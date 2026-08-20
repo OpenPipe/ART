@@ -1043,8 +1043,20 @@ class _ResidentRunState(BaseModel):
     initial_generation: TrainerGeneration | None = None
     pending_load: _PreparedRunLoad | None = None
     next_accumulator_revision: int = 1
+    residency_revision: int = 0
     registration_complete: bool = False
     unregistering: bool = False
+
+
+@contextmanager
+def _residency_mutation(state: _ResidentRunState) -> Iterator[None]:
+    if state.residency_revision % 2:
+        raise RuntimeError("nested run residency mutation")
+    state.residency_revision += 1
+    try:
+        yield
+    finally:
+        state.residency_revision += 1
 
 
 class MCoreRunSlotExecutor:
@@ -1294,23 +1306,36 @@ class MCoreRunSlotExecutor:
     def optimizer_layout(self, checkpoint: Any) -> Any:
         return self._slot_trainer.prepared_checkpoint_slot_optimizer_layout(checkpoint)
 
-    def prepare_residency(self, run_id: str, command_kind: str) -> bool:
+    def prepare_residency(
+        self,
+        run_id: str,
+        command_kind: str,
+        expected_learner_version: int,
+    ) -> bool:
         """Launch component transfers before the serialized GPU command turn."""
         state = self._require_run(run_id)
+        revision = state.residency_revision
+        desired = state.desired
+        if (
+            revision % 2
+            or revision != state.residency_revision
+            or state.learner_version != expected_learner_version
+        ):
+            return False
         if command_kind in {"forward", "forward_backward"}:
-            keys = (state.desired.weights,)
+            keys = (desired.weights,)
             if (
                 command_kind == "forward_backward"
-                and state.desired.accumulator is not None
+                and desired.accumulator is not None
             ):
-                keys += (state.desired.accumulator,)
+                keys += (desired.accumulator,)
         elif command_kind == "optim_step":
             keys = tuple(
                 key
                 for key in (
-                    state.desired.weights,
-                    state.desired.optimizer,
-                    state.desired.accumulator,
+                    desired.weights,
+                    desired.optimizer,
+                    desired.accumulator,
                 )
                 if key is not None
             )
@@ -1320,7 +1345,14 @@ class MCoreRunSlotExecutor:
             self._residency.prefetch_l1_working_set(keys)
         except ResidencyCapacityUnavailable:
             return False
-        return True
+        except RuntimeError:
+            if revision != state.residency_revision:
+                return False
+            raise
+        return (
+            revision == state.residency_revision
+            and state.learner_version == expected_learner_version
+        )
 
     def execute_forward_backward(
         self,
@@ -1562,15 +1594,17 @@ class MCoreRunSlotExecutor:
                 residency_tensors.optimizer,
                 retire_source=True,
             )
-        state.desired = GenerationResidency(
-            weights=output_weights,
-            optimizer=output_optimizer,
-            accumulator=state.desired.accumulator,
-        )
-        state.installed_weights = output_weights
-        state.installed_optimizer = output_optimizer
-        state.learner_version = job.learner_version
-        self._retire_accumulator(state)
+        accumulator = state.desired.accumulator
+        with _residency_mutation(state):
+            state.desired = GenerationResidency(
+                weights=output_weights,
+                optimizer=output_optimizer,
+            )
+            state.installed_weights = output_weights
+            state.installed_optimizer = output_optimizer
+            state.learner_version = job.learner_version
+        if accumulator is not None:
+            self._residency.retire_async(accumulator)
         from art.megatron.lora import LoRASlotRef
 
         snapshot_metrics = self._publisher.stage(
@@ -1763,12 +1797,13 @@ class MCoreRunSlotExecutor:
                 and previous.optimizer_key != state.installed_optimizer
             ):
                 self._residency.retire_async(previous.optimizer_key)
-        state.desired = GenerationResidency(
-            weights=prepared.weights_key,
-            optimizer=prepared.optimizer_key,
-        )
-        state.pending_load = prepared
-        state.learner_version = job.learner_version
+        with _residency_mutation(state):
+            state.desired = GenerationResidency(
+                weights=prepared.weights_key,
+                optimizer=prepared.optimizer_key,
+            )
+            state.pending_load = prepared
+            state.learner_version = job.learner_version
         return {
             "operation_id": job.operation_id,
             "learner_version": job.learner_version,
@@ -2000,15 +2035,17 @@ class MCoreRunSlotExecutor:
             }
         )
         self._residency.register_mutable_l1(key, tensors)
-        state.desired = state.desired.model_copy(update={"accumulator": key})
-        state.next_accumulator_revision += 1
+        with _residency_mutation(state):
+            state.desired = state.desired.model_copy(update={"accumulator": key})
+            state.next_accumulator_revision += 1
 
     def _retire_accumulator(self, state: _ResidentRunState) -> None:
         key = state.desired.accumulator
         if key is None:
             return
+        with _residency_mutation(state):
+            state.desired = state.desired.model_copy(update={"accumulator": None})
         self._residency.retire_async(key)
-        state.desired = state.desired.model_copy(update={"accumulator": None})
 
     @contextmanager
     def _accumulator_resident(self, state: _ResidentRunState) -> Iterator[None]:

@@ -635,9 +635,12 @@ class MegatronTrainingSlot:
         self,
         run_id: str,
         command_kind: Literal["forward", "forward_backward", "optim_step"],
+        expected_learner_version: int,
     ) -> dict[str, float]:
         self._require_run(run_id)
-        return await self.trainer.prepare_residency(run_id, command_kind)
+        return await self.trainer.prepare_residency(
+            run_id, command_kind, expected_learner_version
+        )
 
     async def forward(self, prepared: PreparedForward) -> ForwardResult:
         launch = await self.start_forward(prepared)

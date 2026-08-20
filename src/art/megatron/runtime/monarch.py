@@ -232,6 +232,7 @@ class _ResidencyPrefetchResult(BaseModel):
     rank: int
     run_id: str
     command_kind: str
+    learner_version: int
     admitted: bool = True
     elapsed_s: float = 0.0
     error_type: str | None = None
@@ -265,12 +266,13 @@ async def _prepare_run_residency(
     lock: asyncio.Lock,
     run_id: str,
     command_kind: str,
+    learner_version: int,
     *,
     timeout_s: float,
 ) -> dict[str, float]:
     async with lock:
         reply, receiver = Channel.open()
-        request = run_id, command_kind, reply
+        request = run_id, command_kind, learner_version, reply
         started = time.perf_counter()
         for port in ports:
             port.send(request)
@@ -280,7 +282,8 @@ async def _prepare_run_residency(
                 for _ in ports
             ]
         if {result.rank for result in results} != set(range(len(ports))) or any(
-            (result.run_id, result.command_kind) != (run_id, command_kind)
+            (result.run_id, result.command_kind, result.learner_version)
+            != (run_id, command_kind, learner_version)
             for result in results
         ):
             raise RuntimeError("residency prefetch returned mismatched rank identity")
@@ -711,16 +714,17 @@ class MonarchTrainerActor(Actor):
 
     def _run_residency_prefetch(self, receiver: Any) -> None:
         while (request := receiver.recv().get()) is not None:
-            run_id, command_kind, reply = request
+            run_id, command_kind, learner_version, reply = request
             started = time.perf_counter()
             try:
                 admitted = self._require_run_slot_executor().prepare_residency(
-                    run_id, command_kind
+                    run_id, command_kind, learner_version
                 )
                 result = _ResidencyPrefetchResult(
                     rank=self._runtime.rank,
                     run_id=run_id,
                     command_kind=command_kind,
+                    learner_version=learner_version,
                     admitted=admitted,
                     elapsed_s=time.perf_counter() - started,
                 )
@@ -729,6 +733,7 @@ class MonarchTrainerActor(Actor):
                     rank=self._runtime.rank,
                     run_id=run_id,
                     command_kind=command_kind,
+                    learner_version=learner_version,
                     elapsed_s=time.perf_counter() - started,
                     error_type=type(error).__name__,
                     message=str(error),
@@ -2677,7 +2682,7 @@ class MonarchTrainerSlot:
         )
 
     async def prepare_residency(
-        self, run_id: str, command_kind: str
+        self, run_id: str, command_kind: str, learner_version: int
     ) -> dict[str, float]:
         self._require_open()
         if not self._residency_prefetch_ports:
@@ -2687,6 +2692,7 @@ class MonarchTrainerSlot:
             self._residency_prefetch_lock,
             run_id,
             command_kind,
+            learner_version,
             timeout_s=self._command_timeout_s,
         )
 
