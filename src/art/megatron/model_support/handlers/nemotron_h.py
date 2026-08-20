@@ -9,7 +9,10 @@ from typing import Any, Literal, Sequence, cast
 
 import torch
 
-from art.megatron.model_support.handlers.default_dense import DefaultMoeHandler
+from art.megatron.model_support.handlers.default_dense import (
+    DefaultMoeHandler,
+    _compile_workaround_flags_for_provider,
+)
 from art.megatron.model_support.internal_padding import (
     pad_dim_right,
     round_up_to_multiple,
@@ -18,6 +21,7 @@ from art.megatron.model_support.internal_padding import (
     zero_ranges,
 )
 from art.megatron.model_support.spec import (
+    CompileWorkaroundConfig,
     ExpertPackedLoraGroup,
     ExpertPackedLoraSlot,
     LayerFamilyInstance,
@@ -39,6 +43,7 @@ _MAMBA_KERNEL_ID = (
     "mamba_ssm_2_3_2_post1_e9594ce1.chunk_scan_combined.chunk128.conv4.fp32_state.v1"
 )
 _MAMBA_LAYOUT_KEY = "mamba2.z_x_b_c_dt.head_group.v1"
+_NEMOTRON_H_MOE_COMPILE_WORKAROUND_FLAGS = ("te_triton_permute_with_mask_map",)
 _HF_SEMANTICS = {
     "attention_bias": False,
     "attention_dropout": 0.0,
@@ -1314,6 +1319,18 @@ class NemotronHMoeHandler(DefaultMoeHandler):
         _validate_no_virtual_pipeline(provider)
         _validate_provider_semantics(provider)
         _padding_sizes_from_provider(provider)
+
+    def compile_workaround_config(
+        self,
+        provider: Any,
+    ) -> CompileWorkaroundConfig:
+        return CompileWorkaroundConfig(
+            flags=_compile_workaround_flags_for_provider(
+                provider,
+                _NEMOTRON_H_MOE_COMPILE_WORKAROUND_FLAGS,
+            ),
+            shared_expert_state=self._shared_expert_compile_state(provider),
+        )
 
     def linear_recurrent_contract(
         self, provider: Any
