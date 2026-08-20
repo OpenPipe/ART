@@ -85,6 +85,41 @@ def _compile_cache_key(spec: TrainerRuntimeSpec, rank: int) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _deserialize_cache_artifacts(serialized: bytes) -> dict[str, list[Any]]:
+    from torch.compiler._cache import CacheArtifactManager, _deserialize_single_cache
+    from torch.utils._appending_byte_serializer import AppendingByteSerializer
+
+    CacheArtifactManager._ensure_cache_artifacts_registered()
+    merged: dict[str, dict[str, Any]] = {}
+    for kind, artifacts in AppendingByteSerializer.to_list(
+        serialized, deserialize_fn=_deserialize_single_cache
+    ):
+        by_key = merged.setdefault(kind, {})
+        by_key.update((artifact.key, artifact) for artifact in artifacts)
+    return {
+        kind: [by_key[key] for key in sorted(by_key)]
+        for kind, by_key in sorted(merged.items())
+    }
+
+
+def _serialize_cache_artifacts(artifacts: dict[str, list[Any]]) -> bytes:
+    from torch.compiler._cache import _serialize_single_cache
+    from torch.utils._appending_byte_serializer import AppendingByteSerializer
+
+    serializer = AppendingByteSerializer(serialize_fn=_serialize_single_cache)
+    serializer.extend((kind, artifacts[kind]) for kind in sorted(artifacts))
+    return serializer.to_bytes()
+
+
+def _merge_cache_artifacts(
+    target: dict[str, list[Any]], incoming: dict[str, list[Any]]
+) -> None:
+    for kind, artifacts in incoming.items():
+        by_key = {artifact.key: artifact for artifact in target.get(kind, ())}
+        by_key.update((artifact.key, artifact) for artifact in artifacts)
+        target[kind] = [by_key[key] for key in sorted(by_key)]
+
+
 class TrainerCompileCache:
     """Trusted rank-local PyTorch compiler cache for one exact runtime shape."""
 
@@ -95,9 +130,11 @@ class TrainerCompileCache:
         self.path = cache_root / "megatron" / "compile_cache" / "v1" / self.key
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.loaded = False
+        self._artifacts: dict[str, list[Any]] = {}
 
     def load(self) -> CompileCacheEvent:
         import torch
+        from torch.compiler._cache import CacheArtifactManager
 
         started = time.perf_counter()
         if not self.path.is_file():
@@ -105,8 +142,13 @@ class TrainerCompileCache:
                 status="miss", key=self.key, elapsed_s=time.perf_counter() - started
             )
         artifact = self.path.read_bytes()
+        artifacts = _deserialize_cache_artifacts(artifact)
         if torch.compiler.load_cache_artifacts(artifact) is None:
             raise RuntimeError(f"PyTorch rejected compile cache {self.key}")
+        self._artifacts = artifacts
+        CacheArtifactManager._seen_artifacts.update(
+            artifact for values in artifacts.values() for artifact in values
+        )
         self.loaded = True
         return CompileCacheEvent(
             status="hit",
@@ -116,10 +158,15 @@ class TrainerCompileCache:
         )
 
     def publish(self) -> CompileCacheEvent:
+        import fcntl
+
         import torch
+        from torch.compiler._cache import CacheArtifactManager
 
         started = time.perf_counter()
-        if self.loaded or self.path.is_file():
+        if not CacheArtifactManager.need_serialize():
+            if not self.path.is_file():
+                raise RuntimeError("PyTorch produced no compiler cache after training")
             return CompileCacheEvent(
                 status="existing",
                 key=self.key,
@@ -130,12 +177,33 @@ class TrainerCompileCache:
         if saved is None:
             raise RuntimeError("PyTorch produced no compiler cache after training")
         artifact, _info = saved
-        staging = self.path.with_name(f".{self.key}.{os.getpid()}.{uuid.uuid4().hex}")
-        try:
-            staging.write_bytes(artifact)
-            os.replace(staging, self.path)
-        finally:
-            staging.unlink(missing_ok=True)
+        incoming = _deserialize_cache_artifacts(artifact)
+        lock_path = self.path.with_name(f".{self.key}.lock")
+        with lock_path.open("a+b") as lock:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            try:
+                merged: dict[str, list[Any]] = {}
+                _merge_cache_artifacts(merged, self._artifacts)
+                if self.path.is_file():
+                    _merge_cache_artifacts(
+                        merged, _deserialize_cache_artifacts(self.path.read_bytes())
+                    )
+                _merge_cache_artifacts(merged, incoming)
+                artifact = _serialize_cache_artifacts(merged)
+                staging = self.path.with_name(
+                    f".{self.key}.{os.getpid()}.{uuid.uuid4().hex}"
+                )
+                try:
+                    with staging.open("wb") as output:
+                        output.write(artifact)
+                        output.flush()
+                        os.fsync(output.fileno())
+                    os.replace(staging, self.path)
+                finally:
+                    staging.unlink(missing_ok=True)
+                self._artifacts = merged
+            finally:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
         self.loaded = True
         return CompileCacheEvent(
             status="published",

@@ -755,13 +755,17 @@ class MonarchTrainerActor(Actor):
             )
 
     def _publish_compile_cache(self) -> None:
-        if self._compile_cache is None or "publish_s" in self._compile_cache_metrics:
+        if self._compile_cache is None:
             return
         event = self._compile_cache.publish()
         self._compile_cache_metrics.update(
             {
-                "publish_s": event.elapsed_s,
-                "published": float(event.status == "published"),
+                "publish_s": self._compile_cache_metrics.get("publish_s", 0.0)
+                + event.elapsed_s,
+                "published": max(
+                    self._compile_cache_metrics.get("published", 0.0),
+                    float(event.status == "published"),
+                ),
                 "artifact_bytes": float(event.artifact_bytes),
             }
         )
@@ -1042,7 +1046,7 @@ class MonarchTrainerActor(Actor):
                 coordinator=self._runtime.rank == 0,
             )
             result = launch.materialize()
-            return {
+            response = {
                 "rank": self._runtime.rank,
                 "operation_id": result["operation_id"],
                 "learner_version": result["learner_version"],
@@ -1050,6 +1054,8 @@ class MonarchTrainerActor(Actor):
                 "metrics": result["metrics"],
                 "token_logprobs": result["token_logprobs"],
             }
+            self._publish_compile_cache()
+            return response
         except BaseException:
             self._valid = False
             raise
@@ -1092,7 +1098,7 @@ class MonarchTrainerActor(Actor):
             )
             ready = True
             result = await asyncio.to_thread(launch.materialize)
-            return {
+            response = {
                 "rank": self._runtime.rank,
                 "operation_id": result["operation_id"],
                 "learner_version": result["learner_version"],
@@ -1100,6 +1106,8 @@ class MonarchTrainerActor(Actor):
                 "metrics": result["metrics"],
                 "token_logprobs": result["token_logprobs"],
             }
+            self._publish_compile_cache()
+            return response
         except BaseException as error:
             self._valid = False
             if not ready:
@@ -1138,13 +1146,15 @@ class MonarchTrainerActor(Actor):
                 job, batch, Event()
             )
             coordinator = self._runtime.rank == 0
-            return {
+            response = {
                 "rank": self._runtime.rank,
                 "operation_id": job.operation_id,
                 "learner_version": job.expected_learner_version,
                 "metrics": result["metrics"] if coordinator else {},
                 "token_logprobs": result["token_logprobs"] if coordinator else (),
             }
+            self._publish_compile_cache()
+            return response
         except BaseException:
             self._valid = False
             raise
@@ -1169,7 +1179,7 @@ class MonarchTrainerActor(Actor):
                 job, batch, Event()
             )
             coordinator = self._runtime.rank == 0
-            return {
+            response = {
                 "rank": self._runtime.rank,
                 "operation_id": job.operation_id,
                 "learner_version": job.expected_learner_version,
@@ -1177,6 +1187,8 @@ class MonarchTrainerActor(Actor):
                 "metrics": result["metrics"] if coordinator else {},
                 "token_logprobs": result["token_logprobs"] if coordinator else (),
             }
+            self._publish_compile_cache()
+            return response
         except BaseException:
             self._valid = False
             raise
@@ -1198,7 +1210,7 @@ class MonarchTrainerActor(Actor):
                 job, batch, Event()
             )
             coordinator = self._runtime.rank == 0
-            return {
+            response = {
                 "rank": self._runtime.rank,
                 "operation_id": job.operation_id,
                 "learner_version": job.expected_learner_version,
@@ -1206,6 +1218,8 @@ class MonarchTrainerActor(Actor):
                 "metrics": result["metrics"] if coordinator else {},
                 "token_logprobs": result["token_logprobs"] if coordinator else (),
             }
+            self._publish_compile_cache()
+            return response
         except BaseException:
             self._valid = False
             raise
