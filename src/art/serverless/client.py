@@ -999,6 +999,7 @@ class RemoteTrainingOperation(Generic[ResultT]):
         result_type: type[ResultT],
         preparation: asyncio.Future[RunEvent] | None = None,
         on_completion: Callable[[], None] | None = None,
+        on_cancelled: Callable[[], None] | None = None,
     ) -> None:
         if (ref.kind == "forward_backward") != (preparation is not None):
             raise ValueError("preparation future is required exclusively for F/B")
@@ -1009,6 +1010,7 @@ class RemoteTrainingOperation(Generic[ResultT]):
         self._terminal = terminal
         self._preparation = preparation
         self._cancel_request_id = uuid.uuid4().hex
+        self._on_cancelled = on_cancelled
         if on_completion is not None:
             self._terminal.add_done_callback(lambda _: on_completion())
 
@@ -1069,19 +1071,38 @@ class RemoteTrainingOperation(Generic[ResultT]):
 
     async def cancel(self) -> None:
         try:
-            await self._service.cancel_operation(
+            view = await self._service.cancel_operation(
                 self._ref.run_id,
                 self._ref.operation_id,
                 self._cancel_request_id,
             )
         except RemoteTrainingHttpError as error:
-            if error.status_code != 409 or (
-                await self._service.get_operation(
-                    self._ref.run_id, self._ref.operation_id
-                )
-            ).status not in {"running", "succeeded"}:
+            if error.status_code != 409:
+                raise
+            view = await self._service.get_operation(
+                self._ref.run_id, self._ref.operation_id
+            )
+            if view.status == "cancelled":
+                self._settle_cancelled(view)
+                return
+            if view.status not in {"running", "succeeded"}:
                 raise
             await self.result()
+            return
+        if view.status != "cancelled":
+            raise RemoteTrainingError("cancellation returned a non-cancelled operation")
+        self._settle_cancelled(view)
+
+    def _settle_cancelled(self, view: OperationView) -> None:
+        event = _terminal_event(view)
+        if event is None or event.event != "operation_cancelled":
+            raise RemoteTrainingError("cancelled operation omitted its terminal event")
+        if self._on_cancelled is not None:
+            self._on_cancelled()
+        if not self._terminal.done():
+            self._terminal.set_result(event)
+        if self._preparation is not None and not self._preparation.done():
+            self._preparation.set_result(event)
 
 
 class RemoteTrainingClient:
@@ -1250,6 +1271,11 @@ class RemoteTrainingClient:
                     result_type,
                     preparation=preparation,
                     on_completion=self._bound_operation_cache,
+                    on_cancelled=(
+                        lambda: self._forget_forward_backward(operation_id)
+                    )
+                    if kind == "forward_backward"
+                    else None,
                 )
             except (asyncio.CancelledError, httpx.TransportError):
                 raise
@@ -1278,7 +1304,7 @@ class RemoteTrainingClient:
                 self._open_forward_backward.clear()
             return operation
 
-    def _forget_empty_forward_backward(
+    def _forget_noncontributing_forward_backward(
         self,
         operation: RemoteTrainingOperation[ForwardBackwardResult],
         future: asyncio.Future[RunEvent],
@@ -1289,16 +1315,25 @@ class RemoteTrainingClient:
             event = future.result()
         except BaseException:
             return
-        if event.event != FORWARD_BACKWARD_PREPARED_EVENT or (
+        empty = event.event == FORWARD_BACKWARD_PREPARED_EVENT and (
             ForwardBackwardPreparation.model_validate(event.payload)
             .gradient_disposition
-            != "empty"
-        ):
+            == "empty"
+        )
+        if event.event != "operation_cancelled" and not empty:
             return
+        self._forget_forward_backward(operation.ref.operation_id)
+
+    def _forget_forward_backward(self, operation_id: str) -> None:
         try:
-            self._open_forward_backward.remove(operation)
-        except ValueError:
-            pass
+            operation = next(
+                value
+                for value in self._open_forward_backward
+                if value.ref.operation_id == operation_id
+            )
+        except StopIteration:
+            return
+        self._open_forward_backward.remove(operation)
 
     async def _resolve_replay(
         self,
@@ -1356,6 +1391,9 @@ class RemoteTrainingClient:
             result_type,
             preparation=preparation,
             on_completion=self._bound_operation_cache,
+            on_cancelled=(lambda: self._forget_forward_backward(operation_id))
+            if kind == "forward_backward"
+            else None,
         )
         self._operations[request.request_id] = (fingerprint, operation)
         if kind == "forward_backward":
@@ -1374,7 +1412,9 @@ class RemoteTrainingClient:
     ) -> None:
         self._open_forward_backward.append(operation)
         preparation.add_done_callback(
-            lambda future: self._forget_empty_forward_backward(operation, future)
+            lambda future: self._forget_noncontributing_forward_backward(
+                operation, future
+            )
         )
 
     def _validate_replay(

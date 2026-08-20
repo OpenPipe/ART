@@ -18,6 +18,8 @@ import art.serverless.client as client_module
 from art.serverless.client import (
     RemoteTrainingClient,
     RemoteTrainingError,
+    RemoteTrainingOperation,
+    RemoteTrainingOperationCancelled,
     RemoteTrainingServiceClient,
 )
 from art.serverless.contracts import (
@@ -26,7 +28,9 @@ from art.serverless.contracts import (
     AdapterSpec,
     CreateTrainingRunRequest,
     OperationResultRef,
+    OperationView,
     TrainingRunSpec,
+    TrainingRunView,
     remote_request_fingerprint,
 )
 from art.serverless.data_plane import (
@@ -44,6 +48,7 @@ from art.training.contracts import (
     ForwardBackwardResult,
     LossConfig,
     LossFnOutput,
+    OperationRef,
     OptimStepRequest,
     OptimStepResult,
     PackingOutcome,
@@ -521,6 +526,69 @@ def test_tokenized_request_rejects_oversized_logprob_result(monkeypatch):
                 ),
             )
         )
+
+
+@pytest.mark.asyncio
+async def test_cancelled_forward_is_removed_from_open_accumulation_immediately():
+    now = datetime.now(timezone.utc)
+    ref = OperationRef(
+        run_id="run",
+        operation_id=_operation_id("run", "forward"),
+        sequence_id=0,
+        learner_parent_version=0,
+        kind="forward_backward",
+    )
+
+    class CancellationService(RemoteTrainingServiceClient):
+        async def cancel_operation(self, *_args):
+            return OperationView(
+                ref=ref,
+                request_id="forward",
+                request_fingerprint="0" * 64,
+                status="cancelled",
+                gradient_disposition="pending",
+                event_cursor=1,
+                created_at=now,
+                updated_at=now,
+            )
+
+    service = CancellationService.__new__(CancellationService)
+    client = RemoteTrainingClient(
+        service,
+        TrainingRunView(
+            run_id="run",
+            spec=TrainingRunSpec(
+                run_name="test",
+                base_model="model",
+                adapter=AdapterSpec(rank=1, target_modules=("q_proj",)),
+            ),
+            status="open",
+            next_sequence_id=1,
+            projected_learner_version=0,
+            committed_learner_version=0,
+            created_at=now,
+            updated_at=now,
+        ),
+    )
+    terminal = asyncio.get_running_loop().create_future()
+    preparation = asyncio.get_running_loop().create_future()
+    operation = RemoteTrainingOperation(
+        ref,
+        service,
+        terminal,
+        ForwardBackwardResult,
+        preparation=preparation,
+        on_cancelled=lambda: client._forget_forward_backward(ref.operation_id),
+    )
+    client._open_forward_backward.append(operation)
+
+    await operation.cancel()
+
+    assert client._open_forward_backward == []
+    with pytest.raises(RemoteTrainingOperationCancelled):
+        await operation.gradient_disposition()
+    with pytest.raises(RemoteTrainingOperationCancelled):
+        await operation.result()
 
 
 @pytest.mark.parametrize("admit_before_failure", (False, True))
