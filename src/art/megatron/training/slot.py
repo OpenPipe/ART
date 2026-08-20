@@ -228,6 +228,18 @@ class _SnapshotSource(BaseModel):
 _MAX_PENDING_BATCH_RELEASES = 2
 
 
+class _BatchReleaseLease:
+    def __init__(self, slots: asyncio.BoundedSemaphore) -> None:
+        self._slots = slots
+        self._released = False
+
+    def release(self) -> None:
+        if self._released:
+            raise RuntimeError("packed-batch release lease was already released")
+        self._released = True
+        self._slots.release()
+
+
 class MegatronTrainingSlot:
     """Canonical pack-and-command facade for one persistent Megatron mesh."""
 
@@ -254,6 +266,10 @@ class MegatronTrainingSlot:
         self._sft_tokenizer = SftBatchTokenizer()
         self._batch_releases: set[asyncio.Task[None]] = set()
         self._batch_release_failures: list[BaseException] = []
+        self._batch_release_slots = asyncio.BoundedSemaphore(
+            _MAX_PENDING_BATCH_RELEASES
+        )
+        self._batch_release_leases: dict[str, _BatchReleaseLease] = {}
         self._closed = False
 
     @property
@@ -487,25 +503,44 @@ class MegatronTrainingSlot:
     async def materialize_forward_packing(
         self, planned: PlannedPackedForward
     ) -> PreparedPackedForward:
-        packed = await self.runtime.materialize_pack(planned.packing)
-        if packed is None:
-            raise ValueError(f"{planned.kind} batch produced no packed sequence")
-        return PreparedPackedForward(
-            ref=planned.ref,
-            kind=planned.kind,
-            packed=packed,
-            packing=packing_outcome(
-                packed,
-                target_packed_sequences=(
-                    planned.config.grad_accumulation_sequences
-                    or self._data_parallel_size()
+        lease = await self._acquire_batch_release()
+        packed = None
+        try:
+            packed = await self.runtime.materialize_pack(planned.packing)
+            if packed is None:
+                raise ValueError(f"{planned.kind} batch produced no packed sequence")
+            prepared = PreparedPackedForward(
+                ref=planned.ref,
+                kind=planned.kind,
+                packed=packed,
+                packing=packing_outcome(
+                    packed,
+                    target_packed_sequences=(
+                        planned.config.grad_accumulation_sequences
+                        or self._data_parallel_size()
+                    ),
                 ),
-            ),
-            config=planned.config,
-            experimental_config=planned.experimental_config,
-            loss=planned.loss,
-            return_token_logprobs=planned.return_token_logprobs,
-        )
+                config=planned.config,
+                experimental_config=planned.experimental_config,
+                loss=planned.loss,
+                return_token_logprobs=planned.return_token_logprobs,
+            )
+            generation_id = packed.packing_generation_id
+            if generation_id in self._batch_release_leases:
+                raise RuntimeError("packing generation is already materialized")
+            self._batch_release_leases[generation_id] = lease
+            return prepared
+        except BaseException as error:
+            if packed is not None:
+                try:
+                    await self.runtime.release_batch(packed)
+                except BaseException as cleanup:
+                    error.add_note(
+                        "packed batch cleanup also failed: "
+                        f"{type(cleanup).__name__}: {cleanup}"
+                    )
+            lease.release()
+            raise
 
     async def discard_forward_packing(self, planned: PlannedPackedForward) -> None:
         await self.runtime.discard_pack(planned.packing)
@@ -530,7 +565,13 @@ class MegatronTrainingSlot:
 
     async def discard_prepared(self, prepared: PreparedForward) -> None:
         if isinstance(prepared, PreparedPackedForward):
-            await self.runtime.release_batch(prepared.packed)
+            lease = self._batch_release_leases.pop(
+                prepared.packed.packing_generation_id
+            )
+            try:
+                await self.runtime.release_batch(prepared.packed)
+            finally:
+                lease.release()
 
     async def prepare_residency(
         self,
@@ -587,7 +628,7 @@ class MegatronTrainingSlot:
         try:
             raw = await self.trainer.forward(job, prepared.packed.leases)
         finally:
-            await self._release_batch_soon(prepared.packed)
+            self._release_batch_soon(prepared.packed)
         return ForwardResult(
             operation_id=ref.operation_id,
             packing=prepared.packing,
@@ -672,7 +713,7 @@ class MegatronTrainingSlot:
         try:
             raw = await self.trainer.start_forward_backward(job, prepared.packed.leases)
         finally:
-            await self._release_batch_soon(prepared.packed)
+            self._release_batch_soon(prepared.packed)
 
         async def complete() -> ForwardBackwardResult:
             result = await asyncio.shield(raw.completion)
@@ -691,7 +732,7 @@ class MegatronTrainingSlot:
             produced_gradient=prepared.packing.loss_bearing_tokens > 0,
             completion=asyncio.create_task(
                 complete(), name=f"megatron-fb-result-{ref.operation_id}"
-            )
+            ),
         )
 
     @staticmethod
@@ -1337,6 +1378,8 @@ class MegatronTrainingSlot:
                 )
                 await asyncio.sleep(0)
             self._raise_batch_release_failures()
+            if self._batch_release_leases:
+                raise RuntimeError("prepared packed batches were not released")
         except BaseException as error:
             primary = error
         self._closed = True
@@ -1353,15 +1396,21 @@ class MegatronTrainingSlot:
         if primary is not None:
             raise primary
 
-    async def _release_batch_soon(self, packed: DistributedPackedBatch) -> None:
-        while len(self._batch_releases) >= _MAX_PENDING_BATCH_RELEASES:
-            await asyncio.wait(
-                self._batch_releases, return_when=asyncio.FIRST_COMPLETED
-            )
-            await asyncio.sleep(0)
-            self._raise_batch_release_failures()
+    async def _acquire_batch_release(self) -> _BatchReleaseLease:
+        await self._batch_release_slots.acquire()
+        return _BatchReleaseLease(self._batch_release_slots)
+
+    def _release_batch_soon(self, packed: DistributedPackedBatch) -> None:
+        lease = self._batch_release_leases.pop(packed.packing_generation_id)
+
+        async def release() -> None:
+            try:
+                await self.runtime.release_batch(packed)
+            finally:
+                lease.release()
+
         task = asyncio.create_task(
-            self.runtime.release_batch(packed),
+            release(),
             name=f"release-packed-batch-{packed.packing_generation_id}",
         )
         self._batch_releases.add(task)
