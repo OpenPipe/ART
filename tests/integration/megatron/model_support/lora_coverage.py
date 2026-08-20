@@ -229,7 +229,10 @@ def run_lora_coverage(case_config: OracleCaseConfig) -> LoraCoverageReport:
         with provider_topology_env(topology):
             runtime = megatron_train.build_training_runtime(
                 model_identifier=case_config.provider_model or case_config.base_model,
-                provider_torch_dtype=torch.float32,
+                provider_torch_dtype={
+                    "bf16": torch.bfloat16,
+                    "fp32": torch.float32,
+                }[case_config.precision],
                 provider_configure=lambda provider: _configure_provider(
                     provider, topology, case_config
                 ),
