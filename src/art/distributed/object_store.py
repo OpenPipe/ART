@@ -323,8 +323,11 @@ class S3BinaryObjectStore:
         # Failed writes remain invisible until the conditional manifest commit and
         # are reclaimed later by the lifecycle owner after writer fencing.
         for file in planned:
-            written = self._upload(
-                _binary_object_file_key(prefix, file), files[file.relative_path]
+            key = _binary_object_file_key(prefix, file)
+            written = (
+                file.byte_count
+                if self._committed_file_exists(key, file)
+                else self._upload(key, files[file.relative_path])
             )
             if written != file.byte_count:
                 raise RuntimeError("binary object upload changed its planned size")
@@ -753,6 +756,19 @@ class S3BinaryObjectStore:
             )
             raise
         return total
+
+    def _committed_file_exists(self, key: str, file: BinaryObjectFile) -> bool:
+        # S3 exposes a PUT atomically. The digest is already part of this immutable
+        # key, so a matching-size object is a completed upload from this plan.
+        try:
+            value = self._client.head_object(Bucket=self.config.bucket, Key=key)
+        except Exception as error:
+            if _is_missing_object(error):
+                return False
+            raise
+        if value.get("ContentLength") != file.byte_count:
+            raise RuntimeError("content-addressed object has a conflicting size")
+        return True
 
     def _upload_ordered_shards(
         self,

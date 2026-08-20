@@ -166,6 +166,36 @@ def consume_checkpoint_bundle(
     output_dir: str | Path,
     restore_optimizer: bool,
 ) -> RestoredCheckpointBundle:
+    return _consume_checkpoint_bundle(
+        source,
+        output_dir=output_dir,
+        restore_optimizer=restore_optimizer,
+        verify_files=True,
+    )
+
+
+def consume_transported_checkpoint_bundle(
+    source: str | Path,
+    *,
+    output_dir: str | Path,
+    restore_optimizer: bool,
+) -> RestoredCheckpointBundle:
+    """Consume a manifest-checked, content-addressed transport materialization."""
+    return _consume_checkpoint_bundle(
+        source,
+        output_dir=output_dir,
+        restore_optimizer=restore_optimizer,
+        verify_files=False,
+    )
+
+
+def _consume_checkpoint_bundle(
+    source: str | Path,
+    *,
+    output_dir: str | Path,
+    restore_optimizer: bool,
+    verify_files: bool,
+) -> RestoredCheckpointBundle:
     bundle = Path(source).absolute()
     manifest = read_checkpoint_bundle(bundle)
     bundle_files = {record.path: record for record in manifest.files}
@@ -183,6 +213,7 @@ def consume_checkpoint_bundle(
                     bundle / relative,
                     staging / record.name,
                     expected=bundle_files[relative],
+                    verify=verify_files,
                 )
             adapter = publish_adapter_checkpoint(
                 staging,
@@ -225,6 +256,7 @@ def consume_checkpoint_bundle(
                         bundle / record.path,
                         pending / PurePosixPath(record.path).name,
                         expected=record,
+                        verify=verify_files,
                     )
                 restored_manifest = manifest.optimizer.model_copy(
                     update={"adapter": adapter}
@@ -304,8 +336,13 @@ def _verify_file(path: Path, expected: BundleFile) -> None:
         raise RuntimeError(f"checkpoint bundle file hash differs: {path}")
 
 
-def _move_verified_file(source: Path, target: Path, *, expected: BundleFile) -> None:
-    _verify_file(source, expected)
+def _move_verified_file(
+    source: Path, target: Path, *, expected: BundleFile, verify: bool = True
+) -> None:
+    if verify:
+        _verify_file(source, expected)
+    elif not source.is_file() or source.stat().st_size != expected.size_bytes:
+        raise RuntimeError(f"checkpoint bundle file is incomplete: {source}")
     target.parent.mkdir(parents=True, exist_ok=True)
     if source.stat().st_dev != target.parent.stat().st_dev:
         raise RuntimeError(
