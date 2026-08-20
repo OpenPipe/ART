@@ -9,6 +9,7 @@ from art.megatron.runtime.nvme_residency import NvmeResidencyStoreConfig
 from art.megatron.runtime.residency import ResidencyKey, ResidencyLimits, TierCapacity
 from art.megatron.runtime.run_residency import RunResidencyConfig, RunResidencyManager
 from art.megatron.tensor_snapshot import SnapshotReadBarrier
+from art.utils.disk_admission import DiskAdmissionConfig
 
 
 class _DeferredCopyEvent:
@@ -43,6 +44,18 @@ def _barrier(event: _DeferredCopyEvent) -> SnapshotReadBarrier:
     return barrier
 
 
+def _nvme(tmp_path: Path) -> NvmeResidencyStoreConfig:
+    return NvmeResidencyStoreConfig(
+        root=str(tmp_path / "l3"),
+        disk_admission=DiskAdmissionConfig(
+            shared_storage_mount=tmp_path,
+            storage_identity=f"test-{tmp_path.name}",
+            node_identity="test-node",
+            runtime_free_floor_bytes=0,
+        ),
+    )
+
+
 def _manager(tmp_path: Path) -> RunResidencyManager:
     capacity = TierCapacity(max_bytes=64 << 20)
     return RunResidencyManager(
@@ -52,7 +65,7 @@ def _manager(tmp_path: Path) -> RunResidencyManager:
                 l2_cpu=capacity,
                 l3_nvme=capacity,
             ),
-            nvme=NvmeResidencyStoreConfig(root=str(tmp_path / "l3")),
+            nvme=_nvme(tmp_path),
         ),
         snapshot_barrier=SnapshotReadBarrier(),
     )
@@ -125,7 +138,7 @@ def test_each_l2_snapshot_precedes_mutation_of_same_residency_key(
                 l2_cpu=capacity,
                 l3_nvme=capacity,
             ),
-            nvme=NvmeResidencyStoreConfig(root=str(tmp_path / "l3")),
+            nvme=_nvme(tmp_path),
         ),
         snapshot_barrier=SnapshotReadBarrier(),
     )

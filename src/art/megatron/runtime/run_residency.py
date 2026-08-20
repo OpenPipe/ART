@@ -59,9 +59,7 @@ class _ManagedState(BaseModel):
     l2_future: Future[HostTensorImage] | None = None
     l3_future: Future[NvmeResidencyManifest] | None = None
     l2_demotion: Future[None] | None = None
-    l1_reservation: ResidencyReservation | None = None
     l1_transition: TensorResidencyTransition | None = None
-    evict_l2_after_l1: bool = False
 
 
 class RunResidencyManager:
@@ -161,7 +159,6 @@ class RunResidencyManager:
                 self.ledger.drop(key, "l2_cpu")
                 state.l2 = None
                 state.l2_future = None
-                state.evict_l2_after_l1 = False
             self.ledger.touch(key)
 
     def register_l2(
@@ -434,12 +431,6 @@ class RunResidencyManager:
                     is not None
                     and installed not in protected
                 }
-                transient_l2 = {
-                    state.key
-                    for state in missing
-                    if not self.ledger.has_copy(state.key, "l2_cpu")
-                    and self.ledger.has_copy(state.key, "l3_nvme")
-                }
             capacity = self.config.limits.l1_gpu.max_bytes
             if demanded_bytes > capacity:
                 raise ResidencyCapacityUnavailable(
@@ -461,9 +452,6 @@ class RunResidencyManager:
                 demanded_bytes=demanded_bytes,
                 protected=protected,
             )
-            for state in missing:
-                if not self.ledger.has_copy(state.key, "l2_cpu"):
-                    self._ensure_l2(state.key, protected=protected).result()
             with self._lock:
                 missing = tuple(
                     self._state(key)
@@ -473,57 +461,88 @@ class RunResidencyManager:
                 )
                 if not missing:
                     return
-            demands = tuple(
-                ResidencyDemand(
-                    key=state.key,
-                    source="l2_cpu",
-                    target="l1_gpu",
-                    byte_count=self._l1_demand_bytes(state),
-                )
-                for state in missing
-            )
-            with self._lock:
-                reservations = self._reserve_many(demands)
-                images: list[HostTensorImage | TensorResidencySnapshot] = []
-                transition: TensorResidencyTransition | None = None
-                try:
-                    for state in missing:
-                        image = self._state(state.key).l2
-                        if image is None:
-                            raise RuntimeError(
-                                "L1 admission lost its committed L2 source"
-                            )
-                        image.activate()
-                        images.append(image)
-                    transition = self._mover.move(
-                        tuple(tensor for state in missing for tensor in state.tensors),
-                        self.config.device,
+                sources = tuple(self._l1_source(state) for state in missing)
+                demands = tuple(
+                    ResidencyDemand(
+                        key=state.key,
+                        source=source,
+                        target="l1_gpu",
+                        byte_count=self._l1_demand_bytes(state),
                     )
-                    if transition.stats.byte_count != incoming_bytes:
-                        raise RuntimeError("L1 working-set transfer byte count changed")
+                    for state, source in zip(missing, sources, strict=True)
+                )
+                reservations = self._reserve_many(demands)
+            authoritative: list[HostTensorImage | TensorResidencySnapshot] = []
+            transition: TensorResidencyTransition | None = None
+            staging = None
+            try:
+                if "l3_nvme" in sources:
+                    staging = self._mover.staging()
+                for state, source in zip(missing, sources, strict=True):
+                    image = state.l2 if source == "l2_cpu" else state.l3
+                    if image is None:
+                        raise RuntimeError(
+                            f"L1 admission lost its committed {source} source"
+                        )
+                    authoritative.append(image)
+                    if source == "l3_nvme":
+                        manifest = state.l3_manifest
+                        if manifest is None or staging is None:
+                            raise RuntimeError(
+                                "L3 residency lost its committed transfer metadata"
+                            )
+                        targets = tuple(
+                            staging.stager.target_bytes(record.byte_count)
+                            for record in manifest.storages
+                        )
+                        image = self._store.read_committed(
+                            state.key, manifest, state.tensors, targets
+                        )
+                    elif staging is not None:
+                        image = self._mover.stage_host_image(image, staging)
+                    image.activate()
+                transfer_staging = staging
+                staging = None
+                transition = self._mover.move(
+                    tuple(tensor for state in missing for tensor in state.tensors),
+                    self.config.device,
+                    staging=transfer_staging,
+                )
+                if transition.stats.byte_count != incoming_bytes:
+                    raise RuntimeError("L1 working-set transfer byte count changed")
+                with self._lock:
                     # Storage is allocated; the retained event gates authoritative use.
                     self.ledger.commit_many(reservations)
-                except BaseException:
-                    if transition is not None:
-                        transition.wait_on_current_stream()
-                    for image in images:
+                    for state in missing:
+                        state.l1_transition = transition
+            except BaseException:
+                if transition is not None:
+                    transition.wait_on_current_stream()
+                elif staging is not None:
+                    staging.release()
+                with self._lock:
+                    for image in authoritative:
                         image.activate()
                     self._cancel_many(reservations)
-                    raise
-                for state in missing:
-                    state.l1_reservation = None
-                    state.l1_transition = transition
-                    state.evict_l2_after_l1 = state.key in transient_l2
+                raise
 
     def acquire_l1(self, key: ResidencyKey) -> None:
         self.acquire_l1_working_set((key,))
 
     def acquire_l1_working_set(self, keys: Iterable[ResidencyKey]) -> None:
         """Fence, commit, and pin a complete demanded trainer working set."""
+        self._require_open()
         keys = self._working_set_keys(keys)
         if not keys:
             return
-        self.prepare_l1_working_set(keys)
+        with self._lock:
+            needs_prepare = any(
+                not self.ledger.has_copy(key, "l1_gpu")
+                and self._state(key).l1_transition is None
+                for key in keys
+            )
+        if needs_prepare:
+            self.prepare_l1_working_set(keys)
         with self._lock:
             for key in keys:
                 self._require_not_retiring(key)
@@ -613,7 +632,6 @@ class RunResidencyManager:
         finally:
             with self._lock:
                 self.ledger.unpin(key, "l2_cpu")
-                self._drop_transient_l2_locked(key)
             self._try_retire(key)
 
     def retire(self, key: ResidencyKey) -> None:
@@ -747,27 +765,16 @@ class RunResidencyManager:
         )
         if not states:
             return
-        reservations = tuple(
-            state.l1_reservation for state in states if state.l1_reservation is not None
-        )
-        if reservations and len(reservations) != len(states):
-            raise RuntimeError("L1 transfer has an incomplete reservation set")
         if synchronize:
             transition.synchronize()
         else:
             transition.wait_on_current_stream()
-        if reservations:
-            self._commit_many(reservations)
-        else:
-            with self._transition_slots:
-                self._release_transition_slot()
+        with self._transition_slots:
+            self._release_transition_slot()
         for state in states:
             state.l1_transition = None
-            state.l1_reservation = None
             if component := self._exclusive_component(state.key):
                 self._installed_components[component] = state.key
-        for state in states:
-            self._drop_transient_l2_locked(state.key)
 
     def _try_retire(self, key: ResidencyKey) -> None:
         retirement: Future[None] | None = None
@@ -829,17 +836,6 @@ class RunResidencyManager:
         component = self._exclusive_component(key)
         if component is not None and self._installed_components.get(component) == key:
             self._installed_components.pop(component)
-
-    def _drop_transient_l2_locked(self, key: ResidencyKey) -> None:
-        state = self._states.get(key)
-        if (
-            state is not None
-            and state.evict_l2_after_l1
-            and state.l1_transition is None
-            and self.ledger.has_copy(key, "l1_gpu")
-            and self._evict_l2(key)
-        ):
-            state.evict_l2_after_l1 = False
 
     def _demote_after(
         self, key: ResidencyKey, dependency: Future[NvmeResidencyManifest]
@@ -1006,7 +1002,6 @@ class RunResidencyManager:
             self.ledger.drop(key, "l2_cpu")
             state.l2 = None
             state.l2_future = None
-            state.evict_l2_after_l1 = False
             return True
 
     def _evict_l3(self, key: ResidencyKey) -> bool:
@@ -1074,8 +1069,6 @@ class RunResidencyManager:
     def _l1_demand_bytes(self, state: _ManagedState) -> int:
         if self.ledger.has_copy(state.key, "l1_gpu"):
             return self.ledger.copy(state.key, "l1_gpu").byte_count
-        if state.l1_reservation is not None:
-            return state.l1_reservation.byte_count
         if state.l2 is not None:
             return state.l2.stats.byte_count
         if state.l3_manifest is not None:
@@ -1087,6 +1080,17 @@ class RunResidencyManager:
         if byte_count < 1:
             raise RuntimeError("residency state has no materializable tensor storage")
         return byte_count
+
+    def _l1_source(self, state: _ManagedState) -> ResidencyTier:
+        if self.ledger.has_copy(state.key, "l2_cpu"):
+            if state.l2 is None:
+                raise RuntimeError("L2 ledger copy has no host image")
+            return "l2_cpu"
+        if self.ledger.has_copy(state.key, "l3_nvme"):
+            if state.l3 is None or state.l3_manifest is None:
+                raise RuntimeError("L3 ledger copy has no committed image")
+            return "l3_nvme"
+        raise RuntimeError("L1 admission lost every lower-tier source")
 
     def _require_not_retiring(self, key: ResidencyKey) -> None:
         if key in self._retirements:

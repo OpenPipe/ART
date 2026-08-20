@@ -19,6 +19,7 @@ from art.megatron.runtime.run_residency import (
 )
 from art.megatron.runtime.tensor_residency import TensorResidencyTransition
 from art.megatron.tensor_snapshot import SnapshotReadBarrier
+from art.utils.disk_admission import DiskAdmissionConfig
 
 GIB = 1 << 30
 
@@ -54,7 +55,15 @@ def manager(
                 l3_nvme=TierCapacity(max_bytes=max(l1_bytes, l2_bytes, 1 << 20)),
                 max_concurrent_transitions=2,
             ),
-            nvme=NvmeResidencyStoreConfig(root=str(root), min_free_bytes=0),
+            nvme=NvmeResidencyStoreConfig(
+                root=str(root),
+                disk_admission=DiskAdmissionConfig(
+                    shared_storage_mount=root.parent,
+                    storage_identity=f"test-{root.parent.name}",
+                    node_identity="test-node",
+                    runtime_free_floor_bytes=0,
+                ),
+            ),
             device="cuda:0",
         ),
         snapshot_barrier=SnapshotReadBarrier(),

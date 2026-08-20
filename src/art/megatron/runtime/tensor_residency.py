@@ -359,12 +359,19 @@ class TensorResidencyMover:
         *,
         staging: "_PinnedStagerLease | None" = None,
     ) -> TensorResidencyTransition:
-        target = self._normalized_device(torch.device(target))
-        groups = tuple(
-            group
-            for group in self._groups(tensors)
-            if self._normalized_device(group.source.device) != target
-        )
+        """Move tensor storage and consume any caller-owned staging lease."""
+        owned_staging = staging
+        try:
+            target = self._normalized_device(torch.device(target))
+            groups = tuple(
+                group
+                for group in self._groups(tensors)
+                if self._normalized_device(group.source.device) != target
+            )
+        except BaseException:
+            if owned_staging is not None:
+                owned_staging.release()
+            raise
         if not groups:
             return TensorResidencyTransition(
                 stats=TensorResidencyStats(
@@ -372,6 +379,7 @@ class TensorResidencyMover:
                 ),
                 fences=(),
                 sources=(),
+                staging=owned_staging,
             )
         cuda_devices = {
             int(device.index)
@@ -380,15 +388,17 @@ class TensorResidencyMover:
             if device.type == "cuda" and device.index is not None
         }
         if len(cuda_devices) != 1:
+            if owned_staging is not None:
+                owned_staging.release()
             raise RuntimeError(
                 "one tensor residency move must use exactly one CUDA device"
             )
-        owned_staging = staging
         if target.type == "cuda" and any(
             group.source.device.type == "cpu" and not group.source.is_pinned()
             for group in groups
         ):
-            if staging is not None:
+            if owned_staging is not None:
+                owned_staging.release()
                 raise RuntimeError("caller staging does not own the CPU sources")
             owned_staging = self._stagers.acquire()
             try:
@@ -406,9 +416,11 @@ class TensorResidencyMover:
                 owned_staging.release()
                 raise
         device = cuda_devices.pop()
-        stream = self._stream(device)
+        stream: torch.cuda.Stream | None = None
         sources: list[torch.Tensor] = []
+        transfer_started = False
         try:
+            stream = self._stream(device)
             with torch.cuda.device(device), torch.cuda.stream(stream), torch.no_grad():
                 if any(group.source.device.type == "cuda" for group in groups):
                     stream.wait_stream(torch.cuda.current_stream(device))
@@ -419,6 +431,7 @@ class TensorResidencyMover:
                         device=target,
                         pin_memory=target.type == "cpu",
                     )
+                    transfer_started = True
                     destination.copy_(group.source, non_blocking=True)
                     if group.source.device.type == "cuda":
                         group.source.record_stream(stream)
@@ -435,9 +448,23 @@ class TensorResidencyMover:
                         view.tensor.data = replacement
                 event = torch.cuda.Event(blocking=True)
                 event.record(stream)
-        except BaseException:
+        except BaseException as error:
             if owned_staging is not None:
-                owned_staging.release()
+                try:
+                    if transfer_started and stream is not None:
+                        with torch.cuda.device(device), torch.cuda.stream(stream):
+                            fence = _CudaFence(
+                                device=device, event=torch.cuda.Event(blocking=True)
+                            )
+                            fence.event.record(stream)
+                        owned_staging.release_after((fence,))
+                    else:
+                        owned_staging.release()
+                except BaseException as cleanup_error:
+                    raise BaseExceptionGroup(
+                        "tensor residency transfer and staging cleanup failed",
+                        (error, cleanup_error),
+                    ) from None
             raise
         return TensorResidencyTransition(
             stats=TensorResidencyStats(
@@ -452,6 +479,24 @@ class TensorResidencyMover:
 
     def staging(self) -> "_PinnedStagerLease":
         return self._stagers.acquire()
+
+    @staticmethod
+    def stage_host_image(
+        image: HostTensorImage,
+        staging: "_PinnedStagerLease",
+    ) -> HostTensorImage:
+        """Place pageable image storage in one caller-owned transfer lease."""
+        targets = tuple(
+            source
+            if source.is_pinned()
+            else staging.stager.target_like(source).copy_(source)
+            for source in image.storage_bytes()
+        )
+        return HostTensorImage(
+            groups=image.groups(),
+            targets=targets,
+            input_tensor_count=image.input_tensor_count,
+        )
 
     def _stream(self, device: int) -> torch.cuda.Stream:
         stream = self._streams.get(device)

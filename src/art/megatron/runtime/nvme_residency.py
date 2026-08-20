@@ -201,7 +201,7 @@ class NvmeResidencyStore:
         tensors: tuple[torch.Tensor, ...],
         targets: tuple[torch.Tensor, ...],
     ) -> HostTensorImage:
-        """Read L3 directly into caller-owned CPU transfer or L2 buffers."""
+        """Read L3 into caller-owned L1 transfer staging or durable L2 buffers."""
         destination = self.path(key)
         if self._read_manifest(destination) != manifest:
             raise RuntimeError("committed L3 residency manifest changed identity")
