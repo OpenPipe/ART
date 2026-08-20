@@ -799,6 +799,7 @@ def selected_suite_topologies(
     *,
     is_moe: bool = True,
     cp_supported: bool = True,
+    virtual_pipeline_supported: bool = True,
 ) -> list[Topology]:
     """Returns TP1 plus one composed correctness topology for a model family."""
     if is_moe:
@@ -809,6 +810,8 @@ def selected_suite_topologies(
         )
     else:
         composition = DENSE_COMPOSITION_TOPOLOGY
+    if not virtual_pipeline_supported:
+        composition = composition.model_copy(update={"vpp": 1})
     return [oracle_topology(is_moe=is_moe), composition]
 
 
@@ -2265,6 +2268,7 @@ def _suite_variants(
     *,
     is_moe: bool = True,
     cp_supported: bool = True,
+    virtual_pipeline_supported: bool = True,
     max_world_size: int | None = None,
     variant_flex_backend: FlexBackend | None = None,
     phase_pass_fns: dict[str, PhasePassFn] | None = None,
@@ -2275,6 +2279,7 @@ def _suite_variants(
     for topology in selected_suite_topologies(
         is_moe=is_moe,
         cp_supported=cp_supported,
+        virtual_pipeline_supported=virtual_pipeline_supported,
     )[1:]:
         if max_world_size is not None and topology.world_size() > max_world_size:
             continue
@@ -2333,6 +2338,7 @@ def _run_paired_objective_suite(
     oracle_flex_backend: FlexBackend | None,
     variant_flex_backend: FlexBackend | None,
     cp_supported: bool,
+    virtual_pipeline_supported: bool = True,
     phase_pass_fns: dict[str, PhasePassFn] | None,
     use_fp32_lora_reference: bool,
     require_existing_references: bool = False,
@@ -2360,6 +2366,7 @@ def _run_paired_objective_suite(
             objective,
             is_moe=case_config.is_moe,
             cp_supported=cp_supported,
+            virtual_pipeline_supported=virtual_pipeline_supported,
             max_world_size=max_world_size,
             variant_flex_backend=variant_flex_backend,
             phase_pass_fns=phase_pass_fns,
@@ -2406,6 +2413,7 @@ def run_suite(
     oracle_flex_backend: FlexBackend | None = None,
     variant_flex_backend: FlexBackend | None = None,
     cp_supported: bool = True,
+    virtual_pipeline_supported: bool = True,
     phase_pass_fns: dict[str, PhasePassFn] | None = None,
     use_fp32_lora_reference: bool = True,
     require_existing_references: bool = False,
@@ -2422,6 +2430,7 @@ def run_suite(
             oracle_flex_backend=oracle_flex_backend,
             variant_flex_backend=variant_flex_backend,
             cp_supported=cp_supported,
+            virtual_pipeline_supported=virtual_pipeline_supported,
             phase_pass_fns=phase_pass_fns,
             use_fp32_lora_reference=use_fp32_lora_reference,
             require_existing_references=require_existing_references,
@@ -2448,6 +2457,7 @@ def run_suite(
                         objective,
                         is_moe=case_config.is_moe,
                         cp_supported=cp_supported,
+                        virtual_pipeline_supported=virtual_pipeline_supported,
                         max_world_size=max_world_size,
                         variant_flex_backend=variant_flex_backend,
                         phase_pass_fns=phase_pass_fns,

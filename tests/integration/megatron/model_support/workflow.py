@@ -668,6 +668,7 @@ def run_correctness_sensitivity_stage(
     )
     handler = get_model_support_handler_for_spec(spec)
     cp_supported = bool(handler.cp_supported)
+    virtual_pipeline_supported = bool(handler.virtual_pipeline_supported)
     correctness_precision = handler.correctness_precision()
     correctness_use_fp32_lora_reference = handler.correctness_use_fp32_lora_reference()
     correctness_phase_pass_fns = handler.correctness_phase_pass_fns(oracle_harness)
@@ -675,6 +676,7 @@ def run_correctness_sensitivity_stage(
         oracle_harness.selected_suite_topologies(
             is_moe=handler.is_moe,
             cp_supported=cp_supported,
+            virtual_pipeline_supported=virtual_pipeline_supported,
         )
     )
     objectives = list(oracle_harness.SUPPORTED_ORACLE_OBJECTIVES)
@@ -801,6 +803,7 @@ def run_correctness_sensitivity_stage(
                     case_config=case_config,
                     max_world_size=max_world_size,
                     cp_supported=cp_supported,
+                    virtual_pipeline_supported=virtual_pipeline_supported,
                     phase_pass_fns=correctness_phase_pass_fns,
                     use_fp32_lora_reference=correctness_use_fp32_lora_reference,
                     require_existing_references=phase == "variants",
@@ -849,6 +852,7 @@ def run_correctness_sensitivity_stage(
             "use_fp32_lora_reference": correctness_use_fp32_lora_reference,
             "is_moe": handler.is_moe,
             "cp_supported": cp_supported,
+            "virtual_pipeline_supported": virtual_pipeline_supported,
             "allow_unvalidated_arch": allow_unvalidated_arch,
             "objectives": objectives,
             "sensitivity_mutations": mutations,

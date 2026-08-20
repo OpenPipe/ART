@@ -34,6 +34,7 @@ from art.megatron.recurrent.contract import (
 
 _NANO_PATTERN = "MEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEMEM*EMEMEMEME"
 _NANO_MIN_PATTERN = _NANO_PATTERN[:13]
+_NANO_COMPACT_PATTERN = _NANO_PATTERN[:14]
 _MOE_FFN_ALIGNMENT = 128
 _LOGICAL_MOE_FFN_ATTR = "art_nemotron_h_logical_moe_ffn_hidden_size"
 _CONVOLUTION_WIDTH = 4
@@ -213,10 +214,10 @@ def _main_pattern(provider: Any) -> str:
     if "/" in raw:
         raise RuntimeError("ART Nemotron-H training does not support MTP patterns")
     pattern = raw.replace("|", "")
-    if pattern not in {_NANO_MIN_PATTERN, _NANO_PATTERN}:
+    if pattern not in {_NANO_MIN_PATTERN, _NANO_COMPACT_PATTERN, _NANO_PATTERN}:
         raise RuntimeError(
-            "Nemotron-H requires the production hybrid pattern or its complete "
-            f"13-layer validation prefix; got {pattern!r}"
+            "Nemotron-H requires the production hybrid pattern or an exact "
+            f"13/14-layer validation prefix; got {pattern!r}"
         )
     if int(getattr(provider, "num_layers", 0) or 0) != len(pattern):
         raise RuntimeError(
@@ -271,8 +272,15 @@ def _profile_for_provider(provider: Any) -> tuple[str, dict[str, int]]:
         )
         raise RuntimeError(f"Unsupported Nemotron-H {profile_name} geometry: {details}")
     pattern = _main_pattern(provider)
-    if profile_name == "compact" and pattern != _NANO_MIN_PATTERN:
-        raise RuntimeError("Compact Nemotron-H requires the exact 13-layer pattern")
+    allowed_patterns = (
+        {_NANO_MIN_PATTERN, _NANO_PATTERN}
+        if profile_name == "production"
+        else {_NANO_MIN_PATTERN, _NANO_COMPACT_PATTERN}
+    )
+    if pattern not in allowed_patterns:
+        raise RuntimeError(
+            f"Unsupported Nemotron-H {profile_name} provider pattern {pattern!r}"
+        )
     return profile_name, expected
 
 
@@ -440,7 +448,7 @@ def _profile_for_hf_config(config: Any | None) -> tuple[str, dict[str, int]]:
     allowed_patterns = (
         {(_NANO_PATTERN, len(_NANO_PATTERN)), (_NANO_MIN_PATTERN, 13)}
         if profile_name == "production"
-        else {(_NANO_MIN_PATTERN, 13)}
+        else {(_NANO_MIN_PATTERN, 13), (_NANO_COMPACT_PATTERN, 14)}
     )
     if (pattern, depth) not in allowed_patterns:
         raise RuntimeError(
@@ -1259,7 +1267,24 @@ class NemotronHMoeHandler(DefaultMoeHandler):
     key = "nemotron_h_moe"
     is_moe = True
     cp_supported = True
+    virtual_pipeline_supported = False
     native_vllm_lora_status = "wip"
+
+    def configure_oracle_provider(self, provider: Any, *, case_config: Any) -> None:
+        """Select an existing compact checkpoint prefix for validation only."""
+        depth = int(case_config.num_layers)
+        source = getattr(provider, "hybrid_layer_pattern", None)
+        target = _NANO_PATTERN[:depth]
+        if (
+            depth not in {13, 14}
+            or source not in {_NANO_MIN_PATTERN, _NANO_COMPACT_PATTERN}
+            or len(source) < depth
+        ):
+            raise RuntimeError(
+                "Nemotron-H oracle requires a checkpoint-backed 13/14-layer "
+                f"compact prefix; source={source!r}, requested={depth}"
+            )
+        provider.hybrid_layer_pattern = target
 
     def identity_lora_model_config(self, base_config: Any) -> Any:
         return base_config

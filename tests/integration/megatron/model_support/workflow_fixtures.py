@@ -17,7 +17,7 @@ FIXTURE_PATH_ENV = "ART_MODEL_SUPPORT_FIXTURE_PATH"
 FIXTURE_CACHE_ENV = "ART_MODEL_SUPPORT_FIXTURE_CACHE"
 FIXTURE_ROOT_ENV = "ART_MODEL_SUPPORT_FIXTURE_ROOT"
 FIXTURE_VERSION = 18
-_MODEL_FIXTURE_VERSION_OFFSETS = {"nemotron_h_moe": 1}
+_MODEL_FIXTURE_VERSION_OFFSETS = {"nemotron_h_moe": 2}
 _CANONICAL_CACHE_VERSION = 16
 _ROOT = Path("/tmp/art-models/main-merge-oracle")
 _CACHE_ROOT = Path("/tmp/art-model-support-workflow/hf-cache")
@@ -445,11 +445,11 @@ def _configure(
         text.hybrid_override_pattern = _truncate_hybrid_override_pattern(
             text.hybrid_override_pattern,
             source_depth=int(text.num_hidden_layers),
-            target_depth=13,
+            target_depth=14,
             model_key=model_key,
         )
         compact = _set(
-            _common(config, layers=13, hidden=256, **common),
+            _common(config, layers=14, hidden=256, **common),
             intermediate_size=256,
             moe_intermediate_size=256,
             moe_shared_expert_intermediate_size=512,

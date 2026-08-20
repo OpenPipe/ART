@@ -46,6 +46,7 @@ class DefaultDenseHandler:
     key = "default_dense"
     is_moe = False
     cp_supported = True
+    virtual_pipeline_supported = True
     native_vllm_lora_status = "disabled"
 
     def identity_lora_model_config(self, base_config: Any) -> Any:

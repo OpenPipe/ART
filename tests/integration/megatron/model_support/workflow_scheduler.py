@@ -333,6 +333,7 @@ def _stage_gpu_count(
             for topology in selected_suite_topologies(
                 is_moe=handler.is_moe,
                 cp_supported=bool(handler.cp_supported),
+                virtual_pipeline_supported=bool(handler.virtual_pipeline_supported),
             )
         )
     resources = getattr(
@@ -472,6 +473,7 @@ def _stage_runtime_topology(
             selected_suite_topologies(
                 is_moe=handler.is_moe,
                 cp_supported=bool(handler.cp_supported),
+                virtual_pipeline_supported=bool(handler.virtual_pipeline_supported),
             )
         )
         if stage_name == CORRECTNESS_REFERENCE_STAGE:
