@@ -346,12 +346,67 @@ def _train_kwargs() -> dict[str, Any]:
     }
 
 
-async def _prepare(backend, model, groups, *, parent: int = 3):
-    return await backend.prepare_pipeline_batch(
+async def _prepare_context(
+    backend, model, groups, *, parent: int = 3, train_kwargs=None
+):
+    return await backend.prepare_pipeline_commands(
         model,
         groups,
-        train_kwargs=_train_kwargs(),
+        train_kwargs=(train_kwargs if train_kwargs is not None else _train_kwargs()),
         learner_parent_version=parent,
+    )
+
+
+async def _admit_forward(context):
+    request = context.forward_request.model_copy(
+        update={"sequence_id": context.client.next_sequence_id}
+    )
+    return await context.client.forward_backward(request)
+
+
+async def _admit_commands(context, forward):
+    optimizer = sampler = None
+    try:
+        optimizer = await context.client.optim_step(
+            context.optimizer_request(context.client.next_sequence_id)
+        )
+        step = optimizer.ref.reserved_output_learner_version
+        if step is None:
+            raise RuntimeError("optimizer did not reserve a learner version")
+        sampler = await context.client.save_weights_for_sampler(
+            await context.sampler_request(step, context.client.next_sequence_id)
+        )
+        state_request = context.state_request(step, context.client.next_sequence_id)
+        state = (
+            await context.client.save_state(state_request)
+            if state_request is not None
+            else None
+        )
+        await context.commands_admitted(
+            forward=forward,
+            optimizer=optimizer,
+            sampler=sampler,
+            state=state,
+        )
+    except BaseException:
+        await context.abort(
+            forward,
+            optimizer,
+            sampler,
+            optimizer_admitted=optimizer is not None,
+        )
+        raise
+    return step, optimizer
+
+
+def _complete_commands(context, forward, optimizer, step):
+    return asyncio.create_task(
+        context.complete(
+            step=step,
+            forward=forward,
+            optimizer=optimizer,
+            forward_submit_s=0.0,
+        )
     )
 
 
@@ -436,21 +491,44 @@ def _summary(queue: _Queue) -> tuple[TrajectoryGroup, TrajectoryGroupRef]:
     return group, ref
 
 
-async def _stage_and_prepare(backend, model, queue, summary, ref, *, parent=3):
-    del queue, ref
-    return await _prepare(backend, model, [summary], parent=parent)
+def _distributed_group() -> tuple[_Queue, TrajectoryGroup]:
+    queue = _Queue(_full_group())
+    group, _ = _summary(queue)
+    return queue, group
+
+
+async def _start_commands(backend, model, *, parent=3, train_kwargs=None):
+    queue, group = _distributed_group()
+    context = await _prepare_context(
+        backend,
+        model,
+        [group],
+        parent=parent,
+        train_kwargs=train_kwargs,
+    )
+    forward = await _admit_forward(context)
+    step, optimizer = await _admit_commands(context, forward)
+    return SimpleNamespace(
+        queue=queue,
+        context=context,
+        forward=forward,
+        optimizer=optimizer,
+        step=step,
+        completion=_complete_commands(context, forward, optimizer, step),
+    )
 
 
 @pytest.mark.asyncio
-async def test_bundle_failure_keeps_selection_owned_by_group() -> None:
+async def test_bundle_failure_releases_marked_selection_once() -> None:
     backend, model, _, _ = _backend()
     queue = _Queue(_full_group(), fail_materialize=True)
     summary, _ = _summary(queue)
     with pytest.raises(RuntimeError, match="materialization failed"):
-        await _prepare(backend, model, [summary])
-    assert summary._distributed_lease is not None
-    assert queue.marked == []
-    assert queue.released == []
+        await _prepare_context(backend, model, [summary])
+    selections, generation_id = queue.marked[0]
+    assert summary._distributed_lease is None
+    assert len(selections) == 1
+    assert queue.released == [(selections, "discarded", generation_id)]
 
 
 def _forward_result(operation_id: str) -> ForwardBackwardResult:
@@ -625,86 +703,84 @@ async def test_remote_prepare_materializes_distributed_group_and_discards_once()
 ):
     backend, model, client, _ = _backend()
     queue = _Queue(_full_group())
-    summary, ref = _summary(queue)
+    summary, _ = _summary(queue)
     summary._collect_packing_shape = True
 
-    metrics = await _stage_and_prepare(backend, model, queue, summary, ref)
-    prepared = summary._prepared_training_batch
+    context = await _prepare_context(backend, model, [summary])
+    forward = await _admit_forward(context)
     encoded = prepare_training_batch(client.batch)
     group_ref = encoded.remote.groups[0]
-    payload = encoded.objects[0].payload
+    payload = b"".join(encoded.objects[0].wire_chunks())
     decoded = decode_trajectory_group(group_ref, payload, route_payloads={})
-    replay_payload = encode_trajectory_group(decoded.bundle).data.payload
+    replay_payload = b"".join(
+        encode_trajectory_group(decoded.bundle).data.wire_chunks()
+    )
     rebuilt = group_ref.annotations.apply(decoded.bundle.payload().build())
 
-    assert metrics["time/step_prepare_remote_batch_s"] >= 0
+    assert context.preparation_metrics["time/step_prepare_remote_batch_s"] >= 0
     assert len(rebuilt.trajectories[0].messages_and_choices) == 2
     assert rebuilt.trajectories[0].messages_and_choices[-1].logprobs is not None
     assert client.collect_packing_shapes
     assert replay_payload == payload
     assert summary._distributed_lease is None
-    assert queue.marked == [((prepared.selections[0],), prepared.generation_id)]
+    assert queue.marked == [(context.selections, context.generation_id)]
 
-    await backend.discard_pipeline_batch([summary])
-    assert summary._prepared_training_batch is None
-    assert prepared.forward.cancelled
-    assert queue.released == [
-        ((prepared.selections[0],), "discarded", prepared.generation_id)
-    ]
+    await context.abort(forward, None, None, optimizer_admitted=False)
+    assert forward.cancelled
+    assert queue.released == [(context.selections, "discarded", context.generation_id)]
 
 
 @pytest.mark.asyncio
 async def test_remote_optimizer_admission_failure_discards_prepared_batch() -> None:
-    backend, model, client, _ = _backend(fail_optimizer=True)
+    backend, model, _, _ = _backend(fail_optimizer=True)
     queue = _Queue(_full_group())
-    summary, ref = _summary(queue)
+    summary, _ = _summary(queue)
 
-    await _stage_and_prepare(backend, model, queue, summary, ref)
-    prepared = summary._prepared_training_batch
+    context = await _prepare_context(backend, model, [summary])
+    forward = await _admit_forward(context)
     with pytest.raises(RuntimeError, match="optimizer admission failed"):
-        await backend.start_pipeline_train(model, [summary], **_train_kwargs())
+        await _admit_commands(context, forward)
 
-    assert summary._prepared_training_batch is None
-    assert prepared.forward.cancelled
-    assert queue.released == [
-        ((prepared.selections[0],), "discarded", prepared.generation_id)
-    ]
+    assert forward.cancelled
+    assert queue.released == [(context.selections, "discarded", context.generation_id)]
 
 
 @pytest.mark.asyncio
-async def test_remote_prepared_upload_consumes_marked_selection_once() -> None:
+async def test_admitted_commands_consume_marked_selection_once() -> None:
     backend, model, _, _ = _backend()
     queue = _Queue(_full_group())
-    summary, ref = _summary(queue)
+    summary, _ = _summary(queue)
 
-    await _stage_and_prepare(backend, model, queue, summary, ref)
-    prepared = summary._prepared_training_batch
-    await backend._release_remote_pipeline_batch(prepared, disposition="consumed")
+    context = await _prepare_context(backend, model, [summary])
+    forward = await _admit_forward(context)
+    await _admit_commands(context, forward)
+    await backend._drain_background()
 
-    assert queue.released == [
-        ((prepared.selections[0],), "consumed", prepared.generation_id)
-    ]
+    assert queue.released == [(context.selections, "consumed", context.generation_id)]
 
 
 @pytest.mark.asyncio
 async def test_next_forward_is_admitted_before_prior_forward_completes() -> None:
     backend, model, client, _ = _backend()
-    first_queue = _Queue(_full_group())
-    first, first_ref = _summary(first_queue)
-    await _stage_and_prepare(backend, model, first_queue, first, first_ref)
+    _, first = _distributed_group()
+    first_context = await _prepare_context(backend, model, [first])
+    first_forward = await _admit_forward(first_context)
 
-    pending = await backend.start_pipeline_train(model, [first], **_train_kwargs())
-    assert pending.step == 4
+    first_step, first_optimizer = await _admit_commands(first_context, first_forward)
+    completion = _complete_commands(
+        first_context, first_forward, first_optimizer, first_step
+    )
+    assert first_step == 4
     assert [operation.ref.kind for operation in client.operations] == [
         "forward_backward",
         "optim_step",
         "save_sampler",
     ]
-    assert not pending.completion.done()
+    assert not completion.done()
 
-    second_queue = _Queue(_full_group())
-    second, second_ref = _summary(second_queue)
-    await _stage_and_prepare(backend, model, second_queue, second, second_ref, parent=4)
+    _, second = _distributed_group()
+    second_context = await _prepare_context(backend, model, [second], parent=4)
+    second_forward = await _admit_forward(second_context)
     assert [operation.ref.sequence_id for operation in client.operations] == [
         0,
         1,
@@ -714,13 +790,14 @@ async def test_next_forward_is_admitted_before_prior_forward_completes() -> None
     assert client.operations[-1].ref.kind == "forward_backward"
     assert client.operations[-1].ref.learner_parent_version == 4
 
-    client.operations[0].result_future.set_result(
-        _forward_result(client.operations[0].ref.operation_id)
+    first_forward.result_future.set_result(
+        _forward_result(first_forward.ref.operation_id)
     )
-    result = await pending.result()
+    result = await completion
     assert result.step == 4
     assert result.packed_policy_token_counts == ((3, 1),)
-    await backend.discard_pipeline_batch([second])
+    await second_context.abort(second_forward, None, None, optimizer_admitted=False)
+    await backend._drain_background()
 
 
 @pytest.mark.asyncio
@@ -740,19 +817,20 @@ async def test_remote_optimizer_state_save_policy(
     backend, model, client, _ = _backend()
     client.projected_learner_version = parent
     queue = _Queue(_full_group())
-    group, ref = _summary(queue)
+    group, _ = _summary(queue)
 
-    await _stage_and_prepare(backend, model, queue, group, ref, parent=parent)
     kwargs = _train_kwargs()
     kwargs["final_training_step"] = final_step
     kwargs["save_checkpoint"] = save_checkpoint
-    pending = await backend.start_pipeline_train(model, [group], **kwargs)
+    context = await _prepare_context(
+        backend, model, [group], parent=parent, train_kwargs=kwargs
+    )
+    forward = await _admit_forward(context)
+    step, optimizer = await _admit_commands(context, forward)
 
     assert (client.operations[-1].ref.kind == "save_state") is expected
-    client.operations[0].result_future.set_result(
-        _forward_result(client.operations[0].ref.operation_id)
-    )
-    await pending.result()
+    forward.result_future.set_result(_forward_result(forward.ref.operation_id))
+    await _complete_commands(context, forward, optimizer, step)
     await backend._drain_background()
 
 
@@ -777,19 +855,19 @@ async def test_group_discard_skips_backend_after_selection_ownership_transfer() 
 
 @pytest.mark.asyncio
 async def test_committed_train_does_not_wait_for_batch_release() -> None:
-    backend, model, client, sampler = _backend()
+    backend, model, _, sampler = _backend()
     queue = _Queue(_full_group())
     queue.release_gate = asyncio.Event()
-    group, ref = _summary(queue)
+    group, _ = _summary(queue)
 
-    await _stage_and_prepare(backend, model, queue, group, ref)
-    pending = await backend.start_pipeline_train(model, [group], **_train_kwargs())
-    client.operations[0].result_future.set_result(
-        _forward_result(client.operations[0].ref.operation_id)
-    )
+    context = await _prepare_context(backend, model, [group])
+    forward = await _admit_forward(context)
+    step, optimizer = await _admit_commands(context, forward)
+    completion = _complete_commands(context, forward, optimizer, step)
+    forward.result_future.set_result(_forward_result(forward.ref.operation_id))
 
     await asyncio.wait_for(sampler.published.wait(), timeout=1)
-    assert (await asyncio.wait_for(pending.result(), timeout=1)).step == 4
+    assert (await asyncio.wait_for(completion, timeout=1)).step == 4
     assert queue.released == []
 
     queue.release_gate.set()
@@ -803,13 +881,17 @@ async def test_train_and_next_optimizer_do_not_wait_for_sampler_publication() ->
     client.gate_sampler = True
     sampler.active_gate = asyncio.Event()
 
-    first = await backend.start_pipeline_train(
-        model, [_full_group()], **_train_kwargs()
+    _, first_group = _distributed_group()
+    first_context = await _prepare_context(backend, model, [first_group])
+    first_forward = await _admit_forward(first_context)
+    first_step, first_optimizer = await _admit_commands(first_context, first_forward)
+    first_completion = _complete_commands(
+        first_context, first_forward, first_optimizer, first_step
     )
-    client.operations[0].result_future.set_result(
-        _forward_result(client.operations[0].ref.operation_id)
+    first_forward.result_future.set_result(
+        _forward_result(first_forward.ref.operation_id)
     )
-    first_result = await asyncio.wait_for(first.result(), timeout=1)
+    first_result = await asyncio.wait_for(first_completion, timeout=1)
 
     assert first_result.step == 4
     assert first_result.checkpoint_id is None
@@ -818,16 +900,24 @@ async def test_train_and_next_optimizer_do_not_wait_for_sampler_publication() ->
     assert not first_ready.done()
     assert "publication/materialization" not in first_result.metrics
 
-    second = await backend.start_pipeline_train(
-        model, [_full_group()], **_train_kwargs()
+    _, second_group = _distributed_group()
+    second_context = await _prepare_context(
+        backend, model, [second_group], parent=first_step
+    )
+    second_forward = await _admit_forward(second_context)
+    second_step, second_optimizer = await _admit_commands(
+        second_context, second_forward
     )
     assert [operation.ref.kind for operation in client.operations].count(
         "optim_step"
     ) == 2
-    client.operations[3].result_future.set_result(
-        _forward_result(client.operations[3].ref.operation_id)
+    second_completion = _complete_commands(
+        second_context, second_forward, second_optimizer, second_step
     )
-    second_result = await asyncio.wait_for(second.result(), timeout=1)
+    second_forward.result_future.set_result(
+        _forward_result(second_forward.ref.operation_id)
+    )
+    second_result = await asyncio.wait_for(second_completion, timeout=1)
 
     client.complete_sampler(0)
     await asyncio.wait_for(sampler.active_started.wait(), timeout=1)
@@ -870,12 +960,12 @@ async def test_public_train_waits_for_sampler_checkpoint_and_active_alias() -> N
     training = asyncio.create_task(
         backend.train(model, [_full_group()], **_train_kwargs())
     )
-    async with asyncio.timeout(1):
-        while len(client.operations) < 3:
-            await asyncio.sleep(0)
-    client.operations[0].result_future.set_result(
-        _forward_result(client.operations[0].ref.operation_id)
-    )
+    await _wait_for_operations(client, 1)
+    forward = client.operations[0]
+    assert forward.preparation_future is not None
+    forward.preparation_future.set_result("contributes")
+    await _wait_for_operations(client, 3)
+    forward.result_future.set_result(_forward_result(forward.ref.operation_id))
     await asyncio.sleep(0)
     assert not training.done()
 
@@ -899,20 +989,30 @@ async def test_active_sampler_publications_follow_learner_order() -> None:
     client.gate_sampler = True
     sampler.active_gate = asyncio.Event()
 
-    first = await backend.start_pipeline_train(
-        model, [_full_group()], **_train_kwargs()
+    _, first_group = _distributed_group()
+    first_context = await _prepare_context(backend, model, [first_group])
+    first_forward = await _admit_forward(first_context)
+    first_step, first_optimizer = await _admit_commands(first_context, first_forward)
+    first_forward.result_future.set_result(
+        _forward_result(first_forward.ref.operation_id)
     )
-    client.operations[0].result_future.set_result(
-        _forward_result(client.operations[0].ref.operation_id)
+    first_result = await _complete_commands(
+        first_context, first_forward, first_optimizer, first_step
     )
-    first_result = await first.result()
-    second = await backend.start_pipeline_train(
-        model, [_full_group()], **_train_kwargs()
+    _, second_group = _distributed_group()
+    second_context = await _prepare_context(
+        backend, model, [second_group], parent=first_step
     )
-    client.operations[3].result_future.set_result(
-        _forward_result(client.operations[3].ref.operation_id)
+    second_forward = await _admit_forward(second_context)
+    second_step, second_optimizer = await _admit_commands(
+        second_context, second_forward
     )
-    second_result = await second.result()
+    second_forward.result_future.set_result(
+        _forward_result(second_forward.ref.operation_id)
+    )
+    second_result = await _complete_commands(
+        second_context, second_forward, second_optimizer, second_step
+    )
 
     second_pending = backend._pending_sampler_publications[
         backend._sampler_key(model, second_result.step)
@@ -946,7 +1046,7 @@ async def test_active_sampler_publications_follow_learner_order() -> None:
 
 @pytest.mark.asyncio
 async def test_retention_apply_does_not_block_or_forget_new_publication() -> None:
-    backend, model, client, _ = _backend()
+    backend, model, _, _ = _backend()
     service = _RetentionService(_checkpoint(3))
     backend._service = service
     await _materialize_sampler_result(backend, model, 3)
@@ -958,14 +1058,9 @@ async def test_retention_apply_does_not_block_or_forget_new_publication() -> Non
     )
     await asyncio.wait_for(service.apply_started.wait(), timeout=1)
 
-    pending = await asyncio.wait_for(
-        backend.start_pipeline_train(model, [_full_group()], **_train_kwargs()),
-        timeout=1,
-    )
-    client.operations[0].result_future.set_result(
-        _forward_result(client.operations[0].ref.operation_id)
-    )
-    result = await asyncio.wait_for(pending.result(), timeout=1)
+    run = await asyncio.wait_for(_start_commands(backend, model), timeout=1)
+    run.forward.result_future.set_result(_forward_result(run.forward.ref.operation_id))
+    result = await asyncio.wait_for(run.completion, timeout=1)
     assert result.checkpoint_ready is not None
     await asyncio.wait_for(result.checkpoint_ready, timeout=1)
 
@@ -982,13 +1077,9 @@ async def test_pending_materialization_is_atomic_with_retention_reservation() ->
     client.gate_sampler = True
     service = _RetentionService(_checkpoint(4))
     backend._service = service
-    pending = await backend.start_pipeline_train(
-        model, [_full_group()], **_train_kwargs()
-    )
-    client.operations[0].result_future.set_result(
-        _forward_result(client.operations[0].ref.operation_id)
-    )
-    result = await asyncio.wait_for(pending.result(), timeout=1)
+    run = await _start_commands(backend, model)
+    run.forward.result_future.set_result(_forward_result(run.forward.ref.operation_id))
+    result = await asyncio.wait_for(run.completion, timeout=1)
 
     reserve_started = asyncio.Event()
     reserve_gate = asyncio.Event()
@@ -1029,13 +1120,9 @@ async def test_exact_eval_waits_for_its_pending_sampler_then_publishes_version()
     backend, model, client, sampler = _backend()
     client.gate_sampler = True
     sampler.active_gate = asyncio.Event()
-    pending = await backend.start_pipeline_train(
-        model, [_full_group()], **_train_kwargs()
-    )
-    client.operations[0].result_future.set_result(
-        _forward_result(client.operations[0].ref.operation_id)
-    )
-    result = await pending.result()
+    run = await _start_commands(backend, model)
+    run.forward.result_future.set_result(_forward_result(run.forward.ref.operation_id))
+    result = await run.completion
     entered = asyncio.Event()
     leave = asyncio.Event()
 
@@ -1072,16 +1159,12 @@ async def test_exact_eval_waits_for_its_pending_sampler_then_publishes_version()
 async def test_publication_failure_does_not_relabel_committed_train(
     boundary: str,
 ) -> None:
-    backend, model, client, sampler = _backend()
+    backend, model, _, sampler = _backend()
     sampler.fail_active = True
-    pending = await backend.start_pipeline_train(
-        model, [_full_group()], **_train_kwargs()
-    )
-    client.operations[0].result_future.set_result(
-        _forward_result(client.operations[0].ref.operation_id)
-    )
+    run = await _start_commands(backend, model)
+    run.forward.result_future.set_result(_forward_result(run.forward.ref.operation_id))
 
-    result = await asyncio.wait_for(pending.result(), timeout=1)
+    result = await asyncio.wait_for(run.completion, timeout=1)
     assert result.step == 4
     assert result.packed_policy_token_counts == ((3, 1),)
     assert result.checkpoint_ready is not None
@@ -1093,9 +1176,7 @@ async def test_publication_failure_does_not_relabel_committed_train(
 
     with pytest.raises(BaseExceptionGroup, match="remote background operations failed"):
         if boundary == "next_train":
-            await backend.start_pipeline_train(
-                model, [_full_group()], **_train_kwargs()
-            )
+            await _start_commands(backend, model, parent=result.step)
         else:
             await backend.finalize_training_session(model)
 
@@ -1106,13 +1187,9 @@ async def test_close_drains_sampler_materialization_and_activation() -> None:
     backend._close_timeout_s = 1.0
     client.gate_sampler = True
     sampler.active_gate = asyncio.Event()
-    pending = await backend.start_pipeline_train(
-        model, [_full_group()], **_train_kwargs()
-    )
-    client.operations[0].result_future.set_result(
-        _forward_result(client.operations[0].ref.operation_id)
-    )
-    result = await pending.result()
+    run = await _start_commands(backend, model)
+    run.forward.result_future.set_result(_forward_result(run.forward.ref.operation_id))
+    result = await run.completion
 
     close = asyncio.create_task(backend.close())
     await asyncio.sleep(0)
@@ -1138,13 +1215,9 @@ async def test_close_bounds_stuck_sampler_publication() -> None:
     backend, model, client, _ = _backend()
     backend._close_timeout_s = 0.02
     client.gate_sampler = True
-    pending = await backend.start_pipeline_train(
-        model, [_full_group()], **_train_kwargs()
-    )
-    client.operations[0].result_future.set_result(
-        _forward_result(client.operations[0].ref.operation_id)
-    )
-    result = await pending.result()
+    run = await _start_commands(backend, model)
+    run.forward.result_future.set_result(_forward_result(run.forward.ref.operation_id))
+    result = await run.completion
 
     started = time.monotonic()
     with pytest.raises(BaseExceptionGroup, match="ServerlessBackend shutdown failed"):
