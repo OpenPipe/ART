@@ -105,12 +105,14 @@ def test_cache_reuses_structure_and_freezes_generation_metadata(
     for _ in range(50):
         assert trainer.checkpoint_slot_residency_tensors("run") is residency
         assert trainer.checkpoint_slot_optimizer_residency_source("run") is not None
-    assert calls["state_dict"] == layout_calls["run"] == 1
+    assert calls["state_dict"] == 0
+    assert layout_calls["run"] == 1
     snapshot = trainer.checkpoint_slot_optimizer_snapshot_sources("run")
     assert snapshot is not None
     assert isinstance(snapshot["layout"], dict)
     assert isinstance(cast(dict[str, Any], snapshot["optimizer"])["state"], dict)
-    assert calls["state_dict"] == layout_calls["run"] == 1
+    assert calls["state_dict"] == 0
+    assert layout_calls["run"] == 1
 
     optimizer.param_groups[0]["lr"] = 0.25
     optimizer.param_groups[0]["step"] = 7
@@ -122,7 +124,8 @@ def test_cache_reuses_structure_and_freezes_generation_metadata(
     assert second_group["lr"] == 0.25
     assert second_group["step"] == 7
     assert _optimizer_payload(first)["state"] is _optimizer_payload(second)["state"]
-    assert calls["state_dict"] == layout_calls["run"] == 1
+    assert calls["state_dict"] == 0
+    assert layout_calls["run"] == 1
     with pytest.raises(TypeError):
         cast(dict[str, Any], first.state["layout"])["parallel"] = ()
     with pytest.raises(TypeError):
@@ -168,7 +171,7 @@ def test_cache_is_exact_across_shapes_ranks_and_targets(
     assert small_source.state["layout"] == layouts["small"]
     assert wide_source.state["layout"] == layouts["wide"]
     assert small_source.state["layout"] != wide_source.state["layout"]
-    assert small_calls["state_dict"] == wide_calls["state_dict"] == 1
+    assert small_calls["state_dict"] == wide_calls["state_dict"] == 0
 
     replacement, _optimizer, replacement_calls = _slot(((3, 5), (3, 7)))
     trainer._checkpoint_slots["small"] = replacement
@@ -179,7 +182,7 @@ def test_cache_is_exact_across_shapes_ranks_and_targets(
     assert tuple(map(id, replacement_source.tensors)) != tuple(
         map(id, small_source.tensors)
     )
-    assert replacement_calls["state_dict"] == 1
+    assert replacement_calls["state_dict"] == 0
     assert layout_calls == {"small": 2, "wide": 1}
 
 
@@ -199,9 +202,11 @@ def test_cache_rebuilds_for_lazy_state_and_optimizer_replacement(
     initialized = trainer.checkpoint_slot_optimizer_residency_source("run")
     assert initialized is not None
     assert len(_optimizer_payload(initialized)["state"]) == 2
-    assert calls["state_dict"] == layout_calls["run"] == 2
+    assert calls["state_dict"] == 0
+    assert layout_calls["run"] == 2
     trainer.checkpoint_slot_optimizer_residency_source("run")
-    assert calls["state_dict"] == layout_calls["run"] == 2
+    assert calls["state_dict"] == 0
+    assert layout_calls["run"] == 2
 
     masters = tuple(torch.nn.Parameter(param.detach().clone()) for param in slot.params)
     prepared = PreparedTrainerRankOptimizerState(
@@ -236,7 +241,7 @@ def test_cache_rebuilds_for_lazy_state_and_optimizer_replacement(
     assert trainer.checkpoint_slot_optimizer_residency_source("run") is None
 
 
-def test_cache_rejects_detached_state_dict_tensors(
+def test_cache_bypasses_optimizer_specific_state_dict_materialization(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     slot, optimizer, _calls = _slot(((2, 2),))
@@ -246,21 +251,13 @@ def test_cache_rejects_detached_state_dict_tensors(
         {"run": _layout(((2, 2),), "q_proj", 2)},
     )
 
-    def clone(value: object) -> object:
-        if isinstance(value, torch.Tensor):
-            return value.clone()
-        if isinstance(value, dict):
-            return {key: clone(item) for key, item in value.items()}
-        if isinstance(value, list):
-            return [clone(item) for item in value]
-        if isinstance(value, tuple):
-            return tuple(clone(item) for item in value)
-        return value
-
-    optimizer.state_dict = lambda: cast(  # type: ignore[method-assign]
-        dict[str, Any], clone(torch.optim.Optimizer.state_dict(optimizer))
+    optimizer.state_dict = lambda: (_ for _ in ()).throw(  # type: ignore[method-assign]
+        RuntimeError("optimizer-specific state_dict must not run")
     )
-    with pytest.raises(
-        _impl.TrainerRankSlotStateError, match="preserve live tensor identity"
-    ):
-        trainer.checkpoint_slot_optimizer_residency_source("run")
+    source = trainer.checkpoint_slot_optimizer_residency_source("run")
+    assert source is not None
+    dynamic = cast(_DynamicOptimizer, slot.optimizer)
+    expected = _impl._unique_tensors(
+        (*dynamic.master_params, *_impl._nested_tensors(optimizer.state))
+    )
+    assert tuple(map(id, source.tensors)) == tuple(map(id, expected))

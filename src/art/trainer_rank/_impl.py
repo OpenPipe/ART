@@ -1699,7 +1699,10 @@ class TrainerRank:
                 "Optimizer residency parameter order differs from its master tensors."
             )
 
-        packed = optimizer.state_dict()
+        # Residency moves the optimizer's live tensors. Optimizer overrides such as
+        # TE FusedAdam.state_dict() materialize unscaled copies and cannot describe
+        # that live working set.
+        packed = torch.optim.Optimizer.state_dict(optimizer)
         packed_state = packed.get("state")
         packed_groups = packed.get("param_groups")
         if not isinstance(packed_state, Mapping) or not isinstance(
