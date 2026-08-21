@@ -2716,7 +2716,17 @@ class _GenerationPublisher:
         self._residency.register_l2(
             sampler_key, tuple(source.tensors[name] for name in names)
         )
-        return source.model_copy(update={"tensors": {}})
+        try:
+            return source.model_copy(update={"tensors": {}})
+        except BaseException as error:
+            try:
+                self._residency.retire(sampler_key)
+            except BaseException as cleanup:
+                raise BaseExceptionGroup(
+                    "sampler source finalization and residency cleanup failed",
+                    [error, cleanup],
+                ) from None
+            raise
 
     def ensure_generation(
         self,
