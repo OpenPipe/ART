@@ -378,6 +378,7 @@ class Qwen35MoeHandler(Qwen35BaseHandler):
                         source_lora="lora_A",
                         output_suffix="base_layer.lora_A.weight",
                         pack_layout="expert_rows",
+                        shared_outer_factor=True,
                     ),
                     ExpertPackedLoraSlot(
                         source_projection="gate_up_proj",
@@ -396,6 +397,7 @@ class Qwen35MoeHandler(Qwen35BaseHandler):
                         source_lora="lora_B",
                         output_suffix="lora_B.weight",
                         pack_layout="rank_major_expert_cols",
+                        shared_outer_factor=True,
                     ),
                 ),
             ),

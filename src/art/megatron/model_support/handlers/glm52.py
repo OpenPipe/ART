@@ -8,6 +8,7 @@ from art.megatron.model_support.handlers.default_dense import (
     DefaultMoeHandler,
     _compile_workaround_flags_for_provider,
 )
+from art.megatron.model_support.shared_outer import compact_shared_outer
 from art.megatron.model_support.spec import (
     CompileWorkaroundConfig,
     ExpertPackedLoraGroup,
@@ -472,6 +473,7 @@ class Glm52Handler(DefaultMoeHandler):
                         source_lora="lora_A",
                         output_suffix="base_layer.lora_A.weight",
                         pack_layout="expert_rows",
+                        shared_outer_factor=True,
                     ),
                     ExpertPackedLoraSlot(
                         source_projection="gate_up_proj",
@@ -490,6 +492,7 @@ class Glm52Handler(DefaultMoeHandler):
                         source_lora="lora_B",
                         output_suffix="lora_B.weight",
                         pack_layout="rank_major_expert_cols",
+                        shared_outer_factor=True,
                     ),
                 ),
             ),
@@ -501,7 +504,11 @@ class Glm52Handler(DefaultMoeHandler):
         *,
         adapter_config: dict[str, Any],
     ) -> dict[str, torch.Tensor]:
-        return _from_vllm_expert_lora(tensors, adapter_config)
+        return compact_shared_outer(
+            _from_vllm_expert_lora(tensors, adapter_config),
+            adapter_config=adapter_config,
+            groups=self.expert_packed_lora_groups(),
+        )
 
 
 GLM52_HANDLER = Glm52Handler()

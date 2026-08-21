@@ -13,6 +13,10 @@ from art.megatron.model_support.handlers.default_dense import (
     _compile_workaround_flags_for_provider,
     _require_moe_experts,
 )
+from art.megatron.model_support.shared_outer import (
+    compact_shared_outer,
+    expand_shared_outer,
+)
 from art.megatron.model_support.spec import (
     CompileWorkaroundConfig,
     ExpertPackedLoraGroup,
@@ -455,9 +459,13 @@ class Dsv4Handler(DefaultMoeHandler):
         *,
         adapter_config: dict[str, Any],
     ) -> dict[str, torch.Tensor]:
-        return _dsv4_from_vllm_lora_tensors(
-            tensors,
+        return compact_shared_outer(
+            _dsv4_from_vllm_lora_tensors(
+                tensors,
+                adapter_config=adapter_config,
+            ),
             adapter_config=adapter_config,
+            groups=self.expert_packed_lora_groups(),
         )
 
     def to_vllm_lora_tensors(
@@ -466,7 +474,14 @@ class Dsv4Handler(DefaultMoeHandler):
         *,
         adapter_config: dict[str, Any],
     ) -> tuple[dict[str, torch.Tensor], dict[str, Any]]:
-        return _dsv4_to_vllm_lora_tensors(tensors, adapter_config=adapter_config)
+        return _dsv4_to_vllm_lora_tensors(
+            expand_shared_outer(
+                tensors,
+                adapter_config=adapter_config,
+                groups=self.expert_packed_lora_groups(),
+            ),
+            adapter_config=adapter_config,
+        )
 
     def to_vllm_lora_config(self, adapter_config: dict[str, Any]) -> dict[str, Any]:
         """Translate ART training targets only for restrictive vLLM launches.
@@ -488,6 +503,7 @@ class Dsv4Handler(DefaultMoeHandler):
                         source_lora="lora_A",
                         output_suffix="base_layer.lora_A.weight",
                         pack_layout="expert_rows",
+                        shared_outer_factor=True,
                     ),
                     ExpertPackedLoraSlot(
                         source_projection="gate_up_proj",
@@ -506,6 +522,7 @@ class Dsv4Handler(DefaultMoeHandler):
                         source_lora="lora_B",
                         output_suffix="lora_B.weight",
                         pack_layout="rank_major_expert_cols",
+                        shared_outer_factor=True,
                     ),
                 ),
             ),

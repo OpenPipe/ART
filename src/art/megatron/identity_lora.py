@@ -7,7 +7,11 @@ import torch
 from art.dev.get_model_config import default_target_modules
 
 from .lora_config import LORA_ALPHA, default_lora_rank_for_handler
-from .model_support.lora_disk import normalize_lora_checkpoint_to_vllm
+from .model_support.lora_disk import (
+    load_vllm_lora_tensors,
+    save_vllm_lora_tensors,
+)
+from .model_support.shared_outer import canonicalize_identity_shared_outer
 from .model_support.spec import ModelSupportHandler
 
 
@@ -103,11 +107,15 @@ def create_identity_lora(
         bias="none",
     ).to_dict()
     final_config["moe_parameterization"] = moe_parameterization
-    normalize_lora_checkpoint_to_vllm(
-        lora_path,
-        handler=handler,
+    tensors = canonicalize_identity_shared_outer(
+        load_vllm_lora_tensors(lora_path),
         adapter_config=final_config,
+        groups=handler.expert_packed_lora_groups(),
     )
+    tensors, final_config = handler.to_vllm_lora_tensors(
+        tensors, adapter_config=final_config
+    )
+    save_vllm_lora_tensors(lora_path, tensors, final_config)
     del peft_model, model
     if torch.cuda.is_initialized():
         torch.cuda.synchronize()

@@ -54,6 +54,10 @@ from art.megatron.model_support.internal_padding import (
 from art.megatron.model_support.internal_padding import (
     zero_ranges as _zero_ranges,
 )
+from art.megatron.model_support.shared_outer import (
+    compact_shared_outer,
+    expand_shared_outer,
+)
 from art.megatron.model_support.spec import (
     CompileWorkaroundConfig,
     ExpertPackedLoraGroup,
@@ -730,7 +734,14 @@ class Gemma4MoeHandler(_Gemma4TokenizerMixin, DefaultMoeHandler):
         *,
         adapter_config: dict[str, Any],
     ) -> tuple[dict[str, torch.Tensor], dict[str, Any]]:
-        return _to_vllm_lora_tensors(tensors, adapter_config=adapter_config)
+        return _to_vllm_lora_tensors(
+            expand_shared_outer(
+                tensors,
+                adapter_config=adapter_config,
+                groups=self.expert_packed_lora_groups(),
+            ),
+            adapter_config=adapter_config,
+        )
 
     def from_vllm_lora_tensors(
         self,
@@ -738,7 +749,11 @@ class Gemma4MoeHandler(_Gemma4TokenizerMixin, DefaultMoeHandler):
         *,
         adapter_config: dict[str, Any],
     ) -> dict[str, torch.Tensor]:
-        return _from_vllm_lora_tensors(tensors, adapter_config=adapter_config)
+        return compact_shared_outer(
+            _from_vllm_lora_tensors(tensors, adapter_config=adapter_config),
+            adapter_config=adapter_config,
+            groups=self.expert_packed_lora_groups(),
+        )
 
     def expert_packed_lora_groups(self) -> tuple[ExpertPackedLoraGroup, ...]:
         return (
@@ -750,6 +765,7 @@ class Gemma4MoeHandler(_Gemma4TokenizerMixin, DefaultMoeHandler):
                         source_lora="lora_A",
                         output_suffix="base_layer.lora_A.weight",
                         pack_layout="expert_rows",
+                        shared_outer_factor=True,
                     ),
                     ExpertPackedLoraSlot(
                         source_projection="gate_up_proj",
@@ -768,6 +784,7 @@ class Gemma4MoeHandler(_Gemma4TokenizerMixin, DefaultMoeHandler):
                         source_lora="lora_B",
                         output_suffix="lora_B.weight",
                         pack_layout="rank_major_expert_cols",
+                        shared_outer_factor=True,
                     ),
                 ),
             ),

@@ -85,6 +85,7 @@ class ExpertPackedLoraSlot(BaseModel):
     source_lora: Literal["lora_A", "lora_B"]
     output_suffix: str
     pack_layout: ExpertPackedLoraLayout
+    shared_outer_factor: bool = False
 
 
 class ExpertPackedLoraGroup(BaseModel):

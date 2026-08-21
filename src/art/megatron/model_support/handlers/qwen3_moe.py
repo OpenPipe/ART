@@ -11,6 +11,10 @@ from art.megatron.model_support.handlers.qwen3_common import (
     install_qwen3_text_preprocess_patch,
     qwen3_forward_kwargs,
 )
+from art.megatron.model_support.shared_outer import (
+    compact_shared_outer,
+    expand_shared_outer,
+)
 from art.megatron.model_support.spec import (
     CompileWorkaroundConfig,
     ExpertPackedLoraGroup,
@@ -38,6 +42,10 @@ class Qwen3MoeHandler(DefaultMoeHandler):
                         source_lora=lora,
                         output_suffix=f"{projection}.{lora}.weight",
                         pack_layout="expert_rows",
+                        shared_outer_factor=(
+                            lora
+                            == ("lora_B" if projection == "down_proj" else "lora_A")
+                        ),
                     )
                     for projection in ("gate_proj", "up_proj", "down_proj")
                     for lora in ("lora_A", "lora_B")
@@ -51,7 +59,26 @@ class Qwen3MoeHandler(DefaultMoeHandler):
         *,
         adapter_config: dict[str, Any],
     ) -> tuple[dict[str, torch.Tensor], dict[str, Any]]:
-        return _to_vllm_lora_tensors(tensors, adapter_config=adapter_config)
+        return _to_vllm_lora_tensors(
+            expand_shared_outer(
+                tensors,
+                adapter_config=adapter_config,
+                groups=self.expert_packed_lora_groups(),
+            ),
+            adapter_config=adapter_config,
+        )
+
+    def from_vllm_lora_tensors(
+        self,
+        tensors: dict[str, torch.Tensor],
+        *,
+        adapter_config: dict[str, Any],
+    ) -> dict[str, torch.Tensor]:
+        return compact_shared_outer(
+            tensors,
+            adapter_config=adapter_config,
+            groups=self.expert_packed_lora_groups(),
+        )
 
     def to_vllm_lora_config(self, adapter_config: dict[str, Any]) -> dict[str, Any]:
         return _qwen3_moe_config(adapter_config)
