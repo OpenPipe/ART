@@ -6,6 +6,7 @@ from io import BytesIO
 import json
 from pathlib import Path
 from threading import Lock
+import time
 from typing import cast
 
 from botocore.exceptions import ClientError
@@ -20,6 +21,7 @@ from art.distributed.object_store import (
     S3BinaryObjectReceiver,
     S3BinaryObjectStore,
     S3ObjectStoreConfig,
+    ordered_binary_object_plan,
     vllm_lora_ordered_target,
 )
 from art.megatron.optimizer_state import (
@@ -313,6 +315,119 @@ def test_ordered_retry_reuses_the_exact_immutable_object() -> None:
         f"{target.store.prefix}/{target.object_id}/_COMMITTED.json",
     ]
     store.close()
+
+
+def test_pending_ordered_receive_overlaps_upload_and_resumes_shards(
+    tmp_path: Path,
+) -> None:
+    target, client = _target(), _S3()
+    publisher, receiver = _store(target, client), _store(target, client)
+    files = _source()
+    plan = ordered_binary_object_plan(
+        target,
+        tuple(
+            BinaryObjectFile(
+                relative_path=path, byte_count=sum(x.nbytes for x in chunks)
+            )
+            for path, chunks in sorted(files.items())
+        ),
+    )
+    ref = publisher.publish_ordered_plan(target, plan)
+    payload = {
+        path: b"".join(bytes(chunk) for chunk in chunks)
+        for path, chunks in files.items()
+    }
+    shards = {
+        shard.index: (
+            memoryview(payload[shard.relative_path])[
+                shard.file_offset : shard.file_offset + shard.byte_count
+            ],
+        )
+        for shard in plan.shards
+    }
+    destination = tmp_path / "receive"
+    with ThreadPoolExecutor(max_workers=1) as tasks:
+        pending = tasks.submit(
+            receiver.materialize_ordered_pending,
+            ref,
+            destination,
+            timeout_s=2.0,
+            poll_interval_s=0.001,
+            max_poll_interval_s=0.005,
+        )
+        deadline = time.monotonic() + 1
+        shard_prefix = f"{target.store.prefix}/{target.object_id}/shards/"
+        while not any(key.startswith(shard_prefix) for key in client.gets):
+            assert time.monotonic() < deadline
+            time.sleep(0.001)
+        first = publisher.upload_ordered_shards(target, plan, {0: shards[0]})
+        rest = publisher.upload_ordered_shards(
+            target, plan, {index: shards[index] for index in range(1, len(shards))}
+        )
+        assert not pending.done()
+        publisher.commit_ordered(target, plan, (*first, *rest))
+        assert pending.result(timeout=1) == destination
+    assert (destination / "adapter_config.json").read_bytes() == b"cfg"
+    assert (destination / "adapter_model.safetensors").read_bytes() == b"abcdefghij"
+    assert not (destination / ".ordered-shards").exists()
+    publisher.close()
+    receiver.close()
+
+
+def test_pending_ordered_receive_reuses_fsynced_shards(tmp_path: Path) -> None:
+    target, client = _target(), _S3()
+    publisher, receiver = _store(target, client), _store(target, client)
+    files = _source()
+    plan = ordered_binary_object_plan(
+        target,
+        tuple(
+            BinaryObjectFile(
+                relative_path=path, byte_count=sum(x.nbytes for x in chunks)
+            )
+            for path, chunks in sorted(files.items())
+        ),
+    )
+    ref = publisher.publish_ordered_plan(target, plan)
+    payload = {
+        path: b"".join(bytes(chunk) for chunk in chunks)
+        for path, chunks in files.items()
+    }
+    shards = {
+        shard.index: (
+            memoryview(payload[shard.relative_path])[
+                shard.file_offset : shard.file_offset + shard.byte_count
+            ],
+        )
+        for shard in plan.shards
+    }
+    first = publisher.upload_ordered_shards(target, plan, {0: shards[0]})
+    destination = tmp_path / "receive"
+    with pytest.raises(TimeoutError):
+        receiver.materialize_ordered_pending(
+            ref,
+            destination,
+            timeout_s=0.03,
+            poll_interval_s=0.001,
+            max_poll_interval_s=0.005,
+        )
+    assert (destination / ".ordered-shards/00000000.json").is_file()
+    rest = publisher.upload_ordered_shards(
+        target, plan, {index: shards[index] for index in range(1, len(shards))}
+    )
+    publisher.commit_ordered(target, plan, (*first, *rest))
+    client.gets.clear()
+    receiver.materialize_ordered_pending(
+        ref,
+        destination,
+        timeout_s=1,
+        poll_interval_s=0.001,
+        max_poll_interval_s=0.005,
+    )
+    first_key = f"{target.store.prefix}/{target.object_id}/shards/00000000"
+    assert first_key not in client.gets
+    assert (destination / "adapter_model.safetensors").read_bytes() == b"abcdefghij"
+    publisher.close()
+    receiver.close()
 
 
 def test_ordered_fenced_cleanup_reclaims_partial_plan_and_shards() -> None:

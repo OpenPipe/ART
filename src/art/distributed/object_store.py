@@ -11,6 +11,7 @@ from pathlib import Path, PurePosixPath
 import re
 import shutil
 from threading import Lock
+import time
 from typing import Annotated, Any, Callable, Iterable, Literal, Sequence
 from uuid import uuid4
 
@@ -434,8 +435,7 @@ class S3BinaryObjectStore:
         ref = ordered_binary_object_ref_from_plan(target, plan)
         ordered = tuple(sorted(shards, key=lambda shard: shard.index))
         if len(ordered) != len(plan.shards) or any(
-            stored.index != planned.index
-            or stored.byte_count != planned.byte_count
+            stored.index != planned.index or stored.byte_count != planned.byte_count
             for stored, planned in zip(ordered, plan.shards, strict=False)
         ):
             raise ValueError("ordered shard results differ from the published plan")
@@ -626,6 +626,55 @@ class S3BinaryObjectStore:
             return self._materialize_ordered(ref, commit, destination)
         return self._materialize(ref, destination)
 
+    def materialize_ordered_pending(
+        self,
+        ref: OrderedBinaryObjectRef,
+        destination: str | Path,
+        *,
+        timeout_s: float,
+        poll_interval_s: float = 0.01,
+        max_poll_interval_s: float = 0.25,
+    ) -> Path:
+        """Download shards as they appear, then require the exact final commit."""
+        if timeout_s <= 0 or not 0 < poll_interval_s <= max_poll_interval_s:
+            raise ValueError("ordered receive timing bounds must be positive")
+        bucket, plan_key, plan, _ = self._read_ordered_plan(ref)
+        root = Path(destination)
+        root.mkdir(parents=True, exist_ok=True)
+        receipts = root / ".ordered-shards"
+        receipts.mkdir(exist_ok=True)
+        for file in plan.files:
+            target = root / file.relative_path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if target.exists():
+                if target.stat().st_size != file.byte_count:
+                    raise RuntimeError("partial ordered object file changed size")
+            else:
+                with target.open("xb") as output:
+                    output.truncate(file.byte_count)
+        deadline = time.monotonic() + timeout_s
+        stored = self._download_pending_ordered_shards(
+            bucket,
+            str(PurePosixPath(plan_key).parent),
+            ref.plan_sha256,
+            plan,
+            root,
+            receipts,
+            deadline,
+            poll_interval_s,
+            max_poll_interval_s,
+        )
+        commit = self._wait_ordered_commit(
+            ref,
+            deadline=deadline,
+            poll_interval_s=poll_interval_s,
+            max_poll_interval_s=max_poll_interval_s,
+        )
+        if commit.shards != stored:
+            raise RuntimeError("downloaded ordered shards differ from their commit")
+        shutil.rmtree(receipts)
+        return root
+
     def _materialize(self, ref: BinaryObjectRef, destination: str | Path) -> Path:
         root = Path(destination)
         root.mkdir(parents=True, exist_ok=False)
@@ -731,6 +780,193 @@ class S3BinaryObjectStore:
                 with suppress(BaseException):
                     future.result()
             raise
+
+    def _download_pending_ordered_shards(
+        self,
+        bucket: str,
+        prefix: str,
+        plan_sha256: str,
+        plan: OrderedBinaryObjectPlan,
+        root: Path,
+        receipts: Path,
+        deadline: float,
+        poll_interval_s: float,
+        max_poll_interval_s: float,
+    ) -> tuple[StoredOrderedBinaryObjectShard, ...]:
+        pending: dict[Future[StoredOrderedBinaryObjectShard], int] = {}
+        shards = iter(plan.shards)
+        source_files = {file.relative_path: file for file in plan.files}
+        results: list[StoredOrderedBinaryObjectShard | None] = [None] * len(plan.shards)
+
+        def submit() -> bool:
+            try:
+                shard = next(shards)
+            except StopIteration:
+                return False
+            future = self._parts.submit(
+                self._wait_download_ordered_shard,
+                bucket,
+                prefix,
+                plan_sha256,
+                shard,
+                source_files[shard.relative_path],
+                root / shard.relative_path,
+                receipts / f"{shard.index:08d}.json",
+                deadline,
+                poll_interval_s,
+                max_poll_interval_s,
+            )
+            pending[future] = shard.index
+            return True
+
+        for _ in range(min(self.config.multipart_concurrency, len(plan.shards))):
+            submit()
+        try:
+            while pending:
+                done, _ = wait(pending, return_when=FIRST_COMPLETED)
+                for future in done:
+                    index = pending.pop(future)
+                    results[index] = future.result()
+                    submit()
+        except BaseException:
+            futures = tuple(pending)
+            for future in futures:
+                future.cancel()
+            wait(futures)
+            for future in futures:
+                with suppress(BaseException):
+                    future.result()
+            raise
+        if any(result is None for result in results):
+            raise RuntimeError("ordered receiver did not download every shard")
+        return tuple(result for result in results if result is not None)
+
+    def _wait_download_ordered_shard(
+        self,
+        bucket: str,
+        prefix: str,
+        plan_sha256: str,
+        shard: OrderedBinaryObjectShard,
+        source: BinaryObjectFile,
+        target: Path,
+        receipt: Path,
+        deadline: float,
+        poll_interval_s: float,
+        max_poll_interval_s: float,
+    ) -> StoredOrderedBinaryObjectShard:
+        if receipt.exists():
+            stored = StoredOrderedBinaryObjectShard.model_validate_json(
+                receipt.read_bytes()
+            )
+            if (stored.index, stored.byte_count) != (shard.index, shard.byte_count):
+                raise RuntimeError("partial ordered shard receipt changed identity")
+            return stored
+        delay_s = poll_interval_s
+        while True:
+            stored = self._download_available_ordered_shard(
+                bucket,
+                prefix,
+                plan_sha256,
+                shard,
+                source,
+                target,
+            )
+            if stored is not None:
+                temporary = receipt.with_name(f".{receipt.name}.{uuid4().hex}.tmp")
+                with temporary.open("xb") as output:
+                    output.write(_model_bytes(stored))
+                    output.flush()
+                    os.fsync(output.fileno())
+                os.replace(temporary, receipt)
+                return stored
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(f"ordered shard {shard.index} was not published")
+            time.sleep(min(delay_s, remaining))
+            delay_s = min(max_poll_interval_s, delay_s * 2)
+
+    def _download_available_ordered_shard(
+        self,
+        bucket: str,
+        prefix: str,
+        plan_sha256: str,
+        shard: OrderedBinaryObjectShard,
+        source: BinaryObjectFile,
+        target: Path,
+    ) -> StoredOrderedBinaryObjectShard | None:
+        key = _ordered_binary_object_shard_key(prefix, shard.index)
+        try:
+            response = self._client.get_object(Bucket=bucket, Key=key)
+        except Exception as error:
+            if _is_missing_object(error):
+                return None
+            raise
+        body = response["Body"]
+        try:
+            etag = response.get("ETag")
+            if (
+                response.get("ContentLength") != shard.byte_count
+                or response.get("Metadata")
+                != _ordered_binary_object_shard_metadata(
+                    plan_sha256, source.sha256, shard
+                )
+                or not isinstance(etag, str)
+                or not etag
+            ):
+                raise RuntimeError(
+                    f"ordered object shard changed identity: {shard.index}"
+                )
+            byte_count = 0
+            with target.open("r+b", buffering=0) as output:
+                output.seek(shard.file_offset)
+                while chunk := body.read(8 << 20):
+                    byte_count += len(chunk)
+                    if byte_count > shard.byte_count:
+                        raise RuntimeError(
+                            f"ordered object shard changed size: {shard.index}"
+                        )
+                    remaining = memoryview(chunk)
+                    while remaining:
+                        written = output.write(remaining)
+                        if written is None or written < 1:
+                            raise RuntimeError(
+                                f"ordered object shard write stalled: {shard.index}"
+                            )
+                        remaining = remaining[written:]
+                os.fsync(output.fileno())
+            if byte_count != shard.byte_count:
+                raise RuntimeError(f"ordered object shard changed size: {shard.index}")
+            return StoredOrderedBinaryObjectShard(
+                index=shard.index,
+                byte_count=shard.byte_count,
+                etag=etag,
+            )
+        finally:
+            body.close()
+
+    def _wait_ordered_commit(
+        self,
+        ref: OrderedBinaryObjectRef,
+        *,
+        deadline: float,
+        poll_interval_s: float,
+        max_poll_interval_s: float,
+    ) -> OrderedBinaryObjectCommit:
+        delay_s = poll_interval_s
+        while True:
+            commit = self._resolve_commit(ref.manifest_uri, missing_ok=True)
+            if commit is not None:
+                if (
+                    not isinstance(commit, OrderedBinaryObjectCommit)
+                    or commit.ref != ref
+                ):
+                    raise RuntimeError("ordered object commit differs from its plan")
+                return commit
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("ordered object was not committed")
+            time.sleep(min(delay_s, remaining))
+            delay_s = min(max_poll_interval_s, delay_s * 2)
 
     def _download_ordered_shard(
         self,
@@ -1465,6 +1701,14 @@ def ordered_binary_object_ref(
     return _ordered_binary_object_ref(
         target, _ordered_binary_object_layout(target, files)
     )
+
+
+def ordered_binary_object_plan(
+    target: OrderedBinaryObjectTarget,
+    files: tuple[BinaryObjectFile, ...],
+) -> OrderedBinaryObjectPlan:
+    """Build the immutable shard plan before any payload is mapped or uploaded."""
+    return _ordered_binary_object_layout(target, files)
 
 
 def ordered_binary_object_ref_from_plan(
