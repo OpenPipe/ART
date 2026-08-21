@@ -198,7 +198,7 @@ class _Service:
 
     async def load_state_command(self, ref, source, *, restore_optimizer):
         self.calls.append(
-            f"load:{ref.sequence_id}:{source.adapter_step}:{restore_optimizer}"
+            f"load:{ref.sequence_id}:{source.adapter.step}:{restore_optimizer}"
         )
         generation = self.generation.model_copy(
             update={
@@ -267,7 +267,7 @@ class _FailingService(_Service):
     async def load_state_command(self, ref, source, *, restore_optimizer):
         if self.failure_kind == "load_state" and not self.failure_consumed:
             self.calls.append(
-                f"load:{ref.sequence_id}:{source.adapter_step}:{restore_optimizer}"
+                f"load:{ref.sequence_id}:{source.adapter.step}:{restore_optimizer}"
             )
             await self._fail()
         return await super().load_state_command(
@@ -472,12 +472,9 @@ def test_local_forward_and_load_use_the_same_ordered_stream() -> None:
         client._remember_checkpoint(
             "exact",
             ResolvedCheckpointState(
-                adapter_path="/tmp/adapter",
-                adapter_step=4,
-                adapter_training_session_id="session",
-                adapter_generation_id="generation-4",
+                adapter=service.adapter,
                 optimizer_state_path="/tmp/optimizer",
-                optimizer_generation_id="generation-4",
+                optimizer_generation_id=service.adapter.generation_id,
             ),
         )
         exact = await client.load_state_with_optimizer(
@@ -593,12 +590,18 @@ def test_failed_local_mutation_poisons_concurrently_submitted_successor(
             client._remember_checkpoint(
                 "source",
                 ResolvedCheckpointState(
-                    adapter_path="/tmp/adapter",
-                    adapter_step=3,
-                    adapter_training_session_id="session",
-                    adapter_generation_id="generation-3",
+                    adapter=service.adapter.model_copy(
+                        update={
+                            "step": 3,
+                            "generation_id": (
+                                "step-00000003-0123456789abcdef0123456789abcdef"
+                            ),
+                        }
+                    ),
                     optimizer_state_path="/tmp/optimizer",
-                    optimizer_generation_id="generation-3",
+                    optimizer_generation_id=(
+                        "step-00000003-0123456789abcdef0123456789abcdef"
+                    ),
                 ),
             )
             failed = await client.load_state(

@@ -1510,8 +1510,8 @@ class DistributedMegatronService:
                     expected_learner_version=ref.learner_parent_version,
                     learner_version=output_version,
                     generation=generation,
-                    adapter_path=source.adapter_path,
-                    adapter_step=source.adapter_step,
+                    adapter_path=source.adapter.identity,
+                    adapter_step=source.adapter.step,
                     optimizer_state_path=(
                         source.optimizer_state_path if restore_optimizer else None
                     ),

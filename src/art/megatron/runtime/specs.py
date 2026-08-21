@@ -116,10 +116,7 @@ class RunSlotRegistration(_Spec):
     training_session_id: str = Field(min_length=1)
     learner_version: int = Field(ge=0)
     generation_id: str = Field(min_length=1)
-    adapter_path: str = Field(min_length=1)
-    adapter_step: int = Field(ge=0)
-    adapter_training_session_id: str = Field(min_length=1)
-    adapter_generation_id: str = Field(min_length=1)
+    adapter: OptimizerAdapter
     optimizer_state_path: str = Field(min_length=1)
     initial_optimizer_state_path: str | None = Field(default=None, min_length=1)
     initial_optimizer_generation_id: str | None = Field(default=None, min_length=1)
@@ -439,10 +436,7 @@ class LoadStateJobSpec(_Spec):
 
 
 class ResolvedCheckpointState(_Spec):
-    adapter_path: str = Field(min_length=1)
-    adapter_step: int = Field(ge=0)
-    adapter_training_session_id: str = Field(min_length=1)
-    adapter_generation_id: str = Field(min_length=1)
+    adapter: OptimizerAdapter
     optimizer_state_path: str | None = Field(default=None, min_length=1)
     optimizer_generation_id: str | None = Field(default=None, min_length=1)
 

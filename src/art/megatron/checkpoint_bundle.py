@@ -77,7 +77,7 @@ class CheckpointBundleManifest(_BundleRecord):
 
 
 class RestoredCheckpointBundle(_BundleRecord):
-    adapter_path: str
+    adapter: OptimizerAdapter
     optimizer_state_path: str | None = None
     generation_id: str
     learner_version: int = Field(ge=0)
@@ -276,7 +276,7 @@ def _consume_checkpoint_bundle(
             raise RuntimeError("optimizer restore target contains another generation")
 
     return RestoredCheckpointBundle(
-        adapter_path=adapter.identity,
+        adapter=adapter,
         optimizer_state_path=optimizer_path,
         generation_id=adapter.generation_id,
         learner_version=adapter.step,

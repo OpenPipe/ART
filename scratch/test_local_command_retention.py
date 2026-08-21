@@ -8,6 +8,7 @@ import pytest
 
 from art.distributed.trajectory_store import TrajectoryGroupBundle
 from art.megatron.distributed_service import DistributedMegatronService
+from art.megatron.optimizer_state import CheckpointFile, OptimizerAdapter
 from art.megatron.runtime.specs import ResolvedCheckpointState
 import art.megatron.training.client as client_module
 from art.megatron.training.client import (
@@ -58,10 +59,18 @@ def _client(service: _Service) -> LocalMegatronTrainingClient:
 
 def _checkpoint(step: int) -> ResolvedCheckpointState:
     return ResolvedCheckpointState(
-        adapter_path=f"/checkpoint/{step}",
-        adapter_step=step,
-        adapter_training_session_id="session",
-        adapter_generation_id=f"generation-{step}",
+        adapter=OptimizerAdapter(
+            identity=f"/checkpoint/{step}",
+            training_session_id="session",
+            step=step,
+            generation_id=(
+                f"step-{step:08d}-0123456789abcdef0123456789abcdef"
+            ),
+            files=(
+                CheckpointFile(name="adapter_config.json", size_bytes=1),
+                CheckpointFile(name="adapter_model.safetensors", size_bytes=1),
+            ),
+        ),
     )
 
 

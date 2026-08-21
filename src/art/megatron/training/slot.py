@@ -26,11 +26,11 @@ from art.megatron.optimizer_state import (
     OptimizerAdapter,
     OptimizerGenerationManifest,
     link_adapter_generation,
-    optimizer_adapter,
     optimizer_generation_nbytes,
     read_adapter_publication,
     read_committed_optimizer_pointer,
     read_optimizer_generation_manifest,
+    validate_adapter_manifest,
 )
 from art.megatron.runtime.data_plane import SFTBatchData
 from art.megatron.runtime.publication import (
@@ -308,7 +308,13 @@ class MegatronTrainingSlot:
         output_dir = self._require_managed_path(output_dir)
         registration = registration.model_copy(
             update={
-                "adapter_path": self._require_managed_path(registration.adapter_path),
+                "adapter": registration.adapter.model_copy(
+                    update={
+                        "identity": self._require_managed_path(
+                            registration.adapter.identity
+                        )
+                    }
+                ),
                 "optimizer_state_path": self._require_managed_path(
                     registration.optimizer_state_path
                 ),
@@ -327,18 +333,8 @@ class MegatronTrainingSlot:
             if candidate != (prior.registration, prior.model, prior.output_dir):
                 raise RuntimeError("run_id was reused for another resident run")
             return
-        adapter = read_adapter_publication(
-            registration.adapter_path,
-            step=registration.adapter_step,
-        ) or optimizer_adapter(
-            registration.adapter_path,
-            registration.adapter_step,
-            training_session_id=registration.adapter_training_session_id,
-        )
-        if adapter.training_session_id != registration.adapter_training_session_id:
-            raise ValueError("adapter belongs to another training session")
-        if adapter.generation_id != registration.adapter_generation_id:
-            raise ValueError("adapter generation differs from run registration")
+        adapter = registration.adapter
+        validate_adapter_manifest(adapter)
         await self.trainer.register_run(registration)
         self._runs[registration.run_id] = _ResidentRun(
             registration=registration,
@@ -1017,8 +1013,8 @@ class MegatronTrainingSlot:
             expected_learner_version=ref.learner_parent_version,
             learner_version=output_version,
             generation=generation,
-            adapter_path=self._require_managed_path(source.adapter_path),
-            adapter_step=source.adapter_step,
+            adapter_path=self._require_managed_path(source.adapter.identity),
+            adapter_step=source.adapter.step,
             optimizer_state_path=(
                 self._require_managed_path(source.optimizer_state_path)
                 if request.restore_optimizer and source.optimizer_state_path is not None

@@ -488,18 +488,28 @@ def acknowledge_materialized_adapter(
     step: int,
     training_session_id: str,
     generation_id: str,
+    files: tuple[CheckpointFile, ...],
 ) -> OptimizerAdapter:
     """Attach exact learner identity to an already verified adapter tree."""
     path = Path(adapter_path).absolute()
-    adapter = optimizer_adapter(
-        path,
-        step,
+    _root, payloads = _adapter_checkpoint_files(path)
+    if tuple(payload.name for payload in payloads) != tuple(
+        record.name for record in files
+    ) or any(
+        payload.stat().st_size != record.size_bytes
+        for payload, record in zip(payloads, files, strict=True)
+    ):
+        raise RuntimeError("materialized adapter differs from its verified manifest")
+    adapter = OptimizerAdapter(
+        identity=str(path),
         training_session_id=training_session_id,
+        step=step,
         generation_id=generation_id,
+        files=files,
     )
     acknowledgment = path / ADAPTER_PUBLICATION_ACK
     if acknowledgment.exists():
-        if read_adapter_publication(path, step=step) != adapter:
+        if read_adapter_publication(path, step=step, verify_files=False) != adapter:
             raise RuntimeError("materialized adapter acknowledgement changed identity")
     else:
         _write_model_atomic(acknowledgment, adapter)
@@ -556,6 +566,25 @@ def read_adapter_publication(
                 f"current={current_files}"
             )
     return adapter
+
+
+def validate_adapter_manifest(adapter: OptimizerAdapter) -> None:
+    """Validate an immutable adapter without rescanning payload bytes."""
+    if (
+        read_adapter_publication(
+            adapter.identity,
+            step=adapter.step,
+            verify_files=False,
+        )
+        != adapter
+    ):
+        raise RuntimeError("adapter manifest is not the acknowledged publication")
+    _root, payloads = _adapter_checkpoint_files(adapter.identity)
+    if any(
+        payload.stat().st_size != record.size_bytes
+        for payload, record in zip(payloads, adapter.files, strict=True)
+    ):
+        raise RuntimeError("adapter payload size differs from its verified manifest")
 
 
 def _validate_adapter_publication(

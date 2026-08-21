@@ -1115,13 +1115,13 @@ class MCoreRunSlotExecutor:
         from art.megatron.optimizer_state import load_trainer_rank_optimizer_state
         from art.trainer_rank import MaterializedCheckpoint
 
-        adapter_config = load_adapter_config(registration.adapter_path)
+        adapter_config = load_adapter_config(registration.adapter.identity)
         adapter_layout_fingerprint = hashlib.sha256(
             encode_adapter_config(adapter_config)
         ).hexdigest()
         checkpoint = self._slot_trainer.prepare_checkpoint_slot_load_sync(
             MaterializedCheckpoint(
-                path=registration.run_id, directory=registration.adapter_path
+                path=registration.run_id, directory=registration.adapter.identity
             ),
             device="cpu",
         )
@@ -1130,8 +1130,8 @@ class MCoreRunSlotExecutor:
             loaded_optimizer = load_trainer_rank_optimizer_state(
                 self.runtime,
                 optimizer_state_path=registration.initial_optimizer_state_path,
-                adapter_path=registration.adapter_path,
-                adapter_step=registration.adapter_step,
+                adapter_path=registration.adapter.identity,
+                adapter_step=registration.adapter.step,
                 optimizer_generation_id=registration.initial_optimizer_generation_id,
                 layout=self.optimizer_layout(checkpoint),
             )
@@ -1244,7 +1244,7 @@ class MCoreRunSlotExecutor:
                 training_session_id=registration.training_session_id,
                 policy_step=registration.learner_version,
                 generation_id=registration.generation_id,
-                adapter_path=registration.adapter_path,
+                adapter_path=registration.adapter.identity,
             ),
             pending_load=prepared,
         )

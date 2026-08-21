@@ -725,10 +725,7 @@ class LocalMegatronTrainingClient:
                 self._remember_checkpoint(
                     request.checkpoint_name,
                     ResolvedCheckpointState(
-                        adapter_path=adapter.identity,
-                        adapter_step=adapter.step,
-                        adapter_training_session_id=adapter.training_session_id,
-                        adapter_generation_id=adapter.generation_id,
+                        adapter=adapter,
                     ),
                 )
                 return SamplerWeightsResult(
@@ -782,12 +779,7 @@ class LocalMegatronTrainingClient:
                 self._remember_checkpoint(
                     request.checkpoint_name,
                     ResolvedCheckpointState(
-                        adapter_path=durable.adapter.identity,
-                        adapter_step=durable.adapter.step,
-                        adapter_training_session_id=(
-                            durable.adapter.training_session_id
-                        ),
-                        adapter_generation_id=durable.adapter.generation_id,
+                        adapter=durable.adapter,
                         optimizer_state_path=self._service.optimizer_state_path,
                         optimizer_generation_id=durable.adapter.generation_id,
                     ),
@@ -868,10 +860,9 @@ class LocalMegatronTrainingClient:
             self._remember_checkpoint(
                 checkpoint.checkpoint_id,
                 ResolvedCheckpointState(
-                    adapter_path=generation.adapter_path,
-                    adapter_step=generation.policy_step,
-                    adapter_training_session_id=adapter.training_session_id,
-                    adapter_generation_id=adapter.generation_id,
+                    adapter=adapter.model_copy(
+                        update={"identity": generation.adapter_path}
+                    ),
                     optimizer_state_path=self._service.optimizer_state_path,
                     optimizer_generation_id=generation.generation_id,
                 ),
@@ -900,8 +891,8 @@ class LocalMegatronTrainingClient:
     ) -> None:
         existing = self._checkpoints.get(checkpoint_id)
         same_learner = existing is not None and (
-            existing.adapter_path == checkpoint.adapter_path
-            and existing.adapter_step == checkpoint.adapter_step
+            existing.adapter.identity == checkpoint.adapter.identity
+            and existing.adapter.step == checkpoint.adapter.step
         )
         if existing is not None and not same_learner and not overwrite:
             raise RuntimeError(
@@ -915,7 +906,7 @@ class LocalMegatronTrainingClient:
         self._checkpoints = {
             name: checkpoint
             for name, checkpoint in self._checkpoints.items()
-            if checkpoint.adapter_step in retain_steps
+            if checkpoint.adapter.step in retain_steps
         }
 
     async def _prepare_rl_batch(self, request: ForwardRequest | ForwardBackwardRequest):
