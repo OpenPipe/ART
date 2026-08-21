@@ -143,7 +143,6 @@ _SUPERVISION_MESHES: dict[str, "MonarchTrainerSupervision"] = {}
 _EXPECTED_STOPPED_MESH_FAILURES: dict[str, float] = {}
 _PREVIOUS_FAULT_HOOK: Callable[[MeshFailure], None] | None = None
 _MAX_PENDING_RUN_CLEANUPS = 8
-_DEFERRED_RESPONSE_JOIN_TIMEOUT_S = process_shutdown_timeout(2)
 
 
 def _response_exception(error: BaseException) -> Exception:
@@ -152,6 +151,19 @@ def _response_exception(error: BaseException) -> Exception:
         if isinstance(error, Exception)
         else RuntimeError(f"{type(error).__name__}: {error}")
     )
+
+
+def _rank_process_group_is_initialized() -> bool:
+    import torch
+
+    return torch.distributed.is_initialized()
+
+
+def _destroy_rank_process_group() -> None:
+    import torch
+
+    if torch.distributed.is_initialized():
+        torch.distributed.destroy_process_group()
 
 
 def _configure_hybrid_ep_env(
@@ -548,6 +560,23 @@ class MonarchTrainerActor(Actor):
         runtime_spec_json: str,
         run_id: str,
     ) -> None:
+        self._teardown_lock = Lock()
+        self._teardown_complete = False
+        self._teardown_poisoned = False
+        self._shutdown_timeout_s = process_shutdown_timeout(2)
+        self._valid = False
+        self._executor: Any | None = None
+        self._run_slot_executor: Any | None = None
+        self._weight_offload: Any | None = None
+        self._command_job_open = False
+        self._deferred_response_lock = Lock()
+        self._deferred_response_threads: set[Thread] = set()
+        self._deferred_response_stopping = False
+        self._cp_preplanner = None
+        self._cp_lookahead_port = None
+        self._cp_lookahead_thread: Thread | None = None
+        self._residency_prefetch_port = None
+        self._residency_prefetch_thread: Thread | None = None
         runtime_spec = TrainerRuntimeSpec.model_validate_json(runtime_spec_json)
         topology = runtime_spec.trainer_mesh.topology
         cache_root = configure_model_cache_env(cache_root=runtime_spec.cache_root)
@@ -670,16 +699,7 @@ class MonarchTrainerActor(Actor):
             streaming_config=streaming_weight_offload_config_from_env(),
         )
         self._weight_offload.install()
-        self._command_job_open = False
-        self._deferred_response_lock = Lock()
-        self._deferred_response_threads: set[Thread] = set()
-        self._deferred_response_stopping = False
         self._compile_cache_publish_lock = Lock()
-        self._cp_preplanner = None
-        self._cp_lookahead_port = None
-        self._cp_lookahead_thread = None
-        self._residency_prefetch_port = None
-        self._residency_prefetch_thread = None
         if self._run_slot_executor is not None:
             self._residency_prefetch_port, receiver = Channel.open()
             self._residency_prefetch_thread = Thread(
@@ -743,18 +763,17 @@ class MonarchTrainerActor(Actor):
             self._deferred_response_threads.add(thread)
             thread.start()
 
-    def _stop_deferred_responses(self) -> None:
+    def _stop_deferred_responses(self, deadline: float) -> None:
         with self._deferred_response_lock:
             self._deferred_response_stopping = True
             threads = tuple(self._deferred_response_threads)
-        deadline = time.monotonic() + _DEFERRED_RESPONSE_JOIN_TIMEOUT_S
         for thread in threads:
             thread.join(timeout=max(0.0, deadline - time.monotonic()))
         alive = [thread.name for thread in threads if thread.is_alive()]
         if alive:
             raise RuntimeError(
                 "trainer response settlement did not stop within "
-                f"{_DEFERRED_RESPONSE_JOIN_TIMEOUT_S:g}s: {alive}"
+                f"the shutdown deadline: {alive}"
             )
 
     def _run_cp_lookahead(self, receiver: Any) -> None:
@@ -824,34 +843,31 @@ class MonarchTrainerActor(Actor):
                 )
             reply.send(result.model_dump(mode="json"))
 
-    def _stop_cp_lookahead(self) -> None:
-        thread, self._cp_lookahead_thread = self._cp_lookahead_thread, None
+    def _stop_cp_lookahead(self, deadline: float) -> None:
+        thread = self._cp_lookahead_thread
         if thread is None:
             return
         port = self._cp_lookahead_port
         if port is None:
             raise RuntimeError("CP lookahead thread has no request port")
         port.send(None)
-        thread.join(timeout=30.0)
+        thread.join(timeout=max(0.0, deadline - time.monotonic()))
         if thread.is_alive():
-            raise RuntimeError("CP lookahead service did not stop within 30 seconds")
+            raise RuntimeError("CP lookahead service exceeded shutdown deadline")
+        self._cp_lookahead_thread = None
 
-    def _stop_residency_prefetch(self) -> None:
-        thread, self._residency_prefetch_thread = (
-            self._residency_prefetch_thread,
-            None,
-        )
+    def _stop_residency_prefetch(self, deadline: float) -> None:
+        thread = self._residency_prefetch_thread
         if thread is None:
             return
         port = self._residency_prefetch_port
         if port is None:
             raise RuntimeError("residency prefetch thread has no request port")
         port.send(None)
-        thread.join(timeout=30.0)
+        thread.join(timeout=max(0.0, deadline - time.monotonic()))
         if thread.is_alive():
-            raise RuntimeError(
-                "residency prefetch service did not stop within 30 seconds"
-            )
+            raise RuntimeError("residency prefetch service exceeded shutdown deadline")
+        self._residency_prefetch_thread = None
 
     def _publish_compile_cache(self) -> None:
         with self._compile_cache_publish_lock:
@@ -1809,21 +1825,100 @@ class MonarchTrainerActor(Actor):
             result = self._executor.inspect_resident_lora(request)
         return result.model_dump(mode="json")
 
-    @endpoint
-    def close(self) -> None:
-        if self._command_job_open:
-            self._executor.discard_open_gradients()
-            self._weight_offload.after_job()
-            self._command_job_open = False
-        self._stop_residency_prefetch()
-        if self._run_slot_executor is not None:
-            self._run_slot_executor.close()
-        self._stop_cp_lookahead()
-        self._executor.close()
-        import torch
+    def _rank_teardown(self, shutdown_timeout_s: float) -> None:
+        with self._teardown_lock:
+            if self._teardown_complete:
+                return
+            self._valid = False
+            deadline = time.monotonic() + max(0.0, shutdown_timeout_s)
+            failures: list[BaseException] = []
 
-        if torch.distributed.is_initialized():
-            torch.distributed.destroy_process_group()
+            def attempt(name: str, action: Callable[[], None]) -> None:
+                try:
+                    action()
+                except BaseException as error:
+                    error.add_note(f"Megatron rank teardown phase failed: {name}")
+                    failures.append(error)
+
+            try:
+                attempt(
+                    "deferred_responses",
+                    lambda: self._stop_deferred_responses(deadline),
+                )
+                if self._command_job_open:
+                    if self._executor is not None:
+                        attempt(
+                            "discard_open_gradients",
+                            self._executor.discard_open_gradients,
+                        )
+                    if self._weight_offload is not None:
+                        attempt(
+                            "finish_weight_offload_job",
+                            self._weight_offload.after_job,
+                        )
+                    self._command_job_open = False
+                attempt(
+                    "residency_prefetch",
+                    lambda: self._stop_residency_prefetch(deadline),
+                )
+                if self._run_slot_executor is not None:
+                    attempt(
+                        "run_slot_executor",
+                        lambda: self._run_slot_executor.close(deadline=deadline),
+                    )
+                attempt("cp_lookahead", lambda: self._stop_cp_lookahead(deadline))
+                if self._executor is not None:
+                    attempt(
+                        "base_executor",
+                        lambda: self._executor.close(deadline=deadline),
+                    )
+            finally:
+                attempt("process_group", _destroy_rank_process_group)
+
+            unsafe = []
+            with self._deferred_response_lock:
+                if any(thread.is_alive() for thread in self._deferred_response_threads):
+                    unsafe.append("deferred responses")
+            for name, thread in (
+                ("residency prefetch", self._residency_prefetch_thread),
+                ("CP lookahead", self._cp_lookahead_thread),
+            ):
+                if thread is not None and thread.is_alive():
+                    unsafe.append(name)
+            if (
+                self._run_slot_executor is not None
+                and not self._run_slot_executor.closed
+            ):
+                unsafe.append("run-slot executor")
+            if self._executor is not None and not self._executor.closed:
+                unsafe.append("base executor")
+            if _rank_process_group_is_initialized():
+                unsafe.append("distributed process group")
+            if unsafe:
+                failures.append(
+                    TimeoutError(
+                        "Megatron rank retained unsafe resources after shutdown "
+                        f"deadline: {', '.join(unsafe)}"
+                    )
+                )
+            elif time.monotonic() > deadline:
+                failures.append(
+                    TimeoutError("Megatron rank exceeded shutdown deadline")
+                )
+            self._teardown_complete = not unsafe
+            self._teardown_poisoned = bool(failures)
+            if len(failures) == 1:
+                raise failures[0]
+            if failures:
+                raise BaseExceptionGroup("Megatron rank teardown failed", failures)
+
+    @endpoint
+    def close(self, shutdown_timeout_s: float | None = None) -> None:
+        self._rank_teardown(
+            self._shutdown_timeout_s
+            if shutdown_timeout_s is None
+            else shutdown_timeout_s
+        )
 
     @endpoint
     def advance_without_training(
@@ -1864,16 +1959,7 @@ class MonarchTrainerActor(Actor):
     def __cleanup__(self, exc: Exception | None) -> None:
         if exc is not None:
             self._valid = False
-        self._stop_deferred_responses()
-        if self._command_job_open:
-            self._executor.discard_open_gradients()
-            self._weight_offload.after_job()
-            self._command_job_open = False
-        self._stop_residency_prefetch()
-        if self._run_slot_executor is not None:
-            self._run_slot_executor.close()
-        self._stop_cp_lookahead()
-        self._executor.close()
+        self._rank_teardown(self._shutdown_timeout_s)
 
 
 async def spawn_monarch_trainer_actors(
@@ -2025,6 +2111,7 @@ class MonarchTrainerSlot:
         self._closed = False
         self._valid = True
         self._stop_task: asyncio.Task[None] | None = None
+        self._close_task: asyncio.Task[None] | None = None
         self._publications: dict[
             str, asyncio.Task[tuple[TrainerRankPublication, ...]]
         ] = {}
@@ -2945,33 +3032,51 @@ class MonarchTrainerSlot:
     async def close(self) -> None:
         if self._closed:
             return
-        self._closed = True
-        self._valid = False
-        for authorization in self._publication_authorizations.values():
-            authorization.set()
-        registrations = tuple(value[1] for value in self._registration_tasks.values())
-        for task in registrations:
-            task.cancel()
-        if registrations:
-            await asyncio.gather(*registrations, return_exceptions=True)
-        removals = tuple(self._removal_tasks.values())
+        if self._close_task is not None and self._close_task.done():
+            try:
+                self._close_task.result()
+            except BaseException:
+                self._close_task = None
+        if self._close_task is None:
+            self._valid = False
+            self._close_task = asyncio.create_task(self._close())
+            self._close_task.add_done_callback(consume_future_exception)
+        await asyncio.shield(self._close_task)
+
+    async def _close(self) -> None:
+        loop = asyncio.get_running_loop()
+        shutdown_timeout_s = min(self._shutdown_timeout_s, process_shutdown_timeout(1))
+        deadline = loop.time() + shutdown_timeout_s
+        graceful_deadline = min(deadline, loop.time() + process_shutdown_timeout(2))
         primary: BaseException | None = None
         try:
-            async with asyncio.timeout(self._shutdown_timeout_s * 0.8):
+            async with asyncio.timeout_at(graceful_deadline):
+                for authorization in self._publication_authorizations.values():
+                    authorization.set()
+                registrations = tuple(
+                    value[1] for value in self._registration_tasks.values()
+                )
+                for task in registrations:
+                    task.cancel()
+                if registrations:
+                    await asyncio.gather(*registrations, return_exceptions=True)
+                removals = tuple(self._removal_tasks.values())
                 outcomes = await asyncio.gather(*removals, return_exceptions=True)
                 failures = [
                     outcome
                     for outcome in outcomes
                     if isinstance(outcome, BaseException)
                 ]
-                await _remote_teardown(self._actors.close.call())
+                await _remote_teardown(
+                    self._actors.close.call(max(0.0, graceful_deadline - loop.time()))
+                )
                 await asyncio.gather(*self._publications.values())
                 if failures:
                     raise BaseExceptionGroup("run cleanup failed", failures)
         except BaseException as error:
             primary = error
         try:
-            await self._force_stop()
+            await self._force_stop(max(0.0, deadline - loop.time()))
         except BaseException as error:
             if primary is None:
                 primary = error
@@ -2979,6 +3084,8 @@ class MonarchTrainerSlot:
                 primary.add_note(
                     f"trainer slot cleanup failed: {type(error).__name__}: {error}"
                 )
+        else:
+            self._closed = True
         if primary is not None:
             raise primary
 
@@ -3003,10 +3110,19 @@ class MonarchTrainerSlot:
 
     async def _invalidate(self, error: BaseException, message: str) -> None:
         self._valid = False
-        self._closed = True
-        await cleanup_after_failure(error, self._force_stop, message=message)
 
-    async def _force_stop(self) -> None:
+        async def stop() -> None:
+            await self._force_stop()
+            self._closed = True
+
+        await cleanup_after_failure(error, stop, message=message)
+
+    async def _force_stop(self, timeout_s: float | None = None) -> None:
+        if self._stop_task is not None and self._stop_task.done():
+            try:
+                self._stop_task.result()
+            except BaseException:
+                self._stop_task = None
         if self._stop_task is None:
             self._stop_task = asyncio.create_task(
                 _remote_teardown(self._proc_mesh.stop())
@@ -3021,7 +3137,10 @@ class MonarchTrainerSlot:
 
             self._stop_task.add_done_callback(stopped)
         await asyncio.wait_for(
-            asyncio.shield(self._stop_task), self._shutdown_timeout_s
+            asyncio.shield(self._stop_task),
+            min(self._shutdown_timeout_s, process_shutdown_timeout(1))
+            if timeout_s is None
+            else timeout_s,
         )
 
 
@@ -4535,7 +4654,6 @@ class MonarchTrainerRun:
                 self._close_task = None
         if self._close_task is None:
             graceful = self._valid and self._active_job_id is None
-            self._closed = True
             self._valid = False
             self._cancel_active()
             self._close_task = asyncio.create_task(self._close(graceful))
@@ -4544,16 +4662,24 @@ class MonarchTrainerRun:
 
     async def _close(self, graceful: bool) -> None:
         loop = asyncio.get_running_loop()
-        deadline = loop.time() + self.run_spec.shutdown_timeout_s
+        shutdown_timeout_s = min(
+            self.run_spec.shutdown_timeout_s, process_shutdown_timeout(1)
+        )
+        deadline = loop.time() + shutdown_timeout_s
         primary: BaseException | None = None
         if graceful:
             publications = tuple(self._publications.values())
             for publication in publications:
                 publication.authorized.set()
+            graceful_deadline = min(deadline, loop.time() + process_shutdown_timeout(2))
             try:
-                async with asyncio.timeout(self.run_spec.shutdown_timeout_s / 2):
+                async with asyncio.timeout_at(graceful_deadline):
                     await asyncio.gather(
-                        _remote_teardown(self._actors.close.call()),
+                        _remote_teardown(
+                            self._actors.close.call(
+                                max(0.0, graceful_deadline - loop.time())
+                            )
+                        ),
                         *(
                             self._await_publication(publication)
                             for publication in publications
@@ -4571,6 +4697,8 @@ class MonarchTrainerRun:
                 primary.add_note(
                     f"trainer ProcMesh cleanup failed: {type(exc).__name__}: {exc}"
                 )
+        else:
+            self._closed = True
         if primary is not None:
             raise primary
 

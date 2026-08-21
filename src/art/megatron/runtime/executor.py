@@ -35,6 +35,7 @@ from art.megatron.optimizer_state import (
     read_adapter_publication,
 )
 from art.training.contracts import TokenLogprobs
+from art.utils.lifecycle import process_shutdown_timeout
 from art.utils.safetensors import (
     FileIdentity,
     PreparedSafetensors,
@@ -540,7 +541,12 @@ class MegatronTrainJobExecutor:
         )
         self._gradient_parent_version: int | None = None
         self._python_gc_stabilized = False
+        self._closing = False
         self._closed = False
+
+    @property
+    def closed(self) -> bool:
+        return self._closed
 
     def execute(
         self,
@@ -549,7 +555,7 @@ class MegatronTrainJobExecutor:
         sink: EventSink,
         cancelled: Event,
     ) -> dict[str, float]:
-        if self._closed:
+        if self._closing or self._closed:
             raise RuntimeError("Megatron executor is closed")
         self._require_no_open_gradients()
         timing = self.runtime.inter_forward_backward_timing
@@ -597,7 +603,7 @@ class MegatronTrainJobExecutor:
         sink: EventSink,
         cancelled: Event,
     ) -> dict[str, float]:
-        if self._closed:
+        if self._closing or self._closed:
             raise RuntimeError("Megatron executor is closed")
         timing = self.runtime.inter_forward_backward_timing
         timing.current_job_start_s = time.monotonic()
@@ -670,7 +676,7 @@ class MegatronTrainJobExecutor:
         return inspect_resident_lora(self.runtime, request)
 
     def _validate_diagnostic_runtime(self) -> None:
-        if self._closed:
+        if self._closing or self._closed:
             raise RuntimeError("Megatron executor is closed")
         self._require_no_open_gradients()
         self._publisher.raise_if_failed()
@@ -719,7 +725,7 @@ class MegatronTrainJobExecutor:
         batch: InMemoryPackedBatch,
         cancelled: Event,
     ) -> dict[str, Any]:
-        if self._closed:
+        if self._closing or self._closed:
             raise RuntimeError("Megatron executor is closed")
         validate_packed_batch(batch)
         self._publisher.raise_if_failed()
@@ -754,7 +760,7 @@ class MegatronTrainJobExecutor:
         batch: InMemoryPackedBatch,
         cancelled: Event,
     ) -> dict[str, Any]:
-        if self._closed:
+        if self._closing or self._closed:
             raise RuntimeError("Megatron executor is closed")
         validate_packed_batch(batch)
         self._publisher.raise_if_failed()
@@ -784,7 +790,7 @@ class MegatronTrainJobExecutor:
         batch: SFTBatchData,
         cancelled: Event,
     ) -> dict[str, Any]:
-        if self._closed:
+        if self._closing or self._closed:
             raise RuntimeError("Megatron executor is closed")
         self._publisher.raise_if_failed()
         if self._gradient_parent_version not in {
@@ -817,7 +823,7 @@ class MegatronTrainJobExecutor:
         batch: SFTBatchData,
         cancelled: Event,
     ) -> dict[str, Any]:
-        if self._closed:
+        if self._closing or self._closed:
             raise RuntimeError("Megatron executor is closed")
         self._publisher.raise_if_failed()
         from art.megatron.train import execute_megatron_sft_forward_job
@@ -836,7 +842,7 @@ class MegatronTrainJobExecutor:
         ).materialize()
 
     def execute_optimizer(self, job: OptimizerJobSpec) -> dict[str, Any]:
-        if self._closed:
+        if self._closing or self._closed:
             raise RuntimeError("Megatron executor is closed")
         self._publisher.raise_if_failed()
         if self._gradient_parent_version != job.expected_learner_version:
@@ -899,7 +905,7 @@ class MegatronTrainJobExecutor:
         }
 
     def execute_load_state(self, job: LoadStateJobSpec) -> dict[str, Any]:
-        if self._closed:
+        if self._closing or self._closed:
             raise RuntimeError("Megatron executor is closed")
         self._require_no_open_gradients()
         from art.megatron.train import execute_megatron_load_state_job
@@ -931,7 +937,7 @@ class MegatronTrainJobExecutor:
         job: GenerationSnapshotJobSpec,
         sink: EventSink,
     ) -> dict[str, Any]:
-        if self._closed:
+        if self._closing or self._closed:
             raise RuntimeError("Megatron executor is closed")
         self._publisher.raise_if_failed()
         runtime = self.runtime
@@ -1018,7 +1024,7 @@ class MegatronTrainJobExecutor:
         optimizer_state_path: str,
         adapter: "OptimizerAdapter | None",
     ) -> dict[str, float]:
-        if self._closed:
+        if self._closing or self._closed:
             raise RuntimeError("Megatron executor is closed")
         self._require_no_open_gradients()
         if (
@@ -1042,17 +1048,22 @@ class MegatronTrainJobExecutor:
         runtime.resident_generation_id = output.generation_id
         return {}
 
-    def close(self) -> None:
+    def close(self, *, deadline: float | None = None) -> None:
         if self._closed:
             return
-        self._closed = True
+        deadline = (
+            time.monotonic() + process_shutdown_timeout(2)
+            if deadline is None
+            else deadline
+        )
+        self._closing = True
         failures: list[BaseException] = []
         try:
             self._gradients.discard()
         except BaseException as error:
             failures.append(error)
         try:
-            self._publisher.close()
+            self._publisher.close(deadline=deadline)
             self.runtime.optimizer_snapshot_barrier.synchronize()
         except BaseException as error:
             failures.append(error)
@@ -1064,13 +1075,13 @@ class MegatronTrainJobExecutor:
                 failures.append(error)
             finally:
                 self.runtime.moe_routing_replay_controller = None
-        try:
-            import torch
-
-            if torch.distributed.is_initialized():
-                torch.distributed.destroy_process_group()
-        except BaseException as error:
-            failures.append(error)
+        if self._publisher.closed:
+            self._closed = True
+            self._closing = False
+        else:
+            failures.append(
+                TimeoutError("Megatron executor retained publication worker threads")
+            )
         if len(failures) == 1:
             raise failures[0]
         if failures:
@@ -1191,7 +1202,30 @@ class MCoreRunSlotExecutor:
         ] = {}
         self._run_cleanups: dict[str, Future[None]] = {}
         self._runs: dict[str, _ResidentRunState] = {}
+        self._lifecycle_lock = Lock()
+        self._transition_futures: set[Future[Any]] = set()
+        self._closing = False
         self._closed = False
+
+    @property
+    def closed(self) -> bool:
+        with self._lifecycle_lock:
+            return self._closed
+
+    def _submit_transition(
+        self, pool: ThreadPoolExecutor, fn: Any, *args: Any
+    ) -> Future[Any]:
+        with self._lifecycle_lock:
+            if self._closing or self._closed:
+                raise RuntimeError("Megatron run slot is closed")
+            future = pool.submit(fn, *args)
+            self._transition_futures.add(future)
+        future.add_done_callback(self._transition_completed)
+        return future
+
+    def _transition_completed(self, future: Future[Any]) -> None:
+        with self._lifecycle_lock:
+            self._transition_futures.discard(future)
 
     def register_run(self, registration: RunSlotRegistration) -> None:
         self.commit_run_registration(self.prepare_run_registration(registration))
@@ -1199,7 +1233,7 @@ class MCoreRunSlotExecutor:
     def prepare_run_registration(
         self, registration: RunSlotRegistration
     ) -> _PreparedRunRegistration:
-        if self._closed:
+        if self._closing or self._closed:
             raise RuntimeError("Megatron run slot is closed")
         if registration.run_id in self._runs:
             raise RuntimeError(
@@ -1283,7 +1317,9 @@ class MCoreRunSlotExecutor:
             )
         self._registration_preparations[registration.run_id] = (
             fingerprint,
-            self._load_pool.submit(self.prepare_run_registration, registration),
+            self._submit_transition(
+                self._load_pool, self.prepare_run_registration, registration
+            ),
         )
         return self._registration_preparations[registration.run_id][1]
 
@@ -1320,7 +1356,7 @@ class MCoreRunSlotExecutor:
     def commit_run_registration(self, value: _PreparedRunRegistration) -> None:
         registration, prepared = value.registration, value.load
         run_id = registration.run_id
-        if self._closed:
+        if self._closing or self._closed:
             raise RuntimeError("Megatron run slot is closed")
         if run_id in self._runs:
             raise RuntimeError(f"training run is already resident: {run_id!r}")
@@ -1835,7 +1871,7 @@ class MCoreRunSlotExecutor:
         self._load_preparations[job.operation_id] = (
             job.run_id,
             job.fingerprint,
-            self._load_pool.submit(self.prepare_load_state, job),
+            self._submit_transition(self._load_pool, self.prepare_load_state, job),
         )
 
     def load_state_prepared(self, job: LoadStateJobSpec) -> bool:
@@ -2070,8 +2106,8 @@ class MCoreRunSlotExecutor:
             raise failures[0]
         if failures:
             raise BaseExceptionGroup("Megatron run detach failed", failures)
-        self._run_cleanups[run_id] = self._cleanup_pool.submit(
-            self._finish_run_cleanup, run_id
+        self._run_cleanups[run_id] = self._submit_transition(
+            self._cleanup_pool, self._finish_run_cleanup, run_id
         )
 
     def finish_unregister_run(self, run_id: str) -> None:
@@ -2113,9 +2149,17 @@ class MCoreRunSlotExecutor:
             raise BaseExceptionGroup("Megatron run cleanup failed", failures)
         self._runs.pop(run_id)
 
-    def close(self) -> None:
-        if self._closed:
-            return
+    def close(self, *, deadline: float | None = None) -> None:
+        deadline = (
+            time.monotonic() + self._residency.config.shutdown_timeout_s
+            if deadline is None
+            else deadline
+        )
+        with self._lifecycle_lock:
+            if self._closed:
+                return
+            self._closing = True
+            tracked_futures = tuple(self._transition_futures)
         failures: list[BaseException] = []
         for state in self._runs.values():
             if state.gradients is not None:
@@ -2127,27 +2171,48 @@ class MCoreRunSlotExecutor:
             *(value[2] for value in self._load_preparations.values()),
             *(value[1] for value in self._registration_preparations.values()),
             *self._run_cleanups.values(),
+            *tracked_futures,
         )
         for future in futures:
             future.cancel()
-        _done, pending = wait(
-            futures, timeout=self._residency.config.shutdown_timeout_s
-        )
+        _done, pending = wait(futures, timeout=max(0.0, deadline - time.monotonic()))
         self._load_pool.shutdown(wait=False, cancel_futures=True)
         self._cleanup_pool.shutdown(wait=False, cancel_futures=True)
         try:
-            self._publisher.close()
+            self._publisher.close(deadline=deadline)
         except BaseException as error:
             failures.append(error)
         try:
-            self._residency.close()
+            self._residency.close(deadline=deadline)
         except BaseException as error:
             failures.append(error)
-        self._closed = True
         if pending:
             failures.append(
                 TimeoutError(
-                    f"{len(pending)} state preparations exceeded shutdown timeout"
+                    f"{len(pending)} state preparations exceeded shutdown deadline"
+                )
+            )
+        with self._lifecycle_lock:
+            live_transitions = tuple(
+                future for future in self._transition_futures if not future.done()
+            )
+        safe = (
+            not pending
+            and not live_transitions
+            and self._publisher.closed
+            and self._residency.closed
+        )
+        if safe:
+            self._load_pool.shutdown(wait=True, cancel_futures=True)
+            self._cleanup_pool.shutdown(wait=True, cancel_futures=True)
+            with self._lifecycle_lock:
+                self._closed = True
+                self._closing = False
+        else:
+            failures.append(
+                TimeoutError(
+                    "Megatron run slot retained "
+                    f"{len(set(pending).union(live_transitions))} transition workers"
                 )
             )
         if len(failures) == 1:
@@ -2162,7 +2227,7 @@ class MCoreRunSlotExecutor:
         require_complete: bool = True,
         allow_unregistering: bool = False,
     ) -> _ResidentRunState:
-        if self._closed:
+        if self._closing or self._closed:
             raise RuntimeError("Megatron run slot is closed")
         try:
             state = self._runs[run_id]
@@ -2488,9 +2553,35 @@ class _GenerationPublisher:
         self._prepared: dict[str, _PreparedRankSnapshot] = {}
         self._prepared_order: deque[str] = deque()
         self._residency_retirements: set[Future[None]] = set()
+        self._work: set[Future[Any]] = set()
         self._failures: list[BaseException] = []
         self._next_admission_order = 0
         self._in_flight = 0
+        self._closing = False
+        self._closed = False
+
+    @property
+    def closed(self) -> bool:
+        with self._lock:
+            return self._closed
+
+    def _submit(
+        self,
+        pool: ThreadPoolExecutor,
+        fn: Any,
+        *args: Any,
+    ) -> Future[Any]:
+        with self._lock:
+            if self._closing or self._closed:
+                raise RuntimeError("generation publisher is closed")
+            future = pool.submit(fn, *args)
+            self._work.add(future)
+        future.add_done_callback(self._work_completed)
+        return future
+
+    def _work_completed(self, future: Future[Any]) -> None:
+        with self._lock:
+            self._work.discard(future)
 
     def stage(
         self,
@@ -2562,8 +2653,12 @@ class _GenerationPublisher:
                 if residency_key is None
                 else residency_key.model_copy(update={"representation": "sampler"})
             )
-            resolved = self._resolution_pool.submit(
-                self._resolve_generation, lora, optimizer, lora_residency_key
+            resolved = self._submit(
+                self._resolution_pool,
+                self._resolve_generation,
+                lora,
+                optimizer,
+                lora_residency_key,
             )
             entry = _CachedGeneration(
                 run_id=run_id,
@@ -2666,7 +2761,8 @@ class _GenerationPublisher:
         sampler_key = weights_key.model_copy(update={"representation": "sampler"})
         weights_l2 = self._residency.retain_l2(weights_key)
         try:
-            prepared = self._sampler_pool.submit(
+            prepared = self._submit(
+                self._sampler_pool,
                 self._prepare_resident_lora,
                 weights_key,
                 weights_l2,
@@ -2822,7 +2918,7 @@ class _GenerationPublisher:
                 stager=stager,
             )
         self.runtime.optimizer_snapshot_barrier.register(optimizer, key=entry.run_id)
-        resolved = self._resolution_pool.submit(optimizer.resolve)
+        resolved = self._submit(self._resolution_pool, optimizer.resolve)
         with self._lock:
             if entry.retired or entry.released or entry.optimizer_upgrade is not None:
                 raise RuntimeError(
@@ -3006,8 +3102,8 @@ class _GenerationPublisher:
                     "LoRA readiness collective accepted a missing snapshot stager"
                 )
             self.runtime.optimizer_snapshot_barrier.register(pending, key=run_id)
-            resolved = self._resolution_pool.submit(
-                self._resolve_ordered_sampler, pending
+            resolved = self._submit(
+                self._resolution_pool, self._resolve_ordered_sampler, pending
             )
             entry = _CachedGeneration(
                 run_id=run_id,
@@ -3451,11 +3547,12 @@ class _GenerationPublisher:
                 if prepared.distributed_adapter is not None
                 else self._transport_pool
             )
-            transport = transport_pool.submit(
-                self._transfer_prepared_snapshot, prepared, started
+            transport = self._submit(
+                transport_pool, self._transfer_prepared_snapshot, prepared, started
             )
             durability = self._start_durability(prepared, started)
-            publication = self._completion_pool.submit(
+            publication = self._submit(
+                self._completion_pool,
                 self._complete_publication,
                 transport,
                 durability,
@@ -3481,8 +3578,11 @@ class _GenerationPublisher:
         self, prepared: _PreparedRankSnapshot, submitted_at: float
     ) -> Future[_RankSnapshotPersistence]:
         if self._requires_durable_write(prepared):
-            return self._durability_pool.submit(
-                self._persist_prepared_snapshot, prepared, submitted_at
+            return self._submit(
+                self._durability_pool,
+                self._persist_prepared_snapshot,
+                prepared,
+                submitted_at,
             )
         completed: Future[_RankSnapshotPersistence] = Future()
         completed.set_result(self._persist_prepared_snapshot(prepared, submitted_at))
@@ -3913,8 +4013,8 @@ class _GenerationPublisher:
         resident = entry.resident_lora
         if resident is None or self._residency is None:
             raise RuntimeError("generation has no resident LoRA source")
-        return self._sampler_pool.submit(
-            self._consolidate_resident_lora_sync, resident
+        return self._submit(
+            self._sampler_pool, self._consolidate_resident_lora_sync, resident
         ).result()
 
     def _consolidate_resident_lora_sync(
@@ -4517,9 +4617,22 @@ class _GenerationPublisher:
         if failures:
             raise BaseExceptionGroup("trainer generation publication failed", failures)
 
-    def close(self) -> None:
+    def close(self, *, deadline: float | None = None) -> None:
+        deadline = (
+            time.monotonic()
+            + (
+                process_shutdown_timeout(2)
+                if self._residency is None
+                else self._residency.config.shutdown_timeout_s
+            )
+            if deadline is None
+            else deadline
+        )
         failures: list[BaseException] = []
         with self._lock:
+            if self._closed:
+                return
+            self._closing = True
             dormant = tuple(
                 prepared
                 for prepared in self._prepared.values()
@@ -4536,52 +4649,77 @@ class _GenerationPublisher:
                 entry.retired = True
         for entry in entries:
             self._maybe_release(entry)
-        self._sampler_pool.shutdown(wait=True)
-        self._resolution_pool.shutdown(wait=True)
-        self._transport_pool.shutdown(wait=True)
-        self._ordered_transport_pool.shutdown(wait=True)
-        self._durability_pool.shutdown(wait=True)
-        self._completion_pool.shutdown(wait=True)
+        pools = (
+            self._sampler_pool,
+            self._resolution_pool,
+            self._transport_pool,
+            self._ordered_transport_pool,
+            self._durability_pool,
+            self._completion_pool,
+        )
+        with self._lock:
+            work = tuple(self._work)
+        for future in work:
+            future.cancel()
+        for pool in pools:
+            pool.shutdown(wait=False, cancel_futures=True)
+        _done, pending_work = wait(work, timeout=max(0.0, deadline - time.monotonic()))
+        if not pending_work:
+            for pool in pools:
+                pool.shutdown(wait=True, cancel_futures=True)
         for entry in entries:
             self._maybe_release(entry)
         with self._lock:
             retirements = tuple(self._residency_retirements)
-        _done, pending = wait(
-            retirements,
-            timeout=(
-                None
-                if self._residency is None
-                else self._residency.config.shutdown_timeout_s
-            ),
+        _done, pending_retirements = wait(
+            retirements, timeout=max(0.0, deadline - time.monotonic())
         )
-        if pending:
-            failures.append(
-                TimeoutError(
-                    f"{len(pending)} sampler residency retirements exceeded shutdown timeout"
-                )
+        with self._lock:
+            live_work = tuple(future for future in self._work if not future.done())
+            live_retirements = tuple(
+                future for future in self._residency_retirements if not future.done()
             )
-        if self._transport_sender is not None:
+            in_flight = self._in_flight
+        safe = not (
+            pending_work
+            or pending_retirements
+            or live_work
+            or live_retirements
+            or in_flight
+        )
+        if safe and self._transport_sender is not None:
             try:
                 self._transport_sender.close()
             except BaseException as error:
                 failures.append(error)
             self._transport_sender = None
-        if self._object_store is not None:
+        if safe and self._object_store is not None:
             try:
                 self._object_store.close()
             except BaseException as error:
                 failures.append(error)
             self._object_store = None
-        with self._lock:
-            in_flight = self._in_flight
-        if in_flight:
+        if not safe:
             failures.append(
-                RuntimeError(f"publication close retained {in_flight} snapshots")
+                TimeoutError(
+                    "generation publisher shutdown deadline left "
+                    f"{len(set(pending_work).union(live_work))} worker futures, "
+                    f"{len(set(pending_retirements).union(live_retirements))} "
+                    f"residency retirements, and {in_flight} snapshots"
+                )
+            )
+        elif time.monotonic() > deadline:
+            failures.append(
+                TimeoutError("generation publisher exceeded shutdown deadline")
             )
         try:
             self.raise_if_failed()
         except BaseException as error:
             failures.append(error)
+        if safe:
+            with self._lock:
+                self._closed = True
+                self._closing = False
         if len(failures) == 1:
             raise failures[0]
         if failures:

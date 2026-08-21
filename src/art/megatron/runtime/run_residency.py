@@ -3,6 +3,7 @@ from __future__ import annotations
 from concurrent.futures import Future, ThreadPoolExecutor, wait
 from contextlib import contextmanager
 from threading import Condition, Lock, RLock
+import time
 from typing import Any, Iterable, Iterator
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -98,6 +99,11 @@ class RunResidencyManager:
         self._active_transitions = 0
         self._closing = False
         self._closed = False
+
+    @property
+    def closed(self) -> bool:
+        with self._lock:
+            return self._closed
 
     def register_l1(
         self, key: ResidencyKey, tensors: tuple[torch.Tensor, ...]
@@ -723,17 +729,22 @@ class RunResidencyManager:
         with self._lock:
             return tuple(key for key in self._states if key.run_id == run_id)
 
-    def close(self) -> None:
+    def close(self, *, deadline: float | None = None) -> None:
+        deadline = (
+            time.monotonic() + self.config.shutdown_timeout_s
+            if deadline is None
+            else deadline
+        )
         with self._lock:
             if self._closed:
                 return
-            if self._closing:
-                raise RuntimeError("run residency manager close is already in progress")
             self._closing = True
             self._transition_slots.notify_all()
             futures = tuple(self._futures)
-        _done, pending = wait(futures, timeout=self.config.shutdown_timeout_s)
+        for future in futures:
+            future.cancel()
         self._pool.shutdown(wait=False, cancel_futures=True)
+        _done, pending = wait(futures, timeout=max(0.0, deadline - time.monotonic()))
         failures: list[BaseException] = []
         if not pending:
             with self._lock:
@@ -743,9 +754,16 @@ class RunResidencyManager:
                     if (transition := state.l1_transition) is not None
                 }
                 for transition in transitions.values():
-                    self._finish_l1_transfer_locked(transition, synchronize=True)
+                    if time.monotonic() >= deadline:
+                        break
+                    try:
+                        self._finish_l1_transfer_locked(transition, synchronize=True)
+                    except BaseException as error:
+                        failures.append(error)
                 states = tuple(self._states.values())
             for state in states:
+                if time.monotonic() >= deadline:
+                    break
                 try:
                     self._retire(state.key)
                 except BaseException as error:
@@ -755,14 +773,34 @@ class RunResidencyManager:
         except BaseException as error:
             failures.append(error)
         with self._lock:
-            self._closed = True
-            self._closing = False
-        if pending:
+            live_futures = tuple(
+                future for future in self._futures if not future.done()
+            )
+            live_transitions = self._active_transitions + sum(
+                state.l1_transition is not None for state in self._states.values()
+            )
+            remaining_states = len(self._states)
+        unsafe = bool(
+            pending
+            or live_futures
+            or live_transitions
+            or remaining_states
+            or time.monotonic() > deadline
+        )
+        if unsafe:
             failures.append(
                 TimeoutError(
-                    f"{len(pending)} residency transitions exceeded shutdown timeout"
+                    "run residency shutdown deadline left "
+                    f"{len(set(pending).union(live_futures))} worker futures and "
+                    f"{live_transitions} active transitions and "
+                    f"{remaining_states} resident states"
                 )
             )
+        else:
+            self._pool.shutdown(wait=True, cancel_futures=True)
+            with self._lock:
+                self._closed = True
+                self._closing = False
         if len(failures) == 1:
             raise failures[0]
         if failures:
@@ -1167,8 +1205,10 @@ class RunResidencyManager:
                 self._try_retire(key)
 
     def _submit(self, fn: Any, *args: Any) -> Future[Any]:
-        future = self._pool.submit(fn, *args)
         with self._lock:
+            if self._closing or self._closed:
+                raise RuntimeError("run residency manager is closed")
+            future = self._pool.submit(fn, *args)
             self._futures.add(future)
         future.add_done_callback(self._completed)
         return future
