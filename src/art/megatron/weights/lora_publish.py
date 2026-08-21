@@ -181,11 +181,55 @@ def build_local_lora_export_plan(
     slot_ref: LoRASlotRef | None = None,
 ) -> LocalLoraExportPlan:
     """Compile model traversal into stable indices; no parameter data is copied."""
-    source_indices = {id(tensor): index for index, tensor in enumerate(residency_tensors)}
+    sources = tuple(
+        (
+            module,
+            tuple(module._lora_params(slot_ref)),
+            tuple(module._export_items(slot_ref)),
+        )
+        for module in iter_lora_modules(model_chunks)
+    )
+    return _build_lora_export_plan(
+        sources, residency_tensors, adapter_dtypes, packed_expert_groups
+    )
+
+
+def build_prepared_lora_export_plan(
+    sites: Sequence[tuple[LoRA, Any]],
+    residency_tensors: Sequence[torch.Tensor],
+    adapter_dtypes: dict[str, torch.dtype],
+    *,
+    packed_expert_groups: Sequence[ExpertPackedLoraGroup] = (),
+) -> LocalLoraExportPlan:
+    """Compile detached checkpoint slots without installing them in the model."""
+    sources = []
+    for module, slot in sites:
+        params = (("lora_A.weight", slot.A_T), ("lora_B.weight", slot.B_T))
+        sources.append((module, params, _export_items_from_params(module, params)))
+    return _build_lora_export_plan(
+        sources, residency_tensors, adapter_dtypes, packed_expert_groups
+    )
+
+
+def _build_lora_export_plan(
+    sources: Iterable[
+        tuple[
+            LoRA,
+            Sequence[tuple[str, torch.nn.Parameter]],
+            Sequence[tuple[str, torch.nn.Parameter, int | None]],
+        ]
+    ],
+    residency_tensors: Sequence[torch.Tensor],
+    adapter_dtypes: dict[str, torch.dtype],
+    packed_expert_groups: Sequence[ExpertPackedLoraGroup],
+) -> LocalLoraExportPlan:
+    source_indices = {
+        id(tensor): index for index, tensor in enumerate(residency_tensors)
+    }
     entries: list[LocalLoraExportEntry] = []
-    for module in iter_lora_modules(model_chunks):
-        packed = _uses_packed_expert_publish(module, packed_expert_groups, slot_ref)
-        for key, param, expert in module._export_items(slot_ref):
+    for module, params, export_items in sources:
+        packed = _uses_packed_expert_params(module, packed_expert_groups, params)
+        for key, param, expert in export_items:
             if packed and module._is_expert_parameter(param):
                 continue
             try:
@@ -211,7 +255,7 @@ def build_local_lora_export_plan(
         expert_ids = tuple(expert for expert in module.expert_ids if expert is not None)
         if not expert_ids:
             continue
-        for suffix, param in module._lora_params(slot_ref):
+        for suffix, param in params:
             if not module._is_expert_parameter(param):
                 continue
             slot_match = _packed_expert_slot(
@@ -253,6 +297,34 @@ def build_local_lora_export_plan(
     )
 
 
+def _export_items_from_params(
+    module: LoRA, params: Sequence[tuple[str, torch.nn.Parameter]]
+) -> tuple[tuple[str, torch.nn.Parameter, int | None], ...]:
+    items = []
+    for suffix, param in params:
+        if not module._should_export_parameter(param):
+            continue
+        if module._is_expert_parameter(param):
+            items.extend(
+                (
+                    f"{module.adapter_model_prefix.format(expert=expert)}.{suffix}",
+                    param,
+                    local_expert,
+                )
+                for local_expert, expert in enumerate(module.expert_ids)
+                if expert is not None
+            )
+        else:
+            items.append(
+                (
+                    f"{module._adapter_model_prefix_for_param(param)}.{suffix}",
+                    param,
+                    None,
+                )
+            )
+    return tuple(items)
+
+
 def iter_lora_modules(model_chunks: ModelChunks) -> Iterable[LoRA]:
     for chunk in model_chunks:
         for module in chunk.modules():
@@ -289,9 +361,18 @@ def _uses_packed_expert_publish(
     groups: Sequence[ExpertPackedLoraGroup],
     slot_ref: LoRASlotRef | None = None,
 ) -> bool:
+    return _uses_packed_expert_params(
+        module, groups, tuple(module._lora_params(slot_ref))
+    )
+
+
+def _uses_packed_expert_params(
+    module: LoRA,
+    groups: Sequence[ExpertPackedLoraGroup],
+    params: Sequence[tuple[str, torch.nn.Parameter]],
+) -> bool:
     if module.num_local_experts <= 1:
         return False
-    params = tuple(module._lora_params(slot_ref))
     return bool(params) and all(
         _packed_expert_slot(module.adapter_model_prefix, suffix, groups) is not None
         for suffix, _param in params

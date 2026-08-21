@@ -1,4 +1,4 @@
-from concurrent.futures import Future
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager
 from types import SimpleNamespace
 from typing import Any, cast
@@ -8,6 +8,7 @@ import torch
 
 from art.megatron import optimizer_state as optimizer_state_module
 from art.megatron.model_support import lora_disk
+from art.megatron.optimizer_state import CheckpointFile, OptimizerAdapter
 from art.megatron.runtime.executor import (
     GenerationResidency,
     MCoreRunSlotExecutor,
@@ -203,6 +204,12 @@ class _Residency:
         future.set_result(SimpleNamespace(tensors=lambda: self.components[key]))
         return future
 
+    def retain_l2(self, key: Any) -> Future[Any]:
+        return self.ensure_l2(key)
+
+    def release_l2(self, _key: Any) -> None:
+        return None
+
     @contextmanager
     def borrow_l2(self, key: Any) -> Any:
         yield SimpleNamespace(tensors=lambda: self.components[key])
@@ -213,7 +220,7 @@ class _Publisher:
         self.registrations: list[dict[str, Any]] = []
         self.fail = False
 
-    def register_existing(self, **kwargs: Any) -> dict[str, float]:
+    def register_resident_generation(self, **kwargs: Any) -> dict[str, float]:
         if self.fail:
             raise RuntimeError("forced publication failure")
         self.registrations.append(kwargs)
@@ -262,23 +269,37 @@ def _executor(
     executor._publisher = publisher
     executor._load_preparations = {}
     executor._registration_preparations = {}
+    executor._cleanup_pool = ThreadPoolExecutor(max_workers=1)
+    executor._run_cleanups = {}
     executor._runs = {}
     executor._closed = False
+    monkeypatch.setattr(
+        MCoreRunSlotExecutor,
+        "_build_prepared_lora_export_plan",
+        lambda _self, _checkpoint: "export-plan",
+    )
     return executor, slot, residency, publisher
 
 
 def _register(executor: MCoreRunSlotExecutor, **kwargs: Any) -> None:
+    generation_id = "step-00000000-0123456789abcdef0123456789abcdef"
     executor.register_run(
         RunSlotRegistration(
             tenant_id="tenant",
             run_id="run",
             training_session_id="session",
             learner_version=0,
-            generation_id="step-00000000-0123456789abcdef0123456789abcdef",
-            adapter_path="/adapter",
-            adapter_step=0,
-            adapter_training_session_id="session",
-            adapter_generation_id="step-00000000-0123456789abcdef0123456789abcdef",
+            generation_id=generation_id,
+            adapter=OptimizerAdapter(
+                identity="/adapter",
+                training_session_id="session",
+                step=0,
+                generation_id=generation_id,
+                files=(
+                    CheckpointFile(name="adapter_config.json", size_bytes=1),
+                    CheckpointFile(name="adapter_model.safetensors", size_bytes=1),
+                ),
+            ),
             optimizer_state_path="/optimizer",
             **kwargs,
         )
@@ -369,9 +390,9 @@ def test_fresh_registration_first_fb_then_optim_reuses_prepared_state(
     executor.complete_run_registration("run")
 
     assert publisher.registrations[0]["optimizer_source"] is pending.optimizer.source
-    assert (
-        publisher.registrations[0]["optimizer_residency_key"] == pending.optimizer_key
-    )
+    assert publisher.registrations[0]["weights_key"] == pending.weights_key
+    assert publisher.registrations[0]["optimizer_key"] == pending.optimizer_key
+    assert publisher.registrations[0]["export_plan"] == "export-plan"
     assert slot.weight_installs == slot.optimizer_installs == 0
 
     residency.acquire_error = ResidencyCapacityUnavailable("forced L1 capacity")
@@ -437,6 +458,11 @@ def test_fresh_initial_optimizer_snapshots_from_l2_before_l1_install(
         SimpleNamespace(rank=0, world_size=1),
         capacity=2,
         residency=cast(Any, residency),
+    )
+    monkeypatch.setattr(
+        publisher,
+        "_prepare_resident_lora",
+        lambda *_args, **_kwargs: SimpleNamespace(),
     )
     executor._publisher = publisher
     optimizer_snapshot = object()
@@ -518,6 +544,7 @@ def test_existing_install_setup_failure_keeps_previous_checkpoint(
         optimizer_key=None,
         checkpoint=replacement,
         optimizer=None,
+        lora_export_plan="replacement-plan",
         adapter_config=state.adapter_config,
     )
     residency.register_l2_working_set(((replacement_key, prepared.weights),))
@@ -569,7 +596,7 @@ def test_unregister_retries_repeated_checkpoint_unload_failure(
         assert set(residency.components) == resident_keys
         assert residency.retirements == []
         with pytest.raises(RuntimeError, match="being unregistered"):
-            executor.prepare_residency("run", "forward")
+            executor.prepare_residency("run", "forward", 0)
 
     slot.unload_error = None
 
@@ -611,7 +638,7 @@ def test_unregister_retries_residency_retirement_failure(
     assert slot.unload_calls == 1 and slot.installed_checkpoint is None
     assert tuple(key.representation for key in residency.keys("run")) == ("weights",)
     with pytest.raises(RuntimeError, match="being unregistered"):
-        executor.prepare_residency("run", "forward")
+        executor.prepare_residency("run", "forward", 0)
 
     residency.retirement_errors.clear()
     executor.unregister_run("run")
@@ -669,7 +696,7 @@ def test_exact_resume_uses_prepared_layout_and_is_published_exactly(
 
     registration = publisher.registrations[0]
     assert registration["optimizer_source"] is pending.optimizer.source
-    assert registration["optimizer_residency_key"] == pending.optimizer_key
+    assert registration["optimizer_key"] == pending.optimizer_key
     assert slot.weight_installs == slot.optimizer_installs == 0
 
 

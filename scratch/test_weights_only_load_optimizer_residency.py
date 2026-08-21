@@ -100,7 +100,7 @@ class _Publisher:
     def __init__(self) -> None:
         self.registrations: list[dict[str, Any]] = []
 
-    def register_existing(self, **kwargs: Any) -> dict[str, float]:
+    def register_resident_generation(self, **kwargs: Any) -> dict[str, float]:
         self.registrations.append(kwargs)
         return {}
 
@@ -177,6 +177,11 @@ def _executor(
     executor._publisher = publisher
     executor._runs = {"run": state}
     executor._closed = False
+    monkeypatch.setattr(
+        MCoreRunSlotExecutor,
+        "_build_prepared_lora_export_plan",
+        lambda _self, _checkpoint: "replacement-plan",
+    )
     monkeypatch.setattr(lora_disk, "load_adapter_config", lambda _path: _CONFIG)
     monkeypatch.setattr(
         executor_module,
@@ -222,8 +227,11 @@ def test_weights_only_load_registers_fresh_cpu_optimizer_in_l2(
         {
             "run_id": "run",
             "generation": job.generation,
+            "weights_key": prepared.weights_key,
+            "export_plan": "replacement-plan",
+            "adapter_config": _CONFIG,
             "optimizer_source": prepared.optimizer.source,
-            "optimizer_residency_key": prepared.optimizer_key,
+            "optimizer_key": prepared.optimizer_key,
         }
     ]
 

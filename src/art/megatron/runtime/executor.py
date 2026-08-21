@@ -1088,6 +1088,7 @@ class _PreparedRunLoad(BaseModel):
     optimizer_key: ResidencyKey | None
     checkpoint: Any
     optimizer: Any | None
+    lora_export_plan: Any
     adapter_config: dict[str, Any]
     optimizer_restored: bool = False
 
@@ -1214,6 +1215,7 @@ class MCoreRunSlotExecutor:
             ),
             device="cpu",
         )
+        export_plan = self._build_prepared_lora_export_plan(checkpoint)
         if registration.initial_optimizer_state_path is not None:
             assert registration.initial_optimizer_generation_id is not None
             loaded_optimizer = load_trainer_rank_optimizer_state(
@@ -1247,6 +1249,7 @@ class MCoreRunSlotExecutor:
             optimizer_key=optimizer_key,
             checkpoint=checkpoint,
             optimizer=optimizer,
+            lora_export_plan=export_plan,
             optimizer_restored=(registration.initial_optimizer_state_path is not None),
             adapter_config=adapter_config,
         )
@@ -1337,6 +1340,7 @@ class MCoreRunSlotExecutor:
                 adapter_path=registration.adapter.identity,
             ),
             pending_load=prepared,
+            lora_export_plan=prepared.lora_export_plan,
         )
         self._residency.register_l2_working_set(
             (
@@ -1376,11 +1380,14 @@ class MCoreRunSlotExecutor:
                 or pending.optimizer_key is None
             ):
                 raise RuntimeError("run registration has no prepared L2 working set")
-            self._publisher.register_existing(
+            self._publisher.register_resident_generation(
                 run_id=run_id,
                 generation=generation,
+                weights_key=pending.weights_key,
+                export_plan=pending.lora_export_plan,
+                adapter_config=pending.adapter_config,
                 optimizer_source=pending.optimizer.snapshot_source(),
-                optimizer_residency_key=pending.optimizer_key,
+                optimizer_key=pending.optimizer_key,
             )
         except BaseException as error:
             try:
@@ -1677,22 +1684,9 @@ class MCoreRunSlotExecutor:
             )
             if optimizer_source is None:
                 raise RuntimeError("optimizer commit has no immutable optimizer state")
-            from art.megatron.lora import LoRASlotRef
-            from art.megatron.weights.lora_publish import (
-                build_local_lora_export_plan,
-            )
-
             export_plan = state.lora_export_plan
             if export_plan is None:
-                export_plan = state.lora_export_plan = build_local_lora_export_plan(
-                    self.runtime.model,
-                    residency_tensors.weights,
-                    {},
-                    packed_expert_groups=(
-                        self.runtime.model_support_handler.expert_packed_lora_groups()
-                    ),
-                    slot_ref=LoRASlotRef("checkpoint", job.run_id),
-                )
+                raise RuntimeError("resident run has no immutable LoRA export plan")
         if not result["update_successful"] or not math.isfinite(result["grad_norm"]):
             raise RuntimeError("dynamic LoRA optimizer rejected the update")
         optimizer_step_s = time.perf_counter() - started
@@ -1773,6 +1767,7 @@ class MCoreRunSlotExecutor:
             MaterializedCheckpoint(path=job.run_id, directory=job.adapter_path),
             device="cpu",
         )
+        export_plan = self._build_prepared_lora_export_plan(checkpoint)
         if job.optimizer_state_path is not None:
             assert job.optimizer_generation_id is not None
             loaded = load_trainer_rank_optimizer_state(
@@ -1810,6 +1805,7 @@ class MCoreRunSlotExecutor:
             ),
             checkpoint=checkpoint,
             optimizer=optimizer,
+            lora_export_plan=export_plan,
             optimizer_restored=job.restore_optimizer,
             adapter_config=config,
         )
@@ -1901,11 +1897,14 @@ class MCoreRunSlotExecutor:
             self._residency.retire(optimizer_key)
             raise RuntimeError("loaded generation has no matching immutable adapter")
         try:
-            snapshot_metrics = self._publisher.register_existing(
+            snapshot_metrics = self._publisher.register_resident_generation(
                 run_id=job.run_id,
                 generation=job.generation,
+                weights_key=prepared.weights_key,
+                export_plan=prepared.lora_export_plan,
+                adapter_config=prepared.adapter_config,
                 optimizer_source=prepared.optimizer.snapshot_source(),
-                optimizer_residency_key=optimizer_key,
+                optimizer_key=optimizer_key,
             )
         except BaseException:
             self._residency.retire(prepared.weights_key)
@@ -1925,6 +1924,7 @@ class MCoreRunSlotExecutor:
                 optimizer=optimizer_key,
             )
             state.pending_load = prepared
+            state.lora_export_plan = prepared.lora_export_plan
             state.learner_version = job.learner_version
         return {
             "operation_id": job.operation_id,
@@ -1937,6 +1937,20 @@ class MCoreRunSlotExecutor:
                 **snapshot_metrics,
             },
         }
+
+    def _build_prepared_lora_export_plan(self, checkpoint: Any) -> Any:
+        from art.megatron.weights.lora_publish import (
+            build_prepared_lora_export_plan,
+        )
+
+        return build_prepared_lora_export_plan(
+            checkpoint.sites,
+            checkpoint.parameters,
+            {},
+            packed_expert_groups=(
+                self.runtime.model_support_handler.expert_packed_lora_groups()
+            ),
+        )
 
     def execute_snapshot(
         self,

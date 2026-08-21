@@ -218,6 +218,7 @@ def _state(
         installed_weights=desired.weights if installed else None,
         installed_optimizer=desired.optimizer if installed else None,
         registration_complete=True,
+        lora_export_plan="export-plan",
     )
 
 
