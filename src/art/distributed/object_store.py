@@ -11,7 +11,7 @@ from pathlib import Path, PurePosixPath
 import re
 import shutil
 from threading import Lock
-from typing import Annotated, Any, Iterable, Literal
+from typing import Annotated, Any, Callable, Iterable, Literal, Sequence
 from uuid import uuid4
 
 from pydantic import (
@@ -371,18 +371,82 @@ class S3BinaryObjectStore:
         file_sha256: dict[str, str] | None = None,
     ) -> OrderedBinaryObjectRef:
         """Publish caller-owned buffers as directly consumable ordered shards."""
-        self._require_target(target)
         plan = _ordered_binary_object_plan(target, files, file_sha256)
-        plan_body = _model_bytes(plan)
-        ref = _ordered_binary_object_ref(target, plan, plan_body=plan_body)
-        prefix = self._prefix(target)
-        self._put_immutable(f"{prefix}/_PLAN.json", plan_body)
+        ref = self.publish_ordered_plan(target, plan)
         stored = self._upload_ordered_shards(
             target, plan, files, plan_sha256=ref.plan_sha256
         )
-        commit = OrderedBinaryObjectCommit(ref=ref, shards=stored)
-        body = _model_bytes(commit)
-        self._put_immutable(f"{prefix}/_COMMITTED.json", body)
+        return self.commit_ordered(target, plan, stored)
+
+    def publish_ordered_plan(
+        self,
+        target: OrderedBinaryObjectTarget,
+        plan: OrderedBinaryObjectPlan,
+    ) -> OrderedBinaryObjectRef:
+        """Publish the immutable plan before any independently owned shards."""
+        self._require_target(target)
+        _require_ordered_plan_target(
+            target,
+            plan,
+            expected_byte_count=sum(file.byte_count for file in plan.files),
+        )
+        plan_body = _model_bytes(plan)
+        ref = _ordered_binary_object_ref(target, plan, plan_body=plan_body)
+        self._put_immutable(f"{self._prefix(target)}/_PLAN.json", plan_body)
+        return ref
+
+    def upload_ordered_shards(
+        self,
+        target: OrderedBinaryObjectTarget,
+        plan: OrderedBinaryObjectPlan,
+        payloads: dict[int, tuple[memoryview, ...]],
+    ) -> tuple[StoredOrderedBinaryObjectShard, ...]:
+        """Upload an arbitrary, bounded subset of a previously published plan."""
+        self._require_target(target)
+        _require_ordered_plan_target(
+            target,
+            plan,
+            expected_byte_count=sum(file.byte_count for file in plan.files),
+        )
+        ref = _ordered_binary_object_ref(target, plan)
+        shards = {shard.index: shard for shard in plan.shards}
+        if any(index not in shards for index in payloads):
+            raise ValueError("ordered shard payload identifies an unknown shard")
+        for index, chunks in payloads.items():
+            if sum(chunk.nbytes for chunk in chunks) != shards[index].byte_count:
+                raise ValueError("ordered shard payload has the wrong byte count")
+        return self._upload_ordered_payloads(
+            target,
+            tuple(shards[index] for index in sorted(payloads)),
+            payloads,
+            plan_sha256=ref.plan_sha256,
+            source_sha256={file.relative_path: file.sha256 for file in plan.files},
+        )
+
+    def commit_ordered(
+        self,
+        target: OrderedBinaryObjectTarget,
+        plan: OrderedBinaryObjectPlan,
+        shards: Sequence[StoredOrderedBinaryObjectShard],
+    ) -> OrderedBinaryObjectRef:
+        """Commit a complete distributed upload after every planned shard exists."""
+        self._require_target(target)
+        ref = ordered_binary_object_ref_from_plan(target, plan)
+        ordered = tuple(sorted(shards, key=lambda shard: shard.index))
+        if len(ordered) != len(plan.shards) or any(
+            stored.index != planned.index
+            or stored.byte_count != planned.byte_count
+            for stored, planned in zip(ordered, plan.shards, strict=False)
+        ):
+            raise ValueError("ordered shard results differ from the published plan")
+        commit = OrderedBinaryObjectCommit(
+            ref=ref,
+            shards=ordered,
+        )
+        self._put_immutable(
+            f"{self._prefix(target)}/_COMMITTED.json",
+            _model_bytes(commit),
+        )
         return ref
 
     def resolve_ordered(
@@ -939,28 +1003,65 @@ class S3BinaryObjectStore:
         *,
         plan_sha256: str,
     ) -> tuple[StoredOrderedBinaryObjectShard, ...]:
+        return self._upload_ordered_shard_set(
+            target,
+            plan.shards,
+            lambda shard: (files[shard.relative_path], shard.file_offset),
+            plan_sha256=plan_sha256,
+            source_sha256={file.relative_path: file.sha256 for file in plan.files},
+        )
+
+    def _upload_ordered_payloads(
+        self,
+        target: OrderedBinaryObjectTarget,
+        shards: tuple[OrderedBinaryObjectShard, ...],
+        payloads: dict[int, tuple[memoryview, ...]],
+        *,
+        plan_sha256: str,
+        source_sha256: dict[str, str | None],
+    ) -> tuple[StoredOrderedBinaryObjectShard, ...]:
+        return self._upload_ordered_shard_set(
+            target,
+            shards,
+            lambda shard: (payloads[shard.index], 0),
+            plan_sha256=plan_sha256,
+            source_sha256=source_sha256,
+        )
+
+    def _upload_ordered_shard_set(
+        self,
+        target: OrderedBinaryObjectTarget,
+        shards: Sequence[OrderedBinaryObjectShard],
+        source: Callable[
+            [OrderedBinaryObjectShard], tuple[tuple[memoryview, ...], int]
+        ],
+        *,
+        plan_sha256: str,
+        source_sha256: dict[str, str | None],
+    ) -> tuple[StoredOrderedBinaryObjectShard, ...]:
         pending: dict[Future[StoredOrderedBinaryObjectShard], int] = {}
         completed: list[StoredOrderedBinaryObjectShard] = []
-        shards = iter(plan.shards)
-        source_sha256 = {file.relative_path: file.sha256 for file in plan.files}
+        remaining = iter(shards)
 
         def submit() -> bool:
             try:
-                shard = next(shards)
+                shard = next(remaining)
             except StopIteration:
                 return False
+            chunks, source_offset = source(shard)
             future = self._parts.submit(
                 self._upload_ordered_shard,
                 self._prefix(target),
                 shard,
-                files[shard.relative_path],
+                chunks,
                 plan_sha256,
                 source_sha256[shard.relative_path],
+                source_offset,
             )
             pending[future] = shard.index
             return True
 
-        for _ in range(min(target.max_concurrent_shards, len(plan.shards))):
+        for _ in range(min(target.max_concurrent_shards, len(shards))):
             submit()
         try:
             while pending:
@@ -990,6 +1091,7 @@ class S3BinaryObjectStore:
         chunks: tuple[memoryview, ...],
         plan_sha256: str,
         source_sha256: str | None,
+        source_offset: int,
     ) -> StoredOrderedBinaryObjectShard:
         key = _ordered_binary_object_shard_key(prefix, shard.index)
         metadata = _ordered_binary_object_shard_metadata(
@@ -1001,7 +1103,7 @@ class S3BinaryObjectStore:
                 Key=key,
                 Body=_ChunkRangeReader(
                     chunks,
-                    offset=shard.file_offset,
+                    offset=source_offset,
                     byte_count=shard.byte_count,
                 ),
                 ContentLength=shard.byte_count,
@@ -1363,6 +1465,19 @@ def ordered_binary_object_ref(
     return _ordered_binary_object_ref(
         target, _ordered_binary_object_layout(target, files)
     )
+
+
+def ordered_binary_object_ref_from_plan(
+    target: OrderedBinaryObjectTarget,
+    plan: OrderedBinaryObjectPlan,
+) -> OrderedBinaryObjectRef:
+    """Derive the receiver-compatible reference for an exact custom shard plan."""
+    _require_ordered_plan_target(
+        target,
+        plan,
+        expected_byte_count=sum(file.byte_count for file in plan.files),
+    )
+    return _ordered_binary_object_ref(target, plan)
 
 
 def vllm_lora_ordered_target(

@@ -13,6 +13,9 @@ import pytest
 
 from art.distributed.object_store import (
     VLLM_LORA_OBJECT_FORMAT,
+    BinaryObjectFile,
+    OrderedBinaryObjectPlan,
+    OrderedBinaryObjectShard,
     OrderedBinaryObjectTarget,
     S3BinaryObjectReceiver,
     S3BinaryObjectStore,
@@ -232,6 +235,67 @@ def test_ordered_commit_resolves_verifies_and_deletes_by_discriminator() -> None
     store.delete(ref)
     assert not any(key.startswith(f"{prefix}/") for key in client.objects)
     assert store.resolve(ref.manifest_uri, missing_ok=True) is None
+    store.close()
+
+
+def test_distributed_ordered_upload_uses_rank_local_payload_offsets() -> None:
+    target, client = _target(), _S3()
+    store = _store(target, client)
+    plan = OrderedBinaryObjectPlan(
+        object_id=target.object_id,
+        format=target.format,
+        files=(
+            BinaryObjectFile(relative_path="adapter_config.json", byte_count=3),
+            BinaryObjectFile(relative_path="adapter_model.safetensors", byte_count=10),
+        ),
+        shards=(
+            OrderedBinaryObjectShard(
+                index=0,
+                relative_path="adapter_config.json",
+                file_offset=0,
+                byte_count=3,
+            ),
+            OrderedBinaryObjectShard(
+                index=1,
+                relative_path="adapter_model.safetensors",
+                file_offset=0,
+                byte_count=4,
+            ),
+            OrderedBinaryObjectShard(
+                index=2,
+                relative_path="adapter_model.safetensors",
+                file_offset=4,
+                byte_count=4,
+            ),
+            OrderedBinaryObjectShard(
+                index=3,
+                relative_path="adapter_model.safetensors",
+                file_offset=8,
+                byte_count=2,
+            ),
+        ),
+        metadata=target.metadata,
+    )
+
+    expected = store.publish_ordered_plan(target, plan)
+    first = store.upload_ordered_shards(
+        target,
+        plan,
+        {0: (memoryview(b"cfg"),), 2: (memoryview(b"efgh"),)},
+    )
+    second = store.upload_ordered_shards(
+        target,
+        plan,
+        {1: (memoryview(b"abcd"),), 3: (memoryview(b"ij"),)},
+    )
+    assert store.commit_ordered(target, plan, (*first, *second)) == expected
+    prefix = f"{target.store.prefix}/{target.object_id}/shards"
+    assert [client.objects[f"{prefix}/{index:08d}"] for index in range(4)] == [
+        b"cfg",
+        b"abcd",
+        b"efgh",
+        b"ij",
+    ]
     store.close()
 
 
