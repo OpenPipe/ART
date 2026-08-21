@@ -3550,8 +3550,9 @@ class TrainerRank:
         *,
         context: str,
     ) -> list[AnyForwardOutput]:
-        if torch.cuda.is_available() and self.device.type == "cuda":
-            torch.cuda.synchronize(self.device)
+        # Allocator counters update on host allocation/free requests; no fence is needed.
+        profile_memory = torch.cuda.is_available() and self.device.type == "cuda"
+        if profile_memory:
             baseline = int(torch.cuda.memory_allocated(self.device))
             torch.cuda.reset_peak_memory_stats(self.device)
         else:
@@ -3561,11 +3562,8 @@ class TrainerRank:
                 "forward",
                 self._telemetry_signature(plan),
                 dedup_signature=self._telemetry_plan_signature(plan),
-                synchronized=torch.cuda.is_available() and self.device.type == "cuda",
             ):
                 outputs = self._execute_flat_plan(plan)
-                if torch.cuda.is_available() and self.device.type == "cuda":
-                    torch.cuda.synchronize(self.device)
         except torch.cuda.OutOfMemoryError as exc:
             check = self._memory_check(plan)
             self._raise_memory_error(
@@ -3575,7 +3573,7 @@ class TrainerRank:
                 message="CUDA OOM occurred despite the planner estimate",
             )
             raise AssertionError("unreachable") from exc
-        if torch.cuda.is_available() and self.device.type == "cuda":
+        if profile_memory:
             peak = int(torch.cuda.max_memory_allocated(self.device))
             self._update_memory_profile(plan, max(0, peak - baseline))
         return outputs
