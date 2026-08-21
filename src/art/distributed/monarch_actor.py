@@ -951,28 +951,11 @@ class ArtHostService(Actor):
         if retained.request.generation_id != generation_id:
             raise ValueError("packing plan generation changed before materialization")
         self._packing_plans.pop(batch_id)
-        packed = None
         packing_started = time.monotonic()
         packing_lock_wait_s = 0.0
         packing_compute_s = 0.0
-        if retained.prepared is not None:
-            from art.local.backend import LocalBackend
-
-            prepared = retained.prepared
-            async with self._packing_lock:
-                packing_lock_wait_s = time.monotonic() - packing_started
-                packing_compute_started = time.monotonic()
-                packed, cancelled = await complete_to_thread(
-                    lambda: LocalBackend._materialize_packed_tensors(
-                        prepared,
-                        packing_timings=retained.packing_timings,
-                    )
-                )
-                packing_compute_s = time.monotonic() - packing_compute_started
-                if cancelled is not None:
-                    raise cancelled
-        packing_core_s = time.monotonic() - packing_started
-        if packed is None:
+        if retained.prepared is None:
+            packing_core_s = time.monotonic() - packing_started
             return PackingResult(
                 ref=None,
                 packed_group_shapes=retained.packed_group_shapes,
@@ -988,44 +971,90 @@ class ArtHostService(Actor):
                 packing_timings=retained.packing_timings,
                 trajectory_log_wait_s=retained.trajectory_log_wait_s,
             )
-        trainable_assistant_tokens = int(packed["assistant_mask"].sum().item())
-        loss_mask = packed["assistant_mask"]
-        if retained.request.tokenized_loss is None:
-            loss_mask = loss_mask[:, 1:]
-        loss_bearing_tokens = int(loss_mask.sum().item())
-        non_padding_tokens = int((packed["group_ids"] != -1).sum().item())
-        finalize_started = time.monotonic()
-        ref = self._packed_batches.store.create(
-            packed,
-            batch_id=batch_id,
-            group_ids=retained.request.group_ids,
-            record_ids=retained.request.record_ids,
-            min_source_version=retained.request.min_source_version,
-            max_source_version=retained.request.max_source_version,
-        )
-        if ref.storage_byte_count != retained.storage_byte_count:
-            raise RuntimeError("materialized batch changed its retained storage plan")
-        packed_batch_finalize_s = time.monotonic() - finalize_started
-        return PackingResult(
-            ref=ref,
-            packed_group_shapes=retained.packed_group_shapes,
-            generation_id=generation_id,
-            trainable_assistant_tokens=trainable_assistant_tokens,
-            loss_bearing_tokens=loss_bearing_tokens,
-            non_padding_tokens=non_padding_tokens,
-            trajectory_log_path=retained.request.trajectory_log_path,
-            trajectory_fetch_s=retained.trajectory_fetch_s,
-            trajectory_receive_s=retained.trajectory_receive_s,
-            trajectory_build_s=retained.trajectory_build_s,
-            packing_core_s=retained.packing_core_s + packing_core_s,
-            packing_lock_wait_s=(
-                retained.packing_lock_wait_s + packing_lock_wait_s
-            ),
-            packing_compute_s=retained.packing_compute_s + packing_compute_s,
-            packing_timings=retained.packing_timings,
-            trajectory_log_wait_s=retained.trajectory_log_wait_s,
-            packed_batch_finalize_s=packed_batch_finalize_s,
-        )
+        prepared = retained.prepared
+        store = self._packed_batches.store
+        writer = None
+        ref = None
+        try:
+            async with self._packing_lock:
+                packing_lock_wait_s = time.monotonic() - packing_started
+                packing_compute_started = time.monotonic()
+                writer = store.reserve_plan(prepared.plan, batch_id=batch_id)
+                if writer.storage_byte_count != retained.storage_byte_count:
+                    raise RuntimeError(
+                        "materialized batch changed its retained storage plan"
+                    )
+                tensors = writer.tensors
+                assert tensors is not None
+
+                def materialize() -> Any:
+                    from art.preprocessing.pack import (
+                        materialize_packed_tensors_into,
+                        plot_packed_tensors,
+                    )
+
+                    counts = materialize_packed_tensors_into(
+                        prepared.plan,
+                        tensors,
+                        pad_token_id=prepared.pad_token_id,
+                        advantage_balance=prepared.advantage_balance,
+                        timings=retained.packing_timings,
+                    )
+                    if prepared.plot_output_dir is not None:
+                        plot_packed_tensors(tensors, prepared.plot_output_dir)
+                    return counts
+
+                writer.begin()
+                materialized = False
+                try:
+                    counts, cancelled = await complete_to_thread(materialize)
+                    if cancelled is not None:
+                        raise cancelled
+                    materialized = True
+                finally:
+                    writer.finish(success=materialized)
+                packing_compute_s = time.monotonic() - packing_compute_started
+            packing_core_s = time.monotonic() - packing_started
+            loss_bearing_tokens = (
+                counts.trainable_assistant_tokens
+                if retained.request.tokenized_loss is not None
+                else counts.shifted_loss_bearing_tokens
+            )
+            finalize_started = time.monotonic()
+            ref = store.commit_plan(
+                writer,
+                group_ids=retained.request.group_ids,
+                record_ids=retained.request.record_ids,
+                min_source_version=retained.request.min_source_version,
+                max_source_version=retained.request.max_source_version,
+            )
+            packed_batch_finalize_s = time.monotonic() - finalize_started
+            return PackingResult(
+                ref=ref,
+                packed_group_shapes=retained.packed_group_shapes,
+                generation_id=generation_id,
+                trainable_assistant_tokens=counts.trainable_assistant_tokens,
+                loss_bearing_tokens=loss_bearing_tokens,
+                non_padding_tokens=counts.non_padding_tokens,
+                trajectory_log_path=retained.request.trajectory_log_path,
+                trajectory_fetch_s=retained.trajectory_fetch_s,
+                trajectory_receive_s=retained.trajectory_receive_s,
+                trajectory_build_s=retained.trajectory_build_s,
+                packing_core_s=retained.packing_core_s + packing_core_s,
+                packing_lock_wait_s=(
+                    retained.packing_lock_wait_s + packing_lock_wait_s
+                ),
+                packing_compute_s=retained.packing_compute_s + packing_compute_s,
+                packing_timings=retained.packing_timings,
+                trajectory_log_wait_s=retained.trajectory_log_wait_s,
+                packed_batch_finalize_s=packed_batch_finalize_s,
+            )
+        except BaseException:
+            if ref is not None:
+                store.reclaim(batch_id)
+            elif writer is not None:
+                store.abort(writer.reservation.reservation_id)
+            raise
 
     @resilient_endpoint
     async def publish_batch(self, ref: PackedBatchRef) -> PackedBatchTransfer:

@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING, Any, Coroutine, Literal, Protocol, TypeVar, ca
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 if TYPE_CHECKING:
-    from art.preprocessing.pack import PrefixTreePackingPlan
+    from art.preprocessing.pack import PackedTensors, PrefixTreePackingPlan
 
 PACKED_BATCH_FORMAT = "art_packed_rl_v2"
 SFT_BATCH_FORMAT = "art_sft_tensor_v1"
@@ -396,6 +396,109 @@ class _Entry:
         self.ref = ref
 
 
+class PackedBatchWriter:
+    """Private writable storage that has no published lease until commit."""
+
+    __slots__ = (
+        "_active",
+        "_cancelled",
+        "_closed",
+        "_flat",
+        "_ready",
+        "_shm",
+        "_unlinked",
+        "manifest",
+        "reservation",
+        "tensors",
+    )
+
+    def __init__(
+        self,
+        *,
+        reservation: BatchReservation,
+        manifest: tuple[TensorSpec, ...],
+        shm: shared_memory.SharedMemory,
+        flat: tuple[tuple[str, Any], ...],
+        tensors: "PackedTensors",
+    ) -> None:
+        self.reservation = reservation
+        self.manifest = manifest
+        self.tensors: PackedTensors | None = tensors
+        self._shm: shared_memory.SharedMemory | None = shm
+        self._flat = flat
+        self._active = False
+        self._cancelled = False
+        self._closed = False
+        self._ready = False
+        self._unlinked = False
+
+    @property
+    def shared_memory_name(self) -> str:
+        shm = self._shm
+        if shm is None:
+            raise PackedBatchLeaseError("packed-batch writer storage is closed")
+        return shm.name
+
+    @property
+    def storage_byte_count(self) -> int:
+        return self.reservation.storage_byte_count
+
+    @property
+    def ready(self) -> bool:
+        return self._ready and not self._cancelled and not self._closed
+
+    def begin(self) -> None:
+        if self._active or self._cancelled or self._closed or self._ready:
+            raise PackedBatchLeaseError("packed-batch writer is not writable")
+        self._active = True
+
+    def finish(self, *, success: bool) -> None:
+        if not self._active:
+            raise PackedBatchLeaseError("packed-batch writer is not active")
+        self._active = False
+        if success and not self._cancelled:
+            self._ready = True
+        else:
+            self._cancel()
+
+    def _cancel(self) -> None:
+        self._cancelled = True
+        self._ready = False
+        self._unlink()
+        if not self._active:
+            self._close()
+
+    def _take_storage(self) -> shared_memory.SharedMemory:
+        if not self.ready or self._shm is None:
+            raise PackedBatchLeaseError("packed-batch writer cannot be committed")
+        shm = self._shm
+        self.tensors = None
+        self._flat = ()
+        self._shm = None
+        self._closed = True
+        return shm
+
+    def _unlink(self) -> None:
+        if self._unlinked or self._shm is None:
+            return
+        try:
+            self._shm.unlink()
+        except FileNotFoundError:
+            pass
+        self._unlinked = True
+
+    def _close(self) -> None:
+        if self._closed:
+            return
+        shm = self._shm
+        self.tensors = None
+        self._flat = ()
+        self._shm = None
+        self._closed = True
+        if shm is not None:
+            shm.close()
+
+
 class SharedMemoryPackedBatchStore:
     """Own immutable current-format batches in bounded POSIX shared memory."""
 
@@ -406,6 +509,7 @@ class SharedMemoryPackedBatchStore:
         self.capacity_bytes = capacity_bytes
         self._entries: dict[str, _Entry] = {}
         self._reservations: dict[str, BatchReservation] = {}
+        self._writers: dict[str, PackedBatchWriter] = {}
         self._reclaimed: set[str] = set()
         self._used_bytes = 0
         self._reserved_bytes = 0
@@ -479,6 +583,36 @@ class SharedMemoryPackedBatchStore:
 
     def reserve(self, source: PackedBatchRef) -> BatchReservation:
         return self._reserve(source.batch_id, source.storage_byte_count)
+
+    def reserve_plan(
+        self, plan: "PrefixTreePackingPlan", *, batch_id: str
+    ) -> PackedBatchWriter:
+        manifest, storage_byte_count = _packed_plan_layout(plan)
+        reservation = self._reserve(batch_id, storage_byte_count)
+        try:
+            shm = shared_memory.SharedMemory(create=True, size=storage_byte_count)
+            try:
+                flat = tuple(
+                    (spec.name, _tensor_from_buffer(_shm_buffer(shm), spec))
+                    for spec in manifest
+                )
+                tensors = _packed_plan_tensor_views(plan, dict(flat))
+            except BaseException:
+                shm.close()
+                shm.unlink()
+                raise
+        except BaseException:
+            self.abort(reservation.reservation_id)
+            raise
+        writer = PackedBatchWriter(
+            reservation=reservation,
+            manifest=manifest,
+            shm=shm,
+            flat=flat,
+            tensors=tensors,
+        )
+        self._writers[reservation.reservation_id] = writer
+        return writer
 
     def reserve_sft(self, manifest: SftBatchManifest) -> BatchReservation:
         return self._reserve(manifest.batch_id, manifest.storage_byte_count)
@@ -577,9 +711,76 @@ class SharedMemoryPackedBatchStore:
             raise
 
     def abort(self, reservation_id: str) -> None:
+        writer = self._writers.pop(reservation_id, None)
         reservation = self._reservations.pop(reservation_id, None)
         if reservation is not None:
             self._reserved_bytes -= reservation.storage_byte_count
+        if writer is not None:
+            writer._cancel()
+
+    def commit_plan(
+        self,
+        writer: PackedBatchWriter,
+        *,
+        group_ids: tuple[str, ...] = (),
+        record_ids: tuple[str, ...] = (),
+        min_source_version: int = 0,
+        max_source_version: int = 0,
+    ) -> PackedBatchRef:
+        reservation = writer.reservation
+        if (
+            self._reservations.get(reservation.reservation_id) != reservation
+            or self._writers.get(reservation.reservation_id) is not writer
+            or writer.tensors is None
+            or not writer.ready
+        ):
+            raise PackedBatchLeaseError(
+                f"packed batch {reservation.batch_id!r} was reclaimed during materialization"
+            )
+        flat, metadata = _flatten_packed_tensors(writer.tensors)
+        manifest, storage_byte_count = _layout(flat)
+        if (
+            manifest != writer.manifest
+            or storage_byte_count != writer.storage_byte_count
+        ):
+            raise RuntimeError("materialized batch changed its reserved tensor layout")
+        if any(
+            name != expected_name or tensor is not expected_tensor
+            for (name, tensor), (expected_name, expected_tensor) in zip(
+                flat, writer._flat, strict=True
+            )
+        ):
+            raise RuntimeError("materialized batch replaced reserved tensor storage")
+        ref = PackedBatchRef(
+            batch_id=reservation.batch_id,
+            owner_actor_id=self.owner_actor_id,
+            lease_id=secrets.token_hex(16),
+            shared_memory_name=writer.shared_memory_name,
+            owner_process_id=os.getpid(),
+            tensors=manifest,
+            num_sequences=metadata["num_sequences"],
+            sequence_length=metadata["sequence_length"],
+            byte_count=sum(spec.byte_count for spec in manifest),
+            storage_byte_count=storage_byte_count,
+            pixel_values_present=metadata["pixel_values_present"],
+            image_grid_thw_present=metadata["image_grid_thw_present"],
+            moe_routing_replay=metadata["moe_routing_replay"],
+            prefix_tree_packing_stats=metadata["prefix_tree_packing_stats"],
+            training_kind=metadata["training_kind"],
+            tokenized_output_map=metadata["tokenized_output_map"],
+            group_ids=group_ids,
+            record_ids=record_ids,
+            min_source_version=min_source_version,
+            max_source_version=max_source_version,
+        )
+        shm = writer._take_storage()
+        self._writers.pop(reservation.reservation_id)
+        self._reservations.pop(reservation.reservation_id)
+        self._reserved_bytes -= reservation.storage_byte_count
+        self._used_bytes += reservation.storage_byte_count
+        self._created_bytes += reservation.storage_byte_count
+        self._entries[reservation.batch_id] = _Entry(shm, ref)
+        return ref
 
     def drop(self, ref: PackedBatchRef | SftBatchRef) -> None:
         """Idempotently reclaim one host-owned packed batch."""
@@ -1291,6 +1492,12 @@ def packed_text_storage_byte_count(
 
 def packed_plan_storage_byte_count(plan: "PrefixTreePackingPlan") -> int:
     """Return exact shared-memory bytes for one retained prefix-tree plan."""
+    return _packed_plan_layout(plan)[1]
+
+
+def _packed_plan_layout(
+    plan: "PrefixTreePackingPlan",
+) -> tuple[tuple[TensorSpec, ...], int]:
     route = plan.route_contract
     num_experts, num_layers, topk = route or (None, None, None)
     core, suffix = _packed_text_layouts(
@@ -1316,7 +1523,33 @@ def packed_plan_storage_byte_count(plan: "PrefixTreePackingPlan") -> int:
             if dtype != expected_dtype:
                 raise ValueError(f"packed {name} tensors require {expected_dtype}")
             optional.append((f"{name}/{index}", dtype, shape))
-    return _layout_specs([*core, *optional, *suffix])[1]
+    return _layout_specs([*core, *optional, *suffix])
+
+
+def _packed_plan_tensor_views(
+    plan: "PrefixTreePackingPlan", flat: Mapping[str, Any]
+) -> "PackedTensors":
+    from art.preprocessing.moe_routing import (
+        MoeRoutingPackStats,
+        PackedMoeRoutingReplay,
+    )
+
+    tensors: dict[str, Any] = {name: flat[name] for name, _ in _CORE_PACKED_DTYPES}
+    for name in ("pixel_values", "image_grid_thw"):
+        tensors[name] = [
+            flat.get(f"{name}/{index}") for index in range(plan.num_sequences)
+        ]
+    tensors["moe_routing_replay"] = None
+    if plan.candidate_capacity:
+        tensors.update((name, flat[name]) for name, _ in _TOKENIZED_PACKED_DTYPES)
+    if plan.route_contract is not None:
+        num_experts, _num_layers, _topk = plan.route_contract
+        tensors["moe_routing_replay"] = PackedMoeRoutingReplay(
+            expert_indices=flat["moe_routing_replay/expert_indices"],
+            num_experts=num_experts,
+            pack_stats=MoeRoutingPackStats(),
+        )
+    return cast("PackedTensors", tensors)
 
 
 def _packed_text_layouts(

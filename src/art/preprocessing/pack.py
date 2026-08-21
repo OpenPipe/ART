@@ -74,6 +74,14 @@ class PackedTensors(TypedDict):
     tokenized_output_map: NotRequired["TokenizedOutputMap"]
 
 
+class PackedTensorCounts(NamedTuple):
+    logical_tokens: int
+    non_padding_tokens: int
+    padding_tokens: int
+    trainable_assistant_tokens: int
+    shifted_loss_bearing_tokens: int
+
+
 class TokenizedOutputMap(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -113,6 +121,12 @@ class _PrefixTreePackItem(NamedTuple):
 class _PrefixTreeRowPlan(NamedTuple):
     segments: tuple[PrefixTreePackSegment, ...]
     length: int
+
+
+class _PackedRowCounts(NamedTuple):
+    non_padding_tokens: int
+    trainable_assistant_tokens: int
+    shifted_loss_bearing_tokens: int
 
 
 class PrefixTreePackingPlan:
@@ -465,69 +479,187 @@ def materialize_packed_tensors(
     advantage_balance: float = 0.0,
     timings: PackingTimings | None = None,
 ) -> PackedTensors:
+    started = time.monotonic()
+    packed_tensors = _allocate_packed_tensors(packing_plan)
+    _materialize_packed_tensors_into(
+        packing_plan,
+        packed_tensors,
+        pad_token_id=pad_token_id,
+        advantage_balance=advantage_balance,
+        timings=timings,
+        allocation_started=started,
+    )
+    return packed_tensors
+
+
+def materialize_packed_tensors_into(
+    packing_plan: PrefixTreePackingPlan,
+    packed_tensors: PackedTensors,
+    *,
+    pad_token_id: int = -100,
+    advantage_balance: float = 0.0,
+    timings: PackingTimings | None = None,
+) -> PackedTensorCounts:
+    """Materialize one plan into caller-owned writable CPU tensor storage."""
+    return _materialize_packed_tensors_into(
+        packing_plan,
+        packed_tensors,
+        pad_token_id=pad_token_id,
+        advantage_balance=advantage_balance,
+        timings=timings,
+        allocation_started=time.monotonic(),
+    )
+
+
+def _materialize_packed_tensors_into(
+    packing_plan: PrefixTreePackingPlan,
+    packed_tensors: PackedTensors,
+    *,
+    pad_token_id: int,
+    advantage_balance: float,
+    timings: PackingTimings | None,
+    allocation_started: float,
+) -> PackedTensorCounts:
     items = packing_plan.items
     planned_rows = packing_plan.planned_rows
     seq_len = packing_plan.sequence_length
     include_moe_routing = packing_plan.include_moe_routing
-    moe_routing_pack_stats = MoeRoutingPackStats()
     rows = [row for row, _ in planned_rows]
     row_plans = [plan for _, plan in planned_rows]
 
-    started = time.monotonic()
     num_sequences = len(rows)
-    tokens_np = np.full((num_sequences, seq_len), pad_token_id, dtype=np.int64)
-    group_ids_np = np.full((num_sequences, seq_len), -1, dtype=np.int64)
-    parent_ids_np = np.full((num_sequences, seq_len), -1, dtype=np.int64)
-    input_pos_np = np.zeros((num_sequences, seq_len), dtype=np.int64)
-    assistant_mask_np = np.zeros((num_sequences, seq_len), dtype=np.bool_)
-    logprobs_np = np.full((num_sequences, seq_len), np.nan, dtype=np.float32)
-    advantages_np = np.zeros((num_sequences, seq_len), dtype=np.float32)
-    weights_np = np.zeros((num_sequences, seq_len), dtype=np.float32)
+    core_shape = (num_sequences, seq_len)
+    tokens_np = _writable_numpy_tensor(
+        packed_tensors["tokens"], name="tokens", dtype="int64", shape=core_shape
+    )
+    group_ids_np = _writable_numpy_tensor(
+        packed_tensors["group_ids"],
+        name="group_ids",
+        dtype="int64",
+        shape=core_shape,
+    )
+    parent_ids_np = _writable_numpy_tensor(
+        packed_tensors["parent_ids"],
+        name="parent_ids",
+        dtype="int64",
+        shape=core_shape,
+    )
+    input_pos_np = _writable_numpy_tensor(
+        packed_tensors["input_pos"],
+        name="input_pos",
+        dtype="int64",
+        shape=core_shape,
+    )
+    assistant_mask_np = _writable_numpy_tensor(
+        packed_tensors["assistant_mask"],
+        name="assistant_mask",
+        dtype="bool",
+        shape=core_shape,
+    )
+    logprobs_np = _writable_numpy_tensor(
+        packed_tensors["logprobs"],
+        name="logprobs",
+        dtype="float32",
+        shape=core_shape,
+    )
+    advantages_np = _writable_numpy_tensor(
+        packed_tensors["advantages"],
+        name="advantages",
+        dtype="float32",
+        shape=core_shape,
+    )
+    weights_np = _writable_numpy_tensor(
+        packed_tensors["weights"],
+        name="weights",
+        dtype="float32",
+        shape=core_shape,
+    )
+    tokens_np.fill(pad_token_id)
+    group_ids_np.fill(-1)
+    parent_ids_np.fill(-1)
+    input_pos_np.fill(0)
+    assistant_mask_np.fill(False)
+    logprobs_np.fill(np.nan)
+    advantages_np.fill(0)
+    weights_np.fill(0)
     tokenized_items = [item for item in items if item.datum_index is not None]
     candidate_capacity = packing_plan.candidate_capacity
     tokenized_shape = (num_sequences, seq_len, candidate_capacity)
-    target_tokens_np = (
-        np.full(tokenized_shape, -100, dtype=np.int64) if tokenized_items else None
+    target_tokens_np = loss_weights_np = behavior_logprobs_np = token_advantages_np = (
+        None
     )
-    loss_weights_np = (
-        np.zeros(tokenized_shape, dtype=np.float32) if tokenized_items else None
-    )
-    behavior_logprobs_np = (
-        np.zeros(tokenized_shape, dtype=np.float32) if tokenized_items else None
-    )
-    token_advantages_np = (
-        np.zeros(tokenized_shape, dtype=np.float32) if tokenized_items else None
-    )
+    if tokenized_items:
+        target_tokens_np = _writable_numpy_tensor(
+            packed_tensors["target_tokens"],
+            name="target_tokens",
+            dtype="int64",
+            shape=tokenized_shape,
+        )
+        loss_weights_np = _writable_numpy_tensor(
+            packed_tensors["loss_weights"],
+            name="loss_weights",
+            dtype="float32",
+            shape=tokenized_shape,
+        )
+        behavior_logprobs_np = _writable_numpy_tensor(
+            packed_tensors["behavior_logprobs"],
+            name="behavior_logprobs",
+            dtype="float32",
+            shape=tokenized_shape,
+        )
+        token_advantages_np = _writable_numpy_tensor(
+            packed_tensors["token_advantages"],
+            name="token_advantages",
+            dtype="float32",
+            shape=tokenized_shape,
+        )
+        target_tokens_np.fill(-100)
+        loss_weights_np.fill(0)
+        behavior_logprobs_np.fill(0)
+        token_advantages_np.fill(0)
     packed_positions = (
         [np.full(len(item.token_ids), -1, dtype=np.int64) for item in items]
         if tokenized_items
         else None
     )
-    pixel_values: list[torch.Tensor | None] = []
-    image_grid_thw: list[torch.Tensor | None] = []
+    pixel_values = packed_tensors["pixel_values"]
+    image_grid_thw = packed_tensors["image_grid_thw"]
+    if len(pixel_values) != num_sequences or len(image_grid_thw) != num_sequences:
+        raise ValueError("packed tensor-list destinations must be row aligned")
     route_contract = packing_plan.route_contract
     route_tensor_np: np.ndarray | None = None
     if include_moe_routing:
         assert route_contract is not None
         num_experts, num_layers, topk = route_contract
+        replay = packed_tensors["moe_routing_replay"]
+        if replay is None or replay.num_experts != num_experts:
+            raise ValueError("MoE replay destination does not match the packing plan")
+        route_tensor_np = _writable_numpy_tensor(
+            replay.expert_indices,
+            name="moe_routing_replay/expert_indices",
+            dtype=str(moe_route_dtype(num_experts)),
+            shape=(num_layers, num_sequences, seq_len, topk),
+        )
         padding = deterministic_moe_routes(
             np.arange(seq_len, dtype=np.int64),
             route_shape=(num_layers, topk),
             num_experts=num_experts,
         )
-        route_tensor_np = np.broadcast_to(
-            np.moveaxis(padding, 1, 0)[:, None],
-            (num_layers, num_sequences, seq_len, topk),
-        ).copy()
+        route_tensor_np[...] = np.moveaxis(padding, 1, 0)[:, None]
+    elif packed_tensors["moe_routing_replay"] is not None:
+        raise ValueError("non-MoE packing plan received a replay destination")
     if timings is not None:
-        timings.packing_array_allocation_s = time.monotonic() - started
+        timings.packing_array_allocation_s = time.monotonic() - allocation_started
 
     started = time.monotonic()
+    non_padding_tokens = 0
+    trainable_assistant_tokens = 0
+    shifted_loss_bearing_tokens = 0
     for index, (row, plan) in enumerate(zip(rows, row_plans, strict=True)):
         row_route_tensor = (
             route_tensor_np[:, index] if route_tensor_np is not None else None
         )
-        _materialize_prefix_tree_row(
+        row_counts = _materialize_prefix_tree_row(
             row,
             plan=plan,
             token_ids=tokens_np[index],
@@ -555,69 +687,71 @@ def materialize_packed_tensors(
             packed_row=index,
             packed_sequence_length=seq_len,
         )
-        pixel_values.append(_packed_row_tensor_list(row, "pixel_values"))
-        image_grid_thw.append(_packed_row_tensor_list(row, "image_grid_thw"))
+        non_padding_tokens += row_counts.non_padding_tokens
+        trainable_assistant_tokens += row_counts.trainable_assistant_tokens
+        shifted_loss_bearing_tokens += row_counts.shifted_loss_bearing_tokens
+        _materialize_packed_row_tensor_list(row, "pixel_values", pixel_values[index])
+        _materialize_packed_row_tensor_list(
+            row, "image_grid_thw", image_grid_thw[index]
+        )
     if timings is not None:
         timings.packing_row_materialize_s = time.monotonic() - started
     started = time.monotonic()
-    assistant_mask_tensor = torch.from_numpy(assistant_mask_np)
-    weights_tensor = torch.from_numpy(weights_np)
-    weights_tensor = torch.where(
-        assistant_mask_tensor, weights_tensor, torch.zeros_like(weights_tensor)
+    assistant_mask_tensor = packed_tensors["assistant_mask"]
+    weights_tensor = packed_tensors["weights"]
+    torch.where(
+        assistant_mask_tensor,
+        weights_tensor,
+        weights_tensor.new_zeros(()),
+        out=weights_tensor,
     )
-    if bool(assistant_mask_tensor.any()):
+    if trainable_assistant_tokens:
         weights_tensor[assistant_mask_tensor] /= weights_tensor[
             assistant_mask_tensor
         ].mean()
-    advantages_tensor = torch.from_numpy(advantages_np)
-    advantages_tensor = torch.where(
-        assistant_mask_tensor, advantages_tensor, torch.zeros_like(advantages_tensor)
+    advantages_tensor = packed_tensors["advantages"]
+    torch.where(
+        assistant_mask_tensor,
+        advantages_tensor,
+        advantages_tensor.new_zeros(()),
+        out=advantages_tensor,
     )
     if advantage_balance > 0.0:
-        advantages_tensor = torch.where(
-            advantages_tensor > 0,
-            advantages_tensor,
-            advantages_tensor * (1 - advantage_balance),
+        np.multiply(
+            advantages_np,
+            1 - advantage_balance,
+            out=advantages_np,
+            where=advantages_np <= 0,
         )
     elif advantage_balance < 0.0:
-        advantages_tensor = torch.where(
-            advantages_tensor < 0,
-            advantages_tensor,
-            advantages_tensor * (1 + advantage_balance),
+        np.multiply(
+            advantages_np,
+            1 + advantage_balance,
+            out=advantages_np,
+            where=advantages_np >= 0,
         )
-    if bool(assistant_mask_tensor.any()):
+    if trainable_assistant_tokens:
         advantages_tensor[assistant_mask_tensor] /= (
             advantages_tensor[assistant_mask_tensor].abs()
             * weights_tensor[assistant_mask_tensor]
         ).mean()
 
-    packed_tensors: PackedTensors = {
-        "tokens": torch.from_numpy(tokens_np),
-        "group_ids": torch.from_numpy(group_ids_np),
-        "parent_ids": torch.from_numpy(parent_ids_np),
-        "input_pos": torch.from_numpy(input_pos_np),
-        "assistant_mask": assistant_mask_tensor,
-        "logprobs": torch.from_numpy(logprobs_np),
-        "advantages": advantages_tensor,
-        "weights": weights_tensor,
-        "pixel_values": pixel_values,
-        "image_grid_thw": image_grid_thw,
-        "moe_routing_replay": None,
-        "prefix_tree_packing_stats": {
-            "logical_tokens": sum(len(item.token_ids) for item in items),
-            "physical_tokens": sum(plan.length for plan in row_plans),
-            "policy_token_counts": _packed_policy_token_counts(items),
-        },
+    counts = PackedTensorCounts(
+        logical_tokens=sum(len(item.token_ids) for item in items),
+        non_padding_tokens=non_padding_tokens,
+        padding_tokens=num_sequences * seq_len - non_padding_tokens,
+        trainable_assistant_tokens=trainable_assistant_tokens,
+        shifted_loss_bearing_tokens=shifted_loss_bearing_tokens,
+    )
+    packed_tensors["prefix_tree_packing_stats"] = {
+        "logical_tokens": counts.logical_tokens,
+        "physical_tokens": counts.non_padding_tokens,
+        "policy_token_counts": _packed_policy_token_counts(items),
     }
     if include_moe_routing:
         assert route_tensor_np is not None and route_contract is not None
-        num_experts, _num_layers, _topk = route_contract
-        moe_routing_pack_stats.packed_tokens = sum(plan.length for plan in row_plans)
-        packed_tensors["moe_routing_replay"] = PackedMoeRoutingReplay(
-            expert_indices=torch.from_numpy(route_tensor_np),
-            num_experts=num_experts,
-            pack_stats=moe_routing_pack_stats,
-        )
+        assert replay is not None
+        replay.pack_stats.packed_tokens = counts.non_padding_tokens
     if tokenized_items:
         assert target_tokens_np is not None
         assert loss_weights_np is not None
@@ -627,10 +761,6 @@ def materialize_packed_tensors(
         if any(np.any(positions < 0) for positions in packed_positions):
             raise RuntimeError("tokenized output map does not cover every input token")
         packed_tensors.update(
-            target_tokens=torch.from_numpy(target_tokens_np),
-            loss_weights=torch.from_numpy(loss_weights_np),
-            behavior_logprobs=torch.from_numpy(behavior_logprobs_np),
-            token_advantages=torch.from_numpy(token_advantages_np),
             tokenized_output_map=TokenizedOutputMap(
                 packed_positions=tuple(
                     tuple(int(value) for value in positions)
@@ -645,7 +775,87 @@ def materialize_packed_tensors(
         )
     if timings is not None:
         timings.packing_tensor_finalize_s = time.monotonic() - started
-    return packed_tensors
+    return counts
+
+
+def _allocate_packed_tensors(packing_plan: PrefixTreePackingPlan) -> PackedTensors:
+    shape = (packing_plan.num_sequences, packing_plan.sequence_length)
+    tensors: PackedTensors = {
+        "tokens": torch.empty(shape, dtype=torch.int64),
+        "group_ids": torch.empty(shape, dtype=torch.int64),
+        "parent_ids": torch.empty(shape, dtype=torch.int64),
+        "input_pos": torch.empty(shape, dtype=torch.int64),
+        "assistant_mask": torch.empty(shape, dtype=torch.bool),
+        "logprobs": torch.empty(shape, dtype=torch.float32),
+        "advantages": torch.empty(shape, dtype=torch.float32),
+        "weights": torch.empty(shape, dtype=torch.float32),
+        "pixel_values": _allocate_packed_tensor_list(packing_plan, "pixel_values"),
+        "image_grid_thw": _allocate_packed_tensor_list(packing_plan, "image_grid_thw"),
+        "moe_routing_replay": None,
+    }
+    if packing_plan.candidate_capacity:
+        tokenized_shape = (*shape, packing_plan.candidate_capacity)
+        tensors.update(
+            target_tokens=torch.empty(tokenized_shape, dtype=torch.int64),
+            loss_weights=torch.empty(tokenized_shape, dtype=torch.float32),
+            behavior_logprobs=torch.empty(tokenized_shape, dtype=torch.float32),
+            token_advantages=torch.empty(tokenized_shape, dtype=torch.float32),
+        )
+    if packing_plan.route_contract is not None:
+        num_experts, num_layers, topk = packing_plan.route_contract
+        tensors["moe_routing_replay"] = PackedMoeRoutingReplay(
+            expert_indices=torch.empty(
+                (num_layers, *shape, topk),
+                dtype=getattr(torch, str(moe_route_dtype(num_experts))),
+            ),
+            num_experts=num_experts,
+            pack_stats=MoeRoutingPackStats(),
+        )
+    return tensors
+
+
+def _allocate_packed_tensor_list(
+    packing_plan: PrefixTreePackingPlan,
+    attr: Literal["pixel_values", "image_grid_thw"],
+) -> list[torch.Tensor | None]:
+    result: list[torch.Tensor | None] = []
+    for (row, _), layout in zip(
+        packing_plan.planned_rows,
+        packing_plan.tensor_list_layouts(attr),
+        strict=True,
+    ):
+        if layout is None:
+            result.append(None)
+            continue
+        dtype, shape = layout
+        sources = _packed_row_tensors(row, attr)
+        result.append(
+            torch.empty(shape, dtype=getattr(torch, dtype), device=sources[0].device)
+        )
+    return result
+
+
+def _writable_numpy_tensor(
+    tensor: torch.Tensor,
+    *,
+    name: str,
+    dtype: str,
+    shape: tuple[int, ...],
+) -> np.ndarray:
+    expected_dtype = getattr(torch, dtype)
+    if (
+        tensor.device.type != "cpu"
+        or not tensor.is_contiguous()
+        or tensor.dtype != expected_dtype
+        or tuple(tensor.shape) != shape
+    ):
+        raise ValueError(
+            f"{name} destination must be contiguous CPU {dtype} with shape {shape}"
+        )
+    array = tensor.numpy()
+    if not array.flags.writeable:
+        raise ValueError(f"{name} destination must be writable")
+    return array
 
 
 def _prefix_tree_pack_plan(
@@ -1151,7 +1361,10 @@ def _materialize_prefix_tree_row(
     packed_positions: list[np.ndarray] | None = None,
     packed_row: int = 0,
     packed_sequence_length: int = 0,
-) -> None:
+) -> _PackedRowCounts:
+    non_padding_tokens = 0
+    trainable_assistant_tokens = 0
+    shifted_loss_bearing_tokens = 0
     for segment in plan.segments:
         dst_start = int(segment.packed_start)
         if dst_start >= plan.length:
@@ -1161,6 +1374,15 @@ def _materialize_prefix_tree_row(
         src_start = int(segment.start)
         src_end = src_start + segment_length
         item = row[segment.sequence_indices[0]]
+        materialized_assistant_mask = item.assistant_mask[src_start:src_end]
+        assistant_tokens = int(np.count_nonzero(materialized_assistant_mask))
+        non_padding_tokens += segment_length
+        trainable_assistant_tokens += assistant_tokens
+        shifted_loss_bearing_tokens += (
+            int(np.count_nonzero(materialized_assistant_mask[1:]))
+            if dst_start == 0
+            else assistant_tokens
+        )
         token_ids[dst_start:dst_end] = item.token_ids[src_start:src_end]
         group_ids[dst_start:dst_end] = int(segment.group_id)
         parent_ids[dst_start:dst_end] = int(segment.parent_id)
@@ -1233,6 +1455,11 @@ def _materialize_prefix_tree_row(
                 raw_routes=item.moe_routes,
                 route_shape=route_shape,
             )
+    return _PackedRowCounts(
+        non_padding_tokens=non_padding_tokens,
+        trainable_assistant_tokens=trainable_assistant_tokens,
+        shifted_loss_bearing_tokens=shifted_loss_bearing_tokens,
+    )
 
 
 def _copy_optional_loss_tensor(
@@ -1285,6 +1512,29 @@ def _packed_row_tensor_list(
 ) -> torch.Tensor | None:
     tensors = _packed_row_tensors(row, attr)
     return torch.concat(tensors) if tensors else None
+
+
+def _materialize_packed_row_tensor_list(
+    row: list[_PrefixTreePackItem],
+    attr: Literal["pixel_values", "image_grid_thw"],
+    destination: torch.Tensor | None,
+) -> None:
+    sources = _packed_row_tensors(row, attr)
+    if not sources:
+        if destination is not None:
+            raise ValueError(f"{attr} destination exists for an empty packed row")
+        return
+    if destination is None:
+        raise ValueError(f"{attr} destination is missing for a nonempty packed row")
+    offset = 0
+    for source in sources:
+        if source.device != destination.device:
+            raise ValueError(f"packed {attr} source and destination devices differ")
+        end = offset + int(source.shape[0])
+        destination[offset:end].copy_(source)
+        offset = end
+    if offset != destination.shape[0]:
+        raise ValueError(f"packed {attr} destination shape does not match its plan")
 
 
 def _packed_row_tensors(
