@@ -55,6 +55,7 @@ from .publication import (
     SnapshotWriteGrant,
     SnapshotWritePlan,
     TrainerPublicationFailed,
+    TrainerPublicationProgress,
     TrainerPublicationSucceeded,
     TrainerRankPublication,
 )
@@ -3991,6 +3992,7 @@ class _GenerationPublisher:
         if distributed is not None:
             from art.megatron.weights.rank_distributed_lora_publish import (
                 PreparedRankDistributedLora,
+                RankDistributedLoraPublicationPhase,
                 publish_rank_distributed_vllm_lora,
             )
 
@@ -4014,11 +4016,25 @@ class _GenerationPublisher:
                 raise RuntimeError(
                     "multi-rank ordered publication has no independent control group"
                 )
+            generation_id = prepared.plan.generation.generation_id
+            rank = int(self.runtime.rank)
+
+            def report_progress(phase: RankDistributedLoraPublicationPhase) -> None:
+                prepared.sink.publication(
+                    TrainerPublicationProgress(
+                        generation_id=generation_id,
+                        rank=rank,
+                        phase=phase,
+                    )
+                )
+
+            report_progress("transport_ready")
             ref = publish_rank_distributed_vllm_lora(
                 distributed,
                 store,
                 group=group,
                 local_error=local_error,
+                progress=report_progress,
             )
             if ref != distributed.layout.ref:
                 raise RuntimeError(

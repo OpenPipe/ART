@@ -466,8 +466,25 @@ class TrainerPublicationFailed(_PublicationModel):
     message: str = Field(min_length=1)
 
 
+class TrainerPublicationProgress(_PublicationModel):
+    kind: Literal["publication_progress"] = "publication_progress"
+    generation_id: str = Field(min_length=1)
+    rank: int = Field(ge=0)
+    phase: Literal[
+        "transport_ready",
+        "ranks_ready",
+        "plan_ready",
+        "payloads_ready",
+        "shards_uploaded",
+        "ranks_uploaded",
+        "committed",
+    ]
+
+
 TrainerPublicationEvent = Annotated[
-    TrainerPublicationSucceeded | TrainerPublicationFailed,
+    TrainerPublicationSucceeded
+    | TrainerPublicationFailed
+    | TrainerPublicationProgress,
     Field(discriminator="kind"),
 ]
 TRAINER_PUBLICATION_EVENT_ADAPTER = TypeAdapter(TrainerPublicationEvent)

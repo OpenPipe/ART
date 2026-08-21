@@ -44,6 +44,7 @@ from .publication import (
     SnapshotWritePlan,
     TrainerPublicationEvent,
     TrainerPublicationFailed,
+    TrainerPublicationProgress,
     TrainerPublicationSucceeded,
     TrainerRankPublication,
     build_snapshot_write_plan,
@@ -2886,7 +2887,10 @@ class MonarchTrainerSlot:
         authorization: asyncio.Event,
     ) -> tuple[TrainerRankPublication, ...]:
         records: dict[int, TrainerRankPublication] = {}
+        progress: dict[int, str] = {}
         await authorization.wait()
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self._command_timeout_s
         supervision = asyncio.create_task(self._supervision.wait())
         receive: asyncio.Future[Any] | None = None
         try:
@@ -2894,11 +2898,14 @@ class MonarchTrainerSlot:
                 receive = asyncio.ensure_future(receiver.recv())
                 done, _ = await asyncio.wait(
                     {receive, supervision},
-                    timeout=self._shutdown_timeout_s,
+                    timeout=max(0.0, deadline - loop.time()),
                     return_when=asyncio.FIRST_COMPLETED,
                 )
                 if not done:
-                    raise TimeoutError("trainer ranks produced no publication event")
+                    raise TimeoutError(
+                        "trainer publication exceeded command timeout; "
+                        f"last rank phases: {progress}"
+                    )
                 if supervision in done:
                     raise RuntimeError("trainer mesh failed: " + supervision.result())
                 payload = receive.result()
@@ -2909,6 +2916,13 @@ class MonarchTrainerSlot:
                         f"{payload['traceback']}"
                     )
                 event = TRAINER_PUBLICATION_EVENT_ADAPTER.validate_python(payload)
+                if isinstance(event, TrainerPublicationProgress):
+                    if event.generation_id != generation.generation_id:
+                        raise RuntimeError("trainer rank progressed another generation")
+                    if event.rank >= len(self._rank_processes):
+                        raise RuntimeError("trainer publication progress has unknown rank")
+                    progress[event.rank] = event.phase
+                    continue
                 if isinstance(event, TrainerPublicationFailed):
                     raise RuntimeError(
                         f"trainer rank {event.rank} publication failed "
@@ -4025,6 +4039,7 @@ class MonarchTrainerRun:
                     if payload["kind"] in {
                         "publication_succeeded",
                         "publication_failed",
+                        "publication_progress",
                     }:
                         self._record_publication(payload)
                         receive = asyncio.ensure_future(receiver.recv())
@@ -4243,6 +4258,8 @@ class MonarchTrainerRun:
             raise RuntimeError(
                 f"trainer publication {generation_id} is already terminal"
             )
+        if isinstance(event, TrainerPublicationProgress):
+            return
         if isinstance(event, TrainerPublicationFailed):
             future.set_exception(
                 RuntimeError(

@@ -33,6 +33,16 @@ from art.megatron.weights.lora_publish import (
     merge_sharded_adapter_entries,
 )
 
+RankDistributedLoraPublicationPhase = Literal[
+    "transport_ready",
+    "ranks_ready",
+    "plan_ready",
+    "payloads_ready",
+    "shards_uploaded",
+    "ranks_uploaded",
+    "committed",
+]
+
 _SAFETENSORS_DTYPES = {
     torch.bool: "BOOL",
     torch.uint8: "U8",
@@ -1327,6 +1337,7 @@ def publish_rank_distributed_vllm_lora(
     *,
     group: Any | None = None,
     local_error: BaseException | None = None,
+    progress: Callable[[RankDistributedLoraPublicationPhase], None] | None = None,
 ) -> OrderedBinaryObjectRef:
     """Publish plan first, rank-owned shards concurrently, and commit last."""
     rank, world_size = _rank_world(group)
@@ -1355,6 +1366,8 @@ def publish_rank_distributed_vllm_lora(
         )
     if store is None:
         raise RuntimeError("rank-distributed LoRA publication has no object store")
+    if progress is not None:
+        progress("ranks_ready")
     coordinator = layout.coordinator_rank
     plan_ref = None
     plan_error = None
@@ -1376,14 +1389,21 @@ def publish_rank_distributed_vllm_lora(
     )
     if plan_ref != layout.ref:
         raise RuntimeError("published LoRA plan differs from prepared reference")
+    if progress is not None:
+        progress("plan_ready")
     stored: tuple[StoredOrderedBinaryObjectShard, ...] = ()
     upload_error = None
     try:
+        payloads = prepared.shard_payloads()
+        if progress is not None:
+            progress("payloads_ready")
         stored = store.upload_ordered_shards(
             layout.target,
             layout.plan,
-            prepared.shard_payloads(),
+            payloads,
         )
+        if progress is not None:
+            progress("shards_uploaded")
     except BaseException as error:
         upload_error = f"{type(error).__name__}: {error}"
     uploads: list[
@@ -1403,6 +1423,8 @@ def publish_rank_distributed_vllm_lora(
         raise RuntimeError(
             "rank-distributed LoRA shard upload failed: " + "; ".join(failures)
         )
+    if progress is not None:
+        progress("ranks_uploaded")
     committed = None
     commit_error = None
     if rank == coordinator:
@@ -1425,6 +1447,8 @@ def publish_rank_distributed_vllm_lora(
         world_size=world_size,
         group=group,
     )
+    if progress is not None:
+        progress("committed")
     if committed != layout.ref:
         raise RuntimeError("committed LoRA object differs from its prepared reference")
     return committed
