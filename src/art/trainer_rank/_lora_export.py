@@ -136,7 +136,6 @@ def _prepare_vllm_lora_publish(
     slot_ref: LoRASlotRef | None = None,
     runtime: tuple[int, torch.device] | None = None,
 ) -> _VllmLoraPublishPlan:
-    from art.megatron.lora import LoRAPublishPlanner
     from art.megatron.weights import lora_publish
 
     rank, device = (
@@ -145,7 +144,6 @@ def _prepare_vllm_lora_publish(
         else runtime
     )
     packed_expert_groups = tuple(handler.expert_packed_lora_groups())
-    planner = LoRAPublishPlanner(model, slot_ref)
     local_tensors, local_metadata = lora_publish.collect_local_lora_entries(
         model,
         adapter_dtypes,
@@ -163,22 +161,8 @@ def _prepare_vllm_lora_publish(
         packed_expert_groups=packed_expert_groups,
         slot_ref=slot_ref,
     )
-    all_packed_metadata = (
-        lora_publish._global_packed_expert_metadata(
-            planner, adapter_dtypes, packed_expert_groups
-        )
-        if rank == 0
-        else local_packed_metadata
-    )
-    all_metadata = (
-        lora_publish._global_regular_metadata(
-            planner,
-            adapter_dtypes,
-            packed_expert_groups if all_packed_metadata else (),
-        )
-        if rank == 0
-        else local_metadata
-    )
+    all_packed_metadata = lora_publish._canonical_global_metadata(local_packed_metadata)
+    all_metadata = lora_publish._canonical_global_metadata(local_metadata)
     return _VllmLoraPublishPlan(
         rank=rank,
         device=device,
@@ -225,12 +209,14 @@ def _build_vllm_lora_tensors_from_inputs(
 ) -> tuple[dict[str, torch.Tensor], dict[str, Any]]:
     from art.megatron.weights import lora_publish
 
-    return lora_publish._rank0_vllm_lora_tensors(
+    merged_tensors = lora_publish._rank0_merged_lora_tensors(
         metadata=inputs.metadata,
         tensors_by_owner_key=inputs.tensors_by_owner_key,
         packed_expert_metadata=inputs.packed_expert_metadata,
         packed_expert_tensors_by_owner_key=inputs.packed_expert_tensors_by_owner_key,
-        handler=inputs.handler,
+    )
+    return inputs.handler.to_vllm_lora_tensors(
+        merged_tensors,
         adapter_config=inputs.adapter_config,
     )
 
