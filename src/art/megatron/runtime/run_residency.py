@@ -973,7 +973,8 @@ class RunResidencyManager:
         reservation: ResidencyReservation | None = None
         try:
             image = l2_future.result()
-            byte_count = self._store.physical_bytes(state.key, image)
+            plan = self._store.prepare_write(state.key, image)
+            byte_count = plan.physical_bytes
             with self._admission_locks["l3_nvme"]:
                 self._reclaim("l3_nvme", byte_count, protected={state.key})
                 reservation = self._reserve(
@@ -982,10 +983,10 @@ class RunResidencyManager:
                     target="l3_nvme",
                     byte_count=byte_count,
                 )
-            manifest = self._store.write(state.key, image)
-            if manifest.physical_bytes != byte_count:
-                raise RuntimeError("L3 residency physical size changed during commit")
-            mapped = self._store.map_committed(state.key, manifest, state.tensors)
+            manifest = self._store.write_prepared(plan, image)
+            if manifest != plan.manifest:
+                raise RuntimeError("L3 residency manifest changed during commit")
+            mapped = self._store.map_newly_committed(plan, state.tensors)
             with self._lock:
                 self._commit(
                     reservation,

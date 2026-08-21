@@ -90,6 +90,17 @@ class NvmeResidencyManifest(BaseModel):
         return self.data_bytes + len(self.model_dump_json().encode())
 
 
+class NvmeResidencyWritePlan(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    manifest: NvmeResidencyManifest
+    manifest_bytes: bytes = Field(min_length=1)
+
+    @property
+    def physical_bytes(self) -> int:
+        return self.manifest.data_bytes + len(self.manifest_bytes)
+
+
 class NvmeResidencyStore:
     """Atomic, content-verified L3 storage for one rank's live tensor images."""
 
@@ -109,10 +120,29 @@ class NvmeResidencyStore:
         key: ResidencyKey,
         image: HostTensorImage,
     ) -> NvmeResidencyManifest:
+        return self.write_prepared(self.prepare_write(key, image), image)
+
+    def prepare_write(
+        self,
+        key: ResidencyKey,
+        image: HostTensorImage,
+    ) -> NvmeResidencyWritePlan:
         resolve = getattr(image, "resolve", None)
         if callable(resolve):
             resolve()
         manifest = self._manifest(key, image)
+        return NvmeResidencyWritePlan(
+            manifest=manifest,
+            manifest_bytes=manifest.model_dump_json().encode(),
+        )
+
+    def write_prepared(
+        self,
+        plan: NvmeResidencyWritePlan,
+        image: HostTensorImage,
+    ) -> NvmeResidencyManifest:
+        manifest = plan.manifest
+        key = manifest.key
         destination = self.path(key)
         with self._lock:
             if destination.exists():
@@ -136,7 +166,7 @@ class NvmeResidencyStore:
             try:
                 temporary.mkdir()
                 committed = self._write_image(
-                    temporary, manifest, image, reservation=reservation
+                    temporary, plan, image, reservation=reservation
                 )
                 os.rename(temporary, destination)
                 self._fsync_dir(self.root)
@@ -160,10 +190,7 @@ class NvmeResidencyStore:
                 raise
 
     def physical_bytes(self, key: ResidencyKey, image: HostTensorImage) -> int:
-        resolve = getattr(image, "resolve", None)
-        if callable(resolve):
-            resolve()
-        return self._manifest(key, image).physical_bytes
+        return self.prepare_write(key, image).physical_bytes
 
     def load(
         self,
@@ -188,6 +215,17 @@ class NvmeResidencyStore:
             raise RuntimeError("committed L3 residency manifest changed identity")
         self._verify_data_size(destination, manifest)
         return self._map_image(destination, manifest, tensors)
+
+    def map_newly_committed(
+        self,
+        plan: NvmeResidencyWritePlan,
+        tensors: tuple[torch.Tensor, ...],
+    ) -> HostTensorImage:
+        destination = self.path(plan.manifest.key)
+        self._verify_data_size(destination, plan.manifest)
+        if (destination / _MANIFEST_FILE).stat().st_size != len(plan.manifest_bytes):
+            raise RuntimeError("newly committed L3 manifest changed size")
+        return self._map_image(destination, plan.manifest, tensors)
 
     def read_committed(
         self,
@@ -336,11 +374,12 @@ class NvmeResidencyStore:
     def _write_image(
         self,
         directory: Path,
-        manifest: NvmeResidencyManifest,
+        plan: NvmeResidencyWritePlan,
         image: HostTensorImage,
         *,
         reservation: DiskReservationLease,
     ) -> NvmeResidencyManifest:
+        manifest = plan.manifest
         with (directory / _DATA_FILE).open("wb", buffering=0) as handle:
             cursor = 0
             for record, target in zip(
@@ -360,7 +399,7 @@ class NvmeResidencyStore:
                     raise RuntimeError("L3 residency write changed physical layout")
             handle.flush()
             os.fsync(handle.fileno())
-        payload = manifest.model_dump_json().encode()
+        payload = plan.manifest_bytes
         with (directory / _MANIFEST_FILE).open("wb", buffering=0) as handle:
             handle.write(payload)
             handle.flush()
