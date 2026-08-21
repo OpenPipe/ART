@@ -1524,7 +1524,10 @@ class RemoteTrainingClient:
         return await self._submit(request, kind="forward", result_type=ForwardResult)
 
     async def forward_backward(
-        self, request: ForwardBackwardRequest
+        self,
+        request: ForwardBackwardRequest,
+        *,
+        encoded_batch: EncodedTrainingBatch | None = None,
     ) -> RemoteTrainingOperation[ForwardBackwardResult]:
         return cast(
             RemoteTrainingOperation[ForwardBackwardResult],
@@ -1532,6 +1535,7 @@ class RemoteTrainingClient:
                 request,
                 kind="forward_backward",
                 result_type=ForwardBackwardResult,
+                encoded_batch=encoded_batch,
             ),
         )
 

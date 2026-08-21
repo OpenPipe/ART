@@ -37,6 +37,7 @@ from ..training import (
     SaveStateResult,
     SaveWeightsForSamplerRequest,
     SupervisedTrajectoryBatch,
+    TrainingOperation,
 )
 from ..trajectories import Trajectory, TrajectoryGroup
 from ..types import LocalTrainResult, TrainSFTConfig
@@ -110,6 +111,13 @@ class _MegatronPipelineCommandContext(BaseModel):
     expose_checkpoint_path: bool
     started: float = Field(ge=0)
     _finished: bool = PrivateAttr(default=False)
+
+    async def forward_backward(
+        self, sequence_id: int
+    ) -> TrainingOperation[ForwardBackwardResult]:
+        return await self.client.forward_backward(
+            self.forward_request.model_copy(update={"sequence_id": sequence_id})
+        )
 
     def optimizer_request(self, sequence_id: int) -> OptimStepRequest:
         return OptimStepRequest(

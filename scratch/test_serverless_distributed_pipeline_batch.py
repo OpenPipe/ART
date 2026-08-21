@@ -25,6 +25,7 @@ from art.distributed.trajectory_store import (
 from art.metrics_taxonomy import TRAIN_GRADIENT_STEPS_KEY
 from art.pipeline_trainer.checkpoint_retention import CheckpointRetentionPlan
 from art.pipeline_trainer.trainer import PipelineTrainer
+import art.serverless.backend as serverless_backend_module
 from art.serverless.backend import ServerlessBackend
 from art.serverless.data_plane import (
     decode_trajectory_group,
@@ -109,6 +110,7 @@ class _Client:
         self.service: _Service | None = None
         self.shutdown_calls = 0
         self.abort_calls = 0
+        self.encoded_batches = []
 
     async def stage_rl_group(self, value) -> None:
         assert self.service is not None
@@ -153,9 +155,10 @@ class _Client:
             SimpleNamespace(sequence_id=self.next_sequence_id), "forward_backward"
         )
 
-    async def forward_backward(self, request):
+    async def forward_backward(self, request, *, encoded_batch=None):
         self.batch = request.batch
         self.collect_packing_shapes = request.collect_packing_shapes
+        self.encoded_batches.append(encoded_batch)
         return self._operation(request, "forward_backward")
 
     async def optim_step(self, request):
@@ -359,10 +362,7 @@ async def _prepare_context(
 
 
 async def _admit_forward(context):
-    request = context.forward_request.model_copy(
-        update={"sequence_id": context.client.next_sequence_id}
-    )
-    return await context.client.forward_backward(request)
+    return await context.forward_backward(context.client.next_sequence_id)
 
 
 async def _admit_commands(context, forward):
@@ -529,6 +529,36 @@ async def test_bundle_failure_releases_marked_selection_once() -> None:
     selections, generation_id = queue.marked[0]
     assert summary._distributed_lease is None
     assert len(selections) == 1
+    assert queue.released == [(selections, "discarded", generation_id)]
+
+
+@pytest.mark.asyncio
+async def test_pipeline_encodes_remote_batch_before_forward_admission() -> None:
+    backend, model, client, _ = _backend()
+    queue, group = _distributed_group()
+
+    context = await _prepare_context(backend, model, [group])
+    assert context.encoded_batch.batch is context.forward_request.batch
+    assert client.encoded_batches == []
+
+    await _admit_forward(context)
+    assert client.encoded_batches == [context.encoded_batch]
+    assert queue.released == []
+
+
+@pytest.mark.asyncio
+async def test_pipeline_encoding_failure_releases_selection(monkeypatch) -> None:
+    backend, model, _, _ = _backend()
+    queue, group = _distributed_group()
+
+    def fail(_batch):
+        raise RuntimeError("encoding failed")
+
+    monkeypatch.setattr(serverless_backend_module, "prepare_training_batch", fail)
+    with pytest.raises(RuntimeError, match="encoding failed"):
+        await _prepare_context(backend, model, [group])
+
+    selections, generation_id = queue.marked[0]
     assert queue.released == [(selections, "discarded", generation_id)]
 
 

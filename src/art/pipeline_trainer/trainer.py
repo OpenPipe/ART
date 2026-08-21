@@ -1476,11 +1476,10 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
             try:
                 if self._admission_tail is not None:
                     await asyncio.shield(self._admission_tail)
-                forward_request = context.forward_request.model_copy(
-                    update={"sequence_id": context.client.next_sequence_id}
-                )
                 submit_started = time.monotonic()
-                forward = await context.client.forward_backward(forward_request)
+                forward = await context.forward_backward(
+                    context.client.next_sequence_id
+                )
                 forward_submit_s = time.monotonic() - submit_started
                 if forward.ref.learner_parent_version != packing_policy_step:
                     raise RuntimeError(

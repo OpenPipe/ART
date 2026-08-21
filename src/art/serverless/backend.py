@@ -53,6 +53,7 @@ from art.trajectories import Trajectory, TrajectoryGroup
 from art.types import ServerlessTrainResult, TrainConfig, TrainSFTConfig
 from art.utils.lifecycle import (
     complete_task,
+    complete_to_thread,
     consume_future_exception,
     process_shutdown_timeout,
 )
@@ -70,6 +71,7 @@ from .contracts import (
     CreateTrainingRunRequest,
     TrainingRunSpec,
 )
+from .data_plane import EncodedTrainingBatch, prepare_training_batch
 
 if TYPE_CHECKING:
     from art.model import Model, TrainableModel
@@ -113,12 +115,21 @@ class _RemotePipelineCommandContext(BaseModel):
     selections: tuple[Any, ...]
     generation_id: str = Field(min_length=1)
     forward_request: ForwardBackwardRequest
+    encoded_batch: SkipValidation[EncodedTrainingBatch] = Field(exclude=True)
     settings: _ServerlessTrainSettings
     preparation_metrics: dict[str, float]
     started: float = Field(ge=0)
     _sampler_pending: _PendingSamplerPublication | None = PrivateAttr(default=None)
     _publication: asyncio.Task[dict[str, float]] | None = PrivateAttr(default=None)
     _released: bool = PrivateAttr(default=False)
+
+    async def forward_backward(
+        self, sequence_id: int
+    ) -> TrainingOperation[ForwardBackwardResult]:
+        return await self.client.forward_backward(
+            self.forward_request.model_copy(update={"sequence_id": sequence_id}),
+            encoded_batch=self.encoded_batch,
+        )
 
     def optimizer_request(self, sequence_id: int) -> OptimStepRequest:
         return OptimStepRequest(
@@ -1729,8 +1740,29 @@ class ServerlessBackend:
             ),
             return_token_logprobs=False,
         )
+        encode_started = time.monotonic()
+        try:
+            encoded_batch, cancelled = await complete_to_thread(
+                lambda: prepare_training_batch(batch)
+            )
+            if cancelled is not None:
+                raise cancelled
+        except BaseException as primary:
+            try:
+                await queue.release_selections(
+                    selected,
+                    disposition="discarded",
+                    generation_id=generation_id,
+                )
+            except BaseException as cleanup:
+                raise BaseExceptionGroup(
+                    "remote batch encoding and source cleanup failed",
+                    [primary, cleanup],
+                ) from None
+            raise
         metrics = {
             "time/step_prepare_remote_batch_s": time.monotonic() - started,
+            "time/step_encode_remote_batch_s": time.monotonic() - encode_started,
         }
         return _RemotePipelineCommandContext(
             backend=self,
@@ -1740,6 +1772,7 @@ class ServerlessBackend:
             selections=selected,
             generation_id=generation_id,
             forward_request=request,
+            encoded_batch=encoded_batch,
             settings=settings,
             preparation_metrics=metrics,
             started=started,

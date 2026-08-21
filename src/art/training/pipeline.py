@@ -31,6 +31,10 @@ class PipelineCommandContext(Protocol):
     @property
     def preparation_metrics(self) -> dict[str, float]: ...
 
+    async def forward_backward(
+        self, sequence_id: int
+    ) -> TrainingOperation[ForwardBackwardResult]: ...
+
     def optimizer_request(self, sequence_id: int) -> OptimStepRequest: ...
 
     async def sampler_request(
