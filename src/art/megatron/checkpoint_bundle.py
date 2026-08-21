@@ -25,6 +25,7 @@ from .optimizer_state import (
     publish_adapter_checkpoint,
     read_adapter_publication,
     read_committed_optimizer_pointer,
+    validate_adapter_checkpoint,
 )
 
 BUNDLE_MANIFEST = "bundle.json"
@@ -73,6 +74,13 @@ class CheckpointBundleManifest(_BundleRecord):
         actual = {file.path for file in self.files}
         if actual != expected or len(actual) != len(self.files):
             raise ValueError("checkpoint bundle file coverage is incomplete")
+        bundle_files = {file.path: file for file in self.files}
+        for record in self.adapter.files:
+            bundled = bundle_files[f"adapter/{record.name}"]
+            if bundled.size_bytes != record.size_bytes or (
+                record.sha256 is not None and bundled.sha256 != record.sha256
+            ):
+                raise ValueError("checkpoint bundle adapter identity changed")
         return self
 
 
@@ -294,6 +302,14 @@ def read_checkpoint_bundle(
         )
     except Exception as error:
         raise RuntimeError(f"invalid checkpoint bundle: {root}") from error
+    try:
+        validate_adapter_checkpoint(
+            root / "adapter",
+            manifest.adapter,
+            verify_files=False,
+        )
+    except Exception as error:
+        raise RuntimeError(f"invalid bundled adapter: {root}: {error}") from error
     if verify_files:
         for record in manifest.files:
             _verify_file(root / record.path, record)

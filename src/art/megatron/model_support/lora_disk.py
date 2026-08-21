@@ -7,6 +7,10 @@ from typing import Any
 import torch
 
 from art.megatron.model_support.spec import ModelSupportHandler
+from art.megatron.weights.rank_sharded_lora import (
+    detect_adapter_checkpoint_format,
+    load_rank_sharded_lora_tensors,
+)
 from art.utils.safetensors import (
     FileIdentity,
     PreparedSafetensors,
@@ -79,6 +83,8 @@ def resolve_lora_handler(
 def load_vllm_lora_tensors(
     lora_path: str | Path,
 ) -> dict[str, torch.Tensor]:
+    if detect_adapter_checkpoint_format(lora_path) == "rank_sharded":
+        return load_rank_sharded_lora_tensors(lora_path)
     adapter_model_path = Path(lora_path) / "adapter_model.safetensors"
     with safe_open(adapter_model_path, framework="pt") as adapter_file:
         return {key: adapter_file.get_tensor(key) for key in adapter_file.keys()}
@@ -116,13 +122,19 @@ def normalize_lora_checkpoint_to_vllm(
     adapter_config: dict[str, Any] | None = None,
     allow_unvalidated_arch: bool = False,
 ) -> None:
-    adapter_model_path = Path(lora_path) / "adapter_model.safetensors"
-    if not adapter_model_path.exists():
+    root = Path(lora_path)
+    if not (
+        (root / "adapter_model.safetensors").exists()
+        or (root / "adapter_manifest.json").exists()
+    ):
         return
+    format = detect_adapter_checkpoint_format(root)
     if adapter_config is None:
         adapter_config = load_adapter_config(lora_path)
     if adapter_config.get(ART_LORA_FORMAT_CONFIG_KEY) == ART_LORA_FORMAT_VLLM:
         return
+    if format == "rank_sharded":
+        raise RuntimeError("rank-sharded durable LoRA is not an in-place conversion target")
     resolved_handler = resolve_lora_handler(
         lora_path,
         handler,
