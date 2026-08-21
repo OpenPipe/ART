@@ -1218,6 +1218,7 @@ class RemoteTrainingClient:
         self._events = _RunEventObserver(service, run.run_id)
         self._close_timeout_s = close_timeout_s
         self._lock = asyncio.Lock()
+        self._admission_tail: asyncio.Future[None] | None = None
         self._operations: dict[str, tuple[str, RemoteTrainingOperation[Any]]] = {}
         self._open_forward_backward: list[
             RemoteTrainingOperation[ForwardBackwardResult]
@@ -1275,6 +1276,46 @@ class RemoteTrainingClient:
         result_type: type[ResultT],
         encoded_batch: EncodedTrainingBatch | None = None,
     ) -> TrainingOperation[ResultT]:
+        predecessor = self._admission_tail
+        turn = asyncio.get_running_loop().create_future()
+        self._admission_tail = turn
+        try:
+            if isinstance(request, (ForwardRequest, ForwardBackwardRequest)):
+                prepared, cancelled = await complete_to_thread(
+                    lambda: _prepare_forward_submission(request, encoded_batch)
+                )
+                if cancelled is not None:
+                    raise cancelled
+                wire_request, submission, fingerprint = prepared
+            else:
+                wire_request, submission = request, None
+                fingerprint = remote_request_fingerprint(request)
+            if predecessor is not None:
+                await asyncio.shield(predecessor)
+            return await self._admit_prepared(
+                request,
+                kind=kind,
+                result_type=result_type,
+                wire_request=wire_request,
+                submission=submission,
+                fingerprint=fingerprint,
+            )
+        finally:
+            if predecessor is not None and not predecessor.done():
+                predecessor.add_done_callback(lambda _: turn.set_result(None))
+            else:
+                turn.set_result(None)
+
+    async def _admit_prepared(
+        self,
+        request: RunCommand,
+        *,
+        kind: OperationKind,
+        result_type: type[ResultT],
+        wire_request: RunCommand | RemoteForwardRequest,
+        submission: EncodedForwardSubmission | None,
+        fingerprint: str,
+    ) -> TrainingOperation[ResultT]:
         async with self._lock:
             if self._closed:
                 raise RuntimeError("remote training client is closed")
@@ -1292,16 +1333,6 @@ class RemoteTrainingClient:
                     f"expected sequence {self._next_sequence_id}, "
                     f"got {request.sequence_id}"
                 )
-            if isinstance(request, (ForwardRequest, ForwardBackwardRequest)):
-                prepared, cancelled = await complete_to_thread(
-                    lambda: _prepare_forward_submission(request, encoded_batch)
-                )
-                if cancelled is not None:
-                    raise cancelled
-                wire_request, submission, fingerprint = prepared
-            else:
-                wire_request, submission = request, None
-                fingerprint = remote_request_fingerprint(request)
             if existing := self._operations.get(request.request_id):
                 if existing[0] != fingerprint:
                     raise ValueError("request_id was reused with different content")

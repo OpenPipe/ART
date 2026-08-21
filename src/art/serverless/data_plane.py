@@ -773,6 +773,7 @@ def encode_tokenized_batch_wire(batch: TokenizedTrainingBatch) -> bytes:
     payload = batch.encoded_payload()
     if payload is None:
         payload = _encode_tokenized_wire_batch(batch, route_encoding="prefix_tree")
+        batch.remember_encoded_payload(payload)
     return payload
 
 
