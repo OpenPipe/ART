@@ -1,7 +1,13 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncGenerator, AsyncIterator, Coroutine, Generator
+from collections.abc import (
+    AsyncGenerator,
+    AsyncIterator,
+    Coroutine,
+    Generator,
+    Iterable,
+)
 import copy
 from datetime import datetime, timedelta
 import gzip
@@ -383,6 +389,76 @@ async def test_async_helpers_and_group_aggregation_are_isolated() -> None:
     assert result.exceptions[0].message == "boom"
     assert len(generated_result.trajectories[0].exchanges.chat_completions) == 1
     assert not outer.exchanges
+
+    calls = 0
+
+    async def once() -> art.Trajectory:
+        nonlocal calls
+        calls += 1
+        return art.Trajectory(reward=1)
+
+    shared = once()
+    resolved = art.Trajectory(reward=2)
+    mixed = await art.trajectory_group(
+        [resolved, shared, shared, ValueError("recorded")],
+        exceptions=[RuntimeError("provided")],
+        metadata={"source": "test"},
+        metrics={"score": 3},
+        logs=["log"],
+    )
+    assert calls == 1
+    assert len(mixed.trajectories) == 3
+    assert mixed.trajectories[0] is resolved
+    assert mixed.trajectories[1] is mixed.trajectories[2]
+    assert [error.message for error in mixed.exceptions] == [
+        "recorded",
+        "provided",
+    ]
+    assert mixed.metadata == {"source": "test"}
+    assert mixed.metrics == {"score": 3}
+    assert mixed.logs == ["log"]
+
+    sibling_started = asyncio.Event()
+    sibling_stopped = asyncio.Event()
+
+    async def sibling() -> art.Trajectory:
+        sibling_started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            sibling_stopped.set()
+        raise AssertionError("unreachable")
+
+    async def cancelled() -> art.Trajectory:
+        await sibling_started.wait()
+        raise asyncio.CancelledError
+
+    with pytest.raises(asyncio.CancelledError):
+        await art.trajectory_group([sibling(), cancelled()])
+    assert sibling_stopped.is_set()
+
+    sibling_started.clear()
+    sibling_stopped.clear()
+    scheduled = sibling()
+
+    def failing_iterable() -> Iterable[Coroutine[Any, Any, art.Trajectory]]:
+        yield scheduled
+        raise ValueError("iteration failed")
+
+    with pytest.raises(ValueError, match="iteration failed"):
+        await art.trajectory_group(failing_iterable())
+    assert scheduled.cr_frame is None
+
+    task = asyncio.create_task(once())
+    scheduled = await art.trajectory_group([task, task])
+    assert len(scheduled.trajectories) == 2
+    assert scheduled.trajectories[0] is scheduled.trajectories[1]
+    assert calls == 2
+
+    future = asyncio.get_running_loop().create_future()
+    future.set_result(resolved)
+    from_future = await art.trajectory_group([future])
+    assert from_future.trajectories == [resolved]
 
 
 def test_sync_group_generator_initializes_once(

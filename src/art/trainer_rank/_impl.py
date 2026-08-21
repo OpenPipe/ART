@@ -46,6 +46,7 @@ from art.megatron.prefix_tree_packing import (
     estimate_prefix_tree_packed_tokens,
     prefix_tree_pack,
 )
+from art.trainer_rank._telemetry import phase as _telemetry_phase
 
 if TYPE_CHECKING:
     from megatron.core.models.gpt.gpt_model import GPTModel
@@ -66,6 +67,7 @@ if TYPE_CHECKING:
         _FinalizedSave,
         _PreparedSave,
     )
+    from art.trainer_rank._lora_export import _PreparedLoraExport
 
 
 @dataclass(frozen=True)
@@ -820,6 +822,7 @@ class TrainerRank:
         self._default_slot_ref: LoRASlotRef | None = None
         self._slot_stack: list[LoRASlotRef] = []
         self._checkpoint_slots: dict[str, _CheckpointSlot] = {}
+        self._prepared_lora_exports: dict[str, tuple[str, _PreparedLoraExport]] = {}
         self._checkpoint_prefetches: dict[str, asyncio.Task[PreparedCheckpoint]] = {}
         self._checkpoint_mutation_tail: asyncio.Task[None] | None = None
         self._checkpoint_process_group: dist.ProcessGroup | None = None
@@ -1281,11 +1284,41 @@ class TrainerRank:
         output_dir: str,
         checkpoint_path: str | Literal["active"] = "active",
     ) -> int:
-        from . import _checkpoint
+        from . import _lora_export
 
-        return _checkpoint.export_lora(
+        return _lora_export.export_lora(
             self, output_dir, self._resolve_checkpoint_name(checkpoint_path)
         )
+
+    def _prepare_lora_export(
+        self,
+        export_id: str,
+        checkpoint_path: str | Literal["active"] = "active",
+        *,
+        owner_id: str,
+    ) -> tuple[int, dict[str, float]]:
+        from . import _lora_export
+
+        return _lora_export.prepare_lora_export(
+            self,
+            export_id,
+            self._resolve_checkpoint_name(checkpoint_path),
+            owner_id=owner_id,
+        )
+
+    def _finish_lora_export(
+        self, export_id: str, output_dir: str, *, owner_id: str
+    ) -> dict[str, float]:
+        from . import _lora_export
+
+        return _lora_export.finish_lora_export(
+            self, export_id, output_dir, owner_id=owner_id
+        )
+
+    def _abort_lora_export(self, export_id: str, *, owner_id: str) -> None:
+        from . import _lora_export
+
+        _lora_export.abort_lora_export(self, export_id, owner_id=owner_id)
 
     @staticmethod
     def _checkpoint_source_key(path: str) -> str:
@@ -1548,9 +1581,13 @@ class TrainerRank:
         self._validate_replicated_top_level_count(len(items))
         start = 0
         while start < len(items):
-            candidate = self._select_next_micro_batch(
-                items, start, checkpoint=checkpoint
-            )
+            with _telemetry_phase(
+                "plan",
+                {"global_start": start, "global_remaining": len(items) - start},
+            ):
+                candidate = self._select_next_micro_batch(
+                    items, start, checkpoint=checkpoint
+                )
             flat_outputs = iter(
                 self._run_flat_plan_with_memory_tracking(
                     candidate.plan,
@@ -1564,23 +1601,30 @@ class TrainerRank:
                     self._last_global_micro_batch_size or 0,
                     candidate.stats_global_count,
                 )
-            yield MicroBatch(
-                inputs=candidate.inputs,
-                outputs=outputs,
-                indices=candidate.indices,
-                stats=MicroBatchStats(
-                    global_start=start,
-                    global_stop=stop,
-                    global_count=candidate.stats_global_count,
-                    local_count=len(candidate.inputs),
-                    packed_tokens=candidate.plan.packed_tokens,
-                    logical_tokens=candidate.plan.logical_tokens,
-                    estimated_required_bytes=candidate.check.estimated_required_bytes,
-                    available_bytes=candidate.check.available_bytes,
-                    rejected_candidates=candidate.rejected_candidates,
-                    cold_start=candidate.cold_start,
-                ),
-            )
+            with _telemetry_phase(
+                # This interval is controlled by the caller and normally contains
+                # loss construction and backward for the yielded microbatch.
+                "caller",
+                self._telemetry_signature(candidate.plan),
+                dedup_signature=self._telemetry_plan_signature(candidate.plan),
+            ):
+                yield MicroBatch(
+                    inputs=candidate.inputs,
+                    outputs=outputs,
+                    indices=candidate.indices,
+                    stats=MicroBatchStats(
+                        global_start=start,
+                        global_stop=stop,
+                        global_count=candidate.stats_global_count,
+                        local_count=len(candidate.inputs),
+                        packed_tokens=candidate.plan.packed_tokens,
+                        logical_tokens=candidate.plan.logical_tokens,
+                        estimated_required_bytes=candidate.check.estimated_required_bytes,
+                        available_bytes=candidate.check.available_bytes,
+                        rejected_candidates=candidate.rejected_candidates,
+                        cold_start=candidate.cold_start,
+                    ),
+                )
             start = stop
 
     @overload
@@ -1696,11 +1740,15 @@ class TrainerRank:
         selected_checkpoints = self._selected_dynamic_checkpoints(checkpoints)
         if on_live_graphs == "error":
             self._guard_checkpoints_can_step(selected_checkpoints)
-        return self._dynamic_optim_step(
-            selected_checkpoints,
-            params=params,
-            scale_grads=scale_grads,
-        )
+        with _telemetry_phase(
+            "optim",
+            {"checkpoint_count": len(selected_checkpoints)},
+        ):
+            return self._dynamic_optim_step(
+                selected_checkpoints,
+                params=params,
+                scale_grads=scale_grads,
+            )
 
     def _load_checkpoint_slot(
         self,
@@ -2575,7 +2623,15 @@ class TrainerRank:
         else:
             baseline = 0
         try:
-            outputs = self._execute_flat_plan(plan)
+            with _telemetry_phase(
+                "forward",
+                self._telemetry_signature(plan),
+                dedup_signature=self._telemetry_plan_signature(plan),
+                synchronized=torch.cuda.is_available() and self.device.type == "cuda",
+            ):
+                outputs = self._execute_flat_plan(plan)
+                if torch.cuda.is_available() and self.device.type == "cuda":
+                    torch.cuda.synchronize(self.device)
         except torch.cuda.OutOfMemoryError as exc:
             check = self._memory_check(plan)
             self._raise_memory_error(
@@ -2586,10 +2642,34 @@ class TrainerRank:
             )
             raise AssertionError("unreachable") from exc
         if torch.cuda.is_available() and self.device.type == "cuda":
-            torch.cuda.synchronize(self.device)
             peak = int(torch.cuda.max_memory_allocated(self.device))
             self._update_memory_profile(plan, max(0, peak - baseline))
         return outputs
+
+    @staticmethod
+    def _telemetry_plan_signature(plan: _FlatForwardPlan) -> dict[str, object]:
+        return {
+            "topology": plan.signature.topology,
+            "shared_prefix_max_depth": plan.signature.shared_prefix_max_depth,
+            "slot_group_count": plan.signature.slot_group_count,
+            "request_mix": plan.signature.request_mix,
+            "grad_enabled": plan.signature.grad_enabled,
+        }
+
+    @classmethod
+    def _telemetry_signature(cls, plan: _FlatForwardPlan) -> dict[str, object]:
+        return {
+            **cls._telemetry_plan_signature(plan),
+            "request_count": plan.request_count,
+            "packed_tokens": plan.packed_tokens,
+            "logical_tokens": plan.logical_tokens,
+            "group_packed_tokens": tuple(
+                int(group.packed.tokens.numel()) for group in plan.groups
+            ),
+            "group_segment_counts": tuple(
+                len(group.packed.segments) for group in plan.groups
+            ),
+        }
 
     def _execute_flat_plan(self, plan: _FlatForwardPlan) -> list[AnyForwardOutput]:
         outputs = [

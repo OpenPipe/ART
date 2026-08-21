@@ -1344,14 +1344,22 @@ async def trajectory(coroutine: Coroutine[Any, Any, object]) -> Trajectory:
 
 
 async def trajectory_group(
-    trajectories: Iterable[Coroutine[Any, Any, Trajectory]],
+    trajectories: Iterable[Trajectory | BaseException | Awaitable[Trajectory]],
     *,
+    exceptions: Iterable[BaseException | PydanticException] = (),
+    metadata: dict[str, MetadataValue] | None = None,
+    metrics: dict[str, float | int | bool] | None = None,
+    logs: list[str] | None = None,
     return_exceptions: bool = False,
 ) -> TrajectoryGroup:
     from ._scope import capture_trajectory_group
 
     return await capture_trajectory_group(
         trajectories,
+        exceptions=exceptions,
+        metadata=metadata,
+        metrics=metrics,
+        logs=logs,
         return_exceptions=return_exceptions,
     )
 
