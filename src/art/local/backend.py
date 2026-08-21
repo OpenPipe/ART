@@ -15,7 +15,7 @@ import shutil
 import socket
 import time
 from types import TracebackType
-from typing import TYPE_CHECKING, Any, AsyncIterator, Iterable, Literal, cast
+from typing import Any, AsyncIterator, Iterable, Literal, cast
 import warnings
 
 from art.utils.chat_template import (
@@ -46,9 +46,6 @@ from tqdm import auto as tqdm
 from transformers import AutoTokenizer
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 from typing_extensions import Self
-
-if TYPE_CHECKING:
-    from transformers.image_processing_utils import BaseImageProcessor
 
 from art.utils.output_dirs import (
     get_default_art_path,
@@ -357,7 +354,6 @@ class LocalBackend:
             tuple[str, str, str, int], tuple[float, dict[str, float]]
         ] = {}
         self._vllm_metrics_client: httpx.AsyncClient | None = None
-        self._image_processors: dict[str, BaseImageProcessor | None] = {}
         self._requires_explicit_packed_sequence_length = False
         self._packed_sequence_length_requires_chunk_alignment = True
         self._supports_result_packing = False
@@ -1066,15 +1062,6 @@ class LocalBackend:
                 internal_config=internal_config,
             )
             self._tokenizers[tokenizer_key] = tokenizer
-        if model.base_model not in self._image_processors:
-            try:
-                from transformers import AutoImageProcessor
-
-                self._image_processors[model.base_model] = (
-                    AutoImageProcessor.from_pretrained(model.base_model, use_fast=True)
-                )
-            except Exception:
-                self._image_processors[model.base_model] = None
         tokenizer = self._tokenizers[tokenizer_key]
         chat_template_kwargs = internal_config.get("chat_template_kwargs")
         chat_template_tool_schema_format = self._chat_template_tool_schema_format(
@@ -1095,7 +1082,6 @@ class LocalBackend:
                 trajectory_groups,
                 allow_training_without_logprobs,
                 scale_rewards,
-                image_processor=self._image_processors[model.base_model],
                 chat_template_kwargs=chat_template_kwargs,
                 chat_template_tool_schema_format=chat_template_tool_schema_format,
                 model=automatic_training_model_selector(
