@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 import sys
 import time
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict
@@ -45,6 +45,8 @@ from art.megatron.model_support.lora_disk import (
     ART_LORA_FORMAT_VLLM,
     encode_adapter_config,
 )
+from art.megatron.runtime.executor import _GenerationPublisher
+from art.megatron.runtime.specs import TrainerGeneration
 from art.megatron.tensor_snapshot import (
     PinnedCpuSnapshotBuilder,
     PinnedCpuSnapshotStager,
@@ -712,3 +714,94 @@ def test_snapshot_fence_waits_for_caller_stream(monkeypatch: pytest.MonkeyPatch)
 
     assert stager.stream_value.waited_for is caller_stream
     assert builder._devices == {3}
+
+
+def test_generation_publisher_uses_independent_ordered_control_group(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import art.megatron.weights.lora_publish as lora_publish
+    import art.megatron.weights.rank_distributed_lora_publish as distributed_publish
+
+    fixture = _fixture("qwen36_per_expert", 0, 1, tmp_path)
+    generation = TrainerGeneration(
+        training_session_id="session",
+        policy_step=7,
+        generation_id="step-00000007-00000000000000000000000000000000",
+        adapter_path="adapter",
+    )
+    target = _target("qwen36_per_expert", 1).model_copy(
+        update={
+            "metadata": {
+                "training_session_id": generation.training_session_id,
+                "generation_id": generation.generation_id,
+                "policy_step": str(generation.policy_step),
+            }
+        }
+    )
+    monkeypatch.setattr(
+        lora_publish,
+        "collect_local_lora_entries",
+        lambda *_args, **_kwargs: (fixture.regular, fixture.regular_metadata),
+    )
+    monkeypatch.setattr(
+        lora_publish,
+        "collect_local_packed_expert_entries",
+        lambda *_args, **_kwargs: (fixture.packed, fixture.packed_metadata),
+    )
+
+    class Barrier:
+        registered = []
+
+        def register(self, pending, *, key: str) -> None:
+            self.registered.append((pending, key))
+
+    class Sink:
+        events = []
+
+        def publication(self, event) -> None:
+            self.events.append(event)
+
+    control_group = object()
+    runtime = SimpleNamespace(
+        rank=0,
+        world_size=1,
+        model=(),
+        model_support_handler=fixture.handler,
+        optimizer_snapshot_barrier=Barrier(),
+        publication_group=control_group,
+    )
+    publisher = _GenerationPublisher(runtime, capacity=2)
+    plan, _metrics = publisher.prepare_ordered_sampler(
+        operation_id="operation",
+        run_id="run",
+        generation=generation,
+        optimizer_state_path=str(tmp_path / "optimizer"),
+        target=target,
+        adapter_dtypes={},
+        adapter_config=fixture.adapter_config,
+        slot_ref=None,
+        sink=Sink(),
+    )
+    prepared = publisher._prepared["operation"]
+    calls = []
+    store = object()
+
+    def publish(value, received_store, *, group):
+        calls.append((value, received_store, group))
+        return value.layout.ref
+
+    monkeypatch.setattr(
+        distributed_publish,
+        "publish_rank_distributed_vllm_lora",
+        publish,
+    )
+    monkeypatch.setattr(publisher, "_object_store_for", lambda _target: store)
+    transport = publisher._transfer_prepared_snapshot(prepared, time.perf_counter())
+
+    assert runtime.optimizer_snapshot_barrier.registered[0][1] == "run"
+    assert plan.transport_adapter is not None
+    assert transport.adapter == plan.transport_adapter
+    assert calls == [(prepared.distributed_adapter, store, control_group)]
+    publisher.discard("operation")
+    publisher.close()

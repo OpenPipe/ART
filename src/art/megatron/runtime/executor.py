@@ -82,12 +82,33 @@ from .trainer_run import EventSink
 
 if TYPE_CHECKING:
     from art.megatron.lora import LoRASlotRef
+    from art.megatron.weights.rank_distributed_lora_publish import (
+        PreparedRankDistributedLora,
+    )
     from art.trainer_rank import TrainerRankOptimizerState
 
 
 def _consume_future(future: Future[Any]) -> None:
     if not future.cancelled():
         future.exception()
+
+
+def _ordered_sampler_target(
+    job: GenerationSnapshotJobSpec,
+) -> OrderedBinaryObjectTarget | None:
+    target = job.adapter_object_target
+    if not isinstance(target, OrderedBinaryObjectTarget):
+        return None
+    if (
+        job.save_optimizer
+        or job.staging_adapter_path is not None
+        or job.existing_adapter is not None
+        or job.publication_targets
+    ):
+        raise ValueError(
+            "ordered sampler publication cannot include local or optimizer writes"
+        )
+    return target
 
 
 def _command_token_logprobs(
@@ -924,6 +945,25 @@ class MegatronTrainJobExecutor:
             not runtime.optimizer_state_loaded or runtime.optimizer is None
         ):
             raise RuntimeError("snapshot requested non-resident optimizer state")
+        ordered_target = _ordered_sampler_target(job)
+        if ordered_target is not None:
+            rank_plan, metrics = self._publisher.prepare_ordered_sampler(
+                operation_id=job.operation_id,
+                run_id=job.run_id,
+                generation=job.generation,
+                optimizer_state_path=job.optimizer_state_path,
+                target=ordered_target,
+                adapter_dtypes=runtime.adapter_export_dtypes,
+                adapter_config=runtime.adapter_export_config,
+                slot_ref=None,
+                sink=sink,
+            )
+            return {
+                "operation_id": job.operation_id,
+                "learner_version": job.learner_version,
+                "rank_write_plan": rank_plan.model_dump(mode="json"),
+                "metrics": metrics,
+            }
         stage_metrics = self._publisher.ensure_generation(
             run_id=job.run_id,
             generation=job.generation,
@@ -1874,6 +1914,28 @@ class MCoreRunSlotExecutor:
         self._validate_parent(state, job.training_session_id, job.learner_version)
         if state.desired.weights.generation_id != job.generation.generation_id:
             raise RuntimeError("snapshot does not identify the selected generation")
+        ordered_target = _ordered_sampler_target(job)
+        if ordered_target is not None:
+            from art.megatron.lora import LoRASlotRef
+
+            with self._resident(state):
+                rank_plan, metrics = self._publisher.prepare_ordered_sampler(
+                    operation_id=job.operation_id,
+                    run_id=job.run_id,
+                    generation=job.generation,
+                    optimizer_state_path=job.optimizer_state_path,
+                    target=ordered_target,
+                    adapter_dtypes={},
+                    adapter_config=state.adapter_config,
+                    slot_ref=LoRASlotRef("checkpoint", job.run_id),
+                    sink=sink,
+                )
+            return {
+                "operation_id": job.operation_id,
+                "learner_version": job.learner_version,
+                "rank_write_plan": rank_plan.model_dump(mode="json"),
+                "metrics": metrics,
+            }
         stage_metrics: dict[str, float] = {}
         if not self._publisher.has_generation(job.generation):
             from art.megatron.lora import LoRASlotRef
@@ -2283,6 +2345,7 @@ class _CachedGeneration(BaseModel):
     admission_order: int = Field(default=0, ge=0)
     retired: bool = False
     released: bool = False
+    ephemeral: bool = False
 
 
 class _SnapshotTransport(BaseModel):
@@ -2322,6 +2385,7 @@ class _PreparedRankSnapshot(BaseModel):
     entry: _CachedGeneration
     plan: SnapshotRankWritePlan
     adapter: _PreparedAdapterPayload | None
+    distributed_adapter: Any | None = None
     optimizer: Any | None
     optimizer_archive: Any | None
     optimizer_identity: FileIdentity | None
@@ -2361,6 +2425,9 @@ class _GenerationPublisher:
         )
         self._transport_pool = ThreadPoolExecutor(
             max_workers=capacity, thread_name_prefix="art-publish-transport"
+        )
+        self._ordered_transport_pool = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="art-publish-ordered"
         )
         self._durability_pool = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="art-publish-durable"
@@ -2642,6 +2709,196 @@ class _GenerationPublisher:
             "snapshot_optimizer_attach_s": elapsed,
         }
 
+    def prepare_ordered_sampler(
+        self,
+        *,
+        operation_id: str,
+        run_id: str,
+        generation: TrainerGeneration,
+        optimizer_state_path: str,
+        target: OrderedBinaryObjectTarget,
+        adapter_dtypes: dict[str, torch.dtype],
+        adapter_config: dict[str, Any],
+        slot_ref: "LoRASlotRef | None",
+        sink: EventSink,
+    ) -> tuple[SnapshotRankWritePlan, dict[str, float]]:
+        """Prepare rank-owned sampler bytes while the selected learner is resident."""
+        self.raise_if_failed()
+        with self._lock:
+            cached = self._prepared.get(operation_id)
+        if cached is not None:
+            if (
+                cached.plan.generation != generation
+                or cached.adapter_object_target != target
+                or cached.distributed_adapter is None
+            ):
+                raise RuntimeError(
+                    "ordered sampler operation was reused for another snapshot"
+                )
+            return cached.plan, {}
+        expected_metadata = {
+            "training_session_id": generation.training_session_id,
+            "generation_id": generation.generation_id,
+            "policy_step": str(generation.policy_step),
+        }
+        if any(target.metadata.get(key) != value for key, value in expected_metadata.items()):
+            raise RuntimeError(
+                "ordered sampler target identifies another learner generation"
+            )
+
+        from art.megatron.lora import _block_for_key
+        from art.megatron.weights.lora_publish import (
+            collect_local_lora_entries,
+            collect_local_packed_expert_entries,
+        )
+        from art.megatron.weights.rank_distributed_lora_publish import (
+            prepare_rank_distributed_vllm_lora,
+        )
+
+        wait_s, in_flight, stager = self._acquire_slot(protected_run_id=run_id)
+        started = time.perf_counter()
+        entry: _CachedGeneration | None = None
+        resolved: Future[_ResolvedGeneration] | None = None
+        try:
+            handler = self.runtime.model_support_handler
+            packed_groups = handler.expert_packed_lora_groups()
+            local_tensors, local_metadata = collect_local_lora_entries(
+                self.runtime.model,
+                adapter_dtypes,
+                owner_rank=int(self.runtime.rank),
+                packed_expert_groups=packed_groups,
+                slot_ref=slot_ref,
+            )
+            local_packed_tensors, local_packed_metadata = (
+                collect_local_packed_expert_entries(
+                    self.runtime.model,
+                    adapter_dtypes,
+                    owner_rank=int(self.runtime.rank),
+                    packed_expert_groups=packed_groups,
+                    slot_ref=slot_ref,
+                )
+            )
+            source_devices = {
+                tensor.device
+                for tensor in (*local_tensors.values(), *local_packed_tensors.values())
+            }
+            if len(source_devices) > 1:
+                raise RuntimeError(
+                    "one rank-distributed sampler source spans multiple devices"
+                )
+            exchange_device = (
+                source_devices.pop()
+                if source_devices
+                else torch.device("cuda", torch.cuda.current_device())
+            )
+            pending = prepare_rank_distributed_vllm_lora(
+                target=target,
+                local_tensors=local_tensors,
+                local_metadata=local_metadata,
+                local_packed_tensors=local_packed_tensors,
+                local_packed_metadata=local_packed_metadata,
+                handler=handler,
+                adapter_config=adapter_config,
+                conversion_group_for_key=_block_for_key,
+                exchange_device=exchange_device,
+                stager=stager,
+            )
+            self.runtime.optimizer_snapshot_barrier.register(pending, key=run_id)
+            resolved = self._resolution_pool.submit(
+                self._resolve_ordered_sampler, pending
+            )
+            entry = _CachedGeneration(
+                run_id=run_id,
+                generation=generation,
+                stager=stager,
+                resolved=resolved,
+                ephemeral=True,
+            )
+            resolved.add_done_callback(
+                lambda _done, cached_entry=entry: self._maybe_release(cached_entry)
+            )
+            ref = pending.payload.layout.ref
+            expected_files = {"adapter_config.json", "adapter_model.safetensors"}
+            if {file.relative_path for file in ref.files} != expected_files:
+                raise RuntimeError("ordered sampler object has an invalid LoRA layout")
+            transport_adapter = OptimizerAdapter(
+                identity=ref.manifest_uri,
+                training_session_id=generation.training_session_id,
+                step=generation.policy_step,
+                generation_id=generation.generation_id,
+                files=tuple(
+                    CheckpointFile(
+                        name=cast(Any, file.relative_path),
+                        size_bytes=file.byte_count,
+                        sha256=file.sha256,
+                    )
+                    for file in ref.files
+                ),
+            )
+            rank = int(self.runtime.rank)
+            rank_plan = SnapshotRankWritePlan(
+                rank=rank,
+                generation=generation,
+                transport_adapter=transport_adapter if rank == 0 else None,
+                saves_optimizer=False,
+            )
+            completion: Future[TrainerRankPublication] = Future()
+            completion.add_done_callback(_consume_future)
+            contexts = ExitStack()
+            prepared = _PreparedRankSnapshot(
+                operation_id=operation_id,
+                entry=entry,
+                plan=rank_plan,
+                adapter=None,
+                distributed_adapter=pending.payload,
+                optimizer=None,
+                optimizer_archive=None,
+                optimizer_identity=None,
+                optimizer_state_path=optimizer_state_path,
+                staging_adapter_path=None,
+                publication_targets=(),
+                adapter_object_target=target,
+                contexts=contexts,
+                completion=completion,
+                sink=sink,
+                prepared_at=started,
+            )
+            with self._lock:
+                if operation_id in self._prepared:
+                    raise RuntimeError(
+                        f"snapshot operation already prepared: {operation_id}"
+                    )
+                self._prepared[operation_id] = prepared
+                self._prepared_order.append(operation_id)
+                entry.consumers.append(completion)
+        except BaseException:
+            if entry is None:
+                if resolved is not None:
+                    resolved.result()
+                self._release_slot(stager)
+            else:
+                entry.retired = True
+                self._maybe_release(entry)
+            raise
+        metrics = {
+            "snapshot_pool_wait_s": wait_s,
+            "snapshot_pool_in_use": float(in_flight),
+            "snapshot_pool_pressure": in_flight / self.capacity,
+            "snapshot_ordered_prepare_s": time.perf_counter() - started,
+            **{
+                f"snapshot_ordered_{key}": float(value)
+                for key, value in pending.payload.stats.model_dump().items()
+            },
+        }
+        return rank_plan, metrics
+
+    @staticmethod
+    def _resolve_ordered_sampler(
+        pending: PendingCpuSnapshot["PreparedRankDistributedLora"],
+    ) -> _ResolvedGeneration:
+        pending.resolve()
+        return _ResolvedGeneration(lora=None, optimizer=None, prepared_tensors=None)
+
     def prepare(
         self,
         *,
@@ -2655,6 +2912,10 @@ class _GenerationPublisher:
         save_optimizer: bool,
         sink: EventSink,
     ) -> tuple[SnapshotRankWritePlan, dict[str, float]]:
+        if isinstance(adapter_object_target, OrderedBinaryObjectTarget):
+            raise RuntimeError(
+                "ordered sampler objects require rank-distributed preparation"
+            )
         self.raise_if_failed()
         with self._lock:
             entry = self._cache.get(generation.generation_id)
@@ -2806,6 +3067,7 @@ class _GenerationPublisher:
                 entry=entry,
                 plan=rank_plan,
                 adapter=adapter_payload,
+                distributed_adapter=None,
                 optimizer=optimizer,
                 optimizer_archive=optimizer_archive,
                 optimizer_identity=optimizer_identity,
@@ -2867,7 +3129,12 @@ class _GenerationPublisher:
             self._prepared_order.popleft()
         started = time.perf_counter()
         try:
-            transport = self._transport_pool.submit(
+            transport_pool = (
+                self._ordered_transport_pool
+                if prepared.distributed_adapter is not None
+                else self._transport_pool
+            )
+            transport = transport_pool.submit(
                 self._transfer_prepared_snapshot, prepared, started
             )
             durability = self._start_durability(prepared, started)
@@ -3299,6 +3566,55 @@ class _GenerationPublisher:
         self, prepared: _PreparedRankSnapshot, submitted_at: float
     ) -> _SnapshotTransport:
         started = time.perf_counter()
+        distributed = prepared.distributed_adapter
+        if distributed is not None:
+            from art.megatron.weights.rank_distributed_lora_publish import (
+                PreparedRankDistributedLora,
+                publish_rank_distributed_vllm_lora,
+            )
+
+            if not isinstance(distributed, PreparedRankDistributedLora):
+                raise RuntimeError("ordered publication has an invalid distributed payload")
+            prepared.entry.resolved.result()
+            ready = time.perf_counter()
+            target = prepared.adapter_object_target
+            if not isinstance(target, OrderedBinaryObjectTarget):
+                raise RuntimeError(
+                    "rank-distributed adapter has no ordered object target"
+                )
+            group = self.runtime.publication_group
+            if distributed.layout.world_size > 1 and group is None:
+                raise RuntimeError(
+                    "multi-rank ordered publication has no independent control group"
+                )
+            ref = publish_rank_distributed_vllm_lora(
+                distributed,
+                self._object_store_for(target),
+                group=group,
+            )
+            if ref != distributed.layout.ref:
+                raise RuntimeError(
+                    "rank-distributed adapter publication changed identity"
+                )
+            adapter = (
+                prepared.plan.transport_adapter
+                if int(self.runtime.rank) == distributed.layout.coordinator_rank
+                else None
+            )
+            if (adapter is None) != (
+                int(self.runtime.rank) != distributed.layout.coordinator_rank
+            ):
+                raise RuntimeError(
+                    "rank-distributed adapter plan changed coordinator ownership"
+                )
+            return _SnapshotTransport(
+                adapter=adapter,
+                metrics={
+                    "time/snapshot_transport_queue_s": started - submitted_at,
+                    "time/snapshot_transport_wait_s": ready - started,
+                    "time/snapshot_transport_s": time.perf_counter() - ready,
+                },
+            )
         if int(self.runtime.rank) != 0:
             return _SnapshotTransport(
                 metrics={"time/snapshot_transport_queue_s": started - submitted_at}
@@ -3499,12 +3815,7 @@ class _GenerationPublisher:
             raise RuntimeError(
                 "adapter object target identifies another learner generation"
             )
-        with self._lock:
-            if self._object_store is None:
-                self._object_store = S3BinaryObjectStore(target.store)
-            elif self._object_store.config != target.store:
-                raise RuntimeError("generation publisher cannot mix object stores")
-            store = self._object_store
+        store = self._object_store_for(target)
         planned_files = {file.name: file for file in planned.files}
         source_files: dict[str, tuple[memoryview, ...]] = {
             "adapter_model.safetensors": tuple(
@@ -3539,6 +3850,16 @@ class _GenerationPublisher:
         ):
             raise RuntimeError("adapter object publication differs from its plan")
         return planned
+
+    def _object_store_for(
+        self, target: BinaryObjectPublicationTarget
+    ) -> S3BinaryObjectStore:
+        with self._lock:
+            if self._object_store is None:
+                self._object_store = S3BinaryObjectStore(target.store)
+            elif self._object_store.config != target.store:
+                raise RuntimeError("generation publisher cannot mix object stores")
+            return self._object_store
 
     def _persist_generation(
         self, prepared: _PreparedRankSnapshot
@@ -3704,6 +4025,8 @@ class _GenerationPublisher:
                 self._prepared_order.remove(prepared.operation_id)
             except ValueError:
                 pass
+            if prepared.entry.ephemeral:
+                prepared.entry.retired = True
         self._maybe_release(prepared.entry)
 
     def _report_failure(
@@ -3771,6 +4094,7 @@ class _GenerationPublisher:
             self._maybe_release(entry)
         self._resolution_pool.shutdown(wait=True)
         self._transport_pool.shutdown(wait=True)
+        self._ordered_transport_pool.shutdown(wait=True)
         self._durability_pool.shutdown(wait=True)
         self._completion_pool.shutdown(wait=True)
         for entry in entries:
