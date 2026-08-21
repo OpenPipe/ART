@@ -1,11 +1,15 @@
 import asyncio
 from contextlib import asynccontextmanager
+import hashlib
 from types import SimpleNamespace
 
 import pytest
 import torch
 
-from art.distributed.trajectory_store import TrajectoryGroupBundle
+from art.distributed.trajectory_store import (
+    TrajectoryGroupBundle,
+    TrajectoryGroupDataIdentity,
+)
 from art.local.backend import _PackedTrainingBatch
 from art.megatron.backend import _DistributedBatchPayload
 from art.megatron.distributed_service import GenerationSnapshotLaunch
@@ -219,11 +223,7 @@ class _Service:
             {"optimizer_restored": restore_optimizer},
             generation,
             {},
-            DurableTrainerPublication(
-                adapter=adapter,
-                resume_step=generation.policy_step,
-                optimizer_step=generation.policy_step,
-            ),
+            adapter,
         )
 
 
@@ -299,8 +299,18 @@ class _Client(LocalMegatronTrainingClient):
 
 
 def _batch() -> RlTrajectoryBatch:
+    header = b"header"
     batch = RlTrajectoryBatch(
-        groups=(TrajectoryGroupBundle(header=b"header", records=()),),
+        groups=(
+            TrajectoryGroupBundle(
+                header=header,
+                records=(),
+                route_free_identity=TrajectoryGroupDataIdentity(
+                    sha256=hashlib.sha256(header).hexdigest(),
+                    byte_count=len(header),
+                ),
+            ),
+        ),
         min_source_version=3,
         max_source_version=3,
     )

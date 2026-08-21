@@ -199,6 +199,12 @@ class RankDistributedLoraOutputRecord(BaseModel):
         return self
 
 
+class RankDistributedLoraPublicationReadiness(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    error: str | None = None
+
+
 class PreparedRankDistributedLora(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True, extra="forbid", frozen=True)
 
@@ -304,12 +310,15 @@ def _collect_prepare_records(
     world_size: int,
     exchange_group: Any | None,
     metadata_group: Any | None,
+    local_error: BaseException | None = None,
 ) -> tuple[
     list[RankDistributedLoraPrepareRecord],
     list[LoraShardMeta],
     list[PackedExpertShardMeta],
 ]:
     try:
+        if local_error is not None:
+            raise local_error
         contract = RankDistributedLoraCallContract(
             target=target,
             handler_key=str(getattr(handler, "key", "")),
@@ -945,14 +954,15 @@ def prepare_rank_distributed_vllm_lora(
     local_metadata: Sequence[LoraShardMeta],
     local_packed_tensors: dict[str, torch.Tensor],
     local_packed_metadata: Sequence[PackedExpertShardMeta],
-    handler: Any,
+    handler: Any | None,
     adapter_config: dict[str, Any],
     conversion_group_for_key: Callable[[str], str],
     group: Any | None = None,
     metadata_group: Any | None = None,
     coordinator_rank: int = 0,
-    exchange_device: torch.device,
-    stager: PinnedCpuSnapshotStager,
+    exchange_device: torch.device | None,
+    stager: PinnedCpuSnapshotStager | None,
+    local_error: BaseException | None = None,
 ) -> PendingCpuSnapshot[PreparedRankDistributedLora]:
     """Gather declared conversion dependency groups and prepare rank-owned L2 ranges.
 
@@ -964,31 +974,46 @@ def prepare_rank_distributed_vllm_lora(
     converted tensors or a returned config decision must map to the same group.
     """
     rank, world_size = _rank_world(group)
-    exchange_device = torch.device(exchange_device)
-    if exchange_device.type == "cuda" and exchange_device.index is None:
-        exchange_device = torch.device("cuda", torch.cuda.current_device())
-    if exchange_device.type not in {"cpu", "cuda"}:
-        raise ValueError(f"unsupported LoRA exchange device: {exchange_device.type}")
-    if coordinator_rank >= world_size:
-        raise ValueError("LoRA publication coordinator leaves its world")
-    if world_size > 1:
-        backend = str(torch.distributed.get_backend(group))  # type: ignore[possibly-missing-attribute]
-        expected_backend = "gloo" if exchange_device.type == "cpu" else "nccl"
-        if exchange_device.type not in {"cpu", "cuda"} or backend != expected_backend:
-            raise RuntimeError(
-                "LoRA exchange device must match its distributed backend: "
-                f"device={exchange_device.type} backend={backend}"
+    if world_size > 1 and metadata_group is None:
+        metadata_group = group
+    try:
+        if local_error is not None:
+            raise local_error
+        if handler is None or stager is None or exchange_device is None:
+            raise RuntimeError("rank-distributed LoRA preparation is incomplete")
+        exchange_device = torch.device(exchange_device)
+        if exchange_device.type == "cuda" and exchange_device.index is None:
+            exchange_device = torch.device("cuda", torch.cuda.current_device())
+        if exchange_device.type not in {"cpu", "cuda"}:
+            raise ValueError(
+                f"unsupported LoRA exchange device: {exchange_device.type}"
             )
-        metadata_group = group if metadata_group is None else metadata_group
-        metadata_backend = str(torch.distributed.get_backend(metadata_group))  # type: ignore[possibly-missing-attribute]
-        if metadata_backend != "gloo":
-            raise RuntimeError("LoRA metadata exchange requires an all-rank Gloo group")
-        if (
-            torch.distributed.get_world_size(metadata_group) != world_size  # type: ignore[possibly-missing-attribute]
-            or tuple(torch.distributed.get_process_group_ranks(metadata_group))  # type: ignore[possibly-missing-attribute]
-            != tuple(torch.distributed.get_process_group_ranks(group))  # type: ignore[possibly-missing-attribute]
-        ):
-            raise RuntimeError("LoRA metadata and tensor groups cover different ranks")
+        if coordinator_rank >= world_size:
+            raise ValueError("LoRA publication coordinator leaves its world")
+        if world_size > 1:
+            backend = str(torch.distributed.get_backend(group))  # type: ignore[possibly-missing-attribute]
+            expected_backend = "gloo" if exchange_device.type == "cpu" else "nccl"
+            if backend != expected_backend:
+                raise RuntimeError(
+                    "LoRA exchange device must match its distributed backend: "
+                    f"device={exchange_device.type} backend={backend}"
+                )
+            metadata_backend = str(torch.distributed.get_backend(metadata_group))  # type: ignore[possibly-missing-attribute]
+            if metadata_backend != "gloo":
+                raise RuntimeError(
+                    "LoRA metadata exchange requires an all-rank Gloo group"
+                )
+            if (
+                torch.distributed.get_world_size(metadata_group) != world_size  # type: ignore[possibly-missing-attribute]
+                or tuple(torch.distributed.get_process_group_ranks(metadata_group))  # type: ignore[possibly-missing-attribute]
+                != tuple(torch.distributed.get_process_group_ranks(group))  # type: ignore[possibly-missing-attribute]
+            ):
+                raise RuntimeError(
+                    "LoRA metadata and tensor groups cover different ranks"
+                )
+    except BaseException as error:
+        local_error = error
+        exchange_device = torch.device("cpu")
     records, local_metadata, local_packed_metadata = _collect_prepare_records(
         target=target,
         handler=handler,
@@ -1004,7 +1029,10 @@ def prepare_rank_distributed_vllm_lora(
         world_size=world_size,
         exchange_group=group,
         metadata_group=metadata_group,
+        local_error=local_error,
     )
+    if handler is None or stager is None:
+        raise RuntimeError("LoRA readiness collective accepted incomplete preparation")
     regular_candidates = _gather_candidates(
         tuple(record.regular for record in records),
     )
@@ -1168,15 +1196,38 @@ def _broadcast_result(
 
 def publish_rank_distributed_vllm_lora(
     prepared: PreparedRankDistributedLora,
-    store: S3BinaryObjectStore,
+    store: S3BinaryObjectStore | None,
     *,
     group: Any | None = None,
+    local_error: BaseException | None = None,
 ) -> OrderedBinaryObjectRef:
     """Publish plan first, rank-owned shards concurrently, and commit last."""
     rank, world_size = _rank_world(group)
     layout = prepared.layout
     if (rank, world_size) != (prepared.rank, layout.world_size):
         raise RuntimeError("rank-distributed LoRA publication world changed")
+    readiness = RankDistributedLoraPublicationReadiness(
+        error=(
+            None
+            if local_error is None
+            else f"{type(local_error).__name__}: {local_error}"
+        )
+    )
+    ready = tuple(
+        RankDistributedLoraPublicationReadiness.model_validate(value)
+        for value in _all_gather_records(readiness, world_size, group)
+    )
+    failures = [
+        f"rank {owner}: {value.error}"
+        for owner, value in enumerate(ready)
+        if value.error is not None
+    ]
+    if failures:
+        raise RuntimeError(
+            "rank-distributed LoRA publication is not ready: " + "; ".join(failures)
+        )
+    if store is None:
+        raise RuntimeError("rank-distributed LoRA publication has no object store")
     coordinator = layout.coordinator_rank
     plan_ref = None
     plan_error = None

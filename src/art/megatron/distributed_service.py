@@ -54,6 +54,7 @@ from .optimizer_state import (
     adapter_generation_lease,
     commit_optimizer_policy_advance,
     format_megatron_resume_message,
+    link_adapter_generation,
     new_optimizer_generation,
     optimizer_adapter,
     prepare_megatron_resume_state,
@@ -1483,7 +1484,7 @@ class DistributedMegatronService:
         dict[str, Any],
         TrainerGeneration,
         dict[str, float],
-        DurableTrainerPublication,
+        OptimizerAdapter,
     ]:
         output_version = ref.reserved_output_learner_version
         if output_version is None:
@@ -1520,34 +1521,36 @@ class DistributedMegatronService:
                     ),
                     restore_optimizer=restore_optimizer,
                 )
+            alias_started = time.monotonic()
+            adapter = await asyncio.to_thread(
+                link_adapter_generation,
+                source.adapter.identity,
+                source_step=source.adapter.step,
+                staging_path=(
+                    Path(self.output_dir)
+                    / "megatron_runtime"
+                    / "staging"
+                    / generation.generation_id
+                ),
+                step=generation.policy_step,
+                training_session_id=generation.training_session_id,
+                generation_id=generation.generation_id,
+            )
+            alias_s = time.monotonic() - alias_started
             result = await trainer.load_state(job)
             async with self._mutation_lock:
                 if self._latest_step != ref.learner_parent_version:
                     raise RuntimeError("learner advanced while load executed")
                 self._latest_step = output_version
                 self._learner_generation = generation
-                self._trainer_resident_generation = generation
+                self._trainer_resident_generation = None
+                self._published_adapters[output_version] = adapter
                 self._published_adapters = {
                     step: adapter
                     for step, adapter in self._published_adapters.items()
-                    if step < output_version
+                    if step <= output_version
                 }
-            commit_operation_id = f"{ref.operation_id}:load-commit"
-            launch = await self._snapshot_command_locked(
-                OperationRef(
-                    run_id=ref.run_id,
-                    operation_id=commit_operation_id,
-                    sequence_id=ref.sequence_id,
-                    learner_parent_version=output_version,
-                    kind="save_state",
-                ),
-                save_optimizer=True,
-                activate_serving=False,
-                sequence_continuation_of=ref.operation_id,
-            )
-            durable = await asyncio.shield(launch.completion)
-            trainer.retire_operation(commit_operation_id)
-            return result, generation, launch.metrics, durable
+            return result, generation, {"time/load_adapter_alias_s": alias_s}, adapter
 
     async def snapshot_command(
         self,

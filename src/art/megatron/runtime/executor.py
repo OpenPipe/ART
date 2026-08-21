@@ -2756,42 +2756,60 @@ class _GenerationPublisher:
             prepare_rank_distributed_vllm_lora,
         )
 
-        wait_s, in_flight, stager = self._acquire_slot(protected_run_id=run_id)
+        wait_s = 0.0
+        in_flight = 0
+        stager: PinnedCpuSnapshotStager | None = None
         started = time.perf_counter()
         entry: _CachedGeneration | None = None
         resolved: Future[_ResolvedGeneration] | None = None
+        handler: Any | None = None
+        local_tensors: dict[str, torch.Tensor] = {}
+        local_metadata = ()
+        local_packed_tensors: dict[str, torch.Tensor] = {}
+        local_packed_metadata = ()
+        exchange_device: torch.device | None = None
+        local_error: BaseException | None = None
         try:
-            handler = self.runtime.model_support_handler
-            packed_groups = handler.expert_packed_lora_groups()
-            local_tensors, local_metadata = collect_local_lora_entries(
-                self.runtime.model,
-                adapter_dtypes,
-                owner_rank=int(self.runtime.rank),
-                packed_expert_groups=packed_groups,
-                slot_ref=slot_ref,
-            )
-            local_packed_tensors, local_packed_metadata = (
-                collect_local_packed_expert_entries(
+            try:
+                wait_s, in_flight, stager = self._acquire_slot(
+                    protected_run_id=run_id
+                )
+                handler = self.runtime.model_support_handler
+                packed_groups = handler.expert_packed_lora_groups()
+                local_tensors, local_metadata = collect_local_lora_entries(
                     self.runtime.model,
                     adapter_dtypes,
                     owner_rank=int(self.runtime.rank),
                     packed_expert_groups=packed_groups,
                     slot_ref=slot_ref,
                 )
-            )
-            source_devices = {
-                tensor.device
-                for tensor in (*local_tensors.values(), *local_packed_tensors.values())
-            }
-            if len(source_devices) > 1:
-                raise RuntimeError(
-                    "one rank-distributed sampler source spans multiple devices"
+                local_packed_tensors, local_packed_metadata = (
+                    collect_local_packed_expert_entries(
+                        self.runtime.model,
+                        adapter_dtypes,
+                        owner_rank=int(self.runtime.rank),
+                        packed_expert_groups=packed_groups,
+                        slot_ref=slot_ref,
+                    )
                 )
-            exchange_device = (
-                source_devices.pop()
-                if source_devices
-                else torch.device("cuda", torch.cuda.current_device())
-            )
+                source_devices = {
+                    tensor.device
+                    for tensor in (
+                        *local_tensors.values(),
+                        *local_packed_tensors.values(),
+                    )
+                }
+                if len(source_devices) > 1:
+                    raise RuntimeError(
+                        "one rank-distributed sampler source spans multiple devices"
+                    )
+                exchange_device = (
+                    source_devices.pop()
+                    if source_devices
+                    else torch.device("cuda", torch.cuda.current_device())
+                )
+            except BaseException as error:
+                local_error = error
             pending = prepare_rank_distributed_vllm_lora(
                 target=target,
                 local_tensors=local_tensors,
@@ -2804,7 +2822,12 @@ class _GenerationPublisher:
                 metadata_group=self.runtime.publication_metadata_group,
                 exchange_device=exchange_device,
                 stager=stager,
+                local_error=local_error,
             )
+            if stager is None:
+                raise RuntimeError(
+                    "LoRA readiness collective accepted a missing snapshot stager"
+                )
             self.runtime.optimizer_snapshot_barrier.register(pending, key=run_id)
             resolved = self._resolution_pool.submit(
                 self._resolve_ordered_sampler, pending
@@ -2814,10 +2837,12 @@ class _GenerationPublisher:
                 generation=generation,
                 stager=stager,
                 resolved=resolved,
-                ephemeral=True,
             )
+            self._cache_staging(entry)
             resolved.add_done_callback(
-                lambda _done, cached_entry=entry: self._maybe_release(cached_entry)
+                lambda done, cached_entry=entry: self._snapshot_resolved(
+                    cached_entry, done
+                )
             )
             ref = pending.payload.layout.ref
             expected_files = {"adapter_config.json", "adapter_model.safetensors"}
@@ -2877,7 +2902,8 @@ class _GenerationPublisher:
             if entry is None:
                 if resolved is not None:
                     resolved.result()
-                self._release_slot(stager)
+                if stager is not None:
+                    self._release_slot(stager)
             else:
                 entry.retired = True
                 self._maybe_release(entry)
@@ -3577,13 +3603,19 @@ class _GenerationPublisher:
 
             if not isinstance(distributed, PreparedRankDistributedLora):
                 raise RuntimeError("ordered publication has an invalid distributed payload")
-            prepared.entry.resolved.result()
-            ready = time.perf_counter()
             target = prepared.adapter_object_target
             if not isinstance(target, OrderedBinaryObjectTarget):
                 raise RuntimeError(
                     "rank-distributed adapter has no ordered object target"
                 )
+            local_error: BaseException | None = None
+            store: S3BinaryObjectStore | None = None
+            try:
+                prepared.entry.resolved.result()
+                store = self._object_store_for(target)
+            except BaseException as error:
+                local_error = error
+            ready = time.perf_counter()
             group = self.runtime.publication_group
             if distributed.layout.world_size > 1 and group is None:
                 raise RuntimeError(
@@ -3591,8 +3623,9 @@ class _GenerationPublisher:
                 )
             ref = publish_rank_distributed_vllm_lora(
                 distributed,
-                self._object_store_for(target),
+                store,
                 group=group,
+                local_error=local_error,
             )
             if ref != distributed.layout.ref:
                 raise RuntimeError(

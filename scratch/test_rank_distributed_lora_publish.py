@@ -59,6 +59,7 @@ from art.megatron.weights.lora_publish import (
 )
 from art.megatron.weights.rank_distributed_lora_publish import (
     prepare_rank_distributed_vllm_lora,
+    publish_rank_distributed_vllm_lora,
 )
 from art.utils.safetensors import prepare_safetensors
 
@@ -716,6 +717,50 @@ def _contract_worker(
                 exchange_device=torch.device("cpu"),
                 stager=PinnedCpuSnapshotStager(),
             )
+        with pytest.raises(
+            RuntimeError,
+            match="LoRA preparation validation failed: rank 1: ValueError",
+        ):
+            prepare_rank_distributed_vllm_lora(
+                target=_target("qwen36_per_expert", world_size),
+                local_tensors=fixture.regular if rank == 0 else {},
+                local_metadata=fixture.regular_metadata if rank == 0 else (),
+                local_packed_tensors=fixture.packed if rank == 0 else {},
+                local_packed_metadata=(
+                    fixture.packed_metadata if rank == 0 else ()
+                ),
+                handler=fixture.handler if rank == 0 else None,
+                adapter_config=fixture.adapter_config,
+                conversion_group_for_key=_block_for_key,
+                exchange_device=torch.device("cpu") if rank == 0 else None,
+                stager=PinnedCpuSnapshotStager() if rank == 0 else None,
+                local_error=(
+                    ValueError("rank-local collection failure") if rank == 1 else None
+                ),
+            )
+        prepared = prepare_rank_distributed_vllm_lora(
+            target=_target("qwen36_per_expert", world_size),
+            local_tensors=fixture.regular,
+            local_metadata=fixture.regular_metadata,
+            local_packed_tensors=fixture.packed,
+            local_packed_metadata=fixture.packed_metadata,
+            handler=fixture.handler,
+            adapter_config=fixture.adapter_config,
+            conversion_group_for_key=_block_for_key,
+            exchange_device=torch.device("cpu"),
+            stager=PinnedCpuSnapshotStager(),
+        ).resolve()
+        with pytest.raises(
+            RuntimeError,
+            match="publication is not ready: rank 1: ValueError",
+        ):
+            publish_rank_distributed_vllm_lora(
+                prepared,
+                object(),  # type: ignore[arg-type]
+                local_error=(
+                    ValueError("rank-local store failure") if rank == 1 else None
+                ),
+            )
         if rank == 0:
             Path(report_path).write_text("ok\n")
     finally:
@@ -830,11 +875,22 @@ def test_generation_publisher_uses_independent_ordered_control_group(
         sink=Sink(),
     )
     prepared = publisher._prepared["operation"]
+    assert publisher.has_generation(generation)
+    assert (
+        publisher.ensure_generation(
+            run_id="run",
+            generation=generation,
+            adapter_dtypes={},
+            adapter_config=fixture.adapter_config,
+            snapshot_optimizer=False,
+        )
+        == {}
+    )
     calls = []
     store = object()
 
-    def publish(value, received_store, *, group):
-        calls.append((value, received_store, group))
+    def publish(value, received_store, *, group, local_error):
+        calls.append((value, received_store, group, local_error))
         return value.layout.ref
 
     monkeypatch.setattr(
@@ -848,6 +904,6 @@ def test_generation_publisher_uses_independent_ordered_control_group(
     assert runtime.optimizer_snapshot_barrier.registered[0][1] == "run"
     assert plan.transport_adapter is not None
     assert transport.adapter == plan.transport_adapter
-    assert calls == [(prepared.distributed_adapter, store, control_group)]
+    assert calls == [(prepared.distributed_adapter, store, control_group, None)]
     publisher.discard("operation")
     publisher.close()

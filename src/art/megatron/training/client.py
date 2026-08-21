@@ -846,7 +846,7 @@ class LocalMegatronTrainingClient:
                 raise ValueError(
                     f"unknown local checkpoint: {request.checkpoint!r}"
                 ) from error
-            raw, generation, _metrics, durable = await self._service.load_state_command(
+            raw, generation, _metrics, adapter = await self._service.load_state_command(
                 admission.ref,
                 source,
                 restore_optimizer=restore_optimizer,
@@ -856,15 +856,18 @@ class LocalMegatronTrainingClient:
                 generation.policy_step,
                 generation.generation_id,
             )
-            adapter = durable.transport_adapter or durable.adapter
             self._remember_checkpoint(
                 checkpoint.checkpoint_id,
                 ResolvedCheckpointState(
                     adapter=adapter.model_copy(
                         update={"identity": generation.adapter_path}
                     ),
-                    optimizer_state_path=self._service.optimizer_state_path,
-                    optimizer_generation_id=generation.generation_id,
+                    optimizer_state_path=(
+                        source.optimizer_state_path if restore_optimizer else None
+                    ),
+                    optimizer_generation_id=(
+                        source.optimizer_generation_id if restore_optimizer else None
+                    ),
                 ),
             )
             return LoadStateResult(
