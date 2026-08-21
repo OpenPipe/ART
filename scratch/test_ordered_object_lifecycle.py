@@ -15,6 +15,7 @@ import pytest
 from art.distributed.object_store import (
     VLLM_LORA_OBJECT_FORMAT,
     BinaryObjectFile,
+    OrderedBinaryObjectAborted,
     OrderedBinaryObjectPlan,
     OrderedBinaryObjectShard,
     OrderedBinaryObjectTarget,
@@ -428,6 +429,123 @@ def test_pending_ordered_receive_reuses_fsynced_shards(tmp_path: Path) -> None:
     assert (destination / "adapter_model.safetensors").read_bytes() == b"abcdefghij"
     publisher.close()
     receiver.close()
+
+
+def test_pending_receive_does_not_block_ready_later_shards(tmp_path: Path) -> None:
+    target, client = _target(), _S3()
+    publisher, receiver = _store(target, client), _store(target, client)
+    files = _source()
+    plan = ordered_binary_object_plan(
+        target,
+        tuple(
+            BinaryObjectFile(
+                relative_path=path, byte_count=sum(x.nbytes for x in chunks)
+            )
+            for path, chunks in sorted(files.items())
+        ),
+    )
+    ref = publisher.publish_ordered_plan(target, plan)
+    payload = {
+        path: b"".join(bytes(chunk) for chunk in chunks)
+        for path, chunks in files.items()
+    }
+    shards = {
+        shard.index: (
+            memoryview(payload[shard.relative_path])[
+                shard.file_offset : shard.file_offset + shard.byte_count
+            ],
+        )
+        for shard in plan.shards
+    }
+    destination = tmp_path / "out-of-order"
+
+    with ThreadPoolExecutor(max_workers=1) as tasks:
+        pending = tasks.submit(
+            receiver.materialize_ordered_pending,
+            ref,
+            destination,
+            timeout_s=2,
+            poll_interval_s=0.001,
+            max_poll_interval_s=0.005,
+        )
+        later = publisher.upload_ordered_shards(
+            target, plan, {2: shards[2], 3: shards[3]}
+        )
+        receipts = destination / ".ordered-shards"
+        deadline = time.monotonic() + 1
+        while not all((receipts / f"{index:08d}.json").is_file() for index in (2, 3)):
+            assert time.monotonic() < deadline
+            time.sleep(0.001)
+        assert not any((receipts / f"{index:08d}.json").exists() for index in (0, 1))
+        earlier = publisher.upload_ordered_shards(
+            target, plan, {0: shards[0], 1: shards[1]}
+        )
+        publisher.commit_ordered(target, plan, (*earlier, *later))
+        assert pending.result(timeout=1) == destination
+
+    publisher.close()
+    receiver.close()
+
+
+def test_ordered_abort_interrupts_streaming_receive_and_reclaims_shards(
+    tmp_path: Path,
+) -> None:
+    target, client = _target(), _S3()
+    publisher, receiver = _store(target, client), _store(target, client)
+    files = _source()
+    plan = ordered_binary_object_plan(
+        target,
+        tuple(
+            BinaryObjectFile(
+                relative_path=path, byte_count=sum(x.nbytes for x in chunks)
+            )
+            for path, chunks in sorted(files.items())
+        ),
+    )
+    ref = publisher.publish_ordered_plan(target, plan)
+    destination = tmp_path / "aborted"
+
+    with ThreadPoolExecutor(max_workers=1) as tasks:
+        pending = tasks.submit(
+            receiver.materialize_ordered_pending,
+            ref,
+            destination,
+            timeout_s=30,
+            poll_interval_s=0.001,
+            max_poll_interval_s=0.005,
+        )
+        shard_prefix = f"{target.store.prefix}/{target.object_id}/shards/"
+        deadline = time.monotonic() + 1
+        while not any(key.startswith(shard_prefix) for key in client.gets):
+            assert time.monotonic() < deadline
+            time.sleep(0.001)
+        started = time.monotonic()
+        assert publisher.abort_ordered(ref)
+        with pytest.raises(OrderedBinaryObjectAborted):
+            pending.result(timeout=1)
+        assert time.monotonic() - started < 0.25
+
+    prefix = f"{target.store.prefix}/{target.object_id}"
+    assert json.loads(client.objects[f"{prefix}/_COMMITTED.json"])[
+        "disposition"
+    ] == "aborted"
+    assert not any("/shards/" in key for key in client.objects)
+    publisher.close()
+    receiver.close()
+
+
+def test_ordered_commit_and_abort_share_one_atomic_terminal() -> None:
+    target, client = _target(), _S3()
+    store = _store(target, client)
+    ref = store.publish_ordered(target, _source())
+
+    assert not store.abort_ordered(ref)
+    assert store.resolve(ref.manifest_uri) == ref
+    assert json.loads(
+        client.objects[f"{target.store.prefix}/{target.object_id}/_COMMITTED.json"]
+    )["disposition"] == "committed"
+    assert any("/shards/" in key for key in client.objects)
+    store.close()
 
 
 def test_ordered_fenced_cleanup_reclaims_partial_plan_and_shards() -> None:

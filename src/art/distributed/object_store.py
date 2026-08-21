@@ -4,6 +4,7 @@ from bisect import bisect_right
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from contextlib import suppress
 import hashlib
+from heapq import heappop, heappush
 from io import BytesIO, RawIOBase
 import json
 import os
@@ -211,6 +212,7 @@ class StoredOrderedBinaryObjectShard(_ObjectModel):
 
 class OrderedBinaryObjectCommit(_ObjectModel):
     transport: Literal["ordered_s3_shards"] = "ordered_s3_shards"
+    disposition: Literal["committed"] = "committed"
     ref: OrderedBinaryObjectRef
     shards: tuple[StoredOrderedBinaryObjectShard, ...] = Field(min_length=1)
 
@@ -225,11 +227,21 @@ class OrderedBinaryObjectCommit(_ObjectModel):
         return self
 
 
-BinaryObjectPublicationCommit = Annotated[
-    BinaryObjectRef | OrderedBinaryObjectCommit,
-    Field(discriminator="transport"),
-]
-_BINARY_OBJECT_COMMIT_ADAPTER = TypeAdapter(BinaryObjectPublicationCommit)
+class OrderedBinaryObjectAbort(_ObjectModel):
+    transport: Literal["ordered_s3_shards"] = "ordered_s3_shards"
+    disposition: Literal["aborted"] = "aborted"
+    ref: OrderedBinaryObjectRef
+    reason: Literal["publisher_failed"] = "publisher_failed"
+
+
+class OrderedBinaryObjectAborted(RuntimeError):
+    pass
+
+
+BinaryObjectPublicationTerminal = (
+    BinaryObjectRef | OrderedBinaryObjectCommit | OrderedBinaryObjectAbort
+)
+_BINARY_OBJECT_TERMINAL_ADAPTER = TypeAdapter(BinaryObjectPublicationTerminal)
 
 
 class BinaryObjectMaterialization(_ObjectModel):
@@ -443,11 +455,36 @@ class S3BinaryObjectStore:
             ref=ref,
             shards=ordered,
         )
-        self._put_immutable(
-            f"{self._prefix(target)}/_COMMITTED.json",
-            _model_bytes(commit),
+        terminal = self._put_ordered_terminal(
+            commit, manifest_uri=self._manifest_uri(target)
         )
+        if isinstance(terminal, OrderedBinaryObjectAbort):
+            raise OrderedBinaryObjectAborted(
+                f"ordered object publication was aborted: {ref.object_id}"
+            )
+        if terminal != commit:
+            raise RuntimeError("another publisher committed different object content")
         return ref
+
+    def abort_ordered(self, ref: OrderedBinaryObjectRef) -> bool:
+        """Atomically abort an uncommitted publication and reclaim payload shards."""
+        bucket, plan_key, _, _ = self._read_ordered_plan(ref)
+        terminal = self._put_ordered_terminal(
+            OrderedBinaryObjectAbort(ref=ref), manifest_uri=ref.manifest_uri
+        )
+        if isinstance(terminal, OrderedBinaryObjectCommit):
+            return False
+        if terminal != OrderedBinaryObjectAbort(ref=ref):
+            raise RuntimeError("ordered object abort changed identity")
+        prefix = str(PurePosixPath(plan_key).parent)
+        self._delete_keys(
+            bucket,
+            tuple(
+                _ordered_binary_object_shard_key(prefix, index)
+                for index in range(ref.shard_count)
+            ),
+        )
+        return True
 
     def resolve_ordered(
         self, manifest_uri: str, *, missing_ok: bool = False
@@ -469,7 +506,17 @@ class S3BinaryObjectStore:
 
     def _resolve_commit(
         self, manifest_uri: str, *, missing_ok: bool = False
-    ) -> BinaryObjectPublicationCommit | None:
+    ) -> BinaryObjectRef | OrderedBinaryObjectCommit | None:
+        terminal = self._resolve_terminal(manifest_uri, missing_ok=missing_ok)
+        if isinstance(terminal, OrderedBinaryObjectAbort):
+            raise OrderedBinaryObjectAborted(
+                f"ordered object publication was aborted: {terminal.ref.object_id}"
+            )
+        return terminal
+
+    def _resolve_terminal(
+        self, manifest_uri: str, *, missing_ok: bool = False
+    ) -> BinaryObjectPublicationTerminal | None:
         from botocore.exceptions import ClientError
 
         bucket, key = self._require_manifest_uri(manifest_uri)
@@ -479,14 +526,14 @@ class S3BinaryObjectStore:
             if missing_ok and _is_missing_object(error):
                 return None
             raise
-        commit = _BINARY_OBJECT_COMMIT_ADAPTER.validate_json(body)
-        ref = commit.ref if isinstance(commit, OrderedBinaryObjectCommit) else commit
+        terminal = _BINARY_OBJECT_TERMINAL_ADAPTER.validate_json(body)
+        ref = terminal.ref if not isinstance(terminal, BinaryObjectRef) else terminal
         if (
             ref.manifest_uri != manifest_uri
             or ref.object_id != PurePosixPath(key).parent.name
         ):
-            raise RuntimeError("binary object commit identifies another manifest")
-        return commit
+            raise RuntimeError("binary object terminal identifies another manifest")
+        return terminal
 
     def verify(
         self,
@@ -656,6 +703,7 @@ class S3BinaryObjectStore:
         stored = self._download_pending_ordered_shards(
             bucket,
             str(PurePosixPath(plan_key).parent),
+            ref,
             ref.plan_sha256,
             plan,
             root,
@@ -785,6 +833,7 @@ class S3BinaryObjectStore:
         self,
         bucket: str,
         prefix: str,
+        ref: OrderedBinaryObjectRef,
         plan_sha256: str,
         plan: OrderedBinaryObjectPlan,
         root: Path,
@@ -793,41 +842,91 @@ class S3BinaryObjectStore:
         poll_interval_s: float,
         max_poll_interval_s: float,
     ) -> tuple[StoredOrderedBinaryObjectShard, ...]:
-        pending: dict[Future[StoredOrderedBinaryObjectShard], int] = {}
-        shards = iter(plan.shards)
+        pending: dict[Future[StoredOrderedBinaryObjectShard | None], int] = {}
         source_files = {file.relative_path: file for file in plan.files}
         results: list[StoredOrderedBinaryObjectShard | None] = [None] * len(plan.shards)
+        delays = [poll_interval_s] * len(plan.shards)
+        scheduled: list[tuple[float, int]] = []
+        for shard in plan.shards:
+            receipt = receipts / f"{shard.index:08d}.json"
+            if receipt.exists():
+                stored = StoredOrderedBinaryObjectShard.model_validate_json(
+                    receipt.read_bytes()
+                )
+                if (stored.index, stored.byte_count) != (
+                    shard.index,
+                    shard.byte_count,
+                ):
+                    raise RuntimeError("partial ordered shard receipt changed identity")
+                results[shard.index] = stored
+            else:
+                heappush(scheduled, (0.0, shard.index))
 
-        def submit() -> bool:
-            try:
-                shard = next(shards)
-            except StopIteration:
-                return False
+        def submit(index: int) -> None:
+            shard = plan.shards[index]
             future = self._parts.submit(
-                self._wait_download_ordered_shard,
+                self._download_available_ordered_shard,
                 bucket,
                 prefix,
                 plan_sha256,
                 shard,
                 source_files[shard.relative_path],
                 root / shard.relative_path,
-                receipts / f"{shard.index:08d}.json",
-                deadline,
-                poll_interval_s,
-                max_poll_interval_s,
             )
             pending[future] = shard.index
-            return True
-
-        for _ in range(min(self.config.multipart_concurrency, len(plan.shards))):
-            submit()
         try:
-            while pending:
-                done, _ = wait(pending, return_when=FIRST_COMPLETED)
+            while scheduled or pending:
+                now = time.monotonic()
+                while (
+                    scheduled
+                    and len(pending) < self.config.multipart_concurrency
+                    and scheduled[0][0] <= now
+                ):
+                    _, index = heappop(scheduled)
+                    submit(index)
+                remaining = deadline - now
+                if remaining <= 0:
+                    raise TimeoutError("ordered object shards were not published")
+                timeout = min(max_poll_interval_s, remaining)
+                if scheduled and len(pending) < self.config.multipart_concurrency:
+                    timeout = min(timeout, max(0.0, scheduled[0][0] - now))
+                done: set[Future[StoredOrderedBinaryObjectShard | None]] = set()
+                if pending:
+                    done, _ = wait(
+                        pending,
+                        timeout=timeout,
+                        return_when=FIRST_COMPLETED,
+                    )
+                elif timeout:
+                    time.sleep(timeout)
+                if not done:
+                    terminal = self._resolve_terminal(
+                        ref.manifest_uri, missing_ok=True
+                    )
+                    if isinstance(terminal, OrderedBinaryObjectAbort):
+                        raise OrderedBinaryObjectAborted(
+                            f"ordered object publication was aborted: {ref.object_id}"
+                        )
                 for future in done:
                     index = pending.pop(future)
-                    results[index] = future.result()
-                    submit()
+                    stored = future.result()
+                    if stored is None:
+                        heappush(
+                            scheduled,
+                            (time.monotonic() + delays[index], index),
+                        )
+                        delays[index] = min(
+                            max_poll_interval_s, delays[index] * 2
+                        )
+                        continue
+                    receipt = receipts / f"{index:08d}.json"
+                    temporary = receipt.with_name(f".{receipt.name}.{uuid4().hex}.tmp")
+                    with temporary.open("xb") as output:
+                        output.write(_model_bytes(stored))
+                        output.flush()
+                        os.fsync(output.fileno())
+                    os.replace(temporary, receipt)
+                    results[index] = stored
         except BaseException:
             futures = tuple(pending)
             for future in futures:
@@ -840,50 +939,6 @@ class S3BinaryObjectStore:
         if any(result is None for result in results):
             raise RuntimeError("ordered receiver did not download every shard")
         return tuple(result for result in results if result is not None)
-
-    def _wait_download_ordered_shard(
-        self,
-        bucket: str,
-        prefix: str,
-        plan_sha256: str,
-        shard: OrderedBinaryObjectShard,
-        source: BinaryObjectFile,
-        target: Path,
-        receipt: Path,
-        deadline: float,
-        poll_interval_s: float,
-        max_poll_interval_s: float,
-    ) -> StoredOrderedBinaryObjectShard:
-        if receipt.exists():
-            stored = StoredOrderedBinaryObjectShard.model_validate_json(
-                receipt.read_bytes()
-            )
-            if (stored.index, stored.byte_count) != (shard.index, shard.byte_count):
-                raise RuntimeError("partial ordered shard receipt changed identity")
-            return stored
-        delay_s = poll_interval_s
-        while True:
-            stored = self._download_available_ordered_shard(
-                bucket,
-                prefix,
-                plan_sha256,
-                shard,
-                source,
-                target,
-            )
-            if stored is not None:
-                temporary = receipt.with_name(f".{receipt.name}.{uuid4().hex}.tmp")
-                with temporary.open("xb") as output:
-                    output.write(_model_bytes(stored))
-                    output.flush()
-                    os.fsync(output.fileno())
-                os.replace(temporary, receipt)
-                return stored
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise TimeoutError(f"ordered shard {shard.index} was not published")
-            time.sleep(min(delay_s, remaining))
-            delay_s = min(max_poll_interval_s, delay_s * 2)
 
     def _download_available_ordered_shard(
         self,
@@ -1366,6 +1421,33 @@ class S3BinaryObjectStore:
             byte_count=shard.byte_count,
             etag=etag,
         )
+
+    def _put_ordered_terminal(
+        self,
+        terminal: OrderedBinaryObjectCommit | OrderedBinaryObjectAbort,
+        *,
+        manifest_uri: str,
+    ) -> OrderedBinaryObjectCommit | OrderedBinaryObjectAbort:
+        bucket, key = self._require_manifest_uri(manifest_uri)
+        body = _model_bytes(terminal)
+        try:
+            self._client.put_object(
+                Bucket=bucket,
+                Key=key,
+                Body=body,
+                ContentType="application/json",
+                IfNoneMatch="*",
+            )
+        except Exception as error:
+            if not _is_precondition_failed(error):
+                raise
+            existing = self._resolve_terminal(manifest_uri)
+            if not isinstance(
+                existing, (OrderedBinaryObjectCommit, OrderedBinaryObjectAbort)
+            ):
+                raise RuntimeError("ordered terminal changed transport") from error
+            return existing
+        return terminal
 
     def _put_immutable(self, key: str, body: bytes) -> None:
         try:
