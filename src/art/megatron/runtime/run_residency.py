@@ -279,11 +279,18 @@ class RunResidencyManager:
                 "only committed trainer component generations may advance in place"
             )
         if retire_source:
-            if not (
-                self.ledger.has_copy(source, "l2_cpu")
-                or self.ledger.has_copy(source, "l3_nvme")
-            ):
-                self.ensure_l2(source).result()
+            with self._lock:
+                source_state = self._state(source)
+                lower_pending = source_state.l2_future
+                has_lower = self.ledger.has_copy(
+                    source, "l2_cpu"
+                ) or self.ledger.has_copy(source, "l3_nvme")
+            if lower_pending is not None and lower_pending.done():
+                lower_pending.result()
+            if not has_lower and lower_pending is None:
+                raise RuntimeError(
+                    "committed L1 source has no immutable lower-tier image"
+                )
         byte_count = self._mover.byte_count(tensors, "cuda")
         old_bytes = self.ledger.copy(source, "l1_gpu").byte_count
         with self._admission_locks["l1_gpu"]:
@@ -825,15 +832,36 @@ class RunResidencyManager:
                 return
             if state.l1_transition is not None:
                 self._finish_l1_transfer_locked(state.l1_transition)
-            entry = self.ledger.entry(key)
-            if any(entry.pin_counts.values()) or self.ledger.has_reservation(key):
-                return
             try:
-                self._retire_now_locked(key)
-            except BaseException as caught:
-                error = caught
-                self._failures.append(caught)
-            self._retirements.pop(key, None)
+                entry = self.ledger.entry(key)
+            except KeyError:
+                failed_dependency = next(
+                    (
+                        dependency
+                        for dependency in dependencies
+                        if dependency is not None
+                        and dependency.done()
+                        and not dependency.cancelled()
+                        and dependency.exception() is not None
+                    ),
+                    None,
+                )
+                if failed_dependency is None:
+                    raise
+                error = failed_dependency.exception()
+                assert error is not None
+                self._states.pop(key)
+                self._mutation_barriers.pop(key, None)
+                self._retirements.pop(key, None)
+            else:
+                if any(entry.pin_counts.values()) or self.ledger.has_reservation(key):
+                    return
+                try:
+                    self._retire_now_locked(key)
+                except BaseException as caught:
+                    error = caught
+                    self._failures.append(caught)
+                self._retirements.pop(key, None)
         if error is None:
             retirement.set_result(None)
         else:
