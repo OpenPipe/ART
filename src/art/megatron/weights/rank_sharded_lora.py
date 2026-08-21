@@ -343,6 +343,19 @@ def write_rank_sharded_lora_checkpoint(
     *,
     group: Any | None = None,
 ) -> RankShardedLoraCheckpoint:
+    plans = _all_gather(
+        prepared,
+        {
+            "rank": prepared.rank,
+            "plan_sha256": prepared.plan_sha256,
+            "error": None,
+        },
+        group,
+    )
+    if tuple(item["rank"] for item in plans) != tuple(range(prepared.world_size)) or any(
+        item["plan_sha256"] != prepared.plan_sha256 for item in plans
+    ):
+        raise RuntimeError("rank-sharded LoRA ranks entered with different plans")
     local_write: RankShardedLoraRankWrite | None = None
     local_error: BaseException | None = None
     try:
