@@ -762,6 +762,7 @@ class MegatronTrainJobExecutor:
     def execute_optimizer(self, job: OptimizerJobSpec) -> dict[str, Any]:
         if self._closed:
             raise RuntimeError("Megatron executor is closed")
+        self._publisher.raise_if_failed()
         if self._gradient_parent_version != job.expected_learner_version:
             raise RuntimeError("optimizer parent does not match accumulated gradients")
         runtime = self.runtime
@@ -803,18 +804,6 @@ class MegatronTrainJobExecutor:
         runtime.resident_generation_id = job.generation.generation_id
         runtime.optimizer_state_loaded = True
         self._gradient_parent_version = None
-        if (
-            runtime.adapter_export_dtypes is None
-            or runtime.adapter_export_config is None
-        ):
-            raise RuntimeError("optimizer output has no adapter export layout")
-        snapshot_metrics = self._publisher.stage(
-            run_id=job.run_id,
-            generation=job.generation,
-            adapter_dtypes=runtime.adapter_export_dtypes,
-            adapter_config=runtime.adapter_export_config,
-            snapshot_optimizer=False,
-        )
         return {
             "operation_id": job.operation_id,
             "learner_version": job.learner_version,
@@ -825,7 +814,6 @@ class MegatronTrainJobExecutor:
                 "optimizer/update_successful": float(result.update_successful),
                 "optimizer/num_zeros_in_grad": float(result.num_zeros_in_grad or 0),
                 "time/optimizer_step_s": optimizer_step_s,
-                **snapshot_metrics,
             },
         }
 
@@ -1533,6 +1521,7 @@ class MCoreRunSlotExecutor:
         self._validate_parent(
             state, job.training_session_id, job.expected_learner_version
         )
+        self._publisher.raise_if_failed()
         gradients = self._require_gradients(state)
         gradients.seal(job.contributing_forward_backward_operation_ids)
         from art.trainer_rank import AdamParams
@@ -1571,11 +1560,6 @@ class MCoreRunSlotExecutor:
         residency_tensors = self._slot_trainer.checkpoint_slot_residency_tensors(
             job.run_id
         )
-        optimizer_source = (
-            self._slot_trainer.checkpoint_slot_optimizer_residency_source(job.run_id)
-        )
-        if optimizer_source is None:
-            raise RuntimeError("optimizer commit has no immutable optimizer state")
         self._residency.advance_l1(
             parent_weights,
             output_weights,
@@ -1605,24 +1589,6 @@ class MCoreRunSlotExecutor:
             state.learner_version = job.learner_version
         if accumulator is not None:
             self._residency.retire_async(accumulator)
-        from art.megatron.lora import LoRASlotRef
-
-        snapshot_metrics = self._publisher.stage(
-            run_id=job.run_id,
-            generation=job.generation,
-            adapter_dtypes={},
-            adapter_config=state.adapter_config,
-            slot_ref=LoRASlotRef("checkpoint", job.run_id),
-            snapshot_optimizer=False,
-            residency_key=output_weights,
-        )
-        snapshot_metrics.update(
-            self._publisher.attach_resident_optimizer(
-                generation=job.generation,
-                source=optimizer_source,
-                residency_key=output_optimizer,
-            )
-        )
         return {
             "operation_id": job.operation_id,
             "learner_version": job.learner_version,
@@ -1633,7 +1599,6 @@ class MCoreRunSlotExecutor:
                 "optimizer/update_successful": result["update_successful"],
                 "optimizer/num_zeros_in_grad": result["num_zeros_in_grad"],
                 "time/optimizer_step_s": optimizer_step_s,
-                **snapshot_metrics,
             },
         }
 
@@ -1830,13 +1795,41 @@ class MCoreRunSlotExecutor:
         self._validate_parent(state, job.training_session_id, job.learner_version)
         if state.desired.weights.generation_id != job.generation.generation_id:
             raise RuntimeError("snapshot does not identify the selected generation")
-        if not self._publisher.has_generation(
-            job.generation, require_optimizer=job.save_optimizer
+        stage_metrics: dict[str, float] = {}
+        if not self._publisher.has_generation(job.generation):
+            from art.megatron.lora import LoRASlotRef
+
+            with self._resident(state):
+                stage_metrics.update(
+                    self._publisher.ensure_generation(
+                        run_id=job.run_id,
+                        generation=job.generation,
+                        adapter_dtypes={},
+                        adapter_config=state.adapter_config,
+                        slot_ref=LoRASlotRef("checkpoint", job.run_id),
+                        snapshot_optimizer=False,
+                        residency_key=state.desired.weights,
+                    )
+                )
+        if job.save_optimizer and not self._publisher.has_generation(
+            job.generation, require_optimizer=True
         ):
-            raise RuntimeError(
-                "selected generation has no immutable publication snapshot"
+            optimizer_key = state.desired.optimizer
+            optimizer_source = (
+                self._slot_trainer.checkpoint_slot_optimizer_residency_source(
+                    job.run_id
+                )
             )
-        rank_plan, metrics = self._publisher.prepare(
+            if optimizer_key is None or optimizer_source is None:
+                raise RuntimeError("snapshot has no immutable optimizer state")
+            stage_metrics.update(
+                self._publisher.attach_resident_optimizer(
+                    generation=job.generation,
+                    source=optimizer_source,
+                    residency_key=optimizer_key,
+                )
+            )
+        rank_plan, prepare_metrics = self._publisher.prepare(
             operation_id=job.operation_id,
             generation=job.generation,
             optimizer_state_path=job.optimizer_state_path,
@@ -1851,7 +1844,7 @@ class MCoreRunSlotExecutor:
             "operation_id": job.operation_id,
             "learner_version": job.learner_version,
             "rank_write_plan": rank_plan.model_dump(mode="json"),
-            "metrics": metrics,
+            "metrics": {**stage_metrics, **prepare_metrics},
         }
 
     def authorize_snapshot(
@@ -2469,6 +2462,7 @@ class _GenerationPublisher:
         slot_ref: "LoRASlotRef | None" = None,
         trainer_rank_optimizer_state: "TrainerRankOptimizerState | None" = None,
         snapshot_optimizer: bool,
+        residency_key: ResidencyKey | None = None,
     ) -> dict[str, float]:
         with self._lock:
             entry = self._cache.get(generation.generation_id)
@@ -2487,6 +2481,7 @@ class _GenerationPublisher:
                 slot_ref=slot_ref,
                 trainer_rank_optimizer_state=trainer_rank_optimizer_state,
                 snapshot_optimizer=snapshot_optimizer,
+                residency_key=residency_key,
             )
         assert entry is not None
         if not snapshot_optimizer or entry.has_optimizer:
