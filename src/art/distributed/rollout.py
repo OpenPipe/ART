@@ -397,6 +397,7 @@ class DistributedTrajectoryQueue:
         self._space_waiters: set[asyncio.Future[None]] = set()
         self._item_waiters: set[asyncio.Future[None]] = set()
         self._take_lock = asyncio.Lock()
+        self._lifecycle_lock = asyncio.Lock()
         self._owner_cleanup_refs: dict[str, deque[TrajectoryGroupRef]] = {}
         self._owner_cleanup_tasks: dict[str, asyncio.Task[None]] = {}
         self._owner_cleanup_failure: BaseException | None = None
@@ -645,15 +646,16 @@ class DistributedTrajectoryQueue:
             await self._flush_resizes()
         except BaseException as error:
             failures.append(error)
-        if not self._closed:
-            self._closed = True
-            self._notify_space()
-            self._notify_items()
-            if self._started:
-                try:
-                    self._cleanup_refs += await self.endpoint.close(self.queue_id)
-                except BaseException as error:
-                    failures.append(error)
+        async with self._lifecycle_lock:
+            if not self._closed:
+                self._closed = True
+                self._notify_space()
+                self._notify_items()
+                if self._started:
+                    try:
+                        self._cleanup_refs += await self.endpoint.close(self.queue_id)
+                    except BaseException as error:
+                        failures.append(error)
         if self._owner_cleanup_tasks:
             await asyncio.gather(*tuple(self._owner_cleanup_tasks.values()))
         refs = self._cleanup_refs
@@ -840,14 +842,17 @@ class DistributedTrajectoryQueue:
         if not leases:
             return []
         try:
-            await self.endpoint.release(
-                TrajectoryQueueRelease(
-                    queue_id=self.queue_id,
-                    leases=leases,
-                    generation_id=generation_id,
-                    disposition=disposition,
+            async with self._lifecycle_lock:
+                if self._closed:
+                    return []
+                await self.endpoint.release(
+                    TrajectoryQueueRelease(
+                        queue_id=self.queue_id,
+                        leases=leases,
+                        generation_id=generation_id,
+                        disposition=disposition,
+                    )
                 )
-            )
         except BaseException as error:
             return [error]
         self._notify_space()

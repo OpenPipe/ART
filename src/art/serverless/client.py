@@ -1159,6 +1159,9 @@ class RemoteTrainingOperation(Generic[ResultT]):
                 self._settle_cancelled(view)
                 return
             if view.status not in {"running", "succeeded"}:
+                run = await self._service.get_run(self._ref.run_id)
+                if run.status == "failed":
+                    return
                 raise
             await self.result()
             return
