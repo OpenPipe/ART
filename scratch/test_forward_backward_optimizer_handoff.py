@@ -22,7 +22,11 @@ from art.megatron.runtime.executor import (
 )
 import art.megatron.runtime.monarch as monarch_module
 from art.megatron.runtime.monarch import MonarchTrainerSlot
-from art.megatron.runtime.specs import RunSlotRegistration
+from art.megatron.runtime.specs import (
+    RankLocalOptimizerWorkSummary,
+    RunOptimizerWorkSummary,
+    RunSlotRegistration,
+)
 from art.megatron.training.command_telemetry import (
     PendingRankCommandTelemetry,
     RankTelemetryTopology,
@@ -174,9 +178,7 @@ class _Batch:
 
 class _SftBatch:
     def __init__(self) -> None:
-        self.manifest = SimpleNamespace(
-            fingerprint="sft-batch", num_trainable_tokens=7
-        )
+        self.manifest = SimpleNamespace(fingerprint="sft-batch", num_trainable_tokens=7)
 
     def model_dump_json(self) -> str:
         return "sft-batch"
@@ -326,7 +328,9 @@ class _Actors:
             for rank in range(self.ranks)
         }
 
-    def _registration_results(self, *, ready: bool | None = None) -> dict[int, dict[str, Any]]:
+    def _registration_results(
+        self, *, ready: bool | None = None
+    ) -> dict[int, dict[str, Any]]:
         return {
             rank: {
                 "rank": rank,
@@ -336,6 +340,18 @@ class _Actors:
             for rank in range(self.ranks)
         }
 
+    @staticmethod
+    def _optimizer_work(rank: int) -> RankLocalOptimizerWorkSummary:
+        return RankLocalOptimizerWorkSummary(
+            rank=rank,
+            adapter_rank=2,
+            target_modules=("q_proj",),
+            trainable_lora_numel=32 * (rank + 1),
+            optimizer_passes=3,
+            parameter_count=2,
+            layout_fingerprint=f"{rank + 1:064x}",
+        )
+
     async def _start_registration(
         self, _payload: str, ready_port: _Port
     ) -> dict[int, dict[str, Any]]:
@@ -344,7 +360,15 @@ class _Actors:
         async def ready() -> None:
             await self.registration_ready.wait()
             for rank in range(self.ranks):
-                ready_port.send({"rank": rank, "run_id": "run"})
+                ready_port.send(
+                    {
+                        "rank": rank,
+                        "run_id": "run",
+                        "optimizer_work": self._optimizer_work(rank).model_dump(
+                            mode="json"
+                        ),
+                    }
+                )
 
         task = asyncio.create_task(ready())
         self.registration_notifications.add(task)
@@ -422,9 +446,7 @@ async def test_sft_optimizer_launches_after_ready_before_late_result() -> None:
     launch = await slot.start_sft_forward_backward(_Job("sft-fb"), _SftBatch())
 
     assert actors.events == ["ready:sft-fb"]
-    optimizer = await slot.optim_step(
-        _Job("optimizer", contributions=("fb-0", "fb-1"))
-    )
+    optimizer = await slot.optim_step(_Job("optimizer", contributions=("fb-0", "fb-1")))
     assert optimizer["operation_id"] == "optimizer"
     assert actors.events == ["ready:sft-fb", "optimizer:optimizer"]
     assert not launch.completion.done()
@@ -441,9 +463,7 @@ async def test_forward_releases_gpu_turn_before_late_result() -> None:
 
     launch = await slot.start_forward(_Job("forward"), _Batch())
     assert not launch.completion.done()
-    optimizer = await slot.optim_step(
-        _Job("optimizer", contributions=("fb-0", "fb-1"))
-    )
+    optimizer = await slot.optim_step(_Job("optimizer", contributions=("fb-0", "fb-1")))
 
     assert optimizer["operation_id"] == "optimizer"
     assert actors.events == ["ready:forward", "optimizer:optimizer"]
@@ -456,7 +476,10 @@ async def test_forward_releases_gpu_turn_before_late_result() -> None:
 async def test_run_cleanup_does_not_hold_gpu_turn_or_tombstone_identity() -> None:
     actors = _Actors()
     slot = _slot(actors)
-    slot._registrations["run"] = "old"
+    old_work = RunOptimizerWorkSummary(
+        run_id="run", ranks=tuple(actors._optimizer_work(rank) for rank in range(2))
+    )
+    slot._registrations["run"] = ("old", old_work)
 
     cleanup = asyncio.create_task(slot.unregister_run("run"))
     await actors.cleanup_started.wait()
@@ -479,8 +502,9 @@ async def test_run_cleanup_does_not_hold_gpu_turn_or_tombstone_identity() -> Non
         adapter=_adapter("new-session"),
         optimizer_state_path="/optimizer",
     )
-    await slot.register_run(registration)
-    assert slot._registrations["run"] == registration.model_dump_json()
+    work = await slot.register_run(registration)
+    assert slot._registrations["run"] == (registration.model_dump_json(), work)
+    assert work.critical_rank.rank == 1
 
 
 @pytest.mark.asyncio
@@ -507,8 +531,9 @@ async def test_registration_preparation_does_not_hold_gpu_command_lock() -> None
     assert (await launch.completion)["operation_id"] == "fb-0"
 
     actors.registration_ready.set()
-    await pending_registration
-    assert slot._registrations["run"] == registration.model_dump_json()
+    work = await pending_registration
+    assert slot._registrations["run"] == (registration.model_dump_json(), work)
+    assert work.critical_rank.trainable_lora_numel == 64
 
 
 @pytest.mark.asyncio

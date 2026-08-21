@@ -1,5 +1,6 @@
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager
+from threading import Lock
 from types import SimpleNamespace
 from typing import Any, cast
 
@@ -16,17 +17,42 @@ from art.megatron.runtime.executor import (
     _PreparedRunLoad,
 )
 from art.megatron.runtime.residency import ResidencyCapacityUnavailable
-from art.megatron.runtime.specs import RunSlotRegistration
+from art.megatron.runtime.specs import (
+    RankLocalOptimizerWorkSummary,
+    RunSlotRegistration,
+)
 from art.megatron.training import gradient_accumulator as accumulator_module
 from art.trainer_rank import TrainerRank
 
 
 class _PreparedOptimizer:
     def __init__(self, tensors: tuple[torch.Tensor, ...], layout: Any) -> None:
-        self.tensors = tensors
+        self.master_params = tuple(
+            torch.nn.Parameter(tensor, requires_grad=True) for tensor in tensors
+        )
+        self.state = tuple(
+            {
+                "step": torch.zeros((), dtype=torch.float32),
+                "exp_avg": torch.zeros_like(master),
+                "exp_avg_sq": torch.zeros_like(master),
+            }
+            for master in self.master_params
+        )
         self.layout = layout
         self.source = SimpleNamespace(
             bind=lambda resident_tensors: {"bound": tuple(resident_tensors)}
+        )
+
+    @property
+    def tensors(self) -> tuple[torch.Tensor, ...]:
+        return (
+            *self.master_params,
+            *(
+                tensor
+                for state in self.state
+                for tensor in state.values()
+                if isinstance(tensor, torch.Tensor)
+            ),
         )
 
     def snapshot_source(self) -> object:
@@ -263,7 +289,7 @@ def _executor(
     slot = _SlotTrainer(shapes, targets)
     residency = _Residency()
     publisher = _Publisher()
-    executor.runtime = SimpleNamespace(optimizer_layout_fingerprint="topology")
+    executor.runtime = SimpleNamespace(rank=0, optimizer_layout_fingerprint="topology")
     executor._slot_trainer = slot
     executor._residency = residency
     executor._publisher = publisher
@@ -272,6 +298,9 @@ def _executor(
     executor._cleanup_pool = ThreadPoolExecutor(max_workers=1)
     executor._run_cleanups = {}
     executor._runs = {}
+    executor._lifecycle_lock = Lock()
+    executor._transition_futures = set()
+    executor._closing = False
     executor._closed = False
     monkeypatch.setattr(
         MCoreRunSlotExecutor,
@@ -281,9 +310,11 @@ def _executor(
     return executor, slot, residency, publisher
 
 
-def _register(executor: MCoreRunSlotExecutor, **kwargs: Any) -> None:
+def _register(
+    executor: MCoreRunSlotExecutor, **kwargs: Any
+) -> RankLocalOptimizerWorkSummary:
     generation_id = "step-00000000-0123456789abcdef0123456789abcdef"
-    executor.register_run(
+    return executor.register_run(
         RunSlotRegistration(
             tenant_id="tenant",
             run_id="run",
@@ -304,6 +335,48 @@ def _register(executor: MCoreRunSlotExecutor, **kwargs: Any) -> None:
             **kwargs,
         )
     )
+
+
+def test_registration_returns_exact_rank_local_optimizer_work(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    executor, _slot, _residency, _publisher = _executor(
+        monkeypatch,
+        rank=4,
+        targets=("q_proj", "o_proj"),
+        shapes=((4, 8), (8, 2)),
+    )
+
+    work = _register(executor)
+
+    assert work.rank == 0
+    assert work.adapter_rank == 4
+    assert work.target_modules == ("q_proj", "o_proj")
+    assert work.trainable_lora_numel == 48
+    assert work.parameter_count == 2
+    assert work.optimizer_passes == 3
+    assert work.cost == 144
+
+
+def test_registration_rejects_inexact_optimizer_plane_shape(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    executor, slot, _residency, _publisher = _executor(monkeypatch)
+    prepare = slot.prepare_fresh_checkpoint_slot_optimizer_for_residency
+
+    def invalid(checkpoint: Any) -> _PreparedOptimizer:
+        optimizer = prepare(checkpoint)
+        optimizer.state[0]["exp_avg"] = torch.zeros(7)
+        return optimizer
+
+    monkeypatch.setattr(
+        slot, "prepare_fresh_checkpoint_slot_optimizer_for_residency", invalid
+    )
+
+    with pytest.raises(RuntimeError, match="neither parameter nor scalar shape"):
+        _register(executor)
+
+    assert executor._runs == {}
 
 
 def test_exact_optimizer_preparation_uses_no_installed_slot(

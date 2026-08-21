@@ -130,6 +130,67 @@ class RunSlotRegistration(_Spec):
         return self
 
 
+class RankLocalOptimizerWorkSummary(_Spec):
+    """Exact physical LoRA and optimizer work prepared by one trainer rank."""
+
+    rank: int = Field(ge=0)
+    adapter_rank: int = Field(ge=1)
+    target_modules: tuple[str, ...] = Field(min_length=1)
+    trainable_lora_numel: int = Field(ge=1)
+    optimizer_passes: int = Field(ge=1)
+    parameter_count: int = Field(ge=1)
+    layout_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+    @model_validator(mode="after")
+    def _validate_targets(self) -> "RankLocalOptimizerWorkSummary":
+        if any(not target for target in self.target_modules) or len(
+            set(self.target_modules)
+        ) != len(self.target_modules):
+            raise ValueError("rank-local optimizer targets must be unique and nonempty")
+        return self
+
+    @property
+    def cost(self) -> int:
+        return self.trainable_lora_numel * self.optimizer_passes
+
+
+class RunOptimizerWorkSummary(_Spec):
+    """Immutable rank-local optimizer work returned by run registration."""
+
+    run_id: str = Field(min_length=1)
+    ranks: tuple[RankLocalOptimizerWorkSummary, ...] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def _validate_ranks(self) -> "RunOptimizerWorkSummary":
+        if tuple(rank.rank for rank in self.ranks) != tuple(range(len(self.ranks))):
+            raise ValueError("optimizer work ranks must be ordered and contiguous")
+        signatures = {(rank.adapter_rank, rank.target_modules) for rank in self.ranks}
+        if len(signatures) != 1:
+            raise ValueError("trainer ranks disagree on immutable LoRA configuration")
+        return self
+
+    @property
+    def adapter_rank(self) -> int:
+        return self.ranks[0].adapter_rank
+
+    @property
+    def target_modules(self) -> tuple[str, ...]:
+        return self.ranks[0].target_modules
+
+    @property
+    def critical_rank(self) -> RankLocalOptimizerWorkSummary:
+        return max(self.ranks, key=lambda rank: (rank.cost, -rank.rank))
+
+    @property
+    def layout_fingerprint(self) -> str:
+        payload = json.dumps(
+            [rank.model_dump(mode="json") for rank in self.ranks],
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode()
+        return hashlib.sha256(payload).hexdigest()
+
+
 class CurrentTrainConfig(TrainConfig):
     model_config = ConfigDict(extra="forbid", frozen=True)
 

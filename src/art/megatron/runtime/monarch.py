@@ -58,6 +58,7 @@ from .specs import (
     HybridEpRuntimeSpec,
     LoadStateJobSpec,
     OptimizerJobSpec,
+    RankLocalOptimizerWorkSummary,
     ResidentLoraExport,
     ResidentLoraInspectionResult,
     ResidentLoraInspectionShard,
@@ -66,6 +67,7 @@ from .specs import (
     ResidentScoreJobSpec,
     ResidentScoreResult,
     ResidentScoreShard,
+    RunOptimizerWorkSummary,
     RunSlotRegistration,
     SftForwardBackwardJobSpec,
     SftForwardJobSpec,
@@ -303,6 +305,7 @@ class _RunRegistrationReady(BaseModel):
 
     rank: int
     run_id: str
+    optimizer_work: RankLocalOptimizerWorkSummary | None = None
     error_type: str | None = None
     message: str | None = None
     traceback_text: str | None = None
@@ -1129,10 +1132,11 @@ class MonarchTrainerActor(Actor):
 
         def ready(completed: Any) -> None:
             try:
-                completed.result()
+                prepared = completed.result()
                 result = _RunRegistrationReady(
                     rank=self._runtime.rank,
                     run_id=registration.run_id,
+                    optimizer_work=prepared.optimizer_work,
                 )
             except BaseException as error:
                 result = _RunRegistrationReady(
@@ -2116,8 +2120,10 @@ class MonarchTrainerSlot:
             str, asyncio.Task[tuple[TrainerRankPublication, ...]]
         ] = {}
         self._publication_authorizations: dict[str, asyncio.Event] = {}
-        self._registrations: dict[str, str] = {}
-        self._registration_tasks: dict[str, tuple[str, asyncio.Task[None]]] = {}
+        self._registrations: dict[str, tuple[str, RunOptimizerWorkSummary]] = {}
+        self._registration_tasks: dict[
+            str, tuple[str, asyncio.Task[RunOptimizerWorkSummary]]
+        ] = {}
         self._removal_tasks: dict[str, asyncio.Task[None]] = {}
         self._cleanup_slots = asyncio.BoundedSemaphore(_MAX_PENDING_RUN_CLEANUPS)
         self._operations: dict[str, tuple[str, dict[str, Any]]] = {}
@@ -2130,14 +2136,16 @@ class MonarchTrainerSlot:
     def valid(self) -> bool:
         return self._valid
 
-    async def register_run(self, registration: RunSlotRegistration) -> None:
+    async def register_run(
+        self, registration: RunSlotRegistration
+    ) -> RunOptimizerWorkSummary:
         fingerprint = registration.model_dump_json()
         async with self._registration_lock:
             self._require_open()
             if prior := self._registrations.get(registration.run_id):
-                if prior != fingerprint:
+                if prior[0] != fingerprint:
                     raise RuntimeError("run_id was reused for another registration")
-                return
+                return prior[1]
             if registration.run_id in self._removal_tasks:
                 raise RuntimeError("run_id is still being removed")
             pending = self._registration_tasks.get(registration.run_id)
@@ -2152,11 +2160,11 @@ class MonarchTrainerSlot:
                 )
                 task.add_done_callback(consume_future_exception)
                 self._registration_tasks[registration.run_id] = (fingerprint, task)
-        await asyncio.shield(task)
+        return await asyncio.shield(task)
 
     async def _register_prepared_run(
         self, registration: RunSlotRegistration, fingerprint: str
-    ) -> None:
+    ) -> RunOptimizerWorkSummary:
         payload = registration.model_dump_json()
         expected_ranks = set(range(len(self._rank_processes)))
 
@@ -2203,6 +2211,17 @@ class MonarchTrainerSlot:
                     for item in failures
                 )
                 raise RuntimeError(f"run registration preparation failed:\n{details}")
+            rank_work = tuple(
+                item.optimizer_work
+                for item in sorted(ready, key=lambda item: item.rank)
+                if item.optimizer_work is not None
+            )
+            if len(rank_work) != len(self._rank_processes):
+                raise RuntimeError("trainer rank omitted exact optimizer work")
+            optimizer_work = RunOptimizerWorkSummary(
+                run_id=registration.run_id,
+                ranks=rank_work,
+            )
             finished = list(
                 (
                     await asyncio.wait_for(
@@ -2214,7 +2233,11 @@ class MonarchTrainerSlot:
                 ).values()
             )
             validate(finished)
-            self._registrations[registration.run_id] = fingerprint
+            self._registrations[registration.run_id] = (
+                fingerprint,
+                optimizer_work,
+            )
+            return optimizer_work
         except BaseException as error:
             if self.valid:
                 try:

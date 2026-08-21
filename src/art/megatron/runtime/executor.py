@@ -5,6 +5,7 @@ from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from contextlib import ExitStack, contextmanager
 import gc
 import hashlib
+import json
 import math
 from pathlib import Path
 from threading import BoundedSemaphore, Condition, Event, Lock
@@ -68,6 +69,7 @@ from .specs import (
     GenerationSnapshotJobSpec,
     LoadStateJobSpec,
     OptimizerJobSpec,
+    RankLocalOptimizerWorkSummary,
     ResidentLoraInspectionShard,
     ResidentLoraInspectionSpec,
     ResidentScoreJobSpec,
@@ -1118,6 +1120,122 @@ class _PreparedRunRegistration(BaseModel):
 
     registration: RunSlotRegistration
     load: _PreparedRunLoad
+    optimizer_work: RankLocalOptimizerWorkSummary
+
+
+def _rank_local_optimizer_work(
+    rank: int, prepared: _PreparedRunLoad
+) -> RankLocalOptimizerWorkSummary:
+    optimizer = prepared.optimizer
+    if optimizer is None:
+        raise RuntimeError("run registration has no prepared optimizer")
+    weights = prepared.weights
+    masters = tuple(optimizer.master_params)
+    states = tuple(optimizer.state)
+    if not weights or len(masters) != len(weights) or len(states) != len(weights):
+        raise RuntimeError("prepared optimizer does not cover every LoRA parameter")
+
+    adapter_rank = prepared.adapter_config.get("r")
+    configured_targets = prepared.adapter_config.get("target_modules")
+    if type(adapter_rank) is not int or adapter_rank < 1:
+        raise RuntimeError("prepared LoRA has no valid adapter rank")
+    if not isinstance(configured_targets, (list, tuple)) or not configured_targets:
+        raise RuntimeError("prepared LoRA has no explicit target modules")
+    if any(not isinstance(target, str) or not target for target in configured_targets):
+        raise RuntimeError("prepared LoRA target modules must be nonempty strings")
+    target_modules = tuple(configured_targets)
+    if len(set(target_modules)) != len(target_modules):
+        raise RuntimeError("prepared LoRA target modules are not unique")
+
+    parameter_layouts: list[dict[str, Any]] = []
+    pass_counts: set[int] = set()
+    optimizer_tensor_ids: set[int] = set()
+    for index, (weight, master, state) in enumerate(
+        zip(weights, masters, states, strict=True)
+    ):
+        shape = tuple(weight.shape)
+        if tuple(master.shape) != shape:
+            raise RuntimeError(
+                f"optimizer master shape differs from LoRA parameter {index}"
+            )
+        if not isinstance(state, dict) or not {
+            "step",
+            "exp_avg",
+            "exp_avg_sq",
+        }.issubset(state):
+            raise RuntimeError(
+                f"prepared Adam state is incomplete for LoRA parameter {index}"
+            )
+        planes: list[tuple[str, torch.Tensor]] = [("master", master)]
+        scalars: list[dict[str, Any]] = []
+        for name, value in sorted(state.items()):
+            if not isinstance(value, torch.Tensor):
+                if not isinstance(value, (bool, int, float)):
+                    raise RuntimeError(
+                        f"optimizer state {name!r} for parameter {index} is not scalar"
+                    )
+                scalars.append({"name": name, "type": type(value).__name__})
+                continue
+            value_shape = tuple(value.shape)
+            if value_shape == shape:
+                planes.append((name, value))
+            elif value.numel() == 1:
+                scalars.append(
+                    {
+                        "name": name,
+                        "shape": value_shape,
+                        "dtype": str(value.dtype),
+                    }
+                )
+            else:
+                raise RuntimeError(
+                    f"optimizer state {name!r} for parameter {index} has "
+                    "neither parameter nor scalar shape"
+                )
+        plane_ids = tuple(id(tensor) for _name, tensor in planes)
+        if len(set(plane_ids)) != len(plane_ids) or any(
+            tensor_id in optimizer_tensor_ids for tensor_id in plane_ids
+        ):
+            raise RuntimeError("prepared optimizer aliases parameter-sized tensors")
+        optimizer_tensor_ids.update(plane_ids)
+        pass_counts.add(len(planes))
+        parameter_layouts.append(
+            {
+                "weight_shape": shape,
+                "weight_dtype": str(weight.dtype),
+                "optimizer_planes": [
+                    {
+                        "name": name,
+                        "shape": tuple(tensor.shape),
+                        "dtype": str(tensor.dtype),
+                    }
+                    for name, tensor in planes
+                ],
+                "optimizer_scalars": scalars,
+            }
+        )
+    if len(pass_counts) != 1:
+        raise RuntimeError("optimizer parameter-sized work differs across parameters")
+    optimizer_passes = pass_counts.pop()
+    payload = json.dumps(
+        {
+            "adapter_rank": adapter_rank,
+            "target_modules": target_modules,
+            "optimizer_layout": optimizer.layout,
+            "parameters": parameter_layouts,
+        },
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode()
+    return RankLocalOptimizerWorkSummary(
+        rank=rank,
+        adapter_rank=adapter_rank,
+        target_modules=target_modules,
+        trainable_lora_numel=sum(weight.numel() for weight in weights),
+        optimizer_passes=optimizer_passes,
+        parameter_count=len(weights),
+        layout_fingerprint=hashlib.sha256(payload).hexdigest(),
+    )
 
 
 class GenerationResidency(BaseModel):
@@ -1227,8 +1345,12 @@ class MCoreRunSlotExecutor:
         with self._lifecycle_lock:
             self._transition_futures.discard(future)
 
-    def register_run(self, registration: RunSlotRegistration) -> None:
-        self.commit_run_registration(self.prepare_run_registration(registration))
+    def register_run(
+        self, registration: RunSlotRegistration
+    ) -> RankLocalOptimizerWorkSummary:
+        prepared = self.prepare_run_registration(registration)
+        self.commit_run_registration(prepared)
+        return prepared.optimizer_work
 
     def prepare_run_registration(
         self, registration: RunSlotRegistration
@@ -1300,7 +1422,11 @@ class MCoreRunSlotExecutor:
             raise RuntimeError(
                 "prepared initial working set is not entirely CPU resident"
             )
-        return _PreparedRunRegistration(registration=registration, load=prepared)
+        return _PreparedRunRegistration(
+            registration=registration,
+            load=prepared,
+            optimizer_work=_rank_local_optimizer_work(self.runtime.rank, prepared),
+        )
 
     def start_prepare_run_registration(
         self, registration: RunSlotRegistration
@@ -1337,13 +1463,15 @@ class MCoreRunSlotExecutor:
 
     def finish_prepared_run_registration(
         self, registration: RunSlotRegistration
-    ) -> None:
+    ) -> RankLocalOptimizerWorkSummary:
         if not self.run_registration_prepared(registration):
             raise RuntimeError("run registration preparation is not complete")
         _fingerprint, future = self._registration_preparations.pop(
             registration.run_id
         )
-        self.commit_run_registration(future.result())
+        prepared = future.result()
+        self.commit_run_registration(prepared)
+        return prepared.optimizer_work
 
     def discard_prepared_run_registration(self, run_id: str) -> None:
         preparation = self._registration_preparations.pop(run_id, None)

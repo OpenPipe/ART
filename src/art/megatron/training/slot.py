@@ -52,6 +52,7 @@ from art.megatron.runtime.specs import (
     OptimizerJobSpec,
     ResolvedCheckpointState,
     RlForwardBackwardConfig,
+    RunOptimizerWorkSummary,
     RunSlotRegistration,
     SftForwardBackwardJobSpec,
     SftForwardJobSpec,
@@ -202,6 +203,7 @@ class _ResidentRun(BaseModel):
     model: RolloutModelSpec
     output_dir: str = Field(min_length=1)
     generation: TrainerGeneration
+    optimizer_work: RunOptimizerWorkSummary
 
 
 class _PendingSnapshot(BaseModel):
@@ -303,7 +305,7 @@ class MegatronTrainingSlot:
         *,
         model: RolloutModelSpec,
         output_dir: str,
-    ) -> None:
+    ) -> RunOptimizerWorkSummary:
         self._require_open()
         output_dir = self._require_managed_path(output_dir)
         registration = registration.model_copy(
@@ -332,10 +334,12 @@ class MegatronTrainingSlot:
             candidate = (registration, model, output_dir)
             if candidate != (prior.registration, prior.model, prior.output_dir):
                 raise RuntimeError("run_id was reused for another resident run")
-            return
+            return prior.optimizer_work
         adapter = registration.adapter
         validate_adapter_manifest(adapter)
-        await self.trainer.register_run(registration)
+        optimizer_work = await self.trainer.register_run(registration)
+        if optimizer_work.run_id != registration.run_id:
+            raise RuntimeError("trainer returned optimizer work for another run")
         self._runs[registration.run_id] = _ResidentRun(
             registration=registration,
             model=model,
@@ -346,7 +350,9 @@ class MegatronTrainingSlot:
                 generation_id=registration.generation_id,
                 adapter_path=adapter.identity,
             ),
+            optimizer_work=optimizer_work,
         )
+        return optimizer_work
 
     async def unregister_run(self, run_id: str) -> None:
         self._require_open()
