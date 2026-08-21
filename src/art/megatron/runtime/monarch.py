@@ -19,7 +19,6 @@ from monarch.actor import (
     MeshFailure,
     Port,
     ProcMesh,
-    concurrent_endpoint,
     endpoint,
 )
 from monarch.spmd import SPMDActor
@@ -30,7 +29,11 @@ from art.distributed.monarch_bootstrap import activate_cuda_device
 from art.distributed.specs import GpuId
 from art.training.contracts import OperationRef
 from art.utils.cache_dirs import configure_model_cache_env
-from art.utils.lifecycle import cleanup_after_failure, consume_future_exception
+from art.utils.lifecycle import (
+    cleanup_after_failure,
+    consume_future_exception,
+    process_shutdown_timeout,
+)
 
 from .data_plane import InMemoryPackedBatch, SFTBatchData
 from .publication import (
@@ -117,6 +120,15 @@ _SUPERVISION_MESHES: dict[str, "MonarchTrainerSupervision"] = {}
 _EXPECTED_STOPPED_MESH_FAILURES: dict[str, float] = {}
 _PREVIOUS_FAULT_HOOK: Callable[[MeshFailure], None] | None = None
 _MAX_PENDING_RUN_CLEANUPS = 8
+_DEFERRED_RESPONSE_JOIN_TIMEOUT_S = process_shutdown_timeout(2)
+
+
+def _response_exception(error: BaseException) -> Exception:
+    return (
+        error
+        if isinstance(error, Exception)
+        else RuntimeError(f"{type(error).__name__}: {error}")
+    )
 
 
 def _configure_hybrid_ep_env(
@@ -636,6 +648,10 @@ class MonarchTrainerActor(Actor):
         )
         self._weight_offload.install()
         self._command_job_open = False
+        self._deferred_response_lock = Lock()
+        self._deferred_response_threads: set[Thread] = set()
+        self._deferred_response_stopping = False
+        self._compile_cache_publish_lock = Lock()
         self._cp_preplanner = None
         self._cp_lookahead_port = None
         self._cp_lookahead_thread = None
@@ -673,6 +689,50 @@ class MonarchTrainerActor(Actor):
         if self._run_slot_executor is None:
             raise RuntimeError("trainer actor is not configured for multi-run slots")
         return self._run_slot_executor
+
+    def _defer_response(
+        self,
+        port: Port[dict[str, Any]],
+        materialize: Callable[[], dict[str, Any]],
+        *,
+        name: str,
+        invalidate_on_error: bool,
+    ) -> None:
+        with self._deferred_response_lock:
+            if self._deferred_response_stopping:
+                raise RuntimeError("trainer actor is stopping")
+
+            def settle() -> None:
+                try:
+                    port.send(materialize())
+                except BaseException as error:
+                    if invalidate_on_error:
+                        self._valid = False
+                    try:
+                        port.exception(_response_exception(error))
+                    except BaseException:
+                        pass
+                finally:
+                    with self._deferred_response_lock:
+                        self._deferred_response_threads.discard(thread)
+
+            thread = Thread(target=settle, name=name, daemon=True)
+            self._deferred_response_threads.add(thread)
+            thread.start()
+
+    def _stop_deferred_responses(self) -> None:
+        with self._deferred_response_lock:
+            self._deferred_response_stopping = True
+            threads = tuple(self._deferred_response_threads)
+        deadline = time.monotonic() + _DEFERRED_RESPONSE_JOIN_TIMEOUT_S
+        for thread in threads:
+            thread.join(timeout=max(0.0, deadline - time.monotonic()))
+        alive = [thread.name for thread in threads if thread.is_alive()]
+        if alive:
+            raise RuntimeError(
+                "trainer response settlement did not stop within "
+                f"{_DEFERRED_RESPONSE_JOIN_TIMEOUT_S:g}s: {alive}"
+            )
 
     def _run_cp_lookahead(self, receiver: Any) -> None:
         while (request := receiver.recv().get()) is not None:
@@ -771,20 +831,21 @@ class MonarchTrainerActor(Actor):
             )
 
     def _publish_compile_cache(self) -> None:
-        if self._compile_cache is None:
-            return
-        event = self._compile_cache.publish()
-        self._compile_cache_metrics.update(
-            {
-                "publish_s": self._compile_cache_metrics.get("publish_s", 0.0)
-                + event.elapsed_s,
-                "published": max(
-                    self._compile_cache_metrics.get("published", 0.0),
-                    float(event.status == "published"),
-                ),
-                "artifact_bytes": float(event.artifact_bytes),
-            }
-        )
+        with self._compile_cache_publish_lock:
+            if self._compile_cache is None:
+                return
+            event = self._compile_cache.publish()
+            self._compile_cache_metrics.update(
+                {
+                    "publish_s": self._compile_cache_metrics.get("publish_s", 0.0)
+                    + event.elapsed_s,
+                    "published": max(
+                        self._compile_cache_metrics.get("published", 0.0),
+                        float(event.status == "published"),
+                    ),
+                    "artifact_bytes": float(event.artifact_bytes),
+                }
+            )
 
     @endpoint
     def ready(self) -> dict[str, Any]:
@@ -1036,9 +1097,7 @@ class MonarchTrainerActor(Actor):
                     run_id=registration.run_id,
                     error_type=type(error).__name__,
                     message=str(error),
-                    traceback_text="".join(
-                        traceback.format_exception(error)
-                    ),
+                    traceback_text="".join(traceback.format_exception(error)),
                 )
             ready_port.send(result.model_dump(mode="json"))
 
@@ -1071,14 +1130,27 @@ class MonarchTrainerActor(Actor):
         self._require_run_slot_executor().start_unregister_run(run_id)
         return {"rank": self._runtime.rank, "run_id": run_id}
 
-    @concurrent_endpoint
-    async def finish_unregister_run_slot(self, run_id: str) -> dict[str, Any]:
-        if not self._valid:
-            raise RuntimeError("trainer actor runtime is invalid")
-        await asyncio.to_thread(
-            self._require_run_slot_executor().finish_unregister_run, run_id
-        )
-        return {"rank": self._runtime.rank, "run_id": run_id}
+    @endpoint(explicit_response_port=True)
+    def finish_unregister_run_slot(
+        self, response_port: Port[dict[str, Any]], run_id: str
+    ) -> None:
+        try:
+            if not self._valid:
+                raise RuntimeError("trainer actor runtime is invalid")
+            executor = self._require_run_slot_executor()
+
+            def finish() -> dict[str, Any]:
+                executor.finish_unregister_run(run_id)
+                return {"rank": self._runtime.rank, "run_id": run_id}
+
+            self._defer_response(
+                response_port,
+                finish,
+                name=f"art-unregister-run-{run_id}",
+                invalidate_on_error=False,
+            )
+        except BaseException as error:
+            response_port.exception(_response_exception(error))
 
     @endpoint
     def execute_run_slot_forward_backward(
@@ -1120,17 +1192,19 @@ class MonarchTrainerActor(Actor):
             if batch is not None:
                 batch.close()
 
-    @concurrent_endpoint
-    async def start_run_slot_forward_backward(
+    @endpoint(explicit_response_port=True)
+    def start_run_slot_forward_backward(
         self,
+        response_port: Port[dict[str, Any]],
         job_json: str,
         batch_json: str,
         ready_port: Port[dict[str, Any]],
-    ) -> dict[str, Any]:
+    ) -> None:
         batch = None
         ready = False
-        job = ForwardBackwardJobSpec.model_validate_json(job_json)
+        job = None
         try:
+            job = ForwardBackwardJobSpec.model_validate_json(job_json)
             if not self._valid:
                 raise RuntimeError("trainer actor runtime is invalid")
             leases = PackedBatchLeaseSet.model_validate_json(batch_json)
@@ -1154,20 +1228,28 @@ class MonarchTrainerActor(Actor):
                 ).model_dump(mode="json")
             )
             ready = True
-            result = await asyncio.to_thread(launch.materialize)
-            response = {
-                "rank": self._runtime.rank,
-                "operation_id": result["operation_id"],
-                "learner_version": result["learner_version"],
-                "token_count": result["token_count"],
-                "metrics": result["metrics"],
-                "token_logprobs": result["token_logprobs"],
-            }
-            self._publish_compile_cache()
-            return response
+
+            def materialize() -> dict[str, Any]:
+                result = launch.materialize()
+                self._publish_compile_cache()
+                return {
+                    "rank": self._runtime.rank,
+                    "operation_id": result["operation_id"],
+                    "learner_version": result["learner_version"],
+                    "token_count": result["token_count"],
+                    "metrics": result["metrics"],
+                    "token_logprobs": result["token_logprobs"],
+                }
+
+            self._defer_response(
+                response_port,
+                materialize,
+                name=f"art-fb-result-{job.operation_id}",
+                invalidate_on_error=True,
+            )
         except BaseException as error:
             self._valid = False
-            if not ready:
+            if not ready and job is not None:
                 ready_port.send(
                     _CommandReady(
                         rank=self._runtime.rank,
@@ -1178,22 +1260,24 @@ class MonarchTrainerActor(Actor):
                         traceback_text=traceback.format_exc(),
                     ).model_dump(mode="json")
                 )
-            raise
+            response_port.exception(_response_exception(error))
         finally:
             if batch is not None:
                 batch.close()
 
-    @concurrent_endpoint
-    async def start_run_slot_forward(
+    @endpoint(explicit_response_port=True)
+    def start_run_slot_forward(
         self,
+        response_port: Port[dict[str, Any]],
         job_json: str,
         batch_json: str,
         ready_port: Port[dict[str, Any]],
-    ) -> dict[str, Any]:
+    ) -> None:
         batch = None
         ready = False
-        job = ForwardJobSpec.model_validate_json(job_json)
+        job = None
         try:
+            job = ForwardJobSpec.model_validate_json(job_json)
             if not self._valid:
                 raise RuntimeError("trainer actor runtime is invalid")
             leases = PackedBatchLeaseSet.model_validate_json(batch_json)
@@ -1217,13 +1301,21 @@ class MonarchTrainerActor(Actor):
                 ).model_dump(mode="json")
             )
             ready = True
-            result = await asyncio.to_thread(launch.materialize)
-            response = {"rank": self._runtime.rank, **result}
-            self._publish_compile_cache()
-            return response
+
+            def materialize() -> dict[str, Any]:
+                result = {"rank": self._runtime.rank, **launch.materialize()}
+                self._publish_compile_cache()
+                return result
+
+            self._defer_response(
+                response_port,
+                materialize,
+                name=f"art-forward-result-{job.operation_id}",
+                invalidate_on_error=True,
+            )
         except BaseException as error:
             self._valid = False
-            if not ready:
+            if not ready and job is not None:
                 ready_port.send(
                     _CommandReady(
                         rank=self._runtime.rank,
@@ -1234,7 +1326,7 @@ class MonarchTrainerActor(Actor):
                         traceback_text=traceback.format_exc(),
                     ).model_dump(mode="json")
                 )
-            raise
+            response_port.exception(_response_exception(error))
         finally:
             if batch is not None:
                 batch.close()
@@ -1275,25 +1367,25 @@ class MonarchTrainerActor(Actor):
             if batch is not None:
                 batch.close()
 
-    @concurrent_endpoint
-    async def start_run_slot_sft_forward_backward(
+    @endpoint(explicit_response_port=True)
+    def start_run_slot_sft_forward_backward(
         self,
+        response_port: Port[dict[str, Any]],
         job_json: str,
         batch_json: str,
         ready_port: Port[dict[str, Any]],
-    ) -> dict[str, Any]:
+    ) -> None:
         batch = None
         ready = False
-        job = SftForwardBackwardJobSpec.model_validate_json(job_json)
+        job = None
         try:
+            job = SftForwardBackwardJobSpec.model_validate_json(job_json)
             if not self._valid:
                 raise RuntimeError("trainer actor runtime is invalid")
             leases = SftBatchLeaseSet.model_validate_json(batch_json)
             if leases.manifest.fingerprint != job.batch_fingerprint:
                 raise ValueError("SFT F/B lease differs from its job")
-            batch = SFTBatchData.open(
-                leases.manifest, leases.host_refs[self._host_id]
-            )
+            batch = SFTBatchData.open(leases.manifest, leases.host_refs[self._host_id])
             if not self._command_job_open:
                 self._weight_offload.before_job()
                 self._command_job_open = True
@@ -1313,12 +1405,21 @@ class MonarchTrainerActor(Actor):
                 ).model_dump(mode="json")
             )
             ready = True
-            response = {"rank": self._runtime.rank, **await asyncio.to_thread(launch.materialize)}
-            self._publish_compile_cache()
-            return response
+
+            def materialize() -> dict[str, Any]:
+                result = {"rank": self._runtime.rank, **launch.materialize()}
+                self._publish_compile_cache()
+                return result
+
+            self._defer_response(
+                response_port,
+                materialize,
+                name=f"art-sft-fb-result-{job.operation_id}",
+                invalidate_on_error=True,
+            )
         except BaseException as error:
             self._valid = False
-            if not ready:
+            if not ready and job is not None:
                 ready_port.send(
                     _CommandReady(
                         rank=self._runtime.rank,
@@ -1329,30 +1430,30 @@ class MonarchTrainerActor(Actor):
                         traceback_text=traceback.format_exc(),
                     ).model_dump(mode="json")
                 )
-            raise
+            response_port.exception(_response_exception(error))
         finally:
             if batch is not None:
                 batch.close()
 
-    @concurrent_endpoint
-    async def start_run_slot_sft_forward(
+    @endpoint(explicit_response_port=True)
+    def start_run_slot_sft_forward(
         self,
+        response_port: Port[dict[str, Any]],
         job_json: str,
         batch_json: str,
         ready_port: Port[dict[str, Any]],
-    ) -> dict[str, Any]:
+    ) -> None:
         batch = None
         ready = False
-        job = SftForwardJobSpec.model_validate_json(job_json)
+        job = None
         try:
+            job = SftForwardJobSpec.model_validate_json(job_json)
             if not self._valid:
                 raise RuntimeError("trainer actor runtime is invalid")
             leases = SftBatchLeaseSet.model_validate_json(batch_json)
             if leases.manifest.fingerprint != job.batch_fingerprint:
                 raise ValueError("SFT forward lease differs from its job")
-            batch = SFTBatchData.open(
-                leases.manifest, leases.host_refs[self._host_id]
-            )
+            batch = SFTBatchData.open(leases.manifest, leases.host_refs[self._host_id])
             if not self._command_job_open:
                 self._weight_offload.before_job()
                 self._command_job_open = True
@@ -1372,12 +1473,21 @@ class MonarchTrainerActor(Actor):
                 ).model_dump(mode="json")
             )
             ready = True
-            response = {"rank": self._runtime.rank, **await asyncio.to_thread(launch.materialize)}
-            self._publish_compile_cache()
-            return response
+
+            def materialize() -> dict[str, Any]:
+                result = {"rank": self._runtime.rank, **launch.materialize()}
+                self._publish_compile_cache()
+                return result
+
+            self._defer_response(
+                response_port,
+                materialize,
+                name=f"art-sft-forward-result-{job.operation_id}",
+                invalidate_on_error=True,
+            )
         except BaseException as error:
             self._valid = False
-            if not ready:
+            if not ready and job is not None:
                 ready_port.send(
                     _CommandReady(
                         rank=self._runtime.rank,
@@ -1388,7 +1498,7 @@ class MonarchTrainerActor(Actor):
                         traceback_text=traceback.format_exc(),
                     ).model_dump(mode="json")
                 )
-            raise
+            response_port.exception(_response_exception(error))
         finally:
             if batch is not None:
                 batch.close()
@@ -1702,6 +1812,7 @@ class MonarchTrainerActor(Actor):
     def __cleanup__(self, exc: Exception | None) -> None:
         if exc is not None:
             self._valid = False
+        self._stop_deferred_responses()
         if self._command_job_open:
             self._executor.discard_open_gradients()
             self._weight_offload.after_job()
@@ -1867,9 +1978,7 @@ class MonarchTrainerSlot:
         ] = {}
         self._publication_authorizations: dict[str, asyncio.Event] = {}
         self._registrations: dict[str, str] = {}
-        self._registration_tasks: dict[
-            str, tuple[str, asyncio.Task[None]]
-        ] = {}
+        self._registration_tasks: dict[str, tuple[str, asyncio.Task[None]]] = {}
         self._removal_tasks: dict[str, asyncio.Task[None]] = {}
         self._cleanup_slots = asyncio.BoundedSemaphore(_MAX_PENDING_RUN_CLEANUPS)
         self._operations: dict[str, tuple[str, dict[str, Any]]] = {}
