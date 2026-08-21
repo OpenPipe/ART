@@ -115,6 +115,11 @@ def create_identity_lora(
     tensors, final_config = handler.to_vllm_lora_tensors(
         tensors, adapter_config=final_config
     )
+    tensors = canonicalize_identity_shared_outer(
+        tensors,
+        adapter_config=final_config,
+        groups=handler.expert_packed_lora_groups(),
+    )
     save_vllm_lora_tensors(lora_path, tensors, final_config)
     del peft_model, model
     if torch.cuda.is_initialized():

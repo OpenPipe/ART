@@ -31,6 +31,18 @@ def canonicalize_identity_shared_outer(
                     shared = entries[0][1]
                     for key, _ in entries[1:]:
                         result[key] = shared
+        for slot in group.slots:
+            if not slot.shared_outer_factor:
+                continue
+            suffix = f"{group.art_group_suffix}.{slot.output_suffix}"
+            for key, tensor in tuple(result.items()):
+                if key.endswith(suffix):
+                    result[key] = _share_packed_factor(
+                        tensor,
+                        rank=int(adapter_config["r"]),
+                        layout=slot.pack_layout,
+                        key=key,
+                    )
     return result
 
 
@@ -187,3 +199,33 @@ def _expert_key(prefix: str, expert: int, projection: str, lora: str) -> str:
 
 def _compact_key(prefix: str, projection: str, lora: str) -> str:
     return f"{prefix}.shared.{projection}.{lora}.weight"
+
+
+def _share_packed_factor(
+    tensor: torch.Tensor,
+    *,
+    rank: int,
+    layout: str,
+    key: str,
+) -> torch.Tensor:
+    axis = 0 if layout == "expert_rows" else tensor.ndim - 1
+    if tensor.shape[axis] % rank:
+        raise RuntimeError(
+            f"identity shared-outer factor {key} shape {tuple(tensor.shape)} "
+            f"is not divisible by rank {rank}"
+        )
+    experts = tensor.shape[axis] // rank
+    if experts <= 1:
+        return tensor
+    if layout == "expert_rows":
+        return tensor.narrow(0, 0, rank).repeat(
+            experts, *(1 for _ in tensor.shape[1:])
+        )
+    shape = (*tensor.shape[:-1], rank, experts)
+    return (
+        tensor.reshape(shape)
+        .narrow(-1, 0, 1)
+        .expand(*shape)
+        .reshape(tensor.shape)
+        .contiguous()
+    )
