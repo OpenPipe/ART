@@ -21,7 +21,7 @@ from art.utils.disk_admission import (
 from .residency import ResidencyKey
 from .tensor_residency import HostTensorImage, _StorageGroup, _TensorView
 
-_FORMAT = "art_tensor_residency_v3"
+_FORMAT = "art_tensor_residency_v4"
 _DATA_FILE = "state.bin"
 _MANIFEST_FILE = "manifest.json"
 
@@ -40,6 +40,7 @@ class NvmeStorageRecord(BaseModel):
 
     offset: int = Field(ge=0)
     byte_count: int = Field(ge=1)
+    sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
 
 
 class NvmeTensorRecord(BaseModel):
@@ -56,7 +57,7 @@ class NvmeTensorRecord(BaseModel):
 class NvmeResidencyManifest(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    format: Literal["art_tensor_residency_v3"] = _FORMAT
+    format: Literal["art_tensor_residency_v4"] = _FORMAT
     key: ResidencyKey
     input_tensor_count: int = Field(ge=1)
     payload_bytes: int = Field(ge=1)
@@ -175,6 +176,7 @@ class NvmeResidencyStore:
         if manifest.key != key:
             raise RuntimeError("L3 residency manifest changed identity")
         self._verify_data_size(destination, manifest)
+        self._verify_content(destination, manifest)
         return self._map_image(destination, manifest, tensors), manifest
 
     def map_committed(
@@ -327,7 +329,11 @@ class NvmeResidencyStore:
             data_bytes=cursor,
             layout_sha256=self._digest_json(layout),
             storages=tuple(
-                NvmeStorageRecord(offset=offset, byte_count=target.numel())
+                NvmeStorageRecord(
+                    offset=offset,
+                    byte_count=target.numel(),
+                    sha256="0" * 64,
+                )
                 for offset, target in zip(offsets, targets, strict=True)
             ),
             tensors=tensors,
@@ -341,6 +347,7 @@ class NvmeResidencyStore:
         *,
         reservation: DiskReservationLease,
     ) -> NvmeResidencyManifest:
+        storages: list[NvmeStorageRecord] = []
         with (directory / _DATA_FILE).open("wb", buffering=0) as handle:
             cursor = 0
             for record, target in zip(
@@ -351,23 +358,27 @@ class NvmeResidencyStore:
                     cursor += padding
                     reservation.record_written(cursor)
                 view = memoryview(target.numpy()).cast("B")
+                digest = hashlib.sha256()
                 for start in range(0, len(view), self.config.io_chunk_bytes):
                     chunk = view[start : start + self.config.io_chunk_bytes]
                     handle.write(chunk)
+                    digest.update(chunk)
                     cursor += len(chunk)
                     reservation.record_written(cursor)
                 if cursor != record.offset + record.byte_count:
                     raise RuntimeError("L3 residency write changed physical layout")
+                storages.append(record.model_copy(update={"sha256": digest.hexdigest()}))
             handle.flush()
             os.fsync(handle.fileno())
-        payload = manifest.model_dump_json().encode()
+        committed = manifest.model_copy(update={"storages": tuple(storages)})
+        payload = committed.model_dump_json().encode()
         with (directory / _MANIFEST_FILE).open("wb", buffering=0) as handle:
             handle.write(payload)
             handle.flush()
             os.fsync(handle.fileno())
         reservation.record_written(manifest.data_bytes + len(payload))
         self._fsync_dir(directory)
-        return manifest
+        return committed
 
     def _read_targets(
         self,
@@ -380,12 +391,34 @@ class NvmeResidencyStore:
                 handle.seek(record.offset)
                 view = memoryview(target.numpy()).cast("B")
                 cursor = 0
+                digest = hashlib.sha256()
                 while cursor < len(view):
                     chunk = view[cursor : cursor + self.config.io_chunk_bytes]
                     count = handle.readinto(chunk)
                     if count != len(chunk):
                         raise RuntimeError("L3 residency data ended during restore")
+                    digest.update(chunk)
                     cursor += count
+                if digest.hexdigest() != record.sha256:
+                    raise RuntimeError("L3 residency storage content changed")
+
+    def _verify_content(
+        self, directory: Path, manifest: NvmeResidencyManifest
+    ) -> None:
+        buffer = bytearray(self.config.io_chunk_bytes)
+        with (directory / _DATA_FILE).open("rb", buffering=0) as handle:
+            for record in manifest.storages:
+                handle.seek(record.offset)
+                digest, remaining = hashlib.sha256(), record.byte_count
+                while remaining:
+                    chunk = memoryview(buffer)[: min(remaining, len(buffer))]
+                    count = handle.readinto(chunk)
+                    if count != len(chunk):
+                        raise RuntimeError("L3 residency data ended during verification")
+                    digest.update(chunk)
+                    remaining -= count
+                if digest.hexdigest() != record.sha256:
+                    raise RuntimeError("L3 residency storage content changed")
 
     @staticmethod
     def _verify_data_size(directory: Path, manifest: NvmeResidencyManifest) -> None:
