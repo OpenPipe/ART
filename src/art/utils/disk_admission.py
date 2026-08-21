@@ -4,10 +4,12 @@ from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from datetime import datetime, timezone
 import fcntl
+import hashlib
 import os
 from pathlib import Path
 import shutil
 import stat
+import struct
 from threading import Lock, RLock
 from typing import Literal
 from uuid import uuid4
@@ -17,6 +19,10 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 _LOCK_NAME = ".art_disk_admission.lock"
 _MANIFEST_NAME = ".art_disk_admission.json"
 _LEASE_DIR = ".art_disk_reservations"
+_PROGRESS_MAGIC = b"ARTPRG01"
+_PROGRESS_BODY = struct.Struct(">8sQQ")
+_PROGRESS_SLOT_BYTES = _PROGRESS_BODY.size + hashlib.sha256().digest_size
+_PROGRESS_SLOTS = 2
 _MAX_CLOSED_RESERVATIONS = 256
 _PROCESS_ALIVE = "alive"
 _PROCESS_DEAD = "dead"
@@ -133,6 +139,7 @@ class DiskReservationLease:
         self.planned_bytes = planned_bytes
         self._written_bytes = 0
         self._recorded_bytes = 0
+        self._progress_sequence = 0
         self._lease_path = lease_path
         self._lease_descriptor = lease_descriptor
         self._closed = False
@@ -149,9 +156,9 @@ class DiskReservationLease:
             < self._admission.config.progress_update_bytes
         ):
             return
-        self._admission._set_remaining(
-            self.reservation_id, self.planned_bytes - written_bytes
-        )
+        sequence = self._progress_sequence + 1
+        _write_lease_progress(self._lease_descriptor, sequence, written_bytes)
+        self._progress_sequence = sequence
         self._recorded_bytes = written_bytes
 
     def complete(self) -> None:
@@ -255,8 +262,9 @@ class DiskAdmission:
                     raise DiskAdmissionError(
                         "disk reservation owned path overlaps an active reservation"
                     )
+                # Sampling progress before free space makes racing writes conservative.
                 active_remaining = sum(
-                    value.remaining_bytes
+                    self._effective_remaining(value)
                     for value in manifest.reservations.values()
                     if value.state == "active"
                 )
@@ -288,7 +296,9 @@ class DiskAdmission:
         with self._manifest() as manifest:
             self._reap_unclaimed_dead(manifest)
             return tuple(
-                value
+                value.model_copy(
+                    update={"remaining_bytes": self._effective_remaining(value)}
+                )
                 for value in manifest.reservations.values()
                 if value.state == "active"
             )
@@ -360,18 +370,6 @@ class DiskAdmission:
             self._prune_closed(manifest)
         return tuple(settled)
 
-    def _set_remaining(self, reservation_id: str, remaining_bytes: int) -> None:
-        self._require_owner_process()
-        with self._manifest() as manifest:
-            value = self._owned_active(manifest, reservation_id)
-            if not 0 <= remaining_bytes <= value.remaining_bytes:
-                raise DiskAdmissionError(
-                    "disk reservation remaining bytes cannot increase"
-                )
-            manifest.reservations[reservation_id] = value.model_copy(
-                update={"remaining_bytes": remaining_bytes, "updated_at": _now()}
-            )
-
     def _close(
         self,
         reservation_id: str,
@@ -442,6 +440,18 @@ class DiskAdmission:
         if process_state == _PROCESS_ALIVE:
             return True
         return _lease_is_held(self._lease_path(value), self.mount)
+
+    def _effective_remaining(self, value: DiskReservation) -> int:
+        # Lease progress is volatile; a dead owner must receive no capacity credit.
+        if not self._owner_is_live(value):
+            return value.planned_bytes
+        written_bytes = max(
+            value.planned_bytes - value.remaining_bytes,
+            _read_lease_progress(
+                self._lease_path(value), self.mount, value.planned_bytes
+            ),
+        )
+        return value.planned_bytes - written_bytes
 
     def _process_state(self, value: DiskProcessIdentity) -> str:
         if (
@@ -606,6 +616,51 @@ def _lease_is_held(path: Path, mount: Path) -> bool:
         return False
     finally:
         os.close(descriptor)
+
+
+def _write_lease_progress(descriptor: int, sequence: int, written_bytes: int) -> None:
+    body = _PROGRESS_BODY.pack(_PROGRESS_MAGIC, sequence, written_bytes)
+    payload = body + hashlib.sha256(body).digest()
+    # Alternating slots preserve the previous checksum-valid sample on a torn write.
+    offset = ((sequence - 1) % _PROGRESS_SLOTS) * _PROGRESS_SLOT_BYTES
+    view = memoryview(payload)
+    while view:
+        count = os.pwrite(descriptor, view, offset)
+        if count == 0:
+            raise OSError("disk reservation progress write made no progress")
+        offset += count
+        view = view[count:]
+
+
+def _read_lease_progress(path: Path, mount: Path, planned_bytes: int) -> int:
+    flags = os.O_RDONLY | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags)
+    except FileNotFoundError:
+        return 0
+    try:
+        _validate_file(descriptor, mount, "disk reservation lease")
+        payload = os.pread(descriptor, _PROGRESS_SLOT_BYTES * _PROGRESS_SLOTS, 0)
+    finally:
+        os.close(descriptor)
+    latest = (0, 0)
+    for offset in range(0, len(payload), _PROGRESS_SLOT_BYTES):
+        slot = payload[offset : offset + _PROGRESS_SLOT_BYTES]
+        if len(slot) != _PROGRESS_SLOT_BYTES:
+            continue
+        body = slot[: _PROGRESS_BODY.size]
+        if hashlib.sha256(body).digest() != slot[_PROGRESS_BODY.size :]:
+            continue
+        magic, sequence, written_bytes = _PROGRESS_BODY.unpack(body)
+        if (
+            magic == _PROGRESS_MAGIC
+            and sequence > latest[0]
+            and written_bytes <= planned_bytes
+        ):
+            latest = sequence, written_bytes
+    return latest[1]
 
 
 def _paths_have_open_files(values: tuple[str, ...]) -> bool:
