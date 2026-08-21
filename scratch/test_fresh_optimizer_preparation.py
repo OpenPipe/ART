@@ -193,15 +193,14 @@ def test_fresh_optimizer_is_complete_exact_cpu_payload(
     assert torch.cuda.is_initialized() == cuda_initialized
     assert len(prepared.master_params) == len(checkpoint.parameters)
     assert len(prepared.state) == len(checkpoint.parameters)
-    assert len(prepared.padding_masks) == len(checkpoint.parameters)
-    for parameter, master, values, mask in zip(
+    assert prepared.valid_ranges == tuple(None for _ in checkpoint.parameters)
+    for parameter, master, values in zip(
         checkpoint.parameters,
         prepared.master_params,
         prepared.state,
-        prepared.padding_masks,
         strict=True,
     ):
-        assert master.device.type == mask.device.type == "cpu"
+        assert master.device.type == "cpu"
         assert master.dtype == torch.float32
         assert master.requires_grad
         assert _storage_key(master) != _storage_key(parameter)
@@ -216,8 +215,6 @@ def test_fresh_optimizer_is_complete_exact_cpu_payload(
         assert not torch.count_nonzero(step)
         assert not torch.count_nonzero(exp_avg)
         assert not torch.count_nonzero(exp_avg_sq)
-        assert mask.shape == parameter.shape and mask.dtype == torch.bool
-        assert not torch.count_nonzero(mask)
     assert prepared.param_group == {
         "lr": 0.0,
         "bias_correction": True,
@@ -232,7 +229,7 @@ def test_fresh_optimizer_is_complete_exact_cpu_payload(
     steps = tuple(cast(torch.Tensor, values["step"]) for values in prepared.state)
     scalar_bytes = _storage_nbytes(steps)
     assert scalar_bytes == 4 * len(checkpoint.parameters)
-    assert _storage_nbytes(prepared.tensors) == 13 * parameter_elements + scalar_bytes
+    assert _storage_nbytes(prepared.tensors) == 12 * parameter_elements + scalar_bytes
 
     snapshot = prepared.snapshot_source()
     optimizer = cast(dict[str, object], snapshot.state["optimizer"])

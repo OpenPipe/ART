@@ -60,9 +60,7 @@ def _slot(
         _CheckpointSlot(
             params=params,
             optimizer=_DynamicOptimizer(optimizer, masters),
-            optimizer_padding_masks=tuple(
-                torch.zeros_like(param, dtype=torch.bool) for param in params
-            ),
+            optimizer_valid_ranges=tuple(None for _ in params),
         ),
         optimizer,
         calls,
@@ -218,7 +216,10 @@ def test_cache_rebuilds_for_lazy_state_and_optimizer_replacement(
             for master in masters
         ),
         param_group={"lr": 0.5},
-        padding_masks=cast(tuple[torch.Tensor, ...], slot.optimizer_padding_masks),
+        valid_ranges=cast(
+            tuple[_impl._OptimizerTensorValidRanges, ...],
+            slot.optimizer_valid_ranges,
+        ),
     )
     trainer._bind_prepared_checkpoint_slot_optimizer(
         "run", prepared, torch.optim.AdamW(masters)

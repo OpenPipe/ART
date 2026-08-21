@@ -93,6 +93,9 @@ TrainerRankOptimizerParameterLayout = tuple[
     str,
     tuple[int, ...],
 ]
+_OptimizerTensorValidRanges = (
+    tuple[tuple[int, ...], int, tuple[tuple[int, int], ...]] | None
+)
 
 
 class TrainerRankOptimizerLayout(TypedDict):
@@ -154,7 +157,7 @@ class PreparedTrainerRankOptimizerState(BaseModel):
     master_params: tuple[torch.nn.Parameter, ...]
     state: tuple[dict[str, object], ...]
     param_group: dict[str, object]
-    padding_masks: tuple[torch.Tensor, ...]
+    valid_ranges: tuple[_OptimizerTensorValidRanges, ...]
 
     @property
     def tensors(self) -> tuple[torch.Tensor, ...]:
@@ -162,7 +165,6 @@ class PreparedTrainerRankOptimizerState(BaseModel):
             (
                 *self.master_params,
                 *_nested_tensors(self.state),
-                *self.padding_masks,
             )
         )
 
@@ -768,7 +770,7 @@ class _OptimizerResidencyDescriptor(BaseModel):
     layout: SkipValidation[TrainerRankOptimizerLayout]
     master_params: SkipValidation[tuple[torch.nn.Parameter, ...]]
     slot_params: SkipValidation[tuple[torch.nn.Parameter, ...]]
-    padding_masks: SkipValidation[tuple[torch.Tensor, ...] | None]
+    valid_ranges: SkipValidation[tuple[_OptimizerTensorValidRanges, ...] | None]
     residency: SkipValidation[TrainerRankResidencyTensors]
 
     def matches(self, slot: _CheckpointSlot) -> bool:
@@ -778,7 +780,7 @@ class _OptimizerResidencyDescriptor(BaseModel):
             and dynamic.optimizer is self.optimizer
             and dynamic.master_params is self.master_params
             and slot.params is self.slot_params
-            and slot.optimizer_padding_masks is self.padding_masks
+            and slot.optimizer_valid_ranges is self.valid_ranges
             and self.optimizer.state is self.live_optimizer_state
             and len(self.optimizer.state) == self.state_entries
             and len(self.optimizer.param_groups) == 1
@@ -833,7 +835,7 @@ class _CheckpointSlot:
     revision: int = 0
     custom: dict[str, _CustomObject] = dataclass_field(default_factory=dict)
     custom_payload: "PreparedCustomPayload | None" = None
-    optimizer_padding_masks: tuple[torch.Tensor, ...] | None = None
+    optimizer_valid_ranges: tuple[_OptimizerTensorValidRanges, ...] | None = None
     optimizer_residency_descriptor: _OptimizerResidencyDescriptor | None = None
 
     def invalidate_optimizer_residency(self) -> None:
@@ -1207,7 +1209,7 @@ class TrainerRank:
             slot.optimizer = extended_optimizer
         slot.custom[name] = custom
         slot.params += new_params
-        slot.optimizer_padding_masks = None
+        slot.optimizer_valid_ranges = None
         slot.invalidate_optimizer_residency()
         tracker.active = True
         return custom.value
@@ -1735,7 +1737,6 @@ class TrainerRank:
             (
                 *dynamic.master_params,
                 *live_state_tensors,
-                *(slot.optimizer_padding_masks or ()),
             )
         )
         descriptor = _OptimizerResidencyDescriptor(
@@ -1752,7 +1753,7 @@ class TrainerRank:
             ),
             master_params=dynamic.master_params,
             slot_params=slot.params,
-            padding_masks=slot.optimizer_padding_masks,
+            valid_ranges=slot.optimizer_valid_ranges,
             residency=TrainerRankResidencyTensors(
                 weights=weights,
                 optimizer=optimizer_tensors,
@@ -1831,7 +1832,7 @@ class TrainerRank:
             param_group={
                 key: value for key, value in param_group.items() if key != "params"
             },
-            padding_masks=self._prepared_optimizer_padding_masks(checkpoint),
+            valid_ranges=self._prepared_optimizer_valid_ranges(checkpoint),
         )
 
     def prepare_fresh_checkpoint_slot_optimizer_for_residency(
@@ -1846,7 +1847,7 @@ class TrainerRank:
                 "parameters."
             )
         layout = self._prepared_dynamic_optimizer_layout(checkpoint)
-        padding_masks = self._prepared_optimizer_padding_masks(checkpoint)
+        valid_ranges = self._prepared_optimizer_valid_ranges(checkpoint)
         masters = tuple(
             torch.nn.Parameter(param.detach().to(torch.float32).clone())
             for param in parameters
@@ -1871,7 +1872,7 @@ class TrainerRank:
                 "eps": defaults.eps,
                 "weight_decay": defaults.weight_decay,
             },
-            padding_masks=padding_masks,
+            valid_ranges=valid_ranges,
         )
 
     def install_prepared_checkpoint_slot_optimizer(
@@ -1937,7 +1938,7 @@ class TrainerRank:
         )
         slot = self._checkpoint_slots[name]
         slot.optimizer = _DynamicOptimizer(optimizer, state.master_params)
-        slot.optimizer_padding_masks = state.padding_masks
+        slot.optimizer_valid_ranges = state.valid_ranges
         slot.invalidate_optimizer_residency()
         self._zero_dynamic_optimizer_padding(name, slot.optimizer)
 
@@ -2763,26 +2764,23 @@ class TrainerRank:
         *,
         params: AdamParams,
     ) -> dict[str, float]:
-        masked = []
-        for name, model_params, grads, step_flags in selected:
-            masks = self._dynamic_optimizer_padding_masks(name)
-            masked.append(
-                (
-                    name,
-                    model_params,
-                    tuple(
-                        grad.masked_fill(mask, 0)
-                        for grad, mask in zip(grads, masks, strict=True)
-                    ),
-                    step_flags,
-                )
+        padding_targets = []
+        for name, _model_params, grads, _step_flags in selected:
+            valid_ranges = self._dynamic_optimizer_valid_ranges(name)
+            padding_targets.extend(
+                (grad, ranges)
+                for grad, ranges in zip(grads, valid_ranges, strict=True)
+                if ranges is not None
             )
+        _zero_optimizer_padding(padding_targets)
         all_params = tuple(
-            param for _, slot_params, _, _ in masked for param in slot_params
+            param for _, slot_params, _, _ in selected for param in slot_params
         )
-        all_grads = tuple(grad for _, _, slot_grads, _ in masked for grad in slot_grads)
+        all_grads = tuple(
+            grad for _, _, slot_grads, _ in selected for grad in slot_grads
+        )
         grad_norm = _distributed_grad_norm(all_params, all_grads)
-        if not torch.isfinite(torch.tensor(grad_norm)):
+        if not math.isfinite(grad_norm):
             self.zero_grad()
             return {
                 "learning_rate": float(params.learning_rate),
@@ -2795,12 +2793,14 @@ class TrainerRank:
             if params.grad_clip_norm > 0.0
             else 1.0
         )
-        for name, model_params, grads, step_flags in masked:
+        if clip < 1.0:
+            torch._foreach_mul_(all_grads, clip)
+        for name, model_params, grads, step_flags in selected:
             dynamic = self._dynamic_optimizer(name, params)
             for master, grad, should_step in zip(
                 dynamic.master_params, grads, step_flags, strict=True
             ):
-                master.grad = grad.mul(clip) if should_step else None
+                master.grad = grad if should_step else None
             dynamic.optimizer.step()
             dynamic.optimizer.zero_grad(set_to_none=True)
             with torch.no_grad():
@@ -3022,17 +3022,22 @@ class TrainerRank:
         name: str,
         dynamic: _DynamicOptimizer,
     ) -> None:
-        masks = self._dynamic_optimizer_padding_masks(name)
-        with torch.no_grad():
-            for param, mask in zip(dynamic.master_params, masks, strict=True):
-                param.masked_fill_(mask, 0)
-                for value in dynamic.optimizer.state.get(param, {}).values():
-                    if isinstance(value, torch.Tensor) and value.shape == param.shape:
-                        value.masked_fill_(mask, 0)
+        valid_ranges = self._dynamic_optimizer_valid_ranges(name)
+        targets = []
+        for param, ranges in zip(dynamic.master_params, valid_ranges, strict=True):
+            if ranges is None:
+                continue
+            targets.append((param, ranges))
+            targets.extend(
+                (value, ranges)
+                for value in dynamic.optimizer.state.get(param, {}).values()
+                if isinstance(value, torch.Tensor) and value.shape == param.shape
+            )
+        _zero_optimizer_padding(targets)
 
-    def _prepared_optimizer_padding_masks(
+    def _prepared_optimizer_valid_ranges(
         self, checkpoint: "PreparedCheckpointSlotInstall"
-    ) -> tuple[torch.Tensor, ...]:
+    ) -> tuple[_OptimizerTensorValidRanges, ...]:
         params = checkpoint.parameters
         masks = tuple(torch.zeros_like(param, dtype=torch.bool) for param in params)
         indices = {id(param): index for index, param in enumerate(params)}
@@ -3078,11 +3083,13 @@ class TrainerRank:
                 masks[index].copy_(mask)
             else:
                 masks[index][expert].copy_(mask)
-        return masks
+        return tuple(_compact_optimizer_valid_ranges(mask) for mask in masks)
 
-    def _dynamic_optimizer_padding_masks(self, name: str) -> tuple[torch.Tensor, ...]:
+    def _dynamic_optimizer_valid_ranges(
+        self, name: str
+    ) -> tuple[_OptimizerTensorValidRanges, ...]:
         slot = self._checkpoint_slots[name]
-        if (cached := slot.optimizer_padding_masks) is not None:
+        if (cached := slot.optimizer_valid_ranges) is not None:
             return cached
         params = slot.params
         masks = tuple(torch.zeros_like(param, dtype=torch.bool) for param in params)
@@ -3150,9 +3157,10 @@ class TrainerRank:
                 masks[index].copy_(mask)
             else:
                 masks[index][expert].copy_(mask)
-        slot.optimizer_padding_masks = masks
+        valid_ranges = tuple(_compact_optimizer_valid_ranges(mask) for mask in masks)
+        slot.optimizer_valid_ranges = valid_ranges
         slot.invalidate_optimizer_residency()
-        return masks
+        return valid_ranges
 
     def _reduce_dynamic_grads(
         self,
@@ -4697,21 +4705,109 @@ def _dtype_size(dtype: torch.dtype) -> int:
     return torch.empty((), dtype=dtype).element_size()
 
 
+def _compact_optimizer_valid_ranges(
+    padding_mask: torch.Tensor,
+) -> _OptimizerTensorValidRanges:
+    if padding_mask.dtype != torch.bool:
+        raise TypeError("Optimizer padding masks must be boolean tensors.")
+    if not bool(padding_mask.any()):
+        return None
+    shape = tuple(padding_mask.shape)
+    for axis in range(padding_mask.ndim):
+        reduced_dims = tuple(dim for dim in range(padding_mask.ndim) if dim != axis)
+        axis_padding = (
+            padding_mask.any(dim=reduced_dims) if reduced_dims else padding_mask
+        )
+        broadcast_shape = [1] * padding_mask.ndim
+        broadcast_shape[axis] = int(padding_mask.shape[axis])
+        if not torch.equal(
+            padding_mask,
+            axis_padding.reshape(broadcast_shape).expand_as(padding_mask),
+        ):
+            continue
+        valid_ranges = []
+        start = None
+        for index, valid in enumerate((~axis_padding).tolist()):
+            if valid and start is None:
+                start = index
+            elif not valid and start is not None:
+                valid_ranges.append((start, index))
+                start = None
+        if start is not None:
+            valid_ranges.append((start, int(axis_padding.numel())))
+        return shape, axis, tuple(valid_ranges)
+    raise TrainerRankSlotStateError(
+        f"Optimizer padding for shape {shape} is not representable by ranges "
+        "along one tensor axis."
+    )
+
+
+def _optimizer_padding_views(
+    tensor: torch.Tensor,
+    valid_ranges: _OptimizerTensorValidRanges,
+) -> tuple[torch.Tensor, ...]:
+    if valid_ranges is None:
+        return ()
+    shape, axis, ranges = valid_ranges
+    if tuple(tensor.shape) != shape:
+        raise TrainerRankSlotStateError(
+            f"Optimizer padding shape changed from {shape} to {tuple(tensor.shape)}."
+        )
+    extent = int(shape[axis])
+    cursor = 0
+    padding = []
+    for start, end in ranges:
+        if not (cursor <= start < end <= extent):
+            raise TrainerRankSlotStateError(
+                f"Optimizer valid ranges {ranges} are invalid for shape {shape}."
+            )
+        if cursor < start:
+            padding.append(tensor.narrow(axis, cursor, start - cursor))
+        cursor = end
+    if cursor < extent:
+        padding.append(tensor.narrow(axis, cursor, extent - cursor))
+    return tuple(padding)
+
+
+def _zero_optimizer_padding(
+    targets: Iterable[tuple[torch.Tensor, _OptimizerTensorValidRanges]],
+) -> None:
+    padding = tuple(
+        view
+        for tensor, valid_ranges in targets
+        for view in _optimizer_padding_views(tensor, valid_ranges)
+    )
+    if padding:
+        with torch.no_grad():
+            torch._foreach_zero_(padding)
+
+
 def _distributed_grad_norm(
     params: Sequence[torch.nn.Parameter],
     grads: Sequence[torch.Tensor],
 ) -> float:
     if len(params) != len(grads):
         raise ValueError("params and grads must have matching lengths")
-    included = [
+    included = tuple(
         grad
         for param, grad in zip(params, grads, strict=True)
         if _include_in_distributed_grad_norm(param)
-    ]
+    )
     device = grads[0].device if grads else torch.device("cpu")
-    squared = torch.zeros((), device=device, dtype=torch.float32)
-    for grad in included:
-        squared.add_(grad.float().square().sum())
+    if any(
+        grad.dtype != torch.float32
+        or grad.device != device
+        or grad.layout != torch.strided
+        for grad in included
+    ):
+        raise TypeError(
+            "Distributed optimizer gradients must be dense FP32 tensors on one device."
+        )
+    if included:
+        norms = torch.stack(torch._foreach_norm(included, 2.0))
+        squared = torch.dot(norms, norms)
+    else:
+        squared = torch.zeros((), device=device, dtype=torch.float32)
     if dist.is_available() and dist.is_initialized():
         dist.all_reduce(squared, op=dist.ReduceOp.SUM)
     return float(torch.sqrt(squared).item())

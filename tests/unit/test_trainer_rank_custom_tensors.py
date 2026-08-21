@@ -740,7 +740,7 @@ def test_custom_parameters_join_slot_optimizer_with_replicated_metadata() -> Non
     assert all(getattr(param, "grad_sync_op") == "avg" for param in expected)
     assert all(buffer is not param for param in slot.params)
     assert all(
-        not mask.any() for mask in trainer._dynamic_optimizer_padding_masks("student")
+        ranges is None for ranges in trainer._dynamic_optimizer_valid_ranges("student")
     )
 
 

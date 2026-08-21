@@ -342,7 +342,7 @@ def test_dynamic_shared_factor_uses_dense_dp_cp_and_etp_groups(
 
 
 @pytest.mark.parametrize("shared_factor", ("A", "B"))
-def test_dynamic_optimizer_masks_use_active_slot_parameterization(
+def test_dynamic_optimizer_ranges_use_active_slot_parameterization(
     shared_factor: LoraFactor,
 ) -> None:
     from art.trainer_rank._impl import TrainerRank, _CheckpointSlot
@@ -369,20 +369,12 @@ def test_dynamic_optimizer_masks_use_active_slot_parameterization(
         parameters=(slot.A_T, slot.B_T),
         sites=((target, slot),),
     )
-    prepared_masks = trainer._prepared_optimizer_padding_masks(prepared)
-    assert [tuple(mask.shape) for mask in prepared_masks] == [
-        tuple(slot.A_T.shape),
-        tuple(slot.B_T.shape),
-    ]
-    assert not any(torch.count_nonzero(mask) for mask in prepared_masks)
+    prepared_ranges = trainer._prepared_optimizer_valid_ranges(prepared)
+    assert prepared_ranges == (None, None)
 
     target.install_lora_slot(slot)
     trainer._checkpoint_slots = {
         "optimizer": _CheckpointSlot(params=(slot.A_T, slot.B_T))
     }
-    installed_masks = trainer._dynamic_optimizer_padding_masks("optimizer")
-    assert [tuple(mask.shape) for mask in installed_masks] == [
-        tuple(slot.A_T.shape),
-        tuple(slot.B_T.shape),
-    ]
-    assert not any(torch.count_nonzero(mask) for mask in installed_masks)
+    installed_ranges = trainer._dynamic_optimizer_valid_ranges("optimizer")
+    assert installed_ranges == (None, None)

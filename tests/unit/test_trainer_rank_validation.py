@@ -1128,7 +1128,7 @@ def test_checkpoint_slot_adapter_config_rejects_cross_rank_mismatch(
         trainer._validate_checkpoint_adapter_config("student", None, alpha=None)
 
 
-def test_dynamic_optimizer_padding_masks_are_cached_per_loaded_slot() -> None:
+def test_dynamic_optimizer_valid_ranges_are_cached_per_loaded_slot() -> None:
     calls = 0
     runtime = _runtime()
 
@@ -1145,8 +1145,8 @@ def test_dynamic_optimizer_padding_masks_are_cached_per_loaded_slot() -> None:
         params=(torch.nn.Parameter(torch.ones(2)),)
     )
 
-    first = trainer._dynamic_optimizer_padding_masks("student")
-    second = trainer._dynamic_optimizer_padding_masks("student")
+    first = trainer._dynamic_optimizer_valid_ranges("student")
+    second = trainer._dynamic_optimizer_valid_ranges("student")
 
     assert first is second
     assert calls == 1

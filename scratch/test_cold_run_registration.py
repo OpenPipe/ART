@@ -321,12 +321,8 @@ def test_exact_optimizer_preparation_uses_no_installed_slot(
     )
     monkeypatch.setattr(
         trainer,
-        "_prepared_optimizer_padding_masks",
-        lambda candidate: (
-            (torch.zeros_like(parameter, dtype=torch.bool),)
-            if candidate is checkpoint
-            else ()
-        ),
+        "_prepared_optimizer_valid_ranges",
+        lambda candidate: (None,) if candidate is checkpoint else (),
     )
 
     prepared = trainer.prepare_checkpoint_slot_optimizer_for_residency(
