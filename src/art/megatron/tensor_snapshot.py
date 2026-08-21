@@ -116,6 +116,12 @@ class PinnedCpuSnapshotBuilder:
         self._sources.extend(sources)
         return tuple(outputs)
 
+    def fence_current_stream(self, device: int) -> None:
+        """Include caller-stream work in the pending snapshot mutation fence."""
+        stream = self._stager.stream(device)
+        stream.wait_stream(torch.cuda.current_stream(device))
+        self._devices.add(device)
+
     def finish(self, payload: _T) -> PendingCpuSnapshot[_T]:
         fence_started = time.perf_counter()
         fences: list[_CudaFence] = []

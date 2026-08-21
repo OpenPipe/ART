@@ -8,6 +8,7 @@ import time
 from types import ModuleType
 from typing import Any, Literal
 
+from pydantic import BaseModel, ConfigDict
 import pytest
 import torch
 import torch.multiprocessing as mp
@@ -35,13 +36,19 @@ sys.modules.setdefault(
 
 from art.distributed.object_store import OrderedBinaryObjectTarget, S3ObjectStoreConfig
 from art.megatron.lora import LoraShardMeta, _block_for_key
+from art.megatron.model_support.handlers.dsv4 import DSV4_HANDLER
+from art.megatron.model_support.handlers.gemma4 import GEMMA4_MOE_HANDLER
+from art.megatron.model_support.handlers.gpt_oss import GPT_OSS_MOE_HANDLER
 from art.megatron.model_support.handlers.qwen3_5 import QWEN3_5_MOE_HANDLER
 from art.megatron.model_support.lora_disk import (
     ART_LORA_FORMAT_CONFIG_KEY,
     ART_LORA_FORMAT_VLLM,
     encode_adapter_config,
 )
-from art.megatron.tensor_snapshot import PinnedCpuSnapshotStager
+from art.megatron.tensor_snapshot import (
+    PinnedCpuSnapshotBuilder,
+    PinnedCpuSnapshotStager,
+)
 from art.megatron.weights.lora_publish import (
     PackedExpertShardMeta,
     _canonical_global_metadata,
@@ -53,7 +60,39 @@ from art.megatron.weights.rank_distributed_lora_publish import (
 )
 from art.utils.safetensors import prepare_safetensors
 
-Case = Literal["regular", "packed", "shared_outer"]
+Case = Literal[
+    "qwen36_per_expert",
+    "qwen36_packed",
+    "qwen36_shared_outer",
+    "gpt_oss_per_expert",
+    "gpt_oss_packed",
+    "gemma4_per_expert",
+    "gemma4_packed",
+    "dsv4_per_expert",
+    "dsv4_packed",
+]
+CASES: tuple[Case, ...] = (
+    "qwen36_per_expert",
+    "qwen36_packed",
+    "qwen36_shared_outer",
+    "gpt_oss_per_expert",
+    "gpt_oss_packed",
+    "gemma4_per_expert",
+    "gemma4_packed",
+    "dsv4_per_expert",
+    "dsv4_packed",
+)
+
+
+class Fixture(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True, extra="forbid")
+
+    handler: Any
+    regular: dict[str, torch.Tensor]
+    regular_metadata: list[LoraShardMeta]
+    packed: dict[str, torch.Tensor]
+    packed_metadata: list[PackedExpertShardMeta]
+    adapter_config: dict[str, Any]
 
 
 def _tensor(shape: tuple[int, ...], seed: int, dtype: torch.dtype) -> torch.Tensor:
@@ -102,125 +141,188 @@ def _fixture(
     case: Case,
     rank: int,
     world_size: int,
-) -> tuple[
-    dict[str, torch.Tensor],
-    list[LoraShardMeta],
-    dict[str, torch.Tensor],
-    list[PackedExpertShardMeta],
-    dict[str, Any],
-]:
+    fixture_root: Path,
+) -> Fixture:
     regular: dict[str, torch.Tensor] = {}
     regular_meta: list[LoraShardMeta] = []
     packed: dict[str, torch.Tensor] = {}
     packed_meta: list[PackedExpertShardMeta] = []
     layers = max(4, world_size * 2)
-    if case == "regular":
-        for layer in range(layers):
-            prefix = f"base_model.model.model.layers.{layer}.self_attn"
-            replicated_key = f"{prefix}.q_proj.lora_A.weight"
-            replicated = _tensor((2, 3), layer * 100, torch.bfloat16)
-            regular[replicated_key] = replicated
-            regular_meta.append(
-                _regular_meta(
-                    replicated_key,
-                    replicated,
-                    rank,
-                    {"sharded": False, "shard_world_size": 1, "shard_rank": 0},
-                )
-            )
-            uniform_key = f"{prefix}.o_proj.lora_B.weight"
-            uniform = _tensor((2, 3), layer * 1000 + rank * 10, torch.float32)
-            regular[uniform_key] = uniform
-            regular_meta.append(
-                _regular_meta(
-                    uniform_key,
-                    uniform,
-                    rank,
-                    {
-                        "sharded": True,
-                        "shard_world_size": world_size,
-                        "shard_rank": rank,
-                        "export_shard_dim": 0,
-                        "export_shard_strategy": "uniform",
-                    },
-                )
-            )
-            component_key = f"{prefix}.k_proj.lora_B.weight"
-            component = _tensor((4, 3), layer * 10000 + rank * 100, torch.float16)
-            regular[component_key] = component
-            regular_meta.append(
-                _regular_meta(
-                    component_key,
-                    component,
-                    rank,
-                    {
-                        "sharded": True,
-                        "shard_world_size": world_size,
-                        "shard_rank": rank,
-                        "export_shard_dim": 0,
-                        "export_shard_strategy": "componentwise",
-                        "component_sizes": [2 * world_size, 2 * world_size],
-                    },
-                )
-            )
-        config = {
-            "r": 2,
-            "lora_alpha": 4,
-            "target_modules": ["q_proj", "o_proj", "k_proj"],
+    if case.endswith("_per_expert"):
+        family, mode = case.removesuffix("_per_expert"), "per_expert"
+    elif case.endswith("_shared_outer"):
+        family, mode = case.removesuffix("_shared_outer"), "shared_outer"
+    else:
+        family, mode = case.removesuffix("_packed"), "packed"
+    if family == "qwen36":
+        handler = QWEN3_5_MOE_HANDLER
+        hidden, intermediate = 3, 4
+        attention = ("q_proj", "o_proj", "k_proj")
+        base_model = "Qwen/Qwen3.6-35B-A3B"
+        extra_config = {
+            "num_attention_heads": 2,
+            "num_key_value_heads": 1,
+            "head_dim": 3,
         }
-        return regular, regular_meta, packed, packed_meta, config
+        gate_layout = "rank_major_expert_cols"
+    elif family == "gpt_oss":
+        handler = GPT_OSS_MOE_HANDLER
+        hidden, intermediate = 128, 1024
+        attention = ("q_proj", "o_proj", "k_proj")
+        base_model = str(fixture_root / "gpt_oss")
+        extra_config = {}
+        gate_layout = "interleaved_gate_up_rank_major_expert_cols"
+    elif family == "gemma4":
+        handler = GEMMA4_MOE_HANDLER
+        hidden, intermediate = 6, 128
+        attention = ("k_proj", "o_proj", "q_proj")
+        base_model = str(fixture_root / "gemma4")
+        extra_config = {}
+        gate_layout = "rank_major_expert_cols"
+    else:
+        handler = DSV4_HANDLER
+        hidden, intermediate = 3, 4
+        attention = ("q_a_proj", "o_a_proj", "kv_proj")
+        base_model = "deepseek-ai/DeepSeek-V4-Flash"
+        extra_config = {}
+        gate_layout = "rank_major_expert_cols"
 
+    replicated_manifest = {
+        "sharded": False,
+        "shard_world_size": 1,
+        "shard_rank": 0,
+    }
     for layer in range(layers):
-        prefix = f"base_model.model.model.layers.{layer}.mlp.experts"
-        slots = (
-            ("base_layer.lora_B.weight", (2, 6, 2), "rank_major_expert_cols"),
-            ("lora_A.weight", (2, 2, 5), "expert_rows"),
+        layer_prefix = f"base_model.model.model.layers.{layer}"
+        attention_prefix = f"{layer_prefix}.self_attn"
+        q_key = f"{attention_prefix}.{attention[0]}.lora_A.weight"
+        q = _tensor((2, hidden), layer * 100, torch.bfloat16)
+        regular[q_key] = q
+        regular_meta.append(_regular_meta(q_key, q, rank, replicated_manifest))
+        q_b_rows = 12 if family == "qwen36" else hidden
+        q_b_key = f"{attention_prefix}.{attention[0]}.lora_B.weight"
+        q_b = _tensor((q_b_rows, 2), layer * 100 + 20, torch.float32)
+        regular[q_b_key] = q_b
+        regular_meta.append(_regular_meta(q_b_key, q_b, rank, replicated_manifest))
+
+        uniform_key = f"{attention_prefix}.{attention[1]}.lora_B.weight"
+        uniform = _tensor((2, 2), layer * 1000 + rank * 10, torch.float16)
+        regular[uniform_key] = uniform
+        regular_meta.append(
+            _regular_meta(
+                uniform_key,
+                uniform,
+                rank,
+                {
+                    "sharded": True,
+                    "shard_world_size": world_size,
+                    "shard_rank": rank,
+                    "export_shard_dim": 0,
+                    "export_shard_strategy": "uniform",
+                },
+            )
         )
-        if case == "packed":
-            slots += (
-                ("base_layer.lora_A.weight", (2, 2, 5), "expert_rows"),
-                ("lora_B.weight", (2, 5, 2), "rank_major_expert_cols"),
+        component_key = f"{attention_prefix}.{attention[2]}.lora_B.weight"
+        component = _tensor((4, 2), layer * 10000 + rank * 100, torch.float16)
+        regular[component_key] = component
+        regular_meta.append(
+            _regular_meta(
+                component_key,
+                component,
+                rank,
+                {
+                    "sharded": True,
+                    "shard_world_size": world_size,
+                    "shard_rank": rank,
+                    "export_shard_dim": 0,
+                    "export_shard_strategy": "componentwise",
+                    "component_sizes": [2 * world_size, 2 * world_size],
+                },
             )
-        for slot, shape, layout in slots:
-            key = f"{prefix}.{slot}"
-            value = _tensor(shape, layer * 10000 + rank * 1000, torch.bfloat16)
-            packed[key] = value
-            packed_meta.append(
-                _packed_meta(
-                    key,
-                    value,
-                    rank,
-                    expert_start=rank * 2,
-                    layout=layout,
+        )
+
+        expert_prefix = f"{layer_prefix}.mlp.experts"
+        if mode == "per_expert":
+            for expert in range(rank * 2, rank * 2 + 2):
+                for module, lora, shape in (
+                    ("gate_up_proj", "lora_A", (2, hidden)),
+                    ("gate_up_proj", "lora_B", (2 * intermediate, 2)),
+                    ("down_proj", "lora_A", (2, intermediate)),
+                    ("down_proj", "lora_B", (hidden, 2)),
+                ):
+                    key = f"{expert_prefix}.{expert}.{module}.{lora}.weight"
+                    value = _tensor(
+                        shape,
+                        layer * 100_000 + expert * 1_000 + len(regular),
+                        torch.bfloat16,
+                    )
+                    regular[key] = value
+                    regular_meta.append(
+                        _regular_meta(key, value, rank, replicated_manifest)
+                    )
+        else:
+            slots = (
+                ("base_layer.lora_B.weight", (2, 2 * intermediate, 2), gate_layout),
+                ("lora_A.weight", (2, 2, intermediate), "expert_rows"),
+            )
+            if mode == "packed":
+                slots += (
+                    ("base_layer.lora_A.weight", (2, 2, hidden), "expert_rows"),
+                    (
+                        "lora_B.weight",
+                        (2, hidden, 2),
+                        "rank_major_expert_cols",
+                    ),
                 )
-            )
-        if case == "shared_outer":
-            for module, lora, shape in (
-                ("gate_up_proj", "lora_A", (2, 5)),
-                ("down_proj", "lora_B", (5, 2)),
-            ):
-                key = f"{prefix}.shared.{module}.{lora}.weight"
-                value = _tensor(shape, layer * 100, torch.bfloat16)
-                regular[key] = value
-                regular_meta.append(
-                    _regular_meta(
+            for slot, shape, layout in slots:
+                key = f"{expert_prefix}.{slot}"
+                value = _tensor(
+                    shape,
+                    layer * 100_000 + rank * 1_000 + len(packed),
+                    torch.bfloat16,
+                )
+                packed[key] = value
+                packed_meta.append(
+                    _packed_meta(
                         key,
                         value,
                         rank,
-                        {
-                            "sharded": False,
-                            "shard_world_size": 1,
-                            "shard_rank": 0,
-                        },
+                        expert_start=rank * 2,
+                        layout=layout,
                     )
                 )
+            if mode == "shared_outer":
+                for module, lora, shape in (
+                    ("gate_up_proj", "lora_A", (2, hidden)),
+                    ("down_proj", "lora_B", (hidden, 2)),
+                ):
+                    key = f"{expert_prefix}.shared.{module}.{lora}.weight"
+                    value = _tensor(shape, layer * 100 + len(regular), torch.bfloat16)
+                    regular[key] = value
+                    regular_meta.append(
+                        _regular_meta(key, value, rank, replicated_manifest)
+                    )
+
+    target_modules = [*attention, "gate_proj", "up_proj", "down_proj"]
     config = {
+        "base_model_name_or_path": base_model,
         "r": 2,
         "lora_alpha": 4,
-        "target_modules": ["gate_up_proj", "down_proj"],
-        **({"moe_parameterization": "shared_outer"} if case == "shared_outer" else {}),
+        "target_modules": target_modules,
+        "bias": "none",
+        "moe_parameterization": (
+            "shared_outer" if mode == "shared_outer" else "per_expert"
+        ),
+        **extra_config,
     }
-    return regular, regular_meta, packed, packed_meta, config
+    return Fixture(
+        handler=handler,
+        regular=regular,
+        regular_metadata=regular_meta,
+        packed=packed,
+        packed_metadata=packed_meta,
+        adapter_config=config,
+    )
 
 
 def _target(case: Case, world_size: int) -> OrderedBinaryObjectTarget:
@@ -233,9 +335,7 @@ def _target(case: Case, world_size: int) -> OrderedBinaryObjectTarget:
     )
     return OrderedBinaryObjectTarget(
         store=store,
-        object_id=f"{world_size}{'123'[('regular', 'packed', 'shared_outer').index(case)]}".ljust(
-            64, "0"
-        ),
+        object_id=f"{world_size:02x}{CASES.index(case):02x}".ljust(64, "0"),
         format="vllm_lora",
         shard_bytes=37,
         max_concurrent_shards=16,
@@ -255,6 +355,7 @@ def _old_rank0_bytes(
     regular_meta: list[LoraShardMeta],
     packed: dict[str, torch.Tensor],
     packed_meta: list[PackedExpertShardMeta],
+    handler: Any,
     config: dict[str, Any],
     rank: int,
 ) -> tuple[dict[str, bytes] | None, int]:
@@ -285,7 +386,7 @@ def _old_rank0_bytes(
         packed_expert_metadata=canonical_packed,
         packed_expert_tensors_by_owner_key=old_packed,
     )
-    converted, published_config = QWEN3_5_MOE_HANDLER.to_vllm_lora_tensors(
+    converted, published_config = handler.to_vllm_lora_tensors(
         merged,
         adapter_config=dict(config),
     )
@@ -322,18 +423,22 @@ def _assert_new_bytes(
     assert {key: bytes(value) for key, value in actual.items()} == expected
 
 
-def _run_case(case: Case, rank: int, world_size: int) -> dict[str, Any] | None:
-    regular, regular_meta, packed, packed_meta, config = _fixture(
-        case, rank, world_size
-    )
+def _run_case(
+    case: Case,
+    rank: int,
+    world_size: int,
+    fixture_root: Path,
+) -> dict[str, Any] | None:
+    fixture = _fixture(case, rank, world_size, fixture_root)
     torch.distributed.barrier()
     old_started = time.perf_counter()
     expected, old_source_bytes = _old_rank0_bytes(
-        regular,
-        regular_meta,
-        packed,
-        packed_meta,
-        config,
+        fixture.regular,
+        fixture.regular_metadata,
+        fixture.packed,
+        fixture.packed_metadata,
+        fixture.handler,
+        fixture.adapter_config,
         rank,
     )
     torch.distributed.barrier()
@@ -341,12 +446,13 @@ def _run_case(case: Case, rank: int, world_size: int) -> dict[str, Any] | None:
     new_started = time.perf_counter()
     prepared = prepare_rank_distributed_vllm_lora(
         target=_target(case, world_size),
-        local_tensors=regular,
-        local_metadata=regular_meta,
-        local_packed_tensors=packed,
-        local_packed_metadata=packed_meta,
-        handler=QWEN3_5_MOE_HANDLER,
-        adapter_config=config,
+        local_tensors=fixture.regular,
+        local_metadata=fixture.regular_metadata,
+        local_packed_tensors=fixture.packed,
+        local_packed_metadata=fixture.packed_metadata,
+        handler=fixture.handler,
+        adapter_config=fixture.adapter_config,
+        conversion_group_for_key=_block_for_key,
         exchange_device=torch.device("cpu"),
         stager=PinnedCpuSnapshotStager(),
     ).resolve()
@@ -372,6 +478,40 @@ def _run_case(case: Case, rank: int, world_size: int) -> dict[str, Any] | None:
     assert all(value is not None for value in stats)
     assert all(value is not None for value in timings)
     _assert_new_bytes(expected, prepared, [value or {} for value in gathered_payloads])
+    published_config = json.loads(expected["adapter_config.json"])
+    expected_targets = {
+        "qwen36": ["q_proj", "o_proj", "k_proj", "experts"],
+        "gpt_oss": ["q_proj", "o_proj", "k_proj", "experts"],
+        "gemma4": [
+            "k_proj",
+            "o_proj",
+            "q_proj",
+            "gate_proj",
+            "up_proj",
+            "down_proj",
+            "experts",
+        ],
+        "dsv4": [
+            "fused_wqa_wkv",
+            "wo_a",
+            "gate_up_proj",
+            "experts",
+            "down_proj",
+        ],
+    }
+    family = next(name for name in expected_targets if case.startswith(name))
+    assert published_config["target_modules"] == expected_targets[family]
+    assert published_config["moe_parameterization"] == (
+        "shared_outer" if case.endswith("shared_outer") else "per_expert"
+    )
+    assert published_config[ART_LORA_FORMAT_CONFIG_KEY] == ART_LORA_FORMAT_VLLM
+    if family == "gemma4":
+        names = {tensor.name for tensor in prepared.layout.tensors}
+        assert any(".v_proj." in name for name in names)
+    if case == "qwen36_shared_outer":
+        assert not any(
+            ".shared." in tensor.name for tensor in prepared.layout.tensors
+        )
     typed_stats = [value for value in stats if value is not None]
     typed_timings = [value for value in timings if value is not None]
     global_output_bytes = sum(tensor.byte_count for tensor in prepared.layout.tensors)
@@ -410,6 +550,7 @@ def _worker(
     world_size: int,
     rendezvous: str,
     report_path: str,
+    fixture_root: str,
 ) -> None:
     torch.distributed.init_process_group(
         "gloo",
@@ -420,8 +561,11 @@ def _worker(
     try:
         reports = [
             report
-            for case in ("regular", "packed", "shared_outer")
-            if (report := _run_case(case, rank, world_size)) is not None
+            for case in CASES
+            if (
+                report := _run_case(case, rank, world_size, Path(fixture_root))
+            )
+            is not None
         ]
         if rank == 0:
             Path(report_path).write_text(json.dumps(reports, indent=2) + "\n")
@@ -434,19 +578,137 @@ def test_rank_distributed_lora_matches_current_rank0_bytes(
     tmp_path: Path,
     world_size: int,
 ) -> None:
+    fixture_root = tmp_path / "models"
+    (fixture_root / "gpt_oss").mkdir(parents=True)
+    (fixture_root / "gpt_oss" / "config.json").write_text(
+        json.dumps({"hidden_size": 128, "intermediate_size": 128})
+    )
+    (fixture_root / "gemma4").mkdir()
+    (fixture_root / "gemma4" / "config.json").write_text(
+        json.dumps(
+            {
+                "text_config": {
+                    "enable_moe_block": True,
+                    "hidden_size": 6,
+                    "moe_intermediate_size": 4,
+                    "attention_k_eq_v": True,
+                    "layer_types": ["full_attention"] * max(4, world_size * 2),
+                }
+            }
+        )
+    )
     mp.spawn(
         _worker,
         args=(
             world_size,
             str(tmp_path / f"gloo-{world_size}"),
             str(tmp_path / f"report-{world_size}.json"),
+            str(fixture_root),
         ),
         nprocs=world_size,
         join=True,
     )
     reports = json.loads((tmp_path / f"report-{world_size}.json").read_text())
-    assert {report["case"] for report in reports} == {
-        "regular",
-        "packed",
-        "shared_outer",
-    }
+    assert {report["case"] for report in reports} == set(CASES)
+
+
+def _contract_worker(
+    rank: int,
+    rendezvous: str,
+    report_path: str,
+) -> None:
+    world_size = 2
+    torch.distributed.init_process_group(
+        "gloo",
+        init_method=f"file://{rendezvous}",
+        rank=rank,
+        world_size=world_size,
+    )
+    try:
+        fixture = _fixture(
+            "qwen36_per_expert",
+            rank,
+            world_size,
+            Path(report_path).parent,
+        )
+        target = _target("qwen36_per_expert", world_size)
+        if rank:
+            target = target.model_copy(update={"object_id": "f" * 64})
+        with pytest.raises(
+            RuntimeError,
+            match="publication calls are inconsistent",
+        ):
+            prepare_rank_distributed_vllm_lora(
+                target=target,
+                local_tensors=fixture.regular,
+                local_metadata=fixture.regular_metadata,
+                local_packed_tensors=fixture.packed,
+                local_packed_metadata=fixture.packed_metadata,
+                handler=fixture.handler,
+                adapter_config=fixture.adapter_config,
+                conversion_group_for_key=_block_for_key,
+                exchange_device=torch.device("cpu"),
+                stager=PinnedCpuSnapshotStager(),
+            )
+        with pytest.raises(
+            RuntimeError,
+            match="dependency groups differ across ranks",
+        ):
+            prepare_rank_distributed_vllm_lora(
+                target=_target("qwen36_per_expert", world_size),
+                local_tensors=fixture.regular,
+                local_metadata=fixture.regular_metadata,
+                local_packed_tensors=fixture.packed,
+                local_packed_metadata=fixture.packed_metadata,
+                handler=fixture.handler,
+                adapter_config=fixture.adapter_config,
+                conversion_group_for_key=(
+                    _block_for_key
+                    if rank == 0
+                    else lambda key: f"rank-1:{_block_for_key(key)}"
+                ),
+                exchange_device=torch.device("cpu"),
+                stager=PinnedCpuSnapshotStager(),
+            )
+        if rank == 0:
+            Path(report_path).write_text("ok\n")
+    finally:
+        torch.distributed.destroy_process_group()
+
+
+def test_rank_distributed_lora_rejects_collective_ordering_mismatch(
+    tmp_path: Path,
+) -> None:
+    report_path = tmp_path / "contract-ok"
+    mp.spawn(
+        _contract_worker,
+        args=(str(tmp_path / "gloo-contract"), str(report_path)),
+        nprocs=2,
+        join=True,
+    )
+    assert report_path.read_text() == "ok\n"
+
+
+def test_snapshot_fence_waits_for_caller_stream(monkeypatch: pytest.MonkeyPatch) -> None:
+    caller_stream = object()
+
+    class Stream:
+        waited_for: object | None = None
+
+        def wait_stream(self, stream: object) -> None:
+            self.waited_for = stream
+
+    class Stager:
+        stream_value = Stream()
+
+        def stream(self, device: int) -> Stream:
+            assert device == 3
+            return self.stream_value
+
+    stager = Stager()
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda _device: caller_stream)
+    builder = PinnedCpuSnapshotBuilder(stager)  # type: ignore[arg-type]
+    builder.fence_current_stream(3)
+
+    assert stager.stream_value.waited_for is caller_stream
+    assert builder._devices == {3}

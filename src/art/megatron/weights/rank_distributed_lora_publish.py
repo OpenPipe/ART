@@ -1,5 +1,5 @@
 from collections import defaultdict
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 import json
 import math
 import struct
@@ -19,7 +19,7 @@ from art.distributed.object_store import (
     StoredOrderedBinaryObjectShard,
     ordered_binary_object_ref_from_plan,
 )
-from art.megatron.lora import LoraShardMeta, _block_for_key
+from art.megatron.lora import LoraShardMeta
 from art.megatron.model_support.lora_disk import (
     ART_LORA_FORMAT_CONFIG_KEY,
     ART_LORA_FORMAT_VLLM,
@@ -155,6 +155,16 @@ class RankDistributedLoraStats(BaseModel):
     owned_block_count: int = Field(ge=0)
 
 
+class RankDistributedLoraCallContract(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    target: OrderedBinaryObjectTarget
+    handler_key: str = Field(min_length=1)
+    adapter_config: bytes = Field(min_length=1)
+    coordinator_rank: int = Field(ge=0)
+    exchange_device_type: Literal["cpu", "cuda"]
+
+
 class PreparedRankDistributedLora(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True, extra="forbid", frozen=True)
 
@@ -233,8 +243,40 @@ def _dtype_from_name(name: str) -> torch.dtype:
     return dtype
 
 
-def _metadata_block(meta: LoraShardMeta | PackedExpertShardMeta) -> str:
-    return meta.block if isinstance(meta, LoraShardMeta) else _block_for_key(meta.key)
+def _validate_call_contract(
+    *,
+    target: OrderedBinaryObjectTarget,
+    handler: Any,
+    adapter_config: dict[str, Any],
+    coordinator_rank: int,
+    exchange_device: torch.device,
+    world_size: int,
+    group: Any | None,
+) -> None:
+    contract = RankDistributedLoraCallContract(
+        target=target,
+        handler_key=str(getattr(handler, "key", "")),
+        adapter_config=encode_adapter_config(adapter_config),
+        coordinator_rank=coordinator_rank,
+        exchange_device_type=exchange_device.type,
+    )
+    gathered: list[RankDistributedLoraCallContract | None] = [None] * world_size
+    if world_size == 1:
+        gathered[0] = contract
+    else:
+        torch.distributed.all_gather_object(gathered, contract, group=group)  # type: ignore[possibly-missing-attribute]
+    if any(value != contract for value in gathered):
+        raise RuntimeError("rank-distributed LoRA publication calls are inconsistent")
+
+
+def _metadata_group(
+    meta: LoraShardMeta | PackedExpertShardMeta,
+    conversion_group_for_key: Callable[[str], str],
+) -> str:
+    group = conversion_group_for_key(meta.key)
+    if not group:
+        raise ValueError(f"LoRA conversion dependency group is empty: {meta.key}")
+    return group
 
 
 def _metadata_identity(
@@ -298,18 +340,49 @@ def _gather_candidates(
     return {identity: tuple(entries) for identity, entries in candidates.items()}
 
 
+def _validated_conversion_groups(
+    candidates: dict[
+        tuple[str, str, int, int],
+        tuple[LoraShardMeta | PackedExpertShardMeta, ...],
+    ],
+    conversion_group_for_key: Callable[[str], str],
+    *,
+    world_size: int,
+    group: Any | None,
+) -> dict[str, str]:
+    groups: dict[str, str] = {}
+    for entries in candidates.values():
+        key = entries[0].key
+        value = conversion_group_for_key(key)
+        if not value:
+            raise ValueError(f"LoRA conversion dependency group is empty: {key}")
+        previous = groups.setdefault(key, value)
+        if previous != value:
+            raise RuntimeError(f"LoRA conversion dependency group changed: {key}")
+    canonical = tuple(sorted(groups.items()))
+    gathered: list[tuple[tuple[str, str], ...] | None] = [None] * world_size
+    if world_size == 1:
+        gathered[0] = canonical
+    else:
+        torch.distributed.all_gather_object(gathered, canonical, group=group)  # type: ignore[possibly-missing-attribute]
+    if any(value != canonical for value in gathered):
+        raise RuntimeError("LoRA conversion dependency groups differ across ranks")
+    return groups
+
+
 def _assign_blocks(
     candidates: dict[
         tuple[str, str, int, int],
         tuple[LoraShardMeta | PackedExpertShardMeta, ...],
     ],
     world_size: int,
+    conversion_group_for_key: Callable[[str], str],
 ) -> dict[str, int]:
     costs: dict[str, int] = defaultdict(int)
     local_bytes: dict[str, dict[int, int]] = defaultdict(lambda: defaultdict(int))
     for entries in candidates.values():
         meta = entries[0]
-        block = _metadata_block(meta)
+        block = _metadata_group(meta, conversion_group_for_key)
         byte_count = _metadata_bytes(meta)
         costs[block] += byte_count
         for candidate in entries:
@@ -331,12 +404,15 @@ def _canonical_sources(
         tuple[LoraShardMeta | PackedExpertShardMeta, ...],
     ],
     block_owners: dict[str, int],
+    conversion_group_for_key: Callable[[str], str],
 ) -> tuple[list[LoraShardMeta], list[PackedExpertShardMeta]]:
     regular: list[LoraShardMeta] = []
     packed: list[PackedExpertShardMeta] = []
     for identity in sorted(candidates):
         entries = candidates[identity]
-        destination = block_owners[_metadata_block(entries[0])]
+        destination = block_owners[
+            _metadata_group(entries[0], conversion_group_for_key)
+        ]
         selected = next(
             (entry for entry in entries if entry.owner_rank == destination),
             min(entries, key=lambda entry: entry.owner_rank),
@@ -355,8 +431,6 @@ def _validate_local_tensors(
     if set(tensors) != {meta.key for meta in metadata}:
         raise ValueError("local LoRA tensors and metadata differ")
     for meta in metadata:
-        if isinstance(meta, LoraShardMeta) and meta.block != _block_for_key(meta.key):
-            raise ValueError(f"LoRA conversion block differs from its key: {meta.key}")
         tensor = tensors[meta.key]
         if (
             tensor.device != device
@@ -376,12 +450,13 @@ def _exchange_to_block_owners(
     world_size: int,
     group: Any | None,
     device: torch.device,
+    conversion_group_for_key: Callable[[str], str],
 ) -> tuple[dict[tuple[int, str], torch.Tensor], int, int]:
     received: dict[tuple[int, str], torch.Tensor] = {}
     sent_bytes = 0
     received_bytes = 0
     sort_key = lambda meta: (
-        _metadata_block(meta),
+        _metadata_group(meta, conversion_group_for_key),
         meta.key,
         int(getattr(meta, "expert_start", -1)),
         int(meta.manifest.get("shard_rank", 0)),
@@ -390,10 +465,12 @@ def _exchange_to_block_owners(
         dtype = _dtype_from_name(dtype_name)
         typed = [meta for meta in metadata if meta.dtype_name == dtype_name]
         remote = any(
-            meta.owner_rank != block_owners[_metadata_block(meta)] for meta in typed
+            meta.owner_rank
+            != block_owners[_metadata_group(meta, conversion_group_for_key)]
+            for meta in typed
         )
         for meta in typed:
-            destination = block_owners[_metadata_block(meta)]
+            destination = block_owners[_metadata_group(meta, conversion_group_for_key)]
             if meta.owner_rank == rank == destination:
                 received[(rank, meta.key)] = local_tensors[meta.key]
         if not remote:
@@ -404,7 +481,10 @@ def _exchange_to_block_owners(
                     meta
                     for meta in typed
                     if meta.owner_rank == rank
-                    and block_owners[_metadata_block(meta)] == destination
+                    and block_owners[
+                        _metadata_group(meta, conversion_group_for_key)
+                    ]
+                    == destination
                     and destination != rank
                 ],
                 key=sort_key,
@@ -417,7 +497,10 @@ def _exchange_to_block_owners(
                     meta
                     for meta in typed
                     if meta.owner_rank == source
-                    and block_owners[_metadata_block(meta)] == rank
+                    and block_owners[
+                        _metadata_group(meta, conversion_group_for_key)
+                    ]
+                    == rank
                     and source != rank
                 ],
                 key=sort_key,
@@ -469,6 +552,7 @@ def _merge_owned_blocks(
     rank: int,
     handler: Any,
     adapter_config: dict[str, Any],
+    conversion_group_for_key: Callable[[str], str],
 ) -> tuple[dict[str, torch.Tensor], list[dict[str, Any]], int, int]:
     output: dict[str, torch.Tensor] = {}
     configs: list[dict[str, Any]] = []
@@ -480,7 +564,11 @@ def _merge_owned_blocks(
     )
     peak_accounted_bytes = retained_input_bytes
     for block in owned_blocks:
-        block_regular = [meta for meta in regular if _metadata_block(meta) == block]
+        block_regular = [
+            meta
+            for meta in regular
+            if _metadata_group(meta, conversion_group_for_key) == block
+        ]
         entries: dict[str, list[tuple[dict[str, Any], torch.Tensor]]] = defaultdict(
             list
         )
@@ -489,7 +577,11 @@ def _merge_owned_blocks(
                 (meta.manifest, regular_tensors[(meta.owner_rank, meta.key)])
             )
         merged = merge_sharded_adapter_entries(dict(entries))
-        block_packed = [meta for meta in packed if _metadata_block(meta) == block]
+        block_packed = [
+            meta
+            for meta in packed
+            if _metadata_group(meta, conversion_group_for_key) == block
+        ]
         if block_packed:
             merged_packed = merge_packed_expert_adapter_entries(
                 block_packed,
@@ -763,22 +855,27 @@ def prepare_rank_distributed_vllm_lora(
     local_packed_metadata: Sequence[PackedExpertShardMeta],
     handler: Any,
     adapter_config: dict[str, Any],
+    conversion_group_for_key: Callable[[str], str],
     group: Any | None = None,
     coordinator_rank: int = 0,
     exchange_device: torch.device,
     stager: PinnedCpuSnapshotStager,
 ) -> PendingCpuSnapshot[PreparedRankDistributedLora]:
-    """Gather complete layer conversion groups and prepare rank-owned L2 ranges.
+    """Gather declared conversion dependency groups and prepare rank-owned L2 ranges.
 
     The supplied tensors retain current global-rank metadata and must remain immutable
     through owner exchange and conversion. A NCCL caller may invoke this on a side
     stream after its snapshot-ready event; it must register the returned pending
-    snapshot before allowing the optimizer to mutate the source weights.
+    snapshot before allowing the optimizer to mutate the source weights. The required
+    grouping callable is part of the handler contract: every key jointly needed for
+    converted tensors or a returned config decision must map to the same group.
     """
     rank, world_size = _rank_world(group)
     exchange_device = torch.device(exchange_device)
     if exchange_device.type == "cuda" and exchange_device.index is None:
         exchange_device = torch.device("cuda", torch.cuda.current_device())
+    if exchange_device.type not in {"cpu", "cuda"}:
+        raise ValueError(f"unsupported LoRA exchange device: {exchange_device.type}")
     if coordinator_rank >= world_size:
         raise ValueError("LoRA publication coordinator leaves its world")
     if world_size > 1:
@@ -789,6 +886,15 @@ def prepare_rank_distributed_vllm_lora(
                 "LoRA exchange device must match its distributed backend: "
                 f"device={exchange_device.type} backend={backend}"
             )
+    _validate_call_contract(
+        target=target,
+        handler=handler,
+        adapter_config=adapter_config,
+        coordinator_rank=coordinator_rank,
+        exchange_device=exchange_device,
+        world_size=world_size,
+        group=group,
+    )
     local_metadata = _normalize_local_owners(
         local_metadata,
         rank=rank,
@@ -822,8 +928,23 @@ def prepare_rank_distributed_vllm_lora(
         raise RuntimeError("regular and packed LoRA identities overlap")
     if not candidates:
         raise RuntimeError("rank-distributed LoRA publication has no tensors")
-    block_owners = _assign_blocks(candidates, world_size)
-    regular, packed = _canonical_sources(candidates, block_owners)
+    conversion_groups = _validated_conversion_groups(
+        candidates,
+        conversion_group_for_key,
+        world_size=world_size,
+        group=group,
+    )
+    conversion_group_for_key = conversion_groups.__getitem__
+    block_owners = _assign_blocks(
+        candidates,
+        world_size,
+        conversion_group_for_key,
+    )
+    regular, packed = _canonical_sources(
+        candidates,
+        block_owners,
+        conversion_group_for_key,
+    )
     exchanged_regular, sent_regular, received_regular = _exchange_to_block_owners(
         regular,
         local_tensors,
@@ -832,6 +953,7 @@ def prepare_rank_distributed_vllm_lora(
         world_size=world_size,
         group=group,
         device=exchange_device,
+        conversion_group_for_key=conversion_group_for_key,
     )
     exchanged_packed, sent_packed, received_packed = _exchange_to_block_owners(
         packed,
@@ -841,6 +963,7 @@ def prepare_rank_distributed_vllm_lora(
         world_size=world_size,
         group=group,
         device=exchange_device,
+        conversion_group_for_key=conversion_group_for_key,
     )
     output, local_configs, owned_block_count, peak_accounted_owner_bytes = (
         _merge_owned_blocks(
@@ -852,6 +975,7 @@ def prepare_rank_distributed_vllm_lora(
             rank=rank,
             handler=handler,
             adapter_config=adapter_config,
+            conversion_group_for_key=conversion_group_for_key,
         )
     )
     published_config = _published_config(
@@ -888,6 +1012,10 @@ def prepare_rank_distributed_vllm_lora(
         if exchange_device.type == "cuda"
         else output
     )
+    if exchange_device.type == "cuda":
+        if exchange_device.index is None:
+            raise RuntimeError("CUDA LoRA exchange device has no index")
+        builder.fence_current_stream(exchange_device.index)
     prepared = PreparedRankDistributedLora(
         layout=layout,
         rank=rank,
