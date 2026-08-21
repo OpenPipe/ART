@@ -22,6 +22,7 @@ from art.serverless.client import (
     RemoteTrainingOperationCancelled,
     RemoteTrainingServiceClient,
     _ByteBudget,
+    _ResultAcknowledger,
 )
 from art.serverless.contracts import (
     FORWARD_BACKWARD_PREPARED_EVENT,
@@ -58,6 +59,23 @@ from art.training.contracts import (
     TokenizedTrainingBatch,
 )
 from art.training.tokenized import TokenizedDatum
+
+
+@pytest.mark.asyncio
+async def test_result_acknowledger_isolates_failed_results() -> None:
+    attempts: list[str] = []
+
+    async def acknowledge(_run_id: str, operation_id: str) -> None:
+        attempts.append(operation_id)
+        if operation_id == "failed":
+            raise RuntimeError("failed acknowledgement")
+
+    acknowledger = _ResultAcknowledger(acknowledge)
+    await acknowledger.submit("run", "failed")
+    await acknowledger.submit("run", "succeeded")
+    with pytest.raises(RemoteTrainingError, match=r"failed for 1 result"):
+        await acknowledger.close()
+    assert attempts == ["failed", "succeeded"]
 
 
 def _operation_id(run_id: str, request_id: str) -> str:

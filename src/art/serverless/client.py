@@ -188,13 +188,10 @@ class _ResultAcknowledger:
         self._queue: asyncio.Queue[tuple[str, str] | None] = asyncio.Queue(max_pending)
         self._worker: asyncio.Task[None] | None = None
         self._failure: BaseException | None = None
+        self._failure_count = 0
         self._closed = False
 
     async def submit(self, run_id: str, operation_id: str) -> None:
-        if self._failure is not None:
-            raise RemoteTrainingError("remote result acknowledgement failed") from (
-                self._failure
-            )
         if self._closed:
             raise RemoteTrainingError("remote result acknowledger is closed")
         if self._worker is None:
@@ -210,9 +207,10 @@ class _ResultAcknowledger:
                 await self._queue.put(None)
                 await self._worker
         if self._failure is not None:
-            raise RemoteTrainingError("remote result acknowledgement failed") from (
-                self._failure
-            )
+            raise RemoteTrainingError(
+                "remote result acknowledgement failed for "
+                f"{self._failure_count} result(s)"
+            ) from self._failure
 
     async def _run(self) -> None:
         while True:
@@ -221,12 +219,9 @@ class _ResultAcknowledger:
                 if item is None:
                     return
                 await self._acknowledge(*item)
-            except BaseException as error:
-                self._failure = error
-                while not self._queue.empty():
-                    self._queue.get_nowait()
-                    self._queue.task_done()
-                return
+            except Exception as error:
+                self._failure_count += 1
+                self._failure = self._failure or error
             finally:
                 self._queue.task_done()
 
