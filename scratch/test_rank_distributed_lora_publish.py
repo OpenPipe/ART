@@ -805,9 +805,11 @@ def test_snapshot_fence_waits_for_caller_stream(monkeypatch: pytest.MonkeyPatch)
     assert builder._devices == {3}
 
 
+@pytest.mark.parametrize("preexisting", [False, True])
 def test_generation_publisher_uses_independent_ordered_control_group(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    preexisting: bool,
 ) -> None:
     import art.megatron.weights.lora_publish as lora_publish
     import art.megatron.weights.rank_distributed_lora_publish as distributed_publish
@@ -862,7 +864,16 @@ def test_generation_publisher_uses_independent_ordered_control_group(
         publication_group=control_group,
         publication_metadata_group=None,
     )
-    publisher = _GenerationPublisher(runtime, capacity=2)
+    residency = SimpleNamespace(config=SimpleNamespace(shutdown_timeout_s=1.0))
+    publisher = _GenerationPublisher(runtime, capacity=2, residency=residency)
+    if preexisting:
+        publisher.register_existing(
+            run_id="run",
+            generation=generation,
+            optimizer_source=None,
+            optimizer_residency_key=None,
+        )
+    cached = publisher._cache.get(generation.generation_id)
     plan, _metrics = publisher.prepare_ordered_sampler(
         operation_id="operation",
         run_id="run",
@@ -875,17 +886,9 @@ def test_generation_publisher_uses_independent_ordered_control_group(
         sink=Sink(),
     )
     prepared = publisher._prepared["operation"]
-    assert publisher.has_generation(generation)
-    assert (
-        publisher.ensure_generation(
-            run_id="run",
-            generation=generation,
-            adapter_dtypes={},
-            adapter_config=fixture.adapter_config,
-            snapshot_optimizer=False,
-        )
-        == {}
-    )
+    assert prepared.entry.ephemeral
+    assert publisher._cache.get(generation.generation_id) is cached
+    assert publisher.has_generation(generation) is preexisting
     calls = []
     store = object()
 
@@ -906,4 +909,6 @@ def test_generation_publisher_uses_independent_ordered_control_group(
     assert transport.adapter == plan.transport_adapter
     assert calls == [(prepared.distributed_adapter, store, control_group, None)]
     publisher.discard("operation")
+    assert publisher._in_flight == 0
+    assert publisher.has_generation(generation) is preexisting
     publisher.close()

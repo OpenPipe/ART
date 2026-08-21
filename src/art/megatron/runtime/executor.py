@@ -2837,12 +2837,10 @@ class _GenerationPublisher:
                 generation=generation,
                 stager=stager,
                 resolved=resolved,
+                ephemeral=True,
             )
-            self._cache_staging(entry)
             resolved.add_done_callback(
-                lambda done, cached_entry=entry: self._snapshot_resolved(
-                    cached_entry, done
-                )
+                lambda _done, transient=entry: self._maybe_release(transient)
             )
             ref = pending.payload.layout.ref
             expected_files = {"adapter_config.json", "adapter_model.safetensors"}
@@ -3294,9 +3292,16 @@ class _GenerationPublisher:
 
     def _evict_for_capacity(self, *, protected_run_id: str | None = None) -> None:
         with self._lock:
+            entries = list(self._cache.values())
+            entries.extend(
+                prepared.entry
+                for prepared in self._prepared.values()
+                if prepared.entry.ephemeral
+                and all(entry is not prepared.entry for entry in entries)
+            )
             entries = tuple(
                 entry
-                for entry in self._cache.values()
+                for entry in entries
                 if entry.stager is not None and not entry.released
             )
             if not entries:
@@ -3361,6 +3366,8 @@ class _GenerationPublisher:
         return entry.resolved, *optimizer, *entry.consumers
 
     def _cache_staging(self, entry: _CachedGeneration) -> None:
+        if entry.ephemeral:
+            raise RuntimeError("ephemeral publication entered the generation cache")
         with self._lock:
             generation_id = entry.generation.generation_id
             if generation_id in self._cache:
@@ -3372,6 +3379,8 @@ class _GenerationPublisher:
             self._cache[generation_id] = entry
 
     def _activate_generation(self, entry: _CachedGeneration) -> None:
+        if entry.ephemeral:
+            raise RuntimeError("ephemeral publication cannot become a generation")
         # Callback order must not let an older admission replace a newer success.
         with self._lock:
             if entry.retired or entry.released:
@@ -3440,11 +3449,16 @@ class _GenerationPublisher:
             ):
                 return
             entry.released = True
-            self._cache.pop(entry.generation.generation_id, None)
-            if self._latest_by_run.get(entry.run_id) == entry.generation.generation_id:
-                self._latest_by_run.pop(entry.run_id)
-            for object_id in entry.object_ids:
-                self._object_publications.pop(object_id, None)
+            if not entry.ephemeral:
+                if self._cache.get(entry.generation.generation_id) is entry:
+                    self._cache.pop(entry.generation.generation_id)
+                if (
+                    self._latest_by_run.get(entry.run_id)
+                    == entry.generation.generation_id
+                ):
+                    self._latest_by_run.pop(entry.run_id)
+                for object_id in entry.object_ids:
+                    self._object_publications.pop(object_id, None)
             if not entry.resolved.cancelled() and entry.resolved.exception() is None:
                 lora_key = entry.resolved.result().lora_residency_key
                 if lora_key is not None:
