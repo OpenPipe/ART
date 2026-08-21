@@ -1601,28 +1601,50 @@ class MonarchTrainerActor(Actor):
     def discard_run_slot_load_state(self, operation_id: str) -> None:
         self._require_run_slot_executor().discard_prepared_load_state(operation_id)
 
-    @endpoint
+    @endpoint(explicit_response_port=True)
     def execute_run_slot_snapshot(
         self,
+        response_port: Port[dict[str, Any]],
         job_json: str,
         event_port: Port[dict[str, Any]],
-    ) -> dict[str, Any]:
+    ) -> None:
         try:
             if not self._valid:
                 raise RuntimeError("trainer actor runtime is invalid")
             job = GenerationSnapshotJobSpec.model_validate_json(job_json)
             coordinator = self._runtime.rank == 0
-            result = self._require_run_slot_executor().execute_snapshot(
-                job,
-                _ActorEventSink(event_port, coordinator=coordinator),
+
+            def prepare() -> dict[str, Any]:
+                try:
+                    result = self._require_run_slot_executor().execute_snapshot(
+                        job,
+                        _ActorEventSink(event_port, coordinator=coordinator),
+                    )
+                    return {
+                        "rank": self._runtime.rank,
+                        "operation_id": job.operation_id,
+                        "learner_version": job.learner_version,
+                        "rank_write_plan": result["rank_write_plan"],
+                        "metrics": result["metrics"] if coordinator else {},
+                    }
+                except BaseException as error:
+                    event_port.send(
+                        {
+                            "kind": "rank_failed",
+                            "rank": self._runtime.rank,
+                            "error_type": type(error).__name__,
+                            "message": str(error),
+                            "traceback": traceback.format_exc(),
+                        }
+                    )
+                    raise
+
+            self._defer_response(
+                response_port,
+                prepare,
+                name=f"art-snapshot-prepare-{job.operation_id}",
+                invalidate_on_error=True,
             )
-            return {
-                "rank": self._runtime.rank,
-                "operation_id": job.operation_id,
-                "learner_version": job.learner_version,
-                "rank_write_plan": result["rank_write_plan"],
-                "metrics": result["metrics"] if coordinator else {},
-            }
         except BaseException as error:
             self._valid = False
             event_port.send(
@@ -1634,7 +1656,7 @@ class MonarchTrainerActor(Actor):
                     "traceback": traceback.format_exc(),
                 }
             )
-            raise
+            response_port.exception(_response_exception(error))
 
     @endpoint
     def authorize_run_slot_snapshot(
