@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from collections import deque
 from collections.abc import Callable, Mapping
+import hashlib
 import secrets
 import time
 from typing import TYPE_CHECKING, Annotated, Any, Literal, NamedTuple
@@ -133,6 +134,11 @@ class TrajectoryRouteSequence(_Contract):
         )
 
 
+class TrajectoryGroupDataIdentity(_Contract):
+    sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    byte_count: int = Field(ge=1)
+
+
 class TrajectoryGroupBundle(_Contract):
     """Immutable route-free records and uncompressed local MoE route sequences."""
 
@@ -140,22 +146,39 @@ class TrajectoryGroupBundle(_Contract):
 
     header: _ImmutableBytes
     records: tuple[_ImmutableBytes, ...]
+    route_free_identity: TrajectoryGroupDataIdentity
     route_sequences: tuple[TrajectoryRouteSequence, ...] = ()
+
+    @model_validator(mode="after")
+    def _validate_route_free_size(self) -> "TrajectoryGroupBundle":
+        if self.route_free_identity.byte_count != len(self.header) + sum(
+            map(len, self.records)
+        ):
+            raise ValueError("trajectory data identity has the wrong byte count")
+        return self
 
     @classmethod
     def from_payload(cls, payload: TrajectoryGroupPayload) -> "TrajectoryGroupBundle":
         from msgspec import msgpack
 
         payload, route_sequences = _split_trajectory_routes(payload)
+        digest = hashlib.sha256()
+        header = msgpack.encode(
+            payload.model_copy(update={"trajectories": ()}).model_dump(mode="python")
+        )
+        digest.update(header)
+        records = []
+        byte_count = len(header)
+        for value in payload.trajectories:
+            record = _encode_trajectory_record(value.model_dump(mode="python"))
+            digest.update(record)
+            records.append(record)
+            byte_count += len(record)
         return cls(
-            header=msgpack.encode(
-                payload.model_copy(update={"trajectories": ()}).model_dump(
-                    mode="python"
-                )
-            ),
-            records=tuple(
-                _encode_trajectory_record(record.model_dump(mode="python"))
-                for record in payload.trajectories
+            header=header,
+            records=tuple(records),
+            route_free_identity=TrajectoryGroupDataIdentity(
+                sha256=digest.hexdigest(), byte_count=byte_count
             ),
             route_sequences=route_sequences,
         )
@@ -390,7 +413,14 @@ class TrajectoryGroupDataLayout(_Contract):
 
 
 class TrajectoryGroupLayout(TrajectoryGroupDataLayout):
+    route_free_identity: TrajectoryGroupDataIdentity
     route_sequences: tuple[TrajectoryRouteSequenceLayout, ...] = ()
+
+    @model_validator(mode="after")
+    def _validate_route_free_size(self) -> "TrajectoryGroupLayout":
+        if self.route_free_identity.byte_count != self.byte_count:
+            raise ValueError("trajectory layout identity has the wrong byte count")
+        return self
 
 
 class TrajectoryBatchTransfer(_Contract):
@@ -464,6 +494,7 @@ class TrajectoryBatchTransfer(_Contract):
                     TrajectoryGroupBundle(
                         header=header,
                         records=records,
+                        route_free_identity=layout.route_free_identity,
                         route_sequences=route_sequences,
                     )
                 )
@@ -516,6 +547,7 @@ async def publish_trajectory_bundles(
                 TrajectoryGroupLayout(
                     header_byte_count=len(bundle.header),
                     record_byte_counts=tuple(map(len, bundle.records)),
+                    route_free_identity=bundle.route_free_identity,
                     route_sequences=tuple(
                         TrajectoryRouteSequenceLayout(
                             trajectory_index=value.trajectory_index,
@@ -646,10 +678,12 @@ class _StoredGroup:
     def __init__(
         self,
         header: _ImmutableBytes,
+        route_free_identity: TrajectoryGroupDataIdentity,
         route_sequences: tuple[TrajectoryRouteSequence, ...],
         ref: TrajectoryGroupRef,
     ) -> None:
         self.header = header
+        self.route_free_identity = route_free_identity
         self.route_sequences = route_sequences
         self.ref = ref
 
@@ -755,7 +789,9 @@ class TrajectoryRecordStore:
             records=records,
             descriptor=descriptor,
         )
-        self._groups[result_id] = _StoredGroup(bundle.header, bundle.route_sequences, ref)
+        self._groups[result_id] = _StoredGroup(
+            bundle.header, bundle.route_free_identity, bundle.route_sequences, ref
+        )
         self._used_bytes += byte_count
         return ref
 
@@ -766,6 +802,7 @@ class TrajectoryRecordStore:
             records=tuple(
                 self._records[record.record_id] for record in stored.ref.records
             ),
+            route_free_identity=stored.route_free_identity,
             route_sequences=stored.route_sequences,
         )
 

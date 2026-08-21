@@ -282,11 +282,23 @@ def test_training_object_identity_is_content_addressed_across_commands() -> None
     assert changed_encoded.objects[0].ref.object_id != first.objects[0].ref.object_id
 
 
+def test_route_free_identity_matches_original_immutable_bytes() -> None:
+    bundle = TrajectoryGroupBundle.from_group(_group(5))
+    payload = b"".join((bundle.header, *bundle.records))
+    encoded = encode_trajectory_group(bundle, object_id="6" * 64)
+
+    assert bundle.route_free_identity.sha256 == hashlib.sha256(payload).hexdigest()
+    assert bundle.route_free_identity.byte_count == len(payload)
+    assert encoded.data.ref.sha256 == bundle.route_free_identity.sha256
+    assert b"".join(encoded.data.wire_chunks()) == payload
+
+
 def test_distributed_transfer_preserves_uncompressed_route_sequences() -> None:
     bundle = TrajectoryGroupBundle.from_group(_group(4))
     layout = TrajectoryGroupLayout(
         header_byte_count=len(bundle.header),
         record_byte_counts=tuple(map(len, bundle.records)),
+        route_free_identity=bundle.route_free_identity,
         route_sequences=tuple(
             TrajectoryRouteSequenceLayout(
                 trajectory_index=value.trajectory_index,
@@ -332,8 +344,42 @@ def test_distributed_transfer_preserves_uncompressed_route_sequences() -> None:
         for sequence in restored.route_sequences
         for segment in sequence.data
     )
+    assert restored.route_free_identity == bundle.route_free_identity
     assert _route_values(restored.build()) == _route_values(bundle.build())
     assert tuple(map(bytes, restored.route_sequences[0].data)) == bundle.route_sequences[0].data
+
+
+def test_received_bundle_encoding_does_not_rescan_route_free_bytes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bundle = TrajectoryGroupBundle.from_group(TrajectoryGroup([Trajectory()]))
+    payload = bytearray(b"".join((bundle.header, *bundle.records)))
+    transfer = TrajectoryBatchTransfer(
+        stream=ByteStreamTransfer(
+            stream_id="stream",
+            host="127.0.0.1",
+            port=1,
+            token="1" * 64,
+            byte_count=len(payload),
+        ),
+        groups=(
+            TrajectoryGroupLayout(
+                header_byte_count=len(bundle.header),
+                record_byte_counts=tuple(map(len, bundle.records)),
+                route_free_identity=bundle.route_free_identity,
+            ),
+        ),
+    )
+    restored = transfer._build_bundles(payload)[0]
+
+    def forbidden(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("received trajectory bytes were hashed again")
+
+    monkeypatch.setattr(data_plane.hashlib, "sha256", forbidden)
+    encoded = encode_trajectory_group(restored, object_id="7" * 64)
+
+    assert encoded.data.ref.sha256 == bundle.route_free_identity.sha256
+    assert all(chunk.obj is payload for chunk in encoded.data.chunks)
 
 
 def test_command_identity_includes_separate_route_content() -> None:

@@ -18,6 +18,7 @@ from art.distributed.moe_route_store import (
 )
 from art.distributed.trajectory_store import (
     TrajectoryGroupBundle,
+    TrajectoryGroupDataIdentity,
     TrajectoryGroupDataLayout,
     TrajectoryRouteSequence,
 )
@@ -324,6 +325,7 @@ def encode_trajectory_group(
     )
     data = _encode_training_object_chunks(
         (bundle.header, *bundle.records),
+        identity=bundle.route_free_identity,
         data_format=RL_GROUP_DATA_FORMAT,
         object_id=object_id,
     )
@@ -641,7 +643,13 @@ def decode_trajectory_group(
         end = offset + byte_count
         records.append(source[offset:end])
         offset = end
-    bundle = TrajectoryGroupBundle(header=header, records=tuple(records))
+    bundle = TrajectoryGroupBundle(
+        header=header,
+        records=tuple(records),
+        route_free_identity=TrajectoryGroupDataIdentity(
+            sha256=ref.data.sha256, byte_count=ref.data.byte_count
+        ),
+    )
     return DecodedRlGroup(
         bundle=bundle,
         routes=MoeRouteGroupPayload(
@@ -930,21 +938,18 @@ def _encode_training_object(
 def _encode_training_object_chunks(
     payloads: tuple[bytes | memoryview, ...],
     *,
+    identity: TrajectoryGroupDataIdentity,
     data_format: Literal["art_trajectory_group_records_v4"],
     object_id: str | None,
 ) -> EncodedTrainingObject:
     chunks = tuple(
         chunk for payload in payloads for chunk in _iter_readonly_chunks(payload)
     )
-    digest = hashlib.sha256()
-    for chunk in chunks:
-        digest.update(chunk)
-    sha256 = digest.hexdigest()
     return EncodedTrainingObject(
         ref=TrainingDataRef(
-            object_id=object_id or _object_id(f"{data_format}\0{sha256}"),
-            sha256=sha256,
-            byte_count=sum(map(len, chunks)),
+            object_id=object_id or _object_id(f"{data_format}\0{identity.sha256}"),
+            sha256=identity.sha256,
+            byte_count=identity.byte_count,
             format=data_format,
         ),
         chunks=chunks,
