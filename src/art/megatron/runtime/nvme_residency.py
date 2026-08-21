@@ -102,7 +102,7 @@ class NvmeResidencyWritePlan(BaseModel):
 
 
 class NvmeResidencyStore:
-    """Atomic, content-verified L3 storage for one rank's live tensor images."""
+    """Atomic, layout-verified L3 storage for one rank's live tensor images."""
 
     def __init__(self, config: NvmeResidencyStoreConfig) -> None:
         self.config = config
