@@ -8,7 +8,14 @@ import sys
 from typing import Any, Literal, NamedTuple, TypeVar, cast
 
 from msgspec import msgpack
-from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    TypeAdapter,
+    field_validator,
+    model_validator,
+)
 
 from art.distributed.moe_route_store import (
     MoeRouteGroupPayload,
@@ -263,6 +270,29 @@ class EncodedForwardSubmission(BaseModel):
 
     def stream(self) -> AsyncIterable[bytes]:
         return _ForwardSubmissionStream(self.preamble, self.chunks)
+
+
+class VerifiedOperationResultPayload(BaseModel):
+    """Operation-result bytes whose digest was verified during receipt."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, arbitrary_types_allowed=True)
+
+    ref: OperationResultRef
+    payload: memoryview
+
+    @field_validator("payload", mode="before")
+    @classmethod
+    def _readonly_bytes(cls, value: bytes | bytearray | memoryview) -> memoryview:
+        view = memoryview(value)
+        if not view.c_contiguous:
+            raise ValueError("verified operation result must be contiguous")
+        return view.cast("B").toreadonly()
+
+    @model_validator(mode="after")
+    def _validate_size(self) -> "VerifiedOperationResultPayload":
+        if len(self.payload) != self.ref.byte_count:
+            raise ValueError("verified operation result has the wrong byte count")
+        return self
 
 
 class _ForwardSubmissionStream:
@@ -993,12 +1023,26 @@ def encode_operation_result(
 
 
 def decode_operation_result(
-    ref: OperationResultRef, payload: bytes | bytearray, result_type: type[ResultT]
+    ref: OperationResultRef,
+    payload: bytes | bytearray | memoryview,
+    result_type: type[ResultT],
 ) -> ResultT:
     if len(payload) != ref.byte_count:
         raise ValueError("operation result byte count differs from its reference")
     if hashlib.sha256(payload).hexdigest() != ref.object_id:
         raise ValueError("operation result hash differs from its reference")
+    return _decode_operation_result(payload, result_type)
+
+
+def decode_verified_operation_result(
+    verified: VerifiedOperationResultPayload, result_type: type[ResultT]
+) -> ResultT:
+    return _decode_operation_result(verified.payload, result_type)
+
+
+def _decode_operation_result(
+    payload: bytes | bytearray | memoryview, result_type: type[ResultT]
+) -> ResultT:
     return result_type.model_validate(msgpack.decode(payload, ext_hook=_decode_ext))
 
 

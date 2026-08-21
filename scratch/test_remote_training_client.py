@@ -38,6 +38,7 @@ from art.serverless.data_plane import (
     FORWARD_SUBMISSION_PREFIX_BYTES,
     EncodedRouteObject,
     EncodedTrainingObject,
+    VerifiedOperationResultPayload,
     decode_forward_submission_manifest,
     decode_forward_submission_prefix,
     decode_operation_result,
@@ -303,6 +304,31 @@ def _decode_submission(payload: bytes):
     )
 
 
+def _forward_result() -> ForwardBackwardResult:
+    return ForwardBackwardResult(
+        operation_id="operation",
+        packing=PackingOutcome(
+            packed_sequence_length=8,
+            packed_sequences=1,
+            target_packed_sequences=1,
+            nominal_capacity_tokens=8,
+            physical_tokens=2,
+            non_padding_tokens=2,
+            loss_bearing_tokens=1,
+            trainable_assistant_tokens=1,
+            policy_token_counts=None,
+            group_shapes=(),
+        ),
+        loss_fn_outputs=(LossFnOutput(token_logprobs=(-1.0,)),),
+    )
+
+
+def _verified_payload(
+    ref: OperationResultRef, payload: bytes | bytearray
+) -> VerifiedOperationResultPayload:
+    return VerifiedOperationResultPayload(ref=ref, payload=payload)
+
+
 def test_operation_result_sidecar_preserves_compact_packing_arrays():
     result = ForwardBackwardResult(
         operation_id="operation",
@@ -368,6 +394,9 @@ def test_operation_result_reference_rejects_unbounded_receive_allocation():
 async def test_operation_result_streams_into_exact_receive_buffer():
     payload = b"result-payload"
     stream = _ChunkedResult(payload)
+    ref = OperationResultRef(
+        object_id=hashlib.sha256(payload).hexdigest(), byte_count=len(payload)
+    )
 
     async def handle(_: httpx.Request) -> httpx.Response:
         return httpx.Response(200, stream=stream)
@@ -384,15 +413,94 @@ async def test_operation_result_streams_into_exact_receive_buffer():
     received = await service._receive_operation_result(
         "run",
         "operation",
-        OperationResultRef(
-            object_id="0" * 64,
-            byte_count=len(payload),
-        ),
+        ref,
     )
-    assert isinstance(received, bytearray)
-    assert received == payload
+    assert isinstance(received, VerifiedOperationResultPayload)
+    assert received.ref == ref
+    assert bytes(received.payload) == payload
     assert stream.reads > 1
     await http.aclose()
+
+
+@pytest.mark.asyncio
+async def test_operation_result_hashes_each_chunk_once_without_decode_rescan(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    result = _forward_result()
+    ref, payload = encode_operation_result(result)
+    stream = _ChunkedResult(payload)
+    initial_sizes: list[int] = []
+    update_sizes: list[int] = []
+    sha256 = hashlib.sha256
+
+    class TrackedSha256:
+        def __init__(self, initial: bytes = b"") -> None:
+            initial_sizes.append(len(initial))
+            self._digest = sha256(initial)
+
+        def update(self, chunk: bytes) -> None:
+            update_sizes.append(len(chunk))
+            self._digest.update(chunk)
+
+        def hexdigest(self) -> str:
+            return self._digest.hexdigest()
+
+    async def handle(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, stream=stream)
+
+    http = httpx.AsyncClient(
+        base_url="http://test/v1/", transport=httpx.MockTransport(handle)
+    )
+    service = RemoteTrainingServiceClient(
+        api_key="test",
+        base_url="http://test/v1",
+        control_http_client=http,
+        transfer_http_client=http,
+    )
+    monkeypatch.setattr(client_module.hashlib, "sha256", TrackedSha256)
+
+    assert (
+        await service.receive_operation_result(
+            "run", "operation", ref, ForwardBackwardResult
+        )
+        == result
+    )
+    assert initial_sizes == [0]
+    assert len(update_sizes) == stream.reads > 1
+    assert sum(update_sizes) == len(payload)
+    await http.aclose()
+
+
+@pytest.mark.asyncio
+async def test_operation_result_stream_rejects_corruption() -> None:
+    ref, payload = encode_operation_result(_forward_result())
+    corrupted = bytearray(payload)
+    corrupted[-1] ^= 1
+
+    async def handle(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, stream=_ChunkedResult(bytes(corrupted)))
+
+    http = httpx.AsyncClient(
+        base_url="http://test/v1/", transport=httpx.MockTransport(handle)
+    )
+    service = RemoteTrainingServiceClient(
+        api_key="test",
+        base_url="http://test/v1",
+        control_http_client=http,
+        transfer_http_client=http,
+    )
+    with pytest.raises(RemoteTrainingError, match="result hash changed"):
+        await service._receive_operation_result("run", "operation", ref)
+    await http.aclose()
+
+
+def test_unverified_operation_result_decoder_rejects_corruption() -> None:
+    ref, payload = encode_operation_result(_forward_result())
+    corrupted = bytearray(payload)
+    corrupted[-1] ^= 1
+
+    with pytest.raises(ValueError, match="hash differs"):
+        decode_operation_result(ref, corrupted, ForwardBackwardResult)
 
 
 @pytest.mark.asyncio
@@ -423,11 +531,13 @@ async def test_operation_result_receive_budget_serializes_allocations(monkeypatc
         transfer_http_client=http,
         max_result_bytes_in_flight=2 * len(payload),
     )
-    ref = OperationResultRef(object_id="0" * 64, byte_count=len(payload))
+    ref = OperationResultRef(
+        object_id=hashlib.sha256(payload).hexdigest(), byte_count=len(payload)
+    )
     monkeypatch.setattr(
         client_module,
-        "decode_operation_result",
-        lambda _ref, value, _type: bytes(value),
+        "decode_verified_operation_result",
+        lambda value, _type: bytes(value.payload),
     )
     monkeypatch.setattr(client_module, "_forward_result_buffer_bytes", len)
     first = asyncio.create_task(
@@ -494,11 +604,13 @@ async def test_operation_result_receive_budget_close_wakes_waiters(monkeypatch):
         transfer_http_client=http,
         max_result_bytes_in_flight=2 * len(payload),
     )
-    ref = OperationResultRef(object_id="0" * 64, byte_count=len(payload))
+    ref = OperationResultRef(
+        object_id=hashlib.sha256(payload).hexdigest(), byte_count=len(payload)
+    )
     monkeypatch.setattr(
         client_module,
-        "decode_operation_result",
-        lambda _ref, value, _type: bytes(value),
+        "decode_verified_operation_result",
+        lambda value, _type: bytes(value.payload),
     )
     monkeypatch.setattr(client_module, "_forward_result_buffer_bytes", len)
     first = asyncio.create_task(
@@ -677,12 +789,12 @@ async def test_remote_client_retries_and_preserves_command_order(
     assert client.next_sequence_id == 2
     assert client.projected_learner_version == 1
     decode_started, decode_release = threading.Event(), threading.Event()
-    decode_operation_result = client_module.decode_operation_result
+    verified_decoder = client_module.decode_verified_operation_result
 
     def gated_decode(*args, **kwargs):
         decode_started.set()
         assert decode_release.wait(1), "result decode blocked the event loop"
-        return decode_operation_result(*args, **kwargs)
+        return verified_decoder(*args, **kwargs)
 
     async def release_decode():
         while not decode_started.is_set():
@@ -690,7 +802,7 @@ async def test_remote_client_retries_and_preserves_command_order(
         await asyncio.sleep(0)
         decode_release.set()
 
-    monkeypatch.setattr(client_module, "decode_operation_result", gated_decode)
+    monkeypatch.setattr(client_module, "decode_verified_operation_result", gated_decode)
     forward_result, optimizer_result, _ = await asyncio.gather(
         forward.result(), optimizer.result(), release_decode()
     )
@@ -765,9 +877,9 @@ async def test_result_budget_remains_reserved_through_cancelled_decode(
     async def download(_run_id, operation_id, result_ref):
         assert result_ref is ref
         downloads.append(operation_id)
-        return bytearray(byte_count)
+        return _verified_payload(ref, bytearray(byte_count))
 
-    def decode(_ref, _payload, _result_type):
+    def decode(_payload, _result_type):
         nonlocal decode_calls
         decode_calls += 1
         if decode_calls == 1:
@@ -776,7 +888,7 @@ async def test_result_budget_remains_reserved_through_cancelled_decode(
         return SimpleNamespace(operation_id=f"result-{decode_calls}")
 
     monkeypatch.setattr(service, "_download_operation_result", download)
-    monkeypatch.setattr(client_module, "decode_operation_result", decode)
+    monkeypatch.setattr(client_module, "decode_verified_operation_result", decode)
     monkeypatch.setattr(
         client_module, "_forward_result_buffer_bytes", lambda _: byte_count
     )
@@ -816,9 +928,9 @@ async def test_result_budget_releases_after_decode_error(
 
     async def download(_run_id, operation_id, _result_ref):
         downloads.append(operation_id)
-        return bytearray(byte_count)
+        return _verified_payload(ref, bytearray(byte_count))
 
-    def decode(_ref, _payload, _result_type):
+    def decode(_payload, _result_type):
         nonlocal decode_calls
         decode_calls += 1
         if decode_calls == 1:
@@ -828,7 +940,7 @@ async def test_result_budget_releases_after_decode_error(
         return SimpleNamespace(operation_id="result-2")
 
     monkeypatch.setattr(service, "_download_operation_result", download)
-    monkeypatch.setattr(client_module, "decode_operation_result", decode)
+    monkeypatch.setattr(client_module, "decode_verified_operation_result", decode)
     monkeypatch.setattr(
         client_module, "_forward_result_buffer_bytes", lambda _: byte_count
     )

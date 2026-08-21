@@ -64,7 +64,8 @@ from .data_plane import (
     FORWARD_SUBMISSION_MEDIA_TYPE,
     EncodedForwardSubmission,
     EncodedTrainingBatch,
-    decode_operation_result,
+    VerifiedOperationResultPayload,
+    decode_verified_operation_result,
     encode_forward_submission,
     prepare_training_batch,
 )
@@ -485,7 +486,7 @@ class RemoteTrainingServiceClient:
             payload = await self._receive_operation_result(run_id, operation_id, ref)
             try:
                 result, cancelled = await complete_to_thread(
-                    lambda: decode_operation_result(ref, payload, result_type)
+                    lambda: decode_verified_operation_result(payload, result_type)
                 )
             finally:
                 del payload
@@ -496,7 +497,7 @@ class RemoteTrainingServiceClient:
 
     async def _receive_operation_result(
         self, run_id: str, operation_id: str, ref: OperationResultRef
-    ) -> bytearray:
+    ) -> VerifiedOperationResultPayload:
         failure_count = 0
         while True:
             if self._closed:
@@ -513,7 +514,7 @@ class RemoteTrainingServiceClient:
 
     async def _download_operation_result(
         self, run_id: str, operation_id: str, ref: OperationResultRef
-    ) -> bytearray:
+    ) -> VerifiedOperationResultPayload:
         response = await self._send(
             "GET",
             f"training/runs/{run_id}/operations/{operation_id}/result",
@@ -529,18 +530,22 @@ class RemoteTrainingServiceClient:
                     "remote operation result Content-Length changed"
                 )
             payload = bytearray(ref.byte_count)
+            digest = hashlib.sha256()
             offset = 0
             async for chunk in response.aiter_bytes():
                 end = offset + len(chunk)
                 if end > len(payload):
                     raise RemoteTrainingError("remote operation result grew in transit")
                 payload[offset:end] = chunk
+                digest.update(chunk)
                 offset = end
         finally:
             await response.aclose()
         if offset != ref.byte_count:
             raise RemoteTrainingError("remote operation result byte count changed")
-        return payload
+        if digest.hexdigest() != ref.object_id:
+            raise RemoteTrainingError("remote operation result hash changed")
+        return VerifiedOperationResultPayload(ref=ref, payload=payload)
 
     async def acknowledge_operation_result(
         self, run_id: str, operation_id: str
