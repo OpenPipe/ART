@@ -2791,9 +2791,7 @@ class _GenerationPublisher:
             transport = self._transport_pool.submit(
                 self._transfer_prepared_snapshot, prepared, started
             )
-            durability = self._durability_pool.submit(
-                self._persist_prepared_snapshot, prepared, started
-            )
+            durability = self._start_durability(prepared, started)
             publication = self._completion_pool.submit(
                 self._complete_publication,
                 transport,
@@ -2809,6 +2807,23 @@ class _GenerationPublisher:
             self._authorization_failed(prepared, error)
             raise
         return {"snapshot_authorize_s": time.perf_counter() - started}
+
+    @staticmethod
+    def _requires_durable_write(prepared: _PreparedRankSnapshot) -> bool:
+        return prepared.optimizer is not None or (
+            prepared.adapter is not None and prepared.staging_adapter_path is not None
+        )
+
+    def _start_durability(
+        self, prepared: _PreparedRankSnapshot, submitted_at: float
+    ) -> Future[_RankSnapshotPersistence]:
+        if self._requires_durable_write(prepared):
+            return self._durability_pool.submit(
+                self._persist_prepared_snapshot, prepared, submitted_at
+            )
+        completed: Future[_RankSnapshotPersistence] = Future()
+        completed.set_result(self._persist_prepared_snapshot(prepared, submitted_at))
+        return completed
 
     def discard(self, operation_id: str) -> None:
         with self._lock:
