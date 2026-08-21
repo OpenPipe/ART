@@ -1134,6 +1134,7 @@ class _ResidentRunState(BaseModel):
     residency_revision: int = 0
     registration_complete: bool = False
     unregistering: bool = False
+    lora_export_plan: Any | None = None
 
 
 @contextmanager
@@ -1681,15 +1682,17 @@ class MCoreRunSlotExecutor:
                 build_local_lora_export_plan,
             )
 
-            export_plan = build_local_lora_export_plan(
-                self.runtime.model,
-                residency_tensors.weights,
-                {},
-                packed_expert_groups=(
-                    self.runtime.model_support_handler.expert_packed_lora_groups()
-                ),
-                slot_ref=LoRASlotRef("checkpoint", job.run_id),
-            )
+            export_plan = state.lora_export_plan
+            if export_plan is None:
+                export_plan = state.lora_export_plan = build_local_lora_export_plan(
+                    self.runtime.model,
+                    residency_tensors.weights,
+                    {},
+                    packed_expert_groups=(
+                        self.runtime.model_support_handler.expert_packed_lora_groups()
+                    ),
+                    slot_ref=LoRASlotRef("checkpoint", job.run_id),
+                )
         if not result["update_successful"] or not math.isfinite(result["grad_norm"]):
             raise RuntimeError("dynamic LoRA optimizer rejected the update")
         optimizer_step_s = time.perf_counter() - started
