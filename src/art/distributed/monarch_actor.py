@@ -316,6 +316,14 @@ class ArtHostService(Actor):
 
     @resilient_endpoint
     async def close(self) -> None:
+        failures: list[BaseException] = []
+
+        async def close_one(operation: Any) -> None:
+            try:
+                await operation
+            except BaseException as error:
+                failures.append(error)
+
         probe_ids = tuple(
             {
                 *self._nccl_cleanups,
@@ -324,25 +332,39 @@ class ArtHostService(Actor):
                 *self._nccl_rendezvous,
             }
         )
-        await asyncio.gather(
-            *(self._cancel_nccl_preflight(probe_id) for probe_id in probe_ids)
+        nccl_results = await asyncio.gather(
+            *(self._cancel_nccl_preflight(probe_id) for probe_id in probe_ids),
+            return_exceptions=True,
+        )
+        failures.extend(
+            result for result in nccl_results if isinstance(result, BaseException)
         )
         for queue in self._trajectory_queues.values():
-            queue.close()
+            try:
+                queue.close()
+            except BaseException as error:
+                failures.append(error)
         self._trajectory_queues.clear()
         for batch_id in tuple(self._batch_publishers):
-            await self._drop_batch(batch_id)
+            await close_one(self._drop_batch(batch_id))
         async with self._packing_lock:
             if self._packer is not None:
-                await self._packer.close()
+                await close_one(self._packer.close())
                 self._packer = None
         if self._vllm_launcher is not None:
-            await self._vllm_launcher.close()
+            await close_one(self._vllm_launcher.close())
             self._vllm_launcher = None
         if self._managed_etcd is not None:
-            await asyncio.to_thread(self._managed_etcd.close)
+            await close_one(asyncio.to_thread(self._managed_etcd.close))
             self._managed_etcd = None
-        self._packed_batches.store.close()
+        try:
+            self._packed_batches.store.close()
+        except BaseException as error:
+            failures.append(error)
+        if len(failures) == 1:
+            raise failures[0]
+        if failures:
+            raise BaseExceptionGroup("ART host cleanup failed", failures)
 
     async def _require_nccl_probe(self, probe_id: str) -> float:
         if probe_id in self._cancelled_nccl_probes:
