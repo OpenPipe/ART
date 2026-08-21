@@ -4,7 +4,6 @@ from collections.abc import Callable, Sequence
 import math
 from typing import Any, Literal
 
-from megatron.core import parallel_state as ps
 from pydantic import BaseModel, ConfigDict, Field
 import torch
 
@@ -14,14 +13,10 @@ from art.loss import (
     LossOffPolicyDiagnosticsAccumulator,
     probability_correlation_from_stats,
 )
-from art.megatron.context_parallel.types import TrainingStepWorkload
 from art.metrics_taxonomy import TRAIN_GRADIENT_STEPS_KEY
 
-from .pipeline_schedule import (
-    PipelineScheduleTelemetry,
-    aggregate_pipeline_rank_metrics,
-    aggregate_pipeline_schedule_metrics,
-)
+from .pipeline_telemetry import aggregate_pipeline_rank_metrics
+from .workload import TrainingStepWorkload
 
 _CORRELATION = slice(2, 2 + PROBABILITY_CORRELATION_STAT_COUNT)
 _KL_SUM = _CORRELATION.stop
@@ -48,7 +43,7 @@ class PendingRankCommandTelemetry(BaseModel):
     topology: RankTelemetryTopology
     statistics: torch.Tensor
     workload: TrainingStepWorkload
-    schedules: tuple[PipelineScheduleTelemetry, ...] = Field(min_length=1)
+    schedules: tuple[Any, ...] = Field(min_length=1)
     inter_metric_readers: tuple[Callable[[], dict[str, float]], ...] = ()
     base_metrics: dict[str, float] = Field(default_factory=dict)
     num_gradient_steps: int = Field(default=1, ge=1)
@@ -69,6 +64,8 @@ class RankCommandTelemetry(BaseModel):
 
 
 def rank_telemetry_topology() -> RankTelemetryTopology:
+    from megatron.core import parallel_state as ps
+
     if not torch.distributed.is_initialized():
         return RankTelemetryTopology(global_rank=0, dp_cp_ranks=(0,), pp_ranks=(0,))
     return RankTelemetryTopology(
@@ -116,12 +113,16 @@ def materialize_rank_telemetry(
     pending: PendingRankCommandTelemetry,
     staged_statistics: torch.Tensor,
 ) -> dict[str, Any]:
+    from .pipeline_schedule import aggregate_pipeline_schedule_metrics
+
     inter_metrics: dict[str, float] = {}
     for reader in pending.inter_metric_readers:
         values = reader()
         overlap = inter_metrics.keys() & values.keys()
         if overlap:
-            raise RuntimeError(f"duplicate deferred telemetry metrics: {sorted(overlap)}")
+            raise RuntimeError(
+                f"duplicate deferred telemetry metrics: {sorted(overlap)}"
+            )
         inter_metrics.update(values)
     return RankCommandTelemetry(
         program=pending.program,
@@ -148,15 +149,18 @@ def aggregate_rank_command_telemetry(
         raise ValueError("command telemetry requires rank results")
     by_rank = {row.topology.global_rank: row for row in rows}
     if len(by_rank) != len(rows) or 0 not in by_rank:
-        raise RuntimeError("command telemetry has duplicate ranks or no global rank zero")
+        raise RuntimeError(
+            "command telemetry has duplicate ranks or no global rank zero"
+        )
     coordinator = by_rank[0]
-    invariants = {
-        (row.program, row.backward, row.num_gradient_steps) for row in rows
-    }
+    invariants = {(row.program, row.backward, row.num_gradient_steps) for row in rows}
     if len(invariants) != 1:
         raise RuntimeError("trainer ranks returned incompatible command telemetry")
     data_rows = tuple(by_rank[rank] for rank in coordinator.topology.dp_cp_ranks)
-    if any(row.topology.dp_cp_ranks != coordinator.topology.dp_cp_ranks for row in data_rows):
+    if any(
+        row.topology.dp_cp_ranks != coordinator.topology.dp_cp_ranks
+        for row in data_rows
+    ):
         raise RuntimeError("data-parallel telemetry groups disagree")
     totals = tuple(
         math.fsum(row.statistics[index] for row in data_rows)

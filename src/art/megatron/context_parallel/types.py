@@ -9,6 +9,10 @@ from pydantic import BaseModel, ConfigDict, Field
 import torch
 
 from art.megatron.selective_lm_head import LmHeadTokenSelection
+from art.megatron.training.workload import (
+    TrainingMicrobatchWorkload,
+    TrainingStepWorkload,
+)
 
 from .layout_index import TokenLayoutIndex
 from .loss_inputs import ContextParallelLossInputs
@@ -182,28 +186,6 @@ class DispatchedPackedTensors(ContextParallelLossInputs):
     loss_weights: torch.Tensor | None = None
     behavior_logprobs: torch.Tensor | None = None
     token_advantages: torch.Tensor | None = None
-
-
-class TrainingMicrobatchWorkload(BaseModel):
-    model_config = ConfigDict(frozen=True)
-
-    logical_nonpadding_tokens: int = Field(ge=0)
-    loss_bearing_tokens: int = Field(ge=0)
-    executed_token_equivalents: int = Field(ge=0)
-    nominal_schedule_capacity_tokens: int = Field(ge=0)
-
-
-class TrainingStepWorkload(BaseModel):
-    model_config = ConfigDict(frozen=True)
-
-    logical_nonpadding_tokens: int = Field(ge=0)
-    loss_bearing_tokens: int = Field(ge=0)
-    executed_token_equivalents: int = Field(ge=0)
-    nominal_schedule_capacity_tokens: int = Field(ge=0)
-    dummy_executed_token_equivalents: int = Field(ge=0)
-    dummy_schedule_capacity_tokens: int = Field(ge=0)
-    real_microbatches: int = Field(ge=0)
-    dummy_microbatches: int = Field(ge=0)
 
 
 @dataclass
