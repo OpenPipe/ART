@@ -1555,15 +1555,23 @@ class TrainerRank:
         for param in self.checkpoint_slot_parameters(name):
             param.grad = None
 
-    def reduce_checkpoint_slot_grads(
+    def checkpoint_slot_local_gradient_sums(
+        self, name: str
+    ) -> tuple[torch.Tensor, ...]:
+        return self._local_dynamic_grads(self.checkpoint_slot_parameters(name))
+
+    def reduce_checkpoint_slot_gradient_sums(
         self,
         name: str,
-        *,
-        scale_grads: float,
+        gradients: tuple[torch.Tensor, ...],
     ) -> tuple[torch.Tensor, ...]:
-        return self._reduce_dynamic_grads(
-            self.checkpoint_slot_parameters(name), scale_grads=scale_grads
-        )
+        params = self.checkpoint_slot_parameters(name)
+        if len(gradients) != len(params) or any(
+            gradient.shape != param.shape
+            for gradient, param in zip(gradients, params, strict=True)
+        ):
+            raise ValueError("gradient sum layout does not match checkpoint slot")
+        return self._sync_dynamic_grads(params, gradients)
 
     def optim_step_reduced(
         self,
@@ -2744,9 +2752,10 @@ class TrainerRank:
         for name in checkpoint_names:
             slot_params = self._checkpoint_slots[name].params
             step_flags = self._dynamic_param_step_flags(slot_params)
-            slot_grads = self._reduce_dynamic_grads(
+            slot_grads = self._local_dynamic_grads(
                 slot_params, scale_grads=scale_grads
             )
+            self._sync_dynamic_grads(slot_params, slot_grads)
             selected.append((name, slot_params, slot_grads, step_flags))
 
         return self._step_dynamic_optimizer(tuple(selected), params=params)
@@ -3162,11 +3171,25 @@ class TrainerRank:
         slot.invalidate_optimizer_residency()
         return valid_ranges
 
-    def _reduce_dynamic_grads(
+    def _local_dynamic_grads(
         self,
         params: Sequence[torch.nn.Parameter],
         *,
-        scale_grads: float,
+        scale_grads: float = 1.0,
+    ) -> tuple[torch.Tensor, ...]:
+        return tuple(
+            (
+                torch.zeros_like(param, dtype=torch.float32)
+                if param.grad is None
+                else param.grad.detach().float().mul(scale_grads)
+            )
+            for param in params
+        )
+
+    def _sync_dynamic_grads(
+        self,
+        params: Sequence[torch.nn.Parameter],
+        grads: tuple[torch.Tensor, ...],
     ) -> tuple[torch.Tensor, ...]:
         from megatron.core import parallel_state as ps
 
@@ -3188,14 +3211,6 @@ class TrainerRank:
             key = (id(group), str(op), grad.dtype, grad.device)
             buckets.setdefault(key, (group, op, []))[2].append(grad)
 
-        grads = tuple(
-            (
-                torch.zeros_like(param, dtype=torch.float32)
-                if param.grad is None
-                else param.grad.detach().float().mul(scale_grads)
-            )
-            for param in params
-        )
         for param, grad in zip(params, grads, strict=True):
             if bool(getattr(param, "allreduce", True)):
                 group = ps.get_data_parallel_group(with_context_parallel=True)

@@ -7,6 +7,9 @@ from art.utils.group_aggregate import group_aggregate
 
 from . import dev
 
+PROBABILITY_CORRELATION_STAT_COUNT = 6
+IMPORTANCE_RATIO_HISTOGRAM_BUCKETS = 258
+
 if TYPE_CHECKING:
     from art.preprocessing.inputs import TrainInputs
     from art.preprocessing.pack import PackedTensors
@@ -111,6 +114,38 @@ class LossOffPolicyDiagnosticsAccumulator(BaseModel):
             )
         )
 
+    def tensor(self, *, device: torch.device | None = None) -> torch.Tensor:
+        if self.ratio_sum is None:
+            if device is None:
+                raise ValueError("empty diagnostics require an explicit device")
+            return torch.zeros(
+                3 + IMPORTANCE_RATIO_HISTOGRAM_BUCKETS,
+                device=device,
+                dtype=torch.float64,
+            )
+        assert self.clipped_count is not None
+        assert self.token_count is not None
+        assert self.ratio_histogram is not None
+        return torch.cat(
+            (
+                self.ratio_sum.reshape(1),
+                self.clipped_count.reshape(1),
+                self.token_count.reshape(1),
+                self.ratio_histogram,
+            )
+        ).to(dtype=torch.float64)
+
+    @classmethod
+    def from_tensor(cls, values: torch.Tensor) -> "LossOffPolicyDiagnosticsAccumulator":
+        if values.shape != (3 + IMPORTANCE_RATIO_HISTOGRAM_BUCKETS,):
+            raise ValueError("invalid off-policy diagnostics vector shape")
+        return cls(
+            ratio_sum=values[0],
+            clipped_count=values[1],
+            token_count=values[2],
+            ratio_histogram=values[3:],
+        )
+
     def to_metrics(self, *, group: Any | None = None) -> dict[str, float]:
         if (
             self.ratio_sum is None
@@ -120,14 +155,7 @@ class LossOffPolicyDiagnosticsAccumulator(BaseModel):
         ):
             return {}
 
-        vector = torch.cat(
-            [
-                self.ratio_sum.reshape(1),
-                self.clipped_count.reshape(1),
-                self.token_count.reshape(1),
-                self.ratio_histogram,
-            ]
-        )
+        vector = self.tensor()
         if group is not None:
             torch.distributed.all_reduce(vector, group=group)  # ty: ignore[possibly-missing-attribute]
 
@@ -189,7 +217,10 @@ class Loss(BaseModel):
     entropy: torch.Tensor | None
     policy_loss_sum: torch.Tensor
     probs_corr: torch.Tensor
+    probs_corr_stats: torch.Tensor
     kl_policy_ref: torch.Tensor | None = None
+    kl_policy_ref_sum: torch.Tensor | None = None
+    kl_policy_ref_count: torch.Tensor | None = None
     offpolicy_diagnostics: LossOffPolicyDiagnostics | None = None
 
 
@@ -251,21 +282,45 @@ def compute_probs_corr(
     old_logprobs: torch.Tensor,
     new_logprobs: torch.Tensor,
 ) -> torch.Tensor:
+    return probability_correlation_from_stats(
+        compute_probs_corr_stats(old_logprobs, new_logprobs)
+    ).to(dtype=new_logprobs.dtype)
+
+
+def compute_probs_corr_stats(
+    old_logprobs: torch.Tensor,
+    new_logprobs: torch.Tensor,
+) -> torch.Tensor:
     old_logprobs_mask = torch.isfinite(old_logprobs) & torch.isfinite(new_logprobs)
-    old_probs = torch.exp(old_logprobs[old_logprobs_mask])
-    new_probs = torch.exp(new_logprobs[old_logprobs_mask])
-    if old_probs.numel() < 2:
-        return new_logprobs.new_zeros(())
-    old_std = old_probs.std(unbiased=False)
-    new_std = new_probs.std(unbiased=False)
-    if (
-        not torch.isfinite(old_std).item()
-        or not torch.isfinite(new_std).item()
-        or old_std.item() == 0.0
-        or new_std.item() == 0.0
-    ):
-        return new_logprobs.new_zeros(())
-    return torch.corrcoef(torch.stack([old_probs, new_probs]))[0, 1]
+    old_probs = torch.exp(old_logprobs[old_logprobs_mask]).to(torch.float64)
+    new_probs = torch.exp(new_logprobs[old_logprobs_mask]).to(torch.float64)
+    return torch.stack(
+        (
+            old_probs.new_tensor(old_probs.numel()),
+            old_probs.sum(),
+            new_probs.sum(),
+            old_probs.square().sum(),
+            new_probs.square().sum(),
+            (old_probs * new_probs).sum(),
+        )
+    )
+
+
+def probability_correlation_from_stats(stats: torch.Tensor) -> torch.Tensor:
+    if stats.shape != (PROBABILITY_CORRELATION_STAT_COUNT,):
+        raise ValueError("invalid probability-correlation statistics shape")
+    count, sum_x, sum_y, sum_x2, sum_y2, sum_xy = stats
+    covariance = count * sum_xy - sum_x * sum_y
+    variance_x = count * sum_x2 - sum_x.square()
+    variance_y = count * sum_y2 - sum_y.square()
+    denominator = (variance_x.clamp_min(0) * variance_y.clamp_min(0)).sqrt()
+    valid = (
+        (count >= 2)
+        & torch.isfinite(covariance)
+        & torch.isfinite(denominator)
+        & (denominator > 0)
+    )
+    return torch.where(valid, covariance / denominator.clamp_min(1e-30), 0.0)
 
 
 def _mask_ignored_tokens(
@@ -293,13 +348,16 @@ def loss_fn(
         ref_logprobs = _mask_ignored_tokens(ref_logprobs, assistant_mask_bool)
     assistant_mask = assistant_mask_bool.to(new_logprobs.dtype)
     weights = aligned_inputs.weights
-    probs_corr = compute_probs_corr(
+    probs_corr_stats = compute_probs_corr_stats(
         torch.where(
             assistant_mask_bool,
             old_logprobs,
             old_logprobs.new_full((), float("nan")),
         ),
         new_logprobs,
+    )
+    probs_corr = probability_correlation_from_stats(probs_corr_stats).to(
+        dtype=new_logprobs.dtype
     )
     # Assume missing old logprobs were sampled under the current policy
     old_logprobs = torch.where(
@@ -352,6 +410,8 @@ def loss_fn(
     if tau := experimental_config.get("kimi_k2_tau", None):
         advantages = advantages - tau * logprob_diff.detach()
     kl_policy_ref: torch.Tensor | None = None
+    kl_policy_ref_sum: torch.Tensor | None = None
+    kl_policy_ref_count: torch.Tensor | None = None
     kl_penalty_coef = experimental_config.get("kl_penalty_coef", 0.0)
     if kl_penalty_coef > 0 and ref_logprobs is not None:
         match experimental_config.get("kl_penalty_source", "current_learner"):
@@ -362,7 +422,9 @@ def loss_fn(
             case other:
                 raise AssertionError(other)
         kl_per_token = (kl_source_logprobs - ref_logprobs).detach() * assistant_mask
-        avg_kl = aligned_inputs.masked_mean(kl_per_token, assistant_mask)
+        kl_policy_ref_sum = kl_per_token.sum()
+        kl_policy_ref_count = assistant_mask.sum()
+        avg_kl = kl_policy_ref_sum / kl_policy_ref_count.clamp_min(1e-18)
         kl_penalty = kl_penalty_coef * (avg_kl - kl_per_token) * assistant_mask
         advantages = advantages + kl_penalty
         kl_policy_ref = avg_kl
@@ -414,7 +476,10 @@ def loss_fn(
         entropy=entropy,
         policy_loss_sum=policy_loss.sum(),
         probs_corr=probs_corr,
+        probs_corr_stats=probs_corr_stats,
         kl_policy_ref=kl_policy_ref,
+        kl_policy_ref_sum=kl_policy_ref_sum,
+        kl_policy_ref_count=kl_policy_ref_count,
         offpolicy_diagnostics=offpolicy_diagnostics,
     )
 

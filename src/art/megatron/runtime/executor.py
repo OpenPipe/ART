@@ -44,6 +44,10 @@ from art.utils.safetensors import (
 )
 
 from ..tensor_snapshot import PendingCpuSnapshot, PinnedCpuSnapshotStager
+from ..training.command_telemetry import (
+    PendingRankCommandTelemetry,
+    materialize_rank_telemetry,
+)
 from ..training.gradient_accumulator import GradientAccumulator
 from .data_plane import InMemoryPackedBatch, SFTBatchData, validate_packed_batch
 from .publication import (
@@ -191,7 +195,9 @@ class ForwardBackwardRankLaunch(BaseModel):
     candidate_capacity: int | None
     coordinator: bool
     return_token_logprobs: bool
-    snapshot: SkipValidation[PendingCpuSnapshot[Any]]
+    token_count: int
+    telemetry: SkipValidation[PendingRankCommandTelemetry]
+    snapshot: SkipValidation[PendingCpuSnapshot[dict[str, Any]]]
     staging: SkipValidation[_ForwardBackwardResultStagerLease]
     _materialize_lock: Lock = PrivateAttr(default_factory=Lock)
     _materialized: dict[str, Any] | None = PrivateAttr(default=None)
@@ -206,20 +212,20 @@ class ForwardBackwardRankLaunch(BaseModel):
                 assert self._materialized is not None
                 return self._materialized
             try:
-                result = self.snapshot.resolve()
-                staged_result = result.get("result")
+                staged = self.snapshot.resolve()
                 materialized = {
                     "operation_id": self.operation_id,
                     "learner_version": self.learner_version,
-                    "token_count": int(result["token_count"].item()),
-                    "metrics": (
-                        staged_result.metrics() if self.coordinator else {}
+                    "token_count": self.token_count,
+                    "metrics": {},
+                    "_rank_telemetry": materialize_rank_telemetry(
+                        self.telemetry, staged["statistics"]
                     ),
                     "token_logprobs": (
                         _materialize_command_token_logprobs(
                             self.batch,
                             self.candidate_capacity,
-                            tuple(staged_result.result.new_logprobs),
+                            tuple(staged["token_logprobs"]),
                         )
                         if self.coordinator and self.return_token_logprobs
                         else ()
@@ -245,9 +251,10 @@ class ForwardRankLaunch(BaseModel):
     batch: SkipValidation[PackedBatchRef]
     candidate_capacity: int | None
     coordinator: bool
-    snapshot: SkipValidation[PendingCpuSnapshot[Any]]
+    telemetry: SkipValidation[PendingRankCommandTelemetry | None]
+    snapshot: SkipValidation[PendingCpuSnapshot[dict[str, Any]]]
     staging: SkipValidation[_ForwardBackwardResultStagerLease]
-    metrics: dict[str, float]
+    base_metrics: dict[str, float]
     _materialize_lock: Lock = PrivateAttr(default_factory=Lock)
     _materialized: dict[str, Any] | None = PrivateAttr(default=None)
     _materialization_error: BaseException | None = PrivateAttr(default=None)
@@ -261,14 +268,27 @@ class ForwardRankLaunch(BaseModel):
                 assert self._materialized is not None
                 return self._materialized
             try:
-                outputs = tuple(self.snapshot.resolve())
+                staged = self.snapshot.resolve()
                 self._materialized = {
                     "operation_id": self.operation_id,
                     "learner_version": self.learner_version,
-                    "metrics": self.metrics if self.coordinator else {},
+                    "metrics": (
+                        self.base_metrics
+                        if self.coordinator and self.telemetry is None
+                        else {}
+                    ),
+                    "_rank_telemetry": (
+                        None
+                        if self.telemetry is None
+                        else materialize_rank_telemetry(
+                            self.telemetry, staged["statistics"]
+                        )
+                    ),
                     "token_logprobs": (
                         _materialize_command_token_logprobs(
-                            self.batch, self.candidate_capacity, outputs
+                            self.batch,
+                            self.candidate_capacity,
+                            tuple(staged["token_logprobs"]),
                         )
                         if self.coordinator
                         else ()
@@ -291,6 +311,9 @@ class SftRankLaunch(BaseModel):
     operation_id: str
     learner_version: int
     coordinator: bool
+    token_count: int
+    telemetry: SkipValidation[PendingRankCommandTelemetry]
+    logprob_lengths: tuple[int, ...]
     snapshot: SkipValidation[PendingCpuSnapshot[dict[str, Any]]]
     staging: SkipValidation[_ForwardBackwardResultStagerLease]
     _materialize_lock: Lock = PrivateAttr(default_factory=Lock)
@@ -307,20 +330,27 @@ class SftRankLaunch(BaseModel):
                 return self._materialized
             try:
                 staged = self.snapshot.resolve()
-                if self.coordinator:
-                    from .sft_result import materialize_sft_command_result
-
-                    result = materialize_sft_command_result(staged)
-                else:
-                    result = {
-                        "operation_id": self.operation_id,
-                        "token_count": int(staged["token_count"].item()),
-                        "metrics": {},
-                        "token_logprobs": (),
-                    }
+                token_logprobs = ()
+                if self.coordinator and "logprob_values" in staged:
+                    present = staged["logprob_present"]
+                    if not bool(torch.all(present == 1)):
+                        raise RuntimeError(
+                            "SFT forward did not materialize every trajectory"
+                        )
+                    values = staged["logprob_values"]
+                    token_logprobs = tuple(
+                        tuple(float(value) for value in values[index, :length].tolist())
+                        for index, length in enumerate(self.logprob_lengths)
+                    )
                 self._materialized = {
-                    **result,
+                    "operation_id": self.operation_id,
                     "learner_version": self.learner_version,
+                    "token_count": self.token_count,
+                    "metrics": {},
+                    "_rank_telemetry": materialize_rank_telemetry(
+                        self.telemetry, staged["statistics"]
+                    ),
+                    "token_logprobs": token_logprobs,
                 }
                 return self._materialized
             except BaseException as error:
@@ -341,7 +371,16 @@ def _stage_forward_rank_result(
 ) -> ForwardRankLaunch:
     staging = pool.acquire()
     try:
-        outputs = tuple(result["token_logprobs"]) if job.return_token_logprobs else ()
+        outputs = (
+            tuple(result["token_logprobs"])
+            if coordinator and job.return_token_logprobs
+            else ()
+        )
+        telemetry = result.get("telemetry")
+        if telemetry is None:
+            base_metrics = cast(dict[str, float], result["metrics"])
+        else:
+            base_metrics = {}
         builder = staging.stager.begin()
         target_tokens = (
             batch.tensors.get("target_tokens")
@@ -356,9 +395,19 @@ def _stage_forward_rank_result(
                 None if target_tokens is None else int(target_tokens.shape[2])
             ),
             coordinator=coordinator,
-            snapshot=builder.finish(builder.stage_group(outputs)),
+            telemetry=telemetry,
+            snapshot=builder.finish(
+                {
+                    "token_logprobs": builder.stage_group(outputs),
+                    **(
+                        {"statistics": builder.stage(telemetry.statistics)}
+                        if telemetry is not None
+                        else {}
+                    ),
+                }
+            ),
             staging=staging,
-            metrics=result["metrics"],
+            base_metrics=base_metrics,
         )
     except BaseException:
         staging.release()
@@ -379,23 +428,14 @@ def _stage_forward_backward_rank_result(
         # These are command-result allocations, not mutable parameter, optimizer,
         # or accumulator storage. The builder retains and record_streams CUDA
         # sources until its side-stream copy completes.
-        staged: dict[str, Any] = {"token_count": builder.stage(result.token_count)}
-        if coordinator:
-            step = result.result
-            staged["result"] = result.model_copy(
-                update={
-                    "result": step.model_copy(
-                        update={
-                            "reduced_loss": builder.stage(step.reduced_loss),
-                            "new_logprobs": (
-                                list(builder.stage_group(step.new_logprobs))
-                                if job.return_token_logprobs
-                                else []
-                            ),
-                        }
-                    )
-                }
-            )
+        staged: dict[str, Any] = {
+            "statistics": builder.stage(result.telemetry.statistics),
+            "token_logprobs": (
+                builder.stage_group(result.new_logprobs)
+                if coordinator and job.return_token_logprobs
+                else ()
+            ),
+        }
         target_tokens = (
             batch.tensors.get("target_tokens")
             if batch.ref.training_kind == "tokenized"
@@ -410,6 +450,8 @@ def _stage_forward_backward_rank_result(
             ),
             coordinator=coordinator,
             return_token_logprobs=job.return_token_logprobs,
+            token_count=job.trainable_token_count,
+            telemetry=result.telemetry,
             snapshot=builder.finish(staged),
             staging=staging,
         )
@@ -428,20 +470,23 @@ def _stage_sft_rank_result(
     staging = pool.acquire()
     try:
         builder = staging.stager.begin()
-        staged: dict[str, Any] = {}
-        if coordinator:
-            staged.update(result)
-            staged["reduced_loss"] = builder.stage(result["reduced_loss"])
+        telemetry = cast(PendingRankCommandTelemetry, result["telemetry"])
+        staged: dict[str, Any] = {
+            "statistics": builder.stage(telemetry.statistics)
+        }
+        if coordinator and job.return_token_logprobs:
             values = result["logprob_values"]
             present = result["logprob_present"]
             if values is not None:
                 staged["logprob_values"] = builder.stage(values)
                 staged["logprob_present"] = builder.stage(present)
-        staged["token_count"] = builder.stage(result["token_count"])
         return SftRankLaunch(
             operation_id=job.operation_id,
             learner_version=job.expected_learner_version,
             coordinator=coordinator,
+            token_count=job.trainable_token_count,
+            telemetry=telemetry,
+            logprob_lengths=tuple(result["logprob_lengths"]),
             snapshot=builder.finish(staged),
             staging=staging,
         )
@@ -468,6 +513,9 @@ class MegatronTrainJobExecutor:
             capacity=int(runtime.snapshot_pool_capacity),
         )
         self._gradients = GradientAccumulator(model_chunks=runtime.model)
+        self._command_result_stagers = _ForwardBackwardResultStagerPool(
+            int(runtime.snapshot_pool_capacity)
+        )
         self._gradient_parent_version: int | None = None
         self._python_gc_stabilized = False
         self._closed = False
@@ -670,17 +718,13 @@ class MegatronTrainJobExecutor:
             cancelled=cancelled,
         )
         self._gradient_parent_version = job.expected_learner_version
-        step = result.result
-        return {
-            "operation_id": job.operation_id,
-            "metrics": result.metrics(),
-            "token_count": int(result.token_count.item()),
-            "token_logprobs": (
-                _command_token_logprobs(batch, step.new_logprobs)
-                if job.return_token_logprobs
-                else ()
-            ),
-        }
+        return _stage_forward_backward_rank_result(
+            self._command_result_stagers,
+            job,
+            batch,
+            result,
+            coordinator=int(self.runtime.rank) == 0,
+        ).materialize()
 
     def execute_forward(
         self,
@@ -704,14 +748,13 @@ class MegatronTrainJobExecutor:
             batch.tensors,
             cancelled=cancelled,
         )
-        return {
-            **result,
-            "token_logprobs": (
-                _command_token_logprobs(batch, result["token_logprobs"])
-                if job.return_token_logprobs
-                else ()
-            ),
-        }
+        return _stage_forward_rank_result(
+            self._command_result_stagers,
+            job,
+            batch,
+            result,
+            coordinator=int(self.runtime.rank) == 0,
+        ).materialize()
 
     def execute_sft_forward_backward(
         self,
@@ -739,7 +782,12 @@ class MegatronTrainJobExecutor:
             cancelled=cancelled,
         )
         self._gradient_parent_version = job.expected_learner_version
-        return result
+        return _stage_sft_rank_result(
+            self._command_result_stagers,
+            job,
+            result,
+            coordinator=int(self.runtime.rank) == 0,
+        ).materialize()
 
     def execute_sft_forward(
         self,
@@ -752,12 +800,18 @@ class MegatronTrainJobExecutor:
         self._publisher.raise_if_failed()
         from art.megatron.train import execute_megatron_sft_forward_job
 
-        return execute_megatron_sft_forward_job(
+        result = execute_megatron_sft_forward_job(
             self.runtime,
             job,
             batch,
             cancelled=cancelled,
         )
+        return _stage_sft_rank_result(
+            self._command_result_stagers,
+            job,
+            result,
+            coordinator=int(self.runtime.rank) == 0,
+        ).materialize()
 
     def execute_optimizer(self, job: OptimizerJobSpec) -> dict[str, Any]:
         if self._closed:
@@ -769,7 +823,12 @@ class MegatronTrainJobExecutor:
         if runtime.optimizer is None:
             raise RuntimeError("trainer has no resident optimizer")
         self._gradients.seal(job.contributing_forward_backward_operation_ids)
-        self._gradients.prepare_optimizer()
+        accumulated = self._gradients.prepare_optimizer()
+        from art.megatron.training.finalize_grads import (
+            finalize_accumulated_model_grads,
+        )
+
+        finalize_accumulated_model_grads(runtime.model, accumulated)
         for group in runtime.optimizer.param_groups:
             group["betas"] = (job.optimizer.beta1, job.optimizer.beta2)
             group["eps"] = job.optimizer.eps
@@ -1472,7 +1531,6 @@ class MCoreRunSlotExecutor:
                 gradient_accumulator=gradients,
                 accumulator_residency=self._accumulator_resident(state),
                 cancelled=cancelled,
-                materialize_result=False,
             )
             self._register_gradient_contribution(state, job.operation_id)
         return _stage_sft_rank_result(
@@ -1510,7 +1568,6 @@ class MCoreRunSlotExecutor:
                 job,
                 batch,
                 cancelled=cancelled,
-                materialize_result=False,
             )
         return _stage_sft_rank_result(
             self._command_result_stagers, job, result, coordinator=coordinator
@@ -1531,7 +1588,29 @@ class MCoreRunSlotExecutor:
         ) as working_set:
             self._residency.wait_before_mutation_working_set(working_set)
             self.runtime.optimizer_snapshot_barrier.wait_before_mutation(key=job.run_id)
-            reduced_gradients = gradients.prepare_optimizer()
+            accumulated = gradients.prepare_optimizer()
+            expected_tokens = accumulated.expected_global_token_count
+            assert expected_tokens is not None
+            from megatron.core import parallel_state as ps
+
+            from art.megatron.training.finalize_grads import (
+                finalize_model_grads_extended,
+                reduce_accumulated_token_count,
+            )
+
+            global_tokens = reduce_accumulated_token_count(
+                accumulated.local_token_count,
+                expected_global_token_count=expected_tokens,
+                group=ps.get_data_parallel_group(with_context_parallel=True),
+            )
+            reduced_gradients = (
+                self._slot_trainer.reduce_checkpoint_slot_gradient_sums(
+                    job.run_id, accumulated.gradients
+                )
+            )
+            if accumulated.reduction == "token_mean":
+                torch._foreach_div_(reduced_gradients, global_tokens)
+            finalize_model_grads_extended(self.runtime.model, num_tokens=None)
             started = time.perf_counter()
             result = self._slot_trainer.optim_step_reduced(
                 job.run_id,

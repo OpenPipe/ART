@@ -35,6 +35,7 @@ from art.utils.lifecycle import (
     process_shutdown_timeout,
 )
 
+from ..training.command_telemetry import aggregate_rank_command_telemetry
 from .data_plane import InMemoryPackedBatch, SFTBatchData
 from .publication import (
     TRAINER_PUBLICATION_EVENT_ADAPTER,
@@ -80,6 +81,27 @@ from .specs import (
     TrainJobSpec,
     TrainProgress,
 )
+
+
+def _coordinator_command_result(
+    results: list[dict[str, Any]],
+    *,
+    expected_token_count: int,
+    aggregate_telemetry: bool,
+) -> dict[str, Any]:
+    result = dict(next(item for item in results if item["rank"] == 0))
+    payloads = [item["_rank_telemetry"] for item in results]
+    if aggregate_telemetry:
+        if any(payload is None for payload in payloads):
+            raise RuntimeError("trainer rank omitted required command telemetry")
+        result["metrics"] = aggregate_rank_command_telemetry(
+            payloads,
+            expected_token_count=expected_token_count,
+        )
+    elif any(payload is not None for payload in payloads):
+        raise RuntimeError("trainer rank returned unexpected command telemetry")
+    result.pop("_rank_telemetry")
+    return result
 
 
 class _ActorEventSink:
@@ -940,6 +962,7 @@ class MonarchTrainerActor(Actor):
                 "learner_version": job.expected_learner_version,
                 "token_count": result["token_count"],
                 "metrics": result["metrics"] if coordinator else {},
+                "_rank_telemetry": result["_rank_telemetry"],
                 "token_logprobs": result["token_logprobs"] if coordinator else (),
             }
         except BaseException:
@@ -968,6 +991,7 @@ class MonarchTrainerActor(Actor):
                 "operation_id": job.operation_id,
                 "learner_version": job.expected_learner_version,
                 "metrics": result["metrics"] if coordinator else {},
+                "_rank_telemetry": result["_rank_telemetry"],
                 "token_logprobs": result["token_logprobs"] if coordinator else (),
             }
         except BaseException:
@@ -998,6 +1022,7 @@ class MonarchTrainerActor(Actor):
                 "learner_version": job.expected_learner_version,
                 "token_count": result["token_count"],
                 "metrics": result["metrics"] if coordinator else {},
+                "_rank_telemetry": result["_rank_telemetry"],
                 "token_logprobs": result["token_logprobs"] if coordinator else (),
             }
         except BaseException:
@@ -1025,6 +1050,7 @@ class MonarchTrainerActor(Actor):
                 "learner_version": job.expected_learner_version,
                 "token_count": result["token_count"],
                 "metrics": result["metrics"] if coordinator else {},
+                "_rank_telemetry": result["_rank_telemetry"],
                 "token_logprobs": result["token_logprobs"] if coordinator else (),
             }
         except BaseException:
@@ -1181,6 +1207,7 @@ class MonarchTrainerActor(Actor):
                 "learner_version": result["learner_version"],
                 "token_count": result["token_count"],
                 "metrics": result["metrics"],
+                "_rank_telemetry": result["_rank_telemetry"],
                 "token_logprobs": result["token_logprobs"],
             }
             self._publish_compile_cache()
@@ -1238,6 +1265,7 @@ class MonarchTrainerActor(Actor):
                     "learner_version": result["learner_version"],
                     "token_count": result["token_count"],
                     "metrics": result["metrics"],
+                    "_rank_telemetry": result["_rank_telemetry"],
                     "token_logprobs": result["token_logprobs"],
                 }
 
@@ -1356,6 +1384,7 @@ class MonarchTrainerActor(Actor):
                 "operation_id": job.operation_id,
                 "learner_version": job.expected_learner_version,
                 "metrics": result["metrics"] if coordinator else {},
+                "_rank_telemetry": result["_rank_telemetry"],
                 "token_logprobs": result["token_logprobs"] if coordinator else (),
             }
             self._publish_compile_cache()
@@ -2274,7 +2303,11 @@ class MonarchTrainerSlot:
                 raise RuntimeError(
                     "trainer F/B token count differs from packed provenance"
                 )
-            result = next(result for result in results if result["rank"] == 0)
+            result = _coordinator_command_result(
+                results,
+                expected_token_count=job.trainable_token_count,
+                aggregate_telemetry=True,
+            )
             self._operations[job.operation_id] = (job.fingerprint, result)
             return result
         except BaseException as error:
@@ -2369,7 +2402,11 @@ class MonarchTrainerSlot:
                 operation_id=job.operation_id,
                 learner_version=job.expected_learner_version,
             )
-            result = next(result for result in results if result["rank"] == 0)
+            result = _coordinator_command_result(
+                results,
+                expected_token_count=job.trainable_token_count,
+                aggregate_telemetry=job.loss is not None,
+            )
             self._operations[job.operation_id] = (job.fingerprint, result)
             return result
         except BaseException as error:
@@ -2515,7 +2552,11 @@ class MonarchTrainerSlot:
                 raise RuntimeError(
                     f"trainer {label} token count differs from its payload"
                 )
-            result = next(result for result in results if result["rank"] == 0)
+            result = _coordinator_command_result(
+                results,
+                expected_token_count=job.trainable_token_count,
+                aggregate_telemetry=True,
+            )
             self._operations[job.operation_id] = (job.fingerprint, result)
             return result
         except BaseException as error:
@@ -3254,7 +3295,11 @@ class MonarchTrainerRun:
                 operation_id=job.operation_id,
                 learner_version=job.expected_learner_version,
             )
-            result = next(result for result in results if result["rank"] == 0)
+            result = _coordinator_command_result(
+                results,
+                expected_token_count=job.trainable_token_count,
+                aggregate_telemetry=job.loss is not None,
+            )
             self._next_operation_sequence += 1
             self._operations[job.operation_id] = (job.fingerprint, result)
             self._operation_sequence_ids[job.operation_id] = job.sequence_id
@@ -3298,7 +3343,11 @@ class MonarchTrainerRun:
                 raise RuntimeError(
                     "trainer F/B token count differs from packed policy provenance"
                 )
-            result = next(result for result in results if result["rank"] == 0)
+            result = _coordinator_command_result(
+                results,
+                expected_token_count=job.trainable_token_count,
+                aggregate_telemetry=True,
+            )
             self._open_forward_backward_ids.append(job.operation_id)
             self._next_operation_sequence += 1
             self._operations[job.operation_id] = (job.fingerprint, result)
@@ -3373,7 +3422,11 @@ class MonarchTrainerRun:
                     raise RuntimeError(
                         "trainer SFT token count differs from its payload"
                     )
-                result = next(item for item in results if item["rank"] == 0)
+                result = _coordinator_command_result(
+                    results,
+                    expected_token_count=job.trainable_token_count,
+                    aggregate_telemetry=True,
+                )
                 if backward:
                     self._open_forward_backward_ids.append(job.operation_id)
                 self._next_operation_sequence += 1

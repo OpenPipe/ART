@@ -1,11 +1,14 @@
 from collections.abc import Iterable
-from typing import Any, Literal, cast
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 from megatron.core import parallel_state as ps
 from megatron.core.distributed.finalize_model_grads import finalize_model_grads
 from megatron.core.transformer.module import MegatronModule
 import torch
 from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
+
+if TYPE_CHECKING:
+    from .gradient_accumulator import AccumulatedGradientSums
 
 GradSyncDomain = Literal["tp_default", "expert_tp"]
 GradSyncOp = Literal["none", "sum", "avg"]
@@ -122,6 +125,62 @@ def flush_param_grads_to_main_grads(model_chunks: Iterable[torch.nn.Module]) -> 
             ):
                 main_grad.add_(param.grad.to(dtype=main_grad.dtype))
             param.grad = None
+
+
+def reduce_accumulated_token_count(
+    local_token_count: torch.Tensor,
+    *,
+    expected_global_token_count: int,
+    group: Any,
+) -> torch.Tensor:
+    global_token_count = local_token_count.detach().clone()
+    if torch.distributed.get_world_size(group) > 1:  # ty: ignore[possibly-missing-attribute]
+        torch.distributed.all_reduce(global_token_count, group=group)  # ty: ignore[possibly-missing-attribute]
+    observed = int(global_token_count.item())
+    if observed != expected_global_token_count:
+        raise RuntimeError(
+            "accumulated trainable-token count differs from packed provenance: "
+            f"observed={observed}, expected={expected_global_token_count}"
+        )
+    return global_token_count
+
+
+def finalize_accumulated_model_grads(
+    model: list[MegatronModule],
+    accumulated: "AccumulatedGradientSums",
+    *,
+    pg_collection: Any | None = None,
+) -> torch.Tensor:
+    expected = accumulated.expected_global_token_count
+    if expected is None:
+        raise RuntimeError("optimizer gradients lack global token provenance")
+    flush_param_grads_to_main_grads(model)
+    if accumulated.reduction == "token_mean":
+        global_token_count = accumulated.local_token_count.detach().clone()
+        finalize_model_grads_extended(
+            model,
+            num_tokens=global_token_count,
+            pg_collection=pg_collection,
+        )
+        observed = int(global_token_count.item())
+        if observed != expected:
+            raise RuntimeError(
+                "accumulated trainable-token count differs from packed provenance: "
+                f"observed={observed}, expected={expected}"
+            )
+        return global_token_count
+    group = (
+        pg_collection.dp_cp
+        if pg_collection is not None
+        else ps.get_data_parallel_group(with_context_parallel=True)
+    )
+    global_token_count = reduce_accumulated_token_count(
+        accumulated.local_token_count,
+        expected_global_token_count=expected,
+        group=group,
+    )
+    finalize_model_grads_extended(model, num_tokens=None, pg_collection=pg_collection)
+    return global_token_count
 
 
 def finalize_model_grads_extended(

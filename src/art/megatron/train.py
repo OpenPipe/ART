@@ -37,12 +37,14 @@ from torch._inductor.runtime.cache_dir_utils import cache_dir as inductor_cache_
 
 from art import dev, types
 from art.loss import (
+    PROBABILITY_CORRELATION_STAT_COUNT,
     AlignedLossInputs,
     LossInputs,
     LossOffPolicyDiagnostics,
     LossOffPolicyDiagnosticsAccumulator,
-    compute_probs_corr,
+    compute_probs_corr_stats,
     loss_fn,
+    probability_correlation_from_stats,
     shift_tensor,
 )
 from art.megatron.context_parallel.types import (
@@ -73,7 +75,6 @@ from art.megatron.routing_replay import (
     prepare_moe_routing_replay_boundaries,
 )
 from art.megatron.runtime.data_plane import SFTBatchData
-from art.megatron.runtime.sft_result import materialize_sft_command_result
 from art.megatron.runtime.specs import (
     ForwardBackwardJobSpec,
     ForwardJobSpec,
@@ -97,6 +98,11 @@ from art.megatron.selective_lm_head import (
     vocab_parallel_selected_logprobs,
 )
 from art.megatron.tensor_snapshot import SnapshotReadBarrier
+from art.megatron.training.command_telemetry import (
+    PendingRankCommandTelemetry,
+    rank_telemetry_statistics,
+    rank_telemetry_topology,
+)
 from art.megatron.training.compile import configure_training_compile
 from art.megatron.training.finalize_grads import (
     finalize_model_grads_extended,
@@ -270,34 +276,26 @@ class MegatronForwardBackwardStepResult(BaseModel):
 class MegatronForwardBackwardJobResult(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
-    result: MegatronForwardBackwardStepResult
+    new_logprobs: tuple[torch.Tensor, ...]
+    telemetry: PendingRankCommandTelemetry
     num_gradient_steps: int = Field(ge=1)
-    forward_backward_s: float = Field(ge=0)
-    replay_finalize_s: float = Field(ge=0)
     token_count: torch.Tensor
-
-    def metrics(self) -> dict[str, float]:
-        metrics = _rl_forward_backward_metrics(
-            self.result,
-            num_gradient_steps=self.num_gradient_steps,
-            forward_backward_s=self.forward_backward_s,
-        )
-        metrics["time/replay_finalize_s"] = self.replay_finalize_s
-        return metrics
 
 
 class RLForwardBackwardState(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
     raw_loss_sum: torch.Tensor
-    probs_corr_total: torch.Tensor
-    kl_values: tuple[float, ...]
+    probs_corr_stats: torch.Tensor
+    kl_sum: torch.Tensor
+    kl_count: torch.Tensor
     new_logprobs: tuple[torch.Tensor, ...]
     token_count: torch.Tensor
     micro_count: int = Field(ge=1)
     schedule: MCoreScheduleAdapter[PreparedRLMicroInputs]
     loss_diagnostics: LossOffPolicyDiagnosticsAccumulator
     inter_schedule_metrics: dict[str, float] = Field(default_factory=dict)
+    deferred_inter_schedule_metrics: Callable[[], dict[str, float]] | None = None
 
 
 class SFTForwardBackwardState(BaseModel):
@@ -651,6 +649,7 @@ def _execute_megatron_rl_forward_backward_steps(
     replay_bundle: MoeRoutingReplayBundle | None = None,
     state_is_resident: bool = False,
     forward_only: bool = False,
+    defer_grad_sync: bool = False,
 ) -> tuple[dict[str, torch.dtype], float, int, float]:
     job_prepare_started = time.perf_counter()
     template = None
@@ -811,6 +810,8 @@ def _execute_megatron_rl_forward_backward_steps(
                     if isinstance(job, ForwardBackwardJobSpec)
                     else True
                 ),
+                defer_grad_sync=defer_grad_sync,
+                rank_local_metrics=isinstance(job, ForwardBackwardJobSpec),
             )
             after_step(
                 step_index,
@@ -1097,6 +1098,92 @@ def execute_megatron_sft_job(
             del adapter_dtypes
 
 
+def _sum_training_workloads(
+    workloads: tuple[TrainingStepWorkload, ...],
+) -> TrainingStepWorkload:
+    return TrainingStepWorkload(
+        **{
+            name: sum(getattr(workload, name) for workload in workloads)
+            for name in TrainingStepWorkload.model_fields
+        }
+    )
+
+
+def _pending_rl_command_telemetry(
+    states: tuple[RLForwardBackwardState, ...],
+    *,
+    backward: bool,
+    elapsed_s: float,
+    replay_finalize_s: float,
+) -> PendingRankCommandTelemetry:
+    if not states:
+        raise ValueError("RL command telemetry requires at least one schedule")
+    diagnostics = LossOffPolicyDiagnosticsAccumulator()
+    for state in states:
+        diagnostics.extend(state.loss_diagnostics)
+    zero = states[0].raw_loss_sum.new_zeros(())
+    return PendingRankCommandTelemetry(
+        program="rl",
+        backward=backward,
+        topology=rank_telemetry_topology(),
+        statistics=rank_telemetry_statistics(
+            loss_sum=sum((state.raw_loss_sum for state in states), zero),
+            token_count=sum((state.token_count for state in states), zero),
+            correlation=sum(
+                (state.probs_corr_stats for state in states),
+                states[0].probs_corr_stats.new_zeros(
+                    states[0].probs_corr_stats.shape
+                ),
+            ),
+            kl_sum=sum((state.kl_sum for state in states), zero),
+            kl_count=sum((state.kl_count for state in states), zero),
+            diagnostics=diagnostics,
+        ),
+        workload=_sum_training_workloads(
+            tuple(state.schedule.local_training_workload() for state in states)
+        ),
+        schedules=tuple(state.schedule.telemetry for state in states),
+        inter_metric_readers=tuple(
+            reader
+            for state in states
+            if (reader := state.deferred_inter_schedule_metrics) is not None
+        ),
+        base_metrics={
+            ("time/forward_backward_s" if backward else "time/forward_s"): elapsed_s,
+            "time/replay_finalize_s": replay_finalize_s,
+        },
+        num_gradient_steps=len(states),
+    )
+
+
+def _pending_sft_command_telemetry(
+    state: SFTForwardBackwardState,
+    *,
+    local_token_count: torch.Tensor,
+    backward: bool,
+    elapsed_s: float,
+) -> PendingRankCommandTelemetry:
+    zero = state.raw_loss_sum.new_zeros(())
+    return PendingRankCommandTelemetry(
+        program="sft",
+        backward=backward,
+        topology=rank_telemetry_topology(),
+        statistics=rank_telemetry_statistics(
+            loss_sum=state.raw_loss_sum,
+            token_count=local_token_count,
+            correlation=zero.new_zeros(PROBABILITY_CORRELATION_STAT_COUNT),
+            kl_sum=zero,
+            kl_count=zero,
+            diagnostics=LossOffPolicyDiagnosticsAccumulator(),
+        ),
+        workload=state.schedule.local_training_workload(),
+        schedules=(state.schedule.telemetry,),
+        base_metrics={
+            ("time/forward_backward_s" if backward else "time/forward_s"): elapsed_s
+        },
+    )
+
+
 def execute_megatron_rl_forward_backward_job(
     runtime: TrainingRuntime,
     job: ForwardBackwardJobSpec,
@@ -1114,7 +1201,6 @@ def execute_megatron_rl_forward_backward_job(
     reduction = "sum" if job.loss is not None else "token_mean"
     states: list[RLForwardBackwardState] = []
     durations: list[float] = []
-    global_token_counts: list[torch.Tensor] = []
 
     def before_step(step_index: int) -> None:
         if step_index:
@@ -1128,19 +1214,13 @@ def execute_megatron_rl_forward_backward_job(
         _replay_finalize_s: float,
         _step_input_prepare_s: float,
     ) -> None:
-        global_token_count = state.token_count.detach().clone()
-        torch.distributed.all_reduce(
-            global_token_count,
-            group=ps.get_data_parallel_group(with_context_parallel=True),
-        )
         internal.record(
             f"{job.operation_id}:{step_index}",
-            global_token_count,
+            state.token_count,
             reduction=reduction,
         )
         states.append(state)
         durations.append(duration_s)
-        global_token_counts.append(global_token_count)
 
     _, replay_finalize_s, _, _ = _execute_megatron_rl_forward_backward_steps(
         runtime,
@@ -1150,25 +1230,34 @@ def execute_megatron_rl_forward_backward_job(
         after_step=record_step,
         cancelled=cancelled,
         replay_bundle=replay_bundle,
+        defer_grad_sync=True,
     )
     finish_started = time.perf_counter()
     internal.seal(internal.contribution_ids)
-    internal.prepare_optimizer()
-    internal.consume()
-    token_count = sum(
-        global_token_counts,
-        torch.zeros_like(global_token_counts[0]),
+    local_sums = internal.prepare_local_sums()
+    gradient_accumulator.record(
+        job.operation_id,
+        local_sums.local_token_count,
+        expected_global_token_count=job.trainable_token_count,
+        reduction=reduction,
     )
-    gradient_accumulator.record(job.operation_id, token_count, reduction=reduction)
-    result = _finish_megatron_rl_forward_backward_job(tuple(states))
+    internal.consume()
+    token_count = local_sums.local_token_count.new_tensor(job.trainable_token_count)
+    elapsed_s = sum(durations) + time.perf_counter() - finish_started
     runtime.resident_training_session_id = job.training_session_id
     runtime.resident_policy_step = job.expected_learner_version
     runtime.optimizer_state_loaded = True
     return MegatronForwardBackwardJobResult(
-        result=result,
+        new_logprobs=tuple(
+            value for state in states for value in state.new_logprobs
+        ),
+        telemetry=_pending_rl_command_telemetry(
+            tuple(states),
+            backward=True,
+            elapsed_s=elapsed_s,
+            replay_finalize_s=replay_finalize_s,
+        ),
         num_gradient_steps=len(states),
-        forward_backward_s=sum(durations) + time.perf_counter() - finish_started,
-        replay_finalize_s=replay_finalize_s,
         token_count=token_count,
     )
 
@@ -1206,7 +1295,6 @@ def execute_megatron_dynamic_lora_forward_backward_job(
     reduction = "sum" if job.loss is not None else "token_mean"
     states: list[RLForwardBackwardState] = []
     durations: list[float] = []
-    global_token_counts: list[torch.Tensor] = []
     gradient_accumulator.before_forward_backward()
 
     def before_step(_step_index: int) -> None:
@@ -1220,26 +1308,15 @@ def execute_megatron_dynamic_lora_forward_backward_job(
         _replay_finalize_s: float,
         _step_input_prepare_s: float,
     ) -> None:
-        global_token_count = state.token_count.detach().clone()
-        torch.distributed.all_reduce(
-            global_token_count,
-            group=ps.get_data_parallel_group(with_context_parallel=True),
-        )
-        gradients = slot_trainer.reduce_checkpoint_slot_grads(
-            slot_name,
-            scale_grads=(
-                1.0 if reduction == "sum" else 1.0 / float(global_token_count.item())
-            ),
-        )
+        gradients = slot_trainer.checkpoint_slot_local_gradient_sums(slot_name)
         internal.record(
             f"{job.operation_id}:{step_index}",
-            global_token_count,
+            state.token_count,
             gradients,
             reduction=reduction,
         )
         states.append(state)
         durations.append(duration_s)
-        global_token_counts.append(global_token_count)
 
     with use_lora_slot(slot_ref):
         _, replay_finalize_s, _, _ = _execute_megatron_rl_forward_backward_steps(
@@ -1251,25 +1328,34 @@ def execute_megatron_dynamic_lora_forward_backward_job(
             cancelled=cancelled,
             replay_bundle=replay_bundle,
             state_is_resident=True,
+            defer_grad_sync=True,
         )
     finish_started = time.perf_counter()
     internal.seal(internal.contribution_ids)
-    gradients = internal.prepare_optimizer()
-    token_count = sum(
-        global_token_counts,
-        torch.zeros_like(global_token_counts[0]),
-    )
+    local_sums = internal.prepare_local_sums()
     with accumulator_residency:
         gradient_accumulator.record(
-            job.operation_id, token_count, gradients, reduction=reduction
+            job.operation_id,
+            local_sums.local_token_count,
+            local_sums.gradients,
+            expected_global_token_count=job.trainable_token_count,
+            reduction=reduction,
         )
     internal.consume()
     slot_trainer.clear_checkpoint_slot_grads(slot_name)
+    token_count = local_sums.local_token_count.new_tensor(job.trainable_token_count)
+    elapsed_s = sum(durations) + time.perf_counter() - finish_started
     return MegatronForwardBackwardJobResult(
-        result=_finish_megatron_rl_forward_backward_job(tuple(states)),
+        new_logprobs=tuple(
+            value for state in states for value in state.new_logprobs
+        ),
+        telemetry=_pending_rl_command_telemetry(
+            tuple(states),
+            backward=True,
+            elapsed_s=elapsed_s,
+            replay_finalize_s=replay_finalize_s,
+        ),
         num_gradient_steps=len(states),
-        forward_backward_s=sum(durations) + time.perf_counter() - finish_started,
-        replay_finalize_s=replay_finalize_s,
         token_count=token_count,
     )
 
@@ -1325,20 +1411,6 @@ def _sft_command_inputs(
     )
 
 
-def _global_sft_loss_and_tokens(
-    state: SFTForwardBackwardState,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    token_count = _local_trainable_sft_token_count_tensor(
-        state.prepared_micros, device=state.device
-    )
-    raw_loss_sum = state.raw_loss_sum.detach().clone()
-    if torch.distributed.is_initialized():
-        group = ps.get_data_parallel_group(with_context_parallel=True)
-        torch.distributed.all_reduce(token_count, group=group)
-        torch.distributed.all_reduce(raw_loss_sum, group=group)
-    return raw_loss_sum / token_count, token_count
-
-
 def _global_sft_logprob_tensors(
     state: SFTForwardBackwardState,
     batch: SFTBatchData,
@@ -1371,30 +1443,28 @@ def _sft_command_result(
     job: SftForwardBackwardJobSpec | SftForwardJobSpec,
     batch: SFTBatchData,
     state: SFTForwardBackwardState,
-    reduced_loss: torch.Tensor,
-    token_count: torch.Tensor,
+    local_token_count: torch.Tensor,
     elapsed_s: float,
     backward: bool,
-    materialize: bool,
 ) -> dict[str, Any]:
-    workload = state.schedule.training_workload()
     values = present = None
     lengths: tuple[int, ...] = ()
     if job.return_token_logprobs:
         values, present, lengths = _global_sft_logprob_tensors(state, batch)
     result = {
         "operation_id": job.operation_id,
-        "reduced_loss": reduced_loss,
-        "token_count": token_count,
-        "workload": workload,
-        "telemetry": state.schedule.telemetry,
-        "elapsed_s": elapsed_s,
-        "backward": backward,
+        "token_count": local_token_count.new_tensor(job.trainable_token_count),
+        "telemetry": _pending_sft_command_telemetry(
+            state,
+            local_token_count=local_token_count,
+            backward=backward,
+            elapsed_s=elapsed_s,
+        ),
         "logprob_values": values,
         "logprob_present": present,
         "logprob_lengths": lengths,
     }
-    return materialize_sft_command_result(result) if materialize else result
+    return result
 
 
 def execute_megatron_sft_forward_backward_job(
@@ -1404,7 +1474,6 @@ def execute_megatron_sft_forward_backward_job(
     *,
     gradient_accumulator: Any,
     cancelled: Event | None = None,
-    materialize_result: bool = True,
 ) -> dict[str, Any]:
     """Run one supervised F/B against the resident single-run learner."""
     if cancelled is not None and cancelled.is_set():
@@ -1423,9 +1492,16 @@ def execute_megatron_sft_forward_backward_job(
         step_index=0,
         sample_index=indices,
         hybridep_token_counts=hybridep_token_counts,
+        defer_grad_sync=True,
     )
-    reduced_loss, token_count = _global_sft_loss_and_tokens(state)
-    gradient_accumulator.record(job.operation_id, token_count)
+    local_token_count = _local_trainable_sft_token_count_tensor(
+        state.prepared_micros, device=state.device
+    )
+    gradient_accumulator.record(
+        job.operation_id,
+        local_token_count,
+        expected_global_token_count=job.trainable_token_count,
+    )
     runtime.resident_training_session_id = job.training_session_id
     runtime.resident_policy_step = job.expected_learner_version
     runtime.optimizer_state_loaded = True
@@ -1433,11 +1509,9 @@ def execute_megatron_sft_forward_backward_job(
         job=job,
         batch=batch,
         state=state,
-        reduced_loss=reduced_loss,
-        token_count=token_count,
+        local_token_count=local_token_count,
         elapsed_s=time.perf_counter() - started,
         backward=True,
-        materialize=materialize_result,
     )
 
 
@@ -1447,7 +1521,6 @@ def execute_megatron_sft_forward_job(
     batch: SFTBatchData,
     *,
     cancelled: Event | None = None,
-    materialize_result: bool = True,
 ) -> dict[str, Any]:
     """Run one supervised forward without mutating accumulated gradients."""
     if cancelled is not None and cancelled.is_set():
@@ -1465,16 +1538,16 @@ def execute_megatron_sft_forward_job(
         sample_index=indices,
         hybridep_token_counts=hybridep_token_counts,
     )
-    reduced_loss, token_count = _global_sft_loss_and_tokens(state)
+    local_token_count = _local_trainable_sft_token_count_tensor(
+        state.prepared_micros, device=state.device
+    )
     return _sft_command_result(
         job=job,
         batch=batch,
         state=state,
-        reduced_loss=reduced_loss,
-        token_count=token_count,
+        local_token_count=local_token_count,
         elapsed_s=time.perf_counter() - started,
         backward=False,
-        materialize=materialize_result,
     )
 
 
@@ -1487,7 +1560,6 @@ def execute_megatron_dynamic_lora_sft_forward_backward_job(
     gradient_accumulator: Any,
     accumulator_residency: AbstractContextManager[None],
     cancelled: Event | None = None,
-    materialize_result: bool = True,
 ) -> dict[str, Any]:
     from art.megatron.lora import LoRASlotRef, use_lora_slot
 
@@ -1508,23 +1580,26 @@ def execute_megatron_dynamic_lora_sft_forward_backward_job(
                 step_index=0,
                 sample_index=indices,
                 hybridep_token_counts=hybridep_token_counts,
+                defer_grad_sync=True,
             )
-        reduced_loss, token_count = _global_sft_loss_and_tokens(state)
-        gradients = slot_trainer.reduce_checkpoint_slot_grads(
-            job.run_id,
-            scale_grads=1.0 / float(token_count.item()),
+        local_token_count = _local_trainable_sft_token_count_tensor(
+            state.prepared_micros, device=state.device
         )
+        gradients = slot_trainer.checkpoint_slot_local_gradient_sums(job.run_id)
         with accumulator_residency:
-            gradient_accumulator.record(job.operation_id, token_count, gradients)
+            gradient_accumulator.record(
+                job.operation_id,
+                local_token_count,
+                gradients,
+                expected_global_token_count=job.trainable_token_count,
+            )
         return _sft_command_result(
             job=job,
             batch=batch,
             state=state,
-            reduced_loss=reduced_loss,
-            token_count=token_count,
+            local_token_count=local_token_count,
             elapsed_s=time.perf_counter() - started,
             backward=True,
-            materialize=materialize_result,
         )
     finally:
         slot_trainer.clear_checkpoint_slot_grads(job.run_id)
@@ -1536,7 +1611,6 @@ def execute_megatron_dynamic_lora_sft_forward_job(
     batch: SFTBatchData,
     *,
     cancelled: Event | None = None,
-    materialize_result: bool = True,
 ) -> dict[str, Any]:
     from art.megatron.lora import LoRASlotRef, use_lora_slot
 
@@ -1555,16 +1629,16 @@ def execute_megatron_dynamic_lora_sft_forward_job(
             sample_index=indices,
             hybridep_token_counts=hybridep_token_counts,
         )
-    reduced_loss, token_count = _global_sft_loss_and_tokens(state)
+    local_token_count = _local_trainable_sft_token_count_tensor(
+        state.prepared_micros, device=state.device
+    )
     return _sft_command_result(
         job=job,
         batch=batch,
         state=state,
-        reduced_loss=reduced_loss,
-        token_count=token_count,
+        local_token_count=local_token_count,
         elapsed_s=time.perf_counter() - started,
         backward=False,
-        materialize=materialize_result,
     )
 
 
@@ -1603,17 +1677,17 @@ def execute_megatron_rl_forward_job(
             state_is_resident=state_is_resident,
             forward_only=True,
         )
-        result = _finish_megatron_rl_forward_backward_job(tuple(states))
         return {
             "operation_id": job.operation_id,
-            "token_logprobs": tuple(result.new_logprobs),
-            "metrics": {
-                "loss/train": float(result.reduced_loss.item()),
-                "time/forward_s": time.perf_counter() - started,
-                "time/replay_finalize_s": replay_finalize_s,
-                **result.loss_metrics,
-                **result.pipeline_metrics,
-            },
+            "token_logprobs": tuple(
+                value for state in states for value in state.new_logprobs
+            ),
+            "telemetry": _pending_rl_command_telemetry(
+                tuple(states),
+                backward=False,
+                elapsed_s=time.perf_counter() - started,
+                replay_finalize_s=replay_finalize_s,
+            ),
         }
     global_sequences = resolve_global_grad_accumulation_sequences(
         job.config.grad_accumulation_sequences
@@ -2248,8 +2322,19 @@ def _finalize_model_grads_without_normalization(
     finalize_model_grads_extended(model, num_tokens=None, **kwargs)
 
 
+def _defer_model_grad_finalization(
+    model: list[MegatronModule],
+    num_tokens: torch.Tensor | None = None,
+    **kwargs: Any,
+) -> None:
+    del model, num_tokens, kwargs
+
+
 def _install_schedule_finalize(
-    model_chunks: ModelChunks, *, normalize_by_tokens: bool = True
+    model_chunks: ModelChunks,
+    *,
+    normalize_by_tokens: bool = True,
+    defer_grad_sync: bool = False,
 ) -> None:
     seen: set[int] = set()
     for chunk in model_chunks:
@@ -2258,9 +2343,13 @@ def _install_schedule_finalize(
             continue
         seen.add(id(config))
         config.finalize_model_grads_func = (
-            finalize_model_grads_extended
-            if normalize_by_tokens
-            else _finalize_model_grads_without_normalization
+            _defer_model_grad_finalization
+            if defer_grad_sync
+            else (
+                finalize_model_grads_extended
+                if normalize_by_tokens
+                else _finalize_model_grads_without_normalization
+            )
         )
 
 
@@ -3256,6 +3345,7 @@ def _run_megatron_sft_schedule(
     moe_routing_replay_controller: MoeRoutingReplayController | None = None,
     hybridep_token_counts: list[int] | None = None,
     forward_only: bool,
+    defer_grad_sync: bool = False,
 ) -> SFTForwardBackwardState:
     micro_inputs = inputs if isinstance(inputs, list) else [inputs]
     if not micro_inputs:
@@ -3290,7 +3380,7 @@ def _run_megatron_sft_schedule(
 
     if not forward_only:
         _zero_grad_buffers(model_chunks)
-        _install_schedule_finalize(model_chunks)
+        _install_schedule_finalize(model_chunks, defer_grad_sync=defer_grad_sync)
 
     pending_prepared_micro: PreparedMegatronBatch | None = None
     prepared_micros: list[PreparedSFTMicroInputs] = []
@@ -3421,6 +3511,7 @@ def run_megatron_sft_forward_backward_step(
     sample_index: int | list[int | None],
     moe_routing_replay_controller: MoeRoutingReplayController | None = None,
     hybridep_token_counts: list[int] | None = None,
+    defer_grad_sync: bool = False,
 ) -> SFTForwardBackwardState:
     return _run_megatron_sft_schedule(
         model_chunks=model_chunks,
@@ -3432,6 +3523,7 @@ def run_megatron_sft_forward_backward_step(
         moe_routing_replay_controller=moe_routing_replay_controller,
         hybridep_token_counts=hybridep_token_counts,
         forward_only=False,
+        defer_grad_sync=defer_grad_sync,
     )
 
 
@@ -3487,6 +3579,7 @@ def _run_training_schedule(
     timing: _InterForwardBackwardTiming | None,
     *,
     forward_only: bool = False,
+    rank_local_metrics: bool = False,
 ) -> tuple[list[Any], Callable[[], dict[str, float]]]:
     started_s = time.monotonic()
     gap_s = (
@@ -3532,6 +3625,32 @@ def _run_training_schedule(
     local_timing = torch.tensor(
         (gap_s, *(phase_s or (math.nan, math.nan, math.nan))), dtype=torch.float64
     )
+    if rank_local_metrics:
+        rank = torch.distributed.get_rank()  # ty: ignore[possibly-missing-attribute]
+
+        def local_metrics() -> dict[str, float]:
+            phase_names = ("previous_job_tail", "worker_idle", "current_job_prepare")
+            values = {
+                f"{_INTER_FORWARD_BACKWARD_GAP_PREFIX}{rank}_s": float(
+                    local_timing[0]
+                )
+            }
+            values.update(
+                {
+                    f"{_INTER_FORWARD_BACKWARD_PHASE_PREFIX}{name}_rank_{rank}_s": float(
+                        local_timing[index]
+                    )
+                    for index, name in enumerate(phase_names, start=1)
+                    if not torch.isnan(local_timing[index])
+                }
+            )
+            if previous_cuda_end is not None and cuda_span is not None:
+                values[f"{_INTER_FORWARD_BACKWARD_GPU_GAP_PREFIX}{rank}_s"] = (
+                    previous_cuda_end.elapsed_time(cuda_span[0]) / 1e3
+                )
+            return values
+
+        return outputs, local_metrics
     rank_timings = [torch.empty_like(local_timing) for _ in range(world_size)]
     work = None
     if world_size == 1:
@@ -3645,6 +3764,8 @@ def run_megatron_rl_forward_backward_step(
     loss: LossConfig | None = None,
     forward_only: bool = False,
     return_token_logprobs: bool = True,
+    defer_grad_sync: bool = False,
+    rank_local_metrics: bool = False,
 ) -> RLForwardBackwardState:
     if forward_only and loss is None:
         raise ValueError("forward-only RL schedule requires a tokenized named loss")
@@ -3689,7 +3810,11 @@ def run_megatron_rl_forward_backward_step(
 
     if not forward_only:
         _zero_grad_buffers(model_chunks)
-        _install_schedule_finalize(model_chunks, normalize_by_tokens=loss is None)
+        _install_schedule_finalize(
+            model_chunks,
+            normalize_by_tokens=loss is None,
+            defer_grad_sync=defer_grad_sync,
+        )
 
     micro_count = len(micro_inputs)
     prepared_micros: list[PreparedRLMicroInputs] = []
@@ -3825,15 +3950,18 @@ def run_megatron_rl_forward_backward_step(
                 values = {
                     "order": item.order,
                     "raw_loss_sum": micro_loss.detach(),
-                    "probs_corr": (
-                        compute_probs_corr(
+                    "probs_corr_stats": (
+                        compute_probs_corr_stats(
                             selected_behavior.masked_fill(~active, float("nan")),
                             selected_logprobs.masked_fill(~active, float("nan")),
                         ).detach()
                         if ratio is not None
-                        else micro_loss.detach().new_zeros(())
+                        else micro_loss.detach().new_zeros(
+                            PROBABILITY_CORRELATION_STAT_COUNT
+                        )
                     ),
-                    "kl_policy_ref": None,
+                    "kl_policy_ref_sum": None,
+                    "kl_policy_ref_count": None,
                     "offpolicy_diagnostics": diagnostics,
                     "new_logprobs": prepared.lm_head_selection.restore_rows(
                         selected_logprobs.detach()
@@ -3876,15 +4004,12 @@ def run_megatron_rl_forward_backward_step(
                 {
                     "order": item.order,
                     "raw_loss_sum": micro_loss.detach(),
-                    "probs_corr": loss_info.probs_corr.detach(),
-                    "kl_policy_ref": (
-                        None
-                        if loss_info.kl_policy_ref is None
-                        else float(loss_info.kl_policy_ref.item())
-                    ),
+                    "probs_corr_stats": loss_info.probs_corr_stats.detach(),
+                    "kl_policy_ref_sum": loss_info.kl_policy_ref_sum,
+                    "kl_policy_ref_count": loss_info.kl_policy_ref_count,
                     "offpolicy_diagnostics": loss_info.offpolicy_diagnostics,
                     "new_logprobs": (
-                        token_output.restore(new_logprobs.detach()).to("cpu")
+                        token_output.restore(new_logprobs.detach())
                         if return_token_logprobs
                         else None
                     ),
@@ -3904,6 +4029,7 @@ def run_megatron_rl_forward_backward_step(
         forward_step_func,
         inter_forward_backward_timing,
         forward_only=forward_only,
+        rank_local_metrics=rank_local_metrics,
     )
     replay_finalize_started = time.perf_counter()
     if moe_routing_replay_controller is not None:
@@ -3927,17 +4053,26 @@ def run_megatron_rl_forward_backward_step(
         ),
         torch.zeros([], device=device, dtype=torch.float32),
     )
-    probs_corr_total = sum(
+    probs_corr_stats = sum(
         (
-            cast(torch.Tensor, data["probs_corr"]).to(device)
+            cast(torch.Tensor, data["probs_corr_stats"]).to(device)
             for data in pipeline_results
         ),
-        torch.zeros([], device=device, dtype=torch.float32),
+        torch.zeros(
+            PROBABILITY_CORRELATION_STAT_COUNT,
+            device=device,
+            dtype=torch.float64,
+        ),
     )
-    kl_values = [
-        float(value)
+    kl_sums = [
+        cast(torch.Tensor, value).to(device)
         for data in pipeline_results
-        if (value := data["kl_policy_ref"]) is not None
+        if (value := data["kl_policy_ref_sum"]) is not None
+    ]
+    kl_counts = [
+        cast(torch.Tensor, value).to(device)
+        for data in pipeline_results
+        if (value := data["kl_policy_ref_count"]) is not None
     ]
     loss_diagnostics = LossOffPolicyDiagnosticsAccumulator()
     for data in pipeline_results:
@@ -3948,11 +4083,23 @@ def run_megatron_rl_forward_backward_step(
         device=device,
     )
     result_collect_s = time.perf_counter() - result_collect_started
-    inter_metrics_started = time.perf_counter()
-    inter_metrics = collect_inter_schedule_metrics()
-    inter_metrics["time/post_schedule_inter_metrics_s"] = (
-        time.perf_counter() - inter_metrics_started
-    )
+    deferred_inter_metrics = None
+    if rank_local_metrics:
+        def deferred_inter_metrics() -> dict[str, float]:
+            started = time.perf_counter()
+            metrics = collect_inter_schedule_metrics()
+            metrics["time/post_schedule_inter_metrics_s"] = (
+                time.perf_counter() - started
+            )
+            return metrics
+
+        inter_metrics: dict[str, float] = {}
+    else:
+        inter_metrics_started = time.perf_counter()
+        inter_metrics = collect_inter_schedule_metrics()
+        inter_metrics["time/post_schedule_inter_metrics_s"] = (
+            time.perf_counter() - inter_metrics_started
+        )
     inter_metrics.update(
         {
             "time/schedule_prepare_s": schedule_prepare_s,
@@ -3983,14 +4130,16 @@ def run_megatron_rl_forward_backward_step(
         )
     return RLForwardBackwardState(
         raw_loss_sum=raw_loss_sum,
-        probs_corr_total=probs_corr_total,
-        kl_values=tuple(kl_values),
+        probs_corr_stats=probs_corr_stats,
+        kl_sum=sum(kl_sums, torch.zeros([], device=device, dtype=torch.float32)),
+        kl_count=sum(kl_counts, torch.zeros([], device=device, dtype=torch.float32)),
         new_logprobs=tuple(new_logprobs),
         token_count=token_count,
         micro_count=micro_count,
         schedule=schedule,
         loss_diagnostics=loss_diagnostics,
         inter_schedule_metrics=inter_metrics,
+        deferred_inter_schedule_metrics=deferred_inter_metrics,
     )
 
 
@@ -4004,9 +4153,13 @@ def _finish_megatron_rl_forward_backward_step(
     )
     return MegatronForwardBackwardStepResult(
         reduced_loss=reduced_loss,
-        probs_corr=float((state.probs_corr_total / state.micro_count).item()),
+        probs_corr=float(
+            probability_correlation_from_stats(state.probs_corr_stats).item()
+        ),
         kl_policy_ref=(
-            sum(state.kl_values) / len(state.kl_values) if state.kl_values else None
+            float((state.kl_sum / state.kl_count).item())
+            if float(state.kl_count.item()) > 0
+            else None
         ),
         new_logprobs=list(state.new_logprobs),
         workload=state.schedule.training_workload(),
@@ -4044,25 +4197,24 @@ def _finish_megatron_rl_forward_backward_job(
         tuple(state.schedule.telemetry for state in states)
     )
     pipeline_metrics.update(states[0].inter_schedule_metrics)
+    probs_corr_stats = sum(
+        (state.probs_corr_stats for state in states),
+        torch.zeros_like(states[0].probs_corr_stats),
+    )
+    kl_sum = sum((state.kl_sum for state in states), torch.zeros_like(states[0].kl_sum))
+    kl_count = sum(
+        (state.kl_count for state in states), torch.zeros_like(states[0].kl_count)
+    )
     return MegatronForwardBackwardStepResult(
         reduced_loss=_reduce_loss_sum(
             raw_loss_sum,
             token_count,
             group=ps.get_data_parallel_group(with_context_parallel=True),
         ),
-        probs_corr=float(
-            (
-                sum(
-                    (state.probs_corr_total for state in states),
-                    torch.zeros_like(states[0].probs_corr_total),
-                )
-                / sum(state.micro_count for state in states)
-            ).item()
-        ),
+        probs_corr=float(probability_correlation_from_stats(probs_corr_stats).item()),
         kl_policy_ref=(
-            sum(value for state in states for value in state.kl_values)
-            / sum(len(state.kl_values) for state in states)
-            if any(state.kl_values for state in states)
+            float((kl_sum / kl_count).item())
+            if float(kl_count.item()) > 0
             else None
         ),
         new_logprobs=[value for state in states for value in state.new_logprobs],

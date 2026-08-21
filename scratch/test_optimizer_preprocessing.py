@@ -134,30 +134,36 @@ def test_sealed_accumulator_is_masked_and_clipped_in_place(
         torch.flip(grad, dims=(-1,)).mul(0.25) for grad in first_finite
     )
     first = tuple(
-        grad.masked_fill(mask, torch.nan)
+        grad.mul(2.0).masked_fill(mask, torch.nan)
         for grad, mask in zip(first_finite, masks, strict=True)
     )
     second = tuple(
-        grad.masked_fill(mask, torch.inf)
+        grad.mul(3.0).masked_fill(mask, torch.inf)
         for grad, mask in zip(second_finite, masks, strict=True)
     )
     expected_accumulated = tuple(
-        (left * 2.0 + right * 3.0) / 5.0
-        for left, right in zip(first, second, strict=True)
+        (left + right) / 5.0 for left, right in zip(first, second, strict=True)
     )
 
     accumulator = ParameterGradientAccumulator(parameters=model_params)
     accumulator.record(
-        "first", torch.tensor(2.0), tuple(grad.clone() for grad in first)
+        "first",
+        torch.tensor(2.0),
+        tuple(grad.clone() for grad in first),
+        expected_global_token_count=2,
     )
     accumulator.record(
-        "second", torch.tensor(3.0), tuple(grad.clone() for grad in second)
+        "second",
+        torch.tensor(3.0),
+        tuple(grad.clone() for grad in second),
+        expected_global_token_count=3,
     )
     resident = accumulator.residency_tensors()[1:]
     accumulator.seal(("first", "second"))
     owned = accumulator.prepare_optimizer()
-    assert tuple(map(id, owned)) == tuple(map(id, resident))
-    for actual, target in zip(owned, expected_accumulated, strict=True):
+    assert tuple(map(id, owned.gradients)) == tuple(map(id, resident))
+    torch._foreach_div_(owned.gradients, owned.local_token_count)
+    for actual, target in zip(owned.gradients, expected_accumulated, strict=True):
         torch.testing.assert_close(actual, target, rtol=0, atol=0, equal_nan=True)
 
     reference_grads = tuple(
@@ -192,13 +198,15 @@ def test_sealed_accumulator_is_masked_and_clipped_in_place(
     monkeypatch.setattr(trainer, "_slot_ref", lambda _name: None)
     monkeypatch.setattr(trainer, "_prune_slot_graphs", lambda _ref=None: None)
     result = trainer._step_dynamic_optimizer(
-        (("run", model_params, owned, (True, False)),),
+        (("run", model_params, owned.gradients, (True, False)),),
         params=config,
     )
 
     assert result["grad_norm"] == pytest.approx(reference_norm, rel=2.0e-6)
-    assert tuple(map(id, owned)) == tuple(map(id, resident))
-    for actual, target, mask in zip(owned, reference_grads, masks, strict=True):
+    assert tuple(map(id, owned.gradients)) == tuple(map(id, resident))
+    for actual, target, mask in zip(
+        owned.gradients, reference_grads, masks, strict=True
+    ):
         torch.testing.assert_close(actual, target, rtol=2.0e-6, atol=1.0e-7)
         assert not torch.count_nonzero(actual.masked_select(mask))
     for actual, target in zip(model_params, reference_masters, strict=True):

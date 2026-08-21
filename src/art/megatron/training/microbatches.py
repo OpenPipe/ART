@@ -437,19 +437,22 @@ def _move_inputs_to_device(inputs: PackedTensors, device: torch.device) -> None:
     inputs.update(_map_packed_tensors(inputs, lambda tensor: tensor.to(device)))
 
 
-def _count_trainable_tokens(inputs: LossInputs | DispatchedPackedTensors) -> float:
+def _count_trainable_tokens(
+    inputs: LossInputs | DispatchedPackedTensors,
+) -> torch.Tensor:
     if isinstance(inputs, DispatchedPackedTensors) and inputs.loss_weights is not None:
-        return float((inputs.loss_weights != 0).any(dim=-1).sum().item())
+        return (inputs.loss_weights != 0).any(dim=-1).sum(dtype=torch.int64)
     assistant_mask = inputs.align_inputs().assistant_mask
-    return float(assistant_mask.sum().item())
+    return assistant_mask.sum(dtype=torch.int64)
 
 
 def _local_trainable_token_count_tensor(
     micro_inputs: list[LossInputs | DispatchedPackedTensors],
     device: torch.device,
 ) -> torch.Tensor:
-    local_token_total = sum(_count_trainable_tokens(micro) for micro in micro_inputs)
-    return torch.tensor(local_token_total, device=device, dtype=torch.int)
+    return torch.stack(
+        tuple(_count_trainable_tokens(micro).to(device=device) for micro in micro_inputs)
+    ).sum(dtype=torch.int64)
 
 
 def _art_flex_sliding_windows(provider: Any) -> tuple[int, ...]:
@@ -778,24 +781,24 @@ def _prepare_next_rl_cp_micro(
 
 def _count_sft_trainable_tokens(
     inputs: dict[str, torch.Tensor] | PreparedSFTMicroInputs,
-) -> float:
+) -> torch.Tensor:
     if isinstance(inputs, PreparedSFTMicroInputs):
-        return float(inputs.loss_mask.sum().item())
-    attention_mask = inputs["attention_mask"].reshape(-1)
-    actual_len = int(attention_mask.sum().item())
-    labels = inputs["labels"].reshape(-1)[:actual_len].unsqueeze(0)
-    shifted_labels = shift_tensor(labels, -100)
-    return float((shifted_labels != -100).sum().item())
+        return inputs.loss_mask.sum(dtype=torch.int64)
+    attention_mask = inputs["attention_mask"].reshape(-1).to(dtype=torch.bool)
+    labels = inputs["labels"].reshape(-1)
+    return ((labels[1:] != -100) & attention_mask[1:]).sum(dtype=torch.int64)
 
 
 def _local_trainable_sft_token_count_tensor(
     micro_inputs: Sequence[dict[str, torch.Tensor] | PreparedSFTMicroInputs],
     device: torch.device,
 ) -> torch.Tensor:
-    local_token_total = sum(
-        _count_sft_trainable_tokens(micro) for micro in micro_inputs
-    )
-    return torch.tensor(local_token_total, device=device, dtype=torch.int)
+    return torch.stack(
+        tuple(
+            _count_sft_trainable_tokens(micro).to(device=device)
+            for micro in micro_inputs
+        )
+    ).sum(dtype=torch.int64)
 
 
 def _prepare_dense_sft_micro(

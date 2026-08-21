@@ -10,6 +10,17 @@ from .model_chunks import ModelChunks
 GradientReduction = Literal["token_mean", "sum"]
 
 
+class AccumulatedGradientSums(BaseModel):
+    """One rank's unnormalized gradient and token numerators."""
+
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    gradients: tuple[torch.Tensor, ...]
+    local_token_count: torch.Tensor
+    expected_global_token_count: int | None
+    reduction: GradientReduction
+
+
 class GradientAccumulator(BaseModel):
     """Fold Megatron F/B contributions into one O(parameter-bytes) buffer."""
 
@@ -21,6 +32,8 @@ class GradientAccumulator(BaseModel):
     _saved_gradients: tuple[torch.Tensor, ...] | None = PrivateAttr(default=None)
     _saved_tokens: torch.Tensor | None = PrivateAttr(default=None)
     _resident_tokens: torch.Tensor | None = PrivateAttr(default=None)
+    _expected_global_tokens: int | None = PrivateAttr(default=None)
+    _expects_global_tokens: bool | None = PrivateAttr(default=None)
     _reduction: GradientReduction | None = PrivateAttr(default=None)
     _sealed: tuple[str, ...] | None = PrivateAttr(default=None)
 
@@ -46,22 +59,15 @@ class GradientAccumulator(BaseModel):
         if self._resident_tokens is None:
             return
         gradients = self._main_gradients()
-        tokens = self._resident_tokens
         if self._saved_gradients is None:
             saved = tuple(grad.clone() for grad in gradients)
-            saved_tokens = tokens.clone()
-            if self._reduction == "token_mean":
-                for grad in saved:
-                    grad.mul_(tokens)
             self._saved_gradients = saved
-            self._saved_tokens = saved_tokens
+            self._saved_tokens = self._resident_tokens.clone()
         else:
             assert self._saved_tokens is not None
             for saved, grad in zip(self._saved_gradients, gradients, strict=True):
-                if self._reduction == "token_mean":
-                    grad.mul_(tokens)
                 saved.add_(grad)
-            self._saved_tokens.add_(tokens)
+            self._saved_tokens.add_(self._resident_tokens)
         self._resident_tokens = None
 
     def record(
@@ -69,6 +75,7 @@ class GradientAccumulator(BaseModel):
         operation_id: str,
         token_count: torch.Tensor,
         *,
+        expected_global_token_count: int | None = None,
         reduction: GradientReduction = "token_mean",
     ) -> None:
         if self._sealed is not None:
@@ -81,8 +88,22 @@ class GradientAccumulator(BaseModel):
             raise RuntimeError("resident gradients must be stashed before another F/B")
         if self._reduction is not None and self._reduction != reduction:
             raise RuntimeError("one gradient accumulator cannot mix reduction modes")
+        expects_global_tokens = expected_global_token_count is not None
+        if (
+            self._expects_global_tokens is not None
+            and self._expects_global_tokens != expects_global_tokens
+        ):
+            raise RuntimeError(
+                "one gradient accumulator cannot mix observed-only and "
+                "provenance-checked contributions"
+            )
         self._operation_ids.append(operation_id)
         self._resident_tokens = token_count.detach().clone()
+        self._expects_global_tokens = expects_global_tokens
+        if expected_global_token_count is not None:
+            self._expected_global_tokens = (
+                (self._expected_global_tokens or 0) + expected_global_token_count
+            )
         self._reduction = reduction
 
     def seal(self, operation_ids: tuple[str, ...]) -> None:
@@ -96,25 +117,31 @@ class GradientAccumulator(BaseModel):
             )
         self._sealed = operation_ids
 
-    def prepare_optimizer(self) -> None:
+    def prepare_local_sums(self) -> AccumulatedGradientSums:
         if self._sealed is None:
             raise RuntimeError("gradient accumulator must be sealed before optimizer")
         if self._resident_tokens is None:
             raise RuntimeError("last gradient contribution is not resident")
-        if self._saved_gradients is None:
-            return
         main_grads = self._main_gradients()
-        if self._reduction == "sum":
+        local_tokens = self._resident_tokens
+        if self._saved_gradients is not None:
+            assert self._saved_tokens is not None
             for grad, saved in zip(main_grads, self._saved_gradients, strict=True):
                 grad.add_(saved)
-            return
-        assert self._saved_tokens is not None
-        total_tokens = self._saved_tokens + self._resident_tokens
-        for grad in main_grads:
-            grad.mul_(self._resident_tokens)
-        for grad, saved in zip(main_grads, self._saved_gradients, strict=True):
-            grad.add_(saved)
-            grad.div_(total_tokens)
+            local_tokens = local_tokens + self._saved_tokens
+        assert self._reduction is not None
+        return AccumulatedGradientSums(
+            gradients=main_grads,
+            local_token_count=local_tokens,
+            expected_global_token_count=self._expected_global_tokens,
+            reduction=self._reduction,
+        )
+
+    def prepare_optimizer(self) -> AccumulatedGradientSums:
+        prepared = self.prepare_local_sums()
+        if prepared.expected_global_token_count is None:
+            raise RuntimeError("optimizer gradients lack global token provenance")
+        return prepared
 
     def consume(self) -> tuple[str, ...]:
         if self._sealed is None:
@@ -138,6 +165,8 @@ class GradientAccumulator(BaseModel):
         self._saved_gradients = None
         self._saved_tokens = None
         self._resident_tokens = None
+        self._expected_global_tokens = None
+        self._expects_global_tokens = None
         self._reduction = None
         self._sealed = None
 
@@ -175,6 +204,8 @@ class ParameterGradientAccumulator(BaseModel):
     _operation_ids: list[str] = PrivateAttr(default_factory=list)
     _gradients: tuple[torch.Tensor, ...] | None = PrivateAttr(default=None)
     _token_count: torch.Tensor | None = PrivateAttr(default=None)
+    _expected_global_tokens: int | None = PrivateAttr(default=None)
+    _expects_global_tokens: bool | None = PrivateAttr(default=None)
     _reduction: GradientReduction | None = PrivateAttr(default=None)
     _prepared: bool = PrivateAttr(default=False)
     _sealed: tuple[str, ...] | None = PrivateAttr(default=None)
@@ -206,6 +237,7 @@ class ParameterGradientAccumulator(BaseModel):
         token_count: torch.Tensor,
         gradients: tuple[torch.Tensor, ...],
         *,
+        expected_global_token_count: int | None = None,
         reduction: GradientReduction = "token_mean",
     ) -> None:
         if self._sealed is not None:
@@ -220,10 +252,16 @@ class ParameterGradientAccumulator(BaseModel):
             raise RuntimeError("one gradient accumulator cannot mix reduction modes")
         if self._prepared:
             raise RuntimeError("cannot add gradients after optimizer preparation")
+        expects_global_tokens = expected_global_token_count is not None
+        if (
+            self._expects_global_tokens is not None
+            and self._expects_global_tokens != expects_global_tokens
+        ):
+            raise RuntimeError(
+                "one gradient accumulator cannot mix observed-only and "
+                "provenance-checked contributions"
+            )
         owned = tuple(grad.detach() for grad in gradients)
-        if reduction == "token_mean":
-            for grad in owned:
-                grad.mul_(token_count)
         if self._gradients is None:
             self._gradients = owned
             self._token_count = token_count.detach().clone()
@@ -233,6 +271,11 @@ class ParameterGradientAccumulator(BaseModel):
                 target.add_(grad)
             self._token_count.add_(token_count)
         self._operation_ids.append(operation_id)
+        self._expects_global_tokens = expects_global_tokens
+        if expected_global_token_count is not None:
+            self._expected_global_tokens = (
+                (self._expected_global_tokens or 0) + expected_global_token_count
+            )
         self._reduction = reduction
 
     def seal(self, operation_ids: tuple[str, ...]) -> None:
@@ -246,16 +289,25 @@ class ParameterGradientAccumulator(BaseModel):
             )
         self._sealed = operation_ids
 
-    def prepare_optimizer(self) -> tuple[torch.Tensor, ...]:
+    def prepare_local_sums(self) -> AccumulatedGradientSums:
         if self._sealed is None:
             raise RuntimeError("gradient accumulator must be sealed before optimizer")
         if self._gradients is None or self._token_count is None:
             raise RuntimeError("gradient accumulator is empty")
-        if not self._prepared and self._reduction == "token_mean":
-            for grad in self._gradients:
-                grad.div_(self._token_count)
+        assert self._reduction is not None
         self._prepared = True
-        return self._gradients
+        return AccumulatedGradientSums(
+            gradients=self._gradients,
+            local_token_count=self._token_count,
+            expected_global_token_count=self._expected_global_tokens,
+            reduction=self._reduction,
+        )
+
+    def prepare_optimizer(self) -> AccumulatedGradientSums:
+        prepared = self.prepare_local_sums()
+        if prepared.expected_global_token_count is None:
+            raise RuntimeError("optimizer gradients lack global token provenance")
+        return prepared
 
     def consume(self) -> tuple[str, ...]:
         if self._sealed is None:
@@ -273,6 +325,8 @@ class ParameterGradientAccumulator(BaseModel):
         self._operation_ids.clear()
         self._gradients = None
         self._token_count = None
+        self._expected_global_tokens = None
+        self._expects_global_tokens = None
         self._reduction = None
         self._prepared = False
         self._sealed = None

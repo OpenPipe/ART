@@ -165,14 +165,23 @@ class PipelineScheduleTelemetry:
     peak_memory_bytes: int = 0
     _cuda_timers: _DeferredCudaTimers | None = field(default=None, repr=False)
     _metrics_cache: dict[str, float] | None = field(default=None, repr=False)
+    _local_metrics_cache: dict[str, float] | None = field(default=None, repr=False)
 
     def cuda_span(self) -> tuple[torch.cuda.Event, torch.cuda.Event] | None:
         timers = self._cuda_timers
         return None if timers is None else timers.span("forward-backward")
 
     def metrics(self) -> dict[str, float]:
-        if self._metrics_cache is not None:
-            return dict(self._metrics_cache)
+        return self._build_metrics(rank_local=False)
+
+    def local_metrics(self) -> dict[str, float]:
+        """Resolve this rank's events without launching a collective."""
+        return self._build_metrics(rank_local=True)
+
+    def _build_metrics(self, *, rank_local: bool) -> dict[str, float]:
+        cached = self._local_metrics_cache if rank_local else self._metrics_cache
+        if cached is not None:
+            return dict(cached)
         self._resolve_cuda_timers()
         bubble_fraction = pipeline_bubble_fraction(
             pp_size=self.pp_size,
@@ -217,8 +226,11 @@ class PipelineScheduleTelemetry:
             metrics[f"pipeline/chunk_{chunk}/forward_calls"] = float(
                 self.forward_calls_by_chunk[chunk]
             )
-        metrics.update(self._stage_metrics())
-        self._metrics_cache = metrics
+        metrics.update(self._stage_metrics(rank_local=rank_local))
+        if rank_local:
+            self._local_metrics_cache = metrics
+        else:
+            self._metrics_cache = metrics
         return dict(metrics)
 
     def _resolve_cuda_timers(self) -> None:
@@ -230,7 +242,7 @@ class PipelineScheduleTelemetry:
         self.forward_compute_s_by_chunk = timers.by_chunk("forward-compute")
         self.backward_compute_s_by_chunk = timers.by_chunk("backward-compute")
 
-    def _stage_metrics(self) -> dict[str, float]:
+    def _stage_metrics(self, *, rank_local: bool) -> dict[str, float]:
         local = [
             self.schedule_gpu_s,
             sum(self.forward_compute_s_by_chunk.values()),
@@ -248,7 +260,7 @@ class PipelineScheduleTelemetry:
             ),
         ]
         rows = [local]
-        if self.pp_size > 1:
+        if self.pp_size > 1 and not rank_local:
             value = torch.tensor(
                 local, device=torch.cuda.current_device(), dtype=torch.float64
             )
@@ -263,7 +275,8 @@ class PipelineScheduleTelemetry:
             rows = gathered.view(self.pp_size, -1).cpu().tolist()
 
         metrics: dict[str, float] = {}
-        for stage, row in enumerate(rows):
+        stages = (self.pp_rank,) if rank_local else range(len(rows))
+        for stage, row in zip(stages, rows, strict=True):
             prefix = f"pipeline/stage_{stage}"
             metrics[f"{prefix}/schedule_gpu_s"] = row[0]
             metrics[f"{prefix}/forward_compute_s"] = row[1]
@@ -286,12 +299,16 @@ class PipelineScheduleTelemetry:
 
 def aggregate_pipeline_schedule_metrics(
     values: Sequence[PipelineScheduleTelemetry],
+    *,
+    rank_local: bool = False,
 ) -> dict[str, float]:
     if not values:
         raise ValueError(
             "pipeline telemetry aggregation requires at least one schedule"
         )
-    rows = tuple(value.metrics() for value in values)
+    rows = tuple(
+        value.local_metrics() if rank_local else value.metrics() for value in values
+    )
     keys = rows[0].keys()
     if any(row.keys() != keys for row in rows[1:]):
         raise RuntimeError("pipeline schedules emitted different metric sets")
@@ -353,10 +370,49 @@ def aggregate_pipeline_schedule_metrics(
     )
     bubbles = sum(max(0, value.pp_size - 1) for value in values)
     out["pipeline/ideal_bubble_fraction"] = bubbles / (useful + bubbles)
+    stages = (values[0].pp_rank,) if rank_local else range(values[0].pp_size)
     stage_compute = [
         out[f"pipeline/stage_{stage}/forward_compute_s"]
         + out[f"pipeline/stage_{stage}/backward_compute_s"]
-        for stage in range(values[0].pp_size)
+        for stage in stages
+    ]
+    maximum = max(stage_compute, default=0.0)
+    out["pipeline/stage_compute_imbalance_fraction"] = (
+        (maximum - min(stage_compute)) / maximum if maximum else 0.0
+    )
+    return out
+
+
+def aggregate_pipeline_rank_metrics(
+    rows: Sequence[dict[str, float]],
+) -> dict[str, float]:
+    """Join one rank-local telemetry row per physical pipeline stage."""
+    if not rows:
+        raise ValueError("pipeline rank aggregation requires at least one row")
+    pp_size = int(rows[0]["pipeline/pp_size"])
+    if len(rows) != pp_size:
+        raise RuntimeError(
+            f"pipeline telemetry has {len(rows)} stages, expected {pp_size}"
+        )
+    by_stage = {int(row["pipeline/pp_rank"]): row for row in rows}
+    if set(by_stage) != set(range(pp_size)):
+        raise RuntimeError("pipeline telemetry has duplicate or missing PP ranks")
+    out = {
+        key: value
+        for key, value in by_stage[0].items()
+        if not key.startswith("pipeline/stage_")
+        and key != "pipeline/stage_compute_imbalance_fraction"
+    }
+    for stage, row in sorted(by_stage.items()):
+        prefix = f"pipeline/stage_{stage}/"
+        stage_values = {key: value for key, value in row.items() if key.startswith(prefix)}
+        if not stage_values:
+            raise RuntimeError(f"pipeline telemetry is missing stage {stage} values")
+        out.update(stage_values)
+    stage_compute = [
+        out[f"pipeline/stage_{stage}/forward_compute_s"]
+        + out[f"pipeline/stage_{stage}/backward_compute_s"]
+        for stage in range(pp_size)
     ]
     maximum = max(stage_compute, default=0.0)
     out["pipeline/stage_compute_imbalance_fraction"] = (
@@ -782,6 +838,19 @@ class MCoreScheduleAdapter(Generic[_T]):
             dummy_schedule_capacity_tokens=dummy_nominal,
             real_microbatches=real_microbatches,
             dummy_microbatches=dummy_microbatches,
+        )
+
+    def local_training_workload(self) -> TrainingStepWorkload:
+        return TrainingStepWorkload(
+            **dict(
+                zip(
+                    TrainingStepWorkload.model_fields,
+                    _local_training_workload_values(
+                        self.microbatches, int(ps.get_context_parallel_rank())
+                    ),
+                    strict=True,
+                )
+            )
         )
 
     @contextmanager
