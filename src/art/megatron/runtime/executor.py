@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections import deque
+from collections import OrderedDict, deque
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from contextlib import ExitStack, contextmanager
 import gc
@@ -2293,7 +2293,11 @@ class _GenerationPublisher:
         self._transport_sender_lock = Lock()
         self._object_store: S3BinaryObjectStore | None = None
         self._object_publications: dict[str, Future[OptimizerAdapter]] = {}
-        self._lora_layouts: dict[tuple[Any, ...], SafetensorsLayout] = {}
+        # Keep one active publication cohort and one recent shape cohort.
+        self._lora_layout_capacity = 2 * capacity
+        self._lora_layouts: OrderedDict[
+            tuple[Any, ...], SafetensorsLayout
+        ] = OrderedDict()
         self._cache: dict[str, _CachedGeneration] = {}
         self._latest_by_run: dict[str, str] = {}
         self._prepared: dict[str, _PreparedRankSnapshot] = {}
@@ -3128,6 +3132,10 @@ class _GenerationPublisher:
             layout = self._lora_layouts.get(cache_key)
             if layout is None:
                 layout = self._lora_layouts[cache_key] = SafetensorsLayout(lora.tensors)
+                if len(self._lora_layouts) > self._lora_layout_capacity:
+                    self._lora_layouts.popitem(last=False)
+            else:
+                self._lora_layouts.move_to_end(cache_key)
         return layout.bind(lora.tensors)
 
     @contextmanager
