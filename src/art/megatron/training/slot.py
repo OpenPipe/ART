@@ -475,6 +475,13 @@ class MegatronTrainingSlot:
     ) -> PlannedPackedForward:
         state = self._require_run(ref.run_id)
         if isinstance(request.batch, TokenizedTrainingBatch):
+            if (
+                self.runtime_spec.enable_moe_routing_replay
+                and request.batch.datums[0].moe_routes is None
+            ):
+                raise ValueError(
+                    "MoE routing replay requires routes for every tokenized datum"
+                )
             plan = await self.runtime.prepare_pack(
                 PackingRequest(
                     model=state.model,
