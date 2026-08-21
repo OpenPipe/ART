@@ -272,6 +272,7 @@ class LocalMegatronTrainingClient:
         self._completed_result_bytes = 0
         self._completion_tasks: set[asyncio.Task[Any]] = set()
         self._checkpoints: dict[str, ResolvedCheckpointState] = {}
+        self._checkpoint_learner_versions: dict[str, int] = {}
         self._sft_tokenizer = SftBatchTokenizer()
         self._batch_releases: set[asyncio.Task[None]] = set()
         self._batch_release_failures: list[BaseException] = []
@@ -712,6 +713,9 @@ class LocalMegatronTrainingClient:
             admission: CommandAdmission,
             own_task: Callable[[asyncio.Task[Any]], asyncio.Task[Any]],
         ) -> SamplerWeightsResult | _DeferredResult[SamplerWeightsResult]:
+            self._claim_checkpoint_name(
+                request.checkpoint_name, admission.ref.learner_parent_version
+            )
             launch = await self._service.snapshot_command(
                 admission.ref,
                 save_optimizer=False,
@@ -836,6 +840,8 @@ class LocalMegatronTrainingClient:
         *,
         restore_optimizer: bool,
     ) -> TrainingOperation[LoadStateResult]:
+        request = request.model_copy(update={"restore_optimizer": restore_optimizer})
+
         async def execute(
             admission: CommandAdmission,
             _own_task: Callable[[asyncio.Task[Any]], asyncio.Task[Any]],
@@ -849,7 +855,7 @@ class LocalMegatronTrainingClient:
             raw, generation, _metrics, adapter = await self._service.load_state_command(
                 admission.ref,
                 source,
-                restore_optimizer=restore_optimizer,
+                restore_optimizer=request.restore_optimizer,
             )
             checkpoint = checkpoint_ref(
                 admission.ref.run_id,
@@ -863,10 +869,14 @@ class LocalMegatronTrainingClient:
                         update={"identity": generation.adapter_path}
                     ),
                     optimizer_state_path=(
-                        source.optimizer_state_path if restore_optimizer else None
+                        source.optimizer_state_path
+                        if request.restore_optimizer
+                        else None
                     ),
                     optimizer_generation_id=(
-                        source.optimizer_generation_id if restore_optimizer else None
+                        source.optimizer_generation_id
+                        if request.restore_optimizer
+                        else None
                     ),
                 ),
             )
@@ -892,6 +902,9 @@ class LocalMegatronTrainingClient:
         *,
         overwrite: bool = False,
     ) -> None:
+        self._claim_checkpoint_name(
+            checkpoint_id, checkpoint.adapter.step, overwrite=overwrite
+        )
         existing = self._checkpoints.get(checkpoint_id)
         same_learner = existing is not None and (
             existing.adapter.identity == checkpoint.adapter.identity
@@ -905,11 +918,31 @@ class LocalMegatronTrainingClient:
             return
         self._checkpoints[checkpoint_id] = checkpoint
 
+    def _claim_checkpoint_name(
+        self, checkpoint_id: str, learner_version: int, *, overwrite: bool = False
+    ) -> None:
+        existing = self._checkpoints.get(checkpoint_id)
+        claimed = (
+            existing.adapter.step
+            if existing is not None
+            else self._checkpoint_learner_versions.get(checkpoint_id)
+        )
+        if claimed is not None and claimed != learner_version and not overwrite:
+            raise RuntimeError(
+                f"checkpoint name {checkpoint_id!r} identifies different learners"
+            )
+        self._checkpoint_learner_versions[checkpoint_id] = learner_version
+
     def prune_checkpoints(self, *, retain_steps: set[int]) -> None:
         self._checkpoints = {
             name: checkpoint
             for name, checkpoint in self._checkpoints.items()
             if checkpoint.adapter.step in retain_steps
+        }
+        self._checkpoint_learner_versions = {
+            name: step
+            for name, step in self._checkpoint_learner_versions.items()
+            if step in retain_steps
         }
 
     async def _prepare_rl_batch(self, request: ForwardRequest | ForwardBackwardRequest):
