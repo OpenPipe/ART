@@ -5,13 +5,13 @@ import subprocess
 import sys
 
 ROOT = Path(__file__).resolve().parents[4]
+# Transformers initializes Torch Inductor's own cache default during import.
 CACHE_ENV_VARS = (
     "HF_HOME",
     "HF_HUB_CACHE",
     "TORCH_HOME",
     "TORCH_EXTENSIONS_DIR",
     "TORCHINDUCTOR_COMPILE_THREADS",
-    "TORCHINDUCTOR_CACHE_DIR",
     "TRITON_CACHE_DIR",
     "VLLM_CACHE_ROOT",
     "XDG_CACHE_HOME",
