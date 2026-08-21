@@ -51,6 +51,7 @@ from .contracts import (
     DeleteCheckpointResult,
     EventPage,
     ForwardBackwardPreparation,
+    InlineOperationResult,
     OperationResultRef,
     OperationView,
     PreparedGradientDisposition,
@@ -59,6 +60,7 @@ from .contracts import (
     SetCheckpointTtlRequest,
     TrainingRunView,
     remote_request_fingerprint,
+    validate_forward_operation_result,
 )
 from .data_plane import (
     FORWARD_SUBMISSION_MEDIA_TYPE,
@@ -1124,19 +1126,33 @@ class RemoteTrainingOperation(Generic[ResultT]):
             )
         if event.event != "operation_succeeded":
             raise RemoteTrainingError(f"unexpected terminal event {event.event!r}")
+        remote: InlineOperationResult | OperationResultRef | None = None
         if self._ref.kind in {"forward", "forward_backward"}:
-            remote = OperationResultRef.model_validate(event.payload)
-            result = await self._service.receive_operation_result(
-                self._ref.run_id,
-                self._ref.operation_id,
-                remote,
-                self._result_type,
-            )
+            try:
+                remote = validate_forward_operation_result(event.payload)
+            except ValueError as error:
+                raise RemoteTrainingError(
+                    "remote forward result transport is invalid"
+                ) from error
+            if isinstance(remote, InlineOperationResult):
+                try:
+                    result = self._result_type.model_validate(remote.result)
+                except ValueError as error:
+                    raise RemoteTrainingError(
+                        "remote inline forward result is invalid"
+                    ) from error
+            else:
+                result = await self._service.receive_operation_result(
+                    self._ref.run_id,
+                    self._ref.operation_id,
+                    remote,
+                    self._result_type,
+                )
         else:
             result = self._result_type.model_validate(event.payload)
         if result.operation_id != self._ref.operation_id:
             raise RemoteTrainingError("operation result identity changed")
-        if self._ref.kind in {"forward", "forward_backward"}:
+        if isinstance(remote, OperationResultRef):
             await self._service.acknowledge_operation_result(
                 self._ref.run_id, self._ref.operation_id
             )

@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from datetime import datetime
 import hashlib
 import json
 from typing import Annotated, Any, Literal
 
-from pydantic import Field, model_validator
+from pydantic import Field, TypeAdapter, model_validator
 
 from art.distributed.moe_route_store import (
     MoeRouteSlice,
@@ -32,6 +33,7 @@ SFT_DATA_FORMAT = "art_sft_batch_msgpack_v1"
 TOKENIZED_DATA_FORMAT = "art_tokenized_batch_msgpack_v2"
 OPERATION_RESULT_FORMAT = "art_operation_result_msgpack_v1"
 MAX_OPERATION_RESULT_BYTES = 512 << 20
+MAX_INLINE_OPERATION_RESULT_BYTES = 64 << 10
 MAX_BASE_MODEL_LENGTH = 512
 MAX_TARGET_MODULE_COUNT = 256
 MAX_TARGET_MODULE_LENGTH = 255
@@ -215,9 +217,28 @@ RemoteTrainingBatchRef = Annotated[
 
 
 class OperationResultRef(Contract):
+    transport: Literal["object"] = "object"
     object_id: str = Field(pattern=r"^[0-9a-f]{64}$")
     byte_count: int = Field(ge=1, le=MAX_OPERATION_RESULT_BYTES)
     format: Literal["art_operation_result_msgpack_v1"] = OPERATION_RESULT_FORMAT
+
+
+class InlineOperationResult(Contract):
+    transport: Literal["inline"] = "inline"
+    result: dict[str, Any]
+
+
+ForwardOperationResult = Annotated[
+    InlineOperationResult | OperationResultRef,
+    Field(discriminator="transport"),
+]
+_FORWARD_OPERATION_RESULT_ADAPTER = TypeAdapter(ForwardOperationResult)
+
+
+def validate_forward_operation_result(value: object) -> ForwardOperationResult:
+    if not isinstance(value, Mapping) or "transport" not in value:
+        raise ValueError("forward result transport discriminator is required")
+    return _FORWARD_OPERATION_RESULT_ADAPTER.validate_python(value)
 
 
 class RemoteForwardRequest(RunCommand):
@@ -378,7 +399,7 @@ class OperationView(Contract):
     status: OperationStatus
     gradient_disposition: GradientDisposition | None = None
     contributing_forward_backward_operation_ids: tuple[str, ...] = ()
-    result: OperationResultRef | dict[str, Any] | None = None
+    result: dict[str, Any] | None = None
     error: dict[str, Any] | None = None
     event_cursor: int = Field(ge=1)
     created_at: datetime
@@ -391,6 +412,11 @@ class OperationView(Contract):
             raise ValueError(
                 "gradient_disposition is required exclusively for F/B operations"
             )
+        if self.result is not None and self.ref.kind in {
+            "forward",
+            "forward_backward",
+        }:
+            validate_forward_operation_result(self.result)
         return self
 
 

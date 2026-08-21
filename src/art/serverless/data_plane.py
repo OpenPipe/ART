@@ -31,6 +31,7 @@ from art.distributed.trajectory_store import (
 )
 from art.megatron.prefix_tree_packing import prefix_tree_pack_segments
 from art.training.contracts import (
+    ForwardResult,
     OperationResult,
     RlTrajectoryBatch,
     SupervisedTrajectoryBatch,
@@ -45,10 +46,12 @@ from art.training.tokenized import (
 )
 
 from .contracts import (
+    MAX_INLINE_OPERATION_RESULT_BYTES,
     MAX_RL_GROUPS_PER_BATCH,
     RL_GROUP_DATA_FORMAT,
     SFT_DATA_FORMAT,
     TOKENIZED_DATA_FORMAT,
+    InlineOperationResult,
     OperationResultRef,
     RemoteForwardRequest,
     RemoteRlBatchRef,
@@ -1020,6 +1023,31 @@ def encode_operation_result(
         ),
         payload,
     )
+
+
+def encode_inline_operation_result(
+    result: OperationResult,
+) -> tuple[InlineOperationResult, bytes] | None:
+    if isinstance(result, ForwardResult):
+        logprob_bytes = sum(
+            len(output.token_logprobs.data) for output in result.loss_fn_outputs
+        )
+        # Base64 alone exceeds the envelope bound. This is an exact proof about
+        # encoded JSON size, not a semantic decision based on requested outputs.
+        if 4 * ((logprob_bytes + 2) // 3) > MAX_INLINE_OPERATION_RESULT_BYTES:
+            return None
+        token_id_json_bytes = sum(
+            sum(len(str(token_id)) + 1 for token_id in leaf.token_ids)
+            for shape in result.packing.group_shapes
+            for leaf in shape.leaves
+        )
+        if token_id_json_bytes > MAX_INLINE_OPERATION_RESULT_BYTES:
+            return None
+    inline = InlineOperationResult(result=result.model_dump(mode="json"))
+    payload = inline.model_dump_json().encode()
+    if len(payload) > MAX_INLINE_OPERATION_RESULT_BYTES:
+        return None
+    return inline, payload
 
 
 def decode_operation_result(
