@@ -4,6 +4,7 @@ from concurrent.futures import ThreadPoolExecutor
 import hashlib
 from io import BytesIO
 import json
+from pathlib import Path
 from threading import Lock
 from typing import cast
 
@@ -11,10 +12,16 @@ from botocore.exceptions import ClientError
 import pytest
 
 from art.distributed.object_store import (
+    VLLM_LORA_OBJECT_FORMAT,
     OrderedBinaryObjectTarget,
+    S3BinaryObjectReceiver,
     S3BinaryObjectStore,
     S3ObjectStoreConfig,
     vllm_lora_ordered_target,
+)
+from art.megatron.optimizer_state import (
+    CheckpointFile,
+    acknowledge_materialized_adapter,
 )
 
 
@@ -100,6 +107,28 @@ class _S3:
         pass
 
 
+class _CommitChangingS3(_S3):
+    def __init__(self) -> None:
+        super().__init__()
+        self.changed = False
+
+    def get_object(self, *, Bucket: str, Key: str):
+        response = super().get_object(Bucket=Bucket, Key=Key)
+        if "/shards/" in Key:
+            with self.lock:
+                if not self.changed:
+                    commit_key = next(
+                        key for key in self.objects if key.endswith("/_COMMITTED.json")
+                    )
+                    commit = json.loads(self.objects[commit_key])
+                    commit["shards"][0]["etag"] = '"superseded"'
+                    self.objects[commit_key] = json.dumps(
+                        commit, separators=(",", ":"), sort_keys=True
+                    ).encode()
+                    self.changed = True
+        return response
+
+
 def _target() -> OrderedBinaryObjectTarget:
     config = S3ObjectStoreConfig(
         endpoint_url="https://objects.invalid",
@@ -112,7 +141,7 @@ def _target() -> OrderedBinaryObjectTarget:
         config,
         run_id="run",
         training_session_id="session",
-        generation_id="generation",
+        generation_id="step-00000007-0123456789abcdef0123456789abcdef",
         policy_step=7,
     )
     return OrderedBinaryObjectTarget.model_validate(
@@ -128,6 +157,22 @@ def _store(target: OrderedBinaryObjectTarget, client: _S3) -> S3BinaryObjectStor
     store._lock = Lock()
     store._closed = False
     return store
+
+
+def _receiver(
+    target: OrderedBinaryObjectTarget,
+    store: S3BinaryObjectStore,
+    receive_root: Path,
+) -> S3BinaryObjectReceiver:
+    receive_root.mkdir()
+    receiver = S3BinaryObjectReceiver.__new__(S3BinaryObjectReceiver)
+    receiver.config = target.store
+    receiver.receive_root = receive_root
+    receiver._store = store
+    receiver._active = set()
+    receiver._lock = Lock()
+    receiver._closed = False
+    return receiver
 
 
 def _source() -> dict[str, tuple[memoryview, ...]]:
@@ -226,3 +271,70 @@ def test_ordered_fenced_cleanup_reclaims_partial_plan_and_shards() -> None:
     assert not any(key.startswith(f"{prefix}/") for key in client.objects)
     assert client.objects["unrelated/object"] == b"keep"
     store.close()
+
+
+def test_ordered_receiver_materializes_later_adapter_only_restore(
+    tmp_path: Path,
+) -> None:
+    target, client = _target(), _S3()
+    store = _store(target, client)
+    source = _source()
+    ref = store.publish_ordered(target, source)
+    receive_root = (tmp_path / "receives").resolve()
+    receiver = _receiver(target, store, receive_root)
+
+    materialization = receiver.materialize(
+        ref.manifest_uri,
+        expected_format=VLLM_LORA_OBJECT_FORMAT,
+        expected_metadata=target.metadata,
+    )
+
+    path = Path(materialization.path)
+    assert materialization.ref == ref
+    assert (path / "adapter_config.json").read_bytes() == b"cfg"
+    assert (path / "adapter_model.safetensors").read_bytes() == b"abcdefghij"
+    assert all(file.sha256 is None for file in materialization.ref.files)
+    prefix = f"{target.store.prefix}/{target.object_id}"
+    assert {
+        f"{prefix}/shards/{index:08d}" for index in range(ref.shard_count)
+    }.issubset(client.gets)
+    files = {file.relative_path: file for file in materialization.ref.files}
+    adapter = acknowledge_materialized_adapter(
+        path,
+        step=7,
+        training_session_id=target.metadata["training_session_id"],
+        generation_id=target.metadata["generation_id"],
+        files=tuple(
+            CheckpointFile(
+                name=name,
+                size_bytes=files[name].byte_count,
+                sha256=files[name].sha256,
+            )
+            for name in ("adapter_config.json", "adapter_model.safetensors")
+        ),
+    )
+    assert all(file.sha256 is None for file in adapter.files)
+
+    receiver.release(materialization)
+    assert not path.exists()
+    receiver.close()
+
+
+def test_ordered_receiver_discards_materialization_if_commit_changes(
+    tmp_path: Path,
+) -> None:
+    target, client = _target(), _CommitChangingS3()
+    store = _store(target, client)
+    ref = store.publish_ordered(target, _source())
+    receive_root = (tmp_path / "receives").resolve()
+    receiver = _receiver(target, store, receive_root)
+
+    with pytest.raises(RuntimeError, match="commit changed during materialization"):
+        receiver.materialize(
+            ref.manifest_uri,
+            expected_format=VLLM_LORA_OBJECT_FORMAT,
+            expected_metadata=target.metadata,
+        )
+
+    assert not tuple(receive_root.iterdir())
+    receiver.close()

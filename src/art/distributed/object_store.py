@@ -232,7 +232,7 @@ _BINARY_OBJECT_COMMIT_ADAPTER = TypeAdapter(BinaryObjectPublicationCommit)
 
 
 class BinaryObjectMaterialization(_ObjectModel):
-    ref: BinaryObjectRef
+    ref: BinaryObjectPublicationRef
     path: str = Field(min_length=1)
 
 
@@ -486,16 +486,7 @@ class S3BinaryObjectStore:
         commit = self._resolve_commit(ref.manifest_uri)
         if not isinstance(commit, OrderedBinaryObjectCommit) or commit.ref != ref:
             raise RuntimeError("ordered object commit changed before verification")
-        bucket, plan_key = self._ordered_plan_location(ref)
-        try:
-            plan_body = self._read(plan_key, bucket=bucket)
-        except Exception as error:
-            if _is_missing_object(error):
-                raise RuntimeError("ordered object plan is missing") from error
-            raise
-        if hashlib.sha256(plan_body).hexdigest() != ref.plan_sha256:
-            raise RuntimeError("ordered object plan changed identity")
-        plan = OrderedBinaryObjectPlan.model_validate_json(plan_body)
+        bucket, plan_key, plan, plan_body = self._read_ordered_plan(ref)
         _require_ordered_plan_target(
             target, plan, expected_byte_count=expected_byte_count
         )
@@ -528,10 +519,47 @@ class S3BinaryObjectStore:
                     f"ordered object shard changed identity: {shard.index}"
                 )
 
-    def materialize(self, ref: BinaryObjectRef, destination: str | Path) -> Path:
-        resolved = self.resolve(ref.manifest_uri)
+    def _read_ordered_plan(
+        self, ref: OrderedBinaryObjectRef
+    ) -> tuple[str, str, OrderedBinaryObjectPlan, bytes]:
+        bucket, plan_key = self._ordered_plan_location(ref)
+        try:
+            plan_body = self._read(plan_key, bucket=bucket)
+        except Exception as error:
+            if _is_missing_object(error):
+                raise RuntimeError("ordered object plan is missing") from error
+            raise
+        plan_sha256 = hashlib.sha256(plan_body).hexdigest()
+        if plan_sha256 != ref.plan_sha256:
+            raise RuntimeError("ordered object plan changed identity")
+        plan = OrderedBinaryObjectPlan.model_validate_json(plan_body)
+        planned_ref = OrderedBinaryObjectRef(
+            object_id=plan.object_id,
+            format=plan.format,
+            plan_uri=ref.plan_uri,
+            manifest_uri=ref.manifest_uri,
+            plan_sha256=plan_sha256,
+            byte_count=sum(file.byte_count for file in plan.files),
+            files=plan.files,
+            shard_count=len(plan.shards),
+            metadata=plan.metadata,
+        )
+        if planned_ref != ref:
+            raise RuntimeError("ordered object plan differs from its committed ref")
+        return bucket, plan_key, plan, plan_body
+
+    def materialize(
+        self, ref: BinaryObjectPublicationRef, destination: str | Path
+    ) -> Path:
+        commit = self._resolve_commit(ref.manifest_uri)
+        resolved = (
+            commit.ref if isinstance(commit, OrderedBinaryObjectCommit) else commit
+        )
         if resolved != ref:
             raise RuntimeError("binary object manifest changed before materialization")
+        if isinstance(ref, OrderedBinaryObjectRef):
+            assert isinstance(commit, OrderedBinaryObjectCommit)
+            return self._materialize_ordered(ref, commit, destination)
         return self._materialize(ref, destination)
 
     def _materialize(self, ref: BinaryObjectRef, destination: str | Path) -> Path:
@@ -557,6 +585,144 @@ class S3BinaryObjectStore:
             shutil.rmtree(root, ignore_errors=True)
             raise
         return root
+
+    def _materialize_ordered(
+        self,
+        ref: OrderedBinaryObjectRef,
+        commit: OrderedBinaryObjectCommit,
+        destination: str | Path,
+    ) -> Path:
+        bucket, plan_key, plan, _ = self._read_ordered_plan(ref)
+        root = Path(destination)
+        root.mkdir(parents=True, exist_ok=False)
+        try:
+            for file in plan.files:
+                target = root / file.relative_path
+                target.parent.mkdir(parents=True, exist_ok=True)
+                with target.open("xb") as output:
+                    output.truncate(file.byte_count)
+            self._download_ordered_shards(
+                bucket,
+                str(PurePosixPath(plan_key).parent),
+                ref.plan_sha256,
+                plan,
+                commit,
+                root,
+            )
+            if self._resolve_commit(ref.manifest_uri) != commit:
+                raise RuntimeError(
+                    "ordered object commit changed during materialization"
+                )
+        except BaseException:
+            shutil.rmtree(root, ignore_errors=True)
+            raise
+        return root
+
+    def _download_ordered_shards(
+        self,
+        bucket: str,
+        prefix: str,
+        plan_sha256: str,
+        plan: OrderedBinaryObjectPlan,
+        commit: OrderedBinaryObjectCommit,
+        root: Path,
+    ) -> None:
+        pending: dict[Future[None], int] = {}
+        shards = iter(zip(plan.shards, commit.shards, strict=True))
+        source_files = {file.relative_path: file for file in plan.files}
+
+        def submit() -> bool:
+            try:
+                shard, stored = next(shards)
+            except StopIteration:
+                return False
+            future = self._parts.submit(
+                self._download_ordered_shard,
+                bucket,
+                prefix,
+                plan_sha256,
+                shard,
+                stored,
+                source_files[shard.relative_path],
+                root / shard.relative_path,
+            )
+            pending[future] = shard.index
+            return True
+
+        for _ in range(min(self.config.multipart_concurrency, len(plan.shards))):
+            submit()
+        try:
+            while pending:
+                done, _ = wait(pending, return_when=FIRST_COMPLETED)
+                for future in done:
+                    pending.pop(future)
+                    future.result()
+                    submit()
+        except BaseException:
+            futures = tuple(pending)
+            for future in futures:
+                future.cancel()
+            wait(futures)
+            for future in futures:
+                with suppress(BaseException):
+                    future.result()
+            raise
+
+    def _download_ordered_shard(
+        self,
+        bucket: str,
+        prefix: str,
+        plan_sha256: str,
+        shard: OrderedBinaryObjectShard,
+        stored: StoredOrderedBinaryObjectShard,
+        source: BinaryObjectFile,
+        target: Path,
+    ) -> None:
+        key = _ordered_binary_object_shard_key(prefix, shard.index)
+        try:
+            response = self._client.get_object(Bucket=bucket, Key=key)
+        except Exception as error:
+            if _is_missing_object(error):
+                raise RuntimeError(
+                    f"ordered object shard is missing: {shard.index}"
+                ) from error
+            raise
+        body = response["Body"]
+        try:
+            if (
+                stored.index != shard.index
+                or stored.byte_count != shard.byte_count
+                or response.get("ContentLength") != shard.byte_count
+                or response.get("Metadata")
+                != _ordered_binary_object_shard_metadata(
+                    plan_sha256, source.sha256, shard
+                )
+                or response.get("ETag") != stored.etag
+            ):
+                raise RuntimeError(
+                    f"ordered object shard changed identity: {shard.index}"
+                )
+            byte_count = 0
+            with target.open("r+b", buffering=0) as output:
+                output.seek(shard.file_offset)
+                while chunk := body.read(8 << 20):
+                    byte_count += len(chunk)
+                    if byte_count > shard.byte_count:
+                        raise RuntimeError(
+                            f"ordered object shard changed size: {shard.index}"
+                        )
+                    remaining = memoryview(chunk)
+                    while remaining:
+                        written = output.write(remaining)
+                        if written is None or written < 1:
+                            raise RuntimeError(
+                                f"ordered object shard write stalled: {shard.index}"
+                            )
+                        remaining = remaining[written:]
+            if byte_count != shard.byte_count:
+                raise RuntimeError(f"ordered object shard changed size: {shard.index}")
+        finally:
+            body.close()
 
     def _read_file(self, ref: BinaryObjectRef, file: BinaryObjectFile) -> bytes:
         bucket, manifest_key = _parse_s3_uri(ref.manifest_uri)
@@ -1004,9 +1170,14 @@ class S3BinaryObjectReceiver:
         with self._lock:
             if self._closed:
                 raise RuntimeError("binary object receiver is closed")
-        ref = self._resolve(manifest_uri, expected_format, expected_metadata)
+        ref = self._resolve_publication(
+            manifest_uri, expected_format, expected_metadata
+        )
         destination = self.receive_root / f".receive-{uuid4().hex}"
-        self._store._materialize(ref, destination)
+        if isinstance(ref, OrderedBinaryObjectRef):
+            self._store.materialize(ref, destination)
+        else:
+            self._store._materialize(ref, destination)
         with self._lock:
             if self._closed:
                 shutil.rmtree(destination, ignore_errors=True)
@@ -1125,10 +1296,21 @@ class S3BinaryObjectReceiver:
         expected_format: str,
         expected_metadata: dict[str, str],
     ) -> BinaryObjectRef:
+        ref = self._resolve_publication(
+            manifest_uri, expected_format, expected_metadata
+        )
+        if not isinstance(ref, BinaryObjectRef):
+            raise RuntimeError("ordered binary objects require materialization")
+        return ref
+
+    def _resolve_publication(
+        self,
+        manifest_uri: str,
+        expected_format: str,
+        expected_metadata: dict[str, str],
+    ) -> BinaryObjectPublicationRef:
         ref = self._store.resolve(manifest_uri)
         assert ref is not None
-        if not isinstance(ref, BinaryObjectRef):
-            raise RuntimeError("ordered binary objects require the ordered receiver")
         if ref.format != expected_format:
             raise RuntimeError("binary object format does not match its consumer")
         if any(
