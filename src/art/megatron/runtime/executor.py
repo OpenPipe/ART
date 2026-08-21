@@ -2737,6 +2737,7 @@ class _GenerationPublisher:
                 )
             return cached.plan, {}
         expected_metadata = {
+            "run_id": run_id,
             "training_session_id": generation.training_session_id,
             "generation_id": generation.generation_id,
             "policy_step": str(generation.policy_step),
@@ -2800,6 +2801,7 @@ class _GenerationPublisher:
                 handler=handler,
                 adapter_config=adapter_config,
                 conversion_group_for_key=_block_for_key,
+                metadata_group=self.runtime.publication_metadata_group,
                 exchange_device=exchange_device,
                 stager=stager,
             )

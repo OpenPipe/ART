@@ -446,18 +446,30 @@ def _run_case(
     torch.distributed.barrier()
     old_elapsed_s = time.perf_counter() - old_started
     new_started = time.perf_counter()
-    prepared = prepare_rank_distributed_vllm_lora(
-        target=_target(case, world_size),
-        local_tensors=fixture.regular,
-        local_metadata=fixture.regular_metadata,
-        local_packed_tensors=fixture.packed,
-        local_packed_metadata=fixture.packed_metadata,
-        handler=fixture.handler,
-        adapter_config=fixture.adapter_config,
-        conversion_group_for_key=_block_for_key,
-        exchange_device=torch.device("cpu"),
-        stager=PinnedCpuSnapshotStager(),
-    ).resolve()
+    object_collectives = 0
+    original_all_gather_object = torch.distributed.all_gather_object
+
+    def counted_all_gather_object(*args: Any, **kwargs: Any) -> Any:
+        nonlocal object_collectives
+        object_collectives += 1
+        return original_all_gather_object(*args, **kwargs)
+
+    torch.distributed.all_gather_object = counted_all_gather_object
+    try:
+        prepared = prepare_rank_distributed_vllm_lora(
+            target=_target(case, world_size),
+            local_tensors=fixture.regular,
+            local_metadata=fixture.regular_metadata,
+            local_packed_tensors=fixture.packed,
+            local_packed_metadata=fixture.packed_metadata,
+            handler=fixture.handler,
+            adapter_config=fixture.adapter_config,
+            conversion_group_for_key=_block_for_key,
+            exchange_device=torch.device("cpu"),
+            stager=PinnedCpuSnapshotStager(),
+        ).resolve()
+    finally:
+        torch.distributed.all_gather_object = original_all_gather_object
     torch.distributed.barrier()
     new_elapsed_s = time.perf_counter() - new_started
     layouts: list[Any] = [None] * world_size
@@ -471,8 +483,10 @@ def _run_case(
     torch.distributed.all_gather_object(gathered_payloads, local_payloads)
     stats: list[Any] = [None] * world_size
     torch.distributed.all_gather_object(stats, prepared.stats)
-    timings: list[tuple[float, float] | None] = [None] * world_size
-    torch.distributed.all_gather_object(timings, (old_elapsed_s, new_elapsed_s))
+    timings: list[tuple[float, float, int] | None] = [None] * world_size
+    torch.distributed.all_gather_object(
+        timings, (old_elapsed_s, new_elapsed_s, object_collectives)
+    )
     if rank != 0:
         return None
     assert expected is not None
@@ -516,6 +530,7 @@ def _run_case(
         )
     typed_stats = [value for value in stats if value is not None]
     typed_timings = [value for value in timings if value is not None]
+    assert {value[2] for value in typed_timings} == {0 if world_size == 1 else 2}
     global_output_bytes = sum(tensor.byte_count for tensor in prepared.layout.tensors)
     assert sum(value.owned_tensor_bytes for value in typed_stats) == global_output_bytes
     block_owners: dict[str, set[int]] = defaultdict(set)
@@ -543,6 +558,7 @@ def _run_case(
         "received_bytes": sum(value.received_bytes for value in typed_stats),
         "old_rank0_wall_s": max(value[0] for value in typed_timings),
         "distributed_wall_s": max(value[1] for value in typed_timings),
+        "prepare_object_collectives": typed_timings[0][2],
         "shards": len(prepared.layout.plan.shards),
     }
 
@@ -654,7 +670,7 @@ def _contract_worker(
             )
         with pytest.raises(
             RuntimeError,
-            match="dependency groups differ across ranks",
+            match="dependency group changed across ranks",
         ):
             prepare_rank_distributed_vllm_lora(
                 target=_target("qwen36_per_expert", world_size),
@@ -669,6 +685,34 @@ def _contract_worker(
                     if rank == 0
                     else lambda key: f"rank-1:{_block_for_key(key)}"
                 ),
+                exchange_device=torch.device("cpu"),
+                stager=PinnedCpuSnapshotStager(),
+            )
+
+        class RankFailingHandler:
+            key = fixture.handler.key
+
+            def to_vllm_lora_tensors(self, *args: Any, **kwargs: Any) -> Any:
+                if rank == 1:
+                    raise ValueError("rank-local conversion failure")
+                return fixture.handler.to_vllm_lora_tensors(*args, **kwargs)
+
+            def to_vllm_lora_config(self, *args: Any, **kwargs: Any) -> Any:
+                return fixture.handler.to_vllm_lora_config(*args, **kwargs)
+
+        with pytest.raises(
+            RuntimeError,
+            match="LoRA conversion failed: rank 1: ValueError",
+        ):
+            prepare_rank_distributed_vllm_lora(
+                target=_target("qwen36_per_expert", world_size),
+                local_tensors=fixture.regular,
+                local_metadata=fixture.regular_metadata,
+                local_packed_tensors=fixture.packed,
+                local_packed_metadata=fixture.packed_metadata,
+                handler=RankFailingHandler(),
+                adapter_config=fixture.adapter_config,
+                conversion_group_for_key=_block_for_key,
                 exchange_device=torch.device("cpu"),
                 stager=PinnedCpuSnapshotStager(),
             )
@@ -733,6 +777,7 @@ def test_generation_publisher_uses_independent_ordered_control_group(
     target = _target("qwen36_per_expert", 1).model_copy(
         update={
             "metadata": {
+                "run_id": "run",
                 "training_session_id": generation.training_session_id,
                 "generation_id": generation.generation_id,
                 "policy_step": str(generation.policy_step),
@@ -770,6 +815,7 @@ def test_generation_publisher_uses_independent_ordered_control_group(
         model_support_handler=fixture.handler,
         optimizer_snapshot_barrier=Barrier(),
         publication_group=control_group,
+        publication_metadata_group=None,
     )
     publisher = _GenerationPublisher(runtime, capacity=2)
     plan, _metrics = publisher.prepare_ordered_sampler(

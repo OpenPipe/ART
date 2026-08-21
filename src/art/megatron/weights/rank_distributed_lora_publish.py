@@ -4,7 +4,7 @@ import json
 import math
 import struct
 import sys
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 import torch
@@ -165,6 +165,40 @@ class RankDistributedLoraCallContract(BaseModel):
     exchange_device_type: Literal["cpu", "cuda"]
 
 
+class RankDistributedLoraPrepareRecord(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True, extra="forbid", frozen=True)
+
+    contract: RankDistributedLoraCallContract | None = None
+    regular: tuple[LoraShardMeta, ...] = ()
+    packed: tuple[PackedExpertShardMeta, ...] = ()
+    conversion_groups: tuple[tuple[str, str], ...] = ()
+    error: str | None = None
+
+    @model_validator(mode="after")
+    def _valid_or_failed(self) -> "RankDistributedLoraPrepareRecord":
+        if (self.error is None) != (self.contract is not None):
+            raise ValueError("LoRA prepare record must be valid or failed")
+        if self.error is not None and (
+            self.regular or self.packed or self.conversion_groups
+        ):
+            raise ValueError("failed LoRA prepare record cannot carry metadata")
+        return self
+
+
+class RankDistributedLoraOutputRecord(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    tensors: tuple[RankOwnedTensor, ...] = ()
+    configs: tuple[dict[str, Any], ...] = ()
+    error: str | None = None
+
+    @model_validator(mode="after")
+    def _valid_or_failed(self) -> "RankDistributedLoraOutputRecord":
+        if self.error is not None and (self.tensors or self.configs):
+            raise ValueError("failed LoRA output record cannot carry metadata")
+        return self
+
+
 class PreparedRankDistributedLora(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True, extra="forbid", frozen=True)
 
@@ -243,30 +277,92 @@ def _dtype_from_name(name: str) -> torch.dtype:
     return dtype
 
 
-def _validate_call_contract(
+def _all_gather_records(value: Any, world_size: int, group: Any | None) -> list[Any]:
+    gathered = [None] * world_size
+    if world_size == 1:
+        gathered[0] = value
+    else:
+        torch.distributed.all_gather_object(gathered, value, group=group)  # type: ignore[possibly-missing-attribute]
+    if any(record is None for record in gathered):
+        raise RuntimeError("rank-distributed LoRA metadata gather omitted a rank")
+    return gathered
+
+
+def _collect_prepare_records(
     *,
     target: OrderedBinaryObjectTarget,
     handler: Any,
     adapter_config: dict[str, Any],
     coordinator_rank: int,
     exchange_device: torch.device,
+    local_tensors: dict[str, torch.Tensor],
+    local_metadata: Sequence[LoraShardMeta],
+    local_packed_tensors: dict[str, torch.Tensor],
+    local_packed_metadata: Sequence[PackedExpertShardMeta],
+    conversion_group_for_key: Callable[[str], str],
+    rank: int,
     world_size: int,
-    group: Any | None,
-) -> None:
-    contract = RankDistributedLoraCallContract(
-        target=target,
-        handler_key=str(getattr(handler, "key", "")),
-        adapter_config=encode_adapter_config(adapter_config),
-        coordinator_rank=coordinator_rank,
-        exchange_device_type=exchange_device.type,
-    )
-    gathered: list[RankDistributedLoraCallContract | None] = [None] * world_size
-    if world_size == 1:
-        gathered[0] = contract
-    else:
-        torch.distributed.all_gather_object(gathered, contract, group=group)  # type: ignore[possibly-missing-attribute]
-    if any(value != contract for value in gathered):
+    exchange_group: Any | None,
+    metadata_group: Any | None,
+) -> tuple[
+    list[RankDistributedLoraPrepareRecord],
+    list[LoraShardMeta],
+    list[PackedExpertShardMeta],
+]:
+    try:
+        contract = RankDistributedLoraCallContract(
+            target=target,
+            handler_key=str(getattr(handler, "key", "")),
+            adapter_config=encode_adapter_config(adapter_config),
+            coordinator_rank=coordinator_rank,
+            exchange_device_type=cast(Literal["cpu", "cuda"], exchange_device.type),
+        )
+        regular = cast(
+            list[LoraShardMeta],
+            _normalize_local_owners(local_metadata, rank=rank, group=exchange_group),
+        )
+        packed = cast(
+            list[PackedExpertShardMeta],
+            _normalize_local_owners(
+                local_packed_metadata, rank=rank, group=exchange_group
+            ),
+        )
+        _validate_local_tensors(local_tensors, regular, exchange_device)
+        _validate_local_tensors(local_packed_tensors, packed, exchange_device)
+        conversion_groups = tuple(
+            sorted(
+                {
+                    meta.key: _metadata_group(meta, conversion_group_for_key)
+                    for meta in (*regular, *packed)
+                }.items()
+            )
+        )
+        record = RankDistributedLoraPrepareRecord(
+            contract=contract,
+            regular=tuple(regular),
+            packed=tuple(packed),
+            conversion_groups=conversion_groups,
+        )
+    except BaseException as error:
+        regular, packed = [], []
+        record = RankDistributedLoraPrepareRecord(
+            error=f"{type(error).__name__}: {error}"
+        )
+    gathered = [
+        RankDistributedLoraPrepareRecord.model_validate(value)
+        for value in _all_gather_records(record, world_size, metadata_group)
+    ]
+    failures = [
+        f"rank {owner}: {value.error}"
+        for owner, value in enumerate(gathered)
+        if value.error is not None
+    ]
+    if failures:
+        raise RuntimeError("LoRA preparation validation failed: " + "; ".join(failures))
+    contract = gathered[0].contract
+    if contract is None or any(value.contract != contract for value in gathered[1:]):
         raise RuntimeError("rank-distributed LoRA publication calls are inconsistent")
+    return gathered, regular, packed
 
 
 def _metadata_group(
@@ -304,32 +400,18 @@ def _metadata_without_owner(
 
 
 def _gather_candidates(
-    local: Sequence[LoraShardMeta | PackedExpertShardMeta],
-    *,
-    rank: int,
-    world_size: int,
-    group: Any | None,
+    gathered: Sequence[Sequence[LoraShardMeta | PackedExpertShardMeta]],
 ) -> dict[
     tuple[str, str, int, int],
     tuple[LoraShardMeta | PackedExpertShardMeta, ...],
 ]:
-    for meta in local:
-        if meta.owner_rank != rank:
-            raise ValueError("local LoRA metadata identifies another source rank")
-    gathered: list[list[LoraShardMeta | PackedExpertShardMeta] | None] = [
-        None
-    ] * world_size
-    if world_size == 1:
-        gathered[0] = list(local)
-    else:
-        torch.distributed.all_gather_object(gathered, list(local), group=group)  # type: ignore[possibly-missing-attribute]
     candidates: dict[
         tuple[str, str, int, int], list[LoraShardMeta | PackedExpertShardMeta]
     ] = defaultdict(list)
-    for rank_entries in gathered:
-        if rank_entries is None:
-            raise RuntimeError("LoRA metadata gather returned a missing rank")
+    for rank, rank_entries in enumerate(gathered):
         for meta in rank_entries:
+            if meta.owner_rank != rank:
+                raise RuntimeError("LoRA metadata identifies another source rank")
             candidates[_metadata_identity(meta)].append(meta)
     for identity, entries in candidates.items():
         if len({entry.owner_rank for entry in entries}) != len(entries):
@@ -345,28 +427,19 @@ def _validated_conversion_groups(
         tuple[str, str, int, int],
         tuple[LoraShardMeta | PackedExpertShardMeta, ...],
     ],
-    conversion_group_for_key: Callable[[str], str],
-    *,
-    world_size: int,
-    group: Any | None,
+    records: Sequence[RankDistributedLoraPrepareRecord],
 ) -> dict[str, str]:
     groups: dict[str, str] = {}
-    for entries in candidates.values():
-        key = entries[0].key
-        value = conversion_group_for_key(key)
-        if not value:
-            raise ValueError(f"LoRA conversion dependency group is empty: {key}")
-        previous = groups.setdefault(key, value)
-        if previous != value:
-            raise RuntimeError(f"LoRA conversion dependency group changed: {key}")
-    canonical = tuple(sorted(groups.items()))
-    gathered: list[tuple[tuple[str, str], ...] | None] = [None] * world_size
-    if world_size == 1:
-        gathered[0] = canonical
-    else:
-        torch.distributed.all_gather_object(gathered, canonical, group=group)  # type: ignore[possibly-missing-attribute]
-    if any(value != canonical for value in gathered):
-        raise RuntimeError("LoRA conversion dependency groups differ across ranks")
+    for record in records:
+        for key, value in record.conversion_groups:
+            previous = groups.setdefault(key, value)
+            if previous != value:
+                raise RuntimeError(
+                    f"LoRA conversion dependency group changed across ranks: {key}"
+                )
+    expected = {entries[0].key for entries in candidates.values()}
+    if set(groups) != expected:
+        raise RuntimeError("LoRA conversion dependency groups do not cover metadata")
     return groups
 
 
@@ -417,9 +490,10 @@ def _canonical_sources(
             (entry for entry in entries if entry.owner_rank == destination),
             min(entries, key=lambda entry: entry.owner_rank),
         )
-        (packed if isinstance(selected, PackedExpertShardMeta) else regular).append(
-            selected
-        )
+        if isinstance(selected, PackedExpertShardMeta):
+            packed.append(selected)
+        else:
+            regular.append(selected)
     return regular, packed
 
 
@@ -622,23 +696,14 @@ def _unique_storage_bytes(tensors: Sequence[torch.Tensor]) -> int:
 
 
 def _published_config(
-    local_configs: list[dict[str, Any]],
+    records: Sequence[RankDistributedLoraOutputRecord],
     *,
     handler: Any,
     adapter_config: dict[str, Any],
-    world_size: int,
-    group: Any | None,
 ) -> dict[str, Any]:
-    gathered: list[list[dict[str, Any]] | None] = [None] * world_size
-    if world_size == 1:
-        gathered[0] = local_configs
-    else:
-        torch.distributed.all_gather_object(gathered, local_configs, group=group)  # type: ignore[possibly-missing-attribute]
     unique: dict[bytes, dict[str, Any]] = {}
-    for values in gathered:
-        if values is None:
-            raise RuntimeError("LoRA config gather returned a missing rank")
-        for value in values:
+    for record in records:
+        for value in record.configs:
             unique.setdefault(encode_adapter_config(value), value)
     baseline = encode_adapter_config(adapter_config)
     declared = handler.to_vllm_lora_config(dict(adapter_config))
@@ -658,14 +723,12 @@ def _published_config(
     return {**selected, ART_LORA_FORMAT_CONFIG_KEY: ART_LORA_FORMAT_VLLM}
 
 
-def _gather_output_metadata(
+def _local_output_metadata(
     tensors: dict[str, torch.Tensor],
     *,
     rank: int,
-    world_size: int,
-    group: Any | None,
 ) -> tuple[RankOwnedTensor, ...]:
-    local = [
+    return tuple(
         RankOwnedTensor(
             name=name,
             owner_rank=rank,
@@ -674,16 +737,45 @@ def _gather_output_metadata(
             byte_count=tensor.nbytes,
         )
         for name, tensor in sorted(tensors.items())
+    )
+
+
+def _collect_output_records(
+    output: dict[str, torch.Tensor],
+    local_configs: list[dict[str, Any]],
+    *,
+    rank: int,
+    world_size: int,
+    metadata_group: Any | None,
+    error: BaseException | None = None,
+) -> tuple[RankDistributedLoraOutputRecord, ...]:
+    record = (
+        RankDistributedLoraOutputRecord(
+            tensors=_local_output_metadata(output, rank=rank),
+            configs=tuple(local_configs),
+        )
+        if error is None
+        else RankDistributedLoraOutputRecord(error=f"{type(error).__name__}: {error}")
+    )
+    gathered = tuple(
+        RankDistributedLoraOutputRecord.model_validate(value)
+        for value in _all_gather_records(record, world_size, metadata_group)
+    )
+    failures = [
+        f"rank {owner}: {value.error}"
+        for owner, value in enumerate(gathered)
+        if value.error is not None
     ]
-    gathered: list[list[RankOwnedTensor] | None] = [None] * world_size
-    if world_size == 1:
-        gathered[0] = local
-    else:
-        torch.distributed.all_gather_object(gathered, local, group=group)  # type: ignore[possibly-missing-attribute]
-    if any(values is None for values in gathered):
-        raise RuntimeError("LoRA output metadata gather returned a missing rank")
+    if failures:
+        raise RuntimeError("LoRA conversion failed: " + "; ".join(failures))
+    return gathered
+
+
+def _global_output_metadata(
+    records: Sequence[RankDistributedLoraOutputRecord],
+) -> tuple[RankOwnedTensor, ...]:
     result = sorted(
-        (tensor for values in gathered for tensor in values or ()),
+        (tensor for record in records for tensor in record.tensors),
         key=lambda tensor: tensor.name,
     )
     if len({tensor.name for tensor in result}) != len(result):
@@ -857,6 +949,7 @@ def prepare_rank_distributed_vllm_lora(
     adapter_config: dict[str, Any],
     conversion_group_for_key: Callable[[str], str],
     group: Any | None = None,
+    metadata_group: Any | None = None,
     coordinator_rank: int = 0,
     exchange_device: torch.device,
     stager: PinnedCpuSnapshotStager,
@@ -886,42 +979,37 @@ def prepare_rank_distributed_vllm_lora(
                 "LoRA exchange device must match its distributed backend: "
                 f"device={exchange_device.type} backend={backend}"
             )
-    _validate_call_contract(
+        metadata_group = group if metadata_group is None else metadata_group
+        metadata_backend = str(torch.distributed.get_backend(metadata_group))  # type: ignore[possibly-missing-attribute]
+        if metadata_backend != "gloo":
+            raise RuntimeError("LoRA metadata exchange requires an all-rank Gloo group")
+        if (
+            torch.distributed.get_world_size(metadata_group) != world_size  # type: ignore[possibly-missing-attribute]
+            or tuple(torch.distributed.get_process_group_ranks(metadata_group))  # type: ignore[possibly-missing-attribute]
+            != tuple(torch.distributed.get_process_group_ranks(group))  # type: ignore[possibly-missing-attribute]
+        ):
+            raise RuntimeError("LoRA metadata and tensor groups cover different ranks")
+    records, local_metadata, local_packed_metadata = _collect_prepare_records(
         target=target,
         handler=handler,
         adapter_config=adapter_config,
         coordinator_rank=coordinator_rank,
         exchange_device=exchange_device,
+        local_tensors=local_tensors,
+        local_metadata=local_metadata,
+        local_packed_tensors=local_packed_tensors,
+        local_packed_metadata=local_packed_metadata,
+        conversion_group_for_key=conversion_group_for_key,
+        rank=rank,
         world_size=world_size,
-        group=group,
-    )
-    local_metadata = _normalize_local_owners(
-        local_metadata,
-        rank=rank,
-        group=group,
-    )
-    local_packed_metadata = _normalize_local_owners(
-        local_packed_metadata,
-        rank=rank,
-        group=group,
-    )
-    _validate_local_tensors(local_tensors, local_metadata, exchange_device)
-    _validate_local_tensors(
-        local_packed_tensors,
-        local_packed_metadata,
-        exchange_device,
+        exchange_group=group,
+        metadata_group=metadata_group,
     )
     regular_candidates = _gather_candidates(
-        local_metadata,
-        rank=rank,
-        world_size=world_size,
-        group=group,
+        tuple(record.regular for record in records),
     )
     packed_candidates = _gather_candidates(
-        local_packed_metadata,
-        rank=rank,
-        world_size=world_size,
-        group=group,
+        tuple(record.packed for record in records),
     )
     candidates = {**regular_candidates, **packed_candidates}
     if len(candidates) != len(regular_candidates) + len(packed_candidates):
@@ -930,9 +1018,7 @@ def prepare_rank_distributed_vllm_lora(
         raise RuntimeError("rank-distributed LoRA publication has no tensors")
     conversion_groups = _validated_conversion_groups(
         candidates,
-        conversion_group_for_key,
-        world_size=world_size,
-        group=group,
+        records,
     )
     conversion_group_for_key = conversion_groups.__getitem__
     block_owners = _assign_blocks(
@@ -965,32 +1051,41 @@ def prepare_rank_distributed_vllm_lora(
         device=exchange_device,
         conversion_group_for_key=conversion_group_for_key,
     )
-    output, local_configs, owned_block_count, peak_accounted_owner_bytes = (
-        _merge_owned_blocks(
-            regular,
-            packed,
-            exchanged_regular,
-            exchanged_packed,
-            block_owners,
-            rank=rank,
-            handler=handler,
-            adapter_config=adapter_config,
-            conversion_group_for_key=conversion_group_for_key,
+    output: dict[str, torch.Tensor] = {}
+    local_configs: list[dict[str, Any]] = []
+    owned_block_count = 0
+    peak_accounted_owner_bytes = 0
+    conversion_error: BaseException | None = None
+    try:
+        output, local_configs, owned_block_count, peak_accounted_owner_bytes = (
+            _merge_owned_blocks(
+                regular,
+                packed,
+                exchanged_regular,
+                exchanged_packed,
+                block_owners,
+                rank=rank,
+                handler=handler,
+                adapter_config=adapter_config,
+                conversion_group_for_key=conversion_group_for_key,
+            )
         )
-    )
-    published_config = _published_config(
-        local_configs,
-        handler=handler,
-        adapter_config=adapter_config,
-        world_size=world_size,
-        group=group,
-    )
-    output_metadata = _gather_output_metadata(
+    except BaseException as error:
+        conversion_error = error
+    output_records = _collect_output_records(
         output,
+        local_configs,
         rank=rank,
         world_size=world_size,
-        group=group,
+        metadata_group=metadata_group,
+        error=conversion_error,
     )
+    published_config = _published_config(
+        output_records,
+        handler=handler,
+        adapter_config=adapter_config,
+    )
+    output_metadata = _global_output_metadata(output_records)
     config_bytes = encode_adapter_config(published_config)
     header = _safetensors_header(output_metadata)
     layout = _build_layout(

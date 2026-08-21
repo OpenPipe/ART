@@ -221,6 +221,7 @@ class TrainingRuntime(BaseModel):
         default_factory=_InterForwardBackwardTiming
     )
     publication_group: Any | None = None
+    publication_metadata_group: Any | None = None
 
     @field_validator("model")
     @classmethod
@@ -616,6 +617,11 @@ def build_training_runtime(
         if world_size > 1
         else None
     )
+    publication_metadata_group = (
+        torch.distributed.new_group(backend="gloo")  # ty: ignore[possibly-missing-attribute]
+        if world_size > 1
+        else None
+    )
 
     runtime = TrainingRuntime(
         model_identifier=model_identifier,
@@ -634,6 +640,7 @@ def build_training_runtime(
             metrics_group=metrics_group
         ),
         publication_group=publication_group,
+        publication_metadata_group=publication_metadata_group,
     )
     _model_runtime_sha256(runtime)
     configure_moe_routing_replay(
