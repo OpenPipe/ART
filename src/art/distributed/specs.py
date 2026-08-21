@@ -65,7 +65,14 @@ class EndpointSpec(_Spec):
 
     @property
     def url(self) -> str:
-        return f"http://{self.host}:{self.port}"
+        raw_host = self.host.strip("[]")
+        try:
+            address = ip_address(raw_host)
+        except ValueError:
+            authority = self.host
+        else:
+            authority = f"[{raw_host}]" if address.version == 6 else raw_host
+        return f"http://{authority}:{self.port}"
 
     @property
     def is_loopback(self) -> bool:
@@ -241,8 +248,11 @@ class ModelServiceSpec(_Spec):
             != self.parallel.world_size
         ):
             raise ValueError("vLLM TP * PP * DP must equal the service GPU count")
-        if len(self.members) > 1 and not self.rendezvous.is_routable:
-            raise ValueError("multi-host vLLM rendezvous must be routable")
+        if len(self.members) > 1:
+            if not self.leader_endpoint.is_routable:
+                raise ValueError("multi-host vLLM leader endpoint must be routable")
+            if not self.rendezvous.is_routable:
+                raise ValueError("multi-host vLLM rendezvous must be routable")
         local_world_size = len(self.members[0].gpu_ids)
         world_size_within_dp = self.parallel.tp * self.parallel.pp
         if (

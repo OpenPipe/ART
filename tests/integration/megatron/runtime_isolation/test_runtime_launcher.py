@@ -1,10 +1,13 @@
 import os
 from pathlib import Path
+import subprocess
+import sys
 from typing import Any, cast
 
 import pytest
 
 from art import vllm_runtime as runtime
+from art.distributed import nccl_preflight
 
 ROOT = Path(__file__).resolve().parents[4]
 
@@ -65,6 +68,32 @@ def test_build_runtime_server_cmd_honors_runtime_bin_override(monkeypatch) -> No
         )
     )
     assert command[:2] == ["/opt/art/bin/runtime", "--wrapped"]
+
+
+def test_vllm_nccl_preflight_executes_in_runtime_python(
+    monkeypatch, tmp_path: Path
+) -> None:
+    runtime_bin = tmp_path / ".venv" / "bin" / runtime.RUNTIME_SERVER
+    runtime_bin.parent.mkdir(parents=True)
+    runtime_bin.write_text("#!/bin/sh\n", encoding="ascii")
+    runtime_python = runtime_bin.with_name("python")
+    runtime_python.symlink_to(sys.executable)
+    monkeypatch.setenv("ART_VLLM_RUNTIME_BIN", str(runtime_bin))
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            nccl_preflight._VLLM_EXEC_SCRIPT,
+            "print('runtime-ready')",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        env=os.environ.copy(),
+    )
+
+    assert result.stdout.strip() == "runtime-ready"
 
 
 def test_build_runtime_server_cmd_allows_lora_without_initial_adapter(

@@ -162,13 +162,13 @@ import sys
 
 from art.vllm_runtime import (
     RUNTIME_SERVER,
-    _runtime_python_for_nccl_discovery,
+    _resolve_vllm_runtime_python,
     _vllm_runtime_subprocess_cwd,
     _vllm_runtime_subprocess_env,
 )
 
 try:
-    python = _runtime_python_for_nccl_discovery()
+    python = _resolve_vllm_runtime_python()
 except RuntimeError as error:
     raise RuntimeError(
         "Cannot derive the Python environment behind ART_VLLM_RUNTIME_BIN; "
