@@ -15,6 +15,7 @@ from .data_plane import (
     SftBatchManifest,
     SftBatchRef,
 )
+from .moe_route_store import MoeRouteObjectBatchTransfer, MoeRoutePrefetchRef
 from .packing import PackingPlanResult, PackingRequest, PackingResult
 from .rollout import (
     RolloutInvocation,
@@ -274,6 +275,24 @@ class MonarchPackingEndpoint:
     def __init__(self, actor: Any) -> None:
         self.actor = actor
 
+    async def prefetch_moe_routes(
+        self,
+        transfer: MoeRouteObjectBatchTransfer,
+        prefetch: MoeRoutePrefetchRef,
+        *,
+        batch_id: str,
+        generation_id: str,
+        transfer_timeout_s: float,
+    ) -> None:
+        await call_remote(
+            self.actor.prefetch_moe_routes,
+            transfer,
+            prefetch,
+            batch_id,
+            generation_id,
+            transfer_timeout_s,
+        )
+
     async def pack(
         self,
         request: PackingRequest,
@@ -296,9 +315,5 @@ class MonarchPackingEndpoint:
             self.actor.prepare_batch, request, batch_id, transfer_timeout_s
         )
 
-    async def materialize(
-        self, batch_id: str, generation_id: str
-    ) -> PackingResult:
-        return await call_remote(
-            self.actor.materialize_batch, batch_id, generation_id
-        )
+    async def materialize(self, batch_id: str, generation_id: str) -> PackingResult:
+        return await call_remote(self.actor.materialize_batch, batch_id, generation_id)

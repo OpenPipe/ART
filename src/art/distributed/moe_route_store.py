@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable, Iterable, Mapping
+from concurrent.futures import Executor
 from typing import TYPE_CHECKING, Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, PlainSerializer, model_validator
+
+from art.utils.lifecycle import complete_task
 
 from .data_plane import (
     ByteStreamPublisher,
@@ -168,6 +171,7 @@ class MoeRouteObjectBatchTransfer(_Contract):
         slots: asyncio.Semaphore,
         *,
         timeout_s: float,
+        executor: Executor | None = None,
     ) -> tuple[MoeRouteGroupPayload, ...]:
         objects = {value.object_id: value for group in self.groups for value in group}
         values = iter(objects.values())
@@ -176,9 +180,18 @@ class MoeRouteObjectBatchTransfer(_Contract):
         async def receive() -> None:
             for value in values:
                 async with slots:
-                    payloads[value.object_id] = await asyncio.to_thread(
-                        self._receive, receiver, value
+
+                    async def read() -> memoryview:
+                        return await asyncio.get_running_loop().run_in_executor(
+                            executor, self._receive, receiver, value
+                        )
+
+                    payload, cancelled = await complete_task(
+                        asyncio.create_task(read())
                     )
+                    payloads[value.object_id] = payload
+                    if cancelled is not None:
+                        raise cancelled
 
         async with asyncio.timeout(timeout_s):
             async with asyncio.TaskGroup() as workers:
@@ -224,6 +237,13 @@ class MoeRouteObjectBatchTransfer(_Contract):
         if file.byte_count != value.byte_count:
             raise RuntimeError("stored route object changed immutable identity")
         return memoryview(payload).toreadonly()
+
+
+class MoeRoutePrefetchRef(_Contract):
+    """Actor-local ownership of one exact stored-route receive."""
+
+    prefetch_id: str = Field(min_length=1)
+    group_count: int = Field(ge=1)
 
 
 async def publish_moe_route_groups(

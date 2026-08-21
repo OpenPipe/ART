@@ -11,10 +11,12 @@ from pydantic import BaseModel, ConfigDict, Field, SkipValidation, model_validat
 
 from art.distributed.art_runtime import (
     ArtRuntime,
+    DistributedMoeRoutePrefetch,
     DistributedPackedBatch,
     DistributedPackingPlan,
 )
 from art.distributed.data_plane import SftBatchLeaseSet, SftBatchManifest
+from art.distributed.moe_route_store import MoeRouteObjectBatchTransfer
 from art.distributed.object_store import (
     OrderedBinaryObjectTarget,
     S3ObjectStoreConfig,
@@ -143,6 +145,14 @@ class PlannedPackedForward(BaseModel):
         if (self.kind == "tokenized") != (self.loss is not None):
             raise ValueError("tokenized planned batches require their named loss")
         return self
+
+
+class PlannedMoeRoutePrefetch(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    ref: OperationRef
+    transfer: MoeRouteObjectBatchTransfer
+    distributed: DistributedMoeRoutePrefetch
 
 
 class PreparedSftForward(PreparedForward):
@@ -291,6 +301,7 @@ class MegatronTrainingSlot:
             _MAX_PENDING_BATCH_RELEASES
         )
         self._batch_release_leases: dict[str, _BatchReleaseLease] = {}
+        self._moe_route_prefetches: dict[str, PlannedMoeRoutePrefetch] = {}
         self._closed = False
 
     @property
@@ -422,9 +433,7 @@ class MegatronTrainingSlot:
                 math.ceil(batch.num_trajectories / data_parallel_size)
                 * data_parallel_size
             )
-            packing = sft_packing_outcome(
-                batch, physical_sequences=grad_sequences
-            )
+            packing = sft_packing_outcome(batch, physical_sequences=grad_sequences)
             lease = await self._acquire_batch_release()
             manifest, chunks = batch.distribution_payload(uuid.uuid4().hex)
             leases = None
@@ -474,13 +483,81 @@ class MegatronTrainingSlot:
                 )
             raise
 
+    async def prefetch_forward_moe_routes(
+        self,
+        ref: OperationRef,
+        transfer: MoeRouteObjectBatchTransfer,
+    ) -> PlannedMoeRoutePrefetch:
+        self._require_run(ref.run_id)
+        if ref.operation_id in self._moe_route_prefetches:
+            raise RuntimeError("operation already has a route prefetch")
+        distributed = await self.runtime.prefetch_moe_routes(
+            transfer, generation_id=uuid.uuid4().hex
+        )
+        prefetch = PlannedMoeRoutePrefetch(
+            ref=ref, transfer=transfer, distributed=distributed
+        )
+        self._moe_route_prefetches[ref.operation_id] = prefetch
+        return prefetch
+
+    async def discard_forward_moe_routes(
+        self, prefetch: PlannedMoeRoutePrefetch
+    ) -> None:
+        current = self._moe_route_prefetches.pop(prefetch.ref.operation_id, None)
+        if current != prefetch:
+            raise RuntimeError("route prefetch is not the active operation prefetch")
+        await self.runtime.discard_moe_route_prefetch(prefetch.distributed)
+
     async def prepare_forward_packing(
         self,
         ref: OperationRef,
         request: ForwardRequest | ForwardBackwardRequest,
+        *,
+        moe_route_prefetch: PlannedMoeRoutePrefetch | None = None,
     ) -> PlannedPackedForward:
         state = self._require_run(ref.run_id)
+        if moe_route_prefetch is not None:
+            current = self._moe_route_prefetches.pop(ref.operation_id, None)
+            if current != moe_route_prefetch or moe_route_prefetch.ref != ref:
+                supplied = self._moe_route_prefetches.pop(
+                    moe_route_prefetch.ref.operation_id, None
+                )
+                prefetches = {
+                    value.distributed.batch_id: value
+                    for value in (current, supplied, moe_route_prefetch)
+                    if value is not None
+                }
+                await asyncio.gather(
+                    *(
+                        self.runtime.discard_moe_route_prefetch(value.distributed)
+                        for value in prefetches.values()
+                    )
+                )
+                raise RuntimeError("route prefetch does not own this operation")
+        try:
+            return await self._prepare_forward_packing_owned(
+                state,
+                ref,
+                request,
+                moe_route_prefetch,
+            )
+        except BaseException:
+            if moe_route_prefetch is not None:
+                await self.runtime.discard_moe_route_prefetch(
+                    moe_route_prefetch.distributed
+                )
+            raise
+
+    async def _prepare_forward_packing_owned(
+        self,
+        state: _ResidentRun,
+        ref: OperationRef,
+        request: ForwardRequest | ForwardBackwardRequest,
+        moe_route_prefetch: PlannedMoeRoutePrefetch | None,
+    ) -> PlannedPackedForward:
         if isinstance(request.batch, TokenizedTrainingBatch):
+            if moe_route_prefetch is not None:
+                raise ValueError("tokenized packing cannot consume MoE route prefetch")
             if (
                 self.runtime_spec.enable_moe_routing_replay
                 and request.batch.datums[0].moe_routes is None
@@ -508,6 +585,11 @@ class MegatronTrainingSlot:
             )
         if not isinstance(request.batch, RlTrajectoryBatch):
             raise TypeError("packed planning requires an RL or tokenized batch")
+        route_transfer = request.batch.local_moe_route_object_transfer()
+        if moe_route_prefetch is not None and route_transfer != (
+            moe_route_prefetch.transfer
+        ):
+            raise ValueError("RL route transfer changed after prefetch")
         config = experimental_train_config(request)
         training_config = forward_backward_config(request)
         if (
@@ -519,12 +601,14 @@ class MegatronTrainingSlot:
         plan = await self.runtime.prepare_pack(
             PackingRequest(
                 model=state.model,
-                generation_id=uuid.uuid4().hex,
+                generation_id=(
+                    moe_route_prefetch.distributed.generation_id
+                    if moe_route_prefetch is not None
+                    else uuid.uuid4().hex
+                ),
                 trajectory_groups=request.batch.groups,
                 moe_route_groups=request.batch.local_moe_route_groups(),
-                moe_route_object_transfer=(
-                    request.batch.local_moe_route_object_transfer()
-                ),
+                moe_route_object_transfer=route_transfer,
                 trajectory_annotations=request.batch.local_group_annotations(),
                 advantage_balance=config.advantage_balance,
                 allow_training_without_logprobs=bool(
@@ -544,7 +628,12 @@ class MegatronTrainingSlot:
                 ),
                 min_source_version=request.batch.min_source_version,
                 max_source_version=request.batch.max_source_version,
-            )
+            ),
+            route_prefetch=(
+                moe_route_prefetch.distributed
+                if moe_route_prefetch is not None
+                else None
+            ),
         )
         return PlannedPackedForward(
             ref=ref,
@@ -1527,6 +1616,25 @@ class MegatronTrainingSlot:
             return
         primary: BaseException | None = None
         try:
+            if self._moe_route_prefetches:
+                prefetches = tuple(self._moe_route_prefetches.values())
+                self._moe_route_prefetches.clear()
+                outcomes = await asyncio.gather(
+                    *(
+                        self.runtime.discard_moe_route_prefetch(value.distributed)
+                        for value in prefetches
+                    ),
+                    return_exceptions=True,
+                )
+                failures = [
+                    outcome
+                    for outcome in outcomes
+                    if isinstance(outcome, BaseException)
+                ]
+                if len(failures) == 1:
+                    raise failures[0]
+                if failures:
+                    raise BaseExceptionGroup("route prefetch cleanup failed", failures)
             if self._pending_results:
                 outcomes = await asyncio.gather(
                     *(pending[1] for pending in self._pending_results.values()),
@@ -1571,9 +1679,7 @@ class MegatronTrainingSlot:
         await self._batch_release_slots.acquire()
         return _BatchReleaseLease(self._batch_release_slots)
 
-    def _release_batch_soon(
-        self, packed: DistributedPackedBatch
-    ) -> asyncio.Task[None]:
+    def _release_batch_soon(self, packed: DistributedPackedBatch) -> asyncio.Task[None]:
         lease = self._batch_release_leases.pop(packed.packing_generation_id)
 
         async def release() -> None:

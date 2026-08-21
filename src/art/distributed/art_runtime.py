@@ -39,6 +39,7 @@ from .host_admission import (
     runtime_package_names,
     validate_host_admission,
 )
+from .moe_route_store import MoeRouteObjectBatchTransfer, MoeRoutePrefetchRef
 from .monarch_bootstrap import (
     _start_worker,
     _stop_worker,
@@ -127,6 +128,17 @@ class DistributedPackingPlan(BaseModel):
     @property
     def replicated_storage_byte_count(self) -> int:
         return len(self.trainer_hosts) * self.storage_byte_count
+
+
+class DistributedMoeRoutePrefetch(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    prefetch_id: str = Field(min_length=1)
+    batch_id: str = Field(min_length=1)
+    generation_id: str = Field(min_length=1)
+    source_host: str = Field(min_length=1)
+    trainer_hosts: tuple[str, ...] = Field(min_length=1)
+    transfer: MoeRouteObjectBatchTransfer
 
 
 class ArtRuntime:
@@ -298,6 +310,7 @@ class ArtRuntime:
                     self.config.packed_batch_capacity_bytes,
                     self.config.vllm_output_root,
                     data_plane_host,
+                    self.config.moe_route_receive_concurrency,
                 )
                 self._host_services[host.host_id] = actor
                 adapter_proc = host_mesh.spawn_procs(
@@ -816,6 +829,51 @@ class ArtRuntime:
             host for host in self.topology.cluster.hosts if host.host_id == host_id
         )
 
+    def _reserve_packing_location(self) -> tuple[str, tuple[str, ...], str]:
+        trainer = self.topology.trainer
+        if trainer is None:
+            raise RuntimeError("runtime topology has no trainer mesh")
+        trainer_hosts = tuple(dict.fromkeys(rank.host_id for rank in trainer.ranks))
+        source_host = trainer_hosts[self._next_packing_host % len(trainer_hosts)]
+        self._next_packing_host += 1
+        batch_id = uuid.uuid4().hex
+        self._live_batches[batch_id] = trainer_hosts
+        return source_host, trainer_hosts, batch_id
+
+    async def prefetch_moe_routes(
+        self,
+        transfer: MoeRouteObjectBatchTransfer,
+        *,
+        generation_id: str,
+    ) -> DistributedMoeRoutePrefetch:
+        self._require_open()
+        source_host, trainer_hosts, batch_id = self._reserve_packing_location()
+        prefetch = DistributedMoeRoutePrefetch(
+            prefetch_id=uuid.uuid4().hex,
+            batch_id=batch_id,
+            generation_id=generation_id,
+            source_host=source_host,
+            trainer_hosts=trainer_hosts,
+            transfer=transfer,
+        )
+        try:
+            await MonarchPackingEndpoint(
+                self._host_services[source_host]
+            ).prefetch_moe_routes(
+                transfer,
+                MoeRoutePrefetchRef(
+                    prefetch_id=prefetch.prefetch_id,
+                    group_count=len(transfer.groups),
+                ),
+                batch_id=batch_id,
+                generation_id=generation_id,
+                transfer_timeout_s=self.topology.cluster.rpc_timeout_s,
+            )
+        except BaseException as error:
+            await self._reclaim_after_failure(batch_id, error)
+            raise
+        return prefetch
+
     async def pack(self, request: PackingRequest) -> DistributedPackedBatch | None:
         plan = await self.prepare_pack(request)
         try:
@@ -824,20 +882,38 @@ class ArtRuntime:
             await self._reclaim_after_failure(plan.batch_id, error)
             raise
 
-    async def prepare_pack(self, request: PackingRequest) -> DistributedPackingPlan:
+    async def prepare_pack(
+        self,
+        request: PackingRequest,
+        *,
+        route_prefetch: DistributedMoeRoutePrefetch | None = None,
+    ) -> DistributedPackingPlan:
         self._require_open()
-        trainer = self.topology.trainer
-        if trainer is None:
-            raise RuntimeError("runtime topology has no trainer mesh")
-        trainer_hosts = tuple(dict.fromkeys(rank.host_id for rank in trainer.ranks))
-        source_host = trainer_hosts[self._next_packing_host % len(trainer_hosts)]
-        self._next_packing_host += 1
+        if route_prefetch is None:
+            source_host, trainer_hosts, batch_id = self._reserve_packing_location()
+            wire_request = request
+        else:
+            source_host = route_prefetch.source_host
+            trainer_hosts = route_prefetch.trainer_hosts
+            batch_id = route_prefetch.batch_id
+            if self._live_batches.get(batch_id) != trainer_hosts:
+                raise RuntimeError("route prefetch is no longer live")
+            if request.generation_id != route_prefetch.generation_id:
+                raise ValueError("route prefetch generation changed before packing")
+            if request.moe_route_object_transfer != route_prefetch.transfer:
+                raise ValueError("route prefetch transfer changed before packing")
+            wire_request = request.model_copy(
+                update={
+                    "moe_route_object_transfer": None,
+                    "moe_route_prefetch": MoeRoutePrefetchRef(
+                        prefetch_id=route_prefetch.prefetch_id,
+                        group_count=len(route_prefetch.transfer.groups),
+                    ),
+                }
+            )
         source_service = self._host_services[source_host]
-        batch_id = uuid.uuid4().hex
-        self._live_batches[batch_id] = trainer_hosts
         try:
             async with AsyncExitStack() as publishers:
-                wire_request = request
                 if request.trajectory_groups or request.tokenized_batch is not None:
                     from .moe_route_store import publish_moe_route_groups
                     from .trajectory_store import publish_trajectory_bundles
@@ -852,7 +928,7 @@ class ArtRuntime:
                             (encode_tokenized_batch(request.tokenized_batch),),
                             advertise_host=data_plane_host,
                         )
-                        wire_request = request.model_copy(
+                        wire_request = wire_request.model_copy(
                             update={
                                 "tokenized_batch": None,
                                 "tokenized_transfer": TokenizedBatchTransfer(
@@ -867,7 +943,7 @@ class ArtRuntime:
                             stream_id=batch_id,
                             advertise_host=data_plane_host,
                         )
-                        wire_request = request.model_copy(
+                        wire_request = wire_request.model_copy(
                             update={
                                 "trajectory_groups": (),
                                 "trajectory_transfer": transfer,
@@ -891,9 +967,7 @@ class ArtRuntime:
                         )
                         publishers.push_async_callback(route_publisher.close)
                 packing_rpc_started = time.monotonic()
-                result = await MonarchPackingEndpoint(
-                    source_service
-                ).prepare(
+                result = await MonarchPackingEndpoint(source_service).prepare(
                     wire_request,
                     batch_id,
                     transfer_timeout_s=self.topology.cluster.rpc_timeout_s,
@@ -912,6 +986,13 @@ class ArtRuntime:
             storage_byte_count=result.storage_byte_count,
             packing_rpc_s=packing_rpc_s,
         )
+
+    async def discard_moe_route_prefetch(
+        self, prefetch: DistributedMoeRoutePrefetch
+    ) -> None:
+        if self._live_batches.get(prefetch.batch_id) != prefetch.trainer_hosts:
+            return
+        await self._reclaim_batch(prefetch.batch_id, fence=True)
 
     async def materialize_pack(
         self, plan: DistributedPackingPlan

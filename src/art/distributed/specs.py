@@ -408,6 +408,7 @@ class ArtRuntimeConfig(_Spec):
     packed_batch_capacity_bytes: int = Field(default=2 << 30, ge=1)
     trajectory_capacity_records: int = Field(default=16_384, ge=1)
     trajectory_capacity_bytes: int = Field(default=4 << 30, ge=1)
+    moe_route_receive_concurrency: int = Field(default=16, ge=1)
     vllm_output_root: str = "/tmp/art-vllm"
 
 

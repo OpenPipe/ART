@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 from functools import partial, wraps
 import gc
 import hashlib
@@ -52,6 +53,7 @@ from .host_admission import (
 from .moe_route_store import (
     MoeRouteGroupPayload,
     MoeRouteObjectBatchTransfer,
+    MoeRoutePrefetchRef,
     hydrate_trajectory_group_routes,
 )
 from .monarch_runtime import RemoteCallError, RemoteCallResult
@@ -105,6 +107,16 @@ class _RetainedPackingPlan(BaseModel):
     packing_lock_wait_s: float
     packing_compute_s: float
     trajectory_log_wait_s: float
+
+
+class _MoeRoutePrefetchState(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, arbitrary_types_allowed=True)
+
+    prefetch: MoeRoutePrefetchRef
+    batch_id: str
+    generation_id: str
+    transfer: MoeRouteObjectBatchTransfer
+    completion: asyncio.Task[tuple[MoeRouteGroupPayload, ...]]
 
 
 def _require_etcd_health(url: str, timeout_s: float) -> None:
@@ -236,7 +248,10 @@ class ArtHostService(Actor):
         packed_batch_capacity_bytes: int,
         vllm_output_root: str = "/tmp/art-vllm",
         data_plane_host: str | None = None,
+        moe_route_receive_concurrency: int = 16,
     ) -> None:
+        if moe_route_receive_concurrency < 1:
+            raise ValueError("MoE route receive concurrency must be positive")
         admission = HostAdmissionRequest.model_validate_json(admission_json)
         self.host_id = admission.host_id
         self._admission = admission
@@ -255,7 +270,12 @@ class ArtHostService(Actor):
         self._packing_tasks: set[asyncio.Task[Any]] = set()
         self._packing_plans: dict[str, _RetainedPackingPlan] = {}
         self._moe_route_receivers: dict[str, S3BinaryObjectReceiver] = {}
-        self._moe_route_receive_slots = asyncio.Semaphore(4)
+        self._moe_route_receive_slots = asyncio.Semaphore(moe_route_receive_concurrency)
+        self._moe_route_receive_executor = ThreadPoolExecutor(
+            max_workers=moe_route_receive_concurrency,
+            thread_name_prefix="art-moe-route-receive",
+        )
+        self._moe_route_prefetches: dict[str, _MoeRoutePrefetchState] = {}
         self._closing = False
         self._vllm_output_root = vllm_output_root
         self._vllm_launcher = None
@@ -406,6 +426,7 @@ class ArtHostService(Actor):
                 failures.append(error)
 
         self._closing = True
+        await close_one(self._cancel_moe_route_prefetches())
         if self._packing_tasks:
             results = await asyncio.gather(
                 *tuple(self._packing_tasks), return_exceptions=True
@@ -413,6 +434,7 @@ class ArtHostService(Actor):
             failures.extend(
                 result for result in results if isinstance(result, BaseException)
             )
+        self._moe_route_receive_executor.shutdown(wait=True, cancel_futures=True)
         if self._moe_route_receivers:
             results = await asyncio.gather(
                 *(
@@ -646,26 +668,113 @@ class ArtHostService(Actor):
                     self._moe_route_receiver(transfer),
                     self._moe_route_receive_slots,
                     timeout_s=timeout_s,
+                    executor=self._moe_route_receive_executor,
+                )
+            )
+        if request.moe_route_prefetch is not None:
+            receives.append(
+                self._consume_moe_route_prefetch(
+                    request.moe_route_prefetch,
+                    batch_id=batch_id,
+                    generation_id=request.generation_id,
                 )
             )
         if receives:
             values = await asyncio.gather(*receives)
             if request.moe_route_transfer is not None:
                 streamed = values[0]
-            if request.moe_route_object_transfer is not None:
+            if (
+                request.moe_route_object_transfer is not None
+                or request.moe_route_prefetch is not None
+            ):
                 stored = values[-1]
         return _merge_moe_route_groups(
-            len(request.moe_route_object_transfer.groups)
-            if request.moe_route_object_transfer is not None
+            request.moe_route_prefetch.group_count
+            if request.moe_route_prefetch is not None
             else (
-                len(request.moe_route_transfer.groups)
-                if request.moe_route_transfer is not None
-                else len(request.moe_route_groups)
+                len(request.moe_route_object_transfer.groups)
+                if request.moe_route_object_transfer is not None
+                else (
+                    len(request.moe_route_transfer.groups)
+                    if request.moe_route_transfer is not None
+                    else len(request.moe_route_groups)
+                )
             ),
             request.moe_route_groups,
             streamed,
             stored,
         )
+
+    @resilient_endpoint(concurrent=True)
+    async def prefetch_moe_routes(
+        self,
+        transfer: MoeRouteObjectBatchTransfer,
+        prefetch: MoeRoutePrefetchRef,
+        batch_id: str,
+        generation_id: str,
+        transfer_timeout_s: float,
+    ) -> None:
+        if self._closing:
+            raise RuntimeError("ART host service is closing")
+        if prefetch.group_count != len(transfer.groups):
+            raise ValueError("route prefetch group count changed before receive")
+        if prefetch.prefetch_id in self._moe_route_prefetches:
+            raise RuntimeError("route prefetch identity is already active")
+        if any(
+            state.batch_id == batch_id for state in self._moe_route_prefetches.values()
+        ):
+            raise RuntimeError("packing batch already has a route prefetch")
+        completion = asyncio.create_task(
+            transfer.receive_groups(
+                self._moe_route_receiver(transfer),
+                self._moe_route_receive_slots,
+                timeout_s=transfer_timeout_s,
+                executor=self._moe_route_receive_executor,
+            ),
+            name=f"moe-route-prefetch-{prefetch.prefetch_id}",
+        )
+        self._moe_route_prefetches[prefetch.prefetch_id] = _MoeRoutePrefetchState(
+            prefetch=prefetch,
+            batch_id=batch_id,
+            generation_id=generation_id,
+            transfer=transfer,
+            completion=completion,
+        )
+
+    async def _consume_moe_route_prefetch(
+        self,
+        prefetch: MoeRoutePrefetchRef,
+        *,
+        batch_id: str,
+        generation_id: str,
+    ) -> tuple[MoeRouteGroupPayload, ...]:
+        state = self._moe_route_prefetches.pop(prefetch.prefetch_id, None)
+        if state is None:
+            raise ValueError("unknown or already-consumed route prefetch")
+        if (
+            state.prefetch != prefetch
+            or state.batch_id != batch_id
+            or state.generation_id != generation_id
+        ):
+            state.completion.cancel()
+            await asyncio.gather(state.completion, return_exceptions=True)
+            raise ValueError("route prefetch identity changed before packing")
+        return await state.completion
+
+    async def _cancel_moe_route_prefetches(self, batch_id: str | None = None) -> bool:
+        states = tuple(
+            state
+            for state in self._moe_route_prefetches.values()
+            if batch_id is None or state.batch_id == batch_id
+        )
+        for state in states:
+            self._moe_route_prefetches.pop(state.prefetch.prefetch_id, None)
+            state.completion.cancel()
+        if states:
+            await asyncio.gather(
+                *(state.completion for state in states), return_exceptions=True
+            )
+        return bool(states)
 
     @resilient_endpoint(concurrent=True)
     async def start_vllm_member(self, request: HostMemberLaunchRequest):
@@ -1109,6 +1218,7 @@ class ArtHostService(Actor):
 
     @resilient_endpoint
     async def reclaim_batch(self, batch_id: str, fence: bool) -> bool:
+        prefetched = await self._cancel_moe_route_prefetches(batch_id)
         reclaimed_plan = self._packing_plans.pop(batch_id, None) is not None
         published = False
         failure: BaseException | None = None
@@ -1119,7 +1229,7 @@ class ArtHostService(Actor):
         reclaimed = self._packed_batches.store.reclaim(batch_id, fence=fence)
         if failure is not None:
             raise failure
-        return reclaimed_plan or published or reclaimed
+        return prefetched or reclaimed_plan or published or reclaimed
 
     @resilient_endpoint
     async def stats(self):

@@ -33,6 +33,7 @@ from .moe_route_store import (
     MoeRouteBytes,
     MoeRouteGroupPayload,
     MoeRouteObjectBatchTransfer,
+    MoeRoutePrefetchRef,
 )
 from .rollout import RolloutModelSpec
 from .trajectory_store import (
@@ -322,6 +323,7 @@ class PackingRequest(BaseModel):
     moe_route_groups: tuple[MoeRouteGroupPayload, ...] = ()
     moe_route_transfer: MoeRouteBatchTransfer | None = None
     moe_route_object_transfer: MoeRouteObjectBatchTransfer | None = None
+    moe_route_prefetch: MoeRoutePrefetchRef | None = None
     trajectory_annotations: tuple[TrajectoryGroupAnnotations | None, ...] = ()
     trajectory_sources: tuple[TrajectoryQueueItem, ...] = ()
     trajectory_log_path: str | None = None
@@ -358,7 +360,10 @@ class PackingRequest(BaseModel):
             bool(self.moe_route_groups),
             self.moe_route_transfer is not None,
             self.moe_route_object_transfer is not None,
+            self.moe_route_prefetch is not None,
         )
+        if self.moe_route_object_transfer is not None and self.moe_route_prefetch:
+            raise ValueError("stored routes cannot be both late and prefetched")
         if tokenized and (
             any(route_inputs)
             or self.trajectory_annotations
@@ -397,6 +402,11 @@ class PackingRequest(BaseModel):
             and len(self.moe_route_object_transfer.groups) != group_count
         ):
             raise ValueError("trajectory and object routes are not aligned")
+        if (
+            self.moe_route_prefetch is not None
+            and self.moe_route_prefetch.group_count != group_count
+        ):
+            raise ValueError("trajectory and prefetched routes are not aligned")
         if (
             self.trajectory_annotations
             and len(self.trajectory_annotations) != group_count
