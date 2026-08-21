@@ -4526,7 +4526,7 @@ requires-dist = [
     { name = "nest-asyncio", specifier = ">=1.6.0" },
     { name = "nixl-cu12", marker = "platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'megatron'", specifier = "==1.3.2" },
     { name = "nixl-cu13", marker = "platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'megatron-cu130'", specifier = "==1.3.2" },
-    { name = "numpy", specifier = "<2" },
+    { name = "numpy", specifier = ">=1.26" },
     { name = "numpy", marker = "extra == 'megatron'", specifier = "<2" },
     { name = "numpy", marker = "extra == 'megatron-cu130'", specifier = "<2" },
     { name = "numpy", marker = "extra == 'tinker'", specifier = "<2" },
