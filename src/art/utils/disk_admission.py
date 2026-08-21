@@ -133,13 +133,16 @@ class DiskReservationLease:
         planned_bytes: int,
         lease_path: Path,
         lease_descriptor: int,
+        *,
+        written_bytes: int = 0,
+        progress_sequence: int = 0,
     ) -> None:
         self._admission = admission
         self.reservation_id = reservation_id
         self.planned_bytes = planned_bytes
-        self._written_bytes = 0
-        self._recorded_bytes = 0
-        self._progress_sequence = 0
+        self._written_bytes = written_bytes
+        self._recorded_bytes = written_bytes
+        self._progress_sequence = progress_sequence
         self._lease_path = lease_path
         self._lease_descriptor = lease_descriptor
         self._closed = False
@@ -290,6 +293,87 @@ class DiskAdmission:
             incoming_peak_bytes,
             lease_path,
             lease_descriptor,
+        )
+
+    def adopt_reservation(
+        self,
+        *,
+        incoming_peak_bytes: int,
+        purpose: str,
+        owned_paths: tuple[str | Path, ...],
+        catalog_claim: DiskCatalogClaim,
+        tenant_id: str | None = None,
+        run_id: str | None = None,
+        slot_id: str | None = None,
+        slot_epoch: int | None = None,
+    ) -> DiskReservationLease | None:
+        """Take over one exact, unlocked reservation after its process exits."""
+        self._require_owner_process()
+        paths = tuple(str(self._owned_path(value)) for value in owned_paths)
+        identity = (
+            purpose,
+            tenant_id,
+            run_id,
+            slot_id,
+            slot_epoch,
+            catalog_claim,
+            incoming_peak_bytes,
+            paths,
+        )
+        descriptor = -1
+        with self._manifest() as manifest:
+            matches = tuple(
+                value
+                for value in manifest.reservations.values()
+                if value.state == "active"
+                and (
+                    value.purpose,
+                    value.tenant_id,
+                    value.run_id,
+                    value.slot_id,
+                    value.slot_epoch,
+                    value.catalog_claim,
+                    value.planned_bytes,
+                    value.owned_paths,
+                )
+                == identity
+            )
+            if not matches:
+                return None
+            if len(matches) != 1:
+                raise DiskAdmissionError("disk reservation identity is ambiguous")
+            value = matches[0]
+            if self._owner_is_live(value) or _paths_have_open_files(value.owned_paths):
+                raise DiskAdmissionError("disk reservation still has a live owner")
+            descriptor = _open_and_lock_lease(self._lease_path(value), self.mount)
+            try:
+                written_bytes = _read_lease_progress(
+                    self._lease_path(value), self.mount, value.planned_bytes
+                )
+                os.ftruncate(descriptor, 0)
+                sequence = int(written_bytes > 0)
+                if sequence:
+                    _write_lease_progress(descriptor, sequence, written_bytes)
+                now = _now()
+                manifest.reservations[value.reservation_id] = value.model_copy(
+                    update={
+                        "process": self.process,
+                        "remaining_bytes": value.planned_bytes - written_bytes,
+                        "updated_at": now,
+                    }
+                )
+            except BaseException:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+                os.close(descriptor)
+                raise
+        return DiskReservationLease(
+            self,
+            value.reservation_id,
+            value.planned_bytes,
+            self._lease_path(value),
+            descriptor,
+            written_bytes=written_bytes,
+            progress_sequence=sequence,
         )
 
     def active_reservations(self) -> tuple[DiskReservation, ...]:
@@ -616,6 +700,20 @@ def _lease_is_held(path: Path, mount: Path) -> bool:
         return False
     finally:
         os.close(descriptor)
+
+
+def _open_and_lock_lease(path: Path, mount: Path) -> int:
+    flags = os.O_RDWR | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(path, flags)
+    try:
+        _validate_file(descriptor, mount, "disk reservation lease")
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
 
 
 def _write_lease_progress(descriptor: int, sequence: int, written_bytes: int) -> None:
