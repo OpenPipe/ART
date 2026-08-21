@@ -892,8 +892,10 @@ def test_generation_publisher_uses_independent_ordered_control_group(
     calls = []
     store = object()
 
-    def publish(value, received_store, *, group, local_error):
+    def publish(value, received_store, *, group, local_error, progress):
         calls.append((value, received_store, group, local_error))
+        progress("ranks_ready")
+        progress("committed")
         return value.layout.ref
 
     monkeypatch.setattr(
@@ -908,6 +910,11 @@ def test_generation_publisher_uses_independent_ordered_control_group(
     assert plan.transport_adapter is not None
     assert transport.adapter == plan.transport_adapter
     assert calls == [(prepared.distributed_adapter, store, control_group, None)]
+    assert [event.phase for event in prepared.sink.events] == [
+        "transport_ready",
+        "ranks_ready",
+        "committed",
+    ]
     publisher.discard("operation")
     assert publisher._in_flight == 0
     assert publisher.has_generation(generation) is preexisting
