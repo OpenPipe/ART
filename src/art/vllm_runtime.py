@@ -835,6 +835,17 @@ def ensure_vllm_runtime() -> Path:
         )
 
 
+def _resolve_vllm_runtime_python() -> Path:
+    runtime_command = _runtime_command_prefix()
+    runtime_dir = _runtime_dir_from_bin(Path(runtime_command[0]))
+    if runtime_dir is None:
+        raise RuntimeError(
+            "ART_VLLM_RUNTIME_BIN must point directly to a "
+            ".venv/bin/art-vllm-runtime-server executable"
+        )
+    return _runtime_python(runtime_dir)
+
+
 def _runtime_command_prefix() -> list[str]:
     override = os.environ.get("ART_VLLM_RUNTIME_BIN")
     if override:

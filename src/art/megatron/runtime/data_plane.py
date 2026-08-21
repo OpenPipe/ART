@@ -24,20 +24,28 @@ class InMemoryPackedBatch(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True, extra="forbid")
 
     ref: PackedBatchRef
-    tensors: PackedTensors
     _mapped: MappedPackedBatch | None = PrivateAttr(default=None)
+    _tensors: PackedTensors | None = PrivateAttr(default=None)
+
+    @property
+    def tensors(self) -> PackedTensors:
+        if self._tensors is None:
+            raise RuntimeError("packed batch is closed")
+        return self._tensors
 
     @classmethod
     def open(
         cls, ref: PackedBatchRef, local_ref: PackedBatchRef
     ) -> "InMemoryPackedBatch":
         mapped = MappedPackedBatch.open(local_ref)
-        batch = cls(ref=ref, tensors=mapped.tensors)
+        batch = cls(ref=ref)
         batch._mapped = mapped
+        batch._tensors = mapped.tensors
         return batch
 
     def close(self) -> None:
         if self._mapped is not None:
+            self._tensors = None
             self._mapped.close()
             self._mapped = None
 

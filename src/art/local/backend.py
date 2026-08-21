@@ -1660,7 +1660,7 @@ class LocalBackend:
         except BaseException as error:
             failures: list[BaseException] = [error]
             if registration_started:
-                self._services.pop(model.name, None)
+                self._services.pop(self._model_storage_key(model), None)
                 try:
                     _, close_cancelled = await complete_task(
                         asyncio.create_task(service.aclose())

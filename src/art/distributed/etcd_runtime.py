@@ -6,7 +6,6 @@ import json
 import os
 from pathlib import Path
 import shutil
-import signal
 import socket
 import subprocess
 import tarfile
@@ -15,6 +14,7 @@ import time
 from urllib.request import Request, urlopen
 
 from art.utils.cache_dirs import configure_model_cache_env
+from art.utils.lifecycle import managed_process_cmd, terminate_popen_process_group
 
 from .specs import EndpointSpec
 
@@ -121,29 +121,31 @@ class ManagedEtcd:
         try:
             with (data_dir / "etcd.log").open("wb") as log:
                 process = subprocess.Popen(
-                    [
-                        str(executable),
-                        "--name",
-                        name,
-                        "--data-dir",
-                        str(data_dir / "data"),
-                        "--listen-client-urls",
-                        f"http://0.0.0.0:{client_port}",
-                        "--advertise-client-urls",
-                        endpoint.url,
-                        "--listen-peer-urls",
-                        peer_url,
-                        "--initial-advertise-peer-urls",
-                        peer_url,
-                        "--initial-cluster",
-                        f"{name}={peer_url}",
-                        "--initial-cluster-state",
-                        "new",
-                        "--logger",
-                        "zap",
-                        "--log-level",
-                        "warn",
-                    ],
+                    managed_process_cmd(
+                        [
+                            str(executable),
+                            "--name",
+                            name,
+                            "--data-dir",
+                            str(data_dir / "data"),
+                            "--listen-client-urls",
+                            endpoint.url,
+                            "--advertise-client-urls",
+                            endpoint.url,
+                            "--listen-peer-urls",
+                            peer_url,
+                            "--initial-advertise-peer-urls",
+                            peer_url,
+                            "--initial-cluster",
+                            f"{name}={peer_url}",
+                            "--initial-cluster-state",
+                            "new",
+                            "--logger",
+                            "zap",
+                            "--log-level",
+                            "warn",
+                        ]
+                    ),
                     stdout=log,
                     stderr=subprocess.STDOUT,
                     start_new_session=True,
@@ -167,13 +169,5 @@ class ManagedEtcd:
         raise TimeoutError(f"managed etcd did not become healthy at {endpoint.url}")
 
     def close(self) -> None:
-        if self.process.poll() is None:
-            try:
-                os.killpg(self.process.pid, signal.SIGTERM)
-                self.process.wait(timeout=5)
-            except ProcessLookupError:
-                pass
-            except subprocess.TimeoutExpired:
-                os.killpg(self.process.pid, signal.SIGKILL)
-                self.process.wait()
+        terminate_popen_process_group(self.process, timeout=5)
         shutil.rmtree(self.data_dir, ignore_errors=True)

@@ -39,6 +39,7 @@ class AdapterTransferTarget(_TransportRecord):
     prepare_s: float = Field(ge=0)
     pool_wait_s: float = Field(ge=0)
     registration_s: float = Field(ge=0)
+    transfer_timeout_s: float = Field(default=300.0, gt=0)
 
 
 class AdapterReceiveResult(_TransportRecord):
@@ -221,6 +222,7 @@ class AdapterSnapshotReceiver:
                 prepare_s=time.monotonic() - prepare_started,
                 pool_wait_s=max(0.0, pool_wait_s),
                 registration_s=registration_s,
+                transfer_timeout_s=timeout_s,
             )
         except BaseException:
             self._release_slot(slot, generation_id)
@@ -282,6 +284,7 @@ class AdapterSnapshotReceiver:
                     prepare_s=time.monotonic() - prepare_started,
                     pool_wait_s=time.monotonic() - wait_started,
                     registration_s=0.0,
+                    transfer_timeout_s=timeout_s,
                 )
             except BaseException:
                 listener.close()
@@ -579,7 +582,13 @@ class NixlAdapterSender:
             )
             try:
                 state = agent.transfer(handle)
+                deadline = time.monotonic() + target.transfer_timeout_s
                 while state == "PROC":
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError(
+                            "NIXL adapter transfer timed out for "
+                            f"{target.host_id}: {target.generation_id}"
+                        )
                     time.sleep(0.001)
                     state = agent.check_xfer_state(handle)
                 if state != "DONE":

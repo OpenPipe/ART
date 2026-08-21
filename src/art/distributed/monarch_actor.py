@@ -397,17 +397,38 @@ class ArtHostService(Actor):
 
     @resilient_endpoint
     async def close(self) -> None:
+        failures: list[BaseException] = []
+
+        async def close_one(operation: Any) -> None:
+            try:
+                await operation
+            except BaseException as error:
+                failures.append(error)
+
         self._closing = True
         if self._packing_tasks:
-            await asyncio.gather(*tuple(self._packing_tasks))
+            results = await asyncio.gather(
+                *tuple(self._packing_tasks), return_exceptions=True
+            )
+            failures.extend(
+                result for result in results if isinstance(result, BaseException)
+            )
         if self._moe_route_receivers:
-            await asyncio.gather(
+            results = await asyncio.gather(
                 *(
                     asyncio.to_thread(receiver.close)
                     for receiver in self._moe_route_receivers.values()
-                )
+                ),
+                return_exceptions=True,
+            )
+            failures.extend(
+                result for result in results if isinstance(result, BaseException)
             )
             self._moe_route_receivers.clear()
+        if self._managed_etcd is not None:
+            await close_one(asyncio.to_thread(self._managed_etcd.close))
+            self._managed_etcd = None
+
         probe_ids = tuple(
             {
                 *self._nccl_cleanups,
@@ -416,31 +437,44 @@ class ArtHostService(Actor):
                 *self._nccl_rendezvous,
             }
         )
-        await asyncio.gather(
-            *(self._cancel_nccl_preflight(probe_id) for probe_id in probe_ids)
+        nccl_results = await asyncio.gather(
+            *(self._cancel_nccl_preflight(probe_id) for probe_id in probe_ids),
+            return_exceptions=True,
+        )
+        failures.extend(
+            result for result in nccl_results if isinstance(result, BaseException)
         )
         for queue in self._trajectory_queues.values():
-            queue.close()
+            try:
+                queue.close()
+            except BaseException as error:
+                failures.append(error)
         self._trajectory_queues.clear()
         for batch_id in tuple(self._batch_publishers):
-            await self._drop_batch(batch_id)
-        self._packing_plans.clear()
-        async with self._packing_lock:
-            try:
+            await close_one(self._drop_batch(batch_id))
+        try:
+            async with self._packing_lock:
                 if self._packer is not None:
-                    await self._packer.close()
+                    await close_one(self._packer.close())
                     self._packer = None
-            finally:
-                if self._packing_gc_threshold is not None:
-                    gc.set_threshold(*self._packing_gc_threshold)
-                    self._packing_gc_threshold = None
+        except BaseException as error:
+            failures.append(error)
+        finally:
+            self._packing_plans.clear()
+            if self._packing_gc_threshold is not None:
+                gc.set_threshold(*self._packing_gc_threshold)
+                self._packing_gc_threshold = None
         if self._vllm_launcher is not None:
-            await self._vllm_launcher.close()
+            await close_one(self._vllm_launcher.close())
             self._vllm_launcher = None
-        if self._managed_etcd is not None:
-            await asyncio.to_thread(self._managed_etcd.close)
-            self._managed_etcd = None
-        self._packed_batches.store.close()
+        try:
+            self._packed_batches.store.close()
+        except BaseException as error:
+            failures.append(error)
+        if len(failures) == 1:
+            raise failures[0]
+        if failures:
+            raise BaseExceptionGroup("ART host cleanup failed", failures)
 
     async def _require_nccl_probe(self, probe_id: str) -> float:
         if probe_id in self._cancelled_nccl_probes:

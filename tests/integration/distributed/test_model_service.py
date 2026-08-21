@@ -48,6 +48,32 @@ def _service(tmp_path, runtime) -> DistributedMegatronService:
     )
 
 
+def test_endpoint_url_brackets_ipv6_literals() -> None:
+    assert EndpointSpec(host="2001:db8::1", port=8000).url == (
+        "http://[2001:db8::1]:8000"
+    )
+
+
+def test_multihost_model_service_requires_routable_leader() -> None:
+    with pytest.raises(ValueError, match="leader endpoint must be routable"):
+        ModelServiceSpec(
+            name="model",
+            members=(
+                ModelServiceMemberSpec(
+                    member_id="node0", host_id="host0", node_rank=0, gpu_ids=(0,)
+                ),
+                ModelServiceMemberSpec(
+                    member_id="node1", host_id="host1", node_rank=1, gpu_ids=(0,)
+                ),
+            ),
+            leader_endpoint=EndpointSpec(host="127.0.0.1", port=8000),
+            rendezvous=EndpointSpec(host="10.0.0.1", port=29500),
+            base_model="base",
+            runtime_fingerprint="runtime",
+            parallel=VllmParallelSpec(tp=2),
+        )
+
+
 @pytest.mark.asyncio
 async def test_runtime_retains_model_service_until_stop_succeeds(monkeypatch) -> None:
     spec = _spec()
@@ -287,6 +313,7 @@ async def test_retention_protects_absent_learner_and_serving_steps(
     backend = object.__new__(MegatronBackend)
     backend._runtime = object()
     backend._path = str(tmp_path)
+    backend._training_clients = {}
 
     async def get_service(_self, _model):
         return service
