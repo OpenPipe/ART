@@ -1681,6 +1681,11 @@ class MCoreRunSlotExecutor:
         residency_tensors = self._slot_trainer.checkpoint_slot_residency_tensors(
             job.run_id
         )
+        optimizer_source = (
+            self._slot_trainer.checkpoint_slot_optimizer_residency_source(job.run_id)
+        )
+        if optimizer_source is None:
+            raise RuntimeError("optimizer commit has no immutable optimizer state")
         self._residency.advance_l1(
             parent_weights,
             output_weights,
@@ -1710,6 +1715,24 @@ class MCoreRunSlotExecutor:
             state.learner_version = job.learner_version
         if accumulator is not None:
             self._residency.retire_async(accumulator)
+        from art.megatron.lora import LoRASlotRef
+
+        snapshot_metrics = self._publisher.stage(
+            run_id=job.run_id,
+            generation=job.generation,
+            adapter_dtypes={},
+            adapter_config=state.adapter_config,
+            slot_ref=LoRASlotRef("checkpoint", job.run_id),
+            snapshot_optimizer=False,
+            residency_key=output_weights,
+        )
+        snapshot_metrics.update(
+            self._publisher.attach_resident_optimizer(
+                generation=job.generation,
+                source=optimizer_source,
+                residency_key=output_optimizer,
+            )
+        )
         return {
             "operation_id": job.operation_id,
             "learner_version": job.learner_version,
@@ -1720,6 +1743,7 @@ class MCoreRunSlotExecutor:
                 "optimizer/update_successful": result["update_successful"],
                 "optimizer/num_zeros_in_grad": result["num_zeros_in_grad"],
                 "time/optimizer_step_s": optimizer_step_s,
+                **snapshot_metrics,
             },
         }
 
@@ -1935,41 +1959,15 @@ class MCoreRunSlotExecutor:
                 "rank_write_plan": rank_plan.model_dump(mode="json"),
                 "metrics": metrics,
             }
-        stage_metrics: dict[str, float] = {}
         if not self._publisher.has_generation(job.generation):
-            from art.megatron.lora import LoRASlotRef
-
-            with self._resident(state):
-                stage_metrics.update(
-                    self._publisher.ensure_generation(
-                        run_id=job.run_id,
-                        generation=job.generation,
-                        adapter_dtypes={},
-                        adapter_config=state.adapter_config,
-                        slot_ref=LoRASlotRef("checkpoint", job.run_id),
-                        snapshot_optimizer=False,
-                        residency_key=state.desired.weights,
-                    )
-                )
+            raise RuntimeError("selected generation has no immutable weights snapshot")
         if job.save_optimizer and not self._publisher.has_generation(
             job.generation, require_optimizer=True
         ):
-            optimizer_key = state.desired.optimizer
-            optimizer_source = (
-                self._slot_trainer.checkpoint_slot_optimizer_residency_source(
-                    job.run_id
-                )
+            raise RuntimeError(
+                "selected generation has no immutable optimizer snapshot"
             )
-            if optimizer_key is None or optimizer_source is None:
-                raise RuntimeError("snapshot has no immutable optimizer state")
-            stage_metrics.update(
-                self._publisher.attach_resident_optimizer(
-                    generation=job.generation,
-                    source=optimizer_source,
-                    residency_key=optimizer_key,
-                )
-            )
-        rank_plan, prepare_metrics = self._publisher.prepare(
+        rank_plan, metrics = self._publisher.prepare(
             operation_id=job.operation_id,
             generation=job.generation,
             optimizer_state_path=job.optimizer_state_path,
@@ -1984,7 +1982,7 @@ class MCoreRunSlotExecutor:
             "operation_id": job.operation_id,
             "learner_version": job.learner_version,
             "rank_write_plan": rank_plan.model_dump(mode="json"),
-            "metrics": {**stage_metrics, **prepare_metrics},
+            "metrics": metrics,
         }
 
     def authorize_snapshot(

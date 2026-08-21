@@ -1,6 +1,6 @@
 from concurrent.futures import Future
+from contextlib import contextmanager
 import sys
-from threading import Lock
 from types import SimpleNamespace
 from typing import Any
 
@@ -9,44 +9,64 @@ import pytest
 from art.megatron.runtime.executor import (
     GenerationResidency,
     MCoreRunSlotExecutor,
-    MegatronTrainJobExecutor,
     _GenerationPublisher,
+    _ResidentRunState,
 )
 from art.megatron.runtime.residency import ResidencyKey
 from art.megatron.runtime.specs import TrainerGeneration
 
 
+def _generation_id(step: int) -> str:
+    return f"step-{step:08d}-{step:032x}"
+
+
+def _generation(step: int) -> TrainerGeneration:
+    return TrainerGeneration(
+        training_session_id="session",
+        policy_step=step,
+        generation_id=_generation_id(step),
+        adapter_path=f"/adapter/{step}",
+    )
+
+
+def _key(step: int, representation: str = "weights") -> ResidencyKey:
+    return ResidencyKey(
+        tenant_id="tenant",
+        run_id="run",
+        generation_id=_generation_id(step),
+        representation=representation,
+        topology_fingerprint="topology",
+        adapter_layout_fingerprint="layout",
+    )
+
+
+def _resolved(value: Any = None) -> Future[Any]:
+    future: Future[Any] = Future()
+    future.set_result(value)
+    return future
+
+
 class _Gradients:
-    def __init__(self, contributions: tuple[str, ...], prepared: Any = None) -> None:
-        self.contributions = contributions
-        self.prepared = prepared
+    def __init__(self) -> None:
+        self.contributions = ("forward-1",)
         self.sealed: tuple[str, ...] | None = None
 
     def seal(self, contributions: tuple[str, ...]) -> None:
         self.sealed = contributions
 
     def prepare_optimizer(self) -> Any:
-        return self.prepared
+        return SimpleNamespace(
+            expected_global_token_count=1,
+            local_token_count=1,
+            gradients=(),
+            reduction="sum",
+        )
 
     def consume(self) -> tuple[str, ...]:
         return self.contributions
 
 
-class _OptimizerOnlyPublisher:
-    def __init__(self) -> None:
-        self.health_checks = 0
-
-    def raise_if_failed(self) -> None:
-        self.health_checks += 1
-
-    def stage(self, **_kwargs: Any) -> None:
-        raise AssertionError("optimizer staged sampler publication")
-
-    def attach_resident_optimizer(self, **_kwargs: Any) -> None:
-        raise AssertionError("optimizer attached publication state")
-
-
-class _Residency:
+class _CommitResidency:
     def __init__(self) -> None:
         self.acquired: list[tuple[ResidencyKey, ...]] = []
         self.advanced: list[tuple[ResidencyKey, ResidencyKey, bool]] = []
@@ -70,79 +90,96 @@ class _Residency:
         retire_source: bool,
     ) -> Future[Any]:
         self.advanced.append((source, target, retire_source))
-        future: Future[Any] = Future()
-        future.set_result(None)
-        return future
+        return _resolved()
 
-    def retire_async(self, key: ResidencyKey) -> Future[None]:
+    def retire_async(self, key: ResidencyKey) -> Future[Any]:
         self.retired.append(key)
-        future: Future[None] = Future()
-        future.set_result(None)
-        return future
+        return _resolved()
 
 
-class _SnapshotPublisher:
+class _SlotTrainer:
     def __init__(self) -> None:
-        self.staged = False
-        self.has_optimizer = False
-        self.ensure_calls: list[dict[str, Any]] = []
-        self.attach_calls: list[dict[str, Any]] = []
-        self.prepare_calls: list[dict[str, Any]] = []
+        self.optimizer_source = object()
+        self.optimizer_source_calls = 0
+        self.stepped = False
 
-    def has_generation(
-        self, _generation: TrainerGeneration, *, require_optimizer: bool = False
-    ) -> bool:
-        return self.staged and (not require_optimizer or self.has_optimizer)
+    def reduce_checkpoint_slot_gradient_sums(
+        self, _run_id: str, gradients: tuple[Any, ...]
+    ) -> tuple[Any, ...]:
+        return gradients
 
-    def ensure_generation(self, **kwargs: Any) -> dict[str, float]:
-        self.ensure_calls.append(kwargs)
-        self.staged = True
+    def optim_step_reduced(self, *_args: Any, **_kwargs: Any) -> dict[str, float]:
+        self.stepped = True
+        return {
+            "update_successful": True,
+            "grad_norm": 1.0,
+            "num_zeros_in_grad": 0.0,
+        }
+
+    def checkpoint_slot_residency_tensors(self, _run_id: str) -> Any:
+        return SimpleNamespace(weights=(object(),), optimizer=(object(),))
+
+    def checkpoint_slot_optimizer_residency_source(self, _run_id: str) -> object:
+        assert self.stepped
+        self.optimizer_source_calls += 1
+        return self.optimizer_source
+
+
+class _CommittedPublisher:
+    def __init__(self) -> None:
+        self.entries: dict[str, dict[str, Any]] = {}
+        self.events: list[str] = []
+        self.archives: list[dict[str, Any]] = []
+
+    def raise_if_failed(self) -> None:
+        return None
+
+    def stage(self, **kwargs: Any) -> dict[str, float]:
+        self.events.append("stage")
+        generation = kwargs["generation"]
+        self.entries[generation.generation_id] = {
+            "generation": generation,
+            "weights": kwargs["residency_key"],
+            "optimizer": None,
+            "optimizer_source": None,
+        }
         return {"snapshot_launch_s": 1.0}
 
     def attach_resident_optimizer(self, **kwargs: Any) -> dict[str, float]:
-        self.attach_calls.append(kwargs)
-        self.has_optimizer = True
+        self.events.append("attach_optimizer")
+        entry = self.entries[kwargs["generation"].generation_id]
+        entry["optimizer"] = kwargs["residency_key"]
+        entry["optimizer_source"] = kwargs["source"]
         return {"snapshot_optimizer_attach_s": 2.0}
 
+    def has_generation(
+        self, generation: TrainerGeneration, *, require_optimizer: bool = False
+    ) -> bool:
+        entry = self.entries.get(generation.generation_id)
+        return bool(
+            entry is not None
+            and entry["generation"] == generation
+            and (not require_optimizer or entry["optimizer"] is not None)
+        )
+
     def prepare(self, **kwargs: Any) -> tuple[Any, dict[str, float]]:
-        self.prepare_calls.append(kwargs)
+        self.events.append("prepare")
+        entry = self.entries[kwargs["generation"].generation_id]
+        assert not kwargs["save_optimizer"] or entry["optimizer"] is not None
+        self.archives.append(entry.copy())
         plan = SimpleNamespace(model_dump=lambda **_kwargs: {"rank": 0})
         return plan, {"snapshot_prepare_s": 3.0}
 
 
-def _generation(step: int) -> TrainerGeneration:
-    return TrainerGeneration(
-        training_session_id="session",
-        policy_step=step,
-        generation_id=_generation_id(step),
-        adapter_path=f"/adapter/{step}",
-    )
-
-
-def _generation_id(step: int) -> str:
-    return f"step-{step:08d}-{step:032x}"
-
-
-def _key(step: int, representation: str = "weights") -> ResidencyKey:
-    return ResidencyKey(
-        tenant_id="tenant",
-        run_id="run",
-        generation_id=_generation_id(step),
-        representation=representation,
-        topology_fingerprint="topology",
-        adapter_layout_fingerprint="layout",
-    )
-
-
-def _optimizer_job(step: int) -> SimpleNamespace:
+def _optimizer_job() -> SimpleNamespace:
     return SimpleNamespace(
-        operation_id=f"optimizer-{step}",
+        operation_id="optimizer-1",
         run_id="run",
         training_session_id="session",
-        expected_learner_version=step - 1,
-        learner_version=step,
-        generation=_generation(step),
-        contributing_forward_backward_operation_ids=(f"forward-{step}",),
+        expected_learner_version=0,
+        learner_version=1,
+        generation=_generation(1),
+        contributing_forward_backward_operation_ids=("forward-1",),
         optimizer=SimpleNamespace(
             learning_rate=1e-4,
             beta1=0.9,
@@ -154,147 +191,7 @@ def _optimizer_job(step: int) -> SimpleNamespace:
     )
 
 
-def test_static_optimizer_does_not_stage_without_save_successor(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setitem(
-        sys.modules,
-        "art.megatron.train",
-        SimpleNamespace(
-            run_megatron_optimizer_step=lambda **_kwargs: SimpleNamespace(
-                update_successful=True, grad_norm=1.0, num_zeros_in_grad=0
-            )
-        ),
-    )
-    publisher = _OptimizerOnlyPublisher()
-    runtime = SimpleNamespace(
-        optimizer=SimpleNamespace(param_groups=[{}], config=SimpleNamespace()),
-        model_support_handler=object(),
-        model=(),
-        optimizer_snapshot_barrier=SimpleNamespace(wait_before_mutation=lambda: None),
-        resident_training_session_id=None,
-        resident_policy_step=0,
-        resident_generation_id=None,
-        optimizer_state_loaded=True,
-        adapter_export_dtypes=None,
-        adapter_export_config=None,
-    )
-    executor = MegatronTrainJobExecutor.__new__(MegatronTrainJobExecutor)
-    executor.runtime = runtime
-    executor._publisher = publisher
-    executor._gradients = _Gradients(("forward-1",))
-    executor._gradient_parent_version = 0
-    executor._closed = False
-
-    result = executor.execute_optimizer(_optimizer_job(1))
-
-    assert publisher.health_checks == 1
-    assert runtime.resident_generation_id == _generation_id(1)
-    assert not any(key.startswith("snapshot_") for key in result["metrics"])
-
-
-def test_run_slot_optimizer_advances_immutable_state_without_publication() -> None:
-    publisher = _OptimizerOnlyPublisher()
-    residency = _Residency()
-    parent_weights = _key(0)
-    parent_optimizer = _key(0, "optimizer")
-    accumulator = parent_weights.model_copy(
-        update={"representation": "accumulator", "accumulator_revision": 1}
-    )
-    gradients = _Gradients(("forward-1",), prepared=("gradient",))
-    state = SimpleNamespace(
-        training_session_id="session",
-        learner_version=0,
-        gradients=gradients,
-        desired=GenerationResidency(
-            weights=parent_weights,
-            optimizer=parent_optimizer,
-            accumulator=accumulator,
-        ),
-        installed_weights=parent_weights,
-        installed_optimizer=parent_optimizer,
-        pending_load=None,
-        adapter_config={"r": 1},
-        residency_revision=0,
-        registration_complete=True,
-        unregistering=False,
-    )
-    slot = SimpleNamespace(
-        optim_step_reduced=lambda *_args, **_kwargs: {
-            "update_successful": True,
-            "grad_norm": 1.0,
-            "num_zeros_in_grad": 0.0,
-        },
-        checkpoint_slot_residency_tensors=lambda _run_id: SimpleNamespace(
-            weights=(object(),), optimizer=(object(),)
-        ),
-        checkpoint_slot_optimizer_residency_source=lambda _run_id: (
-            _ for _ in ()
-        ).throw(AssertionError("optimizer inspected publication state")),
-    )
-    executor = MCoreRunSlotExecutor.__new__(MCoreRunSlotExecutor)
-    executor.runtime = SimpleNamespace(
-        optimizer_snapshot_barrier=SimpleNamespace(
-            wait_before_mutation=lambda *, key: None
-        )
-    )
-    executor._slot_trainer = slot
-    executor._residency = residency
-    executor._publisher = publisher
-    executor._runs = {"run": state}
-    executor._closed = False
-
-    result = executor.execute_optimizer(_optimizer_job(1))
-
-    output_weights = _key(1)
-    output_optimizer = _key(1, "optimizer")
-    assert residency.advanced == [
-        (parent_weights, output_weights, True),
-        (parent_optimizer, output_optimizer, True),
-    ]
-    assert residency.retired == [accumulator]
-    assert state.desired == GenerationResidency(
-        weights=output_weights, optimizer=output_optimizer
-    )
-    assert publisher.health_checks == 1
-    assert not any(key.startswith("snapshot_") for key in result["metrics"])
-
-
-def _snapshot_executor(*, optimizer_source: Any) -> tuple[Any, ...]:
-    weights = _key(1)
-    optimizer = _key(1, "optimizer")
-    state = SimpleNamespace(
-        training_session_id="session",
-        learner_version=1,
-        desired=GenerationResidency(weights=weights, optimizer=optimizer),
-        installed_weights=weights,
-        installed_optimizer=optimizer,
-        pending_load=None,
-        adapter_config={"r": 1},
-        registration_complete=True,
-        unregistering=False,
-    )
-    publisher = _SnapshotPublisher()
-    residency = _Residency()
-    source_calls: list[str] = []
-
-    def source(run_id: str) -> Any:
-        source_calls.append(run_id)
-        return optimizer_source
-
-    executor = MCoreRunSlotExecutor.__new__(MCoreRunSlotExecutor)
-    executor.runtime = SimpleNamespace()
-    executor._slot_trainer = SimpleNamespace(
-        checkpoint_slot_optimizer_residency_source=source
-    )
-    executor._residency = residency
-    executor._publisher = publisher
-    executor._runs = {"run": state}
-    executor._closed = False
-    return executor, publisher, residency, weights, optimizer, source_calls
-
-
-def _snapshot_job(*, save_optimizer: bool) -> SimpleNamespace:
+def _snapshot_job(*, save_optimizer: bool = True) -> SimpleNamespace:
     return SimpleNamespace(
         operation_id="save",
         run_id="run",
@@ -310,80 +207,304 @@ def _snapshot_job(*, save_optimizer: bool) -> SimpleNamespace:
     )
 
 
-def test_sampler_successor_stages_selected_weights_without_optimizer(
+def _state(
+    *,
+    learner_version: int,
+    desired: GenerationResidency,
+    installed: bool = True,
+    gradients: Any | None = None,
+) -> _ResidentRunState:
+    return _ResidentRunState(
+        tenant_id="tenant",
+        run_id="run",
+        training_session_id="session",
+        learner_version=learner_version,
+        adapter_config={"r": 1},
+        gradients=gradients,
+        desired=desired,
+        installed_weights=desired.weights if installed else None,
+        installed_optimizer=desired.optimizer if installed else None,
+        registration_complete=True,
+    )
+
+
+def test_post_optimizer_save_uses_registered_generation_without_l1(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    from megatron.core import parallel_state
+
+    monkeypatch.setattr(
+        parallel_state,
+        "get_data_parallel_group",
+        lambda **_kwargs: object(),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "art.megatron.training.finalize_grads",
+        SimpleNamespace(
+            reduce_accumulated_token_count=lambda *_args, **_kwargs: 1,
+            finalize_model_grads_extended=lambda *_args, **_kwargs: None,
+        ),
+    )
     monkeypatch.setitem(
         sys.modules,
         "art.megatron.lora",
         SimpleNamespace(LoRASlotRef=lambda kind, name: (kind, name)),
     )
-    executor, publisher, residency, weights, _optimizer, source_calls = (
-        _snapshot_executor(optimizer_source=object())
+    parent_weights = _key(0)
+    parent_optimizer = _key(0, "optimizer")
+    accumulator = parent_weights.model_copy(
+        update={"representation": "accumulator", "accumulator_revision": 1}
     )
-
-    result = executor.execute_snapshot(_snapshot_job(save_optimizer=False), object())
-
-    assert residency.acquired == [(weights,)]
-    assert len(publisher.ensure_calls) == 1
-    assert publisher.ensure_calls[0]["residency_key"] == weights
-    assert publisher.ensure_calls[0]["snapshot_optimizer"] is False
-    assert publisher.attach_calls == []
-    assert source_calls == []
-    assert result["metrics"] == {
-        "snapshot_launch_s": 1.0,
-        "snapshot_prepare_s": 3.0,
-    }
-
-
-def test_state_successor_attaches_existing_optimizer_l2_only_on_demand(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setitem(
-        sys.modules,
-        "art.megatron.lora",
-        SimpleNamespace(LoRASlotRef=lambda kind, name: (kind, name)),
+    state = _state(
+        learner_version=0,
+        desired=GenerationResidency(
+            weights=parent_weights,
+            optimizer=parent_optimizer,
+            accumulator=accumulator,
+        ),
+        gradients=_Gradients(),
     )
-    optimizer_source = object()
-    executor, publisher, residency, weights, optimizer, source_calls = (
-        _snapshot_executor(optimizer_source=optimizer_source)
+    residency = _CommitResidency()
+    slot = _SlotTrainer()
+    publisher = _CommittedPublisher()
+    executor = MCoreRunSlotExecutor.__new__(MCoreRunSlotExecutor)
+    executor.runtime = SimpleNamespace(
+        model=(),
+        optimizer_snapshot_barrier=SimpleNamespace(
+            wait_before_mutation=lambda *, key: None
+        ),
     )
+    executor._slot_trainer = slot
+    executor._residency = residency
+    executor._publisher = publisher
+    executor._runs = {"run": state}
+    executor._closed = False
 
-    result = executor.execute_snapshot(_snapshot_job(save_optimizer=True), object())
+    optimizer_result = executor.execute_optimizer(_optimizer_job())
+    optimizer_acquisitions = tuple(residency.acquired)
 
-    assert residency.acquired == [(weights,)]
-    assert publisher.ensure_calls[0]["snapshot_optimizer"] is False
-    assert publisher.attach_calls == [
+    def forbid_resident(*_args: Any, **_kwargs: Any) -> Any:
+        raise AssertionError("save reacquired the trainer working set")
+
+    executor._resident = forbid_resident
+    save_result = executor.execute_snapshot(_snapshot_job(), object())
+
+    output_weights = _key(1)
+    output_optimizer = _key(1, "optimizer")
+    assert residency.advanced == [
+        (parent_weights, output_weights, True),
+        (parent_optimizer, output_optimizer, True),
+    ]
+    assert tuple(residency.acquired) == optimizer_acquisitions
+    assert slot.optimizer_source_calls == 1
+    assert publisher.events == ["stage", "attach_optimizer", "prepare"]
+    assert publisher.archives == [
         {
             "generation": _generation(1),
-            "source": optimizer_source,
-            "residency_key": optimizer,
+            "weights": output_weights,
+            "optimizer": output_optimizer,
+            "optimizer_source": slot.optimizer_source,
         }
     ]
-    assert source_calls == ["run"]
-    assert result["metrics"] == {
-        "snapshot_launch_s": 1.0,
-        "snapshot_optimizer_attach_s": 2.0,
-        "snapshot_prepare_s": 3.0,
-    }
+    assert optimizer_result["metrics"]["snapshot_optimizer_attach_s"] == 2.0
+    assert save_result["metrics"] == {"snapshot_prepare_s": 3.0}
 
 
-def test_lazy_generation_forwards_exact_residency_identity() -> None:
-    publisher = _GenerationPublisher.__new__(_GenerationPublisher)
-    publisher._lock = Lock()
-    publisher._cache = {}
-    calls: list[dict[str, Any]] = []
-    publisher.stage = lambda **kwargs: calls.append(kwargs) or {"staged": 1.0}
+class _Lora:
+    def __init__(self, tensors: dict[str, Any]) -> None:
+        self.tensors = tensors
+
+    def model_copy(self, *, update: dict[str, Any]) -> "_Lora":
+        return _Lora(update.get("tensors", self.tensors))
+
+
+class _OptimizerSource:
+    def __init__(self) -> None:
+        self.bound: tuple[Any, ...] | None = None
+
+    def bind(self, tensors: tuple[Any, ...]) -> Any:
+        self.bound = tensors
+        return SimpleNamespace(source=self, tensors=tensors)
+
+
+class _LowerTierResidency:
+    def __init__(
+        self,
+        origins: dict[ResidencyKey, str],
+        tensors: dict[ResidencyKey, tuple[Any, ...]],
+    ) -> None:
+        self.origins = origins
+        self.tensor_images = tensors
+        self.borrowed: list[tuple[ResidencyKey, str]] = []
+
+    @contextmanager
+    def borrow_l2(self, key: ResidencyKey) -> Any:
+        self.borrowed.append((key, self.origins[key]))
+        yield SimpleNamespace(tensors=lambda: self.tensor_images[key])
+
+
+class _LowerTierPublisher:
+    def __init__(
+        self,
+        generation: TrainerGeneration,
+        sampler_key: ResidencyKey,
+        optimizer_key: ResidencyKey,
+        residency: _LowerTierResidency,
+        optimizer_source: _OptimizerSource,
+    ) -> None:
+        resolved = _resolved(
+            SimpleNamespace(
+                lora=_Lora({"adapter.weight": object()}),
+                optimizer=None,
+                prepared_tensors=None,
+                lora_residency_key=sampler_key,
+            )
+        )
+        self.entry = SimpleNamespace(
+            generation=generation,
+            resolved=resolved,
+            optimizer_upgrade=None,
+            resident_optimizer=SimpleNamespace(
+                key=optimizer_key,
+                source=optimizer_source,
+            ),
+        )
+        self.delegate = _GenerationPublisher.__new__(_GenerationPublisher)
+        self.delegate.runtime = SimpleNamespace(rank=0)
+        self.delegate._residency = residency
+        self.delegate._prepare_lora_tensors = lambda lora: tuple(lora.tensors.values())
+        self.archive: tuple[Any, Any] | None = None
+
+    def has_generation(
+        self, generation: TrainerGeneration, *, require_optimizer: bool = False
+    ) -> bool:
+        return generation == self.entry.generation
+
+    def prepare(self, **kwargs: Any) -> tuple[Any, dict[str, float]]:
+        with self.delegate._lora_snapshot(self.entry, None) as (_lora, weights):
+            with self.delegate._optimizer_snapshot(
+                self.entry,
+                kwargs["generation"],
+                required=kwargs["save_optimizer"],
+            ) as optimizer:
+                self.archive = weights, optimizer
+        plan = SimpleNamespace(model_dump=lambda **_kwargs: {"rank": 0})
+        return plan, {"snapshot_prepare_s": 1.0}
+
+
+def test_nonresident_committed_save_borrows_l2_and_restores_l3(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     weights = _key(1)
-
-    metrics = publisher.ensure_generation(
-        run_id="run",
-        generation=_generation(1),
-        adapter_dtypes={},
-        adapter_config={"r": 1},
-        snapshot_optimizer=False,
-        residency_key=weights,
+    sampler = weights.model_copy(update={"representation": "sampler"})
+    optimizer = _key(1, "optimizer")
+    weight_tensors = (object(),)
+    optimizer_tensors = (object(), object())
+    residency = _LowerTierResidency(
+        origins={sampler: "l2_cpu", optimizer: "l3_nvme"},
+        tensors={sampler: weight_tensors, optimizer: optimizer_tensors},
+    )
+    optimizer_source = _OptimizerSource()
+    publisher = _LowerTierPublisher(
+        _generation(1), sampler, optimizer, residency, optimizer_source
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "art.megatron.optimizer_state",
+        SimpleNamespace(
+            trainer_rank_optimizer_snapshot_from_cpu=lambda _runtime, state, **kwargs: (
+                state,
+                kwargs["generation_id"],
+                kwargs["step"],
+            )
+        ),
+    )
+    executor = MCoreRunSlotExecutor.__new__(MCoreRunSlotExecutor)
+    executor.runtime = SimpleNamespace()
+    executor._slot_trainer = SimpleNamespace()
+    executor._residency = residency
+    executor._publisher = publisher
+    executor._runs = {
+        "run": _state(
+            learner_version=1,
+            desired=GenerationResidency(weights=weights, optimizer=optimizer),
+            installed=False,
+        )
+    }
+    executor._closed = False
+    executor._resident = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+        AssertionError("save reacquired the trainer working set")
     )
 
-    assert metrics == {"staged": 1.0}
-    assert calls[0]["residency_key"] == weights
+    result = executor.execute_snapshot(_snapshot_job(), object())
+
+    assert residency.borrowed == [(sampler, "l2_cpu"), (optimizer, "l3_nvme")]
+    assert optimizer_source.bound == optimizer_tensors
+    assert publisher.archive is not None
+    assert publisher.archive[0] == weight_tensors
+    assert publisher.archive[1][1:] == (_generation_id(1), 1)
+    assert result["metrics"] == {"snapshot_prepare_s": 1.0}
+
+
+class _IncompletePublisher:
+    def __init__(self, *, has_weights: bool, has_optimizer: bool) -> None:
+        self.has_weights = has_weights
+        self.has_optimizer = has_optimizer
+        self.prepare_calls = 0
+
+    def has_generation(
+        self, _generation: TrainerGeneration, *, require_optimizer: bool = False
+    ) -> bool:
+        return self.has_optimizer if require_optimizer else self.has_weights
+
+    def prepare(self, **_kwargs: Any) -> Any:
+        self.prepare_calls += 1
+        raise AssertionError("incomplete generation reached snapshot preparation")
+
+
+@pytest.mark.parametrize(
+    ("has_weights", "has_optimizer", "save_optimizer", "message"),
+    (
+        (False, False, False, "no immutable weights snapshot"),
+        (True, False, True, "no immutable optimizer snapshot"),
+    ),
+)
+def test_save_fails_closed_for_missing_or_incomplete_generation(
+    has_weights: bool,
+    has_optimizer: bool,
+    save_optimizer: bool,
+    message: str,
+) -> None:
+    weights = _key(1)
+    optimizer = _key(1, "optimizer")
+    publisher = _IncompletePublisher(
+        has_weights=has_weights, has_optimizer=has_optimizer
+    )
+    executor = MCoreRunSlotExecutor.__new__(MCoreRunSlotExecutor)
+    executor.runtime = SimpleNamespace()
+    executor._slot_trainer = SimpleNamespace(
+        checkpoint_slot_optimizer_residency_source=lambda _run_id: (
+            _ for _ in ()
+        ).throw(AssertionError("save inspected mutable optimizer state"))
+    )
+    executor._residency = SimpleNamespace(
+        acquire_l1_working_set=lambda _keys: (_ for _ in ()).throw(
+            AssertionError("save acquired L1")
+        )
+    )
+    executor._publisher = publisher
+    executor._runs = {
+        "run": _state(
+            learner_version=1,
+            desired=GenerationResidency(weights=weights, optimizer=optimizer),
+        )
+    }
+    executor._closed = False
+
+    with pytest.raises(RuntimeError, match=message):
+        executor.execute_snapshot(
+            _snapshot_job(save_optimizer=save_optimizer), object()
+        )
+
+    assert publisher.prepare_calls == 0
