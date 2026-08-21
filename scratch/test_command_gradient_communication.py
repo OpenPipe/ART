@@ -98,6 +98,52 @@ def test_accumulators_keep_one_unnormalized_rank_local_sum(
     assert len(static.residency_tensors()) <= 2
 
 
+def test_dynamic_accumulator_folds_resident_grads_into_stable_fp32_buffers() -> None:
+    first = torch.nn.Parameter(torch.zeros(3, dtype=torch.bfloat16))
+    second = torch.nn.Parameter(torch.zeros(2, dtype=torch.bfloat16))
+    accumulator = ParameterGradientAccumulator(parameters=(first, second))
+    pointers = None
+
+    for index in range(8):
+        accumulator.before_forward_backward()
+        first.grad = torch.full_like(first, index + 1)
+        second.grad = None if index % 2 else torch.full_like(second, 2 * index + 1)
+        accumulator.record_parameters(
+            f"fb-{index}",
+            torch.tensor(index + 1),
+            expected_global_token_count=2 * (index + 1),
+        )
+        current = tuple(
+            tensor.data_ptr() for tensor in accumulator.residency_tensors()[1:]
+        )
+        pointers = current if pointers is None else pointers
+        assert current == pointers
+
+    accumulator.seal(accumulator.contribution_ids)
+    sums = accumulator.prepare_optimizer()
+    assert all(gradient.dtype == torch.float32 for gradient in sums.gradients)
+    torch.testing.assert_close(sums.gradients[0], torch.full((3,), 36.0))
+    torch.testing.assert_close(sums.gradients[1], torch.full((2,), 28.0))
+    assert int(sums.local_token_count) == 36
+    assert sums.expected_global_token_count == 72
+
+
+def test_rejected_resident_gradient_record_does_not_mutate_accumulator() -> None:
+    parameter = torch.nn.Parameter(torch.zeros(2))
+    accumulator = ParameterGradientAccumulator(parameters=(parameter,))
+    parameter.grad = torch.ones_like(parameter)
+    accumulator.record_parameters("fb", torch.tensor(1))
+    before = tuple(tensor.clone() for tensor in accumulator.residency_tensors())
+
+    parameter.grad = torch.full_like(parameter, 9)
+    with pytest.raises(RuntimeError, match="duplicate gradient contribution"):
+        accumulator.record_parameters("fb", torch.tensor(9))
+
+    assert accumulator.contribution_ids == ("fb",)
+    for actual, expected in zip(accumulator.residency_tensors(), before, strict=True):
+        torch.testing.assert_close(actual, expected)
+
+
 def _new_pair_groups() -> tuple[list[dist.ProcessGroup], list[dist.ProcessGroup]]:
     dp = [dist.new_group((0, 2)), dist.new_group((1, 3))]
     tp = [dist.new_group((0, 1)), dist.new_group((2, 3))]

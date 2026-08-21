@@ -1322,11 +1322,9 @@ def execute_megatron_dynamic_lora_forward_backward_job(
         _replay_finalize_s: float,
         _step_input_prepare_s: float,
     ) -> None:
-        gradients = slot_trainer.checkpoint_slot_local_gradient_sums(slot_name)
-        internal.record(
+        internal.record_parameters(
             f"{job.operation_id}:{step_index}",
             state.token_count,
-            gradients,
             reduction=reduction,
         )
         states.append(state)

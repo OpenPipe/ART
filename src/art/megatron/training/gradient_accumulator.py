@@ -240,14 +240,76 @@ class ParameterGradientAccumulator(BaseModel):
         expected_global_token_count: int | None = None,
         reduction: GradientReduction = "token_mean",
     ) -> None:
+        if tuple(tuple(grad.shape) for grad in gradients) != self._layout:
+            raise RuntimeError("gradient contribution layout changed")
+        self._validate_record(
+            operation_id,
+            token_count,
+            expected_global_token_count=expected_global_token_count,
+            reduction=reduction,
+        )
+        owned = tuple(grad.detach() for grad in gradients)
+        if self._gradients is None:
+            self._gradients = owned
+        else:
+            for target, grad in zip(self._gradients, owned, strict=True):
+                target.add_(grad)
+        self._commit_record(
+            operation_id,
+            token_count,
+            expected_global_token_count=expected_global_token_count,
+            reduction=reduction,
+        )
+
+    def record_parameters(
+        self,
+        operation_id: str,
+        token_count: torch.Tensor,
+        *,
+        expected_global_token_count: int | None = None,
+        reduction: GradientReduction = "token_mean",
+    ) -> None:
+        """Accumulate resident parameter grads without per-step gradient copies."""
+        self._validate_record(
+            operation_id,
+            token_count,
+            expected_global_token_count=expected_global_token_count,
+            reduction=reduction,
+        )
+        for param in self.parameters:
+            if param.grad is not None and (
+                param.grad.shape != param.shape or param.grad.device != param.device
+            ):
+                raise RuntimeError("resident parameter gradient layout changed")
+        if self._gradients is None:
+            self._gradients = tuple(
+                torch.zeros_like(param, dtype=torch.float32)
+                for param in self.parameters
+            )
+        for target, param in zip(self._gradients, self.parameters, strict=True):
+            if param.grad is not None:
+                target.add_(param.grad)
+        self._commit_record(
+            operation_id,
+            token_count,
+            expected_global_token_count=expected_global_token_count,
+            reduction=reduction,
+        )
+
+    def _validate_record(
+        self,
+        operation_id: str,
+        token_count: torch.Tensor,
+        *,
+        expected_global_token_count: int | None,
+        reduction: GradientReduction,
+    ) -> None:
         if self._sealed is not None:
             raise RuntimeError("cannot add gradients to a sealed accumulator")
         if operation_id in self._operation_ids:
             raise RuntimeError(f"duplicate gradient contribution {operation_id!r}")
         if token_count.numel() != 1:
             raise ValueError("gradient contribution token_count must be scalar")
-        if tuple(tuple(grad.shape) for grad in gradients) != self._layout:
-            raise RuntimeError("gradient contribution layout changed")
         if self._reduction is not None and self._reduction != reduction:
             raise RuntimeError("one gradient accumulator cannot mix reduction modes")
         if self._prepared:
@@ -261,14 +323,20 @@ class ParameterGradientAccumulator(BaseModel):
                 "one gradient accumulator cannot mix observed-only and "
                 "provenance-checked contributions"
             )
-        owned = tuple(grad.detach() for grad in gradients)
-        if self._gradients is None:
-            self._gradients = owned
+
+    def _commit_record(
+        self,
+        operation_id: str,
+        token_count: torch.Tensor,
+        *,
+        expected_global_token_count: int | None,
+        reduction: GradientReduction,
+    ) -> None:
+        expects_global_tokens = expected_global_token_count is not None
+        if self._token_count is None:
             self._token_count = token_count.detach().clone()
         else:
             assert self._token_count is not None
-            for target, grad in zip(self._gradients, owned, strict=True):
-                target.add_(grad)
             self._token_count.add_(token_count)
         self._operation_ids.append(operation_id)
         self._expects_global_tokens = expects_global_tokens
