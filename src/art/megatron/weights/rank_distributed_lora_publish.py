@@ -158,7 +158,7 @@ class RankDistributedLoraStats(BaseModel):
 class RankDistributedLoraCallContract(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    target: OrderedBinaryObjectTarget
+    target: OrderedBinaryObjectTarget | None = None
     handler_key: str = Field(min_length=1)
     adapter_config: bytes = Field(min_length=1)
     coordinator_rank: int = Field(ge=0)
@@ -245,6 +245,108 @@ class PreparedRankDistributedLora(BaseModel):
         return payloads
 
 
+class PreparedRankDistributedLoraSource(BaseModel):
+    """Target-independent, converted rank-owned sampler weights."""
+
+    model_config = ConfigDict(arbitrary_types_allowed=True, extra="forbid", frozen=True)
+
+    coordinator_rank: int = Field(ge=0)
+    world_size: int = Field(ge=1)
+    rank: int = Field(ge=0)
+    metadata: tuple[RankOwnedTensor, ...] = Field(min_length=1)
+    tensors: dict[str, torch.Tensor]
+    adapter_config: bytes
+    safetensors_header: bytes
+    stats: RankDistributedLoraStats
+
+    def bind_target(
+        self, target: OrderedBinaryObjectTarget
+    ) -> PreparedRankDistributedLora:
+        layout = _build_layout(
+            target,
+            self.metadata,
+            self.adapter_config,
+            self.safetensors_header,
+            coordinator_rank=self.coordinator_rank,
+            world_size=self.world_size,
+        )
+        owned_upload_bytes = sum(
+            shard.byte_count
+            for shard, ownership in zip(
+                layout.plan.shards, layout.shards, strict=True
+            )
+            if ownership.owner_rank == self.rank
+        )
+        return PreparedRankDistributedLora(
+            layout=layout,
+            rank=self.rank,
+            tensors=self.tensors,
+            adapter_config=self.adapter_config,
+            safetensors_header=self.safetensors_header,
+            stats=self.stats.model_copy(
+                update={"owned_upload_bytes": owned_upload_bytes}
+            ),
+        )
+
+
+class ConsolidatedRankDistributedLora(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True, extra="forbid", frozen=True)
+
+    tensors: dict[str, torch.Tensor]
+    adapter_config: dict[str, Any]
+
+
+def consolidate_rank_distributed_vllm_lora_source(
+    source: PreparedRankDistributedLoraSource,
+    *,
+    group: Any | None = None,
+) -> ConsolidatedRankDistributedLora | None:
+    """Gather immutable CPU sampler tensors to the coordinator for persistence."""
+    rank, world_size = _rank_world(group)
+    if (rank, world_size) != (source.rank, source.world_size):
+        raise RuntimeError("rank-distributed LoRA source world changed")
+    if world_size > 1 and str(torch.distributed.get_backend(group)) != "gloo":  # type: ignore[possibly-missing-attribute]
+        raise RuntimeError("LoRA persistence consolidation requires Gloo")
+    local_names = tuple(
+        tensor.name for tensor in source.metadata if tensor.owner_rank == rank
+    )
+    if set(source.tensors) != set(local_names):
+        raise RuntimeError("rank-distributed LoRA source tensors changed")
+    coordinator = source.coordinator_rank
+    consolidated: dict[str, torch.Tensor] = {}
+    for tag, meta in enumerate(source.metadata):
+        dtype = _dtype_from_name(meta.dtype_name)
+        if rank == meta.owner_rank:
+            tensor = source.tensors[meta.name]
+            if (
+                tensor.device.type != "cpu"
+                or not tensor.is_contiguous()
+                or tuple(tensor.shape) != meta.shape
+                or tensor.dtype != dtype
+            ):
+                raise RuntimeError(
+                    f"rank-distributed LoRA tensor changed: {meta.name}"
+                )
+            if rank == coordinator:
+                consolidated[meta.name] = tensor
+            elif world_size > 1:
+                torch.distributed.send(tensor, dst=coordinator, group=group, tag=tag)  # type: ignore[possibly-missing-attribute]
+        elif rank == coordinator:
+            tensor = torch.empty(meta.shape, dtype=dtype, device="cpu")
+            torch.distributed.recv(  # type: ignore[possibly-missing-attribute]
+                tensor, src=meta.owner_rank, group=group, tag=tag
+            )
+            consolidated[meta.name] = tensor
+    if world_size > 1:
+        torch.distributed.barrier(group=group)  # type: ignore[possibly-missing-attribute]
+    if rank != coordinator:
+        return None
+    return ConsolidatedRankDistributedLora(
+        tensors=consolidated,
+        adapter_config=json.loads(source.adapter_config),
+    )
+
+
 def _rank_world(group: Any | None) -> tuple[int, int]:
     if not torch.distributed.is_initialized():  # type: ignore[possibly-missing-attribute]
         return 0, 1
@@ -296,7 +398,7 @@ def _all_gather_records(value: Any, world_size: int, group: Any | None) -> list[
 
 def _collect_prepare_records(
     *,
-    target: OrderedBinaryObjectTarget,
+    target_contract: OrderedBinaryObjectTarget | None,
     handler: Any,
     adapter_config: dict[str, Any],
     coordinator_rank: int,
@@ -320,7 +422,7 @@ def _collect_prepare_records(
         if local_error is not None:
             raise local_error
         contract = RankDistributedLoraCallContract(
-            target=target,
+            target=target_contract,
             handler_key=str(getattr(handler, "key", "")),
             adapter_config=encode_adapter_config(adapter_config),
             coordinator_rank=coordinator_rank,
@@ -947,9 +1049,8 @@ def _build_layout(
     )
 
 
-def prepare_rank_distributed_vllm_lora(
+def prepare_rank_distributed_vllm_lora_source(
     *,
-    target: OrderedBinaryObjectTarget,
     local_tensors: dict[str, torch.Tensor],
     local_metadata: Sequence[LoraShardMeta],
     local_packed_tensors: dict[str, torch.Tensor],
@@ -963,7 +1064,8 @@ def prepare_rank_distributed_vllm_lora(
     exchange_device: torch.device | None,
     stager: PinnedCpuSnapshotStager | None,
     local_error: BaseException | None = None,
-) -> PendingCpuSnapshot[PreparedRankDistributedLora]:
+    target_contract: OrderedBinaryObjectTarget | None = None,
+) -> PendingCpuSnapshot[PreparedRankDistributedLoraSource]:
     """Gather declared conversion dependency groups and prepare rank-owned L2 ranges.
 
     The supplied tensors retain current global-rank metadata and must remain immutable
@@ -1015,7 +1117,7 @@ def prepare_rank_distributed_vllm_lora(
         local_error = error
         exchange_device = torch.device("cpu")
     records, local_metadata, local_packed_metadata = _collect_prepare_records(
-        target=target,
+        target_contract=target_contract,
         handler=handler,
         adapter_config=adapter_config,
         coordinator_rank=coordinator_rank,
@@ -1116,19 +1218,6 @@ def prepare_rank_distributed_vllm_lora(
     output_metadata = _global_output_metadata(output_records)
     config_bytes = encode_adapter_config(published_config)
     header = _safetensors_header(output_metadata)
-    layout = _build_layout(
-        target,
-        output_metadata,
-        config_bytes,
-        header,
-        coordinator_rank=coordinator_rank,
-        world_size=world_size,
-    )
-    owned_upload_bytes = sum(
-        shard.byte_count
-        for shard, ownership in zip(layout.plan.shards, layout.shards, strict=True)
-        if ownership.owner_rank == rank
-    )
     builder = stager.begin()
     staged_output = (
         _stage_published_tensors(output, builder)
@@ -1139,9 +1228,11 @@ def prepare_rank_distributed_vllm_lora(
         if exchange_device.index is None:
             raise RuntimeError("CUDA LoRA exchange device has no index")
         builder.fence_current_stream(exchange_device.index)
-    prepared = PreparedRankDistributedLora(
-        layout=layout,
+    prepared = PreparedRankDistributedLoraSource(
+        coordinator_rank=coordinator_rank,
+        world_size=world_size,
         rank=rank,
+        metadata=output_metadata,
         tensors=staged_output,
         adapter_config=config_bytes,
         safetensors_header=header,
@@ -1154,12 +1245,48 @@ def prepare_rank_distributed_vllm_lora(
             received_bytes=received_regular + received_packed,
             owned_tensor_bytes=sum(tensor.nbytes for tensor in output.values()),
             peak_accounted_owner_bytes=peak_accounted_owner_bytes,
-            owned_upload_bytes=owned_upload_bytes,
+            owned_upload_bytes=0,
             owned_tensor_count=len(output),
             owned_block_count=owned_block_count,
         ),
     )
     return builder.finish(prepared)
+
+
+def prepare_rank_distributed_vllm_lora(
+    *,
+    target: OrderedBinaryObjectTarget,
+    local_tensors: dict[str, torch.Tensor],
+    local_metadata: Sequence[LoraShardMeta],
+    local_packed_tensors: dict[str, torch.Tensor],
+    local_packed_metadata: Sequence[PackedExpertShardMeta],
+    handler: Any | None,
+    adapter_config: dict[str, Any],
+    conversion_group_for_key: Callable[[str], str],
+    group: Any | None = None,
+    metadata_group: Any | None = None,
+    coordinator_rank: int = 0,
+    exchange_device: torch.device | None,
+    stager: PinnedCpuSnapshotStager | None,
+    local_error: BaseException | None = None,
+) -> PendingCpuSnapshot[PreparedRankDistributedLora]:
+    """Compatibility entrypoint that binds a target after source preparation."""
+    return prepare_rank_distributed_vllm_lora_source(
+        local_tensors=local_tensors,
+        local_metadata=local_metadata,
+        local_packed_tensors=local_packed_tensors,
+        local_packed_metadata=local_packed_metadata,
+        handler=handler,
+        adapter_config=adapter_config,
+        conversion_group_for_key=conversion_group_for_key,
+        group=group,
+        metadata_group=metadata_group,
+        coordinator_rank=coordinator_rank,
+        exchange_device=exchange_device,
+        stager=stager,
+        local_error=local_error,
+        target_contract=target,
+    ).map(lambda source: source.bind_target(target))
 
 
 def _broadcast_result(

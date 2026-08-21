@@ -3,12 +3,13 @@ from __future__ import annotations
 from collections.abc import Sequence
 from threading import Lock
 import time
-from typing import Any, Generic, NamedTuple, TypeVar
+from typing import Any, Callable, Generic, NamedTuple, TypeVar
 
 from pydantic import BaseModel, ConfigDict
 import torch
 
 _T = TypeVar("_T")
+_U = TypeVar("_U")
 
 
 class _CudaFence(NamedTuple):
@@ -43,6 +44,10 @@ class PendingCpuSnapshot(Generic[_T]):
             fence.event.synchronize()
         self._sources = ()
         return self.payload
+
+    def map(self, transform: Callable[[_T], _U]) -> "PendingCpuSnapshot[_U]":
+        """Transform metadata while retaining the same source lifetime fences."""
+        return PendingCpuSnapshot(transform(self.payload), self.fences, self._sources)
 
 
 class PinnedCpuSnapshotBuilder:

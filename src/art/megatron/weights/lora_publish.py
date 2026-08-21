@@ -1,6 +1,6 @@
 from collections.abc import Iterable, Sequence
 import time
-from typing import Any, NamedTuple
+from typing import Any, Literal, NamedTuple
 
 from pydantic import BaseModel, ConfigDict, Field
 import torch
@@ -81,6 +81,176 @@ class LoraSnapshotTimings(BaseModel):
             }
         )
         return values
+
+
+class LocalLoraExportEntry(BaseModel):
+    """One immutable view from a checkpoint-slot residency tensor."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    kind: Literal["regular", "packed"]
+    key: str
+    source_index: int = Field(ge=0)
+    target_dtype_name: str
+    manifest: dict[str, Any]
+    expert_index: int | None = Field(default=None, ge=0)
+    expert_start: int | None = Field(default=None, ge=0)
+    expert_count: int | None = Field(default=None, ge=1)
+    pack_layout: str | None = None
+
+
+class LocalLoraExportPlan(BaseModel):
+    """Stable export operations bound to the ordered slot-residency tuple."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    source_count: int = Field(ge=1)
+    entries: tuple[LocalLoraExportEntry, ...] = Field(min_length=1)
+
+    def materialize(
+        self,
+        sources: Sequence[torch.Tensor],
+        *,
+        owner_rank: int,
+    ) -> tuple[
+        dict[str, torch.Tensor],
+        tuple[LoraShardMeta, ...],
+        dict[str, torch.Tensor],
+        tuple[PackedExpertShardMeta, ...],
+    ]:
+        if len(sources) != self.source_count:
+            raise RuntimeError("LoRA export residency tensor count changed")
+        regular: dict[str, torch.Tensor] = {}
+        regular_metadata: list[LoraShardMeta] = []
+        packed: dict[str, torch.Tensor] = {}
+        packed_metadata: list[PackedExpertShardMeta] = []
+        for entry in self.entries:
+            source = sources[entry.source_index]
+            dtype = _dtype_from_name(entry.target_dtype_name)
+            if entry.kind == "regular":
+                value = (
+                    source[entry.expert_index].T
+                    if entry.expert_index is not None
+                    else source.T
+                ).to(dtype=dtype).contiguous()
+                regular[entry.key] = value
+                regular_metadata.append(
+                    LoraShardMeta(
+                        key=entry.key,
+                        owner_rank=owner_rank,
+                        shape=tuple(value.shape),
+                        dtype_name=entry.target_dtype_name,
+                        manifest=entry.manifest,
+                        block=_block_for_key(entry.key),
+                    )
+                )
+                continue
+            assert (
+                entry.expert_start is not None
+                and entry.expert_count is not None
+                and entry.pack_layout is not None
+            )
+            value = (
+                source[: entry.expert_count]
+                .transpose(1, 2)
+                .to(dtype=dtype)
+                .contiguous()
+            )
+            packed[entry.key] = value
+            packed_metadata.append(
+                PackedExpertShardMeta(
+                    key=entry.key,
+                    owner_rank=owner_rank,
+                    shape=tuple(value.shape),
+                    dtype_name=entry.target_dtype_name,
+                    manifest=entry.manifest,
+                    expert_start=entry.expert_start,
+                    expert_count=entry.expert_count,
+                    pack_layout=entry.pack_layout,
+                )
+            )
+        return regular, tuple(regular_metadata), packed, tuple(packed_metadata)
+
+
+def build_local_lora_export_plan(
+    model_chunks: ModelChunks,
+    residency_tensors: Sequence[torch.Tensor],
+    adapter_dtypes: dict[str, torch.dtype],
+    *,
+    packed_expert_groups: Sequence[ExpertPackedLoraGroup] = (),
+    slot_ref: LoRASlotRef | None = None,
+) -> LocalLoraExportPlan:
+    """Compile model traversal into stable indices; no parameter data is copied."""
+    source_indices = {id(tensor): index for index, tensor in enumerate(residency_tensors)}
+    entries: list[LocalLoraExportEntry] = []
+    for module in iter_lora_modules(model_chunks):
+        packed = _uses_packed_expert_publish(module, packed_expert_groups, slot_ref)
+        for key, param, expert in module._export_items(slot_ref):
+            if packed and module._is_expert_parameter(param):
+                continue
+            try:
+                source_index = source_indices[id(param)]
+            except KeyError as error:
+                raise RuntimeError(
+                    f"LoRA export parameter is absent from residency: {key}"
+                ) from error
+            value = param.data[expert].T if expert is not None else param.data.T
+            target_dtype = adapter_dtypes.get(key, value.dtype)
+            entries.append(
+                LocalLoraExportEntry(
+                    kind="regular",
+                    key=key,
+                    source_index=source_index,
+                    target_dtype_name=_dtype_name(target_dtype),
+                    manifest=module._manifest_for_param(param),
+                    expert_index=expert,
+                )
+            )
+        if not packed:
+            continue
+        expert_ids = tuple(expert for expert in module.expert_ids if expert is not None)
+        if not expert_ids:
+            continue
+        for suffix, param in module._lora_params(slot_ref):
+            if not module._is_expert_parameter(param):
+                continue
+            slot_match = _packed_expert_slot(
+                module.adapter_model_prefix, suffix, packed_expert_groups
+            )
+            if slot_match is None or not module._should_export_parameter(param):
+                continue
+            group_prefix, slot = slot_match
+            key = f"{group_prefix}.{slot.output_suffix}"
+            try:
+                source_index = source_indices[id(param)]
+            except KeyError as error:
+                raise RuntimeError(
+                    f"packed LoRA export parameter is absent from residency: {key}"
+                ) from error
+            source_keys = module._expected_weight_keys(suffix.removesuffix(".weight"))
+            dtype = (
+                adapter_dtypes[source_keys[0]]
+                if source_keys and source_keys[0] in adapter_dtypes
+                else param.dtype
+            )
+            entries.append(
+                LocalLoraExportEntry(
+                    kind="packed",
+                    key=key,
+                    source_index=source_index,
+                    target_dtype_name=_dtype_name(dtype),
+                    manifest=module._manifest_for_param(param),
+                    expert_start=expert_ids[0],
+                    expert_count=len(expert_ids),
+                    pack_layout=slot.pack_layout,
+                )
+            )
+    keys = [entry.key for entry in entries]
+    if not entries or len(set(keys)) != len(keys):
+        raise RuntimeError("LoRA export plan is empty or contains duplicate keys")
+    return LocalLoraExportPlan(
+        source_count=len(residency_tensors), entries=tuple(entries)
+    )
 
 
 def iter_lora_modules(model_chunks: ModelChunks) -> Iterable[LoRA]:

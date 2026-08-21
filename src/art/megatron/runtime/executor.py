@@ -9,7 +9,7 @@ import math
 from pathlib import Path
 from threading import BoundedSemaphore, Condition, Event, Lock
 import time
-from typing import TYPE_CHECKING, Any, Iterator, cast
+from typing import TYPE_CHECKING, Any, Iterator, Literal, cast
 
 from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, SkipValidation
 import torch
@@ -1666,6 +1666,30 @@ class MCoreRunSlotExecutor:
                 ),
                 grads=reduced_gradients,
             )
+            residency_tensors = self._slot_trainer.checkpoint_slot_residency_tensors(
+                job.run_id
+            )
+            optimizer_source = (
+                self._slot_trainer.checkpoint_slot_optimizer_residency_source(
+                    job.run_id
+                )
+            )
+            if optimizer_source is None:
+                raise RuntimeError("optimizer commit has no immutable optimizer state")
+            from art.megatron.lora import LoRASlotRef
+            from art.megatron.weights.lora_publish import (
+                build_local_lora_export_plan,
+            )
+
+            export_plan = build_local_lora_export_plan(
+                self.runtime.model,
+                residency_tensors.weights,
+                {},
+                packed_expert_groups=(
+                    self.runtime.model_support_handler.expert_packed_lora_groups()
+                ),
+                slot_ref=LoRASlotRef("checkpoint", job.run_id),
+            )
         if not result["update_successful"] or not math.isfinite(result["grad_norm"]):
             raise RuntimeError("dynamic LoRA optimizer rejected the update")
         optimizer_step_s = time.perf_counter() - started
@@ -1678,14 +1702,6 @@ class MCoreRunSlotExecutor:
         output_weights = parent_weights.model_copy(
             update={"generation_id": job.generation.generation_id}
         )
-        residency_tensors = self._slot_trainer.checkpoint_slot_residency_tensors(
-            job.run_id
-        )
-        optimizer_source = (
-            self._slot_trainer.checkpoint_slot_optimizer_residency_source(job.run_id)
-        )
-        if optimizer_source is None:
-            raise RuntimeError("optimizer commit has no immutable optimizer state")
         self._residency.advance_l1(
             parent_weights,
             output_weights,
@@ -1715,23 +1731,14 @@ class MCoreRunSlotExecutor:
             state.learner_version = job.learner_version
         if accumulator is not None:
             self._residency.retire_async(accumulator)
-        from art.megatron.lora import LoRASlotRef
-
-        snapshot_metrics = self._publisher.stage(
+        snapshot_metrics = self._publisher.register_resident_generation(
             run_id=job.run_id,
             generation=job.generation,
-            adapter_dtypes={},
+            weights_key=output_weights,
+            export_plan=export_plan,
             adapter_config=state.adapter_config,
-            slot_ref=LoRASlotRef("checkpoint", job.run_id),
-            snapshot_optimizer=False,
-            residency_key=output_weights,
-        )
-        snapshot_metrics.update(
-            self._publisher.attach_resident_optimizer(
-                generation=job.generation,
-                source=optimizer_source,
-                residency_key=output_optimizer,
-            )
+            optimizer_source=optimizer_source,
+            optimizer_key=output_optimizer,
         )
         return {
             "operation_id": job.operation_id,
@@ -1941,18 +1948,17 @@ class MCoreRunSlotExecutor:
         if ordered_target is not None:
             from art.megatron.lora import LoRASlotRef
 
-            with self._resident(state):
-                rank_plan, metrics = self._publisher.prepare_ordered_sampler(
-                    operation_id=job.operation_id,
-                    run_id=job.run_id,
-                    generation=job.generation,
-                    optimizer_state_path=job.optimizer_state_path,
-                    target=ordered_target,
-                    adapter_dtypes={},
-                    adapter_config=state.adapter_config,
-                    slot_ref=LoRASlotRef("checkpoint", job.run_id),
-                    sink=sink,
-                )
+            rank_plan, metrics = self._publisher.prepare_ordered_sampler(
+                operation_id=job.operation_id,
+                run_id=job.run_id,
+                generation=job.generation,
+                optimizer_state_path=job.optimizer_state_path,
+                target=ordered_target,
+                adapter_dtypes={},
+                adapter_config=state.adapter_config,
+                slot_ref=LoRASlotRef("checkpoint", job.run_id),
+                sink=sink,
+            )
             return {
                 "operation_id": job.operation_id,
                 "learner_version": job.learner_version,
@@ -2329,6 +2335,13 @@ class _ResidentOptimizerSource(BaseModel):
     source: Any
 
 
+class _ResidentLoraSource(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True, frozen=True)
+
+    key: ResidencyKey
+    prepared: SkipValidation[Future[Any]]
+
+
 class _CachedGeneration(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
@@ -2337,6 +2350,7 @@ class _CachedGeneration(BaseModel):
     stager: PinnedCpuSnapshotStager | None
     resolved: Future[_ResolvedGeneration]
     optimizer_upgrade: Future[Any] | None = None
+    resident_lora: _ResidentLoraSource | None = None
     resident_optimizer: _ResidentOptimizerSource | None = None
     has_optimizer: bool = False
     release_stager_on_resolve: bool = False
@@ -2423,6 +2437,9 @@ class _GenerationPublisher:
         ]
         self._resolution_pool = ThreadPoolExecutor(
             max_workers=capacity, thread_name_prefix="art-snapshot-resolve"
+        )
+        self._sampler_pool = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="art-sampler-prepare"
         )
         self._transport_pool = ThreadPoolExecutor(
             max_workers=capacity, thread_name_prefix="art-publish-transport"
@@ -2603,6 +2620,101 @@ class _GenerationPublisher:
             "snapshot_optimizer_attach_s": time.perf_counter() - started,
         }
 
+    def register_resident_generation(
+        self,
+        *,
+        run_id: str,
+        generation: TrainerGeneration,
+        weights_key: ResidencyKey,
+        export_plan: Any,
+        adapter_config: dict[str, Any],
+        optimizer_source: Any,
+        optimizer_key: ResidencyKey,
+    ) -> dict[str, float]:
+        """Prepare one exact sampler generation from immutable L2 state."""
+        if self._residency is None:
+            raise RuntimeError("resident generation requires a residency manager")
+        started = time.perf_counter()
+        with self._lock:
+            if generation.generation_id in self._cache:
+                raise RuntimeError(
+                    f"generation snapshot already exists: {generation.generation_id}"
+                )
+        self._residency.ensure_l2(weights_key)
+        self._residency.ensure_l2(optimizer_key)
+        sampler_key = weights_key.model_copy(update={"representation": "sampler"})
+        prepared = self._sampler_pool.submit(
+            self._prepare_resident_lora,
+            weights_key,
+            sampler_key,
+            export_plan,
+            adapter_config,
+        )
+        resolved: Future[_ResolvedGeneration] = Future()
+        resolved.set_result(
+            _ResolvedGeneration(lora=None, optimizer=None, prepared_tensors=None)
+        )
+        entry = _CachedGeneration(
+            run_id=run_id,
+            generation=generation,
+            stager=None,
+            resolved=resolved,
+            resident_lora=_ResidentLoraSource(
+                key=sampler_key,
+                prepared=prepared,
+            ),
+            resident_optimizer=_ResidentOptimizerSource(
+                key=optimizer_key,
+                source=optimizer_source,
+            ),
+            has_optimizer=True,
+        )
+        self._cache_staging(entry)
+        prepared.add_done_callback(
+            lambda done, cached=entry: self._resident_lora_prepared(cached, done)
+        )
+        return {
+            "snapshot_resident_attach_s": time.perf_counter() - started,
+        }
+
+    def _prepare_resident_lora(
+        self,
+        weights_key: ResidencyKey,
+        sampler_key: ResidencyKey,
+        export_plan: Any,
+        adapter_config: dict[str, Any],
+    ) -> Any:
+        if self._residency is None:
+            raise RuntimeError("resident generation requires a residency manager")
+        from art.megatron.lora import _block_for_key
+        from art.megatron.weights.rank_distributed_lora_publish import (
+            prepare_rank_distributed_vllm_lora_source,
+        )
+
+        with self._residency.borrow_l2(weights_key) as image:
+            regular, regular_meta, packed, packed_meta = export_plan.materialize(
+                image.tensors(), owner_rank=int(self.runtime.rank)
+            )
+        pending = prepare_rank_distributed_vllm_lora_source(
+            local_tensors=regular,
+            local_metadata=regular_meta,
+            local_packed_tensors=packed,
+            local_packed_metadata=packed_meta,
+            handler=self.runtime.model_support_handler,
+            adapter_config=adapter_config,
+            conversion_group_for_key=_block_for_key,
+            group=self.runtime.publication_group,
+            metadata_group=self.runtime.publication_metadata_group,
+            exchange_device=torch.device("cpu"),
+            stager=PinnedCpuSnapshotStager(reusable=True),
+        )
+        source = pending.resolve()
+        names = tuple(sorted(source.tensors))
+        self._residency.register_l2(
+            sampler_key, tuple(source.tensors[name] for name in names)
+        )
+        return source.model_copy(update={"tensors": {}})
+
     def ensure_generation(
         self,
         *,
@@ -2748,6 +2860,27 @@ class _GenerationPublisher:
                 "ordered sampler target identifies another learner generation"
             )
 
+        with self._lock:
+            generation_entry = self._cache.get(generation.generation_id)
+        if (
+            generation_entry is not None
+            and not generation_entry.retired
+            and generation_entry.generation == generation
+            and generation_entry.resident_lora is not None
+        ):
+            return self._prepare_ordered_resident_sampler(
+                operation_id=operation_id,
+                generation=generation,
+                optimizer_state_path=optimizer_state_path,
+                target=target,
+                entry=generation_entry,
+                sink=sink,
+            )
+        if slot_ref is not None:
+            raise RuntimeError(
+                "dynamic LoRA generation has no immutable resident sampler source"
+            )
+
         from art.megatron.lora import _block_for_key
         from art.megatron.weights.lora_publish import (
             collect_local_lora_entries,
@@ -2854,7 +2987,13 @@ class _GenerationPublisher:
                 generation_id=generation.generation_id,
                 files=tuple(
                     CheckpointFile(
-                        name=cast(Any, file.relative_path),
+                        name=cast(
+                            Literal[
+                                "adapter_config.json",
+                                "adapter_model.safetensors",
+                            ],
+                            file.relative_path,
+                        ),
                         size_bytes=file.byte_count,
                         sha256=file.sha256,
                     )
@@ -2919,6 +3058,106 @@ class _GenerationPublisher:
         }
         return rank_plan, metrics
 
+    def _prepare_ordered_resident_sampler(
+        self,
+        *,
+        operation_id: str,
+        generation: TrainerGeneration,
+        optimizer_state_path: str,
+        target: OrderedBinaryObjectTarget,
+        entry: _CachedGeneration,
+        sink: EventSink,
+    ) -> tuple[SnapshotRankWritePlan, dict[str, float]]:
+        if self._residency is None or entry.resident_lora is None:
+            raise RuntimeError("ordered sampler generation has no resident source")
+        started = time.perf_counter()
+        source = entry.resident_lora.prepared.result()
+        contexts = ExitStack()
+        try:
+            image = contexts.enter_context(
+                self._residency.borrow_l2(entry.resident_lora.key)
+            )
+            names = tuple(
+                tensor.name
+                for tensor in source.metadata
+                if tensor.owner_rank == int(self.runtime.rank)
+            )
+            tensors = image.tensors()
+            if len(names) != len(tensors):
+                raise RuntimeError("resident sampler tensor identity changed")
+            distributed = source.model_copy(
+                update={"tensors": dict(zip(names, tensors, strict=True))}
+            ).bind_target(target)
+            ref = distributed.layout.ref
+            expected_files = {"adapter_config.json", "adapter_model.safetensors"}
+            if {file.relative_path for file in ref.files} != expected_files:
+                raise RuntimeError("ordered sampler object has an invalid LoRA layout")
+            transport_adapter = OptimizerAdapter(
+                identity=ref.manifest_uri,
+                training_session_id=generation.training_session_id,
+                step=generation.policy_step,
+                generation_id=generation.generation_id,
+                files=tuple(
+                    CheckpointFile(
+                        name=cast(
+                            Literal[
+                                "adapter_config.json",
+                                "adapter_model.safetensors",
+                            ],
+                            file.relative_path,
+                        ),
+                        size_bytes=file.byte_count,
+                        sha256=file.sha256,
+                    )
+                    for file in ref.files
+                ),
+            )
+            rank = int(self.runtime.rank)
+            rank_plan = SnapshotRankWritePlan(
+                rank=rank,
+                generation=generation,
+                transport_adapter=transport_adapter if rank == 0 else None,
+                saves_optimizer=False,
+            )
+            completion: Future[TrainerRankPublication] = Future()
+            completion.add_done_callback(_consume_future)
+            prepared = _PreparedRankSnapshot(
+                operation_id=operation_id,
+                entry=entry,
+                plan=rank_plan,
+                adapter=None,
+                distributed_adapter=distributed,
+                optimizer=None,
+                optimizer_archive=None,
+                optimizer_identity=None,
+                optimizer_state_path=optimizer_state_path,
+                staging_adapter_path=None,
+                publication_targets=(),
+                adapter_object_target=target,
+                contexts=contexts,
+                completion=completion,
+                sink=sink,
+                prepared_at=started,
+            )
+            with self._lock:
+                if operation_id in self._prepared:
+                    raise RuntimeError(
+                        f"snapshot operation already prepared: {operation_id}"
+                    )
+                self._prepared[operation_id] = prepared
+                self._prepared_order.append(operation_id)
+                entry.consumers.append(completion)
+        except BaseException:
+            contexts.close()
+            raise
+        return rank_plan, {
+            "snapshot_ordered_prepare_s": time.perf_counter() - started,
+            **{
+                f"snapshot_ordered_{key}": float(value)
+                for key, value in distributed.stats.model_dump().items()
+            },
+        }
+
     @staticmethod
     def _resolve_ordered_sampler(
         pending: PendingCpuSnapshot["PreparedRankDistributedLora"],
@@ -2964,14 +3203,22 @@ class _GenerationPublisher:
             adapter = existing_adapter if rank == 0 else None
             transport_adapter = None
             adapter_payload = None
-            needs_adapter_payload = rank == 0 and (
-                (adapter is None and staging_adapter_path is not None)
+            wants_adapter_payload = (
+                (existing_adapter is None and staging_adapter_path is not None)
                 or bool(publication_targets)
                 or adapter_object_target is not None
             )
+            consolidated_lora = (
+                self._consolidate_resident_lora(entry)
+                if wants_adapter_payload and entry.resident_lora is not None
+                else None
+            )
+            needs_adapter_payload = rank == 0 and (
+                wants_adapter_payload
+            )
             if needs_adapter_payload:
                 lora, tensors = contexts.enter_context(
-                    self._lora_snapshot(entry, adapter)
+                    self._lora_snapshot(entry, adapter, consolidated_lora)
                 )
                 config = encode_adapter_config(
                     {
@@ -3258,6 +3505,8 @@ class _GenerationPublisher:
         for entry in entries:
             try:
                 entry.resolved.result()
+                if entry.resident_lora is not None:
+                    entry.resident_lora.prepared.result()
                 if entry.optimizer_upgrade is not None:
                     entry.optimizer_upgrade.result()
                 for consumer in tuple(entry.consumers):
@@ -3434,6 +3683,22 @@ class _GenerationPublisher:
                 entry.retired = True
         self._maybe_release(entry)
 
+    def _resident_lora_prepared(
+        self,
+        entry: _CachedGeneration,
+        prepared: Future[Any],
+    ) -> None:
+        if prepared.cancelled():
+            with self._lock:
+                entry.retired = True
+        elif (error := prepared.exception()) is not None:
+            with self._lock:
+                self._failures.append(error)
+                entry.retired = True
+        else:
+            self._activate_generation(entry)
+        self._maybe_release(entry)
+
     def _maybe_release(self, entry: _CachedGeneration) -> None:
         retirement: Future[None] | None = None
         retirement_started = False
@@ -3442,6 +3707,10 @@ class _GenerationPublisher:
                 not entry.retired
                 or entry.released
                 or not entry.resolved.done()
+                or (
+                    entry.resident_lora is not None
+                    and not entry.resident_lora.prepared.done()
+                )
                 or (
                     entry.optimizer_upgrade is not None
                     and not entry.optimizer_upgrade.done()
@@ -3460,7 +3729,27 @@ class _GenerationPublisher:
                     self._latest_by_run.pop(entry.run_id)
                 for object_id in entry.object_ids:
                     self._object_publications.pop(object_id, None)
-            if not entry.resolved.cancelled() and entry.resolved.exception() is None:
+            resident_lora = entry.resident_lora
+            if (
+                resident_lora is not None
+                and not resident_lora.prepared.cancelled()
+                and resident_lora.prepared.exception() is None
+            ):
+                if self._residency is None:
+                    raise RuntimeError(
+                        "resident LoRA source has no residency manager"
+                    )
+                try:
+                    retirement = self._residency.retire_async(resident_lora.key)
+                    retirement_started = True
+                except BaseException as error:
+                    retirement = Future()
+                    retirement.set_exception(error)
+                    self._failures.append(error)
+                entry.residency_retirement = retirement
+                if retirement_started:
+                    self._residency_retirements.add(retirement)
+            elif not entry.resolved.cancelled() and entry.resolved.exception() is None:
                 lora_key = entry.resolved.result().lora_residency_key
                 if lora_key is not None:
                     if self._residency is None:
@@ -3547,7 +3836,13 @@ class _GenerationPublisher:
         self,
         entry: _CachedGeneration,
         existing_adapter: OptimizerAdapter | None,
+        consolidated_lora: Any | None = None,
     ) -> Iterator[tuple[Any, PreparedSafetensors]]:
+        if entry.resident_lora is not None:
+            if consolidated_lora is None:
+                raise RuntimeError("resident LoRA consolidation returned no rank-zero value")
+            yield consolidated_lora, self._prepare_lora_tensors(consolidated_lora)
+            return
         snapshot = entry.resolved.result()
         if snapshot.lora is None:
             if existing_adapter is None:
@@ -3570,6 +3865,47 @@ class _GenerationPublisher:
                 update={"tensors": dict(zip(keys, tensors, strict=True))}
             )
             yield lora, self._prepare_lora_tensors(lora)
+
+    def _consolidate_resident_lora(self, entry: _CachedGeneration) -> Any | None:
+        resident = entry.resident_lora
+        if resident is None or self._residency is None:
+            raise RuntimeError("generation has no resident LoRA source")
+        return self._sampler_pool.submit(
+            self._consolidate_resident_lora_sync, resident
+        ).result()
+
+    def _consolidate_resident_lora_sync(
+        self, resident: _ResidentLoraSource
+    ) -> Any | None:
+        from art.megatron.weights.lora_publish import LoraSnapshot
+        from art.megatron.weights.rank_distributed_lora_publish import (
+            consolidate_rank_distributed_vllm_lora_source,
+        )
+
+        if self._residency is None:
+            raise RuntimeError("generation has no residency manager")
+        source = resident.prepared.result()
+        with self._residency.borrow_l2(resident.key) as image:
+            names = tuple(
+                tensor.name
+                for tensor in source.metadata
+                if tensor.owner_rank == int(self.runtime.rank)
+            )
+            tensors = image.tensors()
+            if len(names) != len(tensors):
+                raise RuntimeError("resident sampler tensor identity changed")
+            consolidated = consolidate_rank_distributed_vllm_lora_source(
+                source.model_copy(
+                    update={"tensors": dict(zip(names, tensors, strict=True))}
+                ),
+                group=self.runtime.publication_group,
+            )
+        if consolidated is None:
+            return None
+        return LoraSnapshot(
+            tensors=consolidated.tensors,
+            adapter_config=consolidated.adapter_config,
+        )
 
     @contextmanager
     def _optimizer_snapshot(
@@ -4142,6 +4478,7 @@ class _GenerationPublisher:
                 entry.retired = True
         for entry in entries:
             self._maybe_release(entry)
+        self._sampler_pool.shutdown(wait=True)
         self._resolution_pool.shutdown(wait=True)
         self._transport_pool.shutdown(wait=True)
         self._ordered_transport_pool.shutdown(wait=True)

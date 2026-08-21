@@ -134,23 +134,16 @@ class _CommittedPublisher:
     def raise_if_failed(self) -> None:
         return None
 
-    def stage(self, **kwargs: Any) -> dict[str, float]:
-        self.events.append("stage")
+    def register_resident_generation(self, **kwargs: Any) -> dict[str, float]:
+        self.events.append("register_resident")
         generation = kwargs["generation"]
         self.entries[generation.generation_id] = {
             "generation": generation,
-            "weights": kwargs["residency_key"],
-            "optimizer": None,
-            "optimizer_source": None,
+            "weights": kwargs["weights_key"],
+            "optimizer": kwargs["optimizer_key"],
+            "optimizer_source": kwargs["optimizer_source"],
         }
-        return {"snapshot_launch_s": 1.0}
-
-    def attach_resident_optimizer(self, **kwargs: Any) -> dict[str, float]:
-        self.events.append("attach_optimizer")
-        entry = self.entries[kwargs["generation"].generation_id]
-        entry["optimizer"] = kwargs["residency_key"]
-        entry["optimizer_source"] = kwargs["source"]
-        return {"snapshot_optimizer_attach_s": 2.0}
+        return {"snapshot_resident_attach_s": 1.0}
 
     def has_generation(
         self, generation: TrainerGeneration, *, require_optimizer: bool = False
@@ -251,6 +244,13 @@ def test_post_optimizer_save_uses_registered_generation_without_l1(
         "art.megatron.lora",
         SimpleNamespace(LoRASlotRef=lambda kind, name: (kind, name)),
     )
+    monkeypatch.setitem(
+        sys.modules,
+        "art.megatron.weights.lora_publish",
+        SimpleNamespace(
+            build_local_lora_export_plan=lambda *_args, **_kwargs: object()
+        ),
+    )
     parent_weights = _key(0)
     parent_optimizer = _key(0, "optimizer")
     accumulator = parent_weights.model_copy(
@@ -273,6 +273,9 @@ def test_post_optimizer_save_uses_registered_generation_without_l1(
         model=(),
         optimizer_snapshot_barrier=SimpleNamespace(
             wait_before_mutation=lambda *, key: None
+        ),
+        model_support_handler=SimpleNamespace(
+            expert_packed_lora_groups=lambda: ()
         ),
     )
     executor._slot_trainer = slot
@@ -298,7 +301,7 @@ def test_post_optimizer_save_uses_registered_generation_without_l1(
     ]
     assert tuple(residency.acquired) == optimizer_acquisitions
     assert slot.optimizer_source_calls == 1
-    assert publisher.events == ["stage", "attach_optimizer", "prepare"]
+    assert publisher.events == ["register_resident", "prepare"]
     assert publisher.archives == [
         {
             "generation": _generation(1),
@@ -307,7 +310,7 @@ def test_post_optimizer_save_uses_registered_generation_without_l1(
             "optimizer_source": slot.optimizer_source,
         }
     ]
-    assert optimizer_result["metrics"]["snapshot_optimizer_attach_s"] == 2.0
+    assert optimizer_result["metrics"]["snapshot_resident_attach_s"] == 1.0
     assert save_result["metrics"] == {"snapshot_prepare_s": 3.0}
 
 
@@ -365,6 +368,7 @@ class _LowerTierPublisher:
             generation=generation,
             resolved=resolved,
             optimizer_upgrade=None,
+            resident_lora=None,
             resident_optimizer=SimpleNamespace(
                 key=optimizer_key,
                 source=optimizer_source,
