@@ -324,6 +324,10 @@ class ArtHostService(Actor):
             except BaseException as error:
                 failures.append(error)
 
+        if self._managed_etcd is not None:
+            await close_one(asyncio.to_thread(self._managed_etcd.close))
+            self._managed_etcd = None
+
         probe_ids = tuple(
             {
                 *self._nccl_cleanups,
@@ -347,16 +351,16 @@ class ArtHostService(Actor):
         self._trajectory_queues.clear()
         for batch_id in tuple(self._batch_publishers):
             await close_one(self._drop_batch(batch_id))
-        async with self._packing_lock:
-            if self._packer is not None:
-                await close_one(self._packer.close())
-                self._packer = None
+        try:
+            async with self._packing_lock:
+                if self._packer is not None:
+                    await close_one(self._packer.close())
+                    self._packer = None
+        except BaseException as error:
+            failures.append(error)
         if self._vllm_launcher is not None:
             await close_one(self._vllm_launcher.close())
             self._vllm_launcher = None
-        if self._managed_etcd is not None:
-            await close_one(asyncio.to_thread(self._managed_etcd.close))
-            self._managed_etcd = None
         try:
             self._packed_batches.store.close()
         except BaseException as error:
