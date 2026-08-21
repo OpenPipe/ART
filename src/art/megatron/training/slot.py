@@ -1327,6 +1327,10 @@ class MegatronTrainingSlot:
         existing = read_adapter_publication(
             generation.adapter_path, step=generation.policy_step
         )
+        # Ordered publication snapshots resident tensors; the local adapter is
+        # lineage metadata, not a second output.
+        if isinstance(object_target, OrderedBinaryObjectTarget):
+            existing = None
         if not save_optimizer and existing is not None and object_target is None:
             return self._existing_snapshot(ref, generation, existing)
         optimizer_state_path = source.optimizer_state_path
