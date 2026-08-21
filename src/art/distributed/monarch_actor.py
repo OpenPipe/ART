@@ -24,7 +24,11 @@ from monarch.actor import (  # ty: ignore[unresolved-import]
 from pydantic import BaseModel, ConfigDict
 
 from art.megatron.runtime.managed import MegatronRuntimeInfo
-from art.utils.lifecycle import complete_task, complete_to_thread
+from art.utils.lifecycle import (
+    complete_task,
+    complete_to_thread,
+    process_shutdown_timeout,
+)
 
 from .adapter_transport import AdapterSnapshotReceiver
 from .artifact_preflight import (
@@ -90,6 +94,7 @@ from .trajectory_store import (
 from .vllm_replica import HostMemberLaunchRequest
 
 _PACKING_GC_ALLOCATION_THRESHOLD = 50_000
+_MOE_ROUTE_SHUTDOWN_TIMEOUT_SECONDS = process_shutdown_timeout(3)
 
 
 class _RetainedPackingPlan(BaseModel):
@@ -275,6 +280,10 @@ class ArtHostService(Actor):
             max_workers=moe_route_receive_concurrency,
             thread_name_prefix="art-moe-route-receive",
         )
+        self._moe_route_receive_tasks: set[
+            asyncio.Task[tuple[MoeRouteGroupPayload, ...]]
+        ] = set()
+        self._moe_route_shutdown_task: asyncio.Task[None] | None = None
         self._moe_route_prefetches: dict[str, _MoeRoutePrefetchState] = {}
         self._closing = False
         self._vllm_output_root = vllm_output_root
@@ -426,7 +435,15 @@ class ArtHostService(Actor):
                 failures.append(error)
 
         self._closing = True
-        await close_one(self._cancel_moe_route_prefetches())
+        await close_one(self._cancel_moe_route_prefetches(wait=False))
+        try:
+            await self._shutdown_moe_route_receives(
+                timeout_s=_MOE_ROUTE_SHUTDOWN_TIMEOUT_SECONDS
+            )
+        except TimeoutError:
+            raise
+        except BaseException as error:
+            failures.append(error)
         if self._packing_tasks:
             results = await asyncio.gather(
                 *tuple(self._packing_tasks), return_exceptions=True
@@ -434,19 +451,6 @@ class ArtHostService(Actor):
             failures.extend(
                 result for result in results if isinstance(result, BaseException)
             )
-        self._moe_route_receive_executor.shutdown(wait=True, cancel_futures=True)
-        if self._moe_route_receivers:
-            results = await asyncio.gather(
-                *(
-                    asyncio.to_thread(receiver.close)
-                    for receiver in self._moe_route_receivers.values()
-                ),
-                return_exceptions=True,
-            )
-            failures.extend(
-                result for result in results if isinstance(result, BaseException)
-            )
-            self._moe_route_receivers.clear()
         if self._managed_etcd is not None:
             await close_one(asyncio.to_thread(self._managed_etcd.close))
             self._managed_etcd = None
@@ -647,6 +651,64 @@ class ArtHostService(Actor):
             self._moe_route_receivers[key] = receiver
         return receiver
 
+    def _start_moe_route_receive(
+        self,
+        transfer: MoeRouteObjectBatchTransfer,
+        *,
+        timeout_s: float,
+        name: str,
+    ) -> asyncio.Task[tuple[MoeRouteGroupPayload, ...]]:
+        if self._closing:
+            raise RuntimeError("ART host service is closing")
+        task = asyncio.create_task(
+            transfer.receive_groups(
+                self._moe_route_receiver(transfer),
+                self._moe_route_receive_slots,
+                timeout_s=timeout_s,
+                executor=self._moe_route_receive_executor,
+            ),
+            name=name,
+        )
+        self._moe_route_receive_tasks.add(task)
+        task.add_done_callback(self._moe_route_receive_tasks.discard)
+        return task
+
+    async def _finish_moe_route_shutdown(self) -> None:
+        receives = tuple(self._moe_route_receive_tasks)
+        for task in receives:
+            task.cancel()
+        if receives:
+            await asyncio.gather(*receives, return_exceptions=True)
+            self._moe_route_receive_tasks.difference_update(receives)
+        await asyncio.to_thread(
+            self._moe_route_receive_executor.shutdown,
+            wait=True,
+            cancel_futures=True,
+        )
+        receivers = tuple(self._moe_route_receivers.values())
+        self._moe_route_receivers.clear()
+        results = await asyncio.gather(
+            *(asyncio.to_thread(receiver.close) for receiver in receivers),
+            return_exceptions=True,
+        )
+        failures = [result for result in results if isinstance(result, BaseException)]
+        if len(failures) == 1:
+            raise failures[0]
+        if failures:
+            raise BaseExceptionGroup("MoE route receiver shutdown failed", failures)
+
+    async def _shutdown_moe_route_receives(self, *, timeout_s: float) -> None:
+        if self._moe_route_shutdown_task is None:
+            self._moe_route_shutdown_task = asyncio.create_task(
+                self._finish_moe_route_shutdown(), name="moe-route-receive-shutdown"
+            )
+        done, _ = await asyncio.wait(
+            (self._moe_route_shutdown_task,), timeout=timeout_s
+        )
+        if not done:
+            raise TimeoutError(f"MoE route receives did not stop within {timeout_s:g}s")
+        self._moe_route_shutdown_task.result()
+
     async def _receive_moe_route_groups(
         self, request: PackingRequest, batch_id: str, timeout_s: float
     ) -> tuple[MoeRouteGroupPayload, ...]:
@@ -664,11 +726,10 @@ class ArtHostService(Actor):
         if request.moe_route_object_transfer is not None:
             transfer = request.moe_route_object_transfer
             receives.append(
-                transfer.receive_groups(
-                    self._moe_route_receiver(transfer),
-                    self._moe_route_receive_slots,
+                self._start_moe_route_receive(
+                    transfer,
                     timeout_s=timeout_s,
-                    executor=self._moe_route_receive_executor,
+                    name=f"moe-route-receive-{batch_id}",
                 )
             )
         if request.moe_route_prefetch is not None:
@@ -724,13 +785,9 @@ class ArtHostService(Actor):
             state.batch_id == batch_id for state in self._moe_route_prefetches.values()
         ):
             raise RuntimeError("packing batch already has a route prefetch")
-        completion = asyncio.create_task(
-            transfer.receive_groups(
-                self._moe_route_receiver(transfer),
-                self._moe_route_receive_slots,
-                timeout_s=transfer_timeout_s,
-                executor=self._moe_route_receive_executor,
-            ),
+        completion = self._start_moe_route_receive(
+            transfer,
+            timeout_s=transfer_timeout_s,
             name=f"moe-route-prefetch-{prefetch.prefetch_id}",
         )
         self._moe_route_prefetches[prefetch.prefetch_id] = _MoeRoutePrefetchState(
@@ -761,7 +818,9 @@ class ArtHostService(Actor):
             raise ValueError("route prefetch identity changed before packing")
         return await state.completion
 
-    async def _cancel_moe_route_prefetches(self, batch_id: str | None = None) -> bool:
+    async def _cancel_moe_route_prefetches(
+        self, batch_id: str | None = None, *, wait: bool = True
+    ) -> bool:
         states = tuple(
             state
             for state in self._moe_route_prefetches.values()
@@ -770,7 +829,7 @@ class ArtHostService(Actor):
         for state in states:
             self._moe_route_prefetches.pop(state.prefetch.prefetch_id, None)
             state.completion.cancel()
-        if states:
+        if states and wait:
             await asyncio.gather(
                 *(state.completion for state in states), return_exceptions=True
             )

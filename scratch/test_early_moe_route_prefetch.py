@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 import threading
+import time
 from typing import Any
 
 import pytest
@@ -16,12 +17,19 @@ from art.distributed.moe_route_store import (
     MoeRouteSlice,
     MoeRouteStoredObject,
 )
-from art.distributed.monarch_actor import ArtHostService
+from art.distributed.monarch_actor import (
+    _MOE_ROUTE_SHUTDOWN_TIMEOUT_SECONDS,
+    ArtHostService,
+)
 from art.distributed.object_store import S3ObjectStoreConfig
 from art.distributed.packing import PackingRequest
 from art.distributed.specs import ArtRuntimeConfig
 from art.megatron.training.slot import MegatronTrainingSlot
 from art.training.contracts import OperationRef
+from art.utils.lifecycle import (
+    PROCESS_SHUTDOWN_TIMEOUT_SECONDS,
+    process_shutdown_timeout,
+)
 
 
 def _transfer(group_count: int = 1) -> MoeRouteObjectBatchTransfer:
@@ -62,6 +70,9 @@ def _actor() -> ArtHostService:
     actor._moe_route_prefetches = {}
     actor._moe_route_receive_slots = asyncio.Semaphore(16)
     actor._moe_route_receive_executor = None
+    actor._moe_route_receive_tasks = set()
+    actor._moe_route_shutdown_task = None
+    actor._moe_route_receivers = {}
     actor._moe_route_receiver = lambda _transfer: object()
     return actor
 
@@ -90,6 +101,12 @@ def test_actor_uses_configured_route_receive_concurrency(
     assert actor._moe_route_receive_slots._value == 16
     assert actor._moe_route_receive_executor._max_workers == 16
     actor._moe_route_receive_executor.shutdown()
+
+
+def test_route_shutdown_deadline_precedes_process_deadline() -> None:
+    assert _MOE_ROUTE_SHUTDOWN_TIMEOUT_SECONDS == process_shutdown_timeout(3)
+    assert _MOE_ROUTE_SHUTDOWN_TIMEOUT_SECONDS == 14.0
+    assert _MOE_ROUTE_SHUTDOWN_TIMEOUT_SECONDS < PROCESS_SHUTDOWN_TIMEOUT_SECONDS
 
 
 @pytest.mark.asyncio
@@ -131,6 +148,61 @@ async def test_route_receive_opens_the_measured_sixteen_way_window(
         release.set()
         await asyncio.gather(task, return_exceptions=True)
         executor.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_stuck_route_read_does_not_block_actor_loop_or_receiver_safety(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    actor = _actor()
+    actor._moe_route_receive_executor = ThreadPoolExecutor(max_workers=1)
+    started = threading.Event()
+    release = threading.Event()
+    heartbeat_ticks = 0
+    heartbeat_stop = asyncio.Event()
+
+    class Receiver:
+        close_calls = 0
+
+        def close(self) -> None:
+            self.close_calls += 1
+
+    receiver = Receiver()
+    actor._moe_route_receivers = {"routes": receiver}
+
+    def receive(_self: object, _receiver: object, _value: object) -> memoryview:
+        started.set()
+        assert release.wait(2)
+        return memoryview(bytearray(b"x")).toreadonly()
+
+    async def heartbeat() -> None:
+        nonlocal heartbeat_ticks
+        while not heartbeat_stop.is_set():
+            heartbeat_ticks += 1
+            await asyncio.sleep(0.005)
+
+    monkeypatch.setattr(MoeRouteObjectBatchTransfer, "_receive", receive)
+    receive_task = actor._start_moe_route_receive(
+        _transfer(), timeout_s=5, name="blocked-route-read"
+    )
+    assert await asyncio.to_thread(started.wait, 1)
+    heartbeat_task = asyncio.create_task(heartbeat())
+    began = time.monotonic()
+    try:
+        with pytest.raises(TimeoutError, match="within 0.05s"):
+            await actor._shutdown_moe_route_receives(timeout_s=0.05)
+        elapsed = time.monotonic() - began
+        assert 0.04 <= elapsed < 0.25
+        assert heartbeat_ticks >= 5
+        assert receiver.close_calls == 0
+    finally:
+        release.set()
+        await asyncio.wait_for(actor._moe_route_shutdown_task, 1)
+        await asyncio.gather(receive_task, return_exceptions=True)
+        heartbeat_stop.set()
+        await heartbeat_task
+
+    assert receiver.close_calls == 1
 
 
 async def _start_prefetch(
