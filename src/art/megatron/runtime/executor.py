@@ -1089,6 +1089,7 @@ class _PreparedRunLoad(BaseModel):
     checkpoint: Any
     optimizer: Any | None
     adapter_config: dict[str, Any]
+    optimizer_restored: bool = False
 
     @property
     def weights(self) -> tuple[torch.Tensor, ...]:
@@ -1245,6 +1246,7 @@ class MCoreRunSlotExecutor:
             optimizer_key=optimizer_key,
             checkpoint=checkpoint,
             optimizer=optimizer,
+            optimizer_restored=(registration.initial_optimizer_state_path is not None),
             adapter_config=adapter_config,
         )
         tensors = (*prepared.weights, *prepared.optimizer_tensors)
@@ -1619,8 +1621,6 @@ class MCoreRunSlotExecutor:
             state, job.training_session_id, job.expected_learner_version
         )
         self._publisher.raise_if_failed()
-        gradients = self._require_gradients(state)
-        gradients.seal(job.contributing_forward_backward_operation_ids)
         from art.trainer_rank import AdamParams
 
         with self._resident(
@@ -1628,6 +1628,8 @@ class MCoreRunSlotExecutor:
         ) as working_set:
             self._residency.wait_before_mutation_working_set(working_set)
             self.runtime.optimizer_snapshot_barrier.wait_before_mutation(key=job.run_id)
+            gradients = self._require_gradients(state)
+            gradients.seal(job.contributing_forward_backward_operation_ids)
             accumulated = gradients.prepare_optimizer()
             expected_tokens = accumulated.expected_global_token_count
             assert expected_tokens is not None
@@ -1737,7 +1739,6 @@ class MCoreRunSlotExecutor:
             MaterializedCheckpoint(path=job.run_id, directory=job.adapter_path),
             device="cpu",
         )
-        optimizer_state = None
         if job.optimizer_state_path is not None:
             assert job.optimizer_generation_id is not None
             loaded = load_trainer_rank_optimizer_state(
@@ -1748,10 +1749,14 @@ class MCoreRunSlotExecutor:
                 optimizer_generation_id=job.optimizer_generation_id,
                 layout=self.optimizer_layout(checkpoint),
             )
-            optimizer_state = (
+            optimizer = (
                 self._slot_trainer.prepare_checkpoint_slot_optimizer_for_residency(
                     job.run_id, checkpoint, loaded
                 )
+            )
+        else:
+            optimizer = self._slot_trainer.prepare_fresh_checkpoint_slot_optimizer_for_residency(
+                checkpoint
             )
         adapter_layout_fingerprint = hashlib.sha256(
             encode_adapter_config(config)
@@ -1766,17 +1771,20 @@ class MCoreRunSlotExecutor:
         prepared = _PreparedRunLoad(
             operation_id=job.operation_id,
             weights_key=weights_key,
-            optimizer_key=(
-                None
-                if optimizer_state is None
-                else weights_key.model_copy(update={"representation": "optimizer"})
+            optimizer_key=weights_key.model_copy(
+                update={"representation": "optimizer"}
             ),
             checkpoint=checkpoint,
-            optimizer=optimizer_state,
+            optimizer=optimizer,
+            optimizer_restored=job.restore_optimizer,
             adapter_config=config,
         )
         tensors = (*prepared.weights, *prepared.optimizer_tensors)
-        if not tensors or any(tensor.device.type != "cpu" for tensor in tensors):
+        if (
+            not prepared.weights
+            or not prepared.optimizer_tensors
+            or any(tensor.device.type != "cpu" for tensor in tensors)
+        ):
             raise RuntimeError(
                 "prepared checkpoint generation is not entirely CPU resident"
             )
@@ -1834,17 +1842,19 @@ class MCoreRunSlotExecutor:
         if (
             prepared.operation_id != job.operation_id
             or prepared.weights_key.generation_id != job.generation.generation_id
-            or (prepared.optimizer is not None) != job.restore_optimizer
+            or prepared.optimizer is None
+            or prepared.optimizer_key is None
+            or prepared.optimizer_restored != job.restore_optimizer
         ):
             raise RuntimeError("prepared load does not match its ordered command")
         previous = state.pending_load
-        working_set = [(prepared.weights_key, prepared.weights)]
-        if prepared.optimizer_key is not None:
-            working_set.append((prepared.optimizer_key, prepared.optimizer_tensors))
-        weights_image, *optimizer_images = self._residency.register_l2_working_set(
-            working_set
+        optimizer_key = prepared.optimizer_key
+        weights_image, optimizer_image = self._residency.register_l2_working_set(
+            (
+                (prepared.weights_key, prepared.weights),
+                (optimizer_key, prepared.optimizer_tensors),
+            )
         )
-        optimizer_image = optimizer_images[0] if optimizer_images else None
         adapter = read_adapter_publication(
             job.generation.adapter_path,
             step=job.generation.policy_step,
@@ -1854,24 +1864,18 @@ class MCoreRunSlotExecutor:
             or adapter.generation_id != job.generation.generation_id
         ):
             self._residency.retire(prepared.weights_key)
-            if prepared.optimizer_key is not None:
-                self._residency.retire(prepared.optimizer_key)
+            self._residency.retire(optimizer_key)
             raise RuntimeError("loaded generation has no matching immutable adapter")
         try:
             snapshot_metrics = self._publisher.register_existing(
                 run_id=job.run_id,
                 generation=job.generation,
-                optimizer_source=(
-                    None
-                    if prepared.optimizer is None
-                    else prepared.optimizer.snapshot_source()
-                ),
-                optimizer_residency_key=prepared.optimizer_key,
+                optimizer_source=prepared.optimizer.snapshot_source(),
+                optimizer_residency_key=optimizer_key,
             )
         except BaseException:
             self._residency.retire(prepared.weights_key)
-            if prepared.optimizer_key is not None:
-                self._residency.retire(prepared.optimizer_key)
+            self._residency.retire(optimizer_key)
             raise
         if previous is not None:
             if previous.weights_key != state.installed_weights:
@@ -1884,7 +1888,7 @@ class MCoreRunSlotExecutor:
         with _residency_mutation(state):
             state.desired = GenerationResidency(
                 weights=prepared.weights_key,
-                optimizer=prepared.optimizer_key,
+                optimizer=optimizer_key,
             )
             state.pending_load = prepared
             state.learner_version = job.learner_version
@@ -1894,12 +1898,7 @@ class MCoreRunSlotExecutor:
             "optimizer_restored": job.restore_optimizer,
             "metrics": {
                 "residency/load_l2_bytes": float(
-                    weights_image.stats.byte_count
-                    + (
-                        0
-                        if optimizer_image is None
-                        else optimizer_image.stats.byte_count
-                    )
+                    weights_image.stats.byte_count + optimizer_image.stats.byte_count
                 ),
                 **snapshot_metrics,
             },
@@ -2310,6 +2309,10 @@ class MCoreRunSlotExecutor:
             current.get("target_modules", ())
         ):
             raise ValueError("loaded adapter changes immutable target_modules")
+        if replacement.get("moe_parameterization", "per_expert") != current.get(
+            "moe_parameterization", "per_expert"
+        ):
+            raise ValueError("loaded adapter changes immutable moe_parameterization")
 
 
 class _ResolvedGeneration(BaseModel):
