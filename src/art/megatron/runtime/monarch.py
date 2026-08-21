@@ -1575,32 +1575,41 @@ class MonarchTrainerActor(Actor):
             raise
 
     @endpoint
-    def start_prepare_run_slot_load_state(self, job_json: str) -> dict[str, Any]:
+    def start_prepare_run_slot_load_state(
+        self,
+        job_json: str,
+        ready_port: Port[dict[str, Any]],
+    ) -> dict[str, Any]:
         try:
             if not self._valid:
                 raise RuntimeError("trainer actor runtime is invalid")
             job = LoadStateJobSpec.model_validate_json(job_json)
-            self._require_run_slot_executor().start_prepare_load_state(job)
-            return {
-                "rank": self._runtime.rank,
-                "operation_id": job.operation_id,
-                "learner_version": job.learner_version,
-            }
-        except BaseException:
-            self._valid = False
-            raise
+            future = self._require_run_slot_executor().start_prepare_load_state(job)
 
-    @endpoint
-    def poll_prepare_run_slot_load_state(self, job_json: str) -> dict[str, Any]:
-        try:
-            if not self._valid:
-                raise RuntimeError("trainer actor runtime is invalid")
-            job = LoadStateJobSpec.model_validate_json(job_json)
+            def ready(completed: Any) -> None:
+                try:
+                    completed.result()
+                    result = _CommandReady(
+                        rank=self._runtime.rank,
+                        operation_id=job.operation_id,
+                        learner_version=job.learner_version,
+                    )
+                except BaseException as error:
+                    result = _CommandReady(
+                        rank=self._runtime.rank,
+                        operation_id=job.operation_id,
+                        learner_version=job.learner_version,
+                        error_type=type(error).__name__,
+                        message=str(error),
+                        traceback_text="".join(traceback.format_exception(error)),
+                    )
+                ready_port.send(result.model_dump(mode="json"))
+
+            future.add_done_callback(ready)
             return {
                 "rank": self._runtime.rank,
                 "operation_id": job.operation_id,
                 "learner_version": job.learner_version,
-                "ready": self._require_run_slot_executor().load_state_prepared(job),
             }
         except BaseException:
             self._valid = False
@@ -2734,10 +2743,13 @@ class MonarchTrainerSlot:
         self._require_open()
         payload = job.model_dump_json()
         try:
+            ready_port, receiver = Channel.open()
             started = list(
                 (
                     await asyncio.wait_for(
-                        self._actors.start_prepare_run_slot_load_state.call(payload),
+                        self._actors.start_prepare_run_slot_load_state.call(
+                            payload, ready_port
+                        ),
                         timeout=self._command_timeout_s,
                     )
                 ).values()
@@ -2748,26 +2760,30 @@ class MonarchTrainerSlot:
                 learner_version=job.learner_version,
             )
             deadline = asyncio.get_running_loop().time() + self._command_timeout_s
-            while True:
-                remaining = deadline - asyncio.get_running_loop().time()
-                if remaining <= 0:
-                    raise TimeoutError("load preparation exceeded command timeout")
-                polled = list(
-                    (
-                        await asyncio.wait_for(
-                            self._actors.poll_prepare_run_slot_load_state.call(payload),
-                            timeout=remaining,
-                        )
-                    ).values()
+            ready = [
+                _CommandReady.model_validate(
+                    await asyncio.wait_for(
+                        receiver.recv(),
+                        timeout=max(
+                            deadline - asyncio.get_running_loop().time(), 0.001
+                        ),
+                    )
                 )
-                self._validate_command_results(
-                    polled,
-                    operation_id=job.operation_id,
-                    learner_version=job.learner_version,
+                for _ in self._rank_processes
+            ]
+            self._validate_command_results(
+                [item.model_dump(mode="json") for item in ready],
+                operation_id=job.operation_id,
+                learner_version=job.learner_version,
+            )
+            failures = [item for item in ready if item.error_type is not None]
+            if failures:
+                details = "\n".join(
+                    f"rank {item.rank}: {item.error_type}: {item.message}\n"
+                    f"{item.traceback_text or ''}"
+                    for item in failures
                 )
-                if all(bool(result["ready"]) for result in polled):
-                    return
-                await asyncio.sleep(min(0.01, remaining))
+                raise RuntimeError(f"load preparation failed:\n{details}")
         except BaseException as error:
             await self._invalidate(error, "load preparation and cleanup failed")
             raise

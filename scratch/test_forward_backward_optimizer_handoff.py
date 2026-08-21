@@ -210,6 +210,9 @@ class _Actors:
         self.registration_started = asyncio.Event()
         self.registration_ready = asyncio.Event()
         self.registration_notifications: set[asyncio.Task[None]] = set()
+        self.load_started = asyncio.Event()
+        self.load_ready = asyncio.Event()
+        self.load_notifications: set[asyncio.Task[None]] = set()
         self.cleanup_started = asyncio.Event()
         self.cleanup_gate = asyncio.Event()
         self.start_run_slot_forward_backward = _Call(self._forward_backward)
@@ -218,6 +221,7 @@ class _Actors:
         self.start_run_slot_sft_forward = _Call(self._forward)
         self.execute_run_slot_optimizer = _Call(self._optimizer)
         self.start_prepare_run_slot_registration = _Call(self._start_registration)
+        self.start_prepare_run_slot_load_state = _Call(self._start_load)
         self.finish_prepare_run_slot_registration = _Call(self._finish_registration)
         self.discard_run_slot_registration = _Call(self._discard_registration)
         self.start_unregister_run_slot = _Call(self._start_unregister)
@@ -378,6 +382,34 @@ class _Actors:
     async def _finish_registration(self, _payload: str) -> dict[int, dict[str, Any]]:
         return self._registration_results()
 
+    async def _start_load(
+        self, operation_id: str, ready_port: _Port
+    ) -> dict[int, dict[str, Any]]:
+        self.load_started.set()
+
+        async def ready() -> None:
+            await self.load_ready.wait()
+            for rank in range(self.ranks):
+                ready_port.send(
+                    {
+                        "rank": rank,
+                        "operation_id": operation_id,
+                        "learner_version": 4,
+                    }
+                )
+
+        task = asyncio.create_task(ready())
+        self.load_notifications.add(task)
+        task.add_done_callback(self.load_notifications.discard)
+        return {
+            rank: {
+                "rank": rank,
+                "operation_id": operation_id,
+                "learner_version": 4,
+            }
+            for rank in range(self.ranks)
+        }
+
     async def _discard_registration(self, _run_id: str) -> dict[int, dict[str, Any]]:
         return self._registration_results()
 
@@ -505,6 +537,20 @@ async def test_run_cleanup_does_not_hold_gpu_turn_or_tombstone_identity() -> Non
     work = await slot.register_run(registration)
     assert slot._registrations["run"] == (registration.model_dump_json(), work)
     assert work.critical_rank.rank == 1
+
+
+@pytest.mark.asyncio
+async def test_load_preparation_uses_one_rank_completion_notification() -> None:
+    actors = _Actors()
+    slot = _slot(actors)
+
+    preparation = asyncio.create_task(slot.prepare_load_state(_Job("load")))
+    await actors.load_started.wait()
+    assert not preparation.done()
+    actors.load_ready.set()
+    await preparation
+
+    assert not actors.load_notifications
 
 
 @pytest.mark.asyncio

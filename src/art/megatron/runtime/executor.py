@@ -1997,19 +1997,23 @@ class MCoreRunSlotExecutor:
             )
         return prepared
 
-    def start_prepare_load_state(self, job: LoadStateJobSpec) -> None:
+    def start_prepare_load_state(
+        self, job: LoadStateJobSpec
+    ) -> Future[_PreparedRunLoad]:
         existing = self._load_preparations.get(job.operation_id)
         if existing is not None:
             if existing[:2] != (job.run_id, job.fingerprint):
                 raise RuntimeError(
                     "operation_id was reused for another load preparation"
                 )
-            return
+            return existing[2]
+        future = self._submit_transition(self._load_pool, self.prepare_load_state, job)
         self._load_preparations[job.operation_id] = (
             job.run_id,
             job.fingerprint,
-            self._submit_transition(self._load_pool, self.prepare_load_state, job),
+            future,
         )
+        return future
 
     def load_state_prepared(self, job: LoadStateJobSpec) -> bool:
         try:
