@@ -10,7 +10,7 @@ import uuid
 from art.distributed.packing import PackingRequest
 from art.distributed.rollout import RolloutModelSpec
 from art.preprocessing.sft import SftBatchTokenizer
-from art.training.client import TrainingOperation
+from art.training.client import PreparedGradientDisposition, TrainingOperation
 from art.training.contracts import (
     Contract,
     ForwardBackwardRequest,
@@ -199,6 +199,7 @@ class LocalTrainingOperation(Generic[ResultT]):
         result: asyncio.Future[ResultT],
         state: _OperationState,
         prepare_cancel: Callable[[], None],
+        gradient_disposition: PreparedGradientDisposition | None,
     ) -> None:
         self._request_id = request_id
         self._admission = admission
@@ -206,6 +207,7 @@ class LocalTrainingOperation(Generic[ResultT]):
         self._result = result
         self._state = state
         self._prepare_cancel = prepare_cancel
+        self._gradient_disposition = gradient_disposition
 
     @property
     def ref(self):
@@ -226,6 +228,11 @@ class LocalTrainingOperation(Generic[ResultT]):
             self._state.cancel_requested = True
             self._result.cancel()
         await asyncio.sleep(0)
+
+    async def gradient_disposition(self) -> PreparedGradientDisposition:
+        if self._gradient_disposition is None:
+            raise TypeError("gradient disposition is only available for F/B")
+        return self._gradient_disposition
 
     def _force_cancel(self) -> None:
         self._state.force_cancelled = True
@@ -437,6 +444,9 @@ class LocalMegatronTrainingClient:
             result,
             state,
             prepare_cancel,
+            ("contributes" if gradient_contribution else "empty")
+            if kind == "forward_backward"
+            else None,
         )
         self._operations[admission.ref.operation_id] = operation
         result.add_done_callback(lambda _: self._bound_operation_cache(operation))

@@ -94,6 +94,7 @@ async def test_all_dropped_local_sft_is_noncontributing_and_sequence_safe() -> N
     assert [row async for row in stream] == []
 
     operation = next(iter(client._operations.values()))
+    assert await operation.gradient_disposition() == "empty"
     result = await operation.result()
     assert isinstance(result, ForwardBackwardResult)
     assert not result.produced_gradient

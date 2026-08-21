@@ -32,7 +32,11 @@ from art.distributed.rollout import (
 from art.distributed.trajectory_store import TrajectoryGroupBundle, TrajectoryGroupRef
 from art.metrics_taxonomy import TRAIN_GRADIENT_STEPS_KEY
 from art.serving_capabilities import discover_serving_capabilities
-from art.training.client import TrainingOperation
+from art.training.client import (
+    TrainingOperation,
+    admit_and_settle_gradient_step,
+    iter_sft_batch_schedule,
+)
 from art.training.contracts import (
     AdamConfig,
     ForwardBackwardRequest,
@@ -1790,26 +1794,17 @@ class ServerlessBackend:
         self._raise_background_failures()
         from art.utils.sft import resolve_sft_batch_size
 
-        values = list(trajectories)
-        if not values:
-            return
         batch_size = resolve_sft_batch_size(
             batch_size=config.batch_size, default_batch_size=2
         )
-        raw_batches = [
-            values[index : index + batch_size]
-            for index in range(0, len(values), batch_size)
-        ]
-        rates = (
-            [float(value) for value in config.learning_rate]
-            if isinstance(config.learning_rate, list)
-            else [float(config.learning_rate)] * len(raw_batches)
-        )
-        if len(rates) != len(raw_batches):
-            raise ValueError("SFT learning-rate schedule must match batch count")
-        client = await self.training_client(model)
-        rows: list[dict[str, float]] = []
-        for batch, learning_rate in zip(raw_batches, rates, strict=True):
+        client = None
+        pending_row: dict[str, float] | None = None
+        gradient_steps = 0
+        for batch, learning_rate in iter_sft_batch_schedule(
+            trajectories, batch_size, config.learning_rate
+        ):
+            if client is None:
+                client = await self.training_client(model)
             sequence = client.next_sequence_id
             forward = await client.forward_backward(
                 ForwardBackwardRequest(
@@ -1824,62 +1819,33 @@ class ServerlessBackend:
                     return_token_logprobs=False,
                 )
             )
-            disposition = await forward.gradient_disposition()
-            if disposition == "empty":
-                forward_result = await forward.result()
-                if forward_result.produced_gradient:
-                    raise RuntimeError(
-                        "empty SFT preparation returned a gradient contribution"
-                    )
-                continue
-            try:
-                optimizer = await client.optim_step(
+            settled = await admit_and_settle_gradient_step(
+                forward,
+                lambda: client.optim_step(
                     OptimStepRequest(
                         run_id=client.run_id,
                         request_id=uuid.uuid4().hex,
                         sequence_id=sequence + 1,
                         optimizer=AdamConfig(learning_rate=learning_rate),
                     )
-                )
-            except BaseException as primary:
-                cleanup = await asyncio.gather(forward.cancel(), return_exceptions=True)
-                failures = [
-                    value for value in cleanup if isinstance(value, BaseException)
-                ]
-                if failures:
-                    raise BaseExceptionGroup(
-                        "SFT optimizer admission and F/B cleanup failed",
-                        [primary, *failures],
-                    ) from None
-                raise
-            results = await asyncio.gather(
-                forward.result(), optimizer.result(), return_exceptions=True
+                ),
             )
-            failures = [value for value in results if isinstance(value, BaseException)]
-            if failures:
-                raise BaseExceptionGroup("remote SFT operations failed", failures)
-            forward_result, optimizer_result = results
-            if not (
-                isinstance(forward_result, ForwardBackwardResult)
-                and isinstance(optimizer_result, OptimStepResult)
-                and forward_result.produced_gradient
-            ):
-                raise RuntimeError(
-                    "contributing SFT operations returned invalid results"
-                )
-            rows.append(
-                {
-                    **merge_gradient_step_metrics(
-                        forward_result.metrics, optimizer_result.metrics
-                    ),
-                    **_packing_outcome_metrics(forward_result.packing),
-                    "data/step_num_trajectories": float(len(batch)),
-                }
+            if settled is None:
+                continue
+            forward_result, optimizer_result = settled
+            row = merge_gradient_step_metrics(
+                forward_result.metrics, optimizer_result.metrics
             )
-        if not rows:
+            row.update(_packing_outcome_metrics(forward_result.packing))
+            row["data/step_num_trajectories"] = float(len(batch))
+            row.pop(TRAIN_GRADIENT_STEPS_KEY, None)
+            if pending_row is not None:
+                yield pending_row
+            pending_row = row
+            gradient_steps += 1
+        if pending_row is None:
             return
-        for row in rows:
-            row[TRAIN_GRADIENT_STEPS_KEY] = float(len(rows))
+        assert client is not None
         sequence = client.next_sequence_id
         step = client.projected_learner_version
         sampler, sampler_ready = await self._start_sampler_publication(
@@ -1901,10 +1867,10 @@ class ServerlessBackend:
             state.result(),
             self._complete_sampler_publication(model, step, sampler, sampler_ready),
         )
-        rows[-1].update(state_result.metrics)
-        rows[-1].update(publication_metrics)
-        for row in rows:
-            yield row
+        pending_row[TRAIN_GRADIENT_STEPS_KEY] = float(gradient_steps)
+        pending_row.update(state_result.metrics)
+        pending_row.update(publication_metrics)
+        yield pending_row
 
     async def finalize_training_session(
         self, model: AnyTrainableModel

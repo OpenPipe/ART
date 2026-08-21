@@ -39,6 +39,10 @@ from ..training import (
     SupervisedTrajectoryBatch,
     TrainingOperation,
 )
+from ..training.client import (
+    admit_and_settle_gradient_step,
+    iter_sft_batch_schedule,
+)
 from ..trajectories import Trajectory, TrajectoryGroup
 from ..types import LocalTrainResult, TrainSFTConfig
 from ..utils.lifecycle import complete_task
@@ -786,27 +790,18 @@ class MegatronBackend(LocalBackend):
         del dev_config, verbose
         from ..utils.sft import resolve_sft_batch_size
 
-        values = list(trajectories)
-        if not values:
-            return
         batch_size = resolve_sft_batch_size(
             batch_size=config.batch_size,
             default_batch_size=self._default_sft_batch_size(),
         )
-        batches = [
-            values[index : index + batch_size]
-            for index in range(0, len(values), batch_size)
-        ]
-        rates = (
-            config.learning_rate
-            if isinstance(config.learning_rate, list)
-            else [config.learning_rate] * len(batches)
-        )
-        if len(rates) != len(batches):
-            raise ValueError("SFT learning-rate schedule must match batch count")
-        client = await self.training_client(cast(TrainableModel, model))
-        rows: list[dict[str, float]] = []
-        for batch, learning_rate in zip(batches, rates, strict=True):
+        client = None
+        pending_row: dict[str, float] | None = None
+        gradient_steps = 0
+        for batch, learning_rate in iter_sft_batch_schedule(
+            trajectories, batch_size, config.learning_rate
+        ):
+            if client is None:
+                client = await self.training_client(cast(TrainableModel, model))
             sequence = client.next_sequence_id
             forward = await client.forward_backward(
                 ForwardBackwardRequest(
@@ -821,24 +816,26 @@ class MegatronBackend(LocalBackend):
                     return_token_logprobs=False,
                 )
             )
-            forward_result = await forward.result()
-            if not forward_result.produced_gradient:
-                continue
-            optimizer = await client.optim_step(
-                OptimStepRequest(
-                    run_id=client.run_id,
-                    request_id=uuid.uuid4().hex,
-                    sequence_id=client.next_sequence_id,
-                    optimizer=AdamConfig(learning_rate=learning_rate),
-                )
+            settled = await admit_and_settle_gradient_step(
+                forward,
+                lambda: client.optim_step(
+                    OptimStepRequest(
+                        run_id=client.run_id,
+                        request_id=uuid.uuid4().hex,
+                        sequence_id=sequence + 1,
+                        optimizer=AdamConfig(learning_rate=learning_rate),
+                    )
+                ),
             )
-            optimizer_result = await optimizer.result()
-            rows.append(
+            if settled is None:
+                continue
+            forward_result, optimizer_result = settled
+            row = merge_gradient_step_metrics(
+                forward_result.metrics, optimizer_result.metrics
+            )
+            row.update(
                 {
-                    **merge_gradient_step_metrics(
-                        forward_result.metrics, optimizer_result.metrics
-                    ),
-                    "data/step_num_trajectories": float(len(values)),
+                    "data/step_num_trajectories": float(len(batch)),
                     "data/step_trainable_assistant_tokens": float(
                         forward_result.packing.trainable_assistant_tokens
                     ),
@@ -849,10 +846,14 @@ class MegatronBackend(LocalBackend):
                     ),
                 }
             )
-        if not rows:
+            row.pop(TRAIN_GRADIENT_STEPS_KEY, None)
+            if pending_row is not None:
+                yield pending_row
+            pending_row = row
+            gradient_steps += 1
+        if pending_row is None:
             return
-        for row in rows:
-            row[TRAIN_GRADIENT_STEPS_KEY] = float(len(rows))
+        assert client is not None
         service = cast(
             Any,
             await self._get_service(cast(TrainableModel, model)),
@@ -882,10 +883,10 @@ class MegatronBackend(LocalBackend):
         sampler_result, state_result = await asyncio.gather(
             sampler.result(), state.result()
         )
-        rows[-1].update(sampler_result.publication_metrics)
-        rows[-1].update(state_result.metrics)
-        for row in rows:
-            yield row
+        pending_row[TRAIN_GRADIENT_STEPS_KEY] = float(gradient_steps)
+        pending_row.update(sampler_result.publication_metrics)
+        pending_row.update(state_result.metrics)
+        yield pending_row
 
     async def _prepare_backend_for_training(
         self,

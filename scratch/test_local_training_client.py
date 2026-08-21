@@ -418,6 +418,8 @@ def test_local_optimizer_starts_before_forward_backward_result_settles() -> None
                 loss=LossConfig(name="cispo"),
             )
         )
+        assert await forward.gradient_disposition() == "contributes"
+        assert not forward._result.done()
         optimizer = await client.optim_step(
             OptimStepRequest(
                 run_id="run",
@@ -432,6 +434,8 @@ def test_local_optimizer_starts_before_forward_backward_result_settles() -> None
         )
         assert service.calls == ["fb:0", "optim:1:1"]
         assert not forward._result.done()
+        with pytest.raises(TypeError, match="only available for F/B"):
+            await optimizer.gradient_disposition()
 
         service.result_release.set()
         assert (await forward.result()).operation_id == forward.ref.operation_id
