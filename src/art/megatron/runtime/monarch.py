@@ -35,7 +35,6 @@ from art.utils.lifecycle import (
     process_shutdown_timeout,
 )
 
-from ..training.command_telemetry import aggregate_rank_command_telemetry
 from .data_plane import InMemoryPackedBatch, SFTBatchData
 from .publication import (
     TRAINER_PUBLICATION_EVENT_ADAPTER,
@@ -95,6 +94,8 @@ def _coordinator_command_result(
     result = dict(next(item for item in results if item["rank"] == 0))
     payloads = [item["_rank_telemetry"] for item in results]
     if aggregate_telemetry:
+        from ..training.command_telemetry import aggregate_rank_command_telemetry
+
         if any(payload is None for payload in payloads):
             raise RuntimeError("trainer rank omitted required command telemetry")
         result["metrics"] = aggregate_rank_command_telemetry(
