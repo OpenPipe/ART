@@ -1161,8 +1161,11 @@ class MCoreRunSlotExecutor:
             raise RuntimeError("multi-run Megatron requires explicit residency limits")
         if runtime.optimizer_layout_fingerprint is None:
             raise RuntimeError("multi-run Megatron has no topology fingerprint")
+        residency_config = runtime.run_residency_config.model_copy(
+            update={"device": str(self._slot_trainer.device)}
+        )
         self._residency = RunResidencyManager(
-            runtime.run_residency_config,
+            residency_config,
             snapshot_barrier=runtime.optimizer_snapshot_barrier,
         )
         self._publisher = _GenerationPublisher(
