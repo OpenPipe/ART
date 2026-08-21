@@ -862,7 +862,6 @@ class RunResidencyManager:
                 self._commit(
                     reservation,
                     immutable_ref=str(self._store.path(state.key)),
-                    digest=manifest.data_sha256,
                 )
                 state.l3_manifest = manifest
                 state.l2 = image
@@ -896,7 +895,6 @@ class RunResidencyManager:
                 self._commit(
                     reservation,
                     immutable_ref=str(self._store.path(state.key)),
-                    digest=manifest.data_sha256,
                 )
                 state.l3 = mapped
                 state.l3_manifest = manifest

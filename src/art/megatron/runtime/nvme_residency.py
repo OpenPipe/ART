@@ -21,7 +21,7 @@ from art.utils.disk_admission import (
 from .residency import ResidencyKey
 from .tensor_residency import HostTensorImage, _StorageGroup, _TensorView
 
-_FORMAT = "art_tensor_residency_v2"
+_FORMAT = "art_tensor_residency_v3"
 _DATA_FILE = "state.bin"
 _MANIFEST_FILE = "manifest.json"
 
@@ -56,12 +56,11 @@ class NvmeTensorRecord(BaseModel):
 class NvmeResidencyManifest(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    format: Literal["art_tensor_residency_v2"] = _FORMAT
+    format: Literal["art_tensor_residency_v3"] = _FORMAT
     key: ResidencyKey
     input_tensor_count: int = Field(ge=1)
     payload_bytes: int = Field(ge=1)
     data_bytes: int = Field(ge=1)
-    data_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     layout_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     storages: tuple[NvmeStorageRecord, ...]
     tensors: tuple[NvmeTensorRecord, ...]
@@ -125,11 +124,7 @@ class NvmeResidencyStore:
                     raise RuntimeError(
                         "L3 residency key changed immutable tensor layout"
                     )
-                self._verify_data(destination, existing)
-                if self._image_sha256(manifest, image) != existing.data_sha256:
-                    raise RuntimeError(
-                        "L3 residency key changed immutable tensor contents"
-                    )
+                self._verify_data_size(destination, existing)
                 return existing
             temporary = self.root / f".{destination.name}.tmp-{uuid.uuid4().hex}"
             reservation = self._disk_admission.reserve(
@@ -179,7 +174,7 @@ class NvmeResidencyStore:
         manifest = self._read_manifest(destination)
         if manifest.key != key:
             raise RuntimeError("L3 residency manifest changed identity")
-        self._verify_data(destination, manifest)
+        self._verify_data_size(destination, manifest)
         return self._map_image(destination, manifest, tensors), manifest
 
     def map_committed(
@@ -330,7 +325,6 @@ class NvmeResidencyStore:
             input_tensor_count=input_count,
             payload_bytes=sum(target.numel() for target in targets),
             data_bytes=cursor,
-            data_sha256="0" * 64,
             layout_sha256=self._digest_json(layout),
             storages=tuple(
                 NvmeStorageRecord(offset=offset, byte_count=target.numel())
@@ -347,7 +341,6 @@ class NvmeResidencyStore:
         *,
         reservation: DiskReservationLease,
     ) -> NvmeResidencyManifest:
-        digest = hashlib.sha256()
         with (directory / _DATA_FILE).open("wb", buffering=0) as handle:
             cursor = 0
             for record, target in zip(
@@ -361,50 +354,20 @@ class NvmeResidencyStore:
                 for start in range(0, len(view), self.config.io_chunk_bytes):
                     chunk = view[start : start + self.config.io_chunk_bytes]
                     handle.write(chunk)
-                    digest.update(chunk)
                     cursor += len(chunk)
                     reservation.record_written(cursor)
                 if cursor != record.offset + record.byte_count:
                     raise RuntimeError("L3 residency write changed physical layout")
             handle.flush()
             os.fsync(handle.fileno())
-        committed = manifest.model_copy(update={"data_sha256": digest.hexdigest()})
-        payload = committed.model_dump_json().encode()
+        payload = manifest.model_dump_json().encode()
         with (directory / _MANIFEST_FILE).open("wb", buffering=0) as handle:
             handle.write(payload)
             handle.flush()
             os.fsync(handle.fileno())
         reservation.record_written(manifest.data_bytes + len(payload))
         self._fsync_dir(directory)
-        return committed
-
-    def _image_sha256(
-        self, manifest: NvmeResidencyManifest, image: HostTensorImage
-    ) -> str:
-        digest = hashlib.sha256()
-        for target in image.storage_bytes():
-            digest.update(memoryview(target.numpy()).cast("B"))
-        return digest.hexdigest()
-
-    def _verify_data(self, directory: Path, manifest: NvmeResidencyManifest) -> None:
-        self._verify_data_size(directory, manifest)
-        digest = hashlib.sha256()
-        scratch = bytearray(self.config.io_chunk_bytes)
-        with (directory / _DATA_FILE).open("rb", buffering=0) as handle:
-            for record in manifest.storages:
-                handle.seek(record.offset)
-                remaining = record.byte_count
-                while remaining:
-                    view = memoryview(scratch)[: min(remaining, len(scratch))]
-                    count = handle.readinto(view)
-                    if count != len(view):
-                        raise RuntimeError(
-                            "L3 residency data ended during verification"
-                        )
-                    digest.update(view)
-                    remaining -= count
-        if digest.hexdigest() != manifest.data_sha256:
-            raise RuntimeError("L3 residency data checksum changed")
+        return manifest
 
     def _read_targets(
         self,
@@ -412,7 +375,6 @@ class NvmeResidencyStore:
         manifest: NvmeResidencyManifest,
         targets: tuple[torch.Tensor, ...],
     ) -> None:
-        digest = hashlib.sha256()
         with (directory / _DATA_FILE).open("rb", buffering=0) as handle:
             for record, target in zip(manifest.storages, targets, strict=True):
                 handle.seek(record.offset)
@@ -423,10 +385,7 @@ class NvmeResidencyStore:
                     count = handle.readinto(chunk)
                     if count != len(chunk):
                         raise RuntimeError("L3 residency data ended during restore")
-                    digest.update(chunk)
                     cursor += count
-        if digest.hexdigest() != manifest.data_sha256:
-            raise RuntimeError("L3 residency data checksum changed during restore")
 
     @staticmethod
     def _verify_data_size(directory: Path, manifest: NvmeResidencyManifest) -> None:
