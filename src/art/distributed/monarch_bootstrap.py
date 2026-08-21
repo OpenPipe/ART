@@ -319,7 +319,10 @@ def _program_reference(value: str) -> tuple[str, str]:
     os.environ["PYTHONPATH"] = os.pathsep.join(
         dict.fromkeys((root, *filter(None, inherited)))
     )
-    os.environ[_PROGRAM_PYTHONPATH_ENV] = root
+    program_roots = os.environ.get(_PROGRAM_PYTHONPATH_ENV, "").split(os.pathsep)
+    os.environ[_PROGRAM_PYTHONPATH_ENV] = os.pathsep.join(
+        dict.fromkeys((root, *filter(None, program_roots)))
+    )
     importlib.invalidate_caches()
     spec = importlib.util.find_spec(module)
     if spec is None or spec.origin is None or Path(spec.origin).resolve() != script:
