@@ -334,6 +334,59 @@ def test_pp_telemetry_is_rank_local_and_controller_aggregated(
     assert metrics["data/step_num_gradient_steps"] == 1
 
 
+def test_rank_local_inter_schedule_metrics_keep_rank_identity() -> None:
+    payloads = []
+    for rank in range(2):
+        zero = torch.zeros(())
+        pending = PendingRankCommandTelemetry(
+            program="rl",
+            backward=True,
+            topology=RankTelemetryTopology(
+                global_rank=rank,
+                dp_cp_ranks=(0, 1),
+                pp_ranks=(rank,),
+            ),
+            statistics=rank_telemetry_statistics(
+                loss_sum=torch.tensor(float(rank + 1)),
+                token_count=torch.tensor(4),
+                correlation=torch.zeros(6),
+                kl_sum=zero,
+                kl_count=zero,
+                diagnostics=LossOffPolicyDiagnosticsAccumulator(),
+            ),
+            workload=_workload(4),
+            schedules=(
+                PipelineScheduleTelemetry(
+                    pp_rank=0,
+                    pp_size=1,
+                    vp_size=1,
+                    num_microbatches=1,
+                    real_microbatches=1,
+                    dummy_microbatches=0,
+                    micro_batch_size=1,
+                    seq_length=8,
+                    microbatch_group_size=1,
+                    forward_compute_s_by_chunk={0: 1.0},
+                    backward_compute_s_by_chunk={0: 1.0},
+                    forward_calls_by_chunk={0: 1},
+                ),
+            ),
+            inter_metric_readers=(
+                lambda rank=rank: {
+                    f"time/post_schedule_inter_metrics_rank_{rank}_s": 0.01
+                },
+            ),
+        )
+        payloads.append(
+            materialize_rank_telemetry(pending, pending.statistics.clone())
+        )
+
+    metrics = aggregate_rank_command_telemetry(payloads, expected_token_count=8)
+
+    assert metrics["time/post_schedule_inter_metrics_rank_0_s"] == 0.01
+    assert metrics["time/post_schedule_inter_metrics_rank_1_s"] == 0.01
+
+
 def test_micro_loss_telemetry_has_no_host_synchronization(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

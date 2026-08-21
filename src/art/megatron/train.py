@@ -4097,10 +4097,12 @@ def run_megatron_rl_forward_backward_step(
     result_collect_s = time.perf_counter() - result_collect_started
     deferred_inter_metrics = None
     if rank_local_metrics:
+        rank = torch.distributed.get_rank()  # ty: ignore[possibly-missing-attribute]
+
         def deferred_inter_metrics() -> dict[str, float]:
             started = time.perf_counter()
             metrics = collect_inter_schedule_metrics()
-            metrics["time/post_schedule_inter_metrics_s"] = (
+            metrics[f"time/post_schedule_inter_metrics_rank_{rank}_s"] = (
                 time.perf_counter() - started
             )
             return metrics
