@@ -29,6 +29,14 @@ from .tensor_snapshot import (
     PinnedCpuSnapshotBuilder,
     PinnedCpuSnapshotStager,
 )
+from .weights.rank_sharded_lora import (
+    RANK_SHARDED_LORA_MANIFEST,
+    CheckpointFile,
+    detect_adapter_checkpoint_format,
+    encode_rank_sharded_lora_manifest,
+    rank_sharded_lora_checkpoint_files,
+    read_rank_sharded_lora_checkpoint,
+)
 
 ALLOW_UNPAIRED_MEGATRON_RESUME_ENV = "ART_ALLOW_UNPAIRED_MEGATRON_RESUME"
 OPTIMIZER_GENERATIONS_DIR = "generations"
@@ -82,10 +90,21 @@ class MegatronResumeStep(_OptimizerRecord):
     quarantined_lora_steps: tuple[int, ...] = ()
 
 
-class CheckpointFile(_OptimizerRecord):
-    name: Literal["adapter_config.json", "adapter_model.safetensors"]
-    size_bytes: int = Field(gt=0)
-    sha256: str | None = Field(default=None, pattern=_SHA256_PATTERN)
+def adapter_checkpoint_file_format(
+    files: tuple[CheckpointFile, ...],
+) -> Literal["canonical", "rank_sharded"]:
+    names = tuple(file.name for file in files)
+    if names == _ADAPTER_FILES:
+        return "canonical"
+    if (
+        len(files) >= 3
+        and names[:2] == ("adapter_config.json", RANK_SHARDED_LORA_MANIFEST)
+        and names[2:]
+        == tuple(f"shards/{index:08d}.bin" for index in range(len(files) - 2))
+        and all(file.sha256 is not None for file in files)
+    ):
+        return "rank_sharded"
+    raise ValueError("adapter checkpoint files do not identify a supported format")
 
 
 class OptimizerAdapter(_OptimizerRecord):
@@ -99,8 +118,12 @@ class OptimizerAdapter(_OptimizerRecord):
     def _validate_files(self) -> "OptimizerAdapter":
         if _generation_step(self.generation_id) != self.step:
             raise ValueError("adapter generation ID and policy step must match")
-        if tuple(file.name for file in self.files) != _ADAPTER_FILES:
-            raise ValueError("adapter manifest must cover every payload file once")
+        try:
+            adapter_checkpoint_file_format(self.files)
+        except ValueError as error:
+            raise ValueError(
+                "adapter manifest must cover every payload file once"
+            ) from error
         return self
 
 
@@ -366,7 +389,16 @@ def optimizer_shard_path(
 
 def _adapter_checkpoint_files(path: str | Path) -> tuple[Path, tuple[Path, ...]]:
     adapter_path = Path(path)
-    files = tuple(adapter_path / name for name in _ADAPTER_FILES)
+    format = detect_adapter_checkpoint_format(adapter_path)
+    names = (
+        _ADAPTER_FILES
+        if format == "canonical"
+        else tuple(
+            file.name
+            for file in read_rank_sharded_lora_checkpoint(adapter_path).files
+        )
+    )
+    files = tuple(adapter_path / name for name in names)
     missing = [str(file) for file in files if not file.is_file()]
     if missing:
         raise RuntimeError(f"Adapter checkpoint is incomplete; missing {missing}")
@@ -374,15 +406,62 @@ def _adapter_checkpoint_files(path: str | Path) -> tuple[Path, tuple[Path, ...]]
 
 
 def _adapter_file_records(path: str | Path) -> tuple[CheckpointFile, ...]:
-    _adapter_path, files = _adapter_checkpoint_files(path)
+    adapter_path, files = _adapter_checkpoint_files(path)
+    if detect_adapter_checkpoint_format(adapter_path) == "rank_sharded":
+        return read_rank_sharded_lora_checkpoint(
+            adapter_path, verify_files=True
+        ).files
     return tuple(
         CheckpointFile(
-            name=cast(Any, file.name),
+            name=file.relative_to(adapter_path).as_posix(),
             size_bytes=file.stat().st_size,
             sha256=_file_sha256(file),
         )
         for file in files
     )
+
+
+def validate_adapter_checkpoint(
+    path: str | Path,
+    adapter: OptimizerAdapter,
+    *,
+    verify_files: bool,
+) -> None:
+    root = Path(path).absolute()
+    physical_format = detect_adapter_checkpoint_format(root)
+    if adapter_checkpoint_file_format(adapter.files) != physical_format:
+        raise RuntimeError("adapter manifest names another physical format")
+    if physical_format == "rank_sharded":
+        checkpoint = read_rank_sharded_lora_checkpoint(
+            root, verify_files=verify_files
+        )
+        manifest = checkpoint.manifest
+        if (
+            manifest.training_session_id,
+            manifest.generation_id,
+            manifest.step,
+        ) != (
+            adapter.training_session_id,
+            adapter.generation_id,
+            adapter.step,
+        ):
+            raise RuntimeError("rank-sharded adapter manifest names another generation")
+        if checkpoint.files != adapter.files:
+            raise RuntimeError("rank-sharded adapter physical coverage changed")
+        return
+    _adapter_root, payloads = _adapter_checkpoint_files(root)
+    if tuple(payload.relative_to(root).as_posix() for payload in payloads) != tuple(
+        record.name for record in adapter.files
+    ) or any(
+        payload.stat().st_size != record.size_bytes
+        for payload, record in zip(payloads, adapter.files, strict=True)
+    ):
+        raise RuntimeError("canonical adapter physical coverage is incomplete or changed")
+    if verify_files and any(
+        record.sha256 is not None and _file_sha256(payload) != record.sha256
+        for payload, record in zip(payloads, adapter.files, strict=True)
+    ):
+        raise RuntimeError("canonical adapter file digest changed")
 
 
 def _file_sha256(path: Path) -> str:
@@ -456,14 +535,10 @@ def publish_adapter_checkpoint(
         raise RuntimeError(f"Refusing to replace canonical adapter {canonical}")
     records = files
     _adapter_path, paths = _adapter_checkpoint_files(staging)
-    if tuple(path.name for path in paths) != tuple(record.name for record in records):
+    if tuple(path.relative_to(staging).as_posix() for path in paths) != tuple(
+        record.name for record in records
+    ):
         raise RuntimeError("adapter file identity has invalid coverage")
-    for path, record in zip(paths, records, strict=True):
-        if path.stat().st_size != record.size_bytes:
-            raise RuntimeError("adapter file size changed before publication")
-        with path.open("rb") as adapter_file:
-            os.fsync(adapter_file.fileno())
-    _fsync_directory(staging)
     adapter = OptimizerAdapter(
         identity=str(canonical),
         training_session_id=training_session_id,
@@ -471,6 +546,14 @@ def publish_adapter_checkpoint(
         generation_id=generation_id or _initial_generation_id(canonical, step),
         files=records,
     )
+    validate_adapter_checkpoint(staging, adapter, verify_files=False)
+    for path in paths:
+        with path.open("rb") as adapter_file:
+            os.fsync(adapter_file.fileno())
+    for parent in sorted({path.parent for path in paths}, key=lambda path: len(path.parts)):
+        if parent != staging:
+            _fsync_directory(parent)
+    _fsync_directory(staging)
     _write_model_atomic(staging / ADAPTER_PUBLICATION_ACK, adapter)
     canonical.parent.mkdir(parents=True, exist_ok=True)
     os.replace(staging, canonical)
@@ -492,14 +575,6 @@ def acknowledge_materialized_adapter(
 ) -> OptimizerAdapter:
     """Attach exact learner identity to an already verified adapter tree."""
     path = Path(adapter_path).absolute()
-    _root, payloads = _adapter_checkpoint_files(path)
-    if tuple(payload.name for payload in payloads) != tuple(
-        record.name for record in files
-    ) or any(
-        payload.stat().st_size != record.size_bytes
-        for payload, record in zip(payloads, files, strict=True)
-    ):
-        raise RuntimeError("materialized adapter differs from its verified manifest")
     adapter = OptimizerAdapter(
         identity=str(path),
         training_session_id=training_session_id,
@@ -507,6 +582,7 @@ def acknowledge_materialized_adapter(
         generation_id=generation_id,
         files=files,
     )
+    validate_adapter_checkpoint(path, adapter, verify_files=False)
     acknowledgment = path / ADAPTER_PUBLICATION_ACK
     if acknowledgment.exists():
         if read_adapter_publication(path, step=step, verify_files=False) != adapter:
@@ -558,13 +634,9 @@ def read_adapter_publication(
             f"expected_identity={expected_identity!r}, expected_step={step}"
         )
     if verify_files:
-        current_files = _adapter_file_records(canonical)
-        if adapter.files != current_files:
-            raise RuntimeError(
-                "Adapter publication acknowledgment does not match canonical "
-                f"file coverage and sizes: acknowledged={adapter.files}, "
-                f"current={current_files}"
-            )
+        validate_adapter_checkpoint(canonical, adapter, verify_files=True)
+    else:
+        validate_adapter_checkpoint(canonical, adapter, verify_files=False)
     return adapter
 
 
@@ -579,12 +651,7 @@ def validate_adapter_manifest(adapter: OptimizerAdapter) -> None:
         != adapter
     ):
         raise RuntimeError("adapter manifest is not the acknowledged publication")
-    _root, payloads = _adapter_checkpoint_files(adapter.identity)
-    if any(
-        payload.stat().st_size != record.size_bytes
-        for payload, record in zip(payloads, adapter.files, strict=True)
-    ):
-        raise RuntimeError("adapter payload size differs from its verified manifest")
+    validate_adapter_checkpoint(adapter.identity, adapter, verify_files=False)
 
 
 def _validate_adapter_publication(
@@ -722,16 +789,39 @@ def link_adapter_generation(
         if existing is not None:
             return existing
         staging.mkdir(parents=True)
-        for record in source.files:
-            os.link(Path(source.identity) / record.name, staging / record.name)
+        source_root = Path(source.identity)
+        if adapter_checkpoint_file_format(source.files) == "rank_sharded":
+            source_checkpoint = read_rank_sharded_lora_checkpoint(
+                source_root, verify_files=True
+            )
+            manifest = type(source_checkpoint.manifest).model_validate(
+                {
+                    **source_checkpoint.manifest.model_dump(mode="json"),
+                    "training_session_id": training_session_id,
+                    "generation_id": generation_id,
+                    "step": step,
+                }
+            )
+            files = rank_sharded_lora_checkpoint_files(manifest)
+            for record in files:
+                target = staging / record.name
+                target.parent.mkdir(parents=True, exist_ok=True)
+                if record.name == RANK_SHARDED_LORA_MANIFEST:
+                    target.write_bytes(encode_rank_sharded_lora_manifest(manifest))
+                else:
+                    os.link(source_root / record.name, target)
+        else:
+            files = source.files
+            for record in files:
+                os.link(source_root / record.name, staging / record.name)
         adapter = publish_adapter_checkpoint(
             staging,
             step=step,
-            files=source.files,
+            files=files,
             training_session_id=training_session_id,
             generation_id=generation_id,
         )
-        if adapter.files != source.files:
+        if adapter.files != files:
             raise RuntimeError("cloned adapter file coverage changed")
         return adapter
 
