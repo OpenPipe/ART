@@ -1037,12 +1037,15 @@ def encode_inline_operation_result(
         # encoded JSON size, not a semantic decision based on requested outputs.
         if 4 * ((logprob_bytes + 2) // 3) > MAX_INLINE_OPERATION_RESULT_BYTES:
             return None
-        token_id_json_bytes = sum(
-            sum(len(str(token_id)) + 1 for token_id in leaf.token_ids)
+        minimum_token_id_json_bytes = sum(
+            max(0, 2 * len(leaf.token_ids) - 1)
             for shape in result.packing.group_shapes
             for leaf in shape.leaves
         )
-        if token_id_json_bytes > MAX_INLINE_OPERATION_RESULT_BYTES:
+        # Each JSON integer needs at least one byte and adjacent values need a
+        # comma. Omit brackets and field metadata to keep this a strict lower
+        # bound; borderline values still take the exact serialization path.
+        if minimum_token_id_json_bytes > MAX_INLINE_OPERATION_RESULT_BYTES:
             return None
     inline = InlineOperationResult(result=result.model_dump(mode="json"))
     payload = inline.model_dump_json().encode()
