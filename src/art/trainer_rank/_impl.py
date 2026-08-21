@@ -19,7 +19,7 @@ import math
 import os
 from pathlib import Path
 import threading
-from types import TracebackType
+from types import MappingProxyType, TracebackType
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -35,7 +35,7 @@ from typing import (
 )
 import weakref
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, SkipValidation
 import torch
 from torch.autograd.function import FunctionCtx
 import torch.distributed as dist
@@ -753,6 +753,71 @@ class _DynamicOptimizer:
     master_params: tuple[torch.nn.Parameter, ...]
 
 
+class _OptimizerResidencyDescriptor(BaseModel):
+    """Stable structure and tensor order for one exact slot optimizer."""
+
+    model_config = ConfigDict(arbitrary_types_allowed=True, frozen=True)
+
+    optimizer: SkipValidation[torch.optim.Optimizer]
+    optimizer_state: SkipValidation[object]
+    live_optimizer_state: SkipValidation[object]
+    parameter_group: SkipValidation[dict[str, object]]
+    parameter_group_params: SkipValidation[object]
+    parameter_order: tuple[object, ...]
+    state_entries: int
+    layout: SkipValidation[TrainerRankOptimizerLayout]
+    master_params: SkipValidation[tuple[torch.nn.Parameter, ...]]
+    slot_params: SkipValidation[tuple[torch.nn.Parameter, ...]]
+    padding_masks: SkipValidation[tuple[torch.Tensor, ...] | None]
+    residency: SkipValidation[TrainerRankResidencyTensors]
+
+    def matches(self, slot: _CheckpointSlot) -> bool:
+        dynamic = slot.optimizer
+        return bool(
+            dynamic is not None
+            and dynamic.optimizer is self.optimizer
+            and dynamic.master_params is self.master_params
+            and slot.params is self.slot_params
+            and slot.optimizer_padding_masks is self.padding_masks
+            and self.optimizer.state is self.live_optimizer_state
+            and len(self.optimizer.state) == self.state_entries
+            and len(self.optimizer.param_groups) == 1
+            and self.optimizer.param_groups[0] is self.parameter_group
+            and self.parameter_group.get("params") is self.parameter_group_params
+        )
+
+    def snapshot_source(self) -> TrainerRankOptimizerSnapshotSource:
+        metadata = {
+            key: value for key, value in self.parameter_group.items() if key != "params"
+        }
+        if _nested_tensors(metadata):
+            raise TrainerRankSlotStateError(
+                "Optimizer parameter-group metadata must not contain tensors."
+            )
+        optimizer = {
+            "state": self.optimizer_state,
+            "param_groups": [
+                {
+                    **cast(dict[str, object], _copy_nested_state(metadata)),
+                    "params": self.parameter_order,
+                }
+            ],
+        }
+        state = cast(
+            TrainerRankOptimizerState,
+            {
+                "format_version": 1,
+                "layout": self.layout,
+                "master_params": self.master_params,
+                "optimizer": optimizer,
+            },
+        )
+        return TrainerRankOptimizerSnapshotSource.model_construct(
+            state=state,
+            tensors=self.residency.optimizer,
+        )
+
+
 @dataclass(frozen=True)
 class _CustomObject:
     kind: Literal["module", "parameter", "buffer"]
@@ -769,6 +834,10 @@ class _CheckpointSlot:
     custom: dict[str, _CustomObject] = dataclass_field(default_factory=dict)
     custom_payload: "PreparedCustomPayload | None" = None
     optimizer_padding_masks: tuple[torch.Tensor, ...] | None = None
+    optimizer_residency_descriptor: _OptimizerResidencyDescriptor | None = None
+
+    def invalidate_optimizer_residency(self) -> None:
+        self.optimizer_residency_descriptor = None
 
 
 @dataclass(frozen=True)
@@ -1139,6 +1208,7 @@ class TrainerRank:
         slot.custom[name] = custom
         slot.params += new_params
         slot.optimizer_padding_masks = None
+        slot.invalidate_optimizer_residency()
         tracker.active = True
         return custom.value
 
@@ -1519,32 +1589,19 @@ class TrainerRank:
     def checkpoint_slot_optimizer_snapshot_sources(
         self, name: str
     ) -> TrainerRankOptimizerState | None:
-        slot = self._checkpoint_slots.get(name)
-        if slot is None:
-            raise ValueError(f"Unknown checkpoint slot: {name!r}")
-        if slot.optimizer is None:
+        descriptor = self._checkpoint_slot_optimizer_residency_descriptor(name)
+        if descriptor is None:
             return None
-        return {
-            "format_version": 1,
-            "layout": self._dynamic_optimizer_layout(name),
-            "master_params": slot.optimizer.master_params,
-            "optimizer": cast(dict[str, object], slot.optimizer.optimizer.state_dict()),
-        }
+        return cast(
+            TrainerRankOptimizerState,
+            _copy_nested_state(descriptor.snapshot_source().state),
+        )
 
     def checkpoint_slot_optimizer_residency_source(
         self, name: str
     ) -> TrainerRankOptimizerSnapshotSource | None:
-        state = self.checkpoint_slot_optimizer_snapshot_sources(name)
-        if state is None:
-            return None
-        tensors = self.checkpoint_slot_residency_tensors(name).optimizer
-        return TrainerRankOptimizerSnapshotSource(
-            state=cast(
-                TrainerRankOptimizerState,
-                _copy_nested_state(state),
-            ),
-            tensors=tensors,
-        )
+        descriptor = self._checkpoint_slot_optimizer_residency_descriptor(name)
+        return None if descriptor is None else descriptor.snapshot_source()
 
     def checkpoint_slot_optimizer_state(
         self, name: str
@@ -1561,7 +1618,12 @@ class TrainerRank:
         }
 
     def checkpoint_slot_optimizer_layout(self, name: str) -> TrainerRankOptimizerLayout:
-        self.checkpoint_slot_parameters(name)
+        slot = self._checkpoint_slots.get(name)
+        if slot is None:
+            raise ValueError(f"Unknown checkpoint slot: {name!r}")
+        descriptor = slot.optimizer_residency_descriptor
+        if descriptor is not None and descriptor.matches(slot):
+            return descriptor.layout
         return self._dynamic_optimizer_layout(name)
 
     def prepared_checkpoint_slot_optimizer_layout(
@@ -1576,6 +1638,10 @@ class TrainerRank:
         slot = self._checkpoint_slots.get(name)
         if slot is None:
             raise ValueError(f"Unknown checkpoint slot: {name!r}")
+        if slot.optimizer is not None:
+            descriptor = self._checkpoint_slot_optimizer_residency_descriptor(name)
+            assert descriptor is not None
+            return descriptor.residency
         weights = _unique_tensors(
             (
                 *slot.params,
@@ -1586,17 +1652,114 @@ class TrainerRank:
                 ),
             )
         )
+        return TrainerRankResidencyTensors(weights=weights, optimizer=())
+
+    def _checkpoint_slot_optimizer_residency_descriptor(
+        self, name: str
+    ) -> _OptimizerResidencyDescriptor | None:
+        slot = self._checkpoint_slots.get(name)
+        if slot is None:
+            raise ValueError(f"Unknown checkpoint slot: {name!r}")
         dynamic = slot.optimizer
-        optimizer = ()
-        if dynamic is not None:
-            optimizer = _unique_tensors(
-                (
-                    *dynamic.master_params,
-                    *_nested_tensors(dynamic.optimizer.state),
-                    *(slot.optimizer_padding_masks or ()),
+        if dynamic is None:
+            slot.invalidate_optimizer_residency()
+            return None
+        cached = slot.optimizer_residency_descriptor
+        if cached is not None and cached.matches(slot):
+            return cached
+
+        optimizer = dynamic.optimizer
+        if len(optimizer.param_groups) != 1:
+            raise TrainerRankSlotStateError(
+                "Optimizer residency requires exactly one parameter group."
+            )
+        parameter_group = optimizer.param_groups[0]
+        group_params = parameter_group.get("params")
+        if (
+            not isinstance(group_params, Sequence)
+            or len(group_params) != len(dynamic.master_params)
+            or any(
+                actual is not expected
+                for actual, expected in zip(
+                    group_params, dynamic.master_params, strict=True
                 )
             )
-        return TrainerRankResidencyTensors(weights=weights, optimizer=optimizer)
+        ):
+            raise TrainerRankSlotStateError(
+                "Optimizer residency parameter order differs from its master tensors."
+            )
+
+        packed = optimizer.state_dict()
+        packed_state = packed.get("state")
+        packed_groups = packed.get("param_groups")
+        if not isinstance(packed_state, Mapping) or not isinstance(
+            packed_groups, Sequence
+        ):
+            raise TrainerRankSlotStateError("Optimizer residency state is malformed.")
+        if len(packed_groups) != 1 or not isinstance(packed_groups[0], Mapping):
+            raise TrainerRankSlotStateError(
+                "Optimizer residency state requires exactly one parameter group."
+            )
+        parameter_order = packed_groups[0].get("params")
+        if not isinstance(parameter_order, Sequence) or len(parameter_order) != len(
+            dynamic.master_params
+        ):
+            raise TrainerRankSlotStateError(
+                "Optimizer residency state has an invalid parameter binding order."
+            )
+        if not _optimizer_state_has_stable_tensor_leaves(packed_state):
+            raise TrainerRankSlotStateError(
+                "Optimizer residency requires tensor-valued per-parameter state."
+            )
+        live_state_tensors = _nested_tensors(optimizer.state)
+        live_state_tensor_ids = {id(tensor) for tensor in live_state_tensors}
+        if any(
+            id(tensor) not in live_state_tensor_ids
+            for tensor in _nested_tensors(packed_state)
+        ):
+            raise TrainerRankSlotStateError(
+                "Optimizer residency state must preserve live tensor identity."
+            )
+
+        weights = _unique_tensors(
+            (
+                *slot.params,
+                *(
+                    tensor
+                    for custom in slot.custom.values()
+                    for tensor in _custom_residency_tensors(custom)
+                ),
+            )
+        )
+        optimizer_tensors = _unique_tensors(
+            (
+                *dynamic.master_params,
+                *live_state_tensors,
+                *(slot.optimizer_padding_masks or ()),
+            )
+        )
+        descriptor = _OptimizerResidencyDescriptor(
+            optimizer=optimizer,
+            optimizer_state=_freeze_nested_state(packed_state),
+            live_optimizer_state=optimizer.state,
+            parameter_group=parameter_group,
+            parameter_group_params=group_params,
+            parameter_order=tuple(parameter_order),
+            state_entries=len(optimizer.state),
+            layout=cast(
+                TrainerRankOptimizerLayout,
+                _freeze_nested_state(self._dynamic_optimizer_layout(name)),
+            ),
+            master_params=dynamic.master_params,
+            slot_params=slot.params,
+            padding_masks=slot.optimizer_padding_masks,
+            residency=TrainerRankResidencyTensors(
+                weights=weights,
+                optimizer=optimizer_tensors,
+            ),
+        )
+        slot.optimizer_residency_descriptor = descriptor
+        return descriptor
 
     def prepare_checkpoint_slot_optimizer_for_residency(
         self,
@@ -1775,19 +1938,22 @@ class TrainerRank:
         slot = self._checkpoint_slots[name]
         slot.optimizer = _DynamicOptimizer(optimizer, state.master_params)
         slot.optimizer_padding_masks = state.padding_masks
+        slot.invalidate_optimizer_residency()
         self._zero_dynamic_optimizer_padding(name, slot.optimizer)
 
     def restore_checkpoint_slot_optimizer_state(
         self, name: str, state: TrainerRankOptimizerState
     ) -> None:
         self.checkpoint_slot_parameters(name)
-        self._checkpoint_slots[name].optimizer = self._restore_dynamic_optimizer(
-            name, state
-        )
+        slot = self._checkpoint_slots[name]
+        slot.optimizer = self._restore_dynamic_optimizer(name, state)
+        slot.invalidate_optimizer_residency()
 
     def clear_checkpoint_slot_optimizer(self, name: str) -> None:
         self.checkpoint_slot_parameters(name)
-        self._checkpoint_slots[name].optimizer = None
+        slot = self._checkpoint_slots[name]
+        slot.optimizer = None
+        slot.invalidate_optimizer_residency()
 
     def unload_checkpoint_slot(self, name: str) -> int:
         if self._slot_stack:
@@ -2694,6 +2860,7 @@ class TrainerRank:
         if dynamic is None:
             dynamic = self._new_dynamic_optimizer(name, params)
             slot.optimizer = dynamic
+            slot.invalidate_optimizer_residency()
             return dynamic
         for group in dynamic.optimizer.param_groups:
             group["lr"] = params.learning_rate
@@ -2984,6 +3151,7 @@ class TrainerRank:
             else:
                 masks[index][expert].copy_(mask)
         slot.optimizer_padding_masks = masks
+        slot.invalidate_optimizer_residency()
         return masks
 
     def _reduce_dynamic_grads(
@@ -4845,6 +5013,33 @@ def _nested_tensors(value: object) -> tuple[torch.Tensor, ...]:
     if isinstance(value, Sequence) and not isinstance(value, str | bytes):
         return tuple(tensor for item in value for tensor in _nested_tensors(item))
     return ()
+
+
+def _optimizer_state_has_stable_tensor_leaves(value: object) -> bool:
+    if isinstance(value, torch.Tensor):
+        return True
+    if isinstance(value, Mapping):
+        return all(
+            _optimizer_state_has_stable_tensor_leaves(item) for item in value.values()
+        )
+    if isinstance(value, Sequence) and not isinstance(value, str | bytes):
+        return all(_optimizer_state_has_stable_tensor_leaves(item) for item in value)
+    return False
+
+
+def _freeze_nested_state(value: object) -> object:
+    if isinstance(value, torch.Tensor):
+        return value
+    if isinstance(value, Mapping):
+        return MappingProxyType(
+            {
+                _freeze_nested_state(key): _freeze_nested_state(item)
+                for key, item in value.items()
+            }
+        )
+    if isinstance(value, Sequence) and not isinstance(value, str | bytes):
+        return tuple(_freeze_nested_state(item) for item in value)
+    return deepcopy(value)
 
 
 def _copy_nested_state(value: object) -> object:
