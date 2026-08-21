@@ -35,6 +35,15 @@ from art.megatron.optimizer_state import (
     canonical_adapter_path,
     read_adapter_publication,
 )
+from art.megatron.weights.rank_sharded_lora import (
+    PreparedRankShardedLora,
+    RankShardedLoraCheckpoint,
+    RankShardedLoraRankWrite,
+    gather_rank_sharded_lora_checkpoint,
+    identify_rank_sharded_lora_owned,
+    prepare_rank_sharded_lora,
+    publish_rank_sharded_lora_checkpoint,
+)
 from art.training.contracts import TokenLogprobs
 from art.utils.lifecycle import process_shutdown_timeout
 from art.utils.safetensors import (
@@ -2615,6 +2624,9 @@ class _PreparedRankSnapshot(BaseModel):
     plan: SnapshotRankWritePlan
     adapter: _PreparedAdapterPayload | None
     distributed_adapter: Any | None = None
+    durable_adapter: OptimizerAdapter | None = None
+    rank_sharded_adapter: PreparedRankShardedLora | None = None
+    rank_sharded_checkpoint: RankShardedLoraCheckpoint | None = None
     optimizer: Any | None
     optimizer_archive: Any | None
     optimizer_identity: FileIdentity | None
@@ -3432,6 +3444,70 @@ class _GenerationPublisher:
         pending.resolve()
         return _ResolvedGeneration(lora=None, optimizer=None, prepared_tensors=None)
 
+    def _prepare_rank_sharded_durable_adapter(
+        self,
+        entry: _CachedGeneration,
+        generation: TrainerGeneration,
+        staging_adapter_path: str,
+        contexts: ExitStack,
+    ) -> tuple[
+        PreparedRankShardedLora,
+        RankShardedLoraCheckpoint,
+        RankShardedLoraRankWrite,
+        OptimizerAdapter,
+        dict[str, float],
+    ]:
+        if self._residency is None or entry.resident_lora is None:
+            raise RuntimeError("rank-sharded durability requires resident LoRA state")
+        started = time.perf_counter()
+        source = entry.resident_lora.prepared.result()
+        image = contexts.enter_context(
+            self._residency.borrow_l2(entry.resident_lora.key)
+        )
+        names = tuple(
+            tensor.name
+            for tensor in source.metadata
+            if tensor.owner_rank == int(self.runtime.rank)
+        )
+        tensors = image.tensors()
+        if len(names) != len(tensors):
+            raise RuntimeError("resident durable LoRA tensor identity changed")
+        prepared = prepare_rank_sharded_lora(
+            source.model_copy(
+                update={"tensors": dict(zip(names, tensors, strict=True))}
+            ),
+            training_session_id=generation.training_session_id,
+            generation_id=generation.generation_id,
+            step=generation.policy_step,
+        )
+        identity_started = time.perf_counter()
+        local_write = identify_rank_sharded_lora_owned(prepared)
+        checkpoint = gather_rank_sharded_lora_checkpoint(
+            prepared,
+            local_write,
+            group=self.runtime.publication_metadata_group,
+        )
+        identity_s = time.perf_counter() - identity_started
+        adapter = OptimizerAdapter(
+            identity=str(
+                canonical_adapter_path(
+                    staging_adapter_path, generation.policy_step
+                )
+            ),
+            training_session_id=generation.training_session_id,
+            step=generation.policy_step,
+            generation_id=generation.generation_id,
+            files=checkpoint.files,
+        )
+        return prepared, checkpoint, local_write, adapter, {
+            "snapshot_rank_sharded_prepare_s": time.perf_counter() - started,
+            "snapshot_rank_sharded_identity_s": identity_s,
+            "snapshot_rank_sharded_local_bytes": float(
+                sum(shard.size_bytes for shard in local_write.shards)
+            ),
+            "snapshot_rank_sharded_local_shards": float(len(local_write.shards)),
+        }
+
     def prepare(
         self,
         *,
@@ -3467,11 +3543,39 @@ class _GenerationPublisher:
         contexts = ExitStack()
         try:
             rank = int(self.runtime.rank)
-            adapter = existing_adapter if rank == 0 else None
+            durable_prepared = None
+            durable_checkpoint = None
+            durable_adapter = None
+            durable_write = None
+            durable_metrics: dict[str, float] = {}
+            rank_sharded_durable = (
+                existing_adapter is None
+                and staging_adapter_path is not None
+                and entry.resident_lora is not None
+            )
+            if rank_sharded_durable:
+                (
+                    durable_prepared,
+                    durable_checkpoint,
+                    durable_write,
+                    durable_adapter,
+                    durable_metrics,
+                ) = self._prepare_rank_sharded_durable_adapter(
+                    entry, generation, staging_adapter_path, contexts
+                )
+            adapter = (
+                durable_adapter if rank == 0 and durable_adapter is not None
+                else existing_adapter if rank == 0
+                else None
+            )
             transport_adapter = None
             adapter_payload = None
             wants_adapter_payload = (
-                (existing_adapter is None and staging_adapter_path is not None)
+                (
+                    existing_adapter is None
+                    and staging_adapter_path is not None
+                    and not rank_sharded_durable
+                )
                 or bool(publication_targets)
                 or adapter_object_target is not None
             )
@@ -3494,7 +3598,7 @@ class _GenerationPublisher:
                     }
                 )
                 exact_model_identity = (
-                    staging_adapter_path is not None
+                    (staging_adapter_path is not None and not rank_sharded_durable)
                     or bool(publication_targets)
                     or (
                         adapter_object_target is not None
@@ -3596,6 +3700,7 @@ class _GenerationPublisher:
                 generation=generation,
                 adapter=adapter,
                 transport_adapter=transport_adapter,
+                durable_adapter_write=durable_write,
                 optimizer_shard=shard,
                 runtime_sha256=runtime_sha256,
                 topology=topology,
@@ -3609,6 +3714,9 @@ class _GenerationPublisher:
                 plan=rank_plan,
                 adapter=adapter_payload,
                 distributed_adapter=None,
+                durable_adapter=durable_adapter,
+                rank_sharded_adapter=durable_prepared,
+                rank_sharded_checkpoint=durable_checkpoint,
                 optimizer=optimizer,
                 optimizer_archive=optimizer_archive,
                 optimizer_identity=optimizer_identity,
@@ -3632,7 +3740,10 @@ class _GenerationPublisher:
         except BaseException:
             contexts.close()
             raise
-        return rank_plan, {"snapshot_prepare_s": time.perf_counter() - started}
+        return rank_plan, {
+            "snapshot_prepare_s": time.perf_counter() - started,
+            **durable_metrics,
+        }
 
     def authorize(
         self,
@@ -3699,7 +3810,11 @@ class _GenerationPublisher:
     @staticmethod
     def _requires_durable_write(prepared: _PreparedRankSnapshot) -> bool:
         return prepared.optimizer is not None or (
-            prepared.adapter is not None and prepared.staging_adapter_path is not None
+            prepared.staging_adapter_path is not None
+            and (
+                prepared.adapter is not None
+                or prepared.rank_sharded_adapter is not None
+            )
         )
 
     def _start_durability(
@@ -4545,7 +4660,33 @@ class _GenerationPublisher:
         rank = int(self.runtime.rank)
         generation = prepared.plan.generation
         adapter = prepared.plan.adapter
-        if rank == 0:
+        rank_sharded = prepared.rank_sharded_adapter
+        if rank_sharded is not None:
+            checkpoint = prepared.rank_sharded_checkpoint
+            local_write = prepared.plan.durable_adapter_write
+            durable_adapter = prepared.durable_adapter
+            staging = prepared.staging_adapter_path
+            if (
+                checkpoint is None
+                or local_write is None
+                or durable_adapter is None
+                or staging is None
+            ):
+                raise RuntimeError("rank-sharded adapter persistence is incomplete")
+            published = publish_rank_sharded_lora_checkpoint(
+                rank_sharded,
+                checkpoint,
+                local_write,
+                staging,
+                durable_adapter,
+                group=self.runtime.publication_metadata_group,
+            )
+            adapter = published if rank == 0 else None
+            if rank == 0 and adapter != prepared.plan.adapter:
+                raise RuntimeError(
+                    "rank-sharded adapter differs from its authorized plan"
+                )
+        elif rank == 0:
             payload = prepared.adapter
             if payload is not None and prepared.staging_adapter_path is not None:
                 if adapter is None:

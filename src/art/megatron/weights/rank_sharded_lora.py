@@ -7,12 +7,13 @@ import math
 import os
 from pathlib import Path, PurePosixPath
 import re
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Iterator, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 import torch
 
 if TYPE_CHECKING:
+    from art.megatron.optimizer_state import OptimizerAdapter
     from art.megatron.weights.rank_distributed_lora_publish import (
         PreparedRankDistributedLoraSource,
     )
@@ -249,39 +250,56 @@ def prepare_rank_sharded_lora(
 def write_rank_sharded_lora_owned(
     prepared: PreparedRankShardedLora,
     staging_path: str | Path,
+    *,
+    expected: RankShardedLoraRankWrite | None = None,
 ) -> RankShardedLoraRankWrite:
     root = Path(staging_path).absolute()
     shard_root = root / "shards"
     shard_root.mkdir(parents=True, exist_ok=True)
-    metadata = {tensor.name: tensor for tensor in prepared.tensors}
-    buffers = {
-        name: _validated_tensor_buffer(tensor, metadata[name])
-        for name, tensor in prepared.local_tensors.items()
-    }
+    expected = expected or identify_rank_sharded_lora_owned(prepared)
+    _validate_rank_write(prepared, expected)
+    buffers = _rank_sharded_buffers(prepared)
     written: list[RankShardedLoraShard] = []
     for shard in prepared.shards:
         if shard.owner_rank != prepared.rank:
             continue
         path = root / shard.path
-        digest = hashlib.sha256()
         size = 0
         with path.open("xb", buffering=0) as output:
-            for segment in shard.segments:
-                source = (
-                    memoryview(prepared.safetensors_header)
-                    if segment.source == "safetensors_header"
-                    else buffers[segment.tensor_name or ""]
-                )
-                chunk = source[
-                    segment.source_offset : segment.source_offset + segment.size_bytes
-                ]
+            for chunk in _owned_shard_chunks(prepared, shard, buffers):
                 _write_all(output.fileno(), chunk)
-                digest.update(chunk)
                 size += chunk.nbytes
             os.fsync(output.fileno())
         if size != shard.size_bytes:
             raise RuntimeError(f"rank-sharded LoRA shard write was short: {path}")
-        written.append(
+        written.append(expected.shards[len(written)])
+    _fsync_directory(shard_root)
+    result = RankShardedLoraRankWrite(
+        rank=prepared.rank,
+        plan_sha256=prepared.plan_sha256,
+        shards=tuple(written),
+    )
+    if result != expected:
+        raise RuntimeError("rank-sharded LoRA write differs from its identity")
+    return result
+
+
+def identify_rank_sharded_lora_owned(
+    prepared: PreparedRankShardedLora,
+) -> RankShardedLoraRankWrite:
+    buffers = _rank_sharded_buffers(prepared)
+    shards = []
+    for shard in prepared.shards:
+        if shard.owner_rank != prepared.rank:
+            continue
+        digest = hashlib.sha256()
+        size = 0
+        for chunk in _owned_shard_chunks(prepared, shard, buffers):
+            digest.update(chunk)
+            size += chunk.nbytes
+        if size != shard.size_bytes:
+            raise RuntimeError("rank-sharded LoRA identity has incomplete coverage")
+        shards.append(
             RankShardedLoraShard(
                 path=shard.path,
                 logical_offset=shard.logical_offset,
@@ -290,12 +308,13 @@ def write_rank_sharded_lora_owned(
                 sha256=digest.hexdigest(),
             )
         )
-    _fsync_directory(shard_root)
-    return RankShardedLoraRankWrite(
+    result = RankShardedLoraRankWrite(
         rank=prepared.rank,
         plan_sha256=prepared.plan_sha256,
-        shards=tuple(written),
+        shards=tuple(shards),
     )
+    _validate_rank_write(prepared, result)
+    return result
 
 
 def gather_rank_sharded_lora_checkpoint(
@@ -359,7 +378,10 @@ def write_rank_sharded_lora_checkpoint(
     local_write: RankShardedLoraRankWrite | None = None
     local_error: BaseException | None = None
     try:
-        local_write = write_rank_sharded_lora_owned(prepared, staging_path)
+        local_write = identify_rank_sharded_lora_owned(prepared)
+        write_rank_sharded_lora_owned(
+            prepared, staging_path, expected=local_write
+        )
     except BaseException as error:
         local_error = error
     gathered = _all_gather(
@@ -386,6 +408,149 @@ def write_rank_sharded_lora_checkpoint(
     )
     _raise_gathered_errors(completions, "rank-sharded LoRA metadata write failed")
     return checkpoint
+
+
+def publish_rank_sharded_lora_checkpoint(
+    prepared: PreparedRankShardedLora,
+    checkpoint: RankShardedLoraCheckpoint,
+    local_write: RankShardedLoraRankWrite,
+    staging_path: str | Path,
+    expected_adapter: OptimizerAdapter,
+    *,
+    group: Any | None = None,
+) -> OptimizerAdapter:
+    """Commit one exact rank-owned checkpoint without global tensor materialization."""
+    from art.megatron.optimizer_state import (
+        OptimizerAdapter,
+        adapter_publication_transaction,
+        canonical_adapter_path,
+        publish_adapter_checkpoint,
+    )
+
+    _validate_rank_write(prepared, local_write)
+    if (
+        checkpoint.files != rank_sharded_lora_checkpoint_files(checkpoint.manifest)
+        or expected_adapter.identity
+        != str(canonical_adapter_path(staging_path, prepared.step))
+        or expected_adapter.training_session_id != prepared.training_session_id
+        or expected_adapter.generation_id != prepared.generation_id
+        or expected_adapter.step != prepared.step
+        or expected_adapter.files != checkpoint.files
+    ):
+        raise RuntimeError("rank-sharded LoRA publication differs from its plan")
+
+    transaction = None
+    existing = None
+    enter_error: BaseException | None = None
+    if prepared.rank == prepared.coordinator_rank:
+        try:
+            transaction = adapter_publication_transaction(
+                staging_path,
+                step=prepared.step,
+                training_session_id=prepared.training_session_id,
+                generation_id=prepared.generation_id,
+            )
+            _, existing = transaction.__enter__()
+        except BaseException as error:
+            transaction = None
+            enter_error = error
+    entered = _all_gather(
+        prepared,
+        {
+            "rank": prepared.rank,
+            "error": _error_text(enter_error),
+            "existing": (
+                None if existing is None else existing.model_dump(mode="json")
+            ),
+        },
+        group,
+    )
+    _raise_gathered_errors(entered, "rank-sharded LoRA transaction failed")
+    existing_values = [item["existing"] for item in entered if item["existing"]]
+    if existing_values:
+        if len(existing_values) != 1:
+            raise RuntimeError("rank-sharded LoRA transaction has multiple owners")
+        published = OptimizerAdapter.model_validate(existing_values[0])
+        finish_error = _finish_rank_sharded_transaction(transaction, None)
+        finished = _all_gather(
+            prepared,
+            {
+                "rank": prepared.rank,
+                "error": _error_text(finish_error),
+                "adapter": (
+                    published.model_dump(mode="json")
+                    if prepared.rank == prepared.coordinator_rank
+                    else None
+                ),
+            },
+            group,
+        )
+        _raise_gathered_errors(finished, "rank-sharded LoRA transaction failed")
+        if published != expected_adapter:
+            raise RuntimeError("existing rank-sharded LoRA differs from its plan")
+        return published
+
+    write_error: BaseException | None = None
+    try:
+        write_rank_sharded_lora_owned(
+            prepared, staging_path, expected=local_write
+        )
+    except BaseException as error:
+        write_error = error
+    writes = _all_gather(
+        prepared,
+        {"rank": prepared.rank, "error": _error_text(write_error)},
+        group,
+    )
+    gathered_write_error = _gathered_error(
+        writes, "rank-sharded LoRA shard write failed"
+    )
+
+    publish_error: BaseException | None = gathered_write_error
+    published: OptimizerAdapter | None = None
+    if prepared.rank == prepared.coordinator_rank and publish_error is None:
+        try:
+            write_rank_sharded_lora_metadata(prepared, checkpoint, staging_path)
+            published = publish_adapter_checkpoint(
+                staging_path,
+                step=prepared.step,
+                files=checkpoint.files,
+                training_session_id=prepared.training_session_id,
+                generation_id=prepared.generation_id,
+            )
+            if published != expected_adapter:
+                raise RuntimeError(
+                    "rank-sharded LoRA publication changed its identity"
+                )
+        except BaseException as error:
+            publish_error = error
+    finish_error = _finish_rank_sharded_transaction(transaction, publish_error)
+    if publish_error is None:
+        publish_error = finish_error
+    elif finish_error is not None:
+        publish_error.add_note(
+            "rank-sharded transaction cleanup also failed: "
+            f"{type(finish_error).__name__}: {finish_error}"
+        )
+    finished = _all_gather(
+        prepared,
+        {
+            "rank": prepared.rank,
+            "error": _error_text(publish_error),
+            "adapter": (
+                None if published is None else published.model_dump(mode="json")
+            ),
+        },
+        group,
+    )
+    _raise_gathered_errors(finished, "rank-sharded LoRA publication failed")
+    adapters = [item["adapter"] for item in finished if item["adapter"]]
+    if len(adapters) != 1:
+        raise RuntimeError("rank-sharded LoRA publication has no coordinator result")
+    result = OptimizerAdapter.model_validate(adapters[0])
+    if result != expected_adapter:
+        raise RuntimeError("rank-sharded LoRA publication differs from its plan")
+    return result
 
 
 def encode_rank_sharded_lora_manifest(manifest: RankShardedLoraManifest) -> bytes:
@@ -789,6 +954,85 @@ def _checkpoint_from_shards(
     )
 
 
+def _validate_rank_write(
+    prepared: PreparedRankShardedLora,
+    write: RankShardedLoraRankWrite,
+) -> None:
+    expected = tuple(
+        (
+            shard.path,
+            shard.logical_offset,
+            shard.size_bytes,
+            shard.owner_rank,
+        )
+        for shard in prepared.shards
+        if shard.owner_rank == prepared.rank
+    )
+    actual = tuple(
+        (shard.path, shard.logical_offset, shard.size_bytes, shard.owner_rank)
+        for shard in write.shards
+    )
+    if (
+        write.rank != prepared.rank
+        or write.plan_sha256 != prepared.plan_sha256
+        or actual != expected
+    ):
+        raise RuntimeError("rank-sharded LoRA rank identity differs from its plan")
+
+
+def _owned_shard_chunks(
+    prepared: PreparedRankShardedLora,
+    shard: RankShardedLoraPlannedShard,
+    buffers: dict[str, memoryview],
+) -> Iterator[memoryview]:
+    if shard.owner_rank != prepared.rank:
+        raise RuntimeError("rank-sharded LoRA rank read another owner's shard")
+    for segment in shard.segments:
+        source = (
+            memoryview(prepared.safetensors_header)
+            if segment.source == "safetensors_header"
+            else buffers[segment.tensor_name or ""]
+        )
+        yield source[
+            segment.source_offset : segment.source_offset + segment.size_bytes
+        ]
+
+
+def _rank_sharded_buffers(
+    prepared: PreparedRankShardedLora,
+) -> dict[str, memoryview]:
+    metadata = {tensor.name: tensor for tensor in prepared.tensors}
+    return {
+        name: _validated_tensor_buffer(tensor, metadata[name])
+        for name, tensor in prepared.local_tensors.items()
+    }
+
+
+def _gathered_error(gathered: list[Any], message: str) -> RuntimeError | None:
+    errors = [
+        f"rank {rank}: {item.get('error')}"
+        for rank, item in enumerate(gathered)
+        if isinstance(item, dict) and item.get("error") is not None
+    ]
+    return None if not errors else RuntimeError(f"{message}: {'; '.join(errors)}")
+
+
+def _finish_rank_sharded_transaction(
+    transaction: Any | None,
+    error: BaseException | None,
+) -> BaseException | None:
+    if transaction is None:
+        return None
+    try:
+        if error is None:
+            transaction.__exit__(None, None, None)
+        else:
+            transaction.__exit__(type(error), error, error.__traceback__)
+    except BaseException as finish_error:
+        return finish_error
+    return None
+
+
 def _all_gather(
     prepared: PreparedRankShardedLora,
     value: Any,
@@ -815,13 +1059,8 @@ def _all_gather(
 
 
 def _raise_gathered_errors(gathered: list[Any], message: str) -> None:
-    errors = [
-        f"rank {rank}: {item.get('error')}"
-        for rank, item in enumerate(gathered)
-        if isinstance(item, dict) and item.get("error") is not None
-    ]
-    if errors:
-        raise RuntimeError(f"{message}: {'; '.join(errors)}")
+    if error := _gathered_error(gathered, message):
+        raise error
 
 
 def _error_text(error: BaseException | None) -> str | None:

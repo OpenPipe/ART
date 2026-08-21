@@ -16,6 +16,7 @@ from art.megatron.optimizer_state import (
     OptimizerGenerationManifest,
     OptimizerShard,
     OptimizerTopology,
+    adapter_checkpoint_file_format,
     build_optimizer_manifest,
     canonical_adapter_path,
     commit_optimizer_generation,
@@ -24,6 +25,7 @@ from art.megatron.optimizer_state import (
     optimizer_pending_generation_path,
     read_committed_optimizer_pointer,
 )
+from art.megatron.weights.rank_sharded_lora import RankShardedLoraRankWrite
 
 from .specs import TrainerGeneration
 
@@ -37,6 +39,7 @@ class SnapshotRankWritePlan(_PublicationModel):
     generation: TrainerGeneration
     adapter: OptimizerAdapter | None = None
     transport_adapter: OptimizerAdapter | None = None
+    durable_adapter_write: RankShardedLoraRankWrite | None = None
     optimizer_shard: OptimizerShard | None = None
     runtime_sha256: str | None = None
     topology: OptimizerTopology | None = None
@@ -69,14 +72,13 @@ class SnapshotRankWritePlan(_PublicationModel):
                     self.generation.generation_id,
                 ):
                     raise ValueError("adapter write plan identifies another generation")
-            if (
-                self.adapter is not None
-                and self.transport_adapter is not None
-                and self.adapter.files != self.transport_adapter.files
-            ):
-                raise ValueError("local and transport adapter bytes differ")
         elif self.adapter is not None or self.transport_adapter is not None:
             raise ValueError("only rank zero may plan adapter writes")
+        if (
+            self.durable_adapter_write is not None
+            and self.durable_adapter_write.rank != self.rank
+        ):
+            raise ValueError("durable adapter write identifies another rank")
         if self.optimizer_shard is not None and self.optimizer_shard.rank != self.rank:
             raise ValueError("optimizer write plan identifies another rank")
         return self
@@ -105,6 +107,32 @@ class SnapshotWritePlan(_PublicationModel):
             raise ValueError("logical adapter differs from rank-zero write plan")
         if self.adapter_bytes != sum(file.size_bytes for file in self.adapter.files):
             raise ValueError("adapter byte count differs from its exact files")
+        durable_writes = tuple(
+            rank.durable_adapter_write
+            for rank in ordered
+            if rank.durable_adapter_write is not None
+        )
+        if durable_writes:
+            if len(durable_writes) != len(ordered):
+                raise ValueError("durable adapter plan does not cover every rank")
+            if len({write.plan_sha256 for write in durable_writes}) != 1:
+                raise ValueError("durable adapter ranks used different plans")
+            if adapter_checkpoint_file_format(self.adapter.files) != "rank_sharded":
+                raise ValueError("rank-owned adapter writes require sharded storage")
+            shards = tuple(
+                sorted(
+                    (shard for write in durable_writes for shard in write.shards),
+                    key=lambda shard: shard.path,
+                )
+            )
+            expected = tuple(
+                (file.name, file.size_bytes, file.sha256) for file in self.adapter.files[2:]
+            )
+            actual = tuple(
+                (shard.path, shard.size_bytes, shard.sha256) for shard in shards
+            )
+            if actual != expected:
+                raise ValueError("durable adapter shard writes differ from the adapter")
         saves_optimizer = {rank.saves_optimizer for rank in ordered}
         if len(saves_optimizer) != 1:
             raise ValueError("write-plan ranks disagree on optimizer persistence")
@@ -183,6 +211,11 @@ class SnapshotWriteReservationPlan(_PublicationModel):
                 canonical_adapter_path(staging, generation.policy_step)
             ):
                 raise ValueError("local adapter target differs from its snapshot plan")
+            if (
+                adapter_checkpoint_file_format(local.files) == "rank_sharded"
+                and any(rank.durable_adapter_write is None for rank in self.snapshot.ranks)
+            ):
+                raise ValueError("rank-sharded adapter target has no rank-owned writes")
         if (self.targets.optimizer_state_path is None) != (
             self.snapshot.optimizer_manifest is None
         ):
