@@ -284,11 +284,14 @@ class ParameterGradientAccumulator(BaseModel):
         if self._gradients is None:
             self._gradients = tuple(
                 torch.zeros_like(param, dtype=torch.float32)
+                if param.grad is None
+                else param.grad.detach().to(dtype=torch.float32)
                 for param in self.parameters
             )
-        for target, param in zip(self._gradients, self.parameters, strict=True):
-            if param.grad is not None:
-                target.add_(param.grad)
+        else:
+            for target, param in zip(self._gradients, self.parameters, strict=True):
+                if param.grad is not None:
+                    target.add_(param.grad)
         self._commit_record(
             operation_id,
             token_count,

@@ -128,6 +128,23 @@ def test_dynamic_accumulator_folds_resident_grads_into_stable_fp32_buffers() -> 
     assert sums.expected_global_token_count == 72
 
 
+def test_dynamic_accumulator_adopts_first_fp32_grad_storage() -> None:
+    first = torch.nn.Parameter(torch.zeros(3))
+    missing = torch.nn.Parameter(torch.zeros(2))
+    accumulator = ParameterGradientAccumulator(parameters=(first, missing))
+    first.grad = torch.arange(3, dtype=torch.float32)
+    first_storage = first.grad.data_ptr()
+
+    accumulator.record_parameters("fb", torch.tensor(1))
+
+    gradients = accumulator.residency_tensors()[1:]
+    assert gradients[0].data_ptr() == first_storage
+    assert gradients[1].data_ptr() != missing.data_ptr()
+    assert gradients[1].dtype == torch.float32
+    torch.testing.assert_close(gradients[0], torch.arange(3, dtype=torch.float32))
+    torch.testing.assert_close(gradients[1], torch.zeros(2))
+
+
 def test_rejected_resident_gradient_record_does_not_mutate_accumulator() -> None:
     parameter = torch.nn.Parameter(torch.zeros(2))
     accumulator = ParameterGradientAccumulator(parameters=(parameter,))
