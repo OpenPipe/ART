@@ -35,7 +35,7 @@ _TRAINER_PACKAGES = (
     "transformers",
     "triton",
 )
-_RUNTIME_ENV = {
+RUNTIME_ENVIRONMENT_KEYS = {
     "ART_DISABLE_MEGATRON_COMPILE",
     "ART_MEGATRON_ALLOW_UNVALIDATED_ARCH",
     "ART_MEGATRON_ENABLE_MOE_ROUTING_REPLAY",
@@ -414,7 +414,7 @@ def _runtime_environment(
     return tuple(
         sorted(
             (name, environment[name])
-            for name in _RUNTIME_ENV & environment.keys()
+            for name in RUNTIME_ENVIRONMENT_KEYS & environment.keys()
             if environment[name]
         )
     )

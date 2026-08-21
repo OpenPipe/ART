@@ -1158,6 +1158,8 @@ def _start_ssh_workers(
     spec: SshBootstrap,
     startup_timeout_s: float,
 ) -> list[_WorkerSession]:
+    from .host_admission import RUNTIME_ENVIRONMENT_KEYS
+
     workers: list[_WorkerSession] = []
     environment = os.environ.copy()
     environment.pop("ART_VIRTUAL_ENV", None)
@@ -1166,7 +1168,13 @@ def _start_ssh_workers(
         for host, address in zip(spec.hosts, spec.worker_addresses, strict=True):
             launch_id = uuid.uuid4().hex
             python_path = os.environ.get(_PROGRAM_PYTHONPATH_ENV)
-            command_prefix = ("env", f"PYTHONPATH={python_path}") if python_path else ()
+            forwarded = tuple(
+                f"{name}={os.environ[name]}"
+                for name in sorted(RUNTIME_ENVIRONMENT_KEYS & os.environ.keys())
+            )
+            if python_path:
+                forwarded += (f"PYTHONPATH={python_path}",)
+            command_prefix = ("env", *forwarded) if forwarded else ()
             command = "exec " + shlex.join(
                 (
                     *command_prefix,
