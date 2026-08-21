@@ -87,6 +87,7 @@ class RunResidencyManager:
         )
         self._futures: set[Future[Any]] = set()
         self._retirements: dict[ResidencyKey, Future[None]] = {}
+        self._l2_retains: dict[ResidencyKey, int] = {}
         self._l1_demands: set[ResidencyKey] = set()
         self._failures: list[BaseException] = []
         self._lock = RLock()
@@ -634,6 +635,30 @@ class RunResidencyManager:
                 self.ledger.unpin(key, "l2_cpu")
             self._try_retire(key)
 
+    def retain_l2(self, key: ResidencyKey) -> Future[HostTensorImage]:
+        """Keep one exact L2 image available for a deferred consumer."""
+        self._require_open()
+        with self._lock:
+            self._require_not_retiring(key)
+            self._state(key)
+            self._l2_retains[key] = self._l2_retains.get(key, 0) + 1
+        try:
+            return self.ensure_l2(key)
+        except BaseException:
+            self.release_l2(key)
+            raise
+
+    def release_l2(self, key: ResidencyKey) -> None:
+        with self._lock:
+            count = self._l2_retains.get(key, 0)
+            if count < 1:
+                raise RuntimeError("residency L2 retain is not active")
+            if count == 1:
+                self._l2_retains.pop(key)
+            else:
+                self._l2_retains[key] = count - 1
+        self._try_retire(key)
+
     def retire(self, key: ResidencyKey) -> None:
         self._require_open()
         self._retire(key)
@@ -786,6 +811,8 @@ class RunResidencyManager:
                 return
             if key in self._l1_demands:
                 return
+            if self._l2_retains.get(key, 0):
+                return
             dependencies = (
                 state.l2_future,
                 state.l3_future,
@@ -822,6 +849,8 @@ class RunResidencyManager:
         entry = self.ledger.entry(key)
         if any(entry.pin_counts.values()):
             raise RuntimeError("cannot retire a pinned residency state")
+        if self._l2_retains.get(key, 0):
+            raise RuntimeError("cannot retire a retained L2 residency state")
         if self.ledger.has_reservation(key):
             raise RuntimeError("cannot retire a state with an active transition")
         if self.ledger.has_copy(key, "l1_gpu"):
@@ -956,6 +985,7 @@ class RunResidencyManager:
             protected = (
                 protected
                 | self._retirements.keys()
+                | self._l2_retains.keys()
                 | self._l1_demands
                 | {
                     state.key
@@ -990,6 +1020,8 @@ class RunResidencyManager:
             if not self.ledger.has_copy(key, "l2_cpu"):
                 return False
             if state.l1_transition is not None or self.ledger.has_reservation(key):
+                return False
+            if self._l2_retains.get(key, 0):
                 return False
             if self.ledger.entry(key).pin_counts["l2_cpu"]:
                 return False

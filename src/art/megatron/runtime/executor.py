@@ -2646,13 +2646,19 @@ class _GenerationPublisher:
         self._residency.ensure_l2(weights_key)
         self._residency.ensure_l2(optimizer_key)
         sampler_key = weights_key.model_copy(update={"representation": "sampler"})
-        prepared = self._sampler_pool.submit(
-            self._prepare_resident_lora,
-            weights_key,
-            sampler_key,
-            export_plan,
-            adapter_config,
-        )
+        weights_l2 = self._residency.retain_l2(weights_key)
+        try:
+            prepared = self._sampler_pool.submit(
+                self._prepare_resident_lora,
+                weights_key,
+                weights_l2,
+                sampler_key,
+                export_plan,
+                adapter_config,
+            )
+        except BaseException:
+            self._residency.release_l2(weights_key)
+            raise
         resolved: Future[_ResolvedGeneration] = Future()
         resolved.set_result(
             _ResolvedGeneration(lora=None, optimizer=None, prepared_tensors=None)
@@ -2683,6 +2689,7 @@ class _GenerationPublisher:
     def _prepare_resident_lora(
         self,
         weights_key: ResidencyKey,
+        weights_l2: Future[Any],
         sampler_key: ResidencyKey,
         export_plan: Any,
         adapter_config: dict[str, Any],
@@ -2694,39 +2701,44 @@ class _GenerationPublisher:
             prepare_rank_distributed_vllm_lora_source,
         )
 
-        with self._residency.borrow_l2(weights_key) as image:
+        registered = False
+        try:
+            image = weights_l2.result()
             regular, regular_meta, packed, packed_meta = export_plan.materialize(
                 image.tensors(), owner_rank=int(self.runtime.rank)
             )
-        pending = prepare_rank_distributed_vllm_lora_source(
-            local_tensors=regular,
-            local_metadata=regular_meta,
-            local_packed_tensors=packed,
-            local_packed_metadata=packed_meta,
-            handler=self.runtime.model_support_handler,
-            adapter_config=adapter_config,
-            conversion_group_for_key=_block_for_key,
-            group=self.runtime.publication_group,
-            metadata_group=self.runtime.publication_metadata_group,
-            exchange_device=torch.device("cpu"),
-            stager=PinnedCpuSnapshotStager(reusable=True),
-        )
-        source = pending.resolve()
-        names = tuple(sorted(source.tensors))
-        self._residency.register_l2(
-            sampler_key, tuple(source.tensors[name] for name in names)
-        )
-        try:
+            pending = prepare_rank_distributed_vllm_lora_source(
+                local_tensors=regular,
+                local_metadata=regular_meta,
+                local_packed_tensors=packed,
+                local_packed_metadata=packed_meta,
+                handler=self.runtime.model_support_handler,
+                adapter_config=adapter_config,
+                conversion_group_for_key=_block_for_key,
+                group=self.runtime.publication_group,
+                metadata_group=self.runtime.publication_metadata_group,
+                exchange_device=torch.device("cpu"),
+                stager=PinnedCpuSnapshotStager(reusable=True),
+            )
+            source = pending.resolve()
+            names = tuple(sorted(source.tensors))
+            self._residency.register_l2(
+                sampler_key, tuple(source.tensors[name] for name in names)
+            )
+            registered = True
             return source.model_copy(update={"tensors": {}})
         except BaseException as error:
-            try:
-                self._residency.retire(sampler_key)
-            except BaseException as cleanup:
-                raise BaseExceptionGroup(
-                    "sampler source finalization and residency cleanup failed",
-                    [error, cleanup],
-                ) from None
+            if registered:
+                try:
+                    self._residency.retire(sampler_key)
+                except BaseException as cleanup:
+                    raise BaseExceptionGroup(
+                        "sampler source finalization and residency cleanup failed",
+                        [error, cleanup],
+                    ) from None
             raise
+        finally:
+            self._residency.release_l2(weights_key)
 
     def ensure_generation(
         self,

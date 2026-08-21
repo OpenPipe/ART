@@ -219,6 +219,25 @@ def test_retiring_an_unacquired_load_releases_transition_and_gpu_copy(
     residency.close()
 
 
+def test_deferred_l2_retain_blocks_retirement_and_eviction(tmp_path: Path) -> None:
+    residency = manager(tmp_path)
+    state = key("sampler", generation="deferred-publication")
+    tensor = torch.arange(64, dtype=torch.float32)
+    residency.register_l2(state, (tensor,))
+
+    retained = residency.retain_l2(state)
+    retirement = residency.retire_async(state)
+
+    assert torch.equal(retained.result().tensors()[0], tensor)
+    assert not retirement.done()
+    assert not residency._evict_l2(state)
+
+    residency.release_l2(state)
+    retirement.result(timeout=2)
+    assert state not in residency.keys("run")
+    residency.close()
+
+
 def test_prefetch_retains_event_without_cpu_synchronize(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
