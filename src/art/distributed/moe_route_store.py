@@ -170,21 +170,20 @@ class MoeRouteObjectBatchTransfer(_Contract):
         timeout_s: float,
     ) -> tuple[MoeRouteGroupPayload, ...]:
         objects = {value.object_id: value for group in self.groups for value in group}
+        values = iter(objects.values())
+        payloads: dict[str, memoryview] = {}
 
-        async def receive(value: MoeRouteStoredObject) -> memoryview:
-            async with slots:
-                return await asyncio.to_thread(self._receive, receiver, value)
+        async def receive() -> None:
+            for value in values:
+                async with slots:
+                    payloads[value.object_id] = await asyncio.to_thread(
+                        self._receive, receiver, value
+                    )
 
         async with asyncio.timeout(timeout_s):
-            payloads = dict(
-                zip(
-                    objects,
-                    await asyncio.gather(
-                        *(receive(value) for value in objects.values())
-                    ),
-                    strict=True,
-                )
-            )
+            async with asyncio.TaskGroup() as workers:
+                for _ in range(min(len(objects), self.store.multipart_concurrency)):
+                    workers.create_task(receive())
         return tuple(
             MoeRouteGroupPayload(
                 objects=tuple(
