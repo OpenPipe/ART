@@ -805,7 +805,7 @@ class MegatronBackend(LocalBackend):
         if len(rates) != len(batches):
             raise ValueError("SFT learning-rate schedule must match batch count")
         client = await self.training_client(cast(TrainableModel, model))
-        pending: dict[str, float] | None = None
+        rows: list[dict[str, float]] = []
         for batch, learning_rate in zip(batches, rates, strict=True):
             sequence = client.next_sequence_id
             forward = await client.forward_backward(
@@ -821,35 +821,38 @@ class MegatronBackend(LocalBackend):
                     return_token_logprobs=False,
                 )
             )
+            forward_result = await forward.result()
+            if not forward_result.produced_gradient:
+                continue
             optimizer = await client.optim_step(
                 OptimStepRequest(
                     run_id=client.run_id,
                     request_id=uuid.uuid4().hex,
-                    sequence_id=sequence + 1,
+                    sequence_id=client.next_sequence_id,
                     optimizer=AdamConfig(learning_rate=learning_rate),
                 )
             )
-            forward_result, optimizer_result = await asyncio.gather(
-                forward.result(), optimizer.result()
+            optimizer_result = await optimizer.result()
+            rows.append(
+                {
+                    **merge_gradient_step_metrics(
+                        forward_result.metrics, optimizer_result.metrics
+                    ),
+                    "data/step_num_trajectories": float(len(values)),
+                    "data/step_trainable_assistant_tokens": float(
+                        forward_result.packing.trainable_assistant_tokens
+                    ),
+                    "data/step_num_dropped_trajectories": float(
+                        forward_result.metrics.get(
+                            "data/step_num_dropped_trajectories", 0.0
+                        )
+                    ),
+                }
             )
-            if pending is not None:
-                yield pending
-            pending = {
-                **merge_gradient_step_metrics(
-                    forward_result.metrics, optimizer_result.metrics
-                ),
-                "data/step_num_trajectories": float(len(values)),
-                "data/step_trainable_assistant_tokens": float(
-                    forward_result.packing.trainable_assistant_tokens
-                ),
-                "data/step_num_dropped_trajectories": float(
-                    forward_result.metrics.get(
-                        "data/step_num_dropped_trajectories", 0.0
-                    )
-                ),
-                TRAIN_GRADIENT_STEPS_KEY: float(len(batches)),
-            }
-        assert pending is not None
+        if not rows:
+            return
+        for row in rows:
+            row[TRAIN_GRADIENT_STEPS_KEY] = float(len(rows))
         service = cast(
             Any,
             await self._get_service(cast(TrainableModel, model)),
@@ -879,11 +882,10 @@ class MegatronBackend(LocalBackend):
         sampler_result, state_result = await asyncio.gather(
             sampler.result(), state.result()
         )
-        yield {
-            **pending,
-            **sampler_result.publication_metrics,
-            **state_result.metrics,
-        }
+        rows[-1].update(sampler_result.publication_metrics)
+        rows[-1].update(state_result.metrics)
+        for row in rows:
+            yield row
 
     async def _prepare_backend_for_training(
         self,

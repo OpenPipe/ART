@@ -23,6 +23,7 @@ from art.training.contracts import (
     OperationKind,
     OptimStepRequest,
     OptimStepResult,
+    PackingOutcome,
     SamplerWeightsResult,
     SaveStateRequest,
     SaveStateResult,
@@ -300,6 +301,7 @@ class LocalMegatronTrainingClient:
         *,
         kind: OperationKind,
         execute: Any,
+        gradient_contribution: bool = True,
     ) -> TrainingOperation[Any]:
         if self._closed:
             raise RuntimeError("local training client is closed")
@@ -311,6 +313,8 @@ class LocalMegatronTrainingClient:
             return existing
         if admission.ref.operation_id in self._evicted_forward_backward_operations:
             raise RuntimeError("F/B terminal result is no longer retained")
+        if kind == "forward_backward" and not gradient_contribution:
+            self._ledger.cancel_pending_forward_backward(request.request_id, admission)
         predecessor = self._sequence_tail
         sequence_release = _SequenceReleaseGate()
         state = _OperationState()
@@ -411,7 +415,7 @@ class LocalMegatronTrainingClient:
             self._bound_operation_cache(operation)
 
         def prepare_cancel() -> None:
-            if kind == "forward_backward":
+            if kind == "forward_backward" and gradient_contribution:
                 self._ledger.cancel_pending_forward_backward(
                     request.request_id, admission
                 )
@@ -459,20 +463,54 @@ class LocalMegatronTrainingClient:
         *,
         backward: bool,
     ) -> TrainingOperation[ForwardResult | ForwardBackwardResult]:
+        tokenized_sft = None
+        tokenization_s = 0.0
+        if request.batch.kind == "sft":
+            started = time.perf_counter()
+            tokenized_sft = await asyncio.to_thread(
+                self._sft_tokenizer.tokenize,
+                self._model,
+                request.batch.trajectories,
+                assistant_turns=request.batch.assistant_turns,
+            )
+            tokenization_s = time.perf_counter() - started
+
         async def execute(
             admission: CommandAdmission,
             _own_task: Callable[[asyncio.Task[Any]], asyncio.Task[Any]],
         ) -> ForwardResult | ForwardBackwardResult:
             if request.batch.kind == "sft":
-                started = time.perf_counter()
-                tokenized = await asyncio.to_thread(
-                    self._sft_tokenizer.tokenize,
-                    self._model,
-                    request.batch.trajectories,
-                    assistant_turns=request.batch.assistant_turns,
-                )
+                assert tokenized_sft is not None
+                tokenized = tokenized_sft
                 if tokenized.num_trainable_tokens < 1:
-                    raise ValueError("supervised batch produced no trainable tokens")
+                    target_sequences = (
+                        self._service.resolve_sft_global_grad_accumulation_sequences(1)
+                    )
+                    values = {
+                        "operation_id": admission.ref.operation_id,
+                        "packing": PackingOutcome(
+                            packed_sequence_length=1,
+                            packed_sequences=0,
+                            target_packed_sequences=target_sequences,
+                            nominal_capacity_tokens=target_sequences,
+                            physical_tokens=0,
+                            non_padding_tokens=0,
+                            loss_bearing_tokens=0,
+                            trainable_assistant_tokens=0,
+                            policy_token_counts=None,
+                            group_shapes=(),
+                        ),
+                        "loss_fn_outputs": (),
+                        "metrics": {
+                            "time/step_tokenize_trajectory_groups_s": tokenization_s,
+                            "data/step_num_dropped_trajectories": float(
+                                tokenized.num_dropped_trajectories
+                            ),
+                        },
+                    }
+                    if backward:
+                        return ForwardBackwardResult(**values, produced_gradient=False)
+                    return ForwardResult(**values)
                 batch = sft_batch_data(tokenized)
                 grad_sequences = (
                     self._service.resolve_sft_global_grad_accumulation_sequences(
@@ -499,9 +537,7 @@ class LocalMegatronTrainingClient:
                         for values in raw["token_logprobs"]
                     ),
                     metrics={
-                        "time/step_tokenize_trajectory_groups_s": (
-                            time.perf_counter() - started
-                        ),
+                        "time/step_tokenize_trajectory_groups_s": tokenization_s,
                         "data/step_num_dropped_trajectories": float(
                             batch.num_dropped_trajectories
                         ),
@@ -662,6 +698,11 @@ class LocalMegatronTrainingClient:
             request,
             kind=kind,
             execute=execute,
+            gradient_contribution=not (
+                backward
+                and tokenized_sft is not None
+                and tokenized_sft.num_trainable_tokens < 1
+            ),
         )
 
     async def optim_step(
