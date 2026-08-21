@@ -2739,11 +2739,11 @@ class _GenerationPublisher:
             )
             source = pending.resolve()
             names = tuple(sorted(source.tensors))
-            self._residency.register_l2(
-                sampler_key, tuple(source.tensors[name] for name in names)
-            )
+            tensors = tuple(source.tensors[name] for name in names)
+            detached = source.model_copy(update={"tensors": {}})
+            self._residency.register_l2_working_set(((sampler_key, tensors),))
             registered = True
-            return source.model_copy(update={"tensors": {}})
+            return detached
         except BaseException as error:
             if registered:
                 try:
