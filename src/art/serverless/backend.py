@@ -141,9 +141,7 @@ class _RemotePipelineCommandContext(BaseModel):
             request_id=uuid.uuid4().hex,
             sequence_id=sequence_id,
             checkpoint_name=f"step-{step}",
-            publication=SamplerPublication(
-                mode="in_flight_lora", model_alias=self.model.name
-            ),
+            publication=SamplerPublication(mode="none"),
         )
 
     def state_request(self, step: int, sequence_id: int) -> SaveStateRequest | None:
@@ -903,9 +901,7 @@ class ServerlessBackend:
                     request_id=uuid.uuid4().hex,
                     sequence_id=sequence_id,
                     checkpoint_name=f"step-{step}",
-                    publication=SamplerPublication(
-                        mode="in_flight_lora", model_alias=model.name
-                    ),
+                    publication=SamplerPublication(mode="none"),
                 )
             )
         except BaseException as error:

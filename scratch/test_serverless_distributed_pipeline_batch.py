@@ -174,6 +174,7 @@ class _Client:
         return operation
 
     async def save_weights_for_sampler(self, request):
+        assert request.publication.mode == "none"
         operation = self._operation(request, "save_sampler")
         self.sampler_operations.append(
             (operation, request, self.projected_learner_version)
@@ -949,6 +950,20 @@ async def test_train_and_next_optimizer_do_not_wait_for_sampler_publication() ->
         "publication/sampler_step": 5.0,
     }
     await backend._drain_background()
+
+
+@pytest.mark.asyncio
+async def test_sampler_save_materializes_before_external_activation() -> None:
+    backend, model, client, sampler = _backend()
+    step = client.projected_learner_version
+
+    operation, pending = await backend._start_sampler_publication(
+        model, client, step, client.next_sequence_id
+    )
+
+    assert client.sampler_operations[-1][1].publication.mode == "none"
+    await backend._complete_sampler_publication(model, step, operation, pending)
+    assert sampler.publications == ["in_flight_lora"]
 
 
 @pytest.mark.asyncio
