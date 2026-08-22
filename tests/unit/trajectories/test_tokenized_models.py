@@ -1,6 +1,8 @@
 import math
 import pickle
 
+import pytest
+
 import art
 import art.trajectories as tr
 
@@ -70,6 +72,24 @@ def test_nested_tokenized_models_nan_json_round_trip() -> None:
     assert restored_trajectory.reward == trajectory.reward
     assert restored.metrics == group.metrics
     assert restored.metadata == group.metadata
+
+
+def test_tokenized_group_skips_equality_dump_for_identical_source(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = art.Trajectory()
+    tokenized = tr.TokenizedTrajectory(**_history().model_dump(), trajectory=source)
+
+    def unexpected_dump(*_: object, **__: object) -> object:
+        raise AssertionError("identical source trajectories must not be dumped")
+
+    monkeypatch.setattr(art.Trajectory, "model_dump", unexpected_dump)
+    group = tr.TokenizedTrajectoryGroup[tr.TokenizedTrajectory](
+        trajectory_group=art.TrajectoryGroup([source]),
+        trajectories=[tokenized],
+    )
+
+    assert group.trajectories[0].trajectory is source
 
 
 def test_public_group_tokenization_nan_json_round_trip() -> None:

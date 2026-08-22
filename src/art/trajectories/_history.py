@@ -392,9 +392,7 @@ def _chat_generation_tokens(
         )
         if choice is None:
             raise ValueError("Chat choice source index is out of bounds")
-        prompt, output, _ = _chat_choice_tokens(
-            choice, exchange.response.model_dump(mode="python")
-        )
+        prompt, output, _ = _chat_choice_tokens(choice, exchange.response)
         cache[key] = prompt, output
     return cache[key]
 

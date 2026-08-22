@@ -1223,7 +1223,10 @@ class TokenizedTrajectoryGroup(_StringInterningModel, Generic[TokenizedTrajector
         for tokenized, trajectory in zip(
             self.trajectories, self.trajectory_group.trajectories, strict=True
         ):
-            if tokenized.trajectory.model_dump() != trajectory.model_dump():
+            if (
+                tokenized.trajectory is not trajectory
+                and tokenized.trajectory.model_dump() != trajectory.model_dump()
+            ):
                 raise ValueError("Tokenized trajectory does not match its source group")
             tokenized.trajectory = trajectory
             if isinstance(tokenized, TokenizedTrajectory):

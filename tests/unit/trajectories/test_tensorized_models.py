@@ -302,6 +302,27 @@ def test_tensorized_pickle_retains_sources_without_tokenized_intermediate() -> N
     assert torch.equal(restored.tokens, tensorized.tokens)
 
 
+def test_tensorized_group_skips_equality_dump_for_identical_source(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = art.Trajectory()
+    tokenized = tr.TokenizedTrajectory(
+        **_tokenized_history().model_dump(), trajectory=source
+    )
+    tensorized = tokenized.tensorize()
+
+    def unexpected_dump(*_: object, **__: object) -> object:
+        raise AssertionError("identical source trajectories must not be dumped")
+
+    monkeypatch.setattr(art.Trajectory, "model_dump", unexpected_dump)
+    group = tr.TensorizedTrajectoryGroup[tr.TensorizedTrajectory](
+        trajectory_group=art.TrajectoryGroup([source]),
+        trajectories=[tensorized],
+    )
+
+    assert group.trajectories[0].trajectory is source
+
+
 def test_tensorized_group_pydantic_and_cloudpickle_round_trips() -> None:
     cloudpickle = pytest.importorskip("cloudpickle")
     trajectory = _trajectory()

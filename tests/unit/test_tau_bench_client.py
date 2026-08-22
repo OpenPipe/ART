@@ -42,8 +42,8 @@ def test_client_reuses_connections_by_default(
 
     limits = seen["transport_kwargs"]["limits"]
     assert isinstance(limits, httpx.Limits)
-    assert limits.max_connections == 512
-    assert limits.max_keepalive_connections == 512
+    assert limits.max_connections == 100_000
+    assert limits.max_keepalive_connections == 100_000
     assert seen["transport_kwargs"]["retries"] == 2
     assert isinstance(seen["timeout"], httpx.Timeout)
 
@@ -329,8 +329,8 @@ async def test_rollout_supports_string_model_args(
         write=30,
         pool=30,
     )
-    assert http_client.limits.max_connections == 2048
-    assert http_client.limits.max_keepalive_connections == 2048
+    assert http_client.limits.max_connections == 100_000
+    assert http_client.limits.max_keepalive_connections == 100_000
 
 
 @pytest.mark.asyncio

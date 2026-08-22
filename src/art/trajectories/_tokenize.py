@@ -454,7 +454,7 @@ def _logprob_values(values: object) -> list[float]:
         return []
     result: list[float] = []
     for value in values:
-        logprob = _dump(value).get("logprob")
+        logprob = _field(value, "logprob")
         if not isinstance(logprob, (int, float)) or isinstance(logprob, bool):
             return []
         result.append(float(logprob))
@@ -473,17 +473,15 @@ def _chat_logprob_entries(choice: Choice) -> list[object]:
 def _chat_choice_output_tokens(
     choice: Choice,
 ) -> tuple[list[int] | None, list[float]]:
-    choice_data = _dump(choice)
     token_ids = _exact_token_ids(
-        choice_data.get("token_ids"),
+        _field(choice, "token_ids"),
         field="Chat Completions token_ids",
     )
     values = _chat_logprob_entries(choice)
-    message = _dump(choice.message)
     if token_ids == [] and (
         values
         or any(
-            message.get(key)
+            _field(choice.message, key)
             for key in (
                 "content",
                 "refusal",
@@ -507,12 +505,11 @@ def _chat_choice_output_tokens(
 
 
 def _chat_choice_tokens(
-    choice: Choice, response_data: dict[str, Any]
+    choice: Choice, response: object
 ) -> tuple[list[int] | None, list[int] | None, list[float]]:
-    choice_data = _dump(choice)
-    prompt = choice_data.get("prompt_token_ids")
+    prompt = _field(choice, "prompt_token_ids")
     if prompt is None:
-        prompt = response_data.get("prompt_token_ids")
+        prompt = _field(response, "prompt_token_ids")
     prompt_ids = _exact_token_ids(
         prompt,
         field="Chat Completions prompt_token_ids",
@@ -531,7 +528,7 @@ def _chat_tokens(
 ) -> tuple[list[int] | None, list[int] | None, list[float]]:
     if len(response.choices) != 1:
         raise ValueError("Trajectory tokenization requires exactly one response choice")
-    return _chat_choice_tokens(response.choices[0], _dump(response))
+    return _chat_choice_tokens(response.choices[0], response)
 
 
 def _completion_evidence(
@@ -3028,7 +3025,7 @@ def _chat_source_prompt_tokens(source: object) -> list[int] | None:
         choice = next(
             item for item in exchange.response.choices if item.index == choice_index
         )
-        prompt, _, _ = _chat_choice_tokens(choice, _dump(exchange.response))
+        prompt, _, _ = _chat_choice_tokens(choice, exchange.response)
         return prompt
     if isinstance(exchange, ResponsesExchange):
         generation_index = getattr(source, "generation_index", None)

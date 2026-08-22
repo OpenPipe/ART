@@ -20,7 +20,7 @@ from .client import Scenario, TauBenchClient, _get_default_client
 openai_clients: dict[tuple[str, str], AsyncOpenAI] = {}
 CONTEXT_TOKEN_LIMIT = 32_768
 DEFAULT_MAX_COMPLETION_TOKENS = 4096
-_POLICY_CONNECTION_LIMIT = 2048
+_POLICY_CONNECTION_LIMIT = 100_000
 _POLICY_MAX_RETRIES = 1
 _POLICY_HTTP_TIMEOUT = httpx.Timeout(connect=30, read=10 * 60, write=30, pool=30)
 

@@ -109,6 +109,20 @@ def _completion(
     )
 
 
+def test_chat_history_extracts_token_evidence_without_dumping_full_responses(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trajectory = _growing_chat_trajectory(3, exact_tokens=True)
+
+    def unexpected_dump(*_: object, **__: object) -> object:
+        raise AssertionError("chat token evidence must not dump the full response")
+
+    monkeypatch.setattr(ChatCompletion, "model_dump", unexpected_dump)
+
+    histories = trajectory.histories()
+    assert len(histories) == 1
+
+
 def _message() -> MessagesExchange:
     start, end = _times()
     return MessagesExchange(

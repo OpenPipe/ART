@@ -41,7 +41,9 @@ def _intern_strings(value: object, pool: _StringPool | None = None) -> None:
 def _intern_value(value: object, pool: _StringPool, memo: dict[int, object]) -> object:
     if isinstance(value, str):
         return pool.setdefault(value, value)
-    if isinstance(value, (bytes, bytearray, memoryview)) or value is None:
+    if value is None or isinstance(
+        value, (bytes, bytearray, memoryview, bool, int, float, complex)
+    ):
         return value
 
     value_id = id(value)
@@ -58,15 +60,6 @@ def _intern_value(value: object, pool: _StringPool, memo: dict[int, object]) -> 
             _intern_mapping(cast(dict[object, object], extra), pool, memo)
         if isinstance(value, _StringInterningModel):
             value._mark_pickle_strings_interned()
-        return value
-    if is_dataclass(value) and type(value).__module__.startswith("art.trajectories"):
-        memo[value_id] = value
-        for field in fields(value):
-            object.__setattr__(
-                value,
-                field.name,
-                _intern_value(getattr(value, field.name), pool, memo),
-            )
         return value
     if isinstance(value, dict):
         memo[value_id] = value
@@ -95,21 +88,30 @@ def _intern_value(value: object, pool: _StringPool, memo: dict[int, object]) -> 
         result = frozenset(_intern_value(item, pool, memo) for item in value)
         memo[value_id] = result
         return result
+    if is_dataclass(value) and type(value).__module__.startswith("art.trajectories"):
+        memo[value_id] = value
+        for field in fields(value):
+            object.__setattr__(
+                value,
+                field.name,
+                _intern_value(getattr(value, field.name), pool, memo),
+            )
+        return value
     return value
 
 
 def _intern_mapping(
     value: dict[object, object], pool: _StringPool, memo: dict[int, object]
 ) -> None:
-    items = [
-        (
-            _intern_value(key, pool, memo) if isinstance(key, str) else key,
-            _intern_value(item, pool, memo),
-        )
-        for key, item in value.items()
-    ]
-    value.clear()
-    value.update(items)
+    replacements: list[tuple[str, str]] = []
+    for key, item in value.items():
+        if isinstance(key, str):
+            interned = pool.setdefault(key, key)
+            if interned is not key:
+                replacements.append((key, interned))
+        value[key] = _intern_value(item, pool, memo)
+    for key, interned in replacements:
+        value[interned] = value.pop(key)
 
 
 def serialize_messages_and_choices(items: list[Any]) -> list[dict[str, Any]]:
