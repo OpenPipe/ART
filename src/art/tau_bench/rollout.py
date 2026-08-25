@@ -98,6 +98,10 @@ async def rollout(
         idle_timeout_seconds=(
             _STRING_POLICY_ENV_IDLE_TIMEOUT_SECONDS
             if isinstance(base_url_or_model, str)
+            and (
+                chat_completion_kwargs is None
+                or "timeout" not in chat_completion_kwargs
+            )
             else None
         ),
     ) as env:

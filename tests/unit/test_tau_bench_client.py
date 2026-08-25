@@ -473,6 +473,38 @@ async def test_rollout_supports_art_model_like_args() -> None:
 
 
 @pytest.mark.asyncio
+async def test_rollout_preserves_server_lease_for_explicit_policy_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rollout_module = importlib.import_module("art.tau_bench.rollout")
+    rollout_module.openai_clients.clear()
+    monkeypatch.setattr(rollout_module, "AsyncOpenAI", FakeAsyncOpenAI)
+    monkeypatch.setattr(
+        rollout_module,
+        "DefaultAsyncHttpxClient",
+        lambda **kwargs: SimpleNamespace(**kwargs),
+    )
+    monkeypatch.setattr(
+        rollout_module.httpx,
+        "AsyncHTTPTransport",
+        lambda **kwargs: SimpleNamespace(**kwargs),
+    )
+    client = FakeTauBenchClient()
+
+    await rollout_module.rollout(
+        Scenario(domain="banking_knowledge", task=Task(id="task_001")),
+        "http://model.test/v1",
+        "model-key",
+        "default",
+        client=client,
+        max_turns=1,
+        chat_completion_kwargs={"timeout": None},
+    )
+
+    assert client.create_kwargs["idle_timeout_seconds"] is None
+
+
+@pytest.mark.asyncio
 async def test_rollout_captures_two_turn_tool_exchange_with_exact_tokens() -> None:
     rollout_module = importlib.import_module("art.tau_bench.rollout")
     rollout_module.openai_clients.clear()
