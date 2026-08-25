@@ -293,6 +293,11 @@ async def test_rollout_supports_string_model_args(
         "DefaultAsyncHttpxClient",
         lambda **kwargs: SimpleNamespace(**kwargs),
     )
+    monkeypatch.setattr(
+        rollout_module.httpx,
+        "AsyncHTTPTransport",
+        lambda **kwargs: SimpleNamespace(**kwargs),
+    )
     client = FakeTauBenchClient()
     scenario = Scenario(domain="banking_knowledge", task=Task(id="task_001"))
 
@@ -324,13 +329,14 @@ async def test_rollout_supports_string_model_args(
     assert policy_client.kwargs["max_retries"] == 1
     http_client = policy_client.kwargs["http_client"]
     assert http_client.timeout == httpx.Timeout(
-        connect=30,
+        connect=10,
         read=10 * 60,
         write=30,
         pool=30,
     )
-    assert http_client.limits.max_connections == 100_000
-    assert http_client.limits.max_keepalive_connections == 100_000
+    assert http_client.transport.retries == 2
+    assert http_client.transport.limits.max_connections == 100_000
+    assert http_client.transport.limits.max_keepalive_connections == 100_000
 
 
 @pytest.mark.asyncio

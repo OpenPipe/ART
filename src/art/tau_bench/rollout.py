@@ -21,8 +21,9 @@ openai_clients: dict[tuple[str, str], AsyncOpenAI] = {}
 CONTEXT_TOKEN_LIMIT = 32_768
 DEFAULT_MAX_COMPLETION_TOKENS = 4096
 _POLICY_CONNECTION_LIMIT = 100_000
+_POLICY_CONNECT_RETRIES = 2
 _POLICY_MAX_RETRIES = 1
-_POLICY_HTTP_TIMEOUT = httpx.Timeout(connect=30, read=10 * 60, write=30, pool=30)
+_POLICY_HTTP_TIMEOUT = httpx.Timeout(connect=10, read=10 * 60, write=30, pool=30)
 
 
 @overload
@@ -248,9 +249,12 @@ def _completion_client_and_model(
             max_retries=_POLICY_MAX_RETRIES,
             http_client=DefaultAsyncHttpxClient(
                 timeout=_POLICY_HTTP_TIMEOUT,
-                limits=httpx.Limits(
-                    max_connections=_POLICY_CONNECTION_LIMIT,
-                    max_keepalive_connections=_POLICY_CONNECTION_LIMIT,
+                transport=httpx.AsyncHTTPTransport(
+                    retries=_POLICY_CONNECT_RETRIES,
+                    limits=httpx.Limits(
+                        max_connections=_POLICY_CONNECTION_LIMIT,
+                        max_keepalive_connections=_POLICY_CONNECTION_LIMIT,
+                    ),
                 ),
             ),
         )
