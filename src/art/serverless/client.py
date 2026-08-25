@@ -40,6 +40,7 @@ from .contracts import (
     MAX_CHECKPOINT_PAGE_LIMIT,
     MAX_EVENT_PAGE_LIMIT,
     MAX_OPERATION_RESULT_BYTES,
+    TRAINING_INPUT_RECLAIMING_CODE,
     ApplyCheckpointRetentionRequest,
     CancelOperationRequest,
     CheckpointAliasPage,
@@ -76,6 +77,7 @@ ResultT = TypeVar("ResultT", bound=OperationResult)
 ResponseT = TypeVar("ResponseT", bound=Contract)
 _CREATE_RUN_RESOLVE_STATUSES = frozenset({409, 429, 500, 502, 503, 504})
 _TRANSIENT_HTTP_STATUSES = frozenset({429, 502, 503, 504})
+_FORWARD_INPUT_RECLAIM_WAIT_S = 30.0
 _MAX_RETAINED_COMPLETED_OPERATIONS = 1024
 
 
@@ -293,6 +295,15 @@ def _retry_delay(attempt: int) -> float:
     return min(0.1 * 2 ** min(attempt, 4), 1.0)
 
 
+def _is_training_input_reclaim(error: BaseException) -> bool:
+    return (
+        isinstance(error, RemoteTrainingHttpError)
+        and error.status_code == 503
+        and isinstance(error.detail, Mapping)
+        and error.detail.get("code") == TRAINING_INPUT_RECLAIMING_CODE
+    )
+
+
 class RemoteTrainingServiceClient:
     """Typed HTTP transport for the Remote Training operation API."""
 
@@ -406,7 +417,10 @@ class RemoteTrainingServiceClient:
     ) -> OperationRef:
         if kind not in {"forward", "forward_backward"}:
             raise ValueError("forward submission requires a forward operation")
-        for attempt in range(self._max_retries + 1):
+        attempt = 0
+        reclaim_attempt = 0
+        reclaim_deadline: float | None = None
+        while True:
             try:
                 response = await self._send(
                     "POST",
@@ -433,13 +447,26 @@ class RemoteTrainingServiceClient:
                             f"forward submission was ambiguous: {error!r}"
                         )
                         raise
-                    if attempt == self._max_retries:
-                        raise error
-                    await asyncio.sleep(_retry_delay(attempt))
+                    if _is_training_input_reclaim(error):
+                        now = asyncio.get_running_loop().time()
+                        reclaim_deadline = reclaim_deadline or (
+                            now + _FORWARD_INPUT_RECLAIM_WAIT_S
+                        )
+                        delay = min(
+                            _retry_delay(reclaim_attempt), reclaim_deadline - now
+                        )
+                        if delay <= 0:
+                            raise error
+                        reclaim_attempt += 1
+                    else:
+                        if attempt == self._max_retries:
+                            raise error
+                        delay = _retry_delay(attempt)
+                        attempt += 1
+                    await asyncio.sleep(delay)
                     continue
                 return self._validated_forward_admission(view, kind, request)
             return OperationRef.model_validate(response.json())
-        raise AssertionError("forward admission retry loop did not terminate")
 
     @staticmethod
     def _validated_forward_admission(
@@ -1394,9 +1421,7 @@ class RemoteTrainingClient:
                     result_type,
                     preparation=preparation,
                     on_completion=self._bound_operation_cache,
-                    on_cancelled=(
-                        lambda: self._forget_forward_backward(operation_id)
-                    )
+                    on_cancelled=(lambda: self._forget_forward_backward(operation_id))
                     if kind == "forward_backward"
                     else None,
                 )
@@ -1439,8 +1464,9 @@ class RemoteTrainingClient:
         except BaseException:
             return
         empty = event.event == FORWARD_BACKWARD_PREPARED_EVENT and (
-            ForwardBackwardPreparation.model_validate(event.payload)
-            .gradient_disposition
+            ForwardBackwardPreparation.model_validate(
+                event.payload
+            ).gradient_disposition
             == "empty"
         )
         if event.event != "operation_cancelled" and not empty:

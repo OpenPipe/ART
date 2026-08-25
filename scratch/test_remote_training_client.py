@@ -95,6 +95,7 @@ class FakeService:
         self.operation_status_gets = 0
         self.fail_submit_once = True
         self.admit_before_submit_failure = False
+        self.reclaim_failures = 0
 
     def __call__(self, request: httpx.Request) -> httpx.Response:
         path = request.url.path
@@ -123,6 +124,17 @@ class FakeService:
             return httpx.Response(200, json=self.run)
         if path == "/v1/training/runs/run/forward_backward":
             self.submit_bodies.append(request.content)
+            if self.reclaim_failures:
+                self.reclaim_failures -= 1
+                return httpx.Response(
+                    503,
+                    json={
+                        "detail": {
+                            "code": "training_input_reclaiming",
+                            "message": "training input object is being reclaimed",
+                        }
+                    },
+                )
             fail = self.fail_submit_once
             self.fail_submit_once = False
             if fail and not self.admit_before_submit_failure:
@@ -724,14 +736,21 @@ async def test_cancelled_forward_is_removed_from_open_accumulation_immediately()
         await operation.result()
 
 
-@pytest.mark.parametrize("admit_before_failure", (False, True))
+@pytest.mark.parametrize(
+    ("admit_before_failure", "reclaim_failures"),
+    ((False, 0), (True, 0), (False, 4)),
+)
 @pytest.mark.asyncio
 async def test_remote_client_retries_and_preserves_command_order(
     admit_before_failure: bool,
+    reclaim_failures: int,
     monkeypatch: pytest.MonkeyPatch,
 ):
     fake = FakeService()
     fake.admit_before_submit_failure = admit_before_failure
+    fake.fail_submit_once = reclaim_failures == 0
+    fake.reclaim_failures = reclaim_failures
+    monkeypatch.setattr(client_module, "_retry_delay", lambda _attempt: 0.001)
     paths: dict[str, list[str]] = {"control": [], "transfer": []}
 
     def transport(plane: str):
@@ -752,7 +771,7 @@ async def test_remote_client_retries_and_preserves_command_order(
         base_url="http://test/v1",
         control_http_client=control_http,
         transfer_http_client=transfer_http,
-        max_retries=1,
+        max_retries=0 if reclaim_failures else 1,
     )
     client = await RemoteTrainingClient.create(
         service,
@@ -780,7 +799,9 @@ async def test_remote_client_retries_and_preserves_command_order(
     assert await forward.gradient_disposition() == "contributes"
     assert client._open_forward_backward == [forward]
     assert await client.forward_backward(request) is forward
-    assert len(fake.submit_bodies) == (1 if admit_before_failure else 2)
+    assert len(fake.submit_bodies) == (
+        reclaim_failures + 1 if reclaim_failures else 1 if admit_before_failure else 2
+    )
     assert len(set(fake.submit_bodies)) == 1
     submitted = _decode_submission(fake.submit_bodies[0])
     batch_ref = submitted.request.batch.model_dump(mode="python")
@@ -830,7 +851,7 @@ async def test_remote_client_retries_and_preserves_command_order(
     assert optimizer_result.contributing_forward_backward_operation_ids == (
         forward_operation_id,
     )
-    assert fake.operation_status_gets == 1
+    assert fake.operation_status_gets == max(1, reclaim_failures)
     assert 1 <= fake.nonempty_event_pages <= 2
     result_path = f"/v1/training/runs/run/operations/{forward_operation_id}/result"
     assert paths["control"].count(result_path) == 1

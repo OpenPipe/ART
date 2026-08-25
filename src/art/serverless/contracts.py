@@ -51,6 +51,7 @@ MAX_RL_GROUPS_PER_BATCH = 4096
 MAX_ROUTE_OBJECTS_PER_GROUP = 256
 MAX_ROUTE_SLICES_PER_OBJECT = 65536
 MAX_ROUTE_SLICES_PER_GROUP = 262144
+TRAINING_INPUT_RECLAIMING_CODE = "training_input_reclaiming"
 
 TargetModule = Annotated[str, Field(min_length=1, max_length=MAX_TARGET_MODULE_LENGTH)]
 RunMetadataKey = Annotated[
