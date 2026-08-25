@@ -14,6 +14,7 @@ TRANSIENT_STATUS_CODES = {429, 502, 503, 504}
 DEFAULT_STATUS_RETRIES = 12
 DEFAULT_RETRY_BASE_DELAY = 0.5
 DEFAULT_RETRY_MAX_DELAY = 5.0
+_HTTP_POOL_SHARDS = 64
 
 
 def _default_limits() -> httpx.Limits:
@@ -22,6 +23,57 @@ def _default_limits() -> httpx.Limits:
         max_keepalive_connections=100_000,
         keepalive_expiry=60.0,
     )
+
+
+def _shard_limit(total: int | None, shards: int, index: int) -> int | None:
+    if total is None:
+        return None
+    quotient, remainder = divmod(total, shards)
+    return quotient + (index < remainder)
+
+
+class _ShardedAsyncHTTPTransport(httpx.AsyncBaseTransport):
+    """Round-robin requests across smaller HTTP connection pools."""
+
+    def __init__(
+        self,
+        *,
+        limits: httpx.Limits,
+        retries: int,
+        shards: int = _HTTP_POOL_SHARDS,
+    ) -> None:
+        max_connections = limits.max_connections
+        shard_count = min(shards, max_connections or shards)
+        if shard_count < 1:
+            raise ValueError("HTTP transport shards must be positive")
+        self.transports = tuple(
+            httpx.AsyncHTTPTransport(
+                retries=retries,
+                limits=httpx.Limits(
+                    max_connections=_shard_limit(max_connections, shard_count, index),
+                    max_keepalive_connections=_shard_limit(
+                        limits.max_keepalive_connections, shard_count, index
+                    ),
+                    keepalive_expiry=limits.keepalive_expiry,
+                ),
+            )
+            for index in range(shard_count)
+        )
+        self._next = 0
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        transport = self.transports[self._next]
+        self._next = (self._next + 1) % len(self.transports)
+        return await transport.handle_async_request(request)
+
+    async def aclose(self) -> None:
+        await asyncio.gather(*(transport.aclose() for transport in self.transports))
+
+
+def _sharded_transport(
+    *, limits: httpx.Limits, retries: int
+) -> _ShardedAsyncHTTPTransport:
+    return _ShardedAsyncHTTPTransport(limits=limits, retries=retries)
 
 
 def _normalize_timeout(timeout: float | httpx.Timeout | None) -> httpx.Timeout | None:
@@ -141,10 +193,7 @@ class TauBenchClient:
                 base_url or os.getenv("TAU_BENCH_BASE_URL") or "http://localhost:8000"
             ),
             timeout=_normalize_timeout(timeout),
-            transport=httpx.AsyncHTTPTransport(
-                limits=limits or _default_limits(),
-                retries=2,
-            ),
+            transport=_sharded_transport(limits=limits or _default_limits(), retries=2),
         )
 
     async def close(self) -> None:

@@ -27,10 +27,11 @@ def test_client_reuses_connections_by_default(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     seen: dict[str, Any] = {}
+    transport_kwargs: list[dict[str, Any]] = []
 
     class FakeTransport:
         def __init__(self, **kwargs: Any) -> None:
-            seen["transport_kwargs"] = kwargs
+            transport_kwargs.append(kwargs)
 
     class FakeAsyncClient:
         def __init__(self, **kwargs: Any) -> None:
@@ -40,12 +41,53 @@ def test_client_reuses_connections_by_default(
     monkeypatch.setattr(client_module.httpx, "AsyncHTTPTransport", FakeTransport)
     TauBenchClient(base_url="http://tau.test", api_key="secret")
 
-    limits = seen["transport_kwargs"]["limits"]
-    assert isinstance(limits, httpx.Limits)
-    assert limits.max_connections == 100_000
-    assert limits.max_keepalive_connections == 100_000
-    assert seen["transport_kwargs"]["retries"] == 2
+    assert len(transport_kwargs) == 64
+    limits = [kwargs["limits"] for kwargs in transport_kwargs]
+    assert all(isinstance(limit, httpx.Limits) for limit in limits)
+    assert sum(limit.max_connections or 0 for limit in limits) == 100_000
+    assert sum(limit.max_keepalive_connections or 0 for limit in limits) == 100_000
+    assert {kwargs["retries"] for kwargs in transport_kwargs} == {2}
     assert isinstance(seen["timeout"], httpx.Timeout)
+
+
+@pytest.mark.asyncio
+async def test_sharded_transport_routes_round_robin_and_closes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    transports: list[Any] = []
+
+    class FakeTransport:
+        def __init__(self, **kwargs: Any) -> None:
+            self.index = len(transports)
+            self.closed = False
+            transports.append(self)
+
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200, request=request, extensions={"shard": self.index}
+            )
+
+        async def aclose(self) -> None:
+            self.closed = True
+
+    monkeypatch.setattr(client_module.httpx, "AsyncHTTPTransport", FakeTransport)
+    transport = client_module._ShardedAsyncHTTPTransport(
+        limits=httpx.Limits(
+            max_connections=100_000,
+            max_keepalive_connections=100_000,
+        ),
+        retries=2,
+    )
+    request = httpx.Request("GET", "http://tau.test")
+
+    shards = [
+        (await transport.handle_async_request(request)).extensions["shard"]
+        for _ in range(65)
+    ]
+    await transport.aclose()
+
+    assert shards == [*range(64), 0]
+    assert all(item.closed for item in transports)
 
 
 @pytest.mark.asyncio
@@ -334,9 +376,14 @@ async def test_rollout_supports_string_model_args(
         write=30,
         pool=30,
     )
-    assert http_client.transport.retries == 2
-    assert http_client.transport.limits.max_connections == 100_000
-    assert http_client.transport.limits.max_keepalive_connections == 100_000
+    transports = http_client.transport.transports
+    assert len(transports) == 64
+    assert {transport.retries for transport in transports} == {2}
+    assert sum(transport.limits.max_connections for transport in transports) == 100_000
+    assert (
+        sum(transport.limits.max_keepalive_connections for transport in transports)
+        == 100_000
+    )
 
 
 @pytest.mark.asyncio
