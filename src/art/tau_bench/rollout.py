@@ -24,6 +24,7 @@ _POLICY_CONNECTION_LIMIT = 100_000
 _POLICY_CONNECT_RETRIES = 2
 _POLICY_MAX_RETRIES = 1
 _POLICY_HTTP_TIMEOUT = httpx.Timeout(connect=10, read=10 * 60, write=30, pool=30)
+_STRING_POLICY_ENV_IDLE_TIMEOUT_SECONDS = 30 * 60
 
 
 @overload
@@ -94,6 +95,11 @@ async def rollout(
         ),
         retrieval_config=retrieval_config,
         retrieval_config_kwargs=retrieval_config_kwargs,
+        idle_timeout_seconds=(
+            _STRING_POLICY_ENV_IDLE_TIMEOUT_SECONDS
+            if isinstance(base_url_or_model, str)
+            else None
+        ),
     ) as env:
         environment_startup = time.perf_counter() - started
         chat_completion_kwargs = chat_completion_kwargs or {}

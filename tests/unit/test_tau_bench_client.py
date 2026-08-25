@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+from collections.abc import AsyncGenerator
 import importlib
 import json
 from types import SimpleNamespace
@@ -44,7 +46,7 @@ def test_client_reuses_connections_by_default(
     assert len(transport_kwargs) == 64
     limits = [kwargs["limits"] for kwargs in transport_kwargs]
     assert all(isinstance(limit, httpx.Limits) for limit in limits)
-    assert sum(limit.max_connections or 0 for limit in limits) == 100_000
+    assert {limit.max_connections for limit in limits} == {100_000}
     assert sum(limit.max_keepalive_connections or 0 for limit in limits) == 100_000
     assert {kwargs["retries"] for kwargs in transport_kwargs} == {2}
     assert isinstance(seen["timeout"], httpx.Timeout)
@@ -88,6 +90,62 @@ async def test_sharded_transport_routes_round_robin_and_closes(
 
     assert shards == [*range(64), 0]
     assert all(item.closed for item in transports)
+
+
+@pytest.mark.asyncio
+async def test_sharded_transport_does_not_strand_aggregate_capacity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeTransport:
+        def __init__(self, **kwargs: Any) -> None:
+            self.capacity = asyncio.Semaphore(kwargs["limits"].max_connections)
+
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            await self.capacity.acquire()
+
+            async def release() -> None:
+                self.capacity.release()
+
+            return httpx.Response(
+                200,
+                request=request,
+                stream=ClosingStream(release),
+            )
+
+        async def aclose(self) -> None:
+            pass
+
+    class ClosingStream(httpx.AsyncByteStream):
+        def __init__(self, close: Any) -> None:
+            self.close = close
+
+        async def __aiter__(self) -> AsyncGenerator[bytes, None]:
+            if False:
+                yield b""
+
+        async def aclose(self) -> None:
+            await self.close()
+
+    monkeypatch.setattr(client_module.httpx, "AsyncHTTPTransport", FakeTransport)
+    transport = client_module._ShardedAsyncHTTPTransport(
+        limits=httpx.Limits(max_connections=2, max_keepalive_connections=2),
+        retries=0,
+        shards=2,
+    )
+    request = httpx.Request(
+        "GET",
+        "http://tau.test",
+        extensions={"timeout": {"pool": 0.1}},
+    )
+
+    slow = await transport.handle_async_request(request)
+    completed = await transport.handle_async_request(request)
+    await completed.aclose()
+    replacement = await transport.handle_async_request(request)
+
+    await replacement.aclose()
+    await slow.aclose()
+    await transport.aclose()
 
 
 @pytest.mark.asyncio
@@ -364,6 +422,7 @@ async def test_rollout_supports_string_model_args(
     assert trajectory.metrics["tokens/completion"] == 5
     assert client.deleted == ["env-1"]
     assert client.create_kwargs["user_llm"] == "gpt-4.1-2025-04-14"
+    assert client.create_kwargs["idle_timeout_seconds"] == 30 * 60
     policy_client: Any = rollout_module.openai_clients[
         ("http://model.test/v1", "model-key")
     ]
@@ -379,7 +438,7 @@ async def test_rollout_supports_string_model_args(
     transports = http_client.transport.transports
     assert len(transports) == 64
     assert {transport.retries for transport in transports} == {2}
-    assert sum(transport.limits.max_connections for transport in transports) == 100_000
+    assert {transport.limits.max_connections for transport in transports} == {100_000}
     assert (
         sum(transport.limits.max_keepalive_connections for transport in transports)
         == 100_000
@@ -408,6 +467,7 @@ async def test_rollout_supports_art_model_like_args() -> None:
 
     assert trajectory.metadata["scenario_id"] == "task_001"
     assert trajectory.metrics["num_turns"] == 1
+    assert client.create_kwargs["idle_timeout_seconds"] is None
 
 
 @pytest.mark.asyncio
