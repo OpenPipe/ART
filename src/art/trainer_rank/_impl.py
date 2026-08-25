@@ -1581,12 +1581,11 @@ class TrainerRank:
                 candidate = self._select_next_micro_batch(
                     items, start, checkpoint=checkpoint
                 )
-            flat_outputs = iter(
-                self._run_flat_plan_with_memory_tracking(
-                    candidate.plan,
-                    context="forward_micro_batches",
-                )
+            tracked_outputs, memory_baseline = self._run_flat_plan_with_memory_tracking(
+                candidate.plan,
+                context="forward_micro_batches",
             )
+            flat_outputs = iter(tracked_outputs)
             outputs = [_unflatten(item, flat_outputs) for item in candidate.inputs]
             stop = start + candidate.stats_global_count
             if stop < len(items):
@@ -1618,6 +1617,11 @@ class TrainerRank:
                         cold_start=candidate.cold_start,
                     ),
                 )
+            # The caller normally runs backward while the micro-batch is yielded.
+            # Include that peak in future planning; forward-only profiling can
+            # otherwise admit a later micro-batch that leaves no collective or
+            # optimizer headroom.
+            self._update_peak_memory_profile(candidate.plan, memory_baseline)
             start = stop
 
     @overload
@@ -1695,12 +1699,13 @@ class TrainerRank:
                     context="dp_rank_forward",
                     message="forward is predicted to exceed available memory",
                 )
-            outputs = iter(
+            tracked_outputs, _memory_baseline = (
                 self._run_flat_plan_with_memory_tracking(
                     plan,
                     context="dp_rank_forward",
                 )
             )
+            outputs = iter(tracked_outputs)
             return _unflatten(materialized, outputs)
 
     def dp_reduce(
@@ -2608,13 +2613,13 @@ class TrainerRank:
         plan: _FlatForwardPlan,
         *,
         context: str,
-    ) -> list[AnyForwardOutput]:
+    ) -> tuple[list[AnyForwardOutput], int | None]:
         if torch.cuda.is_available() and self.device.type == "cuda":
             torch.cuda.synchronize(self.device)
             baseline = int(torch.cuda.memory_allocated(self.device))
             torch.cuda.reset_peak_memory_stats(self.device)
         else:
-            baseline = 0
+            baseline = None
         try:
             with _telemetry_phase(
                 "forward",
@@ -2634,10 +2639,16 @@ class TrainerRank:
                 message="CUDA OOM occurred despite the planner estimate",
             )
             raise AssertionError("unreachable") from exc
-        if torch.cuda.is_available() and self.device.type == "cuda":
-            peak = int(torch.cuda.max_memory_allocated(self.device))
-            self._update_memory_profile(plan, max(0, peak - baseline))
-        return outputs
+        self._update_peak_memory_profile(plan, baseline)
+        return outputs, baseline
+
+    def _update_peak_memory_profile(
+        self, plan: _FlatForwardPlan, baseline: int | None
+    ) -> None:
+        if baseline is None:
+            return
+        peak = int(torch.cuda.max_memory_allocated(self.device))
+        self._update_memory_profile(plan, max(0, peak - baseline))
 
     @staticmethod
     def _telemetry_plan_signature(plan: _FlatForwardPlan) -> dict[str, object]:

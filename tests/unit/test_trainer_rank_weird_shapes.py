@@ -251,9 +251,10 @@ def test_forward_micro_batches_preserves_nested_vineppo_groups(
     monkeypatch.setattr(
         rank,
         "_run_flat_plan_with_memory_tracking",
-        lambda plan, **_kwargs: [
-            ForwardOutput(None, None, None, None) for _ in range(plan.request_count)
-        ],
+        lambda plan, **_kwargs: (
+            [ForwardOutput(None, None, None, None) for _ in range(plan.request_count)],
+            None,
+        ),
     )
     groups = _vineppo_like_inputs()
 
@@ -279,9 +280,10 @@ def test_forward_preserves_caller_owned_nested_input_tensors(
     monkeypatch.setattr(
         rank,
         "_run_flat_plan_with_memory_tracking",
-        lambda plan, **_kwargs: [
-            ForwardOutput(None, None, None, None) for _ in range(plan.request_count)
-        ],
+        lambda plan, **_kwargs: (
+            [ForwardOutput(None, None, None, None) for _ in range(plan.request_count)],
+            None,
+        ),
     )
     groups = _vineppo_like_inputs()
     tensors = [
@@ -457,9 +459,10 @@ def test_forward_micro_batches_shrinks_when_memory_budget_drops(
     def run(plan, **_kwargs):
         if available["packed_tokens"] == first_limit_packed_tokens:
             available["packed_tokens"] = tail_limit_packed_tokens
-        return [
-            ForwardOutput(None, None, None, None) for _ in range(plan.request_count)
-        ]
+        return (
+            [ForwardOutput(None, None, None, None) for _ in range(plan.request_count)],
+            None,
+        )
 
     monkeypatch.setattr(rank, "_plan_flat_forward", plan)
     _set_packed_token_budget(monkeypatch, rank, lambda: available["packed_tokens"])

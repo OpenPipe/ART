@@ -180,7 +180,11 @@ def _empty_outputs(plan: object, **_kwargs: object) -> list[ForwardOutput]:
 
 def _stub_forward(mp, rank, out=_empty_outputs, dp=(0, 1), profiled=False) -> None:
     mp.setattr(rank, "_dp_rank_and_size", lambda: dp)
-    mp.setattr(rank, "_run_flat_plan_with_memory_tracking", out)
+
+    def run(*args, **kwargs):
+        return out(*args, **kwargs), None
+
+    mp.setattr(rank, "_run_flat_plan_with_memory_tracking", run)
     if profiled:
         mp.setattr(rank, "_all_ranks_have_memory_profile", lambda **_: True)
 
@@ -2688,6 +2692,35 @@ def test_forward_micro_batches_ramps_after_first_success(
     assert batches[0].stats.cold_start
     assert batches[1].stats.global_count > 1
     assert not batches[1].stats.cold_start
+
+
+def test_forward_micro_batches_profiles_caller_peak_after_yield(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trainer = TrainerRank(_runtime())
+    _stub_forward(monkeypatch, trainer, profiled=True)
+    plan = trainer._plan_flat_forward([_target_request(1)])
+    monkeypatch.setattr(
+        trainer,
+        "_run_flat_plan_with_memory_tracking",
+        lambda *_args, **_kwargs: (_empty_outputs(plan), 123),
+    )
+    profiles: list[tuple[int, int | None]] = []
+    monkeypatch.setattr(
+        trainer,
+        "_update_peak_memory_profile",
+        lambda candidate, baseline: profiles.append(
+            (candidate.packed_tokens, baseline)
+        ),
+    )
+
+    batches = trainer.forward_micro_batches([_target_request(1)])
+    next(batches)
+
+    assert profiles == []
+    with pytest.raises(StopIteration):
+        next(batches)
+    assert profiles == [(plan.packed_tokens, 123)]
 
 
 def test_memory_profiles_distinguish_grad_mode() -> None:
