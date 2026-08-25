@@ -140,6 +140,8 @@ async def test_sharded_transport_does_not_strand_aggregate_capacity(
 
     slow = await transport.handle_async_request(request)
     completed = await transport.handle_async_request(request)
+    with pytest.raises(httpx.PoolTimeout):
+        await transport.handle_async_request(request)
     await completed.aclose()
     replacement = await transport.handle_async_request(request)
 
