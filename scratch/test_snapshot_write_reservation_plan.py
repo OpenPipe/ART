@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 from pathlib import Path
+from types import SimpleNamespace
 
 from pydantic import ValidationError
 import pytest
@@ -28,6 +29,8 @@ from art.megatron.runtime.publication import (
     build_snapshot_write_reservation_plan,
 )
 from art.megatron.runtime.specs import TrainerGeneration
+from art.megatron.training.slot import MegatronTrainingSlot
+from art.training.contracts import OperationRef
 
 
 def _reservation_plan(tmp_path: Path) -> SnapshotWriteReservationPlan:
@@ -237,3 +240,32 @@ def test_existing_snapshot_retains_exact_physical_sources(tmp_path: Path) -> Non
     assert existing.local_write_bytes == 0
     assert existing.local_write_paths == ()
     assert existing.digest != plan.digest
+
+
+def test_existing_snapshot_preserves_source_rank_geometry_after_migration(
+    tmp_path: Path,
+) -> None:
+    source = _reservation_plan(tmp_path).snapshot
+    manifest = source.optimizer_manifest
+    assert manifest is not None
+    slot = object.__new__(MegatronTrainingSlot)
+    slot.runtime_spec = SimpleNamespace(
+        trainer_mesh=SimpleNamespace(ranks=(object(), object()))
+    )
+
+    existing = slot._existing_snapshot(
+        OperationRef(
+            run_id="run",
+            operation_id="save-state-after-migration",
+            sequence_id=2,
+            learner_parent_version=1,
+            kind="save_state",
+        ),
+        source.generation,
+        source.adapter,
+        manifest=manifest,
+        optimizer_state_path=str(tmp_path / "optimizer"),
+    )
+
+    assert existing.plan.optimizer_manifest == manifest
+    assert len(existing.plan.ranks) == manifest.topology.world_size

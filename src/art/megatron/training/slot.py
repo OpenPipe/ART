@@ -1588,6 +1588,11 @@ class MegatronTrainingSlot:
         shards = (
             {} if manifest is None else {shard.rank: shard for shard in manifest.shards}
         )
+        rank_count = (
+            len(self.runtime_spec.trainer_mesh.ranks)
+            if manifest is None
+            else manifest.topology.world_size
+        )
         ranks = tuple(
             SnapshotRankWritePlan(
                 rank=rank,
@@ -1598,7 +1603,7 @@ class MegatronTrainingSlot:
                 topology=None if manifest is None else manifest.topology,
                 saves_optimizer=manifest is not None,
             )
-            for rank in range(len(self.runtime_spec.trainer_mesh.ranks))
+            for rank in range(rank_count)
         )
         plan = build_snapshot_write_plan(
             operation_id=ref.operation_id, generation=generation, ranks=ranks
