@@ -125,6 +125,15 @@ def _model_padding_layers(model_config: Any) -> tuple[int, ...]:
     if config is None:
         config = getattr(model_config, "hf_config", model_config)
     num_layers = int(getattr(config, "num_hidden_layers", 0))
+    hybrid_pattern = getattr(config, "hybrid_override_pattern", None)
+    if hybrid_pattern is not None:
+        if len(hybrid_pattern) != num_layers:
+            raise RuntimeError(
+                "hybrid_override_pattern does not match num_hidden_layers"
+            )
+        if not set(hybrid_pattern).issubset({"M", "-", "*", "E"}):
+            raise RuntimeError(f"Unsupported hybrid layer types: {set(hybrid_pattern)}")
+        return tuple(i for i, kind in enumerate(hybrid_pattern) if kind != "E")
     layer_types = getattr(config, "mlp_layer_types", None)
     if layer_types is not None:
         if len(layer_types) != num_layers:
