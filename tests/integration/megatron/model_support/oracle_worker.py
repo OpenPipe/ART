@@ -1280,7 +1280,7 @@ def _mutation_hook(
                     with_context_parallel=True
                 )
             )
-            return local_token_total.to(torch.float32) / max(dp_world_size, 1)
+            return local_token_total // max(dp_world_size, 1)
 
         megatron_train_module._local_trainable_token_count_tensor = (
             _wrong_local_trainable_token_count_tensor
@@ -1300,7 +1300,7 @@ def _mutation_hook(
                     with_context_parallel=True
                 )
             )
-            return local_token_total.to(torch.float32) / max(dp_world_size, 1)
+            return local_token_total // max(dp_world_size, 1)
 
         megatron_train_module._local_trainable_sft_token_count_tensor = (
             _wrong_local_trainable_sft_token_count_tensor
