@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 from copy import copy
+from functools import lru_cache
+import json
+from pathlib import Path
 from typing import Any, Literal, Sequence, cast
 
 import torch
@@ -69,10 +72,65 @@ def _model_config(model_chunks: Sequence[Any]) -> Any | None:
 
 
 def _padding_sizes_from_hf_config(config: Any) -> tuple[int, int]:
-    logical = int(getattr(config, "moe_intermediate_size", 0) or 0)
+    logical = int(
+        (
+            config.get("moe_intermediate_size", 0)
+            if isinstance(config, dict)
+            else getattr(config, "moe_intermediate_size", 0)
+        )
+        or 0
+    )
     if logical <= 0:
         raise RuntimeError("Nemotron-H config is missing moe_intermediate_size")
     return logical, round_up_to_multiple(logical, _MOE_FFN_ALIGNMENT)
+
+
+@lru_cache(maxsize=8)
+def _padding_sizes_from_adapter_base(base_model: str) -> tuple[int, int]:
+    config_path = Path(base_model) / "config.json"
+    if not config_path.exists():
+        from huggingface_hub import hf_hub_download
+
+        config_path = Path(hf_hub_download(base_model, "config.json"))
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    return _padding_sizes_from_hf_config(config.get("text_config") or config)
+
+
+def _convert_lora_padding(
+    tensors: dict[str, torch.Tensor],
+    *,
+    adapter_config: dict[str, Any],
+    pad: bool,
+) -> dict[str, torch.Tensor]:
+    axes = {
+        key: (
+            0
+            if key.endswith(".up_proj.lora_B.weight")
+            else -1
+            if key.endswith(".down_proj.lora_A.weight")
+            else None
+        )
+        for key in tensors
+        if ".mixer.experts." in key
+    }
+    if not any(axis is not None for axis in axes.values()):
+        return tensors
+    base_model = adapter_config.get("base_model_name_or_path")
+    if not isinstance(base_model, str) or not base_model:
+        raise RuntimeError(
+            "Nemotron-H LoRA conversion requires base_model_name_or_path"
+        )
+    logical, internal = _padding_sizes_from_adapter_base(base_model)
+    return {
+        key: (
+            pad_dim_right(value, dim=axis, size=internal)
+            if pad
+            else trim_dim_right(value, dim=axis, size=logical)
+        )
+        if (axis := axes.get(key)) is not None
+        else value
+        for key, value in tensors.items()
+    }
 
 
 def _model_bridge_hf_config(model_bridge: Any) -> Any:
@@ -484,6 +542,33 @@ class NemotronHHandler(DefaultMoeHandler):
         )
 
         return build_mamba_stack_adapter_weights(model_chunks)
+
+    def to_vllm_lora_tensors(
+        self,
+        tensors: dict[str, torch.Tensor],
+        *,
+        adapter_config: dict[str, Any],
+    ) -> tuple[dict[str, torch.Tensor], dict[str, Any]]:
+        return (
+            _convert_lora_padding(
+                tensors,
+                adapter_config=adapter_config,
+                pad=False,
+            ),
+            adapter_config,
+        )
+
+    def from_vllm_lora_tensors(
+        self,
+        tensors: dict[str, torch.Tensor],
+        *,
+        adapter_config: dict[str, Any],
+    ) -> dict[str, torch.Tensor]:
+        return _convert_lora_padding(
+            tensors,
+            adapter_config=adapter_config,
+            pad=True,
+        )
 
     def zero_internal_padding_grads(self, model_chunks: Sequence[Any]) -> None:
         _zero_expert_padding(model_chunks, grads=True, params=False)
