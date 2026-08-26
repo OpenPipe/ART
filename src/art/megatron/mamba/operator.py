@@ -10,7 +10,9 @@ import torch
 
 from art.megatron.gdn.conv_gelu import packed_varlen_causal_conv
 
+from .permutation import permute_rows
 from .plan import MambaConvBucket, MambaExecutionPlan, MambaScanBucket
+from .tree_kernels import assemble_scan_outputs, gather_scan_inputs
 
 MAMBA_SSM_VERSION = "2.3.2.post1"
 
@@ -39,12 +41,17 @@ def run_mamba_tree(
     heads = int(params.dt_bias.numel())
     inner = heads * params.head_dim
     groups = params.num_groups * params.state_dim
-    z, conv_input, dt = torch.split(
+    _, conv_input, dt = torch.split(
         projected, [inner, inner + 2 * groups, heads], dim=-1
     )
     convolved = _run_convolution(conv_input, plan, params)
-    postconv = torch.cat((z, convolved, dt), dim=-1)
-    output = projected.new_zeros((plan.tree.token_count, inner))
+    scan_inputs = gather_scan_inputs(
+        convolved, dt, plan.scan_token_positions, plan.scan_token_occurrences
+    )
+    outputs: list[torch.Tensor] = []
+    output_rows: list[torch.Tensor] = []
+    output_positions: list[torch.Tensor] = []
+    offset = 0
     states: list[torch.Tensor | None] = []
     zero_state = torch.zeros(
         (heads, params.head_dim, params.state_dim),
@@ -56,20 +63,25 @@ def run_mamba_tree(
             parents = _parent_states(
                 bucket.parent_state_indices, states, zero_state, "SSD"
             )
+            rows = bucket.batch_size * bucket.length
             dense_output, final = _run_scan_bucket(
-                postconv, bucket, parents, params, plan.chunk_size
+                scan_inputs.narrow(0, offset, rows),
+                bucket,
+                parents,
+                params,
+                plan.chunk_size,
             )
-            write = bucket.output_mask
-            output = output.index_copy(
-                0,
-                bucket.token_indices[write],
-                dense_output[write],
-            )
+            offset += rows
+            outputs.append(dense_output)
+            output_rows.append(bucket.output_rows)
+            output_positions.append(bucket.output_positions)
             if bucket.needs_final_state:
                 if final is None:
                     raise RuntimeError("Mamba SSD omitted a required boundary state")
                 _store_states(states, bucket.state_indices, final)
-    return output
+    return assemble_scan_outputs(
+        outputs, output_rows, output_positions, plan.tree.token_count
+    )
 
 
 def _run_convolution(
@@ -77,13 +89,17 @@ def _run_convolution(
     plan: MambaExecutionPlan,
     params: MambaParameters,
 ) -> torch.Tensor:
-    output = torch.zeros_like(conv_input)
+    compacted = permute_rows(conv_input, plan.conv_token_positions)
+    outputs = []
+    offset = 0
     states: list[torch.Tensor | None] = []
     zero_state = conv_input.new_zeros(
         (int(params.conv_weight.shape[0]), int(params.conv_weight.shape[1]) - 1)
     )
     for bucket in plan.conv_buckets:
-        compact = conv_input.index_select(0, bucket.token_indices)
+        length = int(bucket.token_indices.numel())
+        compact = compacted.narrow(0, offset, length)
+        offset += length
         parents = _parent_states(
             bucket.parent_indices, states, zero_state, "convolution"
         )
@@ -98,13 +114,13 @@ def _run_convolution(
         )
         if final is None:
             raise RuntimeError("Mamba convolution omitted a required boundary state")
-        output = output.index_copy(0, bucket.token_indices, compact_output)
+        outputs.append(compact_output)
         _store_states(states, bucket.segment_indices, final)
-    return output
+    return permute_rows(torch.cat(outputs), plan.conv_canonical_order)
 
 
 def _run_scan_bucket(
-    postconv: torch.Tensor,
+    scan_inputs: torch.Tensor,
     bucket: MambaScanBucket,
     initial_states: torch.Tensor,
     params: MambaParameters,
@@ -113,12 +129,9 @@ def _run_scan_bucket(
     heads = int(params.dt_bias.numel())
     inner = heads * params.head_dim
     groups = params.num_groups * params.state_dim
-    dense = postconv.index_select(0, bucket.token_indices.flatten()).view(
-        bucket.batch_size, bucket.length, -1
-    )
-    _, convolved, dt = torch.split(dense, [inner, inner + 2 * groups, heads], dim=-1)
+    dense = scan_inputs.view(bucket.batch_size, bucket.length, -1)
+    convolved, dt = torch.split(dense, [inner + 2 * groups, heads], dim=-1)
     x, b, c = torch.split(convolved, [inner, groups, groups], dim=-1)
-    dt = dt.masked_fill(~bucket.real_mask.unsqueeze(-1), -torch.inf)
     result = _mamba_chunk_scan_combined()(
         x.view(bucket.batch_size, bucket.length, heads, params.head_dim),
         dt,

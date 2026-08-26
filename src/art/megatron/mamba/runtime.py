@@ -7,7 +7,7 @@ import torch
 
 from .exchange import (
     MambaShardShape,
-    canonical_head_shard_to_token_layout,
+    canonical_head_shard_pair_to_token_layout,
     projected_tokens_to_canonical_head_shard,
 )
 from .operator import MambaParameters, run_mamba_tree
@@ -284,8 +284,9 @@ def mamba_prefix_tree_forward(
         ),
     )
     gate = canonical[:, : recurrent.shape[-1]]
-    local = canonical_head_shard_to_token_layout(
-        torch.cat((recurrent, gate), dim=-1),
+    local = canonical_head_shard_pair_to_token_layout(
+        recurrent,
+        gate,
         tuple(projected.shape),
         plan.exchange,
         shape,

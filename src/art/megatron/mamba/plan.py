@@ -22,8 +22,8 @@ class MambaScanBucket(BaseModel):
     state_indices: tuple[int, ...]
     parent_state_indices: tuple[int, ...]
     token_indices: torch.Tensor
-    real_mask: torch.Tensor
-    output_mask: torch.Tensor
+    output_rows: torch.Tensor
+    output_positions: torch.Tensor
     needs_final_state: bool
 
     @property
@@ -43,6 +43,7 @@ class MambaTokenExchangePlan(BaseModel):
     source_token_counts: tuple[int, ...]
     global_positions_by_rank: tuple[torch.Tensor, ...]
     received_global_positions: torch.Tensor
+    received_canonical_order: torch.Tensor
     physical_token_positions: torch.Tensor
 
     @property
@@ -60,6 +61,10 @@ class MambaExecutionPlan(BaseModel):
     tree: RecurrentPrefixTree
     conv_buckets: tuple[MambaConvBucket, ...]
     scan_phases: tuple[tuple[MambaScanBucket, ...], ...]
+    conv_token_positions: torch.Tensor
+    conv_canonical_order: torch.Tensor
+    scan_token_positions: torch.Tensor
+    scan_token_occurrences: torch.Tensor
     exchange: MambaTokenExchangePlan
     chunk_size: int = Field(gt=0)
 
@@ -94,10 +99,27 @@ def build_mamba_execution_plan(
         cp_size=cp_size,
         token_layout=token_layout,
     )
+    conv_buckets = _build_conv_buckets(tree, device)
+    scan_phases = _build_scan_phases(tree, chunk_size, device)
+    conv_positions = torch.cat(tuple(bucket.token_indices for bucket in conv_buckets))
+    scan_positions = torch.cat(
+        tuple(
+            bucket.token_indices.flatten() for phase in scan_phases for bucket in phase
+        )
+    )
+    scan_output_positions = torch.cat(
+        tuple(bucket.output_positions for phase in scan_phases for bucket in phase)
+    )
+    _canonical_order(scan_output_positions, tree.token_count)
+    scan_occurrences = _token_occurrences(scan_positions, tree.token_count)
     return MambaExecutionPlan(
         tree=tree,
-        conv_buckets=_build_conv_buckets(tree, device),
-        scan_phases=_build_scan_phases(tree, chunk_size, device),
+        conv_buckets=conv_buckets,
+        scan_phases=scan_phases,
+        conv_token_positions=conv_positions,
+        conv_canonical_order=_canonical_order(conv_positions, tree.token_count),
+        scan_token_positions=scan_positions,
+        scan_token_occurrences=scan_occurrences,
         exchange=exchange,
         chunk_size=chunk_size,
     )
@@ -263,12 +285,15 @@ def _materialize_scan_bucket(
         token_indices[row, :count] = torch.tensor(column.positions, dtype=torch.long)
         real_mask[row, :count] = True
         output_mask[row, :count] = torch.tensor(column.output_mask, dtype=torch.bool)
+    output_rows = output_mask.flatten().nonzero().flatten()
+    output_positions = token_indices.flatten()[output_rows]
+    token_indices = torch.where(real_mask, token_indices, -1)
     return MambaScanBucket(
         state_indices=tuple(column.state_index for column in columns),
         parent_state_indices=tuple(column.parent_state_index for column in columns),
         token_indices=token_indices.to(device),
-        real_mask=real_mask.to(device),
-        output_mask=output_mask.to(device),
+        output_rows=output_rows.to(device),
+        output_positions=output_positions.to(device),
         needs_final_state=needs_final_state,
     )
 
@@ -309,18 +334,46 @@ def _build_exchange_plan(
         torch.tensor(positions, dtype=torch.long, device=device)
         for positions in positions_by_rank
     )
+    received_global_positions = torch.tensor(flattened, dtype=torch.long, device=device)
     return MambaTokenExchangePlan(
         cp_rank=cp_rank,
         cp_size=cp_size,
         source_token_counts=tuple(len(positions) for positions in positions_by_rank),
         global_positions_by_rank=tensors,
-        received_global_positions=torch.tensor(
-            flattened, dtype=torch.long, device=device
+        received_global_positions=received_global_positions,
+        received_canonical_order=_canonical_order(
+            received_global_positions, tree.token_count
         ),
         physical_token_positions=torch.tensor(
             tree.physical_token_positions, dtype=torch.long, device=device
         ),
     )
+
+
+def _canonical_order(positions: torch.Tensor, token_count: int) -> torch.Tensor:
+    if positions.numel() != token_count or not torch.equal(
+        positions.sort().values,
+        torch.arange(token_count, dtype=torch.long, device=positions.device),
+    ):
+        raise ValueError("Mamba row positions must be a complete permutation")
+    return positions.argsort()
+
+
+def _token_occurrences(positions: torch.Tensor, token_count: int) -> torch.Tensor:
+    valid_occurrences = (positions >= 0).nonzero().flatten()
+    valid_positions = positions[valid_occurrences]
+    order = valid_positions.argsort(stable=True)
+    sorted_positions = valid_positions[order]
+    counts = torch.bincount(sorted_positions, minlength=token_count)
+    if torch.any(counts == 0):
+        raise ValueError("Mamba scan plan must contain every recurrent token")
+    starts = counts.cumsum(0) - counts
+    slots = (
+        torch.arange(order.numel(), device=positions.device) - starts[sorted_positions]
+    )
+    occurrences = positions.new_full((token_count, int(counts.max())), -1)
+    occurrences[sorted_positions, slots] = valid_occurrences[order]
+    return occurrences
 
 
 def _local_to_global_positions(

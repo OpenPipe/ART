@@ -4,6 +4,8 @@ from pydantic import BaseModel, ConfigDict, Field
 import torch
 from torch.distributed.nn.functional import all_to_all_single
 
+from .exchange_kernels import assemble_head_shards, pack_canonical_pair, pack_projected
+from .permutation import permute_rows
 from .plan import MambaTokenExchangePlan
 
 
@@ -34,40 +36,22 @@ def projected_tokens_to_canonical_head_shard(
     if int(projected.shape[1]) != 1:
         raise ValueError("ART Mamba CP supports exactly one packed sequence")
     local = flat[: plan.local_token_count]
-    z, x, b, c, dt = torch.split(
+    send = pack_projected(
         local,
-        [
-            shape.inner,
-            shape.inner,
-            shape.groups * shape.state_dim,
-            shape.groups * shape.state_dim,
-            shape.heads,
-        ],
-        dim=-1,
+        inner=shape.inner,
+        heads=shape.heads,
+        groups=shape.groups,
+        state_dim=shape.state_dim,
+        cp_size=plan.cp_size,
     )
-    send_chunks = [
-        torch.cat(
-            (
-                _even_slice(z, rank, plan.cp_size),
-                _even_slice(x, rank, plan.cp_size),
-                _group_slice(b, rank, plan.cp_size, shape.groups, shape.state_dim),
-                _group_slice(c, rank, plan.cp_size, shape.groups, shape.state_dim),
-                _even_slice(dt, rank, plan.cp_size),
-            ),
-            dim=-1,
-        )
-        for rank in range(plan.cp_size)
-    ]
-    local_width = int(send_chunks[0].shape[-1])
+    local_width = int(send.shape[-1])
     received = _all_to_all_flat(
-        torch.cat(send_chunks, dim=0).flatten(),
+        send.flatten(),
         send_splits=(plan.local_token_count * local_width,) * plan.cp_size,
         receive_splits=tuple(count * local_width for count in plan.source_token_counts),
         group=group,
     ).view(plan.token_count, local_width)
-    return received.new_zeros(received.shape).index_copy(
-        0, plan.received_global_positions, received
-    )
+    return permute_rows(received, plan.received_canonical_order)
 
 
 def canonical_head_shard_to_token_layout(
@@ -94,40 +78,71 @@ def canonical_head_shard_to_token_layout(
         flat = canonical.new_zeros(
             (projected_shape[0] * projected_shape[1], output_width)
         )
-        return flat.index_copy(0, plan.physical_token_positions, canonical).view(
+        return flat.index_copy_(0, plan.physical_token_positions, canonical).view(
             projected_shape[0], projected_shape[1], output_width
         )
-    send_chunks = [
-        canonical.index_select(0, positions)
-        for positions in plan.global_positions_by_rank
-    ]
+    send = permute_rows(canonical, plan.received_global_positions)
+    return _canonical_send_to_token_layout(
+        send, projected_shape, plan, components, local_inner, group
+    )
+
+
+def canonical_head_shard_pair_to_token_layout(
+    first: torch.Tensor,
+    second: torch.Tensor,
+    projected_shape: tuple[int, int, int],
+    plan: MambaTokenExchangePlan,
+    shape: MambaShardShape,
+    group: object,
+) -> torch.Tensor:
+    """Fuse Mamba recurrent/gate packing into the return token exchange."""
+
+    local_inner = shape.inner // plan.cp_size
+    expected = (plan.token_count, local_inner)
+    if tuple(first.shape) != expected or tuple(second.shape) != expected:
+        raise ValueError(f"canonical Mamba components must both have shape {expected}")
+    if plan.cp_size == 1:
+        return canonical_head_shard_to_token_layout(
+            torch.cat((first, second), dim=-1),
+            projected_shape,
+            plan,
+            shape,
+            group,
+        )
+    send = pack_canonical_pair(first, second, plan.received_global_positions)
+    return _canonical_send_to_token_layout(
+        send, projected_shape, plan, 2, local_inner, group
+    )
+
+
+def _canonical_send_to_token_layout(
+    send: torch.Tensor,
+    projected_shape: tuple[int, int, int],
+    plan: MambaTokenExchangePlan,
+    components: int,
+    local_inner: int,
+    group: object,
+) -> torch.Tensor:
+    local_width = components * local_inner
+    output_width = components * plan.cp_size * local_inner
     received = _all_to_all_flat(
-        torch.cat(send_chunks, dim=0).flatten(),
+        send.flatten(),
         send_splits=tuple(count * local_width for count in plan.source_token_counts),
         receive_splits=(plan.local_token_count * local_width,) * plan.cp_size,
         group=group,
     )
-    assembled = torch.cat(
-        tuple(
-            received.narrow(
-                0,
-                rank * plan.local_token_count * local_width,
-                plan.local_token_count * local_width,
-            ).view(plan.local_token_count, components, local_inner)
-            for rank in range(plan.cp_size)
-        ),
-        dim=-1,
-    ).flatten(1)
     flat_size = projected_shape[0] * projected_shape[1]
     if flat_size < plan.local_token_count:
         raise ValueError(
             "Mamba output token layout is smaller than its real token count"
         )
-    flat = canonical.new_zeros((flat_size, output_width))
-    flat = flat.index_copy(
-        0,
-        torch.arange(plan.local_token_count, device=canonical.device),
-        assembled,
+    flat = assemble_head_shards(
+        received,
+        flat_tokens=flat_size,
+        tokens=plan.local_token_count,
+        cp_size=plan.cp_size,
+        components=components,
+        local_inner=local_inner,
     )
     return flat.view(projected_shape[0], projected_shape[1], output_width)
 
@@ -147,30 +162,3 @@ def _all_to_all_flat(
         input_split_sizes=list(send_splits),
         group=group,
     )
-
-
-def _even_slice(tensor: torch.Tensor, rank: int, size: int) -> torch.Tensor:
-    if int(tensor.shape[-1]) % size:
-        raise ValueError("Mamba head features must divide evenly across CP")
-    width = int(tensor.shape[-1]) // size
-    return tensor.narrow(-1, rank * width, width)
-
-
-def _group_slice(
-    tensor: torch.Tensor,
-    rank: int,
-    cp_size: int,
-    groups: int,
-    state_dim: int,
-) -> torch.Tensor:
-    if groups >= cp_size:
-        if groups % cp_size:
-            raise ValueError("Mamba groups must divide evenly across CP")
-        local_groups = groups // cp_size
-        return tensor.narrow(
-            -1, rank * local_groups * state_dim, local_groups * state_dim
-        )
-    if cp_size % groups:
-        raise ValueError("Mamba CP must divide evenly across replicated groups")
-    group = rank // (cp_size // groups)
-    return tensor.narrow(-1, group * state_dim, state_dim)
