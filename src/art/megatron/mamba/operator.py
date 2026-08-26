@@ -90,9 +90,7 @@ def run_mamba_tree(
     heads = int(params.dt_bias.numel())
     inner = heads * params.head_dim
     groups = params.num_groups * params.state_dim
-    _, conv_input, dt = torch.split(
-        projected, [inner, inner + 2 * groups, heads], dim=-1
-    )
+    conv_input, dt = torch.split(projected, [inner + 2 * groups, heads], dim=-1)
     convolved = _run_convolution(conv_input, plan, params)
     scan_inputs = gather_scan_inputs(
         convolved, dt, plan.scan_token_positions, plan.scan_token_occurrences
@@ -247,7 +245,7 @@ def _validate_inputs(
 ) -> None:
     heads = int(params.dt_bias.numel())
     expected_width = (
-        2 * heads * params.head_dim + 2 * params.num_groups * params.state_dim + heads
+        heads * params.head_dim + 2 * params.num_groups * params.state_dim + heads
     )
     if tuple(projected.shape) != (plan.tree.token_count, expected_width):
         raise ValueError(

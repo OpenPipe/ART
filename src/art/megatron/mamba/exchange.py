@@ -4,7 +4,7 @@ from pydantic import BaseModel, ConfigDict, Field
 import torch
 from torch.distributed.nn.functional import all_to_all_single
 
-from .exchange_kernels import assemble_head_shards, pack_projected, pack_recurrent_pair
+from .exchange_kernels import assemble_head_shards, pack_projected
 from .plan import MambaTokenExchangePlan
 
 
@@ -53,31 +53,28 @@ def projected_tokens_to_recurrent_layout(
     return received
 
 
-def recurrent_layout_pair_to_token_layout(
-    first: torch.Tensor,
-    second: torch.Tensor,
+def recurrent_layout_to_token_layout(
+    recurrent: torch.Tensor,
     projected_shape: tuple[int, int, int],
     plan: MambaTokenExchangePlan,
     shape: MambaShardShape,
     group: object,
 ) -> torch.Tensor:
-    """Fuse source-ordered recurrent/gate shards into the return exchange."""
+    """Return source-ordered recurrent head shards to their token owners."""
 
     local_inner = shape.inner // plan.cp_size
     expected = (plan.token_count, local_inner)
-    if tuple(first.shape) != expected or tuple(second.shape) != expected:
-        raise ValueError(f"Mamba recurrent components must both have shape {expected}")
+    if tuple(recurrent.shape) != expected:
+        raise ValueError(f"Mamba recurrent output must have shape {expected}")
     if plan.cp_size == 1:
-        pair = torch.cat((first, second), dim=-1)
-        flat = pair.new_zeros(
-            (projected_shape[0] * projected_shape[1], 2 * shape.inner)
+        flat = recurrent.new_zeros(
+            (projected_shape[0] * projected_shape[1], shape.inner)
         )
-        return flat.index_copy_(0, plan.physical_token_positions, pair).view(
-            *projected_shape[:2], 2 * shape.inner
+        return flat.index_copy_(0, plan.physical_token_positions, recurrent).view(
+            *projected_shape[:2], shape.inner
         )
-    send = pack_recurrent_pair(first, second)
     return _recurrent_send_to_token_layout(
-        send, projected_shape, plan, 2, local_inner, group
+        recurrent, projected_shape, plan, local_inner, group
     )
 
 
@@ -85,16 +82,13 @@ def _recurrent_send_to_token_layout(
     send: torch.Tensor,
     projected_shape: tuple[int, int, int],
     plan: MambaTokenExchangePlan,
-    components: int,
     local_inner: int,
     group: object,
 ) -> torch.Tensor:
-    local_width = components * local_inner
-    output_width = components * plan.cp_size * local_inner
     received = _all_to_all_flat(
         send.flatten(),
-        send_splits=tuple(count * local_width for count in plan.source_token_counts),
-        receive_splits=(plan.local_token_count * local_width,) * plan.cp_size,
+        send_splits=tuple(count * local_inner for count in plan.source_token_counts),
+        receive_splits=(plan.local_token_count * local_inner,) * plan.cp_size,
         group=group,
     )
     flat_size = projected_shape[0] * projected_shape[1]
@@ -107,10 +101,9 @@ def _recurrent_send_to_token_layout(
         flat_tokens=flat_size,
         tokens=plan.local_token_count,
         cp_size=plan.cp_size,
-        components=components,
         local_inner=local_inner,
     )
-    return flat.view(projected_shape[0], projected_shape[1], output_width)
+    return flat.view(*projected_shape)
 
 
 def _all_to_all_flat(

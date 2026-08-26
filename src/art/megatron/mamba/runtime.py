@@ -8,7 +8,7 @@ import torch
 from .exchange import (
     MambaShardShape,
     projected_tokens_to_recurrent_layout,
-    recurrent_layout_pair_to_token_layout,
+    recurrent_layout_to_token_layout,
 )
 from .operator import MambaParameters, run_mamba_tree
 from .plan import MambaExecutionPlan
@@ -262,8 +262,9 @@ def mamba_prefix_tree_forward(
         groups=int(mixer.ngroups_local_tp),
         state_dim=int(mixer.d_state),
     )
+    gate = projected[..., : shape.inner]
     recurrent_layout = projected_tokens_to_recurrent_layout(
-        projected,
+        projected[..., shape.inner :],
         plan.exchange,
         shape,
         mixer.pg_collection.cp,
@@ -283,18 +284,15 @@ def mamba_prefix_tree_forward(
             num_groups=int(cp.ngroups_local_tpcp),
         ),
     )
-    gate = recurrent_layout[:, : recurrent.shape[-1]]
-    local = recurrent_layout_pair_to_token_layout(
+    local = recurrent_layout_to_token_layout(
         recurrent,
-        gate,
-        tuple(projected.shape),
+        tuple(gate.shape),
         plan.exchange,
         shape,
         mixer.pg_collection.cp,
     )
     if not mixer.rmsnorm:
         raise RuntimeError("ART Mamba tree execution requires gated RMSNorm")
-    local, gate = local.chunk(2, dim=-1)
     local = mixer.norm(local, gate)
     return mixer.out_proj(local)
 
