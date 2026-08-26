@@ -1128,7 +1128,11 @@ async def test_retention_apply_does_not_block_or_forget_new_publication() -> Non
 @pytest.mark.asyncio
 async def test_retention_ignores_checkpoint_committed_after_planning() -> None:
     backend, model, _, _ = _backend()
-    service = _RetentionService(_checkpoint(3), _checkpoint(4))
+    service = _RetentionService(
+        _checkpoint(3),
+        _checkpoint(4),
+        protected=("step-4",),
+    )
     service.apply_gate.set()
     backend._service = service
 
@@ -1140,6 +1144,8 @@ async def test_retention_ignores_checkpoint_committed_after_planning() -> None:
     assert tuple(item.checkpoint_id for item in service.retention_request.observed) == (
         "step-3",
     )
+    assert service.retention_request.retain_checkpoint_ids == ()
+    assert service.retention_request.archive_checkpoint_ids == ()
 
 
 @pytest.mark.asyncio
