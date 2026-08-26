@@ -385,6 +385,7 @@ _THROUGHPUT_CONFIGS = {
         rollouts_per_group=4,
         groups_per_step=16,
         initial_model_calls_per_inference_gpu=20,
+        max_num_batched_tokens=THROUGHPUT_PACKED_SEQUENCE_LENGTH,
         max_steps=17,
     ),
 }
