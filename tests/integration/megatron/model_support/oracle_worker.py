@@ -1264,8 +1264,8 @@ def _mutation_hook(
         raise ValueError(f"Unsupported mutation: {mutation}")
 
     if mutation == "skip_finalize":
-        megatron_train_module.finalize_model_grads_extended = lambda _model, **_kwargs: (
-            None
+        megatron_train_module.finalize_model_grads_extended = (
+            lambda _model, _num_tokens=None, **_kwargs: None
         )
 
     if mutation == "dp_local_token_normalization":
