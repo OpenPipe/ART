@@ -1149,6 +1149,7 @@ class _PreparedRunLoad(BaseModel):
     checkpoint: Any
     optimizer: Any | None
     lora_export_plan: Any
+    optimizer_export_plan: Any
     adapter_config: dict[str, Any]
     optimizer_restored: bool = False
 
@@ -1325,6 +1326,7 @@ class _ResidentRunState(BaseModel):
     registration_complete: bool = False
     unregistering: bool = False
     lora_export_plan: Any | None = None
+    optimizer_export_plan: Any | None = None
     kl_references: SkipValidation[OrderedDict[str, _PreparedKlReference]] = Field(
         default_factory=OrderedDict
     )
@@ -1447,6 +1449,9 @@ class MCoreRunSlotExecutor:
             device="cpu",
         )
         export_plan = self._build_prepared_lora_export_plan(checkpoint)
+        optimizer_export_plan = self._build_prepared_lora_export_plan(
+            checkpoint, packed_experts=False
+        )
         if registration.initial_optimizer_state_path is not None:
             assert registration.initial_optimizer_generation_id is not None
             loaded_optimizer = load_trainer_rank_optimizer_state(
@@ -1481,6 +1486,7 @@ class MCoreRunSlotExecutor:
             checkpoint=checkpoint,
             optimizer=optimizer,
             lora_export_plan=export_plan,
+            optimizer_export_plan=optimizer_export_plan,
             optimizer_restored=(registration.initial_optimizer_state_path is not None),
             adapter_config=adapter_config,
         )
@@ -1580,6 +1586,7 @@ class MCoreRunSlotExecutor:
             ),
             pending_load=prepared,
             lora_export_plan=prepared.lora_export_plan,
+            optimizer_export_plan=prepared.optimizer_export_plan,
         )
         self._residency.register_l2_working_set(
             (
@@ -1624,6 +1631,7 @@ class MCoreRunSlotExecutor:
                 generation=generation,
                 weights_key=pending.weights_key,
                 export_plan=pending.lora_export_plan,
+                optimizer_export_plan=pending.optimizer_export_plan,
                 adapter_config=pending.adapter_config,
                 optimizer_source=pending.optimizer.snapshot_source(),
                 optimizer_key=pending.optimizer_key,
@@ -2191,6 +2199,11 @@ class MCoreRunSlotExecutor:
             export_plan = state.lora_export_plan
             if export_plan is None:
                 raise RuntimeError("resident run has no immutable LoRA export plan")
+            optimizer_export_plan = state.optimizer_export_plan
+            if optimizer_export_plan is None:
+                raise RuntimeError(
+                    "resident run has no immutable optimizer export plan"
+                )
         if not result["update_successful"] or not math.isfinite(result["grad_norm"]):
             raise RuntimeError("dynamic LoRA optimizer rejected the update")
         consumed = gradients.consume()
@@ -2236,6 +2249,7 @@ class MCoreRunSlotExecutor:
             generation=job.generation,
             weights_key=output_weights,
             export_plan=export_plan,
+            optimizer_export_plan=optimizer_export_plan,
             adapter_config=state.adapter_config,
             optimizer_source=optimizer_source,
             optimizer_key=output_optimizer,
@@ -2274,6 +2288,9 @@ class MCoreRunSlotExecutor:
             device="cpu",
         )
         export_plan = self._build_prepared_lora_export_plan(checkpoint)
+        optimizer_export_plan = self._build_prepared_lora_export_plan(
+            checkpoint, packed_experts=False
+        )
         if job.optimizer_state_path is not None:
             assert job.optimizer_generation_id is not None
             loaded = load_trainer_rank_optimizer_state(
@@ -2312,6 +2329,7 @@ class MCoreRunSlotExecutor:
             checkpoint=checkpoint,
             optimizer=optimizer,
             lora_export_plan=export_plan,
+            optimizer_export_plan=optimizer_export_plan,
             optimizer_restored=job.restore_optimizer,
             adapter_config=config,
         )
@@ -2412,6 +2430,7 @@ class MCoreRunSlotExecutor:
                 generation=job.generation,
                 weights_key=prepared.weights_key,
                 export_plan=prepared.lora_export_plan,
+                optimizer_export_plan=prepared.optimizer_export_plan,
                 adapter_config=prepared.adapter_config,
                 optimizer_source=prepared.optimizer.snapshot_source(),
                 optimizer_key=optimizer_key,
@@ -2435,6 +2454,7 @@ class MCoreRunSlotExecutor:
             )
             state.pending_load = prepared
             state.lora_export_plan = prepared.lora_export_plan
+            state.optimizer_export_plan = prepared.optimizer_export_plan
             state.learner_version = job.learner_version
         return {
             "operation_id": job.operation_id,
@@ -2448,7 +2468,9 @@ class MCoreRunSlotExecutor:
             },
         }
 
-    def _build_prepared_lora_export_plan(self, checkpoint: Any) -> Any:
+    def _build_prepared_lora_export_plan(
+        self, checkpoint: Any, *, packed_experts: bool = True
+    ) -> Any:
         from art.megatron.weights.lora_publish import (
             build_prepared_lora_export_plan,
         )
@@ -2459,6 +2481,8 @@ class MCoreRunSlotExecutor:
             {},
             packed_expert_groups=(
                 self.runtime.model_support_handler.expert_packed_lora_groups()
+                if packed_experts
+                else ()
             ),
         )
 
@@ -2997,6 +3021,8 @@ class _ResidentOptimizerSource(BaseModel):
 
     key: ResidencyKey
     source: Any
+    export_plan: Any | None = None
+    adapter_config: dict[str, Any] | None = None
 
 
 class _ResidentLoraSource(BaseModel):
@@ -3346,6 +3372,7 @@ class _GenerationPublisher:
         generation: TrainerGeneration,
         weights_key: ResidencyKey,
         export_plan: Any,
+        optimizer_export_plan: Any,
         adapter_config: dict[str, Any],
         optimizer_source: Any,
         optimizer_key: ResidencyKey,
@@ -3392,6 +3419,8 @@ class _GenerationPublisher:
             resident_optimizer=_ResidentOptimizerSource(
                 key=optimizer_key,
                 source=optimizer_source,
+                export_plan=optimizer_export_plan,
+                adapter_config=adapter_config,
             ),
             has_optimizer=True,
         )
