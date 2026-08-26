@@ -13,7 +13,12 @@ from art.distributed.data_plane import PackedBatchRef
 from art.distributed.object_store import BinaryObjectPublicationTarget
 from art.distributed.specs import NixlTransportSpec, TrainerMeshSpec
 from art.megatron.optimizer_state import OptimizerAdapter
-from art.training.contracts import AdamConfig, LossConfig
+from art.training.contracts import (
+    MAX_CHECKPOINT_REFERENCE_LENGTH,
+    MAX_CONTROL_IDENTIFIER_LENGTH,
+    AdamConfig,
+    LossConfig,
+)
 from art.types import TrainConfig, TrainSFTConfig
 
 from .run_residency import RunResidencyConfig
@@ -219,6 +224,7 @@ class ExperimentalTrainConfig(_Spec):
     kl_penalty_source: Literal["current_learner", "sample"] = "current_learner"
     kl_penalty_step_lag: int | None = Field(default=None, ge=0)
     kl_ref_adapter_path: str | None = None
+    kl_ref_checkpoint_id: str | None = None
     logprob_calculation_chunk_size: int | None = Field(default=None, ge=1)
     mask_prob_ratio: bool = False
     max_negative_advantage_importance_sampling_weight: float | None = None
@@ -231,6 +237,19 @@ class ExperimentalTrainConfig(_Spec):
     scale_rewards: bool = True
     truncated_importance_sampling: float | None = None
     moe_routing_replay_strict: bool = True
+
+
+class KlReferenceSpec(_Spec):
+    run_id: str = Field(min_length=1, max_length=MAX_CONTROL_IDENTIFIER_LENGTH)
+    checkpoint_id: str = Field(min_length=1, max_length=MAX_CHECKPOINT_REFERENCE_LENGTH)
+    adapter_path: str = Field(min_length=1)
+
+
+class KlReferenceAcquisition(_Spec):
+    run_id: str = Field(min_length=1, max_length=MAX_CONTROL_IDENTIFIER_LENGTH)
+    checkpoint_id: str = Field(min_length=1, max_length=MAX_CHECKPOINT_REFERENCE_LENGTH)
+    acquisition_id: str = Field(pattern=r"^[0-9a-f]{32}$")
+    metrics: dict[str, float]
 
 
 class TrainerGeneration(_Spec):

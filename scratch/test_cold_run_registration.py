@@ -200,6 +200,15 @@ class _Residency:
         if self.acquire_error is not None:
             raise self.acquire_error
 
+    def acquire_prepared_l1_working_set(self, keys: Any) -> None:
+        self.acquire_l1_working_set(keys)
+
+    def retain_l1_working_set(self, keys: Any) -> None:
+        self.acquire_l1_working_set(keys)
+
+    def prefetch_l1_working_set(self, keys: Any) -> None:
+        self.acquire_l1_working_set(keys)
+
     def release_l1_working_set(self, _keys: Any) -> None:
         return None
 
@@ -295,9 +304,13 @@ def _executor(
     executor._publisher = publisher
     executor._load_preparations = {}
     executor._registration_preparations = {}
+    executor._kl_reference_preparations = {}
+    executor._kl_reference_cache_capacity = 1
     executor._cleanup_pool = ThreadPoolExecutor(max_workers=1)
     executor._run_cleanups = {}
     executor._runs = {}
+    executor._residency_admission_lock = Lock()
+    executor._residency_admissions = {}
     executor._lifecycle_lock = Lock()
     executor._transition_futures = set()
     executor._closing = False
@@ -308,6 +321,31 @@ def _executor(
         lambda _self, _checkpoint: "export-plan",
     )
     return executor, slot, residency, publisher
+
+
+@contextmanager
+def _resident(
+    executor: MCoreRunSlotExecutor,
+    state: Any,
+    *,
+    include_optimizer: bool = False,
+) -> Any:
+    operation_id = "test-residency"
+    keys = tuple(
+        key
+        for key in (
+            state.desired.weights,
+            state.desired.optimizer if include_optimizer else None,
+        )
+        if key is not None
+    )
+    executor._residency_admissions[operation_id] = keys
+    with executor._resident(
+        state,
+        operation_id=operation_id,
+        include_optimizer=include_optimizer,
+    ):
+        yield
 
 
 def _register(
@@ -470,13 +508,13 @@ def test_fresh_registration_first_fb_then_optim_reuses_prepared_state(
 
     residency.acquire_error = ResidencyCapacityUnavailable("forced L1 capacity")
     with pytest.raises(ResidencyCapacityUnavailable, match="forced L1 capacity"):
-        with executor._resident(state):
+        with _resident(executor, state):
             pass
     assert slot.weight_installs == slot.optimizer_installs == 0
     assert state.installed_weights is state.installed_optimizer is None
 
     residency.acquire_error = None
-    with executor._resident(state):
+    with _resident(executor, state):
         assert state.installed_weights == state.desired.weights
         assert state.installed_optimizer is None
         assert state.gradients is not None
@@ -490,13 +528,13 @@ def test_fresh_registration_first_fb_then_optim_reuses_prepared_state(
         "forced optimizer L1 capacity"
     )
     with pytest.raises(ResidencyCapacityUnavailable, match="optimizer L1 capacity"):
-        with executor._resident(state, include_optimizer=True):
+        with _resident(executor, state, include_optimizer=True):
             slot.optim_step_reduced("run", params=object(), grads=())
     assert slot.optimizer_installs == slot.optimizer_steps == 0
     assert state.pending_load is pending
 
     residency.acquire_error = None
-    with executor._resident(state, include_optimizer=True):
+    with _resident(executor, state, include_optimizer=True):
         assert state.installed_optimizer == state.desired.optimizer
         slot.optim_step_reduced("run", params=object(), grads=())
     assert tuple(key.representation for key in residency.acquisitions[-1]) == (
@@ -583,7 +621,7 @@ def test_cold_first_install_setup_failure_precedes_slot_mutation(
     )
 
     with pytest.raises(RuntimeError, match="forced accumulator failure"):
-        with executor._resident(state):
+        with _resident(executor, state):
             pass
 
     assert slot.weight_installs == slot.unload_calls == 0
@@ -598,7 +636,7 @@ def test_existing_install_setup_failure_keeps_previous_checkpoint(
     executor, slot, residency, _publisher = _executor(monkeypatch)
     _register(executor)
     state = executor._runs["run"]
-    with executor._resident(state):
+    with _resident(executor, state):
         pass
     previous_key = state.installed_weights
     previous_checkpoint = slot.installed_checkpoint
@@ -636,7 +674,7 @@ def test_existing_install_setup_failure_keeps_previous_checkpoint(
     )
 
     with pytest.raises(RuntimeError, match="forced replacement setup failure"):
-        with executor._resident(state):
+        with _resident(executor, state):
             pass
 
     assert slot.weight_installs == 1
@@ -655,7 +693,7 @@ def test_unregister_retries_repeated_checkpoint_unload_failure(
     _register(executor)
     executor.complete_run_registration("run")
     state = executor._runs["run"]
-    with executor._resident(state):
+    with _resident(executor, state):
         pass
     resident_keys = set(residency.components)
     slot.unload_error = RuntimeError("forced unload failure")
@@ -669,7 +707,7 @@ def test_unregister_retries_repeated_checkpoint_unload_failure(
         assert set(residency.components) == resident_keys
         assert residency.retirements == []
         with pytest.raises(RuntimeError, match="being unregistered"):
-            executor.prepare_residency("run", "forward", 0)
+            executor.prefetch_residency("run", "forward", 0)
 
     slot.unload_error = None
 
@@ -689,7 +727,7 @@ def test_unregister_retries_residency_retirement_failure(
     _register(executor)
     executor.complete_run_registration("run")
     state = executor._runs["run"]
-    with executor._resident(state):
+    with _resident(executor, state):
         pass
     residency.retirement_errors["weights"] = RuntimeError(
         "forced residency retirement failure"
@@ -711,7 +749,7 @@ def test_unregister_retries_residency_retirement_failure(
     assert slot.unload_calls == 1 and slot.installed_checkpoint is None
     assert tuple(key.representation for key in residency.keys("run")) == ("weights",)
     with pytest.raises(RuntimeError, match="being unregistered"):
-        executor.prepare_residency("run", "forward", 0)
+        executor.prefetch_residency("run", "forward", 0)
 
     residency.retirement_errors.clear()
     executor.unregister_run("run")

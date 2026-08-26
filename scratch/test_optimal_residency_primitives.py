@@ -176,6 +176,38 @@ def test_grouped_prefetch_and_acquire_cover_complete_working_set(
     residency.close()
 
 
+def test_command_turn_rejects_an_unprepared_working_set(tmp_path: Path) -> None:
+    residency = manager(tmp_path, l1_bytes=1024, l2_bytes=4096)
+    weights = key("weights")
+    residency.register_l2(weights, (torch.empty(400, dtype=torch.uint8),))
+
+    with pytest.raises(RuntimeError, match="unprepared L1 working set"):
+        residency.acquire_prepared_l1_working_set((weights,))
+
+    assert residency.ledger.usage().ready_bytes["l1_gpu"] == 0
+    residency.close()
+
+
+def test_selected_command_retains_l1_across_competing_prefetches(
+    tmp_path: Path,
+) -> None:
+    residency = manager(tmp_path, l1_bytes=512, l2_bytes=4096)
+    selected = key("weights", generation="selected")
+    competing = key("weights", generation="competing")
+    residency.register_l2(selected, (torch.empty(400, dtype=torch.uint8),))
+    residency.register_l2(competing, (torch.empty(400, dtype=torch.uint8),))
+
+    residency.retain_l1_working_set((selected,))
+    with pytest.raises(ResidencyCapacityUnavailable):
+        residency.prefetch_l1_working_set((competing,))
+
+    residency.acquire_prepared_l1_working_set((selected,))
+    residency.release_l1_working_set((selected,))
+    residency.release_l1_working_set((selected,))
+    residency.prefetch_l1_working_set((competing,))
+    residency.close()
+
+
 def test_advance_defers_retirement_for_overlapping_l2_save_lease(
     tmp_path: Path,
 ) -> None:
