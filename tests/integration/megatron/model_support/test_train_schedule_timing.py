@@ -10,8 +10,15 @@ class _Schedule:
         self._span = None
         self.telemetry = SimpleNamespace(cuda_span=lambda: self._span)
 
-    def run(self, forward_step_func: Any, *, forward_only: bool) -> list[str]:
-        assert callable(forward_step_func) and forward_only is False
+    def run(
+        self,
+        forward_step_func: Any,
+        *,
+        forward_only: bool,
+        collect_non_loss_data: bool,
+    ) -> list[str]:
+        assert callable(forward_step_func)
+        assert forward_only is collect_non_loss_data is False
         self._span = next(self._spans, None)
         return ["output"]
 
