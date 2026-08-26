@@ -1703,27 +1703,25 @@ class MCoreRunSlotExecutor:
     def abort_kl_reference_acquisition(
         self, run_id: str, checkpoint_id: str, acquisition_id: str
     ) -> None:
-        self.discard_prepared_kl_reference(run_id, checkpoint_id)
         state = self._require_run(run_id)
-        acquired = state.kl_reference_acquisitions.pop(acquisition_id, None)
+        acquired = state.kl_reference_acquisitions.get(acquisition_id)
+        if acquired is not None and acquired != checkpoint_id:
+            raise RuntimeError("KL reference acquisition changed identity")
+        self.discard_prepared_kl_reference(run_id, checkpoint_id)
+        if acquired is None:
+            return
+        del state.kl_reference_acquisitions[acquisition_id]
+        self._decrement_kl_reference(state, checkpoint_id)
+
+    def release_kl_reference(
+        self, run_id: str, checkpoint_id: str, acquisition_id: str
+    ) -> None:
+        state = self._require_run(run_id)
+        acquired = state.kl_reference_acquisitions.get(acquisition_id)
         if acquired is None:
             return
         if acquired != checkpoint_id:
             raise RuntimeError("KL reference acquisition changed identity")
-        self._decrement_kl_reference(state, checkpoint_id)
-
-    def release_kl_reference(self, run_id: str, checkpoint_id: str) -> None:
-        state = self._require_run(run_id)
-        acquisition_id = next(
-            (
-                acquisition_id
-                for acquisition_id, acquired in state.kl_reference_acquisitions.items()
-                if acquired == checkpoint_id
-            ),
-            None,
-        )
-        if acquisition_id is None:
-            raise RuntimeError("KL reference acquisition state is inconsistent")
         del state.kl_reference_acquisitions[acquisition_id]
         self._decrement_kl_reference(state, checkpoint_id)
 
@@ -2405,6 +2403,10 @@ class MCoreRunSlotExecutor:
         state = self._require_run(
             run_id, require_complete=False, allow_unregistering=True
         )
+        if state.kl_reference_acquisitions or state.kl_reference_counts:
+            raise RuntimeError(
+                "cannot unregister a run with active KL reference acquisitions"
+            )
         state.unregistering = True
         failures: list[BaseException] = []
         for operation_id, (prepared_run_id, _fingerprint, _future) in tuple(

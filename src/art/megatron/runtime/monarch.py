@@ -56,6 +56,7 @@ from .specs import (
     ForwardJobSpec,
     GenerationSnapshotJobSpec,
     HybridEpRuntimeSpec,
+    KlReferenceAcquisition,
     KlReferenceSpec,
     LoadStateJobSpec,
     OptimizerJobSpec,
@@ -1742,8 +1743,12 @@ class MonarchTrainerActor(Actor):
         )
 
     @endpoint
-    def release_run_slot_kl_reference(self, run_id: str, checkpoint_id: str) -> None:
-        self._require_run_slot_executor().release_kl_reference(run_id, checkpoint_id)
+    def release_run_slot_kl_reference(
+        self, run_id: str, checkpoint_id: str, acquisition_id: str
+    ) -> None:
+        self._require_run_slot_executor().release_kl_reference(
+            run_id, checkpoint_id, acquisition_id
+        )
 
     @endpoint(explicit_response_port=True)
     def execute_run_slot_snapshot(
@@ -2913,7 +2918,9 @@ class MonarchTrainerSlot:
             timeout=self._command_timeout_s,
         )
 
-    async def acquire_kl_reference(self, spec: KlReferenceSpec) -> dict[str, float]:
+    async def acquire_kl_reference(
+        self, spec: KlReferenceSpec
+    ) -> KlReferenceAcquisition:
         async with self._kl_reference_lock:
             self._require_open()
             payload = spec.model_dump_json()
@@ -2989,28 +2996,64 @@ class MonarchTrainerSlot:
                     for item in acquired
                 ):
                     raise RuntimeError("KL reference acquired with mismatched identity")
-                return {
-                    "time/kl_reference_prepare_s": time.perf_counter() - started_at,
-                    "kl_reference/rank_bytes": float(
-                        sum(item["byte_count"] for item in acquired)
-                    ),
-                }
-            except BaseException:
-                await asyncio.gather(
-                    self._actors.abort_run_slot_kl_reference_acquisition.call(
-                        spec.run_id, spec.checkpoint_id, acquisition_id
-                    ),
-                    return_exceptions=True,
+                return KlReferenceAcquisition(
+                    run_id=spec.run_id,
+                    checkpoint_id=spec.checkpoint_id,
+                    acquisition_id=acquisition_id,
+                    metrics={
+                        "time/kl_reference_prepare_s": (
+                            time.perf_counter() - started_at
+                        ),
+                        "kl_reference/rank_bytes": float(
+                            sum(item["byte_count"] for item in acquired)
+                        ),
+                    },
                 )
+            except BaseException as error:
+                try:
+                    await asyncio.wait_for(
+                        self._actors.abort_run_slot_kl_reference_acquisition.call(
+                            spec.run_id, spec.checkpoint_id, acquisition_id
+                        ),
+                        timeout=self._command_timeout_s,
+                    )
+                except BaseException as cleanup_error:
+                    failure = BaseExceptionGroup(
+                        "KL reference acquisition and rollback failed",
+                        [error, cleanup_error],
+                    )
+                    await self._invalidate(
+                        failure, "KL reference acquisition rollback failed"
+                    )
+                    raise failure
                 raise
 
-    async def release_kl_reference(self, run_id: str, checkpoint_id: str) -> None:
+    async def release_kl_reference(
+        self, run_id: str, checkpoint_id: str, acquisition_id: str
+    ) -> None:
         async with self._kl_reference_lock:
             self._require_open()
-            await asyncio.wait_for(
-                self._actors.release_run_slot_kl_reference.call(run_id, checkpoint_id),
-                timeout=self._command_timeout_s,
-            )
+            try:
+                await asyncio.wait_for(
+                    self._actors.release_run_slot_kl_reference.call(
+                        run_id, checkpoint_id, acquisition_id
+                    ),
+                    timeout=self._command_timeout_s,
+                )
+            except BaseException as error:
+                try:
+                    await asyncio.wait_for(
+                        self._actors.release_run_slot_kl_reference.call(
+                            run_id, checkpoint_id, acquisition_id
+                        ),
+                        timeout=self._command_timeout_s,
+                    )
+                except BaseException as retry_error:
+                    failure = BaseExceptionGroup(
+                        "KL reference release retry failed", [error, retry_error]
+                    )
+                    await self._invalidate(failure, "KL reference release failed")
+                    raise failure
 
     async def load_state(self, job: LoadStateJobSpec) -> dict[str, Any]:
         async with self._control_lock:

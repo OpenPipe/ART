@@ -610,10 +610,18 @@ class ServerlessBackend:
                         for state in self._exact_adapter_states.values()
                         if state.leases
                     )
-                    if active:
+                    references = sorted(
+                        f"{key[2]}@{step}={count}"
+                        for (
+                            key,
+                            step,
+                        ), count in self._checkpoint_reference_counts.items()
+                        if count
+                    )
+                    if active or references:
                         raise RuntimeError(
-                            "cannot close ServerlessBackend with active exact adapter "
-                            f"leases: {', '.join(active)}"
+                            "cannot close ServerlessBackend with active exact "
+                            "references: " + ", ".join((*active, *references))
                         )
                     self._closing = True
 
@@ -695,6 +703,16 @@ class ServerlessBackend:
         if not isinstance(model, TrainableModel):
             raise TypeError("ServerlessBackend only supports trainable models")
         client = await self.training_client(model)
+        model_key = self._model_key(model)
+        async with self._sampler_state_lock:
+            if any(
+                key == model_key and count
+                for (key, _step), count in self._checkpoint_reference_counts.items()
+            ) or any(
+                key[0] == model_key and state.leases
+                for key, state in self._exact_adapter_states.items()
+            ):
+                raise RuntimeError("cannot delete a model with active exact references")
         await client.shutdown()
         async with self._sampler_state_lock:
             tail = self._sampler_publication_tails.get(self._model_key(model))
@@ -707,7 +725,6 @@ class ServerlessBackend:
                 await self._service.delete_checkpoint(
                     client.run_id, checkpoint.checkpoint_id
                 )
-        model_key = self._model_key(model)
         await self._clear_sampler_state(model_key)
         self._clients.pop(model_key)
 
@@ -2022,6 +2039,13 @@ class ServerlessBackend:
 
     async def _clear_sampler_state(self, model_key: _ModelKey | None = None) -> None:
         async with self._sampler_state_lock:
+            active_references = [
+                key
+                for key, count in self._checkpoint_reference_counts.items()
+                if count and (model_key is None or key[0] == model_key)
+            ]
+            if active_references:
+                raise RuntimeError("cannot clear sampler state with active references")
             active_retentions = [
                 key
                 for key, retention in self._sampler_retention_tails.items()

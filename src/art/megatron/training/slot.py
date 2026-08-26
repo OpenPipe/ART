@@ -50,6 +50,7 @@ from art.megatron.runtime.specs import (
     ForwardBackwardJobSpec,
     ForwardJobSpec,
     GenerationSnapshotJobSpec,
+    KlReferenceAcquisition,
     KlReferenceSpec,
     LoadStateJobSpec,
     OptimizerJobSpec,
@@ -747,7 +748,7 @@ class MegatronTrainingSlot:
 
     async def acquire_kl_reference(
         self, run_id: str, checkpoint_id: str, adapter_path: str
-    ) -> dict[str, float]:
+    ) -> KlReferenceAcquisition:
         self._require_run(run_id)
         return await self.trainer.acquire_kl_reference(
             KlReferenceSpec(
@@ -757,9 +758,11 @@ class MegatronTrainingSlot:
             )
         )
 
-    async def release_kl_reference(self, run_id: str, checkpoint_id: str) -> None:
+    async def release_kl_reference(
+        self, run_id: str, checkpoint_id: str, acquisition_id: str
+    ) -> None:
         self._require_run(run_id)
-        await self.trainer.release_kl_reference(run_id, checkpoint_id)
+        await self.trainer.release_kl_reference(run_id, checkpoint_id, acquisition_id)
 
     async def forward(self, prepared: PreparedForward) -> ForwardResult:
         launch = await self.start_forward(prepared)

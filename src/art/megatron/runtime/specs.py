@@ -13,7 +13,12 @@ from art.distributed.data_plane import PackedBatchRef
 from art.distributed.object_store import BinaryObjectPublicationTarget
 from art.distributed.specs import NixlTransportSpec, TrainerMeshSpec
 from art.megatron.optimizer_state import OptimizerAdapter
-from art.training.contracts import AdamConfig, LossConfig
+from art.training.contracts import (
+    MAX_CHECKPOINT_REFERENCE_LENGTH,
+    MAX_CONTROL_IDENTIFIER_LENGTH,
+    AdamConfig,
+    LossConfig,
+)
 from art.types import TrainConfig, TrainSFTConfig
 
 from .run_residency import RunResidencyConfig
@@ -235,9 +240,16 @@ class ExperimentalTrainConfig(_Spec):
 
 
 class KlReferenceSpec(_Spec):
-    run_id: str = Field(min_length=1)
-    checkpoint_id: str = Field(min_length=1)
+    run_id: str = Field(min_length=1, max_length=MAX_CONTROL_IDENTIFIER_LENGTH)
+    checkpoint_id: str = Field(min_length=1, max_length=MAX_CHECKPOINT_REFERENCE_LENGTH)
     adapter_path: str = Field(min_length=1)
+
+
+class KlReferenceAcquisition(_Spec):
+    run_id: str = Field(min_length=1, max_length=MAX_CONTROL_IDENTIFIER_LENGTH)
+    checkpoint_id: str = Field(min_length=1, max_length=MAX_CHECKPOINT_REFERENCE_LENGTH)
+    acquisition_id: str = Field(pattern=r"^[0-9a-f]{32}$")
+    metrics: dict[str, float]
 
 
 class TrainerGeneration(_Spec):
