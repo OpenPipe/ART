@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import copy
 from typing import Any, Literal, Sequence, cast
 
 import torch
@@ -349,7 +350,9 @@ class NemotronHHandler(DefaultMoeHandler):
     native_vllm_lora_status = "wip"
 
     def identity_lora_model_config(self, base_config: Any) -> Any:
-        return base_config
+        model_config = copy(base_config)
+        model_config.model_type = "art_nemotron_h_identity_lora"
+        return model_config
 
     def _identity_lora_parameter_suffixes(
         self, target_modules: list[str]
