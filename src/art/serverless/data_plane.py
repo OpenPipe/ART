@@ -342,7 +342,7 @@ def _validate_wire_chunks(chunks: tuple[memoryview, ...]) -> int:
 def encode_trajectory_group(
     bundle: TrajectoryGroupBundle,
     *,
-    object_id: str | None = None,
+    object_id: str,
     route_encoding: RouteWireEncoding = "prefix_tree",
     route_group: MoeRouteGroupPayload | None = None,
     stored_routes: tuple[MoeRouteStoredObject, ...] | None = None,
@@ -592,8 +592,11 @@ def _route_data_range(
 def prepare_training_batch(
     batch: TrainingBatch,
     *,
+    object_namespace: str,
     route_encoding: RouteWireEncoding = "prefix_tree",
 ) -> EncodedTrainingBatch:
+    if not object_namespace:
+        raise ValueError("training batch object namespace must not be empty")
     if isinstance(batch, RlTrajectoryBatch):
         annotations = batch.local_group_annotations()
         route_groups = batch.local_moe_route_groups()
@@ -603,6 +606,7 @@ def prepare_training_batch(
         groups = tuple(
             encode_trajectory_group(
                 group,
+                object_id=_object_id(f"{object_namespace}\0group\0{index}"),
                 route_encoding=route_encoding,
                 route_group=route_groups[index] if route_groups else None,
                 stored_routes=(
@@ -631,7 +635,7 @@ def prepare_training_batch(
         value = _encode_training_object(
             msgpack.encode(batch.model_dump(mode="python")),
             data_format=SFT_DATA_FORMAT,
-            object_id=None,
+            object_id=_object_id(f"{object_namespace}\0batch"),
         )
         objects = (value,)
         route_objects = ()
@@ -645,7 +649,7 @@ def prepare_training_batch(
         value = _encode_training_object(
             payload,
             data_format=TOKENIZED_DATA_FORMAT,
-            object_id=None,
+            object_id=_object_id(f"{object_namespace}\0batch"),
         )
         objects = (value,)
         route_objects = ()
@@ -955,12 +959,12 @@ def _encode_training_object(
         "art_sft_batch_msgpack_v1",
         "art_tokenized_batch_msgpack_v2",
     ],
-    object_id: str | None,
+    object_id: str,
 ) -> EncodedTrainingObject:
     digest = hashlib.sha256(payload).hexdigest()
     return EncodedTrainingObject(
         ref=TrainingDataRef(
-            object_id=object_id or _object_id(f"{data_format}\0{digest}"),
+            object_id=object_id,
             sha256=digest,
             byte_count=len(payload),
             format=data_format,
@@ -974,14 +978,14 @@ def _encode_training_object_chunks(
     *,
     identity: TrajectoryGroupDataIdentity,
     data_format: Literal["art_trajectory_group_records_v4"],
-    object_id: str | None,
+    object_id: str,
 ) -> EncodedTrainingObject:
     chunks = tuple(
         chunk for payload in payloads for chunk in _iter_readonly_chunks(payload)
     )
     return EncodedTrainingObject(
         ref=TrainingDataRef(
-            object_id=object_id or _object_id(f"{data_format}\0{identity.sha256}"),
+            object_id=object_id,
             sha256=identity.sha256,
             byte_count=identity.byte_count,
             format=data_format,

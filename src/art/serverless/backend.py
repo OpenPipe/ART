@@ -1756,7 +1756,10 @@ class ServerlessBackend:
         encode_started = time.monotonic()
         try:
             encoded_batch, cancelled = await complete_to_thread(
-                lambda: prepare_training_batch(batch)
+                lambda: prepare_training_batch(
+                    batch,
+                    object_namespace=request_id,
+                )
             )
             if cancelled is not None:
                 raise cancelled

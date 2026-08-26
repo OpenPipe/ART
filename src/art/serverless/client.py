@@ -245,7 +245,10 @@ def _prepare_forward_submission(
     prepared = (
         encoded_batch
         if encoded_batch is not None
-        else prepare_training_batch(request.batch)
+        else prepare_training_batch(
+            request.batch,
+            object_namespace=request.request_id,
+        )
     )
     if prepared.batch is not request.batch:
         raise ValueError("prepared batch does not belong to the request")

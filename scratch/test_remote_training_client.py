@@ -12,6 +12,7 @@ import httpx
 import pytest
 
 from art import Trajectory, TrajectoryGroup
+from art.distributed.object_store import S3ObjectStoreConfig
 from art.distributed.trajectory_store import TrajectoryGroupBundle
 from art.pipeline_tuner.config import PackedGroupShape, PackingLeafShape
 import art.serverless.client as client_module
@@ -44,6 +45,7 @@ from art.serverless.data_plane import (
     decode_forward_submission_prefix,
     decode_operation_result,
     encode_operation_result,
+    prepare_training_batch,
 )
 from art.training.contracts import (
     AdamConfig,
@@ -59,6 +61,33 @@ from art.training.contracts import (
     TokenizedTrainingBatch,
 )
 from art.training.tokenized import TokenizedDatum
+
+
+def test_remote_object_store_read_timeout_covers_network_tails() -> None:
+    config = S3ObjectStoreConfig(
+        endpoint_url="https://objects.test",
+        region="test",
+        bucket="test",
+        prefix="test",
+    )
+    assert config.read_timeout_s == 16.0
+
+
+def test_training_input_identity_is_idempotent_per_request() -> None:
+    group = TrajectoryGroupBundle.from_group(TrajectoryGroup([Trajectory()]))
+    batch = RlTrajectoryBatch(
+        groups=(group, group),
+        min_source_version=0,
+        max_source_version=0,
+    )
+    first = prepare_training_batch(batch, object_namespace="request-a")
+    retry = prepare_training_batch(batch, object_namespace="request-a")
+    next_request = prepare_training_batch(batch, object_namespace="request-b")
+
+    assert first.remote == retry.remote
+    assert len({value.ref.object_id for value in first.objects}) == 2
+    assert first.objects[0].ref.sha256 == next_request.objects[0].ref.sha256
+    assert first.objects[0].ref.object_id != next_request.objects[0].ref.object_id
 
 
 @pytest.mark.asyncio

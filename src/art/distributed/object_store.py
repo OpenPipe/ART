@@ -59,7 +59,7 @@ class S3ObjectStoreConfig(_ObjectModel):
     )
     multipart_concurrency: int = Field(default=16, ge=1)
     connect_timeout_s: float = Field(default=2.0, gt=0, le=60)
-    read_timeout_s: float = Field(default=2.0, gt=0, le=300)
+    read_timeout_s: float = Field(default=16.0, gt=0, le=300)
     max_attempts: int = Field(default=2, ge=1, le=5)
 
     @property
