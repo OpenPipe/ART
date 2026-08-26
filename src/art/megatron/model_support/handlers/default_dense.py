@@ -1,4 +1,4 @@
-from contextlib import nullcontext
+from contextlib import AbstractContextManager, nullcontext
 from typing import Any, Callable, Literal, Sequence
 
 import torch
@@ -52,6 +52,9 @@ class DefaultDenseHandler:
 
     def identity_lora_model_config(self, base_config: Any) -> Any:
         return base_config
+
+    def identity_lora_model_context(self) -> AbstractContextManager[None]:
+        return nullcontext()
 
     def identity_lora_target_parameters(
         self,

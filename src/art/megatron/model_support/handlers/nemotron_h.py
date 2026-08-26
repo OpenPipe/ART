@@ -1,10 +1,16 @@
 from __future__ import annotations
 
+from contextlib import AbstractContextManager, nullcontext
 from copy import copy
 from functools import lru_cache
+from importlib.machinery import ModuleSpec
+from importlib.util import find_spec
 import json
 from pathlib import Path
+import sys
+from types import ModuleType
 from typing import Any, Literal, Sequence, cast
+from unittest.mock import patch
 
 import torch
 
@@ -38,6 +44,26 @@ _EXPERT_MAPPING_AXES = {
     "decoder.layers.*.mlp.experts.local_experts.*.linear_fc1.weight": 0,
     "decoder.layers.*.mlp.experts.local_experts.*.linear_fc2.weight": 1,
 }
+
+
+def _identity_lora_rmsnorm(*args: Any, **kwargs: Any) -> None:
+    raise RuntimeError("identity-LoRA Mamba shim cannot execute model math")
+
+
+def _identity_lora_model_context() -> AbstractContextManager[None]:
+    if find_spec("mamba_ssm") is not None:
+        return nullcontext()
+    modules: dict[str, ModuleType] = {}
+    for name in ("mamba_ssm", "mamba_ssm.ops", "mamba_ssm.ops.triton"):
+        module = ModuleType(name)
+        setattr(module, "__path__", [])
+        module.__spec__ = ModuleSpec(name, loader=None, is_package=True)
+        modules[name] = module
+    layernorm = ModuleType("mamba_ssm.ops.triton.layernorm_gated")
+    layernorm.__spec__ = ModuleSpec(layernorm.__name__, loader=None)
+    setattr(layernorm, "rmsnorm_fn", _identity_lora_rmsnorm)
+    modules[layernorm.__name__] = layernorm
+    return patch.dict(sys.modules, modules)
 
 
 def _configure_moe_padding(provider: Any) -> None:
@@ -485,6 +511,9 @@ class NemotronHHandler(DefaultMoeHandler):
         model_config = copy(base_config)
         model_config.model_type = "art_nemotron_h_identity_lora"
         return model_config
+
+    def identity_lora_model_context(self) -> AbstractContextManager[None]:
+        return _identity_lora_model_context()
 
     def _identity_lora_parameter_suffixes(
         self, target_modules: list[str]

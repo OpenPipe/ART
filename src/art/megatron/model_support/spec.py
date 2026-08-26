@@ -119,6 +119,8 @@ class ModelSupportHandler(Protocol):
 
     def identity_lora_model_config(self, base_config: Any) -> Any: ...
 
+    def identity_lora_model_context(self) -> AbstractContextManager[None]: ...
+
     def identity_lora_target_parameters(
         self,
         model: Any,
