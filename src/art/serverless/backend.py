@@ -1499,7 +1499,10 @@ class ServerlessBackend:
             async for page in self._service.iter_checkpoint_pages(client.run_id):
                 protected_checkpoint_ids.update(page.protected_checkpoint_ids)
                 for checkpoint in page.checkpoints:
-                    if checkpoint.state != "ready":
+                    if (
+                        checkpoint.state != "ready"
+                        or checkpoint.learner_version not in plan.observed_steps
+                    ):
                         continue
                     if len(ready) == MAX_CHECKPOINT_RETENTION_ITEMS:
                         raise RuntimeError(

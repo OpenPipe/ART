@@ -1126,6 +1126,38 @@ async def test_retention_apply_does_not_block_or_forget_new_publication() -> Non
 
 
 @pytest.mark.asyncio
+async def test_retention_ignores_checkpoint_committed_after_planning() -> None:
+    backend, model, _, _ = _backend()
+    service = _RetentionService(_checkpoint(3), _checkpoint(4))
+    service.apply_gate.set()
+    backend._service = service
+
+    await backend._apply_checkpoint_retention(
+        model,
+        CheckpointRetentionPlan(observed_steps={3}),
+    )
+
+    assert tuple(item.checkpoint_id for item in service.retention_request.observed) == (
+        "step-3",
+    )
+
+
+@pytest.mark.asyncio
+async def test_retention_rejects_checkpoint_removed_after_planning() -> None:
+    backend, model, _, _ = _backend()
+    service = _RetentionService(_checkpoint(4))
+    backend._service = service
+
+    with pytest.raises(
+        RuntimeError, match="remote checkpoint catalog changed during retention"
+    ):
+        await backend._apply_checkpoint_retention(
+            model,
+            CheckpointRetentionPlan(observed_steps={3}),
+        )
+
+
+@pytest.mark.asyncio
 async def test_retention_keeps_server_protected_recovery_generation() -> None:
     backend, model, _, _ = _backend()
     service = _RetentionService(
