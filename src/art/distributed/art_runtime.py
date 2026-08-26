@@ -97,22 +97,23 @@ class DistributedPackedBatch(BaseModel):
 
     leases: PackedBatchLeaseSet
     packed_group_shapes: tuple[Any, ...]
-    trainable_assistant_tokens: int
-    loss_bearing_tokens: int
-    non_padding_tokens: int
-    trajectory_log_path: str | None = None
-    packing_rpc_s: float = 0.0
-    trajectory_fetch_s: float = 0.0
-    trajectory_receive_s: float = 0.0
-    trajectory_build_s: float = 0.0
-    packing_core_s: float = 0.0
-    packing_lock_wait_s: float = 0.0
-    packing_compute_s: float = 0.0
-    packing_timings: PackingTimings = Field(default_factory=PackingTimings)
-    trajectory_log_wait_s: float = 0.0
-    packed_batch_finalize_s: float = 0.0
-    packed_batch_fanout_s: float = 0.0
-    packing_generation_id: str
+    trainable_assistant_tokens: int = Field(ge=0)
+    loss_bearing_tokens: int = Field(ge=0)
+    non_padding_tokens: int = Field(ge=0)
+    num_dropped_trajectories: int = Field(ge=0)
+    trajectory_log_path: str | None
+    packing_rpc_s: float = Field(ge=0)
+    trajectory_fetch_s: float = Field(ge=0)
+    trajectory_receive_s: float = Field(ge=0)
+    trajectory_build_s: float = Field(ge=0)
+    packing_core_s: float = Field(ge=0)
+    packing_lock_wait_s: float = Field(ge=0)
+    packing_compute_s: float = Field(ge=0)
+    packing_timings: PackingTimings
+    trajectory_log_wait_s: float = Field(ge=0)
+    packed_batch_finalize_s: float = Field(ge=0)
+    packed_batch_fanout_s: float = Field(ge=0)
+    packing_generation_id: str = Field(min_length=1)
 
 
 class DistributedPackingPlan(BaseModel):
@@ -1049,6 +1050,7 @@ class ArtRuntime:
             trainable_assistant_tokens=result.trainable_assistant_tokens,
             loss_bearing_tokens=result.loss_bearing_tokens,
             non_padding_tokens=result.non_padding_tokens,
+            num_dropped_trajectories=result.num_dropped_trajectories,
             trajectory_log_path=result.trajectory_log_path,
             packing_rpc_s=packing_rpc_s,
             trajectory_fetch_s=result.trajectory_fetch_s,

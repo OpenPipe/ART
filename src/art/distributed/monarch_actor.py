@@ -21,7 +21,7 @@ from monarch.actor import (  # ty: ignore[unresolved-import]
     concurrent_endpoint,
     endpoint,
 )
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 from art.megatron.runtime.managed import MegatronRuntimeInfo
 from art.utils.lifecycle import (
@@ -103,6 +103,7 @@ class _RetainedPackingPlan(BaseModel):
     request: PackingRequest
     prepared: Any | None
     packed_group_shapes: tuple[Any | None, ...]
+    num_dropped_trajectories: int = Field(ge=0)
     storage_byte_count: int
     packing_timings: Any
     trajectory_fetch_s: float
@@ -1011,6 +1012,7 @@ class ArtHostService(Actor):
                         plan=plan,
                         pad_token_id=-100,
                         advantage_balance=0.0,
+                        num_dropped_trajectories=0,
                     )
                 elif self._packer is None:
                     from art.megatron.backend import MegatronBackend
@@ -1091,6 +1093,9 @@ class ArtHostService(Actor):
             request=request,
             prepared=prepared,
             packed_group_shapes=shapes,
+            num_dropped_trajectories=(
+                0 if prepared is None else prepared.num_dropped_trajectories
+            ),
             storage_byte_count=storage_byte_count,
             packing_timings=packing_timings,
             trajectory_fetch_s=trajectory_fetch_s,
@@ -1127,6 +1132,11 @@ class ArtHostService(Actor):
             return PackingResult(
                 ref=None,
                 packed_group_shapes=retained.packed_group_shapes,
+                trainable_assistant_tokens=0,
+                loss_bearing_tokens=0,
+                non_padding_tokens=0,
+                num_dropped_trajectories=retained.num_dropped_trajectories,
+                trajectory_log_path=None,
                 generation_id=generation_id,
                 trajectory_fetch_s=retained.trajectory_fetch_s,
                 trajectory_receive_s=retained.trajectory_receive_s,
@@ -1138,6 +1148,7 @@ class ArtHostService(Actor):
                 packing_compute_s=retained.packing_compute_s + packing_compute_s,
                 packing_timings=retained.packing_timings,
                 trajectory_log_wait_s=retained.trajectory_log_wait_s,
+                packed_batch_finalize_s=0.0,
             )
         prepared = retained.prepared
         store = self._packed_batches.store
@@ -1204,6 +1215,7 @@ class ArtHostService(Actor):
                 trainable_assistant_tokens=counts.trainable_assistant_tokens,
                 loss_bearing_tokens=loss_bearing_tokens,
                 non_padding_tokens=counts.non_padding_tokens,
+                num_dropped_trajectories=retained.num_dropped_trajectories,
                 trajectory_log_path=retained.request.trajectory_log_path,
                 trajectory_fetch_s=retained.trajectory_fetch_s,
                 trajectory_receive_s=retained.trajectory_receive_s,
