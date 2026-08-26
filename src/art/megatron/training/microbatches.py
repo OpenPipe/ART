@@ -25,12 +25,16 @@ from art.megatron.flex_attn.compiled import flash_sparse_block_size_for_head_dim
 from art.megatron.prefix_tree import parse_prefix_tree
 from art.megatron.prefix_tree_state import create_prefix_tree_state
 from art.megatron.runtime.preschedule_trace import trace_current_preschedule
-from art.megatron.selective_lm_head import LmHeadTokenSelection
+from art.megatron.selective_lm_head import (
+    LmHeadTokenSelection,
+    tokenized_lm_head_masks,
+)
 from art.megatron.training.trace import (
     packed_sequence_token_uids,
     sft_sequence_token_uids,
 )
 from art.preprocessing.pack import PackedTensors
+from art.training.tokenized import TokenizedLossName
 
 
 class CpBatchLookaheadState(BaseModel):
@@ -441,8 +445,12 @@ def _move_inputs_to_device(inputs: PackedTensors, device: torch.device) -> None:
 def _count_trainable_tokens(
     inputs: LossInputs | DispatchedPackedTensors,
 ) -> torch.Tensor:
-    if isinstance(inputs, DispatchedPackedTensors) and inputs.loss_weights is not None:
-        return (inputs.loss_weights != 0).any(dim=-1).sum(dtype=torch.int64)
+    if isinstance(inputs, DispatchedPackedTensors) and inputs.target_tokens is not None:
+        active = torch.zeros_like(inputs.target_tokens, dtype=torch.bool)
+        for coefficients in (inputs.loss_weights, inputs.token_advantages):
+            if coefficients is not None:
+                active |= coefficients != 0
+        return active.any(dim=-1).sum(dtype=torch.int64)
     assistant_mask = inputs.align_inputs().assistant_mask
     return assistant_mask.sum(dtype=torch.int64)
 
@@ -452,7 +460,9 @@ def _local_trainable_token_count_tensor(
     device: torch.device,
 ) -> torch.Tensor:
     return torch.stack(
-        tuple(_count_trainable_tokens(micro).to(device=device) for micro in micro_inputs)
+        tuple(
+            _count_trainable_tokens(micro).to(device=device) for micro in micro_inputs
+        )
     ).sum(dtype=torch.int64)
 
 
@@ -588,6 +598,8 @@ def _prepare_dense_rl_micro(
     provider: Any,
     model_support_handler: Any,
     ref_logprobs: torch.Tensor | None,
+    loss_name: TokenizedLossName | None = None,
+    return_token_logprobs: bool = True,
 ) -> PreparedRLMicroInputs:
     attention_state = create_prefix_tree_state(
         group_ids=micro["group_ids"],
@@ -612,18 +624,31 @@ def _prepare_dense_rl_micro(
         if tokenized
         else shift_tensor(micro["assistant_mask"], False)
     )
-    shifted_labels = (
-        micro["target_tokens"][..., 0]
-        if tokenized
-        else torch.where(
+    if tokenized:
+        projection_mask, active_mask = tokenized_lm_head_masks(
+            target_tokens=micro["target_tokens"],
+            loss_weights=micro.get("loss_weights"),
+            token_advantages=micro.get("token_advantages"),
+            loss_name=loss_name,
+            return_token_logprobs=return_token_logprobs,
+        )
+        shifted_labels = micro["target_tokens"][..., 0].masked_fill(
+            ~projection_mask, -100
+        )
+    else:
+        shifted_labels = torch.where(
             shifted_assistant_mask,
             shift_tensor(micro["tokens"], -100),
             torch.full_like(micro["tokens"], -100),
         )
-    )
-    lm_head_selection = LmHeadTokenSelection.from_labels(
-        shifted_labels,
-        target_device=device,
+        active_mask = shifted_labels != -100
+    lm_head_selection = (
+        LmHeadTokenSelection.from_mask(projection_mask, target_device=device)
+        if tokenized
+        else LmHeadTokenSelection.from_labels(
+            shifted_labels,
+            target_device=device,
+        )
     )
     workload = TrainingMicrobatchWorkload(
         logical_nonpadding_tokens=sum(
@@ -632,7 +657,7 @@ def _prepare_dense_rl_micro(
                 group_ids=micro["group_ids"], parent_ids=micro["parent_ids"]
             )
         ),
-        loss_bearing_tokens=lm_head_selection.logical_row_count,
+        loss_bearing_tokens=int(active_mask.sum().item()),
         executed_token_equivalents=int(micro["tokens"].numel()),
         nominal_schedule_capacity_tokens=int(micro["tokens"].numel()),
     )
@@ -664,6 +689,8 @@ def _prepare_rl_cp_micro_full(
     model_support_handler: Any,
     trace_token_uids: bool,
     ref_logprobs: torch.Tensor | None,
+    loss_name: TokenizedLossName | None = None,
+    return_token_logprobs: bool = True,
 ) -> PreparedMegatronBatch:
     """Prepare RL CP inputs without moving planning metadata to CUDA first.
 
@@ -701,6 +728,8 @@ def _prepare_rl_cp_micro_full(
         model_support_handler=model_support_handler,
         attention_head_dim=getattr(provider, "kv_channels", None),
         attention_value_head_dim=getattr(provider, "kv_channels", None),
+        loss_name=loss_name,
+        return_token_logprobs=return_token_logprobs,
     )
 
 
@@ -739,6 +768,8 @@ def _prepare_current_rl_micro(
     ref_logprobs: torch.Tensor | None,
     trace_token_uids: bool,
     pending_prepared_micro: PreparedMegatronBatch | None,
+    loss_name: TokenizedLossName | None = None,
+    return_token_logprobs: bool = True,
 ) -> tuple[PreparedRLMicroInputs, PreparedMegatronBatch | None]:
     if int(topology.cp) <= 1:
         return (
@@ -748,6 +779,8 @@ def _prepare_current_rl_micro(
                 provider=provider,
                 model_support_handler=model_support_handler,
                 ref_logprobs=ref_logprobs,
+                loss_name=loss_name,
+                return_token_logprobs=return_token_logprobs,
             ),
             pending_prepared_micro,
         )
@@ -761,6 +794,8 @@ def _prepare_current_rl_micro(
             model_support_handler=model_support_handler,
             trace_token_uids=trace_token_uids,
             ref_logprobs=ref_logprobs,
+            loss_name=loss_name,
+            return_token_logprobs=return_token_logprobs,
         )
     return _prepared_rl_micro_from_cp_batch(prepared, ref_logprobs=ref_logprobs), None
 
@@ -774,6 +809,8 @@ def _prepare_next_rl_cp_micro(
     model_support_handler: Any,
     trace_token_uids: bool,
     ref_logprobs: torch.Tensor | None = None,
+    loss_name: TokenizedLossName | None = None,
+    return_token_logprobs: bool = True,
 ) -> PreparedMegatronBatch | None:
     if next_micro is None or int(topology.cp) <= 1:
         return None
@@ -785,6 +822,8 @@ def _prepare_next_rl_cp_micro(
         model_support_handler=model_support_handler,
         trace_token_uids=trace_token_uids,
         ref_logprobs=ref_logprobs,
+        loss_name=loss_name,
+        return_token_logprobs=return_token_logprobs,
     )
 
 

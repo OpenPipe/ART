@@ -95,7 +95,7 @@ from art.megatron.selective_lm_head import (
     TokenLossOutput,
     forward_token_logits,
     forward_token_losses,
-    vocab_parallel_selected_logprobs,
+    selected_target_logprobs,
 )
 from art.megatron.tensor_snapshot import SnapshotReadBarrier
 from art.megatron.training.command_telemetry import (
@@ -3685,9 +3685,9 @@ def _inter_forward_backward_phase_metrics(
             )
         }
     )
-    values[
-        f"{_INTER_FORWARD_BACKWARD_PHASE_PREFIX}phase_order_valid_rank_{rank}"
-    ] = float(parts[4])
+    values[f"{_INTER_FORWARD_BACKWARD_PHASE_PREFIX}phase_order_valid_rank_{rank}"] = (
+        float(parts[4])
+    )
     return values
 
 
@@ -3964,6 +3964,8 @@ def run_megatron_rl_forward_backward_step(
             ref_logprobs=micro_ref_logprobs,
             trace_token_uids=trace_token_uids,
             pending_prepared_micro=pending_prepared_micro,
+            loss_name=None if loss is None else loss.name,
+            return_token_logprobs=return_token_logprobs,
         )
         trace_current_preschedule("cp_current_micro_exit", micro_order=micro_order)
         prepared_micros.append(prepared_micro)
@@ -3985,6 +3987,8 @@ def run_megatron_rl_forward_backward_step(
                 micro_count=micro_count,
                 next_step_first_ref_logprobs=next_step_first_ref_logprobs,
             ),
+            loss_name=None if loss is None else loss.name,
+            return_token_logprobs=return_token_logprobs,
         )
         trace_current_preschedule(
             "cp_lookahead_micro_exit",
@@ -4058,8 +4062,10 @@ def run_megatron_rl_forward_backward_step(
                 selected_advantages = prepared.lm_head_selection.select_rows(
                     token_advantages
                 )
-                selected_logprobs = vocab_parallel_selected_logprobs(
-                    output_tensor, selected_targets
+                selected_logprobs = selected_target_logprobs(
+                    model,
+                    output_tensor,
+                    selected_targets,
                 )
                 loss_output = tokenized_loss(
                     loss,
@@ -4105,8 +4111,12 @@ def run_megatron_rl_forward_backward_step(
                     "kl_policy_ref_sum": None,
                     "kl_policy_ref_count": None,
                     "offpolicy_diagnostics": diagnostics,
-                    "new_logprobs": prepared.lm_head_selection.restore_rows(
-                        selected_logprobs.detach()
+                    "new_logprobs": (
+                        prepared.lm_head_selection.restore_rows(
+                            selected_logprobs.detach()
+                        )
+                        if return_token_logprobs
+                        else None
                     ),
                 }
                 if forward_only:

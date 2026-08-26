@@ -15,8 +15,12 @@ from art.megatron.runtime.preschedule_trace import (
     cuda_stream_fields,
     trace_current_preschedule,
 )
-from art.megatron.selective_lm_head import LmHeadTokenSelection
+from art.megatron.selective_lm_head import (
+    LmHeadTokenSelection,
+    tokenized_lm_head_masks,
+)
 from art.preprocessing.pack import PackedTensors
+from art.training.tokenized import TokenizedLossName
 
 from .builder import build_prefix_tree_attention_spec
 from .layout_index import TokenLayoutIndex
@@ -2199,6 +2203,8 @@ def prepare_cp_micro(
     model_support_handler: Any | None = None,
     attention_head_dim: int | None = None,
     attention_value_head_dim: int | None = None,
+    loss_name: TokenizedLossName | None = None,
+    return_token_logprobs: bool = True,
 ) -> PreparedMegatronBatch:
     """Prepare one CP microbatch with a CPU-only planning phase.
 
@@ -2240,6 +2246,8 @@ def prepare_cp_micro(
         target_device=target_device,
         cp_group=cp_group,
         ref_logprobs=ref_logprobs,
+        loss_name=loss_name,
+        return_token_logprobs=return_token_logprobs,
     )
     trace_current_preschedule(
         "cp_tensor_dispatch_exit",
@@ -2429,6 +2437,8 @@ def dispatch_megatron_context_parallel_training_tensors(
     target_device: torch.device | None = None,
     cp_group: Any | None = None,
     ref_logprobs: torch.Tensor | None = None,
+    loss_name: TokenizedLossName | None = None,
+    return_token_logprobs: bool = True,
 ) -> tuple[DispatchedPackedTensors, TrainingMicrobatchWorkload]:
     """Gather this rank's training tensors and optionally move them to device.
 
@@ -2446,15 +2456,22 @@ def dispatch_megatron_context_parallel_training_tensors(
         if tokenized
         else shift_tensor(micro["assistant_mask"], False)
     )
-    labels = (
-        micro["target_tokens"][..., 0]
-        if tokenized
-        else torch.where(
+    if tokenized:
+        projection_mask, active_mask = tokenized_lm_head_masks(
+            target_tokens=micro["target_tokens"],
+            loss_weights=micro.get("loss_weights"),
+            token_advantages=micro.get("token_advantages"),
+            loss_name=loss_name,
+            return_token_logprobs=return_token_logprobs,
+        )
+        labels = micro["target_tokens"][..., 0].masked_fill(~projection_mask, -100)
+    else:
+        labels = torch.where(
             assistant_mask,
             shift_tensor(micro["tokens"], -100),
             torch.full_like(micro["tokens"], -100),
         )
-    )
+        active_mask = labels != -100
     old_logprobs = shift_tensor(micro["logprobs"], float("nan"))
     advantages = shift_tensor(micro["advantages"], 0.0)
     weights = shift_tensor(micro["weights"], 0.0)
@@ -2495,6 +2512,7 @@ def dispatch_megatron_context_parallel_training_tensors(
         return None if tensor is None else dispatch(tensor, pad_value)
 
     local_labels = dispatch(labels, -100, move_to_target=False)
+    local_active_mask = dispatch(active_mask, False, move_to_target=False)
     lm_head_selection = LmHeadTokenSelection.from_labels(
         local_labels,
         target_device=target_device,
@@ -2530,11 +2548,11 @@ def dispatch_megatron_context_parallel_training_tensors(
     )
     trace_current_preschedule(
         "cp_loss_bearing_tokens",
-        loss_bearing_tokens=lm_head_selection.logical_row_count,
+        loss_bearing_tokens=int(local_active_mask.sum().item()),
     )
     workload = TrainingMicrobatchWorkload(
         logical_nonpadding_tokens=sum(rank_plan.local_valid_lengths),
-        loss_bearing_tokens=lm_head_selection.logical_row_count,
+        loss_bearing_tokens=int(local_active_mask.sum().item()),
         executed_token_equivalents=int(local_labels.numel()),
         nominal_schedule_capacity_tokens=rank_plan.original_seq_len,
     )
