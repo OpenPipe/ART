@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sys
 from typing import Any, Literal, Sequence, cast
 
 import torch
@@ -30,6 +31,80 @@ _EXPERT_MAPPING_AXES = {
     "decoder.layers.*.mlp.experts.local_experts.*.linear_fc1.weight": 0,
     "decoder.layers.*.mlp.experts.local_experts.*.linear_fc2.weight": 1,
 }
+
+
+def _hf_reference_mamba_forward(
+    mixer: Any,
+    input_states: torch.Tensor,
+    cache_params: Any = None,
+    cache_position: torch.Tensor | None = None,
+    attention_mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Use the pinned training SSD scan in the otherwise-native HF mixer."""
+
+    if cache_params is not None:
+        raise RuntimeError("Nemotron-H HF parity does not support Mamba cache state")
+    batch, sequence, _ = input_states.shape
+    if sequence <= 0 or (
+        cache_position is not None
+        and (
+            cache_position.dtype != torch.int64
+            or tuple(cache_position.shape) != (sequence,)
+            or not torch.equal(
+                cache_position,
+                torch.arange(sequence, device=cache_position.device),
+            )
+        )
+    ):
+        raise RuntimeError("Nemotron-H HF parity received invalid cache positions")
+    implementation = sys.modules.get(type(mixer).__module__)
+    mask_padding = getattr(implementation, "apply_mask_to_padding_states", None)
+    if not callable(mask_padding):
+        raise RuntimeError("Nemotron-H HF padding-mask helper is unavailable")
+    input_dtype = input_states.dtype
+    projected = mixer.in_proj(mask_padding(input_states, attention_mask))
+    expected_width = (
+        2 * mixer.intermediate_size
+        + 2 * mixer.n_groups * mixer.ssm_state_size
+        + mixer.num_heads
+    )
+    if int(projected.shape[-1]) != expected_width:
+        raise RuntimeError("Nemotron-H HF Mamba projection geometry changed")
+    gate, convolved, dt = projected.split(
+        [mixer.intermediate_size, mixer.conv_dim, mixer.num_heads], dim=-1
+    )
+    convolved = mixer.act(
+        mixer.conv1d(convolved.transpose(1, 2))[..., :sequence].transpose(1, 2)
+    )
+    convolved = mask_padding(convolved, attention_mask)
+    group_width = mixer.n_groups * mixer.ssm_state_size
+    x, b, c = convolved.split(
+        [mixer.intermediate_size, group_width, group_width], dim=-1
+    )
+    scan_length = round_up_to_multiple(sequence, int(mixer.chunk_size))
+
+    def pad(value: torch.Tensor, fill: float) -> torch.Tensor:
+        tail = value.new_full((batch, scan_length - sequence, *value.shape[2:]), fill)
+        return torch.cat((value, tail), dim=1)
+
+    from art.megatron.mamba.operator import _mamba_chunk_scan_combined
+
+    output = _mamba_chunk_scan_combined()(
+        pad(x.view(batch, sequence, mixer.num_heads, mixer.head_dim), 0.0),
+        pad(dt, -torch.inf),
+        -torch.exp(mixer.A_log.float()),
+        pad(b.view(batch, sequence, mixer.n_groups, mixer.ssm_state_size), 0.0),
+        pad(c.view(batch, sequence, mixer.n_groups, mixer.ssm_state_size), 0.0),
+        chunk_size=mixer.chunk_size,
+        D=mixer.D.float(),
+        z=None,
+        dt_bias=mixer.dt_bias.float(),
+        dt_softplus=True,
+        return_final_states=False,
+        state_dtype=torch.float32,
+    )[:, :sequence]
+    output = mixer.norm(output.reshape(batch, sequence, -1), gate)
+    return mixer.out_proj(output.to(input_dtype))
 
 
 def _configure_moe_padding(provider: Any) -> None:
@@ -430,8 +505,54 @@ class NemotronHHandler(DefaultMoeHandler):
             "packed_seq_params": None,
         }
 
+    def prepare_hf_reference_model(self, model: Any) -> Any:
+        pattern = str(model.config.hybrid_override_pattern)
+        expected_names = [
+            f"backbone.layers.{index}.mixer"
+            for index, symbol in enumerate(pattern)
+            if symbol == "M"
+        ]
+        mixers = [
+            (name, module)
+            for name, module in model.named_modules()
+            if type(module).__name__ == "NemotronHMamba2Mixer"
+        ]
+        if [name for name, _ in mixers] != expected_names:
+            raise RuntimeError("Nemotron-H HF Mamba topology changed")
+        mixer_types = {type(module) for _, module in mixers}
+        if len(mixer_types) != 1:
+            raise RuntimeError("Nemotron-H HF Mamba implementation changed")
+        mixer_type = mixer_types.pop()
+        reference_type = type(
+            "ArtReferenceNemotronHMamba2Mixer",
+            (mixer_type,),
+            {
+                "__module__": mixer_type.__module__,
+                "torch_forward": _hf_reference_mamba_forward,
+            },
+        )
+        for _, mixer in mixers:
+            mixer.__class__ = reference_type
+        return model
+
     def correctness_precision(self) -> Literal["bf16", "fp32"]:
         return "bf16"
+
+    def correctness_phase_pass_fns(self, oracle_harness: Any) -> dict[str, Any]:
+        nonzero = {"typical_abs_scale": 0.0, "candidate_abs_scale": 0.0}
+        forward = oracle_harness.MetricThresholdRule(
+            limits={"mean_abs_pct": 3.0}, minimums=nonzero
+        )
+        grad = oracle_harness.MetricThresholdRule(
+            limits={"mean_abs_pct": 5.0}, minimums=nonzero
+        )
+        return {
+            "forward": forward,
+            "outputs": forward,
+            "losses": oracle_harness.MetricThresholdRule(limits={"mean_abs_pct": 3.0}),
+            "grads": grad,
+            "deltas": grad,
+        }
 
     def collect_layer_families(self, provider: Any) -> list[LayerFamilyInstance]:
         pattern = str(provider.hybrid_layer_pattern).split("/", 1)[0]
