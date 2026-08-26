@@ -1372,15 +1372,15 @@ class ServerlessBackend:
         try:
             client = await self.training_client(model)
             checkpoints = []
-            current_checkpoint_id = None
+            protected_checkpoint_ids: set[str] = set()
             async for page in self._service.iter_checkpoint_pages(client.run_id):
-                current_checkpoint_id = page.current_checkpoint_id
+                protected_checkpoint_ids.update(page.protected_checkpoint_ids)
                 checkpoints.extend(page.checkpoints)
             keep = set(steps_to_keep)
             keep.update(
                 checkpoint.learner_version
                 for checkpoint in checkpoints
-                if checkpoint.checkpoint_id == current_checkpoint_id
+                if checkpoint.checkpoint_id in protected_checkpoint_ids
             )
             retained = await self._reserve_sampler_forgetting(
                 retention,
@@ -1495,9 +1495,9 @@ class ServerlessBackend:
         try:
             client = await self.training_client(model)
             ready = []
-            current_checkpoint_id = None
+            protected_checkpoint_ids: set[str] = set()
             async for page in self._service.iter_checkpoint_pages(client.run_id):
-                current_checkpoint_id = page.current_checkpoint_id
+                protected_checkpoint_ids.update(page.protected_checkpoint_ids)
                 for checkpoint in page.checkpoints:
                     if checkpoint.state != "ready":
                         continue
@@ -1513,7 +1513,7 @@ class ServerlessBackend:
             retained.update(
                 checkpoint.learner_version
                 for checkpoint in ready
-                if checkpoint.checkpoint_id == current_checkpoint_id
+                if checkpoint.checkpoint_id in protected_checkpoint_ids
             )
             retained = await self._reserve_sampler_forgetting(
                 retention,
@@ -1525,8 +1525,10 @@ class ServerlessBackend:
                 for checkpoint in ready
                 if checkpoint.learner_version in retained
             }
-            if current_checkpoint_id is not None:
-                retain_checkpoint_ids.add(current_checkpoint_id)
+            retain_checkpoint_ids.update(
+                protected_checkpoint_ids
+                & {checkpoint.checkpoint_id for checkpoint in ready}
+            )
             await self._service.apply_checkpoint_retention(
                 client.run_id,
                 ApplyCheckpointRetentionRequest(

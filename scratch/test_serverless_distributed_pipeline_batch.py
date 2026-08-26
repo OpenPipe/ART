@@ -287,9 +287,10 @@ class _Service:
 
 
 class _RetentionService(_Service):
-    def __init__(self, *checkpoints: Any) -> None:
+    def __init__(self, *checkpoints: Any, protected: tuple[str, ...] = ()) -> None:
         super().__init__()
         self.checkpoints = checkpoints
+        self.protected = protected
         self.apply_started = asyncio.Event()
         self.apply_gate = asyncio.Event()
         self.retention_request = None
@@ -299,6 +300,7 @@ class _RetentionService(_Service):
         yield SimpleNamespace(
             checkpoints=self.checkpoints,
             current_checkpoint_id=None,
+            protected_checkpoint_ids=self.protected,
         )
 
     async def apply_checkpoint_retention(self, run_id, request) -> None:
@@ -744,7 +746,9 @@ async def test_remote_prepare_materializes_distributed_group_and_discards_once()
 
     context = await _prepare_context(backend, model, [summary])
     forward = await _admit_forward(context)
-    encoded = prepare_training_batch(client.batch, object_namespace="test-remote-prepare")
+    encoded = prepare_training_batch(
+        client.batch, object_namespace="test-remote-prepare"
+    )
     group_ref = encoded.remote.groups[0]
     payload = b"".join(encoded.objects[0].wire_chunks())
     decoded = decode_trajectory_group(group_ref, payload, route_payloads={})
@@ -1119,6 +1123,28 @@ async def test_retention_apply_does_not_block_or_forget_new_publication() -> Non
     assert backend._sampler_key(model, 3) not in backend._sampler_results
     assert backend._sampler_key(model, 4) in backend._sampler_results
     await backend._drain_background()
+
+
+@pytest.mark.asyncio
+async def test_retention_keeps_server_protected_recovery_generation() -> None:
+    backend, model, _, _ = _backend()
+    service = _RetentionService(
+        _checkpoint(1),
+        _checkpoint(6),
+        protected=("step-1", "step-6"),
+    )
+    service.apply_gate.set()
+    backend._service = service
+
+    await backend._apply_checkpoint_retention(
+        model,
+        CheckpointRetentionPlan(
+            observed_steps={1, 6},
+            retain_steps={6},
+        ),
+    )
+
+    assert service.retention_request.retain_checkpoint_ids == ("step-1", "step-6")
 
 
 @pytest.mark.asyncio

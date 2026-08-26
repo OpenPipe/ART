@@ -514,7 +514,21 @@ class CheckpointPage(Contract):
         max_length=MAX_CHECKPOINT_PAGE_LIMIT
     )
     current_checkpoint_id: str | None
+    protected_checkpoint_ids: tuple[ControlIdentifier, ...] = Field(max_length=2)
     next_cursor: CheckpointCursor | None
+
+    @model_validator(mode="after")
+    def _validate_protected(self) -> "CheckpointPage":
+        if len(self.protected_checkpoint_ids) != len(
+            set(self.protected_checkpoint_ids)
+        ):
+            raise ValueError("protected checkpoint ids must be unique")
+        if (
+            self.current_checkpoint_id is not None
+            and self.current_checkpoint_id not in self.protected_checkpoint_ids
+        ):
+            raise ValueError("current checkpoint must be protected")
+        return self
 
 
 class CheckpointAliasPage(Contract):

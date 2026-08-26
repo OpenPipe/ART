@@ -42,6 +42,7 @@ async def test_complete_checkpoint_listing_traverses_bounded_pages() -> None:
         page = CheckpointPage(
             checkpoints=checkpoints[:100] if cursor is None else checkpoints[100:],
             current_checkpoint_id="checkpoint-0104",
+            protected_checkpoint_ids=("checkpoint-0104",),
             next_cursor="second_page" if cursor is None else None,
         )
         return httpx.Response(200, json=page.model_dump(mode="json"))
@@ -80,6 +81,7 @@ async def test_retention_snapshot_rejects_checkpoint_513() -> None:
             yield CheckpointPage(
                 checkpoints=checkpoints[offset : offset + 100],
                 current_checkpoint_id="checkpoint-0512",
+                protected_checkpoint_ids=("checkpoint-0512",),
                 next_cursor=("next" if offset + 100 < len(checkpoints) else None),
             )
 
@@ -95,6 +97,7 @@ def test_checkpoint_wire_contracts_are_hard_bounded() -> None:
         CheckpointPage(
             checkpoints=(checkpoint,) * (MAX_CHECKPOINT_PAGE_LIMIT + 1),
             current_checkpoint_id=checkpoint.checkpoint_id,
+            protected_checkpoint_ids=(checkpoint.checkpoint_id,),
             next_cursor=None,
         )
     with pytest.raises(ValidationError, match="at most 100 items"):
@@ -108,5 +111,6 @@ def test_checkpoint_wire_contracts_are_hard_bounded() -> None:
         CheckpointPage(
             checkpoints=(),
             current_checkpoint_id=None,
+            protected_checkpoint_ids=(),
             next_cursor="not-an-opaque-cursor=",
         )

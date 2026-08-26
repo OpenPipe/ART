@@ -59,6 +59,7 @@ class _RetentionService(_Service):
                 ),
             ),
             current_checkpoint_id=None,
+            protected_checkpoint_ids=(),
         )
 
     async def apply_checkpoint_retention(self, run_id: str, request: Any) -> None:
