@@ -193,6 +193,13 @@ class OptimizerGenerationManifest(_OptimizerGenerationRecord):
     shards: tuple[OptimizerShard, ...]
 
 
+class VerifiedOptimizerGeneration(_OptimizerRecord):
+    """Exact optimizer generation authenticated before distributed loading."""
+
+    generation: str = Field(pattern=f"^{_GENERATION_PATTERN}$")
+    manifest_sha256: str = Field(pattern=_SHA256_PATTERN)
+
+
 class OptimizerGenerationPointer(_OptimizerGenerationRecord):
     format_version: Literal[3] = 3
 
@@ -1057,6 +1064,21 @@ def read_optimizer_generation_manifest(
     return _read_manifest(optimizer_generation_path(optimizer_state_path, generation))
 
 
+def verify_optimizer_generation(
+    optimizer_state_path: str, generation: str
+) -> VerifiedOptimizerGeneration:
+    """Authenticate one immutable generation once before rank-local reads."""
+    with optimizer_generation_lease(optimizer_state_path, generation) as pointer:
+        generation_path = optimizer_generation_path(optimizer_state_path, generation)
+        manifest, manifest_sha256 = _read_manifest_identity(generation_path)
+        _validate_pointer_manifest(pointer, manifest)
+        verify_optimizer_generation_manifest(optimizer_state_path, manifest)
+    return VerifiedOptimizerGeneration(
+        generation=generation,
+        manifest_sha256=manifest_sha256,
+    )
+
+
 def verify_optimizer_generation_manifest(
     optimizer_state_path: str, manifest: OptimizerGenerationManifest
 ) -> None:
@@ -1088,15 +1110,21 @@ def read_committed_optimizer_adapter_step(optimizer_state_path: str) -> int | No
 
 
 def _read_manifest(generation_path: Path) -> OptimizerGenerationManifest:
+    return _read_manifest_identity(generation_path)[0]
+
+
+def _read_manifest_identity(
+    generation_path: Path,
+) -> tuple[OptimizerGenerationManifest, str]:
     manifest_path = generation_path / OPTIMIZER_MANIFEST
     try:
-        return OptimizerGenerationManifest.model_validate_json(
-            manifest_path.read_text("utf-8")
-        )
+        encoded = manifest_path.read_bytes()
+        manifest = OptimizerGenerationManifest.model_validate_json(encoded)
     except Exception as exc:
         raise RuntimeError(
             f"Invalid optimizer generation manifest: {manifest_path}"
         ) from exc
+    return manifest, hashlib.sha256(encoded).hexdigest()
 
 
 def _ordered_manifest_shards(
@@ -2497,20 +2525,25 @@ def load_trainer_rank_optimizer_state(
     adapter_path: str,
     adapter_step: int,
     optimizer_generation_id: str,
+    verification: VerifiedOptimizerGeneration,
     layout: Any,
     sites: Sequence[tuple[Any, Any]],
     expected_keys: Sequence[str],
 ) -> Any:
     """Repartition one logical optimizer generation for this destination rank."""
+    if verification.generation != optimizer_generation_id:
+        raise RuntimeError("Optimizer verification names another generation")
     with optimizer_generation_lease(
         optimizer_state_path, optimizer_generation_id
     ) as pointer:
-        adapter = _loaded_adapter(adapter_path, adapter_step)
         generation_path = optimizer_generation_path(
             optimizer_state_path, pointer.generation
         )
-        manifest = _read_manifest(generation_path)
+        manifest, manifest_sha256 = _read_manifest_identity(generation_path)
+        if manifest_sha256 != verification.manifest_sha256:
+            raise RuntimeError("Optimizer generation manifest verification mismatch")
         _validate_pointer_manifest(pointer, manifest)
+        adapter = _loaded_adapter(adapter_path, adapter_step)
         shards = _validate_generation_files(generation_path, manifest, local_rank=None)
         if pointer.adapter.model_copy(update={"identity": adapter.identity}) != adapter:
             raise RuntimeError(

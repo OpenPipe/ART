@@ -1456,11 +1456,13 @@ class MCoreRunSlotExecutor:
         )
         if registration.initial_optimizer_state_path is not None:
             assert registration.initial_optimizer_generation_id is not None
+            assert registration.initial_optimizer_verification is not None
             loaded_optimizer = load_trainer_rank_optimizer_state(
                 optimizer_state_path=registration.initial_optimizer_state_path,
                 adapter_path=registration.adapter.identity,
                 adapter_step=registration.adapter.step,
                 optimizer_generation_id=registration.initial_optimizer_generation_id,
+                verification=registration.initial_optimizer_verification,
                 layout=self.optimizer_layout(checkpoint),
                 sites=checkpoint.sites,
                 expected_keys=tuple(checkpoint.expected_keys),
@@ -2296,11 +2298,13 @@ class MCoreRunSlotExecutor:
         )
         if job.optimizer_state_path is not None:
             assert job.optimizer_generation_id is not None
+            assert job.optimizer_verification is not None
             loaded = load_trainer_rank_optimizer_state(
                 optimizer_state_path=job.optimizer_state_path,
                 adapter_path=job.adapter_path,
                 adapter_step=job.adapter_step,
                 optimizer_generation_id=job.optimizer_generation_id,
+                verification=job.optimizer_verification,
                 layout=self.optimizer_layout(checkpoint),
                 sites=checkpoint.sites,
                 expected_keys=tuple(checkpoint.expected_keys),

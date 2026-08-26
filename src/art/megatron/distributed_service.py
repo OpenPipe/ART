@@ -62,6 +62,7 @@ from .optimizer_state import (
     read_adapter_publication,
     read_committed_optimizer_pointer,
     resolve_committed_optimizer_policy,
+    verify_optimizer_generation,
 )
 from .runtime.build import build_trainer_runtime_spec
 from .runtime.data_plane import SFTBatchData
@@ -1501,6 +1502,17 @@ class DistributedMegatronService:
                 if ref.learner_parent_version != self._latest_step:
                     raise RuntimeError("load command learner parent changed")
                 generation = self._training_generation(output_version)
+                verification = (
+                    await asyncio.to_thread(
+                        verify_optimizer_generation,
+                        source.optimizer_state_path,
+                        source.optimizer_generation_id,
+                    )
+                    if restore_optimizer
+                    and source.optimizer_state_path is not None
+                    and source.optimizer_generation_id is not None
+                    else None
+                )
                 job = LoadStateJobSpec(
                     operation_id=ref.operation_id,
                     run_id=ref.run_id,
@@ -1517,6 +1529,7 @@ class DistributedMegatronService:
                     optimizer_generation_id=(
                         source.optimizer_generation_id if restore_optimizer else None
                     ),
+                    optimizer_verification=verification,
                     restore_optimizer=restore_optimizer,
                 )
             alias_started = time.monotonic()

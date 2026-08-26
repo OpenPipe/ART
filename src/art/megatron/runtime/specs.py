@@ -12,7 +12,7 @@ from art.distributed.adapter_transport import AdapterTransferTarget
 from art.distributed.data_plane import PackedBatchRef
 from art.distributed.object_store import BinaryObjectPublicationTarget
 from art.distributed.specs import NixlTransportSpec, TrainerMeshSpec
-from art.megatron.optimizer_state import OptimizerAdapter
+from art.megatron.optimizer_state import OptimizerAdapter, VerifiedOptimizerGeneration
 from art.training.contracts import (
     MAX_CHECKPOINT_REFERENCE_LENGTH,
     MAX_CONTROL_IDENTIFIER_LENGTH,
@@ -132,6 +132,7 @@ class RunSlotRegistration(_Spec):
     optimizer_state_path: str = Field(min_length=1)
     initial_optimizer_state_path: str | None = Field(default=None, min_length=1)
     initial_optimizer_generation_id: str | None = Field(default=None, min_length=1)
+    initial_optimizer_verification: VerifiedOptimizerGeneration | None = None
 
     @model_validator(mode="after")
     def _validate_initial_optimizer(self) -> "RunSlotRegistration":
@@ -139,6 +140,16 @@ class RunSlotRegistration(_Spec):
             self.initial_optimizer_generation_id is None
         ):
             raise ValueError("initial optimizer path and generation must be paired")
+        if self.initial_optimizer_state_path is None and (
+            self.initial_optimizer_verification is not None
+        ):
+            raise ValueError("fresh optimizer registration cannot be preverified")
+        if (
+            self.initial_optimizer_verification is not None
+            and self.initial_optimizer_verification.generation
+            != self.initial_optimizer_generation_id
+        ):
+            raise ValueError("initial optimizer verification names another generation")
         return self
 
 
@@ -495,6 +506,7 @@ class LoadStateJobSpec(_Spec):
     adapter_step: int = Field(ge=0)
     optimizer_state_path: str | None = Field(default=None, min_length=1)
     optimizer_generation_id: str | None = Field(default=None, min_length=1)
+    optimizer_verification: VerifiedOptimizerGeneration | None = None
     restore_optimizer: bool = False
 
     @model_validator(mode="after")
@@ -509,12 +521,22 @@ class LoadStateJobSpec(_Spec):
         if self.restore_optimizer != (
             self.optimizer_state_path is not None
             and self.optimizer_generation_id is not None
+            and self.optimizer_verification is not None
         ) or (self.optimizer_state_path is None) != (
             self.optimizer_generation_id is None
+        ) or (self.optimizer_state_path is None) != (
+            self.optimizer_verification is None
         ):
             raise ValueError(
-                "optimizer path and generation are required exactly for exact load"
+                "optimizer path, generation, and verification are required exactly "
+                "for exact load"
             )
+        if (
+            self.optimizer_verification is not None
+            and self.optimizer_verification.generation
+            != self.optimizer_generation_id
+        ):
+            raise ValueError("optimizer verification names another generation")
         return self
 
     @property

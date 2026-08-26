@@ -33,6 +33,7 @@ from art.megatron.optimizer_state import (
     read_committed_optimizer_pointer,
     read_optimizer_generation_manifest,
     validate_adapter_manifest,
+    verify_optimizer_generation,
 )
 from art.megatron.runtime.data_plane import SFTBatchData
 from art.megatron.runtime.publication import (
@@ -344,12 +345,32 @@ class MegatronTrainingSlot:
         )
         prior = self._runs.get(registration.run_id)
         if prior is not None:
-            candidate = (registration, model, output_dir)
+            candidate = (
+                registration.model_copy(
+                    update={
+                        "initial_optimizer_verification": (
+                            prior.registration.initial_optimizer_verification
+                        )
+                    }
+                ),
+                model,
+                output_dir,
+            )
             if candidate != (prior.registration, prior.model, prior.output_dir):
                 raise RuntimeError("run_id was reused for another resident run")
             return prior.optimizer_work
         adapter = registration.adapter
         validate_adapter_manifest(adapter)
+        if registration.initial_optimizer_state_path is not None:
+            assert registration.initial_optimizer_generation_id is not None
+            verification = await asyncio.to_thread(
+                verify_optimizer_generation,
+                registration.initial_optimizer_state_path,
+                registration.initial_optimizer_generation_id,
+            )
+            registration = registration.model_copy(
+                update={"initial_optimizer_verification": verification}
+            )
         optimizer_work = await self.trainer.register_run(registration)
         if optimizer_work.run_id != registration.run_id:
             raise RuntimeError("trainer returned optimizer work for another run")
@@ -1170,6 +1191,17 @@ class MegatronTrainingSlot:
             generation_id=operation_generation_id(ref.operation_id, output_version),
             adapter_path=get_step_checkpoint_dir(state.output_dir, output_version),
         )
+        verification = (
+            await asyncio.to_thread(
+                verify_optimizer_generation,
+                self._require_managed_path(source.optimizer_state_path),
+                source.optimizer_generation_id,
+            )
+            if request.restore_optimizer
+            and source.optimizer_state_path is not None
+            and source.optimizer_generation_id is not None
+            else None
+        )
         job = LoadStateJobSpec(
             operation_id=ref.operation_id,
             run_id=ref.run_id,
@@ -1188,6 +1220,7 @@ class MegatronTrainingSlot:
             optimizer_generation_id=(
                 source.optimizer_generation_id if request.restore_optimizer else None
             ),
+            optimizer_verification=verification,
             restore_optimizer=request.restore_optimizer,
         )
         await self.trainer.prepare_load_state(job)
