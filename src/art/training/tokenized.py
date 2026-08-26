@@ -125,16 +125,30 @@ def validate_tokenized_loss_values(
     loss: TokenizedLossName,
     values: Mapping[str, float | int | bool | str | None],
 ) -> None:
-    allowed = (
-        {"clip_low_threshold", "clip_high_threshold"}
-        if loss in {"ppo", "cispo"}
-        else set()
-    )
+    numeric = {
+        "clip_low_threshold",
+        "clip_high_threshold",
+        "grad_accumulation_sequences",
+        "kl_penalty_coef",
+    }
+    strings = {"kl_penalty_source", "kl_ref_adapter_path", "kl_ref_checkpoint_id"}
+    allowed = numeric | strings if loss in {"ppo", "cispo"} else set()
     unknown = set(values) - allowed
     if unknown:
         raise ValueError(f"unsupported {loss} loss settings: {sorted(unknown)}")
-    for name, value in values.items():
-        _finite_float(name, value)
+    for name in numeric & values.keys():
+        value = values[name]
+        if value is not None:
+            _finite_float(name, value)
+    if _finite_float("kl_penalty_coef", values.get("kl_penalty_coef", 0.0)) < 0:
+        raise ValueError("kl_penalty_coef must be nonnegative")
+    source = values.get("kl_penalty_source")
+    if source is not None and source not in {"current_learner", "sample"}:
+        raise ValueError("kl_penalty_source is invalid")
+    for name in strings - {"kl_penalty_source"}:
+        value = values.get(name)
+        if value is not None and (not isinstance(value, str) or not value):
+            raise TypeError(f"{name} must be a nonempty string")
     if (
         loss in {"ppo", "cispo"}
         and tokenized_clip_bounds(loss, values)[0]

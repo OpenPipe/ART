@@ -11,6 +11,7 @@ from threading import Event, Lock, Thread
 import time
 import traceback
 from typing import Any, Callable
+import uuid
 
 import monarch.actor as monarch_actor
 from monarch.actor import (
@@ -55,6 +56,8 @@ from .specs import (
     ForwardJobSpec,
     GenerationSnapshotJobSpec,
     HybridEpRuntimeSpec,
+    KlReferenceAcquisition,
+    KlReferenceSpec,
     LoadStateJobSpec,
     OptimizerJobSpec,
     RankLocalOptimizerWorkSummary,
@@ -280,9 +283,11 @@ class _ResidencyPrefetchResult(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     rank: int
+    operation_id: str | None = None
     run_id: str
     command_kind: str
     learner_version: int
+    kl_reference_checkpoint_id: str | None = None
     admitted: bool = True
     elapsed_s: float = 0.0
     error_type: str | None = None
@@ -296,6 +301,17 @@ class _CommandReady(BaseModel):
     rank: int
     operation_id: str
     learner_version: int
+    error_type: str | None = None
+    message: str | None = None
+    traceback_text: str | None = None
+
+
+class _KlReferenceReady(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    rank: int
+    run_id: str
+    checkpoint_id: str
     error_type: str | None = None
     message: str | None = None
     traceback_text: str | None = None
@@ -315,15 +331,24 @@ class _RunRegistrationReady(BaseModel):
 async def _prepare_run_residency(
     ports: tuple[Port[Any], ...],
     lock: asyncio.Lock,
+    operation_id: str | None,
     run_id: str,
     command_kind: str,
     learner_version: int,
+    kl_reference_checkpoint_id: str | None,
     *,
     timeout_s: float,
 ) -> dict[str, float]:
     async with lock:
         reply, receiver = Channel.open()
-        request = run_id, command_kind, learner_version, reply
+        request = (
+            operation_id,
+            run_id,
+            command_kind,
+            learner_version,
+            kl_reference_checkpoint_id,
+            reply,
+        )
         started = time.perf_counter()
         for port in ports:
             port.send(request)
@@ -333,8 +358,20 @@ async def _prepare_run_residency(
                 for _ in ports
             ]
         if {result.rank for result in results} != set(range(len(ports))) or any(
-            (result.run_id, result.command_kind, result.learner_version)
-            != (run_id, command_kind, learner_version)
+            (
+                result.run_id,
+                result.operation_id,
+                result.command_kind,
+                result.learner_version,
+                result.kl_reference_checkpoint_id,
+            )
+            != (
+                run_id,
+                operation_id,
+                command_kind,
+                learner_version,
+                kl_reference_checkpoint_id,
+            )
             for result in results
         ):
             raise RuntimeError("residency prefetch returned mismatched rank identity")
@@ -820,26 +857,51 @@ class MonarchTrainerActor(Actor):
 
     def _run_residency_prefetch(self, receiver: Any) -> None:
         while (request := receiver.recv().get()) is not None:
-            run_id, command_kind, learner_version, reply = request
+            (
+                operation_id,
+                run_id,
+                command_kind,
+                learner_version,
+                kl_reference_checkpoint_id,
+                reply,
+            ) = request
             started = time.perf_counter()
             try:
-                admitted = self._require_run_slot_executor().prepare_residency(
-                    run_id, command_kind, learner_version
+                executor = self._require_run_slot_executor()
+                admitted = (
+                    executor.prefetch_residency(
+                        run_id,
+                        command_kind,
+                        learner_version,
+                        kl_reference_checkpoint_id,
+                    )
+                    if operation_id is None
+                    else executor.admit_residency(
+                        operation_id,
+                        run_id,
+                        command_kind,
+                        learner_version,
+                        kl_reference_checkpoint_id,
+                    )
                 )
                 result = _ResidencyPrefetchResult(
                     rank=self._runtime.rank,
+                    operation_id=operation_id,
                     run_id=run_id,
                     command_kind=command_kind,
                     learner_version=learner_version,
+                    kl_reference_checkpoint_id=kl_reference_checkpoint_id,
                     admitted=admitted,
                     elapsed_s=time.perf_counter() - started,
                 )
             except BaseException as error:
                 result = _ResidencyPrefetchResult(
                     rank=self._runtime.rank,
+                    operation_id=operation_id,
                     run_id=run_id,
                     command_kind=command_kind,
                     learner_version=learner_version,
+                    kl_reference_checkpoint_id=kl_reference_checkpoint_id,
                     elapsed_s=time.perf_counter() - started,
                     error_type=type(error).__name__,
                     message=str(error),
@@ -1177,6 +1239,15 @@ class MonarchTrainerActor(Actor):
             raise RuntimeError("trainer actor runtime is invalid")
         self._require_run_slot_executor().start_unregister_run(run_id)
         return {"rank": self._runtime.rank, "run_id": run_id}
+
+    @endpoint
+    def release_run_slot_residency_admission(
+        self, operation_id: str
+    ) -> dict[str, Any]:
+        if not self._valid:
+            raise RuntimeError("trainer actor runtime is invalid")
+        self._require_run_slot_executor().release_residency_admission(operation_id)
+        return {"rank": self._runtime.rank, "operation_id": operation_id}
 
     @endpoint(explicit_response_port=True)
     def finish_unregister_run_slot(
@@ -1631,6 +1702,81 @@ class MonarchTrainerActor(Actor):
     @endpoint
     def discard_run_slot_load_state(self, operation_id: str) -> None:
         self._require_run_slot_executor().discard_prepared_load_state(operation_id)
+
+    @endpoint
+    def start_prepare_run_slot_kl_reference(
+        self,
+        spec_json: str,
+        ready_port: Port[dict[str, Any]],
+    ) -> dict[str, Any]:
+        try:
+            if not self._valid:
+                raise RuntimeError("trainer actor runtime is invalid")
+            spec = KlReferenceSpec.model_validate_json(spec_json)
+            future = self._require_run_slot_executor().start_prepare_kl_reference(spec)
+
+            def ready(completed: Any) -> None:
+                try:
+                    completed.result()
+                    result = _KlReferenceReady(
+                        rank=self._runtime.rank,
+                        run_id=spec.run_id,
+                        checkpoint_id=spec.checkpoint_id,
+                    )
+                except BaseException as error:
+                    result = _KlReferenceReady(
+                        rank=self._runtime.rank,
+                        run_id=spec.run_id,
+                        checkpoint_id=spec.checkpoint_id,
+                        error_type=type(error).__name__,
+                        message=str(error),
+                        traceback_text="".join(traceback.format_exception(error)),
+                    )
+                ready_port.send(result.model_dump(mode="json"))
+
+            future.add_done_callback(ready)
+            return {
+                "rank": self._runtime.rank,
+                "run_id": spec.run_id,
+                "checkpoint_id": spec.checkpoint_id,
+            }
+        except BaseException:
+            self._valid = False
+            raise
+
+    @endpoint
+    def acquire_run_slot_kl_reference(
+        self, spec_json: str, acquisition_id: str
+    ) -> dict[str, Any]:
+        spec = KlReferenceSpec.model_validate_json(spec_json)
+        return {
+            "rank": self._runtime.rank,
+            **self._require_run_slot_executor().finish_prepared_kl_reference(
+                spec, acquisition_id
+            ),
+        }
+
+    @endpoint
+    def discard_run_slot_kl_reference(self, run_id: str, checkpoint_id: str) -> None:
+        self._require_run_slot_executor().discard_prepared_kl_reference(
+            run_id, checkpoint_id
+        )
+
+    @endpoint
+    def abort_run_slot_kl_reference_acquisition(
+        self, run_id: str, checkpoint_id: str, acquisition_id: str
+    ) -> None:
+        self._require_run_slot_executor().abort_kl_reference_acquisition(
+            run_id, checkpoint_id, acquisition_id
+        )
+
+    @endpoint
+    def release_run_slot_kl_reference(
+        self, run_id: str, checkpoint_id: str, acquisition_id: str
+    ) -> None:
+        self._require_run_slot_executor().release_kl_reference(
+            run_id, checkpoint_id, acquisition_id
+        )
 
     @endpoint(explicit_response_port=True)
     def execute_run_slot_snapshot(
@@ -2121,6 +2267,7 @@ class MonarchTrainerSlot:
         self._control_lock = asyncio.Lock()
         self._cp_lookahead_lock = asyncio.Lock()
         self._residency_prefetch_lock = asyncio.Lock()
+        self._kl_reference_lock = asyncio.Lock()
         self._registration_lock = asyncio.Lock()
         self._closed = False
         self._valid = True
@@ -2799,6 +2946,143 @@ class MonarchTrainerSlot:
             timeout=self._command_timeout_s,
         )
 
+    async def acquire_kl_reference(
+        self, spec: KlReferenceSpec
+    ) -> KlReferenceAcquisition:
+        async with self._kl_reference_lock:
+            self._require_open()
+            payload = spec.model_dump_json()
+            acquisition_id = uuid.uuid4().hex
+            ready_port, receiver = Channel.open()
+            started_at = time.perf_counter()
+            try:
+                started = list(
+                    (
+                        await asyncio.wait_for(
+                            self._actors.start_prepare_run_slot_kl_reference.call(
+                                payload, ready_port
+                            ),
+                            timeout=self._command_timeout_s,
+                        )
+                    ).values()
+                )
+                if {item["rank"] for item in started} != set(
+                    range(len(self._rank_processes))
+                ) or any(
+                    (item["run_id"], item["checkpoint_id"])
+                    != (spec.run_id, spec.checkpoint_id)
+                    for item in started
+                ):
+                    raise RuntimeError(
+                        "KL preparation started with mismatched identity"
+                    )
+                deadline = asyncio.get_running_loop().time() + self._command_timeout_s
+                ready = [
+                    _KlReferenceReady.model_validate(
+                        await asyncio.wait_for(
+                            receiver.recv(),
+                            timeout=max(
+                                deadline - asyncio.get_running_loop().time(), 0.001
+                            ),
+                        )
+                    )
+                    for _ in self._rank_processes
+                ]
+                if {item.rank for item in ready} != set(
+                    range(len(self._rank_processes))
+                ) or any(
+                    (item.run_id, item.checkpoint_id)
+                    != (spec.run_id, spec.checkpoint_id)
+                    for item in ready
+                ):
+                    raise RuntimeError(
+                        "KL preparation completed with mismatched identity"
+                    )
+                failures = [item for item in ready if item.error_type is not None]
+                if failures:
+                    details = "\n".join(
+                        f"rank {item.rank}: {item.error_type}: {item.message}\n"
+                        f"{item.traceback_text or ''}"
+                        for item in failures
+                    )
+                    raise RuntimeError(f"KL reference preparation failed:\n{details}")
+                acquired = list(
+                    (
+                        await asyncio.wait_for(
+                            self._actors.acquire_run_slot_kl_reference.call(
+                                payload, acquisition_id
+                            ),
+                            timeout=self._command_timeout_s,
+                        )
+                    ).values()
+                )
+                if {item["rank"] for item in acquired} != set(
+                    range(len(self._rank_processes))
+                ) or any(
+                    (item["run_id"], item["checkpoint_id"])
+                    != (spec.run_id, spec.checkpoint_id)
+                    for item in acquired
+                ):
+                    raise RuntimeError("KL reference acquired with mismatched identity")
+                return KlReferenceAcquisition(
+                    run_id=spec.run_id,
+                    checkpoint_id=spec.checkpoint_id,
+                    acquisition_id=acquisition_id,
+                    metrics={
+                        "time/kl_reference_prepare_s": (
+                            time.perf_counter() - started_at
+                        ),
+                        "kl_reference/rank_bytes": float(
+                            sum(item["byte_count"] for item in acquired)
+                        ),
+                    },
+                )
+            except BaseException as error:
+                try:
+                    await asyncio.wait_for(
+                        self._actors.abort_run_slot_kl_reference_acquisition.call(
+                            spec.run_id, spec.checkpoint_id, acquisition_id
+                        ),
+                        timeout=self._command_timeout_s,
+                    )
+                except BaseException as cleanup_error:
+                    failure = BaseExceptionGroup(
+                        "KL reference acquisition and rollback failed",
+                        [error, cleanup_error],
+                    )
+                    await self._invalidate(
+                        failure, "KL reference acquisition rollback failed"
+                    )
+                    raise failure
+                raise
+
+    async def release_kl_reference(
+        self, run_id: str, checkpoint_id: str, acquisition_id: str
+    ) -> None:
+        async with self._kl_reference_lock:
+            self._require_open()
+            try:
+                await asyncio.wait_for(
+                    self._actors.release_run_slot_kl_reference.call(
+                        run_id, checkpoint_id, acquisition_id
+                    ),
+                    timeout=self._command_timeout_s,
+                )
+            except BaseException as error:
+                try:
+                    await asyncio.wait_for(
+                        self._actors.release_run_slot_kl_reference.call(
+                            run_id, checkpoint_id, acquisition_id
+                        ),
+                        timeout=self._command_timeout_s,
+                    )
+                except BaseException as retry_error:
+                    failure = BaseExceptionGroup(
+                        "KL reference release retry failed", [error, retry_error]
+                    )
+                    await self._invalidate(failure, "KL reference release failed")
+                    raise failure
+
     async def load_state(self, job: LoadStateJobSpec) -> dict[str, Any]:
         async with self._control_lock:
             self._require_open()
@@ -2907,9 +3191,7 @@ class MonarchTrainerSlot:
             )
         predecessor = self._publication_predecessors[plan.operation_id]
         if predecessor is not None:
-            await asyncio.wait_for(
-                predecessor.wait(), timeout=self._command_timeout_s
-            )
+            await asyncio.wait_for(predecessor.wait(), timeout=self._command_timeout_s)
         async with self._control_lock:
             prepared = self._operations.get(plan.operation_id)
             if (
@@ -2939,18 +3221,14 @@ class MonarchTrainerSlot:
             } != {plan.operation_id}:
                 raise RuntimeError("trainer ranks returned an invalid authorization")
             authorization.set()
-            return next(result for result in results if result["rank"] == 0)[
-                "metrics"
-            ]
+            return next(result for result in results if result["rank"] == 0)["metrics"]
 
     async def discard_prepared_snapshot(self, operation_id: str) -> None:
         if operation_id not in self._publication_predecessors:
             return
         predecessor = self._publication_predecessors[operation_id]
         if predecessor is not None:
-            await asyncio.wait_for(
-                predecessor.wait(), timeout=self._command_timeout_s
-            )
+            await asyncio.wait_for(predecessor.wait(), timeout=self._command_timeout_s)
         async with self._control_lock:
             authorization = self._publication_authorizations.get(operation_id)
             publication = self._publications.get(operation_id)
@@ -3011,7 +3289,11 @@ class MonarchTrainerSlot:
         )
 
     async def prepare_residency(
-        self, run_id: str, command_kind: str, learner_version: int
+        self,
+        run_id: str,
+        command_kind: str,
+        learner_version: int,
+        kl_reference_checkpoint_id: str | None = None,
     ) -> dict[str, float]:
         self._require_open()
         if not self._residency_prefetch_ports:
@@ -3019,11 +3301,57 @@ class MonarchTrainerSlot:
         return await _prepare_run_residency(
             self._residency_prefetch_ports,
             self._residency_prefetch_lock,
+            None,
             run_id,
             command_kind,
             learner_version,
+            kl_reference_checkpoint_id,
             timeout_s=self._command_timeout_s,
         )
+
+    async def admit_residency(
+        self,
+        operation_id: str,
+        run_id: str,
+        command_kind: str,
+        learner_version: int,
+        kl_reference_checkpoint_id: str | None = None,
+    ) -> dict[str, float]:
+        self._require_open()
+        try:
+            metrics = await _prepare_run_residency(
+                self._residency_prefetch_ports,
+                self._residency_prefetch_lock,
+                operation_id,
+                run_id,
+                command_kind,
+                learner_version,
+                kl_reference_checkpoint_id,
+                timeout_s=self._command_timeout_s,
+            )
+        except BaseException as error:
+            try:
+                await self.release_residency_admission(operation_id)
+            except BaseException as cleanup_error:
+                raise BaseExceptionGroup(
+                    "residency admission and rollback failed", [error, cleanup_error]
+                ) from None
+            raise
+        if metrics["residency/prefetch_admitted"] == 0.0:
+            await self.release_residency_admission(operation_id)
+        return metrics
+
+    async def release_residency_admission(self, operation_id: str) -> None:
+        self._require_open()
+        values = await asyncio.wait_for(
+            self._actors.release_run_slot_residency_admission.call(operation_id),
+            timeout=self._command_timeout_s,
+        )
+        results = list(values.values())
+        if {result["rank"] for result in results} != set(
+            range(len(self._rank_processes))
+        ) or {result["operation_id"] for result in results} != {operation_id}:
+            raise RuntimeError("trainer ranks released another residency admission")
 
     def _cached_operation(
         self, operation_id: str, fingerprint: str
@@ -3076,7 +3404,9 @@ class MonarchTrainerSlot:
                     if event.generation_id != generation.generation_id:
                         raise RuntimeError("trainer rank progressed another generation")
                     if event.rank >= len(self._rank_processes):
-                        raise RuntimeError("trainer publication progress has unknown rank")
+                        raise RuntimeError(
+                            "trainer publication progress has unknown rank"
+                        )
                     progress[event.rank] = event.phase
                     continue
                 if isinstance(event, TrainerPublicationFailed):

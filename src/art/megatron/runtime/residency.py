@@ -20,15 +20,19 @@ class ResidencyCapacityUnavailable(RuntimeError):
     """A legal transfer cannot be admitted until current residency changes."""
 
 
+class ResidencyWorkingSetTooLarge(ResidencyCapacityUnavailable):
+    """A demanded working set cannot fit even after every legal eviction."""
+
+
 class ResidencyKey(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     tenant_id: str = Field(min_length=1)
     run_id: str = Field(min_length=1)
     generation_id: str = Field(min_length=1)
-    representation: Literal["weights", "optimizer", "accumulator", "sampler"] = (
-        "weights"
-    )
+    representation: Literal[
+        "weights", "optimizer", "accumulator", "reference", "sampler"
+    ] = "weights"
     accumulator_revision: int = Field(default=0, ge=0)
     topology_fingerprint: str = Field(min_length=1)
     adapter_layout_fingerprint: str = Field(min_length=1)

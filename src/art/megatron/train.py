@@ -1154,9 +1154,7 @@ def _pending_rl_command_telemetry(
             token_count=sum((state.token_count for state in states), zero),
             correlation=sum(
                 (state.probs_corr_stats for state in states),
-                states[0].probs_corr_stats.new_zeros(
-                    states[0].probs_corr_stats.shape
-                ),
+                states[0].probs_corr_stats.new_zeros(states[0].probs_corr_stats.shape),
             ),
             kl_sum=sum((state.kl_sum for state in states), zero),
             kl_count=sum((state.kl_count for state in states), zero),
@@ -1275,9 +1273,7 @@ def execute_megatron_rl_forward_backward_job(
     runtime.resident_policy_step = job.expected_learner_version
     runtime.optimizer_state_loaded = True
     return MegatronForwardBackwardJobResult(
-        new_logprobs=tuple(
-            value for state in states for value in state.new_logprobs
-        ),
+        new_logprobs=tuple(value for state in states for value in state.new_logprobs),
         telemetry=_pending_rl_command_telemetry(
             tuple(states),
             backward=True,
@@ -1306,14 +1302,17 @@ def execute_megatron_dynamic_lora_forward_backward_job(
         ParameterGradientAccumulator,
     )
 
-    ref_path = _experimental_train_config(job).get("kl_ref_adapter_path")
+    experimental = _experimental_train_config(job)
+    ref_path = experimental.get("kl_ref_adapter_path")
+    ref_checkpoint_id = experimental.get("kl_ref_checkpoint_id")
     if (
         job.config.kl_penalty_coef > 0.0
         and ref_path is not None
         and os.path.abspath(ref_path) != os.path.abspath(job.source_adapter_path)
+        and ref_checkpoint_id is None
     ):
-        raise NotImplementedError(
-            "dynamic MCore slots require the KL reference to be the current learner"
+        raise RuntimeError(
+            "dynamic MCore KL references must be acquired before GPU execution"
         )
     slot_name = job.run_id
     slot_ref = LoRASlotRef("checkpoint", slot_name)
@@ -1371,9 +1370,7 @@ def execute_megatron_dynamic_lora_forward_backward_job(
     token_count = local_sums.local_token_count.new_tensor(job.trainable_token_count)
     elapsed_s = sum(durations) + time.perf_counter() - finish_started
     return MegatronForwardBackwardJobResult(
-        new_logprobs=tuple(
-            value for state in states for value in state.new_logprobs
-        ),
+        new_logprobs=tuple(value for state in states for value in state.new_logprobs),
         telemetry=_pending_rl_command_telemetry(
             tuple(states),
             backward=True,
@@ -3306,6 +3303,27 @@ def _prepare_kl_reference_logprobs(
             "provide kl_ref_adapter_path."
         )
 
+    ref_checkpoint_id = _experimental_train_config(job).get("kl_ref_checkpoint_id")
+    if ref_checkpoint_id is not None:
+        from art.megatron.lora import LoRASlotRef, use_lora_slot
+        from art.megatron.runtime.executor import kl_reference_slot_name
+
+        with use_lora_slot(
+            LoRASlotRef("checkpoint", kl_reference_slot_name(job.run_id))
+        ):
+            return _precompute_reference_logprobs(
+                runtime=runtime,
+                packed_tensors=packed_tensors,
+                sample_step_indices=_reference_sample_step_indices(
+                    num_sequences=num_sequences,
+                    num_steps=num_steps,
+                    global_grad_accumulation_sequences=(
+                        global_grad_accumulation_sequences
+                    ),
+                ),
+                global_grad_accumulation_sequences=(global_grad_accumulation_sequences),
+            )
+
     current_adapter_path = job.source_adapter_path
     adapter_swapped = os.path.abspath(ref_adapter_path) != os.path.abspath(
         current_adapter_path
@@ -3656,9 +3674,7 @@ def _run_training_schedule(
         def local_metrics() -> dict[str, float]:
             phase_names = ("previous_job_tail", "worker_idle", "current_job_prepare")
             values = {
-                f"{_INTER_FORWARD_BACKWARD_GAP_PREFIX}{rank}_s": float(
-                    local_timing[0]
-                )
+                f"{_INTER_FORWARD_BACKWARD_GAP_PREFIX}{rank}_s": float(local_timing[0])
             }
             values.update(
                 {
@@ -4240,9 +4256,7 @@ def _finish_megatron_rl_forward_backward_job(
         ),
         probs_corr=float(probability_correlation_from_stats(probs_corr_stats).item()),
         kl_policy_ref=(
-            float((kl_sum / kl_count).item())
-            if float(kl_count.item()) > 0
-            else None
+            float((kl_sum / kl_count).item()) if float(kl_count.item()) > 0 else None
         ),
         new_logprobs=[value for state in states for value in state.new_logprobs],
         workload=TrainingStepWorkload(

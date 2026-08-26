@@ -39,6 +39,7 @@ from art.training.client import (
 )
 from art.training.contracts import (
     AdamConfig,
+    CheckpointRef,
     ForwardBackwardRequest,
     ForwardBackwardResult,
     LossConfig,
@@ -85,12 +86,6 @@ if TYPE_CHECKING:
     )
 
 
-_SERVERLESS_KL_REFERENCE_BLOCKER = (
-    "serverless KL references require a remote checkpoint-to-reference-adapter "
-    "contract. The current training command schema only carries named RL losses "
-    "('cispo'/'ppo') plus scalar KL fields and does not expose a named KL loss or "
-    "reference checkpoint resolver."
-)
 _EXACT_ADAPTER_REMOVE_ATTEMPTS = 2
 _ModelKey = tuple[str | None, str, str, str]
 _SamplerKey = tuple[_ModelKey, int]
@@ -125,6 +120,9 @@ class _RemotePipelineCommandContext(BaseModel):
     settings: _ServerlessTrainSettings
     preparation_metrics: dict[str, float]
     started: float = Field(ge=0)
+    reference_key: SkipValidation[_SamplerKey | None] = Field(
+        default=None, exclude=True
+    )
     _sampler_pending: _PendingSamplerPublication | None = PrivateAttr(default=None)
     _publication: asyncio.Task[dict[str, float]] | None = PrivateAttr(default=None)
     _released: bool = PrivateAttr(default=False)
@@ -132,10 +130,13 @@ class _RemotePipelineCommandContext(BaseModel):
     async def forward_backward(
         self, sequence_id: int
     ) -> TrainingOperation[ForwardBackwardResult]:
-        return await self.client.forward_backward(
-            self.forward_request.model_copy(update={"sequence_id": sequence_id}),
-            encoded_batch=self.encoded_batch,
-        )
+        try:
+            return await self.client.forward_backward(
+                self.forward_request.model_copy(update={"sequence_id": sequence_id}),
+                encoded_batch=self.encoded_batch,
+            )
+        finally:
+            await self._release_reference()
 
     def optimizer_request(self, sequence_id: int) -> OptimStepRequest:
         return OptimStepRequest(
@@ -269,6 +270,7 @@ class _RemotePipelineCommandContext(BaseModel):
         optimizer_admitted: bool,
     ) -> None:
         del optimizer
+        await self._release_reference()
         cleanup: list[Coroutine[Any, Any, None]] = []
         if not optimizer_admitted and forward is not None:
             cleanup.append(forward.cancel())
@@ -313,6 +315,13 @@ class _RemotePipelineCommandContext(BaseModel):
         if self._sampler_pending is None:
             raise RuntimeError("remote sampler publication was not reserved")
         return self._sampler_pending
+
+    async def _release_reference(self) -> None:
+        if self.reference_key is None:
+            return
+        key = self.reference_key
+        object.__setattr__(self, "reference_key", None)
+        await self.backend._release_checkpoint_reference(key)
 
     async def _release(self, disposition: Literal["consumed", "discarded"]) -> None:
         if self._released:
@@ -398,7 +407,7 @@ class _ServerlessTrainSettings(BaseModel):
     normalize_advantages: bool = True
     adam_params: object | None = None
     kl_penalty_coef: float = 0.0
-    kl_penalty_reference_step: int | None = None
+    kl_penalty_reference_step: int | None = Field(default=None, ge=0)
     kl_ref_adapter_path: str | None = None
     kl_penalty_source: Literal["current_learner", "sample"] = "current_learner"
     epsilon: float | None = None
@@ -430,8 +439,8 @@ class _ServerlessTrainSettings(BaseModel):
             raise ValueError("custom loss and optimizer objects are not supported")
         if self.kl_ref_adapter_path is not None:
             raise ValueError("remote training does not accept client filesystem paths")
-        if self.kl_penalty_reference_step is not None:
-            raise NotImplementedError(_SERVERLESS_KL_REFERENCE_BLOCKER)
+        if self.kl_penalty_coef > 0.0 and self.kl_penalty_source != "sample":
+            raise ValueError("remote KL penalties require sample-side logprobs")
         return self
 
     def resolve(self) -> tuple[TrainConfig, LossConfig]:
@@ -541,6 +550,7 @@ class ServerlessBackend:
         ] = {}
         self._sampler_retention_tails: dict[_ModelKey, _SamplerRetention] = {}
         self._sampler_retention_reservations: dict[_SamplerKey, _SamplerRetention] = {}
+        self._checkpoint_reference_counts: dict[_SamplerKey, int] = {}
         self._exact_adapter_states: dict[_SamplerKey, _ExactAdapterLeaseState] = {}
         self._sampler_state_lock = asyncio.Lock()
         self._close_lock = asyncio.Lock()
@@ -600,10 +610,18 @@ class ServerlessBackend:
                         for state in self._exact_adapter_states.values()
                         if state.leases
                     )
-                    if active:
+                    references = sorted(
+                        f"{key[2]}@{step}={count}"
+                        for (
+                            key,
+                            step,
+                        ), count in self._checkpoint_reference_counts.items()
+                        if count
+                    )
+                    if active or references:
                         raise RuntimeError(
-                            "cannot close ServerlessBackend with active exact adapter "
-                            f"leases: {', '.join(active)}"
+                            "cannot close ServerlessBackend with active exact "
+                            "references: " + ", ".join((*active, *references))
                         )
                     self._closing = True
 
@@ -685,6 +703,16 @@ class ServerlessBackend:
         if not isinstance(model, TrainableModel):
             raise TypeError("ServerlessBackend only supports trainable models")
         client = await self.training_client(model)
+        model_key = self._model_key(model)
+        async with self._sampler_state_lock:
+            if any(
+                key == model_key and count
+                for (key, _step), count in self._checkpoint_reference_counts.items()
+            ) or any(
+                key[0] == model_key and state.leases
+                for key, state in self._exact_adapter_states.items()
+            ):
+                raise RuntimeError("cannot delete a model with active exact references")
         await client.shutdown()
         async with self._sampler_state_lock:
             tail = self._sampler_publication_tails.get(self._model_key(model))
@@ -697,7 +725,6 @@ class ServerlessBackend:
                 await self._service.delete_checkpoint(
                     client.run_id, checkpoint.checkpoint_id
                 )
-        model_key = self._model_key(model)
         await self._clear_sampler_state(model_key)
         self._clients.pop(model_key)
 
@@ -909,6 +936,79 @@ class ServerlessBackend:
 
     def _sampler_key(self, model: AnyTrainableModel, step: int) -> _SamplerKey:
         return self._model_key(model), step
+
+    async def _acquire_checkpoint_reference(
+        self,
+        model: AnyTrainableModel,
+        client: RemoteTrainingClient,
+        step: int,
+    ) -> tuple[_SamplerKey, CheckpointRef]:
+        key = self._sampler_key(model, step)
+        while True:
+            async with self._sampler_state_lock:
+                if self._closing or self._closed:
+                    raise RuntimeError("ServerlessBackend is closed")
+                retention = self._sampler_retention_reservations.get(key)
+                if retention is None:
+                    result = self._sampler_results.get(key)
+                    pending = self._pending_sampler_publications.get(key)
+                    if result is None and pending is None:
+                        raise RuntimeError(
+                            f"KL reference checkpoint for learner step {step} is unavailable"
+                        )
+                    self._checkpoint_reference_counts[key] = (
+                        self._checkpoint_reference_counts.get(key, 0) + 1
+                    )
+                    break
+            await asyncio.shield(retention.settled)
+        try:
+            if result is None:
+                assert pending is not None
+                result = await asyncio.shield(pending.materialized)
+            checkpoint = result.checkpoint
+            if checkpoint.run_id != client.run_id or checkpoint.learner_version != step:
+                raise RuntimeError("KL reference materialized an unexpected checkpoint")
+            return key, checkpoint
+        except BaseException:
+            await self._release_checkpoint_reference(key)
+            raise
+
+    async def _release_checkpoint_reference(self, key: _SamplerKey) -> None:
+        async with self._sampler_state_lock:
+            count = self._checkpoint_reference_counts.get(key)
+            if count is None:
+                raise RuntimeError("KL reference lease state is inconsistent")
+            if count == 1:
+                del self._checkpoint_reference_counts[key]
+            else:
+                self._checkpoint_reference_counts[key] = count - 1
+
+    @asynccontextmanager
+    async def _checkpoint_reference(
+        self,
+        model: AnyTrainableModel,
+        client: RemoteTrainingClient,
+        step: int,
+    ) -> AsyncIterator[CheckpointRef]:
+        key, checkpoint = await self._acquire_checkpoint_reference(model, client, step)
+        try:
+            yield checkpoint
+        finally:
+            await self._release_checkpoint_reference(key)
+
+    @asynccontextmanager
+    async def _training_reference(
+        self,
+        model: AnyTrainableModel,
+        client: RemoteTrainingClient,
+        settings: _ServerlessTrainSettings,
+    ) -> AsyncIterator[CheckpointRef | None]:
+        if settings.kl_penalty_coef <= 0.0:
+            yield None
+            return
+        step = settings.kl_penalty_reference_step or 0
+        async with self._checkpoint_reference(model, client, step) as checkpoint:
+            yield checkpoint
 
     async def _start_sampler_publication(
         self,
@@ -1200,6 +1300,11 @@ class ServerlessBackend:
                 raise RuntimeError("sampler retention state is inconsistent")
             retained = set(retain_steps)
             retained.update(self._pending_sampler_steps_locked(retention.model_key))
+            retained.update(
+                step
+                for (key, step), count in self._checkpoint_reference_counts.items()
+                if key == retention.model_key and count
+            )
             self._validate_sampler_retention_locked(retention.model_key, retained)
             # Only entries represented by this catalog snapshot may be forgotten.
             forget = {
@@ -1337,6 +1442,11 @@ class ServerlessBackend:
             step
             for key, step in self._sampler_retention_reservations
             if key == model_key and step not in retain_steps
+        )
+        protected.extend(
+            step
+            for (key, step), count in self._checkpoint_reference_counts.items()
+            if key == model_key and step not in retain_steps and count
         )
         if protected:
             raise RuntimeError(
@@ -1509,21 +1619,26 @@ class ServerlessBackend:
                 "distributed trajectory batches require remote pipeline preparation"
             )
         started = time.monotonic()
-        request = ForwardBackwardRequest(
-            run_id=client.run_id,
-            request_id=uuid.uuid4().hex,
-            sequence_id=client.next_sequence_id,
-            batch=RlTrajectoryBatch.from_groups(
-                groups, default_source_version=client.projected_learner_version
-            ),
-            loss=loss,
-            collect_packing_shapes=any(
-                group._collect_packing_shape for group in groups
-            ),
-            return_token_logprobs=False,
-        )
-        submit_started = time.monotonic()
-        forward = await client.forward_backward(request)
+        async with self._training_reference(
+            model, client, settings
+        ) as reference_checkpoint:
+            request = ForwardBackwardRequest(
+                run_id=client.run_id,
+                request_id=uuid.uuid4().hex,
+                sequence_id=client.next_sequence_id,
+                batch=RlTrajectoryBatch.from_groups(
+                    groups, default_source_version=client.projected_learner_version
+                ),
+                loss=loss.model_copy(
+                    update={"reference_checkpoint": reference_checkpoint}
+                ),
+                collect_packing_shapes=any(
+                    group._collect_packing_shape for group in groups
+                ),
+                return_token_logprobs=False,
+            )
+            submit_started = time.monotonic()
+            forward = await client.forward_backward(request)
         forward_submit_s = time.monotonic() - submit_started
 
         optimizer: TrainingOperation[OptimStepResult] | None = None
@@ -1742,17 +1857,6 @@ class ServerlessBackend:
                 selection.lease.item.annotations for selection in selected
             ),
         )
-        request = ForwardBackwardRequest(
-            run_id=client.run_id,
-            request_id=request_id,
-            sequence_id=client.next_sequence_id,
-            batch=batch,
-            loss=loss,
-            collect_packing_shapes=any(
-                group._collect_packing_shape for group in trajectory_groups
-            ),
-            return_token_logprobs=False,
-        )
         encode_started = time.monotonic()
         try:
             encoded_batch, cancelled = await complete_to_thread(
@@ -1780,6 +1884,46 @@ class ServerlessBackend:
             "time/step_prepare_remote_batch_s": time.monotonic() - started,
             "time/step_encode_remote_batch_s": time.monotonic() - encode_started,
         }
+        reference_key: _SamplerKey | None = None
+        reference_checkpoint: CheckpointRef | None = None
+        try:
+            if settings.kl_penalty_coef > 0.0:
+                (
+                    reference_key,
+                    reference_checkpoint,
+                ) = await self._acquire_checkpoint_reference(
+                    model,
+                    client,
+                    settings.kl_penalty_reference_step or 0,
+                )
+            request = ForwardBackwardRequest(
+                run_id=client.run_id,
+                request_id=request_id,
+                sequence_id=client.next_sequence_id,
+                batch=batch,
+                loss=loss.model_copy(
+                    update={"reference_checkpoint": reference_checkpoint}
+                ),
+                collect_packing_shapes=any(
+                    group._collect_packing_shape for group in trajectory_groups
+                ),
+                return_token_logprobs=False,
+            )
+        except BaseException as primary:
+            if reference_key is not None:
+                await self._release_checkpoint_reference(reference_key)
+            try:
+                await queue.release_selections(
+                    selected,
+                    disposition="discarded",
+                    generation_id=generation_id,
+                )
+            except BaseException as cleanup:
+                raise BaseExceptionGroup(
+                    "remote command preparation and source cleanup failed",
+                    [primary, cleanup],
+                ) from None
+            raise
         return _RemotePipelineCommandContext(
             backend=self,
             model=model,
@@ -1792,6 +1936,7 @@ class ServerlessBackend:
             settings=settings,
             preparation_metrics=metrics,
             started=started,
+            reference_key=reference_key,
         )
 
     async def _train_sft(
@@ -1894,6 +2039,13 @@ class ServerlessBackend:
 
     async def _clear_sampler_state(self, model_key: _ModelKey | None = None) -> None:
         async with self._sampler_state_lock:
+            active_references = [
+                key
+                for key, count in self._checkpoint_reference_counts.items()
+                if count and (model_key is None or key[0] == model_key)
+            ]
+            if active_references:
+                raise RuntimeError("cannot clear sampler state with active references")
             active_retentions = [
                 key
                 for key, retention in self._sampler_retention_tails.items()

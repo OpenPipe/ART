@@ -50,6 +50,8 @@ from art.megatron.runtime.specs import (
     ForwardBackwardJobSpec,
     ForwardJobSpec,
     GenerationSnapshotJobSpec,
+    KlReferenceAcquisition,
+    KlReferenceSpec,
     LoadStateJobSpec,
     OptimizerJobSpec,
     ResolvedCheckpointState,
@@ -578,8 +580,8 @@ class MegatronTrainingSlot:
                 ref=ref,
                 kind="tokenized",
                 packing=plan,
-                config=RlForwardBackwardConfig(),
-                experimental_config=ExperimentalTrainConfig(),
+                config=forward_backward_config(request),
+                experimental_config=experimental_train_config(request),
                 loss=request.loss,
                 return_token_logprobs=request.return_token_logprobs,
             )
@@ -734,11 +736,53 @@ class MegatronTrainingSlot:
         run_id: str,
         command_kind: Literal["forward", "forward_backward", "optim_step"],
         expected_learner_version: int,
+        kl_reference_checkpoint_id: str | None = None,
     ) -> dict[str, float]:
         self._require_run(run_id)
         return await self.trainer.prepare_residency(
-            run_id, command_kind, expected_learner_version
+            run_id,
+            command_kind,
+            expected_learner_version,
+            kl_reference_checkpoint_id,
         )
+
+    async def admit_residency(
+        self,
+        operation_id: str,
+        run_id: str,
+        command_kind: Literal["forward", "forward_backward", "optim_step"],
+        expected_learner_version: int,
+        kl_reference_checkpoint_id: str | None = None,
+    ) -> dict[str, float]:
+        self._require_run(run_id)
+        return await self.trainer.admit_residency(
+            operation_id,
+            run_id,
+            command_kind,
+            expected_learner_version,
+            kl_reference_checkpoint_id,
+        )
+
+    async def release_residency_admission(self, operation_id: str) -> None:
+        await self.trainer.release_residency_admission(operation_id)
+
+    async def acquire_kl_reference(
+        self, run_id: str, checkpoint_id: str, adapter_path: str
+    ) -> KlReferenceAcquisition:
+        self._require_run(run_id)
+        return await self.trainer.acquire_kl_reference(
+            KlReferenceSpec(
+                run_id=run_id,
+                checkpoint_id=checkpoint_id,
+                adapter_path=adapter_path,
+            )
+        )
+
+    async def release_kl_reference(
+        self, run_id: str, checkpoint_id: str, acquisition_id: str
+    ) -> None:
+        self._require_run(run_id)
+        await self.trainer.release_kl_reference(run_id, checkpoint_id, acquisition_id)
 
     async def forward(self, prepared: PreparedForward) -> ForwardResult:
         launch = await self.start_forward(prepared)

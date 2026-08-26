@@ -211,12 +211,25 @@ TrainingBatch = Annotated[
 ]
 
 
+class CheckpointRef(Contract):
+    run_id: str = Field(min_length=1, max_length=MAX_CONTROL_IDENTIFIER_LENGTH)
+    learner_version: int = Field(ge=0)
+    checkpoint_id: str = Field(min_length=1, max_length=MAX_CHECKPOINT_REFERENCE_LENGTH)
+
+
 class LossConfig(Contract):
     name: TokenizedLossName
     normalize_advantages: bool = True
     values: dict[str, FiniteFloat | int | bool | str | None] = Field(
         default_factory=dict
     )
+    reference_checkpoint: CheckpointRef | None = None
+
+    @model_validator(mode="after")
+    def _validate_reference_checkpoint(self) -> "LossConfig":
+        if self.reference_checkpoint is not None and self.name not in {"cispo", "ppo"}:
+            raise ValueError("reference checkpoints require an RL loss")
+        return self
 
 
 class ForwardRequest(RunCommand):
@@ -242,6 +255,14 @@ class ForwardRequest(RunCommand):
                 f"{self.batch.kind} batches require one of {sorted(expected)}, "
                 f"got {self.loss.name!r}"
             )
+        coefficient = self.loss.values.get("kl_penalty_coef", 0.0)
+        if isinstance(coefficient, bool) or not isinstance(coefficient, int | float):
+            raise TypeError("kl_penalty_coef must be numeric")
+        if coefficient < 0.0:
+            raise ValueError("kl_penalty_coef must be nonnegative")
+        reference = self.loss.reference_checkpoint
+        if reference is not None and reference.run_id != self.run_id:
+            raise ValueError("reference checkpoint must belong to the command run")
         if isinstance(self.batch, TokenizedTrainingBatch):
             validate_tokenized_loss_values(self.loss.name, self.loss.values)
             for datum in self.batch.datums:
@@ -329,12 +350,6 @@ class OperationRef(Contract):
         ):
             raise ValueError("learner transitions must advance exactly one version")
         return self
-
-
-class CheckpointRef(Contract):
-    run_id: str = Field(min_length=1)
-    learner_version: int = Field(ge=0)
-    checkpoint_id: str = Field(min_length=1)
 
 
 class PolicyTokenCount(Contract):
