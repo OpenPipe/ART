@@ -279,7 +279,7 @@ NEMOTRON_H_SPEC = ModelSupportSpec(
     is_moe=True,
     model_names=("nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",),
     default_target_modules=_NEMOTRON_H_TARGET_MODULES,
-    native_vllm_lora_status=_WIP_NATIVE_VLLM_LORA_STATUS,
+    native_vllm_lora_status=_VALIDATED_NATIVE_VLLM_LORA_STATUS,
     dependency_floor=DependencyFloor(
         megatron_bridge="e1a207ac757e5d0ed94d8ffbe1cbd28e81d8c084",
     ),
@@ -296,8 +296,9 @@ VALIDATED_MODEL_SUPPORT_SPECS = (
     DSV4_SPEC,
     GLM52_SPEC,
     GPT_OSS_MOE_SPEC,
+    NEMOTRON_H_SPEC,
 )
-PROBE_ONLY_MODEL_SUPPORT_SPECS: tuple[ModelSupportSpec, ...] = (NEMOTRON_H_SPEC,)
+PROBE_ONLY_MODEL_SUPPORT_SPECS: tuple[ModelSupportSpec, ...] = ()
 _ALL_MODEL_SUPPORT_SPECS = (
     DEFAULT_DENSE_SPEC,
     *VALIDATED_MODEL_SUPPORT_SPECS,

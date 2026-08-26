@@ -882,6 +882,7 @@ def test_validated_architecture_representative_models_are_fixed() -> None:
         "deepseek-ai/DeepSeek-V4-Flash",
         "zai-org/GLM-5.2",
         "openai/gpt-oss-20b",
+        "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
     ]
 
 

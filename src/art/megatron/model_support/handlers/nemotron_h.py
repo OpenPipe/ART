@@ -479,7 +479,7 @@ def _check_mixed_precision(model_chunks: Sequence[Any], *, mark: bool) -> None:
 class NemotronHHandler(DefaultMoeHandler):
     key = "nemotron_h_moe"
     has_recurrent_layers = True
-    native_vllm_lora_status = "wip"
+    native_vllm_lora_status = "validated"
 
     def identity_lora_model_config(self, base_config: Any) -> Any:
         model_config = copy(base_config)
