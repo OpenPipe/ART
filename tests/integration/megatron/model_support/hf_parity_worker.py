@@ -1758,6 +1758,7 @@ def _worker_run(request: HfParityRunRequest) -> None:
                 "position_ids": packed_tensors["input_pos"][index].detach().clone(),
             }
         )
+    del packed_tensors
     zero_template = megatron_train._zero_contribution_sft_inputs(trajectory_tensors[0])
     sample_indices = build_parity_sample_indices(
         num_sequences=len(trajectory_tensors),
