@@ -536,6 +536,8 @@ mobile-starlight-toc:not(:has(a[href^="#"]:not([href="#_top"]))) {
 .pagination-links {
   display: flex;
   gap: 1.5rem;
+  width: 100%;
+  max-width: var(--sl-content-width);
 }
 
 /* Starlight sizes each link to half the row; size them to their text instead
