@@ -4,6 +4,7 @@ import asyncio
 from collections.abc import AsyncIterator, Awaitable
 import hashlib
 import json
+import math
 import os
 import socket
 from threading import Event, Lock, Thread
@@ -559,6 +560,7 @@ class MonarchTrainerActor(Actor):
                 "rank": self._runtime.rank,
                 "learner_version": job.learner_version,
                 "metrics": metrics if coordinator else {},
+                "gradient_step_train_s": metrics.get("time/gradient_step_train_s"),
                 "compile_cache": self._compile_cache_metrics,
             }
         except BaseException as error:
@@ -603,6 +605,7 @@ class MonarchTrainerActor(Actor):
                 "rank": self._runtime.rank,
                 "learner_version": job.learner_version,
                 "metrics": metrics if coordinator else {},
+                "gradient_step_train_s": metrics.get("time/gradient_step_train_s"),
                 "compile_cache": self._compile_cache_metrics,
             }
         except BaseException as error:
@@ -1287,6 +1290,22 @@ class MonarchTrainerRun:
                                 "trainer ranks did not agree on job completion"
                             )
                         metrics = dict(payload["metrics"])
+                        rank_train_times = [
+                            result.get("gradient_step_train_s") for result in results
+                        ]
+                        if any(value is not None for value in rank_train_times):
+                            if not all(
+                                isinstance(value, int | float)
+                                and math.isfinite(value)
+                                and value > 0
+                                for value in rank_train_times
+                            ):
+                                raise RuntimeError(
+                                    "trainer ranks returned incomplete gradient-step timing"
+                                )
+                            metrics["time/gradient_step_train_rank_max_s"] = max(
+                                rank_train_times
+                            )
                         cache_metrics = [
                             result.get("compile_cache", {}) for result in results
                         ]
