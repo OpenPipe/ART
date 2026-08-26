@@ -17,6 +17,7 @@ FIXTURE_PATH_ENV = "ART_MODEL_SUPPORT_FIXTURE_PATH"
 FIXTURE_CACHE_ENV = "ART_MODEL_SUPPORT_FIXTURE_CACHE"
 FIXTURE_ROOT_ENV = "ART_MODEL_SUPPORT_FIXTURE_ROOT"
 FIXTURE_VERSION = 18
+_MODEL_FIXTURE_VERSION_OFFSETS = {"nemotron_h_moe": 6}
 _CANONICAL_CACHE_VERSION = 16
 _ROOT = Path("/tmp/art-models/main-merge-oracle")
 _CACHE_ROOT = Path("/tmp/art-model-support-workflow/hf-cache")
@@ -47,6 +48,13 @@ _REDUCED_TRAINABILITY_ENV: dict[str, dict[str, dict[str, str]]] = {
 }
 _TOKENIZER_FIXTURE_VERSION = 3
 _FUNCTIONAL_FIXTURE_VERSION = 1
+_FUNCTIONAL_FIXTURE_VERSION_OFFSETS = {"nemotron_h_moe": 5}
+_FUNCTIONAL_REMOTE_CODE_FILES = {
+    "nemotron_h_moe": (
+        "configuration_nemotron_h.py",
+        "modeling_nemotron_h.py",
+    )
+}
 _REVISIONS = {
     "meta-llama/Llama-3.2-1B-Instruct": "9213176726f574b556790deb65791e0c5aa438b6",
     "Qwen/Qwen3-32B": "9216db5781bf21249d130ec9da846c4624c16137",
@@ -59,6 +67,9 @@ _REVISIONS = {
     "deepseek-ai/DeepSeek-V4-Flash": "60d8d70770c6776ff598c94bb586a859a38244f1",
     "zai-org/GLM-5.2": "b4734de4facf877f85769a911abafc5283eab3d9",
     "openai/gpt-oss-20b": "6cee5e81ee83917806bbde320786a8fb61efebee",
+    "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16": (
+        "2d59de1cbd51c0adf384eb906b766d1aee0e0517"
+    ),
 }
 _MULTIMODAL = {"qwen3_5_dense", "qwen3_5_moe", "gemma4_dense", "gemma4_moe"}
 
@@ -236,6 +247,26 @@ _PLAIN_TEXT: dict[str, tuple[int, int, dict[str, Any]]] = {
             "tie_word_embeddings": False, "quantization_config": None,
         },
     ),
+    "nemotron_h_moe": (
+        6,
+        256,
+        {
+            "intermediate_size": 512,
+            "hybrid_override_pattern": "MEMEM*",
+            "head_dim": 32,
+            "num_attention_heads": 8,
+            "num_key_value_heads": 2,
+            "mamba_num_heads": 8,
+            "mamba_head_dim": 64,
+            "n_groups": 2,
+            "ssm_state_size": 128,
+            "moe_intermediate_size": 256,
+            "moe_shared_expert_intermediate_size": 512,
+            "n_routed_experts": 4,
+            "num_experts_per_tok": 2,
+            "tie_word_embeddings": False,
+        },
+    ),
 }
 _QWEN35_TEXT = {
     "layer_types": (["linear_attention"] * 3 + ["full_attention"]) * 2,
@@ -329,6 +360,7 @@ _FUNCTIONAL_PLANS = {
     "dsv4": _plan(6, "layers", auxiliary=("mtp", "num_nextn_predict_layers")),
     "glm52": _plan(10, "model.layers", auxiliary=(None, "num_nextn_predict_layers")),
     "gpt_oss_moe": _plan(4, "model.layers"),
+    "nemotron_h_moe": _plan(6, "backbone.layers"),
 }
 _FUNCTIONAL_PATTERNS = {
     "qwen3_dense": {"layer_types": ("full_attention",) * 2},
@@ -343,6 +375,7 @@ _FUNCTIONAL_PATTERNS = {
         "indexer_types": ("full",) * 3 + ("shared",) * 3 + ("full",) + ("shared",) * 3,
     },
     "gpt_oss_moe": {"layer_types": ("sliding_attention", "full_attention") * 2},
+    "nemotron_h_moe": {"hybrid_override_pattern": "MEMEM*"},
 }
 # fmt: on
 
@@ -483,20 +516,28 @@ def _functional_config(
         if type(count) is not int or count < 0:
             raise RuntimeError(f"{model_key} has invalid {count_field}")
         reduced_text[count_field] = 0
-    patterns: dict[str, list[object]] = {}
+    patterns: dict[str, object] = {}
     for field in _FUNCTIONAL_LAYER_FIELDS:
         if (values := text.get(field)) is not None:
             if not isinstance(values, list) or len(values) != source_depth:
                 raise RuntimeError(f"{model_key} production {field} is incomplete")
             patterns[field] = values[: plan.depth]
             reduced_text[field] = patterns[field]
+    hybrid_pattern = text.get("hybrid_override_pattern")
+    if hybrid_pattern is not None:
+        if not isinstance(hybrid_pattern, str) or len(hybrid_pattern) != source_depth:
+            raise RuntimeError(f"{model_key} production hybrid pattern is invalid")
+        patterns["hybrid_override_pattern"] = hybrid_pattern[: plan.depth]
+        reduced_text["hybrid_override_pattern"] = hybrid_pattern[: plan.depth]
     for field, expected in _FUNCTIONAL_PATTERNS.get(model_key, {}).items():
-        if tuple(patterns.get(field, ())) != expected:
+        actual = patterns.get(field)
+        if (tuple(actual) if isinstance(actual, list) else actual) != expected:
             raise RuntimeError(f"{model_key} production {field} pattern changed")
 
     shape_exclusions = (
         "num_hidden_layers",
         *_FUNCTIONAL_LAYER_FIELDS,
+        "hybrid_override_pattern",
         *((plan.auxiliary[1],) if plan.auxiliary else ()),
     )
     width = {"text": _config_shape(text, *shape_exclusions)}
@@ -708,6 +749,16 @@ def _fixture_namespace(
     ).hexdigest()[:16]
 
 
+def _fixture_version(model_key: str) -> int:
+    return FIXTURE_VERSION + _MODEL_FIXTURE_VERSION_OFFSETS.get(model_key, 0)
+
+
+def _functional_fixture_version(model_key: str) -> int:
+    return _FUNCTIONAL_FIXTURE_VERSION + _FUNCTIONAL_FIXTURE_VERSION_OFFSETS.get(
+        model_key, 0
+    )
+
+
 def _is_current(
     path: Path,
     *,
@@ -724,7 +775,11 @@ def _is_current(
         return False
     expected = {
         "version": version
-        or (_TOKENIZER_FIXTURE_VERSION if tokenizer_compatible else FIXTURE_VERSION),
+        or (
+            _TOKENIZER_FIXTURE_VERSION
+            if tokenizer_compatible
+            else _fixture_version(model_key)
+        ),
         "source_model": canonical_model,
         "source_revision": revision,
         "handler": model_key,
@@ -835,6 +890,12 @@ def _build(
         config.save_pretrained(staging)
         if functional:
             (staging / "config.json").write_text(json.dumps(reduced, indent=2) + "\n")
+            for name in _FUNCTIONAL_REMOTE_CODE_FILES.get(model_key, ()):
+                if source_fixture is None:
+                    raise RuntimeError(
+                        f"{model_key} remote code requires a parent fixture"
+                    )
+                shutil.copy2(source_fixture / name, staging / name)
         tokenizer.save_pretrained(staging)
         if model_key in _MULTIMODAL:
             AutoProcessor.from_pretrained(
@@ -870,9 +931,42 @@ def _build(
             )
             with torch.random.fork_rng(devices=[]):
                 torch.manual_seed(0)
-                model = auto.from_config(config, trust_remote_code=True).to(
-                    torch.bfloat16
+                configured_dtype = getattr(config, "dtype", None)
+                model = auto.from_config(
+                    config,
+                    trust_remote_code=True,
+                    **(
+                        {"dtype": torch.float32}
+                        if model_key == "nemotron_h_moe"
+                        else {}
+                    ),
                 )
+                if model_key == "nemotron_h_moe":
+                    config.dtype = configured_dtype
+                fp32 = {}
+                if model_key == "nemotron_h_moe":
+                    pattern = str(config.hybrid_override_pattern)
+                    for index, symbol in enumerate(pattern):
+                        mixer = model.backbone.layers[index].mixer
+                        if symbol == "E":
+                            torch.nn.init.normal_(
+                                mixer.gate.weight, std=float(config.initializer_range)
+                            )
+                        if symbol == "M":
+                            fp32[f"backbone.layers.{index}.mixer.A_log"] = (
+                                mixer.A_log.detach().clone()
+                            )
+                            fp32[f"backbone.layers.{index}.mixer.D"] = (
+                                mixer.D.detach().clone()
+                            )
+                        elif symbol == "E":
+                            fp32[
+                                f"backbone.layers.{index}.mixer.gate.e_score_correction_bias"
+                            ] = mixer.gate.e_score_correction_bias.detach().clone()
+                model = model.to(torch.bfloat16)
+                tensors = dict(model.named_parameters()) | dict(model.named_buffers())
+                for name, value in fp32.items():
+                    tensors[name].data = value
             if model_key.startswith("gemma4_"):
                 layers = model.model.language_model.layers
                 residual_scale = (2 * len(layers)) ** -0.5
@@ -880,6 +974,10 @@ def _build(
                     for layer in layers:
                         layer.post_attention_layernorm.weight.fill_(residual_scale)
                         layer.post_feedforward_layernorm.weight.fill_(residual_scale)
+            if model_key == "nemotron_h_moe":
+                if model._tied_weights_keys != ["lm_head.weight"]:
+                    raise RuntimeError("Nemotron-H HF tied-weight metadata changed")
+                model._tied_weights_keys = {}
             parameters = sum(parameter.numel() for parameter in model.parameters())
             model.save_pretrained(
                 staging, safe_serialization=True, max_shard_size="2GB"
@@ -902,7 +1000,9 @@ def _build(
         )
         manifest = {
             "version": (
-                _TOKENIZER_FIXTURE_VERSION if tokenizer_compatible else FIXTURE_VERSION
+                _TOKENIZER_FIXTURE_VERSION
+                if tokenizer_compatible
+                else _fixture_version(model_key)
             ),
             "source_model": canonical_model,
             "source_revision": revision,
@@ -925,7 +1025,7 @@ def _build(
                 raise RuntimeError("functional fixture construction is incomplete")
             manifest.update(
                 {
-                    "version": _FUNCTIONAL_FIXTURE_VERSION,
+                    "version": _functional_fixture_version(model_key),
                     "fixture_kind": "functional_pretrained",
                     "pretrained": True,
                     "num_layers": _functional_plan(model_key).depth,
@@ -1041,7 +1141,7 @@ def _validate_tokenizer_compatible_fixture(
 def _functional_contract_sha256(model_key: str) -> str:
     return _json_sha256(
         (
-            _FUNCTIONAL_FIXTURE_VERSION,
+            _functional_fixture_version(model_key),
             _functional_plan(model_key).model_dump(mode="json"),
             _FUNCTIONAL_PATTERNS.get(model_key),
         )
@@ -1238,7 +1338,7 @@ def ensure_workflow_fixture(
         revision=revision,
         root=root,
         cache_root=Path(os.environ.get(FIXTURE_CACHE_ENV, str(_CACHE_ROOT))),
-        version=FIXTURE_VERSION,
+        version=_fixture_version(model_key),
         tokenizer_compatible=False,
     )
     tokenizer_path: Path | None = None
@@ -1263,14 +1363,15 @@ def ensure_workflow_fixture(
     functional_hf_home: Path | None = None
     functional_manifest: dict[str, object] | None = None
     if required_stages & _FUNCTIONAL_STAGES:
+        functional_version = _functional_fixture_version(model_key)
         functional_path, functional_manifest, functional_hf_home = (
             _ensure_cached_fixture(
                 canonical_model=base_model,
                 model_key=model_key,
                 revision=revision,
-                root=_FUNCTIONAL_FIXTURE_ROOT / f"v{_FUNCTIONAL_FIXTURE_VERSION}",
+                root=_FUNCTIONAL_FIXTURE_ROOT / f"v{functional_version}",
                 cache_root=_FUNCTIONAL_CACHE_ROOT,
-                version=_FUNCTIONAL_FIXTURE_VERSION,
+                version=functional_version,
                 tokenizer_compatible=True,
                 source_fixture=output,
                 functional=True,
