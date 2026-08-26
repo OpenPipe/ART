@@ -84,12 +84,10 @@ def _coefficient_sum_kernel(
 
 
 @triton.jit
-def _softmax_backward_kernel(
+def _softmax_workspace_kernel(
     logits,
     row_max,
     row_sum,
-    coefficient_sums,
-    grad_logits,
     LOCAL_VOCAB_SIZE: tl.constexpr,
     BLOCK_V: tl.constexpr,
 ):
@@ -102,9 +100,30 @@ def _softmax_backward_kernel(
     ).to(tl.float32)
     maximum = tl.load(row_max + row)
     denominator = tl.load(row_sum + row)
+    probabilities = tl.exp(values - maximum) / denominator
+    tl.store(logits + row * LOCAL_VOCAB_SIZE + offsets, probabilities, mask=mask)
+
+
+@triton.jit
+def _scale_softmax_backward_kernel(
+    probabilities,
+    coefficient_sums,
+    LOCAL_VOCAB_SIZE: tl.constexpr,
+    BLOCK_V: tl.constexpr,
+):
+    row = tl.program_id(0)
+    block = tl.program_id(1)
+    offsets = block * BLOCK_V + tl.arange(0, BLOCK_V)
+    mask = offsets < LOCAL_VOCAB_SIZE
+    values = tl.load(
+        probabilities + row * LOCAL_VOCAB_SIZE + offsets, mask=mask, other=0.0
+    ).to(tl.float32)
     coefficient_sum = tl.load(coefficient_sums + row)
-    gradients = -tl.exp(values - maximum) / denominator * coefficient_sum
-    tl.store(grad_logits + row * LOCAL_VOCAB_SIZE + offsets, gradients, mask=mask)
+    tl.store(
+        probabilities + row * LOCAL_VOCAB_SIZE + offsets,
+        -values * coefficient_sum,
+        mask=mask,
+    )
 
 
 @triton.jit
@@ -141,7 +160,7 @@ class _VocabParallelMultiTargetLogprobs(torch.autograd.Function):
         group: Any,
         vocab_start: int,
         tp_size: int,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         if local_logits.ndim != 2 or target_tokens.ndim != 2:
             raise ValueError(
                 "multi-target logprobs require [N,V] logits and [N,K] targets"
@@ -201,22 +220,33 @@ class _VocabParallelMultiTargetLogprobs(torch.autograd.Function):
         )
         if tp_size > 1:
             torch.distributed.all_reduce(target_logits, group=group)
-        ctx.save_for_backward(local_logits, target_tokens, global_max, global_sum)
-        ctx.vocab_start = vocab_start
-        return (
+        logprobs = (
             target_logits - (global_max + global_sum.log()).unsqueeze(1)
         ).masked_fill(~valid, 0.0)
+        _softmax_workspace_kernel[(row_count, triton.cdiv(local_vocab_size, 256))](
+            local_logits,
+            global_max,
+            global_sum,
+            LOCAL_VOCAB_SIZE=local_vocab_size,
+            BLOCK_V=256,
+            num_warps=4,
+        )
+        ctx.mark_dirty(local_logits)
+        ctx.set_materialize_grads(False)
+        ctx.save_for_backward(local_logits, target_tokens)
+        ctx.vocab_start = vocab_start
+        return logprobs, local_logits
 
     @staticmethod
     def backward(
         ctx: Any, *grad_outputs: Any
     ) -> tuple[torch.Tensor, None, None, None, None]:
         coefficients = grad_outputs[0].contiguous()
-        local_logits, target_tokens, global_max, global_sum = ctx.saved_tensors
-        row_count, local_vocab_size = map(int, local_logits.shape)
+        probabilities, target_tokens = ctx.saved_tensors
+        row_count, local_vocab_size = map(int, probabilities.shape)
         target_count = int(target_tokens.shape[1])
         coefficient_sums = torch.empty(
-            row_count, device=local_logits.device, dtype=torch.float32
+            row_count, device=probabilities.device, dtype=torch.float32
         )
         _coefficient_sum_kernel[(row_count,)](
             coefficients,
@@ -226,13 +256,9 @@ class _VocabParallelMultiTargetLogprobs(torch.autograd.Function):
             BLOCK_K=256,
             num_warps=4,
         )
-        grad_logits = torch.empty_like(local_logits)
-        _softmax_backward_kernel[(row_count, triton.cdiv(local_vocab_size, 256))](
-            local_logits,
-            global_max,
-            global_sum,
+        _scale_softmax_backward_kernel[(row_count, triton.cdiv(local_vocab_size, 256))](
+            probabilities,
             coefficient_sums,
-            grad_logits,
             LOCAL_VOCAB_SIZE=local_vocab_size,
             BLOCK_V=256,
             num_warps=4,
@@ -241,7 +267,7 @@ class _VocabParallelMultiTargetLogprobs(torch.autograd.Function):
         _target_gradient_kernel[(triton.cdiv(value_count, 256),)](
             coefficients,
             target_tokens,
-            grad_logits,
+            probabilities,
             value_count,
             LOCAL_VOCAB_SIZE=local_vocab_size,
             target_count=target_count,
@@ -249,7 +275,7 @@ class _VocabParallelMultiTargetLogprobs(torch.autograd.Function):
             BLOCK=256,
             num_warps=4,
         )
-        return grad_logits, None, None, None, None
+        return probabilities, None, None, None, None
 
 
 def vocab_parallel_multi_target_logprobs(
@@ -267,10 +293,11 @@ def vocab_parallel_multi_target_logprobs(
         if initialized and tp_size > 1
         else None
     )
-    return _VocabParallelMultiTargetLogprobs.apply(
+    logprobs, _ = _VocabParallelMultiTargetLogprobs.apply(
         local_logits,
         target_tokens,
         group,
         tp_rank * int(local_logits.shape[1]),
         tp_size,
     )
+    return logprobs
