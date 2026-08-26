@@ -23,6 +23,8 @@ from art.megatron.model_support.internal_padding import (
 )
 from art.megatron.model_support.spec import (
     CompileWorkaroundConfig,
+    ExpertPackedLoraGroup,
+    ExpertPackedLoraSlot,
     LayerFamilyInstance,
     PrefixTreeModelStateContext,
 )
@@ -86,14 +88,73 @@ def _padding_sizes_from_hf_config(config: Any) -> tuple[int, int]:
 
 
 @lru_cache(maxsize=8)
-def _padding_sizes_from_adapter_base(base_model: str) -> tuple[int, int]:
+def _expert_sizes_from_adapter_base(base_model: str) -> tuple[int, int, int]:
     config_path = Path(base_model) / "config.json"
     if not config_path.exists():
         from huggingface_hub import hf_hub_download
 
         config_path = Path(hf_hub_download(base_model, "config.json"))
     config = json.loads(config_path.read_text(encoding="utf-8"))
-    return _padding_sizes_from_hf_config(config.get("text_config") or config)
+    config = config.get("text_config") or config
+    logical, internal = _padding_sizes_from_hf_config(config)
+    experts = int(config.get("n_routed_experts", 0) or 0)
+    if experts <= 0:
+        raise RuntimeError("Nemotron-H config is missing n_routed_experts")
+    return logical, internal, experts
+
+
+_PACKED_EXPERT_LORA_SLOTS = tuple(
+    ExpertPackedLoraSlot(
+        source_projection=projection,
+        source_lora=lora,
+        output_suffix=f"{projection}.{lora}.weight",
+        pack_layout="expert_rows",
+    )
+    for projection in ("up_proj", "down_proj")
+    for lora in ("lora_A", "lora_B")
+)
+
+
+def _unpack_expert_lora(
+    tensors: dict[str, torch.Tensor],
+    *,
+    logical: int,
+    internal: int,
+    experts: int,
+) -> dict[str, torch.Tensor] | None:
+    suffixes = {
+        f".mixer.experts.{slot.output_suffix}": slot
+        for slot in _PACKED_EXPERT_LORA_SLOTS
+    }
+    packed = {
+        key: (suffix, slot)
+        for key in tensors
+        for suffix, slot in suffixes.items()
+        if key.endswith(suffix)
+    }
+    if not packed:
+        return None
+    if any(".mixer.experts." in key and key not in packed for key in tensors):
+        raise RuntimeError("Nemotron-H LoRA mixes packed and per-expert tensors")
+
+    result = {key: value for key, value in tensors.items() if key not in packed}
+    for key, (suffix, slot) in packed.items():
+        value = tensors[key]
+        if value.ndim != 2 or value.shape[0] % experts:
+            raise RuntimeError(f"Invalid packed Nemotron-H LoRA tensor: {key}")
+        blocks = value.view(experts, value.shape[0] // experts, value.shape[1])
+        if slot.source_projection == "up_proj" and slot.source_lora == "lora_B":
+            if blocks.shape[1] != internal:
+                raise RuntimeError(f"{key}: expected expert width {internal}")
+            blocks = blocks[:, :logical].contiguous()
+        elif slot.source_projection == "down_proj" and slot.source_lora == "lora_A":
+            if blocks.shape[2] != internal:
+                raise RuntimeError(f"{key}: expected expert width {internal}")
+            blocks = blocks[:, :, :logical].contiguous()
+        prefix = key[: -len(suffix)]
+        for expert, block in enumerate(blocks):
+            result[f"{prefix}.mixer.experts.{expert}.{slot.output_suffix}"] = block
+    return result
 
 
 def _convert_lora_padding(
@@ -102,6 +163,25 @@ def _convert_lora_padding(
     adapter_config: dict[str, Any],
     pad: bool,
 ) -> dict[str, torch.Tensor]:
+    base_model = adapter_config.get("base_model_name_or_path")
+    if not isinstance(base_model, str) or not base_model:
+        raise RuntimeError(
+            "Nemotron-H LoRA conversion requires base_model_name_or_path"
+        )
+    logical, internal, experts = _expert_sizes_from_adapter_base(base_model)
+    if (
+        not pad
+        and (
+            unpacked := _unpack_expert_lora(
+                tensors,
+                logical=logical,
+                internal=internal,
+                experts=experts,
+            )
+        )
+        is not None
+    ):
+        return unpacked
     axes = {
         key: (
             0
@@ -115,12 +195,6 @@ def _convert_lora_padding(
     }
     if not any(axis is not None for axis in axes.values()):
         return tensors
-    base_model = adapter_config.get("base_model_name_or_path")
-    if not isinstance(base_model, str) or not base_model:
-        raise RuntimeError(
-            "Nemotron-H LoRA conversion requires base_model_name_or_path"
-        )
-    logical, internal = _padding_sizes_from_adapter_base(base_model)
     return {
         key: (
             pad_dim_right(value, dim=axis, size=internal)
@@ -542,6 +616,14 @@ class NemotronHHandler(DefaultMoeHandler):
         )
 
         return build_mamba_stack_adapter_weights(model_chunks)
+
+    def expert_packed_lora_groups(self) -> tuple[ExpertPackedLoraGroup, ...]:
+        return (
+            ExpertPackedLoraGroup(
+                art_group_suffix=".mixer.experts",
+                slots=_PACKED_EXPERT_LORA_SLOTS,
+            ),
+        )
 
     def to_vllm_lora_tensors(
         self,
