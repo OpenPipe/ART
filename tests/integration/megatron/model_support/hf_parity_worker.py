@@ -845,7 +845,7 @@ def _hf_requires_recurrent_prefix_paths(
     handler = get_model_support_handler(
         base_model, allow_unvalidated_arch=allow_unvalidated_arch
     )
-    return bool(getattr(handler, "build_gdn_execution_spec", False))
+    return handler.has_recurrent_layers
 
 
 def _prepare_hf_reference_forward(

@@ -113,6 +113,7 @@ class ModelSupportHandler(Protocol):
     key: str
     is_moe: bool
     build_gdn_execution_spec: bool
+    has_recurrent_layers: bool
     cp_supported: bool
     native_vllm_lora_status: NativeVllmLoraStatus
 

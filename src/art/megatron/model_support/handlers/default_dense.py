@@ -45,6 +45,7 @@ def _compile_workaround_flags_for_provider(
 class DefaultDenseHandler:
     key = "default_dense"
     build_gdn_execution_spec = False
+    has_recurrent_layers = False
     is_moe = False
     cp_supported = True
     native_vllm_lora_status = "disabled"

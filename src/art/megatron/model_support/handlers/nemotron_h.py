@@ -274,6 +274,7 @@ def _zero_expert_padding(
 
 class NemotronHHandler(DefaultMoeHandler):
     key = "nemotron_h_moe"
+    has_recurrent_layers = True
     native_vllm_lora_status = "wip"
 
     def identity_lora_model_config(self, base_config: Any) -> Any:

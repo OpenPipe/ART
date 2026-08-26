@@ -52,6 +52,7 @@ _LORA_NAMES = ("lora_A", "lora_B")
 class Qwen35BaseHandler(DefaultDenseHandler):
     key = "qwen3_5_base"
     build_gdn_execution_spec = True
+    has_recurrent_layers = True
     native_vllm_lora_status = "validated"
 
     def vllm_server_args(self) -> dict[str, object]:
