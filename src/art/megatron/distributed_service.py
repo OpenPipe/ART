@@ -2164,10 +2164,11 @@ class DistributedMegatronService:
             raise error
 
     def _raise_publication_failure(self) -> None:
-        if self._publication_failure is not None:
-            raise RuntimeError("trainer generation publication failed") from (
-                self._publication_failure
-            )
+        if (error := self._publication_failure) is not None:
+            raise RuntimeError(
+                "trainer generation publication failed: "
+                f"{type(error).__name__}: {error}"
+            ) from error
 
     async def resolve_global_grad_accumulation_sequences(
         self, config: types.TrainConfig
