@@ -50,6 +50,7 @@ from art.megatron.runtime.specs import (
     ForwardBackwardJobSpec,
     ForwardJobSpec,
     GenerationSnapshotJobSpec,
+    KlReferenceSpec,
     LoadStateJobSpec,
     OptimizerJobSpec,
     ResolvedCheckpointState,
@@ -734,11 +735,31 @@ class MegatronTrainingSlot:
         run_id: str,
         command_kind: Literal["forward", "forward_backward", "optim_step"],
         expected_learner_version: int,
+        kl_reference_checkpoint_id: str | None = None,
     ) -> dict[str, float]:
         self._require_run(run_id)
         return await self.trainer.prepare_residency(
-            run_id, command_kind, expected_learner_version
+            run_id,
+            command_kind,
+            expected_learner_version,
+            kl_reference_checkpoint_id,
         )
+
+    async def acquire_kl_reference(
+        self, run_id: str, checkpoint_id: str, adapter_path: str
+    ) -> dict[str, float]:
+        self._require_run(run_id)
+        return await self.trainer.acquire_kl_reference(
+            KlReferenceSpec(
+                run_id=run_id,
+                checkpoint_id=checkpoint_id,
+                adapter_path=adapter_path,
+            )
+        )
+
+    async def release_kl_reference(self, run_id: str, checkpoint_id: str) -> None:
+        self._require_run(run_id)
+        await self.trainer.release_kl_reference(run_id, checkpoint_id)
 
     async def forward(self, prepared: PreparedForward) -> ForwardResult:
         launch = await self.start_forward(prepared)

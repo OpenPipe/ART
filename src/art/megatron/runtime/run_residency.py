@@ -1141,7 +1141,7 @@ class RunResidencyManager:
 
     @staticmethod
     def _exclusive_component(key: ResidencyKey) -> tuple[str, str] | None:
-        if key.representation not in ("weights", "optimizer"):
+        if key.representation not in ("weights", "optimizer", "reference"):
             return None
         return key.run_id, key.representation
 
@@ -1155,7 +1155,8 @@ class RunResidencyManager:
         if len({key.run_id for key in keys}) > 1:
             raise ValueError("one L1 working set cannot span runs")
         if any(
-            key.representation not in ("weights", "optimizer", "accumulator")
+            key.representation
+            not in ("weights", "optimizer", "accumulator", "reference")
             for key in keys
         ):
             raise ValueError("L1 working sets contain trainer components only")

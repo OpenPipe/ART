@@ -26,9 +26,9 @@ class ResidencyKey(BaseModel):
     tenant_id: str = Field(min_length=1)
     run_id: str = Field(min_length=1)
     generation_id: str = Field(min_length=1)
-    representation: Literal["weights", "optimizer", "accumulator", "sampler"] = (
-        "weights"
-    )
+    representation: Literal[
+        "weights", "optimizer", "accumulator", "reference", "sampler"
+    ] = "weights"
     accumulator_revision: int = Field(default=0, ge=0)
     topology_fingerprint: str = Field(min_length=1)
     adapter_layout_fingerprint: str = Field(min_length=1)

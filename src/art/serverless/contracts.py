@@ -284,6 +284,18 @@ class RemoteForwardRequest(RunCommand):
                 f"{self.batch.kind} batches require one of {sorted(expected)}, "
                 f"got {self.loss.name!r}"
             )
+        if self.loss.values.keys() & {"kl_ref_adapter_path", "kl_ref_checkpoint_id"}:
+            raise ValueError("remote forward commands cannot contain internal KL state")
+        coefficient = self.loss.values.get("kl_penalty_coef", 0.0)
+        if not isinstance(coefficient, int | float):
+            raise TypeError("kl_penalty_coef must be numeric")
+        if coefficient > 0.0:
+            if self.loss.values.get("kl_penalty_source") != "sample":
+                raise ValueError("remote KL penalties require sample-side logprobs")
+            if self.loss.reference_checkpoint is None:
+                raise ValueError("remote KL penalties require a reference checkpoint")
+        elif self.loss.reference_checkpoint is not None:
+            raise ValueError("reference checkpoints require a positive KL penalty")
         return self
 
 

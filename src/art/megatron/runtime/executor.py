@@ -76,6 +76,7 @@ from .specs import (
     ForwardBackwardJobSpec,
     ForwardJobSpec,
     GenerationSnapshotJobSpec,
+    KlReferenceSpec,
     LoadStateJobSpec,
     OptimizerJobSpec,
     RankLocalOptimizerWorkSummary,
@@ -104,6 +105,10 @@ if TYPE_CHECKING:
 def _consume_future(future: Future[Any]) -> None:
     if not future.cancelled():
         future.exception()
+
+
+def kl_reference_slot_name(run_id: str) -> str:
+    return f"{run_id}:kl_reference"
 
 
 def _ordered_sampler_target(
@@ -505,9 +510,7 @@ def _stage_sft_rank_result(
     try:
         builder = staging.stager.begin()
         telemetry = cast(PendingRankCommandTelemetry, result["telemetry"])
-        staged: dict[str, Any] = {
-            "statistics": builder.stage(telemetry.statistics)
-        }
+        staged: dict[str, Any] = {"statistics": builder.stage(telemetry.statistics)}
         if coordinator and job.return_token_logprobs:
             values = result["logprob_values"]
             present = result["logprob_present"]
@@ -1124,6 +1127,19 @@ class _PreparedRunLoad(BaseModel):
         return () if self.optimizer is None else tuple(self.optimizer.tensors)
 
 
+class _PreparedKlReference(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True, frozen=True)
+
+    spec: KlReferenceSpec
+    key: ResidencyKey
+    checkpoint: Any
+    adapter_config: dict[str, Any]
+
+    @property
+    def weights(self) -> tuple[torch.Tensor, ...]:
+        return tuple(self.checkpoint.parameters)
+
+
 class _PreparedRunRegistration(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True, frozen=True)
 
@@ -1275,6 +1291,12 @@ class _ResidentRunState(BaseModel):
     registration_complete: bool = False
     unregistering: bool = False
     lora_export_plan: Any | None = None
+    kl_references: SkipValidation[OrderedDict[str, _PreparedKlReference]] = Field(
+        default_factory=OrderedDict
+    )
+    kl_reference_counts: dict[str, int] = Field(default_factory=dict)
+    kl_reference_acquisitions: dict[str, str] = Field(default_factory=dict)
+    installed_kl_reference: ResidencyKey | None = None
 
 
 @contextmanager
@@ -1327,6 +1349,10 @@ class MCoreRunSlotExecutor:
         self._registration_preparations: dict[
             str, tuple[str, Future[_PreparedRunRegistration]]
         ] = {}
+        self._kl_reference_preparations: dict[
+            tuple[str, str], tuple[str, Future[_PreparedKlReference]]
+        ] = {}
+        self._kl_reference_cache_capacity = max(1, int(runtime.snapshot_pool_capacity))
         self._run_cleanups: dict[str, Future[None]] = {}
         self._runs: dict[str, _ResidentRunState] = {}
         self._lifecycle_lock = Lock()
@@ -1462,7 +1488,9 @@ class MCoreRunSlotExecutor:
         try:
             fingerprint, future = self._registration_preparations[registration.run_id]
         except KeyError as error:
-            raise RuntimeError("run registration preparation was not started") from error
+            raise RuntimeError(
+                "run registration preparation was not started"
+            ) from error
         if fingerprint != registration.model_dump_json():
             raise RuntimeError("run registration preparation identity changed")
         if future.done():
@@ -1475,9 +1503,7 @@ class MCoreRunSlotExecutor:
     ) -> RankLocalOptimizerWorkSummary:
         if not self.run_registration_prepared(registration):
             raise RuntimeError("run registration preparation is not complete")
-        _fingerprint, future = self._registration_preparations.pop(
-            registration.run_id
-        )
+        _fingerprint, future = self._registration_preparations.pop(registration.run_id)
         prepared = future.result()
         self.commit_run_registration(prepared)
         return prepared.optimizer_work
@@ -1577,6 +1603,158 @@ class MCoreRunSlotExecutor:
         state.initial_generation = None
         state.registration_complete = True
 
+    def prepare_kl_reference(self, spec: KlReferenceSpec) -> _PreparedKlReference:
+        state = self._require_run(spec.run_id)
+        from art.megatron.model_support.lora_disk import load_adapter_config
+        from art.trainer_rank import MaterializedCheckpoint
+
+        adapter_config = load_adapter_config(spec.adapter_path)
+        self._validate_adapter_layout(state.adapter_config, adapter_config)
+        checkpoint = self._slot_trainer.prepare_checkpoint_slot_load_sync(
+            MaterializedCheckpoint(
+                path=kl_reference_slot_name(spec.run_id),
+                directory=spec.adapter_path,
+            ),
+            device="cpu",
+        )
+        weights = tuple(checkpoint.parameters)
+        if not weights or any(tensor.device.type != "cpu" for tensor in weights):
+            raise RuntimeError("prepared KL reference is not entirely CPU resident")
+        return _PreparedKlReference(
+            spec=spec,
+            key=ResidencyKey(
+                tenant_id=state.tenant_id,
+                run_id=spec.run_id,
+                generation_id=f"kl-reference:{spec.checkpoint_id}",
+                representation="reference",
+                topology_fingerprint=self.runtime.optimizer_layout_fingerprint,
+                adapter_layout_fingerprint=hashlib.sha256(
+                    encode_adapter_config(adapter_config)
+                ).hexdigest(),
+            ),
+            checkpoint=checkpoint,
+            adapter_config=adapter_config,
+        )
+
+    def start_prepare_kl_reference(
+        self, spec: KlReferenceSpec
+    ) -> Future[_PreparedKlReference]:
+        key = spec.run_id, spec.checkpoint_id
+        fingerprint = spec.model_dump_json()
+        existing = self._kl_reference_preparations.get(key)
+        if existing is not None:
+            if existing[0] != fingerprint:
+                raise RuntimeError("KL checkpoint ID was reused for another adapter")
+            return existing[1]
+        state = self._require_run(spec.run_id)
+        cached = state.kl_references.get(spec.checkpoint_id)
+        if cached is not None:
+            if cached.spec != spec:
+                raise RuntimeError("KL checkpoint ID was reused for another adapter")
+            future: Future[_PreparedKlReference] = Future()
+            future.set_result(cached)
+        else:
+            future = self._submit_transition(
+                self._load_pool, self.prepare_kl_reference, spec
+            )
+        self._kl_reference_preparations[key] = fingerprint, future
+        return future
+
+    def finish_prepared_kl_reference(
+        self, spec: KlReferenceSpec, acquisition_id: str
+    ) -> dict[str, Any]:
+        key = spec.run_id, spec.checkpoint_id
+        try:
+            fingerprint, future = self._kl_reference_preparations.pop(key)
+        except KeyError as error:
+            raise RuntimeError("KL reference preparation was not started") from error
+        if fingerprint != spec.model_dump_json():
+            raise RuntimeError("KL reference preparation identity changed")
+        prepared = future.result()
+        state = self._require_run(spec.run_id)
+        if acquisition_id in state.kl_reference_acquisitions:
+            raise RuntimeError("KL reference acquisition ID was reused")
+        cached = state.kl_references.get(spec.checkpoint_id)
+        if cached is None:
+            self._residency.register_l2(prepared.key, prepared.weights)
+            state.kl_references[spec.checkpoint_id] = prepared
+        elif cached.spec != spec or cached.key != prepared.key:
+            raise RuntimeError("cached KL reference changed identity")
+        state.kl_references.move_to_end(spec.checkpoint_id)
+        state.kl_reference_counts[spec.checkpoint_id] = (
+            state.kl_reference_counts.get(spec.checkpoint_id, 0) + 1
+        )
+        state.kl_reference_acquisitions[acquisition_id] = spec.checkpoint_id
+        self._trim_kl_references(state)
+        return {
+            "run_id": spec.run_id,
+            "checkpoint_id": spec.checkpoint_id,
+            "byte_count": sum(tensor.nbytes for tensor in prepared.weights),
+        }
+
+    def discard_prepared_kl_reference(self, run_id: str, checkpoint_id: str) -> None:
+        preparation = self._kl_reference_preparations.pop((run_id, checkpoint_id), None)
+        if preparation is None:
+            return
+        future = preparation[1]
+        if not future.cancel():
+            future.add_done_callback(_consume_future)
+
+    def abort_kl_reference_acquisition(
+        self, run_id: str, checkpoint_id: str, acquisition_id: str
+    ) -> None:
+        self.discard_prepared_kl_reference(run_id, checkpoint_id)
+        state = self._require_run(run_id)
+        acquired = state.kl_reference_acquisitions.pop(acquisition_id, None)
+        if acquired is None:
+            return
+        if acquired != checkpoint_id:
+            raise RuntimeError("KL reference acquisition changed identity")
+        self._decrement_kl_reference(state, checkpoint_id)
+
+    def release_kl_reference(self, run_id: str, checkpoint_id: str) -> None:
+        state = self._require_run(run_id)
+        acquisition_id = next(
+            (
+                acquisition_id
+                for acquisition_id, acquired in state.kl_reference_acquisitions.items()
+                if acquired == checkpoint_id
+            ),
+            None,
+        )
+        if acquisition_id is None:
+            raise RuntimeError("KL reference acquisition state is inconsistent")
+        del state.kl_reference_acquisitions[acquisition_id]
+        self._decrement_kl_reference(state, checkpoint_id)
+
+    def _decrement_kl_reference(
+        self, state: _ResidentRunState, checkpoint_id: str
+    ) -> None:
+        count = state.kl_reference_counts.get(checkpoint_id)
+        if count is None:
+            raise RuntimeError("KL reference acquisition state is inconsistent")
+        if count == 1:
+            del state.kl_reference_counts[checkpoint_id]
+        else:
+            state.kl_reference_counts[checkpoint_id] = count - 1
+        self._trim_kl_references(state)
+
+    def _trim_kl_references(self, state: _ResidentRunState) -> None:
+        while len(state.kl_references) > self._kl_reference_cache_capacity:
+            retired = next(
+                (
+                    checkpoint_id
+                    for checkpoint_id, reference in state.kl_references.items()
+                    if not state.kl_reference_counts.get(checkpoint_id)
+                    and reference.key != state.installed_kl_reference
+                ),
+                None,
+            )
+            if retired is None:
+                return
+            reference = state.kl_references.pop(retired)
+            self._residency.retire_async(reference.key)
+
     def optimizer_layout(self, checkpoint: Any) -> Any:
         return self._slot_trainer.prepared_checkpoint_slot_optimizer_layout(checkpoint)
 
@@ -1585,6 +1763,7 @@ class MCoreRunSlotExecutor:
         run_id: str,
         command_kind: str,
         expected_learner_version: int,
+        kl_reference_checkpoint_id: str | None = None,
     ) -> bool:
         """Launch component transfers before the serialized GPU command turn."""
         state = self._require_run(run_id)
@@ -1598,10 +1777,15 @@ class MCoreRunSlotExecutor:
             return False
         if command_kind in {"forward", "forward_backward"}:
             keys = (desired.weights,)
-            if (
-                command_kind == "forward_backward"
-                and desired.accumulator is not None
-            ):
+            if kl_reference_checkpoint_id is not None:
+                try:
+                    reference = state.kl_references[kl_reference_checkpoint_id]
+                except KeyError as error:
+                    raise RuntimeError(
+                        "KL reference residency was not acquired"
+                    ) from error
+                keys += (reference.key,)
+            if command_kind == "forward_backward" and desired.accumulator is not None:
                 keys += (desired.accumulator,)
         elif command_kind == "optim_step":
             keys = tuple(
@@ -1658,7 +1842,10 @@ class MCoreRunSlotExecutor:
             execute_megatron_dynamic_lora_forward_backward_job,
         )
 
-        with self._resident(state):
+        with self._resident(
+            state,
+            kl_reference_checkpoint_id=job.experimental_config.kl_ref_checkpoint_id,
+        ):
             gradients = self._require_gradients(state)
             result = execute_megatron_dynamic_lora_forward_backward_job(
                 self.runtime,
@@ -1707,7 +1894,10 @@ class MCoreRunSlotExecutor:
         self._publisher.raise_if_failed()
         from art.megatron.train import execute_megatron_dynamic_lora_forward_job
 
-        with self._resident(state):
+        with self._resident(
+            state,
+            kl_reference_checkpoint_id=job.experimental_config.kl_ref_checkpoint_id,
+        ):
             result = execute_megatron_dynamic_lora_forward_job(
                 self.runtime,
                 job,
@@ -1830,10 +2020,8 @@ class MCoreRunSlotExecutor:
                 expected_global_token_count=expected_tokens,
                 group=ps.get_data_parallel_group(with_context_parallel=True),
             )
-            reduced_gradients = (
-                self._slot_trainer.reduce_checkpoint_slot_gradient_sums(
-                    job.run_id, accumulated.gradients
-                )
+            reduced_gradients = self._slot_trainer.reduce_checkpoint_slot_gradient_sums(
+                job.run_id, accumulated.gradients
             )
             if accumulated.reduction == "token_mean":
                 torch._foreach_div_(reduced_gradients, global_tokens)
@@ -2227,6 +2415,14 @@ class MCoreRunSlotExecutor:
                     self.discard_prepared_load_state(operation_id)
                 except BaseException as error:
                     failures.append(error)
+        for (prepared_run_id, checkpoint_id), (_fingerprint, _future) in tuple(
+            self._kl_reference_preparations.items()
+        ):
+            if prepared_run_id == run_id:
+                try:
+                    self.discard_prepared_kl_reference(run_id, checkpoint_id)
+                except BaseException as error:
+                    failures.append(error)
         if state.gradients is not None:
             try:
                 state.gradients.discard()
@@ -2235,6 +2431,11 @@ class MCoreRunSlotExecutor:
             else:
                 state.gradients = None
         try:
+            if state.installed_kl_reference is not None:
+                self._slot_trainer.unload_checkpoint_slot(
+                    kl_reference_slot_name(run_id)
+                )
+                state.installed_kl_reference = None
             if state.checkpoint_slot_installed or state.installed_weights is not None:
                 self._slot_trainer.unload_checkpoint_slot(run_id)
                 state.checkpoint_slot_installed = False
@@ -2283,7 +2484,9 @@ class MCoreRunSlotExecutor:
                 TimeoutError(f"{len(pending)} run residency retirements timed out")
             )
         if not failures and self._residency.keys(run_id):
-            failures.append(RuntimeError("Megatron run cleanup left resident resources"))
+            failures.append(
+                RuntimeError("Megatron run cleanup left resident resources")
+            )
         if failures:
             if len(failures) == 1:
                 raise failures[0]
@@ -2432,13 +2635,26 @@ class MCoreRunSlotExecutor:
         *,
         include_optimizer: bool = False,
         include_accumulator: bool = False,
+        kl_reference_checkpoint_id: str | None = None,
     ) -> Iterator[tuple[ResidencyKey, ...]]:
         weights_key = state.desired.weights
         optimizer_key = state.desired.optimizer if include_optimizer else None
         accumulator_key = state.desired.accumulator if include_accumulator else None
+        reference = (
+            None
+            if kl_reference_checkpoint_id is None
+            else state.kl_references.get(kl_reference_checkpoint_id)
+        )
+        if kl_reference_checkpoint_id is not None and reference is None:
+            raise RuntimeError("KL reference residency was not acquired")
         working_set = tuple(
             key
-            for key in (weights_key, optimizer_key, accumulator_key)
+            for key in (
+                weights_key,
+                optimizer_key,
+                accumulator_key,
+                None if reference is None else reference.key,
+            )
             if key is not None
         )
         acquired = False
@@ -2506,6 +2722,13 @@ class MCoreRunSlotExecutor:
                         )
                     state.installed_optimizer = optimizer_key
                     state.pending_load = None
+            if reference is not None and state.installed_kl_reference != reference.key:
+                self._slot_trainer.install_prepared_checkpoint_slot_load_sync(
+                    reference.checkpoint
+                )
+                state.installed_kl_reference = reference.key
+                state.kl_references.move_to_end(reference.spec.checkpoint_id)
+                self._trim_kl_references(state)
             yield working_set
         finally:
             if acquired:
@@ -2689,9 +2912,9 @@ class _GenerationPublisher:
         self._object_publications: dict[str, Future[OptimizerAdapter]] = {}
         # Keep one active publication cohort and one recent shape cohort.
         self._lora_layout_capacity = 2 * capacity
-        self._lora_layouts: OrderedDict[
-            tuple[Any, ...], SafetensorsLayout
-        ] = OrderedDict()
+        self._lora_layouts: OrderedDict[tuple[Any, ...], SafetensorsLayout] = (
+            OrderedDict()
+        )
         self._cache: dict[str, _CachedGeneration] = {}
         self._latest_by_run: dict[str, str] = {}
         self._prepared: dict[str, _PreparedRankSnapshot] = {}
@@ -3138,7 +3361,10 @@ class _GenerationPublisher:
             "generation_id": generation.generation_id,
             "policy_step": str(generation.policy_step),
         }
-        if any(target.metadata.get(key) != value for key, value in expected_metadata.items()):
+        if any(
+            target.metadata.get(key) != value
+            for key, value in expected_metadata.items()
+        ):
             raise RuntimeError(
                 "ordered sampler target identifies another learner generation"
             )
@@ -3188,9 +3414,7 @@ class _GenerationPublisher:
         local_error: BaseException | None = None
         try:
             try:
-                wait_s, in_flight, stager = self._acquire_slot(
-                    protected_run_id=run_id
-                )
+                wait_s, in_flight, stager = self._acquire_slot(protected_run_id=run_id)
                 handler = self.runtime.model_support_handler
                 packed_groups = handler.expert_packed_lora_groups()
                 local_tensors, local_metadata = collect_local_lora_entries(
@@ -3494,23 +3718,27 @@ class _GenerationPublisher:
         identity_s = time.perf_counter() - identity_started
         adapter = OptimizerAdapter(
             identity=str(
-                canonical_adapter_path(
-                    staging_adapter_path, generation.policy_step
-                )
+                canonical_adapter_path(staging_adapter_path, generation.policy_step)
             ),
             training_session_id=generation.training_session_id,
             step=generation.policy_step,
             generation_id=generation.generation_id,
             files=checkpoint.files,
         )
-        return prepared, checkpoint, local_write, adapter, {
-            "snapshot_rank_sharded_prepare_s": time.perf_counter() - started,
-            "snapshot_rank_sharded_identity_s": identity_s,
-            "snapshot_rank_sharded_local_bytes": float(
-                sum(shard.size_bytes for shard in local_write.shards)
-            ),
-            "snapshot_rank_sharded_local_shards": float(len(local_write.shards)),
-        }
+        return (
+            prepared,
+            checkpoint,
+            local_write,
+            adapter,
+            {
+                "snapshot_rank_sharded_prepare_s": time.perf_counter() - started,
+                "snapshot_rank_sharded_identity_s": identity_s,
+                "snapshot_rank_sharded_local_bytes": float(
+                    sum(shard.size_bytes for shard in local_write.shards)
+                ),
+                "snapshot_rank_sharded_local_shards": float(len(local_write.shards)),
+            },
+        )
 
     def prepare(
         self,
@@ -3568,8 +3796,10 @@ class _GenerationPublisher:
                     entry, generation, staging_adapter_path, contexts
                 )
             adapter = (
-                durable_adapter if rank == 0 and durable_adapter is not None
-                else existing_adapter if rank == 0
+                durable_adapter
+                if rank == 0 and durable_adapter is not None
+                else existing_adapter
+                if rank == 0
                 else None
             )
             transport_adapter = None
@@ -3588,9 +3818,7 @@ class _GenerationPublisher:
                 if wants_adapter_payload and entry.resident_lora is not None
                 else None
             )
-            needs_adapter_payload = rank == 0 and (
-                wants_adapter_payload
-            )
+            needs_adapter_payload = rank == 0 and (wants_adapter_payload)
             if needs_adapter_payload:
                 lora, tensors = contexts.enter_context(
                     self._lora_snapshot(entry, adapter, consolidated_lora)
@@ -3662,9 +3890,7 @@ class _GenerationPublisher:
                             file.model_copy(update={"sha256": None})
                             for file in exact_files
                         )
-                        if isinstance(
-                            adapter_object_target, OrderedBinaryObjectTarget
-                        )
+                        if isinstance(adapter_object_target, OrderedBinaryObjectTarget)
                         else exact_files
                     )
                     transport_adapter = OptimizerAdapter(
@@ -4126,9 +4352,7 @@ class _GenerationPublisher:
                 and resident_lora.prepared.exception() is None
             ):
                 if self._residency is None:
-                    raise RuntimeError(
-                        "resident LoRA source has no residency manager"
-                    )
+                    raise RuntimeError("resident LoRA source has no residency manager")
                 try:
                     retirement = self._residency.retire_async(resident_lora.key)
                     retirement_started = True
@@ -4230,7 +4454,9 @@ class _GenerationPublisher:
     ) -> Iterator[tuple[Any, PreparedSafetensors]]:
         if entry.resident_lora is not None:
             if consolidated_lora is None:
-                raise RuntimeError("resident LoRA consolidation returned no rank-zero value")
+                raise RuntimeError(
+                    "resident LoRA consolidation returned no rank-zero value"
+                )
             yield consolidated_lora, self._prepare_lora_tensors(consolidated_lora)
             return
         snapshot = entry.resolved.result()
@@ -4344,7 +4570,9 @@ class _GenerationPublisher:
             )
 
             if not isinstance(distributed, PreparedRankDistributedLora):
-                raise RuntimeError("ordered publication has an invalid distributed payload")
+                raise RuntimeError(
+                    "ordered publication has an invalid distributed payload"
+                )
             target = prepared.adapter_object_target
             if not isinstance(target, OrderedBinaryObjectTarget):
                 raise RuntimeError(
@@ -4610,8 +4838,7 @@ class _GenerationPublisher:
         planned_files = {file.name: file for file in planned.files}
         source_files: dict[str, tuple[memoryview, ...]] = {
             "adapter_model.safetensors": tuple(
-                memoryview(chunk.numpy()).cast("B")
-                for chunk in payload.tensors.chunks
+                memoryview(chunk.numpy()).cast("B") for chunk in payload.tensors.chunks
             ),
             "adapter_config.json": (memoryview(payload.config),),
         }
@@ -4624,8 +4851,7 @@ class _GenerationPublisher:
                 target,
                 source_files,
                 file_sha256={
-                    name: cast(str, file.sha256)
-                    for name, file in planned_files.items()
+                    name: cast(str, file.sha256) for name, file in planned_files.items()
                 },
             )
         published_files = {file.relative_path: file for file in ref.files}

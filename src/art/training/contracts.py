@@ -211,12 +211,25 @@ TrainingBatch = Annotated[
 ]
 
 
+class CheckpointRef(Contract):
+    run_id: str = Field(min_length=1)
+    learner_version: int = Field(ge=0)
+    checkpoint_id: str = Field(min_length=1)
+
+
 class LossConfig(Contract):
     name: TokenizedLossName
     normalize_advantages: bool = True
     values: dict[str, FiniteFloat | int | bool | str | None] = Field(
         default_factory=dict
     )
+    reference_checkpoint: CheckpointRef | None = None
+
+    @model_validator(mode="after")
+    def _validate_reference_checkpoint(self) -> "LossConfig":
+        if self.reference_checkpoint is not None and self.name not in {"cispo", "ppo"}:
+            raise ValueError("reference checkpoints require an RL loss")
+        return self
 
 
 class ForwardRequest(RunCommand):
@@ -329,12 +342,6 @@ class OperationRef(Contract):
         ):
             raise ValueError("learner transitions must advance exactly one version")
         return self
-
-
-class CheckpointRef(Contract):
-    run_id: str = Field(min_length=1)
-    learner_version: int = Field(ge=0)
-    checkpoint_id: str = Field(min_length=1)
 
 
 class PolicyTokenCount(Contract):
