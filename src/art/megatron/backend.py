@@ -299,6 +299,16 @@ def _packing_metrics(packed: Any) -> dict[str, float]:
     }
 
 
+def _prefix_tree_metrics(batch: _PackedTrainingBatch) -> dict[str, float]:
+    return {
+        "prefix_tree/logical_tokens": float(batch.logical_tokens),
+        "prefix_tree/physical_tokens": float(batch.physical_tokens),
+        "prefix_tree/compression_ratio": (
+            batch.logical_tokens / batch.physical_tokens
+        ),
+    }
+
+
 def _packing_outcome_metrics(packing: PackingOutcome) -> dict[str, float]:
     return {
         "pipeline/packed_sequence_length": float(packing.packed_sequence_length),
@@ -1231,7 +1241,7 @@ class MegatronBackend(LocalBackend):
                 "Megatron pipeline batch did not use the typed data plane"
             )
         distributed = payload.packed
-        metrics = _packing_metrics(distributed)
+        metrics = {**_packing_metrics(distributed), **_prefix_tree_metrics(batch)}
         from .distributed_service import DistributedMegatronService
 
         service = cast(
