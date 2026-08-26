@@ -65,6 +65,8 @@ def test_inter_forward_backward_timing_uses_rank_local_monotonic_boundaries(
         "time/inter_forward_backward_boundary_command_interval_rank_0_s": 1.5,
         "time/inter_forward_backward_boundary_job_prepare_rank_0_s": 1.0,
         "time/inter_forward_backward_phase_order_valid_rank_0": 1.0,
+        "time/inter_forward_backward_previous_job_complete_present_rank_0": 1.0,
+        "time/inter_forward_backward_current_job_start_present_rank_0": 1.0,
         "time/inter_forward_backward_gpu_gap_rank_0_s": 0.06,
     }
     assert timing.previous_schedule_end_s == 17.0
@@ -92,6 +94,8 @@ def test_inter_forward_backward_timing_reports_invalid_boundary_order(
         "time/inter_forward_backward_boundary_command_interval_rank_0_s": -1.0,
         "time/inter_forward_backward_boundary_job_prepare_rank_0_s": 2.0,
         "time/inter_forward_backward_phase_order_valid_rank_0": 0.0,
+        "time/inter_forward_backward_previous_job_complete_present_rank_0": 1.0,
+        "time/inter_forward_backward_current_job_start_present_rank_0": 1.0,
     }
 
 
@@ -141,9 +145,33 @@ def test_inter_forward_backward_timing_gathers_rank_durations_on_cpu_group(
         "time/inter_forward_backward_boundary_command_interval_rank_0_s": 0.5,
         "time/inter_forward_backward_boundary_job_prepare_rank_0_s": 1.0,
         "time/inter_forward_backward_phase_order_valid_rank_0": 1.0,
+        "time/inter_forward_backward_previous_job_complete_present_rank_0": 1.0,
+        "time/inter_forward_backward_current_job_start_present_rank_0": 1.0,
         "time/inter_forward_backward_boundary_job_tail_rank_1_s": 0.5,
         "time/inter_forward_backward_boundary_command_interval_rank_1_s": 0.5,
         "time/inter_forward_backward_boundary_job_prepare_rank_1_s": 1.25,
         "time/inter_forward_backward_phase_order_valid_rank_1": 1.0,
+        "time/inter_forward_backward_previous_job_complete_present_rank_1": 1.0,
+        "time/inter_forward_backward_current_job_start_present_rank_1": 1.0,
     }
     assert waits == [True]
+
+
+def test_inter_forward_backward_timing_reports_missing_boundaries(monkeypatch) -> None:
+    timestamps = iter((1.0, 2.0, 4.0, 5.0))
+    monkeypatch.setattr(train.time, "monotonic", lambda: next(timestamps))
+    monkeypatch.setattr(train.torch.distributed, "get_world_size", lambda: 1)
+    timing = train._InterForwardBackwardTiming()
+    schedule = cast(Any, _Schedule())
+
+    train._run_training_schedule(schedule, lambda: None, timing)
+    timing.current_job_start_s = 3.0
+    _, collect_metrics = train._run_training_schedule(
+        schedule, lambda: None, timing
+    )
+
+    assert collect_metrics() == {
+        "time/inter_forward_backward_gap_rank_0_s": 2.0,
+        "time/inter_forward_backward_previous_job_complete_present_rank_0": 0.0,
+        "time/inter_forward_backward_current_job_start_present_rank_0": 1.0,
+    }

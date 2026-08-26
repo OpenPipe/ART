@@ -3612,6 +3612,16 @@ def _inter_forward_backward_phase_metrics(
         if bool(parts[4])
         else {}
     )
+    values.update(
+        {
+            f"{_INTER_FORWARD_BACKWARD_PHASE_PREFIX}previous_job_complete_present_rank_{rank}": float(
+                parts[5]
+            ),
+            f"{_INTER_FORWARD_BACKWARD_PHASE_PREFIX}current_job_start_present_rank_{rank}": float(
+                parts[6]
+            ),
+        }
+    )
     if torch.isnan(parts[1]):
         return values
     values.update(
@@ -3696,6 +3706,8 @@ def _run_training_schedule(
             gap_s,
             *(boundary_delta_s or (math.nan, math.nan, math.nan)),
             float(phase_s is not None),
+            float(timing.previous_job_complete_s is not None),
+            float(timing.current_job_start_s is not None),
         ),
         dtype=torch.float64,
     )
