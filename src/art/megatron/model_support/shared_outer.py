@@ -63,9 +63,31 @@ def expand_shared_outer(
         for prefix, slots in compact.items():
             experts = expanded.get(prefix, {})
             if not experts:
-                raise RuntimeError(
-                    f"shared-outer LoRA cannot infer experts for {prefix}"
+                count = _packed_expert_count(
+                    result,
+                    prefix=prefix,
+                    group=group,
+                    rank=int(adapter_config["r"]),
                 )
+                for slot_key, (key, tensor) in slots.items():
+                    slot = next(
+                        slot
+                        for slot in group.slots
+                        if (slot.source_projection, slot.source_lora) == slot_key
+                    )
+                    output = f"{prefix}.{slot.output_suffix}"
+                    if output in result:
+                        raise RuntimeError(
+                            f"mixed compact and packed shared LoRA key: {output}"
+                        )
+                    result[output] = _pack_shared_factor(
+                        tensor,
+                        experts=count,
+                        layout=slot.pack_layout,
+                        key=key,
+                    )
+                    result.pop(key)
+                continue
             for slot_key, (key, tensor) in slots.items():
                 for expert in experts:
                     output = _expert_key(prefix, expert, *slot_key)
@@ -121,9 +143,7 @@ def compact_shared_outer(
 def _expanded_groups(
     tensors: dict[str, torch.Tensor], group: ExpertPackedLoraGroup
 ) -> dict[str, dict[int, dict[tuple[str, str], tuple[str, torch.Tensor]]]]:
-    declared = {
-        (slot.source_projection, slot.source_lora) for slot in group.slots
-    }
+    declared = {(slot.source_projection, slot.source_lora) for slot in group.slots}
     projections = "|".join(re.escape(slot.source_projection) for slot in group.slots)
     loras = "|".join(
         re.escape(lora)
@@ -160,8 +180,7 @@ def _compact_groups(
     declared = {(slot.source_projection, slot.source_lora) for slot in shared}
     projections = "|".join(re.escape(slot.source_projection) for slot in shared)
     loras = "|".join(
-        re.escape(lora)
-        for lora in dict.fromkeys(slot.source_lora for slot in shared)
+        re.escape(lora) for lora in dict.fromkeys(slot.source_lora for slot in shared)
     )
     pattern = re.compile(
         rf"^(?P<prefix>.*{re.escape(group.art_group_suffix)})\.shared\."
@@ -218,9 +237,7 @@ def _share_packed_factor(
     if experts <= 1:
         return tensor
     if layout == "expert_rows":
-        return tensor.narrow(0, 0, rank).repeat(
-            experts, *(1 for _ in tensor.shape[1:])
-        )
+        return tensor.narrow(0, 0, rank).repeat(experts, *(1 for _ in tensor.shape[1:]))
     shape = (*tensor.shape[:-1], rank, experts)
     return (
         tensor.reshape(shape)
@@ -229,3 +246,67 @@ def _share_packed_factor(
         .reshape(tensor.shape)
         .contiguous()
     )
+
+
+def _packed_expert_count(
+    tensors: dict[str, torch.Tensor],
+    *,
+    prefix: str,
+    group: ExpertPackedLoraGroup,
+    rank: int,
+) -> int:
+    counts: dict[str, int] = {}
+    for slot in group.slots:
+        key = f"{prefix}.{slot.output_suffix}"
+        tensor = tensors.get(key)
+        if tensor is None:
+            continue
+        extent: int | None = None
+        if slot.source_lora == "lora_A" and slot.pack_layout == "expert_rows":
+            extent = int(tensor.shape[0])
+        elif slot.source_lora == "lora_B" and slot.pack_layout in {
+            "rank_major_expert_cols",
+            "interleaved_gate_up_rank_major_expert_cols",
+        }:
+            extent = int(tensor.shape[-1])
+        if extent is None:
+            continue
+        if extent % rank:
+            raise RuntimeError(
+                f"packed shared-outer peer {key} extent {extent} "
+                f"is not divisible by rank {rank}"
+            )
+        counts[key] = extent // rank
+    unique = set(counts.values())
+    if len(unique) != 1 or next(iter(unique), 0) <= 0:
+        raise RuntimeError(
+            f"shared-outer LoRA cannot infer one expert count for {prefix}: {counts}"
+        )
+    return unique.pop()
+
+
+def _pack_shared_factor(
+    tensor: torch.Tensor,
+    *,
+    experts: int,
+    layout: str,
+    key: str,
+) -> torch.Tensor:
+    if tensor.ndim != 2:
+        raise RuntimeError(
+            f"shared-outer LoRA factor {key} must be 2D, got {tuple(tensor.shape)}"
+        )
+    if layout == "expert_rows":
+        return torch.cat([tensor] * experts, dim=0).contiguous()
+    blocks = tensor.unsqueeze(0).expand(experts, *tensor.shape)
+    if layout == "interleaved_gate_up_rank_major_expert_cols":
+        if tensor.shape[0] % 2:
+            raise RuntimeError(f"interleaved shared-outer factor {key} needs even rows")
+        gate, up = blocks.split(tensor.shape[0] // 2, dim=1)
+        blocks = torch.stack((gate, up), dim=2).flatten(1, 2)
+    if layout in {
+        "rank_major_expert_cols",
+        "interleaved_gate_up_rank_major_expert_cols",
+    }:
+        return blocks.permute(1, 2, 0).reshape(tensor.shape[0], -1).contiguous()
+    raise RuntimeError(f"unsupported shared-outer packed layout {layout!r}")
