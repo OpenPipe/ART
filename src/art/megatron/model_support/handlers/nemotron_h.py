@@ -395,7 +395,7 @@ def _check_mixed_precision(model_chunks: Sequence[Any], *, mark: bool) -> None:
                 module._keep_fp32_buffers = ("expert_bias",)
             if getattr(module, "_keep_fp32_buffers", None) != ("expert_bias",):
                 raise RuntimeError("Nemotron-H router FP32 marker changed")
-    if not mixer_count or not router_count:
+    if not mixer_count:
         raise RuntimeError("Nemotron-H mixed-precision topology changed")
 
 
@@ -611,8 +611,10 @@ class NemotronHHandler(DefaultMoeHandler):
             if tensor.is_floating_point()
             and tensor.dtype != (torch.float32 if name in fp32_names else params_dtype)
         }
-        if fp32_names - state.keys() or invalid:
-            raise RuntimeError("Nemotron-H HF reference precision changed")
+        if missing := fp32_names - state.keys():
+            raise RuntimeError(f"Nemotron-H HF reference state changed: {missing}")
+        if invalid:
+            raise RuntimeError(f"Nemotron-H HF reference precision changed: {invalid}")
         expected_names = [
             f"backbone.layers.{index}.mixer"
             for index, symbol in enumerate(pattern)
@@ -642,22 +644,19 @@ class NemotronHHandler(DefaultMoeHandler):
         return model
 
     def correctness_precision(self) -> Literal["bf16", "fp32"]:
-        return "bf16"
+        return "fp32"
 
     def correctness_phase_pass_fns(self, oracle_harness: Any) -> dict[str, Any]:
         nonzero = {"typical_abs_scale": 0.0, "candidate_abs_scale": 0.0}
-        forward = oracle_harness.MetricThresholdRule(
-            limits={"mean_abs_pct": 3.0}, minimums=nonzero
-        )
-        grad = oracle_harness.MetricThresholdRule(
-            limits={"mean_abs_pct": 5.0}, minimums=nonzero
+        strict = oracle_harness.MetricThresholdRule(
+            limits={"mean_abs_pct": 0.5}, minimums=nonzero
         )
         return {
-            "forward": forward,
-            "outputs": forward,
-            "losses": oracle_harness.MetricThresholdRule(limits={"mean_abs_pct": 3.0}),
-            "grads": grad,
-            "deltas": grad,
+            "forward": strict,
+            "outputs": strict,
+            "losses": strict,
+            "grads": strict,
+            "deltas": strict,
         }
 
     def collect_layer_families(self, provider: Any) -> list[LayerFamilyInstance]:
