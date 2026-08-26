@@ -32,6 +32,7 @@ from art.megatron.weights.lora_publish import (
     merge_packed_expert_adapter_entries,
     merge_sharded_adapter_entries,
 )
+from art.megatron.weights.rank_distributed_types import RankDistributedLoraStats
 
 RankDistributedLoraPublicationPhase = Literal[
     "transport_ready",
@@ -148,21 +149,6 @@ class RankDistributedLoraLayout(BaseModel):
         if self.ref != ordered_binary_object_ref_from_plan(self.target, self.plan):
             raise ValueError("LoRA ordered reference differs from its target")
         return self
-
-
-class RankDistributedLoraStats(BaseModel):
-    model_config = ConfigDict(extra="forbid", frozen=True)
-
-    rank: int = Field(ge=0)
-    world_size: int = Field(ge=1)
-    source_bytes: int = Field(ge=0)
-    sent_bytes: int = Field(ge=0)
-    received_bytes: int = Field(ge=0)
-    owned_tensor_bytes: int = Field(ge=0)
-    peak_accounted_owner_bytes: int = Field(ge=0)
-    owned_upload_bytes: int = Field(ge=0)
-    owned_tensor_count: int = Field(ge=0)
-    owned_block_count: int = Field(ge=0)
 
 
 class RankDistributedLoraCallContract(BaseModel):

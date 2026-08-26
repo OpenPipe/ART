@@ -12,11 +12,7 @@ from safetensors import safe_open
 import torch
 
 from art.megatron.tensor_snapshot import PinnedCpuSnapshotStager
-from art.megatron.weights.lora_publish import LocalLoraExportPlan
-from art.megatron.weights.rank_distributed_lora_publish import (
-    RankDistributedLoraStats,
-    prepare_rank_distributed_vllm_lora_source,
-)
+from art.megatron.weights.rank_distributed_types import RankDistributedLoraStats
 from art.utils.safetensors import (
     FileIdentity,
     PreparedSafetensors,
@@ -26,6 +22,7 @@ from art.utils.safetensors import (
 )
 
 if TYPE_CHECKING:
+    from art.megatron.weights.lora_publish import LocalLoraExportPlan
     from art.trainer_rank import (
         TrainerRankOptimizerLayout,
         TrainerRankOptimizerState,
@@ -194,6 +191,10 @@ def prepare_portable_optimizer_archive(
     A multi-rank call requires a Gloo group. Every logical key's master and both
     moments are assigned to one source rank in a single ownership/exchange pass.
     """
+    from art.megatron.weights.rank_distributed_lora_publish import (
+        prepare_rank_distributed_vllm_lora_source,
+    )
+
     rank, world_size, global_rank = _rank_world(group)
     if torch.distributed.is_initialized() and (  # type: ignore[possibly-missing-attribute]
         rank != global_rank
