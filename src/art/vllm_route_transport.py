@@ -2,8 +2,11 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterable, AsyncIterator
 import struct
+from typing import TypeVar
 
+from openai.types import Completion
 from openai.types.chat import ChatCompletion
+from pydantic import BaseModel
 
 from art.preprocessing.moe_routing import MoeRouteArray
 
@@ -15,6 +18,7 @@ MAX_RESPONSE_BYTES = 4 << 30
 MAX_JSON_BYTES = 64 << 20
 MAX_ROUTE_COUNT = 4096
 MAX_ROUTE_ARRAY_BYTES = 512 << 20
+_Response = TypeVar("_Response", bound=BaseModel)
 
 
 def is_routed_experts_response(body: bytes) -> bool:
@@ -68,13 +72,25 @@ def decode_routed_experts_response(
 async def decode_routed_experts_response_stream(
     chunks: AsyncIterable[bytes],
 ) -> tuple[ChatCompletion, dict[int, MoeRouteArray]]:
+    return await _decode_routed_experts_response_stream(chunks, ChatCompletion)
+
+
+async def decode_routed_experts_completion_response_stream(
+    chunks: AsyncIterable[bytes],
+) -> tuple[Completion, dict[int, MoeRouteArray]]:
+    return await _decode_routed_experts_response_stream(chunks, Completion)
+
+
+async def _decode_routed_experts_response_stream(
+    chunks: AsyncIterable[bytes], response_type: type[_Response]
+) -> tuple[_Response, dict[int, MoeRouteArray]]:
     import numpy as np
 
     reader = _AsyncByteReader(chunks.__aiter__())
     header = await reader.read_exact(HEADER.size, "ART routed-experts response header")
     magic, json_size, route_count, num_experts = HEADER.unpack_from(header)
     _validate_response_header(magic, json_size, route_count, num_experts)
-    response = ChatCompletion.model_validate_json(
+    response = response_type.model_validate_json(
         await reader.read_exact(json_size, "ART routed-experts JSON response")
     )
     routes: dict[int, MoeRouteArray] = {}

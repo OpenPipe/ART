@@ -1,12 +1,18 @@
 from __future__ import annotations
 
+import asyncio
 import json
+from types import SimpleNamespace
 import unittest
 
 from art_vllm_runtime import binary_routes
 import numpy as np
+import pytest
 
-from art.vllm_route_transport import decode_routed_experts_response
+from art.vllm_route_transport import (
+    decode_routed_experts_completion_response_stream,
+    decode_routed_experts_response,
+)
 
 
 class BinaryRoutesProtocolTest(unittest.TestCase):
@@ -35,6 +41,48 @@ class BinaryRoutesProtocolTest(unittest.TestCase):
             self.assertEqual(routes[0].num_experts, num_experts)
             self.assertEqual(routes[0].dtype, np.dtype(dtype))
             np.testing.assert_array_equal(routes[0], values)
+
+    def test_completion_response_preserves_exact_prompt_token_ids(self) -> None:
+        prompt_ids = list(range(128))
+        response = json.dumps(
+            {
+                "id": "route-test",
+                "choices": [
+                    {
+                        "finish_reason": "length",
+                        "index": 0,
+                        "logprobs": None,
+                        "prompt_token_ids": prompt_ids,
+                        "text": "",
+                        "token_ids": [129],
+                    }
+                ],
+                "created": 0,
+                "model": "test-model",
+                "object": "text_completion",
+                "usage": {
+                    "prompt_tokens": 128,
+                    "completion_tokens": 1,
+                    "total_tokens": 129,
+                },
+            }
+        ).encode()
+        body = binary_routes.encode_routed_experts_response(
+            response,
+            {0: np.zeros((128, 1, 1), dtype=np.uint8)},
+            num_experts=8,
+        )
+
+        async def chunks():
+            yield body
+
+        decoded, routes = asyncio.run(
+            decode_routed_experts_completion_response_stream(chunks())
+        )
+
+        self.assertEqual(decoded.choices[0].prompt_token_ids, prompt_ids)
+        self.assertEqual(decoded.choices[0].token_ids, [129])
+        self.assertEqual(routes[0].shape, (128, 1, 1))
 
     def test_rejects_expert_count_beyond_uint16_protocol(self) -> None:
         with self.assertRaisesRegex(RuntimeError, r"\[1, 65536\]"):
@@ -131,6 +179,52 @@ class BinaryRoutesProtocolTest(unittest.TestCase):
 
         with self.assertRaisesRegex(RuntimeError, "outside the exact model range"):
             binary_routes.encode_routed_experts_response(b"{}", routes)
+
+
+def test_completion_capture_strips_binary_routes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm.entrypoints.openai.chat_completion.serving import OpenAIServingChat
+    from vllm.entrypoints.openai.completion.serving import OpenAIServingCompletion
+
+    async def chat_response(*_args, **_kwargs):
+        return None
+
+    def completion_response(_self, _batch, *_args, **_kwargs):
+        return "response"
+
+    monkeypatch.setattr(
+        OpenAIServingChat, "chat_completion_full_generator", chat_response
+    )
+    monkeypatch.setattr(
+        OpenAIServingCompletion,
+        "request_output_to_completion_response",
+        completion_response,
+    )
+    binary_routes.patch_binary_routed_experts_response()
+
+    previous = (
+        binary_routes._REGISTERED_NUM_EXPERTS,
+        binary_routes._REGISTERED_PADDING_LAYERS,
+    )
+    try:
+        binary_routes._REGISTERED_NUM_EXPERTS = 8
+        binary_routes._REGISTERED_PADDING_LAYERS = ()
+        values = np.zeros((128, 1, 1), dtype=np.uint8)
+        output = SimpleNamespace(routed_experts=values)
+        batch = [SimpleNamespace(outputs=[output])]
+        with binary_routes.capture_routed_experts() as captured:
+            response = OpenAIServingCompletion.request_output_to_completion_response(
+                object(), batch
+            )
+        assert response == "response"
+        assert captured[0] is values
+        assert output.routed_experts is None
+    finally:
+        (
+            binary_routes._REGISTERED_NUM_EXPERTS,
+            binary_routes._REGISTERED_PADDING_LAYERS,
+        ) = previous
 
 
 if __name__ == "__main__":

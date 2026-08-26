@@ -211,35 +211,62 @@ def _register_model_route_layout(model_config: Any) -> None:
 
 def patch_binary_routed_experts_response() -> None:
     from vllm.entrypoints.openai.chat_completion.serving import OpenAIServingChat
+    from vllm.entrypoints.openai.completion.serving import OpenAIServingCompletion
 
-    original = OpenAIServingChat.chat_completion_full_generator
-    if getattr(original, "__art_binary_routes_patched__", False):
-        return
+    original_chat = OpenAIServingChat.chat_completion_full_generator
+    if not getattr(original_chat, "__art_binary_routes_patched__", False):
 
-    @wraps(original)
-    async def patched(
-        self: Any,
-        request: Any,
-        result_generator: AsyncIterator[Any],
-        *args: Any,
-        **kwargs: Any,
-    ) -> Any:
-        capture = _CAPTURE.get()
-        if capture is None:
-            return await original(self, request, result_generator, *args, **kwargs)
+        @wraps(original_chat)
+        async def patched_chat(
+            self: Any,
+            request: Any,
+            result_generator: AsyncIterator[Any],
+            *args: Any,
+            **kwargs: Any,
+        ) -> Any:
+            capture = _CAPTURE.get()
+            if capture is None:
+                return await original_chat(
+                    self, request, result_generator, *args, **kwargs
+                )
 
-        async def stripped_results() -> AsyncIterator[Any]:
-            async for result in result_generator:
-                for output in result.outputs:
-                    if output.routed_experts is not None:
-                        capture[int(output.index)] = output.routed_experts
-                        output.routed_experts = None
-                yield result
+            async def stripped_results() -> AsyncIterator[Any]:
+                async for result in result_generator:
+                    for output in result.outputs:
+                        if output.routed_experts is not None:
+                            capture[int(output.index)] = output.routed_experts
+                            output.routed_experts = None
+                    yield result
 
-        return await original(self, request, stripped_results(), *args, **kwargs)
+            return await original_chat(
+                self, request, stripped_results(), *args, **kwargs
+            )
 
-    patched.__art_binary_routes_patched__ = True  # type: ignore[attr-defined]
-    OpenAIServingChat.chat_completion_full_generator = patched
+        patched_chat.__art_binary_routes_patched__ = True  # type: ignore[attr-defined]
+        OpenAIServingChat.chat_completion_full_generator = patched_chat
+
+    original_completion = OpenAIServingCompletion.request_output_to_completion_response
+    if not getattr(original_completion, "__art_binary_routes_patched__", False):
+
+        @wraps(original_completion)
+        def patched_completion(
+            self: Any, final_res_batch: list[Any], *args: Any, **kwargs: Any
+        ) -> Any:
+            capture = _CAPTURE.get()
+            if capture is not None:
+                choice_index = 0
+                for result in final_res_batch:
+                    for output in result.outputs:
+                        if output.routed_experts is not None:
+                            capture[choice_index] = output.routed_experts
+                            output.routed_experts = None
+                        choice_index += 1
+            return original_completion(self, final_res_batch, *args, **kwargs)
+
+        patched_completion.__art_binary_routes_patched__ = True  # type: ignore[attr-defined]
+        OpenAIServingCompletion.request_output_to_completion_response = (
+            patched_completion
+        )
 
 
 def patch_pipeline_routed_experts() -> None:
