@@ -11,6 +11,7 @@ from art.megatron.runtime.monarch import (
     MonarchTrainerActor,
     MonarchTrainerRun,
     _CommandReady,
+    _snapshot_readiness_timeout,
 )
 from art.megatron.runtime.publication import SnapshotRankWritePlan
 from art.megatron.runtime.specs import (
@@ -91,7 +92,10 @@ def test_deferred_response_inherits_actor_cuda_device(
 
     monkeypatch.setattr(torch.cuda, "current_device", current_device)
     monkeypatch.setattr(torch.cuda, "device", device)
+    monkeypatch.setenv("LOCAL_RANK", "1")
     delivered = Event()
+    started = Event()
+    release = Event()
     result = {}
 
     class Port:
@@ -107,13 +111,31 @@ def test_deferred_response_inherits_actor_cuda_device(
     actor._deferred_response_lock = Lock()
     actor._deferred_response_stopping = False
     actor._deferred_response_threads = set()
+    actor._snapshot_phase_lock = Lock()
+    actor._snapshot_phases = {}
+    actor._runtime = SimpleNamespace(rank=1)
     actor._valid = True
+
+    def materialize():
+        actor._record_snapshot_phase("snapshot-device", "executor_enter")
+        started.set()
+        release.wait()
+        return {"device": current_device()}
+
     actor._defer_response(
         Port(),
-        lambda: {"device": current_device()},
-        name="deferred-device-test",
+        materialize,
+        name="art-snapshot-prepare-snapshot-device",
         invalidate_on_error=True,
     )
+    assert started.wait(1)
+    report = actor._snapshot_phase_report("snapshot-device")
+    assert report["expected_cuda_device"] == 1
+    assert report["phase"]["phase"] == "executor_enter"
+    assert report["phase"]["cuda_device"] == 1
+    assert report["thread_alive"] is True
+    assert "release.wait" in report["thread_stack"]
+    release.set()
     assert delivered.wait(1)
     assert result == {"device": 1}
 
@@ -183,6 +205,39 @@ def test_snapshot_rank_failure_does_not_wait_for_missing_readiness() -> None:
         assert trainer._next_operation_sequence == 0
         assert trainer._active_job_id is None
         assert trainer._active_collective is None
+
+    asyncio.run(run_test())
+
+
+def test_snapshot_timeout_reports_received_ranks_and_rank_phase() -> None:
+    async def run_test() -> None:
+        class Values:
+            def values(self):
+                return (
+                    {
+                        "rank": 0,
+                        "operation_id": "snapshot-1",
+                        "phase": {"phase": "readiness_sent"},
+                    },
+                    {
+                        "rank": 1,
+                        "operation_id": "snapshot-1",
+                        "phase": {"phase": "executor_enter"},
+                    },
+                )
+
+        class Inspect:
+            async def call(self, operation_id):
+                assert operation_id == "snapshot-1"
+                return Values()
+
+        error = await _snapshot_readiness_timeout(
+            SimpleNamespace(inspect_snapshot_phase=Inspect()), snapshot_job(), {0}
+        )
+        message = str(error)
+        assert "received_ranks=[0]" in message
+        assert '"rank": 1' in message
+        assert '"phase": "executor_enter"' in message
 
     asyncio.run(run_test())
 

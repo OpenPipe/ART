@@ -7,7 +7,8 @@ import json
 import os
 from pathlib import Path
 import socket
-from threading import Event, Lock, Thread
+import sys
+from threading import Event, Lock, Thread, current_thread
 import time
 import traceback
 from typing import Any, Callable
@@ -304,6 +305,18 @@ class _CommandReady(BaseModel):
     error_type: str | None = None
     message: str | None = None
     traceback_text: str | None = None
+
+
+class _SnapshotRankPhase(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    rank: int
+    operation_id: str
+    phase: str
+    thread_name: str
+    cuda_device: int
+    monotonic_ns: int
+    error: str | None = None
 
 
 class _KlReferenceReady(BaseModel):
@@ -613,6 +626,8 @@ class MonarchTrainerActor(Actor):
         self._deferred_response_lock = Lock()
         self._deferred_response_threads: set[Thread] = set()
         self._deferred_response_stopping = False
+        self._snapshot_phase_lock = Lock()
+        self._snapshot_phases: dict[str, _SnapshotRankPhase] = {}
         self._cp_preplanner = None
         self._cp_lookahead_port = None
         self._cp_lookahead_thread: Thread | None = None
@@ -773,6 +788,61 @@ class MonarchTrainerActor(Actor):
         if self._run_slot_executor is None:
             raise RuntimeError("trainer actor is not configured for multi-run slots")
         return self._run_slot_executor
+
+    def _record_snapshot_phase(
+        self, operation_id: str, phase: str, *, error: BaseException | None = None
+    ) -> None:
+        import torch
+
+        record = _SnapshotRankPhase(
+            rank=self._runtime.rank,
+            operation_id=operation_id,
+            phase=phase,
+            thread_name=current_thread().name,
+            cuda_device=torch.cuda.current_device(),
+            monotonic_ns=time.monotonic_ns(),
+            error=(None if error is None else f"{type(error).__name__}: {error}"),
+        )
+        with self._snapshot_phase_lock:
+            if operation_id not in self._snapshot_phases:
+                while len(self._snapshot_phases) >= 16:
+                    self._snapshot_phases.pop(next(iter(self._snapshot_phases)))
+            self._snapshot_phases[operation_id] = record
+
+    def _snapshot_phase_report(self, operation_id: str) -> dict[str, Any]:
+        with self._snapshot_phase_lock:
+            phase = self._snapshot_phases.get(operation_id)
+        thread_name = f"art-snapshot-prepare-{operation_id}"
+        with self._deferred_response_lock:
+            thread = next(
+                (
+                    candidate
+                    for candidate in self._deferred_response_threads
+                    if candidate.name == thread_name
+                ),
+                None,
+            )
+        frame = (
+            sys._current_frames().get(thread.ident)
+            if thread is not None and thread.ident is not None
+            else None
+        )
+        return {
+            "rank": self._runtime.rank,
+            "operation_id": operation_id,
+            "expected_cuda_device": int(os.environ["LOCAL_RANK"]),
+            "phase": None if phase is None else phase.model_dump(mode="json"),
+            "thread_alive": thread is not None and thread.is_alive(),
+            "thread_stack": (
+                None
+                if frame is None
+                else "".join(traceback.format_stack(frame, limit=32))
+            ),
+        }
+
+    @endpoint
+    def inspect_snapshot_phase(self, operation_id: str) -> dict[str, Any]:
+        return self._snapshot_phase_report(operation_id)
 
     def _defer_response(
         self,
@@ -1865,8 +1935,10 @@ class MonarchTrainerActor(Actor):
                 raise RuntimeError("trainer actor runtime is invalid")
             job = GenerationSnapshotJobSpec.model_validate_json(job_json)
             coordinator = self._runtime.rank == 0
+            self._record_snapshot_phase(job.operation_id, "endpoint_validated")
 
             def mark_staged() -> None:
+                self._record_snapshot_phase(job.operation_id, "readiness_send_enter")
                 ready_port.send(
                     _CommandReady(
                         rank=self._runtime.rank,
@@ -1875,14 +1947,20 @@ class MonarchTrainerActor(Actor):
                     ).model_dump(mode="json")
                 )
                 staged.set()
+                self._record_snapshot_phase(job.operation_id, "readiness_sent")
 
             def prepare() -> dict[str, Any]:
                 try:
+                    self._record_snapshot_phase(
+                        job.operation_id, "deferred_prepare_started"
+                    )
+                    self._record_snapshot_phase(job.operation_id, "executor_enter")
                     result = self._require_run_slot_executor().execute_snapshot(
                         job,
                         _ActorEventSink(event_port, coordinator=coordinator),
                         mark_staged,
                     )
+                    self._record_snapshot_phase(job.operation_id, "plan_ready")
                     return {
                         "rank": self._runtime.rank,
                         "operation_id": job.operation_id,
@@ -1891,6 +1969,7 @@ class MonarchTrainerActor(Actor):
                         "metrics": result["metrics"] if coordinator else {},
                     }
                 except BaseException as error:
+                    self._record_snapshot_phase(job.operation_id, "failed", error=error)
                     if not staged.is_set():
                         ready_port.send(
                             _CommandReady(
@@ -1976,8 +2055,10 @@ class MonarchTrainerActor(Actor):
                 self._weight_offload.before_job()
                 self._command_job_open = True
             coordinator = self._runtime.rank == 0
+            self._record_snapshot_phase(job.operation_id, "endpoint_validated")
 
             def mark_staged() -> None:
+                self._record_snapshot_phase(job.operation_id, "readiness_send_enter")
                 ready_port.send(
                     _CommandReady(
                         rank=self._runtime.rank,
@@ -1986,14 +2067,20 @@ class MonarchTrainerActor(Actor):
                     ).model_dump(mode="json")
                 )
                 staged.set()
+                self._record_snapshot_phase(job.operation_id, "readiness_sent")
 
             def prepare() -> dict[str, Any]:
                 try:
+                    self._record_snapshot_phase(
+                        job.operation_id, "deferred_prepare_started"
+                    )
+                    self._record_snapshot_phase(job.operation_id, "executor_enter")
                     result = self._executor.execute_snapshot(
                         job,
                         _ActorEventSink(event_port, coordinator=coordinator),
                         mark_staged,
                     )
+                    self._record_snapshot_phase(job.operation_id, "plan_ready")
                     return {
                         "rank": self._runtime.rank,
                         "operation_id": job.operation_id,
@@ -2002,6 +2089,7 @@ class MonarchTrainerActor(Actor):
                         "metrics": result["metrics"] if coordinator else {},
                     }
                 except BaseException as error:
+                    self._record_snapshot_phase(job.operation_id, "failed", error=error)
                     if not staged.is_set():
                         ready_port.send(
                             _CommandReady(
@@ -2402,6 +2490,7 @@ async def _collect_command_ready(
     rank_processes: tuple[_TrainerRankReady, ...],
     *,
     label: str,
+    progress: set[int] | None = None,
 ) -> None:
     learner_version = (
         job.learner_version
@@ -2429,6 +2518,8 @@ async def _collect_command_ready(
                 f"trainer {label} readiness has mismatched rank identity"
             )
         received_ranks.add(result.rank)
+        if progress is not None:
+            progress.add(result.rank)
         if result.error_type is not None:
             raise RuntimeError(
                 f"trainer {label} failed before {ready_state}:\n"
@@ -2437,6 +2528,27 @@ async def _collect_command_ready(
             )
     if received_ranks != expected_ranks:
         raise RuntimeError(f"trainer {label} readiness has mismatched rank identity")
+
+
+async def _snapshot_readiness_timeout(
+    actors: Any,
+    job: GenerationSnapshotJobSpec,
+    received_ranks: set[int],
+) -> TimeoutError:
+    try:
+        values = await asyncio.wait_for(
+            actors.inspect_snapshot_phase.call(job.operation_id), timeout=2.0
+        )
+        phases: Any = sorted(values.values(), key=lambda value: value["rank"])
+    except Exception as error:
+        phases = {
+            "diagnostic_error": f"{type(error).__name__}: {error}",
+        }
+    return TimeoutError(
+        "trainer ranks did not fence snapshot mutation: "
+        f"received_ranks={sorted(received_ranks)} "
+        f"rank_phases={json.dumps(phases, sort_keys=True)}"
+    )
 
 
 class MonarchTrainerSlot:
@@ -3329,12 +3441,14 @@ class MonarchTrainerSlot:
                     job.model_dump_json(), event_port, ready_port
                 )
             )
+            readiness_progress: set[int] = set()
             readiness = asyncio.create_task(
                 _collect_command_ready(
                     ready_receiver,
                     job,
                     self._rank_processes,
                     label="snapshot",
+                    progress=readiness_progress,
                 ),
                 name=f"megatron-slot-snapshot-ready-{operation_id}",
             )
@@ -3345,7 +3459,9 @@ class MonarchTrainerSlot:
                     return_when=asyncio.FIRST_COMPLETED,
                 )
                 if not done:
-                    raise TimeoutError("trainer ranks did not fence snapshot mutation")
+                    raise await _snapshot_readiness_timeout(
+                        self._actors, job, readiness_progress
+                    )
                 if readiness in done:
                     readiness.result()
                 else:
@@ -4489,12 +4605,14 @@ class MonarchTrainerRun:
                     job.model_dump_json(), event_port, ready_port
                 )
             )
+            readiness_progress: set[int] = set()
             readiness = asyncio.create_task(
                 _collect_command_ready(
                     ready_receiver,
                     job,
                     self._rank_processes,
                     label="snapshot",
+                    progress=readiness_progress,
                 ),
                 name=f"megatron-snapshot-ready-{job.operation_id}",
             )
@@ -4507,7 +4625,9 @@ class MonarchTrainerRun:
                     return_when=asyncio.FIRST_COMPLETED,
                 )
                 if not done:
-                    raise TimeoutError("trainer ranks did not fence snapshot mutation")
+                    raise await _snapshot_readiness_timeout(
+                        self._actors, job, readiness_progress
+                    )
                 if readiness in done:
                     readiness.result()
                 else:
