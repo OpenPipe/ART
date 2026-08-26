@@ -16,8 +16,13 @@ from typing import (
 )
 import warnings
 
-import httpx
-from openai import APIConnectionError, AsyncOpenAI, DefaultAsyncHttpxClient
+from openai import (
+    DEFAULT_CONNECTION_LIMITS,
+    DEFAULT_TIMEOUT,
+    APIConnectionError,
+    AsyncOpenAI,
+    DefaultAsyncHttpxClient,
+)
 import polars as pl
 from pydantic import BaseModel
 from typing_extensions import Never, TypeVar
@@ -629,8 +634,8 @@ class Model(
             base_url=self.inference_base_url,
             api_key=self.inference_api_key,
             http_client=DefaultAsyncHttpxClient(
-                timeout=httpx.Timeout(timeout=1200, connect=5.0),
-                limits=httpx.Limits(
+                timeout=type(DEFAULT_TIMEOUT)(timeout=1200, connect=5.0),
+                limits=type(DEFAULT_CONNECTION_LIMITS)(
                     max_connections=100_000, max_keepalive_connections=100_000
                 ),
             ),
