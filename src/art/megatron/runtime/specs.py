@@ -84,21 +84,28 @@ class TrainerRuntimeSpec(_Spec):
 
     @property
     def compatibility_fingerprint(self) -> str:
-        # Residency policy and HybridEP rendezvous identity are process-local.
-        hybrid_ep = (
-            None
-            if self.hybrid_ep is None
-            else self.hybrid_ep.model_copy(update={"run_id": "<runtime>"})
-        )
-        return _fingerprint(
-            self.model_copy(
-                update={
-                    # TrainerRank materializes each run's exact adapter slot shape.
-                    "lora_rank": 1,
-                    "lora_moe_parameterization": "per_expert",
-                    "run_residency": None,
-                    "hybrid_ep": hybrid_ep,
-                }
+        # These fields describe slot placement or capacity. TrainerRank restores
+        # canonical logical checkpoints into the destination slot's own layout.
+        return _fingerprint_payload(
+            self.model_dump(
+                mode="json",
+                exclude={
+                    "cache_root",
+                    "trainer_mesh",
+                    "packed_sequence_length",
+                    "compile_enabled",
+                    "compile_cache",
+                    "compile_fingerprint",
+                    "optimizer_layout_fingerprint",
+                    "lora_rank",
+                    "lora_target_modules",
+                    "lora_moe_parameterization",
+                    "streaming_weight_offload",
+                    "offload_between_jobs",
+                    "hybrid_ep",
+                    "snapshot_pool_capacity",
+                    "run_residency",
+                },
             )
         )
 
@@ -873,7 +880,9 @@ def validate_event_stream(events: Sequence[TrainEvent]) -> None:
 
 
 def _fingerprint(value: BaseModel) -> str:
-    payload = json.dumps(
-        value.model_dump(mode="json"), separators=(",", ":"), sort_keys=True
-    ).encode()
+    return _fingerprint_payload(value.model_dump(mode="json"))
+
+
+def _fingerprint_payload(value: object) -> str:
+    payload = json.dumps(value, separators=(",", ":"), sort_keys=True).encode()
     return hashlib.sha256(payload).hexdigest()
