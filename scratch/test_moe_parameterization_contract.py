@@ -251,6 +251,33 @@ def test_runtime_builder_propagates_parameterization(monkeypatch) -> None:
             offload_between_jobs=False,
         )
 
+    config["lora_config"]["moe_parameterization"] = "shared_outer"
+    original_contract = runtime_build.build_trainer_runtime_spec(
+        runtime,
+        base_model="model",
+        config=config,
+        enable_expert_replay=False,
+        offload_between_jobs=False,
+    )
+    monkeypatch.setattr(
+        runtime_build,
+        "portable_optimizer_semantic_contract",
+        lambda: {
+            "optimizer_implementation": "incompatible.Optimizer",
+            "logical_archive_format": "incompatible_v1",
+        },
+    )
+    incompatible_contract = runtime_build.build_trainer_runtime_spec(
+        runtime,
+        base_model="model",
+        config=config,
+        enable_expert_replay=False,
+        offload_between_jobs=False,
+    )
+    assert incompatible_contract.optimizer_semantic_fingerprint != (
+        original_contract.optimizer_semantic_fingerprint
+    )
+
 
 def test_monarch_build_sets_explicit_provider_parameterization(monkeypatch) -> None:
     from art.megatron import train

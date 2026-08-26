@@ -6,6 +6,7 @@ import pytest
 from art.megatron.optimizer_state import (
     CheckpointFile,
     OptimizerAdapter,
+    OptimizerGenerationManifest,
     OptimizerShard,
     OptimizerTopology,
     build_optimizer_manifest,
@@ -80,6 +81,49 @@ def test_generation_verification_rejects_same_size_shard_corruption(
 
     with pytest.raises(RuntimeError, match="Optimizer shard digest mismatch"):
         verify_optimizer_generation(str(tmp_path), _GENERATION)
+
+
+def test_logical_optimizer_manifest_rejects_pre_semantic_format() -> None:
+    manifest = build_optimizer_manifest(
+        generation=_GENERATION,
+        step=1,
+        adapter=OptimizerAdapter(
+            identity="adapter",
+            training_session_id="session",
+            step=1,
+            generation_id=_GENERATION,
+            files=(
+                CheckpointFile(name="adapter_config.json", size_bytes=1),
+                CheckpointFile(name="adapter_model.safetensors", size_bytes=1),
+            ),
+        ),
+        runtime_sha256=_DIGEST,
+        optimizer_semantic_sha256="1" * 64,
+        world_size=1,
+        topology=OptimizerTopology(
+            world_size=1,
+            tp=1,
+            cp=1,
+            ep=1,
+            etp=1,
+            pp=1,
+            vpp=1,
+        ),
+        shards=[
+            OptimizerShard(
+                rank=0,
+                size_bytes=1,
+                layout_sha256=_DIGEST,
+                sha256=_DIGEST,
+                serialization="art_logical_safetensors_v1",
+                logical_keys=("weight",),
+            )
+        ],
+    )
+    payload = manifest.model_dump(mode="json")
+    payload["format_version"] = 3
+    with pytest.raises(ValueError, match="format_version"):
+        OptimizerGenerationManifest.model_validate(payload)
 
 
 def test_rank_loader_authenticates_the_verified_manifest(tmp_path: Path) -> None:

@@ -18,6 +18,7 @@ from ..model_support import (
     get_model_support_spec,
     model_uses_expert_parallel,
 )
+from ..portable_optimizer_archive import portable_optimizer_semantic_contract
 from ..runtime_config import get_megatron_runtime_config
 from .run_residency import RunResidencyConfig
 from .specs import HybridEpRuntimeSpec, TrainerRuntimeSpec
@@ -111,6 +112,7 @@ def build_trainer_runtime_spec(
                 "lora_moe_parameterization": lora.get(
                     "moe_parameterization", "per_expert"
                 ),
+                "optimizer": portable_optimizer_semantic_contract(),
             }
         ),
         optimizer_layout_fingerprint=_digest({"mesh": mesh.model_dump(mode="json")}),

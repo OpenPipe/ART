@@ -31,12 +31,38 @@ if TYPE_CHECKING:
 _COMPONENTS = ("master", "exp_avg", "exp_avg_sq")
 _METADATA_KEY = "art.portable_optimizer_archive"
 
+
+def portable_optimizer_semantic_contract() -> dict[str, object]:
+    """Return the topology-neutral contract required for exact optimizer resume.
+
+    Per-command hyperparameters are deliberately absent: they are checkpoint data
+    in ``param_group`` and are restored exactly. This contract identifies the
+    implementation and construction rules that give those values meaning.
+    """
+    return {
+        "optimizer_implementation": (
+            "transformer_engine.pytorch.optimizers.FusedAdam"
+        ),
+        "algorithm": "adamw",
+        "bias_correction": True,
+        "capturable": False,
+        "trainer_rank_state_format": 1,
+        "logical_archive_format": "art_logical_safetensors_v1",
+        "logical_archive_metadata_format": 1,
+        "parameter_state": ("master", "exp_avg", "exp_avg_sq", "step"),
+        "parameter_groups": (
+            "one_group_all_checkpoint_slot_parameters_in_residency_order_v1"
+        ),
+        "dynamic_param_group_values": ("lr", "betas", "eps", "weight_decay"),
+    }
+
 __all__ = (
     "LoadedPortableOptimizerArchive",
     "PortableOptimizerArchiveMetadata",
     "PortableOptimizerComponents",
     "PreparedPortableOptimizerArchive",
     "portable_optimizer_logical_keys_for_sites",
+    "portable_optimizer_semantic_contract",
     "prepare_portable_optimizer_archive",
     "read_portable_optimizer_archive",
     "reconstruct_portable_optimizer_components",

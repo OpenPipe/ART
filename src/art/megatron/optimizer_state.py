@@ -187,7 +187,7 @@ class _OptimizerGenerationRecord(_PairedOptimizerRecord):
 
 
 class OptimizerGenerationManifest(_OptimizerGenerationRecord):
-    format_version: Literal[3] = 3
+    format_version: Literal[4] = 4
     runtime_sha256: str = Field(pattern=_SHA256_PATTERN)
     optimizer_semantic_sha256: str | None = Field(
         default=None, pattern=_SHA256_PATTERN
@@ -218,7 +218,7 @@ class VerifiedOptimizerGeneration(_OptimizerRecord):
 
 
 class OptimizerGenerationPointer(_OptimizerGenerationRecord):
-    format_version: Literal[3] = 3
+    format_version: Literal[4] = 4
 
 
 class OptimizerPolicyPointer(_OptimizerRecord):
