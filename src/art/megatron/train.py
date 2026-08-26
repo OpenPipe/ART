@@ -223,6 +223,7 @@ class TrainingRuntime(BaseModel):
     publication_group: Any | None = None
     publication_exchange_group: Any | None = None
     publication_metadata_group: Any | None = None
+    publication_durability_group: Any | None = None
 
     @field_validator("model")
     @classmethod
@@ -618,14 +619,19 @@ def build_training_runtime(
         if world_size > 1
         else None
     )
-    # Resident-source exchange can overlap an earlier sampler publication. A
-    # separate group keeps those asynchronous collective sequences independent.
+    # Independently scheduled publication lanes must never share a collective
+    # sequence. Each lane is internally ordered and may overlap the others.
     publication_exchange_group = (
         torch.distributed.new_group(backend="gloo")  # ty: ignore[possibly-missing-attribute]
         if world_size > 1
         else None
     )
     publication_metadata_group = (
+        torch.distributed.new_group(backend="gloo")  # ty: ignore[possibly-missing-attribute]
+        if world_size > 1
+        else None
+    )
+    publication_durability_group = (
         torch.distributed.new_group(backend="gloo")  # ty: ignore[possibly-missing-attribute]
         if world_size > 1
         else None
@@ -650,6 +656,7 @@ def build_training_runtime(
         publication_group=publication_group,
         publication_exchange_group=publication_exchange_group,
         publication_metadata_group=publication_metadata_group,
+        publication_durability_group=publication_durability_group,
     )
     _model_runtime_sha256(runtime)
     configure_moe_routing_replay(
@@ -3685,9 +3692,9 @@ def _inter_forward_backward_phase_metrics(
             )
         }
     )
-    values[
-        f"{_INTER_FORWARD_BACKWARD_PHASE_PREFIX}phase_order_valid_rank_{rank}"
-    ] = float(parts[4])
+    values[f"{_INTER_FORWARD_BACKWARD_PHASE_PREFIX}phase_order_valid_rank_{rank}"] = (
+        float(parts[4])
+    )
     return values
 
 

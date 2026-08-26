@@ -2478,18 +2478,19 @@ class MCoreRunSlotExecutor:
 
             self._publisher.reserve_snapshot(job.operation_id)
             try:
-                rank_plan, metrics = self._publisher.prepare_ordered_sampler(
-                    operation_id=job.operation_id,
-                    run_id=job.run_id,
-                    generation=job.generation,
-                    optimizer_state_path=job.optimizer_state_path,
-                    target=ordered_target,
-                    adapter_dtypes={},
-                    adapter_config=state.adapter_config,
-                    slot_ref=LoRASlotRef("checkpoint", job.run_id),
-                    sink=sink,
-                    staged=staged,
-                )
+                with self._publisher.prepare_turn(job.operation_id):
+                    rank_plan, metrics = self._publisher.prepare_ordered_sampler(
+                        operation_id=job.operation_id,
+                        run_id=job.run_id,
+                        generation=job.generation,
+                        optimizer_state_path=job.optimizer_state_path,
+                        target=ordered_target,
+                        adapter_dtypes={},
+                        adapter_config=state.adapter_config,
+                        slot_ref=LoRASlotRef("checkpoint", job.run_id),
+                        sink=sink,
+                        staged=staged,
+                    )
             except BaseException:
                 self._publisher.discard(job.operation_id)
                 raise
@@ -2513,17 +2514,18 @@ class MCoreRunSlotExecutor:
         self._publisher.reserve_snapshot(job.operation_id)
         try:
             staged()
-            rank_plan, metrics = self._publisher.prepare(
-                operation_id=job.operation_id,
-                generation=job.generation,
-                optimizer_state_path=job.optimizer_state_path,
-                staging_adapter_path=job.staging_adapter_path,
-                existing_adapter=job.existing_adapter,
-                publication_targets=job.publication_targets,
-                adapter_object_target=job.adapter_object_target,
-                save_optimizer=job.save_optimizer,
-                sink=sink,
-            )
+            with self._publisher.prepare_turn(job.operation_id):
+                rank_plan, metrics = self._publisher.prepare(
+                    operation_id=job.operation_id,
+                    generation=job.generation,
+                    optimizer_state_path=job.optimizer_state_path,
+                    staging_adapter_path=job.staging_adapter_path,
+                    existing_adapter=job.existing_adapter,
+                    publication_targets=job.publication_targets,
+                    adapter_object_target=job.adapter_object_target,
+                    save_optimizer=job.save_optimizer,
+                    sink=sink,
+                )
         except BaseException:
             self._publisher.discard(job.operation_id)
             raise
@@ -3133,6 +3135,8 @@ class _GenerationPublisher:
         self._latest_by_run: dict[str, str] = {}
         self._prepared: dict[str, _PreparedRankSnapshot] = {}
         self._prepared_order: deque[str] = deque()
+        self._prepare_order: deque[str] = deque()
+        self._prepare_condition = Condition(self._lock)
         self._residency_retirements: set[Future[None]] = set()
         self._work: set[Future[Any]] = set()
         self._failures: list[BaseException] = []
@@ -3148,6 +3152,25 @@ class _GenerationPublisher:
                     f"snapshot operation already reserved: {operation_id}"
                 )
             self._prepared_order.append(operation_id)
+            self._prepare_order.append(operation_id)
+
+    @contextmanager
+    def prepare_turn(self, operation_id: str) -> Iterator[None]:
+        with self._prepare_condition:
+            while self._prepare_order and self._prepare_order[0] != operation_id:
+                if operation_id not in self._prepare_order:
+                    raise RuntimeError("snapshot preparation reservation was released")
+                self._prepare_condition.wait()
+            if not self._prepare_order:
+                raise RuntimeError("snapshot preparation has no reservation")
+        try:
+            yield
+        finally:
+            with self._prepare_condition:
+                if not self._prepare_order or self._prepare_order[0] != operation_id:
+                    raise RuntimeError("snapshot preparation order changed")
+                self._prepare_order.popleft()
+                self._prepare_condition.notify_all()
 
     def _register_prepared(self, prepared: _PreparedRankSnapshot) -> None:
         with self._lock:
@@ -3433,7 +3456,7 @@ class _GenerationPublisher:
                 adapter_config=adapter_config,
                 conversion_group_for_key=_block_for_key,
                 group=self.runtime.publication_exchange_group,
-                metadata_group=self.runtime.publication_metadata_group,
+                metadata_group=self.runtime.publication_exchange_group,
                 exchange_device=torch.device("cpu"),
                 stager=PinnedCpuSnapshotStager(reusable=True),
             )
@@ -4288,11 +4311,21 @@ class _GenerationPublisher:
                     self._prepared_order.remove(operation_id)
                 except ValueError:
                     pass
+                try:
+                    self._prepare_order.remove(operation_id)
+                except ValueError:
+                    pass
+                self._prepare_condition.notify_all()
                 return
             if prepared.authorized:
                 raise RuntimeError("cannot discard an authorized snapshot write")
             self._prepared.pop(operation_id)
             self._prepared_order.remove(operation_id)
+            try:
+                self._prepare_order.remove(operation_id)
+            except ValueError:
+                pass
+            self._prepare_condition.notify_all()
         error = RuntimeError("snapshot write authorization was rejected")
         try:
             prepared.contexts.close()
@@ -5132,7 +5165,7 @@ class _GenerationPublisher:
                 local_write,
                 staging,
                 durable_adapter,
-                group=self.runtime.publication_metadata_group,
+                group=self.runtime.publication_durability_group,
             )
             adapter = published if rank == 0 else None
             if rank == 0 and adapter != prepared.plan.adapter:
@@ -5291,6 +5324,11 @@ class _GenerationPublisher:
                 self._prepared_order.remove(prepared.operation_id)
             except ValueError:
                 pass
+            try:
+                self._prepare_order.remove(prepared.operation_id)
+            except ValueError:
+                pass
+            self._prepare_condition.notify_all()
             if prepared.entry.ephemeral:
                 prepared.entry.retired = True
         self._maybe_release(prepared.entry)
