@@ -631,6 +631,13 @@ def _sized_config(
         if len(values) < num_layers:
             raise ValueError(f"{model_key} {field} has only {len(values)} entries")
         text[field] = values[:num_layers]
+    hybrid_pattern = source_text.get("hybrid_override_pattern")
+    if hybrid_pattern is not None:
+        if not isinstance(hybrid_pattern, str) or len(hybrid_pattern) != source_layers:
+            raise ValueError(f"{model_key} has an invalid hybrid_override_pattern")
+        if num_layers > source_layers:
+            raise ValueError(f"cannot expand {model_key} hybrid_override_pattern")
+        text["hybrid_override_pattern"] = hybrid_pattern[:num_layers]
     source_width = _width_fingerprint(source)
     if not source_width or source_width != _width_fingerprint(sized):
         raise ValueError("throughput fixture changed or lost production-width fields")
@@ -639,7 +646,11 @@ def _sized_config(
         "source_num_layers": source_layers,
         "changed_paths": [
             f"{prefix}{field}"
-            for field in ("num_hidden_layers", *_LAYER_LIST_FIELDS)
+            for field in (
+                "num_hidden_layers",
+                *_LAYER_LIST_FIELDS,
+                "hybrid_override_pattern",
+            )
             if field == "num_hidden_layers" or field in source_text
         ],
         "width_fingerprint": source_width,

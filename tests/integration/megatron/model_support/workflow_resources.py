@@ -378,6 +378,15 @@ _THROUGHPUT_CONFIGS = {
         max_num_seqs=48,
         max_steps=21,
     ),
+    "nemotron_h_moe": ThroughputWorkflowConfig(
+        num_layers=13,
+        prompt_tokens=3884,
+        completion_tokens=48,
+        rollouts_per_group=5,
+        groups_per_step=27,
+        initial_model_calls_per_inference_gpu=20,
+        max_steps=17,
+    ),
 }
 
 # Floors are isolated tok/s, E2E tok/s, accepted tok/s, E2E/isolated, and
