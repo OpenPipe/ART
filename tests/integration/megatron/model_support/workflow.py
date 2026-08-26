@@ -99,6 +99,10 @@ _RUNTIME_ARTIFACT_DIR_NAMES = frozenset(
 _WORKFLOW_STAGE_TIMEOUT_S = 30 * 60
 _WORKFLOW_STAGE_TIMEOUT_OVERRIDES_S = {
     ("e2e_throughput", "deepseek-ai/DeepSeek-V4-Flash"): 40 * 60,
+    (
+        "correctness_sensitivity",
+        "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
+    ): 45 * 60,
 }
 
 
