@@ -40,7 +40,7 @@ _AUTO_GPU_HOURLY_PRICING_USD = {
 
 import httpx
 import numpy as np
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 import torch
 from tqdm import auto as tqdm
 from transformers import AutoTokenizer
@@ -143,6 +143,7 @@ class PreparedPackedTensors(BaseModel):
     plan: PrefixTreePackingPlan
     pad_token_id: int
     advantage_balance: float
+    num_dropped_trajectories: int = Field(default=0, ge=0)
     plot_output_dir: str | None = None
 
 
@@ -1094,6 +1095,9 @@ class LocalBackend:
             packing_timings.packing_tokenization_s = time.monotonic() - started
         if not tokenized_results:
             return None
+        tokenized_trajectory_ids = {
+            id(result.trajectory) for result in tokenized_results
+        }
         started = time.monotonic()
         too_long_for_model = [
             result
@@ -1184,6 +1188,10 @@ class LocalBackend:
             plan=plan,
             pad_token_id=tokenizer.eos_token_id,
             advantage_balance=advantage_balance,
+            num_dropped_trajectories=len(
+                tokenized_trajectory_ids
+                - {id(result.trajectory) for result in tokenized_results}
+            ),
             plot_output_dir=(
                 get_model_dir(model=model, art_path=self._path) if plot_tensors else None
             ),

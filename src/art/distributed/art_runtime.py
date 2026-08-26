@@ -100,6 +100,7 @@ class DistributedPackedBatch(BaseModel):
     trainable_assistant_tokens: int
     loss_bearing_tokens: int
     non_padding_tokens: int
+    num_dropped_trajectories: int = Field(default=0, ge=0)
     trajectory_log_path: str | None = None
     packing_rpc_s: float = 0.0
     trajectory_fetch_s: float = 0.0
@@ -1049,6 +1050,7 @@ class ArtRuntime:
             trainable_assistant_tokens=result.trainable_assistant_tokens,
             loss_bearing_tokens=result.loss_bearing_tokens,
             non_padding_tokens=result.non_padding_tokens,
+            num_dropped_trajectories=result.num_dropped_trajectories,
             trajectory_log_path=result.trajectory_log_path,
             packing_rpc_s=packing_rpc_s,
             trajectory_fetch_s=result.trajectory_fetch_s,
