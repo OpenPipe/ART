@@ -108,6 +108,8 @@ class SamplerManager(Protocol):
         self, model: AnyTrainableModel, publication: SamplerPublication
     ) -> None: ...
 
+    async def close(self) -> None: ...
+
 
 class _RemotePipelineCommandContext(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True, frozen=True)
@@ -609,16 +611,43 @@ class ServerlessBackend:
             failures: list[BaseException] = []
             try:
                 async with asyncio.timeout_at(deadline):
+                    await self._drain_background()
+            except BaseException as error:
+                failures.append(error)
+            if failures and self._background:
+                tasks = tuple(self._background)
+                for task in tasks:
+                    task.cancel()
+                _, pending = await asyncio.wait(
+                    tasks,
+                    timeout=max(0.0, deadline - asyncio.get_running_loop().time()),
+                )
+                if pending:
+                    failures.append(
+                        TimeoutError(
+                            f"{len(pending)} remote background operations did not stop"
+                        )
+                    )
+
+            try:
+                async with asyncio.timeout_at(deadline):
+                    await self._drain_exact_adapters()
+            except BaseException as error:
+                failures.append(error)
+            try:
+                async with asyncio.timeout_at(deadline):
+                    await self._sampler_manager.close()
+            except BaseException as error:
+                failures.append(error)
+            try:
+                async with asyncio.timeout_at(deadline):
                     results = await asyncio.gather(
                         *(client.shutdown() for client in self._clients.values()),
                         return_exceptions=True,
                     )
-                    failures.extend(
-                        result
-                        for result in results
-                        if isinstance(result, BaseException)
-                    )
-                    await self._drain_background()
+                failures.extend(
+                    result for result in results if isinstance(result, BaseException)
+                )
             except BaseException as error:
                 failures.append(error)
                 try:
@@ -637,35 +666,15 @@ class ServerlessBackend:
                     )
                 except BaseException as cleanup_error:
                     failures.append(cleanup_error)
-            if failures and self._background:
-                tasks = tuple(self._background)
-                for task in tasks:
-                    task.cancel()
-                _, pending = await asyncio.wait(
-                    tasks,
-                    timeout=max(0.0, deadline - asyncio.get_running_loop().time()),
-                )
-                if pending:
-                    failures.append(
-                        TimeoutError(
-                            f"{len(pending)} remote background operations did not stop"
-                        )
-                    )
-
-            adapters_drained = False
             try:
                 async with asyncio.timeout_at(deadline):
-                    await self._drain_exact_adapters()
-                adapters_drained = True
+                    await self._service.close()
             except BaseException as error:
                 failures.append(error)
-            if adapters_drained:
-                try:
-                    async with asyncio.timeout_at(deadline):
-                        await self._service.close()
-                except BaseException as error:
-                    failures.append(error)
-            await self._clear_sampler_state()
+            try:
+                await self._clear_sampler_state()
+            except BaseException as error:
+                failures.append(error)
             if failures:
                 raise BaseExceptionGroup("ServerlessBackend shutdown failed", failures)
             self._closed = True
