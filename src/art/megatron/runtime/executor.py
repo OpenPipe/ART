@@ -993,18 +993,23 @@ class MegatronTrainJobExecutor:
             raise RuntimeError("snapshot requested non-resident optimizer state")
         ordered_target = _ordered_sampler_target(job)
         if ordered_target is not None:
-            rank_plan, metrics = self._publisher.prepare_ordered_sampler(
-                operation_id=job.operation_id,
-                run_id=job.run_id,
-                generation=job.generation,
-                optimizer_state_path=job.optimizer_state_path,
-                target=ordered_target,
-                adapter_dtypes=runtime.adapter_export_dtypes,
-                adapter_config=runtime.adapter_export_config,
-                slot_ref=None,
-                sink=sink,
-                staged=staged,
-            )
+            self._publisher.reserve_snapshot(job.operation_id)
+            try:
+                rank_plan, metrics = self._publisher.prepare_ordered_sampler(
+                    operation_id=job.operation_id,
+                    run_id=job.run_id,
+                    generation=job.generation,
+                    optimizer_state_path=job.optimizer_state_path,
+                    target=ordered_target,
+                    adapter_dtypes=runtime.adapter_export_dtypes,
+                    adapter_config=runtime.adapter_export_config,
+                    slot_ref=None,
+                    sink=sink,
+                    staged=staged,
+                )
+            except BaseException:
+                self._publisher.discard(job.operation_id)
+                raise
             return {
                 "operation_id": job.operation_id,
                 "learner_version": job.learner_version,
@@ -1018,18 +1023,23 @@ class MegatronTrainJobExecutor:
             adapter_config=runtime.adapter_export_config,
             snapshot_optimizer=job.save_optimizer,
         )
-        staged()
-        rank_plan, prepare_metrics = self._publisher.prepare(
-            operation_id=job.operation_id,
-            generation=job.generation,
-            optimizer_state_path=job.optimizer_state_path,
-            staging_adapter_path=job.staging_adapter_path,
-            existing_adapter=job.existing_adapter,
-            publication_targets=job.publication_targets,
-            adapter_object_target=job.adapter_object_target,
-            save_optimizer=job.save_optimizer,
-            sink=sink,
-        )
+        self._publisher.reserve_snapshot(job.operation_id)
+        try:
+            staged()
+            rank_plan, prepare_metrics = self._publisher.prepare(
+                operation_id=job.operation_id,
+                generation=job.generation,
+                optimizer_state_path=job.optimizer_state_path,
+                staging_adapter_path=job.staging_adapter_path,
+                existing_adapter=job.existing_adapter,
+                publication_targets=job.publication_targets,
+                adapter_object_target=job.adapter_object_target,
+                save_optimizer=job.save_optimizer,
+                sink=sink,
+            )
+        except BaseException:
+            self._publisher.discard(job.operation_id)
+            raise
         metrics = {
             **stage_metrics,
             **prepare_metrics,
@@ -2469,18 +2479,23 @@ class MCoreRunSlotExecutor:
         if ordered_target is not None:
             from art.megatron.lora import LoRASlotRef
 
-            rank_plan, metrics = self._publisher.prepare_ordered_sampler(
-                operation_id=job.operation_id,
-                run_id=job.run_id,
-                generation=job.generation,
-                optimizer_state_path=job.optimizer_state_path,
-                target=ordered_target,
-                adapter_dtypes={},
-                adapter_config=state.adapter_config,
-                slot_ref=LoRASlotRef("checkpoint", job.run_id),
-                sink=sink,
-                staged=staged,
-            )
+            self._publisher.reserve_snapshot(job.operation_id)
+            try:
+                rank_plan, metrics = self._publisher.prepare_ordered_sampler(
+                    operation_id=job.operation_id,
+                    run_id=job.run_id,
+                    generation=job.generation,
+                    optimizer_state_path=job.optimizer_state_path,
+                    target=ordered_target,
+                    adapter_dtypes={},
+                    adapter_config=state.adapter_config,
+                    slot_ref=LoRASlotRef("checkpoint", job.run_id),
+                    sink=sink,
+                    staged=staged,
+                )
+            except BaseException:
+                self._publisher.discard(job.operation_id)
+                raise
             return {
                 "operation_id": job.operation_id,
                 "learner_version": job.learner_version,
@@ -2498,18 +2513,23 @@ class MCoreRunSlotExecutor:
         # Run-slot generations are immutable L2/L3 images. A following F/B may
         # read L1 while rank-plan construction continues; only an optimizer turn
         # can mutate the selected learner.
-        staged()
-        rank_plan, metrics = self._publisher.prepare(
-            operation_id=job.operation_id,
-            generation=job.generation,
-            optimizer_state_path=job.optimizer_state_path,
-            staging_adapter_path=job.staging_adapter_path,
-            existing_adapter=job.existing_adapter,
-            publication_targets=job.publication_targets,
-            adapter_object_target=job.adapter_object_target,
-            save_optimizer=job.save_optimizer,
-            sink=sink,
-        )
+        self._publisher.reserve_snapshot(job.operation_id)
+        try:
+            staged()
+            rank_plan, metrics = self._publisher.prepare(
+                operation_id=job.operation_id,
+                generation=job.generation,
+                optimizer_state_path=job.optimizer_state_path,
+                staging_adapter_path=job.staging_adapter_path,
+                existing_adapter=job.existing_adapter,
+                publication_targets=job.publication_targets,
+                adapter_object_target=job.adapter_object_target,
+                save_optimizer=job.save_optimizer,
+                sink=sink,
+            )
+        except BaseException:
+            self._publisher.discard(job.operation_id)
+            raise
         return {
             "operation_id": job.operation_id,
             "learner_version": job.learner_version,
@@ -3124,6 +3144,28 @@ class _GenerationPublisher:
         self._closing = False
         self._closed = False
 
+    def reserve_snapshot(self, operation_id: str) -> None:
+        with self._lock:
+            if operation_id in self._prepared or operation_id in self._prepared_order:
+                raise RuntimeError(
+                    f"snapshot operation already reserved: {operation_id}"
+                )
+            self._prepared_order.append(operation_id)
+
+    def _register_prepared(self, prepared: _PreparedRankSnapshot) -> None:
+        with self._lock:
+            operation_id = prepared.operation_id
+            if operation_id in self._prepared:
+                raise RuntimeError(
+                    f"snapshot operation already prepared: {operation_id}"
+                )
+            if operation_id not in self._prepared_order:
+                raise RuntimeError(
+                    "snapshot operation has no authorization reservation"
+                )
+            self._prepared[operation_id] = prepared
+            prepared.entry.consumers.append(prepared.completion)
+
     @property
     def closed(self) -> bool:
         with self._lock:
@@ -3736,14 +3778,7 @@ class _GenerationPublisher:
                 sink=sink,
                 prepared_at=started,
             )
-            with self._lock:
-                if operation_id in self._prepared:
-                    raise RuntimeError(
-                        f"snapshot operation already prepared: {operation_id}"
-                    )
-                self._prepared[operation_id] = prepared
-                self._prepared_order.append(operation_id)
-                entry.consumers.append(completion)
+            self._register_prepared(prepared)
         except BaseException:
             if entry is None:
                 if resolved is not None:
@@ -3847,14 +3882,7 @@ class _GenerationPublisher:
                 sink=sink,
                 prepared_at=started,
             )
-            with self._lock:
-                if operation_id in self._prepared:
-                    raise RuntimeError(
-                        f"snapshot operation already prepared: {operation_id}"
-                    )
-                self._prepared[operation_id] = prepared
-                self._prepared_order.append(operation_id)
-                entry.consumers.append(completion)
+            self._register_prepared(prepared)
         except BaseException:
             contexts.close()
             raise
@@ -4160,14 +4188,7 @@ class _GenerationPublisher:
                 sink=sink,
                 prepared_at=started,
             )
-            with self._lock:
-                if operation_id in self._prepared:
-                    raise RuntimeError(
-                        f"snapshot operation already prepared: {operation_id}"
-                    )
-                self._prepared[operation_id] = prepared
-                self._prepared_order.append(operation_id)
-                entry.consumers.append(completion)
+            self._register_prepared(prepared)
         except BaseException:
             contexts.close()
             raise
@@ -4266,6 +4287,10 @@ class _GenerationPublisher:
         with self._lock:
             prepared = self._prepared.get(operation_id)
             if prepared is None:
+                try:
+                    self._prepared_order.remove(operation_id)
+                except ValueError:
+                    pass
                 return
             if prepared.authorized:
                 raise RuntimeError("cannot discard an authorized snapshot write")

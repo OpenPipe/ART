@@ -874,6 +874,7 @@ def test_generation_publisher_uses_independent_ordered_control_group(
             optimizer_residency_key=None,
         )
     cached = publisher._cache.get(generation.generation_id)
+    publisher.reserve_snapshot("operation")
     plan, _metrics = publisher.prepare_ordered_sampler(
         operation_id="operation",
         run_id="run",
@@ -884,6 +885,7 @@ def test_generation_publisher_uses_independent_ordered_control_group(
         adapter_config=fixture.adapter_config,
         slot_ref=None,
         sink=Sink(),
+        staged=lambda: None,
     )
     prepared = publisher._prepared["operation"]
     assert prepared.entry.ephemeral

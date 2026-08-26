@@ -471,6 +471,12 @@ def test_snapshot_fences_mutation_before_plan_construction() -> None:
             order.append("stage")
             return {}
 
+        def reserve_snapshot(self, _operation_id):
+            order.append("reserve")
+
+        def discard(self, _operation_id):
+            order.append("discard")
+
         def prepare(self, **_kwargs):
             order.append("plan")
             return rank_plan, {}
@@ -492,4 +498,4 @@ def test_snapshot_fences_mutation_before_plan_construction() -> None:
         SimpleNamespace(),
         lambda: order.append("ready"),
     )
-    assert order == ["stage", "ready", "plan"]
+    assert order == ["stage", "reserve", "ready", "plan"]
