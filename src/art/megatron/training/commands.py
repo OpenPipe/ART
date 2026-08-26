@@ -89,6 +89,7 @@ def packing_outcome(
 
 def packing_metrics(packed: DistributedPackedBatch) -> dict[str, float]:
     return {
+        "data/step_num_dropped_trajectories": float(packed.num_dropped_trajectories),
         "time/step_trajectory_fetch_s": packed.trajectory_fetch_s,
         "time/step_trajectory_receive_s": packed.trajectory_receive_s,
         "time/step_trajectory_build_s": packed.trajectory_build_s,
