@@ -46,8 +46,8 @@ class AdapterReceiveResult(_TransportRecord):
     host_id: str = Field(min_length=1)
     generation_id: str = Field(min_length=1)
     path: str = Field(min_length=1)
-    tensor_bytes: int = Field(gt=0)
-    config_bytes: int = Field(gt=0)
+    model_identity: FileIdentity
+    config_identity: FileIdentity
     materialization_s: float = Field(ge=0)
     slot_id: int = Field(default=0, ge=0)
     used_bytes: int = Field(default=0, ge=0)
@@ -63,7 +63,8 @@ class AdapterTransferNotification(_TransportRecord):
     generation_id: str = Field(min_length=1)
     used_bytes: int = Field(gt=0)
     model_identity: FileIdentity
-    adapter_config: dict[str, Any]
+    config_identity: FileIdentity
+    adapter_config_b64: str = Field(min_length=1)
     sender_staging_s: float = Field(ge=0)
     sender_registration_s: float = Field(ge=0)
 
@@ -322,12 +323,15 @@ class AdapterSnapshotReceiver:
                 path / "adapter_model.safetensors",
                 identity=notification.model_identity,
             )
-            with (path / "adapter_config.json").open("w", encoding="utf-8") as output:
-                json.dump(notification.adapter_config, output, indent=2, sort_keys=True)
-                output.write("\n")
+            config = base64.b64decode(notification.adapter_config_b64)
+            if (
+                len(config) != notification.config_identity.size_bytes
+                or hashlib.sha256(config).hexdigest()
+                != notification.config_identity.sha256
+            ):
+                raise RuntimeError("Adapter config identity changed in transport")
+            (path / "adapter_config.json").write_bytes(config)
             materialization_s = time.monotonic() - started
-            model_bytes = (path / "adapter_model.safetensors").stat().st_size
-            config_bytes = (path / "adapter_config.json").stat().st_size
         except BaseException:
             if path.exists():
                 from shutil import rmtree
@@ -341,8 +345,8 @@ class AdapterSnapshotReceiver:
             host_id=self.host_id,
             generation_id=generation_id,
             path=str(path),
-            tensor_bytes=model_bytes,
-            config_bytes=config_bytes,
+            model_identity=notification.model_identity,
+            config_identity=notification.config_identity,
             materialization_s=materialization_s,
             slot_id=pending.target.slot_id,
             used_bytes=notification.used_bytes,
@@ -373,13 +377,18 @@ class AdapterSnapshotReceiver:
             config_path = path / "adapter_config.json"
             if not model_path.is_file() or not config_path.is_file():
                 raise RuntimeError("local adapter transfer is incomplete")
+            if (
+                model_path.stat().st_size != notification.model_identity.size_bytes
+                or config_path.stat().st_size != notification.config_identity.size_bytes
+            ):
+                raise RuntimeError("local adapter materialization changed size")
             self._materialized.add(generation_id)
             return AdapterReceiveResult(
                 host_id=self.host_id,
                 generation_id=generation_id,
                 path=str(path),
-                tensor_bytes=model_path.stat().st_size,
-                config_bytes=config_path.stat().st_size,
+                model_identity=notification.model_identity,
+                config_identity=notification.config_identity,
                 materialization_s=notification.sender_staging_s,
                 slot_id=pending.target.slot_id,
                 used_bytes=notification.used_bytes,
@@ -516,10 +525,11 @@ class NixlAdapterSender:
     def send(
         self,
         payload: PreparedSafetensors,
-        adapter_config: dict[str, Any],
+        adapter_config: bytes,
         targets: tuple[AdapterTransferTarget, ...],
         *,
         model_identity: FileIdentity,
+        config_identity: FileIdentity,
     ) -> None:
         if not targets:
             return
@@ -541,7 +551,8 @@ class NixlAdapterSender:
                 generation_id=first.generation_id,
                 used_bytes=used_bytes,
                 model_identity=model_identity,
-                adapter_config=adapter_config,
+                config_identity=config_identity,
+                adapter_config_b64=base64.b64encode(adapter_config).decode(),
                 sender_staging_s=time.monotonic() - staging_started,
                 sender_registration_s=sender_registration_s,
             )
@@ -645,26 +656,36 @@ class AdapterSnapshotSender:
         prepared_tensors: PreparedSafetensors,
         model_identity: FileIdentity,
     ) -> None:
+        from art.megatron.model_support.lora_disk import encode_adapter_config
+
         transports = {target.transport for target in targets}
         if not targets:
             return
         if len(transports) != 1:
             raise RuntimeError("adapter transfer targets mix transports")
+        snapshot_config = {**snapshot.adapter_config, "art_lora_format": "vllm"}
+        config = encode_adapter_config(snapshot_config)
+        config_identity = FileIdentity(
+            size_bytes=len(config), sha256=hashlib.sha256(config).hexdigest()
+        )
         if transports == {"nixl"}:
             if self._nixl is None:
                 self._nixl = NixlAdapterSender()
             self._nixl.send(
                 prepared_tensors,
-                {**snapshot.adapter_config, "art_lora_format": "vllm"},
+                config,
                 targets,
                 model_identity=model_identity,
+                config_identity=config_identity,
             )
             return
         self._send_local(
             snapshot,
             targets,
+            adapter_config=config,
             prepared_tensors=prepared_tensors,
             model_identity=model_identity,
+            config_identity=config_identity,
         )
 
     @staticmethod
@@ -672,28 +693,36 @@ class AdapterSnapshotSender:
         snapshot: Any,
         targets: tuple[AdapterTransferTarget, ...],
         *,
+        adapter_config: bytes,
         prepared_tensors: PreparedSafetensors,
         model_identity: FileIdentity,
+        config_identity: FileIdentity,
     ) -> None:
-        from art.megatron.weights.lora_publish import save_vllm_lora_snapshot
+        from art.megatron.model_support.lora_disk import save_vllm_lora_tensors
 
         first = targets[0]
-        snapshot_config = {**snapshot.adapter_config, "art_lora_format": "vllm"}
         if any(target.generation_id != first.generation_id for target in targets):
             raise RuntimeError("local adapter transfer target changed")
         for target in targets:
             started = time.monotonic()
-            save_vllm_lora_snapshot(
-                snapshot,
+            identities = save_vllm_lora_tensors(
                 target.path,
+                snapshot.tensors,
+                snapshot.adapter_config,
                 prepared_tensors=prepared_tensors,
                 model_identity=model_identity,
             )
+            if identities != {
+                "adapter_config.json": config_identity,
+                "adapter_model.safetensors": model_identity,
+            }:
+                raise RuntimeError("local adapter identities changed while saving")
             notification = AdapterTransferNotification(
                 generation_id=target.generation_id,
                 used_bytes=prepared_tensors.nbytes,
                 model_identity=model_identity,
-                adapter_config=snapshot_config,
+                config_identity=config_identity,
+                adapter_config_b64=base64.b64encode(adapter_config).decode(),
                 sender_staging_s=time.monotonic() - started,
                 sender_registration_s=0.0,
             ).model_dump_json()

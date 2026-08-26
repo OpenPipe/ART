@@ -1318,9 +1318,7 @@ class DistributedMegatronService:
                 try:
                     return await asyncio.shield(result.completion)
                 except BaseException as error:
-                    await self._cleanup_failed_trainer_transaction(
-                        trainer, None, error
-                    )
+                    await self._cleanup_failed_trainer_transaction(trainer, None, error)
                     raise
 
             return ForwardBackwardServiceLaunch(
@@ -2023,14 +2021,17 @@ class DistributedMegatronService:
                 if len(received) != len(publication_targets):
                     raise RuntimeError("Not every inference host received the adapter")
                 paths = {result.path for result in received}
-                sizes = {
-                    (result.tensor_bytes, result.config_bytes) for result in received
+                identities = {
+                    (result.model_identity, result.config_identity)
+                    for result in received
                 }
-                if len(paths) != 1 or len(sizes) != 1:
+                if len(paths) != 1 or len(identities) != 1:
                     raise RuntimeError(
                         "Inference hosts materialized different adapters"
                     )
-                tensor_bytes, config_bytes = sizes.pop()
+                model_identity, config_identity = identities.pop()
+                tensor_bytes = model_identity.size_bytes
+                config_bytes = config_identity.size_bytes
                 checkpoint = paths.pop()
                 adapter = OptimizerAdapter(
                     identity=str(Path(generation.adapter_path).absolute()),
@@ -2039,10 +2040,14 @@ class DistributedMegatronService:
                     generation_id=generation.generation_id,
                     files=(
                         CheckpointFile(
-                            name="adapter_config.json", size_bytes=config_bytes
+                            name="adapter_config.json",
+                            size_bytes=config_bytes,
+                            sha256=config_identity.sha256,
                         ),
                         CheckpointFile(
-                            name="adapter_model.safetensors", size_bytes=tensor_bytes
+                            name="adapter_model.safetensors",
+                            size_bytes=tensor_bytes,
+                            sha256=model_identity.sha256,
                         ),
                     ),
                 )
