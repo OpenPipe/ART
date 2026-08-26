@@ -8,10 +8,12 @@ from megatron.core.transformer.transformer_layer import TransformerLayer
 import torch
 
 from art.megatron.lora import (
+    ComponentwiseColumnParallelLinearLoRA,
     GatedDeltaNetInProjLoRA,
     LoRA,
     MLPExpertsLinearFC1LoRA,
     MLPExpertsLinearFC2LoRA,
+    RowParallelLinearLoRA,
     SelfAttentionLinearProjLoRA,
     SelfAttentionLinearQKVLoRA,
     SharedExpertsLinearFC1LoRA,
@@ -189,7 +191,7 @@ def _set_lora_weights(
 
 
 def layer_base_prefix(
-    module: TransformerLayer,
+    module: Any,
     *,
     module_name: str | None = None,
 ) -> str:
@@ -200,6 +202,46 @@ def layer_base_prefix(
         ):
             return canonical_name
     return f"language_model.decoder.layers.{module.layer_number - 1}"
+
+
+def build_mamba_stack_adapter_weights(
+    model_chunks: Sequence[Any],
+) -> dict[str, list[Any]]:
+    from megatron.core.ssm.mamba_layer import MambaLayer
+    from megatron.core.transformer.transformer_layer import MoETransformerLayer
+
+    adapter_weights_by_base: dict[str, list[Any]] = {}
+    for chunk in model_chunks:
+        for module_name, module in chunk.named_modules():
+            if not isinstance(module, (MambaLayer, TransformerLayer)):
+                continue
+            layer_prefix = layer_base_prefix(module, module_name=module_name)
+            if isinstance(module, MambaLayer):
+                add_mamba_mixer_adapter_weights(
+                    adapter_weights_by_base,
+                    layer_prefix=layer_prefix,
+                    mixer=module.mixer,
+                )
+            elif isinstance(module, MoETransformerLayer):
+                add_grouped_moe_adapter_weights(
+                    adapter_weights_by_base,
+                    layer_prefix=layer_prefix,
+                    experts=module.mlp.experts,
+                )
+                shared_experts = getattr(module.mlp, "shared_experts", None)
+                if shared_experts is not None:
+                    add_shared_experts_adapter_weights(
+                        adapter_weights_by_base,
+                        layer_prefix=layer_prefix,
+                        shared_experts=shared_experts,
+                    )
+            else:
+                add_standard_self_attention_adapter_weights(
+                    adapter_weights_by_base,
+                    layer_prefix=layer_prefix,
+                    self_attention=module.self_attention,
+                )
+    return adapter_weights_by_base
 
 
 def build_transformer_layer_adapter_weights(
@@ -302,6 +344,30 @@ def add_standard_self_attention_adapter_weights(
     )
 
 
+def add_mamba_mixer_adapter_weights(
+    adapter_weights_by_base: dict[str, list[Any]],
+    *,
+    layer_prefix: str,
+    mixer: Any,
+) -> None:
+    in_proj = getattr(mixer, "in_proj", None)
+    if isinstance(in_proj, ComponentwiseColumnParallelLinearLoRA):
+        base_prefix = f"{layer_prefix}.mixer.in_proj"
+        _set_adapter_weights(
+            adapter_weights_by_base,
+            base_prefix,
+            _simple_adapter_weight(base_prefix, in_proj.lora),
+        )
+    out_proj = getattr(mixer, "out_proj", None)
+    if isinstance(out_proj, RowParallelLinearLoRA):
+        base_prefix = f"{layer_prefix}.mixer.out_proj"
+        _set_adapter_weights(
+            adapter_weights_by_base,
+            base_prefix,
+            _simple_adapter_weight(base_prefix, out_proj.lora),
+        )
+
+
 def _add_dense_mlp_adapter_weights_for_layer(
     adapter_weights_by_base: dict[str, list[Any]],
     layer_prefix: str,
@@ -347,7 +413,14 @@ def add_grouped_moe_adapter_weights(
     linear_fc1 = getattr(experts, "linear_fc1", None)
     base_prefix = f"{layer_prefix}.mlp.experts.linear_fc1"
     if isinstance(linear_fc1, MLPExpertsLinearFC1LoRA):
-        if linear_fc1.fused_gate_up:
+        if linear_fc1.non_gated:
+            lora = linear_fc1.up_lora
+            build_weight = lambda local_expert_idx: _simple_adapter_weight(
+                base_prefix,
+                linear_fc1.up_lora,
+                expert_idx=local_expert_idx,
+            )
+        elif linear_fc1.fused_gate_up:
             lora = linear_fc1.lora
             build_weight = lambda local_expert_idx: _simple_adapter_weight(
                 base_prefix,
@@ -419,12 +492,19 @@ def add_split_mlp_adapter_weights(
     linear_fc1 = getattr(mlp, "linear_fc1", None)
     if isinstance(linear_fc1, SharedExpertsLinearFC1LoRA):
         fc1_prefix = f"{base_prefix}.linear_fc1"
-        _set_lora_weights(
-            adapter_weights_by_base,
-            fc1_prefix,
-            (linear_fc1.gate_lora, "adapter_gate"),
-            (linear_fc1.up_lora, "adapter_up"),
-        )
+        if linear_fc1.non_gated:
+            _set_adapter_weights(
+                adapter_weights_by_base,
+                fc1_prefix,
+                _simple_adapter_weight(fc1_prefix, linear_fc1.up_lora),
+            )
+        else:
+            _set_lora_weights(
+                adapter_weights_by_base,
+                fc1_prefix,
+                (linear_fc1.gate_lora, "adapter_gate"),
+                (linear_fc1.up_lora, "adapter_up"),
+            )
 
     linear_fc2 = getattr(mlp, "linear_fc2", None)
     if isinstance(linear_fc2, SharedExpertsLinearFC2LoRA):

@@ -93,7 +93,6 @@ _NEMOTRON_H_TARGET_MODULES = (
     "o_proj",
     "in_proj",
     "out_proj",
-    "gate_proj",
     "up_proj",
     "down_proj",
     "experts",

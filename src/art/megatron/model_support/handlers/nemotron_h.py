@@ -6,11 +6,15 @@ import torch
 
 from art.megatron.mamba.plan import build_mamba_execution_plan
 from art.megatron.mamba.runtime import MAMBA_STATE_KEY, install_mamba_prefix_tree_hooks
-from art.megatron.model_support.handlers.default_dense import DefaultMoeHandler
+from art.megatron.model_support.handlers.default_dense import (
+    DefaultMoeHandler,
+    _require_moe_experts,
+)
 from art.megatron.model_support.internal_padding import (
     pad_dim_right,
     round_up_to_multiple,
     trim_dim_right,
+    zero_lora_padding,
 )
 from art.megatron.model_support.spec import (
     LayerFamilyInstance,
@@ -41,6 +45,24 @@ def _configure_moe_padding(provider: Any) -> None:
         raise RuntimeError("Nemotron-H provider is missing moe_ffn_hidden_size")
     setattr(provider, _LOGICAL_MOE_FFN_ATTR, logical)
     provider.moe_ffn_hidden_size = round_up_to_multiple(logical, _MOE_FFN_ALIGNMENT)
+
+
+def _padding_sizes_from_provider(provider: Any) -> tuple[int, int]:
+    logical = int(getattr(provider, _LOGICAL_MOE_FFN_ATTR, 0) or 0)
+    internal = int(getattr(provider, "moe_ffn_hidden_size", 0) or 0)
+    if logical <= 0 or internal != round_up_to_multiple(logical, _MOE_FFN_ALIGNMENT):
+        raise RuntimeError(f"Invalid Nemotron-H expert padding: {logical}->{internal}")
+    return logical, internal
+
+
+def _model_config(model_chunks: Sequence[Any]) -> Any | None:
+    for chunk in model_chunks:
+        config = getattr(chunk, "config", None)
+        if config is None:
+            config = getattr(getattr(chunk, "module", None), "config", None)
+        if config is not None:
+            return config
+    return None
 
 
 def _padding_sizes_from_hf_config(config: Any) -> tuple[int, int]:
@@ -161,6 +183,95 @@ def _patch_bridge_padding(model_bridge: Any) -> None:
         bridge_type.megatron_to_hf_config = classmethod(padded_config_export)
 
 
+def _zero_padded_tensor(
+    parameter: torch.nn.Parameter,
+    *,
+    dim: int,
+    start: int,
+    end: int,
+    grads: bool,
+    params: bool,
+) -> None:
+    tensors = [parameter.data] if params else []
+    if grads:
+        for value in (parameter.grad, getattr(parameter, "main_grad", None)):
+            local = getattr(value, "_local_tensor", None)
+            tensor = value if torch.is_tensor(value) else local
+            if torch.is_tensor(tensor):
+                tensors.append(tensor)
+    dim %= parameter.ndim
+    for tensor in tensors:
+        tensor.narrow(dim, start, end - start).zero_()
+
+
+def _zero_expert_padding(
+    model_chunks: Sequence[Any],
+    *,
+    grads: bool,
+    params: bool,
+) -> None:
+    config = _model_config(model_chunks)
+    if config is None:
+        return
+    logical, internal = _padding_sizes_from_provider(config)
+    if logical == internal:
+        return
+
+    from megatron.core.transformer.moe.experts import TEGroupedMLP
+
+    from art.megatron import lora
+
+    etp_size = lora._get_shard_world_size("expert_tp")
+    etp_rank = lora._get_shard_rank("expert_tp")
+    if internal % etp_size:
+        raise RuntimeError(
+            f"Padded expert width {internal} does not divide ETP{etp_size}"
+        )
+    local_size = internal // etp_size
+    shard_start = etp_rank * local_size
+    start = max(logical, shard_start) - shard_start
+    end = min(internal, shard_start + local_size) - shard_start
+
+    with torch.no_grad():
+        for chunk in model_chunks:
+            for module in chunk.modules():
+                if isinstance(module, TEGroupedMLP):
+                    fc1 = getattr(module.linear_fc1, "linear_fc1", module.linear_fc1)
+                    fc2 = getattr(module.linear_fc2, "linear_fc2", module.linear_fc2)
+                    for linear, dim in ((fc1, 0), (fc2, 1)):
+                        for expert in range(module.num_local_experts):
+                            parameter = getattr(linear, f"weight{expert}")
+                            if end > start:
+                                _zero_padded_tensor(
+                                    parameter,
+                                    dim=dim,
+                                    start=start,
+                                    end=end,
+                                    grads=grads,
+                                    params=params,
+                                )
+                if not isinstance(module, lora.LoRA):
+                    continue
+                prefix = module.adapter_model_prefix
+                if ".mixer.experts." not in prefix:
+                    continue
+                if prefix.endswith(".up_proj"):
+                    parameter, dim = module.B_T, -1
+                elif prefix.endswith(".down_proj"):
+                    parameter, dim = module.A_T, -2
+                else:
+                    continue
+                zero_lora_padding(
+                    parameter,
+                    dim=dim,
+                    logical=logical,
+                    internal=internal,
+                    components=(internal,),
+                    grads=grads,
+                    params=params,
+                )
+
+
 class NemotronHHandler(DefaultMoeHandler):
     key = "nemotron_h_moe"
     native_vllm_lora_status = "wip"
@@ -200,6 +311,97 @@ class NemotronHHandler(DefaultMoeHandler):
 
     def install_preprocess_patch(self, model_chunks: Sequence[Any]) -> None:
         install_mamba_prefix_tree_hooks(model_chunks)
+
+    def apply_lora_adapters(
+        self,
+        model_chunks: Sequence[Any],
+        provider: Any,
+        *,
+        target_modules: list[str],
+        rank: int,
+        alpha: int,
+    ) -> None:
+        from megatron.core.ssm.mamba_layer import MambaLayer
+        from megatron.core.transformer.transformer_layer import (
+            MoETransformerLayer,
+            TransformerLayer,
+        )
+
+        from art.megatron.lora import (
+            wrap_grouped_moe_experts,
+            wrap_mamba_mixer,
+            wrap_shared_experts_mlp,
+            wrap_standard_self_attention,
+        )
+
+        heads = int(provider.mamba_num_heads)
+        inner = heads * int(provider.mamba_head_dim)
+        state = int(provider.mamba_num_groups) * int(provider.mamba_state_dim)
+        components = (inner, inner, state, state, heads)
+        targets = set(target_modules)
+        for chunk in model_chunks:
+            for module in chunk.modules():
+                if not isinstance(module, (MambaLayer, TransformerLayer)):
+                    continue
+                prefix = f"base_model.model.backbone.layers.{module.layer_number - 1}"
+                if isinstance(module, MambaLayer):
+                    wrap_mamba_mixer(
+                        module.mixer,
+                        adapter_model_prefix=f"{prefix}.mixer",
+                        provider=provider,
+                        target_modules=targets,
+                        component_sizes=components,
+                        rank=rank,
+                        alpha=alpha,
+                    )
+                elif isinstance(module, MoETransformerLayer):
+                    wrap_grouped_moe_experts(
+                        _require_moe_experts(module),
+                        adapter_model_prefix=prefix,
+                        target_modules=targets,
+                        rank=rank,
+                        alpha=alpha,
+                        non_gated=True,
+                        module_namespace="mixer.experts",
+                    )
+                    shared = getattr(module.mlp, "shared_experts", None)
+                    if shared is not None:
+                        wrap_shared_experts_mlp(
+                            shared,
+                            adapter_model_prefix=prefix,
+                            provider=provider,
+                            target_modules=targets,
+                            rank=rank,
+                            alpha=alpha,
+                            non_gated=True,
+                            module_namespace="mixer.shared_experts",
+                        )
+                else:
+                    wrap_standard_self_attention(
+                        module.self_attention,
+                        adapter_model_prefix=prefix,
+                        provider=provider,
+                        target_modules=targets,
+                        rank=rank,
+                        alpha=alpha,
+                        projection_namespace="mixer",
+                    )
+
+    def build_adapter_weights_by_base(
+        self,
+        model_chunks: Sequence[Any],
+    ) -> dict[str, list[Any]]:
+        from art.megatron.weights.adapter_export import (
+            build_mamba_stack_adapter_weights,
+        )
+
+        return build_mamba_stack_adapter_weights(model_chunks)
+
+    def zero_internal_padding_grads(self, model_chunks: Sequence[Any]) -> None:
+        _zero_expert_padding(model_chunks, grads=True, params=False)
+
+    def zero_internal_padding_params(self, model_chunks: Sequence[Any]) -> None:
+        _zero_expert_padding(model_chunks, grads=False, params=True)
 
     def build_prefix_tree_model_state(
         self,

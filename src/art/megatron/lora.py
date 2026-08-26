@@ -1328,6 +1328,10 @@ class SelfAttentionLinearProjLoRA(torch.nn.Module):
         return base_output + lora_output, bias_output
 
 
+class RowParallelLinearLoRA(SelfAttentionLinearProjLoRA):
+    """Generic row-parallel projection LoRA wrapper."""
+
+
 def _install_replicated_qkv_all_gather_compile_boundary() -> None:
     from megatron.core.transformer import attention
 
@@ -1636,6 +1640,72 @@ class GatedDeltaNetInProjLoRA(torch.nn.Module):
         return linear_output + adapter_output, bias
 
 
+class ComponentwiseColumnParallelLinearLoRA(torch.nn.Module):
+    """LoRA for a column projection whose output packs sharded components."""
+
+    def __init__(
+        self,
+        adapter_model_prefix: str,
+        in_proj: TEColumnParallelLinear | TELayerNormColumnParallelLinear,
+        component_sizes: Sequence[int],
+        rank: int,
+        alpha: float,
+    ) -> None:
+        super().__init__()
+        components = tuple(map(int, component_sizes))
+        tp_size = int(getattr(in_proj, "tp_size", _get_shard_world_size("tp")))
+        if not components or any(size <= 0 or size % tp_size for size in components):
+            raise ValueError(
+                f"Component sizes {components} must be positive and TP{tp_size}-divisible"
+            )
+        local_components = tuple(size // tp_size for size in components)
+        weight = getattr(in_proj, "weight", None)
+        if not isinstance(weight, torch.Tensor) or sum(local_components) != int(
+            weight.shape[0]
+        ):
+            raise ValueError(
+                f"Component sizes {components} do not match {type(in_proj).__name__}"
+            )
+        partition_sizes = getattr(weight, "partition_sizes", None)
+        if partition_sizes is not None and tuple(partition_sizes) != local_components:
+            raise ValueError(
+                f"Projection partitions {tuple(partition_sizes)} do not match "
+                f"component layout {local_components}"
+            )
+        if isinstance(in_proj, TELayerNormColumnParallelLinear):
+            in_proj.return_layernorm_output = True
+            in_proj.return_layernorm_output_gathered = True
+        self.in_proj = in_proj
+        self.lora = _parallel_lora(
+            adapter_model_prefix=adapter_model_prefix,
+            linear=in_proj,
+            out_features=sum(local_components),
+            rank=rank,
+            alpha=alpha,
+            layout="column",
+        )
+        _set_lora_shard_strategy_metadata(
+            self.lora.B_T,
+            strategy="componentwise",
+            component_sizes=components,
+        )
+
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None]:
+        base_output, bias = self.in_proj(x)
+        if isinstance(base_output, tuple):
+            base, lora_input = base_output
+        else:
+            base = base_output
+            lora_input = _column_parallel_lora_input(x, self.in_proj)
+        adapter = self.lora(lora_input)
+        if adapter.shape != base.shape:
+            raise RuntimeError(
+                f"{self.lora.adapter_model_prefix}: LoRA output {tuple(adapter.shape)} "
+                f"does not match base output {tuple(base.shape)}"
+            )
+        return base + adapter, bias
+
+
 class MLPExpertsLinearFC1LoRA(torch.nn.Module):
     def __init__(
         self,
@@ -1645,12 +1715,29 @@ class MLPExpertsLinearFC1LoRA(torch.nn.Module):
         alpha: float,
         num_local_experts: int,
         fused_gate_up: bool = False,
+        non_gated: bool = False,
     ) -> None:
         super().__init__()
+        if fused_gate_up and non_gated:
+            raise ValueError("fused_gate_up and non_gated are mutually exclusive")
         self.linear_fc1 = linear_fc1
         self.out_features = _out_features(linear_fc1)
         self.fused_gate_up = bool(fused_gate_up)
-        if self.fused_gate_up:
+        self.non_gated = bool(non_gated)
+        if self.non_gated:
+            self.up_lora = _parallel_lora(
+                adapter_model_prefix=f"{adapter_model_prefix}.{{expert}}.up_proj",
+                linear=linear_fc1,
+                out_features=self.out_features,
+                rank=rank,
+                alpha=alpha,
+                layout="column",
+                shard_domain="expert_tp",
+                grad_sync_domain=EXPERT_TP_GRAD_SYNC_DOMAIN,
+                allreduce=False,
+                num_local_experts=num_local_experts,
+            )
+        elif self.fused_gate_up:
             self.lora = _parallel_lora(
                 adapter_model_prefix=f"{adapter_model_prefix}.{{expert}}.gate_up_proj",
                 linear=linear_fc1,
@@ -1697,12 +1784,12 @@ class MLPExpertsLinearFC1LoRA(torch.nn.Module):
         )(x, tokens_per_expert)
         adapter_out = (
             _expert_grouped_lora_forward(
-                self.lora,
+                self.up_lora if self.non_gated else self.lora,
                 x,
                 tokens_per_expert,
                 self.out_features,
             )
-            if self.fused_gate_up
+            if self.non_gated or self.fused_gate_up
             else _expert_grouped_lora_dual_forward(self, x, tokens_per_expert)
         )
         return base_out + adapter_out, bias_out
@@ -1762,22 +1849,36 @@ class SharedExpertsLinearFC1LoRA(torch.nn.Module):
         rank: int,
         alpha: float,
         lora_cls: type[LoRA] = LoRA,
+        non_gated: bool = False,
     ) -> None:
         super().__init__()
         if isinstance(linear_fc1, TELayerNormColumnParallelLinear):
             linear_fc1.return_layernorm_output = True
             linear_fc1.return_layernorm_output_gathered = True
         self.linear_fc1 = linear_fc1
-        self.gate_lora, self.up_lora = _parallel_lora_pair(
-            adapter_model_prefix=adapter_model_prefix,
-            linear=linear_fc1,
-            out_features=linear_fc1.out_features // 2,
-            rank=rank,
-            alpha=alpha,
-            layout="column",
-            suffixes=("gate_proj", "up_proj"),
-            lora_cls=lora_cls,
-        )
+        self.out_features = int(linear_fc1.weight.shape[0])
+        self.non_gated = bool(non_gated)
+        if self.non_gated:
+            self.up_lora = _parallel_lora(
+                adapter_model_prefix=f"{adapter_model_prefix}.up_proj",
+                linear=linear_fc1,
+                out_features=self.out_features,
+                rank=rank,
+                alpha=alpha,
+                layout="column",
+                lora_cls=lora_cls,
+            )
+        else:
+            self.gate_lora, self.up_lora = _parallel_lora_pair(
+                adapter_model_prefix=adapter_model_prefix,
+                linear=linear_fc1,
+                out_features=linear_fc1.out_features // 2,
+                rank=rank,
+                alpha=alpha,
+                layout="column",
+                suffixes=("gate_proj", "up_proj"),
+                lora_cls=lora_cls,
+            )
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None]:
         if int(x.numel()) == 0:
@@ -1785,24 +1886,28 @@ class SharedExpertsLinearFC1LoRA(torch.nn.Module):
             weight = getattr(self.linear_fc1, "weight", None)
             if isinstance(weight, torch.Tensor):
                 zero = zero + weight.to(dtype=x.dtype).sum() * 0.0
-            for lora in (self.gate_lora, self.up_lora):
+            loras = (
+                (self.up_lora,) if self.non_gated else (self.gate_lora, self.up_lora)
+            )
+            for lora in loras:
                 zero = zero + lora.A_T.to(dtype=x.dtype).sum() * 0.0
                 zero = zero + lora.B_T.to(dtype=x.dtype).sum() * 0.0
-            return zero.expand(
-                *x.shape[:-1], self.linear_fc1.out_features
-            ).clone(), None
+            return zero.expand(*x.shape[:-1], self.out_features).clone(), None
         base_output, bias_out = self.linear_fc1(x)
         if isinstance(base_output, tuple):
             base_out, lora_input = base_output
         else:
             base_out = base_output
             lora_input = _column_parallel_lora_input(x, self.linear_fc1)
-        adapter_out = torch.cat(
-            [self.gate_lora(lora_input), self.up_lora(lora_input)],
-            dim=-1,
+        adapter_out = (
+            self.up_lora(lora_input)
+            if self.non_gated
+            else torch.cat(
+                [self.gate_lora(lora_input), self.up_lora(lora_input)], dim=-1
+            )
         )
         if adapter_out.shape != base_out.shape:
-            adapter_model_prefix = self.gate_lora.adapter_model_prefix.rsplit(".", 1)[0]
+            adapter_model_prefix = self.up_lora.adapter_model_prefix.rsplit(".", 1)[0]
             raise RuntimeError(
                 f"{adapter_model_prefix}: LoRA adapter output shape "
                 f"{tuple(adapter_out.shape)} does not match base output shape "
@@ -1848,7 +1953,7 @@ def _unwrap_attr(
     return unwrapped
 
 
-def _adapter_model_prefix(module: TransformerLayer) -> str:
+def _adapter_model_prefix(module: Any) -> str:
     return f"base_model.model.model.layers.{module.layer_number - 1}"
 
 
@@ -1870,7 +1975,9 @@ def wrap_standard_self_attention(
     target_modules: set[str],
     rank: int,
     alpha: int,
+    projection_namespace: str = "self_attn",
 ) -> None:
+    projection_prefix = f"{adapter_model_prefix}.{projection_namespace}"
     if _targets_include(target_modules, "o_proj"):
         self_attention_linear_proj = _unwrap_attr(
             self_attention.linear_proj,
@@ -1878,7 +1985,7 @@ def wrap_standard_self_attention(
             TERowParallelLinear,
         )
         self_attention.linear_proj = SelfAttentionLinearProjLoRA(
-            adapter_model_prefix=f"{adapter_model_prefix}.self_attn.o_proj",
+            adapter_model_prefix=f"{projection_prefix}.o_proj",
             linear_proj=self_attention_linear_proj,
             rank=rank,
             alpha=alpha,
@@ -1891,7 +1998,7 @@ def wrap_standard_self_attention(
             TELayerNormColumnParallelLinear,
         )
         linear_qkv_lora = SelfAttentionLinearQKVLoRA(
-            adapter_model_prefix=f"{adapter_model_prefix}.self_attn",
+            adapter_model_prefix=projection_prefix,
             linear_qkv=self_attention_linear_qkv,
             rank=rank,
             alpha=alpha,
@@ -1899,6 +2006,40 @@ def wrap_standard_self_attention(
             target_modules=target_modules,
         )
         setattr(self_attention, "linear_qkv", linear_qkv_lora)
+
+
+def wrap_mamba_mixer(
+    mixer: Any,
+    *,
+    adapter_model_prefix: str,
+    provider: Any,
+    target_modules: set[str],
+    component_sizes: Sequence[int],
+    rank: int,
+    alpha: int,
+) -> None:
+    if _targets_include(target_modules, "in_proj"):
+        in_proj = _unwrap_attr(
+            mixer.in_proj,
+            "in_proj",
+            (TEColumnParallelLinear, TELayerNormColumnParallelLinear),
+        )
+        mixer.in_proj = ComponentwiseColumnParallelLinearLoRA(
+            adapter_model_prefix=f"{adapter_model_prefix}.in_proj",
+            in_proj=in_proj,
+            component_sizes=component_sizes,
+            rank=rank,
+            alpha=alpha,
+        )
+    if _targets_include(target_modules, "out_proj"):
+        out_proj = _unwrap_attr(mixer.out_proj, "linear_proj", TERowParallelLinear)
+        mixer.out_proj = RowParallelLinearLoRA(
+            adapter_model_prefix=f"{adapter_model_prefix}.out_proj",
+            linear_proj=out_proj,
+            rank=rank,
+            alpha=alpha,
+            provider=provider,
+        )
 
 
 def wrap_gated_delta_net_attention(
@@ -1946,12 +2087,20 @@ def wrap_grouped_moe_experts(
     rank: int,
     alpha: int,
     fused_gate_up: bool = False,
+    non_gated: bool = False,
+    module_namespace: str = "mlp.experts",
 ) -> None:
+    if fused_gate_up and non_gated:
+        raise ValueError("fused_gate_up and non_gated are mutually exclusive")
+    expert_prefix = f"{adapter_model_prefix}.{module_namespace}"
     expert_loras: list[LoRA] = []
     wrap_fc1 = (
         _targets_include(target_modules, "experts")
         if fused_gate_up
-        else _targets_include(target_modules, "gate_proj", "up_proj")
+        else _targets_include(
+            target_modules,
+            *(("experts", "up_proj") if non_gated else ("gate_proj", "up_proj")),
+        )
     )
     if wrap_fc1:
         mlp_experts_linear_fc1 = _unwrap_attr(
@@ -1960,21 +2109,31 @@ def wrap_grouped_moe_experts(
             TEColumnParallelGroupedLinear,  # type: ignore
         )
         linear_fc1_lora = MLPExpertsLinearFC1LoRA(
-            adapter_model_prefix=f"{adapter_model_prefix}.mlp.experts",
+            adapter_model_prefix=expert_prefix,
             linear_fc1=mlp_experts_linear_fc1,
             rank=rank,
             alpha=alpha,
             num_local_experts=experts.num_local_experts,
             fused_gate_up=fused_gate_up,
+            non_gated=non_gated,
         )
         setattr(experts, "linear_fc1", linear_fc1_lora)
         expert_loras.extend(
-            (linear_fc1_lora.lora,)
-            if fused_gate_up
-            else (linear_fc1_lora.gate_lora, linear_fc1_lora.up_lora)
+            (linear_fc1_lora.up_lora,)
+            if non_gated
+            else (
+                (linear_fc1_lora.lora,)
+                if fused_gate_up
+                else (linear_fc1_lora.gate_lora, linear_fc1_lora.up_lora)
+            )
         )
     wrap_fc2 = (
-        wrap_fc1 if fused_gate_up else _targets_include(target_modules, "down_proj")
+        wrap_fc1
+        if fused_gate_up
+        else _targets_include(
+            target_modules,
+            *(("experts", "down_proj") if non_gated else ("down_proj",)),
+        )
     )
     if wrap_fc2:
         linear_fc2 = _unwrap_attr(
@@ -1983,7 +2142,7 @@ def wrap_grouped_moe_experts(
             TERowParallelGroupedLinear,  # type: ignore
         )
         linear_fc2_lora = MLPExpertsLinearFC2LoRA(
-            adapter_model_prefix=f"{adapter_model_prefix}.mlp.experts",
+            adapter_model_prefix=expert_prefix,
             linear_fc2=linear_fc2,
             rank=rank,
             alpha=alpha,
@@ -2003,8 +2162,11 @@ def wrap_split_mlp_lora(
     rank: int,
     alpha: int,
     lora_cls: type[LoRA] = LoRA,
+    non_gated: bool = False,
 ) -> None:
-    if _targets_include(target_modules, "gate_proj", "up_proj"):
+    if _targets_include(
+        target_modules, *(("up_proj",) if non_gated else ("gate_proj", "up_proj"))
+    ):
         linear_fc1 = _unwrap_attr(
             mlp.linear_fc1,
             "linear_fc1",
@@ -2016,6 +2178,7 @@ def wrap_split_mlp_lora(
             rank=rank,
             alpha=alpha,
             lora_cls=lora_cls,
+            non_gated=non_gated,
         )
     if _targets_include(target_modules, "down_proj"):
         linear_fc2 = _unwrap_attr(
@@ -2081,15 +2244,18 @@ def wrap_shared_experts_mlp(
     rank: int,
     alpha: int,
     lora_cls: type[LoRA] = LoRA,
+    non_gated: bool = False,
+    module_namespace: str = "mlp.shared_experts",
 ) -> None:
     wrap_split_mlp_lora(
         shared_experts,
-        adapter_model_prefix=f"{adapter_model_prefix}.mlp.shared_experts",
+        adapter_model_prefix=f"{adapter_model_prefix}.{module_namespace}",
         provider=provider,
         target_modules=target_modules,
         rank=rank,
         alpha=alpha,
         lora_cls=lora_cls,
+        non_gated=non_gated,
     )
 
 
