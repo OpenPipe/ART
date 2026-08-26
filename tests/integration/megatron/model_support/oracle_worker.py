@@ -1328,9 +1328,7 @@ def _mutation_hook(
             num_sequences: int,
             global_grad_accumulation_sequences: int,
         ) -> list[int | None]:
-            base_global_sample_index = global_grad_accumulation_sequences * (
-                step_index + megatron_train_module.ps.get_data_parallel_rank()
-            )
+            base_global_sample_index = step_index * global_grad_accumulation_sequences
             return [
                 (global_sample_index if global_sample_index < num_sequences else None)
                 for global_sample_index in range(
@@ -1784,7 +1782,16 @@ def _worker_run(
                 num_sequences=request.packed_tensors.num_sequences,
                 global_grad_accumulation_sequences=global_grad_accumulation_sequences,
             )
-            forward_trace_capture.set_step(step_index, micro_sample_indices)
+            trace_sample_indices = micro_sample_indices
+            if request.mutation == "dp_grad_accumulation_seqs":
+                trace_offset = (
+                    ps.get_data_parallel_rank() * request.packed_tensors.num_sequences
+                )
+                trace_sample_indices = [
+                    None if index is None else index + trace_offset
+                    for index in micro_sample_indices
+                ]
+            forward_trace_capture.set_step(step_index, trace_sample_indices)
             captured_grads = None
             _debug(f"starting step_index={step_index}")
             if request.objective == "rl":
@@ -1862,6 +1869,21 @@ def _worker_run(
                     model_chunks, optimizer_master=True
                 )
                 if rank0:
+                    if request.mutation == "dp_grad_accumulation_seqs":
+                        num_sequences = request.packed_tensors.num_sequences
+                        ordered_micro_sample_indices = [
+                            None if index is None else index % num_sequences
+                            for index in ordered_micro_sample_indices
+                        ]
+                        for calls in _require_not_none(
+                            merged_trace, "merged_trace"
+                        ).values():
+                            for call in calls:
+                                sample_index = call.get("micro_sample_index")
+                                if isinstance(sample_index, int):
+                                    call["micro_sample_index"] = (
+                                        sample_index % num_sequences
+                                    )
                     trace = _trim_trace_padding(
                         _require_not_none(merged_trace, "merged_trace"),
                         valid_lengths=_require_not_none(valid_lengths, "valid_lengths"),
