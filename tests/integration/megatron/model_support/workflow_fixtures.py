@@ -17,7 +17,7 @@ FIXTURE_PATH_ENV = "ART_MODEL_SUPPORT_FIXTURE_PATH"
 FIXTURE_CACHE_ENV = "ART_MODEL_SUPPORT_FIXTURE_CACHE"
 FIXTURE_ROOT_ENV = "ART_MODEL_SUPPORT_FIXTURE_ROOT"
 FIXTURE_VERSION = 18
-_MODEL_FIXTURE_VERSION_OFFSETS = {"nemotron_h_moe": 6}
+_MODEL_FIXTURE_VERSION_OFFSETS = {"nemotron_h_moe": 7}
 _CANONICAL_CACHE_VERSION = 16
 _ROOT = Path("/tmp/art-models/main-merge-oracle")
 _CACHE_ROOT = Path("/tmp/art-model-support-workflow/hf-cache")
@@ -978,9 +978,17 @@ def _build(
                 if model._tied_weights_keys != ["lm_head.weight"]:
                     raise RuntimeError("Nemotron-H HF tied-weight metadata changed")
                 model._tied_weights_keys = {}
+                model.register_for_auto_class("AutoModelForCausalLM")
             parameters = sum(parameter.numel() for parameter in model.parameters())
             model.save_pretrained(
-                staging, safe_serialization=True, max_shard_size="2GB"
+                staging,
+                safe_serialization=True,
+                max_shard_size="2GB",
+                **(
+                    {"save_original_format": False}
+                    if model_key == "nemotron_h_moe"
+                    else {}
+                ),
             )
             del model
             gc.collect()
