@@ -8,6 +8,7 @@ from art.megatron.mamba.plan import build_mamba_execution_plan
 from art.megatron.mamba.runtime import MAMBA_STATE_KEY, install_mamba_prefix_tree_hooks
 from art.megatron.model_support.handlers.default_dense import (
     DefaultMoeHandler,
+    _compile_workaround_flags_for_provider,
     _require_moe_experts,
 )
 from art.megatron.model_support.internal_padding import (
@@ -17,6 +18,7 @@ from art.megatron.model_support.internal_padding import (
     zero_lora_padding,
 )
 from art.megatron.model_support.spec import (
+    CompileWorkaroundConfig,
     LayerFamilyInstance,
     PrefixTreeModelStateContext,
 )
@@ -346,6 +348,13 @@ class NemotronHHandler(DefaultMoeHandler):
             raise ValueError("Nemotron-H does not support virtual pipeline parallelism")
         _configure_moe_padding(provider)
         provider.use_mamba_mem_eff_path = True
+
+    def compile_workaround_config(self, provider: Any) -> CompileWorkaroundConfig:
+        return CompileWorkaroundConfig(
+            flags=_compile_workaround_flags_for_provider(
+                provider, ("te_triton_permute_with_mask_map",)
+            )
+        )
 
     def install_preprocess_patch(self, model_chunks: Sequence[Any]) -> None:
         install_mamba_prefix_tree_hooks(model_chunks)
