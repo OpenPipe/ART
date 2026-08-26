@@ -565,9 +565,7 @@ def _run_case(
         names = {tensor.name for tensor in prepared.layout.tensors}
         assert any(".v_proj." in name for name in names)
     if case == "qwen36_shared_outer":
-        assert not any(
-            ".shared." in tensor.name for tensor in prepared.layout.tensors
-        )
+        assert not any(".shared." in tensor.name for tensor in prepared.layout.tensors)
     typed_stats = [value for value in stats if value is not None]
     typed_timings = [value for value in timings if value is not None]
     assert {value[2] for value in typed_timings} == {0 if world_size == 1 else 2}
@@ -620,9 +618,7 @@ def _worker(
         reports = [
             report
             for case in CASES
-            if (
-                report := _run_case(case, rank, world_size, Path(fixture_root))
-            )
+            if (report := _run_case(case, rank, world_size, Path(fixture_root)))
             is not None
         ]
         if rank == 0:
@@ -765,9 +761,7 @@ def _contract_worker(
                 local_tensors=fixture.regular if rank == 0 else {},
                 local_metadata=fixture.regular_metadata if rank == 0 else (),
                 local_packed_tensors=fixture.packed if rank == 0 else {},
-                local_packed_metadata=(
-                    fixture.packed_metadata if rank == 0 else ()
-                ),
+                local_packed_metadata=(fixture.packed_metadata if rank == 0 else ()),
                 handler=fixture.handler if rank == 0 else None,
                 adapter_config=fixture.adapter_config,
                 conversion_group_for_key=_block_for_key,
@@ -819,7 +813,9 @@ def test_rank_distributed_lora_rejects_collective_ordering_mismatch(
     assert report_path.read_text() == "ok\n"
 
 
-def test_snapshot_fence_waits_for_caller_stream(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_snapshot_fence_waits_for_caller_stream(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     caller_stream = object()
 
     class Stream:
