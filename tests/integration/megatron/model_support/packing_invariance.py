@@ -18,7 +18,6 @@ from pydantic import BaseModel, Field
 import torch
 
 from art.megatron import train as megatron_train
-from art.megatron.mamba.runtime import mamba_model_preprocess
 from art.megatron.model_support.discovery import inspect_architecture
 from art.megatron.model_support.registry import (
     get_model_support_handler_for_spec,
@@ -149,18 +148,30 @@ def _cleanup_distributed_state() -> None:
         torch.distributed.destroy_process_group()  # type: ignore[possibly-missing-attribute]
 
 
-def _locate_model_preprocess(model_chunks: list[Any]) -> Any:
+def _mamba_preprocess(
+    model: MambaModel,
+    *,
+    input_ids: torch.Tensor,
+    position_ids: torch.Tensor,
+) -> tuple[torch.Tensor, None]:
+    return model.embedding(input_ids=input_ids, position_ids=position_ids), None
+
+
+def _locate_model_preprocess(model_chunks: list[Any]) -> tuple[Any, bool]:
     for chunk in model_chunks:
         module: Any = chunk
         while hasattr(module, "module"):
             module = module.module
         if isinstance(module, GPTModel):
-            return module._preprocess
+            return module._preprocess, module.position_embedding_type == "rope"
         if isinstance(module, MambaModel):
-            return partial(mamba_model_preprocess, module)
+            return partial(_mamba_preprocess, module), False
         language_model = getattr(module, "language_model", None)
         if isinstance(language_model, GPTModel):
-            return language_model._preprocess
+            return (
+                language_model._preprocess,
+                language_model.position_embedding_type == "rope",
+            )
     raise RuntimeError("Failed to locate a model preprocessor for packing invariance")
 
 
@@ -764,7 +775,7 @@ def _run_packing_invariance_worker(
         if runtime is None:
             raise RuntimeError("packing invariance did not acquire a Megatron runtime")
         model_chunks = cast(list[Any], runtime.model)
-        hooked_preprocess = _locate_model_preprocess(model_chunks)
+        hooked_preprocess, rotary_expected = _locate_model_preprocess(model_chunks)
         for chunk in model_chunks:
             chunk.eval()
 
@@ -784,7 +795,7 @@ def _run_packing_invariance_worker(
             input_ids = cast(torch.Tensor, packed_tensors["tokens"]).cuda()
             group_ids = cast(torch.Tensor, packed_tensors["group_ids"]).cuda()
             parent_ids = cast(torch.Tensor, packed_tensors["parent_ids"]).cuda()
-            rotary_grouping_checked = False
+            rotary_grouping_checked = not rotary_expected
             rotary_grouping_respected = True
             repeated_position_key_count = 0
             for row_index in range(int(position_ids.shape[0])):
