@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Coroutine
 import heapq
 import time
 from typing import TYPE_CHECKING, Any, Generic, NamedTuple, TypeVar, cast
@@ -62,9 +62,7 @@ CommandResultT = TypeVar("CommandResultT")
 _MAX_RETAINED_COMPLETED_OPERATIONS = 1024
 _MAX_RETAINED_COMPLETED_RESULT_BYTES = 512 << 20
 _TASK_DRAIN_TIMEOUT_S = process_shutdown_timeout(2)
-_DEFERRED_RESULT_KINDS = frozenset(
-    {"forward_backward", "save_sampler", "save_state"}
-)
+_DEFERRED_RESULT_KINDS = frozenset({"forward_backward", "save_sampler", "save_state"})
 _SEQUENCE_POISONING_KINDS = frozenset({"forward_backward", "optim_step", "load_state"})
 
 
@@ -105,7 +103,7 @@ async def _drain_tasks(
 
 async def _run_command_while_releasing(
     command: Awaitable[CommandResultT],
-    release: Awaitable[float],
+    release: Coroutine[Any, Any, float],
     *,
     release_name: str,
 ) -> tuple[CommandResultT, float]:
@@ -136,6 +134,30 @@ async def _run_command_while_releasing(
 class _DeferredResult(NamedTuple, Generic[ResultT]):
     completion: asyncio.Task[ResultT]
     owned: tuple[asyncio.Task[Any], ...] = ()
+
+
+def _forward_command_result(
+    *,
+    backward: bool,
+    operation_id: str,
+    packing: PackingOutcome,
+    loss_fn_outputs: tuple[LossFnOutput, ...],
+    metrics: dict[str, float],
+) -> ForwardResult | ForwardBackwardResult:
+    if backward:
+        return ForwardBackwardResult(
+            operation_id=operation_id,
+            packing=packing,
+            loss_fn_outputs=loss_fn_outputs,
+            metrics=metrics,
+            produced_gradient=packing.loss_bearing_tokens > 0,
+        )
+    return ForwardResult(
+        operation_id=operation_id,
+        packing=packing,
+        loss_fn_outputs=loss_fn_outputs,
+        metrics=metrics,
+    )
 
 
 class _SequenceReleaseGate:
@@ -488,7 +510,11 @@ class LocalMegatronTrainingClient:
         async def execute(
             admission: CommandAdmission,
             _own_task: Callable[[asyncio.Task[Any]], asyncio.Task[Any]],
-        ) -> ForwardResult | ForwardBackwardResult:
+        ) -> (
+            ForwardResult
+            | ForwardBackwardResult
+            | _DeferredResult[ForwardBackwardResult]
+        ):
             if request.batch.kind == "sft":
                 assert tokenized_sft is not None
                 tokenized = tokenized_sft
@@ -496,9 +522,10 @@ class LocalMegatronTrainingClient:
                     target_sequences = (
                         self._service.resolve_sft_global_grad_accumulation_sequences(1)
                     )
-                    values = {
-                        "operation_id": admission.ref.operation_id,
-                        "packing": PackingOutcome(
+                    return _forward_command_result(
+                        backward=backward,
+                        operation_id=admission.ref.operation_id,
+                        packing=PackingOutcome(
                             packed_sequence_length=1,
                             packed_sequences=0,
                             target_packed_sequences=target_sequences,
@@ -510,17 +537,14 @@ class LocalMegatronTrainingClient:
                             policy_token_counts=None,
                             group_shapes=(),
                         ),
-                        "loss_fn_outputs": (),
-                        "metrics": {
+                        loss_fn_outputs=(),
+                        metrics={
                             "time/step_tokenize_trajectory_groups_s": tokenization_s,
                             "data/step_num_dropped_trajectories": float(
                                 tokenized.num_dropped_trajectories
                             ),
                         },
-                    }
-                    if backward:
-                        return ForwardBackwardResult(**values, produced_gradient=False)
-                    return ForwardResult(**values)
+                    )
                 batch = sft_batch_data(tokenized)
                 grad_sequences = (
                     self._service.resolve_sft_global_grad_accumulation_sequences(
@@ -536,8 +560,8 @@ class LocalMegatronTrainingClient:
                         admission.ref, batch, grad_sequences
                     )
                 )
-                result_type = ForwardBackwardResult if backward else ForwardResult
-                return result_type(
+                return _forward_command_result(
+                    backward=backward,
                     operation_id=admission.ref.operation_id,
                     packing=sft_packing_outcome(
                         batch, physical_sequences=grad_sequences
@@ -595,11 +619,11 @@ class LocalMegatronTrainingClient:
                 finally:
                     self._release_batch_soon(packed)
 
-                def tokenized_result(raw: dict[str, Any]):
-                    result_type = (
-                        ForwardBackwardResult if backward else ForwardResult
-                    )
-                    return result_type(
+                def tokenized_result(
+                    raw: dict[str, Any],
+                ) -> ForwardResult | ForwardBackwardResult:
+                    return _forward_command_result(
+                        backward=backward,
                         operation_id=admission.ref.operation_id,
                         packing=packing,
                         loss_fn_outputs=tuple(
@@ -637,27 +661,32 @@ class LocalMegatronTrainingClient:
                 return time.perf_counter() - started
 
             training_config = forward_backward_config(request)
-            raw, release_s = await _run_command_while_releasing(
-                (
+            if backward:
+                launch, release_s = await _run_command_while_releasing(
                     self._service.start_forward_backward_command(
                         admission.ref,
                         payload.packed,
                         training_config,
                         experimental_train_config(request),
-                    )
-                    if backward
-                    else self._service.forward_command(
+                    ),
+                    release_sources(),
+                    release_name=(
+                        f"release-trajectory-sources-{admission.ref.operation_id}"
+                    ),
+                )
+            else:
+                raw, release_s = await _run_command_while_releasing(
+                    self._service.forward_command(
                         admission.ref,
                         payload.packed,
                         training_config,
                         experimental_train_config(request),
-                    )
-                ),
-                release_sources(),
-                release_name=(
-                    f"release-trajectory-sources-{admission.ref.operation_id}"
-                ),
-            )
+                    ),
+                    release_sources(),
+                    release_name=(
+                        f"release-trajectory-sources-{admission.ref.operation_id}"
+                    ),
+                )
             packing = packing_outcome(
                 payload.packed,
                 target_packed_sequences=(
@@ -675,9 +704,11 @@ class LocalMegatronTrainingClient:
                 "time/step_source_lease_release_s": release_s,
             }
 
-            def packed_result(raw: dict[str, Any]):
-                result_type = ForwardBackwardResult if backward else ForwardResult
-                return result_type(
+            def packed_result(
+                raw: dict[str, Any],
+            ) -> ForwardResult | ForwardBackwardResult:
+                return _forward_command_result(
+                    backward=backward,
                     operation_id=admission.ref.operation_id,
                     packing=packing,
                     loss_fn_outputs=tuple(
@@ -693,7 +724,7 @@ class LocalMegatronTrainingClient:
             async def complete_packed() -> ForwardBackwardResult:
                 return cast(
                     ForwardBackwardResult,
-                    packed_result(await asyncio.shield(raw.completion)),
+                    packed_result(await asyncio.shield(launch.completion)),
                 )
 
             return _DeferredResult(
@@ -1237,9 +1268,7 @@ class LocalMegatronTrainingClient:
             self._completed_operation_order.clear()
         elif len(self._completed_operation_order) > max(64, 2 * len(live)):
             self._completed_operation_order = [
-                entry
-                for entry in self._completed_operation_order
-                if entry[1] in live
+                entry for entry in self._completed_operation_order if entry[1] in live
             ]
             heapq.heapify(self._completed_operation_order)
 

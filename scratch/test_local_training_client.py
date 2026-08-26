@@ -52,6 +52,7 @@ class _Backend:
             non_padding_tokens=6,
             loss_bearing_tokens=2,
             trainable_assistant_tokens=2,
+            num_dropped_trajectories=0,
             trajectory_fetch_s=0.1,
             trajectory_receive_s=0.04,
             trajectory_build_s=0.06,

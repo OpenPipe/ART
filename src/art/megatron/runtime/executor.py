@@ -2167,6 +2167,7 @@ class MCoreRunSlotExecutor:
                 ),
                 grads=reduced_gradients,
             )
+            optimizer_step_s = time.perf_counter() - started
             residency_tensors = self._slot_trainer.checkpoint_slot_residency_tensors(
                 job.run_id
             )
@@ -2182,7 +2183,6 @@ class MCoreRunSlotExecutor:
                 raise RuntimeError("resident run has no immutable LoRA export plan")
         if not result["update_successful"] or not math.isfinite(result["grad_norm"]):
             raise RuntimeError("dynamic LoRA optimizer rejected the update")
-        optimizer_step_s = time.perf_counter() - started
         consumed = gradients.consume()
         if consumed != job.contributing_forward_backward_operation_ids:
             raise RuntimeError("optimizer consumed the wrong gradient contributions")
