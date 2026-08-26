@@ -137,6 +137,12 @@ class _CommittedPublisher:
     def raise_if_failed(self) -> None:
         return None
 
+    def reserve_snapshot(self, _operation_id: str) -> None:
+        self.events.append("reserve")
+
+    def discard(self, _operation_id: str) -> None:
+        self.events.append("discard")
+
     def register_resident_generation(self, **kwargs: Any) -> dict[str, float]:
         self.events.append("register_resident")
         generation = kwargs["generation"]
@@ -300,7 +306,7 @@ def test_post_optimizer_save_uses_registered_generation_without_l1(
         raise AssertionError("save reacquired the trainer working set")
 
     executor._resident = forbid_resident
-    save_result = executor.execute_snapshot(_snapshot_job(), object())
+    save_result = executor.execute_snapshot(_snapshot_job(), object(), lambda: None)
 
     output_weights = _key(1)
     output_optimizer = _key(1, "optimizer")
@@ -310,7 +316,7 @@ def test_post_optimizer_save_uses_registered_generation_without_l1(
     ]
     assert tuple(residency.acquired) == optimizer_acquisitions
     assert slot.optimizer_source_calls == 1
-    assert publisher.events == ["register_resident", "prepare"]
+    assert publisher.events == ["register_resident", "reserve", "prepare"]
     assert publisher.archives == [
         {
             "generation": _generation(1),
@@ -394,6 +400,12 @@ class _LowerTierPublisher:
     ) -> bool:
         return generation == self.entry.generation
 
+    def reserve_snapshot(self, _operation_id: str) -> None:
+        return None
+
+    def discard(self, _operation_id: str) -> None:
+        return None
+
     def prepare(self, **kwargs: Any) -> tuple[Any, dict[str, float]]:
         with self.delegate._lora_snapshot(self.entry, None) as (_lora, weights):
             with self.delegate._optimizer_snapshot(
@@ -451,7 +463,7 @@ def test_nonresident_committed_save_borrows_l2_and_restores_l3(
         AssertionError("save reacquired the trainer working set")
     )
 
-    result = executor.execute_snapshot(_snapshot_job(), object())
+    result = executor.execute_snapshot(_snapshot_job(), object(), lambda: None)
 
     assert residency.borrowed == [(sampler, "l2_cpu"), (optimizer, "l3_nvme")]
     assert optimizer_source.bound == optimizer_tensors
@@ -519,7 +531,7 @@ def test_save_fails_closed_for_missing_or_incomplete_generation(
 
     with pytest.raises(RuntimeError, match=message):
         executor.execute_snapshot(
-            _snapshot_job(save_optimizer=save_optimizer), object()
+            _snapshot_job(save_optimizer=save_optimizer), object(), lambda: None
         )
 
     assert publisher.prepare_calls == 0
