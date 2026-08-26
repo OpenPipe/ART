@@ -74,6 +74,9 @@ class _Sampler:
         del model
         self.publications.append(f"remove:{publication.mode}")
 
+    async def close(self) -> None:
+        pass
+
 
 class _Operation:
     def __init__(self, ref: OperationRef) -> None:
@@ -551,7 +554,8 @@ async def test_pipeline_encoding_failure_releases_selection(monkeypatch) -> None
     backend, model, _, _ = _backend()
     queue, group = _distributed_group()
 
-    def fail(_batch):
+    def fail(_batch, *, object_namespace):
+        del object_namespace
         raise RuntimeError("encoding failed")
 
     monkeypatch.setattr(serverless_backend_module, "prepare_training_batch", fail)
@@ -740,12 +744,12 @@ async def test_remote_prepare_materializes_distributed_group_and_discards_once()
 
     context = await _prepare_context(backend, model, [summary])
     forward = await _admit_forward(context)
-    encoded = prepare_training_batch(client.batch)
+    encoded = prepare_training_batch(client.batch, object_namespace="test-remote-prepare")
     group_ref = encoded.remote.groups[0]
     payload = b"".join(encoded.objects[0].wire_chunks())
     decoded = decode_trajectory_group(group_ref, payload, route_payloads={})
     replay_payload = b"".join(
-        encode_trajectory_group(decoded.bundle).data.wire_chunks()
+        encode_trajectory_group(decoded.bundle, object_id="0" * 64).data.wire_chunks()
     )
     rebuilt = group_ref.annotations.apply(decoded.bundle.payload().build())
 
