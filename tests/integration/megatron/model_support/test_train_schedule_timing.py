@@ -61,9 +61,38 @@ def test_inter_forward_backward_timing_uses_rank_local_monotonic_boundaries(
         "time/inter_forward_backward_previous_job_tail_rank_0_s": 0.5,
         "time/inter_forward_backward_worker_idle_rank_0_s": 1.5,
         "time/inter_forward_backward_current_job_prepare_rank_0_s": 1.0,
+        "time/inter_forward_backward_boundary_job_tail_rank_0_s": 0.5,
+        "time/inter_forward_backward_boundary_command_interval_rank_0_s": 1.5,
+        "time/inter_forward_backward_boundary_job_prepare_rank_0_s": 1.0,
+        "time/inter_forward_backward_phase_order_valid_rank_0": 1.0,
         "time/inter_forward_backward_gpu_gap_rank_0_s": 0.06,
     }
     assert timing.previous_schedule_end_s == 17.0
+
+
+def test_inter_forward_backward_timing_reports_invalid_boundary_order(
+    monkeypatch,
+) -> None:
+    timestamps = iter((10.0, 12.0, 15.0, 17.0))
+    monkeypatch.setattr(train.time, "monotonic", lambda: next(timestamps))
+    monkeypatch.setattr(train.torch.distributed, "get_world_size", lambda: 1)
+    timing = train._InterForwardBackwardTiming()
+    schedule = cast(Any, _Schedule())
+
+    train._run_training_schedule(schedule, lambda: None, timing)
+    timing.previous_job_complete_s = 14.0
+    timing.current_job_start_s = 13.0
+    _, collect_metrics = train._run_training_schedule(
+        schedule, lambda: None, timing
+    )
+
+    assert collect_metrics() == {
+        "time/inter_forward_backward_gap_rank_0_s": 3.0,
+        "time/inter_forward_backward_boundary_job_tail_rank_0_s": 2.0,
+        "time/inter_forward_backward_boundary_command_interval_rank_0_s": -1.0,
+        "time/inter_forward_backward_boundary_job_prepare_rank_0_s": 2.0,
+        "time/inter_forward_backward_phase_order_valid_rank_0": 0.0,
+    }
 
 
 def test_inter_forward_backward_timing_gathers_rank_durations_on_cpu_group(
@@ -108,5 +137,13 @@ def test_inter_forward_backward_timing_gathers_rank_durations_on_cpu_group(
         "time/inter_forward_backward_previous_job_tail_rank_1_s": 0.5,
         "time/inter_forward_backward_worker_idle_rank_1_s": 0.5,
         "time/inter_forward_backward_current_job_prepare_rank_1_s": 1.25,
+        "time/inter_forward_backward_boundary_job_tail_rank_0_s": 0.5,
+        "time/inter_forward_backward_boundary_command_interval_rank_0_s": 0.5,
+        "time/inter_forward_backward_boundary_job_prepare_rank_0_s": 1.0,
+        "time/inter_forward_backward_phase_order_valid_rank_0": 1.0,
+        "time/inter_forward_backward_boundary_job_tail_rank_1_s": 0.5,
+        "time/inter_forward_backward_boundary_command_interval_rank_1_s": 0.5,
+        "time/inter_forward_backward_boundary_job_prepare_rank_1_s": 1.25,
+        "time/inter_forward_backward_phase_order_valid_rank_1": 1.0,
     }
     assert waits == [True]
