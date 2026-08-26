@@ -2130,6 +2130,8 @@ class MonarchTrainerSlot:
             str, asyncio.Task[tuple[TrainerRankPublication, ...]]
         ] = {}
         self._publication_authorizations: dict[str, asyncio.Event] = {}
+        self._publication_predecessors: dict[str, asyncio.Event | None] = {}
+        self._publication_authorization_tail: asyncio.Event | None = None
         self._registrations: dict[str, tuple[str, RunOptimizerWorkSummary]] = {}
         self._registration_tasks: dict[
             str, tuple[str, asyncio.Task[RunOptimizerWorkSummary]]
@@ -2873,6 +2875,10 @@ class MonarchTrainerSlot:
                 publication.add_done_callback(consume_future_exception)
                 self._publications[operation_id] = publication
                 self._publication_authorizations[operation_id] = authorization
+                self._publication_predecessors[operation_id] = (
+                    self._publication_authorization_tail
+                )
+                self._publication_authorization_tail = authorization
                 result = next(result for result in results if result["rank"] == 0)
                 self._operations[job.operation_id] = (
                     job.fingerprint,
@@ -2895,35 +2901,56 @@ class MonarchTrainerSlot:
         self, plan: SnapshotWritePlan, grant: SnapshotWriteGrant
     ) -> dict[str, float]:
         grant.validate_plan(plan)
-        prepared = self._operations.get(plan.operation_id)
-        if (
-            prepared is None
-            or SnapshotWritePlan.model_validate(prepared[1]["write_plan"]) != plan
-        ):
-            raise RuntimeError("snapshot authorization differs from its prepared plan")
-        authorization = self._publication_authorizations.get(plan.operation_id)
-        if authorization is None:
+        if plan.operation_id not in self._publication_predecessors:
             raise RuntimeError(
                 f"trainer has no prepared publication {plan.operation_id}"
             )
-        if authorization.is_set():
-            return {}
-        values = await asyncio.wait_for(
-            self._actors.authorize_run_slot_snapshot.call(
-                plan.model_dump_json(), grant.model_dump_json()
-            ),
-            timeout=self._command_timeout_s,
-        )
-        results = list(values.values())
-        expected_ranks = set(range(len(self._rank_processes)))
-        if {result["rank"] for result in results} != expected_ranks or {
-            result["operation_id"] for result in results
-        } != {plan.operation_id}:
-            raise RuntimeError("trainer ranks returned an invalid authorization")
-        authorization.set()
-        return next(result for result in results if result["rank"] == 0)["metrics"]
+        predecessor = self._publication_predecessors[plan.operation_id]
+        if predecessor is not None:
+            await asyncio.wait_for(
+                predecessor.wait(), timeout=self._command_timeout_s
+            )
+        async with self._control_lock:
+            prepared = self._operations.get(plan.operation_id)
+            if (
+                prepared is None
+                or SnapshotWritePlan.model_validate(prepared[1]["write_plan"]) != plan
+            ):
+                raise RuntimeError(
+                    "snapshot authorization differs from its prepared plan"
+                )
+            authorization = self._publication_authorizations.get(plan.operation_id)
+            if authorization is None:
+                raise RuntimeError(
+                    f"trainer has no prepared publication {plan.operation_id}"
+                )
+            if authorization.is_set():
+                return {}
+            values = await asyncio.wait_for(
+                self._actors.authorize_run_slot_snapshot.call(
+                    plan.model_dump_json(), grant.model_dump_json()
+                ),
+                timeout=self._command_timeout_s,
+            )
+            results = list(values.values())
+            expected_ranks = set(range(len(self._rank_processes)))
+            if {result["rank"] for result in results} != expected_ranks or {
+                result["operation_id"] for result in results
+            } != {plan.operation_id}:
+                raise RuntimeError("trainer ranks returned an invalid authorization")
+            authorization.set()
+            return next(result for result in results if result["rank"] == 0)[
+                "metrics"
+            ]
 
     async def discard_prepared_snapshot(self, operation_id: str) -> None:
+        if operation_id not in self._publication_predecessors:
+            return
+        predecessor = self._publication_predecessors[operation_id]
+        if predecessor is not None:
+            await asyncio.wait_for(
+                predecessor.wait(), timeout=self._command_timeout_s
+            )
         async with self._control_lock:
             authorization = self._publication_authorizations.get(operation_id)
             publication = self._publications.get(operation_id)
@@ -2946,6 +2973,7 @@ class MonarchTrainerSlot:
                 raise RuntimeError("discarded snapshot unexpectedly published")
             self._publications.pop(operation_id, None)
             self._publication_authorizations.pop(operation_id, None)
+            self._publication_predecessors.pop(operation_id, None)
             self._operations.pop(operation_id, None)
 
     def wait_for_publication(
@@ -2964,6 +2992,7 @@ class MonarchTrainerSlot:
                 raise RuntimeError("cannot retire an active trainer publication")
             self._publications.pop(operation_id)
             self._publication_authorizations.pop(operation_id, None)
+            self._publication_predecessors.pop(operation_id, None)
         self._operations.pop(operation_id, None)
 
     async def prepare_cp_lookahead(
