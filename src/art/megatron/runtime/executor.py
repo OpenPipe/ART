@@ -183,10 +183,7 @@ def _materialize_command_token_logprobs(
         output_map.packed_positions, output_map.candidate_counts, strict=True
     ):
         values = host[list(positions), :candidates]
-        if candidates == 1:
-            logical.append(_packed_logprobs(values[:, 0], (len(positions),)))
-        else:
-            logical.append(_packed_logprobs(values, (len(positions), candidates)))
+        logical.append(_packed_logprobs(values, (len(positions), candidates)))
     return tuple(logical)
 
 
