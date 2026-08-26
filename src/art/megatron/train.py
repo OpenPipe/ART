@@ -199,6 +199,7 @@ class TrainingRuntime(BaseModel):
     optimizer: Any | None
     optimizer_config: OptimizerConfig
     optimizer_runtime_sha256: str | None = None
+    optimizer_semantic_sha256: str | None = None
     optimizer_persistent: bool = True
     resident_run_id: str | None = None
     resident_training_session_id: str | None = None
@@ -508,6 +509,7 @@ def build_training_runtime(
     snapshot_pool_capacity: int = 2,
     run_residency_config: Any | None = None,
     optimizer_layout_fingerprint: str | None = None,
+    optimizer_semantic_sha256: str | None = None,
 ) -> TrainingRuntime:
     if random_state := os.environ.get("ART_MEGATRON_RANDOM_STATE"):
         seed = int(random_state)
@@ -644,6 +646,7 @@ def build_training_runtime(
         snapshot_pool_capacity=snapshot_pool_capacity,
         run_residency_config=run_residency_config,
         optimizer_layout_fingerprint=optimizer_layout_fingerprint,
+        optimizer_semantic_sha256=optimizer_semantic_sha256,
         inter_forward_backward_timing=_InterForwardBackwardTiming(
             metrics_group=metrics_group
         ),

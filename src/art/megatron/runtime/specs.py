@@ -56,6 +56,7 @@ class TrainerRuntimeSpec(_Spec):
     compile_enabled: bool
     compile_cache: bool = False
     compile_fingerprint: str = Field(min_length=1)
+    optimizer_semantic_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
     optimizer_layout_fingerprint: str = Field(min_length=1)
     allow_unvalidated_arch: bool = False
     enable_moe_routing_replay: bool = False

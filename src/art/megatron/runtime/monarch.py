@@ -255,6 +255,7 @@ def _build_training_runtime(spec: TrainerRuntimeSpec, *, rank: int) -> Any:
         snapshot_pool_capacity=spec.snapshot_pool_capacity,
         run_residency_config=residency,
         optimizer_layout_fingerprint=spec.optimizer_layout_fingerprint,
+        optimizer_semantic_sha256=spec.optimizer_semantic_fingerprint,
         provider_configure=lambda provider: setattr(
             provider,
             "_art_lora_moe_parameterization",

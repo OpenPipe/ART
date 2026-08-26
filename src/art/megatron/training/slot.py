@@ -1633,6 +1633,9 @@ class MegatronTrainingSlot:
                 adapter=adapter if rank == 0 else None,
                 optimizer_shard=shards.get(rank),
                 runtime_sha256=None if manifest is None else manifest.runtime_sha256,
+                optimizer_semantic_sha256=(
+                    None if manifest is None else manifest.optimizer_semantic_sha256
+                ),
                 topology=None if manifest is None else manifest.topology,
                 saves_optimizer=manifest is not None,
             )

@@ -42,6 +42,7 @@ class SnapshotRankWritePlan(_PublicationModel):
     durable_adapter_write: RankShardedLoraRankWrite | None = None
     optimizer_shard: OptimizerShard | None = None
     runtime_sha256: str | None = None
+    optimizer_semantic_sha256: str | None = None
     topology: OptimizerTopology | None = None
     saves_optimizer: bool
 
@@ -58,6 +59,15 @@ class SnapshotRankWritePlan(_PublicationModel):
             value is not None for value in optimizer_values
         ):
             raise ValueError("non-optimizer write plan contains optimizer fields")
+        logical = (
+            self.optimizer_shard is not None
+            and self.optimizer_shard.serialization
+            == "art_logical_safetensors_v1"
+        )
+        if logical != (self.optimizer_semantic_sha256 is not None):
+            raise ValueError(
+                "logical optimizer write plans require a semantic fingerprint"
+            )
         if self.rank == 0:
             if self.adapter is None and self.transport_adapter is None:
                 raise ValueError("rank-zero write plan requires an adapter")
@@ -388,10 +398,12 @@ def build_snapshot_write_plan(
     manifest = None
     if saves_optimizer == {True}:
         runtime_ids = {rank.runtime_sha256 for rank in ordered}
+        semantic_ids = {rank.optimizer_semantic_sha256 for rank in ordered}
         topologies = {rank.topology for rank in ordered}
-        if len(runtime_ids) != 1 or len(topologies) != 1:
+        if len(runtime_ids) != 1 or len(semantic_ids) != 1 or len(topologies) != 1:
             raise RuntimeError("trainer ranks planned incompatible optimizer archives")
         runtime_sha256 = runtime_ids.pop()
+        optimizer_semantic_sha256 = semantic_ids.pop()
         topology = topologies.pop()
         if runtime_sha256 is None or topology is None:
             raise RuntimeError("optimizer write plan is incomplete")
@@ -400,6 +412,7 @@ def build_snapshot_write_plan(
             step=generation.policy_step,
             adapter=adapter,
             runtime_sha256=runtime_sha256,
+            optimizer_semantic_sha256=optimizer_semantic_sha256,
             world_size=len(ordered),
             shards=[
                 rank.optimizer_shard
@@ -430,6 +443,7 @@ class TrainerRankPublication(_PublicationModel):
     transport_adapter: OptimizerAdapter | None = None
     shard: OptimizerShard | None = None
     runtime_sha256: str | None = None
+    optimizer_semantic_sha256: str | None = None
     topology: OptimizerTopology | None = None
     saves_optimizer: bool
     metrics: dict[str, float] = Field(default_factory=dict)
@@ -472,6 +486,7 @@ class TrainerRankPublication(_PublicationModel):
             self.transport_adapter,
             self.shard,
             self.runtime_sha256,
+            self.optimizer_semantic_sha256,
             self.topology,
             self.saves_optimizer,
         ) != (
@@ -479,6 +494,7 @@ class TrainerRankPublication(_PublicationModel):
             self.plan.transport_adapter,
             self.plan.optimizer_shard,
             self.plan.runtime_sha256,
+            self.plan.optimizer_semantic_sha256,
             self.plan.topology,
             self.plan.saves_optimizer,
         ):
@@ -571,6 +587,7 @@ def commit_trainer_publication(
             record.transport_adapter,
             record.shard,
             record.runtime_sha256,
+            record.optimizer_semantic_sha256,
             record.topology,
             record.saves_optimizer,
         ) != (
@@ -578,6 +595,7 @@ def commit_trainer_publication(
             expected.transport_adapter,
             expected.optimizer_shard,
             expected.runtime_sha256,
+            expected.optimizer_semantic_sha256,
             expected.topology,
             expected.saves_optimizer,
         ):

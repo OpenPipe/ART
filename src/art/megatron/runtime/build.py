@@ -60,17 +60,21 @@ def build_trainer_runtime_spec(
         "yes",
         "on",
     }
-    identity = {
-        "art": art_source_revision(),
+    model_semantics = {
         "model": model_identifier,
         "support_model": base_model,
         "revision": revision,
         "handler": handler.key,
-        "mesh": mesh.model_dump(mode="json"),
         "model_initialization": config.get(
             "megatron_model_initialization", "pretrained"
         ),
     }
+    identity = {
+        "art": art_source_revision(),
+        **model_semantics,
+        "mesh": mesh.model_dump(mode="json"),
+    }
+    dtype = trainer_dtype(config)
     return TrainerRuntimeSpec(
         art_revision=identity["art"],
         model_identifier=model_identifier,
@@ -83,7 +87,7 @@ def build_trainer_runtime_spec(
         lora_alpha=float(lora.get("alpha", LORA_ALPHA)),
         lora_target_modules=tuple(targets),
         lora_moe_parameterization=lora.get("moe_parameterization", "per_expert"),
-        dtype=trainer_dtype(config),
+        dtype=dtype,
         trainer_mesh=mesh,
         packed_sequence_length=runtime_config.packed_sequence_length,
         snapshot_pool_capacity=runtime_config.snapshot_pool_capacity,
@@ -91,6 +95,21 @@ def build_trainer_runtime_spec(
         compile_enabled=compile_enabled,
         compile_cache=runtime_config.compile_cache and compile_enabled,
         compile_fingerprint=_digest({**identity, "compile": compile_enabled}),
+        optimizer_semantic_fingerprint=_digest(
+            {
+                **model_semantics,
+                "dtype": dtype,
+                "lora_rank": int(
+                    lora.get("rank") or default_lora_rank_for_handler(handler)
+                ),
+                "lora_alpha": float(lora.get("alpha", LORA_ALPHA)),
+                # Target order does not change the logical LoRA parameter set.
+                "lora_target_modules": tuple(sorted(targets)),
+                "lora_moe_parameterization": lora.get(
+                    "moe_parameterization", "per_expert"
+                ),
+            }
+        ),
         optimizer_layout_fingerprint=_digest({"mesh": mesh.model_dump(mode="json")}),
         allow_unvalidated_arch=allow_unvalidated_arch,
         enable_moe_routing_replay=enable_expert_replay

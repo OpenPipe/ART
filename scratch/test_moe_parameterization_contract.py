@@ -41,6 +41,7 @@ def _runtime_spec(
         packed_sequence_length=1024,
         compile_enabled=True,
         compile_fingerprint="compile",
+        optimizer_semantic_fingerprint="0" * 64,
         optimizer_layout_fingerprint="optimizer",
     )
 
@@ -165,6 +166,48 @@ def test_runtime_builder_propagates_parameterization(monkeypatch) -> None:
     )
 
     assert spec.lora_moe_parameterization == "shared_outer"
+    topology_cp2 = MegatronTopologyConfig(tp=1, cp=2, ep=1, pp=1, etp=1)
+    runtime.topology.trainer = TrainerMeshSpec(
+        ranks=(
+            GpuPlacement(host_id="host", gpu_id=0),
+            GpuPlacement(host_id="host", gpu_id=1),
+        ),
+        topology=topology_cp2,
+    )
+    monkeypatch.setattr(
+        runtime_build,
+        "get_megatron_runtime_config",
+        lambda: MegatronRuntimeConfig(
+            topology=topology_cp2,
+            packed_sequence_length=2048,
+        ),
+    )
+    migrated_spec = runtime_build.build_trainer_runtime_spec(
+        runtime,
+        base_model="model",
+        config=config,
+        enable_expert_replay=False,
+        offload_between_jobs=False,
+    )
+    assert migrated_spec.optimizer_semantic_fingerprint == (
+        spec.optimizer_semantic_fingerprint
+    )
+    assert migrated_spec.optimizer_layout_fingerprint != (
+        spec.optimizer_layout_fingerprint
+    )
+
+    config["lora_config"]["target_modules"] = ["gate", "experts"]
+    changed_targets_spec = runtime_build.build_trainer_runtime_spec(
+        runtime,
+        base_model="model",
+        config=config,
+        enable_expert_replay=False,
+        offload_between_jobs=False,
+    )
+    assert changed_targets_spec.optimizer_semantic_fingerprint != (
+        migrated_spec.optimizer_semantic_fingerprint
+    )
+
     config["lora_config"]["moe_parameterization"] = "invalid"
     with pytest.raises(ValidationError, match="lora_moe_parameterization"):
         runtime_build.build_trainer_runtime_spec(

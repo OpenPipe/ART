@@ -189,8 +189,25 @@ class _OptimizerGenerationRecord(_PairedOptimizerRecord):
 class OptimizerGenerationManifest(_OptimizerGenerationRecord):
     format_version: Literal[3] = 3
     runtime_sha256: str = Field(pattern=_SHA256_PATTERN)
+    optimizer_semantic_sha256: str | None = Field(
+        default=None, pattern=_SHA256_PATTERN
+    )
     topology: OptimizerTopology
     shards: tuple[OptimizerShard, ...]
+
+    @model_validator(mode="after")
+    def _validate_portable_semantics(self) -> "OptimizerGenerationManifest":
+        portable = {
+            shard.serialization == "art_logical_safetensors_v1"
+            for shard in self.shards
+        }
+        if len(portable) != 1:
+            raise ValueError("optimizer generation cannot mix physical formats")
+        if portable.pop() != (self.optimizer_semantic_sha256 is not None):
+            raise ValueError(
+                "logical optimizer generations require a semantic fingerprint"
+            )
+        return self
 
 
 class VerifiedOptimizerGeneration(_OptimizerRecord):
@@ -234,6 +251,9 @@ class OptimizerStateSnapshot(_OptimizerRecord):
     rank: int = Field(ge=0)
     world_size: int = Field(gt=0)
     runtime_sha256: str = Field(pattern=_SHA256_PATTERN)
+    optimizer_semantic_sha256: str | None = Field(
+        default=None, pattern=_SHA256_PATTERN
+    )
     layout_sha256: str = Field(pattern=_SHA256_PATTERN)
     topology: OptimizerTopology
     state_dict: Any
@@ -1148,6 +1168,7 @@ def build_optimizer_manifest(
     step: int,
     adapter: OptimizerAdapter,
     runtime_sha256: str,
+    optimizer_semantic_sha256: str | None = None,
     world_size: int,
     shards: list[OptimizerShard],
     topology: OptimizerTopology | None = None,
@@ -1157,6 +1178,7 @@ def build_optimizer_manifest(
         step=step,
         adapter=adapter,
         runtime_sha256=runtime_sha256,
+        optimizer_semantic_sha256=optimizer_semantic_sha256,
         topology=topology or current_optimizer_topology(world_size),
         shards=tuple(shards),
     )
@@ -1866,6 +1888,16 @@ def _model_runtime_sha256(runtime: Any) -> str:
     return runtime.optimizer_runtime_sha256
 
 
+def trainer_rank_optimizer_semantic_sha256(runtime: Any) -> str:
+    """Return the topology-neutral logical runtime identity for exact resume."""
+    value = getattr(runtime, "optimizer_semantic_sha256", None)
+    if not isinstance(value, str) or re.fullmatch(_SHA256_PATTERN, value) is None:
+        raise RuntimeError(
+            "TrainerRank optimizer durability requires a logical runtime fingerprint"
+        )
+    return value
+
+
 def _optimizer_layout_sha256(runtime: Any) -> str:
     names_by_parameter: dict[int, list[str]] = {}
     for chunk_index, chunk in enumerate(runtime.model):
@@ -2136,6 +2168,7 @@ def stage_trainer_rank_optimizer_state_snapshot(
             rank=runtime.rank,
             world_size=runtime.world_size,
             runtime_sha256=_model_runtime_sha256(runtime),
+            optimizer_semantic_sha256=trainer_rank_optimizer_semantic_sha256(runtime),
             layout_sha256=_json_sha256(layout),
             topology=current_optimizer_topology(runtime.world_size),
             state_dict=_stage_optimizer_value(state, builder),
@@ -2163,6 +2196,7 @@ def trainer_rank_optimizer_snapshot_from_cpu(
         rank=runtime.rank,
         world_size=runtime.world_size,
         runtime_sha256=_model_runtime_sha256(runtime),
+        optimizer_semantic_sha256=trainer_rank_optimizer_semantic_sha256(runtime),
         layout_sha256=_json_sha256(layout),
         topology=current_optimizer_topology(runtime.world_size),
         state_dict=state,
@@ -2526,6 +2560,7 @@ def load_trainer_rank_optimizer_state(
     adapter_step: int,
     optimizer_generation_id: str,
     verification: VerifiedOptimizerGeneration,
+    expected_optimizer_semantic_sha256: str,
     layout: Any,
     sites: Sequence[tuple[Any, Any]],
     expected_keys: Sequence[str],
@@ -2543,6 +2578,15 @@ def load_trainer_rank_optimizer_state(
         if manifest_sha256 != verification.manifest_sha256:
             raise RuntimeError("Optimizer generation manifest verification mismatch")
         _validate_pointer_manifest(pointer, manifest)
+        if (
+            manifest.optimizer_semantic_sha256
+            != expected_optimizer_semantic_sha256
+        ):
+            raise RuntimeError(
+                "Optimizer checkpoint logical runtime mismatch: "
+                f"saved={manifest.optimizer_semantic_sha256}, "
+                f"current={expected_optimizer_semantic_sha256}"
+            )
         adapter = _loaded_adapter(adapter_path, adapter_step)
         shards = _validate_generation_files(generation_path, manifest, local_rank=None)
         if pointer.adapter.model_copy(update={"identity": adapter.identity}) != adapter:

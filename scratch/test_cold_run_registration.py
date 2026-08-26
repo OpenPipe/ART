@@ -304,7 +304,11 @@ def _executor(
     slot = _SlotTrainer(shapes, targets)
     residency = _Residency()
     publisher = _Publisher()
-    executor.runtime = SimpleNamespace(rank=0, optimizer_layout_fingerprint="topology")
+    executor.runtime = SimpleNamespace(
+        rank=0,
+        optimizer_layout_fingerprint="topology",
+        optimizer_semantic_sha256="0" * 64,
+    )
     executor._slot_trainer = slot
     executor._residency = residency
     executor._publisher = publisher

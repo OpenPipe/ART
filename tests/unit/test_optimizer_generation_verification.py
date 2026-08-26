@@ -41,6 +41,7 @@ def _generation(root: Path) -> tuple[Path, OptimizerAdapter]:
         step=1,
         adapter=adapter,
         runtime_sha256=_DIGEST,
+        optimizer_semantic_sha256="1" * 64,
         world_size=1,
         topology=OptimizerTopology(
             world_size=1,
@@ -96,6 +97,25 @@ def test_rank_loader_authenticates_the_verified_manifest(tmp_path: Path) -> None
             adapter_step=adapter.step,
             optimizer_generation_id=_GENERATION,
             verification=receipt,
+            expected_optimizer_semantic_sha256="1" * 64,
+            layout={},
+            sites=(),
+            expected_keys=(),
+        )
+
+
+def test_rank_loader_rejects_a_different_logical_runtime(tmp_path: Path) -> None:
+    _shard, adapter = _generation(tmp_path)
+    receipt = verify_optimizer_generation(str(tmp_path), _GENERATION)
+
+    with pytest.raises(RuntimeError, match="logical runtime mismatch"):
+        load_trainer_rank_optimizer_state(
+            optimizer_state_path=str(tmp_path),
+            adapter_path=adapter.identity,
+            adapter_step=adapter.step,
+            optimizer_generation_id=_GENERATION,
+            verification=receipt,
+            expected_optimizer_semantic_sha256="2" * 64,
             layout={},
             sites=(),
             expected_keys=(),

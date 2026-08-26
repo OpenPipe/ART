@@ -1437,7 +1437,10 @@ class MCoreRunSlotExecutor:
                 f"training run is already resident: {registration.run_id!r}"
             )
         from art.megatron.model_support.lora_disk import load_adapter_config
-        from art.megatron.optimizer_state import load_trainer_rank_optimizer_state
+        from art.megatron.optimizer_state import (
+            load_trainer_rank_optimizer_state,
+            trainer_rank_optimizer_semantic_sha256,
+        )
         from art.trainer_rank import MaterializedCheckpoint
 
         adapter_config = load_adapter_config(registration.adapter.identity)
@@ -1463,6 +1466,9 @@ class MCoreRunSlotExecutor:
                 adapter_step=registration.adapter.step,
                 optimizer_generation_id=registration.initial_optimizer_generation_id,
                 verification=registration.initial_optimizer_verification,
+                expected_optimizer_semantic_sha256=(
+                    trainer_rank_optimizer_semantic_sha256(self.runtime)
+                ),
                 layout=self.optimizer_layout(checkpoint),
                 sites=checkpoint.sites,
                 expected_keys=tuple(checkpoint.expected_keys),
@@ -2283,7 +2289,10 @@ class MCoreRunSlotExecutor:
     def prepare_load_state(self, job: LoadStateJobSpec) -> _PreparedRunLoad:
         state = self._require_run(job.run_id)
         from art.megatron.model_support.lora_disk import load_adapter_config
-        from art.megatron.optimizer_state import load_trainer_rank_optimizer_state
+        from art.megatron.optimizer_state import (
+            load_trainer_rank_optimizer_state,
+            trainer_rank_optimizer_semantic_sha256,
+        )
         from art.trainer_rank import MaterializedCheckpoint
 
         config = load_adapter_config(job.adapter_path)
@@ -2305,6 +2314,9 @@ class MCoreRunSlotExecutor:
                 adapter_step=job.adapter_step,
                 optimizer_generation_id=job.optimizer_generation_id,
                 verification=job.optimizer_verification,
+                expected_optimizer_semantic_sha256=(
+                    trainer_rank_optimizer_semantic_sha256(self.runtime)
+                ),
                 layout=self.optimizer_layout(checkpoint),
                 sites=checkpoint.sites,
                 expected_keys=tuple(checkpoint.expected_keys),
@@ -3076,6 +3088,7 @@ class _RankSnapshotPersistence(BaseModel):
     adapter: OptimizerAdapter | None = None
     shard: OptimizerShard | None = None
     runtime_sha256: str | None = None
+    optimizer_semantic_sha256: str | None = None
     topology: OptimizerTopology | None = None
     saves_optimizer: bool
     metrics: dict[str, float] = Field(default_factory=dict)
@@ -4173,6 +4186,7 @@ class _GenerationPublisher:
             optimizer_identity = None
             shard = None
             runtime_sha256 = None
+            optimizer_semantic_sha256 = None
             topology = None
             if optimizer is not None:
                 resident = entry.resident_optimizer
@@ -4214,6 +4228,7 @@ class _GenerationPublisher:
                         logical_keys=optimizer_archive.metadata.logical_keys,
                     )
                 runtime_sha256 = optimizer.runtime_sha256
+                optimizer_semantic_sha256 = optimizer.optimizer_semantic_sha256
                 topology = optimizer.topology
             rank_plan = SnapshotRankWritePlan(
                 rank=rank,
@@ -4223,6 +4238,7 @@ class _GenerationPublisher:
                 durable_adapter_write=durable_write,
                 optimizer_shard=shard,
                 runtime_sha256=runtime_sha256,
+                optimizer_semantic_sha256=optimizer_semantic_sha256,
                 topology=topology,
                 saves_optimizer=save_optimizer,
             )
@@ -5049,6 +5065,7 @@ class _GenerationPublisher:
             transport_adapter=transferred.adapter,
             shard=persisted.shard,
             runtime_sha256=persisted.runtime_sha256,
+            optimizer_semantic_sha256=persisted.optimizer_semantic_sha256,
             topology=persisted.topology,
             saves_optimizer=persisted.saves_optimizer,
             metrics=metrics,
@@ -5282,6 +5299,7 @@ class _GenerationPublisher:
             adapter=adapter,
             shard=shard,
             runtime_sha256=prepared.plan.runtime_sha256,
+            optimizer_semantic_sha256=prepared.plan.optimizer_semantic_sha256,
             topology=prepared.plan.topology,
             saves_optimizer=optimizer is not None,
         )
