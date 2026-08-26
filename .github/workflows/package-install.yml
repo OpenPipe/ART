@@ -57,7 +57,9 @@ jobs:
           project_dir="$(mktemp -d)"
           cd "$project_dir"
           uv init --name art-install-smoke --python 3.12 --bare
-          uv add "openpipe-art[backend] @ file://${wheel_path}"
+          uv add --index https://download.pytorch.org/whl/cu128 \
+            --index-strategy unsafe-best-match \
+            "openpipe-art[backend] @ file://${wheel_path}"
           uv sync
 
       - name: Resolve published Megatron profiles
@@ -118,9 +120,12 @@ jobs:
             --index-url https://download.pytorch.org/whl/cpu \
             "torch==2.11.0"
           uv pip install --python .venv/bin/python \
+            "aiohttp>=3.13.0" \
             "msgspec>=0.21.0" \
             "torchmonarch==0.6.0" \
             "transformers==5.12.1"
+          uv pip install --python .venv/bin/python --no-deps \
+            "openpipe-art[distributed,megatron] @ file://${wheel_path}"
 
           .venv/bin/python - <<'PY'
           import sys
