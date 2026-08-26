@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import Any, Sequence, cast
 
+from art.megatron.rotary import absolute_rotary_pos_emb
+
 
 def _context_parallel_world_size(config: Any) -> int:
     from megatron.core import parallel_state as ps
@@ -10,41 +12,6 @@ def _context_parallel_world_size(config: Any) -> int:
     if is_initialized() and ps.model_parallel_is_initialized():
         return int(ps.get_context_parallel_world_size())
     return int(getattr(config, "context_parallel_size", 1) or 1)
-
-
-def _build_absolute_rotary_pos_emb(
-    module: Any,
-    *,
-    max_position: int,
-    dtype: Any,
-    device: Any,
-) -> Any:
-    import torch
-
-    rotary_pos_emb = module.rotary_pos_emb
-    cache = getattr(module, "_art_absolute_rotary_pos_emb_cache", None)
-    if cache is None:
-        cache = {}
-        setattr(module, "_art_absolute_rotary_pos_emb_cache", cache)
-    cache_key = (str(device), max_position + 1)
-    cached = cache.get(cache_key)
-    if cached is not None:
-        return cached
-
-    freqs = rotary_pos_emb.get_freqs_non_repeated(max_position + 1)
-    if not rotary_pos_emb.rotary_interleaved:
-        absolute_rotary_pos_emb = torch.cat((freqs, freqs), dim=-1)
-    else:
-        absolute_rotary_pos_emb = torch.stack(
-            (freqs.view(-1, 1), freqs.view(-1, 1)),
-            dim=-1,
-        ).view(freqs.shape[0], -1)
-    absolute_rotary_pos_emb = absolute_rotary_pos_emb[:, None, None, :].to(
-        device=device,
-        dtype=dtype,
-    )
-    cache[cache_key] = absolute_rotary_pos_emb
-    return absolute_rotary_pos_emb
 
 
 def qwen3_forward_kwargs(model: Any, **kwargs: Any) -> dict[str, Any]:
@@ -123,7 +90,7 @@ def install_qwen3_text_preprocess_patch(model_chunks: Sequence[Any]) -> None:
                     int,
                     getattr(_gpt_module, "_art_qwen3_rotary_seq_len", None),
                 )
-                table_source = _build_absolute_rotary_pos_emb(
+                table_source = absolute_rotary_pos_emb(
                     _gpt_module,
                     max_position=int(rotary_seq_len) - 1,
                     dtype=table.dtype,

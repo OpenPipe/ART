@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 from contextlib import ExitStack, redirect_stderr, redirect_stdout
+from functools import partial
 import os
 from pathlib import Path
 import subprocess
@@ -12,10 +13,12 @@ from unittest.mock import patch
 
 from megatron.core import parallel_state as ps
 from megatron.core.models.gpt.gpt_model import GPTModel
+from megatron.core.models.mamba.mamba_model import MambaModel
 from pydantic import BaseModel, Field
 import torch
 
 from art.megatron import train as megatron_train
+from art.megatron.mamba.runtime import mamba_model_preprocess
 from art.megatron.model_support.discovery import inspect_architecture
 from art.megatron.model_support.registry import (
     get_model_support_handler_for_spec,
@@ -70,6 +73,7 @@ _SINGLE_ROTARY_OUTPUT_HANDLER_KEYS = frozenset(
         "qwen3_5_moe",
         "dsv4",
         "gpt_oss_moe",
+        "nemotron_h_moe",
     }
 )
 _TUPLE_ROTARY_OUTPUT_HANDLER_KEYS = frozenset({"gemma4_dense", "gemma4_moe"})
@@ -145,17 +149,19 @@ def _cleanup_distributed_state() -> None:
         torch.distributed.destroy_process_group()  # type: ignore[possibly-missing-attribute]
 
 
-def _locate_gpt_module(model_chunks: list[Any]) -> GPTModel:
+def _locate_model_preprocess(model_chunks: list[Any]) -> Any:
     for chunk in model_chunks:
         module: Any = chunk
         while hasattr(module, "module"):
             module = module.module
         if isinstance(module, GPTModel):
-            return module
+            return module._preprocess
+        if isinstance(module, MambaModel):
+            return partial(mamba_model_preprocess, module)
         language_model = getattr(module, "language_model", None)
         if isinstance(language_model, GPTModel):
-            return language_model
-    raise RuntimeError("Failed to locate GPTModel for packing invariance validation")
+            return language_model._preprocess
+    raise RuntimeError("Failed to locate a model preprocessor for packing invariance")
 
 
 class PackingInvarianceScenario(BaseModel):
@@ -758,10 +764,9 @@ def _run_packing_invariance_worker(
         if runtime is None:
             raise RuntimeError("packing invariance did not acquire a Megatron runtime")
         model_chunks = cast(list[Any], runtime.model)
-        gpt_module = _locate_gpt_module(model_chunks)
+        hooked_preprocess = _locate_model_preprocess(model_chunks)
         for chunk in model_chunks:
             chunk.eval()
-        hooked_preprocess = gpt_module._preprocess
 
         for scenario_name, packed_config, deep in scenarios:
             _debug_log(

@@ -5,6 +5,8 @@ from typing import Any, Sequence, cast
 
 import torch
 
+from art.megatron.rotary import rotary_pos_emb_for_positions
+
 from .exchange import (
     MambaShardShape,
     canonical_head_shard_to_token_layout,
@@ -15,18 +17,24 @@ from .plan import MambaExecutionPlan
 
 MAMBA_STATE_KEY = "mamba_2"
 _ACTIVE_STATE = "_art_mamba_prefix_tree_state"
+_ACTIVE_POSITION_IDS = "_art_mamba_position_ids"
 
 
 def install_mamba_prefix_tree_hooks(model_chunks: Sequence[Any]) -> None:
     """Route only Nemotron Mamba/attention layers through ART prefix-tree state."""
 
+    from megatron.core.models.mamba.mamba_model import MambaModel
     from megatron.core.ssm.mamba_layer import MambaLayer
     from megatron.core.ssm.mamba_mixer import MambaMixer
     from megatron.core.transformer.transformer_layer import TransformerLayer
 
     for chunk in model_chunks:
         for module in chunk.modules():
-            if isinstance(module, MambaLayer) and not getattr(
+            if isinstance(module, MambaModel) and not getattr(
+                module, "_art_mamba_model_hooked", False
+            ):
+                _install_mamba_model_hook(module)
+            elif isinstance(module, MambaLayer) and not getattr(
                 module, "_art_mamba_layer_hooked", False
             ):
                 original = module.forward
@@ -99,6 +107,81 @@ def install_mamba_prefix_tree_hooks(model_chunks: Sequence[Any]) -> None:
 
                 module.forward = MethodType(attention_forward, module)
                 module._art_mamba_attention_hooked = True
+
+
+def _install_mamba_model_hook(model: Any) -> None:
+    rotary = model.rotary_pos_emb
+    rotary_forward = rotary.forward
+
+    def positioned_rotary(
+        self: Any,
+        max_seq_len: int,
+        *args: Any,
+        _original=rotary_forward,
+        _model=model,
+        **kwargs: Any,
+    ) -> torch.Tensor:
+        table = _original(max_seq_len, *args, **kwargs)
+        position_ids = getattr(self, _ACTIVE_POSITION_IDS, None)
+        if position_ids is None:
+            return table
+        return rotary_pos_emb_for_positions(
+            _model,
+            position_ids,
+            max_sequence_length=max_seq_len,
+            dtype=table.dtype,
+            device=table.device,
+        )
+
+    rotary.forward = MethodType(positioned_rotary, rotary)
+    forward = model.forward
+
+    def model_forward(
+        self: Any,
+        *args: Any,
+        _original=forward,
+        **kwargs: Any,
+    ) -> Any:
+        position_ids = kwargs.get("position_ids")
+        attention_state = kwargs.get("attention_mask")
+        if position_ids is None and len(args) > 1:
+            position_ids = args[1]
+        if attention_state is None and len(args) > 2:
+            attention_state = args[2]
+        if not _has_mamba_plan(attention_state):
+            return _original(*args, **kwargs)
+        if not isinstance(position_ids, torch.Tensor):
+            raise TypeError("ART Mamba prefix-tree execution requires position ids")
+        setattr(self.rotary_pos_emb, _ACTIVE_POSITION_IDS, position_ids)
+        try:
+            return _original(*args, **kwargs)
+        finally:
+            delattr(self.rotary_pos_emb, _ACTIVE_POSITION_IDS)
+
+    model.forward = MethodType(model_forward, model)
+    model._art_mamba_model_hooked = True
+
+
+def mamba_model_preprocess(
+    model: Any,
+    *,
+    input_ids: torch.Tensor,
+    position_ids: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    decoder_input = model.embedding(input_ids=input_ids, position_ids=position_ids)
+    if model.position_embedding_type != "rope":
+        return decoder_input, None
+    max_sequence_length = int(decoder_input.shape[0]) * int(
+        model.config.context_parallel_size
+    )
+    table = model.rotary_pos_emb(max_sequence_length, cp_group=None)
+    return decoder_input, rotary_pos_emb_for_positions(
+        model,
+        position_ids,
+        max_sequence_length=max_sequence_length,
+        dtype=table.dtype,
+        device=table.device,
+    )
 
 
 def mamba_prefix_tree_forward(
