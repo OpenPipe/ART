@@ -161,6 +161,12 @@ class ModelSupportHandler(Protocol):
 
     def install_preprocess_patch(self, model_chunks: Sequence[Any]) -> None: ...
 
+    def prepare_model_for_mixed_precision(
+        self, model_chunks: Sequence[Any]
+    ) -> None: ...
+
+    def validate_model_mixed_precision(self, model_chunks: Sequence[Any]) -> None: ...
+
     def build_pipeline_microbatch_activator(
         self,
         model_chunks: Sequence[Any],

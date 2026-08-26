@@ -133,6 +133,12 @@ class DefaultDenseHandler:
         del model_chunks
         return None
 
+    def prepare_model_for_mixed_precision(self, model_chunks: Sequence[Any]) -> None:
+        del model_chunks
+
+    def validate_model_mixed_precision(self, model_chunks: Sequence[Any]) -> None:
+        del model_chunks
+
     def build_pipeline_microbatch_activator(
         self,
         model_chunks: Sequence[Any],

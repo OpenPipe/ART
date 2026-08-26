@@ -362,6 +362,43 @@ def _zero_expert_padding(
                 )
 
 
+def _check_mixed_precision(model_chunks: Sequence[Any], *, mark: bool) -> None:
+    from megatron.core.ssm.mamba_mixer import MambaMixer
+    from megatron.core.transformer.moe.router import TopKRouter
+
+    modules = {
+        id(module): module for chunk in model_chunks for module in chunk.modules()
+    }.values()
+    mixer_count = router_count = 0
+    for module in modules:
+        if isinstance(module, MambaMixer):
+            mixer_count += 1
+            observed = tuple(
+                getattr(module, name).dtype for name in ("A_log", "D", "dt_bias")
+            )
+            expected = (torch.float32, torch.float32, module.config.params_dtype)
+            if observed != expected:
+                raise RuntimeError(f"Nemotron-H Mamba dtypes changed: {observed}")
+            if mark:
+                module._keep_fp32_parameters = ("A_log", "D")
+            if getattr(module, "_keep_fp32_parameters", None) != ("A_log", "D"):
+                raise RuntimeError("Nemotron-H Mamba FP32 markers changed")
+        elif isinstance(module, TopKRouter) and module.enable_expert_bias:
+            router_count += 1
+            expert_bias = module._buffers.get("expert_bias")
+            if (
+                not isinstance(expert_bias, torch.Tensor)
+                or expert_bias.dtype != torch.float32
+            ):
+                raise RuntimeError("Nemotron-H router expert bias must be FP32")
+            if mark:
+                module._keep_fp32_buffers = ("expert_bias",)
+            if getattr(module, "_keep_fp32_buffers", None) != ("expert_bias",):
+                raise RuntimeError("Nemotron-H router FP32 marker changed")
+    if not mixer_count or not router_count:
+        raise RuntimeError("Nemotron-H mixed-precision topology changed")
+
+
 class NemotronHHandler(DefaultMoeHandler):
     key = "nemotron_h_moe"
     has_recurrent_layers = True
@@ -402,6 +439,12 @@ class NemotronHHandler(DefaultMoeHandler):
 
     def install_preprocess_patch(self, model_chunks: Sequence[Any]) -> None:
         install_mamba_prefix_tree_hooks(model_chunks)
+
+    def prepare_model_for_mixed_precision(self, model_chunks: Sequence[Any]) -> None:
+        _check_mixed_precision(model_chunks, mark=True)
+
+    def validate_model_mixed_precision(self, model_chunks: Sequence[Any]) -> None:
+        _check_mixed_precision(model_chunks, mark=False)
 
     def apply_lora_adapters(
         self,
