@@ -274,6 +274,38 @@ def _zero_expert_padding(
                 )
 
 
+def _canonicalize_loaded_lora_state(
+    state: dict[str, Any],
+    model_chunks: Sequence[Any],
+) -> dict[str, Any]:
+    config = _model_config(model_chunks)
+    if config is None:
+        return state
+    logical, internal = _padding_sizes_from_provider(config)
+    if logical == internal:
+        return state
+    result = dict(state)
+    for key, value in state.items():
+        if not torch.is_tensor(value) or ".mixer.experts." not in key:
+            continue
+        dim = (
+            0
+            if key.endswith(".up_proj.lora_B.weight")
+            else -1
+            if key.endswith(".down_proj.lora_A.weight")
+            else None
+        )
+        if dim is None:
+            continue
+        if value.shape[dim] != internal:
+            raise RuntimeError(
+                f"{key}: expected padded expert width {internal}, got {tuple(value.shape)}"
+            )
+        result[key] = value.clone()
+        result[key].narrow(dim, logical, internal - logical).zero_()
+    return result
+
+
 def _check_mixed_precision(model_chunks: Sequence[Any], *, mark: bool) -> None:
     from megatron.core.ssm.mamba_mixer import MambaMixer
     from megatron.core.transformer.moe.router import TopKRouter
@@ -455,6 +487,13 @@ class NemotronHHandler(DefaultMoeHandler):
 
     def zero_internal_padding_params(self, model_chunks: Sequence[Any]) -> None:
         _zero_expert_padding(model_chunks, grads=False, params=True)
+
+    def canonicalize_loaded_lora_state(
+        self,
+        state: dict[str, Any],
+        model_chunks: Sequence[Any],
+    ) -> dict[str, Any]:
+        return _canonicalize_loaded_lora_state(state, model_chunks)
 
     def build_prefix_tree_model_state(
         self,
