@@ -1208,7 +1208,9 @@ def _patch_lora_for_fp32(
     def _reference_fc1_forward(self: Any, x: torch.Tensor, tokens_per_expert: Any):
         base_out, bias_out = self.linear_fc1(x, tokens_per_expert)
         adapter_out = (
-            self.lora(x, tokens_per_expert)
+            self.up_lora(x, tokens_per_expert)
+            if self.non_gated
+            else self.lora(x, tokens_per_expert)
             if self.fused_gate_up
             else torch.cat(
                 (
