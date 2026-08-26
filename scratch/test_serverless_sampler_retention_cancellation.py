@@ -19,6 +19,9 @@ class _Sampler:
     async def remove(self, *args, **kwargs) -> None:
         raise AssertionError("sampler removal is not expected")
 
+    async def close(self) -> None:
+        pass
+
 
 class _Client:
     def __init__(self) -> None:
