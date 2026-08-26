@@ -320,7 +320,7 @@ def _stage_gpu_count(
     if stage_name == CORRECTNESS_REFERENCE_STAGE:
         return 1
     if stage_name == "correctness_sensitivity":
-        from .oracle_harness import selected_suite_topologies
+        from . import oracle_harness
 
         handler = get_model_support_handler_for_spec(
             get_model_support_spec(
@@ -330,10 +330,7 @@ def _stage_gpu_count(
         )
         return max(
             topology.world_size()
-            for topology in selected_suite_topologies(
-                is_moe=handler.is_moe,
-                cp_supported=bool(handler.cp_supported),
-            )
+            for topology in handler.correctness_suite_topologies(oracle_harness)
         )
     resources = getattr(
         HANDLER_WORKFLOW_RESOURCES.get(prepared.report.model_key), stage_name, None
@@ -460,7 +457,7 @@ def _stage_runtime_topology(
     if stage_name in _CPU_STAGES:
         return WorkflowRuntimeTopology()
     if stage_name in {"correctness_sensitivity", CORRECTNESS_REFERENCE_STAGE}:
-        from .oracle_harness import selected_suite_topologies
+        from . import oracle_harness
 
         handler = get_model_support_handler_for_spec(
             get_model_support_spec(
@@ -468,12 +465,7 @@ def _stage_runtime_topology(
                 allow_unvalidated_arch=prepared.allow_unvalidated_arch,
             )
         )
-        variants = tuple(
-            selected_suite_topologies(
-                is_moe=handler.is_moe,
-                cp_supported=bool(handler.cp_supported),
-            )
-        )
+        variants = tuple(handler.correctness_suite_topologies(oracle_harness))
         if stage_name == CORRECTNESS_REFERENCE_STAGE:
             variants = variants[:1]
         else:

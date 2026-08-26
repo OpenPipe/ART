@@ -200,6 +200,8 @@ class ModelSupportHandler(Protocol):
         self, oracle_harness: Any
     ) -> dict[str, Any] | None: ...
 
+    def correctness_suite_topologies(self, oracle_harness: Any) -> list[Any]: ...
+
     def collect_layer_families(
         self,
         provider: "GPTModelProvider",

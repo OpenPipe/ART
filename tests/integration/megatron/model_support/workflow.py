@@ -671,12 +671,7 @@ def run_correctness_sensitivity_stage(
     correctness_precision = handler.correctness_precision()
     correctness_use_fp32_lora_reference = handler.correctness_use_fp32_lora_reference()
     correctness_phase_pass_fns = handler.correctness_phase_pass_fns(oracle_harness)
-    suite_topologies = list(
-        oracle_harness.selected_suite_topologies(
-            is_moe=handler.is_moe,
-            cp_supported=cp_supported,
-        )
-    )
+    suite_topologies = list(handler.correctness_suite_topologies(oracle_harness))
     objectives = list(oracle_harness.SUPPORTED_ORACLE_OBJECTIVES)
     skip_sensitivity = _truthy_env(SKIP_SENSITIVITY_ENV)
     available_gpu_count = oracle_harness.available_gpu_count()
@@ -799,6 +794,7 @@ def run_correctness_sensitivity_stage(
             with _redirect_output(correctness_log):
                 suite_reports = oracle_harness.run_suite(
                     case_config=case_config,
+                    suite_topologies=suite_topologies,
                     max_world_size=max_world_size,
                     cp_supported=cp_supported,
                     phase_pass_fns=correctness_phase_pass_fns,

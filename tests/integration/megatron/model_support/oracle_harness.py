@@ -2265,6 +2265,7 @@ def _suite_variants(
     *,
     is_moe: bool = True,
     cp_supported: bool = True,
+    suite_topologies: list[Topology] | None = None,
     max_world_size: int | None = None,
     variant_flex_backend: FlexBackend | None = None,
     phase_pass_fns: dict[str, PhasePassFn] | None = None,
@@ -2272,10 +2273,15 @@ def _suite_variants(
     """Builds the standard oracle suite variant ordering."""
     phase_pass = phase_pass_fns or _default_phase_pass_fns()
     variants: list[VariantSpec] = []
-    for topology in selected_suite_topologies(
-        is_moe=is_moe,
-        cp_supported=cp_supported,
-    )[1:]:
+    topologies = (
+        suite_topologies
+        if suite_topologies is not None
+        else selected_suite_topologies(
+            is_moe=is_moe,
+            cp_supported=cp_supported,
+        )
+    )
+    for topology in topologies[1:]:
         if max_world_size is not None and topology.world_size() > max_world_size:
             continue
         variants.append(
@@ -2329,6 +2335,7 @@ def _run_paired_objective_suite(
     *,
     objectives: list[OracleObjective],
     case_config: OracleCaseConfig,
+    suite_topologies: list[Topology] | None,
     max_world_size: int | None,
     oracle_flex_backend: FlexBackend | None,
     variant_flex_backend: FlexBackend | None,
@@ -2360,6 +2367,7 @@ def _run_paired_objective_suite(
             objective,
             is_moe=case_config.is_moe,
             cp_supported=cp_supported,
+            suite_topologies=suite_topologies,
             max_world_size=max_world_size,
             variant_flex_backend=variant_flex_backend,
             phase_pass_fns=phase_pass_fns,
@@ -2402,6 +2410,7 @@ _run_paired_dense_suite = _run_paired_objective_suite
 def run_suite(
     *,
     case_config: OracleCaseConfig,
+    suite_topologies: list[Topology] | None = None,
     max_world_size: int | None = None,
     oracle_flex_backend: FlexBackend | None = None,
     variant_flex_backend: FlexBackend | None = None,
@@ -2418,6 +2427,7 @@ def run_suite(
         return _run_paired_objective_suite(
             objectives=objectives,
             case_config=case_config,
+            suite_topologies=suite_topologies,
             max_world_size=max_world_size,
             oracle_flex_backend=oracle_flex_backend,
             variant_flex_backend=variant_flex_backend,
@@ -2448,6 +2458,7 @@ def run_suite(
                         objective,
                         is_moe=case_config.is_moe,
                         cp_supported=cp_supported,
+                        suite_topologies=suite_topologies,
                         max_world_size=max_world_size,
                         variant_flex_backend=variant_flex_backend,
                         phase_pass_fns=phase_pass_fns,

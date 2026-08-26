@@ -4,6 +4,8 @@ from typing import Any, Literal
 import pytest
 import torch
 
+from art.megatron.model_support.handlers.nemotron_h import NEMOTRON_H_HANDLER
+
 from . import oracle_harness
 from .forward_trace import ForwardTraceCapture, _extract_router_topk
 from .oracle_harness import (
@@ -996,6 +998,21 @@ def test_normal_suite_selects_oracle_plus_one_legal_composition(
     assert [topology.world_size() for topology in topologies] == [1, 8]
 
 
+def test_nemotron_suite_uses_legal_mamba_composition() -> None:
+    topologies = NEMOTRON_H_HANDLER.correctness_suite_topologies(oracle_harness)
+    composition = Topology(tp=1, ep=2, etp=2, dp=2, cp=2, pp=2, vpp=1, sp=False)
+
+    assert topologies == [oracle_harness.ORACLE_TOPOLOGY, composition]
+    assert composition.world_size() == 8
+    assert composition.resolved_expert_dp() == 1
+    assert 2 % (composition.tp * composition.cp) == 0
+    assert 8 % (composition.tp * composition.cp) == 0
+    assert [
+        variant.topology
+        for variant in _suite_variants("rl", suite_topologies=topologies)
+    ] == [composition]
+
+
 def test_paired_objectives_reuse_composition_worker_artifacts(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1028,6 +1045,7 @@ def test_paired_objectives_reuse_composition_worker_artifacts(
             base_model="Qwen/Qwen3.5-35B-A3B",
             model_support_key="qwen3_5_moe",
         ),
+        suite_topologies=None,
         max_world_size=None,
         oracle_flex_backend=None,
         variant_flex_backend=None,

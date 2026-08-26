@@ -186,6 +186,12 @@ class DefaultDenseHandler:
         del oracle_harness
         return None
 
+    def correctness_suite_topologies(self, oracle_harness: Any) -> list[Any]:
+        return oracle_harness.selected_suite_topologies(
+            is_moe=self.is_moe,
+            cp_supported=self.cp_supported,
+        )
+
     def to_vllm_lora_tensors(
         self,
         tensors: dict[str, torch.Tensor],

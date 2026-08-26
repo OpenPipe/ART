@@ -568,6 +568,14 @@ class NemotronHHandler(DefaultMoeHandler):
             "deltas": strict,
         }
 
+    def correctness_suite_topologies(self, oracle_harness: Any) -> list[Any]:
+        oracle, composition = super().correctness_suite_topologies(oracle_harness)
+        # TP * CP must divide both the compact fixture's 2 and Nano's 8 groups.
+        return [
+            oracle,
+            composition.model_copy(update={"tp": 1, "dp": 2, "vpp": 1, "sp": False}),
+        ]
+
     def collect_layer_families(self, provider: Any) -> list[LayerFamilyInstance]:
         pattern = str(provider.hybrid_layer_pattern).split("/", 1)[0]
         families = []
