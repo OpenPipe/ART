@@ -2537,6 +2537,34 @@ async def _collect_command_ready(
         raise RuntimeError(f"trainer {label} readiness has mismatched rank identity")
 
 
+async def _await_command_readiness(
+    rank_call: asyncio.Future[Any],
+    readiness: asyncio.Future[None],
+    deadline: float,
+    *,
+    timeout_message: str,
+) -> None:
+    loop = asyncio.get_running_loop()
+    done, _ = await asyncio.wait(
+        {rank_call, readiness},
+        timeout=max(0.0, deadline - loop.time()),
+        return_when=asyncio.FIRST_COMPLETED,
+    )
+    if not done:
+        raise TimeoutError(timeout_message)
+    if readiness in done:
+        readiness.result()
+    if rank_call in done:
+        rank_call.result()
+    if not readiness.done():
+        done, _ = await asyncio.wait(
+            {readiness}, timeout=max(0.0, deadline - loop.time())
+        )
+        if not done:
+            raise TimeoutError(timeout_message)
+    readiness.result()
+
+
 async def _snapshot_readiness_timeout(
     actors: Any,
     job: GenerationSnapshotJobSpec,
@@ -2857,20 +2885,12 @@ class MonarchTrainerSlot:
                 name=f"megatron-fb-ready-{job.operation_id}",
             )
             try:
-                done, _ = await asyncio.wait(
-                    {rank_call, readiness},
-                    timeout=max(0.0, deadline - asyncio.get_running_loop().time()),
-                    return_when=asyncio.FIRST_COMPLETED,
+                await _await_command_readiness(
+                    rank_call,
+                    readiness,
+                    deadline,
+                    timeout_message="trainer ranks did not reach F/B gradient-ready",
                 )
-                if not done:
-                    raise TimeoutError("trainer ranks did not reach F/B gradient-ready")
-                if readiness in done:
-                    readiness.result()
-                else:
-                    await rank_call
-                    raise RuntimeError(
-                        "trainer F/B returned before every rank reported gradient-ready"
-                    )
                 completion = asyncio.create_task(
                     self._complete_forward_backward(job, rank_call, deadline),
                     name=f"megatron-fb-result-{job.operation_id}",
@@ -2979,20 +2999,12 @@ class MonarchTrainerSlot:
                 name=f"megatron-forward-ready-{job.operation_id}",
             )
             try:
-                done, _ = await asyncio.wait(
-                    {rank_call, readiness},
-                    timeout=max(0.0, deadline - asyncio.get_running_loop().time()),
-                    return_when=asyncio.FIRST_COMPLETED,
+                await _await_command_readiness(
+                    rank_call,
+                    readiness,
+                    deadline,
+                    timeout_message="trainer ranks did not reach forward GPU-ready",
                 )
-                if not done:
-                    raise TimeoutError("trainer ranks did not reach forward GPU-ready")
-                if readiness in done:
-                    readiness.result()
-                else:
-                    await rank_call
-                    raise RuntimeError(
-                        "trainer forward returned before every rank reported GPU-ready"
-                    )
                 completion = asyncio.create_task(
                     self._complete_forward(job, rank_call, deadline),
                     name=f"megatron-forward-result-{job.operation_id}",
@@ -3118,20 +3130,12 @@ class MonarchTrainerSlot:
                 name=f"megatron-sft-ready-{job.operation_id}",
             )
             try:
-                done, _ = await asyncio.wait(
-                    {rank_call, readiness},
-                    timeout=max(0.0, deadline - asyncio.get_running_loop().time()),
-                    return_when=asyncio.FIRST_COMPLETED,
+                await _await_command_readiness(
+                    rank_call,
+                    readiness,
+                    deadline,
+                    timeout_message=f"trainer ranks did not reach {label} readiness",
                 )
-                if not done:
-                    raise TimeoutError(f"trainer ranks did not reach {label} readiness")
-                if readiness in done:
-                    readiness.result()
-                else:
-                    await rank_call
-                    raise RuntimeError(
-                        f"trainer {label} returned before every rank reported ready"
-                    )
                 completion = asyncio.create_task(
                     self._complete_sft_command(job, rank_call, deadline, backward),
                     name=f"megatron-sft-result-{job.operation_id}",
@@ -4355,20 +4359,12 @@ class MonarchTrainerRun:
         self._active_job_id = job.operation_id
         self._active_collective = rank_call
         try:
-            done, _ = await asyncio.wait(
-                {rank_call, readiness},
-                timeout=max(0.0, deadline - loop.time()),
-                return_when=asyncio.FIRST_COMPLETED,
+            await _await_command_readiness(
+                rank_call,
+                readiness,
+                deadline,
+                timeout_message="trainer ranks did not reach F/B gradient-ready",
             )
-            if not done:
-                raise TimeoutError("trainer ranks did not reach F/B gradient-ready")
-            if readiness in done:
-                readiness.result()
-            else:
-                await rank_call
-                raise RuntimeError(
-                    "trainer F/B returned before every rank reported gradient-ready"
-                )
             self._open_forward_backward_ids.append(job.operation_id)
             self._next_operation_sequence += 1
             self._operation_sequence_ids[job.operation_id] = job.sequence_id
