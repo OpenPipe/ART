@@ -274,6 +274,8 @@ def test_publisher_close_never_reports_closed_with_a_live_worker() -> None:
 def _run_slot_executor(calls: list[str]) -> MCoreRunSlotExecutor:
     executor = MCoreRunSlotExecutor.__new__(MCoreRunSlotExecutor)
     executor._lifecycle_lock = Lock()
+    executor._residency_admission_lock = Lock()
+    executor._residency_admissions = {}
     executor._transition_futures = set()
     executor._load_pool = ThreadPoolExecutor(max_workers=1)
     executor._cleanup_pool = ThreadPoolExecutor(max_workers=1)

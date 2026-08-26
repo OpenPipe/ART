@@ -1,6 +1,7 @@
 from concurrent.futures import Future
 from contextlib import contextmanager
 import sys
+from threading import Lock
 from types import SimpleNamespace
 from typing import Any
 
@@ -74,6 +75,8 @@ class _CommitResidency:
 
     def acquire_l1_working_set(self, keys: Any) -> None:
         self.acquired.append(tuple(keys))
+
+    acquire_prepared_l1_working_set = acquire_l1_working_set
 
     def release_l1_working_set(self, _keys: Any) -> None:
         return None
@@ -275,14 +278,18 @@ def test_post_optimizer_save_uses_registered_generation_without_l1(
         optimizer_snapshot_barrier=SimpleNamespace(
             wait_before_mutation=lambda *, key: None
         ),
-        model_support_handler=SimpleNamespace(
-            expert_packed_lora_groups=lambda: ()
-        ),
+        model_support_handler=SimpleNamespace(expert_packed_lora_groups=lambda: ()),
+        inter_forward_backward_timing=SimpleNamespace(previous_job_complete_s=None),
     )
     executor._slot_trainer = slot
     executor._residency = residency
     executor._publisher = publisher
     executor._runs = {"run": state}
+    executor._residency_admission_lock = Lock()
+    executor._residency_admissions = {
+        "optimizer-1": (parent_weights, parent_optimizer, accumulator)
+    }
+    executor._closing = False
     executor._closed = False
 
     optimizer_result = executor.execute_optimizer(_optimizer_job())
@@ -437,6 +444,7 @@ def test_nonresident_committed_save_borrows_l2_and_restores_l3(
             installed=False,
         )
     }
+    executor._closing = False
     executor._closed = False
     executor._resident = lambda *_args, **_kwargs: (_ for _ in ()).throw(
         AssertionError("save reacquired the trainer working set")
@@ -505,6 +513,7 @@ def test_save_fails_closed_for_missing_or_incomplete_generation(
             desired=GenerationResidency(weights=weights, optimizer=optimizer),
         )
     }
+    executor._closing = False
     executor._closed = False
 
     with pytest.raises(RuntimeError, match=message):
