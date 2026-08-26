@@ -2549,29 +2549,29 @@ class MonarchTrainerSlot:
         label: str,
     ) -> None:
         ready_state = "gradient-ready" if label.endswith("F/B") else "GPU-ready"
-        results = [
-            _CommandReady.model_validate(await receiver.recv())
-            for _ in self._rank_processes
-        ]
-        if {result.rank for result in results} != set(
-            range(len(self._rank_processes))
-        ) or any(
-            (result.operation_id, result.learner_version)
-            != (job.operation_id, job.expected_learner_version)
-            for result in results
-        ):
+        expected_ranks = set(range(len(self._rank_processes)))
+        received_ranks: set[int] = set()
+        for _ in self._rank_processes:
+            result = _CommandReady.model_validate(await receiver.recv())
+            if (
+                result.rank not in expected_ranks
+                or result.rank in received_ranks
+                or (result.operation_id, result.learner_version)
+                != (job.operation_id, job.expected_learner_version)
+            ):
+                raise RuntimeError(
+                    f"trainer {label} readiness has mismatched rank identity"
+                )
+            received_ranks.add(result.rank)
+            if result.error_type is not None:
+                raise RuntimeError(
+                    f"trainer {label} failed before {ready_state}:\n"
+                    f"rank {result.rank}: {result.error_type}: {result.message}\n"
+                    f"{result.traceback_text or ''}"
+                )
+        if received_ranks != expected_ranks:
             raise RuntimeError(
                 f"trainer {label} readiness has mismatched rank identity"
-            )
-        failures = [result for result in results if result.error_type is not None]
-        if failures:
-            details = "\n".join(
-                f"rank {result.rank}: {result.error_type}: {result.message}\n"
-                f"{result.traceback_text or ''}"
-                for result in failures
-            )
-            raise RuntimeError(
-                f"trainer {label} failed before {ready_state}:\n{details}"
             )
 
     async def _complete_forward_backward(
