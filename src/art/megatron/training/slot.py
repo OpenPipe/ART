@@ -579,8 +579,8 @@ class MegatronTrainingSlot:
                 ref=ref,
                 kind="tokenized",
                 packing=plan,
-                config=RlForwardBackwardConfig(),
-                experimental_config=ExperimentalTrainConfig(),
+                config=forward_backward_config(request),
+                experimental_config=experimental_train_config(request),
                 loss=request.loss,
                 return_token_logprobs=request.return_token_logprobs,
             )

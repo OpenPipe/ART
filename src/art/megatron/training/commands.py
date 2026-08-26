@@ -22,7 +22,9 @@ def forward_backward_config(
 ) -> RlForwardBackwardConfig:
     values = request.loss.values
     kl_penalty_coef = values.get("kl_penalty_coef", 0.0)
-    if not isinstance(kl_penalty_coef, int | float):
+    if isinstance(kl_penalty_coef, bool) or not isinstance(
+        kl_penalty_coef, int | float
+    ):
         raise TypeError("kl_penalty_coef must be numeric")
     return RlForwardBackwardConfig(
         kl_penalty_coef=float(kl_penalty_coef),

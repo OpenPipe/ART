@@ -212,9 +212,9 @@ TrainingBatch = Annotated[
 
 
 class CheckpointRef(Contract):
-    run_id: str = Field(min_length=1)
+    run_id: str = Field(min_length=1, max_length=MAX_CONTROL_IDENTIFIER_LENGTH)
     learner_version: int = Field(ge=0)
-    checkpoint_id: str = Field(min_length=1)
+    checkpoint_id: str = Field(min_length=1, max_length=MAX_CHECKPOINT_REFERENCE_LENGTH)
 
 
 class LossConfig(Contract):
@@ -255,6 +255,14 @@ class ForwardRequest(RunCommand):
                 f"{self.batch.kind} batches require one of {sorted(expected)}, "
                 f"got {self.loss.name!r}"
             )
+        coefficient = self.loss.values.get("kl_penalty_coef", 0.0)
+        if isinstance(coefficient, bool) or not isinstance(coefficient, int | float):
+            raise TypeError("kl_penalty_coef must be numeric")
+        if coefficient < 0.0:
+            raise ValueError("kl_penalty_coef must be nonnegative")
+        reference = self.loss.reference_checkpoint
+        if reference is not None and reference.run_id != self.run_id:
+            raise ValueError("reference checkpoint must belong to the command run")
         if isinstance(self.batch, TokenizedTrainingBatch):
             validate_tokenized_loss_values(self.loss.name, self.loss.values)
             for datum in self.batch.datums:
