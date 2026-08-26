@@ -111,8 +111,6 @@ def _hf_parity_phase_pass_fns() -> dict[str, PhasePassFn]:
 def _hf_parity_phase_pass_fns_for_case(
     case_config: OracleCaseConfig,
 ) -> dict[str, PhasePassFn]:
-    if case_config.precision == "fp32":
-        return _hf_parity_phase_pass_fns()
     from art.megatron.model_support.registry import get_model_support_handler
 
     handler = get_model_support_handler(
@@ -308,6 +306,9 @@ def set_hf_config_num_layers(config: Any, num_layers: int) -> str:
             layer_types = getattr(config_view, "layer_types", None)
             if isinstance(layer_types, (list, tuple)):
                 setattr(config_view, "layer_types", list(layer_types[:num_layers]))
+            hybrid_pattern = getattr(config_view, "hybrid_override_pattern", None)
+            if isinstance(hybrid_pattern, str):
+                config_view.hybrid_override_pattern = hybrid_pattern[:num_layers]
             mlp_only_layers = getattr(config_view, "mlp_only_layers", None)
             if isinstance(mlp_only_layers, (list, tuple)):
                 setattr(

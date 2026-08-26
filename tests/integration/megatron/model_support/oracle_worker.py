@@ -484,9 +484,9 @@ def _configure_provider(
     """
     del topology
     provider.num_layers = case_config.num_layers
-    for name in ("moe_layer_freq", "glm52_indexer_types"):
+    for name in ("moe_layer_freq", "glm52_indexer_types", "hybrid_layer_pattern"):
         pattern = getattr(provider, name, None)
-        if isinstance(pattern, (list, tuple)):
+        if isinstance(pattern, (list, tuple, str)):
             setattr(provider, name, type(pattern)(pattern[: case_config.num_layers]))
     if case_config.precision == "fp32":
         provider.bf16 = False
