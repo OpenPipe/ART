@@ -505,8 +505,51 @@ class NemotronHHandler(DefaultMoeHandler):
             "packed_seq_params": None,
         }
 
+    def prepare_hf_reference_model_class(self, model_class: type[Any]) -> type[Any]:
+        if model_class.__name__ != "NemotronHForCausalLM":
+            raise TypeError("Nemotron-H HF reference model class changed")
+        strict_fp32 = tuple(
+            getattr(model_class, "_keep_in_fp32_modules_strict", ()) or ()
+        ) + (
+            "*.mixer.A_log",
+            "*.mixer.D",
+            "*.mixer.gate.e_score_correction_bias",
+        )
+        return type(
+            f"ArtStrictFp32{model_class.__name__}",
+            (model_class,),
+            {
+                "__module__": model_class.__module__,
+                "_keep_in_fp32_modules_strict": strict_fp32,
+            },
+        )
+
     def prepare_hf_reference_model(self, model: Any) -> Any:
         pattern = str(model.config.hybrid_override_pattern)
+        fp32_names = {
+            name
+            for index, symbol in enumerate(pattern)
+            for name in (
+                (
+                    f"backbone.layers.{index}.mixer.A_log",
+                    f"backbone.layers.{index}.mixer.D",
+                )
+                if symbol == "M"
+                else (f"backbone.layers.{index}.mixer.gate.e_score_correction_bias",)
+                if symbol == "E"
+                else ()
+            )
+        }
+        state = model.state_dict()
+        params_dtype = model.backbone.embeddings.weight.dtype
+        invalid = {
+            name: tensor.dtype
+            for name, tensor in state.items()
+            if tensor.is_floating_point()
+            and tensor.dtype != (torch.float32 if name in fp32_names else params_dtype)
+        }
+        if fp32_names - state.keys() or invalid:
+            raise RuntimeError("Nemotron-H HF reference precision changed")
         expected_names = [
             f"backbone.layers.{index}.mixer"
             for index, symbol in enumerate(pattern)

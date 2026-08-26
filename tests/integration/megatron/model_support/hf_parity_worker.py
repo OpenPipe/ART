@@ -479,6 +479,7 @@ def _load_hf_model(
     allow_unvalidated_arch: bool,
 ) -> Any:
     from transformers import AutoConfig, AutoModelForCausalLM
+    from transformers.dynamic_module_utils import get_class_from_dynamic_module
 
     from art.megatron.model_support.registry import get_model_support_handler
 
@@ -504,7 +505,25 @@ def _load_hf_model(
         if hf_reference_from_pretrained_kwargs is not None
         else {}
     )
-    model = AutoModelForCausalLM.from_pretrained(
+    model_class = AutoModelForCausalLM
+    prepare_model_class = getattr(handler, "prepare_hf_reference_model_class", None)
+    if prepare_model_class is not None:
+        auto_map = getattr(config, "auto_map", None)
+        class_reference = (
+            auto_map.get(AutoModelForCausalLM.__name__)
+            if isinstance(auto_map, dict)
+            else None
+        )
+        if not isinstance(class_reference, str) or not class_reference:
+            raise RuntimeError("HF reference model class is unavailable")
+        model_class = prepare_model_class(
+            get_class_from_dynamic_module(
+                class_reference,
+                base_model,
+                revision=getattr(config, "_commit_hash", None),
+            )
+        )
+    model = model_class.from_pretrained(
         base_model,
         config=config,
         trust_remote_code=True,
