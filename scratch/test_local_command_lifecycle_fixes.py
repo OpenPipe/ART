@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 from types import SimpleNamespace
 from typing import Any
 
@@ -81,7 +82,8 @@ def _forward_backward(request_id: str, sequence_id: int) -> ForwardBackwardReque
                     header=header,
                     records=(),
                     route_free_identity=TrajectoryGroupDataIdentity(
-                        sha256="0" * 64, byte_count=len(header)
+                        sha256=hashlib.sha256(header).hexdigest(),
+                        byte_count=len(header),
                     ),
                 ),
             ),
@@ -172,6 +174,7 @@ async def test_trainer_consumes_only_the_exact_cancelled_sequence() -> None:
     run._cancelled_operations = {}
     run._operation_sequence_ids = {}
     run._operations = {}
+    run._snapshot_launches = {}
     run._next_operation_sequence = 0
     run._learner_version = 7
     run._open_forward_backward_ids = ["prior-gradient"]

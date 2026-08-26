@@ -145,6 +145,22 @@ class _Receiver:
         return await self.queue.get()
 
 
+class _DelayedPort(_Port):
+    def __init__(self, queue: asyncio.Queue[Any], release: asyncio.Event) -> None:
+        super().__init__(queue)
+        self.release = release
+        self.deliveries: set[asyncio.Task[None]] = set()
+
+    def send(self, value: Any) -> None:
+        async def deliver() -> None:
+            await self.release.wait()
+            self.queue.put_nowait(value)
+
+        task = asyncio.create_task(deliver())
+        self.deliveries.add(task)
+        task.add_done_callback(self.deliveries.discard)
+
+
 class _Call:
     def __init__(self, method: Any) -> None:
         self.call = method
@@ -219,7 +235,7 @@ class _Actors:
         self.start_run_slot_forward_backward = _Call(self._forward_backward)
         self.start_run_slot_forward = _Call(self._forward)
         self.start_run_slot_sft_forward_backward = _Call(self._sft_forward_backward)
-        self.start_run_slot_sft_forward = _Call(self._forward)
+        self.start_run_slot_sft_forward = _Call(self._sft_forward)
         self.execute_run_slot_optimizer = _Call(self._optimizer)
         self.start_prepare_run_slot_registration = _Call(self._start_registration)
         self.start_prepare_run_slot_load_state = _Call(self._start_load)
@@ -229,7 +245,12 @@ class _Actors:
         self.finish_unregister_run_slot = _Call(self._finish_unregister)
 
     async def _forward(
-        self, operation_id: str, _batch: str, ready_port: _Port
+        self,
+        operation_id: str,
+        _batch: str,
+        ready_port: _Port,
+        *,
+        program: Literal["rl", "sft"] = "rl",
     ) -> dict[int, dict[str, Any]]:
         for rank in range(self.ranks):
             ready_port.send(
@@ -248,14 +269,27 @@ class _Actors:
                 "rank": rank,
                 "operation_id": operation_id,
                 "learner_version": 3,
+                "token_count": 7,
                 "metrics": {"rank": float(rank)} if rank == 0 else {},
-                "_rank_telemetry": None,
+                "_rank_telemetry": _rank_telemetry_payload(
+                    rank=rank,
+                    ranks=self.ranks,
+                    total_tokens=7,
+                    program=program,
+                )
+                if program == "sft"
+                else None,
                 "token_logprobs": ({"shape": [1], "data": b"data"},)
                 if rank == 0
                 else (),
             }
             for rank in range(self.ranks)
         }
+
+    async def _sft_forward(
+        self, operation_id: str, batch: str, ready_port: _Port
+    ) -> dict[int, dict[str, Any]]:
+        return await self._forward(operation_id, batch, ready_port, program="sft")
 
     async def _forward_backward(
         self,
@@ -534,6 +568,108 @@ async def test_optimizer_launches_after_ready_before_late_result() -> None:
     assert (await first.completion)["operation_id"] == "fb-0"
     assert (await second.completion)["operation_id"] == "fb-1"
     assert actors.events[-2:] == ["result:fb-0", "result:fb-1"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("command", ("rl_fb", "rl_forward", "sft_fb", "sft_forward"))
+async def test_successful_rank_result_can_arrive_before_ready_delivery(
+    command: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    release = asyncio.Event()
+
+    def open_channel() -> tuple[_DelayedPort, _Receiver]:
+        queue: asyncio.Queue[Any] = asyncio.Queue()
+        return _DelayedPort(queue, release), _Receiver(queue)
+
+    monkeypatch.setattr(monarch_module.Channel, "open", staticmethod(open_channel))
+    actors = _Actors()
+    actors.allow_host_materialization.set()
+    slot = _slot(actors)
+
+    operation_id = f"{command}-0"
+    if command == "rl_fb":
+        start = asyncio.create_task(
+            slot.start_forward_backward(_Job(operation_id), _Batch())
+        )
+    elif command == "rl_forward":
+        start = asyncio.create_task(slot.start_forward(_Job(operation_id), _Batch()))
+    elif command == "sft_fb":
+        start = asyncio.create_task(
+            slot.start_sft_forward_backward(_Job(operation_id), _SftBatch())
+        )
+    else:
+        start = asyncio.create_task(
+            slot.start_sft_forward(_Job(operation_id), _SftBatch())
+        )
+    await actors.host_materialization_started.wait()
+    while f"result:{operation_id}" not in actors.events:
+        await asyncio.sleep(0)
+    await asyncio.sleep(0)
+
+    assert not start.done()
+    release.set()
+    launch = await start
+    assert (await launch.completion)["operation_id"] == operation_id
+
+
+@pytest.mark.asyncio
+async def test_legacy_successful_rank_result_can_arrive_before_ready_delivery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    release = asyncio.Event()
+
+    def open_channel() -> tuple[_DelayedPort, _Receiver]:
+        queue: asyncio.Queue[Any] = asyncio.Queue()
+        return _DelayedPort(queue, release), _Receiver(queue)
+
+    monkeypatch.setattr(monarch_module.Channel, "open", staticmethod(open_channel))
+    actors = _Actors()
+    actors.allow_host_materialization.set()
+    run = _legacy_run(actors)
+    job = _Job("legacy-fb")
+    job.run_id = "run"
+    job.training_session_id = "session"
+    job.sequence_id = 0
+    job.batch = SimpleNamespace(sequence_length=8)
+    batch = _Batch()
+    batch.ref = job.batch
+
+    start = asyncio.create_task(run.start_forward_backward(job, batch))
+    await actors.host_materialization_started.wait()
+    while "result:legacy-fb" not in actors.events:
+        await asyncio.sleep(0)
+    await asyncio.sleep(0)
+
+    assert not start.done()
+    release.set()
+    launch = await start
+    assert (await launch.completion)["operation_id"] == "legacy-fb"
+
+
+@pytest.mark.asyncio
+async def test_rank_failure_preempts_delayed_ready_delivery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    release = asyncio.Event()
+
+    def open_channel() -> tuple[_DelayedPort, _Receiver]:
+        queue: asyncio.Queue[Any] = asyncio.Queue()
+        return _DelayedPort(queue, release), _Receiver(queue)
+
+    monkeypatch.setattr(monarch_module.Channel, "open", staticmethod(open_channel))
+    actors = _Actors()
+    actors.fail_before_ready = True
+    slot = _slot(actors)
+
+    try:
+        with pytest.raises(RuntimeError, match="F/B failed"):
+            await asyncio.wait_for(
+                slot.start_forward_backward(_Job("failed-fb"), _Batch()),
+                timeout=0.2,
+            )
+    finally:
+        release.set()
 
 
 @pytest.mark.asyncio

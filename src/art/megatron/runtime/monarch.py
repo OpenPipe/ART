@@ -7,7 +7,8 @@ import json
 import os
 from pathlib import Path
 import socket
-from threading import Event, Lock, Thread
+import sys
+from threading import Event, Lock, Thread, current_thread
 import time
 import traceback
 from typing import Any, Callable
@@ -309,6 +310,18 @@ class _CommandReady(BaseModel):
     error_type: str | None = None
     message: str | None = None
     traceback_text: str | None = None
+
+
+class _SnapshotRankPhase(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    rank: int
+    operation_id: str
+    phase: str
+    thread_name: str
+    cuda_device: int
+    monotonic_ns: int
+    error: str | None = None
 
 
 class _KlReferenceReady(BaseModel):
@@ -618,6 +631,8 @@ class MonarchTrainerActor(Actor):
         self._deferred_response_lock = Lock()
         self._deferred_response_threads: set[Thread] = set()
         self._deferred_response_stopping = False
+        self._snapshot_phase_lock = Lock()
+        self._snapshot_phases: dict[str, _SnapshotRankPhase] = {}
         self._cp_preplanner = None
         self._cp_lookahead_port = None
         self._cp_lookahead_thread: Thread | None = None
@@ -779,6 +794,63 @@ class MonarchTrainerActor(Actor):
             raise RuntimeError("trainer actor is not configured for multi-run slots")
         return self._run_slot_executor
 
+    def _record_snapshot_phase(
+        self, operation_id: str, phase: str, *, error: BaseException | None = None
+    ) -> None:
+        import torch
+
+        record = _SnapshotRankPhase(
+            rank=self._runtime.rank,
+            operation_id=operation_id,
+            phase=phase,
+            thread_name=current_thread().name,
+            cuda_device=torch.cuda.current_device(),
+            monotonic_ns=time.monotonic_ns(),
+            error=(None if error is None else f"{type(error).__name__}: {error}"),
+        )
+        if os.environ.get("ART_DEBUG_SNAPSHOT_RANK_PHASES") == "1":
+            print(f"ART_SNAPSHOT_RANK_PHASE {record.model_dump_json()}", flush=True)
+        with self._snapshot_phase_lock:
+            if operation_id not in self._snapshot_phases:
+                while len(self._snapshot_phases) >= 16:
+                    self._snapshot_phases.pop(next(iter(self._snapshot_phases)))
+            self._snapshot_phases[operation_id] = record
+
+    def _snapshot_phase_report(self, operation_id: str) -> dict[str, Any]:
+        with self._snapshot_phase_lock:
+            phase = self._snapshot_phases.get(operation_id)
+        thread_name = f"art-snapshot-prepare-{operation_id}"
+        with self._deferred_response_lock:
+            thread = next(
+                (
+                    candidate
+                    for candidate in self._deferred_response_threads
+                    if candidate.name == thread_name
+                ),
+                None,
+            )
+        frame = (
+            sys._current_frames().get(thread.ident)
+            if thread is not None and thread.ident is not None
+            else None
+        )
+        return {
+            "rank": self._runtime.rank,
+            "operation_id": operation_id,
+            "expected_cuda_device": int(os.environ["LOCAL_RANK"]),
+            "phase": None if phase is None else phase.model_dump(mode="json"),
+            "thread_alive": thread is not None and thread.is_alive(),
+            "thread_stack": (
+                None
+                if frame is None
+                else "".join(traceback.format_stack(frame, limit=32))
+            ),
+        }
+
+    @endpoint
+    def inspect_snapshot_phase(self, operation_id: str) -> dict[str, Any]:
+        return self._snapshot_phase_report(operation_id)
+
     def _defer_response(
         self,
         port: Port[dict[str, Any]],
@@ -787,13 +859,17 @@ class MonarchTrainerActor(Actor):
         name: str,
         invalidate_on_error: bool,
     ) -> None:
+        import torch
+
+        cuda_device = torch.cuda.current_device()
         with self._deferred_response_lock:
             if self._deferred_response_stopping:
                 raise RuntimeError("trainer actor is stopping")
 
             def settle() -> None:
                 try:
-                    port.send(materialize())
+                    with torch.cuda.device(cuda_device):
+                        port.send(materialize())
                 except BaseException as error:
                     if invalidate_on_error:
                         self._valid = False
@@ -1896,19 +1972,43 @@ class MonarchTrainerActor(Actor):
         response_port: Port[dict[str, Any]],
         job_json: str,
         event_port: Port[dict[str, Any]],
+        ready_port: Port[dict[str, Any]],
     ) -> None:
+        staged = Event()
+        job = None
         try:
             if not self._valid:
                 raise RuntimeError("trainer actor runtime is invalid")
             job = GenerationSnapshotJobSpec.model_validate_json(job_json)
             coordinator = self._runtime.rank == 0
+            self._record_snapshot_phase(job.operation_id, "endpoint_validated")
+
+            def mark_staged() -> None:
+                self._record_snapshot_phase(
+                    job.operation_id, "mutation_fence_complete"
+                )
+                ready_port.send(
+                    _CommandReady(
+                        rank=self._runtime.rank,
+                        operation_id=job.operation_id,
+                        learner_version=job.learner_version,
+                    ).model_dump(mode="json")
+                )
+                staged.set()
+                self._record_snapshot_phase(job.operation_id, "readiness_sent")
 
             def prepare() -> dict[str, Any]:
                 try:
+                    self._record_snapshot_phase(
+                        job.operation_id, "deferred_prepare_started"
+                    )
+                    self._record_snapshot_phase(job.operation_id, "mutation_fence_enter")
                     result = self._require_run_slot_executor().execute_snapshot(
                         job,
                         _ActorEventSink(event_port, coordinator=coordinator),
+                        mark_staged,
                     )
+                    self._record_snapshot_phase(job.operation_id, "plan_ready")
                     return {
                         "rank": self._runtime.rank,
                         "operation_id": job.operation_id,
@@ -1917,6 +2017,18 @@ class MonarchTrainerActor(Actor):
                         "metrics": result["metrics"] if coordinator else {},
                     }
                 except BaseException as error:
+                    self._record_snapshot_phase(job.operation_id, "failed", error=error)
+                    if not staged.is_set():
+                        ready_port.send(
+                            _CommandReady(
+                                rank=self._runtime.rank,
+                                operation_id=job.operation_id,
+                                learner_version=job.learner_version,
+                                error_type=type(error).__name__,
+                                message=str(error),
+                                traceback_text=traceback.format_exc(),
+                            ).model_dump(mode="json")
+                        )
                     event_port.send(
                         {
                             "kind": "rank_failed",
@@ -1973,12 +2085,16 @@ class MonarchTrainerActor(Actor):
         self._require_run_slot_executor().discard_prepared_snapshot(operation_id)
         return {"rank": self._runtime.rank, "operation_id": operation_id}
 
-    @endpoint
+    @endpoint(explicit_response_port=True)
     def execute_snapshot(
         self,
+        response_port: Port[dict[str, Any]],
         job_json: str,
         event_port: Port[dict[str, Any]],
-    ) -> dict[str, Any]:
+        ready_port: Port[dict[str, Any]],
+    ) -> None:
+        staged = Event()
+        job = None
         try:
             if not self._valid:
                 raise RuntimeError("trainer actor runtime is invalid")
@@ -1987,17 +2103,71 @@ class MonarchTrainerActor(Actor):
                 self._weight_offload.before_job()
                 self._command_job_open = True
             coordinator = self._runtime.rank == 0
-            result = self._executor.execute_snapshot(
-                job,
-                _ActorEventSink(event_port, coordinator=coordinator),
+            self._record_snapshot_phase(job.operation_id, "endpoint_validated")
+
+            def mark_staged() -> None:
+                self._record_snapshot_phase(
+                    job.operation_id, "mutation_fence_complete"
+                )
+                ready_port.send(
+                    _CommandReady(
+                        rank=self._runtime.rank,
+                        operation_id=job.operation_id,
+                        learner_version=job.learner_version,
+                    ).model_dump(mode="json")
+                )
+                staged.set()
+                self._record_snapshot_phase(job.operation_id, "readiness_sent")
+
+            def prepare() -> dict[str, Any]:
+                try:
+                    self._record_snapshot_phase(
+                        job.operation_id, "deferred_prepare_started"
+                    )
+                    self._record_snapshot_phase(job.operation_id, "mutation_fence_enter")
+                    result = self._executor.execute_snapshot(
+                        job,
+                        _ActorEventSink(event_port, coordinator=coordinator),
+                        mark_staged,
+                    )
+                    self._record_snapshot_phase(job.operation_id, "plan_ready")
+                    return {
+                        "rank": self._runtime.rank,
+                        "operation_id": job.operation_id,
+                        "learner_version": job.learner_version,
+                        "rank_write_plan": result["rank_write_plan"],
+                        "metrics": result["metrics"] if coordinator else {},
+                    }
+                except BaseException as error:
+                    self._record_snapshot_phase(job.operation_id, "failed", error=error)
+                    if not staged.is_set():
+                        ready_port.send(
+                            _CommandReady(
+                                rank=self._runtime.rank,
+                                operation_id=job.operation_id,
+                                learner_version=job.learner_version,
+                                error_type=type(error).__name__,
+                                message=str(error),
+                                traceback_text=traceback.format_exc(),
+                            ).model_dump(mode="json")
+                        )
+                    event_port.send(
+                        {
+                            "kind": "rank_failed",
+                            "rank": self._runtime.rank,
+                            "error_type": type(error).__name__,
+                            "message": str(error),
+                            "traceback": traceback.format_exc(),
+                        }
+                    )
+                    raise
+
+            self._defer_response(
+                response_port,
+                prepare,
+                name=f"art-snapshot-prepare-{job.operation_id}",
+                invalidate_on_error=True,
             )
-            return {
-                "rank": self._runtime.rank,
-                "operation_id": job.operation_id,
-                "learner_version": job.learner_version,
-                "rank_write_plan": result["rank_write_plan"],
-                "metrics": result["metrics"] if coordinator else {},
-            }
         except BaseException as error:
             self._valid = False
             event_port.send(
@@ -2009,7 +2179,7 @@ class MonarchTrainerActor(Actor):
                     "traceback": traceback.format_exc(),
                 }
             )
-            raise
+            response_port.exception(_response_exception(error))
 
     @endpoint
     def authorize_snapshot(self, plan_json: str, grant_json: str) -> dict[str, Any]:
@@ -2350,6 +2520,15 @@ class ForwardCommandLaunch(BaseModel):
     completion: SkipValidation[asyncio.Future[dict[str, Any]]]
 
 
+class SnapshotPrepareCommandLaunch(BaseModel):
+    """Ranks fenced mutation; the plan is pending and publication is reserved."""
+
+    model_config = ConfigDict(arbitrary_types_allowed=True, extra="forbid", frozen=True)
+
+    completion: SkipValidation[asyncio.Future[dict[str, Any]]]
+    publication: SkipValidation[asyncio.Future[tuple[TrainerRankPublication, ...]]]
+
+
 async def _collect_command_ready(
     receiver: Any,
     job: (
@@ -2357,12 +2536,25 @@ async def _collect_command_ready(
         | ForwardBackwardJobSpec
         | SftForwardJobSpec
         | SftForwardBackwardJobSpec
+        | GenerationSnapshotJobSpec
     ),
     rank_processes: tuple[_TrainerRankReady, ...],
     *,
     label: str,
+    progress: set[int] | None = None,
 ) -> None:
-    ready_state = "gradient-ready" if label.endswith("F/B") else "GPU-ready"
+    learner_version = (
+        job.learner_version
+        if isinstance(job, GenerationSnapshotJobSpec)
+        else job.expected_learner_version
+    )
+    ready_state = (
+        "gradient-ready"
+        if label.endswith("F/B")
+        else "mutation-fenced"
+        if isinstance(job, GenerationSnapshotJobSpec)
+        else "GPU-ready"
+    )
     expected_ranks = set(range(len(rank_processes)))
     received_ranks: set[int] = set()
     for _ in rank_processes:
@@ -2371,12 +2563,14 @@ async def _collect_command_ready(
             result.rank not in expected_ranks
             or result.rank in received_ranks
             or (result.operation_id, result.learner_version)
-            != (job.operation_id, job.expected_learner_version)
+            != (job.operation_id, learner_version)
         ):
             raise RuntimeError(
                 f"trainer {label} readiness has mismatched rank identity"
             )
         received_ranks.add(result.rank)
+        if progress is not None:
+            progress.add(result.rank)
         if result.error_type is not None:
             raise RuntimeError(
                 f"trainer {label} failed before {ready_state}:\n"
@@ -2385,6 +2579,84 @@ async def _collect_command_ready(
             )
     if received_ranks != expected_ranks:
         raise RuntimeError(f"trainer {label} readiness has mismatched rank identity")
+
+
+async def _await_command_readiness(
+    rank_call: asyncio.Future[Any],
+    readiness: asyncio.Future[None],
+    deadline: float,
+    *,
+    timeout_message: str,
+) -> None:
+    loop = asyncio.get_running_loop()
+    done, _ = await asyncio.wait(
+        {rank_call, readiness},
+        timeout=max(0.0, deadline - loop.time()),
+        return_when=asyncio.FIRST_COMPLETED,
+    )
+    if not done:
+        raise TimeoutError(timeout_message)
+    if readiness in done:
+        readiness.result()
+    if rank_call in done:
+        rank_call.result()
+    if not readiness.done():
+        done, _ = await asyncio.wait(
+            {readiness}, timeout=max(0.0, deadline - loop.time())
+        )
+        if not done:
+            raise TimeoutError(timeout_message)
+    readiness.result()
+
+
+async def _snapshot_readiness_timeout(
+    actors: Any,
+    job: GenerationSnapshotJobSpec,
+    received_ranks: set[int],
+) -> TimeoutError:
+    try:
+        values = await asyncio.wait_for(
+            actors.inspect_snapshot_phase.call(job.operation_id), timeout=2.0
+        )
+        phases: Any = sorted(values.values(), key=lambda value: value["rank"])
+    except Exception as error:
+        phases = {
+            "diagnostic_error": f"{type(error).__name__}: {error}",
+        }
+    return TimeoutError(
+        "trainer ranks did not fence snapshot mutation: "
+        f"received_ranks={sorted(received_ranks)} "
+        f"rank_phases={json.dumps(phases, sort_keys=True)}"
+    )
+
+
+async def _await_snapshot_readiness(
+    rank_call: asyncio.Future[Any],
+    readiness: asyncio.Future[None],
+    actors: Any,
+    job: GenerationSnapshotJobSpec,
+    received_ranks: set[int],
+    deadline: float,
+) -> None:
+    loop = asyncio.get_running_loop()
+    done, _ = await asyncio.wait(
+        {rank_call, readiness},
+        timeout=max(0.0, deadline - loop.time()),
+        return_when=asyncio.FIRST_COMPLETED,
+    )
+    if not done:
+        raise await _snapshot_readiness_timeout(actors, job, received_ranks)
+    if readiness in done:
+        readiness.result()
+    if rank_call in done:
+        rank_call.result()
+    if not readiness.done():
+        done, _ = await asyncio.wait(
+            {readiness}, timeout=max(0.0, deadline - loop.time())
+        )
+        if not done:
+            raise await _snapshot_readiness_timeout(actors, job, received_ranks)
+    readiness.result()
 
 
 class MonarchTrainerSlot:
@@ -2435,6 +2707,10 @@ class MonarchTrainerSlot:
         self._removal_tasks: dict[str, asyncio.Task[None]] = {}
         self._cleanup_slots = asyncio.BoundedSemaphore(_MAX_PENDING_RUN_CLEANUPS)
         self._operations: dict[str, tuple[str, dict[str, Any]]] = {}
+        self._snapshot_launches: dict[
+            str, tuple[str, SnapshotPrepareCommandLaunch]
+        ] = {}
+        self._snapshot_tasks: set[asyncio.Task[dict[str, Any]]] = set()
         self._forward_backward_launches: dict[
             str, tuple[str, ForwardBackwardCommandLaunch]
         ] = {}
@@ -2653,20 +2929,12 @@ class MonarchTrainerSlot:
                 name=f"megatron-fb-ready-{job.operation_id}",
             )
             try:
-                done, _ = await asyncio.wait(
-                    {rank_call, readiness},
-                    timeout=max(0.0, deadline - asyncio.get_running_loop().time()),
-                    return_when=asyncio.FIRST_COMPLETED,
+                await _await_command_readiness(
+                    rank_call,
+                    readiness,
+                    deadline,
+                    timeout_message="trainer ranks did not reach F/B gradient-ready",
                 )
-                if not done:
-                    raise TimeoutError("trainer ranks did not reach F/B gradient-ready")
-                if readiness in done:
-                    readiness.result()
-                else:
-                    await rank_call
-                    raise RuntimeError(
-                        "trainer F/B returned before every rank reported gradient-ready"
-                    )
                 completion = asyncio.create_task(
                     self._complete_forward_backward(job, rank_call, deadline),
                     name=f"megatron-fb-result-{job.operation_id}",
@@ -2775,20 +3043,12 @@ class MonarchTrainerSlot:
                 name=f"megatron-forward-ready-{job.operation_id}",
             )
             try:
-                done, _ = await asyncio.wait(
-                    {rank_call, readiness},
-                    timeout=max(0.0, deadline - asyncio.get_running_loop().time()),
-                    return_when=asyncio.FIRST_COMPLETED,
+                await _await_command_readiness(
+                    rank_call,
+                    readiness,
+                    deadline,
+                    timeout_message="trainer ranks did not reach forward GPU-ready",
                 )
-                if not done:
-                    raise TimeoutError("trainer ranks did not reach forward GPU-ready")
-                if readiness in done:
-                    readiness.result()
-                else:
-                    await rank_call
-                    raise RuntimeError(
-                        "trainer forward returned before every rank reported GPU-ready"
-                    )
                 completion = asyncio.create_task(
                     self._complete_forward(job, rank_call, deadline),
                     name=f"megatron-forward-result-{job.operation_id}",
@@ -2914,20 +3174,12 @@ class MonarchTrainerSlot:
                 name=f"megatron-sft-ready-{job.operation_id}",
             )
             try:
-                done, _ = await asyncio.wait(
-                    {rank_call, readiness},
-                    timeout=max(0.0, deadline - asyncio.get_running_loop().time()),
-                    return_when=asyncio.FIRST_COMPLETED,
+                await _await_command_readiness(
+                    rank_call,
+                    readiness,
+                    deadline,
+                    timeout_message=f"trainer ranks did not reach {label} readiness",
                 )
-                if not done:
-                    raise TimeoutError(f"trainer ranks did not reach {label} readiness")
-                if readiness in done:
-                    readiness.result()
-                else:
-                    await rank_call
-                    raise RuntimeError(
-                        f"trainer {label} returned before every rank reported ready"
-                    )
                 completion = asyncio.create_task(
                     self._complete_sft_command(job, rank_call, deadline, backward),
                     name=f"megatron-sft-result-{job.operation_id}",
@@ -3243,41 +3495,67 @@ class MonarchTrainerSlot:
     async def prepare_snapshot(
         self, job: GenerationSnapshotJobSpec
     ) -> SnapshotWritePlan:
+        launch = await self.start_prepare_snapshot(job)
+        result = await asyncio.shield(launch.completion)
+        return SnapshotWritePlan.model_validate(result["write_plan"])
+
+    async def start_prepare_snapshot(
+        self, job: GenerationSnapshotJobSpec
+    ) -> SnapshotPrepareCommandLaunch:
         async with self._control_lock:
             self._require_open()
             cached = self._cached_operation(job.operation_id, job.fingerprint)
             if cached is not None:
-                return SnapshotWritePlan.model_validate(cached["write_plan"])
+                publication = self._publications.get(job.operation_id)
+                if publication is None:
+                    raise RuntimeError("completed snapshot has no publication owner")
+                completion = asyncio.get_running_loop().create_future()
+                completion.set_result(cached)
+                return SnapshotPrepareCommandLaunch(
+                    completion=completion, publication=publication
+                )
+            if inflight := self._snapshot_launches.get(job.operation_id):
+                if inflight[0] != job.fingerprint:
+                    raise RuntimeError("operation_id was reused for another snapshot")
+                return inflight[1]
             operation_id = job.operation_id
             if operation_id in self._publications:
                 raise RuntimeError(f"publication already exists: {operation_id}")
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + self._command_timeout_s
+            event_port, event_receiver = Channel[dict[str, Any]].open()
+            ready_port, ready_receiver = Channel[dict[str, Any]].open()
+            rank_call = asyncio.ensure_future(
+                self._actors.execute_run_slot_snapshot.call(
+                    job.model_dump_json(), event_port, ready_port
+                )
+            )
+            readiness_progress: set[int] = set()
+            readiness = asyncio.create_task(
+                _collect_command_ready(
+                    ready_receiver,
+                    job,
+                    self._rank_processes,
+                    label="snapshot",
+                    progress=readiness_progress,
+                ),
+                name=f"megatron-slot-snapshot-ready-{operation_id}",
+            )
             try:
-                send_port, receiver = Channel[dict[str, Any]].open()
-                values = await asyncio.wait_for(
-                    self._actors.execute_run_slot_snapshot.call(
-                        job.model_dump_json(), send_port
-                    ),
-                    timeout=self._command_timeout_s,
-                )
-                results = list(values.values())
-                self._validate_command_results(
-                    results,
-                    operation_id=job.operation_id,
-                    learner_version=job.learner_version,
-                )
-                rank_plans = tuple(
-                    SnapshotRankWritePlan.model_validate(result["rank_write_plan"])
-                    for result in results
-                )
-                plan = build_snapshot_write_plan(
-                    operation_id=job.operation_id,
-                    generation=job.generation,
-                    ranks=rank_plans,
+                await _await_snapshot_readiness(
+                    rank_call,
+                    readiness,
+                    self._actors,
+                    job,
+                    readiness_progress,
+                    deadline,
                 )
                 authorization = asyncio.Event()
                 publication = asyncio.create_task(
                     self._collect_publication(
-                        receiver, job.generation, authorization=authorization
+                        event_receiver,
+                        job.generation,
+                        authorization=authorization,
                     ),
                     name=f"megatron-slot-publish-{operation_id}",
                 )
@@ -3288,23 +3566,109 @@ class MonarchTrainerSlot:
                     self._publication_authorization_tail
                 )
                 self._publication_authorization_tail = authorization
-                result = next(result for result in results if result["rank"] == 0)
-                self._operations[job.operation_id] = (
-                    job.fingerprint,
-                    {**result, "write_plan": plan.model_dump(mode="json")},
+                completion = asyncio.create_task(
+                    self._complete_snapshot_prepare(
+                        job, rank_call, publication, deadline
+                    ),
+                    name=f"megatron-slot-snapshot-plan-{operation_id}",
                 )
-                return plan
+                launch = SnapshotPrepareCommandLaunch(
+                    completion=completion, publication=publication
+                )
+                self._snapshot_launches[operation_id] = (job.fingerprint, launch)
+                return launch
             except BaseException as error:
+                for task in (readiness, rank_call):
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(readiness, rank_call, return_exceptions=True)
+                publication = self._publications.get(operation_id)
+                if publication is not None:
+                    await self._abort_snapshot_publication(operation_id, publication)
                 await self._invalidate(error, "snapshot operation and cleanup failed")
                 raise
 
+    async def _complete_snapshot_prepare(
+        self,
+        job: GenerationSnapshotJobSpec,
+        rank_call: asyncio.Future[Any],
+        publication: asyncio.Task[tuple[TrainerRankPublication, ...]],
+        deadline: float,
+    ) -> dict[str, Any]:
+        operation_id = job.operation_id
+        try:
+            async with asyncio.timeout_at(deadline):
+                values = await asyncio.shield(rank_call)
+            results = list(values.values())
+            self._validate_command_results(
+                results,
+                operation_id=operation_id,
+                learner_version=job.learner_version,
+            )
+            rank_plans = tuple(
+                SnapshotRankWritePlan.model_validate(result["rank_write_plan"])
+                for result in results
+            )
+            plan = build_snapshot_write_plan(
+                operation_id=operation_id,
+                generation=job.generation,
+                ranks=rank_plans,
+            )
+            result = next(result for result in results if result["rank"] == 0)
+            result = {**result, "write_plan": plan.model_dump(mode="json")}
+            self._operations[operation_id] = (job.fingerprint, result)
+            return result
+        except BaseException as error:
+            await self._abort_snapshot_publication(operation_id, publication)
+            await self._invalidate(error, "snapshot operation and cleanup failed")
+            raise
+        finally:
+            self._snapshot_launches.pop(operation_id, None)
+
+    async def _abort_snapshot_publication(
+        self,
+        operation_id: str,
+        publication: asyncio.Task[tuple[TrainerRankPublication, ...]],
+    ) -> None:
+        authorization = self._publication_authorizations.get(operation_id)
+        if authorization is not None:
+            authorization.set()
+        if not publication.done():
+            publication.cancel()
+        await asyncio.gather(publication, return_exceptions=True)
+        if self._publications.get(operation_id) is publication:
+            self._publications.pop(operation_id)
+        predecessor = self._publication_predecessors.pop(operation_id, None)
+        self._publication_authorizations.pop(operation_id, None)
+        if self._publication_authorization_tail is authorization:
+            self._publication_authorization_tail = predecessor
+
     async def snapshot(self, job: GenerationSnapshotJobSpec) -> dict[str, Any]:
-        plan = await self.prepare_snapshot(job)
-        metrics = await self.authorize_snapshot(plan, SnapshotWriteGrant.local(plan))
-        result = self._cached_operation(job.operation_id, job.fingerprint)
-        if result is None:
-            raise RuntimeError("authorized snapshot lost its prepared operation")
-        return {**result, "metrics": {**result["metrics"], **metrics}}
+        launch = await self.start_snapshot(job)
+        return await asyncio.shield(launch.completion)
+
+    async def start_snapshot(
+        self, job: GenerationSnapshotJobSpec
+    ) -> SnapshotPrepareCommandLaunch:
+        prepared = await self.start_prepare_snapshot(job)
+
+        async def complete() -> dict[str, Any]:
+            result = await asyncio.shield(prepared.completion)
+            plan = SnapshotWritePlan.model_validate(result["write_plan"])
+            metrics = await self.authorize_snapshot(
+                plan, SnapshotWriteGrant.local(plan)
+            )
+            return {**result, "metrics": {**result["metrics"], **metrics}}
+
+        completion = asyncio.create_task(
+            complete(), name=f"megatron-slot-snapshot-{job.operation_id}"
+        )
+        self._snapshot_tasks.add(completion)
+        completion.add_done_callback(self._snapshot_tasks.discard)
+        completion.add_done_callback(consume_future_exception)
+        return SnapshotPrepareCommandLaunch(
+            completion=completion, publication=prepared.publication
+        )
 
     async def authorize_snapshot(
         self, plan: SnapshotWritePlan, grant: SnapshotWriteGrant
@@ -3389,6 +3753,7 @@ class MonarchTrainerSlot:
         return asyncio.shield(publication)
 
     def retire_operation(self, operation_id: str) -> None:
+        self._snapshot_launches.pop(operation_id, None)
         publication = self._publications.get(operation_id)
         if publication is not None:
             if not publication.done():
@@ -3584,6 +3949,8 @@ class MonarchTrainerSlot:
                     task.cancel()
                 if registrations:
                     await asyncio.gather(*registrations, return_exceptions=True)
+                if self._snapshot_tasks:
+                    await asyncio.gather(*tuple(self._snapshot_tasks))
                 removals = tuple(self._removal_tasks.values())
                 outcomes = await asyncio.gather(*removals, return_exceptions=True)
                 failures = [
@@ -3838,6 +4205,10 @@ class MonarchTrainerRun:
         self._forward_backward_launches: dict[
             str, tuple[str, ForwardBackwardCommandLaunch]
         ] = {}
+        self._snapshot_launches: dict[
+            str, tuple[str, SnapshotPrepareCommandLaunch]
+        ] = {}
+        self._snapshot_tasks: set[asyncio.Task[dict[str, Any]]] = set()
         self._operation_sequence_ids: dict[str, int] = {}
         self._cancelled_operations: dict[str, OperationRef] = {}
         self._next_operation_sequence = 0
@@ -4032,20 +4403,12 @@ class MonarchTrainerRun:
         self._active_job_id = job.operation_id
         self._active_collective = rank_call
         try:
-            done, _ = await asyncio.wait(
-                {rank_call, readiness},
-                timeout=max(0.0, deadline - loop.time()),
-                return_when=asyncio.FIRST_COMPLETED,
+            await _await_command_readiness(
+                rank_call,
+                readiness,
+                deadline,
+                timeout_message="trainer ranks did not reach F/B gradient-ready",
             )
-            if not done:
-                raise TimeoutError("trainer ranks did not reach F/B gradient-ready")
-            if readiness in done:
-                readiness.result()
-            else:
-                await rank_call
-                raise RuntimeError(
-                    "trainer F/B returned before every rank reported gradient-ready"
-                )
             self._open_forward_backward_ids.append(job.operation_id)
             self._next_operation_sequence += 1
             self._operation_sequence_ids[job.operation_id] = job.sequence_id
@@ -4300,49 +4663,145 @@ class MonarchTrainerRun:
     async def prepare_snapshot(
         self, job: GenerationSnapshotJobSpec
     ) -> SnapshotWritePlan:
+        launch = await self.start_prepare_snapshot(job)
+        result = await asyncio.shield(launch.completion)
+        return SnapshotWritePlan.model_validate(result["write_plan"])
+
+    async def start_prepare_snapshot(
+        self, job: GenerationSnapshotJobSpec
+    ) -> SnapshotPrepareCommandLaunch:
+        if launch := self._snapshot_launches.get(job.operation_id):
+            if launch[0] != job.fingerprint:
+                raise RuntimeError("operation_id was reused for another snapshot")
+            return launch[1]
         cached = self._operations.get(job.operation_id)
         if cached is not None and cached[0] == job.fingerprint:
-            return SnapshotWritePlan.model_validate(cached[1]["write_plan"])
+            raise RuntimeError("completed snapshot has no publication owner")
         async with self._lock:
+            if launch := self._snapshot_launches.get(job.operation_id):
+                if launch[0] != job.fingerprint:
+                    raise RuntimeError("operation_id was reused for another snapshot")
+                return launch[1]
             cached = self._operations.get(job.operation_id)
             if cached is not None:
                 if cached[0] != job.fingerprint:
                     raise RuntimeError("operation_id was reused for another snapshot")
-                return SnapshotWritePlan.model_validate(cached[1]["write_plan"])
+                raise RuntimeError("completed snapshot has no publication owner")
             self._validate_operation(job)
-            result = await self._run_snapshot(job)
-            return SnapshotWritePlan.model_validate(result["write_plan"])
+            generation_id = job.generation.generation_id
+            if generation_id in self._publications:
+                raise RuntimeError(
+                    f"publication generation already exists: {generation_id}"
+                )
+            self._expire_prior_publications()
+            publication = asyncio.get_running_loop().create_future()
+            publication.add_done_callback(consume_future_exception)
+            state = _PublicationState(generation_id, publication)
+            self._publications[generation_id] = state
+            event_port, event_receiver = Channel[dict[str, Any]].open()
+            ready_port, ready_receiver = Channel[dict[str, Any]].open()
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + self._command_timeout_s()
+            rank_call = asyncio.ensure_future(
+                self._actors.execute_snapshot.call(
+                    job.model_dump_json(), event_port, ready_port
+                )
+            )
+            readiness_progress: set[int] = set()
+            readiness = asyncio.create_task(
+                _collect_command_ready(
+                    ready_receiver,
+                    job,
+                    self._rank_processes,
+                    label="snapshot",
+                    progress=readiness_progress,
+                ),
+                name=f"megatron-snapshot-ready-{job.operation_id}",
+            )
+            self._active_job_id = job.operation_id
+            self._active_collective = rank_call
+            try:
+                await _await_snapshot_readiness(
+                    rank_call,
+                    readiness,
+                    self._actors,
+                    job,
+                    readiness_progress,
+                    deadline,
+                )
+                if job.sequence_continuation_of is None:
+                    self._next_operation_sequence += 1
+                self._operation_sequence_ids[job.operation_id] = job.sequence_id
+                completion = asyncio.create_task(
+                    self._complete_snapshot_prepare(
+                        job, rank_call, event_receiver, state, deadline
+                    ),
+                    name=f"megatron-snapshot-plan-{job.operation_id}",
+                )
+                launch = SnapshotPrepareCommandLaunch(
+                    completion=completion, publication=publication
+                )
+                self._snapshot_launches[job.operation_id] = (
+                    job.fingerprint,
+                    launch,
+                )
+                return launch
+            except BaseException as error:
+                for task in (readiness, rank_call):
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(readiness, rank_call, return_exceptions=True)
+                if not publication.done():
+                    publication.set_exception(error)
+                state.records.clear()
+                state.train_done = True
+                await self._invalidate_command(error, "snapshot and cleanup failed")
+                raise
+            finally:
+                if self._active_job_id == job.operation_id:
+                    self._active_job_id = None
+                    self._active_collective = None
+                self._retire_publication(state)
 
     async def snapshot(self, job: GenerationSnapshotJobSpec) -> dict[str, Any]:
-        plan = await self.prepare_snapshot(job)
-        metrics = await self.authorize_snapshot(plan, SnapshotWriteGrant.local(plan))
-        result = self._operations.get(job.operation_id)
-        if result is None or result[0] != job.fingerprint:
-            raise RuntimeError("authorized snapshot lost its prepared operation")
-        return {**result[1], "metrics": {**result[1]["metrics"], **metrics}}
+        launch = await self.start_snapshot(job)
+        return await asyncio.shield(launch.completion)
 
-    async def _run_snapshot(self, job: GenerationSnapshotJobSpec) -> dict[str, Any]:
-        generation_id = job.generation.generation_id
-        if generation_id in self._publications:
-            raise RuntimeError(
-                f"publication generation already exists: {generation_id}"
+    async def start_snapshot(
+        self, job: GenerationSnapshotJobSpec
+    ) -> SnapshotPrepareCommandLaunch:
+        prepared = await self.start_prepare_snapshot(job)
+
+        async def complete() -> dict[str, Any]:
+            result = await asyncio.shield(prepared.completion)
+            plan = SnapshotWritePlan.model_validate(result["write_plan"])
+            metrics = await self.authorize_snapshot(
+                plan, SnapshotWriteGrant.local(plan)
             )
-        self._expire_prior_publications()
-        publication = asyncio.get_running_loop().create_future()
-        publication.add_done_callback(consume_future_exception)
-        state = _PublicationState(generation_id, publication)
-        self._publications[generation_id] = state
-        send_port, receiver = Channel[dict[str, Any]].open()
-        collective = asyncio.ensure_future(
-            self._actors.execute_snapshot.call(job.model_dump_json(), send_port)
+            return {**result, "metrics": {**result["metrics"], **metrics}}
+
+        completion = asyncio.create_task(
+            complete(), name=f"megatron-snapshot-{job.operation_id}"
         )
-        self._active_job_id = job.operation_id
-        self._active_collective = collective
+        self._snapshot_tasks.add(completion)
+        completion.add_done_callback(self._snapshot_tasks.discard)
+        completion.add_done_callback(consume_future_exception)
+        return SnapshotPrepareCommandLaunch(
+            completion=completion, publication=prepared.publication
+        )
+
+    async def _complete_snapshot_prepare(
+        self,
+        job: GenerationSnapshotJobSpec,
+        rank_call: asyncio.Future[Any],
+        receiver: Any,
+        state: _PublicationState,
+        deadline: float,
+    ) -> dict[str, Any]:
+        publication = state.future
         try:
-            values = await asyncio.wait_for(
-                collective,
-                timeout=self._command_timeout_s(),
-            )
+            async with asyncio.timeout_at(deadline):
+                values = await asyncio.shield(rank_call)
             results = list(values.values())
             self._validate_rank_command_results(
                 results,
@@ -4365,8 +4824,6 @@ class MonarchTrainerRun:
             self._publication_drains.add(drain)
             drain.add_done_callback(self._publication_drains.discard)
             drain.add_done_callback(consume_future_exception)
-            if job.sequence_continuation_of is None:
-                self._next_operation_sequence += 1
             result = {**result, "write_plan": plan.model_dump(mode="json")}
             self._operations[job.operation_id] = (job.fingerprint, result)
             self._operation_sequence_ids[job.operation_id] = job.sequence_id
@@ -4376,12 +4833,10 @@ class MonarchTrainerRun:
                 publication.set_exception(error)
             state.records.clear()
             state.train_done = True
+            self._snapshot_launches.pop(job.operation_id, None)
             await self._invalidate_command(error, "snapshot and cleanup failed")
             raise
         finally:
-            if self._active_job_id == job.operation_id:
-                self._active_job_id = None
-                self._active_collective = None
             self._retire_publication(state)
 
     async def authorize_snapshot(
@@ -4924,6 +5379,7 @@ class MonarchTrainerRun:
         return self._await_publication(state)
 
     def retire_operation(self, operation_id: str) -> None:
+        self._snapshot_launches.pop(operation_id, None)
         self._operations.pop(operation_id, None)
         self._operation_sequence_ids.pop(operation_id, None)
         self._cancelled_operations.pop(operation_id, None)
@@ -5267,6 +5723,8 @@ class MonarchTrainerRun:
             graceful_deadline = min(deadline, loop.time() + process_shutdown_timeout(2))
             try:
                 async with asyncio.timeout_at(graceful_deadline):
+                    if self._snapshot_tasks:
+                        await asyncio.gather(*tuple(self._snapshot_tasks))
                     await asyncio.gather(
                         _remote_teardown(
                             self._actors.close.call(

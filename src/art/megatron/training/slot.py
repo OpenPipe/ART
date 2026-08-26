@@ -1534,7 +1534,7 @@ class MegatronTrainingSlot:
             )
         )
         started = time.perf_counter()
-        plan = await self.trainer.prepare_snapshot(
+        launch = await self.trainer.start_prepare_snapshot(
             GenerationSnapshotJobSpec(
                 operation_id=ref.operation_id,
                 sequence_continuation_of=sequence_continuation_of,
@@ -1550,6 +1550,8 @@ class MegatronTrainingSlot:
                 save_optimizer=persist_optimizer,
             )
         )
+        result = await asyncio.shield(launch.completion)
+        plan = SnapshotWritePlan.model_validate(result["write_plan"])
         return _PendingSnapshot(
             run_id=source.run_id,
             generation=generation,
@@ -1564,7 +1566,7 @@ class MegatronTrainingSlot:
                 writes_optimizer=persist_optimizer,
                 adapter_object_target=object_target,
             ),
-            publication=self.trainer.wait_for_publication(ref.operation_id),
+            publication=launch.publication,
             started=started,
         )
 

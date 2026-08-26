@@ -1647,11 +1647,15 @@ class DistributedMegatronService:
             publication_targets=targets,
             save_optimizer=save_optimizer,
         )
-        result = await trainer.snapshot(job)
-        metrics = dict(result["metrics"])
-        rank_snapshot = asyncio.create_task(
-            trainer.wait_for_publication(generation.generation_id)
-        )
+        snapshot = await trainer.start_snapshot(job)
+        metrics: dict[str, float] = {}
+
+        async def complete_rank_snapshot() -> tuple[TrainerRankPublication, ...]:
+            result = await asyncio.shield(snapshot.completion)
+            metrics.update(result["metrics"])
+            return await asyncio.shield(snapshot.publication)
+
+        rank_snapshot = asyncio.create_task(complete_rank_snapshot())
         self._snapshot_rank_tasks[generation.policy_step] = rank_snapshot
         rank_snapshot.add_done_callback(consume_future_exception)
         if activate_serving:
@@ -1663,6 +1667,7 @@ class DistributedMegatronService:
                 publication_targets=targets,
                 publication_waiter=rank_snapshot,
             )
+
             completion = asyncio.create_task(
                 self._complete_activated_snapshot(
                     generation,

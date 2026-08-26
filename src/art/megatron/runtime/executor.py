@@ -10,7 +10,7 @@ import math
 from pathlib import Path
 from threading import BoundedSemaphore, Condition, Event, Lock
 import time
-from typing import TYPE_CHECKING, Any, Iterator, Literal, cast
+from typing import TYPE_CHECKING, Any, Callable, Iterator, Literal, cast
 
 from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, SkipValidation
 import torch
@@ -974,6 +974,7 @@ class MegatronTrainJobExecutor:
         self,
         job: GenerationSnapshotJobSpec,
         sink: EventSink,
+        staged: Callable[[], None],
     ) -> dict[str, Any]:
         if self._closing or self._closed:
             raise RuntimeError("Megatron executor is closed")
@@ -1002,6 +1003,7 @@ class MegatronTrainJobExecutor:
                 adapter_config=runtime.adapter_export_config,
                 slot_ref=None,
                 sink=sink,
+                staged=staged,
             )
             return {
                 "operation_id": job.operation_id,
@@ -1016,6 +1018,7 @@ class MegatronTrainJobExecutor:
             adapter_config=runtime.adapter_export_config,
             snapshot_optimizer=job.save_optimizer,
         )
+        staged()
         rank_plan, prepare_metrics = self._publisher.prepare(
             operation_id=job.operation_id,
             generation=job.generation,
@@ -2456,6 +2459,7 @@ class MCoreRunSlotExecutor:
         self,
         job: GenerationSnapshotJobSpec,
         sink: EventSink,
+        staged: Callable[[], None],
     ) -> dict[str, Any]:
         state = self._require_run(job.run_id)
         self._validate_parent(state, job.training_session_id, job.learner_version)
@@ -2475,6 +2479,7 @@ class MCoreRunSlotExecutor:
                 adapter_config=state.adapter_config,
                 slot_ref=LoRASlotRef("checkpoint", job.run_id),
                 sink=sink,
+                staged=staged,
             )
             return {
                 "operation_id": job.operation_id,
@@ -2490,6 +2495,10 @@ class MCoreRunSlotExecutor:
             raise RuntimeError(
                 "selected generation has no immutable optimizer snapshot"
             )
+        # Run-slot generations are immutable L2/L3 images. A following F/B may
+        # read L1 while rank-plan construction continues; only an optimizer turn
+        # can mutate the selected learner.
+        staged()
         rank_plan, metrics = self._publisher.prepare(
             operation_id=job.operation_id,
             generation=job.generation,
@@ -3528,6 +3537,7 @@ class _GenerationPublisher:
         adapter_config: dict[str, Any],
         slot_ref: "LoRASlotRef | None",
         sink: EventSink,
+        staged: Callable[[], None],
     ) -> tuple[SnapshotRankWritePlan, dict[str, float]]:
         """Prepare rank-owned sampler bytes while the selected learner is resident."""
         self.raise_if_failed()
@@ -3542,6 +3552,7 @@ class _GenerationPublisher:
                 raise RuntimeError(
                     "ordered sampler operation was reused for another snapshot"
                 )
+            staged()
             return cached.plan, {}
         expected_metadata = {
             "run_id": run_id,
@@ -3565,6 +3576,7 @@ class _GenerationPublisher:
             and generation_entry.generation == generation
             and generation_entry.resident_lora is not None
         ):
+            staged()
             return self._prepare_ordered_resident_sampler(
                 operation_id=operation_id,
                 generation=generation,
@@ -3658,6 +3670,7 @@ class _GenerationPublisher:
                     "LoRA readiness collective accepted a missing snapshot stager"
                 )
             self.runtime.optimizer_snapshot_barrier.register(pending, key=run_id)
+            staged()
             resolved = self._submit(
                 self._resolution_pool, self._resolve_ordered_sampler, pending
             )
