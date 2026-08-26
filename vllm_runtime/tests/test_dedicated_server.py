@@ -1,5 +1,6 @@
 import asyncio
 from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
 from http.client import HTTPConnection
 import json
 import os
@@ -27,6 +28,20 @@ _PAYLOAD: dict[str, object] = {
     "process_uuid": "runtime-process",
     "generation": 4,
 }
+
+
+def _fake_vllm_app() -> FastAPI:
+    app = FastAPI()
+
+    @app.post("/v1/chat/completions")
+    async def original_chat_completion():
+        raise AssertionError("ART must replace vLLM's original route")
+
+    @app.post("/v1/completions")
+    async def original_completion():
+        raise AssertionError("ART must replace vLLM's original route")
+
+    return app
 
 
 def _get(
@@ -153,7 +168,9 @@ def test_fast_metrics_url_uses_controller_routable_host(monkeypatch) -> None:
 def test_runtime_sleep_route_returns_engine_validation_error(monkeypatch) -> None:
     from vllm.entrypoints.openai import api_server
 
-    monkeypatch.setattr(api_server, "build_app", lambda *args, **kwargs: FastAPI())
+    monkeypatch.setattr(
+        api_server, "build_app", lambda *args, **kwargs: _fake_vllm_app()
+    )
     monkeypatch.setattr(api_server, "_art_runtime_routes_patched", False, raising=False)
     dedicated_server._patch_art_runtime_routes()
     app = api_server.build_app()
@@ -231,7 +248,9 @@ def test_binary_completion_route_uses_exact_token_prompt(monkeypatch) -> None:
         routes[0] = np.zeros((128, 1, 1), dtype=np.uint8)
         yield routes
 
-    monkeypatch.setattr(api_server, "build_app", lambda *args, **kwargs: FastAPI())
+    monkeypatch.setattr(
+        api_server, "build_app", lambda *args, **kwargs: _fake_vllm_app()
+    )
     monkeypatch.setattr(api_server, "_art_runtime_routes_patched", False, raising=False)
     monkeypatch.setattr(api_router, "create_completion", create_completion)
     monkeypatch.setattr(binary_routes, "capture_routed_experts", capture_routed_experts)
@@ -260,6 +279,139 @@ def test_binary_completion_route_uses_exact_token_prompt(monkeypatch) -> None:
     assert request.prompt == prompt_ids
     assert decoded.choices[0].prompt_token_ids == prompt_ids
     assert routes[0].shape == (128, 1, 1)
+
+
+def test_public_completion_without_route_grant_preserves_native_response(
+    monkeypatch,
+) -> None:
+    from art_vllm_runtime import binary_routes
+    from vllm.entrypoints.openai import api_server
+    from vllm.entrypoints.openai.completion import api_router
+
+    async def create_completion(request, _raw_request):
+        assert getattr(request, "route_upload", None) is None
+        return dedicated_server.JSONResponse(
+            content={
+                "id": "cmpl-public-test",
+                "object": "text_completion",
+                "created": 0,
+                "model": request.model,
+                "choices": [{"index": 0, "text": "ok", "finish_reason": "stop"}],
+                "usage": {
+                    "prompt_tokens": 1,
+                    "completion_tokens": 1,
+                    "total_tokens": 2,
+                },
+            }
+        )
+
+    @contextmanager
+    def forbidden_capture():
+        raise AssertionError("ordinary public inference must not capture routes")
+        yield
+
+    monkeypatch.setattr(
+        api_server, "build_app", lambda *args, **kwargs: _fake_vllm_app()
+    )
+    monkeypatch.setattr(api_server, "_art_runtime_routes_patched", False, raising=False)
+    monkeypatch.setattr(api_router, "create_completion", create_completion)
+    monkeypatch.setattr(binary_routes, "capture_routed_experts", forbidden_capture)
+    dedicated_server._patch_art_runtime_routes()
+    app = api_server.build_app()
+
+    response = TestClient(app).post(
+        "/v1/completions",
+        json={"model": "model", "prompt": [1], "max_tokens": 1},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["choices"][0]["text"] == "ok"
+
+
+def test_public_completion_uploads_routes_and_exposes_event_completion(
+    monkeypatch,
+) -> None:
+    from art_vllm_runtime import binary_routes, patches, route_uploads
+    from vllm.entrypoints.openai import api_server
+    from vllm.entrypoints.openai.completion import api_router
+
+    patches.subclass_chat_completion_request()
+    uploaded: dict[str, object] = {}
+
+    class Uploader:
+        def __init__(self, *, allowed_host_suffixes):
+            assert allowed_host_suffixes == ("test.example",)
+
+        async def put(self, grant, chunks, *, actual_bytes):
+            uploaded["client_reference"] = grant.client_reference
+            uploaded["body"] = b"".join(chunks)
+            uploaded["actual_bytes"] = actual_bytes
+
+        async def close(self):
+            uploaded["closed"] = True
+
+    async def create_completion(request, _raw_request):
+        assert request.route_upload.client_reference == "routes-1"
+        return dedicated_server.JSONResponse(
+            content={
+                "id": "cmpl-public-upload",
+                "object": "text_completion",
+                "created": 0,
+                "model": request.model,
+                "choices": [{"index": 0, "text": "ok", "finish_reason": "stop"}],
+                "usage": {
+                    "prompt_tokens": 1,
+                    "completion_tokens": 1,
+                    "total_tokens": 2,
+                },
+            }
+        )
+
+    @contextmanager
+    def capture_routed_experts():
+        routes = binary_routes._CapturedRoutes(num_experts=8, padding_layers=())
+        routes[0] = np.zeros((2, 1, 1), dtype=np.uint8)
+        yield routes
+
+    monkeypatch.setenv(dedicated_server._ROUTE_UPLOAD_ALLOWED_HOSTS_ENV, "test.example")
+    monkeypatch.setitem(dedicated_server._runtime_state, "binary_routed_experts", True)
+    monkeypatch.setattr(
+        api_server, "build_app", lambda *args, **kwargs: _fake_vllm_app()
+    )
+    monkeypatch.setattr(api_server, "_art_runtime_routes_patched", False, raising=False)
+    monkeypatch.setattr(api_router, "create_completion", create_completion)
+    monkeypatch.setattr(binary_routes, "capture_routed_experts", capture_routed_experts)
+    monkeypatch.setattr(route_uploads, "PresignedPutUploader", Uploader)
+    dedicated_server._patch_art_runtime_routes()
+    app = api_server.build_app()
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/completions",
+            json={
+                "model": "model",
+                "prompt": [1],
+                "max_tokens": 1,
+                "route_upload": {
+                    "url": "https://objects.test.example/bucket/routes-1",
+                    "expires_at": (
+                        datetime.now(timezone.utc) + timedelta(minutes=1)
+                    ).isoformat(),
+                    "max_bytes": 1024,
+                    "client_reference": "routes-1",
+                },
+            },
+        )
+        assert response.status_code == 200
+        operation = response.json()["route_upload"]
+        status = client.get(
+            f"/v1/route_uploads/{operation['operation_id']}/wait?timeout=1"
+        )
+        assert status.json()["state"] == "ready"
+
+    assert uploaded["client_reference"] == "routes-1"
+    assert uploaded["actual_bytes"] == len(uploaded["body"])
+    assert uploaded["closed"] is True
 
 
 @pytest.mark.asyncio

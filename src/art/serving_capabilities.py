@@ -11,7 +11,7 @@ from pydantic import (
     model_validator,
 )
 
-ART_SERVING_PROTOCOL_VERSION = 5
+ART_SERVING_PROTOCOL_VERSION = 6
 
 ServingFeature = Literal[
     "binary_routed_experts",
@@ -19,6 +19,7 @@ ServingFeature = Literal[
     "inplace_lora_load",
     "in_flight_lora_updates",
     "policy_token_spans",
+    "presigned_route_uploads",
 ]
 
 
@@ -64,6 +65,7 @@ class ServingCapabilities(BaseModel):
     inplace_lora_load: bool = False
     in_flight_lora_updates: bool = False
     policy_token_spans: bool = False
+    presigned_route_uploads: bool = False
 
     @model_validator(mode="after")
     def _validate_protocol(self) -> "ServingCapabilities":

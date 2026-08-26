@@ -711,6 +711,8 @@ class Model(
         if self.trainable:
             body["return_token_ids"] = True
             body["return_tokens_as_token_ids"] = True
+            if self._policy_span_mode() == "require":
+                body["return_policy_spans"] = True
         configured_chat_template_kwargs = (
             internal_config.get("chat_template_kwargs")
             if internal_config is not None

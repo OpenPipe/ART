@@ -6,6 +6,7 @@ import pytest
 from art import Model, TrainableModel
 from art.costs import build_cost_calculator, get_model_pricing
 from art.model import _OpenAIChatCompletionsProxy, _OpenAIClientProxy
+from art.serving_capabilities import ART_SERVING_PROTOCOL_VERSION, ServingCapabilities
 
 
 class _FakeUsage:
@@ -247,6 +248,30 @@ class TestModelOpenAIClientCosts:
         assert model._default_chat_completion_extra_body() == {
             "return_token_ids": True,
             "return_tokens_as_token_ids": True,
+            "chat_template_kwargs": {"preserve_thinking": True},
+        }
+
+    def test_trainable_model_requests_policy_spans_only_when_supported(self) -> None:
+        model = TrainableModel(
+            run_name="test-run",
+            name="test-run",
+            project="test-project",
+            base_model="test-model",
+        )
+        object.__setattr__(
+            model,
+            "_serving_capabilities",
+            ServingCapabilities(
+                runtime="art_vllm",
+                protocol_version=ART_SERVING_PROTOCOL_VERSION,
+                policy_token_spans=True,
+            ),
+        )
+
+        assert model._default_chat_completion_extra_body() == {
+            "return_token_ids": True,
+            "return_tokens_as_token_ids": True,
+            "return_policy_spans": True,
             "chat_template_kwargs": {"preserve_thinking": True},
         }
 

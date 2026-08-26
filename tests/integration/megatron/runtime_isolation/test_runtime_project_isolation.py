@@ -64,7 +64,10 @@ def _runtime_python(source: str, artifact_dir: Path, name: str) -> str:
     (artifact_dir / f"{name}_stdout.txt").write_text(result.stdout)
     (artifact_dir / f"{name}_stderr.txt").write_text(result.stderr)
     result.check_returncode()
-    return result.stdout.strip()
+    lines = result.stdout.rstrip().splitlines()
+    if not lines:
+        raise RuntimeError(f"Runtime probe {name!r} produced no result line")
+    return lines[-1]
 
 
 def test_runtime_project_imports_in_its_own_project_env(artifact_dir: Path) -> None:
@@ -91,29 +94,107 @@ def test_runtime_server_source_contains_only_required_custom_routes() -> None:
         assert route in source
 
 
-def test_runtime_patch_always_returns_token_ids(
+def test_runtime_metadata_requires_explicit_request_fields(
     artifact_dir: Path,
 ) -> None:
     payload = _runtime_python(
         "import json; "
-        "from art_vllm_runtime.patches import apply_vllm_runtime_patches; "
-        "apply_vllm_runtime_patches(); "
+        "from art_vllm_runtime.patches import subclass_chat_completion_request; "
+        "subclass_chat_completion_request(); "
         "from vllm.entrypoints.openai.chat_completion import protocol; "
+        "from vllm.entrypoints.openai.completion import protocol as completion_protocol; "
         "request = protocol.ChatCompletionRequest("
         "model='m', messages=[{'role': 'user', 'content': 'x'}]"
+        "); "
+        "completion = completion_protocol.CompletionRequest("
+        "model='m', prompt=[1], max_tokens=1"
         "); "
         "print(json.dumps({"
         "'logprobs': request.logprobs, "
         "'top_logprobs': request.top_logprobs, "
-        "'return_token_ids': request.return_token_ids"
+        "'return_token_ids': request.return_token_ids, "
+        "'return_policy_spans': request.return_policy_spans, "
+        "'completion_return_policy_spans': completion.return_policy_spans"
         "}))",
         artifact_dir,
         "route_token_ids",
     )
     assert json.loads(payload) == {
-        "logprobs": True,
+        "logprobs": False,
         "top_logprobs": 0,
-        "return_token_ids": True,
+        "return_token_ids": None,
+        "return_policy_spans": False,
+        "completion_return_policy_spans": False,
+    }
+
+
+def test_runtime_policy_spans_cover_prompt_and_decode_forward_tokens(
+    artifact_dir: Path,
+) -> None:
+    payload = _runtime_python(
+        """
+import json
+from types import SimpleNamespace
+from art_vllm_runtime.policy_spans import (
+    ART_POLICY_TOKEN_SPANS_FIELD,
+    ART_PROMPT_POLICY_TOKEN_SPANS_FIELD,
+    _append_absolute_prompt_spans,
+    _attach_policy_spans_to_model_output,
+)
+
+accumulated = []
+for policy_version, update_seq, prompt_span, sampled in (
+    (4, 7, (1, 3), [],),
+    (5, 8, (3, 6), [42, 43]),
+):
+    output = SimpleNamespace(req_ids=["request"], sampled_token_ids=[sampled])
+    _attach_policy_spans_to_model_output(output, {
+        "request": {
+            "prompt_span": prompt_span,
+            "prompt_tokens": 6,
+            "policy_version": policy_version,
+            "lora_slot": "slot",
+            "update_seq": update_seq,
+        }
+    })
+    prompt = getattr(output, ART_PROMPT_POLICY_TOKEN_SPANS_FIELD, {}).get(
+        "request", []
+    )
+    _append_absolute_prompt_spans(accumulated, prompt)
+    if sampled:
+        completion = getattr(output, ART_POLICY_TOKEN_SPANS_FIELD)["request"]
+
+print(json.dumps({"prompt": accumulated, "completion": completion}))
+""",
+        artifact_dir,
+        "prompt_decode_policy_spans",
+    )
+    assert json.loads(payload) == {
+        "prompt": [
+            {
+                "start_token": 1,
+                "end_token": 3,
+                "policy_version": 4,
+                "lora_slot": "slot",
+                "update_seq": 7,
+            },
+            {
+                "start_token": 3,
+                "end_token": 6,
+                "policy_version": 5,
+                "lora_slot": "slot",
+                "update_seq": 8,
+            },
+        ],
+        "completion": [
+            {
+                "start_token": 0,
+                "end_token": 2,
+                "policy_version": 5,
+                "lora_slot": "slot",
+                "update_seq": 8,
+            }
+        ],
     }
 
 

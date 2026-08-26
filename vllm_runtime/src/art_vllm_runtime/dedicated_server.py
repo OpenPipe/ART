@@ -3,6 +3,7 @@
 import argparse
 import asyncio
 from functools import lru_cache
+import hashlib
 from http import HTTPStatus
 from ipaddress import ip_address
 import json
@@ -26,13 +27,16 @@ from art_vllm_runtime.binary_routes import (
 from art_vllm_runtime.fast_metrics import FastMetricsSidecar
 from art_vllm_runtime.patches import apply_vllm_runtime_patches
 
-ART_SERVING_PROTOCOL_VERSION = 5
+ART_SERVING_PROTOCOL_VERSION = 6
 _runtime_state: dict[str, object] = {}
 _auth_tokens: list[str] = []
 _fast_metrics_port: int | None = None
 _LORA_UPDATE_PATH = "/art/in_flight_lora_update"
 _ASGI_STARTED_AT = "art_lora_update_asgi_started_at"
 _BODY_RECEIVED_AT = "art_lora_update_body_received_at"
+_ROUTE_UPLOAD_MANAGER_STATE = "art_route_upload_manager"
+_ROUTE_UPLOAD_ALLOWED_HOSTS_ENV = "ART_ROUTE_UPLOAD_ALLOWED_HOST_SUFFIXES"
+_AUTHENTICATED_PRINCIPAL_SCOPE_KEY = "art.authenticated_principal"
 
 
 def _patch_prebound_listener_tcp_nodelay(api_server: Any) -> None:
@@ -56,6 +60,32 @@ def _art_metrics_snapshot() -> dict[str, Any]:
         generation=_runtime_state["generation"],
     )
     return snapshot
+
+
+def _route_upload_owner(request: Any) -> str:
+    """Derive an opaque status owner from normal inference authentication."""
+
+    principal = request.scope.get(_AUTHENTICATED_PRINCIPAL_SCOPE_KEY)
+    if isinstance(principal, str) and principal:
+        value = f"principal\0{principal}"
+        return hashlib.blake2s(value.encode(), digest_size=16).hexdigest()
+    authorization = request.headers.get("authorization", "")
+    if not authorization:
+        return "unauthenticated-local-runtime"
+    value = f"authorization\0{authorization}"
+    return hashlib.blake2s(value.encode(), digest_size=16).hexdigest()
+
+
+def _route_upload_manager(request: Any) -> Any | None:
+    return getattr(request.app.state, _ROUTE_UPLOAD_MANAGER_STATE, None)
+
+
+def _route_upload_allowed_host_suffixes() -> tuple[str, ...]:
+    return tuple(
+        value.strip()
+        for value in os.environ.get(_ROUTE_UPLOAD_ALLOWED_HOSTS_ENV, "").split(",")
+        if value.strip()
+    )
 
 
 def _fast_metrics_url(request: Any) -> str:
@@ -310,7 +340,15 @@ def _patch_art_runtime_routes() -> None:
 
     from art_vllm_runtime.binary_routes import (
         capture_routed_experts,
+        routed_experts_object_chunks,
         routed_experts_response_chunks,
+    )
+    from art_vllm_runtime.route_uploads import (
+        PresignedPutUploader,
+        RouteUploadError,
+        RouteUploadForbidden,
+        RouteUploadManager,
+        RouteUploadNotFound,
     )
 
     if getattr(api_server, "_art_runtime_routes_patched", False):
@@ -321,6 +359,13 @@ def _patch_art_runtime_routes() -> None:
 
     def art_build_app(*build_args: object, **build_kwargs: object) -> FastAPI:
         app = original_build_app(*build_args, **build_kwargs)
+        allowed_hosts = _route_upload_allowed_host_suffixes()
+        if allowed_hosts:
+            route_upload_manager = RouteUploadManager(
+                PresignedPutUploader(allowed_host_suffixes=allowed_hosts)
+            )
+            setattr(app.state, _ROUTE_UPLOAD_MANAGER_STATE, route_upload_manager)
+            app.router.add_event_handler("shutdown", route_upload_manager.close)
         router = APIRouter()
 
         def engine(request: Request):
@@ -381,7 +426,63 @@ def _patch_art_runtime_routes() -> None:
                     "policy_token_spans": bool(
                         _runtime_state.get("policy_token_spans", False)
                     ),
+                    "presigned_route_uploads": (
+                        _route_upload_manager(raw_request) is not None
+                        and bool(_runtime_state.get("binary_routed_experts", False))
+                    ),
                 }
+            )
+
+        @router.post(
+            "/v1/chat/completions",
+            dependencies=[Depends(validate_json_request)],
+        )
+        async def public_chat_completion(
+            request: ChatCompletionRequest, raw_request: Request
+        ) -> Response:
+            if getattr(request, "return_policy_spans", False) and request.stream:
+                return JSONResponse(
+                    content={"error": "policy spans require stream=false"},
+                    status_code=HTTPStatus.BAD_REQUEST.value,
+                )
+            if getattr(request, "route_upload", None) is None:
+                response = await create_chat_completion(request, raw_request)
+                return response if response is not None else Response(status_code=499)
+            if request.stream:
+                return JSONResponse(
+                    content={"error": "route upload requires stream=false"},
+                    status_code=HTTPStatus.BAD_REQUEST.value,
+                )
+            return await _generate_routed_response(
+                request,
+                raw_request,
+                lambda: create_chat_completion(request, raw_request),
+            )
+
+        @router.post(
+            "/v1/completions",
+            dependencies=[Depends(validate_json_request)],
+        )
+        async def public_completion(
+            request: CompletionRequest, raw_request: Request
+        ) -> Response:
+            if getattr(request, "return_policy_spans", False) and request.stream:
+                return JSONResponse(
+                    content={"error": "policy spans require stream=false"},
+                    status_code=HTTPStatus.BAD_REQUEST.value,
+                )
+            if getattr(request, "route_upload", None) is None:
+                response = await create_completion(request, raw_request)
+                return response if response is not None else Response(status_code=499)
+            if request.stream:
+                return JSONResponse(
+                    content={"error": "route upload requires stream=false"},
+                    status_code=HTTPStatus.BAD_REQUEST.value,
+                )
+            return await _generate_routed_response(
+                request,
+                raw_request,
+                lambda: create_completion(request, raw_request),
             )
 
         @router.post(
@@ -396,9 +497,11 @@ def _patch_art_runtime_routes() -> None:
                     content={"error": "ART binary routed experts require stream=false"},
                     status_code=HTTPStatus.BAD_REQUEST.value,
                 )
-            with capture_routed_experts() as routes:
-                response = await create_chat_completion(request, raw_request)
-            return _routed_response(response, routes)
+            return await _generate_routed_response(
+                request,
+                raw_request,
+                lambda: create_chat_completion(request, raw_request),
+            )
 
         @router.post(
             "/art/v1/completions",
@@ -425,9 +528,77 @@ def _patch_art_runtime_routes() -> None:
                     },
                     status_code=HTTPStatus.BAD_REQUEST.value,
                 )
-            with capture_routed_experts() as routes:
-                response = await create_completion(request, raw_request)
-            return _routed_response(response, routes)
+            return await _generate_routed_response(
+                request,
+                raw_request,
+                lambda: create_completion(request, raw_request),
+            )
+
+        async def _generate_routed_response(
+            request: Any,
+            raw_request: Request,
+            generate: Any,
+        ) -> Response:
+            grant = getattr(request, "route_upload", None)
+            lease = None
+            if grant is not None:
+                if not bool(_runtime_state.get("binary_routed_experts", False)):
+                    return JSONResponse(
+                        content={"error": "routed-expert capture is disabled"},
+                        status_code=HTTPStatus.SERVICE_UNAVAILABLE.value,
+                    )
+                manager = _route_upload_manager(raw_request)
+                if manager is None:
+                    return JSONResponse(
+                        content={"error": "presigned route uploads are disabled"},
+                        status_code=HTTPStatus.SERVICE_UNAVAILABLE.value,
+                    )
+                try:
+                    lease = await manager.reserve(
+                        owner_id=_route_upload_owner(raw_request),
+                        request_id=str(
+                            getattr(request, "request_id", None)
+                            or grant.client_reference
+                        ),
+                        grant=grant,
+                    )
+                except RouteUploadError as error:
+                    return JSONResponse(
+                        content={"error": str(error)},
+                        status_code=HTTPStatus.BAD_REQUEST.value,
+                    )
+            if lease is None:
+                with capture_routed_experts() as routes:
+                    response = await generate()
+                return _routed_response(response, routes)
+            async with lease:
+                with capture_routed_experts() as routes:
+                    response = await generate()
+                if response is None:
+                    await lease.fail("generation was cancelled")
+                    return Response(status_code=499)
+                if response.status_code >= HTTPStatus.BAD_REQUEST.value:
+                    await lease.fail(
+                        f"generation failed with HTTP {response.status_code}"
+                    )
+                    return response
+                if not routes:
+                    await lease.fail("vLLM returned no routed experts")
+                    return JSONResponse(
+                        content={"error": "vLLM returned no routed experts"},
+                        status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value,
+                    )
+                try:
+                    future = await lease.publish(routed_experts_object_chunks(routes))
+                except RouteUploadError as error:
+                    return JSONResponse(
+                        content={
+                            "error": str(error),
+                            "route_upload": lease.future.model_dump(mode="json"),
+                        },
+                        status_code=HTTPStatus.REQUEST_ENTITY_TOO_LARGE.value,
+                    )
+                return _route_upload_response(response, future)
 
         def _routed_response(response: Response | None, routes: Any) -> Response:
             if response is None:
@@ -456,6 +627,67 @@ def _patch_art_runtime_routes() -> None:
                 media_type="application/vnd.art.routed-experts-v2",
                 headers=headers,
             )
+
+        def _route_upload_response(response: Response, future: Any) -> Response:
+            try:
+                content = json.loads(response.body)
+            except (TypeError, ValueError) as error:
+                raise RuntimeError(
+                    "vLLM returned a non-JSON response for route upload"
+                ) from error
+            content["route_upload"] = future.model_dump(mode="json")
+            headers = {
+                key: value
+                for key, value in response.headers.items()
+                if key.lower() != "content-length"
+            }
+            return JSONResponse(
+                content=content,
+                status_code=response.status_code,
+                headers=headers,
+            )
+
+        async def _route_upload_status(
+            operation_id: str, raw_request: Request, wait_s: float
+        ) -> JSONResponse:
+            manager = _route_upload_manager(raw_request)
+            if manager is None:
+                return JSONResponse(
+                    content={"error": "presigned route uploads are disabled"},
+                    status_code=HTTPStatus.SERVICE_UNAVAILABLE.value,
+                )
+            try:
+                future = await manager.wait(
+                    owner_id=_route_upload_owner(raw_request),
+                    operation_id=operation_id,
+                    timeout_s=wait_s,
+                )
+            except RouteUploadNotFound as error:
+                return JSONResponse(
+                    content={"error": str(error)},
+                    status_code=HTTPStatus.NOT_FOUND.value,
+                )
+            except RouteUploadForbidden as error:
+                return JSONResponse(
+                    content={"error": str(error)},
+                    status_code=HTTPStatus.FORBIDDEN.value,
+                )
+            return JSONResponse(content=future.model_dump(mode="json"))
+
+        @router.get("/v1/route_uploads/{operation_id}")
+        async def route_upload_status(
+            operation_id: str,
+            raw_request: Request,
+        ) -> JSONResponse:
+            return await _route_upload_status(operation_id, raw_request, 0.0)
+
+        @router.get("/v1/route_uploads/{operation_id}/wait")
+        async def wait_for_route_upload(
+            operation_id: str,
+            raw_request: Request,
+            timeout: float = Query(default=30.0, ge=0.0, le=30.0),
+        ) -> JSONResponse:
+            return await _route_upload_status(operation_id, raw_request, timeout)
 
         @router.post("/art/reset_prefix_cache")
         async def reset_prefix_cache(
@@ -756,6 +988,19 @@ def _patch_art_runtime_routes() -> None:
                         )
                     raise
 
+        for path in ("/v1/chat/completions", "/v1/completions"):
+            matches = [
+                route
+                for route in app.router.routes
+                if getattr(route, "path", None) == path
+                and "POST" in (getattr(route, "methods", None) or ())
+            ]
+            if len(matches) != 1:
+                raise RuntimeError(
+                    f"ART expected one vLLM generation route for {path}, "
+                    f"found {len(matches)}"
+                )
+            app.router.routes.remove(matches[0])
         app.include_router(router)
         return app
 
