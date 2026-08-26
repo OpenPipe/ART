@@ -79,7 +79,8 @@ _QUEUE_WAIT_TIME_KEY = "_art_queue_wait_s"
 _PIPELINE_SHUTDOWN_TIMEOUT_SECONDS = process_shutdown_timeout(1)
 _PIPELINE_STAGE_GRACE_FRACTION = 0.25
 _PIPELINE_STAGE_CANCEL_FRACTION = 0.5
-_PIPELINE_OPTIONAL_DRAIN_FRACTION = 0.75
+_PIPELINE_TRAINING_DRAIN_FRACTION = 0.75
+_PIPELINE_OPTIONAL_DRAIN_FRACTION = 0.9
 _SCORE_FRESHNESS_TAU_STEPS = 8.0
 # Rollout critical batch size from the best current GRPO/RLVR evidence. This is
 # grounded in reported experiments, not a well-validated universal constant.
@@ -700,20 +701,38 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                     return_when=asyncio.FIRST_COMPLETED,
                 )
                 if not done:
-                    failures.append(
-                        _PipelineStageShutdownTimeout(
-                            f"{len(stages)} pipeline stages did not stop cooperatively "
-                            "before the stage shutdown cutoff."
+                    training = {
+                        task
+                        for task in stages
+                        if task.get_name() == "training_stage"
+                        and not self._shutdown_failed_event.is_set()
+                    }
+                    interruptible = stages - training
+                    if interruptible:
+                        failures.append(
+                            _PipelineStageShutdownTimeout(
+                                f"{len(interruptible)} pipeline stages did not stop "
+                                "cooperatively before the stage shutdown cutoff."
+                            )
                         )
-                    )
+                        failures.extend(
+                            await settle_tasks(
+                                interruptible,
+                                cancel=True,
+                                deadline=self._shutdown_phase_deadline(
+                                    _PIPELINE_STAGE_CANCEL_FRACTION
+                                ),
+                                description="pipeline stages",
+                                ownership=self._shutdown_owned_tasks,
+                            )
+                        )
                     failures.extend(
                         await settle_tasks(
-                            stages,
-                            cancel=True,
+                            training,
                             deadline=self._shutdown_phase_deadline(
-                                _PIPELINE_STAGE_CANCEL_FRACTION
+                                _PIPELINE_TRAINING_DRAIN_FRACTION
                             ),
-                            description="pipeline stages",
+                            description="active pipeline training command",
                             ownership=self._shutdown_owned_tasks,
                         )
                     )
@@ -1472,10 +1491,26 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                     await self._packed_queue.put(None)
                     return
                 continue
+            if not self._accept_prepared_batches:
+                await context.abort(None, None, None, optimizer_admitted=False)
+                return
             forward: TrainingOperation[ForwardBackwardResult] | None = None
-            try:
-                if self._admission_tail is not None:
+            if self._admission_tail is not None:
+                try:
                     await asyncio.shield(self._admission_tail)
+                except BaseException as primary:
+                    try:
+                        await context.abort(None, None, None, optimizer_admitted=False)
+                    except BaseException as cleanup:
+                        raise BaseExceptionGroup(
+                            "pipeline admission-tail wait and cleanup failed",
+                            [primary, cleanup],
+                        ) from None
+                    raise
+            if not self._accept_prepared_batches:
+                await context.abort(None, None, None, optimizer_admitted=False)
+                return
+            try:
                 submit_started = time.monotonic()
                 forward = await context.forward_backward(
                     context.client.next_sequence_id

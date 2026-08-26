@@ -127,6 +127,73 @@ async def test_clean_stop_finalizes_owner_without_failure_mode(tmp_path: Path) -
 
 
 @pytest.mark.asyncio
+async def test_clean_stop_drains_admitted_training_past_stage_grace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(trainer_module, "_PIPELINE_SHUTDOWN_TIMEOUT_SECONDS", 0.2)
+    trainer = _trainer(tmp_path, _Backend())
+    completed = asyncio.Event()
+
+    async def training_stage() -> None:
+        trainer._backend_training_started = True
+        trainer.request_stop()
+        await asyncio.sleep(0.08)
+        completed.set()
+
+    _replace_stages(trainer, training_stage)
+
+    await asyncio.wait_for(trainer.train(handle_signals=False), timeout=1.0)
+    assert completed.is_set()
+    assert not _pipeline_tasks()
+
+
+@pytest.mark.asyncio
+async def test_stop_during_prepare_aborts_without_forward_backward(
+    tmp_path: Path,
+) -> None:
+    backend = _Backend()
+    trainer = _trainer(tmp_path, backend)
+    trainer._packed_queue = asyncio.Queue()
+    prepare_started = asyncio.Event()
+    release_prepare = asyncio.Event()
+    forward_calls = 0
+    abort_calls = 0
+
+    class Context:
+        preparation_metrics: dict[str, float] = {}
+        client = SimpleNamespace(next_sequence_id=0)
+
+        async def forward_backward(self, _sequence_id: int):
+            nonlocal forward_calls
+            forward_calls += 1
+            raise AssertionError("forward_backward must not be admitted after stop")
+
+        async def abort(self, *_args, **_kwargs) -> None:
+            nonlocal abort_calls
+            abort_calls += 1
+
+    async def collect_batch(_step: int):
+        return [object()], 0, False
+
+    async def prepare(*_args, **_kwargs):
+        prepare_started.set()
+        await release_prepare.wait()
+        return Context()
+
+    trainer._collect_batch = collect_batch  # type: ignore[method-assign]
+    backend.prepare_pipeline_commands = prepare  # type: ignore[attr-defined]
+    packing = asyncio.create_task(trainer._packing_stage())
+    await prepare_started.wait()
+    trainer.request_stop()
+    release_prepare.set()
+    await asyncio.wait_for(packing, timeout=1.0)
+
+    assert forward_calls == 0
+    assert abort_calls == 1
+    assert trainer._packed_queue.empty()
+
+
+@pytest.mark.asyncio
 async def test_failed_pipeline_closes_backend_owned_publication_and_joins_wrappers(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -201,7 +268,7 @@ async def test_stubborn_stage_is_cancelled_and_joined(
     await started.wait()
     trainer.request_stop()
 
-    with pytest.raises(TimeoutError, match="stage shutdown cutoff"):
+    with pytest.raises(TimeoutError, match="active pipeline training command"):
         await operation
     assert cancelled.is_set()
     assert not _pipeline_tasks()
@@ -254,8 +321,8 @@ async def test_cancellation_suppressing_stage_is_retained_without_blocking_clean
     assert isinstance(error, BaseException)
     leaves = trainer_module.unique_exception_leaves((error,))
     assert any(
-        str(failure)
-        == "1 live task(s) remain in pipeline stages after the pipeline shutdown deadline."
+        str(failure) == "1 live task(s) remain in active pipeline training command "
+        "after the pipeline shutdown deadline."
         for failure in leaves
     )
     assert data_released.is_set() and leases_released.is_set()
