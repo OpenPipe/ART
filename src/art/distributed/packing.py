@@ -465,6 +465,7 @@ class PackingResult(BaseModel):
     trainable_assistant_tokens: int = Field(default=0, ge=0)
     loss_bearing_tokens: int = Field(default=0, ge=0)
     non_padding_tokens: int = Field(default=0, ge=0)
+    num_dropped_trajectories: int = Field(default=0, ge=0)
     trajectory_log_path: str | None = None
     trajectory_fetch_s: float = Field(default=0.0, ge=0)
     trajectory_receive_s: float = Field(default=0.0, ge=0)
