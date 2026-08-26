@@ -574,7 +574,7 @@ def _packed_input_fingerprint(prepared: Any) -> str:
     return _packed_batch_fingerprint(prepared)
 
 
-async def _execute_pipeline_commands(prepared: Any) -> Any:
+async def _execute_pipeline_commands(prepared: Any) -> tuple[Any, Any]:
     forward = optimizer = sampler = None
     try:
         submit_started = time.monotonic()
@@ -601,11 +601,14 @@ async def _execute_pipeline_commands(prepared: Any) -> Any:
             sampler=sampler,
             state=state,
         )
-        return await prepared.complete(
-            step=step,
-            forward=forward,
-            optimizer=optimizer,
-            forward_submit_s=forward_submit_s,
+        return (
+            await prepared.complete(
+                step=step,
+                forward=forward,
+                optimizer=optimizer,
+                forward_submit_s=forward_submit_s,
+            ),
+            sampler,
         )
     except BaseException:
         await prepared.abort(
@@ -1324,11 +1327,11 @@ async def _run_isolated_backend_phase(
         except BaseException:
             await _discard_prepared_pipeline_context(prepared)
             raise
-        result = await _execute_pipeline_commands(prepared)
+        result, sampler = await _execute_pipeline_commands(prepared)
         if sample_index >= _ISOLATED_WARMUP_STEPS:
             packed_input_fingerprints.append(current_packed_fingerprint)
             samples.append((result.metrics, int(result.step)))
-        await service.wait_for_serving(int(result.step))
+        await _activation_event(service, int(result.step), sampler)
     trajectory_input_fingerprint, packed_input_fingerprint = (
         _matched_input_fingerprints(
             [captured.trajectory_fingerprint for captured in captured_inputs],
