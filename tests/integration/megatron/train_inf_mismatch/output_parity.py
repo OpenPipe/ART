@@ -1070,17 +1070,20 @@ def _run_logits(
             context_parallel_size=topology.cp,
         )
         _set_hybridep_token_count(int(input_ids.numel()))
-    with torch.no_grad():
-        logits = runtime.model[0](
-            input_ids=input_ids,
-            position_ids=position_ids,
-            attention_mask=torch.zeros((1, 1, 1, 1), dtype=torch.bool, device=device),
-            labels=None,
-            **runtime.model_support_handler.get_forward_kwargs(
-                runtime.model[0],
-                attention_bias=attention_state,
-            ),
+    forward_kwargs = dict(
+        input_ids=input_ids,
+        position_ids=position_ids,
+        attention_mask=torch.zeros((1, 1, 1, 1), dtype=torch.bool, device=device),
+        labels=None,
+    )
+    forward_kwargs.update(
+        runtime.model_support_handler.get_forward_kwargs(
+            runtime.model[0],
+            attention_bias=attention_state,
         )
+    )
+    with torch.no_grad():
+        logits = runtime.model[0](**forward_kwargs)
         from megatron.core import parallel_state, tensor_parallel
 
         if (
@@ -1268,17 +1271,20 @@ def _score_context_parallel_once(
             prepared_micro.local_token_uids,
         ),
     ):
-        logits = model_chunks[0](
+        forward_kwargs = dict(
             input_ids=prepared_micro.model_tokens,
             position_ids=prepared_micro.model_input_pos,
             attention_mask=torch.zeros((1, 1, 1, 1), dtype=torch.bool, device=device),
             labels=None,
             packed_seq_params=prepared_micro.packed_seq_params,
-            **runtime.model_support_handler.get_forward_kwargs(
+        )
+        forward_kwargs.update(
+            runtime.model_support_handler.get_forward_kwargs(
                 model_chunks[0],
                 attention_bias=prepared_micro.attention_state,
-            ),
+            )
         )
+        logits = model_chunks[0](**forward_kwargs)
     if ps.get_tensor_model_parallel_world_size() > 1:
         logits = tensor_parallel.gather_from_tensor_model_parallel_region(logits)
     logical_uids = logical_logit_uids(
