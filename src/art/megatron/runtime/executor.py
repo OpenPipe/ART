@@ -505,9 +505,7 @@ def _stage_sft_rank_result(
     try:
         builder = staging.stager.begin()
         telemetry = cast(PendingRankCommandTelemetry, result["telemetry"])
-        staged: dict[str, Any] = {
-            "statistics": builder.stage(telemetry.statistics)
-        }
+        staged: dict[str, Any] = {"statistics": builder.stage(telemetry.statistics)}
         if coordinator and job.return_token_logprobs:
             values = result["logprob_values"]
             present = result["logprob_present"]
@@ -736,6 +734,14 @@ class MegatronTrainJobExecutor:
         batch: InMemoryPackedBatch,
         cancelled: Event,
     ) -> dict[str, Any]:
+        return self.start_forward_backward(job, batch, cancelled).materialize()
+
+    def start_forward_backward(
+        self,
+        job: ForwardBackwardJobSpec,
+        batch: InMemoryPackedBatch,
+        cancelled: Event,
+    ) -> ForwardBackwardRankLaunch:
         if self._closing or self._closed:
             raise RuntimeError("Megatron executor is closed")
         validate_packed_batch(batch)
@@ -763,7 +769,7 @@ class MegatronTrainJobExecutor:
             batch,
             result,
             coordinator=int(self.runtime.rank) == 0,
-        ).materialize()
+        )
 
     def execute_forward(
         self,
@@ -1462,7 +1468,9 @@ class MCoreRunSlotExecutor:
         try:
             fingerprint, future = self._registration_preparations[registration.run_id]
         except KeyError as error:
-            raise RuntimeError("run registration preparation was not started") from error
+            raise RuntimeError(
+                "run registration preparation was not started"
+            ) from error
         if fingerprint != registration.model_dump_json():
             raise RuntimeError("run registration preparation identity changed")
         if future.done():
@@ -1475,9 +1483,7 @@ class MCoreRunSlotExecutor:
     ) -> RankLocalOptimizerWorkSummary:
         if not self.run_registration_prepared(registration):
             raise RuntimeError("run registration preparation is not complete")
-        _fingerprint, future = self._registration_preparations.pop(
-            registration.run_id
-        )
+        _fingerprint, future = self._registration_preparations.pop(registration.run_id)
         prepared = future.result()
         self.commit_run_registration(prepared)
         return prepared.optimizer_work
@@ -1598,10 +1604,7 @@ class MCoreRunSlotExecutor:
             return False
         if command_kind in {"forward", "forward_backward"}:
             keys = (desired.weights,)
-            if (
-                command_kind == "forward_backward"
-                and desired.accumulator is not None
-            ):
+            if command_kind == "forward_backward" and desired.accumulator is not None:
                 keys += (desired.accumulator,)
         elif command_kind == "optim_step":
             keys = tuple(
@@ -1830,10 +1833,8 @@ class MCoreRunSlotExecutor:
                 expected_global_token_count=expected_tokens,
                 group=ps.get_data_parallel_group(with_context_parallel=True),
             )
-            reduced_gradients = (
-                self._slot_trainer.reduce_checkpoint_slot_gradient_sums(
-                    job.run_id, accumulated.gradients
-                )
+            reduced_gradients = self._slot_trainer.reduce_checkpoint_slot_gradient_sums(
+                job.run_id, accumulated.gradients
             )
             if accumulated.reduction == "token_mean":
                 torch._foreach_div_(reduced_gradients, global_tokens)
@@ -2283,7 +2284,9 @@ class MCoreRunSlotExecutor:
                 TimeoutError(f"{len(pending)} run residency retirements timed out")
             )
         if not failures and self._residency.keys(run_id):
-            failures.append(RuntimeError("Megatron run cleanup left resident resources"))
+            failures.append(
+                RuntimeError("Megatron run cleanup left resident resources")
+            )
         if failures:
             if len(failures) == 1:
                 raise failures[0]
@@ -2689,9 +2692,9 @@ class _GenerationPublisher:
         self._object_publications: dict[str, Future[OptimizerAdapter]] = {}
         # Keep one active publication cohort and one recent shape cohort.
         self._lora_layout_capacity = 2 * capacity
-        self._lora_layouts: OrderedDict[
-            tuple[Any, ...], SafetensorsLayout
-        ] = OrderedDict()
+        self._lora_layouts: OrderedDict[tuple[Any, ...], SafetensorsLayout] = (
+            OrderedDict()
+        )
         self._cache: dict[str, _CachedGeneration] = {}
         self._latest_by_run: dict[str, str] = {}
         self._prepared: dict[str, _PreparedRankSnapshot] = {}
@@ -3138,7 +3141,10 @@ class _GenerationPublisher:
             "generation_id": generation.generation_id,
             "policy_step": str(generation.policy_step),
         }
-        if any(target.metadata.get(key) != value for key, value in expected_metadata.items()):
+        if any(
+            target.metadata.get(key) != value
+            for key, value in expected_metadata.items()
+        ):
             raise RuntimeError(
                 "ordered sampler target identifies another learner generation"
             )
@@ -3188,9 +3194,7 @@ class _GenerationPublisher:
         local_error: BaseException | None = None
         try:
             try:
-                wait_s, in_flight, stager = self._acquire_slot(
-                    protected_run_id=run_id
-                )
+                wait_s, in_flight, stager = self._acquire_slot(protected_run_id=run_id)
                 handler = self.runtime.model_support_handler
                 packed_groups = handler.expert_packed_lora_groups()
                 local_tensors, local_metadata = collect_local_lora_entries(
@@ -3494,23 +3498,27 @@ class _GenerationPublisher:
         identity_s = time.perf_counter() - identity_started
         adapter = OptimizerAdapter(
             identity=str(
-                canonical_adapter_path(
-                    staging_adapter_path, generation.policy_step
-                )
+                canonical_adapter_path(staging_adapter_path, generation.policy_step)
             ),
             training_session_id=generation.training_session_id,
             step=generation.policy_step,
             generation_id=generation.generation_id,
             files=checkpoint.files,
         )
-        return prepared, checkpoint, local_write, adapter, {
-            "snapshot_rank_sharded_prepare_s": time.perf_counter() - started,
-            "snapshot_rank_sharded_identity_s": identity_s,
-            "snapshot_rank_sharded_local_bytes": float(
-                sum(shard.size_bytes for shard in local_write.shards)
-            ),
-            "snapshot_rank_sharded_local_shards": float(len(local_write.shards)),
-        }
+        return (
+            prepared,
+            checkpoint,
+            local_write,
+            adapter,
+            {
+                "snapshot_rank_sharded_prepare_s": time.perf_counter() - started,
+                "snapshot_rank_sharded_identity_s": identity_s,
+                "snapshot_rank_sharded_local_bytes": float(
+                    sum(shard.size_bytes for shard in local_write.shards)
+                ),
+                "snapshot_rank_sharded_local_shards": float(len(local_write.shards)),
+            },
+        )
 
     def prepare(
         self,
@@ -3568,8 +3576,10 @@ class _GenerationPublisher:
                     entry, generation, staging_adapter_path, contexts
                 )
             adapter = (
-                durable_adapter if rank == 0 and durable_adapter is not None
-                else existing_adapter if rank == 0
+                durable_adapter
+                if rank == 0 and durable_adapter is not None
+                else existing_adapter
+                if rank == 0
                 else None
             )
             transport_adapter = None
@@ -3588,9 +3598,7 @@ class _GenerationPublisher:
                 if wants_adapter_payload and entry.resident_lora is not None
                 else None
             )
-            needs_adapter_payload = rank == 0 and (
-                wants_adapter_payload
-            )
+            needs_adapter_payload = rank == 0 and (wants_adapter_payload)
             if needs_adapter_payload:
                 lora, tensors = contexts.enter_context(
                     self._lora_snapshot(entry, adapter, consolidated_lora)
@@ -3662,9 +3670,7 @@ class _GenerationPublisher:
                             file.model_copy(update={"sha256": None})
                             for file in exact_files
                         )
-                        if isinstance(
-                            adapter_object_target, OrderedBinaryObjectTarget
-                        )
+                        if isinstance(adapter_object_target, OrderedBinaryObjectTarget)
                         else exact_files
                     )
                     transport_adapter = OptimizerAdapter(
@@ -4126,9 +4132,7 @@ class _GenerationPublisher:
                 and resident_lora.prepared.exception() is None
             ):
                 if self._residency is None:
-                    raise RuntimeError(
-                        "resident LoRA source has no residency manager"
-                    )
+                    raise RuntimeError("resident LoRA source has no residency manager")
                 try:
                     retirement = self._residency.retire_async(resident_lora.key)
                     retirement_started = True
@@ -4230,7 +4234,9 @@ class _GenerationPublisher:
     ) -> Iterator[tuple[Any, PreparedSafetensors]]:
         if entry.resident_lora is not None:
             if consolidated_lora is None:
-                raise RuntimeError("resident LoRA consolidation returned no rank-zero value")
+                raise RuntimeError(
+                    "resident LoRA consolidation returned no rank-zero value"
+                )
             yield consolidated_lora, self._prepare_lora_tensors(consolidated_lora)
             return
         snapshot = entry.resolved.result()
@@ -4344,7 +4350,9 @@ class _GenerationPublisher:
             )
 
             if not isinstance(distributed, PreparedRankDistributedLora):
-                raise RuntimeError("ordered publication has an invalid distributed payload")
+                raise RuntimeError(
+                    "ordered publication has an invalid distributed payload"
+                )
             target = prepared.adapter_object_target
             if not isinstance(target, OrderedBinaryObjectTarget):
                 raise RuntimeError(
@@ -4610,8 +4618,7 @@ class _GenerationPublisher:
         planned_files = {file.name: file for file in planned.files}
         source_files: dict[str, tuple[memoryview, ...]] = {
             "adapter_model.safetensors": tuple(
-                memoryview(chunk.numpy()).cast("B")
-                for chunk in payload.tensors.chunks
+                memoryview(chunk.numpy()).cast("B") for chunk in payload.tensors.chunks
             ),
             "adapter_config.json": (memoryview(payload.config),),
         }
@@ -4624,8 +4631,7 @@ class _GenerationPublisher:
                 target,
                 source_files,
                 file_sha256={
-                    name: cast(str, file.sha256)
-                    for name, file in planned_files.items()
+                    name: cast(str, file.sha256) for name, file in planned_files.items()
                 },
             )
         published_files = {file.relative_path: file for file in ref.files}

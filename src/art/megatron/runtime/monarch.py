@@ -993,6 +993,76 @@ class MonarchTrainerActor(Actor):
             if batch is not None:
                 batch.close()
 
+    @endpoint(explicit_response_port=True)
+    def start_forward_backward(
+        self,
+        response_port: Port[dict[str, Any]],
+        job_json: str,
+        batch_json: str,
+        ready_port: Port[dict[str, Any]],
+    ) -> None:
+        batch = None
+        ready = False
+        job = None
+        try:
+            job = ForwardBackwardJobSpec.model_validate_json(job_json)
+            if not self._valid:
+                raise RuntimeError("trainer actor runtime is invalid")
+            leases = PackedBatchLeaseSet.model_validate_json(batch_json)
+            batch = InMemoryPackedBatch.open(job.batch, leases.host_refs[self._host_id])
+            if not self._command_job_open:
+                self._weight_offload.before_job()
+                self._command_job_open = True
+            launch = self._executor.start_forward_backward(job, batch, Event())
+            batch.close()
+            batch = None
+            ready_port.send(
+                _CommandReady(
+                    rank=self._runtime.rank,
+                    operation_id=job.operation_id,
+                    learner_version=job.expected_learner_version,
+                ).model_dump(mode="json")
+            )
+            ready = True
+
+            def materialize() -> dict[str, Any]:
+                result = launch.materialize()
+                self._publish_compile_cache()
+                coordinator = self._runtime.rank == 0
+                return {
+                    "rank": self._runtime.rank,
+                    "operation_id": job.operation_id,
+                    "learner_version": job.expected_learner_version,
+                    "token_count": result["token_count"],
+                    "metrics": result["metrics"] if coordinator else {},
+                    "_rank_telemetry": result["_rank_telemetry"],
+                    "token_logprobs": (result["token_logprobs"] if coordinator else ()),
+                }
+
+            self._defer_response(
+                response_port,
+                materialize,
+                name=f"art-fb-result-{job.operation_id}",
+                invalidate_on_error=True,
+            )
+        except BaseException as error:
+            self._valid = False
+            if not ready and job is not None:
+                ready_port.send(
+                    _CommandReady(
+                        rank=self._runtime.rank,
+                        operation_id=job.operation_id,
+                        learner_version=job.expected_learner_version,
+                        error_type=type(error).__name__,
+                        message=str(error),
+                        traceback_text=traceback.format_exc(),
+                    ).model_dump(mode="json")
+                )
+            response_port.exception(_response_exception(error))
+        finally:
+            if batch is not None:
+                batch.close()
+
     @endpoint
     def execute_forward(self, job_json: str, batch_json: str) -> dict[str, Any]:
         batch = None
@@ -2092,6 +2162,38 @@ class ForwardCommandLaunch(BaseModel):
     completion: SkipValidation[asyncio.Future[dict[str, Any]]]
 
 
+async def _collect_command_ready(
+    receiver: Any,
+    job: (
+        ForwardJobSpec
+        | ForwardBackwardJobSpec
+        | SftForwardJobSpec
+        | SftForwardBackwardJobSpec
+    ),
+    rank_processes: tuple[_TrainerRankReady, ...],
+    *,
+    label: str,
+) -> None:
+    ready_state = "gradient-ready" if label.endswith("F/B") else "GPU-ready"
+    results = [
+        _CommandReady.model_validate(await receiver.recv()) for _ in rank_processes
+    ]
+    if {result.rank for result in results} != set(range(len(rank_processes))) or any(
+        (result.operation_id, result.learner_version)
+        != (job.operation_id, job.expected_learner_version)
+        for result in results
+    ):
+        raise RuntimeError(f"trainer {label} readiness has mismatched rank identity")
+    failures = [result for result in results if result.error_type is not None]
+    if failures:
+        details = "\n".join(
+            f"rank {result.rank}: {result.error_type}: {result.message}\n"
+            f"{result.traceback_text or ''}"
+            for result in failures
+        )
+        raise RuntimeError(f"trainer {label} failed before {ready_state}:\n{details}")
+
+
 class MonarchTrainerSlot:
     """One persistent Megatron mesh serving many sequenced training runs."""
 
@@ -2401,31 +2503,7 @@ class MonarchTrainerSlot:
         *,
         label: str,
     ) -> None:
-        ready_state = "gradient-ready" if label.endswith("F/B") else "GPU-ready"
-        results = [
-            _CommandReady.model_validate(await receiver.recv())
-            for _ in self._rank_processes
-        ]
-        if {result.rank for result in results} != set(
-            range(len(self._rank_processes))
-        ) or any(
-            (result.operation_id, result.learner_version)
-            != (job.operation_id, job.expected_learner_version)
-            for result in results
-        ):
-            raise RuntimeError(
-                f"trainer {label} readiness has mismatched rank identity"
-            )
-        failures = [result for result in results if result.error_type is not None]
-        if failures:
-            details = "\n".join(
-                f"rank {result.rank}: {result.error_type}: {result.message}\n"
-                f"{result.traceback_text or ''}"
-                for result in failures
-            )
-            raise RuntimeError(
-                f"trainer {label} failed before {ready_state}:\n{details}"
-            )
+        await _collect_command_ready(receiver, job, self._rank_processes, label=label)
 
     async def _complete_forward_backward(
         self,
@@ -2907,9 +2985,7 @@ class MonarchTrainerSlot:
             )
         predecessor = self._publication_predecessors[plan.operation_id]
         if predecessor is not None:
-            await asyncio.wait_for(
-                predecessor.wait(), timeout=self._command_timeout_s
-            )
+            await asyncio.wait_for(predecessor.wait(), timeout=self._command_timeout_s)
         async with self._control_lock:
             prepared = self._operations.get(plan.operation_id)
             if (
@@ -2939,18 +3015,14 @@ class MonarchTrainerSlot:
             } != {plan.operation_id}:
                 raise RuntimeError("trainer ranks returned an invalid authorization")
             authorization.set()
-            return next(result for result in results if result["rank"] == 0)[
-                "metrics"
-            ]
+            return next(result for result in results if result["rank"] == 0)["metrics"]
 
     async def discard_prepared_snapshot(self, operation_id: str) -> None:
         if operation_id not in self._publication_predecessors:
             return
         predecessor = self._publication_predecessors[operation_id]
         if predecessor is not None:
-            await asyncio.wait_for(
-                predecessor.wait(), timeout=self._command_timeout_s
-            )
+            await asyncio.wait_for(predecessor.wait(), timeout=self._command_timeout_s)
         async with self._control_lock:
             authorization = self._publication_authorizations.get(operation_id)
             publication = self._publications.get(operation_id)
@@ -3076,7 +3148,9 @@ class MonarchTrainerSlot:
                     if event.generation_id != generation.generation_id:
                         raise RuntimeError("trainer rank progressed another generation")
                     if event.rank >= len(self._rank_processes):
-                        raise RuntimeError("trainer publication progress has unknown rank")
+                        raise RuntimeError(
+                            "trainer publication progress has unknown rank"
+                        )
                     progress[event.rank] = event.phase
                     continue
                 if isinstance(event, TrainerPublicationFailed):
@@ -3380,6 +3454,9 @@ class MonarchTrainerRun:
         self._learner_version = run_spec.initial_learner_version
         self._jobs: dict[str, tuple[str, tuple[TrainEvent, ...]]] = {}
         self._operations: dict[str, tuple[str, dict[str, Any]]] = {}
+        self._forward_backward_launches: dict[
+            str, tuple[str, ForwardBackwardCommandLaunch]
+        ] = {}
         self._operation_sequence_ids: dict[str, int] = {}
         self._cancelled_operations: dict[str, OperationRef] = {}
         self._next_operation_sequence = 0
@@ -3453,15 +3530,26 @@ class MonarchTrainerRun:
         job: ForwardBackwardJobSpec,
         batch: PackedBatchLeaseSet,
     ) -> dict[str, Any]:
-        cached = self._operations.get(job.operation_id)
-        if cached is not None and cached[0] == job.fingerprint:
-            return cached[1]
+        launch = await self.start_forward_backward(job, batch)
+        return await asyncio.shield(launch.completion)
+
+    async def start_forward_backward(
+        self,
+        job: ForwardBackwardJobSpec,
+        batch: PackedBatchLeaseSet,
+    ) -> ForwardBackwardCommandLaunch:
         async with self._lock:
             cached = self._operations.get(job.operation_id)
             if cached is not None:
                 if cached[0] != job.fingerprint:
                     raise RuntimeError("operation_id was reused for a different F/B")
-                return cached[1]
+                completion = asyncio.get_running_loop().create_future()
+                completion.set_result(cached[1])
+                return ForwardBackwardCommandLaunch(completion=completion)
+            if inflight := self._forward_backward_launches.get(job.operation_id):
+                if inflight[0] != job.fingerprint:
+                    raise RuntimeError("operation_id was reused for a different F/B")
+                return inflight[1]
             self._validate_operation(job)
             if batch.ref != job.batch:
                 raise ValueError("F/B batch ref does not match supplied packed batch")
@@ -3469,7 +3557,7 @@ class MonarchTrainerRun:
                 raise ValueError(
                     "packed batch sequence length does not match the trainer runtime"
                 )
-            return await self._run_forward_backward(job, batch)
+            return await self._start_forward_backward(job, batch)
 
     async def forward(
         self,
@@ -3538,23 +3626,79 @@ class MonarchTrainerRun:
                 self._active_job_id = None
                 self._active_collective = None
 
-    async def _run_forward_backward(
+    async def _start_forward_backward(
         self,
         job: ForwardBackwardJobSpec,
         batch: PackedBatchLeaseSet,
-    ) -> dict[str, Any]:
-        collective = asyncio.ensure_future(
-            self._actors.execute_forward_backward.call(
-                job.model_dump_json(), batch.model_dump_json()
+    ) -> ForwardBackwardCommandLaunch:
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self._command_timeout_s()
+        ready_port, receiver = Channel.open()
+        rank_call = asyncio.ensure_future(
+            self._actors.start_forward_backward.call(
+                job.model_dump_json(), batch.model_dump_json(), ready_port
             )
         )
+        readiness = asyncio.create_task(
+            _collect_command_ready(
+                receiver,
+                job,
+                self._rank_processes,
+                label="F/B",
+            ),
+            name=f"megatron-fb-ready-{job.operation_id}",
+        )
         self._active_job_id = job.operation_id
-        self._active_collective = collective
+        self._active_collective = rank_call
         try:
-            values = await asyncio.wait_for(
-                collective,
-                timeout=self._command_timeout_s(),
+            done, _ = await asyncio.wait(
+                {rank_call, readiness},
+                timeout=max(0.0, deadline - loop.time()),
+                return_when=asyncio.FIRST_COMPLETED,
             )
+            if not done:
+                raise TimeoutError("trainer ranks did not reach F/B gradient-ready")
+            if readiness in done:
+                readiness.result()
+            else:
+                await rank_call
+                raise RuntimeError(
+                    "trainer F/B returned before every rank reported gradient-ready"
+                )
+            self._open_forward_backward_ids.append(job.operation_id)
+            self._next_operation_sequence += 1
+            self._operation_sequence_ids[job.operation_id] = job.sequence_id
+            completion = asyncio.create_task(
+                self._complete_forward_backward(job, rank_call, deadline),
+                name=f"megatron-fb-result-{job.operation_id}",
+            )
+            launch = ForwardBackwardCommandLaunch(completion=completion)
+            self._forward_backward_launches[job.operation_id] = (
+                job.fingerprint,
+                launch,
+            )
+            return launch
+        except BaseException as error:
+            for task in (readiness, rank_call):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(readiness, rank_call, return_exceptions=True)
+            await self._invalidate_command(error, "F/B operation and cleanup failed")
+            raise
+        finally:
+            if self._active_job_id == job.operation_id:
+                self._active_job_id = None
+                self._active_collective = None
+
+    async def _complete_forward_backward(
+        self,
+        job: ForwardBackwardJobSpec,
+        rank_call: asyncio.Future[Any],
+        deadline: float,
+    ) -> dict[str, Any]:
+        try:
+            async with asyncio.timeout_at(deadline):
+                values = await asyncio.shield(rank_call)
             results = list(values.values())
             self._validate_rank_command_results(
                 results,
@@ -3572,18 +3716,13 @@ class MonarchTrainerRun:
                 expected_token_count=job.trainable_token_count,
                 aggregate_telemetry=True,
             )
-            self._open_forward_backward_ids.append(job.operation_id)
-            self._next_operation_sequence += 1
             self._operations[job.operation_id] = (job.fingerprint, result)
-            self._operation_sequence_ids[job.operation_id] = job.sequence_id
             return result
         except BaseException as error:
-            await self._invalidate_command(error, "F/B operation and cleanup failed")
+            await self._invalidate_command(error, "late F/B result and cleanup failed")
             raise
         finally:
-            if self._active_job_id == job.operation_id:
-                self._active_job_id = None
-                self._active_collective = None
+            self._forward_backward_launches.pop(job.operation_id, None)
 
     async def sft_forward_backward(
         self,
@@ -4722,7 +4861,11 @@ class MonarchTrainerRun:
             except BaseException:
                 self._close_task = None
         if self._close_task is None:
-            graceful = self._valid and self._active_job_id is None
+            graceful = (
+                self._valid
+                and self._active_job_id is None
+                and not self._forward_backward_launches
+            )
             self._valid = False
             self._cancel_active()
             self._close_task = asyncio.create_task(self._close(graceful))
