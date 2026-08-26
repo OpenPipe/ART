@@ -1777,7 +1777,7 @@ def install_staged_checkpoint_slot(
     optimizer: Any | None = None,
 ) -> None:
     """Bind detached slot objects at the serialized L1 run-switch barrier."""
-    group = _ensure_group(trainer)
+    group = _ensure_install_group(trainer)
     name = prepared.name
     _phase(
         lambda: trainer._guard_slot_can_load(trainer._slot_ref(name)),
@@ -1838,7 +1838,7 @@ def install_checkpoint_slot_load(
     *,
     restore_checkpoint_optimizer: bool,
 ) -> None:
-    group = _ensure_group(trainer)
+    group = _ensure_install_group(trainer)
     name = prepared.name
     source = prepared.source
     config = cast("_AdapterConfig", prepared.config)
@@ -1917,11 +1917,17 @@ def load_checkpoint(
 
 def _ensure_groups(
     trainer: TrainerRank,
-) -> tuple[dist.ProcessGroup | None, dist.ProcessGroup | None]:
+) -> tuple[
+    dist.ProcessGroup | None,
+    dist.ProcessGroup | None,
+    dist.ProcessGroup | None,
+]:
     if not hasattr(trainer, "_checkpoint_process_group"):
         trainer._checkpoint_process_group = None
     if not hasattr(trainer, "_checkpoint_finalize_process_group"):
         trainer._checkpoint_finalize_process_group = None
+    if not hasattr(trainer, "_checkpoint_install_process_group"):
+        trainer._checkpoint_install_process_group = None
     if not hasattr(trainer, "_checkpoint_group_lock"):
         trainer._checkpoint_group_lock = threading.Lock()
     if _distributed():
@@ -1932,9 +1938,14 @@ def _ensure_groups(
                 trainer._checkpoint_finalize_process_group = dist.new_group(
                     backend="gloo"
                 )
+            if trainer._checkpoint_install_process_group is None:
+                trainer._checkpoint_install_process_group = dist.new_group(
+                    backend="gloo"
+                )
     return (
         trainer._checkpoint_process_group,
         trainer._checkpoint_finalize_process_group,
+        trainer._checkpoint_install_process_group,
     )
 
 
@@ -1944,3 +1955,7 @@ def _ensure_group(trainer: TrainerRank) -> dist.ProcessGroup | None:
 
 def _ensure_finalize_group(trainer: TrainerRank) -> dist.ProcessGroup | None:
     return _ensure_groups(trainer)[1]
+
+
+def _ensure_install_group(trainer: TrainerRank) -> dist.ProcessGroup | None:
+    return _ensure_groups(trainer)[2]
