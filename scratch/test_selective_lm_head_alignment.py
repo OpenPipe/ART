@@ -11,7 +11,11 @@ from art.megatron.context_parallel.runtime import (
     prepare_megatron_context_parallel_state,
 )
 from art.megatron.context_parallel.types import ContextParallelConfig, ParallelTopology
-from art.megatron.selective_lm_head import LmHeadTokenSelection, forward_token_losses
+from art.megatron.selective_lm_head import (
+    LmHeadTokenSelection,
+    forward_token_logits,
+    forward_token_losses,
+)
 from art.preprocessing.pack import PackedTensors
 
 
@@ -66,6 +70,33 @@ class _ToyLanguageModel(torch.nn.Module):
     ) -> torch.Tensor:
         logits = self.output_layer(hidden_states)
         return logits if labels is None else self.compute_language_model_loss(labels, logits)
+
+
+class _ToyGptOutput(_ToyLanguageModel):
+    def forward(
+        self,
+        *,
+        hidden_states: torch.Tensor,
+        labels: torch.Tensor | None,
+    ) -> torch.Tensor:
+        if labels is not None:
+            raise ValueError("test only exercises logits")
+        return self.output_layer(hidden_states).transpose(0, 1).contiguous()
+
+
+def test_forward_token_logits_uses_metadata_only_singleton_reshape() -> None:
+    model = _ToyGptOutput(13, 19)
+    hidden = torch.randn(17, 1, 13, requires_grad=True)
+    selection = LmHeadTokenSelection.from_mask(torch.ones(1, 17, dtype=torch.bool))
+    logits = forward_token_logits(
+        model,
+        selection=selection,
+        forward_kwargs={"hidden_states": hidden},
+    )
+    assert tuple(logits.shape) == (selection.projected_row_count, 19)
+    assert type(logits.grad_fn).__name__.startswith("ViewBackward")
+    logits.sum().backward()
+    assert hidden.grad is not None and hidden.grad.count_nonzero()
 
 
 @pytest.mark.parametrize(

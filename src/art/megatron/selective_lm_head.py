@@ -330,9 +330,9 @@ def forward_token_logits(
         raise TypeError("selected model output must be a [tokens, batch, vocab] tensor")
     selected_tokens = selection.projected_row_count
     if tuple(logits.shape[:2]) == (selected_tokens, 1):
-        return logits[:, 0, :].contiguous()
+        return logits.reshape(selected_tokens, logits.shape[-1])
     if tuple(logits.shape[:2]) == (1, selected_tokens):
-        return logits[0, :, :].contiguous()
+        return logits.reshape(selected_tokens, logits.shape[-1])
     raise ValueError(
         "selected logits do not match LM-head selection: "
         f"logits={tuple(logits.shape)} selected_tokens={selected_tokens}"
@@ -358,7 +358,10 @@ def selected_target_logprobs(
 
     language_model = _language_model(model)
     _validate_language_model(language_model)
-    if getattr(language_model.config, "cross_entropy_fusion_impl", None) != "te":
+    if (
+        not bool(getattr(language_model.config, "cross_entropy_loss_fusion", False))
+        or getattr(language_model.config, "cross_entropy_fusion_impl", None) != "te"
+    ):
         raise RuntimeError("single-target selected logprobs require TE cross entropy")
     valid = target_tokens[:, 0] >= 0
     labels = target_tokens[:, 0].masked_fill(~valid, 0).reshape(1, -1)
