@@ -23,6 +23,7 @@ from .residency import (
     ResidencyLimits,
     ResidencyReservation,
     ResidencyTier,
+    ResidencyWorkingSetTooLarge,
 )
 from .tensor_residency import (
     HostTensorImage,
@@ -420,6 +421,15 @@ class RunResidencyManager:
 
     def prepare_l1_working_set(self, keys: Iterable[ResidencyKey]) -> None:
         """Atomically admit and launch one demanded trainer working set."""
+        self._prepare_l1_working_set(keys, retain=False)
+
+    def retain_l1_working_set(self, keys: Iterable[ResidencyKey]) -> None:
+        """Admit and pin a working set until its selected command consumes it."""
+        self._prepare_l1_working_set(keys, retain=True)
+
+    def _prepare_l1_working_set(
+        self, keys: Iterable[ResidencyKey], *, retain: bool
+    ) -> None:
         self._require_open()
         keys = self._working_set_keys(keys)
         if not keys:
@@ -447,7 +457,7 @@ class RunResidencyManager:
                 }
             capacity = self.config.limits.l1_gpu.max_bytes
             if demanded_bytes > capacity:
-                raise ResidencyCapacityUnavailable(
+                raise ResidencyWorkingSetTooLarge(
                     "l1_gpu demanded working set exceeds capacity: "
                     f"demanded={demanded_bytes}, max={capacity}"
                 )
@@ -474,6 +484,8 @@ class RunResidencyManager:
                     and self._state(key).l1_transition is None
                 )
                 if not missing:
+                    if retain:
+                        self.ledger.pin_many((key, "l1_gpu") for key in keys)
                     return
                 sources = tuple(self._l1_source(state) for state in missing)
                 demands = tuple(
@@ -529,6 +541,8 @@ class RunResidencyManager:
                     self.ledger.commit_many(reservations)
                     for state in missing:
                         state.l1_transition = transition
+                    if retain:
+                        self.ledger.pin_many((key, "l1_gpu") for key in keys)
             except BaseException:
                 if transition is not None:
                     transition.wait_on_current_stream()
@@ -569,6 +583,32 @@ class RunResidencyManager:
                 self._finish_l1_transfer_locked(transition)
             if any(not self.ledger.has_copy(key, "l1_gpu") for key in keys):
                 raise RuntimeError("demanded working set did not become L1 resident")
+            self.ledger.pin_many((key, "l1_gpu") for key in keys)
+
+    def acquire_prepared_l1_working_set(self, keys: Iterable[ResidencyKey]) -> None:
+        """Fence and pin a working set whose transfer was admitted before the turn."""
+        self._require_open()
+        keys = self._working_set_keys(keys)
+        if not keys:
+            return
+        with self._lock:
+            if any(
+                not self.ledger.has_copy(key, "l1_gpu")
+                and self._state(key).l1_transition is None
+                for key in keys
+            ):
+                raise RuntimeError("GPU command reached an unprepared L1 working set")
+            for key in keys:
+                self._require_not_retiring(key)
+            transitions = {
+                id(transition): transition
+                for key in keys
+                if (transition := self._state(key).l1_transition) is not None
+            }
+            for transition in transitions.values():
+                self._finish_l1_transfer_locked(transition)
+            if any(not self.ledger.has_copy(key, "l1_gpu") for key in keys):
+                raise RuntimeError("prepared working set did not become L1 resident")
             self.ledger.pin_many((key, "l1_gpu") for key in keys)
 
     def prefetch_l1(self, key: ResidencyKey) -> None:

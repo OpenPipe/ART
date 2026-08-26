@@ -746,6 +746,26 @@ class MegatronTrainingSlot:
             kl_reference_checkpoint_id,
         )
 
+    async def admit_residency(
+        self,
+        operation_id: str,
+        run_id: str,
+        command_kind: Literal["forward", "forward_backward", "optim_step"],
+        expected_learner_version: int,
+        kl_reference_checkpoint_id: str | None = None,
+    ) -> dict[str, float]:
+        self._require_run(run_id)
+        return await self.trainer.admit_residency(
+            operation_id,
+            run_id,
+            command_kind,
+            expected_learner_version,
+            kl_reference_checkpoint_id,
+        )
+
+    async def release_residency_admission(self, operation_id: str) -> None:
+        await self.trainer.release_residency_admission(operation_id)
+
     async def acquire_kl_reference(
         self, run_id: str, checkpoint_id: str, adapter_path: str
     ) -> KlReferenceAcquisition:

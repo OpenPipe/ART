@@ -70,7 +70,11 @@ from .publication import (
     TrainerPublicationSucceeded,
     TrainerRankPublication,
 )
-from .residency import ResidencyCapacityUnavailable, ResidencyKey
+from .residency import (
+    ResidencyCapacityUnavailable,
+    ResidencyKey,
+    ResidencyWorkingSetTooLarge,
+)
 from .run_residency import RunResidencyManager
 from .specs import (
     ForwardBackwardJobSpec,
@@ -1353,6 +1357,8 @@ class MCoreRunSlotExecutor:
             tuple[str, str], tuple[str, Future[_PreparedKlReference]]
         ] = {}
         self._kl_reference_cache_capacity = max(1, int(runtime.snapshot_pool_capacity))
+        self._residency_admission_lock = Lock()
+        self._residency_admissions: dict[str, tuple[ResidencyKey, ...]] = {}
         self._run_cleanups: dict[str, Future[None]] = {}
         self._runs: dict[str, _ResidentRunState] = {}
         self._lifecycle_lock = Lock()
@@ -1756,22 +1762,57 @@ class MCoreRunSlotExecutor:
     def optimizer_layout(self, checkpoint: Any) -> Any:
         return self._slot_trainer.prepared_checkpoint_slot_optimizer_layout(checkpoint)
 
-    def prepare_residency(
+    def prefetch_residency(
         self,
         run_id: str,
         command_kind: str,
         expected_learner_version: int,
         kl_reference_checkpoint_id: str | None = None,
     ) -> bool:
+        return self._prepare_residency(
+            None,
+            run_id,
+            command_kind,
+            expected_learner_version,
+            kl_reference_checkpoint_id,
+        )
+
+    def admit_residency(
+        self,
+        operation_id: str,
+        run_id: str,
+        command_kind: str,
+        expected_learner_version: int,
+        kl_reference_checkpoint_id: str | None = None,
+    ) -> bool:
+        return self._prepare_residency(
+            operation_id,
+            run_id,
+            command_kind,
+            expected_learner_version,
+            kl_reference_checkpoint_id,
+        )
+
+    def _prepare_residency(
+        self,
+        operation_id: str | None,
+        run_id: str,
+        command_kind: str,
+        expected_learner_version: int,
+        kl_reference_checkpoint_id: str | None,
+    ) -> bool:
         """Launch component transfers before the serialized GPU command turn."""
         state = self._require_run(run_id)
         revision = state.residency_revision
         desired = state.desired
-        if (
-            revision % 2
-            or revision != state.residency_revision
-            or state.learner_version != expected_learner_version
-        ):
+        if revision % 2 or revision != state.residency_revision:
+            return False
+        if state.learner_version > expected_learner_version:
+            raise RuntimeError(
+                "residency prefetch targets a stale learner version: "
+                f"requested={expected_learner_version}, current={state.learner_version}"
+            )
+        if state.learner_version < expected_learner_version:
             return False
         if command_kind in {"forward", "forward_backward"}:
             keys = (desired.weights,)
@@ -1797,18 +1838,52 @@ class MCoreRunSlotExecutor:
             )
         else:
             raise ValueError(f"unsupported residency prefetch command {command_kind!r}")
+        if operation_id is not None:
+            with self._residency_admission_lock:
+                retained = self._residency_admissions.get(operation_id)
+            if retained is not None:
+                if retained != keys:
+                    raise RuntimeError("operation residency admission changed identity")
+                return True
         try:
-            self._residency.prefetch_l1_working_set(keys)
+            if operation_id is None:
+                self._residency.prefetch_l1_working_set(keys)
+            else:
+                self._residency.retain_l1_working_set(keys)
+        except ResidencyWorkingSetTooLarge:
+            raise
         except ResidencyCapacityUnavailable:
             return False
         except RuntimeError:
             if revision != state.residency_revision:
                 return False
             raise
-        return (
+        admitted = (
             revision == state.residency_revision
             and state.learner_version == expected_learner_version
         )
+        if operation_id is None:
+            return admitted
+        if not admitted:
+            self._residency.release_l1_working_set(keys)
+            return False
+        with self._residency_admission_lock:
+            retained = self._residency_admissions.get(operation_id)
+            if retained is not None:
+                self._residency.release_l1_working_set(keys)
+                if retained != keys:
+                    raise RuntimeError(
+                        "operation residency admission changed identity"
+                    )
+                return True
+            self._residency_admissions[operation_id] = keys
+        return True
+
+    def release_residency_admission(self, operation_id: str) -> None:
+        with self._residency_admission_lock:
+            keys = self._residency_admissions.pop(operation_id, None)
+        if keys is not None:
+            self._residency.release_l1_working_set(keys)
 
     def execute_forward_backward(
         self,
@@ -1842,6 +1917,7 @@ class MCoreRunSlotExecutor:
 
         with self._resident(
             state,
+            operation_id=job.operation_id,
             kl_reference_checkpoint_id=job.experimental_config.kl_ref_checkpoint_id,
         ):
             gradients = self._require_gradients(state)
@@ -1894,6 +1970,7 @@ class MCoreRunSlotExecutor:
 
         with self._resident(
             state,
+            operation_id=job.operation_id,
             kl_reference_checkpoint_id=job.experimental_config.kl_ref_checkpoint_id,
         ):
             result = execute_megatron_dynamic_lora_forward_job(
@@ -1936,7 +2013,7 @@ class MCoreRunSlotExecutor:
             execute_megatron_dynamic_lora_sft_forward_backward_job,
         )
 
-        with self._resident(state):
+        with self._resident(state, operation_id=job.operation_id):
             gradients = self._require_gradients(state)
             result = execute_megatron_dynamic_lora_sft_forward_backward_job(
                 self.runtime,
@@ -1977,7 +2054,7 @@ class MCoreRunSlotExecutor:
         self._publisher.raise_if_failed()
         from art.megatron.train import execute_megatron_dynamic_lora_sft_forward_job
 
-        with self._resident(state):
+        with self._resident(state, operation_id=job.operation_id):
             result = execute_megatron_dynamic_lora_sft_forward_job(
                 self.runtime,
                 job,
@@ -1997,7 +2074,10 @@ class MCoreRunSlotExecutor:
         from art.trainer_rank import AdamParams
 
         with self._resident(
-            state, include_optimizer=True, include_accumulator=True
+            state,
+            operation_id=job.operation_id,
+            include_optimizer=True,
+            include_accumulator=True,
         ) as working_set:
             self._residency.wait_before_mutation_working_set(working_set)
             self.runtime.optimizer_snapshot_barrier.wait_before_mutation(key=job.run_id)
@@ -2407,6 +2487,17 @@ class MCoreRunSlotExecutor:
             raise RuntimeError(
                 "cannot unregister a run with active KL reference acquisitions"
             )
+        with self._residency_admission_lock:
+            active_admissions = tuple(
+                operation_id
+                for operation_id, keys in self._residency_admissions.items()
+                if any(key.run_id == run_id for key in keys)
+            )
+        if active_admissions:
+            raise RuntimeError(
+                "cannot unregister a run with active residency admissions: "
+                f"{active_admissions}"
+            )
         state.unregistering = True
         failures: list[BaseException] = []
         for operation_id, (prepared_run_id, _fingerprint, _future) in tuple(
@@ -2507,6 +2598,21 @@ class MCoreRunSlotExecutor:
             self._closing = True
             tracked_futures = tuple(self._transition_futures)
         failures: list[BaseException] = []
+        with self._residency_admission_lock:
+            active_admissions = tuple(self._residency_admissions.items())
+            self._residency_admissions.clear()
+        if active_admissions:
+            failures.append(
+                RuntimeError(
+                    "Megatron run slot closed with active residency admissions: "
+                    f"{tuple(operation_id for operation_id, _keys in active_admissions)}"
+                )
+            )
+            for _operation_id, keys in active_admissions:
+                try:
+                    self._residency.release_l1_working_set(keys)
+                except BaseException as error:
+                    failures.append(error)
         for state in self._runs.values():
             if state.gradients is not None:
                 try:
@@ -2622,7 +2728,7 @@ class MCoreRunSlotExecutor:
         if key is None:
             yield
             return
-        self._residency.acquire_l1(key)
+        self._residency.acquire_prepared_l1_working_set((key,))
         try:
             self._residency.wait_before_mutation_working_set((key,))
             self._residency.begin_l1_mutation(key)
@@ -2635,6 +2741,7 @@ class MCoreRunSlotExecutor:
         self,
         state: _ResidentRunState,
         *,
+        operation_id: str,
         include_optimizer: bool = False,
         include_accumulator: bool = False,
         kl_reference_checkpoint_id: str | None = None,
@@ -2659,9 +2766,13 @@ class MCoreRunSlotExecutor:
             )
             if key is not None
         )
+        with self._residency_admission_lock:
+            admitted = self._residency_admissions.get(operation_id)
+        if admitted is None or not set(working_set).issubset(admitted):
+            raise RuntimeError("GPU command has no exact residency admission")
         acquired = False
         try:
-            self._residency.acquire_l1_working_set(working_set)
+            self._residency.acquire_prepared_l1_working_set(working_set)
             acquired = True
             if state.installed_weights != weights_key:
                 pending = state.pending_load
@@ -2735,6 +2846,7 @@ class MCoreRunSlotExecutor:
         finally:
             if acquired:
                 self._residency.release_l1_working_set(working_set)
+            self.release_residency_admission(operation_id)
 
     @staticmethod
     def _require_gradients(state: _ResidentRunState) -> Any:

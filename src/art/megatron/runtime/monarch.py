@@ -283,6 +283,7 @@ class _ResidencyPrefetchResult(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     rank: int
+    operation_id: str | None = None
     run_id: str
     command_kind: str
     learner_version: int
@@ -330,6 +331,7 @@ class _RunRegistrationReady(BaseModel):
 async def _prepare_run_residency(
     ports: tuple[Port[Any], ...],
     lock: asyncio.Lock,
+    operation_id: str | None,
     run_id: str,
     command_kind: str,
     learner_version: int,
@@ -340,6 +342,7 @@ async def _prepare_run_residency(
     async with lock:
         reply, receiver = Channel.open()
         request = (
+            operation_id,
             run_id,
             command_kind,
             learner_version,
@@ -357,12 +360,14 @@ async def _prepare_run_residency(
         if {result.rank for result in results} != set(range(len(ports))) or any(
             (
                 result.run_id,
+                result.operation_id,
                 result.command_kind,
                 result.learner_version,
                 result.kl_reference_checkpoint_id,
             )
             != (
                 run_id,
+                operation_id,
                 command_kind,
                 learner_version,
                 kl_reference_checkpoint_id,
@@ -853,6 +858,7 @@ class MonarchTrainerActor(Actor):
     def _run_residency_prefetch(self, receiver: Any) -> None:
         while (request := receiver.recv().get()) is not None:
             (
+                operation_id,
                 run_id,
                 command_kind,
                 learner_version,
@@ -861,14 +867,26 @@ class MonarchTrainerActor(Actor):
             ) = request
             started = time.perf_counter()
             try:
-                admitted = self._require_run_slot_executor().prepare_residency(
-                    run_id,
-                    command_kind,
-                    learner_version,
-                    kl_reference_checkpoint_id,
+                executor = self._require_run_slot_executor()
+                admitted = (
+                    executor.prefetch_residency(
+                        run_id,
+                        command_kind,
+                        learner_version,
+                        kl_reference_checkpoint_id,
+                    )
+                    if operation_id is None
+                    else executor.admit_residency(
+                        operation_id,
+                        run_id,
+                        command_kind,
+                        learner_version,
+                        kl_reference_checkpoint_id,
+                    )
                 )
                 result = _ResidencyPrefetchResult(
                     rank=self._runtime.rank,
+                    operation_id=operation_id,
                     run_id=run_id,
                     command_kind=command_kind,
                     learner_version=learner_version,
@@ -879,6 +897,7 @@ class MonarchTrainerActor(Actor):
             except BaseException as error:
                 result = _ResidencyPrefetchResult(
                     rank=self._runtime.rank,
+                    operation_id=operation_id,
                     run_id=run_id,
                     command_kind=command_kind,
                     learner_version=learner_version,
@@ -1220,6 +1239,15 @@ class MonarchTrainerActor(Actor):
             raise RuntimeError("trainer actor runtime is invalid")
         self._require_run_slot_executor().start_unregister_run(run_id)
         return {"rank": self._runtime.rank, "run_id": run_id}
+
+    @endpoint
+    def release_run_slot_residency_admission(
+        self, operation_id: str
+    ) -> dict[str, Any]:
+        if not self._valid:
+            raise RuntimeError("trainer actor runtime is invalid")
+        self._require_run_slot_executor().release_residency_admission(operation_id)
+        return {"rank": self._runtime.rank, "operation_id": operation_id}
 
     @endpoint(explicit_response_port=True)
     def finish_unregister_run_slot(
@@ -3273,12 +3301,57 @@ class MonarchTrainerSlot:
         return await _prepare_run_residency(
             self._residency_prefetch_ports,
             self._residency_prefetch_lock,
+            None,
             run_id,
             command_kind,
             learner_version,
             kl_reference_checkpoint_id,
             timeout_s=self._command_timeout_s,
         )
+
+    async def admit_residency(
+        self,
+        operation_id: str,
+        run_id: str,
+        command_kind: str,
+        learner_version: int,
+        kl_reference_checkpoint_id: str | None = None,
+    ) -> dict[str, float]:
+        self._require_open()
+        try:
+            metrics = await _prepare_run_residency(
+                self._residency_prefetch_ports,
+                self._residency_prefetch_lock,
+                operation_id,
+                run_id,
+                command_kind,
+                learner_version,
+                kl_reference_checkpoint_id,
+                timeout_s=self._command_timeout_s,
+            )
+        except BaseException as error:
+            try:
+                await self.release_residency_admission(operation_id)
+            except BaseException as cleanup_error:
+                raise BaseExceptionGroup(
+                    "residency admission and rollback failed", [error, cleanup_error]
+                ) from None
+            raise
+        if metrics["residency/prefetch_admitted"] == 0.0:
+            await self.release_residency_admission(operation_id)
+        return metrics
+
+    async def release_residency_admission(self, operation_id: str) -> None:
+        self._require_open()
+        values = await asyncio.wait_for(
+            self._actors.release_run_slot_residency_admission.call(operation_id),
+            timeout=self._command_timeout_s,
+        )
+        results = list(values.values())
+        if {result["rank"] for result in results} != set(
+            range(len(self._rank_processes))
+        ) or {result["operation_id"] for result in results} != {operation_id}:
+            raise RuntimeError("trainer ranks released another residency admission")
 
     def _cached_operation(
         self, operation_id: str, fingerprint: str
