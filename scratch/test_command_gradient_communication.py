@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -286,6 +287,47 @@ def _workload(tokens: int) -> TrainingStepWorkload:
         real_microbatches=1,
         dummy_microbatches=0,
     )
+
+
+def test_multi_schedule_command_keeps_only_boundary_timing_reader(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from art.megatron import train
+
+    monkeypatch.setattr(
+        train,
+        "rank_telemetry_topology",
+        lambda: RankTelemetryTopology(global_rank=0, dp_cp_ranks=(0,), pp_ranks=(0,)),
+    )
+    readers = (
+        lambda: {"time/inter_forward_backward_gap_rank_0_s": 1.0},
+        lambda: {"time/inter_forward_backward_gap_rank_0_s": 0.1},
+    )
+    states = tuple(
+        SimpleNamespace(
+            raw_loss_sum=torch.tensor(1.0),
+            token_count=torch.tensor(2.0),
+            probs_corr_stats=torch.zeros(6),
+            kl_sum=torch.zeros(()),
+            kl_count=torch.zeros(()),
+            loss_diagnostics=LossOffPolicyDiagnosticsAccumulator(),
+            schedule=SimpleNamespace(
+                local_training_workload=lambda: _workload(2),
+                telemetry=object(),
+            ),
+            deferred_inter_schedule_metrics=reader,
+        )
+        for reader in readers
+    )
+
+    pending = train._pending_rl_command_telemetry(
+        states, backward=True, elapsed_s=2.0, replay_finalize_s=0.0
+    )
+
+    assert pending.inter_metric_readers == (readers[0],)
+    assert pending.inter_metric_readers[0]() == {
+        "time/inter_forward_backward_gap_rank_0_s": 1.0
+    }
 
 
 def test_pp_telemetry_is_rank_local_and_controller_aggregated(

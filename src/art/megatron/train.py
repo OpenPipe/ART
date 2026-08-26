@@ -1166,10 +1166,14 @@ def _pending_rl_command_telemetry(
             tuple(state.schedule.local_training_workload() for state in states)
         ),
         schedules=tuple(state.schedule.telemetry for state in states),
-        inter_metric_readers=tuple(
-            reader
-            for state in states
-            if (reader := state.deferred_inter_schedule_metrics) is not None
+        # Inter-schedule timing is a command-boundary metric. A command may run
+        # several schedule steps, but only its first step describes the gap from
+        # the preceding command; later readers would emit the same rank keys for
+        # internal gradient steps.
+        inter_metric_readers=(
+            (states[0].deferred_inter_schedule_metrics,)
+            if states[0].deferred_inter_schedule_metrics is not None
+            else ()
         ),
         base_metrics={
             ("time/forward_backward_s" if backward else "time/forward_s"): elapsed_s,
