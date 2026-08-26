@@ -2374,34 +2374,32 @@ def _run_paired_objective_suite(
         )
 
     rl_runner = runner(rl_objective, sft_objective)
-    try:
-        if require_existing_references:
-            rl_runner.ensure_oracle(require_existing=True)
-        reports = rl_runner.run_suite(
-            variants(rl_objective),
+    if require_existing_references:
+        rl_runner.ensure_oracle(require_existing=True)
+    reports = rl_runner.run_suite(
+        variants(rl_objective),
+        prune_reference_artifacts=False,
+        prune_case_artifacts=False,
+        prune_paired_artifacts=False,
+    )
+    sft_runner = runner(sft_objective)
+    sft_runner._oracle_initialized = sft_runner._oracle_regenerated = True
+    reports.extend(
+        sft_runner.run_suite(
+            [
+                variant.model_copy(update={"force_regenerate": False})
+                for variant in variants(sft_objective)
+            ],
             prune_reference_artifacts=False,
             prune_case_artifacts=False,
-            prune_paired_artifacts=False,
         )
-        sft_runner = runner(sft_objective)
-        sft_runner._oracle_initialized = sft_runner._oracle_regenerated = True
-        reports.extend(
-            sft_runner.run_suite(
-                [
-                    variant.model_copy(update={"force_regenerate": False})
-                    for variant in variants(sft_objective)
-                ],
-                prune_reference_artifacts=False,
-                prune_case_artifacts=False,
-            )
-        )
-        return reports
-    finally:
-        _prune_completed_runners(
-            [rl_runner],
-            prune_reference_artifacts=prune_reference_artifacts,
-            prune_case_artifacts=prune_case_artifacts,
-        )
+    )
+    _prune_completed_runners(
+        [rl_runner],
+        prune_reference_artifacts=prune_reference_artifacts,
+        prune_case_artifacts=prune_case_artifacts,
+    )
+    return reports
 
 
 _run_paired_dense_suite = _run_paired_objective_suite
