@@ -100,12 +100,16 @@ class LocalLoraExportEntry(BaseModel):
 
 
 class LocalLoraExportPlan(BaseModel):
-    """Stable export operations bound to the ordered slot-residency tuple."""
+    """Stable export operations bound to one rank's slot-residency tuple.
+
+    Replicated parameters are exported by one rank, so another rank may have no
+    entries. The distributed publisher enforces nonempty global ownership.
+    """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     source_count: int = Field(ge=1)
-    entries: tuple[LocalLoraExportEntry, ...] = Field(min_length=1)
+    entries: tuple[LocalLoraExportEntry, ...]
 
     def materialize(
         self,
@@ -289,9 +293,16 @@ def _build_lora_export_plan(
                     pack_layout=slot.pack_layout,
                 )
             )
-    keys = [entry.key for entry in entries]
-    if not entries or len(set(keys)) != len(keys):
-        raise RuntimeError("LoRA export plan is empty or contains duplicate keys")
+    seen: set[str] = set()
+    duplicates: set[str] = set()
+    for entry in entries:
+        if entry.key in seen:
+            duplicates.add(entry.key)
+        seen.add(entry.key)
+    if duplicates:
+        raise RuntimeError(
+            f"LoRA export plan contains duplicate keys: {tuple(sorted(duplicates))}"
+        )
     return LocalLoraExportPlan(
         source_count=len(residency_tensors), entries=tuple(entries)
     )
