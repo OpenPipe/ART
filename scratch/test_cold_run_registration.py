@@ -9,7 +9,11 @@ import torch
 
 from art.megatron import optimizer_state as optimizer_state_module
 from art.megatron.model_support import lora_disk
-from art.megatron.optimizer_state import CheckpointFile, OptimizerAdapter
+from art.megatron.optimizer_state import (
+    CheckpointFile,
+    OptimizerAdapter,
+    VerifiedOptimizerGeneration,
+)
 from art.megatron.runtime.executor import (
     GenerationResidency,
     MCoreRunSlotExecutor,
@@ -354,6 +358,15 @@ def _register(
     executor: MCoreRunSlotExecutor, **kwargs: Any
 ) -> RankLocalOptimizerWorkSummary:
     generation_id = "step-00000000-0123456789abcdef0123456789abcdef"
+    optimizer_generation = kwargs.get("initial_optimizer_generation_id")
+    if (
+        optimizer_generation is not None
+        and "initial_optimizer_verification" not in kwargs
+    ):
+        kwargs["initial_optimizer_verification"] = VerifiedOptimizerGeneration(
+            generation=optimizer_generation,
+            manifest_sha256="0" * 64,
+        )
     return executor.register_run(
         RunSlotRegistration(
             tenant_id="tenant",
@@ -794,7 +807,9 @@ def test_exact_resume_uses_prepared_layout_and_is_published_exactly(
     _register(
         executor,
         initial_optimizer_state_path="/optimizer",
-        initial_optimizer_generation_id="optimizer-generation",
+        initial_optimizer_generation_id=(
+            "step-00000001-11111111111111111111111111111111"
+        ),
     )
     state = executor._runs["run"]
     pending = state.pending_load
