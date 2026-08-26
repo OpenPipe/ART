@@ -1562,18 +1562,19 @@ def _run_megatron_sft_step(
             prepared_micro.local_token_uids,
             prepared_micro.attention_state,
         )
-        attention_mask = megatron_train._placeholder_attention_mask(device)
-        forward_kwargs = runtime.model_support_handler.get_forward_kwargs(
-            runtime.model[0],
-            attention_bias=prepared_micro.attention_state,
-        )
-        per_token_loss = runtime.model[0](
+        forward_kwargs = dict(
             input_ids=prepared_micro.input_ids,
             position_ids=prepared_micro.position_ids,
-            attention_mask=attention_mask,
+            attention_mask=megatron_train._placeholder_attention_mask(device),
             labels=prepared_micro.labels,
-            **forward_kwargs,
         )
+        forward_kwargs.update(
+            runtime.model_support_handler.get_forward_kwargs(
+                runtime.model[0],
+                attention_bias=prepared_micro.attention_state,
+            )
+        )
+        per_token_loss = runtime.model[0](**forward_kwargs)
         masked_losses = per_token_loss[prepared_micro.loss_mask]
         trainable_losses.append(masked_losses.detach().cpu())
         loss_sum = loss_sum + masked_losses.sum()

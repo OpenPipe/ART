@@ -393,25 +393,24 @@ def _run_logits(
     position_ids: torch.Tensor,
     attention_bias: Any,
 ) -> torch.Tensor:
-    forward_kwargs = handler.get_forward_kwargs(
-        model,
-        attention_bias=attention_bias,
+    forward_kwargs = dict(
+        input_ids=input_ids,
+        position_ids=position_ids,
+        attention_mask=torch.zeros(
+            (1, 1, 1, 1),
+            dtype=torch.bool,
+            device=input_ids.device,
+        ),
+        labels=None,
+    )
+    forward_kwargs.update(
+        handler.get_forward_kwargs(
+            model,
+            attention_bias=attention_bias,
+        )
     )
     with torch.no_grad():
-        return cast(
-            torch.Tensor,
-            model(
-                input_ids=input_ids,
-                position_ids=position_ids,
-                attention_mask=torch.zeros(
-                    (1, 1, 1, 1),
-                    dtype=torch.bool,
-                    device=input_ids.device,
-                ),
-                labels=None,
-                **forward_kwargs,
-            ),
-        )
+        return cast(torch.Tensor, model(**forward_kwargs))
 
 
 def _logits_equivalence_check(
