@@ -55,6 +55,7 @@ from art.megatron.weights.lora_publish import (
     PackedExpertShardMeta,
     _canonical_global_metadata,
     _exchange_batched_tensors,
+    _pack_merged_expert_blocks,
     _rank0_merged_lora_tensors,
 )
 from art.megatron.weights.rank_distributed_lora_publish import (
@@ -69,6 +70,7 @@ Case = Literal[
     "qwen36_shared_outer",
     "gpt_oss_per_expert",
     "gpt_oss_packed",
+    "gpt_oss_shared_outer",
     "gemma4_per_expert",
     "gemma4_packed",
     "dsv4_per_expert",
@@ -80,6 +82,7 @@ CASES: tuple[Case, ...] = (
     "qwen36_shared_outer",
     "gpt_oss_per_expert",
     "gpt_oss_packed",
+    "gpt_oss_shared_outer",
     "gemma4_per_expert",
     "gemma4_packed",
     "dsv4_per_expert",
@@ -96,6 +99,42 @@ class Fixture(BaseModel):
     packed: dict[str, torch.Tensor]
     packed_metadata: list[PackedExpertShardMeta]
     adapter_config: dict[str, Any]
+
+
+@pytest.mark.parametrize(
+    "layout",
+    (
+        "expert_rows",
+        "rank_major_expert_cols",
+        "interleaved_gate_up_rank_major_expert_cols",
+    ),
+)
+def test_pack_merged_expert_blocks_exact_layout(layout: str) -> None:
+    joined = torch.arange(3 * 4 * 2).reshape(3, 4, 2)
+    blocks = []
+    for start, block in ((2, joined[2:]), (0, joined[:2])):
+        meta = PackedExpertShardMeta(
+            key="experts.weight",
+            owner_rank=0,
+            shape=tuple(block.shape),
+            dtype_name="int64",
+            manifest={"sharded": False, "shard_world_size": 1},
+            expert_start=start,
+            expert_count=int(block.shape[0]),
+            pack_layout=layout,
+        )
+        blocks.append((meta, block))
+
+    actual = _pack_merged_expert_blocks("experts.weight", blocks)
+    if layout == "expert_rows":
+        expected = joined.flatten(0, 1)
+    elif layout == "rank_major_expert_cols":
+        expected = joined.permute(1, 2, 0).reshape(4, 6)
+    else:
+        gate, up = joined.split(2, dim=1)
+        interleaved = torch.stack((gate, up), dim=2).flatten(1, 2)
+        expected = interleaved.permute(1, 2, 0).reshape(4, 6)
+    assert torch.equal(actual, expected)
 
 
 def _tensor(shape: tuple[int, ...], seed: int, dtype: torch.dtype) -> torch.Tensor:
