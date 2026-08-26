@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
-from art.distributed.trajectory_store import TrajectoryGroupBundle
+from art.distributed.trajectory_store import (
+    TrajectoryGroupBundle,
+    TrajectoryGroupDataIdentity,
+)
 from art.megatron.runtime.monarch import MonarchTrainerRun
 import art.megatron.training.client as client_module
 from art.megatron.training.client import (
@@ -72,7 +76,15 @@ def _forward_backward(request_id: str, sequence_id: int) -> ForwardBackwardReque
         request_id=request_id,
         sequence_id=sequence_id,
         batch=RlTrajectoryBatch(
-            groups=(TrajectoryGroupBundle(header=b"header", records=()),),
+            groups=(
+                TrajectoryGroupBundle(
+                    header=b"header",
+                    records=(),
+                    route_free_identity=TrajectoryGroupDataIdentity(
+                        sha256=hashlib.sha256(b"header").hexdigest(), byte_count=6
+                    ),
+                ),
+            ),
             min_source_version=0,
             max_source_version=0,
         ),
