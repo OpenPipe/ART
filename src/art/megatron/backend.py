@@ -17,7 +17,7 @@ from .._backend_training import (
     should_save_optimizer_state,
 )
 from ..backend import AnyTrainableModel
-from ..distributed.art_runtime import ArtRuntime
+from ..distributed.art_runtime import ArtRuntime, DistributedPackedBatch
 from ..local.backend import LocalBackend, _PackedTrainingBatch
 from ..local.service import ModelService
 from ..metrics_taxonomy import TRAIN_GRADIENT_STEPS_KEY
@@ -51,12 +51,13 @@ from ..vllm_runtime import get_external_vllm_runtime_config
 from .migrations import apply_megatron_migrations
 from .runtime.specs import ResidentLoraInspectionResult, ResidentScoreResult
 from .runtime_config import get_megatron_runtime_config
+from .training.commands import packing_metrics
 
 
 class _DistributedBatchPayload(BaseModel):
-    model_config = ConfigDict(arbitrary_types_allowed=True, frozen=True)
+    model_config = ConfigDict(arbitrary_types_allowed=True, extra="forbid", frozen=True)
 
-    packed: Any
+    packed: SkipValidation[DistributedPackedBatch]
     groups: tuple[Any, ...]
     bundles: tuple[Any, ...]
     selections: tuple[Any, ...]
@@ -280,22 +281,11 @@ class _MegatronPipelineCommandContext(BaseModel):
         )
 
 
-def _packing_metrics(packed: Any) -> dict[str, float]:
+def _prefix_tree_metrics(batch: _PackedTrainingBatch) -> dict[str, float]:
     return {
-        "time/step_trajectory_fetch_s": packed.trajectory_fetch_s,
-        "time/step_trajectory_receive_s": packed.trajectory_receive_s,
-        "time/step_trajectory_build_s": packed.trajectory_build_s,
-        "time/step_packing_core_s": packed.packing_core_s,
-        "time/step_packing_lock_wait_s": packed.packing_lock_wait_s,
-        "time/step_packing_compute_s": packed.packing_compute_s,
-        **{
-            f"time/step_{name}": value
-            for name, value in packed.packing_timings.model_dump().items()
-        },
-        "time/step_trajectory_log_wait_s": packed.trajectory_log_wait_s,
-        "time/step_packed_batch_finalize_s": packed.packed_batch_finalize_s,
-        "time/step_packing_rpc_s": packed.packing_rpc_s,
-        "time/step_packed_batch_fanout_s": packed.packed_batch_fanout_s,
+        "prefix_tree/logical_tokens": float(batch.logical_tokens),
+        "prefix_tree/physical_tokens": float(batch.physical_tokens),
+        "prefix_tree/compression_ratio": (batch.logical_tokens / batch.physical_tokens),
     }
 
 
@@ -612,13 +602,12 @@ class MegatronBackend(LocalBackend):
             raise RuntimeError("resident scoring produced no packed batch")
 
         try:
-            from ..distributed.art_runtime import DistributedPackedBatch
             from .distributed_service import DistributedMegatronService
 
             payload = batch.payload
             if not isinstance(payload, _DistributedBatchPayload):
                 raise RuntimeError("resident scoring did not use the typed data plane")
-            distributed_batch = cast(DistributedPackedBatch, payload.packed)
+            distributed_batch = payload.packed
             service = cast(
                 DistributedMegatronService,
                 await self._get_service(model),
@@ -840,9 +829,7 @@ class MegatronBackend(LocalBackend):
                         forward_result.packing.trainable_assistant_tokens
                     ),
                     "data/step_num_dropped_trajectories": float(
-                        forward_result.metrics.get(
-                            "data/step_num_dropped_trajectories", 0.0
-                        )
+                        forward_result.metrics["data/step_num_dropped_trajectories"]
                     ),
                 }
             )
@@ -951,7 +938,7 @@ class MegatronBackend(LocalBackend):
         generation_id = uuid.uuid4().hex
         trajectory_log_path: str | None = None
         runtime: ArtRuntime | None = None
-        packed: Any = None
+        packed: DistributedPackedBatch | None = None
         marked_packed = False
         transferred = False
         try:
@@ -1134,7 +1121,7 @@ class MegatronBackend(LocalBackend):
         self,
         *,
         runtime: ArtRuntime | None,
-        packed: Any,
+        packed: DistributedPackedBatch | None,
         selections: tuple[Any, ...],
         generation_id: str | None,
         trajectory_log_path: str | None,
@@ -1231,7 +1218,7 @@ class MegatronBackend(LocalBackend):
                 "Megatron pipeline batch did not use the typed data plane"
             )
         distributed = payload.packed
-        metrics = _packing_metrics(distributed)
+        metrics = {**packing_metrics(distributed), **_prefix_tree_metrics(batch)}
         from .distributed_service import DistributedMegatronService
 
         service = cast(
@@ -1668,13 +1655,11 @@ class MegatronBackend(LocalBackend):
         *,
         disposition: Literal["consumed", "discarded"],
     ) -> None:
-        from ..distributed.art_runtime import DistributedPackedBatch
-
         payload = batch.payload
         if not isinstance(payload, _DistributedBatchPayload):
             raise RuntimeError("Megatron batch has no owning typed runtime")
         runtime = cast(ArtRuntime, payload.runtime)
-        distributed_batch = cast(DistributedPackedBatch, payload.packed)
+        distributed_batch = payload.packed
         releases: list[Any] = [runtime.release_batch(distributed_batch)]
         if payload.selections:
             queue = payload.selections[0].queue

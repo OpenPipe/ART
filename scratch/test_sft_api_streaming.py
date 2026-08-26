@@ -88,8 +88,10 @@ class _Client:
                 loss_fn_outputs=(),
                 metrics={
                     "time/forward_backward_s": 0.2,
+                    "data/step_num_dropped_trajectories": 0.0,
                     TRAIN_GRADIENT_STEPS_KEY: 1.0,
                 },
+                produced_gradient=True,
             ),
             "contributes",
         )

@@ -2,7 +2,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 
 class TrainingMicrobatchWorkload(BaseModel):
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(extra="forbid", frozen=True)
 
     logical_nonpadding_tokens: int = Field(ge=0)
     loss_bearing_tokens: int = Field(ge=0)
@@ -11,7 +11,7 @@ class TrainingMicrobatchWorkload(BaseModel):
 
 
 class TrainingStepWorkload(BaseModel):
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(extra="forbid", frozen=True)
 
     logical_nonpadding_tokens: int = Field(ge=0)
     loss_bearing_tokens: int = Field(ge=0)

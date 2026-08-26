@@ -1,3 +1,4 @@
+from threading import Lock
 from types import SimpleNamespace
 from typing import Any
 
@@ -89,6 +90,8 @@ class _Residency:
         if self.acquire_error is not None:
             raise self.acquire_error
 
+    acquire_prepared_l1_working_set = acquire_l1_working_set
+
     def release_l1_working_set(self, _keys: Any) -> None:
         return None
 
@@ -171,11 +174,16 @@ def _executor(
     slot = _SlotTrainer()
     residency = _Residency()
     publisher = _Publisher()
-    executor.runtime = SimpleNamespace(optimizer_layout_fingerprint="topology")
+    executor.runtime = SimpleNamespace(
+        optimizer_layout_fingerprint="topology", rank=0
+    )
     executor._slot_trainer = slot
     executor._residency = residency
     executor._publisher = publisher
     executor._runs = {"run": state}
+    executor._residency_admission_lock = Lock()
+    executor._residency_admissions = {}
+    executor._closing = False
     executor._closed = False
     monkeypatch.setattr(
         MCoreRunSlotExecutor,
@@ -246,10 +254,21 @@ def test_optimizer_budget_rejection_precedes_gradient_seal_and_install(
     state.gradients = gradients
     residency.acquire_error = ResidencyCapacityUnavailable("forced L1 capacity")
     optimizer_job = SimpleNamespace(
+        operation_id="optimizer",
         run_id="run",
         training_session_id="session",
         expected_learner_version=1,
         contributing_forward_backward_operation_ids=("forward",),
+    )
+    state = executor._runs["run"]
+    executor._residency_admissions["optimizer"] = tuple(
+        key
+        for key in (
+            state.desired.weights,
+            state.desired.optimizer,
+            state.desired.accumulator,
+        )
+        if key is not None
     )
 
     with pytest.raises(ResidencyCapacityUnavailable, match="forced L1 capacity"):

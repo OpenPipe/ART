@@ -3649,6 +3649,48 @@ def _finish_megatron_sft_step(
     )
 
 
+def _inter_forward_backward_phase_metrics(
+    parts: torch.Tensor, rank: int
+) -> dict[str, float]:
+    names = ("previous_job_tail", "worker_idle", "current_job_prepare")
+    values = (
+        {
+            f"{_INTER_FORWARD_BACKWARD_PHASE_PREFIX}{name}_rank_{rank}_s": float(
+                parts[index]
+            )
+            for index, name in enumerate(names, start=1)
+        }
+        if bool(parts[4])
+        else {}
+    )
+    values.update(
+        {
+            f"{_INTER_FORWARD_BACKWARD_PHASE_PREFIX}previous_job_complete_present_rank_{rank}": float(
+                parts[5]
+            ),
+            f"{_INTER_FORWARD_BACKWARD_PHASE_PREFIX}current_job_start_present_rank_{rank}": float(
+                parts[6]
+            ),
+        }
+    )
+    if torch.isnan(parts[1]):
+        return values
+    values.update(
+        {
+            f"{_INTER_FORWARD_BACKWARD_PHASE_PREFIX}boundary_{name}_rank_{rank}_s": float(
+                parts[index]
+            )
+            for index, name in enumerate(
+                ("job_tail", "command_interval", "job_prepare"), start=1
+            )
+        }
+    )
+    values[
+        f"{_INTER_FORWARD_BACKWARD_PHASE_PREFIX}phase_order_valid_rank_{rank}"
+    ] = float(parts[4])
+    return values
+
+
 def _run_training_schedule(
     schedule: MCoreScheduleAdapter[Any],
     forward_step_func: Callable[..., Any],
@@ -3681,6 +3723,18 @@ def _run_training_schedule(
             started_s - timing.current_job_start_s,
         )
     )
+    boundary_delta_s = (
+        None
+        if timing is None
+        or timing.previous_schedule_end_s is None
+        or timing.previous_job_complete_s is None
+        or timing.current_job_start_s is None
+        else (
+            timing.previous_job_complete_s - timing.previous_schedule_end_s,
+            timing.current_job_start_s - timing.previous_job_complete_s,
+            started_s - timing.current_job_start_s,
+        )
+    )
     previous_cuda_end = (
         timing.previous_schedule_cuda_end if timing is not None else None
     )
@@ -3699,25 +3753,23 @@ def _run_training_schedule(
         return outputs, lambda: {}
     world_size = torch.distributed.get_world_size()  # ty: ignore[possibly-missing-attribute]
     local_timing = torch.tensor(
-        (gap_s, *(phase_s or (math.nan, math.nan, math.nan))), dtype=torch.float64
+        (
+            gap_s,
+            *(boundary_delta_s or (math.nan, math.nan, math.nan)),
+            float(phase_s is not None),
+            float(timing.previous_job_complete_s is not None),
+            float(timing.current_job_start_s is not None),
+        ),
+        dtype=torch.float64,
     )
     if rank_local_metrics:
         rank = torch.distributed.get_rank()  # ty: ignore[possibly-missing-attribute]
 
         def local_metrics() -> dict[str, float]:
-            phase_names = ("previous_job_tail", "worker_idle", "current_job_prepare")
             values = {
                 f"{_INTER_FORWARD_BACKWARD_GAP_PREFIX}{rank}_s": float(local_timing[0])
             }
-            values.update(
-                {
-                    f"{_INTER_FORWARD_BACKWARD_PHASE_PREFIX}{name}_rank_{rank}_s": float(
-                        local_timing[index]
-                    )
-                    for index, name in enumerate(phase_names, start=1)
-                    if not torch.isnan(local_timing[index])
-                }
-            )
+            values.update(_inter_forward_backward_phase_metrics(local_timing, rank))
             if previous_cuda_end is not None and cuda_span is not None:
                 values[f"{_INTER_FORWARD_BACKWARD_GPU_GAP_PREFIX}{rank}_s"] = (
                     previous_cuda_end.elapsed_time(cuda_span[0]) / 1e3
@@ -3746,16 +3798,10 @@ def _run_training_schedule(
             f"{_INTER_FORWARD_BACKWARD_GAP_PREFIX}{rank}_s": float(parts[0].item())
             for rank, parts in enumerate(rank_timings)
         }
-        phase_names = ("previous_job_tail", "worker_idle", "current_job_prepare")
         values.update(
-            {
-                f"{_INTER_FORWARD_BACKWARD_PHASE_PREFIX}{name}_rank_{rank}_s": float(
-                    parts[index].item()
-                )
-                for rank, parts in enumerate(rank_timings)
-                for index, name in enumerate(phase_names, start=1)
-                if not torch.isnan(parts[index])
-            }
+            metric
+            for rank, parts in enumerate(rank_timings)
+            for metric in _inter_forward_backward_phase_metrics(parts, rank).items()
         )
         if previous_cuda_end is None or cuda_span is None:
             return values

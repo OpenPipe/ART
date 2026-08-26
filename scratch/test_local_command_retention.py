@@ -6,7 +6,10 @@ from typing import Any
 
 import pytest
 
-from art.distributed.trajectory_store import TrajectoryGroupBundle
+from art.distributed.trajectory_store import (
+    TrajectoryGroupBundle,
+    TrajectoryGroupDataIdentity,
+)
 from art.megatron.distributed_service import DistributedMegatronService
 from art.megatron.optimizer_state import CheckpointFile, OptimizerAdapter
 from art.megatron.runtime.specs import ResolvedCheckpointState
@@ -63,9 +66,7 @@ def _checkpoint(step: int) -> ResolvedCheckpointState:
             identity=f"/checkpoint/{step}",
             training_session_id="session",
             step=step,
-            generation_id=(
-                f"step-{step:08d}-0123456789abcdef0123456789abcdef"
-            ),
+            generation_id=(f"step-{step:08d}-0123456789abcdef0123456789abcdef"),
             files=(
                 CheckpointFile(name="adapter_config.json", size_bytes=1),
                 CheckpointFile(name="adapter_model.safetensors", size_bytes=1),
@@ -234,7 +235,15 @@ async def test_optimizer_retires_only_its_terminal_fb_contributions() -> None:
         request_id="forward",
         sequence_id=0,
         batch=RlTrajectoryBatch(
-            groups=(TrajectoryGroupBundle(header=b"header", records=(b"record",)),),
+            groups=(
+                TrajectoryGroupBundle(
+                    header=b"header",
+                    records=(b"record",),
+                    route_free_identity=TrajectoryGroupDataIdentity(
+                        sha256="0" * 64, byte_count=len(b"headerrecord")
+                    ),
+                ),
+            ),
             min_source_version=0,
             max_source_version=0,
         ),

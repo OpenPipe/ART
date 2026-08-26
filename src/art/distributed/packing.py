@@ -462,20 +462,20 @@ class PackingResult(BaseModel):
 
     ref: PackedBatchRef | None
     packed_group_shapes: tuple[PackedGroupShape | None, ...]
-    trainable_assistant_tokens: int = Field(default=0, ge=0)
-    loss_bearing_tokens: int = Field(default=0, ge=0)
-    non_padding_tokens: int = Field(default=0, ge=0)
-    num_dropped_trajectories: int = Field(default=0, ge=0)
-    trajectory_log_path: str | None = None
-    trajectory_fetch_s: float = Field(default=0.0, ge=0)
-    trajectory_receive_s: float = Field(default=0.0, ge=0)
-    trajectory_build_s: float = Field(default=0.0, ge=0)
-    packing_core_s: float = Field(default=0.0, ge=0)
-    packing_lock_wait_s: float = Field(default=0.0, ge=0)
-    packing_compute_s: float = Field(default=0.0, ge=0)
-    packing_timings: PackingTimings = Field(default_factory=PackingTimings)
-    trajectory_log_wait_s: float = Field(default=0.0, ge=0)
-    packed_batch_finalize_s: float = Field(default=0.0, ge=0)
+    trainable_assistant_tokens: int = Field(ge=0)
+    loss_bearing_tokens: int = Field(ge=0)
+    non_padding_tokens: int = Field(ge=0)
+    num_dropped_trajectories: int = Field(ge=0)
+    trajectory_log_path: str | None
+    trajectory_fetch_s: float = Field(ge=0)
+    trajectory_receive_s: float = Field(ge=0)
+    trajectory_build_s: float = Field(ge=0)
+    packing_core_s: float = Field(ge=0)
+    packing_lock_wait_s: float = Field(ge=0)
+    packing_compute_s: float = Field(ge=0)
+    packing_timings: PackingTimings
+    trajectory_log_wait_s: float = Field(ge=0)
+    packed_batch_finalize_s: float = Field(ge=0)
     generation_id: str = Field(min_length=1)
 
 

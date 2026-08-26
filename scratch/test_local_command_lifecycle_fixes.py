@@ -6,7 +6,10 @@ from typing import Any
 
 import pytest
 
-from art.distributed.trajectory_store import TrajectoryGroupBundle
+from art.distributed.trajectory_store import (
+    TrajectoryGroupBundle,
+    TrajectoryGroupDataIdentity,
+)
 from art.megatron.runtime.monarch import MonarchTrainerRun
 import art.megatron.training.client as client_module
 from art.megatron.training.client import (
@@ -67,12 +70,21 @@ def _save(request_id: str, sequence_id: int) -> SaveWeightsForSamplerRequest:
 
 
 def _forward_backward(request_id: str, sequence_id: int) -> ForwardBackwardRequest:
+    header = b"header"
     return ForwardBackwardRequest(
         run_id="run",
         request_id=request_id,
         sequence_id=sequence_id,
         batch=RlTrajectoryBatch(
-            groups=(TrajectoryGroupBundle(header=b"header", records=()),),
+            groups=(
+                TrajectoryGroupBundle(
+                    header=header,
+                    records=(),
+                    route_free_identity=TrajectoryGroupDataIdentity(
+                        sha256="0" * 64, byte_count=len(header)
+                    ),
+                ),
+            ),
             min_source_version=0,
             max_source_version=0,
         ),
@@ -98,6 +110,7 @@ def _forward_backward_result(operation_id: str) -> ForwardBackwardResult:
         loss_fn_outputs=(
             LossFnOutput(token_logprobs=TokenLogprobs(shape=(3,), data=b"x" * 12)),
         ),
+        produced_gradient=True,
     )
 
 
@@ -134,9 +147,7 @@ def test_completed_operation_heap_compaction_is_geometric(
     client = _client(_Service())
     total = 1024
     client._completed_operations = {str(index): 0 for index in range(total)}
-    client._completed_operation_order = [
-        (index, str(index)) for index in range(total)
-    ]
+    client._completed_operation_order = [(index, str(index)) for index in range(total)]
     heapify_calls = 0
     heapify = client_module.heapq.heapify
 

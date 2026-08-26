@@ -21,7 +21,7 @@ from art.megatron.runtime.executor import (
     _stage_sft_rank_result,
 )
 import art.megatron.runtime.monarch as monarch_module
-from art.megatron.runtime.monarch import MonarchTrainerSlot
+from art.megatron.runtime.monarch import MonarchTrainerRun, MonarchTrainerSlot
 from art.megatron.runtime.specs import (
     RankLocalOptimizerWorkSummary,
     RunOptimizerWorkSummary,
@@ -457,6 +457,59 @@ def _slot(actors: _Actors) -> MonarchTrainerSlot:
         command_timeout_s=2.0,
         shutdown_timeout_s=1.0,
     )
+
+
+def _legacy_run(actors: _Actors) -> MonarchTrainerRun:
+    actors.start_forward_backward = actors.start_run_slot_forward_backward
+    run = object.__new__(MonarchTrainerRun)
+    run.runtime_spec = SimpleNamespace(
+        packed_sequence_length=8,
+        trainer_mesh=SimpleNamespace(ranks=tuple(range(actors.ranks))),
+    )
+    run.run_spec = SimpleNamespace(
+        run_id="run",
+        training_session_id="session",
+        event_timeout_s=2.0,
+        initial_event_timeout_s=None,
+    )
+    run._actors = actors
+    run._rank_processes = tuple(object() for _ in range(actors.ranks))
+    run._learner_version = 3
+    run._jobs = {}
+    run._operations = {}
+    run._forward_backward_launches = {}
+    run._operation_sequence_ids = {}
+    run._cancelled_operations = {}
+    run._next_operation_sequence = 0
+    run._open_forward_backward_ids = []
+    run._lock = asyncio.Lock()
+    run._active_job_id = None
+    run._active_collective = None
+    run._closed = False
+    run._valid = True
+    return run
+
+
+@pytest.mark.asyncio
+async def test_legacy_run_releases_forward_backward_at_gradient_ready() -> None:
+    actors = _Actors()
+    run = _legacy_run(actors)
+    job = _Job("fb-0")
+    job.run_id = "run"
+    job.training_session_id = "session"
+    job.sequence_id = 0
+    job.batch = SimpleNamespace(sequence_length=8)
+    batch = _Batch()
+    batch.ref = job.batch
+
+    launch = await run.start_forward_backward(job, batch)
+
+    assert run._next_operation_sequence == 1
+    assert run._open_forward_backward_ids == ["fb-0"]
+    assert not launch.completion.done()
+    actors.allow_host_materialization.set()
+    assert (await launch.completion)["token_count"] == 7
+    assert run._operations["fb-0"][0] == job.fingerprint
 
 
 @pytest.mark.asyncio

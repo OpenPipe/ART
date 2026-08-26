@@ -574,7 +574,7 @@ def _packed_input_fingerprint(prepared: Any) -> str:
     return _packed_batch_fingerprint(prepared)
 
 
-async def _execute_pipeline_commands(prepared: Any) -> Any:
+async def _execute_pipeline_commands(prepared: Any) -> tuple[Any, Any]:
     forward = optimizer = sampler = None
     try:
         submit_started = time.monotonic()
@@ -601,11 +601,14 @@ async def _execute_pipeline_commands(prepared: Any) -> Any:
             sampler=sampler,
             state=state,
         )
-        return await prepared.complete(
-            step=step,
-            forward=forward,
-            optimizer=optimizer,
-            forward_submit_s=forward_submit_s,
+        return (
+            await prepared.complete(
+                step=step,
+                forward=forward,
+                optimizer=optimizer,
+                forward_submit_s=forward_submit_s,
+            ),
+            sampler,
         )
     except BaseException:
         await prepared.abort(
@@ -781,7 +784,10 @@ class PolicyActivationEvent(NamedTuple):
         return self.serving_active_monotonic_s - self.trainer_completed_monotonic_s
 
 
-async def _activation_event(service: Any, step: int) -> PolicyActivationEvent:
+async def _activation_event(
+    service: Any, step: int, sampler: Any
+) -> PolicyActivationEvent:
+    await sampler.result()
     await service.wait_for_serving(step)
     completed, active = service.policy_activation_timing(step)
     return PolicyActivationEvent(step, completed, active)
@@ -1321,11 +1327,11 @@ async def _run_isolated_backend_phase(
         except BaseException:
             await _discard_prepared_pipeline_context(prepared)
             raise
-        result = await _execute_pipeline_commands(prepared)
+        result, sampler = await _execute_pipeline_commands(prepared)
         if sample_index >= _ISOLATED_WARMUP_STEPS:
             packed_input_fingerprints.append(current_packed_fingerprint)
             samples.append((result.metrics, int(result.step)))
-        await service.wait_for_serving(int(result.step))
+        await _activation_event(service, int(result.step), sampler)
     trajectory_input_fingerprint, packed_input_fingerprint = (
         _matched_input_fingerprints(
             [captured.trajectory_fingerprint for captured in captured_inputs],
@@ -2067,16 +2073,26 @@ async def _run_e2e_throughput_async(
                 def __getattr__(self, name: str) -> Any:
                     return getattr(self._inner, name)
 
+                async def commands_admitted(self, **kwargs: Any) -> None:
+                    await self._inner.commands_admitted(**kwargs)
+                    sampler = kwargs["sampler"]
+                    step = int(sampler.ref.learner_parent_version)
+                    if step in activation_tasks:
+                        raise RuntimeError(
+                            f"duplicate sampler publication for policy {step}"
+                        )
+                    activation_tasks[step] = asyncio.create_task(
+                        _activation_event(service, step, sampler),
+                        name=f"throughput-policy-activation-{step}",
+                    )
+
                 async def complete(self, **kwargs: Any) -> Any:
                     result = await self._inner.complete(**kwargs)
                     step = int(result.step)
-                    if step in activation_tasks:
+                    if step not in activation_tasks:
                         raise RuntimeError(
-                            f"duplicate trainer completion for policy {step}"
+                            f"trainer completion lacks sampler publication for policy {step}"
                         )
-                    activation_tasks[step] = asyncio.create_task(
-                        _activation_event(service, step)
-                    )
                     captured_batch_id = self._captured_batch_id
                     if captured_batch_id is not None:
                         capture_task = capture_tasks.get(captured_batch_id)

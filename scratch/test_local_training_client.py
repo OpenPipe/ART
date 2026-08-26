@@ -36,7 +36,7 @@ from art.trajectories import Trajectory
 
 
 class _Backend:
-    def __init__(self) -> None:
+    def __init__(self, *, num_dropped_trajectories: int = 0) -> None:
         ref = SimpleNamespace(
             sequence_length=8,
             num_sequences=1,
@@ -52,6 +52,7 @@ class _Backend:
             non_padding_tokens=6,
             loss_bearing_tokens=2,
             trainable_assistant_tokens=2,
+            num_dropped_trajectories=num_dropped_trajectories,
             trajectory_fetch_s=0.1,
             trajectory_receive_s=0.04,
             trajectory_build_s=0.06,
@@ -139,9 +140,7 @@ class _Service:
     async def consume_cancelled_command(self, ref) -> None:
         self.calls.append(f"cancelled:{ref.sequence_id}")
 
-    async def start_forward_backward_command(
-        self, ref, _batch, _config, _experimental
-    ):
+    async def start_forward_backward_command(self, ref, _batch, _config, _experimental):
         self.calls.append(f"fb:{ref.sequence_id}")
         completion = asyncio.get_running_loop().create_future()
         completion.set_result(
@@ -242,9 +241,7 @@ class _FailingService(_Service):
         await self.failure_release.wait()
         raise self.failure
 
-    async def start_forward_backward_command(
-        self, ref, _batch, _config, _experimental
-    ):
+    async def start_forward_backward_command(self, ref, _batch, _config, _experimental):
         if self.failure_kind == "forward_backward" and not self.failure_consumed:
             self.calls.append(f"fb:{ref.sequence_id}")
             await self._fail()
@@ -280,9 +277,7 @@ class _DelayedResultService(_Service):
         super().__init__()
         self.result_release = asyncio.Event()
 
-    async def start_forward_backward_command(
-        self, ref, _batch, _config, _experimental
-    ):
+    async def start_forward_backward_command(self, ref, _batch, _config, _experimental):
         self.calls.append(f"fb:{ref.sequence_id}")
 
         async def complete():
@@ -508,6 +503,31 @@ def test_local_forward_and_load_use_the_same_ordered_stream() -> None:
         ]
         assert service.retired_operation_ids == []
         assert client.projected_learner_version == 5
+        await client.close()
+
+    asyncio.run(run())
+
+
+def test_forward_reports_exact_dropped_trajectory_count() -> None:
+    async def run() -> None:
+        client = _Client(
+            run_id="run",
+            learner_version=3,
+            backend=_Backend(num_dropped_trajectories=3),
+            model=object(),
+            service=_Service(),
+        )
+        operation = await client.forward(
+            ForwardRequest(
+                run_id="run",
+                request_id="forward",
+                sequence_id=0,
+                batch=_batch(),
+                loss=LossConfig(name="cispo"),
+            )
+        )
+        result = await operation.result()
+        assert result.metrics["data/step_num_dropped_trajectories"] == 3.0
         await client.close()
 
     asyncio.run(run())
