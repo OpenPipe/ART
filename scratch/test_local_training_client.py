@@ -292,6 +292,23 @@ class _DelayedResultService(_Service):
         return SimpleNamespace(completion=asyncio.create_task(complete()))
 
 
+class _BlockedSnapshotStartService(_Service):
+    def __init__(self) -> None:
+        super().__init__()
+        self.snapshot_started = asyncio.Event()
+        self.snapshot_cancelled = asyncio.Event()
+
+    async def snapshot_command(self, ref, *, save_optimizer, activate_serving):
+        self.calls.append(
+            f"snapshot:{ref.sequence_id}:{save_optimizer}:{activate_serving}"
+        )
+        self.snapshot_started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            self.snapshot_cancelled.set()
+
+
 class _Client(LocalMegatronTrainingClient):
     async def _prepare_rl_batch(self, request):
         request.batch.require_local_groups()
@@ -786,6 +803,37 @@ def test_close_cancels_ten_deferred_snapshot_completions() -> None:
         assert service.retired_operation_ids == [
             operation.ref.operation_id for operation in operations
         ]
+
+    asyncio.run(run())
+
+
+def test_close_cancels_snapshot_before_launch_is_returned() -> None:
+    async def run() -> None:
+        service = _BlockedSnapshotStartService()
+        client = _Client(
+            run_id="run",
+            learner_version=3,
+            backend=_Backend(),
+            model=object(),
+            service=service,
+        )
+        operation = await client.save_state(
+            SaveStateRequest(
+                run_id="run",
+                request_id="blocked-state",
+                sequence_id=0,
+                checkpoint_name="blocked-state",
+            )
+        )
+        await asyncio.wait_for(service.snapshot_started.wait(), timeout=1)
+
+        await asyncio.wait_for(client.close(), timeout=1)
+        assert service.snapshot_cancelled.is_set()
+        assert operation._ordered.cancelled()
+        assert operation._result.cancelled()
+        assert not any(not task.done() for task in client._completion_tasks)
+        assert client._operations == {}
+        assert client._ledger._records == {}
 
     asyncio.run(run())
 

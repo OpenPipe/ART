@@ -782,13 +782,17 @@ class MonarchTrainerActor(Actor):
         name: str,
         invalidate_on_error: bool,
     ) -> None:
+        import torch
+
+        cuda_device = torch.cuda.current_device()
         with self._deferred_response_lock:
             if self._deferred_response_stopping:
                 raise RuntimeError("trainer actor is stopping")
 
             def settle() -> None:
                 try:
-                    port.send(materialize())
+                    with torch.cuda.device(cuda_device):
+                        port.send(materialize())
                 except BaseException as error:
                     if invalidate_on_error:
                         self._valid = False
@@ -2411,23 +2415,28 @@ async def _collect_command_ready(
         if isinstance(job, GenerationSnapshotJobSpec)
         else "GPU-ready"
     )
-    results = [
-        _CommandReady.model_validate(await receiver.recv()) for _ in rank_processes
-    ]
-    if {result.rank for result in results} != set(range(len(rank_processes))) or any(
-        (result.operation_id, result.learner_version)
-        != (job.operation_id, learner_version)
-        for result in results
-    ):
+    expected_ranks = set(range(len(rank_processes)))
+    received_ranks: set[int] = set()
+    for _ in rank_processes:
+        result = _CommandReady.model_validate(await receiver.recv())
+        if (
+            result.rank not in expected_ranks
+            or result.rank in received_ranks
+            or (result.operation_id, result.learner_version)
+            != (job.operation_id, learner_version)
+        ):
+            raise RuntimeError(
+                f"trainer {label} readiness has mismatched rank identity"
+            )
+        received_ranks.add(result.rank)
+        if result.error_type is not None:
+            raise RuntimeError(
+                f"trainer {label} failed before {ready_state}:\n"
+                f"rank {result.rank}: {result.error_type}: {result.message}\n"
+                f"{result.traceback_text or ''}"
+            )
+    if received_ranks != expected_ranks:
         raise RuntimeError(f"trainer {label} readiness has mismatched rank identity")
-    failures = [result for result in results if result.error_type is not None]
-    if failures:
-        details = "\n".join(
-            f"rank {result.rank}: {result.error_type}: {result.message}\n"
-            f"{result.traceback_text or ''}"
-            for result in failures
-        )
-        raise RuntimeError(f"trainer {label} failed before {ready_state}:\n{details}")
 
 
 class MonarchTrainerSlot:
