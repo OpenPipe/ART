@@ -4,8 +4,7 @@ from pydantic import BaseModel, ConfigDict, Field
 import torch
 from torch.distributed.nn.functional import all_to_all_single
 
-from .exchange_kernels import assemble_head_shards, pack_canonical_pair, pack_projected
-from .permutation import permute_rows
+from .exchange_kernels import assemble_head_shards, pack_projected, pack_recurrent_pair
 from .plan import MambaTokenExchangePlan
 
 
@@ -18,13 +17,13 @@ class MambaShardShape(BaseModel):
     state_dim: int = Field(gt=0)
 
 
-def projected_tokens_to_canonical_head_shard(
+def projected_tokens_to_recurrent_layout(
     projected: torch.Tensor,
     plan: MambaTokenExchangePlan,
     shape: MambaShardShape,
     group: object,
 ) -> torch.Tensor:
-    """Exchange token-sharded projections into canonical tokens and CP-sharded heads."""
+    """Exchange token-sharded projections into source-ordered CP head shards."""
 
     if projected.ndim != 3:
         raise ValueError(
@@ -51,43 +50,10 @@ def projected_tokens_to_canonical_head_shard(
         receive_splits=tuple(count * local_width for count in plan.source_token_counts),
         group=group,
     ).view(plan.token_count, local_width)
-    return permute_rows(received, plan.received_canonical_order)
+    return received
 
 
-def canonical_head_shard_to_token_layout(
-    canonical: torch.Tensor,
-    projected_shape: tuple[int, int, int],
-    plan: MambaTokenExchangePlan,
-    shape: MambaShardShape,
-    group: object,
-) -> torch.Tensor:
-    """Return CP head-sharded Mamba output to ART's attention token layout."""
-
-    local_inner = shape.inner // plan.cp_size
-    if canonical.ndim != 2:
-        raise ValueError(f"canonical Mamba output must be 2D, got {canonical.shape}")
-    components, remainder = divmod(int(canonical.shape[-1]), local_inner)
-    if int(canonical.shape[0]) != plan.token_count or not components or remainder:
-        raise ValueError(
-            "canonical Mamba output must contain whole CP-local head components; "
-            f"got {tuple(canonical.shape)}"
-        )
-    local_width = components * local_inner
-    output_width = components * shape.inner
-    if plan.cp_size == 1:
-        flat = canonical.new_zeros(
-            (projected_shape[0] * projected_shape[1], output_width)
-        )
-        return flat.index_copy_(0, plan.physical_token_positions, canonical).view(
-            projected_shape[0], projected_shape[1], output_width
-        )
-    send = permute_rows(canonical, plan.received_global_positions)
-    return _canonical_send_to_token_layout(
-        send, projected_shape, plan, components, local_inner, group
-    )
-
-
-def canonical_head_shard_pair_to_token_layout(
+def recurrent_layout_pair_to_token_layout(
     first: torch.Tensor,
     second: torch.Tensor,
     projected_shape: tuple[int, int, int],
@@ -95,27 +61,27 @@ def canonical_head_shard_pair_to_token_layout(
     shape: MambaShardShape,
     group: object,
 ) -> torch.Tensor:
-    """Fuse Mamba recurrent/gate packing into the return token exchange."""
+    """Fuse source-ordered recurrent/gate shards into the return exchange."""
 
     local_inner = shape.inner // plan.cp_size
     expected = (plan.token_count, local_inner)
     if tuple(first.shape) != expected or tuple(second.shape) != expected:
-        raise ValueError(f"canonical Mamba components must both have shape {expected}")
+        raise ValueError(f"Mamba recurrent components must both have shape {expected}")
     if plan.cp_size == 1:
-        return canonical_head_shard_to_token_layout(
-            torch.cat((first, second), dim=-1),
-            projected_shape,
-            plan,
-            shape,
-            group,
+        pair = torch.cat((first, second), dim=-1)
+        flat = pair.new_zeros(
+            (projected_shape[0] * projected_shape[1], 2 * shape.inner)
         )
-    send = pack_canonical_pair(first, second, plan.received_global_positions)
-    return _canonical_send_to_token_layout(
+        return flat.index_copy_(0, plan.physical_token_positions, pair).view(
+            *projected_shape[:2], 2 * shape.inner
+        )
+    send = pack_recurrent_pair(first, second)
+    return _recurrent_send_to_token_layout(
         send, projected_shape, plan, 2, local_inner, group
     )
 
 
-def _canonical_send_to_token_layout(
+def _recurrent_send_to_token_layout(
     send: torch.Tensor,
     projected_shape: tuple[int, int, int],
     plan: MambaTokenExchangePlan,

@@ -43,8 +43,7 @@ class MambaTokenExchangePlan(BaseModel):
     cp_size: int = Field(gt=0)
     source_token_counts: tuple[int, ...]
     global_positions_by_rank: tuple[torch.Tensor, ...]
-    received_global_positions: torch.Tensor
-    received_canonical_order: torch.Tensor
+    canonical_to_received: torch.Tensor
     physical_token_positions: torch.Tensor
 
     @property
@@ -99,8 +98,27 @@ def build_mamba_execution_plan(
         cp_size=cp_size,
         token_layout=token_layout,
     )
-    conv_buckets = _build_conv_buckets(tree, device)
-    scan_phases = _build_scan_phases(tree, chunk_size, device)
+    canonical_to_received = exchange.canonical_to_received
+    conv_buckets = tuple(
+        bucket.model_copy(
+            update={"token_indices": canonical_to_received[bucket.token_indices]}
+        )
+        for bucket in _build_conv_buckets(tree, device)
+    )
+    scan_phases = tuple(
+        tuple(
+            bucket.model_copy(
+                update={
+                    "token_indices": _remap_positions(
+                        bucket.token_indices, canonical_to_received
+                    ),
+                    "output_positions": canonical_to_received[bucket.output_positions],
+                }
+            )
+            for bucket in phase
+        )
+        for phase in _build_scan_phases(tree, chunk_size, device)
+    )
     conv_positions = torch.cat(tuple(bucket.token_indices for bucket in conv_buckets))
     scan_positions = torch.cat(
         tuple(
@@ -366,13 +384,23 @@ def _build_exchange_plan(
         cp_size=cp_size,
         source_token_counts=tuple(len(positions) for positions in positions_by_rank),
         global_positions_by_rank=tensors,
-        received_global_positions=received_global_positions,
-        received_canonical_order=_canonical_order(
+        canonical_to_received=_canonical_order(
             received_global_positions, tree.token_count
         ),
         physical_token_positions=torch.tensor(
             tree.physical_token_positions, dtype=torch.long, device=device
         ),
+    )
+
+
+def _remap_positions(
+    positions: torch.Tensor, canonical_to_received: torch.Tensor
+) -> torch.Tensor:
+    valid = positions >= 0
+    return torch.where(
+        valid,
+        canonical_to_received[positions.clamp_min(0)],
+        -1,
     )
 
 

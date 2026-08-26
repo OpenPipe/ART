@@ -216,10 +216,9 @@ def _disassemble_head_shards_grad_kernel(
 
 
 @triton.jit(do_not_specialize=["tokens"])
-def _pack_canonical_pair_kernel(
+def _pack_recurrent_pair_kernel(
     first,
     second,
-    order,
     output,
     tokens,
     width: tl.constexpr,
@@ -230,7 +229,7 @@ def _pack_canonical_pair_kernel(
 ):
     n = tl.program_id(0) * BLOCK_N + tl.arange(0, BLOCK_N)
     d = tl.program_id(1) * BLOCK_D + tl.arange(0, BLOCK_D)
-    source_row = tl.load(order + n, mask=n < tokens, other=0).to(tl.int64)
+    source_row = n.to(tl.int64)
     first_component = d[None, :] < width
     first_value = tl.load(
         first + source_row[:, None] * first_stride + d[None, :].to(tl.int64),
@@ -251,9 +250,8 @@ def _pack_canonical_pair_kernel(
 
 
 @triton.jit(do_not_specialize=["tokens"])
-def _unpack_canonical_pair_grad_kernel(
+def _unpack_recurrent_pair_grad_kernel(
     grad,
-    order,
     grad_first,
     grad_second,
     tokens,
@@ -263,7 +261,7 @@ def _unpack_canonical_pair_grad_kernel(
 ):
     n = tl.program_id(0) * BLOCK_N + tl.arange(0, BLOCK_N)
     d = tl.program_id(1) * BLOCK_D + tl.arange(0, BLOCK_D)
-    destination = tl.load(order + n, mask=n < tokens, other=0).to(tl.int64)
+    destination = n.to(tl.int64)
     mask = (n[:, None] < tokens) & (d[None, :] < width)
     first_value = tl.load(
         grad + n[:, None].to(tl.int64) * (2 * width) + d[None, :].to(tl.int64),
@@ -410,22 +408,20 @@ class _AssembleHeadShards(torch.autograd.Function):
         return output.flatten(), None, None, None, None, None
 
 
-class _PackCanonicalPair(torch.autograd.Function):
+class _PackRecurrentPair(torch.autograd.Function):
     @staticmethod
     def forward(
         ctx: Any,
         first: torch.Tensor,
         second: torch.Tensor,
-        order: torch.Tensor,
     ) -> torch.Tensor:
         tokens, width = first.shape
         output = first.new_empty((tokens, 2 * width))
-        _pack_canonical_pair_kernel[
+        _pack_recurrent_pair_kernel[
             (triton.cdiv(tokens, _BLOCK_N), triton.cdiv(2 * width, _BLOCK_D))
         ](
             first,
             second,
-            order,
             output,
             tokens,
             width,
@@ -435,24 +431,19 @@ class _PackCanonicalPair(torch.autograd.Function):
             _BLOCK_D,
             num_warps=8,
         )
-        ctx.save_for_backward(order)
         ctx.shape = (tokens, width)
         return output
 
     @staticmethod
-    def backward(
-        ctx: Any, grad: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, None]:
-        (order,) = ctx.saved_tensors
+    def backward(ctx: Any, grad: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         tokens, width = ctx.shape
         grad = grad.contiguous()
         first = grad.new_empty((tokens, width))
         second = grad.new_empty((tokens, width))
-        _unpack_canonical_pair_grad_kernel[
+        _unpack_recurrent_pair_grad_kernel[
             (triton.cdiv(tokens, _BLOCK_N), triton.cdiv(width, _BLOCK_D))
         ](
             grad,
-            order,
             first,
             second,
             tokens,
@@ -461,7 +452,7 @@ class _PackCanonicalPair(torch.autograd.Function):
             _BLOCK_D,
             num_warps=8,
         )
-        return first, second, None
+        return first, second
 
 
 def pack_projected(
@@ -490,9 +481,7 @@ def assemble_head_shards(
     )
 
 
-def pack_canonical_pair(
-    first: torch.Tensor, second: torch.Tensor, order: torch.Tensor
-) -> torch.Tensor:
+def pack_recurrent_pair(first: torch.Tensor, second: torch.Tensor) -> torch.Tensor:
     if first.shape != second.shape or first.ndim != 2:
-        raise ValueError("canonical Mamba components must have equal 2D shapes")
-    return _PackCanonicalPair.apply(first, second, order)
+        raise ValueError("Mamba recurrent components must have equal 2D shapes")
+    return _PackRecurrentPair.apply(first, second)
