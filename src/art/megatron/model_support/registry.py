@@ -18,6 +18,7 @@ _GEMMA4_MOE_HANDLER_KEY = "gemma4_moe"
 _DSV4_HANDLER_KEY = "dsv4"
 _GLM52_HANDLER_KEY = "glm52"
 _GPT_OSS_MOE_HANDLER_KEY = "gpt_oss_moe"
+_NEMOTRON_H_HANDLER_KEY = "nemotron_h_moe"
 _VALIDATED_NATIVE_VLLM_LORA_STATUS: NativeVllmLoraStatus = "validated"
 _WIP_NATIVE_VLLM_LORA_STATUS: NativeVllmLoraStatus = "wip"
 _DISABLED_NATIVE_VLLM_LORA_STATUS: NativeVllmLoraStatus = "disabled"
@@ -80,6 +81,18 @@ _GLM52_TARGET_MODULES = (
     "q_b_proj",
     "kv_a_proj_with_mqa",
     "o_proj",
+    "gate_proj",
+    "up_proj",
+    "down_proj",
+    "experts",
+)
+_NEMOTRON_H_TARGET_MODULES = (
+    "q_proj",
+    "k_proj",
+    "v_proj",
+    "o_proj",
+    "in_proj",
+    "out_proj",
     "gate_proj",
     "up_proj",
     "down_proj",
@@ -261,6 +274,18 @@ GPT_OSS_MOE_SPEC = ModelSupportSpec(
     ),
 )
 
+NEMOTRON_H_SPEC = ModelSupportSpec(
+    key="nemotron_h_moe",
+    handler_key=_NEMOTRON_H_HANDLER_KEY,
+    is_moe=True,
+    model_names=("nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",),
+    default_target_modules=_NEMOTRON_H_TARGET_MODULES,
+    native_vllm_lora_status=_WIP_NATIVE_VLLM_LORA_STATUS,
+    dependency_floor=DependencyFloor(
+        megatron_bridge="e1a207ac757e5d0ed94d8ffbe1cbd28e81d8c084",
+    ),
+)
+
 VALIDATED_MODEL_SUPPORT_SPECS = (
     LLAMA3_DENSE_SPEC,
     QWEN3_MOE_SPEC,
@@ -273,7 +298,7 @@ VALIDATED_MODEL_SUPPORT_SPECS = (
     GLM52_SPEC,
     GPT_OSS_MOE_SPEC,
 )
-PROBE_ONLY_MODEL_SUPPORT_SPECS: tuple[ModelSupportSpec, ...] = ()
+PROBE_ONLY_MODEL_SUPPORT_SPECS: tuple[ModelSupportSpec, ...] = (NEMOTRON_H_SPEC,)
 _ALL_MODEL_SUPPORT_SPECS = (
     DEFAULT_DENSE_SPEC,
     *VALIDATED_MODEL_SUPPORT_SPECS,
@@ -335,6 +360,10 @@ _HANDLER_IMPORTS: dict[str, tuple[str, str]] = {
         "art.megatron.model_support.handlers.gpt_oss",
         "GPT_OSS_MOE_HANDLER",
     ),
+    _NEMOTRON_H_HANDLER_KEY: (
+        "art.megatron.model_support.handlers.nemotron_h",
+        "NEMOTRON_H_HANDLER",
+    ),
 }
 _BRIDGE_REGISTRATION_IMPORTS: dict[str, tuple[str, str]] = {
     "qwen3_5_dense": (
@@ -372,6 +401,7 @@ GEMMA4_DENSE_MODELS = frozenset(GEMMA4_DENSE_SPEC.model_names)
 DSV4_MODELS = frozenset(DSV4_SPEC.model_names)
 GLM52_MODELS = frozenset(GLM52_SPEC.model_names)
 GPT_OSS_MOE_MODELS = frozenset(GPT_OSS_MOE_SPEC.model_names)
+NEMOTRON_H_MODELS = frozenset(NEMOTRON_H_SPEC.model_names)
 
 
 class UnsupportedModelArchitectureError(ValueError):

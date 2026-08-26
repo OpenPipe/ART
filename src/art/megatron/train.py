@@ -1387,10 +1387,12 @@ def _forward_prepared_rl_micro(
         position_ids=prepared_micro.model_input_pos,
         attention_mask=_placeholder_attention_mask(device),
         packed_seq_params=prepared_micro.packed_seq_params,
-        **model_support_handler.get_forward_kwargs(
+    )
+    model_forward_kwargs.update(
+        model_support_handler.get_forward_kwargs(
             model,
             attention_bias=prepared_micro.attention_state,
-        ),
+        )
     )
     with attach_trace_token_uids(model_chunks, prepared_micro.local_token_uids):
         if chunk_post_process(model):
@@ -1557,14 +1559,16 @@ def _calculate_megatron_logprob_batch(
                 model_chunks[0],
                 labels=prepared.model_labels,
                 selection=prepared.lm_head_selection,
-                forward_kwargs=dict(
-                    input_ids=prepared.model_tokens,
-                    position_ids=prepared.model_input_pos,
-                    attention_mask=_placeholder_attention_mask(device),
-                    packed_seq_params=prepared.packed_seq_params,
-                    **model_support_handler.get_forward_kwargs(
+                forward_kwargs=(
+                    dict(
+                        input_ids=prepared.model_tokens,
+                        position_ids=prepared.model_input_pos,
+                        attention_mask=_placeholder_attention_mask(device),
+                        packed_seq_params=prepared.packed_seq_params,
+                    )
+                    | model_support_handler.get_forward_kwargs(
                         model_chunks[0], attention_bias=prepared.attention_state
-                    ),
+                    )
                 ),
                 enabled=False,
             )
@@ -1847,10 +1851,12 @@ def _forward_prepared_score_micro(
         position_ids=prepared.model_input_pos,
         attention_mask=_placeholder_attention_mask(device),
         packed_seq_params=prepared.packed_seq_params,
-        **model_support_handler.get_forward_kwargs(
+    )
+    forward_kwargs.update(
+        model_support_handler.get_forward_kwargs(
             model_chunk,
             attention_bias=prepared.attention_state,
-        ),
+        )
     )
     with attach_trace_token_uids(model_chunks, prepared.local_token_uids):
         if chunk_post_process(model_chunk):
@@ -2436,9 +2442,11 @@ def run_megatron_sft_step(
             position_ids=prepared.position_ids,
             attention_mask=_placeholder_attention_mask(device),
             packed_seq_params=prepared.packed_seq_params,
-            **model_support_handler.get_forward_kwargs(
+        )
+        kwargs.update(
+            model_support_handler.get_forward_kwargs(
                 model, attention_bias=prepared.attention_state
-            ),
+            )
         )
         with attach_trace_token_uids(model_chunks, prepared.local_token_uids):
             if chunk_post_process(model):

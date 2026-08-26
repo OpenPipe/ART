@@ -610,6 +610,31 @@ def _enforce_ep_overlap_recompute_contract(provider: GPTModelProvider) -> None:
 
 def _install_art_training_flex_attention(provider: GPTModelProvider) -> None:
     _register_art_flex_attention_mapping_types()
+    if hasattr(provider, "mamba_stack_spec"):
+        base_stack_spec = provider.mamba_stack_spec
+
+        def _flex_attention_mamba_stack_spec(config: Any) -> object:
+            module_spec_type = _optional_module_spec_type()
+            if module_spec_type is not None and isinstance(
+                base_stack_spec, module_spec_type
+            ):
+                stack_spec = copy.deepcopy(base_stack_spec)
+            elif inspect.signature(base_stack_spec).parameters:
+                stack_spec = base_stack_spec(config)
+            else:
+                stack_spec = base_stack_spec()
+            attention_layer = stack_spec.submodules.attention_layer
+            patch_art_flex_attention(attention_layer, config)
+            return stack_spec
+
+        provider.mamba_stack_spec = cast(Any, _flex_attention_mamba_stack_spec)
+        return
+
+    if not hasattr(provider, "transformer_layer_spec"):
+        raise TypeError(
+            f"Unsupported Megatron provider type {type(provider).__name__}: expected "
+            "transformer_layer_spec or mamba_stack_spec"
+        )
     base_layer_spec = provider.transformer_layer_spec
 
     def _flex_attention_layer_spec(
