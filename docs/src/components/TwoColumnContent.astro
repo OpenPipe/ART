@@ -1,34 +1,9 @@
----
-const { headings, toc } = Astro.locals.starlightRoute;
-
-// Starlight's generated TOC always contains the page title. Treat the page as
-// two-column only when it also has a heading that the configured TOC displays.
-// This keeps empty TOC rails out of the layout instead of compensating for
-// them later with page-specific width overrides.
-const hasTableOfContents = Boolean(
-  toc &&
-    headings.some(
-      ({ depth }) =>
-        depth >= toc.minHeadingLevel && depth <= toc.maxHeadingLevel,
-    ),
-);
----
-
-<div
-  class:list={[
-    "art-two-column lg:sl-flex",
-    { "art-two-column-has-toc": hasTableOfContents },
-  ]}
->
-  {
-    hasTableOfContents && (
-      <aside class="right-sidebar-container print:hidden">
-        <div class="right-sidebar">
-          <slot name="right-sidebar" />
-        </div>
-      </aside>
-    )
-  }
+<div class="art-two-column lg:sl-flex">
+  <aside class="right-sidebar-container print:hidden">
+    <div class="right-sidebar">
+      <slot name="right-sidebar" />
+    </div>
+  </aside>
   <div class="main-pane"><slot /></div>
 </div>
 
@@ -43,19 +18,14 @@ const hasTableOfContents = Boolean(
       .right-sidebar-container {
         order: 2;
         position: relative;
-        width: max(
-          var(--sl-sidebar-width),
-          calc(
-            var(--sl-sidebar-width) +
-              (100% - var(--sl-content-width) - var(--sl-sidebar-width)) / 2
-          )
-        );
+        flex: 0 0 var(--art-right-rail-width);
+        width: var(--art-right-rail-width);
       }
 
       .right-sidebar {
         position: fixed;
         top: 0;
-        width: 100%;
+        width: var(--art-right-rail-width);
         height: 100vh;
         padding-top: var(--sl-nav-height);
         overflow-y: auto;
@@ -63,20 +33,9 @@ const hasTableOfContents = Boolean(
       }
 
       .main-pane {
-        width: 100%;
-      }
-
-      .art-two-column-has-toc .main-pane {
-        --sl-content-margin-inline: auto 0;
-
         order: 1;
-        width: min(
-          calc(100% - var(--sl-sidebar-width)),
-          calc(
-            var(--sl-content-width) +
-              (100% - var(--sl-content-width) - var(--sl-sidebar-width)) / 2
-          )
-        );
+        flex: 0 0 calc(100% - var(--art-right-rail-width));
+        width: calc(100% - var(--art-right-rail-width));
       }
     }
   }

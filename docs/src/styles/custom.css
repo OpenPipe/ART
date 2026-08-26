@@ -12,10 +12,13 @@
 
   /* Layout */
   --sl-content-width: 45rem;
-  --sl-sidebar-width: 20rem;
+  --sl-sidebar-width: 18rem;
   --sl-nav-height: 4rem;
   --sl-nav-pad-x: 3rem;
   --sl-content-pad-x: 2.5rem;
+  --art-shell-width: 92rem;
+  --art-shell-pad-x: 2rem;
+  --art-right-rail-width: 20rem;
   --art-toc-width: 16.5rem;
 
   /* Shape */
@@ -375,13 +378,6 @@ site-search button[data-open-modal] > span::after {
 
 .sl-markdown-content {
   color: var(--sl-color-gray-2);
-}
-
-/* Mintlify lets pages without an on-page table of contents use the full
-   reading column. Keep the narrower measure when a TOC is present, but give
-   tables and prose-only pages the same 69rem canvas as the source site. */
-body:not(:has(.right-sidebar-panel a[href^="#"]:not([href="#_top"]))) {
-  --sl-content-width: 69rem;
 }
 
 /* Mintlify links read like emphasized text with a brand-color underline,
@@ -924,6 +920,7 @@ mobile-starlight-toc:not(:has(a[href^="#"]:not([href="#_top"]))) {
 @media (min-width: 72rem) {
   .right-sidebar-panel {
     padding-block: 2.5rem 1rem;
+    padding-inline: 3.5rem 0;
   }
 
   /* The outer rail also carries the whitespace that balances the article.
