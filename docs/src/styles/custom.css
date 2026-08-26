@@ -338,10 +338,6 @@ site-search button[data-open-modal] > span::after {
   padding-block: 2.5rem;
 }
 
-.content-panel .sl-container {
-  margin-inline: 0;
-}
-
 /* Starlight separates the title panel from the body with a rule; Mintlify
    runs them together. */
 .content-panel + .content-panel {
@@ -923,31 +919,18 @@ mobile-starlight-toc:not(:has(a[href^="#"]:not([href="#_top"]))) {
   }
 }
 
-/* Widen the right rail to Mintlify's proportions once there's room for it. */
+/* Match the visible TOC column to Mintlify while the structural rail keeps
+   Starlight's balanced wide-screen content positioning. */
 @media (min-width: 72rem) {
-  .right-sidebar-container,
-  .right-sidebar {
-    width: var(--art-toc-width);
-  }
-
-  .main-pane {
-    width: calc(100% - var(--art-toc-width));
-  }
-
-  body:not(:has(.right-sidebar-panel a[href^="#"]:not([href="#_top"])))
-    .main-pane {
-    width: 100%;
-  }
-
   .right-sidebar-panel {
     padding-block: 2.5rem 1rem;
   }
 
-  /* Starlight fixes this container at 18rem, which is wider than our rail and
-     pushes long entries off-screen. Let it fill the rail instead. */
+  /* The outer rail also carries the whitespace that balances the article.
+     Limit only its visible TOC content, not the structural rail itself. */
   .right-sidebar-panel .sl-container {
-    width: 100%;
-    max-width: none;
+    width: var(--art-toc-width);
+    max-width: var(--art-toc-width);
     margin: 0;
   }
 }
