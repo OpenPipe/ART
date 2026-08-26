@@ -110,6 +110,7 @@ def _forward_backward_result(operation_id: str) -> ForwardBackwardResult:
         loss_fn_outputs=(
             LossFnOutput(token_logprobs=TokenLogprobs(shape=(3,), data=b"x" * 12)),
         ),
+        produced_gradient=True,
     )
 
 

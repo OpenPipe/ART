@@ -498,7 +498,7 @@ class ForwardResult(OperationResult):
 
 
 class ForwardBackwardResult(ForwardResult):
-    produced_gradient: bool = True
+    produced_gradient: bool
 
     @model_validator(mode="after")
     def _validate_gradient(self) -> "ForwardBackwardResult":

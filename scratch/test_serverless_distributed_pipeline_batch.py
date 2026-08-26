@@ -591,6 +591,7 @@ def _forward_result(operation_id: str) -> ForwardBackwardResult:
             "pipeline/gradient_step_real_microbatches": 1.0,
             "pipeline/gradient_step_dummy_microbatches": 0.0,
         },
+        produced_gradient=True,
     )
 
 
