@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 from types import SimpleNamespace
 from typing import Any
 
 from pydantic import ValidationError
 import pytest
 
-from art.distributed.trajectory_store import TrajectoryGroupBundle
+from art.distributed.trajectory_store import (
+    TrajectoryGroupBundle,
+    TrajectoryGroupDataIdentity,
+)
 import art.megatron.training.client as client_module
 from art.megatron.training.client import LocalMegatronTrainingClient
 from art.training.contracts import (
@@ -46,12 +50,22 @@ def _client(
 
 
 def _forward_backward(request_id: str, sequence_id: int) -> ForwardBackwardRequest:
+    header = b"header"
     return ForwardBackwardRequest(
         run_id="run",
         request_id=request_id,
         sequence_id=sequence_id,
         batch=RlTrajectoryBatch(
-            groups=(TrajectoryGroupBundle(header=b"header", records=()),),
+            groups=(
+                TrajectoryGroupBundle(
+                    header=header,
+                    records=(),
+                    route_free_identity=TrajectoryGroupDataIdentity(
+                        sha256=hashlib.sha256(header).hexdigest(),
+                        byte_count=len(header),
+                    ),
+                ),
+            ),
             min_source_version=0,
             max_source_version=0,
         ),
