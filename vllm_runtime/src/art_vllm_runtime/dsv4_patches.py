@@ -1,13 +1,23 @@
 """DSV4-specific monkey patches for the ART-owned vLLM runtime."""
 
+from copy import copy
 import functools
 import importlib
+import inspect
 from typing import Any
+
+from packaging.version import Version
+import torch
 
 
 def apply_dsv4_vllm_runtime_patches() -> None:
-    patch_layerwise_reload_shadow_attrs()
-    patch_dsv4_attn_sink_layerwise_reload()
+    model = _require_dsv4_vllm_0251_contract()
+    if getattr(model, "_art_dsv4_runtime_patched", False):
+        return
+    patch_dsv4_hash_moe_config()
+    patch_dsv4_dummy_hash_routes()
+    patch_dsv4_rope_config()
+    patch_dsv4_compress_ratio_config()
     patch_dsv4_mhc_pre_fixed_split()
     patch_dsv4_mhc_stable_transition()
     patch_dsv4_lora_support()
@@ -15,178 +25,184 @@ def apply_dsv4_vllm_runtime_patches() -> None:
     patch_dsv4_fast_path_lora()
     patch_dsv4_triton_moe_topk6_routing()
     patch_lora_linear_base_attr_proxy()
-    patch_marlin_lora_swiglu_limit()
+    model._art_dsv4_runtime_patched = True
 
 
-def _drop_reload_shadow_attrs(layer: Any, names: Any) -> None:
-    for name in names:
-        if (
-            name in getattr(layer, "__dict__", {})
-            and name not in layer._parameters
-            and name not in layer._buffers
-            and name not in layer._modules
-        ):
-            delattr(layer, name)
+def _require_dsv4_vllm_0251_contract() -> Any:
+    import vllm
+
+    if Version(vllm.__version__).base_version != "0.25.1":
+        raise RuntimeError(
+            "ART DSV4 runtime patches require vLLM 0.25.1 exactly; "
+            f"found {vllm.__version__}"
+        )
+    model = importlib.import_module("vllm.models.deepseek_v4.nvidia.model")
+    flashmla = importlib.import_module("vllm.models.deepseek_v4.nvidia.flashmla")
+    flashinfer = importlib.import_module(
+        "vllm.models.deepseek_v4.nvidia.flashinfer_sparse"
+    )
+    required = (
+        (model.DeepseekV4Model.load_weights, ("self", "weights")),
+        (model.DeepseekV4ForCausalLM.load_weights, ("self", "weights")),
+        (flashmla.DeepseekV4FlashMLAAttention._o_proj, ("self", "o", "positions")),
+        (
+            flashinfer.DeepseekV4FlashInferMLAAttention._o_proj,
+            ("self", "o", "positions"),
+        ),
+        (
+            flashinfer.DeepseekV4FlashInferSM120Attention._o_proj,
+            ("self", "o", "positions"),
+        ),
+    )
+    for function, expected in required:
+        actual = tuple(inspect.signature(function).parameters)
+        if actual != expected:
+            raise RuntimeError(
+                f"vLLM DSV4 patch contract changed for {function}: "
+                f"{actual} != {expected}"
+            )
+    routing = importlib.import_module("vllm.third_party.triton_kernels.routing")
+    if not hasattr(routing.SortTokens, "forward"):
+        raise RuntimeError("vLLM DSV4 routing patch target is unavailable")
+    return model
 
 
-def patch_layerwise_reload_shadow_attrs() -> None:
-    """Allow vLLM layerwise reload to restore processed DSV4 MegaMoE params.
+def patch_dsv4_hash_moe_config() -> None:
+    """Bridge the canonical hash-MoE layer list into vLLM's count field."""
+    from transformers import configuration_utils
+    from vllm.transformers_utils.configs.deepseek_v4 import DeepseekV4Config
 
-    DeepSeek V4 MegaMoE drops loader-side Parameters after transforming them for
-    DeepGEMM. Some vLLM builds leave same-name plain attributes behind; PyTorch
-    then rejects register_parameter during the next checkpoint-format reload.
-    """
-    from vllm.model_executor.model_loader.reload import layerwise, meta
-
-    if getattr(meta, "_art_reload_shadow_attrs_patched", False):
+    if "hash_moe" not in configuration_utils.ALLOWED_LAYER_TYPES:
+        configuration_utils.ALLOWED_LAYER_TYPES += ("hash_moe",)
+    original = DeepseekV4Config.__init__
+    if getattr(original, "__art_hash_moe_patched__", False):
         return
 
-    original_restore_layer_on_meta = meta.restore_layer_on_meta
-    original_place_kernel_tensors = layerwise._place_kernel_tensors
-
-    def restore_layer_on_meta(layer: Any, info: Any) -> None:
-        restore_params, restore_buffers = info.restore_metadata
-        _drop_reload_shadow_attrs(layer, tuple(restore_params) + tuple(restore_buffers))
-        return original_restore_layer_on_meta(layer, info)
-
-    def _place_kernel_tensors(layer: Any, info: Any) -> None:
-        assert info.kernel_tensors is not None
-        parameters, buffers = info.kernel_tensors
-        _drop_reload_shadow_attrs(layer, tuple(parameters) + tuple(buffers))
-        return original_place_kernel_tensors(layer, info)
-
-    restore_layer_on_meta.__art_patched__ = True  # type: ignore[attr-defined]
-    _place_kernel_tensors.__art_patched__ = True  # type: ignore[attr-defined]
-    meta.restore_layer_on_meta = restore_layer_on_meta  # type: ignore[method-assign]
-    layerwise.restore_layer_on_meta = restore_layer_on_meta  # type: ignore[method-assign]
-    layerwise._place_kernel_tensors = _place_kernel_tensors  # type: ignore[method-assign]
-    setattr(meta, "_art_reload_shadow_attrs_patched", True)
-
-
-def _import_dsv4_model_module() -> Any | None:
-    for module_name in (
-        "vllm.model_executor.models.deepseek_v4",
-        "vllm.models.deepseek_v4.nvidia.model",
-    ):
-        try:
-            return importlib.import_module(module_name)
-        except ImportError:
-            continue
-    return None
-
-
-def patch_dsv4_attn_sink_layerwise_reload() -> None:
-    """Route DSV4 attention-sink loads through vLLM's layerwise loader.
-
-    Merged-weight transfer uses vLLM checkpoint-format reload. During that path,
-    every loadable parameter must be applied through its `weight_loader`; direct
-    `copy_` into `attn_sink` bypasses layerwise accounting and finalize restores
-    the old kernel tensor. With `load_format=dummy`, that old tensor is the
-    initialized sink, not the checkpoint sink.
-    """
-    dsv4_model = _import_dsv4_model_module()
-    if dsv4_model is None:
-        return
-    from vllm.model_executor.models.utils import is_pp_missing_parameter
-
-    model_cls = getattr(dsv4_model, "DeepseekV4Model", None)
-    if model_cls is None:
-        return
-    original = model_cls.load_weights
-    if getattr(original, "__art_patched__", False):
-        return
-
-    def load_weights(self: Any, weights: Any) -> set[str]:
-        stacked_params_mapping = [
-            ("gate_up_proj", "w1", 0),
-            ("gate_up_proj", "w3", 1),
-            ("attn.fused_wqa_wkv", "attn.wq_a", 0),
-            ("attn.fused_wqa_wkv", "attn.wkv", 1),
-            ("compressor.fused_wkv_wgate", "compressor.wkv", 0),
-            ("compressor.fused_wkv_wgate", "compressor.wgate", 1),
-        ]
-        params_dict = dict(self.named_parameters())
-        loaded_params: set[str] = set()
-
-        tp_size = dsv4_model.get_tensor_model_parallel_world_size()
-        tp_rank = dsv4_model.get_tensor_model_parallel_rank()
-        n_head = self.config.num_attention_heads
-        n_local_head = n_head // tp_size
-        head_rank_start = n_local_head * tp_rank
-        head_rank_end = n_local_head * (tp_rank + 1)
-        expert_mapping = self.get_expert_mapping()
-
-        for name, loaded_weight in weights:
-            for param_name, weight_name, shard_id in stacked_params_mapping:
-                if ".experts." in name:
-                    continue
-                if weight_name not in name:
-                    continue
-                name = name.replace(weight_name, param_name)
-
-                if is_pp_missing_parameter(name, self):
-                    break
-                param = params_dict[name]
-                param.weight_loader(param, loaded_weight, shard_id)
-                loaded_params.add(name)
-                break
-            else:
-                if ".experts." in name:
-                    if (
-                        "weight_scale" in name
-                        and loaded_weight.dtype == dsv4_model.torch.float8_e8m0fnu
-                    ):
-                        loaded_weight = loaded_weight.view(dsv4_model.torch.uint8)
-                    for mapping in expert_mapping:
-                        param_name, weight_name, expert_id, expert_shard_id = mapping
-                        if weight_name not in name:
-                            continue
-                        name_mapped = name.replace(weight_name, param_name)
-                        if is_pp_missing_parameter(name_mapped, self):
-                            continue
-                        param = params_dict[name_mapped]
-                        success = param.weight_loader(
-                            param,
-                            loaded_weight,
-                            name_mapped,
-                            shard_id=expert_shard_id,
-                            expert_id=expert_id,
-                            return_success=True,
-                        )
-                        if success:
-                            name = name_mapped
-                            break
-                    loaded_params.add(name_mapped)
-                    continue
-                if "attn_sink" in name:
-                    if is_pp_missing_parameter(name, self):
-                        continue
-                    param = params_dict[name]
-                    narrow_weight = loaded_weight[head_rank_start:head_rank_end]
-                    padded_weight = loaded_weight.new_full(
-                        tuple(param.shape), -float("inf")
-                    )
-                    padded_weight[: narrow_weight.shape[0]].copy_(narrow_weight)
-                    weight_loader = getattr(
-                        param, "weight_loader", dsv4_model.default_weight_loader
-                    )
-                    weight_loader(param, padded_weight)
-                    loaded_params.add(name)
-                    continue
-
-                if is_pp_missing_parameter(name, self):
-                    continue
-                param = params_dict[name]
-                weight_loader = getattr(
-                    param, "weight_loader", dsv4_model.default_weight_loader
+    def __init__(self: Any, *args: Any, **kwargs: Any) -> None:
+        layer_types = list(kwargs.get("mlp_layer_types", ()) or ())
+        if layer_types:
+            num_hash_layers = next(
+                (
+                    index
+                    for index, layer_type in enumerate(layer_types)
+                    if layer_type != "hash_moe"
+                ),
+                len(layer_types),
+            )
+            if "hash_moe" in layer_types[num_hash_layers:]:
+                raise ValueError("DSV4 hash-MoE layers must form a contiguous prefix")
+            configured = kwargs.setdefault("num_hash_layers", num_hash_layers)
+            if int(configured) != num_hash_layers:
+                raise ValueError(
+                    "DSV4 num_hash_layers disagrees with mlp_layer_types: "
+                    f"{configured} != {num_hash_layers}"
                 )
-                weight_loader(param, loaded_weight)
-                loaded_params.add(name)
+        original(self, *args, **kwargs)
 
-        return loaded_params
+    __init__.__art_hash_moe_patched__ = True  # type: ignore[attr-defined]
+    __init__.__art_original__ = original  # type: ignore[attr-defined]
+    DeepseekV4Config.__init__ = __init__
 
-    load_weights.__art_patched__ = True  # type: ignore[attr-defined]
-    model_cls.load_weights = load_weights  # type: ignore[method-assign]
+
+def patch_dsv4_dummy_hash_routes() -> None:
+    """Make dummy hash routes valid, deterministic replay inputs."""
+    from vllm.model_executor.models.utils import extract_layer_index
+    from vllm.models.deepseek_v4.nvidia.model import DeepseekV4MoE
+
+    original = DeepseekV4MoE.__init__
+    if getattr(original, "__art_dummy_hash_routes_patched__", False):
+        return
+
+    def __init__(self: Any, vllm_config: Any, prefix: str = "") -> None:
+        original(self, vllm_config, prefix)
+        table = self.gate.tid2eid
+        if vllm_config.load_config.load_format != "dummy" or table is None:
+            return
+        num_experts = int(self.n_routed_experts)
+        topk = int(table.shape[1])
+        if topk > num_experts:
+            raise ValueError(
+                f"DSV4 hash top-k exceeds expert count: {topk} > {num_experts}"
+            )
+        tokens = torch.arange(table.shape[0], dtype=table.dtype, device=table.device)
+        offsets = torch.arange(topk, dtype=table.dtype, device=table.device)
+        starts = tokens * (topk + 1) + (extract_layer_index(prefix) + 1) * topk
+        with torch.no_grad():
+            table.copy_((starts[:, None] + offsets).remainder(num_experts))
+
+    __init__.__art_dummy_hash_routes_patched__ = True  # type: ignore[attr-defined]
+    __init__.__art_original__ = original  # type: ignore[attr-defined]
+    DeepseekV4MoE.__init__ = __init__
+
+
+def patch_dsv4_rope_config() -> None:
+    """Bridge Transformers 5's per-attention RoPE sets into vLLM 0.25."""
+    attention = importlib.import_module("vllm.models.deepseek_v4.attention")
+    rope = importlib.import_module("vllm.models.deepseek_v4.common.rope")
+    original = rope.build_deepseek_v4_rope
+    if getattr(original, "__art_nested_rope_config_patched__", False):
+        return
+
+    def build_deepseek_v4_rope(
+        config: Any, *, compress_ratio: int, **kwargs: Any
+    ) -> Any:
+        parameter_sets = getattr(config, "rope_parameters", None)
+        if not isinstance(parameter_sets, dict) or not {
+            "main",
+            "compress",
+        }.issubset(parameter_sets):
+            return original(config, compress_ratio=compress_ratio, **kwargs)
+        compat_config = copy(config)
+        compat_config.rope_parameters = dict(
+            parameter_sets["compress" if compress_ratio > 1 else "main"]
+        )
+        return original(
+            compat_config,
+            compress_ratio=compress_ratio,
+            **kwargs,
+        )
+
+    build_deepseek_v4_rope.__art_nested_rope_config_patched__ = True  # type: ignore[attr-defined]
+    rope.build_deepseek_v4_rope = build_deepseek_v4_rope
+    attention.build_deepseek_v4_rope = build_deepseek_v4_rope
+
+
+def _normalize_dsv4_compress_ratios(config: Any) -> None:
+    if getattr(config, "compress_ratios", None) is not None:
+        return
+    layer_types = list(getattr(config, "layer_types", ()) or ())
+    num_layers = int(getattr(config, "num_hidden_layers", 0))
+    if len(layer_types) != num_layers:
+        raise ValueError(
+            "DSV4 layer_types must match num_hidden_layers: "
+            f"{len(layer_types)} != {num_layers}"
+        )
+    rates = dict(getattr(config, "compress_rates", {}) or {})
+    supported = {"sliding_attention", *rates}
+    unknown = sorted(set(layer_types) - supported)
+    if unknown:
+        raise ValueError(f"Unsupported DSV4 layer types: {unknown}")
+    config.compress_ratios = [
+        int(rates.get(layer_type, 0)) for layer_type in layer_types
+    ]
+
+
+def patch_dsv4_compress_ratio_config() -> None:
+    """Bridge Transformers 5 DSV4 config names into vLLM 0.25."""
+    attention = importlib.import_module("vllm.models.deepseek_v4.attention")
+    attention_cls = attention.DeepseekV4Attention
+    marker = "_art_compress_ratio_config_patched"
+    if getattr(attention_cls, marker, False):
+        return
+    original = attention_cls.__init__
+
+    def __init__(self: Any, vllm_config: Any, *args: Any, **kwargs: Any) -> None:
+        _normalize_dsv4_compress_ratios(vllm_config.model_config.hf_config)
+        original(self, vllm_config, *args, **kwargs)
+
+    __init__.__art_original__ = original  # type: ignore[attr-defined]
+    attention_cls.__init__ = __init__
+    setattr(attention_cls, marker, True)
 
 
 def patch_dsv4_mhc_pre_fixed_split() -> None:
@@ -279,11 +295,9 @@ def patch_dsv4_lora_support() -> None:
     point this patch at the FlashInfer TRTLLM MXFP4 backend; that backend
     currently has no LoRA hooks.
     """
-    dsv4_model = _import_dsv4_model_module()
-    if dsv4_model is None:
-        return
-    model_cls = getattr(dsv4_model, "DeepseekV4ForCausalLM", None)
-    if model_cls is None or getattr(model_cls, "_art_dsv4_lora_patched", False):
+    dsv4_model = importlib.import_module("vllm.models.deepseek_v4.nvidia.model")
+    model_cls = dsv4_model.DeepseekV4ForCausalLM
+    if getattr(model_cls, "_art_dsv4_lora_patched", False):
         return
     model_cls.supports_lora = True
     model_cls.embedding_modules = {}
@@ -381,21 +395,6 @@ def _is_lora_wrapped_linear(module: Any) -> bool:
         hasattr(module, name)
         for name in ("lora_a_stacked", "lora_b_stacked", "punica_wrapper")
     )
-
-
-def _apply_lora_to_existing_linear_output(
-    module: Any,
-    x: Any,
-    output: Any,
-) -> Any:
-    if not _is_lora_wrapped_linear(module):
-        return output
-    wrapper = module.punica_wrapper
-    if getattr(wrapper, "no_lora", False):
-        return output
-    if getattr(wrapper, "indices_len", [None])[0] is None:
-        return output
-    return module._apply_lora_to_output(x, output)
 
 
 def _register_dsv4_lora_expand_fp32_output_op() -> None:
@@ -1016,7 +1015,13 @@ def _apply_dsv4_wo_a_lora_fast(
         shrunk = wrapper.add_shrink(buffer, lora_input[group], wo_a.lora_a_stacked, 1.0)
         if not current_platform.can_update_inplace():
             buffer = shrunk
-        buffer = tensor_model_parallel_all_gather(buffer)
+        if wo_a.lora_config.fully_sharded_loras:
+            buffer = tensor_model_parallel_all_gather(buffer)
+        if buffer.shape[-1] != lora_b.shape[-1]:
+            raise RuntimeError(
+                "DSV4 wo_a LoRA rank mismatch after TP placement: "
+                f"A={buffer.shape[-1]} B={lora_b.shape[-1]}"
+            )
         expanded = wrapper.add_expand(
             z_flat,
             buffer,
@@ -1126,16 +1131,28 @@ def _dsv4_deep_gemm_fp8_o_proj_with_lora(
     return wo_b(z.flatten(1))
 
 
+def _dsv4_fp32_cos_sin_cache(rotary_emb: Any) -> Any:
+    cache = rotary_emb.cos_sin_cache
+    if cache.dtype != torch.float32:
+        cache = cache.float()
+        rotary_emb.cos_sin_cache = cache
+    return cache
+
+
 def _patch_dsv4_cuda_o_proj_lora(attn_cls: Any, o_proj_mod: Any) -> None:
     if getattr(attn_cls, "_art_wo_a_fast_path_lora_patched", False):
         return
+    original = attn_cls._o_proj
 
     def _o_proj(self: Any, o: Any, positions: Any) -> Any:
+        cos_sin_cache = _dsv4_fp32_cos_sin_cache(self.rotary_emb)
+        if not _is_active_lora_wrapped_linear(self.wo_a):
+            return original(self, o, positions)
         return _dsv4_deep_gemm_fp8_o_proj_with_lora(
             o_proj_mod,
             o,
             positions,
-            self.rotary_emb.cos_sin_cache,
+            cos_sin_cache,
             self.wo_a,
             self.wo_b,
             n_groups=self.n_local_groups,
@@ -1148,28 +1165,16 @@ def _patch_dsv4_cuda_o_proj_lora(attn_cls: Any, o_proj_mod: Any) -> None:
         )
 
     _o_proj.__art_patched__ = True  # type: ignore[attr-defined]
+    _o_proj.__art_original__ = original  # type: ignore[attr-defined]
     attn_cls._o_proj = _o_proj
     attn_cls._art_wo_a_fast_path_lora_patched = True
 
 
-def _patch_current_dsv4_fast_path_lora() -> bool:
-    try:
-        dsv4_attention = importlib.import_module("vllm.models.deepseek_v4.attention")
-    except ModuleNotFoundError:
-        return False
-
-    attention_cls = getattr(dsv4_attention, "DeepseekV4Attention", None)
-    if attention_cls is None:
-        return False
-
+def _patch_dsv4_fast_path_lora() -> None:
+    dsv4_attention = importlib.import_module("vllm.models.deepseek_v4.attention")
+    attention_cls = dsv4_attention.DeepseekV4Attention
     _patch_dsv4_compressor_fast_path_lora(attention_cls)
-
-    try:
-        o_proj_mod = importlib.import_module(
-            "vllm.models.deepseek_v4.nvidia.ops.o_proj"
-        )
-    except ModuleNotFoundError:
-        return True
+    o_proj_mod = importlib.import_module("vllm.models.deepseek_v4.nvidia.ops.o_proj")
 
     for module_name, class_name in (
         (
@@ -1180,15 +1185,13 @@ def _patch_current_dsv4_fast_path_lora() -> bool:
             "vllm.models.deepseek_v4.nvidia.flashinfer_sparse",
             "DeepseekV4FlashInferMLAAttention",
         ),
+        (
+            "vllm.models.deepseek_v4.nvidia.flashinfer_sparse",
+            "DeepseekV4FlashInferSM120Attention",
+        ),
     ):
-        try:
-            module = importlib.import_module(module_name)
-        except ModuleNotFoundError:
-            continue
-        attn_cls = getattr(module, class_name, None)
-        if attn_cls is not None:
-            _patch_dsv4_cuda_o_proj_lora(attn_cls, o_proj_mod)
-    return True
+        module = importlib.import_module(module_name)
+        _patch_dsv4_cuda_o_proj_lora(getattr(module, class_name), o_proj_mod)
 
 
 def patch_dsv4_fast_path_lora() -> None:
@@ -1203,119 +1206,7 @@ def patch_dsv4_fast_path_lora() -> None:
     """
     _register_dsv4_inv_rope_lora_input_op()
     _register_dsv4_lora_expand_fp32_output_op()
-    if _patch_current_dsv4_fast_path_lora():
-        return
-
-    dsv4_attn = importlib.import_module(
-        "vllm.model_executor.layers.deepseek_v4_attention"
-    )
-    wrapper_cls = getattr(dsv4_attn, "DeepseekV4MultiHeadLatentAttentionWrapper", None)
-    if wrapper_cls is None:
-        return
-    if getattr(wrapper_cls, "_art_fast_path_lora_patched", False):
-        return
-
-    original_attn_gemm_parallel_execute = wrapper_cls.attn_gemm_parallel_execute
-    original_forward = wrapper_cls.forward
-
-    def attn_gemm_parallel_execute(self: Any, hidden_states: Any) -> tuple[Any, ...]:
-        qr_kv, kv_score, indexer_kv_score, indexer_weights = (
-            original_attn_gemm_parallel_execute(self, hidden_states)
-        )
-        if self.compressor is not None:
-            kv_score = _apply_dsv4_compressor_lora_to_existing_output(
-                self.compressor.fused_wkv_wgate,
-                hidden_states,
-                kv_score,
-            )
-        if self.indexer is not None:
-            indexer_kv_score = _apply_dsv4_compressor_lora_to_existing_output(
-                self.indexer.compressor.fused_wkv_wgate,
-                hidden_states,
-                indexer_kv_score,
-            )
-        return qr_kv, kv_score, indexer_kv_score, indexer_weights
-
-    def forward(
-        self: Any,
-        positions: Any,
-        hidden_states: Any,
-        llama_4_scaling: Any | None = None,
-    ) -> Any:
-        if dsv4_attn.current_platform.is_rocm():
-            return original_forward(self, positions, hidden_states, llama_4_scaling)
-
-        num_tokens = hidden_states.shape[0]
-        o_padded = dsv4_attn.torch.empty(
-            (num_tokens, self.padded_heads, self.head_dim),
-            dtype=hidden_states.dtype,
-            device=hidden_states.device,
-        )
-
-        dsv4_attn.torch.ops.vllm.deepseek_v4_attention(
-            hidden_states,
-            positions,
-            o_padded,
-            self.layer_name,
-        )
-        o = o_padded[:, : self.n_local_heads, :]
-
-        wo_a_lora_input = None
-        if _is_active_lora_wrapped_linear(self.wo_a):
-            o_fp8, o_scale, wo_a_lora_input = (
-                _dsv4_fused_inv_rope_fp8_quant_with_lora_input(
-                    dsv4_attn,
-                    o,
-                    positions,
-                    self.rotary_emb.cos_sin_cache,
-                    n_groups=self.n_local_groups,
-                    heads_per_group=self.n_local_heads // self.n_local_groups,
-                    lora_dtype=self.wo_a.lora_a_stacked[0].dtype,
-                    nope_dim=self.nope_head_dim,
-                    rope_dim=self.rope_head_dim,
-                    tma_aligned_scales=self._tma_aligned_scales,
-                )
-            )
-        else:
-            o_fp8, o_scale = dsv4_attn.fused_inv_rope_fp8_quant(
-                o,
-                positions,
-                self.rotary_emb.cos_sin_cache,
-                n_groups=self.n_local_groups,
-                heads_per_group=self.n_local_heads // self.n_local_groups,
-                nope_dim=self.nope_head_dim,
-                rope_dim=self.rope_head_dim,
-                tma_aligned_scales=self._tma_aligned_scales,
-            )
-
-        z = dsv4_attn.torch.empty(
-            (num_tokens, self.n_local_groups, self.o_lora_rank),
-            device=o.device,
-            dtype=dsv4_attn.torch.bfloat16,
-        )
-        dsv4_attn.torch.ops.vllm.deepseek_v4_fp8_einsum(
-            o_fp8,
-            o_scale,
-            self.wo_a.weight,
-            self.wo_a.weight_scale_inv,
-            z,
-            "bhr,hdr->bhd",
-            list(self._einsum_recipe),
-        )
-        if wo_a_lora_input is not None:
-            z = _apply_dsv4_wo_a_lora_fast(
-                self.wo_a,
-                z,
-                lora_input=wo_a_lora_input,
-                n_local_groups=self.n_local_groups,
-            )
-        return self.wo_b(z.flatten(1))
-
-    attn_gemm_parallel_execute.__art_patched__ = True  # type: ignore[attr-defined]
-    forward.__art_patched__ = True  # type: ignore[attr-defined]
-    wrapper_cls.attn_gemm_parallel_execute = attn_gemm_parallel_execute
-    wrapper_cls.forward = forward
-    wrapper_cls._art_fast_path_lora_patched = True
+    _patch_dsv4_fast_path_lora()
 
 
 def _next_power_of_two(value: int) -> int:
@@ -1331,15 +1222,12 @@ def patch_dsv4_triton_moe_topk6_routing() -> None:
     the engine exits before serving starts. Keep the original indexing stride at
     192, but sort over a padded power-of-two vector and mask padded lanes.
     """
-    try:
-        import torch
-        import triton
-        import triton.language as tl
-        from vllm.third_party.triton_kernels.routing_details._expt_data import (
-            _expt_data_compute,
-        )
-    except ImportError:
-        return
+    import torch
+    import triton
+    import triton.language as tl
+    from vllm.third_party.triton_kernels.routing_details._expt_data import (
+        _expt_data_compute,
+    )
 
     @triton.jit
     def _routing_compute_indx_pow2(
@@ -1456,14 +1344,8 @@ def patch_dsv4_triton_moe_topk6_routing() -> None:
                 BLOCK_SIZE_PADDED,
             )
 
-    for module_name in (
-        "vllm.third_party.triton_kernels.routing",
-        "triton_kernels.routing",
-    ):
-        try:
-            routing = importlib.import_module(module_name)
-        except ImportError:
-            continue
+    for module_name in ("vllm.third_party.triton_kernels.routing",):
+        routing = importlib.import_module(module_name)
         original_forward = routing.SortTokens.forward
         if getattr(original_forward, "__art_dsv4_topk6_pow2_patched__", False):
             continue
@@ -1610,64 +1492,3 @@ def patch_lora_linear_base_attr_proxy() -> None:
         if not hasattr(BaseLinearLayerWithLoRA, name):
             setattr(BaseLinearLayerWithLoRA, name, _base_layer_attr_proxy(name))
     BaseLinearLayerWithLoRA._art_base_attr_proxy_patched = True
-
-
-def patch_marlin_lora_swiglu_limit() -> None:
-    """Keep Marlin MoE LoRA active when DSV4 uses a SwiGLU clamp limit.
-
-    vLLM's Marlin LoRA path injects W13 LoRA inside the activation callback and
-    stores that activated cache for W2 LoRA. DSV4 sets ``gemm1_clamp_limit``;
-    upstream Marlin bypasses the callback in that case and calls the clamp op
-    directly, so W13 LoRA is skipped and W2 LoRA later misses ``cache2``. Route
-    the callback through the same clamp op while preserving Marlin execution.
-    """
-    try:
-        marlin_moe = importlib.import_module(
-            "vllm.model_executor.layers.fused_moe.fused_marlin_moe"
-        )
-    except ModuleNotFoundError:
-        return
-
-    from vllm.model_executor.layers.fused_moe.activation import MoEActivation
-    from vllm.model_executor.layers.fused_moe.utils import swiglu_limit_func
-
-    MarlinExperts = marlin_moe.MarlinExperts
-
-    original_apply = MarlinExperts.apply
-    if getattr(original_apply, "__art_patched__", False):
-        return
-
-    sentinel = object()
-
-    def apply(self: Any, *args: Any, **kwargs: Any) -> Any:
-        clamp_limit = getattr(self, "gemm1_clamp_limit", None)
-        if getattr(self, "_lora_context", None) is None or clamp_limit is None:
-            return original_apply(self, *args, **kwargs)
-
-        original_activation = self.activation
-        previous_activation = self.__dict__.get("activation", sentinel)
-        previous_clamp_limit = self.gemm1_clamp_limit
-
-        def activation_with_clamp(
-            activation: Any,
-            output: Any,
-            input: Any,
-        ) -> None:
-            if activation == MoEActivation.SILU:
-                swiglu_limit_func(output, input, clamp_limit)
-            else:
-                original_activation(activation, output, input)
-
-        self.activation = activation_with_clamp
-        self.gemm1_clamp_limit = None
-        try:
-            return original_apply(self, *args, **kwargs)
-        finally:
-            self.gemm1_clamp_limit = previous_clamp_limit
-            if previous_activation is sentinel:
-                delattr(self, "activation")
-            else:
-                self.activation = previous_activation
-
-    apply.__art_patched__ = True  # type: ignore[attr-defined]
-    MarlinExperts.apply = apply  # type: ignore[method-assign]

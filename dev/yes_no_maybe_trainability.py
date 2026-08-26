@@ -247,7 +247,7 @@ def make_backend(
     if backend_name == "local":
         return LocalBackend(path=art_path, in_process=in_process)
     if backend_name == "megatron":
-        return MegatronBackend(path=art_path, in_process=in_process)
+        return MegatronBackend(path=art_path)
     raise ValueError(f"Unsupported BACKEND={backend_name!r}")
 
 

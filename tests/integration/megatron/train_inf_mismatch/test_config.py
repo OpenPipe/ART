@@ -4,8 +4,20 @@ from types import SimpleNamespace
 
 import torch
 
+from ..model_support.workflow_resources import (
+    HandlerWorkflowResources,
+    MegatronWorkflowResources,
+    MegatronWorkflowTopology,
+    VllmWorkflowResources,
+    WorkflowStageResources,
+)
 from . import output_parity
 from .output_parity import config_from_env
+from .real_path import (
+    RealPathConfig,
+    _cuda_visible_devices_for_slots,
+    _real_path_max_model_len,
+)
 
 
 def test_cp_unsupported_default_converts_cp_to_dp_without_changing_tp(
@@ -56,14 +68,14 @@ def test_cp_unsupported_model_uses_non_cp_default_topology(monkeypatch) -> None:
 
     assert config.topology.cp == 1
     assert config.topology.tp == 2
-    assert config.topology.ep == 2
-    assert config.topology.dp == 1
-    assert config.trainer_gpu_ids == [0, 1]
+    assert config.topology.ep == 4
+    assert config.topology.dp == 2
+    assert config.trainer_gpu_ids == [0, 1, 2, 3]
     assert config.inference_gpu_ids == [2, 3]
     assert config.engine_args["tensor_parallel_size"] == 2
     assert config.engine_args["enable_expert_parallel"] is True
     assert config.engine_args["kv_cache_dtype"] == "fp8"
-    assert config.engine_args["moe_backend"] == "triton_unfused"
+    assert config.engine_args["moe_backend"] == "auto"
     assert config.streaming_weight_offload is True
     assert config.megatron_env == {}
     assert config.external_vllm_server_url == "http://127.0.0.1:8000"

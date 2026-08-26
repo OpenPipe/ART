@@ -49,7 +49,11 @@ def _ensure_torchvision_nms_schema() -> None:
             "nms(Tensor dets, Tensor scores, float iou_threshold) -> Tensor"
         )
     except RuntimeError as exc:
-        if "Only a single TORCH_LIBRARY" not in str(exc) and "already" not in str(exc):
+        if (
+            "Only a single TORCH_LIBRARY" not in str(exc)
+            and "already" not in str(exc)
+            and "multiple times" not in str(exc)
+        ):
             raise
         _TORCHVISION_LIB = torch.library.Library("torchvision", "FRAGMENT")
         try:
@@ -57,7 +61,9 @@ def _ensure_torchvision_nms_schema() -> None:
                 "nms(Tensor dets, Tensor scores, float iou_threshold) -> Tensor"
             )
         except RuntimeError as define_exc:
-            if "already" not in str(define_exc):
+            if "already" not in str(define_exc) and "multiple times" not in str(
+                define_exc
+            ):
                 raise
 
 

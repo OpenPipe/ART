@@ -2,8 +2,6 @@
 requires = [
     "setuptools>=78.1.0",
     "torch==2.11.0",
-    "nvidia-cuda-cccl-cu12==12.9.27",
-    "nvidia-nvtx-cu12>=12.8,<13",
 ]
 build-backend = "setuptools.build_meta"
 

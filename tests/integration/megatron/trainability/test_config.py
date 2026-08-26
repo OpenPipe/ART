@@ -14,11 +14,19 @@ from .test_live_length_trainability import (
     LengthSampleReport,
     LengthTrainabilityReport,
     _default_learning_rate,
+    _length_current_step_demand,
+    _length_max_steps,
+    _length_rollout_seed,
+    _length_rollout_temperature,
+    _length_rollouts_per_prompt,
     _length_trainability_thresholds,
     _prompt_for_index,
     _target_tokens,
     _use_default_moe_dedicated_placement,
     length_trainability_passed,
+)
+from .test_live_length_trainability import (
+    _extra_body as _length_extra_body,
 )
 from .test_live_length_trainability import (
     _prompt_tree_shape as _length_prompt_tree_shape,
@@ -29,7 +37,13 @@ from .yes_no_trainability import (
     _build_internal_config,
     _build_variant,
     _default_variant_name,
+    _engine_args_for_yes_no_trainability,
     _evaluate_groups,
+    _get_env_int_list,
+    _max_tokens,
+    _render_chat_messages,
+    _rescore_groups,
+    _select_answer_target,
     _TrainabilityVariant,
     _variant_init_args,
     _variant_max_steps,
@@ -37,219 +51,80 @@ from .yes_no_trainability import (
     _variant_rollouts_per_prompt,
     _variant_train_kwargs,
     build_prompts,
+    reward_for_answer,
     yes_no_trainability_passed,
+)
+from .yes_no_trainability import (
+    _extra_body as _yes_no_extra_body,
 )
 from .yes_no_trainability import (
     _prompt_tree_shape as _yes_no_prompt_tree_shape,
 )
 
 
-class _ConcurrentCompletions:
-    def __init__(self, expected: int) -> None:
-        self.expected = expected
-        self.started = 0
-        self.active = 0
-        self.max_active = 0
-        self.all_started = asyncio.Event()
-
-    async def create(self, **kwargs):
-        self.started += 1
-        self.active += 1
-        self.max_active = max(self.max_active, self.active)
-        if self.started == self.expected:
-            self.all_started.set()
-        try:
-            await asyncio.wait_for(self.all_started.wait(), timeout=1.0)
-            return ChatCompletion(
-                id=f"completion-{self.started}",
-                choices=[
-                    Choice(
-                        finish_reason="stop",
-                        index=0,
-                        message=ChatCompletionMessage(
-                            role="assistant",
-                            content="maybe",
-                        ),
-                    )
-                ],
-                created=0,
-                model=str(kwargs["model"]),
-                object="chat.completion",
-            )
-        finally:
-            self.active -= 1
-
-
-class _FakeChat:
-    def __init__(self, completions: _ConcurrentCompletions) -> None:
-        self.completions = completions
-
-
-class _FakeClient:
-    def __init__(self, completions: _ConcurrentCompletions) -> None:
-        self.chat = _FakeChat(completions)
-
-
-class _FakeModel:
-    def __init__(self, client: _FakeClient) -> None:
-        self.client = client
-
-    def openai_client(self) -> _FakeClient:
-        return self.client
-
-    def get_inference_name(self, *, step: int | None = None) -> str:
-        return f"fake@{step}"
-
-
-@pytest.mark.asyncio
-async def test_eval_prompts_are_submitted_concurrently() -> None:
-    completions = _ConcurrentCompletions(expected=3)
-
-    groups = await _evaluate_groups(
-        cast(art.TrainableModel, _FakeModel(_FakeClient(completions))),
-        base_model="Qwen/Qwen3-30B-A3B-Instruct-2507",
-        prompts=["a", "b", "c"],
-        step=1,
-    )
-
-    assert len(groups) == 3
-    assert completions.started == 3
-    assert completions.max_active == 3
-    assert [group.trajectories[0].reward for group in groups] == [1.0, 1.0, 1.0]
-
-
-def test_megatron_variants_keep_short_packed_sequence_default(monkeypatch) -> None:
-    monkeypatch.delenv("ART_MODEL_SUPPORT_YES_NO_PACKED_SEQUENCE_LENGTH", raising=False)
-    variant = _TrainabilityVariant(
-        name="megatron_shared",
-        backend_name="megatron",
-        placement_mode="shared",
-        trainer_gpu_ids=[0, 1],
-        inference_gpu_ids=[0, 1],
-    )
-
-    assert _variant_packed_sequence_length(variant) == 1024
-    assert _variant_train_kwargs(variant) == {"packed_sequence_length": 1024}
-    config = _build_internal_config(
-        variant, base_model="Qwen/Qwen3-30B-A3B-Instruct-2507"
-    )
-    assert config["init_args"]["max_seq_length"] == 1024
-    assert config["rollout_weights_mode"] == "lora"
-    assert (
-        _default_variant_name("Qwen/Qwen3-30B-A3B-Instruct-2507") == "megatron_shared"
-    )
-    assert _variant_rollouts_per_prompt(variant) == 4
-    assert _variant_max_steps(variant) == 4
-
-
-def test_unsloth_variant_uses_chunk_aligned_training_length(monkeypatch) -> None:
-    monkeypatch.delenv("ART_MODEL_SUPPORT_YES_NO_PACKED_SEQUENCE_LENGTH", raising=False)
-    variant = _TrainabilityVariant(
-        name="unsloth_dedicated",
-        backend_name="local",
-        placement_mode="dedicated",
-        trainer_gpu_ids=[0],
-        inference_gpu_ids=[1],
-    )
-
-    assert _variant_packed_sequence_length(variant) == 1024
-    assert _variant_train_kwargs(variant) == {"packed_sequence_length": 1024}
-    assert _variant_init_args(variant) == {"max_seq_length": 1024}
-    assert _build_internal_config(
-        variant, base_model="Qwen/Qwen3-30B-A3B-Instruct-2507"
-    )["init_args"] == {"max_seq_length": 1024}
-    assert _variant_rollouts_per_prompt(variant) == 8
-    assert _variant_max_steps(variant) == 12
-
-
-def test_qwen3_5_defaults_to_shared_lora_rollout() -> None:
-    variant = _TrainabilityVariant(
-        name="megatron_shared",
-        backend_name="megatron",
-        placement_mode="shared",
-        trainer_gpu_ids=[0, 1],
-        inference_gpu_ids=[0, 1],
-    )
-
-    config = _build_internal_config(variant, base_model="Qwen/Qwen3.5-35B-A3B")
-
-    assert _default_variant_name("Qwen/Qwen3.5-35B-A3B") == "megatron_shared"
-    assert config["rollout_weights_mode"] == "lora"
-    assert "trainer_gpu_ids" not in config
-    assert "inference_gpu_ids" not in config
-
-
-def test_dense_yes_no_default_uses_dedicated_placement(monkeypatch) -> None:
-    monkeypatch.delenv("ART_MODEL_SUPPORT_YES_NO_VARIANT", raising=False)
-
-    assert _default_variant_name("Qwen/Qwen3-32B") == "megatron_dedicated"
-
-
-def test_yes_no_default_variant_env_override(monkeypatch) -> None:
-    monkeypatch.setenv("ART_MODEL_SUPPORT_YES_NO_VARIANT", "megatron_shared")
-
-    assert _default_variant_name("Qwen/Qwen3-32B") == "megatron_shared"
-
-
-def test_yes_no_trainability_passes_initially_saturated_stable_report() -> None:
-    report = YesNoTrainabilityReport(
-        variant="megatron_shared",
-        backend_name="megatron",
-        placement_mode="shared",
-        base_model="google/gemma-4-31B-it",
-        output_dir="/tmp/report",
-        trainer_gpu_ids=[0, 1],
-        inference_gpu_ids=[0, 1],
-        rollout_weights_mode="lora",
-        reward_threshold=0.9,
-        max_steps=4,
-        prompt_count=8,
-        eval_prompt_count=8,
-        rollouts_per_prompt=4,
-        latest_step=1,
-        initial_eval_reward=0.9375,
-        final_eval_reward=0.9375,
-        saturated_step=1,
-        step0_name="model@0",
-        latest_name="model@1",
-        steps=[
-            TrainabilityStepReport(
-                step=1,
-                eval_reward=0.9375,
-                train_reward=0.875,
-                train_metrics={"grad_norm": 54.0},
-            )
-        ],
-    )
-
-    assert yes_no_trainability_passed(report) is True
-
-
-def test_yes_no_prompts_form_prefix_tree_by_default(monkeypatch) -> None:
-    monkeypatch.delenv("ART_MODEL_SUPPORT_YES_NO_PROMPT", raising=False)
-    monkeypatch.setenv("ART_MODEL_SUPPORT_YES_NO_PROMPT_COUNT", "8")
-
-    prompts = build_prompts()
-
-    assert _yes_no_prompt_tree_shape(prompts) == (3, 6)
-
-
-def test_qwen3_5_length_trainability_uses_stable_learning_rate() -> None:
-    assert _default_learning_rate("Qwen/Qwen3.5-35B-A3B") == 7e-5
+def test_qwen3_5_length_trainability_uses_stable_moe_defaults() -> None:
+    assert _default_learning_rate("Qwen/Qwen3.5-35B-A3B") == 1e-4
+    assert _length_rollouts_per_prompt("Qwen/Qwen3.5-35B-A3B") == 32
+    assert _length_max_steps("Qwen/Qwen3.5-35B-A3B") == 40
+    assert _length_max_steps("meta-llama/Llama-3.2-1B-Instruct") == 30
+    assert _length_max_steps("openai/gpt-oss-20b") == 30
+    assert _length_rollout_seed("Qwen/Qwen3.5-35B-A3B") == 20261833
+    assert _length_rollout_temperature("Qwen/Qwen3.5-35B-A3B") == 0.8
+    assert _length_current_step_demand("Qwen/Qwen3.5-35B-A3B") is True
     assert _default_learning_rate("Qwen/Qwen3-30B-A3B-Instruct-2507") == 1e-4
+    assert _length_rollouts_per_prompt("Qwen/Qwen3-30B-A3B-Instruct-2507") == 4
+    assert _length_max_steps("Qwen/Qwen3-30B-A3B-Instruct-2507") == 20
+    assert _length_rollout_seed("Qwen/Qwen3-30B-A3B-Instruct-2507") is None
+    assert _length_rollout_temperature("Qwen/Qwen3-30B-A3B-Instruct-2507") == 1.1
+    assert _length_current_step_demand("Qwen/Qwen3-30B-A3B-Instruct-2507") is False
+    assert _length_rollout_seed("openai/gpt-oss-20b") == 20261833
+    assert _length_current_step_demand("openai/gpt-oss-20b") is True
+
+
+def test_length_trainability_environment_overrides_model_defaults(monkeypatch) -> None:
+    monkeypatch.setenv("ART_MODEL_SUPPORT_LENGTH_MAX_STEPS", "9")
+    monkeypatch.setenv("ART_MODEL_SUPPORT_LENGTH_ROLLOUTS_PER_PROMPT", "6")
+    monkeypatch.setenv("ART_MODEL_SUPPORT_LENGTH_ROLLOUT_SEED", "17")
+    monkeypatch.setenv("ART_MODEL_SUPPORT_LENGTH_ROLLOUT_TEMPERATURE", "0.7")
+    monkeypatch.setenv("ART_MODEL_SUPPORT_LENGTH_CURRENT_STEP_DEMAND", "0")
+
+    assert _length_max_steps("Qwen/Qwen3.5-35B-A3B") == 9
+    assert _length_rollouts_per_prompt("Qwen/Qwen3.5-35B-A3B") == 6
+    assert _length_rollout_seed("Qwen/Qwen3.5-35B-A3B") == 17
+    assert _length_rollout_seed("Qwen/Qwen3-30B-A3B-Instruct-2507") == 17
+    assert _length_rollout_temperature("Qwen/Qwen3.5-35B-A3B") == 0.7
+    assert _length_current_step_demand("Qwen/Qwen3.5-35B-A3B") is False
 
 
 def test_gpt_oss_length_target_accounts_for_harmony_tokens(monkeypatch) -> None:
+    assert _target_tokens("google/gemma-4-31B-it") == 22
     assert _target_tokens("openai/gpt-oss-20b") == 20
     assert _target_tokens("Qwen/Qwen3.5-35B-A3B") == 10
+    assert _target_tokens("zai-org/GLM-5.2") == 12
     monkeypatch.setenv("ART_MODEL_SUPPORT_LENGTH_TARGET_TOKENS", "24")
     assert _target_tokens("openai/gpt-oss-20b") == 24
+
+
+def test_length_trainability_default_success_threshold() -> None:
+    thresholds = _length_trainability_thresholds("zai-org/GLM-5.2")
+
+    assert thresholds.success_abs_error_max == 2
 
 
 def test_length_prompts_form_prefix_tree_by_default() -> None:
     prompts = [_prompt_for_index(index)[0] for index in range(4)]
 
     assert _length_prompt_tree_shape(prompts) == (3, 6)
+
+
+def test_glm52_length_prompt_requests_a_fuller_initial_answer() -> None:
+    default_prompt = _prompt_for_index(0)[0]
+    glm52_prompt = _prompt_for_index(0, base_model="zai-org/GLM-5.2")[0]
+
+    assert "Use one sentence." in default_prompt
+    assert (
+        "Use two complete sentences with one concrete detail in each." in glm52_prompt
+    )
 
 
 def test_length_trainability_accepts_near_baseline_learning_signal() -> None:
@@ -262,7 +137,6 @@ def test_length_trainability_accepts_near_baseline_learning_signal() -> None:
         trainer_gpu_ids=[0],
         inference_gpu_ids=[1],
         training_topology={"tp": 1, "cp": 1, "ep": 1, "etp": 1, "dp": 1, "sp": False},
-        rollout_weights_mode="lora",
         rollouts_per_prompt=4,
         normalize_advantages=True,
         summary_log_path="/tmp/length_trainability.log",
@@ -356,7 +230,6 @@ def test_validated_dense_model_uses_dense_shared_topology(
     )
 
     config = _build_internal_config(variant, base_model="Qwen/Qwen3.5-4B")
-    assert config["rollout_weights_mode"] == "lora"
     assert config["engine_args"]["enable_sleep_mode"] is True
     assert "enable_expert_parallel" not in config["engine_args"]
 
@@ -373,7 +246,6 @@ def test_qwen3_5_moe_shared_variant_enables_expert_parallel(monkeypatch) -> None
 
     config = _build_internal_config(variant, base_model="Qwen/Qwen3.5-35B-A3B")
 
-    assert config["rollout_weights_mode"] == "lora"
     assert config["engine_args"]["enable_expert_parallel"] is True
 
 
@@ -387,13 +259,17 @@ def test_dsv4_trainability_uses_large_model_dedicated_resources(
         "get_device_properties",
         lambda device: SimpleNamespace(total_memory=284 * 1024**3),
     )
+
+    def unexpected_memory_probe(_device_ids) -> float:
+        raise AssertionError("external vLLM must not probe resident inference memory")
+
     monkeypatch.setattr(
         "tests.integration.megatron.trainability.yes_no_trainability."
         "_safe_gpu_memory_utilization",
-        lambda device_ids: 0.5,
+        unexpected_memory_probe,
     )
     monkeypatch.setenv("ART_MODEL_SUPPORT_EXTERNAL_VLLM_URL", "http://127.0.0.1:8000")
-
+    monkeypatch.setenv("ART_MODEL_SUPPORT_EXTERNAL_VLLM_HEALTH_TIMEOUT", "1200")
     default_variant = _default_variant_name(
         "deepseek-ai/DeepSeek-V4-Flash",
     )
@@ -409,21 +285,22 @@ def test_dsv4_trainability_uses_large_model_dedicated_resources(
     assert default_variant == "megatron_dedicated"
     assert variant.topology is not None
     assert variant.topology.tp == 2
-    assert variant.topology.ep == 2
+    assert variant.topology.ep == 4
     assert variant.topology.cp == 1
-    assert variant.topology.dp == 1
+    assert variant.topology.dp == 2
     assert variant.topology.sp is True
-    assert variant.trainer_gpu_ids == [0, 1]
+    assert variant.trainer_gpu_ids == [0, 1, 2, 3]
     assert variant.inference_gpu_ids == [2, 3]
     assert config["engine_args"]["tensor_parallel_size"] == 2
     assert config["engine_args"]["enable_expert_parallel"] is True
     assert config["engine_args"]["kv_cache_dtype"] == "fp8"
-    assert config["engine_args"].get("moe_backend") == "triton_unfused"
+    assert config["engine_args"].get("moe_backend") == "auto"
     assert "megatron_topology" not in config
     assert config["vllm_runtime"] == {
         "mode": "external",
         "server_url": "http://127.0.0.1:8000",
         "api_key": "art-external-vllm",
+        "health_timeout_s": 1200.0,
     }
 
 

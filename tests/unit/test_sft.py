@@ -3,13 +3,18 @@
 import json
 from pathlib import Path
 import tempfile
+from types import SimpleNamespace
+from typing import Any, cast
+from unittest.mock import AsyncMock
 
 import pytest
 
+from art import TrainableModel
 from art.utils.sft import (
     create_lr_schedule,
     create_sft_dataset_iterator,
     iterate_file,
+    train_sft_from_file,
 )
 
 
@@ -84,6 +89,32 @@ def test_iterate_file_deterministic():
 
     finally:
         jsonl_file.unlink()
+
+
+@pytest.mark.asyncio
+async def test_train_sft_from_file_forwards_assistant_turns():
+    """Test that file-based SFT can train only on the final assistant turn."""
+    jsonl_file = create_temp_jsonl(2)
+    train_sft = AsyncMock()
+    model = cast(
+        TrainableModel[Any, dict[str, Any]],
+        SimpleNamespace(train_sft=train_sft),
+    )
+
+    try:
+        await train_sft_from_file(
+            model=model,
+            file_path=str(jsonl_file),
+            batch_size=2,
+            assistant_turns="last",
+        )
+    finally:
+        jsonl_file.unlink()
+
+    await_args = train_sft.await_args
+    assert await_args is not None
+    config = await_args.args[1]
+    assert config.assistant_turns == "last"
 
 
 def test_lr_schedule_warmup_not_zero():

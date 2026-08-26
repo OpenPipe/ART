@@ -61,12 +61,14 @@ class FlexAttentionWrapper(torch.nn.Module):
         backend = flex_backend_for_head_dims(
             head_dim=int(q.shape[-1]),
             head_dim_v=int(v.shape[-1]),
+            device=q.device,
         )
         result = get_dense_compiled_flex_attention(
             backend=backend,
             head_dim=int(q.shape[-1]),
             head_dim_v=int(v.shape[-1]),
             triton_num_stages_2_head_dims=self.triton_num_stages_2_head_dims,
+            device=q.device,
         )(
             q,
             k,

@@ -35,14 +35,15 @@ class PipelineAutotuneConfig(pydantic.BaseModel):
     window_steps: int = pydantic.Field(default=4, ge=1)
     warmup_ignore_steps: int = pydantic.Field(default=3, ge=0)
     target_spill_probability: float = pydantic.Field(default=0.03, ge=0.0, le=1.0)
-    worker_step: int = pydantic.Field(default=4, ge=1)
+    worker_step: int = pydantic.Field(default=2, ge=1)
     worker_move_fraction: float = pydantic.Field(default=0.10, gt=0.0, le=1.0)
+    worker_load_change_windows: int = pydantic.Field(default=2, ge=1)
     max_worker_move: int = pydantic.Field(default=16, ge=4)
     max_rollout_workers: int = pydantic.Field(default=1024, ge=1)
     initial_model_calls_per_inference_gpu: int = pydantic.Field(default=8, ge=1)
     initial_min_groups_per_packed_sequence: int = pydantic.Field(default=8, ge=1)
     initial_max_groups_per_packed_sequence: int = pydantic.Field(default=8, ge=1)
-    packing_trials: int = pydantic.Field(default=64, ge=16)
+    packing_trials: int = pydantic.Field(default=48, ge=16)
     packing_reservoir_multiplier: int = pydantic.Field(default=2, ge=2)
     packing_reservoir_min_groups: int = pydantic.Field(default=32, ge=16)
     packing_history_steps: int = pydantic.Field(default=64, ge=1)
@@ -58,7 +59,7 @@ class PipelineAutotuneConfig(pydantic.BaseModel):
     queue_put_severe_frac: float = pydantic.Field(default=1.0 / 3.0, ge=0.0, le=1.0)
     stale_high_frac: float = pydantic.Field(default=0.20, ge=0.0, le=1.0)
     stale_clear_frac: float = pydantic.Field(default=0.10, ge=0.0, le=1.0)
-    padding_high_frac: float = pydantic.Field(default=0.25, ge=0.0, le=1.0)
+    unused_and_dummy_high_frac: float = pydantic.Field(default=0.25, ge=0.0, le=1.0)
     trainer_min_batch_lower_score: float = pydantic.Field(default=0.15, ge=0.0)
     trainer_min_batch_raise_score: float = pydantic.Field(default=0.10, ge=0.0)
     min_batch_collect_improvement_ratio: float = pydantic.Field(
@@ -71,7 +72,7 @@ class PipelineAutotuneConfig(pydantic.BaseModel):
         default=0.85, gt=0.0, le=1.0
     )
     target_group_change_windows: int = pydantic.Field(default=1, ge=1)
-    target_group_increase_fraction: float = pydantic.Field(default=0.25, gt=0.0, le=1.0)
+    target_group_increase_fraction: float = pydantic.Field(default=0.20, gt=0.0, le=1.0)
     target_group_max_increase: int = pydantic.Field(default=64, ge=1)
     target_group_min_relative_change: float = pydantic.Field(
         default=0.10, ge=0.0, le=1.0
@@ -142,10 +143,20 @@ class TunerWindowStats(pydantic.BaseModel):
     collect_batch_s: float = 0.0
     trainer_underfeed_score: float = 0.0
     vllm_pressure: float = 0.0
+    vllm_waiting_capacity_request_s: float = pydantic.Field(default=0.0, ge=0.0)
+    vllm_running_request_s: float = pydantic.Field(default=0.0, ge=0.0)
     queue_put_wait_frac: float = 0.0
     predicted_stale_frac: float = 0.0
     actual_stale_frac: float = 0.0
-    padding_ratio_mean: float = 0.0
+    unused_and_dummy_ratio_mean: float = 0.0
+    vllm_poll_samples: int = 0
+    vllm_poll_successes: int = 0
+    vllm_poll_timeouts: int = 0
+    vllm_poll_errors: int = 0
+    vllm_poll_skipped: int = 0
+    vllm_poll_coverage: float = 0.0
+    vllm_poll_schedule_lag_p99_s: float = 0.0
+    vllm_poll_request_latency_p99_s: float = 0.0
 
 
 class TunerDecision(pydantic.BaseModel):
@@ -166,6 +177,7 @@ class PipelineAutotunerProfile(pydantic.BaseModel):
     packed_sequence_length: int | None = None
     target_packed_sequences: int | None = None
     inference_gpu_count: int | None = None
+    rollout_worker_capacity: int | None = pydantic.Field(default=None, ge=1)
     policy_age_limit_steps: float | None = None
     settings: PipelineTuneSettings
     config: PipelineAutotuneConfig

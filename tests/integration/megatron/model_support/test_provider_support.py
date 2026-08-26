@@ -11,13 +11,13 @@ pytest.importorskip("megatron.bridge")
 from megatron.core.transformer.enums import AttnBackend
 
 from art.megatron.context_parallel.core_attention import ArtContextParallelCoreAttention
+from art.megatron.dsv4.bridge import _install_dsv4_source_aliases
 from art.megatron.flex_attn.attention import FlexDotProductAttention
 from art.megatron.lora import default_lora_rank_for_handler
 from art.megatron.model_support.registry import (
     UnsupportedModelArchitectureError,
     get_model_support_handler,
     get_model_support_spec,
-    model_requires_merged_rollout,
     model_uses_expert_parallel,
 )
 import art.megatron.provider as provider_module
@@ -45,6 +45,7 @@ class _FakeProvider:
         self.recompute_num_layers: int | None = None
         self.expert_model_parallel_size = 1
         self.expert_tensor_parallel_size = 1
+        self.dsv4_hc_mult = 4
 
     def _base_layer_spec(
         self, config: object, vp_stage: int | None = None
@@ -136,18 +137,33 @@ def test_openpipe_qwen3_14b_instruct_uses_qwen3_dense_support() -> None:
     assert handler.key == "qwen3_dense"
 
 
+def test_meta_llama_32_1b_instruct_uses_llama3_dense_support() -> None:
+    model = "meta-llama/Llama-3.2-1B-Instruct"
+    spec = get_model_support_spec(model)
+    handler = get_model_support_handler(model)
+
+    assert spec.key == "llama3_dense"
+    assert spec.is_moe is False
+    assert spec.native_vllm_lora_status == "validated"
+    assert handler.key == "llama3_dense"
+
+
 def test_model_support_specs_own_moe_metadata() -> None:
+    assert model_uses_expert_parallel("meta-llama/Llama-3.2-1B-Instruct") is False
     assert model_uses_expert_parallel("OpenPipe/Qwen3-14B-Instruct") is False
     assert model_uses_expert_parallel("Qwen/Qwen3-30B-A3B-Instruct-2507") is True
     assert model_uses_expert_parallel("Qwen/Qwen3.5-35B-A3B") is True
     assert model_uses_expert_parallel("deepseek-ai/DeepSeek-V4-Flash") is True
 
 
-def test_dsv4_prefers_validated_native_lora_rollout() -> None:
+def test_dsv4_native_lora_is_validated() -> None:
     spec = get_model_support_spec("deepseek-ai/DeepSeek-V4-Flash")
 
     assert spec.native_vllm_lora_status == "validated"
-    assert model_requires_merged_rollout("deepseek-ai/DeepSeek-V4-Flash") is False
+
+
+def test_dsv4_config_only_bridge_does_not_require_checkpoint_state() -> None:
+    _install_dsv4_source_aliases(SimpleNamespace(config=SimpleNamespace()))
 
 
 def test_dsv4_provider_disables_shared_expert_overlap(
@@ -166,6 +182,11 @@ def test_dsv4_provider_disables_shared_expert_overlap(
         lambda *args, **kwargs: fake_bridge,
     )
     monkeypatch.setattr(provider_module.torch.cuda, "device_count", lambda: 2)
+    monkeypatch.setattr(
+        provider_module.torch.cuda,
+        "get_device_properties",
+        lambda device: SimpleNamespace(major=9, name="NVIDIA H200"),
+    )
 
     resolved = provider_module.get_provider("deepseek-ai/DeepSeek-V4-Flash")
 

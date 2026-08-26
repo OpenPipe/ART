@@ -1,10 +1,8 @@
-import importlib.util
 import json
 import os
 from pathlib import Path
 import shutil
 import subprocess
-import sys
 from types import SimpleNamespace
 from typing import Any, cast
 
@@ -37,7 +35,8 @@ from art.megatron.weights.lora_publish import (
     merge_sharded_adapter_entries,
     save_vllm_lora_from_model,
 )
-from art.trainer_rank import TrainerRank
+from art.trainer_rank import TrainerRank, _checkpoint, _lora_export
+from art.trainer_rank._impl import _AdapterConfig, _CheckpointSlot
 from art.utils.convert_moe_lora import convert_checkpoint_if_needed
 
 REPO_ROOT = Path(__file__).parents[4]
@@ -151,37 +150,6 @@ def _save_adapter(path: Path, tensors: dict[str, torch.Tensor], config: dict) ->
     path.mkdir(parents=True, exist_ok=True)
     save_file(tensors, path / "adapter_model.safetensors")
     (path / "adapter_config.json").write_text(json.dumps(config), encoding="utf-8")
-
-
-def _old_merge_shard_files_to_vllm(
-    lora_path: Path,
-    *,
-    handler,
-    adapter_config: dict,
-) -> None:
-    entries_by_key: dict[str, list[tuple[dict, torch.Tensor]]] = {}
-    shard_paths = sorted(lora_path.glob("adapter_model-*-of-*.safetensors"))
-    manifest_paths = sorted(lora_path.glob("adapter_manifest-*-of-*.json"))
-    for shard_path in shard_paths:
-        suffix = shard_path.name.removeprefix("adapter_model-").removesuffix(
-            ".safetensors"
-        )
-        manifest = json.loads(
-            (lora_path / f"adapter_manifest-{suffix}.json").read_text()
-        )
-        shard_tensors = load_file(shard_path)
-        assert set(shard_tensors) == set(manifest)
-        for key, tensor in shard_tensors.items():
-            entries_by_key.setdefault(key, []).append((manifest[key], tensor))
-
-    merged = merge_sharded_adapter_entries(entries_by_key)
-    vllm_tensors, adapter_config = handler.to_vllm_lora_tensors(
-        merged,
-        adapter_config=adapter_config,
-    )
-    save_vllm_lora_tensors(lora_path, vllm_tensors, adapter_config)
-    for path in [*shard_paths, *manifest_paths]:
-        path.unlink()
 
 
 def _assert_stock_vllm_loads(
@@ -890,6 +858,25 @@ def test_dsv4_vllm_canonical_moe_roundtrip(tmp_path: Path) -> None:
     assert "model.layers.4.attn.compressor.wgate" in loaded_modules
     assert "model.layers.4.attn.compressor.wkv" in loaded_modules
 
+    packed_art = {
+        key.replace(".ffn.experts", ".mlp.experts"): tensor
+        for key, tensor in vllm_tensors.items()
+        if ".ffn.experts" in key
+    }
+    reexported, _ = DSV4_HANDLER.to_vllm_lora_tensors(
+        packed_art,
+        adapter_config=config,
+    )
+    _assert_tensors_equal(
+        reexported,
+        {key: tensor for key, tensor in vllm_tensors.items() if ".ffn.experts" in key},
+    )
+    assert all(
+        reexported[key].data_ptr()
+        == packed_art[key.replace(".ffn.experts", ".mlp.experts")].data_ptr()
+        for key in reexported
+    )
+
 
 def test_gemma4_shared_experts_plural_keys_map_to_vllm_dense_mlp(tmp_path: Path):
     art_prefix = "base_model.model.model.layers.0"
@@ -967,6 +954,66 @@ def test_gemma4_shared_experts_plural_keys_map_to_vllm_dense_mlp(tmp_path: Path)
         adapter_config=adapter_config,
     )
     _assert_tensors_equal(roundtrip, original)
+
+
+def test_gemma4_peft_target_parameter_moe_layout_is_transposed(tmp_path: Path):
+    model_dir = tmp_path / "gemma4-moe"
+    model_dir.mkdir()
+    (model_dir / "config.json").write_text(
+        json.dumps(
+            {
+                "text_config": {
+                    "enable_moe_block": True,
+                    "hidden_size": 6,
+                    "moe_intermediate_size": 2,
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    prefix = "base_model.model.model.layers.0.moe.experts"
+    peft_gate_up_a = torch.arange(8, dtype=torch.float32).reshape(2, 4)
+    peft_gate_up_b = torch.arange(12, dtype=torch.float32).reshape(6, 2)
+    peft_down_a = torch.arange(12, 24, dtype=torch.float32).reshape(2, 6)
+    peft_down_b = torch.arange(4, dtype=torch.float32).reshape(2, 2)
+    peft_tensors = {
+        f"{prefix}.base_layer.lora_A.weight": peft_gate_up_a,
+        f"{prefix}.base_layer.lora_B.weight": peft_gate_up_b,
+        f"{prefix}.lora_A.weight": peft_down_a,
+        f"{prefix}.lora_B.weight": peft_down_b,
+    }
+    adapter_config = _config(str(model_dir), rank=1, alpha=1)
+
+    normalized, _ = GEMMA4_MOE_HANDLER.to_vllm_lora_tensors(
+        peft_tensors,
+        adapter_config=adapter_config,
+    )
+
+    assert torch.equal(
+        normalized[f"{prefix}.base_layer.lora_A.weight"], peft_gate_up_b.T
+    )
+    assert torch.equal(
+        normalized[f"{prefix}.base_layer.lora_B.weight"], peft_gate_up_a.T
+    )
+    assert torch.equal(normalized[f"{prefix}.lora_A.weight"], peft_down_b.T)
+    assert torch.equal(normalized[f"{prefix}.lora_B.weight"], peft_down_a.T)
+
+    internal = GEMMA4_MOE_HANDLER.from_vllm_lora_tensors(
+        peft_tensors,
+        adapter_config=adapter_config,
+    )
+    art_prefix = "base_model.model.model.layers.0.mlp.experts"
+    for expert in range(2):
+        gate_up_a = internal[f"{art_prefix}.{expert}.gate_up_proj.lora_A.weight"]
+        gate_up_b = internal[f"{art_prefix}.{expert}.gate_up_proj.lora_B.weight"]
+        down_a = internal[f"{art_prefix}.{expert}.down_proj.lora_A.weight"]
+        down_b = internal[f"{art_prefix}.{expert}.down_proj.lora_B.weight"]
+        assert torch.equal(gate_up_a, peft_gate_up_b[:, expert].unsqueeze(0))
+        assert torch.equal(gate_up_b[:4], peft_gate_up_a[expert].unsqueeze(1))
+        assert torch.count_nonzero(gate_up_b[4:]) == 0
+        assert torch.equal(down_a[:, :2], peft_down_b[:, expert].unsqueeze(0))
+        assert torch.count_nonzero(down_a[:, 2:]) == 0
+        assert torch.equal(down_b, peft_down_a[expert].unsqueeze(1))
 
 
 def test_gpt_oss_vllm_canonical_roundtrip_and_stock_loader(tmp_path: Path):
@@ -1244,7 +1291,6 @@ def test_qwen35_megatron_shards_merge_to_vllm_checkpoint_and_roundtrip(
         handler=QWEN3_5_MOE_HANDLER,
     )
     _assert_tensors_equal(roundtrip, full)
-    final_config = json.loads((adapter_dir / "adapter_config.json").read_text())
     loaded_modules = _assert_stock_vllm_loads(
         adapter_dir,
         expected_modules={"experts"},
@@ -1391,117 +1437,6 @@ def test_lora_publish_planner_maps_expert_owner_ranks(monkeypatch):
     assert LoRAPublishPlanner._expert_owner_rank(ep_rank=3, shard_rank=1) == 7
 
 
-def test_batched_lora_publish_matches_old_shard_merge_exactly(tmp_path: Path):
-    uniform_key = "base_model.model.model.layers.0.self_attn.q_proj.lora_B.weight"
-    componentwise_key = (
-        "base_model.model.model.layers.0.mlp.experts.gate_up_proj.lora_B.weight"
-    )
-    unsharded_key = "base_model.model.model.layers.0.self_attn.q_proj.lora_A.weight"
-    full_uniform = torch.arange(8, dtype=torch.float32).reshape(4, 2)
-    full_componentwise = torch.tensor(
-        [[0.0], [1.0], [10.0], [11.0], [2.0], [3.0], [12.0], [13.0]]
-    )
-    shard0 = {
-        unsharded_key: torch.arange(4, dtype=torch.float32).reshape(2, 2) + 100,
-        uniform_key: full_uniform[:2],
-        componentwise_key: torch.tensor([[0.0], [1.0], [2.0], [3.0]]),
-    }
-    shard1 = {
-        uniform_key: full_uniform[2:],
-        componentwise_key: torch.tensor([[10.0], [11.0], [12.0], [13.0]]),
-    }
-    unsharded_manifest = {"sharded": False, "shard_world_size": 1, "shard_rank": 0}
-    uniform_manifest = {
-        "sharded": True,
-        "shard_world_size": 2,
-        "export_shard_dim": 0,
-        "export_shard_strategy": "uniform",
-    }
-    componentwise_manifest = {
-        "sharded": True,
-        "shard_world_size": 2,
-        "export_shard_dim": 0,
-        "export_shard_strategy": "componentwise",
-        "component_sizes": [4, 4],
-    }
-    manifest0 = {
-        unsharded_key: unsharded_manifest,
-        uniform_key: {**uniform_manifest, "shard_rank": 0},
-        componentwise_key: {**componentwise_manifest, "shard_rank": 0},
-    }
-    manifest1 = {
-        uniform_key: {**uniform_manifest, "shard_rank": 1},
-        componentwise_key: {**componentwise_manifest, "shard_rank": 1},
-    }
-
-    class IdentityHandler:
-        def to_vllm_lora_tensors(self, tensors, *, adapter_config):
-            return dict(tensors), dict(adapter_config)
-
-    old_dir = tmp_path / "old"
-    current_dir = tmp_path / "current"
-    old_dir.mkdir()
-    save_file(shard0, old_dir / "adapter_model-01-of-02.safetensors")
-    save_file(shard1, old_dir / "adapter_model-02-of-02.safetensors")
-    (old_dir / "adapter_manifest-01-of-02.json").write_text(
-        json.dumps(manifest0, sort_keys=True)
-    )
-    (old_dir / "adapter_manifest-02-of-02.json").write_text(
-        json.dumps(manifest1, sort_keys=True)
-    )
-    adapter_config = _config("Qwen/Qwen3-30B-A3B")
-    handler = IdentityHandler()
-    _old_merge_shard_files_to_vllm(
-        old_dir,
-        handler=handler,
-        adapter_config=adapter_config,
-    )
-
-    metadata = [
-        LoraShardMeta(
-            key=key,
-            owner_rank=0,
-            shape=tuple(tensor.shape),
-            dtype_name=str(tensor.dtype).removeprefix("torch."),
-            manifest=manifest0[key],
-            block="base_model.model.model.layers.0",
-        )
-        for key, tensor in shard0.items()
-    ] + [
-        LoraShardMeta(
-            key=key,
-            owner_rank=1,
-            shape=tuple(tensor.shape),
-            dtype_name=str(tensor.dtype).removeprefix("torch."),
-            manifest=manifest1[key],
-            block="base_model.model.model.layers.0",
-        )
-        for key, tensor in shard1.items()
-    ]
-    lora_publish._save_rank0_vllm_lora(
-        metadata=metadata,
-        tensors_by_owner_key={
-            **{(0, key): tensor for key, tensor in shard0.items()},
-            **{(1, key): tensor for key, tensor in shard1.items()},
-        },
-        handler=handler,
-        adapter_config=adapter_config,
-        output_dir=str(current_dir),
-    )
-
-    old_tensors = load_file(old_dir / "adapter_model.safetensors")
-    current_tensors = load_file(current_dir / "adapter_model.safetensors")
-    _assert_tensors_equal(current_tensors, old_tensors)
-    assert torch.equal(current_tensors[uniform_key], full_uniform)
-    assert torch.equal(current_tensors[componentwise_key], full_componentwise)
-    assert (current_dir / "adapter_model.safetensors").read_bytes() == (
-        old_dir / "adapter_model.safetensors"
-    ).read_bytes()
-    assert json.loads((current_dir / "adapter_config.json").read_text()) == json.loads(
-        (old_dir / "adapter_config.json").read_text()
-    )
-
-
 def test_save_vllm_lora_from_model_writes_single_vllm_checkpoint(tmp_path: Path):
     prefix = "base_model.model.model.layers.0.mlp.experts.0"
     full = {
@@ -1526,7 +1461,7 @@ def test_save_vllm_lora_from_model_writes_single_vllm_checkpoint(tmp_path: Path)
         out_features=8,
         rank=1,
         alpha=1,
-        dtype=torch.float32,
+        dtype=torch.bfloat16,
         device=torch.device("cpu"),
     )
     gate_up_lora.A_T.data.copy_(full[f"{prefix}.gate_up_proj.lora_A.weight"].T)
@@ -1537,7 +1472,7 @@ def test_save_vllm_lora_from_model_writes_single_vllm_checkpoint(tmp_path: Path)
         out_features=2,
         rank=1,
         alpha=1,
-        dtype=torch.float32,
+        dtype=torch.bfloat16,
         device=torch.device("cpu"),
     )
     down_lora.A_T.data.copy_(full[f"{prefix}.down_proj.lora_A.weight"].T)
@@ -1546,7 +1481,7 @@ def test_save_vllm_lora_from_model_writes_single_vllm_checkpoint(tmp_path: Path)
     publish_dir = tmp_path / "published_from_model"
     save_vllm_lora_from_model(
         model=cast(Any, [torch.nn.Sequential(gate_up_lora, down_lora)]),
-        adapter_dtypes={key: tensor.dtype for key, tensor in full.items()},
+        adapter_dtypes={},
         handler=QWEN3_5_MOE_HANDLER,
         adapter_config=_config("Qwen/Qwen3.5-35B-A3B", rank=1, alpha=1),
         output_dir=str(publish_dir),
@@ -1559,7 +1494,93 @@ def test_save_vllm_lora_from_model_writes_single_vllm_checkpoint(tmp_path: Path)
         str(publish_dir),
         handler=QWEN3_5_MOE_HANDLER,
     )
-    _assert_tensors_equal(roundtrip, full)
+    _assert_tensors_equal(
+        roundtrip,
+        {key: tensor.bfloat16() for key, tensor in full.items()},
+    )
+
+
+@pytest.mark.parametrize(
+    ("failed_phase", "expected_plans"),
+    (("validate LoRA publish runtime", 0), ("plan LoRA publish", 1)),
+)
+def test_remote_preexchange_failure_prevents_tensor_exchange(
+    monkeypatch: pytest.MonkeyPatch,
+    failed_phase: str,
+    expected_plans: int,
+) -> None:
+    exchanges: list[object] = []
+    plans: list[object] = []
+    failure_group = cast(Any, object())
+
+    monkeypatch.setattr(
+        _lora_export,
+        "_validate_vllm_lora_publish_runtime",
+        lambda *_args: (0, torch.device("cpu")),
+    )
+    monkeypatch.setattr(
+        _lora_export,
+        "_prepare_vllm_lora_publish",
+        lambda *_args, **_kwargs: plans.append(object()) or plans[-1],
+    )
+    monkeypatch.setattr(
+        _lora_export,
+        "_exchange_vllm_lora_publish",
+        lambda *_args: exchanges.append(object()),
+    )
+
+    def synchronize(error: BaseException | None, phase: str, group: object) -> None:
+        assert group is failure_group
+        if error is not None:
+            raise error
+        if phase == failed_phase:
+            raise RuntimeError(f"Another rank failed to {phase}")
+
+    monkeypatch.setattr(_checkpoint, "raise_distributed", synchronize)
+    trainer = SimpleNamespace(
+        runtime=SimpleNamespace(
+            rank=0,
+            world_size=2,
+            model=object(),
+            model_support_handler=object(),
+        ),
+        _slot_ref=lambda _name: None,
+    )
+
+    with pytest.raises(RuntimeError, match=f"Another rank failed to {failed_phase}"):
+        _lora_export._capture_lora_publish_inputs(
+            cast(Any, trainer), "student", {}, failure_group
+        )
+
+    assert exchanges == []
+    assert len(plans) == expected_plans
+
+
+def test_runtime_resolution_failure_uses_trainer_failure_group(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    failure_group = cast(Any, object())
+    synchronized_groups: list[object] = []
+    monkeypatch.setattr(
+        _lora_export,
+        "_validate_vllm_lora_publish_runtime",
+        lambda *_args: (_ for _ in ()).throw(RuntimeError("device resolution failed")),
+    )
+
+    def synchronize(error: BaseException | None, _phase: str, group: object) -> None:
+        synchronized_groups.append(group)
+        if error is not None:
+            raise error
+
+    monkeypatch.setattr(_checkpoint, "raise_distributed", synchronize)
+    trainer = SimpleNamespace(runtime=SimpleNamespace(rank=0, world_size=2))
+
+    with pytest.raises(RuntimeError, match="device resolution failed"):
+        _lora_export._capture_lora_publish_inputs(
+            cast(Any, trainer), "student", {}, failure_group
+        )
+
+    assert synchronized_groups == [failure_group]
 
 
 def test_trainer_rank_publishes_named_checkpoint_slot_without_mutating_base(
@@ -1581,14 +1602,16 @@ def test_trainer_rank_publishes_named_checkpoint_slot_without_mutating_base(
     )
     trainer._slot_stack = []
     trainer._pending_slot_graphs = {}
-    trainer._dynamic_optimizers = {}
-    trainer._checkpoint_slot_params_by_name = {}
-    trainer._checkpoint_slot_adapter_configs = {}
+    trainer._checkpoint_slots = {}
     config = _config("Qwen/Qwen3-8B", rank=2, alpha=2)
-    assert trainer.load_checkpoint_slot("student", adapter, adapter_config=config) == 1
+    assert trainer._load_checkpoint_slot("student", adapter, alpha=2) == 1
+    trainer._checkpoint_slots["student"] = _CheckpointSlot(
+        tuple(trainer._iter_slot_parameters(trainer._slot_ref("student"))),
+        cast(_AdapterConfig, config),
+    )
     output_dir = tmp_path / "checkpoint"
 
-    trainer.save_checkpoint_slot_lora("student", str(output_dir))
+    assert trainer.export_lora(str(output_dir), "student") == 0
 
     _assert_tensors_equal(load_file(output_dir / "adapter_model.safetensors"), adapter)
     assert json.loads((output_dir / "adapter_config.json").read_text()) == {
@@ -1599,9 +1622,63 @@ def test_trainer_rank_publishes_named_checkpoint_slot_without_mutating_base(
     assert torch.equal(lora.B_T, baseline[1])
 
 
+def test_prepared_lora_export_is_immutable_and_abortable(tmp_path: Path):
+    prefix = "base_model.model.model.layers.0.self_attn.q_proj"
+    lora = LoRA(prefix, 3, 4, 2, 2, torch.float32, torch.device("cpu"))
+    adapter = {
+        f"{prefix}.lora_A.weight": torch.arange(6, dtype=torch.float32).reshape(2, 3),
+        f"{prefix}.lora_B.weight": torch.arange(8, dtype=torch.float32).reshape(4, 2),
+    }
+    trainer = TrainerRank.__new__(TrainerRank)
+    trainer.runtime = SimpleNamespace(
+        model=[lora],
+        model_support_handler=DEFAULT_DENSE_HANDLER,
+        rank=0,
+        world_size=1,
+    )
+    trainer._slot_stack = []
+    trainer._pending_slot_graphs = {}
+    trainer._checkpoint_slots = {}
+    config = _config("Qwen/Qwen3-8B", rank=2, alpha=2)
+    assert trainer._load_checkpoint_slot("student", adapter, alpha=2) == 1
+    trainer._checkpoint_slots["student"] = _CheckpointSlot(
+        tuple(trainer._iter_slot_parameters(trainer._slot_ref("student"))),
+        cast(_AdapterConfig, config),
+    )
+
+    revision, capture_timings = trainer._prepare_lora_export(
+        "first", "student", owner_id="owner"
+    )
+    for parameter in trainer._checkpoint_slots["student"].params:
+        parameter.data.fill_(99)
+    output_dir = tmp_path / "prepared"
+    finalize_timings = trainer._finish_lora_export(
+        "first", str(output_dir), owner_id="owner"
+    )
+
+    assert revision == 0
+    assert set(capture_timings) == {
+        "slot_validation",
+        "runtime_validation",
+        "plan_collect",
+        "exchange",
+        "d2h",
+    }
+    assert set(finalize_timings) == {"convert", "serialize"}
+    _assert_tensors_equal(load_file(output_dir / "adapter_model.safetensors"), adapter)
+    with pytest.raises(ValueError, match="Unknown prepared LoRA export"):
+        trainer._finish_lora_export("first", str(output_dir), owner_id="owner")
+
+    trainer._prepare_lora_export("aborted", "student", owner_id="owner")
+    trainer._abort_lora_export("aborted", owner_id="owner")
+    with pytest.raises(ValueError, match="Unknown prepared LoRA export"):
+        trainer._finish_lora_export("aborted", str(output_dir), owner_id="owner")
+
+
 @pytest.mark.parametrize(
     ("handler", "base_model"),
     (
+        (QWEN3_MOE_HANDLER, "Qwen/Qwen3-30B-A3B-Instruct-2507"),
         (QWEN3_5_MOE_HANDLER, "Qwen/Qwen3.5-35B-A3B"),
         (DSV4_HANDLER, "deepseek-ai/DeepSeek-V4-Flash"),
     ),
@@ -1622,41 +1699,33 @@ def test_direct_3d_packed_expert_publish_matches_handler_vllm_exactly(
     intermediate = 4
     group_prefix = "base_model.model.model.layers.0.mlp.experts"
     full: dict[str, torch.Tensor] = {}
-    gate_up_lora = LoRA(
-        adapter_model_prefix=f"{group_prefix}.{{expert}}.gate_up_proj",
-        in_features=hidden,
-        out_features=2 * intermediate,
-        rank=rank,
-        alpha=rank,
-        dtype=torch.float32,
-        device=torch.device("cpu"),
-        num_local_experts=2,
-    )
-    down_lora = LoRA(
-        adapter_model_prefix=f"{group_prefix}.{{expert}}.down_proj",
-        in_features=intermediate,
-        out_features=hidden,
-        rank=rank,
-        alpha=rank,
-        dtype=torch.float32,
-        device=torch.device("cpu"),
-        num_local_experts=2,
-    )
+    projection_loras = {
+        projection: LoRA(
+            adapter_model_prefix=f"{group_prefix}.{{expert}}.{projection}",
+            in_features=hidden if projection != "down_proj" else intermediate,
+            out_features=(
+                hidden
+                if projection == "down_proj"
+                else 2 * intermediate
+                if projection == "gate_up_proj"
+                else intermediate
+            ),
+            rank=rank,
+            alpha=rank,
+            dtype=torch.float32,
+            device=torch.device("cpu"),
+            num_local_experts=2,
+        )
+        for projection in (
+            ("gate_proj", "up_proj", "down_proj")
+            if handler is QWEN3_MOE_HANDLER
+            else ("gate_up_proj", "down_proj")
+        )
+    }
     offset = 0
     for expert in range(2):
         expert_prefix = f"{group_prefix}.{expert}"
         tensors = {
-            "gate_up_proj.lora_A.weight": torch.arange(
-                rank * hidden,
-                dtype=torch.float32,
-            ).reshape(rank, hidden)
-            + offset,
-            "gate_up_proj.lora_B.weight": torch.arange(
-                2 * intermediate * rank,
-                dtype=torch.float32,
-            ).reshape(2 * intermediate, rank)
-            + offset
-            + 100,
             "down_proj.lora_A.weight": torch.arange(
                 rank * intermediate,
                 dtype=torch.float32,
@@ -1670,20 +1739,36 @@ def test_direct_3d_packed_expert_publish_matches_handler_vllm_exactly(
             + offset
             + 300,
         }
+        for projection_index, projection in enumerate(
+            ("gate_proj", "up_proj")
+            if handler is QWEN3_MOE_HANDLER
+            else ("gate_up_proj",)
+        ):
+            output = intermediate if handler is QWEN3_MOE_HANDLER else 2 * intermediate
+            tensors[f"{projection}.lora_A.weight"] = (
+                torch.arange(rank * hidden, dtype=torch.float32).reshape(rank, hidden)
+                + offset
+                + projection_index * 10
+            )
+            tensors[f"{projection}.lora_B.weight"] = (
+                torch.arange(output * rank, dtype=torch.float32).reshape(output, rank)
+                + offset
+                + 100
+                + projection_index * 10
+            )
         for suffix, tensor in tensors.items():
             full[f"{expert_prefix}.{suffix}"] = tensor
-        gate_up_lora.A_T.data[expert].copy_(tensors["gate_up_proj.lora_A.weight"].T)
-        gate_up_lora.B_T.data[expert].copy_(tensors["gate_up_proj.lora_B.weight"].T)
-        down_lora.A_T.data[expert].copy_(tensors["down_proj.lora_A.weight"].T)
-        down_lora.B_T.data[expert].copy_(tensors["down_proj.lora_B.weight"].T)
+        for projection, lora in projection_loras.items():
+            lora.A_T.data[expert].copy_(tensors[f"{projection}.lora_A.weight"].T)
+            lora.B_T.data[expert].copy_(tensors[f"{projection}.lora_B.weight"].T)
         offset += 1000
 
     slot_ref = LoRASlotRef("checkpoint", "student") if dynamic_slot else None
     if slot_ref is not None:
-        assert gate_up_lora.load_lora_slot(
-            slot_ref, full, alpha=rank, requires_grad=True
+        assert all(
+            lora.load_lora_slot(slot_ref, full, alpha=rank, requires_grad=True)
+            for lora in projection_loras.values()
         )
-        assert down_lora.load_lora_slot(slot_ref, full, alpha=rank, requires_grad=True)
 
     adapter_config = _config(base_model, rank=rank, alpha=rank)
     old_dir = tmp_path / "old"
@@ -1694,7 +1779,7 @@ def test_direct_3d_packed_expert_publish_matches_handler_vllm_exactly(
     )
     save_vllm_lora_tensors(old_dir, old_tensors, old_config)
     save_vllm_lora_from_model(
-        model=cast(Any, [torch.nn.Sequential(gate_up_lora, down_lora)]),
+        model=cast(Any, [torch.nn.Sequential(*projection_loras.values())]),
         adapter_dtypes={key: tensor.dtype for key, tensor in full.items()},
         handler=handler,
         adapter_config=dict(adapter_config),

@@ -5,7 +5,6 @@ from dataclasses import dataclass, field
 from functools import cached_property
 import logging
 import os
-import socket
 from typing import Any, AsyncIterator, Literal, TypedDict, cast
 
 import torch
@@ -15,7 +14,6 @@ from .. import dev, types
 from ..adapter_leases import in_flight_lora_name
 from ..dev.validate import is_dedicated_mode
 from ..local.checkpoints import get_last_checkpoint_dir
-from ..preprocessing.inputs import TrainInputs
 from ..preprocessing.pack import DiskPackedTensors
 from ..preprocessing.tokenize import SFTBatch
 from ..serving_capabilities import (
@@ -33,12 +31,6 @@ from ..utils.output_dirs import get_step_checkpoint_dir
 from ..vllm_runtime import (
     ManagedVllmRuntime,
     VllmRuntimeLaunchConfig,
-)
-from ..weight_transfer import (
-    DEFAULT_PACKED_BUFFER_SIZE_BYTES,
-    DEFAULT_PACKED_NUM_BUFFERS,
-    trainer_init,
-    trainer_send_weights,
 )
 from .train import (
     UnslothTrainContext,
@@ -114,21 +106,6 @@ def save_checkpoint(
     return checkpoint_dir
 
 
-def _find_free_tcp_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", 0))
-        return int(sock.getsockname()[1])
-
-
-def _normalize_merged_checkpoint_name(name: str) -> str:
-    # PEFT wraps adapted modules under `.base_layer`, but vLLM expects the
-    # original checkpoint parameter names during update_weights().
-    normalized = name.removeprefix("base_model.model.")
-    while ".base_layer." in normalized:
-        normalized = normalized.replace(".base_layer.", ".")
-    return normalized
-
-
 # ============================================================================
 # Service
 # ============================================================================
@@ -147,7 +124,6 @@ class UnslothService:
         init=False,
         repr=False,
     )
-    _weight_transfer_group: Any = field(default=None, init=False, repr=False)
     _lifecycle: ServiceLifecycle = field(
         default_factory=ServiceLifecycle,
         init=False,
@@ -195,12 +171,6 @@ class UnslothService:
         return is_dedicated_mode(self.config)
 
     @property
-    def rollout_weights_mode(self) -> Literal["lora", "merged"]:
-        mode = self.config["rollout_weights_mode"]
-        assert mode in {"lora", "merged"}
-        return mode
-
-    @property
     def rollout_weight_update_mode(self) -> Literal["step_lora", "in_flight_lora"]:
         mode = self.config.get("rollout_weight_update_mode", "step_lora")
         assert mode in {"step_lora", "in_flight_lora"}
@@ -212,10 +182,7 @@ class UnslothService:
 
     @property
     def _initial_served_model_name(self) -> str:
-        if (
-            self.rollout_weights_mode == "lora"
-            and self.rollout_weight_update_mode == "in_flight_lora"
-        ):
+        if self.rollout_weight_update_mode == "in_flight_lora":
             return self._in_flight_lora_slot
         return f"{self.model_name}@{self._latest_step}"
 
@@ -244,10 +211,6 @@ class UnslothService:
     def _vllm_api_key(self) -> str | None:
         return self._vllm_runtime.api_key
 
-    @property
-    def _vllm_nccl_so_path(self) -> str | None:
-        return self._vllm_runtime.nccl_so_path
-
     def _runtime_cuda_visible_devices(self) -> str:
         if self.is_dedicated:
             return ",".join(str(gpu_id) for gpu_id in self.config["inference_gpu_ids"])
@@ -262,13 +225,8 @@ class UnslothService:
         if config and "engine_args" in config:
             engine_args.update(dict(config["engine_args"]))
         engine_args.setdefault("generation_config", "vllm")
-        if self.rollout_weights_mode == "merged":
-            engine_args["weight_transfer_config"] = {"backend": "nccl"}
-            engine_args.pop("enable_lora", None)
-            engine_args.pop("max_loras", None)
-        else:
-            engine_args["enable_lora"] = True
-            engine_args.setdefault("max_loras", 2)
+        engine_args["enable_lora"] = True
+        engine_args.setdefault("max_loras", 2)
         for key in ("model", "served_model_name"):
             engine_args.pop(key, None)
         return engine_args
@@ -334,7 +292,6 @@ class UnslothService:
                 cuda_visible_devices=self._runtime_cuda_visible_devices(),
                 lora_path=lora_path,
                 served_model_name=self._initial_served_model_name,
-                rollout_weights_mode=self.rollout_weights_mode,
                 engine_args=self._runtime_engine_args(config),
                 server_args=server_args,
             ),
@@ -351,218 +308,6 @@ class UnslothService:
             self._runtime_cuda_visible_devices(),
         )
         return location
-
-    async def _set_served_model_name(self, step: int) -> None:
-        import httpx
-
-        self._raise_if_child_failed()
-        served_model_name = f"{self.model_name}@{step}"
-        async with httpx.AsyncClient() as client:
-            response = await client.post(
-                f"{self._vllm_base_url}/art/set_served_model_name",
-                json={"name": served_model_name},
-                **self._runtime_request_kwargs(),
-                timeout=30.0,
-            )
-            response.raise_for_status()
-        logger.info(
-            "[DEDICATED] Updated merged rollout alias to %s",
-            served_model_name,
-        )
-
-    async def _init_merged_weight_transfer(self) -> None:
-        import httpx
-
-        self._raise_if_child_failed()
-        if self._weight_transfer_group is not None:
-            return
-
-        async with httpx.AsyncClient() as client:
-            world_size_response = await client.get(
-                f"{self._vllm_base_url}/get_world_size",
-                **self._runtime_request_kwargs(),
-                timeout=30.0,
-            )
-            try:
-                world_size_response.raise_for_status()
-            except httpx.HTTPStatusError as exc:
-                raise RuntimeError(
-                    "Merged rollout weights require a vLLM build with the "
-                    "/get_world_size endpoint"
-                ) from exc
-            inference_world_size = int(world_size_response.json()["world_size"])
-            if self._vllm_nccl_so_path is None:
-                raise RuntimeError("vLLM runtime NCCL path is not initialized")
-
-            master_port = _find_free_tcp_port()
-            init_info = {
-                "master_address": "127.0.0.1",
-                "master_port": master_port,
-                "rank_offset": 1,
-                "world_size": inference_world_size + 1,
-            }
-
-            remote_init_task = asyncio.create_task(
-                client.post(
-                    f"{self._vllm_base_url}/init_weight_transfer_engine",
-                    json={"init_info": init_info},
-                    **self._runtime_request_kwargs(),
-                    timeout=300.0,
-                )
-            )
-            self._weight_transfer_group = await asyncio.to_thread(
-                trainer_init,
-                {
-                    "master_address": init_info["master_address"],
-                    "master_port": init_info["master_port"],
-                    "world_size": init_info["world_size"],
-                    "nccl_so_path": self._vllm_nccl_so_path,
-                },
-            )
-            remote_init_response = await remote_init_task
-            try:
-                remote_init_response.raise_for_status()
-            except httpx.HTTPStatusError as exc:
-                raise RuntimeError(
-                    "Merged rollout weights require a vLLM build with the "
-                    "/init_weight_transfer_engine endpoint"
-                ) from exc
-
-        logger.info(
-            "[DEDICATED] Initialized merged weight transfer: inference_world_size=%d",
-            inference_world_size,
-        )
-
-    def _merged_checkpoint_weights_for_vllm(self) -> list[tuple[str, torch.Tensor]]:
-        model = self._state.peft_model.base_model.model
-        device = next(model.parameters()).device
-        assert device.type == "cuda"
-
-        weights: list[tuple[str, torch.Tensor]] = []
-        normalized_names: set[str] = set()
-        for name, tensor in model.state_dict().items():
-            if "lora_" in name:
-                continue
-            normalized_name = _normalize_merged_checkpoint_name(name)
-            assert normalized_name not in normalized_names
-            normalized_names.add(normalized_name)
-            detached = tensor.detach()
-            if detached.device != device:
-                detached = detached.to(device=device, non_blocking=True)
-            weights.append((normalized_name, detached))
-
-        assert weights
-        return weights
-
-    async def _sync_merged_weights(
-        self,
-        step: int,
-        pause_generation: bool,
-    ) -> None:
-        import httpx
-
-        self._raise_if_child_failed()
-        assert self._weight_transfer_group is not None
-
-        peft_model = self._state.peft_model
-        merged = False
-        error: Exception | None = None
-        logger.info("[DEDICATED] Syncing merged rollout weights for step %d", step)
-
-        async with httpx.AsyncClient() as client:
-            try:
-                if pause_generation:
-                    response = await client.post(
-                        f"{self._vllm_base_url}/pause",
-                        params={"mode": "wait"},
-                        **self._runtime_request_kwargs(),
-                        timeout=300.0,
-                    )
-                    response.raise_for_status()
-
-                peft_model.merge_adapter()
-                merged = True
-                torch.cuda.synchronize()
-
-                weights = self._merged_checkpoint_weights_for_vllm()
-                response = await client.post(
-                    f"{self._vllm_base_url}/start_weight_update",
-                    json={"is_checkpoint_format": True},
-                    **self._runtime_request_kwargs(),
-                    timeout=300.0,
-                )
-                response.raise_for_status()
-                update_info = {
-                    "names": [name for name, _ in weights],
-                    "dtype_names": [
-                        str(tensor.dtype).removeprefix("torch.")
-                        for _, tensor in weights
-                    ],
-                    "shapes": [list(tensor.shape) for _, tensor in weights],
-                    "packed": True,
-                    "packed_buffer_size_bytes": DEFAULT_PACKED_BUFFER_SIZE_BYTES,
-                    "packed_num_buffers": DEFAULT_PACKED_NUM_BUFFERS,
-                }
-
-                _, update_response = await asyncio.gather(
-                    asyncio.to_thread(
-                        trainer_send_weights,
-                        iter(weights),
-                        {
-                            "group": self._weight_transfer_group,
-                            "packed": True,
-                            "packed_buffer_size_bytes": DEFAULT_PACKED_BUFFER_SIZE_BYTES,
-                            "packed_num_buffers": DEFAULT_PACKED_NUM_BUFFERS,
-                        },
-                    ),
-                    client.post(
-                        f"{self._vllm_base_url}/update_weights",
-                        json={"update_info": update_info},
-                        **self._runtime_request_kwargs(),
-                        timeout=600.0,
-                    ),
-                )
-                try:
-                    update_response.raise_for_status()
-                except httpx.HTTPStatusError as exc:
-                    raise RuntimeError(
-                        "Merged rollout weights require a vLLM build with the "
-                        "/update_weights endpoint"
-                    ) from exc
-                response = await client.post(
-                    f"{self._vllm_base_url}/finish_weight_update",
-                    **self._runtime_request_kwargs(),
-                    timeout=600.0,
-                )
-                response.raise_for_status()
-                self._latest_step = step
-                await self._set_served_model_name(step)
-            except Exception as exc:
-                error = exc
-                raise
-            finally:
-                if merged:
-                    peft_model.unmerge_adapter()
-                    torch.cuda.synchronize()
-                if pause_generation:
-                    try:
-                        response = await client.post(
-                            f"{self._vllm_base_url}/resume",
-                            **self._runtime_request_kwargs(),
-                            timeout=30.0,
-                        )
-                        response.raise_for_status()
-                    except Exception:
-                        if error is None:
-                            raise
-                        logger.exception(
-                            "Failed to resume generation after merged weight sync error"
-                        )
-
-        logger.info(
-            "[DEDICATED] Merged rollout sync complete for step %d",
-            step,
-        )
 
     async def _reload_adapter(self, checkpoint_path: str, step: int) -> None:
         """Reload LoRA adapter in vLLM subprocess via HTTP."""
@@ -630,8 +375,6 @@ class UnslothService:
             await self._reload_adapter(checkpoint_path, step)
 
     async def acquire_exact_adapter(self, step: int, checkpoint_path: str) -> str:
-        if self.rollout_weights_mode != "lora":
-            raise RuntimeError("Exact checkpoint eval requires LoRA rollout serving")
         lora_name = self._exact_lora_name(step)
         async with self._exact_adapter_lock:
             loaded_steps = (
@@ -673,6 +416,22 @@ class UnslothService:
             await self._unload_exact_adapter(step)
             del self._exact_adapter_refcounts[step]
 
+    async def resolve_global_grad_accumulation_sequences(
+        self, config: types.TrainConfig
+    ) -> int:
+        configured = int(
+            self.config.get("trainer_args", {}).get("gradient_accumulation_steps", 1)
+        )
+        if configured < 1:
+            raise ValueError("Unsloth gradient accumulation must be >= 1")
+        requested = config.grad_accumulation_sequences
+        if requested is not None and requested != configured:
+            raise ValueError(
+                "UnslothService is configured for "
+                f"grad_accumulation_sequences={configured}, got {requested}"
+            )
+        return configured
+
     async def _unload_adapter_name(self, lora_name: str) -> bool:
         import httpx
 
@@ -698,7 +457,7 @@ class UnslothService:
         self._loaded_exact_adapter_steps.discard(step)
 
     async def prune_loaded_adapters(self, *, retain_steps: set[int]) -> None:
-        if self.rollout_weights_mode != "lora" or self._vllm_port == 0:
+        if self._vllm_port == 0:
             return
         async with self._exact_adapter_lock:
             for step in sorted(self._loaded_exact_adapter_steps - retain_steps):
@@ -715,20 +474,12 @@ class UnslothService:
         """Terminate vLLM subprocess if running."""
         if not self._lifecycle.begin_close():
             return
-        weight_transfer_group = self._weight_transfer_group
-        self._weight_transfer_group = None
         try:
-            try:
-                if weight_transfer_group is not None:
-                    close = getattr(weight_transfer_group, "close", None)
-                    if close is not None:
-                        close()
-            finally:
-                self._child_processes.close()
-                self._vllm_runtime.close()
-                self._loaded_adapter_steps.clear()
-                self._loaded_exact_adapter_steps.clear()
-                self._exact_adapter_refcounts.clear()
+            self._child_processes.close()
+            self._vllm_runtime.close()
+            self._loaded_adapter_steps.clear()
+            self._loaded_exact_adapter_steps.clear()
+            self._exact_adapter_refcounts.clear()
         finally:
             self._lifecycle.restore_parent_cleanup()
 
@@ -770,15 +521,10 @@ class UnslothService:
                 headers=self._runtime_headers(),
                 allow_openai_compatible=False,
             )
-            if self.rollout_weights_mode == "lora":
-                if self.rollout_weight_update_mode == "in_flight_lora":
-                    await self._update_in_flight_adapter(lora_path, self._latest_step)
-                else:
-                    self._loaded_adapter_steps.add(self._latest_step)
-            if self.rollout_weights_mode == "merged":
-                _ = self._state
-                await self._init_merged_weight_transfer()
-                await self._sync_merged_weights(self._latest_step, False)
+            if self.rollout_weight_update_mode == "in_flight_lora":
+                await self._update_in_flight_adapter(lora_path, self._latest_step)
+            else:
+                self._loaded_adapter_steps.add(self._latest_step)
         except BaseException as exc:
             await cleanup_after_failure(
                 exc,
@@ -819,10 +565,7 @@ class UnslothService:
         self._is_sleeping = False
 
     async def register_lora_for_step(self, step: int, checkpoint_dir: str) -> None:
-        if self.rollout_weights_mode == "merged":
-            await self._set_served_model_name(step)
-        else:
-            await self._load_rollout_lora_for_step(checkpoint_dir, step)
+        await self._load_rollout_lora_for_step(checkpoint_dir, step)
         self._latest_step = step
 
     async def train(
@@ -879,18 +622,11 @@ class UnslothService:
         )
 
         new_step = int(os.path.basename(checkpoint_dir))
-        if self.rollout_weights_mode == "merged":
-            logger.info(
-                "[DEDICATED] _train_dedicated: saved checkpoint step=%s, syncing merged weights...",
-                new_step,
-            )
-            await self._sync_merged_weights(new_step, True)
-        else:
-            logger.info(
-                "[DEDICATED] _train_dedicated: saved checkpoint step=%s, reloading adapter...",
-                new_step,
-            )
-            await self._load_rollout_lora_for_step(checkpoint_dir, new_step)
+        logger.info(
+            "[DEDICATED] _train_dedicated: saved checkpoint step=%s, reloading adapter...",
+            new_step,
+        )
+        await self._load_rollout_lora_for_step(checkpoint_dir, new_step)
         self._latest_step = new_step
         logger.info(
             f"[DEDICATED] _train_dedicated: inference weights updated for step {new_step}"

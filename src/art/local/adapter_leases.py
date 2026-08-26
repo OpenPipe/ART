@@ -32,3 +32,8 @@ class AdapterLeaseManager:
 
     def active_steps(self) -> set[int]:
         return set(self._counts)
+
+    @asynccontextmanager
+    async def prune_guard(self) -> AsyncIterator[set[int]]:
+        async with self._condition:
+            yield self.active_steps()

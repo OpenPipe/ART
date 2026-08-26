@@ -25,7 +25,7 @@ def _load_dsv4_patches_module():
     return module
 
 
-def test_dsv4_lora_support_declares_vllm_024_manager_protocol(monkeypatch) -> None:
+def test_dsv4_lora_support_declares_vllm_025_manager_protocol(monkeypatch) -> None:
     patches = _load_dsv4_patches_module()
 
     class FakeDeepseekV4ForCausalLM:
@@ -33,21 +33,58 @@ def test_dsv4_lora_support_declares_vllm_024_manager_protocol(monkeypatch) -> No
 
     manager_patches: list[type] = []
     monkeypatch.setattr(
-        patches,
-        "_import_dsv4_model_module",
-        lambda: SimpleNamespace(DeepseekV4ForCausalLM=FakeDeepseekV4ForCausalLM),
+        patches.importlib,
+        "import_module",
+        lambda name: (
+            SimpleNamespace(DeepseekV4ForCausalLM=FakeDeepseekV4ForCausalLM)
+            if name == "vllm.models.deepseek_v4.nvidia.model"
+            else None
+        ),
     )
     monkeypatch.setattr(
         patches,
         "_patch_dsv4_lora_manager_indexer_skip",
         manager_patches.append,
     )
-
     patches.patch_dsv4_lora_support()
 
     assert getattr(FakeDeepseekV4ForCausalLM, "supports_lora") is True
     assert getattr(FakeDeepseekV4ForCausalLM, "lora_manager") is None
     assert manager_patches == [FakeDeepseekV4ForCausalLM]
+
+
+def test_dsv4_fp8_o_proj_normalizes_rope_cache_once() -> None:
+    patches = _load_dsv4_patches_module()
+    rotary_emb = SimpleNamespace(cos_sin_cache=torch.ones(4, 8, dtype=torch.bfloat16))
+
+    cache = patches._dsv4_fp32_cos_sin_cache(rotary_emb)
+
+    assert cache.dtype == torch.float32
+    assert rotary_emb.cos_sin_cache is cache
+    assert patches._dsv4_fp32_cos_sin_cache(rotary_emb) is cache
+
+
+def test_dsv4_native_o_proj_receives_fp32_rope_cache() -> None:
+    patches = _load_dsv4_patches_module()
+    seen: list[torch.Tensor] = []
+
+    class Attention:
+        def __init__(self) -> None:
+            self.rotary_emb = SimpleNamespace(
+                cos_sin_cache=torch.ones(4, 8, dtype=torch.bfloat16)
+            )
+            self.wo_a = SimpleNamespace()
+
+        def _o_proj(self, _o, _positions):
+            seen.append(self.rotary_emb.cos_sin_cache)
+            return "native"
+
+    patches._patch_dsv4_cuda_o_proj_lora(Attention, SimpleNamespace())
+    attention = Attention()
+
+    assert attention._o_proj(None, None) == "native"
+    assert seen == [attention.rotary_emb.cos_sin_cache]
+    assert seen[0].dtype == torch.float32
 
 
 def test_dsv4_compressor_helper_uses_punica_metadata_without_full_batch_lora(

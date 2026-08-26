@@ -7,6 +7,7 @@ import math
 import os
 from pathlib import Path
 import re
+import secrets
 import shutil
 from typing import Any, Callable, Literal, TypeVar, cast
 
@@ -16,7 +17,13 @@ from rich.console import Console
 from rich.table import Table
 import torch
 
-from art.megatron.routing_replay import ROUTER_KEY_FORMAT_VERSION
+from art.megatron.routing_replay import (
+    ROUTER_KEY_FORMAT_VERSION,
+    MoeRoutingReplayBundle,
+)
+from art.megatron.routing_replay import (
+    ParallelTopology as ReplayParallelTopology,
+)
 from art.megatron.training.streaming_weight_offload import StreamingWeightOffloadConfig
 
 from ..artifacts import GitRepoState, pinned_git_state
@@ -33,7 +40,12 @@ SENSITIVITY_MUTATION_ENV = "ART_SENSITIVITY_MUTATIONS"
 ORACLE_OBJECTIVE_ENV = "ART_ORACLE_OBJECTIVE"
 ORACLE_BASE_MODEL_ENV = "ART_ORACLE_BASE_MODEL"
 KEEP_TOPOLOGY_ARTIFACTS_ENV = "ART_ORACLE_KEEP_TOPOLOGY_ARTIFACTS"
+SHARED_MEMORY_ROOT_ENV = "ART_ORACLE_SHARED_MEMORY_ROOT"
 ORACLE_ARTIFACT_SUITE_NAME = "Megatron oracle artifacts"
+MAX_COMPARISON_BYTES = 8 * 1024**3
+MAX_FAILURE_ROWS = 8
+MAX_FAILURE_VALUES = 32
+COMPARISON_PHASES = "outputs grads deltas forward router_scores router_topk_ids".split()
 
 OracleObjective = Literal["rl", "sft"]
 SUPPORTED_ORACLE_OBJECTIVES: tuple[OracleObjective, ...] = ("rl", "sft")
@@ -214,10 +226,11 @@ class Topology(BaseModel):
         return attention_world
 
 
+# Retained for focused/nightly sentinel runs; normal workflows use compositions below.
 TOPOLOGIES = [
     Topology(tp=1, ep=1, etp=1, dp=1, sp=False),
     Topology(tp=1, ep=2, etp=1, dp=1, cp=2, sp=False),
-    Topology(tp=2, ep=2, etp=1, dp=1, cp=2, sp=True),
+    Topology(tp=1, ep=2, etp=1, dp=1, cp=2, pp=2, vpp=2, sp=False),
     Topology(tp=2, ep=4, etp=2, dp=2, cp=2, sp=True),
 ]
 
@@ -233,15 +246,20 @@ CP_UNSUPPORTED_MOE_TOPOLOGIES = [
 ]
 DENSE_TOPOLOGIES = [
     Topology(tp=1, ep=1, etp=1, dp=1, sp=False),
-    Topology(tp=2, ep=1, etp=1, dp=1, sp=True),
-    Topology(tp=1, ep=1, etp=1, dp=2, sp=False),
-    Topology(tp=2, ep=1, etp=1, dp=2, sp=True),
-    Topology(tp=1, ep=1, etp=1, dp=1, cp=2, sp=False),
-    Topology(tp=2, ep=1, etp=1, dp=1, cp=2, sp=True),
+    Topology(tp=2, ep=1, etp=1, dp=1, cp=2, sp=False),
     Topology(tp=2, ep=1, etp=1, dp=2, cp=2, sp=True),
 ]
 ORACLE_TOPOLOGY = TOPOLOGIES[0]
 DENSE_ORACLE_TOPOLOGY = DENSE_TOPOLOGIES[0]
+CP_MOE_COMPOSITION_TOPOLOGY = Topology(
+    tp=2, ep=2, etp=2, dp=1, cp=2, pp=2, vpp=2, sp=True
+)
+DENSE_COMPOSITION_TOPOLOGY = Topology(
+    tp=2, ep=1, etp=1, dp=1, cp=2, pp=2, vpp=2, sp=True
+)
+NO_CP_MOE_COMPOSITION_TOPOLOGY = Topology(
+    tp=2, ep=2, etp=2, dp=2, cp=1, pp=2, vpp=2, sp=True
+)
 SENSITIVITY_TOPOLOGY = Topology(tp=2, ep=2, etp=1, dp=1, sp=True)
 CP_ATTENTION_SENSITIVITY_TOPOLOGY = Topology(tp=1, ep=2, etp=1, dp=1, cp=2, sp=False)
 DENSE_SENSITIVITY_TOPOLOGY = Topology(tp=2, ep=1, etp=1, dp=1, sp=True)
@@ -265,11 +283,14 @@ SENSITIVITY_TOPOLOGY_BY_MUTATION["bwd_skip_sync_fc1_a"] = Topology(
 SENSITIVITY_TOPOLOGY_BY_MUTATION |= {
     k: Topology(tp=1, ep=2, etp=1, dp=2, sp=False)
     for k in [
-        "dp_grad_accumulation_seqs",
         "dp_local_token_normalization",
         "sft_local_token_normalization",
     ]
 }
+# Isolate DP sample assignment from HybridEP's independently planned micro extents.
+SENSITIVITY_TOPOLOGY_BY_MUTATION["dp_grad_accumulation_seqs"] = Topology(
+    tp=1, ep=1, etp=1, dp=2, sp=False
+)
 
 
 class PackedTensorConfig(BaseModel):
@@ -341,6 +362,8 @@ class OracleCaseConfig(BaseModel):
     """Contains all deterministic run parameters for one oracle case."""
 
     base_model: str
+    provider_model: str | None = None
+    model_support_key: str | None = None
     precision: Literal["bf16", "fp32"] = "fp32"
     num_layers: int = 4
     seed: int = 20260304
@@ -356,6 +379,12 @@ class OracleCaseConfig(BaseModel):
 
     @property
     def is_moe(self) -> bool:
+        if self.model_support_key is not None:
+            from art.megatron.model_support.registry import (
+                get_model_support_spec_by_key,
+            )
+
+            return get_model_support_spec_by_key(self.model_support_key).is_moe
         from art.megatron.model_support import model_uses_expert_parallel
 
         return model_uses_expert_parallel(
@@ -394,6 +423,8 @@ class WorkerRunRequest(BaseModel):
     topology_dir: str
     packed_tensors: DiskPackedTensorsSpec
     shared_init_adapter_path: str
+    comparison_dir: str = Field(default_factory=lambda: str(_new_comparison_dir()))
+    prepare_moe_routing_replay: bool = False
     mutation: SensitivityMutation | None = None
     moe_routing_replay_path: str | None = None
     moe_routing_replay_strict: bool = True
@@ -407,7 +438,7 @@ class WorkerRunRequest(BaseModel):
 
 
 class StepTrace(BaseModel):
-    """Tracks per-step trace artifact filenames and loss metadata."""
+    """Tracks one step's compact loss and sample metadata."""
 
     step_index: int
     loss: float
@@ -415,10 +446,6 @@ class StepTrace(BaseModel):
     micro_sample_indices: list[int | None] = Field(default_factory=list)
     micro_losses: list[float] = Field(default_factory=list)
     debug_files: dict[str, str] = Field(default_factory=dict)
-    output_file: str
-    grads_file: str
-    deltas_file: str
-    lora_file: str
 
 
 class RunManifest(BaseModel):
@@ -433,6 +460,7 @@ class RunManifest(BaseModel):
     world_size: int
     seed: int
     num_steps: int
+    comparison_dir: str | None = None
     packed_tensors: DiskPackedTensorsSpec
     offload_between_jobs: bool = True
     streaming_weight_offload: StreamingWeightOffloadConfig = Field(
@@ -499,7 +527,7 @@ class VariantSpec(BaseModel):
 
 
 class VariantReport(BaseModel):
-    """Captures full comparison output for one variant run."""
+    """Captures compact comparison output for one variant run."""
 
     git: GitRepoState
     case_id: str
@@ -510,7 +538,6 @@ class VariantReport(BaseModel):
     signal: Literal["pass", "fail"]
     pass_count: int
     fail_count: int
-    step_summaries: dict[int, dict[str, Any]] = Field(repr=False)
     metrics: list[MetricRow] = Field(repr=False)
 
 
@@ -768,35 +795,41 @@ def oracle_topology(*, is_moe: bool = True) -> Topology:
     return ORACLE_TOPOLOGY if is_moe else DENSE_ORACLE_TOPOLOGY
 
 
-def _filter_context_parallel_support(
-    topologies: list[Topology],
-    *,
-    is_moe: bool,
-    cp_supported: bool,
-) -> list[Topology]:
-    if cp_supported:
-        return topologies
-    if is_moe:
-        return list(CP_UNSUPPORTED_MOE_TOPOLOGIES)
-    return [_without_context_parallel(topology) for topology in topologies]
-
-
 def selected_suite_topologies(
     *,
     is_moe: bool = True,
     cp_supported: bool = True,
 ) -> list[Topology]:
-    """Returns the correctness topology list for a model family."""
-    return _filter_context_parallel_support(
-        list(TOPOLOGIES if is_moe else DENSE_TOPOLOGIES),
-        is_moe=is_moe,
-        cp_supported=cp_supported,
-    )
+    """Returns TP1 plus one composed correctness topology for a model family."""
+    if is_moe:
+        composition = (
+            CP_MOE_COMPOSITION_TOPOLOGY
+            if cp_supported
+            else NO_CP_MOE_COMPOSITION_TOPOLOGY
+        )
+    else:
+        composition = DENSE_COMPOSITION_TOPOLOGY
+    return [oracle_topology(is_moe=is_moe), composition]
 
 
 def stable_case_id(case_config: OracleCaseConfig) -> str:
     """Builds a deterministic case id from case config contents."""
     payload = case_config.model_dump(mode="json")
+    if case_config.model_support_key is not None:
+        from art.megatron.model_support.registry import get_model_support_spec_by_key
+
+        payload["runtime_target_modules"] = list(
+            get_model_support_spec_by_key(
+                case_config.model_support_key
+            ).default_target_modules
+        )
+    else:
+        from art.megatron.model_support import default_target_modules_for_model
+
+        payload["runtime_target_modules"] = default_target_modules_for_model(
+            case_config.base_model,
+            allow_unvalidated_arch=case_config.allow_unvalidated_arch,
+        )
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     digest = hashlib.sha256(encoded.encode("utf-8")).hexdigest()[:16]
     model_tag = (
@@ -819,6 +852,75 @@ def _read_json(path: Path) -> dict[str, Any]:
     """Loads a JSON object from disk."""
     with path.open("r", encoding="utf-8") as handle:
         return json.load(handle)
+
+
+def _comparison_dir(path: str | Path) -> Path:
+    path = Path(path)
+    root = Path(os.environ.get(SHARED_MEMORY_ROOT_ENV, "/dev/shm"))
+    if path.parent.resolve() != root.resolve() or not path.name.startswith(
+        "art_oracle_"
+    ):
+        raise RuntimeError(f"Invalid oracle comparison directory: {path}")
+    return path
+
+
+def _new_comparison_dir() -> Path:
+    root = Path(os.environ.get(SHARED_MEMORY_ROOT_ENV, "/dev/shm"))
+    if not root.is_dir():
+        raise RuntimeError(f"Oracle shared-memory root is unavailable: {root}")
+    return root / f"art_oracle_{os.getpid()}_{secrets.token_hex(8)}"
+
+
+def _remove_comparison_dir(path: str | Path) -> None:
+    path = _comparison_dir(path)
+    if path.exists():
+        shutil.rmtree(path)
+
+
+def _write_comparison_sink(
+    path: Path,
+    maps: dict[str, dict[str, torch.Tensor]],
+) -> None:
+    """Writes exactly compared tensors into one bounded shared-memory file."""
+    from safetensors.torch import save_file  # ty: ignore[unresolved-import]
+
+    _comparison_dir(path.parent).mkdir(exist_ok=True)
+    tensors = {
+        f"{phase}/{name}": tensor.detach().cpu().contiguous()
+        for phase, tensor_map in maps.items()
+        for name, tensor in tensor_map.items()
+    }
+    raw_bytes = sum(
+        tensor.numel() * tensor.element_size() for tensor in tensors.values()
+    )
+    used_bytes = sum(item.stat().st_size for item in path.parent.iterdir())
+    if not tensors or used_bytes + raw_bytes > MAX_COMPARISON_BYTES:
+        raise RuntimeError(
+            "Oracle comparison sink exceeds its bound: "
+            f"used={used_bytes} raw={raw_bytes} limit={MAX_COMPARISON_BYTES}"
+        )
+    save_file(tensors, str(path))
+    encoded_bytes = path.stat().st_size
+    if used_bytes + encoded_bytes > MAX_COMPARISON_BYTES:
+        path.unlink()
+        raise RuntimeError(
+            "Encoded oracle comparison sink exceeds its bound: "
+            f"used={used_bytes} encoded={encoded_bytes} limit={MAX_COMPARISON_BYTES}"
+        )
+
+
+def _load_comparison_sink(path: Path) -> dict[str, dict[str, torch.Tensor]]:
+    from safetensors.torch import load_file  # ty: ignore[unresolved-import]
+
+    _comparison_dir(path.parent)
+    tensors = load_file(str(path))
+    maps: dict[str, dict[str, torch.Tensor]] = {
+        phase: {} for phase in COMPARISON_PHASES
+    }
+    for key, tensor in tensors.items():
+        phase, name = key.split("/", 1)
+        maps[phase][name] = tensor
+    return maps
 
 
 def _current_git_state() -> GitRepoState:
@@ -892,20 +994,67 @@ def ensure_case_artifacts(case_config: OracleCaseConfig) -> CaseArtifacts:
     )
 
 
+def _manifest_has_live_comparisons(path: Path) -> bool:
+    try:
+        manifest = _load_manifest(path)
+        directory = _comparison_dir(
+            _require_not_none(manifest.comparison_dir, "comparison_dir")
+        )
+        return bool(manifest.steps) and all(
+            (directory / f"step_{step.step_index:03d}.safetensors").is_file()
+            for step in manifest.steps
+        )
+    except Exception:
+        return False
+
+
+def _release_comparisons(path: Path) -> None:
+    for name in ("manifest.json", "run_request.json"):
+        try:
+            directory = _read_json(path / name).get("comparison_dir")
+        except Exception:
+            continue
+        if directory is not None:
+            _remove_comparison_dir(directory)
+
+
 def _replace_topology_dir(path: Path) -> None:
     """Resets one topology output directory before regeneration."""
     if path.exists():
+        _release_comparisons(path)
         shutil.rmtree(path)
     path.mkdir(parents=True, exist_ok=True)
-    (path / "traces").mkdir(parents=True, exist_ok=True)
+
+
+def _replay_bundle_for_topology(
+    source: Path,
+    *,
+    topology: Topology,
+    output_dir: Path,
+) -> Path:
+    bundle = MoeRoutingReplayBundle.from_dir(source)
+    runtime_topology = ReplayParallelTopology.model_validate(
+        topology.model_dump(
+            include={"tp", "ep", "etp", "dp", "sp", "cp", "pp", "vpp"},
+            mode="python",
+        )
+    )
+    if bundle.topology == runtime_topology:
+        return source
+    bundle.model_copy(update={"topology": runtime_topology}).to_dir(output_dir)
+    return output_dir
 
 
 def _prune_topology_artifacts(path: Path) -> None:
     """Keeps small diagnostics and removes tensors that are only needed for comparison."""
-    if keep_topology_artifacts() or not path.exists():
+    if not path.exists():
+        return
+    _release_comparisons(path)
+    if keep_topology_artifacts():
         return
     for child in path.iterdir():
         if child.name in {
+            "failure_tensors.safetensors",
             "manifest.json",
             "variant_report.json",
             "run_request.json",
@@ -938,19 +1087,81 @@ def _load_manifest(topology_dir: Path) -> RunManifest:
     return RunManifest.model_validate(_read_json(manifest_path))
 
 
-def _load_output_tensor(topology_dir: Path, step: StepTrace):
-    """Loads one output trace tensor referenced by a step trace entry."""
-    import torch
+def _sample_valid_lengths(
+    packed_tensors: dict[str, torch.Tensor],
+) -> tuple[int, ...]:
+    from art.megatron.context_parallel.builder import build_prefix_tree_attention_spec
 
-    path = topology_dir / step.output_file
-    return torch.load(path, map_location="cpu")
+    return tuple(
+        int(
+            build_prefix_tree_attention_spec(
+                group_ids=packed_tensors["group_ids"][row : row + 1],
+                parent_ids=packed_tensors["parent_ids"][row : row + 1],
+            )
+            .rows[0]
+            .valid_tokens
+        )
+        for row in range(int(packed_tensors["group_ids"].shape[0]))
+    )
 
 
-def _load_safetensor_map(path: Path) -> dict[str, Any]:
-    """Loads one safetensor map from disk."""
-    from safetensors.torch import load_file  # ty: ignore[unresolved-import]
-
-    return load_file(str(path))
+def _trim_trace_padding(
+    trace: dict[str, list[dict[str, Any]]],
+    *,
+    valid_lengths: tuple[int, ...],
+    sequence_length: int,
+) -> dict[str, list[dict[str, Any]]]:
+    """Applies the existing valid-token trim before tensors enter the sink."""
+    if sequence_length <= 0:
+        return trace
+    for calls in trace.values():
+        for call in calls:
+            sample_index = call.get("micro_sample_index")
+            if not isinstance(sample_index, int):
+                continue
+            valid_length = valid_lengths[sample_index]
+            row_token_uids = call.get("row_token_uids")
+            if isinstance(row_token_uids, torch.Tensor) and row_token_uids.ndim == 1:
+                local_token_uids = torch.remainder(row_token_uids, sequence_length)
+                keep_rows = torch.nonzero(
+                    (row_token_uids >= 0) & (local_token_uids < valid_length),
+                    as_tuple=False,
+                ).reshape(-1)
+                if int(keep_rows.numel()) < int(row_token_uids.numel()):
+                    call["row_token_uids"] = row_token_uids.index_select(
+                        0, keep_rows
+                    ).contiguous()
+                    for key in (
+                        "primary_output",
+                        "router_topk_scores",
+                        "router_topk_ids",
+                    ):
+                        tensor = call.get(key)
+                        if (
+                            isinstance(tensor, torch.Tensor)
+                            and tensor.ndim > 0
+                            and int(tensor.shape[0]) == int(row_token_uids.numel())
+                        ):
+                            call[key] = tensor.index_select(0, keep_rows).contiguous()
+                    continue
+            if valid_length >= sequence_length:
+                continue
+            for key in ("primary_output", "router_topk_scores", "router_topk_ids"):
+                tensor = call.get(key)
+                if not isinstance(tensor, torch.Tensor) or tensor.ndim == 0:
+                    continue
+                leading_dim = int(tensor.shape[0])
+                if leading_dim <= valid_length:
+                    continue
+                if leading_dim % sequence_length == 0:
+                    target_rows = valid_length * (leading_dim // sequence_length)
+                elif leading_dim <= sequence_length:
+                    target_rows = valid_length
+                else:
+                    continue
+                if 0 < target_rows < leading_dim:
+                    call[key] = tensor[:target_rows].contiguous()
+    return trace
 
 
 def _align_sequence_parallel(reference, candidate):  # type: ignore[no-untyped-def]
@@ -964,14 +1175,6 @@ def _align_sequence_parallel(reference, candidate):  # type: ignore[no-untyped-d
     ):
         return candidate.reshape(reference.shape)
     return None
-
-
-def _load_forward_trace(
-    topology_dir: Path, step_index: int
-) -> dict[str, list[dict[str, Any]]]:
-    """Loads one merged forward-trace file for a given step."""
-    trace_path = topology_dir / "traces" / f"forward_trace_step_{step_index:03d}.pt"
-    return ForwardTraceCapture.load_trace(trace_path)
 
 
 def _finite_metric(value: float, *, default: float = NON_FINITE_METRIC_VALUE) -> float:
@@ -1079,6 +1282,7 @@ class VariantRunner:
         oracle_offload_between_jobs: bool = True,
         oracle_streaming_weight_offload: StreamingWeightOffloadConfig | None = None,
         use_fp32_lora_reference: bool = True,
+        paired_objective: OracleObjective | None = None,
         console: Console | None = None,
     ) -> None:
         self.objective = objective
@@ -1102,6 +1306,7 @@ class VariantRunner:
             oracle_streaming_weight_offload or StreamingWeightOffloadConfig()
         )
         self.use_fp32_lora_reference = use_fp32_lora_reference
+        self.paired_objective = paired_objective
         self.shared_init_path = Path(self.case_artifacts.shared_init_adapter_path)
         self.oracle_flex_backend = _resolve_test_flex_backend(
             case_config, oracle_flex_backend
@@ -1112,153 +1317,15 @@ class VariantRunner:
         self.console = console or Console(width=140)
         self._oracle_initialized = False
         self._oracle_regenerated = False
-        self._sample_valid_lengths_cache: tuple[int, ...] | None = None
-
-    def _sample_valid_lengths(self) -> tuple[int, ...]:
-        if self._sample_valid_lengths_cache is not None:
-            return self._sample_valid_lengths_cache
-        from art.megatron.context_parallel.builder import (
-            build_prefix_tree_attention_spec,
-        )
-        from art.preprocessing.pack import packed_tensors_from_dir
-
-        packed_tensors = packed_tensors_from_dir(
-            **self.case_artifacts.packed_tensors.model_dump(exclude_none=True)
-        )
-        group_ids = packed_tensors["group_ids"]
-        parent_ids = packed_tensors["parent_ids"]
-        self._sample_valid_lengths_cache = tuple(
-            int(
-                build_prefix_tree_attention_spec(
-                    group_ids=group_ids[row_index : row_index + 1],
-                    parent_ids=parent_ids[row_index : row_index + 1],
-                )
-                .rows[0]
-                .valid_tokens
-            )
-            for row_index in range(int(group_ids.shape[0]))
-        )
-        return self._sample_valid_lengths_cache
-
-    def _step_micro_sample_indices(self, step: StepTrace) -> list[int | None]:
-        base_sample_index = (
-            step.step_index * self.case_config.grad_accumulation_sequences
-        )
-        expected = [
-            sample_index
-            if sample_index < self.case_artifacts.packed_tensors.num_sequences
-            else None
-            for sample_index in range(
-                base_sample_index,
-                base_sample_index + self.case_config.grad_accumulation_sequences,
-            )
-        ]
-        if step.micro_sample_indices and len(step.micro_sample_indices) == len(
-            expected
-        ):
-            return list(step.micro_sample_indices)
-        return expected
-
-    def _load_output_tensor_map(
-        self,
-        topology_dir: Path,
-        step: StepTrace,
-    ) -> dict[str, torch.Tensor]:
-        tensor = _load_output_tensor(topology_dir, step)
-        if isinstance(tensor, list):
-            outputs = tensor
-        elif isinstance(tensor, torch.Tensor) and tensor.ndim >= 1:
-            outputs = [tensor[index] for index in range(int(tensor.shape[0]))]
-        else:
-            return {"logprobs": tensor}
-
-        sample_indices = self._step_micro_sample_indices(step)
-        valid_lengths = self._sample_valid_lengths()
-        output_map: dict[str, torch.Tensor] = {}
-        for output_index, output in enumerate(outputs):
-            key = f"logprobs.micro_{output_index:03d}"
-            if not isinstance(output, torch.Tensor):
-                output_map[key] = output
-                continue
-            if output_index < len(sample_indices):
-                sample_index = sample_indices[output_index]
-                if isinstance(sample_index, int):
-                    valid_length = int(valid_lengths[sample_index])
-                    target_length = max(valid_length - 1, 0)
-                    if output.ndim > 0 and int(output.shape[-1]) > target_length:
-                        output = output[..., :target_length].contiguous()
-            output_map[key] = output
-        return output_map
+        self._failure_samples: dict[
+            tuple[int, str, str], tuple[torch.Tensor, torch.Tensor]
+        ] = {}
 
     @staticmethod
     def _load_loss_tensor_map(step: StepTrace) -> dict[str, torch.Tensor]:
         return {"loss": torch.tensor([step.loss], dtype=torch.float32)}
 
-    def _trim_trace_padding(
-        self,
-        trace: dict[str, list[dict[str, Any]]],
-    ) -> dict[str, list[dict[str, Any]]]:
-        valid_lengths = self._sample_valid_lengths()
-        sequence_length = int(self.case_config.packed_tensors.sequence_length)
-        if sequence_length <= 0:
-            return trace
-
-        for calls in trace.values():
-            for call in calls:
-                sample_index = call.get("micro_sample_index")
-                if not isinstance(sample_index, int):
-                    continue
-                valid_length = int(valid_lengths[sample_index])
-                row_token_uids = call.get("row_token_uids")
-                if (
-                    isinstance(row_token_uids, torch.Tensor)
-                    and row_token_uids.ndim == 1
-                ):
-                    local_token_uids = torch.remainder(row_token_uids, sequence_length)
-                    keep_rows = torch.nonzero(
-                        (row_token_uids >= 0) & (local_token_uids < valid_length),
-                        as_tuple=False,
-                    ).reshape(-1)
-                    if int(keep_rows.numel()) < int(row_token_uids.numel()):
-                        call["row_token_uids"] = row_token_uids.index_select(
-                            0, keep_rows
-                        ).contiguous()
-                        for key in (
-                            "primary_output",
-                            "router_topk_scores",
-                            "router_topk_ids",
-                        ):
-                            tensor = call.get(key)
-                            if (
-                                isinstance(tensor, torch.Tensor)
-                                and tensor.ndim > 0
-                                and int(tensor.shape[0]) == int(row_token_uids.numel())
-                            ):
-                                call[key] = tensor.index_select(
-                                    0, keep_rows
-                                ).contiguous()
-                        continue
-                if valid_length >= sequence_length:
-                    continue
-                for key in ("primary_output", "router_topk_scores", "router_topk_ids"):
-                    tensor = call.get(key)
-                    if not isinstance(tensor, torch.Tensor) or tensor.ndim == 0:
-                        continue
-                    leading_dim = int(tensor.shape[0])
-                    if leading_dim <= valid_length:
-                        continue
-                    if leading_dim % sequence_length == 0:
-                        row_multiplier = leading_dim // sequence_length
-                        target_rows = valid_length * row_multiplier
-                    elif leading_dim <= sequence_length:
-                        target_rows = valid_length
-                    else:
-                        continue
-                    if 0 < target_rows < leading_dim:
-                        call[key] = tensor[:target_rows].contiguous()
-        return trace
-
-    def _run_topology(
+    def _prepare_topology(
         self,
         *,
         topology: Topology,
@@ -1266,21 +1333,29 @@ class VariantRunner:
         mutation: SensitivityMutation | None,
         replay_bundle_dir: Path | None,
         capture_bundle_dir: Path | None,
+        prepare_moe_routing_replay: bool = False,
         regenerate: bool,
         flex_backend: FlexBackend | None = None,
         offload_between_jobs: bool = True,
         streaming_weight_offload: StreamingWeightOffloadConfig | None = None,
-    ) -> Path:
-        """Executes one topology worker run and returns its output directory."""
+    ) -> tuple[Path, WorkerRunRequest | None]:
+        """Prepares one topology output and returns any worker request it needs."""
         topology_dir = self.case_dir / output_slug
         manifest_path = topology_dir / "manifest.json"
         if (
             manifest_path.exists()
             and not regenerate
             and _manifest_matches_current_commit(manifest_path)
+            and _manifest_has_live_comparisons(topology_dir)
         ):
-            return topology_dir
+            return topology_dir, None
         _replace_topology_dir(topology_dir)
+        if replay_bundle_dir is not None and replay_bundle_dir.exists():
+            replay_bundle_dir = _replay_bundle_for_topology(
+                replay_bundle_dir,
+                topology=topology,
+                output_dir=topology_dir / "moe_routing_replay",
+            )
         run_case_config = self.case_config
         request = WorkerRunRequest(
             git=self.git,
@@ -1291,6 +1366,8 @@ class VariantRunner:
             topology_dir=str(topology_dir),
             packed_tensors=self.case_artifacts.packed_tensors,
             shared_init_adapter_path=str(self.shared_init_path),
+            comparison_dir=str(_new_comparison_dir()),
+            prepare_moe_routing_replay=prepare_moe_routing_replay,
             mutation=mutation,
             moe_routing_replay_path=(
                 None if replay_bundle_dir is None else str(replay_bundle_dir)
@@ -1306,38 +1383,196 @@ class VariantRunner:
             ),
             use_fp32_lora_reference=self.use_fp32_lora_reference,
         )
-        from .oracle_worker import run_worker_subprocess
+        return topology_dir, request
 
-        run_worker_subprocess(request, topology_dir, repo_root=REPO_ROOT)
+    def _paired_topology_dir(self, topology_dir: Path) -> Path:
+        prefix = f"{self.objective}__"
+        if self.paired_objective is None or not topology_dir.name.startswith(prefix):
+            raise ValueError(f"Cannot pair oracle output '{topology_dir.name}'")
+        return self.case_dir / (
+            f"{self.paired_objective}__{topology_dir.name.removeprefix(prefix)}"
+        )
+
+    def _routing_bundle_dir(self, objective: OracleObjective) -> Path:
+        return self.case_dir / f"{objective}__{ORACLE_MOE_ROUTING_BUNDLE_DIRNAME}"
+
+    def _objective_artifact_paths(
+        self,
+    ) -> list[tuple[OracleObjective, Path, Path, Path]]:
+        oracle_dirs = [(self.objective, self.oracle_dir)]
+        if self.paired_objective is not None:
+            oracle_dirs.append(
+                (self.paired_objective, self._paired_topology_dir(self.oracle_dir))
+            )
+        return [
+            (
+                objective,
+                oracle_dir,
+                self._routing_bundle_dir(objective),
+                self.case_dir / f"{oracle_dir.name}__oracle_capture",
+            )
+            for objective, oracle_dir in oracle_dirs
+        ]
+
+    def _paired_worker_request(
+        self,
+        request: WorkerRunRequest,
+        paired_dir: Path,
+    ) -> WorkerRunRequest:
+        objective = self.paired_objective
+        if objective is None:
+            raise ValueError("Cannot build a paired request without a paired objective")
+        updates: dict[str, Any] = {
+            "objective": objective,
+            "topology_dir": str(paired_dir),
+        }
+        if request.moe_routing_replay_path is not None:
+            source = self._routing_bundle_dir(objective)
+            updates["moe_routing_replay_path"] = str(
+                _replay_bundle_for_topology(
+                    source,
+                    topology=request.topology,
+                    output_dir=paired_dir / "moe_routing_replay",
+                )
+                if source.exists()
+                else source
+            )
+        if request.capture_moe_routing_bundle_path is not None:
+            updates["capture_moe_routing_bundle_path"] = str(
+                self._routing_bundle_dir(objective)
+            )
+        updates["comparison_dir"] = str(_new_comparison_dir())
+        return request.model_copy(update=updates)
+
+    def _run_prepared(self, prepared: list[tuple[Path, WorkerRunRequest]]) -> None:
+        requests: list[WorkerRunRequest] = []
+        topology_dirs: list[Path] = []
+        for topology_dir, request in prepared:
+            requests.append(request)
+            topology_dirs.append(topology_dir)
+            if self.paired_objective is not None:
+                paired_dir = self._paired_topology_dir(topology_dir)
+                _replace_topology_dir(paired_dir)
+                requests.append(self._paired_worker_request(request, paired_dir))
+                topology_dirs.append(paired_dir)
+        try:
+            from .oracle_worker import run_worker_subprocesses
+
+            run_worker_subprocesses(requests, topology_dirs, repo_root=REPO_ROOT)
+        except BaseException:
+            for request in requests:
+                _remove_comparison_dir(request.comparison_dir)
+            raise
+
+    def _run_topology(
+        self,
+        *,
+        topology: Topology,
+        output_slug: str,
+        mutation: SensitivityMutation | None,
+        replay_bundle_dir: Path | None,
+        capture_bundle_dir: Path | None,
+        regenerate: bool,
+        flex_backend: FlexBackend | None = None,
+        offload_between_jobs: bool = True,
+        streaming_weight_offload: StreamingWeightOffloadConfig | None = None,
+    ) -> Path:
+        """Executes one topology worker run and returns its output directory."""
+        replay_output_slug = (
+            self.oracle_slug if capture_bundle_dir is not None else None
+        )
+        topology_dir, request = self._prepare_topology(
+            topology=topology,
+            output_slug=output_slug,
+            mutation=mutation,
+            replay_bundle_dir=replay_bundle_dir,
+            capture_bundle_dir=capture_bundle_dir,
+            prepare_moe_routing_replay=replay_output_slug is not None,
+            regenerate=regenerate,
+            flex_backend=flex_backend,
+            offload_between_jobs=offload_between_jobs,
+            streaming_weight_offload=streaming_weight_offload,
+        )
+        prepared = [] if request is None else [(topology_dir, request)]
+        if replay_output_slug is not None:
+            replay_dir, replay_request = self._prepare_topology(
+                topology=topology,
+                output_slug=replay_output_slug,
+                mutation=mutation,
+                replay_bundle_dir=_require_not_none(
+                    capture_bundle_dir, "capture_bundle_dir"
+                ),
+                capture_bundle_dir=None,
+                prepare_moe_routing_replay=True,
+                regenerate=regenerate,
+                flex_backend=flex_backend,
+                offload_between_jobs=offload_between_jobs,
+                streaming_weight_offload=streaming_weight_offload,
+            )
+            if replay_request is not None:
+                prepared.append((replay_dir, replay_request))
+        if prepared:
+            self._run_prepared(prepared)
         return topology_dir
 
-    def ensure_oracle(self) -> Path:
+    def _prune_valid_moe_capture(
+        self,
+        capture_dir: Path,
+        *,
+        objective: OracleObjective | None = None,
+        bundle_dir: Path | None = None,
+    ) -> None:
+        """Prunes capture tensors only after persisted metadata reloads cleanly."""
+        objective = objective or self.objective
+        bundle_dir = bundle_dir or self.oracle_routing_bundle_dir
+        manifest = _load_manifest(capture_dir)
+        bundle = MoeRoutingReplayBundle.from_dir(bundle_dir)
+        expected_topology = ReplayParallelTopology.model_validate(
+            self.oracle_topology.model_dump(
+                include={"tp", "ep", "etp", "dp", "sp", "cp", "pp", "vpp"},
+                mode="python",
+            )
+        )
+        if (
+            manifest.git.commit != self.git.commit
+            or manifest.case_id != self.case_id
+            or manifest.objective != objective
+            or manifest.topology != self.oracle_topology.slug()
+            or manifest.num_steps != self.case_config.num_steps
+            or len(manifest.steps) != manifest.num_steps
+            or bundle.topology != expected_topology
+            or bundle.num_steps != manifest.num_steps
+        ):
+            raise RuntimeError("Persisted MoE routing capture metadata does not match")
+        _prune_topology_artifacts(capture_dir)
+
+    def ensure_oracle(self, *, require_existing: bool = False) -> Path:
         """Ensures routing capture and the canonical replay-backed oracle exist once."""
         regenerate = regenerate_requested()
         if self._oracle_initialized and (not regenerate or self._oracle_regenerated):
             return self.oracle_dir
         if regenerate and self.shared_init_path.exists():
             self.shared_init_path.unlink()
-        bundle_manifest = self.oracle_routing_bundle_dir / "manifest.json"
-        oracle_manifest = self.oracle_dir / "manifest.json"
-        capture_manifest = (
-            self.case_dir / f"{self.oracle_slug}__oracle_capture" / "manifest.json"
-        )
-        bundle_format_current = False
-        if bundle_manifest.exists():
+        objective_artifacts = self._objective_artifact_paths()
+        bundle_format_current = True
+        for _, _, bundle_dir, _ in objective_artifacts:
+            bundle_manifest = bundle_dir / "manifest.json"
             try:
-                bundle_format_current = (
-                    _read_json(bundle_manifest).get("format_version")
+                bundle_format_current &= (
+                    bundle_manifest.exists()
+                    and _read_json(bundle_manifest).get("format_version")
                     == ROUTER_KEY_FORMAT_VERSION
                 )
             except Exception:
                 bundle_format_current = False
         need_capture = (
             regenerate
-            or not bundle_manifest.exists()
             or not bundle_format_current
             or not self.shared_init_path.exists()
-            or not _manifest_matches_current_commit(capture_manifest)
+            or any(
+                not _manifest_matches_current_commit(capture_dir / "manifest.json")
+                for _, _, _, capture_dir in objective_artifacts
+            )
         )
         run_oracle_topology = partial(
             self._run_topology,
@@ -1349,17 +1584,31 @@ class VariantRunner:
             regenerate=True,
         )
         if self.case_config.is_moe and need_capture:
+            if require_existing:
+                raise RuntimeError(f"missing prepared oracle capture: {self.case_dir}")
             run_oracle_topology(
                 output_slug=f"{self.oracle_slug}__oracle_capture",
                 replay_bundle_dir=None,
                 capture_bundle_dir=self.oracle_routing_bundle_dir,
             )
-        if (
+            for objective, _, bundle_dir, capture_dir in objective_artifacts:
+                self._prune_valid_moe_capture(
+                    capture_dir,
+                    objective=objective,
+                    bundle_dir=bundle_dir,
+                )
+        need_oracle = not (self.case_config.is_moe and need_capture) and (
             regenerate
-            or not oracle_manifest.exists()
             or not self.shared_init_path.exists()
-            or not _manifest_matches_current_commit(oracle_manifest)
-        ):
+            or any(
+                not _manifest_matches_current_commit(oracle_dir / "manifest.json")
+                or not _manifest_has_live_comparisons(oracle_dir)
+                for _, oracle_dir, _, _ in objective_artifacts
+            )
+        )
+        if require_existing and need_oracle:
+            raise RuntimeError(f"missing prepared oracle reference: {self.case_dir}")
+        if need_oracle:
             run_oracle_topology(
                 output_slug=self.oracle_slug,
                 replay_bundle_dir=(
@@ -1495,16 +1744,16 @@ class VariantRunner:
                 reference_aligned, candidate_aligned
             )
             if aligned_candidate is None:
-                rows.append(
-                    self._build_metric_row(
-                        variant=variant,
-                        step_index=step_index,
-                        phase=phase,
-                        param=name,
-                        summary=self._inf_summary(),
-                        structural_failure="shape mismatch",
-                    )
+                row = self._build_metric_row(
+                    variant=variant,
+                    step_index=step_index,
+                    phase=phase,
+                    param=name,
+                    summary=self._inf_summary(),
+                    structural_failure="shape mismatch",
                 )
+                self._remember_failure(row, reference_aligned, candidate_aligned)
+                rows.append(row)
                 continue
             summary: dict[str, float]
             if router_ids:
@@ -1520,16 +1769,32 @@ class VariantRunner:
                 accumulator = DiffAccumulator()
                 accumulator.update(reference_aligned, aligned_candidate)
                 summary = accumulator.as_summary()
-            rows.append(
-                self._build_metric_row(
-                    variant=variant,
-                    step_index=step_index,
-                    phase=phase,
-                    param=name,
-                    summary=summary,
-                )
+            row = self._build_metric_row(
+                variant=variant,
+                step_index=step_index,
+                phase=phase,
+                param=name,
+                summary=summary,
             )
+            if not row.pass_signal:
+                self._remember_failure(row, reference_aligned, aligned_candidate)
+            rows.append(row)
         return rows
+
+    def _remember_failure(
+        self,
+        row: MetricRow,
+        reference: torch.Tensor,
+        candidate: torch.Tensor,
+    ) -> None:
+        key = (row.step_index, row.phase, row.param)
+        self._failure_samples.setdefault(
+            key,
+            (
+                reference.detach().cpu().reshape(-1)[:MAX_FAILURE_VALUES].clone(),
+                candidate.detach().cpu().reshape(-1)[:MAX_FAILURE_VALUES].clone(),
+            ),
+        )
 
     def _check_matching_keys(
         self,
@@ -1618,16 +1883,6 @@ class VariantRunner:
         return rows
 
     @staticmethod
-    def _build_step_summaries(rows: list[MetricRow]) -> dict[int, dict[str, Any]]:
-        """Builds step-indexed payloads directly from row model dumps."""
-        step_summaries: dict[int, dict[str, Any]] = {}
-        for row in rows:
-            step_entry = step_summaries.setdefault(row.step_index, {})
-            phase_entry = cast(dict[str, Any], step_entry.setdefault(row.phase, {}))
-            phase_entry[row.param] = row.model_dump(mode="json")
-        return step_summaries
-
-    @staticmethod
     def _step_phase_rows(
         rows: list[MetricRow], step_index: int, phase: str
     ) -> list[MetricRow]:
@@ -1677,12 +1932,19 @@ class VariantRunner:
 
     def compare_variant(self, variant: VariantSpec) -> VariantReport:
         """Compares one candidate variant against its reference topology."""
+        self._failure_samples = {}
         reference_slug = variant.resolved_reference_slug()
         topology_slug = variant.resolved_output_slug()
         reference_dir = self.case_dir / reference_slug
         topology_dir = self.case_dir / topology_slug
         reference_manifest = _load_manifest(reference_dir)
         topology_manifest = _load_manifest(topology_dir)
+        reference_comparisons = _comparison_dir(
+            _require_not_none(reference_manifest.comparison_dir, "comparison_dir")
+        )
+        topology_comparisons = _comparison_dir(
+            _require_not_none(topology_manifest.comparison_dir, "comparison_dir")
+        )
         rows: list[MetricRow] = []
         if reference_manifest.objective != variant.objective:
             rows.append(
@@ -1727,23 +1989,21 @@ class VariantRunner:
                 )
             )
 
-        import torch
-
         for reference_step, topology_step in zip(
             reference_manifest.steps, topology_manifest.steps
         ):
             step_index = reference_step.step_index
-            reference_trace = self._trim_trace_padding(
-                _load_forward_trace(reference_dir, step_index)
+            reference_maps = _load_comparison_sink(
+                reference_comparisons / f"step_{step_index:03d}.safetensors"
             )
-            topology_trace = self._trim_trace_padding(
-                _load_forward_trace(topology_dir, step_index)
+            topology_maps = _load_comparison_sink(
+                topology_comparisons / f"step_{step_index:03d}.safetensors"
             )
             map_phase_inputs = [
                 (
                     "outputs",
-                    self._load_output_tensor_map(reference_dir, reference_step),
-                    self._load_output_tensor_map(topology_dir, topology_step),
+                    reference_maps["outputs"],
+                    topology_maps["outputs"],
                     False,
                 ),
                 (
@@ -1754,35 +2014,29 @@ class VariantRunner:
                 ),
                 (
                     "grads",
-                    _load_safetensor_map(reference_dir / reference_step.grads_file),
-                    _load_safetensor_map(topology_dir / topology_step.grads_file),
+                    reference_maps["grads"],
+                    topology_maps["grads"],
                     False,
                 ),
                 (
                     "deltas",
-                    _load_safetensor_map(reference_dir / reference_step.deltas_file),
-                    _load_safetensor_map(topology_dir / topology_step.deltas_file),
+                    reference_maps["deltas"],
+                    topology_maps["deltas"],
                     False,
                 ),
-                *[
-                    (
-                        phase,
-                        ForwardTraceCapture.flatten_trace_tensors(
-                            reference_trace,
-                            value_key=value_key,
-                        ),
-                        ForwardTraceCapture.flatten_trace_tensors(
-                            topology_trace,
-                            value_key=value_key,
-                        ),
-                        phase == "router_topk_ids",
-                    )
-                    for phase, value_key in (
-                        ("forward", "primary_output"),
-                        ("router_scores", "router_topk_scores"),
-                        ("router_topk_ids", "router_topk_ids"),
-                    )
-                ],
+                ("forward", reference_maps["forward"], topology_maps["forward"], False),
+                (
+                    "router_scores",
+                    reference_maps["router_scores"],
+                    topology_maps["router_scores"],
+                    False,
+                ),
+                (
+                    "router_topk_ids",
+                    reference_maps["router_topk_ids"],
+                    topology_maps["router_topk_ids"],
+                    True,
+                ),
             ]
             for phase, reference_map, candidate_map, router_ids in map_phase_inputs:
                 rows.extend(
@@ -1809,7 +2063,6 @@ class VariantRunner:
             signal=signal,
             pass_count=pass_count,
             fail_count=fail_count,
-            step_summaries=self._build_step_summaries(rows),
             metrics=rows,
         )
 
@@ -1838,19 +2091,40 @@ class VariantRunner:
         )
 
     def _write_variant_report(self, topology_dir: Path, report: VariantReport) -> None:
-        """Persists full variant report JSON for debugging and regression inspection."""
+        """Persists compact metrics and bounded tensors only for failed rows."""
+        from safetensors.torch import save_file  # ty: ignore[unresolved-import]
+
+        failure_path = topology_dir / "failure_tensors.safetensors"
+        failure_path.unlink(missing_ok=True)
+        failures = [
+            (index, sample)
+            for index, row in enumerate(report.metrics)
+            if not row.pass_signal
+            and (
+                sample := self._failure_samples.get(
+                    (row.step_index, row.phase, row.param)
+                )
+            )
+            is not None
+        ][:MAX_FAILURE_ROWS]
+        failure_tensors = {
+            f"metric_{index:04d}.{side}": sample[offset]
+            for index, sample in failures
+            for offset, side in enumerate(("reference", "candidate"))
+        }
+        if failure_tensors:
+            save_file(failure_tensors, str(failure_path))
         _write_json(
             topology_dir / "variant_report.json", report.model_dump(mode="json")
         )
 
     def _prune_reference_artifacts(self) -> None:
         """Drops oracle-only tensors after all comparisons that need them are complete."""
-        _prune_topology_artifacts(self.oracle_dir)
-        if self.case_config.is_moe:
-            _prune_topology_artifacts(self.oracle_routing_bundle_dir)
-            _prune_topology_artifacts(
-                self.case_dir / f"{self.oracle_slug}__oracle_capture"
-            )
+        for _, oracle_dir, bundle_dir, capture_dir in self._objective_artifact_paths():
+            _prune_topology_artifacts(oracle_dir)
+            if self.case_config.is_moe:
+                _prune_topology_artifacts(bundle_dir)
+                _prune_topology_artifacts(capture_dir)
 
     def print_report(self, report: VariantReport) -> None:
         """Prints a row-level table excluding expert-specific rows."""
@@ -1906,7 +2180,6 @@ class VariantRunner:
         topology_dir = self.ensure_variant_artifacts(variant)
         report = self.compare_variant(variant)
         self._write_variant_report(topology_dir, report)
-        _prune_topology_artifacts(topology_dir)
         self.print_report(report)
         return report
 
@@ -1916,32 +2189,38 @@ class VariantRunner:
         *,
         prune_reference_artifacts: bool = True,
         prune_case_artifacts: bool = True,
+        prune_paired_artifacts: bool = True,
     ) -> list[VariantReport]:
         """Runs variants in order and stops at the first unexpected signal.
 
-        Reference and case artifacts are normally pruned when the suite exits.
         Callers that immediately run another comparison suite against the same
-        reference can defer that pruning so the second suite does not have to
-        regenerate or fail on missing forward traces.
+        reference can defer shared cleanup until all consumers finish.
         """
         reports: list[VariantReport] = []
         try:
             for variant in variants:
-                report = self.run_variant(variant)
-                reports.append(report)
-                self.assert_expected_signal(
-                    report,
-                    "Megatron correctness suite mismatch",
-                    report_path=self.case_dir
-                    / variant.resolved_output_slug()
-                    / "variant_report.json",
-                )
+                topology_dir = self.case_dir / variant.resolved_output_slug()
+                try:
+                    report = self.run_variant(variant)
+                    self.assert_expected_signal(
+                        report,
+                        "Megatron correctness suite mismatch",
+                        report_path=topology_dir / "variant_report.json",
+                    )
+                    reports.append(report)
+                finally:
+                    if topology_dir != self.oracle_dir:
+                        _prune_topology_artifacts(topology_dir)
+                    if self.paired_objective is not None and prune_paired_artifacts:
+                        _prune_topology_artifacts(
+                            self._paired_topology_dir(topology_dir)
+                        )
+            return reports
         finally:
             if prune_reference_artifacts:
                 self._prune_reference_artifacts()
             if prune_case_artifacts:
                 _prune_case_artifacts(self.case_dir)
-        return reports
 
 
 def _default_phase_pass_fns() -> dict[str, PhasePassFn]:
@@ -2011,6 +2290,115 @@ def _suite_variants(
     return variants
 
 
+def _prune_completed_runners(
+    runners: list[VariantRunner],
+    *,
+    prune_reference_artifacts: bool = True,
+    prune_case_artifacts: bool = True,
+) -> None:
+    """Prunes shared artifacts after every owning suite completes successfully."""
+    if prune_reference_artifacts:
+        for runner in runners:
+            runner._prune_reference_artifacts()
+    if prune_case_artifacts:
+        for case_dir in dict.fromkeys(runner.case_dir for runner in runners):
+            _prune_case_artifacts(case_dir)
+
+
+def prepare_suite_references(
+    *,
+    case_config: OracleCaseConfig,
+    oracle_flex_backend: FlexBackend | None = None,
+    use_fp32_lora_reference: bool = True,
+) -> None:
+    """Materializes the canonical references without running a candidate topology."""
+    objectives = selected_oracle_objectives()
+    paired = objectives == list(SUPPORTED_ORACLE_OBJECTIVES)
+    paired_objective = objectives[1] if paired else None
+    for objective in objectives[:1] if paired else objectives:
+        VariantRunner(
+            objective=objective,
+            case_config=case_config,
+            oracle_flex_backend=oracle_flex_backend,
+            use_fp32_lora_reference=use_fp32_lora_reference,
+            paired_objective=paired_objective,
+        ).ensure_oracle()
+
+
+def _run_paired_objective_suite(
+    *,
+    objectives: list[OracleObjective],
+    case_config: OracleCaseConfig,
+    max_world_size: int | None,
+    oracle_flex_backend: FlexBackend | None,
+    variant_flex_backend: FlexBackend | None,
+    cp_supported: bool,
+    phase_pass_fns: dict[str, PhasePassFn] | None,
+    use_fp32_lora_reference: bool,
+    require_existing_references: bool = False,
+    prune_reference_artifacts: bool,
+    prune_case_artifacts: bool,
+) -> list[VariantReport]:
+    """Runs RL/SFT pairs without rebuilding one topology twice."""
+    rl_objective, sft_objective = objectives
+
+    def runner(
+        objective: OracleObjective,
+        paired_objective: OracleObjective | None = None,
+    ) -> VariantRunner:
+        return VariantRunner(
+            objective=objective,
+            case_config=case_config,
+            oracle_flex_backend=oracle_flex_backend,
+            variant_flex_backend=variant_flex_backend,
+            use_fp32_lora_reference=use_fp32_lora_reference,
+            paired_objective=paired_objective,
+        )
+
+    def variants(objective: OracleObjective) -> list[VariantSpec]:
+        return _suite_variants(
+            objective,
+            is_moe=case_config.is_moe,
+            cp_supported=cp_supported,
+            max_world_size=max_world_size,
+            variant_flex_backend=variant_flex_backend,
+            phase_pass_fns=phase_pass_fns,
+        )
+
+    rl_runner = runner(rl_objective, sft_objective)
+    try:
+        if require_existing_references:
+            rl_runner.ensure_oracle(require_existing=True)
+        reports = rl_runner.run_suite(
+            variants(rl_objective),
+            prune_reference_artifacts=False,
+            prune_case_artifacts=False,
+            prune_paired_artifacts=False,
+        )
+        sft_runner = runner(sft_objective)
+        sft_runner._oracle_initialized = sft_runner._oracle_regenerated = True
+        reports.extend(
+            sft_runner.run_suite(
+                [
+                    variant.model_copy(update={"force_regenerate": False})
+                    for variant in variants(sft_objective)
+                ],
+                prune_reference_artifacts=False,
+                prune_case_artifacts=False,
+            )
+        )
+        return reports
+    finally:
+        _prune_completed_runners(
+            [rl_runner],
+            prune_reference_artifacts=prune_reference_artifacts,
+            prune_case_artifacts=prune_case_artifacts,
+        )
+
+
+_run_paired_dense_suite = _run_paired_objective_suite
+
+
 def run_suite(
     *,
     case_config: OracleCaseConfig,
@@ -2020,34 +2408,61 @@ def run_suite(
     cp_supported: bool = True,
     phase_pass_fns: dict[str, PhasePassFn] | None = None,
     use_fp32_lora_reference: bool = True,
+    require_existing_references: bool = False,
     prune_reference_artifacts: bool = True,
     prune_case_artifacts: bool = True,
 ) -> list[VariantReport]:
     """Runs non-oracle topologies against the canonical replay-backed oracle."""
-    reports: list[VariantReport] = []
-    for objective in selected_oracle_objectives():
-        runner = VariantRunner(
-            objective=objective,
+    objectives = selected_oracle_objectives()
+    if objectives == list(SUPPORTED_ORACLE_OBJECTIVES):
+        return _run_paired_objective_suite(
+            objectives=objectives,
             case_config=case_config,
+            max_world_size=max_world_size,
             oracle_flex_backend=oracle_flex_backend,
             variant_flex_backend=variant_flex_backend,
+            cp_supported=cp_supported,
+            phase_pass_fns=phase_pass_fns,
             use_fp32_lora_reference=use_fp32_lora_reference,
+            require_existing_references=require_existing_references,
+            prune_reference_artifacts=prune_reference_artifacts,
+            prune_case_artifacts=prune_case_artifacts,
         )
-        reports.extend(
-            runner.run_suite(
-                _suite_variants(
-                    objective,
-                    is_moe=case_config.is_moe,
-                    cp_supported=cp_supported,
-                    max_world_size=max_world_size,
-                    variant_flex_backend=variant_flex_backend,
-                    phase_pass_fns=phase_pass_fns,
-                ),
-                prune_reference_artifacts=prune_reference_artifacts,
-                prune_case_artifacts=prune_case_artifacts,
+    reports: list[VariantReport] = []
+    runners: list[VariantRunner] = []
+    try:
+        for objective in objectives:
+            runner = VariantRunner(
+                objective=objective,
+                case_config=case_config,
+                oracle_flex_backend=oracle_flex_backend,
+                variant_flex_backend=variant_flex_backend,
+                use_fp32_lora_reference=use_fp32_lora_reference,
             )
+            runners.append(runner)
+            if require_existing_references:
+                runner.ensure_oracle(require_existing=True)
+            reports.extend(
+                runner.run_suite(
+                    _suite_variants(
+                        objective,
+                        is_moe=case_config.is_moe,
+                        cp_supported=cp_supported,
+                        max_world_size=max_world_size,
+                        variant_flex_backend=variant_flex_backend,
+                        phase_pass_fns=phase_pass_fns,
+                    ),
+                    prune_reference_artifacts=False,
+                    prune_case_artifacts=False,
+                )
+            )
+        return reports
+    finally:
+        _prune_completed_runners(
+            runners,
+            prune_reference_artifacts=prune_reference_artifacts,
+            prune_case_artifacts=prune_case_artifacts,
         )
-    return reports
 
 
 def run_sensitivity_suite(
@@ -2061,6 +2476,7 @@ def run_sensitivity_suite(
     """Runs a list of sensitivity mutations and expects each to fail."""
     phase_pass = _default_phase_pass_fns()
     reports: list[VariantReport] = []
+    runners: list[VariantRunner] = []
     ran_any_variants = False
     for objective in selected_oracle_objectives():
         objective_mutations = selected_sensitivity_mutations_for_objective(
@@ -2154,8 +2570,16 @@ def run_sensitivity_suite(
             if not variants:
                 continue
             ran_any_variants = True
-            reports.extend(runner.run_suite(variants))
+            runners.append(runner)
+            reports.extend(
+                runner.run_suite(
+                    variants,
+                    prune_reference_artifacts=False,
+                    prune_case_artifacts=False,
+                )
+            )
     if ran_any_variants:
+        _prune_completed_runners(runners)
         return reports
     requested = ", ".join(mutations)
     supported = ", ".join(

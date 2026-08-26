@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
 from contextlib import contextmanager
 import os
 from pathlib import Path
@@ -20,11 +21,29 @@ from art.megatron.lora import LoRA, LoRASlotRef, use_lora_slot  # noqa: E402
 from art.trainer_rank import (  # noqa: E402
     AdamParams,
     TrainerRank,
+    TrainerRankSlotStateError,
+)
+from art.trainer_rank._checkpoint import (  # noqa: E402
+    LocalOptimizerState,
+    OptimizerConfig,
+    _commit_slot,
+)
+from art.trainer_rank._impl import (  # noqa: E402
+    _CheckpointSlot,
     _distributed_grad_norm,
     _vocab_parallel_log_z,
     _vocab_parallel_target_logprobs,
     _vocab_parallel_topk_from_local,
 )
+
+
+class _CudaValueHead(torch.nn.Module):
+    def __init__(self, hidden_size: int) -> None:
+        super().__init__()
+        self.projection = torch.nn.Linear(hidden_size, 1)
+
+    def score(self, hidden: torch.Tensor) -> dict[str, torch.Tensor]:
+        return {"value": self.projection(hidden)}
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required.")
@@ -72,7 +91,7 @@ def test_dynamic_lora_slots_capture_recompute_context_and_step_independently() -
             key: value.cpu().double()
             for key, value in _adapter("dense", rank=3, seed=7).items()
         }
-        trainer.load_checkpoint_slot("CPU", cpu_adapter)
+        _install_checkpoint(trainer, "CPU", cpu_adapter)
         cpu_slot = lora._slot(LoRASlotRef("checkpoint", "CPU"))
         assert cpu_slot is not None
         assert cpu_slot.A_T.device == lora.A_T.device
@@ -82,7 +101,7 @@ def test_dynamic_lora_slots_capture_recompute_context_and_step_independently() -
 
         with trainer.push_checkpoint("A"):
             assert trainer._slot_stack[-1] == ref_a
-            with trainer.push_lora(None):
+            with trainer.push_checkpoint(None):
                 assert trainer._slot_stack[-1].name is None
             assert trainer._slot_stack[-1] == ref_a
         assert trainer._slot_stack == []
@@ -100,6 +119,85 @@ def test_dynamic_lora_slots_capture_recompute_context_and_step_independently() -
         _assert_reload_replaces_slot_optimizer(ref_a, lora, trainer)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required.")
+def test_trainer_rank_custom_objects_train_and_become_stale_on_cuda() -> None:
+    with _single_rank_model_parallel():
+        device = torch.device("cuda")
+        lora = LoRA("dense", 4, 5, 2, 32, torch.float32, device)
+        trainer = _trainer_for(lora, device)
+        _install_checkpoint(trainer, "A", _adapter("dense", rank=2, seed=1))
+        head = trainer.module(
+            "value_head", lambda: _CudaValueHead(4).to(device), checkpoint="A"
+        )
+        gain = trainer.parameter(
+            "gain", lambda: torch.ones((), device=device), checkpoint="A"
+        )
+        running = trainer.buffer(
+            "running", lambda: torch.tensor(0.25, device=device), checkpoint="A"
+        )
+
+        output = head.score(torch.randn(3, 4, device=device))["value"] * gain + running
+        with pytest.raises(TrainerRankSlotStateError, match="live backward graph"):
+            trainer._guard_slot_can_load(trainer._slot_ref("A"))
+        output.sum().backward()
+        before = tuple(param.detach().clone() for param in head.parameters()) + (
+            gain.detach().clone(),
+        )
+        trainer.optim_step(
+            params=AdamParams(learning_rate=1e-3, weight_decay=0.0),
+            checkpoints=["A"],
+        )
+        after = tuple(head.parameters()) + (gain,)
+        assert all(
+            not torch.equal(old, new) for old, new in zip(before, after, strict=True)
+        )
+        torch.testing.assert_close(running, torch.tensor(0.25, device=device))
+
+        _install_checkpoint(trainer, "A", _adapter("dense", rank=2, seed=2))
+        for operation in (
+            lambda: head.score(torch.ones(1, 4, device=device)),
+            lambda: gain + 1,
+            lambda: running + 1,
+        ):
+            with pytest.raises(TrainerRankSlotStateError, match="stale"):
+                operation()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required.")
+def test_checkpoint_reload_does_not_alias_the_next_slot() -> None:
+    with _single_rank_model_parallel():
+        device = torch.device("cuda")
+        first = LoRA("first", 4, 5, 2, 32, torch.float32, device)
+        second = LoRA("second", 4, 5, 2, 32, torch.float32, device)
+        trainer = _trainer_for(first, device)
+        trainer.runtime.model = [torch.nn.Sequential(first, second)]
+
+        def adapter(
+            seed: int, *, include_second: bool = True
+        ) -> dict[str, torch.Tensor]:
+            return _adapter("first", rank=2, seed=seed) | (
+                _adapter("second", rank=2, seed=seed + 10) if include_second else {}
+            )
+
+        def stage(destination: str, state: dict[str, torch.Tensor]) -> None:
+            temporary = f"temporary-{destination}"
+            trainer._load_checkpoint_slot(temporary, state, alpha=32.0)
+            _commit_slot(trainer, temporary, destination)
+
+        stage("A", adapter(1))
+        stage("B", adapter(2))
+        slot_b = second._slot(trainer._slot_ref("B"))
+        assert slot_b is not None
+        expected_b = slot_b.A_T.detach().clone()
+        stage("A", adapter(3, include_second=False))
+        stage("C", adapter(4))
+
+        slot_b = second._slot(trainer._slot_ref("B"))
+        slot_c = second._slot(trainer._slot_ref("C"))
+        assert slot_b is not None and slot_c is not None and slot_b is not slot_c
+        torch.testing.assert_close(slot_b.A_T, expected_b)
+
+
 @pytest.mark.parametrize("tp_size", (2, 4))
 def test_trainer_rank_tp_head_backward_matches_unsharded_oracle(
     tp_size: int,
@@ -114,6 +212,71 @@ def test_trainer_rank_tp_head_backward_matches_unsharded_oracle(
         nprocs=tp_size,
         join=True,
     )
+
+
+@pytest.mark.parametrize(
+    ("topology", "world"),
+    (("dp", 2), ("tp", 2), ("cp", 2), ("tp_cp", 4)),
+)
+def test_trainer_rank_custom_parameter_reduction_oracle(
+    topology: str,
+    world: int,
+    tmp_path: Path,
+) -> None:
+    if not torch.cuda.is_available() or torch.cuda.device_count() < world:
+        pytest.skip(f"requires {world} CUDA devices")
+    init_file = tmp_path / f"custom_parameter_{topology}"
+    mp.spawn(
+        _custom_parameter_reduction_worker,
+        args=(world, f"file://{init_file}", topology),
+        nprocs=world,
+        join=True,
+    )
+
+
+def _custom_parameter_reduction_worker(
+    rank: int,
+    world: int,
+    init_method: str,
+    topology: str,
+) -> None:
+    torch.cuda.set_device(rank)
+    init_process_group("nccl", rank=rank, world_size=world, init_method=init_method)
+    try:
+        tp_size = 2 if topology == "tp_cp" else world if topology == "tp" else 1
+        cp_size = 2 if topology == "tp_cp" else world if topology == "cp" else 1
+        ps.initialize_model_parallel(
+            tensor_model_parallel_size=tp_size,
+            pipeline_model_parallel_size=1,
+            context_parallel_size=cp_size,
+            expert_model_parallel_size=1,
+        )
+        device = torch.device("cuda", rank)
+        ref = LoRASlotRef("checkpoint", "A")
+        lora = LoRA("dense", 1, 1, 1, 1, torch.float32, device)
+        lora.load_lora_slot(
+            ref,
+            {
+                "dense.lora_A.weight": torch.ones(1, 1, device=device),
+                "dense.lora_B.weight": torch.ones(1, 1, device=device),
+            },
+            requires_grad=True,
+        )
+        trainer = _trainer_for(lora, device)
+        parameter = trainer.parameter(
+            "gain",
+            lambda: torch.tensor(float(rank + 1), device=device),
+            checkpoint="A",
+        )
+        torch.testing.assert_close(parameter, torch.tensor(1.0, device=device))
+        (parameter * float(rank + 1)).backward()
+        (reduced,) = trainer._reduce_dynamic_grads((parameter,), scale_grads=1.0)
+        expected = {"dp": 3.0, "tp": 1.5, "cp": 3.0, "tp_cp": 5.0}[topology]
+        torch.testing.assert_close(reduced, torch.tensor(expected, device=device))
+    finally:
+        if getattr(ps, "model_parallel_is_initialized", lambda: False)():
+            ps.destroy_model_parallel()
+        destroy_process_group()
 
 
 def _tp_head_backward_worker(rank: int, world: int, init_method: str) -> None:
@@ -261,8 +424,7 @@ def _assert_distributed_optimizer_restore(device: torch.device) -> None:
     with use_lora_slot(ref):
         lora(x).sum().backward()
     trainer.optim_step(params=params, checkpoints=["A"])
-    state = trainer.checkpoint_slot_optimizer_state("A")
-    assert state is not None
+    state = _optimizer_state(trainer, "A")
     slot = lora._slot(ref)
     assert slot is not None
     adapter = {
@@ -275,7 +437,10 @@ def _assert_distributed_optimizer_restore(device: torch.device) -> None:
 
     restored_lora = LoRA("dense", 4, 5, 2, 32, torch.float32, device)
     restored = _trainer_for(restored_lora, device)
-    restored.load_checkpoint_slot("A", adapter, optimizer_state=state)
+    _install_checkpoint(restored, "A", adapter)
+    restored._checkpoint_slots["A"].optimizer = restored._restore_canonical_optimizer(
+        "A", state
+    )
     with use_lora_slot(ref):
         restored_lora(x).sum().backward()
     restored.optim_step(params=params, checkpoints=["A"])
@@ -283,76 +448,6 @@ def _assert_distributed_optimizer_restore(device: torch.device) -> None:
         lora.lora_slot_params(ref), restored_lora.lora_slot_params(ref), strict=True
     ):
         torch.testing.assert_close(actual, expected, atol=0, rtol=0)
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required.")
-def test_restored_dynamic_optimizer_canonicalizes_internal_padding() -> None:
-    with _single_rank_model_parallel():
-        for num_local_experts in (1, 2):
-            _assert_restored_dynamic_optimizer_canonicalizes_internal_padding(
-                num_local_experts
-            )
-
-
-def _assert_restored_dynamic_optimizer_canonicalizes_internal_padding(
-    num_local_experts: int,
-) -> None:
-    device = torch.device("cuda")
-    ref = LoRASlotRef("checkpoint", "A")
-    prefix = "dense" if num_local_experts == 1 else "experts.{expert}"
-    adapter = {
-        key: value
-        for expert in range(num_local_experts)
-        for key, value in _adapter(
-            prefix.format(expert=expert), rank=2, seed=17 + expert
-        ).items()
-    }
-    lora = LoRA(
-        prefix,
-        4,
-        5,
-        2,
-        32,
-        torch.float32,
-        device,
-        num_local_experts=num_local_experts,
-    )
-    lora.load_lora_slot(ref, adapter, requires_grad=True)
-    trainer = _trainer_for(lora, device)
-
-    def canonicalize(
-        state: dict[str, torch.Tensor], _model: object
-    ) -> dict[str, torch.Tensor]:
-        result = {key: value.clone() for key, value in state.items()}
-        for value in result.values():
-            value[..., -1] = 0
-        return result
-
-    trainer.runtime.model_support_handler.canonicalize_loaded_lora_state = canonicalize
-    for param in trainer._checkpoint_slot_params_by_name["A"]:
-        param.grad = torch.ones_like(param)
-    trainer.optim_step(
-        params=AdamParams(learning_rate=1e-3, weight_decay=0.1, grad_clip_norm=0.0),
-        checkpoints=["A"],
-    )
-    state = trainer.checkpoint_slot_optimizer_state("A")
-    assert state is not None
-    masks = trainer._dynamic_optimizer_padding_masks("A")
-    masters = cast(tuple[torch.Tensor, ...], state["master_params"])
-    optimizer = cast(dict[str, object], state["optimizer"])
-    optimizer_states = cast(dict[int, dict[str, object]], optimizer["state"])
-    for index, (master, mask) in enumerate(zip(masters, masks, strict=True)):
-        master.masked_fill_(mask.cpu(), 5)
-        for value in optimizer_states[index].values():
-            if isinstance(value, torch.Tensor) and value.shape == master.shape:
-                value.masked_fill_(mask.cpu(), 5)
-
-    restored = trainer._restore_dynamic_optimizer("A", state)
-    for master, mask in zip(restored.master_params, masks, strict=True):
-        assert torch.count_nonzero(master[mask]) == 0
-        for value in restored.optimizer.state[master].values():
-            if isinstance(value, torch.Tensor) and value.shape == master.shape:
-                assert torch.count_nonzero(value[mask]) == 0
 
 
 def _local_shard(full: torch.Tensor, rank: int, size: int) -> torch.Tensor:
@@ -443,13 +538,13 @@ def _assert_reload_replaces_slot_optimizer(
     trainer: TrainerRank,
 ) -> None:
     assert ref.name is not None
-    old_params = trainer._checkpoint_slot_params_by_name[ref.name]
-    assert ref.name in trainer._dynamic_optimizers
+    old_params = trainer._checkpoint_slots[ref.name].params
+    assert trainer._checkpoint_slots[ref.name].optimizer is not None
 
-    trainer.load_checkpoint_slot(ref.name, _adapter("dense", rank=3, seed=9))
+    _install_checkpoint(trainer, ref.name, _adapter("dense", rank=3, seed=9))
 
-    new_params = trainer._checkpoint_slot_params_by_name[ref.name]
-    assert ref.name not in trainer._dynamic_optimizers
+    new_params = trainer._checkpoint_slots[ref.name].params
+    assert trainer._checkpoint_slots[ref.name].optimizer is None
     assert [tuple(param.shape) for param in new_params] == [(4, 3), (3, 5)]
     assert all(old is not new for old, new in zip(old_params, new_params, strict=True))
     slot = lora._slot(ref)
@@ -457,26 +552,80 @@ def _assert_reload_replaces_slot_optimizer(
     assert slot.rank == 3
 
 
+def _install_checkpoint(
+    trainer: TrainerRank, name: str, adapter: dict[str, torch.Tensor]
+) -> int:
+    loaded = trainer._load_checkpoint_slot(name, adapter, alpha=32.0)
+    previous = trainer._checkpoint_slots.get(name)
+    trainer._checkpoint_slots[name] = _CheckpointSlot(
+        tuple(trainer._iter_slot_parameters(trainer._slot_ref(name))),
+        revision=0 if previous is None else previous.revision + 1,
+    )
+    return loaded
+
+
+def _optimizer_state(trainer: TrainerRank, name: str) -> LocalOptimizerState:
+    dynamic = trainer._checkpoint_slots[name].optimizer
+    assert dynamic is not None
+    states = [
+        cast(dict[str, torch.Tensor], dynamic.optimizer.state[master])
+        for master in dynamic.master_params
+    ]
+    group = dynamic.optimizer.param_groups[0]
+    beta1, beta2 = cast(tuple[float, float], group["betas"])
+    return LocalOptimizerState(
+        masters=tuple(
+            master.detach().cpu().clone() for master in dynamic.master_params
+        ),
+        exp_avgs=tuple(state["exp_avg"].detach().cpu().clone() for state in states),
+        exp_avg_sqs=tuple(
+            state["exp_avg_sq"].detach().cpu().clone() for state in states
+        ),
+        steps=tuple(float(state["step"].item()) for state in states),
+        config=OptimizerConfig(
+            learning_rate=float(group["lr"]),
+            beta1=beta1,
+            beta2=beta2,
+            eps=float(group["eps"]),
+            weight_decay=float(group["weight_decay"]),
+        ),
+    )
+
+
 def _trainer_for(lora: LoRA, device: torch.device) -> TrainerRank:
     trainer = TrainerRank.__new__(TrainerRank)
     trainer.runtime = SimpleNamespace(
         model=[lora],
         optimizer=None,
-        model_support_handler=SimpleNamespace(
-            canonicalize_loaded_lora_state=lambda state, _model: state,
-            zero_internal_padding_grads=lambda _model: None,
-            zero_internal_padding_params=lambda _model: None,
-        ),
+        model_support_handler=_IdentityModelSupportHandler(),
     )
     trainer.device = device
     trainer._slot_stack = []
     trainer._default_slot_ref = None
-    trainer._dynamic_optimizers = {}
-    trainer._checkpoint_slot_params_by_name = {
-        "A": tuple(lora.lora_slot_params(LoRASlotRef("checkpoint", "A"))),
-        "B": tuple(lora.lora_slot_params(LoRASlotRef("checkpoint", "B"))),
+    trainer._checkpoint_slots = {
+        name: _CheckpointSlot(
+            tuple(lora.lora_slot_params(LoRASlotRef("checkpoint", name)))
+        )
+        for name in ("A", "B")
     }
+    trainer._checkpoint_prefetches = {}
+    trainer._checkpoint_mutation_tail = None
     return trainer
+
+
+class _IdentityModelSupportHandler:
+    def zero_internal_padding_grads(
+        self, model_chunks: Sequence[torch.nn.Module]
+    ) -> None:
+        del model_chunks
+
+    def canonicalize_loaded_lora_state(
+        self,
+        state: dict[str, torch.Tensor],
+        model_chunks: Sequence[torch.nn.Module],
+    ) -> dict[str, torch.Tensor]:
+        del model_chunks
+        return state
 
 
 @contextmanager

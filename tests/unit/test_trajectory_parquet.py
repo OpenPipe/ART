@@ -35,7 +35,8 @@ from openai.types.chat.chat_completion_user_message_param import (
 )
 import pytest
 
-from art import History, Trajectory, TrajectoryGroup
+from art import Trajectory, TrajectoryGroup
+from art.trajectories import LegacyHistory
 from art.types import MessageOrChoice
 from art.utils.trajectory_logging import (
     read_trajectory_groups_parquet,
@@ -154,7 +155,19 @@ def _exchange_trajectory() -> Trajectory:
                             "parallel_tool_calls": True,
                             "tool_choice": "auto",
                             "tools": [],
-                            "raw_output_tokens": [{"token_id": 20, "logprob": -0.3}],
+                            "token_generations": [
+                                {
+                                    "prompt_token_ids": [10],
+                                    "output_tokens": [
+                                        {
+                                            "token_id": 20,
+                                            "logprob": -0.3,
+                                            "text": "done",
+                                        }
+                                    ],
+                                    "output_indices": [0],
+                                }
+                            ],
                         },
                         "start_time": "2026-01-01T00:00:04",
                         "end_time": "2026-01-01T00:00:05",
@@ -295,7 +308,7 @@ def test_legacy_serializer_round_trips_complete_legacy_trajectory() -> None:
         [
             Trajectory(
                 messages_and_choices=[choice],
-                additional_histories=[History(messages_and_choices=[choice])],
+                additional_histories=[LegacyHistory(messages_and_choices=[choice])],
                 reward=1.0,
                 initial_policy_version=3,
                 final_policy_version=4,
@@ -513,7 +526,9 @@ class TestParquetRoundTrip:
                 }
             ],
             additional_histories=[
-                History(messages_and_choices=[{"role": "user", "content": "alternate"}])
+                LegacyHistory(
+                    messages_and_choices=[{"role": "user", "content": "alternate"}]
+                )
             ],
             initial_policy_version=7,
             final_policy_version=8,

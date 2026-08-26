@@ -25,6 +25,7 @@ from art.megatron.context_parallel.types import (  # noqa: E402
     ParallelTopology,
 )
 from art.megatron.gdn.gdn_prefix_tree import GdnPlannerConfig  # noqa: E402
+from art.megatron.selective_lm_head import LmHeadTokenSelection  # noqa: E402
 from art.preprocessing.pack import PackedTensors  # noqa: E402
 
 from .cases import default_phase0_cases  # noqa: E402
@@ -171,9 +172,14 @@ def test_main_loss_matches_shifted_dispatched_loss_inputs() -> None:
     )
     ref_logprobs = torch.tensor([[-0.9, -0.7, -0.6, -0.8, -0.55, -0.5]])
     entropies = torch.tensor([[0.0, 0.2, 0.4, 0.6, 0.8, 0.0]])
+    dispatched_labels = torch.where(
+        shift_tensor(packed["assistant_mask"], False),
+        shift_tensor(packed["tokens"], -100),
+        torch.full_like(packed["tokens"], -100),
+    )
     dispatched = DispatchedPackedTensors(
         tokens=packed["tokens"],
-        labels=shift_tensor(packed["tokens"], -100),
+        labels=dispatched_labels,
         input_pos=packed["input_pos"],
         assistant_mask=shift_tensor(packed["assistant_mask"], False),
         group_ids=shift_tensor(packed["group_ids"], 0),
@@ -181,6 +187,7 @@ def test_main_loss_matches_shifted_dispatched_loss_inputs() -> None:
         advantages=shift_tensor(packed["advantages"], 0.0),
         weights=shift_tensor(packed["weights"], 0.0),
         valid_lengths=(6,),
+        lm_head_selection=LmHeadTokenSelection.from_labels(dispatched_labels),
         original_logprobs=shift_tensor(packed["original_logprobs"], 0.0),
         ref_logprobs=ref_logprobs,
     )

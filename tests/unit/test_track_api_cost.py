@@ -724,7 +724,19 @@ class TestTrackApiCostIntegration:
                     reward=1.0,
                     messages_and_choices=[
                         {"role": "user", "content": "hello"},
-                        {"role": "assistant", "content": "hi"},
+                        {
+                            "role": "assistant",
+                            "content": "hi",
+                            "policy_token_spans": [
+                                {
+                                    "start_token": 0,
+                                    "end_token": 1,
+                                    "policy_version": 1,
+                                    "lora_slot": "active",
+                                    "update_seq": 1,
+                                }
+                            ],
+                        },
                     ],
                 )
             ]

@@ -5,7 +5,6 @@ from typing_extensions import Required, TypedDict
 
 from .engine import EngineArgs
 
-RolloutWeightsMode = Literal["lora", "merged"]
 RolloutWeightUpdateMode = Literal["step_lora", "in_flight_lora"]
 VllmRuntimeMode = Literal["managed", "external"]
 
@@ -133,12 +132,7 @@ class InternalModelConfig(TypedDict, total=False):
             inference run on separate GPUs.
         inference_gpu_ids: GPU IDs for vLLM inference (e.g., [1]). When set
             with trainer_gpu_ids, enables dedicated mode.
-        rollout_weights_mode: How inference weights are applied in vLLM.
-            - "lora": load LoRA adapters into vLLM directly
-            - "merged": keep training LoRA adapters, but push merged weights
-              into vLLM for inference
         rollout_weight_update_mode: How LoRA rollout weights are registered
-            when rollout_weights_mode is "lora".
             - "step_lora": load one adapter per policy step
             - "in_flight_lora": update one derived LoRA slot in place while
               recording token-level policy spans
@@ -164,7 +158,6 @@ class InternalModelConfig(TypedDict, total=False):
     trainer_args: "TrainerArgs"
     trainer_gpu_ids: list[int]
     inference_gpu_ids: list[int]
-    rollout_weights_mode: "RolloutWeightsMode"
     rollout_weight_update_mode: "RolloutWeightUpdateMode"
     chat_template_kwargs: dict[str, object]
     chat_template: str
@@ -173,6 +166,7 @@ class InternalModelConfig(TypedDict, total=False):
     chat_template_tool_schema_format: Literal["default", "vllm_openai"]
     vllm_runtime: VllmRuntimeArgs
     allow_unvalidated_arch: bool
+    megatron_model_initialization: Literal["pretrained", "random"]
 
 
 class BackendModelConfig(InternalModelConfig, total=False):

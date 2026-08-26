@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 import hashlib
 import os
 import re
-from typing import Any, Literal, Sequence, cast
+from typing import Any, Callable, Iterator, Literal, Sequence, cast
 
 import torch
 
@@ -29,6 +30,7 @@ _ORACLE_FFN_HIDDEN_SIZE = 256
 _ORACLE_INDEX_HEADS = 1
 _ORACLE_INDEX_TOPK = 1024
 _VALIDATION_NUM_LAYERS_ENV = "ART_DSV4_VALIDATION_NUM_LAYERS"
+_ORACLE_LAYER_RE = re.compile(r"(?P<prefix>(?:^|\.)decoder\.layers\.)(?P<layer>\d+)")
 _ORACLE_EXPERT_WEIGHT_RE = re.compile(r"\.mlp\.experts\..*\.weight(?P<expert>\d+)$")
 _DSV4_ART_MOE_EXPERT_KEY_RE = re.compile(
     r"^(?P<prefix>.*\.mlp\.experts)\.(?P<expert>\d+)\."
@@ -44,6 +46,34 @@ _DSV4_SPLIT_MOE_EXPERT_KEY_RE = re.compile(
     r"\.ffn\.experts\.\d+\.w[123])\.lora_[AB]\.weight$"
 )
 _DSV4_MOE_COMPILE_WORKAROUND_FLAGS = ("te_triton_permute_with_mask_map",)
+
+
+def _dsv4_input_activator(
+    model: Any,
+) -> Callable[[torch.Tensor | None, torch.Tensor | None], None]:
+    from art.megatron.dsv4.deepseek_v4 import DeepSeekV4Attention
+    from art.megatron.dsv4.layer import Dsv4MoELayer
+
+    modules = tuple(model.modules())
+    input_setters = tuple(
+        child.set_input_ids for child in modules if isinstance(child, Dsv4MoELayer)
+    )
+    position_setters = tuple(
+        child.set_position_ids
+        for child in modules
+        if isinstance(child, DeepSeekV4Attention)
+    )
+
+    def activate(
+        input_ids: torch.Tensor | None,
+        position_ids: torch.Tensor | None,
+    ) -> None:
+        for setter in input_setters:
+            setter(input_ids)
+        for setter in position_setters:
+            setter(position_ids)
+
+    return activate
 
 
 class Dsv4Handler(DefaultMoeHandler):
@@ -69,6 +99,7 @@ class Dsv4Handler(DefaultMoeHandler):
     def configure_provider_for_runtime(self, provider: Any) -> None:
         provider.mtp_num_layers = None
         provider.moe_shared_expert_overlap = False
+        provider.art_pipeline_activation_multiplier = provider.dsv4_hc_mult
         raw_num_layers = os.environ.get(_VALIDATION_NUM_LAYERS_ENV)
         if raw_num_layers is None:
             return
@@ -216,9 +247,6 @@ class Dsv4Handler(DefaultMoeHandler):
     def install_preprocess_patch(self, model_chunks: Sequence[Any]) -> None:
         from megatron.core.models.gpt.gpt_model import GPTModel
 
-        from art.megatron.dsv4.deepseek_v4 import DeepSeekV4Attention
-        from art.megatron.dsv4.layer import Dsv4MoELayer
-
         for chunk in list(model_chunks):
             module: Any = chunk
             while hasattr(module, "module"):
@@ -229,26 +257,27 @@ class Dsv4Handler(DefaultMoeHandler):
                 else cast(GPTModel, getattr(module, "language_model"))
             )
             preprocess = gpt_module._preprocess
+            activate = _dsv4_input_activator(gpt_module.decoder)
 
             def preprocess_hook(
-                *args: Any, _preprocess=preprocess, _gpt=gpt_module, **kwargs: Any
+                *args: Any,
+                _preprocess=preprocess,
+                _activate=activate,
+                **kwargs: Any,
             ):
                 input_ids = kwargs.get("input_ids")
                 position_ids = kwargs.get("position_ids")
-                for child in _gpt.decoder.modules():
-                    if isinstance(child, Dsv4MoELayer):
-                        child.set_input_ids(
-                            input_ids if isinstance(input_ids, torch.Tensor) else None
-                        )
-                    if isinstance(child, DeepSeekV4Attention):
-                        child.set_position_ids(
-                            position_ids
-                            if isinstance(position_ids, torch.Tensor)
-                            else None
-                        )
+                _activate(
+                    input_ids if isinstance(input_ids, torch.Tensor) else None,
+                    position_ids if isinstance(position_ids, torch.Tensor) else None,
+                )
                 preproc_output = list(_preprocess(*args, **kwargs))
-                decoder_input = cast(torch.Tensor, preproc_output[0])
-                if not decoder_input.requires_grad and decoder_input.is_leaf:
+                decoder_input = cast(torch.Tensor | None, preproc_output[0])
+                if (
+                    decoder_input is not None
+                    and not decoder_input.requires_grad
+                    and decoder_input.is_leaf
+                ):
                     decoder_input.requires_grad_(True)
                 table = preproc_output[1]
                 if isinstance(position_ids, torch.Tensor) and torch.is_tensor(table):
@@ -266,6 +295,40 @@ class Dsv4Handler(DefaultMoeHandler):
                 return tuple(preproc_output)
 
             setattr(gpt_module, "_preprocess", preprocess_hook)
+
+    def build_pipeline_microbatch_activator(
+        self,
+        model_chunks: Sequence[Any],
+    ) -> Callable[[Any, int], None]:
+        activators = tuple(_dsv4_input_activator(chunk) for chunk in model_chunks)
+
+        def activate(prepared: Any, chunk_index: int) -> None:
+            input_ids = getattr(prepared, "model_tokens", None)
+            position_ids = getattr(prepared, "model_input_pos", None)
+            if input_ids is None:
+                input_ids = prepared.input_ids
+                position_ids = prepared.position_ids
+            activators[chunk_index](input_ids, position_ids)
+
+        return activate
+
+    @contextmanager
+    def preserve_pipeline_microbatch_activation(
+        self,
+        model_chunks: Sequence[Any],
+    ) -> Iterator[None]:
+        states = [
+            (module, name, getattr(module, name))
+            for chunk in model_chunks
+            for module in chunk.modules()
+            for name in ("_dsv4_input_ids", "_dsv4_position_ids")
+            if hasattr(module, name)
+        ]
+        try:
+            yield
+        finally:
+            for module, name, value in states:
+                setattr(module, name, value)
 
     def collect_layer_families(self, provider: Any) -> list[LayerFamilyInstance]:
         ratios: list[int] = list(getattr(provider, "dsv4_compress_ratios", ()) or ())
@@ -385,16 +448,6 @@ class Dsv4Handler(DefaultMoeHandler):
                     )
         return adapter_weights_by_base
 
-    def iter_merged_vllm_weight_metadata(
-        self,
-        weight_export: Any,
-    ) -> Any:
-        bridge = getattr(weight_export.bridge, "_model_bridge", None)
-        metadata_iter = getattr(bridge, "iter_merged_vllm_weight_metadata", None)
-        if metadata_iter is None:
-            return None
-        return metadata_iter(weight_export)
-
     def from_vllm_lora_tensors(
         self,
         tensors: dict[str, torch.Tensor],
@@ -478,6 +531,28 @@ class Dsv4Handler(DefaultMoeHandler):
         config._experts_implementation = "eager"
         self._apply_oracle_shape_overrides(config)
 
+    def prepare_hf_reference_model(self, model: Any) -> Any:
+        from art.megatron.dsv4.hf_oracle import prepare_hf_reference_model
+
+        return prepare_hf_reference_model(model)
+
+    def prepare_hf_reference_forward(
+        self,
+        model: Any,
+        *,
+        position_ids: torch.Tensor,
+        group_ids: torch.Tensor,
+        parent_ids: torch.Tensor,
+    ) -> None:
+        from art.megatron.dsv4.hf_oracle import set_hf_reference_prefix_tree
+
+        set_hf_reference_prefix_tree(
+            model,
+            position_ids=position_ids,
+            group_ids=group_ids,
+            parent_ids=parent_ids,
+        )
+
     def hf_reference_from_pretrained_kwargs(
         self, *, config: Any, dtype: torch.dtype
     ) -> dict[str, Any]:
@@ -505,6 +580,30 @@ class Dsv4Handler(DefaultMoeHandler):
         config: Any,
     ) -> None:
         _add_dsv4_hf_reference_source_aliases(state, config)
+
+    def hf_parity_gradient_group(self, param: str) -> str:
+        if param == "model.embed_tokens.weight":
+            return "embedding"
+        if (
+            param == "lm_head.weight"
+            or param == "model.norm.weight"
+            or param.startswith("model.hc_head.")
+        ):
+            return "final_envelope"
+        match = re.fullmatch(r"model\.layers\.(\d+)\.(.+)", param)
+        if match is None:
+            raise ValueError(f"Unmapped DSV4 HF-parity gradient: {param}")
+        layer, module = match.groups()
+        prefix = f"model.layers.{layer}"
+        if module.startswith(("attn_hc.", "self_attn.")):
+            return f"{prefix}.attention"
+        if module.startswith(("ffn_hc.", "mlp.")):
+            return f"{prefix}.ffn"
+        if module == "input_layernorm.weight":
+            return f"{prefix}.input_norm"
+        if module == "post_attention_layernorm.weight":
+            return f"{prefix}.post_attention_norm"
+        raise ValueError(f"Unmapped DSV4 HF-parity gradient: {param}")
 
     def configure_oracle_provider(self, provider: Any, *, case_config: Any) -> None:
         """Mirrors HF oracle reductions while keeping DSV4 hard kernel invariants."""
@@ -577,11 +676,12 @@ class Dsv4Handler(DefaultMoeHandler):
         ep_size = ps.get_expert_model_parallel_world_size()
         with torch.no_grad():
             for chunk in model_chunks:
+                global_layers = self._oracle_global_layer_indices(chunk)
                 for name, param in chunk.named_parameters():
                     if self._is_oracle_lora_tensor(name):
                         continue
                     init_name = self._oracle_base_tensor_name(
-                        name,
+                        self._oracle_global_layer_name(name, global_layers),
                         ep_rank=ep_rank,
                         ep_size=ep_size,
                     )
@@ -591,8 +691,36 @@ class Dsv4Handler(DefaultMoeHandler):
                         seed=seed,
                     )
                 for name, buffer in chunk.named_buffers():
-                    self._initialize_oracle_buffer(name, buffer, seed=seed)
+                    self._initialize_oracle_buffer(
+                        self._oracle_global_layer_name(name, global_layers),
+                        buffer,
+                        seed=seed,
+                    )
         return model_chunks
+
+    @staticmethod
+    def _oracle_global_layer_indices(chunk: Any) -> dict[int, int]:
+        from art.megatron.dsv4.layer import Dsv4TransformerLayer
+
+        indices: dict[int, int] = {}
+        for name, module in chunk.named_modules():
+            if not isinstance(module, Dsv4TransformerLayer):
+                continue
+            match = _ORACLE_LAYER_RE.search(name)
+            if match is None:
+                raise RuntimeError(f"Cannot locate DSV4 oracle layer in {name!r}")
+            indices[int(match.group("layer"))] = int(module.layer_number) - 1
+        return indices
+
+    @staticmethod
+    def _oracle_global_layer_name(name: str, indices: dict[int, int]) -> str:
+        match = _ORACLE_LAYER_RE.search(name)
+        if match is None:
+            return name
+        global_layer = indices[int(match.group("layer"))]
+        return (
+            f"{name[: match.start('layer')]}{global_layer}{name[match.end('layer') :]}"
+        )
 
     @staticmethod
     def _is_oracle_lora_tensor(name: str) -> bool:
@@ -1120,9 +1248,15 @@ def _dsv4_to_vllm_lora_tensors(
     canonical = _dsv4_from_vllm_lora_tensors(
         tensors,
         adapter_config=adapter_config,
+        split_experts=False,
     )
+    fused_prefixes: set[str] = set()
     grouped: dict[str, dict[int, dict[str, dict[str, torch.Tensor]]]] = {}
     for key, tensor in canonical.items():
+        fused_match = _DSV4_VLLM_MOE_KEY_RE.match(key)
+        if fused_match is not None:
+            fused_prefixes.add(fused_match.group("prefix"))
+            continue
         match = _DSV4_ART_MOE_EXPERT_KEY_RE.match(key)
         if match is not None:
             grouped.setdefault(match.group("prefix"), {}).setdefault(
@@ -1131,6 +1265,12 @@ def _dsv4_to_vllm_lora_tensors(
 
     transformed: dict[str, torch.Tensor] = {}
     used_keys: set[str] = set()
+    mixed_prefixes = fused_prefixes.intersection(grouped)
+    if mixed_prefixes:
+        raise RuntimeError(
+            f"Mixed fused and split DSV4 MoE LoRA block for {min(mixed_prefixes)}"
+        )
+
     for prefix, experts in grouped.items():
         vllm_prefix = _dsv4_to_vllm_lora_key(prefix)
         blocks = {
@@ -1182,6 +1322,7 @@ def _dsv4_from_vllm_lora_tensors(
     tensors: dict[str, torch.Tensor],
     *,
     adapter_config: dict[str, Any],
+    split_experts: bool = True,
 ) -> dict[str, torch.Tensor]:
     split_key = next(
         (key for key in tensors if _DSV4_SPLIT_MOE_EXPERT_KEY_RE.match(key)), None
@@ -1221,16 +1362,37 @@ def _dsv4_from_vllm_lora_tensors(
             raise RuntimeError(
                 f"Incomplete DSV4 vLLM MoE LoRA block for {prefix}"
             ) from exc
-        if gate_up_a.shape[0] % rank != 0:
+        non_2d = next(
+            (slot for slot, tensor in slots.items() if tensor.ndim != 2), None
+        )
+        if non_2d is not None:
+            raise RuntimeError(
+                f"{prefix}: {non_2d} must be 2D, got {tuple(slots[non_2d].shape)}"
+            )
+        if rank <= 0 or gate_up_a.shape[0] == 0 or gate_up_a.shape[0] % rank != 0:
             raise RuntimeError(
                 f"{prefix}: gate/up lora_A rows {gate_up_a.shape[0]} are not "
                 f"divisible by rank {rank}"
             )
-        if gate_up_b.shape[0] % 2 != 0:
-            raise RuntimeError(
-                f"{prefix}: gate/up lora_B rows {gate_up_b.shape[0]} are not even"
-            )
         num_experts = gate_up_a.shape[0] // rank
+        expected = {
+            "gate/up lora_B": (
+                tuple(gate_up_b.shape),
+                (2 * down_a.shape[1], gate_up_a.shape[0]),
+            ),
+            "down lora_A": (down_a.shape[0], gate_up_a.shape[0]),
+            "down lora_B": (
+                tuple(down_b.shape),
+                (gate_up_a.shape[1], gate_up_a.shape[0]),
+            ),
+        }
+        for slot, (actual, wanted) in expected.items():
+            if actual != wanted:
+                raise RuntimeError(
+                    f"{prefix}: {slot} shape {actual} does not match {wanted}"
+                )
+        if not split_experts:
+            continue
         gate_up_b_by_expert = _dsv4_unpack_vllm_3d_lora_b(
             gate_up_b,
             num_experts=num_experts,
@@ -1268,4 +1430,4 @@ def _dsv4_from_vllm_lora_tensors(
     for key, tensor in canonical.items():
         if key not in used_keys:
             transformed[key] = tensor
-    return transformed
+    return transformed if split_experts else canonical

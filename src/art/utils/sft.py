@@ -353,6 +353,7 @@ async def train_sft_from_file(
     verbose: bool = False,
     shuffle_buffer_size: int = 10000,
     log_metrics: bool = True,
+    assistant_turns: Literal["all", "last"] = "all",
 ) -> None:
     """
     Train a model using supervised fine-tuning from a JSONL file.
@@ -377,6 +378,9 @@ async def train_sft_from_file(
         shuffle_buffer_size: Size of shuffle buffer. Default: 10000.
                              Larger values give better shuffling but use more memory.
         log_metrics: Whether to log SFT optimizer metrics. Default: True.
+        assistant_turns: Which assistant turns contribute to the training loss.
+            Use "last" to train only on the final assistant turn in each trajectory.
+            Default: "all".
 
     Example:
         await train_sft_from_file(
@@ -385,6 +389,7 @@ async def train_sft_from_file(
             epochs=3,
             batch_size=4,
             peak_lr=2e-4,
+            assistant_turns="last",
         )
     """
     from art.types import TrainSFTConfig
@@ -444,6 +449,7 @@ async def train_sft_from_file(
     config = TrainSFTConfig(
         learning_rate=learning_rates,
         batch_size=batch_size,
+        assistant_turns=assistant_turns,
     )
 
     await model.train_sft(

@@ -8,12 +8,15 @@ from typing import Any
 
 from vllm.v1.metrics.loggers import StatLoggerBase
 
+from art_vllm_runtime.fast_metrics import FastMetricsSharedWriter
+
 
 class _ArtRuntimeMetricsState:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._record_count = 0
         self._last_update_unix_s = 0.0
+        self._writer: FastMetricsSharedWriter | None = None
         self._engine_gauges: dict[int, dict[str, float]] = {}
         self._engine_configs: dict[int, dict[str, float]] = {}
         self._counters = {
@@ -43,7 +46,7 @@ class _ArtRuntimeMetricsState:
             ("max_num_seqs", scheduler_config, "max_num_seqs"),
             ("max_num_batched_tokens", scheduler_config, "max_num_batched_tokens"),
             ("max_model_len", model_config, "max_model_len"),
-            ("world_size", parallel_config, "world_size"),
+            ("world_size", parallel_config, "world_size_across_dp"),
         ):
             value = getattr(obj, attr, None)
             if isinstance(value, (int, float)):
@@ -59,6 +62,7 @@ class _ArtRuntimeMetricsState:
             ]
         with self._lock:
             self._engine_configs[engine_idx] = engine_config
+            self._publish_locked()
 
     def record(
         self,
@@ -118,68 +122,82 @@ class _ArtRuntimeMetricsState:
                 self._counters["num_preempted_reqs_total"] += float(
                     iteration_stats.num_preempted_reqs
                 )
+            self._publish_locked()
+
+    def _metrics_locked(self) -> dict[str, float]:
+        gauges = list(self._engine_gauges.values())
+        engine_configs = list(self._engine_configs.values())
+        metrics = dict(self._counters)
+        prefix_queries = metrics["prefix_cache_queries_total"]
+        external_prefix_queries = metrics["external_prefix_cache_queries_total"]
+        max_model_lens = [
+            item["max_model_len"] for item in engine_configs if "max_model_len" in item
+        ]
+        metrics.update(
+            {
+                "prefix_cache_hit_rate": (
+                    metrics["prefix_cache_hits_total"] / prefix_queries
+                    if prefix_queries > 0
+                    else 0.0
+                ),
+                "external_prefix_cache_hit_rate": (
+                    metrics["external_prefix_cache_hits_total"]
+                    / external_prefix_queries
+                    if external_prefix_queries > 0
+                    else 0.0
+                ),
+                "num_requests_running": sum(item["running"] for item in gauges),
+                "num_requests_waiting": sum(item["waiting"] for item in gauges),
+                "num_requests_waiting_capacity": sum(
+                    item["waiting_capacity"] for item in gauges
+                ),
+                "num_requests_waiting_deferred": sum(
+                    item["waiting_deferred"] for item in gauges
+                ),
+                "kv_cache_usage_perc": max(
+                    (item["kv_cache_usage"] for item in gauges), default=0.0
+                ),
+                "max_num_seqs": sum(
+                    item.get("max_num_seqs", 0.0) for item in engine_configs
+                ),
+                "max_num_batched_tokens": sum(
+                    item.get("max_num_batched_tokens", 0.0) for item in engine_configs
+                ),
+                "max_num_scheduled_tokens": sum(
+                    item.get("max_num_scheduled_tokens", 0.0) for item in engine_configs
+                ),
+                "max_model_len": max(max_model_lens, default=0.0),
+                "world_size": max(
+                    (item.get("world_size", 0.0) for item in engine_configs),
+                    default=0.0,
+                ),
+            }
+        )
+        return metrics
+
+    def _publish_locked(self) -> None:
+        if self._writer is not None:
+            self._writer.publish(
+                last_update_unix_s=self._last_update_unix_s,
+                record_count=self._record_count,
+                engine_count=len(self._engine_gauges),
+                metrics=self._metrics_locked(),
+            )
+
+    def set_writer(self, writer: FastMetricsSharedWriter | None) -> None:
+        with self._lock:
+            self._writer = writer
+            self._publish_locked()
 
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
-            gauges = list(self._engine_gauges.values())
-            engine_configs = list(self._engine_configs.values())
-            metrics = dict(self._counters)
-            prefix_queries = metrics["prefix_cache_queries_total"]
-            external_prefix_queries = metrics["external_prefix_cache_queries_total"]
-            max_model_lens = [
-                item["max_model_len"]
-                for item in engine_configs
-                if "max_model_len" in item
-            ]
-            metrics.update(
-                {
-                    "prefix_cache_hit_rate": (
-                        metrics["prefix_cache_hits_total"] / prefix_queries
-                        if prefix_queries > 0
-                        else 0.0
-                    ),
-                    "external_prefix_cache_hit_rate": (
-                        metrics["external_prefix_cache_hits_total"]
-                        / external_prefix_queries
-                        if external_prefix_queries > 0
-                        else 0.0
-                    ),
-                    "num_requests_running": sum(item["running"] for item in gauges),
-                    "num_requests_waiting": sum(item["waiting"] for item in gauges),
-                    "num_requests_waiting_capacity": sum(
-                        item["waiting_capacity"] for item in gauges
-                    ),
-                    "num_requests_waiting_deferred": sum(
-                        item["waiting_deferred"] for item in gauges
-                    ),
-                    "kv_cache_usage_perc": max(
-                        (item["kv_cache_usage"] for item in gauges), default=0.0
-                    ),
-                    "max_num_seqs": sum(
-                        item.get("max_num_seqs", 0.0) for item in engine_configs
-                    ),
-                    "max_num_batched_tokens": sum(
-                        item.get("max_num_batched_tokens", 0.0)
-                        for item in engine_configs
-                    ),
-                    "max_num_scheduled_tokens": sum(
-                        item.get("max_num_scheduled_tokens", 0.0)
-                        for item in engine_configs
-                    ),
-                    "max_model_len": max(max_model_lens, default=0.0),
-                    "world_size": max(
-                        (item.get("world_size", 0.0) for item in engine_configs),
-                        default=0.0,
-                    ),
-                }
-            )
             return {
                 "schema_version": 1,
                 "source": "art_vllm_runtime",
                 "last_update_unix_s": self._last_update_unix_s,
                 "record_count": self._record_count,
                 "engine_count": len(self._engine_gauges),
-                "metrics": metrics,
+                "metrics": self._metrics_locked(),
             }
 
     def record_policy_cache_salt_audit(
@@ -194,6 +212,7 @@ class _ArtRuntimeMetricsState:
         )
         with self._lock:
             self._counters[key] += 1.0
+            self._publish_locked()
 
     def record_policy_cache_waiting_update(
         self, *, updated: int, skipped_started: int
@@ -205,6 +224,7 @@ class _ArtRuntimeMetricsState:
             self._counters["policy_cache_started_waiting_requests_skipped_total"] += (
                 float(skipped_started)
             )
+            self._publish_locked()
 
 
 _STATE = _ArtRuntimeMetricsState()
@@ -235,6 +255,10 @@ class ArtRuntimeStatLogger(StatLoggerBase):
 
 def get_art_metrics_snapshot() -> dict[str, Any]:
     return _STATE.snapshot()
+
+
+def set_fast_metrics_writer(writer: FastMetricsSharedWriter | None) -> None:
+    _STATE.set_writer(writer)
 
 
 def record_policy_cache_salt_audit(*, lora_request: bool, salted: bool) -> None:

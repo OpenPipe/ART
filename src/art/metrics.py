@@ -103,38 +103,108 @@ PIPELINE_RL_METRIC_DEFINITIONS: tuple[MetricDefinition, ...] = (
         score_component=True,
     ),
     MetricDefinition(
-        key="data/step_padding_ratio",
-        title="Padding ratio",
-        description=(
-            "unused packed-token slots, including dummy data-parallel rows, "
-            "divided by executed packed-token capacity for this step"
-        ),
-        kind="ratio",
-        higher_is_better=False,
-        dashboard_default=True,
+        key="data/step_nonpadding_logical_tokens",
+        title="Non-padding logical train tokens",
+        description="actual non-padding tokens in real training microbatches",
+        kind="counter",
+        unit="tokens",
+        higher_is_better=None,
     ),
     MetricDefinition(
-        key="data/step_executed_packed_train_tokens",
-        title="Megatron executed packed train tokens",
+        key="data/step_loss_bearing_tokens",
+        title="Loss-bearing train tokens",
+        description="actual shifted token positions contributing to the loss",
+        kind="counter",
+        unit="tokens",
+        higher_is_better=None,
+    ),
+    MetricDefinition(
+        key="data/step_executed_token_equivalents",
+        title="Executed token-equivalents",
         description=(
-            "packed token rows included in Megatron throughput; CP excludes "
-            "configured packed-row padding that is not dispatched"
+            "materialized per-rank token extents summed over DP and CP, including "
+            "padding and dummy microbatches"
         ),
         kind="counter",
         unit="tokens",
         higher_is_better=None,
     ),
     MetricDefinition(
-        key="throughput/train_packed_tok_per_s",
-        title="Megatron packed train tokens per second",
+        key="data/step_nominal_schedule_capacity_tokens",
+        title="Nominal schedule capacity",
+        description="configured packed-row capacity before CP pruning",
+        kind="counter",
+        unit="tokens",
+        higher_is_better=None,
+    ),
+    MetricDefinition(
+        key="data/step_dummy_executed_token_equivalents",
+        title="Executed dummy token-equivalents",
+        description="runtime-plan token-equivalents executed by PP dummy microbatches",
+        kind="counter",
+        unit="tokens",
+        higher_is_better=False,
+    ),
+    MetricDefinition(
+        key="data/step_dummy_schedule_capacity_tokens",
+        title="Dummy schedule capacity",
+        description="nominal packed-token capacity assigned to PP dummy microbatches",
+        kind="counter",
+        unit="tokens",
+        higher_is_better=False,
+    ),
+    MetricDefinition(
+        key="data/step_unused_packed_capacity_tokens",
+        title="Unused packed capacity",
+        description="nominal real-microbatch capacity not occupied by logical tokens",
+        kind="counter",
+        unit="tokens",
+        higher_is_better=False,
+    ),
+    MetricDefinition(
+        key="data/step_unused_and_dummy_ratio",
+        title="Unused and dummy capacity ratio",
         description=(
-            "physical training-token throughput reported by the Megatron worker; "
-            "CP excludes configured packed-row padding that is not dispatched"
+            "unused real packed-token capacity plus PP dummy schedule capacity, "
+            "divided by nominal schedule capacity"
         ),
+        kind="ratio",
+        higher_is_better=False,
+        dashboard_default=True,
+    ),
+    MetricDefinition(
+        key="throughput/train_nonpadding_logical_tok_per_s",
+        title="Logical train tokens per second",
+        description="actual non-padding logical tokens divided by training time",
         kind="rate",
         unit="tok/s",
         higher_is_better=True,
         dashboard_default=True,
+    ),
+    MetricDefinition(
+        key="throughput/train_loss_bearing_tok_per_s",
+        title="Loss-bearing train tokens per second",
+        description="actual loss-bearing tokens divided by training time",
+        kind="rate",
+        unit="tok/s",
+        higher_is_better=True,
+    ),
+    MetricDefinition(
+        key="throughput/train_executed_tok_equiv_per_s",
+        title="Executed token-equivalents per second",
+        description="executed materialized token-equivalents divided by training time",
+        kind="rate",
+        unit="tok/s",
+        higher_is_better=True,
+        dashboard_default=True,
+    ),
+    MetricDefinition(
+        key="throughput/train_nominal_capacity_tok_per_s",
+        title="Nominal schedule capacity per second",
+        description="configured packed-row capacity divided by training time",
+        kind="rate",
+        unit="tok/s",
+        higher_is_better=True,
     ),
     MetricDefinition(
         key="loss/importance_ratio_mean",
@@ -499,14 +569,35 @@ class MetricsBuilder:
             }
             result.update(self._compute_rollups(cost_metrics))
 
+            cum_state = self._shared_state.cum_state
+            unused_and_dummy_ratio = "data/step_unused_and_dummy_ratio"
             for key, value in list(result.items()):
                 section = key.split("/", 1)[0]
-                if section not in _HIERARCHICAL_SECTIONS:
+                if (
+                    section not in _HIERARCHICAL_SECTIONS
+                    or key == unused_and_dummy_ratio
+                ):
                     continue
                 cum_key = to_cumulative_metric_key(key)
-                next_value = self._shared_state.cum_state.get(cum_key, 0.0) + value
-                self._shared_state.cum_state[cum_key] = next_value
+                next_value = cum_state.get(cum_key, 0.0) + value
+                cum_state[cum_key] = next_value
                 result[cum_key] = next_value
+
+            if unused_and_dummy_ratio in result:
+                cum_key = to_cumulative_metric_key(unused_and_dummy_ratio)
+                nominal = cum_state.get(
+                    "data/cum/nominal_schedule_capacity_tokens", 0.0
+                )
+                unused_and_dummy = sum(
+                    cum_state.get(key, 0.0)
+                    for key in (
+                        "data/cum/unused_packed_capacity_tokens",
+                        "data/cum/dummy_schedule_capacity_tokens",
+                    )
+                )
+                ratio = unused_and_dummy / nominal if nominal else 0.0
+                cum_state[cum_key] = ratio
+                result[cum_key] = ratio
 
             if pending_scenario_ids:
                 self._shared_state.unique_scenario_ids.update(pending_scenario_ids)
@@ -515,6 +606,16 @@ class MetricsBuilder:
                 )
 
             self._update_throughput_metrics(result)
+            pending_state.step_buffer.clear()
+            pending_state.pending_scenario_ids.clear()
+            return result
+
+    async def drain_pending(self) -> dict[str, float]:
+        """Move raw step deltas across an execution boundary without rollups."""
+
+        async with self._shared_state.lock:
+            pending_state = self._pending_state()
+            result = dict(pending_state.step_buffer)
             pending_state.step_buffer.clear()
             pending_state.pending_scenario_ids.clear()
             return result

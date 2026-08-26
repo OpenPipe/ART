@@ -43,7 +43,59 @@ def _ceil_to_multiple(value: float, multiple: int, *, minimum: int = 1) -> int:
     return max(minimum, int(math.ceil(value / multiple)) * multiple)
 
 
+def _round_to_multiple(value: float, multiple: int, *, minimum: int = 1) -> int:
+    return max(minimum, int(math.floor(value / multiple + 0.5)) * multiple)
+
+
 _VLLM_SCRAPE_GROUP_TOLERANCE_S = 0.05
+_TRAINER_CAPACITY_EPSILON = 1e-9
+
+
+def _vllm_sample_max_age_s(metric_interval_s: float) -> float:
+    # Preserve one delayed poll without allowing an unbounded zero-order hold.
+    return 2.0 * metric_interval_s
+
+
+def _vllm_sample_intervals(
+    sample_times: Sequence[float],
+    *,
+    window_start_s: float,
+    window_end_s: float,
+    metric_interval_s: float,
+) -> list[tuple[float, float]]:
+    times = sorted(set(sample_times))
+    max_age_s = _vllm_sample_max_age_s(metric_interval_s)
+    intervals: list[tuple[float, float]] = []
+    for index, t_s in enumerate(times):
+        next_t_s = times[index + 1] if index + 1 < len(times) else math.inf
+        start_s = max(t_s, window_start_s)
+        end_s = min(next_t_s, t_s + max_age_s, window_end_s)
+        if end_s > start_s:
+            intervals.append((t_s, end_s - start_s))
+    return intervals
+
+
+def _packing_group_candidates(
+    *, current: int, available: int, radius: int, min_change_fraction: float
+) -> list[int]:
+    # Half-hysteresis spacing brackets each actionable target change.
+    step = max(1, math.ceil(current * min_change_fraction / 2.0))
+    min_change = max(1, math.ceil(current * min_change_fraction))
+    lower = max(1, min(available, current - radius))
+    upper = min(available, current + radius)
+    candidates = {lower, min(current, available), upper}
+    candidates.update(
+        groups
+        for groups in (current - min_change, current + min_change)
+        if lower <= groups <= upper
+    )
+    for offset in range(step, radius, step):
+        candidates.update(
+            groups
+            for groups in (current - offset, current + offset)
+            if lower <= groups <= upper
+        )
+    return sorted(candidates)
 
 
 class PackingProjection(pydantic.BaseModel):
@@ -55,6 +107,16 @@ class PackingOutcome(pydantic.BaseModel):
     step: int
     groups: int = pydantic.Field(ge=1)
     packed_sequences: int = pydantic.Field(ge=1)
+
+
+def _trainer_underfeed_score(
+    *, idle_frac: float, unused_and_dummy_ratio: float
+) -> float:
+    denominator = max(
+        _TRAINER_CAPACITY_EPSILON,
+        1.0 + _TRAINER_CAPACITY_EPSILON - max(0.0, min(1.0, unused_and_dummy_ratio)),
+    )
+    return max(0.0, idle_frac) / denominator
 
 
 class PipelineAutotuner:
@@ -70,7 +132,15 @@ class PipelineAutotuner:
         inference_gpu_count: int,
         policy_age_limit_steps: float,
         starting_step: int = 0,
+        rollout_worker_capacity: int | None = None,
     ) -> None:
+        if rollout_worker_capacity is not None and rollout_worker_capacity < 1:
+            raise ValueError("rollout_worker_capacity must be >= 1")
+        if (
+            rollout_worker_capacity is not None
+            and settings.num_rollout_workers > rollout_worker_capacity
+        ):
+            raise ValueError("initial settings exceed rollout worker capacity")
         self.config = config
         self.settings = settings
         self.model_name = model_name
@@ -79,7 +149,9 @@ class PipelineAutotuner:
         self.target_packed_sequences = max(1, int(target_packed_sequences))
         self.inference_gpu_count = inference_gpu_count
         self.policy_age_limit_steps = policy_age_limit_steps
+        self.rollout_worker_capacity = rollout_worker_capacity
         self.metrics: list[PipelineMetric] = []
+        self.vllm_pressure_samples: list[tuple[float, float, float]] = []
         self.packed_groups: list[PackedGroupObservation] = []
         self._packing_outcomes: list[PackingOutcome] = []
         self._packing_outcome_steps: set[int] = set()
@@ -88,6 +160,8 @@ class PipelineAutotuner:
         self._last_decision_step = self._warmup_end_step
         self._target_candidate: int | None = None
         self._target_candidate_count = 0
+        self._worker_load_candidate_direction: int | None = None
+        self._worker_load_candidate_count = 0
         self._stale_backlog_active = False
         self._min_batch_trial_baseline_collect_s: float | None = None
         self._min_batch_trial_batch_size: int | None = None
@@ -99,6 +173,11 @@ class PipelineAutotuner:
         if rec.name != "objective/score" or rec.step is None:
             return None
         return self.maybe_decide(int(rec.step))
+
+    def on_vllm_pressure_sample(
+        self, *, t_s: float, running: float, waiting_capacity: float
+    ) -> None:
+        self.vllm_pressure_samples.append((t_s, running, waiting_capacity))
 
     def on_packed_group(self, rec: PackedGroupObservation) -> None:
         if self.packed_groups and rec.step > self.packed_groups[-1].step:
@@ -124,7 +203,22 @@ class PipelineAutotuner:
         self._emit_stable_recommendations(decision)
         if decision.previous != decision.updated:
             self.settings = decision.updated
+        self._prune_metrics(stats)
         return decision
+
+    def _prune_metrics(self, stats: TunerWindowStats) -> None:
+        raw_cutoff = stats.window_end_s - _vllm_sample_max_age_s(
+            self.config.vllm_metric_interval_s
+        )
+        self.metrics = [
+            rec
+            for rec in self.metrics
+            if (rec.step is None and rec.t_s >= raw_cutoff)
+            or (rec.step is not None and int(rec.step) >= stats.end_step)
+        ]
+        self.vllm_pressure_samples = [
+            sample for sample in self.vllm_pressure_samples if sample[0] >= raw_cutoff
+        ]
 
     def window_stats(self) -> TunerWindowStats | None:
         by_step: dict[int, dict[str, PipelineMetric]] = defaultdict(dict)
@@ -140,7 +234,18 @@ class PipelineAutotuner:
         if len(steps) < self.config.window_steps:
             return None
         window_steps = steps[-self.config.window_steps :]
-        t0 = min(by_step[step]["objective/score"].t_s for step in window_steps)
+        preceding_objective_times = [
+            rec.t_s
+            for rec in self.metrics
+            if rec.name == "objective/score"
+            and rec.step is not None
+            and int(rec.step) < window_steps[0]
+        ]
+        t0 = (
+            max(preceding_objective_times)
+            if preceding_objective_times
+            else min(by_step[step]["objective/score"].t_s for step in window_steps)
+        )
         t1 = max(rec.t_s for step in window_steps for rec in by_step[step].values())
 
         def step_values(name: str) -> list[float]:
@@ -171,16 +276,26 @@ class PipelineAutotuner:
         queue_put_wait_s = sum(
             _required_step_values(by_step, window_steps, "queue/put_wait_s")
         )
-        train_capacity_tokens = _required_step_values(
-            by_step, window_steps, "data/step_packed_train_tokens"
+        nominal_capacity_tokens = _required_step_values(
+            by_step, window_steps, "data/step_nominal_schedule_capacity_tokens"
         )
         non_padding_tokens = _required_step_values(
-            by_step, window_steps, "data/step_non_padding_train_tokens"
+            by_step, window_steps, "data/step_nonpadding_logical_tokens"
         )
         vllm_metrics = [
             rec
             for rec in self.metrics
-            if rec.step is None and t0 <= rec.t_s <= max(t1, t0 + 1e-6)
+            if rec.step is None
+            and t0 - _vllm_sample_max_age_s(self.config.vllm_metric_interval_s)
+            <= rec.t_s
+            <= max(t1, t0 + 1e-6)
+        ]
+        vllm_pressure_samples = [
+            sample
+            for sample in self.vllm_pressure_samples
+            if t0 - _vllm_sample_max_age_s(self.config.vllm_metric_interval_s)
+            <= sample[0]
+            <= max(t1, t0 + 1e-6)
         ]
         window_step_set = set(window_steps)
         packed_group_counts: dict[int, int] = defaultdict(int)
@@ -197,18 +312,31 @@ class PipelineAutotuner:
                 "Pipeline autotuner requires packed-group observations in every "
                 f"trainable decision-window step; missing steps {missing_packed_steps}."
             )
-        padding_ratios = []
+        unused_and_dummy_ratios = []
         for capacity, non_padding in zip(
-            train_capacity_tokens, non_padding_tokens, strict=True
+            nominal_capacity_tokens, non_padding_tokens, strict=True
         ):
             if capacity <= 0:
                 continue
-            padding_ratios.append(max(0.0, (capacity - non_padding) / capacity))
+            unused_and_dummy_ratios.append(
+                max(0.0, (capacity - non_padding) / capacity)
+            )
         trainer_idle_frac = (collect / wall) if wall > 0 else 0.0
-        padding_ratio_mean = _mean(padding_ratios)
+        unused_and_dummy_ratio_mean = _mean(unused_and_dummy_ratios)
         self._record_packing_outcomes(
             by_step=by_step,
             window_steps=window_steps,
+        )
+        if not vllm_pressure_samples:
+            vllm_pressure_samples = _vllm_samples_from_metrics(vllm_metrics)
+        waiting_capacity_request_s, running_request_s = (
+            _vllm_request_seconds_from_samples(
+                vllm_pressure_samples,
+                window_start_s=t0,
+                window_end_s=t1,
+                metric_interval_s=self.config.vllm_metric_interval_s,
+                min_coverage=1.0 - self.config.vllm_metric_timeout_window_frac,
+            )
         )
         return TunerWindowStats(
             start_step=window_steps[0],
@@ -216,16 +344,21 @@ class PipelineAutotuner:
             window_start_s=t0,
             window_end_s=t1,
             collect_batch_s=collect / len(window_steps),
-            trainer_underfeed_score=max(0.0, trainer_idle_frac),
-            vllm_pressure=_vllm_pressure(
-                vllm_metrics, window_start_s=t0, window_end_s=t1
+            trainer_underfeed_score=_trainer_underfeed_score(
+                idle_frac=trainer_idle_frac,
+                unused_and_dummy_ratio=unused_and_dummy_ratio_mean,
             ),
+            vllm_pressure=_vllm_pressure_ratio(
+                waiting_capacity_request_s, running_request_s
+            ),
+            vllm_waiting_capacity_request_s=waiting_capacity_request_s,
+            vllm_running_request_s=running_request_s,
             queue_put_wait_frac=queue_put_wait_s
             / max(queue_put_wait_s + rollout_s, 1e-9),
             predicted_stale_frac=_mean(step_values("queue/predicted_stale_fraction")),
             actual_stale_frac=sum(stale_groups)
             / max(sum(groups) + sum(stale_groups) + sum(zero_variance_groups), 1.0),
-            padding_ratio_mean=padding_ratio_mean,
+            unused_and_dummy_ratio_mean=unused_and_dummy_ratio_mean,
         )
 
     def _record_packing_outcomes(
@@ -308,11 +441,14 @@ class PipelineAutotuner:
         )
         if target_changed:
             self._clear_min_batch_trial()
+            self._clear_worker_load_candidate()
         stale_backlog_active = self._update_stale_backlog_state(stats)
         action = "hold"
+        pending_worker_action = "hold"
         reason = "inside hysteresis band or already balanced"
 
         if stale_backlog_active and updated.min_batch_size < updated.max_batch_size:
+            self._clear_worker_load_candidate()
             updated = updated.model_copy(
                 update={
                     "min_batch_size": min(
@@ -327,6 +463,7 @@ class PipelineAutotuner:
             action = "raise_min_batch_size"
             reason = "stale backlog requires dense batches before reducing workers"
         elif stale_backlog_active:
+            self._clear_worker_load_candidate()
             updated = updated.model_copy(
                 update={
                     "num_rollout_workers": self._move_workers(
@@ -336,40 +473,87 @@ class PipelineAutotuner:
             )
             action = "decrease_workers"
             reason = "predicted or actual stale backlog exceeds the freshness target"
+        elif target_changed:
+            reason = "batch geometry changed; worker load evidence was reset"
+        elif (
+            state == "inference_over_train_over"
+            and stats.queue_put_wait_frac >= self.config.queue_put_severe_frac
+        ):
+            pending_worker_action = "decrease_workers"
+            if self._worker_load_change_ready(-1):
+                updated = updated.model_copy(
+                    update={
+                        "num_rollout_workers": self._move_workers(
+                            updated.num_rollout_workers, -1
+                        )
+                    }
+                )
+                action = pending_worker_action
+                reason = (
+                    "sustained vLLM pressure plus queue backpressure indicates "
+                    "excess workers"
+                )
+            else:
+                reason = self._pending_worker_load_reason("decrease")
         elif stats.queue_put_wait_frac >= self.config.queue_put_severe_frac:
+            self._clear_worker_load_candidate()
             reason = "completed-group queue backpressure is active"
         elif state in {
             "inference_under_train_under",
             "inference_balanced_train_under",
         }:
-            updated = updated.model_copy(
-                update={
-                    "num_rollout_workers": self._move_workers(
-                        updated.num_rollout_workers, +1
-                    )
-                }
-            )
-            action = "increase_workers"
-            reason = "vLLM pressure is low and trainer is underfed"
+            pending_worker_action = "increase_workers"
+            if self._worker_load_change_ready(+1):
+                updated = updated.model_copy(
+                    update={
+                        "num_rollout_workers": self._move_workers(
+                            updated.num_rollout_workers, +1
+                        )
+                    }
+                )
+                action = pending_worker_action
+                reason = "sustained vLLM pressure is low and trainer is underfed"
+            else:
+                reason = self._pending_worker_load_reason("increase")
         elif state == "inference_over_train_over":
+            self._clear_worker_load_candidate()
             reason = "both sides are loaded; no throughput-safe online change"
+        else:
+            self._clear_worker_load_candidate()
 
         if not target_changed and not stale_backlog_active:
             min_update = self._min_batch_adjustment(
                 updated,
                 stats,
-                action,
+                pending_worker_action
+                if pending_worker_action == "increase_workers"
+                else action,
                 inference_over=inference_over,
             )
             if min_update is not None:
+                self._clear_worker_load_candidate()
                 updated, action, reason = min_update
 
         updated = self._settings_with_recomputed_queue(
             updated, stats, adapt_target=False
         )
-        if action == "hold" and updated != previous:
+        worker_limit = freshness_worker_limit(
+            target_groups_per_step=updated.target_groups_per_step,
+            limit_steps_off_policy=self.policy_age_limit_steps,
+            running_reserve_fraction=self.config.queue_running_reserve_fraction,
+            worker_step=self.config.worker_step,
+        )
+        if (
+            worker_limit is not None
+            and previous.num_rollout_workers > worker_limit
+            and updated.num_rollout_workers <= worker_limit
+        ):
+            self._clear_worker_load_candidate()
+            action = "decrease_workers"
+            reason = "running rollout reserve exceeded the policy-age budget"
+        elif action == "hold" and updated != previous:
             action = "resize_batch_queue"
-            reason = "recomputed target batch size and freshness-bounded queue"
+            reason = "recomputed target batch size and one-batch queue capacity"
         return TunerDecision(
             step=stats.end_step,
             state=state,
@@ -379,6 +563,28 @@ class PipelineAutotuner:
             updated=updated,
             stats=stats,
         )
+
+    def _worker_load_change_ready(self, direction: int) -> bool:
+        if self._worker_load_candidate_direction == direction:
+            self._worker_load_candidate_count += 1
+        else:
+            self._worker_load_candidate_direction = direction
+            self._worker_load_candidate_count = 1
+        if self._worker_load_candidate_count < self.config.worker_load_change_windows:
+            return False
+        self._clear_worker_load_candidate()
+        return True
+
+    def _pending_worker_load_reason(self, direction: str) -> str:
+        return (
+            f"worker {direction} awaits sustained evidence "
+            f"({self._worker_load_candidate_count}/"
+            f"{self.config.worker_load_change_windows})"
+        )
+
+    def _clear_worker_load_candidate(self) -> None:
+        self._worker_load_candidate_direction = None
+        self._worker_load_candidate_count = 0
 
     def _update_stale_backlog_state(self, stats: TunerWindowStats) -> bool:
         stale_fractions = (stats.predicted_stale_frac, stats.actual_stale_frac)
@@ -552,16 +758,17 @@ class PipelineAutotuner:
                 )
             )
         if (
-            stats.padding_ratio_mean >= self.config.padding_high_frac
+            stats.unused_and_dummy_ratio_mean >= self.config.unused_and_dummy_high_frac
             and trainer_saturated
             and vllm_saturated
         ):
             recommendations.append(
                 (
                     "decrease_packed_sequence_length",
-                    "Pipeline autotuner observes high padding while Megatron and vLLM "
+                    "Pipeline autotuner observes high unused or dummy capacity while "
+                    "Megatron and vLLM "
                     "are both saturated; decrease packed_sequence_length to reduce "
-                    "padding waste.",
+                    "schedule waste.",
                 )
             )
         return recommendations
@@ -569,14 +776,20 @@ class PipelineAutotuner:
     def _move_workers(self, current: int, direction: int) -> int:
         raw = max(
             self.config.worker_step,
-            _ceil_to_multiple(
+            _round_to_multiple(
                 current * self.config.worker_move_fraction, self.config.worker_step
             ),
         )
         cap = _ceil_to_multiple(self.config.max_worker_move, self.config.worker_step)
+        floor = min(
+            self.config.worker_step,
+            self.rollout_worker_capacity or self.config.worker_step,
+        )
+        moved = max(floor, current + direction * min(cap, raw))
         return min(
+            moved,
             self.config.max_rollout_workers,
-            max(self.config.worker_step, current + direction * min(cap, raw)),
+            self.rollout_worker_capacity or moved,
         )
 
     def _settings_with_recomputed_queue(
@@ -598,14 +811,23 @@ class PipelineAutotuner:
             min_batch = max(floor, min(target, max(1, round(target * ratio))))
         # Packed sequence length is the user's cap on target/max batch size. If a
         # run should never use larger train batches, lower packed_sequence_length.
-        queue = recommended_queue_size(
+        worker_limit = freshness_worker_limit(
             target_groups_per_step=target,
             limit_steps_off_policy=self.policy_age_limit_steps,
-            num_rollout_workers=settings.num_rollout_workers,
             running_reserve_fraction=self.config.queue_running_reserve_fraction,
+            worker_step=self.config.worker_step,
+        )
+        workers = (
+            settings.num_rollout_workers
+            if worker_limit is None
+            else min(settings.num_rollout_workers, worker_limit)
+        )
+        queue = recommended_queue_size(
+            target_groups_per_step=target,
         )
         return settings.model_copy(
             update={
+                "num_rollout_workers": workers,
                 "target_groups_per_step": target,
                 "min_batch_size": min_batch,
                 "max_batch_size": target,
@@ -690,62 +912,88 @@ class PipelineAutotuner:
             ]
         )
         current = max(1, settings.target_groups_per_step)
-        increase = max(
+        # Search only target changes that the controller can apply in one window.
+        radius = max(
             1,
             min(
                 self.config.target_group_max_increase,
                 math.ceil(current * self.config.target_group_increase_fraction),
             ),
         )
-        lo = max(1, current // 2)
-        hi = min(len(reservoir), current + increase)
-        history_risks = self._packing_history_risks(range(lo, hi + 1))
+        candidates = _packing_group_candidates(
+            current=current,
+            available=len(reservoir),
+            radius=radius,
+            min_change_fraction=self.config.target_group_min_relative_change,
+        )
+        history_risks = self._packing_history_risks(candidates)
         projections: dict[int, PackingProjection] = {}
 
         def project(groups: int) -> PackingProjection:
             existing = projections.get(groups)
             if existing is not None:
                 return existing
+            history_risk = history_risks[groups]
+            if history_risk > self.config.target_spill_probability:
+                projection = PackingProjection(
+                    groups=groups, spill_probability=history_risk
+                )
+                projections[groups] = projection
+                return projection
             rng = random.Random((stats.end_step << 32) ^ groups)
             spills = 0.0
+            trials = 0.0
             for _ in range(self.config.packing_trials):
                 selected = rng.sample(range(len(reservoir)), groups)
                 after = pool.estimate(selected, seq_len=self.packed_sequence_length)
-                spills += float(after.packed_sequences > self.target_packed_sequences)
-            trials = float(self.config.packing_trials)
+                trials += 1.0
+                if after.packed_sequences > self.target_packed_sequences:
+                    spills += 1.0
+                    best_case_risk = self._packing_probability_upper(
+                        events=spills, trials=float(self.config.packing_trials)
+                    )
+                    if best_case_risk > self.config.target_spill_probability:
+                        break
+                if (
+                    self._packing_probability_upper(events=spills, trials=trials)
+                    <= self.config.target_spill_probability
+                ):
+                    break
             counterfactual_risk = self._packing_probability_upper(
                 events=spills,
                 trials=trials,
             )
             projection = PackingProjection(
                 groups=groups,
-                spill_probability=max(counterfactual_risk, history_risks[groups]),
+                spill_probability=max(counterfactual_risk, history_risk),
             )
             projections[groups] = projection
             return projection
 
-        best = lo - 1
-        left, right = lo, hi
-        while left <= right:
-            groups = (left + right) // 2
-            if (
-                project(groups).spill_probability
-                <= self.config.target_spill_probability
-            ):
-                best = groups
-                left = groups + 1
-            else:
-                right = groups - 1
-        for groups in range(max(lo, best - 2), min(hi, best + 2) + 1):
-            project(groups)
+        upper_index = len(candidates) - 1
+        if (
+            project(candidates[upper_index]).spill_probability
+            > self.config.target_spill_probability
+        ):
+            left, right = 0, upper_index - 1
+            while left <= right:
+                index = (left + right) // 2
+                if (
+                    project(candidates[index]).spill_probability
+                    <= self.config.target_spill_probability
+                ):
+                    left = index + 1
+                else:
+                    right = index - 1
         monotone_risk = 0.0
         for groups in sorted(projections):
             projection = projections[groups]
-            monotone_risk = max(monotone_risk, projection.spill_probability)
             if projection.spill_probability < monotone_risk:
                 projections[groups] = projection.model_copy(
                     update={"spill_probability": monotone_risk}
                 )
+            else:
+                monotone_risk = projection.spill_probability
         return [projections[groups] for groups in sorted(projections)]
 
     def _packing_reservoir(
@@ -784,9 +1032,13 @@ class PipelineAutotuner:
                 break
         return selected
 
-    def _packing_history_risks(self, groups_range: range) -> dict[int, float]:
-        risks: dict[int, float] = {}
-        for groups in groups_range:
+    def _packing_history_risks(self, groups_range: Sequence[int]) -> dict[int, float]:
+        exact_risks: dict[int, float] = {}
+        for groups in {
+            outcome.groups
+            for outcome in self._packing_outcomes
+            if outcome.groups <= max(groups_range)
+        }:
             outcomes = [
                 outcome
                 for outcome in self._packing_outcomes
@@ -803,16 +1055,21 @@ class PipelineAutotuner:
             # Zero-spill samples are useful diagnostics but should not block exploration:
             # a beta upper bound with sparse clean samples would make target batches
             # sticky. Actual spills are the hard signal we carry across the horizon.
-            risks[groups] = (
+            exact_risks[groups] = (
                 self._packing_probability_upper(events=spills, trials=trials)
                 if spills > 0.0
                 else 0.0
             )
+        risks: dict[int, float] = {}
         inherited_spill_probability = 0.0
-        for groups in sorted(risks):
-            inherited_spill_probability = max(
-                inherited_spill_probability, risks[groups]
-            )
+        history_groups = iter(sorted(exact_risks.items()))
+        next_history = next(history_groups, None)
+        for groups in sorted(groups_range):
+            while next_history is not None and next_history[0] <= groups:
+                inherited_spill_probability = max(
+                    inherited_spill_probability, next_history[1]
+                )
+                next_history = next(history_groups, None)
             risks[groups] = inherited_spill_probability
         return risks
 
@@ -838,13 +1095,15 @@ class PipelineAutotuner:
             packed_sequence_length=self.packed_sequence_length,
             target_packed_sequences=self.target_packed_sequences,
             inference_gpu_count=self.inference_gpu_count,
+            rollout_worker_capacity=self.rollout_worker_capacity,
             policy_age_limit_steps=self.policy_age_limit_steps,
             settings=self.settings,
             config=self.config,
             decisions=self.decisions,
             notes=[
                 "The first warmup_ignore_steps are excluded from throughput decisions.",
-                "queue_maxsize is bounded so queue_size / target_groups_per_step <= the policy-age limit.",
+                "queue_maxsize bounds ready, packing, and packed groups to one target "
+                "batch; active rollouts add at most one worker wave.",
                 *self._profile_recommendations(),
             ],
         )
@@ -867,7 +1126,14 @@ def build_initial_settings(
     inference_gpu_count: int,
     target_packed_sequences: int,
     policy_age_limit_steps: float,
+    rollout_worker_capacity: int | None,
 ) -> PipelineTuneSettings:
+    target_slots = max(1, int(target_packed_sequences))
+    max_batch = int(config.initial_max_groups_per_packed_sequence) * target_slots
+    min_batch = min(
+        int(config.initial_min_groups_per_packed_sequence) * target_slots,
+        max_batch,
+    )
     workers = min(
         config.max_rollout_workers,
         _ceil_to_multiple(
@@ -876,21 +1142,22 @@ def build_initial_settings(
             minimum=config.worker_step,
         ),
     )
-    target_slots = max(1, int(target_packed_sequences))
-    max_batch = int(config.initial_max_groups_per_packed_sequence) * target_slots
-    min_batch = min(
-        int(config.initial_min_groups_per_packed_sequence) * target_slots,
-        max_batch,
+    worker_limit = freshness_worker_limit(
+        target_groups_per_step=max_batch,
+        limit_steps_off_policy=policy_age_limit_steps,
+        running_reserve_fraction=config.queue_running_reserve_fraction,
+        worker_step=config.worker_step,
     )
+    if worker_limit is not None:
+        workers = min(workers, worker_limit)
+    if rollout_worker_capacity is not None:
+        workers = min(workers, rollout_worker_capacity)
     min_batch = max(
         min_batch,
         math.ceil(max_batch * config.freshness_min_batch_floor_fraction),
     )
     queue = recommended_queue_size(
         target_groups_per_step=max_batch,
-        limit_steps_off_policy=policy_age_limit_steps,
-        num_rollout_workers=workers,
-        running_reserve_fraction=config.queue_running_reserve_fraction,
     )
     return PipelineTuneSettings(
         num_rollout_workers=workers,
@@ -901,26 +1168,50 @@ def build_initial_settings(
     )
 
 
-def recommended_queue_size(
+def freshness_worker_limit(
     *,
     target_groups_per_step: int,
     limit_steps_off_policy: float,
-    num_rollout_workers: int,
     running_reserve_fraction: float,
-) -> int:
+    worker_step: int,
+) -> int | None:
+    """Leave one queued batch inside the completed-work freshness budget."""
+
+    if running_reserve_fraction <= 0.0:
+        return None
     target = max(1, int(target_groups_per_step))
-    limit = max(1.0, float(limit_steps_off_policy))
-    max_completed = max(1, int(math.floor(target * limit)))
-    running_reserve = int(
-        math.ceil(max(0, num_rollout_workers) * running_reserve_fraction)
-    )
-    lower = target
-    return max(lower, min(max_completed, max_completed - running_reserve))
+    max_completed = int(math.floor(target * max(1.0, limit_steps_off_policy)))
+    raw_limit = int(math.floor((max_completed - target) / running_reserve_fraction))
+    return max(1, (raw_limit // max(1, worker_step)) * max(1, worker_step))
+
+
+def recommended_queue_size(
+    *,
+    target_groups_per_step: int,
+) -> int:
+    return max(1, int(target_groups_per_step))
 
 
 def _vllm_pressure(
-    metrics: list[PipelineMetric], *, window_start_s: float, window_end_s: float
+    metrics: list[PipelineMetric],
+    *,
+    window_start_s: float,
+    window_end_s: float,
+    metric_interval_s: float,
+    min_coverage: float,
 ) -> float:
+    return _vllm_pressure_from_samples(
+        _vllm_samples_from_metrics(metrics),
+        window_start_s=window_start_s,
+        window_end_s=window_end_s,
+        metric_interval_s=metric_interval_s,
+        min_coverage=min_coverage,
+    )
+
+
+def _vllm_samples_from_metrics(
+    metrics: list[PipelineMetric],
+) -> list[tuple[float, float, float]]:
     wanted = {"vllm/num_requests_running", "vllm/num_requests_waiting_capacity"}
     rows: list[tuple[float, str, float]] = []
     for rec in metrics:
@@ -929,37 +1220,93 @@ def _vllm_pressure(
     if not rows:
         raise RuntimeError("Pipeline autotuning requires vLLM runtime metric samples.")
     by_time = _group_vllm_metric_rows(rows)
-    times = sorted(t_s for t_s, values in by_time.items() if wanted <= values.keys())
-    if not times:
+    samples = [
+        (
+            t_s,
+            values["vllm/num_requests_running"],
+            values["vllm/num_requests_waiting_capacity"],
+        )
+        for t_s, values in by_time.items()
+        if wanted <= values.keys()
+    ]
+    if not samples:
         raise RuntimeError(
             "Pipeline autotuning requires complete vLLM running/capacity samples."
         )
-    capacity_wait_request_s = 0.0
-    running_request_s = 0.0
-    total_s = 0.0
-    for idx, t_s in enumerate(times):
-        values = by_time[t_s]
-        if not {
-            "vllm/num_requests_running",
-            "vllm/num_requests_waiting_capacity",
-        }.issubset(values):
-            continue
-        next_t_s = times[idx + 1] if idx + 1 < len(times) else window_end_s
-        start_s = max(t_s, window_start_s)
-        end_s = min(next_t_s, window_end_s)
-        if end_s <= start_s:
-            continue
-        duration_s = end_s - start_s
-        total_s += duration_s
-        capacity_wait_request_s += (
-            max(0.0, values["vllm/num_requests_waiting_capacity"]) * duration_s
+    return samples
+
+
+def _vllm_pressure_from_samples(
+    samples: Sequence[tuple[float, float, float]],
+    *,
+    window_start_s: float,
+    window_end_s: float,
+    metric_interval_s: float,
+    min_coverage: float,
+) -> float:
+    return _vllm_pressure_ratio(
+        *_vllm_request_seconds_from_samples(
+            samples,
+            window_start_s=window_start_s,
+            window_end_s=window_end_s,
+            metric_interval_s=metric_interval_s,
+            min_coverage=min_coverage,
         )
-        running_request_s += max(0.0, values["vllm/num_requests_running"]) * duration_s
+    )
+
+
+def _vllm_request_seconds_from_samples(
+    samples: Sequence[tuple[float, float, float]],
+    *,
+    window_start_s: float,
+    window_end_s: float,
+    metric_interval_s: float,
+    min_coverage: float,
+) -> tuple[float, float]:
+    by_time = {
+        t_s: (running, waiting_capacity)
+        for t_s, running, waiting_capacity in samples
+        if math.isfinite(running) and math.isfinite(waiting_capacity)
+    }
+    times = sorted(by_time)
+    if not times:
+        raise RuntimeError("Pipeline autotuning requires vLLM pressure samples.")
+    window_s = window_end_s - window_start_s
+    if window_s <= 0.0:
+        raise RuntimeError(
+            "Pipeline autotuning requires a positive vLLM sample window."
+        )
+    intervals = _vllm_sample_intervals(
+        times,
+        window_start_s=window_start_s,
+        window_end_s=window_end_s,
+        metric_interval_s=metric_interval_s,
+    )
+    total_s = sum(duration_s for _, duration_s in intervals)
+    coverage = total_s / window_s
+    if coverage + 1e-9 < min_coverage:
+        raise RuntimeError(
+            "Pipeline autotuning cannot rely on vLLM pressure: successful telemetry "
+            f"covered {coverage:.1%} of the decision window; requires at least "
+            f"{min_coverage:.1%}."
+        )
+    waiting_capacity_request_s = 0.0
+    running_request_s = 0.0
+    for t_s, duration_s in intervals:
+        running, waiting_capacity = by_time[t_s]
+        waiting_capacity_request_s += max(0.0, waiting_capacity) * duration_s
+        running_request_s += max(0.0, running) * duration_s
     if total_s <= 0.0:
         raise RuntimeError("Pipeline autotuning requires nonzero vLLM sample duration.")
+    return waiting_capacity_request_s, running_request_s
+
+
+def _vllm_pressure_ratio(
+    waiting_capacity_request_s: float, running_request_s: float
+) -> float:
     if running_request_s > 0.0:
-        return capacity_wait_request_s / running_request_s
-    return math.inf if capacity_wait_request_s > 0.0 else 0.0
+        return waiting_capacity_request_s / running_request_s
+    return math.inf if waiting_capacity_request_s > 0.0 else 0.0
 
 
 def _group_vllm_metric_rows(

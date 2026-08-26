@@ -4,9 +4,12 @@ from typing import Any, cast
 import pytest
 import torch
 
+from art.megatron.model_support.handlers.dsv4 import DSV4_HANDLER
+
 from ..artifacts import GitRepoState
 from . import hf_parity as hf_parity_module
 from . import hf_parity_worker as hf_parity_worker_module
+from .base_megatron_session import initialize_single_rank_process_group
 from .hf_parity import (
     HF_PARITY_OUTPUT_DIRNAME,
     HF_PARITY_PACKED_TENSORS,
@@ -23,12 +26,14 @@ from .hf_parity_worker import (
     _drop_gemma4_reparameterized_norm_grads,
     _filter_language_only_tensor_map,
     _hf_moe_router_key,
+    _hf_prefix_tree_forward_inputs,
     _hf_router_num_experts,
     _is_language_hf_param_name,
     _mapping_supports_derivative_parity,
     _maybe_modify_converted_hf_grad,
     _normalize_hf_grads_for_bridge,
     _normalize_hf_tensor_map_for_bridge,
+    _validate_distributed_process_env,
 )
 from .oracle_harness import DiskPackedTensorsSpec, OracleCaseConfig
 from .validation_spec import MinimalLayerCoverageReport
@@ -43,6 +48,38 @@ def test_build_parity_sample_indices_pads_with_none() -> None:
         num_sequences=2,
         global_grad_accumulation_sequences=4,
     ) == [0, 1, None, None]
+
+
+def test_hf_prefix_tree_inputs_block_siblings_and_repeat_positions() -> None:
+    model = SimpleNamespace(
+        config=SimpleNamespace(
+            layer_types=["full_attention", "sliding_attention"],
+            sliding_window=2,
+        )
+    )
+    micro = {
+        "group_ids": torch.tensor([0, 0, 1, 1, 2, 2]),
+        "parent_ids": torch.tensor([0, 0, 0, 0, 0, 0]),
+        "position_ids": torch.tensor([0, 1, 2, 3, 2, 3]),
+    }
+
+    attention_mask, position_ids = _hf_prefix_tree_forward_inputs(
+        model,
+        micro,
+        actual_len=6,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+
+    assert isinstance(attention_mask, dict)
+    masks = cast(dict[str, torch.Tensor], attention_mask)
+    full_allowed = masks["full_attention"][0, 0] == 0
+    sliding_allowed = masks["sliding_attention"][0, 0] == 0
+    assert position_ids.tolist() == [[0, 1, 2, 3, 2, 3]]
+    assert full_allowed[4, 1]
+    assert not full_allowed[4, 2]
+    assert not sliding_allowed[4, 0]
+    assert sliding_allowed[4, 1]
 
 
 def test_hf_parity_uses_train_inf_mismatch_settings() -> None:
@@ -150,6 +187,7 @@ def test_run_hf_parity_always_reruns_existing_report(
         "assess_minimal_layer_coverage",
         lambda **_: coverage,
     )
+    monkeypatch.setattr(hf_parity_module, "pinned_git_state", lambda _: _git_state())
     monkeypatch.setattr(
         hf_parity_module,
         "ensure_case_artifacts",
@@ -222,7 +260,11 @@ def test_run_hf_parity_subprocess_does_not_override_recompute(
         captured.update(kwargs)
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
-    monkeypatch.setattr(hf_parity_module.subprocess, "run", _fake_run)
+    monkeypatch.setattr(
+        hf_parity_module,
+        "subprocess",
+        SimpleNamespace(run=_fake_run),
+    )
 
     hf_parity_module.run_hf_parity_subprocess(request, tmp_path)
 
@@ -231,6 +273,91 @@ def test_run_hf_parity_subprocess_does_not_override_recompute(
     assert "ART_MEGATRON_RECOMPUTE_METHOD" not in env
     assert "ART_MEGATRON_RECOMPUTE_NUM_LAYERS" not in env
     assert "ART_MEGATRON_RECOMPUTE_MODULES" not in env
+
+
+def test_run_hf_parity_subprocess_does_not_allocate_tcp_rendezvous(
+    monkeypatch, tmp_path
+) -> None:
+    request = HfParityRunRequest(
+        git=_git_state(),
+        case_id="case-id",
+        case_config=OracleCaseConfig(base_model="Qwen/Qwen3.5-35B-A3B"),
+        packed_tensors=DiskPackedTensorsSpec(
+            dir=str(tmp_path / "packed"),
+            num_sequences=4,
+            sequence_length=8,
+        ),
+        output_dir=str(tmp_path),
+        coverage=MinimalLayerCoverageReport(
+            base_model="Qwen/Qwen3.5-35B-A3B",
+            model_key="qwen3_5_moe",
+            requested_num_layers=4,
+            recommended_min_layers=4,
+            covered=True,
+        ),
+    )
+    environments: list[dict[str, str]] = []
+    monkeypatch.delenv("MASTER_ADDR", raising=False)
+    monkeypatch.delenv("MASTER_PORT", raising=False)
+
+    def _fake_run(*args, **kwargs):
+        del args
+        environments.append(kwargs["env"])
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(
+        hf_parity_module,
+        "subprocess",
+        SimpleNamespace(run=_fake_run),
+    )
+
+    hf_parity_module.run_hf_parity_subprocess(request, tmp_path)
+
+    for env in environments:
+        assert "MASTER_ADDR" not in env
+        assert "MASTER_PORT" not in env
+        assert env["RANK"] == "0"
+        assert env["WORLD_SIZE"] == "1"
+        assert env["LOCAL_RANK"] == "0"
+        assert env["LOCAL_WORLD_SIZE"] == "1"
+
+
+def test_hf_parity_worker_requires_explicit_distributed_env(monkeypatch) -> None:
+    distributed_env = {
+        "RANK": "0",
+        "WORLD_SIZE": "1",
+        "LOCAL_RANK": "0",
+        "LOCAL_WORLD_SIZE": "1",
+    }
+    for name in distributed_env:
+        monkeypatch.delenv(name, raising=False)
+    with pytest.raises(RuntimeError, match="explicit distributed environment"):
+        _validate_distributed_process_env()
+
+    for name, value in distributed_env.items():
+        monkeypatch.setenv(name, value)
+    _validate_distributed_process_env()
+
+
+def test_single_rank_process_group_uses_an_in_process_store(monkeypatch) -> None:
+    store = object()
+    init_kwargs: dict[str, object] = {}
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: False)
+    monkeypatch.setattr(torch.distributed, "HashStore", lambda: store)
+    monkeypatch.setattr(
+        torch.distributed,
+        "init_process_group",
+        lambda **kwargs: init_kwargs.update(kwargs),
+    )
+
+    initialize_single_rank_process_group()
+
+    assert init_kwargs == {
+        "backend": "nccl",
+        "store": store,
+        "rank": 0,
+        "world_size": 1,
+    }
 
 
 def test_normalize_hf_tensor_map_for_bridge_adds_language_model_prefix() -> None:
@@ -274,6 +401,61 @@ def test_build_tensor_map_metric_rows_enforces_nonzero_per_tensor() -> None:
 
     assert by_param["all_zero"].pass_signal is False
     assert by_param["active"].pass_signal is True
+
+
+def test_grouped_tensor_map_rows_keep_individual_nonzero_gates() -> None:
+    rows = build_tensor_map_metric_rows(
+        phase="grads",
+        reference={"large": torch.ones(1000), "small": torch.ones(1)},
+        candidate={"large": torch.full((1000,), 1.01), "small": torch.full((1,), 2.0)},
+        group_by=lambda _: "joint_update",
+    )
+    by_param = {row.param: row for row in rows}
+
+    assert by_param["joint_update"].phase == "grads"
+    assert by_param["joint_update"].mean_abs_pct < 3.0
+    assert by_param["joint_update"].pass_signal is True
+    assert by_param["small"].phase == "grads_diagnostic"
+    assert by_param["small"].mean_abs_pct == 100.0
+    assert by_param["small"].pass_signal is True
+
+    zero_rows = build_tensor_map_metric_rows(
+        phase="grads",
+        reference={"active": torch.ones(2), "zero": torch.zeros(1)},
+        candidate={"active": torch.ones(2), "zero": torch.zeros(1)},
+        group_by=lambda _: "joint_update",
+    )
+    assert {row.param: row for row in zero_rows}["zero"].pass_signal is False
+
+
+@pytest.mark.parametrize(
+    ("param", "group"),
+    (
+        ("model.embed_tokens.weight", "embedding"),
+        ("lm_head.weight", "final_envelope"),
+        ("model.hc_head.hc_scale", "final_envelope"),
+        ("model.norm.weight", "final_envelope"),
+        ("model.layers.2.attn_hc.base", "model.layers.2.attention"),
+        (
+            "model.layers.2.self_attn.compressor.kv_proj.weight",
+            "model.layers.2.attention",
+        ),
+        ("model.layers.2.ffn_hc.fn", "model.layers.2.ffn"),
+        ("model.layers.2.mlp.experts.0.up_proj.weight", "model.layers.2.ffn"),
+        ("model.layers.2.input_layernorm.weight", "model.layers.2.input_norm"),
+        (
+            "model.layers.2.post_attention_layernorm.weight",
+            "model.layers.2.post_attention_norm",
+        ),
+    ),
+)
+def test_dsv4_hf_parity_gradient_groups(param: str, group: str) -> None:
+    assert DSV4_HANDLER.hf_parity_gradient_group(param) == group
+
+
+def test_dsv4_hf_parity_gradient_groups_reject_unknown_parameter() -> None:
+    with pytest.raises(ValueError, match="Unmapped DSV4 HF-parity gradient"):
+        DSV4_HANDLER.hf_parity_gradient_group("model.layers.0.unknown.weight")
 
 
 def test_language_hf_param_filter_keeps_text_and_drops_visual() -> None:
@@ -380,7 +562,7 @@ def test_build_megatron_runtime_uses_training_provider_bundle(
     assert configured_bundles == [(provider_bundle, False)]
     assert kwargs["print_env"] is False
     assert kwargs["trainable_parameter_mode"] == "base_model"
-    configured_provider = SimpleNamespace()
+    configured_provider = SimpleNamespace(_art_model_support_handler=SimpleNamespace())
     kwargs["provider_configure"](configured_provider)
     optimizer_config = kwargs["optimizer_config"]
     assert configured_provider.num_layers == request.case_config.num_layers

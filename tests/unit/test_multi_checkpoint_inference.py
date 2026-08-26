@@ -356,7 +356,7 @@ class TestUnslothServiceMaxLoras:
     async def test_prune_loaded_adapters_unloads_non_retained_steps(
         self, unsloth_service_class, monkeypatch
     ):
-        """UnslothService should unload old vLLM LoRA adapters like MegatronService."""
+        """UnslothService should unload old vLLM LoRA adapters after updates."""
         httpx = pytest.importorskip("httpx")
         UnslothService = unsloth_service_class
         calls = []
@@ -382,7 +382,7 @@ class TestUnslothServiceMaxLoras:
         service = UnslothService(
             model_name="test-model",
             base_model="meta-llama/Llama-3.1-8B",
-            config={"rollout_weights_mode": "lora"},
+            config={},
             output_dir="/tmp/test",
         )
         service._vllm_port = 8000

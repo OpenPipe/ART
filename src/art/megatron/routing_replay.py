@@ -10,7 +10,7 @@ import re
 import types
 from typing import TYPE_CHECKING, Any, Protocol
 
-from pydantic import BaseModel, ConfigDict, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 from safetensors.torch import load_file, save_file
 import torch
 
@@ -20,10 +20,11 @@ if TYPE_CHECKING:
     from art.preprocessing.pack import PackedTensors
 
 ROUTER_NAME_TOKEN = ".mlp.router"
-ROUTER_KEY_FORMAT_VERSION = "moe_routing_replay_v3"
+ROUTER_KEY_FORMAT_VERSION = "moe_routing_replay_v4"
 GLOBAL_TOKEN_UIDS_KEY = "global_token_uids"
 
 _ROUTER_LAYER_PATTERN = re.compile(r"decoder\.layers\.(?P<layer>\d+)\.mlp\.router$")
+_ROUTER_KEY_PATTERN = re.compile(r"^chunk_\d+\.layer_(?P<layer>\d+)\.mlp\.router$")
 _TRACE_CHUNK_PREFIX_PATTERN = re.compile(r"^chunk(?P<chunk>\d+)\.(?P<name>.+)$")
 logger = logging.getLogger(__name__)
 _ACTIVE_ROUTING_REPLAY_CONTROLLER: Any | None = None
@@ -31,6 +32,21 @@ _ACTIVE_ROUTING_REPLAY_CONTROLLER: Any | None = None
 
 def _active_routing_replay_controller() -> Any | None:
     return _ACTIVE_ROUTING_REPLAY_CONTROLLER
+
+
+@torch.compiler.disable
+def _routing_with_replay_boundary(
+    router_module: Any,
+    *args: Any,
+    **kwargs: Any,
+) -> Any:
+    controller = _active_routing_replay_controller()
+    if controller is not None:
+        controller._prepare_native_target_for_router(
+            router_module._art_routing_replay_router_key,
+            logits=args[0],
+        )
+    return router_module._art_routing_replay_original(*args, **kwargs)
 
 
 def _to_tensor_cpu_contiguous(
@@ -64,6 +80,115 @@ def build_router_key_from_module_name(*, chunk_index: int, module_name: str) -> 
     return f"chunk_{chunk_index:02d}.layer_{layer_index:04d}.mlp.router"
 
 
+def _router_key_for_model_module(
+    *,
+    module_name: str,
+    layer_prefixes: list[tuple[str, int]],
+    fallback_chunk_index: int | None,
+) -> str:
+    for prefix, global_layer_index in layer_prefixes:
+        if module_name.startswith(f"{prefix}."):
+            return f"chunk_00.layer_{global_layer_index:04d}.mlp.router"
+    if fallback_chunk_index is not None:
+        return build_router_key_from_module_name(
+            chunk_index=fallback_chunk_index,
+            module_name=module_name,
+        )
+    raise RuntimeError(
+        "PP/VPP routing replay requires every router to have an owning "
+        f"TransformerLayer; router='{module_name}'"
+    )
+
+
+def _global_layer_prefixes(chunk: Any) -> list[tuple[str, int]]:
+    from megatron.core.transformer.transformer_layer import TransformerLayer
+
+    prefixes: dict[str, int] = {}
+    for module_name, module in chunk.named_modules():
+        original = getattr(module, "_orig_mod", None)
+        layer = (
+            original
+            if isinstance(original, TransformerLayer)
+            else module
+            if isinstance(module, TransformerLayer)
+            else None
+        )
+        if layer is not None:
+            prefixes[module_name] = int(layer.layer_number) - 1
+    return sorted(prefixes.items(), key=lambda item: len(item[0]), reverse=True)
+
+
+def prepare_moe_routing_replay_boundaries(
+    model_chunks: list[Any],
+    *,
+    pipeline_model: bool | None = None,
+) -> dict[str, dict[str, Any]]:
+    """Install stable eager router boundaries before model compilation."""
+    if pipeline_model is None:
+        from megatron.core import parallel_state as ps
+
+        pipeline_model = len(model_chunks) > 1 or (
+            ps.model_parallel_is_initialized()
+            and int(ps.get_pipeline_model_parallel_world_size()) > 1
+        )
+    bindings: dict[str, dict[str, Any]] = {}
+    for chunk_index, chunk in enumerate(model_chunks):
+        layer_prefixes = _global_layer_prefixes(chunk)
+        for module_name, module in chunk.named_modules():
+            if ROUTER_NAME_TOKEN not in module_name or not hasattr(module, "routing"):
+                continue
+            router_key = _router_key_for_model_module(
+                module_name=module_name,
+                layer_prefixes=layer_prefixes,
+                fallback_chunk_index=None if pipeline_model else chunk_index,
+            )
+            if router_key in bindings:
+                raise RuntimeError(
+                    "Multiple local model chunks own the same replay router: "
+                    f"router_key='{router_key}'"
+                )
+            config = getattr(module, "config", None)
+            if bool(getattr(config, "moe_router_fusion", False)):
+                raise RuntimeError(
+                    "MoE routing replay requires moe_router_fusion=False because "
+                    "Megatron Core fused routing bypasses RouterReplay: "
+                    f"router_key='{router_key}'"
+                )
+            router_replay = getattr(module, "router_replay", None)
+            if router_replay is None:
+                raise RuntimeError(
+                    "MoE routing replay requires provider.moe_enable_routing_replay=True "
+                    "before model construction: "
+                    f"router_key='{router_key}'"
+                )
+            installed_key = getattr(
+                module, "_art_routing_replay_router_key", router_key
+            )
+            if installed_key != router_key:
+                raise RuntimeError(
+                    "Routing replay boundary key changed after model construction: "
+                    f"{installed_key!r} != {router_key!r}"
+                )
+            if not getattr(module, "_art_routing_replay_target_patched", False):
+                module._art_routing_replay_original = module.routing
+                module._art_routing_replay_router_key = router_key
+                module.routing = types.MethodType(_routing_with_replay_boundary, module)
+                module._art_routing_replay_target_patched = True
+            bindings[router_key] = {
+                "module": module,
+                "router_replay": router_replay,
+                "sequence_parallel": bool(getattr(config, "sequence_parallel", False)),
+                "context_parallel_size": int(
+                    getattr(config, "context_parallel_size", 1)
+                ),
+                "topk": int(getattr(module, "topk")),
+                "chunk_index": chunk_index,
+                "layer_index": _global_layer_from_router_key(router_key),
+                "num_experts": int(getattr(config, "num_moe_experts", 0) or 0),
+            }
+    return bindings
+
+
 def build_router_key_from_trace_name(trace_module_name: str) -> str:
     chunk_match = _TRACE_CHUNK_PREFIX_PATTERN.match(trace_module_name)
     if chunk_match is None:
@@ -75,6 +200,13 @@ def build_router_key_from_trace_name(trace_module_name: str) -> str:
         chunk_index=int(chunk_match.group("chunk")),
         module_name=chunk_match.group("name"),
     )
+
+
+def _global_layer_from_router_key(router_key: str) -> int:
+    match = _ROUTER_KEY_PATTERN.fullmatch(router_key)
+    if match is None:
+        raise RuntimeError(f"Invalid routing replay router key: {router_key!r}")
+    return int(match.group("layer"))
 
 
 class ParallelTopology(BaseModel):
@@ -250,7 +382,10 @@ class MoeRoutingReplayBundle(BaseModel):
     num_steps: int
     max_topk: int
     router_keys: list[str]
-    steps: dict[int, StepRoutes]
+    steps: dict[int, StepRoutes] = Field(default_factory=dict)
+    expert_indices: torch.Tensor | None = None
+    num_experts: int | None = None
+    global_grad_accumulation_sequences: int | None = None
 
     @model_validator(mode="after")
     def _validate(self) -> "MoeRoutingReplayBundle":
@@ -267,6 +402,14 @@ class MoeRoutingReplayBundle(BaseModel):
             raise RuntimeError("router_keys cannot be empty")
         if len(set(self.router_keys)) != len(self.router_keys):
             raise RuntimeError("router_keys must be unique")
+        if self.expert_indices is not None:
+            self._validate_tensor_storage()
+            return self
+        if (
+            self.num_experts is not None
+            or self.global_grad_accumulation_sequences is not None
+        ):
+            raise RuntimeError("Legacy replay bundles cannot carry tensor metadata")
         expected_steps = set(range(self.num_steps))
         if set(self.steps) != expected_steps:
             raise RuntimeError(
@@ -290,6 +433,41 @@ class MoeRoutingReplayBundle(BaseModel):
                         )
         return self
 
+    @property
+    def tensor_backed(self) -> bool:
+        return self.expert_indices is not None
+
+    def _validate_tensor_storage(self) -> None:
+        indices = self.expert_indices
+        assert indices is not None
+        if self.steps:
+            raise RuntimeError("Tensor-backed replay cannot also contain route calls")
+        if indices.device.type != "cpu" or not indices.is_contiguous():
+            raise RuntimeError("Tensor-backed replay requires contiguous CPU storage")
+        if indices.ndim != 4 or min(map(int, indices.shape)) <= 0:
+            raise RuntimeError(
+                "Tensor-backed replay requires [layer, row, position, topk]"
+            )
+        num_experts = int(self.num_experts or 0)
+        expected_dtype = torch.uint8 if num_experts <= 256 else torch.uint16
+        if not 1 <= num_experts <= 65_536 or indices.dtype != expected_dtype:
+            raise RuntimeError("Tensor-backed replay expert count and dtype disagree")
+        accumulation = int(self.global_grad_accumulation_sequences or 0)
+        if accumulation <= 0:
+            raise RuntimeError("Tensor-backed replay requires positive accumulation")
+        layers, sequences, _sequence_length, topk = map(int, indices.shape)
+        if (
+            layers != len(self.router_keys)
+            or topk != self.max_topk
+            or self.num_steps != math.ceil(sequences / accumulation)
+        ):
+            raise RuntimeError("Tensor-backed replay metadata disagrees with its shape")
+        expected_keys = [
+            f"chunk_00.layer_{layer:04d}.mlp.router" for layer in range(layers)
+        ]
+        if self.router_keys != expected_keys:
+            raise RuntimeError("Tensor-backed replay router keys are not layer-major")
+
     @classmethod
     def from_dir(cls, bundle_dir: str | Path) -> "MoeRoutingReplayBundle":
         base_dir = Path(bundle_dir)
@@ -304,6 +482,24 @@ class MoeRoutingReplayBundle(BaseModel):
                 f"{manifest.get('format_version')!r}; expected "
                 f"{ROUTER_KEY_FORMAT_VERSION!r}"
             )
+        if manifest.get("storage") == "layer_major":
+            loaded = load_file(str(base_dir / manifest["file"]))
+            indices = loaded["expert_indices"].detach().clone().contiguous()
+            del loaded
+            return cls(
+                format_version=manifest["format_version"],
+                topology=ParallelTopology.model_validate(manifest["topology"]),
+                num_steps=int(manifest["num_steps"]),
+                max_topk=int(manifest["max_topk"]),
+                router_keys=list(manifest["router_keys"]),
+                expert_indices=indices,
+                num_experts=int(manifest["num_experts"]),
+                global_grad_accumulation_sequences=int(
+                    manifest["global_grad_accumulation_sequences"]
+                ),
+            )
+        if manifest.get("storage") != "calls":
+            raise RuntimeError("Unknown MoE routing replay storage format")
 
         steps: dict[int, StepRoutes] = {}
         for step_index_str, step_info in manifest["steps"].items():
@@ -364,6 +560,28 @@ class MoeRoutingReplayBundle(BaseModel):
     def to_dir(self, bundle_dir: str | Path) -> None:
         base_dir = Path(bundle_dir)
         base_dir.mkdir(parents=True, exist_ok=True)
+        if self.tensor_backed:
+            assert self.expert_indices is not None
+            tensor_file = "layer_major.safetensors"
+            save_file(
+                {"expert_indices": self.expert_indices}, str(base_dir / tensor_file)
+            )
+            manifest = {
+                "format_version": self.format_version,
+                "storage": "layer_major",
+                "file": tensor_file,
+                "topology": self.topology.model_dump(mode="json"),
+                "num_steps": self.num_steps,
+                "max_topk": self.max_topk,
+                "router_keys": self.router_keys,
+                "num_experts": self.num_experts,
+                "global_grad_accumulation_sequences": (
+                    self.global_grad_accumulation_sequences
+                ),
+            }
+            with (base_dir / "manifest.json").open("w", encoding="utf-8") as handle:
+                json.dump(manifest, handle, indent=2, sort_keys=True)
+            return
         manifest_steps: dict[str, Any] = {}
 
         for step_index, step_routes in sorted(self.steps.items()):
@@ -405,6 +623,7 @@ class MoeRoutingReplayBundle(BaseModel):
 
         manifest = {
             "format_version": self.format_version,
+            "storage": "calls",
             "topology": self.topology.model_dump(mode="json"),
             "num_steps": self.num_steps,
             "max_topk": self.max_topk,
@@ -429,127 +648,22 @@ def build_moe_routing_replay_bundle_from_packed_tensors(
             "global_grad_accumulation_sequences must be positive when building "
             f"MoE routing replay bundles, got {global_grad_accumulation_sequences}"
         )
-    expert_indices = _to_tensor_cpu_contiguous(
-        routing_replay.expert_indices, dtype=torch.int32
-    )
-    token_mask = _to_tensor_cpu_contiguous(routing_replay.token_mask, dtype=torch.bool)
-    num_experts = int(routing_replay.num_experts)
-    num_sequences = int(expert_indices.shape[0])
-    sequence_length = int(expert_indices.shape[1])
-    num_layers = int(expert_indices.shape[2])
-    topk = int(expert_indices.shape[3])
+    expert_indices = routing_replay.expert_indices
+    num_layers, num_sequences, _sequence_length, topk = map(int, expert_indices.shape)
 
     router_keys = [
         f"chunk_00.layer_{layer_index:04d}.mlp.router"
         for layer_index in range(num_layers)
     ]
-    steps: dict[int, StepRoutes] = {}
     num_steps = math.ceil(num_sequences / global_grad_accumulation_sequences)
-    global_token_uids = torch.arange(sequence_length, dtype=torch.int64)
-    all_row_positions = torch.arange(sequence_length, dtype=torch.long)
-    for step_index in range(num_steps):
-        start = step_index * global_grad_accumulation_sequences
-        end = start + global_grad_accumulation_sequences
-        calls_by_router: dict[str, dict[int, RouterCallRoute]] = {
-            router_key: {} for router_key in router_keys
-        }
-        for offset, sample_index in enumerate(range(start, end)):
-            if sample_index < num_sequences:
-                routes_by_layer = _sample_routes_by_layer(
-                    expert_indices=expert_indices,
-                    token_mask=token_mask,
-                    sample_index=sample_index,
-                    num_experts=num_experts,
-                    topk=topk,
-                )
-                sample_route_index: int | None = sample_index
-                micro_slot: int | None = None
-            else:
-                routes_by_layer = _synthetic_replay_layer_rows(
-                    row_positions=all_row_positions,
-                    layer_seeds=_layer_replay_seeds(
-                        num_layers=num_layers,
-                        base_seed=(step_index + 1) * 1_000_003 + (offset + 1) * 9_176,
-                    ),
-                    num_experts=num_experts,
-                    topk=topk,
-                    dtype=expert_indices.dtype,
-                )
-                sample_route_index = None
-                micro_slot = offset
-            for layer_index, router_key in enumerate(router_keys):
-                calls_by_router[router_key][offset] = _full_mask_router_call_route(
-                    expert_indices=routes_by_layer[layer_index],
-                    num_experts=num_experts,
-                    sample_index=sample_route_index,
-                    micro_slot=micro_slot,
-                )
-        routers = {
-            router_key: StepRouterRoutes.model_construct(calls=calls)
-            for router_key, calls in calls_by_router.items()
-        }
-        steps[step_index] = StepRoutes.model_construct(
-            routers=routers,
-            global_token_uids=global_token_uids,
-        )
-    return MoeRoutingReplayBundle.model_construct(
+    return MoeRoutingReplayBundle(
         topology=topology or parallel_topology_from_env(),
         num_steps=num_steps,
         max_topk=topk,
         router_keys=router_keys,
-        steps=steps,
-    )
-
-
-def _sample_routes_by_layer(
-    *,
-    expert_indices: torch.Tensor,
-    token_mask: torch.Tensor,
-    sample_index: int,
-    num_experts: int,
-    topk: int,
-) -> torch.Tensor:
-    routes_by_layer = expert_indices[sample_index].permute(1, 0, 2).contiguous()
-    missing_positions = torch.nonzero(~token_mask[sample_index], as_tuple=False).view(
-        -1
-    )
-    if int(missing_positions.numel()) == 0:
-        return routes_by_layer
-    # Megatron Core RouterReplay requires concrete top-k ids. The packer leaves
-    # only padding and terminal query rows missing, so materialize deterministic
-    # values for those rows without rescanning the bundle here.
-    routes_by_layer[:, missing_positions, :] = _synthetic_replay_layer_rows(
-        row_positions=missing_positions,
-        layer_seeds=_layer_replay_seeds(
-            num_layers=int(expert_indices.shape[2]),
-            base_seed=(sample_index + 1) * 1_000_003,
-        ),
-        num_experts=num_experts,
-        topk=topk,
-        dtype=expert_indices.dtype,
-    )
-    return routes_by_layer
-
-
-def _layer_replay_seeds(*, num_layers: int, base_seed: int) -> torch.Tensor:
-    return base_seed + (torch.arange(num_layers, dtype=torch.long) + 1) * 97_003
-
-
-def _full_mask_router_call_route(
-    *,
-    expert_indices: torch.Tensor,
-    num_experts: int,
-    sample_index: int | None = None,
-    micro_slot: int | None = None,
-) -> RouterCallRoute:
-    return RouterCallRoute.model_construct(
         expert_indices=expert_indices,
-        expert_probs=None,
-        expert_mask=None,
-        num_experts=int(num_experts),
-        sample_index=None if sample_index is None else int(sample_index),
-        micro_slot=None if micro_slot is None else int(micro_slot),
-        rank_token_counts=None,
+        num_experts=routing_replay.num_experts,
+        global_grad_accumulation_sequences=global_grad_accumulation_sequences,
     )
 
 
@@ -562,7 +676,24 @@ def parallel_topology_from_env() -> ParallelTopology:
     )
     cp = _env_int("ART_MEGATRON_CONTEXT_PARALLEL_SIZE", 1)
     pp = _env_int("ART_MEGATRON_PIPELINE_MODEL_PARALLEL_SIZE", 1)
-    return ParallelTopology(tp=tp, ep=ep, etp=etp, dp=1, sp=tp > 1, cp=cp, pp=pp)
+    vpp = _env_int("ART_MEGATRON_VIRTUAL_PIPELINE_MODEL_PARALLEL_SIZE", 1)
+    world_size = _env_int("WORLD_SIZE", tp * cp * pp)
+    model_parallel_size = tp * cp * pp
+    if world_size % model_parallel_size:
+        raise RuntimeError(
+            f"WORLD_SIZE={world_size} is not divisible by TP*CP*PP="
+            f"{model_parallel_size}"
+        )
+    return ParallelTopology(
+        tp=tp,
+        ep=ep,
+        etp=etp,
+        dp=world_size // model_parallel_size,
+        sp=tp > 1,
+        cp=cp,
+        pp=pp,
+        vpp=vpp,
+    )
 
 
 def _env_int(name: str, default: int) -> int:
@@ -711,33 +842,41 @@ class MoeRoutingReplayController:
         self._device = torch.device(device) if device is not None else None
 
         self._active_step_index: int | None = None
+        self._active_step_samples: list[int | None] = []
         self._active_sample_index: int | None = None
         self._active_step_routes: StepRoutes | None = None
         self._active_micro_order: int | None = None
+        self._active_chunk_index: int | None = None
         self._router_call_cursors: dict[str, int] = {}
         self._router_call_sequences: dict[str, list[int]] = {}
         self._router_last_call_indices: dict[str, int] = {}
         self._router_last_call_keys: dict[str, tuple[str, int] | None] = {}
+        self._router_consumed_calls: dict[str, dict[tuple[str, int], int]] = {}
         self._router_reuse_counts: dict[str, int] = {}
         self._global_uid_to_row_index: dict[int, int] = {}
         self._global_uid_dense_start: int | None = None
         self._global_uid_count: int = 0
         self._local_router_keys: set[str] = set()
+        self._local_router_keys_by_chunk: dict[int, set[str]] = {}
         self._router_bindings: dict[str, dict[str, Any]] = {}
+        self._runtime_topology: ParallelTopology | None = None
+        self._expect_recompute_reuse = False
         self._prepared_uid_sets: dict[str, torch.Tensor] = {}
         self._prepared_targets: dict[tuple[str, str, int], torch.Tensor] = {}
         self._router_prepared_target_keys: dict[str, tuple[str, int]] = {}
-        self._target_buffers: dict[tuple[str, str, int], torch.Tensor] = {}
+        self._step_targets: dict[tuple[str, str, int], torch.Tensor] = {}
+        self._step_target_ready_events: dict[
+            tuple[str, str, int], torch.cuda.Event
+        ] = {}
         self._host_target_staging: list[torch.Tensor] = []
         self._target_copy_stream: torch.cuda.Stream | None = None
-        self._target_copy_event: torch.cuda.Event | None = None
-        self._target_copy_waited: bool = True
         self._active_token_uid_key: str | None = None
 
     def update_bundle(self, *, bundle: MoeRoutingReplayBundle, strict: bool) -> None:
         self.bundle = bundle
         self.strict = strict
         self.clear_replay_state()
+        self._validate_runtime_topology()
         if self.strict:
             missing = sorted(
                 router_key
@@ -749,6 +888,7 @@ class MoeRoutingReplayController:
                     "Router keys from model are missing in replay bundle: "
                     f"router_keys={missing}"
                 )
+        self._validate_local_routes()
 
     def clear_replay_state(self) -> None:
         self._clear_native_router_replay_state()
@@ -765,147 +905,174 @@ class MoeRoutingReplayController:
         global _ACTIVE_ROUTING_REPLAY_CONTROLLER
         if self._router_bindings:
             return
-        for chunk_index, chunk in enumerate(model_chunks):
-            for module_name, module in chunk.named_modules():
-                if ROUTER_NAME_TOKEN not in module_name or not hasattr(
-                    module, "routing"
-                ):
-                    continue
-                router_key = build_router_key_from_module_name(
-                    chunk_index=chunk_index,
-                    module_name=module_name,
+        pipeline_model = self.bundle.topology.pp > 1 or len(model_chunks) > 1
+        bindings = prepare_moe_routing_replay_boundaries(
+            model_chunks,
+            pipeline_model=pipeline_model,
+        )
+        self._local_router_keys_by_chunk = {
+            chunk_index: set() for chunk_index in range(len(model_chunks))
+        }
+        for router_key, binding in bindings.items():
+            chunk_index = int(binding["chunk_index"])
+            if self.strict and router_key not in self.bundle.router_keys:
+                raise RuntimeError(
+                    "Router key from model is missing in replay bundle: "
+                    f"router_key='{router_key}'"
                 )
-                if self.strict and router_key not in self.bundle.router_keys:
-                    raise RuntimeError(
-                        "Router key from model is missing in replay bundle: "
-                        f"router_key='{router_key}'"
-                    )
-                config = getattr(module, "config", None)
-                if bool(getattr(config, "moe_router_fusion", False)):
-                    raise RuntimeError(
-                        "MoE routing replay requires moe_router_fusion=False because "
-                        "Megatron Core fused routing bypasses RouterReplay: "
-                        f"router_key='{router_key}'"
-                    )
-                router_replay = getattr(module, "router_replay", None)
-                if router_replay is None:
-                    raise RuntimeError(
-                        "MoE routing replay requires provider.moe_enable_routing_replay=True "
-                        "before model construction: "
-                        f"router_key='{router_key}'"
-                    )
-                if getattr(router_replay, "_art_routing_replay_patched", False):
-                    raise RuntimeError(
-                        "RouterReplay instance is already patched: "
-                        f"router_key='{router_key}'"
-                    )
-                if getattr(module, "_art_routing_replay_target_patched", False):
-                    raise RuntimeError(
-                        "Router module routing method is already patched: "
-                        f"router_key='{router_key}'"
-                    )
-
-                sequence_parallel = bool(getattr(config, "sequence_parallel", False))
-                context_parallel_size = int(getattr(config, "context_parallel_size", 1))
-                topk = int(getattr(module, "topk"))
-                original_routing = module.routing
-
-                def _prepare_native_target_for_bound_router(
-                    _controller: MoeRoutingReplayController = self,
-                    _router_key: str = router_key,
-                ) -> None:
-                    _controller._prepare_native_target_for_router(_router_key)
-
-                prepare_native_target = torch.compiler.disable(
-                    _prepare_native_target_for_bound_router
-                )
-
-                def _hash_routing_with_replay_target(
-                    router_module: Any,
-                    *args: Any,
-                    _original_routing: Any = original_routing,
-                    _prepare_native_target: Any = prepare_native_target,
-                    **kwargs: Any,
-                ) -> Any:
-                    del router_module
-                    _prepare_native_target()
-                    return _original_routing(*args, **kwargs)
-
-                def _moe_routing_with_replay_target(
-                    router_module: Any,
-                    *args: Any,
-                    _original_routing: Any = original_routing,
-                    _prepare_native_target: Any = prepare_native_target,
-                    **kwargs: Any,
-                ) -> Any:
-                    del router_module
-                    _prepare_native_target()
-                    return _original_routing(*args, **kwargs)
-
-                def _routing_with_replay_target(
-                    router_module: Any,
-                    *args: Any,
-                    _original_routing: Any = original_routing,
-                    _prepare_native_target: Any = prepare_native_target,
-                    **kwargs: Any,
-                ) -> Any:
-                    del router_module
-                    # Target selection mutates Python replay cursors and Megatron's
-                    # RouterReplay state; keep it out of Dynamo while preserving
-                    # compiled routing compute below.
-                    _prepare_native_target()
-                    return _original_routing(*args, **kwargs)
-
-                original_routing_name = getattr(
-                    getattr(original_routing, "__func__", None), "__name__", ""
-                )
-                if original_routing_name == "_hash_routing":
-                    routing_wrapper = _hash_routing_with_replay_target
-                elif original_routing_name == "_moe_routing":
-                    routing_wrapper = _moe_routing_with_replay_target
-                else:
-                    routing_wrapper = _routing_with_replay_target
-                # Routing replay mutates Python replay cursors and Megatron's
-                # RouterReplay target state immediately before routing consumes
-                # it. Keep the whole patched routing boundary eager so Dynamo
-                # cannot specialize or reorder around that mutable replay state.
-                module.routing = types.MethodType(
-                    torch.compiler.disable(routing_wrapper),
-                    module,
-                )
-                setattr(module, "_art_routing_replay_target_patched", True)
-                self._router_bindings[router_key] = {
-                    "module": module,
-                    "original_routing": original_routing,
-                    "router_replay": router_replay,
-                    "sequence_parallel": sequence_parallel,
-                    "context_parallel_size": context_parallel_size,
-                    "topk": topk,
-                }
-                self._local_router_keys.add(router_key)
+            self._router_bindings[router_key] = binding
+            self._local_router_keys.add(router_key)
+            self._local_router_keys_by_chunk[chunk_index].add(router_key)
+        self._runtime_topology = self._runtime_parallel_topology(model_chunks)
+        self._validate_runtime_topology()
+        self._validate_local_routes()
+        self._expect_recompute_reuse = bool(self._router_bindings) and all(
+            getattr(binding["module"].config, "recompute_granularity", None) == "full"
+            and getattr(binding["module"].config, "recompute_method", None) == "uniform"
+            and int(getattr(binding["module"].config, "recompute_num_layers", 0) or 0)
+            == 1
+            for binding in self._router_bindings.values()
+        )
         _ACTIVE_ROUTING_REPLAY_CONTROLLER = self
 
     def remove_router_patches(self) -> None:
         global _ACTIVE_ROUTING_REPLAY_CONTROLLER
         if _ACTIVE_ROUTING_REPLAY_CONTROLLER is self:
             _ACTIVE_ROUTING_REPLAY_CONTROLLER = None
-        for binding in self._router_bindings.values():
-            module = binding["module"]
-            original_routing = binding.get("original_routing")
-            if original_routing is not None:
-                module.routing = original_routing
-            if hasattr(module, "_art_routing_replay_target_patched"):
-                delattr(module, "_art_routing_replay_target_patched")
         self._router_bindings.clear()
         self._local_router_keys.clear()
-        self._target_buffers.clear()
+        self._local_router_keys_by_chunk.clear()
+        self._runtime_topology = None
+        self._expect_recompute_reuse = False
+        self._step_targets.clear()
         self._clear_native_router_replay_state()
         self._reset_step_state()
 
-    def begin_micro(self, sample_index: int | None, micro_order: int) -> None:
+    @staticmethod
+    def _runtime_parallel_topology(
+        model_chunks: list[Any],
+    ) -> ParallelTopology | None:
+        if not torch.distributed.is_initialized():  # ty: ignore[possibly-missing-attribute]
+            return None
+        from megatron.core import parallel_state as ps
+        from megatron.core.utils import get_model_config
+
+        sequence_parallel = {
+            bool(getattr(get_model_config(chunk), "sequence_parallel", False))
+            for chunk in model_chunks
+        }
+        if len(sequence_parallel) != 1:
+            raise RuntimeError(
+                "Model chunks disagree on sequence_parallel: "
+                f"values={sorted(sequence_parallel)}"
+            )
+        return ParallelTopology(
+            tp=int(ps.get_tensor_model_parallel_world_size()),
+            ep=int(ps.get_expert_model_parallel_world_size()),
+            etp=int(ps.get_expert_tensor_parallel_world_size()),
+            dp=int(ps.get_data_parallel_world_size()),
+            sp=sequence_parallel.pop(),
+            cp=int(ps.get_context_parallel_world_size()),
+            pp=int(ps.get_pipeline_model_parallel_world_size()),
+            vpp=int(ps.get_virtual_pipeline_model_parallel_world_size() or 1),
+        )
+
+    def _validate_runtime_topology(self) -> None:
+        if (
+            self._runtime_topology is not None
+            and self.bundle.topology != self._runtime_topology
+        ):
+            raise RuntimeError(
+                "Routing replay bundle topology differs from the active trainer: "
+                f"bundle={self.bundle.topology.model_dump()}, "
+                f"runtime={self._runtime_topology.model_dump()}"
+            )
+
+    def _validate_local_routes(self) -> None:
+        if self.bundle.tensor_backed:
+            assert self.bundle.expert_indices is not None
+            for router_key, binding in self._router_bindings.items():
+                if router_key not in self.bundle.router_keys:
+                    continue
+                model_num_experts = int(binding["num_experts"])
+                if model_num_experts and model_num_experts != self.bundle.num_experts:
+                    raise RuntimeError(
+                        "Replay expert count does not match the model router: "
+                        f"router='{router_key}', replay={self.bundle.num_experts}, "
+                        f"model={model_num_experts}"
+                    )
+                if int(binding["topk"]) != self.bundle.max_topk:
+                    raise RuntimeError(
+                        "Replay route topk does not match Megatron router topk: "
+                        f"router='{router_key}', replay={self.bundle.max_topk}, "
+                        f"router_topk={binding['topk']}"
+                    )
+                if int(binding["layer_index"]) >= int(
+                    self.bundle.expert_indices.shape[0]
+                ):
+                    raise RuntimeError(
+                        f"Replay has no global layer for router '{router_key}'"
+                    )
+            return
+        for router_key, binding in self._router_bindings.items():
+            if router_key not in self.bundle.router_keys:
+                continue
+            model_num_experts = int(binding["num_experts"])
+            for step_index, step in self.bundle.steps.items():
+                for call_index, route in step.routers[router_key].calls.items():
+                    selected = (
+                        route.expert_indices
+                        if route.expert_mask is None
+                        else route.expert_indices[route.expert_mask]
+                    )
+                    if int(selected.numel()) == 0:
+                        continue
+                    minimum = int(selected.min().item())
+                    maximum = int(selected.max().item())
+                    limit = model_num_experts or int(route.num_experts)
+                    if minimum < 0 or maximum >= limit:
+                        raise RuntimeError(
+                            "Replay route expert id is outside the model router: "
+                            f"step={step_index}, router='{router_key}', "
+                            f"call={call_index}, range=[{minimum}, {maximum}], "
+                            f"num_experts={limit}"
+                        )
+
+    def _active_local_router_keys(self) -> set[str]:
+        if self._active_chunk_index is None:
+            raise RuntimeError("Routing replay chunk is not active")
+        try:
+            return self._local_router_keys_by_chunk[self._active_chunk_index]
+        except KeyError as exc:
+            raise RuntimeError(
+                f"Routing replay received unknown model chunk {self._active_chunk_index}"
+            ) from exc
+
+    def begin_micro(
+        self,
+        sample_index: int | None,
+        micro_order: int,
+        chunk_index: int = 0,
+    ) -> None:
+        if self._active_step_index is None:
+            raise RuntimeError("Routing replay begin_micro called before set_step")
+        if self.bundle.tensor_backed:
+            if not 0 <= micro_order < len(self._active_step_samples):
+                raise RuntimeError(
+                    f"Routing replay micro order is out of range: {micro_order}"
+                )
+            expected_sample = self._active_step_samples[micro_order]
+            if sample_index != expected_sample:
+                raise RuntimeError(
+                    "Routing replay micro sample differs from set_step: "
+                    f"micro={micro_order}, expected={expected_sample}, "
+                    f"actual={sample_index}"
+                )
         self._active_sample_index = sample_index
         self._active_micro_order = micro_order
-        for router_key in sorted(self._local_router_keys):
+        self._active_chunk_index = chunk_index
+        self._reset_staged_micro_targets()
+        for router_key in sorted(self._active_local_router_keys()):
             call_indices = self._active_micro_call_indices(router_key)
             if len(call_indices) != 1:
                 raise RuntimeError(
@@ -925,7 +1092,7 @@ class MoeRoutingReplayController:
         *,
         active_token_uid_key: str = "attention",
     ) -> None:
-        if self._active_step_routes is None or self._active_micro_order is None:
+        if self._active_step_index is None or self._active_micro_order is None:
             raise RuntimeError(
                 "Routing replay target staging requires set_step and begin_micro"
             )
@@ -943,11 +1110,13 @@ class MoeRoutingReplayController:
                 f"key='{active_token_uid_key}', prepared={sorted(prepared_uid_sets)}"
             )
         self._prepared_uid_sets = prepared_uid_sets
-        if not self._local_router_keys:
+        active_router_keys = self._active_local_router_keys()
+        if not active_router_keys:
             self._active_token_uid_key = active_token_uid_key
             return
+        new_target_keys: list[tuple[str, str, int]] = []
         for token_uid_key, token_uids in prepared_uid_sets.items():
-            for router_key in sorted(self._local_router_keys):
+            for router_key in sorted(active_router_keys):
                 call_indices = self._active_micro_call_indices(router_key)
                 if len(call_indices) != 1:
                     raise RuntimeError(
@@ -956,6 +1125,11 @@ class MoeRoutingReplayController:
                     )
                 call_index = call_indices[0]
                 binding = self._router_bindings[router_key]
+                target_key = (token_uid_key, router_key, call_index)
+                cached_target = self._step_targets.get(target_key)
+                if cached_target is not None:
+                    self._prepared_targets[target_key] = cached_target
+                    continue
                 router_token_uids = self._token_uids_for_router_binding(
                     token_uids,
                     sequence_parallel=bool(binding["sequence_parallel"]),
@@ -966,14 +1140,16 @@ class MoeRoutingReplayController:
                     explicit_uids=router_token_uids,
                 )
                 self._stage_prepared_target(
-                    target_key=(token_uid_key, router_key, call_index),
+                    target_key=target_key,
                     target_cpu=target_cpu,
                 )
-        self._record_target_copy_event()
+                self._step_targets[target_key] = self._prepared_targets[target_key]
+                new_target_keys.append(target_key)
+        self._record_target_copy_event(new_target_keys)
         self.set_active_token_uid_key(active_token_uid_key)
 
     def set_active_token_uid_key(self, token_uid_key: str) -> None:
-        if not self._local_router_keys:
+        if not self._active_local_router_keys():
             self._active_token_uid_key = token_uid_key
             return
         prepared_keys = {
@@ -1023,6 +1199,14 @@ class MoeRoutingReplayController:
         step_index: int,
         sample_index: int | list[int | None] | None,
     ) -> None:
+        if self.bundle.tensor_backed:
+            self._set_tensor_step(step_index=step_index, sample_index=sample_index)
+            RouterReplay, RouterReplayAction = _router_replay_classes()
+            RouterReplay.clear_global_indices()
+            RouterReplay.set_global_router_replay_action(
+                RouterReplayAction.REPLAY_FORWARD
+            )
+            return
         if step_index not in self.bundle.steps:
             raise RuntimeError(
                 f"Replay bundle missing step_index={step_index}. "
@@ -1036,12 +1220,17 @@ class MoeRoutingReplayController:
             else sample_index
         )
         self._active_micro_order = None
+        self._active_chunk_index = None
         self._active_step_routes = step_routes
         self._reset_staged_micro_targets()
+        self._step_targets = {}
+        self._step_target_ready_events = {}
+        self._host_target_staging = []
         self._router_call_cursors = {}
         self._router_call_sequences = {}
         self._router_last_call_indices = {}
         self._router_last_call_keys = {}
+        self._router_consumed_calls = {}
         self._router_reuse_counts = {}
         self._global_uid_count = int(step_routes.global_token_uids.numel())
         self._global_uid_dense_start = self._dense_global_uid_start(
@@ -1079,6 +1268,7 @@ class MoeRoutingReplayController:
                         f"route_topk={route.max_topk}, router_topk={binding_topk}"
                     )
             self._router_call_cursors[router_key] = 0
+            self._router_consumed_calls[router_key] = {}
             self._router_call_sequences[router_key] = self._build_call_sequence(
                 router_key=router_key,
                 sample_index=sample_index,
@@ -1087,8 +1277,46 @@ class MoeRoutingReplayController:
         RouterReplay.clear_global_indices()
         RouterReplay.set_global_router_replay_action(RouterReplayAction.REPLAY_FORWARD)
 
-    def finalize_step(self) -> None:
-        if self._active_step_routes is None:
+    def _set_tensor_step(
+        self,
+        *,
+        step_index: int,
+        sample_index: int | list[int | None] | None,
+    ) -> None:
+        if not 0 <= step_index < self.bundle.num_steps:
+            raise RuntimeError(
+                f"Replay bundle missing step_index={step_index}. "
+                f"Available steps={list(range(self.bundle.num_steps))}"
+            )
+        samples = sample_index if isinstance(sample_index, list) else [sample_index]
+        if not samples:
+            raise RuntimeError("Routing replay step requires at least one microbatch")
+        assert self.bundle.expert_indices is not None
+        accumulation = int(self.bundle.global_grad_accumulation_sequences or 0)
+        start = step_index * accumulation
+        stop = min(start + accumulation, int(self.bundle.expert_indices.shape[1]))
+        real_samples = [sample for sample in samples if sample is not None]
+        if len(real_samples) != len(set(real_samples)) or any(
+            not start <= sample < stop for sample in real_samples
+        ):
+            raise RuntimeError(
+                "Routing replay samples do not belong to the active step: "
+                f"step={step_index}, span=[{start}, {stop}), samples={samples}"
+            )
+
+        self._reset_step_state()
+        self._active_step_index = step_index
+        self._active_step_samples = list(samples)
+        self._global_uid_dense_start = 0
+        self._global_uid_count = int(self.bundle.expert_indices.shape[2])
+        call_sequence = list(range(len(samples)))
+        for router_key in self._local_router_keys:
+            self._router_call_cursors[router_key] = 0
+            self._router_call_sequences[router_key] = call_sequence
+            self._router_consumed_calls[router_key] = {}
+
+    def finalize_step(self, *, expect_recompute: bool = False) -> None:
+        if self._active_step_index is None:
             raise RuntimeError("finalize_step called before set_step")
         for router_key in sorted(self._local_router_keys):
             consumed = self._router_call_cursors.get(router_key, 0)
@@ -1104,6 +1332,14 @@ class MoeRoutingReplayController:
                     f"step={self._active_step_index}, router='{router_key}', "
                     f"consumed={consumed}, expected={len(call_sequence)}"
                 )
+            if expect_recompute and self._expect_recompute_reuse:
+                reused = self._router_reuse_counts.get(router_key, 0)
+                if reused != len(call_sequence):
+                    raise RuntimeError(
+                        "Routing replay recompute consumption mismatch: "
+                        f"step={self._active_step_index}, router='{router_key}', "
+                        f"reused={reused}, expected={len(call_sequence)}"
+                    )
         if self._router_reuse_counts:
             logger.info(
                 "Routing replay reused routes for recompute: step=%s counts=%s",
@@ -1115,15 +1351,21 @@ class MoeRoutingReplayController:
 
     def _reset_step_state(self) -> None:
         self._active_step_index = None
+        self._active_step_samples = []
         self._active_sample_index = None
         self._active_step_routes = None
         self._active_micro_order = None
+        self._active_chunk_index = None
         self._router_call_cursors = {}
         self._router_call_sequences = {}
         self._router_last_call_indices = {}
         self._router_last_call_keys = {}
+        self._router_consumed_calls = {}
         self._router_reuse_counts = {}
         self._reset_staged_micro_targets()
+        self._step_targets = {}
+        self._step_target_ready_events = {}
+        self._host_target_staging = []
         self._global_uid_to_row_index = {}
         self._global_uid_dense_start = None
         self._global_uid_count = 0
@@ -1132,9 +1374,6 @@ class MoeRoutingReplayController:
         self._prepared_uid_sets = {}
         self._prepared_targets = {}
         self._router_prepared_target_keys = {}
-        self._host_target_staging = []
-        self._target_copy_event = None
-        self._target_copy_waited = True
         self._active_token_uid_key = None
 
     @staticmethod
@@ -1223,12 +1462,21 @@ class MoeRoutingReplayController:
         )
 
     def _active_micro_call_indices(self, router_key: str) -> list[int]:
+        if self.bundle.tensor_backed:
+            if self._active_step_index is None or self._active_micro_order is None:
+                raise RuntimeError("Routing replay begin_micro called before set_step")
+            return [self._active_micro_order]
         if self._active_step_routes is None:
             raise RuntimeError("Routing replay begin_micro called before set_step")
         router_calls = self._active_step_routes.routers[router_key].calls
         call_sequence = self._router_call_sequences[router_key]
         cursor = self._router_call_cursors.get(router_key, 0)
         active_call_key = self._active_router_call_key()
+        consumed_call = self._router_consumed_calls.get(router_key, {}).get(
+            active_call_key
+        )
+        if consumed_call is not None:
+            return [consumed_call]
         if cursor >= len(call_sequence):
             last_index = self._router_last_call_indices.get(router_key)
             last_key = self._router_last_call_keys.get(router_key)
@@ -1259,6 +1507,33 @@ class MoeRoutingReplayController:
         return indices
 
     def _next_route_call_index(self, router_key: str) -> int:
+        if self.bundle.tensor_backed:
+            if self._active_step_index is None or self._active_micro_order is None:
+                raise RuntimeError(
+                    "Routing replay router call occurred before set_step"
+                )
+            call_index = self._active_micro_order
+            call_key = ("micro", call_index)
+            consumed = self._router_consumed_calls[router_key]
+            if call_key in consumed:
+                if not self.allow_recompute_reuse:
+                    raise RuntimeError(
+                        "Routing replay recompute reuse is disabled: "
+                        f"step={self._active_step_index}, router='{router_key}', "
+                        f"micro={call_index}"
+                    )
+                self._router_reuse_counts[router_key] = (
+                    self._router_reuse_counts.get(router_key, 0) + 1
+                )
+                return call_index
+            if call_index not in self._router_call_sequences[router_key]:
+                raise RuntimeError(
+                    "Routing replay micro is outside the local call sequence: "
+                    f"router='{router_key}', micro={call_index}"
+                )
+            consumed[call_key] = call_index
+            self._router_call_cursors[router_key] += 1
+            return call_index
         if self._active_step_routes is None:
             raise RuntimeError("Routing replay router call occurred before set_step")
         router_calls = self._active_step_routes.routers[router_key].calls
@@ -1270,6 +1545,20 @@ class MoeRoutingReplayController:
             )
         cursor = self._router_call_cursors.get(router_key, 0)
         active_call_key = self._active_router_call_key()
+        consumed_call = self._router_consumed_calls.get(router_key, {}).get(
+            active_call_key
+        )
+        if consumed_call is not None:
+            if not self.allow_recompute_reuse:
+                raise RuntimeError(
+                    "Routing replay recompute reuse is disabled: "
+                    f"step={self._active_step_index}, router='{router_key}', "
+                    f"call_key={active_call_key}"
+                )
+            self._router_reuse_counts[router_key] = (
+                self._router_reuse_counts.get(router_key, 0) + 1
+            )
+            return consumed_call
         last_index = self._router_last_call_indices.get(router_key)
         last_key = self._router_last_call_keys.get(router_key)
         next_key = (
@@ -1302,20 +1591,29 @@ class MoeRoutingReplayController:
         call_index = call_sequence[cursor]
         self._router_call_cursors[router_key] = cursor + 1
         self._router_last_call_indices[router_key] = call_index
-        self._router_last_call_keys[router_key] = _router_call_key(
-            router_calls[call_index]
-        )
+        call_key = _router_call_key(router_calls[call_index])
+        self._router_last_call_keys[router_key] = call_key
+        self._router_consumed_calls[router_key][call_key] = call_index
         return call_index
 
-    def _prepare_native_target_for_router(self, router_key: str) -> None:
+    def _prepare_native_target_for_router(
+        self, router_key: str, *, logits: torch.Tensor
+    ) -> None:
         if (
-            self._active_step_routes is None
+            self._active_step_index is None
             or self._active_micro_order is None
             or self._active_token_uid_key is None
         ):
             raise RuntimeError(
                 "Routing replay router call occurred before staged targets were ready: "
                 f"router='{router_key}'"
+            )
+        binding = self._router_bindings[router_key]
+        if int(binding["chunk_index"]) != self._active_chunk_index:
+            raise RuntimeError(
+                "Routing replay router ran under the wrong VPP chunk: "
+                f"router='{router_key}', owner={binding['chunk_index']}, "
+                f"active={self._active_chunk_index}"
             )
         call_indices = self._active_micro_call_indices(router_key)
         if len(call_indices) != 1:
@@ -1331,9 +1629,6 @@ class MoeRoutingReplayController:
                 f"actual={call_index}"
             )
         target_key = (self._active_token_uid_key, call_index)
-        if self._router_prepared_target_keys.get(router_key) == target_key:
-            return
-        self.wait_for_staged_targets()
         staged_key = (self._active_token_uid_key, router_key, call_index)
         target = self._prepared_targets.get(staged_key)
         if target is None:
@@ -1342,14 +1637,34 @@ class MoeRoutingReplayController:
                 f"step={self._active_step_index}, router='{router_key}', "
                 f"call={call_index}, token_uid_key='{self._active_token_uid_key}'"
             )
-        topk = int(self._router_bindings[router_key]["topk"])
+        self._wait_for_staged_target(staged_key, target)
+        if target.device.type == "cuda":
+            target.record_stream(torch.cuda.current_stream(target.device))
+        if self._router_prepared_target_keys.get(router_key) == target_key:
+            return
+        topk = int(binding["topk"])
+        logit_experts = int(logits.shape[-1])
+        model_num_experts = int(binding["num_experts"])
+        if model_num_experts and model_num_experts != logit_experts:
+            raise RuntimeError(
+                "Routing replay router expert count differs from logits: "
+                f"router='{router_key}', model_experts={model_num_experts}, "
+                f"logit_experts={logit_experts}"
+            )
+        expected_tokens = int(logits.numel()) // logit_experts
+        if int(target.shape[0]) != expected_tokens:
+            raise RuntimeError(
+                "Routing replay target token count differs from router logits: "
+                f"router='{router_key}', target_tokens={int(target.shape[0])}, "
+                f"logit_tokens={expected_tokens}"
+            )
         if int(target.shape[1]) != topk:
             raise RuntimeError(
                 "Routing replay target topk mismatch at router call: "
                 f"router='{router_key}', call={call_index}, "
                 f"target_topk={int(target.shape[1])}, router_topk={topk}"
             )
-        router_replay = self._router_bindings[router_key]["router_replay"]
+        router_replay = binding["router_replay"]
         router_replay.set_target_indices(target)
         router_replay.set_router_replay_action(
             _router_replay_classes()[1].REPLAY_FORWARD
@@ -1363,6 +1678,52 @@ class MoeRoutingReplayController:
         call_index: int,
         explicit_uids: torch.Tensor,
     ) -> torch.Tensor:
+        if self.bundle.tensor_backed:
+            assert self.bundle.expert_indices is not None
+            num_experts = int(self.bundle.num_experts or 0)
+            topk = self.bundle.max_topk
+            layer_index = int(self._router_bindings[router_key]["layer_index"])
+            sample_index = self._active_step_samples[call_index]
+            source = (
+                None
+                if sample_index is None
+                else self.bundle.expert_indices[layer_index, sample_index]
+            )
+            local_uids = explicit_uids.reshape(-1).contiguous()
+            target_cpu = torch.empty(
+                (int(local_uids.numel()), topk),
+                dtype=(torch.uint8 if num_experts <= 256 else torch.uint16),
+            )
+            valid_positions = torch.nonzero(local_uids >= 0, as_tuple=False).reshape(-1)
+            if int(valid_positions.numel()) > 0:
+                valid_uids = local_uids[valid_positions]
+                if source is None:
+                    target_cpu[valid_positions] = _synthetic_replay_rows(
+                        row_positions=valid_uids,
+                        num_experts=num_experts,
+                        topk=topk,
+                        dtype=target_cpu.dtype,
+                        seed=self._tensor_synthetic_seed(layer_index, call_index),
+                    )
+                else:
+                    row_indices = self._row_indices_for_explicit_uids(
+                        valid_uids=valid_uids,
+                        router_key=router_key,
+                        call_index=call_index,
+                    )
+                    target_cpu[valid_positions] = source.index_select(0, row_indices)
+            invalid_positions = torch.nonzero(local_uids < 0, as_tuple=False).reshape(
+                -1
+            )
+            if int(invalid_positions.numel()) > 0:
+                target_cpu[invalid_positions] = _synthetic_replay_rows(
+                    row_positions=invalid_positions,
+                    num_experts=num_experts,
+                    topk=topk,
+                    dtype=target_cpu.dtype,
+                    seed=self._tensor_synthetic_seed(layer_index, call_index),
+                )
+            return target_cpu.contiguous()
         if self._active_step_routes is None:
             raise RuntimeError("Routing replay explicit target used before set_step")
         route = self._active_step_routes.routers[router_key].calls[call_index]
@@ -1394,6 +1755,13 @@ class MoeRoutingReplayController:
                 + (call_index + 1) * 97_003,
             )
         return target_cpu.contiguous()
+
+    def _tensor_synthetic_seed(self, layer_index: int, call_index: int) -> int:
+        return (
+            (int(self._active_step_index or 0) + 1) * 1_000_003
+            + (layer_index + 1) * 97_003
+            + (call_index + 1) * 9_176
+        )
 
     def _row_indices_for_explicit_uids(
         self,
@@ -1455,10 +1823,10 @@ class MoeRoutingReplayController:
         target_key: tuple[str, str, int],
         target_cpu: torch.Tensor,
     ) -> None:
-        target_cpu = target_cpu.to(dtype=torch.long).contiguous()
+        target_cpu = target_cpu.contiguous()
         device = self._target_device()
         if device.type != "cuda":
-            self._prepared_targets[target_key] = target_cpu
+            self._prepared_targets[target_key] = target_cpu.to(dtype=torch.long)
             return
         if self._target_copy_stream is None:
             self._target_copy_stream = torch.cuda.Stream(device=device)
@@ -1466,36 +1834,36 @@ class MoeRoutingReplayController:
             target_cpu if target_cpu.is_pinned() else target_cpu.pin_memory()
         ).contiguous()
         self._host_target_staging.append(host_target)
-        buffer = self._target_buffers.get(target_key)
-        if (
-            buffer is None
-            or buffer.shape != host_target.shape
-            or buffer.device != device
-            or buffer.dtype != torch.long
-        ):
-            buffer = torch.empty(
+        with torch.cuda.stream(self._target_copy_stream):
+            narrow_buffer = torch.empty(
                 tuple(host_target.shape),
                 device=device,
-                dtype=torch.long,
+                dtype=host_target.dtype,
             )
-            self._target_buffers[target_key] = buffer
-        with torch.cuda.stream(self._target_copy_stream):
-            buffer.copy_(host_target, non_blocking=True)
+            narrow_buffer.copy_(host_target, non_blocking=True)
+            buffer = narrow_buffer.to(dtype=torch.long)
+            narrow_buffer.record_stream(self._target_copy_stream)
             buffer.record_stream(self._target_copy_stream)
         self._prepared_targets[target_key] = buffer
-        self._target_copy_waited = False
 
-    def _record_target_copy_event(self) -> None:
-        if self._target_copy_stream is None or self._target_copy_waited:
+    def _record_target_copy_event(
+        self,
+        target_keys: list[tuple[str, str, int]],
+    ) -> None:
+        if self._target_copy_stream is None or not target_keys:
             return
-        self._target_copy_event = torch.cuda.Event()
+        ready = torch.cuda.Event()
         with torch.cuda.stream(self._target_copy_stream):
-            self._target_copy_event.record()
+            ready.record()
+        for target_key in target_keys:
+            self._step_target_ready_events[target_key] = ready
 
-    def wait_for_staged_targets(self) -> None:
-        if self._target_copy_event is None or self._target_copy_waited:
+    def _wait_for_staged_target(
+        self,
+        target_key: tuple[str, str, int],
+        target: torch.Tensor,
+    ) -> None:
+        ready = self._step_target_ready_events.get(target_key)
+        if ready is None:
             return
-        torch.cuda.current_stream(self._target_device()).wait_event(
-            self._target_copy_event
-        )
-        self._target_copy_waited = True
+        torch.cuda.current_stream(target.device).wait_event(ready)

@@ -1,11 +1,12 @@
 from datetime import datetime
 from typing import Any
 
-from openai.types.chat import ChatCompletion
+from openai.types.chat import ChatCompletion, ChatCompletionMessageParam
 from openai.types.chat.chat_completion import Choice
 import pytest
 
 import art
+import art.trajectories as tr
 from art.trajectories import ChatCompletionsExchange, ChatCompletionsRequest
 
 pytest.importorskip("tinker")
@@ -16,6 +17,16 @@ from art.tinker_native.data import trajectory_groups_to_datums  # noqa: E402
 def _exchange(
     prompt: list[int], output: list[int], *, logprobs: bool = True
 ) -> ChatCompletionsExchange:
+    messages: list[ChatCompletionMessageParam] = [
+        {"role": "user", "content": "question"}
+    ]
+    if len(prompt) > 1:
+        messages.extend(
+            [
+                {"role": "assistant", "content": "answer"},
+                {"role": "user", "content": "next"},
+            ]
+        )
     response = ChatCompletion.model_validate(
         {
             "id": "chat-1",
@@ -48,7 +59,7 @@ def _exchange(
         }
     )
     return ChatCompletionsExchange(
-        request=ChatCompletionsRequest(model="test/model", messages=[]),
+        request=ChatCompletionsRequest(model="test/model", messages=messages),
         response=response,
         start_time=datetime.now(),
         end_time=datetime.now(),
@@ -57,7 +68,7 @@ def _exchange(
 
 def _trajectory(reward: float, *, logprobs: bool = True) -> art.Trajectory:
     return art.Trajectory(
-        exchanges=art.TrajectoryExchanges(
+        exchanges=tr.TrajectoryExchanges(
             chat_completions=[
                 _exchange([10], [20], logprobs=logprobs),
                 _exchange([10, 20, 11], [21], logprobs=logprobs),

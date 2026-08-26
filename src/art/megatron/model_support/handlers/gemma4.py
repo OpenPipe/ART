@@ -67,14 +67,6 @@ _GEMMA4_MOE_COMPILE_WORKAROUND_FLAGS = (
     "moe_postprocess",
     "te_triton_permute_with_mask_map",
 )
-_GEMMA4_TRITON_NUM_STAGES_2_SIGNATURES = {
-    # google/gemma-4-31B-it: Triton flex attention raises "No valid triton
-    # configs" for global attention head_dim=512 with backend-only options.
-    ("dense", 60, 5376, 32, 256, 512, 4),
-    # google/gemma-4-26B-A4B-it hits the same Triton resource limit on global
-    # attention head_dim=512 with backend-only options.
-    ("moe", 30, 2816, 16, 256, 512, 2),
-}
 _ART_MOE_EXPERT_KEY_RE = re.compile(
     r"^(?P<prefix>.*\.mlp\.experts)\.(?P<expert>\d+)\."
     r"(?P<module>gate_up_proj|down_proj)\.(?P<lora>lora_[AB])\.weight$"
@@ -402,12 +394,13 @@ def _zero_gemma4_moe_lora_padding(
             logical, internal = _gemma4_moe_padding_sizes_from_provider(config)
             if logical == internal:
                 continue
-            for prefix, a_t, b_t in art_lora.iter_lora_sites([chunk]):
-                if ".mlp.experts." not in prefix:
+            for module in chunk.modules():
+                prefix = getattr(module, "adapter_model_prefix", None)
+                if not isinstance(prefix, str) or ".mlp.experts." not in prefix:
                     continue
-                if prefix.endswith(".gate_up_proj"):
+                if prefix.endswith(".gate_up_proj") and hasattr(module, "B_T"):
                     _zero_gemma4_moe_lora_padding_tensor_set(
-                        b_t,
+                        cast(torch.nn.Parameter, module.B_T),
                         dim=-1,
                         logical=logical,
                         internal=internal,
@@ -415,9 +408,9 @@ def _zero_gemma4_moe_lora_padding(
                         grads=grads,
                         params=params,
                     )
-                elif prefix.endswith(".down_proj"):
+                elif prefix.endswith(".down_proj") and hasattr(module, "A_T"):
                     _zero_gemma4_moe_lora_padding_tensor_set(
-                        a_t,
+                        cast(torch.nn.Parameter, module.A_T),
                         dim=-2,
                         logical=logical,
                         internal=internal,
@@ -518,7 +511,24 @@ def _canonicalize_gemma4_loaded_lora_state(
     }
 
 
-class Gemma4MoeHandler(DefaultMoeHandler):
+class _Gemma4TokenizerMixin:
+    def configure_tokenizer(
+        self,
+        tokenizer: Any,
+        *,
+        internal_config: Any,
+    ) -> Any:
+        if not any(
+            internal_config.get(key) is not None
+            for key in ("chat_template", "chat_template_path")
+        ):
+            from art.utils.chat_template import TOOL_CALL_ARGUMENTS_AS_MAPPING_ATTR
+
+            setattr(tokenizer, TOOL_CALL_ARGUMENTS_AS_MAPPING_ATTR, True)
+        return tokenizer
+
+
+class Gemma4MoeHandler(_Gemma4TokenizerMixin, DefaultMoeHandler):
     key = "gemma4_moe"
     is_moe = True
     native_vllm_lora_status = "validated"
@@ -790,7 +800,7 @@ class Gemma4MoeHandler(DefaultMoeHandler):
 GEMMA4_MOE_HANDLER = Gemma4MoeHandler()
 
 
-class Gemma4DenseHandler(DefaultDenseHandler):
+class Gemma4DenseHandler(_Gemma4TokenizerMixin, DefaultDenseHandler):
     key = "gemma4_dense"
     native_vllm_lora_status = "validated"
 
@@ -1276,8 +1286,12 @@ def _install_gemma4_preprocess_patch(model_chunks: Sequence[Any]) -> None:
                     setattr(gemma4_rotary, "cp_group", rotary_cp_group)
                     if local_rotary is not None:
                         setattr(local_rotary, "cp_group", local_rotary_cp_group)
-            decoder_input = cast(torch.Tensor, preproc_output[0])
-            if not decoder_input.requires_grad and decoder_input.is_leaf:
+            decoder_input = cast(torch.Tensor | None, preproc_output[0])
+            if (
+                decoder_input is not None
+                and not decoder_input.requires_grad
+                and decoder_input.is_leaf
+            ):
                 decoder_input.requires_grad_(True)
             rotary_pos_emb = preproc_output[1]
             if not isinstance(position_ids, torch.Tensor) or not isinstance(
@@ -1481,35 +1495,12 @@ def _gemma4_attention_pattern(provider: Any) -> tuple[int, int]:
 def _gemma4_flex_attention_compile_crash_config(
     provider: Any,
 ) -> FlexAttentionCompileCrashConfig:
-    signature = _gemma4_compile_crash_signature(provider)
     global_head_dim = int(getattr(provider, "global_head_dim", 0) or 0)
-    if signature in _GEMMA4_TRITON_NUM_STAGES_2_SIGNATURES or (
-        signature is None and global_head_dim >= 512
-    ):
+    if global_head_dim >= 512:
         return FlexAttentionCompileCrashConfig(
             triton_num_stages_2_head_dims=(global_head_dim,)
         )
     return FlexAttentionCompileCrashConfig()
-
-
-def _gemma4_compile_crash_signature(provider: Any) -> tuple[Any, ...] | None:
-    required_attrs = (
-        "num_layers",
-        "hidden_size",
-        "num_attention_heads",
-        "kv_channels",
-    )
-    if any(not hasattr(provider, attr) for attr in required_attrs):
-        return None
-    return (
-        "moe" if int(getattr(provider, "num_moe_experts", 0) or 0) > 0 else "dense",
-        int(provider.num_layers),
-        int(provider.hidden_size),
-        int(provider.num_attention_heads),
-        int(provider.kv_channels),
-        int(getattr(provider, "global_head_dim", 0) or 0),
-        int(getattr(provider, "num_global_key_value_heads", 0) or 0),
-    )
 
 
 def _is_gemma4_global_layer(layer_number: int, provider: Any) -> bool:
@@ -1817,11 +1808,87 @@ def _vllm_moe_config(adapter_config: dict[str, Any]) -> dict[str, Any]:
     return config
 
 
+def _canonicalize_gemma4_peft_moe_target_parameter_layout(
+    tensors: dict[str, torch.Tensor],
+    *,
+    adapter_config: dict[str, Any],
+) -> dict[str, torch.Tensor]:
+    """Transpose PEFT's parameter-LoRA factors into vLLM's 3D MoE layout.
+
+    Gemma4 stores its expert parameters as ``[expert, out, in]`` tensors,
+    while PEFT's generic 3D target-parameter wrapper interprets them as
+    ``[expert, in, out]``.  The resulting factors already use vLLM's fused
+    expert key names, but every expert delta is transposed.  Shape-detect that
+    layout and transpose the factors back before either Megatron import or
+    vLLM normalization.
+    """
+    base_model = adapter_config.get("base_model_name_or_path")
+    if not isinstance(base_model, str) or not base_model:
+        return tensors
+    config = _gemma4_text_config_dict(base_model)
+    if not bool(config.get("enable_moe_block", False)):
+        return tensors
+    hidden = int(config.get("hidden_size", 0) or 0)
+    intermediate = int(config.get("moe_intermediate_size", 0) or 0)
+    if hidden <= 0 or intermediate <= 0:
+        return tensors
+
+    grouped: dict[str, dict[str, str]] = {}
+    for key in tensors:
+        match = _VLLM_MOE_KEY_RE.match(key)
+        if match is None:
+            continue
+        slot = (
+            f"{'base_layer.' if match.group('base_layer') else ''}{match.group('lora')}"
+        )
+        grouped.setdefault(match.group("prefix"), {})[slot] = key
+
+    transformed = dict(tensors)
+    for slots in grouped.values():
+        required = {
+            "base_layer.lora_A",
+            "base_layer.lora_B",
+            "lora_A",
+            "lora_B",
+        }
+        if set(slots) != required:
+            continue
+        gate_up_a_key = slots["base_layer.lora_A"]
+        gate_up_b_key = slots["base_layer.lora_B"]
+        down_a_key = slots["lora_A"]
+        down_b_key = slots["lora_B"]
+        gate_up_a = tensors[gate_up_a_key]
+        gate_up_b = tensors[gate_up_b_key]
+        down_a = tensors[down_a_key]
+        down_b = tensors[down_b_key]
+        packed_rank = int(gate_up_a.shape[0])
+        peft_shapes = (
+            (packed_rank, 2 * intermediate),
+            (hidden, packed_rank),
+            (packed_rank, hidden),
+            (intermediate, packed_rank),
+        )
+        actual_shapes = tuple(
+            tuple(tensor.shape) for tensor in (gate_up_a, gate_up_b, down_a, down_b)
+        )
+        if actual_shapes != peft_shapes:
+            continue
+        transformed[gate_up_a_key] = gate_up_b.transpose(0, 1).contiguous()
+        transformed[gate_up_b_key] = gate_up_a.transpose(0, 1).contiguous()
+        transformed[down_a_key] = down_b.transpose(0, 1).contiguous()
+        transformed[down_b_key] = down_a.transpose(0, 1).contiguous()
+    return transformed
+
+
 def _to_vllm_lora_tensors(
     tensors: dict[str, torch.Tensor],
     *,
     adapter_config: dict[str, Any],
 ) -> tuple[dict[str, torch.Tensor], dict[str, Any]]:
+    tensors = _canonicalize_gemma4_peft_moe_target_parameter_layout(
+        tensors,
+        adapter_config=adapter_config,
+    )
     grouped = group_expert_lora_tensors(tensors, _ART_MOE_EXPERT_KEY_RE)
     if not grouped:
         transformed: dict[str, torch.Tensor] = {}
@@ -1939,6 +2006,10 @@ def _from_vllm_lora_tensors(
     *,
     adapter_config: dict[str, Any],
 ) -> dict[str, torch.Tensor]:
+    tensors = _canonicalize_gemma4_peft_moe_target_parameter_layout(
+        tensors,
+        adapter_config=adapter_config,
+    )
     expert_grouped: dict[str, dict[int, dict[str, dict[str, torch.Tensor]]]] = {}
     for key, tensor in tensors.items():
         match = _VLLM_MOE_EXPERT_KEY_RE.match(key)
@@ -2133,6 +2204,7 @@ def _gemma4_text_only_mapping_registry(hf_config: Any | None = None) -> Any:
     from megatron.bridge.models.conversion.mapping_registry import (
         MegatronMappingRegistry,
     )
+    from megatron.bridge.models.conversion.param_mapping import AutoMapping
     from megatron.bridge.models.gemma.gemma4_bridge import _Gemma4QKVMapping
     from megatron.bridge.models.gemma_vl.gemma4_vl_bridge import Gemma4VLBridge
 
@@ -2191,7 +2263,11 @@ def _gemma4_text_only_mapping_registry(hf_config: Any | None = None) -> Any:
 
     text_config = getattr(hf_config, "text_config", hf_config)
     is_moe = bool(getattr(text_config, "enable_moe_block", False))
-    language_mappings = []
+    language_mappings = (
+        []
+        if bool(getattr(text_config, "tie_word_embeddings", True))
+        else [AutoMapping("output_layer.weight", "lm_head.weight")]
+    )
     for mapping in upstream_registry.mappings:
         if not mapping.megatron_param.startswith("language_model."):
             continue

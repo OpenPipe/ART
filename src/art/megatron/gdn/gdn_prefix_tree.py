@@ -4,6 +4,7 @@ from bisect import bisect_left
 from dataclasses import dataclass, replace
 from typing import Any, Literal, NamedTuple, cast
 
+from pydantic import BaseModel, ConfigDict
 import torch
 
 from art.megatron.context_parallel.layout_index import TokenLayoutIndex
@@ -303,6 +304,25 @@ class GdnRankExecutionPlan:
         return _tokens_from_rank_ranges(self.gdn_token_ranges)
 
 
+class GdnGlobalExecutionDecision(BaseModel):
+    """All-rank GDN decisions without rank-local planner tensors."""
+
+    model_config = ConfigDict(frozen=True, arbitrary_types_allowed=True)
+
+    cp_size: int
+    source_layout: TokenLayoutIndex
+    depth_count: int
+    gdn_token_counts_by_rank: tuple[int, ...]
+    owner_by_node: tuple[int, ...]
+    chained_nodes: tuple[bool, ...]
+    tree_has_children: tuple[bool, ...]
+    gdn_ranges_by_rank_by_position: tuple[tuple[tuple[int, int, int], ...], ...]
+    gdn_ranges_by_rank_by_source: tuple[tuple[tuple[int, int, int], ...], ...]
+    segments_by_rank_depth: tuple[tuple[tuple[GdnSegmentSpec, ...], ...], ...]
+    chain_segments_by_depth: tuple[tuple[GdnSegmentSpec, ...], ...]
+    cross_rank_token_count: int
+
+
 @dataclass(frozen=True)
 class _AttentionLayoutIndex:
     """Counting index for CP attention token ownership."""
@@ -366,52 +386,40 @@ def build_gdn_rank_execution_plan(
     fork buckets for short work where CP collectives would be inefficient.
     """
 
-    planner_config = planner_config or GdnPlannerConfig()
-    target_device = torch.device(device)
-    if target_device.type != "cpu":
-        cpu_plan = build_gdn_rank_execution_plan(
-            spec,
-            device="cpu",
-            cp_rank=cp_rank,
-            cp_size=cp_size,
-            attention_token_layout_index=attention_token_layout_index,
-            planner_config=planner_config,
-        )
-        return move_gdn_rank_execution_plan_to_device(cpu_plan, target_device)
-    return _build_tree_rank_execution_plan(
+    resolved_config = planner_config or GdnPlannerConfig()
+    decision = build_gdn_global_execution_decision(
         spec,
-        device=device,
-        cp_rank=cp_rank,
         cp_size=cp_size,
         attention_token_layout_index=attention_token_layout_index,
-        planner_config=planner_config,
+        planner_config=resolved_config,
+    )
+    return materialize_gdn_rank_execution_plan(
+        spec,
+        decision,
+        device=device,
+        cp_rank=cp_rank,
+        planner_config=resolved_config,
     )
 
 
-def _build_tree_rank_execution_plan(
+def build_gdn_global_execution_decision(
     spec: GdnPackedExecutionSpec,
     *,
-    device: torch.device | str,
-    cp_rank: int,
-    cp_size: int,
-    attention_token_layout_index: TokenLayoutIndex | None,
-    planner_config: GdnPlannerConfig,
-) -> GdnRankExecutionPlan:
+    cp_size: int = 1,
+    attention_token_layout_index: TokenLayoutIndex | None = None,
+    planner_config: GdnPlannerConfig | None = None,
+) -> GdnGlobalExecutionDecision:
+    """Select one deterministic all-rank GDN assignment without tensors."""
+
+    planner_config = planner_config or GdnPlannerConfig()
     if cp_size < 1:
         raise ValueError(f"cp_size must be >= 1, got {cp_size}")
-    if cp_rank < 0 or cp_rank >= cp_size:
-        raise ValueError(f"cp_rank must be in [0, {cp_size}), got {cp_rank}")
     if not spec.tree_segments:
         raise ValueError("tree GDN planning requires tree segments")
     if len(spec.tree_parent_indices) != len(spec.tree_segments):
         raise ValueError("tree parent metadata length must match tree segments")
     if len(spec.tree_depths) != len(spec.tree_segments):
         raise ValueError("tree depth metadata length must match tree segments")
-
-    from art.megatron.gdn.layout import (
-        _reverse_exchange_plan,
-        build_local_rank_cp_exchange_plan_from_dest_ranges,
-    )
 
     source_layout = _attention_source_layout(
         spec,
@@ -549,27 +557,85 @@ def _build_tree_rank_execution_plan(
         tuple(sorted(ranges)) for ranges in gdn_ranges_by_rank
     )
 
+    return GdnGlobalExecutionDecision(
+        cp_size=cp_size,
+        source_layout=source_layout,
+        depth_count=depth_count,
+        gdn_token_counts_by_rank=tuple(rank_loads),
+        owner_by_node=tuple(owner_by_node),
+        chained_nodes=tuple(chained_nodes),
+        tree_has_children=tuple(tree_has_children),
+        gdn_ranges_by_rank_by_position=gdn_ranges_by_rank_by_position,
+        gdn_ranges_by_rank_by_source=gdn_ranges_by_rank_by_source,
+        segments_by_rank_depth=tuple(
+            tuple(tuple(segments) for segments in rank_depths)
+            for rank_depths in segments_by_rank_depth
+        ),
+        chain_segments_by_depth=tuple(
+            tuple(segments) for segments in chain_segments_by_depth
+        ),
+        cross_rank_token_count=cross_rank_token_count,
+    )
+
+
+def materialize_gdn_rank_execution_plan(
+    spec: GdnPackedExecutionSpec,
+    decision: GdnGlobalExecutionDecision,
+    *,
+    device: torch.device | str,
+    cp_rank: int = 0,
+    planner_config: GdnPlannerConfig | None = None,
+) -> GdnRankExecutionPlan:
+    """Build only one rank's tensor metadata from a global decision."""
+
+    cp_size = int(decision.cp_size)
+    if cp_rank < 0 or cp_rank >= cp_size:
+        raise ValueError(f"cp_rank must be in [0, {cp_size}), got {cp_rank}")
+    target_device = torch.device(device)
+    if target_device.type != "cpu":
+        cpu_plan = materialize_gdn_rank_execution_plan(
+            spec,
+            decision,
+            device="cpu",
+            cp_rank=cp_rank,
+            planner_config=planner_config,
+        )
+        return move_gdn_rank_execution_plan_to_device(cpu_plan, target_device)
+
+    from art.megatron.gdn.layout import (
+        _reverse_exchange_plan,
+        build_local_rank_cp_exchange_plan_from_dest_ranges,
+    )
+
+    planner_config = planner_config or GdnPlannerConfig()
+    device = target_device
+    source_layout = decision.source_layout
+    depth_count = int(decision.depth_count)
+    rank_loads = decision.gdn_token_counts_by_rank
+    gdn_ranges_by_rank_by_position = decision.gdn_ranges_by_rank_by_position
+    gdn_ranges_by_rank_by_source = decision.gdn_ranges_by_rank_by_source
+
     attention_to_gdn = build_local_rank_cp_exchange_plan_from_dest_ranges(
         source_layout=source_layout,
         device=device,
         local_rank=cp_rank,
         dest_ranges_by_rank=gdn_ranges_by_rank_by_position,
-        cross_rank_token_count=cross_rank_token_count,
+        cross_rank_token_count=decision.cross_rank_token_count,
     )
     local_token_ranges = gdn_ranges_by_rank_by_source[cp_rank]
     if cp_size == 1:
         tree_segment_buckets_by_depth = _build_chunk_aligned_cp1_tree_buckets(
             spec,
-            tuple(tree_has_children),
+            decision.tree_has_children,
             device=device,
             planner_config=planner_config,
         )
     else:
         tree_segment_buckets_by_depth = tuple(
             _build_tree_bucket_plans(
-                tuple(segments_by_rank_depth[cp_rank][depth]),
+                decision.segments_by_rank_depth[cp_rank][depth],
                 spec.tree_parent_indices,
-                tuple(tree_has_children),
+                decision.tree_has_children,
                 local_token_ranges=local_token_ranges,
                 sequence_length=spec.sequence_length,
                 device=device,
@@ -579,9 +645,9 @@ def _build_tree_rank_execution_plan(
     tree_chain_buckets_by_depth = (
         tuple(
             _build_tree_bucket_plans(
-                tuple(chain_segments_by_depth[depth]),
+                decision.chain_segments_by_depth[depth],
                 spec.tree_parent_indices,
-                tuple(tree_has_children),
+                decision.tree_has_children,
                 local_token_ranges=local_token_ranges,
                 sequence_length=spec.sequence_length,
                 device=device,
@@ -597,8 +663,8 @@ def _build_tree_rank_execution_plan(
     )
     tree_state_exchanges_by_depth = _build_tree_state_exchanges_by_depth(
         spec,
-        owner_by_node=tuple(owner_by_node),
-        chained_nodes=tuple(chained_nodes),
+        owner_by_node=decision.owner_by_node,
+        chained_nodes=decision.chained_nodes,
         cp_rank=cp_rank,
         cp_size=cp_size,
         depth_count=depth_count,
@@ -1161,47 +1227,6 @@ def _score_chain_segment_keys(
     )
 
 
-def _add_local_search_load(
-    rank_loads: list[int],
-    owner: int,
-    segment: GdnSegmentSpec,
-    *,
-    segment_attention_counts: dict[tuple[int, int, int], tuple[int, ...]],
-) -> int:
-    rank_loads[owner] += segment.length
-    return segment.length - segment_attention_counts[_segment_key(segment)][owner]
-
-
-def _estimate_local_rank_kernel_work(
-    local_segments_by_rank_depth: tuple[tuple[tuple[GdnSegmentSpec, ...], ...], ...],
-) -> tuple[tuple[int, ...], int, int]:
-    estimate = _estimate_local_runtime_from_lengths(
-        tuple(
-            tuple(
-                tuple(segment.length for segment in segments)
-                for segments in rank_segments
-            )
-            for rank_segments in local_segments_by_rank_depth
-        )
-    )
-    return (
-        estimate.rank_work,
-        max(estimate.rank_bucket_counts, default=0),
-        max(estimate.rank_segment_counts, default=0),
-    )
-
-
-def _estimate_local_rank_kernel_work_from_lengths(
-    local_lengths_by_rank_depth: tuple[tuple[tuple[int, ...], ...], ...],
-) -> tuple[tuple[int, ...], int, int]:
-    estimate = _estimate_local_runtime_from_lengths(local_lengths_by_rank_depth)
-    return (
-        estimate.rank_work,
-        max(estimate.rank_bucket_counts, default=0),
-        max(estimate.rank_segment_counts, default=0),
-    )
-
-
 def _estimate_local_runtime_from_lengths(
     local_lengths_by_rank_depth: tuple[tuple[tuple[int, ...], ...], ...],
 ) -> _GdnLocalRuntimeEstimate:
@@ -1225,36 +1250,6 @@ def _estimate_local_runtime_from_lengths(
         rank_bucket_counts=tuple(rank_bucket_counts),
         rank_segment_counts=tuple(rank_segment_counts),
     )
-
-
-def _estimate_chain_rank_kernel_work(
-    chain_segments_by_depth: tuple[tuple[GdnSegmentSpec, ...], ...],
-    *,
-    chain_rank_counts_by_key: dict[GdnSegmentDecisionKey, tuple[int, ...]],
-    cp_size: int,
-) -> tuple[tuple[int, ...], int]:
-    estimate = _estimate_chain_runtime_from_counts(
-        tuple(
-            tuple(
-                chain_rank_counts_by_key[_segment_key(segment)] for segment in segments
-            )
-            for segments in chain_segments_by_depth
-        ),
-        cp_size=cp_size,
-    )
-    return estimate.rank_work, estimate.bucket_count
-
-
-def _estimate_chain_rank_kernel_work_from_counts(
-    chain_rank_counts_by_depth: tuple[tuple[tuple[int, ...], ...], ...],
-    *,
-    cp_size: int,
-) -> tuple[tuple[int, ...], int]:
-    estimate = _estimate_chain_runtime_from_counts(
-        chain_rank_counts_by_depth,
-        cp_size=cp_size,
-    )
-    return estimate.rank_work, estimate.bucket_count
 
 
 def _estimate_chain_runtime_from_counts(

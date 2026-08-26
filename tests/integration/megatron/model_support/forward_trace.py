@@ -72,7 +72,47 @@ def _trace_hook(fn: Callable[..., Any]) -> Callable[..., Any]:
 
 def _normalize_trace_module_name(module_name: str) -> str:
     """Strips compile-wrapper path segments from trace module names."""
-    return module_name.replace("._orig_mod", "")
+    normalized = module_name.replace("._orig_mod", "")
+    chunk, separator, remainder = normalized.partition(".")
+    if (
+        separator
+        and chunk.startswith("chunk")
+        and chunk.removeprefix("chunk").isdigit()
+    ):
+        return remainder
+    return normalized
+
+
+def _global_trace_module_name(
+    module_name: str,
+    module_by_name: dict[str, Any],
+    *,
+    chunk_index: int,
+) -> str:
+    local_layer_index = _module_layer_index(module_name)
+    normalized = _normalize_trace_module_name(module_name)
+    if local_layer_index is None:
+        return f"chunk{chunk_index}.{normalized}"
+    marker = "decoder.layers."
+    marker_index = module_name.find(marker)
+    layer_name_end = marker_index + len(marker) + len(str(local_layer_index))
+    layer = module_by_name[module_name[:layer_name_end]]
+    layer_number = getattr(layer, "layer_number", None)
+    if layer_number is None:
+        layer_number = getattr(getattr(layer, "_orig_mod", None), "layer_number", None)
+    if layer_number is None:
+        raise RuntimeError(
+            f"Transformer layer has no global layer_number: {module_name}"
+        )
+    normalized_marker_index = normalized.find(marker)
+    normalized_layer_start = normalized_marker_index + len(marker)
+    normalized_layer_end = normalized_layer_start + len(str(local_layer_index))
+    return "chunk{}.{}{}{}".format(
+        chunk_index,
+        normalized[:normalized_layer_start],
+        int(layer_number) - 1,
+        normalized[normalized_layer_end:],
+    )
 
 
 def _safe_int(value: Any, default: int = 0) -> int:
@@ -249,7 +289,16 @@ def _extract_router_topk(
         topk_scores = probs.new_zeros((probs.shape[0], 0))
         topk_ids = torch.zeros((probs.shape[0], 0), dtype=torch.int64)
     else:
-        topk_scores, topk_ids = torch.topk(probs, k=topk, dim=-1)
+        expert_ids = torch.arange(probs.shape[-1]).expand_as(routing_map)
+        topk_ids = (
+            expert_ids.masked_fill(~routing_map, probs.shape[-1])
+            .sort(dim=-1)
+            .values[:, :topk]
+        )
+        valid = topk_ids < probs.shape[-1]
+        topk_scores = probs.gather(-1, topk_ids.clamp_max(probs.shape[-1] - 1))
+        topk_ids = topk_ids.masked_fill(~valid, -1)
+        topk_scores = topk_scores.masked_fill(~valid, 0)
     return topk_ids.contiguous(), topk_scores.contiguous()
 
 
@@ -311,7 +360,9 @@ class ForwardTraceCapture:
             tuple[int | None, int, int | None, torch.Tensor, torch.Tensor | None]
         ] = []
         self._trace_metadata_by_name: dict[str, dict[str, Any]] = {}
-        self._next_micro_order = 0
+        self._root_module_ids: set[int] = set()
+        self._root_output_module_ids: set[int] = set()
+        self._next_micro_order_by_root: dict[int, int] = {}
         self._inside_root_forward = False
         self._hook_handles: list[Any] = []
         if not enabled:
@@ -321,13 +372,19 @@ class ForwardTraceCapture:
     def _register_hooks(self, model_chunks: list[Any]) -> None:
         if not model_chunks:
             raise RuntimeError("Expected at least one model chunk for forward tracing")
-        root_module = model_chunks[0]
-        self._hook_handles.append(
-            root_module.register_forward_pre_hook(_trace_hook(self._root_pre_hook))
-        )
-        self._hook_handles.append(
-            root_module.register_forward_hook(_trace_hook(self._root_post_hook))
-        )
+        from art.megatron.training.pipeline_schedule import chunk_post_process
+
+        self._root_module_ids = {id(chunk) for chunk in model_chunks}
+        self._root_output_module_ids = {
+            id(chunk) for chunk in model_chunks if chunk_post_process(chunk)
+        }
+        for root_module in model_chunks:
+            self._hook_handles.append(
+                root_module.register_forward_pre_hook(_trace_hook(self._root_pre_hook))
+            )
+            self._hook_handles.append(
+                root_module.register_forward_hook(_trace_hook(self._root_post_hook))
+            )
         for chunk_index, chunk in enumerate(model_chunks):
             named_modules = list(chunk.named_modules())
             module_by_name = dict(named_modules)
@@ -339,8 +396,10 @@ class ForwardTraceCapture:
                     and layer_index > self.max_layer_index
                 ):
                     continue
-                trace_module_name = _normalize_trace_module_name(
-                    f"chunk{chunk_index}.{module_name}"
+                trace_module_name = _global_trace_module_name(
+                    module_name,
+                    module_by_name,
+                    chunk_index=chunk_index,
                 )
                 metadata = self._build_module_trace_metadata(
                     module_name=module_name,
@@ -421,7 +480,9 @@ class ForwardTraceCapture:
     @staticmethod
     def _lora_primary_output_merge_hint(module: Any) -> dict[str, Any] | None:
         """Infers the correct output merge op for LoRA modules."""
-        if module.__class__.__name__ != "LoRA":
+        from art.megatron.lora import LoRA
+
+        if not isinstance(module, LoRA):
             return None
         lora_module = module
         b_param = getattr(lora_module, "B_T", None)
@@ -454,6 +515,8 @@ class ForwardTraceCapture:
         a_world_size = _shard_world_size_for_domain(a_domain)
         if bool(getattr(a_param, "lora_tp_sharded", False)) and a_world_size > 1:
             return {"op": "sum"}
+        if a_world_size > 1 and a_domain == b_domain:
+            return {"op": "replicated"}
         return None
 
     def _infer_primary_output_merge_hint(
@@ -671,32 +734,34 @@ class ForwardTraceCapture:
         if self.current_step_index is None:
             return
         self._inside_root_forward = True
-        micro_order = self._next_micro_order
+        micro_order = self._next_micro_order_by_root[id(_module)]
         sample_index = self._sample_index_for_micro(micro_order)
         self.begin_micro(sample_index=sample_index, micro_order=micro_order)
 
     def _root_post_hook(self, _module: Any, _inputs: Any, output: Any) -> None:
         if self.current_step_index is None:
             return
-        output_tensor = self.guess_primary_tensor(output)
-        if output_tensor is None:
-            raise RuntimeError(
-                f"Expected root forward output to contain a tensor, got {type(output)}"
+        module_id = id(_module)
+        if module_id in self._root_output_module_ids:
+            output_tensor = self.guess_primary_tensor(output)
+            if output_tensor is None:
+                raise RuntimeError(
+                    f"Expected root forward output to contain a tensor, got {type(output)}"
+                )
+            sample_index = self.current_micro_sample_index
+            micro_order = self.current_micro_order
+            self.current_step_outputs.append(
+                (
+                    sample_index,
+                    micro_order,
+                    None
+                    if sample_index is not None
+                    else _local_dummy_micro_slot(micro_order),
+                    output_tensor.float(),
+                    getattr(_module, "_art_root_output_token_uids", None),
+                )
             )
-        sample_index = self.current_micro_sample_index
-        micro_order = self.current_micro_order
-        self.current_step_outputs.append(
-            (
-                sample_index,
-                micro_order,
-                None
-                if sample_index is not None
-                else _local_dummy_micro_slot(micro_order),
-                output_tensor.float(),
-                getattr(_module, "_art_root_output_token_uids", None),
-            )
-        )
-        self._next_micro_order = micro_order + 1
+        self._next_micro_order_by_root[module_id] += 1
         self._inside_root_forward = False
 
     def set_step(
@@ -711,7 +776,9 @@ class ForwardTraceCapture:
         self.current_micro_sample_index = None
         self.current_micro_order = 0
         self.current_micro_module_call_counts = {}
-        self._next_micro_order = 0
+        self._next_micro_order_by_root = {
+            module_id: 0 for module_id in self._root_module_ids
+        }
         self._inside_root_forward = False
 
     def begin_micro(self, sample_index: int | None, micro_order: int) -> None:
@@ -1253,8 +1320,7 @@ class ForwardTraceCapture:
     @classmethod
     def _canonicalize_call_row_token_order(cls, call: dict[str, Any]) -> None:
         """Canonicalizes all row-aligned call tensors to global token order."""
-        cls._align_exact_zero_padding_row_token_uids(call)
-        cls._drop_exact_zero_padding_rows(call)
+        cls._drop_padding_rows(call)
         row_token_uids = call.get("row_token_uids")
         if not isinstance(row_token_uids, torch.Tensor) or row_token_uids.ndim != 1:
             return
@@ -1276,8 +1342,8 @@ class ForwardTraceCapture:
         call["row_token_uids"] = row_token_uids.index_select(0, order).contiguous()
 
     @classmethod
-    def _drop_exact_zero_padding_rows(cls, call: dict[str, Any]) -> None:
-        """Removes traced sequence-padding rows before comparing compact CP traces."""
+    def _drop_padding_rows(cls, call: dict[str, Any]) -> None:
+        """Removes rows explicitly marked as sequence padding by their token UID."""
         row_token_uids = call.get("row_token_uids")
         tensor = call.get("primary_output")
         if (
@@ -1292,9 +1358,6 @@ class ForwardTraceCapture:
         padding_rows = row_token_uids < 0
         if row_count == 0 or not bool(padding_rows.any().item()):
             return
-        flat = tensor.detach().reshape(row_count, -1)
-        if not bool((flat[padding_rows] == 0).all().item()):
-            return
         valid_rows = torch.nonzero(~padding_rows, as_tuple=False).reshape(-1)
         original_call = dict(call)
         for key, value in original_call.items():
@@ -1306,48 +1369,6 @@ class ForwardTraceCapture:
                 total_rows=row_count,
             )
         call["row_token_uids"] = row_token_uids.index_select(0, valid_rows).contiguous()
-
-    @staticmethod
-    def _align_exact_zero_padding_row_token_uids(call: dict[str, Any]) -> None:
-        """Moves padding UID markers onto exact-zero sequence-parallel pad rows."""
-        row_token_uids = call.get("row_token_uids")
-        tensor = call.get("primary_output")
-        if (
-            not isinstance(row_token_uids, torch.Tensor)
-            or row_token_uids.ndim != 1
-            or not isinstance(tensor, torch.Tensor)
-            or tensor.ndim == 0
-            or int(tensor.shape[0]) != int(row_token_uids.numel())
-        ):
-            return
-        row_count = int(row_token_uids.numel())
-        if row_count <= 1 or not bool((row_token_uids < 0).any().item()):
-            return
-        flat = tensor.detach().reshape(row_count, -1)
-        zero_rows = torch.nonzero(
-            (flat == 0).all(dim=1) & (row_token_uids >= 0),
-            as_tuple=False,
-        ).reshape(-1)
-        negative_rows = torch.nonzero(
-            (row_token_uids < 0) & ~(flat == 0).all(dim=1),
-            as_tuple=False,
-        ).reshape(-1)
-        if int(zero_rows.numel()) == 0 or int(zero_rows.numel()) != int(
-            negative_rows.numel()
-        ):
-            return
-        aligned = row_token_uids.clone()
-        for zero_pos, negative_pos in zip(
-            zero_rows.tolist(), negative_rows.tolist(), strict=True
-        ):
-            zero_pos = int(zero_pos)
-            negative_pos = int(negative_pos)
-            if zero_pos >= negative_pos:
-                return
-            shifted = aligned[zero_pos:negative_pos].clone()
-            aligned[zero_pos] = -1
-            aligned[zero_pos + 1 : negative_pos + 1] = shifted
-        call["row_token_uids"] = aligned
 
     @classmethod
     def _canonicalize_primary_output_tensor(
@@ -1641,6 +1662,13 @@ class ForwardTraceCapture:
             raise RuntimeError("Cannot merge empty rank value list")
         if all(isinstance(value, torch.Tensor) for value in values_by_rank):
             tensors = cast(list[torch.Tensor], values_by_rank)
+            if preferred_reduce == "replicated":
+                if not all(
+                    tensors[0].shape == tensor.shape and torch.equal(tensors[0], tensor)
+                    for tensor in tensors[1:]
+                ):
+                    raise RuntimeError("Replicated trace outputs diverged across ranks")
+                return tensors[0]
             if preferred_reduce == "sum" and all(
                 tensors[0].shape == tensor.shape for tensor in tensors[1:]
             ):
@@ -1801,8 +1829,8 @@ class ForwardTraceCapture:
                 preferred_cat_dim = None
                 preferred_reduce = None
                 if isinstance(primary_hint, dict):
-                    if primary_hint.get("op") == "sum":
-                        preferred_reduce = "sum"
+                    if primary_hint.get("op") in {"sum", "replicated"}:
+                        preferred_reduce = str(primary_hint["op"])
                     elif primary_hint.get("op") == "concat" and isinstance(
                         primary_hint.get("dim"), int
                     ):
@@ -1851,8 +1879,8 @@ class ForwardTraceCapture:
                         dim = selected_hint.get("dim")
                         if isinstance(dim, int):
                             preferred_cat_dim = dim
-                    elif op == "sum":
-                        preferred_reduce = "sum"
+                    elif op in {"sum", "replicated"}:
+                        preferred_reduce = op
                 if (
                     preferred_reduce is None
                     and preferred_cat_dim == 0
@@ -1942,7 +1970,7 @@ class ForwardTraceCapture:
                 preferred_cat_dim=preferred_cat_dim,
                 preferred_reduce=preferred_reduce,
             )
-        if preferred_cat_dim != -1 and preferred_reduce != "sum":
+        if preferred_cat_dim != -1 and preferred_reduce not in {"sum", "replicated"}:
             return cls._merge_rank_values(
                 values_by_rank,
                 preferred_cat_dim=preferred_cat_dim,

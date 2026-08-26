@@ -112,11 +112,16 @@ async def main():
         peak_lr=2e-4,
         schedule_type="cosine",
         warmup_ratio=0.1,
+        assistant_turns="last",
         verbose=True,
     )
 
 asyncio.run(main())
 ```
+
+Set `assistant_turns="last"` to calculate loss only on the final assistant
+message in each JSONL row. Earlier assistant messages remain available as
+context. If omitted, the helper trains on all assistant turns.
 
 ## Distillation
 

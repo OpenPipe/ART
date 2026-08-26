@@ -3,18 +3,22 @@ from __future__ import annotations
 import fcntl
 from hashlib import sha256
 from importlib.metadata import PackageNotFoundError, version
+import json
 import os
 from pathlib import Path
 import platform
 import shutil
 import subprocess
 import sys
+import tarfile
 import tempfile
+from urllib.request import Request, urlopen
 
 import torch
 
 PACKAGE = "art-deep-ep"
 SOURCE = Path(__file__).with_name("_hybrid_ep")
+NATIVE_ASSETS = Path(__file__).parent / "runtime" / "native_assets.json"
 
 
 def _output(command: list[str]) -> str:
@@ -43,47 +47,202 @@ def _arch_list() -> str:
                 "HybridEP requires exactly one TORCH_CUDA_ARCH_LIST value"
             )
         return architectures.pop()
-    if not torch.cuda.is_available():
-        raise RuntimeError(
-            "HybridEP setup requires a visible GPU or TORCH_CUDA_ARCH_LIST"
-        )
+    nvidia_smi = shutil.which("nvidia-smi")
+    if nvidia_smi is None:
+        raise RuntimeError("HybridEP setup requires nvidia-smi")
     capabilities = {
-        torch.cuda.get_device_capability(device)
-        for device in range(torch.cuda.device_count())
+        value.strip()
+        for value in _output(
+            [
+                nvidia_smi,
+                "--query-gpu=compute_cap",
+                "--format=csv,noheader,nounits",
+            ]
+        ).splitlines()
+        if value.strip()
     }
     if len(capabilities) != 1:
-        raise RuntimeError("HybridEP requires visible GPUs with one compute capability")
-    major, minor = capabilities.pop()
-    return f"{major}.{minor}"
+        raise RuntimeError("HybridEP requires host GPUs with one compute capability")
+    return capabilities.pop()
 
 
 def _source_hash() -> str:
     digest = sha256()
-    for path in sorted(path for path in SOURCE.rglob("*") if path.is_file()):
+    for path in sorted(
+        path
+        for path in SOURCE.rglob("*")
+        if path.is_file() and "__pycache__" not in path.parts
+    ):
         digest.update(str(path.relative_to(SOURCE)).encode())
         digest.update(path.read_bytes())
     return digest.hexdigest()
 
 
-def _build_identity() -> tuple[str, str]:
+def _native_archives() -> dict[str, tuple[Path, str]]:
+    from art.megatron.runtime.managed import _bundled_runtime_dir, _load_manifest
+
+    bundle = _bundled_runtime_dir()
+    if (bundle / "manifest.json").is_file():
+        manifest = _load_manifest(bundle)
+        return {
+            asset.filename: (bundle / asset.filename, asset.sha256)
+            for asset in manifest.source_archives
+        }
+
+    assets = json.loads(NATIVE_ASSETS.read_text())
+    root = _cache_root() / "native_archives"
+    root.mkdir(parents=True, exist_ok=True)
+    with (root / ".download.lock").open("w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        for filename, asset in assets.items():
+            path = root / filename
+            if path.is_file() and _file_hash(path) == asset["sha256"]:
+                continue
+            partial = path.with_suffix(path.suffix + ".partial")
+            try:
+                with (
+                    urlopen(
+                        Request(asset["url"], headers={"User-Agent": "openpipe-art"})
+                    ) as response,
+                    partial.open("wb") as output,
+                ):
+                    shutil.copyfileobj(response, output)
+                if _file_hash(partial) != asset["sha256"]:
+                    raise RuntimeError(f"Native asset checksum mismatch: {filename}")
+                partial.replace(path)
+            finally:
+                partial.unlink(missing_ok=True)
+    return {
+        filename: (root / filename, asset["sha256"])
+        for filename, asset in assets.items()
+    }
+
+
+def _file_hash(path: Path) -> str:
+    digest = sha256()
+    with path.open("rb") as file:
+        for chunk in iter(lambda: file.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _prepare_nixl_build_environment() -> str:
+    from art.distributed.nixl_runtime import configure_nixl_environment
+
+    paths = configure_nixl_environment()
+    runtime_identity = f"{paths.module}=={version(paths.module.replace('_', '-'))}"
+    headers = ("NIXL_INCLUDE_DIR", "NIXL_GPU_INCLUDE_DIR", "UCX_INCLUDE_DIR")
+    if all(name in os.environ and Path(os.environ[name]).is_dir() for name in headers):
+        return (
+            runtime_identity
+            + ":"
+            + sha256(
+                "\0".join(os.environ[name] for name in headers).encode()
+            ).hexdigest()
+        )
+    nixl_home = Path(os.environ.get("NIXL_HOME", ""))
+    ucx_home = Path(os.environ.get("UCX_HOME", ""))
+    if (nixl_home / "include" / "nixl.h").is_file() and (
+        ucx_home / "include" / "ucp" / "api" / "device" / "ucp_device_impl.h"
+    ).is_file():
+        os.environ.update(
+            NIXL_INCLUDE_DIR=str(nixl_home / "include"),
+            NIXL_GPU_INCLUDE_DIR=str(nixl_home / "include" / "gpu" / "ucx"),
+            UCX_INCLUDE_DIR=str(ucx_home / "include"),
+        )
+        return (
+            runtime_identity
+            + ":"
+            + sha256(f"{nixl_home}\0{ucx_home}".encode()).hexdigest()
+        )
+
+    archives = _native_archives()
+    required = {"nixl-de8115ca.tar.gz", "ucx-1.21.0.tar.gz"}
+    if archives.keys() != required:
+        raise RuntimeError(
+            f"Megatron runtime has the wrong source archives: {archives}"
+        )
+    identity = sha256(
+        "".join(archives[name][1] for name in sorted(archives)).encode()
+    ).hexdigest()
+    destination = _cache_root() / "native_sources" / identity
+    lock_path = destination.with_suffix(".lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if not destination.is_dir():
+            stage = Path(
+                tempfile.mkdtemp(prefix=f".{identity}.tmp-", dir=lock_path.parent)
+            )
+            try:
+                for name in sorted(required):
+                    with tarfile.open(archives[name][0]) as archive:
+                        archive.extractall(stage, filter="data")
+                stage.rename(destination)
+            finally:
+                if stage.exists():
+                    shutil.rmtree(stage)
+    nixl_source = next(destination.glob("nixl-*"), None)
+    ucx_source = next(destination.glob("ucx-*"), None)
+    if nixl_source is None or ucx_source is None:
+        raise RuntimeError(f"Native source archives are malformed: {destination}")
+    os.environ.update(
+        NIXL_INCLUDE_DIR=str(nixl_source / "src" / "api" / "cpp"),
+        NIXL_GPU_INCLUDE_DIR=str(nixl_source / "src" / "api" / "gpu" / "ucx"),
+        UCX_INCLUDE_DIR=str(ucx_source / "src"),
+        NIXL_LIBRARY_DIR=str(paths.library_dir),
+        NIXL_DEPENDENCY_LIBRARY_DIR=str(paths.dependency_library_dir),
+    )
+    return f"{runtime_identity}:{identity}"
+
+
+def _cuda_dependency_versions(cuda_home: Path) -> tuple[str, str]:
+    if torch.version.cuda and torch.version.cuda.startswith("12."):
+        return version("nvidia-cuda-cccl-cu12"), version("nvidia-nvtx-cu12")
+    if torch.version.cuda and torch.version.cuda.startswith("13."):
+        major, minor = torch.version.cuda.split(".")[:2]
+        cccl = _output(
+            ["dpkg-query", "-W", "-f=${Version}", f"cuda-cccl-{major}-{minor}"]
+        )
+        return cccl, version("nvidia-nvtx")
+    raise RuntimeError(f"HybridEP does not support torch CUDA {torch.version.cuda}")
+
+
+def _build_identity(
+    *, enable_multinode: bool | None = None, use_nixl: bool | None = None
+) -> tuple[str, str]:
     cuda_home = _cuda_home()
     arch_list = _arch_list()
     digest = sha256()
+    if enable_multinode is None:
+        enable_multinode = os.environ.get("HYBRID_EP_MULTINODE", "0") == "1"
+    if use_nixl is None:
+        use_nixl = os.environ.get("USE_NIXL", "0") == "1"
+    if use_nixl and not enable_multinode:
+        raise ValueError("NIXL HybridEP requires multi-node support")
+    nixl_runtime_identity = None
+    if use_nixl:
+        from art.distributed.nixl_runtime import validate_nixl_host
+
+        validate_nixl_host()
+        nixl_runtime_identity = _prepare_nixl_build_environment()
+    cccl_version, nvtx_version = _cuda_dependency_versions(cuda_home)
     values = [
         _source_hash(),
         sys.implementation.cache_tag,
         platform.machine(),
         torch.__version__,
         str(torch.version.cuda),
-        torch.__config__.show(),
-        version("nvidia-cuda-cccl-cu12"),
-        version("nvidia-nvtx-cu12"),
+        cccl_version,
+        nvtx_version,
         _output([str(cuda_home / "bin" / "nvcc"), "--version"]),
         _output([os.environ.get("CXX", "c++"), "--version"]),
         arch_list,
-        os.environ.get("HYBRID_EP_MULTINODE", "0"),
-        os.environ.get("USE_NIXL", "0"),
+        str(int(enable_multinode)),
+        str(int(use_nixl)),
     ]
+    if nixl_runtime_identity:
+        values.append(nixl_runtime_identity)
     for value in values:
         digest.update(value.encode())
         digest.update(b"\0")
@@ -99,6 +258,9 @@ def _installed_version() -> str | None:
 
 
 def _cache_root() -> Path:
+    root = os.environ.get("ART_MEGATRON_CACHE_ROOT")
+    if root:
+        return Path(root) / "hybrid_ep"
     return (
         Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache"))
         / "art"
@@ -107,8 +269,10 @@ def _cache_root() -> Path:
 
 
 def _uv() -> str:
-    if uv := shutil.which("uv"):
-        return uv
+    candidates = (Path(sys.executable).parent / "uv", shutil.which("uv"))
+    for candidate in candidates:
+        if candidate and Path(candidate).is_file():
+            return str(candidate)
     raise RuntimeError("HybridEP setup requires uv")
 
 
@@ -131,6 +295,7 @@ def _build_wheel(build_version: str, arch_list: str) -> Path:
             shutil.copytree(SOURCE, source)
             env = os.environ.copy()
             env["ART_HYBRID_EP_BUILD_VERSION"] = build_version
+            env["CUDA_HOME"] = str(_cuda_home())
             env["TORCH_CUDA_ARCH_LIST"] = arch_list
             subprocess.run(
                 [
@@ -182,12 +347,14 @@ def setup_hybrid_ep() -> str:
     return build_version
 
 
-def validate_hybrid_ep() -> None:
-    expected, _ = _build_identity()
-    if (installed := _installed_version()) != expected:
+def validate_hybrid_ep(*, require_multinode: bool = False) -> None:
+    candidates = [_build_identity(enable_multinode=True, use_nixl=True)[0]]
+    if not require_multinode:
+        candidates.append(_build_identity(enable_multinode=False, use_nixl=False)[0])
+    if (installed := _installed_version()) not in candidates:
         raise RuntimeError(
             "HybridEP is not built for this ART source and Megatron environment "
-            f"(expected {expected}, found {installed}). Run Megatron setup."
+            f"(expected one of {candidates}, found {installed}). Run Megatron setup."
         )
 
 

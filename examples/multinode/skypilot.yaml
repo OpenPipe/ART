@@ -1,0 +1,22 @@
+name: art-multinode
+
+num_nodes: 2
+
+workdir: .
+
+resources:
+  cpus: 4+
+  memory: 8+
+
+envs:
+  PYTHONUTF8: "1"
+
+setup: |
+  set -euo pipefail
+  uvx uv@0.11.7 sync --frozen --no-dev --extra distributed
+
+run: |
+  set -euo pipefail
+  exec .venv/bin/art-monarch skypilot \
+    --program examples/multinode/program.py:main \
+    --startup-timeout 90

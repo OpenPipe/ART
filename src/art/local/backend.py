@@ -16,8 +16,14 @@ from types import TracebackType
 from typing import TYPE_CHECKING, Any, AsyncIterator, Iterable, Literal, cast
 import warnings
 
+from art.utils.chat_template import (
+    chat_template_with_preserved_thinking,
+    configure_preserved_thinking_chat_template,
+)
 from art.utils.lifecycle import (
     PROCESS_SHUTDOWN_TIMEOUT_SECONDS,
+    complete_task,
+    complete_to_thread,
     process_shutdown_timeout,
 )
 
@@ -31,7 +37,7 @@ _AUTO_GPU_HOURLY_PRICING_USD = {
 
 import httpx
 import numpy as np
-import polars as pl
+from pydantic import BaseModel, ConfigDict
 import torch
 from tqdm import auto as tqdm
 from transformers import AutoTokenizer
@@ -89,8 +95,9 @@ from ..preprocessing.tokenize import (
     tokenize_sft_batch,
     tokenize_trajectory_groups,
 )
-from ..serving_capabilities import ServingCapabilities
+from ..serving_capabilities import FastMetricsSnapshot, ServingCapabilities
 from ..trajectories import Trajectory, TrajectoryGroup
+from ..trajectories._selection import automatic_training_model_selector
 from ..types import (
     Choice,
     LocalTrainResult,
@@ -113,59 +120,41 @@ from .checkpoints import (
 from .service import ModelService
 
 
-def _prometheus_values(text: str, name: str) -> list[float]:
-    values: list[float] = []
-    for line in text.splitlines():
-        if not line or line.startswith("#"):
-            continue
-        try:
-            sample, raw_value = line.rsplit(None, 1)
-        except ValueError:
-            continue
-        sample_name = sample.split("{", 1)[0]
-        if sample_name != name:
-            continue
-        try:
-            values.append(float(raw_value))
-        except ValueError:
-            continue
-    return values
+class _PackedTrainingBatch(BaseModel):
+    model_config = ConfigDict(extra="forbid", arbitrary_types_allowed=True)
+
+    payload: Any
+    num_sequences: int
+    sequence_length: int
+    trainable_assistant_tokens: int
+    loss_bearing_tokens: int
+    non_padding_tokens: int
+    logical_tokens: int
+    physical_tokens: int
+    include_moe_routing: bool
 
 
-def _prometheus_sum(text: str, name: str) -> float | None:
-    values = _prometheus_values(text, name)
-    if not values:
-        return None
-    return math.fsum(values)
+class _TrainStepVllmMetricsCollector:
+    def __init__(self, backend: "LocalBackend", model: Model) -> None:
+        self._backend = backend
+        self._model = model
+        self._client = httpx.AsyncClient(
+            timeout=1.0,
+            limits=httpx.Limits(max_connections=1, max_keepalive_connections=1),
+        )
+        self._snapshots: dict[
+            tuple[str, str, str, int], tuple[float, dict[str, float]]
+        ] = {}
 
+    async def collect(self) -> dict[str, float]:
+        return await self._backend._collect_train_step_vllm_metrics(
+            self._model,
+            client=self._client,
+            snapshots=self._snapshots,
+        )
 
-def _prometheus_sum_with_label(
-    text: str, name: str, label: str, value: str
-) -> float | None:
-    values: list[float] = []
-    needle = f'{label}="{value}"'
-    for line in text.splitlines():
-        if not line or line.startswith("#"):
-            continue
-        try:
-            sample, raw_value = line.rsplit(None, 1)
-        except ValueError:
-            continue
-        sample_name = sample.split("{", 1)[0]
-        if sample_name != name or needle not in sample:
-            continue
-        try:
-            values.append(float(raw_value))
-        except ValueError:
-            continue
-    return math.fsum(values) if values else None
-
-
-def _prometheus_mean(text: str, name: str) -> float | None:
-    values = _prometheus_values(text, name)
-    if not values:
-        return None
-    return math.fsum(values) / len(values)
+    async def aclose(self) -> None:
+        await self._client.aclose()
 
 
 def _configured_chat_template_value(
@@ -236,14 +225,39 @@ def _apply_configured_chat_template_server_args(
     *,
     base_model: str | None = None,
 ) -> None:
+    server_args = dict(config_dict.get("server_args", {}))
+    if server_args.get("chat_template") is not None:
+        if chat_template_content_format := internal_config.get(
+            "chat_template_content_format"
+        ):
+            server_args.setdefault(
+                "chat_template_content_format",
+                chat_template_content_format,
+            )
+        config_dict["server_args"] = server_args
+        return
     chat_template = _configured_chat_template_server_arg(internal_config)
     if chat_template is None and base_model is not None:
         chat_template = _model_support_default_chat_template(
             base_model, internal_config
         )
+    if chat_template is None and _should_probe_preserve_thinking_template(base_model):
+        try:
+            tokenizer = AutoTokenizer.from_pretrained(base_model)
+        except (OSError, ValueError) as error:
+            warnings.warn(
+                f"Could not load {base_model!r} to configure prior-thinking "
+                f"preservation: {error}",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+        else:
+            default = getattr(tokenizer, "chat_template", None)
+            preserved = chat_template_with_preserved_thinking(default)
+            if preserved != default:
+                chat_template = cast(str, preserved)
     if chat_template is None:
         return
-    server_args = dict(config_dict.get("server_args", {}))
     server_args.setdefault("chat_template", chat_template)
     if chat_template_content_format := internal_config.get(
         "chat_template_content_format"
@@ -253,6 +267,13 @@ def _apply_configured_chat_template_server_args(
             chat_template_content_format,
         )
     config_dict["server_args"] = server_args
+
+
+def _should_probe_preserve_thinking_template(base_model: str | None) -> bool:
+    if base_model is None:
+        return False
+    model_name = base_model.rstrip("/").rsplit("/", 1)[-1]
+    return model_name.startswith(("Qwen3-", "Qwen3.5-"))
 
 
 def _tokenizer_cache_key(
@@ -268,7 +289,9 @@ def _tokenizer_cache_key(
 def _load_training_tokenizer(base_model: str) -> PreTrainedTokenizerBase:
     return cast(
         PreTrainedTokenizerBase,
-        AutoTokenizer.from_pretrained(base_model),
+        configure_preserved_thinking_chat_template(
+            AutoTokenizer.from_pretrained(base_model)
+        ),
     )
 
 
@@ -316,8 +339,9 @@ class LocalBackend:
         self._grad_accumulation_sequences_by_service: dict[int, int] = {}
         self._provenance_update_tasks: set[asyncio.Task[None]] = set()
         self._vllm_metric_snapshots: dict[
-            tuple[str, str], tuple[float, dict[str, float]]
+            tuple[str, str, str, int], tuple[float, dict[str, float]]
         ] = {}
+        self._vllm_metrics_client: httpx.AsyncClient | None = None
         self._image_processors: dict[str, BaseImageProcessor | None] = {}
         self._requires_explicit_packed_sequence_length = False
         self._packed_sequence_length_requires_chunk_alignment = True
@@ -375,6 +399,13 @@ class LocalBackend:
     def supports_automatic_train_step_metrics(self) -> bool:
         return True
 
+    def _supports_concurrent_training_and_inference(
+        self, model: AnyTrainableModel
+    ) -> bool:
+        from ..dev.validate import is_dedicated_mode
+
+        return is_dedicated_mode(model._internal_config or dev.InternalModelConfig())
+
     def automatic_gpu_cost_per_hour_usd(self, model: Model) -> float | None:
         per_gpu_cost = self._resolve_gpu_cost_per_hour_usd()
         if per_gpu_cost is None:
@@ -385,65 +416,80 @@ class LocalBackend:
             return None
         return per_gpu_cost * gpu_count
 
+    def create_train_step_vllm_metrics_collector(
+        self, model: Model
+    ) -> _TrainStepVllmMetricsCollector:
+        return _TrainStepVllmMetricsCollector(self, model)
+
     async def collect_train_step_vllm_metrics(self, model: Model) -> dict[str, float]:
+        client = self._vllm_metrics_client
+        if client is None:
+            client = self._vllm_metrics_client = httpx.AsyncClient(
+                timeout=1.0,
+                limits=httpx.Limits(max_connections=4, max_keepalive_connections=4),
+            )
+        return await self._collect_train_step_vllm_metrics(
+            model,
+            client=client,
+            snapshots=self._vllm_metric_snapshots,
+        )
+
+    async def _collect_train_step_vllm_metrics(
+        self,
+        model: Model,
+        *,
+        client: httpx.AsyncClient,
+        snapshots: dict[tuple[str, str, str, int], tuple[float, dict[str, float]]],
+    ) -> dict[str, float]:
         capabilities = model._serving_capabilities
         if capabilities is None:
             raise RuntimeError("vLLM serving capabilities have not been discovered")
         capabilities.require("fast_metrics", operation="ART vLLM metrics collection")
-        base_url = model.inference_base_url
-        if not base_url or not base_url.startswith(("http://", "https://")):
-            raise RuntimeError(
-                "ART vLLM metrics require model.inference_base_url to point to the "
-                "dedicated ART vLLM runtime."
-            )
-
-        metrics_root = base_url.rstrip("/")
-        if metrics_root.endswith("/v1"):
-            metrics_root = metrics_root[: -len("/v1")]
-        headers = (
-            {"Authorization": f"Bearer {model.inference_api_key}"}
-            if model.inference_api_key
-            else None
-        )
+        endpoint = capabilities.fast_metrics
+        assert endpoint is not None
+        metrics_url = str(endpoint.url)
         try:
-            async with httpx.AsyncClient(timeout=1.0) as client:
-                response = await client.get(
-                    f"{metrics_root}/art/metrics",
-                    headers=headers,
-                )
-                response.raise_for_status()
-                payload = response.json()
+            response = await client.get(
+                metrics_url,
+                headers=(
+                    {"Authorization": f"Bearer {model.inference_api_key}"}
+                    if model.inference_api_key
+                    else None
+                ),
+            )
+            response.raise_for_status()
+            payload = FastMetricsSnapshot.model_validate(response.json())
         except httpx.TimeoutException:
             raise ArtVllmMetricsTimeoutError(
-                f"Timed out collecting ART vLLM metrics from {metrics_root}."
+                f"Timed out collecting ART vLLM metrics from {metrics_url}."
             )
         except (httpx.HTTPError, ValueError) as exc:
             raise RuntimeError(
-                "ART vLLM metrics require the dedicated ART runtime endpoint at "
-                f"{metrics_root}/art/metrics."
+                f"ART vLLM metrics endpoint returned an invalid response from "
+                f"{metrics_url}."
             ) from exc
 
-        raw_metrics = payload.get("metrics") if isinstance(payload, dict) else None
-        if not isinstance(raw_metrics, dict):
-            raise RuntimeError(
-                "ART vLLM metrics endpoint returned an invalid payload: expected "
-                "a top-level metrics object."
-            )
+        raw_metrics = payload.metrics
+        process_uuid = payload.process_uuid
+        generation = payload.generation
 
         def required_metric(name: str) -> float:
-            raw_value = raw_metrics.get(name)
-            if not isinstance(raw_value, (int, float)):
+            try:
+                return raw_metrics[name]
+            except KeyError:
                 raise RuntimeError(
                     f"ART vLLM metrics endpoint did not provide numeric {name!r}."
-                )
-            return float(raw_value)
+                ) from None
 
         def optional_metric(name: str) -> float | None:
-            raw_value = raw_metrics.get(name)
-            if not isinstance(raw_value, (int, float)):
-                return None
-            return float(raw_value)
+            return raw_metrics.get(name)
 
+        counter_names = (
+            "prompt_tokens_total",
+            "generation_tokens_total",
+            "prefix_cache_queries_total",
+            "prefix_cache_hits_total",
+        )
         snapshot = {
             "prompt_tokens_total": required_metric("prompt_tokens_total"),
             "generation_tokens_total": required_metric("generation_tokens_total"),
@@ -451,8 +497,7 @@ class LocalBackend:
             "prefix_cache_hits_total": required_metric("prefix_cache_hits_total"),
             "num_preemptions_total": required_metric("num_preempted_reqs_total"),
         }
-        metrics: dict[str, float] = {}
-        gauges = {
+        metrics: dict[str, float] = {
             "vllm/num_requests_running": required_metric("num_requests_running"),
             "vllm/num_requests_waiting": required_metric("num_requests_waiting"),
             "vllm/num_requests_waiting_capacity": required_metric(
@@ -461,9 +506,6 @@ class LocalBackend:
             "vllm/kv_cache_usage_perc": required_metric("kv_cache_usage_perc"),
             "vllm/num_preemptions_total": snapshot["num_preemptions_total"],
         }
-        for key, value in gauges.items():
-            if value is not None:
-                metrics[key] = value
         for name in (
             "max_num_seqs",
             "max_num_batched_tokens",
@@ -475,52 +517,52 @@ class LocalBackend:
             if value is not None:
                 metrics[f"vllm/{name}"] = value
 
+        current = {name: snapshot[name] for name in counter_names}
         now = time.monotonic()
-        storage_key = self._model_storage_key(model)
-        previous = self._vllm_metric_snapshots.get(storage_key)
+        model_key = self._model_storage_key(model)
+        key = (*model_key, process_uuid, generation)
+        previous = snapshots.get(key)
+        snapshots[key] = (now, current)
+        for stale in tuple(snapshots):
+            if stale[:2] == model_key and stale != key:
+                del snapshots[stale]
+        delta_queries = 0.0
         if previous is not None:
             previous_time, previous_snapshot = previous
-            elapsed = max(0.0, now - previous_time)
+            elapsed = now - previous_time
             if elapsed > 0:
-                prompt_tokens = snapshot["prompt_tokens_total"]
-                previous_prompt_tokens = previous_snapshot.get("prompt_tokens_total")
-                if prompt_tokens is not None and previous_prompt_tokens is not None:
-                    metrics["vllm/prompt_tok_per_s"] = max(
-                        0.0, (prompt_tokens - previous_prompt_tokens) / elapsed
+                metrics["vllm/prompt_tok_per_s"] = max(
+                    0.0,
+                    (
+                        current["prompt_tokens_total"]
+                        - previous_snapshot["prompt_tokens_total"]
                     )
-                generation_tokens = snapshot["generation_tokens_total"]
-                previous_generation_tokens = previous_snapshot.get(
-                    "generation_tokens_total"
+                    / elapsed,
                 )
-                if (
-                    generation_tokens is not None
-                    and previous_generation_tokens is not None
-                ):
-                    metrics["vllm/completion_tok_per_s"] = max(
-                        0.0, (generation_tokens - previous_generation_tokens) / elapsed
+                metrics["vllm/completion_tok_per_s"] = max(
+                    0.0,
+                    (
+                        current["generation_tokens_total"]
+                        - previous_snapshot["generation_tokens_total"]
                     )
-
-            prefix_queries = snapshot["prefix_cache_queries_total"]
-            previous_prefix_queries = previous_snapshot.get(
-                "prefix_cache_queries_total"
+                    / elapsed,
+                )
+            delta_queries = max(
+                0.0,
+                current["prefix_cache_queries_total"]
+                - previous_snapshot["prefix_cache_queries_total"],
             )
-            prefix_hits = snapshot["prefix_cache_hits_total"]
-            previous_prefix_hits = previous_snapshot.get("prefix_cache_hits_total")
-            if (
-                prefix_queries is not None
-                and previous_prefix_queries is not None
-                and prefix_hits is not None
-                and previous_prefix_hits is not None
-            ):
-                delta_queries = prefix_queries - previous_prefix_queries
-                if delta_queries > 0:
-                    metrics["vllm/prefix_cache_hit_rate"] = max(
-                        0.0,
-                        min(1.0, (prefix_hits - previous_prefix_hits) / delta_queries),
-                    )
-        elif (
-            snapshot["prefix_cache_queries_total"] is not None
-            and snapshot["prefix_cache_hits_total"] is not None
+            delta_hits = max(
+                0.0,
+                current["prefix_cache_hits_total"]
+                - previous_snapshot["prefix_cache_hits_total"],
+            )
+            if delta_queries > 0:
+                metrics["vllm/prefix_cache_hit_rate"] = min(
+                    1.0, delta_hits / delta_queries
+                )
+        if (
+            "vllm/prefix_cache_hit_rate" not in metrics
             and snapshot["prefix_cache_queries_total"] > 0
         ):
             metrics["vllm/prefix_cache_hit_rate"] = max(
@@ -532,10 +574,6 @@ class LocalBackend:
                 ),
             )
 
-        self._vllm_metric_snapshots[storage_key] = (
-            now,
-            {key: value for key, value in snapshot.items() if value is not None},
-        )
         return metrics
 
     def _resolve_gpu_cost_per_hour_usd(self) -> float | None:
@@ -621,10 +659,18 @@ class LocalBackend:
         await self.close()
 
     async def close(self) -> None:
+        task = asyncio.create_task(self._close_local_backend())
+        _, cancelled = await complete_task(task)
+        if cancelled is not None:
+            raise cancelled
+
+    async def _close_local_backend(self) -> None:
         """
         If running vLLM in a separate process, this will kill that process and close the communication threads.
         """
+        failures: list[Exception] = []
         for service in self._services.values():
+            propagate = bool(getattr(service, "propagate_close_errors", False))
             try:
                 aclose = getattr(service, "aclose", None)
                 if aclose is None:
@@ -633,24 +679,40 @@ class LocalBackend:
                         close()
                 else:
                     await asyncio.wait_for(
-                        aclose(), timeout=_SERVICE_CLOSE_TIMEOUT_SECONDS
+                        aclose(),
+                        timeout=float(
+                            getattr(
+                                service,
+                                "close_timeout_s",
+                                _SERVICE_CLOSE_TIMEOUT_SECONDS,
+                            )
+                        ),
                     )
-            except TimeoutError:
-                logger.warning("Timed out while closing local backend service.")
-            except Exception:
-                logger.exception("Failed to close local backend service.")
+            except Exception as error:
+                if propagate:
+                    failures.append(error)
+                else:
+                    logger.exception("Failed to close local backend service.")
             finally:
                 try:
                     close_proxy(service)
-                except Exception:
-                    logger.exception("Failed to close local backend service proxy.")
+                except Exception as error:
+                    if propagate:
+                        failures.append(error)
+                    else:
+                        logger.exception("Failed to close local backend service proxy.")
         self._services.clear()
         self._adapter_leases.clear()
+        client, self._vllm_metrics_client = self._vllm_metrics_client, None
+        if client is not None:
+            await client.aclose()
         await self._drain_provenance_update_tasks()
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
             torch.cuda.ipc_collect()
+        if failures:
+            raise ExceptionGroup("distributed backend close failed", failures)
 
     def _close(self) -> None:
         self._cancel_provenance_update_tasks()
@@ -668,6 +730,14 @@ class LocalBackend:
                     logger.exception("Failed to close local backend service proxy.")
         self._services.clear()
         self._adapter_leases.clear()
+        client, self._vllm_metrics_client = self._vllm_metrics_client, None
+        if client is not None:
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                asyncio.run(client.aclose())
+            else:
+                loop.create_task(client.aclose())
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -862,11 +932,14 @@ class LocalBackend:
         if service is None:
             return
         manager = self._adapter_leases.get(storage_key)
-        if manager is not None:
-            retain_steps = set(retain_steps) | manager.active_steps()
         prune_loaded_adapters = getattr(service, "prune_loaded_adapters", None)
-        if prune_loaded_adapters is not None:
+        if prune_loaded_adapters is None:
+            return
+        if manager is None:
             await prune_loaded_adapters(retain_steps=retain_steps)
+            return
+        async with manager.prune_guard() as leased_steps:
+            await prune_loaded_adapters(retain_steps=set(retain_steps) | leased_steps)
 
     async def _get_service(self, model: TrainableModel) -> ModelService:
         from ..dev.get_model_config import get_model_config
@@ -901,11 +974,14 @@ class LocalBackend:
                     str(g) for g in config["trainer_gpu_ids"]
                 )
 
-            self._services[storage_key] = service_class(
-                model_name=model.name,
-                base_model=model.base_model,
-                config=config,
-                output_dir=get_model_dir(model=model, art_path=self._path),
+            self._services[storage_key] = cast(
+                ModelService,
+                service_class(
+                    model_name=model.name,
+                    base_model=model.base_model,
+                    config=config,
+                    output_dir=get_model_dir(model=model, art_path=self._path),
+                ),
             )
             if not dedicated and not self._in_process:
                 self._services[storage_key] = move_to_child_process(
@@ -949,6 +1025,12 @@ class LocalBackend:
         chat_template_tool_schema_format = self._chat_template_tool_schema_format(
             internal_config
         )
+        model_max_sequence_length = self._model_max_sequence_length(model)
+        training_max_sequence_length = (
+            min(model_max_sequence_length, packed_sequence_length)
+            if packed_sequence_length is not None
+            else model_max_sequence_length
+        )
         tokenized_results = list(
             tokenize_trajectory_groups(
                 tokenizer,
@@ -958,11 +1040,14 @@ class LocalBackend:
                 image_processor=self._image_processors[model.base_model],
                 chat_template_kwargs=chat_template_kwargs,
                 chat_template_tool_schema_format=chat_template_tool_schema_format,
+                model=automatic_training_model_selector(
+                    self._model_inference_name(model)
+                ),
+                _max_sequence_length=training_max_sequence_length,
             )
         )
         if not tokenized_results:
             return None
-        model_max_sequence_length = self._model_max_sequence_length(model)
         too_long_for_model = [
             result
             for result in tokenized_results
@@ -1043,7 +1128,7 @@ class LocalBackend:
             not allow_training_without_logprobs
             and np.isnan(packed_tensors["logprobs"]).all()
         ):
-            print(
+            logger.warning(
                 "There are no assistant logprobs to train on. Did you forget to include at least one Choice in Trajectory.messages_and_choices?"
             )
             return None
@@ -1052,7 +1137,7 @@ class LocalBackend:
                 packed_tensors, get_model_dir(model=model, art_path=self._path)
             )
         else:
-            print(
+            logger.info(
                 f"Packed {len(tokenized_results)} trajectories into {packed_tensors['tokens'].shape[0]} sequences of length {packed_tensors['tokens'].shape[1]}"
             )
         return packed_tensors
@@ -1102,6 +1187,8 @@ class LocalBackend:
         """Delete checkpoint files, keeping only the specified steps."""
 
         output_dir = get_model_dir(model=model, art_path=self._path)
+        from ..megatron.optimizer_state import optimizer_retention_lease
+
         service = await self._get_service(model)
         try:
             from ..tinker.service import TinkerService
@@ -1111,7 +1198,12 @@ class LocalBackend:
                 return
         except ImportError:
             pass
-        delete_checkpoints(output_dir, steps_to_keep)
+
+        def delete_retained() -> None:
+            with optimizer_retention_lease(output_dir, set(steps_to_keep)) as protected:
+                delete_checkpoints(output_dir, sorted(protected))
+
+        await asyncio.to_thread(delete_retained)
 
     async def _prepare_backend_for_training(
         self,
@@ -1120,7 +1212,9 @@ class LocalBackend:
     ) -> tuple[str, str]:
         config_dict: dict = dict(config or {})
         internal_config = cast(dev.InternalModelConfig, model._internal_config or {})
-        _apply_configured_chat_template_server_args(config_dict, internal_config)
+        _apply_configured_chat_template_server_args(
+            config_dict, internal_config, base_model=model.base_model
+        )
         if self._model_uses_expert_replay(model):
             engine_args = dict(config_dict.get("engine_args", {}))
             engine_args["enable_return_routed_experts"] = True
@@ -1230,6 +1324,8 @@ class LocalBackend:
         # Checkpoint behavior
         save_checkpoint: bool = True,
         optimizer_save_interval: int = 5,
+        final_training_step: int | None = None,
+        grad_accumulation_sequences: int | None = None,
         # Verbosity
         verbose: bool = False,
     ) -> LocalTrainResult:
@@ -1366,6 +1462,8 @@ class LocalBackend:
             num_trajectories_learning_rate_multiplier_power=num_trajectories_learning_rate_multiplier_power,
             kl_ref_adapter_path=resolved_kl_ref_adapter_path,
             optimizer_save_interval=optimizer_save_interval,
+            final_training_step=final_training_step,
+            grad_accumulation_sequences=grad_accumulation_sequences,
         )
 
         # Collect metrics from training
@@ -1427,6 +1525,57 @@ class LocalBackend:
         self._provenance_update_tasks.add(task)
         task.add_done_callback(self._provenance_update_tasks.discard)
 
+    async def _advance_skipped_step(
+        self,
+        model: TrainableModel,
+        service: ModelService,
+        current_step: int,
+        next_step: int,
+    ) -> dict[str, float]:
+        model_dir = get_model_dir(model=model, art_path=self._path)
+        current = get_step_checkpoint_dir(model_dir, current_step)
+        if not os.path.exists(current):
+            return {}
+        checkpoint = get_step_checkpoint_dir(model_dir, next_step)
+        if os.path.exists(checkpoint):
+            raise RuntimeError(f"Refusing to replace checkpoint {checkpoint}")
+        registration_started = False
+        try:
+            _, cancelled = await complete_to_thread(
+                lambda: shutil.copytree(current, checkpoint)
+            )
+            if cancelled is not None:
+                raise cancelled
+            registration_started = True
+            await service.register_lora_for_step(next_step, checkpoint)
+        except BaseException as error:
+            failures: list[BaseException] = [error]
+            if registration_started:
+                self._services.pop(self._model_storage_key(model), None)
+                try:
+                    _, close_cancelled = await complete_task(
+                        asyncio.create_task(service.aclose())
+                    )
+                    if close_cancelled is not None:
+                        failures.append(close_cancelled)
+                except BaseException as close_error:
+                    failures.append(close_error)
+            if os.path.exists(checkpoint):
+                try:
+                    _, remove_cancelled = await complete_to_thread(
+                        lambda: shutil.rmtree(checkpoint)
+                    )
+                    if remove_cancelled is not None:
+                        failures.append(remove_cancelled)
+                except BaseException as remove_error:
+                    failures.append(remove_error)
+            if len(failures) > 1:
+                raise BaseExceptionGroup(
+                    "skipped-step publication and rollback failed", failures
+                ) from None
+            raise
+        return {}
+
     async def _train_model(
         self,
         model: TrainableModel,
@@ -1448,7 +1597,190 @@ class LocalBackend:
             include_trainable_groups=True,
         )
         include_moe_routing = self._model_uses_expert_replay(model)
-        packed_tensors = self._get_packed_tensors(
+        packed_batch = await self._prepare_training_batch(
+            model,
+            trajectory_groups,
+            dev_config,
+            include_moe_routing=include_moe_routing,
+        )
+        if packed_batch is None:
+            print(
+                "Skipping tuning as there is no suitable data. "
+                "This can happen when all the trajectories in the same group "
+                "have the same reward and thus no advantage to train on."
+            )
+
+            # Still advance the step by renaming the checkpoint directory
+            current_step = await self._get_step(model)
+            next_step = current_step + 1
+            logger.info(
+                f"[BACKEND] _train_model SKIP: current_step={current_step} "
+                f"next_step={next_step} (all rewards equal)"
+            )
+            advance_metrics = await self._advance_skipped_step(
+                model, service, current_step, next_step
+            )
+            logger.info(
+                f"[BACKEND] _train_model SKIP: advanced checkpoint "
+                f"{current_step} -> {next_step}"
+            )
+
+            # Yield metrics showing no groups were trainable
+            # (the frontend will handle logging)
+            yield {
+                **base_metrics,
+                "data/step_num_groups_trainable": 0.0,
+                "data/step_trainable_assistant_tokens": 0.0,
+                "data/step_nonpadding_logical_tokens": 0.0,
+                "data/step_loss_bearing_tokens": 0.0,
+                "data/step_executed_token_equivalents": 0.0,
+                "data/step_nominal_schedule_capacity_tokens": 0.0,
+                "data/step_dummy_executed_token_equivalents": 0.0,
+                "data/step_dummy_schedule_capacity_tokens": 0.0,
+                "data/step_unused_packed_capacity_tokens": 0.0,
+                "data/step_unused_and_dummy_ratio": 0.0,
+                TRAIN_GRADIENT_STEPS_KEY: 0.0,
+                **advance_metrics,
+            }
+            return
+        async with self._training_batch_lifecycle(packed_batch):
+            base_metrics["data/step_trainable_assistant_tokens"] = float(
+                packed_batch.trainable_assistant_tokens
+            )
+            packed_sequences = packed_batch.num_sequences
+            packed_sequence_length = packed_batch.sequence_length
+            non_padding_tokens = packed_batch.non_padding_tokens
+            service_dev_config = cast(dev.TrainConfig, {**dev_config})
+            grad_accumulation_sequences = (
+                await self._resolve_grad_accumulation_sequences(service, config)
+            )
+            fallback_gradient_steps = math.ceil(
+                packed_sequences / grad_accumulation_sequences
+            )
+            packed_train_tokens = int(
+                fallback_gradient_steps
+                * grad_accumulation_sequences
+                * packed_sequence_length
+            )
+            base_metrics.update(
+                {
+                    "data/step_packed_sequences": float(packed_sequences),
+                    "data/step_nonpadding_logical_tokens": float(non_padding_tokens),
+                    "data/step_loss_bearing_tokens": float(
+                        packed_batch.loss_bearing_tokens
+                    ),
+                    "data/step_executed_token_equivalents": float(packed_train_tokens),
+                    "data/step_nominal_schedule_capacity_tokens": float(
+                        packed_train_tokens
+                    ),
+                    "data/step_dummy_executed_token_equivalents": 0.0,
+                    "data/step_dummy_schedule_capacity_tokens": 0.0,
+                    "data/step_unused_packed_capacity_tokens": float(
+                        packed_train_tokens - non_padding_tokens
+                    ),
+                    "data/step_unused_and_dummy_ratio": (
+                        float(packed_train_tokens - non_padding_tokens)
+                        / packed_train_tokens
+                    ),
+                    "prefix_tree/logical_tokens": float(packed_batch.logical_tokens),
+                    "prefix_tree/physical_tokens": float(packed_batch.physical_tokens),
+                    "prefix_tree/compression_ratio": (
+                        packed_batch.logical_tokens / packed_batch.physical_tokens
+                    ),
+                }
+            )
+            # The frontend applies reward scaling and logs the resulting metrics.
+            pbar = tqdm.tqdm(
+                total=fallback_gradient_steps,
+                desc="train",
+                disable=not verbose,
+            )
+            reported_gradient_steps: int | None = None
+            try:
+                async for result in self._stream_prepared_training(
+                    model,
+                    service,
+                    packed_batch,
+                    config,
+                    service_dev_config,
+                    grad_accumulation_sequences,
+                    verbose,
+                ):
+                    raw_num_gradient_steps = result.pop(TRAIN_GRADIENT_STEPS_KEY, None)
+                    if raw_num_gradient_steps is not None:
+                        num_gradient_steps = int(raw_num_gradient_steps)
+                        if reported_gradient_steps is None:
+                            reported_gradient_steps = num_gradient_steps
+                            if pbar.total != num_gradient_steps:
+                                pbar.total = num_gradient_steps
+                                pbar.refresh()
+                        else:
+                            assert num_gradient_steps == reported_gradient_steps, (
+                                f"num_gradient_steps {num_gradient_steps} != "
+                                f"reported_gradient_steps {reported_gradient_steps}"
+                            )
+                    else:
+                        num_gradient_steps = (
+                            reported_gradient_steps or fallback_gradient_steps
+                        )
+                    yield {
+                        **base_metrics,
+                        **result,
+                        TRAIN_GRADIENT_STEPS_KEY: float(num_gradient_steps),
+                    }
+                    if verbose:
+                        pbar.update(1)
+                        pbar.set_postfix(result)
+            finally:
+                pbar.close()
+            if verbose:
+                print("_train_model complete")
+
+    @asynccontextmanager
+    async def _training_batch_lifecycle(
+        self, batch: _PackedTrainingBatch
+    ) -> AsyncIterator[None]:
+        primary: BaseException | None = None
+        try:
+            yield
+        except BaseException as error:
+            primary = error
+            raise
+        finally:
+            try:
+                _, cancelled = await complete_task(
+                    asyncio.create_task(
+                        self._finish_training_batch(batch, failed=primary is not None)
+                    )
+                )
+                if cancelled is not None:
+                    raise cancelled
+            except BaseException as release_error:
+                if primary is None:
+                    raise
+                if release_error is not primary:
+                    primary.add_note(
+                        "training-batch release also failed: "
+                        f"{type(release_error).__name__}: {release_error}"
+                    )
+
+    async def _finish_training_batch(
+        self, batch: _PackedTrainingBatch, *, failed: bool
+    ) -> None:
+        await self._release_training_batch(batch)
+
+    async def _release_training_batch(self, batch: _PackedTrainingBatch) -> None:
+        pass
+
+    async def _prepare_training_batch(
+        self,
+        model: TrainableModel,
+        trajectory_groups: list[TrajectoryGroup],
+        dev_config: dev.TrainConfig,
+        *,
+        include_moe_routing: bool,
+    ) -> _PackedTrainingBatch | None:
+        packed = self._get_packed_tensors(
             model,
             trajectory_groups,
             advantage_balance=dev_config.get("advantage_balance", 0.0),
@@ -1463,102 +1795,37 @@ class LocalBackend:
             ),
             include_moe_routing=include_moe_routing,
         )
-        if packed_tensors is None:
-            print(
-                "Skipping tuning as there is no suitable data. "
-                "This can happen when all the trajectories in the same group "
-                "have the same reward and thus no advantage to train on."
-            )
+        if packed is None:
+            return None
+        num_sequences, sequence_length = packed["tokens"].shape
+        packing_stats = packed["prefix_tree_packing_stats"]
+        return _PackedTrainingBatch(
+            payload=packed,
+            num_sequences=num_sequences,
+            sequence_length=sequence_length,
+            trainable_assistant_tokens=int(packed["assistant_mask"].sum().item()),
+            loss_bearing_tokens=int(packed["assistant_mask"][:, 1:].sum().item()),
+            non_padding_tokens=int((packed["group_ids"] != -1).sum().item()),
+            logical_tokens=packing_stats["logical_tokens"],
+            physical_tokens=packing_stats["physical_tokens"],
+            include_moe_routing=include_moe_routing,
+        )
 
-            # Still advance the step by renaming the checkpoint directory
-            current_step = self.__get_step(model)
-            next_step = current_step + 1
-            logger.info(
-                f"[BACKEND] _train_model SKIP: current_step={current_step} "
-                f"next_step={next_step} (all rewards equal)"
-            )
-            current_checkpoint_dir = get_step_checkpoint_dir(
-                get_model_dir(model=model, art_path=self._path), current_step
-            )
-            next_checkpoint_dir = get_step_checkpoint_dir(
-                get_model_dir(model=model, art_path=self._path), next_step
-            )
-
-            # If the current checkpoint exists, copy it to the next step
-            if os.path.exists(current_checkpoint_dir):
-                shutil.copytree(
-                    current_checkpoint_dir,
-                    next_checkpoint_dir,
-                    dirs_exist_ok=True,
-                )
-                logger.info(
-                    f"[BACKEND] _train_model SKIP: copied checkpoint "
-                    f"{current_step} -> {next_step}, calling register_lora_for_step..."
-                )
-
-                try:
-                    # Register the copied checkpoint as a new LoRA adapter
-                    # so it's available for inference at the new step
-                    register_lora_for_step = getattr(
-                        service, "register_lora_for_step", None
-                    )
-                    if callable(register_lora_for_step):
-                        await register_lora_for_step(next_step, next_checkpoint_dir)
-                    logger.info(
-                        f"[BACKEND] _train_model SKIP: register_lora_for_step "
-                        f"completed for step {next_step}"
-                    )
-                except ModuleNotFoundError:
-                    pass  # Unsloth is not installed
-
-            # Yield metrics showing no groups were trainable
-            # (the frontend will handle logging)
-            yield {
-                **base_metrics,
-                "data/step_num_groups_trainable": 0.0,
-                "data/step_trainable_assistant_tokens": 0.0,
-                TRAIN_GRADIENT_STEPS_KEY: 0.0,
-            }
-            return
-        base_metrics["data/step_trainable_assistant_tokens"] = float(
-            packed_tensors["assistant_mask"].sum().item()
+    async def _stream_prepared_training(
+        self,
+        model: TrainableModel,
+        service: ModelService,
+        batch: _PackedTrainingBatch,
+        config: TrainConfig,
+        service_dev_config: dev.TrainConfig,
+        grad_accumulation_sequences: int,
+        verbose: bool,
+    ) -> AsyncIterator[dict[str, float]]:
+        packed = cast(PackedTensors, batch.payload)
+        disk = packed_tensors_to_dir(
+            packed, f"{get_model_dir(model=model, art_path=self._path)}/tensors"
         )
-        packed_sequences, packed_sequence_length = packed_tensors["tokens"].shape
-        non_padding_tokens = int((packed_tensors["group_ids"] != -1).sum().item())
-        packing_stats = packed_tensors["prefix_tree_packing_stats"]
-        disk_packed_tensors = packed_tensors_to_dir(
-            packed_tensors, f"{get_model_dir(model=model, art_path=self._path)}/tensors"
-        )
-        service_dev_config = cast(dev.TrainConfig, {**dev_config})
-        grad_accumulation_sequences = await self._resolve_grad_accumulation_sequences(
-            service,
-            config,
-        )
-        fallback_gradient_steps = math.ceil(
-            packed_sequences / grad_accumulation_sequences
-        )
-        packed_train_tokens = int(
-            fallback_gradient_steps
-            * grad_accumulation_sequences
-            * packed_sequence_length
-        )
-        base_metrics.update(
-            {
-                "data/step_packed_sequences": float(packed_sequences),
-                "data/step_packed_train_tokens": float(packed_train_tokens),
-                "data/step_non_padding_train_tokens": float(non_padding_tokens),
-                "data/step_padding_ratio": (
-                    float(packed_train_tokens - non_padding_tokens)
-                    / packed_train_tokens
-                ),
-                "prefix_tree/logical_tokens": float(packing_stats["logical_tokens"]),
-                "prefix_tree/physical_tokens": float(packing_stats["physical_tokens"]),
-                "prefix_tree/compression_ratio": (
-                    packing_stats["logical_tokens"] / packing_stats["physical_tokens"]
-                ),
-            }
-        )
-        if include_moe_routing:
+        if batch.include_moe_routing:
             from ..megatron.routing_replay import (
                 build_moe_routing_replay_bundle_from_packed_tensors,
             )
@@ -1568,42 +1835,13 @@ class LocalBackend:
                 "moe_routing_replay"
             )
             build_moe_routing_replay_bundle_from_packed_tensors(
-                packed_tensors=packed_tensors,
+                packed_tensors=packed,
                 global_grad_accumulation_sequences=grad_accumulation_sequences,
             ).to_dir(routing_replay_dir)
             service_dev_config["moe_routing_replay_path"] = routing_replay_dir
             service_dev_config["moe_routing_replay_strict"] = True
-        # Note: scale_learning_rate_by_reward_std_dev is now handled by the frontend (Model.train())
-        pbar = tqdm.tqdm(total=fallback_gradient_steps, desc="train")
-        reported_gradient_steps: int | None = None
-        async for result in service.train(
-            disk_packed_tensors, config, service_dev_config, verbose
-        ):
-            raw_num_gradient_steps = result.pop(TRAIN_GRADIENT_STEPS_KEY, None)
-            if raw_num_gradient_steps is not None:
-                num_gradient_steps = int(raw_num_gradient_steps)
-                if reported_gradient_steps is None:
-                    reported_gradient_steps = num_gradient_steps
-                    if pbar.total != num_gradient_steps:
-                        pbar.total = num_gradient_steps
-                        pbar.refresh()
-                else:
-                    assert num_gradient_steps == reported_gradient_steps, (
-                        f"num_gradient_steps {num_gradient_steps} != reported_gradient_steps {reported_gradient_steps}"
-                    )
-            else:
-                num_gradient_steps = reported_gradient_steps or fallback_gradient_steps
-            yield {
-                **base_metrics,
-                **result,
-                TRAIN_GRADIENT_STEPS_KEY: float(num_gradient_steps),
-            }
-            pbar.update(1)
-            pbar.set_postfix(result)
-        pbar.close()
-        # Note: Metrics logging is now handled by the frontend (Model.train())
-        if verbose:
-            print("_train_model complete")
+        async for result in service.train(disk, config, service_dev_config, verbose):
+            yield result
 
     async def _resolve_grad_accumulation_sequences(
         self,
@@ -1611,26 +1849,15 @@ class LocalBackend:
         config: TrainConfig,
     ) -> int:
         if config.grad_accumulation_sequences is not None:
-            return max(1, int(config.grad_accumulation_sequences))
+            return int(await service.resolve_global_grad_accumulation_sequences(config))
 
         service_key = id(service)
         if service_key in self._grad_accumulation_sequences_by_service:
             return self._grad_accumulation_sequences_by_service[service_key]
 
-        resolver = getattr(
-            cast(Any, service),
-            "resolve_global_grad_accumulation_sequences",
-            None,
-        )
-        if callable(resolver):
-            resolved = max(1, int(await resolver(config)))
-        else:
-            resolved = 1
+        resolved = int(await service.resolve_global_grad_accumulation_sequences(config))
         self._grad_accumulation_sequences_by_service[service_key] = resolved
         return resolved
-
-    # Note: _get_reward_std_dev_learning_rate_multiplier and _log_metrics
-    # have been moved to the Model class (frontend)
 
     async def _train_sft(
         self,
@@ -1728,19 +1955,20 @@ class LocalBackend:
         # Get the service and train
         service = await self._get_service(model)
 
-        pbar = tqdm.tqdm(total=len(batches), desc="sft train")
+        pbar = tqdm.tqdm(total=len(batches), desc="sft train", disable=not verbose)
         total_trainable_tokens = sum(batch.num_trainable_tokens for batch in batches)
         total_trajectories = len(trajectory_list)
         batch_count = 0
 
         async for result in service.train_sft(batches, service_config, verbose):
-            pbar.update(1)
-            postfix: dict[str, str | int] = {
-                "loss": f"{result.get('loss/train', 0):.4f}"
-            }
-            if total_dropped_trajectories:
-                postfix["dropped"] = total_dropped_trajectories
-            pbar.set_postfix(postfix)
+            if verbose:
+                pbar.update(1)
+                postfix: dict[str, str | int] = {
+                    "loss": f"{result.get('loss/train', 0):.4f}"
+                }
+                if total_dropped_trajectories:
+                    postfix["dropped"] = total_dropped_trajectories
+                pbar.set_postfix(postfix)
             batch_count += 1
             yield {
                 **result,
@@ -2045,11 +2273,6 @@ class LocalBackend:
 
         # If S3 bucket is provided, pull from S3 first
         if from_s3_bucket is not None:
-            if verbose:
-                print(
-                    f"DEBUG: Fork checkpoint - from_s3_bucket={from_s3_bucket}, not_after_step={not_after_step}"
-                )
-
             # Determine which checkpoint to pull
             if not_after_step is None:
                 # Pull only the latest checkpoint
@@ -2112,12 +2335,6 @@ class LocalBackend:
                 f"No checkpoints found for model {from_model} in project {from_project}"
             )
 
-        if verbose:
-            print(f"DEBUG: Checkpoint base dir: {checkpoint_base_dir}")
-            print(
-                f"DEBUG: Contents: {os.listdir(checkpoint_base_dir) if os.path.exists(checkpoint_base_dir) else 'Does not exist'}"
-            )
-
         # Get all available checkpoint steps
         available_steps = sorted(
             int(d)
@@ -2156,21 +2373,11 @@ class LocalBackend:
             print(
                 f"Copying checkpoint from {source_checkpoint_dir} to {dest_checkpoint_dir}"
             )
-            print(f"DEBUG: Source dir exists: {os.path.exists(source_checkpoint_dir)}")
-            if os.path.exists(source_checkpoint_dir):
-                print(
-                    f"DEBUG: Source dir contents: {os.listdir(source_checkpoint_dir)}"
-                )
-                print(
-                    f"DEBUG: Source dir is empty: {len(os.listdir(source_checkpoint_dir)) == 0}"
-                )
 
         import shutil
 
         # Remove destination if it already exists (empty directory from previous attempts)
         if os.path.exists(dest_checkpoint_dir):
-            if verbose:
-                print("DEBUG: Destination already exists, removing it first")
             shutil.rmtree(dest_checkpoint_dir)
 
         shutil.copytree(source_checkpoint_dir, dest_checkpoint_dir)

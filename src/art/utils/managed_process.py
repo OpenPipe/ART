@@ -62,8 +62,8 @@ def main() -> None:
         if shutting_down:
             return
         shutting_down = True
-        signal_child_group(sig)
         if process is not None:
+            process.send_signal(sig)
             try:
                 process.wait(timeout=args.child_timeout)
             except subprocess.TimeoutExpired:

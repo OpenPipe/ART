@@ -17,7 +17,6 @@ from art.megatron.dsv4.rope import (
 from art.megatron.dsv4.utils import rotate_activation
 from art.megatron.prefix_tree import (
     PrefixTreeRow,
-    PrefixTreeSegment,
     parse_prefix_tree,
 )
 
@@ -34,11 +33,11 @@ class Dsv4CompressionLayout(NamedTuple):
 
 class _Dsv4CompressionPlan(NamedTuple):
     row: PrefixTreeRow
-    position_to_index_by_group: dict[int, dict[int, int]]
-    positions_by_group: dict[int, list[int]]
+    position_bounds_by_group: dict[int, tuple[int, int]]
+    branch_mapping_by_group: dict[int, tuple[torch.Tensor, torch.Tensor]]
     group_pre_order: dict[int, int]
     group_post_order: dict[int, int]
-    query_group_pre_order: list[int]
+    query_group_pre_order: torch.Tensor
 
 
 class Dsv4PrefixTreeState(BaseModel):
@@ -76,52 +75,6 @@ def build_prefix_tree_compression_layouts(
         )
         for ratio in (4, 128)
     }
-
-
-def _segment_positions(
-    position_row: torch.Tensor,
-    segment: PrefixTreeSegment,
-) -> list[int]:
-    positions = [int(value) for value in position_row[segment.start : segment.end]]
-    if positions != list(range(positions[0], positions[-1] + 1)):
-        raise ValueError(
-            "DSV4 prefix-tree compression requires contiguous positions within "
-            f"group={segment.group_id}, got {positions[:4]}...{positions[-4:]}."
-        )
-    return positions
-
-
-def _segment_path(
-    row: PrefixTreeRow,
-    segment: PrefixTreeSegment,
-) -> tuple[PrefixTreeSegment, ...]:
-    by_group = {candidate.group_id: candidate for candidate in row.segments}
-    return tuple(
-        by_group[group_id] for group_id in (*segment.ancestors, segment.group_id)
-    )
-
-
-def _branch_position_map(
-    *,
-    row: PrefixTreeRow,
-    segment: PrefixTreeSegment,
-    positions_by_group: dict[int, list[int]],
-) -> dict[int, int]:
-    by_group = {candidate.group_id: candidate for candidate in row.segments}
-    mapping: dict[int, int] = {}
-    expected = 0
-    for path_segment in _segment_path(row, segment):
-        positions = positions_by_group[path_segment.group_id]
-        if positions[0] != expected:
-            raise ValueError(
-                "DSV4 prefix-tree compression requires contiguous branch "
-                f"positions; expected {expected}, got {positions[0]} for "
-                f"group={path_segment.group_id}."
-            )
-        for offset, logical_pos in enumerate(positions):
-            mapping[logical_pos] = by_group[path_segment.group_id].start + offset
-        expected = positions[-1] + 1
-    return mapping
 
 
 def _group_preorder_intervals(
@@ -180,54 +133,87 @@ def _build_prefix_tree_compression_plan(
     group_cpu = group_ids.detach().cpu()
     parent_cpu = parent_ids.detach().cpu()
     (row,) = parse_prefix_tree(group_ids=group_cpu, parent_ids=parent_cpu)
-    positions_by_group = {
-        segment.group_id: _segment_positions(position_cpu[0], segment)
-        for segment in row.segments
-    }
-    group_pre_order, group_post_order = _group_preorder_intervals(row)
-    query_group_pre_order = [-1] * int(position_ids.shape[1])
-    for segment in row.segments:
-        pre_order = group_pre_order[segment.group_id]
-        for token_index in range(segment.start, segment.end):
-            query_group_pre_order[token_index] = pre_order
-    position_to_index_by_group = {
-        segment.group_id: _branch_position_map(
-            row=row,
-            segment=segment,
-            positions_by_group=positions_by_group,
+    position_row = position_cpu[0]
+    prior_end = max(row.valid_tokens - 1, 0)
+    same_group = group_cpu[0, 1 : row.valid_tokens] == group_cpu[0, :prior_end]
+    invalid = torch.nonzero(
+        same_group
+        & (position_row[1 : row.valid_tokens] != position_row[:prior_end] + 1),
+        as_tuple=False,
+    ).flatten()
+    if invalid.numel():
+        index = int(invalid[0]) + 1
+        segment = next(item for item in row.segments if item.start <= index < item.end)
+        positions = position_row[segment.start : segment.end].tolist()
+        raise ValueError(
+            "DSV4 prefix-tree compression requires contiguous positions within "
+            f"group={segment.group_id}, got {positions[:4]}...{positions[-4:]}."
+        )
+    position_bounds_by_group = {
+        segment.group_id: (
+            int(position_row[segment.start]),
+            int(position_row[segment.end - 1]),
         )
         for segment in row.segments
     }
+    by_group = {segment.group_id: segment for segment in row.segments}
+    for segment in row.segments:
+        expected = (
+            0
+            if not segment.ancestors
+            else position_bounds_by_group[segment.ancestors[-1]][1] + 1
+        )
+        actual = position_bounds_by_group[segment.group_id][0]
+        if actual != expected:
+            raise ValueError(
+                "DSV4 prefix-tree compression requires contiguous branch "
+                f"positions; expected {expected}, got {actual} for "
+                f"group={segment.group_id}."
+            )
+    branch_mapping_by_group = {}
+    for segment in row.segments:
+        path = tuple(
+            by_group[group_id] for group_id in (*segment.ancestors, segment.group_id)
+        )
+        branch_mapping_by_group[segment.group_id] = (
+            torch.tensor(
+                [position_bounds_by_group[item.group_id][1] + 1 for item in path]
+            ),
+            torch.tensor(
+                [
+                    item.start - position_bounds_by_group[item.group_id][0]
+                    for item in path
+                ]
+            ),
+        )
+    group_pre_order, group_post_order = _group_preorder_intervals(row)
+    query_group_pre_order = torch.full(
+        (int(position_ids.shape[1]),), -1, dtype=torch.int32
+    )
+    for segment in row.segments:
+        query_group_pre_order[segment.start : segment.end] = group_pre_order[
+            segment.group_id
+        ]
     return _Dsv4CompressionPlan(
         row=row,
-        position_to_index_by_group=position_to_index_by_group,
-        positions_by_group=positions_by_group,
+        position_bounds_by_group=position_bounds_by_group,
+        branch_mapping_by_group=branch_mapping_by_group,
         group_pre_order=group_pre_order,
         group_post_order=group_post_order,
         query_group_pre_order=query_group_pre_order,
     )
 
 
-def _logical_window_indices(
-    position_to_index: dict[int, int],
+def _map_branch_positions(
+    logical_positions: torch.Tensor,
     *,
-    logical_start: int,
-    ratio: int,
-    allow_negative_padding: bool,
-) -> list[int]:
-    indices: list[int] = []
-    for logical_pos in range(logical_start, logical_start + ratio):
-        index = position_to_index.get(logical_pos)
-        if index is None:
-            if logical_pos < 0 and allow_negative_padding:
-                indices.append(-1)
-                continue
-            raise ValueError(
-                "DSV4 prefix-tree compression window references missing "
-                f"logical position {logical_pos}."
-            )
-        indices.append(index)
-    return indices
+    path_ends: torch.Tensor,
+    path_offsets: torch.Tensor,
+) -> torch.Tensor:
+    valid = logical_positions >= 0
+    safe = logical_positions.clamp_min(0)
+    path = torch.searchsorted(path_ends, safe, right=True)
+    return torch.where(valid, safe + path_offsets[path], -1)
 
 
 def build_prefix_tree_compression_layout(
@@ -252,66 +238,74 @@ def _emit_prefix_tree_compression_layout(
     plan: _Dsv4CompressionPlan,
     ratio: int,
 ) -> Dsv4CompressionLayout:
-    current_rows: list[list[int]] = []
-    previous_rows: list[list[int]] = []
-    entry_pre_orders: list[int] = []
-    entry_post_orders: list[int] = []
-    start_rows: list[int] = []
-    end_rows: list[int] = []
+    current_rows: list[torch.Tensor] = []
+    previous_rows: list[torch.Tensor] = []
+    entry_pre_orders: list[torch.Tensor] = []
+    entry_post_orders: list[torch.Tensor] = []
+    start_rows: list[torch.Tensor] = []
+    end_rows: list[torch.Tensor] = []
+    offsets = torch.arange(ratio)
 
     for segment in plan.row.segments:
-        position_to_index = plan.position_to_index_by_group[segment.group_id]
-        segment_positions = plan.positions_by_group[segment.group_id]
-        segment_end_pos = segment_positions[-1]
+        segment_end_pos = plan.position_bounds_by_group[segment.group_id][1]
         parent_end_pos = (
             -1
             if not segment.ancestors
-            else plan.positions_by_group[segment.ancestors[-1]][-1]
+            else plan.position_bounds_by_group[segment.ancestors[-1]][1]
         )
-        usable = ((segment_end_pos + 1) // ratio) * ratio
-        for logical_start in range(0, usable, ratio):
-            if logical_start + ratio - 1 <= parent_end_pos:
-                continue
-            current_rows.append(
-                _logical_window_indices(
-                    position_to_index,
-                    logical_start=logical_start,
-                    ratio=ratio,
-                    allow_negative_padding=False,
-                )
+        starts = torch.arange(
+            ((parent_end_pos + 1) // ratio) * ratio,
+            ((segment_end_pos + 1) // ratio) * ratio,
+            ratio,
+        )
+        if not starts.numel():
+            continue
+        path_ends, path_offsets = plan.branch_mapping_by_group[segment.group_id]
+        logical_positions = starts[:, None] + offsets
+        current_rows.append(
+            _map_branch_positions(
+                logical_positions,
+                path_ends=path_ends,
+                path_offsets=path_offsets,
             )
-            previous_rows.append(
-                _logical_window_indices(
-                    position_to_index,
-                    logical_start=logical_start - ratio,
-                    ratio=ratio,
-                    allow_negative_padding=True,
-                )
+        )
+        previous_rows.append(
+            _map_branch_positions(
+                logical_positions - ratio,
+                path_ends=path_ends,
+                path_offsets=path_offsets,
             )
-            entry_pre_orders.append(plan.group_pre_order[segment.group_id])
-            entry_post_orders.append(plan.group_post_order[segment.group_id])
-            start_rows.append(logical_start)
-            end_rows.append(logical_start + ratio - 1)
+        )
+        entry_pre_orders.append(
+            torch.full(
+                (starts.numel(),),
+                plan.group_pre_order[segment.group_id],
+                dtype=torch.int32,
+            )
+        )
+        entry_post_orders.append(
+            torch.full(
+                (starts.numel(),),
+                plan.group_post_order[segment.group_id],
+                dtype=torch.int32,
+            )
+        )
+        start_rows.append(starts)
+        end_rows.append(starts + ratio - 1)
 
-    entry_count = len(current_rows)
-    current = torch.empty((entry_count, ratio), dtype=torch.long)
-    previous = torch.empty_like(current)
-    if entry_count:
-        current[:] = torch.tensor(current_rows, dtype=torch.long)
-        previous[:] = torch.tensor(previous_rows, dtype=torch.long)
-    entry_pre_order = torch.tensor(entry_pre_orders, dtype=torch.int32)
-    entry_post_order = torch.tensor(entry_post_orders, dtype=torch.int32)
-    starts = torch.tensor(start_rows, dtype=torch.long)
-    ends = torch.tensor(end_rows, dtype=torch.long)
-    query_pre_order = torch.tensor(plan.query_group_pre_order, dtype=torch.int32)
+    empty = torch.empty((0, ratio), dtype=torch.long)
     return Dsv4CompressionLayout(
-        current,
-        previous,
-        entry_pre_order,
-        entry_post_order,
-        starts,
-        ends,
-        query_pre_order,
+        torch.cat(current_rows) if current_rows else empty,
+        torch.cat(previous_rows) if previous_rows else empty.clone(),
+        torch.cat(entry_pre_orders)
+        if entry_pre_orders
+        else torch.empty(0, dtype=torch.int32),
+        torch.cat(entry_post_orders)
+        if entry_post_orders
+        else torch.empty(0, dtype=torch.int32),
+        torch.cat(start_rows) if start_rows else torch.empty(0, dtype=torch.long),
+        torch.cat(end_rows) if end_rows else torch.empty(0, dtype=torch.long),
+        plan.query_group_pre_order,
     )
 
 
@@ -486,6 +480,8 @@ class DeepSeekV4Compressor(nn.Module):
 
         self._keep_fp32_parameters = ("ape",)
         setattr(self.ape, "_keep_fp32", True)
+        if config.perform_initialization:
+            nn.init.zeros_(self.ape)
 
         base = cfg.dsv4_compress_rope_theta
         assert rope_head_dim == 64

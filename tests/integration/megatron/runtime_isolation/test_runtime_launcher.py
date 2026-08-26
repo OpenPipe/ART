@@ -1,11 +1,13 @@
 import os
 from pathlib import Path
-from types import SimpleNamespace
+import subprocess
+import sys
 from typing import Any, cast
 
 import pytest
 
 from art import vllm_runtime as runtime
+from art.distributed import nccl_preflight
 
 ROOT = Path(__file__).resolve().parents[4]
 
@@ -39,7 +41,7 @@ def test_build_runtime_server_cmd_uses_runtime_project(
             cuda_visible_devices="1",
             lora_path="/tmp/lora",
             served_model_name="test@0",
-            rollout_weights_mode="merged",
+            initial_policy_version=7,
             engine_args={"weight_transfer_config": {"backend": "nccl"}},
             server_args={"tool_call_parser": "hermes"},
         )
@@ -50,6 +52,7 @@ def test_build_runtime_server_cmd_uses_runtime_project(
         '--engine-args-json={"weight_transfer_config": {"backend": "nccl"}}' in command
     )
     assert '--server-args-json={"tool_call_parser": "hermes"}' in command
+    assert "--initial-policy-version=7" in command
 
 
 def test_build_runtime_server_cmd_honors_runtime_bin_override(monkeypatch) -> None:
@@ -62,10 +65,35 @@ def test_build_runtime_server_cmd_honors_runtime_bin_override(monkeypatch) -> No
             cuda_visible_devices="1",
             lora_path="/tmp/lora",
             served_model_name="test@0",
-            rollout_weights_mode="merged",
         )
     )
     assert command[:2] == ["/opt/art/bin/runtime", "--wrapped"]
+
+
+def test_vllm_nccl_preflight_executes_in_runtime_python(
+    monkeypatch, tmp_path: Path
+) -> None:
+    runtime_bin = tmp_path / ".venv" / "bin" / runtime.RUNTIME_SERVER
+    runtime_bin.parent.mkdir(parents=True)
+    runtime_bin.write_text("#!/bin/sh\n", encoding="ascii")
+    runtime_python = runtime_bin.with_name("python")
+    runtime_python.symlink_to(sys.executable)
+    monkeypatch.setenv("ART_VLLM_RUNTIME_BIN", str(runtime_bin))
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            nccl_preflight._VLLM_EXEC_SCRIPT,
+            "print('runtime-ready')",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        env=os.environ.copy(),
+    )
+
+    assert result.stdout.strip() == "runtime-ready"
 
 
 def test_build_runtime_server_cmd_allows_lora_without_initial_adapter(
@@ -86,13 +114,12 @@ def test_build_runtime_server_cmd_allows_lora_without_initial_adapter(
             host="0.0.0.0",
             cuda_visible_devices="0,1",
             served_model_name="test@0",
-            rollout_weights_mode="lora",
         )
     )
 
     assert command[0] == str(runtime_bin)
     assert not any(arg.startswith("--lora-path=") for arg in command)
-    assert "--rollout-weights-mode=lora" in command
+    assert not any(arg.startswith("--rollout-weights-mode=") for arg in command)
 
 
 def test_external_checkpoint_path_mapping() -> None:
@@ -113,45 +140,15 @@ def test_external_checkpoint_path_mapping() -> None:
     assert mapped == "/remote/ws/projects/art/.art/models/model/0001"
 
 
-def test_get_vllm_runtime_nccl_so_path_queries_runtime_python(
-    monkeypatch,
-    tmp_path: Path,
-) -> None:
-    monkeypatch.delenv("ART_VLLM_RUNTIME_BIN", raising=False)
-    runtime_root = tmp_path / "custom-runtime"
-    runtime_bin = runtime_root / ".venv" / "bin" / "art-vllm-runtime-server"
-    runtime_python = runtime_root / ".venv" / "bin" / "python"
-    runtime_bin.parent.mkdir(parents=True, exist_ok=True)
-    runtime_bin.write_text("#!/bin/sh\n", encoding="ascii")
-    runtime_python.write_text("#!/bin/sh\n", encoding="ascii")
-    nccl_so_path = tmp_path / "libnccl.so.2"
-    nccl_so_path.write_text("nccl\n", encoding="ascii")
-    seen: dict[str, object] = {}
-
-    def fake_run(command, *, capture_output: bool, text: bool):
-        seen["command"] = command
-        seen["capture_output"] = capture_output
-        seen["text"] = text
-        return SimpleNamespace(returncode=0, stdout=f"{nccl_so_path}\n", stderr="")
-
-    monkeypatch.setenv("ART_VLLM_RUNTIME_PROJECT_ROOT", str(runtime_root))
-    monkeypatch.setattr(runtime, "subprocess", SimpleNamespace(run=fake_run))
-
-    assert runtime.get_vllm_runtime_nccl_so_path() == nccl_so_path.resolve()
-    command = seen["command"]
-    assert isinstance(command, list)
-    assert command[0] == str(runtime_python)
-    assert seen["capture_output"] is True
-    assert seen["text"] is True
-
-
 def test_vllm_runtime_subprocess_env_isolates_flashinfer_for_source_runtime(
     monkeypatch,
     tmp_path: Path,
 ) -> None:
     runtime_root = tmp_path / "vllm_runtime"
+    cache_root = tmp_path / "node_cache"
     runtime_root.mkdir()
     monkeypatch.setenv("ART_VLLM_RUNTIME_PROJECT_ROOT", str(runtime_root))
+    monkeypatch.setenv("XDG_CACHE_HOME", str(cache_root))
     monkeypatch.setenv("FLASHINFER_WORKSPACE_BASE", "/shared/flashinfer")
     monkeypatch.setenv(
         "PYTHONPATH",
@@ -167,8 +164,22 @@ def test_vllm_runtime_subprocess_env_isolates_flashinfer_for_source_runtime(
 
     assert env["PYTHONPATH"] == "/keep"
     assert env["FLASHINFER_WORKSPACE_BASE"] == str(
-        tmp_path / "scratch" / "vllm_runtime_flashinfer"
+        cache_root / "vllm_runtime" / "flashinfer_workspace"
     )
+
+
+def test_vllm_runtime_subprocess_env_pins_runtime_tools(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    runtime_bin = tmp_path / "vllm_runtime/.venv/bin/art-vllm-runtime-server"
+    runtime_bin.parent.mkdir(parents=True)
+    runtime_bin.touch()
+    monkeypatch.setenv("PATH", "/usr/bin")
+
+    env = runtime._vllm_runtime_subprocess_env([str(runtime_bin)])
+
+    assert env["PATH"] == f"{runtime_bin.parent}{os.pathsep}/usr/bin"
 
 
 def test_vllm_runtime_subprocess_env_isolates_flashinfer_for_managed_runtime(
@@ -397,3 +408,24 @@ async def test_wait_for_vllm_runtime_polls_http_health(monkeypatch) -> None:
         "url": "http://127.0.0.1:8123/health",
         "timeout": 5.0,
     }
+
+
+@pytest.mark.asyncio
+async def test_wait_for_vllm_runtime_fails_when_engine_core_dies(
+    tmp_path: Path,
+) -> None:
+    class FakeProcess:
+        def poll(self):
+            return None
+
+    log_path = tmp_path / "vllm.log"
+    log_path.write_text("APIServer is alive\nEngineCore failed to start\n")
+
+    with pytest.raises(RuntimeError, match="EngineCore failed to start"):
+        await runtime.wait_for_vllm_runtime(
+            process=cast(Any, FakeProcess()),
+            host="127.0.0.1",
+            port=8123,
+            timeout=300.0,
+            log_path=str(log_path),
+        )

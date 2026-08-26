@@ -71,11 +71,14 @@ class TinkerBackend(LocalBackend):
                 TinkerTrainingClientArgs,
                 config["tinker_args"].get("training_client_args") or {},
             )
-            self._services[storage_key] = TinkerService(
-                model_name=model.name,
-                base_model=model.base_model,
-                config=config,
-                output_dir=get_model_dir(model=model, art_path=self._path),
+            self._services[storage_key] = cast(
+                ModelService,
+                TinkerService(
+                    model_name=model.name,
+                    base_model=model.base_model,
+                    config=config,
+                    output_dir=get_model_dir(model=model, art_path=self._path),
+                ),
             )
             if not self._in_process:
                 self._services[storage_key] = move_to_child_process(

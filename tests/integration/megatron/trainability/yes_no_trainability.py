@@ -10,6 +10,7 @@ import time
 from typing import Any, AsyncIterator, Iterator, Literal, TypedDict, cast
 import uuid
 
+from openai.types.chat.chat_completion import Choice
 from pydantic import BaseModel, Field
 import torch
 
@@ -22,7 +23,6 @@ from art.megatron.model_support.registry import (
     model_supports_context_parallel,
     model_uses_expert_parallel,
 )
-from art.megatron.model_support.spec import RolloutWeightsMode
 
 from ..model_support.oracle_harness import Topology, oracle_topology
 from ..model_support.oracle_worker import provider_topology_env
@@ -37,6 +37,7 @@ _SHARED_GPU_IDS_ENV = "ART_MODEL_SUPPORT_SHARED_GPU_IDS"
 _VARIANT_ENV = "ART_MODEL_SUPPORT_YES_NO_VARIANT"
 _EXTERNAL_VLLM_URL_ENV = "ART_MODEL_SUPPORT_EXTERNAL_VLLM_URL"
 _EXTERNAL_VLLM_API_KEY_ENV = "ART_MODEL_SUPPORT_EXTERNAL_VLLM_API_KEY"
+_EXTERNAL_VLLM_HEALTH_TIMEOUT_ENV = "ART_MODEL_SUPPORT_EXTERNAL_VLLM_HEALTH_TIMEOUT"
 _TRAINABILITY_ROOT = (
     Path(__file__).resolve().parents[4] / ".local" / "model_support_validation"
 )
@@ -48,9 +49,17 @@ _VARIANT_NAME = Literal[
     "unsloth_dedicated",
 ]
 _RESOURCE_STAGE_NAME = Literal["yes_no_trainability", "length_trainability"]
+_Answer = Literal["yes", "no", "maybe"]
+_ANSWER_TARGETS: tuple[_Answer, ...] = ("yes", "no", "maybe")
+_GPT_OSS_MAX_STEPS = 8
+_GPT_OSS_MAX_TOKENS = 256
+_GPT_OSS_MAX_MODEL_LEN = 512
+_GPT_OSS_SYSTEM_PROMPT = (
+    "Use minimal reasoning. Give only one final word: yes, no, or maybe."
+)
 
 
-class _TrainKwargs(TypedDict):
+class _TrainKwargs(TypedDict, total=False):
     packed_sequence_length: int
 
 
@@ -66,10 +75,10 @@ class YesNoTrainabilityReport(BaseModel):
     backend_name: Literal["megatron", "local"]
     placement_mode: Literal["shared", "dedicated"]
     base_model: str
+    target_answer: _Answer
     output_dir: str
     trainer_gpu_ids: list[int]
     inference_gpu_ids: list[int]
-    rollout_weights_mode: str
     reward_threshold: float
     max_steps: int
     prompt_count: int
@@ -161,11 +170,14 @@ def _external_vllm_runtime_config() -> dev.VllmRuntimeArgs | None:
     server_url = os.environ.get(_EXTERNAL_VLLM_URL_ENV)
     if server_url is None or server_url.strip() == "":
         return None
-    return {
+    config: dev.VllmRuntimeArgs = {
         "mode": "external",
         "server_url": server_url,
         "api_key": os.environ.get(_EXTERNAL_VLLM_API_KEY_ENV, "art-external-vllm"),
     }
+    if timeout := os.environ.get(_EXTERNAL_VLLM_HEALTH_TIMEOUT_ENV):
+        config["health_timeout_s"] = float(timeout)
+    return config
 
 
 def _topology_with_env_overrides(topology: Topology) -> Topology:
@@ -288,9 +300,12 @@ def _safe_gpu_memory_utilization(device_ids: list[int]) -> float:
     )
 
 
-def reward_for_answer(text: str) -> float:
+def reward_for_answer(text: str, *, target: _Answer | None = None) -> float:
+    answer = first_word_for_answer(text).lower()
+    if target is not None:
+        return float(answer == target)
     return {"yes": 0.5, "no": 0.75, "maybe": 1.0}.get(
-        first_word_for_answer(text).lower(),
+        answer,
         0.0,
     )
 
@@ -310,12 +325,60 @@ def first_word_for_answer(text: str | None) -> str:
     return first_word[0].strip(".,!?:;\"'()[]{}")
 
 
+def _select_answer_target(groups: list[art.TrajectoryGroup]) -> _Answer | None:
+    counts = {
+        target: [
+            sum(
+                first_word_for_answer(_trajectory_answer_text(trajectory)).lower()
+                == target
+                for trajectory in group.trajectories
+            )
+            for group in groups
+        ]
+        for target in _ANSWER_TARGETS
+    }
+    candidates = [
+        target
+        for target, group_counts in counts.items()
+        if any(
+            0 < count < len(group.trajectories)
+            for count, group in zip(group_counts, groups, strict=True)
+        )
+    ]
+    return (
+        min(candidates, key=lambda target: sum(counts[target])) if candidates else None
+    )
+
+
+def _trajectory_answer_text(trajectory: art.Trajectory) -> str:
+    choice = cast(Choice, trajectory.messages_and_choices[-1])
+    return choice.message.content or ""
+
+
+def _rescore_groups(groups: list[art.TrajectoryGroup], *, target: _Answer) -> None:
+    for group in groups:
+        for trajectory in group.trajectories:
+            trajectory.reward = reward_for_answer(
+                _trajectory_answer_text(trajectory), target=target
+            )
+
+
 def _get_env_int(name: str, default: int) -> int:
     return int(os.environ.get(name, str(default)))
 
 
 def _get_env_float(name: str, default: float) -> float:
     return float(os.environ.get(name, str(default)))
+
+
+def _get_env_int_list(name: str) -> list[int] | None:
+    raw = os.environ.get(name)
+    if raw is None:
+        return None
+    parts = raw.split(",")
+    if any(not part.strip() for part in parts):
+        raise ValueError(f"Invalid integer list for {name}: {raw!r}")
+    return [int(part) for part in parts]
 
 
 def _get_env_bool(name: str, default: bool) -> bool:
@@ -330,13 +393,25 @@ def _get_env_bool(name: str, default: bool) -> bool:
     raise ValueError(f"Invalid boolean value for {name}: {raw!r}")
 
 
-def _max_tokens() -> int:
-    return _get_env_int("ART_MODEL_SUPPORT_YES_NO_MAX_TOKENS", 5)
+def _is_gpt_oss_model(base_model: str) -> bool:
+    return (
+        get_model_support_spec(base_model, allow_unvalidated_arch=True).key
+        == "gpt_oss_moe"
+    )
+
+
+def _max_tokens(base_model: str) -> int:
+    return _get_env_int(
+        "ART_MODEL_SUPPORT_YES_NO_MAX_TOKENS",
+        _GPT_OSS_MAX_TOKENS if _is_gpt_oss_model(base_model) else 5,
+    )
 
 
 def _render_chat_messages(base_model: str, prompt: str) -> art.Messages:
-    del base_model
-    return [{"role": "user", "content": prompt}]
+    messages: art.Messages = [{"role": "user", "content": prompt}]
+    if _is_gpt_oss_model(base_model):
+        messages.insert(0, {"role": "system", "content": _GPT_OSS_SYSTEM_PROMPT})
+    return messages
 
 
 def _enable_thinking() -> bool:
@@ -345,8 +420,15 @@ def _enable_thinking() -> bool:
     ).strip().lower() in {"1", "true", "yes", "on"}
 
 
-def _extra_body() -> dict[str, object]:
-    return {"chat_template_kwargs": {"enable_thinking": _enable_thinking()}}
+def _extra_body(base_model: str) -> dict[str, object]:
+    chat_template_kwargs: dict[str, object] = {"enable_thinking": _enable_thinking()}
+    if _is_gpt_oss_model(base_model):
+        chat_template_kwargs["reasoning_effort"] = "low"
+    body: dict[str, object] = {"chat_template_kwargs": chat_template_kwargs}
+    allowed_token_ids = _get_env_int_list("ART_MODEL_SUPPORT_YES_NO_ALLOWED_TOKEN_IDS")
+    if allowed_token_ids is not None:
+        body["allowed_token_ids"] = allowed_token_ids
+    return body
 
 
 def _request_timeout(name: str, default: float) -> float:
@@ -355,14 +437,27 @@ def _request_timeout(name: str, default: float) -> float:
 
 def _engine_args_for_yes_no_trainability(
     *,
+    base_model: str,
     inference_gpu_ids: list[int],
     tensor_parallel_size: int = 1,
     enable_expert_parallel: bool = False,
     enable_sleep_mode: bool | None = None,
+    external_runtime: bool = False,
 ) -> dev.EngineArgs:
     engine_args: dict[str, object] = {
-        "gpu_memory_utilization": _safe_gpu_memory_utilization(inference_gpu_ids),
-        "max_model_len": _get_env_int("ART_MODEL_SUPPORT_YES_NO_MAX_MODEL_LEN", 128),
+        "gpu_memory_utilization": (
+            float(
+                os.environ.get(
+                    "ART_MODEL_SUPPORT_YES_NO_GPU_MEMORY_UTILIZATION", "0.85"
+                )
+            )
+            if external_runtime
+            else _safe_gpu_memory_utilization(inference_gpu_ids)
+        ),
+        "max_model_len": _get_env_int(
+            "ART_MODEL_SUPPORT_YES_NO_MAX_MODEL_LEN",
+            _GPT_OSS_MAX_MODEL_LEN if _is_gpt_oss_model(base_model) else 128,
+        ),
         "max_num_seqs": _get_env_int("ART_MODEL_SUPPORT_YES_NO_MAX_NUM_SEQS", 4),
         "enforce_eager": True,
         "tensor_parallel_size": tensor_parallel_size,
@@ -550,7 +645,11 @@ def _variant_packed_sequence_length(variant: _TrainabilityVariant) -> int:
 
 
 def _variant_train_kwargs(variant: _TrainabilityVariant) -> _TrainKwargs:
-    return {"packed_sequence_length": _variant_packed_sequence_length(variant)}
+    return (
+        {}
+        if variant.backend_name == "megatron"
+        else {"packed_sequence_length": _variant_packed_sequence_length(variant)}
+    )
 
 
 def _variant_init_args(variant: _TrainabilityVariant) -> dev.InitArgs:
@@ -560,6 +659,7 @@ def _variant_init_args(variant: _TrainabilityVariant) -> dev.InitArgs:
 def _init_megatron_runtime_config(
     variant: _TrainabilityVariant,
     *,
+    packed_sequence_length: int | None = None,
     streaming_weight_offload: bool = False,
 ) -> None:
     if variant.topology is None:
@@ -574,30 +674,29 @@ def _init_megatron_runtime_config(
             ep=variant.topology.ep,
             etp=variant.topology.etp,
         ),
-        packed_sequence_length=_variant_packed_sequence_length(variant),
+        packed_sequence_length=(
+            _variant_packed_sequence_length(variant)
+            if packed_sequence_length is None
+            else packed_sequence_length
+        ),
         streaming_weight_offload=streaming_weight_offload,
     )
 
 
-def _variant_max_steps(variant: _TrainabilityVariant) -> int:
-    default = 12 if variant.backend_name == "local" else 4
+def _variant_max_steps(variant: _TrainabilityVariant, *, base_model: str) -> int:
+    default = (
+        12
+        if variant.backend_name == "local"
+        else _GPT_OSS_MAX_STEPS
+        if _is_gpt_oss_model(base_model)
+        else 4
+    )
     return _get_env_int("ART_MODEL_SUPPORT_YES_NO_MAX_STEPS", default)
 
 
 def _variant_rollouts_per_prompt(variant: _TrainabilityVariant) -> int:
     default = 8 if variant.backend_name == "local" else 4
     return _get_env_int("ART_MODEL_SUPPORT_YES_NO_ROLLOUTS_PER_PROMPT", default)
-
-
-def _rollout_weights_mode(
-    base_model: str,
-    *,
-    allow_unvalidated_arch: bool = False,
-) -> RolloutWeightsMode:
-    return get_model_support_spec(
-        base_model,
-        allow_unvalidated_arch=allow_unvalidated_arch,
-    ).default_rollout_weights_mode
 
 
 def _default_variant_name(
@@ -625,25 +724,19 @@ def _default_variant_name(
         base_model,
         allow_unvalidated_arch=allow_unvalidated_arch,
     )
-    rollout_weights_mode = _rollout_weights_mode(
-        base_model,
-        allow_unvalidated_arch=allow_unvalidated_arch,
-    )
-    if rollout_weights_mode == "merged" or not is_moe:
-        return "megatron_dedicated"
-    return "megatron_shared"
+    return "megatron_shared" if is_moe else "megatron_dedicated"
 
 
 def _build_internal_config(
     variant: _TrainabilityVariant,
     *,
     base_model: str,
-    rollout_weights_mode: RolloutWeightsMode | None = None,
     allow_unvalidated_arch: bool = False,
     resource_stage_name: _RESOURCE_STAGE_NAME = "yes_no_trainability",
 ) -> dev.InternalModelConfig:
     shared = variant.placement_mode == "shared"
     inference_gpu_ids = variant.inference_gpu_ids
+    external_runtime = _external_vllm_runtime_config()
     stage_resources = _trainability_stage_resources(
         base_model,
         stage_name=resource_stage_name,
@@ -665,6 +758,7 @@ def _build_internal_config(
     else:
         vllm_resources = None
     engine_args = _engine_args_for_yes_no_trainability(
+        base_model=base_model,
         inference_gpu_ids=inference_gpu_ids,
         tensor_parallel_size=(
             vllm_resources.tensor_parallel_size
@@ -684,6 +778,7 @@ def _build_internal_config(
             )
         ),
         enable_sleep_mode=True if shared else None,
+        external_runtime=external_runtime is not None,
     )
     if vllm_resources is not None:
         engine_args.update(vllm_resources.engine_args())
@@ -691,16 +786,10 @@ def _build_internal_config(
         engine_args.update(stage_resources.vllm.extra_engine_args)
     engine_args["model"] = base_model
     internal_config = dev.InternalModelConfig(
-        rollout_weights_mode=rollout_weights_mode
-        or _rollout_weights_mode(
-            base_model,
-            allow_unvalidated_arch=allow_unvalidated_arch,
-        ),
         engine_args=engine_args,
         init_args=_variant_init_args(variant),
         allow_unvalidated_arch=allow_unvalidated_arch,
     )
-    external_runtime = _external_vllm_runtime_config()
     if (
         stage_resources is not None
         and stage_resources.requires_external_vllm
@@ -772,6 +861,7 @@ async def _evaluate_groups(
     base_model: str,
     prompts: list[str],
     step: int,
+    target: _Answer | None = None,
 ) -> list[art.TrajectoryGroup]:
     client = model.openai_client()
 
@@ -780,8 +870,8 @@ async def _evaluate_groups(
         completion = await client.chat.completions.create(
             messages=messages,
             model=model.get_inference_name(step=step),
-            max_tokens=_max_tokens(),
-            extra_body=_extra_body(),
+            max_tokens=_max_tokens(base_model),
+            extra_body=_extra_body(base_model),
             temperature=_get_env_float(
                 "ART_MODEL_SUPPORT_YES_NO_EVAL_TEMPERATURE",
                 0.0,
@@ -793,7 +883,9 @@ async def _evaluate_groups(
             [
                 art.Trajectory(
                     messages_and_choices=[*messages, choice],
-                    reward=reward_for_answer(choice.message.content or ""),
+                    reward=reward_for_answer(
+                        choice.message.content or "", target=target
+                    ),
                 )
             ]
         )
@@ -816,6 +908,7 @@ async def _evaluate_model(
     base_model: str,
     prompts: list[str],
     step: int,
+    target: _Answer | None = None,
 ) -> float:
     return _mean_group_reward(
         await _evaluate_groups(
@@ -823,6 +916,7 @@ async def _evaluate_model(
             base_model=base_model,
             prompts=prompts,
             step=step,
+            target=target,
         )
     )
 
@@ -833,6 +927,7 @@ async def _build_training_groups(
     base_model: str,
     prompts: list[str],
     rollouts_per_prompt: int,
+    target: _Answer | None = None,
 ) -> list[art.TrajectoryGroup]:
     client = model.openai_client()
 
@@ -841,9 +936,9 @@ async def _build_training_groups(
         completion = await client.chat.completions.create(
             messages=messages,
             model=model.get_inference_name(),
-            max_tokens=_max_tokens(),
+            max_tokens=_max_tokens(base_model),
             n=rollouts_per_prompt,
-            extra_body=_extra_body(),
+            extra_body=_extra_body(base_model),
             temperature=_get_env_float(
                 "ART_MODEL_SUPPORT_YES_NO_ROLLOUT_TEMPERATURE",
                 1.2,
@@ -857,7 +952,9 @@ async def _build_training_groups(
             [
                 art.Trajectory(
                     messages_and_choices=[*messages, choice],
-                    reward=reward_for_answer(choice.message.content or ""),
+                    reward=reward_for_answer(
+                        choice.message.content or "", target=target
+                    ),
                 )
                 for choice in completion.choices
             ]
@@ -878,6 +975,7 @@ async def _build_trainable_groups(
     base_model: str,
     prompts: list[str],
     rollouts_per_prompt: int,
+    target: _Answer | None = None,
 ) -> list[art.TrajectoryGroup]:
     max_attempts = _get_env_int("ART_MODEL_SUPPORT_YES_NO_MAX_ROLLOUT_ATTEMPTS", 4)
     for _ in range(max_attempts):
@@ -886,6 +984,7 @@ async def _build_trainable_groups(
             base_model=base_model,
             prompts=prompts,
             rollouts_per_prompt=rollouts_per_prompt,
+            target=target,
         )
         trainable_groups = [
             group for group in groups if _group_has_reward_variance(group)
@@ -894,6 +993,32 @@ async def _build_trainable_groups(
             return trainable_groups
     raise RuntimeError(
         "No reward-variant trajectory groups were produced for yes/no trainability"
+    )
+
+
+async def _build_initial_trainable_groups(
+    model: art.TrainableModel,
+    *,
+    base_model: str,
+    prompts: list[str],
+    rollouts_per_prompt: int,
+) -> tuple[_Answer, list[art.TrajectoryGroup]]:
+    max_attempts = _get_env_int("ART_MODEL_SUPPORT_YES_NO_MAX_ROLLOUT_ATTEMPTS", 4)
+    for _ in range(max_attempts):
+        groups = await _build_training_groups(
+            model,
+            base_model=base_model,
+            prompts=prompts,
+            rollouts_per_prompt=rollouts_per_prompt,
+        )
+        target = _select_answer_target(groups)
+        if target is not None:
+            _rescore_groups(groups, target=target)
+            return target, [
+                group for group in groups if _group_has_reward_variance(group)
+            ]
+    raise RuntimeError(
+        "No answer with within-group support was produced for yes/no trainability"
     )
 
 
@@ -908,7 +1033,7 @@ async def _warmup_model(
         messages=_render_chat_messages(base_model, prompt),
         model=model.get_inference_name(step=0),
         max_tokens=1,
-        extra_body=_extra_body(),
+        extra_body=_extra_body(base_model),
         temperature=0.0,
         timeout=_request_timeout("ART_MODEL_SUPPORT_YES_NO_WARMUP_TIMEOUT", 900.0),
     )
@@ -919,7 +1044,6 @@ async def run_yes_no_trainability_async(
     base_model: str,
     variant_name: _VARIANT_NAME = "megatron_shared",
     artifact_root: Path | None = None,
-    rollout_weights_mode: RolloutWeightsMode | None = None,
     allow_unvalidated_arch: bool = False,
     extra_env: dict[str, str] | None = None,
 ) -> YesNoTrainabilityReport:
@@ -931,7 +1055,7 @@ async def run_yes_no_trainability_async(
     backend_root = artifact_root or _artifact_dir(base_model, variant.name)
     backend_root.mkdir(parents=True, exist_ok=True)
     reward_threshold = _get_env_float("ART_MODEL_SUPPORT_YES_NO_REWARD_THRESHOLD", 0.9)
-    max_steps = _variant_max_steps(variant)
+    max_steps = _variant_max_steps(variant, base_model=base_model)
     rollouts_per_prompt = _variant_rollouts_per_prompt(variant)
     eval_prompt_count = _get_env_int("ART_MODEL_SUPPORT_YES_NO_EVAL_PROMPTS", 8)
     prompts = build_prompts()
@@ -940,10 +1064,8 @@ async def run_yes_no_trainability_async(
     internal_config = _build_internal_config(
         variant,
         base_model=base_model,
-        rollout_weights_mode=rollout_weights_mode,
         allow_unvalidated_arch=allow_unvalidated_arch,
     )
-    rollout_weights_mode = internal_config["rollout_weights_mode"]
     workflow_resources = handler_workflow_resources_for_base_model(
         base_model,
         allow_unvalidated_arch=allow_unvalidated_arch,
@@ -986,15 +1108,23 @@ async def run_yes_no_trainability_async(
     ) as backend:
         await model.register(backend)
         output_dir = Path(model.base_path) / model.project / "models" / model.run_name
-        await _warmup_model(model, base_model=base_model, prompt=prompts[0])
         step0_name = model.get_inference_name(step=0)
         model_ids_before = await _list_model_ids(model)
-        initial_eval_groups = await _evaluate_groups(
+        async with backend.exact_adapter_lease(model, 0):
+            await _warmup_model(model, base_model=base_model, prompt=prompts[0])
+            initial_eval_groups = await _evaluate_groups(
+                model,
+                base_model=base_model,
+                prompts=eval_prompts,
+                step=0,
+            )
+        target_answer, initial_train_groups = await _build_initial_trainable_groups(
             model,
             base_model=base_model,
-            prompts=eval_prompts,
-            step=0,
+            prompts=prompts,
+            rollouts_per_prompt=rollouts_per_prompt,
         )
+        _rescore_groups(initial_eval_groups, target=target_answer)
         initial_eval_reward = _mean_group_reward(initial_eval_groups)
         await model.log(initial_eval_groups, step=0, split="val")
         report = YesNoTrainabilityReport(
@@ -1002,10 +1132,10 @@ async def run_yes_no_trainability_async(
             backend_name=variant.backend_name,
             placement_mode=variant.placement_mode,
             base_model=base_model,
+            target_answer=target_answer,
             output_dir=str(output_dir),
             trainer_gpu_ids=variant.trainer_gpu_ids,
             inference_gpu_ids=variant.inference_gpu_ids,
-            rollout_weights_mode=rollout_weights_mode,
             reward_threshold=reward_threshold,
             max_steps=max_steps,
             prompt_count=len(prompts),
@@ -1020,12 +1150,17 @@ async def run_yes_no_trainability_async(
             model_ids_before=model_ids_before,
         )
 
-        for _ in range(max_steps):
-            train_groups = await _build_trainable_groups(
-                model,
-                base_model=base_model,
-                prompts=prompts,
-                rollouts_per_prompt=rollouts_per_prompt,
+        for step_index in range(max_steps):
+            train_groups = (
+                initial_train_groups
+                if step_index == 0
+                else await _build_trainable_groups(
+                    model,
+                    base_model=base_model,
+                    prompts=prompts,
+                    rollouts_per_prompt=rollouts_per_prompt,
+                    target=target_answer,
+                )
             )
             result = await backend.train(
                 model,
@@ -1035,7 +1170,7 @@ async def run_yes_no_trainability_async(
                     1e-4,
                 ),
                 loss_fn="cispo",
-                packed_sequence_length=train_kwargs["packed_sequence_length"],
+                **train_kwargs,
             )
             await model.log(
                 train_groups,
@@ -1043,12 +1178,14 @@ async def run_yes_no_trainability_async(
                 step=result.step,
                 split="train",
             )
-            eval_groups = await _evaluate_groups(
-                model,
-                base_model=base_model,
-                prompts=eval_prompts,
-                step=result.step,
-            )
+            async with backend.exact_adapter_lease(model, int(result.step)):
+                eval_groups = await _evaluate_groups(
+                    model,
+                    base_model=base_model,
+                    prompts=eval_prompts,
+                    step=result.step,
+                    target=target_answer,
+                )
             eval_reward = _mean_group_reward(eval_groups)
             await model.log(eval_groups, step=result.step, split="val")
             report.latest_step = int(result.step)
@@ -1076,7 +1213,10 @@ async def run_yes_no_trainability_async(
                 break
 
         report.model_ids_after = await _list_model_ids(model)
-        report.latest_snapshot = await _chat_snapshot(model, step=report.latest_step)
+        async with backend.exact_adapter_lease(model, report.latest_step):
+            report.latest_snapshot = await _chat_snapshot(
+                model, step=report.latest_step
+            )
 
     output_dir = Path(report.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1090,6 +1230,7 @@ async def run_yes_no_trainability_async(
 def run_yes_no_trainability(
     base_model: str,
     *,
+    artifact_root: Path | None = None,
     allow_unvalidated_arch: bool = False,
 ) -> YesNoTrainabilityReport:
     return asyncio.run(
@@ -1099,12 +1240,29 @@ def run_yes_no_trainability(
                 base_model,
                 allow_unvalidated_arch=allow_unvalidated_arch,
             ),
+            artifact_root=artifact_root,
             allow_unvalidated_arch=allow_unvalidated_arch,
         )
     )
 
 
 def yes_no_trainability_passed(report: YesNoTrainabilityReport) -> bool:
+    has_nonzero_gradient = any(
+        max(
+            step.train_metrics.get("grad_norm", 0.0),
+            step.train_metrics.get("loss/grad_norm", 0.0),
+        )
+        > 0.0
+        for step in report.steps
+    )
+    has_positive_probs_corr = any(
+        max(
+            step.train_metrics.get("probs_corr", 0.0),
+            step.train_metrics.get("loss/probs_corr", 0.0),
+        )
+        > 0.0
+        for step in report.steps
+    )
     learned_from_below_threshold = (
         report.saturated_step is not None
         and report.saturated_step > 0
@@ -1113,27 +1271,20 @@ def yes_no_trainability_passed(report: YesNoTrainabilityReport) -> bool:
         and report.final_eval_reward >= report.reward_threshold
         and report.final_eval_reward > report.initial_eval_reward
     )
-    already_saturated_and_stable = (
-        report.initial_eval_reward >= report.reward_threshold
-        and report.latest_step > 0
-        and report.final_eval_reward is not None
-        and report.final_eval_reward >= report.reward_threshold
-        and bool(report.steps)
-        and any(step.train_metrics.get("grad_norm", 0.0) > 0.0 for step in report.steps)
+    return (
+        learned_from_below_threshold
+        and has_nonzero_gradient
+        and has_positive_probs_corr
     )
-    return learned_from_below_threshold or already_saturated_and_stable
 
 
 def run_megatron_dedicated_yes_no_trainability(
     base_model: str,
-    *,
-    rollout_weights_mode: RolloutWeightsMode | None = None,
 ) -> YesNoTrainabilityReport:
     return asyncio.run(
         run_yes_no_trainability_async(
             base_model=base_model,
             variant_name="megatron_dedicated",
-            rollout_weights_mode=rollout_weights_mode,
         )
     )
 

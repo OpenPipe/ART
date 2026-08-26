@@ -5,8 +5,10 @@ from enum import Enum
 from typing import Any
 
 from megatron.core.packed_seq_params import PackedSeqParams
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 import torch
+
+from art.megatron.selective_lm_head import LmHeadTokenSelection
 
 from .layout_index import TokenLayoutIndex
 from .loss_inputs import ContextParallelLossInputs
@@ -50,6 +52,34 @@ class PackedBatchAttentionSpec:
     rows: tuple[PackedRowAttentionSpec, ...]
 
 
+class ContextParallelStageWorkProfile(BaseModel):
+    """Architecture work assigned to one physical pipeline rank."""
+
+    model_config = ConfigDict(frozen=True)
+
+    physical_pipeline_rank: int = Field(ge=0)
+    query_flops_per_token: int = Field(ge=0)
+    tile_pair_flops: int = Field(ge=0)
+    k_hbm_bytes_per_token: int = Field(ge=0)
+    k_fetch_bytes_per_token: int = Field(ge=0)
+    dkv_reduce_bytes_per_token: int = Field(ge=0)
+    query_memory_bytes_per_token: int = Field(ge=0)
+    k_memory_bytes_per_token: int = Field(ge=0)
+
+
+class ContextParallelWorkloadProfile(BaseModel):
+    """Model-specific facts used to compare low-fragmentation CP layouts."""
+
+    model_config = ConfigDict(frozen=True)
+
+    stages: tuple[ContextParallelStageWorkProfile, ...] = Field(min_length=1)
+    query_tile_size: int = Field(gt=0)
+    key_tile_size: int = Field(gt=0)
+    indexer_score_workspace_elements: int = Field(gt=0)
+    indexer_max_k_tokens: int = Field(gt=0)
+    max_ownership_ranges_per_rank: int = Field(default=2, gt=0)
+
+
 @dataclass(frozen=True)
 class ContextParallelConfig:
     block_size: int = 128
@@ -73,6 +103,7 @@ class ContextParallelConfig:
     planner_remote_stage_token_floor: int = 4096
     planner_remote_stage_pair_floor: int = 4_000_000
     planner_remote_stage_underfill_ms: float = 0.287151
+    workload_profile: ContextParallelWorkloadProfile | None = None
 
 
 @dataclass(frozen=True)
@@ -142,10 +173,33 @@ class DispatchedPackedTensors(ContextParallelLossInputs):
     advantages: torch.Tensor
     weights: torch.Tensor
     valid_lengths: tuple[int, ...]
+    lm_head_selection: LmHeadTokenSelection
     original_logprobs: torch.Tensor | None = None
     ref_logprobs: torch.Tensor | None = None
     loss_all_reduce_group: Any | None = None
     token_uids: torch.Tensor | None = None
+
+
+class TrainingMicrobatchWorkload(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    logical_nonpadding_tokens: int = Field(ge=0)
+    loss_bearing_tokens: int = Field(ge=0)
+    executed_token_equivalents: int = Field(ge=0)
+    nominal_schedule_capacity_tokens: int = Field(ge=0)
+
+
+class TrainingStepWorkload(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    logical_nonpadding_tokens: int = Field(ge=0)
+    loss_bearing_tokens: int = Field(ge=0)
+    executed_token_equivalents: int = Field(ge=0)
+    nominal_schedule_capacity_tokens: int = Field(ge=0)
+    dummy_executed_token_equivalents: int = Field(ge=0)
+    dummy_schedule_capacity_tokens: int = Field(ge=0)
+    real_microbatches: int = Field(ge=0)
+    dummy_microbatches: int = Field(ge=0)
 
 
 @dataclass
@@ -181,6 +235,7 @@ class ArtContextParallelState:
     group_ids: torch.Tensor
     parent_ids: torch.Tensor
     input_pos: torch.Tensor
+    model_state: dict[str, Any] = field(default_factory=dict)
     block_mask_variants: tuple[CpBlockMaskVariant, ...] = ()
     gdn_execution_spec: Any | None = None
     gdn_execution_plan: Any | None = None
@@ -203,6 +258,7 @@ class ArtContextParallelState:
 class PreparedMegatronBatch:
     tensors: DispatchedPackedTensors
     attention_state: Any
+    workload: TrainingMicrobatchWorkload
     packed_seq_params: PackedSeqParams | None = None
     rank_plan: RankRuntimePlan | None = None
     pad_multiple: int = 1

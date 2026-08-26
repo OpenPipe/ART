@@ -26,6 +26,14 @@ class ModelService(Protocol):
 
     async def release_exact_adapter(self, step: int) -> None: ...
 
+    async def resolve_global_grad_accumulation_sequences(
+        self, config: types.TrainConfig
+    ) -> int: ...
+
+    async def register_lora_for_step(self, step: int, checkpoint_dir: str) -> None: ...
+
+    async def aclose(self) -> None: ...
+
     def train(
         self,
         disk_packed_tensors: DiskPackedTensors,

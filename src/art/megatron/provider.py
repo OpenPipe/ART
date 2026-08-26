@@ -12,11 +12,18 @@ from megatron.bridge.training.flex_dispatcher_backend import (
 from megatron.core.transformer.enums import AttnBackend
 from pydantic import BaseModel, ConfigDict
 import torch
+from transformers import AutoConfig
 
+from art.megatron.expert_parallel import (
+    activate_expert_parallel_layout,
+    configure_expert_parallel_layout,
+    patch_moe_routers,
+)
 from art.megatron.model_support.registry import (
     ensure_model_support_bridge_registered_for_spec,
     get_model_support_handler_for_spec,
     get_model_support_spec,
+    get_model_support_spec_by_key,
 )
 from art.megatron.model_support.spec import ModelSupportSpec
 from art.megatron.runtime.bridge_runtime import install_art_bridge_runtime_patches
@@ -56,6 +63,10 @@ _INT_ENV_FIELDS = (
         "virtual_pipeline_model_parallel_size",
         "ART_MEGATRON_VIRTUAL_PIPELINE_MODEL_PARALLEL_SIZE",
     ),
+    (
+        "microbatch_group_size_per_vp_stage",
+        "ART_MEGATRON_VPP_MICROBATCH_GROUP_SIZE",
+    ),
     ("expert_model_parallel_size", "ART_MEGATRON_EXPERT_MODEL_PARALLEL_SIZE"),
     ("recompute_num_layers", "ART_MEGATRON_RECOMPUTE_NUM_LAYERS"),
 )
@@ -91,11 +102,12 @@ def resolve_layer_spec(
     module_spec_type = _optional_module_spec_type()
     if module_spec_type is not None and isinstance(base_layer_spec, module_spec_type):
         return copy.deepcopy(base_layer_spec)
-    kwargs = (
-        {"vp_stage": vp_stage}
-        if vp_stage in inspect.signature(base_layer_spec).parameters
-        else {}
+    parameters = inspect.signature(base_layer_spec).parameters
+    accepts_vp_stage = "vp_stage" in parameters or any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters.values()
     )
+    kwargs = {"vp_stage": vp_stage} if accepts_vp_stage else {}
     return base_layer_spec(config, **kwargs)
 
 
@@ -180,6 +192,7 @@ class _ProviderRuntimeEnv(BaseModel):
     context_parallel_size: int | None = None
     pipeline_model_parallel_size: int | None = None
     virtual_pipeline_model_parallel_size: int | None = None
+    microbatch_group_size_per_vp_stage: int | None = None
     expert_model_parallel_size: int | None = None
     expert_tensor_parallel_size: int | None = None
     recompute_granularity: Literal["full", "selective"] | None = None
@@ -370,6 +383,12 @@ def _apply_art_training_runtime_prepare_defaults(
     provider: GPTModelProvider,
     handler: Any,
 ) -> None:
+    # Apex does not build its CUDA extensions in the CUDA 13 environment.
+    if (
+        torch.version.cuda is not None
+        and int(torch.version.cuda.partition(".")[0]) >= 13
+    ):
+        provider.gradient_accumulation_fusion = False
     provider.recompute_granularity = "full"
     provider.recompute_method = "uniform"
     provider.recompute_num_layers = 1
@@ -540,6 +559,11 @@ def _apply_runtime_env_overrides(
         runtime_env,
         "virtual_pipeline_model_parallel_size",
     )
+    _apply_provider_attr_if_set(
+        provider,
+        runtime_env,
+        "microbatch_group_size_per_vp_stage",
+    )
     _apply_provider_attr_if_value(provider, runtime_env, "expert_model_parallel_size")
     _apply_provider_attr_if_value(provider, runtime_env, "expert_tensor_parallel_size")
     _apply_provider_attr_if_set(provider, runtime_env, "recompute_granularity")
@@ -609,20 +633,39 @@ def _build_provider_bundle(
     model: str,
     *,
     torch_dtype: torch.dtype,
+    load_weights: bool = True,
     allow_unvalidated_arch: bool = False,
+    model_support_key: str | None = None,
 ) -> ProviderBundle:
-    spec = get_model_support_spec(
-        model,
-        allow_unvalidated_arch=allow_unvalidated_arch,
+    spec = (
+        get_model_support_spec_by_key(model_support_key)
+        if model_support_key is not None
+        else get_model_support_spec(
+            model,
+            allow_unvalidated_arch=allow_unvalidated_arch,
+        )
     )
     ensure_model_support_bridge_registered_for_spec(spec)
     handler = get_model_support_handler_for_spec(spec)
-    bridge = AutoBridge.from_hf_pretrained(
-        model,
-        dtype=torch_dtype,
-        trust_remote_code=True,
+    if load_weights:
+        bridge = AutoBridge.from_hf_pretrained(
+            model,
+            dtype=torch_dtype,
+            trust_remote_code=True,
+        )
+    else:
+        bridge = AutoBridge.from_hf_config(
+            AutoConfig.from_pretrained(
+                model,
+                dtype=torch_dtype,
+                trust_remote_code=True,
+            )
+        )
+    provider = (
+        bridge.to_megatron_provider()
+        if load_weights
+        else bridge.to_megatron_provider(load_weights=False)
     )
-    provider = bridge.to_megatron_provider()
     handler.patch_bridge(bridge)
     return ProviderBundle(
         provider=provider,
@@ -636,13 +679,17 @@ def prepare_provider_bundle(
     model: str,
     *,
     torch_dtype: torch.dtype = torch.bfloat16,
+    load_weights: bool = True,
     allow_unvalidated_arch: bool = False,
+    model_support_key: str | None = None,
 ) -> ProviderBundle:
     runtime_env = _ProviderRuntimeEnv.from_environ()
     bundle = _build_provider_bundle(
         model,
         torch_dtype=torch_dtype,
+        load_weights=load_weights,
         allow_unvalidated_arch=allow_unvalidated_arch,
+        model_support_key=model_support_key,
     )
     provider = bundle.provider
     setattr(provider, "_art_model_support_handler", bundle.handler)
@@ -672,13 +719,32 @@ def prepare_provider_bundle(
 
 
 def finalize_provider_bundle(provider_bundle: ProviderBundle) -> ProviderBundle:
-    runtime_env = _ProviderRuntimeEnv.from_environ()
+    _ProviderRuntimeEnv.from_environ()
     provider = cast(GPTModelProvider, provider_bundle.provider)
     _apply_art_training_runtime_finalize_defaults(provider)
     _enforce_art_moe_grouped_gemm_fast_path(provider)
+    configure_expert_parallel_layout(provider)
     _finalize_provider_with_art_overrides(provider)
+    if activate_expert_parallel_layout(provider) is not None:
+        _install_nonuniform_expert_parallel(provider)
     _normalize_recompute_settings(provider)
     return provider_bundle
+
+
+def _install_nonuniform_expert_parallel(provider: GPTModelProvider) -> None:
+    base_layer_spec = provider.transformer_layer_spec
+
+    def _nonuniform_expert_layer_spec(
+        config: GPTModelProvider, vp_stage: int | None = None
+    ) -> object:
+        layer_spec = resolve_layer_spec(base_layer_spec, config, vp_stage)
+        if patch_moe_routers(layer_spec) == 0:
+            raise RuntimeError(
+                "non-uniform expert parallelism found no MoE router in the layer spec"
+            )
+        return layer_spec
+
+    provider.transformer_layer_spec = cast(Any, _nonuniform_expert_layer_spec)
 
 
 def _finalize_provider_with_art_overrides(provider: GPTModelProvider) -> None:
@@ -759,13 +825,17 @@ def get_provider_bundle(
     model: str,
     *,
     torch_dtype: torch.dtype = torch.bfloat16,
+    load_weights: bool = True,
     allow_unvalidated_arch: bool = False,
+    model_support_key: str | None = None,
 ) -> ProviderBundle:
     return finalize_provider_bundle(
         prepare_provider_bundle(
             model,
             torch_dtype=torch_dtype,
+            load_weights=load_weights,
             allow_unvalidated_arch=allow_unvalidated_arch,
+            model_support_key=model_support_key,
         )
     )
 
@@ -774,10 +844,14 @@ def get_provider(
     model: str,
     *,
     torch_dtype: torch.dtype = torch.bfloat16,
+    load_weights: bool = True,
     allow_unvalidated_arch: bool = False,
+    model_support_key: str | None = None,
 ) -> GPTModelProvider:
     return get_provider_bundle(
         model,
         torch_dtype=torch_dtype,
+        load_weights=load_weights,
         allow_unvalidated_arch=allow_unvalidated_arch,
+        model_support_key=model_support_key,
     ).provider

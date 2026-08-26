@@ -1,4 +1,3 @@
-import asyncio
 from contextlib import contextmanager, nullcontext
 from contextvars import Token
 from datetime import datetime
@@ -31,7 +30,6 @@ from .metrics_taxonomy import (
     SFT_GRADIENT_STEP_KEY,
     SFT_METRIC_PREFIX,
     SFT_WANDB_GRADIENT_STEP_KEY,
-    TRAIN_GRADIENT_STEPS_KEY,
     average_metric_samples,
     build_data_metrics_from_summary,
     summarize_trajectory_groups,
@@ -305,6 +303,13 @@ class _OpenAIClientProxy:
             self._suppress_weave_trace,
         )
 
+    async def __aenter__(self) -> "_OpenAIClientProxy":
+        await self._client.__aenter__()
+        return self
+
+    async def __aexit__(self, *args: Any) -> Any:
+        return await self._client.__aexit__(*args)
+
     def __getattr__(self, name: str) -> Any:
         return getattr(self._client, name)
 
@@ -339,11 +344,19 @@ WANDB_CANONICAL_METRIC_KEYS = frozenset(
         "offpolicy/token_weighted_policy_age_steps",
         "offpolicy/token_weighted_policy_age_p95_steps",
         "throughput/accepted_train_tok_per_s",
-        "throughput/train_packed_tok_per_s",
-        "data/step_executed_packed_train_tokens",
+        "throughput/train_nonpadding_logical_tok_per_s",
+        "throughput/train_loss_bearing_tok_per_s",
+        "throughput/train_executed_tok_equiv_per_s",
+        "throughput/train_nominal_capacity_tok_per_s",
         "data/step_trainable_assistant_tokens",
-        "data/step_non_padding_train_tokens",
-        "data/step_padding_ratio",
+        "data/step_nonpadding_logical_tokens",
+        "data/step_loss_bearing_tokens",
+        "data/step_executed_token_equivalents",
+        "data/step_nominal_schedule_capacity_tokens",
+        "data/step_dummy_executed_token_equivalents",
+        "data/step_dummy_schedule_capacity_tokens",
+        "data/step_unused_packed_capacity_tokens",
+        "data/step_unused_and_dummy_ratio",
         "data/cum/num_unique_scenarios",
         "data/cum/num_scenarios",
         "data/cum/num_gradient_steps",
@@ -668,6 +681,7 @@ class Model(
         return "none"
 
     def _default_chat_completion_extra_body(self) -> dict[str, Any] | None:
+        """Defaults for ART-managed inference while preserving caller overrides."""
         internal_config = getattr(self, "_internal_config", None)
         if internal_config is None and not self.trainable:
             return None
@@ -675,13 +689,16 @@ class Model(
         if self.trainable:
             body["return_token_ids"] = True
             body["return_tokens_as_token_ids"] = True
-        chat_template_kwargs = (
+        configured_chat_template_kwargs = (
             internal_config.get("chat_template_kwargs")
             if internal_config is not None
             else None
         )
-        if chat_template_kwargs is not None:
-            body["chat_template_kwargs"] = dict(chat_template_kwargs)
+        if self.trainable or internal_config is not None:
+            body["chat_template_kwargs"] = {
+                "preserve_thinking": True,
+                **(configured_chat_template_kwargs or {}),
+            }
         if not body:
             return None
         return body
@@ -1295,9 +1312,22 @@ class Model(
 
         # 1. Write parquet
         file_name = f"{step:04d}.parquet"
-        write_trajectory_groups_parquet(
-            trajectory_groups, f"{trajectories_dir}/{file_name}"
-        )
+        trajectory_path = f"{trajectories_dir}/{file_name}"
+        prepared_paths = {
+            group._prepared_log_path
+            for group in trajectory_groups
+            if group._prepared_log_path is not None
+        }
+        if prepared_paths:
+            if len(prepared_paths) != 1 or any(
+                group._prepared_log_path is None for group in trajectory_groups
+            ):
+                raise RuntimeError("trajectory batch has inconsistent prepared logs")
+            os.replace(prepared_paths.pop(), trajectory_path)
+            for group in trajectory_groups:
+                group._prepared_log_path = None
+        else:
+            write_trajectory_groups_parquet(trajectory_groups, trajectory_path)
 
         # 2. Calculate aggregate metrics (excluding additive costs)
         reward_key = "reward"

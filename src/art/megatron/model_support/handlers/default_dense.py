@@ -1,4 +1,5 @@
-from typing import Any, Literal, Sequence
+from contextlib import nullcontext
+from typing import Any, Callable, Literal, Sequence
 
 import torch
 
@@ -9,7 +10,6 @@ from art.megatron.model_support.spec import (
     HfWeightSource,
     LayerFamilyInstance,
     PrefixTreeModelStateContext,
-    RolloutWeightsMode,
     SharedExpertCompileState,
 )
 
@@ -106,6 +106,10 @@ class DefaultDenseHandler:
         del provider
         return None
 
+    def context_parallel_workload_profile(self, provider: Any) -> Any | None:
+        del provider
+        return None
+
     def default_chat_template(self) -> str | None:
         return None
 
@@ -118,12 +122,7 @@ class DefaultDenseHandler:
         del internal_config
         return tokenizer
 
-    def vllm_engine_args(
-        self,
-        *,
-        rollout_weights_mode: RolloutWeightsMode,
-    ) -> dict[str, object]:
-        del rollout_weights_mode
+    def vllm_engine_args(self) -> dict[str, object]:
         return {}
 
     def vllm_server_args(self) -> dict[str, object]:
@@ -132,6 +131,20 @@ class DefaultDenseHandler:
     def install_preprocess_patch(self, model_chunks: Sequence[Any]) -> None:
         del model_chunks
         return None
+
+    def build_pipeline_microbatch_activator(
+        self,
+        model_chunks: Sequence[Any],
+    ) -> Callable[[Any, int], None] | None:
+        del model_chunks
+        return None
+
+    def preserve_pipeline_microbatch_activation(
+        self,
+        model_chunks: Sequence[Any],
+    ):
+        del model_chunks
+        return nullcontext()
 
     def build_prefix_tree_model_state(
         self,
@@ -176,6 +189,9 @@ class DefaultDenseHandler:
 
     def to_vllm_lora_config(self, adapter_config: dict[str, Any]) -> dict[str, Any]:
         return adapter_config
+
+    def vllm_lora_conversion_is_view_only(self) -> bool:
+        return False
 
     def from_vllm_lora_tensors(
         self,

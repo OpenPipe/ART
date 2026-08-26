@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from datetime import datetime
 import json
+import math
 from typing import Any, Literal
 from urllib.parse import urlsplit
 
@@ -14,7 +16,11 @@ from openai.types.chat.chat_completion_chunk import ChatCompletionChunk
 from openai.types.responses import Response
 from pydantic import TypeAdapter, ValidationError
 
-from ..openai import init_chat_completion, update_chat_completion
+from ..openai import (
+    finalize_chat_completion,
+    init_chat_completion,
+    update_chat_completion,
+)
 from ..preprocessing.moe_routing import attach_moe_routing_metadata_to_choice
 from ..vllm_route_transport import (
     decode_routed_experts_response,
@@ -52,9 +58,12 @@ def endpoint_for_url(url: str) -> Endpoint | None:
 
 
 def _sse_events(body: bytes) -> list[tuple[str | None, SSEPayload]]:
-    text = body.decode("utf-8").replace("\r\n", "\n")
+    text = body.decode("utf-8").replace("\r\n", "\n").replace("\r", "\n")
     events: list[tuple[str | None, SSEPayload]] = []
-    for block in text.split("\n\n"):
+    blocks = text.split("\n\n")
+    if not text.endswith("\n\n"):
+        blocks.pop()
+    for block in blocks:
         event_name: str | None = None
         data_lines: list[str] = []
         for line in block.splitlines():
@@ -95,6 +104,7 @@ def _chat_response(body: bytes, *, stream: bool) -> ChatCompletion:
         return ChatCompletion.model_validate_json(body)
     response: ChatCompletion | None = None
     choices: dict[int, ChatCompletion] = {}
+    terminal_choices: set[int] = set()
     done = False
     for _, payload in _sse_events(body):
         if payload == "[DONE]":
@@ -125,16 +135,23 @@ def _chat_response(body: bytes, *, stream: bool) -> ChatCompletion:
             response = init_chat_completion(chunk.model_copy(update={"choices": []}))
         update_chat_completion(response, chunk.model_copy(update={"choices": []}))
         for choice in chunk.choices:
+            if choice.finish_reason is not None:
+                terminal_choices.add(choice.index)
             choice_chunk = chunk.model_copy(update={"choices": [choice]})
             choice_response = choices.get(choice.index)
             if choice_response is None:
                 choice_response = init_chat_completion(choice_chunk)
                 choices[choice.index] = choice_response
             update_chat_completion(choice_response, choice_chunk)
-    if response is None or not done:
+    if response is None or not done or not choices:
         raise ValueError("Incomplete Chat Completions stream")
+    missing = set(choices) - terminal_choices
+    if missing:
+        raise ValueError(
+            f"Chat Completions stream choices {sorted(missing)} were not terminal"
+        )
     response.choices = [choices[index].choices[0] for index in sorted(choices)]
-    return response
+    return finalize_chat_completion(response)
 
 
 def _completion_response(body: bytes, *, stream: bool) -> Completion:
@@ -221,9 +238,46 @@ def _messages_response(body: bytes, *, stream: bool) -> Message:
     complete = False
     token_ids: list[int] = []
     logprobs: list[float] = []
+    prompt_token_ids: list[int] = []
+    block_token_ids: dict[int, list[int]] = {}
+    block_logprobs: dict[int, list[float]] = {}
+
+    def parsed_token_ids(value: object, field: str) -> list[int] | None:
+        if value is None:
+            return None
+        if not isinstance(value, list):
+            raise ValueError(f"{field} must contain integer token IDs")
+        result: list[int] = []
+        for item in value:
+            if not isinstance(item, int) or isinstance(item, bool) or item < 0:
+                raise ValueError(f"{field} must contain integer token IDs")
+            result.append(item)
+        return result
+
+    def token_logprobs(value: object, field: str) -> list[float] | None:
+        if value is None:
+            return None
+        if not isinstance(value, list):
+            raise ValueError(f"{field} must contain numeric logprobs")
+        result: list[float] = []
+        for item in value:
+            if (
+                not isinstance(item, (int, float))
+                or isinstance(item, bool)
+                or not math.isfinite(item)
+            ):
+                raise ValueError(f"{field} must contain numeric logprobs")
+            result.append(float(item))
+        return result
+
     for event_name, payload in _sse_events(body):
         if not isinstance(payload, dict):
             continue
+        event_type = payload.get("type") or event_name
+        if event_name == "ping" or event_type == "ping":
+            continue
+        if event_name == "error" or event_type == "error":
+            raise ValueError("Anthropic Messages stream returned an error event")
         if event_name and "type" not in payload:
             payload = {**payload, "type": event_name}
         event = adapter.validate_python(payload)
@@ -232,25 +286,80 @@ def _messages_response(body: bytes, *, stream: bool) -> Message:
             current_snapshot=snapshot,
             output_format=NOT_GIVEN,
         )
-        if event.type == "message_delta":
-            event_token_ids = payload.get("token_ids")
-            event_logprobs = payload.get("logprobs")
-            if isinstance(event_token_ids, list) and all(
-                isinstance(value, int) for value in event_token_ids
-            ):
+        if event.type == "message_start":
+            message = payload.get("message")
+            values = (
+                message.get("prompt_token_ids") if isinstance(message, dict) else None
+            )
+            if (
+                values := parsed_token_ids(values, "Messages prompt_token_ids")
+            ) is not None:
+                prompt_token_ids = values
+        elif event.type == "message_delta":
+            if (
+                values := parsed_token_ids(
+                    payload.get("prompt_token_ids"), "Messages prompt_token_ids"
+                )
+            ) is not None:
+                prompt_token_ids = values
+            if (
+                event_token_ids := parsed_token_ids(
+                    payload.get("token_ids"), "Messages token_ids"
+                )
+            ) is not None:
                 token_ids = event_token_ids
-            if isinstance(event_logprobs, list) and all(
-                isinstance(value, (int, float)) for value in event_logprobs
+            if (
+                event_logprobs := token_logprobs(
+                    payload.get("logprobs"), "Messages logprobs"
+                )
+            ) is not None:
+                logprobs = event_logprobs
+        elif event.type in {"content_block_start", "content_block_delta"}:
+            index = payload.get("index")
+            event_token_ids = parsed_token_ids(
+                payload.get("token_ids"), "Messages content token_ids"
+            )
+            event_logprobs = token_logprobs(
+                payload.get("logprobs"), "Messages content logprobs"
+            )
+            if (
+                isinstance(index, int)
+                and not isinstance(index, bool)
+                and event_token_ids
             ):
-                logprobs = [float(value) for value in event_logprobs]
+                block_token_ids.setdefault(index, []).extend(event_token_ids)
+            if (
+                isinstance(index, int)
+                and not isinstance(index, bool)
+                and event_logprobs
+            ):
+                block_logprobs.setdefault(index, []).extend(event_logprobs)
         complete = complete or event.type == "message_stop"
     if snapshot is None or not complete:
         raise ValueError("Incomplete Messages stream")
     data = snapshot.model_dump(mode="python")
+    content = data.get("content")
+    if isinstance(content, list):
+        rebuilt_content: list[object] = []
+        for index, raw_block in enumerate(content):
+            if not isinstance(raw_block, dict):
+                rebuilt_content.append(raw_block)
+                continue
+            block: dict[str, Any] = {
+                str(key): value for key, value in raw_block.items()
+            }
+            if values := block_token_ids.get(index):
+                block["token_ids"] = values
+            if values := block_logprobs.get(index):
+                block["logprobs"] = values
+            rebuilt_content.append(block)
+        data["content"] = rebuilt_content
     if token_ids:
         data["token_ids"] = token_ids
     if logprobs:
         data["logprobs"] = logprobs
+    if prompt_token_ids:
+        data["prompt_token_ids"] = prompt_token_ids
     return Message.model_validate(data)
 
 
@@ -265,6 +374,14 @@ def build_exchange(
     stream = request.get("stream") is True
     if endpoint == "chat_completions":
         response = _chat_response(body, stream=stream)
+        stream_options = request.get("stream_options")
+        if (
+            stream
+            and isinstance(stream_options, Mapping)
+            and stream_options.get("include_usage") is True
+            and response.usage is None
+        ):
+            raise ValueError("Chat Completions stream is missing requested usage")
         return ChatCompletionsExchange(
             request=ChatCompletionsRequest(**request),
             response=response,

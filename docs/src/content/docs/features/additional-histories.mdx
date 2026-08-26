@@ -29,10 +29,16 @@ Each trajectory can contain:
 
 Some models, like Qwen 3, use chat templates that remove special tokens (such as `<think>`) from previous turns in multi-turn conversations. This can interfere with training when you want the model to learn from its thinking process across all turns.
 
+ART-managed inference and SFT paths preserve prior-turn thinking by default when
+the model's chat template supports it. You can override that behavior explicitly
+with `chat_template_kwargs={"preserve_thinking": False}`. Additional histories
+remain useful for custom or externally managed templates that do not expose a
+prior-thinking preservation option.
+
 By splitting each turn into a separate history, you can preserve these tokens for training:
 
 ```python
-from art.trajectories import Trajectory, History
+from art.trajectories import LegacyHistory, Trajectory
 
 # Instead of a single multi-turn conversation that loses <think> tokens
 # Train as separate histories to preserve them
@@ -43,7 +49,7 @@ trajectory = Trajectory(
         {"role": "assistant", "content": "<think>I need to add 2 and 2</think>4"}
     ],
     additional_histories=[
-        History(
+        LegacyHistory(
             messages_and_choices=[
                 # The Qwen 3 chat template removes <think> tokens from previous turns
                 {"role": "user", "content": "What is 2+2?"},
@@ -84,7 +90,7 @@ trajectory = Trajectory(
     ],
     additional_histories=[
         # Sub-agent 1: Code analysis
-        History(
+        LegacyHistory(
             messages_and_choices=[
                 {"role": "system", "content": "You are a code analysis expert"},
                 {"role": "user", "content": "Find potential bugs in main.py"},
@@ -92,7 +98,7 @@ trajectory = Trajectory(
             ]
         ),
         # Sub-agent 2: Bug fixing
-        History(
+        LegacyHistory(
             messages_and_choices=[
                 {"role": "system", "content": "You are a bug fixing expert"},
                 {"role": "user", "content": "Fix the null pointer issue on line 42"},
@@ -118,7 +124,7 @@ trajectory = Trajectory(
     ],
     additional_histories=[
         # Previous conversation segment before compaction
-        History(
+        LegacyHistory(
             messages_and_choices=[
                 {"role": "system", "content": "You are a helpful assistant."},
                 {"role": "user", "content": "Compacted conversation history: the user asked about quantum entanglement, and the assistant explained..."},
@@ -154,11 +160,11 @@ for history in histories:
 
 ### Data Structure
 
-The `History` class structure:
+The legacy `LegacyHistory` payload structure:
 
 ```python
 @dataclass
-class History:
+class LegacyHistory:
     messages_and_choices: list[dict[str, Any]]
     tools: list[Tool] | None = None
 ```
@@ -170,7 +176,7 @@ The `Trajectory` class with additional histories:
 class Trajectory:
     messages_and_choices: list[dict[str, Any]]
     tools: list[Tool] | None = None
-    additional_histories: list[History] = field(default_factory=list)
+    additional_histories: list[LegacyHistory] = field(default_factory=list)
     reward: float | None = None
     metrics: dict[str, Any] = field(default_factory=dict)
 ```
@@ -180,7 +186,7 @@ class Trajectory:
 ### Creating a Trajectory with Additional Histories
 
 ```python
-from art.trajectories import Trajectory, History
+from art.trajectories import LegacyHistory, Trajectory
 
 # Create the main conversation
 main_messages = [
@@ -190,14 +196,14 @@ main_messages = [
 ]
 
 # Create additional histories
-history1 = History(
+history1 = LegacyHistory(
     messages_and_choices=[
         {"role": "user", "content": "First subtask"},
         {"role": "assistant", "content": "Completing first subtask..."}
     ]
 )
 
-history2 = History(
+history2 = LegacyHistory(
     messages_and_choices=[
         {"role": "user", "content": "Second subtask"},
         {"role": "assistant", "content": "Completing second subtask..."}

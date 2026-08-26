@@ -198,7 +198,10 @@ async def main() -> None:
         )
     )
 
-    backend = MegatronBackend()
+    art.init_megatron_runtime_config(
+        topology=art.MegatronTopologyConfig(),
+        packed_sequence_length=packed_sequence_length,
+    )
     model = art.TrainableModel(
         run_name=model_name,
         name=model_name,
@@ -214,7 +217,7 @@ async def main() -> None:
     prompts = prompts[: int(os.environ.get("PROMPTS_LIMIT", str(len(prompts))))]
     eval_prompts = prompts[: int(os.environ.get("EVAL_PROMPTS", "24"))]
 
-    try:
+    async with MegatronBackend() as backend:
         print(json.dumps({"event": "register_start"}), flush=True)
         await model.register(backend)
         print(
@@ -294,7 +297,6 @@ async def main() -> None:
                 model,
                 train_groups,
                 learning_rate=learning_rate,
-                packed_sequence_length=packed_sequence_length,
             )
             print(
                 json.dumps(
@@ -327,8 +329,6 @@ async def main() -> None:
                 ),
                 flush=True,
             )
-    finally:
-        await backend.close()
 
 
 if __name__ == "__main__":

@@ -3,9 +3,9 @@ from typing import Any
 
 import pytest
 
-from art import TrainableModel
+from art import Model, TrainableModel
 from art.costs import build_cost_calculator, get_model_pricing
-from art.model import _OpenAIChatCompletionsProxy
+from art.model import _OpenAIChatCompletionsProxy, _OpenAIClientProxy
 
 
 class _FakeUsage:
@@ -70,6 +70,28 @@ def _build_model() -> TrainableModel:
 
 
 class TestModelOpenAIClientCosts:
+    @pytest.mark.asyncio
+    async def test_openai_client_proxy_preserves_async_lifetime(self) -> None:
+        class _Client:
+            chat = type("Chat", (), {"completions": object()})()
+            entered = False
+            exited = False
+
+            async def __aenter__(self) -> "_Client":
+                self.entered = True
+                return self
+
+            async def __aexit__(self, *args: Any) -> None:
+                self.exited = True
+
+        client = _Client()
+        proxy = _OpenAIClientProxy(client, lambda _response: None)
+
+        async with proxy as entered:
+            assert entered is proxy
+            assert client.entered
+        assert client.exited
+
     @pytest.mark.asyncio
     async def test_openai_client_automatically_logs_train_tinker_costs(
         self,
@@ -212,4 +234,48 @@ class TestModelOpenAIClientCosts:
                 "enable_thinking": False,
                 "preserve_thinking": True,
             },
+        }
+
+    def test_trainable_model_preserves_prior_thinking_by_default(self) -> None:
+        model = TrainableModel(
+            run_name="test-run",
+            name="test-run",
+            project="test-project",
+            base_model="test-model",
+        )
+
+        assert model._default_chat_completion_extra_body() == {
+            "return_token_ids": True,
+            "return_tokens_as_token_ids": True,
+            "chat_template_kwargs": {"preserve_thinking": True},
+        }
+
+    def test_art_managed_model_preserves_prior_thinking_by_default(self) -> None:
+        model = Model(name="test-model", project="test-project")
+        object.__setattr__(model, "_internal_config", {})
+
+        assert model._default_chat_completion_extra_body() == {
+            "chat_template_kwargs": {"preserve_thinking": True}
+        }
+
+    def test_unmanaged_model_does_not_receive_template_kwargs(self) -> None:
+        model = Model(name="test-model", project="test-project")
+
+        assert model._default_chat_completion_extra_body() is None
+
+    def test_configured_preserve_thinking_false_overrides_managed_default(
+        self,
+    ) -> None:
+        model = TrainableModel(
+            run_name="test-run",
+            name="test-run",
+            project="test-project",
+            base_model="test-model",
+            _internal_config={"chat_template_kwargs": {"preserve_thinking": False}},
+        )
+
+        assert model._default_chat_completion_extra_body() == {
+            "return_token_ids": True,
+            "return_tokens_as_token_ids": True,
+            "chat_template_kwargs": {"preserve_thinking": False},
         }

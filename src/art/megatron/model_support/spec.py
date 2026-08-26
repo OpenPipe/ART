@@ -1,4 +1,13 @@
-from typing import TYPE_CHECKING, Any, Literal, Protocol, Sequence, runtime_checkable
+from contextlib import AbstractContextManager
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Literal,
+    Protocol,
+    Sequence,
+    runtime_checkable,
+)
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -6,7 +15,6 @@ if TYPE_CHECKING:
     from megatron.bridge import AutoBridge
     from megatron.bridge.models.gpt_provider import GPTModelProvider
 
-RolloutWeightsMode = Literal["lora", "merged"]
 NativeVllmLoraStatus = Literal["disabled", "wip", "validated"]
 SharedExpertCompileState = Literal[
     "none",
@@ -56,6 +64,7 @@ class PrefixTreeModelStateContext(BaseModel):
     attention_token_layout_index: Any | None = None
     attention_head_dim: int | None = None
     attention_value_head_dim: int | None = None
+    context_parallel_state: Any | None = None
 
 
 class CompileWorkaroundConfig(BaseModel):
@@ -95,7 +104,6 @@ class ModelSupportSpec(BaseModel):
     is_moe: bool = False
     model_names: tuple[str, ...] = ()
     default_target_modules: tuple[str, ...]
-    default_rollout_weights_mode: RolloutWeightsMode = "lora"
     native_vllm_lora_status: NativeVllmLoraStatus = "disabled"
     dependency_floor: DependencyFloor = Field(default_factory=DependencyFloor)
 
@@ -135,6 +143,8 @@ class ModelSupportHandler(Protocol):
 
     def configure_provider_for_runtime(self, provider: "GPTModelProvider") -> None: ...
 
+    def context_parallel_workload_profile(self, provider: Any) -> Any | None: ...
+
     def default_chat_template(self) -> str | None: ...
 
     def configure_tokenizer(
@@ -144,15 +154,21 @@ class ModelSupportHandler(Protocol):
         internal_config: Any,
     ) -> Any: ...
 
-    def vllm_engine_args(
-        self,
-        *,
-        rollout_weights_mode: RolloutWeightsMode,
-    ) -> dict[str, object]: ...
+    def vllm_engine_args(self) -> dict[str, object]: ...
 
     def vllm_server_args(self) -> dict[str, object]: ...
 
     def install_preprocess_patch(self, model_chunks: Sequence[Any]) -> None: ...
+
+    def build_pipeline_microbatch_activator(
+        self,
+        model_chunks: Sequence[Any],
+    ) -> Callable[[Any, int], None] | None: ...
+
+    def preserve_pipeline_microbatch_activation(
+        self,
+        model_chunks: Sequence[Any],
+    ) -> AbstractContextManager[None]: ...
 
     def build_prefix_tree_model_state(
         self,
@@ -208,6 +224,8 @@ class ModelSupportHandler(Protocol):
         self,
         adapter_config: dict[str, Any],
     ) -> dict[str, Any]: ...
+
+    def vllm_lora_conversion_is_view_only(self) -> bool: ...
 
     def expert_packed_lora_groups(self) -> tuple[ExpertPackedLoraGroup, ...]: ...
 

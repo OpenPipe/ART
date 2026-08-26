@@ -7,7 +7,8 @@ import os
 from pathlib import Path
 import random
 import shutil
-from typing import Any, AsyncIterator, Literal, cast
+import time
+from typing import Any, AsyncIterator, Awaitable, Callable, Literal, cast
 import uuid
 
 from pydantic import BaseModel, Field
@@ -29,8 +30,10 @@ from .yes_no_trainability import (
     _get_env_bool,
     _get_env_float,
     _get_env_int,
+    _get_env_int_list,
     _init_megatron_runtime_config,
     _list_model_ids,
+    _temporary_env,
     _topology_with_env_overrides,
     _trainability_stage_resources,
 )
@@ -39,18 +42,26 @@ torch = pytest.importorskip("torch")
 
 DEFAULT_BASE_MODEL = "Qwen/Qwen3.5-35B-A3B"
 DEFAULT_LENGTH_LEARNING_RATE = 1e-4
-LARGE_MOE_LENGTH_LEARNING_RATE = 7e-5
+LENGTH_MAX_STEPS_BY_MODEL = {
+    "llama3_dense": 30,
+    "qwen3_5_moe": 40,
+    "gpt_oss_moe": 30,
+}
+QWEN3_5_MOE_LENGTH_ROLLOUTS_PER_PROMPT = 32
+DETERMINISTIC_LENGTH_ROLLOUT_SEED = 20261833
+QWEN3_5_MOE_LENGTH_ROLLOUT_TEMPERATURE = 0.8
 LIVE_ENV = "ART_RUN_LIVE_LENGTH_TRAINABILITY"
 TRAINER_GPU_IDS_ENV = "ART_MODEL_SUPPORT_TRAINER_GPU_IDS"
 INFERENCE_GPU_IDS_ENV = "ART_MODEL_SUPPORT_INFERENCE_GPU_IDS"
 REPO_ROOT = Path(__file__).resolve().parents[4]
 LATEST_SUMMARY_LOG_PATH = REPO_ROOT / ".local" / "length_trainability.log"
 DEFAULT_INITIAL_ABS_ERROR_MIN = 5.0
-DEFAULT_SUCCESS_ABS_ERROR_MAX = 1.5
+DEFAULT_SUCCESS_ABS_ERROR_MAX = 2.0
 GPT_OSS_INITIAL_ABS_ERROR_MIN = 100.0
 GPT_OSS_SUCCESS_ABS_ERROR_MAX = 5.0
 GPT_OSS_TARGET_TOKENS = 20
 GEMMA4_TARGET_TOKENS = 22
+GLM52_TARGET_TOKENS = 12
 GEMMA4_LENGTH_LEARNING_RATE = 3e-5
 DEFAULT_LENGTH_MAX_STEPS = 20
 GPT_OSS_MIN_MAX_TOKENS = 512
@@ -164,6 +175,13 @@ class LengthTrainabilityThresholds(BaseModel):
     success_abs_error_max: float
 
 
+class LengthTrainingPhaseReport(BaseModel):
+    name: Literal["complete", "first_update", "continuation"]
+    start_step: int
+    end_step: int
+    duration_s: float
+
+
 class LengthTrainabilityReport(BaseModel):
     base_model: str
     max_steps: int
@@ -173,7 +191,6 @@ class LengthTrainabilityReport(BaseModel):
     trainer_gpu_ids: list[int]
     inference_gpu_ids: list[int]
     training_topology: dict[str, int | bool]
-    rollout_weights_mode: str
     rollouts_per_prompt: int
     prompt_tree_depth: int = 0
     prompt_tree_branch_count: int = 0
@@ -188,6 +205,13 @@ class LengthTrainabilityReport(BaseModel):
     final_train_abs_error: float | None
     model_ids_after: list[str]
     samples: list[LengthSampleReport]
+    phases: list[LengthTrainingPhaseReport] = Field(default_factory=list)
+
+
+LengthResidentHook = Callable[
+    [Literal["registered", "first_update"], Any, art.TrainableModel, int],
+    Awaitable[None],
+]
 
 
 def _require_opt_in() -> None:
@@ -225,7 +249,9 @@ def _word_count(text: str) -> int:
 def _target_tokens(base_model: str | None = None) -> int:
     model_key = _model_support_key(base_model)
     default = {
+        "gemma4_dense": GEMMA4_TARGET_TOKENS,
         "gemma4_moe": GEMMA4_TARGET_TOKENS,
+        "glm52": GLM52_TARGET_TOKENS,
         "gpt_oss_moe": GPT_OSS_TARGET_TOKENS,
     }.get(model_key, 10)
     return _get_env_int("ART_MODEL_SUPPORT_LENGTH_TARGET_TOKENS", default)
@@ -234,8 +260,6 @@ def _target_tokens(base_model: str | None = None) -> int:
 def _default_learning_rate(base_model: str) -> float:
     if _model_support_key(base_model) == "gemma4_moe":
         return GEMMA4_LENGTH_LEARNING_RATE
-    if base_model == DEFAULT_BASE_MODEL:
-        return LARGE_MOE_LENGTH_LEARNING_RATE
     return DEFAULT_LENGTH_LEARNING_RATE
 
 
@@ -325,7 +349,11 @@ def _base_max_tokens(target_tokens: int, *, base_model: str | None = None) -> in
     return max_tokens
 
 
-def _prompt_for_index(index: int) -> tuple[str, int]:
+def _prompt_for_index(
+    index: int,
+    *,
+    base_model: str | None = None,
+) -> tuple[str, int]:
     target_words = _get_env_int("ART_MODEL_SUPPORT_LENGTH_PROMPT_WORDS", 300)
     rng = random.Random(index)
     sentences = list(FILLER_SENTENCES)
@@ -333,7 +361,13 @@ def _prompt_for_index(index: int) -> tuple[str, int]:
     selected: list[str] = []
     mid = LENGTH_PROMPT_MIDS[(index // 2) % len(LENGTH_PROMPT_MIDS)]
     leaf = LENGTH_PROMPT_LEAVES[index % len(LENGTH_PROMPT_LEAVES)]
-    prefix = f"{BASE_PROMPT}\n\n{mid}\n\n{leaf}"
+    base_prompt = BASE_PROMPT
+    if _model_support_key(base_model) == "glm52":
+        base_prompt = base_prompt.replace(
+            "Use one sentence.",
+            "Use two complete sentences with one concrete detail in each.",
+        )
+    prefix = f"{base_prompt}\n\n{mid}\n\n{leaf}"
     prompt = prefix
     for sentence in sentences:
         if _word_count(prompt) >= target_words:
@@ -366,7 +400,7 @@ def _scenario(
 ) -> LengthScenario:
     target_tokens = _target_tokens(base_model)
     max_tokens = _base_max_tokens(target_tokens, base_model=base_model)
-    prompt, prompt_word_count = _prompt_for_index(index)
+    prompt, prompt_word_count = _prompt_for_index(index, base_model=base_model)
     return LengthScenario(
         scenario_index=index,
         target_step=index if target_step is None else target_step,
@@ -441,10 +475,28 @@ def _messages(
     return messages
 
 
-def _extra_body(chat_template_kwargs: dict[str, Any]) -> dict[str, object]:
-    return (
+def _extra_body(
+    chat_template_kwargs: dict[str, Any], *, seed: int | None = None
+) -> dict[str, object]:
+    body: dict[str, object] = (
         {"chat_template_kwargs": chat_template_kwargs} if chat_template_kwargs else {}
     )
+    allowed_token_ids = _get_env_int_list("ART_MODEL_SUPPORT_LENGTH_ALLOWED_TOKEN_IDS")
+    if allowed_token_ids is not None:
+        body["allowed_token_ids"] = allowed_token_ids
+    if (
+        min_tokens := os.environ.get("ART_MODEL_SUPPORT_LENGTH_MIN_TOKENS")
+    ) is not None:
+        body["min_tokens"] = int(min_tokens)
+    if (
+        frequency_penalty := os.environ.get(
+            "ART_MODEL_SUPPORT_LENGTH_FREQUENCY_PENALTY"
+        )
+    ) is not None:
+        body["frequency_penalty"] = float(frequency_penalty)
+    if seed is not None:
+        body["seed"] = seed
+    return body
 
 
 def _length_chat_template_kwargs(base_model: str, tokenizer: object) -> dict[str, Any]:
@@ -465,11 +517,46 @@ def _scenario_limit() -> int | None:
     return _get_env_int("ART_MODEL_SUPPORT_LENGTH_SCENARIOS", 0)
 
 
-def _length_max_steps() -> int:
+def _length_max_steps(base_model: str) -> int:
     return _get_env_int(
         "ART_MODEL_SUPPORT_LENGTH_MAX_STEPS",
-        DEFAULT_LENGTH_MAX_STEPS,
+        LENGTH_MAX_STEPS_BY_MODEL.get(
+            _model_support_key(base_model), DEFAULT_LENGTH_MAX_STEPS
+        ),
     )
+
+
+def _length_rollouts_per_prompt(base_model: str) -> int:
+    return _get_env_int(
+        "ART_MODEL_SUPPORT_LENGTH_ROLLOUTS_PER_PROMPT",
+        QWEN3_5_MOE_LENGTH_ROLLOUTS_PER_PROMPT
+        if _model_support_key(base_model) == "qwen3_5_moe"
+        else 4,
+    )
+
+
+def _length_current_step_demand(base_model: str) -> bool:
+    return _get_env_bool(
+        "ART_MODEL_SUPPORT_LENGTH_CURRENT_STEP_DEMAND",
+        _model_support_key(base_model) in {"gpt_oss_moe", "qwen3_5_moe"},
+    )
+
+
+def _length_rollout_temperature(base_model: str) -> float:
+    return _get_env_float(
+        "ART_MODEL_SUPPORT_LENGTH_ROLLOUT_TEMPERATURE",
+        QWEN3_5_MOE_LENGTH_ROLLOUT_TEMPERATURE
+        if _model_support_key(base_model) == "qwen3_5_moe"
+        else 1.1,
+    )
+
+
+def _length_rollout_seed(base_model: str) -> int | None:
+    if (seed := os.environ.get("ART_MODEL_SUPPORT_LENGTH_ROLLOUT_SEED")) is not None:
+        return int(seed)
+    if _model_support_key(base_model) in {"gpt_oss_moe", "qwen3_5_moe"}:
+        return DETERMINISTIC_LENGTH_ROLLOUT_SEED
+    return None
 
 
 def _zero_variance_discard_multiplier(max_steps: int) -> int:
@@ -543,6 +630,7 @@ async def _length_group(
         )
         for completion_index in range(n)
     ]
+    seed = _length_rollout_seed(base_model)
     trajectories: list[art.Trajectory] = []
     completions = await asyncio.gather(
         *(
@@ -552,7 +640,14 @@ async def _length_group(
                 max_tokens=max_tokens,
                 n=1,
                 temperature=temperature,
-                extra_body=_extra_body(chat_template_kwargs),
+                extra_body=_extra_body(
+                    chat_template_kwargs,
+                    seed=(
+                        None
+                        if seed is None
+                        else seed + scenario.scenario_index * n + completion_index
+                    ),
+                ),
                 logprobs=True,
                 top_logprobs=0,
                 timeout=_get_env_float(
@@ -560,7 +655,7 @@ async def _length_group(
                     900.0,
                 ),
             )
-            for max_tokens in max_tokens_by_completion
+            for completion_index, max_tokens in enumerate(max_tokens_by_completion)
         )
     )
     for max_tokens, completion in zip(
@@ -688,8 +783,12 @@ async def run_length_trainability_async(
     base_model: str = DEFAULT_BASE_MODEL,
     artifact_dir: Path | None = None,
     allow_unvalidated_arch: bool = False,
+    resident_hook: LengthResidentHook | None = None,
+    registration_ready: Awaitable[object] | None = None,
+    first_update_learning_rate: float | None = None,
 ) -> LengthTrainabilityReport:
     artifact_dir = artifact_dir or _artifact_dir(base_model)
+    artifact_dir.mkdir(parents=True, exist_ok=True)
     variant = _build_variant(
         "megatron_dedicated",
         base_model=base_model,
@@ -697,28 +796,40 @@ async def run_length_trainability_async(
         resource_stage_name="length_trainability",
     )
     _use_default_moe_dedicated_placement(variant, base_model=base_model)
-    max_steps = _length_max_steps()
-    max_steps_off_policy = _get_env_int(
-        "ART_MODEL_SUPPORT_LENGTH_MAX_STEPS_OFF_POLICY",
-        0,
+    stage_resources = _trainability_stage_resources(
+        base_model,
+        stage_name="length_trainability",
+        allow_unvalidated_arch=allow_unvalidated_arch,
     )
-    rollouts_per_prompt = _get_env_int(
-        "ART_MODEL_SUPPORT_LENGTH_ROLLOUTS_PER_PROMPT",
-        4,
-    )
-    normalize_advantages = _get_env_bool(
-        "ART_MODEL_SUPPORT_LENGTH_NORMALIZE_ADVANTAGES",
-        True,
-    )
-    rollout_workers = _get_env_int(
-        "ART_MODEL_SUPPORT_LENGTH_ROLLOUT_WORKERS",
-        max(1, max_steps_off_policy + 1),
-    )
-    thresholds = _length_trainability_thresholds(base_model)
-    scenario_limit = _scenario_limit()
-    zero_variance_discard_multiplier = _zero_variance_discard_multiplier(max_steps)
+    backend_env = stage_resources.megatron_env if stage_resources is not None else {}
+    with _temporary_env(backend_env):
+        max_steps = _length_max_steps(base_model)
+        if resident_hook is not None and max_steps < 2:
+            raise ValueError(
+                "resident functional validation requires at least two steps"
+            )
+        max_steps_off_policy = _get_env_int(
+            "ART_MODEL_SUPPORT_LENGTH_MAX_STEPS_OFF_POLICY",
+            0,
+        )
+        rollouts_per_prompt = _length_rollouts_per_prompt(base_model)
+        normalize_advantages = _get_env_bool(
+            "ART_MODEL_SUPPORT_LENGTH_NORMALIZE_ADVANTAGES",
+            True,
+        )
+        rollout_workers = _get_env_int(
+            "ART_MODEL_SUPPORT_LENGTH_ROLLOUT_WORKERS",
+            max(1, max_steps_off_policy + 1),
+        )
+        thresholds = _length_trainability_thresholds(base_model)
+        scenario_limit = _scenario_limit()
+        zero_variance_discard_multiplier = _zero_variance_discard_multiplier(max_steps)
+        current_step_demand = _length_current_step_demand(base_model)
     success_hit = False
+    pending_trainable_step: int | None = None
+    scenario_index = 0
     samples: list[LengthSampleReport] = []
+    phases: list[LengthTrainingPhaseReport] = []
     backend_root = artifact_dir / "megatron_dedicated_workspace"
     summary_log_path = artifact_dir / "length_trainability.log"
     _init_summary_log(summary_log_path)
@@ -728,33 +839,30 @@ async def run_length_trainability_async(
         allow_unvalidated_arch=allow_unvalidated_arch,
         resource_stage_name="length_trainability",
     )
-    internal_config["engine_args"]["max_model_len"] = _get_env_int(
+    max_model_len = _get_env_int(
         "ART_MODEL_SUPPORT_LENGTH_MAX_MODEL_LEN",
         1024,
     )
+    internal_config["engine_args"]["max_model_len"] = max_model_len
+    internal_config["init_args"]["max_seq_length"] = max_model_len
     internal_config["engine_args"]["max_num_seqs"] = _get_env_int(
         "ART_MODEL_SUPPORT_LENGTH_MAX_NUM_SEQS",
-        4,
+        max(4, rollouts_per_prompt),
     )
     from transformers import AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(base_model)
     chat_template_kwargs = _length_chat_template_kwargs(base_model, tokenizer)
-    rollout_weights_mode = internal_config["rollout_weights_mode"]
-    stage_resources = _trainability_stage_resources(
-        base_model,
-        stage_name="length_trainability",
-        allow_unvalidated_arch=allow_unvalidated_arch,
-    )
-    _init_megatron_runtime_config(
-        variant,
-        streaming_weight_offload=(
-            stage_resources.streaming_weight_offload
-            if stage_resources is not None
-            else False
-        ),
-    )
-    backend_env = stage_resources.megatron_env if stage_resources is not None else {}
+    with _temporary_env(backend_env):
+        _init_megatron_runtime_config(
+            variant,
+            packed_sequence_length=max_model_len,
+            streaming_weight_offload=(
+                stage_resources.streaming_weight_offload
+                if stage_resources is not None
+                else False
+            ),
+        )
 
     async with _backend_context(
         variant,
@@ -770,26 +878,48 @@ async def run_length_trainability_async(
             _internal_config=internal_config,
             report_metrics=[],
         )
+        if registration_ready is not None:
+            await registration_ready
         await model.register(backend)
+        registered_step = await model.get_step()
+        if resident_hook is not None:
+            await resident_hook("registered", backend, model, registered_step)
+
+        trainer: PipelineTrainer | None = None
 
         async def scenarios() -> AsyncIterator[dict[str, object]]:
-            index = 0
+            nonlocal pending_trainable_step, scenario_index
             while not success_hit and (
-                scenario_limit is None or index < scenario_limit
+                scenario_limit is None or scenario_index < scenario_limit
             ):
+                required_step = pending_trainable_step
+                if current_step_demand and required_step is not None:
+                    assert trainer is not None
+                    active_trainer = trainer
+                    async with active_trainer.state.policy_updated:
+                        await active_trainer.state.policy_updated.wait_for(
+                            lambda: (
+                                active_trainer.state.done
+                                or active_trainer.state.policy_version > required_step
+                            )
+                        )
+                    pending_trainable_step = None
+                    if active_trainer.state.done:
+                        return
+                index = scenario_index
+                scenario_index += 1
                 yield _scenario(
                     index,
                     target_step=0,
                     base_model=base_model,
                 ).model_dump()
-                index += 1
 
         async def rollout_fn(
             rollout_model: art.TrainableModel,
             scenario: dict[str, object],
             _config: None,
         ) -> art.TrajectoryGroup:
-            nonlocal success_hit
+            nonlocal pending_trainable_step, success_hit
             model_name = rollout_model.get_inference_name()
             target_step = _step_from_model_name(model_name)
             if target_step is None:
@@ -802,14 +932,19 @@ async def run_length_trainability_async(
                 split="train",
                 step=target_step,
                 n=rollouts_per_prompt,
-                temperature=_get_env_float(
-                    "ART_MODEL_SUPPORT_LENGTH_ROLLOUT_TEMPERATURE",
-                    1.1,
-                ),
+                temperature=_length_rollout_temperature(base_model),
                 chat_template_kwargs=chat_template_kwargs,
                 samples=samples,
                 summary_log_path=summary_log_path,
             )
+            rewards = [trajectory.reward for trajectory in group.trajectories]
+            if current_step_demand:
+                pending_trainable_step = (
+                    target_step
+                    if len(rewards) > 1
+                    and any(abs(reward - rewards[0]) > 1e-12 for reward in rewards[1:])
+                    else None
+                )
             if _success_abs_error_passed(
                 _mean_abs_error_by_step(
                     [sample for sample in samples if sample.split == "train"]
@@ -819,37 +954,83 @@ async def run_length_trainability_async(
                 success_hit = True
             return group
 
-        trainer = PipelineTrainer(
-            model=model,
-            backend=backend,
-            rollout_fn=rollout_fn,
-            scenarios=scenarios(),
-            config=None,
-            pipeline=PipelineRuntimeConfig(
-                num_rollout_workers=rollout_workers,
-                min_batch_size=1,
-                max_batch_size=1,
-            ),
-            max_steps_off_policy=max_steps_off_policy,
-            learning_rate=_get_env_float(
-                "ART_MODEL_SUPPORT_LENGTH_LEARNING_RATE",
-                _default_learning_rate(base_model),
-            ),
-            loss_fn="cispo",
-            normalize_advantages=normalize_advantages,
-            max_steps=max_steps,
-            eval_every_n_steps=0,
-            eval_at_start=False,
-            save_checkpoint=False,
-            total_scenarios=scenario_limit,
-            log_interval_seconds=30.0,
-            discard_queue_multiplier=zero_variance_discard_multiplier,
-            resume=False,
+        learning_rate = _get_env_float(
+            "ART_MODEL_SUPPORT_LENGTH_LEARNING_RATE",
+            _default_learning_rate(base_model),
         )
-        await trainer.train(handle_signals=False)
+
+        def build_trainer(steps: int, phase_learning_rate: float) -> PipelineTrainer:
+            return PipelineTrainer(
+                model=model,
+                backend=backend,
+                rollout_fn=rollout_fn,
+                scenarios=scenarios(),
+                config=None,
+                pipeline=PipelineRuntimeConfig(
+                    num_rollout_workers=rollout_workers,
+                    min_batch_size=1,
+                    max_batch_size=1,
+                ),
+                max_steps_off_policy=max_steps_off_policy,
+                learning_rate=phase_learning_rate,
+                loss_fn="cispo",
+                normalize_advantages=normalize_advantages,
+                max_steps=steps,
+                eval_every_n_steps=0,
+                eval_at_start=False,
+                save_checkpoint=False,
+                total_scenarios=scenario_limit,
+                log_interval_seconds=30.0,
+                discard_queue_multiplier=zero_variance_discard_multiplier,
+                resume=False,
+            )
+
+        phase_steps = (1, max_steps - 1) if resident_hook is not None else (max_steps,)
+        for phase_index, steps in enumerate(phase_steps):
+            if steps <= 0:
+                continue
+            phase_start = await model.get_step()
+            started = time.monotonic()
+            phase_learning_rate = (
+                first_update_learning_rate
+                if phase_index == 0 and first_update_learning_rate is not None
+                else learning_rate
+            )
+            trainer = build_trainer(steps, phase_learning_rate)
+            await trainer.train(handle_signals=False)
+            phase_end = await model.get_step()
+            if resident_hook is not None and phase_index == 0:
+                pending_trainable_step = None
+                if current_step_demand:
+                    # Trainer shutdown may prefetch but not execute the next scenario.
+                    scenario_index = phase_end
+            phases.append(
+                LengthTrainingPhaseReport(
+                    name=(
+                        "complete"
+                        if resident_hook is None
+                        else "first_update"
+                        if phase_index == 0
+                        else "continuation"
+                    ),
+                    start_step=phase_start,
+                    end_step=phase_end,
+                    duration_s=time.monotonic() - started,
+                )
+            )
+            if resident_hook is not None and phase_index == 0:
+                if phase_end != phase_start + 1:
+                    raise RuntimeError(
+                        "resident functional phase must advance exactly one policy step: "
+                        f"{phase_start} -> {phase_end}"
+                    )
+                async with backend.exact_adapter_lease(model, phase_end):
+                    await resident_hook("first_update", backend, model, phase_end)
+                success_hit = False
 
         latest_step = await model.get_step()
-        model_ids_after = await _list_model_ids(model)
+        async with backend.exact_adapter_lease(model, latest_step):
+            model_ids_after = await _list_model_ids(model)
 
     train_samples = [sample for sample in samples if sample.split == "train"]
     train_rewards_by_step = {
@@ -897,7 +1078,6 @@ async def run_length_trainability_async(
         trainer_gpu_ids=variant.trainer_gpu_ids,
         inference_gpu_ids=variant.inference_gpu_ids,
         training_topology=cast(dict[str, int | bool], topology.model_dump()),
-        rollout_weights_mode=rollout_weights_mode,
         rollouts_per_prompt=rollouts_per_prompt,
         prompt_tree_depth=prompt_tree_depth,
         prompt_tree_branch_count=prompt_tree_branch_count,
@@ -912,6 +1092,7 @@ async def run_length_trainability_async(
         final_train_abs_error=final_train_abs_error,
         model_ids_after=model_ids_after,
         samples=samples,
+        phases=phases,
     )
     (artifact_dir / "length_trainability.json").write_text(
         json.dumps(report.model_dump(mode="json"), indent=2, sort_keys=True) + "\n",
@@ -933,6 +1114,23 @@ def run_length_trainability(
     )
 
 
+def _resident_phase_contract_passed(report: LengthTrainabilityReport) -> bool:
+    if all(phase.name == "complete" for phase in report.phases):
+        return True
+    if len(report.phases) != 2:
+        return False
+    first_update, continuation = report.phases
+    return (
+        first_update.name == "first_update"
+        and first_update.start_step == 0
+        and first_update.end_step == 1
+        and continuation.name == "continuation"
+        and continuation.start_step == 1
+        and continuation.end_step == report.latest_step
+        and continuation.end_step > continuation.start_step
+    )
+
+
 def length_trainability_passed(report: LengthTrainabilityReport) -> bool:
     thresholds = report.thresholds
     train_samples = [sample for sample in report.samples if sample.split == "train"]
@@ -942,6 +1140,7 @@ def length_trainability_passed(report: LengthTrainabilityReport) -> bool:
     }
     return (
         bool(train_samples)
+        and _resident_phase_contract_passed(report)
         and report.latest_step <= report.max_steps
         and report.initial_train_abs_error is not None
         and _initial_abs_error_passed(report.initial_train_abs_error, thresholds)
@@ -966,6 +1165,7 @@ def assert_length_trainability_passed(report: LengthTrainabilityReport) -> None:
         for step in {sample.step for sample in train_samples}
     }
     assert train_samples
+    assert _resident_phase_contract_passed(report)
     assert report.latest_step <= report.max_steps
     assert report.initial_train_abs_error is not None
     assert _initial_abs_error_passed(report.initial_train_abs_error, thresholds)

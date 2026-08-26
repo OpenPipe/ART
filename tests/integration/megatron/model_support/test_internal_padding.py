@@ -30,9 +30,6 @@ class _Lora(torch.nn.Module):
         )
         self.A_T = self._parameter(a_shape)
         self.B_T = self._parameter(b_shape)
-        self._slot_modules = torch.nn.ModuleDict(
-            {"checkpoint": _LoraSlot(a_shape, b_shape)}
-        )
 
     @staticmethod
     def _parameter(shape: tuple[int, ...]) -> torch.nn.Parameter:
@@ -42,13 +39,6 @@ class _Lora(torch.nn.Module):
         setattr(parameter, "lora_tp_sharded", False)
         setattr(parameter, "lora_shard_domain", "expert_tp")
         return parameter
-
-
-class _LoraSlot(torch.nn.Module):
-    def __init__(self, a_shape: tuple[int, ...], b_shape: tuple[int, ...]) -> None:
-        super().__init__()
-        self.A_T = _Lora._parameter(a_shape)
-        self.B_T = _Lora._parameter(b_shape)
 
 
 class _Chunk(torch.nn.Module):
@@ -116,15 +106,9 @@ def test_internal_padding_is_zeroed(
     handler.zero_internal_padding_params([chunk])
 
     for module_name, parameter_name, dim, ranges in padding:
-        module = getattr(chunk, module_name)
-        parameters = (
-            getattr(module, parameter_name),
-            getattr(module._slot_modules["checkpoint"], parameter_name),
-        )
-        for parameter in parameters:
-            for tensor in (parameter, parameter.grad, parameter.main_grad):
-                assert torch.count_nonzero(tensor) > 0
-                for start, end in ranges:
-                    assert (
-                        torch.count_nonzero(tensor.narrow(dim, start, end - start)) == 0
-                    )
+        parameter = getattr(getattr(chunk, module_name), parameter_name)
+        tensors = (parameter, parameter.grad, parameter.main_grad)
+        for tensor in tensors:
+            assert torch.count_nonzero(tensor) > 0
+            for start, end in ranges:
+                assert torch.count_nonzero(tensor.narrow(dim, start, end - start)) == 0

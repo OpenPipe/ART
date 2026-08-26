@@ -10,11 +10,48 @@ import subprocess
 import sys
 import time
 from types import FrameType
-from typing import Any
+from typing import Any, TypeVar
 
 PROCESS_SHUTDOWN_TIMEOUT_SECONDS = 20.0
 _PROCESS_SHUTDOWN_LEVEL_STEP = 0.1
 _PROCESS_SHUTDOWN_SWEEP_GRACE_FRACTION = 0.05
+_T = TypeVar("_T")
+
+
+async def complete_task(
+    task: asyncio.Task[_T],
+) -> tuple[_T, asyncio.CancelledError | None]:
+    cancelled: asyncio.CancelledError | None = None
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError as error:
+            if task.cancelled():
+                break
+            cancelled = cancelled or error
+        except BaseException:
+            break
+    try:
+        result = task.result()
+    except BaseException as error:
+        if cancelled is not None:
+            cancelled.add_note(f"operation also failed: {error}")
+            raise cancelled
+        raise
+    return result, cancelled
+
+
+async def complete_to_thread(
+    operation: Callable[[], _T],
+) -> tuple[_T, asyncio.CancelledError | None]:
+    return await complete_task(asyncio.create_task(asyncio.to_thread(operation)))
+
+
+def consume_future_exception(future: asyncio.Future[Any]) -> None:
+    try:
+        future.exception()
+    except asyncio.CancelledError:
+        pass
 
 
 def process_shutdown_timeout(level: int) -> float:

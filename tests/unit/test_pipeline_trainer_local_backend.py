@@ -753,7 +753,7 @@ def test_local_backend_get_packed_tensors_warns_and_drops_overlong_results(
         patch(
             "art.local.backend.tokenize_trajectory_groups",
             return_value=iter([short_result, long_result]),
-        ),
+        ) as tokenize,
         pytest.warns(UserWarning, match="Dropping 1 tokenized results"),
     ):
         packed_tensors = backend._get_packed_tensors(
@@ -769,6 +769,10 @@ def test_local_backend_get_packed_tensors_warns_and_drops_overlong_results(
 
     assert packed_tensors is not None
     assert packed_tensors["tokens"].shape == (1, 4)
+    selector = tokenize.call_args.kwargs["model"]
+    assert selector.value == f"{model.name}@0"
+    assert selector.automatic_family == (model.name, "@")
+    assert selector.allow_glob is False
 
 
 @pytest.mark.asyncio
@@ -1161,36 +1165,3 @@ async def test_pipeline_trainer_scheduled_eval_holds_retention_lease(
     assert trainer._scheduled_eval_steps == set()
     assert backend.active_steps == set()
     assert trainer._protected_checkpoint_steps(8) == {8}
-
-
-def test_pipeline_trainer_rejects_merged_weight_eval(tmp_path: Path) -> None:
-    model = TrainableModel(
-        run_name="pipeline-merged-eval",
-        name="pipeline-merged-eval",
-        project="pipeline-tests",
-        base_model="test-model",
-        base_path=str(tmp_path),
-        _internal_config=InternalModelConfig(
-            trainer_gpu_ids=[0],
-            inference_gpu_ids=[1],
-            rollout_weights_mode="merged",
-        ),
-    )
-
-    with pytest.raises(
-        ValueError,
-        match="eval requires rollout_weights_mode='lora'",
-    ):
-        PipelineTrainer(
-            model=model,
-            backend=LocalBackend(path=str(tmp_path)),
-            rollout_fn=_noop_rollout,
-            scenarios=[],
-            config={},
-            pipeline=PipelineRuntimeConfig(
-                num_rollout_workers=1,
-                min_batch_size=1,
-                max_batch_size=1,
-            ),
-            eval_fn=_noop_eval,
-        )

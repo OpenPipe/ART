@@ -120,13 +120,15 @@ mock_stream_response = b"""data: {"id":"chatcmpl-aa0d1e3261414f53acafc2f8e53bf9d
 
 data: {"id":"chatcmpl-aa0d1e3261414f53acafc2f8e53bf9d6","object":"chat.completion.chunk","created":1755831263,"model":"test","choices":[{"index":0,"delta":{"role":"assistant","content":""},"logprobs":null,"finish_reason":null}]}
 
-data: {"id":"chatcmpl-aa0d1e3261414f53acafc2f8e53bf9d6","object":"chat.completion.chunk","created":1755831263,"model":"test","choices":[{"index":0,"delta":{"tool_calls":[{"id":"chatcmpl-tool-29e663261e524fcfa2162f4f3d76a7f0","type":"function","index":0,"function":{"name":"get_current_weather","arguments":"{"}}]},"logprobs":{"content":[{"token":"token_id:314","logprob":-0.00015293381875380874,"bytes":[32,123],"top_logprobs":[]}]},"finish_reason":null}]}
+data: {"id":"chatcmpl-aa0d1e3261414f53acafc2f8e53bf9d6","object":"chat.completion.chunk","created":1755831263,"model":"test","choices":[{"index":0,"delta":{"tool_calls":[{"type":"function","index":0,"function":{"arguments":"{"}}]},"logprobs":{"content":[{"token":"token_id:314","logprob":-0.00015293381875380874,"bytes":[32,123],"top_logprobs":[]}]},"finish_reason":null}]}
 
 data: {"id":"chatcmpl-aa0d1e3261414f53acafc2f8e53bf9d6","object":"chat.completion.chunk","created":1755831263,"model":"test","choices":[{"index":0,"delta":{"tool_calls":[{"id":"chatcmpl-tool-29e663261e524fcfa2162f4f3d76a7f0","type":"function","index":0,"function":{"name":"get_current_weather","arguments":"{"}}]},"logprobs":{"content":[{"token":"token_id:314","logprob":-0.00015293381875380874,"bytes":[32,123],"top_logprobs":[]}]},"finish_reason":null}]}
 
 data: {"id":"chatcmpl-aa0d1e3261414f53acafc2f8e53bf9d6","object":"chat.completion.chunk","created":1755831263,"model":"test","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"name":null,"arguments":"}"}}]},"logprobs":{"content":[{"token":"token_id:3417","logprob":-3.576278118089249e-7,"bytes":[125,125],"top_logprobs":[]}]},"finish_reason":null}]}
 
 data: {"id":"chatcmpl-aa0d1e3261414f53acafc2f8e53bf9d6","object":"chat.completion.chunk","created":1755831263,"model":"test","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"name":null,"arguments":"}"}}]},"logprobs":{"content":[{"token":"token_id:3417","logprob":-3.576278118089249e-7,"bytes":[125,125],"top_logprobs":[]}]},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-aa0d1e3261414f53acafc2f8e53bf9d6","object":"chat.completion.chunk","created":1755831263,"model":"test","choices":[{"index":0,"delta":{},"logprobs":null,"finish_reason":"stop"}]}
 
 data: [DONE]
 
@@ -167,7 +169,7 @@ mock_stream_choice = Choice(
             "refusal": None,
         },
         "message": {
-            "content": None,
+            "content": "",
             "refusal": None,
             "role": "assistant",
             "annotations": None,
@@ -209,7 +211,7 @@ async def test_server():
     await runner.cleanup()
 
 
-async def test_auto_trajectory(test_server: None) -> None:
+async def test_trajectory_capture(test_server: None) -> None:
     message: ChatCompletionMessageParam = {"role": "user", "content": "Hi!"}
     tools: list[ChatCompletionToolParam] = [
         {
@@ -279,15 +281,11 @@ async def test_auto_trajectory(test_server: None) -> None:
             stream=True,
         ):
             pass
-        # Add ART support with a couple lines of optional code
-        if trajectory := art.auto_trajectory():  # ty: ignore[deprecated]
-            trajectory.reward = 1.0
+        if current := art.current_trajectory():
+            current.reward = 1.0
         return chat_completion.choices[0].message.content
 
-    # Use the capture_auto_trajectory utility to capture a trajectory automatically
-    trajectory = await art.capture_auto_trajectory(  # ty: ignore[deprecated]
-        say_hi()
-    )
+    trajectory = await art.trajectory(say_hi())
     exchanges = trajectory.exchanges.chat_completions
     assert len(exchanges) == 5
     assert exchanges[0].request["messages"] == [message]
@@ -300,7 +298,7 @@ async def test_auto_trajectory(test_server: None) -> None:
 
 
 @pytest.mark.filterwarnings("ignore::UserWarning:pydantic")
-async def test_litellm_auto_trajectory(test_server: None) -> None:
+async def test_litellm_trajectory_capture(test_server: None) -> None:
     message: ChatCompletionMessageParam = {"role": "user", "content": "Hi!"}
     tools: list[ChatCompletionToolParam] = [
         {
@@ -357,15 +355,11 @@ async def test_litellm_auto_trajectory(test_server: None) -> None:
         )
         async for _ in stream:
             pass
-        # Add ART support with a couple lines of optional code
-        if trajectory := art.auto_trajectory():  # ty: ignore[deprecated]
-            trajectory.reward = 1.0
+        if current := art.current_trajectory():
+            current.reward = 1.0
         return choice.message.content
 
-    # Use the capture_auto_trajectory utility to capture a trajectory automatically
-    trajectory = await art.capture_auto_trajectory(  # ty: ignore[deprecated]
-        say_hi()
-    )
+    trajectory = await art.trajectory(say_hi())
     exchanges = trajectory.exchanges.chat_completions
     assert len(exchanges) == 3
     assert exchanges[0].request["messages"] == [message]

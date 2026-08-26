@@ -1,6 +1,7 @@
 """Unit tests for dedicated mode config validation and get_model_config integration."""
 
 import tempfile
+from typing import cast
 
 import pytest
 
@@ -85,18 +86,16 @@ def test_overlapping_gpu_ids():
         )
 
 
-def test_trainer_not_starting_at_zero():
-    with pytest.raises(ValueError, match="must start at GPU 0"):
-        validate_dedicated_config(
-            InternalModelConfig(trainer_gpu_ids=[1], inference_gpu_ids=[0])
-        )
+def test_trainer_can_use_nonzero_gpu():
+    validate_dedicated_config(
+        InternalModelConfig(trainer_gpu_ids=[2], inference_gpu_ids=[3])
+    )
 
 
-def test_trainer_not_contiguous():
-    with pytest.raises(ValueError, match="must be contiguous starting from 0"):
-        validate_dedicated_config(
-            InternalModelConfig(trainer_gpu_ids=[0, 2], inference_gpu_ids=[1])
-        )
+def test_trainer_can_use_noncontiguous_gpus():
+    validate_dedicated_config(
+        InternalModelConfig(trainer_gpu_ids=[0, 2], inference_gpu_ids=[1])
+    )
 
 
 def test_dedicated_rejects_fast_inference():
@@ -142,7 +141,6 @@ def test_get_model_config_shared_mode():
         assert "inference_gpu_ids" not in result
         assert result["engine_args"]["enable_sleep_mode"] is True
         assert "fast_inference" not in result["init_args"]
-        assert result["rollout_weights_mode"] == "lora"
         assert result["rollout_weight_update_mode"] == "step_lora"
         assert result["lora_config"]["target_modules"] == [
             "q_proj",
@@ -210,7 +208,6 @@ def test_get_model_config_dedicated_mode():
         assert result["inference_gpu_ids"] == [1]
         assert result["engine_args"]["enable_sleep_mode"] is False
         assert "fast_inference" not in result["init_args"]
-        assert result["rollout_weights_mode"] == "lora"
         assert result["rollout_weight_update_mode"] == "step_lora"
 
 
@@ -227,31 +224,13 @@ def test_get_model_config_dedicated_preserves_user_engine_args():
         assert result["engine_args"]["enable_sleep_mode"] is False
 
 
-def test_get_model_config_preserves_rollout_weights_mode():
-    with tempfile.TemporaryDirectory() as tmpdir:
-        config = InternalModelConfig(
-            trainer_gpu_ids=[0],
-            inference_gpu_ids=[1],
-            rollout_weights_mode="merged",
-        )
-        result = get_model_config("test-model", tmpdir, config)
-        assert result["rollout_weights_mode"] == "merged"
-
-
-def test_invalid_rollout_weights_mode():
-    with pytest.raises(
-        ValueError, match="rollout_weights_mode must be either 'lora' or 'merged'"
-    ):
-        validate_dedicated_config(
-            InternalModelConfig(rollout_weights_mode="bad-mode")  # type: ignore
-        )
-
-
-def test_merged_rollout_weights_requires_dedicated_mode():
-    with pytest.raises(
-        ValueError, match="rollout_weights_mode='merged' requires dedicated mode"
-    ):
-        validate_dedicated_config(InternalModelConfig(rollout_weights_mode="merged"))
+@pytest.mark.parametrize("value", ["lora", "merged", "bad-mode"])
+def test_removed_rollout_weights_mode_is_rejected(value: str):
+    config = cast(InternalModelConfig, {"rollout_weights_mode": value})
+    with pytest.raises(ValueError, match="rollout_weights_mode has been removed"):
+        validate_dedicated_config(config)
+    with pytest.raises(ValueError, match="rollout_weights_mode has been removed"):
+        get_model_config("test-model", "", config)
 
 
 def test_qwen3_5_moe_allows_default_lora_rollout_weights():
@@ -259,17 +238,6 @@ def test_qwen3_5_moe_allows_default_lora_rollout_weights():
         InternalModelConfig(
             trainer_gpu_ids=[0],
             inference_gpu_ids=[1],
-            engine_args={"model": "Qwen/Qwen3.5-35B-A3B"},  # type: ignore[typeddict-item]
-        )
-    )
-
-
-def test_qwen3_5_moe_allows_merged_rollout_weights():
-    validate_dedicated_config(
-        InternalModelConfig(
-            trainer_gpu_ids=[0],
-            inference_gpu_ids=[1],
-            rollout_weights_mode="merged",
             engine_args={"model": "Qwen/Qwen3.5-35B-A3B"},  # type: ignore[typeddict-item]
         )
     )

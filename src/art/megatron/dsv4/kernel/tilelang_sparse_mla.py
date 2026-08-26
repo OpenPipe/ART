@@ -51,7 +51,7 @@ class DeepSeekV4SparseAttention(torch.autograd.Function):
             )
 
         output = o if output_dtype is None else o.to(output_dtype)
-        ctx.save_for_backward(q, kv, attn_sink, topk_idxs, output.clone(), lse)
+        ctx.save_for_backward(q, kv, attn_sink, topk_idxs, lse)
         ctx.sm_scale = sm_scale
 
         return output
@@ -59,7 +59,7 @@ class DeepSeekV4SparseAttention(torch.autograd.Function):
     @staticmethod
     def backward(ctx: Any, *grad_outputs: Any):
         do = grad_outputs[0]
-        q, kv, attn_sink, topk_idxs, output, lse = ctx.saved_tensors
+        q, kv, attn_sink, topk_idxs, lse = ctx.saved_tensors
         sm_scale = ctx.sm_scale
 
         with preserve_tilelang_env():
@@ -71,7 +71,6 @@ class DeepSeekV4SparseAttention(torch.autograd.Function):
                 q,
                 kv,
                 attn_sink,
-                output.to(q.dtype),
                 do.to(q.dtype),
                 topk_idxs,
                 lse,

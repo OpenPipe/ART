@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 from contextlib import asynccontextmanager
 import os
-from typing import Any, AsyncGenerator, Literal
+from typing import Any, AsyncGenerator, Literal, cast
 import uuid
 
 import httpx
@@ -14,14 +14,118 @@ TRANSIENT_STATUS_CODES = {429, 502, 503, 504}
 DEFAULT_STATUS_RETRIES = 12
 DEFAULT_RETRY_BASE_DELAY = 0.5
 DEFAULT_RETRY_MAX_DELAY = 5.0
+_HTTP_POOL_SHARDS = 64
 
 
 def _default_limits() -> httpx.Limits:
     return httpx.Limits(
-        max_connections=512,
-        max_keepalive_connections=512,
+        max_connections=100_000,
+        max_keepalive_connections=100_000,
         keepalive_expiry=60.0,
     )
+
+
+def _shard_limit(total: int | None, shards: int, index: int) -> int | None:
+    if total is None:
+        return None
+    quotient, remainder = divmod(total, shards)
+    return quotient + (index < remainder)
+
+
+class _CapacityReleaseStream(httpx.AsyncByteStream):
+    def __init__(
+        self, stream: httpx.AsyncByteStream, capacity: asyncio.Semaphore
+    ) -> None:
+        self._stream = stream
+        self._capacity = capacity
+        self._closed = False
+
+    async def __aiter__(self) -> AsyncGenerator[bytes, None]:
+        try:
+            async for chunk in self._stream:
+                yield chunk
+        finally:
+            await self.aclose()
+
+    async def aclose(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            await self._stream.aclose()
+        finally:
+            self._capacity.release()
+
+
+class _ShardedAsyncHTTPTransport(httpx.AsyncBaseTransport):
+    """Round-robin requests across smaller HTTP connection pools."""
+
+    def __init__(
+        self,
+        *,
+        limits: httpx.Limits,
+        retries: int,
+        shards: int = _HTTP_POOL_SHARDS,
+    ) -> None:
+        max_connections = limits.max_connections
+        shard_count = min(shards, max_connections or shards)
+        if shard_count < 1:
+            raise ValueError("HTTP transport shards must be positive")
+        self._capacity = (
+            asyncio.Semaphore(max_connections) if max_connections is not None else None
+        )
+        self.transports = tuple(
+            httpx.AsyncHTTPTransport(
+                retries=retries,
+                limits=httpx.Limits(
+                    # Aggregate active capacity is enforced above the shards. Giving
+                    # every shard the aggregate ceiling prevents uneven request
+                    # durations from stranding capacity in another shard.
+                    max_connections=max_connections,
+                    max_keepalive_connections=_shard_limit(
+                        limits.max_keepalive_connections, shard_count, index
+                    ),
+                    keepalive_expiry=limits.keepalive_expiry,
+                ),
+            )
+            for index in range(shard_count)
+        )
+        self._next = 0
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        capacity = self._capacity
+        if capacity is not None:
+            pool_timeout = request.extensions.get("timeout", {}).get("pool")
+            try:
+                async with asyncio.timeout(pool_timeout):
+                    await capacity.acquire()
+            except TimeoutError:
+                raise httpx.PoolTimeout(
+                    "Timed out waiting for an available connection slot",
+                    request=request,
+                ) from None
+        transport = self.transports[self._next]
+        self._next = (self._next + 1) % len(self.transports)
+        try:
+            response = await transport.handle_async_request(request)
+        except BaseException:
+            if capacity is not None:
+                capacity.release()
+            raise
+        if capacity is not None:
+            response.stream = _CapacityReleaseStream(
+                cast(httpx.AsyncByteStream, response.stream), capacity
+            )
+        return response
+
+    async def aclose(self) -> None:
+        await asyncio.gather(*(transport.aclose() for transport in self.transports))
+
+
+def _sharded_transport(
+    *, limits: httpx.Limits, retries: int
+) -> _ShardedAsyncHTTPTransport:
+    return _ShardedAsyncHTTPTransport(limits=limits, retries=retries)
 
 
 def _normalize_timeout(timeout: float | httpx.Timeout | None) -> httpx.Timeout | None:
@@ -141,10 +245,7 @@ class TauBenchClient:
                 base_url or os.getenv("TAU_BENCH_BASE_URL") or "http://localhost:8000"
             ),
             timeout=_normalize_timeout(timeout),
-            transport=httpx.AsyncHTTPTransport(
-                limits=limits or _default_limits(),
-                retries=2,
-            ),
+            transport=_sharded_transport(limits=limits or _default_limits(), retries=2),
         )
 
     async def close(self) -> None:

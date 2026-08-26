@@ -306,112 +306,6 @@ def _refine_interval_blocks(
         full_blocks[q_idx, k_idx] = bool(is_full)
 
 
-def _refine_sliding_interval_blocks(
-    *,
-    partial_blocks: np.ndarray,
-    full_blocks: np.ndarray,
-    q_abs: np.ndarray,
-    k_abs: np.ndarray,
-    q_enter: np.ndarray,
-    k_enter: np.ndarray,
-    k_exit: np.ndarray,
-    q_pos: np.ndarray,
-    k_pos: np.ndarray,
-    q_block: int,
-    k_block: int,
-    sliding_window: int,
-) -> None:
-    candidates = partial_blocks | full_blocks
-    if not bool(candidates.any()):
-        return
-
-    q_abs_blocks = _block_matrix(
-        q_abs,
-        block_size=q_block,
-        block_count=int(partial_blocks.shape[0]),
-        fill_value=_INVALID_ABS,
-    )
-    q_enter_blocks = _block_matrix(
-        q_enter,
-        block_size=q_block,
-        block_count=int(partial_blocks.shape[0]),
-        fill_value=_INVALID_ENTER,
-    )
-    q_pos_blocks = _block_matrix(
-        q_pos,
-        block_size=q_block,
-        block_count=int(partial_blocks.shape[0]),
-        fill_value=_INVALID_POS,
-    )
-    k_abs_blocks = _block_matrix(
-        k_abs,
-        block_size=k_block,
-        block_count=int(partial_blocks.shape[1]),
-        fill_value=_INVALID_ABS,
-    )
-    k_enter_blocks = _block_matrix(
-        k_enter,
-        block_size=k_block,
-        block_count=int(partial_blocks.shape[1]),
-        fill_value=_INVALID_ENTER,
-    )
-    k_exit_blocks = _block_matrix(
-        k_exit,
-        block_size=k_block,
-        block_count=int(partial_blocks.shape[1]),
-        fill_value=_INVALID_EXIT,
-    )
-    k_pos_blocks = _block_matrix(
-        k_pos,
-        block_size=k_block,
-        block_count=int(partial_blocks.shape[1]),
-        fill_value=_INVALID_POS,
-    )
-
-    q_valid = (
-        (q_abs_blocks >= 0) & (q_enter_blocks >= 0) & (q_pos_blocks != _INVALID_POS)
-    )
-    k_valid = (
-        (k_abs_blocks >= 0)
-        & (k_enter_blocks >= 0)
-        & (k_exit_blocks > k_enter_blocks)
-        & (k_pos_blocks != _INVALID_POS)
-    )
-
-    q_indices, k_indices = np.nonzero(candidates)
-    partial_blocks[q_indices, k_indices] = False
-    full_blocks[q_indices, k_indices] = False
-    for q_idx, k_idx in zip(q_indices, k_indices, strict=True):
-        q_valid_row = q_valid[q_idx]
-        k_valid_row = k_valid[k_idx]
-        if not bool(q_valid_row.any()) or not bool(k_valid_row.any()):
-            continue
-
-        q_abs_row = q_abs_blocks[q_idx][:, None]
-        q_enter_row = q_enter_blocks[q_idx][:, None]
-        q_pos_row = q_pos_blocks[q_idx][:, None]
-        k_abs_row = k_abs_blocks[k_idx][None, :]
-        k_enter_row = k_enter_blocks[k_idx][None, :]
-        k_exit_row = k_exit_blocks[k_idx][None, :]
-        k_pos_row = k_pos_blocks[k_idx][None, :]
-        delta = q_pos_row - k_pos_row
-        allowed = (
-            q_valid_row[:, None]
-            & k_valid_row[None, :]
-            & (q_abs_row >= k_abs_row)
-            & (k_enter_row <= q_enter_row)
-            & (q_enter_row < k_exit_row)
-            & (delta >= 0)
-            & (delta < int(sliding_window))
-        )
-        if not bool(allowed.any()):
-            continue
-        if bool(q_valid_row.all()) and bool(k_valid_row.all()) and bool(allowed.all()):
-            full_blocks[q_idx, k_idx] = True
-        else:
-            partial_blocks[q_idx, k_idx] = True
-
-
 def _is_strictly_increasing(values: np.ndarray) -> bool:
     return int(values.size) <= 1 or bool(np.all(values[1:] > values[:-1]))
 
@@ -657,6 +551,7 @@ def _build_sparse_block_mask(
         full_blocks[q_slice, k_slice] |= is_full
 
     partial_blocks &= ~full_blocks
+    sliding_full_blocks = full_blocks.copy() if sliding_window is not None else None
     needs_refine = full_blocks | ((touch_counts > 1) & partial_blocks)
     if bool(needs_refine.any()):
         refined_partial = partial_blocks & needs_refine
@@ -674,22 +569,12 @@ def _build_sparse_block_mask(
         )
         partial_blocks = (partial_blocks & ~needs_refine) | refined_partial
         full_blocks = (full_blocks & ~needs_refine) | refined_full
-    if sliding_window is not None:
-        assert q_pos is not None and k_pos is not None
-        _refine_sliding_interval_blocks(
-            partial_blocks=partial_blocks,
-            full_blocks=full_blocks,
-            q_abs=q_abs,
-            k_abs=k_abs,
-            q_enter=q_enter,
-            k_enter=k_enter,
-            k_exit=k_exit,
-            q_pos=q_pos,
-            k_pos=k_pos,
-            q_block=q_block,
-            k_block=k_block,
-            sliding_window=int(sliding_window),
-        )
+    if sliding_full_blocks is not None:
+        promoted = full_blocks & ~sliding_full_blocks
+        partial_blocks |= promoted
+        full_blocks &= sliding_full_blocks
+    # Partial blocks retain exact token masking through mask_mod. Keep ancestry
+    # refinement from promoting sliding-window boundary blocks to full blocks.
     kv_num_blocks, kv_indices = _dense_blocks_to_ordered(
         partial_blocks,
         device=device,

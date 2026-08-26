@@ -8,6 +8,7 @@ from art.megatron.model_support.spec import (
 )
 
 _DEFAULT_DENSE_HANDLER_KEY = "default_dense"
+_LLAMA3_DENSE_HANDLER_KEY = "llama3_dense"
 _QWEN3_DENSE_HANDLER_KEY = "qwen3_dense"
 _QWEN3_MOE_HANDLER_KEY = "qwen3_moe"
 _QWEN3_5_DENSE_HANDLER_KEY = "qwen3_5_dense"
@@ -15,6 +16,7 @@ _QWEN3_5_MOE_HANDLER_KEY = "qwen3_5_moe"
 _GEMMA4_DENSE_HANDLER_KEY = "gemma4_dense"
 _GEMMA4_MOE_HANDLER_KEY = "gemma4_moe"
 _DSV4_HANDLER_KEY = "dsv4"
+_GLM52_HANDLER_KEY = "glm52"
 _GPT_OSS_MOE_HANDLER_KEY = "gpt_oss_moe"
 _VALIDATED_NATIVE_VLLM_LORA_STATUS: NativeVllmLoraStatus = "validated"
 _WIP_NATIVE_VLLM_LORA_STATUS: NativeVllmLoraStatus = "wip"
@@ -73,12 +75,46 @@ _DSV4_TARGET_MODULES = (
     "down_proj",
     "experts",
 )
+_GLM52_TARGET_MODULES = (
+    "q_a_proj",
+    "q_b_proj",
+    "kv_a_proj_with_mqa",
+    "o_proj",
+    "gate_proj",
+    "up_proj",
+    "down_proj",
+    "experts",
+)
 
 DEFAULT_DENSE_SPEC = ModelSupportSpec(
     key="default_dense",
     handler_key=_DEFAULT_DENSE_HANDLER_KEY,
     default_target_modules=_DENSE_TARGET_MODULES,
     native_vllm_lora_status=_DISABLED_NATIVE_VLLM_LORA_STATUS,
+)
+
+LLAMA3_DENSE_SPEC = ModelSupportSpec(
+    key="llama3_dense",
+    handler_key=_LLAMA3_DENSE_HANDLER_KEY,
+    model_names=(
+        "meta-llama/Meta-Llama-3-8B",
+        "meta-llama/Meta-Llama-3-8B-Instruct",
+        "meta-llama/Meta-Llama-3-70B",
+        "meta-llama/Meta-Llama-3-70B-Instruct",
+        "meta-llama/Llama-3.1-8B",
+        "meta-llama/Llama-3.1-8B-Instruct",
+        "meta-llama/Llama-3.1-70B",
+        "meta-llama/Llama-3.1-70B-Instruct",
+        "meta-llama/Llama-3.1-405B",
+        "meta-llama/Llama-3.1-405B-Instruct",
+        "meta-llama/Llama-3.2-1B",
+        "meta-llama/Llama-3.2-1B-Instruct",
+        "meta-llama/Llama-3.2-3B",
+        "meta-llama/Llama-3.2-3B-Instruct",
+        "meta-llama/Llama-3.3-70B-Instruct",
+    ),
+    default_target_modules=_DENSE_TARGET_MODULES,
+    native_vllm_lora_status=_VALIDATED_NATIVE_VLLM_LORA_STATUS,
 )
 
 QWEN3_MOE_SPEC = ModelSupportSpec(
@@ -195,6 +231,19 @@ DSV4_SPEC = ModelSupportSpec(
     dependency_floor=DependencyFloor(transformers="5.12.1"),
 )
 
+GLM52_SPEC = ModelSupportSpec(
+    key="glm52",
+    handler_key=_GLM52_HANDLER_KEY,
+    is_moe=True,
+    model_names=("zai-org/GLM-5.2",),
+    default_target_modules=_GLM52_TARGET_MODULES,
+    native_vllm_lora_status=_VALIDATED_NATIVE_VLLM_LORA_STATUS,
+    dependency_floor=DependencyFloor(
+        transformers="5.12.1",
+        megatron_bridge="e1a207ac757e5d0ed94d8ffbe1cbd28e81d8c084",
+    ),
+)
+
 GPT_OSS_MOE_SPEC = ModelSupportSpec(
     key="gpt_oss_moe",
     handler_key=_GPT_OSS_MOE_HANDLER_KEY,
@@ -212,6 +261,7 @@ GPT_OSS_MOE_SPEC = ModelSupportSpec(
 )
 
 VALIDATED_MODEL_SUPPORT_SPECS = (
+    LLAMA3_DENSE_SPEC,
     QWEN3_MOE_SPEC,
     QWEN3_DENSE_SPEC,
     QWEN3_5_MOE_SPEC,
@@ -219,9 +269,10 @@ VALIDATED_MODEL_SUPPORT_SPECS = (
     GEMMA4_MOE_SPEC,
     GEMMA4_DENSE_SPEC,
     DSV4_SPEC,
+    GLM52_SPEC,
     GPT_OSS_MOE_SPEC,
 )
-PROBE_ONLY_MODEL_SUPPORT_SPECS = ()
+PROBE_ONLY_MODEL_SUPPORT_SPECS: tuple[ModelSupportSpec, ...] = ()
 _ALL_MODEL_SUPPORT_SPECS = (
     DEFAULT_DENSE_SPEC,
     *VALIDATED_MODEL_SUPPORT_SPECS,
@@ -242,6 +293,10 @@ _HANDLER_IMPORTS: dict[str, tuple[str, str]] = {
     _DEFAULT_DENSE_HANDLER_KEY: (
         "art.megatron.model_support.handlers.default_dense",
         "DEFAULT_DENSE_HANDLER",
+    ),
+    _LLAMA3_DENSE_HANDLER_KEY: (
+        "art.megatron.model_support.handlers.llama3",
+        "LLAMA3_DENSE_HANDLER",
     ),
     _QWEN3_DENSE_HANDLER_KEY: (
         "art.megatron.model_support.handlers.qwen3_dense",
@@ -270,6 +325,10 @@ _HANDLER_IMPORTS: dict[str, tuple[str, str]] = {
     _DSV4_HANDLER_KEY: (
         "art.megatron.model_support.handlers.dsv4",
         "DSV4_HANDLER",
+    ),
+    _GLM52_HANDLER_KEY: (
+        "art.megatron.model_support.handlers.glm52",
+        "GLM52_HANDLER",
     ),
     _GPT_OSS_MOE_HANDLER_KEY: (
         "art.megatron.model_support.handlers.gpt_oss",
@@ -302,6 +361,7 @@ _HANDLERS_BY_KEY: dict[str, ModelSupportHandler] = {}
 _REGISTERED_BRIDGE_KEYS: set[str] = set()
 
 QWEN3_DENSE_MODELS = frozenset(QWEN3_DENSE_SPEC.model_names)
+LLAMA3_DENSE_MODELS = frozenset(LLAMA3_DENSE_SPEC.model_names)
 QWEN3_MOE_MODELS = frozenset(QWEN3_MOE_SPEC.model_names)
 QWEN3_5_DENSE_MODELS = frozenset(QWEN3_5_DENSE_SPEC.model_names)
 QWEN3_5_MOE_MODELS = frozenset(QWEN3_5_MOE_SPEC.model_names)
@@ -309,6 +369,7 @@ QWEN3_5_MODELS = QWEN3_5_DENSE_MODELS | QWEN3_5_MOE_MODELS
 GEMMA4_MOE_MODELS = frozenset(GEMMA4_MOE_SPEC.model_names)
 GEMMA4_DENSE_MODELS = frozenset(GEMMA4_DENSE_SPEC.model_names)
 DSV4_MODELS = frozenset(DSV4_SPEC.model_names)
+GLM52_MODELS = frozenset(GLM52_SPEC.model_names)
 GPT_OSS_MOE_MODELS = frozenset(GPT_OSS_MOE_SPEC.model_names)
 
 
@@ -331,6 +392,13 @@ def get_model_support_spec(
         "Pass allow_unvalidated_arch=True only for explicit validation/probing. "
         f"Supported models: {supported}."
     )
+
+
+def get_model_support_spec_by_key(key: str) -> ModelSupportSpec:
+    try:
+        return _SPECS_BY_KEY[key]
+    except KeyError as exc:
+        raise KeyError(f"No model support spec registered for {key!r}") from exc
 
 
 def get_model_support_handler(
@@ -414,20 +482,6 @@ def native_vllm_lora_status_for_model(
         base_model,
         allow_unvalidated_arch=allow_unvalidated_arch,
     ).native_vllm_lora_status
-
-
-def model_requires_merged_rollout(
-    base_model: str,
-    *,
-    allow_unvalidated_arch: bool = False,
-) -> bool:
-    return (
-        get_model_support_spec(
-            base_model,
-            allow_unvalidated_arch=allow_unvalidated_arch,
-        ).default_rollout_weights_mode
-        == "merged"
-    )
 
 
 def model_uses_expert_parallel(

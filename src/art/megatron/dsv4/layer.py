@@ -260,6 +260,14 @@ class Dsv4TransformerLayer(TransformerLayer):
             self.hc_ffn_scale,
         ):
             setattr(param, "_keep_fp32", True)
+        if self.config.perform_initialization:
+            assert self.config.init_method is not None
+            self.config.init_method(self.hc_attn_fn)
+            self.config.init_method(self.hc_ffn_fn)
+            for param in (self.hc_attn_base, self.hc_ffn_base):
+                torch.nn.init.zeros_(param)
+            for param in (self.hc_attn_scale, self.hc_ffn_scale):
+                torch.nn.init.ones_(param)
         self.hc_util = DeepSeekV4HyperConnectionUtil(self.config)
 
     def forward(

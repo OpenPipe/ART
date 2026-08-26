@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import argparse
-from contextlib import ExitStack
+from contextlib import ExitStack, redirect_stderr, redirect_stdout
 import os
 from pathlib import Path
 import subprocess
 import sys
 import time
 from typing import Any, cast
+from unittest.mock import patch
 
 from megatron.core import parallel_state as ps
 from megatron.core.models.gpt.gpt_model import GPTModel
@@ -16,10 +17,21 @@ import torch
 
 from art.megatron import train as megatron_train
 from art.megatron.model_support.discovery import inspect_architecture
+from art.megatron.model_support.registry import (
+    get_model_support_handler_for_spec,
+    get_model_support_spec,
+)
+from art.megatron.model_support.spec import PrefixTreeModelStateContext
 from art.megatron.prefix_tree import parse_prefix_tree_row
 from art.megatron.prefix_tree_state import create_prefix_tree_state
 
 from ..artifacts import GitRepoState, pinned_git_state
+from .base_megatron_session import (
+    BaseMegatronResetReport,
+    BaseMegatronSessionKey,
+    active_base_megatron_session,
+    initialize_single_rank_process_group,
+)
 from .fp32_grouped_gemm import (
     allow_fp32_grouped_gemm_fallback_for_model_support_tests,
 )
@@ -42,9 +54,7 @@ from .prefix_tree_workloads import build_complex_prefix_tree_packed_tensors
 
 allow_fp32_grouped_gemm_fallback_for_model_support_tests()
 
-# Qwen3.5's single packed forward versus many shorter references has measured
-# up to 0.24% shape-dependent numerical drift. Use the standard 0.5% fp32 gate.
-_LOGITS_MEAN_ABS_PCT_LIMIT = 0.5
+_LOGITS_MEAN_ABS_PCT_LIMITS = {"fp32": 0.5, "bf16": 3.0}
 _DEBUG_ENV = "ART_PACKING_INVARIANCE_DEBUG"
 PACKING_INVARIANCE_REPORT_FILENAME = "report.json"
 PACKING_INVARIANCE_ARTIFACT_SUITE_NAME = "Megatron packing-invariance artifacts"
@@ -53,6 +63,7 @@ _SINGLE_ROTARY_OUTPUT_HANDLER_KEYS = frozenset(
     {
         "default_dense",
         "default_moe",
+        "llama3_dense",
         "qwen3_dense",
         "qwen3_moe",
         "qwen3_5_dense",
@@ -160,6 +171,7 @@ class PackingInvarianceScenario(BaseModel):
     completion_pair_count: int
     logits_equivalent: bool
     logits_mean_abs_pct: float
+    logits_mean_abs_pct_limit: float
     logits_max_abs_diff: float
     matched: bool
 
@@ -169,6 +181,9 @@ class PackingInvarianceReport(BaseModel):
     base_model: str
     output_dir: str
     num_layers: int
+    precision: str
+    base_megatron_session_reused: bool = False
+    base_megatron_reset: BaseMegatronResetReport | None = None
     scenarios: list[PackingInvarianceScenario] = Field(default_factory=list)
 
 
@@ -283,9 +298,30 @@ def _rotary_grouping_check(
 
 def _rotary_outputs_for_validation(
     *,
-    handler_key: str,
+    handler: Any,
     preprocess_output: Any,
+    position_ids: torch.Tensor,
+    group_ids: torch.Tensor,
+    parent_ids: torch.Tensor,
 ) -> tuple[torch.Tensor | None, ...]:
+    handler_key = handler.key
+    if handler_key == "glm52":
+        model_state = handler.build_prefix_tree_model_state(
+            PrefixTreeModelStateContext(
+                input_pos=position_ids.detach().cpu(),
+                group_ids=group_ids.detach().cpu(),
+                parent_ids=parent_ids.detach().cpu(),
+                device=position_ids.device,
+            )
+        )
+        state = model_state.get("glm52")
+        if (
+            state is None
+            or not torch.is_tensor(state.rope_cos)
+            or not torch.is_tensor(state.rope_sin)
+        ):
+            raise RuntimeError("GLM-5.2 packed-position validation requires RoPE state")
+        return (torch.cat((state.rope_cos, state.rope_sin), dim=-1).permute(1, 0, 2),)
     rotary_output = preprocess_output[1]
     if handler_key in _SINGLE_ROTARY_OUTPUT_HANDLER_KEYS:
         return (
@@ -308,6 +344,14 @@ def _build_art_realistic_packed_tensors(
     deep: bool,
 ) -> dict[str, Any]:
     return build_complex_prefix_tree_packed_tensors(config, seed, deep=deep)
+
+
+def _dtype_for_precision(precision: str) -> torch.dtype:
+    if precision == "bf16":
+        return torch.bfloat16
+    if precision == "fp32":
+        return torch.float32
+    raise ValueError(f"Unsupported packed-position precision: {precision}")
 
 
 def _prefix_tree_leaf_paths(
@@ -379,6 +423,7 @@ def _logits_equivalence_check(
     position_ids: torch.Tensor,
     group_ids: torch.Tensor,
     parent_ids: torch.Tensor,
+    mean_abs_pct_limit: float,
 ) -> tuple[int, bool, float, float]:
     _debug_log(
         "logits_check start "
@@ -488,12 +533,13 @@ def _logits_equivalence_check(
         mean_abs = logits_abs_sum / max(logits_numel, 1)
         typical_abs = logits_ref_abs_sum / max(logits_numel, 1)
         logits_mean_abs_pct = (mean_abs / (typical_abs + 1e-12)) * 100.0
-        logits_equivalent = logits_mean_abs_pct <= _LOGITS_MEAN_ABS_PCT_LIMIT
+        logits_equivalent = logits_mean_abs_pct <= mean_abs_pct_limit
         _debug_log(
             "logits_check done "
             f"pairs={completion_pair_count} "
             f"equivalent={logits_equivalent} "
             f"mean_abs_pct={logits_mean_abs_pct:.6f} "
+            f"limit={mean_abs_pct_limit:.6f} "
             f"max_abs_diff={logits_max_abs_diff:.6f}"
         )
         return (
@@ -536,6 +582,17 @@ def _run_packing_invariance_subprocess(
         raise RuntimeError(
             f"Packing invariance worker failed with exit code {run.returncode}.\n{tail}"
         )
+
+
+def _run_packing_invariance_in_process(
+    request: PackingInvarianceRunRequest,
+    output_dir: Path,
+) -> None:
+    request_path = output_dir / "run_request.json"
+    _write_json(request_path, request.model_dump(mode="json"))
+    with (output_dir / "worker.log").open("w", encoding="utf-8") as worker_log:
+        with redirect_stdout(worker_log), redirect_stderr(worker_log):
+            run_worker_cli(request_path)
 
 
 def _run_packing_invariance_worker(
@@ -618,51 +675,89 @@ def _run_packing_invariance_worker(
             False,
         ),
     ]
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is required for packing invariance validation")
+
+    spec = get_model_support_spec(
+        base_model,
+        allow_unvalidated_arch=allow_unvalidated_arch,
+    )
+    handler = get_model_support_handler_for_spec(spec)
+    precision = handler.correctness_precision()
+    mean_abs_pct_limit = _LOGITS_MEAN_ABS_PCT_LIMITS[precision]
     report = PackingInvarianceReport(
         git=git,
         base_model=base_model,
         output_dir=str(output_dir),
         num_layers=num_layers,
+        precision=precision,
     )
-
-    if not torch.cuda.is_available():
-        raise RuntimeError("CUDA is required for packing invariance validation")
-
     case_config = OracleCaseConfig(
         base_model=base_model,
-        precision="fp32",
+        precision=precision,
         num_layers=num_layers,
         allow_unvalidated_arch=allow_unvalidated_arch,
     )
     runtime: megatron_train.TrainingRuntime | None = None
-    flex_patch_stack = ExitStack()
-    flex_patch_stack.enter_context(
+    session = active_base_megatron_session()
+    reused_runtime = session is not None
+    runtime_stack = ExitStack()
+    if not torch.distributed.is_initialized():
+        initialize_single_rank_process_group()
+        runtime_stack.enter_context(
+            patch.dict(
+                os.environ,
+                {
+                    "RANK": "0",
+                    "WORLD_SIZE": "1",
+                    "LOCAL_RANK": "0",
+                    "LOCAL_WORLD_SIZE": "1",
+                },
+            )
+        )
+    runtime_stack.enter_context(
         _apply_requested_flex_backend_patch(TEST_DEFAULT_FLEX_BACKEND)
     )
-    flex_patch_stack.enter_context(
-        _apply_test_flex_inner_fp32_patch(TEST_DEFAULT_FLEX_BACKEND)
-    )
-    flex_patch_stack.enter_context(
-        _apply_test_attention_full_fp32_patch(TEST_DEFAULT_FLEX_BACKEND)
-    )
+    if precision == "fp32":
+        runtime_stack.enter_context(
+            _apply_test_flex_inner_fp32_patch(TEST_DEFAULT_FLEX_BACKEND)
+        )
+        runtime_stack.enter_context(
+            _apply_test_attention_full_fp32_patch(TEST_DEFAULT_FLEX_BACKEND)
+        )
     try:
-        with provider_topology_env(ORACLE_TOPOLOGY):
-            runtime = _time_block(
-                "build_training_runtime",
-                lambda: megatron_train.build_training_runtime(
-                    model_identifier=base_model,
-                    provider_torch_dtype=torch.float32,
-                    provider_configure=lambda provider: _configure_provider(
-                        provider,
-                        ORACLE_TOPOLOGY,
-                        case_config,
-                    ),
-                    print_env=False,
-                    build_optimizer=False,
-                    trainable_parameter_mode="base_model",
+        if session is not None:
+            runtime = session.reset_for_packing(
+                key=BaseMegatronSessionKey(
+                    base_model=base_model,
+                    model_key=spec.key,
+                    num_layers=num_layers,
+                    precision=precision,
                     allow_unvalidated_arch=allow_unvalidated_arch,
-                ),
+                )
             )
+            report.base_megatron_session_reused = True
+            report.base_megatron_reset = session.reset_report
+        else:
+            with provider_topology_env(ORACLE_TOPOLOGY):
+                runtime = _time_block(
+                    "build_training_runtime",
+                    lambda: megatron_train.build_training_runtime(
+                        model_identifier=base_model,
+                        provider_torch_dtype=_dtype_for_precision(precision),
+                        provider_configure=lambda provider: _configure_provider(
+                            provider,
+                            ORACLE_TOPOLOGY,
+                            case_config,
+                        ),
+                        print_env=False,
+                        build_optimizer=False,
+                        trainable_parameter_mode="base_model",
+                        allow_unvalidated_arch=allow_unvalidated_arch,
+                    ),
+                )
+        if runtime is None:
+            raise RuntimeError("packing invariance did not acquire a Megatron runtime")
         model_chunks = cast(list[Any], runtime.model)
         gpt_module = _locate_gpt_module(model_chunks)
         for chunk in model_chunks:
@@ -703,8 +798,11 @@ def _run_packing_invariance_worker(
                 row_respected = True
                 row_repeated_count = 0
                 rotary_outputs = _rotary_outputs_for_validation(
-                    handler_key=runtime.model_support_handler.key,
+                    handler=runtime.model_support_handler,
                     preprocess_output=hooked_output,
+                    position_ids=row_position_ids,
+                    group_ids=group_ids[row_index : row_index + 1],
+                    parent_ids=parent_ids[row_index : row_index + 1],
                 )
                 for rotary_output in rotary_outputs:
                     checked, respected, repeated_count = _rotary_grouping_check(
@@ -737,6 +835,7 @@ def _run_packing_invariance_worker(
                     position_ids=position_ids,
                     group_ids=group_ids,
                     parent_ids=parent_ids,
+                    mean_abs_pct_limit=mean_abs_pct_limit,
                 ),
                 device=input_ids.device,
             )
@@ -773,6 +872,7 @@ def _run_packing_invariance_worker(
                     completion_pair_count=completion_pair_count,
                     logits_equivalent=logits_equivalent,
                     logits_mean_abs_pct=logits_mean_abs_pct,
+                    logits_mean_abs_pct_limit=mean_abs_pct_limit,
                     logits_max_abs_diff=logits_max_abs_diff,
                     matched=matched,
                 )
@@ -781,10 +881,11 @@ def _run_packing_invariance_worker(
         torch.cuda.empty_cache()
         _debug_log("run complete; model deleted and cuda cache emptied")
     finally:
-        flex_patch_stack.close()
-        del runtime
-        torch.cuda.empty_cache()
-        _cleanup_distributed_state()
+        runtime_stack.close()
+        if not reused_runtime:
+            del runtime
+            torch.cuda.empty_cache()
+            _cleanup_distributed_state()
 
     (output_dir / PACKING_INVARIANCE_REPORT_FILENAME).write_text(
         report.model_dump_json(indent=2),
@@ -798,14 +899,21 @@ def run_packing_invariance(
     base_model: str,
     num_layers: int | None = None,
     allow_unvalidated_arch: bool = False,
+    in_process: bool = False,
 ) -> PackingInvarianceReport:
     _debug_log(f"run start base_model={base_model} requested_num_layers={num_layers}")
+    spec = get_model_support_spec(
+        base_model,
+        allow_unvalidated_arch=allow_unvalidated_arch,
+    )
+    handler = get_model_support_handler_for_spec(spec)
+    dtype = _dtype_for_precision(handler.correctness_precision())
     resolved_num_layers = (
         max(
             1,
             inspect_architecture(
                 base_model,
-                torch_dtype=torch.float32,
+                torch_dtype=dtype,
                 allow_unvalidated_arch=allow_unvalidated_arch,
             ).recommended_min_layers,
         )
@@ -825,7 +933,12 @@ def run_packing_invariance(
         allow_unvalidated_arch=allow_unvalidated_arch,
     )
     with provider_topology_env(ORACLE_TOPOLOGY):
-        _run_packing_invariance_subprocess(request, output_dir)
+        runner = (
+            _run_packing_invariance_in_process
+            if in_process
+            else _run_packing_invariance_subprocess
+        )
+        runner(request, output_dir)
     return PackingInvarianceReport.model_validate(_read_json(report_path))
 
 

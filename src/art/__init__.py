@@ -29,12 +29,6 @@ if os.getenv("SUPPRESS_LITELLM_SERIALIZATION_WARNINGS", "1") == "1":
 
     suppress_litellm_serialization_warnings()
 
-# torch.cuda.MemPool doesn't currently support expandable_segments which is used in sleep mode
-conf = os.getenv("PYTORCH_CUDA_ALLOC_CONF", "").split(",")
-if "expandable_segments:True" in conf:
-    conf.remove("expandable_segments:True")
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = ",".join(conf)
-
 # Import unsloth before transformers, peft, and trl only in backend processes that
 # explicitly request it. Unsloth is an optional backend dependency, not a base ART
 # import dependency.
@@ -78,29 +72,10 @@ from .model import Model, TrainableModel
 from .pipeline_tuner import PipelineAutotuneConfig, PipelineRuntimeConfig
 from .serverless import ServerlessBackend
 from .trajectories import (
-    AnthropicMessagesHistory,
-    ChatCompletionsExchange,
-    ChatCompletionsHistory,
-    CompletionsExchange,
-    CompletionsHistory,
-    History,
-    MessagesExchange,
-    ResponsesExchange,
-    ResponsesHistory,
-    TokenizedTrajectory,
-    TokenizedTrajectoryGroup,
     Trajectory,
-    TrajectoryExchanges,
     TrajectoryGroup,
-    TrajectoryHistory,
-    auto_trajectory,  # ty: ignore[deprecated]
-    capture_auto_trajectory,  # ty: ignore[deprecated]
     current_trajectory,
-    current_trajectory_group,
-    tokenize_trajectories,
-    tokenize_trajectory,
-    tokenize_trajectory_group,
-    tokenize_trajectory_groups,
+    no_capture,
     trajectory,
     trajectory_group,
 )
@@ -121,10 +96,8 @@ from .yield_trajectory import capture_yielded_trajectory, yield_trajectory
 
 __all__ = [
     "dev",
-    "auto_trajectory",
-    "capture_auto_trajectory",
     "current_trajectory",
-    "current_trajectory_group",
+    "no_capture",
     "gather_trajectories",
     "gather_trajectory_groups",
     "trajectory_group_batches",
@@ -154,26 +127,9 @@ __all__ = [
     "TrainConfig",
     "TrainResult",
     "Trajectory",
-    "TrajectoryExchanges",
     "TrajectoryGroup",
-    "History",
-    "TrajectoryHistory",
-    "ChatCompletionsExchange",
-    "ChatCompletionsHistory",
-    "CompletionsExchange",
-    "CompletionsHistory",
-    "ResponsesExchange",
-    "ResponsesHistory",
-    "MessagesExchange",
-    "AnthropicMessagesHistory",
-    "TokenizedTrajectory",
-    "TokenizedTrajectoryGroup",
     "trajectory",
     "trajectory_group",
-    "tokenize_trajectory",
-    "tokenize_trajectories",
-    "tokenize_trajectory_group",
-    "tokenize_trajectory_groups",
     "capture_yielded_trajectory",
     "yield_trajectory",
 ]

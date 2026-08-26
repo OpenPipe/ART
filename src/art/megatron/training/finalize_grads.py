@@ -127,6 +127,9 @@ def flush_param_grads_to_main_grads(model_chunks: Iterable[torch.nn.Module]) -> 
 def finalize_model_grads_extended(
     model: list[MegatronModule],
     num_tokens: torch.Tensor | None = None,
+    *,
+    pg_collection: Any | None = None,
+    force_all_reduce: bool = False,
 ) -> None:
     """Run Megatron finalize, then apply extra LoRA grad-sync reductions.
 
@@ -139,6 +142,8 @@ def finalize_model_grads_extended(
     finalize_model_grads(
         cast(list[torch.nn.Module], model),
         num_tokens=num_tokens,
+        pg_collection=pg_collection,
+        force_all_reduce=force_all_reduce,
     )
 
     buckets: dict[

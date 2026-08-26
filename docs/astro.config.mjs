@@ -47,6 +47,7 @@ export default defineConfig({
             page("getting-started/about", "ART Docs"),
             page("getting-started/quick-start", "Quick Start"),
             page("getting-started/installation-setup", "Installation + Setup"),
+            page("getting-started/multi-node", "Multi-node deployment"),
             page("getting-started/notebooks", "Notebooks"),
             page("getting-started/faq", "FAQ"),
           ],

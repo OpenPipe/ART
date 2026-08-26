@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+import atexit
+from collections import deque
 from contextlib import ExitStack, contextmanager
 import faulthandler
 import hashlib
@@ -17,6 +19,9 @@ import numpy as np
 import torch
 
 from art.megatron.routing_replay import (
+    ROUTER_NAME_TOKEN,
+)
+from art.megatron.routing_replay import (
     ParallelTopology as ReplayParallelTopology,
 )
 from art.preprocessing.pack import PackedTensors
@@ -24,7 +29,7 @@ from art.utils.lifecycle import terminate_popen_process_group
 
 from ..routing_replay.bundle import build_bundle_from_forward_trace_dir
 from ..routing_replay.trace import install_moe_routing_trace_hooks
-from .forward_trace import ForwardTraceCapture
+from .forward_trace import CAPTURE_NAME_TOKENS, ForwardTraceCapture
 from .fp32_grouped_gemm import (
     allow_fp32_grouped_gemm_fallback_for_model_support_tests,
 )
@@ -38,8 +43,13 @@ from .oracle_harness import (
     StepTrace,
     Topology,
     WorkerRunRequest,
+    _comparison_dir,
     _read_json,
+    _remove_comparison_dir,
     _require_not_none,
+    _sample_valid_lengths,
+    _trim_trace_padding,
+    _write_comparison_sink,
     _write_json,
 )
 from .test_inputs import build_sft_trajectory_tensors_from_packed_tensors
@@ -49,6 +59,8 @@ _TOPOLOGY_ENV_VARS = {
     "cp": "ART_MEGATRON_CONTEXT_PARALLEL_SIZE",
     "ep": "ART_MEGATRON_EXPERT_MODEL_PARALLEL_SIZE",
     "etp": "ART_MEGATRON_EXPERT_TENSOR_PARALLEL_SIZE",
+    "pp": "ART_MEGATRON_PIPELINE_MODEL_PARALLEL_SIZE",
+    "vpp": "ART_MEGATRON_VIRTUAL_PIPELINE_MODEL_PARALLEL_SIZE",
 }
 _ORACLE_DEBUG_ENV = "ART_ORACLE_DEBUG"
 _ATTACH_TOKEN_UIDS_ENV = "ART_MEGATRON_ATTACH_TOKEN_UIDS"
@@ -85,8 +97,29 @@ def run_worker_subprocess(
     repo_root: Path,
 ) -> None:
     """Runs one distributed worker subprocess and stores combined logs."""
-    request_path = topology_dir / "run_request.json"
-    _write_json(request_path, request.model_dump(mode="json"))
+    run_worker_subprocesses([request], [topology_dir], repo_root=repo_root)
+
+
+def run_worker_subprocesses(
+    requests: list[WorkerRunRequest],
+    topology_dirs: list[Path],
+    *,
+    repo_root: Path,
+) -> None:
+    """Runs compatible requests in one distributed rank-process lifetime."""
+    if not requests or len(requests) != len(topology_dirs):
+        raise ValueError(
+            "Worker requests and topology directories must be non-empty and aligned"
+        )
+    topology = requests[0].topology
+    if any(request.topology != topology for request in requests[1:]):
+        raise ValueError("One worker process lifetime requires one parallel topology")
+
+    request_paths: list[Path] = []
+    for request, topology_dir in zip(requests, topology_dirs, strict=True):
+        request_path = topology_dir / "run_request.json"
+        _write_json(request_path, request.model_dump(mode="json"))
+        request_paths.append(request_path)
     worker_module = "integration.megatron.model_support.oracle_worker"
     worker_cwd = repo_root / "tests"
 
@@ -96,35 +129,39 @@ def run_worker_subprocess(
         "torch.distributed.run",
         "--standalone",
         "--nproc_per_node",
-        str(request.topology.world_size()),
+        str(topology.world_size()),
         "-m",
         worker_module,
         "--worker-run",
-        "--run-request",
-        str(request_path),
     ]
-    combined_lines: list[str] = []
-    worker_log_path = topology_dir / "worker.log"
+    for request_path in request_paths:
+        command.extend(("--run-request", str(request_path)))
+    output_tail: deque[str] = deque(maxlen=80)
     live_log_raw = os.environ.get("ART_ORACLE_LIVE_TRAINING_LOG")
     live_log_path = None if not live_log_raw else Path(live_log_raw)
     run: subprocess.Popen[str] | None = None
-    worker_log_path.parent.mkdir(parents=True, exist_ok=True)
-    with worker_log_path.open("w", encoding="utf-8") as worker_log:
+    for topology_dir in topology_dirs:
+        topology_dir.mkdir(parents=True, exist_ok=True)
+    with ExitStack() as logs:
+        worker_logs = [
+            logs.enter_context(
+                (topology_dir / "worker.log").open("w", encoding="utf-8")
+            )
+            for topology_dir in topology_dirs
+        ]
         live_log = None
         try:
             if live_log_path is not None:
                 live_log_path.parent.mkdir(parents=True, exist_ok=True)
                 live_log = live_log_path.open("a", encoding="utf-8")
-                live_log.write(
-                    f"\n=== {request.objective} {request.topology.slug()} ===\n"
-                )
+                live_log.write(f"\n=== {requests[0].objective} {topology.slug()} ===\n")
                 live_log.flush()
             env = {
                 **os.environ,
                 "ART_MEGATRON_ATTACH_TOKEN_UIDS": "1",
                 "PYTHONUNBUFFERED": "1",
             }
-            if request.case_config.precision == "fp32":
+            if requests[0].case_config.precision == "fp32":
                 env["NVIDIA_TF32_OVERRIDE"] = "0"
             run = subprocess.Popen(
                 command,
@@ -137,10 +174,18 @@ def run_worker_subprocess(
                 start_new_session=True,
             )
             assert run.stdout is not None
+            active_log_index = 0
+            request_markers = {
+                f"=== oracle request {index} ===": index
+                for index in range(len(requests))
+            }
             for line in run.stdout:
-                combined_lines.append(line)
-                worker_log.write(line)
-                worker_log.flush()
+                output_tail.append(line.rstrip())
+                marker_index = request_markers.get(line.strip())
+                if marker_index is not None:
+                    active_log_index = marker_index
+                worker_logs[active_log_index].write(line)
+                worker_logs[active_log_index].flush()
                 if live_log is not None:
                     live_log.write(line)
                     live_log.flush()
@@ -150,12 +195,10 @@ def run_worker_subprocess(
                 terminate_popen_process_group(run)
             if live_log is not None:
                 live_log.close()
-    combined_output = "".join(combined_lines).strip()
     if run.returncode != 0:
-        tail = "\n".join(combined_output.splitlines()[-80:])
         raise RuntimeError(
-            f"Topology run failed for {request.topology.slug()} with exit code "
-            f"{run.returncode}.\n{tail}"
+            f"Topology run failed for {topology.slug()} with exit code "
+            f"{run.returncode}.\n" + "\n".join(output_tail)
         )
 
 
@@ -172,10 +215,9 @@ def _set_deterministic_seed(seed: int) -> None:
 
 def provider_topology_env_vars(topology: Topology) -> dict[str, str]:
     return {
-        _TOPOLOGY_ENV_VARS["tp"]: str(topology.tp),
-        _TOPOLOGY_ENV_VARS["cp"]: str(topology.cp),
-        _TOPOLOGY_ENV_VARS["ep"]: str(topology.ep),
-        _TOPOLOGY_ENV_VARS["etp"]: str(topology.etp),
+        env_var: str(getattr(topology, field))
+        for field, env_var in _TOPOLOGY_ENV_VARS.items()
+        if field != "vpp" or topology.vpp > 1
     }
 
 
@@ -234,6 +276,8 @@ def _gather_full_state(
 
 def _collect_lora_state(
     model_chunks: list[Any],
+    *,
+    optimizer_master: bool = False,
 ) -> dict[str, Any] | None:
     """Collects full LoRA adapter state for validation and delta computation."""
     local_state: dict[str, Any] = {}
@@ -248,9 +292,27 @@ def _collect_lora_state(
                             f"Duplicate manifest key while collecting state: {key}"
                         )
                     local_manifest[key] = value
-            if not hasattr(module, "sharded_lora_state_dict"):
+            if optimizer_master:
+                export_items = getattr(module, "_export_items", None)
+                if not callable(export_items):
+                    continue
+                module_state = {}
+                for key, param, expert in export_items():
+                    main_param = getattr(param, "main_param", None)
+                    if main_param is None and param.dtype == torch.float32:
+                        main_param = param
+                    if main_param is None or bool(
+                        getattr(param, "main_param_sharded", False)
+                    ):
+                        raise RuntimeError(
+                            f"Oracle requires a full FP32 optimizer master parameter for '{key}'"
+                        )
+                    value = main_param[expert] if expert is not None else main_param
+                    module_state[key] = value.T
+            elif hasattr(module, "sharded_lora_state_dict"):
+                module_state = module.sharded_lora_state_dict()
+            else:
                 continue
-            module_state = module.sharded_lora_state_dict()
             for key, value in module_state.items():
                 if key in local_state:
                     raise RuntimeError(
@@ -374,35 +436,45 @@ def _build_deterministic_shared_init(
     return initialized
 
 
-def _stack_output_tensors(outputs: list[torch.Tensor]) -> torch.Tensor:
-    """Stacks micro outputs, padding the trailing sequence axis when lengths differ."""
+def _output_tensor_map(
+    outputs: list[torch.Tensor],
+    sample_indices: list[int | None],
+    valid_lengths: tuple[int, ...],
+) -> dict[str, torch.Tensor]:
+    """Materializes the exact per-micro tensors consumed by comparison."""
     if not outputs:
-        raise RuntimeError("Expected at least one output tensor to stack")
+        raise RuntimeError("Expected at least one captured micro output")
     first = outputs[0]
-    if all(tensor.shape == first.shape for tensor in outputs[1:]):
-        return torch.stack(outputs, dim=0)
     if any(tensor.ndim != first.ndim for tensor in outputs[1:]) or any(
         tensor.shape[:-1] != first.shape[:-1] for tensor in outputs[1:]
     ):
         raise RuntimeError("Unable to stack output tensors with incompatible shapes")
-
-    max_last_dim = max(int(tensor.shape[-1]) for tensor in outputs)
-    padded_outputs: list[torch.Tensor] = []
-    for tensor in outputs:
-        if int(tensor.shape[-1]) == max_last_dim:
-            padded_outputs.append(tensor)
-            continue
-        pad_value = float("nan") if tensor.dtype.is_floating_point else 0
-        padded = tensor.new_full((*tensor.shape[:-1], max_last_dim), pad_value)
-        padded[..., : tensor.shape[-1]] = tensor
-        padded_outputs.append(padded)
-    return torch.stack(padded_outputs, dim=0)
+    max_last_dim = max(int(tensor.shape[-1]) for tensor in outputs) if first.ndim else 0
+    result: dict[str, torch.Tensor] = {}
+    for index, output in enumerate(outputs):
+        output = (-output).contiguous()
+        sample_index = sample_indices[index] if index < len(sample_indices) else None
+        target_length = max_last_dim
+        if isinstance(sample_index, int):
+            target_length = min(target_length, max(valid_lengths[sample_index] - 1, 0))
+        if output.ndim and int(output.shape[-1]) < target_length:
+            padded = output.new_full(
+                (*output.shape[:-1], target_length),
+                float("nan") if output.dtype.is_floating_point else 0,
+            )
+            padded[..., : output.shape[-1]] = output
+            output = padded
+        elif output.ndim and int(output.shape[-1]) > target_length:
+            output = output[..., :target_length].contiguous()
+        result[f"logprobs.micro_{index:03d}"] = output
+    return result
 
 
 def _configure_provider(
     provider: Any,
     topology: Topology,
     case_config: OracleCaseConfig,
+    prepare_moe_routing_replay: bool = False,
 ) -> None:
     """Applies deterministic topology/model overrides to provider config.
 
@@ -412,6 +484,10 @@ def _configure_provider(
     """
     del topology
     provider.num_layers = case_config.num_layers
+    for name in ("moe_layer_freq", "glm52_indexer_types"):
+        pattern = getattr(provider, name, None)
+        if isinstance(pattern, (list, tuple)):
+            setattr(provider, name, type(pattern)(pattern[: case_config.num_layers]))
     if case_config.precision == "fp32":
         provider.bf16 = False
         provider.fp16 = False
@@ -425,15 +501,14 @@ def _configure_provider(
         provider.attention_dropout = 0.0
     if hasattr(provider, "hidden_dropout"):
         provider.hidden_dropout = 0.0
-    from art.megatron.model_support.registry import get_model_support_handler
-
-    handler = get_model_support_handler(
-        case_config.base_model,
-        allow_unvalidated_arch=case_config.allow_unvalidated_arch,
-    )
+    handler = provider._art_model_support_handler
     configure_oracle_provider = getattr(handler, "configure_oracle_provider", None)
     if configure_oracle_provider is not None:
         configure_oracle_provider(provider, case_config=case_config)
+    if prepare_moe_routing_replay:
+        from art.megatron.train import _enable_native_moe_routing_replay
+
+        _enable_native_moe_routing_replay(provider)
 
 
 @contextmanager
@@ -451,7 +526,6 @@ def _patch_finalize_provider_bundle_for_oracle(
             provider.moe_token_dispatcher_type = "alltoall"
             provider.moe_flex_dispatcher_backend = None
             provider.moe_enable_deepep = False
-            provider.moe_shared_expert_overlap = True
             provider.overlap_moe_expert_parallel_comm = False
             provider.delay_wgrad_compute = False
             provider.ep_overlap_early_attn_memory_release = False
@@ -505,6 +579,24 @@ def _configure_cuda_precision(case_config: OracleCaseConfig) -> None:
     torch.set_float32_matmul_precision("highest")
 
 
+def _sparse_flex_test_call(attention_call: Callable[..., Any]) -> Callable[..., Any]:
+    from torch.nn.attention.flex_attention import AuxRequest
+
+    def sparse_call(q, k, v, *, block_mask, scale, enable_gqa):
+        out, aux = attention_call(
+            q,
+            k,
+            v,
+            block_mask=block_mask,
+            scale=scale,
+            enable_gqa=enable_gqa,
+            return_aux=AuxRequest(lse=True),
+        )
+        return out, aux.lse
+
+    return sparse_call
+
+
 @contextmanager
 def _apply_requested_flex_backend_patch(flex_backend: str | None):
     if flex_backend is None:
@@ -539,7 +631,9 @@ def _apply_requested_flex_backend_patch(flex_backend: str | None):
         compiled_flex_attention._forced_flex_attention_dense
     )
     compiled_flex_attention.sparse_compiled_flex_attention = torch.compile(
-        compiled_flex_attention._forced_flex_attention_sparse
+        compiled_flex_attention._sparse_flex_attention_with_options(
+            patched_kernel_options
+        )
     )
     try:
         yield
@@ -594,7 +688,7 @@ def _apply_test_flex_inner_fp32_patch(flex_backend: str | None):
         _fp32_inner_call
     )
     compiled_flex_attention.sparse_compiled_flex_attention = torch.compile(
-        _fp32_inner_call
+        _sparse_flex_test_call(_fp32_inner_call)
     )
     try:
         yield
@@ -678,7 +772,7 @@ def _apply_test_attention_full_fp32_patch(flex_backend: str | None):
         _fp32_inner_call
     )
     compiled_flex_attention.sparse_compiled_flex_attention = torch.compile(
-        _fp32_inner_call
+        _sparse_flex_test_call(_fp32_inner_call)
     )
     setattr(ColumnParallelLinear, "_forward_impl", _column_forward_impl_fp32)
     setattr(RowParallelLinear, "_forward_impl", _row_forward_impl_fp32)
@@ -928,85 +1022,57 @@ def _apply_attention_async_comm_mutation(mutation: SensitivityMutation | None):
 
     from art.megatron.context_parallel import comm
 
-    original = comm.A2AVCommunicator.launch_kv_fetch
+    original = comm.A2AVCommunicator._launch_exchange
     comm_delay_cycles = 80_000_000
 
-    def _mutated_launch_kv_fetch(
+    def _mutated_launch_exchange(
         self: Any,
         *,
-        k_local: torch.Tensor,
-        v_local: torch.Tensor,
-        plan: Any,
+        tensor: torch.Tensor,
+        recv_buffer: torch.Tensor,
+        total_send_rows: int,
+        make_send_buffer: Callable[[], torch.Tensor],
+        output_split_sizes: list[int],
+        input_split_sizes: list[int],
         group: Any,
         async_op: bool,
-        range_meta_cache: dict[Any, Any] | None = None,
-        label: str = "kv_fetch",
-        input_layout: str = "token_major",
-        output_layout: str = "head_major",
+        input_layout: str,
+        row_factor: int = 2,
     ):
-        if group is None or comm._DIST.get_world_size(group) == 1:
-            return original(
-                self,
-                k_local=k_local,
-                v_local=v_local,
-                plan=plan,
-                group=group,
-                async_op=async_op,
-                range_meta_cache=range_meta_cache,
-                label=label,
-                input_layout=input_layout,
-                output_layout=output_layout,
-            )
-
-        total_send_rows = int(sum(plan.send_splits))
-        total_recv_rows = int(sum(plan.recv_splits))
-        recv_packed = k_local.new_empty(
-            comm._packed_peer_tensor_shape(
-                tensor=k_local,
-                total_rows=total_recv_rows,
-                input_layout=input_layout,
-            )
-        )
-        input_split_sizes = [split * 2 for split in plan.send_splits]
-        output_split_sizes = [split * 2 for split in plan.recv_splits]
-        stream = self._get_stream(k_local) if async_op else None
+        stream = self._get_stream(tensor) if async_op else None
         if stream is None:
             return original(
                 self,
-                k_local=k_local,
-                v_local=v_local,
-                plan=plan,
+                tensor=tensor,
+                recv_buffer=recv_buffer,
+                total_send_rows=total_send_rows,
+                make_send_buffer=make_send_buffer,
+                output_split_sizes=output_split_sizes,
+                input_split_sizes=input_split_sizes,
                 group=group,
                 async_op=async_op,
-                range_meta_cache=range_meta_cache,
-                label=label,
                 input_layout=input_layout,
-                output_layout=output_layout,
+                row_factor=row_factor,
             )
-        current_stream = torch.cuda.current_stream(k_local.device)
+        current_stream = torch.cuda.current_stream(tensor.device)
         if total_send_rows > 0:
             stream.wait_stream(current_stream)
         with torch.cuda.stream(stream):
             if total_send_rows <= 0:
-                send_buffer = k_local.new_empty(
+                send_buffer = tensor.new_empty(
                     comm._packed_peer_tensor_shape(
-                        tensor=k_local,
+                        tensor=tensor,
                         total_rows=0,
                         input_layout=input_layout,
+                        row_factor=row_factor,
                     )
                 )
             else:
-                send_buffer = comm._pack_gathered_tensors_per_peer(
-                    left_tensor=k_local,
-                    right_tensor=v_local,
-                    ranges_by_peer=plan.send_ranges_by_peer,
-                    range_meta_cache=range_meta_cache,
-                    input_layout=input_layout,
-                )
+                send_buffer = make_send_buffer()
             if total_send_rows > 0:
                 torch.cuda._sleep(comm_delay_cycles)
             handle = comm._launch_peer_exchange(
-                recv_buffer=recv_packed,
+                recv_buffer=recv_buffer,
                 send_buffer=send_buffer,
                 output_split_sizes=output_split_sizes,
                 input_split_sizes=input_split_sizes,
@@ -1015,21 +1081,13 @@ def _apply_attention_async_comm_mutation(mutation: SensitivityMutation | None):
             )
         if total_send_rows > 0 and send_buffer.numel() > 0:
             send_buffer.zero_()
-        return comm.KvFetchWork(
-            packed_buffer=recv_packed,
-            recv_splits=plan.recv_splits,
-            handle=handle,
-            send_buffer=send_buffer,
-            stream=stream,
-            label=label,
-            output_layout=output_layout,
-        )
+        return handle, send_buffer, stream
 
-    comm.A2AVCommunicator.launch_kv_fetch = _mutated_launch_kv_fetch  # type: ignore[invalid-assignment]
+    comm.A2AVCommunicator._launch_exchange = _mutated_launch_exchange  # type: ignore[invalid-assignment]
     try:
         yield
     finally:
-        comm.A2AVCommunicator.launch_kv_fetch = original
+        comm.A2AVCommunicator._launch_exchange = original
 
 
 @contextmanager
@@ -1117,7 +1175,7 @@ def _patch_lora_for_fp32(
         work_a = self.A_T.to(dtype=work_dtype)
         work_b = self.B_T.to(dtype=work_dtype)
 
-        if tokens_per_expert is None or self.num_local_experts == 1:
+        if tokens_per_expert is None or not self.is_expert:
             return (((work_x @ work_a) @ work_b) * self.scale).to(dtype=x.dtype)
 
         counts = (
@@ -1289,6 +1347,7 @@ def _mutation_hook(
             *,
             model_support_handler: Any | None = None,
             model_chunks: Any | None = None,
+            before_step: Callable[[], None] | None = None,
         ):
             if pre_optimizer_step_hook is not None:
                 pre_optimizer_step_hook()
@@ -1297,6 +1356,7 @@ def _mutation_hook(
                 learning_rate,
                 model_support_handler=model_support_handler,
                 model_chunks=model_chunks,
+                before_step=before_step,
             )
 
         megatron_train_module._optimizer_step = _patched_optimizer_step
@@ -1346,16 +1406,96 @@ def _mutation_hook(
             )
 
 
-def _worker_run(request: WorkerRunRequest) -> None:
-    """Executes one full distributed training trace generation worker run."""
-    os.environ.setdefault(_ATTACH_TOKEN_UIDS_ENV, "1")
-    from safetensors.torch import load_file, save_file  # ty: ignore[unresolved-import]
-    import torch
+class _WorkerSession:
+    """Owns reusable distributed model state for one parallel topology."""
 
-    from art import dev, types
+    def __init__(
+        self,
+        *,
+        request: WorkerRunRequest,
+        runtime: Any,
+        weight_offload: Any,
+        flex_patch_stack: ExitStack,
+    ) -> None:
+        self.request = request
+        self.runtime = runtime
+        self.weight_offload = weight_offload
+        self.flex_patch_stack = flex_patch_stack
+        self.rng_state: tuple[Any, Any, torch.Tensor, list[torch.Tensor]] | None = None
+
+    def begin_request(self) -> None:
+        self.weight_offload.before_job()
+        if self.rng_state is None:
+            self.rng_state = (
+                random.getstate(),
+                np.random.get_state(),
+                torch.get_rng_state(),
+                torch.cuda.get_rng_state_all(),
+            )
+            return
+        python_state, numpy_state, torch_state, cuda_states = self.rng_state
+        random.setstate(python_state)
+        np.random.set_state(numpy_state)
+        torch.set_rng_state(torch_state)
+        torch.cuda.set_rng_state_all(cuda_states)
+
+    def end_request(self) -> None:
+        self.weight_offload.after_job()
+
+    def close(self) -> None:
+        _debug("starting worker session close")
+        torch.distributed.barrier()  # ty: ignore[possibly-missing-attribute]
+        self.flex_patch_stack.close()
+        torch.distributed.destroy_process_group()  # ty: ignore[possibly-missing-attribute]
+        _debug("finished worker session close")
+
+
+def _validate_session_request(
+    session_request: WorkerRunRequest,
+    request: WorkerRunRequest,
+) -> None:
+    """Rejects request differences that require rebuilding distributed state."""
+    per_run_fields = {
+        "objective",
+        "topology_dir",
+        "comparison_dir",
+        "mutation",
+        "moe_routing_replay_path",
+        "moe_routing_replay_strict",
+        "capture_moe_routing_bundle_path",
+    }
+    if session_request.model_dump(exclude=per_run_fields) != request.model_dump(
+        exclude=per_run_fields
+    ):
+        raise ValueError("Worker requests require different distributed runtimes")
+
+
+def _clear_optimizer_state(optimizer: Any) -> None:
+    chained = getattr(optimizer, "chained_optimizers", None)
+    if chained is not None:
+        for child in chained:
+            _clear_optimizer_state(child)
+        return
+    inner = getattr(optimizer, "optimizer", None)
+    state = getattr(inner, "state", None)
+    if state is None:
+        raise TypeError(f"{type(optimizer).__name__} has no mutable optimizer state")
+    state.clear()
+
+
+def _reset_optimizer_state(optimizer: Any) -> None:
+    from art.megatron import train as megatron_train
+
+    _clear_optimizer_state(optimizer)
+    megatron_train._eager_initialize_optimizer_state(optimizer)
+
+
+def _start_worker_session(request: WorkerRunRequest) -> _WorkerSession:
+    """Builds distributed model state once for compatible oracle requests."""
+    _debug("starting worker session setup")
+    os.environ.setdefault(_ATTACH_TOKEN_UIDS_ENV, "1")
     from art.megatron import train as megatron_train
     from art.megatron.training.weight_offload import WeightOffloadManager
-    from art.preprocessing.pack import packed_tensors_from_dir
 
     if request.case_config.precision == "fp32":
         allow_fp32_grouped_gemm_fallback_for_model_support_tests()
@@ -1396,16 +1536,22 @@ def _worker_run(request: WorkerRunRequest) -> None:
                 else torch.bfloat16
             )
             runtime = megatron_train.build_training_runtime(
-                model_identifier=request.case_config.base_model,
+                model_identifier=(
+                    request.case_config.provider_model or request.case_config.base_model
+                ),
                 provider_torch_dtype=provider_torch_dtype,
                 provider_configure=lambda provider: _configure_provider(
-                    provider, request.topology, request.case_config
+                    provider,
+                    request.topology,
+                    request.case_config,
+                    request.prepare_moe_routing_replay,
                 ),
                 optimizer_config=_build_optimizer_config(request.case_config),
                 moe_routing_replay_path=request.moe_routing_replay_path,
                 moe_routing_replay_strict=request.moe_routing_replay_strict,
                 print_env=False,
                 allow_unvalidated_arch=request.case_config.allow_unvalidated_arch,
+                model_support_key=request.case_config.model_support_key,
             )
         _debug("finished build_training_runtime")
     model_chunks = runtime.model
@@ -1420,18 +1566,65 @@ def _worker_run(request: WorkerRunRequest) -> None:
     )
     weight_offload.install()
     weight_offload.after_job()
-    weight_offload.before_job()
+    _debug("finished worker session setup")
+    return _WorkerSession(
+        request=request,
+        runtime=runtime,
+        weight_offload=weight_offload,
+        flex_patch_stack=flex_patch_stack,
+    )
+
+
+def _worker_run(
+    request: WorkerRunRequest,
+    session: _WorkerSession | None = None,
+) -> _WorkerSession:
+    """Executes one trace while retaining compatible distributed model state."""
+    from safetensors.torch import load_file, save_file  # ty: ignore[unresolved-import]
+
+    from art import dev, types
+    from art.megatron import train as megatron_train
+    from art.preprocessing.pack import packed_tensors_from_dir
+
+    reused_runtime = session is not None
+    if session is None:
+        session = _start_worker_session(request)
+    else:
+        _validate_session_request(session.request, request)
+    runtime = session.runtime
+    model_chunks = runtime.model
+    optimizer = runtime.optimizer
+    capture_routes = request.capture_moe_routing_bundle_path is not None
+    _debug(f"starting request objective={request.objective} capture={capture_routes}")
+    session.begin_request()
+    # Reloading LoRA masters does not clear moments from a prior paired objective.
+    _reset_optimizer_state(optimizer)
+    if reused_runtime:
+        had_replay = runtime.moe_routing_replay_controller is not None
+        megatron_train.configure_moe_routing_replay(
+            runtime,
+            replay_bundle_path=request.moe_routing_replay_path,
+            strict=request.moe_routing_replay_strict,
+        )
+        if not had_replay and request.moe_routing_replay_path is not None:
+            # Recompile with the full replay comparison hooks.
+            torch.compiler.reset()
 
     topology_dir = Path(request.topology_dir)
-    traces_dir = topology_dir / "traces"
-    traces_dir.mkdir(parents=True, exist_ok=True)
+    comparison_dir = _comparison_dir(request.comparison_dir)
+    rank0 = torch.distributed.get_rank() == 0  # ty: ignore[possibly-missing-attribute]
+    if rank0:
+        atexit.register(_remove_comparison_dir, comparison_dir)
+    routing_traces_dir = comparison_dir / "routing_traces"
+    if rank0 and capture_routes:
+        routing_traces_dir.mkdir(parents=True)
 
     # setup the shared initial lora
     shared_init_path = Path(request.shared_init_adapter_path)
     if not shared_init_path.exists():
         _debug("collecting initial lora state")
         initial_state = _collect_lora_state(model_chunks)
-        if torch.distributed.get_rank() == 0:  # ty: ignore[possibly-missing-attribute]
+        if rank0:
             _debug("building deterministic initial lora state")
             shared_init_path.parent.mkdir(parents=True, exist_ok=True)
             deterministic_init = _build_deterministic_shared_init(
@@ -1455,9 +1648,11 @@ def _worker_run(request: WorkerRunRequest) -> None:
         optimizer,
         model_support_handler=runtime.model_support_handler,
     )
+    optimizer.zero_grad()
+    megatron_train._zero_grad_buffers(model_chunks)
     _debug("collecting loaded lora state")
     loaded_state = _collect_lora_state(model_chunks)
-    if torch.distributed.get_rank() == 0:  # ty: ignore[possibly-missing-attribute]
+    if rank0:
         _debug("validating loaded lora state")
         _validate_loaded_state_matches_adapter(
             _require_not_none(loaded_state, "loaded_state"),
@@ -1472,6 +1667,11 @@ def _worker_run(request: WorkerRunRequest) -> None:
     packed_tensors = packed_tensors_from_dir(
         **request.packed_tensors.model_dump(exclude_none=True)
     )
+    valid_lengths = (
+        _sample_valid_lengths(cast(dict[str, torch.Tensor], packed_tensors))
+        if not capture_routes and rank0
+        else None
+    )
     sft_trajectory_tensors: list[dict[str, torch.Tensor]] | None = None
     rl_zero_template: PackedTensors | None = None
     sft_zero_template: dict[str, torch.Tensor] | None = None
@@ -1485,7 +1685,11 @@ def _worker_run(request: WorkerRunRequest) -> None:
         sft_zero_template = megatron_train._zero_contribution_sft_inputs(
             sft_trajectory_tensors[0]
         )
-    initial_lora_state = loaded_state
+    initial_optimizer_state = (
+        None
+        if capture_routes
+        else _collect_lora_state(model_chunks, optimizer_master=True)
+    )
     global_grad_accumulation_sequences = request.case_config.grad_accumulation_sequences
 
     train_config = types.TrainConfig(
@@ -1499,6 +1703,10 @@ def _worker_run(request: WorkerRunRequest) -> None:
     forward_trace_capture = ForwardTraceCapture(
         model_chunks,
         enabled=True,
+        capture_name_tokens=(
+            (ROUTER_NAME_TOKEN,) if capture_routes else CAPTURE_NAME_TOKENS
+        ),
+        capture_layer_outputs=not capture_routes,
     )
     install_moe_routing_trace_hooks(lambda: runtime.moe_routing_replay_controller)
     from megatron.core import parallel_state as ps
@@ -1533,7 +1741,9 @@ def _worker_run(request: WorkerRunRequest) -> None:
                 model_chunks,
                 request.mutation,
                 request.topology,
-                pre_optimizer_step_hook=_capture_lora_grads,
+                pre_optimizer_step_hook=(
+                    None if capture_routes else _capture_lora_grads
+                ),
                 loss_scale=request.case_config.loss_scale,
             )
         )
@@ -1614,60 +1824,85 @@ def _worker_run(request: WorkerRunRequest) -> None:
                 )
             _debug(f"finished step_index={step_index}")
             print(f"finished step_index={step_index}", flush=True)
-            ordered_step_outputs = (
-                forward_trace_capture.ordered_step_outputs_with_sample_indices()
-            )
-            if ordered_step_outputs is None:
-                ordered_micro_sample_indices = None
-                ordered_micro_outputs = None
+            ordered_micro_sample_indices = micro_sample_indices
+            if capture_routes:
+                forward_trace_capture.save_current_step(routing_traces_dir)
             else:
+                ordered_step_outputs = (
+                    forward_trace_capture.ordered_step_outputs_with_sample_indices()
+                )
                 ordered_micro_sample_indices, ordered_micro_outputs = (
-                    ordered_step_outputs
+                    (micro_sample_indices, None)
+                    if ordered_step_outputs is None
+                    else ordered_step_outputs
                 )
-            forward_trace_capture.save_current_step(traces_dir)
-            torch.distributed.barrier()  # ty: ignore[possibly-missing-attribute]
-            current_lora_state = _collect_lora_state(model_chunks)
+                gathered_traces: list[Any] | None = (
+                    [None] * torch.distributed.get_world_size()  # ty: ignore[possibly-missing-attribute]
+                    if rank0
+                    else None
+                )
+                torch.distributed.gather_object(  # ty: ignore[possibly-missing-attribute]
+                    forward_trace_capture.current_step_trace, gathered_traces, dst=0
+                )
+                merged_trace = (
+                    None
+                    if gathered_traces is None
+                    else forward_trace_capture.canonicalize_trace(
+                        forward_trace_capture._merge_rank_traces(
+                            cast(Any, gathered_traces)
+                        )
+                    )
+                )
+                torch.distributed.barrier()  # ty: ignore[possibly-missing-attribute]
+                current_optimizer_state = _collect_lora_state(
+                    model_chunks, optimizer_master=True
+                )
+                if rank0:
+                    trace = _trim_trace_padding(
+                        _require_not_none(merged_trace, "merged_trace"),
+                        valid_lengths=_require_not_none(valid_lengths, "valid_lengths"),
+                        sequence_length=request.case_config.packed_tensors.sequence_length,
+                    )
+                    ordered_outputs = _require_not_none(
+                        ordered_micro_outputs, "ordered_micro_outputs"
+                    )
+                    current_state = _require_not_none(
+                        current_optimizer_state, "current_optimizer_state"
+                    )
+                    _write_comparison_sink(
+                        comparison_dir / f"step_{step_index:03d}.safetensors",
+                        {
+                            "outputs": _output_tensor_map(
+                                ordered_outputs,
+                                ordered_micro_sample_indices,
+                                _require_not_none(valid_lengths, "valid_lengths"),
+                            ),
+                            "grads": _require_not_none(
+                                captured_grads, "captured_grads"
+                            ),
+                            "deltas": _apply_save_mutation_to_tensor_map(
+                                _delta_state(
+                                    _require_not_none(
+                                        initial_optimizer_state,
+                                        "initial_optimizer_state",
+                                    ),
+                                    current_state,
+                                ),
+                                mutation=request.mutation,
+                            ),
+                            "forward": ForwardTraceCapture.flatten_trace_tensors(
+                                trace, value_key="primary_output"
+                            ),
+                            "router_scores": ForwardTraceCapture.flatten_trace_tensors(
+                                trace, value_key="router_topk_scores"
+                            ),
+                            "router_topk_ids": ForwardTraceCapture.flatten_trace_tensors(
+                                trace, value_key="router_topk_ids"
+                            ),
+                        },
+                    )
 
-            if torch.distributed.get_rank() == 0:  # ty: ignore[possibly-missing-attribute]
-                grads = _require_not_none(captured_grads, "captured_grads")
-                initial_state = _require_not_none(
-                    initial_lora_state, "initial_lora_state"
-                )
-                current_state = _require_not_none(
-                    current_lora_state, "current_lora_state"
-                )
-                deltas = _delta_state(initial_state, current_state)
-                saved_deltas = _apply_save_mutation_to_tensor_map(
-                    deltas,
-                    mutation=request.mutation,
-                )
-                saved_current_state = _apply_save_mutation_to_tensor_map(
-                    current_state,
-                    mutation=request.mutation,
-                )
-
-                output_rel = Path("traces") / f"output_step_{step_index:03d}.pt"
-                grads_rel = Path("traces") / f"grads_step_{step_index:03d}.safetensors"
-                deltas_rel = (
-                    Path("traces") / f"deltas_step_{step_index:03d}.safetensors"
-                )
-                lora_rel = Path(f"lora_step_{step_index:03d}.safetensors")
-                ordered_outputs = _require_not_none(
-                    ordered_micro_outputs, "ordered_micro_outputs"
-                )
-                if not ordered_outputs:
-                    raise RuntimeError("Expected at least one captured micro output")
-
-                torch.save(
-                    _stack_output_tensors(
-                        [(-output).contiguous() for output in ordered_outputs]
-                    ),
-                    topology_dir / output_rel,
-                )
-                save_file(grads, str(topology_dir / grads_rel))
-                save_file(saved_deltas, str(topology_dir / deltas_rel))
-                save_file(saved_current_state, str(topology_dir / lora_rel))
-
+            if rank0:
                 step_traces.append(
                     StepTrace(
                         step_index=step_index,
@@ -1676,26 +1911,18 @@ def _worker_run(request: WorkerRunRequest) -> None:
                             / request.case_config.loss_scale
                         ),
                         probs_corr=step_result.probs_corr,
-                        micro_sample_indices=list(
-                            ordered_micro_sample_indices
-                            if ordered_micro_sample_indices is not None
-                            else micro_sample_indices
-                        ),
-                        output_file=str(output_rel),
-                        grads_file=str(grads_rel),
-                        deltas_file=str(deltas_rel),
-                        lora_file=str(lora_rel),
+                        micro_sample_indices=list(ordered_micro_sample_indices),
                     )
                 )
             torch.distributed.barrier()  # ty: ignore[possibly-missing-attribute]
 
     forward_trace_capture.close()
 
-    if torch.distributed.get_rank() == 0:  # ty: ignore[possibly-missing-attribute]
+    if rank0:
         # build and save the moe routing replay bundle
-        if request.capture_moe_routing_bundle_path is not None:
+        if capture_routes:
             replay_bundle = build_bundle_from_forward_trace_dir(
-                traces_dir=traces_dir,
+                traces_dir=routing_traces_dir,
                 num_steps=request.case_config.num_steps,
                 topology=ReplayParallelTopology.model_validate(
                     request.topology.model_dump(
@@ -1704,7 +1931,13 @@ def _worker_run(request: WorkerRunRequest) -> None:
                     )
                 ),
             )
-            replay_bundle.to_dir(request.capture_moe_routing_bundle_path)
+            replay_bundle.to_dir(
+                _require_not_none(
+                    request.capture_moe_routing_bundle_path,
+                    "capture_moe_routing_bundle_path",
+                )
+            )
+            _remove_comparison_dir(comparison_dir)
 
         # build and save the run manifest
         manifest = RunManifest(
@@ -1717,6 +1950,7 @@ def _worker_run(request: WorkerRunRequest) -> None:
             world_size=request.topology.world_size(),
             seed=request.case_config.seed,
             num_steps=request.case_config.num_steps,
+            comparison_dir=None if capture_routes else str(comparison_dir),
             packed_tensors=request.packed_tensors,
             offload_between_jobs=request.offload_between_jobs,
             streaming_weight_offload=request.streaming_weight_offload,
@@ -1724,18 +1958,34 @@ def _worker_run(request: WorkerRunRequest) -> None:
             steps=step_traces,
         )
         _write_json(topology_dir / "manifest.json", manifest.model_dump(mode="json"))
-    weight_offload.after_job()
-    torch.distributed.barrier()  # ty: ignore[possibly-missing-attribute]
-    flex_patch_stack.close()
-    torch.distributed.destroy_process_group()  # ty: ignore[possibly-missing-attribute]
+    session.end_request()
+    _debug(f"finished request objective={request.objective}")
+    if rank0:
+        atexit.unregister(_remove_comparison_dir)
+    return session
 
 
-def run_worker_cli(run_request_path: Path) -> None:
-    """Loads a worker request and dispatches worker execution."""
-    request = WorkerRunRequest.model_validate(_read_json(run_request_path))
+def run_worker_cli(run_request_paths: list[Path]) -> None:
+    """Loads compatible worker requests and dispatches them in one process lifetime."""
+    requests = [
+        WorkerRunRequest.model_validate(_read_json(run_request_path))
+        for run_request_path in run_request_paths
+    ]
+    session: _WorkerSession | None = None
     try:
-        _worker_run(request)
+        for index, request in enumerate(requests):
+            if index > 0:
+                torch.distributed.barrier()  # ty: ignore[possibly-missing-attribute]
+                if torch.distributed.get_rank() == 0:  # ty: ignore[possibly-missing-attribute]
+                    print(
+                        f"=== oracle request {index} ===",
+                        flush=True,
+                    )
+                torch.distributed.barrier()  # ty: ignore[possibly-missing-attribute]
+            session = _worker_run(request, session)
     finally:
+        if session is not None:
+            session.close()
         if _oracle_debug_enabled():
             faulthandler.cancel_dump_traceback_later()
 
@@ -1744,7 +1994,7 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     """Parses worker CLI arguments."""
     parser = argparse.ArgumentParser(description="Megatron oracle harness worker")
     parser.add_argument("--worker-run", action="store_true")
-    parser.add_argument("--run-request", type=Path)
+    parser.add_argument("--run-request", type=Path, action="append")
     return parser.parse_args(argv)
 
 
@@ -1753,7 +2003,7 @@ def _main(argv: list[str]) -> int:
     args = _parse_args(argv)
     if not args.worker_run:
         raise SystemExit("This module is intended for test imports or --worker-run")
-    if args.run_request is None:
+    if not args.run_request:
         raise SystemExit("--run-request is required with --worker-run")
     run_worker_cli(args.run_request)
     return 0

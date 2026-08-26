@@ -41,6 +41,7 @@ from ..model import Model, TrainableModel
 from ..tinker.backend import get_renderer_name
 from ..tinker.server import get_free_port
 from ..trajectories import Trajectory, TrajectoryGroup
+from ..trajectories._selection import automatic_training_model_selector
 from ..types import TrainResult, TrainSFTConfig
 from ..utils.lifecycle import process_shutdown_timeout
 from ..utils.output_dirs import get_model_dir
@@ -358,6 +359,7 @@ class TinkerNativeBackend:
             state.tokenizer,
             normalize_advantages,
             base_model=model.base_model,
+            model=automatic_training_model_selector(self._model_inference_name(model)),
         )
 
         metrics: dict[str, float] = {
@@ -422,16 +424,15 @@ class TinkerNativeBackend:
                 model_input=datum.model_input, loss_fn_inputs=loss_fn_inputs
             )
 
-        forward_output = await self._tinker_train_call(
-            "forward_backward",
-            state.training_client.forward_backward(
-                [remove_mask(datum) for datum in datums],
-                loss_fn=loss_fn,
-                loss_fn_config=loss_fn_config,
-            ),
+        forward_future = state.training_client.forward_backward(
+            [remove_mask(datum) for datum in datums],
+            loss_fn=loss_fn,
+            loss_fn_config=loss_fn_config,
         )
-        optim_output = await self._tinker_train_call(
-            "optim_step", state.training_client.optim_step(adam_params)
+        optim_future = state.training_client.optim_step(adam_params)
+        forward_output, optim_output = await asyncio.gather(
+            self._tinker_train_call("forward_backward", forward_future),
+            self._tinker_train_call("optim_step", optim_future),
         )
 
         if forward_output.metrics:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+import os
 from typing import Any
 
 from ..types import MegatronRuntimeConfig, MegatronTopologyConfig
@@ -13,6 +14,8 @@ def init_megatron_runtime_config(
     *,
     topology: MegatronTopologyConfig | Mapping[str, int | None] | None = None,
     packed_sequence_length: int | None = None,
+    snapshot_pool_capacity: int = 2,
+    compile_cache: bool | None = None,
     streaming_weight_offload: bool = False,
 ) -> MegatronRuntimeConfig:
     global _MEGATRON_RUNTIME_CONFIG
@@ -20,6 +23,13 @@ def init_megatron_runtime_config(
         config = {
             "topology": topology,
             "packed_sequence_length": packed_sequence_length,
+            "snapshot_pool_capacity": snapshot_pool_capacity,
+            "compile_cache": (
+                os.environ.get("ART_MEGATRON_COMPILE_CACHE", "0").lower()
+                in {"1", "true", "yes", "on"}
+                if compile_cache is None
+                else compile_cache
+            ),
             "streaming_weight_offload": streaming_weight_offload,
         }
     runtime_config = MegatronRuntimeConfig.model_validate(config)

@@ -12,7 +12,7 @@ import pytest
 import art
 from art import dev
 from art.megatron.backend import MegatronBackend
-from art.megatron.service import MegatronService
+from art.megatron.distributed_service import DistributedMegatronService
 
 from ..model_support.oracle_harness import ORACLE_TOPOLOGY, Topology
 from ..model_support.oracle_worker import provider_topology_env
@@ -31,8 +31,8 @@ torch = pytest.importorskip("torch")
 DEFAULT_BASE_MODEL = "Qwen/Qwen3-30B-A3B-Instruct-2507"
 DEFAULT_MAX_SEQ_LENGTH = 1024
 DEFAULT_PACKED_SEQUENCE_LENGTH = 1024
-DEDICATED_MERGED_ENV = "ART_RUN_LIVE_MEGATRON_MERGED_SMOKE"
-DEDICATED_MULTIRANK_MERGED_ENV = "ART_RUN_LIVE_MEGATRON_MULTIRANK_MERGED_SMOKE"
+DEDICATED_ENV = "ART_RUN_LIVE_MEGATRON_DEDICATED_SMOKE"
+DEDICATED_MULTIRANK_ENV = "ART_RUN_LIVE_MEGATRON_MULTIRANK_SMOKE"
 SHARED_LORA_ENV = "ART_RUN_LIVE_MEGATRON_SHARED_SMOKE"
 SHARED_LONG_LORA_ENV = "ART_RUN_LIVE_MEGATRON_SHARED_LONG_SMOKE"
 SHARED_TOPOLOGY = Topology(tp=1, ep=2, etp=1, dp=1, cp=2, sp=False)
@@ -81,17 +81,13 @@ def _inference_gpu_ids() -> list[int]:
 
 def _multirank_trainer_gpu_ids() -> list[int]:
     if not torch.cuda.is_available() or torch.cuda.device_count() < 3:
-        raise RuntimeError(
-            "Need at least 3 visible CUDA GPUs for multi-rank Megatron merged smoke"
-        )
+        raise RuntimeError("Need at least 3 visible CUDA GPUs for multi-rank smoke")
     return [0, 1]
 
 
 def _multirank_inference_gpu_ids() -> list[int]:
     if not torch.cuda.is_available() or torch.cuda.device_count() < 3:
-        raise RuntimeError(
-            "Need at least 3 visible CUDA GPUs for multi-rank Megatron merged smoke"
-        )
+        raise RuntimeError("Need at least 3 visible CUDA GPUs for multi-rank smoke")
     return [2]
 
 
@@ -104,9 +100,10 @@ def _shared_live_config() -> dev.InternalModelConfig:
     return cast(
         dev.InternalModelConfig,
         {
-            "rollout_weights_mode": "lora",
             "engine_args": {
-                **_engine_args_for_yes_no_trainability(inference_gpu_ids=[0, 1]),
+                **_engine_args_for_yes_no_trainability(
+                    base_model=_base_model(), inference_gpu_ids=[0, 1]
+                ),
                 "tensor_parallel_size": 2,
                 "enable_expert_parallel": True,
                 "enable_sleep_mode": True,
@@ -116,30 +113,25 @@ def _shared_live_config() -> dev.InternalModelConfig:
     )
 
 
-def _dedicated_merged_config() -> dev.InternalModelConfig:
+def _dedicated_config() -> dev.InternalModelConfig:
     return {
         "trainer_gpu_ids": _trainer_gpu_ids(),
         "inference_gpu_ids": _inference_gpu_ids(),
-        "rollout_weights_mode": "merged",
-        "engine_args": {
-            **_engine_args_for_yes_no_trainability(
-                inference_gpu_ids=_inference_gpu_ids()
-            ),
-        },
+        "engine_args": _engine_args_for_yes_no_trainability(
+            base_model=_base_model(), inference_gpu_ids=_inference_gpu_ids()
+        ),
         "init_args": {"max_seq_length": _max_seq_length()},
     }
 
 
-def _dedicated_multirank_merged_config() -> dev.InternalModelConfig:
+def _dedicated_multirank_config() -> dev.InternalModelConfig:
     return {
         "trainer_gpu_ids": _multirank_trainer_gpu_ids(),
         "inference_gpu_ids": _multirank_inference_gpu_ids(),
-        "rollout_weights_mode": "merged",
-        "engine_args": {
-            **_engine_args_for_yes_no_trainability(
-                inference_gpu_ids=_multirank_inference_gpu_ids()
-            ),
-        },
+        "engine_args": _engine_args_for_yes_no_trainability(
+            base_model=_base_model(),
+            inference_gpu_ids=_multirank_inference_gpu_ids(),
+        ),
         "init_args": {"max_seq_length": _max_seq_length()},
     }
 
@@ -169,15 +161,15 @@ async def _chat_snapshot(model: art.TrainableModel, *, step: int) -> dict[str, o
     }
 
 
-async def _runtime_is_sleeping(service: MegatronService) -> bool:
+async def _runtime_is_sleeping(service: DistributedMegatronService) -> bool:
     async with httpx.AsyncClient(timeout=30.0) as client:
-        response = await client.get(f"{service._vllm_base_url}/is_sleeping")
+        response = await client.get(f"{service._base_url}/is_sleeping")
         response.raise_for_status()
         return bool(response.json()["is_sleeping"])
 
 
 async def _wait_until_runtime_sleeping(
-    service: MegatronService,
+    service: DistributedMegatronService,
     *,
     timeout_s: float = 300.0,
     poll_s: float = 0.5,
@@ -282,7 +274,7 @@ async def test_megatron_backend_shared_lora_runtime_sleep_wake_live_smoke(
             report_metrics=[],
         )
         await model.register(backend)
-        service = cast(MegatronService, await backend._get_service(model))
+        service = cast(DistributedMegatronService, await backend._get_service(model))
         prompts = _train_group_prompts()
         await _warmup_model(model, base_model=model.base_model, prompt=prompts[0])
         step0_name = model.get_inference_name(step=0)
@@ -356,10 +348,10 @@ async def test_megatron_backend_shared_lora_runtime_sleep_wake_live_smoke(
     reason="Need at least 2 CUDA GPUs for Megatron live smokes",
 )
 @pytest.mark.asyncio
-async def test_megatron_backend_dedicated_merged_live_smoke(
+async def test_megatron_backend_dedicated_live_smoke(
     artifact_dir: Path,
 ) -> None:
-    _require_opt_in(DEDICATED_MERGED_ENV)
+    _require_opt_in(DEDICATED_ENV)
     backend_root = artifact_dir / "art_workspace"
     backend_root.mkdir(parents=True, exist_ok=True)
 
@@ -367,17 +359,17 @@ async def test_megatron_backend_dedicated_merged_live_smoke(
         backend_root=backend_root,
         topology=ORACLE_TOPOLOGY,
     ) as backend:
-        run_name = f"megatron-merged-live-{uuid.uuid4().hex[:8]}"
+        run_name = f"megatron-dedicated-live-{uuid.uuid4().hex[:8]}"
         model = art.TrainableModel(
             name=run_name,
             run_name=run_name,
             project="integration-tests",
             base_model=_base_model(),
-            _internal_config=_dedicated_merged_config(),
+            _internal_config=_dedicated_config(),
             report_metrics=[],
         )
         await model.register(backend)
-        service = cast(MegatronService, await backend._get_service(model))
+        service = cast(DistributedMegatronService, await backend._get_service(model))
         prompts = _train_group_prompts()
         await _warmup_model(model, base_model=model.base_model, prompt=prompts[0])
         step0_name = model.get_inference_name(step=0)
@@ -415,26 +407,26 @@ async def test_megatron_backend_dedicated_merged_live_smoke(
             "eval_reward": eval_reward,
             "latest_snapshot": latest_snapshot,
         }
-        (artifact_dir / "dedicated_megatron_merged_live_result.json").write_text(
+        (artifact_dir / "dedicated_megatron_live_result.json").write_text(
             json.dumps(payload, indent=2, sort_keys=True) + "\n",
             encoding="utf-8",
         )
         assert latest_step > 0
         assert step0_name in model_ids_before
         assert latest_name in model_ids_after
-        assert step0_name not in model_ids_after
+        assert step0_name in model_ids_after
         assert latest_snapshot["has_logprobs"] is True
 
 
 @pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.device_count() < 3,
-    reason="Need at least 3 CUDA GPUs for multi-rank Megatron merged smoke",
+    reason="Need at least 3 CUDA GPUs for multi-rank Megatron smoke",
 )
 @pytest.mark.asyncio
-async def test_megatron_backend_dedicated_multirank_merged_live_smoke(
+async def test_megatron_backend_dedicated_multirank_live_smoke(
     artifact_dir: Path,
 ) -> None:
-    _require_opt_in(DEDICATED_MULTIRANK_MERGED_ENV)
+    _require_opt_in(DEDICATED_MULTIRANK_ENV)
     backend_root = artifact_dir / "art_workspace"
     backend_root.mkdir(parents=True, exist_ok=True)
 
@@ -442,17 +434,17 @@ async def test_megatron_backend_dedicated_multirank_merged_live_smoke(
         backend_root=backend_root,
         topology=SHARED_TOPOLOGY,
     ) as backend:
-        run_name = f"megatron-multirank-merged-live-{uuid.uuid4().hex[:8]}"
+        run_name = f"megatron-multirank-live-{uuid.uuid4().hex[:8]}"
         model = art.TrainableModel(
             name=run_name,
             run_name=run_name,
             project="integration-tests",
             base_model=_base_model(),
-            _internal_config=_dedicated_multirank_merged_config(),
+            _internal_config=_dedicated_multirank_config(),
             report_metrics=[],
         )
         await model.register(backend)
-        service = cast(MegatronService, await backend._get_service(model))
+        service = cast(DistributedMegatronService, await backend._get_service(model))
         prompts = _train_group_prompts()
         await _warmup_model(model, base_model=model.base_model, prompt=prompts[0])
         step0_name = model.get_inference_name(step=0)
@@ -493,16 +485,14 @@ async def test_megatron_backend_dedicated_multirank_merged_live_smoke(
             "inference_gpu_ids": _multirank_inference_gpu_ids(),
             "topology": SHARED_TOPOLOGY.model_dump(),
         }
-        (
-            artifact_dir / "dedicated_megatron_multirank_merged_live_result.json"
-        ).write_text(
+        (artifact_dir / "dedicated_megatron_multirank_live_result.json").write_text(
             json.dumps(payload, indent=2, sort_keys=True) + "\n",
             encoding="utf-8",
         )
         assert latest_step > 0
         assert step0_name in model_ids_before
         assert latest_name in model_ids_after
-        assert step0_name not in model_ids_after
+        assert step0_name in model_ids_after
         assert latest_snapshot["has_logprobs"] is True
 
 
@@ -532,7 +522,7 @@ async def test_megatron_backend_shared_lora_ten_step_live_smoke(
             report_metrics=[],
         )
         await model.register(backend)
-        service = cast(MegatronService, await backend._get_service(model))
+        service = cast(DistributedMegatronService, await backend._get_service(model))
         prompts = _train_group_prompts()
         await _warmup_model(model, base_model=model.base_model, prompt=prompts[0])
         step0_name = model.get_inference_name(step=0)
