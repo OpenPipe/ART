@@ -1024,6 +1024,7 @@ class MegatronTrainingSlot:
                     for values in result["token_logprobs"]
                 ),
                 metrics={**packing_metrics(prepared.packed), **result["metrics"]},
+                produced_gradient=prepared.packing.loss_bearing_tokens > 0,
             )
 
         return ForwardBackwardLaunch(
@@ -1042,41 +1043,55 @@ class MegatronTrainingSlot:
         *,
         backward: bool,
     ) -> ForwardResult:
-        result = ForwardBackwardResult if backward else ForwardResult
-        return result(
+        loss_fn_outputs = tuple(
+            LossFnOutput(token_logprobs=values) for values in raw["token_logprobs"]
+        )
+        metrics = {
+            "time/step_tokenize_trajectory_groups_s": prepared.tokenization_s,
+            "data/step_num_dropped_trajectories": float(
+                prepared.batch.num_dropped_trajectories
+            ),
+            **raw["metrics"],
+        }
+        if backward:
+            return ForwardBackwardResult(
+                operation_id=prepared.ref.operation_id,
+                packing=prepared.packing,
+                loss_fn_outputs=loss_fn_outputs,
+                metrics=metrics,
+                produced_gradient=True,
+            )
+        return ForwardResult(
             operation_id=prepared.ref.operation_id,
             packing=prepared.packing,
-            loss_fn_outputs=tuple(
-                LossFnOutput(token_logprobs=values) for values in raw["token_logprobs"]
-            ),
-            metrics={
-                "time/step_tokenize_trajectory_groups_s": prepared.tokenization_s,
-                "data/step_num_dropped_trajectories": float(
-                    prepared.batch.num_dropped_trajectories
-                ),
-                **raw["metrics"],
-            },
+            loss_fn_outputs=loss_fn_outputs,
+            metrics=metrics,
         )
 
     @staticmethod
     def _empty_sft_forward_result(
         prepared: PreparedEmptySftForward, *, backward: bool
     ) -> ForwardResult:
-        result = ForwardBackwardResult if backward else ForwardResult
-        values: dict[str, Any] = {
-            "operation_id": prepared.ref.operation_id,
-            "packing": prepared.packing,
-            "loss_fn_outputs": (),
-            "metrics": {
-                "time/step_tokenize_trajectory_groups_s": prepared.tokenization_s,
-                "data/step_num_dropped_trajectories": float(
-                    prepared.num_dropped_trajectories
-                ),
-            },
+        metrics = {
+            "time/step_tokenize_trajectory_groups_s": prepared.tokenization_s,
+            "data/step_num_dropped_trajectories": float(
+                prepared.num_dropped_trajectories
+            ),
         }
         if backward:
-            values["produced_gradient"] = False
-        return result.model_validate(values)
+            return ForwardBackwardResult(
+                operation_id=prepared.ref.operation_id,
+                packing=prepared.packing,
+                loss_fn_outputs=(),
+                metrics=metrics,
+                produced_gradient=False,
+            )
+        return ForwardResult(
+            operation_id=prepared.ref.operation_id,
+            packing=prepared.packing,
+            loss_fn_outputs=(),
+            metrics=metrics,
+        )
 
     async def optim_step(
         self,

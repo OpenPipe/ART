@@ -187,6 +187,7 @@ class FakeService:
                     group_shapes=(),
                 ),
                 loss_fn_outputs=(LossFnOutput(token_logprobs=(0.0,)),),
+                produced_gradient=True,
             )
             result_ref, payload = encode_operation_result(result)
             self.operation_results[ref["operation_id"]] = payload
@@ -379,6 +380,7 @@ def _forward_result() -> ForwardBackwardResult:
             group_shapes=(),
         ),
         loss_fn_outputs=(LossFnOutput(token_logprobs=(-1.0,)),),
+        produced_gradient=True,
     )
 
 
@@ -413,6 +415,7 @@ def test_operation_result_sidecar_preserves_compact_packing_arrays():
             ),
         ),
         loss_fn_outputs=(LossFnOutput(token_logprobs=(-1.25, -2.5)),),
+        produced_gradient=True,
     )
     ref, payload = encode_operation_result(result)
     restored = decode_operation_result(ref, payload, ForwardBackwardResult)
@@ -436,6 +439,7 @@ def test_operation_result_sidecar_preserves_candidate_logprob_shape():
             group_shapes=(),
         ),
         loss_fn_outputs=(LossFnOutput(token_logprobs=((-1.0, -2.0), (-3.0, -4.0))),),
+        produced_gradient=True,
     )
     ref, payload = encode_operation_result(result)
     assert decode_operation_result(ref, payload, ForwardBackwardResult) == result

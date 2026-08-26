@@ -143,7 +143,7 @@ class PreparedPackedTensors(BaseModel):
     plan: PrefixTreePackingPlan
     pad_token_id: int
     advantage_balance: float
-    num_dropped_trajectories: int = Field(default=0, ge=0)
+    num_dropped_trajectories: int = Field(ge=0)
     plot_output_dir: str | None = None
 
 
@@ -1193,7 +1193,9 @@ class LocalBackend:
                 - {id(result.trajectory) for result in tokenized_results}
             ),
             plot_output_dir=(
-                get_model_dir(model=model, art_path=self._path) if plot_tensors else None
+                get_model_dir(model=model, art_path=self._path)
+                if plot_tensors
+                else None
             ),
         )
 
@@ -1210,9 +1212,7 @@ class LocalBackend:
             timings=packing_timings,
         )
         if prepared.plot_output_dir is not None:
-            plot_packed_tensors(
-                packed_tensors, prepared.plot_output_dir
-            )
+            plot_packed_tensors(packed_tensors, prepared.plot_output_dir)
         else:
             logger.info(
                 f"Packed {len(prepared.plan.items)} trajectories into "

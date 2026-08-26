@@ -71,6 +71,7 @@ def _save(request_id: str, sequence_id: int) -> SaveWeightsForSamplerRequest:
 
 
 def _forward_backward(request_id: str, sequence_id: int) -> ForwardBackwardRequest:
+    header = b"header"
     return ForwardBackwardRequest(
         run_id="run",
         request_id=request_id,
@@ -78,10 +79,11 @@ def _forward_backward(request_id: str, sequence_id: int) -> ForwardBackwardReque
         batch=RlTrajectoryBatch(
             groups=(
                 TrajectoryGroupBundle(
-                    header=b"header",
+                    header=header,
                     records=(),
                     route_free_identity=TrajectoryGroupDataIdentity(
-                        sha256=hashlib.sha256(b"header").hexdigest(), byte_count=6
+                        sha256=hashlib.sha256(header).hexdigest(),
+                        byte_count=len(header),
                     ),
                 ),
             ),
@@ -110,6 +112,7 @@ def _forward_backward_result(operation_id: str) -> ForwardBackwardResult:
         loss_fn_outputs=(
             LossFnOutput(token_logprobs=TokenLogprobs(shape=(3,), data=b"x" * 12)),
         ),
+        produced_gradient=True,
     )
 
 
@@ -146,9 +149,7 @@ def test_completed_operation_heap_compaction_is_geometric(
     client = _client(_Service())
     total = 1024
     client._completed_operations = {str(index): 0 for index in range(total)}
-    client._completed_operation_order = [
-        (index, str(index)) for index in range(total)
-    ]
+    client._completed_operation_order = [(index, str(index)) for index in range(total)]
     heapify_calls = 0
     heapify = client_module.heapq.heapify
 

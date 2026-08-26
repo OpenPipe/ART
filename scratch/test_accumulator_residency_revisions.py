@@ -1,3 +1,4 @@
+from threading import Lock
 from types import SimpleNamespace
 
 import torch
@@ -39,6 +40,8 @@ class _ResidencyProbe:
         self.working_sets.append(tuple(keys))
         for key in keys:
             self.acquire_l1(key)
+
+    acquire_prepared_l1_working_set = acquire_l1_working_set
 
     def wait_before_mutation_working_set(self, keys):
         (key,) = tuple(keys)
@@ -98,6 +101,7 @@ def test_accumulation_window_reuses_one_mutable_residency_revision() -> None:
         installed_weights=weights,
     )
     executor = MCoreRunSlotExecutor.__new__(MCoreRunSlotExecutor)
+    executor.runtime = SimpleNamespace(rank=0)
     residency = _ResidencyProbe()
     executor._residency = residency
 
@@ -110,10 +114,17 @@ def test_accumulation_window_reuses_one_mutable_residency_revision() -> None:
     assert current is not None
     torch.testing.assert_close(gradient, torch.full_like(gradient, 3.0))
     assert current.accumulator_revision == 1
-    with executor._resident(state, include_accumulator=True):
-        assert residency.acquired == [weights, current]
+    executor._residency_admission_lock = Lock()
+    residency.acquire_l1_working_set((weights, current))
+    executor._residency_admissions = {"forward": (weights, current)}
+    with executor._resident(state, operation_id="forward", include_accumulator=True):
+        assert residency.acquired == [weights, current, weights, current]
     assert residency.acquired == []
-    assert residency.working_sets == [(weights, current)]
+    assert residency.working_sets == [
+        (current,),
+        (weights, current),
+        (weights, current),
+    ]
     executor._retire_accumulator(state)
     assert state.desired.accumulator is None
     assert state.next_accumulator_revision == 2

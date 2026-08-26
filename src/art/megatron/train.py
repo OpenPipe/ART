@@ -674,6 +674,13 @@ def _execute_megatron_rl_forward_backward_steps(
     forward_only: bool = False,
     defer_grad_sync: bool = False,
 ) -> tuple[dict[str, torch.dtype], float, int, float]:
+    from art.megatron.runtime.preschedule_trace import (
+        preschedule_trace_scope,
+        trace_preschedule,
+    )
+
+    rank = int(runtime.rank)
+    operation_id = job.operation_id
     job_prepare_started = time.perf_counter()
     template = None
     zero_template = None
@@ -694,11 +701,13 @@ def _execute_megatron_rl_forward_backward_steps(
                 packed_tensors=packed_tensors,
                 global_grad_accumulation_sequences=global_grad_accumulation_sequences,
             )
+        trace_preschedule(rank, operation_id, "replay_configure_enter")
         configure_moe_routing_replay(
             runtime,
             replay_bundle=replay_bundle,
             strict=_moe_replay_strict(job),
         )
+        trace_preschedule(rank, operation_id, "replay_configure_exit")
         replay_finalize_s = time.perf_counter() - replay_finalize_started
         adapter_dtypes = (
             {} if state_is_resident else _prepare_rl_training_state(runtime, job)
@@ -726,19 +735,29 @@ def _execute_megatron_rl_forward_backward_steps(
             if ps.get_expert_model_parallel_world_size() > 1
             else None
         )
+        required_hybridep_capacity = max(
+            (
+                count
+                for step_counts in hybridep_token_counts_by_step or ()
+                for count in step_counts
+            ),
+            default=0,
+        )
+        trace_preschedule(
+            rank,
+            operation_id,
+            "hybridep_capacity_enter",
+            required_capacity=required_hybridep_capacity,
+            packed_sequence_length=packed_sequence_length,
+            context_parallel_size=topology.cp,
+        )
         _ensure_hybridep_capacity(
             runtime,
             packed_sequence_length=packed_sequence_length,
             context_parallel_size=topology.cp,
-            required_capacity=max(
-                (
-                    count
-                    for step_counts in hybridep_token_counts_by_step or ()
-                    for count in step_counts
-                ),
-                default=0,
-            ),
+            required_capacity=required_hybridep_capacity,
         )
+        trace_preschedule(rank, operation_id, "hybridep_capacity_exit")
         ref_logprobs_by_index = _prepare_kl_reference_logprobs(
             runtime=runtime,
             job=job,
@@ -810,31 +829,46 @@ def _execute_megatron_rl_forward_backward_steps(
             )
             step_input_prepare_s = time.perf_counter() - step_input_prepare_started
             train_step_started = time.perf_counter()
-            state = run_megatron_rl_forward_backward_step(
-                model_chunks=runtime.model,
-                provider=runtime.provider,
-                model_support_handler=runtime.model_support_handler,
-                inputs=micro_inputs,
-                config=job.config,
-                experimental_config=_experimental_train_config(job),
-                ref_logprobs=ref_logprobs,
+            trace_preschedule(
+                rank,
+                operation_id,
+                "schedule_prepare_enter",
                 step_index=step_index,
-                sample_index=micro_indices,
-                moe_routing_replay_controller=runtime.moe_routing_replay_controller,
-                cp_lookahead_state=cp_lookahead_state,
-                next_step_first_micro=next_step_first_micro,
-                next_step_first_ref_logprobs=next_step_first_ref_logprobs,
-                hybridep_token_counts=hybridep_token_counts,
-                inter_forward_backward_timing=runtime.inter_forward_backward_timing,
-                loss=job.loss if isinstance(job, ForwardBackwardJobSpec) else None,
-                forward_only=forward_only,
-                return_token_logprobs=(
-                    job.return_token_logprobs
-                    if isinstance(job, ForwardBackwardJobSpec)
-                    else True
-                ),
-                defer_grad_sync=defer_grad_sync,
-                rank_local_metrics=isinstance(job, ForwardBackwardJobSpec),
+                micro_indices=tuple(micro_indices),
+            )
+            with preschedule_trace_scope(rank, operation_id):
+                state = run_megatron_rl_forward_backward_step(
+                    model_chunks=runtime.model,
+                    provider=runtime.provider,
+                    model_support_handler=runtime.model_support_handler,
+                    inputs=micro_inputs,
+                    config=job.config,
+                    experimental_config=_experimental_train_config(job),
+                    ref_logprobs=ref_logprobs,
+                    step_index=step_index,
+                    sample_index=micro_indices,
+                    moe_routing_replay_controller=runtime.moe_routing_replay_controller,
+                    cp_lookahead_state=cp_lookahead_state,
+                    next_step_first_micro=next_step_first_micro,
+                    next_step_first_ref_logprobs=next_step_first_ref_logprobs,
+                    hybridep_token_counts=hybridep_token_counts,
+                    inter_forward_backward_timing=runtime.inter_forward_backward_timing,
+                    loss=job.loss if isinstance(job, ForwardBackwardJobSpec) else None,
+                    forward_only=forward_only,
+                    return_token_logprobs=(
+                        job.return_token_logprobs
+                        if isinstance(job, ForwardBackwardJobSpec)
+                        else True
+                    ),
+                    defer_grad_sync=defer_grad_sync,
+                    rank_local_metrics=isinstance(job, ForwardBackwardJobSpec),
+                    preschedule_operation_id=operation_id,
+                )
+            trace_preschedule(
+                rank,
+                operation_id,
+                "schedule_exit",
+                step_index=step_index,
             )
             after_step(
                 step_index,
@@ -2791,12 +2825,11 @@ def _local_packed_token_scores(
     top_k: int,
 ) -> tuple[PackedTokenScore, ...]:
     selection = prepared.lm_head_selection
-    labels = selection.select(prepared.model_labels).reshape(-1)
+    labels = selection.select_labels(prepared.model_labels).reshape(-1)
     token_uids = prepared.local_token_uids
     if token_uids is None:
         raise RuntimeError("resident scoring requires packed token UIDs")
-    uid_indices = selection.flat_indices.to(device=token_uids.device)
-    selected_uids = token_uids.reshape(-1).index_select(0, uid_indices)
+    selected_uids = selection.select(token_uids, padding_value=-1).reshape(-1)
     target_logprobs, top_logprobs, top_ids = _vocab_parallel_token_scores(
         local_logits,
         labels,
@@ -3853,7 +3886,13 @@ def run_megatron_rl_forward_backward_step(
     return_token_logprobs: bool = True,
     defer_grad_sync: bool = False,
     rank_local_metrics: bool = False,
+    preschedule_operation_id: str | None = None,
 ) -> RLForwardBackwardState:
+    from art.megatron.runtime.preschedule_trace import (
+        trace_current_preschedule,
+        trace_preschedule,
+    )
+
     if forward_only and loss is None:
         raise ValueError("forward-only RL schedule requires a tokenized named loss")
     schedule_prepare_started = time.perf_counter()
@@ -3876,10 +3915,12 @@ def run_megatron_rl_forward_backward_step(
         micro_sample_indices = [sample_index]
 
     if moe_routing_replay_controller is not None:
+        trace_current_preschedule("replay_set_step_enter", step_index=step_index)
         moe_routing_replay_controller.set_step(
             step_index=step_index,
             sample_index=micro_sample_indices,
         )
+        trace_current_preschedule("replay_set_step_exit", step_index=step_index)
 
     device = next(model_chunks[0].parameters()).device
     topology = _infer_parallel_topology(model_chunks)
@@ -3909,6 +3950,11 @@ def run_megatron_rl_forward_backward_step(
         micro_ref_logprobs = _select_ref_logprobs(ref_logprobs, micro_order)
         if micro_ref_logprobs is not None and int(topology.cp) <= 1:
             micro_ref_logprobs = micro_ref_logprobs.to(device)
+        trace_current_preschedule(
+            "cp_current_micro_enter",
+            micro_order=micro_order,
+            used_lookahead=pending_prepared_micro is not None,
+        )
         prepared_micro, pending_prepared_micro = _prepare_current_rl_micro(
             micro_inputs[micro_order],
             device=device,
@@ -3919,7 +3965,9 @@ def run_megatron_rl_forward_backward_step(
             trace_token_uids=trace_token_uids,
             pending_prepared_micro=pending_prepared_micro,
         )
+        trace_current_preschedule("cp_current_micro_exit", micro_order=micro_order)
         prepared_micros.append(prepared_micro)
+        trace_current_preschedule("cp_lookahead_micro_enter", micro_order=micro_order)
         pending_prepared_micro = _prepare_next_rl_cp_micro(
             _next_micro_lookahead(
                 micro_inputs,
@@ -3937,6 +3985,11 @@ def run_megatron_rl_forward_backward_step(
                 micro_count=micro_count,
                 next_step_first_ref_logprobs=next_step_first_ref_logprobs,
             ),
+        )
+        trace_current_preschedule(
+            "cp_lookahead_micro_exit",
+            micro_order=micro_order,
+            prepared=pending_prepared_micro is not None,
         )
     if cp_lookahead_state is not None:
         cp_lookahead_state.pending_prepared_micro = pending_prepared_micro
@@ -3995,7 +4048,9 @@ def run_megatron_rl_forward_backward_step(
                 assert loss_weights is not None
                 assert behavior_logprobs is not None
                 assert token_advantages is not None
-                selected_targets = prepared.lm_head_selection.select_rows(target_tokens)
+                selected_targets = prepared.lm_head_selection.select_rows(
+                    target_tokens, padding_value=-1
+                )
                 selected_weights = prepared.lm_head_selection.select_rows(loss_weights)
                 selected_behavior = prepared.lm_head_selection.select_rows(
                     behavior_logprobs
@@ -4111,6 +4166,14 @@ def run_megatron_rl_forward_backward_step(
         )
 
     schedule_prepare_s = time.perf_counter() - schedule_prepare_started
+    if preschedule_operation_id is not None:
+        trace_preschedule(
+            int(torch.distributed.get_rank()),
+            preschedule_operation_id,
+            "mcore_schedule_enter",
+            step_index=step_index,
+            micro_count=micro_count,
+        )
     forward_data_store, collect_inter_schedule_metrics = _run_training_schedule(
         schedule,
         forward_step_func,
@@ -4118,6 +4181,13 @@ def run_megatron_rl_forward_backward_step(
         forward_only=forward_only,
         rank_local_metrics=rank_local_metrics,
     )
+    if preschedule_operation_id is not None:
+        trace_preschedule(
+            int(torch.distributed.get_rank()),
+            preschedule_operation_id,
+            "mcore_schedule_exit",
+            step_index=step_index,
+        )
     replay_finalize_started = time.perf_counter()
     if moe_routing_replay_controller is not None:
         moe_routing_replay_controller.finalize_step(expect_recompute=not forward_only)

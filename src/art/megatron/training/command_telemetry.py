@@ -26,7 +26,7 @@ RANK_STATISTIC_COUNT = _OFF_POLICY.start + 3 + IMPORTANCE_RATIO_HISTOGRAM_BUCKET
 
 
 class RankTelemetryTopology(BaseModel):
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(extra="forbid", frozen=True)
 
     global_rank: int = Field(ge=0)
     dp_cp_ranks: tuple[int, ...] = Field(min_length=1)
@@ -36,7 +36,7 @@ class RankTelemetryTopology(BaseModel):
 class PendingRankCommandTelemetry(BaseModel):
     """Small rank-local result resolved after the GPU turn is released."""
 
-    model_config = ConfigDict(arbitrary_types_allowed=True)
+    model_config = ConfigDict(arbitrary_types_allowed=True, extra="forbid")
 
     program: Literal["rl", "sft"]
     backward: bool
@@ -50,12 +50,15 @@ class PendingRankCommandTelemetry(BaseModel):
 
 
 class RankCommandTelemetry(BaseModel):
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(extra="forbid", frozen=True)
 
     program: Literal["rl", "sft"]
     backward: bool
     topology: RankTelemetryTopology
-    statistics: tuple[float, ...]
+    statistics: tuple[float, ...] = Field(
+        min_length=RANK_STATISTIC_COUNT,
+        max_length=RANK_STATISTIC_COUNT,
+    )
     workload: TrainingStepWorkload
     pipeline_metrics: dict[str, float]
     inter_metrics: dict[str, float]

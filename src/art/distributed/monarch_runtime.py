@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from typing import Any, Literal
+from typing import Any, Literal, TypeVar
 
 from pydantic import BaseModel, ConfigDict
 
@@ -50,6 +50,14 @@ class RemoteCallResult(BaseModel):
 
     value: Any = None
     error: RemoteCallError | None = None
+
+
+ModelT = TypeVar("ModelT", bound=BaseModel)
+
+
+def _validate_remote_model(model: type[ModelT], value: Any) -> ModelT:
+    payload = value.model_dump(mode="python") if isinstance(value, BaseModel) else value
+    return model.model_validate(payload)
 
 
 def unwrap_remote_call(result: RemoteCallResult) -> Any:
@@ -300,8 +308,11 @@ class MonarchPackingEndpoint:
         *,
         transfer_timeout_s: float,
     ) -> PackingResult:
-        return await call_remote(
-            self.actor.pack_batch, request, batch_id, transfer_timeout_s
+        return _validate_remote_model(
+            PackingResult,
+            await call_remote(
+                self.actor.pack_batch, request, batch_id, transfer_timeout_s
+            ),
         )
 
     async def prepare(
@@ -311,9 +322,15 @@ class MonarchPackingEndpoint:
         *,
         transfer_timeout_s: float,
     ) -> PackingPlanResult:
-        return await call_remote(
-            self.actor.prepare_batch, request, batch_id, transfer_timeout_s
+        return _validate_remote_model(
+            PackingPlanResult,
+            await call_remote(
+                self.actor.prepare_batch, request, batch_id, transfer_timeout_s
+            ),
         )
 
     async def materialize(self, batch_id: str, generation_id: str) -> PackingResult:
-        return await call_remote(self.actor.materialize_batch, batch_id, generation_id)
+        return _validate_remote_model(
+            PackingResult,
+            await call_remote(self.actor.materialize_batch, batch_id, generation_id),
+        )
