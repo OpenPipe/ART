@@ -380,10 +380,10 @@ _THROUGHPUT_CONFIGS = {
     ),
     "nemotron_h_moe": ThroughputWorkflowConfig(
         num_layers=39,
-        prompt_tokens=3884,
+        prompt_tokens=7900,
         completion_tokens=48,
-        rollouts_per_group=5,
-        groups_per_step=27,
+        rollouts_per_group=4,
+        groups_per_step=16,
         initial_model_calls_per_inference_gpu=20,
         max_steps=17,
     ),
