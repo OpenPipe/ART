@@ -229,6 +229,15 @@ class InlineOperationResult(Contract):
     result: dict[str, Any]
 
 
+class ReleasedOperationResult(Contract):
+    transport: Literal["released"] = "released"
+    object_id: str = Field(pattern=r"^[0-9a-f]{64}$")
+    byte_count: int = Field(ge=1, le=MAX_OPERATION_RESULT_BYTES)
+    format: Literal["art_operation_result_msgpack_v1"] = OPERATION_RESULT_FORMAT
+    reason: str = Field(min_length=1, max_length=32)
+    released_at: datetime
+
+
 ForwardOperationResult = Annotated[
     InlineOperationResult | OperationResultRef,
     Field(discriminator="transport"),
@@ -434,7 +443,10 @@ class OperationView(Contract):
             "forward",
             "forward_backward",
         }:
-            validate_forward_operation_result(self.result)
+            if self.result.get("transport") == "released":
+                ReleasedOperationResult.model_validate(self.result)
+            else:
+                validate_forward_operation_result(self.result)
         return self
 
 
