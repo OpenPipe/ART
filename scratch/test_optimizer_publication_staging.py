@@ -228,6 +228,7 @@ def _state(
         installed_optimizer=desired.optimizer if installed else None,
         registration_complete=True,
         lora_export_plan="export-plan",
+        optimizer_export_plan="optimizer-export-plan",
     )
 
 
