@@ -395,15 +395,18 @@ def _dtype_from_name(name: str) -> torch.dtype:
     return dtype
 
 
-def _all_gather_records(value: Any, world_size: int, group: Any | None) -> list[Any]:
-    gathered = [None] * world_size
+def _all_gather_records(
+    value: BaseModel, world_size: int, group: Any | None
+) -> list[Any]:
+    gathered: list[str | None] = [None] * world_size
+    payload = value.model_dump_json()
     if world_size == 1:
-        gathered[0] = value
+        gathered[0] = payload
     else:
-        torch.distributed.all_gather_object(gathered, value, group=group)  # type: ignore[possibly-missing-attribute]
+        torch.distributed.all_gather_object(gathered, payload, group=group)  # type: ignore[possibly-missing-attribute]
     if any(record is None for record in gathered):
         raise RuntimeError("rank-distributed LoRA metadata gather omitted a rank")
-    return gathered
+    return [type(value).model_validate_json(cast(str, record)) for record in gathered]
 
 
 def _collect_prepare_records(

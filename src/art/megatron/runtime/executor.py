@@ -1229,6 +1229,8 @@ def _rank_local_optimizer_work(
         planes: list[tuple[str, torch.Tensor]] = [("master", master)]
         scalars: list[dict[str, Any]] = []
         for name, value in sorted(state.items()):
+            if not isinstance(name, str):
+                raise RuntimeError("optimizer state names must be strings")
             if not isinstance(value, torch.Tensor):
                 if not isinstance(value, (bool, int, float)):
                     raise RuntimeError(
@@ -1455,12 +1457,13 @@ class MCoreRunSlotExecutor:
         if registration.initial_optimizer_state_path is not None:
             assert registration.initial_optimizer_generation_id is not None
             loaded_optimizer = load_trainer_rank_optimizer_state(
-                self.runtime,
                 optimizer_state_path=registration.initial_optimizer_state_path,
                 adapter_path=registration.adapter.identity,
                 adapter_step=registration.adapter.step,
                 optimizer_generation_id=registration.initial_optimizer_generation_id,
                 layout=self.optimizer_layout(checkpoint),
+                sites=checkpoint.sites,
+                expected_keys=tuple(checkpoint.expected_keys),
             )
             optimizer = (
                 self._slot_trainer.prepare_checkpoint_slot_optimizer_for_residency(
@@ -2294,12 +2297,13 @@ class MCoreRunSlotExecutor:
         if job.optimizer_state_path is not None:
             assert job.optimizer_generation_id is not None
             loaded = load_trainer_rank_optimizer_state(
-                self.runtime,
                 optimizer_state_path=job.optimizer_state_path,
                 adapter_path=job.adapter_path,
                 adapter_step=job.adapter_step,
                 optimizer_generation_id=job.optimizer_generation_id,
                 layout=self.optimizer_layout(checkpoint),
+                sites=checkpoint.sites,
+                expected_keys=tuple(checkpoint.expected_keys),
             )
             optimizer = (
                 self._slot_trainer.prepare_checkpoint_slot_optimizer_for_residency(
@@ -4167,17 +4171,44 @@ class _GenerationPublisher:
             runtime_sha256 = None
             topology = None
             if optimizer is not None:
-                from art.megatron.optimizer_archive import prepare_optimizer_archive
+                resident = entry.resident_optimizer
+                if resident is None:
+                    from art.megatron.optimizer_archive import (
+                        prepare_optimizer_archive,
+                    )
 
-                optimizer_archive = prepare_optimizer_archive(optimizer.state_dict)
-                optimizer_identity = optimizer_archive.identity()
-                shard = OptimizerShard(
-                    rank=optimizer.rank,
-                    size_bytes=optimizer_identity.size_bytes,
-                    layout_sha256=optimizer.layout_sha256,
-                    sha256=optimizer_identity.sha256,
-                    serialization="art_safetensors_v1",
-                )
+                    optimizer_archive = prepare_optimizer_archive(optimizer.state_dict)
+                    optimizer_identity = optimizer_archive.identity()
+                    shard = OptimizerShard(
+                        rank=optimizer.rank,
+                        size_bytes=optimizer_identity.size_bytes,
+                        layout_sha256=optimizer.layout_sha256,
+                        sha256=optimizer_identity.sha256,
+                        serialization="art_safetensors_v1",
+                    )
+                else:
+                    if resident.export_plan is None:
+                        raise RuntimeError(
+                            "resident optimizer has no logical export plan"
+                        )
+                    from art.megatron.portable_optimizer_archive import (
+                        prepare_portable_optimizer_archive,
+                    )
+
+                    optimizer_archive = prepare_portable_optimizer_archive(
+                        optimizer.state_dict,
+                        resident.export_plan,
+                        group=self.runtime.publication_exchange_group,
+                    )
+                    optimizer_identity = optimizer_archive.identity()
+                    shard = OptimizerShard(
+                        rank=optimizer.rank,
+                        size_bytes=optimizer_identity.size_bytes,
+                        layout_sha256=optimizer.layout_sha256,
+                        sha256=optimizer_identity.sha256,
+                        serialization="art_logical_safetensors_v1",
+                        logical_keys=optimizer_archive.metadata.logical_keys,
+                    )
                 runtime_sha256 = optimizer.runtime_sha256
                 topology = optimizer.topology
             rank_plan = SnapshotRankWritePlan(
@@ -5137,6 +5168,7 @@ class _GenerationPublisher:
             adapter_publication_transaction,
             publish_adapter_checkpoint,
             write_optimizer_snapshot_shard,
+            write_portable_optimizer_snapshot_shard,
         )
 
         rank = int(self.runtime.rank)
@@ -5224,7 +5256,15 @@ class _GenerationPublisher:
             identity = prepared.optimizer_identity
             if archive is None or identity is None:
                 raise RuntimeError("authorized optimizer has no prepared archive")
-            shard = write_optimizer_snapshot_shard(
+            planned = prepared.plan.optimizer_shard
+            if planned is None:
+                raise RuntimeError("authorized optimizer has no shard plan")
+            writer = (
+                write_portable_optimizer_snapshot_shard
+                if planned.serialization == "art_logical_safetensors_v1"
+                else write_optimizer_snapshot_shard
+            )
+            shard = writer(
                 optimizer,
                 optimizer_state_path=prepared.optimizer_state_path,
                 prepared=archive,

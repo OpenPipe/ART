@@ -116,6 +116,8 @@ class LocalLoraExportPlan(BaseModel):
         sources: Sequence[torch.Tensor],
         *,
         owner_rank: int,
+        key_prefix: str = "",
+        dtype_override: torch.dtype | None = None,
     ) -> tuple[
         dict[str, torch.Tensor],
         tuple[LoraShardMeta, ...],
@@ -130,20 +132,30 @@ class LocalLoraExportPlan(BaseModel):
         packed_metadata: list[PackedExpertShardMeta] = []
         for entry in self.entries:
             source = sources[entry.source_index]
-            dtype = _dtype_from_name(entry.target_dtype_name)
+            key = f"{key_prefix}{entry.key}"
+            dtype = (
+                dtype_override
+                if dtype_override is not None
+                else _dtype_from_name(entry.target_dtype_name)
+            )
+            dtype_name = _dtype_name(dtype)
             if entry.kind == "regular":
                 value = (
-                    source[entry.expert_index].T
-                    if entry.expert_index is not None
-                    else source.T
-                ).to(dtype=dtype).contiguous()
-                regular[entry.key] = value
+                    (
+                        source[entry.expert_index].T
+                        if entry.expert_index is not None
+                        else source.T
+                    )
+                    .to(dtype=dtype)
+                    .contiguous()
+                )
+                regular[key] = value
                 regular_metadata.append(
                     LoraShardMeta(
-                        key=entry.key,
+                        key=key,
                         owner_rank=owner_rank,
                         shape=tuple(value.shape),
-                        dtype_name=entry.target_dtype_name,
+                        dtype_name=dtype_name,
                         manifest=entry.manifest,
                         block=_block_for_key(entry.key),
                     )
@@ -160,13 +172,13 @@ class LocalLoraExportPlan(BaseModel):
                 .to(dtype=dtype)
                 .contiguous()
             )
-            packed[entry.key] = value
+            packed[key] = value
             packed_metadata.append(
                 PackedExpertShardMeta(
-                    key=entry.key,
+                    key=key,
                     owner_rank=owner_rank,
                     shape=tuple(value.shape),
-                    dtype_name=entry.target_dtype_name,
+                    dtype_name=dtype_name,
                     manifest=entry.manifest,
                     expert_start=entry.expert_start,
                     expert_count=entry.expert_count,

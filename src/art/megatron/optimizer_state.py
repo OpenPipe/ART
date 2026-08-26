@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Sequence
 from contextlib import ExitStack, asynccontextmanager, contextmanager
 import copy
 import fcntl
@@ -21,6 +22,9 @@ from art.utils.safetensors import FileIdentity
 
 if TYPE_CHECKING:
     from art.megatron.optimizer_archive import PreparedOptimizerArchive
+    from art.megatron.portable_optimizer_archive import (
+        PreparedPortableOptimizerArchive,
+    )
 
 from ..utils.get_model_step import get_step_from_dir
 from ..utils.output_dirs import get_step_checkpoint_dir
@@ -75,7 +79,11 @@ _STEP_OPTIMIZER_CONFIG_FIELDS = {
     "lr",
     "weight_decay",
 }
-OptimizerShardSerialization = Literal["torch_pickle_v1", "art_safetensors_v1"]
+OptimizerShardSerialization = Literal[
+    "torch_pickle_v1",
+    "art_safetensors_v1",
+    "art_logical_safetensors_v1",
+]
 
 
 class _OptimizerRecord(BaseModel):
@@ -143,6 +151,16 @@ class OptimizerShard(_OptimizerRecord):
     layout_sha256: str = Field(pattern=_SHA256_PATTERN)
     sha256: str | None = Field(default=None, pattern=_SHA256_PATTERN)
     serialization: OptimizerShardSerialization = "torch_pickle_v1"
+    logical_keys: tuple[str, ...] = ()
+
+    @model_validator(mode="after")
+    def _validate_logical_keys(self) -> "OptimizerShard":
+        portable = self.serialization == "art_logical_safetensors_v1"
+        if not portable and self.logical_keys:
+            raise ValueError("only logical optimizer shards may declare logical keys")
+        if self.logical_keys != tuple(sorted(set(self.logical_keys))):
+            raise ValueError("optimizer shard logical keys must be sorted and unique")
+        return self
 
 
 class _PairedOptimizerRecord(_OptimizerRecord):
@@ -394,8 +412,7 @@ def _adapter_checkpoint_files(path: str | Path) -> tuple[Path, tuple[Path, ...]]
         _ADAPTER_FILES
         if format == "canonical"
         else tuple(
-            file.name
-            for file in read_rank_sharded_lora_checkpoint(adapter_path).files
+            file.name for file in read_rank_sharded_lora_checkpoint(adapter_path).files
         )
     )
     files = tuple(adapter_path / name for name in names)
@@ -408,9 +425,7 @@ def _adapter_checkpoint_files(path: str | Path) -> tuple[Path, tuple[Path, ...]]
 def _adapter_file_records(path: str | Path) -> tuple[CheckpointFile, ...]:
     adapter_path, files = _adapter_checkpoint_files(path)
     if detect_adapter_checkpoint_format(adapter_path) == "rank_sharded":
-        return read_rank_sharded_lora_checkpoint(
-            adapter_path, verify_files=True
-        ).files
+        return read_rank_sharded_lora_checkpoint(adapter_path, verify_files=True).files
     return tuple(
         CheckpointFile(
             name=file.relative_to(adapter_path).as_posix(),
@@ -432,9 +447,7 @@ def validate_adapter_checkpoint(
     if adapter_checkpoint_file_format(adapter.files) != physical_format:
         raise RuntimeError("adapter manifest names another physical format")
     if physical_format == "rank_sharded":
-        checkpoint = read_rank_sharded_lora_checkpoint(
-            root, verify_files=verify_files
-        )
+        checkpoint = read_rank_sharded_lora_checkpoint(root, verify_files=verify_files)
         manifest = checkpoint.manifest
         if (
             manifest.training_session_id,
@@ -456,7 +469,9 @@ def validate_adapter_checkpoint(
         payload.stat().st_size != record.size_bytes
         for payload, record in zip(payloads, adapter.files, strict=True)
     ):
-        raise RuntimeError("canonical adapter physical coverage is incomplete or changed")
+        raise RuntimeError(
+            "canonical adapter physical coverage is incomplete or changed"
+        )
     if verify_files and any(
         record.sha256 is not None and _file_sha256(payload) != record.sha256
         for payload, record in zip(payloads, adapter.files, strict=True)
@@ -550,7 +565,9 @@ def publish_adapter_checkpoint(
     for path in paths:
         with path.open("rb") as adapter_file:
             os.fsync(adapter_file.fileno())
-    for parent in sorted({path.parent for path in paths}, key=lambda path: len(path.parts)):
+    for parent in sorted(
+        {path.parent for path in paths}, key=lambda path: len(path.parts)
+    ):
         if parent != staging:
             _fsync_directory(parent)
     _fsync_directory(staging)
@@ -2167,6 +2184,41 @@ def write_optimizer_snapshot_shard(
     )
 
 
+def write_portable_optimizer_snapshot_shard(
+    snapshot: OptimizerStateSnapshot,
+    *,
+    optimizer_state_path: str,
+    prepared: PreparedPortableOptimizerArchive,
+    identity: FileIdentity,
+) -> OptimizerShard:
+    """Write one source-owned logical shard for topology-neutral restoration."""
+    from art.megatron.portable_optimizer_archive import (
+        write_portable_optimizer_archive,
+    )
+
+    pending = optimizer_pending_generation_path(
+        optimizer_state_path, snapshot.generation_id
+    )
+    shard_path = optimizer_shard_path(
+        pending,
+        rank=snapshot.rank,
+        world_size=snapshot.world_size,
+        serialization="art_logical_safetensors_v1",
+    )
+    pending.mkdir(parents=True, exist_ok=True)
+    written = write_portable_optimizer_archive(prepared, shard_path, identity=identity)
+    if written != identity:
+        raise RuntimeError("portable optimizer archive identity changed after planning")
+    return OptimizerShard(
+        rank=snapshot.rank,
+        size_bytes=identity.size_bytes,
+        layout_sha256=snapshot.layout_sha256,
+        sha256=identity.sha256,
+        serialization="art_logical_safetensors_v1",
+        logical_keys=prepared.metadata.logical_keys,
+    )
+
+
 def _loaded_adapter(adapter_path: str, step: int) -> OptimizerAdapter:
     path = Path(adapter_path).absolute()
     canonical = _canonical_adapter_path(path, step)
@@ -2440,57 +2492,80 @@ def load_optimizer_state(
 
 
 def load_trainer_rank_optimizer_state(
-    runtime: Any,
     *,
     optimizer_state_path: str,
     adapter_path: str,
     adapter_step: int,
     optimizer_generation_id: str,
     layout: Any,
+    sites: Sequence[tuple[Any, Any]],
+    expected_keys: Sequence[str],
 ) -> Any:
-    """Load one topology-strict shard without entering the GPU process group."""
-    runtime_sha256 = _model_runtime_sha256(runtime)
-    layout_sha256 = _json_sha256(layout)
+    """Repartition one logical optimizer generation for this destination rank."""
     with optimizer_generation_lease(
         optimizer_state_path, optimizer_generation_id
     ) as pointer:
         adapter = _loaded_adapter(adapter_path, adapter_step)
-        _, manifest, shards = _validate_generation(
-            optimizer_state_path, pointer, runtime.world_size, runtime.rank
+        generation_path = optimizer_generation_path(
+            optimizer_state_path, pointer.generation
         )
-        if manifest.runtime_sha256 != runtime_sha256:
-            raise RuntimeError(
-                "Optimizer checkpoint model-runtime mismatch: "
-                f"saved={manifest.runtime_sha256}, current={runtime_sha256}"
-            )
-        if pointer.adapter != adapter:
+        manifest = _read_manifest(generation_path)
+        _validate_pointer_manifest(pointer, manifest)
+        shards = _validate_generation_files(generation_path, manifest, local_rank=None)
+        if pointer.adapter.model_copy(update={"identity": adapter.identity}) != adapter:
             raise RuntimeError(
                 "Optimizer checkpoint adapter mismatch: "
                 f"saved={pointer.adapter.model_dump()}, current={adapter.model_dump()}"
             )
-        _validate_adapter_publication(pointer.adapter, verify_files=True)
-        saved_layout = shards[runtime.rank].layout_sha256
-        if saved_layout != layout_sha256:
+        _validate_adapter_publication(adapter, verify_files=True)
+        if any(shard.serialization != "art_logical_safetensors_v1" for shard in shards):
             raise RuntimeError(
-                "Optimizer parameter ownership/layout mismatch: "
-                f"rank={runtime.rank}, saved={saved_layout}, current={layout_sha256}"
+                "TrainerRank optimizer checkpoints require logical safetensors shards"
             )
-
-        shard = resolve_optimizer_shard(
-            optimizer_state_path,
-            rank=runtime.rank,
-            world_size=runtime.world_size,
-            pointer=pointer,
+        from art.megatron.portable_optimizer_archive import (
+            portable_optimizer_logical_keys_for_sites,
+            read_portable_optimizer_archive,
+            reconstruct_portable_optimizer_components,
+            reconstruct_trainer_rank_optimizer_state,
         )
-        assert shard is not None
-        saved_shard = shards[runtime.rank]
-        if saved_shard.serialization != "art_safetensors_v1":
-            raise RuntimeError(
-                "TrainerRank optimizer checkpoints require art_safetensors_v1 shards"
-            )
-        from art.megatron.optimizer_archive import load_optimizer_archive
 
-        return load_optimizer_archive(shard)
+        required = portable_optimizer_logical_keys_for_sites(sites)
+        expected = set(expected_keys)
+        owners: dict[str, OptimizerShard] = {}
+        for shard in shards:
+            for key in shard.logical_keys:
+                if key in owners:
+                    raise RuntimeError(
+                        f"Optimizer logical key has multiple source owners: {key}"
+                    )
+                owners[key] = shard
+        if set(owners) != expected:
+            raise RuntimeError(
+                "Optimizer checkpoint logical keys differ from the destination: "
+                f"missing={sorted(expected.difference(owners))}, "
+                f"unexpected={sorted(set(owners).difference(expected))}"
+            )
+        if missing := set(required).difference(expected):
+            raise RuntimeError(
+                "Destination rank requires optimizer keys outside the prepared "
+                f"checkpoint: {sorted(missing)}"
+            )
+        archives = []
+        for shard in shards:
+            selected = set(shard.logical_keys).intersection(required)
+            if not selected:
+                continue
+            path = optimizer_shard_path(
+                generation_path,
+                rank=shard.rank,
+                world_size=manifest.topology.world_size,
+                serialization=shard.serialization,
+            )
+            archives.append(
+                read_portable_optimizer_archive(path, logical_keys=selected)
+            )
+        components = reconstruct_portable_optimizer_components(archives)
+        return reconstruct_trainer_rank_optimizer_state(components, sites, layout)
 
 
 def _allow_unpaired_resume() -> bool:

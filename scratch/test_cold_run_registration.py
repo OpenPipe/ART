@@ -90,7 +90,9 @@ class _SlotTrainer:
                     ).reshape(shape)
                 )
                 for shape in self.shapes
-            )
+            ),
+            sites=(),
+            expected_keys=frozenset(),
         )
         return self.checkpoint
 
@@ -318,7 +320,7 @@ def _executor(
     monkeypatch.setattr(
         MCoreRunSlotExecutor,
         "_build_prepared_lora_export_plan",
-        lambda _self, _checkpoint: "export-plan",
+        lambda _self, _checkpoint, **_kwargs: "export-plan",
     )
     return executor, slot, residency, publisher
 
@@ -653,10 +655,11 @@ def test_existing_install_setup_failure_keeps_previous_checkpoint(
         operation_id="load:replacement-generation",
         weights_key=replacement_key,
         optimizer_key=None,
-        checkpoint=replacement,
-        optimizer=None,
-        lora_export_plan="replacement-plan",
-        adapter_config=state.adapter_config,
+            checkpoint=replacement,
+            optimizer=None,
+            lora_export_plan="replacement-plan",
+            optimizer_export_plan="replacement-optimizer-plan",
+            adapter_config=state.adapter_config,
     )
     residency.register_l2_working_set(((replacement_key, prepared.weights),))
     state.desired = GenerationResidency(weights=replacement_key)
@@ -780,7 +783,7 @@ def test_exact_resume_uses_prepared_layout_and_is_published_exactly(
         "tensors": tuple(torch.zeros(shape, dtype=torch.float32) for shape in shapes)
     }
 
-    def load_optimizer(_runtime: Any, **kwargs: Any) -> Any:
+    def load_optimizer(**kwargs: Any) -> Any:
         loaded.update(kwargs)
         return archive
 
