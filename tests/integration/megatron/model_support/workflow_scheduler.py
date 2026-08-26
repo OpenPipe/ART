@@ -1261,7 +1261,10 @@ def run_prepared_workflows(
                 result = ValidationStageResult(
                     name=operation.stage,
                     passed=False,
-                    metrics={"error": detail},
+                    metrics={
+                        "error": detail,
+                        "workflow_stage_duration_s": worker_wall_s,
+                    },
                 )
             result.metrics["workflow_session_id"] = session.id
             result.metrics["workflow_gpu_ids"] = [
