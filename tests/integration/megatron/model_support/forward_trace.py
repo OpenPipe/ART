@@ -559,6 +559,8 @@ class ForwardTraceCapture:
         etp_world_size = _safe_ps_stat("get_expert_tensor_parallel_world_size", 1)
         if ".mlp.experts.linear_fc1" in name and ".lora" not in name:
             if etp_world_size > 1:
+                if bool(getattr(module, "non_gated", False)):
+                    return {"op": "concat", "dim": -1}
                 return {
                     "op": "concat",
                     "dim": -1,
