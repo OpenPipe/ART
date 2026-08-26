@@ -1,18 +1,42 @@
 ---
-import Search from "@astrojs/starlight/components/Search.astro";
-import ThemeSelect from "@astrojs/starlight/components/ThemeSelect.astro";
+import Search from "./Search.astro";
+import ThemeToggle from "./ThemeToggle.astro";
 ---
 
-<div class="art-header">
+<div class="site-header-inner">
   <a class="art-header-title" href="/" aria-label="ART home page">
     <img class="art-logo-light" src="/images/site-assets/logo/light.svg" alt="OpenPipe" />
     <img class="art-logo-dark" src="/images/site-assets/logo/dark.svg" alt="OpenPipe" />
   </a>
-  <div class="art-header-search print:hidden"><Search /></div>
-  <nav class="art-header-links sl-hidden lg:sl-flex print:hidden" aria-label="Project links">
+  <div class="art-header-search print-hidden"><Search /></div>
+  <nav class="art-header-links print-hidden" aria-label="Project links">
     <a href="https://discord.gg/zbBHRUpwf4">Discord</a>
     <a href="https://openpipe.ai/blog">Blog</a>
     <a class="art-github-button" href="https://github.com/openpipe/ART">GitHub <span aria-hidden="true">›</span></a>
   </nav>
-  <div class="art-theme print:hidden"><ThemeSelect /></div>
+  <ThemeToggle />
+  <button class="mobile-menu-button" type="button" aria-expanded="false" aria-controls="docs-sidebar" aria-label="Open navigation">
+    <svg class="menu-open-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M4 12h16M4 17h16" /></svg>
+    <svg class="menu-close-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18" /></svg>
+  </button>
 </div>
+
+<script>
+  const button = document.querySelector<HTMLButtonElement>(".mobile-menu-button");
+  const sidebar = document.querySelector<HTMLElement>("#docs-sidebar");
+
+  function setMenu(open: boolean) {
+    button?.setAttribute("aria-expanded", String(open));
+    button?.setAttribute("aria-label", open ? "Close navigation" : "Open navigation");
+    document.documentElement.toggleAttribute("data-menu-open", open);
+  }
+
+  button?.addEventListener("click", () => setMenu(button.getAttribute("aria-expanded") !== "true"));
+  sidebar?.addEventListener("click", (event) => {
+    if ((event.target as Element).closest("a")) setMenu(false);
+  });
+  document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") setMenu(false);
+  });
+  matchMedia("(min-width: 64rem)").addEventListener("change", () => setMenu(false));
+</script>

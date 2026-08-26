@@ -1,0 +1,17 @@
+---
+import Header from "../components/Header.astro";
+import "@fontsource-variable/inter";
+import "../styles/custom.css";
+---
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width" />
+    <title>Page not found - ART</title>
+    <script is:inline>
+      document.documentElement.dataset.theme = localStorage.getItem("art-theme") || (matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
+    </script>
+  </head>
+  <body><header class="site-header"><Header /></header><main class="not-found"><p class="page-eyebrow">404</p><h1>Page not found</h1><p>The page you requested doesn’t exist.</p><a href="/getting-started/about/">Return to the ART docs</a></main></body>
+</html>

@@ -1,0 +1,16 @@
+---
+import { hrefFor, type NavigationItem } from "../navigation";
+
+interface Props {
+  previous?: NavigationItem;
+  next?: NavigationItem;
+}
+const { previous, next } = Astro.props;
+---
+
+{(previous || next) && (
+  <nav class="pagination-links" aria-label="Documentation pages">
+    {previous && <a rel="prev" href={hrefFor(previous.slug)}>{previous.label}</a>}
+    {next && <a rel="next" href={hrefFor(next.slug)}>{next.label}</a>}
+  </nav>
+)}

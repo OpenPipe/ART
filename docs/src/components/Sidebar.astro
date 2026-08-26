@@ -1,42 +1,23 @@
 ---
-import MobileMenuFooter from "@astrojs/starlight/components/MobileMenuFooter.astro";
+import { hrefFor, navigation } from "../navigation";
 
-const { sidebar } = Astro.locals.starlightRoute;
-
-const icons: Record<string, string> = {
-  "/getting-started/about/": "house",
-  "/getting-started/quick-start/": "forward",
-  "/getting-started/installation-setup/": "gear",
-  "/getting-started/multi-node/": "network-wired",
-  "/getting-started/notebooks/": "book",
-  "/getting-started/faq/": "block-question",
-  "/fundamentals/training-loop/": "recycle",
-  "/fundamentals/art-client/": "laptop-code",
-  "/fundamentals/art-backend/": "server",
-  "/fundamentals/ruler/": "ruler",
-  "/fundamentals/sft-training/": "graduation-cap",
-  "/features/tracking-metrics/": "chart-line",
-  "/tutorials/summarizer/": "list",
-  "/tutorials/open-deep-research/": "magnifying-glass",
-  "/resources/models/": "robot",
-  "/resources/glossary/": "circle-info",
-};
+interface Props { currentSlug: string }
+const { currentSlug } = Astro.props;
 
 const iconUrl = (name: string) => `url("https://d3gk2c5xim1je2.cloudfront.net/fontawesome/v7.2.0/regular/${name}.svg")`;
 ---
 
 <ul class="art-sidebar-list">
-  {sidebar.map((entry) => (
-    entry.type === "group" ? (
+  {navigation.map((group) => (
       <li class="art-sidebar-section">
-        <div class="art-sidebar-heading">{entry.label}</div>
+        <div class="art-sidebar-heading">{group.label}</div>
         <ul>
-          {entry.entries.map((item) => item.type === "link" && (
+          {group.items.map((item) => (
             <li>
-              <a href={item.href} aria-current={item.isCurrent ? "page" : undefined}>
-                {icons[item.href] && <span
+              <a href={hrefFor(item.slug)} aria-current={item.slug === currentSlug ? "page" : undefined}>
+                {item.icon && <span
                   class="art-icon art-sidebar-icon"
-                  style={`--art-icon: ${iconUrl(icons[item.href])}`}
+                  style={`--art-icon: ${iconUrl(item.icon)}`}
                 ></span>}
                 <span>{item.label}</span>
               </a>
@@ -44,16 +25,10 @@ const iconUrl = (name: string) => `url("https://d3gk2c5xim1je2.cloudfront.net/fo
           ))}
         </ul>
       </li>
-    ) : (
-      <li class="art-sidebar-section">
-        <a href={entry.href} aria-current={entry.isCurrent ? "page" : undefined}>
-          <span>{entry.label}</span>
-        </a>
-      </li>
-    )
   ))}
 </ul>
 
-<div class="md:sl-hidden">
-  <MobileMenuFooter />
+<div class="art-mobile-menu-footer">
+  <a href="https://discord.gg/zbBHRUpwf4">Discord</a>
+  <a href="https://github.com/openpipe/ART">GitHub</a>
 </div>

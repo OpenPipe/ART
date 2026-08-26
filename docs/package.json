@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "astro dev --port 3001",
-    "build": "astro check && astro build",
+    "build": "astro check && astro build && pagefind --site dist",
     "deploy": "pnpm build && wrangler deploy",
     "preview": "astro preview --port 3001",
     "preview:cloudflare": "pnpm build && wrangler dev",
@@ -13,21 +13,16 @@
   },
   "dependencies": {
     "@astrojs/check": "^0.9.6",
-    "@astrojs/starlight": "^0.41.9",
+    "@astrojs/mdx": "^7.0.8",
+    "@astrojs/sitemap": "^3.7.3",
     "@fontsource-variable/inter": "^5.3.0",
     "astro": "^7.2.7",
+    "astro-expressive-code": "^0.44.1",
+    "pagefind": "^1.5.2",
     "sharp": "^0.34.4",
-    "starlight-llms-txt": "^0.11.0",
     "typescript": "^5.9.3"
   },
   "devDependencies": {
     "wrangler": "^4.126.0"
-  },
-  "pnpm": {
-    "onlyBuiltDependencies": [
-      "esbuild",
-      "sharp",
-      "workerd"
-    ]
   }
 }

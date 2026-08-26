@@ -1,959 +1,367 @@
-/* =========================================================================
-   ART docs theme
-   Everything is driven by the tokens below. To retheme, change the tokens —
-   the rules underneath should not need to be touched.
-   ========================================================================= */
-
 :root {
-  /* Brand */
-  --art-accent: #ff5733;
-  --art-accent-hover: #f34825;
-  --art-accent-contrast: #fff;
-
-  /* Layout */
-  --sl-content-width: 45rem;
-  --sl-sidebar-width: 18rem;
-  --sl-nav-height: 4rem;
-  --sl-nav-pad-x: 3rem;
-  --sl-content-pad-x: 2.5rem;
-  --art-shell-width: 92rem;
-  --art-shell-pad-x: 2rem;
-  --art-right-rail-width: 20rem;
-  --art-toc-width: 16.5rem;
-
-  /* Shape */
-  --art-radius: 0.75rem;
-  --art-radius-lg: 1rem;
-
-  /* Type */
-  --sl-text-base: 1rem;
-  --sl-text-body: 1rem;
-  --sl-line-height: 1.75;
-  --__sl-font: "Inter Variable", Inter, ui-sans-serif, -apple-system,
-    BlinkMacSystemFont, "Segoe UI", sans-serif;
-
-  /* Palette (light) — the warm neutral ramp Mintlify's mint theme uses, taken
-     from the reference docs: body text #464140, muted #777271, hairline
-     #f5f0ef. Starlight's scale runs from highest-contrast (`white`) to page
-     background (`black`), so in light mode the names are inverted on purpose. */
-  --sl-color-white: #1e1918;
-  --sl-color-gray-1: #2d2726;
-  --sl-color-gray-2: #464140;
-  --sl-color-gray-3: #777271;
-  --sl-color-gray-4: #a6a1a0;
-  --sl-color-gray-5: #e7e4e3;
-  --sl-color-gray-6: #f5f0ef;
-  --sl-color-gray-7: #faf7f7;
-  --sl-color-black: #fff;
-
-  --sl-color-accent-low: #ffeeea;
-  --sl-color-accent: var(--art-accent);
-  --sl-color-accent-high: #b72e17;
-
-  --art-code-bg: var(--sl-color-bg);
-  --art-sidebar-icon: var(--sl-color-gray-4);
+  color-scheme: light;
+  --color-accent: #ff5733;
+  --color-accent-hover: #f34825;
+  --color-accent-soft: #ffeeea;
+  --color-text: #1e1918;
+  --color-body: #464140;
+  --color-muted: #777271;
+  --color-faint: #a6a1a0;
+  --color-border: #e7e4e3;
+  --color-hairline: #f5f0ef;
+  --color-subtle: #faf7f7;
+  --color-surface: #fff;
+  --color-code: #fff;
+  --radius: 0.75rem;
+  --radius-lg: 1rem;
+  --header-height: 4rem;
+  --shell-width: 92rem;
+  --shell-padding: 2rem;
+  --sidebar-width: 18rem;
+  --article-rail-width: 50rem;
+  --toc-width: 20rem;
+  --content-width: 45rem;
+  --content-padding: 2.5rem;
+  font-family: "Inter Variable", Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  font-synthesis: none;
 }
 
 :root[data-theme="dark"] {
-  --sl-color-white: #fff;
-  --sl-color-gray-1: #e6e1e0;
-  --sl-color-gray-2: #a6a1a0;
-  --sl-color-gray-3: #777271;
-  --sl-color-gray-4: #55504f;
-  --sl-color-gray-5: #2d2726;
-  --sl-color-gray-6: #1f1b1a;
-  --sl-color-gray-7: #171413;
-  --sl-color-black: #0b0c0e;
-
-  --sl-color-accent-low: #231412;
-  --sl-color-accent: #ff7357;
-  --sl-color-accent-high: #ffd7cf;
-
-  --art-code-bg: #0b0c0e;
-  --art-sidebar-icon: var(--sl-color-gray-3);
+  color-scheme: dark;
+  --color-accent: #ff7357;
+  --color-accent-hover: #ff876e;
+  --color-accent-soft: #231412;
+  --color-text: #fff;
+  --color-body: #e6e1e0;
+  --color-muted: #a6a1a0;
+  --color-faint: #777271;
+  --color-border: #2d2726;
+  --color-hairline: #1f1b1a;
+  --color-subtle: #171413;
+  --color-surface: #0b0c0e;
+  --color-code: #0b0c0e;
 }
 
-/* =========================================================================
-   Header
-   ========================================================================= */
+*, *::before, *::after { box-sizing: border-box; }
 
-header.header {
-  background: var(--sl-color-bg);
-  border-bottom: 1px solid var(--sl-color-hairline-light);
-  box-shadow: none;
+html { scroll-padding-top: calc(var(--header-height) + 1.5rem); }
+
+body {
+  margin: 0;
+  color: var(--color-body);
+  background: var(--color-surface);
+  font-size: 1rem;
+  line-height: 1.75;
+  -webkit-font-smoothing: antialiased;
 }
 
-.art-header {
+button, input { font: inherit; }
+img, svg { max-width: 100%; }
+
+.skip-link {
+  position: fixed;
+  z-index: 100;
+  top: 0.5rem;
+  left: 0.5rem;
+  padding: 0.5rem 0.75rem;
+  color: white;
+  background: var(--color-accent);
+  border-radius: var(--radius);
+  transform: translateY(-150%);
+}
+.skip-link:focus { transform: none; }
+
+/* Header */
+.site-header {
+  position: fixed;
+  z-index: 40;
+  inset: 0 0 auto;
+  height: var(--header-height);
+  background: var(--color-surface);
+  border-bottom: 1px solid var(--color-hairline);
+}
+
+.site-header-inner {
   position: relative;
   display: flex;
   align-items: center;
-  gap: var(--sl-content-pad-x);
+  gap: var(--content-padding);
+  width: 100%;
+  max-width: var(--shell-width);
   height: 100%;
+  margin-inline: auto;
+  padding-inline: var(--shell-padding);
 }
 
-/* Sizing the logo cell to the sidebar lines the logo up with the sidebar
-   links. On wide screens the search is centred on the header independently
-   of it (see below), so this only sets the logo's own column. */
 .art-header-title {
   flex: 0 0 auto;
-  width: calc(
-    var(--sl-sidebar-width) - var(--sl-nav-pad-x) - var(--sl-content-pad-x)
-  );
+  width: calc(var(--sidebar-width) - var(--content-padding));
 }
+.art-header-title img { display: block; width: auto; max-width: none; max-height: 1.75rem; }
+.art-logo-dark, :root[data-theme="dark"] .art-logo-light { display: none !important; }
+:root[data-theme="dark"] .art-logo-dark { display: block !important; }
 
-.art-header-title img {
-  display: block;
-  width: auto;
-  max-width: none;
-  max-height: 1.75rem;
-}
-
-.art-header-title .art-logo-dark,
-:root[data-theme="dark"] .art-header-title .art-logo-light {
-  display: none;
-}
-
-:root[data-theme="dark"] .art-header-title .art-logo-dark {
-  display: block;
-}
-
-.art-header-search {
-  flex: 0 1 19rem;
-  min-width: 0;
-}
-
-/* Centre the search on the header rather than letting the logo and links
-   decide where it lands. Taking it out of flow is what keeps it centred on
-   the page, since the two sides aren't the same width. Below this breakpoint
-   the header is too tight for that, so it stays in flow. */
-@media (min-width: 50rem) {
-  .art-header-search {
-    position: absolute;
-    inset-inline-start: 50%;
-    top: 50%;
-    width: 19rem;
-    transform: translate(-50%, -50%);
-  }
-}
-
-.art-header-links {
+.art-header-search { flex: 0 1 19rem; min-width: 0; }
+.search-button {
+  display: flex;
   align-items: center;
-  gap: 1.5rem;
-  margin-inline-start: auto;
-  white-space: nowrap;
+  gap: 0.625rem;
+  width: 100%;
+  height: 2.25rem;
+  padding: 0 0.75rem;
+  color: var(--color-muted);
+  background: var(--color-subtle);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+  cursor: pointer;
 }
+.search-button:hover { color: var(--color-text); border-color: var(--color-faint); }
+.search-button svg, .search-input-row > svg { width: 1rem; fill: none; stroke: currentColor; stroke-width: 2; }
+.search-button span { font-size: 0.875rem; }
+.search-button kbd { margin-left: auto; font-size: 0.6875rem; }
 
-.art-header-links a {
-  color: var(--sl-color-gray-2);
-  font-size: 0.875rem;
-  font-weight: 500;
-  text-decoration: none;
-}
-
-.art-header-links a:hover {
-  color: var(--sl-color-white);
-}
-
+.art-header-links { display: none; align-items: center; gap: 1.5rem; margin-left: auto; white-space: nowrap; }
+.art-header-links a { color: var(--color-body); font-size: 0.875rem; font-weight: 500; text-decoration: none; }
+.art-header-links a:hover { color: var(--color-text); }
 .art-header-links .art-github-button {
   display: inline-flex;
   align-items: center;
   gap: 0.3rem;
   padding: 0.5rem 0.75rem;
-  color: var(--art-accent-contrast);
-  background: var(--art-accent);
-  border-radius: var(--art-radius);
+  color: white;
+  background: var(--color-accent);
+  border-radius: var(--radius);
 }
+.art-header-links .art-github-button:hover { color: white; background: var(--color-accent-hover); }
 
-.art-header-links .art-github-button:hover {
-  color: var(--art-accent-contrast);
-  background: var(--art-accent-hover);
-}
-
-/* Search box: pill-shaped, matching the header buttons. */
-site-search button[data-open-modal] {
-  width: 100%;
-  max-width: none;
-  height: 2.25rem;
-  border-radius: var(--art-radius);
-}
-
-/* Starlight ships "Search" as the label; Mintlify uses "Search...". */
-site-search button[data-open-modal] > span {
-  font-size: 0;
-}
-
-site-search button[data-open-modal] > span::after {
-  content: "Search...";
-  font-size: 0.875rem;
-}
-
-/* Theme toggle: an icon-only button. Starlight's filled laptop/sun/moon set
-   is swapped for a single line icon that reflects the active theme — a sun in
-   light mode, a moon in dark — over an invisible <select> that still offers
-   the full auto/light/dark menu on click. */
-.art-theme {
-  flex: 0 0 auto;
-  --art-theme-icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Ccircle cx='12' cy='12' r='4'/%3E%3Cpath d='M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41'/%3E%3C/svg%3E");
-}
-
-:root[data-theme="dark"] .art-theme {
-  --art-theme-icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z'/%3E%3C/svg%3E");
-}
-
-.art-theme label {
-  position: relative;
+.art-theme, .mobile-menu-button {
   display: grid;
+  flex: none;
   place-items: center;
-  width: 2rem;
-  height: 2rem;
-  padding: 0;
+  width: 2.25rem;
+  height: 2.25rem;
+  padding: 0.5rem;
+  color: var(--color-muted);
+  background: transparent;
   border: 0;
-  border-radius: var(--art-radius);
-  color: var(--sl-color-gray-3);
-}
-
-.art-theme label:hover {
-  color: var(--sl-color-white);
-  background: var(--sl-color-gray-6);
-}
-
-.art-theme label::before {
-  content: "";
-  width: 1.125rem;
-  height: 1.125rem;
-  background: currentColor;
-  mask: var(--art-theme-icon) center / contain no-repeat;
-}
-
-/* Starlight's own icon and dropdown caret are replaced by ::before above. */
-.art-theme .label-icon,
-.art-theme .caret {
-  display: none;
-}
-
-/* The native select covers the button for clicks, but stays invisible. */
-.art-theme select {
-  position: absolute;
-  inset: 0;
-  width: 100%;
-  height: 100%;
-  opacity: 0;
+  border-radius: var(--radius);
   cursor: pointer;
 }
+.art-theme:hover, .mobile-menu-button:hover { color: var(--color-text); background: var(--color-hairline); }
+.art-theme svg, .mobile-menu-button svg { width: 1.125rem; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+.theme-moon, :root[data-theme="dark"] .theme-sun { display: none; }
+:root[data-theme="dark"] .theme-moon { display: block; }
+.menu-close-icon, .mobile-menu-button[aria-expanded="true"] .menu-open-icon { display: none; }
+.mobile-menu-button[aria-expanded="true"] .menu-close-icon { display: block; }
 
-/* =========================================================================
-   Left sidebar
-   ========================================================================= */
-
-.sidebar-pane {
-  border-inline-end: 0;
-}
-
-.sidebar-content {
-  padding-top: 2rem;
-}
-
-.art-sidebar-list,
-.art-sidebar-list ul {
-  margin: 0;
+/* Search */
+.search-dialog {
+  width: min(42rem, calc(100vw - 2rem));
+  max-height: min(42rem, calc(100vh - 4rem));
   padding: 0;
-  list-style: none;
-}
-
-.art-sidebar-list {
-  padding-inline: 1rem;
-}
-
-.art-sidebar-section + .art-sidebar-section {
-  margin-top: 2rem;
-}
-
-.art-sidebar-heading {
-  margin-bottom: 0.625rem;
-  padding-inline: 1rem;
-  color: var(--sl-color-white);
-  font-size: 0.875rem;
-  line-height: 1.5rem;
-  font-weight: 600;
-}
-
-.art-sidebar-list a {
-  display: flex;
-  align-items: center;
-  gap: 0.75rem;
-  padding: 0.375rem 1rem;
-  border-radius: var(--art-radius);
-  color: var(--sl-color-gray-2);
-  font-size: 0.875rem;
-  line-height: 1.5rem;
-  text-decoration: none;
-}
-
-.art-sidebar-list a:hover,
-.art-sidebar-list a:focus-visible {
-  color: var(--sl-color-white);
-  background: var(--sl-color-gray-6);
-}
-
-.art-sidebar-list a[aria-current="page"] {
-  color: var(--art-accent);
-  background: var(--sl-color-accent-low);
-  font-weight: 600;
-}
-
-/* =========================================================================
-   Icons
-   Font Awesome SVGs are masked so they inherit `color`. Any element with an
-   `--art-icon` custom property gets one.
-   ========================================================================= */
-
-.art-icon {
-  display: inline-block;
-  flex: none;
-  background: currentColor;
-  mask: var(--art-icon) center / contain no-repeat;
-}
-
-/* The icon sits a couple of steps dimmer than its label, so it reads as a
-   marker rather than competing with the text. It goes accent on the current
-   page, where it should match. */
-.art-sidebar-icon {
-  width: 1rem;
-  height: 1rem;
-  color: var(--art-sidebar-icon);
-}
-
-.art-sidebar-list a[aria-current="page"] .art-sidebar-icon {
-  color: var(--art-accent);
-}
-
-.art-card-icon {
-  width: 1.5rem;
-  height: 1.5rem;
-  color: var(--art-accent);
-}
-
-/* =========================================================================
-   Page heading + content
-   ========================================================================= */
-
-.content-panel {
-  padding-block: 2.5rem;
-}
-
-/* Starlight separates the title panel from the body with a rule; Mintlify
-   runs them together. */
-.content-panel + .content-panel {
-  border-top: 0;
-  padding-top: 0;
-}
-
-.content-panel:has(.art-page-heading) {
-  padding-bottom: 2rem;
-}
-
-.art-page-heading .art-eyebrow {
-  margin: 0 0 0.625rem;
-  color: var(--art-accent);
-  font-size: 0.875rem;
-  font-weight: 600;
-}
-
-.art-page-heading h1 {
-  margin: 0;
-  color: var(--sl-color-white);
-  font-size: 2.25rem;
-  line-height: 1.1;
-  letter-spacing: -0.025em;
-  font-weight: 600;
-}
-
-.art-page-heading .art-description {
-  max-width: none;
-  margin: 0.5rem 0 0;
-  color: var(--sl-color-gray-2);
-  font-size: 1.125rem;
-  line-height: 1.55;
-}
-
-.sl-markdown-content {
-  color: var(--sl-color-gray-2);
-}
-
-/* Mintlify links read like emphasized text with a brand-color underline,
-   rather than turning the entire label orange. */
-.sl-markdown-content a:not(.art-card, .sl-anchor-link) {
-  color: var(--sl-color-white);
-  font-weight: 600;
-  text-decoration-color: var(--art-accent);
-  text-decoration-thickness: 1px;
-  text-underline-offset: 0.2em;
-}
-
-.sl-markdown-content a:not(.art-card, .sl-anchor-link):hover {
-  color: var(--art-accent);
-}
-
-.sl-markdown-content :is(h1, h2, h3, h4, h5, h6) {
-  color: var(--sl-color-white);
-  letter-spacing: -0.025em;
-}
-
-/* A page can open with its own `#` heading; keep it below the page title. */
-.sl-markdown-content h1,
-.sl-markdown-content .sl-heading-wrapper.level-h1 {
-  font-size: 1.875rem;
-}
-
-.sl-markdown-content h1 {
-  line-height: 1.25;
-}
-
-/* Starlight's heading scale runs much larger than Mintlify's — its h3 is
-   bigger than our h2 — and it derives each heading's top margin from that
-   size (1.5em). Sizing the anchor wrapper alongside the heading keeps that
-   proportional rhythm intact while correcting the scale. */
-.sl-markdown-content h2,
-.sl-markdown-content .sl-heading-wrapper.level-h2 {
-  font-size: 1.5rem;
-}
-
-.sl-markdown-content h3,
-.sl-markdown-content .sl-heading-wrapper.level-h3 {
-  font-size: 1.25rem;
-}
-
-.sl-markdown-content :is(h4, h5, h6),
-.sl-markdown-content .sl-heading-wrapper:is(.level-h4, .level-h5, .level-h6) {
-  font-size: 1rem;
-}
-
-.sl-markdown-content h2 {
-  line-height: 1.35;
-}
-
-.sl-markdown-content h3 {
-  line-height: 1.4;
-}
-
-.sl-markdown-content :is(h4, h5, h6) {
-  line-height: 1.5;
-}
-
-/* Mintlify separates list items; Starlight runs them together. */
-.sl-markdown-content :is(ul, ol) > li + li {
-  margin-top: 0.5rem;
-}
-
-/* Round bullets, indented to match Mintlify. */
-.sl-markdown-content ul:not(:where(.not-content *)) {
-  padding-inline-start: 0;
-  list-style: none;
-}
-
-.sl-markdown-content ul:not(:where(.not-content *)) > li {
-  position: relative;
-  padding-inline-start: 2rem;
-}
-
-.sl-markdown-content ul:not(:where(.not-content *)) > li::before {
-  content: "";
-  position: absolute;
-  inset-inline-start: 0.5rem;
-  top: 0.7em;
-  width: 0.375rem;
-  height: 0.375rem;
-  background: var(--sl-color-gray-3);
-  border-radius: 50%;
-}
-
-/* =========================================================================
-   Right sidebar (table of contents)
-   ========================================================================= */
-
-/* Starlight rules off the table of contents and lets it scroll on both axes.
-   Drop the rule, and clip the horizontal axis so a long heading can never
-   push the rail sideways — `overflow-wrap` below makes it wrap instead. */
-.right-sidebar {
-  border-inline-start: 0;
-  overflow-x: clip;
-}
-
-.right-sidebar-panel h2 {
-  display: flex;
-  align-items: center;
-  gap: 0.75rem;
-  margin: 0;
-  font-size: 0.875rem;
-  font-weight: 500;
-}
-
-.right-sidebar-panel h2::before {
-  content: "";
-  width: 1rem;
-  height: 1rem;
-  flex: none;
-  background: currentColor;
-  mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath d='M8 5h13v2H8V5ZM3 5h2v2H3V5Zm5 6h13v2H8v-2Zm-5 0h2v2H3v-2Zm5 6h13v2H8v-2Zm-5 0h2v2H3v-2Z'/%3E%3C/svg%3E") center / contain no-repeat;
-}
-
-.right-sidebar-panel a {
-  padding-block: 0.25rem;
-  font-size: 0.875rem;
-  font-weight: 500;
-  overflow-wrap: anywhere;
-}
-
-/* The h1 is already rendered by PageTitle, so skip the "Overview" link. */
-.right-sidebar-panel a[href="#_top"] {
-  display: none;
-}
-
-/* With that link hidden, a page with no headings (the FAQ is all accordions)
-   is left with a stranded "On this page" heading. Drop the whole rail —
-   and its mobile equivalent — when there's nothing to link to. */
-.right-sidebar-panel:not(:has(a[href^="#"]:not([href="#_top"]))),
-mobile-starlight-toc:not(:has(a[href^="#"]:not([href="#_top"]))) {
-  display: none;
-}
-
-/* =========================================================================
-   Previous / next links
-   Starlight renders these as two big bordered cards, each stacking a
-   "Previous"/"Next" label over a 1.5rem title. Mintlify uses a single line:
-   just the page title at body-small weight with a thin chevron, prev pinned
-   left and next pinned right, no box.
-   ========================================================================= */
-
-.pagination-links {
-  display: flex;
-  gap: 1.5rem;
-  width: 100%;
-  max-width: var(--sl-content-width);
-}
-
-/* Starlight sizes each link to half the row; size them to their text instead
-   so `next` can sit flush against the right edge of the content column. */
-.pagination-links a {
-  display: flex;
-  flex: 0 1 auto;
-  flex-direction: row;
-  align-items: center;
-  gap: 0.75rem;
-  width: auto;
-  min-width: 0;
-  padding: 0;
-  border: 0;
-  border-radius: 0;
-  box-shadow: none;
-  color: var(--sl-color-gray-2);
-}
-
-.pagination-links a[rel="next"] {
-  margin-inline-start: auto;
-}
-
-.pagination-links a:hover {
-  color: var(--sl-color-white);
-}
-
-/* Zeroing the wrapper hides the "Previous"/"Next" label — Mintlify keeps that
-   distinction in the chevron alone — while leaving it in the a11y tree. The
-   title opts back in to a real size below. */
-.pagination-links a > span {
-  font-size: 0;
-}
-
-.pagination-links a br {
-  display: none;
-}
-
-.pagination-links .link-title {
-  display: block;
-  overflow: hidden;
-  color: inherit;
-  font-size: 0.875rem;
-  font-weight: 600;
-  white-space: nowrap;
-  text-overflow: ellipsis;
-}
-
-/* Starlight's chunky filled arrow is replaced by a thin chevron: one icon,
-   rotated for the "next" direction. */
-.pagination-links a svg {
-  display: none;
-}
-
-.pagination-links a[rel="prev"]::before,
-.pagination-links a[rel="next"]::after {
-  content: "";
-  flex: none;
-  width: 0.5rem;
-  height: 0.75rem;
-  background: var(--sl-color-gray-3);
-  mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 8 12' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M6.5 1 1.5 6l5 5'/%3E%3C/svg%3E") center / contain no-repeat;
-}
-
-.pagination-links a[rel="next"]::after {
-  transform: rotate(180deg);
-}
-
-.pagination-links a:hover::before,
-.pagination-links a:hover::after {
-  background: var(--sl-color-white);
-}
-
-/* =========================================================================
-   Code blocks (Expressive Code)
-   Mintlify renders code as a single plain box — a subtle hairline border, a
-   rounded surface, and a copy button on hover. Flatten Expressive Code's
-   window frame to match: drop the box-shadow and the terminal titlebar with
-   its traffic-light dots, and paint the border and radius onto the box.
-   ========================================================================= */
-
-.expressive-code .frame {
-  box-shadow: none;
-}
-
-/* Terminal frames add a titlebar with traffic-light dots; Mintlify shows
-   neither. (Editor frames keep their tab so file names still render.) */
-.expressive-code .frame.is-terminal .header {
-  display: none;
-}
-
-.expressive-code .frame pre {
-  border: 1px solid var(--sl-color-gray-5);
-  border-radius: var(--art-radius-lg);
-  background: var(--art-code-bg);
-}
-
-/* Without the titlebar, the terminal box rounds all four corners. */
-.expressive-code .frame.is-terminal pre {
-  border-radius: var(--art-radius-lg);
-}
-
-/* Expressive Code offsets the copy button below the titlebar; with the
-   titlebar hidden, pull it back up to the top-right of the box. */
-.expressive-code .frame.is-terminal .copy {
-  inset-block-start: 0.375rem;
-}
-
-/* =========================================================================
-   Components
-   ========================================================================= */
-
-/* --- Shared surface: cards, accordions, and callouts are the same box. --- */
-.art-card,
-.art-accordion,
-.art-aside {
-  background: var(--sl-color-bg);
-  border: 1px solid var(--sl-color-gray-5);
-  border-radius: var(--art-radius-lg);
-}
-
-/* Starlight gives every element inside .sl-markdown-content a top margin.
-   Our components lay themselves out, so opt their internals back out. The
-   outermost element of each component keeps the margin, which is what spaces
-   it from the surrounding prose. */
-.card-wrapper,
-.art-card :where(*),
-.art-accordion summary,
-.art-accordion summary :where(*),
-.art-aside :where(.art-aside-icon, .art-aside-content),
-.art-aside-content > :first-child,
-.art-frame :where(*) {
-  margin-top: 0;
-}
-
-/* --- Cards --- */
-
-/* Starlight's vertical rhythm selector skips inline elements, and a standalone
-   <Card href> renders as an <a> — so both the card and whatever follows it
-   lose their top margin. Restore the rhythm for cards in the markdown flow.
-   (Cards inside .cards-container are spaced by the grid gap instead.) */
-.sl-markdown-content > .art-card,
-.sl-markdown-content > .art-card + * {
-  margin-top: 1rem;
-}
-
-.cards-container {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(18rem, 1fr));
-  gap: 1rem;
-}
-
-.card-wrapper {
-  display: flex;
-}
-
-.art-card {
-  display: flex;
-  align-items: center;
-  gap: 1rem;
-  width: 100%;
-  padding: 1.25rem 1.5rem;
-  color: var(--sl-color-white);
-  text-decoration: none;
-  transition: border-color 140ms ease, transform 140ms ease, box-shadow 140ms ease;
-}
-
-.art-card-link:hover {
-  color: var(--sl-color-white);
-  border-color: var(--art-accent);
-  box-shadow: 0 5px 20px rgb(24 24 27 / 7%);
-  transform: translateY(-1px);
-}
-
-.art-card-text {
-  display: flex;
-  flex-direction: column;
-  gap: 0.25rem;
-  min-width: 0;
-}
-
-.art-card-title {
-  font-weight: 600;
-}
-
-.art-card-body {
-  color: var(--sl-color-gray-2);
-  font-size: 0.875rem;
-  line-height: 1.5;
-}
-
-/* Horizontal cards are compact link tiles: icon, title, arrow. The body stays
-   in the markup as the link's accessible description. */
-.art-card-body:empty {
-  display: none;
-}
-
-.art-card-arrow {
-  width: 0.875rem;
-  height: 0.875rem;
-  margin-inline-start: auto;
-  color: var(--sl-color-gray-3);
-}
-
-/* --- Accordion ---
-   Starlight styles bare <details> with a left rule and inset padding; the
-   `padding: 0` / `margin: 0` resets below undo that so the card border wins.
-   Its rotating chevron marker is kept — it already matches Mintlify. */
-.art-accordion {
-  overflow: hidden;
-  padding: 0;
-}
-
-.art-accordion + .art-accordion {
-  margin-top: 0.75rem;
-}
-
-.art-accordion summary {
-  display: flex;
-  align-items: center;
-  gap: 0.5rem;
-  margin: 0;
-  padding: 1rem 1.25rem;
-  color: var(--sl-color-white);
-  font-weight: 500;
-  cursor: pointer;
-}
-
-.art-accordion summary:hover {
-  background: var(--sl-color-gray-7);
-}
-
-.art-accordion-content {
-  padding: 0 1.25rem 1.25rem 2.5rem;
-}
-
-/* --- Callouts ---
-   Mintlify tints each callout by type — note blue, warning yellow, danger
-   red, tip green — and leaves info neutral. Each type sets the three tokens
-   below; the rules underneath never need to change. */
-.art-aside {
-  --art-aside-bg: var(--sl-color-gray-7);
-  --art-aside-border: var(--sl-color-gray-5);
-  --art-aside-accent: var(--sl-color-gray-2);
-
-  display: flex;
-  gap: 0.75rem;
-  padding: 1rem 1.25rem;
-  color: var(--sl-color-white);
-  background: var(--art-aside-bg);
-  border-color: var(--art-aside-border);
-  font-size: 0.875rem;
-  line-height: 1.5;
-}
-
-.art-aside-note {
-  --art-aside-bg: #eff6ff;
-  --art-aside-border: #bfdbfe;
-  --art-aside-accent: #1d4ed8;
-}
-
-.art-aside-tip {
-  --art-aside-bg: #f0fdf4;
-  --art-aside-border: #bbf7d0;
-  --art-aside-accent: #15803d;
-}
-
-.art-aside-caution {
-  --art-aside-bg: #fefce8;
-  --art-aside-border: #fef08a;
-  --art-aside-accent: #854d0e;
-}
-
-.art-aside-danger {
-  --art-aside-bg: #fef2f2;
-  --art-aside-border: #fecaca;
-  --art-aside-accent: #b91c1c;
-}
-
-/* On a dark page the pastel fills read as blocks of colour, so tint the
-   surface instead of painting over it. */
-:root[data-theme="dark"] .art-aside-note {
-  --art-aside-bg: #172554;
-  --art-aside-border: #1e40af;
-  --art-aside-accent: #93c5fd;
-}
-
-:root[data-theme="dark"] .art-aside-tip {
-  --art-aside-bg: #052e16;
-  --art-aside-border: #166534;
-  --art-aside-accent: #86efac;
-}
-
-:root[data-theme="dark"] .art-aside-caution {
-  --art-aside-bg: #2c2205;
-  --art-aside-border: #854d0e;
-  --art-aside-accent: #fde047;
-}
-
-:root[data-theme="dark"] .art-aside-danger {
-  --art-aside-bg: #2f1416;
-  --art-aside-border: #991b1b;
-  --art-aside-accent: #fca5a5;
-}
-
-.art-aside-icon {
-  flex: none;
-  width: 1.25rem;
-  color: var(--art-aside-accent);
-}
-
-.art-aside-icon svg {
-  display: block;
-  width: 1.25rem;
-  height: 1.25rem;
-}
-
-.art-aside-content {
-  min-width: 0;
-  width: 100%;
-}
-
-.art-aside-title {
-  display: block;
-  margin-bottom: 0.5rem;
-}
-
-.art-aside-content > :first-child {
-  margin-top: 0;
-}
-
-.art-aside-content > :last-child {
-  margin-bottom: 0;
-}
-
-/* --- Frame --- */
-.art-frame-media {
-  overflow: hidden;
-  border: 1px solid var(--sl-color-gray-5);
-  border-radius: var(--art-radius-lg);
-}
-
-.art-frame img {
+  color: var(--color-body);
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-lg);
+  box-shadow: 0 24px 80px rgb(0 0 0 / 20%);
+}
+.search-dialog::backdrop { background: rgb(30 25 24 / 35%); backdrop-filter: blur(3px); }
+.search-panel { display: block; }
+.search-input-row { display: flex; align-items: center; gap: 0.75rem; padding: 0.875rem 1rem; border-bottom: 1px solid var(--color-border); }
+.search-input-row input { flex: 1; min-width: 0; color: var(--color-text); background: transparent; border: 0; outline: 0; }
+.search-input-row button { padding: 0.2rem 0.4rem; color: var(--color-muted); background: var(--color-subtle); border: 1px solid var(--color-border); border-radius: 0.375rem; font-size: 0.6875rem; cursor: pointer; }
+.search-results { max-height: 32rem; padding: 0.5rem; overflow-y: auto; }
+.search-results > p { margin: 1.5rem; color: var(--color-muted); text-align: center; }
+.search-results a { display: flex; flex-direction: column; gap: 0.125rem; padding: 0.75rem; color: var(--color-body); border-radius: 0.625rem; text-decoration: none; }
+.search-results a:hover { background: var(--color-subtle); }
+.search-results strong { color: var(--color-text); font-size: 0.875rem; }
+.search-results span { font-size: 0.8125rem; line-height: 1.5; }
+.search-results mark { color: var(--color-accent); background: transparent; font-weight: 600; }
+
+/* Shared page shell */
+.site-shell {
   display: block;
   width: 100%;
-  margin: 0;
+  max-width: var(--shell-width);
+  min-height: 100vh;
+  margin-inline: auto;
+  padding-top: var(--header-height);
 }
 
-.art-frame figcaption {
-  margin-top: 0.5rem;
-  color: var(--sl-color-gray-3);
-  font-size: 0.8125rem;
-  text-align: center;
+.docs-sidebar {
+  visibility: hidden;
+  position: fixed;
+  z-index: 30;
+  inset: var(--header-height) 0 0;
+  padding: 2rem 1rem;
+  overflow-y: auto;
+  background: var(--color-surface);
+}
+:root[data-menu-open] { overflow: hidden; }
+:root[data-menu-open] .docs-sidebar { visibility: visible; }
+.docs-main { min-width: 0; }
+
+.art-sidebar-list, .art-sidebar-list ul { margin: 0; padding: 0; list-style: none; }
+.art-sidebar-section + .art-sidebar-section { margin-top: 2rem; }
+.art-sidebar-heading { margin-bottom: 0.625rem; padding-inline: 1rem; color: var(--color-text); font-size: 0.875rem; line-height: 1.5rem; font-weight: 600; }
+.art-sidebar-list a { display: flex; align-items: center; gap: 0.75rem; padding: 0.375rem 1rem; color: var(--color-body); border-radius: var(--radius); font-size: 0.875rem; line-height: 1.5rem; text-decoration: none; }
+.art-sidebar-list a:hover, .art-sidebar-list a:focus-visible { color: var(--color-text); background: var(--color-hairline); }
+.art-sidebar-list a[aria-current="page"] { color: var(--color-accent); background: var(--color-accent-soft); font-weight: 600; }
+.art-icon { display: inline-block; flex: none; background: currentColor; mask: var(--art-icon) center / contain no-repeat; }
+.art-sidebar-icon { width: 1rem; height: 1rem; color: var(--color-faint); }
+.art-sidebar-list a[aria-current="page"] .art-sidebar-icon { color: var(--color-accent); }
+.art-mobile-menu-footer { display: flex; gap: 1rem; margin: 2rem 1rem 0; padding-top: 1rem; border-top: 1px solid var(--color-border); }
+.art-mobile-menu-footer a { padding: 0; }
+
+/* Article */
+.page-columns { min-width: 0; }
+.article-pane { min-width: 0; }
+.article { width: 100%; max-width: var(--article-rail-width); padding: 2.5rem var(--content-padding) 4rem; }
+.page-heading { max-width: var(--content-width); margin-bottom: 2rem; }
+.page-eyebrow { margin: 0 0 0.625rem; color: var(--color-accent); font-size: 0.875rem; font-weight: 600; }
+.page-heading h1 { margin: 0; color: var(--color-text); font-size: 2.25rem; line-height: 1.1; letter-spacing: -0.025em; font-weight: 600; }
+.page-description { margin: 0.5rem 0 0; color: var(--color-body); font-size: 1.125rem; line-height: 1.55; }
+.doc-content, .page-footer { width: 100%; max-width: var(--content-width); }
+.doc-content { color: var(--color-body); }
+
+.doc-content > :first-child { margin-top: 0; }
+.doc-content > :last-child { margin-bottom: 0; }
+.doc-content > * + * { margin-top: 1rem; }
+.doc-content :is(h1, h2, h3, h4, h5, h6) { color: var(--color-text); letter-spacing: -0.025em; scroll-margin-top: calc(var(--header-height) + 1.5rem); }
+.doc-content h1 { margin-bottom: 0; font-size: 1.875rem; line-height: 1.25; }
+.doc-content h2 { margin-top: 2.5rem; margin-bottom: 0; font-size: 1.5rem; line-height: 1.35; }
+.doc-content h3 { margin-top: 1.875rem; margin-bottom: 0; font-size: 1.25rem; line-height: 1.4; }
+.doc-content :is(h4, h5, h6) { margin-top: 1.5rem; margin-bottom: 0; font-size: 1rem; line-height: 1.5; }
+.doc-content p { margin-bottom: 0; }
+.doc-content a:not(.art-card) { color: var(--color-text); font-weight: 600; text-decoration-color: var(--color-accent); text-decoration-thickness: 1px; text-underline-offset: 0.2em; }
+.doc-content a:not(.art-card):hover { color: var(--color-accent); }
+.doc-content :is(ul, ol) { margin-bottom: 0; padding-left: 2rem; }
+.doc-content :is(ul, ol) > li + li { margin-top: 0.5rem; }
+.doc-content ul { list-style: none; }
+.doc-content ul > li { position: relative; }
+.doc-content ul > li::before { content: ""; position: absolute; left: -1.5rem; top: 0.7em; width: 0.375rem; height: 0.375rem; background: var(--color-muted); border-radius: 50%; }
+.doc-content li > :is(ul, ol) { margin-top: 0.5rem; }
+.doc-content blockquote { margin-inline: 0; padding-left: 1rem; color: var(--color-muted); border-left: 3px solid var(--color-border); }
+.doc-content :not(pre) > code { padding: 0.125rem 0.3rem; color: var(--color-text); background: var(--color-subtle); border: 1px solid var(--color-border); border-radius: 0.3rem; font-size: 0.875em; }
+.doc-content table { display: block; width: 100%; overflow-x: auto; border-collapse: collapse; font-size: 0.875rem; line-height: 1.5; }
+.doc-content :is(th, td) { min-width: 7rem; padding: 0.625rem 0.75rem; border: 1px solid var(--color-border); text-align: left; vertical-align: top; }
+.doc-content th { color: var(--color-text); font-weight: 600; }
+.doc-content hr { border: 0; border-top: 1px solid var(--color-border); }
+
+/* Table of contents */
+.mobile-toc { margin: 1rem 1.25rem 0; border-bottom: 1px solid var(--color-border); }
+.mobile-toc summary { padding: 0.625rem 0; color: var(--color-text); font-size: 0.875rem; font-weight: 600; cursor: pointer; }
+.mobile-toc nav { display: flex; flex-direction: column; padding-bottom: 0.75rem; }
+.mobile-toc a, .page-toc a { color: var(--color-muted); font-size: 0.875rem; font-weight: 500; line-height: 1.5; text-decoration: none; overflow-wrap: anywhere; }
+.mobile-toc a { padding: 0.25rem 0; }
+.mobile-toc a.nested { padding-left: 1rem; }
+.page-toc { display: none; }
+.page-toc nav { position: sticky; top: var(--header-height); width: 100%; padding: 2.5rem 0 2rem 3.5rem; }
+.page-toc h2 { display: flex; align-items: center; gap: 0.75rem; margin: 0 0 0.5rem; color: var(--color-text); font-size: 0.875rem; font-weight: 500; }
+.page-toc h2::before { content: ""; width: 1rem; height: 1rem; flex: none; background: currentColor; mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath d='M8 5h13v2H8V5ZM3 5h2v2H3V5Zm5 6h13v2H8v-2Zm-5 0h2v2H3v-2Zm5 6h13v2H8v-2Zm-5 0h2v2H3v-2Z'/%3E%3C/svg%3E") center / contain no-repeat; }
+.page-toc a { display: block; width: 16.5rem; padding: 0.25rem 0; }
+.page-toc a.nested { padding-left: 1rem; }
+.page-toc a:hover, .page-toc a[aria-current="location"] { color: var(--color-text); }
+
+/* Page footer */
+.page-footer { margin-top: 6rem; }
+.edit-link { display: inline-flex; align-items: center; gap: 0.625rem; color: var(--color-muted); font-size: 0.875rem; text-decoration: none; }
+.edit-link:hover { color: var(--color-text); }
+.edit-link svg { width: 1rem; fill: none; stroke: currentColor; stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; }
+.pagination-links { display: flex; gap: 1.5rem; width: 100%; margin-top: 2rem; }
+.pagination-links a { display: flex; align-items: center; gap: 0.75rem; min-width: 0; color: var(--color-body); font-size: 0.875rem; font-weight: 600; text-decoration: none; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.pagination-links a[rel="next"] { margin-left: auto; text-align: right; }
+.pagination-links a:hover { color: var(--color-text); }
+.pagination-links a[rel="prev"]::before, .pagination-links a[rel="next"]::after { content: ""; flex: none; width: 0.5rem; height: 0.75rem; background: var(--color-muted); mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 8 12' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M6.5 1 1.5 6l5 5'/%3E%3C/svg%3E") center / contain no-repeat; }
+.pagination-links a[rel="next"]::after { transform: rotate(180deg); }
+
+/* Code blocks */
+.doc-content .expressive-code .frame { box-shadow: none !important; }
+.doc-content .expressive-code .frame.is-terminal .header { display: none !important; }
+.doc-content .expressive-code .frame pre { border: 1px solid var(--color-border) !important; border-radius: var(--radius-lg) !important; background: var(--color-code) !important; }
+.doc-content .expressive-code .frame.is-terminal .copy { inset-block-start: 0.375rem !important; }
+
+/* Content components */
+.art-card, .art-accordion, .art-aside { background: var(--color-surface); border: 1px solid var(--color-border); border-radius: var(--radius-lg); }
+.card-wrapper, .art-card :where(*), .art-accordion summary, .art-accordion summary :where(*), .art-aside :where(.art-aside-icon, .art-aside-content), .art-aside-content > :first-child, .art-frame :where(*) { margin-top: 0; }
+.doc-content > .art-card, .doc-content > .art-card + * { margin-top: 1rem; }
+.cards-container { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(18rem, 100%), 1fr)); gap: 1rem; }
+.card-wrapper { display: flex; }
+.art-card { display: flex; align-items: center; gap: 1rem; width: 100%; padding: 1.25rem 1.5rem; color: var(--color-text); text-decoration: none; transition: border-color 140ms ease, transform 140ms ease, box-shadow 140ms ease; }
+.art-card-link:hover { color: var(--color-text); border-color: var(--color-accent); box-shadow: 0 5px 20px rgb(24 24 27 / 7%); transform: translateY(-1px); }
+.art-card-icon { width: 1.5rem; height: 1.5rem; color: var(--color-accent); }
+.art-card-text { display: flex; flex-direction: column; gap: 0.25rem; min-width: 0; }
+.art-card-title { font-weight: 600; }
+.art-card-body { color: var(--color-body); font-size: 0.875rem; line-height: 1.5; }
+.art-card-body:empty { display: none; }
+.art-card-arrow { width: 0.875rem; height: 0.875rem; margin-left: auto; color: var(--color-muted); }
+
+.art-accordion { overflow: hidden; padding: 0; }
+.art-accordion + .art-accordion { margin-top: 0.75rem; }
+.art-accordion summary { display: flex; align-items: center; gap: 0.5rem; padding: 1rem 1.25rem; color: var(--color-text); font-weight: 500; cursor: pointer; }
+.art-accordion summary:hover { background: var(--color-subtle); }
+.art-accordion-content { padding: 0 1.25rem 1.25rem 2.5rem; }
+
+.art-aside { --aside-bg: var(--color-subtle); --aside-border: var(--color-border); --aside-accent: var(--color-body); display: flex; gap: 0.75rem; padding: 1rem 1.25rem; color: var(--color-text); background: var(--aside-bg); border-color: var(--aside-border); font-size: 0.875rem; line-height: 1.5; }
+.art-aside-note { --aside-bg: #eff6ff; --aside-border: #bfdbfe; --aside-accent: #1d4ed8; }
+.art-aside-tip { --aside-bg: #f0fdf4; --aside-border: #bbf7d0; --aside-accent: #15803d; }
+.art-aside-caution { --aside-bg: #fefce8; --aside-border: #fef08a; --aside-accent: #854d0e; }
+.art-aside-danger { --aside-bg: #fef2f2; --aside-border: #fecaca; --aside-accent: #b91c1c; }
+:root[data-theme="dark"] .art-aside-note { --aside-bg: #172554; --aside-border: #1e40af; --aside-accent: #93c5fd; }
+:root[data-theme="dark"] .art-aside-tip { --aside-bg: #052e16; --aside-border: #166534; --aside-accent: #86efac; }
+:root[data-theme="dark"] .art-aside-caution { --aside-bg: #2c2205; --aside-border: #854d0e; --aside-accent: #fde047; }
+:root[data-theme="dark"] .art-aside-danger { --aside-bg: #2f1416; --aside-border: #991b1b; --aside-accent: #fca5a5; }
+.art-aside-icon { flex: none; width: 1.25rem; color: var(--aside-accent); }
+.art-aside-icon svg { display: block; width: 1.25rem; height: 1.25rem; }
+.art-aside-content { min-width: 0; width: 100%; }
+.art-aside-title { display: block; margin-bottom: 0.5rem; }
+.art-aside-content > :last-child { margin-bottom: 0; }
+
+.art-frame-media { overflow: hidden; border: 1px solid var(--color-border); border-radius: var(--radius-lg); }
+.art-frame img { display: block; width: 100%; margin: 0; }
+.art-frame figcaption { margin-top: 0.5rem; color: var(--color-muted); font-size: 0.8125rem; text-align: center; }
+.full-width { width: 100%; overflow-x: auto; }
+.not-found { width: min(100% - 2.5rem, 45rem); margin: 0 auto; padding-top: 10rem; }
+.not-found h1 { color: var(--color-text); font-size: 2.25rem; }
+.not-found a { color: var(--color-text); text-decoration-color: var(--color-accent); }
+
+@media (min-width: 64rem) {
+  .art-header-search { position: absolute; left: 50%; top: 50%; width: 19rem; transform: translate(-50%, -50%); }
+  .art-header-links { display: flex; }
+  .mobile-menu-button { display: none; }
+  .site-shell { display: grid; grid-template-columns: var(--sidebar-width) minmax(0, 1fr); padding-inline: var(--shell-padding); }
+  .docs-sidebar { visibility: visible; position: sticky; z-index: auto; inset: auto; top: var(--header-height); height: calc(100vh - var(--header-height)); margin-left: -1rem; padding: 2rem 1rem; }
+  .docs-main { grid-column: 2; }
+  .art-mobile-menu-footer { display: none; }
+  .mobile-toc { margin-inline: var(--content-padding); }
 }
 
-/* --- Dense tables (opt in with <div class="full-width">) --- */
-.full-width table {
-  width: 100%;
-  border-collapse: collapse;
+@media (min-width: 80rem) {
+  .page-columns { display: grid; grid-template-columns: minmax(0, var(--article-rail-width)) var(--toc-width); }
+  .article-pane { grid-column: 1; grid-row: 1; }
+  .mobile-toc { display: none; }
+  .page-toc { display: block; grid-column: 2; grid-row: 1; min-width: 0; }
 }
 
-.full-width :is(th, td) {
-  vertical-align: top;
-  line-height: 1.5;
-  padding: 0.375rem 0.5rem;
-  border: 1px solid var(--sl-color-gray-5);
-  border-inline-end: 0;
+@media (max-width: 63.999rem) {
+  :root { --shell-padding: 1.25rem; --content-padding: 1.25rem; }
+  .site-header-inner { gap: 0.375rem; }
+  .art-header-title { flex: 1; width: auto; }
+  .art-header-search { flex: none; }
+  .search-button { width: 2.25rem; padding: 0.625rem; }
+  .search-button span, .search-button kbd { display: none; }
+  .article { padding-top: 2rem; }
+  .page-heading h1 { font-size: 2rem; }
 }
 
-.full-width :is(th, td):first-child {
-  border-inline-start: 0;
+@media (max-width: 30rem) {
+  .art-theme { display: none; }
+  .pagination-links { align-items: flex-start; flex-direction: column; }
+  .pagination-links a[rel="next"] { margin-left: 0; }
 }
 
-/* =========================================================================
-   Responsive
-   ========================================================================= */
-
-/* Mintlify shows no persistent heading anchor icons on touch devices, where
-   there's no hover to reveal them on demand. */
-@media (hover: none) {
-  .sl-markdown-content .sl-anchor-link {
-    display: none;
-  }
-}
-
-/* Match the visible TOC column to Mintlify while the structural rail keeps
-   Starlight's balanced wide-screen content positioning. */
-@media (min-width: 72rem) {
-  .right-sidebar-panel {
-    padding-block: 2.5rem 1rem;
-    padding-inline: 3.5rem 0;
-  }
-
-  /* The outer rail also carries the whitespace that balances the article.
-     Limit only its visible TOC content, not the structural rail itself. */
-  .right-sidebar-panel .sl-container {
-    width: var(--art-toc-width);
-    max-width: var(--art-toc-width);
-    margin: 0;
-  }
-}
-
-@media (max-width: 74rem) {
-  .art-header-links {
-    display: none;
-  }
-}
-
-@media (max-width: 50rem) {
-  :root {
-    --sl-content-pad-x: 1.25rem;
-    --sl-nav-pad-x: 1rem;
-  }
-
-  .art-header-title {
-    width: auto;
-    flex: 1;
-  }
-
-  .art-header-search {
-    flex: none;
-  }
-
-  .art-theme {
-    display: none;
-  }
+@media print {
+  .print-hidden, .site-header, .docs-sidebar, .mobile-toc, .page-toc, .page-footer { display: none !important; }
+  .site-shell, .page-columns { display: block; max-width: none; padding: 0; }
+  .article { max-width: none; padding: 0; }
 }
