@@ -20,6 +20,10 @@ from art.megatron.flex_attn.compiled import (
     select_sparse_execution_family,
     sparse_compiled_flex_attention,
 )
+from art.megatron.runtime.preschedule_trace import (
+    cuda_stream_fields,
+    trace_current_preschedule,
+)
 
 from .block_mask import build_block_mask_from_context, prepare_block_mask_context
 from .comm import A2AVCommunicator
@@ -836,6 +840,12 @@ def prepare_context_parallel_execution_state(
     state: ArtContextParallelState,
     device: torch.device,
 ) -> None:
+    trace_current_preschedule(
+        "cp_block_mask_variants_enter",
+        stage_count=len(state.rank_plan.stage_plans),
+        configured_variant_count=len(state.block_mask_variants),
+        **cuda_stream_fields(device.index),
+    )
     variants = state.block_mask_variants or (
         CpBlockMaskVariant(
             sliding_window=None,
@@ -846,6 +856,14 @@ def prepare_context_parallel_execution_state(
         if stage_plan.q_len <= 0 or stage_plan.k_len <= 0 or not stage_plan.slices:
             continue
         for variant in variants:
+            trace_current_preschedule(
+                "cp_block_mask_stage_enter",
+                stage_index=stage_plan.stage_index,
+                q_len=stage_plan.q_len,
+                k_len=stage_plan.k_len,
+                block_size=variant.block_size,
+                sliding_window=variant.sliding_window,
+            )
             execution_spec = _resolve_stage_execution_spec(
                 stage_plan=stage_plan,
                 state=state,
@@ -859,6 +877,13 @@ def prepare_context_parallel_execution_state(
                 block_size=variant.block_size,
                 sliding_window=variant.sliding_window,
             )
+            trace_current_preschedule(
+                "cp_block_mask_stage_exit",
+                stage_index=stage_plan.stage_index,
+                q_len=stage_plan.q_len,
+                k_len=stage_plan.k_len,
+            )
+    trace_current_preschedule("cp_block_mask_variants_exit")
 
 
 def _validate_stage_block_alignment(

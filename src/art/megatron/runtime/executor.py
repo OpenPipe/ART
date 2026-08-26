@@ -61,7 +61,11 @@ from ..training.command_telemetry import (
 )
 from ..training.gradient_accumulator import GradientAccumulator
 from .data_plane import InMemoryPackedBatch, SFTBatchData, validate_packed_batch
-from .preschedule_trace import trace_preschedule
+from .preschedule_trace import (
+    cuda_stream_fields,
+    preschedule_trace_scope,
+    trace_preschedule,
+)
 from .publication import (
     SnapshotRankWritePlan,
     SnapshotWriteGrant,
@@ -1854,10 +1858,11 @@ class MCoreRunSlotExecutor:
                     raise RuntimeError("operation residency admission changed identity")
                 return True
         try:
-            if operation_id is None:
-                self._residency.prefetch_l1_working_set(keys)
-            else:
-                self._residency.retain_l1_working_set(keys)
+            with preschedule_trace_scope(int(self.runtime.rank), trace_id):
+                if operation_id is None:
+                    self._residency.prefetch_l1_working_set(keys)
+                else:
+                    self._residency.retain_l1_working_set(keys)
         except ResidencyWorkingSetTooLarge:
             raise
         except ResidencyCapacityUnavailable:
@@ -2803,10 +2808,17 @@ class MCoreRunSlotExecutor:
                 operation_id,
                 "resident_acquire_enter",
                 working_set=tuple(key.representation for key in working_set),
+                **cuda_stream_fields(),
             )
-            self._residency.acquire_prepared_l1_working_set(working_set)
+            with preschedule_trace_scope(rank, operation_id):
+                self._residency.acquire_prepared_l1_working_set(working_set)
             acquired = True
-            trace_preschedule(rank, operation_id, "resident_acquire_exit")
+            trace_preschedule(
+                rank,
+                operation_id,
+                "resident_acquire_exit",
+                **cuda_stream_fields(),
+            )
             if state.installed_weights != weights_key:
                 pending = state.pending_load
                 if pending is None or pending.weights_key != weights_key:
