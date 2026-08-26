@@ -803,6 +803,8 @@ class MonarchTrainerActor(Actor):
             monotonic_ns=time.monotonic_ns(),
             error=(None if error is None else f"{type(error).__name__}: {error}"),
         )
+        if os.environ.get("ART_DEBUG_SNAPSHOT_RANK_PHASES") == "1":
+            print(f"ART_SNAPSHOT_RANK_PHASE {record.model_dump_json()}", flush=True)
         with self._snapshot_phase_lock:
             if operation_id not in self._snapshot_phases:
                 while len(self._snapshot_phases) >= 16:
@@ -1938,7 +1940,9 @@ class MonarchTrainerActor(Actor):
             self._record_snapshot_phase(job.operation_id, "endpoint_validated")
 
             def mark_staged() -> None:
-                self._record_snapshot_phase(job.operation_id, "readiness_send_enter")
+                self._record_snapshot_phase(
+                    job.operation_id, "mutation_fence_complete"
+                )
                 ready_port.send(
                     _CommandReady(
                         rank=self._runtime.rank,
@@ -1954,7 +1958,7 @@ class MonarchTrainerActor(Actor):
                     self._record_snapshot_phase(
                         job.operation_id, "deferred_prepare_started"
                     )
-                    self._record_snapshot_phase(job.operation_id, "executor_enter")
+                    self._record_snapshot_phase(job.operation_id, "mutation_fence_enter")
                     result = self._require_run_slot_executor().execute_snapshot(
                         job,
                         _ActorEventSink(event_port, coordinator=coordinator),
@@ -2058,7 +2062,9 @@ class MonarchTrainerActor(Actor):
             self._record_snapshot_phase(job.operation_id, "endpoint_validated")
 
             def mark_staged() -> None:
-                self._record_snapshot_phase(job.operation_id, "readiness_send_enter")
+                self._record_snapshot_phase(
+                    job.operation_id, "mutation_fence_complete"
+                )
                 ready_port.send(
                     _CommandReady(
                         rank=self._runtime.rank,
@@ -2074,7 +2080,7 @@ class MonarchTrainerActor(Actor):
                     self._record_snapshot_phase(
                         job.operation_id, "deferred_prepare_started"
                     )
-                    self._record_snapshot_phase(job.operation_id, "executor_enter")
+                    self._record_snapshot_phase(job.operation_id, "mutation_fence_enter")
                     result = self._executor.execute_snapshot(
                         job,
                         _ActorEventSink(event_port, coordinator=coordinator),

@@ -74,6 +74,7 @@ def bare_trainer(snapshot_call, *, ranks: int) -> MonarchTrainerRun:
 
 def test_deferred_response_inherits_actor_cuda_device(
     monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     state = local()
     state.device = 1
@@ -93,6 +94,7 @@ def test_deferred_response_inherits_actor_cuda_device(
     monkeypatch.setattr(torch.cuda, "current_device", current_device)
     monkeypatch.setattr(torch.cuda, "device", device)
     monkeypatch.setenv("LOCAL_RANK", "1")
+    monkeypatch.setenv("ART_DEBUG_SNAPSHOT_RANK_PHASES", "1")
     delivered = Event()
     started = Event()
     release = Event()
@@ -117,7 +119,7 @@ def test_deferred_response_inherits_actor_cuda_device(
     actor._valid = True
 
     def materialize():
-        actor._record_snapshot_phase("snapshot-device", "executor_enter")
+        actor._record_snapshot_phase("snapshot-device", "mutation_fence_enter")
         started.set()
         release.wait()
         return {"device": current_device()}
@@ -131,13 +133,17 @@ def test_deferred_response_inherits_actor_cuda_device(
     assert started.wait(1)
     report = actor._snapshot_phase_report("snapshot-device")
     assert report["expected_cuda_device"] == 1
-    assert report["phase"]["phase"] == "executor_enter"
+    assert report["phase"]["phase"] == "mutation_fence_enter"
     assert report["phase"]["cuda_device"] == 1
     assert report["thread_alive"] is True
     assert "release.wait" in report["thread_stack"]
     release.set()
     assert delivered.wait(1)
     assert result == {"device": 1}
+    trace = capsys.readouterr().out
+    assert "ART_SNAPSHOT_RANK_PHASE" in trace
+    assert '"phase":"mutation_fence_enter"' in trace
+    assert '"cuda_device":1' in trace
 
 
 def test_snapshot_waits_for_every_rank_before_advancing_parent() -> None:
@@ -222,7 +228,7 @@ def test_snapshot_timeout_reports_received_ranks_and_rank_phase() -> None:
                     {
                         "rank": 1,
                         "operation_id": "snapshot-1",
-                        "phase": {"phase": "executor_enter"},
+                        "phase": {"phase": "mutation_fence_enter"},
                     },
                 )
 
@@ -237,7 +243,7 @@ def test_snapshot_timeout_reports_received_ranks_and_rank_phase() -> None:
         message = str(error)
         assert "received_ranks=[0]" in message
         assert '"rank": 1' in message
-        assert '"phase": "executor_enter"' in message
+        assert '"phase": "mutation_fence_enter"' in message
 
     asyncio.run(run_test())
 
