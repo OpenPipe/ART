@@ -6,6 +6,7 @@ import copy
 from dataclasses import replace
 import fnmatch
 import re
+import time
 from typing import Any, cast
 
 from megatron.bridge.models.common.unimodal import to_empty_if_meta_device
@@ -37,24 +38,36 @@ _Fp32PreservedTensor = tuple[torch.nn.Module, str, torch.Tensor, bool]
 
 class ExpertTensorSlice:
     __slots__ = (
+        "_loader",
+        "_tensor",
         "global_start",
         "global_stop",
         "physical_to_logical",
-        "tensor",
     )
 
     def __init__(
         self,
-        tensor: torch.Tensor,
+        tensor: torch.Tensor | None = None,
         *,
         global_start: int,
         global_stop: int,
         physical_to_logical: tuple[int | None, ...] | None = None,
+        loader: Callable[[], torch.Tensor] | None = None,
     ) -> None:
-        self.tensor = tensor
+        if (tensor is None) == (loader is None):
+            raise ValueError("exactly one of tensor or loader must be provided")
+        self._tensor = tensor
+        self._loader = loader
         self.global_start = int(global_start)
         self.global_stop = int(global_stop)
         self.physical_to_logical = physical_to_logical
+
+    @property
+    def tensor(self) -> torch.Tensor:
+        if self._tensor is None:
+            assert self._loader is not None
+            self._tensor = self._loader()
+        return self._tensor
 
     def get(self, global_expert: int) -> torch.Tensor:
         global_expert = int(global_expert)
@@ -90,6 +103,9 @@ class ExpertTensorSlice:
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self.tensor, name)
+
+    def release(self) -> None:
+        self._tensor = None
 
 
 def _pin_cpu_tensor(tensor: torch.Tensor) -> torch.Tensor:
@@ -173,6 +189,7 @@ def _load_hf_tensor_slice(
     *,
     start: int,
     stop: int,
+    device: torch.device | None = None,
 ) -> torch.Tensor:
     source = getattr(hf_state_dict, "source", None)
     if source is None or not hasattr(source, "key_to_filename_map"):
@@ -186,7 +203,10 @@ def _load_hf_tensor_slice(
     from safetensors import safe_open
 
     file_path = source.path / key_to_filename[key]
-    with safe_open(file_path, framework="pt", device="cpu") as handle:
+    safe_device: str | int = "cpu"
+    if device is not None:
+        safe_device = device.index if device.index is not None else str(device)
+    with safe_open(file_path, framework="pt", device=safe_device) as handle:
         tensor_slice = handle.get_slice(key)
         shape = tuple(int(dim) for dim in tensor_slice.get_shape())
         if not shape or start < 0 or stop > shape[0] or start >= stop:
@@ -195,6 +215,34 @@ def _load_hf_tensor_slice(
             )
         index = (slice(start, stop),) + (slice(None),) * (len(shape) - 1)
         return tensor_slice[index]
+
+
+def _load_hf_source_slice(
+    bridge: MegatronModelBridge | None,
+    source: HfWeightSource,
+    hf_state_dict: Mapping[str, torch.Tensor],
+    *,
+    selected_option: tuple[str, ...],
+    start: int,
+    stop: int,
+) -> torch.Tensor:
+    device = _materialization_device() if torch.cuda.is_available() else None
+    sliced_state = {
+        key: _load_hf_tensor_slice(
+            hf_state_dict,
+            key,
+            start=start,
+            stop=stop,
+            device=device,
+        )
+        for key in selected_option
+    }
+    return _materialize_hf_weight_source(
+        bridge,
+        source,
+        sliced_state,
+        selected_option=selected_option,
+    )
 
 
 def _direct_hf_weight_source(key: str) -> HfWeightSource:
@@ -427,45 +475,21 @@ def load_unique_hf_keys_once(
             task=task,
         )
         selected_option = _select_physical_key_option(source, hf_state_dict)
-        if source.kind != "direct":
-            tensor = _materialize_hf_weight_source(
-                bridge,
-                source,
-                hf_state_dict,
-                selected_option=selected_option,
-            )
-            if not tensor.ndim or start < 0 or stop > tensor.shape[0] or start >= stop:
-                raise RuntimeError(
-                    f"invalid expert slice [{start}, {stop}) for {key!r} "
-                    f"with shape {tuple(tensor.shape)}"
-                )
-            cache[key] = ExpertTensorSlice(
-                _pin_cpu_tensor(tensor[start:stop]),
-                global_start=start,
-                global_stop=stop,
-                physical_to_logical=(
-                    None if layout is None else layout.physical_to_logical
-                ),
-            )
-            continue
-        if len(selected_option) != 1:
-            raise RuntimeError(
-                "direct HF source must select exactly one physical key for "
-                f"{source.logical_key!r}; got {selected_option!r}"
-            )
         cache[key] = ExpertTensorSlice(
-            _pin_cpu_tensor(
-                _load_hf_tensor_slice(
-                    hf_state_dict,
-                    selected_option[0],
-                    start=start,
-                    stop=stop,
-                )
-            ),
             global_start=start,
             global_stop=stop,
             physical_to_logical=(
                 None if layout is None else layout.physical_to_logical
+            ),
+            loader=lambda source=source, selected_option=selected_option, start=start, stop=stop: (
+                _load_hf_source_slice(
+                    bridge,
+                    source,
+                    hf_state_dict,
+                    selected_option=selected_option,
+                    start=start,
+                    stop=stop,
+                )
             ),
         )
     return cache
@@ -495,6 +519,38 @@ class _CachedStateLookup(Mapping[str, torch.Tensor | ExpertTensorSlice]):
 
     def __len__(self) -> int:
         return len(set(self._cache).union(self._source))
+
+
+def _cache_use_counts(
+    tasks: Iterable[Any],
+    cache: Mapping[str, torch.Tensor | ExpertTensorSlice],
+) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for task in tasks:
+        if task is None or task.megatron_module is None:
+            continue
+        for key in _iter_hf_param_names(task.mapping.hf_param):
+            if key in cache:
+                counts[key] = counts.get(key, 0) + 1
+    return counts
+
+
+def _release_consumed_cache(
+    task: Any,
+    cache: dict[str, torch.Tensor | ExpertTensorSlice],
+    remaining: dict[str, int],
+) -> None:
+    for key in _iter_hf_param_names(task.mapping.hf_param):
+        count = remaining.get(key)
+        if count is None:
+            continue
+        if count > 1:
+            remaining[key] = count - 1
+            continue
+        value = cache.pop(key)
+        remaining.pop(key)
+        if isinstance(value, ExpertTensorSlice):
+            value.release()
 
 
 def _materialization_device() -> torch.device:
@@ -846,12 +902,27 @@ def _validate_local_pretrained_tasks(
         )
 
 
+def _trace_weight_load(started: float, stage: str, **fields: Any) -> None:
+    rank = (
+        torch.distributed.get_rank()
+        if torch.distributed.is_available() and torch.distributed.is_initialized()
+        else -1
+    )
+    details = " ".join(f"{key}={value}" for key, value in fields.items())
+    print(
+        f"ART_MEGATRON_WEIGHT_LOAD rank={rank} stage={stage} "
+        f"elapsed_s={time.monotonic() - started:.3f} {details}".rstrip(),
+        flush=True,
+    )
+
+
 def _optimized_load_weights_hf_to_megatron(
     self: MegatronModelBridge,
     hf_pretrained: Any,
     megatron_model: Any,
     allowed_mismatched_params: list[str] | None = None,
 ) -> list[Any]:
+    started = time.monotonic()
     if not isinstance(megatron_model, list):
         megatron_model = [megatron_model]
     with contextlib.ExitStack() as stack:
@@ -862,17 +933,30 @@ def _optimized_load_weights_hf_to_megatron(
         tasks = self.build_conversion_tasks(hf_pretrained, megatron_model)
         _validate_local_pretrained_tasks(self, megatron_model, tasks)
         tasks = _prepare_nonuniform_expert_tasks(tasks)
+    _trace_weight_load(started, "tasks_ready", task_count=len(tasks))
     hf_state_dict = hf_pretrained.state
+    _trace_weight_load(started, "cache_plan_started")
     raw_cache = load_unique_hf_keys_once(
         tasks,
         hf_state_dict,
         bridge=self,
         extra_keys=getattr(self, "art_extra_hf_prefetch_keys", None),
     )
+    _trace_weight_load(
+        started,
+        "cache_plan_ready",
+        cache_entries=len(raw_cache),
+        lazy_expert_entries=sum(
+            isinstance(value, ExpertTensorSlice) for value in raw_cache.values()
+        ),
+    )
     cached_state = _CachedStateLookup(cache=raw_cache, source=hf_state_dict)
+    remaining_cache_uses = _cache_use_counts(tasks, raw_cache)
     description = f"Loading from {hf_pretrained.model_name_or_path}"
     pending_device_copy = False
-    for task in self._with_progress_tracking(tasks, description):
+    for task_index, task in enumerate(
+        self._with_progress_tracking(tasks, description), start=1
+    ):
         if task is None or task.megatron_module is None:
             continue
         hf_param = task.mapping.hf_param
@@ -890,6 +974,7 @@ def _optimized_load_weights_hf_to_megatron(
             hf_weights, task.megatron_module
         )
         if converted_weights is None:
+            _release_consumed_cache(task, raw_cache, remaining_cache_uses)
             continue
         assert task.param_weight is not None, (
             "param_weight is required for HF->Megatron conversion"
@@ -904,6 +989,7 @@ def _optimized_load_weights_hf_to_megatron(
                         is_whitelisted = True
                         break
             if is_whitelisted:
+                _release_consumed_cache(task, raw_cache, remaining_cache_uses)
                 continue
             raise ValueError(
                 f"Shape mismatch for megatron param {task.mapping.megatron_param}:\n"
@@ -916,9 +1002,20 @@ def _optimized_load_weights_hf_to_megatron(
             task.param_weight.data.copy_(converted_weights, non_blocking=True)
         if task.param_weight.device.type == "cuda":
             pending_device_copy = True
+        _release_consumed_cache(task, raw_cache, remaining_cache_uses)
+        if task_index == len(tasks) or task_index % max(1, len(tasks) // 10) == 0:
+            _trace_weight_load(
+                started,
+                "conversion_progress",
+                completed=task_index,
+                total=len(tasks),
+            )
     if pending_device_copy and torch.cuda.is_available():
+        _trace_weight_load(started, "device_copy_sync_started")
         torch.cuda.synchronize()
+        _trace_weight_load(started, "device_copy_sync_finished")
     self._broadcast_shared_embeddings(_shared_embedding_broadcast_model(megatron_model))
+    _trace_weight_load(started, "complete")
     return megatron_model
 
 
