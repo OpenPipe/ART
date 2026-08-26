@@ -10,6 +10,7 @@ from art.megatron.optimizer_state import CheckpointFile, OptimizerAdapter
 from art.megatron.runtime.monarch import (
     MonarchTrainerActor,
     MonarchTrainerRun,
+    _await_snapshot_readiness,
     _CommandReady,
     _snapshot_readiness_timeout,
 )
@@ -211,6 +212,30 @@ def test_snapshot_rank_failure_does_not_wait_for_missing_readiness() -> None:
         assert trainer._next_operation_sequence == 0
         assert trainer._active_job_id is None
         assert trainer._active_collective is None
+
+    asyncio.run(run_test())
+
+
+def test_snapshot_rank_result_does_not_overtake_readiness_delivery() -> None:
+    async def run_test() -> None:
+        loop = asyncio.get_running_loop()
+        rank_call = loop.create_future()
+        rank_call.set_result({0: {"rank": 0}, 1: {"rank": 1}})
+        readiness = loop.create_future()
+        waiting = asyncio.create_task(
+            _await_snapshot_readiness(
+                rank_call,
+                readiness,
+                SimpleNamespace(),
+                snapshot_job(),
+                set(),
+                loop.time() + 1.0,
+            )
+        )
+        await asyncio.sleep(0)
+        assert not waiting.done()
+        readiness.set_result(None)
+        await waiting
 
     asyncio.run(run_test())
 

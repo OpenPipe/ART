@@ -2557,6 +2557,35 @@ async def _snapshot_readiness_timeout(
     )
 
 
+async def _await_snapshot_readiness(
+    rank_call: asyncio.Future[Any],
+    readiness: asyncio.Future[None],
+    actors: Any,
+    job: GenerationSnapshotJobSpec,
+    received_ranks: set[int],
+    deadline: float,
+) -> None:
+    loop = asyncio.get_running_loop()
+    done, _ = await asyncio.wait(
+        {rank_call, readiness},
+        timeout=max(0.0, deadline - loop.time()),
+        return_when=asyncio.FIRST_COMPLETED,
+    )
+    if not done:
+        raise await _snapshot_readiness_timeout(actors, job, received_ranks)
+    if readiness in done:
+        readiness.result()
+    if rank_call in done:
+        rank_call.result()
+    if not readiness.done():
+        done, _ = await asyncio.wait(
+            {readiness}, timeout=max(0.0, deadline - loop.time())
+        )
+        if not done:
+            raise await _snapshot_readiness_timeout(actors, job, received_ranks)
+    readiness.result()
+
+
 class MonarchTrainerSlot:
     """One persistent Megatron mesh serving many sequenced training runs."""
 
@@ -3459,22 +3488,14 @@ class MonarchTrainerSlot:
                 name=f"megatron-slot-snapshot-ready-{operation_id}",
             )
             try:
-                done, _ = await asyncio.wait(
-                    {rank_call, readiness},
-                    timeout=max(0.0, deadline - loop.time()),
-                    return_when=asyncio.FIRST_COMPLETED,
+                await _await_snapshot_readiness(
+                    rank_call,
+                    readiness,
+                    self._actors,
+                    job,
+                    readiness_progress,
+                    deadline,
                 )
-                if not done:
-                    raise await _snapshot_readiness_timeout(
-                        self._actors, job, readiness_progress
-                    )
-                if readiness in done:
-                    readiness.result()
-                else:
-                    await rank_call
-                    raise RuntimeError(
-                        "trainer snapshot returned before every rank fenced mutation"
-                    )
                 completion = asyncio.create_task(
                     self._complete_snapshot_prepare(
                         job, rank_call, event_receiver, deadline
@@ -4625,22 +4646,14 @@ class MonarchTrainerRun:
             self._active_job_id = job.operation_id
             self._active_collective = rank_call
             try:
-                done, _ = await asyncio.wait(
-                    {rank_call, readiness},
-                    timeout=max(0.0, deadline - loop.time()),
-                    return_when=asyncio.FIRST_COMPLETED,
+                await _await_snapshot_readiness(
+                    rank_call,
+                    readiness,
+                    self._actors,
+                    job,
+                    readiness_progress,
+                    deadline,
                 )
-                if not done:
-                    raise await _snapshot_readiness_timeout(
-                        self._actors, job, readiness_progress
-                    )
-                if readiness in done:
-                    readiness.result()
-                else:
-                    await rank_call
-                    raise RuntimeError(
-                        "trainer snapshot returned before every rank fenced mutation"
-                    )
                 if job.sequence_continuation_of is None:
                     self._next_operation_sequence += 1
                 self._operation_sequence_ids[job.operation_id] = job.sequence_id
