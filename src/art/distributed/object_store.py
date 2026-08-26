@@ -1163,26 +1163,32 @@ class S3BinaryObjectStore:
             raise RuntimeError("cannot discard a committed binary object")
         prefix = self._prefix(target)
         if isinstance(target, OrderedBinaryObjectTarget):
-            plan = _ordered_binary_object_layout(target, files)
             plan_key = f"{prefix}/_PLAN.json"
             try:
-                existing_plan = self._read(plan_key)
+                plan = OrderedBinaryObjectPlan.model_validate_json(
+                    self._read(plan_key)
+                )
             except Exception as error:
                 if not _is_missing_object(error):
                     raise
             else:
-                if existing_plan != _model_bytes(plan):
+                _require_ordered_plan_target(
+                    target,
+                    plan,
+                    expected_byte_count=sum(file.byte_count for file in files),
+                )
+                if plan.files != files:
                     raise RuntimeError(
                         "uncommitted ordered object plan differs from its target"
                     )
-            self._delete_keys(
-                target.store.bucket,
-                tuple(
+                keys = tuple(
                     _ordered_binary_object_shard_key(prefix, shard.index)
                     for shard in plan.shards
-                ),
-            )
-            self._delete_keys(target.store.bucket, (plan_key,))
+                )
+                for key in keys:
+                    self._abort_uploads(key)
+                self._delete_keys(target.store.bucket, keys)
+                self._delete_keys(target.store.bucket, (plan_key,))
         else:
             keys = tuple(_binary_object_file_key(prefix, file) for file in files)
             if len(keys) != len(set(keys)):
