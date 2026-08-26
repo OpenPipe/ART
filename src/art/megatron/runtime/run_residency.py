@@ -1249,13 +1249,27 @@ class RunResidencyManager:
         with self._transition_slots:
             limit = self.config.limits.max_concurrent_transitions
             while self._active_transitions >= limit:
+                self._reap_ready_l1_transitions_locked()
+                if self._active_transitions < limit:
+                    break
                 if self._closing or self._closed:
                     raise RuntimeError("run residency manager is closed")
-                self._transition_slots.wait()
+                # CUDA events do not notify this CPU condition. Poll only while
+                # the bounded transfer set is physically still in flight.
+                self._transition_slots.wait(timeout=0.001)
                 self._raise_failures()
             reservations = self.ledger.reserve_many(demands)
             self._active_transitions += 1
             return reservations
+
+    def _reap_ready_l1_transitions_locked(self) -> None:
+        transitions = {
+            id(transition): transition
+            for state in self._states.values()
+            if (transition := state.l1_transition) is not None and transition.ready
+        }
+        for transition in transitions.values():
+            self._finish_l1_transfer_locked(transition)
 
     def _commit(
         self,
