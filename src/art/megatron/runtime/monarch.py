@@ -2477,11 +2477,12 @@ class ForwardCommandLaunch(BaseModel):
 
 
 class SnapshotPrepareCommandLaunch(BaseModel):
-    """Every rank has fenced mutation; write-plan materialization is pending."""
+    """Ranks fenced mutation; the plan is pending and publication is reserved."""
 
     model_config = ConfigDict(arbitrary_types_allowed=True, extra="forbid", frozen=True)
 
     completion: SkipValidation[asyncio.Future[dict[str, Any]]]
+    publication: SkipValidation[asyncio.Future[tuple[TrainerRankPublication, ...]]]
 
 
 async def _collect_command_ready(
@@ -3457,9 +3458,14 @@ class MonarchTrainerSlot:
             self._require_open()
             cached = self._cached_operation(job.operation_id, job.fingerprint)
             if cached is not None:
+                publication = self._publications.get(job.operation_id)
+                if publication is None:
+                    raise RuntimeError("completed snapshot has no publication owner")
                 completion = asyncio.get_running_loop().create_future()
                 completion.set_result(cached)
-                return SnapshotPrepareCommandLaunch(completion=completion)
+                return SnapshotPrepareCommandLaunch(
+                    completion=completion, publication=publication
+                )
             if inflight := self._snapshot_launches.get(job.operation_id):
                 if inflight[0] != job.fingerprint:
                     raise RuntimeError("operation_id was reused for another snapshot")
@@ -3496,13 +3502,31 @@ class MonarchTrainerSlot:
                     readiness_progress,
                     deadline,
                 )
+                authorization = asyncio.Event()
+                publication = asyncio.create_task(
+                    self._collect_publication(
+                        event_receiver,
+                        job.generation,
+                        authorization=authorization,
+                    ),
+                    name=f"megatron-slot-publish-{operation_id}",
+                )
+                publication.add_done_callback(consume_future_exception)
+                self._publications[operation_id] = publication
+                self._publication_authorizations[operation_id] = authorization
+                self._publication_predecessors[operation_id] = (
+                    self._publication_authorization_tail
+                )
+                self._publication_authorization_tail = authorization
                 completion = asyncio.create_task(
                     self._complete_snapshot_prepare(
-                        job, rank_call, event_receiver, deadline
+                        job, rank_call, publication, deadline
                     ),
                     name=f"megatron-slot-snapshot-plan-{operation_id}",
                 )
-                launch = SnapshotPrepareCommandLaunch(completion=completion)
+                launch = SnapshotPrepareCommandLaunch(
+                    completion=completion, publication=publication
+                )
                 self._snapshot_launches[operation_id] = (job.fingerprint, launch)
                 return launch
             except BaseException as error:
@@ -3510,6 +3534,9 @@ class MonarchTrainerSlot:
                     if not task.done():
                         task.cancel()
                 await asyncio.gather(readiness, rank_call, return_exceptions=True)
+                publication = self._publications.get(operation_id)
+                if publication is not None:
+                    await self._abort_snapshot_publication(operation_id, publication)
                 await self._invalidate(error, "snapshot operation and cleanup failed")
                 raise
 
@@ -3517,7 +3544,7 @@ class MonarchTrainerSlot:
         self,
         job: GenerationSnapshotJobSpec,
         rank_call: asyncio.Future[Any],
-        receiver: Any,
+        publication: asyncio.Task[tuple[TrainerRankPublication, ...]],
         deadline: float,
     ) -> dict[str, Any]:
         operation_id = job.operation_id
@@ -3539,29 +3566,34 @@ class MonarchTrainerSlot:
                 generation=job.generation,
                 ranks=rank_plans,
             )
-            authorization = asyncio.Event()
-            publication = asyncio.create_task(
-                self._collect_publication(
-                    receiver, job.generation, authorization=authorization
-                ),
-                name=f"megatron-slot-publish-{operation_id}",
-            )
-            publication.add_done_callback(consume_future_exception)
-            self._publications[operation_id] = publication
-            self._publication_authorizations[operation_id] = authorization
-            self._publication_predecessors[operation_id] = (
-                self._publication_authorization_tail
-            )
-            self._publication_authorization_tail = authorization
             result = next(result for result in results if result["rank"] == 0)
             result = {**result, "write_plan": plan.model_dump(mode="json")}
             self._operations[operation_id] = (job.fingerprint, result)
             return result
         except BaseException as error:
+            await self._abort_snapshot_publication(operation_id, publication)
             await self._invalidate(error, "snapshot operation and cleanup failed")
             raise
         finally:
             self._snapshot_launches.pop(operation_id, None)
+
+    async def _abort_snapshot_publication(
+        self,
+        operation_id: str,
+        publication: asyncio.Task[tuple[TrainerRankPublication, ...]],
+    ) -> None:
+        authorization = self._publication_authorizations.get(operation_id)
+        if authorization is not None:
+            authorization.set()
+        if not publication.done():
+            publication.cancel()
+        await asyncio.gather(publication, return_exceptions=True)
+        if self._publications.get(operation_id) is publication:
+            self._publications.pop(operation_id)
+        predecessor = self._publication_predecessors.pop(operation_id, None)
+        self._publication_authorizations.pop(operation_id, None)
+        if self._publication_authorization_tail is authorization:
+            self._publication_authorization_tail = predecessor
 
     async def snapshot(self, job: GenerationSnapshotJobSpec) -> dict[str, Any]:
         launch = await self.start_snapshot(job)
@@ -3586,7 +3618,9 @@ class MonarchTrainerSlot:
         self._snapshot_tasks.add(completion)
         completion.add_done_callback(self._snapshot_tasks.discard)
         completion.add_done_callback(consume_future_exception)
-        return SnapshotPrepareCommandLaunch(completion=completion)
+        return SnapshotPrepareCommandLaunch(
+            completion=completion, publication=prepared.publication
+        )
 
     async def authorize_snapshot(
         self, plan: SnapshotWritePlan, grant: SnapshotWriteGrant
@@ -3671,6 +3705,7 @@ class MonarchTrainerSlot:
         return asyncio.shield(publication)
 
     def retire_operation(self, operation_id: str) -> None:
+        self._snapshot_launches.pop(operation_id, None)
         publication = self._publications.get(operation_id)
         if publication is not None:
             if not publication.done():
@@ -4595,23 +4630,23 @@ class MonarchTrainerRun:
     async def start_prepare_snapshot(
         self, job: GenerationSnapshotJobSpec
     ) -> SnapshotPrepareCommandLaunch:
+        if launch := self._snapshot_launches.get(job.operation_id):
+            if launch[0] != job.fingerprint:
+                raise RuntimeError("operation_id was reused for another snapshot")
+            return launch[1]
         cached = self._operations.get(job.operation_id)
         if cached is not None and cached[0] == job.fingerprint:
-            completion = asyncio.get_running_loop().create_future()
-            completion.set_result(cached[1])
-            return SnapshotPrepareCommandLaunch(completion=completion)
+            raise RuntimeError("completed snapshot has no publication owner")
         async with self._lock:
+            if launch := self._snapshot_launches.get(job.operation_id):
+                if launch[0] != job.fingerprint:
+                    raise RuntimeError("operation_id was reused for another snapshot")
+                return launch[1]
             cached = self._operations.get(job.operation_id)
             if cached is not None:
                 if cached[0] != job.fingerprint:
                     raise RuntimeError("operation_id was reused for another snapshot")
-                completion = asyncio.get_running_loop().create_future()
-                completion.set_result(cached[1])
-                return SnapshotPrepareCommandLaunch(completion=completion)
-            if inflight := self._snapshot_launches.get(job.operation_id):
-                if inflight[0] != job.fingerprint:
-                    raise RuntimeError("operation_id was reused for another snapshot")
-                return inflight[1]
+                raise RuntimeError("completed snapshot has no publication owner")
             self._validate_operation(job)
             generation_id = job.generation.generation_id
             if generation_id in self._publications:
@@ -4663,7 +4698,9 @@ class MonarchTrainerRun:
                     ),
                     name=f"megatron-snapshot-plan-{job.operation_id}",
                 )
-                launch = SnapshotPrepareCommandLaunch(completion=completion)
+                launch = SnapshotPrepareCommandLaunch(
+                    completion=completion, publication=publication
+                )
                 self._snapshot_launches[job.operation_id] = (
                     job.fingerprint,
                     launch,
@@ -4709,7 +4746,9 @@ class MonarchTrainerRun:
         self._snapshot_tasks.add(completion)
         completion.add_done_callback(self._snapshot_tasks.discard)
         completion.add_done_callback(consume_future_exception)
-        return SnapshotPrepareCommandLaunch(completion=completion)
+        return SnapshotPrepareCommandLaunch(
+            completion=completion, publication=prepared.publication
+        )
 
     async def _complete_snapshot_prepare(
         self,
@@ -4754,10 +4793,10 @@ class MonarchTrainerRun:
                 publication.set_exception(error)
             state.records.clear()
             state.train_done = True
+            self._snapshot_launches.pop(job.operation_id, None)
             await self._invalidate_command(error, "snapshot and cleanup failed")
             raise
         finally:
-            self._snapshot_launches.pop(job.operation_id, None)
             self._retire_publication(state)
 
     async def authorize_snapshot(
@@ -5300,6 +5339,7 @@ class MonarchTrainerRun:
         return self._await_publication(state)
 
     def retire_operation(self, operation_id: str) -> None:
+        self._snapshot_launches.pop(operation_id, None)
         self._operations.pop(operation_id, None)
         self._operation_sequence_ids.pop(operation_id, None)
         self._cancelled_operations.pop(operation_id, None)

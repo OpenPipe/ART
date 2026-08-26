@@ -146,7 +146,7 @@ async def test_ordered_sampler_snapshot_does_not_add_existing_local_output(
         pass
 
     class Trainer:
-        async def prepare_snapshot(self, job: GenerationSnapshotJobSpec):
+        async def start_prepare_snapshot(self, job: GenerationSnapshotJobSpec):
             jobs.append(job)
             raise StopAfterCapture
 

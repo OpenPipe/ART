@@ -1649,14 +1649,11 @@ class DistributedMegatronService:
         )
         snapshot = await trainer.start_snapshot(job)
         metrics: dict[str, float] = {}
-        raw_rank_snapshot = asyncio.create_task(
-            trainer.wait_for_publication(generation.generation_id)
-        )
 
         async def complete_rank_snapshot() -> tuple[TrainerRankPublication, ...]:
             result = await asyncio.shield(snapshot.completion)
             metrics.update(result["metrics"])
-            return await asyncio.shield(raw_rank_snapshot)
+            return await asyncio.shield(snapshot.publication)
 
         rank_snapshot = asyncio.create_task(complete_rank_snapshot())
         self._snapshot_rank_tasks[generation.policy_step] = rank_snapshot

@@ -161,6 +161,7 @@ async def test_trainer_consumes_only_the_exact_cancelled_sequence() -> None:
     run._cancelled_operations = {}
     run._operation_sequence_ids = {}
     run._operations = {}
+    run._snapshot_launches = {}
     run._next_operation_sequence = 0
     run._learner_version = 7
     run._open_forward_backward_ids = ["prior-gradient"]

@@ -10,6 +10,7 @@ from art.megatron.optimizer_state import CheckpointFile, OptimizerAdapter
 from art.megatron.runtime.monarch import (
     MonarchTrainerActor,
     MonarchTrainerRun,
+    MonarchTrainerSlot,
     _await_snapshot_readiness,
     _CommandReady,
     _snapshot_readiness_timeout,
@@ -236,6 +237,135 @@ def test_snapshot_rank_result_does_not_overtake_readiness_delivery() -> None:
         assert not waiting.done()
         readiness.set_result(None)
         await waiting
+
+    asyncio.run(run_test())
+
+
+def test_slot_snapshot_launch_owns_publication_before_plan_completion() -> None:
+    async def run_test() -> None:
+        job = snapshot_job()
+        plan_gate = asyncio.Event()
+        adapter = OptimizerAdapter(
+            identity=job.generation.adapter_path,
+            training_session_id=job.training_session_id,
+            step=job.learner_version,
+            generation_id=job.generation.generation_id,
+            files=(
+                CheckpointFile(
+                    name="adapter_config.json", size_bytes=1, sha256="b" * 64
+                ),
+                CheckpointFile(
+                    name="adapter_model.safetensors", size_bytes=1, sha256="a" * 64
+                ),
+            ),
+        )
+        rank_plan = SnapshotRankWritePlan(
+            rank=0,
+            generation=job.generation,
+            adapter=adapter,
+            saves_optimizer=False,
+        )
+
+        class SnapshotCall:
+            async def call(self, job_json, _event_port, ready_port):
+                parsed = GenerationSnapshotJobSpec.model_validate_json(job_json)
+                ready_port.send(
+                    _CommandReady(
+                        rank=0,
+                        operation_id=parsed.operation_id,
+                        learner_version=parsed.learner_version,
+                    ).model_dump(mode="json")
+                )
+                await plan_gate.wait()
+                return {
+                    0: {
+                        "rank": 0,
+                        "operation_id": parsed.operation_id,
+                        "learner_version": parsed.learner_version,
+                        "rank_write_plan": rank_plan.model_dump(mode="json"),
+                        "metrics": {},
+                    }
+                }
+
+        class AuthorizeCall:
+            async def call(self, _plan_json, _grant_json):
+                return {
+                    0: {
+                        "rank": 0,
+                        "operation_id": job.operation_id,
+                        "metrics": {},
+                    }
+                }
+
+        slot = MonarchTrainerSlot.__new__(MonarchTrainerSlot)
+        slot._actors = SimpleNamespace(
+            execute_run_slot_snapshot=SnapshotCall(),
+            authorize_run_slot_snapshot=AuthorizeCall(),
+        )
+        slot._rank_processes = (object(),)
+        slot._control_lock = asyncio.Lock()
+        slot._closed = False
+        slot._valid = True
+        slot._command_timeout_s = 2.0
+        slot._operations = {}
+        slot._snapshot_launches = {}
+        slot._snapshot_tasks = set()
+        slot._publications = {}
+        slot._publication_authorizations = {}
+        slot._publication_predecessors = {}
+        slot._publication_authorization_tail = None
+
+        async def collect_publication(self, _receiver, _generation, *, authorization):
+            await authorization.wait()
+            return ()
+
+        slot._collect_publication = MethodType(collect_publication, slot)
+        launch = await asyncio.wait_for(slot.start_snapshot(job), 1)
+        assert not launch.completion.done()
+        assert launch.publication is slot._publications[job.operation_id]
+        lookup = slot.wait_for_publication(job.operation_id)
+        retry = await asyncio.wait_for(slot.start_snapshot(job), 1)
+        assert retry.publication is launch.publication
+
+        plan_gate.set()
+        assert (await asyncio.wait_for(launch.completion, 1))["operation_id"] == (
+            job.operation_id
+        )
+        await asyncio.wait_for(retry.completion, 1)
+        assert await asyncio.wait_for(launch.publication, 1) == ()
+        assert await asyncio.wait_for(lookup, 1) == ()
+        slot.retire_operation(job.operation_id)
+        assert job.operation_id not in slot._snapshot_launches
+        assert job.operation_id not in slot._publications
+        assert job.operation_id not in slot._publication_authorizations
+
+    asyncio.run(run_test())
+
+
+def test_slot_failed_plan_retires_reserved_publication() -> None:
+    async def run_test() -> None:
+        operation_id = "failed-snapshot"
+        authorization = asyncio.Event()
+
+        async def publication_result():
+            await authorization.wait()
+            await asyncio.Event().wait()
+
+        publication = asyncio.create_task(publication_result())
+        slot = MonarchTrainerSlot.__new__(MonarchTrainerSlot)
+        slot._publications = {operation_id: publication}
+        slot._publication_authorizations = {operation_id: authorization}
+        slot._publication_predecessors = {operation_id: None}
+        slot._publication_authorization_tail = authorization
+
+        await slot._abort_snapshot_publication(operation_id, publication)
+
+        assert publication.cancelled()
+        assert authorization.is_set()
+        assert slot._publications == {}
+        assert slot._publication_authorizations == {}
+        assert slot._publication_predecessors == {}
+        assert slot._publication_authorization_tail is None
 
     asyncio.run(run_test())
 
