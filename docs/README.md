@@ -25,4 +25,4 @@ Edits are reflected immediately by the development server.
 
 Run `pnpm build` before opening a pull request. This checks the project, builds the static pages, and creates the Pagefind search index. The output in `dist` can be hosted on Cloudflare Workers, Cloudflare Pages, GitHub Pages, or another static host.
 
-The included `wrangler.jsonc` targets the `art-new-docs` Cloudflare Pages project. After authenticating Wrangler with the intended Cloudflare account, run `pnpm deploy`.
+The included `wrangler.jsonc` targets the `art-docs` Cloudflare Pages project in the OpenPipe account. After authenticating Wrangler with that account, run `pnpm deploy`.

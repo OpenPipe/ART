@@ -1,6 +1,6 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
-  "name": "art-new-docs",
+  "name": "art-docs",
   "compatibility_date": "2026-08-25",
   "pages_build_output_dir": "./dist"
 }

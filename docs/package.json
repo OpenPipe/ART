@@ -6,7 +6,7 @@
   "scripts": {
     "dev": "astro dev --port 3001",
     "build": "astro check && astro build && pagefind --site dist",
-    "deploy": "pnpm build && wrangler pages deploy --project-name art-new-docs",
+    "deploy": "pnpm build && wrangler pages deploy --project-name art-docs",
     "preview": "astro preview --port 3001",
     "preview:cloudflare": "pnpm build && wrangler dev",
     "check": "astro check"
