@@ -781,7 +781,10 @@ class PolicyActivationEvent(NamedTuple):
         return self.serving_active_monotonic_s - self.trainer_completed_monotonic_s
 
 
-async def _activation_event(service: Any, step: int) -> PolicyActivationEvent:
+async def _activation_event(
+    service: Any, step: int, sampler: Any
+) -> PolicyActivationEvent:
+    await sampler.result()
     await service.wait_for_serving(step)
     completed, active = service.policy_activation_timing(step)
     return PolicyActivationEvent(step, completed, active)
@@ -2067,16 +2070,26 @@ async def _run_e2e_throughput_async(
                 def __getattr__(self, name: str) -> Any:
                     return getattr(self._inner, name)
 
+                async def commands_admitted(self, **kwargs: Any) -> None:
+                    await self._inner.commands_admitted(**kwargs)
+                    sampler = kwargs["sampler"]
+                    step = int(sampler.ref.learner_parent_version)
+                    if step in activation_tasks:
+                        raise RuntimeError(
+                            f"duplicate sampler publication for policy {step}"
+                        )
+                    activation_tasks[step] = asyncio.create_task(
+                        _activation_event(service, step, sampler),
+                        name=f"throughput-policy-activation-{step}",
+                    )
+
                 async def complete(self, **kwargs: Any) -> Any:
                     result = await self._inner.complete(**kwargs)
                     step = int(result.step)
-                    if step in activation_tasks:
+                    if step not in activation_tasks:
                         raise RuntimeError(
-                            f"duplicate trainer completion for policy {step}"
+                            f"trainer completion lacks sampler publication for policy {step}"
                         )
-                    activation_tasks[step] = asyncio.create_task(
-                        _activation_event(service, step)
-                    )
                     captured_batch_id = self._captured_batch_id
                     if captured_batch_id is not None:
                         capture_task = capture_tasks.get(captured_batch_id)
