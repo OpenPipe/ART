@@ -139,15 +139,18 @@ def mamba_prefix_tree_forward(
             num_groups=int(cp.ngroups_local_tpcp),
         ),
     )
+    gate = canonical[:, : recurrent.shape[-1]]
     local = canonical_head_shard_to_token_layout(
-        recurrent,
+        torch.cat((recurrent, gate), dim=-1),
         tuple(projected.shape),
         plan.exchange,
         shape,
         mixer.pg_collection.cp,
     )
-    if mixer.rmsnorm:
-        local = mixer.norm(local)
+    if not mixer.rmsnorm:
+        raise RuntimeError("ART Mamba tree execution requires gated RMSNorm")
+    local, gate = local.chunk(2, dim=-1)
+    local = mixer.norm(local, gate)
     return mixer.out_proj(local)
 
 

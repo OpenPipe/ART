@@ -80,17 +80,22 @@ def canonical_head_shard_to_token_layout(
     """Return CP head-sharded Mamba output to ART's attention token layout."""
 
     local_inner = shape.inner // plan.cp_size
-    if tuple(canonical.shape) != (plan.token_count, local_inner):
+    if canonical.ndim != 2:
+        raise ValueError(f"canonical Mamba output must be 2D, got {canonical.shape}")
+    components, remainder = divmod(int(canonical.shape[-1]), local_inner)
+    if int(canonical.shape[0]) != plan.token_count or not components or remainder:
         raise ValueError(
-            f"canonical Mamba output has shape {tuple(canonical.shape)}, expected "
-            f"{(plan.token_count, local_inner)}"
+            "canonical Mamba output must contain whole CP-local head components; "
+            f"got {tuple(canonical.shape)}"
         )
+    local_width = components * local_inner
+    output_width = components * shape.inner
     if plan.cp_size == 1:
         flat = canonical.new_zeros(
-            (projected_shape[0] * projected_shape[1], shape.inner)
+            (projected_shape[0] * projected_shape[1], output_width)
         )
         return flat.index_copy(0, plan.physical_token_positions, canonical).view(
-            projected_shape[0], projected_shape[1], shape.inner
+            projected_shape[0], projected_shape[1], output_width
         )
     send_chunks = [
         canonical.index_select(0, positions)
@@ -98,33 +103,33 @@ def canonical_head_shard_to_token_layout(
     ]
     received = _all_to_all_flat(
         torch.cat(send_chunks, dim=0).flatten(),
-        send_splits=tuple(count * local_inner for count in plan.source_token_counts),
-        receive_splits=(plan.local_token_count * local_inner,) * plan.cp_size,
+        send_splits=tuple(count * local_width for count in plan.source_token_counts),
+        receive_splits=(plan.local_token_count * local_width,) * plan.cp_size,
         group=group,
     )
     assembled = torch.cat(
         tuple(
             received.narrow(
                 0,
-                rank * plan.local_token_count * local_inner,
-                plan.local_token_count * local_inner,
-            ).view(plan.local_token_count, local_inner)
+                rank * plan.local_token_count * local_width,
+                plan.local_token_count * local_width,
+            ).view(plan.local_token_count, components, local_inner)
             for rank in range(plan.cp_size)
         ),
         dim=-1,
-    )
+    ).flatten(1)
     flat_size = projected_shape[0] * projected_shape[1]
     if flat_size < plan.local_token_count:
         raise ValueError(
             "Mamba output token layout is smaller than its real token count"
         )
-    flat = canonical.new_zeros((flat_size, shape.inner))
+    flat = canonical.new_zeros((flat_size, output_width))
     flat = flat.index_copy(
         0,
         torch.arange(plan.local_token_count, device=canonical.device),
         assembled,
     )
-    return flat.view(projected_shape[0], projected_shape[1], shape.inner)
+    return flat.view(projected_shape[0], projected_shape[1], output_width)
 
 
 def _all_to_all_flat(

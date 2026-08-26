@@ -111,7 +111,12 @@ def _build_conv_buckets(
     for depth in range(
         max((segment.depth for segment in tree.segments), default=-1) + 1
     ):
-        segments = tuple(segment for segment in tree.segments if segment.depth == depth)
+        segments = tuple(
+            sorted(
+                (segment for segment in tree.segments if segment.depth == depth),
+                key=lambda segment: (segment.length, segment.index),
+            )
+        )
         if not segments:
             continue
         lengths = tuple(segment.length for segment in segments)
@@ -234,8 +239,13 @@ def _materialize_scan_phase(
         )
         grouped.setdefault((column.needs_final_state, padded_length), []).append(column)
     return tuple(
-        _materialize_scan_bucket(group, length, needs_state, device)
-        for (needs_state, length), group in grouped.items()
+        _materialize_scan_bucket(
+            group,
+            max(len(column.positions) for column in group),
+            needs_state,
+            device,
+        )
+        for (needs_state, _), group in grouped.items()
     )
 
 

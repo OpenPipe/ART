@@ -116,7 +116,7 @@ def _run_scan_bucket(
     dense = postconv.index_select(0, bucket.token_indices.flatten()).view(
         bucket.batch_size, bucket.length, -1
     )
-    z, convolved, dt = torch.split(dense, [inner, inner + 2 * groups, heads], dim=-1)
+    _, convolved, dt = torch.split(dense, [inner, inner + 2 * groups, heads], dim=-1)
     x, b, c = torch.split(convolved, [inner, groups, groups], dim=-1)
     dt = dt.masked_fill(~bucket.real_mask.unsqueeze(-1), -torch.inf)
     result = _mamba_chunk_scan_combined()(
@@ -127,7 +127,7 @@ def _run_scan_bucket(
         c.view(bucket.batch_size, bucket.length, params.num_groups, params.state_dim),
         chunk_size,
         D=params.d.float(),
-        z=z.view(bucket.batch_size, bucket.length, heads, params.head_dim),
+        z=None,
         dt_bias=params.dt_bias.float(),
         initial_states=initial_states,
         dt_softplus=True,
