@@ -1,0 +1,58 @@
+---
+import MobileMenuFooter from "@astrojs/starlight/components/MobileMenuFooter.astro";
+
+const { sidebar } = Astro.locals.starlightRoute;
+
+const icons: Record<string, string> = {
+  "/getting-started/about/": "house",
+  "/getting-started/quick-start/": "forward",
+  "/getting-started/installation-setup/": "gear",
+  "/getting-started/notebooks/": "book",
+  "/getting-started/faq/": "block-question",
+  "/fundamentals/training-loop/": "recycle",
+  "/fundamentals/art-client/": "laptop-code",
+  "/fundamentals/art-backend/": "server",
+  "/fundamentals/ruler/": "ruler",
+  "/fundamentals/sft-training/": "graduation-cap",
+  "/features/tracking-metrics/": "chart-line",
+  "/tutorials/summarizer/": "list",
+  "/tutorials/open-deep-research/": "magnifying-glass",
+  "/resources/models/": "robot",
+  "/resources/glossary/": "circle-info",
+};
+
+const iconUrl = (name: string) => `url("https://d3gk2c5xim1je2.cloudfront.net/fontawesome/v7.2.0/regular/${name}.svg")`;
+---
+
+<ul class="art-sidebar-list">
+  {sidebar.map((entry) => (
+    entry.type === "group" ? (
+      <li class="art-sidebar-section">
+        <div class="art-sidebar-heading">{entry.label}</div>
+        <ul>
+          {entry.entries.map((item) => item.type === "link" && (
+            <li>
+              <a href={item.href} aria-current={item.isCurrent ? "page" : undefined}>
+                {icons[item.href] && <span
+                  class="art-icon art-sidebar-icon"
+                  style={`--art-icon: ${iconUrl(icons[item.href])}`}
+                ></span>}
+                <span>{item.label}</span>
+              </a>
+            </li>
+          ))}
+        </ul>
+      </li>
+    ) : (
+      <li class="art-sidebar-section">
+        <a href={entry.href} aria-current={entry.isCurrent ? "page" : undefined}>
+          <span>{entry.label}</span>
+        </a>
+      </li>
+    )
+  ))}
+</ul>
+
+<div class="md:sl-hidden">
+  <MobileMenuFooter />
+</div>

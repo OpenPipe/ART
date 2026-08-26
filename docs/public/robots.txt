@@ -1,0 +1,4 @@
+User-agent: *
+Content-Signal: ai-train=yes, search=yes, ai-input=yes
+Allow: /
+Sitemap: https://art.openpipe.ai/sitemap-index.xml

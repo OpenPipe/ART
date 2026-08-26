@@ -1,0 +1,42 @@
+---
+title: "Quick Start"
+description: "Get started with ART in a few quick steps."
+---
+
+import { Accordion, Card, Frame, Note, Info, Warning, Callout } from "../../../components/mintlify";
+
+In this Quick Start tutorial, we'll be training Qwen3 14B Instruct to play [2048](https://play2048.co/), a simple game that requires forward planning and basic math skills.
+
+<Info>
+
+Reading time: <b>15 min</b>
+
+Training time: <b>2 hours</b>
+
+Total cost: <b>Free!</b>
+
+</Info>
+
+## Step 1: Provision W&B API key
+
+[ART](https://github.com/OpenPipe/art) is an open source library and works across infra and observability providers. To keep things simple in this tutorial, we'll exclusively use Weights & Biases services, which means we'll only need to provision one API key. We'll use these services:
+
+* **W&B Training** - autoscale GPUs for inference and training
+* **W&B Models** - record metrics like reward
+* **W&B Weave** - record your model's traces as it generates completions
+* **W&B Artifacts** - store and manage your model's checkpoints
+
+Weights & Biases currently provides a small free tier for all the services we'll use during this quickstart, so you shouldn't need to add a credit card to get started.
+
+- [Weights & Biases](https://wandb.ai/home)
+
+Once you have your Weights & Biases API key, open the [notebook](https://colab.research.google.com/github/openpipe/art-notebooks/blob/main/examples/2048/2048.ipynb) in Google Colab and set it in the **Environment Variables** cell. Then continue on to the next step.
+
+## Step 2: Run the notebook
+
+At the top of the [notebook](https://colab.research.google.com/github/openpipe/art-notebooks/blob/main/examples/2048/2048.ipynb) you should see a small **Run all** button. Press it to begin training your model.
+
+
+## Step 3: Track metrics
+
+While your run progresses, observe its traces and metrics in your [W&B workspace](https://wandb.ai/home). You should start seeing some progress in the first 20-30 steps. For a guide to the metrics ART logs automatically and how to add your own, see [Tracking Metrics](/features/tracking-metrics). If you have questions along the way, please ask in the [Discord](https://discord.gg/zbBHRUpwf4). Happy training!

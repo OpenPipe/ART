@@ -1,31 +1,28 @@
-# OpenPipe Documentation
+# ART Documentation
 
-This repository contains the source for the ART documentation website hosted at [https://art.openpipe.ai](https://art.openpipe.ai).
+This directory contains the source for the ART documentation website hosted at [https://art.openpipe.ai](https://art.openpipe.ai). The site is built with [Astro Starlight](https://starlight.astro.build/) and can be deployed to any static host.
 
 ## Prerequisites
 
-Ensure you have the following packages installed on your machine:
-
 - [pnpm](https://pnpm.io/installation)
-- [node](https://nodejs.org/en/download/)
+- [Node.js](https://nodejs.org/en/download/)
 
-## Contributing
+## Local development
 
-To edit the documentation follow these steps:
+1. Navigate to the `docs` directory.
+2. Run `pnpm install`.
+3. Run `pnpm dev` to start the development server on port 3001.
+4. Edit pages in `src/content/docs`.
 
-1. Clone the repository
-2. Navigate to the `docs` directory
-3. Run `pnpm install` to install the dependencies
-4. Run `pnpm dev` to start the development server
-5. Edit the files in the `docs` directory
-
-Edits to files should immediately be reflected in the development server.
+Edits are reflected immediately by the development server.
 
 ### Adding new pages
 
-1. Create a new .mdx file in the `docs` directory
-2. Navigate to the `mint.json` file and add the new page to the appropriate section to the `navigation` array, or create a new section. Ensure that the path to the new page is correct.
+1. Create a new `.md` or `.mdx` file in `src/content/docs`.
+2. Add the page to the appropriate sidebar group in `astro.config.mjs`.
 
-### Deploying changes
+### Building and deploying
 
-To deploy changes to the hosted docs, commit your changes in a new git branch and create a pull request. Once the pull request is merged, the changes will be deployed to the hosted docs.
+Run `pnpm build` before opening a pull request. The static output in `dist` can be hosted on Cloudflare Workers, Cloudflare Pages, GitHub Pages, or another static host.
+
+The included `wrangler.jsonc` is ready for Cloudflare Workers static-asset hosting. After authenticating Wrangler with the intended Cloudflare account, run `pnpm deploy`.
