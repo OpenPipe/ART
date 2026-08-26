@@ -40,7 +40,7 @@ def _hf_reference_mamba_forward(
     cache_position: torch.Tensor | None = None,
     attention_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Use the pinned training SSD scan in the otherwise-native HF mixer."""
+    """Use ART's pinned training kernels in the otherwise-native HF mixer."""
 
     if cache_params is not None:
         raise RuntimeError("Nemotron-H HF parity does not support Mamba cache state")
@@ -70,12 +70,27 @@ def _hf_reference_mamba_forward(
     )
     if int(projected.shape[-1]) != expected_width:
         raise RuntimeError("Nemotron-H HF Mamba projection geometry changed")
-    gate, convolved, dt = projected.split(
+    gate, conv_input, dt = projected.split(
         [mixer.intermediate_size, mixer.conv_dim, mixer.num_heads], dim=-1
     )
-    convolved = mixer.act(
-        mixer.conv1d(convolved.transpose(1, 2))[..., :sequence].transpose(1, 2)
+    from art.megatron.gdn.conv_gelu import packed_varlen_causal_conv
+
+    convolved, _ = packed_varlen_causal_conv(
+        conv_input.flatten(0, 1),
+        torch.arange(
+            0,
+            (batch + 1) * sequence,
+            sequence,
+            dtype=torch.int32,
+            device=input_states.device,
+        ),
+        conv_input.new_zeros((batch, mixer.conv_dim, int(mixer.conv_kernel_size) - 1)),
+        mixer.conv1d.weight.squeeze(1),
+        mixer.conv1d.bias,
+        activation="silu",
+        output_final_state=True,
     )
+    convolved = convolved.view(batch, sequence, mixer.conv_dim)
     convolved = mask_padding(convolved, attention_mask)
     group_width = mixer.n_groups * mixer.ssm_state_size
     x, b, c = convolved.split(
