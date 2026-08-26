@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from functools import lru_cache
+
 from pydantic import BaseModel, ConfigDict, Field
 import torch
 
@@ -78,6 +80,7 @@ class _ScanColumn(BaseModel):
     needs_final_state: bool
 
 
+@lru_cache(maxsize=4)
 def build_mamba_execution_plan(
     tree: RecurrentPrefixTree,
     *,
@@ -87,7 +90,7 @@ def build_mamba_execution_plan(
     token_layout: TokenLayoutIndex | None,
     chunk_size: int = 128,
 ) -> MambaExecutionPlan:
-    """Materialize fixed-shape tree, scan, and CP metadata once per packed row."""
+    """Reuse fixed-shape tree, scan, and CP metadata across identical packed rows."""
 
     if chunk_size <= 0:
         raise ValueError(f"chunk_size must be positive, got {chunk_size}")
