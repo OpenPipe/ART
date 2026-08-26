@@ -15,6 +15,14 @@ from art.loss import AlignedLossInputs, LossInputs
 
 _ENABLE_ENV = "ART_MEGATRON_SELECTIVE_LM_HEAD"
 _ROW_ALIGNMENT = 16
+# FP32 normalization is exact but must never scale in memory with every selected row.
+_SELECTED_LOGPROB_FP32_CHUNK_BYTES = 1 << 30
+
+
+def _selected_logprob_chunk_rows(local_vocab_size: int) -> int:
+    if local_vocab_size < 1:
+        raise ValueError("selected logprob vocabulary must be nonempty")
+    return max(1, _SELECTED_LOGPROB_FP32_CHUNK_BYTES // (4 * local_vocab_size))
 
 
 class LmHeadTokenSelection(BaseModel):
@@ -311,8 +319,9 @@ class _VocabParallelSelectedLogprobs(torch.autograd.Function):
             raise ValueError("selected logprobs require [N,V] logits and [N,K] targets")
         if local_logits.shape[0] != target_tokens.shape[0]:
             raise ValueError("selected logprob logits and targets do not align")
-        logits = local_logits.float()
-        local_max = logits.max(dim=1).values
+        row_count, local_vocab_size = map(int, local_logits.shape)
+        chunk_rows = _selected_logprob_chunk_rows(local_vocab_size)
+        local_max = local_logits.max(dim=1).values.float()
         global_max = local_max.clone()
         if tp_size > 1:
             torch.distributed.all_reduce(
@@ -320,20 +329,25 @@ class _VocabParallelSelectedLogprobs(torch.autograd.Function):
                 op=torch.distributed.ReduceOp.MAX,  # ty: ignore[possibly-missing-attribute]
                 group=group,
             )
-        exp_logits = torch.exp(logits - global_max.unsqueeze(1))
-        exp_sum = exp_logits.sum(dim=1)
+        exp_sum = torch.empty_like(global_max)
+        for start in range(0, row_count, chunk_rows):
+            rows = slice(start, min(start + chunk_rows, row_count))
+            exp_logits = local_logits[rows].to(dtype=torch.float32, copy=True)
+            exp_logits.sub_(global_max[rows].unsqueeze(1)).exp_()
+            exp_sum[rows] = exp_logits.sum(dim=1)
         if tp_size > 1:
             torch.distributed.all_reduce(exp_sum, group=group)
-        softmax = exp_logits / exp_sum.unsqueeze(1)
 
         local_targets = target_tokens - vocab_start
         valid = target_tokens >= 0
         owns_target = (
             valid & (local_targets >= 0) & (local_targets < local_logits.shape[1])
         )
-        target_logits = logits.gather(
-            1, local_targets.clamp(0, local_logits.shape[1] - 1)
-        ).masked_fill(~owns_target, 0.0)
+        target_logits = (
+            local_logits.gather(1, local_targets.clamp(0, local_logits.shape[1] - 1))
+            .float()
+            .masked_fill(~owns_target, 0.0)
+        )
         owners = owns_target.to(dtype=torch.int32)
         if tp_size > 1:
             torch.distributed.all_reduce(target_logits, group=group)
@@ -342,8 +356,9 @@ class _VocabParallelSelectedLogprobs(torch.autograd.Function):
             torch.all((~valid) | (owners == 1)),
             "target token is outside the vocabulary-parallel output",
         )
-        ctx.save_for_backward(softmax, local_targets, owns_target, valid)
-        ctx.input_dtype = local_logits.dtype
+        ctx.save_for_backward(local_logits, target_tokens, global_max, exp_sum)
+        ctx.vocab_start = vocab_start
+        ctx.chunk_rows = chunk_rows
         return (target_logits - (global_max + exp_sum.log()).unsqueeze(1)).masked_fill(
             ~valid, 0.0
         )
@@ -353,15 +368,28 @@ class _VocabParallelSelectedLogprobs(torch.autograd.Function):
         ctx: Any, *grad_outputs: Any
     ) -> tuple[torch.Tensor, None, None, None, None]:
         grad_output = cast(torch.Tensor, grad_outputs[0])
-        softmax, local_targets, owns_target, valid = ctx.saved_tensors
-        coefficients = grad_output.float().masked_fill(~valid, 0.0)
-        grad_logits = -softmax * coefficients.sum(dim=1, keepdim=True)
-        grad_logits.scatter_add_(
-            1,
-            local_targets.clamp(0, grad_logits.shape[1] - 1),
-            coefficients.masked_fill(~owns_target, 0.0),
+        local_logits, target_tokens, global_max, exp_sum = ctx.saved_tensors
+        local_targets = target_tokens - ctx.vocab_start
+        valid = target_tokens >= 0
+        owns_target = (
+            valid & (local_targets >= 0) & (local_targets < local_logits.shape[1])
         )
-        return grad_logits.to(dtype=ctx.input_dtype), None, None, None, None
+        coefficients = grad_output.float().masked_fill(~valid, 0.0)
+        grad_logits = torch.empty_like(local_logits)
+        row_count = int(local_logits.shape[0])
+        for start in range(0, row_count, ctx.chunk_rows):
+            rows = slice(start, min(start + ctx.chunk_rows, row_count))
+            chunk = local_logits[rows].to(dtype=torch.float32, copy=True)
+            chunk.sub_(global_max[rows].unsqueeze(1)).exp_()
+            chunk.div_(exp_sum[rows].unsqueeze(1))
+            chunk.mul_(-coefficients[rows].sum(dim=1, keepdim=True))
+            chunk.scatter_add_(
+                1,
+                local_targets[rows].clamp(0, chunk.shape[1] - 1),
+                coefficients[rows].masked_fill(~owns_target[rows], 0.0),
+            )
+            grad_logits[rows] = chunk
+        return grad_logits, None, None, None, None
 
 
 def vocab_parallel_selected_logprobs(
