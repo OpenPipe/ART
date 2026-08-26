@@ -5604,11 +5604,12 @@ class MonarchTrainerRun:
             return ValueError(
                 "resident score batch length does not match the trainer runtime"
             )
-        if bool(job.batch.moe_routing_replay) != bool(
-            self.runtime_spec.enable_moe_routing_replay
+        if (
+            job.batch.moe_routing_replay is not None
+            and not self.runtime_spec.enable_moe_routing_replay
         ):
             return ValueError(
-                "resident score routing replay does not match the trainer runtime"
+                "resident score requires unsupported MoE routing replay"
             )
         return None
 

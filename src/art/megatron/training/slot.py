@@ -561,11 +561,11 @@ class MegatronTrainingSlot:
             if moe_route_prefetch is not None:
                 raise ValueError("tokenized packing cannot consume MoE route prefetch")
             if (
-                self.runtime_spec.enable_moe_routing_replay
-                and request.batch.datums[0].moe_routes is None
+                request.batch.datums[0].moe_routes is not None
+                and not self.runtime_spec.enable_moe_routing_replay
             ):
                 raise ValueError(
-                    "MoE routing replay requires routes for every tokenized datum"
+                    "trainer runtime does not support MoE routing replay"
                 )
             plan = await self.runtime.prepare_pack(
                 PackingRequest(
@@ -587,7 +587,11 @@ class MegatronTrainingSlot:
             )
         if not isinstance(request.batch, RlTrajectoryBatch):
             raise TypeError("packed planning requires an RL or tokenized batch")
+        route_groups = request.batch.local_moe_route_groups()
         route_transfer = request.batch.local_moe_route_object_transfer()
+        replay_requested = bool(route_groups) or route_transfer is not None
+        if replay_requested and not self.runtime_spec.enable_moe_routing_replay:
+            raise ValueError("trainer runtime does not support MoE routing replay")
         if moe_route_prefetch is not None and route_transfer != (
             moe_route_prefetch.transfer
         ):
@@ -609,7 +613,7 @@ class MegatronTrainingSlot:
                     else uuid.uuid4().hex
                 ),
                 trajectory_groups=request.batch.groups,
-                moe_route_groups=request.batch.local_moe_route_groups(),
+                moe_route_groups=route_groups,
                 moe_route_object_transfer=route_transfer,
                 trajectory_annotations=request.batch.local_group_annotations(),
                 advantage_balance=config.advantage_balance,
@@ -622,7 +626,7 @@ class MegatronTrainingSlot:
                 logprob_calculation_chunk_size=(
                     config.logprob_calculation_chunk_size or 1024
                 ),
-                include_moe_routing=self.runtime_spec.enable_moe_routing_replay,
+                include_moe_routing=replay_requested,
                 collect_packing_shapes=request.collect_packing_shapes,
                 group_ids=tuple(
                     f"{ref.operation_id}:{index}"
