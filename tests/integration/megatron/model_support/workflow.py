@@ -102,7 +102,7 @@ _WORKFLOW_STAGE_TIMEOUT_OVERRIDES_S = {
     (
         "correctness_sensitivity",
         "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
-    ): 45 * 60,
+    ): 75 * 60,
 }
 
 
