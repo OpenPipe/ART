@@ -632,7 +632,7 @@ def _prepare_dense_rl_micro(
                 group_ids=micro["group_ids"], parent_ids=micro["parent_ids"]
             )
         ),
-        loss_bearing_tokens=int(shifted_assistant_mask.sum().item()),
+        loss_bearing_tokens=lm_head_selection.logical_row_count,
         executed_token_equivalents=int(micro["tokens"].numel()),
         nominal_schedule_capacity_tokens=int(micro["tokens"].numel()),
     )
@@ -824,15 +824,15 @@ def _prepare_dense_sft_micro(
     position_ids = torch.arange(seq_len, device=device).unsqueeze(0)
     shifted_labels = shift_tensor(labels, -100)
     loss_mask = shifted_labels != -100
-    workload = TrainingMicrobatchWorkload(
-        logical_nonpadding_tokens=int(attention_mask.sum().item()),
-        loss_bearing_tokens=int(loss_mask.sum().item()),
-        executed_token_equivalents=seq_len,
-        nominal_schedule_capacity_tokens=int(micro["input_ids"].numel()),
-    )
     lm_head_selection = LmHeadTokenSelection.from_labels(
         shifted_labels,
         target_device=device,
+    )
+    workload = TrainingMicrobatchWorkload(
+        logical_nonpadding_tokens=int(attention_mask.sum().item()),
+        loss_bearing_tokens=lm_head_selection.logical_row_count,
+        executed_token_equivalents=seq_len,
+        nominal_schedule_capacity_tokens=int(micro["input_ids"].numel()),
     )
     shifted_labels = shifted_labels.to(device)
     loss_mask = loss_mask.to(device)

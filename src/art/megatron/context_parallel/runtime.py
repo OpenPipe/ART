@@ -2528,25 +2528,13 @@ def dispatch_megatron_context_parallel_training_tensors(
         assistant_mask_shape=tuple(tensors.assistant_mask.shape),
         **cuda_stream_fields(tensors.assistant_mask.device.index),
     )
-    trace_current_preschedule("cp_assistant_mask_sum_enter", **cuda_stream_fields())
-    loss_bearing_tokens_tensor = tensors.assistant_mask.sum()
     trace_current_preschedule(
-        "cp_assistant_mask_sum_exit",
-        sum_tensor_object_id=id(loss_bearing_tokens_tensor),
-        **cuda_stream_fields(loss_bearing_tokens_tensor.device.index),
-    )
-    trace_current_preschedule(
-        "cp_assistant_mask_item_enter",
-        sum_tensor_object_id=id(loss_bearing_tokens_tensor),
-        **cuda_stream_fields(loss_bearing_tokens_tensor.device.index),
-    )
-    loss_bearing_tokens = int(loss_bearing_tokens_tensor.item())
-    trace_current_preschedule(
-        "cp_assistant_mask_item_exit", loss_bearing_tokens=loss_bearing_tokens
+        "cp_loss_bearing_tokens",
+        loss_bearing_tokens=lm_head_selection.logical_row_count,
     )
     workload = TrainingMicrobatchWorkload(
         logical_nonpadding_tokens=sum(rank_plan.local_valid_lengths),
-        loss_bearing_tokens=loss_bearing_tokens,
+        loss_bearing_tokens=lm_head_selection.logical_row_count,
         executed_token_equivalents=int(local_labels.numel()),
         nominal_schedule_capacity_tokens=rank_plan.original_seq_len,
     )

@@ -2825,12 +2825,11 @@ def _local_packed_token_scores(
     top_k: int,
 ) -> tuple[PackedTokenScore, ...]:
     selection = prepared.lm_head_selection
-    labels = selection.select(prepared.model_labels).reshape(-1)
+    labels = selection.select_labels(prepared.model_labels).reshape(-1)
     token_uids = prepared.local_token_uids
     if token_uids is None:
         raise RuntimeError("resident scoring requires packed token UIDs")
-    uid_indices = selection.flat_indices.to(device=token_uids.device)
-    selected_uids = token_uids.reshape(-1).index_select(0, uid_indices)
+    selected_uids = selection.select(token_uids, padding_value=-1).reshape(-1)
     target_logprobs, top_logprobs, top_ids = _vocab_parallel_token_scores(
         local_logits,
         labels,
@@ -4003,7 +4002,9 @@ def run_megatron_rl_forward_backward_step(
                 assert loss_weights is not None
                 assert behavior_logprobs is not None
                 assert token_advantages is not None
-                selected_targets = prepared.lm_head_selection.select_rows(target_tokens)
+                selected_targets = prepared.lm_head_selection.select_rows(
+                    target_tokens, padding_value=-1
+                )
                 selected_weights = prepared.lm_head_selection.select_rows(loss_weights)
                 selected_behavior = prepared.lm_head_selection.select_rows(
                     behavior_logprobs

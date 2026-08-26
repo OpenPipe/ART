@@ -8,7 +8,7 @@ from megatron.core import parallel_state as ps
 from megatron.core.tensor_parallel.mappings import (
     gather_from_sequence_parallel_region,
 )
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 import torch
 
 from art.loss import AlignedLossInputs, LossInputs
@@ -24,6 +24,24 @@ class LmHeadTokenSelection(BaseModel):
 
     flat_indices: torch.Tensor
     full_shape: tuple[int, int]
+    logical_row_count: int = Field(ge=0)
+    alignment_padding_rows: int = Field(ge=0, le=_ROW_ALIGNMENT)
+
+    @model_validator(mode="after")
+    def _validate_rows(self) -> "LmHeadTokenSelection":
+        if self.flat_indices.ndim != 1 or self.flat_indices.dtype != torch.long:
+            raise ValueError("LM-head row indices must be a flat int64 tensor")
+        if int(self.flat_indices.numel()) != self.logical_row_count:
+            raise ValueError("LM-head logical row metadata does not match indices")
+        if self.logical_row_count > self.full_shape[0] * self.full_shape[1]:
+            raise ValueError("LM-head logical row count exceeds the label shape")
+        if self.projected_row_count and self.projected_row_count % _ROW_ALIGNMENT:
+            raise ValueError("LM-head projected rows must satisfy row alignment")
+        return self
+
+    @property
+    def projected_row_count(self) -> int:
+        return self.logical_row_count + self.alignment_padding_rows
 
     @classmethod
     def from_labels(
@@ -38,71 +56,108 @@ class LmHeadTokenSelection(BaseModel):
             )
         flat_labels = labels.reshape(-1)
         indices = torch.nonzero(flat_labels != -100, as_tuple=False).reshape(-1)
+        logical_row_count = int(indices.numel())
         pad_rows = (
             _ROW_ALIGNMENT
-            if labels.numel() and not indices.numel()
-            else -indices.numel() % _ROW_ALIGNMENT
+            if labels.numel() and not logical_row_count
+            else -logical_row_count % _ROW_ALIGNMENT
         )
-        if pad_rows:
-            # TE specializes n_rows divisibility into data-dependent Triton
-            # binaries. Ignored rows keep every compact launch on one path.
-            ignored = torch.nonzero(flat_labels == -100, as_tuple=False).reshape(-1)
-            if not ignored.numel():
-                raise ValueError("LM-head row alignment requires one ignored label")
-            repeats = (pad_rows + ignored.numel() - 1) // ignored.numel()
-            indices = torch.cat((indices, ignored.repeat(repeats)[:pad_rows]))
         if target_device is not None:
             indices = indices.to(device=target_device, non_blocking=True)
         return cls(
             flat_indices=indices.to(dtype=torch.long).contiguous(),
             full_shape=(int(labels.shape[0]), int(labels.shape[1])),
+            logical_row_count=logical_row_count,
+            alignment_padding_rows=pad_rows,
         )
 
-    def select(self, tensor: torch.Tensor) -> torch.Tensor:
+    def _select_flat(
+        self,
+        tensor: torch.Tensor,
+        *,
+        padding_value: int | float | bool,
+    ) -> torch.Tensor:
+        selected = tensor.index_select(0, self.flat_indices)
+        if not self.alignment_padding_rows:
+            return selected
+        # Synthetic rows keep the projection shape stable without connecting
+        # alignment-only work to any logical token's gradient.
+        padding = tensor.new_full(
+            (self.alignment_padding_rows, *tensor.shape[1:]), padding_value
+        )
+        return torch.cat((selected, padding), dim=0)
+
+    def select(
+        self,
+        tensor: torch.Tensor,
+        *,
+        padding_value: int | float | bool = 0,
+    ) -> torch.Tensor:
         expected = self.full_shape[0] * self.full_shape[1]
         if tensor.numel() != expected:
             raise ValueError(
                 "selected token tensor must match the label shape: "
                 f"tensor={tuple(tensor.shape)} labels={self.full_shape}"
             )
-        return tensor.reshape(-1).index_select(0, self.flat_indices).unsqueeze(0)
+        return self._select_flat(
+            tensor.reshape(-1), padding_value=padding_value
+        ).unsqueeze(0)
 
-    def select_optional(self, tensor: torch.Tensor | None) -> torch.Tensor | None:
-        return None if tensor is None else self.select(tensor)
+    def select_labels(self, labels: torch.Tensor) -> torch.Tensor:
+        return self.select(labels, padding_value=-100)
 
-    def select_rows(self, tensor: torch.Tensor) -> torch.Tensor:
+    def select_optional(
+        self,
+        tensor: torch.Tensor | None,
+        *,
+        padding_value: int | float | bool = 0,
+    ) -> torch.Tensor | None:
+        return (
+            None
+            if tensor is None
+            else self.select(tensor, padding_value=padding_value)
+        )
+
+    def select_rows(
+        self,
+        tensor: torch.Tensor,
+        *,
+        padding_value: int | float | bool = 0,
+    ) -> torch.Tensor:
         if tuple(tensor.shape[:2]) != self.full_shape:
             raise ValueError(
                 "selected row tensor must match the label shape: "
                 f"tensor={tuple(tensor.shape)} labels={self.full_shape}"
             )
-        return tensor.reshape(-1, *tensor.shape[2:]).index_select(0, self.flat_indices)
+        return self._select_flat(
+            tensor.reshape(-1, *tensor.shape[2:]), padding_value=padding_value
+        )
 
     def restore(self, tensor: torch.Tensor, *, fill_value: float = 0.0) -> torch.Tensor:
-        if tensor.numel() != self.flat_indices.numel():
+        if tensor.numel() != self.projected_row_count:
             raise ValueError(
                 "selected tensor length does not match LM-head selection: "
-                f"tensor={tensor.numel()} selection={self.flat_indices.numel()}"
+                f"tensor={tensor.numel()} selection={self.projected_row_count}"
             )
         restored = tensor.new_full(self.full_shape, fill_value)
         restored.reshape(-1).index_copy_(
             0,
             self.flat_indices,
-            tensor.reshape(-1),
+            tensor.reshape(-1)[: self.logical_row_count],
         )
         return restored
 
     def restore_rows(
         self, tensor: torch.Tensor, *, fill_value: float = 0.0
     ) -> torch.Tensor:
-        if int(tensor.shape[0]) != int(self.flat_indices.numel()):
+        if int(tensor.shape[0]) != self.projected_row_count:
             raise ValueError(
                 "selected tensor rows do not match LM-head selection: "
-                f"tensor={tensor.shape[0]} selection={self.flat_indices.numel()}"
+                f"tensor={tensor.shape[0]} selection={self.projected_row_count}"
             )
         restored = tensor.new_full((*self.full_shape, *tensor.shape[1:]), fill_value)
         restored.reshape(-1, *tensor.shape[1:]).index_copy_(
-            0, self.flat_indices, tensor
+            0, self.flat_indices, tensor[: self.logical_row_count]
         )
         return restored
 
@@ -202,7 +257,7 @@ def forward_token_losses(
             token_losses=_empty_token_losses(logits, labels),
             selection=selection,
         )
-    compact_labels = selection.select(labels)
+    compact_labels = selection.select_labels(labels)
     with _select_output_rows(language_model.output_layer, selection):
         with _restore_root_output(model, selection):
             token_losses = model(**forward_kwargs, labels=compact_labels)
@@ -231,7 +286,7 @@ def forward_token_logits(
         logits = model(**forward_kwargs, labels=None)
     if not isinstance(logits, torch.Tensor) or logits.ndim != 3:
         raise TypeError("selected model output must be a [tokens, batch, vocab] tensor")
-    selected_tokens = int(selection.flat_indices.numel())
+    selected_tokens = selection.projected_row_count
     if tuple(logits.shape[:2]) == (selected_tokens, 1):
         return logits[:, 0, :].contiguous()
     if tuple(logits.shape[:2]) == (1, selected_tokens):
@@ -421,12 +476,7 @@ def _select_output_rows(
                 "LM-head hidden states do not match labels: "
                 f"hidden={tuple(hidden_states.shape)} labels={selection.full_shape}"
             )
-        selected = (
-            hidden_states.transpose(0, 1)
-            .reshape(batch * sequence, hidden_states.shape[-1])
-            .index_select(0, selection.flat_indices)
-            .unsqueeze(1)
-        )
+        selected = selection.select_rows(hidden_states.transpose(0, 1)).unsqueeze(1)
         return (selected, *args[1:]), kwargs
 
     handle = output_layer.register_forward_pre_hook(select_rows, with_kwargs=True)
