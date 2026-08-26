@@ -435,8 +435,8 @@ _B300_THROUGHPUT_FLOORS = {
         (81_700, 76_400, 4_850, 0.88, 2.5),
     ),
     "nemotron_h_moe": (
-        "8c5a0f125a8bd8365b68753bd933c9888661cd956c07cc8e4a1e52e94be85216",
-        (40_000, 34_000, 800, 0.80, 4.5),
+        "2729a0389a6fa02d8bdda9f64cff2983dc5113d1123d148e8dd8234882cd6cbd",
+        (40_000, 37_500, 850, 0.88, 4.2),
     ),
 }
 _B300_THROUGHPUT_FINGERPRINT_OVERRIDES = {
