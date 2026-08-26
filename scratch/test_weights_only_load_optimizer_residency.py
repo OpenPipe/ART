@@ -188,7 +188,7 @@ def _executor(
     monkeypatch.setattr(
         MCoreRunSlotExecutor,
         "_build_prepared_lora_export_plan",
-        lambda _self, _checkpoint: "replacement-plan",
+        lambda _self, _checkpoint, **_kwargs: "replacement-plan",
     )
     monkeypatch.setattr(lora_disk, "load_adapter_config", lambda _path: _CONFIG)
     monkeypatch.setattr(
@@ -237,6 +237,7 @@ def test_weights_only_load_registers_fresh_cpu_optimizer_in_l2(
             "generation": job.generation,
             "weights_key": prepared.weights_key,
             "export_plan": "replacement-plan",
+            "optimizer_export_plan": "replacement-plan",
             "adapter_config": _CONFIG,
             "optimizer_source": prepared.optimizer.source,
             "optimizer_key": prepared.optimizer_key,
