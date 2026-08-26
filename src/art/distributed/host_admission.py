@@ -25,7 +25,9 @@ _SHA256 = r"^[0-9a-f]{64}$"
 _BOOT_ID_PATH = Path("/proc/sys/kernel/random/boot_id")
 _BASE_PACKAGES = ("openpipe-art", "pydantic", "torchmonarch")
 _TRAINER_PACKAGES = (
+    "causal-conv1d",
     "flash-attn-4",
+    "mamba-ssm",
     "megatron-bridge",
     "megatron-core",
     "numpy",

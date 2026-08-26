@@ -6,6 +6,7 @@ dependencies = [
     "aiohttp>=3.13.0",
     "apache-tvm-ffi==0.1.11",
     "anthropic>=0.77.0",
+    "causal-conv1d==1.6.1",
     "flash-attn-4==4.0.0b5",
     "flash-linear-attention==0.5.0",
     "flashinfer-cubin==0.6.8.post1",
@@ -85,9 +86,10 @@ override-dependencies = [
     "quack-kernels==0.3.9",
     "tilelang==0.1.10",
 ]
-exclude-dependencies = ["pynvml", "emerging-optimizers", "causal-conv1d"]
+exclude-dependencies = ["pynvml", "emerging-optimizers"]
 no-build-isolation-package = [
     "apex",
+    "causal-conv1d",
     "megatron-bridge",
     "nv-grouped-gemm",
     "transformer-engine",
@@ -98,6 +100,7 @@ no-build-isolation-package = [
 
 [tool.uv.extra-build-dependencies]
 apex = ["torch>=2.11.0"]
+causal-conv1d = [{ requirement = "torch", match-runtime = true }]
 mamba-ssm = [{ requirement = "torch", match-runtime = true }]
 megatron-core = ["pybind11", "setuptools"]
 nv-grouped-gemm = ["torch>=2.11.0"]
@@ -105,6 +108,7 @@ transformer-engine-torch = ["torch>=2.11.0"]
 
 [tool.uv.extra-build-variables]
 apex = { APEX_CPP_EXT = "1", APEX_CUDA_EXT = "1", APEX_FAST_LAYER_NORM = "1", APEX_PARALLEL_BUILD = "8", NVCC_APPEND_FLAGS = "--threads 1" }
+causal-conv1d = { CAUSAL_CONV1D_FORCE_BUILD = "TRUE", MAX_JOBS = "32" }
 mamba-ssm = { MAMBA_FORCE_BUILD = "TRUE", MAX_JOBS = "32" }
 transformer-engine-torch = { NVTE_NO_LOCAL_VERSION = "1" }
 
@@ -112,6 +116,11 @@ transformer-engine-torch = { NVTE_NO_LOCAL_VERSION = "1" }
 name = "apex"
 version = "0.1"
 requires-dist = ["packaging"]
+
+[[tool.uv.dependency-metadata]]
+name = "causal-conv1d"
+version = "1.6.1"
+requires-dist = ["ninja", "packaging", "torch"]
 
 [[tool.uv.dependency-metadata]]
 name = "mamba-ssm"
@@ -180,6 +189,7 @@ requires-dist = [
 
 [tool.uv.sources]
 apex = { git = "https://github.com/NVIDIA/apex.git", rev = "25.09" }
+causal-conv1d = { git = "https://github.com/Dao-AILab/causal-conv1d.git", rev = "c8a268d69712776c7184083e6f158ae20a8961f9" }
 flash-attn-4 = { url = "https://files.pythonhosted.org/packages/24/f7/01ee2576ce41f9884d291ee21861ef194afc0b2b1ce3bd175fc7a6e1b133/flash_attn_4-4.0.0b5-py3-none-any.whl" }
 mamba-ssm = { git = "https://github.com/state-spaces/mamba.git", rev = "e9594ce1c732d97440f0332fdc43170a2294dbfa" }
 megatron-bridge = { git = "https://github.com/NVIDIA-NeMo/Megatron-Bridge.git", rev = "e1a207ac757e5d0ed94d8ffbe1cbd28e81d8c084" }

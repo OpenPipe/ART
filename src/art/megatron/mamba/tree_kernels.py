@@ -101,12 +101,15 @@ def _scatter_rows_kernel(
     rows,
     width: tl.constexpr,
     source_stride: tl.constexpr,
+    IDENTITY_SOURCE: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
     n = tl.program_id(0) * BLOCK_N + tl.arange(0, BLOCK_N)
     d = tl.program_id(1) * BLOCK_D + tl.arange(0, BLOCK_D)
-    source_row = tl.load(source_rows + n, mask=n < rows, other=0).to(tl.int64)
+    source_row = n.to(tl.int64)
+    if not IDENTITY_SOURCE:
+        source_row = tl.load(source_rows + n, mask=n < rows, other=0).to(tl.int64)
     destination = tl.load(destinations + n, mask=n < rows, other=0).to(tl.int64)
     mask = (n[:, None] < rows) & (d[None, :] < width)
     value = tl.load(
@@ -128,13 +131,16 @@ def _gather_rows_grad_kernel(
     output,
     rows,
     width: tl.constexpr,
+    IDENTITY_SOURCE: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
     n = tl.program_id(0) * BLOCK_N + tl.arange(0, BLOCK_N)
     d = tl.program_id(1) * BLOCK_D + tl.arange(0, BLOCK_D)
     destination = tl.load(destinations + n, mask=n < rows, other=0).to(tl.int64)
-    source_row = tl.load(source_rows + n, mask=n < rows, other=0).to(tl.int64)
+    source_row = n.to(tl.int64)
+    if not IDENTITY_SOURCE:
+        source_row = tl.load(source_rows + n, mask=n < rows, other=0).to(tl.int64)
     mask = (n[:, None] < rows) & (d[None, :] < width)
     value = tl.load(
         grad + destination[:, None] * width + d[None, :].to(tl.int64),
@@ -241,6 +247,7 @@ class _AssembleScanOutputs(torch.autograd.Function):
                 count,
                 width,
                 output.stride(-2),
+                False,
                 _BLOCK_N,
                 _BLOCK_D,
                 num_warps=8,
@@ -270,11 +277,65 @@ class _AssembleScanOutputs(torch.autograd.Function):
                 output,
                 row_count,
                 ctx.width,
+                False,
                 _BLOCK_N,
                 _BLOCK_D,
                 num_warps=8,
             )
             result.extend((output, None, None))
+        return tuple(result)
+
+
+class _AssembleRows(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx: Any, token_count: int, *args: torch.Tensor) -> torch.Tensor:
+        outputs = args[0::2]
+        destinations = args[1::2]
+        width = int(outputs[0].shape[-1])
+        result = outputs[0].new_empty((token_count, width))
+        for output, positions in zip(outputs, destinations, strict=True):
+            rows = int(positions.numel())
+            _scatter_rows_kernel[
+                (triton.cdiv(rows, _BLOCK_N), triton.cdiv(width, _BLOCK_D))
+            ](
+                output,
+                positions,
+                positions,
+                result,
+                rows,
+                width,
+                output.stride(0),
+                True,
+                _BLOCK_N,
+                _BLOCK_D,
+                num_warps=8,
+            )
+        ctx.save_for_backward(*destinations)
+        ctx.shapes = tuple(tuple(output.shape) for output in outputs)
+        ctx.width = width
+        return result
+
+    @staticmethod
+    def backward(ctx: Any, grad: torch.Tensor) -> tuple[Any, ...]:
+        result: list[Any] = [None]
+        for shape, positions in zip(ctx.shapes, ctx.saved_tensors, strict=True):
+            output = grad.new_empty(shape)
+            rows = int(positions.numel())
+            _gather_rows_grad_kernel[
+                (triton.cdiv(rows, _BLOCK_N), triton.cdiv(ctx.width, _BLOCK_D))
+            ](
+                grad,
+                positions,
+                positions,
+                output,
+                rows,
+                ctx.width,
+                True,
+                _BLOCK_N,
+                _BLOCK_D,
+                num_warps=8,
+            )
+            result.extend((output, None))
         return tuple(result)
 
 
@@ -285,6 +346,17 @@ def gather_scan_inputs(
     occurrences: torch.Tensor,
 ) -> torch.Tensor:
     return _GatherScanInputs.apply(convolved, dt, positions, occurrences)
+
+
+def assemble_rows(
+    outputs: list[torch.Tensor],
+    destinations: list[torch.Tensor],
+    token_count: int,
+) -> torch.Tensor:
+    args = tuple(
+        item for pair in zip(outputs, destinations, strict=True) for item in pair
+    )
+    return _AssembleRows.apply(token_count, *args)
 
 
 def assemble_scan_outputs(

@@ -12,8 +12,8 @@ class MambaConvBucket(BaseModel):
 
     segment_indices: tuple[int, ...]
     parent_indices: tuple[int, ...]
+    parent_rows: torch.Tensor
     token_indices: torch.Tensor
-    cu_seqlens: torch.Tensor
 
 
 class MambaScanBucket(BaseModel):
@@ -21,6 +21,7 @@ class MambaScanBucket(BaseModel):
 
     state_indices: tuple[int, ...]
     parent_state_indices: tuple[int, ...]
+    parent_rows: torch.Tensor
     token_indices: torch.Tensor
     output_rows: torch.Tensor
     output_positions: torch.Tensor
@@ -62,7 +63,6 @@ class MambaExecutionPlan(BaseModel):
     conv_buckets: tuple[MambaConvBucket, ...]
     scan_phases: tuple[tuple[MambaScanBucket, ...], ...]
     conv_token_positions: torch.Tensor
-    conv_canonical_order: torch.Tensor
     scan_token_positions: torch.Tensor
     scan_token_occurrences: torch.Tensor
     exchange: MambaTokenExchangePlan
@@ -117,7 +117,6 @@ def build_mamba_execution_plan(
         conv_buckets=conv_buckets,
         scan_phases=scan_phases,
         conv_token_positions=conv_positions,
-        conv_canonical_order=_canonical_order(conv_positions, tree.token_count),
         scan_token_positions=scan_positions,
         scan_token_occurrences=scan_occurrences,
         exchange=exchange,
@@ -130,39 +129,46 @@ def _build_conv_buckets(
     device: torch.device,
 ) -> tuple[MambaConvBucket, ...]:
     buckets = []
+    state_rows: dict[int, int] = {}
     for depth in range(
         max((segment.depth for segment in tree.segments), default=-1) + 1
     ):
-        segments = tuple(
-            sorted(
-                (segment for segment in tree.segments if segment.depth == depth),
-                key=lambda segment: (segment.length, segment.index),
+        lengths = sorted(
+            {segment.length for segment in tree.segments if segment.depth == depth}
+        )
+        for length in lengths:
+            segments = tuple(
+                segment
+                for segment in tree.segments
+                if segment.depth == depth and segment.length == length
             )
-        )
-        if not segments:
-            continue
-        lengths = tuple(segment.length for segment in segments)
-        cu_seqlens = torch.tensor(
-            (0, *torch.tensor(lengths).cumsum(0).tolist()),
-            dtype=torch.int32,
-            device=device,
-        )
-        buckets.append(
-            MambaConvBucket(
-                segment_indices=tuple(segment.index for segment in segments),
-                parent_indices=tuple(segment.parent_index for segment in segments),
-                token_indices=torch.tensor(
-                    tuple(
-                        position
-                        for segment in segments
-                        for position in range(segment.start, segment.end)
+            segment_indices = tuple(segment.index for segment in segments)
+            parent_indices = tuple(segment.parent_index for segment in segments)
+            buckets.append(
+                MambaConvBucket(
+                    segment_indices=segment_indices,
+                    parent_indices=parent_indices,
+                    parent_rows=torch.tensor(
+                        tuple(
+                            -1 if parent < 0 else state_rows[parent]
+                            for parent in parent_indices
+                        ),
+                        dtype=torch.long,
+                        device=device,
                     ),
-                    dtype=torch.long,
-                    device=device,
-                ),
-                cu_seqlens=cu_seqlens,
+                    token_indices=torch.tensor(
+                        tuple(
+                            position
+                            for segment in segments
+                            for position in range(segment.start, segment.end)
+                        ),
+                        dtype=torch.long,
+                        device=device,
+                    ),
+                )
             )
-        )
+            for segment_index in segment_indices:
+                state_rows[segment_index] = len(state_rows)
     return tuple(buckets)
 
 
@@ -242,14 +248,22 @@ def _build_scan_phases(
         if segment.parent_index < 0:
             visit(segment.index, (), (), -1, 0)
 
-    return tuple(
-        _materialize_scan_phase(columns, chunk_size, device) for columns in phases
-    )
+    materialized = []
+    state_rows: dict[int, int] = {}
+    for columns in phases:
+        buckets = _materialize_scan_phase(columns, chunk_size, state_rows, device)
+        materialized.append(buckets)
+        for bucket in buckets:
+            if bucket.needs_final_state:
+                for state_index in bucket.state_indices:
+                    state_rows[state_index] = len(state_rows)
+    return tuple(materialized)
 
 
 def _materialize_scan_phase(
     columns: list[_ScanColumn],
     chunk_size: int,
+    state_rows: dict[int, int],
     device: torch.device,
 ) -> tuple[MambaScanBucket, ...]:
     grouped: dict[tuple[bool, int], list[_ScanColumn]] = {}
@@ -265,6 +279,7 @@ def _materialize_scan_phase(
             group,
             max(len(column.positions) for column in group),
             needs_state,
+            state_rows,
             device,
         )
         for (needs_state, _), group in grouped.items()
@@ -275,6 +290,7 @@ def _materialize_scan_bucket(
     columns: list[_ScanColumn],
     length: int,
     needs_final_state: bool,
+    state_rows: dict[int, int],
     device: torch.device,
 ) -> MambaScanBucket:
     token_indices = torch.zeros((len(columns), length), dtype=torch.long)
@@ -291,6 +307,16 @@ def _materialize_scan_bucket(
     return MambaScanBucket(
         state_indices=tuple(column.state_index for column in columns),
         parent_state_indices=tuple(column.parent_state_index for column in columns),
+        parent_rows=torch.tensor(
+            tuple(
+                -1
+                if column.parent_state_index < 0
+                else state_rows[column.parent_state_index]
+                for column in columns
+            ),
+            dtype=torch.long,
+            device=device,
+        ),
         token_indices=token_indices.to(device),
         output_rows=output_rows.to(device),
         output_positions=output_positions.to(device),

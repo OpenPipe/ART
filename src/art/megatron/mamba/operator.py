@@ -3,16 +3,15 @@ from __future__ import annotations
 from functools import cache
 from importlib import import_module
 from importlib.metadata import version
-from typing import cast
 
 from pydantic import BaseModel, ConfigDict, Field
 import torch
+import torch.nn.functional as F
 
-from art.megatron.gdn.conv_gelu import packed_varlen_causal_conv
-
+from .causal_conv import causal_conv1d
 from .permutation import permute_rows
 from .plan import MambaConvBucket, MambaExecutionPlan, MambaScanBucket
-from .tree_kernels import assemble_scan_outputs, gather_scan_inputs
+from .tree_kernels import assemble_rows, assemble_scan_outputs, gather_scan_inputs
 
 MAMBA_SSM_VERSION = "2.3.2.post1"
 
@@ -28,6 +27,56 @@ class MambaParameters(BaseModel):
     head_dim: int = Field(gt=0)
     state_dim: int = Field(gt=0)
     num_groups: int = Field(gt=0)
+
+
+class _SplitScanInputs(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx: object,
+        dense: torch.Tensor,
+        heads: int,
+        head_dim: int,
+        groups: int,
+        state_dim: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        del ctx
+        inner = heads * head_dim
+        state_width = groups * state_dim
+        return (
+            dense[..., :inner].view(*dense.shape[:2], heads, head_dim),
+            dense[..., inner : inner + state_width].view(
+                *dense.shape[:2], groups, state_dim
+            ),
+            dense[..., inner + state_width : inner + 2 * state_width].view(
+                *dense.shape[:2], groups, state_dim
+            ),
+            dense[..., inner + 2 * state_width :],
+        )
+
+    @staticmethod
+    def backward(  # ty: ignore[invalid-method-override]
+        ctx: object,
+        grad_x: torch.Tensor,
+        grad_b: torch.Tensor,
+        grad_c: torch.Tensor,
+        grad_dt: torch.Tensor,
+    ) -> tuple[torch.Tensor, None, None, None, None]:
+        del ctx
+        return (
+            torch.cat(
+                (
+                    grad_x.flatten(2),
+                    grad_b.flatten(2),
+                    grad_c.flatten(2),
+                    grad_dt,
+                ),
+                dim=-1,
+            ),
+            None,
+            None,
+            None,
+            None,
+        )
 
 
 def run_mamba_tree(
@@ -52,7 +101,7 @@ def run_mamba_tree(
     output_rows: list[torch.Tensor] = []
     output_positions: list[torch.Tensor] = []
     offset = 0
-    states: list[torch.Tensor | None] = []
+    states: list[torch.Tensor] = []
     zero_state = torch.zeros(
         (heads, params.head_dim, params.state_dim),
         dtype=torch.float32,
@@ -61,7 +110,7 @@ def run_mamba_tree(
     for phase in plan.scan_phases:
         for bucket in phase:
             parents = _parent_states(
-                bucket.parent_state_indices, states, zero_state, "SSD"
+                bucket.parent_state_indices, bucket.parent_rows, states, zero_state
             )
             rows = bucket.batch_size * bucket.length
             dense_output, final = _run_scan_bucket(
@@ -78,7 +127,7 @@ def run_mamba_tree(
             if bucket.needs_final_state:
                 if final is None:
                     raise RuntimeError("Mamba SSD omitted a required boundary state")
-                _store_states(states, bucket.state_indices, final)
+                states.append(final)
     return assemble_scan_outputs(
         outputs, output_rows, output_positions, plan.tree.token_count
     )
@@ -92,7 +141,7 @@ def _run_convolution(
     compacted = permute_rows(conv_input, plan.conv_token_positions)
     outputs = []
     offset = 0
-    states: list[torch.Tensor | None] = []
+    states: list[torch.Tensor] = []
     zero_state = conv_input.new_zeros(
         (int(params.conv_weight.shape[0]), int(params.conv_weight.shape[1]) - 1)
     )
@@ -101,22 +150,42 @@ def _run_convolution(
         compact = compacted.narrow(0, offset, length)
         offset += length
         parents = _parent_states(
-            bucket.parent_indices, states, zero_state, "convolution"
+            bucket.parent_indices, bucket.parent_rows, states, zero_state
         )
-        compact_output, final = packed_varlen_causal_conv(
-            compact,
-            bucket.cu_seqlens,
-            parents,
-            params.conv_weight,
-            params.conv_bias,
-            activation="silu",
-            output_final_state=True,
-        )
-        if final is None:
-            raise RuntimeError("Mamba convolution omitted a required boundary state")
+        batch = len(bucket.segment_indices)
+        channels = int(compact.shape[1])
+        dense = compact.view(batch, length // batch, channels).transpose(1, 2)
+        if compact.dtype == torch.float32:
+            full = torch.cat((parents, dense), dim=-1)
+            compact_output = F.silu(
+                F.conv1d(
+                    full,
+                    params.conv_weight.unsqueeze(1),
+                    params.conv_bias,
+                    groups=channels,
+                )
+            )
+            state_length = int(params.conv_weight.shape[1]) - 1
+            final = full[..., -state_length:] if state_length else full[..., :0]
+        else:
+            initial = parents.transpose(1, 2).contiguous().transpose(1, 2)
+            bias = params.conv_bias
+            if bias is None:
+                bias = params.conv_weight.new_zeros(channels)
+            compact_output, final = causal_conv1d(
+                dense,
+                params.conv_weight,
+                bias,
+                initial,
+            )
+        compact_output = compact_output.transpose(1, 2).contiguous().flatten(0, 1)
         outputs.append(compact_output)
-        _store_states(states, bucket.segment_indices, final)
-    return permute_rows(torch.cat(outputs), plan.conv_canonical_order)
+        states.append(final)
+    return assemble_rows(
+        outputs,
+        [bucket.token_indices for bucket in plan.conv_buckets],
+        plan.tree.token_count,
+    )
 
 
 def _run_scan_bucket(
@@ -127,17 +196,16 @@ def _run_scan_bucket(
     chunk_size: int,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     heads = int(params.dt_bias.numel())
-    inner = heads * params.head_dim
-    groups = params.num_groups * params.state_dim
     dense = scan_inputs.view(bucket.batch_size, bucket.length, -1)
-    convolved, dt = torch.split(dense, [inner + 2 * groups, heads], dim=-1)
-    x, b, c = torch.split(convolved, [inner, groups, groups], dim=-1)
+    x, b, c, dt = _SplitScanInputs.apply(
+        dense, heads, params.head_dim, params.num_groups, params.state_dim
+    )
     result = _mamba_chunk_scan_combined()(
-        x.view(bucket.batch_size, bucket.length, heads, params.head_dim),
+        x,
         dt,
         -torch.exp(params.a_log.float()),
-        b.view(bucket.batch_size, bucket.length, params.num_groups, params.state_dim),
-        c.view(bucket.batch_size, bucket.length, params.num_groups, params.state_dim),
+        b,
+        c,
         chunk_size,
         D=params.d.float(),
         z=None,
@@ -151,40 +219,25 @@ def _run_scan_bucket(
         output, final = result
     else:
         output, final = result, None
-    return output.view(bucket.batch_size, bucket.length, inner), final
+    return output.view(bucket.batch_size, bucket.length, heads * params.head_dim), final
 
 
 def _parent_states(
     parent_indices: tuple[int, ...],
-    states: list[torch.Tensor | None],
+    parent_rows: torch.Tensor,
+    states: list[torch.Tensor],
     zero: torch.Tensor,
-    kind: str,
 ) -> torch.Tensor:
-    selected = []
-    missing = []
-    for parent in parent_indices:
-        if parent < 0:
-            selected.append(zero)
-        elif parent >= len(states) or states[parent] is None:
-            missing.append(parent)
-        else:
-            selected.append(cast(torch.Tensor, states[parent]))
-    if missing:
-        raise RuntimeError(f"Mamba {kind} is missing parent states {missing}")
-    return torch.stack(selected)
-
-
-def _store_states(
-    states: list[torch.Tensor | None],
-    indices: tuple[int, ...],
-    values: torch.Tensor,
-) -> None:
-    if int(values.shape[0]) != len(indices):
-        raise ValueError("Mamba state rows do not match the execution plan")
-    if indices:
-        states.extend(None for _ in range(max(indices) + 1 - len(states)))
-    for row, index in enumerate(indices):
-        states[index] = values[row]
+    if all(parent < 0 for parent in parent_indices):
+        return zero.unsqueeze(0).expand(int(parent_rows.numel()), *zero.shape)
+    available = states[0] if len(states) == 1 else torch.cat(states)
+    if all(parent >= 0 for parent in parent_indices):
+        return available.index_select(0, parent_rows)
+    output = zero.unsqueeze(0).expand(int(parent_rows.numel()), *zero.shape).clone()
+    positions = (parent_rows >= 0).nonzero().flatten()
+    return output.index_copy(
+        0, positions, available.index_select(0, parent_rows[positions])
+    )
 
 
 def _validate_inputs(

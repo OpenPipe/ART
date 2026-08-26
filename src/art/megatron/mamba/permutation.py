@@ -14,6 +14,7 @@ def _permute_rows_kernel(
     output,
     rows,
     width: tl.constexpr,
+    source_stride: tl.constexpr,
     INVERSE: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_D: tl.constexpr,
@@ -25,7 +26,8 @@ def _permute_rows_kernel(
     output_row = tl.where(INVERSE, ordered, n).to(tl.int64)
     mask = (n[:, None] < rows) & (d[None, :] < width)
     value = tl.load(
-        source + source_row[:, None] * width + d[None, :].to(tl.int64), mask=mask
+        source + source_row[:, None] * source_stride + d[None, :].to(tl.int64),
+        mask=mask,
     )
     tl.store(
         output + output_row[:, None] * width + d[None, :].to(tl.int64),
@@ -41,8 +43,9 @@ _BLOCK_D = 256
 def _launch(
     source: torch.Tensor, order: torch.Tensor, *, inverse: bool
 ) -> torch.Tensor:
-    source = source.contiguous()
     rows, width = source.shape
+    if source.stride(1) != 1:
+        raise ValueError("row permutation requires a contiguous feature dimension")
     output = torch.empty_like(source)
     _permute_rows_kernel[(triton.cdiv(rows, _BLOCK_N), triton.cdiv(width, _BLOCK_D))](
         source,
@@ -50,6 +53,7 @@ def _launch(
         output,
         rows,
         width,
+        source.stride(0),
         inverse,
         _BLOCK_N,
         _BLOCK_D,

@@ -22,7 +22,6 @@ overrides = [
     { name = "tilelang", specifier = "==0.1.10" },
 ]
 excludes = [
-    "causal-conv1d",
     "emerging-optimizers",
     "pynvml",
 ]
@@ -31,6 +30,11 @@ excludes = [
 name = "apex"
 version = "0.1"
 requires-dist = ["packaging"]
+
+[[manifest.dependency-metadata]]
+name = "causal-conv1d"
+version = "1.6.1"
+requires-dist = ["ninja", "packaging", "torch"]
 
 [[manifest.dependency-metadata]]
 name = "mamba-ssm"
@@ -258,6 +262,7 @@ dependencies = [
     { name = "aiohttp" },
     { name = "anthropic" },
     { name = "apache-tvm-ffi" },
+    { name = "causal-conv1d" },
     { name = "flash-attn-4" },
     { name = "flash-linear-attention" },
     { name = "flashinfer-cubin" },
@@ -330,6 +335,7 @@ requires-dist = [
     { name = "anthropic", specifier = ">=0.77.0" },
     { name = "apache-tvm-ffi", specifier = "==0.1.11" },
     { name = "apex", marker = "extra == 'cuda12'", git = "https://github.com/NVIDIA/apex.git?rev=25.09" },
+    { name = "causal-conv1d", git = "https://github.com/Dao-AILab/causal-conv1d.git?rev=c8a268d69712776c7184083e6f158ae20a8961f9" },
     { name = "flash-attn-4", url = "https://files.pythonhosted.org/packages/24/f7/01ee2576ce41f9884d291ee21861ef194afc0b2b1ce3bd175fc7a6e1b133/flash_attn_4-4.0.0b5-py3-none-any.whl" },
     { name = "flash-linear-attention", specifier = "==0.5.0" },
     { name = "flashinfer-cubin", specifier = "==0.6.8.post1" },
@@ -450,6 +456,18 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/70/d2/47e8bc06fe2a06d3f5bdf20f1126ab66c4e99dc48d940e7ba873f7ac7131/cachetools-7.1.7.tar.gz", hash = "sha256:a3e2a00b14d8f8a6b70c1dae7b4685e7ad3bc965c5b42124a2d6ce895da6cf50", size = 40680, upload-time = "2026-08-01T21:20:40.434Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/e4/d8/767faeda872075724b95dd675466a645f1b92aadcdcf2d1429dcfd76c176/cachetools-7.1.7-py3-none-any.whl", hash = "sha256:ef98ef375ad188819ef2f9b3645e3987f4b8c5b7550e436ad998c2de78296df0", size = 16830, upload-time = "2026-08-01T21:20:38.977Z" },
+]
+
+[[package]]
+name = "causal-conv1d"
+version = "1.6.1"
+source = { git = "https://github.com/Dao-AILab/causal-conv1d.git?rev=c8a268d69712776c7184083e6f158ae20a8961f9#c8a268d69712776c7184083e6f158ae20a8961f9" }
+dependencies = [
+    { name = "ninja" },
+    { name = "packaging" },
+    { name = "torch", version = "2.11.0+cu128", source = { registry = "https://download.pytorch.org/whl/cu128" }, marker = "extra == 'extra-20-art-megatron-runtime-cuda12'" },
+    { name = "torch", version = "2.11.0+cu130", source = { registry = "https://download.pytorch.org/whl/cu130" }, marker = "extra == 'extra-20-art-megatron-runtime-cuda13'" },
+    { name = "torch", version = "2.13.0", source = { registry = "https://pypi.org/simple" }, marker = "(extra == 'extra-20-art-megatron-runtime-cuda12' and extra == 'extra-20-art-megatron-runtime-cuda13') or (extra != 'extra-20-art-megatron-runtime-cuda12' and extra != 'extra-20-art-megatron-runtime-cuda13')" },
 ]
 
 [[package]]
