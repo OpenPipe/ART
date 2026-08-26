@@ -21,7 +21,10 @@ from art.megatron.model_support.registry import (
     model_uses_expert_parallel,
 )
 import art.megatron.provider as provider_module
-from art.megatron.runtime.bridge_runtime import load_unique_hf_keys_once
+from art.megatron.runtime.bridge_runtime import (
+    ExpertTensorSlice,
+    load_unique_hf_keys_once,
+)
 
 
 class _FakeProvider:
@@ -267,6 +270,27 @@ def test_gpt_oss_mxfp4_weight_source_materializes_once() -> None:
     assert isinstance(loaded, torch.Tensor)
     assert torch.equal(loaded, resolved)
     assert bridge.calls == [hf_param]
+
+
+def test_expert_tensor_slice_materializes_lazily_and_releases() -> None:
+    calls: list[int] = []
+
+    def load() -> torch.Tensor:
+        calls.append(1)
+        return torch.arange(6).reshape(2, 3)
+
+    expert_slice = ExpertTensorSlice(
+        global_start=4,
+        global_stop=6,
+        loader=load,
+    )
+
+    assert calls == []
+    assert torch.equal(expert_slice[5], torch.tensor([3, 4, 5]))
+    assert calls == [1]
+    expert_slice.release()
+    assert torch.equal(expert_slice[4], torch.tensor([0, 1, 2]))
+    assert calls == [1, 1]
 
 
 def test_finalize_provider_bundle_allows_art_gdn_context_parallel() -> None:

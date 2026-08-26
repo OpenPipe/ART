@@ -304,6 +304,8 @@ def _patch_art_runtime_routes() -> None:
     from vllm.entrypoints.openai.chat_completion.protocol import (
         ChatCompletionRequest,
     )
+    from vllm.entrypoints.openai.completion.api_router import create_completion
+    from vllm.entrypoints.openai.completion.protocol import CompletionRequest
     from vllm.entrypoints.serve.utils.api_utils import validate_json_request
 
     from art_vllm_runtime.binary_routes import (
@@ -396,6 +398,38 @@ def _patch_art_runtime_routes() -> None:
                 )
             with capture_routed_experts() as routes:
                 response = await create_chat_completion(request, raw_request)
+            return _routed_response(response, routes)
+
+        @router.post(
+            "/art/v1/completions",
+            dependencies=[Depends(validate_json_request)],
+        )
+        async def binary_completion(
+            request: CompletionRequest, raw_request: Request
+        ) -> Response:
+            prompt = request.prompt
+            if (
+                request.stream
+                or request.n != 1
+                or not isinstance(prompt, list)
+                or not prompt
+                or not all(type(token) is int for token in prompt)
+                or request.add_special_tokens
+                or request.return_token_ids is not True
+            ):
+                return JSONResponse(
+                    content={
+                        "error": "ART binary completions require one non-streaming "
+                        "choice, exact prompt token IDs, add_special_tokens=false, "
+                        "and return_token_ids=true"
+                    },
+                    status_code=HTTPStatus.BAD_REQUEST.value,
+                )
+            with capture_routed_experts() as routes:
+                response = await create_completion(request, raw_request)
+            return _routed_response(response, routes)
+
+        def _routed_response(response: Response | None, routes: Any) -> Response:
             if response is None:
                 return Response(status_code=499)
             if response.status_code >= HTTPStatus.BAD_REQUEST.value:

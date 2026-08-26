@@ -1,4 +1,5 @@
 import asyncio
+from contextlib import contextmanager
 from http.client import HTTPConnection
 import json
 import os
@@ -8,6 +9,7 @@ from art_vllm_runtime import dedicated_server
 from art_vllm_runtime.fast_metrics import FAST_METRIC_NAMES, FastMetricsSidecar
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+import numpy as np
 import pytest
 from starlette.datastructures import URL
 
@@ -164,6 +166,100 @@ def test_runtime_sleep_route_returns_engine_validation_error(monkeypatch) -> Non
     response = TestClient(app).post("/sleep?level=1&mode=wait")
     assert response.status_code == 400
     assert response.json() == {"error": "invalid level=1 mode='wait'"}
+
+
+@pytest.mark.parametrize("prompt_length", [128, 4096])
+def test_completion_schema_preserves_exact_prompt_token_ids(prompt_length: int) -> None:
+    from vllm.entrypoints.openai.completion.protocol import CompletionRequest
+    from vllm.renderers.inputs.preprocess import parse_model_prompt
+
+    prompt_ids = [index % 257 for index in range(prompt_length)]
+    request = CompletionRequest(
+        model="model",
+        prompt=prompt_ids,
+        add_special_tokens=False,
+        return_token_ids=True,
+    )
+
+    parsed = parse_model_prompt(
+        SimpleNamespace(is_encoder_decoder=False), request.prompt
+    )
+
+    assert parsed["prompt_token_ids"] == prompt_ids
+
+
+def test_binary_completion_route_uses_exact_token_prompt(monkeypatch) -> None:
+    from art_vllm_runtime import binary_routes
+    from vllm.entrypoints.openai import api_server
+    from vllm.entrypoints.openai.completion import api_router
+
+    from art.vllm_route_transport import (
+        decode_routed_experts_completion_response_stream,
+    )
+
+    prompt_ids = list(range(128))
+    observed: dict[str, object] = {}
+
+    async def create_completion(request, _raw_request):
+        observed["request"] = request
+        return dedicated_server.JSONResponse(
+            content={
+                "id": "cmpl-route-test",
+                "object": "text_completion",
+                "created": 0,
+                "model": "model",
+                "choices": [
+                    {
+                        "index": 0,
+                        "text": "",
+                        "finish_reason": "length",
+                        "prompt_token_ids": prompt_ids,
+                        "token_ids": [7],
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 128,
+                    "completion_tokens": 1,
+                    "total_tokens": 129,
+                },
+            }
+        )
+
+    @contextmanager
+    def capture_routed_experts():
+        routes = binary_routes._CapturedRoutes(num_experts=8, padding_layers=())
+        routes[0] = np.zeros((128, 1, 1), dtype=np.uint8)
+        yield routes
+
+    monkeypatch.setattr(api_server, "build_app", lambda *args, **kwargs: FastAPI())
+    monkeypatch.setattr(api_server, "_art_runtime_routes_patched", False, raising=False)
+    monkeypatch.setattr(api_router, "create_completion", create_completion)
+    monkeypatch.setattr(binary_routes, "capture_routed_experts", capture_routed_experts)
+    dedicated_server._patch_art_runtime_routes()
+    app = api_server.build_app()
+    response = TestClient(app).post(
+        "/art/v1/completions",
+        json={
+            "model": "model",
+            "prompt": prompt_ids,
+            "max_tokens": 1,
+            "stream": False,
+            "add_special_tokens": False,
+            "return_token_ids": True,
+        },
+    )
+    assert response.status_code == 200
+
+    async def chunks():
+        yield response.content
+
+    decoded, routes = asyncio.run(
+        decode_routed_experts_completion_response_stream(chunks())
+    )
+    request = observed["request"]
+    assert request.prompt == prompt_ids
+    assert decoded.choices[0].prompt_token_ids == prompt_ids
+    assert routes[0].shape == (128, 1, 1)
 
 
 @pytest.mark.asyncio
