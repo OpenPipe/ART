@@ -1,7 +1,10 @@
 from types import SimpleNamespace
 from typing import Any, cast
 
+import pytest
+
 from art.megatron import train
+from art.megatron.runtime import executor
 
 
 class _Schedule:
@@ -29,6 +32,21 @@ class _CudaEvent:
 
     def elapsed_time(self, end: "_CudaEvent") -> float:
         return end.timestamp_ms - self.timestamp_ms
+
+
+def test_separate_command_executor_records_forward_backward_start(monkeypatch) -> None:
+    timing = train._InterForwardBackwardTiming()
+    runtime = SimpleNamespace(inter_forward_backward_timing=timing)
+    value = cast(Any, object.__new__(executor.MegatronTrainJobExecutor))
+    value.runtime = runtime
+    value._closing = True
+    value._closed = False
+    monkeypatch.setattr(executor.time, "monotonic", lambda: 7.0)
+
+    with pytest.raises(RuntimeError, match="executor is closed"):
+        value.start_forward_backward(None, None, None)
+
+    assert timing.current_job_start_s == 7.0
 
 
 def test_inter_forward_backward_timing_uses_rank_local_monotonic_boundaries(
@@ -91,9 +109,7 @@ def test_inter_forward_backward_timing_reports_invalid_boundary_order(
     train._run_training_schedule(schedule, lambda: None, timing)
     timing.previous_job_complete_s = 14.0
     timing.current_job_start_s = 13.0
-    _, collect_metrics = train._run_training_schedule(
-        schedule, lambda: None, timing
-    )
+    _, collect_metrics = train._run_training_schedule(schedule, lambda: None, timing)
 
     assert collect_metrics() == {
         "time/inter_forward_backward_gap_rank_0_s": 3.0,
@@ -173,9 +189,7 @@ def test_inter_forward_backward_timing_reports_missing_boundaries(monkeypatch) -
 
     train._run_training_schedule(schedule, lambda: None, timing)
     timing.current_job_start_s = 3.0
-    _, collect_metrics = train._run_training_schedule(
-        schedule, lambda: None, timing
-    )
+    _, collect_metrics = train._run_training_schedule(schedule, lambda: None, timing)
 
     assert collect_metrics() == {
         "time/inter_forward_backward_gap_rank_0_s": 2.0,

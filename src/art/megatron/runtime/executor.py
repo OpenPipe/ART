@@ -742,6 +742,9 @@ class MegatronTrainJobExecutor:
         batch: InMemoryPackedBatch,
         cancelled: Event,
     ) -> ForwardBackwardRankLaunch:
+        self.runtime.inter_forward_backward_timing.current_job_start_s = (
+            time.monotonic()
+        )
         if self._closing or self._closed:
             raise RuntimeError("Megatron executor is closed")
         validate_packed_batch(batch)
@@ -807,6 +810,9 @@ class MegatronTrainJobExecutor:
         batch: SFTBatchData,
         cancelled: Event,
     ) -> dict[str, Any]:
+        self.runtime.inter_forward_backward_timing.current_job_start_s = (
+            time.monotonic()
+        )
         if self._closing or self._closed:
             raise RuntimeError("Megatron executor is closed")
         self._publisher.raise_if_failed()
@@ -908,6 +914,7 @@ class MegatronTrainJobExecutor:
         runtime.resident_generation_id = job.generation.generation_id
         runtime.optimizer_state_loaded = True
         self._gradient_parent_version = None
+        runtime.inter_forward_backward_timing.previous_job_complete_s = time.monotonic()
         return {
             "operation_id": job.operation_id,
             "learner_version": job.learner_version,
@@ -1652,7 +1659,9 @@ class MCoreRunSlotExecutor:
         *,
         coordinator: bool,
     ) -> ForwardBackwardRankLaunch:
-        self.runtime.inter_forward_backward_timing.current_job_start_s = time.monotonic()
+        self.runtime.inter_forward_backward_timing.current_job_start_s = (
+            time.monotonic()
+        )
         state = self._require_run(job.run_id)
         self._validate_parent(
             state, job.training_session_id, job.expected_learner_version
@@ -1744,6 +1753,9 @@ class MCoreRunSlotExecutor:
         *,
         coordinator: bool,
     ) -> SftRankLaunch:
+        self.runtime.inter_forward_backward_timing.current_job_start_s = (
+            time.monotonic()
+        )
         state = self._require_run(job.run_id)
         self._validate_parent(
             state, job.training_session_id, job.expected_learner_version
