@@ -1652,6 +1652,7 @@ class MCoreRunSlotExecutor:
         *,
         coordinator: bool,
     ) -> ForwardBackwardRankLaunch:
+        self.runtime.inter_forward_backward_timing.current_job_start_s = time.monotonic()
         state = self._require_run(job.run_id)
         self._validate_parent(
             state, job.training_session_id, job.expected_learner_version
@@ -1914,6 +1915,9 @@ class MCoreRunSlotExecutor:
             adapter_config=state.adapter_config,
             optimizer_source=optimizer_source,
             optimizer_key=output_optimizer,
+        )
+        self.runtime.inter_forward_backward_timing.previous_job_complete_s = (
+            time.monotonic()
         )
         return {
             "operation_id": job.operation_id,
