@@ -221,6 +221,7 @@ class TrainingRuntime(BaseModel):
         default_factory=_InterForwardBackwardTiming
     )
     publication_group: Any | None = None
+    publication_exchange_group: Any | None = None
     publication_metadata_group: Any | None = None
 
     @field_validator("model")
@@ -617,6 +618,13 @@ def build_training_runtime(
         if world_size > 1
         else None
     )
+    # Resident-source exchange can overlap an earlier sampler publication. A
+    # separate group keeps those asynchronous collective sequences independent.
+    publication_exchange_group = (
+        torch.distributed.new_group(backend="gloo")  # ty: ignore[possibly-missing-attribute]
+        if world_size > 1
+        else None
+    )
     publication_metadata_group = (
         torch.distributed.new_group(backend="gloo")  # ty: ignore[possibly-missing-attribute]
         if world_size > 1
@@ -640,6 +648,7 @@ def build_training_runtime(
             metrics_group=metrics_group
         ),
         publication_group=publication_group,
+        publication_exchange_group=publication_exchange_group,
         publication_metadata_group=publication_metadata_group,
     )
     _model_runtime_sha256(runtime)

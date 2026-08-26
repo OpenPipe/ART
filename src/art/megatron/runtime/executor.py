@@ -2973,7 +2973,7 @@ class _GenerationPublisher:
                 handler=self.runtime.model_support_handler,
                 adapter_config=adapter_config,
                 conversion_group_for_key=_block_for_key,
-                group=self.runtime.publication_group,
+                group=self.runtime.publication_exchange_group,
                 metadata_group=self.runtime.publication_metadata_group,
                 exchange_device=torch.device("cpu"),
                 stager=PinnedCpuSnapshotStager(reusable=True),
@@ -4288,7 +4288,7 @@ class _GenerationPublisher:
                 source.model_copy(
                     update={"tensors": dict(zip(names, tensors, strict=True))}
                 ),
-                group=self.runtime.publication_group,
+                group=self.runtime.publication_exchange_group,
             )
         if consolidated is None:
             return None
