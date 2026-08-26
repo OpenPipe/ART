@@ -1274,20 +1274,13 @@ def _mutation_hook(
             micro_inputs: list[Any],
             device: torch.device,
         ) -> torch.Tensor:
-            local_token_total = original_local_token_count_tensor(
-                micro_inputs, device
-            ).item()
+            local_token_total = original_local_token_count_tensor(micro_inputs, device)
             dp_world_size = int(
                 megatron_train_module.ps.get_data_parallel_world_size(
                     with_context_parallel=True
                 )
             )
-            wrong_local_token_total = local_token_total / max(dp_world_size, 1)
-            return torch.tensor(
-                [wrong_local_token_total],
-                device=device,
-                dtype=torch.float32,
-            )
+            return local_token_total.to(torch.float32) / max(dp_world_size, 1)
 
         megatron_train_module._local_trainable_token_count_tensor = (
             _wrong_local_trainable_token_count_tensor
@@ -1301,18 +1294,13 @@ def _mutation_hook(
         ) -> torch.Tensor:
             local_token_total = original_local_sft_token_count_tensor(
                 micro_inputs, device
-            ).item()
+            )
             dp_world_size = int(
                 megatron_train_module.ps.get_data_parallel_world_size(
                     with_context_parallel=True
                 )
             )
-            wrong_local_token_total = local_token_total / max(dp_world_size, 1)
-            return torch.tensor(
-                [wrong_local_token_total],
-                device=device,
-                dtype=torch.float32,
-            )
+            return local_token_total.to(torch.float32) / max(dp_world_size, 1)
 
         megatron_train_module._local_trainable_sft_token_count_tensor = (
             _wrong_local_trainable_sft_token_count_tensor
