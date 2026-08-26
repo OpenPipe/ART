@@ -61,6 +61,7 @@ from ..training.command_telemetry import (
 )
 from ..training.gradient_accumulator import GradientAccumulator
 from .data_plane import InMemoryPackedBatch, SFTBatchData, validate_packed_batch
+from .preschedule_trace import trace_preschedule
 from .publication import (
     SnapshotRankWritePlan,
     SnapshotWriteGrant,
@@ -1802,6 +1803,13 @@ class MCoreRunSlotExecutor:
         kl_reference_checkpoint_id: str | None,
     ) -> bool:
         """Launch component transfers before the serialized GPU command turn."""
+        trace_id = operation_id or f"prefetch:{run_id}:{expected_learner_version}"
+        trace_preschedule(
+            int(self.runtime.rank),
+            trace_id,
+            "residency_prepare_enter",
+            command_kind=command_kind,
+        )
         state = self._require_run(run_id)
         revision = state.residency_revision
         desired = state.desired
@@ -1863,6 +1871,12 @@ class MCoreRunSlotExecutor:
             and state.learner_version == expected_learner_version
         )
         if operation_id is None:
+            trace_preschedule(
+                int(self.runtime.rank),
+                trace_id,
+                "residency_prepare_exit",
+                admitted=admitted,
+            )
             return admitted
         if not admitted:
             self._residency.release_l1_working_set(keys)
@@ -1872,11 +1886,16 @@ class MCoreRunSlotExecutor:
             if retained is not None:
                 self._residency.release_l1_working_set(keys)
                 if retained != keys:
-                    raise RuntimeError(
-                        "operation residency admission changed identity"
-                    )
+                    raise RuntimeError("operation residency admission changed identity")
                 return True
             self._residency_admissions[operation_id] = keys
+        trace_preschedule(
+            int(self.runtime.rank),
+            trace_id,
+            "residency_prepare_exit",
+            admitted=True,
+            working_set=tuple(key.representation for key in keys),
+        )
         return True
 
     def release_residency_admission(self, operation_id: str) -> None:
@@ -1960,11 +1979,14 @@ class MCoreRunSlotExecutor:
         *,
         coordinator: bool,
     ) -> ForwardRankLaunch:
+        rank = int(self.runtime.rank)
+        trace_preschedule(rank, job.operation_id, "executor_start_forward_enter")
         state = self._require_run(job.run_id)
         self._validate_parent(
             state, job.training_session_id, job.expected_learner_version
         )
         validate_packed_batch(batch)
+        trace_preschedule(rank, job.operation_id, "executor_batch_validated")
         self._publisher.raise_if_failed()
         from art.megatron.train import execute_megatron_dynamic_lora_forward_job
 
@@ -1973,12 +1995,14 @@ class MCoreRunSlotExecutor:
             operation_id=job.operation_id,
             kl_reference_checkpoint_id=job.experimental_config.kl_ref_checkpoint_id,
         ):
+            trace_preschedule(rank, job.operation_id, "train_forward_enter")
             result = execute_megatron_dynamic_lora_forward_job(
                 self.runtime,
                 job,
                 batch.tensors,
                 cancelled=cancelled,
             )
+            trace_preschedule(rank, job.operation_id, "train_forward_exit")
         return _stage_forward_rank_result(
             self._command_result_stagers,
             job,
@@ -2746,6 +2770,8 @@ class MCoreRunSlotExecutor:
         include_accumulator: bool = False,
         kl_reference_checkpoint_id: str | None = None,
     ) -> Iterator[tuple[ResidencyKey, ...]]:
+        rank = int(self.runtime.rank)
+        trace_preschedule(rank, operation_id, "resident_enter")
         weights_key = state.desired.weights
         optimizer_key = state.desired.optimizer if include_optimizer else None
         accumulator_key = state.desired.accumulator if include_accumulator else None
@@ -2772,8 +2798,15 @@ class MCoreRunSlotExecutor:
             raise RuntimeError("GPU command has no exact residency admission")
         acquired = False
         try:
+            trace_preschedule(
+                rank,
+                operation_id,
+                "resident_acquire_enter",
+                working_set=tuple(key.representation for key in working_set),
+            )
             self._residency.acquire_prepared_l1_working_set(working_set)
             acquired = True
+            trace_preschedule(rank, operation_id, "resident_acquire_exit")
             if state.installed_weights != weights_key:
                 pending = state.pending_load
                 if pending is None or pending.weights_key != weights_key:
@@ -2785,11 +2818,13 @@ class MCoreRunSlotExecutor:
                 )
 
                 try:
+                    trace_preschedule(rank, operation_id, "resident_install_enter")
                     # TrainerRank binds these exact parameters or rolls back the slot.
                     gradients = ParameterGradientAccumulator(parameters=pending.weights)
                     self._slot_trainer.install_prepared_checkpoint_slot_load_sync(
                         pending.checkpoint
                     )
+                    trace_preschedule(rank, operation_id, "resident_install_exit")
                 except BaseException:
                     self._residency.release_l1_working_set(working_set)
                     acquired = False
@@ -2842,11 +2877,14 @@ class MCoreRunSlotExecutor:
                 state.installed_kl_reference = reference.key
                 state.kl_references.move_to_end(reference.spec.checkpoint_id)
                 self._trim_kl_references(state)
+            trace_preschedule(rank, operation_id, "resident_yield")
             yield working_set
         finally:
+            trace_preschedule(rank, operation_id, "resident_release_enter")
             if acquired:
                 self._residency.release_l1_working_set(working_set)
             self.release_residency_admission(operation_id)
+            trace_preschedule(rank, operation_id, "resident_release_exit")
 
     @staticmethod
     def _require_gradients(state: _ResidentRunState) -> Any:

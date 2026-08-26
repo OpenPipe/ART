@@ -37,6 +37,11 @@ from art.utils.lifecycle import (
 )
 
 from .data_plane import InMemoryPackedBatch, SFTBatchData
+from .preschedule_trace import (
+    start_preschedule_watchdog,
+    stop_preschedule_watchdog,
+    trace_preschedule,
+)
 from .publication import (
     TRAINER_PUBLICATION_EVENT_ADAPTER,
     SnapshotRankWritePlan,
@@ -866,6 +871,14 @@ class MonarchTrainerActor(Actor):
                 reply,
             ) = request
             started = time.perf_counter()
+            trace_id = operation_id or f"prefetch:{run_id}:{learner_version}"
+            trace_preschedule(
+                self._runtime.rank,
+                trace_id,
+                "residency_request_enter",
+                command_kind=command_kind,
+                admitted=operation_id is not None,
+            )
             try:
                 executor = self._require_run_slot_executor()
                 admitted = (
@@ -907,6 +920,15 @@ class MonarchTrainerActor(Actor):
                     message=str(error),
                     traceback_text=traceback.format_exc(),
                 )
+            trace_preschedule(
+                self._runtime.rank,
+                trace_id,
+                "residency_request_exit",
+                command_kind=command_kind,
+                admitted=result.admitted,
+                error_type=result.error_type,
+                elapsed_s=result.elapsed_s,
+            )
             reply.send(result.model_dump(mode="json"))
 
     def _stop_cp_lookahead(self, deadline: float) -> None:
@@ -1241,9 +1263,7 @@ class MonarchTrainerActor(Actor):
         return {"rank": self._runtime.rank, "run_id": run_id}
 
     @endpoint
-    def release_run_slot_residency_admission(
-        self, operation_id: str
-    ) -> dict[str, Any]:
+    def release_run_slot_residency_admission(self, operation_id: str) -> dict[str, Any]:
         if not self._valid:
             raise RuntimeError("trainer actor runtime is invalid")
         self._require_run_slot_executor().release_residency_admission(operation_id)
@@ -1397,21 +1417,42 @@ class MonarchTrainerActor(Actor):
         batch = None
         ready = False
         job = None
+        watchdog = None
         try:
             job = ForwardJobSpec.model_validate_json(job_json)
+            rank = self._runtime.rank
+            watchdog = start_preschedule_watchdog(rank, job.operation_id)
+            trace_preschedule(rank, job.operation_id, "endpoint_enter")
             if not self._valid:
                 raise RuntimeError("trainer actor runtime is invalid")
             leases = PackedBatchLeaseSet.model_validate_json(batch_json)
+            trace_preschedule(rank, job.operation_id, "lease_validated")
             batch = InMemoryPackedBatch.open(job.batch, leases.host_refs[self._host_id])
+            tensors = batch.tensors
+            replay = tensors.get("moe_routing_replay")
+            trace_preschedule(
+                rank,
+                job.operation_id,
+                "batch_opened",
+                batch_id=job.batch.batch_id,
+                token_shape=tuple(tensors["tokens"].shape),
+                replay_shape=(
+                    None if replay is None else tuple(replay.expert_indices.shape)
+                ),
+            )
             if not self._command_job_open:
+                trace_preschedule(rank, job.operation_id, "before_job_enter")
                 self._weight_offload.before_job()
                 self._command_job_open = True
+                trace_preschedule(rank, job.operation_id, "before_job_exit")
+            trace_preschedule(rank, job.operation_id, "executor_enter")
             launch = self._require_run_slot_executor().start_forward(
                 job,
                 batch,
                 Event(),
                 coordinator=self._runtime.rank == 0,
             )
+            trace_preschedule(rank, job.operation_id, "executor_exit")
             batch.close()
             batch = None
             ready_port.send(
@@ -1449,6 +1490,7 @@ class MonarchTrainerActor(Actor):
                 )
             response_port.exception(_response_exception(error))
         finally:
+            stop_preschedule_watchdog(watchdog)
             if batch is not None:
                 batch.close()
 
