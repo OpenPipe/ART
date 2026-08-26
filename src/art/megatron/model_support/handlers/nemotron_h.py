@@ -515,11 +515,16 @@ class NemotronHHandler(DefaultMoeHandler):
             "*.mixer.D",
             "*.mixer.gate.e_score_correction_bias",
         )
+
+        def dtype_plan(model: Any, dtype: torch.dtype) -> dict[str, torch.dtype]:
+            return {**model_class._get_dtype_plan(model, dtype), "*": dtype}
+
         return type(
             f"ArtStrictFp32{model_class.__name__}",
             (model_class,),
             {
                 "__module__": model_class.__module__,
+                "_get_dtype_plan": dtype_plan,
                 "_keep_in_fp32_modules_strict": strict_fp32,
             },
         )
