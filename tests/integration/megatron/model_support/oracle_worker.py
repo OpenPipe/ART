@@ -1328,7 +1328,9 @@ def _mutation_hook(
             num_sequences: int,
             global_grad_accumulation_sequences: int,
         ) -> list[int | None]:
-            base_global_sample_index = step_index * global_grad_accumulation_sequences
+            base_global_sample_index = global_grad_accumulation_sequences * (
+                step_index + megatron_train_module.ps.get_data_parallel_rank()
+            )
             return [
                 (global_sample_index if global_sample_index < num_sequences else None)
                 for global_sample_index in range(
