@@ -206,6 +206,7 @@ class _Actors:
         self.events: list[str] = []
         self.calls = 0
         self.fail_before_ready = False
+        self.fail_one_before_ready = False
         self.fail_late = False
         self.registration_started = asyncio.Event()
         self.registration_ready = asyncio.Event()
@@ -265,6 +266,17 @@ class _Actors:
         program: Literal["rl", "sft"] = "rl",
     ) -> dict[int, dict[str, Any]]:
         self.calls += 1
+        if self.fail_one_before_ready:
+            ready_port.send(
+                {
+                    "rank": 1,
+                    "operation_id": operation_id,
+                    "learner_version": 3,
+                    "error_type": "ValueError",
+                    "message": "rank-local preparation failed",
+                }
+            )
+            await asyncio.Event().wait()
         if self.fail_before_ready:
             for rank in range(self.ranks):
                 ready_port.send(
@@ -682,6 +694,18 @@ async def test_rank_failure_invalidates_the_slot(late: bool) -> None:
         actors.allow_host_materialization.set()
         with pytest.raises(RuntimeError, match="late serialization failed"):
             await launch.completion
+    assert not slot.valid
+    assert slot._proc_mesh.stopped
+
+
+@pytest.mark.asyncio
+async def test_one_rank_preparation_failure_does_not_wait_for_other_ranks() -> None:
+    actors = _Actors()
+    actors.fail_one_before_ready = True
+    slot = _slot(actors)
+    with pytest.raises(RuntimeError, match="rank-local preparation failed"):
+        async with asyncio.timeout(1):
+            await slot.start_forward_backward(_Job("fb-0"), _Batch())
     assert not slot.valid
     assert slot._proc_mesh.stopped
 

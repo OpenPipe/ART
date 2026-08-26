@@ -24,6 +24,7 @@ from art.megatron.context_parallel.types import (
 from art.megatron.flex_attn.compiled import flash_sparse_block_size_for_head_dim
 from art.megatron.prefix_tree import parse_prefix_tree
 from art.megatron.prefix_tree_state import create_prefix_tree_state
+from art.megatron.runtime.preschedule_trace import trace_current_preschedule
 from art.megatron.selective_lm_head import LmHeadTokenSelection
 from art.megatron.training.trace import (
     packed_sequence_token_uids,
@@ -631,7 +632,7 @@ def _prepare_dense_rl_micro(
                 group_ids=micro["group_ids"], parent_ids=micro["parent_ids"]
             )
         ),
-        loss_bearing_tokens=int(shifted_assistant_mask.sum().item()),
+        loss_bearing_tokens=lm_head_selection.logical_row_count,
         executed_token_equivalents=int(micro["tokens"].numel()),
         nominal_schedule_capacity_tokens=int(micro["tokens"].numel()),
     )
@@ -670,12 +671,20 @@ def _prepare_rl_cp_micro_full(
     work. Moving the full packed micro to CUDA before planning forces later D2H
     metadata reads and collapses that overlap.
     """
+    trace_current_preschedule("cp_config_enter")
+    cp_config = _context_parallel_config_for_provider(
+        provider, device, model_support_handler
+    )
+    trace_current_preschedule("cp_config_exit")
+    trace_current_preschedule("cp_block_mask_variant_config_enter")
+    block_mask_variants = _art_flex_cp_block_mask_variants(provider, device)
+    trace_current_preschedule(
+        "cp_block_mask_variant_config_exit", variant_count=len(block_mask_variants)
+    )
     return prepare_cp_micro(
         micro=micro,
         topology=topology,
-        config=_context_parallel_config_for_provider(
-            provider, device, model_support_handler
-        ),
+        config=cp_config,
         cp_group=ps.get_context_parallel_group(check_initialized=False),
         cp_rank=ps.get_context_parallel_rank(),
         build_gdn_execution_spec=bool(
@@ -686,7 +695,7 @@ def _prepare_rl_cp_micro_full(
             model_support_handler,
         ),
         trace_token_uids=trace_token_uids,
-        block_mask_variants=_art_flex_cp_block_mask_variants(provider, device),
+        block_mask_variants=block_mask_variants,
         target_device=device,
         ref_logprobs=ref_logprobs,
         model_support_handler=model_support_handler,
@@ -815,15 +824,15 @@ def _prepare_dense_sft_micro(
     position_ids = torch.arange(seq_len, device=device).unsqueeze(0)
     shifted_labels = shift_tensor(labels, -100)
     loss_mask = shifted_labels != -100
-    workload = TrainingMicrobatchWorkload(
-        logical_nonpadding_tokens=int(attention_mask.sum().item()),
-        loss_bearing_tokens=int(loss_mask.sum().item()),
-        executed_token_equivalents=seq_len,
-        nominal_schedule_capacity_tokens=int(micro["input_ids"].numel()),
-    )
     lm_head_selection = LmHeadTokenSelection.from_labels(
         shifted_labels,
         target_device=device,
+    )
+    workload = TrainingMicrobatchWorkload(
+        logical_nonpadding_tokens=int(attention_mask.sum().item()),
+        loss_bearing_tokens=lm_head_selection.logical_row_count,
+        executed_token_equivalents=seq_len,
+        nominal_schedule_capacity_tokens=int(micro["input_ids"].numel()),
     )
     shifted_labels = shifted_labels.to(device)
     loss_mask = loss_mask.to(device)

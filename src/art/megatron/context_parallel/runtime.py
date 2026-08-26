@@ -11,6 +11,10 @@ from pydantic import BaseModel
 import torch
 
 from art.loss import shift_tensor
+from art.megatron.runtime.preschedule_trace import (
+    cuda_stream_fields,
+    trace_current_preschedule,
+)
 from art.megatron.selective_lm_head import LmHeadTokenSelection
 from art.preprocessing.pack import PackedTensors
 
@@ -2208,6 +2212,8 @@ def prepare_cp_micro(
     Its handler must only enqueue device work: scalar CUDA reads would expose
     planning on the host and invalidate lookahead overlap.
     """
+    trace_current_preschedule("cp_prepare_enter", cp_rank=cp_rank)
+    trace_current_preschedule("cp_plan_materialize_enter", cp_rank=cp_rank)
     state, rank_plan, spec, pad_multiple = prepare_megatron_context_parallel_state(
         micro=micro,
         topology=topology,
@@ -2219,6 +2225,12 @@ def prepare_cp_micro(
         block_mask_variants=block_mask_variants,
         target_device=target_device,
     )
+    trace_current_preschedule(
+        "cp_plan_materialize_exit",
+        cp_rank=cp_rank,
+        local_valid_lengths=rank_plan.local_valid_lengths,
+    )
+    trace_current_preschedule("cp_tensor_dispatch_enter", cp_rank=cp_rank)
     tensors, workload = dispatch_megatron_context_parallel_training_tensors(
         micro=micro,
         rank_plan=rank_plan,
@@ -2229,9 +2241,16 @@ def prepare_cp_micro(
         cp_group=cp_group,
         ref_logprobs=ref_logprobs,
     )
+    trace_current_preschedule(
+        "cp_tensor_dispatch_exit",
+        cp_rank=cp_rank,
+        local_token_shape=tuple(tensors.tokens.shape),
+        **cuda_stream_fields(tensors.tokens.device.index),
+    )
     if model_support_handler is not None:
         from art.megatron.model_support.spec import PrefixTreeModelStateContext
 
+        trace_current_preschedule("cp_model_state_enter", cp_rank=cp_rank)
         state.model_state = dict(
             model_support_handler.build_prefix_tree_model_state(
                 PrefixTreeModelStateContext(
@@ -2246,15 +2265,19 @@ def prepare_cp_micro(
                 )
             )
         )
+        trace_current_preschedule("cp_model_state_exit", cp_rank=cp_rank)
     if tensors.token_uids is not None:
         state = replace(state, trace_token_uids=tensors.token_uids)
     if prepare_execution_state:
         from .executor import prepare_context_parallel_execution_state
 
+        trace_current_preschedule("cp_block_masks_enter", cp_rank=cp_rank)
         prepare_context_parallel_execution_state(
             state=state,
             device=tensors.tokens.device,
         )
+        trace_current_preschedule("cp_block_masks_exit", cp_rank=cp_rank)
+    trace_current_preschedule("cp_prepare_exit", cp_rank=cp_rank)
     return PreparedMegatronBatch(
         tensors=tensors,
         packed_seq_params=None,
@@ -2338,7 +2361,10 @@ def prepare_megatron_context_parallel_state(
             "ART context parallel currently supports exactly one packed sequence at a time, "
             f"got batch={int(micro['group_ids'].shape[0])}."
         )
+    trace_current_preschedule("cp_input_pos_cpu_enter", cp_rank=cp_rank)
     input_pos_cpu = _planning_metadata_cpu(micro["input_pos"])
+    trace_current_preschedule("cp_input_pos_cpu_exit", cp_rank=cp_rank)
+    trace_current_preschedule("cp_planning_bundle_enter", cp_rank=cp_rank)
     planning_key, bundle, group_ids_cpu, parent_ids_cpu = _get_or_build_planning_bundle(
         group_ids=micro["group_ids"],
         parent_ids=micro["parent_ids"],
@@ -2347,6 +2373,10 @@ def prepare_megatron_context_parallel_state(
         original_seq_len=int(micro["tokens"].shape[1]),
         build_gdn_execution_spec=build_gdn_execution_spec,
     )
+    trace_current_preschedule(
+        "cp_planning_bundle_exit", cp_rank=cp_rank, planning_key=planning_key
+    )
+    trace_current_preschedule("cp_rank_plan_enter", cp_rank=cp_rank)
     rank_plan = _get_or_build_bundle_rank_plan(
         planning_key=planning_key,
         bundle=bundle,
@@ -2354,6 +2384,7 @@ def prepare_megatron_context_parallel_state(
         target_rank=cp_rank,
         block_size=int(config.block_size),
     )
+    trace_current_preschedule("cp_rank_plan_exit", cp_rank=cp_rank)
     gdn_execution_plan = None
     if build_gdn_execution_spec:
         _plan_gdn_rank_execution(
@@ -2471,6 +2502,7 @@ def dispatch_megatron_context_parallel_training_tensors(
     local_token_uids = (
         None if token_uids is None else dispatch(token_uids, -1, move_to_target=False)
     )
+    trace_current_preschedule("cp_tensor_materialize_enter", **cuda_stream_fields())
     tensors = DispatchedPackedTensors(
         tokens=dispatch(micro["tokens"], 0),
         labels=_to_target_device(local_labels, target_device),
@@ -2491,9 +2523,18 @@ def dispatch_megatron_context_parallel_training_tensors(
         behavior_logprobs=maybe_dispatch(micro.get("behavior_logprobs"), 0.0),
         token_advantages=maybe_dispatch(micro.get("token_advantages"), 0.0),
     )
+    trace_current_preschedule(
+        "cp_tensor_materialize_exit",
+        assistant_mask_shape=tuple(tensors.assistant_mask.shape),
+        **cuda_stream_fields(tensors.assistant_mask.device.index),
+    )
+    trace_current_preschedule(
+        "cp_loss_bearing_tokens",
+        loss_bearing_tokens=lm_head_selection.logical_row_count,
+    )
     workload = TrainingMicrobatchWorkload(
         logical_nonpadding_tokens=sum(rank_plan.local_valid_lengths),
-        loss_bearing_tokens=int(tensors.assistant_mask.sum().item()),
+        loss_bearing_tokens=lm_head_selection.logical_row_count,
         executed_token_equivalents=int(local_labels.numel()),
         nominal_schedule_capacity_tokens=rank_plan.original_seq_len,
     )

@@ -101,6 +101,7 @@ def test_accumulation_window_reuses_one_mutable_residency_revision() -> None:
         installed_weights=weights,
     )
     executor = MCoreRunSlotExecutor.__new__(MCoreRunSlotExecutor)
+    executor.runtime = SimpleNamespace(rank=0)
     residency = _ResidencyProbe()
     executor._residency = residency
 

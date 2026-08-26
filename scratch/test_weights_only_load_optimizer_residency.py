@@ -174,7 +174,9 @@ def _executor(
     slot = _SlotTrainer()
     residency = _Residency()
     publisher = _Publisher()
-    executor.runtime = SimpleNamespace(optimizer_layout_fingerprint="topology")
+    executor.runtime = SimpleNamespace(
+        optimizer_layout_fingerprint="topology", rank=0
+    )
     executor._slot_trainer = slot
     executor._residency = residency
     executor._publisher = publisher

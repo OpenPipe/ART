@@ -8,6 +8,7 @@ from pydantic import BaseModel, ConfigDict, Field
 import torch
 
 from ..tensor_snapshot import PendingCpuSnapshot, PinnedCpuSnapshotStager
+from .preschedule_trace import cuda_stream_fields, trace_current_preschedule
 
 
 class TensorResidencyStats(BaseModel):
@@ -63,8 +64,17 @@ class TensorResidencyTransition:
         with self._lock:
             if self._resolved:
                 return
+            trace_current_preschedule(
+                "residency_transition_wait_enter",
+                event_object_ids=tuple(id(fence.event) for fence in self._fences),
+                transfer_devices=tuple(fence.device for fence in self._fences),
+                **cuda_stream_fields(),
+            )
             for fence in self._fences:
                 torch.cuda.current_stream(fence.device).wait_event(fence.event)
+            trace_current_preschedule(
+                "residency_transition_wait_exit", **cuda_stream_fields()
+            )
             if self._staging is not None:
                 self._staging.release_after(self._fences)
                 self._staging = None
@@ -421,6 +431,12 @@ class TensorResidencyMover:
         transfer_started = False
         try:
             stream = self._stream(device)
+            trace_current_preschedule(
+                "residency_transfer_enter",
+                transfer_stream_object_id=id(stream),
+                transfer_stream_handle=int(stream.cuda_stream),
+                **cuda_stream_fields(device),
+            )
             with torch.cuda.device(device), torch.cuda.stream(stream), torch.no_grad():
                 if any(group.source.device.type == "cuda" for group in groups):
                     stream.wait_stream(torch.cuda.current_stream(device))
@@ -448,6 +464,13 @@ class TensorResidencyMover:
                         view.tensor.data = replacement
                 event = torch.cuda.Event(blocking=True)
                 event.record(stream)
+                trace_current_preschedule(
+                    "residency_transfer_recorded",
+                    transfer_stream_object_id=id(stream),
+                    transfer_stream_handle=int(stream.cuda_stream),
+                    event_object_id=id(event),
+                    byte_count=sum(group.source.numel() for group in groups),
+                )
         except BaseException as error:
             if owned_staging is not None:
                 try:

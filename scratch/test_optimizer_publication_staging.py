@@ -274,6 +274,7 @@ def test_post_optimizer_save_uses_registered_generation_without_l1(
     publisher = _CommittedPublisher()
     executor = MCoreRunSlotExecutor.__new__(MCoreRunSlotExecutor)
     executor.runtime = SimpleNamespace(
+        rank=0,
         model=(),
         optimizer_snapshot_barrier=SimpleNamespace(
             wait_before_mutation=lambda *, key: None
