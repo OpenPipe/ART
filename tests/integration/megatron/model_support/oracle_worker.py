@@ -1274,10 +1274,9 @@ def _mutation_hook(
             micro_inputs: list[Any],
             device: torch.device,
         ) -> torch.Tensor:
-            local_token_total = sum(
-                megatron_train_module._count_trainable_tokens(micro)
-                for micro in micro_inputs
-            )
+            local_token_total = original_local_token_count_tensor(
+                micro_inputs, device
+            ).item()
             dp_world_size = int(
                 megatron_train_module.ps.get_data_parallel_world_size(
                     with_context_parallel=True
@@ -1300,10 +1299,9 @@ def _mutation_hook(
             micro_inputs: list[Any],
             device: torch.device,
         ) -> torch.Tensor:
-            local_token_total = sum(
-                megatron_train_module._count_sft_trainable_tokens(micro)
-                for micro in micro_inputs
-            )
+            local_token_total = original_local_sft_token_count_tensor(
+                micro_inputs, device
+            ).item()
             dp_world_size = int(
                 megatron_train_module.ps.get_data_parallel_world_size(
                     with_context_parallel=True
