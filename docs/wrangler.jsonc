@@ -1,10 +1,6 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
-  "name": "art-docs",
+  "name": "art-new-docs",
   "compatibility_date": "2026-08-25",
-  "assets": {
-    "directory": "./dist",
-    "html_handling": "auto-trailing-slash",
-    "not_found_handling": "404-page"
-  }
+  "pages_build_output_dir": "./dist"
 }
