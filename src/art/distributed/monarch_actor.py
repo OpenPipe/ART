@@ -103,6 +103,7 @@ class _RetainedPackingPlan(BaseModel):
     request: PackingRequest
     prepared: Any | None
     packed_group_shapes: tuple[Any | None, ...]
+    num_dropped_trajectories: int
     storage_byte_count: int
     packing_timings: Any
     trajectory_fetch_s: float
@@ -1091,6 +1092,9 @@ class ArtHostService(Actor):
             request=request,
             prepared=prepared,
             packed_group_shapes=shapes,
+            num_dropped_trajectories=(
+                0 if prepared is None else prepared.num_dropped_trajectories
+            ),
             storage_byte_count=storage_byte_count,
             packing_timings=packing_timings,
             trajectory_fetch_s=trajectory_fetch_s,
@@ -1127,6 +1131,7 @@ class ArtHostService(Actor):
             return PackingResult(
                 ref=None,
                 packed_group_shapes=retained.packed_group_shapes,
+                num_dropped_trajectories=retained.num_dropped_trajectories,
                 generation_id=generation_id,
                 trajectory_fetch_s=retained.trajectory_fetch_s,
                 trajectory_receive_s=retained.trajectory_receive_s,
@@ -1204,6 +1209,7 @@ class ArtHostService(Actor):
                 trainable_assistant_tokens=counts.trainable_assistant_tokens,
                 loss_bearing_tokens=loss_bearing_tokens,
                 non_padding_tokens=counts.non_padding_tokens,
+                num_dropped_trajectories=retained.num_dropped_trajectories,
                 trajectory_log_path=retained.request.trajectory_log_path,
                 trajectory_fetch_s=retained.trajectory_fetch_s,
                 trajectory_receive_s=retained.trajectory_receive_s,
