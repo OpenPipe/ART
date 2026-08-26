@@ -196,6 +196,18 @@ def test_runtime_builder_propagates_parameterization(monkeypatch) -> None:
         spec.optimizer_layout_fingerprint
     )
 
+    config["init_args"]["random_state"] = 7
+    pretrained_seed_spec = runtime_build.build_trainer_runtime_spec(
+        runtime,
+        base_model="model",
+        config=config,
+        enable_expert_replay=False,
+        offload_between_jobs=False,
+    )
+    assert pretrained_seed_spec.optimizer_semantic_fingerprint == (
+        migrated_spec.optimizer_semantic_fingerprint
+    )
+
     config["lora_config"]["target_modules"] = ["gate", "experts"]
     changed_targets_spec = runtime_build.build_trainer_runtime_spec(
         runtime,
@@ -206,6 +218,27 @@ def test_runtime_builder_propagates_parameterization(monkeypatch) -> None:
     )
     assert changed_targets_spec.optimizer_semantic_fingerprint != (
         migrated_spec.optimizer_semantic_fingerprint
+    )
+
+    config["megatron_model_initialization"] = "random"
+    config["init_args"]["random_state"] = 7
+    random_seed_7 = runtime_build.build_trainer_runtime_spec(
+        runtime,
+        base_model="model",
+        config=config,
+        enable_expert_replay=False,
+        offload_between_jobs=False,
+    )
+    config["init_args"]["random_state"] = 8
+    random_seed_8 = runtime_build.build_trainer_runtime_spec(
+        runtime,
+        base_model="model",
+        config=config,
+        enable_expert_replay=False,
+        offload_between_jobs=False,
+    )
+    assert random_seed_7.optimizer_semantic_fingerprint != (
+        random_seed_8.optimizer_semantic_fingerprint
     )
 
     config["lora_config"]["moe_parameterization"] = "invalid"

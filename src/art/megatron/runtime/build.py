@@ -60,14 +60,17 @@ def build_trainer_runtime_spec(
         "yes",
         "on",
     }
+    random_state = _random_state(config)
+    model_initialization = config.get("megatron_model_initialization", "pretrained")
     model_semantics = {
         "model": model_identifier,
         "support_model": base_model,
         "revision": revision,
         "handler": handler.key,
-        "model_initialization": config.get(
-            "megatron_model_initialization", "pretrained"
-        ),
+        "model_initialization": model_initialization,
+        # A random base is part of the logical learner. For pretrained bases,
+        # exact adapter bytes make the initialization seed irrelevant to resume.
+        "random_state": random_state if model_initialization == "random" else None,
     }
     identity = {
         "art": art_source_revision(),
@@ -118,7 +121,7 @@ def build_trainer_runtime_spec(
         ),
         streaming_weight_offload=runtime_config.streaming_weight_offload,
         offload_between_jobs=offload_between_jobs,
-        random_state=_random_state(config),
+        random_state=random_state,
         hybrid_ep=hybrid_ep_runtime_spec(
             mesh,
             run_id=runtime.runtime_id,
