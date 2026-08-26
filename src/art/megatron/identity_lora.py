@@ -1,4 +1,5 @@
 import os
+from threading import Lock
 from typing import Any, Literal
 import warnings
 
@@ -14,6 +15,8 @@ from .model_support.lora_disk import (
 from .model_support.shared_outer import canonicalize_identity_shared_outer
 from .model_support.spec import ModelSupportHandler
 
+_IDENTITY_LORA_BUILD_LOCK = Lock()
+
 
 def create_identity_lora(
     base_model: str,
@@ -27,6 +30,34 @@ def create_identity_lora(
     handler: ModelSupportHandler | None = None,
 ) -> None:
     """Create an identity LoRA adapter for a Megatron model."""
+    # Accelerate's empty-weight context and the PEFT device patch below mutate
+    # process-global PyTorch methods. Keep identity construction deterministic
+    # and prevent concurrent run registration from materializing meta adapters.
+    with _IDENTITY_LORA_BUILD_LOCK:
+        _create_identity_lora(
+            base_model,
+            lora_path,
+            rank=rank,
+            target_modules=target_modules,
+            lora_alpha=lora_alpha,
+            moe_parameterization=moe_parameterization,
+            random_state=random_state,
+            allow_unvalidated_arch=allow_unvalidated_arch,
+            handler=handler,
+        )
+
+
+def _create_identity_lora(
+    base_model: str,
+    lora_path: str,
+    rank: int | None = None,
+    target_modules: list[str] | None = None,
+    lora_alpha: int = LORA_ALPHA,
+    moe_parameterization: Literal["per_expert", "shared_outer"] = "per_expert",
+    random_state: int | None = None,
+    allow_unvalidated_arch: bool = False,
+    handler: ModelSupportHandler | None = None,
+) -> None:
     if moe_parameterization not in {"per_expert", "shared_outer"}:
         raise ValueError(
             f"unsupported MoE LoRA parameterization {moe_parameterization!r}"
