@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import AsyncExitStack
 import math
 from pathlib import Path
 import time
@@ -27,13 +28,13 @@ from art.distributed.rollout import RolloutModelSpec
 from art.megatron.optimizer_state import (
     OptimizerAdapter,
     OptimizerGenerationManifest,
+    authenticated_optimizer_generation_lease,
     link_adapter_generation,
     optimizer_generation_nbytes,
     read_adapter_publication,
     read_committed_optimizer_pointer,
     read_optimizer_generation_manifest,
     validate_adapter_manifest,
-    verify_optimizer_generation,
 )
 from art.megatron.runtime.data_plane import SFTBatchData
 from art.megatron.runtime.publication import (
@@ -361,17 +362,19 @@ class MegatronTrainingSlot:
             return prior.optimizer_work
         adapter = registration.adapter
         validate_adapter_manifest(adapter)
-        if registration.initial_optimizer_state_path is not None:
-            assert registration.initial_optimizer_generation_id is not None
-            verification = await asyncio.to_thread(
-                verify_optimizer_generation,
-                registration.initial_optimizer_state_path,
-                registration.initial_optimizer_generation_id,
-            )
-            registration = registration.model_copy(
-                update={"initial_optimizer_verification": verification}
-            )
-        optimizer_work = await self.trainer.register_run(registration)
+        async with AsyncExitStack() as leases:
+            if registration.initial_optimizer_state_path is not None:
+                assert registration.initial_optimizer_generation_id is not None
+                verification = await leases.enter_async_context(
+                    authenticated_optimizer_generation_lease(
+                        registration.initial_optimizer_state_path,
+                        registration.initial_optimizer_generation_id,
+                    )
+                )
+                registration = registration.model_copy(
+                    update={"initial_optimizer_verification": verification}
+                )
+            optimizer_work = await self.trainer.register_run(registration)
         if optimizer_work.run_id != registration.run_id:
             raise RuntimeError("trainer returned optimizer work for another run")
         self._runs[registration.run_id] = _ResidentRun(
@@ -1191,39 +1194,40 @@ class MegatronTrainingSlot:
             generation_id=operation_generation_id(ref.operation_id, output_version),
             adapter_path=get_step_checkpoint_dir(state.output_dir, output_version),
         )
-        verification = (
-            await asyncio.to_thread(
-                verify_optimizer_generation,
-                self._require_managed_path(source.optimizer_state_path),
-                source.optimizer_generation_id,
-            )
-            if request.restore_optimizer
-            and source.optimizer_state_path is not None
-            and source.optimizer_generation_id is not None
+        optimizer_state_path = (
+            self._require_managed_path(source.optimizer_state_path)
+            if request.restore_optimizer and source.optimizer_state_path is not None
             else None
         )
-        job = LoadStateJobSpec(
-            operation_id=ref.operation_id,
-            run_id=ref.run_id,
-            sequence_id=ref.sequence_id,
-            training_session_id=state.registration.training_session_id,
-            expected_learner_version=ref.learner_parent_version,
-            learner_version=output_version,
-            generation=generation,
-            adapter_path=self._require_managed_path(source.adapter.identity),
-            adapter_step=source.adapter.step,
-            optimizer_state_path=(
-                self._require_managed_path(source.optimizer_state_path)
-                if request.restore_optimizer and source.optimizer_state_path is not None
+        async with AsyncExitStack() as leases:
+            verification = (
+                await leases.enter_async_context(
+                    authenticated_optimizer_generation_lease(
+                        optimizer_state_path, source.optimizer_generation_id
+                    )
+                )
+                if optimizer_state_path is not None
+                and source.optimizer_generation_id is not None
                 else None
-            ),
-            optimizer_generation_id=(
-                source.optimizer_generation_id if request.restore_optimizer else None
-            ),
-            optimizer_verification=verification,
-            restore_optimizer=request.restore_optimizer,
-        )
-        await self.trainer.prepare_load_state(job)
+            )
+            job = LoadStateJobSpec(
+                operation_id=ref.operation_id,
+                run_id=ref.run_id,
+                sequence_id=ref.sequence_id,
+                training_session_id=state.registration.training_session_id,
+                expected_learner_version=ref.learner_parent_version,
+                learner_version=output_version,
+                generation=generation,
+                adapter_path=self._require_managed_path(source.adapter.identity),
+                adapter_step=source.adapter.step,
+                optimizer_state_path=optimizer_state_path,
+                optimizer_generation_id=(
+                    source.optimizer_generation_id if request.restore_optimizer else None
+                ),
+                optimizer_verification=verification,
+                restore_optimizer=request.restore_optimizer,
+            )
+            await self.trainer.prepare_load_state(job)
         try:
             adapter = await asyncio.to_thread(
                 link_adapter_generation,

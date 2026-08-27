@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from contextlib import ExitStack, asynccontextmanager, contextmanager
 import copy
 import fcntl
@@ -145,22 +145,39 @@ class OptimizerTopology(_OptimizerRecord):
     vpp: int = Field(gt=0)
 
 
+class OptimizerLogicalTensor(_OptimizerRecord):
+    key: str = Field(min_length=1)
+    shape: tuple[int, ...] = Field(min_length=1)
+    dtype: Literal["float32"] = "float32"
+
+    @model_validator(mode="after")
+    def _validate_shape(self) -> "OptimizerLogicalTensor":
+        if any(dimension <= 0 for dimension in self.shape):
+            raise ValueError("optimizer logical tensor dimensions must be positive")
+        return self
+
+
 class OptimizerShard(_OptimizerRecord):
     rank: int = Field(ge=0)
     size_bytes: int = Field(gt=0)
     layout_sha256: str = Field(pattern=_SHA256_PATTERN)
     sha256: str | None = Field(default=None, pattern=_SHA256_PATTERN)
     serialization: OptimizerShardSerialization = "torch_pickle_v1"
-    logical_keys: tuple[str, ...] = ()
+    logical_tensors: tuple[OptimizerLogicalTensor, ...] = ()
 
     @model_validator(mode="after")
-    def _validate_logical_keys(self) -> "OptimizerShard":
+    def _validate_logical_tensors(self) -> "OptimizerShard":
         portable = self.serialization == "art_logical_safetensors_v1"
-        if not portable and self.logical_keys:
-            raise ValueError("only logical optimizer shards may declare logical keys")
-        if self.logical_keys != tuple(sorted(set(self.logical_keys))):
-            raise ValueError("optimizer shard logical keys must be sorted and unique")
+        if not portable and self.logical_tensors:
+            raise ValueError("only logical optimizer shards may declare logical tensors")
+        keys = tuple(tensor.key for tensor in self.logical_tensors)
+        if keys != tuple(sorted(set(keys))):
+            raise ValueError("optimizer shard logical tensors must be sorted and unique")
         return self
+
+    @property
+    def logical_keys(self) -> tuple[str, ...]:
+        return tuple(tensor.key for tensor in self.logical_tensors)
 
 
 class _PairedOptimizerRecord(_OptimizerRecord):
@@ -187,11 +204,12 @@ class _OptimizerGenerationRecord(_PairedOptimizerRecord):
 
 
 class OptimizerGenerationManifest(_OptimizerGenerationRecord):
-    format_version: Literal[4] = 4
+    format_version: Literal[5] = 5
     runtime_sha256: str = Field(pattern=_SHA256_PATTERN)
     optimizer_semantic_sha256: str | None = Field(
         default=None, pattern=_SHA256_PATTERN
     )
+    logical_state_sha256: str | None = Field(default=None, pattern=_SHA256_PATTERN)
     topology: OptimizerTopology
     shards: tuple[OptimizerShard, ...]
 
@@ -203,10 +221,26 @@ class OptimizerGenerationManifest(_OptimizerGenerationRecord):
         }
         if len(portable) != 1:
             raise ValueError("optimizer generation cannot mix physical formats")
-        if portable.pop() != (self.optimizer_semantic_sha256 is not None):
+        logical = portable.pop()
+        if logical != (self.optimizer_semantic_sha256 is not None):
             raise ValueError(
                 "logical optimizer generations require a semantic fingerprint"
             )
+        if logical != (self.logical_state_sha256 is not None):
+            raise ValueError(
+                "logical optimizer generations require a logical-state fingerprint"
+            )
+        if logical:
+            assert self.optimizer_semantic_sha256 is not None
+            expected = _optimizer_logical_state_sha256(
+                generation=self.generation,
+                step=self.step,
+                adapter=self.adapter,
+                optimizer_semantic_sha256=self.optimizer_semantic_sha256,
+                shards=self.shards,
+            )
+            if self.logical_state_sha256 != expected:
+                raise ValueError("optimizer logical-state fingerprint mismatch")
         return self
 
 
@@ -218,7 +252,7 @@ class VerifiedOptimizerGeneration(_OptimizerRecord):
 
 
 class OptimizerGenerationPointer(_OptimizerGenerationRecord):
-    format_version: Literal[4] = 4
+    format_version: Literal[5] = 5
 
 
 class OptimizerPolicyPointer(_OptimizerRecord):
@@ -1089,10 +1123,35 @@ def verify_optimizer_generation(
 ) -> VerifiedOptimizerGeneration:
     """Authenticate one immutable generation once before rank-local reads."""
     with optimizer_generation_lease(optimizer_state_path, generation) as pointer:
-        generation_path = optimizer_generation_path(optimizer_state_path, generation)
-        manifest, manifest_sha256 = _read_manifest_identity(generation_path)
-        _validate_pointer_manifest(pointer, manifest)
-        verify_optimizer_generation_manifest(optimizer_state_path, manifest)
+        return _verify_optimizer_generation_leased(
+            optimizer_state_path, generation, pointer
+        )
+
+
+@asynccontextmanager
+async def authenticated_optimizer_generation_lease(
+    optimizer_state_path: str, generation: str
+) -> AsyncIterator[VerifiedOptimizerGeneration]:
+    """Authenticate off-thread and retain the generation through rank reads."""
+    with optimizer_generation_lease(optimizer_state_path, generation) as pointer:
+        verification = await asyncio.to_thread(
+            _verify_optimizer_generation_leased,
+            optimizer_state_path,
+            generation,
+            pointer,
+        )
+        yield verification
+
+
+def _verify_optimizer_generation_leased(
+    optimizer_state_path: str,
+    generation: str,
+    pointer: OptimizerGenerationPointer,
+) -> VerifiedOptimizerGeneration:
+    generation_path = optimizer_generation_path(optimizer_state_path, generation)
+    manifest, manifest_sha256 = _read_manifest_identity(generation_path)
+    _validate_pointer_manifest(pointer, manifest)
+    verify_optimizer_generation_manifest(optimizer_state_path, manifest)
     return VerifiedOptimizerGeneration(
         generation=generation,
         manifest_sha256=manifest_sha256,
@@ -1147,6 +1206,41 @@ def _read_manifest_identity(
     return manifest, hashlib.sha256(encoded).hexdigest()
 
 
+def _optimizer_logical_state_sha256(
+    *,
+    generation: str,
+    step: int,
+    adapter: OptimizerAdapter,
+    optimizer_semantic_sha256: str,
+    shards: Sequence[OptimizerShard],
+) -> str:
+    """Identify logical geometry and lineage without source-rank provenance."""
+    tensors: dict[str, OptimizerLogicalTensor] = {}
+    for shard in shards:
+        for tensor in shard.logical_tensors:
+            if tensor.key in tensors:
+                raise ValueError(
+                    f"optimizer logical tensor has multiple owners: {tensor.key}"
+                )
+            tensors[tensor.key] = tensor
+    if not tensors:
+        raise ValueError("logical optimizer generation has no logical tensors")
+    payload = {
+        "format": "art_optimizer_logical_state_v1",
+        "optimizer_semantic_sha256": optimizer_semantic_sha256,
+        "lineage": {
+            "training_session_id": adapter.training_session_id,
+            "generation_id": generation,
+            "step": step,
+        },
+        "tensors": [
+            tensors[key].model_dump(mode="json") for key in sorted(tensors)
+        ],
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def _ordered_manifest_shards(
     manifest: OptimizerGenerationManifest,
 ) -> tuple[OptimizerShard, ...]:
@@ -1173,12 +1267,24 @@ def build_optimizer_manifest(
     shards: list[OptimizerShard],
     topology: OptimizerTopology | None = None,
 ) -> OptimizerGenerationManifest:
+    logical_state_sha256 = (
+        _optimizer_logical_state_sha256(
+            generation=generation,
+            step=step,
+            adapter=adapter,
+            optimizer_semantic_sha256=optimizer_semantic_sha256,
+            shards=shards,
+        )
+        if optimizer_semantic_sha256 is not None
+        else None
+    )
     manifest = OptimizerGenerationManifest(
         generation=generation,
         step=step,
         adapter=adapter,
         runtime_sha256=runtime_sha256,
         optimizer_semantic_sha256=optimizer_semantic_sha256,
+        logical_state_sha256=logical_state_sha256,
         topology=topology or current_optimizer_topology(world_size),
         shards=tuple(shards),
     )
@@ -2255,6 +2361,7 @@ def write_portable_optimizer_snapshot_shard(
 ) -> OptimizerShard:
     """Write one source-owned logical shard for topology-neutral restoration."""
     from art.megatron.portable_optimizer_archive import (
+        portable_optimizer_logical_tensors,
         write_portable_optimizer_archive,
     )
 
@@ -2277,7 +2384,10 @@ def write_portable_optimizer_snapshot_shard(
         layout_sha256=snapshot.layout_sha256,
         sha256=identity.sha256,
         serialization="art_logical_safetensors_v1",
-        logical_keys=prepared.metadata.logical_keys,
+        logical_tensors=tuple(
+            OptimizerLogicalTensor(key=key, shape=shape)
+            for key, shape in portable_optimizer_logical_tensors(prepared)
+        ),
     )
 
 
@@ -2563,7 +2673,7 @@ def load_trainer_rank_optimizer_state(
     expected_optimizer_semantic_sha256: str,
     layout: Any,
     sites: Sequence[tuple[Any, Any]],
-    expected_keys: Sequence[str],
+    expected_shapes: Mapping[str, Sequence[int]],
 ) -> Any:
     """Repartition one logical optimizer generation for this destination rank."""
     if verification.generation != optimizer_generation_id:
@@ -2607,20 +2717,44 @@ def load_trainer_rank_optimizer_state(
         )
 
         required = portable_optimizer_logical_keys_for_sites(sites)
-        expected = set(expected_keys)
+        expected_geometry = {
+            str(key): tuple(int(dimension) for dimension in shape)
+            for key, shape in expected_shapes.items()
+        }
+        if any(
+            not key or not shape or any(dimension <= 0 for dimension in shape)
+            for key, shape in expected_geometry.items()
+        ):
+            raise RuntimeError("Destination optimizer geometry is invalid")
+        expected = set(expected_geometry)
         owners: dict[str, OptimizerShard] = {}
+        saved_geometry: dict[str, tuple[int, ...]] = {}
         for shard in shards:
-            for key in shard.logical_keys:
+            for logical_tensor in shard.logical_tensors:
+                key = logical_tensor.key
                 if key in owners:
                     raise RuntimeError(
                         f"Optimizer logical key has multiple source owners: {key}"
                     )
                 owners[key] = shard
+                saved_geometry[key] = logical_tensor.shape
         if set(owners) != expected:
             raise RuntimeError(
                 "Optimizer checkpoint logical keys differ from the destination: "
                 f"missing={sorted(expected.difference(owners))}, "
                 f"unexpected={sorted(set(owners).difference(expected))}"
+            )
+        if saved_geometry != expected_geometry:
+            mismatches = {
+                key: {
+                    "saved": saved_geometry.get(key),
+                    "destination": expected_geometry.get(key),
+                }
+                for key in sorted(set(saved_geometry) | set(expected_geometry))
+                if saved_geometry.get(key) != expected_geometry.get(key)
+            }
+            raise RuntimeError(
+                f"Optimizer checkpoint logical geometry differs: {mismatches}"
             )
         if missing := set(required).difference(expected):
             raise RuntimeError(
@@ -2638,9 +2772,18 @@ def load_trainer_rank_optimizer_state(
                 world_size=manifest.topology.world_size,
                 serialization=shard.serialization,
             )
-            archives.append(
-                read_portable_optimizer_archive(path, logical_keys=selected)
-            )
+            archive = read_portable_optimizer_archive(path, logical_keys=selected)
+            for key in archive.loaded_logical_keys:
+                expected_shape = saved_geometry[key]
+                for component in ("master", "exp_avg", "exp_avg_sq"):
+                    actual_shape = tuple(archive.tensors[f"{component}/{key}"].shape)
+                    if actual_shape != expected_shape:
+                        raise RuntimeError(
+                            "Optimizer archive component geometry differs from its "
+                            f"manifest: {component}/{key}={actual_shape}, "
+                            f"manifest={expected_shape}"
+                        )
+            archives.append(archive)
         if not archives:
             # A nonuniform EP destination can own only physical padding expert
             # slots. It needs no logical tensors, but it still needs the exact

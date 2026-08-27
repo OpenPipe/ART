@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator, Awaitable, Callable
-from contextlib import asynccontextmanager, nullcontext
+from contextlib import AsyncExitStack, asynccontextmanager, nullcontext
 import hashlib
 import json
 import logging
@@ -52,6 +52,7 @@ from .optimizer_state import (
     CheckpointFile,
     OptimizerAdapter,
     adapter_generation_lease,
+    authenticated_optimizer_generation_lease,
     commit_optimizer_policy_advance,
     format_megatron_resume_message,
     link_adapter_generation,
@@ -62,7 +63,6 @@ from .optimizer_state import (
     read_adapter_publication,
     read_committed_optimizer_pointer,
     resolve_committed_optimizer_policy,
-    verify_optimizer_generation,
 )
 from .runtime.build import build_trainer_runtime_spec
 from .runtime.data_plane import SFTBatchData
@@ -1502,14 +1502,18 @@ class DistributedMegatronService:
                 if ref.learner_parent_version != self._latest_step:
                     raise RuntimeError("load command learner parent changed")
                 generation = self._training_generation(output_version)
+                optimizer_state_path = (
+                    source.optimizer_state_path if restore_optimizer else None
+                )
+            alias_started = time.monotonic()
+            async with AsyncExitStack() as leases:
                 verification = (
-                    await asyncio.to_thread(
-                        verify_optimizer_generation,
-                        source.optimizer_state_path,
-                        source.optimizer_generation_id,
+                    await leases.enter_async_context(
+                        authenticated_optimizer_generation_lease(
+                            optimizer_state_path, source.optimizer_generation_id
+                        )
                     )
-                    if restore_optimizer
-                    and source.optimizer_state_path is not None
+                    if optimizer_state_path is not None
                     and source.optimizer_generation_id is not None
                     else None
                 )
@@ -1523,32 +1527,29 @@ class DistributedMegatronService:
                     generation=generation,
                     adapter_path=source.adapter.identity,
                     adapter_step=source.adapter.step,
-                    optimizer_state_path=(
-                        source.optimizer_state_path if restore_optimizer else None
-                    ),
+                    optimizer_state_path=optimizer_state_path,
                     optimizer_generation_id=(
                         source.optimizer_generation_id if restore_optimizer else None
                     ),
                     optimizer_verification=verification,
                     restore_optimizer=restore_optimizer,
                 )
-            alias_started = time.monotonic()
-            adapter = await asyncio.to_thread(
-                link_adapter_generation,
-                source.adapter.identity,
-                source_step=source.adapter.step,
-                staging_path=(
-                    Path(self.output_dir)
-                    / "megatron_runtime"
-                    / "staging"
-                    / generation.generation_id
-                ),
-                step=generation.policy_step,
-                training_session_id=generation.training_session_id,
-                generation_id=generation.generation_id,
-            )
-            alias_s = time.monotonic() - alias_started
-            result = await trainer.load_state(job)
+                adapter = await asyncio.to_thread(
+                    link_adapter_generation,
+                    source.adapter.identity,
+                    source_step=source.adapter.step,
+                    staging_path=(
+                        Path(self.output_dir)
+                        / "megatron_runtime"
+                        / "staging"
+                        / generation.generation_id
+                    ),
+                    step=generation.policy_step,
+                    training_session_id=generation.training_session_id,
+                    generation_id=generation.generation_id,
+                )
+                alias_s = time.monotonic() - alias_started
+                result = await trainer.load_state(job)
             async with self._mutation_lock:
                 if self._latest_step != ref.learner_parent_version:
                     raise RuntimeError("learner advanced while load executed")

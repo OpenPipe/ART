@@ -62,6 +62,7 @@ __all__ = (
     "PortableOptimizerComponents",
     "PreparedPortableOptimizerArchive",
     "portable_optimizer_logical_keys_for_sites",
+    "portable_optimizer_logical_tensors",
     "portable_optimizer_semantic_contract",
     "prepare_portable_optimizer_archive",
     "read_portable_optimizer_archive",
@@ -204,6 +205,19 @@ class _IdentityHandler:
     @staticmethod
     def to_vllm_lora_config(adapter_config: dict[str, Any]) -> dict[str, Any]:
         return adapter_config
+
+
+def portable_optimizer_logical_tensors(
+    prepared: PreparedPortableOptimizerArchive,
+) -> tuple[tuple[str, tuple[int, ...]], ...]:
+    """Return immutable logical master geometry for a prepared archive shard."""
+    return tuple(
+        (
+            key,
+            tuple(prepared.tensors[f"master/{key}"].shape),
+        )
+        for key in prepared.metadata.logical_keys
+    )
 
 
 def prepare_portable_optimizer_archive(

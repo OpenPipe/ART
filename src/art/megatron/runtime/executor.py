@@ -30,6 +30,7 @@ from art.megatron.model_support.lora_disk import (
 from art.megatron.optimizer_state import (
     CheckpointFile,
     OptimizerAdapter,
+    OptimizerLogicalTensor,
     OptimizerShard,
     OptimizerTopology,
     canonical_adapter_path,
@@ -1471,7 +1472,7 @@ class MCoreRunSlotExecutor:
                 ),
                 layout=self.optimizer_layout(checkpoint),
                 sites=checkpoint.sites,
-                expected_keys=tuple(checkpoint.expected_keys),
+                expected_shapes=checkpoint.expected_shapes,
             )
             optimizer = (
                 self._slot_trainer.prepare_checkpoint_slot_optimizer_for_residency(
@@ -2319,7 +2320,7 @@ class MCoreRunSlotExecutor:
                 ),
                 layout=self.optimizer_layout(checkpoint),
                 sites=checkpoint.sites,
-                expected_keys=tuple(checkpoint.expected_keys),
+                expected_shapes=checkpoint.expected_shapes,
             )
             optimizer = (
                 self._slot_trainer.prepare_checkpoint_slot_optimizer_for_residency(
@@ -4210,9 +4211,9 @@ class _GenerationPublisher:
                             "resident optimizer has no logical export plan"
                         )
                     from art.megatron.portable_optimizer_archive import (
+                        portable_optimizer_logical_tensors,
                         prepare_portable_optimizer_archive,
                     )
-
                     optimizer_archive = prepare_portable_optimizer_archive(
                         optimizer.state_dict,
                         resident.export_plan,
@@ -4225,7 +4226,12 @@ class _GenerationPublisher:
                         layout_sha256=optimizer.layout_sha256,
                         sha256=optimizer_identity.sha256,
                         serialization="art_logical_safetensors_v1",
-                        logical_keys=optimizer_archive.metadata.logical_keys,
+                        logical_tensors=tuple(
+                            OptimizerLogicalTensor(key=key, shape=shape)
+                            for key, shape in portable_optimizer_logical_tensors(
+                                optimizer_archive
+                            )
+                        ),
                     )
                 runtime_sha256 = optimizer.runtime_sha256
                 optimizer_semantic_sha256 = optimizer.optimizer_semantic_sha256

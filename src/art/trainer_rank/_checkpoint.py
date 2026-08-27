@@ -89,6 +89,7 @@ class PreparedCheckpointSlotLoad(BaseModel):
     config: dict[str, object]
     adapter: dict[str, torch.Tensor]
     expected_keys: frozenset[str]
+    expected_shapes: dict[str, tuple[int, ...]]
 
 
 class PreparedCheckpointSlotInstall(BaseModel):
@@ -99,6 +100,7 @@ class PreparedCheckpointSlotInstall(BaseModel):
     config: dict[str, object]
     sites: tuple[tuple[Any, Any], ...]
     expected_keys: frozenset[str]
+    expected_shapes: dict[str, tuple[int, ...]]
 
     @property
     def parameters(self) -> tuple[torch.nn.Parameter, ...]:
@@ -1703,7 +1705,32 @@ def prepare_checkpoint_slot_load(
         "localize checkpoint adapter",
         group,
     )
-    expected = {key for keys in _gather(tuple(prepared_adapter), group) for key in keys}
+    gathered_shapes = _gather(
+        tuple(
+            sorted(
+                (str(key), tuple(tensor.shape))
+                for key, tensor in prepared_adapter.items()
+            )
+        ),
+        group,
+    )
+    shape_candidates: dict[str, set[tuple[int, ...]]] = {}
+    for rank_shapes in gathered_shapes:
+        for key, shape in rank_shapes:
+            shape_candidates.setdefault(key, set()).add(shape)
+    disagreements = {
+        key: sorted(shapes)
+        for key, shapes in shape_candidates.items()
+        if len(shapes) != 1
+    }
+    if disagreements:
+        raise trainer._slot_state_error(
+            f"Checkpoint logical tensor geometry differs across ranks: {disagreements}"
+        )
+    expected_shapes = {
+        key: next(iter(shapes)) for key, shapes in shape_candidates.items()
+    }
+    expected = set(expected_shapes)
     if source.manifest is not None and expected != set(source.keys):
         raise trainer._slot_state_error(
             "Checkpoint tensor coverage differs from runtime"
@@ -1714,6 +1741,7 @@ def prepare_checkpoint_slot_load(
         config=dict(config),
         adapter=prepared_adapter,
         expected_keys=frozenset(expected),
+        expected_shapes=expected_shapes,
     )
 
 
@@ -1768,6 +1796,7 @@ def stage_checkpoint_slot_load(
         config=prepared.config,
         sites=sites,
         expected_keys=prepared.expected_keys,
+        expected_shapes=prepared.expected_shapes,
     )
 
 
