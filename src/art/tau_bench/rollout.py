@@ -106,7 +106,11 @@ async def rollout(
         ),
     ) as env:
         environment_startup = time.perf_counter() - started
-        chat_completion_kwargs = chat_completion_kwargs or {}
+        chat_completion_kwargs = dict(chat_completion_kwargs or {})
+        if not {"max_tokens", "max_completion_tokens"} & chat_completion_kwargs.keys():
+            chat_completion_kwargs["max_completion_tokens"] = (
+                DEFAULT_MAX_COMPLETION_TOKENS
+            )
         openai_client, model_name, cost_model = _completion_client_and_model(
             base_url_or_model,
             api_key=api_key,

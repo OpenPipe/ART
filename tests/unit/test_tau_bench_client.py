@@ -429,6 +429,10 @@ async def test_rollout_supports_string_model_args(
         ("http://model.test/v1", "model-key")
     ]
     assert policy_client.chat.completions.kwargs["stream"] is False
+    assert (
+        policy_client.chat.completions.kwargs["max_completion_tokens"]
+        == rollout_module.DEFAULT_MAX_COMPLETION_TOKENS
+    )
     assert policy_client.kwargs["max_retries"] == 1
     http_client = policy_client.kwargs["http_client"]
     assert http_client.timeout == httpx.Timeout(
@@ -470,6 +474,35 @@ async def test_rollout_supports_art_model_like_args() -> None:
     assert trajectory.metadata["scenario_id"] == "task_001"
     assert trajectory.metrics["num_turns"] == 1
     assert client.create_kwargs["idle_timeout_seconds"] is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("argument", ["max_tokens", "max_completion_tokens"])
+async def test_rollout_preserves_explicit_completion_limit(
+    argument: str,
+) -> None:
+    rollout_module = importlib.import_module("art.tau_bench.rollout")
+    model = art.Model(
+        name="registered-model",
+        project="test",
+        inference_api_key="test-key",
+        inference_base_url="http://model.test/v1",
+    )
+    client = FakeTauBenchClient()
+    completion_client = FakeAsyncOpenAI()
+    object.__setattr__(model, "_openai_client", completion_client)
+
+    await rollout_module.rollout(
+        Scenario(domain="banking_knowledge", task=Task(id="task_001")),
+        model,
+        client=client,
+        max_turns=1,
+        chat_completion_kwargs={argument: 123},
+    )
+
+    assert completion_client.chat.completions.kwargs[argument] == 123
+    other = {"max_tokens", "max_completion_tokens"} - {argument}
+    assert other.isdisjoint(completion_client.chat.completions.kwargs)
 
 
 @pytest.mark.asyncio
