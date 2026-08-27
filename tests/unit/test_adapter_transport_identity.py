@@ -38,6 +38,7 @@ def test_nixl_receiver_computes_identity_from_received_bytes(tmp_path) -> None:
     receiver._pending = {
         generation_id: adapter_transport._PendingReceive(target=target, slot=slot)
     }
+    receiver._local_pending = {}
     receiver._materialized = set()
     receiver._take_notification = lambda _generation_id: notification
     receiver._finish = lambda _generation_id: None
