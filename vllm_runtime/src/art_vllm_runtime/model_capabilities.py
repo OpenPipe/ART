@@ -26,6 +26,7 @@ _VALIDATED_QWEN35_MOE_VLLM_VERSIONS = frozenset({"0.25.1", "0.25.1+cu129"})
 def model_backend_capabilities(
     model_config: Any,
     *,
+    capability_base_model: str | None = None,
     binary_route_capture: bool,
 ) -> dict[str, object]:
     """Describe implementation support without inventing conformance evidence."""
@@ -35,7 +36,10 @@ def model_backend_capabilities(
     if not architectures:
         raise RuntimeError("loaded model config does not declare an architecture")
     architecture_set = frozenset(architectures)
-    base_model = str(model_config.model)
+    # Local conformance fixtures may load from a generated directory while
+    # retaining the canonical model contract asserted by the ART launcher.
+    loaded_model_source = str(model_config.model)
+    base_model = capability_base_model or loaded_model_source
     backend_version = version("vllm")
 
     if architecture_set & _GPT_OSS_ARCHITECTURES:

@@ -2304,6 +2304,7 @@ class DistributedMegatronService:
             service = self._model_service_spec()
         template = ReplicaLaunchTemplate(
             served_model_name=self._serving_lora_name(step),
+            capability_base_model=self.base_model,
             lora_path=lora_path,
             initial_policy_version=step,
             initial_generation_id=self._generation_id_for_step(step),

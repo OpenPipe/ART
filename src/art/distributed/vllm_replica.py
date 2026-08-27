@@ -28,6 +28,7 @@ ReplicaPhase = Literal[
 
 class ReplicaLaunchTemplate(_Message):
     served_model_name: str = Field(min_length=1)
+    capability_base_model: str | None = Field(default=None, min_length=1)
     lora_path: str | None = None
     initial_policy_version: int | None = Field(default=None, ge=0)
     initial_generation_id: str | None = Field(default=None, min_length=1)
@@ -596,6 +597,7 @@ class ReplicaManager:
         physical_ids = all(isinstance(gpu_id, int) for gpu_id in member.gpu_ids)
         launch = VllmRuntimeLaunchConfig(
             base_model=self._spec.base_model,
+            capability_base_model=self._template.capability_base_model,
             port=self._spec.leader_endpoint.port,
             host=(
                 self._spec.leader_endpoint.host
