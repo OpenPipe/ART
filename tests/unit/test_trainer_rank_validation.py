@@ -292,8 +292,8 @@ def _trainer_with_checkpoint(
     trainer._checkpoint_slots.setdefault("student", _CheckpointSlot()).params = (param,)
     monkeypatch.setattr(
         trainer,
-        "_reduce_dynamic_grads",
-        lambda params, **_kwargs: tuple(item.grad.float() for item in params),
+        "_sync_dynamic_grads",
+        lambda _params, grads: grads,
     )
     return trainer, param
 
@@ -1114,6 +1114,7 @@ def test_checkpoint_slot_adapter_config_rejects_cross_rank_mismatch(
     checkpoint_group = cast(dist.ProcessGroup, object())
     trainer._checkpoint_process_group = checkpoint_group
     trainer._checkpoint_finalize_process_group = cast(dist.ProcessGroup, object())
+    trainer._checkpoint_install_process_group = cast(dist.ProcessGroup, object())
 
     def gather(
         output: list[object], value: object, *, group: object | None = None
@@ -1436,8 +1437,8 @@ def test_weights_only_load_replaces_stale_optimizer_and_recreates_it_lazily(
     replacement.grad = torch.ones_like(replacement)
     monkeypatch.setattr(
         trainer,
-        "_reduce_dynamic_grads",
-        lambda params, **_kwargs: tuple(item.grad.float() for item in params),
+        "_sync_dynamic_grads",
+        lambda _params, grads: grads,
     )
     result = trainer.optim_step(
         checkpoints=["student"],
@@ -2149,8 +2150,8 @@ def test_real_checkpoint_codec_round_trips_with_optional_optimizer(
         trainer._checkpoint_slots["student"] = _CheckpointSlot(params, config)
         monkeypatch.setattr(
             trainer,
-            "_reduce_dynamic_grads",
-            lambda params, **_kwargs: tuple(item.grad.float() for item in params),
+            "_sync_dynamic_grads",
+            lambda _params, grads: grads,
         )
         return trainer
 
@@ -2173,8 +2174,8 @@ def test_real_checkpoint_codec_round_trips_with_optional_optimizer(
     restored = TrainerRank(_runtime(restored_lora))
     monkeypatch.setattr(
         restored,
-        "_reduce_dynamic_grads",
-        lambda params, **_kwargs: tuple(item.grad.float() for item in params),
+        "_sync_dynamic_grads",
+        lambda _params, grads: grads,
     )
     checkpoint_module.load_checkpoint(restored, prepared, "student")
     assert (
@@ -2253,8 +2254,8 @@ def test_optim_step_rejects_explicit_slot_subset_with_missing_grads(
     )
     monkeypatch.setattr(
         trainer,
-        "_reduce_dynamic_grads",
-        lambda params, **_kwargs: tuple(param.grad.float() for param in params),
+        "_sync_dynamic_grads",
+        lambda _params, grads: grads,
     )
 
     with pytest.raises(TrainerRankSlotStateError, match="missing"):
@@ -2277,8 +2278,8 @@ def test_optim_step_implicitly_steps_only_slots_with_grads(
     )
     monkeypatch.setattr(
         trainer,
-        "_reduce_dynamic_grads",
-        lambda params, **_kwargs: tuple(param.grad.float() for param in params),
+        "_sync_dynamic_grads",
+        lambda _params, grads: grads,
     )
 
     before_ready = ready.detach().clone()
@@ -2322,8 +2323,8 @@ def test_dynamic_optimizer_zeroes_internal_padding_grads_before_step(
     trainer._checkpoint_slots.setdefault("student", _CheckpointSlot()).params = (param,)
     monkeypatch.setattr(
         trainer,
-        "_reduce_dynamic_grads",
-        lambda params, **_kwargs: tuple(item.grad.float() for item in params),
+        "_sync_dynamic_grads",
+        lambda _params, grads: grads,
     )
 
     trainer.optim_step(
