@@ -371,6 +371,9 @@ def _register(
         kwargs["initial_optimizer_verification"] = VerifiedOptimizerGeneration(
             generation=optimizer_generation,
             manifest_sha256="0" * 64,
+            manifest_format_version=5,
+            optimizer_semantic_sha256="0" * 64,
+            logical_state_sha256="0" * 64,
         )
     return executor.register_run(
         RunSlotRegistration(

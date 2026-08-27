@@ -1320,37 +1320,48 @@ class TrainerRank:
             masters.append(torch.nn.Parameter(source.clone()))
         master_params = tuple(masters)
         all_masters = dynamic.master_params + master_params
-        optimizer = torch.optim.AdamW(
+        old_group = dynamic.optimizer.param_groups[0]
+        iteration = shared_optimizer_iteration(
+            old_group,
+            (
+                dynamic.optimizer.state.get(master, {})
+                for master in dynamic.master_params
+            ),
+        )
+        beta1, beta2 = old_group["betas"]
+        optimizer = _build_dynamic_optimizer(
             all_masters,
-            **{
-                key: dynamic.optimizer.defaults[key]
-                for key in (
-                    "lr",
-                    "betas",
-                    "eps",
-                    "weight_decay",
-                    "amsgrad",
-                    "maximize",
-                    "foreach",
-                    "capturable",
-                    "differentiable",
-                    "fused",
-                )
-            }
+            AdamParams(
+                learning_rate=float(old_group["lr"]),
+                beta1=float(beta1),
+                beta2=float(beta2),
+                eps=float(old_group["eps"]),
+                weight_decay=float(old_group["weight_decay"]),
+            ),
         )
         optimizer.param_groups[0].update(
             {
                 key: value
-                for key, value in dynamic.optimizer.param_groups[0].items()
+                for key, value in old_group.items()
                 if key != "params"
             }
         )
+        optimizer.param_groups[0]["step"] = iteration
         optimizer.state.update(dynamic.optimizer.state)
         for (key, _param), master in zip(params, master_params, strict=True):
             state = restored.get(key)
             if state is not None:
+                try:
+                    restored_iteration = require_uniform_optimizer_iterations(
+                        (state.step, iteration)
+                    )
+                except ValueError as exc:
+                    raise TrainerRankSlotStateError(
+                        f"Custom optimizer iteration for checkpoint slot {name!r} "
+                        f"and parameter {key!r} differs from the learner iteration."
+                    ) from exc
+                assert restored_iteration == iteration
                 optimizer.state[master] = {
-                    "step": torch.tensor(state.step, device=master.device),
                     "exp_avg": state.exp_avg.to(master.device).clone(),
                     "exp_avg_sq": state.exp_avg_sq.to(master.device).clone(),
                 }
@@ -3067,7 +3078,7 @@ class TrainerRank:
             )
         try:
             shared_optimizer_iteration(
-                groups[0],
+                cast(Mapping[str, object], groups[0]),
                 (
                     cast(Mapping[str, object], states.get(index, {}))
                     for index in range(len(masters))

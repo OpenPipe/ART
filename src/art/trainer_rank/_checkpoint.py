@@ -762,13 +762,12 @@ def _custom_snapshot(
     if dynamic is not None:
         for record in records.values():
             for key in record["trainable_keys"]:
-                if f"master/{key}" in optimizer:
-                    continue
-                value = tensors[key].float()
-                optimizer[f"master/{key}"] = value
-                optimizer[f"exp_avg/{key}"] = torch.zeros_like(value)
-                optimizer[f"exp_avg_sq/{key}"] = torch.zeros_like(value)
-                optimizer[f"step/{key}"] = torch.tensor(0.0)
+                if f"master/{key}" not in optimizer:
+                    value = tensors[key].float()
+                    optimizer[f"master/{key}"] = value
+                    optimizer[f"exp_avg/{key}"] = torch.zeros_like(value)
+                    optimizer[f"exp_avg_sq/{key}"] = torch.zeros_like(value)
+                optimizer[f"step/{key}"] = torch.tensor(iteration)
 
     if not records:
         return {}

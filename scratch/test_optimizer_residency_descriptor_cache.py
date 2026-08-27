@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from typing import Any, cast
 
 import pytest
@@ -14,6 +14,39 @@ from art.trainer_rank._impl import (
     _CheckpointSlot,
     _DynamicOptimizer,
 )
+from art.trainer_rank._optimizer_semantics import (
+    require_uniform_optimizer_iterations,
+)
+
+
+class _SharedStepAdamW(torch.optim.AdamW):
+    def step(  # ty: ignore[invalid-method-override]
+        self, closure: Callable[[], float] | None = None
+    ) -> float | None:
+        current_by_group: list[int] = []
+        for group in self.param_groups:
+            current = int(group.get("step", 0))
+            current_by_group.append(current)
+            for parameter in group["params"]:
+                state = self.state.get(parameter, {})
+                if state:
+                    state["step"] = torch.tensor(float(current))
+        result = super().step(closure=closure)
+        for group, current in zip(self.param_groups, current_by_group, strict=True):
+            states = tuple(self.state.get(parameter, {}) for parameter in group["params"])
+            projected = tuple(
+                state["step"]
+                for parameter, state in zip(group["params"], states, strict=True)
+                if parameter.grad is not None and "step" in state
+            )
+            group["step"] = (
+                current
+                if not projected
+                else require_uniform_optimizer_iterations(projected)
+            )
+            for state in states:
+                state.pop("step", None)
+        return result
 
 
 def _layout(
@@ -42,7 +75,8 @@ def _slot(
 ) -> tuple[_CheckpointSlot, torch.optim.AdamW, dict[str, int]]:
     params = tuple(torch.nn.Parameter(torch.randn(shape)) for shape in shapes)
     masters = tuple(torch.nn.Parameter(param.detach().clone()) for param in params)
-    optimizer = torch.optim.AdamW(masters, lr=0.01, foreach=False)
+    optimizer = _SharedStepAdamW(masters, lr=0.01, foreach=False)
+    optimizer.param_groups[0]["step"] = 0
     if initialized:
         for master in masters:
             master.grad = torch.ones_like(master)
@@ -55,7 +89,7 @@ def _slot(
         calls["state_dict"] += 1
         return state_dict()
 
-    optimizer.state_dict = counted_state_dict  # type: ignore[method-assign]
+    optimizer.state_dict = counted_state_dict  # ty: ignore[invalid-assignment]
     return (
         _CheckpointSlot(
             params=params,
@@ -120,7 +154,7 @@ def test_cache_reuses_structure_and_freezes_generation_metadata(
     assert second is not None
     second_group = _optimizer_payload(second)["param_groups"][0]
     assert first_group["lr"] == 0.01
-    assert "step" not in first_group
+    assert first_group["step"] == 1
     assert second_group["lr"] == 0.25
     assert second_group["step"] == 7
     assert _optimizer_payload(first)["state"] is _optimizer_payload(second)["state"]
@@ -144,12 +178,14 @@ def test_cache_reuses_structure_and_freezes_generation_metadata(
     assert tuple(map(id, bound_tensors)) == tuple(
         id(replacements_by_id[id(source)]) for source in source_tensors
     )
-    restored_params = tuple(
-        torch.nn.Parameter(torch.zeros_like(param)) for param in slot.params
-    )
-    restored = torch.optim.AdamW(restored_params)
-    restored.load_state_dict(cast(dict[str, Any], bound["optimizer"]))
-    assert len(restored.state) == len(restored_params)
+    bound_optimizer = cast(dict[str, Any], bound["optimizer"])
+    assert bound_optimizer["param_groups"][0]["step"] == 1
+    assert len(bound_optimizer["state"]) == len(slot.params)
+    for index, param in enumerate(slot.params):
+        state = bound_optimizer["state"][index]
+        assert set(state) == {"exp_avg", "exp_avg_sq"}
+        assert state["exp_avg"].shape == param.shape
+        assert state["exp_avg_sq"].shape == param.shape
 
 
 def test_cache_is_exact_across_shapes_ranks_and_targets(
@@ -250,7 +286,7 @@ def test_cache_bypasses_optimizer_specific_state_dict_materialization(
         {"run": _layout(((2, 2),), "q_proj", 2)},
     )
 
-    optimizer.state_dict = lambda: (_ for _ in ()).throw(  # type: ignore[method-assign]
+    optimizer.state_dict = lambda: (_ for _ in ()).throw(  # ty: ignore[invalid-assignment]
         RuntimeError("optimizer-specific state_dict must not run")
     )
     source = trainer.checkpoint_slot_optimizer_residency_source("run")

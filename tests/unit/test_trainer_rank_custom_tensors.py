@@ -703,6 +703,99 @@ def test_parameter_can_be_added_after_checkpoint_optimizer_exists() -> None:
     assert rebuilt.optimizer.param_groups[0]["betas"][0] == 0.7
 
 
+def test_restored_parameter_extension_preserves_shared_optimizer_semantics(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trainer, rank = _trainer("student")
+    slot = trainer._checkpoint_slots["student"]
+    existing = torch.nn.Parameter(torch.tensor(1.0))
+    trainer._tag_custom_parameters((existing,))
+    slot.params = (existing,)
+    slot.optimizer = trainer._new_dynamic_optimizer(
+        "student", AdamParams(learning_rate=1e-3)
+    )
+    monkeypatch.setattr(trainer, "_sync_dynamic_grads", lambda _params, grads: grads)
+    (existing * 3).backward()
+    trainer.optim_step(
+        params=AdamParams(learning_rate=1e-3), checkpoints=["student"]
+    )
+    optimizer_type_name = type(slot.optimizer.optimizer).__name__
+    slot.custom_payload = PreparedCustomPayload(
+        {
+            "added": {
+                "kind": "parameter",
+                "tensor_keys": ["added"],
+                "trainable_keys": ["added"],
+                "parameter_aliases": [["added"]],
+                "buffer_aliases": [],
+                "persistent_buffer_keys": [],
+            }
+        },
+        {"added": torch.tensor(2.0)},
+        {
+            "master/added": torch.tensor(2.0),
+            "exp_avg/added": torch.tensor(0.25),
+            "exp_avg_sq/added": torch.tensor(0.5),
+            "step/added": torch.tensor(1.0),
+        },
+    )
+
+    added = rank.parameter("added", lambda: torch.tensor(-1.0), checkpoint="student")
+    dynamic = slot.optimizer
+    assert dynamic is not None
+    assert type(dynamic.optimizer).__name__ == optimizer_type_name
+    assert type(dynamic.optimizer) is not torch.optim.AdamW
+    assert dynamic.optimizer.param_groups[0]["step"] == 1
+    assert all("step" not in state for state in dynamic.optimizer.state.values())
+
+    (existing * 3).backward()
+    trainer.optim_step(
+        params=AdamParams(learning_rate=1e-2, weight_decay=0.0),
+        checkpoints=["student"],
+    )
+    assert dynamic.optimizer.param_groups[0]["step"] == 2
+    assert all("step" not in state for state in dynamic.optimizer.state.values())
+    torch.testing.assert_close(added, torch.tensor(2.0), atol=0, rtol=0)
+
+
+def test_restored_extension_rejects_iteration_mismatch_transactionally() -> None:
+    trainer, rank = _trainer("student")
+    slot = trainer._checkpoint_slots["student"]
+    existing = torch.nn.Parameter(torch.tensor(1.0))
+    trainer._tag_custom_parameters((existing,))
+    slot.params = (existing,)
+    slot.optimizer = trainer._new_dynamic_optimizer(
+        "student", AdamParams(learning_rate=1e-3)
+    )
+    optimizer = slot.optimizer
+    slot.custom_payload = PreparedCustomPayload(
+        {
+            "added": {
+                "kind": "parameter",
+                "tensor_keys": ["added"],
+                "trainable_keys": ["added"],
+                "parameter_aliases": [["added"]],
+                "buffer_aliases": [],
+                "persistent_buffer_keys": [],
+            }
+        },
+        {"added": torch.tensor(2.0)},
+        {
+            "master/added": torch.tensor(2.0),
+            "exp_avg/added": torch.tensor(0.25),
+            "exp_avg_sq/added": torch.tensor(0.5),
+            "step/added": torch.tensor(1.0),
+        },
+    )
+
+    with pytest.raises(TrainerRankSlotStateError, match="differs from the learner"):
+        rank.parameter("added", lambda: torch.tensor(-1.0), checkpoint="student")
+
+    assert slot.params == (existing,)
+    assert slot.optimizer is optimizer
+    assert "added" not in slot.custom
+
+
 def test_portable_optimizer_rejects_late_trainable_parameter_transactionally() -> None:
     trainer, rank = _trainer("student")
     trainer.runtime.optimizer_semantic_sha256 = "1" * 64
@@ -1095,6 +1188,62 @@ def test_custom_tensors_and_optimizer_restore_lazily_and_survive_unmaterialized_
             lambda: torch.zeros(2, dtype=torch.float64),
             checkpoint="student",
         )
+
+
+def test_unmaterialized_custom_optimizer_tracks_advanced_shared_iteration(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from safetensors.torch import load_file
+
+    from art.trainer_rank import _checkpoint
+
+    trainer, _rank = _trainer("student")
+    slot = trainer._checkpoint_slots["student"]
+    existing = torch.nn.Parameter(torch.tensor(1.0))
+    trainer._tag_custom_parameters((existing,))
+    slot.params = (existing,)
+    slot.optimizer = trainer._new_dynamic_optimizer(
+        "student", AdamParams(learning_rate=1e-3)
+    )
+    monkeypatch.setattr(trainer, "_sync_dynamic_grads", lambda _params, grads: grads)
+    (existing * 3).backward()
+    trainer.optim_step(
+        params=AdamParams(learning_rate=1e-3), checkpoints=["student"]
+    )
+    slot.custom_payload = PreparedCustomPayload(
+        {
+            "deferred": {
+                "kind": "parameter",
+                "tensor_keys": ["deferred"],
+                "trainable_keys": ["deferred"],
+                "parameter_aliases": [["deferred"]],
+                "buffer_aliases": [],
+                "persistent_buffer_keys": [],
+            }
+        },
+        {"deferred": torch.tensor(4.0)},
+        {
+            "master/deferred": torch.tensor(4.0),
+            "exp_avg/deferred": torch.tensor(0.25),
+            "exp_avg_sq/deferred": torch.tensor(0.5),
+            "step/deferred": torch.tensor(1.0),
+        },
+    )
+    (existing * 3).backward()
+    trainer.optim_step(
+        params=AdamParams(learning_rate=1e-3), checkpoints=["student"]
+    )
+
+    snapshot = tmp_path / "snapshot"
+    snapshot.mkdir()
+    _checkpoint._custom_snapshot(trainer, "student", snapshot)
+    saved = load_file(snapshot / "optimizer/custom.safetensors")
+
+    torch.testing.assert_close(saved["master/deferred"], torch.tensor(4.0))
+    torch.testing.assert_close(saved["exp_avg/deferred"], torch.tensor(0.25))
+    torch.testing.assert_close(saved["exp_avg_sq/deferred"], torch.tensor(0.5))
+    assert saved["step/deferred"].item() == 2
 
 
 @pytest.mark.parametrize("mismatch", ("trainability", "aliases", "persistence"))
