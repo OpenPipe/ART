@@ -13,6 +13,36 @@ import httpx
 import pytest
 
 
+def test_runtime_fingerprint_uses_art_source_identity_not_distribution_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from importlib import metadata
+
+    import art.distributed.host_admission as host_admission
+
+    package_queries: list[str] = []
+
+    def package_version(name: str) -> str:
+        package_queries.append(name)
+        if name == "openpipe-art":
+            raise metadata.PackageNotFoundError(name)
+        return "test-version"
+
+    monkeypatch.setattr(host_admission, "_art_build_sha256", lambda: "a" * 64)
+    monkeypatch.setattr(host_admission.metadata, "version", package_version)
+
+    fingerprint = host_admission.build_runtime_fingerprint(
+        host_admission.runtime_package_names(trainer=False)
+    )
+
+    assert fingerprint.art_build_sha256 == "a" * 64
+    assert fingerprint.packages == (
+        ("pydantic", "test-version"),
+        ("torchmonarch", "test-version"),
+    )
+    assert package_queries == ["pydantic", "torchmonarch"]
+
+
 def _process_is_running(pid: int) -> bool:
     try:
         state = Path(f"/proc/{pid}/stat").read_text().split()[2]

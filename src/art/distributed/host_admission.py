@@ -23,7 +23,10 @@ from .specs import CUDA_DEVICE_UUID_PATTERN, GpuId, HostServiceHealth, HostSpec
 _SCHEMA = "art-host-runtime-v1"
 _SHA256 = r"^[0-9a-f]{64}$"
 _BOOT_ID_PATH = Path("/proc/sys/kernel/random/boot_id")
-_BASE_PACKAGES = ("openpipe-art", "pydantic", "torchmonarch")
+# ART is identified by the exact imported package-content digest below. Requiring
+# distribution metadata as well rejects valid source-mounted runtimes and only
+# adds the weaker package version to the admission contract.
+_BASE_PACKAGES = ("pydantic", "torchmonarch")
 _TRAINER_PACKAGES = (
     "flash-attn-4",
     "megatron-bridge",
