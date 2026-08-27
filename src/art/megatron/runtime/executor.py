@@ -4112,7 +4112,6 @@ class _GenerationPublisher:
                 )
                 exact_model_identity = (
                     (staging_adapter_path is not None and not rank_sharded_durable)
-                    or bool(publication_targets)
                     or (
                         adapter_object_target is not None
                         and not isinstance(
@@ -4120,9 +4119,12 @@ class _GenerationPublisher:
                         )
                     )
                 )
+                # Durable local files and non-ordered objects need an exact
+                # identity in the authorized write plan. Live adapter transport
+                # computes the same identity in its asynchronous worker instead
+                # of serializing snapshot authorization on a full payload scan.
                 # Ordered shards are fenced by their plan, range, ETag, and
-                # commit. Hashing the whole adapter here would serialize every
-                # serverless publication before its first shard can upload.
+                # commit and do not require a whole-adapter hash.
                 model_identity = (
                     prepared_safetensors_identity(tensors)
                     if exact_model_identity
@@ -4972,13 +4974,16 @@ class _GenerationPublisher:
                 planned,
             )
         elif prepared.publication_targets:
-            if payload.model_identity is None:
-                raise RuntimeError("adapter transport has no exact file identity")
+            identity_started = time.perf_counter()
+            model_identity = payload.model_identity or prepared_safetensors_identity(
+                payload.tensors
+            )
+            identity_s = time.perf_counter() - identity_started
             self._transfer_lora_snapshot(
                 payload.lora,
                 prepared.publication_targets,
                 prepared_tensors=payload.tensors,
-                model_identity=payload.model_identity,
+                model_identity=model_identity,
             )
         return _SnapshotTransport(
             adapter=adapter,
@@ -4986,6 +4991,11 @@ class _GenerationPublisher:
                 "time/snapshot_transport_queue_s": started - submitted_at,
                 "time/snapshot_transport_wait_s": ready - started,
                 "time/snapshot_transport_s": time.perf_counter() - ready,
+                **(
+                    {"time/snapshot_transport_identity_s": identity_s}
+                    if prepared.publication_targets
+                    else {}
+                ),
             },
         )
 
