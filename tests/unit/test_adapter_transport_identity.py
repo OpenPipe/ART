@@ -68,6 +68,9 @@ def test_local_receiver_computes_identity_from_materialized_file(
     template = tmp_path / "template"
     template.mkdir()
     (template / "adapter_model.safetensors").write_bytes(b"0" * prepared.nbytes)
+    (template / "adapter_config.json").write_text(
+        '{"art_lora_format":"vllm"}', encoding="utf-8"
+    )
     monkeypatch.setenv("ART_LOCAL_ADAPTER_TRANSFER_ROOT", str(tmp_path / "local"))
     receiver = adapter_transport.AdapterSnapshotReceiver(
         "host-1", str(tmp_path / "receiver")
