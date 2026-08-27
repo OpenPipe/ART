@@ -5,16 +5,25 @@ import torch
 
 from art.megatron.portable_optimizer_archive import PortableOptimizerArchiveMetadata
 from art.trainer_rank._optimizer_semantics import (
+    optimizer_step,
     require_uniform_optimizer_steps,
     shared_optimizer_step,
 )
 
 
 def test_shared_optimizer_step_reads_te_group_state() -> None:
-    assert shared_optimizer_step(
+    step = shared_optimizer_step(
         {"step": 7},
         ({"exp_avg": torch.zeros(1)}, {"exp_avg_sq": torch.zeros(1)}),
-    ) == 7.0
+    )
+    assert step == 7
+    assert type(step) is int
+
+
+@pytest.mark.parametrize("value", (1.5, torch.tensor(2.25)))
+def test_optimizer_step_rejects_fractional_iterations(value: object) -> None:
+    with pytest.raises(ValueError, match="nonnegative integer"):
+        optimizer_step(value)
 
 
 def test_shared_optimizer_step_projects_uniform_logical_state() -> None:
