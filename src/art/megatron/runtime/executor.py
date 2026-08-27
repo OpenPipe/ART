@@ -45,7 +45,7 @@ from art.megatron.weights.rank_sharded_lora import (
     prepare_rank_sharded_lora,
     publish_rank_sharded_lora_checkpoint,
 )
-from art.trainer_rank._optimizer_semantics import shared_optimizer_iteration
+from art.trainer_rank._optimizer_semantics import shared_optimizer_step
 from art.training.contracts import TokenLogprobs
 from art.utils.lifecycle import process_shutdown_timeout
 from art.utils.safetensors import (
@@ -1197,9 +1197,9 @@ def _rank_local_optimizer_work(
     if not weights or len(masters) != len(weights) or len(states) != len(weights):
         raise RuntimeError("prepared optimizer does not cover every LoRA parameter")
     try:
-        shared_optimizer_iteration(optimizer.param_group, states)
+        shared_optimizer_step(optimizer.param_group, states)
     except ValueError as exc:
-        raise RuntimeError("prepared optimizer has an invalid shared iteration") from exc
+        raise RuntimeError("prepared optimizer has an invalid shared step") from exc
 
     adapter_rank = prepared.adapter_config.get("r")
     configured_targets = prepared.adapter_config.get("target_modules")

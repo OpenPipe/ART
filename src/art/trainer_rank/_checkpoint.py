@@ -20,7 +20,10 @@ from pydantic import BaseModel, ConfigDict
 import torch
 import torch.distributed as dist
 
-from art.trainer_rank._optimizer_semantics import shared_optimizer_step
+from art.trainer_rank._optimizer_semantics import (
+    require_uniform_optimizer_steps,
+    shared_optimizer_step,
+)
 
 if TYPE_CHECKING:
     from art.megatron.lora import LoRA, LoraShardMeta, LoRASlotRef
@@ -764,7 +767,7 @@ def _custom_snapshot(
                     optimizer[f"master/{key}"] = value
                     optimizer[f"exp_avg/{key}"] = torch.zeros_like(value)
                     optimizer[f"exp_avg_sq/{key}"] = torch.zeros_like(value)
-                optimizer[f"step/{key}"] = torch.tensor(iteration)
+                optimizer[f"step/{key}"] = torch.tensor(dynamic_step)
 
     if not records:
         return {}
@@ -1555,11 +1558,11 @@ def _optimizer_state(
     from art.megatron.lora import LoRA
 
     try:
-        shared_iteration = require_uniform_optimizer_iterations(
+        shared_step = require_uniform_optimizer_steps(
             source.manifest["steps"].values()
         )
     except ValueError as exc:
-        raise RuntimeError("Checkpoint optimizer iterations differ") from exc
+        raise RuntimeError("Checkpoint optimizer steps differ") from exc
     ref = trainer._slot_ref(name)
     components: dict[str, list[torch.Tensor]] = {
         "master": [],
@@ -1594,7 +1597,7 @@ def _optimizer_state(
         if not keys:
             for component in components.values():
                 component.append(torch.zeros_like(parameter))
-            steps.append(float(shared_iteration))
+            steps.append(float(shared_step))
             continue
         for index, component in enumerate(components):
             tensors = {
@@ -1609,7 +1612,10 @@ def _optimizer_state(
                 ),
             )
             components[component].append(_localized(module, full, parameter))
-        steps.append(float(shared_iteration))
+        key_steps = {source.manifest["steps"][key] for key in keys}
+        if key_steps != {float(shared_step)}:
+            raise RuntimeError(f"Optimizer steps differ for {keys}")
+        steps.append(float(shared_step))
     return LocalOptimizerState(
         tuple(components["master"]),
         tuple(components["exp_avg"]),

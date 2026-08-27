@@ -1321,7 +1321,7 @@ class TrainerRank:
         master_params = tuple(masters)
         all_masters = dynamic.master_params + master_params
         old_group = dynamic.optimizer.param_groups[0]
-        iteration = shared_optimizer_iteration(
+        step = shared_optimizer_step(
             old_group,
             (
                 dynamic.optimizer.state.get(master, {})
@@ -1346,21 +1346,19 @@ class TrainerRank:
                 if key != "params"
             }
         )
-        optimizer.param_groups[0]["step"] = iteration
+        optimizer.param_groups[0]["step"] = step
         optimizer.state.update(dynamic.optimizer.state)
         for (key, _param), master in zip(params, master_params, strict=True):
             state = restored.get(key)
             if state is not None:
                 try:
-                    restored_iteration = require_uniform_optimizer_iterations(
-                        (state.step, iteration)
-                    )
+                    restored_step = require_uniform_optimizer_steps((state.step, step))
                 except ValueError as exc:
                     raise TrainerRankSlotStateError(
-                        f"Custom optimizer iteration for checkpoint slot {name!r} "
-                        f"and parameter {key!r} differs from the learner iteration."
+                        f"Custom optimizer step for checkpoint slot {name!r} "
+                        f"and parameter {key!r} differs from the learner step."
                     ) from exc
-                assert restored_iteration == iteration
+                assert restored_step == step
                 optimizer.state[master] = {
                     "exp_avg": state.exp_avg.to(master.device).clone(),
                     "exp_avg_sq": state.exp_avg_sq.to(master.device).clone(),
@@ -1728,16 +1726,6 @@ class TrainerRank:
             raise TrainerRankSlotStateError(
                 "Optimizer residency parameter order differs from its master tensors."
             )
-        try:
-            shared_optimizer_iteration(
-                parameter_group,
-                (optimizer.state.get(master, {}) for master in dynamic.master_params),
-            )
-        except ValueError as exc:
-            raise TrainerRankSlotStateError(
-                "Optimizer residency iteration representation is invalid."
-            ) from exc
-
         # Residency moves the optimizer's live tensors. Optimizer overrides such as
         # TE FusedAdam.state_dict() materialize unscaled copies and cannot describe
         # that live working set.
@@ -1870,12 +1858,6 @@ class TrainerRank:
             dict(cast(Mapping[str, object], states.get(index, {})))
             for index in range(len(masters))
         )
-        try:
-            shared_optimizer_iteration(param_group, prepared_state)
-        except ValueError as exc:
-            raise TrainerRankSlotStateError(
-                "Prepared optimizer iteration representation is invalid."
-            ) from exc
         tensors = (*masters, *_nested_tensors(prepared_state))
         if any(tensor.device.type != "cpu" for tensor in tensors):
             raise TrainerRankSlotStateError(
@@ -1985,12 +1967,6 @@ class TrainerRank:
             raise TrainerRankSlotStateError(
                 "Prepared optimizer parameter group does not own its master parameters."
             )
-        try:
-            shared_optimizer_iteration(state.param_group, state.state)
-        except ValueError as exc:
-            raise TrainerRankSlotStateError(
-                "Prepared optimizer iteration representation is invalid."
-            ) from exc
         optimizer.param_groups[0].update(state.param_group)
         optimizer.state.update(
             {

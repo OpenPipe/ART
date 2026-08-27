@@ -613,7 +613,7 @@ def _optimizer_components(
         values = states.get(index, {})
         if not isinstance(values, Mapping):
             raise ValueError("optimizer parameter state must be a mapping")
-        unexpected = set(values).difference({"exp_avg", "exp_avg_sq"})
+        unexpected = set(values).difference({"exp_avg", "exp_avg_sq", "step"})
         if unexpected:
             raise ValueError(
                 f"unsupported optimizer parameter state: {sorted(map(str, unexpected))}"

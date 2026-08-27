@@ -63,7 +63,10 @@ from art.trainer_rank._impl import (
     _MemoryProfile,
     _validate_top_k,
 )
-from art.trainer_rank._optimizer_semantics import shared_optimizer_step
+from art.trainer_rank._optimizer_semantics import (
+    require_uniform_optimizer_steps,
+    shared_optimizer_step,
+)
 
 if TYPE_CHECKING:
     from art.megatron.lora import LoRASlotRef
@@ -75,23 +78,38 @@ def _cpu_dynamic_optimizer(monkeypatch: pytest.MonkeyPatch) -> None:
     class SharedStepAdamW(torch.optim.AdamW):
         """CPU AdamW oracle with TE FusedAdam's one-step-per-group layout."""
 
-        def step(self, closure: object = None) -> object:
+        def step(  # ty: ignore[invalid-method-override]
+            self, closure: Callable[[], float] | None = None
+        ) -> float | None:
+            current_by_group: list[int] = []
             for group in self.param_groups:
-                shared_step = float(group.get("step", 0.0))
-                for param in group["params"]:
-                    state = self.state[param]
+                current = int(group.get("step", 0))
+                current_by_group.append(current)
+                for parameter in group["params"]:
+                    state = self.state.get(parameter, {})
                     if state:
-                        state["step"] = torch.tensor(shared_step)
+                        state["step"] = torch.tensor(float(current))
             result = super().step(closure=closure)
-            for group in self.param_groups:
-                steps = [
-                    self.state[param]["step"]
-                    for param in group["params"]
-                    if "step" in self.state[param]
-                ]
-                group["step"] = shared_optimizer_step({}, ({"step": s} for s in steps))
-                for param in group["params"]:
-                    self.state[param].pop("step", None)
+            for group, current in zip(
+                self.param_groups, current_by_group, strict=True
+            ):
+                states = tuple(
+                    self.state.get(parameter, {}) for parameter in group["params"]
+                )
+                projected = tuple(
+                    state["step"]
+                    for parameter, state in zip(
+                        group["params"], states, strict=True
+                    )
+                    if parameter.grad is not None and "step" in state
+                )
+                group["step"] = (
+                    current
+                    if not projected
+                    else require_uniform_optimizer_steps(projected)
+                )
+                for state in states:
+                    state.pop("step", None)
             return result
 
     def build(
@@ -2485,7 +2503,7 @@ def test_canonical_optimizer_state_reproduces_exact_next_step(
     assert original._checkpoint_slots["student"].revision == 2
 
 
-def test_shared_optimizer_iteration_advances_when_initialized_parameter_is_skipped(
+def test_shared_optimizer_step_advances_when_initialized_parameter_is_skipped(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     trainer = TrainerRank(_runtime())
@@ -2507,10 +2525,10 @@ def test_shared_optimizer_iteration_advances_when_initialized_parameter_is_skipp
     dynamic = trainer._checkpoint_slots["student"].optimizer
     assert dynamic is not None
     states = tuple(dynamic.optimizer.state[param] for param in dynamic.master_params)
-    assert shared_optimizer_iteration(dynamic.optimizer.param_groups[0], states) == 2
+    assert shared_optimizer_step(dynamic.optimizer.param_groups[0], states) == 2
 
 
-def test_dynamic_optimizer_rejects_legacy_per_parameter_iterations(
+def test_dynamic_optimizer_accepts_uniform_per_parameter_steps(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     trainer, param = _trainer_with_checkpoint(monkeypatch, torch.ones(1))
@@ -2536,10 +2554,20 @@ def test_dynamic_optimizer_rejects_legacy_per_parameter_iterations(
     for values in state["optimizer"]["state"].values():
         values["step"] = torch.tensor(float(iteration))
 
-    with pytest.raises(TrainerRankSlotStateError, match="iteration.*invalid"):
-        trainer.restore_checkpoint_slot_optimizer_state("student", state)
+    trainer.restore_checkpoint_slot_optimizer_state("student", state)
 
-    assert trainer._checkpoint_slots["student"].optimizer is existing
+    restored = trainer._checkpoint_slots["student"].optimizer
+    assert restored is not None and restored is not existing
+    assert (
+        shared_optimizer_step(
+            restored.optimizer.param_groups[0],
+            (
+                restored.optimizer.state.get(master, {})
+                for master in restored.master_params
+            ),
+        )
+        == iteration
+    )
 
 
 def test_dynamic_optimizer_keeps_fp32_master_weight_and_moments(
