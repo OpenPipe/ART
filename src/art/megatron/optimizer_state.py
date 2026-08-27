@@ -1142,6 +1142,24 @@ def verify_optimizer_generation(
         )
 
 
+def validate_verified_optimizer_generation(
+    optimizer_state_path: str,
+    generation: str,
+    verification: VerifiedOptimizerGeneration,
+) -> VerifiedOptimizerGeneration:
+    """Revalidate an ART receipt without rereading immutable optimizer shards."""
+    if verification.generation != generation:
+        raise RuntimeError("Optimizer verification names another generation")
+    with optimizer_generation_lease(optimizer_state_path, generation) as pointer:
+        generation_path = optimizer_generation_path(optimizer_state_path, generation)
+        manifest, manifest_sha256 = _read_manifest_identity(generation_path)
+        _validate_pointer_manifest(pointer, manifest)
+        expected = _verified_optimizer_generation(manifest, manifest_sha256)
+        if verification != expected:
+            raise RuntimeError("Optimizer generation receipt identity mismatch")
+    return verification
+
+
 @asynccontextmanager
 async def authenticated_optimizer_generation_lease(
     optimizer_state_path: str, generation: str
@@ -1166,9 +1184,16 @@ def _verify_optimizer_generation_leased(
     manifest, manifest_sha256 = _read_manifest_identity(generation_path)
     _validate_pointer_manifest(pointer, manifest)
     verify_optimizer_generation_manifest(optimizer_state_path, manifest)
+    return _verified_optimizer_generation(manifest, manifest_sha256)
+
+
+def _verified_optimizer_generation(
+    manifest: OptimizerGenerationManifest,
+    manifest_sha256: str,
+) -> VerifiedOptimizerGeneration:
     return VerifiedOptimizerGeneration(
         manifest_format_version=manifest.format_version,
-        generation=generation,
+        generation=manifest.generation,
         manifest_sha256=manifest_sha256,
         optimizer_semantic_sha256=manifest.optimizer_semantic_sha256,
         logical_state_sha256=manifest.logical_state_sha256,

@@ -23,6 +23,7 @@ from art.megatron.optimizer_state import (
     load_trainer_rank_optimizer_state,
     optimizer_generation_path,
     optimizer_shard_name,
+    validate_verified_optimizer_generation,
     verify_optimizer_generation,
 )
 from art.megatron.portable_optimizer_archive import (
@@ -306,6 +307,86 @@ def test_generation_verification_returns_serializable_semantic_receipt(
     incomplete["logical_state_sha256"] = None
     with pytest.raises(ValueError, match="both topology-portable identities"):
         VerifiedOptimizerGeneration.model_validate(incomplete)
+
+
+def test_verified_generation_receipt_reuse_does_not_rehash_shards(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    shard, _adapter = _generation(tmp_path)
+    hashed_paths: list[Path] = []
+    file_sha256 = optimizer_state_module._file_sha256
+
+    def count_hashes(path: Path) -> str:
+        hashed_paths.append(path)
+        return file_sha256(path)
+
+    monkeypatch.setattr(optimizer_state_module, "_file_sha256", count_hashes)
+    receipt = verify_optimizer_generation(str(tmp_path), _GENERATION)
+
+    assert hashed_paths == [shard]
+    hashed_paths.clear()
+    path_open = Path.open
+
+    def reject_shard_reads(
+        path: Path, mode: str = "r", *args: object, **kwargs: object
+    ) -> object:
+        if path == shard and "r" in mode:
+            pytest.fail("receipt reuse reread optimizer shard content")
+        return path_open(path, mode, *args, **kwargs)
+
+    def reject_full_verification(*_args: object, **_kwargs: object) -> None:
+        pytest.fail("receipt reuse entered full optimizer shard verification")
+
+    monkeypatch.setattr(Path, "open", reject_shard_reads)
+    monkeypatch.setattr(
+        optimizer_state_module,
+        "verify_optimizer_generation_manifest",
+        reject_full_verification,
+    )
+    restored = VerifiedOptimizerGeneration.model_validate_json(
+        receipt.model_dump_json()
+    )
+
+    assert (
+        validate_verified_optimizer_generation(
+            str(tmp_path), _GENERATION, restored
+        )
+        == receipt
+    )
+    assert hashed_paths == []
+
+
+@pytest.mark.parametrize("mutation", ["generation", "semantic", "manifest"])
+def test_verified_generation_receipt_reuse_rejects_identity_mutation(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    _generation(tmp_path)
+    receipt = verify_optimizer_generation(str(tmp_path), _GENERATION)
+    generation = _GENERATION
+    if mutation == "generation":
+        generation = f"step-00000002-{'2' * 32}"
+    elif mutation == "semantic":
+        receipt = VerifiedOptimizerGeneration.model_validate(
+            {
+                **receipt.model_dump(),
+                "optimizer_semantic_sha256": "2" * 64,
+            }
+        )
+    else:
+        manifest_path = (
+            optimizer_generation_path(str(tmp_path), _GENERATION) / "manifest.json"
+        )
+        manifest_path.write_text(manifest_path.read_text() + "\n")
+
+    expected = (
+        "names another generation"
+        if mutation == "generation"
+        else "receipt identity mismatch"
+    )
+    with pytest.raises(RuntimeError, match=expected):
+        validate_verified_optimizer_generation(str(tmp_path), generation, receipt)
 
 
 @pytest.mark.parametrize("old_format", [3, 4])
