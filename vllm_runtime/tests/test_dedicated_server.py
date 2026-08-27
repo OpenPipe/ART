@@ -1089,6 +1089,21 @@ def test_lora_only_runtime_advertises_update_capabilities(monkeypatch) -> None:
     assert dedicated_server._runtime_state["policy_token_spans"] is True
 
 
+def test_runtime_cli_keeps_model_source_and_capability_identity_distinct() -> None:
+    args = dedicated_server.parse_args(
+        [
+            "--model=/run/e2e_throughput/production_width_model",
+            "--capability-base-model=Qwen/Qwen3.5-35B-A3B",
+            "--port=8000",
+            "--cuda-visible-devices=0",
+            "--served-model-name=policy",
+        ]
+    )
+
+    assert args.model == "/run/e2e_throughput/production_width_model"
+    assert args.capability_base_model == "Qwen/Qwen3.5-35B-A3B"
+
+
 @pytest.mark.asyncio
 async def test_lora_mutations_are_serialized_across_slots() -> None:
     models = SimpleNamespace()

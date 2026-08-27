@@ -9,6 +9,7 @@ def _capabilities(
     architecture: str,
     *,
     model: str = "test/model",
+    capability_base_model: str | None = None,
     backend_version: str = "0.25.1",
 ) -> dict[str, object]:
     monkeypatch.setattr(model_capabilities, "version", lambda _package: backend_version)
@@ -17,7 +18,9 @@ def _capabilities(
         hf_config=SimpleNamespace(architectures=[architecture]),
     )
     return model_capabilities.model_backend_capabilities(
-        model_config, binary_route_capture=True
+        model_config,
+        capability_base_model=capability_base_model,
+        binary_route_capture=True,
     )
 
 
@@ -57,6 +60,35 @@ def test_qwen35_moe_exact_model_backend_is_validated(
     assert capabilities["backend_version"] == backend_version
     assert capabilities["validation_status"] == "validated"
     assert capabilities["lora_implementation"] == "native"
+
+
+def test_qwen35_moe_fixture_uses_trusted_canonical_identity(monkeypatch) -> None:
+    capabilities = _capabilities(
+        monkeypatch,
+        "Qwen3_5MoeForConditionalGeneration",
+        model="/run/e2e_throughput/production_width_model",
+        capability_base_model="Qwen/Qwen3.5-35B-A3B",
+    )
+
+    assert capabilities["base_model"] == "Qwen/Qwen3.5-35B-A3B"
+    assert capabilities["validation_status"] == "validated"
+
+
+@pytest.mark.parametrize(
+    "capability_base_model",
+    [None, "Qwen/Qwen3.5-27B"],
+)
+def test_qwen35_moe_fixture_without_exact_canonical_identity_fails_closed(
+    monkeypatch, capability_base_model: str | None
+) -> None:
+    capabilities = _capabilities(
+        monkeypatch,
+        "Qwen3_5MoeForConditionalGeneration",
+        model="/run/e2e_throughput/production_width_model",
+        capability_base_model=capability_base_model,
+    )
+
+    assert capabilities["validation_status"] == "unvalidated"
 
 
 @pytest.mark.parametrize(

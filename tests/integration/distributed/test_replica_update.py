@@ -22,7 +22,11 @@ from art.megatron import distributed_service as service_module
 from art.megatron.distributed_service import DistributedMegatronService
 
 
-def manager(*, engine_args: dict[str, object] | None = None) -> ReplicaManager:
+def manager(
+    *,
+    engine_args: dict[str, object] | None = None,
+    capability_base_model: str | None = None,
+) -> ReplicaManager:
     members = tuple(
         ModelServiceMemberSpec(
             member_id=f"node{rank}",
@@ -49,7 +53,9 @@ def manager(*, engine_args: dict[str, object] | None = None) -> ReplicaManager:
             {"host0": SimpleNamespace(), "host1": SimpleNamespace()},
         ),
         ReplicaLaunchTemplate(
-            served_model_name="model@1", engine_args=engine_args or {}
+            served_model_name="model@1",
+            capability_base_model=capability_base_model,
+            engine_args=engine_args or {},
         ),
     )
     value._state = ReplicaState(
@@ -136,11 +142,12 @@ async def test_in_flight_update_is_the_only_acknowledgement_call(
 
 def test_launch_preserves_user_args_and_owns_native_gang_topology() -> None:
     value = manager(
+        capability_base_model="Qwen/Qwen3.5-35B-A3B",
         engine_args={
             "enable_prefix_caching": False,
             "block_size": 32,
             "prefill_context_parallel_size": 2,
-        }
+        },
     )
     leader = value._launch_request(value.spec.members[0]).launch_config
     follower = value._launch_request(value.spec.members[1]).launch_config
@@ -159,6 +166,9 @@ def test_launch_preserves_user_args_and_owns_native_gang_topology() -> None:
     assert leader.host == "10.0.0.1" and not leader.headless
     assert follower.host == "127.0.0.1" and follower.headless
     assert leader.nnodes == follower.nnodes == 2
+    assert leader.base_model == "base"
+    assert leader.capability_base_model == "Qwen/Qwen3.5-35B-A3B"
+    assert follower.capability_base_model == "Qwen/Qwen3.5-35B-A3B"
     assert "kv_events_config" not in leader.engine_args
 
 

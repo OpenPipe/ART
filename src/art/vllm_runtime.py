@@ -71,6 +71,7 @@ class VllmRuntimeLaunchConfig(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
     base_model: str
+    capability_base_model: str | None = Field(default=None, min_length=1)
     port: int
     host: str = "127.0.0.1"
     cuda_visible_devices: str | None = None
@@ -881,6 +882,8 @@ def build_vllm_runtime_server_cmd(config: VllmRuntimeLaunchConfig) -> list[str]:
         f"--host={config.host}",
         f"--cuda-visible-devices={config.visible_devices}",
     ]
+    if config.capability_base_model is not None:
+        command.append(f"--capability-base-model={config.capability_base_model}")
     if config.lora_path is not None:
         command.append(f"--lora-path={config.lora_path}")
     command.extend(

@@ -435,6 +435,10 @@ def _configure_index_shared_pp(model: str, engine_args: dict[str, Any]) -> str |
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="ART dedicated vLLM server")
     parser.add_argument("--model", required=True, help="Base model name or path")
+    parser.add_argument(
+        "--capability-base-model",
+        help="Canonical model identity asserted by the trusted ART launcher",
+    )
     parser.add_argument("--port", type=int, required=True)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--cuda-visible-devices", required=True)
@@ -1309,6 +1313,7 @@ def _patch_engine_config(
     engine_args_type: Any,
     *,
     pipeline_route_capture: bool,
+    capability_base_model: str | None = None,
 ) -> None:
     current = engine_args_type.create_engine_config
     create_engine_config = getattr(current, "__art_original__", current)
@@ -1323,6 +1328,7 @@ def _patch_engine_config(
             _register_model_route_layout(config.model_config)
         _runtime_state["model_backend"] = model_backend_capabilities(
             config.model_config,
+            capability_base_model=capability_base_model,
             binary_route_capture=bool(
                 _runtime_state.get("binary_routed_experts", False)
             ),
@@ -1439,6 +1445,7 @@ def main(argv: list[str] | None = None) -> None:
     _patch_engine_config(
         AsyncEngineArgs,
         pipeline_route_capture=pipeline_route_capture,
+        capability_base_model=args.capability_base_model,
     )
 
     vllm_args = [

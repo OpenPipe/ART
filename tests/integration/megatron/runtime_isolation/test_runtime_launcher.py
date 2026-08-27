@@ -35,7 +35,8 @@ def test_build_runtime_server_cmd_uses_runtime_project(
     monkeypatch.setenv("ART_VLLM_RUNTIME_PROJECT_ROOT", str(runtime_root))
     command = runtime.build_vllm_runtime_server_cmd(
         runtime.VllmRuntimeLaunchConfig(
-            base_model="Qwen/Qwen3-14B",
+            base_model="/tmp/production_width_model",
+            capability_base_model="Qwen/Qwen3.5-35B-A3B",
             port=8000,
             host="127.0.0.1",
             cuda_visible_devices="1",
@@ -48,7 +49,8 @@ def test_build_runtime_server_cmd_uses_runtime_project(
         )
     )
     assert command[0] == str(runtime_bin)
-    assert "--model=Qwen/Qwen3-14B" in command
+    assert "--model=/tmp/production_width_model" in command
+    assert "--capability-base-model=Qwen/Qwen3.5-35B-A3B" in command
     assert (
         '--engine-args-json={"weight_transfer_config": {"backend": "nccl"}}' in command
     )
