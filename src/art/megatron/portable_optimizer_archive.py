@@ -457,14 +457,12 @@ def reconstruct_trainer_rank_optimizer_state(
             str(key)
             for key in module._expected_weight_keys_for_param(suffix, parameter)
         )
-        if not keys:
-            raise ValueError("destination optimizer parameter has no logical keys")
         missing = set(keys).difference(components.master)
         if missing:
             raise KeyError(
                 f"destination optimizer keys were not loaded: {sorted(missing)}"
             )
-        parameter_steps = {components.steps[key] for key in keys}
+        parameter_steps = {components.steps[key] for key in keys} if keys else {0.0}
         if len(parameter_steps) != 1:
             raise ValueError(
                 "logical optimizer steps differ within one destination parameter: "
@@ -477,12 +475,17 @@ def reconstruct_trainer_rank_optimizer_state(
         )
         localized: dict[str, torch.Tensor] = {}
         for component, mapping in component_maps.items():
-            weight = module._adapter_weight(
-                {key: mapping[key] for key in keys},
-                suffix=suffix,
-                moe_parameterization=parameterization,
-            )
-            value = module._localized_weight(weight, into=parameter)
+            if keys:
+                weight = module._adapter_weight(
+                    {key: mapping[key] for key in keys},
+                    suffix=suffix,
+                    moe_parameterization=parameterization,
+                )
+                value = module._localized_weight(weight, into=parameter)
+            else:
+                value = torch.zeros(
+                    tuple(parameter.shape), device="cpu", dtype=torch.float32
+                )
             if tuple(value.shape) != tuple(parameter.shape):
                 raise ValueError(
                     "localized optimizer component differs from destination "

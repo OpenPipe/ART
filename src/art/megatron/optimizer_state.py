@@ -2641,6 +2641,18 @@ def load_trainer_rank_optimizer_state(
             archives.append(
                 read_portable_optimizer_archive(path, logical_keys=selected)
             )
+        if not archives:
+            # A nonuniform EP destination can own only physical padding expert
+            # slots. It needs no logical tensors, but it still needs the exact
+            # saved Adam parameter-group values from an authenticated archive.
+            shard = shards[0]
+            path = optimizer_shard_path(
+                generation_path,
+                rank=shard.rank,
+                world_size=manifest.topology.world_size,
+                serialization=shard.serialization,
+            )
+            archives.append(read_portable_optimizer_archive(path, logical_keys=()))
         components = reconstruct_portable_optimizer_components(archives)
         return reconstruct_trainer_rank_optimizer_state(components, sites, layout)
 

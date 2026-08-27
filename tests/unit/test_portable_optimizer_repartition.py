@@ -9,6 +9,7 @@ from art.megatron.portable_optimizer_archive import (
     reconstruct_portable_optimizer_components,
     reconstruct_trainer_rank_optimizer_state,
 )
+from art.trainer_rank._impl import _optimizer_parameter_key_owners
 
 
 class _DestinationModule:
@@ -70,6 +71,44 @@ class _ShardedDestinationModule(_DestinationModule):
         self, weight: torch.Tensor, *, into: torch.Tensor
     ) -> torch.Tensor:
         return weight.narrow(1, self._start, into.shape[1]).contiguous()
+
+
+class _PaddedExpertDestinationModule:
+    def __init__(self, expert_ids: tuple[int | None, ...]) -> None:
+        self.expert_ids = expert_ids
+
+    def _expected_weight_keys_for_param(
+        self, suffix: str, _parameter: torch.Tensor
+    ) -> tuple[str, ...]:
+        return tuple(
+            f"layer.{expert}.{suffix}.weight"
+            for expert in self.expert_ids
+            if expert is not None
+        )
+
+    def _adapter_weight(
+        self,
+        tensors: dict[str, torch.Tensor],
+        *,
+        suffix: str,
+        moe_parameterization: object,
+    ) -> torch.Tensor:
+        del moe_parameterization
+        real = iter(
+            tensors[key]
+            for key in self._expected_weight_keys_for_param(
+                suffix, torch.empty(0)
+            )
+        )
+        first = next(iter(tensors.values()))
+        return torch.stack(
+            [torch.zeros_like(first) if expert is None else next(real) for expert in self.expert_ids]
+        )
+
+    @staticmethod
+    def _localized_weight(weight: torch.Tensor, *, into: torch.Tensor) -> torch.Tensor:
+        assert weight.shape == into.shape
+        return weight
 
 
 def _archive(
@@ -220,3 +259,80 @@ def test_logical_optimizer_localizes_into_new_destination_shards() -> None:
             state["optimizer"]["state"][1]["exp_avg_sq"],
             torch.full((2, 2), 22.0),
         )
+
+
+def test_padding_only_destination_uses_zero_optimizer_coordinates() -> None:
+    source = _archive(source_rank=0, values={"layer.0.lora_A.weight": 1.0})
+    metadata_only = LoadedPortableOptimizerArchive(
+        metadata=source.metadata,
+        loaded_logical_keys=(),
+        tensors={},
+    )
+    components = reconstruct_portable_optimizer_components((metadata_only,))
+    module = _PaddedExpertDestinationModule((None, None))
+    parameter = torch.nn.Parameter(torch.empty(2, 2, 3))
+    sites = ((module, SimpleNamespace(A_T=parameter, B_T=parameter.clone())),)
+    layout = {
+        "parallel": (0, 0, 0, 0, 0, 0, 0, 0),
+        "parameters": (
+            (("A",), (2, 2, 3), "torch.float32", "cpu", True, None, "", ()),
+            (("B",), (2, 2, 3), "torch.float32", "cpu", True, None, "", ()),
+        ),
+    }
+
+    state = reconstruct_trainer_rank_optimizer_state(components, sites, layout)
+
+    assert state["optimizer"]["param_groups"][0]["lr"] == 3e-5
+    for index, master in enumerate(state["master_params"]):
+        torch.testing.assert_close(master, torch.zeros_like(master))
+        optimizer_state = state["optimizer"]["state"][index]
+        torch.testing.assert_close(
+            optimizer_state["exp_avg"], torch.zeros_like(master)
+        )
+        torch.testing.assert_close(
+            optimizer_state["exp_avg_sq"], torch.zeros_like(master)
+        )
+        assert optimizer_state["step"].item() == 0.0
+
+
+def test_mixed_expert_destination_maps_keys_around_physical_padding() -> None:
+    module = _PaddedExpertDestinationModule((4, None, 7))
+    parameter = torch.nn.Parameter(torch.empty(3, 2, 3))
+    keys = module._expected_weight_keys_for_param("lora_A", parameter)
+
+    owners, padding = _optimizer_parameter_key_owners(module, parameter, keys)
+
+    assert owners == ((0, keys[0]), (2, keys[1]))
+    assert padding == (1,)
+    source = _archive(
+        source_rank=0,
+        values={
+            keys[0]: 1.0,
+            keys[1]: 2.0,
+            "layer.4.lora_B.weight": 3.0,
+            "layer.7.lora_B.weight": 4.0,
+        },
+    )
+    source = source.model_copy(
+        update={
+            "metadata": source.metadata.model_copy(
+                update={"steps": dict.fromkeys(source.metadata.logical_keys, 31.0)}
+            )
+        }
+    )
+    components = reconstruct_portable_optimizer_components((source,))
+    sites = ((module, SimpleNamespace(A_T=parameter, B_T=parameter.clone())),)
+    layout = {
+        "parallel": (0, 0, 0, 0, 0, 0, 0, 0),
+        "parameters": (
+            (("A",), (3, 2, 3), "torch.float32", "cpu", True, None, "", ()),
+            (("B",), (3, 2, 3), "torch.float32", "cpu", True, None, "", ()),
+        ),
+    }
+
+    state = reconstruct_trainer_rank_optimizer_state(components, sites, layout)
+
+    master = state["master_params"][0]
+    torch.testing.assert_close(master[0], torch.full((2, 3), 1.0))
+    torch.testing.assert_close(master[1], torch.zeros((2, 3)))
+    torch.testing.assert_close(master[2], torch.full((2, 3), 2.0))

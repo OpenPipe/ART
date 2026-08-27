@@ -1176,6 +1176,20 @@ class TrainerRank:
         _checkpoint.raise_distributed(error, f"construct custom object {name!r}", group)
         assert custom is not None
         self._initialize_custom_object(checkpoint_name, name, custom)
+        staged_params = tuple(
+            parameter
+            for _key, parameter in _custom_named_parameters(name, custom)
+            if parameter.requires_grad
+        )
+        if (
+            slot.optimizer is not None
+            and staged_params
+            and getattr(self.runtime, "optimizer_semantic_sha256", None) is not None
+        ):
+            raise TrainerRankSlotStateError(
+                "Topology-portable optimizer durability freezes the trainable "
+                "parameter schema before optimizer construction."
+            )
         tracker: _CustomTensorTracker | None = None
         named_params: tuple[tuple[str, torch.nn.Parameter], ...] = ()
         new_params: tuple[torch.nn.Parameter, ...] = ()
@@ -1318,7 +1332,7 @@ class TrainerRank:
                     "differentiable",
                     "fused",
                 )
-            },
+            }
         )
         optimizer.param_groups[0].update(
             {
@@ -3062,23 +3076,16 @@ class TrainerRank:
                 index = indices[id(param)]
                 mapped.add(index)
                 keys = module._expected_weight_keys_for_param(suffix, param)
-                if int(param.ndim) == 3:
-                    if len(keys) != int(param.shape[0]):
-                        raise TrainerRankSlotStateError(
-                            "Cannot map prepared optimizer padding: expert layout "
-                            "does not match the staged adapter."
-                        )
-                    for expert, key in enumerate(keys):
-                        exported[str(key)] = torch.ones_like(param[expert].T)
-                        owners[str(key)] = (index, expert)
-                elif len(keys) == 1:
-                    key = str(keys[0])
-                    exported[key] = torch.ones_like(param.T)
-                    owners[key] = (index, None)
-                else:
-                    raise TrainerRankSlotStateError(
-                        "Cannot map prepared optimizer padding to adapter keys."
+                key_owners, padding_experts = _optimizer_parameter_key_owners(
+                    module, param, keys
+                )
+                for expert in padding_experts:
+                    masks[index][expert].fill_(True)
+                for expert, key in key_owners:
+                    exported[key] = torch.ones_like(
+                        param.T if expert is None else param[expert].T
                     )
+                    owners[key] = (index, expert)
         if mapped != set(range(len(params))):
             raise TrainerRankSlotStateError(
                 "Prepared optimizer parameters do not cover every staged LoRA site."
@@ -3124,25 +3131,16 @@ class TrainerRank:
                         continue
                     mapped_indices.add(index)
                     keys = expected_keys(str(suffix).removesuffix(".weight"), param)
-                    if int(param.ndim) == 3:
-                        if len(keys) != int(param.shape[0]):
-                            raise TrainerRankSlotStateError(
-                                f"Cannot map optimizer padding for checkpoint "
-                                f"{name!r}: {len(keys)} adapter keys describe "
-                                f"{int(param.shape[0])} local experts."
-                            )
-                        for expert, key in enumerate(keys):
-                            exported[str(key)] = torch.ones_like(param[expert].T)
-                            owners[str(key)] = (index, expert)
-                    elif len(keys) == 1:
-                        key = str(keys[0])
-                        exported[key] = torch.ones_like(param.T)
-                        owners[key] = (index, None)
-                    else:
-                        raise TrainerRankSlotStateError(
-                            f"Cannot map optimizer padding for checkpoint {name!r}: "
-                            f"expected one adapter key, got {len(keys)}."
+                    key_owners, padding_experts = _optimizer_parameter_key_owners(
+                        module, param, keys
+                    )
+                    for expert in padding_experts:
+                        masks[index][expert].fill_(True)
+                    for expert, key in key_owners:
+                        exported[key] = torch.ones_like(
+                            param.T if expert is None else param[expert].T
                         )
+                        owners[key] = (index, expert)
 
         if mapped_indices and (
             missing := sorted(
@@ -4759,6 +4757,39 @@ def _compact_optimizer_valid_ranges(
         f"Optimizer padding for shape {shape} is not representable by ranges "
         "along one tensor axis."
     )
+
+
+def _optimizer_parameter_key_owners(
+    module: object,
+    parameter: torch.Tensor,
+    keys: Sequence[str],
+) -> tuple[tuple[tuple[int | None, str], ...], tuple[int, ...]]:
+    """Map canonical logical keys onto physical parameter expert slots."""
+    if int(parameter.ndim) != 3:
+        if len(keys) != 1:
+            raise TrainerRankSlotStateError(
+                "Optimizer parameter must have exactly one logical adapter key."
+            )
+        return ((None, str(keys[0])),), ()
+
+    expert_ids = tuple(getattr(module, "expert_ids", ()))
+    if len(expert_ids) != int(parameter.shape[0]):
+        raise TrainerRankSlotStateError(
+            "Optimizer expert parameter differs from its physical expert layout."
+        )
+    if sum(expert is not None for expert in expert_ids) != len(keys):
+        raise TrainerRankSlotStateError(
+            "Optimizer expert parameter differs from its logical adapter keys."
+        )
+    logical_keys = iter(str(key) for key in keys)
+    owners: list[tuple[int | None, str]] = []
+    padding: list[int] = []
+    for local_expert, logical_expert in enumerate(expert_ids):
+        if logical_expert is None:
+            padding.append(local_expert)
+        else:
+            owners.append((local_expert, next(logical_keys)))
+    return tuple(owners), tuple(padding)
 
 
 def _optimizer_padding_views(

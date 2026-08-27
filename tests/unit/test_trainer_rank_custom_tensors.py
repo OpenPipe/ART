@@ -667,6 +667,30 @@ def test_parameter_can_be_added_after_checkpoint_optimizer_exists() -> None:
     assert rebuilt.optimizer.param_groups[0]["betas"][0] == 0.7
 
 
+def test_portable_optimizer_rejects_late_trainable_parameter_transactionally() -> None:
+    trainer, rank = _trainer("student")
+    trainer.runtime.optimizer_semantic_sha256 = "1" * 64
+    slot = trainer._checkpoint_slots["student"]
+    existing = torch.nn.Parameter(torch.tensor(1.0))
+    trainer._tag_custom_parameters((existing,))
+    slot.params = (existing,)
+    slot.optimizer = trainer._new_dynamic_optimizer(
+        "student", AdamParams(learning_rate=1e-3)
+    )
+    optimizer = slot.optimizer
+
+    with pytest.raises(
+        TrainerRankSlotStateError,
+        match="freezes the trainable parameter schema",
+    ):
+        rank.parameter("added", lambda: torch.tensor(2.0), checkpoint="student")
+
+    assert "added" not in slot.custom
+    assert slot.params == (existing,)
+    assert slot.optimizer is optimizer
+    assert len(slot.optimizer.master_params) == 1
+
+
 def test_module_tracking_preserves_tied_parameter_identity() -> None:
     trainer, rank = _trainer("student")
 
