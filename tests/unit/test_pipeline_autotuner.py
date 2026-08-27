@@ -1,7 +1,10 @@
+from pathlib import Path
+import tomllib
 from types import SimpleNamespace
 
 import pytest
 
+from art.pipeline_trainer import PipelineTrainer
 from art.pipeline_tuner import PipelineAutotuneConfig
 from art.pipeline_tuner.attachment import (
     PipelineAutotunerAttachment,
@@ -12,6 +15,17 @@ from art.pipeline_tuner.config import (
     TunerDecision,
     TunerWindowStats,
 )
+
+_ROOT = Path(__file__).resolve().parents[2]
+
+
+def test_pipeline_trainer_import_dependencies_are_in_base_project() -> None:
+    project = tomllib.loads((_ROOT / "pyproject.toml").read_text())["project"]
+
+    assert any(
+        dependency.startswith("scipy") for dependency in project["dependencies"]
+    )
+    assert PipelineTrainer.__module__ == "art.pipeline_trainer.trainer"
 
 
 def _decision() -> TunerDecision:

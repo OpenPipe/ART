@@ -5,6 +5,7 @@ from pathlib import Path
 import threading
 
 import pytest
+import torch
 
 from art.megatron.optimizer_state import (
     CheckpointFile,
@@ -25,7 +26,10 @@ from art.megatron.optimizer_state import (
 from art.megatron.portable_optimizer_archive import (
     LoadedPortableOptimizerArchive,
     PortableOptimizerArchiveMetadata,
+    PreparedPortableOptimizerArchive,
+    write_portable_optimizer_archive,
 )
+from art.megatron.weights.rank_distributed_types import RankDistributedLoraStats
 
 _DIGEST = "0" * 64
 _GENERATION = f"step-00000001-{'1' * 32}"
@@ -86,6 +90,163 @@ def _generation(
     )
     (generation / "manifest.json").write_text(manifest.model_dump_json())
     return shard_path, adapter
+
+
+def _real_logical_generation(
+    root: Path,
+) -> tuple[OptimizerAdapter, dict[str, tuple[int, ...]]]:
+    adapter_path = root.parent / f"{root.name}-real-adapter"
+    adapter_path.mkdir()
+    (adapter_path / "adapter_config.json").write_bytes(b"c")
+    (adapter_path / "adapter_model.safetensors").write_bytes(b"m")
+    files = (
+        CheckpointFile(name="adapter_config.json", size_bytes=1),
+        CheckpointFile(name="adapter_model.safetensors", size_bytes=1),
+    )
+    adapter = acknowledge_materialized_adapter(
+        adapter_path,
+        step=1,
+        training_session_id="session",
+        generation_id=_GENERATION,
+        files=files,
+    )
+    generation = optimizer_generation_path(str(root), _GENERATION)
+    generation.mkdir(parents=True)
+    rank_values = (
+        {},
+        {
+            "layer.shared.lora_A.weight": 1.0,
+            "layer.4.lora_B.weight": 2.0,
+        },
+        {"layer.7.lora_B.weight": 3.0},
+    )
+    logical_shapes = {key: (2, 3) for values in rank_values for key in values}
+    shards: list[OptimizerShard] = []
+    for rank, values in enumerate(rank_values):
+        keys = tuple(sorted(values))
+        tensors = {
+            f"{component}/{key}": torch.full(
+                logical_shapes[key], value + offset, dtype=torch.float32
+            )
+            for component, offset in (
+                ("master", 0.0),
+                ("exp_avg", 10.0),
+                ("exp_avg_sq", 20.0),
+            )
+            for key, value in values.items()
+        }
+        prepared = PreparedPortableOptimizerArchive(
+            metadata=PortableOptimizerArchiveMetadata(
+                source_rank=rank,
+                source_world_size=len(rank_values),
+                logical_keys=keys,
+                steps=dict.fromkeys(keys, 31.0),
+                param_group={
+                    "lr": 3e-5,
+                    "betas": [0.9, 0.95],
+                    "eps": 1e-8,
+                    "weight_decay": 0.1,
+                },
+            ),
+            tensors=tensors,
+            exchange_stats=RankDistributedLoraStats(
+                rank=rank,
+                world_size=len(rank_values),
+                source_bytes=0,
+                sent_bytes=0,
+                received_bytes=0,
+                owned_tensor_bytes=0,
+                peak_accounted_owner_bytes=0,
+                owned_upload_bytes=0,
+                owned_tensor_count=len(tensors),
+                owned_block_count=0,
+            ),
+        )
+        path = generation / optimizer_shard_name(
+            rank, len(rank_values), "art_logical_safetensors_v1"
+        )
+        identity = write_portable_optimizer_archive(prepared, path)
+        shards.append(
+            OptimizerShard(
+                rank=rank,
+                size_bytes=identity.size_bytes,
+                layout_sha256=_DIGEST,
+                sha256=identity.sha256,
+                serialization="art_logical_safetensors_v1",
+                logical_tensors=tuple(
+                    OptimizerLogicalTensor(key=key, shape=logical_shapes[key])
+                    for key in keys
+                ),
+            )
+        )
+    manifest = build_optimizer_manifest(
+        generation=_GENERATION,
+        step=1,
+        adapter=adapter,
+        runtime_sha256=_DIGEST,
+        optimizer_semantic_sha256="1" * 64,
+        world_size=len(rank_values),
+        topology=OptimizerTopology(
+            world_size=len(rank_values),
+            tp=1,
+            cp=1,
+            ep=len(rank_values),
+            etp=1,
+            pp=1,
+            vpp=1,
+        ),
+        shards=shards,
+    )
+    (generation / "manifest.json").write_text(manifest.model_dump_json())
+    return adapter, logical_shapes
+
+
+class _SharedOuterPaddedDestination:
+    moe_parameterization = "shared_outer"
+
+    def __init__(self, expert_ids: tuple[int | None, ...]) -> None:
+        self.expert_ids = expert_ids
+
+    def _expected_weight_keys_for_param(
+        self, suffix: str, _parameter: torch.Tensor
+    ) -> tuple[str, ...]:
+        if suffix == "lora_A":
+            return ("layer.shared.lora_A.weight",)
+        return tuple(
+            f"layer.{expert}.lora_B.weight"
+            for expert in self.expert_ids
+            if expert is not None
+        )
+
+    def _adapter_weight(
+        self,
+        tensors: dict[str, torch.Tensor],
+        *,
+        suffix: str,
+        moe_parameterization: object,
+    ) -> torch.Tensor:
+        assert moe_parameterization == "shared_outer"
+        if suffix == "lora_A":
+            return tensors["layer.shared.lora_A.weight"]
+        real = iter(
+            tensors[f"layer.{expert}.lora_B.weight"]
+            for expert in self.expert_ids
+            if expert is not None
+        )
+        first = next(iter(tensors.values()))
+        return torch.stack(
+            [
+                torch.zeros_like(first) if expert is None else next(real)
+                for expert in self.expert_ids
+            ]
+        )
+
+    @staticmethod
+    def _localized_weight(
+        weight: torch.Tensor, *, into: torch.Tensor
+    ) -> torch.Tensor:
+        assert weight.shape == into.shape
+        return weight
 
 
 def test_generation_verification_rejects_same_size_shard_corruption(
@@ -354,6 +515,95 @@ def test_rank_loader_rejects_destination_logical_geometry_change(
             sites=(),
             expected_shapes={"weight": (2, 5)},
         )
+
+
+def test_real_archive_loader_reconstructs_empty_destination_rank(
+    tmp_path: Path,
+) -> None:
+    adapter, logical_shapes = _real_logical_generation(tmp_path)
+    receipt = verify_optimizer_generation(str(tmp_path), _GENERATION)
+
+    state = load_trainer_rank_optimizer_state(
+        optimizer_state_path=str(tmp_path),
+        adapter_path=adapter.identity,
+        adapter_step=adapter.step,
+        optimizer_generation_id=_GENERATION,
+        verification=receipt,
+        expected_optimizer_semantic_sha256="1" * 64,
+        layout={"parameters": ()},
+        sites=(),
+        expected_shapes=logical_shapes,
+    )
+
+    assert state["master_params"] == ()
+    assert state["optimizer"]["state"] == {}
+    assert state["optimizer"]["param_groups"] == [
+        {
+            "lr": 3e-5,
+            "betas": [0.9, 0.95],
+            "eps": 1e-8,
+            "weight_decay": 0.1,
+            "params": [],
+        }
+    ]
+
+
+def test_real_archive_loader_reconstructs_shared_outer_moe_with_padding(
+    tmp_path: Path,
+) -> None:
+    adapter, logical_shapes = _real_logical_generation(tmp_path)
+    receipt = verify_optimizer_generation(str(tmp_path), _GENERATION)
+    module = _SharedOuterPaddedDestination((4, None, 7))
+    slot = type(
+        "Slot",
+        (),
+        {
+            "A_T": torch.nn.Parameter(torch.empty(2, 3)),
+            "B_T": torch.nn.Parameter(torch.empty(3, 2, 3)),
+        },
+    )()
+    layout = {
+        "parameters": (
+            (("A",), (2, 3), "torch.float32", "cpu", True, None, "", ()),
+            (("B",), (3, 2, 3), "torch.float32", "cpu", True, None, "", ()),
+        )
+    }
+
+    state = load_trainer_rank_optimizer_state(
+        optimizer_state_path=str(tmp_path),
+        adapter_path=adapter.identity,
+        adapter_step=adapter.step,
+        optimizer_generation_id=_GENERATION,
+        verification=receipt,
+        expected_optimizer_semantic_sha256="1" * 64,
+        layout=layout,
+        sites=((module, slot),),
+        expected_shapes=logical_shapes,
+    )
+
+    torch.testing.assert_close(state["master_params"][0], torch.full((2, 3), 1.0))
+    torch.testing.assert_close(
+        state["master_params"][1],
+        torch.stack(
+            (
+                torch.full((2, 3), 2.0),
+                torch.zeros((2, 3)),
+                torch.full((2, 3), 3.0),
+            )
+        ),
+    )
+    torch.testing.assert_close(
+        state["optimizer"]["state"][1]["exp_avg"],
+        torch.stack(
+            (
+                torch.full((2, 3), 12.0),
+                torch.zeros((2, 3)),
+                torch.full((2, 3), 13.0),
+            )
+        ),
+    )
+    assert state["optimizer"]["state"][0]["step"].item() == 31.0
+    assert state["optimizer"]["state"][1]["step"].item() == 31.0
 
 
 @pytest.mark.asyncio
