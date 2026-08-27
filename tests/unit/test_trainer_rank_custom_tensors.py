@@ -49,19 +49,31 @@ def _build_cpu_optimizer(
     params: Sequence[torch.nn.Parameter], config: AdamParams
 ) -> torch.optim.Optimizer:
     class SharedStepAdamW(torch.optim.AdamW):
-        def step(self, closure: object = None) -> object:
+        def step(  # ty: ignore[invalid-method-override]
+            self, closure: Callable[[], float] | None = None
+        ) -> float | None:
+            current_by_group: list[int] = []
             for group in self.param_groups:
                 current = int(group.get("step", 0))
+                current_by_group.append(current)
                 for parameter in group["params"]:
                     state = self.state.get(parameter, {})
                     if state:
                         state["step"] = torch.tensor(float(current))
             result = super().step(closure=closure)
-            for group in self.param_groups:
+            for group, current in zip(
+                self.param_groups, current_by_group, strict=True
+            ):
                 states = tuple(
                     self.state.get(parameter, {}) for parameter in group["params"]
                 )
-                projected = tuple(state["step"] for state in states if "step" in state)
+                projected = tuple(
+                    state["step"]
+                    for parameter, state in zip(
+                        group["params"], states, strict=True
+                    )
+                    if parameter.grad is not None and "step" in state
+                )
                 group["step"] = (
                     current
                     if not projected

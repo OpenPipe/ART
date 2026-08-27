@@ -214,13 +214,12 @@ def test_cache_rebuilds_for_lazy_state_and_optimizer_replacement(
         master_params=masters,
         state=tuple(
             {
-                "step": torch.zeros(()),
                 "exp_avg": torch.zeros_like(master),
                 "exp_avg_sq": torch.zeros_like(master),
             }
             for master in masters
         ),
-        param_group={"lr": 0.5},
+        param_group={"lr": 0.5, "step": 0},
         valid_ranges=cast(
             tuple[_impl._OptimizerTensorValidRanges, ...],
             slot.optimizer_valid_ranges,

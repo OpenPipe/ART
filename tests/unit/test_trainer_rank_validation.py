@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 import copy
 from dataclasses import dataclass
 from datetime import timedelta
@@ -43,6 +43,7 @@ from art.trainer_rank._checkpoint import (
     _FinalizedSave,
     _manifest_digest,
     _merge_component,
+    _optimizer_state,
     _PreparedSave,
     _slot_snapshot,
     _validate_base_model,
@@ -77,19 +78,31 @@ def _cpu_dynamic_optimizer(monkeypatch: pytest.MonkeyPatch) -> None:
     class SharedStepAdamW(torch.optim.AdamW):
         """CPU oracle exposing TE FusedAdam's one-counter group layout."""
 
-        def step(self, closure: object = None) -> object:
+        def step(  # ty: ignore[invalid-method-override]
+            self, closure: Callable[[], float] | None = None
+        ) -> float | None:
+            current_by_group: list[int] = []
             for group in self.param_groups:
                 current = int(group.get("step", 0))
+                current_by_group.append(current)
                 for parameter in group["params"]:
                     state = self.state.get(parameter, {})
                     if state:
                         state["step"] = torch.tensor(float(current))
             result = super().step(closure=closure)
-            for group in self.param_groups:
+            for group, current in zip(
+                self.param_groups, current_by_group, strict=True
+            ):
                 states = tuple(
                     self.state.get(parameter, {}) for parameter in group["params"]
                 )
-                projected = tuple(state["step"] for state in states if "step" in state)
+                projected = tuple(
+                    state["step"]
+                    for parameter, state in zip(
+                        group["params"], states, strict=True
+                    )
+                    if parameter.grad is not None and "step" in state
+                )
                 group["step"] = (
                     current
                     if not projected
@@ -1413,6 +1426,69 @@ def _canonical_checkpoint(
     return manifest
 
 
+@pytest.mark.parametrize("owns_logical_parameter", (True, False))
+def test_canonical_optimizer_padding_uses_generation_iteration(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    owns_logical_parameter: bool,
+) -> None:
+    root = tmp_path / "checkpoint"
+    _canonical_checkpoint(root)
+    source = prepare_checkpoint(str(root))
+    logical_key = "layer.q_proj.lora_A.weight"
+
+    class PaddingAwareLoRA(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.A_T = torch.nn.Parameter(torch.empty(1, 2))
+            self.B_T = torch.nn.Parameter(torch.empty(1, 2))
+
+        def _slot(self, _ref: object) -> object:
+            return self
+
+        def _lora_params(
+            self, _ref: object
+        ) -> list[tuple[str, torch.nn.Parameter]]:
+            return [
+                ("lora_A.weight", self.A_T),
+                ("lora_B.weight", self.B_T),
+            ]
+
+        def _expected_weight_keys_for_param(
+            self, suffix: str, _parameter: torch.nn.Parameter
+        ) -> list[str]:
+            if owns_logical_parameter and suffix == "lora_A":
+                return [logical_key]
+            return []
+
+        def _adapter_weight(
+            self, tensors: dict[str, torch.Tensor], **_kwargs: object
+        ) -> torch.Tensor:
+            return next(iter(tensors.values()))
+
+        def _localized_weight(
+            self, tensor: torch.Tensor, *, into: torch.nn.Parameter
+        ) -> torch.Tensor:
+            assert tensor.shape == into.shape
+            return tensor
+
+    site = PaddingAwareLoRA()
+    lora_module = ModuleType("art.megatron.lora")
+    setattr(lora_module, "LoRA", PaddingAwareLoRA)
+    monkeypatch.setitem(sys.modules, "art.megatron.lora", lora_module)
+    trainer = TrainerRank(_runtime(site))
+    monkeypatch.setattr(trainer, "_slot_ref", lambda _name: object())
+
+    state = _optimizer_state(trainer, source, "student")
+
+    assert state.steps == (3.0, 3.0)
+    if owns_logical_parameter:
+        torch.testing.assert_close(state.masters[0], torch.ones(1, 2))
+    else:
+        torch.testing.assert_close(state.masters[0], torch.zeros(1, 2))
+    torch.testing.assert_close(state.masters[1], torch.zeros(1, 2))
+
+
 def test_weights_only_checkpoint_validation_is_canonical(tmp_path: Path) -> None:
     root = tmp_path / "checkpoint"
     manifest = _canonical_checkpoint(root, with_optimizer=False)
@@ -2427,6 +2503,31 @@ def test_canonical_optimizer_state_reproduces_exact_next_step(
         original_optimizer.optimizer.state_dict(),
     )
     assert original._checkpoint_slots["student"].revision == 2
+
+
+def test_shared_optimizer_iteration_advances_when_initialized_parameter_is_skipped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trainer = TrainerRank(_runtime())
+    first = torch.nn.Parameter(torch.tensor([0.5]))
+    second = torch.nn.Parameter(torch.tensor([-0.25]))
+    setattr(first, "_art_custom_checkpoint_param", True)
+    setattr(second, "_art_custom_checkpoint_param", True)
+    trainer._checkpoint_slots["student"] = _CheckpointSlot(params=(first, second))
+    monkeypatch.setattr(trainer, "_sync_dynamic_grads", lambda _params, grads: grads)
+    adam = AdamParams(learning_rate=1e-3, grad_clip_norm=10.0)
+
+    first.grad = torch.ones_like(first)
+    second.grad = torch.ones_like(second)
+    trainer.optim_step(params=adam)
+    first.grad = torch.ones_like(first)
+    second.grad = None
+    trainer.optim_step(params=adam)
+
+    dynamic = trainer._checkpoint_slots["student"].optimizer
+    assert dynamic is not None
+    states = tuple(dynamic.optimizer.state[param] for param in dynamic.master_params)
+    assert shared_optimizer_iteration(dynamic.optimizer.param_groups[0], states) == 2
 
 
 def test_dynamic_optimizer_rejects_legacy_per_parameter_iterations(

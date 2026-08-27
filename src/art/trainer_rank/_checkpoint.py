@@ -20,7 +20,10 @@ from pydantic import BaseModel, ConfigDict
 import torch
 import torch.distributed as dist
 
-from art.trainer_rank._optimizer_semantics import shared_optimizer_iteration
+from art.trainer_rank._optimizer_semantics import (
+    require_uniform_optimizer_iterations,
+    shared_optimizer_iteration,
+)
 
 if TYPE_CHECKING:
     from art.megatron.lora import LoRA, LoraShardMeta, LoRASlotRef
@@ -1555,6 +1558,12 @@ def _optimizer_state(
     assert source.manifest is not None and source.manifest["optimizer"] is not None
     from art.megatron.lora import LoRA
 
+    try:
+        shared_iteration = require_uniform_optimizer_iterations(
+            source.manifest["steps"].values()
+        )
+    except ValueError as exc:
+        raise RuntimeError("Checkpoint optimizer iterations differ") from exc
     ref = trainer._slot_ref(name)
     components: dict[str, list[torch.Tensor]] = {
         "master": [],
@@ -1589,7 +1598,7 @@ def _optimizer_state(
         if not keys:
             for component in components.values():
                 component.append(torch.zeros_like(parameter))
-            steps.append(0.0)
+            steps.append(float(shared_iteration))
             continue
         for index, component in enumerate(components):
             tensors = {
@@ -1604,10 +1613,7 @@ def _optimizer_state(
                 ),
             )
             components[component].append(_localized(module, full, parameter))
-        key_steps = {source.manifest["steps"][key] for key in keys}
-        if len(key_steps) != 1:
-            raise RuntimeError(f"Optimizer steps differ for {keys}")
-        steps.append(key_steps.pop())
+        steps.append(float(shared_iteration))
     return LocalOptimizerState(
         tuple(components["master"]),
         tuple(components["exp_avg"]),

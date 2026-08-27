@@ -36,12 +36,12 @@ class _PreparedOptimizer:
         )
         self.state = tuple(
             {
-                "step": torch.zeros((), dtype=torch.float32),
                 "exp_avg": torch.zeros_like(master),
                 "exp_avg_sq": torch.zeros_like(master),
             }
             for master in self.master_params
         )
+        self.param_group = {"step": 0}
         self.layout = layout
         self.source = SimpleNamespace(
             bind=lambda resident_tensors: {"bound": tuple(resident_tensors)}
@@ -437,6 +437,32 @@ def test_registration_rejects_inexact_optimizer_plane_shape(
     assert executor._runs == {}
 
 
+@pytest.mark.parametrize("invalid_kind", ("missing_group_step", "parameter_step"))
+def test_registration_rejects_invalid_shared_optimizer_iteration(
+    monkeypatch: pytest.MonkeyPatch,
+    invalid_kind: str,
+) -> None:
+    executor, slot, _residency, _publisher = _executor(monkeypatch)
+    prepare = slot.prepare_fresh_checkpoint_slot_optimizer_for_residency
+
+    def invalid(checkpoint: Any) -> _PreparedOptimizer:
+        optimizer = prepare(checkpoint)
+        if invalid_kind == "missing_group_step":
+            optimizer.param_group.pop("step")
+        else:
+            optimizer.state[0]["step"] = torch.tensor(0.0)
+        return optimizer
+
+    monkeypatch.setattr(
+        slot, "prepare_fresh_checkpoint_slot_optimizer_for_residency", invalid
+    )
+
+    with pytest.raises(RuntimeError, match="invalid shared iteration"):
+        _register(executor)
+
+    assert executor._runs == {}
+
+
 def test_exact_optimizer_preparation_uses_no_installed_slot(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -454,8 +480,13 @@ def test_exact_optimizer_preparation_uses_no_installed_slot(
         "layout": layout,
         "master_params": (parameter.detach().clone(),),
         "optimizer": {
-            "param_groups": [{"params": [0]}],
-            "state": {0: {}},
+            "param_groups": [{"params": [0], "step": 0}],
+            "state": {
+                0: {
+                    "exp_avg": torch.zeros_like(parameter),
+                    "exp_avg_sq": torch.zeros_like(parameter),
+                }
+            },
         },
     }
     monkeypatch.setattr(
