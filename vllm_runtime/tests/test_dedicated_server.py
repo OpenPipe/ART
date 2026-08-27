@@ -30,8 +30,17 @@ _PAYLOAD: dict[str, object] = {
 }
 
 
-def _fake_vllm_app() -> FastAPI:
+def _fake_vllm_app(*, authenticated_principal: bool = True) -> FastAPI:
     app = FastAPI()
+
+    if authenticated_principal:
+
+        @app.middleware("http")
+        async def inject_authenticated_principal(request, call_next):
+            request.scope[dedicated_server._AUTHENTICATED_PRINCIPAL_SCOPE_KEY] = (
+                request.headers.get("x-test-authenticated-principal", "test-tenant")
+            )
+            return await call_next(request)
 
     @app.post("/v1/chat/completions")
     async def original_chat_completion():
@@ -163,6 +172,168 @@ def test_fast_metrics_url_uses_controller_routable_host(monkeypatch) -> None:
         request = SimpleNamespace(url=URL(f"http://{host}:8000/art/capabilities"))
         with pytest.raises(RuntimeError, match="unroutable host"):
             dedicated_server._fast_metrics_url(request)
+
+
+def test_capabilities_expose_versioned_model_backend_contract(monkeypatch) -> None:
+    from vllm.entrypoints.openai import api_server
+
+    model_backend = {
+        "schema_version": 1,
+        "base_model": "Qwen/Qwen3.5-35B-A3B",
+        "architectures": ["Qwen3_5MoeForConditionalGeneration"],
+        "backend": "vllm",
+        "backend_version": "0.25.1",
+        "validation_status": "validated",
+        "lora_implementation": "native",
+        "exact_token_ids": True,
+        "exact_token_logprobs": True,
+        "prompt_policy_spans": True,
+        "decode_policy_spans": True,
+        "in_flight_lora_updates": True,
+        "active_request_kv_continuation": True,
+        "new_request_policy_cache_isolation": True,
+        "binary_route_capture": True,
+        "route_capture_dcp": 1,
+        "route_capture_pcp": 1,
+    }
+    monkeypatch.setitem(dedicated_server._runtime_state, "model_backend", model_backend)
+    monkeypatch.setattr(
+        dedicated_server,
+        "_fast_metrics_url",
+        lambda _request: "http://runtime.test/art/metrics",
+    )
+    monkeypatch.setattr(
+        api_server, "build_app", lambda *args, **kwargs: _fake_vllm_app()
+    )
+    monkeypatch.setattr(api_server, "_art_runtime_routes_patched", False, raising=False)
+    dedicated_server._patch_art_runtime_routes()
+
+    response = TestClient(api_server.build_app()).get("/art/capabilities")
+
+    assert response.status_code == 200
+    assert response.json()["protocol_version"] == 8
+    assert response.json()["model_backend"] == model_backend
+
+
+@pytest.mark.asyncio
+async def test_static_token_auth_does_not_invent_route_owner(monkeypatch) -> None:
+    observed: dict[str, object] = {}
+
+    async def app(scope, _receive, _send) -> None:
+        observed.update(scope)
+
+    monkeypatch.setattr(dedicated_server, "_auth_tokens", ["secret"])
+    middleware = dedicated_server._ArtAuthenticationMiddleware(app)
+    await middleware(
+        {
+            "type": "http",
+            "method": "GET",
+            "path": "/art/state",
+            "headers": [(b"authorization", b"Bearer secret")],
+        },
+        lambda: None,
+        lambda _message: None,
+    )
+
+    assert observed["path"] == "/art/state"
+    assert dedicated_server._AUTHENTICATED_PRINCIPAL_SCOPE_KEY not in observed
+
+
+@pytest.mark.asyncio
+async def test_explicit_local_principal_populates_scope(monkeypatch) -> None:
+    observed: dict[str, object] = {}
+
+    async def app(scope, _receive, _send) -> None:
+        observed.update(scope)
+
+    monkeypatch.setattr(dedicated_server, "_auth_tokens", [])
+    middleware = dedicated_server._ArtLocalRoutePrincipalMiddleware(
+        app,
+        principal="local-development",
+    )
+    await middleware(
+        {"type": "http", "method": "GET", "path": "/v1/route_uploads/id"},
+        lambda: None,
+        lambda _message: None,
+    )
+
+    assert (
+        observed[dedicated_server._AUTHENTICATED_PRINCIPAL_SCOPE_KEY]
+        == "local-development"
+    )
+
+
+def test_local_principal_rejects_authenticated_server(monkeypatch) -> None:
+    monkeypatch.setattr(dedicated_server, "_auth_tokens", ["secret"])
+    monkeypatch.setenv(
+        dedicated_server._ROUTE_UPLOAD_LOCAL_PRINCIPAL_ENV,
+        "local-development",
+    )
+
+    with pytest.raises(ValueError, match="requires unauthenticated local mode"):
+        dedicated_server._local_route_upload_principal()
+
+
+def test_route_owner_is_stable_across_bearer_token_rotation() -> None:
+    first = SimpleNamespace(
+        scope={dedicated_server._AUTHENTICATED_PRINCIPAL_SCOPE_KEY: "tenant-7"},
+        headers={"authorization": "Bearer old-token"},
+    )
+    rotated = SimpleNamespace(
+        scope={dedicated_server._AUTHENTICATED_PRINCIPAL_SCOPE_KEY: "tenant-7"},
+        headers={"authorization": "Bearer rotated-token"},
+    )
+
+    assert dedicated_server._route_upload_owner(first) == "tenant-7"
+    assert dedicated_server._route_upload_owner(rotated) == "tenant-7"
+
+
+@pytest.mark.asyncio
+async def test_art_authentication_explicitly_guards_route_status_paths(
+    monkeypatch,
+) -> None:
+    observed: list[str] = []
+    sent: list[dict[str, object]] = []
+
+    async def app(scope, _receive, _send) -> None:
+        observed.append(scope["path"])
+
+    async def receive() -> dict[str, object]:
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(message: dict[str, object]) -> None:
+        sent.append(message)
+
+    monkeypatch.setattr(dedicated_server, "_auth_tokens", ["secret"])
+    middleware = dedicated_server._ArtAuthenticationMiddleware(app)
+    scope = {
+        "type": "http",
+        "method": "GET",
+        "path": "/v1/route_uploads/operation",
+        "headers": [],
+    }
+    await middleware(scope, receive, send)
+
+    assert observed == []
+    assert sent[0]["status"] == 401
+
+    scope["headers"] = [(b"authorization", b"Bearer secret")]
+    await middleware(scope, receive, send)
+    assert observed == ["/v1/route_uploads/operation"]
+
+
+@pytest.mark.asyncio
+async def test_auth_middleware_passes_lifespan_scope(monkeypatch) -> None:
+    observed: list[str] = []
+
+    async def app(scope, _receive, _send) -> None:
+        observed.append(scope["type"])
+
+    monkeypatch.setattr(dedicated_server, "_auth_tokens", ["secret"])
+    middleware = dedicated_server._ArtAuthenticationMiddleware(app)
+    await middleware({"type": "lifespan"}, lambda: None, lambda _message: None)
+
+    assert observed == ["lifespan"]
 
 
 def test_runtime_sleep_route_returns_engine_validation_error(monkeypatch) -> None:
@@ -328,6 +499,64 @@ def test_public_completion_without_route_grant_preserves_native_response(
     assert response.json()["choices"][0]["text"] == "ok"
 
 
+def test_public_chat_without_training_fields_preserves_native_response(
+    monkeypatch,
+) -> None:
+    from art_vllm_runtime import binary_routes
+    from vllm.entrypoints.openai import api_server
+    from vllm.entrypoints.openai.chat_completion import api_router
+
+    async def create_chat_completion(request, _raw_request):
+        assert getattr(request, "route_upload", None) is None
+        assert getattr(request, "return_policy_spans", False) is False
+        return dedicated_server.JSONResponse(
+            content={
+                "id": "chatcmpl-public-test",
+                "object": "chat.completion",
+                "created": 0,
+                "model": request.model,
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "ok"},
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 1,
+                    "completion_tokens": 1,
+                    "total_tokens": 2,
+                },
+            }
+        )
+
+    @contextmanager
+    def forbidden_capture():
+        raise AssertionError("ordinary public inference must not capture routes")
+        yield
+
+    monkeypatch.setattr(
+        api_server, "build_app", lambda *args, **kwargs: _fake_vllm_app()
+    )
+    monkeypatch.setattr(api_server, "_art_runtime_routes_patched", False, raising=False)
+    monkeypatch.setattr(api_router, "create_chat_completion", create_chat_completion)
+    monkeypatch.setattr(binary_routes, "capture_routed_experts", forbidden_capture)
+    dedicated_server._patch_art_runtime_routes()
+    app = api_server.build_app()
+
+    response = TestClient(app).post(
+        "/v1/chat/completions",
+        json={
+            "model": "model",
+            "messages": [{"role": "user", "content": "hello"}],
+            "max_tokens": 1,
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["choices"][0]["message"]["content"] == "ok"
+
+
 def test_public_completion_uploads_routes_and_exposes_event_completion(
     monkeypatch,
 ) -> None:
@@ -337,12 +566,19 @@ def test_public_completion_uploads_routes_and_exposes_event_completion(
 
     patches.subclass_chat_completion_request()
     uploaded: dict[str, object] = {}
+    generated = 0
+    uploads = 0
 
     class Uploader:
         def __init__(self, *, allowed_host_suffixes):
             assert allowed_host_suffixes == ("test.example",)
 
+        def validate_admission(self, _grant):
+            return None
+
         async def put(self, grant, chunks, *, actual_bytes):
+            nonlocal uploads
+            uploads += 1
             uploaded["client_reference"] = grant.client_reference
             uploaded["body"] = b"".join(chunks)
             uploaded["actual_bytes"] = actual_bytes
@@ -351,6 +587,8 @@ def test_public_completion_uploads_routes_and_exposes_event_completion(
             uploaded["closed"] = True
 
     async def create_completion(request, _raw_request):
+        nonlocal generated
+        generated += 1
         assert request.route_upload.client_reference == "routes-1"
         return dedicated_server.JSONResponse(
             content={
@@ -374,6 +612,7 @@ def test_public_completion_uploads_routes_and_exposes_event_completion(
         yield routes
 
     monkeypatch.setenv(dedicated_server._ROUTE_UPLOAD_ALLOWED_HOSTS_ENV, "test.example")
+    monkeypatch.setenv(dedicated_server._ROUTE_UPLOAD_TRUSTED_PRINCIPAL_ENV, "1")
     monkeypatch.setitem(dedicated_server._runtime_state, "binary_routed_experts", True)
     monkeypatch.setattr(
         api_server, "build_app", lambda *args, **kwargs: _fake_vllm_app()
@@ -384,6 +623,7 @@ def test_public_completion_uploads_routes_and_exposes_event_completion(
     monkeypatch.setattr(route_uploads, "PresignedPutUploader", Uploader)
     dedicated_server._patch_art_runtime_routes()
     app = api_server.build_app()
+    expires_at = (datetime.now(timezone.utc) + timedelta(minutes=1)).isoformat()
 
     with TestClient(app) as client:
         response = client.post(
@@ -394,9 +634,7 @@ def test_public_completion_uploads_routes_and_exposes_event_completion(
                 "max_tokens": 1,
                 "route_upload": {
                     "url": "https://objects.test.example/bucket/routes-1",
-                    "expires_at": (
-                        datetime.now(timezone.utc) + timedelta(minutes=1)
-                    ).isoformat(),
+                    "expires_at": expires_at,
                     "max_bytes": 1024,
                     "client_reference": "routes-1",
                 },
@@ -404,14 +642,287 @@ def test_public_completion_uploads_routes_and_exposes_event_completion(
         )
         assert response.status_code == 200
         operation = response.json()["route_upload"]
+        replay = client.post(
+            "/v1/completions",
+            json={
+                "model": "model",
+                "prompt": [1],
+                "max_tokens": 1,
+                "route_upload": {
+                    "url": "https://objects.test.example/bucket/routes-1",
+                    "expires_at": expires_at,
+                    "max_bytes": 1024,
+                    "client_reference": "routes-1",
+                },
+            },
+        )
+        assert replay.status_code == 200
+        replayed = replay.json()
+        assert replayed["route_upload"]["operation_id"] == operation["operation_id"]
+        assert replayed["route_upload"]["client_reference"] == "routes-1"
+        assert replayed["choices"] == response.json()["choices"]
+        conflict = client.post(
+            "/v1/completions",
+            json={
+                "model": "model",
+                "prompt": [2],
+                "max_tokens": 1,
+                "route_upload": {
+                    "url": "https://objects.test.example/bucket/routes-1",
+                    "expires_at": expires_at,
+                    "max_bytes": 1024,
+                    "client_reference": "routes-1",
+                },
+            },
+        )
+        assert conflict.status_code == 400
+        assert "different inference" in conflict.json()["error"]
         status = client.get(
             f"/v1/route_uploads/{operation['operation_id']}/wait?timeout=1"
         )
         assert status.json()["state"] == "ready"
+        foreign_status = client.get(
+            f"/v1/route_uploads/{operation['operation_id']}",
+            headers={"x-test-authenticated-principal": "other-tenant"},
+        )
+        assert foreign_status.status_code == 403
+        assert "another owner" in foreign_status.json()["error"]
 
     assert uploaded["client_reference"] == "routes-1"
     assert uploaded["actual_bytes"] == len(uploaded["body"])
     assert uploaded["closed"] is True
+    assert generated == 1
+    assert uploads == 1
+
+
+def test_public_chat_route_upload_retry_reuses_generation_and_upload(
+    monkeypatch,
+) -> None:
+    from art_vllm_runtime import binary_routes, patches, route_uploads
+    from vllm.entrypoints.openai import api_server
+    from vllm.entrypoints.openai.chat_completion import api_router
+
+    patches.subclass_chat_completion_request()
+    generated = 0
+    uploads = 0
+
+    class Uploader:
+        def __init__(self, *, allowed_host_suffixes):
+            assert allowed_host_suffixes == ("test.example",)
+
+        def validate_admission(self, _grant):
+            return None
+
+        async def put(self, _grant, chunks, *, actual_bytes):
+            nonlocal uploads
+            uploads += 1
+            assert actual_bytes == sum(map(len, chunks))
+
+        async def close(self):
+            pass
+
+    async def create_chat_completion(request, _raw_request):
+        nonlocal generated
+        generated += 1
+        assert request.route_upload.client_reference == "chat-routes-1"
+        return dedicated_server.JSONResponse(
+            content={
+                "id": "chatcmpl-public-upload",
+                "object": "chat.completion",
+                "created": 0,
+                "model": request.model,
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "ok"},
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 1,
+                    "completion_tokens": 1,
+                    "total_tokens": 2,
+                },
+            }
+        )
+
+    @contextmanager
+    def capture_routed_experts():
+        routes = binary_routes._CapturedRoutes(num_experts=8, padding_layers=())
+        routes[0] = np.zeros((2, 1, 1), dtype=np.uint8)
+        yield routes
+
+    monkeypatch.setenv(dedicated_server._ROUTE_UPLOAD_ALLOWED_HOSTS_ENV, "test.example")
+    monkeypatch.setenv(dedicated_server._ROUTE_UPLOAD_TRUSTED_PRINCIPAL_ENV, "1")
+    monkeypatch.setitem(dedicated_server._runtime_state, "binary_routed_experts", True)
+    monkeypatch.setattr(
+        api_server, "build_app", lambda *args, **kwargs: _fake_vllm_app()
+    )
+    monkeypatch.setattr(api_server, "_art_runtime_routes_patched", False, raising=False)
+    monkeypatch.setattr(api_router, "create_chat_completion", create_chat_completion)
+    monkeypatch.setattr(binary_routes, "capture_routed_experts", capture_routed_experts)
+    monkeypatch.setattr(route_uploads, "PresignedPutUploader", Uploader)
+    dedicated_server._patch_art_runtime_routes()
+    expires_at = (datetime.now(timezone.utc) + timedelta(minutes=1)).isoformat()
+    request = {
+        "model": "model",
+        "messages": [{"role": "user", "content": "hello"}],
+        "max_tokens": 1,
+        "route_upload": {
+            "url": "https://objects.test.example/bucket/chat-routes-1",
+            "expires_at": expires_at,
+            "max_bytes": 1024,
+            "client_reference": "chat-routes-1",
+        },
+    }
+
+    with TestClient(api_server.build_app()) as client:
+        response = client.post("/v1/chat/completions", json=request)
+        replay = client.post("/v1/chat/completions", json=request)
+        operation = response.json()["route_upload"]
+        ready = client.get(
+            f"/v1/route_uploads/{operation['operation_id']}/wait?timeout=1"
+        )
+
+    assert response.status_code == 200
+    assert replay.status_code == 200
+    assert replay.json() == response.json()
+    assert ready.json()["state"] == "ready"
+    assert generated == 1
+    assert uploads == 1
+
+
+def test_route_upload_requires_trusted_authenticated_principal(monkeypatch) -> None:
+    from art_vllm_runtime import patches, route_uploads
+    from vllm.entrypoints.openai import api_server
+    from vllm.entrypoints.openai.completion import api_router
+
+    patches.subclass_chat_completion_request()
+
+    class Uploader:
+        def __init__(self, *, allowed_host_suffixes):
+            pass
+
+        def validate_admission(self, _grant):
+            return None
+
+        async def close(self):
+            pass
+
+    async def forbidden_completion(_request, _raw_request):
+        raise AssertionError(
+            "unauthenticated route capture must fail before generation"
+        )
+
+    monkeypatch.setenv(dedicated_server._ROUTE_UPLOAD_ALLOWED_HOSTS_ENV, "test.example")
+    monkeypatch.setenv(dedicated_server._ROUTE_UPLOAD_TRUSTED_PRINCIPAL_ENV, "1")
+    monkeypatch.setitem(dedicated_server._runtime_state, "binary_routed_experts", True)
+    monkeypatch.setattr(
+        api_server,
+        "build_app",
+        lambda *args, **kwargs: _fake_vllm_app(authenticated_principal=False),
+    )
+    monkeypatch.setattr(api_server, "_art_runtime_routes_patched", False, raising=False)
+    monkeypatch.setattr(api_router, "create_completion", forbidden_completion)
+    monkeypatch.setattr(route_uploads, "PresignedPutUploader", Uploader)
+    dedicated_server._patch_art_runtime_routes()
+
+    with TestClient(api_server.build_app()) as client:
+        response = client.post(
+            "/v1/completions",
+            json={
+                "model": "model",
+                "prompt": [1],
+                "max_tokens": 1,
+                "route_upload": {
+                    "url": "https://objects.test.example/bucket/routes",
+                    "expires_at": (
+                        datetime.now(timezone.utc) + timedelta(minutes=1)
+                    ).isoformat(),
+                    "max_bytes": 1024,
+                    "client_reference": "routes",
+                },
+            },
+        )
+
+    assert response.status_code == 403
+    assert "trusted authenticated principal" in response.json()["error"]
+
+
+def test_route_upload_capability_requires_configured_principal_provider(
+    monkeypatch,
+) -> None:
+    from vllm.entrypoints.openai import api_server
+
+    monkeypatch.setenv(dedicated_server._ROUTE_UPLOAD_ALLOWED_HOSTS_ENV, "test.example")
+    monkeypatch.delenv(
+        dedicated_server._ROUTE_UPLOAD_TRUSTED_PRINCIPAL_ENV, raising=False
+    )
+    monkeypatch.setitem(dedicated_server._runtime_state, "binary_routed_experts", True)
+    monkeypatch.setattr(
+        dedicated_server,
+        "_fast_metrics_url",
+        lambda _request: "http://runtime.test/art/metrics",
+    )
+    monkeypatch.setattr(
+        api_server, "build_app", lambda *args, **kwargs: _fake_vllm_app()
+    )
+    monkeypatch.setattr(api_server, "_art_runtime_routes_patched", False, raising=False)
+    dedicated_server._patch_art_runtime_routes()
+
+    with TestClient(api_server.build_app()) as client:
+        capabilities = client.get("/art/capabilities")
+
+    assert capabilities.status_code == 200
+    assert capabilities.json()["presigned_route_uploads"] is False
+
+
+def test_explicit_local_principal_enables_owner_scoped_route_status(
+    monkeypatch,
+) -> None:
+    from art_vllm_runtime import route_uploads
+    from vllm.entrypoints.openai import api_server
+
+    class Uploader:
+        def __init__(self, *, allowed_host_suffixes):
+            pass
+
+        async def close(self):
+            pass
+
+    monkeypatch.setattr(dedicated_server, "_auth_tokens", [])
+    monkeypatch.setenv(dedicated_server._ROUTE_UPLOAD_ALLOWED_HOSTS_ENV, "test.example")
+    monkeypatch.setenv(
+        dedicated_server._ROUTE_UPLOAD_LOCAL_PRINCIPAL_ENV,
+        "local-development",
+    )
+    monkeypatch.delenv(
+        dedicated_server._ROUTE_UPLOAD_TRUSTED_PRINCIPAL_ENV,
+        raising=False,
+    )
+    monkeypatch.setitem(dedicated_server._runtime_state, "binary_routed_experts", True)
+    monkeypatch.setattr(
+        dedicated_server,
+        "_fast_metrics_url",
+        lambda _request: "http://runtime.test/art/metrics",
+    )
+    monkeypatch.setattr(
+        api_server,
+        "build_app",
+        lambda *args, **kwargs: _fake_vllm_app(authenticated_principal=False),
+    )
+    monkeypatch.setattr(api_server, "_art_runtime_routes_patched", False, raising=False)
+    monkeypatch.setattr(route_uploads, "PresignedPutUploader", Uploader)
+    dedicated_server._patch_art_runtime_routes()
+
+    with TestClient(api_server.build_app()) as client:
+        capabilities = client.get("/art/capabilities")
+        missing = client.get("/v1/route_uploads/missing")
+
+    assert capabilities.status_code == 200
+    assert capabilities.json()["presigned_route_uploads"] is True
+    assert missing.status_code == 404
+    assert "not found" in missing.json()["error"]
 
 
 @pytest.mark.asyncio
@@ -449,6 +960,101 @@ def test_launch_policy_version_resolves_loaded_slot_alias(monkeypatch) -> None:
         )
         == 5
     )
+
+
+def test_lora_update_identity_separates_policy_generation_from_source() -> None:
+    first = dedicated_server._InFlightLoraUpdateRequest(
+        model_name="run:active",
+        lora_slot="run:active",
+        lora_path="/holder-a/materialized",
+        operation_id="operation-1",
+        adapter_source="caios://bucket/immutable-version-1",
+        generation_id="policy-generation-1",
+        expected_generation_id=None,
+        policy_version=1,
+    )
+    prior_response = {"status": "updated", "generation_id": first.generation_id}
+    applied = dedicated_server._AppliedLoraUpdate(
+        identity=dedicated_server._lora_update_identity(first),
+        response=prior_response,
+    )
+
+    # A holder-local materialization path is not transport or policy identity.
+    replay = first.model_copy(update={"lora_path": "/holder-b/materialized"})
+    assert (
+        dedicated_server._admit_lora_update(
+            replay,
+            applied,
+            launch_policy_version=None,
+            launch_generation_id=None,
+        )
+        == prior_response
+    )
+
+    changed_source = replay.model_copy(
+        update={"adapter_source": "caios://bucket/immutable-version-2"}
+    )
+    with pytest.raises(ValueError, match="operation identity was reused"):
+        dedicated_server._admit_lora_update(
+            changed_source,
+            applied,
+            launch_policy_version=None,
+            launch_generation_id=None,
+        )
+
+    next_update = first.model_copy(
+        update={
+            "operation_id": "operation-2",
+            "adapter_source": "caios://bucket/immutable-version-2",
+            "generation_id": "policy-generation-2",
+            "expected_generation_id": "policy-generation-1",
+            "policy_version": 2,
+        }
+    )
+    assert (
+        dedicated_server._admit_lora_update(
+            next_update,
+            applied,
+            launch_policy_version=None,
+            launch_generation_id=None,
+        )
+        is None
+    )
+    with pytest.raises(ValueError, match="expected generation"):
+        dedicated_server._admit_lora_update(
+            next_update.model_copy(update={"expected_generation_id": "stale"}),
+            applied,
+            launch_policy_version=None,
+            launch_generation_id=None,
+        )
+
+
+def test_lora_update_checks_launch_generation_lineage() -> None:
+    request = dedicated_server._InFlightLoraUpdateRequest(
+        model_name="run:active",
+        lora_path="/holder/materialized",
+        operation_id="operation-2",
+        adapter_source="caios://bucket/immutable-version-2",
+        generation_id="policy-generation-2",
+        expected_generation_id="policy-generation-1",
+        policy_version=2,
+    )
+    assert (
+        dedicated_server._admit_lora_update(
+            request,
+            None,
+            launch_policy_version=1,
+            launch_generation_id="policy-generation-1",
+        )
+        is None
+    )
+    with pytest.raises(ValueError, match="launch state"):
+        dedicated_server._admit_lora_update(
+            request.model_copy(update={"expected_generation_id": "wrong"}),
+            None,
+            launch_policy_version=1,
+            launch_generation_id="policy-generation-1",
+        )
 
 
 def test_lora_only_runtime_advertises_update_capabilities(monkeypatch) -> None:

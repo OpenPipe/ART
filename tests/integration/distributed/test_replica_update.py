@@ -114,12 +114,23 @@ async def test_in_flight_update_is_the_only_acknowledgement_call(
     service._serving_step = 0
     service._base_url = "http://leader.test:8000"
     service._api_key_value = "secret"
+    service._published_adapters = cast(
+        Any,
+        {
+            0: SimpleNamespace(generation_id="generation-0"),
+            1: SimpleNamespace(generation_id="generation-1"),
+        },
+    )
     name, path = await service._load_adapter("/step/0001", 1)
 
     assert (name, path) == ("model:active", "/step/0001")
     assert len(calls) == 1
     assert calls[0][0] == "http://leader.test:8000/art/in_flight_lora_update"
     assert calls[0][1]["policy_version"] == 1
+    assert calls[0][1]["adapter_source"] == "/step/0001"
+    assert calls[0][1]["operation_id"].startswith("apply:")
+    assert calls[0][1]["generation_id"] == "generation-1"
+    assert calls[0][1]["expected_generation_id"] == "generation-0"
     assert calls[0][2] == {"Authorization": "Bearer secret"}
 
 

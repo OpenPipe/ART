@@ -269,6 +269,7 @@ async def test_recovery_uses_serving_generation_while_learner_is_ahead(
         served_model_name="model@5",
         lora_path=serving_path,
         initial_policy_version=5,
+        initial_generation_id="serving-generation",
     )
     report = manager.verify_update.call_args.args[0]
     assert report.policy_version == "5"

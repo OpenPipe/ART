@@ -120,6 +120,7 @@ class UnslothService:
     output_dir: str
     _is_sleeping: bool = False
     _latest_step: int = 0
+    _in_flight_generation_id: str | None = None
     _vllm_runtime: ManagedVllmRuntime = field(
         default_factory=ManagedVllmRuntime,
         init=False,
@@ -351,6 +352,9 @@ class UnslothService:
         self.serving_capabilities.require(
             "policy_token_spans", operation="In-flight LoRA updates"
         )
+        generation_id = hashlib.sha256(
+            f"unsloth\0{self.model_name}\0{step}".encode()
+        ).hexdigest()
         async with httpx.AsyncClient() as client:
             response = await client.post(
                 f"{self._vllm_base_url}/art/in_flight_lora_update",
@@ -358,9 +362,10 @@ class UnslothService:
                     "model_name": self._in_flight_lora_slot,
                     "lora_slot": self._in_flight_lora_slot,
                     "lora_path": checkpoint_path,
-                    "generation_id": hashlib.sha256(
-                        f"{self.model_name}\0{step}\0{checkpoint_path}".encode()
-                    ).hexdigest(),
+                    "operation_id": f"apply:{generation_id}",
+                    "adapter_source": checkpoint_path,
+                    "generation_id": generation_id,
+                    "expected_generation_id": self._in_flight_generation_id,
                     "policy_version": step,
                 },
                 **self._runtime_request_kwargs(),
@@ -368,6 +373,7 @@ class UnslothService:
             )
             response.raise_for_status()
         self._latest_step = step
+        self._in_flight_generation_id = generation_id
         self._loaded_adapter_steps.add(step)
 
     async def _load_rollout_lora_for_step(

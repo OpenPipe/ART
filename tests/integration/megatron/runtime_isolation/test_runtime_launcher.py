@@ -42,6 +42,7 @@ def test_build_runtime_server_cmd_uses_runtime_project(
             lora_path="/tmp/lora",
             served_model_name="test@0",
             initial_policy_version=7,
+            initial_generation_id="generation-7",
             engine_args={"weight_transfer_config": {"backend": "nccl"}},
             server_args={"tool_call_parser": "hermes"},
         )
@@ -53,6 +54,7 @@ def test_build_runtime_server_cmd_uses_runtime_project(
     )
     assert '--server-args-json={"tool_call_parser": "hermes"}' in command
     assert "--initial-policy-version=7" in command
+    assert "--initial-generation-id=generation-7" in command
 
 
 def test_build_runtime_server_cmd_honors_runtime_bin_override(monkeypatch) -> None:

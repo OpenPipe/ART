@@ -88,6 +88,7 @@ class VllmRuntimeLaunchConfig(BaseModel):
     process_uuid: str | None = None
     update_identity: str | None = None
     initial_policy_version: int | None = Field(default=None, ge=0)
+    initial_generation_id: str | None = Field(default=None, min_length=1)
 
     @model_validator(mode="after")
     def _validate_native_member(self) -> "VllmRuntimeLaunchConfig":
@@ -911,6 +912,8 @@ def build_vllm_runtime_server_cmd(config: VllmRuntimeLaunchConfig) -> list[str]:
         command.append(f"--update-identity={config.update_identity}")
     if config.initial_policy_version is not None:
         command.append(f"--initial-policy-version={config.initial_policy_version}")
+    if config.initial_generation_id is not None:
+        command.append(f"--initial-generation-id={config.initial_generation_id}")
     return command
 
 
