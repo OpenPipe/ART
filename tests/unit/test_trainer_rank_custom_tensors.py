@@ -595,13 +595,8 @@ def test_selected_optimizer_step_updates_only_its_custom_checkpoint(
     b = rank.parameter("gain", lambda: torch.tensor(2.0), checkpoint="B")
     monkeypatch.setattr(
         trainer,
-        "_reduce_dynamic_grads",
-        lambda params, **_kwargs: tuple(
-            torch.zeros_like(param, dtype=torch.float32)
-            if param.grad is None
-            else param.grad.float()
-            for param in params
-        ),
+        "_sync_dynamic_grads",
+        lambda _params, grads: grads,
     )
     (a * 3).backward()
     before_b = b.detach().clone()
@@ -621,13 +616,8 @@ def test_optimizer_skips_unused_custom_parameters(
     unused = rank.parameter("unused", lambda: torch.tensor(3.0), checkpoint="student")
     monkeypatch.setattr(
         trainer,
-        "_reduce_dynamic_grads",
-        lambda params, **_kwargs: tuple(
-            torch.zeros_like(param, dtype=torch.float32)
-            if param.grad is None
-            else param.grad.float()
-            for param in params
-        ),
+        "_sync_dynamic_grads",
+        lambda _params, grads: grads,
     )
     (used * 2).backward()
 
@@ -781,7 +771,9 @@ def test_custom_parameters_join_slot_optimizer_with_replicated_metadata() -> Non
     )
 
 
-@pytest.mark.skipif(find_spec("megatron") is None, reason="requires Megatron")
+@pytest.mark.skipif(
+    find_spec("megatron.bridge") is None, reason="requires Megatron Bridge"
+)
 @pytest.mark.parametrize("payload", ("custom", "optimizer"))
 def test_custom_checkpoint_payload_keys_are_strictly_validated(
     tmp_path: Path,
@@ -816,7 +808,9 @@ def test_custom_checkpoint_payload_keys_are_strictly_validated(
         prepare_checkpoint(str(output))
 
 
-@pytest.mark.skipif(find_spec("megatron") is None, reason="requires Megatron")
+@pytest.mark.skipif(
+    find_spec("megatron.bridge") is None, reason="requires Megatron Bridge"
+)
 def test_custom_tensor_checkpoint_artifacts_and_lora_export_are_separate(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -905,7 +899,9 @@ def test_custom_tensor_checkpoint_artifacts_and_lora_export_are_separate(
     }
 
 
-@pytest.mark.skipif(find_spec("megatron") is None, reason="requires Megatron")
+@pytest.mark.skipif(
+    find_spec("megatron.bridge") is None, reason="requires Megatron Bridge"
+)
 @pytest.mark.parametrize("corruption", ("draft_format", "trainable_buffer"))
 def test_custom_checkpoint_rejects_unreleased_or_invalid_manifests(
     tmp_path: Path,
@@ -931,7 +927,9 @@ def test_custom_checkpoint_rejects_unreleased_or_invalid_manifests(
         prepare_checkpoint(str(output))
 
 
-@pytest.mark.skipif(find_spec("megatron") is None, reason="requires Megatron")
+@pytest.mark.skipif(
+    find_spec("megatron.bridge") is None, reason="requires Megatron Bridge"
+)
 def test_custom_tensor_names_cannot_corrupt_lora_optimizer_metadata(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -940,13 +938,8 @@ def test_custom_tensor_names_cannot_corrupt_lora_optimizer_metadata(
     head = rank.module("layer", _CollisionHead, checkpoint="student")
     monkeypatch.setattr(
         trainer,
-        "_reduce_dynamic_grads",
-        lambda params, **_kwargs: tuple(
-            torch.zeros_like(param, dtype=torch.float32)
-            if param.grad is None
-            else param.grad.float()
-            for param in params
-        ),
+        "_sync_dynamic_grads",
+        lambda _params, grads: grads,
     )
     head.q_proj.lora_A.weight.sum().backward()
     trainer.optim_step(
@@ -965,7 +958,9 @@ def test_custom_tensor_names_cannot_corrupt_lora_optimizer_metadata(
     )
 
 
-@pytest.mark.skipif(find_spec("megatron") is None, reason="requires Megatron")
+@pytest.mark.skipif(
+    find_spec("megatron.bridge") is None, reason="requires Megatron Bridge"
+)
 def test_loaded_custom_payload_is_owned_after_source_removal(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -996,7 +991,9 @@ def test_loaded_custom_payload_is_owned_after_source_removal(
     )
 
 
-@pytest.mark.skipif(find_spec("megatron") is None, reason="requires Megatron")
+@pytest.mark.skipif(
+    find_spec("megatron.bridge") is None, reason="requires Megatron Bridge"
+)
 def test_custom_tensors_and_optimizer_restore_lazily_and_survive_unmaterialized_save(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1180,13 +1177,8 @@ def _step_custom_tensors(
 ) -> None:
     monkeypatch.setattr(
         trainer,
-        "_reduce_dynamic_grads",
-        lambda params, **_kwargs: tuple(
-            torch.zeros_like(param, dtype=torch.float32)
-            if param.grad is None
-            else param.grad.float()
-            for param in params
-        ),
+        "_sync_dynamic_grads",
+        lambda _params, grads: grads,
     )
     hidden = torch.tensor([[0.25, -0.5, 1.0]])
     (head(hidden).sum() + temperature * scale).backward()

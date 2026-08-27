@@ -270,7 +270,8 @@ def _custom_parameter_reduction_worker(
         )
         torch.testing.assert_close(parameter, torch.tensor(1.0, device=device))
         (parameter * float(rank + 1)).backward()
-        (reduced,) = trainer._reduce_dynamic_grads((parameter,), scale_grads=1.0)
+        local = trainer._local_dynamic_grads((parameter,), scale_grads=1.0)
+        (reduced,) = trainer._sync_dynamic_grads((parameter,), local)
         expected = {"dp": 3.0, "tp": 1.5, "cp": 3.0, "tp_cp": 5.0}[topology]
         torch.testing.assert_close(reduced, torch.tensor(expected, device=device))
     finally:
@@ -361,7 +362,10 @@ def _tp_head_backward_worker(rank: int, world: int, init_method: str) -> None:
         replicated = _grad_param(rank, device, sharded=False, sync_op="sum")
         sharded = _grad_param(rank, device, sharded=True)
         trainer = TrainerRank.__new__(TrainerRank)
-        reduced = trainer._reduce_dynamic_grads((replicated, sharded), scale_grads=0.5)
+        local = trainer._local_dynamic_grads(
+            (replicated, sharded), scale_grads=0.5
+        )
+        reduced = trainer._sync_dynamic_grads((replicated, sharded), local)
         expected_replicated = 0.5 * sum(range(1, world + 1))
         torch.testing.assert_close(
             reduced[0], torch.tensor([expected_replicated], device=device)
@@ -406,7 +410,8 @@ def _assert_replica_grad_reduction(
     param = _grad_param(rank, device, sharded=False)
 
     trainer = TrainerRank.__new__(TrainerRank)
-    (reduced,) = trainer._reduce_dynamic_grads((param,), scale_grads=0.25)
+    local = trainer._local_dynamic_grads((param,), scale_grads=0.25)
+    (reduced,) = trainer._sync_dynamic_grads((param,), local)
     expected = 0.25 * sum(range(1, world + 1))
     torch.testing.assert_close(reduced, torch.tensor([expected], device=device))
     assert _distributed_grad_norm((param,), (reduced,)) == pytest.approx(expected)
