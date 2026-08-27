@@ -61,6 +61,7 @@ from art.trainer_rank._impl import (
     _MemoryProfile,
     _validate_top_k,
 )
+from art.trainer_rank._optimizer_semantics import shared_optimizer_step
 
 if TYPE_CHECKING:
     from art.megatron.lora import LoRASlotRef
@@ -69,10 +70,32 @@ if TYPE_CHECKING:
 
 @pytest.fixture(autouse=True)
 def _cpu_dynamic_optimizer(monkeypatch: pytest.MonkeyPatch) -> None:
+    class SharedStepAdamW(torch.optim.AdamW):
+        """CPU AdamW oracle with TE FusedAdam's one-step-per-group layout."""
+
+        def step(self, closure: object = None) -> object:
+            for group in self.param_groups:
+                shared_step = float(group.get("step", 0.0))
+                for param in group["params"]:
+                    state = self.state[param]
+                    if state:
+                        state["step"] = torch.tensor(shared_step)
+            result = super().step(closure=closure)
+            for group in self.param_groups:
+                steps = [
+                    self.state[param]["step"]
+                    for param in group["params"]
+                    if "step" in self.state[param]
+                ]
+                group["step"] = shared_optimizer_step({}, ({"step": s} for s in steps))
+                for param in group["params"]:
+                    self.state[param].pop("step", None)
+            return result
+
     def build(
         params: Iterable[torch.nn.Parameter], config: AdamParams
     ) -> torch.optim.Optimizer:
-        return torch.optim.AdamW(
+        return SharedStepAdamW(
             params,
             lr=config.learning_rate,
             betas=(config.beta1, config.beta2),
@@ -2359,12 +2382,13 @@ def test_canonical_optimizer_state_reproduces_exact_next_step(
     assert dynamic is not None
     optimizer_state = dynamic.optimizer.state[dynamic.master_params[0]]
     group = dynamic.optimizer.param_groups[0]
+    step = shared_optimizer_step(group, (optimizer_state,))
     beta1, beta2 = cast(tuple[float, float], group["betas"])
     state = LocalOptimizerState(
         masters=tuple(param.detach().clone() for param in dynamic.master_params),
         exp_avgs=(cast(torch.Tensor, optimizer_state["exp_avg"]).clone(),),
         exp_avg_sqs=(cast(torch.Tensor, optimizer_state["exp_avg_sq"]).clone(),),
-        steps=(float(cast(torch.Tensor, optimizer_state["step"]).item()),),
+        steps=(step,),
         config=OptimizerConfig(
             learning_rate=float(group["lr"]),
             beta1=beta1,

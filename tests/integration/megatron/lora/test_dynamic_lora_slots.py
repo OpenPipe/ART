@@ -35,6 +35,7 @@ from art.trainer_rank._impl import (  # noqa: E402
     _vocab_parallel_target_logprobs,
     _vocab_parallel_topk_from_local,
 )
+from art.trainer_rank._optimizer_semantics import shared_optimizer_step  # noqa: E402
 
 
 class _CudaValueHead(torch.nn.Module):
@@ -577,6 +578,7 @@ def _optimizer_state(trainer: TrainerRank, name: str) -> LocalOptimizerState:
         for master in dynamic.master_params
     ]
     group = dynamic.optimizer.param_groups[0]
+    step = shared_optimizer_step(group, states)
     beta1, beta2 = cast(tuple[float, float], group["betas"])
     return LocalOptimizerState(
         masters=tuple(
@@ -586,7 +588,7 @@ def _optimizer_state(trainer: TrainerRank, name: str) -> LocalOptimizerState:
         exp_avg_sqs=tuple(
             state["exp_avg_sq"].detach().cpu().clone() for state in states
         ),
-        steps=tuple(float(state["step"].item()) for state in states),
+        steps=(step,) * len(states),
         config=OptimizerConfig(
             learning_rate=float(group["lr"]),
             beta1=beta1,

@@ -20,6 +20,8 @@ from pydantic import BaseModel, ConfigDict
 import torch
 import torch.distributed as dist
 
+from art.trainer_rank._optimizer_semantics import shared_optimizer_step
+
 if TYPE_CHECKING:
     from art.megatron.lora import LoRA, LoraShardMeta, LoRASlotRef
     from art.trainer_rank._impl import (
@@ -683,6 +685,17 @@ def _custom_snapshot(
         )
 
     dynamic = slot.optimizer
+    dynamic_step = (
+        0.0
+        if dynamic is None
+        else shared_optimizer_step(
+            dynamic.optimizer.param_groups[0],
+            (
+                dynamic.optimizer.state.get(master, {})
+                for master in dynamic.master_params
+            ),
+        )
+    )
     masters = (
         {}
         if dynamic is None
@@ -741,7 +754,7 @@ def _custom_snapshot(
                 .cpu()
                 .contiguous()
             )
-            optimizer[f"step/{key}"] = torch.tensor(float(state.get("step", 0.0)))
+            optimizer[f"step/{key}"] = torch.tensor(dynamic_step)
 
     if dynamic is not None:
         for record in records.values():
@@ -782,6 +795,17 @@ def _local_state(
     )
     dynamic = trainer._checkpoint_slots[name].optimizer
     optimizer = None if dynamic is None else _optimizer_config(dynamic)
+    dynamic_step = (
+        0.0
+        if dynamic is None
+        else shared_optimizer_step(
+            dynamic.optimizer.param_groups[0],
+            (
+                dynamic.optimizer.state.get(master, {})
+                for master in dynamic.master_params
+            ),
+        )
+    )
     masters = (
         {}
         if dynamic is None
@@ -826,8 +850,7 @@ def _local_state(
                         payloads[item.block][f"{component}/{key}"] = (
                             local.T.float().cpu().contiguous()
                         )
-                    step = state.get("step", 0.0)
-                    payloads[item.block][f"step/{key}"] = torch.tensor(float(step))
+                    payloads[item.block][f"step/{key}"] = torch.tensor(dynamic_step)
     records: list[_LocalShard] = []
     for index, block in enumerate(sorted(payloads)):
         relative = f"block-{index:06d}.safetensors"

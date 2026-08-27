@@ -47,6 +47,10 @@ from art.megatron.prefix_tree_packing import (
     estimate_prefix_tree_packed_tokens,
     prefix_tree_pack,
 )
+from art.trainer_rank._optimizer_semantics import (
+    require_uniform_optimizer_steps,
+    shared_optimizer_step,
+)
 from art.trainer_rank._telemetry import phase as _telemetry_phase
 
 if TYPE_CHECKING:
@@ -1880,7 +1884,6 @@ class TrainerRank:
         )
         state: tuple[dict[str, object], ...] = tuple(
             {
-                "step": torch.zeros((), dtype=torch.float32),
                 "exp_avg": torch.zeros_like(master),
                 "exp_avg_sq": torch.zeros_like(master),
             }
@@ -1896,6 +1899,7 @@ class TrainerRank:
                 "bias_correction": True,
                 "betas": (defaults.beta1, defaults.beta2),
                 "eps": defaults.eps,
+                "step": 0.0,
                 "weight_decay": defaults.weight_decay,
             },
             valid_ranges=valid_ranges,
@@ -2945,6 +2949,7 @@ class TrainerRank:
             restored = load_custom_optimizer(
                 slot.custom_payload, tuple(key for key, _param in named)
             )
+            restored_steps: list[float] = []
             for (key, _param), master in zip(named, masters[lora_count:], strict=True):
                 state = restored.get(key)
                 if state is not None:
@@ -2952,10 +2957,14 @@ class TrainerRank:
                     with torch.no_grad():
                         master.copy_(state.master.to(master.device))
                     optimizer.state[master] = {
-                        "step": torch.tensor(state.step, device=master.device),
                         "exp_avg": state.exp_avg.to(master.device).clone(),
                         "exp_avg_sq": state.exp_avg_sq.to(master.device).clone(),
                     }
+                    restored_steps.append(state.step)
+            if restored_steps:
+                optimizer.param_groups[0]["step"] = require_uniform_optimizer_steps(
+                    restored_steps
+                )
         return dynamic
 
     def _restore_canonical_optimizer(
@@ -2974,7 +2983,15 @@ class TrainerRank:
             master_params=state.masters,
         )
         dynamic.optimizer.param_groups[0]["eps"] = state.config["eps"]
-        for master, exp_avg, exp_avg_sq, step in zip(
+        try:
+            dynamic.optimizer.param_groups[0]["step"] = (
+                require_uniform_optimizer_steps(state.steps)
+            )
+        except ValueError as exc:
+            raise TrainerRankSlotStateError(
+                f"Canonical optimizer steps differ for checkpoint slot {name!r}."
+            ) from exc
+        for master, exp_avg, exp_avg_sq, _step in zip(
             dynamic.master_params,
             state.exp_avgs,
             state.exp_avg_sqs,
@@ -2988,7 +3005,6 @@ class TrainerRank:
                     f"Canonical optimizer moment shape does not match {name!r}"
                 )
             dynamic.optimizer.state[master] = {
-                "step": torch.tensor(step, dtype=torch.float32),
                 "exp_avg": exp_avg.to(master.device, torch.float32).clone(),
                 "exp_avg_sq": exp_avg_sq.to(master.device, torch.float32).clone(),
             }
@@ -3017,6 +3033,29 @@ class TrainerRank:
             raise TrainerRankSlotStateError(
                 f"Optimizer state for checkpoint slot {name!r} is incomplete."
             )
+        groups = optimizer_state.get("param_groups")
+        states = optimizer_state.get("state")
+        if (
+            not isinstance(groups, Sequence)
+            or len(groups) != 1
+            or not isinstance(groups[0], Mapping)
+            or not isinstance(states, Mapping)
+        ):
+            raise TrainerRankSlotStateError(
+                f"Optimizer state for checkpoint slot {name!r} is malformed."
+            )
+        try:
+            shared_optimizer_step(
+                groups[0],
+                (
+                    cast(Mapping[str, object], states.get(index, {}))
+                    for index in range(len(masters))
+                ),
+            )
+        except (TypeError, ValueError) as exc:
+            raise TrainerRankSlotStateError(
+                f"Optimizer step state for checkpoint slot {name!r} is invalid."
+            ) from exc
         dynamic = self._new_dynamic_optimizer(
             name,
             AdamParams(learning_rate=0.0),
