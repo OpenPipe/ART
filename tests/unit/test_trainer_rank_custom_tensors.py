@@ -678,6 +678,15 @@ def test_portable_optimizer_rejects_late_trainable_parameter_transactionally() -
         "student", AdamParams(learning_rate=1e-3)
     )
     optimizer = slot.optimizer
+    master = optimizer.master_params[0]
+    master.grad = torch.ones_like(master)
+    optimizer.optimizer.step()
+    optimizer.optimizer.zero_grad(set_to_none=True)
+    optimizer_class = type(optimizer.optimizer)
+    optimizer_state = copy.deepcopy(optimizer.optimizer.state_dict())
+    semantic_fingerprint = trainer.runtime.optimizer_semantic_sha256
+    residency_descriptor = cast(Any, object())
+    slot.optimizer_residency_descriptor = residency_descriptor
 
     with pytest.raises(
         TrainerRankSlotStateError,
@@ -689,6 +698,10 @@ def test_portable_optimizer_rejects_late_trainable_parameter_transactionally() -
     assert slot.params == (existing,)
     assert slot.optimizer is optimizer
     assert len(slot.optimizer.master_params) == 1
+    assert type(slot.optimizer.optimizer) is optimizer_class
+    assert trainer.runtime.optimizer_semantic_sha256 == semantic_fingerprint
+    torch.testing.assert_close(slot.optimizer.optimizer.state_dict(), optimizer_state)
+    assert slot.optimizer_residency_descriptor is residency_descriptor
 
 
 def test_module_tracking_preserves_tied_parameter_identity() -> None:
