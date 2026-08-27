@@ -297,9 +297,14 @@ cleanup() {
 trap cleanup EXIT
 printf '0' > "${build_log_offset_path}"
 
-mkdir -p "${context_dir}/docker" "${context_dir}/vllm_runtime"
+mkdir -p "${context_dir}/docker" "${context_dir}/megatron_runtime" \
+  "${context_dir}/vllm_runtime"
 cp "${repo_root}/pyproject.toml" "${context_dir}/pyproject.toml"
 cp "${repo_root}/uv.lock" "${context_dir}/uv.lock"
+cp "${repo_root}/megatron_runtime/pyproject.toml" \
+  "${context_dir}/megatron_runtime/pyproject.toml"
+cp "${repo_root}/megatron_runtime/uv.lock" \
+  "${context_dir}/megatron_runtime/uv.lock"
 cp "${repo_root}/vllm_runtime/pyproject.toml" "${context_dir}/vllm_runtime/pyproject.toml"
 cp "${repo_root}/vllm_runtime/uv.lock" "${context_dir}/vllm_runtime/uv.lock"
 cp "${repo_root}/.dockerignore" "${context_dir}/.dockerignore"
