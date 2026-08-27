@@ -35,6 +35,7 @@ from art.megatron.optimizer_state import (
     read_committed_optimizer_pointer,
     read_optimizer_generation_manifest,
     validate_adapter_manifest,
+    verified_optimizer_generation_receipt_lease,
 )
 from art.megatron.runtime.data_plane import SFTBatchData
 from art.megatron.runtime.publication import (
@@ -365,12 +366,22 @@ class MegatronTrainingSlot:
         async with AsyncExitStack() as leases:
             if registration.initial_optimizer_state_path is not None:
                 assert registration.initial_optimizer_generation_id is not None
-                verification = await leases.enter_async_context(
-                    authenticated_optimizer_generation_lease(
-                        registration.initial_optimizer_state_path,
-                        registration.initial_optimizer_generation_id,
+                supplied_verification = registration.initial_optimizer_verification
+                if supplied_verification is None:
+                    verification = await leases.enter_async_context(
+                        authenticated_optimizer_generation_lease(
+                            registration.initial_optimizer_state_path,
+                            registration.initial_optimizer_generation_id,
+                        )
                     )
-                )
+                else:
+                    verification = await leases.enter_async_context(
+                        verified_optimizer_generation_receipt_lease(
+                            registration.initial_optimizer_state_path,
+                            registration.initial_optimizer_generation_id,
+                            supplied_verification,
+                        )
+                    )
                 registration = registration.model_copy(
                     update={"initial_optimizer_verification": verification}
                 )

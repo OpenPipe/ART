@@ -7,6 +7,7 @@ import threading
 import pytest
 import torch
 
+from art.distributed.rollout import RolloutModelSpec
 from art.megatron import optimizer_state as optimizer_state_module
 from art.megatron.optimizer_state import (
     CheckpointFile,
@@ -32,6 +33,13 @@ from art.megatron.portable_optimizer_archive import (
     PreparedPortableOptimizerArchive,
     write_portable_optimizer_archive,
 )
+from art.megatron.runtime.specs import (
+    RankLocalOptimizerWorkSummary,
+    RunOptimizerWorkSummary,
+    RunSlotRegistration,
+)
+from art.megatron.training import slot as training_slot_module
+from art.megatron.training.slot import MegatronTrainingSlot
 from art.megatron.weights.rank_distributed_types import RankDistributedLoraStats
 
 _DIGEST = "0" * 64
@@ -387,6 +395,100 @@ def test_verified_generation_receipt_reuse_rejects_identity_mutation(
     )
     with pytest.raises(RuntimeError, match=expected):
         validate_verified_optimizer_generation(str(tmp_path), generation, receipt)
+
+
+@pytest.mark.asyncio
+async def test_run_registration_reuses_receipt_and_retains_generation_lease(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    optimizer_state_path = tmp_path / "optimizer"
+    shard, adapter = _generation(optimizer_state_path)
+    receipt = VerifiedOptimizerGeneration.model_validate_json(
+        verify_optimizer_generation(
+            str(optimizer_state_path), _GENERATION
+        ).model_dump_json()
+    )
+    deletion_started = threading.Event()
+
+    def delete() -> None:
+        deletion_started.set()
+        delete_optimizer_generation(
+            str(optimizer_state_path), _GENERATION, replacement_generation=None
+        )
+
+    optimizer_work = RunOptimizerWorkSummary(
+        run_id="run",
+        ranks=(
+            RankLocalOptimizerWorkSummary(
+                rank=0,
+                adapter_rank=1,
+                target_modules=("q_proj",),
+                trainable_lora_numel=1,
+                optimizer_passes=1,
+                parameter_count=1,
+                layout_fingerprint=_DIGEST,
+            ),
+        ),
+    )
+
+    class _RankReadingTrainer:
+        valid = True
+
+        def __init__(self) -> None:
+            self.deletion: asyncio.Task[None] | None = None
+
+        async def register_run(
+            self, registration: RunSlotRegistration
+        ) -> RunOptimizerWorkSummary:
+            assert registration.initial_optimizer_verification == receipt
+            self.deletion = asyncio.create_task(asyncio.to_thread(delete))
+            assert await asyncio.to_thread(deletion_started.wait, 1)
+            await asyncio.sleep(0.05)
+            assert not self.deletion.done()
+            assert shard.read_bytes() == b"logical optimizer bytes"
+            return optimizer_work
+
+    trainer = _RankReadingTrainer()
+    slot = MegatronTrainingSlot.__new__(MegatronTrainingSlot)
+    slot._closed = False
+    slot._batch_release_failures = []
+    slot._runs = {}
+    slot.artifact_root = str(tmp_path.resolve())
+    slot.trainer = trainer
+    monkeypatch.setattr(
+        optimizer_state_module,
+        "_file_sha256",
+        lambda _path: pytest.fail("supplied receipt repeated optimizer shard hashing"),
+    )
+    monkeypatch.setattr(
+        training_slot_module, "validate_adapter_manifest", lambda _adapter: None
+    )
+
+    registration = RunSlotRegistration(
+        tenant_id="tenant",
+        run_id="run",
+        training_session_id="session",
+        learner_version=1,
+        generation_id=_GENERATION,
+        adapter=adapter,
+        optimizer_state_path=str(optimizer_state_path),
+        initial_optimizer_state_path=str(optimizer_state_path),
+        initial_optimizer_generation_id=_GENERATION,
+        initial_optimizer_verification=receipt,
+    )
+    result = await slot.register_run(
+        registration,
+        model=RolloutModelSpec(payload={}),
+        output_dir=str(tmp_path / "output"),
+    )
+
+    assert result == optimizer_work
+    assert trainer.deletion is not None
+    await asyncio.wait_for(trainer.deletion, timeout=1)
+    assert not optimizer_generation_path(
+        str(optimizer_state_path), _GENERATION
+    ).exists()
 
 
 @pytest.mark.parametrize("old_format", [3, 4])

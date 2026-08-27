@@ -1151,13 +1151,30 @@ def validate_verified_optimizer_generation(
     if verification.generation != generation:
         raise RuntimeError("Optimizer verification names another generation")
     with optimizer_generation_lease(optimizer_state_path, generation) as pointer:
-        generation_path = optimizer_generation_path(optimizer_state_path, generation)
-        manifest, manifest_sha256 = _read_manifest_identity(generation_path)
-        _validate_pointer_manifest(pointer, manifest)
-        expected = _verified_optimizer_generation(manifest, manifest_sha256)
-        if verification != expected:
-            raise RuntimeError("Optimizer generation receipt identity mismatch")
-    return verification
+        return _validate_verified_optimizer_generation_leased(
+            optimizer_state_path,
+            generation,
+            pointer,
+            verification,
+        )
+
+
+@asynccontextmanager
+async def verified_optimizer_generation_receipt_lease(
+    optimizer_state_path: str,
+    generation: str,
+    verification: VerifiedOptimizerGeneration,
+) -> AsyncIterator[VerifiedOptimizerGeneration]:
+    """Retain a previously authenticated generation without rehashing its shards."""
+    with optimizer_generation_lease(optimizer_state_path, generation) as pointer:
+        validated = await asyncio.to_thread(
+            _validate_verified_optimizer_generation_leased,
+            optimizer_state_path,
+            generation,
+            pointer,
+            verification,
+        )
+        yield validated
 
 
 @asynccontextmanager
@@ -1198,6 +1215,23 @@ def _verified_optimizer_generation(
         optimizer_semantic_sha256=manifest.optimizer_semantic_sha256,
         logical_state_sha256=manifest.logical_state_sha256,
     )
+
+
+def _validate_verified_optimizer_generation_leased(
+    optimizer_state_path: str,
+    generation: str,
+    pointer: OptimizerGenerationPointer,
+    verification: VerifiedOptimizerGeneration,
+) -> VerifiedOptimizerGeneration:
+    if verification.generation != generation:
+        raise RuntimeError("Optimizer verification names another generation")
+    generation_path = optimizer_generation_path(optimizer_state_path, generation)
+    manifest, manifest_sha256 = _read_manifest_identity(generation_path)
+    _validate_pointer_manifest(pointer, manifest)
+    expected = _verified_optimizer_generation(manifest, manifest_sha256)
+    if verification != expected:
+        raise RuntimeError("Optimizer generation receipt identity mismatch")
+    return verification
 
 
 def verify_optimizer_generation_manifest(
