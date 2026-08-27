@@ -97,6 +97,7 @@ class _SlotTrainer:
             ),
             sites=(),
             expected_keys=frozenset(),
+            expected_shapes={},
         )
         return self.checkpoint
 
