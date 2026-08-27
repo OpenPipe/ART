@@ -158,7 +158,7 @@ def _real_logical_generation(
                     "lr": 3e-5,
                     "betas": [0.9, 0.95],
                     "eps": 1e-8,
-                    "step": 31,
+                    "step": 31.0,
                     "weight_decay": 0.1,
                 },
             ),
@@ -892,10 +892,10 @@ def test_real_archive_loader_reconstructs_empty_destination_rank(
         {
             "lr": 3e-5,
             "betas": [0.9, 0.95],
-            "eps": 1e-8,
-            "step": 31,
-            "weight_decay": 0.1,
-            "params": [],
+                "eps": 1e-8,
+                "step": 31.0,
+                "weight_decay": 0.1,
+                "params": [],
         }
     ]
 
@@ -954,9 +954,9 @@ def test_real_archive_loader_reconstructs_shared_outer_moe_with_padding(
             )
         ),
     )
-    assert state["optimizer"]["param_groups"][0]["step"] == 31
     assert "step" not in state["optimizer"]["state"][0]
     assert "step" not in state["optimizer"]["state"][1]
+    assert state["optimizer"]["param_groups"][0]["step"] == 31.0
 
 
 @pytest.mark.asyncio
@@ -996,7 +996,7 @@ def test_rank_loader_does_not_repeat_full_shard_hash(
         source_world_size=1,
         logical_keys=("weight",),
         steps={"weight": 1.0},
-        param_group={"lr": 3e-5, "step": 1},
+        param_group={"lr": 3e-5, "step": 1.0},
     )
     monkeypatch.setattr(
         "art.megatron.optimizer_state._file_sha256",

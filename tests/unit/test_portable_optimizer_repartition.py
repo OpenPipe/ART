@@ -134,7 +134,7 @@ def _archive(
             source_world_size=source_world_size,
             logical_keys=keys,
             steps=dict.fromkeys(keys, 31.0),
-            param_group={"lr": 3e-5, "betas": [0.9, 0.95], "step": 31},
+            param_group={"lr": 3e-5, "betas": [0.9, 0.95], "step": 31.0},
         ),
         loaded_logical_keys=keys,
         tensors=tensors,
@@ -172,7 +172,7 @@ def test_logical_optimizer_repartitions_across_source_rank_ownership() -> None:
     torch.testing.assert_close(state["master_params"][1], torch.full((2, 3), 2.0))
     optimizer = state["optimizer"]
     assert optimizer["param_groups"] == [
-        {"lr": 3e-5, "betas": [0.9, 0.95], "step": 31, "params": [0, 1]}
+        {"lr": 3e-5, "betas": [0.9, 0.95], "step": 31.0, "params": [0, 1]}
     ]
     optimizer_state = optimizer["state"]
     torch.testing.assert_close(optimizer_state[0]["exp_avg"], torch.full((2, 3), 11.0))
@@ -219,7 +219,7 @@ def test_shared_outer_reconstruction_combines_shared_and_expert_keys() -> None:
     torch.testing.assert_close(
         state["master_params"][1], torch.full((2, 2, 3), 2.0)
     )
-    assert state["optimizer"]["param_groups"][0]["step"] == 31
+    assert state["optimizer"]["param_groups"][0]["step"] == 31.0
 
 
 def test_cp2_ep2_source_semantics_reconstruct_into_cp2_ep1_destination() -> None:
@@ -292,7 +292,9 @@ def test_cp2_ep2_source_semantics_reconstruct_into_cp2_ep1_destination() -> None
                     state["exp_avg_sq"][expert_index], source.exp_avg_sq[key]
                 )
                 assert "step" not in state
-                assert restored["optimizer"]["param_groups"][0]["step"] == 31
+                assert restored["optimizer"]["param_groups"][0]["step"] == (
+                    source.steps[key]
+                )
 
     for parameter_index in range(2):
         torch.testing.assert_close(
@@ -376,7 +378,7 @@ def test_padding_only_destination_uses_zero_optimizer_coordinates() -> None:
             optimizer_state["exp_avg_sq"], torch.zeros_like(master)
         )
         assert "step" not in optimizer_state
-        assert state["optimizer"]["param_groups"][0]["step"] == 31
+        assert state["optimizer"]["param_groups"][0]["step"] == 31.0
 
 
 def test_mixed_expert_destination_maps_keys_around_physical_padding() -> None:

@@ -20,10 +20,7 @@ from pydantic import BaseModel, ConfigDict
 import torch
 import torch.distributed as dist
 
-from art.trainer_rank._optimizer_semantics import (
-    require_uniform_optimizer_iterations,
-    shared_optimizer_iteration,
-)
+from art.trainer_rank._optimizer_semantics import shared_optimizer_step
 
 if TYPE_CHECKING:
     from art.megatron.lora import LoRA, LoraShardMeta, LoRASlotRef
@@ -688,10 +685,10 @@ def _custom_snapshot(
         )
 
     dynamic = slot.optimizer
-    iteration = (
-        0
+    dynamic_step = (
+        0.0
         if dynamic is None
-        else shared_optimizer_iteration(
+        else shared_optimizer_step(
             dynamic.optimizer.param_groups[0],
             (
                 dynamic.optimizer.state.get(master, {})
@@ -757,7 +754,7 @@ def _custom_snapshot(
                 .cpu()
                 .contiguous()
             )
-            optimizer[f"step/{key}"] = torch.tensor(iteration)
+            optimizer[f"step/{key}"] = torch.tensor(dynamic_step)
 
     if dynamic is not None:
         for record in records.values():
@@ -797,10 +794,10 @@ def _local_state(
     )
     dynamic = trainer._checkpoint_slots[name].optimizer
     optimizer = None if dynamic is None else _optimizer_config(dynamic)
-    iteration = (
-        0
+    dynamic_step = (
+        0.0
         if dynamic is None
-        else shared_optimizer_iteration(
+        else shared_optimizer_step(
             dynamic.optimizer.param_groups[0],
             (
                 dynamic.optimizer.state.get(master, {})
@@ -852,7 +849,7 @@ def _local_state(
                         payloads[item.block][f"{component}/{key}"] = (
                             local.T.float().cpu().contiguous()
                         )
-                    payloads[item.block][f"step/{key}"] = torch.tensor(iteration)
+                    payloads[item.block][f"step/{key}"] = torch.tensor(dynamic_step)
     records: list[_LocalShard] = []
     for index, block in enumerate(sorted(payloads)):
         relative = f"block-{index:06d}.safetensors"

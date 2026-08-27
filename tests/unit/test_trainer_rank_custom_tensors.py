@@ -807,6 +807,15 @@ def test_portable_optimizer_rejects_late_trainable_parameter_transactionally() -
         "student", AdamParams(learning_rate=1e-3)
     )
     optimizer = slot.optimizer
+    master = optimizer.master_params[0]
+    master.grad = torch.ones_like(master)
+    optimizer.optimizer.step()
+    optimizer.optimizer.zero_grad(set_to_none=True)
+    optimizer_class = type(optimizer.optimizer)
+    optimizer_state = copy.deepcopy(optimizer.optimizer.state_dict())
+    semantic_fingerprint = trainer.runtime.optimizer_semantic_sha256
+    residency_descriptor = cast(Any, object())
+    slot.optimizer_residency_descriptor = residency_descriptor
 
     with pytest.raises(
         TrainerRankSlotStateError,
@@ -818,6 +827,10 @@ def test_portable_optimizer_rejects_late_trainable_parameter_transactionally() -
     assert slot.params == (existing,)
     assert slot.optimizer is optimizer
     assert len(slot.optimizer.master_params) == 1
+    assert type(slot.optimizer.optimizer) is optimizer_class
+    assert trainer.runtime.optimizer_semantic_sha256 == semantic_fingerprint
+    torch.testing.assert_close(slot.optimizer.optimizer.state_dict(), optimizer_state)
+    assert slot.optimizer_residency_descriptor is residency_descriptor
 
 
 def test_module_tracking_preserves_tied_parameter_identity() -> None:
@@ -897,7 +910,9 @@ def test_custom_parameters_join_slot_optimizer_with_replicated_metadata() -> Non
     )
 
 
-@pytest.mark.skipif(not _has_megatron_bridge(), reason="requires Megatron Bridge")
+@pytest.mark.skipif(
+    find_spec("megatron.bridge") is None, reason="requires Megatron Bridge"
+)
 @pytest.mark.parametrize("payload", ("custom", "optimizer"))
 def test_custom_checkpoint_payload_keys_are_strictly_validated(
     tmp_path: Path,
@@ -932,7 +947,9 @@ def test_custom_checkpoint_payload_keys_are_strictly_validated(
         prepare_checkpoint(str(output))
 
 
-@pytest.mark.skipif(not _has_megatron_bridge(), reason="requires Megatron Bridge")
+@pytest.mark.skipif(
+    find_spec("megatron.bridge") is None, reason="requires Megatron Bridge"
+)
 def test_custom_tensor_checkpoint_artifacts_and_lora_export_are_separate(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1021,7 +1038,9 @@ def test_custom_tensor_checkpoint_artifacts_and_lora_export_are_separate(
     }
 
 
-@pytest.mark.skipif(not _has_megatron_bridge(), reason="requires Megatron Bridge")
+@pytest.mark.skipif(
+    find_spec("megatron.bridge") is None, reason="requires Megatron Bridge"
+)
 @pytest.mark.parametrize("corruption", ("draft_format", "trainable_buffer"))
 def test_custom_checkpoint_rejects_unreleased_or_invalid_manifests(
     tmp_path: Path,
@@ -1047,7 +1066,9 @@ def test_custom_checkpoint_rejects_unreleased_or_invalid_manifests(
         prepare_checkpoint(str(output))
 
 
-@pytest.mark.skipif(not _has_megatron_bridge(), reason="requires Megatron Bridge")
+@pytest.mark.skipif(
+    find_spec("megatron.bridge") is None, reason="requires Megatron Bridge"
+)
 def test_custom_tensor_names_cannot_corrupt_lora_optimizer_metadata(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1076,7 +1097,9 @@ def test_custom_tensor_names_cannot_corrupt_lora_optimizer_metadata(
     )
 
 
-@pytest.mark.skipif(not _has_megatron_bridge(), reason="requires Megatron Bridge")
+@pytest.mark.skipif(
+    find_spec("megatron.bridge") is None, reason="requires Megatron Bridge"
+)
 def test_loaded_custom_payload_is_owned_after_source_removal(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1107,7 +1130,9 @@ def test_loaded_custom_payload_is_owned_after_source_removal(
     )
 
 
-@pytest.mark.skipif(not _has_megatron_bridge(), reason="requires Megatron Bridge")
+@pytest.mark.skipif(
+    find_spec("megatron.bridge") is None, reason="requires Megatron Bridge"
+)
 def test_custom_tensors_and_optimizer_restore_lazily_and_survive_unmaterialized_save(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

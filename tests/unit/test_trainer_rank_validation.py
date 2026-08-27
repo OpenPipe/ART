@@ -63,10 +63,7 @@ from art.trainer_rank._impl import (
     _MemoryProfile,
     _validate_top_k,
 )
-from art.trainer_rank._optimizer_semantics import (
-    require_uniform_optimizer_iterations,
-    shared_optimizer_iteration,
-)
+from art.trainer_rank._optimizer_semantics import shared_optimizer_step
 
 if TYPE_CHECKING:
     from art.megatron.lora import LoRASlotRef
@@ -76,40 +73,25 @@ if TYPE_CHECKING:
 @pytest.fixture(autouse=True)
 def _cpu_dynamic_optimizer(monkeypatch: pytest.MonkeyPatch) -> None:
     class SharedStepAdamW(torch.optim.AdamW):
-        """CPU oracle exposing TE FusedAdam's one-counter group layout."""
+        """CPU AdamW oracle with TE FusedAdam's one-step-per-group layout."""
 
-        def step(  # ty: ignore[invalid-method-override]
-            self, closure: Callable[[], float] | None = None
-        ) -> float | None:
-            current_by_group: list[int] = []
+        def step(self, closure: object = None) -> object:
             for group in self.param_groups:
-                current = int(group.get("step", 0))
-                current_by_group.append(current)
-                for parameter in group["params"]:
-                    state = self.state.get(parameter, {})
+                shared_step = float(group.get("step", 0.0))
+                for param in group["params"]:
+                    state = self.state[param]
                     if state:
-                        state["step"] = torch.tensor(float(current))
+                        state["step"] = torch.tensor(shared_step)
             result = super().step(closure=closure)
-            for group, current in zip(
-                self.param_groups, current_by_group, strict=True
-            ):
-                states = tuple(
-                    self.state.get(parameter, {}) for parameter in group["params"]
-                )
-                projected = tuple(
-                    state["step"]
-                    for parameter, state in zip(
-                        group["params"], states, strict=True
-                    )
-                    if parameter.grad is not None and "step" in state
-                )
-                group["step"] = (
-                    current
-                    if not projected
-                    else require_uniform_optimizer_iterations(projected)
-                )
-                for state in states:
-                    state.pop("step", None)
+            for group in self.param_groups:
+                steps = [
+                    self.state[param]["step"]
+                    for param in group["params"]
+                    if "step" in self.state[param]
+                ]
+                group["step"] = shared_optimizer_step({}, ({"step": s} for s in steps))
+                for param in group["params"]:
+                    self.state[param].pop("step", None)
             return result
 
     def build(
@@ -2465,15 +2447,13 @@ def test_canonical_optimizer_state_reproduces_exact_next_step(
     assert dynamic is not None
     optimizer_state = dynamic.optimizer.state[dynamic.master_params[0]]
     group = dynamic.optimizer.param_groups[0]
-    iteration = shared_optimizer_iteration(group, (optimizer_state,))
-    assert iteration == 1
-    assert "step" not in optimizer_state
+    step = shared_optimizer_step(group, (optimizer_state,))
     beta1, beta2 = cast(tuple[float, float], group["betas"])
     state = LocalOptimizerState(
         masters=tuple(param.detach().clone() for param in dynamic.master_params),
         exp_avgs=(cast(torch.Tensor, optimizer_state["exp_avg"]).clone(),),
         exp_avg_sqs=(cast(torch.Tensor, optimizer_state["exp_avg_sq"]).clone(),),
-        steps=(float(iteration),),
+        steps=(step,),
         config=OptimizerConfig(
             learning_rate=float(group["lr"]),
             beta1=beta1,

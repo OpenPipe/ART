@@ -48,8 +48,8 @@ from art.megatron.prefix_tree_packing import (
     prefix_tree_pack,
 )
 from art.trainer_rank._optimizer_semantics import (
-    require_uniform_optimizer_iterations,
-    shared_optimizer_iteration,
+    require_uniform_optimizer_steps,
+    shared_optimizer_step,
 )
 from art.trainer_rank._telemetry import phase as _telemetry_phase
 
@@ -1925,7 +1925,7 @@ class TrainerRank:
                 "bias_correction": True,
                 "betas": (defaults.beta1, defaults.beta2),
                 "eps": defaults.eps,
-                "step": 0,
+                "step": 0.0,
                 "weight_decay": defaults.weight_decay,
             },
             valid_ranges=valid_ranges,
@@ -2981,7 +2981,7 @@ class TrainerRank:
             restored = load_custom_optimizer(
                 slot.custom_payload, tuple(key for key, _param in named)
             )
-            restored_iterations: list[object] = []
+            restored_steps: list[float] = []
             for (key, _param), master in zip(named, masters[lora_count:], strict=True):
                 state = restored.get(key)
                 if state is not None:
@@ -2992,10 +2992,10 @@ class TrainerRank:
                         "exp_avg": state.exp_avg.to(master.device).clone(),
                         "exp_avg_sq": state.exp_avg_sq.to(master.device).clone(),
                     }
-                    restored_iterations.append(state.step)
-            if restored_iterations:
-                optimizer.param_groups[0]["step"] = (
-                    require_uniform_optimizer_iterations(restored_iterations)
+                    restored_steps.append(state.step)
+            if restored_steps:
+                optimizer.param_groups[0]["step"] = require_uniform_optimizer_steps(
+                    restored_steps
                 )
         return dynamic
 
@@ -3017,11 +3017,11 @@ class TrainerRank:
         dynamic.optimizer.param_groups[0]["eps"] = state.config["eps"]
         try:
             dynamic.optimizer.param_groups[0]["step"] = (
-                require_uniform_optimizer_iterations(state.steps)
+                require_uniform_optimizer_steps(state.steps)
             )
         except ValueError as exc:
             raise TrainerRankSlotStateError(
-                f"Canonical optimizer iterations differ for checkpoint slot {name!r}."
+                f"Canonical optimizer steps differ for checkpoint slot {name!r}."
             ) from exc
         for master, exp_avg, exp_avg_sq, _step in zip(
             dynamic.master_params,
@@ -3077,8 +3077,8 @@ class TrainerRank:
                 f"Optimizer state for checkpoint slot {name!r} is malformed."
             )
         try:
-            shared_optimizer_iteration(
-                cast(Mapping[str, object], groups[0]),
+            shared_optimizer_step(
+                groups[0],
                 (
                     cast(Mapping[str, object], states.get(index, {}))
                     for index in range(len(masters))
@@ -3086,7 +3086,7 @@ class TrainerRank:
             )
         except (TypeError, ValueError) as exc:
             raise TrainerRankSlotStateError(
-                f"Optimizer iteration for checkpoint slot {name!r} is invalid."
+                f"Optimizer step state for checkpoint slot {name!r} is invalid."
             ) from exc
         dynamic = self._new_dynamic_optimizer(
             name,

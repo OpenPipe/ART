@@ -13,11 +13,7 @@ import torch
 
 from art.megatron.tensor_snapshot import PinnedCpuSnapshotStager
 from art.megatron.weights.rank_distributed_types import RankDistributedLoraStats
-from art.trainer_rank._optimizer_semantics import (
-    optimizer_iteration,
-    require_uniform_optimizer_iterations,
-    shared_optimizer_iteration,
-)
+from art.trainer_rank._optimizer_semantics import optimizer_step, shared_optimizer_step
 from art.utils.safetensors import (
     FileIdentity,
     PreparedSafetensors,
@@ -55,8 +51,8 @@ def portable_optimizer_semantic_contract() -> dict[str, object]:
         "logical_archive_format": "art_logical_safetensors_v1",
         "logical_archive_metadata_format": 2,
         "parameter_state": ("master", "exp_avg", "exp_avg_sq"),
-        "optimizer_iteration": (
-            "one_shared_group_counter_projected_per_logical_parameter_v1"
+        "optimizer_step": (
+            "one_shared_param_group_projected_per_logical_parameter_v1"
         ),
         "parameter_groups": (
             "one_group_all_checkpoint_slot_parameters_in_residency_order_v1"
@@ -108,10 +104,10 @@ class PortableOptimizerArchiveMetadata(BaseModel):
             )
         if "step" not in self.param_group:
             raise ValueError("portable optimizer param-group metadata requires step")
-        group_iteration = optimizer_iteration(self.param_group["step"])
+        group_step = optimizer_step(self.param_group["step"])
         if any(not math.isfinite(step) or step < 0 for step in self.steps.values()):
             raise ValueError("portable optimizer steps must be finite and nonnegative")
-        if any(step != group_iteration for step in self.steps.values()):
+        if any(step != group_step for step in self.steps.values()):
             raise ValueError(
                 "portable optimizer logical steps differ from the shared group step"
             )
@@ -474,16 +470,10 @@ def reconstruct_trainer_rank_optimizer_state(
     ):
         raise ValueError("destination optimizer layout differs from prepared sites")
 
-    if "step" not in components.param_group:
-        raise ValueError("portable optimizer parameter group is missing step")
-    group_iteration = optimizer_iteration(components.param_group["step"])
-    if components.steps and (
-        require_uniform_optimizer_iterations(components.steps.values())
-        != group_iteration
-    ):
-        raise ValueError(
-            "portable optimizer logical steps differ from the shared group step"
-        )
+    optimizer_step = shared_optimizer_step(
+        components.param_group,
+        ({"step": step} for step in components.steps.values()),
+    )
     masters: list[torch.Tensor] = []
     optimizer_state: dict[int, dict[str, object]] = {}
     component_maps = {
@@ -549,7 +539,7 @@ def reconstruct_trainer_rank_optimizer_state(
                 "param_groups": [
                     {
                         **components.param_group,
-                        "step": group_iteration,
+                        "step": optimizer_step,
                         "params": list(range(len(masters))),
                     }
                 ],
@@ -602,14 +592,14 @@ def _optimizer_components(
         raise ValueError("optimizer parameter indices differ from master order")
     if any(not isinstance(key, str) for key in raw_group):
         raise ValueError("optimizer param-group keys must be strings")
-    group_iteration = shared_optimizer_iteration(
+    group_step = shared_optimizer_step(
         raw_group,
         (
             cast(Mapping[str, object], states.get(index, {}))
             for index in range(len(masters))
         ),
     )
-    raw_group["step"] = group_iteration
+    raw_group["step"] = group_step
     param_group = {str(key): _as_json_value(value) for key, value in raw_group.items()}
 
     if any(
@@ -645,7 +635,7 @@ def _optimizer_components(
             raise ValueError("optimizer moments differ from their master tensor")
         exp_avgs.append(avg)
         exp_avg_sqs.append(avg_sq)
-        steps.append(float(group_iteration))
+        steps.append(group_step)
     return masters, tuple(exp_avgs), tuple(exp_avg_sqs), tuple(steps), param_group
 
 
