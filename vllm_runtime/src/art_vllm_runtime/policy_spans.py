@@ -939,6 +939,8 @@ def _patch_output_processor_policy_span_accumulation() -> None:
 def _patch_openai_response_policy_spans() -> None:
     from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionResponse
     from vllm.entrypoints.openai.chat_completion.serving import OpenAIServingChat
+    from vllm.entrypoints.openai.completion.protocol import CompletionResponse
+    from vllm.entrypoints.openai.completion.serving import OpenAIServingCompletion
 
     original_full = OpenAIServingChat.chat_completion_full_generator
     if getattr(original_full, "__art_policy_spans_patched__", False):
@@ -970,7 +972,9 @@ def _patch_openai_response_policy_spans() -> None:
             *args,
             **kwargs,
         )
-        if isinstance(response, ChatCompletionResponse):
+        if isinstance(response, ChatCompletionResponse) and bool(
+            getattr(request, "return_policy_spans", False)
+        ):
             spans_by_choice = _policy_spans_by_choice_from_final_output(
                 final_res, ART_POLICY_TOKEN_SPANS_FIELD
             )
@@ -992,6 +996,55 @@ def _patch_openai_response_policy_spans() -> None:
 
     chat_completion_full_generator.__art_policy_spans_patched__ = True  # type: ignore[attr-defined]
     OpenAIServingChat.chat_completion_full_generator = chat_completion_full_generator  # type: ignore[method-assign]
+
+    original_completion_response = (
+        OpenAIServingCompletion.request_output_to_completion_response
+    )
+
+    def request_output_to_completion_response(
+        self: Any,
+        final_res_batch: list[Any],
+        request: Any,
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        response = original_completion_response(
+            self, final_res_batch, request, *args, **kwargs
+        )
+        if not isinstance(response, CompletionResponse) or not bool(
+            getattr(request, "return_policy_spans", False)
+        ):
+            return response
+        response_choice = iter(response.choices)
+        for final_res in final_res_batch:
+            for output in final_res.outputs:
+                choice = next(response_choice)
+                spans = getattr(output, ART_POLICY_TOKEN_SPANS_FIELD, None)
+                if spans:
+                    _set_pydantic_extra(
+                        choice, POLICY_TOKEN_SPANS_FIELD, [dict(span) for span in spans]
+                    )
+                prompt_spans = getattr(
+                    output, ART_PROMPT_POLICY_TOKEN_SPANS_FIELD, None
+                )
+                if prompt_spans:
+                    _set_pydantic_extra(
+                        choice,
+                        PROMPT_POLICY_TOKEN_SPANS_FIELD,
+                        [dict(span) for span in prompt_spans],
+                    )
+        if _resolve_lora_alias(self.models, getattr(request, "model", None)):
+            response.model = request.model
+        return response
+
+    setattr(
+        request_output_to_completion_response,
+        "__art_policy_spans_patched__",
+        True,
+    )
+    OpenAIServingCompletion.request_output_to_completion_response = (  # type: ignore[method-assign]
+        request_output_to_completion_response
+    )
 
 
 def _patch_lora_alias_resolution() -> None:

@@ -11,7 +11,7 @@ from pydantic import (
     model_validator,
 )
 
-ART_SERVING_PROTOCOL_VERSION = 5
+ART_SERVING_PROTOCOL_VERSION = 8
 
 ServingFeature = Literal[
     "binary_routed_experts",
@@ -19,6 +19,7 @@ ServingFeature = Literal[
     "inplace_lora_load",
     "in_flight_lora_updates",
     "policy_token_spans",
+    "presigned_route_uploads",
 ]
 
 
@@ -54,6 +55,76 @@ class FastMetricsSnapshot(BaseModel):
     generation: int = Field(ge=0)
 
 
+class ModelBackendCapabilities(BaseModel):
+    """Conformance evidence for the one model/backend pair served here."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    schema_version: Literal[1]
+    base_model: str = Field(min_length=1)
+    architectures: tuple[str, ...] = Field(min_length=1)
+    backend: Literal["vllm"]
+    backend_version: str = Field(min_length=1)
+    validation_status: Literal["validated", "unvalidated", "unsupported"]
+    lora_implementation: Literal[
+        "native", "art_runtime_patch", "unvalidated", "unavailable"
+    ]
+    exact_token_ids: bool
+    exact_token_logprobs: bool
+    prompt_policy_spans: bool
+    decode_policy_spans: bool
+    in_flight_lora_updates: bool
+    active_request_kv_continuation: bool
+    new_request_policy_cache_isolation: bool
+    binary_route_capture: bool = Field(
+        description=(
+            "Request-scoped route capture is supported by both OpenAI chat and "
+            "completion generation endpoints under the advertised constraints."
+        )
+    )
+    route_capture_dcp: int = Field(ge=1)
+    route_capture_pcp: int = Field(ge=1)
+
+    def require_trainable_generation(
+        self,
+        *,
+        expected_base_model: str | None = None,
+        require_binary_routes: bool = False,
+    ) -> None:
+        if expected_base_model is not None and self.base_model != expected_base_model:
+            raise RuntimeError(
+                f"Remote RL expected model {expected_base_model!r}, but the serving "
+                f"capability document describes {self.base_model!r}."
+            )
+        if self.validation_status != "validated":
+            raise RuntimeError(
+                f"Remote RL is not validated for {self.base_model!r} on "
+                f"{self.backend} {self.backend_version}; capability status is "
+                f"{self.validation_status!r}."
+            )
+        required = {
+            "exact_token_ids": self.exact_token_ids,
+            "exact_token_logprobs": self.exact_token_logprobs,
+            "prompt_policy_spans": self.prompt_policy_spans,
+            "decode_policy_spans": self.decode_policy_spans,
+            "in_flight_lora_updates": self.in_flight_lora_updates,
+            "active_request_kv_continuation": self.active_request_kv_continuation,
+            "new_request_policy_cache_isolation": (
+                self.new_request_policy_cache_isolation
+            ),
+        }
+        if self.lora_implementation not in {"native", "art_runtime_patch"}:
+            required["model_lora_support"] = False
+        if require_binary_routes:
+            required["binary_route_capture"] = self.binary_route_capture
+        missing = sorted(name for name, available in required.items() if not available)
+        if missing:
+            raise RuntimeError(
+                f"Remote RL capability contract is incomplete for "
+                f"{self.base_model!r}: {missing}."
+            )
+
+
 class ServingCapabilities(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -64,6 +135,8 @@ class ServingCapabilities(BaseModel):
     inplace_lora_load: bool = False
     in_flight_lora_updates: bool = False
     policy_token_spans: bool = False
+    presigned_route_uploads: bool = False
+    model_backend: ModelBackendCapabilities | None = None
 
     @model_validator(mode="after")
     def _validate_protocol(self) -> "ServingCapabilities":
@@ -71,6 +144,10 @@ class ServingCapabilities(BaseModel):
         if self.protocol_version != expected:
             raise ValueError(
                 f"{self.runtime} serving protocol must be version {expected}"
+            )
+        if self.runtime == "openai_compatible" and self.model_backend is not None:
+            raise ValueError(
+                "OpenAI-compatible capabilities cannot claim ART conformance"
             )
         return self
 
@@ -84,6 +161,23 @@ class ServingCapabilities(BaseModel):
                 f"{operation} requires serving capability {feature!r}; "
                 f"connected runtime is {self.runtime!r}."
             )
+
+    def require_trainable_generation(
+        self,
+        *,
+        expected_base_model: str | None = None,
+        require_binary_routes: bool = False,
+    ) -> None:
+        if self.runtime != "art_vllm":
+            return
+        if self.model_backend is None:
+            raise RuntimeError(
+                "ART vLLM did not advertise a model/backend conformance document."
+            )
+        self.model_backend.require_trainable_generation(
+            expected_base_model=expected_base_model,
+            require_binary_routes=require_binary_routes,
+        )
 
 
 async def discover_serving_capabilities(
@@ -99,7 +193,10 @@ async def discover_serving_capabilities(
         return ServingCapabilities.openai_compatible()
     try:
         response.raise_for_status()
-        return ServingCapabilities.model_validate(response.json())
+        capabilities = ServingCapabilities.model_validate(response.json())
+        if capabilities.runtime == "art_vllm" and capabilities.model_backend is None:
+            raise ValueError("ART vLLM capabilities omitted model/backend conformance")
+        return capabilities
     except (httpx.HTTPError, ValueError) as exc:
         raise RuntimeError(
             f"Serving runtime returned invalid ART capabilities from {url}."

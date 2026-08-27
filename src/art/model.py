@@ -709,8 +709,16 @@ class Model(
             return None
         body: dict[str, Any] = {}
         if self.trainable:
+            if self._serving_capabilities is not None:
+                self._serving_capabilities.require_trainable_generation(
+                    expected_base_model=getattr(self, "base_model", None)
+                )
+            body["logprobs"] = True
+            body["top_logprobs"] = 0
             body["return_token_ids"] = True
             body["return_tokens_as_token_ids"] = True
+            if self._policy_span_mode() == "require":
+                body["return_policy_spans"] = True
         configured_chat_template_kwargs = (
             internal_config.get("chat_template_kwargs")
             if internal_config is not None

@@ -11,7 +11,9 @@ from pydantic import BaseModel
 from art.preprocessing.moe_routing import MoeRouteArray
 
 MAGIC = b"ARTRTE2\0"
+ROUTE_OBJECT_MAGIC = b"ARTROU2\0"
 HEADER = struct.Struct("<8sQII")
+ROUTE_OBJECT_HEADER = struct.Struct("<8sII")
 ROUTE_HEADER = struct.Struct("<IB3xQQQ")
 DTYPES = {1: "u1", 2: "<u2"}
 MAX_RESPONSE_BYTES = 4 << 30
@@ -81,6 +83,24 @@ async def decode_routed_experts_completion_response_stream(
     return await _decode_routed_experts_response_stream(chunks, Completion)
 
 
+async def decode_routed_experts_object_stream(
+    chunks: AsyncIterable[bytes],
+) -> dict[int, MoeRouteArray]:
+    """Decode the route-only object uploaded independently of generation JSON."""
+
+    reader = _AsyncByteReader(chunks.__aiter__())
+    header = await reader.read_exact(
+        ROUTE_OBJECT_HEADER.size, "ART routed-experts object header"
+    )
+    magic, route_count, num_experts = ROUTE_OBJECT_HEADER.unpack_from(header)
+    if magic != ROUTE_OBJECT_MAGIC:
+        raise RuntimeError("Invalid ART routed-experts object magic")
+    _validate_route_contract(route_count, num_experts)
+    routes = await _decode_route_arrays(reader, route_count, num_experts)
+    await reader.finish()
+    return routes
+
+
 async def _decode_routed_experts_response_stream(
     chunks: AsyncIterable[bytes], response_type: type[_Response]
 ) -> tuple[_Response, dict[int, MoeRouteArray]]:
@@ -93,6 +113,16 @@ async def _decode_routed_experts_response_stream(
     response = response_type.model_validate_json(
         await reader.read_exact(json_size, "ART routed-experts JSON response")
     )
+    routes = await _decode_route_arrays(reader, route_count, num_experts)
+    await reader.finish()
+    return response, routes
+
+
+async def _decode_route_arrays(
+    reader: "_AsyncByteReader", route_count: int, num_experts: int
+) -> dict[int, MoeRouteArray]:
+    import numpy as np
+
     routes: dict[int, MoeRouteArray] = {}
     for _ in range(route_count):
         route_header = await reader.read_exact(
@@ -111,8 +141,7 @@ async def _decode_routed_experts_response_stream(
         routes[choice_index] = MoeRouteArray(
             array.reshape((tokens, layers, topk)), num_experts=num_experts
         )
-    await reader.finish()
-    return response, routes
+    return routes
 
 
 def _validate_response_header(
@@ -125,6 +154,12 @@ def _validate_response_header(
         raise RuntimeError("Invalid ART routed-experts response magic")
     if not 0 < json_size <= MAX_JSON_BYTES:
         raise RuntimeError("ART routed-experts JSON size is outside configured bounds")
+    _validate_route_contract(route_count, num_experts)
+
+
+def _validate_route_contract(route_count: int, num_experts: int) -> None:
+    if route_count < 1:
+        raise RuntimeError("ART routed-experts response contains no route arrays")
     if route_count > MAX_ROUTE_COUNT:
         raise RuntimeError("ART routed-experts route count exceeds configured bounds")
     if not 1 <= num_experts <= 65_536:

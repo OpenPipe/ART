@@ -2306,6 +2306,7 @@ class DistributedMegatronService:
             served_model_name=self._serving_lora_name(step),
             lora_path=lora_path,
             initial_policy_version=step,
+            initial_generation_id=self._generation_id_for_step(step),
             engine_args=self._engine_args(config),
             server_args=self._server_args(config),
         )
@@ -2437,6 +2438,7 @@ class DistributedMegatronService:
                 served_model_name=bootstrap_name,
                 lora_path=checkpoint,
                 initial_policy_version=serving_step,
+                initial_generation_id=generation_id,
             )
             self._vllm_sleeping = False
             capability = await discover_serving_capabilities(
@@ -2660,7 +2662,10 @@ class DistributedMegatronService:
                 "model_name": name,
                 "lora_slot": name,
                 "lora_path": path,
+                "operation_id": f"apply:{self._generation_id_for_step(step)}",
+                "adapter_source": path,
                 "generation_id": self._generation_id_for_step(step),
+                "expected_generation_id": self._generation_id_for_step(active_step),
                 "policy_version": step,
             }
             if in_flight

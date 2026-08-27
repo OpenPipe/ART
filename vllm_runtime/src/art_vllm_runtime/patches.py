@@ -38,17 +38,29 @@ def apply_vllm_runtime_patches() -> None:
 
 def subclass_chat_completion_request() -> None:
     from vllm.entrypoints.openai.chat_completion import protocol
+    from vllm.entrypoints.openai.completion import protocol as completion_protocol
 
-    if getattr(protocol, "_art_chat_completion_request_patched", False):
-        return
+    from art_vllm_runtime.route_uploads import S3PutGrant
 
-    class ChatCompletionRequest(protocol.ChatCompletionRequest):
-        logprobs: bool | None = True
-        top_logprobs: int | None = 0
-        return_token_ids: bool | None = True
+    if not getattr(protocol, "_art_chat_completion_request_patched", False):
 
-    protocol.ChatCompletionRequest = ChatCompletionRequest  # ty:ignore[invalid-assignment]
-    setattr(protocol, "_art_chat_completion_request_patched", True)
+        class ChatCompletionRequest(protocol.ChatCompletionRequest):
+            # Training callers opt into exact metadata. Ordinary OpenAI-compatible
+            # requests retain vLLM's defaults and response shape.
+            return_policy_spans: bool = False
+            route_upload: S3PutGrant | None = None
+
+        protocol.ChatCompletionRequest = ChatCompletionRequest  # ty:ignore[invalid-assignment]
+        setattr(protocol, "_art_chat_completion_request_patched", True)
+
+    if not getattr(completion_protocol, "_art_completion_request_patched", False):
+
+        class CompletionRequest(completion_protocol.CompletionRequest):
+            return_policy_spans: bool = False
+            route_upload: S3PutGrant | None = None
+
+        completion_protocol.CompletionRequest = CompletionRequest  # ty:ignore[invalid-assignment]
+        setattr(completion_protocol, "_art_completion_request_patched", True)
 
 
 def patch_nonstreaming_chat_response_offload() -> None:

@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "Tiny ART-owned vLLM runtime package"
 requires-python = ">=3.12,<3.13"
 dependencies = [
+    "httpx>=0.28.1,<1",
     "openai==2.53.0",
     "pydantic>=2.12.5",
     "transformers==5.12.1",

@@ -901,6 +901,11 @@ class ServerlessBackend:
             headers={"Authorization": f"Bearer {self._inference_api_key}"},
             allow_openai_compatible=False,
         )
+        uses_expert_replay = self._model_uses_expert_replay(model)
+        capabilities.require_trainable_generation(
+            expected_base_model=model.base_model,
+            require_binary_routes=uses_expert_replay,
+        )
         capabilities.require(
             "in_flight_lora_updates", operation="remote pipeline weight publication"
         )
@@ -909,7 +914,7 @@ class ServerlessBackend:
         )
         object.__setattr__(model, "_serving_capabilities", capabilities)
         object.__setattr__(model, "_inference_connection_errors_are_fatal", True)
-        if self._model_uses_expert_replay(model):
+        if uses_expert_replay:
             capabilities.require(
                 "binary_routed_experts", operation="remote MoE routing replay"
             )

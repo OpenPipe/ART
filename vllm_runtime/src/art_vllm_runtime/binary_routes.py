@@ -11,7 +11,9 @@ from typing import Any
 import numpy as np
 
 MAGIC = b"ARTRTE2\0"
+ROUTE_OBJECT_MAGIC = b"ARTROU2\0"
 HEADER = struct.Struct("<8sQII")
+ROUTE_OBJECT_HEADER = struct.Struct("<8sII")
 ROUTE_HEADER = struct.Struct("<IB3xQQQ")
 PIPELINE_ROUTES_ENV = "ART_VLLM_PIPELINE_ROUTES_PROTOCOL"
 PIPELINE_ROUTES_PROTOCOL = "1"
@@ -70,10 +72,38 @@ def routed_experts_response_chunks(
 ) -> tuple[bytes | memoryview, ...]:
     num_experts = int(num_experts or getattr(routes, "num_experts", 0))
     dtype = _route_dtype(num_experts)
-    chunks: list[bytes | memoryview] = [
+    route_chunks = _routed_expert_array_chunks(
+        routes, num_experts=num_experts, dtype=dtype
+    )
+    return (
         HEADER.pack(MAGIC, len(json_body), len(routes), num_experts),
         json_body,
-    ]
+        *route_chunks,
+    )
+
+
+def routed_experts_object_chunks(
+    routes: dict[int, np.ndarray],
+    *,
+    num_experts: int | None = None,
+) -> tuple[bytes | memoryview, ...]:
+    """Encode route arrays without duplicating the normal generation response."""
+
+    num_experts = int(num_experts or getattr(routes, "num_experts", 0))
+    dtype = _route_dtype(num_experts)
+    return (
+        ROUTE_OBJECT_HEADER.pack(ROUTE_OBJECT_MAGIC, len(routes), num_experts),
+        *_routed_expert_array_chunks(routes, num_experts=num_experts, dtype=dtype),
+    )
+
+
+def _routed_expert_array_chunks(
+    routes: dict[int, np.ndarray],
+    *,
+    num_experts: int,
+    dtype: np.dtype[Any],
+) -> tuple[bytes | memoryview, ...]:
+    chunks: list[bytes | memoryview] = []
     for choice_index, array in sorted(routes.items()):
         if array.ndim != 3:
             raise RuntimeError(f"Routed experts must have rank 3, got {array.shape}")

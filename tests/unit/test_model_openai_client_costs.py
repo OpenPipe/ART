@@ -6,6 +6,33 @@ import pytest
 from art import Model, TrainableModel
 from art.costs import build_cost_calculator, get_model_pricing
 from art.model import _OpenAIChatCompletionsProxy, _OpenAIClientProxy
+from art.serving_capabilities import (
+    ART_SERVING_PROTOCOL_VERSION,
+    ModelBackendCapabilities,
+    ServingCapabilities,
+)
+
+
+def _validated_model_backend() -> ModelBackendCapabilities:
+    return ModelBackendCapabilities(
+        schema_version=1,
+        base_model="test-model",
+        architectures=("Qwen3_5MoeForConditionalGeneration",),
+        backend="vllm",
+        backend_version="0.25.1",
+        validation_status="validated",
+        lora_implementation="native",
+        exact_token_ids=True,
+        exact_token_logprobs=True,
+        prompt_policy_spans=True,
+        decode_policy_spans=True,
+        in_flight_lora_updates=True,
+        active_request_kv_continuation=True,
+        new_request_policy_cache_isolation=True,
+        binary_route_capture=True,
+        route_capture_dcp=1,
+        route_capture_pcp=1,
+    )
 
 
 class _FakeUsage:
@@ -228,6 +255,8 @@ class TestModelOpenAIClientCosts:
         )
 
         assert model._default_chat_completion_extra_body() == {
+            "logprobs": True,
+            "top_logprobs": 0,
             "return_token_ids": True,
             "return_tokens_as_token_ids": True,
             "chat_template_kwargs": {
@@ -245,10 +274,99 @@ class TestModelOpenAIClientCosts:
         )
 
         assert model._default_chat_completion_extra_body() == {
+            "logprobs": True,
+            "top_logprobs": 0,
             "return_token_ids": True,
             "return_tokens_as_token_ids": True,
             "chat_template_kwargs": {"preserve_thinking": True},
         }
+
+    @pytest.mark.asyncio
+    async def test_trainable_request_explicitly_sends_exact_training_metadata(
+        self,
+    ) -> None:
+        observed: dict[str, Any] = {}
+
+        class Recorder:
+            async def create(self, *args: Any, **kwargs: Any) -> _FakeResponse:
+                observed.update(kwargs)
+                return _FakeResponse(1, 1)
+
+        model = TrainableModel(
+            run_name="test-run",
+            name="test-run",
+            project="test-project",
+            base_model="test-model",
+        )
+        proxy = _OpenAIChatCompletionsProxy(
+            Recorder(),
+            lambda _response: None,
+            model._default_chat_completion_extra_body(),
+        )
+
+        await proxy.create(
+            model="policy",
+            messages=[{"role": "user", "content": "hello"}],
+        )
+
+        assert observed["extra_body"] == {
+            "logprobs": True,
+            "top_logprobs": 0,
+            "return_token_ids": True,
+            "return_tokens_as_token_ids": True,
+            "chat_template_kwargs": {"preserve_thinking": True},
+        }
+
+    def test_trainable_model_requests_policy_spans_only_when_supported(self) -> None:
+        model = TrainableModel(
+            run_name="test-run",
+            name="test-run",
+            project="test-project",
+            base_model="test-model",
+        )
+        object.__setattr__(
+            model,
+            "_serving_capabilities",
+            ServingCapabilities(
+                runtime="art_vllm",
+                protocol_version=ART_SERVING_PROTOCOL_VERSION,
+                policy_token_spans=True,
+                model_backend=_validated_model_backend(),
+            ),
+        )
+
+        assert model._default_chat_completion_extra_body() == {
+            "logprobs": True,
+            "top_logprobs": 0,
+            "return_token_ids": True,
+            "return_tokens_as_token_ids": True,
+            "return_policy_spans": True,
+            "chat_template_kwargs": {"preserve_thinking": True},
+        }
+
+    def test_trainable_model_rejects_unvalidated_art_runtime(self) -> None:
+        model = TrainableModel(
+            run_name="test-run",
+            name="test-run",
+            project="test-project",
+            base_model="test-model",
+        )
+        model_backend = _validated_model_backend().model_copy(
+            update={"validation_status": "unvalidated"}
+        )
+        object.__setattr__(
+            model,
+            "_serving_capabilities",
+            ServingCapabilities(
+                runtime="art_vllm",
+                protocol_version=ART_SERVING_PROTOCOL_VERSION,
+                policy_token_spans=True,
+                model_backend=model_backend,
+            ),
+        )
+
+        with pytest.raises(RuntimeError, match="not validated"):
+            model._default_chat_completion_extra_body()
 
     def test_art_managed_model_preserves_prior_thinking_by_default(self) -> None:
         model = Model(name="test-model", project="test-project")
@@ -275,6 +393,8 @@ class TestModelOpenAIClientCosts:
         )
 
         assert model._default_chat_completion_extra_body() == {
+            "logprobs": True,
+            "top_logprobs": 0,
             "return_token_ids": True,
             "return_tokens_as_token_ids": True,
             "chat_template_kwargs": {"preserve_thinking": False},
