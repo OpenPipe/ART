@@ -47,6 +47,10 @@ from art.megatron.prefix_tree_packing import (
     estimate_prefix_tree_packed_tokens,
     prefix_tree_pack,
 )
+from art.trainer_rank._optimizer_semantics import (
+    require_uniform_optimizer_iterations,
+    shared_optimizer_iteration,
+)
 from art.trainer_rank._telemetry import phase as _telemetry_phase
 
 if TYPE_CHECKING:
@@ -1713,6 +1717,15 @@ class TrainerRank:
             raise TrainerRankSlotStateError(
                 "Optimizer residency parameter order differs from its master tensors."
             )
+        try:
+            shared_optimizer_iteration(
+                parameter_group,
+                (optimizer.state.get(master, {}) for master in dynamic.master_params),
+            )
+        except ValueError as exc:
+            raise TrainerRankSlotStateError(
+                "Optimizer residency iteration representation is invalid."
+            ) from exc
 
         # Residency moves the optimizer's live tensors. Optimizer overrides such as
         # TE FusedAdam.state_dict() materialize unscaled copies and cannot describe
@@ -1846,6 +1859,12 @@ class TrainerRank:
             dict(cast(Mapping[str, object], states.get(index, {})))
             for index in range(len(masters))
         )
+        try:
+            shared_optimizer_iteration(param_group, prepared_state)
+        except ValueError as exc:
+            raise TrainerRankSlotStateError(
+                "Prepared optimizer iteration representation is invalid."
+            ) from exc
         tensors = (*masters, *_nested_tensors(prepared_state))
         if any(tensor.device.type != "cpu" for tensor in tensors):
             raise TrainerRankSlotStateError(
@@ -1880,7 +1899,6 @@ class TrainerRank:
         )
         state: tuple[dict[str, object], ...] = tuple(
             {
-                "step": torch.zeros((), dtype=torch.float32),
                 "exp_avg": torch.zeros_like(master),
                 "exp_avg_sq": torch.zeros_like(master),
             }
@@ -1896,6 +1914,7 @@ class TrainerRank:
                 "bias_correction": True,
                 "betas": (defaults.beta1, defaults.beta2),
                 "eps": defaults.eps,
+                "step": 0,
                 "weight_decay": defaults.weight_decay,
             },
             valid_ranges=valid_ranges,
@@ -1955,6 +1974,12 @@ class TrainerRank:
             raise TrainerRankSlotStateError(
                 "Prepared optimizer parameter group does not own its master parameters."
             )
+        try:
+            shared_optimizer_iteration(state.param_group, state.state)
+        except ValueError as exc:
+            raise TrainerRankSlotStateError(
+                "Prepared optimizer iteration representation is invalid."
+            ) from exc
         optimizer.param_groups[0].update(state.param_group)
         optimizer.state.update(
             {
@@ -2945,6 +2970,7 @@ class TrainerRank:
             restored = load_custom_optimizer(
                 slot.custom_payload, tuple(key for key, _param in named)
             )
+            restored_iterations: list[object] = []
             for (key, _param), master in zip(named, masters[lora_count:], strict=True):
                 state = restored.get(key)
                 if state is not None:
@@ -2952,10 +2978,14 @@ class TrainerRank:
                     with torch.no_grad():
                         master.copy_(state.master.to(master.device))
                     optimizer.state[master] = {
-                        "step": torch.tensor(state.step, device=master.device),
                         "exp_avg": state.exp_avg.to(master.device).clone(),
                         "exp_avg_sq": state.exp_avg_sq.to(master.device).clone(),
                     }
+                    restored_iterations.append(state.step)
+            if restored_iterations:
+                optimizer.param_groups[0]["step"] = (
+                    require_uniform_optimizer_iterations(restored_iterations)
+                )
         return dynamic
 
     def _restore_canonical_optimizer(
@@ -2974,7 +3004,15 @@ class TrainerRank:
             master_params=state.masters,
         )
         dynamic.optimizer.param_groups[0]["eps"] = state.config["eps"]
-        for master, exp_avg, exp_avg_sq, step in zip(
+        try:
+            dynamic.optimizer.param_groups[0]["step"] = (
+                require_uniform_optimizer_iterations(state.steps)
+            )
+        except ValueError as exc:
+            raise TrainerRankSlotStateError(
+                f"Canonical optimizer iterations differ for checkpoint slot {name!r}."
+            ) from exc
+        for master, exp_avg, exp_avg_sq, _step in zip(
             dynamic.master_params,
             state.exp_avgs,
             state.exp_avg_sqs,
@@ -2988,7 +3026,6 @@ class TrainerRank:
                     f"Canonical optimizer moment shape does not match {name!r}"
                 )
             dynamic.optimizer.state[master] = {
-                "step": torch.tensor(step, dtype=torch.float32),
                 "exp_avg": exp_avg.to(master.device, torch.float32).clone(),
                 "exp_avg_sq": exp_avg_sq.to(master.device, torch.float32).clone(),
             }
@@ -3017,6 +3054,29 @@ class TrainerRank:
             raise TrainerRankSlotStateError(
                 f"Optimizer state for checkpoint slot {name!r} is incomplete."
             )
+        groups = optimizer_state.get("param_groups")
+        states = optimizer_state.get("state")
+        if (
+            not isinstance(groups, Sequence)
+            or len(groups) != 1
+            or not isinstance(groups[0], Mapping)
+            or not isinstance(states, Mapping)
+        ):
+            raise TrainerRankSlotStateError(
+                f"Optimizer state for checkpoint slot {name!r} is malformed."
+            )
+        try:
+            shared_optimizer_iteration(
+                groups[0],
+                (
+                    cast(Mapping[str, object], states.get(index, {}))
+                    for index in range(len(masters))
+                ),
+            )
+        except (TypeError, ValueError) as exc:
+            raise TrainerRankSlotStateError(
+                f"Optimizer iteration for checkpoint slot {name!r} is invalid."
+            ) from exc
         dynamic = self._new_dynamic_optimizer(
             name,
             AdamParams(learning_rate=0.0),
