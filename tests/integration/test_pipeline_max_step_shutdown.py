@@ -13,6 +13,7 @@ from art.distributed.rollout import (
     DistributedTrajectorySelection,
 )
 from art.pipeline_trainer import PipelineRuntimeConfig, PipelineTrainer
+from art.pipeline_trainer import trainer as trainer_module
 from art.training.contracts import OperationRef
 from art.types import TrainResult
 
@@ -177,6 +178,9 @@ class _ImmediateBackend:
         self.client = _ImmediateClient(run_id)
         self.prepared = 0
         self.finalized = 0
+        self.prepare_gate: asyncio.Event | None = None
+        self.prepare_started = asyncio.Event()
+        self.prepare_cancelled = asyncio.Event()
 
     async def _get_step(self, _model: TrainableModel) -> int:
         return self.client.projected_learner_version
@@ -196,6 +200,13 @@ class _ImmediateBackend:
     ) -> _ImmediateContext:
         del normalize_advantages, train_kwargs
         assert self.client.projected_learner_version == learner_parent_version
+        if self.prepare_gate is not None:
+            self.prepare_started.set()
+            try:
+                await self.prepare_gate.wait()
+            except asyncio.CancelledError:
+                self.prepare_cancelled.set()
+                raise
         self.prepared += 1
         context = _ImmediateContext(
             self.client,
@@ -311,4 +322,29 @@ async def test_sibling_clients_stop_cleanly_at_max_steps_with_async_packing(
                 for _step in range(3)
                 for kind in ("forward_backward", "optim_step", "save_sampler")
             ]
-        assert not _live_pipeline_tasks()
+    assert not _live_pipeline_tasks()
+
+
+@pytest.mark.asyncio
+async def test_stop_cancels_blocked_pack_ahead_preparation_before_stage_cutoff(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def no_log(*_args: object, **_kwargs: object) -> None:
+        return None
+
+    monkeypatch.setattr(TrainableModel, "log", no_log)
+    # Keep the real 25% cooperative-stage fraction while leaving enough event-
+    # loop time for both rollout workers to release their queue references.
+    monkeypatch.setattr(trainer_module, "_PIPELINE_SHUTDOWN_TIMEOUT_SECONDS", 0.4)
+    trainer, backend = _trainer(tmp_path, "blocked-prepare")
+    backend.prepare_gate = asyncio.Event()
+    operation = asyncio.create_task(trainer.train(handle_signals=False))
+    await asyncio.wait_for(backend.prepare_started.wait(), timeout=1)
+
+    trainer.request_stop()
+    await asyncio.wait_for(operation, timeout=1)
+
+    assert backend.prepare_cancelled.is_set()
+    assert isinstance(trainer._output_queue, DistributedTrajectoryQueue)
+    assert trainer._output_queue._closed
+    assert not _live_pipeline_tasks()

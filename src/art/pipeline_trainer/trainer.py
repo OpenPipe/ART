@@ -700,10 +700,14 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                     return_when=asyncio.FIRST_COMPLETED,
                 )
                 if not done:
+                    pending_names = ", ".join(
+                        sorted(task.get_name() for task in stages)
+                    )
                     failures.append(
                         _PipelineStageShutdownTimeout(
                             f"{len(stages)} pipeline stages did not stop cooperatively "
-                            "before the stage shutdown cutoff."
+                            "before the stage shutdown cutoff: "
+                            f"{pending_names}."
                         )
                     )
                     failures.extend(
@@ -1454,19 +1458,26 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                     group._collect_packing_shape = True
             started = time.monotonic()
             expected_step = packing_policy_step + 1
-            context = await prepare(
-                self.model,
-                batch,
-                normalize_advantages=self.normalize_advantages,
-                learner_parent_version=packing_policy_step,
-                train_kwargs=self._train_kwargs(
-                    packing_policy_step,
-                    should_checkpoint=(
-                        self.save_checkpoint and self._should_eval_step(expected_step)
+            prepared_context, context = await self._await_or_stop(
+                prepare(
+                    self.model,
+                    batch,
+                    normalize_advantages=self.normalize_advantages,
+                    learner_parent_version=packing_policy_step,
+                    train_kwargs=self._train_kwargs(
+                        packing_policy_step,
+                        should_checkpoint=(
+                            self.save_checkpoint
+                            and self._should_eval_step(expected_step)
+                        ),
                     ),
-                ),
+                )
             )
             preparation_s = time.monotonic() - started
+            if not prepared_context:
+                for group in batch:
+                    await self._discard_collected_group(group)
+                return
             if context is None:
                 if saw_sentinel:
                     await self._packed_queue.put(None)
@@ -1475,11 +1486,22 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
             forward: TrainingOperation[ForwardBackwardResult] | None = None
             try:
                 if self._admission_tail is not None:
-                    await asyncio.shield(self._admission_tail)
+                    tail_completed, _ = await self._await_or_stop(
+                        asyncio.shield(self._admission_tail)
+                    )
+                    if not tail_completed:
+                        await context.abort(
+                            None, None, None, optimizer_admitted=False
+                        )
+                        return
                 submit_started = time.monotonic()
-                forward = await context.forward_backward(
-                    context.client.next_sequence_id
+                forward_completed, forward = await self._await_or_stop(
+                    context.forward_backward(context.client.next_sequence_id)
                 )
+                if not forward_completed:
+                    await context.abort(None, None, None, optimizer_admitted=False)
+                    return
+                assert forward is not None
                 forward_submit_s = time.monotonic() - submit_started
                 if forward.ref.learner_parent_version != packing_policy_step:
                     raise RuntimeError(

@@ -25,7 +25,9 @@ class RolloutWorkerController:
                 self._reconcile()
                 if self.trainer._scenario_source_exhausted and not self._tasks:
                     break
-                await asyncio.sleep(0.25)
+                completed, _ = await self.trainer._await_or_stop(asyncio.sleep(0.25))
+                if not completed:
+                    return
         finally:
             for task in self._tasks.values():
                 task.cancel()
