@@ -4974,16 +4974,11 @@ class _GenerationPublisher:
                 planned,
             )
         elif prepared.publication_targets:
-            identity_started = time.perf_counter()
-            model_identity = payload.model_identity or prepared_safetensors_identity(
-                payload.tensors
-            )
-            identity_s = time.perf_counter() - identity_started
             self._transfer_lora_snapshot(
                 payload.lora,
                 prepared.publication_targets,
                 prepared_tensors=payload.tensors,
-                model_identity=model_identity,
+                model_identity=payload.model_identity,
             )
         return _SnapshotTransport(
             adapter=adapter,
@@ -4991,11 +4986,6 @@ class _GenerationPublisher:
                 "time/snapshot_transport_queue_s": started - submitted_at,
                 "time/snapshot_transport_wait_s": ready - started,
                 "time/snapshot_transport_s": time.perf_counter() - ready,
-                **(
-                    {"time/snapshot_transport_identity_s": identity_s}
-                    if prepared.publication_targets
-                    else {}
-                ),
             },
         )
 
@@ -5097,7 +5087,7 @@ class _GenerationPublisher:
         targets: tuple[Any, ...],
         *,
         prepared_tensors: PreparedSafetensors,
-        model_identity: FileIdentity,
+        model_identity: FileIdentity | None,
     ) -> None:
         from art.distributed.adapter_transport import AdapterSnapshotSender
 

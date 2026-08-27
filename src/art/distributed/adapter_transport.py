@@ -62,7 +62,7 @@ class AdapterReceiveResult(_TransportRecord):
 class AdapterTransferNotification(_TransportRecord):
     generation_id: str = Field(min_length=1)
     used_bytes: int = Field(gt=0)
-    model_identity: FileIdentity
+    model_identity: FileIdentity | None = None
     config_identity: FileIdentity
     adapter_config_b64: str = Field(min_length=1)
     sender_staging_s: float = Field(ge=0)
@@ -316,7 +316,7 @@ class AdapterSnapshotReceiver:
             raise RuntimeError(f"Adapter transfer path already exists: {path}")
         try:
             path.mkdir(parents=True)
-            save_prepared_safetensors(
+            model_identity = save_prepared_safetensors(
                 PreparedSafetensors(
                     (pending.slot.block.narrow(0, 0, notification.used_bytes),)
                 ),
@@ -345,7 +345,7 @@ class AdapterSnapshotReceiver:
             host_id=self.host_id,
             generation_id=generation_id,
             path=str(path),
-            model_identity=notification.model_identity,
+            model_identity=model_identity,
             config_identity=notification.config_identity,
             materialization_s=materialization_s,
             slot_id=pending.target.slot_id,
@@ -528,7 +528,7 @@ class NixlAdapterSender:
         adapter_config: bytes,
         targets: tuple[AdapterTransferTarget, ...],
         *,
-        model_identity: FileIdentity,
+        model_identity: FileIdentity | None,
         config_identity: FileIdentity,
     ) -> None:
         if not targets:
@@ -537,7 +537,7 @@ class NixlAdapterSender:
         if any(target.generation_id != first.generation_id for target in targets[1:]):
             raise RuntimeError("Adapter transfer targets disagree")
         used_bytes = payload.nbytes
-        if model_identity.size_bytes != used_bytes:
+        if model_identity is not None and model_identity.size_bytes != used_bytes:
             raise RuntimeError("Adapter payload identity size does not match payload")
         if any(used_bytes > target.capacity_bytes for target in targets):
             raise RuntimeError("Adapter payload exceeds prepared receive capacity")
@@ -654,7 +654,7 @@ class AdapterSnapshotSender:
         targets: tuple[AdapterTransferTarget, ...],
         *,
         prepared_tensors: PreparedSafetensors,
-        model_identity: FileIdentity,
+        model_identity: FileIdentity | None,
     ) -> None:
         from art.megatron.model_support.lora_disk import encode_adapter_config
 
@@ -695,7 +695,7 @@ class AdapterSnapshotSender:
         *,
         adapter_config: bytes,
         prepared_tensors: PreparedSafetensors,
-        model_identity: FileIdentity,
+        model_identity: FileIdentity | None,
         config_identity: FileIdentity,
     ) -> None:
         from art.megatron.model_support.lora_disk import save_vllm_lora_tensors
@@ -712,15 +712,16 @@ class AdapterSnapshotSender:
                 prepared_tensors=prepared_tensors,
                 model_identity=model_identity,
             )
+            resolved_model_identity = identities["adapter_model.safetensors"]
             if identities != {
                 "adapter_config.json": config_identity,
-                "adapter_model.safetensors": model_identity,
+                "adapter_model.safetensors": resolved_model_identity,
             }:
                 raise RuntimeError("local adapter identities changed while saving")
             notification = AdapterTransferNotification(
                 generation_id=target.generation_id,
                 used_bytes=prepared_tensors.nbytes,
-                model_identity=model_identity,
+                model_identity=resolved_model_identity,
                 config_identity=config_identity,
                 adapter_config_b64=base64.b64encode(adapter_config).decode(),
                 sender_staging_s=time.monotonic() - started,
