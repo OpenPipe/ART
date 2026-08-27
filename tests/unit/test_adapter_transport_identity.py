@@ -5,7 +5,11 @@ from types import SimpleNamespace
 import torch
 
 from art.distributed import adapter_transport
-from art.utils.safetensors import FileIdentity, PreparedSafetensors
+from art.utils.safetensors import (
+    FileIdentity,
+    PreparedSafetensors,
+    prepare_safetensors,
+)
 
 
 def test_nixl_receiver_computes_identity_from_received_bytes(tmp_path) -> None:
@@ -53,3 +57,41 @@ def test_nixl_receiver_computes_identity_from_received_bytes(tmp_path) -> None:
     assert (tmp_path / generation_id / "adapter_model.safetensors").read_bytes() == bytes(
         payload.tolist()
     )
+
+
+def test_local_receiver_computes_identity_from_materialized_file(
+    tmp_path, monkeypatch
+) -> None:
+    generation_id = "generation-local"
+    tensors = {"weight": torch.arange(32, dtype=torch.bfloat16)}
+    prepared = prepare_safetensors(tensors)
+    template = tmp_path / "template"
+    template.mkdir()
+    (template / "adapter_model.safetensors").write_bytes(b"0" * prepared.nbytes)
+    monkeypatch.setenv("ART_LOCAL_ADAPTER_TRANSFER_ROOT", str(tmp_path / "local"))
+    receiver = adapter_transport.AdapterSnapshotReceiver(
+        "host-1", str(tmp_path / "receiver")
+    )
+    target = receiver.prepare(
+        generation_id, str(template), transport="local", timeout_s=1.0
+    )
+    snapshot = SimpleNamespace(
+        tensors=tensors,
+        adapter_config={"base_model_name_or_path": "fixture"},
+    )
+
+    adapter_transport.AdapterSnapshotSender().send(
+        snapshot,
+        (target,),
+        prepared_tensors=prepared,
+        model_identity=None,
+    )
+    result = receiver.poll(generation_id)
+
+    assert result is not None
+    payload = (tmp_path / "local" / "host-1" / generation_id / "adapter_model.safetensors")
+    assert result.model_identity == FileIdentity(
+        size_bytes=payload.stat().st_size,
+        sha256=hashlib.sha256(payload.read_bytes()).hexdigest(),
+    )
+    receiver.release(generation_id)

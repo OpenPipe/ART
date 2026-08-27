@@ -18,6 +18,7 @@ from art.utils.safetensors import (
     FileIdentity,
     PreparedSafetensors,
     save_prepared_safetensors,
+    write_prepared_safetensors,
 )
 
 
@@ -378,16 +379,26 @@ class AdapterSnapshotReceiver:
             if not model_path.is_file() or not config_path.is_file():
                 raise RuntimeError("local adapter transfer is incomplete")
             if (
-                model_path.stat().st_size != notification.model_identity.size_bytes
+                model_path.stat().st_size != notification.used_bytes
                 or config_path.stat().st_size != notification.config_identity.size_bytes
             ):
                 raise RuntimeError("local adapter materialization changed size")
+            with model_path.open("rb", buffering=0) as model_file:
+                model_identity = FileIdentity(
+                    size_bytes=notification.used_bytes,
+                    sha256=hashlib.file_digest(model_file, "sha256").hexdigest(),
+                )
+            if (
+                notification.model_identity is not None
+                and model_identity != notification.model_identity
+            ):
+                raise RuntimeError("local adapter materialization changed identity")
             self._materialized.add(generation_id)
             return AdapterReceiveResult(
                 host_id=self.host_id,
                 generation_id=generation_id,
                 path=str(path),
-                model_identity=notification.model_identity,
+                model_identity=model_identity,
                 config_identity=notification.config_identity,
                 materialization_s=notification.sender_staging_s,
                 slot_id=pending.target.slot_id,
@@ -680,7 +691,6 @@ class AdapterSnapshotSender:
             )
             return
         self._send_local(
-            snapshot,
             targets,
             adapter_config=config,
             prepared_tensors=prepared_tensors,
@@ -690,7 +700,6 @@ class AdapterSnapshotSender:
 
     @staticmethod
     def _send_local(
-        snapshot: Any,
         targets: tuple[AdapterTransferTarget, ...],
         *,
         adapter_config: bytes,
@@ -698,30 +707,23 @@ class AdapterSnapshotSender:
         model_identity: FileIdentity | None,
         config_identity: FileIdentity,
     ) -> None:
-        from art.megatron.model_support.lora_disk import save_vllm_lora_tensors
-
         first = targets[0]
         if any(target.generation_id != first.generation_id for target in targets):
             raise RuntimeError("local adapter transfer target changed")
         for target in targets:
             started = time.monotonic()
-            identities = save_vllm_lora_tensors(
-                target.path,
-                snapshot.tensors,
-                snapshot.adapter_config,
-                prepared_tensors=prepared_tensors,
-                model_identity=model_identity,
+            path = Path(target.path)
+            path.mkdir(parents=True, exist_ok=True)
+            write_prepared_safetensors(
+                prepared_tensors, path / "adapter_model.safetensors"
             )
-            resolved_model_identity = identities["adapter_model.safetensors"]
-            if identities != {
-                "adapter_config.json": config_identity,
-                "adapter_model.safetensors": resolved_model_identity,
-            }:
-                raise RuntimeError("local adapter identities changed while saving")
+            written = (path / "adapter_config.json").write_bytes(adapter_config)
+            if written != config_identity.size_bytes:
+                raise RuntimeError("local adapter config write was incomplete")
             notification = AdapterTransferNotification(
                 generation_id=target.generation_id,
                 used_bytes=prepared_tensors.nbytes,
-                model_identity=resolved_model_identity,
+                model_identity=model_identity,
                 config_identity=config_identity,
                 adapter_config_b64=base64.b64encode(adapter_config).decode(),
                 sender_staging_s=time.monotonic() - started,

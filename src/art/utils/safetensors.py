@@ -274,6 +274,19 @@ def save_prepared_safetensors(
     return FileIdentity(size_bytes=prepared.nbytes, sha256=digest.result())
 
 
+def write_prepared_safetensors(
+    prepared: PreparedSafetensors,
+    path: Path,
+) -> None:
+    """Atomically write a prepared payload when the receiver owns verification."""
+    buffers = [memoryview(chunk.numpy()) for chunk in prepared.chunks]
+    with tempfile.TemporaryDirectory(dir=path.parent) as temp_dir:
+        temporary_path = Path(temp_dir) / path.name
+        with temporary_path.open("wb", buffering=0) as output:
+            _writev_all(output.fileno(), buffers)
+        temporary_path.replace(path)
+
+
 def save_safetensors(tensors: dict[str, torch.Tensor], path: Path) -> FileIdentity:
     """Stream CPU tensor buffers without copying them into GIL-held bytes."""
     return save_prepared_safetensors(prepare_safetensors(tensors), path)
