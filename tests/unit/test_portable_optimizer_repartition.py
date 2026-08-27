@@ -112,7 +112,11 @@ class _PaddedExpertDestinationModule:
 
 
 def _archive(
-    *, source_rank: int, values: dict[str, float], shape: tuple[int, ...] = (2, 3)
+    *,
+    source_rank: int,
+    values: dict[str, float],
+    shape: tuple[int, ...] = (2, 3),
+    source_world_size: int = 2,
 ) -> LoadedPortableOptimizerArchive:
     keys = tuple(sorted(values))
     tensors = {
@@ -127,7 +131,7 @@ def _archive(
     return LoadedPortableOptimizerArchive(
         metadata=PortableOptimizerArchiveMetadata(
             source_rank=source_rank,
-            source_world_size=2,
+            source_world_size=source_world_size,
             logical_keys=keys,
             steps={key: value + 30.0 for key, value in values.items()},
             param_group={"lr": 3e-5, "betas": [0.9, 0.95]},
@@ -218,17 +222,19 @@ def test_shared_outer_reconstruction_combines_shared_and_expert_keys() -> None:
     assert state["optimizer"]["state"][1]["step"].item() == 32.0
 
 
-def test_ep2_source_semantics_reconstruct_into_ep1_destination() -> None:
+def test_cp2_ep2_source_semantics_reconstruct_into_cp2_ep1_destination() -> None:
     """Compare logical Adam state, not source/destination layout bytes.
 
-    The two archives model source EP2 ownership. The one destination parameter
-    per LoRA side models EP1. CP and packed length are intentionally absent from
-    reconstruction because neither changes logical optimizer state.
+    Four archives model CP2/EP2 source ownership, including the CP ranks that
+    contribute no additional logical keys. One destination parameter per LoRA
+    side models EP1 on each CP rank. Packed length is intentionally absent from
+    reconstruction because it does not change logical optimizer state.
     """
     source = reconstruct_portable_optimizer_components(
         (
             _archive(
                 source_rank=0,
+                source_world_size=4,
                 values={
                     "layer.0.lora_A.weight": 1.0,
                     "layer.0.lora_B.weight": 2.0,
@@ -236,11 +242,17 @@ def test_ep2_source_semantics_reconstruct_into_ep1_destination() -> None:
             ),
             _archive(
                 source_rank=1,
+                source_world_size=4,
                 values={
                     "layer.1.lora_A.weight": 1.0,
                     "layer.1.lora_B.weight": 2.0,
                 },
             ),
+            # The other CP replica contributes no additional logical state.
+            # Its empty archives still prove that zero-key source ranks are a
+            # valid part of the topology-neutral generation.
+            _archive(source_rank=2, source_world_size=4, values={}),
+            _archive(source_rank=3, source_world_size=4, values={}),
         )
     )
     module = _PaddedExpertDestinationModule((0, 1))
@@ -257,25 +269,35 @@ def test_ep2_source_semantics_reconstruct_into_ep1_destination() -> None:
         ),
     }
 
-    restored = reconstruct_trainer_rank_optimizer_state(
-        source, sites, destination_layout
+    # Both destination CP ranks reconstruct the same topology-neutral semantic
+    # state despite different source ownership and a changed physical layout.
+    restored_by_cp_rank = tuple(
+        reconstruct_trainer_rank_optimizer_state(source, sites, destination_layout)
+        for _destination_cp_rank in range(2)
     )
 
-    for parameter_index, suffix in enumerate(("lora_A", "lora_B")):
-        state = restored["optimizer"]["state"][parameter_index]
-        for expert_index in range(2):
-            key = f"layer.{expert_index}.{suffix}.weight"
-            torch.testing.assert_close(
-                restored["master_params"][parameter_index][expert_index],
-                source.master[key],
-            )
-            torch.testing.assert_close(
-                state["exp_avg"][expert_index], source.exp_avg[key]
-            )
-            torch.testing.assert_close(
-                state["exp_avg_sq"][expert_index], source.exp_avg_sq[key]
-            )
-            assert state["step"].item() == source.steps[key]
+    for restored in restored_by_cp_rank:
+        for parameter_index, suffix in enumerate(("lora_A", "lora_B")):
+            state = restored["optimizer"]["state"][parameter_index]
+            for expert_index in range(2):
+                key = f"layer.{expert_index}.{suffix}.weight"
+                torch.testing.assert_close(
+                    restored["master_params"][parameter_index][expert_index],
+                    source.master[key],
+                )
+                torch.testing.assert_close(
+                    state["exp_avg"][expert_index], source.exp_avg[key]
+                )
+                torch.testing.assert_close(
+                    state["exp_avg_sq"][expert_index], source.exp_avg_sq[key]
+                )
+                assert state["step"].item() == source.steps[key]
+
+    for parameter_index in range(2):
+        torch.testing.assert_close(
+            restored_by_cp_rank[0]["master_params"][parameter_index],
+            restored_by_cp_rank[1]["master_params"][parameter_index],
+        )
 
 
 def test_logical_optimizer_localizes_into_new_destination_shards() -> None:

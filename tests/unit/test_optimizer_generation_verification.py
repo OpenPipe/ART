@@ -1,5 +1,6 @@
 import asyncio
 import hashlib
+import json
 from pathlib import Path
 import threading
 
@@ -30,7 +31,9 @@ _DIGEST = "0" * 64
 _GENERATION = f"step-00000001-{'1' * 32}"
 
 
-def _generation(root: Path) -> tuple[Path, OptimizerAdapter]:
+def _generation(
+    root: Path, *, optimizer_semantic_sha256: str = "1" * 64
+) -> tuple[Path, OptimizerAdapter]:
     adapter_path = root.parent / f"{root.name}-adapter"
     adapter_path.mkdir()
     (adapter_path / "adapter_config.json").write_bytes(b"c")
@@ -57,7 +60,7 @@ def _generation(root: Path) -> tuple[Path, OptimizerAdapter]:
         step=1,
         adapter=adapter,
         runtime_sha256=_DIGEST,
-        optimizer_semantic_sha256="1" * 64,
+        optimizer_semantic_sha256=optimizer_semantic_sha256,
         world_size=1,
         topology=OptimizerTopology(
             world_size=1,
@@ -100,7 +103,10 @@ def test_generation_verification_rejects_same_size_shard_corruption(
         verify_optimizer_generation(str(tmp_path), _GENERATION)
 
 
-def test_logical_optimizer_manifest_rejects_pre_semantic_format() -> None:
+@pytest.mark.parametrize("old_format", [3, 4])
+def test_logical_optimizer_manifest_rejects_pre_semantic_format(
+    old_format: int,
+) -> None:
     manifest = build_optimizer_manifest(
         generation=_GENERATION,
         step=1,
@@ -140,7 +146,7 @@ def test_logical_optimizer_manifest_rejects_pre_semantic_format() -> None:
         ],
     )
     payload = manifest.model_dump(mode="json")
-    payload["format_version"] = 4
+    payload["format_version"] = old_format
     with pytest.raises(ValueError, match="format_version"):
         OptimizerGenerationManifest.model_validate(payload)
 
@@ -283,8 +289,37 @@ def test_rank_loader_authenticates_the_verified_manifest(tmp_path: Path) -> None
         )
 
 
-def test_rank_loader_rejects_a_different_logical_runtime(tmp_path: Path) -> None:
-    _shard, adapter = _generation(tmp_path)
+def _runtime_semantic_sha256(*, optimizer_implementation: str) -> str:
+    payload = {
+        "model": "same-model",
+        "lora": {
+            "rank": 1,
+            "targets": ["experts"],
+            "parameterization": "shared_outer",
+        },
+        "optimizer": {
+            "implementation": optimizer_implementation,
+            "algorithm": "adamw",
+            "state_schema": ["master", "exp_avg", "exp_avg_sq", "step"],
+            "parameter_group_construction": "one_group_residency_order_v1",
+        },
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def test_rank_loader_rejects_same_model_lora_with_incompatible_optimizer_semantics(
+    tmp_path: Path,
+) -> None:
+    saved_semantics = _runtime_semantic_sha256(
+        optimizer_implementation="transformer_engine.FusedAdam"
+    )
+    incompatible_semantics = _runtime_semantic_sha256(
+        optimizer_implementation="torch.optim.AdamW"
+    )
+    _shard, adapter = _generation(
+        tmp_path, optimizer_semantic_sha256=saved_semantics
+    )
     receipt = verify_optimizer_generation(str(tmp_path), _GENERATION)
 
     with pytest.raises(RuntimeError, match="logical runtime mismatch"):
@@ -294,7 +329,7 @@ def test_rank_loader_rejects_a_different_logical_runtime(tmp_path: Path) -> None
             adapter_step=adapter.step,
             optimizer_generation_id=_GENERATION,
             verification=receipt,
-            expected_optimizer_semantic_sha256="2" * 64,
+            expected_optimizer_semantic_sha256=incompatible_semantics,
             layout={},
             sites=(),
             expected_shapes={},
