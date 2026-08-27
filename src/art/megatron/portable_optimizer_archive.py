@@ -13,6 +13,11 @@ import torch
 
 from art.megatron.tensor_snapshot import PinnedCpuSnapshotStager
 from art.megatron.weights.rank_distributed_types import RankDistributedLoraStats
+from art.trainer_rank._optimizer_semantics import (
+    optimizer_iteration,
+    require_uniform_optimizer_iterations,
+    shared_optimizer_iteration,
+)
 from art.utils.safetensors import (
     FileIdentity,
     PreparedSafetensors,
@@ -48,8 +53,11 @@ def portable_optimizer_semantic_contract() -> dict[str, object]:
         "capturable": False,
         "trainer_rank_state_format": 1,
         "logical_archive_format": "art_logical_safetensors_v1",
-        "logical_archive_metadata_format": 1,
-        "parameter_state": ("master", "exp_avg", "exp_avg_sq", "step"),
+        "logical_archive_metadata_format": 2,
+        "parameter_state": ("master", "exp_avg", "exp_avg_sq"),
+        "optimizer_iteration": (
+            "one_shared_group_counter_projected_per_logical_parameter_v1"
+        ),
         "parameter_groups": (
             "one_group_all_checkpoint_slot_parameters_in_residency_order_v1"
         ),
@@ -75,7 +83,7 @@ __all__ = (
 class PortableOptimizerArchiveMetadata(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    format_version: Literal[1] = 1
+    format_version: Literal[2] = 2
     source_rank: int = Field(ge=0)
     source_world_size: int = Field(ge=1)
     logical_keys: tuple[str, ...]
@@ -98,8 +106,15 @@ class PortableOptimizerArchiveMetadata(BaseModel):
             raise ValueError(
                 "portable optimizer param-group metadata cannot contain params"
             )
+        if "step" not in self.param_group:
+            raise ValueError("portable optimizer param-group metadata requires step")
+        group_iteration = optimizer_iteration(self.param_group["step"])
         if any(not math.isfinite(step) or step < 0 for step in self.steps.values()):
             raise ValueError("portable optimizer steps must be finite and nonnegative")
+        if any(step != group_iteration for step in self.steps.values()):
+            raise ValueError(
+                "portable optimizer logical steps differ from the shared group step"
+            )
         return self
 
 
@@ -459,6 +474,16 @@ def reconstruct_trainer_rank_optimizer_state(
     ):
         raise ValueError("destination optimizer layout differs from prepared sites")
 
+    if "step" not in components.param_group:
+        raise ValueError("portable optimizer parameter group is missing step")
+    group_iteration = optimizer_iteration(components.param_group["step"])
+    if components.steps and (
+        require_uniform_optimizer_iterations(components.steps.values())
+        != group_iteration
+    ):
+        raise ValueError(
+            "portable optimizer logical steps differ from the shared group step"
+        )
     masters: list[torch.Tensor] = []
     optimizer_state: dict[int, dict[str, object]] = {}
     component_maps = {
@@ -511,7 +536,6 @@ def reconstruct_trainer_rank_optimizer_state(
         optimizer_state[index] = {
             "exp_avg": localized["exp_avg"],
             "exp_avg_sq": localized["exp_avg_sq"],
-            "step": torch.tensor(next(iter(parameter_steps)), dtype=torch.float32),
         }
 
     return cast(
@@ -525,6 +549,7 @@ def reconstruct_trainer_rank_optimizer_state(
                 "param_groups": [
                     {
                         **components.param_group,
+                        "step": group_iteration,
                         "params": list(range(len(masters))),
                     }
                 ],
@@ -577,6 +602,14 @@ def _optimizer_components(
         raise ValueError("optimizer parameter indices differ from master order")
     if any(not isinstance(key, str) for key in raw_group):
         raise ValueError("optimizer param-group keys must be strings")
+    group_iteration = shared_optimizer_iteration(
+        raw_group,
+        (
+            cast(Mapping[str, object], states.get(index, {}))
+            for index in range(len(masters))
+        ),
+    )
+    raw_group["step"] = group_iteration
     param_group = {str(key): _as_json_value(value) for key, value in raw_group.items()}
 
     if any(
@@ -590,7 +623,7 @@ def _optimizer_components(
         values = states.get(index, {})
         if not isinstance(values, Mapping):
             raise ValueError("optimizer parameter state must be a mapping")
-        unexpected = set(values).difference({"exp_avg", "exp_avg_sq", "step"})
+        unexpected = set(values).difference({"exp_avg", "exp_avg_sq"})
         if unexpected:
             raise ValueError(
                 f"unsupported optimizer parameter state: {sorted(map(str, unexpected))}"
@@ -612,21 +645,8 @@ def _optimizer_components(
             raise ValueError("optimizer moments differ from their master tensor")
         exp_avgs.append(avg)
         exp_avg_sqs.append(avg_sq)
-        steps.append(_optimizer_step(values.get("step", 0.0)))
+        steps.append(float(group_iteration))
     return masters, tuple(exp_avgs), tuple(exp_avg_sqs), tuple(steps), param_group
-
-
-def _optimizer_step(value: object) -> float:
-    if isinstance(value, torch.Tensor):
-        if value.device.type != "cpu" or value.numel() != 1:
-            raise ValueError("optimizer step tensor must be one CPU scalar")
-        value = value.item()
-    if type(value) not in {int, float}:
-        raise ValueError("optimizer step must be numeric")
-    step = float(cast(int | float, value))
-    if not math.isfinite(step) or step < 0:
-        raise ValueError("optimizer step must be finite and nonnegative")
-    return step
 
 
 def _as_json_value(value: object) -> JsonValue:

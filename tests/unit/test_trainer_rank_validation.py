@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Iterable
+import copy
 from dataclasses import dataclass
 from datetime import timedelta
 import gc
@@ -61,6 +62,10 @@ from art.trainer_rank._impl import (
     _MemoryProfile,
     _validate_top_k,
 )
+from art.trainer_rank._optimizer_semantics import (
+    require_uniform_optimizer_iterations,
+    shared_optimizer_iteration,
+)
 
 if TYPE_CHECKING:
     from art.megatron.lora import LoRASlotRef
@@ -69,10 +74,35 @@ if TYPE_CHECKING:
 
 @pytest.fixture(autouse=True)
 def _cpu_dynamic_optimizer(monkeypatch: pytest.MonkeyPatch) -> None:
+    class SharedStepAdamW(torch.optim.AdamW):
+        """CPU oracle exposing TE FusedAdam's one-counter group layout."""
+
+        def step(self, closure: object = None) -> object:
+            for group in self.param_groups:
+                current = int(group.get("step", 0))
+                for parameter in group["params"]:
+                    state = self.state.get(parameter, {})
+                    if state:
+                        state["step"] = torch.tensor(float(current))
+            result = super().step(closure=closure)
+            for group in self.param_groups:
+                states = tuple(
+                    self.state.get(parameter, {}) for parameter in group["params"]
+                )
+                projected = tuple(state["step"] for state in states if "step" in state)
+                group["step"] = (
+                    current
+                    if not projected
+                    else require_uniform_optimizer_iterations(projected)
+                )
+                for state in states:
+                    state.pop("step", None)
+            return result
+
     def build(
         params: Iterable[torch.nn.Parameter], config: AdamParams
     ) -> torch.optim.Optimizer:
-        return torch.optim.AdamW(
+        return SharedStepAdamW(
             params,
             lr=config.learning_rate,
             betas=(config.beta1, config.beta2),
@@ -2359,12 +2389,15 @@ def test_canonical_optimizer_state_reproduces_exact_next_step(
     assert dynamic is not None
     optimizer_state = dynamic.optimizer.state[dynamic.master_params[0]]
     group = dynamic.optimizer.param_groups[0]
+    iteration = shared_optimizer_iteration(group, (optimizer_state,))
+    assert iteration == 1
+    assert "step" not in optimizer_state
     beta1, beta2 = cast(tuple[float, float], group["betas"])
     state = LocalOptimizerState(
         masters=tuple(param.detach().clone() for param in dynamic.master_params),
         exp_avgs=(cast(torch.Tensor, optimizer_state["exp_avg"]).clone(),),
         exp_avg_sqs=(cast(torch.Tensor, optimizer_state["exp_avg_sq"]).clone(),),
-        steps=(float(cast(torch.Tensor, optimizer_state["step"]).item()),),
+        steps=(float(iteration),),
         config=OptimizerConfig(
             learning_rate=float(group["lr"]),
             beta1=beta1,
@@ -2394,6 +2427,38 @@ def test_canonical_optimizer_state_reproduces_exact_next_step(
         original_optimizer.optimizer.state_dict(),
     )
     assert original._checkpoint_slots["student"].revision == 2
+
+
+def test_dynamic_optimizer_rejects_legacy_per_parameter_iterations(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trainer, param = _trainer_with_checkpoint(monkeypatch, torch.ones(1))
+    param.grad = torch.ones_like(param)
+    trainer.optim_step(params=AdamParams(learning_rate=1e-3))
+    existing = trainer._checkpoint_slots["student"].optimizer
+    assert existing is not None
+    layout = {"parallel": (), "parameters": ()}
+    monkeypatch.setattr(trainer, "_dynamic_optimizer_layout", lambda _name: layout)
+    state = cast(
+        Any,
+        {
+            "format_version": 1,
+            "layout": layout,
+            "master_params": tuple(
+                master.detach().clone() for master in existing.master_params
+            ),
+            "optimizer": copy.deepcopy(existing.optimizer.state_dict()),
+        },
+    )
+    group = state["optimizer"]["param_groups"][0]
+    iteration = group.pop("step")
+    for values in state["optimizer"]["state"].values():
+        values["step"] = torch.tensor(float(iteration))
+
+    with pytest.raises(TrainerRankSlotStateError, match="iteration.*invalid"):
+        trainer.restore_checkpoint_slot_optimizer_state("student", state)
+
+    assert trainer._checkpoint_slots["student"].optimizer is existing
 
 
 def test_dynamic_optimizer_keeps_fp32_master_weight_and_moments(
