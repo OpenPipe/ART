@@ -29,6 +29,50 @@ def test_vllm_start_releases_the_host_service_mailbox() -> None:
 
 
 @pytest.mark.asyncio
+async def test_megatron_runtime_override_is_sent_to_host_service(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import art.distributed.art_runtime as art_runtime
+
+    runtime_python = "/runtime/.venv/bin/art-megatron-python"
+    monkeypatch.setenv("ART_MEGATRON_RUNTIME_PYTHON", runtime_python)
+    runtime = art_runtime.ArtRuntime(
+        object(),
+        cast(
+            Any,
+            SimpleNamespace(
+                cluster=SimpleNamespace(nixl_transport=None, artifact_root=None)
+            ),
+        ),
+    )
+    endpoint = object()
+    runtime._host_services = {
+        "host": SimpleNamespace(ensure_megatron_runtime=endpoint)
+    }
+    info = SimpleNamespace(
+        model_dump_json=lambda: "runtime-contract",
+        profile="cuda13",
+        variant="hybrid_ep",
+        runtime=SimpleNamespace(sha256="runtime-sha"),
+    )
+    calls: list[tuple[object, tuple[object, ...]]] = []
+
+    async def call_remote(target: object, *args: object) -> object:
+        calls.append((target, args))
+        return info
+
+    monkeypatch.setattr(art_runtime, "call_remote", call_remote)
+
+    assert (
+        await runtime._ensure_megatron_runtime(
+            ("host",), require_hybrid_ep=True, multinode=False
+        )
+        is info
+    )
+    assert calls == [(endpoint, (True, False, runtime_python))]
+
+
+@pytest.mark.asyncio
 async def test_publication_wait_is_reserved_before_next_train_can_expire_it() -> None:
     from art.megatron.runtime.monarch import (
         MonarchTrainerRun,

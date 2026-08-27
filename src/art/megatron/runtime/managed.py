@@ -418,6 +418,7 @@ def ensure_megatron_runtime(
     art_build_sha256: str,
     require_hybrid_ep: bool = False,
     multinode: bool = False,
+    runtime_python: str | None = None,
 ) -> MegatronRuntimeInfo:
     if multinode and not require_hybrid_ep:
         raise ValueError("multi-node HybridEP requires require_hybrid_ep=True")
@@ -430,7 +431,7 @@ def ensure_megatron_runtime(
         else "base"
     )
     managed = False
-    if override := os.environ.get("ART_MEGATRON_RUNTIME_PYTHON"):
+    if override := runtime_python or os.environ.get("ART_MEGATRON_RUNTIME_PYTHON"):
         python = Path(override).expanduser().resolve()
         identity = hashlib.sha256(
             f"{art_build_sha256}:{python}:{variant}".encode()

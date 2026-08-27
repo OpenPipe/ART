@@ -5,6 +5,7 @@ from collections import Counter
 from collections.abc import Awaitable, Callable
 from contextlib import AsyncExitStack
 import logging
+import os
 import time
 from typing import Any, Literal
 from urllib.parse import urlparse
@@ -174,6 +175,9 @@ class ArtRuntime:
             tuple[str, tuple[tuple[str, GpuId], ...], str, str | None]
         ] = set()
         self._runtime_packages = runtime_package_names(trainer=False)
+        self._megatron_runtime_python = os.environ.get(
+            "ART_MEGATRON_RUNTIME_PYTHON"
+        )
         self._trainer_runtime_cache: dict[
             tuple[tuple[str, ...], bool, bool], MegatronRuntimeInfo
         ] = {}
@@ -420,6 +424,7 @@ class ArtRuntime:
                     self._host_services[host_id].ensure_megatron_runtime,
                     require_hybrid_ep,
                     multinode,
+                    self._megatron_runtime_python,
                 )
                 for host_id in host_ids
             )

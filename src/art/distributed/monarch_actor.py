@@ -294,7 +294,9 @@ class ArtHostService(Actor):
         self._nccl_sessions: dict[str, tuple[float, asyncio.Task[None]]] = {}
         self._nccl_tasks: dict[str, asyncio.Task[Any]] = {}
         self._cancelled_nccl_probes: set[str] = set()
-        self._megatron_runtimes: dict[tuple[bool, bool], MegatronRuntimeInfo] = {}
+        self._megatron_runtimes: dict[
+            tuple[bool, bool, str | None], MegatronRuntimeInfo
+        ] = {}
         self._managed_etcd = None
 
     @resilient_endpoint
@@ -337,11 +339,14 @@ class ArtHostService(Actor):
 
     @resilient_endpoint
     async def ensure_megatron_runtime(
-        self, require_hybrid_ep: bool, multinode: bool
+        self,
+        require_hybrid_ep: bool,
+        multinode: bool,
+        runtime_python: str | None,
     ) -> MegatronRuntimeInfo:
         if self._admission_report is None:
             raise RuntimeError("host has not passed ART runtime admission")
-        key = (require_hybrid_ep, multinode)
+        key = (require_hybrid_ep, multinode, runtime_python)
         if key not in self._megatron_runtimes:
             from art.megatron.runtime.managed import ensure_megatron_runtime
 
@@ -350,6 +355,7 @@ class ArtHostService(Actor):
                 art_build_sha256=self._admission_report.runtime.art_build_sha256,
                 require_hybrid_ep=require_hybrid_ep,
                 multinode=multinode,
+                runtime_python=runtime_python,
             )
         return self._megatron_runtimes[key]
 
