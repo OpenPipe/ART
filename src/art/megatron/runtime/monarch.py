@@ -2486,6 +2486,7 @@ class _PublicationState:
         "late_waitable",
         "outcome_observed",
         "records",
+        "retired",
         "train_done",
     )
 
@@ -2503,6 +2504,7 @@ class _PublicationState:
         self.active_waiters = 0
         self.late_waitable = True
         self.outcome_observed = False
+        self.retired = asyncio.Event()
 
 
 class ForwardBackwardCommandLaunch(BaseModel):
@@ -4695,10 +4697,16 @@ class MonarchTrainerRun:
                     f"publication generation already exists: {generation_id}"
                 )
             self._expire_prior_publications()
-            publication = asyncio.get_running_loop().create_future()
-            publication.add_done_callback(consume_future_exception)
-            state = _PublicationState(generation_id, publication)
+            publication_outcome = asyncio.get_running_loop().create_future()
+            publication_outcome.add_done_callback(consume_future_exception)
+            state = _PublicationState(generation_id, publication_outcome)
             self._publications[generation_id] = state
+            publication = asyncio.ensure_future(
+                self._await_retired_snapshot_publication(
+                    self.wait_for_publication(generation_id), state
+                )
+            )
+            publication.add_done_callback(consume_future_exception)
             event_port, event_receiver = Channel[dict[str, Any]].open()
             ready_port, ready_receiver = Channel[dict[str, Any]].open()
             loop = asyncio.get_running_loop()
@@ -4752,8 +4760,8 @@ class MonarchTrainerRun:
                     if not task.done():
                         task.cancel()
                 await asyncio.gather(readiness, rank_call, return_exceptions=True)
-                if not publication.done():
-                    publication.set_exception(error)
+                if not publication_outcome.done():
+                    publication_outcome.set_exception(error)
                 state.records.clear()
                 state.train_done = True
                 await self._invalidate_command(error, "snapshot and cleanup failed")
@@ -5404,6 +5412,22 @@ class MonarchTrainerRun:
             state.outcome_observed |= observed
             self._retire_publication(state)
 
+    @staticmethod
+    async def _await_retired_snapshot_publication(
+        publication: Awaitable[tuple[TrainerRankPublication, ...]],
+        state: "_PublicationState",
+    ) -> tuple[TrainerRankPublication, ...]:
+        """Keep one generation reserved until its snapshot receiver is closed."""
+        try:
+            result = await publication
+        except asyncio.CancelledError:
+            raise
+        except BaseException:
+            await state.retired.wait()
+            raise
+        await state.retired.wait()
+        return result
+
     def _record_publication(self, payload: dict[str, Any]) -> None:
         event = TRAINER_PUBLICATION_EVENT_ADAPTER.validate_python(payload)
         generation_id = (
@@ -5511,6 +5535,7 @@ class MonarchTrainerRun:
             return
         if self._publications.get(state.generation_id) is state:
             self._publications.pop(state.generation_id)
+            state.retired.set()
 
     async def advance_without_training(
         self,

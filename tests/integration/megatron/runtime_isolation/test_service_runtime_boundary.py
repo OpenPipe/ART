@@ -51,6 +51,38 @@ async def test_publication_wait_is_reserved_before_next_train_can_expire_it() ->
     assert state.generation_id not in run._publications
 
 
+@pytest.mark.asyncio
+async def test_snapshot_publication_waits_for_receiver_drain_before_reuse() -> None:
+    from art.megatron.runtime.monarch import (
+        MonarchTrainerRun,
+        _PublicationState,
+    )
+
+    run = MonarchTrainerRun.__new__(MonarchTrainerRun)
+    future = asyncio.get_running_loop().create_future()
+    state = _PublicationState("generation-1", future)
+    state.train_done = True
+    state.drain_done = False
+    run._publications = {state.generation_id: state}
+
+    publication = asyncio.create_task(
+        run._await_retired_snapshot_publication(
+            run.wait_for_publication(state.generation_id), state
+        )
+    )
+    future.set_result(())
+    await asyncio.sleep(0)
+
+    assert not publication.done()
+    assert state.generation_id in run._publications
+
+    state.drain_done = True
+    run._retire_publication(state)
+
+    assert await publication == ()
+    assert state.generation_id not in run._publications
+
+
 @pytest.mark.skipif(
     sys.platform != "linux", reason="requires Linux parent-death signal"
 )
