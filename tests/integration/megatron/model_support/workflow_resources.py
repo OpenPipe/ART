@@ -401,7 +401,7 @@ _B300_THROUGHPUT_FLOORS = {
         (64_800, 60_000, 3_750, 0.87, 3.5),
     ),
     "qwen3_5_moe": (
-        "72172ac8d112af1dd7248f52e36ff5cf4cd6c2407d4a6ffb50e2b4758e8bb98d",
+        "41446c8362bfe6849040ef2060e10a1f9dbfbe0665382edebf607398893fce5a",
         (32_600, 30_800, 257, 0.89, 5.5),
     ),
     "gemma4_dense": (
