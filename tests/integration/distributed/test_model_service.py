@@ -1,3 +1,4 @@
+import asyncio
 from types import MethodType, SimpleNamespace
 from typing import Any, cast
 from unittest.mock import AsyncMock, Mock
@@ -17,7 +18,9 @@ from art.local import checkpoints as checkpoints_module
 from art.megatron import distributed_service as service_module
 from art.megatron.backend import MegatronBackend
 from art.megatron.distributed_service import DistributedMegatronService
+from art.megatron.runtime.specs import TrainerGeneration
 from art.serving_capabilities import ART_SERVING_PROTOCOL_VERSION, ServingCapabilities
+from art.training.contracts import OperationRef
 
 
 def _spec() -> ModelServiceSpec:
@@ -46,6 +49,69 @@ def _service(tmp_path, runtime) -> DistributedMegatronService:
         runtime=runtime,
         enable_expert_replay=False,
     )
+
+
+@pytest.mark.asyncio
+async def test_snapshot_command_fences_authorization_not_publication(
+    monkeypatch, tmp_path
+) -> None:
+    service = _service(tmp_path, SimpleNamespace())
+    generation = TrainerGeneration(
+        training_session_id="session",
+        policy_step=1,
+        generation_id="step-00000001-0123456789abcdef0123456789abcdef",
+        adapter_path=str(tmp_path / "checkpoints" / "0001"),
+    )
+    service._training_session_id = generation.training_session_id
+    service._latest_step = generation.policy_step
+    service._learner_generation = generation
+
+    authorization = asyncio.get_running_loop().create_future()
+    publication = asyncio.get_running_loop().create_future()
+    trainer = SimpleNamespace(
+        start_snapshot=AsyncMock(
+            return_value=SimpleNamespace(
+                completion=authorization,
+                publication=publication,
+            )
+        )
+    )
+    service._ensure_trainer_locked = AsyncMock(return_value=(trainer, None))
+    monkeypatch.setattr(
+        service_module, "read_committed_optimizer_pointer", lambda _path: None
+    )
+
+    async def complete_durable_snapshot(_generation, rank_snapshot, _metrics):
+        await rank_snapshot
+        return cast(Any, "durable")
+
+    service._complete_durable_snapshot = complete_durable_snapshot
+    ref = OperationRef(
+        run_id="run",
+        operation_id="save-state-1",
+        sequence_id=3,
+        learner_parent_version=1,
+        kind="save_state",
+    )
+
+    command = asyncio.create_task(
+        service.snapshot_command(
+            ref,
+            save_optimizer=False,
+            activate_serving=False,
+        )
+    )
+    await asyncio.sleep(0)
+    assert not command.done()
+
+    authorization.set_result({"metrics": {"snapshot_authorize_s": 0.01}})
+    launch = await command
+    assert launch.metrics == {"snapshot_authorize_s": 0.01}
+    assert not publication.done()
+    assert not launch.completion.done()
+
+    publication.set_result(())
+    assert await launch.completion == "durable"
 
 
 def test_endpoint_url_brackets_ipv6_literals() -> None:
