@@ -960,6 +960,11 @@ class LocalMegatronTrainingClient:
                         if request.restore_optimizer
                         else None
                     ),
+                    optimizer_verification=(
+                        source.optimizer_verification
+                        if request.restore_optimizer
+                        else None
+                    ),
                 ),
             )
             return LoadStateResult(

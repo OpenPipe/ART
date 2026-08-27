@@ -549,6 +549,7 @@ class ResolvedCheckpointState(_Spec):
     adapter: OptimizerAdapter
     optimizer_state_path: str | None = Field(default=None, min_length=1)
     optimizer_generation_id: str | None = Field(default=None, min_length=1)
+    optimizer_verification: VerifiedOptimizerGeneration | None = None
 
     @model_validator(mode="after")
     def _validate_optimizer(self) -> "ResolvedCheckpointState":
@@ -556,6 +557,12 @@ class ResolvedCheckpointState(_Spec):
             self.optimizer_generation_id is None
         ):
             raise ValueError("optimizer path and generation must be paired")
+        if self.optimizer_verification is not None and (
+            self.optimizer_generation_id is None
+            or self.optimizer_verification.generation
+            != self.optimizer_generation_id
+        ):
+            raise ValueError("optimizer verification names another generation")
         return self
 
 

@@ -35,12 +35,14 @@ from art.megatron.portable_optimizer_archive import (
 )
 from art.megatron.runtime.specs import (
     RankLocalOptimizerWorkSummary,
+    ResolvedCheckpointState,
     RunOptimizerWorkSummary,
     RunSlotRegistration,
 )
 from art.megatron.training import slot as training_slot_module
 from art.megatron.training.slot import MegatronTrainingSlot
 from art.megatron.weights.rank_distributed_types import RankDistributedLoraStats
+from art.training.contracts import LoadStateRequest, OperationRef
 
 _DIGEST = "0" * 64
 _GENERATION = f"step-00000001-{'1' * 32}"
@@ -484,6 +486,127 @@ async def test_run_registration_reuses_receipt_and_retains_generation_lease(
     )
 
     assert result == optimizer_work
+    assert trainer.deletion is not None
+    await asyncio.wait_for(trainer.deletion, timeout=1)
+    assert not optimizer_generation_path(
+        str(optimizer_state_path), _GENERATION
+    ).exists()
+
+
+@pytest.mark.asyncio
+async def test_prepare_load_state_reuses_serialized_receipt_through_rank_reads(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    optimizer_state_path = tmp_path / "optimizer"
+    shard, adapter = _generation(optimizer_state_path)
+    receipt = verify_optimizer_generation(str(optimizer_state_path), _GENERATION)
+    source = ResolvedCheckpointState.model_validate_json(
+        ResolvedCheckpointState(
+            adapter=adapter,
+            optimizer_state_path=str(optimizer_state_path),
+            optimizer_generation_id=_GENERATION,
+            optimizer_verification=receipt,
+        ).model_dump_json()
+    )
+    deletion_started = threading.Event()
+
+    def delete() -> None:
+        deletion_started.set()
+        delete_optimizer_generation(
+            str(optimizer_state_path), _GENERATION, replacement_generation=None
+        )
+
+    optimizer_work = RunOptimizerWorkSummary(
+        run_id="run",
+        ranks=(
+            RankLocalOptimizerWorkSummary(
+                rank=0,
+                adapter_rank=1,
+                target_modules=("q_proj",),
+                trainable_lora_numel=1,
+                optimizer_passes=1,
+                parameter_count=1,
+                layout_fingerprint=_DIGEST,
+            ),
+        ),
+    )
+
+    class _RankReadingTrainer:
+        valid = True
+
+        def __init__(self) -> None:
+            self.deletion: asyncio.Task[None] | None = None
+
+        async def register_run(
+            self, _registration: RunSlotRegistration
+        ) -> RunOptimizerWorkSummary:
+            return optimizer_work
+
+        async def prepare_load_state(self, job: object) -> None:
+            assert getattr(job, "optimizer_verification") == receipt
+            self.deletion = asyncio.create_task(asyncio.to_thread(delete))
+            assert await asyncio.to_thread(deletion_started.wait, 1)
+            await asyncio.sleep(0.05)
+            assert not self.deletion.done()
+            assert shard.read_bytes() == b"logical optimizer bytes"
+
+    trainer = _RankReadingTrainer()
+    slot = MegatronTrainingSlot.__new__(MegatronTrainingSlot)
+    slot._closed = False
+    slot._batch_release_failures = []
+    slot._runs = {}
+    slot._results = {}
+    slot.artifact_root = str(tmp_path.resolve())
+    slot.trainer = trainer
+    monkeypatch.setattr(
+        optimizer_state_module,
+        "_file_sha256",
+        lambda _path: pytest.fail("load-state receipt repeated optimizer shard hashing"),
+    )
+    monkeypatch.setattr(
+        training_slot_module, "validate_adapter_manifest", lambda _adapter: None
+    )
+    monkeypatch.setattr(
+        training_slot_module,
+        "link_adapter_generation",
+        lambda *_args, **_kwargs: adapter,
+    )
+    registration = RunSlotRegistration(
+        tenant_id="tenant",
+        run_id="run",
+        training_session_id="session",
+        learner_version=1,
+        generation_id=_GENERATION,
+        adapter=adapter,
+        optimizer_state_path=str(tmp_path / "resident-optimizer"),
+    )
+    await slot.register_run(
+        registration,
+        model=RolloutModelSpec(payload={}),
+        output_dir=str(tmp_path / "output"),
+    )
+
+    prepared = await slot.prepare_load_state(
+        OperationRef(
+            run_id="run",
+            operation_id="load-operation",
+            sequence_id=1,
+            learner_parent_version=1,
+            reserved_output_learner_version=2,
+            kind="load_state",
+        ),
+        LoadStateRequest(
+            run_id="run",
+            request_id="load-request",
+            sequence_id=1,
+            checkpoint="checkpoint",
+            restore_optimizer=True,
+        ),
+        source,
+    )
+
+    assert prepared.job.optimizer_verification == receipt
     assert trainer.deletion is not None
     await asyncio.wait_for(trainer.deletion, timeout=1)
     assert not optimizer_generation_path(

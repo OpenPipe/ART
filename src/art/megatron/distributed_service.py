@@ -63,6 +63,7 @@ from .optimizer_state import (
     read_adapter_publication,
     read_committed_optimizer_pointer,
     resolve_committed_optimizer_policy,
+    verified_optimizer_generation_receipt_lease,
 )
 from .runtime.build import build_trainer_runtime_spec
 from .runtime.data_plane import SFTBatchData
@@ -1507,16 +1508,26 @@ class DistributedMegatronService:
                 )
             alias_started = time.monotonic()
             async with AsyncExitStack() as leases:
-                verification = (
-                    await leases.enter_async_context(
-                        authenticated_optimizer_generation_lease(
-                            optimizer_state_path, source.optimizer_generation_id
-                        )
-                    )
-                    if optimizer_state_path is not None
+                verification = None
+                if (
+                    optimizer_state_path is not None
                     and source.optimizer_generation_id is not None
-                    else None
-                )
+                ):
+                    if source.optimizer_verification is None:
+                        verification = await leases.enter_async_context(
+                            authenticated_optimizer_generation_lease(
+                                optimizer_state_path,
+                                source.optimizer_generation_id,
+                            )
+                        )
+                    else:
+                        verification = await leases.enter_async_context(
+                            verified_optimizer_generation_receipt_lease(
+                                optimizer_state_path,
+                                source.optimizer_generation_id,
+                                source.optimizer_verification,
+                            )
+                        )
                 job = LoadStateJobSpec(
                     operation_id=ref.operation_id,
                     run_id=ref.run_id,
