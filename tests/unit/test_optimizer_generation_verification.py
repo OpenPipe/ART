@@ -7,6 +7,7 @@ import threading
 import pytest
 import torch
 
+from art.megatron import optimizer_state as optimizer_state_module
 from art.megatron.optimizer_state import (
     CheckpointFile,
     OptimizerAdapter,
@@ -14,6 +15,7 @@ from art.megatron.optimizer_state import (
     OptimizerLogicalTensor,
     OptimizerShard,
     OptimizerTopology,
+    VerifiedOptimizerGeneration,
     acknowledge_materialized_adapter,
     authenticated_optimizer_generation_lease,
     build_optimizer_manifest,
@@ -262,6 +264,48 @@ def test_generation_verification_rejects_same_size_shard_corruption(
 
     with pytest.raises(RuntimeError, match="Optimizer shard digest mismatch"):
         verify_optimizer_generation(str(tmp_path), _GENERATION)
+
+
+def test_generation_verification_returns_serializable_semantic_receipt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _generation(tmp_path)
+    manifest = optimizer_state_module.read_optimizer_generation_manifest(
+        str(tmp_path), _GENERATION
+    )
+    verification_calls = 0
+    verify_manifest = optimizer_state_module.verify_optimizer_generation_manifest
+
+    def count_verification(
+        optimizer_state_path: str,
+        candidate: OptimizerGenerationManifest,
+    ) -> None:
+        nonlocal verification_calls
+        verification_calls += 1
+        verify_manifest(optimizer_state_path, candidate)
+
+    monkeypatch.setattr(
+        optimizer_state_module,
+        "verify_optimizer_generation_manifest",
+        count_verification,
+    )
+
+    receipt = verify_optimizer_generation(str(tmp_path), _GENERATION)
+
+    assert verification_calls == 1
+    assert receipt.receipt_format_version == 1
+    assert receipt.manifest_format_version == manifest.format_version
+    assert receipt.optimizer_semantic_sha256 == manifest.optimizer_semantic_sha256
+    assert receipt.logical_state_sha256 == manifest.logical_state_sha256
+    assert (
+        VerifiedOptimizerGeneration.model_validate_json(receipt.model_dump_json())
+        == receipt
+    )
+    incomplete = receipt.model_dump()
+    incomplete["logical_state_sha256"] = None
+    with pytest.raises(ValueError, match="both topology-portable identities"):
+        VerifiedOptimizerGeneration.model_validate(incomplete)
 
 
 @pytest.mark.parametrize("old_format", [3, 4])

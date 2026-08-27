@@ -247,8 +247,22 @@ class OptimizerGenerationManifest(_OptimizerGenerationRecord):
 class VerifiedOptimizerGeneration(_OptimizerRecord):
     """Exact optimizer generation authenticated before distributed loading."""
 
+    receipt_format_version: Literal[1] = 1
+    manifest_format_version: Literal[5]
     generation: str = Field(pattern=f"^{_GENERATION_PATTERN}$")
     manifest_sha256: str = Field(pattern=_SHA256_PATTERN)
+    optimizer_semantic_sha256: str | None = Field(pattern=_SHA256_PATTERN)
+    logical_state_sha256: str | None = Field(pattern=_SHA256_PATTERN)
+
+    @model_validator(mode="after")
+    def _validate_portable_identity(self) -> "VerifiedOptimizerGeneration":
+        if (self.optimizer_semantic_sha256 is None) != (
+            self.logical_state_sha256 is None
+        ):
+            raise ValueError(
+                "optimizer verification requires both topology-portable identities"
+            )
+        return self
 
 
 class OptimizerGenerationPointer(_OptimizerGenerationRecord):
@@ -1153,8 +1167,11 @@ def _verify_optimizer_generation_leased(
     _validate_pointer_manifest(pointer, manifest)
     verify_optimizer_generation_manifest(optimizer_state_path, manifest)
     return VerifiedOptimizerGeneration(
+        manifest_format_version=manifest.format_version,
         generation=generation,
         manifest_sha256=manifest_sha256,
+        optimizer_semantic_sha256=manifest.optimizer_semantic_sha256,
+        logical_state_sha256=manifest.logical_state_sha256,
     )
 
 
