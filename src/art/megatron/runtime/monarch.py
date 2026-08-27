@@ -2532,6 +2532,16 @@ class SnapshotPrepareCommandLaunch(BaseModel):
     publication: SkipValidation[asyncio.Future[tuple[TrainerRankPublication, ...]]]
 
 
+class SnapshotCommandLaunch(BaseModel):
+    """Rank authorization is ordered; publication may continue asynchronously."""
+
+    model_config = ConfigDict(arbitrary_types_allowed=True, extra="forbid", frozen=True)
+
+    authorization_submitted: SkipValidation[asyncio.Future[None]]
+    completion: SkipValidation[asyncio.Future[dict[str, Any]]]
+    publication: SkipValidation[asyncio.Future[tuple[TrainerRankPublication, ...]]]
+
+
 async def _collect_command_ready(
     receiver: Any,
     job: (
@@ -3652,16 +3662,25 @@ class MonarchTrainerSlot:
 
     async def start_snapshot(
         self, job: GenerationSnapshotJobSpec
-    ) -> SnapshotPrepareCommandLaunch:
+    ) -> SnapshotCommandLaunch:
         prepared = await self.start_prepare_snapshot(job)
+        authorization_submitted = asyncio.get_running_loop().create_future()
+        authorization_submitted.add_done_callback(consume_future_exception)
 
         async def complete() -> dict[str, Any]:
-            result = await asyncio.shield(prepared.completion)
-            plan = SnapshotWritePlan.model_validate(result["write_plan"])
-            metrics = await self.authorize_snapshot(
-                plan, SnapshotWriteGrant.local(plan)
-            )
-            return {**result, "metrics": {**result["metrics"], **metrics}}
+            try:
+                result = await asyncio.shield(prepared.completion)
+                plan = SnapshotWritePlan.model_validate(result["write_plan"])
+                metrics = await self._authorize_snapshot(
+                    plan,
+                    SnapshotWriteGrant.local(plan),
+                    authorization_submitted=authorization_submitted,
+                )
+                return {**result, "metrics": {**result["metrics"], **metrics}}
+            except BaseException as error:
+                if not authorization_submitted.done():
+                    authorization_submitted.set_exception(error)
+                raise
 
         completion = asyncio.create_task(
             complete(), name=f"megatron-slot-snapshot-{job.operation_id}"
@@ -3669,12 +3688,23 @@ class MonarchTrainerSlot:
         self._snapshot_tasks.add(completion)
         completion.add_done_callback(self._snapshot_tasks.discard)
         completion.add_done_callback(consume_future_exception)
-        return SnapshotPrepareCommandLaunch(
-            completion=completion, publication=prepared.publication
+        return SnapshotCommandLaunch(
+            authorization_submitted=authorization_submitted,
+            completion=completion,
+            publication=prepared.publication,
         )
 
     async def authorize_snapshot(
         self, plan: SnapshotWritePlan, grant: SnapshotWriteGrant
+    ) -> dict[str, float]:
+        return await self._authorize_snapshot(plan, grant)
+
+    async def _authorize_snapshot(
+        self,
+        plan: SnapshotWritePlan,
+        grant: SnapshotWriteGrant,
+        *,
+        authorization_submitted: asyncio.Future[None] | None = None,
     ) -> dict[str, float]:
         grant.validate_plan(plan)
         if plan.operation_id not in self._publication_predecessors:
@@ -3699,11 +3729,22 @@ class MonarchTrainerSlot:
                     f"trainer has no prepared publication {plan.operation_id}"
                 )
             if authorization.is_set():
+                if (
+                    authorization_submitted is not None
+                    and not authorization_submitted.done()
+                ):
+                    authorization_submitted.set_result(None)
                 return {}
+            call = self._actors.authorize_run_slot_snapshot.call(
+                plan.model_dump_json(), grant.model_dump_json()
+            )
+            if (
+                authorization_submitted is not None
+                and not authorization_submitted.done()
+            ):
+                authorization_submitted.set_result(None)
             values = await asyncio.wait_for(
-                self._actors.authorize_run_slot_snapshot.call(
-                    plan.model_dump_json(), grant.model_dump_json()
-                ),
+                call,
                 timeout=self._command_timeout_s,
             )
             results = list(values.values())
@@ -4778,16 +4819,25 @@ class MonarchTrainerRun:
 
     async def start_snapshot(
         self, job: GenerationSnapshotJobSpec
-    ) -> SnapshotPrepareCommandLaunch:
+    ) -> SnapshotCommandLaunch:
         prepared = await self.start_prepare_snapshot(job)
+        authorization_submitted = asyncio.get_running_loop().create_future()
+        authorization_submitted.add_done_callback(consume_future_exception)
 
         async def complete() -> dict[str, Any]:
-            result = await asyncio.shield(prepared.completion)
-            plan = SnapshotWritePlan.model_validate(result["write_plan"])
-            metrics = await self.authorize_snapshot(
-                plan, SnapshotWriteGrant.local(plan)
-            )
-            return {**result, "metrics": {**result["metrics"], **metrics}}
+            try:
+                result = await asyncio.shield(prepared.completion)
+                plan = SnapshotWritePlan.model_validate(result["write_plan"])
+                metrics = await self._authorize_snapshot(
+                    plan,
+                    SnapshotWriteGrant.local(plan),
+                    authorization_submitted=authorization_submitted,
+                )
+                return {**result, "metrics": {**result["metrics"], **metrics}}
+            except BaseException as error:
+                if not authorization_submitted.done():
+                    authorization_submitted.set_exception(error)
+                raise
 
         completion = asyncio.create_task(
             complete(), name=f"megatron-snapshot-{job.operation_id}"
@@ -4795,8 +4845,10 @@ class MonarchTrainerRun:
         self._snapshot_tasks.add(completion)
         completion.add_done_callback(self._snapshot_tasks.discard)
         completion.add_done_callback(consume_future_exception)
-        return SnapshotPrepareCommandLaunch(
-            completion=completion, publication=prepared.publication
+        return SnapshotCommandLaunch(
+            authorization_submitted=authorization_submitted,
+            completion=completion,
+            publication=prepared.publication,
         )
 
     async def _complete_snapshot_prepare(
@@ -4851,6 +4903,15 @@ class MonarchTrainerRun:
     async def authorize_snapshot(
         self, plan: SnapshotWritePlan, grant: SnapshotWriteGrant
     ) -> dict[str, float]:
+        return await self._authorize_snapshot(plan, grant)
+
+    async def _authorize_snapshot(
+        self,
+        plan: SnapshotWritePlan,
+        grant: SnapshotWriteGrant,
+        *,
+        authorization_submitted: asyncio.Future[None] | None = None,
+    ) -> dict[str, float]:
         grant.validate_plan(plan)
         prepared = self._operations.get(plan.operation_id)
         if (
@@ -4864,11 +4925,19 @@ class MonarchTrainerRun:
                 f"trainer has no prepared publication {plan.operation_id}"
             )
         if state.authorized.is_set():
+            if (
+                authorization_submitted is not None
+                and not authorization_submitted.done()
+            ):
+                authorization_submitted.set_result(None)
             return {}
+        call = self._actors.authorize_snapshot.call(
+            plan.model_dump_json(), grant.model_dump_json()
+        )
+        if authorization_submitted is not None and not authorization_submitted.done():
+            authorization_submitted.set_result(None)
         values = await asyncio.wait_for(
-            self._actors.authorize_snapshot.call(
-                plan.model_dump_json(), grant.model_dump_json()
-            ),
+            call,
             timeout=self._command_timeout_s(),
         )
         results = list(values.values())

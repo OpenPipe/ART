@@ -52,7 +52,7 @@ def _service(tmp_path, runtime) -> DistributedMegatronService:
 
 
 @pytest.mark.asyncio
-async def test_snapshot_command_fences_authorization_not_publication(
+async def test_snapshot_command_fences_authorization_submission_not_response(
     monkeypatch, tmp_path
 ) -> None:
     service = _service(tmp_path, SimpleNamespace())
@@ -66,11 +66,13 @@ async def test_snapshot_command_fences_authorization_not_publication(
     service._latest_step = generation.policy_step
     service._learner_generation = generation
 
+    authorization_submitted = asyncio.get_running_loop().create_future()
     authorization = asyncio.get_running_loop().create_future()
     publication = asyncio.get_running_loop().create_future()
     trainer = SimpleNamespace(
         start_snapshot=AsyncMock(
             return_value=SimpleNamespace(
+                authorization_submitted=authorization_submitted,
                 completion=authorization,
                 publication=publication,
             )
@@ -104,14 +106,17 @@ async def test_snapshot_command_fences_authorization_not_publication(
     await asyncio.sleep(0)
     assert not command.done()
 
-    authorization.set_result({"metrics": {"snapshot_authorize_s": 0.01}})
+    authorization_submitted.set_result(None)
     launch = await command
-    assert launch.metrics == {"snapshot_authorize_s": 0.01}
+    assert launch.metrics == {}
+    assert not authorization.done()
     assert not publication.done()
     assert not launch.completion.done()
 
+    authorization.set_result({"metrics": {"snapshot_authorize_s": 0.01}})
     publication.set_result(())
     assert await launch.completion == "durable"
+    assert launch.metrics == {"snapshot_authorize_s": 0.01}
 
 
 def test_endpoint_url_brackets_ipv6_literals() -> None:

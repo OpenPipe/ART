@@ -83,6 +83,64 @@ async def test_snapshot_publication_waits_for_receiver_drain_before_reuse() -> N
     assert state.generation_id not in run._publications
 
 
+@pytest.mark.asyncio
+async def test_snapshot_authorization_fence_releases_after_rank_call_submission(
+    monkeypatch,
+) -> None:
+    from art.megatron.runtime import monarch as monarch_module
+
+    operation_id = "snapshot-1"
+    generation_id = "generation-1"
+    plan = SimpleNamespace(
+        operation_id=operation_id,
+        generation=SimpleNamespace(generation_id=generation_id),
+        model_dump_json=Mock(return_value="plan"),
+    )
+    grant = SimpleNamespace(
+        validate_plan=Mock(),
+        model_dump_json=Mock(return_value="grant"),
+    )
+    monkeypatch.setattr(
+        monarch_module.SnapshotWritePlan,
+        "model_validate",
+        lambda _value: plan,
+    )
+
+    response = asyncio.get_running_loop().create_future()
+
+    class Endpoint:
+        def call(self, plan_json: str, grant_json: str):
+            assert (plan_json, grant_json) == ("plan", "grant")
+            return response
+
+    run = monarch_module.MonarchTrainerRun.__new__(
+        monarch_module.MonarchTrainerRun
+    )
+    run._operations = {operation_id: ("fingerprint", {"write_plan": {}})}
+    run._publications = {
+        generation_id: SimpleNamespace(authorized=asyncio.Event())
+    }
+    run._actors = SimpleNamespace(authorize_snapshot=Endpoint())
+    run._rank_processes = (object(),)
+    run._command_timeout_s = lambda: 1.0
+    submitted = asyncio.get_running_loop().create_future()
+
+    authorization = asyncio.create_task(
+        run._authorize_snapshot(
+            cast(Any, plan),
+            cast(Any, grant),
+            authorization_submitted=submitted,
+        )
+    )
+    await submitted
+    assert not authorization.done()
+
+    response.set_result(
+        {0: {"rank": 0, "operation_id": operation_id, "metrics": {"wait_s": 0.1}}}
+    )
+    assert await authorization == {"wait_s": 0.1}
+
+
 @pytest.mark.skipif(
     sys.platform != "linux", reason="requires Linux parent-death signal"
 )

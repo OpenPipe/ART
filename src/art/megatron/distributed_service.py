@@ -1673,14 +1673,15 @@ class DistributedMegatronService:
             save_optimizer=save_optimizer,
         )
         snapshot = await trainer.start_snapshot(job)
-        # Preparation and authorization are command admission, not publication
-        # completion. Letting the next GPU command overtake authorization can leave
-        # its rank RPC queued behind an entire F/B actor turn. Transport and durable
-        # persistence remain asynchronous after this bounded admission fence.
-        prepared = await asyncio.shield(snapshot.completion)
-        metrics = dict(prepared["metrics"])
+        # The next GPU command may proceed once rank authorization has been
+        # submitted ahead of it. Waiting for the rank response here adds a control
+        # round trip to every inter-F/B gap without strengthening ordering.
+        await asyncio.shield(snapshot.authorization_submitted)
+        metrics: dict[str, float] = {}
 
         async def complete_rank_snapshot() -> tuple[TrainerRankPublication, ...]:
+            prepared = await asyncio.shield(snapshot.completion)
+            metrics.update(prepared["metrics"])
             return await asyncio.shield(snapshot.publication)
 
         rank_snapshot = asyncio.create_task(complete_rank_snapshot())
