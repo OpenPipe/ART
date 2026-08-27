@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import asynccontextmanager
+import logging
+import math
 import os
 from typing import Any, AsyncGenerator, Literal, cast
 import uuid
@@ -14,7 +16,18 @@ TRANSIENT_STATUS_CODES = {429, 502, 503, 504}
 DEFAULT_STATUS_RETRIES = 12
 DEFAULT_RETRY_BASE_DELAY = 0.5
 DEFAULT_RETRY_MAX_DELAY = 5.0
+DEFAULT_REQUEST_ATTEMPT_TIMEOUT = 300.0
+DEFAULT_CLEANUP_TIMEOUT = 30.0
+DEFAULT_HTTP_TIMEOUT = httpx.Timeout(connect=10.0, pool=30.0, write=30.0, read=300.0)
 _HTTP_POOL_SHARDS = 64
+_SAFE_METHODS = {"GET", "HEAD", "OPTIONS"}
+_PRE_SEND_TRANSPORT_ERRORS = (
+    httpx.ConnectError,
+    httpx.ConnectTimeout,
+    httpx.PoolTimeout,
+)
+
+logger = logging.getLogger(__name__)
 
 
 def _default_limits() -> httpx.Limits:
@@ -216,9 +229,10 @@ class TauBenchClient:
         *,
         base_url: str | None = None,
         api_key: str | None = None,
-        timeout: float | httpx.Timeout | None = 300.0,
+        timeout: float | httpx.Timeout | None = DEFAULT_HTTP_TIMEOUT,
         limits: httpx.Limits | None = None,
         http_client: httpx.AsyncClient | None = None,
+        request_attempt_timeout: float | None = DEFAULT_REQUEST_ATTEMPT_TIMEOUT,
         status_retries: int | None = None,
         retry_base_delay: float | None = None,
         retry_max_delay: float | None = None,
@@ -240,6 +254,13 @@ class TauBenchClient:
             else _default_retry_max_delay()
         )
         self._owns_client = http_client is None
+        if request_attempt_timeout is not None and (
+            not math.isfinite(request_attempt_timeout) or request_attempt_timeout <= 0
+        ):
+            raise ValueError("request_attempt_timeout must be finite and positive")
+        self._request_attempt_timeout = (
+            request_attempt_timeout if self._owns_client else None
+        )
         self._client = http_client or httpx.AsyncClient(
             base_url=(
                 base_url or os.getenv("TAU_BENCH_BASE_URL") or "http://localhost:8000"
@@ -355,8 +376,31 @@ class TauBenchClient:
         )
         try:
             yield env
-        finally:
+        except BaseException as error:
+            await self._delete_after_error(env.id, error)
+            raise
+        else:
             await self.delete_environment(env.id)
+
+    async def _delete_after_error(
+        self, env_id: str, primary_error: BaseException
+    ) -> None:
+        cleanup = asyncio.create_task(self.delete_environment(env_id))
+        try:
+            async with asyncio.timeout(DEFAULT_CLEANUP_TIMEOUT):
+                await asyncio.shield(cleanup)
+        except BaseException as cleanup_error:
+            if not cleanup.done():
+                cleanup.cancel()
+                cleanup.add_done_callback(_discard_task_result)
+            primary_error.add_note(
+                f"Failed to delete tau-bench environment {env_id}: {cleanup_error!r}"
+            )
+            logger.warning(
+                "Failed to delete tau-bench environment %s while handling another error",
+                env_id,
+                exc_info=True,
+            )
 
     def _auth_headers(self) -> dict[str, str]:
         if self.api_key is None:
@@ -364,25 +408,38 @@ class TauBenchClient:
         return {"Authorization": f"Bearer {self.api_key}"}
 
     async def _request(self, method: str, url: str, **kwargs: Any) -> httpx.Response:
+        method = method.upper()
         headers = dict(kwargs.pop("headers", {}))
         headers.setdefault("X-Request-ID", str(uuid.uuid4()))
         attempts = self.status_retries + 1
         last_transport_error: httpx.TransportError | None = None
         for attempt in range(attempts):
             try:
-                response = await self._client.request(
-                    method,
-                    url,
-                    headers=headers,
-                    **kwargs,
-                )
+                try:
+                    async with asyncio.timeout(self._request_attempt_timeout):
+                        response = await self._client.request(
+                            method,
+                            url,
+                            headers=headers,
+                            **kwargs,
+                        )
+                except TimeoutError as exc:
+                    raise httpx.TimeoutException(
+                        f"tau-bench {method} {url} exceeded the "
+                        f"{self._request_attempt_timeout:g}s attempt deadline"
+                    ) from exc
             except httpx.TransportError as exc:
                 last_transport_error = exc
-                if attempt == attempts - 1:
+                if attempt == attempts - 1 or not _transport_retry_is_safe(
+                    method,
+                    exc,
+                    trusted_transport=self._owns_client,
+                ):
                     raise
             else:
                 if (
                     response.status_code not in TRANSIENT_STATUS_CODES
+                    or method not in _SAFE_METHODS
                     or attempt == attempts - 1
                 ):
                     return response
@@ -392,6 +449,26 @@ class TauBenchClient:
             )
         assert last_transport_error is not None
         raise last_transport_error
+
+
+def _transport_retry_is_safe(
+    method: str,
+    error: httpx.TransportError,
+    *,
+    trusted_transport: bool,
+) -> bool:
+    return method in _SAFE_METHODS or (
+        trusted_transport and isinstance(error, _PRE_SEND_TRANSPORT_ERRORS)
+    )
+
+
+def _discard_task_result(task: asyncio.Task[Any]) -> None:
+    if task.cancelled():
+        return
+    try:
+        task.exception()
+    except BaseException:
+        pass
 
 
 default_client: TauBenchClient | None = None

@@ -49,7 +49,12 @@ def test_client_reuses_connections_by_default(
     assert {limit.max_connections for limit in limits} == {100_000}
     assert sum(limit.max_keepalive_connections or 0 for limit in limits) == 100_000
     assert {kwargs["retries"] for kwargs in transport_kwargs} == {2}
-    assert isinstance(seen["timeout"], httpx.Timeout)
+    assert seen["timeout"] == httpx.Timeout(
+        connect=10.0,
+        pool=30.0,
+        write=30.0,
+        read=300.0,
+    )
 
 
 @pytest.mark.asyncio
@@ -246,6 +251,178 @@ async def test_client_retries_transport_errors() -> None:
 
 
 @pytest.mark.asyncio
+async def test_owned_client_retries_pre_send_error_for_stateful_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    attempts = 0
+
+    async def request(*args: Any, **kwargs: Any) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise httpx.ConnectError("temporary connect failure")
+        return httpx.Response(
+            200,
+            request=httpx.Request("POST", "http://tau.test/environments"),
+            json={"id": "env-1", "observation": "user: hello", "info": {}},
+        )
+
+    client = TauBenchClient(
+        base_url="http://tau.test",
+        api_key="secret",
+        status_retries=3,
+        retry_base_delay=0,
+    )
+    monkeypatch.setattr(client._client, "request", request)
+
+    environment = await client.create_environment(domain="telecom", task_id="task_001")
+    await client.close()
+
+    assert environment.id == "env-1"
+    assert attempts == 2
+
+
+@pytest.mark.asyncio
+async def test_caller_owned_client_does_not_retry_stateful_connect_error() -> None:
+    attempts = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        raise httpx.ConnectError("custom transport failure", request=request)
+
+    http_client = httpx.AsyncClient(
+        base_url="http://tau.test",
+        transport=httpx.MockTransport(handler),
+    )
+    client = TauBenchClient(
+        api_key="secret",
+        http_client=http_client,
+        status_retries=3,
+        retry_base_delay=0,
+    )
+
+    with pytest.raises(httpx.ConnectError):
+        await client.create_environment(domain="telecom", task_id="task_001")
+    await http_client.aclose()
+
+    assert attempts == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure",
+    [
+        httpx.ReadError("response connection failed"),
+        httpx.ReadTimeout("response timed out"),
+        httpx.WriteError("request write failed"),
+        httpx.RemoteProtocolError("response was incomplete"),
+    ],
+)
+async def test_client_does_not_retry_ambiguous_stateful_transport_error(
+    failure: httpx.TransportError,
+) -> None:
+    attempts = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        failure.request = request
+        raise failure
+
+    http_client = httpx.AsyncClient(
+        base_url="http://tau.test",
+        transport=httpx.MockTransport(handler),
+    )
+    client = TauBenchClient(
+        api_key="secret",
+        http_client=http_client,
+        status_retries=3,
+        retry_base_delay=0,
+    )
+
+    with pytest.raises(type(failure)):
+        await client.create_environment(domain="telecom", task_id="task_001")
+    await http_client.aclose()
+
+    assert attempts == 1
+
+
+@pytest.mark.asyncio
+async def test_client_does_not_retry_transient_status_for_stateful_request() -> None:
+    attempts = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        return httpx.Response(503, text="Unavailable")
+
+    http_client = httpx.AsyncClient(
+        base_url="http://tau.test",
+        transport=httpx.MockTransport(handler),
+    )
+    client = TauBenchClient(
+        api_key="secret",
+        http_client=http_client,
+        status_retries=3,
+        retry_base_delay=0,
+    )
+
+    with pytest.raises(httpx.HTTPStatusError):
+        await client.create_environment(domain="telecom", task_id="task_001")
+    await http_client.aclose()
+
+    assert attempts == 1
+
+
+@pytest.mark.asyncio
+async def test_owned_client_has_outer_request_attempt_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = TauBenchClient(
+        base_url="http://tau.test",
+        api_key="secret",
+        request_attempt_timeout=0.01,
+        status_retries=0,
+    )
+
+    async def request(*args: Any, **kwargs: Any) -> httpx.Response:
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+    monkeypatch.setattr(client._client, "request", request)
+    with pytest.raises(httpx.TimeoutException, match="attempt deadline"):
+        await client.get_scenarios()
+    await client.close()
+
+
+@pytest.mark.asyncio
+async def test_caller_owned_client_is_not_wrapped_in_attempt_deadline() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        await asyncio.sleep(0.02)
+        return httpx.Response(200, json={"scenarios": []})
+
+    http_client = httpx.AsyncClient(
+        base_url="http://tau.test",
+        transport=httpx.MockTransport(handler),
+    )
+    client = TauBenchClient(
+        api_key="secret",
+        http_client=http_client,
+        request_attempt_timeout=0.001,
+    )
+
+    assert await client.get_scenarios() == []
+    await http_client.aclose()
+
+
+@pytest.mark.parametrize("value", [0, -1, float("inf"), float("nan")])
+def test_client_rejects_invalid_request_attempt_timeout(value: float) -> None:
+    with pytest.raises(ValueError, match="finite and positive"):
+        TauBenchClient(request_attempt_timeout=value)
+
+
+@pytest.mark.asyncio
 async def test_client_sends_create_environment_idle_timeout() -> None:
     seen: dict[str, Any] = {}
 
@@ -350,6 +527,93 @@ class FakeTauBenchClient(TauBenchClient):
     async def delete_environment(self, env_id: str) -> DeleteEnvironmentResponse:
         self.deleted.append(env_id)
         return DeleteEnvironmentResponse(id=env_id, deleted=True)
+
+
+class FailingDeleteTauBenchClient(FakeTauBenchClient):
+    async def delete_environment(self, env_id: str) -> DeleteEnvironmentResponse:
+        raise RuntimeError(f"could not delete {env_id}")
+
+
+class HangingDeleteTauBenchClient(FakeTauBenchClient):
+    async def delete_environment(self, env_id: str) -> DeleteEnvironmentResponse:
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+
+class CancellationResistantDeleteTauBenchClient(FakeTauBenchClient):
+    def __init__(self) -> None:
+        self.cancelled = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def delete_environment(self, env_id: str) -> DeleteEnvironmentResponse:
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            self.cancelled.set()
+            await self.release.wait()
+        return DeleteEnvironmentResponse(id=env_id, deleted=True)
+
+
+@pytest.mark.asyncio
+async def test_environment_preserves_primary_error_when_cleanup_fails(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    client = FailingDeleteTauBenchClient()
+
+    with pytest.raises(ValueError, match="rollout failed") as exc_info:
+        async with client.environment(domain="telecom", task_id="task_001"):
+            raise ValueError("rollout failed")
+
+    assert exc_info.value.__notes__ == [
+        "Failed to delete tau-bench environment env-1: RuntimeError('could not delete env-1')"
+    ]
+    assert "Failed to delete tau-bench environment env-1" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_environment_preserves_cancellation_when_cleanup_fails() -> None:
+    client = FailingDeleteTauBenchClient()
+
+    with pytest.raises(asyncio.CancelledError):
+        async with client.environment(domain="telecom", task_id="task_001"):
+            raise asyncio.CancelledError
+
+
+@pytest.mark.asyncio
+async def test_environment_bounds_cleanup_while_preserving_primary_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(client_module, "DEFAULT_CLEANUP_TIMEOUT", 0.01)
+    client = HangingDeleteTauBenchClient()
+
+    with pytest.raises(ValueError, match="rollout failed"):
+        async with client.environment(domain="telecom", task_id="task_001"):
+            raise ValueError("rollout failed")
+
+
+@pytest.mark.asyncio
+async def test_environment_does_not_await_cancellation_resistant_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(client_module, "DEFAULT_CLEANUP_TIMEOUT", 0.01)
+    client = CancellationResistantDeleteTauBenchClient()
+
+    with pytest.raises(ValueError, match="rollout failed"):
+        async with client.environment(domain="telecom", task_id="task_001"):
+            raise ValueError("rollout failed")
+
+    await asyncio.wait_for(client.cancelled.wait(), timeout=0.1)
+    client.release.set()
+    await asyncio.sleep(0)
+
+
+@pytest.mark.asyncio
+async def test_environment_propagates_cleanup_error_after_success() -> None:
+    client = FailingDeleteTauBenchClient()
+
+    with pytest.raises(RuntimeError, match="could not delete env-1"):
+        async with client.environment(domain="telecom", task_id="task_001"):
+            pass
 
 
 class FakeCompletions:
