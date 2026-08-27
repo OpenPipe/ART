@@ -18,6 +18,9 @@ _DSV4_ARCHITECTURES = frozenset({"DeepseekV4ForCausalLM"})
 _GPT_OSS_ARCHITECTURES = frozenset(
     {"GptOssForCausalLM", "GptOssForConditionalGeneration"}
 )
+_VALIDATED_QWEN35_MOE_MODEL = "Qwen/Qwen3.5-35B-A3B"
+_VALIDATED_QWEN35_MOE_ARCHITECTURES = frozenset({"Qwen3_5MoeForConditionalGeneration"})
+_VALIDATED_QWEN35_MOE_VLLM_VERSIONS = frozenset({"0.25.1", "0.25.1+cu129"})
 
 
 def model_backend_capabilities(
@@ -32,10 +35,19 @@ def model_backend_capabilities(
     if not architectures:
         raise RuntimeError("loaded model config does not declare an architecture")
     architecture_set = frozenset(architectures)
+    base_model = str(model_config.model)
+    backend_version = version("vllm")
 
     if architecture_set & _GPT_OSS_ARCHITECTURES:
         validation_status = "unsupported"
         lora_implementation = "unavailable"
+    elif (
+        base_model == _VALIDATED_QWEN35_MOE_MODEL
+        and architecture_set == _VALIDATED_QWEN35_MOE_ARCHITECTURES
+        and backend_version in _VALIDATED_QWEN35_MOE_VLLM_VERSIONS
+    ):
+        validation_status = "validated"
+        lora_implementation = "native"
     elif architecture_set <= _QWEN_ARCHITECTURES:
         # Architecture dispatch is not evidence that this exact model revision,
         # runtime build, topology, and route layout passed deployment conformance.
@@ -53,10 +65,10 @@ def model_backend_capabilities(
 
     return {
         "schema_version": 1,
-        "base_model": str(model_config.model),
+        "base_model": base_model,
         "architectures": architectures,
         "backend": "vllm",
-        "backend_version": version("vllm"),
+        "backend_version": backend_version,
         "validation_status": validation_status,
         "lora_implementation": lora_implementation,
         "exact_token_ids": True,
