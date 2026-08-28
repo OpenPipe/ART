@@ -1109,8 +1109,10 @@ def _hf_prefix_tree_paths(
 
 
 def _install_hf_qwen35_gdn_fp32_reference(model: Any, *, base_model: str) -> None:
-    model_key = base_model.lower()
-    if "qwen3.5" not in model_key and "qwen3_5" not in model_key:
+    from art.megatron.model_support.registry import get_model_support_handler
+
+    handler = get_model_support_handler(base_model)
+    if handler.key not in {"qwen3_5_dense", "qwen3_5_moe"}:
         return
     patched = 0
     for module in model.modules():
