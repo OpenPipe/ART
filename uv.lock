@@ -4535,7 +4535,7 @@ requires-dist = [
     { name = "nvidia-nccl-cu13", marker = "sys_platform == 'linux' and extra == 'backend-cu130'", specifier = "==2.28.9" },
     { name = "nvidia-resiliency-ext", marker = "sys_platform == 'linux' and extra == 'backend'", specifier = "<0.5" },
     { name = "nvidia-resiliency-ext", marker = "sys_platform == 'linux' and extra == 'backend-cu130'", specifier = "<0.5" },
-    { name = "openai", specifier = ">=2.14.0" },
+    { name = "openai", specifier = ">=2.14.0,<3" },
     { name = "peft", marker = "extra == 'backend'", specifier = ">=0.14.0" },
     { name = "peft", marker = "extra == 'backend-cu130'", specifier = ">=0.14.0" },
     { name = "peft", marker = "extra == 'megatron'", specifier = ">=0.14.0" },

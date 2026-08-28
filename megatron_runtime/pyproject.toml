@@ -22,7 +22,7 @@ dependencies = [
     "nvidia-ml-py==13.580.82",
     "nvidia-modelopt>=0.42.0a0",
     "nvidia-resiliency-ext<0.5",
-    "openai>=2.14.0",
+    "openai>=2.14.0,<3",
     "peft>=0.14.0",
     "polars>=1.26.0",
     "pydantic>=2.12",
