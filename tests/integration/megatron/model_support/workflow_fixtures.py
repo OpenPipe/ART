@@ -52,6 +52,7 @@ _REVISIONS = {
     "Qwen/Qwen3-32B": "9216db5781bf21249d130ec9da846c4624c16137",
     "Qwen/Qwen3-30B-A3B": "ad44e777bcd18fa416d9da3bd8f70d33ebb85d39",
     "Qwen/Qwen3.5-27B": "fc05daec18b0a78c049392ed2e771dde82bdf654",
+    "Qwen/Qwen3.8-27B": "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0",
     "Qwen/Qwen3.5-35B-A3B": "59d61f3ce65a6d9863b86d2e96597125219dc754",
     "google/gemma-4-31B-it": "842da3794eaa0b77d5f08bae87a17459d91ff475",
     "google/gemma-4-26B-A4B-it": "4d7ae4984b7db7de8f8457170b3f1a419ee76d52",
