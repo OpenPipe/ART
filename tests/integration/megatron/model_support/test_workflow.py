@@ -897,7 +897,7 @@ def test_qwen38_uses_its_measured_throughput_fingerprint() -> None:
         "5617e8880591545a3281ff14d1fe5197eeefc21a81ec80d1a107fd31421d37a0"
     )
     assert qwen38_config.thresholds["b300"].calibration_fingerprint == (
-        "0587238694e26f8f038bfe35d7ce14ac7bc48aced9bae78d827f8893a468d166"
+        "b07ee7ec6338ec021463a43a90fc96c5c5a036b4a04d90b80e1d22c1eef86774"
     )
 
 
