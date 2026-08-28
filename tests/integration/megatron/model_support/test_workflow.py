@@ -885,6 +885,22 @@ def test_validated_architecture_representative_models_are_fixed() -> None:
     ]
 
 
+def test_qwen38_uses_its_measured_throughput_fingerprint() -> None:
+    qwen35 = handler_workflow_resources_for_base_model("Qwen/Qwen3.5-27B")
+    qwen38 = handler_workflow_resources_for_base_model("Qwen/Qwen3.8-27B")
+    assert qwen35 is not None and qwen35.e2e_throughput is not None
+    assert qwen38 is not None and qwen38.e2e_throughput is not None
+    qwen35_config = qwen35.e2e_throughput.throughput
+    qwen38_config = qwen38.e2e_throughput.throughput
+    assert qwen35_config is not None and qwen38_config is not None
+    assert qwen35_config.thresholds["b300"].calibration_fingerprint == (
+        "5617e8880591545a3281ff14d1fe5197eeefc21a81ec80d1a107fd31421d37a0"
+    )
+    assert qwen38_config.thresholds["b300"].calibration_fingerprint == (
+        "0587238694e26f8f038bfe35d7ce14ac7bc48aced9bae78d827f8893a468d166"
+    )
+
+
 def test_dsv4_runtime_stages_use_full_model_resources() -> None:
     resources = handler_workflow_resources_for_base_model(
         "deepseek-ai/DeepSeek-V4-Flash"
