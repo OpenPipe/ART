@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import replace
 import hashlib
 import importlib
@@ -33,6 +33,30 @@ _METADATA_FILES = (
 )
 _MAX_PORTABLE_RANKS = 4096
 _MAX_PORTABLE_FILES = 65_536
+
+
+def _rank_zero_phase[T](rank: int, action: Callable[[], T], phase: str) -> T | None:
+    result = None
+    error: BaseException | None = None
+    if rank == 0:
+        try:
+            result = action()
+        except BaseException as exc:
+            error = exc
+
+    import torch.distributed as dist
+
+    errors = [None if error is None else repr(error)]
+    if dist.is_available() and dist.is_initialized():
+        errors = [None] * dist.get_world_size()
+        dist.all_gather_object(errors, None if error is None else repr(error))
+    if any(errors):
+        if error is not None:
+            raise error
+        raise RuntimeError(
+            f"Another rank failed to {phase}: {next(item for item in errors if item)}"
+        )
+    return result
 
 
 class _Contract(BaseModel):
@@ -377,58 +401,74 @@ def export_portable_checkpoint(
     digest = hashlib.sha256(f"{name}\0{export_id}".encode()).hexdigest()
     root = Path(tempfile.gettempdir()) / f"art-portable-export-{digest}"
     reservation = root.with_name(f".{root.name}.reserved")
-    snapshots = tuple(root.parent.glob(f".{root.name}.snapshot-r{rank}-*"))
-    for path in (root, reservation, *snapshots):
-        if path.is_dir():
-            shutil.rmtree(path)
+
+    def clean_shared_paths() -> None:
+        for path in (root, reservation):
+            try:
+                shutil.rmtree(path)
+            except FileNotFoundError:
+                pass
+
+    def clean_rank_snapshots() -> None:
+        for path in root.parent.glob(f".{root.name}.snapshot-r{rank}-*"):
+            try:
+                shutil.rmtree(path)
+            except FileNotFoundError:
+                pass
+
+    clean_rank_snapshots()
+    _rank_zero_phase(rank, clean_shared_paths, "prepare portable checkpoint export")
     try:
         trainer.save_checkpoint(str(root), name)
-        if rank != 0:
-            return None
-        prepared = _checkpoint.prepare_checkpoint(str(root))
-        manifest = prepared.manifest
-        if manifest is None or manifest["optimizer"] is None:
-            raise RuntimeError("portable export requires canonical optimizer state")
-        relative_paths = tuple(sorted({"checkpoint.json", *manifest["files"]}))
-        files = tuple(
-            PortableSnapshotPreparedFile(
-                relative_path=relative,
-                component=_checkpoint_component(relative),
-                byte_count=(root / relative).stat().st_size,
-                sha256=_file_sha256(root / relative),
-            )
-            for relative in relative_paths
-        )
-        committed = sink.commit_prepared(
-            export_id=export_id,
-            generation=generation,
-            rank=rank,
-            checkpoint_digest=prepared.digest,
-            directory=root,
-            files=files,
-        )
-        by_path = {file.relative_path: file for file in committed}
-        if len(by_path) != len(committed) or set(by_path) != set(relative_paths):
-            raise RuntimeError("portable sink changed the checkpoint file inventory")
-        return PortableSnapshotRankReceipt(
-            rank=rank,
-            checkpoint_digest=prepared.digest,
-            files=tuple(
-                PortableSnapshotFile(
-                    object_id=by_path[file.relative_path].object_id,
-                    relative_path=file.relative_path,
-                    component=file.component,
-                    byte_count=file.byte_count,
-                    sha256=file.sha256,
-                    source_ref=by_path[file.relative_path].source_ref,
+
+        def commit() -> PortableSnapshotRankReceipt:
+            prepared = _checkpoint.prepare_checkpoint(str(root))
+            manifest = prepared.manifest
+            if manifest is None or manifest["optimizer"] is None:
+                raise RuntimeError("portable export requires canonical optimizer state")
+            relative_paths = tuple(sorted({"checkpoint.json", *manifest["files"]}))
+            files = tuple(
+                PortableSnapshotPreparedFile(
+                    relative_path=relative,
+                    component=_checkpoint_component(relative),
+                    byte_count=(root / relative).stat().st_size,
+                    sha256=_file_sha256(root / relative),
                 )
-                for file in files
-            ),
-        )
+                for relative in relative_paths
+            )
+            committed = sink.commit_prepared(
+                export_id=export_id,
+                generation=generation,
+                rank=rank,
+                checkpoint_digest=prepared.digest,
+                directory=root,
+                files=files,
+            )
+            by_path = {file.relative_path: file for file in committed}
+            if len(by_path) != len(committed) or set(by_path) != set(relative_paths):
+                raise RuntimeError(
+                    "portable sink changed the checkpoint file inventory"
+                )
+            return PortableSnapshotRankReceipt(
+                rank=rank,
+                checkpoint_digest=prepared.digest,
+                files=tuple(
+                    PortableSnapshotFile(
+                        object_id=by_path[file.relative_path].object_id,
+                        relative_path=file.relative_path,
+                        component=file.component,
+                        byte_count=file.byte_count,
+                        sha256=file.sha256,
+                        source_ref=by_path[file.relative_path].source_ref,
+                    )
+                    for file in files
+                ),
+            )
+
+        return _rank_zero_phase(rank, commit, "commit portable checkpoint export")
     finally:
-        for path in (root, reservation, *snapshots):
-            if path.is_dir():
-                shutil.rmtree(path)
+        _rank_zero_phase(rank, clean_shared_paths, "clean portable checkpoint export")
+        clean_rank_snapshots()
 
 
 def install_portable_checkpoint(
