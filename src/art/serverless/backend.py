@@ -35,6 +35,8 @@ if TYPE_CHECKING:
     from wandb.sdk.artifacts.artifact import Artifact
 
     from ..model import Model, TrainableModel
+    from ..training import TrainingRunSpec
+    from .native_training import RemoteTrainingClient
 
 
 def _extract_step_from_wandb_artifact(artifact: "Artifact") -> int | None:
@@ -223,6 +225,26 @@ class ServerlessBackend:
         config: dev.OpenAIServerConfig | None,
     ) -> tuple[str, str]:
         return str(self._base_url), self._client.api_key  # ty:ignore[possibly-missing-attribute]
+
+    async def create_training_client(
+        self,
+        *,
+        request_id: str,
+        run_name: str,
+        spec: "TrainingRunSpec",
+        poll_interval_s: float = 0.1,
+    ) -> "RemoteTrainingClient":
+        """Resolve one durable native run and retain its operation identities."""
+
+        from .native_training import RemoteTrainingClient
+
+        return await RemoteTrainingClient.resolve(
+            self._client.training_runs,  # ty:ignore[possibly-missing-attribute]
+            request_id=request_id,
+            run_name=run_name,
+            spec=spec,
+            poll_interval_s=poll_interval_s,
+        )
 
     # Note: _log() method has been moved to the Model class (frontend)
     # Trajectories are now saved locally by the Model.log() method

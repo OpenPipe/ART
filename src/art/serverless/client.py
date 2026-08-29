@@ -19,6 +19,8 @@ from openai._version import __version__
 from openai.pagination import AsyncCursorPage
 from typing_extensions import override
 
+from art.training import LoadStateRequest, RunCommand, TrainingRunSpec
+
 from ..trajectories import TrajectoryGroup
 from ..types import SFTMetricLoggingConfig
 
@@ -107,6 +109,52 @@ class TrainingJobEvent(BaseModel):
         "training_started", "gradient_step", "training_ended", "training_failed"
     ]
     data: dict[str, Any]
+
+
+NativeRunStatus = Literal["open", "closing", "closed", "failed"]
+NativeOperationKind = Literal[
+    "forward",
+    "forward_backward",
+    "optim_step",
+    "save_state",
+    "load_state",
+    "save_weights",
+]
+NativeOperationStatus = Literal[
+    "admitted",
+    "packing",
+    "ready",
+    "running",
+    "succeeded",
+    "failed",
+    "cancelled",
+]
+
+
+class NativeTrainingRun(BaseModel):
+    run_id: str
+    run_name: str
+    spec: dict[str, Any]
+    status: NativeRunStatus
+    next_sequence_id: int
+    projected_learner_version: int
+    committed_learner_version: int
+
+
+class NativeTrainingOperation(BaseModel):
+    operation_id: str
+    run_id: str
+    request_id: str
+    sequence_id: int
+    kind: NativeOperationKind
+    status: NativeOperationStatus
+    learner_parent_version: int
+    reserved_output_learner_version: int | None
+    contributing_operation_ids: tuple[str, ...]
+    cancel_requested: bool
+    event_cursor: int
+    result: dict[str, Any] | None
+    error: dict[str, Any] | None
 
 
 class Models(AsyncAPIResource):
@@ -247,6 +295,106 @@ class TrainingJobEvents(AsyncAPIResource):
         )
 
 
+class TrainingRuns(AsyncAPIResource):
+    """Typed transport for the native sequenced training API."""
+
+    async def resolve(
+        self,
+        *,
+        request_id: str,
+        run_name: str,
+        spec: TrainingRunSpec,
+    ) -> NativeTrainingRun:
+        wire_spec = {
+            "base_model": spec.base_model,
+            "dtype": spec.dtype,
+            "lora_rank": spec.adapter.rank,
+            "lora_target_modules": list(spec.adapter.target_modules),
+            "optimizer": "adamw",
+        }
+        run = await self._post(
+            "/training/runs:resolve",
+            cast_to=NativeTrainingRun,
+            body={
+                "request_id": request_id,
+                "run_name": run_name,
+                "spec": wire_spec,
+            },
+        )
+        if run.run_name != run_name or run.spec != wire_spec:
+            raise RuntimeError("native training run identity changed during resolve")
+        return run
+
+    async def get(self, run_id: str) -> NativeTrainingRun:
+        return await self._get(f"/training/runs/{run_id}", cast_to=NativeTrainingRun)
+
+    async def submit(self, request: RunCommand) -> NativeTrainingOperation:
+        return await self._post(
+            f"/training/runs/{request.run_id}/{request_kind_endpoint(request)}",
+            cast_to=NativeTrainingOperation,
+            body={
+                "request_id": request.request_id,
+                "sequence_id": request.sequence_id,
+                "command": request.model_dump(mode="json"),
+            },
+        )
+
+    async def operation(
+        self, run_id: str, operation_id: str
+    ) -> NativeTrainingOperation:
+        return await self._get(
+            f"/training/runs/{run_id}/operations/{operation_id}",
+            cast_to=NativeTrainingOperation,
+        )
+
+    async def cancel(self, run_id: str, operation_id: str) -> NativeTrainingOperation:
+        return await self._post(
+            f"/training/runs/{run_id}/operations/{operation_id}:cancel",
+            cast_to=NativeTrainingOperation,
+        )
+
+    async def close(self, run_id: str) -> NativeTrainingRun:
+        return await self._post(
+            f"/training/runs/{run_id}:close", cast_to=NativeTrainingRun
+        )
+
+
+def request_kind_endpoint(request: RunCommand) -> str:
+    kind = request_kind(request)
+    if kind == "save_sampler":
+        return "save_weights_for_sampler"
+    if kind == "load_state":
+        assert isinstance(request, LoadStateRequest)
+        return (
+            "load_state_with_optimizer" if request.restore_optimizer else "load_state"
+        )
+    return kind
+
+
+def request_kind(request: RunCommand) -> str:
+    from art.training import (
+        ForwardBackwardRequest,
+        ForwardRequest,
+        OptimStepRequest,
+        SaveStateRequest,
+        SaveWeightsForSamplerRequest,
+    )
+
+    if isinstance(request, ForwardBackwardRequest):
+        return "forward_backward"
+    if isinstance(request, ForwardRequest):
+        return "forward"
+    if isinstance(request, OptimStepRequest):
+        return "optim_step"
+    if isinstance(request, SaveWeightsForSamplerRequest):
+        return "save_sampler"
+    if isinstance(request, SaveStateRequest):
+        return "save_state"
+    if isinstance(request, LoadStateRequest):
+        return "load_state"
+    raise TypeError(f"unsupported native training request {type(request).__name__}")
+
+
 class SFTTrainingJobs(AsyncAPIResource):
     async def create(
         self,
@@ -299,8 +447,10 @@ class Client(AsyncAPIClient):
         stream: bool = False,
         stream_cls: type[AsyncStream[Any]] | None = None,
     ) -> ResponseT | AsyncStream[Any]:
-        # Disable retries for POST requests
-        if options.method.upper() == "POST":
+        # Preview POSTs lack idempotency keys; native run commands do not.
+        if options.method.upper() == "POST" and str(options.url).startswith(
+            "/preview/"
+        ):
             options.max_retries = 0
         return await super().request(
             cast_to=cast_to, options=options, stream=stream, stream_cls=stream_cls
@@ -313,6 +463,10 @@ class Client(AsyncAPIClient):
     @cached_property
     def training_jobs(self) -> TrainingJobs:
         return TrainingJobs(cast(AsyncOpenAI, self))
+
+    @cached_property
+    def training_runs(self) -> TrainingRuns:
+        return TrainingRuns(cast(AsyncOpenAI, self))
 
     @cached_property
     def sft_training_jobs(self) -> SFTTrainingJobs:
