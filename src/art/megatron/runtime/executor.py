@@ -9,6 +9,8 @@ from threading import BoundedSemaphore, Event, Lock
 import time
 from typing import TYPE_CHECKING, Any
 
+import torch
+
 from art.training.contracts import TokenLogprobs
 from art.utils.safetensors import PreparedSafetensors, SafetensorsLayout
 
@@ -59,6 +61,48 @@ if TYPE_CHECKING:
         ExternalLoraPublicationSink,
         ExternalLoraTarget,
     )
+
+
+def _command_token_logprobs(
+    batch: InMemoryPackedBatch,
+    outputs: tuple[torch.Tensor, ...],
+) -> tuple[dict[str, Any], ...]:
+    if batch.ref.training_kind != "tokenized":
+        return tuple(
+            TokenLogprobs.from_values(
+                values.detach().to(device="cpu").flatten().tolist(),
+                shape=tuple(values.shape),
+            ).model_dump(mode="python")
+            for values in outputs
+        )
+    output_map = batch.ref.tokenized_output_map
+    if output_map is None:
+        raise RuntimeError("tokenized batch has no output map")
+    target_tokens = batch.tensors.get("target_tokens")
+    if target_tokens is None:
+        raise RuntimeError("tokenized batch has no target tensor")
+    candidate_capacity = int(target_tokens.shape[2])
+    physical = torch.cat(
+        [values.reshape(-1, candidate_capacity) for values in outputs], dim=0
+    )
+    expected_rows = batch.ref.num_sequences * batch.ref.sequence_length
+    if int(physical.shape[0]) != expected_rows:
+        raise RuntimeError(
+            "tokenized command did not return every physical packed row: "
+            f"returned={physical.shape[0]}, expected={expected_rows}"
+        )
+    host = physical.detach().cpu()
+    logical = []
+    for positions, candidates in zip(
+        output_map.packed_positions, output_map.candidate_counts, strict=True
+    ):
+        values = host[list(positions), :candidates]
+        logical.append(
+            TokenLogprobs.from_values(
+                values.flatten().tolist(), shape=tuple(values.shape)
+            ).model_dump(mode="python")
+        )
+    return tuple(logical)
 
 
 class MegatronTrainJobExecutor:
@@ -162,16 +206,7 @@ class MegatronTrainJobExecutor:
             "logical_nonpadding_tokens": result.logical_nonpadding_tokens,
             "executed_token_equivalents": result.executed_token_equivalents,
             "gpu_service_ns": result.gpu_service_ns,
-            "token_logprobs": tuple(
-                TokenLogprobs.from_values(
-                    values.detach()
-                    .to(device="cpu", dtype=values.dtype)
-                    .flatten()
-                    .tolist(),
-                    shape=tuple(values.shape),
-                ).model_dump(mode="python")
-                for values in result.new_logprobs
-            )
+            "token_logprobs": _command_token_logprobs(batch, result.new_logprobs)
             if job.return_token_logprobs
             else (),
             "metrics": result.metrics,
@@ -201,16 +236,7 @@ class MegatronTrainJobExecutor:
             "logical_nonpadding_tokens": result.logical_nonpadding_tokens,
             "executed_token_equivalents": result.executed_token_equivalents,
             "gpu_service_ns": result.gpu_service_ns,
-            "token_logprobs": tuple(
-                TokenLogprobs.from_values(
-                    values.detach()
-                    .to(device="cpu", dtype=values.dtype)
-                    .flatten()
-                    .tolist(),
-                    shape=tuple(values.shape),
-                ).model_dump(mode="python")
-                for values in result.new_logprobs
-            )
+            "token_logprobs": _command_token_logprobs(batch, result.new_logprobs)
             if job.return_token_logprobs
             else (),
             "metrics": result.metrics,
@@ -747,16 +773,7 @@ class MCoreRunSlotExecutor:
             "logical_nonpadding_tokens": result.logical_nonpadding_tokens,
             "executed_token_equivalents": result.executed_token_equivalents,
             "gpu_service_ns": result.gpu_service_ns,
-            "token_logprobs": tuple(
-                TokenLogprobs.from_values(
-                    values.detach()
-                    .to(device="cpu", dtype=values.dtype)
-                    .flatten()
-                    .tolist(),
-                    shape=tuple(values.shape),
-                ).model_dump(mode="python")
-                for values in result.new_logprobs
-            )
+            "token_logprobs": _command_token_logprobs(batch, result.new_logprobs)
             if job.return_token_logprobs
             else (),
             "metrics": result.metrics,
@@ -787,16 +804,7 @@ class MCoreRunSlotExecutor:
             "logical_nonpadding_tokens": result.logical_nonpadding_tokens,
             "executed_token_equivalents": result.executed_token_equivalents,
             "gpu_service_ns": result.gpu_service_ns,
-            "token_logprobs": tuple(
-                TokenLogprobs.from_values(
-                    values.detach()
-                    .to(device="cpu", dtype=values.dtype)
-                    .flatten()
-                    .tolist(),
-                    shape=tuple(values.shape),
-                ).model_dump(mode="python")
-                for values in result.new_logprobs
-            )
+            "token_logprobs": _command_token_logprobs(batch, result.new_logprobs)
             if job.return_token_logprobs
             else (),
             "metrics": result.metrics,
@@ -860,7 +868,7 @@ class MCoreRunSlotExecutor:
             gradients = self._trainer.reduce_checkpoint_slot_grads(
                 job.run_id,
                 local_sums.gradients,
-                scale_grads=1.0 / observed,
+                scale_grads=(1.0 if local_sums.reduction == "sum" else 1.0 / observed),
             )
             result = self._trainer.optim_step_reduced(
                 job.run_id,

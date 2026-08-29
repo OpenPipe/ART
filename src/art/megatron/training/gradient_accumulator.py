@@ -236,6 +236,7 @@ class ParameterGradientAccumulator:
         self._local_tokens: torch.Tensor | None = None
         self._expected_global_tokens: int | None = None
         self._expects_global_tokens: bool | None = None
+        self._reduction: GradientReduction | None = None
         self._step_flags = (False,) * len(parameters)
         self._sealed: tuple[str, ...] | None = None
 
@@ -261,6 +262,7 @@ class ParameterGradientAccumulator:
         *,
         expected_global_token_count: int | None = None,
         step_flags: tuple[bool, ...] | None = None,
+        reduction: GradientReduction = "token_mean",
     ) -> None:
         if self._sealed is not None:
             raise RuntimeError("cannot add gradients to a sealed accumulator")
@@ -276,6 +278,8 @@ class ParameterGradientAccumulator:
         if len(flags) != len(gradients):
             raise RuntimeError("gradient step flags do not match the parameter layout")
         expects_global = expected_global_token_count is not None
+        if self._reduction is not None and self._reduction != reduction:
+            raise RuntimeError("one gradient accumulator cannot mix reduction modes")
         if (
             self._expects_global_tokens is not None
             and self._expects_global_tokens != expects_global
@@ -294,6 +298,7 @@ class ParameterGradientAccumulator:
             self._local_tokens.add_(token_count)
         self._operation_ids.append(operation_id)
         self._expects_global_tokens = expects_global
+        self._reduction = reduction
         if expected_global_token_count is not None:
             self._expected_global_tokens = (
                 self._expected_global_tokens or 0
@@ -320,11 +325,12 @@ class ParameterGradientAccumulator:
             raise RuntimeError("cannot capture a sealed gradient accumulator")
         if self._gradients is None or self._local_tokens is None:
             raise RuntimeError("gradient accumulator has no contributions")
+        assert self._reduction is not None
         return AccumulatedGradientSums(
             gradients=self._gradients,
             local_token_count=self._local_tokens,
             expected_global_token_count=self._expected_global_tokens,
-            reduction="token_mean",
+            reduction=self._reduction,
         )
 
     def prepare_local_sums(
@@ -334,12 +340,13 @@ class ParameterGradientAccumulator:
             raise RuntimeError("gradient accumulator must be sealed before optimizer")
         if self._gradients is None or self._local_tokens is None:
             raise RuntimeError("gradient accumulator has no contributions")
+        assert self._reduction is not None
         return (
             AccumulatedGradientSums(
                 gradients=self._gradients,
                 local_token_count=self._local_tokens,
                 expected_global_token_count=self._expected_global_tokens,
-                reduction="token_mean",
+                reduction=self._reduction,
             ),
             self._step_flags,
         )
@@ -362,5 +369,6 @@ class ParameterGradientAccumulator:
         self._local_tokens = None
         self._expected_global_tokens = None
         self._expects_global_tokens = None
+        self._reduction = None
         self._step_flags = (False,) * len(self.parameters)
         self._sealed = None

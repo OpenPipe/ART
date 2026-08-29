@@ -37,6 +37,7 @@ from art.training import (
     SaveStateRequest,
     SaveStateResult,
     SaveWeightsForSamplerRequest,
+    TokenizedTrainingBatch,
     TokenLogprobs,
     UsageMeasurement,
     bootstrap_operation_worker,
@@ -348,10 +349,10 @@ class MegatronOperationHandler:
             ):
                 raise ValueError("packed-input command controls changed")
             return captured.ref
-        if not isinstance(request.batch, RlTrajectoryBatch):
+        if not isinstance(request.batch, (RlTrajectoryBatch, TokenizedTrainingBatch)):
             raise OperationExecutionError(
                 "invalid_request",
-                "the persistent Megatron packer currently requires an RL batch",
+                "the persistent Megatron packer requires an RL or tokenized batch",
                 usage=CommandExecutionUsage.no_work(),
             )
         fingerprint = _input_fingerprint(request, operation)
@@ -370,7 +371,11 @@ class MegatronOperationHandler:
                     "retained packed-input capacity is exhausted",
                     usage=CommandExecutionUsage.no_work(),
                 )
-            bundles = retained_route_bundles_from_bundles(request.batch.groups)
+            bundles = (
+                retained_route_bundles_from_bundles(request.batch.groups)
+                if isinstance(request.batch, RlTrajectoryBatch)
+                else ()
+            )
             ownership = await self._acquire_route_ownership(operation, bundles)
             packed = None
             try:
@@ -391,9 +396,17 @@ class MegatronOperationHandler:
                         operation, packed, packing, fingerprint
                     ),
                     content_sha256=packed.leases.ref.content_sha256,
-                    input_kind="rl",
-                    min_source_version=request.batch.min_source_version,
-                    max_source_version=request.batch.max_source_version,
+                    input_kind=request.batch.kind,
+                    min_source_version=(
+                        request.batch.min_source_version
+                        if isinstance(request.batch, RlTrajectoryBatch)
+                        else 0
+                    ),
+                    max_source_version=(
+                        request.batch.max_source_version
+                        if isinstance(request.batch, RlTrajectoryBatch)
+                        else 0
+                    ),
                 )
                 if request.retain_packed_input and ref.content_sha256 is None:
                     raise RuntimeError("replayable packed input has no content digest")
@@ -639,6 +652,9 @@ class MegatronOperationHandler:
                 ),
                 "config": _train_config(self.config.train_config, request),
                 "experimental_config": _experimental_config(request),
+                "loss": (
+                    request.loss if captured.ref.input_kind == "tokenized" else None
+                ),
                 "return_token_logprobs": request.return_token_logprobs,
             }
             if backward:
@@ -825,6 +841,15 @@ class MegatronOperationHandler:
         *,
         retained_route_bundles: tuple[RetainedRouteBundleRef, ...],
     ) -> PackingRequest:
+        if isinstance(request.batch, TokenizedTrainingBatch):
+            return PackingRequest(
+                model=self.config.rollout_model,
+                generation_id=operation.operation_id,
+                tokenized_batch=request.batch,
+                tokenized_loss=cast(Any, request.loss.name),
+                packed_sequence_length=self.trainer.runtime_spec.packed_sequence_length,
+                compute_content_sha256=request.retain_packed_input,
+            )
         assert isinstance(request.batch, RlTrajectoryBatch)
         experimental = _experimental_config(request)
         return PackingRequest(

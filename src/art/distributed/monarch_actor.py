@@ -529,9 +529,20 @@ class ArtHostService(Actor):
     async def pack_batch(
         self, request: PackingRequest, batch_id: str, transfer_timeout_s: float
     ) -> PackingResult:
-        async def receive_groups() -> tuple[list[Any], float]:
+        async def receive_input() -> tuple[list[Any], Any | None, float]:
             fetch_started = time.monotonic()
-            if request.trajectory_sources:
+            if request.tokenized_transfer is not None:
+                if request.tokenized_transfer.stream.stream_id != batch_id:
+                    raise ValueError("packing request has the wrong tokenized stream")
+                tokenized_batch = await request.tokenized_transfer.receive(
+                    timeout_s=transfer_timeout_s
+                )
+                groups = []
+            elif request.tokenized_batch is not None:
+                tokenized_batch = request.tokenized_batch
+                groups = []
+            elif request.trajectory_sources:
+                tokenized_batch = None
                 groups = list(
                     await asyncio.gather(
                         *(
@@ -541,8 +552,10 @@ class ArtHostService(Actor):
                     )
                 )
             elif request.trajectory_transfer is None:
+                tokenized_batch = None
                 groups = [payload.build() for payload in request.trajectory_groups]
             else:
+                tokenized_batch = None
                 if request.trajectory_groups:
                     raise ValueError(
                         "packing request has inline and streamed trajectories"
@@ -554,7 +567,7 @@ class ArtHostService(Actor):
                         timeout_s=transfer_timeout_s
                     )
                 )
-            return groups, time.monotonic() - fetch_started
+            return groups, tokenized_batch, time.monotonic() - fetch_started
 
         route_transfer = request.route_bundle_transfer
         if route_transfer is not None:
@@ -569,9 +582,9 @@ class ArtHostService(Actor):
                 return payload, time.monotonic() - started
 
             async with asyncio.TaskGroup() as tasks:
-                groups_task = tasks.create_task(receive_groups())
+                groups_task = tasks.create_task(receive_input())
                 routes_task = tasks.create_task(receive_routes())
-            groups, trajectory_fetch_s = groups_task.result()
+            groups, tokenized_batch, trajectory_fetch_s = groups_task.result()
             route_payload, route_fetch_s = routes_task.result()
             hydration_started = time.monotonic()
             await asyncio.to_thread(
@@ -582,7 +595,7 @@ class ArtHostService(Actor):
             )
             route_fetch_s += time.monotonic() - hydration_started
         else:
-            groups, trajectory_fetch_s = await receive_groups()
+            groups, tokenized_batch, trajectory_fetch_s = await receive_input()
             route_fetch_s = 0.0
         if request.collect_packing_shapes:
             for group in groups:
@@ -601,34 +614,51 @@ class ArtHostService(Actor):
         packing_started = time.monotonic()
         try:
             async with self._packing_lock:
-                if self._packer is None:
+                if tokenized_batch is not None:
+                    from art.preprocessing.pack import (
+                        packed_tensors_from_tokenized_datums,
+                    )
+
+                    tokenized_loss = request.tokenized_loss
+                    assert tokenized_loss is not None
+                    packed, cancelled = await complete_to_thread(
+                        lambda: packed_tensors_from_tokenized_datums(
+                            tokenized_batch.datums,
+                            loss=tokenized_loss,
+                            seq_len=request.packed_sequence_length,
+                        )
+                    )
+                    if cancelled is not None:
+                        raise cancelled
+                elif self._packer is None:
                     from art.megatron.backend import MegatronBackend
 
                     self._packer = MegatronBackend(
                         path=f"/tmp/art-packing-{os.getpid()}",
                         enable_expert_replay=request.include_moe_routing,
                     )
-                packer = self._packer
-                assert packer is not None
-                packed, cancelled = await complete_to_thread(
-                    lambda: packer._get_packed_tensors(
-                        request.model.build(),
-                        groups,
-                        advantage_balance=request.advantage_balance,
-                        allow_training_without_logprobs=(
-                            request.allow_training_without_logprobs
-                        ),
-                        scale_rewards=request.scale_rewards,
-                        plot_tensors=request.plot_tensors,
-                        packed_sequence_length=request.packed_sequence_length,
-                        logprob_calculation_chunk_size=(
-                            request.logprob_calculation_chunk_size
-                        ),
-                        include_moe_routing=request.include_moe_routing,
+                if tokenized_batch is None:
+                    packer = self._packer
+                    assert packer is not None
+                    packed, cancelled = await complete_to_thread(
+                        lambda: packer._get_packed_tensors(
+                            request.model.build(),
+                            groups,
+                            advantage_balance=request.advantage_balance,
+                            allow_training_without_logprobs=(
+                                request.allow_training_without_logprobs
+                            ),
+                            scale_rewards=request.scale_rewards,
+                            plot_tensors=request.plot_tensors,
+                            packed_sequence_length=request.packed_sequence_length,
+                            logprob_calculation_chunk_size=(
+                                request.logprob_calculation_chunk_size
+                            ),
+                            include_moe_routing=request.include_moe_routing,
+                        )
                     )
-                )
-                if cancelled is not None:
-                    raise cancelled
+                    if cancelled is not None:
+                        raise cancelled
         except BaseException as error:
             if log_future is not None:
 
@@ -666,7 +696,10 @@ class ArtHostService(Actor):
                 trajectory_log_wait_s=trajectory_log_wait_s,
             )
         trainable_assistant_tokens = int(packed["assistant_mask"].sum().item())
-        loss_bearing_tokens = int(packed["assistant_mask"][:, 1:].sum().item())
+        loss_mask = packed["assistant_mask"]
+        if tokenized_batch is None:
+            loss_mask = loss_mask[:, 1:]
+        loss_bearing_tokens = int(loss_mask.sum().item())
         non_padding_tokens = int((packed["group_ids"] != -1).sum().item())
         finalize_started = time.monotonic()
         ref = self._packed_batches.store.create(

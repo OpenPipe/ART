@@ -178,6 +178,10 @@ class DispatchedPackedTensors(ContextParallelLossInputs):
     ref_logprobs: torch.Tensor | None = None
     loss_all_reduce_group: Any | None = None
     token_uids: torch.Tensor | None = None
+    target_tokens: torch.Tensor | None = None
+    loss_weights: torch.Tensor | None = None
+    behavior_logprobs: torch.Tensor | None = None
+    token_advantages: torch.Tensor | None = None
 
 
 class TrainingMicrobatchWorkload(BaseModel):

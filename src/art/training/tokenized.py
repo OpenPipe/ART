@@ -22,10 +22,24 @@ def validate_tokenized_loss_values(
         raise ValueError(f"unsupported {loss} loss settings: {sorted(unknown)}")
     if loss != "cispo":
         return
-    low = _finite_float("clip_low_threshold", values.get("clip_low_threshold", 0.0))
-    high = _finite_float("clip_high_threshold", values.get("clip_high_threshold", 4.0))
+    low, high = tokenized_clip_bounds(loss, values)
     if low > high:
         raise ValueError("clip_low_threshold must not exceed clip_high_threshold")
+
+
+def tokenized_clip_bounds(
+    loss: Literal["ppo", "cispo"],
+    values: Mapping[str, float | int | bool | str | None],
+) -> tuple[float, float]:
+    defaults = (0.8, 1.2) if loss == "ppo" else (0.0, 4.0)
+    return (
+        _finite_float(
+            "clip_low_threshold", values.get("clip_low_threshold", defaults[0])
+        ),
+        _finite_float(
+            "clip_high_threshold", values.get("clip_high_threshold", defaults[1])
+        ),
+    )
 
 
 class TokenizedDatum(BaseModel):

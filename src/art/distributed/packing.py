@@ -4,9 +4,10 @@ from collections.abc import Iterable
 import secrets
 from typing import TYPE_CHECKING, Any, Literal
 
+from msgspec import msgpack
 import numpy as np
 from openai.types.chat.chat_completion import Choice
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, model_validator
 
 from art.pipeline_tuner.config import PackedGroupShape
 from art.preprocessing.moe_routing import (
@@ -16,6 +17,8 @@ from art.preprocessing.moe_routing import (
     MoeRouteArray,
     moe_route_dtype,
 )
+from art.training.contracts import TokenizedTrainingBatch
+from art.training.tokenized import TokenizedLossName
 from art.trajectories import (
     MetadataValue,
     PydanticException,
@@ -29,7 +32,7 @@ from art.vllm_route_transport import (
     retained_route_bundles_from_groups,
 )
 
-from .data_plane import PackedBatchRef
+from .data_plane import ByteStreamTransfer, PackedBatchRef, receive_byte_stream
 from .rollout import RolloutModelSpec
 from .trajectory_store import (
     TrajectoryBatchTransfer,
@@ -39,6 +42,8 @@ from .trajectory_store import (
 
 if TYPE_CHECKING:
     from art.model import TrainableModel
+
+_TOKENIZED_BATCH_ADAPTER = TypeAdapter(TokenizedTrainingBatch)
 
 
 class _ChoiceRoutingPayload(BaseModel):
@@ -271,8 +276,22 @@ class TrajectoryGroupPayload(BaseModel):
         return group
 
 
+class TokenizedBatchTransfer(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    stream: ByteStreamTransfer
+
+    async def receive(self, *, timeout_s: float) -> TokenizedTrainingBatch:
+        payload = await receive_byte_stream(self.stream, timeout_s=timeout_s)
+        return _TOKENIZED_BATCH_ADAPTER.validate_python(msgpack.decode(payload))
+
+
+def encode_tokenized_batch(batch: TokenizedTrainingBatch) -> bytes:
+    return msgpack.encode(batch.model_dump(mode="python"))
+
+
 class PackingRequest(BaseModel):
-    """Current ART packing inputs; generalized loss programs are intentionally absent."""
+    """Canonical trajectory or exact-token packing input."""
 
     model_config = ConfigDict(extra="forbid", frozen=True, arbitrary_types_allowed=True)
 
@@ -281,6 +300,9 @@ class PackingRequest(BaseModel):
     trajectory_groups: tuple[TrajectoryGroupBundle, ...] = ()
     trajectory_transfer: TrajectoryBatchTransfer | None = None
     trajectory_sources: tuple[TrajectoryQueueItem, ...] = ()
+    tokenized_batch: TokenizedTrainingBatch | None = None
+    tokenized_transfer: TokenizedBatchTransfer | None = None
+    tokenized_loss: TokenizedLossName | None = None
     retained_route_bundles: tuple[RetainedRouteBundleRef, ...] = ()
     route_bundle_transfer: RouteBundleBatchTransfer | None = None
     trajectory_log_path: str | None = None
@@ -304,9 +326,16 @@ class PackingRequest(BaseModel):
             bool(self.trajectory_groups),
             self.trajectory_transfer is not None,
             bool(self.trajectory_sources),
+            self.tokenized_batch is not None,
+            self.tokenized_transfer is not None,
         )
         if sum(inputs) != 1:
-            raise ValueError("packing requires exactly one trajectory input")
+            raise ValueError("packing requires exactly one batch input")
+        tokenized = (
+            self.tokenized_batch is not None or self.tokenized_transfer is not None
+        )
+        if tokenized != (self.tokenized_loss is not None):
+            raise ValueError("tokenized packing requires its named loss")
         if self.retained_route_bundles and self.route_bundle_transfer is not None:
             raise ValueError("packing cannot mix retained refs and route transfer")
         if (self.retained_route_bundles or self.route_bundle_transfer) and not (
@@ -318,6 +347,19 @@ class PackingRequest(BaseModel):
             raise ValueError("packing repeats a retained route bundle")
         if len({ref.layout.response_id for ref in refs}) != len(refs):
             raise ValueError("packing repeats a retained route response")
+        if tokenized and (
+            self.retained_route_bundles
+            or self.route_bundle_transfer is not None
+            or self.trajectory_log_path is not None
+            or self.advantage_balance != 0.0
+            or self.allow_training_without_logprobs
+            or not self.scale_rewards
+            or self.plot_tensors
+            or self.logprob_calculation_chunk_size != 1024
+            or self.include_moe_routing
+            or self.collect_packing_shapes
+        ):
+            raise ValueError("tokenized packing cannot carry trajectory-only controls")
         return self
 
     @classmethod
