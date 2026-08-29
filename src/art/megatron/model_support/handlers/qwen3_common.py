@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+from collections import OrderedDict
 from typing import Any, Sequence, cast
+
+_ABSOLUTE_ROTARY_CACHE_MAX_ENTRIES = 8
+_ABSOLUTE_ROTARY_CACHE_MAX_BYTES = 256 * 1024**2
 
 
 def _context_parallel_world_size(config: Any) -> int:
@@ -24,11 +28,15 @@ def _build_absolute_rotary_pos_emb(
     rotary_pos_emb = module.rotary_pos_emb
     cache = getattr(module, "_art_absolute_rotary_pos_emb_cache", None)
     if cache is None:
-        cache = {}
+        cache = OrderedDict()
         setattr(module, "_art_absolute_rotary_pos_emb_cache", cache)
-    cache_key = (str(device), max_position + 1)
-    cached = cache.get(cache_key)
+    elif not isinstance(cache, OrderedDict):
+        cache = OrderedDict(cache)
+        setattr(module, "_art_absolute_rotary_pos_emb_cache", cache)
+    cache_key = (str(device), str(dtype), max_position + 1)
+    cached = cache.pop(cache_key, None)
     if cached is not None:
+        cache[cache_key] = cached
         return cached
 
     freqs = rotary_pos_emb.get_freqs_non_repeated(max_position + 1)
@@ -43,7 +51,20 @@ def _build_absolute_rotary_pos_emb(
         device=device,
         dtype=dtype,
     )
-    cache[cache_key] = absolute_rotary_pos_emb
+    byte_count = (
+        absolute_rotary_pos_emb.numel() * absolute_rotary_pos_emb.element_size()
+    )
+    if byte_count <= _ABSOLUTE_ROTARY_CACHE_MAX_BYTES:
+        cache[cache_key] = absolute_rotary_pos_emb
+        cached_bytes = sum(
+            value.numel() * value.element_size() for value in cache.values()
+        )
+        while (
+            len(cache) > _ABSOLUTE_ROTARY_CACHE_MAX_ENTRIES
+            or cached_bytes > _ABSOLUTE_ROTARY_CACHE_MAX_BYTES
+        ):
+            _, evicted = cache.popitem(last=False)
+            cached_bytes -= evicted.numel() * evicted.element_size()
     return absolute_rotary_pos_emb
 
 

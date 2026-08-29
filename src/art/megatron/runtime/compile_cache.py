@@ -15,12 +15,14 @@ from pydantic import BaseModel, ConfigDict, Field
 from .specs import TrainerRuntimeSpec
 
 _PACKAGES = ("megatron-core", "torchmonarch", "transformer-engine", "transformers")
+_MAX_CACHE_ENTRIES = 16
+_MAX_CACHE_BYTES = 16 * 1024**3
 
 
 class CompileCacheEvent(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    status: Literal["miss", "hit", "published", "existing"]
+    status: Literal["miss", "hit", "published", "existing", "rejected"]
     key: str = Field(pattern=r"^[0-9a-f]{64}$")
     elapsed_s: float = Field(ge=0)
     artifact_bytes: int = Field(default=0, ge=0)
@@ -85,6 +87,35 @@ def _compile_cache_key(spec: TrainerRuntimeSpec, rank: int) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _prune_cache(root: Path, *, protected: Path | None = None) -> None:
+    entries = []
+    for path in root.iterdir():
+        if len(path.name) != 64 or any(
+            char not in "0123456789abcdef" for char in path.name
+        ):
+            continue
+        try:
+            stat = path.stat()
+        except FileNotFoundError:
+            continue
+        if path.is_file():
+            entries.append((path, stat.st_mtime_ns, stat.st_size))
+    entries.sort(key=lambda value: value[1])
+    total = sum(size for _, _, size in entries)
+    remaining = len(entries)
+    for path, _modified, size in entries:
+        if remaining <= _MAX_CACHE_ENTRIES and total <= _MAX_CACHE_BYTES:
+            break
+        if path == protected:
+            continue
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+        total -= size
+        remaining -= 1
+
+
 class TrainerCompileCache:
     """Trusted rank-local PyTorch compiler cache for one exact runtime shape."""
 
@@ -100,13 +131,31 @@ class TrainerCompileCache:
         import torch
 
         started = time.perf_counter()
+        _prune_cache(self.path.parent, protected=self.path)
         if not self.path.is_file():
             return CompileCacheEvent(
                 status="miss", key=self.key, elapsed_s=time.perf_counter() - started
             )
-        artifact = self.path.read_bytes()
+        try:
+            artifact = self.path.read_bytes()
+        except FileNotFoundError:
+            return CompileCacheEvent(
+                status="miss", key=self.key, elapsed_s=time.perf_counter() - started
+            )
+        if len(artifact) > _MAX_CACHE_BYTES:
+            self.path.unlink(missing_ok=True)
+            return CompileCacheEvent(
+                status="rejected",
+                key=self.key,
+                elapsed_s=time.perf_counter() - started,
+                artifact_bytes=len(artifact),
+            )
         if torch.compiler.load_cache_artifacts(artifact) is None:
             raise RuntimeError(f"PyTorch rejected compile cache {self.key}")
+        try:
+            self.path.touch()
+        except FileNotFoundError:
+            pass
         self.loaded = True
         return CompileCacheEvent(
             status="hit",
@@ -119,21 +168,33 @@ class TrainerCompileCache:
         import torch
 
         started = time.perf_counter()
-        if self.loaded or self.path.is_file():
+        try:
+            existing_bytes = self.path.stat().st_size
+        except FileNotFoundError:
+            existing_bytes = 0
+        if self.loaded or existing_bytes:
             return CompileCacheEvent(
                 status="existing",
                 key=self.key,
                 elapsed_s=time.perf_counter() - started,
-                artifact_bytes=self.path.stat().st_size,
+                artifact_bytes=existing_bytes,
             )
         saved = torch.compiler.save_cache_artifacts()
         if saved is None:
             raise RuntimeError("PyTorch produced no compiler cache after training")
         artifact, _info = saved
+        if len(artifact) > _MAX_CACHE_BYTES:
+            return CompileCacheEvent(
+                status="rejected",
+                key=self.key,
+                elapsed_s=time.perf_counter() - started,
+                artifact_bytes=len(artifact),
+            )
         staging = self.path.with_name(f".{self.key}.{os.getpid()}.{uuid.uuid4().hex}")
         try:
             staging.write_bytes(artifact)
             os.replace(staging, self.path)
+            _prune_cache(self.path.parent, protected=self.path)
         finally:
             staging.unlink(missing_ok=True)
         self.loaded = True
