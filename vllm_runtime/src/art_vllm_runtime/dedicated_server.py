@@ -242,6 +242,21 @@ _private_execution_receipts = _PrivateExecutionReceipts(
 _private_route_responses = _PrivateRouteResponses()
 
 
+async def _private_route_capture_failed(
+    request_identity: str, fingerprint: str, error: str
+) -> JSONResponse:
+    await _private_route_responses.release(request_identity, fingerprint)
+    await _private_execution_receipts.settle(request_identity, fingerprint, "ambiguous")
+    return JSONResponse(
+        content={
+            "error": error,
+            "type": "route_capture_incomplete",
+            "execution": "ambiguous",
+        },
+        status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value,
+    )
+
+
 def _patch_prebound_listener_tcp_nodelay(api_server: Any) -> None:
     create_server_socket = api_server.create_server_socket
 
@@ -993,19 +1008,10 @@ def _patch_art_runtime_routes() -> None:
                 return response
             if route_capture_max_bytes is not None:
                 if not routes:
-                    await _private_route_responses.release(
-                        request_identity, fingerprint
-                    )
-                    await _private_execution_receipts.settle(
-                        request_identity, fingerprint, "completed"
-                    )
-                    return JSONResponse(
-                        content={
-                            "error": "vLLM returned no routed experts",
-                            "type": "route_capture_incomplete",
-                            "execution": "completed",
-                        },
-                        status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value,
+                    return await _private_route_capture_failed(
+                        request_identity,
+                        fingerprint,
+                        "vLLM returned no routed experts",
                     )
                 try:
                     retained = encode_routed_experts_response(response.body, routes)
@@ -1013,19 +1019,8 @@ def _patch_art_runtime_routes() -> None:
                         request_identity, fingerprint, retained
                     )
                 except RuntimeError as error:
-                    await _private_route_responses.release(
-                        request_identity, fingerprint
-                    )
-                    await _private_execution_receipts.settle(
-                        request_identity, fingerprint, "completed"
-                    )
-                    return JSONResponse(
-                        content={
-                            "error": str(error),
-                            "type": "route_capture_incomplete",
-                            "execution": "completed",
-                        },
-                        status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value,
+                    return await _private_route_capture_failed(
+                        request_identity, fingerprint, str(error)
                     )
                 await _private_execution_receipts.settle(
                     request_identity, fingerprint, "completed"

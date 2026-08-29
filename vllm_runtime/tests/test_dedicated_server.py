@@ -395,6 +395,42 @@ async def test_private_route_responses_reserve_replay_and_ack_exact_bytes() -> N
     assert await responses.acknowledge(identity) is None
 
 
+@pytest.mark.asyncio
+async def test_route_capture_failure_is_ambiguous_and_releases_bytes(
+    monkeypatch,
+) -> None:
+    responses = dedicated_server._PrivateRouteResponses()
+    receipts = dedicated_server._PrivateExecutionReceipts(capacity=1)
+    identity = "a" * 64
+    fingerprint = "payload"
+    monkeypatch.setattr(dedicated_server, "_private_route_responses", responses)
+    monkeypatch.setattr(dedicated_server, "_private_execution_receipts", receipts)
+    await responses.reserve(
+        identity, fingerprint, 8, capacity_bytes=8, capacity_bundles=1
+    )
+    assert await receipts.claim(identity, fingerprint) is None
+
+    response = await dedicated_server._private_route_capture_failed(
+        identity, fingerprint, "missing routes"
+    )
+
+    assert response.status_code == 500
+    assert json.loads(response.body) == {
+        "error": "missing routes",
+        "type": "route_capture_incomplete",
+        "execution": "ambiguous",
+    }
+    receipt = await receipts.get(identity)
+    assert receipt is not None
+    assert receipt.execution == "ambiguous"
+    assert await responses.state() == {
+        "active_route_reservations": 0,
+        "retained_route_responses": 0,
+        "reserved_route_bytes": 0,
+        "retained_route_bytes": 0,
+    }
+
+
 def test_private_request_fingerprint_uses_authenticated_request_identity() -> None:
     from vllm.entrypoints.openai.chat_completion.protocol import (
         ChatCompletionRequest,
