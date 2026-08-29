@@ -332,13 +332,14 @@ class MegatronSlotCoordinator:
         *,
         checkpoints: MegatronCheckpointOperations | None = None,
         max_retained_operations: int = 128,
+        portable_archive: PortableSnapshotArchive | None = None,
     ) -> MegatronSlotRun:
         return await self._register_run(
             config,
             checkpoints=checkpoints,
             max_retained_operations=max_retained_operations,
             restore_id=None,
-            portable_archive=None,
+            portable_archive=portable_archive,
         )
 
     async def _register_run(

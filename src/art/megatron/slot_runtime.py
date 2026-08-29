@@ -28,6 +28,7 @@ from .optimizer_state import (
 )
 from .route_retention import RouteBundleOwnershipProvider
 from .runtime.build import build_trainer_runtime_spec
+from .runtime.portable_snapshot import PortableSnapshotArchive
 from .runtime.specs import TrainerGeneration, TrainerRuntimeSpec
 from .runtime_config import init_megatron_runtime_config
 from .slot_coordinator import (
@@ -110,6 +111,7 @@ class MegatronSlotRuntime:
         *,
         checkpoints: MegatronCheckpointOperations | None = None,
         max_retained_operations: int = 128,
+        portable_archive: PortableSnapshotArchive | None = None,
     ) -> MegatronRunBinding:
         config = await asyncio.to_thread(
             prepare_megatron_run_config,
@@ -120,6 +122,7 @@ class MegatronSlotRuntime:
             config,
             checkpoints=checkpoints,
             max_retained_operations=max_retained_operations,
+            portable_archive=portable_archive,
         )
         return MegatronRunBinding(run=run, config=config)
 

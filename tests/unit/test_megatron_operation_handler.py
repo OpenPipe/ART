@@ -635,6 +635,12 @@ async def test_slot_coordinator_serializes_four_logical_runs() -> None:
     for index in range(4):
         run_id = f"run-{index}"
         session_id = f"session-{index}"
+        generation = TrainerGeneration(
+            training_session_id=session_id,
+            policy_step=0,
+            generation_id=f"step-00000000-{index:032x}",
+            adapter_path=f"/adapter/{index}",
+        )
         runs.append(
             await slot.register_run(
                 MegatronOperationConfig(
@@ -644,16 +650,16 @@ async def test_slot_coordinator_serializes_four_logical_runs() -> None:
                         rank=index + 1,
                         target_modules=("q_proj",) if index % 2 else ("v_proj",),
                     ),
-                    source=TrainerGeneration(
-                        training_session_id=session_id,
-                        policy_step=0,
-                        generation_id=f"step-00000000-{index:032x}",
-                        adapter_path=f"/adapter/{index}",
-                    ),
+                    source=generation,
                     optimizer_state_path=f"/optimizer/{index}",
                     rollout_model=RolloutModelSpec(payload={}),
                     output_adapter_root=f"/adapter/{index}",
-                )
+                ),
+                portable_archive=(
+                    _portable_archive(generation, source_ref="local://portable")
+                    if index == 0
+                    else None
+                ),
             )
         )
 
@@ -681,6 +687,8 @@ async def test_slot_coordinator_serializes_four_logical_runs() -> None:
 
     assert {outcome.status for outcome in outcomes} == {"succeeded"}
     assert trainer.max_active == 1
+    assert runs[0].portable_install is not None
+    assert all(run.portable_install is None for run in runs[1:])
     assert set(trainer.executed_runs) == {run.run_id for run in runs}
     assert trainer.registered_adapters == {
         f"run-{index}": (
