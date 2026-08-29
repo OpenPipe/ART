@@ -14,6 +14,8 @@ from art.distributed.specs import NixlTransportSpec, TrainerMeshSpec
 from art.training.contracts import AdamConfig, OperationRef
 from art.types import TrainConfig, TrainSFTConfig
 
+from .portable_snapshot import PortableSnapshotArchive
+
 
 class _Spec(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
@@ -78,11 +80,13 @@ class TrainingRunSpec(_Spec):
     runtime_fingerprint: str = Field(min_length=1)
     training_session_id: str = Field(min_length=1)
     initial_learner_version: int = Field(ge=0)
+    initial_generation_id: str | None = Field(default=None, min_length=1)
     initial_operation_sequence: int = Field(default=0, ge=0)
     lora_rank: int = Field(ge=1)
     lora_target_modules: tuple[str, ...] = Field(min_length=1)
     initial_adapter_path: str = Field(min_length=1)
     optimizer_state_path: str = Field(min_length=1)
+    initial_portable_snapshot: PortableSnapshotArchive | None = None
     initial_event_timeout_s: float | None = Field(default=None, gt=0)
     event_timeout_s: float = Field(default=300.0, gt=0)
     shutdown_timeout_s: float = Field(default=240.0, gt=0)

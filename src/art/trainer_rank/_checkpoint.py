@@ -518,6 +518,31 @@ def prepare_checkpoint(
     return PreparedCheckpoint(root, config, keys, manifest, actual, custom)
 
 
+def required_local_checkpoint_files(
+    trainer: TrainerRank,
+    source: PreparedCheckpoint,
+) -> tuple[str, ...]:
+    """Return the canonical files required to restore this destination rank."""
+
+    required = {
+        "adapter_config.json",
+        "adapter_model.safetensors",
+        MANIFEST_FILE,
+    }
+    manifest = source.manifest
+    if manifest is None or manifest["optimizer"] is None:
+        raise RuntimeError("portable restore requires canonical optimizer state")
+    local_keys = set(trainer._local_lora_adapter_templates())
+    if missing := local_keys.difference(manifest["parameters"]):
+        raise RuntimeError(
+            f"portable checkpoint lacks destination adapter keys: {sorted(missing)[:8]}"
+        )
+    required.update(file for key in local_keys for file in manifest["parameters"][key])
+    if manifest.get("custom_tensors"):
+        required.update(manifest["files"])
+    return tuple(sorted(required))
+
+
 def validate_checkpoint(
     path: str | Path, *, require_optimizer: bool = False
 ) -> CheckpointManifest | None:

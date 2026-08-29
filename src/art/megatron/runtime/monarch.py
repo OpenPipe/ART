@@ -36,6 +36,11 @@ from art.utils.cache_dirs import configure_model_cache_env
 from art.utils.lifecycle import cleanup_after_failure, consume_future_exception
 
 from .data_plane import InMemoryPackedBatch, SFTBatchData
+from .portable_snapshot import (
+    PortableSnapshotInstallReceipt,
+    PortableSnapshotReadReceipt,
+    portable_snapshot_source_from_local_runtime,
+)
 from .publication import (
     TRAINER_PUBLICATION_EVENT_ADAPTER,
     TrainerPublicationEvent,
@@ -465,6 +470,10 @@ class MonarchTrainerActor(Actor):
         self._run_slot_executor = MCoreRunSlotExecutor(
             self._runtime,
             accumulator_l1_budget_bytes=runtime_spec.accumulator_l1_budget_bytes,
+            portable_snapshot_source=portable_snapshot_source_from_local_runtime(
+                run_id=run_id,
+                rank=rank,
+            ),
         )
         self._weight_offload = WeightOffloadManager.from_config(
             model=self._runtime.model,
@@ -586,16 +595,18 @@ class MonarchTrainerActor(Actor):
             if not self._command_job_open:
                 self._weight_offload.before_job()
                 opened_job = True
-            self._run_slot_executor.register_run(run_spec)
+            portable_read = self._run_slot_executor.register_run(run_spec)
             return {
                 "rank": self._runtime.rank,
                 "run_id": run_spec.run_id,
                 "lora_rank": run_spec.lora_rank,
                 "lora_target_modules": run_spec.lora_target_modules,
+                "portable_read": (
+                    None
+                    if portable_read is None
+                    else portable_read.model_dump(mode="json")
+                ),
             }
-        except BaseException:
-            self._valid = False
-            raise
         finally:
             if opened_job:
                 self._weight_offload.after_job()
@@ -1202,6 +1213,7 @@ class _CommandRunState:
     learner_version: int
     next_operation_sequence: int = 0
     open_forward_backward_ids: list[str] = field(default_factory=list)
+    portable_install: PortableSnapshotInstallReceipt | None = None
 
 
 def _command_run_identity(spec: TrainingRunSpec) -> tuple[Any, ...]:
@@ -1210,11 +1222,17 @@ def _command_run_identity(spec: TrainingRunSpec) -> tuple[Any, ...]:
         spec.runtime_fingerprint,
         spec.training_session_id,
         spec.initial_learner_version,
+        spec.initial_generation_id,
         spec.initial_operation_sequence,
         spec.lora_rank,
         spec.lora_target_modules,
         spec.initial_adapter_path,
         spec.optimizer_state_path,
+        (
+            None
+            if spec.initial_portable_snapshot is None
+            else spec.initial_portable_snapshot.archive_sha256
+        ),
     )
 
 
@@ -1278,7 +1296,9 @@ class MonarchTrainerRun:
     def valid(self) -> bool:
         return self._valid
 
-    async def register_command_run(self, run_spec: TrainingRunSpec) -> None:
+    async def register_command_run(
+        self, run_spec: TrainingRunSpec
+    ) -> PortableSnapshotInstallReceipt | None:
         if run_spec.runtime_fingerprint != self.runtime_spec.fingerprint:
             raise ValueError(
                 "training run does not match the trainer runtime fingerprint"
@@ -1289,7 +1309,7 @@ class MonarchTrainerRun:
         if prior is not None:
             if _command_run_identity(prior.spec) != _command_run_identity(run_spec):
                 raise RuntimeError("run_id was reused with different trainer state")
-            return
+            return prior.portable_install
         if self._jobs:
             raise RuntimeError("command runs cannot be registered after fused jobs")
         async with self._lock:
@@ -1297,7 +1317,7 @@ class MonarchTrainerRun:
             if prior is not None:
                 if _command_run_identity(prior.spec) != _command_run_identity(run_spec):
                     raise RuntimeError("run_id was reused with different trainer state")
-                return
+                return prior.portable_install
             try:
                 values = await asyncio.wait_for(
                     self._actors.register_command_run.call(run_spec.model_dump_json()),
@@ -1314,14 +1334,52 @@ class MonarchTrainerRun:
                     != {run_spec.lora_target_modules}
                 ):
                     raise RuntimeError("trainer ranks disagreed on run registration")
+                raw_reads = tuple(result["portable_read"] for result in results)
+                if run_spec.initial_portable_snapshot is None:
+                    if any(value is not None for value in raw_reads):
+                        raise RuntimeError(
+                            "ordinary run returned portable read evidence"
+                        )
+                    portable_install = None
+                else:
+                    if any(value is None for value in raw_reads):
+                        raise RuntimeError("portable run omitted rank read evidence")
+                    reads = tuple(
+                        sorted(
+                            (
+                                PortableSnapshotReadReceipt.model_validate(value)
+                                for value in raw_reads
+                            ),
+                            key=lambda value: value.destination_rank,
+                        )
+                    )
+                    portable_install = PortableSnapshotInstallReceipt(
+                        archive_sha256=(
+                            run_spec.initial_portable_snapshot.archive_sha256
+                        ),
+                        runtime_fingerprint=self.runtime_spec.fingerprint,
+                        ranks=reads,
+                    )
             except BaseException as error:
-                await self._invalidate_after_command_failure(error)
+                try:
+                    await asyncio.wait_for(
+                        self._actors.drain_command_run.call(run_spec.run_id),
+                        timeout=run_spec.event_timeout_s,
+                    )
+                except BaseException as cleanup_error:
+                    error.add_note(
+                        "portable registration rollback also failed: "
+                        f"{type(cleanup_error).__name__}: {cleanup_error}"
+                    )
+                    await self._invalidate_after_command_failure(error)
                 raise
             self._command_runs[run_spec.run_id] = _CommandRunState(
                 spec=run_spec,
                 learner_version=run_spec.initial_learner_version,
                 next_operation_sequence=run_spec.initial_operation_sequence,
+                portable_install=portable_install,
             )
+            return portable_install
 
     async def command_run_state(self, run_id: str) -> TrainerCommandRunState:
         async with self._lock:

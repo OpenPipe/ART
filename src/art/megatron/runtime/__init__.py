@@ -1,6 +1,19 @@
 from art.distributed.data_plane import PackedBatchLeaseSet, PackedBatchRef
 
 from .data_plane import InMemoryPackedBatch
+from .portable_snapshot import (
+    ART_PORTABLE_SNAPSHOT_SOURCE_FACTORY_ENV,
+    PortableSnapshotArchive,
+    PortableSnapshotFile,
+    PortableSnapshotGeneration,
+    PortableSnapshotInstallReceipt,
+    PortableSnapshotRankReceipt,
+    PortableSnapshotReadFile,
+    PortableSnapshotReadReceipt,
+    PortableSnapshotSource,
+    build_portable_snapshot_archive,
+    portable_snapshot_source_from_local_runtime,
+)
 from .specs import (
     AdapterReady,
     CurrentTrainConfig,
@@ -26,6 +39,15 @@ __all__ = [
     "InMemoryPackedBatch",
     "PackedBatchRef",
     "PackedBatchLeaseSet",
+    "ART_PORTABLE_SNAPSHOT_SOURCE_FACTORY_ENV",
+    "PortableSnapshotArchive",
+    "PortableSnapshotFile",
+    "PortableSnapshotGeneration",
+    "PortableSnapshotInstallReceipt",
+    "PortableSnapshotRankReceipt",
+    "PortableSnapshotReadFile",
+    "PortableSnapshotReadReceipt",
+    "PortableSnapshotSource",
     "TrainAccepted",
     "TrainCancelled",
     "TrainCompleted",
@@ -36,4 +58,6 @@ __all__ = [
     "TrainProgress",
     "TrainerRuntimeSpec",
     "TrainingRunSpec",
+    "build_portable_snapshot_archive",
+    "portable_snapshot_source_from_local_runtime",
 ]

@@ -5,9 +5,11 @@ __all__ = [
     "MegatronOperationConfig",
     "MegatronOperationHandler",
     "MegatronOperationRuntime",
+    "MegatronPolicyActivationTiming",
     "MegatronArtifactResourcePlan",
     "MegatronRetainedState",
     "MegatronSamplerPublicationReceipt",
+    "POLICY_ACTIVATION_LAG_METRIC",
     "MegatronMigrationContribution",
     "MegatronMigrationFence",
     "MegatronMigrationReplay",
@@ -33,9 +35,11 @@ def __getattr__(name: str) -> Any:
         "MegatronOperationConfig",
         "MegatronOperationHandler",
         "MegatronOperationRuntime",
+        "MegatronPolicyActivationTiming",
         "MegatronArtifactResourcePlan",
         "MegatronRetainedState",
         "MegatronSamplerPublicationReceipt",
+        "POLICY_ACTIVATION_LAG_METRIC",
         "bootstrap_megatron_operation_worker",
     }:
         from . import operation_handler

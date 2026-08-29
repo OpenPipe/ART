@@ -7,7 +7,7 @@ import hashlib
 import json
 from typing import Any, Literal, Protocol, cast
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, FiniteFloat, model_validator
 
 from art.distributed.art_runtime import ArtRuntime, DistributedPackedBatch
 from art.distributed.packing import PackingRequest
@@ -50,6 +50,8 @@ from .runtime.specs import (
     OptimizerJobSpec,
     TrainerGeneration,
 )
+
+POLICY_ACTIVATION_LAG_METRIC = "publication/policy_activation_lag_s"
 
 
 class MegatronCheckpointOperations(Protocol):
@@ -112,6 +114,27 @@ class MegatronRetainedState(BaseModel):
         return self
 
 
+class MegatronPolicyActivationTiming(BaseModel):
+    """Exact holder-local endpoints for one learner's serving activation."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    trainer_completed_monotonic_s: FiniteFloat = Field(ge=0)
+    serving_activated_monotonic_s: FiniteFloat = Field(ge=0)
+
+    @model_validator(mode="after")
+    def _validate_order(self) -> "MegatronPolicyActivationTiming":
+        if self.serving_activated_monotonic_s < self.trainer_completed_monotonic_s:
+            raise ValueError("serving activation preceded trainer completion")
+        return self
+
+    @property
+    def activation_lag_s(self) -> float:
+        return float(
+            self.serving_activated_monotonic_s - self.trainer_completed_monotonic_s
+        )
+
+
 class MegatronSamplerPublicationReceipt(BaseModel):
     """Private durable proof for one operation-keyed serving publication."""
 
@@ -127,6 +150,7 @@ class MegatronSamplerPublicationReceipt(BaseModel):
     runtime_lora_name: str | None = Field(default=None, min_length=1, max_length=512)
     serving_generation_id: str = Field(min_length=1, max_length=255)
     learner_version: int = Field(ge=0)
+    policy_activation_timing: MegatronPolicyActivationTiming | None = None
     holder_update_sequence: int | None = Field(default=None, ge=0)
     holder_update_id: str | None = Field(default=None, min_length=1, max_length=255)
     retained: tuple[MegatronRetainedState, ...] = Field(min_length=1, max_length=8)
@@ -170,6 +194,15 @@ class MegatronSamplerPublicationReceipt(BaseModel):
             )
         ):
             raise RuntimeError("sampler publication retained the wrong resource kind")
+        timing = self.policy_activation_timing
+        if paired_lora and timing is None:
+            raise RuntimeError("paired publication omitted policy activation timing")
+        if (
+            timing is not None
+            and self.result.metrics.get(POLICY_ACTIVATION_LAG_METRIC)
+            != timing.activation_lag_s
+        ):
+            raise RuntimeError("public policy activation lag changed receipt evidence")
         if not holder_backed and (
             self.holder_update_sequence is not None or self.holder_update_id is not None
         ):

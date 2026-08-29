@@ -34,6 +34,10 @@ from .operation_handler import (
     MegatronOperationHandler,
     MegatronSamplerPublicationReceipt,
 )
+from .runtime.portable_snapshot import (
+    PortableSnapshotArchive,
+    PortableSnapshotInstallReceipt,
+)
 from .runtime.specs import (
     TrainerCommandRunState,
     TrainerGeneration,
@@ -125,7 +129,9 @@ class _SharedTrainer(Protocol):
         source_topology: str,
     ) -> tuple[Any, Any, dict[str, float]]: ...
 
-    async def register_command_run(self, run_spec: TrainingRunSpec) -> None: ...
+    async def register_command_run(
+        self, run_spec: TrainingRunSpec
+    ) -> PortableSnapshotInstallReceipt | None: ...
 
     async def command_run_state(self, run_id: str) -> TrainerCommandRunState: ...
 
@@ -144,6 +150,7 @@ class _SharedTrainer(Protocol):
 class MegatronSlotRun:
     run_id: str
     worker: OperationWorker
+    portable_install: PortableSnapshotInstallReceipt | None = None
 
 
 @dataclass(slots=True)
@@ -162,6 +169,8 @@ class _RunState:
     migration_replay_outcomes: tuple[OperationExecutionOutcome, ...] | None = None
     migration_replay_error: str | None = None
     migration_replaying: bool = False
+    portable_archive_sha256: str | None = None
+    portable_install: PortableSnapshotInstallReceipt | None = None
 
 
 @dataclass(slots=True)
@@ -267,7 +276,7 @@ class MegatronSlotCoordinator:
         self._released_migration_fences: dict[str, MegatronMigrationFence] = {}
         self._resumed_migration_fences: dict[tuple[str, str], None] = {}
         self._aborted_migration_restores: dict[
-            tuple[str, str], MegatronOperationConfig
+            tuple[str, str], tuple[MegatronOperationConfig, str | None]
         ] = {}
         self._closed = False
 
@@ -283,6 +292,7 @@ class MegatronSlotCoordinator:
             checkpoints=checkpoints,
             max_retained_operations=max_retained_operations,
             restore_id=None,
+            portable_archive=None,
         )
 
     async def _register_run(
@@ -292,6 +302,7 @@ class MegatronSlotCoordinator:
         checkpoints: MegatronCheckpointOperations | None,
         max_retained_operations: int,
         restore_id: str | None,
+        portable_archive: PortableSnapshotArchive | None,
     ) -> MegatronSlotRun:
         async with self._condition:
             if self._closed:
@@ -302,7 +313,11 @@ class MegatronSlotCoordinator:
                 if aborted_key is None
                 else self._aborted_migration_restores.get(aborted_key)
             )
-            if aborted is not None and aborted != config:
+            archive_sha256 = (
+                None if portable_archive is None else portable_archive.archive_sha256
+            )
+            identity = (config, archive_sha256)
+            if aborted is not None and aborted != identity:
                 raise RuntimeError("aborted migration restore configuration changed")
             prior = self._runs.get(config.run_id)
             if prior is not None:
@@ -314,17 +329,35 @@ class MegatronSlotCoordinator:
                     raise RuntimeError("run_id is already in another lifecycle")
                 if prior.handler.config != config:
                     raise RuntimeError("run_id was reused with different configuration")
-                return MegatronSlotRun(config.run_id, prior.worker)
+                if prior.portable_archive_sha256 != archive_sha256:
+                    raise RuntimeError(
+                        "run_id was reused with another portable archive"
+                    )
+                return MegatronSlotRun(
+                    config.run_id, prior.worker, prior.portable_install
+                )
+            if portable_archive is not None:
+                generation = portable_archive.generation
+                if (
+                    generation.training_session_id != config.training_session_id
+                    or generation.policy_step != config.source.policy_step
+                    or generation.generation_id != config.source.generation_id
+                ):
+                    raise RuntimeError(
+                        "portable archive identifies another learner generation"
+                    )
             run_spec = TrainingRunSpec(
                 run_id=config.run_id,
                 runtime_fingerprint=self.trainer.runtime_spec.fingerprint,
                 training_session_id=config.training_session_id,
                 initial_learner_version=config.source.policy_step,
+                initial_generation_id=config.source.generation_id,
                 initial_operation_sequence=config.initial_operation_sequence,
                 lora_rank=config.adapter.rank,
                 lora_target_modules=config.adapter.target_modules,
                 initial_adapter_path=config.source.adapter_path,
                 optimizer_state_path=config.optimizer_state_path,
+                initial_portable_snapshot=portable_archive,
             )
             runtime_spec = self.trainer.runtime_spec
             if config.adapter.rank > runtime_spec.lora_rank:
@@ -333,7 +366,18 @@ class MegatronSlotCoordinator:
                 runtime_spec.lora_target_modules
             ):
                 raise ValueError("run LoRA targets exceed the slot capability")
-            await self.trainer.register_command_run(run_spec)
+            portable_install = await self.trainer.register_command_run(run_spec)
+            if (portable_archive is None) != (portable_install is None):
+                await self.trainer.drain_command_run(config.run_id)
+                raise RuntimeError(
+                    "trainer returned inconsistent portable install evidence"
+                )
+            if portable_install is not None and (
+                portable_install.archive_sha256 != archive_sha256
+                or portable_install.runtime_fingerprint != runtime_spec.fingerprint
+            ):
+                await self.trainer.drain_command_run(config.run_id)
+                raise RuntimeError("trainer installed another portable archive")
             handler = MegatronOperationHandler(
                 self.runtime,
                 self.trainer,
@@ -351,6 +395,8 @@ class MegatronSlotCoordinator:
                 handler=handler,
                 worker=worker,
                 migration_restore_id=restore_id,
+                portable_archive_sha256=archive_sha256,
+                portable_install=portable_install,
             )
             if aborted_key is not None:
                 self._aborted_migration_restores.pop(aborted_key, None)
@@ -359,7 +405,7 @@ class MegatronSlotCoordinator:
             self._order.append(config.run_id)
             if self._pump_task is None:
                 self._pump_task = asyncio.create_task(self._pump())
-            return MegatronSlotRun(config.run_id, worker)
+            return MegatronSlotRun(config.run_id, worker, portable_install)
 
     def resolve_run(self, run_id: str) -> MegatronSlotRun:
         state = self._runs.get(run_id)
@@ -370,7 +416,7 @@ class MegatronSlotCoordinator:
             or state.migration_restore_id is not None
         ):
             raise KeyError(f"Megatron slot run {run_id!r} is unavailable")
-        return MegatronSlotRun(run_id, state.worker)
+        return MegatronSlotRun(run_id, state.worker, state.portable_install)
 
     async def plan_artifacts(
         self, run_id: str, request: RunCommand
@@ -523,6 +569,7 @@ class MegatronSlotCoordinator:
         restore_id: str,
         checkpoints: MegatronCheckpointOperations | None = None,
         max_retained_operations: int = 128,
+        portable_archive: PortableSnapshotArchive | None = None,
     ) -> MegatronSlotRun:
         """Install a hidden recovery head for exact replay before activation."""
 
@@ -533,6 +580,7 @@ class MegatronSlotCoordinator:
             checkpoints=checkpoints,
             max_retained_operations=max_retained_operations,
             restore_id=restore_id,
+            portable_archive=portable_archive,
         )
 
     async def replay_migration_operations(
@@ -620,7 +668,7 @@ class MegatronSlotCoordinator:
             if state.activated_restore_id == restore_id:
                 if state.activated_migration_fence != expected:
                     raise RuntimeError("activated migration source fence changed")
-                return MegatronSlotRun(run_id, state.worker)
+                return MegatronSlotRun(run_id, state.worker, state.portable_install)
             if (
                 state.migration_restore_id != restore_id
                 or state.migration_replaying
@@ -663,7 +711,7 @@ class MegatronSlotCoordinator:
             state.activated_restore_id = restore_id
             state.activated_migration_fence = expected
             self._condition.notify_all()
-            return MegatronSlotRun(run_id, state.worker)
+            return MegatronSlotRun(run_id, state.worker, state.portable_install)
 
     async def abort_migration_run(self, run_id: str, restore_id: str) -> None:
         """Discard a hidden target after a failed or abandoned restore."""
@@ -729,7 +777,8 @@ class MegatronSlotCoordinator:
                     self._bound_migration_tombstones(self._released_migration_fences)
                 if aborted_restore_id is not None:
                     self._aborted_migration_restores[(run_id, aborted_restore_id)] = (
-                        state.handler.config
+                        state.handler.config,
+                        state.portable_archive_sha256,
                     )
                     self._bound_migration_tombstones(self._aborted_migration_restores)
                 self._runs.pop(run_id)

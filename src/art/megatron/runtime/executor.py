@@ -534,13 +534,18 @@ class _ResidentCommandRun:
     spec: TrainingRunSpec
     learner_version: int
     gradients: Any
+    portable_read: Any | None = None
 
 
 class MCoreRunSlotExecutor:
     """Execute independent exact-shape LoRAs on one warm MCore rank."""
 
     def __init__(
-        self, runtime: Any, *, accumulator_l1_budget_bytes: int = 16 * 1024**3
+        self,
+        runtime: Any,
+        *,
+        accumulator_l1_budget_bytes: int = 16 * 1024**3,
+        portable_snapshot_source: Any | None = None,
     ) -> None:
         from art.trainer_rank import TrainerRank
 
@@ -548,44 +553,82 @@ class MCoreRunSlotExecutor:
         self._trainer = TrainerRank(runtime)
         self._runs: dict[str, _ResidentCommandRun] = {}
         self._accumulator_l1_budget_bytes = accumulator_l1_budget_bytes
+        self._portable_snapshot_source = portable_snapshot_source
         self._closed = False
 
-    def register_run(self, spec: TrainingRunSpec) -> None:
+    def register_run(self, spec: TrainingRunSpec) -> Any | None:
         if self._closed:
             raise RuntimeError("Megatron run slot executor is closed")
         prior = self._runs.get(spec.run_id)
         if prior is not None:
             if prior.spec != spec:
                 raise RuntimeError("run_id was reused with different trainer state")
-            return
+            return prior.portable_read
         from art.megatron.model_support.lora_disk import load_adapter_config
         from art.megatron.training.gradient_accumulator import (
             ParameterGradientAccumulator,
         )
         from art.trainer_rank import MaterializedCheckpoint
 
-        adapter_config = load_adapter_config(spec.initial_adapter_path)
-        targets = adapter_config.get("target_modules")
-        target_modules = (
-            (targets,) if isinstance(targets, str) else tuple(targets or ())
-        )
-        if int(adapter_config.get("r", 0)) != spec.lora_rank or set(
-            target_modules
-        ) != set(spec.lora_target_modules):
-            raise RuntimeError("resident adapter shape differs from run admission")
-        with self._trainer.push_checkpoint(
-            MaterializedCheckpoint(
-                path=spec.run_id,
-                directory=spec.initial_adapter_path,
+        portable_read = None
+        installed = False
+        try:
+            if spec.initial_portable_snapshot is None:
+                adapter_config = load_adapter_config(spec.initial_adapter_path)
+                targets = adapter_config.get("target_modules")
+                target_modules = (
+                    (targets,) if isinstance(targets, str) else tuple(targets or ())
+                )
+                if int(adapter_config.get("r", 0)) != spec.lora_rank or set(
+                    target_modules
+                ) != set(spec.lora_target_modules):
+                    raise RuntimeError(
+                        "resident adapter shape differs from run admission"
+                    )
+                with self._trainer.push_checkpoint(
+                    MaterializedCheckpoint(
+                        path=spec.run_id,
+                        directory=spec.initial_adapter_path,
+                    )
+                ):
+                    pass
+            else:
+                archive = spec.initial_portable_snapshot
+                if self._portable_snapshot_source is None:
+                    raise RuntimeError(
+                        "portable run registration requires a snapshot source"
+                    )
+                generation = archive.generation
+                if (
+                    generation.training_session_id != spec.training_session_id
+                    or generation.policy_step != spec.initial_learner_version
+                    or generation.generation_id != spec.initial_generation_id
+                ):
+                    raise RuntimeError("portable archive identifies another generation")
+                from .portable_snapshot import install_portable_checkpoint
+
+                portable_read, _adapter_config = install_portable_checkpoint(
+                    self._trainer,
+                    self._portable_snapshot_source,
+                    archive,
+                    name=spec.run_id,
+                    destination_rank=int(self.runtime.rank),
+                    expected_lora_rank=spec.lora_rank,
+                    expected_lora_target_modules=spec.lora_target_modules,
+                )
+            installed = True
+            parameters = self._trainer.checkpoint_slot_parameters(spec.run_id)
+            self._runs[spec.run_id] = _ResidentCommandRun(
+                spec=spec,
+                learner_version=spec.initial_learner_version,
+                gradients=ParameterGradientAccumulator(parameters),
+                portable_read=portable_read,
             )
-        ):
-            pass
-        parameters = self._trainer.checkpoint_slot_parameters(spec.run_id)
-        self._runs[spec.run_id] = _ResidentCommandRun(
-            spec=spec,
-            learner_version=spec.initial_learner_version,
-            gradients=ParameterGradientAccumulator(parameters),
-        )
+        except BaseException:
+            if installed:
+                self._trainer.release_checkpoint_slot(spec.run_id)
+            raise
+        return portable_read
 
     def execute_forward_backward(
         self,
@@ -776,6 +819,9 @@ class MCoreRunSlotExecutor:
         for state in self._runs.values():
             state.gradients.discard()
         self._runs.clear()
+        if self._portable_snapshot_source is not None:
+            self._portable_snapshot_source.close()
+            self._portable_snapshot_source = None
 
     def _require_parent(
         self, job: ForwardBackwardJobSpec | ForwardJobSpec | OptimizerJobSpec

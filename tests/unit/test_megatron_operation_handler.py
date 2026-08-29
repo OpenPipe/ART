@@ -14,12 +14,24 @@ from art.distributed.data_plane import (
 from art.distributed.rollout import RolloutModelSpec
 from art.distributed.trajectory_store import TrajectoryGroupBundle
 from art.megatron.operation_handler import (
+    POLICY_ACTIVATION_LAG_METRIC,
     MegatronOperationConfig,
     MegatronOperationHandler,
+    MegatronPolicyActivationTiming,
     MegatronRetainedState,
     MegatronSamplerPublicationReceipt,
 )
 from art.megatron.runtime.monarch import MonarchTrainerRun
+from art.megatron.runtime.portable_snapshot import (
+    PortableSnapshotArchive,
+    PortableSnapshotFile,
+    PortableSnapshotGeneration,
+    PortableSnapshotInstallReceipt,
+    PortableSnapshotRankReceipt,
+    PortableSnapshotReadFile,
+    PortableSnapshotReadReceipt,
+    build_portable_snapshot_archive,
+)
 from art.megatron.runtime.specs import TrainerCommandRunState, TrainerGeneration
 from art.megatron.slot_coordinator import (
     MegatronMigrationContribution,
@@ -118,7 +130,7 @@ class _Trainer:
     def __init__(self) -> None:
         topology = SimpleNamespace(tp=1, cp=1, pp=1)
         self.runtime_spec = SimpleNamespace(
-            fingerprint="runtime",
+            fingerprint="e" * 64,
             lora_rank=32,
             lora_target_modules=("q_proj", "v_proj"),
             packed_sequence_length=8,
@@ -134,7 +146,7 @@ class _Trainer:
         self.run_states: dict[str, TrainerCommandRunState] = {}
         self.migration_releases: list[str] = []
 
-    async def register_command_run(self, run_spec) -> None:
+    async def register_command_run(self, run_spec):
         self.registered_runs.add(run_spec.run_id)
         self.registered_adapters[run_spec.run_id] = (
             run_spec.lora_rank,
@@ -146,6 +158,27 @@ class _Trainer:
             learner_version=run_spec.initial_learner_version,
             next_operation_sequence=run_spec.initial_operation_sequence,
             open_forward_backward_operation_ids=(),
+        )
+        archive = run_spec.initial_portable_snapshot
+        if archive is None:
+            return None
+        return PortableSnapshotInstallReceipt(
+            archive_sha256=archive.archive_sha256,
+            runtime_fingerprint=self.runtime_spec.fingerprint,
+            ranks=(
+                PortableSnapshotReadReceipt(
+                    archive_sha256=archive.archive_sha256,
+                    destination_rank=0,
+                    files=(
+                        PortableSnapshotReadFile(
+                            source_rank=0,
+                            relative_path="checkpoint.json",
+                            byte_count=1,
+                            sha256="a" * 64,
+                        ),
+                    ),
+                ),
+            ),
         )
 
     async def command_run_state(self, run_id: str) -> TrainerCommandRunState:
@@ -259,6 +292,40 @@ def _batch() -> RlTrajectoryBatch:
         groups=(TrajectoryGroupBundle.from_group(TrajectoryGroup()),),
         min_source_version=0,
         max_source_version=0,
+    )
+
+
+def _portable_archive(
+    generation: TrainerGeneration,
+    *,
+    source_ref: str,
+    payload_sha256: str = "a" * 64,
+) -> PortableSnapshotArchive:
+    return build_portable_snapshot_archive(
+        generation=PortableSnapshotGeneration(
+            training_session_id=generation.training_session_id,
+            policy_step=generation.policy_step,
+            generation_id=generation.generation_id,
+        ),
+        checkpoint_digest="d" * 64,
+        ranks=(
+            PortableSnapshotRankReceipt(
+                rank=0,
+                files=tuple(
+                    PortableSnapshotFile(
+                        relative_path=path,
+                        byte_count=1,
+                        sha256=payload_sha256,
+                        source_ref=f"{source_ref}/{path}",
+                    )
+                    for path in (
+                        "adapter_config.json",
+                        "adapter_model.safetensors",
+                        "checkpoint.json",
+                    )
+                ),
+            ),
+        ),
     )
 
 
@@ -490,6 +557,7 @@ async def test_sampler_publication_receipt_lives_until_operation_retirement() ->
         async def save_weights_for_sampler(self, request, operation, generation):
             result = SamplerWeightsResult(
                 operation_id=operation.operation_id,
+                metrics={POLICY_ACTIVATION_LAG_METRIC: 1.25},
                 checkpoint=CheckpointRef(
                     run_id=operation.run_id,
                     learner_version=generation.policy_step,
@@ -506,6 +574,10 @@ async def test_sampler_publication_receipt_lives_until_operation_retirement() ->
                 runtime_lora_name="paired-model@step-0",
                 serving_generation_id=generation.generation_id,
                 learner_version=generation.policy_step,
+                policy_activation_timing=MegatronPolicyActivationTiming(
+                    trainer_completed_monotonic_s=10.0,
+                    serving_activated_monotonic_s=11.25,
+                ),
                 holder_update_sequence=3,
                 holder_update_id="holder-update-3",
                 retained=(
@@ -755,16 +827,29 @@ async def test_slot_migration_fences_replays_and_releases_one_run() -> None:
         rollout_model=RolloutModelSpec(payload={}),
         output_adapter_root="/adapter",
     )
+    abort_archive = _portable_archive(
+        abort_config.source,
+        source_ref="caios://source-a",
+    )
     abort = await slot.install_migration_run(
         abort_config,
         restore_id="abort-restore",
+        portable_archive=abort_archive,
     )
+    assert abort.portable_install is not None
     assert abort.run_id == "abort-run"
     await slot.abort_migration_run("abort-run", "abort-restore")
     await slot.abort_migration_run("abort-run", "abort-restore")
+    retry_archive = _portable_archive(
+        abort_config.source,
+        source_ref="wandb://source-b",
+    )
+    assert retry_archive.archive_sha256 == abort_archive.archive_sha256
+    assert retry_archive.receipt_sha256 != abort_archive.receipt_sha256
     retry = await slot.install_migration_run(
         abort_config,
         restore_id="abort-restore",
+        portable_archive=retry_archive,
     )
     assert retry.run_id == "abort-run"
     await slot.abort_migration_run("abort-run", "abort-restore")
@@ -774,6 +859,7 @@ async def test_slot_migration_fences_replays_and_releases_one_run() -> None:
                 update={"optimizer_state_path": "/optimizer/changed"}
             ),
             restore_id="abort-restore",
+            portable_archive=retry_archive,
         )
     await slot.aclose()
 
