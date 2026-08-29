@@ -57,6 +57,7 @@ def _start_sidecar(*, tokens: list[str], port: int = 0) -> FastMetricsSidecar:
 def test_fast_metrics_listener_auth_keepalive_and_scalar_payload() -> None:
     sidecar = _start_sidecar(tokens=["first", "second"])
     assert sidecar.process.pid != os.getpid()
+    assert os.getsid(sidecar.process.pid) == sidecar.process.pid
     connection = HTTPConnection("127.0.0.1", sidecar.port, timeout=1.0)
     try:
         assert _get(connection)[0] == 401

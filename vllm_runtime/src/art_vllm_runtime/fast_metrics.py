@@ -281,6 +281,7 @@ class FastMetricsSidecar:
                     stdin=subprocess.DEVNULL,
                     pass_fds=(writer.fd, ready_write, lifetime_read),
                     env={"LC_ALL": "C"},
+                    start_new_session=True,
                 )
             finally:
                 os.close(ready_write)
