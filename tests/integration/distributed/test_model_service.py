@@ -17,6 +17,7 @@ from art.local import checkpoints as checkpoints_module
 from art.megatron import distributed_service as service_module
 from art.megatron.backend import MegatronBackend
 from art.megatron.distributed_service import DistributedMegatronService
+from art.megatron.runtime.specs import TrainerGeneration
 from art.serving_capabilities import ART_SERVING_PROTOCOL_VERSION, ServingCapabilities
 
 
@@ -46,6 +47,30 @@ def _service(tmp_path, runtime) -> DistributedMegatronService:
         runtime=runtime,
         enable_expert_replay=False,
     )
+
+
+def test_exact_resident_generation_controls_trainer_freshness(tmp_path) -> None:
+    service = _service(tmp_path, SimpleNamespace())
+    current = TrainerGeneration(
+        training_session_id="session",
+        policy_step=1,
+        generation_id=f"step-{1:08d}-{'1' * 32}",
+        adapter_path=str(tmp_path / "checkpoints" / "0001"),
+    )
+    service._latest_step = 1
+    service._learner_generation = current
+    service._trainer = SimpleNamespace(valid=True, learner_version=0)
+    service._trainer_resident_generation = TrainerGeneration(
+        training_session_id="session",
+        policy_step=0,
+        generation_id=f"step-{0:08d}-{'0' * 32}",
+        adapter_path=str(tmp_path / "checkpoints" / "0000"),
+    )
+
+    assert not service._trainer_is_current()
+
+    service._trainer_resident_generation = current
+    assert service._trainer_is_current()
 
 
 def test_endpoint_url_brackets_ipv6_literals() -> None:

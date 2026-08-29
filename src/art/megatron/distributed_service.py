@@ -352,10 +352,19 @@ class DistributedMegatronService:
             raise RuntimeError("distributed model service is closed")
 
     def _trainer_is_current(self) -> bool:
+        trainer = self._trainer
+        learner = self._learner_generation
+        resident = self._trainer_resident_generation
         return (
-            self._trainer is not None
-            and self._trainer.valid
-            and self._trainer.learner_version == self._latest_step
+            trainer is not None
+            and trainer.valid
+            and learner is not None
+            and learner.policy_step == self._latest_step
+            and (
+                resident == learner
+                # Cold trainers have not established an exact resident generation yet.
+                or (resident is None and trainer.learner_version == self._latest_step)
+            )
         )
 
     def _resident_trainer_for_generation(
