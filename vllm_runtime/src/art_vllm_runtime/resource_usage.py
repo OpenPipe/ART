@@ -493,12 +493,15 @@ def attach_scheduler_usage(
     allocations = getattr(scheduler_output, _GPU_ALLOCATIONS, None)
     owners = getattr(scheduler_output, _GPU_OWNERS, None)
     if scheduler_output.total_num_scheduled_tokens:
-        if not isinstance(allocations, Mapping) or not isinstance(owners, Mapping):
-            raise RuntimeError("GPU service transport is unavailable")
-        for request_id, value in allocations.items():
-            payload = owners.get(request_id)
-            if payload is None:
-                continue
+        if not isinstance(owners, Mapping):
+            raise RuntimeError("GPU service owner transport is unavailable")
+        if not isinstance(allocations, Mapping):
+            if owners:
+                raise RuntimeError("GPU service allocation transport is unavailable")
+            allocations = {}
+        for request_id, payload in owners.items():
+            if request_id not in allocations:
+                raise RuntimeError("GPU service request allocation is unavailable")
             client_index, owner_payload = payload
             target = outputs_by_client.get(client_index)
             if target is None:
@@ -510,7 +513,7 @@ def attach_scheduler_usage(
                 target,
                 [
                     {
-                        "gpu_service_ns": value,
+                        "gpu_service_ns": allocations[request_id],
                         "kind": "gpu",
                         "request_id": owner.request_id,
                         "version": 1,
