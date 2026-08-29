@@ -169,13 +169,15 @@ class _Trainer:
                 PortableSnapshotReadReceipt(
                     archive_sha256=archive.archive_sha256,
                     destination_rank=0,
-                    files=(
+                    files=tuple(
                         PortableSnapshotReadFile(
-                            source_rank=0,
-                            relative_path="checkpoint.json",
-                            byte_count=1,
-                            sha256="a" * 64,
-                        ),
+                            source_rank=receipt.rank,
+                            relative_path=file.relative_path,
+                            byte_count=file.byte_count,
+                            sha256=file.sha256,
+                        )
+                        for receipt in archive.ranks
+                        for file in receipt.files
                     ),
                 ),
             ),
@@ -311,9 +313,16 @@ def _portable_archive(
         ranks=(
             PortableSnapshotRankReceipt(
                 rank=0,
+                checkpoint_digest="d" * 64,
                 files=tuple(
                     PortableSnapshotFile(
+                        object_id=f"object/{path}",
                         relative_path=path,
+                        component=(
+                            "metadata"
+                            if path in {"adapter_config.json", "checkpoint.json"}
+                            else "adapter"
+                        ),
                         byte_count=1,
                         sha256=payload_sha256,
                         source_ref=f"{source_ref}/{path}",

@@ -37,8 +37,16 @@ from art.utils.lifecycle import cleanup_after_failure, consume_future_exception
 
 from .data_plane import InMemoryPackedBatch, SFTBatchData
 from .portable_snapshot import (
+    PortableSnapshotArchive,
+    PortableSnapshotExportReceipt,
+    PortableSnapshotGeneration,
     PortableSnapshotInstallReceipt,
+    PortableSnapshotLoadReceipt,
+    PortableSnapshotRankReceipt,
     PortableSnapshotReadReceipt,
+    PortableSnapshotTensorOwner,
+    build_portable_snapshot_archive,
+    portable_snapshot_sink_from_local_runtime,
     portable_snapshot_source_from_local_runtime,
 )
 from .publication import (
@@ -474,6 +482,10 @@ class MonarchTrainerActor(Actor):
                 run_id=run_id,
                 rank=rank,
             ),
+            portable_snapshot_sink=portable_snapshot_sink_from_local_runtime(
+                run_id=run_id,
+                rank=rank,
+            ),
         )
         self._weight_offload = WeightOffloadManager.from_config(
             model=self._runtime.model,
@@ -610,6 +622,46 @@ class MonarchTrainerActor(Actor):
         finally:
             if opened_job:
                 self._weight_offload.after_job()
+
+    @endpoint
+    def export_command_run_checkpoint(
+        self,
+        run_id: str,
+        generation_json: str,
+        export_id: str,
+    ) -> dict[str, Any]:
+        if not self._valid:
+            raise RuntimeError("trainer actor runtime is invalid")
+        generation = TrainerGeneration.model_validate_json(generation_json)
+        receipt = self._run_slot_executor.export_run_checkpoint(
+            run_id, generation, export_id
+        )
+        return {
+            "rank": self._runtime.rank,
+            "run_id": run_id,
+            "receipt": None if receipt is None else receipt.model_dump(mode="json"),
+            "tensor_owners": self._run_slot_executor.run_tensor_owners(run_id),
+        }
+
+    @endpoint
+    def install_command_run_checkpoint(
+        self,
+        run_id: str,
+        generation_json: str,
+        archive_json: str,
+    ) -> dict[str, Any]:
+        if not self._valid:
+            raise RuntimeError("trainer actor runtime is invalid")
+        generation = TrainerGeneration.model_validate_json(generation_json)
+        archive = PortableSnapshotArchive.model_validate_json(archive_json)
+        receipt = self._run_slot_executor.install_run_checkpoint(
+            run_id, generation, archive
+        )
+        return {
+            "rank": self._runtime.rank,
+            "run_id": run_id,
+            "receipt": receipt.model_dump(mode="json"),
+        }
 
     @endpoint
     def execute(
@@ -1274,6 +1326,10 @@ class MonarchTrainerRun:
         )
         self._jobs: dict[str, tuple[str, tuple[TrainEvent, ...]]] = {}
         self._operations: dict[str, tuple[str, dict[str, Any]]] = {}
+        self._checkpoint_exports: dict[
+            str, tuple[tuple[str, TrainerGeneration], PortableSnapshotExportReceipt]
+        ] = {}
+        self._checkpoint_loads: dict[str, tuple[str, PortableSnapshotLoadReceipt]] = {}
         self._command_mode = False
         self._lock = asyncio.Lock()
         self._cp_lookahead_lock = asyncio.Lock()
@@ -1360,6 +1416,9 @@ class MonarchTrainerRun:
                         runtime_fingerprint=self.runtime_spec.fingerprint,
                         ranks=reads,
                     )
+                    portable_install.validate_archive(
+                        run_spec.initial_portable_snapshot
+                    )
             except BaseException as error:
                 try:
                     await asyncio.wait_for(
@@ -1395,6 +1454,162 @@ class MonarchTrainerRun:
                     state.open_forward_backward_ids
                 ),
             )
+
+    async def export_command_run_checkpoint(
+        self,
+        run_id: str,
+        generation: TrainerGeneration,
+        export_id: str,
+    ) -> PortableSnapshotExportReceipt:
+        identity = (run_id, generation)
+        prior = self._checkpoint_exports.get(export_id)
+        if prior is not None:
+            if prior[0] != identity:
+                raise RuntimeError("checkpoint export ID was reused")
+            return prior[1]
+        async with self._lock:
+            prior = self._checkpoint_exports.get(export_id)
+            if prior is not None:
+                if prior[0] != identity:
+                    raise RuntimeError("checkpoint export ID was reused")
+                return prior[1]
+            state = self._command_runs.get(run_id)
+            if (
+                state is None
+                or state.open_forward_backward_ids
+                or state.spec.training_session_id != generation.training_session_id
+                or state.learner_version != generation.policy_step
+            ):
+                raise RuntimeError("checkpoint export generation is not quiescent")
+            values = await asyncio.wait_for(
+                self._actors.export_command_run_checkpoint.call(
+                    run_id, generation.model_dump_json(), export_id
+                ),
+                timeout=state.spec.event_timeout_s,
+            )
+            results = list(values.values())
+            world_size = len(self.runtime_spec.trainer_mesh.ranks)
+            if {result["rank"] for result in results} != set(range(world_size)) or {
+                result["run_id"] for result in results
+            } != {run_id}:
+                raise RuntimeError("trainer ranks disagreed on checkpoint export")
+            raw_receipts = tuple(
+                result["receipt"] for result in results if result["receipt"] is not None
+            )
+            if len(raw_receipts) != 1:
+                raise RuntimeError("checkpoint export requires one committed inventory")
+            rank_receipt = PortableSnapshotRankReceipt.model_validate(raw_receipts[0])
+            if rank_receipt.rank != 0:
+                raise RuntimeError(
+                    "checkpoint export inventory is not coordinator-owned"
+                )
+            owners: dict[tuple[str, int], int] = {}
+            for result in results:
+                rank = int(result["rank"])
+                for name, shard_rank in result["tensor_owners"]:
+                    key = (str(name), int(shard_rank))
+                    owners[key] = min(rank, owners.get(key, rank))
+            portable_generation = PortableSnapshotGeneration(
+                training_session_id=generation.training_session_id,
+                policy_step=generation.policy_step,
+                generation_id=generation.generation_id,
+            )
+            archive = build_portable_snapshot_archive(
+                generation=portable_generation,
+                checkpoint_digest=rank_receipt.checkpoint_digest,
+                ranks=(rank_receipt,),
+            )
+            receipt = PortableSnapshotExportReceipt(
+                export_id=export_id,
+                generation=portable_generation,
+                archive=archive,
+                tensor_owners=tuple(
+                    PortableSnapshotTensorOwner(
+                        tensor_name=name,
+                        shard_rank=shard_rank,
+                        rank=rank,
+                    )
+                    for (name, shard_rank), rank in sorted(owners.items())
+                ),
+            )
+            self._checkpoint_exports[export_id] = (identity, receipt)
+            while len(self._checkpoint_exports) > 128:
+                self._checkpoint_exports.pop(next(iter(self._checkpoint_exports)))
+            return receipt
+
+    async def install_command_run_checkpoint(
+        self,
+        operation: OperationRef,
+        generation: TrainerGeneration,
+        archive: PortableSnapshotArchive,
+    ) -> PortableSnapshotLoadReceipt:
+        fingerprint = hashlib.sha256(
+            (
+                operation.model_dump_json()
+                + "\0"
+                + generation.model_dump_json()
+                + "\0"
+                + archive.archive_sha256
+            ).encode()
+        ).hexdigest()
+        prior = self._checkpoint_loads.get(operation.operation_id)
+        if prior is not None:
+            if prior[0] != fingerprint:
+                raise RuntimeError("checkpoint load operation was reused")
+            return prior[1]
+        async with self._lock:
+            prior = self._checkpoint_loads.get(operation.operation_id)
+            if prior is not None:
+                if prior[0] != fingerprint:
+                    raise RuntimeError("checkpoint load operation was reused")
+                return prior[1]
+            state = self._command_runs.get(operation.run_id)
+            if (
+                operation.kind != "load_state"
+                or operation.reserved_output_learner_version != generation.policy_step
+                or state is None
+                or state.open_forward_backward_ids
+                or state.learner_version != operation.learner_parent_version
+                or state.next_operation_sequence != operation.sequence_id
+                or state.spec.training_session_id != generation.training_session_id
+            ):
+                raise RuntimeError("checkpoint load command changed run state")
+            values = await asyncio.wait_for(
+                self._actors.install_command_run_checkpoint.call(
+                    operation.run_id,
+                    generation.model_dump_json(),
+                    archive.model_dump_json(),
+                ),
+                timeout=state.spec.event_timeout_s,
+            )
+            reads = tuple(
+                sorted(
+                    (
+                        PortableSnapshotReadReceipt.model_validate(result["receipt"])
+                        for result in values.values()
+                    ),
+                    key=lambda item: item.destination_rank,
+                )
+            )
+            install = PortableSnapshotInstallReceipt(
+                archive_sha256=archive.archive_sha256,
+                runtime_fingerprint=self.runtime_spec.fingerprint,
+                ranks=reads,
+            )
+            install.validate_archive(archive)
+            receipt = PortableSnapshotLoadReceipt(
+                operation_id=operation.operation_id,
+                generation=PortableSnapshotGeneration(
+                    training_session_id=generation.training_session_id,
+                    policy_step=generation.policy_step,
+                    generation_id=generation.generation_id,
+                ),
+                install=install,
+            )
+            self._checkpoint_loads[operation.operation_id] = (fingerprint, receipt)
+            while len(self._checkpoint_loads) > 128:
+                self._checkpoint_loads.pop(next(iter(self._checkpoint_loads)))
+            return receipt
 
     async def record_control_command(
         self,

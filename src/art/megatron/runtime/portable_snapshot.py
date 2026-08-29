@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from dataclasses import replace
 import hashlib
 import importlib
 import json
@@ -8,6 +9,7 @@ import mmap
 import os
 from pathlib import Path, PurePosixPath
 import re
+import shutil
 import tempfile
 from typing import TYPE_CHECKING, BinaryIO, Literal, Protocol, cast
 
@@ -17,6 +19,7 @@ if TYPE_CHECKING:
     from art.trainer_rank import TrainerRank
 
 ART_PORTABLE_SNAPSHOT_SOURCE_FACTORY_ENV = "ART_PORTABLE_SNAPSHOT_SOURCE_FACTORY"
+ART_PORTABLE_SNAPSHOT_SINK_FACTORY_ENV = "ART_PORTABLE_SNAPSHOT_SINK_FACTORY"
 _SHA256 = r"^[0-9a-f]{64}$"
 _GENERATION_ID = re.compile(r"^step-(?P<step>\d{8,})-[0-9a-f]{32}$")
 _ENTRYPOINT = re.compile(
@@ -50,7 +53,9 @@ class PortableSnapshotGeneration(_Contract):
 
 
 class PortableSnapshotFile(_Contract):
+    object_id: str = Field(min_length=1, max_length=1024)
     relative_path: str = Field(min_length=1)
+    component: Literal["metadata", "adapter", "optimizer"]
     byte_count: int = Field(gt=0, le=(1 << 63) - 1)
     sha256: str = Field(pattern=_SHA256)
     source_ref: str = Field(min_length=1, max_length=65_536)
@@ -63,6 +68,7 @@ class PortableSnapshotFile(_Contract):
             or str(path) != self.relative_path
             or self.relative_path in {"", "."}
             or ".." in path.parts
+            or re.match(r"^[A-Za-z]:", self.relative_path) is not None
             or "\\" in self.relative_path
             or "\0" in self.relative_path
         ):
@@ -72,6 +78,7 @@ class PortableSnapshotFile(_Contract):
 
 class PortableSnapshotRankReceipt(_Contract):
     rank: int = Field(ge=0)
+    checkpoint_digest: str = Field(pattern=_SHA256)
     files: tuple[PortableSnapshotFile, ...] = Field(
         min_length=1, max_length=_MAX_PORTABLE_FILES
     )
@@ -123,6 +130,43 @@ class PortableSnapshotReadFile(_Contract):
     sha256: str = Field(pattern=_SHA256)
 
 
+class PortableSnapshotPreparedFile(_Contract):
+    relative_path: str = Field(min_length=1)
+    component: Literal["metadata", "adapter", "optimizer"]
+    byte_count: int = Field(gt=0, le=(1 << 63) - 1)
+    sha256: str = Field(pattern=_SHA256)
+
+
+class PortableSnapshotCommittedFile(_Contract):
+    relative_path: str = Field(min_length=1)
+    object_id: str = Field(min_length=1, max_length=1024)
+    source_ref: str = Field(min_length=1, max_length=65_536)
+
+
+class PortableSnapshotTensorOwner(_Contract):
+    tensor_name: str = Field(min_length=1, max_length=4096)
+    shard_rank: int = Field(ge=0)
+    rank: int = Field(ge=0)
+
+
+class PortableSnapshotExportReceipt(_Contract):
+    export_id: str = Field(min_length=1, max_length=255)
+    generation: PortableSnapshotGeneration
+    archive: PortableSnapshotArchive
+    tensor_owners: tuple[PortableSnapshotTensorOwner, ...] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def _validate_generation(self) -> "PortableSnapshotExportReceipt":
+        if self.archive.generation != self.generation:
+            raise ValueError("portable export archive changed generation")
+        identities = tuple(
+            (owner.tensor_name, owner.shard_rank) for owner in self.tensor_owners
+        )
+        if identities != tuple(sorted(set(identities))):
+            raise ValueError("portable tensor owners must be sorted and unique")
+        return self
+
+
 class PortableSnapshotReadReceipt(_Contract):
     archive_sha256: str = Field(pattern=_SHA256)
     destination_rank: int = Field(ge=0)
@@ -152,6 +196,42 @@ class PortableSnapshotInstallReceipt(_Contract):
             raise ValueError("portable destination ranks installed another archive")
         return self
 
+    def validate_archive(self, archive: PortableSnapshotArchive) -> None:
+        if self.archive_sha256 != archive.archive_sha256:
+            raise RuntimeError("portable install identifies another archive")
+        expected = {
+            file.relative_path: (
+                receipt.rank,
+                file.byte_count,
+                file.sha256,
+            )
+            for receipt in archive.ranks
+            for file in receipt.files
+        }
+        observed: dict[str, tuple[int, int, str]] = {}
+        for receipt in self.ranks:
+            for file in receipt.files:
+                identity = (file.source_rank, file.byte_count, file.sha256)
+                if expected.get(file.relative_path) != identity:
+                    raise RuntimeError(
+                        "portable install read evidence changed archive inventory: "
+                        f"{file.relative_path}"
+                    )
+                prior = observed.setdefault(file.relative_path, identity)
+                if prior != identity:
+                    raise RuntimeError(
+                        "portable destination ranks disagreed on a source file"
+                    )
+        if set(observed) != set(expected):
+            missing = sorted(set(expected).difference(observed))
+            raise RuntimeError(f"portable install omitted archive files: {missing[:8]}")
+
+
+class PortableSnapshotLoadReceipt(_Contract):
+    operation_id: str = Field(min_length=1, max_length=64)
+    generation: PortableSnapshotGeneration
+    install: PortableSnapshotInstallReceipt
+
 
 class PortableSnapshotSource(Protocol):
     """Service-injected reader for private immutable checkpoint files."""
@@ -165,12 +245,31 @@ class PortableSnapshotSource(Protocol):
     def close(self, *, deadline: float | None = None) -> None: ...
 
 
+class PortableSnapshotSink(Protocol):
+    """Rank-local durable writer injected by the service runtime."""
+
+    def commit_prepared(
+        self,
+        *,
+        export_id: str,
+        generation: PortableSnapshotGeneration,
+        rank: int,
+        checkpoint_digest: str,
+        directory: Path,
+        files: tuple[PortableSnapshotPreparedFile, ...],
+    ) -> tuple[PortableSnapshotCommittedFile, ...]: ...
+
+    def close(self, *, deadline: float | None = None) -> None: ...
+
+
 def build_portable_snapshot_archive(
     *,
     generation: PortableSnapshotGeneration,
     checkpoint_digest: str,
     ranks: tuple[PortableSnapshotRankReceipt, ...],
 ) -> PortableSnapshotArchive:
+    if any(receipt.checkpoint_digest != checkpoint_digest for receipt in ranks):
+        raise ValueError("portable ranks disagree on checkpoint digest")
     provisional = PortableSnapshotArchive.model_construct(
         format="art_trainer_rank_checkpoint_v1",
         generation=generation,
@@ -223,6 +322,113 @@ def portable_snapshot_source_from_local_runtime(
     ):
         raise RuntimeError("portable snapshot source factory returned an invalid port")
     return cast(PortableSnapshotSource, source)
+
+
+def portable_snapshot_sink_from_local_runtime(
+    *,
+    run_id: str,
+    rank: int,
+    environ: Mapping[str, str] | None = None,
+) -> PortableSnapshotSink | None:
+    if not run_id or rank < 0:
+        raise ValueError("portable snapshot sink requires a run and rank")
+    entrypoint = (os.environ if environ is None else environ).get(
+        ART_PORTABLE_SNAPSHOT_SINK_FACTORY_ENV
+    )
+    if entrypoint is None:
+        return None
+    match = _ENTRYPOINT.fullmatch(entrypoint)
+    if match is None:
+        raise RuntimeError(
+            f"{ART_PORTABLE_SNAPSHOT_SINK_FACTORY_ENV} must be <module>:<callable>"
+        )
+    try:
+        factory = getattr(
+            importlib.import_module(match.group("module")), match.group("callable")
+        )
+    except (AttributeError, ImportError) as error:
+        raise RuntimeError("cannot resolve portable snapshot sink factory") from error
+    if not callable(factory):
+        raise RuntimeError("portable snapshot sink factory is not callable")
+    sink = factory(run_id=run_id, rank=rank)
+    if any(
+        not callable(getattr(sink, method, None))
+        for method in ("commit_prepared", "close")
+    ):
+        raise RuntimeError("portable snapshot sink factory returned an invalid port")
+    return cast(PortableSnapshotSink, sink)
+
+
+def export_portable_checkpoint(
+    trainer: TrainerRank,
+    sink: PortableSnapshotSink,
+    generation: PortableSnapshotGeneration,
+    *,
+    export_id: str,
+    name: str,
+    rank: int,
+) -> PortableSnapshotRankReceipt | None:
+    """Commit canonical TrainerRank files and return private immutable refs."""
+
+    if not export_id or not name or rank < 0:
+        raise ValueError("portable checkpoint export identity is invalid")
+    from art.trainer_rank import _checkpoint
+
+    digest = hashlib.sha256(f"{name}\0{export_id}".encode()).hexdigest()
+    root = Path(tempfile.gettempdir()) / f"art-portable-export-{digest}"
+    reservation = root.with_name(f".{root.name}.reserved")
+    snapshots = tuple(root.parent.glob(f".{root.name}.snapshot-r{rank}-*"))
+    for path in (root, reservation, *snapshots):
+        if path.is_dir():
+            shutil.rmtree(path)
+    try:
+        trainer.save_checkpoint(str(root), name)
+        if rank != 0:
+            return None
+        prepared = _checkpoint.prepare_checkpoint(str(root))
+        manifest = prepared.manifest
+        if manifest is None or manifest["optimizer"] is None:
+            raise RuntimeError("portable export requires canonical optimizer state")
+        relative_paths = tuple(sorted({"checkpoint.json", *manifest["files"]}))
+        files = tuple(
+            PortableSnapshotPreparedFile(
+                relative_path=relative,
+                component=_checkpoint_component(relative),
+                byte_count=(root / relative).stat().st_size,
+                sha256=_file_sha256(root / relative),
+            )
+            for relative in relative_paths
+        )
+        committed = sink.commit_prepared(
+            export_id=export_id,
+            generation=generation,
+            rank=rank,
+            checkpoint_digest=prepared.digest,
+            directory=root,
+            files=files,
+        )
+        by_path = {file.relative_path: file for file in committed}
+        if len(by_path) != len(committed) or set(by_path) != set(relative_paths):
+            raise RuntimeError("portable sink changed the checkpoint file inventory")
+        return PortableSnapshotRankReceipt(
+            rank=rank,
+            checkpoint_digest=prepared.digest,
+            files=tuple(
+                PortableSnapshotFile(
+                    object_id=by_path[file.relative_path].object_id,
+                    relative_path=file.relative_path,
+                    component=file.component,
+                    byte_count=file.byte_count,
+                    sha256=file.sha256,
+                    source_ref=by_path[file.relative_path].source_ref,
+                )
+                for file in files
+            ),
+        )
+    finally:
+        for path in (root, reservation, *snapshots):
+            if path.is_dir():
+                shutil.rmtree(path)
 
 
 def install_portable_checkpoint(
@@ -306,11 +512,15 @@ def install_portable_checkpoint(
                     raise RuntimeError(
                         f"portable checkpoint manifest digest changed: {relative}"
                     )
-            if prepared.manifest.get("custom_tensors"):
-                prepared = _checkpoint.prepare_checkpoint(str(root))
-            else:
-                prepared = _checkpoint.prepare_checkpoint(
-                    str(root), artifact_entries=entries
+            prepared = _checkpoint.prepare_checkpoint(
+                str(root), artifact_entries=entries
+            )
+            if prepared.manifest is not None and prepared.manifest.get(
+                "custom_tensors"
+            ):
+                prepared = replace(
+                    prepared,
+                    custom=_checkpoint._load_custom_payload(root, prepared.manifest),
                 )
         except BaseException as error:
             read_error = error
@@ -376,6 +586,7 @@ def _archive_payload(archive: PortableSnapshotArchive) -> dict[str, object]:
     files = sorted(
         (
             file.relative_path,
+            file.component,
             file.byte_count,
             file.sha256,
         )
@@ -406,6 +617,16 @@ def _adapter_shape(config: Mapping[str, object]) -> tuple[int, tuple[str, ...]]:
     if not selected or len(selected) != len(set(selected)):
         raise RuntimeError("portable checkpoint LoRA targets must be unique")
     return rank, selected
+
+
+def _checkpoint_component(
+    relative_path: str,
+) -> Literal["metadata", "adapter", "optimizer"]:
+    if relative_path in {"adapter_config.json", "checkpoint.json"}:
+        return "metadata"
+    if relative_path.startswith("optimizer/"):
+        return "optimizer"
+    return "adapter"
 
 
 def _receipt_payload(archive: PortableSnapshotArchive) -> dict[str, object]:

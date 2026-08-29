@@ -36,7 +36,9 @@ from .operation_handler import (
 )
 from .runtime.portable_snapshot import (
     PortableSnapshotArchive,
+    PortableSnapshotExportReceipt,
     PortableSnapshotInstallReceipt,
+    PortableSnapshotLoadReceipt,
 )
 from .runtime.specs import (
     TrainerCommandRunState,
@@ -134,6 +136,20 @@ class _SharedTrainer(Protocol):
     ) -> PortableSnapshotInstallReceipt | None: ...
 
     async def command_run_state(self, run_id: str) -> TrainerCommandRunState: ...
+
+    async def export_command_run_checkpoint(
+        self,
+        run_id: str,
+        generation: TrainerGeneration,
+        export_id: str,
+    ) -> PortableSnapshotExportReceipt: ...
+
+    async def install_command_run_checkpoint(
+        self,
+        operation: OperationRef,
+        generation: TrainerGeneration,
+        archive: PortableSnapshotArchive,
+    ) -> PortableSnapshotLoadReceipt: ...
 
     async def record_control_command(
         self,
@@ -278,6 +294,9 @@ class MegatronSlotCoordinator:
         self._aborted_migration_restores: dict[
             tuple[str, str], tuple[MegatronOperationConfig, str | None]
         ] = {}
+        self._registering_runs: dict[
+            str, tuple[MegatronOperationConfig, str | None, str | None]
+        ] = {}
         self._closed = False
 
     async def register_run(
@@ -304,80 +323,91 @@ class MegatronSlotCoordinator:
         restore_id: str | None,
         portable_archive: PortableSnapshotArchive | None,
     ) -> MegatronSlotRun:
-        async with self._condition:
-            if self._closed:
-                raise RuntimeError("Megatron slot coordinator is closed")
-            aborted_key = None if restore_id is None else (config.run_id, restore_id)
-            aborted = (
-                None
-                if aborted_key is None
-                else self._aborted_migration_restores.get(aborted_key)
-            )
-            archive_sha256 = (
-                None if portable_archive is None else portable_archive.archive_sha256
-            )
-            identity = (config, archive_sha256)
-            if aborted is not None and aborted != identity:
-                raise RuntimeError("aborted migration restore configuration changed")
-            prior = self._runs.get(config.run_id)
-            if prior is not None:
-                if prior.draining or prior.migration_fence_id is not None:
-                    raise RuntimeError("Megatron slot run is draining")
-                if prior.migration_restore_id != restore_id and not (
-                    restore_id is not None and prior.activated_restore_id == restore_id
-                ):
-                    raise RuntimeError("run_id is already in another lifecycle")
-                if prior.handler.config != config:
-                    raise RuntimeError("run_id was reused with different configuration")
-                if prior.portable_archive_sha256 != archive_sha256:
-                    raise RuntimeError(
-                        "run_id was reused with another portable archive"
-                    )
-                return MegatronSlotRun(
-                    config.run_id, prior.worker, prior.portable_install
+        if config.source.training_session_id != config.training_session_id:
+            raise ValueError("source generation belongs to another training session")
+        archive_sha256 = (
+            None if portable_archive is None else portable_archive.archive_sha256
+        )
+        runtime_spec = self.trainer.runtime_spec
+        if config.adapter.rank > runtime_spec.lora_rank:
+            raise ValueError("run LoRA rank exceeds the slot capability")
+        if not set(config.adapter.target_modules).issubset(
+            runtime_spec.lora_target_modules
+        ):
+            raise ValueError("run LoRA targets exceed the slot capability")
+        run_spec = TrainingRunSpec(
+            run_id=config.run_id,
+            runtime_fingerprint=runtime_spec.fingerprint,
+            training_session_id=config.training_session_id,
+            initial_learner_version=config.source.policy_step,
+            initial_generation_id=config.source.generation_id,
+            initial_operation_sequence=config.initial_operation_sequence,
+            lora_rank=config.adapter.rank,
+            lora_target_modules=config.adapter.target_modules,
+            initial_adapter_path=config.source.adapter_path,
+            optimizer_state_path=config.optimizer_state_path,
+            initial_portable_snapshot=portable_archive,
+        )
+        registration_identity = (config, archive_sha256, restore_id)
+        aborted_key = None if restore_id is None else (config.run_id, restore_id)
+        while True:
+            async with self._condition:
+                if self._closed:
+                    raise RuntimeError("Megatron slot coordinator is closed")
+                pending = self._registering_runs.get(config.run_id)
+                if pending is not None:
+                    if pending != registration_identity:
+                        raise RuntimeError(
+                            "run_id is registering with different trainer state"
+                        )
+                    await self._condition.wait()
+                    continue
+                aborted = (
+                    None
+                    if aborted_key is None
+                    else self._aborted_migration_restores.get(aborted_key)
                 )
-            if portable_archive is not None:
-                generation = portable_archive.generation
-                if (
-                    generation.training_session_id != config.training_session_id
-                    or generation.policy_step != config.source.policy_step
-                    or generation.generation_id != config.source.generation_id
-                ):
+                identity = (config, archive_sha256)
+                if aborted is not None and aborted != identity:
                     raise RuntimeError(
-                        "portable archive identifies another learner generation"
+                        "aborted migration restore configuration changed"
                     )
-            run_spec = TrainingRunSpec(
-                run_id=config.run_id,
-                runtime_fingerprint=self.trainer.runtime_spec.fingerprint,
-                training_session_id=config.training_session_id,
-                initial_learner_version=config.source.policy_step,
-                initial_generation_id=config.source.generation_id,
-                initial_operation_sequence=config.initial_operation_sequence,
-                lora_rank=config.adapter.rank,
-                lora_target_modules=config.adapter.target_modules,
-                initial_adapter_path=config.source.adapter_path,
-                optimizer_state_path=config.optimizer_state_path,
-                initial_portable_snapshot=portable_archive,
-            )
-            runtime_spec = self.trainer.runtime_spec
-            if config.adapter.rank > runtime_spec.lora_rank:
-                raise ValueError("run LoRA rank exceeds the slot capability")
-            if not set(config.adapter.target_modules).issubset(
-                runtime_spec.lora_target_modules
-            ):
-                raise ValueError("run LoRA targets exceed the slot capability")
+                prior = self._runs.get(config.run_id)
+                if prior is not None:
+                    if prior.draining or prior.migration_fence_id is not None:
+                        raise RuntimeError("Megatron slot run is draining")
+                    if prior.migration_restore_id != restore_id and not (
+                        restore_id is not None
+                        and prior.activated_restore_id == restore_id
+                    ):
+                        raise RuntimeError("run_id is already in another lifecycle")
+                    if prior.handler.config != config:
+                        raise RuntimeError(
+                            "run_id was reused with different configuration"
+                        )
+                    if prior.portable_archive_sha256 != archive_sha256:
+                        raise RuntimeError(
+                            "run_id was reused with another portable archive"
+                        )
+                    return MegatronSlotRun(
+                        config.run_id, prior.worker, prior.portable_install
+                    )
+                self._registering_runs[config.run_id] = registration_identity
+                break
+
+        trainer_registered = False
+        try:
             portable_install = await self.trainer.register_command_run(run_spec)
+            trainer_registered = True
             if (portable_archive is None) != (portable_install is None):
-                await self.trainer.drain_command_run(config.run_id)
                 raise RuntimeError(
                     "trainer returned inconsistent portable install evidence"
                 )
-            if portable_install is not None and (
-                portable_install.archive_sha256 != archive_sha256
-                or portable_install.runtime_fingerprint != runtime_spec.fingerprint
-            ):
-                await self.trainer.drain_command_run(config.run_id)
-                raise RuntimeError("trainer installed another portable archive")
+            if portable_install is not None:
+                if portable_install.runtime_fingerprint != runtime_spec.fingerprint:
+                    raise RuntimeError("trainer installed another runtime")
+                assert portable_archive is not None
+                portable_install.validate_archive(portable_archive)
             handler = MegatronOperationHandler(
                 self.runtime,
                 self.trainer,
@@ -391,21 +421,40 @@ class MegatronSlotCoordinator:
                 scheduled,
                 max_retained_operations=max_retained_operations,
             )
-            self._runs[config.run_id] = _RunState(
+            state = _RunState(
                 handler=handler,
                 worker=worker,
                 migration_restore_id=restore_id,
                 portable_archive_sha256=archive_sha256,
                 portable_install=portable_install,
             )
-            if aborted_key is not None:
-                self._aborted_migration_restores.pop(aborted_key, None)
-            self._released_migration_fences.pop(config.run_id, None)
-            self._deficit[config.run_id] = 0
-            self._order.append(config.run_id)
-            if self._pump_task is None:
-                self._pump_task = asyncio.create_task(self._pump())
+            async with self._condition:
+                if self._closed:
+                    raise RuntimeError("Megatron slot coordinator closed during setup")
+                self._runs[config.run_id] = state
+                if aborted_key is not None:
+                    self._aborted_migration_restores.pop(aborted_key, None)
+                self._released_migration_fences.pop(config.run_id, None)
+                self._deficit[config.run_id] = 0
+                self._order.append(config.run_id)
+                self._registering_runs.pop(config.run_id, None)
+                if self._pump_task is None:
+                    self._pump_task = asyncio.create_task(self._pump())
+                self._condition.notify_all()
             return MegatronSlotRun(config.run_id, worker, portable_install)
+        except BaseException as error:
+            if trainer_registered:
+                try:
+                    await self.trainer.drain_command_run(config.run_id)
+                except BaseException as cleanup_error:
+                    error.add_note(
+                        "run registration rollback also failed: "
+                        f"{type(cleanup_error).__name__}: {cleanup_error}"
+                    )
+            async with self._condition:
+                self._registering_runs.pop(config.run_id, None)
+                self._condition.notify_all()
+            raise
 
     def resolve_run(self, run_id: str) -> MegatronSlotRun:
         state = self._runs.get(run_id)
@@ -430,6 +479,61 @@ class MegatronSlotCoordinator:
         ):
             raise KeyError(f"Megatron slot run {run_id!r} is unavailable")
         return await state.handler.plan_artifacts(request)
+
+    async def export_run_checkpoint(
+        self,
+        operation: OperationRef,
+    ) -> PortableSnapshotExportReceipt:
+        """Commit exact canonical rank files for the active save-state command."""
+
+        async with self._condition:
+            state = self._runs.get(operation.run_id)
+            if (
+                operation.kind != "save_state"
+                or state is None
+                or state.draining
+                or state.migration_fence_id is not None
+                or state.migration_restore_id is not None
+                or self._active_run_id != operation.run_id
+                or state.handler.retained_contribution_inputs()
+            ):
+                raise RuntimeError(
+                    "checkpoint export is not the active quiescent command"
+                )
+            generation = state.handler.generation
+        return await self.trainer.export_command_run_checkpoint(
+            operation.run_id,
+            generation,
+            operation.operation_id,
+        )
+
+    async def install_run_checkpoint(
+        self,
+        operation: OperationRef,
+        generation: TrainerGeneration,
+        archive: PortableSnapshotArchive,
+    ) -> PortableSnapshotLoadReceipt:
+        """Install one authenticated checkpoint for the active load-state command."""
+
+        async with self._condition:
+            state = self._runs.get(operation.run_id)
+            if (
+                operation.kind != "load_state"
+                or state is None
+                or state.draining
+                or state.migration_fence_id is not None
+                or state.migration_restore_id is not None
+                or self._active_run_id != operation.run_id
+                or state.handler.retained_contribution_inputs()
+            ):
+                raise RuntimeError(
+                    "checkpoint load is not the active quiescent command"
+                )
+        return await self.trainer.install_command_run_checkpoint(
+            operation,
+            generation,
+            archive,
+        )
 
     def sampler_publication_receipt(
         self,
@@ -833,6 +937,8 @@ class MegatronSlotCoordinator:
         async with self._condition:
             self._closed = True
             self._condition.notify_all()
+            while self._registering_runs:
+                await self._condition.wait()
         for run_id in tuple(self._runs):
             await self.drain_run(run_id)
         if self._pump_task is not None:

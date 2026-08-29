@@ -130,6 +130,25 @@ class TrainerRank(_impl.TrainerRank):
     ) -> None:
         super().save_checkpoint(output_dir, checkpoint_path)
 
+    def checkpoint_slot_tensor_owners(self, name: str) -> tuple[tuple[str, int], ...]:
+        self.checkpoint_slot_parameters(name)
+        from art.megatron.weights.lora_publish import collect_local_lora_entries
+
+        _tensors, metadata = collect_local_lora_entries(
+            self.runtime.model,
+            {},
+            owner_rank=dist.get_rank() if dist.is_initialized() else 0,
+            slot_ref=self._slot_ref(name),
+        )
+        return tuple(
+            sorted(
+                {
+                    (item.key, int(item.manifest.get("shard_rank", 0)))
+                    for item in metadata
+                }
+            )
+        )
+
     def prepare_checkpoint_save(
         self,
         output_dir: str,

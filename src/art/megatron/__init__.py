@@ -19,10 +19,13 @@ __all__ = [
     "MegatronSlotRun",
     "MegatronSlotScheduleConfig",
     "MegatronSlotLaunchConfig",
+    "MegatronRunBinding",
+    "MegatronRunBootstrapConfig",
     "MegatronSlotRuntime",
     "MegatronSlotRuntimeDescriptor",
     "bootstrap_megatron_operation_worker",
     "launch_megatron_slot",
+    "prepare_megatron_run_config",
 ]
 
 
@@ -60,9 +63,12 @@ def __getattr__(name: str) -> Any:
         return getattr(slot_coordinator, name)
     if name in {
         "MegatronSlotLaunchConfig",
+        "MegatronRunBinding",
+        "MegatronRunBootstrapConfig",
         "MegatronSlotRuntime",
         "MegatronSlotRuntimeDescriptor",
         "launch_megatron_slot",
+        "prepare_megatron_run_config",
     }:
         from . import slot_runtime
 

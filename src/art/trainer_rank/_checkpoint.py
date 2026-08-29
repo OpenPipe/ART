@@ -539,7 +539,9 @@ def required_local_checkpoint_files(
         )
     required.update(file for key in local_keys for file in manifest["parameters"][key])
     if manifest.get("custom_tensors"):
-        required.update(manifest["files"])
+        required.add("custom_tensors.safetensors")
+        if "optimizer/custom.safetensors" in manifest["files"]:
+            required.add("optimizer/custom.safetensors")
     return tuple(sorted(required))
 
 

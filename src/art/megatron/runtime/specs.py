@@ -95,6 +95,14 @@ class TrainingRunSpec(_Spec):
     def _validate_lora_targets(self) -> "TrainingRunSpec":
         if len(set(self.lora_target_modules)) != len(self.lora_target_modules):
             raise ValueError("lora_target_modules must be unique")
+        archive = self.initial_portable_snapshot
+        if archive is not None and (
+            self.initial_generation_id is None
+            or archive.generation.training_session_id != self.training_session_id
+            or archive.generation.policy_step != self.initial_learner_version
+            or archive.generation.generation_id != self.initial_generation_id
+        ):
+            raise ValueError("portable archive identifies another run generation")
         return self
 
 

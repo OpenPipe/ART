@@ -1,21 +1,38 @@
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
+import os
+from pathlib import Path
+import tempfile
 from typing import Any, Self, cast
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from art import dev
 from art.distributed import ArtLaunchContext, ArtRuntime, ArtRuntimeConfig
+from art.distributed.rollout import RolloutModelSpec
 from art.distributed.specs import RuntimeTopology
+from art.model import TrainableModel
+from art.training import TrainingRunSpec
 from art.types import MegatronRuntimeConfig
+from art.utils.output_dirs import get_step_checkpoint_dir
 from art.vllm_route_transport import RouteBundleReader
 
+from .operation_handler import MegatronCheckpointOperations, MegatronOperationConfig
+from .optimizer_state import (
+    optimizer_adapter,
+    optimizer_model_lease,
+    read_committed_optimizer_pointer,
+    resolve_committed_optimizer_policy,
+)
 from .runtime.build import build_trainer_runtime_spec
+from .runtime.specs import TrainerGeneration, TrainerRuntimeSpec
 from .runtime_config import init_megatron_runtime_config
 from .slot_coordinator import (
     MegatronSlotCoordinator,
     MegatronSlotResourceManager,
+    MegatronSlotRun,
     MegatronSlotScheduleConfig,
 )
 
@@ -59,6 +76,25 @@ class MegatronSlotRuntimeDescriptor(BaseModel):
     runtime_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
 
 
+class MegatronRunBootstrapConfig(BaseModel):
+    """Stable service input for creating or recovering one logical slot run."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    run_id: str = Field(min_length=1, max_length=255)
+    training_session_id: str = Field(min_length=1, max_length=255)
+    run: TrainingRunSpec
+    output_dir: str = Field(min_length=1)
+    initial_operation_sequence: int = Field(default=0, ge=0)
+    max_retained_inputs: int = Field(default=65, ge=1, le=256)
+
+
+@dataclass(slots=True)
+class MegatronRunBinding:
+    run: MegatronSlotRun
+    config: MegatronOperationConfig
+
+
 @dataclass(slots=True)
 class MegatronSlotRuntime:
     """Lifecycle owner for one ART runtime and its shared trainer coordinator."""
@@ -66,6 +102,25 @@ class MegatronSlotRuntime:
     runtime: ArtRuntime
     coordinator: MegatronSlotCoordinator
     descriptor: MegatronSlotRuntimeDescriptor
+
+    async def bind_run(
+        self,
+        request: MegatronRunBootstrapConfig,
+        *,
+        checkpoints: MegatronCheckpointOperations | None = None,
+        max_retained_operations: int = 128,
+    ) -> MegatronRunBinding:
+        config = await asyncio.to_thread(
+            prepare_megatron_run_config,
+            request,
+            self.coordinator.trainer.runtime_spec,
+        )
+        run = await self.coordinator.register_run(
+            config,
+            checkpoints=checkpoints,
+            max_retained_operations=max_retained_operations,
+        )
+        return MegatronRunBinding(run=run, config=config)
 
     async def aclose(self) -> None:
         await self.runtime.close()
@@ -133,4 +188,113 @@ async def launch_megatron_slot(
             runtime_source_epoch=config.runtime_source_epoch,
             runtime_fingerprint=runtime_spec.fingerprint,
         ),
+    )
+
+
+def prepare_megatron_run_config(
+    request: MegatronRunBootstrapConfig,
+    runtime_spec: TrainerRuntimeSpec,
+) -> MegatronOperationConfig:
+    """Create or recover exact ART-owned paths for one logical trainer run."""
+
+    spec = request.run
+    if (
+        spec.base_model != runtime_spec.model_identifier
+        or spec.dtype != runtime_spec.dtype
+    ):
+        raise ValueError("training run model or dtype differs from the slot runtime")
+    if spec.adapter.rank > runtime_spec.lora_rank or not set(
+        spec.adapter.target_modules
+    ).issubset(runtime_spec.lora_target_modules):
+        raise ValueError("training run adapter shape exceeds the slot runtime")
+
+    output_dir = Path(request.output_dir).absolute()
+    optimizer_state = output_dir / "optimizer_states"
+    initial_adapter = Path(get_step_checkpoint_dir(str(output_dir), 0))
+    with optimizer_model_lease(optimizer_state):
+        pointer = read_committed_optimizer_pointer(str(optimizer_state))
+        if pointer is None and not initial_adapter.exists():
+            initial_adapter.parent.mkdir(parents=True, exist_ok=True)
+            with tempfile.TemporaryDirectory(
+                prefix=".art-bootstrap-", dir=initial_adapter.parent
+            ) as temporary:
+                staged = Path(temporary) / "adapter"
+                from .identity_lora import create_identity_lora
+                from .model_support import get_model_support_handler
+
+                create_identity_lora(
+                    spec.base_model,
+                    str(staged),
+                    rank=spec.adapter.rank,
+                    target_modules=list(spec.adapter.target_modules),
+                    lora_alpha=int(runtime_spec.lora_alpha),
+                    random_state=(
+                        spec.seed
+                        if spec.seed is not None
+                        else runtime_spec.random_state
+                    ),
+                    allow_unvalidated_arch=runtime_spec.allow_unvalidated_arch,
+                    handler=get_model_support_handler(
+                        spec.base_model,
+                        allow_unvalidated_arch=runtime_spec.allow_unvalidated_arch,
+                    ),
+                )
+                os.rename(staged, initial_adapter)
+                directory_fd = os.open(initial_adapter.parent, os.O_RDONLY)
+                try:
+                    os.fsync(directory_fd)
+                finally:
+                    os.close(directory_fd)
+        if pointer is None:
+            adapter = optimizer_adapter(
+                initial_adapter,
+                0,
+                training_session_id=request.training_session_id,
+            )
+        else:
+            adapter = resolve_committed_optimizer_policy(
+                str(optimizer_state),
+                initial_adapter_path=str(initial_adapter),
+            ).policy_adapter
+    from .model_support.lora_disk import load_adapter_config
+
+    adapter_config = load_adapter_config(adapter.identity)
+    targets = adapter_config.get("target_modules")
+    actual_targets = (targets,) if isinstance(targets, str) else tuple(targets or ())
+    if (
+        adapter.training_session_id != request.training_session_id
+        or int(adapter_config.get("r", 0)) != spec.adapter.rank
+        or set(actual_targets) != set(spec.adapter.target_modules)
+        or adapter_config.get("base_model_name_or_path") != spec.base_model
+    ):
+        raise RuntimeError("recovered trainer state differs from run admission")
+
+    rollout_model = RolloutModelSpec.from_model(
+        TrainableModel(
+            name=spec.base_model,
+            run_name=request.run_id,
+            project="serverless-training",
+            base_model=spec.base_model,
+            lora_config={
+                "rank": spec.adapter.rank,
+                "target_modules": list(spec.adapter.target_modules),
+            },
+        )
+    )
+    generation = TrainerGeneration(
+        training_session_id=adapter.training_session_id,
+        policy_step=adapter.step,
+        generation_id=adapter.generation_id,
+        adapter_path=adapter.identity,
+    )
+    return MegatronOperationConfig(
+        run_id=request.run_id,
+        training_session_id=request.training_session_id,
+        adapter=spec.adapter,
+        source=generation,
+        initial_operation_sequence=request.initial_operation_sequence,
+        optimizer_state_path=str(optimizer_state),
+        rollout_model=rollout_model,
+        output_adapter_root=str(output_dir / "checkpoints"),
+        max_retained_inputs=request.max_retained_inputs,
     )

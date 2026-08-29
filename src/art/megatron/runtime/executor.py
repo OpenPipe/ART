@@ -43,6 +43,13 @@ from .trainer_run import EventSink
 
 if TYPE_CHECKING:
     from art.megatron.optimizer_state import OptimizerAdapter
+    from art.megatron.runtime.portable_snapshot import (
+        PortableSnapshotArchive,
+        PortableSnapshotRankReceipt,
+        PortableSnapshotReadReceipt,
+        PortableSnapshotSink,
+        PortableSnapshotSource,
+    )
     from art.megatron.weights.external_lora_publish import (
         ExternalLoraPlan,
         ExternalLoraPublication,
@@ -534,7 +541,7 @@ class _ResidentCommandRun:
     spec: TrainingRunSpec
     learner_version: int
     gradients: Any
-    portable_read: Any | None = None
+    portable_read: PortableSnapshotReadReceipt | None = None
 
 
 class MCoreRunSlotExecutor:
@@ -545,7 +552,8 @@ class MCoreRunSlotExecutor:
         runtime: Any,
         *,
         accumulator_l1_budget_bytes: int = 16 * 1024**3,
-        portable_snapshot_source: Any | None = None,
+        portable_snapshot_source: PortableSnapshotSource | None = None,
+        portable_snapshot_sink: PortableSnapshotSink | None = None,
     ) -> None:
         from art.trainer_rank import TrainerRank
 
@@ -554,9 +562,10 @@ class MCoreRunSlotExecutor:
         self._runs: dict[str, _ResidentCommandRun] = {}
         self._accumulator_l1_budget_bytes = accumulator_l1_budget_bytes
         self._portable_snapshot_source = portable_snapshot_source
+        self._portable_snapshot_sink = portable_snapshot_sink
         self._closed = False
 
-    def register_run(self, spec: TrainingRunSpec) -> Any | None:
+    def register_run(self, spec: TrainingRunSpec) -> PortableSnapshotReadReceipt | None:
         if self._closed:
             raise RuntimeError("Megatron run slot executor is closed")
         prior = self._runs.get(spec.run_id)
@@ -629,6 +638,78 @@ class MCoreRunSlotExecutor:
                 self._trainer.release_checkpoint_slot(spec.run_id)
             raise
         return portable_read
+
+    def export_run_checkpoint(
+        self,
+        run_id: str,
+        generation: TrainerGeneration,
+        export_id: str,
+    ) -> PortableSnapshotRankReceipt | None:
+        state = self._runs.get(run_id)
+        if state is None or state.learner_version != generation.policy_step:
+            raise RuntimeError("portable export generation is not resident")
+        if generation.training_session_id != state.spec.training_session_id:
+            raise RuntimeError("portable export belongs to another training session")
+        if self._portable_snapshot_sink is None:
+            raise RuntimeError("portable checkpoint sink is not configured")
+        from .portable_snapshot import (
+            PortableSnapshotGeneration,
+            export_portable_checkpoint,
+        )
+
+        return export_portable_checkpoint(
+            self._trainer,
+            self._portable_snapshot_sink,
+            PortableSnapshotGeneration(
+                training_session_id=generation.training_session_id,
+                policy_step=generation.policy_step,
+                generation_id=generation.generation_id,
+            ),
+            export_id=export_id,
+            name=run_id,
+            rank=int(self.runtime.rank),
+        )
+
+    def run_tensor_owners(self, run_id: str) -> tuple[tuple[str, int], ...]:
+        if run_id not in self._runs:
+            raise KeyError(f"trainer command run {run_id!r} is absent")
+        return self._trainer.checkpoint_slot_tensor_owners(run_id)
+
+    def install_run_checkpoint(
+        self,
+        run_id: str,
+        generation: TrainerGeneration,
+        archive: PortableSnapshotArchive,
+    ) -> PortableSnapshotReadReceipt:
+        state = self._runs.get(run_id)
+        if state is None:
+            raise KeyError(f"trainer command run {run_id!r} is absent")
+        if state.gradients.contribution_ids:
+            raise RuntimeError("cannot load state with open gradient contributions")
+        if generation.training_session_id != state.spec.training_session_id:
+            raise RuntimeError("loaded generation belongs to another training session")
+        if self._portable_snapshot_source is None:
+            raise RuntimeError("portable checkpoint source is not configured")
+        from art.megatron.training.gradient_accumulator import (
+            ParameterGradientAccumulator,
+        )
+
+        from .portable_snapshot import install_portable_checkpoint
+
+        receipt, _adapter_config = install_portable_checkpoint(
+            self._trainer,
+            self._portable_snapshot_source,
+            archive,
+            name=run_id,
+            destination_rank=int(self.runtime.rank),
+            expected_lora_rank=state.spec.lora_rank,
+            expected_lora_target_modules=state.spec.lora_target_modules,
+        )
+        state.gradients = ParameterGradientAccumulator(
+            self._trainer.checkpoint_slot_parameters(run_id)
+        )
+        state.learner_version = generation.policy_step
+        return receipt
 
     def execute_forward_backward(
         self,
@@ -819,9 +900,12 @@ class MCoreRunSlotExecutor:
         for state in self._runs.values():
             state.gradients.discard()
         self._runs.clear()
-        if self._portable_snapshot_source is not None:
-            self._portable_snapshot_source.close()
-            self._portable_snapshot_source = None
+        source, self._portable_snapshot_source = self._portable_snapshot_source, None
+        sink, self._portable_snapshot_sink = self._portable_snapshot_sink, None
+        if source is not None:
+            source.close()
+        if sink is not None and sink is not source:
+            sink.close()
 
     def _require_parent(
         self, job: ForwardBackwardJobSpec | ForwardJobSpec | OptimizerJobSpec
