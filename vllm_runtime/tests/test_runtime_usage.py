@@ -36,7 +36,9 @@ def test_runtime_usage_pages_are_gapless_bounded_and_acknowledged() -> None:
     journal = RuntimeUsageJournal("paired-runtime", 4, capacity=2, clock=lambda: now[0])
     journal.reserve("request-a", _context("tenant-a"))
     journal.reserve("request-b", _context("tenant-b"))
-    assert journal.record_finished(_finished("request-a"), observed_unix_s=10.0)
+    assert journal.record_finished(
+        _finished("chatcmpl-request-a"), observed_unix_s=10.0
+    )
     assert journal.record_finished(
         _finished("request-b", reason="abort"), observed_unix_s=11.0
     )
@@ -49,6 +51,7 @@ def test_runtime_usage_pages_are_gapless_bounded_and_acknowledged() -> None:
     assert page["dropped_through_sequence"] == 0
     first = page["receipts"][0]
     assert first["tenant_id"] == "tenant-a"
+    assert first["receipt_id"] == "request-a"
     assert first["source_sequence"] == 1
     assert first["status"] == "succeeded"
     assert first["failure_attribution"] is None

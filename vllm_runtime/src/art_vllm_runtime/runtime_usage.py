@@ -75,7 +75,11 @@ class RuntimeUsageJournal:
         if not isinstance(request_id, str):
             return False
         with self._lock:
-            context = self._pending.pop(request_id, None)
+            receipt_id = request_id
+            context = self._pending.pop(receipt_id, None)
+            if context is None and request_id.startswith("chatcmpl-"):
+                receipt_id = request_id.removeprefix("chatcmpl-")
+                context = self._pending.pop(receipt_id, None)
             if context is None:
                 return False
             sequence = self._next_sequence
@@ -87,7 +91,7 @@ class RuntimeUsageJournal:
                 ),
             )
             self._receipts[sequence] = self._receipt(
-                request_id, context, finished, sequence, observed
+                receipt_id, context, finished, sequence, observed
             )
             self._last_observed_unix_s = observed
             return True
