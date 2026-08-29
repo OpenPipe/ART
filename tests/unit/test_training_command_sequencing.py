@@ -5,13 +5,17 @@ from art.training import (
     AdamConfig,
     CommandAdmissionPolicy,
     ForwardBackwardRequest,
+    ForwardBackwardResult,
     ForwardRequest,
     LoadStateRequest,
     LossConfig,
+    OperationSucceeded,
     OptimStepRequest,
+    PackingOutcome,
     RunCommandLedger,
     SupervisedTrajectoryBatch,
     TokenLogprobs,
+    bootstrap_operation_worker,
 )
 
 
@@ -123,3 +127,39 @@ def test_token_logprobs_preserve_candidate_shape() -> None:
     assert values.shape == (2, 2)
     assert values.value_count == 4
     assert len(values.data) == 16
+
+
+@pytest.mark.asyncio
+async def test_operation_worker_replays_one_exact_terminal_result() -> None:
+    calls = 0
+
+    async def execute(request, operation, contributions):
+        nonlocal calls
+        calls += 1
+        assert request.request_id == "request"
+        assert contributions == ()
+        return ForwardBackwardResult(
+            operation_id=operation.operation_id,
+            packing=PackingOutcome(
+                packed_sequence_length=8,
+                packed_sequences=1,
+                target_packed_sequences=1,
+                physical_tokens=8,
+                non_padding_tokens=8,
+                loss_bearing_tokens=4,
+                trainable_assistant_tokens=4,
+            ),
+        )
+
+    worker = bootstrap_operation_worker(execute)
+    request = _forward(0, "request")
+    admission = await RunCommandLedger("run", learner_version=0).admit(
+        request, kind="forward_backward"
+    )
+
+    first = await worker.execute(request, admission.ref)
+    second = await worker.execute(request, admission.ref)
+
+    assert isinstance(first, OperationSucceeded)
+    assert second == first
+    assert calls == 1

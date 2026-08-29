@@ -10,13 +10,41 @@ from art.distributed.trajectory_store import TrajectoryGroupBundle
 from art.pipeline_tuner.config import PackedGroupShape
 from art.trajectories import Trajectory
 
+from .tokenized import (
+    MAX_TOKENIZED_PHYSICAL_VALUES,
+    TokenizedDatum,
+    tokenized_physical_value_count,
+    validate_tokenized_loss_values,
+)
+
 MAX_CONTROL_IDENTIFIER_LENGTH = 255
 MAX_CHECKPOINT_REFERENCE_LENGTH = 2048
 MAX_TOKEN_LOGPROB_VALUES = 16_777_216
+MAX_TARGET_MODULES = 256
 
 
 class Contract(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
+
+
+class AdapterSpec(Contract):
+    rank: int = Field(ge=1, le=1024)
+    target_modules: tuple[str, ...] = Field(min_length=1, max_length=MAX_TARGET_MODULES)
+
+    @model_validator(mode="after")
+    def _validate_targets(self) -> AdapterSpec:
+        if any(not target or len(target) > 255 for target in self.target_modules):
+            raise ValueError("LoRA target modules must be nonempty and bounded")
+        if len(set(self.target_modules)) != len(self.target_modules):
+            raise ValueError("LoRA target modules must be unique")
+        return self
+
+
+class TrainingRunSpec(Contract):
+    base_model: str = Field(min_length=1, max_length=512)
+    adapter: AdapterSpec
+    seed: int | None = None
+    dtype: Literal["bfloat16"] = "bfloat16"
 
 
 class RunCommand(Contract):
@@ -44,14 +72,25 @@ class SupervisedTrajectoryBatch(Contract):
     assistant_turns: Literal["all", "last"] = "all"
 
 
+class TokenizedTrainingBatch(Contract):
+    kind: Literal["tokenized"] = "tokenized"
+    datums: tuple[TokenizedDatum, ...] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def _validate_size(self) -> TokenizedTrainingBatch:
+        if tokenized_physical_value_count(self.datums) > MAX_TOKENIZED_PHYSICAL_VALUES:
+            raise ValueError("tokenized batch exceeds the configured value limit")
+        return self
+
+
 TrainingBatch = Annotated[
-    RlTrajectoryBatch | SupervisedTrajectoryBatch,
+    RlTrajectoryBatch | SupervisedTrajectoryBatch | TokenizedTrainingBatch,
     Field(discriminator="kind"),
 ]
 
 
 class LossConfig(Contract):
-    name: Literal["cross_entropy", "cispo", "ppo"]
+    name: Literal["cross_entropy", "importance_sampling", "cispo", "ppo"]
     normalize_advantages: bool = True
     values: dict[str, FiniteFloat | int | bool | str | None] = Field(
         default_factory=dict
@@ -66,12 +105,22 @@ class ForwardRequest(RunCommand):
 
     @model_validator(mode="after")
     def _validate_loss(self) -> "ForwardRequest":
-        expected = {"cross_entropy"} if self.batch.kind == "sft" else {"cispo", "ppo"}
+        expected = {
+            "sft": {"cross_entropy"},
+            "rl": {"cispo", "ppo"},
+            "tokenized": {"cross_entropy", "importance_sampling", "cispo"},
+        }[self.batch.kind]
         if self.loss.name not in expected:
             raise ValueError(
                 f"{self.batch.kind} batches require one of {sorted(expected)}, "
                 f"got {self.loss.name!r}"
             )
+        if isinstance(self.batch, TokenizedTrainingBatch):
+            loss = self.loss.name
+            assert loss != "ppo"
+            validate_tokenized_loss_values(loss, self.loss.values)
+            for datum in self.batch.datums:
+                datum.validate_for_loss(loss)
         return self
 
 
@@ -217,6 +266,13 @@ class TokenLogprobs(Contract):
             buffer.byteswap()
         return cls(shape=shape or (len(values),), data=buffer.tobytes())
 
+    def to_values(self) -> list[float]:
+        buffer = array("f")
+        buffer.frombytes(self.data)
+        if sys.byteorder != "little":
+            buffer.byteswap()
+        return buffer.tolist()
+
 
 class OperationResult(Contract):
     operation_id: str = Field(min_length=1, max_length=64)
@@ -224,25 +280,29 @@ class OperationResult(Contract):
 
 
 class ForwardResult(OperationResult):
+    kind: Literal["forward"] = "forward"
     packing: PackingOutcome
     token_logprobs: tuple[TokenLogprobs, ...] = ()
 
 
 class ForwardBackwardResult(ForwardResult):
-    pass
+    kind: Literal["forward_backward"] = "forward_backward"
 
 
 class OptimStepResult(OperationResult):
+    kind: Literal["optim_step"] = "optim_step"
     contributing_forward_backward_operation_ids: tuple[str, ...] = Field(min_length=1)
     checkpoint: CheckpointRef
 
 
 class SamplerWeightsResult(OperationResult):
+    kind: Literal["save_sampler"] = "save_sampler"
     checkpoint: CheckpointRef
     lora: str = Field(min_length=1, max_length=MAX_CHECKPOINT_REFERENCE_LENGTH)
 
 
 class SaveStateResult(OperationResult):
+    kind: Literal["save_state"] = "save_state"
     checkpoint: CheckpointRef
     optimizer_state: str = Field(
         min_length=1, max_length=MAX_CHECKPOINT_REFERENCE_LENGTH
@@ -250,5 +310,17 @@ class SaveStateResult(OperationResult):
 
 
 class LoadStateResult(OperationResult):
+    kind: Literal["load_state"] = "load_state"
     checkpoint: CheckpointRef
     optimizer_restored: bool
+
+
+OperationResultType = Annotated[
+    ForwardResult
+    | ForwardBackwardResult
+    | OptimStepResult
+    | SamplerWeightsResult
+    | SaveStateResult
+    | LoadStateResult,
+    Field(discriminator="kind"),
+]
