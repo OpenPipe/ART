@@ -29,10 +29,12 @@ def apply_vllm_runtime_patches() -> None:
         patch_binary_routed_experts_response,
         patch_pipeline_routed_experts,
         patch_pipeline_routed_experts_validation,
+        patch_request_scoped_routed_experts,
     )
 
     patch_pipeline_routed_experts_validation()
     patch_pipeline_routed_experts()
+    patch_request_scoped_routed_experts()
     patch_binary_routed_experts_response()
 
 

@@ -15,6 +15,8 @@ HEADER = struct.Struct("<8sQII")
 ROUTE_HEADER = struct.Struct("<IB3xQQQ")
 PIPELINE_ROUTES_ENV = "ART_VLLM_PIPELINE_ROUTES_PROTOCOL"
 PIPELINE_ROUTES_PROTOCOL = "1"
+ROUTE_REQUEST_XARG = "art_return_routed_experts"
+ROUTE_CACHE_SALT = "art-routes=ARTRTE2"
 _REGISTERED_NUM_EXPERTS: int | None = None
 _REGISTERED_PADDING_LAYERS: tuple[int, ...] | None = None
 
@@ -44,6 +46,39 @@ def capture_routed_experts() -> Iterator[_CapturedRoutes]:
         yield routes
     finally:
         _CAPTURE.reset(token)
+
+
+def mark_route_request(request: Any) -> None:
+    xargs = dict(getattr(request, "vllm_xargs", None) or {})
+    xargs[ROUTE_REQUEST_XARG] = 1
+    request.vllm_xargs = xargs
+    cache_salt = getattr(request, "cache_salt", None)
+    if not cache_salt:
+        request.cache_salt = ROUTE_CACHE_SALT
+    elif cache_salt != ROUTE_CACHE_SALT and not cache_salt.endswith(
+        f"|{ROUTE_CACHE_SALT}"
+    ):
+        request.cache_salt = f"{cache_salt}|{ROUTE_CACHE_SALT}"
+
+
+def _sampling_requests_routes(sampling_params: Any) -> bool:
+    extra_args = getattr(sampling_params, "extra_args", None)
+    return isinstance(extra_args, dict) and extra_args.get(ROUTE_REQUEST_XARG) == 1
+
+
+def _scheduled_request_routes(runner: Any, scheduler_output: Any) -> bool:
+    new_params = {
+        item.req_id: item.sampling_params
+        for item in scheduler_output.scheduled_new_reqs
+    }
+    for req_id in scheduler_output.num_scheduled_tokens:
+        sampling_params = new_params.get(req_id)
+        if sampling_params is None:
+            state = runner.requests.get(req_id)
+            sampling_params = getattr(state, "sampling_params", None)
+        if _sampling_requests_routes(sampling_params):
+            return True
+    return False
 
 
 def encode_routed_experts_response(
@@ -214,14 +249,13 @@ def patch_binary_routed_experts_response() -> None:
         **kwargs: Any,
     ) -> Any:
         capture = _CAPTURE.get()
-        if capture is None:
-            return await original(self, request, result_generator, *args, **kwargs)
 
         async def stripped_results() -> AsyncIterator[Any]:
             async for result in result_generator:
                 for output in result.outputs:
                     if output.routed_experts is not None:
-                        capture[int(output.index)] = output.routed_experts
+                        if capture is not None:
+                            capture[int(output.index)] = output.routed_experts
                         output.routed_experts = None
                 yield result
 
@@ -229,6 +263,41 @@ def patch_binary_routed_experts_response() -> None:
 
     patched.__art_binary_routes_patched__ = True  # type: ignore[attr-defined]
     OpenAIServingChat.chat_completion_full_generator = patched
+
+
+def patch_request_scoped_routed_experts() -> None:
+    from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
+        RoutedExpertsCapturer,
+    )
+    from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+
+    original_capture = RoutedExpertsCapturer.capture
+    if not getattr(original_capture, "__art_request_scoped__", False):
+
+        @wraps(original_capture)
+        def capture(self: Any, *args: Any, **kwargs: Any) -> None:
+            if getattr(self, "_art_capture_enabled", True):
+                original_capture(self, *args, **kwargs)
+
+        capture.__art_request_scoped__ = True  # type: ignore[attr-defined]
+        RoutedExpertsCapturer.capture = capture
+
+    original_execute = GPUModelRunner.execute_model
+    if getattr(original_execute, "__art_request_scoped_routes__", False):
+        return
+
+    @wraps(original_execute)
+    def execute(self: Any, scheduler_output: Any, *args: Any, **kwargs: Any) -> Any:
+        capturer = getattr(self, "routed_experts_capturer", None)
+        if capturer is None:
+            return original_execute(self, scheduler_output, *args, **kwargs)
+        enabled = _scheduled_request_routes(self, scheduler_output)
+        capturer._art_capture_enabled = enabled
+        self.routed_experts_initialized = enabled
+        return original_execute(self, scheduler_output, *args, **kwargs)
+
+    execute.__art_request_scoped_routes__ = True  # type: ignore[attr-defined]
+    GPUModelRunner.execute_model = execute
 
 
 def patch_pipeline_routed_experts() -> None:
@@ -245,10 +314,12 @@ def patch_pipeline_routed_experts() -> None:
 
     @wraps(original_execute)
     def execute(self: Any, scheduler_output: Any, *args: Any, **kwargs: Any) -> Any:
-        if enabled:
+        if enabled and self.routed_experts_initialized:
             self._art_pipeline_route_tokens = int(
                 scheduler_output.total_num_scheduled_tokens
             )
+        else:
+            self._art_pipeline_route_tokens = 0
         return original_execute(self, scheduler_output, *args, **kwargs)
 
     @wraps(original_sample)
@@ -257,6 +328,8 @@ def patch_pipeline_routed_experts() -> None:
             return original_sample(self, *args, **kwargs)
         num_tokens = int(getattr(self, "_art_pipeline_route_tokens", 0))
         self._art_pipeline_route_tokens = 0
+        if not num_tokens:
+            return original_sample(self, *args, **kwargs)
         pp = get_pp_group()
         if pp.world_size <= 1:
             raise RuntimeError("pipeline route capture requires PP > 1")

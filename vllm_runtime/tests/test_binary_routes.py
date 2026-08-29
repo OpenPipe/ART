@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 import unittest
 
 from art_vllm_runtime import binary_routes
@@ -10,6 +11,35 @@ from art.vllm_route_transport import decode_routed_experts_response
 
 
 class BinaryRoutesProtocolTest(unittest.TestCase):
+    def test_route_request_binds_private_marker_and_cache_identity(self) -> None:
+        request = SimpleNamespace(vllm_xargs={"other": 2}, cache_salt="policy")
+
+        binary_routes.mark_route_request(request)
+        binary_routes.mark_route_request(request)
+
+        self.assertEqual(
+            request.vllm_xargs,
+            {"other": 2, binary_routes.ROUTE_REQUEST_XARG: 1},
+        )
+        self.assertEqual(request.cache_salt, "policy|art-routes=ARTRTE2")
+
+    def test_only_marked_scheduled_requests_enable_capture(self) -> None:
+        marked = SimpleNamespace(extra_args={binary_routes.ROUTE_REQUEST_XARG: 1})
+        ordinary = SimpleNamespace(extra_args=None)
+        runner = SimpleNamespace(
+            requests={"cached": SimpleNamespace(sampling_params=marked)}
+        )
+        output = SimpleNamespace(
+            scheduled_new_reqs=[
+                SimpleNamespace(req_id="new", sampling_params=ordinary)
+            ],
+            num_scheduled_tokens={"new": 2},
+        )
+        self.assertFalse(binary_routes._scheduled_request_routes(runner, output))
+
+        output.num_scheduled_tokens["cached"] = 1
+        self.assertTrue(binary_routes._scheduled_request_routes(runner, output))
+
     def test_exact_expert_count_and_dtype_roundtrip(self) -> None:
         response = json.dumps(
             {
@@ -48,7 +78,11 @@ class BinaryRoutesProtocolTest(unittest.TestCase):
         text_config = type(
             "TextConfig",
             (),
-            {"num_hidden_layers": 2, "mlp_layer_types": ["dense", "sparse"]},
+            {
+                "num_hidden_layers": 2,
+                "mlp_layer_types": ["dense", "sparse"],
+                "num_experts_per_tok": 2,
+            },
         )()
         model_config = type(
             "ModelConfig",

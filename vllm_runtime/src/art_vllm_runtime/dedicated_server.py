@@ -233,6 +233,7 @@ def _patch_art_runtime_routes() -> None:
     from art_vllm_runtime.binary_routes import (
         capture_routed_experts,
         encode_routed_experts_response,
+        mark_route_request,
     )
 
     if getattr(api_server, "_art_runtime_routes_patched", False):
@@ -310,6 +311,7 @@ def _patch_art_runtime_routes() -> None:
                     content={"error": "ART binary routed experts require stream=false"},
                     status_code=HTTPStatus.BAD_REQUEST.value,
                 )
+            mark_route_request(request)
             with capture_routed_experts() as routes:
                 response = await create_chat_completion(request, raw_request)
             if response is None:
@@ -599,9 +601,7 @@ def main(argv: list[str] | None = None) -> None:
     global _fast_metrics_port
 
     args = parse_args(argv)
-    if (args.initial_generation_id is None) != (
-        args.initial_policy_version is None
-    ):
+    if (args.initial_generation_id is None) != (args.initial_policy_version is None):
         raise ValueError(
             "--initial-generation-id and --initial-policy-version must be set together"
         )
