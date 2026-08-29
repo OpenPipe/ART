@@ -166,6 +166,8 @@ async def test_serving_profile_reports_resolved_runtime_geometry(monkeypatch) ->
         dedicated_server._runtime_state, "serving_profile_identity", identity
     )
     monkeypatch.setitem(dedicated_server._runtime_state, "route_capture", True)
+    monkeypatch.setitem(dedicated_server._runtime_state, "runtime_model", "test/model")
+    monkeypatch.setitem(dedicated_server._runtime_state, "runtime_revision", None)
     engine = SimpleNamespace(
         engine_core=SimpleNamespace(
             call_utility_async=AsyncMock(
@@ -179,7 +181,7 @@ async def test_serving_profile_reports_resolved_runtime_geometry(monkeypatch) ->
         ),
         vllm_config=SimpleNamespace(
             model_config=SimpleNamespace(
-                model="test/model",
+                model="/offline/cache/models--test--model/snapshots/revision",
                 revision=None,
                 tokenizer="test/model",
                 tokenizer_revision=None,
@@ -219,6 +221,7 @@ async def test_serving_profile_reports_resolved_runtime_geometry(monkeypatch) ->
     )
 
     assert profile.identity.model_identifier == "test/model"
+    assert profile.runtime_model == "test/model"
     assert profile.tensor_parallel_size == 2
     assert profile.quantization == "fp8"
     assert profile.multi_token_prediction

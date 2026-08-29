@@ -349,8 +349,10 @@ async def _serving_profile(engine_client: Any) -> dict[str, Any] | None:
     return {
         "schema_version": 2,
         "identity": identity,
-        "runtime_model": model.model,
-        "runtime_revision": model.revision,
+        # vLLM rewrites offline model identifiers to local snapshot paths. Keep
+        # the ART launch identity stable across online and offline resolution.
+        "runtime_model": _runtime_state.get("runtime_model", model.model),
+        "runtime_revision": _runtime_state.get("runtime_revision", model.revision),
         "tokenizer": model.tokenizer,
         "tokenizer_revision": model.tokenizer_revision,
         "model_dtype": _config_string(model.dtype),
@@ -1612,6 +1614,8 @@ def main(argv: list[str] | None = None) -> None:
         pp_layer_partition=pp_layer_partition,
         route_capture=route_capture,
         serving_profile_identity=serving_profile_identity,
+        runtime_model=args.model,
+        runtime_revision=engine_args.get("revision"),
     )
     if args.runtime_source_id is not None:
         configure_runtime_usage(args.runtime_source_id, args.runtime_source_epoch)
