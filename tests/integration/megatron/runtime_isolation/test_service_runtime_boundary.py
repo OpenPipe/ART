@@ -506,7 +506,9 @@ async def test_owned_model_runtimes_reserve_disjoint_local_endpoints(
         def _storage_name(self) -> str:
             return self.name
 
-    async def start_local(topology: object) -> object:
+    async def start_local(
+        topology: object, *, route_bundle_reader: object | None = None
+    ) -> object:
         return SimpleNamespace(topology=topology, close=AsyncMock())
 
     monkeypatch.setattr(ArtRuntime, "start_local", staticmethod(start_local))
