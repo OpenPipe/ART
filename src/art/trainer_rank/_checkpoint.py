@@ -532,11 +532,7 @@ def required_local_checkpoint_files(
     manifest = source.manifest
     if manifest is None or manifest["optimizer"] is None:
         raise RuntimeError("portable restore requires canonical optimizer state")
-    local_keys = set(trainer._local_lora_adapter_templates())
-    if missing := local_keys.difference(manifest["parameters"]):
-        raise RuntimeError(
-            f"portable checkpoint lacks destination adapter keys: {sorted(missing)[:8]}"
-        )
+    local_keys = set(trainer._local_lora_adapter_templates()).intersection(source.keys)
     required.update(file for key in local_keys for file in manifest["parameters"][key])
     if manifest.get("custom_tensors"):
         required.add("custom_tensors.safetensors")
