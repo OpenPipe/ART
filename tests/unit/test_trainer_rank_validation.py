@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import timedelta
 import gc
 from importlib.util import find_spec
@@ -38,6 +38,7 @@ from art.trainer_rank._checkpoint import (
     LocalOptimizerState,
     OptimizerConfig,
     PreparedCheckpoint,
+    PreparedCustomPayload,
     _file_digest,
     _FinalizedSave,
     _manifest_digest,
@@ -587,7 +588,6 @@ async def test_checkpoint_tasks_and_async_context(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     trainer = TrainerRank(_runtime())
-    trainer._checkpoint_prefetches = {}
     fetched: list[str] = []
 
     async def prefetch(path: str) -> object:
@@ -779,6 +779,49 @@ async def test_shared_checkpoint_prefetch_serves_successful_waiters(
     assert cached.result() is source
 
 
+async def test_checkpoint_prefetch_cache_is_count_and_byte_bounded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from art.trainer_rank import _impl
+
+    trainer = TrainerRank(_runtime())
+    payload = PreparedCustomPayload(
+        records={},
+        tensors={"payload": torch.zeros(256, dtype=torch.uint8)},
+        optimizer={},
+    )
+
+    def prepare(path: str) -> PreparedCheckpoint:
+        return PreparedCheckpoint(
+            path=Path(path),
+            config={},
+            keys=(),
+            manifest=None,
+            digest="a" * 64,
+            custom=payload,
+        )
+
+    monkeypatch.setattr("art.trainer_rank._checkpoint.prepare_checkpoint", prepare)
+    monkeypatch.setattr(_impl, "_CHECKPOINT_PREFETCH_CACHE_MAX_ENTRIES", 2)
+    monkeypatch.setattr(_impl, "_CHECKPOINT_PREFETCH_CACHE_MAX_BYTES", 1 << 20)
+    paths = [
+        trainer._checkpoint_source_key(f"checkpoint-{index}") for index in range(3)
+    ]
+
+    for path in paths:
+        await trainer._prefetch_checkpoint(path)
+
+    assert tuple(trainer._checkpoint_prefetches) == tuple(paths[-2:])
+
+    trainer._checkpoint_prefetches.clear()
+    monkeypatch.setattr(_impl, "_CHECKPOINT_PREFETCH_CACHE_MAX_ENTRIES", 8)
+    monkeypatch.setattr(_impl, "_CHECKPOINT_PREFETCH_CACHE_MAX_BYTES", 128)
+    source = await trainer._prefetch_checkpoint("oversized-checkpoint")
+
+    assert source.custom is payload
+    assert not trainer._checkpoint_prefetches
+
+
 async def test_materialized_sources_keep_logical_checkpoint_identities(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -865,7 +908,6 @@ async def test_checkpoint_mutations_follow_call_order_and_recover_from_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     trainer = TrainerRank(_runtime())
-    trainer._checkpoint_prefetches = {}
     started = {name: asyncio.Event() for name in ("first", "second")}
     ready = {name: asyncio.Event() for name in ("first", "second")}
     installed: list[str] = []
@@ -1741,6 +1783,31 @@ def test_checkpoint_asymmetric_cleanup_gather_can_converge(
     assert "save" in completed._finalized_checkpoint_saves
     assert "save" in retained._finalized_checkpoint_saves
     assert "save" not in retained._prepared_checkpoint_saves
+
+
+def test_finalized_checkpoint_tombstones_are_count_and_byte_bounded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from art.trainer_rank import _checkpoint
+
+    trainer = _save_state_trainer()
+    monkeypatch.setattr(_checkpoint, "_MAX_FINALIZED_SAVE_TOMBSTONES", 2)
+    monkeypatch.setattr(_checkpoint, "_MAX_FINALIZED_SAVE_TOMBSTONE_BYTES", 1 << 20)
+    for sequence, path in enumerate(("first", "second", "third")):
+        _checkpoint._record_finalized_save(
+            trainer, path, _FinalizedSave(sequence, "finish")
+        )
+
+    assert tuple(trainer._finalized_checkpoint_saves) == ("second", "third")
+
+    trainer._finalized_checkpoint_saves.clear()
+    one_entry = _checkpoint._finalized_save_tombstone_bytes("second")
+    monkeypatch.setattr(_checkpoint, "_MAX_FINALIZED_SAVE_TOMBSTONES", 8)
+    monkeypatch.setattr(_checkpoint, "_MAX_FINALIZED_SAVE_TOMBSTONE_BYTES", one_entry)
+    _checkpoint._record_finalized_save(trainer, "first", _FinalizedSave(0, "finish"))
+    _checkpoint._record_finalized_save(trainer, "second", _FinalizedSave(1, "abort"))
+
+    assert tuple(trainer._finalized_checkpoint_saves) == ("second",)
 
 
 def test_checkpoint_cleanup_gather_preserves_finish_error(
@@ -2740,6 +2807,45 @@ def test_memory_profiles_distinguish_grad_mode() -> None:
     assert grad_signature.grad_enabled
     assert not no_grad_signature.grad_enabled
     assert grad_signature != no_grad_signature
+
+
+def test_memory_profile_cache_is_lru_count_and_byte_bounded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from art.trainer_rank import _impl
+
+    trainer = TrainerRank(_runtime())
+    base = trainer._plan_flat_forward([_target_request(1)])
+    plans = tuple(
+        replace(
+            base,
+            signature=replace(base.signature, request_mix=(f"mix-{index}",)),
+        )
+        for index in range(3)
+    )
+    monkeypatch.setattr(_impl, "_MEMORY_PROFILE_CACHE_MAX_ENTRIES", 2)
+    monkeypatch.setattr(_impl, "_MEMORY_PROFILE_CACHE_MAX_BYTES", 1 << 20)
+
+    for plan in (plans[0], plans[1], plans[0], plans[2]):
+        trainer._update_memory_profile(plan, plan.output_bytes + plan.packed_tokens)
+
+    assert tuple(trainer._memory_profiles) == (
+        plans[0].signature,
+        plans[2].signature,
+    )
+
+    trainer._memory_profiles.clear()
+    one_entry = _impl._memory_profile_cache_bytes(plans[0].signature)
+    monkeypatch.setattr(_impl, "_MEMORY_PROFILE_CACHE_MAX_ENTRIES", 8)
+    monkeypatch.setattr(_impl, "_MEMORY_PROFILE_CACHE_MAX_BYTES", one_entry)
+    trainer._update_memory_profile(
+        plans[0], plans[0].output_bytes + plans[0].packed_tokens
+    )
+    trainer._update_memory_profile(
+        plans[1], plans[1].output_bytes + plans[1].packed_tokens
+    )
+
+    assert tuple(trainer._memory_profiles) == (plans[1].signature,)
 
 
 def test_forward_micro_batches_does_not_overtrust_tiny_memory_profile(

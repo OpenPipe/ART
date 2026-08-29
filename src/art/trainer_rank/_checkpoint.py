@@ -33,6 +33,8 @@ LEGACY_FORMAT = 1
 MANIFEST_FILE = "checkpoint.json"
 _ART_FORMAT_KEY = "art_lora_format"
 _ART_FORMAT = "art-trainer-rank-v1"
+_MAX_FINALIZED_SAVE_TOMBSTONES = 128
+_MAX_FINALIZED_SAVE_TOMBSTONE_BYTES = 512 * 1024
 
 
 class OptimizerConfig(TypedDict):
@@ -1265,6 +1267,26 @@ def _advance_save_queue(trainer: TrainerRank, sequence: int) -> None:
         trainer._checkpoint_save_condition.notify_all()
 
 
+def _finalized_save_tombstone_bytes(output_dir: str) -> int:
+    return len(os.fsencode(output_dir)) + struct.calcsize("Q") + len("finish")
+
+
+def _record_finalized_save(
+    trainer: TrainerRank, output_dir: str, finalized: _FinalizedSave
+) -> None:
+    tombstones = trainer._finalized_checkpoint_saves
+    tombstones.pop(output_dir, None)
+    tombstones[output_dir] = finalized
+    retained_bytes = sum(_finalized_save_tombstone_bytes(path) for path in tombstones)
+    while tombstones and (
+        len(tombstones) > _MAX_FINALIZED_SAVE_TOMBSTONES
+        or retained_bytes > _MAX_FINALIZED_SAVE_TOMBSTONE_BYTES
+    ):
+        oldest = next(iter(tombstones))
+        retained_bytes -= _finalized_save_tombstone_bytes(oldest)
+        tombstones.pop(oldest)
+
+
 def _cleanup_paths(paths: Iterable[Path]) -> BaseException | None:
     errors: list[BaseException] = []
     for path in paths:
@@ -1432,8 +1454,10 @@ def _finalize_checkpoint_save(
                     trainer._prepared_checkpoint_saves.pop(output_dir, None)
                     trainer._checkpoint_save_outcomes.pop(output_dir, None)
                     assert outcome is not None
-                    trainer._finalized_checkpoint_saves[output_dir] = _FinalizedSave(
-                        sequence, outcome
+                    _record_finalized_save(
+                        trainer,
+                        output_dir,
+                        _FinalizedSave(sequence, outcome),
                     )
                 trainer._checkpoint_save_condition.notify_all()
 

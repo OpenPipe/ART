@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+from collections import OrderedDict
 from collections.abc import Mapping
+import hashlib
 from typing import Any, Generic, TypeVar, cast
 
 from art.training import (
@@ -31,6 +33,9 @@ from .client import (
 )
 
 ResultT = TypeVar("ResultT", bound=OperationResult)
+
+_MAX_RETAINED_OPERATIONS = 128
+_MAX_RETAINED_OPERATION_INDEX_BYTES = 128 * 1024
 
 
 class RemoteTrainingError(RuntimeError):
@@ -130,8 +135,11 @@ class RemoteTrainingClient:
         self._next_sequence_id = run.next_sequence_id
         self._projected_learner_version = run.projected_learner_version
         self._poll_interval_s = poll_interval_s
-        self._operations: dict[str, tuple[str, RemoteTrainingOperation[Any]]] = {}
+        self._operations: OrderedDict[
+            str, tuple[str, RemoteTrainingOperation[Any], int]
+        ] = OrderedDict()
         self._operations_by_id: dict[str, RemoteTrainingOperation[Any]] = {}
+        self._operation_index_bytes = 0
         self._lock = asyncio.Lock()
         self._closed = False
 
@@ -215,12 +223,16 @@ class RemoteTrainingClient:
             if self._closed:
                 return
             self._closed = True
+            self._operations.clear()
+            self._operations_by_id.clear()
+            self._operation_index_bytes = 0
         self._run = await self._service.close(self.run_id)
 
     async def _submit(
         self, request: RunCommand, result_type: type[ResultT]
     ) -> RemoteTrainingOperation[ResultT]:
-        fingerprint = request.model_dump_json()
+        fingerprint = _request_fingerprint(request)
+        command = request.model_dump(mode="json")
         async with self._lock:
             if self._closed:
                 raise RuntimeError("remote training client is closed")
@@ -231,18 +243,24 @@ class RemoteTrainingClient:
                 if prior[0] != fingerprint:
                     raise ValueError("request_id was reused with different content")
                 return cast(RemoteTrainingOperation[ResultT], prior[1])
-            if request.sequence_id != self._next_sequence_id:
+            if request.sequence_id > self._next_sequence_id:
                 raise ValueError(
                     f"expected sequence {self._next_sequence_id}, "
                     f"got {request.sequence_id}"
                 )
+            replay = request.sequence_id < self._next_sequence_id
             admitted = await self._service.submit(request)
             ref = _operation_ref(admitted)
             if (
                 ref.run_id != self.run_id
                 or ref.sequence_id != request.sequence_id
                 or ref.kind != request_kind(request)
-                or ref.learner_parent_version != self._projected_learner_version
+                or admitted.request_id != request.request_id
+                or admitted.command != command
+                or (
+                    not replay
+                    and ref.learner_parent_version != self._projected_learner_version
+                )
             ):
                 raise RemoteTrainingError("server admitted a divergent command")
             operation = RemoteTrainingOperation(
@@ -251,12 +269,35 @@ class RemoteTrainingClient:
                 result_type,
                 poll_interval_s=self._poll_interval_s,
             )
-            self._operations[request.request_id] = (fingerprint, operation)
-            self._operations_by_id[ref.operation_id] = operation
-            self._next_sequence_id += 1
-            if ref.reserved_output_learner_version is not None:
-                self._projected_learner_version = ref.reserved_output_learner_version
+            self._retain_operation(request.request_id, fingerprint, operation)
+            if not replay:
+                self._next_sequence_id += 1
+                if ref.reserved_output_learner_version is not None:
+                    self._projected_learner_version = (
+                        ref.reserved_output_learner_version
+                    )
             return operation
+
+    def _retain_operation(
+        self,
+        request_id: str,
+        fingerprint: str,
+        operation: RemoteTrainingOperation[Any],
+    ) -> None:
+        operation_id = operation.ref.operation_id
+        if operation_id in self._operations_by_id:
+            raise RemoteTrainingError("server reused a retained operation_id")
+        index_bytes = _operation_index_bytes(request_id, fingerprint, operation.ref)
+        self._operations[request_id] = (fingerprint, operation, index_bytes)
+        self._operations_by_id[operation_id] = operation
+        self._operation_index_bytes += index_bytes
+        while self._operations and (
+            len(self._operations) > _MAX_RETAINED_OPERATIONS
+            or self._operation_index_bytes > _MAX_RETAINED_OPERATION_INDEX_BYTES
+        ):
+            _, (_, evicted, evicted_bytes) = self._operations.popitem(last=False)
+            self._operations_by_id.pop(evicted.ref.operation_id, None)
+            self._operation_index_bytes -= evicted_bytes
 
 
 def _operation_ref(operation: NativeTrainingOperation) -> OperationRef:
@@ -268,4 +309,24 @@ def _operation_ref(operation: NativeTrainingOperation) -> OperationRef:
         learner_parent_version=operation.learner_parent_version,
         reserved_output_learner_version=(operation.reserved_output_learner_version),
         kind=kind,
+    )
+
+
+def _request_fingerprint(request: RunCommand) -> str:
+    return hashlib.sha256(request.model_dump_json().encode()).hexdigest()
+
+
+def _operation_index_bytes(request_id: str, fingerprint: str, ref: OperationRef) -> int:
+    return (
+        sum(
+            len(value.encode())
+            for value in (
+                request_id,
+                fingerprint,
+                ref.run_id,
+                ref.operation_id,
+                ref.kind,
+            )
+        )
+        + 3 * 8
     )

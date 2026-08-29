@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections import OrderedDict
 from collections.abc import (
     Awaitable,
     Callable,
@@ -15,6 +16,7 @@ from collections.abc import (
 from copy import deepcopy
 from dataclasses import dataclass
 from dataclasses import field as dataclass_field
+import json
 import math
 import os
 from pathlib import Path
@@ -94,6 +96,10 @@ T = TypeVar("T")
 ModuleT = TypeVar("ModuleT", bound=torch.nn.Module)
 
 _MEMORY_PROFILE_TRUST_GROWTH = 8
+_CHECKPOINT_PREFETCH_CACHE_MAX_ENTRIES = 8
+_CHECKPOINT_PREFETCH_CACHE_MAX_BYTES = 512 * 1024**2
+_MEMORY_PROFILE_CACHE_MAX_ENTRIES = 128
+_MEMORY_PROFILE_CACHE_MAX_BYTES = 64 * 1024
 
 
 class _AdapterConfig(TypedDict):
@@ -423,6 +429,42 @@ class _MemoryCheck:
 class _MemoryProfile:
     bytes_per_token: float
     packed_tokens: int
+
+
+def _memory_profile_cache_bytes(signature: _MemorySignature) -> int:
+    return (
+        8 * (len(signature.topology) + 3)
+        + sum(len(value.encode()) for value in signature.request_mix)
+        + 2 * 8
+    )
+
+
+def _prepared_checkpoint_cache_bytes(source: PreparedCheckpoint) -> int:
+    if not all(
+        hasattr(source, name)
+        for name in ("config", "manifest", "path", "digest", "keys", "custom")
+    ):
+        return 0
+    metadata = json.dumps(
+        {"config": source.config, "manifest": source.manifest},
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    retained = len(metadata) + len(str(source.path).encode()) + len(source.digest)
+    retained += sum(len(key.encode()) for key in source.keys)
+    if source.custom is None:
+        return retained
+    retained += len(
+        json.dumps(
+            source.custom.records, sort_keys=True, separators=(",", ":")
+        ).encode()
+    )
+    for tensors in (source.custom.tensors, source.custom.optimizer):
+        retained += sum(
+            len(key.encode()) + tensor.numel() * tensor.element_size()
+            for key, tensor in tensors.items()
+        )
+    return retained
 
 
 @dataclass(frozen=True)
@@ -824,7 +866,9 @@ class TrainerRank:
         self._slot_stack: list[LoRASlotRef] = []
         self._checkpoint_slots: dict[str, _CheckpointSlot] = {}
         self._prepared_lora_exports: dict[str, tuple[str, _PreparedLoraExport]] = {}
-        self._checkpoint_prefetches: dict[str, asyncio.Task[PreparedCheckpoint]] = {}
+        self._checkpoint_prefetches: OrderedDict[
+            str, asyncio.Task[PreparedCheckpoint]
+        ] = OrderedDict()
         self._checkpoint_mutation_tail: asyncio.Task[None] | None = None
         self._checkpoint_process_group: dist.ProcessGroup | None = None
         self._checkpoint_finalize_process_group: dist.ProcessGroup | None = None
@@ -839,7 +883,9 @@ class TrainerRank:
         self._checkpoint_finalizing_saves: dict[str, Literal["finish", "abort"]] = {}
         self._checkpoint_save_outcomes: dict[str, Literal["finish", "abort"]] = {}
         self._prepared_checkpoint_saves: dict[str, _PreparedSave] = {}
-        self._finalized_checkpoint_saves: dict[str, _FinalizedSave] = {}
+        self._finalized_checkpoint_saves: OrderedDict[str, _FinalizedSave] = (
+            OrderedDict()
+        )
         self._pending_slot_graphs: dict[
             LoRASlotRef, list[weakref.ReferenceType[torch.Tensor]]
         ] = {}
@@ -847,7 +893,9 @@ class TrainerRank:
         self._hybridep_graph_tracking = False
         self._hybridep_buffer_id: int | None = None
         self._hybridep_rows_high_water = 0
-        self._memory_profiles: dict[_MemorySignature, _MemoryProfile] = {}
+        self._memory_profiles: OrderedDict[_MemorySignature, _MemoryProfile] = (
+            OrderedDict()
+        )
         self._last_global_micro_batch_size: int | None = None
         self.zero_grad()
 
@@ -1342,12 +1390,59 @@ class TrainerRank:
             task = self._checkpoint_prefetches[key] = asyncio.create_task(
                 asyncio.to_thread(prepare_checkpoint, key)
             )
+            self._trim_checkpoint_prefetches()
+        else:
+            self._checkpoint_prefetches.move_to_end(key)
         try:
-            return await asyncio.shield(task)
+            source = await asyncio.shield(task)
         except BaseException:
-            if task.done():
+            if self._checkpoint_prefetches.get(key) is task and task.done():
                 self._checkpoint_prefetches.pop(key, None)
             raise
+        if self._checkpoint_prefetches.get(key) is task:
+            self._checkpoint_prefetches.move_to_end(key)
+            self._trim_checkpoint_prefetches()
+        return source
+
+    def _trim_checkpoint_prefetches(self) -> None:
+        for key, task in tuple(self._checkpoint_prefetches.items()):
+            if not task.done():
+                continue
+            try:
+                task.result()
+            except BaseException:
+                if self._checkpoint_prefetches.get(key) is task:
+                    self._checkpoint_prefetches.pop(key, None)
+        retained_bytes = sum(
+            _prepared_checkpoint_cache_bytes(task.result())
+            for task in self._checkpoint_prefetches.values()
+            if task.done() and not task.cancelled() and task.exception() is None
+        )
+        while self._checkpoint_prefetches and (
+            len(self._checkpoint_prefetches) > _CHECKPOINT_PREFETCH_CACHE_MAX_ENTRIES
+            or retained_bytes > _CHECKPOINT_PREFETCH_CACHE_MAX_BYTES
+        ):
+            _, evicted = self._checkpoint_prefetches.popitem(last=False)
+            if (
+                evicted.done()
+                and not evicted.cancelled()
+                and evicted.exception() is None
+            ):
+                retained_bytes -= _prepared_checkpoint_cache_bytes(evicted.result())
+
+    def _release_checkpoint_prefetch(
+        self, key: str, source: PreparedCheckpoint
+    ) -> None:
+        task = self._checkpoint_prefetches.get(key)
+        if task is None or not task.done():
+            return
+        try:
+            cached = task.result()
+        except BaseException:
+            self._checkpoint_prefetches.pop(key, None)
+            return
+        if cached is source:
+            self._checkpoint_prefetches.pop(key, None)
 
     async def _load_checkpoint_path(
         self,
@@ -1369,7 +1464,7 @@ class TrainerRank:
         _checkpoint.raise_distributed(error, "prepare checkpoint", group)
         assert source is not None
         _checkpoint.load_checkpoint(self, source, logical_path)
-        self._checkpoint_prefetches.pop(key, None)
+        self._release_checkpoint_prefetch(key, source)
 
     def _resolve_checkpoint_name(self, checkpoint_path: str | Literal["active"]) -> str:
         if checkpoint_path != "active":
@@ -3147,7 +3242,7 @@ class TrainerRank:
             return
         compute_delta = max(0, peak_delta_bytes - plan.output_bytes)
         bytes_per_token = compute_delta / max(1, plan.packed_tokens)
-        previous = self._memory_profiles.get(plan.signature)
+        previous = self._memory_profiles.pop(plan.signature, None)
         self._memory_profiles[plan.signature] = _MemoryProfile(
             bytes_per_token=max(
                 bytes_per_token,
@@ -3158,6 +3253,16 @@ class TrainerRank:
                 0 if previous is None else previous.packed_tokens,
             ),
         )
+        retained_bytes = sum(
+            _memory_profile_cache_bytes(signature)
+            for signature in self._memory_profiles
+        )
+        while self._memory_profiles and (
+            len(self._memory_profiles) > _MEMORY_PROFILE_CACHE_MAX_ENTRIES
+            or retained_bytes > _MEMORY_PROFILE_CACHE_MAX_BYTES
+        ):
+            evicted, _ = self._memory_profiles.popitem(last=False)
+            retained_bytes -= _memory_profile_cache_bytes(evicted)
 
     def _forward_item(self, request: AnyForwardInput) -> _ForwardItem:
         if request.top_k is not None:

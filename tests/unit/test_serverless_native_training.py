@@ -23,10 +23,12 @@ from art.training import (
 class _TrainingRuns:
     def __init__(self) -> None:
         self.submissions = 0
+        self.operations: dict[str, NativeTrainingOperation] = {}
+        self.run: NativeTrainingRun | None = None
 
     async def resolve(self, **kwargs: Any) -> NativeTrainingRun:
         spec = kwargs["spec"]
-        return NativeTrainingRun(
+        self.run = NativeTrainingRun(
             run_id="run-native",
             run_name=kwargs["run_name"],
             spec={
@@ -41,19 +43,35 @@ class _TrainingRuns:
             projected_learner_version=0,
             committed_learner_version=0,
         )
+        return self.run
 
     async def submit(self, request: ForwardRequest) -> NativeTrainingOperation:
         self.submissions += 1
-        return _operation(request, status="admitted")
+        prior = self.operations.get(request.request_id)
+        if prior is not None:
+            return prior
+        operation_id = (
+            "operation-native"
+            if request.request_id == "request-native"
+            else f"operation-{request.sequence_id}"
+        )
+        admitted = _operation(request, operation_id=operation_id, status="admitted")
+        self.operations[request.request_id] = admitted
+        return admitted
 
     async def operation(
         self, run_id: str, operation_id: str
     ) -> NativeTrainingOperation:
         assert run_id == "run-native"
-        assert operation_id == "operation-native"
-        request = _request()
+        admitted = next(
+            operation
+            for operation in self.operations.values()
+            if operation.operation_id == operation_id
+        )
+        request = ForwardRequest.model_validate(admitted.command)
         return _operation(
             request,
+            operation_id=operation_id,
             status="succeeded",
             result={
                 "kind": "forward",
@@ -74,16 +92,17 @@ class _TrainingRuns:
         raise AssertionError((run_id, operation_id))
 
     async def close(self, run_id: str) -> NativeTrainingRun:
-        run = await self.resolve()
-        assert run_id == run.run_id
-        return run.model_copy(update={"status": "closing"})
+        assert self.run is not None and run_id == self.run.run_id
+        return self.run.model_copy(update={"status": "closing"})
 
 
-def _request() -> ForwardRequest:
+def _request(
+    *, request_id: str = "request-native", sequence_id: int = 0
+) -> ForwardRequest:
     return ForwardRequest(
         run_id="run-native",
-        request_id="request-native",
-        sequence_id=0,
+        request_id=request_id,
+        sequence_id=sequence_id,
         batch=PackedInputCaptureRef(
             run_id="run-native",
             capture_id="capture-native",
@@ -97,11 +116,12 @@ def _request() -> ForwardRequest:
 def _operation(
     request: ForwardRequest,
     *,
+    operation_id: str = "operation-native",
     status: NativeOperationStatus,
     result: dict[str, Any] | None = None,
 ) -> NativeTrainingOperation:
     return NativeTrainingOperation(
-        operation_id="operation-native",
+        operation_id=operation_id,
         run_id=request.run_id,
         request_id=request.request_id,
         sequence_id=request.sequence_id,
@@ -152,3 +172,59 @@ async def test_native_client_retains_run_and_terminal_operation_identity() -> No
     assert evidence.command_digest == f"sha256:{'a' * 64}"
     assert evidence.execution_ended_at is not None
     assert service.submissions == 1
+
+
+@pytest.mark.asyncio
+async def test_native_client_bounds_indexes_and_replays_evicted_requests(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import art.serverless.native_training as native_training
+
+    monkeypatch.setattr(native_training, "_MAX_RETAINED_OPERATIONS", 1)
+    service = _TrainingRuns()
+    client = await RemoteTrainingClient.resolve(
+        cast(TrainingRuns, service),
+        request_id="resolve-native",
+        run_name="gate-2-run",
+        spec=TrainingRunSpec(
+            base_model="Qwen/Qwen3-30B-A3B",
+            adapter=AdapterSpec(rank=32, target_modules=("linear_qkv",)),
+        ),
+    )
+    first_request = _request()
+    second_request = _request(request_id="request-second", sequence_id=1)
+
+    first = await client.forward(first_request)
+    second = await client.forward(second_request)
+
+    assert client.operation_ids == (second.ref.operation_id,)
+    with pytest.raises(native_training.RemoteTrainingError, match="divergent"):
+        await client.forward(
+            first_request.model_copy(update={"collect_packing_shapes": True})
+        )
+
+    replay = await client.forward(first_request)
+    assert replay is not first
+    assert replay.ref == first.ref
+    assert client.next_sequence_id == 2
+    assert client.operation_ids == (first.ref.operation_id,)
+    assert service.submissions == 4
+
+    monkeypatch.setattr(native_training, "_MAX_RETAINED_OPERATIONS", 8)
+    monkeypatch.setattr(
+        native_training,
+        "_MAX_RETAINED_OPERATION_INDEX_BYTES",
+        client._operation_index_bytes,
+    )
+    third = await client.forward(_request(request_id="request-third", sequence_id=2))
+
+    assert client.operation_ids == (third.ref.operation_id,)
+    assert (
+        client._operation_index_bytes
+        <= native_training._MAX_RETAINED_OPERATION_INDEX_BYTES
+    )
+    assert service.submissions == 5
+
+    await client.close()
+    assert client.operation_ids == ()
+    assert client._operation_index_bytes == 0
