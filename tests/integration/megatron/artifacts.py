@@ -23,11 +23,16 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 ARTIFACTS_ROOT = Path(__file__).resolve().parent / "artifacts"
 SUITE_NAME = "Megatron integration tests"
 LONGREP_MAX_CHARS = 12000
+DEPLOYED_SOURCE_ROOT_ENV = "ART_DEPLOYED_SOURCE_ROOT"
+DEPLOYED_SOURCE_COMMIT_ENV = "ART_DEPLOYED_SOURCE_COMMIT"
+DEPLOYED_SOURCE_TREE_ENV = "ART_DEPLOYED_SOURCE_TREE"
+DEPLOYED_SOURCE_BRANCH_ENV = "ART_DEPLOYED_SOURCE_BRANCH"
 
 
 class GitRepoState(BaseModel):
     path: str
     commit: str
+    tree: str | None = None
     dirty: bool
     status: tuple[str, ...] = ()
 
@@ -81,8 +86,44 @@ def _short_text(value: object | None) -> str | None:
     return text[-LONGREP_MAX_CHARS:]
 
 
-def require_clean_git_state(suite_name: str) -> str:
-    """Return the current commit after checking artifacts can be tied to clean code."""
+def _native_worktree() -> bool:
+    try:
+        top_level = _git("rev-parse", "--show-toplevel")
+    except subprocess.CalledProcessError:
+        return False
+    return Path(top_level).resolve() == REPO_ROOT.resolve()
+
+
+def _deployed_source_state() -> GitRepoState:
+    values = {
+        "root": os.environ.get(DEPLOYED_SOURCE_ROOT_ENV),
+        "commit": os.environ.get(DEPLOYED_SOURCE_COMMIT_ENV),
+        "tree": os.environ.get(DEPLOYED_SOURCE_TREE_ENV),
+    }
+    if not all(values.values()):
+        missing = sorted(name for name, value in values.items() if not value)
+        raise RuntimeError(
+            "source-only deployment requires a complete ART source attestation; "
+            f"missing={missing}"
+        )
+    root = Path(str(values["root"])).resolve()
+    if root != REPO_ROOT.resolve():
+        raise RuntimeError(
+            f"deployed ART source root differs: attested={root}, actual={REPO_ROOT.resolve()}"
+        )
+    commit, tree = str(values["commit"]), str(values["tree"])
+    if not re.fullmatch(r"[0-9a-f]{40}", commit) or not re.fullmatch(
+        r"[0-9a-f]{40}", tree
+    ):
+        raise RuntimeError(
+            "deployed ART source commit and tree must be full Git object IDs"
+        )
+    return GitRepoState(path=str(root), commit=commit, tree=tree, dirty=False)
+
+
+def _source_state(suite_name: str) -> GitRepoState:
+    if not _native_worktree():
+        return _deployed_source_state()
     dirty = _git("status", "--porcelain=v1", "--untracked-files=all").splitlines()
     if dirty:
         rendered = "\n".join(dirty)
@@ -91,10 +132,28 @@ def require_clean_git_state(suite_name: str) -> str:
             "Commit or remove these changes before running tests:\n"
             f"{rendered}"
         )
-    return _git("rev-parse", "HEAD")
+    return GitRepoState(
+        path=str(REPO_ROOT),
+        commit=_git("rev-parse", "HEAD"),
+        tree=_git("rev-parse", "HEAD^{tree}"),
+        dirty=False,
+    )
+
+
+def _source_branch() -> str:
+    if _native_worktree():
+        return _git("branch", "--show-current")
+    return os.environ.get(DEPLOYED_SOURCE_BRANCH_ENV, "deployed")
+
+
+def require_clean_git_state(suite_name: str) -> str:
+    """Return the current commit after checking artifacts can be tied to clean code."""
+    return _source_state(suite_name).commit
 
 
 def git_state(path: Path) -> GitRepoState:
+    if path.resolve() == REPO_ROOT.resolve() and not _native_worktree():
+        return _deployed_source_state()
     status = tuple(
         line
         for line in _git("-C", str(path), "status", "--porcelain=v1").splitlines()
@@ -103,14 +162,14 @@ def git_state(path: Path) -> GitRepoState:
     return GitRepoState(
         path=str(path),
         commit=_git("-C", str(path), "rev-parse", "HEAD"),
+        tree=_git("-C", str(path), "rev-parse", "HEAD^{tree}"),
         dirty=bool(status),
         status=status,
     )
 
 
 def pinned_git_state(suite_name: str) -> GitRepoState:
-    require_clean_git_state(suite_name)
-    return git_state(REPO_ROOT)
+    return _source_state(suite_name)
 
 
 def create_artifact_dir(
@@ -121,7 +180,7 @@ def create_artifact_dir(
 ) -> Path:
     """Create a durable, git-addressed artifact directory for one test invocation."""
     commit = require_clean_git_state(suite_name)
-    branch = _git("branch", "--show-current")
+    branch = _source_branch()
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     run_id = f"{timestamp}_{os.getpid()}_{uuid.uuid4().hex[:8]}"
     artifact_dir = artifacts_root / _sanitize_nodeid(test_nodeid) / commit[:12] / run_id
@@ -157,8 +216,8 @@ def write_pytest_result(
     reports: list[Any],
 ) -> Path:
     result = PytestResult(
-        commit=_git("rev-parse", "HEAD"),
-        branch=_git("branch", "--show-current"),
+        commit=require_clean_git_state(SUITE_NAME),
+        branch=_source_branch(),
         test_nodeid=test_nodeid,
         created_at_utc=datetime.now(timezone.utc).isoformat(),
         phases=[
