@@ -864,7 +864,7 @@ def _patch_art_runtime_routes() -> None:
                         },
                         status_code=HTTPStatus.BAD_REQUEST.value,
                     )
-                mark_route_request(request, route_identity=request_identity)
+                mark_route_request(request)
             fingerprint = _private_request_fingerprint(
                 request, route_capture_max_bytes=route_capture_max_bytes
             )
@@ -1212,7 +1212,7 @@ def _patch_art_runtime_routes() -> None:
                 )
             route_identity = request.request_id or uuid.uuid4().hex
             request.request_id = route_identity
-            mark_route_request(request, route_identity=route_identity)
+            mark_route_request(request)
             with capture_routed_experts() as routes:
                 response = await create_chat_completion(request, raw_request)
             if response is None:

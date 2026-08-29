@@ -37,14 +37,18 @@ class BinaryRoutesProtocolTest(unittest.TestCase):
     def test_route_request_binds_private_marker_and_cache_identity(self) -> None:
         request = SimpleNamespace(vllm_xargs={"other": 2}, cache_salt="policy")
 
-        binary_routes.mark_route_request(request, route_identity="request-a")
-        binary_routes.mark_route_request(request, route_identity="request-a")
+        binary_routes.mark_route_request(request)
+        binary_routes.mark_route_request(request)
 
         self.assertEqual(
             request.vllm_xargs,
             {"other": 2, binary_routes.ROUTE_REQUEST_XARG: 1},
         )
-        self.assertEqual(request.cache_salt, "policy|art-routes=ARTRTE2:request-a")
+        self.assertEqual(request.cache_salt, "policy|art-routes=ARTRTE2")
+
+        second = SimpleNamespace(vllm_xargs=None, cache_salt="policy")
+        binary_routes.mark_route_request(second)
+        self.assertEqual(second.cache_salt, request.cache_salt)
 
     def test_only_marked_scheduled_requests_enable_capture(self) -> None:
         marked = SimpleNamespace(extra_args={binary_routes.ROUTE_REQUEST_XARG: 1})
