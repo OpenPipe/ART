@@ -989,6 +989,8 @@ class ArtRuntime:
             runtime_fingerprint=runtime_spec.fingerprint,
             training_session_id=f"art-slot:{launch_id}",
             initial_learner_version=0,
+            lora_rank=runtime_spec.lora_rank,
+            lora_target_modules=runtime_spec.lora_target_modules,
             initial_adapter_path=f"art-slot:{launch_id}:adapter",
             optimizer_state_path=f"art-slot:{launch_id}:optimizer",
             event_timeout_s=command_timeout_s,

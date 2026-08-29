@@ -29,6 +29,7 @@ from art.megatron.slot_coordinator import (
 )
 from art.training import (
     AdamConfig,
+    AdapterSpec,
     CheckpointRef,
     CommandAdmission,
     ExternalLoraReceipt,
@@ -118,6 +119,8 @@ class _Trainer:
         topology = SimpleNamespace(tp=1, cp=1, pp=1)
         self.runtime_spec = SimpleNamespace(
             fingerprint="runtime",
+            lora_rank=32,
+            lora_target_modules=("q_proj", "v_proj"),
             packed_sequence_length=8,
             enable_moe_routing_replay=False,
             trainer_mesh=SimpleNamespace(ranks=(0,), topology=topology),
@@ -127,11 +130,16 @@ class _Trainer:
         self.max_active = 0
         self.executed_runs: list[str] = []
         self.registered_runs: set[str] = set()
+        self.registered_adapters: dict[str, tuple[int, tuple[str, ...]]] = {}
         self.run_states: dict[str, TrainerCommandRunState] = {}
         self.migration_releases: list[str] = []
 
-    def register_command_run(self, run_spec) -> None:
+    async def register_command_run(self, run_spec) -> None:
         self.registered_runs.add(run_spec.run_id)
+        self.registered_adapters[run_spec.run_id] = (
+            run_spec.lora_rank,
+            run_spec.lora_target_modules,
+        )
         self.run_states[run_spec.run_id] = TrainerCommandRunState(
             run_id=run_spec.run_id,
             training_session_id=run_spec.training_session_id,
@@ -264,6 +272,7 @@ async def test_handler_retains_f_b_input_until_optimizer_commit() -> None:
         MegatronOperationConfig(
             run_id="run",
             training_session_id="session",
+            adapter=AdapterSpec(rank=8, target_modules=("q_proj",)),
             source=TrainerGeneration(
                 training_session_id="session",
                 policy_step=0,
@@ -341,6 +350,7 @@ async def test_replay_capture_survives_optimizer_until_explicit_release() -> Non
         MegatronOperationConfig(
             run_id="run",
             training_session_id="session",
+            adapter=AdapterSpec(rank=8, target_modules=("q_proj",)),
             source=TrainerGeneration(
                 training_session_id="session",
                 policy_step=0,
@@ -419,6 +429,10 @@ async def test_slot_coordinator_serializes_four_logical_runs() -> None:
                 MegatronOperationConfig(
                     run_id=run_id,
                     training_session_id=session_id,
+                    adapter=AdapterSpec(
+                        rank=index + 1,
+                        target_modules=("q_proj",) if index % 2 else ("v_proj",),
+                    ),
                     source=TrainerGeneration(
                         training_session_id=session_id,
                         policy_step=0,
@@ -457,6 +471,13 @@ async def test_slot_coordinator_serializes_four_logical_runs() -> None:
     assert {outcome.status for outcome in outcomes} == {"succeeded"}
     assert trainer.max_active == 1
     assert set(trainer.executed_runs) == {run.run_id for run in runs}
+    assert trainer.registered_adapters == {
+        f"run-{index}": (
+            index + 1,
+            ("q_proj",) if index % 2 else ("v_proj",),
+        )
+        for index in range(4)
+    }
     await slot.drain_run("run-0")
     with pytest.raises(KeyError):
         slot.resolve_run("run-0")
@@ -506,6 +527,7 @@ async def test_sampler_publication_receipt_lives_until_operation_retirement() ->
         MegatronOperationConfig(
             run_id="run",
             training_session_id="session",
+            adapter=AdapterSpec(rank=8, target_modules=("q_proj",)),
             source=TrainerGeneration(
                 training_session_id="session",
                 policy_step=0,
@@ -627,6 +649,7 @@ async def test_slot_migration_fences_replays_and_releases_one_run() -> None:
         MegatronOperationConfig(
             run_id="run",
             training_session_id="session",
+            adapter=AdapterSpec(rank=8, target_modules=("q_proj",)),
             source=TrainerGeneration(
                 training_session_id="session",
                 policy_step=2,
@@ -721,6 +744,7 @@ async def test_slot_migration_fences_replays_and_releases_one_run() -> None:
     abort_config = MegatronOperationConfig(
         run_id="abort-run",
         training_session_id="abort-session",
+        adapter=AdapterSpec(rank=8, target_modules=("q_proj",)),
         source=TrainerGeneration(
             training_session_id="abort-session",
             policy_step=0,
@@ -738,9 +762,17 @@ async def test_slot_migration_fences_replays_and_releases_one_run() -> None:
     assert abort.run_id == "abort-run"
     await slot.abort_migration_run("abort-run", "abort-restore")
     await slot.abort_migration_run("abort-run", "abort-restore")
-    with pytest.raises(RuntimeError, match="already aborted"):
+    retry = await slot.install_migration_run(
+        abort_config,
+        restore_id="abort-restore",
+    )
+    assert retry.run_id == "abort-run"
+    await slot.abort_migration_run("abort-run", "abort-restore")
+    with pytest.raises(RuntimeError, match="configuration changed"):
         await slot.install_migration_run(
-            abort_config,
+            abort_config.model_copy(
+                update={"optimizer_state_path": "/optimizer/changed"}
+            ),
             restore_id="abort-restore",
         )
     await slot.aclose()

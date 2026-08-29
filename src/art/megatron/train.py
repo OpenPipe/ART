@@ -629,6 +629,7 @@ def _execute_megatron_rl_forward_backward_steps(
     replay_bundle: MoeRoutingReplayBundle | None = None,
     defer_grad_sync: bool = False,
     forward_only: bool = False,
+    state_is_resident: bool = False,
 ) -> tuple[dict[str, torch.dtype], float]:
     job_prepare_started = time.perf_counter()
     template = None
@@ -656,7 +657,9 @@ def _execute_megatron_rl_forward_backward_steps(
             strict=_moe_replay_strict(job),
         )
         replay_finalize_s = time.perf_counter() - replay_finalize_started
-        adapter_dtypes = _prepare_rl_training_state(runtime, job)
+        adapter_dtypes = (
+            {} if state_is_resident else _prepare_rl_training_state(runtime, job)
+        )
         template = _clone_packed_tensors(select_indexed_inputs(packed_tensors, 0))
         zero_template = _zero_contribution_inputs(template)
         num_sequences, packed_sequence_length = map(int, packed_tensors["tokens"].shape)
@@ -1056,6 +1059,133 @@ def execute_megatron_rl_forward_backward_job(
     )
 
 
+def execute_megatron_dynamic_lora_forward_backward_job(
+    runtime: TrainingRuntime,
+    job: ForwardBackwardJobSpec,
+    packed_tensors: PackedTensors,
+    *,
+    slot_trainer: Any,
+    gradient_accumulator: Any,
+    cancelled: Event | None = None,
+) -> MegatronForwardBackwardJobResult:
+    """Execute F/B against one exact-shape resident TrainerRank slot."""
+    from art.megatron.lora import LoRASlotRef, use_lora_slot
+    from art.megatron.training.gradient_accumulator import (
+        ParameterGradientAccumulator,
+    )
+
+    observed_tokens = int(packed_tensors["assistant_mask"][:, 1:].sum().item())
+    if observed_tokens != job.expected_global_loss_bearing_tokens:
+        raise RuntimeError(
+            "packed F/B loss-bearing token count differs from command provenance: "
+            f"observed={observed_tokens}, "
+            f"expected={job.expected_global_loss_bearing_tokens}"
+        )
+    reference = _experimental_train_config(job).get("kl_ref_adapter_path")
+    if (
+        job.config.kl_penalty_coef > 0.0
+        and reference is not None
+        and os.path.abspath(reference) != os.path.abspath(job.source_adapter_path)
+    ):
+        raise NotImplementedError(
+            "resident dynamic LoRA requires the KL reference to be the learner"
+        )
+    parameters = slot_trainer.checkpoint_slot_parameters(job.run_id)
+    internal = ParameterGradientAccumulator(parameters)
+    states: list[RLForwardBackwardState] = []
+    durations: list[float] = []
+
+    def before_step(_step_index: int) -> None:
+        slot_trainer.clear_checkpoint_slot_grads(job.run_id)
+
+    def record_step(
+        step_index: int,
+        _num_steps: int,
+        state: RLForwardBackwardState,
+        duration_s: float,
+        _replay_finalize_s: float,
+        _step_input_prepare_s: float,
+    ) -> None:
+        gradients = tuple(
+            (
+                torch.zeros_like(parameter, dtype=torch.float32)
+                if parameter.grad is None
+                else parameter.grad.detach().float()
+            )
+            for parameter in parameters
+        )
+        internal.record(
+            f"{job.operation_id}:{step_index}",
+            state.token_count,
+            gradients,
+            step_flags=tuple(parameter.grad is not None for parameter in parameters),
+        )
+        states.append(state)
+        durations.append(duration_s)
+
+    def execute() -> tuple[float, Any, tuple[MegatronForwardBackwardStepResult, ...]]:
+        with use_lora_slot(LoRASlotRef("checkpoint", job.run_id)):
+            _, job_prepare_s = _execute_megatron_rl_forward_backward_steps(
+                runtime,
+                job,
+                packed_tensors,
+                before_step=before_step,
+                after_step=record_step,
+                cancelled=cancelled,
+                defer_grad_sync=True,
+                state_is_resident=True,
+            )
+        internal.seal(internal.contribution_ids)
+        local_sums, step_flags = internal.prepare_local_sums()
+        gradient_accumulator.record(
+            job.operation_id,
+            local_sums.local_token_count,
+            local_sums.gradients,
+            expected_global_token_count=job.expected_global_loss_bearing_tokens,
+            step_flags=step_flags,
+        )
+        internal.consume()
+        slot_trainer.clear_checkpoint_slot_grads(job.run_id)
+        results = tuple(
+            _finish_megatron_rl_forward_backward_step(state) for state in states
+        )
+        if any(not torch.isfinite(result.reduced_loss).item() for result in results):
+            raise RuntimeError("Megatron F/B produced a non-finite loss")
+        return job_prepare_s, local_sums, results
+
+    (job_prepare_s, local_sums, results), gpu_service_ns = measure_cuda_call(execute)
+    return MegatronForwardBackwardJobResult(
+        new_logprobs=tuple(
+            values
+            for _, values in sorted(
+                (
+                    (sample_index, values)
+                    for state in states
+                    for sample_index, values in zip(
+                        state.sample_indices, state.new_logprobs, strict=True
+                    )
+                    if sample_index is not None
+                ),
+                key=lambda item: item[0],
+            )
+        ),
+        local_token_count=local_sums.local_token_count,
+        completed_gradient_steps=len(results),
+        logical_nonpadding_tokens=sum(
+            result.workload.logical_nonpadding_tokens for result in results
+        ),
+        executed_token_equivalents=sum(
+            result.workload.executed_token_equivalents for result in results
+        ),
+        gpu_service_ns=gpu_service_ns,
+        metrics={
+            "time/forward_backward_s": sum(durations),
+            "time/job_prepare_s": job_prepare_s,
+            "data/gradient_steps": float(len(results)),
+        },
+    )
+
+
 def execute_megatron_rl_forward_job(
     runtime: TrainingRuntime,
     job: ForwardJobSpec,
@@ -1063,6 +1193,7 @@ def execute_megatron_rl_forward_job(
     *,
     cancelled: Event | None = None,
     replay_bundle: MoeRoutingReplayBundle | None = None,
+    state_is_resident: bool = False,
 ) -> MegatronForwardJobResult:
     """Run the canonical packed forward without retaining gradients."""
 
@@ -1090,6 +1221,7 @@ def execute_megatron_rl_forward_job(
             cancelled=cancelled,
             replay_bundle=replay_bundle,
             forward_only=True,
+            state_is_resident=state_is_resident,
         )
         finished = tuple(
             _finish_megatron_rl_forward_backward_step(state) for state in results

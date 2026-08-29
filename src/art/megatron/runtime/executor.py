@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import dataclass
 import gc
 import math
 from pathlib import Path
@@ -35,6 +36,7 @@ from .specs import (
     SFTJobSpec,
     TrainerGeneration,
     TrainerJobSpec,
+    TrainingRunSpec,
     TrainJobSpec,
 )
 from .trainer_run import EventSink
@@ -520,6 +522,280 @@ class MegatronTrainJobExecutor:
 
     def _enforce_accumulator_budget(self) -> None:
         resident = sum(value.residency_nbytes for value in self._gradients.values())
+        if resident > self._accumulator_l1_budget_bytes:
+            raise RuntimeError(
+                "gradient accumulators exceed the per-rank L1 budget: "
+                f"{resident} > {self._accumulator_l1_budget_bytes}"
+            )
+
+
+@dataclass(slots=True)
+class _ResidentCommandRun:
+    spec: TrainingRunSpec
+    learner_version: int
+    gradients: Any
+
+
+class MCoreRunSlotExecutor:
+    """Execute independent exact-shape LoRAs on one warm MCore rank."""
+
+    def __init__(
+        self, runtime: Any, *, accumulator_l1_budget_bytes: int = 16 * 1024**3
+    ) -> None:
+        from art.trainer_rank import TrainerRank
+
+        self.runtime = runtime
+        self._trainer = TrainerRank(runtime)
+        self._runs: dict[str, _ResidentCommandRun] = {}
+        self._accumulator_l1_budget_bytes = accumulator_l1_budget_bytes
+        self._closed = False
+
+    def register_run(self, spec: TrainingRunSpec) -> None:
+        if self._closed:
+            raise RuntimeError("Megatron run slot executor is closed")
+        prior = self._runs.get(spec.run_id)
+        if prior is not None:
+            if prior.spec != spec:
+                raise RuntimeError("run_id was reused with different trainer state")
+            return
+        from art.megatron.model_support.lora_disk import load_adapter_config
+        from art.megatron.training.gradient_accumulator import (
+            ParameterGradientAccumulator,
+        )
+        from art.trainer_rank import MaterializedCheckpoint
+
+        adapter_config = load_adapter_config(spec.initial_adapter_path)
+        targets = adapter_config.get("target_modules")
+        target_modules = (
+            (targets,) if isinstance(targets, str) else tuple(targets or ())
+        )
+        if int(adapter_config.get("r", 0)) != spec.lora_rank or set(
+            target_modules
+        ) != set(spec.lora_target_modules):
+            raise RuntimeError("resident adapter shape differs from run admission")
+        with self._trainer.push_checkpoint(
+            MaterializedCheckpoint(
+                path=spec.run_id,
+                directory=spec.initial_adapter_path,
+            )
+        ):
+            pass
+        parameters = self._trainer.checkpoint_slot_parameters(spec.run_id)
+        self._runs[spec.run_id] = _ResidentCommandRun(
+            spec=spec,
+            learner_version=spec.initial_learner_version,
+            gradients=ParameterGradientAccumulator(parameters),
+        )
+
+    def execute_forward_backward(
+        self,
+        job: ForwardBackwardJobSpec,
+        batch: InMemoryPackedBatch,
+        cancelled: Event,
+    ) -> dict[str, Any]:
+        state = self._require_parent(job)
+        validate_packed_batch(batch)
+        from art.megatron.train import (
+            execute_megatron_dynamic_lora_forward_backward_job,
+        )
+
+        try:
+            result = execute_megatron_dynamic_lora_forward_backward_job(
+                self.runtime,
+                job,
+                batch.tensors,
+                slot_trainer=self._trainer,
+                gradient_accumulator=state.gradients,
+                cancelled=cancelled,
+            )
+        except BaseException:
+            self._trainer.clear_checkpoint_slot_grads(job.run_id)
+            raise
+        self._enforce_accumulator_budget()
+        return {
+            "operation_id": job.operation_id,
+            "learner_version": job.expected_learner_version,
+            "loss_bearing_token_count": job.expected_global_loss_bearing_tokens,
+            "completed_gradient_steps": result.completed_gradient_steps,
+            "logical_nonpadding_tokens": result.logical_nonpadding_tokens,
+            "executed_token_equivalents": result.executed_token_equivalents,
+            "gpu_service_ns": result.gpu_service_ns,
+            "token_logprobs": tuple(
+                TokenLogprobs.from_values(
+                    values.detach()
+                    .to(device="cpu", dtype=values.dtype)
+                    .flatten()
+                    .tolist(),
+                    shape=tuple(values.shape),
+                ).model_dump(mode="python")
+                for values in result.new_logprobs
+            )
+            if job.return_token_logprobs
+            else (),
+            "metrics": result.metrics,
+        }
+
+    def execute_forward(
+        self,
+        job: ForwardJobSpec,
+        batch: InMemoryPackedBatch,
+        cancelled: Event,
+    ) -> dict[str, Any]:
+        self._require_parent(job)
+        validate_packed_batch(batch)
+        from art.megatron.lora import LoRASlotRef, use_lora_slot
+        from art.megatron.train import execute_megatron_rl_forward_job
+
+        with use_lora_slot(LoRASlotRef("checkpoint", job.run_id)):
+            result = execute_megatron_rl_forward_job(
+                self.runtime,
+                job,
+                batch.tensors,
+                cancelled=cancelled,
+                state_is_resident=True,
+            )
+        return {
+            "operation_id": job.operation_id,
+            "learner_version": job.expected_learner_version,
+            "logical_nonpadding_tokens": result.logical_nonpadding_tokens,
+            "executed_token_equivalents": result.executed_token_equivalents,
+            "gpu_service_ns": result.gpu_service_ns,
+            "token_logprobs": tuple(
+                TokenLogprobs.from_values(
+                    values.detach()
+                    .to(device="cpu", dtype=values.dtype)
+                    .flatten()
+                    .tolist(),
+                    shape=tuple(values.shape),
+                ).model_dump(mode="python")
+                for values in result.new_logprobs
+            )
+            if job.return_token_logprobs
+            else (),
+            "metrics": result.metrics,
+        }
+
+    def execute_optimizer(self, job: OptimizerJobSpec) -> dict[str, Any]:
+        state = self._require_parent(job)
+        state.gradients.seal(job.contributing_forward_backward_operation_ids)
+        local_sums, step_flags = state.gradients.prepare_local_sums()
+        expected = local_sums.expected_global_token_count
+        if expected is None:
+            raise RuntimeError("optimizer gradients lack global token provenance")
+        from art.trainer_rank import AdamParams
+
+        def optimizer_step() -> tuple[dict[str, float], int]:
+            from megatron.core import parallel_state as ps
+            import torch
+
+            global_tokens = local_sums.local_token_count.detach().clone()
+            group = ps.get_data_parallel_group(with_context_parallel=True)
+            if torch.distributed.get_world_size(group) > 1:
+                torch.distributed.all_reduce(global_tokens, group=group)
+            observed = int(global_tokens.item())
+            if observed != expected:
+                raise RuntimeError(
+                    "accumulated trainable-token count differs from packed "
+                    f"provenance: observed={observed}, expected={expected}"
+                )
+            gradients = self._trainer.reduce_checkpoint_slot_grads(
+                job.run_id,
+                local_sums.gradients,
+                scale_grads=1.0 / observed,
+            )
+            result = self._trainer.optim_step_reduced(
+                job.run_id,
+                params=AdamParams(
+                    learning_rate=job.optimizer.learning_rate,
+                    beta1=job.optimizer.beta1,
+                    beta2=job.optimizer.beta2,
+                    eps=job.optimizer.eps,
+                    weight_decay=job.optimizer.weight_decay,
+                    grad_clip_norm=job.optimizer.grad_clip_norm,
+                ),
+                gradients=gradients,
+                step_flags=step_flags,
+            )
+            return result, observed
+
+        started = time.perf_counter()
+        (result, _tokens), gpu_service_ns = measure_cuda_call(optimizer_step)
+        if not result["update_successful"] or not math.isfinite(result["grad_norm"]):
+            raise RuntimeError("dynamic LoRA optimizer rejected the update")
+        consumed = state.gradients.consume()
+        if consumed != job.contributing_forward_backward_operation_ids:
+            raise RuntimeError("optimizer consumed the wrong gradient contributions")
+        state.learner_version = job.learner_version
+        return {
+            "operation_id": job.operation_id,
+            "learner_version": job.learner_version,
+            "contributing_forward_backward_operation_ids": consumed,
+            "gpu_service_ns": gpu_service_ns,
+            "metrics": {
+                "loss/learning_rate": job.optimizer.learning_rate,
+                "loss/grad_norm": result["grad_norm"],
+                "optimizer/update_successful": result["update_successful"],
+                "optimizer/num_zeros_in_grad": result["num_zeros_in_grad"],
+                "time/optimizer_step_s": time.perf_counter() - started,
+            },
+        }
+
+    def run_gradient_ids(self, run_id: str) -> tuple[str, ...]:
+        state = self._runs.get(run_id)
+        return () if state is None else state.gradients.contribution_ids
+
+    def discard_run_gradients(self, run_id: str) -> tuple[str, ...]:
+        state = self._runs.get(run_id)
+        if state is None:
+            return ()
+        contributions = state.gradients.contribution_ids
+        state.gradients.discard()
+        return contributions
+
+    def release_run(self, run_id: str) -> None:
+        state = self._runs.get(run_id)
+        if state is None:
+            return
+        if state.gradients.contribution_ids:
+            raise RuntimeError("cannot release a run with open gradients")
+        self._trainer.release_checkpoint_slot(run_id)
+        self._runs.pop(run_id)
+
+    def discard_open_gradients(self) -> None:
+        for state in self._runs.values():
+            state.gradients.discard()
+
+    @property
+    def has_open_gradients(self) -> bool:
+        return any(state.gradients.contribution_ids for state in self._runs.values())
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        for state in self._runs.values():
+            state.gradients.discard()
+        self._runs.clear()
+
+    def _require_parent(
+        self, job: ForwardBackwardJobSpec | ForwardJobSpec | OptimizerJobSpec
+    ) -> _ResidentCommandRun:
+        if self._closed:
+            raise RuntimeError("Megatron run slot executor is closed")
+        state = self._runs.get(job.run_id)
+        if state is None:
+            raise RuntimeError(f"training run is not resident: {job.run_id!r}")
+        if (
+            state.spec.training_session_id != job.training_session_id
+            or state.learner_version != job.expected_learner_version
+        ):
+            raise RuntimeError("resident run state does not match command parent")
+        return state
+
+    def _enforce_accumulator_budget(self) -> None:
+        resident = sum(
+            state.gradients.residency_nbytes for state in self._runs.values()
+        )
         if resident > self._accumulator_l1_budget_bytes:
             raise RuntimeError(
                 "gradient accumulators exceed the per-rank L1 budget: "

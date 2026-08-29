@@ -14,6 +14,7 @@ from art.distributed.packing import PackingRequest
 from art.distributed.rollout import RolloutModelSpec
 from art.distributed.trajectory_store import retained_route_bundles_from_bundles
 from art.training import (
+    AdapterSpec,
     CheckpointRef,
     CommandExecutionUsage,
     ForwardBackwardRequest,
@@ -190,6 +191,7 @@ class MegatronOperationConfig(BaseModel):
 
     run_id: str = Field(min_length=1)
     training_session_id: str = Field(min_length=1)
+    adapter: AdapterSpec
     source: TrainerGeneration
     initial_operation_sequence: int = Field(default=0, ge=0)
     optimizer_state_path: str = Field(min_length=1)

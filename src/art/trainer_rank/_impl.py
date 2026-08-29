@@ -75,6 +75,7 @@ class AdamParams:
     learning_rate: float
     beta1: float = 0.9
     beta2: float = 0.99
+    eps: float = 1e-13
     weight_decay: float = 0.1
     grad_clip_norm: float = 0.1
 
@@ -2021,6 +2022,79 @@ class TrainerRank:
             )
             selected.append((name, slot_params, slot_grads, step_flags))
 
+        return self._step_dynamic_optimizer(selected, params=params)
+
+    def checkpoint_slot_parameters(self, name: str) -> tuple[torch.nn.Parameter, ...]:
+        try:
+            return self._checkpoint_slots[name].params
+        except KeyError as error:
+            raise ValueError(f"Unknown checkpoint slot: {name!r}") from error
+
+    def clear_checkpoint_slot_grads(self, name: str) -> None:
+        for parameter in self.checkpoint_slot_parameters(name):
+            parameter.grad = None
+
+    def release_checkpoint_slot(self, name: str) -> None:
+        ref = self._slot_ref(name)
+        if ref in self._slot_stack or self._default_slot_ref == ref:
+            raise TrainerRankSlotStateError(
+                f"Cannot release active checkpoint slot {name!r}"
+            )
+        self._guard_slot_can_load(ref)
+        from art.megatron.lora import LoRA
+
+        for chunk in self.runtime.model:
+            for module in chunk.modules():
+                if not isinstance(module, LoRA):
+                    continue
+                key = module._slot_keys.pop(ref, None)
+                if key is not None:
+                    del module._slot_modules[key]
+        self._checkpoint_slots.pop(name, None)
+        self._slot_graphs().pop(ref, None)
+
+    def optim_step_reduced(
+        self,
+        name: str,
+        *,
+        params: AdamParams,
+        gradients: Sequence[torch.Tensor],
+        step_flags: Sequence[bool],
+    ) -> dict[str, float]:
+        slot_params = self.checkpoint_slot_parameters(name)
+        gradients = tuple(gradients)
+        step_flags = tuple(step_flags)
+        if len(gradients) != len(slot_params) or any(
+            tuple(gradient.shape) != tuple(parameter.shape)
+            for gradient, parameter in zip(gradients, slot_params, strict=True)
+        ):
+            raise ValueError("reduced gradient layout does not match checkpoint slot")
+        if len(step_flags) != len(slot_params):
+            raise ValueError("gradient step flags do not match checkpoint slot")
+        return self._step_dynamic_optimizer(
+            [(name, slot_params, gradients, step_flags)], params=params
+        )
+
+    def _step_dynamic_optimizer(
+        self,
+        selected: Sequence[
+            tuple[
+                str,
+                tuple[torch.nn.Parameter, ...],
+                Sequence[torch.Tensor],
+                Sequence[bool],
+            ]
+        ],
+        *,
+        params: AdamParams,
+    ) -> dict[str, float]:
+        for name, _model_params, grads, _step_flags in selected:
+            for grad, mask in zip(
+                grads,
+                self._dynamic_optimizer_padding_masks(name),
+                strict=True,
+            ):
+                grad.masked_fill_(mask, 0)
         all_params = tuple(
             param for _, slot_params, _, _ in selected for param in slot_params
         )
@@ -2100,7 +2174,9 @@ class TrainerRank:
         for group in dynamic.optimizer.param_groups:
             group["lr"] = params.learning_rate
             group["betas"] = (params.beta1, params.beta2)
+            group["eps"] = params.eps
             group["weight_decay"] = params.weight_decay
+        self._zero_dynamic_optimizer_padding(name, dynamic)
         return dynamic
 
     def _new_dynamic_optimizer(
@@ -2140,6 +2216,7 @@ class TrainerRank:
             masters,
             lr=params.learning_rate,
             betas=(params.beta1, params.beta2),
+            eps=params.eps,
             weight_decay=params.weight_decay,
         )
         dynamic = _DynamicOptimizer(optimizer, masters)
@@ -2295,6 +2372,43 @@ class TrainerRank:
         *,
         scale_grads: float,
     ) -> tuple[torch.Tensor, ...]:
+        gradients = tuple(
+            (
+                torch.zeros_like(param, dtype=torch.float32)
+                if param.grad is None
+                else param.grad.detach()
+            )
+            for param in params
+        )
+        return self._reduce_dynamic_gradient_tensors(
+            params, gradients, scale_grads=scale_grads
+        )
+
+    def reduce_checkpoint_slot_grads(
+        self,
+        name: str,
+        gradients: Sequence[torch.Tensor],
+        *,
+        scale_grads: float,
+    ) -> tuple[torch.Tensor, ...]:
+        params = self.checkpoint_slot_parameters(name)
+        gradients = tuple(gradients)
+        if len(gradients) != len(params) or any(
+            tuple(gradient.shape) != tuple(parameter.shape)
+            for gradient, parameter in zip(gradients, params, strict=True)
+        ):
+            raise ValueError("gradient layout does not match checkpoint slot")
+        return self._reduce_dynamic_gradient_tensors(
+            params, gradients, scale_grads=scale_grads
+        )
+
+    def _reduce_dynamic_gradient_tensors(
+        self,
+        params: Sequence[torch.nn.Parameter],
+        gradients: Sequence[torch.Tensor],
+        *,
+        scale_grads: float,
+    ) -> tuple[torch.Tensor, ...]:
         from megatron.core import parallel_state as ps
 
         from art.megatron.training.finalize_grads import (
@@ -2316,12 +2430,7 @@ class TrainerRank:
             buckets.setdefault(key, (group, op, []))[2].append(grad)
 
         grads = tuple(
-            (
-                torch.zeros_like(param, dtype=torch.float32)
-                if param.grad is None
-                else param.grad.detach().float().mul(scale_grads)
-            )
-            for param in params
+            gradient.detach().float().mul(scale_grads) for gradient in gradients
         )
         for param, grad in zip(params, grads, strict=True):
             if bool(getattr(param, "allreduce", True)):

@@ -351,6 +351,41 @@ class TrainerRank(_impl.TrainerRank):
             on_live_graphs=on_live_graphs,
         )
 
+    def checkpoint_slot_parameters(self, name: str) -> tuple[torch.nn.Parameter, ...]:
+        return super().checkpoint_slot_parameters(name)
+
+    def clear_checkpoint_slot_grads(self, name: str) -> None:
+        super().clear_checkpoint_slot_grads(name)
+
+    def release_checkpoint_slot(self, name: str) -> None:
+        super().release_checkpoint_slot(name)
+
+    def reduce_checkpoint_slot_grads(
+        self,
+        name: str,
+        gradients: Sequence[torch.Tensor],
+        *,
+        scale_grads: float,
+    ) -> tuple[torch.Tensor, ...]:
+        return super().reduce_checkpoint_slot_grads(
+            name, gradients, scale_grads=scale_grads
+        )
+
+    def optim_step_reduced(
+        self,
+        name: str,
+        *,
+        params: AdamParams,
+        gradients: Sequence[torch.Tensor],
+        step_flags: Sequence[bool],
+    ) -> dict[str, float]:
+        return super().optim_step_reduced(
+            name,
+            params=params,
+            gradients=gradients,
+            step_flags=step_flags,
+        )
+
 
 __all__ = [
     "AdapterSelection",

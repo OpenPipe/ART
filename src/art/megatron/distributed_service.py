@@ -481,6 +481,8 @@ class DistributedMegatronService:
             runtime_fingerprint=runtime_spec.fingerprint,
             training_session_id=self._training_session_id,
             initial_learner_version=self._latest_step,
+            lora_rank=runtime_spec.lora_rank,
+            lora_target_modules=runtime_spec.lora_target_modules,
             initial_adapter_path=current,
             optimizer_state_path=self._optimizer_state_path,
             initial_event_timeout_s=self.runtime.topology.cluster.startup_timeout_s,

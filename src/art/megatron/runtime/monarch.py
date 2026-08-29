@@ -456,9 +456,13 @@ class MonarchTrainerActor(Actor):
         )
         from art.megatron.training.weight_offload import WeightOffloadManager
 
-        from .executor import MegatronTrainJobExecutor
+        from .executor import MCoreRunSlotExecutor, MegatronTrainJobExecutor
 
         self._executor = MegatronTrainJobExecutor(
+            self._runtime,
+            accumulator_l1_budget_bytes=runtime_spec.accumulator_l1_budget_bytes,
+        )
+        self._run_slot_executor = MCoreRunSlotExecutor(
             self._runtime,
             accumulator_l1_budget_bytes=runtime_spec.accumulator_l1_budget_bytes,
         )
@@ -573,6 +577,30 @@ class MonarchTrainerActor(Actor):
         return {"rank": self._runtime.rank, "port": self._cp_lookahead_port}
 
     @endpoint
+    def register_command_run(self, run_spec_json: str) -> dict[str, Any]:
+        if not self._valid:
+            raise RuntimeError("trainer actor runtime is invalid")
+        run_spec = TrainingRunSpec.model_validate_json(run_spec_json)
+        opened_job = False
+        try:
+            if not self._command_job_open:
+                self._weight_offload.before_job()
+                opened_job = True
+            self._run_slot_executor.register_run(run_spec)
+            return {
+                "rank": self._runtime.rank,
+                "run_id": run_spec.run_id,
+                "lora_rank": run_spec.lora_rank,
+                "lora_target_modules": run_spec.lora_target_modules,
+            }
+        except BaseException:
+            self._valid = False
+            raise
+        finally:
+            if opened_job:
+                self._weight_offload.after_job()
+
+    @endpoint
     def execute(
         self,
         job_json: str,
@@ -636,7 +664,9 @@ class MonarchTrainerActor(Actor):
             if not self._command_job_open:
                 self._weight_offload.before_job()
                 self._command_job_open = True
-            result = self._executor.execute_forward_backward(job, batch, Event())
+            result = self._run_slot_executor.execute_forward_backward(
+                job, batch, Event()
+            )
             coordinator = self._runtime.rank == 0
             return {
                 **result,
@@ -677,7 +707,7 @@ class MonarchTrainerActor(Actor):
             if not self._command_job_open:
                 self._weight_offload.before_job()
                 opened_job = True
-            result = self._executor.execute_forward(job, batch, Event())
+            result = self._run_slot_executor.execute_forward(job, batch, Event())
             coordinator = self._runtime.rank == 0
             return {
                 **result,
@@ -704,7 +734,7 @@ class MonarchTrainerActor(Actor):
                 raise RuntimeError("optimizer has no open F/B interval")
             job = OptimizerJobSpec.model_validate_json(job_json)
             self._migration_release_receipts.pop(job.run_id, None)
-            result = self._executor.execute_optimizer(job)
+            result = self._run_slot_executor.execute_optimizer(job)
             return {
                 **result,
                 "command_status": "succeeded",
@@ -714,7 +744,7 @@ class MonarchTrainerActor(Actor):
         except BaseException as error:
             self._valid = False
             try:
-                self._executor.discard_open_gradients()
+                self._run_slot_executor.discard_open_gradients()
             except BaseException as cleanup_error:
                 error.add_note(
                     "optimizer actor cleanup also failed: "
@@ -722,7 +752,10 @@ class MonarchTrainerActor(Actor):
                 )
             return _rank_command_failure(self._runtime.rank, error)
         finally:
-            if self._command_job_open:
+            if (
+                self._command_job_open
+                and not self._run_slot_executor.has_open_gradients
+            ):
                 self._weight_offload.after_job()
                 self._command_job_open = False
 
@@ -740,9 +773,13 @@ class MonarchTrainerActor(Actor):
                 raise RuntimeError("migration release identity changed")
             contributions = prior
         else:
-            if self._executor.run_gradient_ids(run_id) != expected_operation_ids:
+            if (
+                self._run_slot_executor.run_gradient_ids(run_id)
+                != expected_operation_ids
+            ):
                 raise RuntimeError("migration release gradients changed")
-            contributions = self._executor.discard_run_gradients(run_id)
+            contributions = self._run_slot_executor.discard_run_gradients(run_id)
+            self._run_slot_executor.release_run(run_id)
             self._migration_release_receipts[run_id] = contributions
             while len(self._migration_release_receipts) > (
                 _MAX_CACHED_COMMAND_OPERATIONS
@@ -750,7 +787,7 @@ class MonarchTrainerActor(Actor):
                 self._migration_release_receipts.pop(
                     next(iter(self._migration_release_receipts))
                 )
-        if self._command_job_open and not self._executor.has_open_gradients:
+        if self._command_job_open and not self._run_slot_executor.has_open_gradients:
             self._weight_offload.after_job()
             self._command_job_open = False
         return {
@@ -758,6 +795,15 @@ class MonarchTrainerActor(Actor):
             "run_id": run_id,
             "discarded_forward_backward_operation_ids": contributions,
         }
+
+    @endpoint
+    def drain_command_run(self, run_id: str) -> dict[str, Any]:
+        if not self._valid:
+            raise RuntimeError("trainer actor runtime is invalid")
+        if self._run_slot_executor.run_gradient_ids(run_id):
+            raise RuntimeError("cannot drain a run with open gradients")
+        self._run_slot_executor.release_run(run_id)
+        return {"rank": self._runtime.rank, "run_id": run_id}
 
     @endpoint
     def execute_sft(
@@ -867,6 +913,7 @@ class MonarchTrainerActor(Actor):
     def close(self) -> None:
         self._stop_cp_lookahead()
         self._abort_command_job()
+        self._run_slot_executor.close()
         self._executor.close()
         import torch
 
@@ -878,6 +925,7 @@ class MonarchTrainerActor(Actor):
             return
         try:
             self._executor.discard_open_gradients()
+            self._run_slot_executor.discard_open_gradients()
         finally:
             self._weight_offload.after_job()
             self._command_job_open = False
@@ -922,6 +970,7 @@ class MonarchTrainerActor(Actor):
         if exc is not None:
             self._valid = False
         self._stop_cp_lookahead()
+        self._run_slot_executor.close()
         self._executor.close()
 
 
@@ -1162,6 +1211,8 @@ def _command_run_identity(spec: TrainingRunSpec) -> tuple[Any, ...]:
         spec.training_session_id,
         spec.initial_learner_version,
         spec.initial_operation_sequence,
+        spec.lora_rank,
+        spec.lora_target_modules,
         spec.initial_adapter_path,
         spec.optimizer_state_path,
     )
@@ -1227,7 +1278,7 @@ class MonarchTrainerRun:
     def valid(self) -> bool:
         return self._valid
 
-    def register_command_run(self, run_spec: TrainingRunSpec) -> None:
+    async def register_command_run(self, run_spec: TrainingRunSpec) -> None:
         if run_spec.runtime_fingerprint != self.runtime_spec.fingerprint:
             raise ValueError(
                 "training run does not match the trainer runtime fingerprint"
@@ -1241,11 +1292,36 @@ class MonarchTrainerRun:
             return
         if self._jobs:
             raise RuntimeError("command runs cannot be registered after fused jobs")
-        self._command_runs[run_spec.run_id] = _CommandRunState(
-            spec=run_spec,
-            learner_version=run_spec.initial_learner_version,
-            next_operation_sequence=run_spec.initial_operation_sequence,
-        )
+        async with self._lock:
+            prior = self._command_runs.get(run_spec.run_id)
+            if prior is not None:
+                if _command_run_identity(prior.spec) != _command_run_identity(run_spec):
+                    raise RuntimeError("run_id was reused with different trainer state")
+                return
+            try:
+                values = await asyncio.wait_for(
+                    self._actors.register_command_run.call(run_spec.model_dump_json()),
+                    timeout=run_spec.event_timeout_s,
+                )
+                results = list(values.values())
+                if (
+                    {result["rank"] for result in results}
+                    != set(range(len(self.runtime_spec.trainer_mesh.ranks)))
+                    or {result["run_id"] for result in results} != {run_spec.run_id}
+                    or {result["lora_rank"] for result in results}
+                    != {run_spec.lora_rank}
+                    or {tuple(result["lora_target_modules"]) for result in results}
+                    != {run_spec.lora_target_modules}
+                ):
+                    raise RuntimeError("trainer ranks disagreed on run registration")
+            except BaseException as error:
+                await self._invalidate_after_command_failure(error)
+                raise
+            self._command_runs[run_spec.run_id] = _CommandRunState(
+                spec=run_spec,
+                learner_version=run_spec.initial_learner_version,
+                next_operation_sequence=run_spec.initial_operation_sequence,
+            )
 
     async def command_run_state(self, run_id: str) -> TrainerCommandRunState:
         async with self._lock:
@@ -1323,6 +1399,15 @@ class MonarchTrainerRun:
                 return
             if state.open_forward_backward_ids:
                 raise RuntimeError("cannot drain a run with open F/B contributions")
+            values = await asyncio.wait_for(
+                self._actors.drain_command_run.call(run_id),
+                timeout=state.spec.event_timeout_s,
+            )
+            results = list(values.values())
+            if {result["rank"] for result in results} != set(
+                range(len(self.runtime_spec.trainer_mesh.ranks))
+            ) or {result["run_id"] for result in results} != {run_id}:
+                raise RuntimeError("trainer ranks disagreed while draining a run")
             self._command_runs.pop(run_id)
 
     async def forward_backward(

@@ -79,11 +79,19 @@ class TrainingRunSpec(_Spec):
     training_session_id: str = Field(min_length=1)
     initial_learner_version: int = Field(ge=0)
     initial_operation_sequence: int = Field(default=0, ge=0)
+    lora_rank: int = Field(ge=1)
+    lora_target_modules: tuple[str, ...] = Field(min_length=1)
     initial_adapter_path: str = Field(min_length=1)
     optimizer_state_path: str = Field(min_length=1)
     initial_event_timeout_s: float | None = Field(default=None, gt=0)
     event_timeout_s: float = Field(default=300.0, gt=0)
     shutdown_timeout_s: float = Field(default=240.0, gt=0)
+
+    @model_validator(mode="after")
+    def _validate_lora_targets(self) -> "TrainingRunSpec":
+        if len(set(self.lora_target_modules)) != len(self.lora_target_modules):
+            raise ValueError("lora_target_modules must be unique")
+        return self
 
 
 class TrainerCommandRunState(_Spec):

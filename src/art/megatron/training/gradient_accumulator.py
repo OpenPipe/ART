@@ -213,3 +213,140 @@ class GradientAccumulator:
         ):
             raise RuntimeError("trainable Megatron gradient layout changed")
         return tuple(gradients)
+
+
+class ParameterGradientAccumulator:
+    """Retain exact local sums for one dynamic parameter layout."""
+
+    def __init__(
+        self,
+        parameters: tuple[torch.nn.Parameter, ...],
+        *,
+        max_contributions: int = 64,
+    ) -> None:
+        if not parameters:
+            raise RuntimeError("gradient accumulator requires trainable parameters")
+        if not 1 <= max_contributions <= 64:
+            raise ValueError("max_contributions must be between 1 and 64")
+        self.parameters = parameters
+        self.max_contributions = max_contributions
+        self._layout = tuple(tuple(parameter.shape) for parameter in parameters)
+        self._operation_ids: list[str] = []
+        self._gradients: tuple[torch.Tensor, ...] | None = None
+        self._local_tokens: torch.Tensor | None = None
+        self._expected_global_tokens: int | None = None
+        self._expects_global_tokens: bool | None = None
+        self._step_flags = (False,) * len(parameters)
+        self._sealed: tuple[str, ...] | None = None
+
+    @property
+    def contribution_ids(self) -> tuple[str, ...]:
+        return tuple(self._operation_ids)
+
+    @property
+    def residency_nbytes(self) -> int:
+        return sum(
+            tensor.numel() * tensor.element_size()
+            for tensor in (
+                *((self._local_tokens,) if self._local_tokens is not None else ()),
+                *(self._gradients or ()),
+            )
+        )
+
+    def record(
+        self,
+        operation_id: str,
+        token_count: torch.Tensor,
+        gradients: tuple[torch.Tensor, ...],
+        *,
+        expected_global_token_count: int | None = None,
+        step_flags: tuple[bool, ...] | None = None,
+    ) -> None:
+        if self._sealed is not None:
+            raise RuntimeError("cannot add gradients to a sealed accumulator")
+        if len(self._operation_ids) >= self.max_contributions:
+            raise RuntimeError("gradient contribution limit reached")
+        if operation_id in self._operation_ids:
+            raise RuntimeError(f"duplicate gradient contribution {operation_id!r}")
+        if token_count.numel() != 1 or float(token_count.item()) < 0:
+            raise ValueError("gradient contribution token_count must be nonnegative")
+        if tuple(tuple(gradient.shape) for gradient in gradients) != self._layout:
+            raise RuntimeError("gradient contribution layout changed")
+        flags = step_flags or (True,) * len(gradients)
+        if len(flags) != len(gradients):
+            raise RuntimeError("gradient step flags do not match the parameter layout")
+        expects_global = expected_global_token_count is not None
+        if (
+            self._expects_global_tokens is not None
+            and self._expects_global_tokens != expects_global
+        ):
+            raise RuntimeError(
+                "one gradient accumulator cannot mix checked and unchecked tokens"
+            )
+        values = tuple(gradient.detach().float() for gradient in gradients)
+        if self._gradients is None:
+            self._gradients = tuple(value.clone() for value in values)
+            self._local_tokens = token_count.detach().clone()
+        else:
+            assert self._local_tokens is not None
+            for saved, value in zip(self._gradients, values, strict=True):
+                saved.add_(value)
+            self._local_tokens.add_(token_count)
+        self._operation_ids.append(operation_id)
+        self._expects_global_tokens = expects_global
+        if expected_global_token_count is not None:
+            self._expected_global_tokens = (
+                self._expected_global_tokens or 0
+            ) + expected_global_token_count
+        self._step_flags = tuple(
+            old or new for old, new in zip(self._step_flags, flags, strict=True)
+        )
+
+    def seal(self, operation_ids: tuple[str, ...]) -> None:
+        if not operation_ids:
+            raise RuntimeError("optimizer requires at least one F/B contribution")
+        if self._sealed is not None:
+            raise RuntimeError("gradient accumulator is already sealed")
+        if operation_ids != tuple(self._operation_ids):
+            raise RuntimeError(
+                "optimizer contribution order does not match the open accumulator"
+            )
+        self._sealed = operation_ids
+
+    def prepare_local_sums(
+        self,
+    ) -> tuple[AccumulatedGradientSums, tuple[bool, ...]]:
+        if self._sealed is None:
+            raise RuntimeError("gradient accumulator must be sealed before optimizer")
+        if self._gradients is None or self._local_tokens is None:
+            raise RuntimeError("gradient accumulator has no contributions")
+        return (
+            AccumulatedGradientSums(
+                gradients=self._gradients,
+                local_token_count=self._local_tokens,
+                expected_global_token_count=self._expected_global_tokens,
+                reduction="token_mean",
+            ),
+            self._step_flags,
+        )
+
+    def consume(self) -> tuple[str, ...]:
+        if self._sealed is None:
+            raise RuntimeError("cannot consume an unsealed gradient accumulator")
+        consumed = self._sealed
+        self._clear()
+        return consumed
+
+    def discard(self) -> None:
+        self._clear()
+        for parameter in self.parameters:
+            parameter.grad = None
+
+    def _clear(self) -> None:
+        self._operation_ids.clear()
+        self._gradients = None
+        self._local_tokens = None
+        self._expected_global_tokens = None
+        self._expects_global_tokens = None
+        self._step_flags = (False,) * len(self.parameters)
+        self._sealed = None

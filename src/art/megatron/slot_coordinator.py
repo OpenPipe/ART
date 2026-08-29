@@ -125,7 +125,7 @@ class _SharedTrainer(Protocol):
         source_topology: str,
     ) -> tuple[Any, Any, dict[str, float]]: ...
 
-    def register_command_run(self, run_spec: TrainingRunSpec) -> None: ...
+    async def register_command_run(self, run_spec: TrainingRunSpec) -> None: ...
 
     async def command_run_state(self, run_id: str) -> TrainerCommandRunState: ...
 
@@ -266,7 +266,9 @@ class MegatronSlotCoordinator:
         self._pump_task: asyncio.Task[None] | None = None
         self._released_migration_fences: dict[str, MegatronMigrationFence] = {}
         self._resumed_migration_fences: dict[tuple[str, str], None] = {}
-        self._aborted_migration_restores: dict[tuple[str, str], None] = {}
+        self._aborted_migration_restores: dict[
+            tuple[str, str], MegatronOperationConfig
+        ] = {}
         self._closed = False
 
     async def register_run(
@@ -294,15 +296,14 @@ class MegatronSlotCoordinator:
         async with self._condition:
             if self._closed:
                 raise RuntimeError("Megatron slot coordinator is closed")
-            if (
-                restore_id is not None
-                and (
-                    config.run_id,
-                    restore_id,
-                )
-                in self._aborted_migration_restores
-            ):
-                raise RuntimeError("migration restore was already aborted")
+            aborted_key = None if restore_id is None else (config.run_id, restore_id)
+            aborted = (
+                None
+                if aborted_key is None
+                else self._aborted_migration_restores.get(aborted_key)
+            )
+            if aborted is not None and aborted != config:
+                raise RuntimeError("aborted migration restore configuration changed")
             prior = self._runs.get(config.run_id)
             if prior is not None:
                 if prior.draining or prior.migration_fence_id is not None:
@@ -320,10 +321,19 @@ class MegatronSlotCoordinator:
                 training_session_id=config.training_session_id,
                 initial_learner_version=config.source.policy_step,
                 initial_operation_sequence=config.initial_operation_sequence,
+                lora_rank=config.adapter.rank,
+                lora_target_modules=config.adapter.target_modules,
                 initial_adapter_path=config.source.adapter_path,
                 optimizer_state_path=config.optimizer_state_path,
             )
-            self.trainer.register_command_run(run_spec)
+            runtime_spec = self.trainer.runtime_spec
+            if config.adapter.rank > runtime_spec.lora_rank:
+                raise ValueError("run LoRA rank exceeds the slot capability")
+            if not set(config.adapter.target_modules).issubset(
+                runtime_spec.lora_target_modules
+            ):
+                raise ValueError("run LoRA targets exceed the slot capability")
+            await self.trainer.register_command_run(run_spec)
             handler = MegatronOperationHandler(
                 self.runtime,
                 self.trainer,
@@ -342,6 +352,8 @@ class MegatronSlotCoordinator:
                 worker=worker,
                 migration_restore_id=restore_id,
             )
+            if aborted_key is not None:
+                self._aborted_migration_restores.pop(aborted_key, None)
             self._released_migration_fences.pop(config.run_id, None)
             self._deficit[config.run_id] = 0
             self._order.append(config.run_id)
@@ -717,7 +729,7 @@ class MegatronSlotCoordinator:
                     self._bound_migration_tombstones(self._released_migration_fences)
                 if aborted_restore_id is not None:
                     self._aborted_migration_restores[(run_id, aborted_restore_id)] = (
-                        None
+                        state.handler.config
                     )
                     self._bound_migration_tombstones(self._aborted_migration_restores)
                 self._runs.pop(run_id)
