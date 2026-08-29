@@ -334,19 +334,15 @@ def _vllm_runtime_subprocess_env(
             env.pop(key, None)
         else:
             env[key] = value
-    runtime_dir = (
-        _runtime_dir_from_bin(Path(runtime_command[0])) if runtime_command else None
+    runtime_venv = (
+        _runtime_venv_from_bin(Path(runtime_command[0])) if runtime_command else None
     )
-    if runtime_dir is not None:
+    if runtime_venv is not None:
         env.pop("PYTHONPATH", None)
-        env["PATH"] = os.pathsep.join(
-            (str(runtime_dir / ".venv" / "bin"), env.get("PATH", ""))
-        )
+        env["PATH"] = os.pathsep.join((str(runtime_venv / "bin"), env.get("PATH", "")))
         nvidia_libs = sorted(
             str(path)
-            for site_packages in (runtime_dir / ".venv" / "lib").glob(
-                "python*/site-packages"
-            )
+            for site_packages in (runtime_venv / "lib").glob("python*/site-packages")
             for path in (site_packages / "nvidia").glob("*/lib")
             if path.is_dir()
         )
@@ -589,13 +585,19 @@ def _runtime_python(runtime_dir: Path) -> Path:
 
 
 def _runtime_dir_from_bin(runtime_bin: Path) -> Path | None:
+    runtime_venv = _runtime_venv_from_bin(runtime_bin)
+    if runtime_venv is not None and runtime_venv.name == ".venv":
+        return runtime_venv.parent
+    return None
+
+
+def _runtime_venv_from_bin(runtime_bin: Path) -> Path | None:
     runtime_bin = runtime_bin.expanduser().resolve()
-    if (
-        runtime_bin.name == RUNTIME_SERVER
-        and runtime_bin.parent.name == "bin"
-        and runtime_bin.parent.parent.name == ".venv"
-    ):
-        return runtime_bin.parent.parent.parent
+    if runtime_bin.name != RUNTIME_SERVER or runtime_bin.parent.name != "bin":
+        return None
+    runtime_venv = runtime_bin.parent.parent
+    if runtime_venv.name == ".venv" or (runtime_venv / "pyvenv.cfg").is_file():
+        return runtime_venv
     return None
 
 
@@ -603,7 +605,10 @@ def _vllm_runtime_subprocess_cwd(runtime_command: list[str] | None = None) -> Pa
     runtime_dir = (
         _runtime_dir_from_bin(Path(runtime_command[0])) if runtime_command else None
     )
-    return runtime_dir or get_vllm_runtime_working_dir()
+    runtime_venv = (
+        _runtime_venv_from_bin(Path(runtime_command[0])) if runtime_command else None
+    )
+    return runtime_dir or runtime_venv or get_vllm_runtime_working_dir()
 
 
 def _is_executable_file(path: Path) -> bool:
@@ -865,13 +870,13 @@ def ensure_vllm_runtime() -> Path:
 
 def _resolve_vllm_runtime_python() -> Path:
     runtime_command = _runtime_command_prefix()
-    runtime_dir = _runtime_dir_from_bin(Path(runtime_command[0]))
-    if runtime_dir is None:
+    runtime_venv = _runtime_venv_from_bin(Path(runtime_command[0]))
+    if runtime_venv is None:
         raise RuntimeError(
             "ART_VLLM_RUNTIME_BIN must point directly to a "
-            ".venv/bin/art-vllm-runtime-server executable"
+            "virtual-environment bin/art-vllm-runtime-server executable"
         )
-    return _runtime_python(runtime_dir)
+    return runtime_venv / "bin" / "python"
 
 
 def _runtime_command_prefix() -> list[str]:

@@ -191,6 +191,25 @@ def test_vllm_runtime_subprocess_env_pins_runtime_tools(
     assert env["PATH"] == f"{runtime_bin.parent}{os.pathsep}/usr/bin"
 
 
+def test_vllm_runtime_subprocess_env_supports_shared_venv(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    runtime_venv = tmp_path / "shared-vllm-runtime"
+    runtime_bin = runtime_venv / "bin" / runtime.RUNTIME_SERVER
+    runtime_bin.parent.mkdir(parents=True)
+    runtime_bin.touch()
+    (runtime_venv / "pyvenv.cfg").write_text("venv\n", encoding="ascii")
+    monkeypatch.setenv("ART_VLLM_RUNTIME_BIN", str(runtime_bin))
+    monkeypatch.setenv("PYTHONPATH", "/trainer/hybrid-ep")
+
+    env = runtime._vllm_runtime_subprocess_env([str(runtime_bin)])
+
+    assert "PYTHONPATH" not in env
+    assert runtime._resolve_vllm_runtime_python() == runtime_venv / "bin" / "python"
+    assert runtime._vllm_runtime_subprocess_cwd([str(runtime_bin)]) == runtime_venv
+
+
 def test_vllm_runtime_subprocess_env_isolates_flashinfer_for_managed_runtime(
     monkeypatch,
     tmp_path: Path,
