@@ -496,8 +496,25 @@ class MegatronTrainJobExecutor:
         self._gradients.clear()
         self._gradient_parent_versions.clear()
 
+    def discard_run_gradients(self, run_id: str) -> tuple[str, ...]:
+        gradients = self._gradients.pop(run_id, None)
+        self._gradient_parent_versions.pop(run_id, None)
+        if gradients is None:
+            return ()
+        contributions = gradients.contribution_ids
+        gradients.discard()
+        return contributions
+
+    def run_gradient_ids(self, run_id: str) -> tuple[str, ...]:
+        gradients = self._gradients.get(run_id)
+        return () if gradients is None else gradients.contribution_ids
+
+    @property
+    def has_open_gradients(self) -> bool:
+        return any(value.contribution_ids for value in self._gradients.values())
+
     def _require_no_open_gradients(self) -> None:
-        if any(gradients.contribution_ids for gradients in self._gradients.values()):
+        if self.has_open_gradients:
             raise RuntimeError("operation cannot discard open gradient contributions")
 
     def _enforce_accumulator_budget(self) -> None:

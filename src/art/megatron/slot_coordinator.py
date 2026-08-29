@@ -9,10 +9,13 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from art.distributed.art_runtime import ArtRuntime
 from art.training import (
+    CommandAdmission,
     CommandExecutionUsage,
     ForwardBackwardRequest,
     ForwardRequest,
+    LoadStateRequest,
     OperationExecutionError,
+    OperationExecutionOutcome,
     OperationFailureCode,
     OperationRef,
     OperationResultType,
@@ -20,7 +23,8 @@ from art.training import (
     OptimStepRequest,
     PackedInputCaptureRef,
     RunCommand,
-    bootstrap_operation_worker,
+    SaveStateRequest,
+    SaveWeightsForSamplerRequest,
 )
 
 from .operation_handler import (
@@ -29,7 +33,11 @@ from .operation_handler import (
     MegatronOperationConfig,
     MegatronOperationHandler,
 )
-from .runtime.specs import TrainerGeneration, TrainingRunSpec
+from .runtime.specs import (
+    TrainerCommandRunState,
+    TrainerGeneration,
+    TrainingRunSpec,
+)
 
 SlotComponent = Literal["weights", "optimizer", "accumulator"]
 
@@ -50,6 +58,30 @@ class MegatronSlotResourceRequest(BaseModel):
     source: TrainerGeneration
     optimizer_state_path: str = Field(min_length=1)
     components: tuple[SlotComponent, ...]
+
+
+class MegatronMigrationContribution(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    operation_id: str = Field(min_length=1)
+    packed_input: PackedInputCaptureRef
+
+
+class MegatronMigrationFence(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    fence_id: str = Field(min_length=1)
+    run_id: str = Field(min_length=1)
+    generation: TrainerGeneration
+    optimizer_state_path: str = Field(min_length=1)
+    next_operation_sequence: int = Field(ge=0)
+    open_contributions: tuple[MegatronMigrationContribution, ...] = Field(max_length=64)
+
+
+@dataclass(frozen=True, slots=True)
+class MegatronMigrationReplay:
+    request: RunCommand
+    admission: CommandAdmission
 
 
 class MegatronSlotResourceManager(Protocol):
@@ -86,6 +118,16 @@ class _SharedTrainer(Protocol):
 
     def register_command_run(self, run_spec: TrainingRunSpec) -> None: ...
 
+    async def command_run_state(self, run_id: str) -> TrainerCommandRunState: ...
+
+    async def record_control_command(
+        self,
+        operation: OperationRef,
+        learner_version: int,
+    ) -> None: ...
+
+    async def release_command_run_for_migration(self, run_id: str) -> None: ...
+
     async def drain_command_run(self, run_id: str) -> None: ...
 
 
@@ -98,9 +140,15 @@ class MegatronSlotRun:
 @dataclass(slots=True)
 class _RunState:
     handler: MegatronOperationHandler
-    worker: OperationWorker
+    worker: _SlotOperationWorker
     draining: bool = False
     preparing: int = 0
+    worker_calls: int = 0
+    migration_fence_id: str | None = None
+    migration_fence: MegatronMigrationFence | None = None
+    migration_restore_id: str | None = None
+    activated_restore_id: str | None = None
+    migration_replaying: bool = False
 
 
 @dataclass(slots=True)
@@ -133,6 +181,48 @@ class _ScheduledRunHandler:
         return await self._slot._execute(request, operation, contributions)
 
 
+class _SlotOperationWorker(OperationWorker):
+    def __init__(
+        self,
+        slot: "MegatronSlotCoordinator",
+        run_id: str,
+        handler: _ScheduledRunHandler,
+        *,
+        max_retained_operations: int,
+    ) -> None:
+        super().__init__(handler, max_retained_operations=max_retained_operations)
+        self._slot = slot
+        self._run_id = run_id
+
+    async def execute(
+        self,
+        request: RunCommand,
+        operation: OperationRef,
+        contributing_forward_backward_operation_ids: tuple[str, ...] = (),
+    ) -> OperationExecutionOutcome:
+        await self._slot._enter_worker_call(self._run_id, self)
+        try:
+            return await super().execute(
+                request,
+                operation,
+                contributing_forward_backward_operation_ids,
+            )
+        finally:
+            await self._slot._leave_worker_call(self._run_id, self)
+
+    async def execute_replay(
+        self,
+        request: RunCommand,
+        operation: OperationRef,
+        contributing_forward_backward_operation_ids: tuple[str, ...],
+    ) -> OperationExecutionOutcome:
+        return await super().execute(
+            request,
+            operation,
+            contributing_forward_backward_operation_ids,
+        )
+
+
 class MegatronSlotCoordinator:
     """Fairly multiplex logical runs over one persistent trainer allocation."""
 
@@ -157,6 +247,8 @@ class MegatronSlotCoordinator:
         self._condition = asyncio.Condition()
         self._active_run_id: str | None = None
         self._pump_task: asyncio.Task[None] | None = None
+        self._released_migration_fences: dict[str, MegatronMigrationFence] = {}
+        self._aborted_migration_restores: dict[str, str] = {}
         self._closed = False
 
     async def register_run(
@@ -166,13 +258,32 @@ class MegatronSlotCoordinator:
         checkpoints: MegatronCheckpointOperations | None = None,
         max_retained_operations: int = 128,
     ) -> MegatronSlotRun:
+        return await self._register_run(
+            config,
+            checkpoints=checkpoints,
+            max_retained_operations=max_retained_operations,
+            restore_id=None,
+        )
+
+    async def _register_run(
+        self,
+        config: MegatronOperationConfig,
+        *,
+        checkpoints: MegatronCheckpointOperations | None,
+        max_retained_operations: int,
+        restore_id: str | None,
+    ) -> MegatronSlotRun:
         async with self._condition:
             if self._closed:
                 raise RuntimeError("Megatron slot coordinator is closed")
             prior = self._runs.get(config.run_id)
             if prior is not None:
-                if prior.draining:
+                if prior.draining or prior.migration_fence_id is not None:
                     raise RuntimeError("Megatron slot run is draining")
+                if prior.migration_restore_id != restore_id and not (
+                    restore_id is not None and prior.activated_restore_id == restore_id
+                ):
+                    raise RuntimeError("run_id is already in another lifecycle")
                 if prior.handler.config != config:
                     raise RuntimeError("run_id was reused with different configuration")
                 return MegatronSlotRun(config.run_id, prior.worker)
@@ -181,6 +292,7 @@ class MegatronSlotCoordinator:
                 runtime_fingerprint=self.trainer.runtime_spec.fingerprint,
                 training_session_id=config.training_session_id,
                 initial_learner_version=config.source.policy_step,
+                initial_operation_sequence=config.initial_operation_sequence,
                 initial_adapter_path=config.source.adapter_path,
                 optimizer_state_path=config.optimizer_state_path,
             )
@@ -192,11 +304,19 @@ class MegatronSlotCoordinator:
                 checkpoints=checkpoints,
             )
             scheduled = _ScheduledRunHandler(self, config.run_id)
-            worker = bootstrap_operation_worker(
+            worker = _SlotOperationWorker(
+                self,
+                config.run_id,
                 scheduled,
                 max_retained_operations=max_retained_operations,
             )
-            self._runs[config.run_id] = _RunState(handler=handler, worker=worker)
+            self._runs[config.run_id] = _RunState(
+                handler=handler,
+                worker=worker,
+                migration_restore_id=restore_id,
+            )
+            self._released_migration_fences.pop(config.run_id, None)
+            self._aborted_migration_restores.pop(config.run_id, None)
             self._deficit[config.run_id] = 0
             self._order.append(config.run_id)
             if self._pump_task is None:
@@ -205,7 +325,12 @@ class MegatronSlotCoordinator:
 
     def resolve_run(self, run_id: str) -> MegatronSlotRun:
         state = self._runs.get(run_id)
-        if state is None or state.draining:
+        if (
+            state is None
+            or state.draining
+            or state.migration_fence_id is not None
+            or state.migration_restore_id is not None
+        ):
             raise KeyError(f"Megatron slot run {run_id!r} is unavailable")
         return MegatronSlotRun(run_id, state.worker)
 
@@ -213,18 +338,326 @@ class MegatronSlotCoordinator:
         self, run_id: str, request: RunCommand
     ) -> MegatronArtifactResourcePlan:
         state = self._runs.get(run_id)
-        if state is None or state.draining:
+        if (
+            state is None
+            or state.draining
+            or state.migration_fence_id is not None
+            or state.migration_restore_id is not None
+        ):
             raise KeyError(f"Megatron slot run {run_id!r} is unavailable")
         return await state.handler.plan_artifacts(request)
+
+    async def _enter_worker_call(
+        self,
+        run_id: str,
+        worker: _SlotOperationWorker,
+    ) -> None:
+        async with self._condition:
+            state = self._runs.get(run_id)
+            if (
+                state is None
+                or state.worker is not worker
+                or state.draining
+                or state.migration_fence_id is not None
+                or state.migration_restore_id is not None
+                or self._closed
+            ):
+                raise KeyError(f"Megatron slot run {run_id!r} is unavailable")
+            state.worker_calls += 1
+
+    async def _leave_worker_call(
+        self,
+        run_id: str,
+        worker: _SlotOperationWorker,
+    ) -> None:
+        async with self._condition:
+            state = self._runs.get(run_id)
+            if state is None or state.worker is not worker:
+                return
+            state.worker_calls -= 1
+            self._condition.notify_all()
+
+    async def fence_and_quiesce_run(
+        self,
+        run_id: str,
+        fence_id: str,
+    ) -> MegatronMigrationFence:
+        """Fence new work and resolve every command already entering the slot."""
+
+        if not fence_id:
+            raise ValueError("fence_id must not be empty")
+        async with self._condition:
+            state = self._runs.get(run_id)
+            if state is None or state.migration_restore_id is not None:
+                raise KeyError(f"Megatron slot run {run_id!r} is unavailable")
+            if state.draining:
+                raise RuntimeError("Megatron slot run is draining")
+            if state.migration_fence_id not in {None, fence_id}:
+                raise RuntimeError("another migration fence owns this run")
+            if state.migration_fence is not None:
+                return state.migration_fence
+            state.migration_fence_id = fence_id
+            while (
+                state.preparing
+                or state.worker_calls
+                or self._active_run_id == run_id
+                or any(item.run_id == run_id for item in self._ready)
+            ):
+                await self._condition.wait()
+
+        trainer_state = await self.trainer.command_run_state(run_id)
+        retained = state.handler.retained_contribution_inputs()
+        retained_ids = tuple(operation_id for operation_id, _ in retained)
+        if (
+            trainer_state.run_id != run_id
+            or trainer_state.training_session_id
+            != state.handler.config.training_session_id
+            or trainer_state.learner_version != state.handler.generation.policy_step
+            or trainer_state.open_forward_backward_operation_ids != retained_ids
+        ):
+            raise RuntimeError("trainer and command handler migration state differ")
+        fence = MegatronMigrationFence(
+            fence_id=fence_id,
+            run_id=run_id,
+            generation=state.handler.generation,
+            optimizer_state_path=state.handler.optimizer_state_path,
+            next_operation_sequence=trainer_state.next_operation_sequence,
+            open_contributions=tuple(
+                MegatronMigrationContribution(
+                    operation_id=operation_id,
+                    packed_input=packed_input,
+                )
+                for operation_id, packed_input in retained
+            ),
+        )
+        async with self._condition:
+            if (
+                self._runs.get(run_id) is not state
+                or state.migration_fence_id != fence_id
+                or state.draining
+            ):
+                raise RuntimeError("Megatron slot run changed while fencing")
+            state.migration_fence = fence
+            self._condition.notify_all()
+            return fence
+
+    async def resume_migration_source(self, run_id: str, fence_id: str) -> None:
+        """Abort a migration before activation and reopen the unchanged source run."""
+
+        async with self._condition:
+            state = self._runs.get(run_id)
+            if state is None or state.migration_fence_id != fence_id or state.draining:
+                raise RuntimeError("migration fence is absent or changed")
+            state.migration_fence = None
+            state.migration_fence_id = None
+            self._condition.notify_all()
+
+    async def install_migration_run(
+        self,
+        config: MegatronOperationConfig,
+        *,
+        restore_id: str,
+        checkpoints: MegatronCheckpointOperations | None = None,
+        max_retained_operations: int = 128,
+    ) -> MegatronSlotRun:
+        """Install a hidden recovery head for exact replay before activation."""
+
+        if not restore_id:
+            raise ValueError("restore_id must not be empty")
+        return await self._register_run(
+            config,
+            checkpoints=checkpoints,
+            max_retained_operations=max_retained_operations,
+            restore_id=restore_id,
+        )
+
+    async def replay_migration_operations(
+        self,
+        run_id: str,
+        restore_id: str,
+        operations: tuple[MegatronMigrationReplay, ...],
+    ) -> tuple[OperationExecutionOutcome, ...]:
+        """Replay one exact ordered suffix while the target remains hidden."""
+
+        async with self._condition:
+            state = self._runs.get(run_id)
+            if (
+                state is None
+                or state.draining
+                or state.migration_restore_id != restore_id
+                or state.migration_replaying
+            ):
+                raise RuntimeError("migration restore is absent, changed, or active")
+            state.migration_replaying = True
+        outcomes: list[OperationExecutionOutcome] = []
+        try:
+            initial = await self.trainer.command_run_state(run_id)
+            expected = _validate_migration_replay(initial, operations)
+            for replay in operations:
+                outcome = await state.worker.execute_replay(
+                    replay.request,
+                    replay.admission.ref,
+                    replay.admission.contributing_forward_backward_operation_ids,
+                )
+                outcomes.append(outcome)
+                if outcome.status == "failed":
+                    break
+            if len(outcomes) == len(operations) and all(
+                outcome.status == "succeeded" for outcome in outcomes
+            ):
+                actual = await self.trainer.command_run_state(run_id)
+                if actual != expected or (
+                    state.handler.generation.policy_step != actual.learner_version
+                ):
+                    raise RuntimeError("migration replay produced the wrong run state")
+            return tuple(outcomes)
+        finally:
+            async with self._condition:
+                if self._runs.get(run_id) is state:
+                    state.migration_replaying = False
+                self._condition.notify_all()
+
+    async def activate_migration_run(
+        self,
+        run_id: str,
+        restore_id: str,
+        expected: MegatronMigrationFence,
+    ) -> MegatronSlotRun:
+        """Expose a restored target only after durable service activation."""
+
+        async with self._condition:
+            state = self._runs.get(run_id)
+            if state is None or state.draining:
+                raise RuntimeError("migration restore is absent or changed")
+            if state.activated_restore_id == restore_id:
+                return MegatronSlotRun(run_id, state.worker)
+            if (
+                state.migration_restore_id != restore_id
+                or state.migration_replaying
+                or expected.run_id != run_id
+            ):
+                raise RuntimeError("migration restore is absent, changed, or active")
+        actual = await self.trainer.command_run_state(run_id)
+        retained_ids = tuple(
+            operation_id
+            for operation_id, _ in state.handler.retained_contribution_inputs()
+        )
+        if (
+            state.handler.generation != expected.generation
+            or actual.learner_version != expected.generation.policy_step
+            or actual.next_operation_sequence != expected.next_operation_sequence
+            or actual.open_forward_backward_operation_ids != retained_ids
+            or retained_ids
+            != tuple(item.operation_id for item in expected.open_contributions)
+        ):
+            raise RuntimeError("restored target does not match the source fence")
+        async with self._condition:
+            if (
+                self._runs.get(run_id) is not state
+                or state.migration_restore_id != restore_id
+                or state.migration_replaying
+            ):
+                raise RuntimeError("migration restore changed while activating")
+            state.migration_restore_id = None
+            state.activated_restore_id = restore_id
+            self._condition.notify_all()
+            return MegatronSlotRun(run_id, state.worker)
+
+    async def abort_migration_run(self, run_id: str, restore_id: str) -> None:
+        """Discard a hidden target after a failed or abandoned restore."""
+
+        async with self._condition:
+            state = self._runs.get(run_id)
+            if state is None:
+                if self._aborted_migration_restores.get(run_id) == restore_id:
+                    return
+                raise RuntimeError("migration restore is absent or changed")
+            if (
+                state.migration_restore_id != restore_id
+                or state.migration_replaying
+                or state.draining
+            ):
+                raise RuntimeError("migration restore is absent, changed, or active")
+            state.draining = True
+        await self._release_migration_run(
+            state,
+            run_id,
+            aborted_restore_id=restore_id,
+        )
+
+    async def release_migration_source(self, fence: MegatronMigrationFence) -> None:
+        """Discard source-local state only after destination activation."""
+
+        async with self._condition:
+            state = self._runs.get(fence.run_id)
+            if state is None:
+                if self._released_migration_fences.get(fence.run_id) == fence:
+                    return
+                raise RuntimeError("migration fence is absent or changed")
+            if (
+                state.migration_fence_id != fence.fence_id
+                or state.migration_fence != fence
+                or state.draining
+            ):
+                raise RuntimeError("migration fence is absent, changed, or releasing")
+            state.draining = True
+        await self._release_migration_run(
+            state,
+            fence.run_id,
+            released_fence=fence,
+        )
+
+    async def _release_migration_run(
+        self,
+        state: _RunState,
+        run_id: str,
+        *,
+        released_fence: MegatronMigrationFence | None = None,
+        aborted_restore_id: str | None = None,
+    ) -> None:
+        try:
+            await self.trainer.release_command_run_for_migration(run_id)
+            await state.handler.release_after_migration()
+            await self.resources.release_run(run_id)
+            async with self._condition:
+                if self._runs.get(run_id) is not state:
+                    raise RuntimeError("Megatron slot run changed while releasing")
+                if released_fence is not None:
+                    self._released_migration_fences[run_id] = released_fence
+                    self._bound_migration_tombstones(self._released_migration_fences)
+                if aborted_restore_id is not None:
+                    self._aborted_migration_restores[run_id] = aborted_restore_id
+                    self._bound_migration_tombstones(self._aborted_migration_restores)
+                self._runs.pop(run_id)
+                self._deficit.pop(run_id, None)
+                if run_id in self._order:
+                    self._order.remove(run_id)
+                self._condition.notify_all()
+        except BaseException:
+            async with self._condition:
+                if self._runs.get(run_id) is state:
+                    state.draining = False
+                    self._condition.notify_all()
+            raise
+
+    @staticmethod
+    def _bound_migration_tombstones(values: dict[str, Any]) -> None:
+        while len(values) > 128:
+            values.pop(next(iter(values)))
 
     async def drain_run(self, run_id: str) -> None:
         async with self._condition:
             state = self._runs.get(run_id)
             if state is None:
                 return
+            if state.migration_fence_id is not None:
+                raise RuntimeError("cannot drain a migration-fenced run")
+            if state.migration_restore_id is not None:
+                raise RuntimeError("abort a restoring migration before draining")
             state.draining = True
             while (
                 state.preparing
+                or state.worker_calls
                 or self._active_run_id == run_id
                 or any(item.run_id == run_id for item in self._ready)
             ):
@@ -260,7 +693,16 @@ class MegatronSlotCoordinator:
     ) -> OperationResultType:
         async with self._condition:
             state = self._runs.get(operation.run_id)
-            if state is None or state.draining or self._closed:
+            if (
+                state is None
+                or state.draining
+                or state.migration_fence_id is not None
+                or (
+                    state.migration_restore_id is not None
+                    and not state.migration_replaying
+                )
+                or self._closed
+            ):
                 raise _not_executed("cancelled", "Megatron slot run is draining")
             state.preparing += 1
         capture: PackedInputCaptureRef | None = None
@@ -292,7 +734,15 @@ class MegatronSlotCoordinator:
                 future=future,
             )
             async with self._condition:
-                if state.draining or self._closed:
+                if (
+                    state.draining
+                    or state.migration_fence_id is not None
+                    or (
+                        state.migration_restore_id is not None
+                        and not state.migration_replaying
+                    )
+                    or self._closed
+                ):
                     raise _not_executed("cancelled", "Megatron slot run is draining")
                 if len(self._ready) >= self.schedule.max_ready_commands:
                     raise _not_executed(
@@ -393,6 +843,68 @@ def _components(request: RunCommand) -> tuple[SlotComponent, ...]:
     if isinstance(request, OptimStepRequest):
         return ("weights", "optimizer", "accumulator")
     return ()
+
+
+def _validate_migration_replay(
+    initial: TrainerCommandRunState,
+    operations: tuple[MegatronMigrationReplay, ...],
+) -> TrainerCommandRunState:
+    next_sequence = initial.next_operation_sequence
+    learner_version = initial.learner_version
+    open_ids = list(initial.open_forward_backward_operation_ids)
+    seen: set[str] = set()
+    expected_types = {
+        "forward": ForwardRequest,
+        "forward_backward": ForwardBackwardRequest,
+        "optim_step": OptimStepRequest,
+        "save_sampler": SaveWeightsForSamplerRequest,
+        "save_state": SaveStateRequest,
+        "load_state": LoadStateRequest,
+    }
+    for replay in operations:
+        request = replay.request
+        admission = replay.admission
+        operation = admission.ref
+        if (
+            request.run_id != initial.run_id
+            or operation.run_id != initial.run_id
+            or request.sequence_id != next_sequence
+            or operation.sequence_id != next_sequence
+        ):
+            raise ValueError("migration replay sequence or run identity changed")
+        if operation.operation_id in seen:
+            raise ValueError("migration replay operation IDs must be unique")
+        seen.add(operation.operation_id)
+        if type(request) is not expected_types[operation.kind]:
+            raise TypeError("migration replay request kind changed")
+        if operation.learner_parent_version != learner_version:
+            raise ValueError("migration replay learner lineage changed")
+        contributions = admission.contributing_forward_backward_operation_ids
+        if operation.kind == "forward_backward":
+            if contributions or len(open_ids) >= 64:
+                raise ValueError("migration replay F/B contribution is invalid")
+            open_ids.append(operation.operation_id)
+        elif operation.kind == "optim_step":
+            if not open_ids or contributions != tuple(open_ids):
+                raise ValueError("migration replay optimizer contribution set changed")
+            open_ids.clear()
+            assert operation.reserved_output_learner_version is not None
+            learner_version = operation.reserved_output_learner_version
+        elif operation.kind == "load_state":
+            if open_ids or contributions:
+                raise ValueError("migration replay load cannot discard gradients")
+            assert operation.reserved_output_learner_version is not None
+            learner_version = operation.reserved_output_learner_version
+        elif contributions:
+            raise ValueError("migration replay attached unexpected contributions")
+        next_sequence += 1
+    return initial.model_copy(
+        update={
+            "learner_version": learner_version,
+            "next_operation_sequence": next_sequence,
+            "open_forward_backward_operation_ids": tuple(open_ids),
+        }
+    )
 
 
 def _not_executed(code: OperationFailureCode, message: str) -> OperationExecutionError:

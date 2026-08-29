@@ -6,6 +6,9 @@ __all__ = [
     "MegatronOperationHandler",
     "MegatronOperationRuntime",
     "MegatronArtifactResourcePlan",
+    "MegatronMigrationContribution",
+    "MegatronMigrationFence",
+    "MegatronMigrationReplay",
     "MegatronSlotCoordinator",
     "MegatronSlotResourceManager",
     "MegatronSlotResourceRequest",
@@ -31,6 +34,9 @@ def __getattr__(name: str) -> Any:
 
         return getattr(operation_handler, name)
     if name in {
+        "MegatronMigrationContribution",
+        "MegatronMigrationFence",
+        "MegatronMigrationReplay",
         "MegatronSlotCoordinator",
         "MegatronSlotResourceManager",
         "MegatronSlotResourceRequest",

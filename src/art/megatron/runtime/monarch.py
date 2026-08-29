@@ -23,6 +23,7 @@ from art.distributed.specs import GpuId
 from art.training import (
     CommandExecutionUsage,
     OperationExecutionError,
+    OperationRef,
     UsageMeasurement,
 )
 from art.utils.cache_dirs import configure_model_cache_env
@@ -55,6 +56,7 @@ from .specs import (
     TrainAccepted,
     TrainCancelled,
     TrainCompleted,
+    TrainerCommandRunState,
     TrainerGeneration,
     TrainerJobSpec,
     TrainerRuntimeSpec,
@@ -463,6 +465,7 @@ class MonarchTrainerActor(Actor):
         )
         self._weight_offload.install()
         self._command_job_open = False
+        self._migration_release_receipts: dict[str, tuple[str, ...]] = {}
         self._cp_preplanner = None
         self._cp_lookahead_port = None
         self._cp_lookahead_thread = None
@@ -621,6 +624,7 @@ class MonarchTrainerActor(Actor):
             if not self._valid:
                 raise RuntimeError("trainer actor runtime is invalid")
             job = ForwardBackwardJobSpec.model_validate_json(job_json)
+            self._migration_release_receipts.pop(job.run_id, None)
             leases = PackedBatchLeaseSet.model_validate_json(batch_json)
             batch = InMemoryPackedBatch.open(job.batch, leases.host_refs[self._host_id])
             if not self._command_job_open:
@@ -661,6 +665,7 @@ class MonarchTrainerActor(Actor):
             if not self._valid:
                 raise RuntimeError("trainer actor runtime is invalid")
             job = ForwardJobSpec.model_validate_json(job_json)
+            self._migration_release_receipts.pop(job.run_id, None)
             leases = PackedBatchLeaseSet.model_validate_json(batch_json)
             batch = InMemoryPackedBatch.open(job.batch, leases.host_refs[self._host_id])
             if not self._command_job_open:
@@ -692,6 +697,7 @@ class MonarchTrainerActor(Actor):
             if not self._command_job_open:
                 raise RuntimeError("optimizer has no open F/B interval")
             job = OptimizerJobSpec.model_validate_json(job_json)
+            self._migration_release_receipts.pop(job.run_id, None)
             result = self._executor.execute_optimizer(job)
             return {
                 **result,
@@ -713,6 +719,39 @@ class MonarchTrainerActor(Actor):
             if self._command_job_open:
                 self._weight_offload.after_job()
                 self._command_job_open = False
+
+    @endpoint
+    def release_command_run_for_migration(
+        self,
+        run_id: str,
+        expected_operation_ids: tuple[str, ...],
+    ) -> dict[str, Any]:
+        if not self._valid:
+            raise RuntimeError("trainer actor runtime is invalid")
+        prior = self._migration_release_receipts.get(run_id)
+        if prior is not None:
+            if prior != expected_operation_ids:
+                raise RuntimeError("migration release identity changed")
+            contributions = prior
+        else:
+            if self._executor.run_gradient_ids(run_id) != expected_operation_ids:
+                raise RuntimeError("migration release gradients changed")
+            contributions = self._executor.discard_run_gradients(run_id)
+            self._migration_release_receipts[run_id] = contributions
+            while len(self._migration_release_receipts) > (
+                _MAX_CACHED_COMMAND_OPERATIONS
+            ):
+                self._migration_release_receipts.pop(
+                    next(iter(self._migration_release_receipts))
+                )
+        if self._command_job_open and not self._executor.has_open_gradients:
+            self._weight_offload.after_job()
+            self._command_job_open = False
+        return {
+            "rank": self._runtime.rank,
+            "run_id": run_id,
+            "discarded_forward_backward_operation_ids": contributions,
+        }
 
     @endpoint
     def execute_sft(
@@ -1081,6 +1120,7 @@ def _command_run_identity(spec: TrainingRunSpec) -> tuple[Any, ...]:
         spec.runtime_fingerprint,
         spec.training_session_id,
         spec.initial_learner_version,
+        spec.initial_operation_sequence,
         spec.initial_adapter_path,
         spec.optimizer_state_path,
     )
@@ -1113,6 +1153,7 @@ class MonarchTrainerRun:
             run_spec.run_id: _CommandRunState(
                 spec=run_spec,
                 learner_version=run_spec.initial_learner_version,
+                next_operation_sequence=run_spec.initial_operation_sequence,
             )
         }
         self._jobs: dict[str, tuple[str, tuple[TrainEvent, ...]]] = {}
@@ -1156,7 +1197,77 @@ class MonarchTrainerRun:
         self._command_runs[run_spec.run_id] = _CommandRunState(
             spec=run_spec,
             learner_version=run_spec.initial_learner_version,
+            next_operation_sequence=run_spec.initial_operation_sequence,
         )
+
+    async def command_run_state(self, run_id: str) -> TrainerCommandRunState:
+        async with self._lock:
+            state = self._command_runs.get(run_id)
+            if state is None:
+                raise KeyError(f"trainer command run {run_id!r} is absent")
+            return TrainerCommandRunState(
+                run_id=run_id,
+                training_session_id=state.spec.training_session_id,
+                learner_version=state.learner_version,
+                next_operation_sequence=state.next_operation_sequence,
+                open_forward_backward_operation_ids=tuple(
+                    state.open_forward_backward_ids
+                ),
+            )
+
+    async def record_control_command(
+        self,
+        operation: OperationRef,
+        learner_version: int,
+    ) -> None:
+        async with self._lock:
+            state = self._command_runs.get(operation.run_id)
+            if state is None:
+                raise KeyError(f"trainer command run {operation.run_id!r} is absent")
+            if operation.sequence_id != state.next_operation_sequence:
+                raise RuntimeError("control command sequence changed")
+            if operation.learner_parent_version != state.learner_version:
+                raise RuntimeError("control command learner parent changed")
+            if operation.kind == "load_state":
+                if state.open_forward_backward_ids:
+                    raise RuntimeError("load_state cannot discard open gradients")
+                if operation.reserved_output_learner_version != learner_version:
+                    raise RuntimeError("load_state output learner version changed")
+                state.learner_version = learner_version
+            elif (
+                operation.kind not in {"save_sampler", "save_state"}
+                or operation.reserved_output_learner_version is not None
+                or learner_version != state.learner_version
+            ):
+                raise RuntimeError("invalid non-GPU control command transition")
+            state.next_operation_sequence += 1
+
+    async def release_command_run_for_migration(self, run_id: str) -> None:
+        async with self._lock:
+            state = self._command_runs.get(run_id)
+            if state is None:
+                return
+            values = await asyncio.wait_for(
+                self._actors.release_command_run_for_migration.call(
+                    run_id,
+                    tuple(state.open_forward_backward_ids),
+                ),
+                timeout=state.spec.event_timeout_s,
+            )
+            results = list(values.values())
+            expected_ranks = set(range(len(self.runtime_spec.trainer_mesh.ranks)))
+            expected_contributions = tuple(state.open_forward_backward_ids)
+            if (
+                {result["rank"] for result in results} != expected_ranks
+                or {result["run_id"] for result in results} != {run_id}
+                or {
+                    tuple(result["discarded_forward_backward_operation_ids"])
+                    for result in results
+                }
+                != {expected_contributions}
+            ):
+                raise RuntimeError("trainer ranks disagreed while releasing a run")
+            self._command_runs.pop(run_id)
 
     async def drain_command_run(self, run_id: str) -> None:
         async with self._lock:

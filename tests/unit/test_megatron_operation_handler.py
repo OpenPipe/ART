@@ -17,11 +17,18 @@ from art.megatron.operation_handler import (
     MegatronOperationHandler,
 )
 from art.megatron.runtime.monarch import MonarchTrainerRun
-from art.megatron.runtime.specs import TrainerGeneration
-from art.megatron.slot_coordinator import MegatronSlotCoordinator
+from art.megatron.runtime.specs import TrainerCommandRunState, TrainerGeneration
+from art.megatron.slot_coordinator import (
+    MegatronMigrationContribution,
+    MegatronMigrationFence,
+    MegatronMigrationReplay,
+    MegatronSlotCoordinator,
+)
 from art.training import (
     AdamConfig,
+    CommandAdmission,
     ForwardBackwardRequest,
+    ForwardBackwardResult,
     ForwardRequest,
     LossConfig,
     OperationExecutionError,
@@ -110,12 +117,60 @@ class _Trainer:
         self.max_active = 0
         self.executed_runs: list[str] = []
         self.registered_runs: set[str] = set()
+        self.run_states: dict[str, TrainerCommandRunState] = {}
+        self.migration_releases: list[str] = []
 
     def register_command_run(self, run_spec) -> None:
         self.registered_runs.add(run_spec.run_id)
+        self.run_states[run_spec.run_id] = TrainerCommandRunState(
+            run_id=run_spec.run_id,
+            training_session_id=run_spec.training_session_id,
+            learner_version=run_spec.initial_learner_version,
+            next_operation_sequence=run_spec.initial_operation_sequence,
+            open_forward_backward_operation_ids=(),
+        )
+
+    async def command_run_state(self, run_id: str) -> TrainerCommandRunState:
+        return self.run_states[run_id]
+
+    async def record_control_command(
+        self, operation: OperationRef, learner_version: int
+    ) -> None:
+        state = self.run_states[operation.run_id]
+        self.run_states[operation.run_id] = state.model_copy(
+            update={
+                "learner_version": learner_version,
+                "next_operation_sequence": state.next_operation_sequence + 1,
+            }
+        )
+
+    async def release_command_run_for_migration(self, run_id: str) -> None:
+        self.migration_releases.append(run_id)
+        self.run_states.pop(run_id, None)
+        self.registered_runs.discard(run_id)
 
     async def drain_command_run(self, run_id: str) -> None:
+        self.run_states.pop(run_id, None)
         self.registered_runs.discard(run_id)
+
+    def _advance(self, job, *, backward: bool = False, optimizer: bool = False) -> None:
+        state = self.run_states.get(job.run_id)
+        if state is None:
+            return
+        open_ids = state.open_forward_backward_operation_ids
+        learner_version = state.learner_version
+        if backward:
+            open_ids = (*open_ids, job.operation_id)
+        if optimizer:
+            open_ids = ()
+            learner_version = job.learner_version
+        self.run_states[job.run_id] = state.model_copy(
+            update={
+                "learner_version": learner_version,
+                "next_operation_sequence": state.next_operation_sequence + 1,
+                "open_forward_backward_operation_ids": open_ids,
+            }
+        )
 
     async def _enter(self, run_id: str) -> None:
         self.active += 1
@@ -126,6 +181,7 @@ class _Trainer:
 
     async def forward(self, job, _batch):
         await self._enter(job.run_id)
+        self._advance(job)
         return {
             "operation_id": job.operation_id,
             "learner_version": job.expected_learner_version,
@@ -137,6 +193,7 @@ class _Trainer:
 
     async def forward_backward(self, job, _batch):
         await self._enter(job.run_id)
+        self._advance(job, backward=True)
         return {
             "operation_id": job.operation_id,
             "learner_version": job.expected_learner_version,
@@ -149,6 +206,7 @@ class _Trainer:
     async def optim_step(self, job):
         if self.fail_optimizer:
             raise RuntimeError("optimizer failed")
+        self._advance(job, optimizer=True)
         return {
             "operation_id": job.operation_id,
             "learner_version": job.learner_version,
@@ -318,6 +376,119 @@ async def test_slot_coordinator_serializes_four_logical_runs() -> None:
     with pytest.raises(KeyError):
         slot.resolve_run("run-0")
     await slot.aclose()
+
+
+@pytest.mark.asyncio
+async def test_slot_migration_fences_replays_and_releases_one_run() -> None:
+    runtime = _Runtime()
+    trainer = _Trainer()
+    trainer.fail_optimizer = False
+    slot = MegatronSlotCoordinator(runtime, trainer)  # type: ignore[arg-type]
+    run = await slot.install_migration_run(
+        MegatronOperationConfig(
+            run_id="run",
+            training_session_id="session",
+            source=TrainerGeneration(
+                training_session_id="session",
+                policy_step=2,
+                generation_id=f"step-00000002-{'a' * 32}",
+                adapter_path="/adapter/2",
+            ),
+            initial_operation_sequence=4,
+            optimizer_state_path="/optimizer/2",
+            rollout_model=RolloutModelSpec(payload={}),
+            output_adapter_root="/adapter",
+        ),
+        restore_id="restore-1",
+    )
+    with pytest.raises(KeyError):
+        slot.resolve_run("run")
+    request = ForwardBackwardRequest(
+        run_id="run",
+        request_id="fb-replay",
+        sequence_id=4,
+        batch=_batch(),
+        loss=LossConfig(name="cispo"),
+    )
+    operation = _operation("fb-replay", "forward_backward", 4, parent=2)
+
+    outcomes = await slot.replay_migration_operations(
+        "run",
+        "restore-1",
+        (
+            MegatronMigrationReplay(
+                request=request,
+                admission=CommandAdmission(ref=operation),
+            ),
+        ),
+    )
+    assert [outcome.status for outcome in outcomes] == ["succeeded"]
+    result = outcomes[0]
+    assert result.status == "succeeded"
+    assert isinstance(result.result, ForwardBackwardResult)
+    assert result.result.packed_input_capture is not None
+    await slot.activate_migration_run(
+        "run",
+        "restore-1",
+        MegatronMigrationFence(
+            fence_id="source-fence",
+            run_id="run",
+            generation=TrainerGeneration(
+                training_session_id="session",
+                policy_step=2,
+                generation_id=f"step-00000002-{'a' * 32}",
+                adapter_path="/adapter/2",
+            ),
+            optimizer_state_path="/optimizer/2",
+            next_operation_sequence=5,
+            open_contributions=(
+                MegatronMigrationContribution(
+                    operation_id="fb-replay",
+                    packed_input=result.result.packed_input_capture,
+                ),
+            ),
+        ),
+    )
+    assert slot.resolve_run("run") == run
+
+    fence = await slot.fence_and_quiesce_run("run", "fence-2")
+    assert fence.generation.policy_step == 2
+    assert fence.next_operation_sequence == 5
+    assert [item.operation_id for item in fence.open_contributions] == ["fb-replay"]
+    assert await slot.fence_and_quiesce_run("run", "fence-2") == fence
+    with pytest.raises(KeyError):
+        slot.resolve_run("run")
+
+    await slot.resume_migration_source("run", "fence-2")
+    assert slot.resolve_run("run") == run
+    fence = await slot.fence_and_quiesce_run("run", "fence-3")
+    await slot.release_migration_source(fence)
+    await slot.release_migration_source(fence)
+    assert trainer.migration_releases == ["run"]
+    assert runtime.released == [runtime.packed]
+    with pytest.raises(KeyError):
+        slot.resolve_run("run")
+    await slot.aclose()
+
+
+@pytest.mark.asyncio
+async def test_control_commands_advance_shared_run_sequence() -> None:
+    run = MonarchTrainerRun.__new__(MonarchTrainerRun)
+    run._lock = asyncio.Lock()
+    state = SimpleNamespace(
+        learner_version=2,
+        next_operation_sequence=4,
+        open_forward_backward_ids=[],
+    )
+    run._command_runs = {"run": state}
+
+    await run.record_control_command(_operation("save", "save_state", 4, parent=2), 2)
+    await run.record_control_command(
+        _operation("load", "load_state", 5, parent=2, output=3), 3
+    )
+
+    assert state.next_operation_sequence == 6
+    assert state.learner_version == 3
 
 
 def test_rank_gpu_service_uses_exclusive_duration_and_exact_count() -> None:

@@ -78,11 +78,28 @@ class TrainingRunSpec(_Spec):
     runtime_fingerprint: str = Field(min_length=1)
     training_session_id: str = Field(min_length=1)
     initial_learner_version: int = Field(ge=0)
+    initial_operation_sequence: int = Field(default=0, ge=0)
     initial_adapter_path: str = Field(min_length=1)
     optimizer_state_path: str = Field(min_length=1)
     initial_event_timeout_s: float | None = Field(default=None, gt=0)
     event_timeout_s: float = Field(default=300.0, gt=0)
     shutdown_timeout_s: float = Field(default=240.0, gt=0)
+
+
+class TrainerCommandRunState(_Spec):
+    run_id: str = Field(min_length=1)
+    training_session_id: str = Field(min_length=1)
+    learner_version: int = Field(ge=0)
+    next_operation_sequence: int = Field(ge=0)
+    open_forward_backward_operation_ids: tuple[str, ...] = Field(max_length=64)
+
+    @model_validator(mode="after")
+    def _validate_open_operations(self) -> "TrainerCommandRunState":
+        if len(set(self.open_forward_backward_operation_ids)) != len(
+            self.open_forward_backward_operation_ids
+        ):
+            raise ValueError("open F/B operation IDs must be unique")
+        return self
 
 
 class CurrentTrainConfig(TrainConfig):

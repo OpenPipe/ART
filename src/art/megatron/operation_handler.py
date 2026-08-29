@@ -106,6 +106,7 @@ class MegatronOperationConfig(BaseModel):
     run_id: str = Field(min_length=1)
     training_session_id: str = Field(min_length=1)
     source: TrainerGeneration
+    initial_operation_sequence: int = Field(default=0, ge=0)
     optimizer_state_path: str = Field(min_length=1)
     rollout_model: RolloutModelSpec
     train_config: CurrentTrainConfig = CurrentTrainConfig()
@@ -133,6 +134,12 @@ class _ResidentTrainer(Protocol):
     ) -> dict[str, Any]: ...
 
     async def optim_step(self, job: OptimizerJobSpec) -> dict[str, Any]: ...
+
+    async def record_control_command(
+        self,
+        operation: OperationRef,
+        learner_version: int,
+    ) -> None: ...
 
 
 class MegatronOperationHandler:
@@ -262,17 +269,34 @@ class MegatronOperationHandler:
                 usage=CommandExecutionUsage.no_work(),
             )
         if isinstance(request, SaveWeightsForSamplerRequest):
-            return await self.checkpoints.save_weights_for_sampler(
+            result = await self.checkpoints.save_weights_for_sampler(
                 request, operation, self._generation
             )
+            await self.trainer.record_control_command(
+                operation, self._generation.policy_step
+            )
+            return result
         if isinstance(request, SaveStateRequest):
-            return await self.checkpoints.save_state(
+            result = await self.checkpoints.save_state(
                 request, operation, self._generation
             )
+            await self.trainer.record_control_command(
+                operation, self._generation.policy_step
+            )
+            return result
         if isinstance(request, LoadStateRequest):
             loaded = await self.checkpoints.load_state(request, operation)
             if loaded.result.operation_id != operation.operation_id:
                 raise RuntimeError("checkpoint loader changed operation identity")
+            if (
+                loaded.generation.training_session_id != self.config.training_session_id
+                or loaded.generation.policy_step
+                != operation.reserved_output_learner_version
+            ):
+                raise RuntimeError("checkpoint loader changed learner lineage")
+            await self.trainer.record_control_command(
+                operation, loaded.generation.policy_step
+            )
             self._generation = loaded.generation
             self._optimizer_state_path = loaded.optimizer_state_path
             return loaded.result
@@ -336,6 +360,17 @@ class MegatronOperationHandler:
             await self._release_if_unowned(capture_id)
         if self._captures:
             raise RuntimeError("packed inputs remain after run drain")
+
+    async def release_after_migration(self) -> None:
+        """Release source-local replay leases after target activation."""
+
+        self._contributions.clear()
+        for captured in self._captures.values():
+            captured.owners.clear()
+        for capture_id in tuple(self._captures):
+            await self._release_if_unowned(capture_id)
+        if self._captures:
+            raise RuntimeError("packed inputs remain after migration source release")
 
     async def _forward(
         self,
