@@ -25,7 +25,7 @@ from art_vllm_runtime.binary_routes import (
 from art_vllm_runtime.fast_metrics import FastMetricsSidecar
 from art_vllm_runtime.patches import apply_vllm_runtime_patches
 
-ART_SERVING_PROTOCOL_VERSION = 5
+ART_SERVING_PROTOCOL_VERSION = 6
 _runtime_state: dict[str, object] = {}
 _auth_tokens: list[str] = []
 _fast_metrics_port: int | None = None
@@ -83,6 +83,73 @@ def _fast_metrics_url(request: Any) -> str:
             fragment="",
         )
     )
+
+
+def _config_string(value: Any) -> str:
+    raw = getattr(value, "value", value)
+    return str(raw).removeprefix("torch.")
+
+
+def _serving_profile(engine_client: Any) -> dict[str, Any] | None:
+    identity = _runtime_state.get("serving_profile_identity")
+    if identity is None:
+        return None
+    if not isinstance(identity, dict):
+        raise RuntimeError("ART serving profile identity is malformed")
+    config = engine_client.vllm_config
+    model = config.model_config
+    parallel = config.parallel_config
+    scheduler = config.scheduler_config
+    cache = config.cache_config
+    lora = config.lora_config
+    if lora is None:
+        raise RuntimeError("ART serving profile requires LoRA configuration")
+    speculative = config.speculative_config
+    speculative_method = (
+        None
+        if speculative is None or speculative.method is None
+        else _config_string(speculative.method)
+    )
+    return {
+        "schema_version": 1,
+        "identity": identity,
+        "runtime_model": model.model,
+        "runtime_revision": model.revision,
+        "tokenizer": model.tokenizer,
+        "tokenizer_revision": model.tokenizer_revision,
+        "model_dtype": _config_string(model.dtype),
+        "quantization": (
+            None if model.quantization is None else _config_string(model.quantization)
+        ),
+        "tensor_parallel_size": parallel.tensor_parallel_size,
+        "pipeline_parallel_size": parallel.pipeline_parallel_size,
+        "data_parallel_size": parallel.data_parallel_size,
+        "prefill_context_parallel_size": parallel.prefill_context_parallel_size,
+        "enable_expert_parallel": parallel.enable_expert_parallel,
+        "max_model_len": model.max_model_len,
+        "max_num_batched_tokens": scheduler.max_num_batched_tokens,
+        "max_num_seqs": scheduler.max_num_seqs,
+        "max_num_partial_prefills": scheduler.max_num_partial_prefills,
+        "kv_cache_dtype": _config_string(cache.cache_dtype),
+        "kv_block_size": cache.block_size,
+        "prefix_caching": cache.enable_prefix_caching,
+        "prefix_hash_algorithm": _config_string(cache.prefix_caching_hash_algo),
+        "max_loras": lora.max_loras,
+        "max_lora_rank": lora.max_lora_rank,
+        "lora_dtype": _config_string(lora.lora_dtype),
+        "speculative_method": speculative_method,
+        "multi_token_prediction": speculative_method == "mtp",
+        "exact_token_ids": True,
+        "selected_token_logprobs": True,
+        "policy_span_schema": "prompt_completion_v1",
+        "cache_transition": "policy_history_route_salt_v1",
+        "lora_update_semantics": "holder_local_in_flight_v1",
+        "route_capture_format": (
+            "art_inference_route_bundle_v1"
+            if _runtime_state.get("route_capture") is True
+            else None
+        ),
+    }
 
 
 class _ArtAuthenticationMiddleware(AuthenticationMiddleware):
@@ -205,6 +272,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--update-identity")
     parser.add_argument("--initial-generation-id")
     parser.add_argument("--initial-policy-version", type=int)
+    parser.add_argument("--serving-profile-identity-json")
     parser.add_argument("--lora-path", help="Optional initial checkpoint path")
     parser.add_argument("--served-model-name", required=True)
     parser.add_argument(
@@ -287,15 +355,18 @@ def _patch_art_runtime_routes() -> None:
 
         @router.get("/art/capabilities")
         async def art_capabilities(raw_request: Request) -> JSONResponse:
+            profile = _serving_profile(engine(raw_request))
             return JSONResponse(
                 content={
                     "runtime": "art_vllm",
                     "protocol_version": ART_SERVING_PROTOCOL_VERSION,
-                    "binary_routed_experts": True,
+                    "binary_routed_experts": _runtime_state.get("route_capture")
+                    is True,
                     "fast_metrics": {"url": _fast_metrics_url(raw_request)},
                     "inplace_lora_load": True,
                     "in_flight_lora_updates": True,
                     "policy_token_spans": True,
+                    "profile": profile,
                 }
             )
 
@@ -607,6 +678,15 @@ def main(argv: list[str] | None = None) -> None:
         )
     engine_args = json.loads(args.engine_args_json)
     server_args = json.loads(args.server_args_json)
+    serving_profile_identity = (
+        None
+        if args.serving_profile_identity_json is None
+        else json.loads(args.serving_profile_identity_json)
+    )
+    if serving_profile_identity is not None and not isinstance(
+        serving_profile_identity, dict
+    ):
+        raise ValueError("serving profile identity must be a JSON object")
     route_capture = engine_args.get("enable_return_routed_experts", False)
     pp_size = engine_args.get("pipeline_parallel_size", 1)
     if not isinstance(route_capture, bool):
@@ -665,6 +745,8 @@ def main(argv: list[str] | None = None) -> None:
         initial_generation_id=args.initial_generation_id,
         initial_policy_version=args.initial_policy_version,
         pp_layer_partition=pp_layer_partition,
+        route_capture=route_capture,
+        serving_profile_identity=serving_profile_identity,
     )
 
     os.environ["CUDA_VISIBLE_DEVICES"] = args.cuda_visible_devices

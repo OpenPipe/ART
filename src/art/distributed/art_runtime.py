@@ -356,6 +356,10 @@ class ArtRuntime:
     def nixl_transport(self) -> NixlTransportSpec | None:
         return self._nixl_transport
 
+    @property
+    def retained_route_prefetch_enabled(self) -> bool:
+        return self._route_bundle_reader is not None
+
     async def _resolve_nixl_transport(self) -> None:
         transport = self._nixl_transport
         if transport is None or transport.metadata_store is not None:

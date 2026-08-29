@@ -10,6 +10,7 @@ import uuid
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from ..serving_capabilities import ServingProfileIdentity
 from ..utils.lifecycle import ChildProcessSupervisor
 from ..vllm_runtime import ManagedVllmRuntime, VllmRuntimeLaunchConfig
 from .adapter_transport import AdapterReceiveResult, AdapterTransferTarget
@@ -33,6 +34,7 @@ class ReplicaLaunchTemplate(_Message):
     initial_policy_version: int | None = Field(default=None, ge=0)
     engine_args: dict[str, object] = Field(default_factory=dict)
     server_args: dict[str, object] = Field(default_factory=dict)
+    serving_profile_identity: ServingProfileIdentity | None = None
 
 
 class HostMemberLaunchRequest(_Message):
@@ -628,6 +630,7 @@ class ReplicaManager:
             update_identity=self._state.update_identity,
             initial_generation_id=self._template.initial_generation_id,
             initial_policy_version=self._template.initial_policy_version,
+            serving_profile_identity=self._template.serving_profile_identity,
         )
         return HostMemberLaunchRequest(
             replica_id=self._spec.name,

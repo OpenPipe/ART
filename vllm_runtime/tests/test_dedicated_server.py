@@ -10,6 +10,8 @@ from fastapi.testclient import TestClient
 import pytest
 from starlette.datastructures import URL
 
+from art.serving_capabilities import ServingProfile
+
 _PAYLOAD: dict[str, object] = {
     "schema_version": 1,
     "source": "art_vllm_runtime",
@@ -138,6 +140,74 @@ def test_fast_metrics_url_uses_controller_routable_host(monkeypatch) -> None:
         request = SimpleNamespace(url=URL(f"http://{host}:8000/art/capabilities"))
         with pytest.raises(RuntimeError, match="unroutable host"):
             dedicated_server._fast_metrics_url(request)
+
+
+def test_serving_profile_reports_resolved_runtime_geometry(monkeypatch) -> None:
+    identity = {
+        "base_model": "test/model",
+        "model_identifier": "test/model",
+        "model_revision": "default",
+        "model_support_key": "test-support",
+        "handler_name": "test-handler",
+        "lora_rank": 32,
+        "lora_alpha": 32.0,
+        "lora_target_modules": ["q_proj", "v_proj"],
+        "trainer_dtype": "bfloat16",
+        "route_replay": True,
+        "lora_transport": "nixl",
+        "retained_route_transport": "none",
+        "retained_route_max_bytes": 0,
+        "retained_route_max_bundles": 0,
+    }
+    monkeypatch.setitem(
+        dedicated_server._runtime_state, "serving_profile_identity", identity
+    )
+    monkeypatch.setitem(dedicated_server._runtime_state, "route_capture", True)
+    engine = SimpleNamespace(
+        vllm_config=SimpleNamespace(
+            model_config=SimpleNamespace(
+                model="test/model",
+                revision=None,
+                tokenizer="test/model",
+                tokenizer_revision=None,
+                dtype="bfloat16",
+                quantization="fp8",
+                max_model_len=16_384,
+            ),
+            parallel_config=SimpleNamespace(
+                tensor_parallel_size=2,
+                pipeline_parallel_size=1,
+                data_parallel_size=1,
+                prefill_context_parallel_size=2,
+                enable_expert_parallel=True,
+            ),
+            scheduler_config=SimpleNamespace(
+                max_num_batched_tokens=32_768,
+                max_num_seqs=64,
+                max_num_partial_prefills=2,
+            ),
+            cache_config=SimpleNamespace(
+                cache_dtype="fp8",
+                block_size=16,
+                enable_prefix_caching=True,
+                prefix_caching_hash_algo="sha256_cbor",
+            ),
+            lora_config=SimpleNamespace(
+                max_loras=2,
+                max_lora_rank=64,
+                lora_dtype="bfloat16",
+            ),
+            speculative_config=SimpleNamespace(method="mtp"),
+        )
+    )
+
+    profile = ServingProfile.model_validate(dedicated_server._serving_profile(engine))
+
+    assert profile.identity.model_identifier == "test/model"
+    assert profile.tensor_parallel_size == 2
+    assert profile.quantization == "fp8"
+    assert profile.multi_token_prediction
+    assert profile.route_capture_format == "art_inference_route_bundle_v1"
 
 
 def test_runtime_sleep_route_returns_engine_validation_error(monkeypatch) -> None:

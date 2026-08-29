@@ -11,7 +11,7 @@ from pydantic import (
     model_validator,
 )
 
-ART_SERVING_PROTOCOL_VERSION = 5
+ART_SERVING_PROTOCOL_VERSION = 6
 
 ServingFeature = Literal[
     "binary_routed_experts",
@@ -54,6 +54,96 @@ class FastMetricsSnapshot(BaseModel):
     generation: int = Field(ge=0)
 
 
+class ServingProfileIdentity(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    base_model: str = Field(min_length=1)
+    model_identifier: str = Field(min_length=1)
+    model_revision: str = Field(min_length=1)
+    model_support_key: str = Field(min_length=1)
+    handler_name: str = Field(min_length=1)
+    lora_rank: int = Field(ge=1)
+    lora_alpha: FiniteFloat = Field(gt=0)
+    lora_target_modules: tuple[str, ...] = Field(min_length=1)
+    trainer_dtype: Literal["bfloat16", "float16", "float32"]
+    route_replay: bool
+    lora_transport: Literal["local", "nixl"]
+    retained_route_transport: Literal["none", "caios_lota"]
+    retained_route_max_bytes: int = Field(ge=0)
+    retained_route_max_bundles: int = Field(ge=0)
+
+    @model_validator(mode="after")
+    def _validate_bounds(self) -> "ServingProfileIdentity":
+        bounds = (self.retained_route_max_bytes, self.retained_route_max_bundles)
+        if self.retained_route_transport == "caios_lota":
+            valid_bounds = all(value > 0 for value in bounds)
+        else:
+            valid_bounds = bounds == (0, 0)
+        if not valid_bounds:
+            raise ValueError(
+                "retained route transport and bounds must be present together"
+            )
+        if len(set(self.lora_target_modules)) != len(self.lora_target_modules):
+            raise ValueError("LoRA target modules must be unique")
+        return self
+
+
+class ServingProfile(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    schema_version: Literal[1] = 1
+    identity: ServingProfileIdentity
+    runtime_model: str = Field(min_length=1)
+    runtime_revision: str | None = None
+    tokenizer: str = Field(min_length=1)
+    tokenizer_revision: str | None = None
+    model_dtype: str = Field(min_length=1)
+    quantization: str | None = None
+    tensor_parallel_size: int = Field(ge=1)
+    pipeline_parallel_size: int = Field(ge=1)
+    data_parallel_size: int = Field(ge=1)
+    prefill_context_parallel_size: int = Field(ge=1)
+    enable_expert_parallel: bool
+    max_model_len: int = Field(ge=1)
+    max_num_batched_tokens: int = Field(ge=1)
+    max_num_seqs: int = Field(ge=1)
+    max_num_partial_prefills: int = Field(ge=1)
+    kv_cache_dtype: str = Field(min_length=1)
+    kv_block_size: int = Field(ge=1)
+    prefix_caching: bool
+    prefix_hash_algorithm: str = Field(min_length=1)
+    max_loras: int = Field(ge=1)
+    max_lora_rank: int = Field(ge=1)
+    lora_dtype: str = Field(min_length=1)
+    speculative_method: str | None = None
+    multi_token_prediction: bool
+    exact_token_ids: Literal[True] = True
+    selected_token_logprobs: Literal[True] = True
+    policy_span_schema: Literal["prompt_completion_v1"] = "prompt_completion_v1"
+    cache_transition: Literal["policy_history_route_salt_v1"] = (
+        "policy_history_route_salt_v1"
+    )
+    lora_update_semantics: Literal["holder_local_in_flight_v1"] = (
+        "holder_local_in_flight_v1"
+    )
+    route_capture_format: Literal["art_inference_route_bundle_v1"] | None = None
+
+    @model_validator(mode="after")
+    def _validate_profile(self) -> "ServingProfile":
+        if (
+            self.runtime_model != self.identity.model_identifier
+            or (self.runtime_revision or "default") != self.identity.model_revision
+        ):
+            raise ValueError("runtime model identity disagrees with the launch profile")
+        if self.max_lora_rank < self.identity.lora_rank:
+            raise ValueError("runtime max LoRA rank is below the training layout")
+        if self.identity.route_replay != (self.route_capture_format is not None):
+            raise ValueError("route replay identity and runtime capture disagree")
+        if self.multi_token_prediction != (self.speculative_method == "mtp"):
+            raise ValueError("MTP flag and speculative method disagree")
+        return self
+
+
 class ServingCapabilities(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -64,6 +154,7 @@ class ServingCapabilities(BaseModel):
     inplace_lora_load: bool = False
     in_flight_lora_updates: bool = False
     policy_token_spans: bool = False
+    profile: ServingProfile | None = None
 
     @model_validator(mode="after")
     def _validate_protocol(self) -> "ServingCapabilities":

@@ -16,6 +16,7 @@ from urllib.parse import urlparse
 import httpx
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from .serving_capabilities import ServingProfileIdentity
 from .utils.cache_dirs import configure_model_cache_env
 from .utils.lifecycle import (
     ChildProcessSupervisor,
@@ -89,6 +90,7 @@ class VllmRuntimeLaunchConfig(BaseModel):
     update_identity: str | None = None
     initial_generation_id: str | None = Field(default=None, min_length=1)
     initial_policy_version: int | None = Field(default=None, ge=0)
+    serving_profile_identity: ServingProfileIdentity | None = None
 
     @model_validator(mode="after")
     def _validate_native_member(self) -> "VllmRuntimeLaunchConfig":
@@ -920,6 +922,11 @@ def build_vllm_runtime_server_cmd(config: VllmRuntimeLaunchConfig) -> list[str]:
         command.append(f"--initial-generation-id={config.initial_generation_id}")
     if config.initial_policy_version is not None:
         command.append(f"--initial-policy-version={config.initial_policy_version}")
+    if config.serving_profile_identity is not None:
+        command.append(
+            "--serving-profile-identity-json="
+            + config.serving_profile_identity.model_dump_json()
+        )
     return command
 
 

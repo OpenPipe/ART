@@ -28,6 +28,7 @@ from art.distributed.vllm_replica import (
 )
 from art.serving_capabilities import (
     ServingCapabilities,
+    ServingProfileIdentity,
     discover_serving_capabilities,
 )
 from art.utils.lifecycle import (
@@ -1758,6 +1759,7 @@ class DistributedMegatronService:
             initial_policy_version=step,
             engine_args=self._engine_args(config),
             server_args=self._server_args(config),
+            serving_profile_identity=self._serving_profile_identity(),
         )
         await self.runtime.start_model_service(
             service, template, on_failure=self._replica_failed
@@ -1768,6 +1770,11 @@ class DistributedMegatronService:
                 base_url=base_url,
                 headers=_headers(api_key),
                 allow_openai_compatible=False,
+            )
+            self._validate_serving_profile(
+                capabilities,
+                template.serving_profile_identity,
+                service,
             )
             generation_id = self._generation_id_for_step(step)
             update_identity = uuid.uuid4().hex
@@ -1965,6 +1972,73 @@ class DistributedMegatronService:
                 f"runtime topology has no unique service {self.model_name!r}"
             )
         return services[0]
+
+    def _serving_profile_identity(self) -> ServingProfileIdentity:
+        spec = self._runtime_spec()
+        retained_routes = self.runtime.retained_route_prefetch_enabled
+        return ServingProfileIdentity(
+            base_model=self.base_model,
+            model_identifier=spec.model_identifier,
+            model_revision=spec.model_revision,
+            model_support_key=spec.model_support_key,
+            handler_name=spec.handler_name,
+            lora_rank=spec.lora_rank,
+            lora_alpha=spec.lora_alpha,
+            lora_target_modules=spec.lora_target_modules,
+            trainer_dtype=spec.dtype,
+            route_replay=spec.enable_moe_routing_replay,
+            lora_transport="nixl" if self.runtime.nixl_transport else "local",
+            retained_route_transport=("caios_lota" if retained_routes else "none"),
+            retained_route_max_bytes=(
+                self.runtime.config.route_bundle_prefetch_capacity_bytes
+                if retained_routes
+                else 0
+            ),
+            retained_route_max_bundles=(
+                self.runtime.config.route_bundle_prefetch_max_bundles
+                if retained_routes
+                else 0
+            ),
+        )
+
+    @staticmethod
+    def _validate_serving_profile(
+        capabilities: ServingCapabilities,
+        identity: ServingProfileIdentity | None,
+        service: ModelServiceSpec,
+    ) -> None:
+        profile = capabilities.profile
+        if identity is None or profile is None or profile.identity != identity:
+            raise RuntimeError("vLLM returned the wrong serving profile identity")
+        parallel = service.parallel
+        actual_parallel = (
+            profile.tensor_parallel_size,
+            profile.pipeline_parallel_size,
+            profile.data_parallel_size,
+            profile.enable_expert_parallel,
+        )
+        expected_parallel = (
+            parallel.tp,
+            parallel.pp,
+            parallel.dp,
+            parallel.enable_expert_parallel,
+        )
+        if actual_parallel != expected_parallel:
+            raise RuntimeError("vLLM returned the wrong serving parallel geometry")
+        if (
+            profile.runtime_model != service.base_model
+            or profile.runtime_revision != service.model_revision
+        ):
+            raise RuntimeError("vLLM returned the wrong serving model identity")
+        exact_features = (
+            capabilities.inplace_lora_load,
+            capabilities.in_flight_lora_updates,
+            capabilities.policy_token_spans,
+            capabilities.fast_metrics is not None,
+            capabilities.binary_routed_experts == identity.route_replay,
+        )
+        if not all(exact_features):
+            raise RuntimeError("vLLM returned incomplete exact serving capabilities")
 
     async def _rollback_server_start(
         self, service_name: str | None
