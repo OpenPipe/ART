@@ -591,6 +591,7 @@ class _ResidentCommandRun:
     spec: TrainingRunSpec
     learner_version: int
     gradients: Any
+    adapter_config: dict[str, Any]
     portable_read: PortableSnapshotReadReceipt | None = None
 
 
@@ -699,7 +700,7 @@ class MCoreRunSlotExecutor:
                     raise RuntimeError("portable archive identifies another generation")
                 from .portable_snapshot import install_portable_checkpoint
 
-                portable_read, _adapter_config = install_portable_checkpoint(
+                portable_read, adapter_config = install_portable_checkpoint(
                     self._trainer,
                     self._portable_snapshot_source,
                     archive,
@@ -714,6 +715,7 @@ class MCoreRunSlotExecutor:
                 spec=spec,
                 learner_version=spec.initial_learner_version,
                 gradients=ParameterGradientAccumulator(parameters),
+                adapter_config=adapter_config,
                 portable_read=portable_read,
             )
         except BaseException:
@@ -1036,7 +1038,11 @@ class MCoreRunSlotExecutor:
         if state.gradients.contribution_ids:
             raise RuntimeError("cannot publish a generation with open gradients")
         sink = _CommandPublicationSink()
-        metrics = self._publisher.submit_command(spec, sink=sink)
+        metrics = self._publisher.submit_command(
+            spec,
+            adapter_config=state.adapter_config,
+            sink=sink,
+        )
         record = sink.future.result()
         return {
             "run_id": spec.run_id,
@@ -1178,20 +1184,16 @@ class _GenerationPublisher:
         self,
         spec: CommandPublicationSpec,
         *,
+        adapter_config: dict[str, Any],
         sink: EventSink,
     ) -> dict[str, float]:
         from art.megatron.lora import LoRASlotRef
 
-        runtime = self.runtime
-        adapter_dtypes = runtime.adapter_export_dtypes
-        adapter_config = runtime.adapter_export_config
-        if adapter_dtypes is None or adapter_config is None:
-            raise RuntimeError("resident command adapter export is not configured")
         return self._submit(
             generation=spec.generation,
             optimizer_state_path=spec.optimizer_state_path,
             staging_adapter_path=spec.staging_adapter_path,
-            adapter_dtypes=adapter_dtypes,
+            adapter_dtypes={},
             adapter_config=adapter_config,
             save_optimizer=False,
             publication_targets=spec.publication_targets,
