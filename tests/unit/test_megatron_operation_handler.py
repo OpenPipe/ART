@@ -11,6 +11,7 @@ from art.distributed.data_plane import (
     PrefixTreePackingStatsSpec,
     TensorSpec,
 )
+from art.distributed.packing import TrajectoryGroupPayload
 from art.distributed.rollout import RolloutModelSpec
 from art.distributed.trajectory_store import TrajectoryGroupBundle
 from art.megatron.operation_handler import (
@@ -59,6 +60,13 @@ from art.training import (
     SaveWeightsForSamplerRequest,
 )
 from art.trajectories import TrajectoryGroup
+from art.vllm_route_transport import (
+    RetainedRouteBundleRef,
+    RouteBundleChoiceLayout,
+    RouteBundleLayout,
+    RouteBundleObjectRef,
+    route_bundle_id,
+)
 
 
 def _packed_batch(*, content_sha256: str | None = None) -> DistributedPackedBatch:
@@ -124,6 +132,26 @@ class _Runtime:
 
     async def release_batch(self, batch):
         self.released.append(batch)
+
+
+class _RouteOwnership:
+    def __init__(self) -> None:
+        self.acquired = []
+        self.transferred = []
+        self.released = []
+
+    async def acquire(self, *, operation, bundles):
+        handle = ("source", operation.operation_id)
+        self.acquired.append((operation, bundles, handle))
+        return handle
+
+    async def transfer(self, handle, *, transfer_id, target_owner_id):
+        target = ("target", transfer_id, target_owner_id)
+        self.transferred.append((handle, target))
+        return target
+
+    async def release(self, handle):
+        self.released.append(handle)
 
 
 class _Trainer:
@@ -297,6 +325,50 @@ def _batch() -> RlTrajectoryBatch:
     )
 
 
+def _batch_with_retained_route() -> tuple[RlTrajectoryBatch, RetainedRouteBundleRef]:
+    choice = RouteBundleChoiceLayout(
+        choice_index=0,
+        dtype="uint8",
+        shape=(1, 1, 1),
+        offset=0,
+        byte_count=1,
+        token_ids_sha256="a" * 64,
+    )
+    identity = {
+        "protocol_version": 1,
+        "format": "art_inference_route_bundle_v1",
+        "request_id": "route-request",
+        "owner_id": "route-owner",
+        "model_identity": "model",
+        "response_id": "response",
+        "num_experts": 1,
+        "choices": [choice.model_dump(mode="json")],
+        "byte_count": 1,
+        "sha256": "b" * 64,
+    }
+    layout = RouteBundleLayout(bundle_id=route_bundle_id(identity), **identity)
+    ref = RetainedRouteBundleRef(
+        object=RouteBundleObjectRef(
+            locator="caios://route",
+            size_bytes=1,
+            sha256=layout.sha256,
+        ),
+        layout=layout,
+        lease_id="producer-lease",
+    )
+    payload = TrajectoryGroupPayload.from_group(TrajectoryGroup()).model_copy(
+        update={"retained_route_bundles": (ref,)}
+    )
+    return (
+        RlTrajectoryBatch(
+            groups=(TrajectoryGroupBundle.from_payload(payload),),
+            min_source_version=0,
+            max_source_version=0,
+        ),
+        ref,
+    )
+
+
 def _portable_archive(
     generation: TrainerGeneration,
     *,
@@ -412,6 +484,68 @@ async def test_handler_retains_f_b_input_until_optimizer_commit() -> None:
     assert handler.retained_contribution_inputs() == ()
     await handler.release_operation_input("forward")
     assert runtime.released[-1] == runtime.packed
+
+
+@pytest.mark.asyncio
+async def test_handler_retains_route_ownership_through_optimizer() -> None:
+    runtime = _Runtime()
+    trainer = _Trainer()
+    trainer.fail_optimizer = False
+    trainer.runtime_spec.enable_moe_routing_replay = True
+    ownership = _RouteOwnership()
+    handler = MegatronOperationHandler(
+        runtime,  # type: ignore[arg-type]
+        trainer,
+        MegatronOperationConfig(
+            run_id="run",
+            training_session_id="session",
+            adapter=AdapterSpec(rank=8, target_modules=("q_proj",)),
+            source=TrainerGeneration(
+                training_session_id="session",
+                policy_step=0,
+                generation_id=f"step-00000000-{'a' * 32}",
+                adapter_path="/adapter/0",
+            ),
+            optimizer_state_path="/optimizer",
+            rollout_model=RolloutModelSpec(payload={}),
+            output_adapter_root="/adapter",
+        ),
+        route_ownership=ownership,
+    )
+    batch, route = _batch_with_retained_route()
+    result = await handler(
+        ForwardBackwardRequest(
+            run_id="run",
+            request_id="fb",
+            sequence_id=0,
+            batch=batch,
+            loss=LossConfig(name="cispo"),
+        ),
+        _operation("fb", "forward_backward", 0),
+        (),
+    )
+    capture = result.packed_input_capture
+    assert capture is not None
+    assert ownership.acquired[0][1] == (route,)
+    target = await handler.transfer_route_ownership(
+        capture,
+        transfer_id="migration:routes",
+        target_owner_id="target-runtime",
+    )
+    assert target is not None and ownership.released == []
+
+    await handler(
+        OptimStepRequest(
+            run_id="run",
+            request_id="optim",
+            sequence_id=1,
+            optimizer=AdamConfig(learning_rate=1e-5),
+        ),
+        _operation("optim", "optim_step", 1, output=1),
+        ("fb",),
+    )
+    assert ownership.released == [("source", "fb")]
+    await ownership.release(target)
 
 
 @pytest.mark.asyncio

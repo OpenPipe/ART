@@ -26,6 +26,7 @@ from .optimizer_state import (
     read_committed_optimizer_pointer,
     resolve_committed_optimizer_policy,
 )
+from .route_retention import RouteBundleOwnershipProvider
 from .runtime.build import build_trainer_runtime_spec
 from .runtime.specs import TrainerGeneration, TrainerRuntimeSpec
 from .runtime_config import init_megatron_runtime_config
@@ -137,6 +138,7 @@ async def launch_megatron_slot(
     *,
     launch: ArtLaunchContext | None = None,
     route_bundle_reader: RouteBundleReader | None = None,
+    route_bundle_ownership: RouteBundleOwnershipProvider | None = None,
     resources: MegatronSlotResourceManager | None = None,
 ) -> MegatronSlotRuntime:
     """Start one shared trainer and return its only service-facing command root."""
@@ -175,6 +177,7 @@ async def launch_megatron_slot(
             trainer,
             resources=resources,
             schedule=config.schedule,
+            route_ownership=route_bundle_ownership,
         )
         runtime.register_closeable(coordinator)
     except BaseException:

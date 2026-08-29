@@ -34,6 +34,10 @@ from .operation_handler import (
     MegatronOperationHandler,
     MegatronSamplerPublicationReceipt,
 )
+from .route_retention import (
+    RouteBundleOwnershipProvider,
+    RouteBundleOwnershipTransfer,
+)
 from .runtime.portable_snapshot import (
     PortableSnapshotArchive,
     PortableSnapshotExportReceipt,
@@ -275,11 +279,13 @@ class MegatronSlotCoordinator:
         *,
         resources: MegatronSlotResourceManager | None = None,
         schedule: MegatronSlotScheduleConfig | None = None,
+        route_ownership: RouteBundleOwnershipProvider | None = None,
     ) -> None:
         self.runtime = runtime
         self.trainer = trainer
         self.resources = resources or InlineMegatronSlotResources()
         self.schedule = schedule or MegatronSlotScheduleConfig()
+        self.route_ownership = route_ownership
         self._runs: dict[str, _RunState] = {}
         self._ready: list[_ReadyCommand] = []
         self._deficit: dict[str, int] = {}
@@ -413,6 +419,7 @@ class MegatronSlotCoordinator:
                 self.trainer,
                 config,
                 checkpoints=checkpoints,
+                route_ownership=self.route_ownership,
             )
             scheduled = _ScheduledRunHandler(self, config.run_id)
             worker = _SlotOperationWorker(
@@ -658,13 +665,79 @@ class MegatronSlotCoordinator:
 
         async with self._condition:
             state = self._runs.get(run_id)
-            if state is None or state.migration_fence_id != fence_id or state.draining:
+            if (
+                state is None
+                or state.migration_fence_id != fence_id
+                or state.draining
+                or state.preparing
+            ):
                 raise RuntimeError("migration fence is absent or changed")
             state.migration_fence = None
             state.migration_fence_id = None
             self._resumed_migration_fences[(run_id, fence_id)] = None
             self._bound_migration_tombstones(self._resumed_migration_fences)
             self._condition.notify_all()
+
+    async def transfer_migration_route_ownership(
+        self,
+        fence: MegatronMigrationFence,
+        *,
+        transfer_id: str,
+        target_owner_id: str,
+    ) -> tuple[RouteBundleOwnershipTransfer, ...]:
+        """Retain exact open-suffix routes for a migration target owner."""
+
+        async with self._condition:
+            state = self._runs.get(fence.run_id)
+            if (
+                state is None
+                or state.draining
+                or state.migration_fence != fence
+                or state.migration_fence_id != fence.fence_id
+                or state.preparing
+            ):
+                raise RuntimeError("migration fence is absent, changed, or active")
+            state.preparing += 1
+        transfers: list[RouteBundleOwnershipTransfer] = []
+        try:
+            for contribution in fence.open_contributions:
+                handle = await state.handler.transfer_route_ownership(
+                    contribution.packed_input,
+                    transfer_id=transfer_id,
+                    target_owner_id=target_owner_id,
+                )
+                if handle is not None:
+                    transfers.append(
+                        RouteBundleOwnershipTransfer(
+                            operation_id=contribution.operation_id,
+                            packed_input=contribution.packed_input,
+                            handle=handle,
+                        )
+                    )
+            async with self._condition:
+                if (
+                    self._runs.get(fence.run_id) is not state
+                    or state.migration_fence != fence
+                ):
+                    raise RuntimeError("migration source changed during route transfer")
+            return tuple(transfers)
+        except BaseException as error:
+            provider = self.route_ownership
+            if provider is not None:
+                for transfer in reversed(transfers):
+                    try:
+                        await provider.release(transfer.handle)
+                    except BaseException as cleanup_error:
+                        error.add_note(
+                            "route transfer rollback also failed: "
+                            f"{type(cleanup_error).__name__}: {cleanup_error}"
+                        )
+            raise
+        finally:
+            async with self._condition:
+                if self._runs.get(fence.run_id) is state:
+                    state.preparing -= 1
+                self._condition.notify_all()
 
     async def install_migration_run(
         self,
@@ -852,6 +925,7 @@ class MegatronSlotCoordinator:
                 state.migration_fence_id != fence.fence_id
                 or state.migration_fence != fence
                 or state.draining
+                or state.preparing
             ):
                 raise RuntimeError("migration fence is absent, changed, or releasing")
             state.draining = True

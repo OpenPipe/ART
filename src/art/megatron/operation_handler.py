@@ -41,7 +41,12 @@ from art.training import (
     UsageMeasurement,
     bootstrap_operation_worker,
 )
+from art.vllm_route_transport import RetainedRouteBundleRef
 
+from .route_retention import (
+    RouteBundleOwnershipHandle,
+    RouteBundleOwnershipProvider,
+)
 from .runtime.specs import (
     CurrentTrainConfig,
     ExperimentalTrainConfig,
@@ -241,6 +246,8 @@ class _CapturedInput:
     control_fingerprint: str
     packed: DistributedPackedBatch
     packing: PackingOutcome
+    route_ownership: RouteBundleOwnershipHandle | None = None
+    packed_released: bool = False
     owners: set[str] = field(default_factory=set)
     retained_for_replay: bool = False
 
@@ -273,6 +280,7 @@ class MegatronOperationHandler:
         config: MegatronOperationConfig,
         *,
         checkpoints: MegatronCheckpointOperations | None = None,
+        route_ownership: RouteBundleOwnershipProvider | None = None,
     ) -> None:
         if config.source.training_session_id != config.training_session_id:
             raise ValueError("source generation belongs to another training session")
@@ -280,6 +288,7 @@ class MegatronOperationHandler:
         self.trainer = trainer
         self.config = config
         self.checkpoints = checkpoints
+        self.route_ownership = route_ownership
         self._generation = config.source
         self._optimizer_state_path = config.optimizer_state_path
         self._captures: dict[str, _CapturedInput] = {}
@@ -349,30 +358,51 @@ class MegatronOperationHandler:
                     "retained packed-input capacity is exhausted",
                     usage=CommandExecutionUsage.no_work(),
                 )
-            packed = await self.runtime.pack(self._packing_request(request, operation))
-            if packed is None:
-                raise ValueError("training input produced no packed sequence")
-            packing = self._packing_outcome(packed, request)
-            ref = PackedInputCaptureRef(
-                run_id=operation.run_id,
-                capture_id=capture_id,
-                manifest_sha256=_capture_manifest_sha256(
-                    operation, packed, packing, fingerprint
-                ),
-                content_sha256=packed.leases.ref.content_sha256,
-                input_kind="rl",
-                min_source_version=request.batch.min_source_version,
-                max_source_version=request.batch.max_source_version,
-            )
-            if request.retain_packed_input and ref.content_sha256 is None:
-                await self.runtime.release_batch(packed)
-                raise RuntimeError("replayable packed input has no content digest")
+            bundles = retained_route_bundles_from_bundles(request.batch.groups)
+            ownership = await self._acquire_route_ownership(operation, bundles)
+            packed = None
+            try:
+                packed = await self.runtime.pack(
+                    self._packing_request(
+                        request,
+                        operation,
+                        retained_route_bundles=bundles,
+                    )
+                )
+                if packed is None:
+                    raise ValueError("training input produced no packed sequence")
+                packing = self._packing_outcome(packed, request)
+                ref = PackedInputCaptureRef(
+                    run_id=operation.run_id,
+                    capture_id=capture_id,
+                    manifest_sha256=_capture_manifest_sha256(
+                        operation, packed, packing, fingerprint
+                    ),
+                    content_sha256=packed.leases.ref.content_sha256,
+                    input_kind="rl",
+                    min_source_version=request.batch.min_source_version,
+                    max_source_version=request.batch.max_source_version,
+                )
+                if request.retain_packed_input and ref.content_sha256 is None:
+                    raise RuntimeError("replayable packed input has no content digest")
+            except BaseException as error:
+                if packed is not None:
+                    try:
+                        await self.runtime.release_batch(packed)
+                    except BaseException as cleanup_error:
+                        error.add_note(
+                            "packed-input cleanup also failed: "
+                            f"{type(cleanup_error).__name__}: {cleanup_error}"
+                        )
+                await self._release_route_ownership(ownership, error)
+                raise
             self._captures[capture_id] = _CapturedInput(
                 ref=ref,
                 request_fingerprint=fingerprint,
                 control_fingerprint=_input_control_fingerprint(request, operation),
                 packed=packed,
                 packing=packing,
+                route_ownership=ownership,
                 retained_for_replay=request.retain_packed_input,
             )
             return ref
@@ -469,6 +499,33 @@ class MegatronOperationHandler:
     async def retry_releases(self) -> None:
         for capture_id in tuple(self._release_failures):
             await self._release_if_unowned(capture_id)
+
+    async def transfer_route_ownership(
+        self,
+        ref: PackedInputCaptureRef,
+        *,
+        transfer_id: str,
+        target_owner_id: str,
+    ) -> RouteBundleOwnershipHandle | None:
+        """Create a target owner while preserving this capture's source lease."""
+
+        if not transfer_id or not target_owner_id:
+            raise ValueError("route ownership transfer identities must not be empty")
+        captured = await self._require_capture(ref, None)
+        handle = captured.route_ownership
+        if handle is None:
+            return None
+        provider = self.route_ownership
+        if provider is None:
+            raise RuntimeError("retained route ownership provider is absent")
+        target = await provider.transfer(
+            handle,
+            transfer_id=transfer_id,
+            target_owner_id=target_owner_id,
+        )
+        if target is None:
+            raise RuntimeError("retained route ownership transfer returned no handle")
+        return target
 
     def retained_contribution_inputs(
         self,
@@ -673,17 +730,63 @@ class MegatronOperationHandler:
         if captured is None or captured.owners or captured.retained_for_replay:
             return
         try:
-            await self.runtime.release_batch(captured.packed)
+            if not captured.packed_released:
+                await self.runtime.release_batch(captured.packed)
+                captured.packed_released = True
+            await self._release_route_ownership(captured.route_ownership)
+            captured.route_ownership = None
         except BaseException as error:
             self._release_failures[capture_id] = error
             return
         self._release_failures.pop(capture_id, None)
         self._captures.pop(capture_id, None)
 
+    async def _acquire_route_ownership(
+        self,
+        operation: OperationRef,
+        bundles: tuple[RetainedRouteBundleRef, ...],
+    ) -> RouteBundleOwnershipHandle | None:
+        if not bundles:
+            return None
+        provider = self.route_ownership
+        if provider is None:
+            raise OperationExecutionError(
+                "execution_failed",
+                "retained route ownership is not configured",
+                usage=CommandExecutionUsage.no_work(),
+            )
+        handle = await provider.acquire(operation=operation, bundles=bundles)
+        if handle is None:
+            raise RuntimeError(
+                "retained route ownership acquisition returned no handle"
+            )
+        return handle
+
+    async def _release_route_ownership(
+        self,
+        handle: RouteBundleOwnershipHandle | None,
+        primary: BaseException | None = None,
+    ) -> None:
+        if handle is None:
+            return
+        provider = self.route_ownership
+        if provider is None:
+            raise RuntimeError("retained route ownership provider is absent")
+        try:
+            await provider.release(handle)
+        except BaseException as error:
+            if primary is None:
+                raise
+            primary.add_note(
+                f"route ownership cleanup also failed: {type(error).__name__}: {error}"
+            )
+
     def _packing_request(
         self,
         request: ForwardRequest | ForwardBackwardRequest,
         operation: OperationRef,
+        *,
+        retained_route_bundles: tuple[RetainedRouteBundleRef, ...],
     ) -> PackingRequest:
         assert isinstance(request.batch, RlTrajectoryBatch)
         experimental = _experimental_config(request)
@@ -691,9 +794,7 @@ class MegatronOperationHandler:
             model=self.config.rollout_model,
             generation_id=operation.operation_id,
             trajectory_groups=request.batch.groups,
-            retained_route_bundles=retained_route_bundles_from_bundles(
-                request.batch.groups
-            ),
+            retained_route_bundles=retained_route_bundles,
             advantage_balance=experimental.advantage_balance,
             allow_training_without_logprobs=bool(
                 experimental.allow_training_without_logprobs
@@ -754,10 +855,15 @@ def bootstrap_megatron_operation_worker(
     config: MegatronOperationConfig,
     *,
     checkpoints: MegatronCheckpointOperations | None = None,
+    route_ownership: RouteBundleOwnershipProvider | None = None,
     max_retained_operations: int = 128,
 ) -> MegatronOperationRuntime:
     handler = MegatronOperationHandler(
-        runtime, trainer, config, checkpoints=checkpoints
+        runtime,
+        trainer,
+        config,
+        checkpoints=checkpoints,
+        route_ownership=route_ownership,
     )
     return MegatronOperationRuntime(
         handler=handler,
