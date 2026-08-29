@@ -7,9 +7,6 @@ import time
 from typing import TYPE_CHECKING, Any, AsyncIterator, Iterable, Literal, cast
 import warnings
 
-from openai._types import NOT_GIVEN
-from tqdm import auto as tqdm
-
 from art.adapter_leases import pin_inference_step, pinned_inference_step
 from art.serverless.client import Client
 
@@ -27,7 +24,6 @@ from ..metrics_taxonomy import (
 from ..trajectories import Trajectory, TrajectoryGroup
 from ..types import (
     ServerlessTrainResult,
-    SFTMetricLoggingConfig,
     TrainConfig,
     TrainSFTConfig,
 )
@@ -51,44 +47,6 @@ def _extract_step_from_wandb_artifact(artifact: "Artifact") -> int | None:
             except ValueError:
                 pass
     return None
-
-
-_UPSTREAM_TRAIN_METRIC_KEYS = {
-    "reward": "train/reward",
-    "reward_std_dev": "train/reward_std_dev",
-    "exception_rate": "train/exception_rate",
-    "policy_loss": "loss/train",
-    "loss": "loss/train",
-    "entropy": "loss/entropy",
-    "kl_div": "loss/kl_div",
-    "kl_policy_ref": "loss/kl_policy_ref",
-    "grad_norm": "loss/grad_norm",
-    "learning_rate": "loss/learning_rate",
-    "num_groups_submitted": "data/step_num_groups_submitted",
-    "num_groups_trainable": "data/step_num_groups_trainable",
-    "num_trajectories": "data/step_num_trajectories",
-    "num_trainable_tokens": "data/step_trainable_assistant_tokens",
-    "train_tokens": "data/step_trainable_assistant_tokens",
-    "num_datums": "data/step_num_datums",
-}
-
-
-def _canonicalize_upstream_metric_key(metric: str) -> str:
-    if "/" in metric:
-        return metric
-    if metric == "tokens_per_second":
-        return ""
-    if metric.startswith("group_metric_"):
-        return f"train/group/{metric[len('group_metric_') :]}"
-    return _UPSTREAM_TRAIN_METRIC_KEYS.get(metric, metric)
-
-
-def _canonicalize_upstream_metrics(metrics: dict[str, float]) -> dict[str, float]:
-    return {
-        canonical_key: float(value)
-        for key, value in metrics.items()
-        if (canonical_key := _canonicalize_upstream_metric_key(key))
-    }
 
 
 def _training_run_spec(model: AnyTrainableModel) -> "TrainingRunSpec":
@@ -137,7 +95,7 @@ class ServerlessBackend:
         self._retained_inputs: dict[str, list["PackedInputCaptureRef"]] = {}
 
     def logs_sft_metrics_remotely(self) -> bool:
-        return True
+        return False
 
     def pipeline_autotuner_inference_observer(self) -> Literal["rollout_supply"]:
         return "rollout_supply"
@@ -699,188 +657,119 @@ class ServerlessBackend:
         dev_config: dev.TrainSFTConfig,
         verbose: bool = False,
     ) -> AsyncIterator[dict[str, float]]:
-        """Train the model using supervised fine-tuning.
+        """Lower raw supervised trajectories through native split commands."""
+        del dev_config
 
-        For ServerlessBackend, this serializes trajectories to a JSONL file,
-        uploads it to W&B artifacts, and calls the SFT training API.
-
-        Args:
-            model: The trainable model to fine-tune.
-            trajectories: Iterable of Trajectory objects.
-            config: SFT configuration with batch size, learning rates, and assistant
-                turn selection.
-            dev_config: Developer configuration.
-            verbose: Whether to print detailed logs.
-
-        Yields:
-            Dictionary containing training metrics for each batch.
-        """
-        import json
-        import tempfile
-        import uuid
+        from art.training import (
+            AdamConfig,
+            ForwardBackwardRequest,
+            LossConfig,
+            OptimStepRequest,
+            SamplerPublication,
+            SaveWeightsForSamplerRequest,
+            SupervisedTrajectoryBatch,
+        )
 
         from ..utils.sft import resolve_sft_batch_size
 
-        assert model.id is not None, "Model ID is required"
-
-        # Get the user's default entity from W&B if not set
-        if model.entity is None:
-            api = wandb_sdk.api(api_key=self._client.api_key)
-            model.entity = api.default_entity
-
-        # Generate unique artifact name to avoid race conditions in distributed systems
-        artifact_id = uuid.uuid4().hex[:12]
-        artifact_name = f"{model._storage_name()}-sft-data-{artifact_id}"
-
-        if verbose:
-            print("Serializing trajectories to file (streaming)...")
-
-        # Serialize trajectories to a temporary JSONL file (streaming - no memory load)
-        num_trajectories = 0
-        with tempfile.NamedTemporaryFile(
-            mode="w", suffix=".jsonl", delete=False
-        ) as tmp_file:
-            for trajectory in trajectories:
-                # Convert trajectory to the expected JSONL format
-                line: dict[str, Any] = {
-                    "messages": trajectory.messages(),
-                }
-                if trajectory.tools:
-                    line["tools"] = trajectory.tools
-                tmp_file.write(json.dumps(line) + "\n")
-                num_trajectories += 1
-            tmp_file_path = tmp_file.name
-
-        if num_trajectories == 0:
-            if verbose:
-                print("No trajectories to train on")
-            import os
-
-            os.unlink(tmp_file_path)
+        values = list(trajectories)
+        if not values:
             return
+        batch_size = resolve_sft_batch_size(
+            batch_size=config.batch_size,
+            default_batch_size=2,
+        )
+        batches = [
+            values[index : index + batch_size]
+            for index in range(0, len(values), batch_size)
+        ]
+        learning_rates = (
+            [float(value) for value in config.learning_rate]
+            if isinstance(config.learning_rate, list)
+            else [float(config.learning_rate)] * len(batches)
+        )
+        if len(learning_rates) != len(batches):
+            raise ValueError("SFT learning-rate schedule must match batch count")
 
-        if verbose:
-            print(f"Serialized {num_trajectories} trajectories")
-
-        try:
-            if verbose:
-                print("Uploading training data to W&B artifacts...")
-
-            # Upload the file to W&B as a dataset artifact
-            # Use the model's canonical run_id from database, or fall back to model name
-            run = wandb_sdk.init(
-                name=model._storage_name(),
-                id=model.run_id or model._storage_name(),
-                entity=model.entity,
-                project=model.project,
-                resume="allow",  # Resume if this run already exists
-                settings=wandb_sdk.settings(api_key=self._client.api_key),
-            )
-            try:
-                artifact = wandb_sdk.artifact(
-                    artifact_name,
-                    type="dataset",
-                    metadata={
-                        "format": "jsonl",
-                        "num_trajectories": num_trajectories,
-                    },
+        client = await self.training_client(model)
+        rows: list[dict[str, float]] = []
+        operation_ids: list[str] = []
+        optimizer_result: Any | None = None
+        for batch, learning_rate in zip(batches, learning_rates, strict=True):
+            request_id = secrets.token_hex(16)
+            forward = await client.forward_backward(
+                ForwardBackwardRequest(
+                    run_id=client.run_id,
+                    request_id=f"fb-{request_id}",
+                    sequence_id=client.next_sequence_id,
+                    batch=SupervisedTrajectoryBatch(
+                        trajectories=tuple(batch),
+                        assistant_turns=config.assistant_turns,
+                    ),
+                    loss=LossConfig(name="cross_entropy"),
+                    return_token_logprobs=False,
                 )
-                artifact.add_file(tmp_file_path, name="train.jsonl")
-                artifact = run.log_artifact(artifact)
-                try:
-                    artifact = artifact.wait()
-                except ValueError as e:
-                    if "Unable to fetch artifact with id" in str(e):
-                        if verbose:
-                            print(f"Warning: {e}")
-                    else:
-                        raise e
-            finally:
-                # Finish the run so the workflow can resume it later
-                # The workflow uses wandb_run with resume="must" to continue this run
-                run.finish()
-        finally:
-            # Clean up temporary file
-            import os
-
-            os.unlink(tmp_file_path)
-
-        # Construct the artifact URL with unique name (v0 is the first version)
-        training_data_url = (
-            f"wandb-artifact:///{model.entity}/{model.project}/{artifact_name}:v0"
-        )
-
-        if verbose:
-            print(f"Training data uploaded. Artifact URL: {training_data_url}")
-            print("Starting SFT training job...")
-
-        # Create SFT training job
-        from .client import SFTTrainingConfig
-
-        sft_config: SFTTrainingConfig = {}
-        if config.batch_size != "auto":
-            batch_size = resolve_sft_batch_size(
-                batch_size=config.batch_size,
-                default_batch_size=2,
             )
-            sft_config["batch_size"] = batch_size
-        sft_config["learning_rate"] = config.learning_rate
-        sft_config["assistant_turns"] = config.assistant_turns
-        metric_logging = cast(
-            SFTMetricLoggingConfig,
-            dict(dev_config.get("metric_logging", {}) or {}),
-        )
-        if metric_logging.get("enabled"):
-            sft_config["metric_logging"] = metric_logging
+            operation_ids.append(forward.ref.operation_id)
+            forward_result = await forward.result()
+            if not forward_result.produced_gradient:
+                await forward.cancel()
+                continue
 
-        sft_training_job = await self._client.sft_training_jobs.create(
-            model_id=model.id,
-            training_data_url=training_data_url,
-            config=sft_config,
-        )
+            optimizer = await client.optim_step(
+                OptimStepRequest(
+                    run_id=client.run_id,
+                    request_id=f"optim-{request_id}",
+                    sequence_id=client.next_sequence_id,
+                    optimizer=AdamConfig(learning_rate=learning_rate),
+                )
+            )
+            operation_ids.append(optimizer.ref.operation_id)
+            optimizer_result = await optimizer.result()
+            rows.append(
+                {
+                    **forward_result.metrics,
+                    **optimizer_result.metrics,
+                    "data/step_num_trajectories": float(len(batch)),
+                    "data/step_trainable_assistant_tokens": float(
+                        forward_result.packing.trainable_assistant_tokens
+                    ),
+                }
+            )
 
-        # Poll for events
-        after: str | None = None
-        num_batches: int | None = None
-        pbar: tqdm.tqdm | None = None
-        while True:
-            await asyncio.sleep(1)
-            async for event in self._client.sft_training_jobs.events.list(
-                training_job_id=sft_training_job.id, after=after or NOT_GIVEN
-            ):
-                if event.type == "gradient_step":
-                    assert pbar is not None and num_batches is not None
-                    pbar.update(1)
-                    pbar.set_postfix(event.data)
-                    metrics = _canonicalize_upstream_metrics(
-                        {k: float(v) for k, v in event.data.items()}
-                    )
-                    yield {
-                        **metrics,
-                        "data/step_num_trajectories": float(num_trajectories),
-                        TRAIN_GRADIENT_STEPS_KEY: float(num_batches),
-                    }
-                elif event.type == "training_started":
-                    num_batches = event.data.get("num_sequences", 0)
-                    if pbar is None:
-                        pbar = tqdm.tqdm(total=num_batches, desc="train sft")
-                    continue
-                elif event.type == "training_ended":
-                    if pbar is not None:
-                        pbar.close()
-                    # Record provenance on the latest W&B artifact for SFT training.
-                    wandb_run = model._get_wandb_run()
-                    if wandb_run is not None:
-                        record_provenance(wandb_run, "serverless-sft")
-                    return
-                elif event.type == "training_failed":
-                    if pbar is not None:
-                        pbar.close()
-                    error_message = event.data.get(
-                        "error_message", "SFT training failed with an unknown error"
-                    )
-                    raise RuntimeError(f"SFT training job failed: {error_message}")
-                after = event.id
+        if optimizer_result is None:
+            return
+        publication_mode = (
+            "in_flight_lora"
+            if (model._internal_config or {}).get("rollout_weight_update_mode")
+            == "in_flight_lora"
+            else "versioned_lora"
+        )
+        publication = await client.save_weights_for_sampler(
+            SaveWeightsForSamplerRequest(
+                run_id=client.run_id,
+                request_id=f"publish-{secrets.token_hex(16)}",
+                sequence_id=client.next_sequence_id,
+                checkpoint_name=f"step-{optimizer_result.checkpoint.learner_version}",
+                publication=SamplerPublication(
+                    mode=publication_mode,
+                    model_alias=model.name,
+                ),
+            )
+        )
+        operation_ids.append(publication.ref.operation_id)
+        publication_result = await publication.result()
+        key = model._storage_name()
+        self._native_steps[key] = optimizer_result.checkpoint.learner_version
+        self._native_artifacts[key] = publication_result.lora
+        wandb_run = model._get_wandb_run()
+        if wandb_run is not None:
+            record_provenance(wandb_run, "serverless-sft")
+        if verbose:
+            print(f"Native SFT operations: {', '.join(operation_ids)}")
+        for row in rows:
+            row[TRAIN_GRADIENT_STEPS_KEY] = float(len(rows))
+            yield row
 
     # ------------------------------------------------------------------
     # Experimental support for S3 and checkpoints
