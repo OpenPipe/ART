@@ -178,6 +178,7 @@ class _RunState:
     handler: MegatronOperationHandler
     worker: _SlotOperationWorker
     draining: bool = False
+    maintenance: bool = False
     preparing: int = 0
     worker_calls: int = 0
     migration_fence_id: str | None = None
@@ -570,16 +571,20 @@ class MegatronSlotCoordinator:
         worker: _SlotOperationWorker,
     ) -> None:
         async with self._condition:
-            state = self._runs.get(run_id)
-            if (
-                state is None
-                or state.worker is not worker
-                or state.draining
-                or state.migration_fence_id is not None
-                or state.migration_restore_id is not None
-                or self._closed
-            ):
-                raise KeyError(f"Megatron slot run {run_id!r} is unavailable")
+            while True:
+                state = self._runs.get(run_id)
+                if (
+                    state is None
+                    or state.worker is not worker
+                    or state.draining
+                    or state.migration_fence_id is not None
+                    or state.migration_restore_id is not None
+                    or self._closed
+                ):
+                    raise KeyError(f"Megatron slot run {run_id!r} is unavailable")
+                if not state.maintenance:
+                    break
+                await self._condition.wait()
             state.worker_calls += 1
 
     async def _leave_worker_call(
@@ -611,6 +616,10 @@ class MegatronSlotCoordinator:
                 raise KeyError(f"Megatron slot run {run_id!r} is unavailable")
             if state.draining:
                 raise RuntimeError("Megatron slot run is draining")
+            while state.maintenance:
+                await self._condition.wait()
+                if self._runs.get(run_id) is not state or state.draining:
+                    raise RuntimeError("Megatron slot run changed while waiting")
             if state.migration_fence_id not in {None, fence_id}:
                 raise RuntimeError("another migration fence owns this run")
             if state.migration_fence is not None:
@@ -659,6 +668,40 @@ class MegatronSlotCoordinator:
             state.migration_fence = fence
             self._condition.notify_all()
             return fence
+
+    async def release_retained_input(self, ref: PackedInputCaptureRef) -> None:
+        """Release one replay capture after its durable recovery coverage."""
+
+        async with self._condition:
+            state = self._runs.get(ref.run_id)
+            if (
+                state is None
+                or state.draining
+                or state.maintenance
+                or state.migration_fence_id is not None
+                or state.migration_restore_id is not None
+            ):
+                raise RuntimeError("Megatron slot run is unavailable for input release")
+            state.maintenance = True
+            try:
+                while (
+                    state.preparing
+                    or state.worker_calls
+                    or self._active_run_id == ref.run_id
+                    or any(item.run_id == ref.run_id for item in self._ready)
+                ):
+                    await self._condition.wait()
+            except BaseException:
+                state.maintenance = False
+                self._condition.notify_all()
+                raise
+        try:
+            await state.handler.discard_prepared_input(ref)
+        finally:
+            async with self._condition:
+                if self._runs.get(ref.run_id) is state:
+                    state.maintenance = False
+                self._condition.notify_all()
 
     async def resume_migration_source(self, run_id: str, fence_id: str) -> None:
         """Abort a migration before activation and reopen the unchanged source run."""
@@ -987,7 +1030,8 @@ class MegatronSlotCoordinator:
                 raise RuntimeError("abort a restoring migration before draining")
             state.draining = True
             while (
-                state.preparing
+                state.maintenance
+                or state.preparing
                 or state.worker_calls
                 or self._active_run_id == run_id
                 or any(item.run_id == run_id for item in self._ready)

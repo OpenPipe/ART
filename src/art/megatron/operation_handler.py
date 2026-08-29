@@ -292,6 +292,7 @@ class MegatronOperationHandler:
         self._generation = config.source
         self._optimizer_state_path = config.optimizer_state_path
         self._captures: dict[str, _CapturedInput] = {}
+        self._released_captures: dict[str, PackedInputCaptureRef] = {}
         self._contributions: dict[str, str] = {}
         self._capture_lock = asyncio.Lock()
         self._release_failures: dict[str, BaseException] = {}
@@ -352,6 +353,8 @@ class MegatronOperationHandler:
                 if prior.request_fingerprint != fingerprint:
                     raise RuntimeError("packed-input operation was reused")
                 return prior.ref
+            if capture_id in self._released_captures:
+                raise RuntimeError("packed-input operation was already released")
             if len(self._captures) >= self.config.max_retained_inputs:
                 raise OperationExecutionError(
                     "capacity_exhausted",
@@ -487,7 +490,13 @@ class MegatronOperationHandler:
         await self._release_if_unowned(capture_id)
 
     async def discard_prepared_input(self, ref: PackedInputCaptureRef) -> None:
-        captured = await self._require_capture(ref, None)
+        captured = self._captures.get(ref.capture_id)
+        if captured is None:
+            if self._released_captures.get(ref.capture_id) == ref:
+                return
+            raise ValueError("packed-input capture is absent or changed")
+        if captured.ref != ref or ref.run_id != self.config.run_id:
+            raise ValueError("packed-input capture is absent or changed")
         if captured.owners:
             raise RuntimeError("cannot discard packed input owned by an operation")
         captured.retained_for_replay = False
@@ -740,6 +749,9 @@ class MegatronOperationHandler:
             return
         self._release_failures.pop(capture_id, None)
         self._captures.pop(capture_id, None)
+        self._released_captures[capture_id] = captured.ref
+        while len(self._released_captures) > self.config.max_retained_inputs:
+            self._released_captures.pop(next(iter(self._released_captures)))
 
     async def _acquire_route_ownership(
         self,

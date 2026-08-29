@@ -621,6 +621,7 @@ async def test_replay_capture_survives_optimizer_until_explicit_release() -> Non
     )
     assert runtime.released == []
     await handler.discard_prepared_input(capture)
+    await handler.discard_prepared_input(capture)
     assert runtime.released == [runtime.packed]
 
 
