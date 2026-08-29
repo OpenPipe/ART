@@ -90,6 +90,7 @@ async def test_failure_stops_whole_gang_before_callback_and_restarts_generation(
         monitor_interval_s=60,
     )
     await manager.start()
+    initial_credentials = manager.dispatch_credentials
     launchers["host1"].failed = True
 
     await manager.poll()
@@ -112,6 +113,11 @@ async def test_failure_stops_whole_gang_before_callback_and_restarts_generation(
     assert restarted.phase == "ready"
     assert restarted.generation == 1
     assert restarted.generation_digest != failures[0].generation_digest
+    assert manager.dispatch_credentials.target_id == restarted.generation_digest
+    assert (
+        manager.dispatch_credentials.authorization_token
+        != initial_credentials.authorization_token
+    )
     for launcher in launchers.values():
         assert [request.launch_config.port for request in launcher.requests] == [
             8000,

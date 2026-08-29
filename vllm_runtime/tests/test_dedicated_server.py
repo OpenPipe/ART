@@ -2,6 +2,7 @@ from http.client import HTTPConnection
 import json
 import os
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 from art_vllm_runtime import dedicated_server
 from art_vllm_runtime.fast_metrics import FAST_METRIC_NAMES, FastMetricsSidecar
@@ -143,7 +144,8 @@ def test_fast_metrics_url_uses_controller_routable_host(monkeypatch) -> None:
             dedicated_server._fast_metrics_url(request)
 
 
-def test_serving_profile_reports_resolved_runtime_geometry(monkeypatch) -> None:
+@pytest.mark.asyncio
+async def test_serving_profile_reports_resolved_runtime_geometry(monkeypatch) -> None:
     identity = {
         "base_model": "test/model",
         "model_identifier": "test/model",
@@ -165,6 +167,16 @@ def test_serving_profile_reports_resolved_runtime_geometry(monkeypatch) -> None:
     )
     monkeypatch.setitem(dedicated_server._runtime_state, "route_capture", True)
     engine = SimpleNamespace(
+        engine_core=SimpleNamespace(
+            call_utility_async=AsyncMock(
+                return_value={
+                    "kv_block_size": 16,
+                    "kv_block_bytes_per_rank": 65_536,
+                    "kv_capacity_blocks_per_rank": 4096,
+                    "kv_capacity_bytes_per_rank": 268_435_456,
+                }
+            )
+        ),
         vllm_config=SimpleNamespace(
             model_config=SimpleNamespace(
                 model="test/model",
@@ -199,16 +211,92 @@ def test_serving_profile_reports_resolved_runtime_geometry(monkeypatch) -> None:
                 lora_dtype="bfloat16",
             ),
             speculative_config=SimpleNamespace(method="mtp"),
-        )
+        ),
     )
 
-    profile = ServingProfile.model_validate(dedicated_server._serving_profile(engine))
+    profile = ServingProfile.model_validate(
+        await dedicated_server._serving_profile(engine)
+    )
 
     assert profile.identity.model_identifier == "test/model"
     assert profile.tensor_parallel_size == 2
     assert profile.quantization == "fp8"
     assert profile.multi_token_prediction
+    assert profile.kv_block_bytes_per_rank == 65_536
+    assert profile.kv_capacity_bytes_per_rank == 268_435_456
     assert profile.route_capture_format == "art_inference_route_bundle_v1"
+
+
+def test_private_dispatch_uses_distinct_auth_and_fences_runtime_target(
+    monkeypatch,
+) -> None:
+    from starlette.requests import Request
+
+    monkeypatch.setattr(dedicated_server, "_auth_tokens", ["public-token"])
+    monkeypatch.setattr(dedicated_server, "_private_dispatch_token", "p" * 32)
+    monkeypatch.setattr(dedicated_server, "_runtime_target_id", "a" * 64)
+
+    app = FastAPI()
+    app.get("/v1/models")(lambda: {"ok": True})
+    app.get("/art/state")(lambda: {"ok": True})
+    app.post(dedicated_server._PRIVATE_DISPATCH_PATH)(lambda: {"ok": True})
+    middleware = dedicated_server._ArtAuthenticationMiddleware(app)
+
+    async def authenticated_app(scope, receive, send):
+        await middleware(scope, receive, send)
+
+    client = TestClient(authenticated_app)
+    assert client.get("/v1/models").status_code == 401
+    assert (
+        client.get(
+            "/v1/models", headers={"Authorization": "Bearer public-token"}
+        ).status_code
+        == 200
+    )
+    assert client.get("/art/state").status_code == 401
+    assert (
+        client.get(
+            "/art/state", headers={"Authorization": "Bearer public-token"}
+        ).status_code
+        == 200
+    )
+    assert (
+        client.post(
+            dedicated_server._PRIVATE_DISPATCH_PATH,
+            headers={"Authorization": "Bearer public-token"},
+        ).status_code
+        == 401
+    )
+    assert (
+        client.post(
+            dedicated_server._PRIVATE_DISPATCH_PATH,
+            headers={"Authorization": "Bearer " + "p" * 32},
+        ).status_code
+        == 200
+    )
+
+    scope = {
+        "type": "http",
+        "method": "POST",
+        "path": dedicated_server._PRIVATE_DISPATCH_PATH,
+        "headers": [
+            (b"authorization", b"Bearer " + b"p" * 32),
+            (b"x-art-runtime-target", b"a" * 64),
+            (b"x-art-request-identity", b"b" * 64),
+            (b"x-art-cache-identity", b"c" * 64),
+        ],
+    }
+    request = Request(scope)
+
+    assert dedicated_server._verify_bearer(request.headers, "p" * 32)
+    assert dedicated_server._private_dispatch_context(request) == (
+        "b" * 64,
+        "c" * 64,
+    )
+    scope["headers"][1] = (b"x-art-runtime-target", b"d" * 64)
+    stale = dedicated_server._private_dispatch_context(Request(scope))
+    assert stale.status_code == 409
+    assert b'"execution":"not_started"' in stale.body
 
 
 def test_runtime_sleep_route_returns_engine_validation_error(monkeypatch) -> None:

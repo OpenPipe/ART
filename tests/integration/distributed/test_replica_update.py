@@ -69,6 +69,7 @@ def manager(*, engine_args: dict[str, object] | None = None) -> ReplicaManager:
             for member in reversed(members)
         ),
     )
+    value._private_dispatch_token = "private-dispatch-token" * 2
     return value
 
 
@@ -154,6 +155,8 @@ def test_launch_preserves_user_args_and_owns_native_gang_topology() -> None:
     assert leader.host == "10.0.0.1" and not leader.headless
     assert follower.host == "127.0.0.1" and follower.headless
     assert leader.nnodes == follower.nnodes == 2
+    assert leader.runtime_target_id == follower.runtime_target_id
+    assert leader.private_dispatch_token == follower.private_dispatch_token
     assert "kv_events_config" not in leader.engine_args
 
 

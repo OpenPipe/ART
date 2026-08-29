@@ -15,7 +15,9 @@ def apply_vllm_runtime_patches() -> None:
     )
     from art_vllm_runtime.policy_spans import patch_policy_token_spans
     from art_vllm_runtime.qwen35_patches import apply_qwen35_vllm_runtime_patches
+    from art_vllm_runtime.runtime_geometry import patch_runtime_geometry
 
+    patch_runtime_geometry()
     patch_policy_token_spans()
     patch_gemma4_moe_lora_support()
     subclass_chat_completion_request()

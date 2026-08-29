@@ -87,6 +87,8 @@ class VllmRuntimeLaunchConfig(BaseModel):
     headless: bool = False
     replica_generation: int = Field(default=0, ge=0)
     process_uuid: str | None = None
+    runtime_target_id: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    private_dispatch_token: str | None = Field(default=None, min_length=32, repr=False)
     update_identity: str | None = None
     initial_generation_id: str | None = Field(default=None, min_length=1)
     initial_policy_version: int | None = Field(default=None, ge=0)
@@ -110,6 +112,10 @@ class VllmRuntimeLaunchConfig(BaseModel):
         ):
             raise ValueError(
                 "initial_generation_id and initial_policy_version must be set together"
+            )
+        if (self.runtime_target_id is None) != (self.private_dispatch_token is None):
+            raise ValueError(
+                "runtime_target_id and private_dispatch_token must be set together"
             )
         if self.node_rank >= self.nnodes:
             raise ValueError("node_rank must be smaller than nnodes")
@@ -386,6 +392,8 @@ class ManagedVllmRuntime:
         env.pop("VLLM_API_KEY", None)
         if self.api_key is not None:
             env["VLLM_API_KEY"] = self.api_key
+        if launch_config.private_dispatch_token is not None:
+            env["ART_PRIVATE_DISPATCH_TOKEN"] = launch_config.private_dispatch_token
         self.process = subprocess.Popen(
             managed_process_cmd(cmd),
             cwd=str(_vllm_runtime_subprocess_cwd(cmd)),
@@ -916,6 +924,8 @@ def build_vllm_runtime_server_cmd(config: VllmRuntimeLaunchConfig) -> list[str]:
                 f"--process-uuid={config.process_uuid}",
             ]
         )
+    if config.runtime_target_id is not None:
+        command.append(f"--runtime-target-id={config.runtime_target_id}")
     if config.update_identity is not None:
         command.append(f"--update-identity={config.update_identity}")
     if config.initial_generation_id is not None:

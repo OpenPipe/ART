@@ -23,6 +23,7 @@ from art.distributed.vllm_replica import (
     ReplicaUpdateReport,
 )
 from art.serving_capabilities import (
+    PairedInferenceEndpoint,
     ServingCapabilities,
     ServingProfileIdentity,
     discover_serving_capabilities,
@@ -163,6 +164,7 @@ class DistributedMegatronService:
         self._managed_service_name: str | None = None
         self._base_url: str | None = None
         self._serving_capabilities: ServingCapabilities | None = None
+        self._paired_inference_endpoint: PairedInferenceEndpoint | None = None
         self._api_key_value: str | None = None
         self._current_lora_name: str | None = None
         self._vllm_sleeping = False
@@ -1630,6 +1632,7 @@ class DistributedMegatronService:
                 managed_service_name=None,
                 base_url=base_url,
                 capabilities=capabilities,
+                paired_inference_endpoint=None,
                 api_key=api_key,
                 current_lora_name=lora_name,
                 serving_step=step,
@@ -1685,6 +1688,9 @@ class DistributedMegatronService:
             )
             if manager.verify_update(report).phase != "ready":
                 raise RuntimeError("model service rejected its initial policy")
+            paired_inference_endpoint = self._paired_inference_target(
+                base_url, capabilities, manager
+            )
         except BaseException as error:
             cleanup = await self._rollback_server_start_safely(service.name)
             if cleanup:
@@ -1696,6 +1702,7 @@ class DistributedMegatronService:
             managed_service_name=service.name,
             base_url=base_url,
             capabilities=capabilities,
+            paired_inference_endpoint=paired_inference_endpoint,
             api_key=api_key,
             current_lora_name=template.served_model_name,
             serving_step=step,
@@ -1708,6 +1715,7 @@ class DistributedMegatronService:
         managed_service_name: str | None,
         base_url: str,
         capabilities: ServingCapabilities,
+        paired_inference_endpoint: PairedInferenceEndpoint | None,
         api_key: str | None,
         current_lora_name: str,
         serving_step: int,
@@ -1715,6 +1723,7 @@ class DistributedMegatronService:
         self._managed_service_name = managed_service_name
         self._base_url = base_url
         self._serving_capabilities = capabilities
+        self._paired_inference_endpoint = paired_inference_endpoint
         self._api_key_value = api_key
         self._current_lora_name = current_lora_name
         self._serving_step = serving_step
@@ -1727,6 +1736,7 @@ class DistributedMegatronService:
     def _unpublish_serving_state(self) -> None:
         self._base_url = None
         self._serving_capabilities = None
+        self._paired_inference_endpoint = None
         self._api_key_value = None
         self._current_lora_name = None
         self._loaded_adapter_steps.clear()
@@ -1820,6 +1830,11 @@ class DistributedMegatronService:
             )
             if manager.verify_update(report).phase != "ready":
                 raise RuntimeError("restarted vLLM replica rejected current policy")
+            self._serving_capabilities = capability
+            if self._paired_inference_endpoint is not None:
+                self._paired_inference_endpoint = self._paired_inference_target(
+                    base_url, capability, manager
+                )
             if current_lora_name != bootstrap_name:
                 await self._unload_adapter_at(bootstrap_name, base_url)
             for step in exact_steps:
@@ -1867,6 +1882,30 @@ class DistributedMegatronService:
                 f"runtime topology has no unique service {self.model_name!r}"
             )
         return services[0]
+
+    def paired_inference_endpoint(self) -> PairedInferenceEndpoint:
+        endpoint = self._paired_inference_endpoint
+        if endpoint is None:
+            raise RuntimeError("paired inference endpoint is unavailable")
+        return endpoint
+
+    @staticmethod
+    def _paired_inference_target(
+        base_url: str,
+        capabilities: ServingCapabilities,
+        manager: Any,
+    ) -> PairedInferenceEndpoint:
+        profile = capabilities.profile
+        if profile is None:
+            raise RuntimeError("paired inference requires an exact serving profile")
+        credentials = manager.dispatch_credentials
+        return PairedInferenceEndpoint(
+            url=f"{base_url.rstrip('/')}/art/internal/v1/chat/completions",
+            target_id=credentials.target_id,
+            runtime_generation=credentials.runtime_generation,
+            authorization_token=credentials.authorization_token,
+            profile=profile,
+        )
 
     def _serving_profile_identity(self) -> ServingProfileIdentity:
         spec = self._runtime_spec()

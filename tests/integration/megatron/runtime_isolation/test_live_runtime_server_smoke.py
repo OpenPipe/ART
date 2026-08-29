@@ -8,6 +8,7 @@ import uuid
 import httpx
 import pytest
 
+from art.serving_capabilities import PairedInferenceEndpoint, ServingProfileIdentity
 import art.vllm_runtime as runtime
 
 torch = pytest.importorskip("torch")
@@ -57,6 +58,8 @@ async def test_external_runtime_server_live_smoke(
 
     port = _find_free_port()
     served_model_name = f"vllm-runtime-live-{uuid.uuid4().hex[:8]}"
+    runtime_target_id = "a" * 64
+    private_dispatch_token = "private-dispatch-token-" + uuid.uuid4().hex
     log_path = artifact_dir / "runtime.log"
     launch_config = runtime.VllmRuntimeLaunchConfig(
         base_model=os.environ.get("BASE_MODEL", DEFAULT_BASE_MODEL),
@@ -64,6 +67,24 @@ async def test_external_runtime_server_live_smoke(
         host="127.0.0.1",
         cuda_visible_devices=os.environ.get("CUDA_VISIBLE_DEVICES", "0"),
         served_model_name=served_model_name,
+        runtime_target_id=runtime_target_id,
+        private_dispatch_token=private_dispatch_token,
+        serving_profile_identity=ServingProfileIdentity(
+            base_model=os.environ.get("BASE_MODEL", DEFAULT_BASE_MODEL),
+            model_identifier=os.environ.get("BASE_MODEL", DEFAULT_BASE_MODEL),
+            model_revision="default",
+            model_support_key="live-smoke",
+            handler_name="live-smoke",
+            lora_rank=1,
+            lora_alpha=1,
+            lora_target_modules=("q_proj",),
+            trainer_dtype="bfloat16",
+            route_replay=False,
+            lora_transport="local",
+            retained_route_transport="none",
+            retained_route_max_bytes=0,
+            retained_route_max_bundles=0,
+        ),
         engine_args={
             "gpu_memory_utilization": _safe_gpu_memory_utilization(),
             "max_model_len": int(
@@ -76,6 +97,7 @@ async def test_external_runtime_server_live_smoke(
     command = runtime.build_vllm_runtime_server_cmd(launch_config)
     env = os.environ.copy()
     env["WANDB_MODE"] = "offline"
+    env["ART_PRIVATE_DISPATCH_TOKEN"] = private_dispatch_token
 
     with log_path.open("w", encoding="utf-8") as log_file:
         process = subprocess.Popen(
@@ -102,6 +124,38 @@ async def test_external_runtime_server_live_smoke(
             original_model_ids = [
                 model_info["id"] for model_info in models_response.json()["data"]
             ]
+            capabilities_response = await client.get("/art/capabilities")
+            capabilities_response.raise_for_status()
+            profile = capabilities_response.json()["profile"]
+            endpoint = PairedInferenceEndpoint(
+                url=f"{client.base_url}/art/internal/v1/chat/completions",
+                target_id=runtime_target_id,
+                runtime_generation=0,
+                authorization_token=private_dispatch_token,
+                profile=profile,
+            )
+            unauthorized = await client.post(
+                endpoint.url.path,
+                json={
+                    "model": served_model_name,
+                    "messages": [{"role": "user", "content": "Say hello."}],
+                    "max_tokens": 1,
+                },
+            )
+            stale_headers = endpoint.request_headers(
+                request_identity="b" * 64,
+                cache_identity="c" * 64,
+            )
+            stale_headers["x-art-runtime-target"] = "d" * 64
+            stale = await client.post(
+                endpoint.url.path,
+                headers=stale_headers,
+                json={
+                    "model": served_model_name,
+                    "messages": [{"role": "user", "content": "Say hello."}],
+                    "max_tokens": 1,
+                },
+            )
 
             sleep_response = await client.post(
                 "/sleep",
@@ -130,6 +184,22 @@ async def test_external_runtime_server_live_smoke(
             )
             completion_response.raise_for_status()
             completion = completion_response.json()
+            private_completion_response = await client.post(
+                endpoint.url.path,
+                headers=endpoint.request_headers(
+                    request_identity="e" * 64,
+                    cache_identity="f" * 64,
+                ),
+                json={
+                    "model": served_model_name,
+                    "messages": [{"role": "user", "content": "Say hello."}],
+                    "max_tokens": 8,
+                    "logprobs": True,
+                    "top_logprobs": 0,
+                },
+            )
+            private_completion_response.raise_for_status()
+            private_completion = private_completion_response.json()
 
         (artifact_dir / "runtime_smoke_result.json").write_text(
             json.dumps(
@@ -141,6 +211,13 @@ async def test_external_runtime_server_live_smoke(
                     "sleeping_after_wake": sleeping_after_wake,
                     "text": completion["choices"][0]["message"]["content"],
                     "has_logprobs": completion["choices"][0]["logprobs"] is not None,
+                    "kv_block_bytes_per_rank": profile["kv_block_bytes_per_rank"],
+                    "kv_capacity_bytes_per_rank": profile["kv_capacity_bytes_per_rank"],
+                    "private_text": private_completion["choices"][0]["message"][
+                        "content"
+                    ],
+                    "stale_status": stale.status_code,
+                    "unauthorized_status": unauthorized.status_code,
                 },
                 indent=2,
                 sort_keys=True,
@@ -152,6 +229,12 @@ async def test_external_runtime_server_live_smoke(
         assert sleeping_before_wake is True
         assert sleeping_after_wake is False
         assert completion["choices"][0]["logprobs"] is not None
+        assert profile["kv_block_bytes_per_rank"] > 0
+        assert profile["kv_capacity_bytes_per_rank"] > 0
+        assert unauthorized.status_code == 401
+        assert stale.status_code == 409
+        assert stale.json()["execution"] == "not_started"
+        assert private_completion["choices"][0]["logprobs"] is not None
     finally:
         process.terminate()
         try:

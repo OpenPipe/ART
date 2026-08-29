@@ -3,10 +3,12 @@
 import argparse
 import asyncio
 from functools import lru_cache
+import hmac
 from http import HTTPStatus
 from ipaddress import ip_address
 import json
 import os
+import re
 import socket
 from typing import Any
 import uuid
@@ -25,10 +27,17 @@ from art_vllm_runtime.binary_routes import (
 from art_vllm_runtime.fast_metrics import FastMetricsSidecar
 from art_vllm_runtime.patches import apply_vllm_runtime_patches
 
-ART_SERVING_PROTOCOL_VERSION = 6
+ART_SERVING_PROTOCOL_VERSION = 7
+_PRIVATE_CACHE_IDENTITY_HEADER = "x-art-cache-identity"
+_PRIVATE_DISPATCH_PATH = "/art/internal/v1/chat/completions"
+_PRIVATE_REQUEST_IDENTITY_HEADER = "x-art-request-identity"
+_RUNTIME_TARGET_HEADER = "x-art-runtime-target"
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _runtime_state: dict[str, object] = {}
 _auth_tokens: list[str] = []
 _fast_metrics_port: int | None = None
+_private_dispatch_token: str | None = None
+_runtime_target_id: str | None = None
 
 
 def _patch_prebound_listener_tcp_nodelay(api_server: Any) -> None:
@@ -90,7 +99,7 @@ def _config_string(value: Any) -> str:
     return str(raw).removeprefix("torch.")
 
 
-def _serving_profile(engine_client: Any) -> dict[str, Any] | None:
+async def _serving_profile(engine_client: Any) -> dict[str, Any] | None:
     identity = _runtime_state.get("serving_profile_identity")
     if identity is None:
         return None
@@ -110,8 +119,18 @@ def _serving_profile(engine_client: Any) -> dict[str, Any] | None:
         if speculative is None or speculative.method is None
         else _config_string(speculative.method)
     )
+    from art_vllm_runtime.engine_core import query_engine_cores
+
+    geometry_reports = await query_engine_cores(engine_client, "art_runtime_geometry")
+    if not geometry_reports or any(
+        report != geometry_reports[0] for report in geometry_reports[1:]
+    ):
+        raise RuntimeError("vLLM engine cores returned inconsistent KV geometry")
+    geometry = geometry_reports[0]
+    if not isinstance(geometry, dict):
+        raise RuntimeError("vLLM returned malformed KV geometry")
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "identity": identity,
         "runtime_model": model.model,
         "runtime_revision": model.revision,
@@ -131,7 +150,7 @@ def _serving_profile(engine_client: Any) -> dict[str, Any] | None:
         "max_num_seqs": scheduler.max_num_seqs,
         "max_num_partial_prefills": scheduler.max_num_partial_prefills,
         "kv_cache_dtype": _config_string(cache.cache_dtype),
-        "kv_block_size": cache.block_size,
+        **geometry,
         "prefix_caching": cache.enable_prefix_caching,
         "prefix_hash_algorithm": _config_string(cache.prefix_caching_hash_algo),
         "max_loras": lora.max_loras,
@@ -159,14 +178,72 @@ class _ArtAuthenticationMiddleware(AuthenticationMiddleware):
     def __call__(self, scope: Scope, receive: Receive, send: Send):
         path = scope.get("path", "").removeprefix(scope.get("root_path", ""))
         if (
-            scope.get("type") in {"http", "websocket"}
-            and scope.get("method") != "OPTIONS"
-            and path.startswith("/art/")
-            and not self.verify_token(Headers(scope=scope))
+            scope.get("type") not in {"http", "websocket"}
+            or scope.get("method") == "OPTIONS"
         ):
+            return self.app(scope, receive, send)
+        headers = Headers(scope=scope)
+        if path == _PRIVATE_DISPATCH_PATH:
+            if _verify_bearer(headers, _private_dispatch_token):
+                return self.app(scope, receive, send)
+        elif not _auth_tokens:
+            return self.app(scope, receive, send)
+        elif path.startswith("/art/"):
+            if self.verify_token(headers):
+                return self.app(scope, receive, send)
+        else:
+            return super().__call__(scope, receive, send)
+        if path.startswith("/art/"):
             response = JSONResponse(content={"error": "Unauthorized"}, status_code=401)
             return response(scope, receive, send)
         return self.app(scope, receive, send)
+
+
+def _verify_bearer(headers: Headers, token: str | None) -> bool:
+    values = headers.getlist("authorization")
+    if token is None or len(values) != 1:
+        return False
+    scheme, separator, provided = values[0].partition(" ")
+    return (
+        separator == " "
+        and scheme.casefold() == "bearer"
+        and hmac.compare_digest(provided, token)
+    )
+
+
+def _private_dispatch_context(request: Any) -> tuple[str, str] | JSONResponse:
+    headers = request.headers
+    target_values = headers.getlist(_RUNTIME_TARGET_HEADER)
+    if (
+        _runtime_target_id is None
+        or len(target_values) != 1
+        or not hmac.compare_digest(target_values[0], _runtime_target_id)
+    ):
+        return JSONResponse(
+            content={
+                "error": "Runtime target is no longer active",
+                "type": "stale_runtime_target",
+                "execution": "not_started",
+            },
+            status_code=HTTPStatus.CONFLICT.value,
+        )
+    identities = []
+    for header in (
+        _PRIVATE_REQUEST_IDENTITY_HEADER,
+        _PRIVATE_CACHE_IDENTITY_HEADER,
+    ):
+        values = headers.getlist(header)
+        if len(values) != 1 or _SHA256_RE.fullmatch(values[0]) is None:
+            return JSONResponse(
+                content={
+                    "error": f"Invalid {header}",
+                    "type": "invalid_private_context",
+                    "execution": "not_started",
+                },
+                status_code=HTTPStatus.BAD_REQUEST.value,
+            )
+        identities.append(values[0])
+    return identities[0], identities[1]
 
 
 class _ResetPrefixCacheRequest(BaseModel):
@@ -269,6 +346,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--headless", action="store_true")
     parser.add_argument("--replica-generation", type=int, default=0)
     parser.add_argument("--process-uuid")
+    parser.add_argument("--runtime-target-id")
     parser.add_argument("--update-identity")
     parser.add_argument("--initial-generation-id")
     parser.add_argument("--initial-policy-version", type=int)
@@ -355,7 +433,7 @@ def _patch_art_runtime_routes() -> None:
 
         @router.get("/art/capabilities")
         async def art_capabilities(raw_request: Request) -> JSONResponse:
-            profile = _serving_profile(engine(raw_request))
+            profile = await _serving_profile(engine(raw_request))
             return JSONResponse(
                 content={
                     "runtime": "art_vllm",
@@ -369,6 +447,21 @@ def _patch_art_runtime_routes() -> None:
                     "profile": profile,
                 }
             )
+
+        @router.post(
+            _PRIVATE_DISPATCH_PATH,
+            dependencies=[Depends(validate_json_request)],
+        )
+        async def private_chat_completion(
+            request: ChatCompletionRequest, raw_request: Request
+        ) -> Response:
+            context = _private_dispatch_context(raw_request)
+            if isinstance(context, JSONResponse):
+                return context
+            _request_identity, cache_identity = context
+            request.cache_salt = f"art-private-cache-v1:{cache_identity}"
+            response = await create_chat_completion(request, raw_request)
+            return Response(status_code=499) if response is None else response
 
         @router.post(
             "/art/v1/chat/completions",
@@ -669,13 +762,29 @@ def _validate_pipeline_route_config(config: Any) -> None:
 
 
 def main(argv: list[str] | None = None) -> None:
-    global _fast_metrics_port
+    global _fast_metrics_port, _private_dispatch_token, _runtime_target_id
 
     args = parse_args(argv)
     if (args.initial_generation_id is None) != (args.initial_policy_version is None):
         raise ValueError(
             "--initial-generation-id and --initial-policy-version must be set together"
         )
+    private_dispatch_token = os.environ.pop("ART_PRIVATE_DISPATCH_TOKEN", None)
+    if (args.runtime_target_id is None) != (private_dispatch_token is None):
+        raise ValueError(
+            "--runtime-target-id and ART_PRIVATE_DISPATCH_TOKEN must be set together"
+        )
+    if (
+        args.runtime_target_id is not None
+        and _SHA256_RE.fullmatch(args.runtime_target_id) is None
+    ):
+        raise ValueError("--runtime-target-id must be a lowercase SHA-256")
+    if private_dispatch_token is not None and len(private_dispatch_token) < 32:
+        raise ValueError(
+            "ART_PRIVATE_DISPATCH_TOKEN must contain at least 32 characters"
+        )
+    _runtime_target_id = args.runtime_target_id
+    _private_dispatch_token = private_dispatch_token
     engine_args = json.loads(args.engine_args_json)
     server_args = json.loads(args.server_args_json)
     serving_profile_identity = (
@@ -800,7 +909,7 @@ def main(argv: list[str] | None = None) -> None:
     if api_key := os.environ.pop("VLLM_API_KEY", None):
         namespace.api_key = [api_key]
     _auth_tokens[:] = namespace.api_key or []
-    if _auth_tokens:
+    if _auth_tokens or _private_dispatch_token is not None:
         namespace.middleware = [
             *namespace.middleware,
             "art_vllm_runtime.dedicated_server._ArtAuthenticationMiddleware",

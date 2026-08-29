@@ -5,6 +5,7 @@ from collections.abc import Awaitable, Callable, Mapping
 import hashlib
 import json
 from pathlib import Path
+import secrets
 from typing import Literal, Protocol
 import uuid
 
@@ -77,6 +78,12 @@ class ReplicaState(_Message):
     policy_digest: str | None = None
     update_identity: str | None = None
     quarantine_reason: str | None = None
+
+
+class ReplicaDispatchCredentials(_Message):
+    target_id: str = Field(pattern=r"^[0-9a-f]{64}$")
+    runtime_generation: int = Field(ge=0)
+    authorization_token: str = Field(min_length=32, repr=False)
 
 
 class ReplicaFailure(_Message):
@@ -255,6 +262,7 @@ class ReplicaManager:
         self._monitor_interval_s = monitor_interval_s
         self._lock = asyncio.Lock()
         self._monitor_task: asyncio.Task[None] | None = None
+        self._private_dispatch_token: str | None = None
         digest = self._generation_digest(spec, 0)
         self._state = ReplicaState(
             replica_id=spec.name,
@@ -271,6 +279,20 @@ class ReplicaManager:
     def state(self) -> ReplicaState:
         return self._state
 
+    @property
+    def dispatch_credentials(self) -> ReplicaDispatchCredentials:
+        if self._state.phase not in {"ready", "updating"}:
+            raise RuntimeError(
+                f"private dispatch is unavailable in {self._state.phase} state"
+            )
+        if self._private_dispatch_token is None:
+            raise RuntimeError("private dispatch credentials are unavailable")
+        return ReplicaDispatchCredentials(
+            target_id=self._state.generation_digest,
+            runtime_generation=self._state.generation,
+            authorization_token=self._private_dispatch_token,
+        )
+
     async def start(self) -> ReplicaState:
         async with self._lock:
             return await self._start_locked()
@@ -278,6 +300,7 @@ class ReplicaManager:
     async def _start_locked(self) -> ReplicaState:
         if self._state.phase != "stopped":
             raise RuntimeError(f"cannot start replica in {self._state.phase} state")
+        self._private_dispatch_token = secrets.token_urlsafe(32)
         self._state = self._state.model_copy(update={"phase": "starting"})
         requests = tuple(self._launch_request(member) for member in self._spec.members)
         tasks = [
@@ -308,6 +331,7 @@ class ReplicaManager:
                     "quarantine_reason": f"gang startup failed: {error}",
                 }
             )
+            self._private_dispatch_token = None
             raise error from None
         self._state = self._state.model_copy(
             update={"phase": "ready", "members": tuple(members)}
@@ -333,6 +357,7 @@ class ReplicaManager:
             )
             raise
         self._state = self._state.model_copy(update={"phase": "stopped", "members": ()})
+        self._private_dispatch_token = None
         return self._state
 
     async def restart(
@@ -627,6 +652,8 @@ class ReplicaManager:
             headless=member.node_rank != 0,
             replica_generation=self._state.generation,
             process_uuid=process_uuid,
+            runtime_target_id=self._state.generation_digest,
+            private_dispatch_token=self._private_dispatch_token,
             update_identity=self._state.update_identity,
             initial_generation_id=self._template.initial_generation_id,
             initial_policy_version=self._template.initial_policy_version,

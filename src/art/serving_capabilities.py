@@ -1,4 +1,5 @@
 from ipaddress import ip_address
+import re
 from typing import Literal
 
 import httpx
@@ -11,7 +12,12 @@ from pydantic import (
     model_validator,
 )
 
-ART_SERVING_PROTOCOL_VERSION = 6
+ART_SERVING_PROTOCOL_VERSION = 7
+
+ART_PRIVATE_CACHE_IDENTITY_HEADER = "x-art-cache-identity"
+ART_PRIVATE_REQUEST_IDENTITY_HEADER = "x-art-request-identity"
+ART_RUNTIME_TARGET_HEADER = "x-art-runtime-target"
+_SHA256_PATTERN = r"^[0-9a-f]{64}$"
 
 ServingFeature = Literal[
     "binary_routed_experts",
@@ -91,7 +97,7 @@ class ServingProfileIdentity(BaseModel):
 class ServingProfile(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    schema_version: Literal[1] = 1
+    schema_version: Literal[2] = 2
     identity: ServingProfileIdentity
     runtime_model: str = Field(min_length=1)
     runtime_revision: str | None = None
@@ -110,6 +116,9 @@ class ServingProfile(BaseModel):
     max_num_partial_prefills: int = Field(ge=1)
     kv_cache_dtype: str = Field(min_length=1)
     kv_block_size: int = Field(ge=1)
+    kv_block_bytes_per_rank: int = Field(ge=1)
+    kv_capacity_blocks_per_rank: int = Field(ge=1)
+    kv_capacity_bytes_per_rank: int = Field(ge=1)
     prefix_caching: bool
     prefix_hash_algorithm: str = Field(min_length=1)
     max_loras: int = Field(ge=1)
@@ -141,7 +150,44 @@ class ServingProfile(BaseModel):
             raise ValueError("route replay identity and runtime capture disagree")
         if self.multi_token_prediction != (self.speculative_method == "mtp"):
             raise ValueError("MTP flag and speculative method disagree")
+        if self.kv_capacity_bytes_per_rank != (
+            self.kv_capacity_blocks_per_rank * self.kv_block_bytes_per_rank
+        ):
+            raise ValueError("KV cache capacity disagrees with its block geometry")
         return self
+
+
+class PairedInferenceEndpoint(BaseModel):
+    """Private, incarnation-fenced service endpoint for one paired runtime."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    schema_version: Literal[1] = 1
+    url: AnyHttpUrl
+    target_id: str = Field(pattern=_SHA256_PATTERN)
+    runtime_generation: int = Field(ge=0)
+    authorization_token: str = Field(min_length=32, repr=False)
+    profile: ServingProfile
+
+    def request_headers(
+        self,
+        *,
+        request_identity: str,
+        cache_identity: str,
+    ) -> dict[str, str]:
+        for name, value in (
+            ("request_identity", request_identity),
+            ("cache_identity", cache_identity),
+        ):
+            if not re.fullmatch(_SHA256_PATTERN, value):
+                raise ValueError(f"{name} must be a lowercase SHA-256")
+        return {
+            "Authorization": f"Bearer {self.authorization_token}",
+            ART_RUNTIME_TARGET_HEADER: self.target_id,
+            ART_PRIVATE_REQUEST_IDENTITY_HEADER: request_identity,
+            ART_PRIVATE_CACHE_IDENTITY_HEADER: cache_identity,
+            "x-request-id": request_identity,
+        }
 
 
 class ServingCapabilities(BaseModel):
