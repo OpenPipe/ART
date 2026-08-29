@@ -45,6 +45,21 @@ def test_prompt_spans_follow_executed_prefill_chunks() -> None:
         ]
     }
 
+    split_batch = SimpleNamespace(
+        req_ids=["request"],
+        num_reqs=1,
+        num_scheduled_tokens=np.array([3]),
+        num_computed_tokens_np=np.array([0]),
+        prefill_len_np=np.array([7]),
+    )
+    split_runner = SimpleNamespace(
+        input_batch=split_batch,
+        lora_state=SimpleNamespace(lora_requests={"request": request}),
+    )
+    assert policy_spans._policy_context_from_runner(
+        split_runner, SimpleNamespace(num_scheduled_tokens={"dummy": 64})
+    ) == context
+
 
 def test_prompt_accumulator_keeps_real_boundaries_and_flushes_with_output() -> None:
     accumulated: list[dict[str, object]] = []

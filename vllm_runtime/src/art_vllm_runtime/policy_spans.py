@@ -1583,10 +1583,14 @@ def _policy_context_from_runner(
         return {}
     num_reqs = int(input_batch.num_reqs)
     req_ids = input_batch.req_ids[:num_reqs]
-    if scheduler_output is None:
-        raise RuntimeError("vLLM scheduler output is required for policy spans")
-    scheduled_by_request = scheduler_output.num_scheduled_tokens
-    scheduled_tokens = [scheduled_by_request[req_id] for req_id in req_ids]
+    scheduled_tokens = getattr(input_batch, "num_scheduled_tokens", None)
+    if scheduled_tokens is None:
+        if scheduler_output is None:
+            raise RuntimeError("vLLM scheduler output is required for policy spans")
+        scheduled_by_request = scheduler_output.num_scheduled_tokens
+        scheduled_tokens = [scheduled_by_request[req_id] for req_id in req_ids]
+    else:
+        scheduled_tokens = scheduled_tokens[:num_reqs]
     computed_tokens = getattr(
         input_batch,
         "num_computed_tokens_np",
