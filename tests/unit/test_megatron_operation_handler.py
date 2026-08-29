@@ -619,12 +619,13 @@ async def test_handler_connects_optimizer_snapshot_to_paired_publication() -> No
         (),
     )
 
+    generation = trainer.optimizer_jobs[-1].generation
     assert publisher.calls == [
         (
-            trainer.optimizer_jobs[-1].generation,
+            generation,
             "/adapter/0",
             "/optimizer",
-            f"/megatron_runtime/staging/step-00000001-{'b' * 32}",
+            f"/megatron_runtime/staging/{generation.generation_id}",
         )
     ]
     assert saved.lora == "run:active"
