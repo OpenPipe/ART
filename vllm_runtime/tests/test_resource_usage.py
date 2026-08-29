@@ -1,9 +1,11 @@
+from concurrent.futures import Future
 from types import SimpleNamespace
 
 from art_vllm_runtime.resource_usage import (
     GPUServiceTracker,
     KVUsageOwner,
     PhysicalKVTracker,
+    _account_future,
 )
 
 
@@ -57,3 +59,19 @@ def test_physical_kv_counts_cached_blocks_once_until_eviction() -> None:
     tracker.release_unresident(blocks)
 
     assert [update["byte_count"] for update in tracker.take_updates()] == [128, 64, 0]
+
+
+def test_accounting_future_drives_lazy_vllm_future() -> None:
+    class LazyFuture(Future[str]):
+        def result(self, timeout: float | None = None) -> str:
+            if not self.done():
+                self.set_result("worker-output")
+            return super().result(timeout)
+
+    completed = _account_future(
+        LazyFuture(),
+        lambda value: f"{value}-accounted",
+        lambda: None,
+    )
+
+    assert completed.result() == "worker-output-accounted"

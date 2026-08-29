@@ -669,26 +669,35 @@ def _patch_executor(executor_class: type[Any]) -> None:
 def _account_future(result: Any, finish: Any, fail: Any) -> Any:
     if not isinstance(result, Future):
         return finish(result)
-    accounted: Future[Any] = Future()
+    return _AccountingFuture(result, finish, fail)
 
-    def completed(future: Future[Any]) -> None:
-        try:
-            value = future.result()
-        except BaseException as execution_error:
-            try:
-                fail()
-            except BaseException as accounting_error:
-                accounted.set_exception(accounting_error)
-            else:
-                accounted.set_exception(execution_error)
-        else:
-            try:
-                accounted.set_result(finish(value))
-            except BaseException as accounting_error:
-                accounted.set_exception(accounting_error)
 
-    result.add_done_callback(completed)
-    return accounted
+class _AccountingFuture(Future[Any]):
+    def __init__(self, source: Future[Any], finish: Any, fail: Any) -> None:
+        super().__init__()
+        self._source = source
+        self._finish = finish
+        self._fail = fail
+        self._resolve_lock = RLock()
+
+    def result(self, timeout: float | None = None) -> Any:
+        with self._resolve_lock:
+            if not self.done():
+                try:
+                    value = self._source.result(timeout)
+                except BaseException as execution_error:
+                    try:
+                        self._fail()
+                    except BaseException as accounting_error:
+                        self.set_exception(accounting_error)
+                    else:
+                        self.set_exception(execution_error)
+                else:
+                    try:
+                        self.set_result(self._finish(value))
+                    except BaseException as accounting_error:
+                        self.set_exception(accounting_error)
+        return super().result(timeout)
 
 
 def _gpu_tracking(executor: Any) -> tuple[GPUServiceTracker, _StageCoordinator]:
