@@ -61,7 +61,9 @@ async def test_external_runtime_server_live_smoke(
     served_model_name = f"vllm-runtime-live-{uuid.uuid4().hex[:8]}"
     runtime_target_id = "a" * 64
     private_dispatch_token = "private-dispatch-token-" + uuid.uuid4().hex
-    log_path = artifact_dir / "runtime.log"
+    log_path = Path(
+        os.environ.get("ART_TEST_RUNTIME_LOG_PATH", artifact_dir / "runtime.log")
+    )
     launch_config = runtime.VllmRuntimeLaunchConfig(
         base_model=os.environ.get("BASE_MODEL", DEFAULT_BASE_MODEL),
         port=port,
