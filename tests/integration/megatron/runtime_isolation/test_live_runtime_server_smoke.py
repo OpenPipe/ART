@@ -193,7 +193,7 @@ async def test_external_runtime_server_live_smoke(
                     "top_logprobs": 0,
                 },
             )
-            completion_response.raise_for_status()
+            assert completion_response.status_code == 200, completion_response.text
             completion = completion_response.json()
             private_completion_response = await client.post(
                 endpoint.url.path,
