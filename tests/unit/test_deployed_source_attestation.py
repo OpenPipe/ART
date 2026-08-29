@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from . import artifacts
+from tests.integration.megatron import artifacts
 
 
 def test_source_only_view_requires_complete_matching_attestation(
