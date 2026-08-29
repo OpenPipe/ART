@@ -83,8 +83,29 @@ class TokenizedTrainingBatch(Contract):
         return self
 
 
+class PackedInputCaptureRef(Contract):
+    """Opaque identity for one immutable slot-local packed input."""
+
+    kind: Literal["captured"] = "captured"
+    run_id: str = Field(min_length=1, max_length=MAX_CONTROL_IDENTIFIER_LENGTH)
+    capture_id: str = Field(min_length=1, max_length=64)
+    manifest_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    input_kind: Literal["rl", "sft", "tokenized"]
+    min_source_version: int = Field(default=0, ge=0)
+    max_source_version: int = Field(default=0, ge=0)
+
+    @model_validator(mode="after")
+    def _validate_source_versions(self) -> "PackedInputCaptureRef":
+        if self.max_source_version < self.min_source_version:
+            raise ValueError("max_source_version must be >= min_source_version")
+        return self
+
+
 TrainingBatch = Annotated[
-    RlTrajectoryBatch | SupervisedTrajectoryBatch | TokenizedTrainingBatch,
+    RlTrajectoryBatch
+    | SupervisedTrajectoryBatch
+    | TokenizedTrainingBatch
+    | PackedInputCaptureRef,
     Field(discriminator="kind"),
 ]
 
@@ -105,14 +126,19 @@ class ForwardRequest(RunCommand):
 
     @model_validator(mode="after")
     def _validate_loss(self) -> "ForwardRequest":
+        batch_kind = (
+            self.batch.input_kind
+            if isinstance(self.batch, PackedInputCaptureRef)
+            else self.batch.kind
+        )
         expected = {
             "sft": {"cross_entropy"},
             "rl": {"cispo", "ppo"},
             "tokenized": {"cross_entropy", "importance_sampling", "cispo"},
-        }[self.batch.kind]
+        }[batch_kind]
         if self.loss.name not in expected:
             raise ValueError(
-                f"{self.batch.kind} batches require one of {sorted(expected)}, "
+                f"{batch_kind} batches require one of {sorted(expected)}, "
                 f"got {self.loss.name!r}"
             )
         if isinstance(self.batch, TokenizedTrainingBatch):
@@ -347,6 +373,7 @@ class OperationResult(Contract):
 class ForwardResult(OperationResult):
     kind: Literal["forward"] = "forward"
     packing: PackingOutcome
+    packed_input_capture: PackedInputCaptureRef | None = None
     token_logprobs: tuple[TokenLogprobs, ...] = ()
 
 

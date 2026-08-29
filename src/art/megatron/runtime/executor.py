@@ -25,6 +25,7 @@ from .publication import (
 )
 from .specs import (
     ForwardBackwardJobSpec,
+    ForwardJobSpec,
     OptimizerJobSpec,
     ResidentLoraInspectionShard,
     ResidentLoraInspectionSpec,
@@ -129,6 +130,44 @@ class MegatronTrainJobExecutor:
             "learner_version": job.expected_learner_version,
             "loss_bearing_token_count": job.expected_global_loss_bearing_tokens,
             "completed_gradient_steps": result.completed_gradient_steps,
+            "logical_nonpadding_tokens": result.logical_nonpadding_tokens,
+            "executed_token_equivalents": result.executed_token_equivalents,
+            "token_logprobs": tuple(
+                TokenLogprobs.from_values(
+                    values.detach()
+                    .to(device="cpu", dtype=values.dtype)
+                    .flatten()
+                    .tolist(),
+                    shape=tuple(values.shape),
+                ).model_dump(mode="python")
+                for values in result.new_logprobs
+            )
+            if job.return_token_logprobs
+            else (),
+            "metrics": result.metrics,
+        }
+
+    def execute_forward(
+        self,
+        job: ForwardJobSpec,
+        batch: InMemoryPackedBatch,
+        cancelled: Event,
+    ) -> dict[str, Any]:
+        if self._closed:
+            raise RuntimeError("Megatron executor is closed")
+        validate_packed_batch(batch)
+        self._publisher.raise_if_failed()
+        from art.megatron.train import execute_megatron_rl_forward_job
+
+        result = execute_megatron_rl_forward_job(
+            self.runtime,
+            job,
+            batch.tensors,
+            cancelled=cancelled,
+        )
+        return {
+            "operation_id": job.operation_id,
+            "learner_version": job.expected_learner_version,
             "logical_nonpadding_tokens": result.logical_nonpadding_tokens,
             "executed_token_equivalents": result.executed_token_equivalents,
             "token_logprobs": tuple(

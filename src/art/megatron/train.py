@@ -72,6 +72,7 @@ from art.megatron.routing_replay import (
 from art.megatron.runtime.data_plane import SFTBatchData
 from art.megatron.runtime.specs import (
     ForwardBackwardJobSpec,
+    ForwardJobSpec,
     PackedTokenScore,
     ResidentLoraExport,
     ResidentLoraInspectionShard,
@@ -277,6 +278,13 @@ class MegatronForwardBackwardJobResult(BaseModel):
     new_logprobs: tuple[torch.Tensor, ...]
     local_token_count: torch.Tensor
     completed_gradient_steps: int = Field(ge=0)
+    logical_nonpadding_tokens: int = Field(ge=0)
+    executed_token_equivalents: int = Field(ge=0)
+    metrics: dict[str, float] = Field(default_factory=dict)
+
+
+class MegatronForwardJobResult(BaseModel):
+    new_logprobs: tuple[torch.Tensor, ...]
     logical_nonpadding_tokens: int = Field(ge=0)
     executed_token_equivalents: int = Field(ge=0)
     metrics: dict[str, float] = Field(default_factory=dict)
@@ -606,7 +614,7 @@ def build_training_runtime(
 
 def _execute_megatron_rl_forward_backward_steps(
     runtime: TrainingRuntime,
-    job: TrainJobSpec | ForwardBackwardJobSpec,
+    job: TrainJobSpec | ForwardBackwardJobSpec | ForwardJobSpec,
     packed_tensors: PackedTensors,
     *,
     before_step: Callable[[int], None],
@@ -614,6 +622,7 @@ def _execute_megatron_rl_forward_backward_steps(
     cancelled: Event | None = None,
     replay_bundle: MoeRoutingReplayBundle | None = None,
     defer_grad_sync: bool = False,
+    forward_only: bool = False,
 ) -> tuple[dict[str, torch.dtype], float]:
     job_prepare_started = time.perf_counter()
     template = None
@@ -765,6 +774,7 @@ def _execute_megatron_rl_forward_backward_steps(
                 hybridep_token_counts=hybridep_token_counts,
                 inter_forward_backward_timing=(runtime.inter_forward_backward_timing),
                 defer_grad_sync=defer_grad_sync,
+                forward_only=forward_only,
             )
             after_step(
                 step_index,
@@ -1035,6 +1045,60 @@ def execute_megatron_rl_forward_backward_job(
     )
 
 
+def execute_megatron_rl_forward_job(
+    runtime: TrainingRuntime,
+    job: ForwardJobSpec,
+    packed_tensors: PackedTensors,
+    *,
+    cancelled: Event | None = None,
+    replay_bundle: MoeRoutingReplayBundle | None = None,
+) -> MegatronForwardJobResult:
+    """Run the canonical packed forward without retaining gradients."""
+
+    results: list[RLForwardBackwardState] = []
+    durations: list[float] = []
+
+    def record_step(
+        _step_index: int,
+        _num_steps: int,
+        state: RLForwardBackwardState,
+        duration_s: float,
+        _replay_finalize_s: float,
+        _step_input_prepare_s: float,
+    ) -> None:
+        results.append(state)
+        durations.append(duration_s)
+
+    _, job_prepare_s = _execute_megatron_rl_forward_backward_steps(
+        runtime,
+        job,
+        packed_tensors,
+        before_step=lambda _step_index: None,
+        after_step=record_step,
+        cancelled=cancelled,
+        replay_bundle=replay_bundle,
+        forward_only=True,
+    )
+    finished = tuple(
+        _finish_megatron_rl_forward_backward_step(state) for state in results
+    )
+    return MegatronForwardJobResult(
+        new_logprobs=tuple(
+            value for result in finished for value in result.new_logprobs
+        ),
+        logical_nonpadding_tokens=sum(
+            result.workload.logical_nonpadding_tokens for result in finished
+        ),
+        executed_token_equivalents=sum(
+            result.workload.executed_token_equivalents for result in finished
+        ),
+        metrics={
+            "time/forward_s": sum(durations),
+            "time/job_prepare_s": job_prepare_s,
+        },
+    )
+
+
 def execute_megatron_sft_job(
     runtime: TrainingRuntime,
     job: SFTJobSpec,
@@ -1166,7 +1230,7 @@ def execute_megatron_sft_job(
 
 
 def _experimental_train_config(
-    job: TrainJobSpec | ForwardBackwardJobSpec,
+    job: TrainJobSpec | ForwardBackwardJobSpec | ForwardJobSpec,
 ) -> dev.TrainConfig:
     return cast(
         dev.TrainConfig,
@@ -1174,13 +1238,15 @@ def _experimental_train_config(
     )
 
 
-def _moe_replay_strict(job: TrainJobSpec | ForwardBackwardJobSpec) -> bool:
+def _moe_replay_strict(
+    job: TrainJobSpec | ForwardBackwardJobSpec | ForwardJobSpec,
+) -> bool:
     return job.experimental_config.moe_routing_replay_strict
 
 
 def _prepare_rl_training_state(
     runtime: TrainingRuntime,
-    job: TrainJobSpec | SFTJobSpec | ForwardBackwardJobSpec,
+    job: TrainJobSpec | SFTJobSpec | ForwardBackwardJobSpec | ForwardJobSpec,
 ) -> dict[str, torch.dtype]:
     state_is_resident = (
         runtime.optimizer_persistent
@@ -2524,7 +2590,7 @@ def _reference_sample_step_indices(
 def _prepare_kl_reference_logprobs(
     *,
     runtime: TrainingRuntime,
-    job: TrainJobSpec | ForwardBackwardJobSpec,
+    job: TrainJobSpec | ForwardBackwardJobSpec | ForwardJobSpec,
     packed_tensors: PackedTensors,
     num_sequences: int,
     num_steps: int,
@@ -2792,6 +2858,8 @@ def _run_training_schedule(
     schedule: MCoreScheduleAdapter[Any],
     forward_step_func: Callable[..., Any],
     timing: _InterForwardBackwardTiming | None,
+    *,
+    forward_only: bool = False,
 ) -> tuple[list[Any], Callable[[], dict[str, float]]]:
     started_s = time.monotonic()
     gap_s = (
@@ -2820,7 +2888,11 @@ def _run_training_schedule(
     previous_cuda_end = (
         timing.previous_schedule_cuda_end if timing is not None else None
     )
-    outputs = schedule.run(forward_step_func, forward_only=False)
+    outputs = schedule.run(
+        forward_step_func,
+        forward_only=forward_only,
+        collect_non_loss_data=forward_only,
+    )
     ended_s = time.monotonic()
     if timing is None:
         return outputs, lambda: {}
@@ -2909,6 +2981,7 @@ def run_megatron_rl_forward_backward_step(
     hybridep_token_counts: list[int] | None = None,
     inter_forward_backward_timing: _InterForwardBackwardTiming | None = None,
     defer_grad_sync: bool = False,
+    forward_only: bool = False,
 ) -> RLForwardBackwardState:
     schedule_prepare_started = time.perf_counter()
     micro_inputs = inputs if isinstance(inputs, list) else [inputs]
@@ -2949,8 +3022,9 @@ def run_megatron_rl_forward_backward_step(
     if cp_lookahead_state is not None and int(topology.cp) <= 1:
         cp_lookahead_state.pending_prepared_micro = None
 
-    _zero_grad_buffers(model_chunks)
-    _install_schedule_finalize(model_chunks, defer_grad_sync=defer_grad_sync)
+    if not forward_only:
+        _zero_grad_buffers(model_chunks)
+        _install_schedule_finalize(model_chunks, defer_grad_sync=defer_grad_sync)
 
     micro_count = len(micro_inputs)
     prepared_micros: list[PreparedRLMicroInputs] = []
@@ -3027,7 +3101,7 @@ def run_megatron_rl_forward_backward_step(
             micro_loss = loss_info.policy_loss + _zero_logprob_graph_contribution(
                 new_logprobs, compact_loss_inputs
             )
-            if not micro_loss.requires_grad:
+            if not forward_only and not micro_loss.requires_grad:
                 raise RuntimeError(
                     "RL micro_loss is detached before pipeline backward: "
                     f"micro={item.order}, sample={item.sample_index}"
@@ -3035,34 +3109,34 @@ def run_megatron_rl_forward_backward_step(
             num_tokens = _local_trainable_token_count_tensor(
                 [prepared.loss_inputs], device=device
             )
-            return (
-                micro_loss,
-                num_tokens,
-                {
-                    "order": item.order,
-                    "raw_loss_sum": micro_loss.detach(),
-                    "probs_corr": loss_info.probs_corr.detach(),
-                    "kl_policy_ref": (
-                        None
-                        if loss_info.kl_policy_ref is None
-                        else float(loss_info.kl_policy_ref.item())
-                    ),
-                    "offpolicy_diagnostics": loss_info.offpolicy_diagnostics,
-                    "new_logprobs": token_output.restore(new_logprobs.detach()).to(
-                        "cpu"
-                    ),
-                },
-            )
+            values = {
+                "order": item.order,
+                "raw_loss_sum": micro_loss.detach(),
+                "probs_corr": loss_info.probs_corr.detach(),
+                "kl_policy_ref": (
+                    None
+                    if loss_info.kl_policy_ref is None
+                    else float(loss_info.kl_policy_ref.item())
+                ),
+                "offpolicy_diagnostics": loss_info.offpolicy_diagnostics,
+                "new_logprobs": token_output.restore(new_logprobs.detach()).to("cpu"),
+            }
+            if forward_only:
+                return values
+            return (micro_loss, num_tokens, values)
 
         return token_output.token_losses, reduce_loss
 
     schedule_prepare_s = time.perf_counter() - schedule_prepare_started
     forward_data_store, collect_inter_schedule_metrics = _run_training_schedule(
-        schedule, forward_step_func, inter_forward_backward_timing
+        schedule,
+        forward_step_func,
+        inter_forward_backward_timing,
+        forward_only=forward_only,
     )
     replay_finalize_started = time.perf_counter()
     if moe_routing_replay_controller is not None:
-        moe_routing_replay_controller.finalize_step(expect_recompute=True)
+        moe_routing_replay_controller.finalize_step(expect_recompute=not forward_only)
     replay_finalize_s = time.perf_counter() - replay_finalize_started
     result_collect_started = time.perf_counter()
     pipeline_results = cast(
