@@ -1,9 +1,14 @@
 from __future__ import annotations
 
+import asyncio
 import os
 from pathlib import Path
 import tempfile
+from typing import Any, Literal, cast
 
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+from art.distributed import ArtLaunchContext
 from art.training import (
     CheckpointRef,
     ForwardBackwardRequest,
@@ -30,6 +35,55 @@ from .operation_handler import (
 from .runtime.portable_snapshot import PortableSnapshotExportReceipt
 from .runtime.specs import TrainerGeneration
 from .slot_coordinator import MegatronSlotCoordinator, MegatronSlotRun
+from .slot_runtime import (
+    MegatronRunBinding,
+    MegatronRunBootstrapConfig,
+    MegatronSlotLaunchConfig,
+    launch_megatron_slot,
+)
+
+ART_MEGATRON_GATE_PLAN_ENV = "ART_MEGATRON_GATE_PLAN"
+
+
+class _GateContract(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+
+class MegatronGateCommand(_GateContract):
+    kind: Literal[
+        "forward",
+        "forward_backward",
+        "optim_step",
+        "save_sampler",
+        "save_state",
+        "load_state",
+    ]
+    request: dict[str, Any]
+    capture_numerics: bool = False
+
+    @model_validator(mode="after")
+    def _validate_capture(self) -> "MegatronGateCommand":
+        if self.capture_numerics and self.kind != "forward_backward":
+            raise ValueError("only forward_backward accepts numerical capture")
+        return self
+
+
+class MegatronGateRunPlan(_GateContract):
+    bootstrap: MegatronRunBootstrapConfig
+    commands: tuple[MegatronGateCommand, ...] = Field(min_length=1, max_length=128)
+
+
+class MegatronGateAttemptPlan(_GateContract):
+    slot: MegatronSlotLaunchConfig
+    attempt_root: str = Field(min_length=1)
+    runs: tuple[MegatronGateRunPlan, ...] = Field(min_length=1, max_length=4)
+
+    @model_validator(mode="after")
+    def _validate_runs(self) -> "MegatronGateAttemptPlan":
+        run_ids = tuple(run.bootstrap.run_id for run in self.runs)
+        if len(set(run_ids)) != len(run_ids):
+            raise ValueError("gate run IDs must be unique")
+        return self
 
 
 class MegatronGateEvidenceRecorder:
@@ -145,6 +199,74 @@ class MegatronGateCheckpointOperations:
         raise RuntimeError(
             "Gate artifact admission requires the production checkpoint adapter"
         )
+
+
+async def run_megatron_gate_attempt(launch: ArtLaunchContext) -> None:
+    """Execute one JSON-planned functional slice on a persistent trainer slot."""
+
+    try:
+        plan_path = os.environ[ART_MEGATRON_GATE_PLAN_ENV]
+    except KeyError:
+        raise RuntimeError(f"{ART_MEGATRON_GATE_PLAN_ENV} is required") from None
+    plan = MegatronGateAttemptPlan.model_validate_json(Path(plan_path).read_bytes())
+    slot = await launch_megatron_slot(plan.slot, launch=launch)
+    recorder = MegatronGateEvidenceRecorder(slot.coordinator, plan.attempt_root)
+    try:
+        bound: list[tuple[MegatronGateRunPlan, MegatronRunBinding]] = []
+        for run_plan in plan.runs:
+            binding = await slot.bind_run(
+                run_plan.bootstrap,
+                checkpoints=MegatronGateCheckpointOperations(
+                    slot.coordinator, plan.attempt_root
+                ),
+            )
+            bound.append((run_plan, binding))
+        await asyncio.gather(
+            *(
+                _execute_run_plan(recorder, run_plan, binding)
+                for run_plan, binding in bound
+            )
+        )
+    finally:
+        await slot.aclose()
+
+
+async def _execute_run_plan(
+    recorder: MegatronGateEvidenceRecorder,
+    plan: MegatronGateRunPlan,
+    binding: MegatronRunBinding,
+) -> None:
+    ledger = RunCommandLedger(
+        plan.bootstrap.run_id,
+        learner_version=binding.config.source.policy_step,
+    )
+    try:
+        for command in plan.commands:
+            request = _parse_command(command)
+            outcome = await recorder.execute(
+                binding.run,
+                ledger,
+                request,
+                capture_numerics=command.capture_numerics,
+            )
+            if isinstance(outcome, OperationFailed):
+                raise RuntimeError(f"{outcome.failure.code}: {outcome.failure.message}")
+        if ledger.open_forward_backward_operation_ids:
+            raise RuntimeError("gate run ended with open F/B contributions")
+    finally:
+        await recorder.coordinator.drain_run(plan.bootstrap.run_id)
+
+
+def _parse_command(command: MegatronGateCommand) -> RunCommand:
+    request_type = {
+        "forward": ForwardRequest,
+        "forward_backward": ForwardBackwardRequest,
+        "optim_step": OptimStepRequest,
+        "save_sampler": SaveWeightsForSamplerRequest,
+        "save_state": SaveStateRequest,
+        "load_state": LoadStateRequest,
+    }[command.kind]
+    return cast(RunCommand, request_type.model_validate(command.request))
 
 
 def _command_kind(request: RunCommand) -> OperationKind:

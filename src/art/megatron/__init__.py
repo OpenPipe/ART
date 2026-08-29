@@ -3,7 +3,10 @@ from typing import Any
 __all__ = [
     "MegatronBackend",
     "MegatronGateCheckpointOperations",
+    "MegatronGateAttemptPlan",
+    "MegatronGateCommand",
     "MegatronGateEvidenceRecorder",
+    "MegatronGateRunPlan",
     "MegatronOperationConfig",
     "MegatronOperationHandler",
     "MegatronOperationRuntime",
@@ -31,6 +34,7 @@ __all__ = [
     "bootstrap_megatron_operation_worker",
     "launch_megatron_slot",
     "prepare_megatron_run_config",
+    "run_megatron_gate_attempt",
 ]
 
 
@@ -41,7 +45,11 @@ def __getattr__(name: str) -> Any:
         return MegatronBackend
     if name in {
         "MegatronGateCheckpointOperations",
+        "MegatronGateAttemptPlan",
+        "MegatronGateCommand",
         "MegatronGateEvidenceRecorder",
+        "MegatronGateRunPlan",
+        "run_megatron_gate_attempt",
     }:
         from . import gate_evidence
 
