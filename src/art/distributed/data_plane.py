@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterable, Callable, Mapping
+import hashlib
 from multiprocessing import resource_tracker, shared_memory
 import os
 import secrets
@@ -77,6 +78,7 @@ class PackedBatchRef(_Contract):
     sequence_length: int = Field(ge=1)
     byte_count: int = Field(ge=0)
     storage_byte_count: int = Field(ge=1)
+    content_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     pixel_values_present: tuple[bool, ...]
     image_grid_thw_present: tuple[bool, ...]
     moe_routing_replay: MoeRoutingReplaySpec | None = None
@@ -263,6 +265,7 @@ class SharedMemoryPackedBatchStore:
         record_ids: tuple[str, ...] = (),
         min_source_version: int = 0,
         max_source_version: int = 0,
+        compute_content_sha256: bool = False,
     ) -> PackedBatchRef:
         flat, metadata = _flatten_packed_tensors(tensors)
         manifest, storage_bytes = _layout(flat)
@@ -291,6 +294,11 @@ class SharedMemoryPackedBatchStore:
                 sequence_length=metadata["sequence_length"],
                 byte_count=sum(spec.byte_count for spec in manifest),
                 storage_byte_count=storage_bytes,
+                content_sha256=(
+                    _packed_content_sha256(shm, manifest)
+                    if compute_content_sha256
+                    else None
+                ),
                 pixel_values_present=metadata["pixel_values_present"],
                 image_grid_thw_present=metadata["image_grid_thw_present"],
                 moe_routing_replay=metadata["moe_routing_replay"],
@@ -1038,6 +1046,28 @@ def _layout(flat: list[tuple[str, Any]]) -> tuple[tuple[TensorSpec, ...], int]:
         )
         offset += byte_count
     return tuple(specs), max(offset, 1)
+
+
+def _packed_content_sha256(
+    shm: shared_memory.SharedMemory, specs: tuple[TensorSpec, ...]
+) -> str:
+    """Hash the canonical tensor manifest and values without copying them."""
+
+    digest = hashlib.sha256(PACKED_BATCH_FORMAT.encode())
+    buffer = _shm_buffer(shm)
+    try:
+        for spec in specs:
+            encoded = spec.model_dump_json().encode()
+            digest.update(len(encoded).to_bytes(8, "big"))
+            digest.update(encoded)
+            value = buffer[spec.offset : spec.offset + spec.byte_count]
+            try:
+                digest.update(value)
+            finally:
+                value.release()
+    finally:
+        buffer.release()
+    return digest.hexdigest()
 
 
 def _tensor_from_buffer(buffer: memoryview, spec: TensorSpec) -> Any:

@@ -676,6 +676,7 @@ class ArtHostService(Actor):
             record_ids=request.record_ids,
             min_source_version=request.min_source_version,
             max_source_version=request.max_source_version,
+            compute_content_sha256=request.compute_content_sha256,
         )
         packed_batch_finalize_s = time.monotonic() - finalize_started
         return PackingResult(

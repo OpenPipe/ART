@@ -90,6 +90,7 @@ class PackedInputCaptureRef(Contract):
     run_id: str = Field(min_length=1, max_length=MAX_CONTROL_IDENTIFIER_LENGTH)
     capture_id: str = Field(min_length=1, max_length=64)
     manifest_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    content_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     input_kind: Literal["rl", "sft", "tokenized"]
     min_source_version: int = Field(default=0, ge=0)
     max_source_version: int = Field(default=0, ge=0)
@@ -122,6 +123,7 @@ class ForwardRequest(RunCommand):
     batch: TrainingBatch
     loss: LossConfig
     collect_packing_shapes: bool = False
+    retain_packed_input: bool = False
     return_token_logprobs: bool = True
 
     @model_validator(mode="after")

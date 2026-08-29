@@ -1,5 +1,8 @@
 import asyncio
 from contextlib import asynccontextmanager
+import hashlib
+import json
+import secrets
 import time
 from typing import TYPE_CHECKING, Any, AsyncIterator, Iterable, Literal, cast
 import warnings
@@ -8,7 +11,7 @@ from openai._types import NOT_GIVEN
 from tqdm import auto as tqdm
 
 from art.adapter_leases import pin_inference_step, pinned_inference_step
-from art.serverless.client import Client, ExperimentalTrainingConfig
+from art.serverless.client import Client
 
 from .. import dev
 from .._backend_training import (
@@ -35,7 +38,7 @@ if TYPE_CHECKING:
     from wandb.sdk.artifacts.artifact import Artifact
 
     from ..model import Model, TrainableModel
-    from ..training import TrainingRunSpec
+    from ..training import PackedInputCaptureRef, TrainingRunSpec
     from .native_training import RemoteTrainingClient
 
 
@@ -88,6 +91,38 @@ def _canonicalize_upstream_metrics(metrics: dict[str, float]) -> dict[str, float
     }
 
 
+def _training_run_spec(model: AnyTrainableModel) -> "TrainingRunSpec":
+    from art.megatron.lora_config import default_lora_rank_for_handler
+    from art.megatron.model_support import (
+        default_target_modules_for_model,
+        get_model_support_handler,
+    )
+    from art.training import AdapterSpec, TrainingRunSpec
+
+    configured = model.lora_config or {}
+    allow_unvalidated = bool(
+        (model._internal_config or {}).get("allow_unvalidated_arch", False)
+    )
+    handler = get_model_support_handler(
+        model.base_model,
+        allow_unvalidated_arch=allow_unvalidated,
+    )
+    return TrainingRunSpec(
+        base_model=model.base_model,
+        adapter=AdapterSpec(
+            rank=int(configured.get("rank") or default_lora_rank_for_handler(handler)),
+            target_modules=tuple(
+                configured.get("target_modules")
+                or default_target_modules_for_model(
+                    model.base_model,
+                    allow_unvalidated_arch=allow_unvalidated,
+                )
+            ),
+        ),
+        seed=configured.get("random_state"),
+    )
+
+
 class ServerlessBackend:
     def __init__(
         self, *, api_key: str | None = None, base_url: str | None = None
@@ -95,6 +130,11 @@ class ServerlessBackend:
         client = Client(api_key=api_key, base_url=base_url)
         self._base_url = str(client.base_url)
         self._client = client
+        self._training_clients: dict[str, RemoteTrainingClient] = {}
+        self._native_steps: dict[str, int] = {}
+        self._native_artifacts: dict[str, str] = {}
+        self._retain_next_inputs: set[str] = set()
+        self._retained_inputs: dict[str, list["PackedInputCaptureRef"]] = {}
 
     def logs_sft_metrics_remotely(self) -> bool:
         return True
@@ -103,7 +143,13 @@ class ServerlessBackend:
         return "rollout_supply"
 
     async def close(self) -> None:
-        await self._client.close()  # ty:ignore[possibly-missing-attribute]
+        try:
+            await asyncio.gather(
+                *(client.close() for client in self._training_clients.values())
+            )
+        finally:
+            self._training_clients.clear()
+            await self._client.close()  # ty:ignore[possibly-missing-attribute]
 
     async def register(
         self,
@@ -246,6 +292,48 @@ class ServerlessBackend:
             poll_interval_s=poll_interval_s,
         )
 
+    async def training_client(self, model: AnyTrainableModel) -> "RemoteTrainingClient":
+        """Return the one native sequenced client owned by this model run."""
+
+        key = model._storage_name()
+        client = self._training_clients.get(key)
+        if client is not None:
+            return client
+        spec = _training_run_spec(model)
+        request_id = (
+            "resolve-"
+            + hashlib.sha256(
+                json.dumps(
+                    {
+                        "project": model.project,
+                        "entity": model.entity,
+                        "run_name": model.run_name,
+                        "spec": spec.model_dump(mode="json"),
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode()
+            ).hexdigest()
+        )
+        client = await self.create_training_client(
+            request_id=request_id,
+            run_name=model.run_name,
+            spec=spec,
+        )
+        self._training_clients[key] = client
+        model.run_id = client.run_id
+        return client
+
+    def retain_next_packed_input(self, model: AnyTrainableModel) -> None:
+        """Keep the next exact packed input alive for a later matched replay."""
+
+        self._retain_next_inputs.add(model._storage_name())
+
+    def retained_packed_inputs(
+        self, model: AnyTrainableModel
+    ) -> tuple["PackedInputCaptureRef", ...]:
+        return tuple(self._retained_inputs.get(model._storage_name(), ()))
+
     # Note: _log() method has been moved to the Model class (frontend)
     # Trajectories are now saved locally by the Model.log() method
 
@@ -370,7 +458,6 @@ class ServerlessBackend:
             # Optionally log training metrics:
             # await model.log(metrics=result.metrics, step=result.step)
         """
-        del optimizer_save_interval
         groups_list = list(trajectory_groups)
         if loss_fn is None:
             resolved_loss_fn: Literal["cispo", "ppo"] = "ppo" if ppo else "cispo"
@@ -427,6 +514,7 @@ class ServerlessBackend:
             packed_sequence_length=packed_sequence_length,
             num_trajectories_learning_rate_multiplier_power=num_trajectories_learning_rate_multiplier_power,
             kl_ref_adapter_path=kl_ref_adapter_path,
+            optimizer_save_interval=optimizer_save_interval,
         )
         if kl_penalty_reference_step is not None:
             dev_config["kl_penalty_reference_step"] = kl_penalty_reference_step
@@ -447,10 +535,12 @@ class ServerlessBackend:
             trainer_started=trainer_started,
         )
 
-        # Get step and artifact name
-        step = await self._get_step(model)
-        artifact_name: str | None = None
-        if model.entity is not None:
+        key = model._storage_name()
+        step = self._native_steps.get(key)
+        if step is None:
+            step = await self._get_step(model)
+        artifact_name: str | None = self._native_artifacts.get(key)
+        if artifact_name is None and model.entity is not None:
             artifact_name = (
                 f"{model.entity}/{model.project}/{model._storage_name()}:step{step}"
             )
@@ -474,88 +564,132 @@ class ServerlessBackend:
         dev_config: dev.TrainConfig,
         verbose: bool = False,
     ) -> AsyncIterator[dict[str, float]]:
+        from art.distributed.trajectory_store import TrajectoryGroupBundle
+        from art.training import (
+            AdamConfig,
+            ForwardBackwardRequest,
+            LossConfig,
+            OptimStepRequest,
+            RlTrajectoryBatch,
+            SamplerPublication,
+            SaveWeightsForSamplerRequest,
+        )
+
         summary = summarize_trajectory_groups(trajectory_groups)
         base_metrics = build_training_summary_metrics(
             summary,
             include_trainable_groups=True,
         )
-        assert model.id is not None, "Model ID is required"
-        training_job = await self._client.training_jobs.create(  # ty:ignore[possibly-missing-attribute]
-            model_id=model.id,
-            trajectory_groups=trajectory_groups,
-            experimental_config=ExperimentalTrainingConfig(
-                advantage_balance=dev_config.get("advantage_balance"),
-                allow_training_without_logprobs=dev_config.get(
-                    "allow_training_without_logprobs"
-                ),
-                epsilon=dev_config.get("epsilon"),
-                epsilon_high=dev_config.get("epsilon_high"),
-                importance_sampling_level=dev_config.get("importance_sampling_level"),
-                kimi_k2_tau=dev_config.get("kimi_k2_tau"),
-                kl_penalty_coef=dev_config.get("kl_penalty_coef"),
-                kl_penalty_reference_step=dev_config.get("kl_penalty_reference_step"),
-                kl_penalty_source=dev_config.get("kl_penalty_source"),
-                kl_penalty_step_lag=dev_config.get("kl_penalty_step_lag"),
-                kl_ref_adapter_path=dev_config.get("kl_ref_adapter_path"),
-                learning_rate=config.learning_rate,
-                logprob_calculation_chunk_size=dev_config.get(
-                    "logprob_calculation_chunk_size"
-                ),
-                loss_fn="ppo" if dev_config.get("ppo") else "cispo",
-                mask_prob_ratio=dev_config.get("mask_prob_ratio"),
-                max_negative_advantage_importance_sampling_weight=dev_config.get(
-                    "max_negative_advantage_importance_sampling_weight"
-                ),
-                normalize_advantages=dev_config.get("scale_rewards"),
-                num_trajectories_learning_rate_multiplier_power=dev_config.get(
-                    "num_trajectories_learning_rate_multiplier_power"
-                ),
-                packed_sequence_length=dev_config.get("packed_sequence_length"),
-                plot_tensors=dev_config.get("plot_tensors"),
-                ppo=dev_config.get("ppo"),
-                precalculate_logprobs=dev_config.get("precalculate_logprobs"),
-                scale_learning_rate_by_reward_std_dev=dev_config.get(
-                    "scale_learning_rate_by_reward_std_dev"
-                ),
-                scale_rewards=dev_config.get("scale_rewards"),
-                truncated_importance_sampling=dev_config.get(
-                    "truncated_importance_sampling"
-                ),
+        if not trajectory_groups or not any(
+            group.trajectories for group in trajectory_groups
+        ):
+            raise ValueError("native training requires at least one trajectory")
+        client = await self.training_client(model)
+        versions = [
+            version
+            for group in trajectory_groups
+            for trajectory in group.trajectories
+            for version in (
+                trajectory.initial_policy_version,
+                trajectory.final_policy_version,
+            )
+            if version is not None
+        ]
+        current_version = client.projected_learner_version
+        batch = RlTrajectoryBatch(
+            groups=tuple(
+                TrajectoryGroupBundle.from_group(group) for group in trajectory_groups
             ),
+            min_source_version=min(versions, default=current_version),
+            max_source_version=max(versions, default=current_version),
         )
-        after: str | None = None
-        num_sequences: int | None = None
-        pbar: tqdm.tqdm | None = None
-        while True:
-            await asyncio.sleep(1)
-            async for event in self._client.training_jobs.events.list(  # ty:ignore[possibly-missing-attribute]
-                training_job_id=training_job.id, after=after or NOT_GIVEN
+        sequence_id = client.next_sequence_id
+        request_id = secrets.token_hex(16)
+        key = model._storage_name()
+        retain_input = key in self._retain_next_inputs
+        forward = await client.forward_backward(
+            ForwardBackwardRequest(
+                run_id=client.run_id,
+                request_id=f"fb-{request_id}",
+                sequence_id=sequence_id,
+                batch=batch,
+                loss=LossConfig(
+                    name="ppo" if dev_config.get("ppo") else "cispo",
+                    normalize_advantages=bool(dev_config.get("scale_rewards", True)),
+                    values=cast(
+                        dict[str, Any],
+                        {
+                            **config.model_dump(mode="python"),
+                            **dict(dev_config),
+                        },
+                    ),
+                ),
+                collect_packing_shapes=any(
+                    group._collect_packing_shape for group in trajectory_groups
+                ),
+                return_token_logprobs=False,
+                retain_packed_input=retain_input,
+            )
+        )
+        self._retain_next_inputs.discard(key)
+        forward_result = await forward.result()
+        capture = forward_result.packed_input_capture
+        if retain_input:
+            if capture is None or capture.content_sha256 is None:
+                raise RuntimeError("retained packed input has no exact content digest")
+            self._retained_inputs.setdefault(key, []).append(capture)
+        if forward_result.packing.group_shapes:
+            if len(forward_result.packing.group_shapes) != len(trajectory_groups):
+                raise RuntimeError("packed-group shapes changed cardinality")
+            for group, shape in zip(
+                trajectory_groups,
+                forward_result.packing.group_shapes,
+                strict=True,
             ):
-                if event.type == "gradient_step":
-                    assert pbar is not None and num_sequences is not None
-                    pbar.update(1)
-                    pbar.set_postfix(event.data)
-                    metrics = _canonicalize_upstream_metrics(
-                        {k: float(v) for k, v in event.data.items()}
-                    )
-                    yield {
-                        **base_metrics,
-                        **metrics,
-                        TRAIN_GRADIENT_STEPS_KEY: float(num_sequences),
-                    }
-                elif event.type == "training_started":
-                    num_sequences = event.data["num_sequences"]
-                    if pbar is None:
-                        pbar = tqdm.tqdm(total=num_sequences, desc="train")
-                    continue
-                elif event.type == "training_ended":
-                    return
-                elif event.type == "training_failed":
-                    error_message = event.data.get(
-                        "error_message", "Training failed with an unknown error"
-                    )
-                    raise RuntimeError(f"Training job failed: {error_message}")
-                after = event.id
+                group._packed_group_shape = shape
+
+        optimizer = await client.optim_step(
+            OptimStepRequest(
+                run_id=client.run_id,
+                request_id=f"optim-{request_id}",
+                sequence_id=client.next_sequence_id,
+                optimizer=AdamConfig(learning_rate=config.learning_rate),
+            )
+        )
+        optimizer_result = await optimizer.result()
+        publication_mode = (
+            "in_flight_lora"
+            if (model._internal_config or {}).get("rollout_weight_update_mode")
+            == "in_flight_lora"
+            else "versioned_lora"
+        )
+        publication = await client.save_weights_for_sampler(
+            SaveWeightsForSamplerRequest(
+                run_id=client.run_id,
+                request_id=f"publish-{request_id}",
+                sequence_id=client.next_sequence_id,
+                checkpoint_name=f"step-{optimizer_result.checkpoint.learner_version}",
+                publication=SamplerPublication(
+                    mode=publication_mode,
+                    model_alias=model.name,
+                ),
+            )
+        )
+        publication_result = await publication.result()
+        self._native_steps[key] = optimizer_result.checkpoint.learner_version
+        self._native_artifacts[key] = publication_result.lora
+        if verbose:
+            print(
+                "Native training operations: "
+                f"{forward.ref.operation_id}, {optimizer.ref.operation_id}, "
+                f"{publication.ref.operation_id}"
+            )
+        yield {
+            **base_metrics,
+            **forward_result.metrics,
+            **optimizer_result.metrics,
+            TRAIN_GRADIENT_STEPS_KEY: float(forward_result.packing.packed_sequences),
+        }
 
     async def _train_sft(
         self,

@@ -533,7 +533,11 @@ def test_shm_replay_is_one_layer_major_uint16_tensor() -> None:
         owner_actor_id="test-owner", capacity_bytes=1 << 20
     )
     try:
-        ref = store.create(packed, batch_id="route-batch")
+        ref = store.create(packed, batch_id="route-batch", compute_content_sha256=True)
+        duplicate = store.create(
+            packed, batch_id="route-batch-copy", compute_content_sha256=True
+        )
+        assert ref.content_sha256 == duplicate.content_sha256
         replay_specs = [
             spec for spec in ref.tensors if spec.name.startswith("moe_routing_replay/")
         ]

@@ -292,6 +292,7 @@ class PackingRequest(BaseModel):
     logprob_calculation_chunk_size: int = Field(default=1024, ge=1)
     include_moe_routing: bool = False
     collect_packing_shapes: bool = False
+    compute_content_sha256: bool = False
     group_ids: tuple[str, ...] = ()
     record_ids: tuple[str, ...] = ()
     min_source_version: int = Field(default=0, ge=0)

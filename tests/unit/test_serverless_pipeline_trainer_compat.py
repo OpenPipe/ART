@@ -151,55 +151,83 @@ async def test_serverless_train_model_forwards_experimental_config() -> None:
     model.id = "model-id"
 
     captured: dict[str, Any] = {}
-    backend._client.training_jobs.create = AsyncMock(  # type: ignore[attr-defined]
-        side_effect=lambda **kwargs: (
-            captured.update(kwargs) or SimpleNamespace(id="training-job-id")
-        )
+    client = SimpleNamespace(
+        run_id="run-native",
+        projected_learner_version=0,
+        next_sequence_id=0,
     )
 
-    async def events_list(**_kwargs: Any):
-        yield SimpleNamespace(id="event-id", type="training_ended", data={})
+    async def forward_backward(request: Any) -> Any:
+        captured["forward_backward"] = request
+        client.next_sequence_id = 1
+        result = SimpleNamespace(
+            packed_input_capture=None,
+            packing=SimpleNamespace(group_shapes=(), packed_sequences=1),
+            metrics={},
+        )
+        return SimpleNamespace(
+            ref=SimpleNamespace(operation_id="forward-backward"),
+            result=AsyncMock(return_value=result),
+        )
 
-    setattr(backend._client.training_jobs.events, "list", events_list)  # type: ignore[attr-defined]
+    async def optim_step(request: Any) -> Any:
+        captured["optim_step"] = request
+        client.next_sequence_id = 2
+        result = SimpleNamespace(
+            checkpoint=SimpleNamespace(learner_version=1), metrics={}
+        )
+        return SimpleNamespace(
+            ref=SimpleNamespace(operation_id="optim-step"),
+            result=AsyncMock(return_value=result),
+        )
 
-    async def no_sleep(_seconds: float) -> None:
-        return None
+    async def save_weights_for_sampler(request: Any) -> Any:
+        captured["save_weights_for_sampler"] = request
+        return SimpleNamespace(
+            ref=SimpleNamespace(operation_id="save-sampler"),
+            result=AsyncMock(return_value=SimpleNamespace(lora="lora-ref")),
+        )
 
-    with patch("art.serverless.backend.asyncio.sleep", no_sleep):
-        async for _ in backend._train_model(
-            model,
-            [_make_group()],
-            TrainConfig(learning_rate=7e-6, kl_penalty_coef=0.2),
-            {
-                "advantage_balance": 0.3,
-                "allow_training_without_logprobs": True,
-                "epsilon": 0.1,
-                "epsilon_high": 0.2,
-                "importance_sampling_level": "sequence",
-                "kimi_k2_tau": 0.4,
-                "kl_penalty_coef": 0.2,
-                "kl_penalty_reference_step": 0,
-                "kl_penalty_source": "sample",
-                "kl_ref_adapter_path": "/tmp/ref",
-                "logprob_calculation_chunk_size": 512,
-                "mask_prob_ratio": True,
-                "max_negative_advantage_importance_sampling_weight": 3.0,
-                "num_trajectories_learning_rate_multiplier_power": 0.5,
-                "packed_sequence_length": 4096,
-                "plot_tensors": True,
-                "ppo": True,
-                "precalculate_logprobs": True,
-                "scale_learning_rate_by_reward_std_dev": True,
-                "scale_rewards": False,
-                "truncated_importance_sampling": 2.0,
-            },
-        ):
-            pass
+    client.forward_backward = forward_backward
+    client.optim_step = optim_step
+    client.save_weights_for_sampler = save_weights_for_sampler
+    backend.training_client = AsyncMock(return_value=client)  # type: ignore[method-assign]
 
-    payload = captured["experimental_config"]
+    async for _ in backend._train_model(
+        model,
+        [_make_group()],
+        TrainConfig(learning_rate=7e-6, kl_penalty_coef=0.2),
+        {
+            "advantage_balance": 0.3,
+            "allow_training_without_logprobs": True,
+            "epsilon": 0.1,
+            "epsilon_high": 0.2,
+            "importance_sampling_level": "sequence",
+            "kimi_k2_tau": 0.4,
+            "kl_penalty_coef": 0.2,
+            "kl_penalty_reference_step": 0,
+            "kl_penalty_source": "sample",
+            "kl_ref_adapter_path": "/tmp/ref",
+            "logprob_calculation_chunk_size": 512,
+            "mask_prob_ratio": True,
+            "max_negative_advantage_importance_sampling_weight": 3.0,
+            "num_trajectories_learning_rate_multiplier_power": 0.5,
+            "packed_sequence_length": 4096,
+            "plot_tensors": True,
+            "ppo": True,
+            "precalculate_logprobs": True,
+            "scale_learning_rate_by_reward_std_dev": True,
+            "scale_rewards": False,
+            "truncated_importance_sampling": 2.0,
+        },
+    ):
+        pass
+
+    forward = captured["forward_backward"]
+    payload = forward.loss.values
     assert payload["learning_rate"] == 7e-6
-    assert payload["loss_fn"] == "ppo"
-    assert payload["normalize_advantages"] is False
+    assert forward.loss.name == "ppo"
+    assert forward.loss.normalize_advantages is False
     assert payload["packed_sequence_length"] == 4096
     assert payload["kl_penalty_coef"] == 0.2
     assert payload["kl_penalty_reference_step"] == 0

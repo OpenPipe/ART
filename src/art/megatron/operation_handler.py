@@ -98,10 +98,10 @@ class MegatronRetainedState(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    owner_id: str = Field(min_length=1)
+    owner_id: str = Field(min_length=1, max_length=255)
     resource: Literal["lora", "storage"]
-    bytes: int = Field(gt=0)
-    work_fingerprint: str = Field(min_length=1)
+    bytes: int = Field(gt=0, le=(1 << 63) - 1)
+    work_fingerprint: str = Field(min_length=1, max_length=128)
     expires_at: datetime | None = None
 
     @model_validator(mode="after")
@@ -117,18 +117,18 @@ class MegatronSamplerPublicationReceipt(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     operation_id: str = Field(min_length=1, max_length=64)
-    request_id: str = Field(min_length=1)
+    request_id: str = Field(min_length=1, max_length=255)
     publication_mode: Literal[
         "versioned_lora", "in_flight_lora", "external_lora", "merged_weights"
     ]
-    requested_public_alias: str = Field(min_length=1)
-    runtime_model_name: str = Field(min_length=1)
-    runtime_lora_name: str | None = Field(default=None, min_length=1)
-    serving_generation_id: str = Field(min_length=1)
+    requested_public_alias: str = Field(min_length=1, max_length=255)
+    runtime_model_name: str = Field(min_length=1, max_length=512)
+    runtime_lora_name: str | None = Field(default=None, min_length=1, max_length=512)
+    serving_generation_id: str = Field(min_length=1, max_length=255)
     learner_version: int = Field(ge=0)
     holder_update_sequence: int | None = Field(default=None, ge=0)
-    holder_update_id: str | None = Field(default=None, min_length=1)
-    retained: tuple[MegatronRetainedState, ...] = Field(min_length=1, max_length=16)
+    holder_update_id: str | None = Field(default=None, min_length=1, max_length=255)
+    retained: tuple[MegatronRetainedState, ...] = Field(min_length=1, max_length=8)
     result: SamplerWeightsResult
 
     def validate_command(
@@ -154,13 +154,14 @@ class MegatronSamplerPublicationReceipt(BaseModel):
             raise RuntimeError("sampler publication receipt changed command identity")
         paired_lora = self.publication_mode in {"versioned_lora", "in_flight_lora"}
         external_lora = self.publication_mode == "external_lora"
+        holder_backed = not external_lora
         holder_update = (
             self.holder_update_sequence is not None
             and self.holder_update_id is not None
         )
         if (
             paired_lora != (self.runtime_lora_name is not None)
-            or paired_lora != holder_update
+            or holder_backed != holder_update
             or external_lora != (self.result.external_lora is not None)
             or any(
                 item.resource != ("lora" if paired_lora or external_lora else "storage")
@@ -168,7 +169,7 @@ class MegatronSamplerPublicationReceipt(BaseModel):
             )
         ):
             raise RuntimeError("sampler publication retained the wrong resource kind")
-        if not paired_lora and (
+        if not holder_backed and (
             self.holder_update_sequence is not None or self.holder_update_id is not None
         ):
             raise RuntimeError("non-holder publication returned holder update evidence")
@@ -206,6 +207,7 @@ class _CapturedInput:
     packed: DistributedPackedBatch
     packing: PackingOutcome
     owners: set[str] = field(default_factory=set)
+    retained_for_replay: bool = False
 
 
 class _ResidentTrainer(Protocol):
@@ -283,6 +285,10 @@ class MegatronOperationHandler:
             raise ValueError("request and operation identities differ")
         if isinstance(request.batch, PackedInputCaptureRef):
             captured = await self._require_capture(request.batch, operation)
+            if request.batch.capture_id != operation.operation_id and (
+                not captured.retained_for_replay or captured.ref.content_sha256 is None
+            ):
+                raise ValueError("packed input was not retained for replay")
             if captured.control_fingerprint != _input_control_fingerprint(
                 request, operation
             ):
@@ -318,16 +324,21 @@ class MegatronOperationHandler:
                 manifest_sha256=_capture_manifest_sha256(
                     operation, packed, packing, fingerprint
                 ),
+                content_sha256=packed.leases.ref.content_sha256,
                 input_kind="rl",
                 min_source_version=request.batch.min_source_version,
                 max_source_version=request.batch.max_source_version,
             )
+            if request.retain_packed_input and ref.content_sha256 is None:
+                await self.runtime.release_batch(packed)
+                raise RuntimeError("replayable packed input has no content digest")
             self._captures[capture_id] = _CapturedInput(
                 ref=ref,
                 request_fingerprint=fingerprint,
                 control_fingerprint=_input_control_fingerprint(request, operation),
                 packed=packed,
                 packing=packing,
+                retained_for_replay=request.retain_packed_input,
             )
             return ref
 
@@ -414,6 +425,7 @@ class MegatronOperationHandler:
         captured = await self._require_capture(ref, None)
         if captured.owners:
             raise RuntimeError("cannot discard packed input owned by an operation")
+        captured.retained_for_replay = False
         await self._release_if_unowned(ref.capture_id)
 
     async def packing_for(self, ref: PackedInputCaptureRef) -> PackingOutcome:
@@ -460,6 +472,7 @@ class MegatronOperationHandler:
             raise RuntimeError("cannot close a run with open F/B contributions")
         for captured in self._captures.values():
             captured.owners.clear()
+            captured.retained_for_replay = False
         for capture_id in tuple(self._captures):
             await self._release_if_unowned(capture_id)
         if self._captures:
@@ -472,6 +485,7 @@ class MegatronOperationHandler:
         self._contributions.clear()
         for captured in self._captures.values():
             captured.owners.clear()
+            captured.retained_for_replay = False
         for capture_id in tuple(self._captures):
             await self._release_if_unowned(capture_id)
         if self._captures:
@@ -604,13 +618,14 @@ class MegatronOperationHandler:
         captured = self._captures.get(ref.capture_id)
         if captured is None or captured.ref != ref:
             raise ValueError("packed-input capture is absent or changed")
-        if operation is not None and ref.capture_id != operation.operation_id:
-            raise ValueError("packed input belongs to another operation")
         return captured
 
     async def _release_after_failed_execution(
         self, capture_id: str, primary: BaseException
     ) -> None:
+        captured = self._captures.get(capture_id)
+        if captured is not None:
+            captured.retained_for_replay = False
         try:
             await self._release_if_unowned(capture_id)
         except BaseException as cleanup:
@@ -620,7 +635,7 @@ class MegatronOperationHandler:
 
     async def _release_if_unowned(self, capture_id: str) -> None:
         captured = self._captures.get(capture_id)
-        if captured is None or captured.owners:
+        if captured is None or captured.owners or captured.retained_for_replay:
             return
         try:
             await self.runtime.release_batch(captured.packed)
@@ -656,6 +671,7 @@ class MegatronOperationHandler:
             ),
             include_moe_routing=self.trainer.runtime_spec.enable_moe_routing_replay,
             collect_packing_shapes=request.collect_packing_shapes,
+            compute_content_sha256=request.retain_packed_input,
             group_ids=tuple(
                 f"{operation.operation_id}:{index}"
                 for index in range(len(request.batch.groups))
@@ -783,10 +799,19 @@ def _input_fingerprint(
 def _input_control_fingerprint(
     request: ForwardRequest | ForwardBackwardRequest, operation: OperationRef
 ) -> str:
-    command = request.model_dump(mode="json", exclude={"batch"})
+    command = request.model_dump(
+        mode="json",
+        exclude={
+            "batch",
+            "run_id",
+            "request_id",
+            "sequence_id",
+            "retain_packed_input",
+        },
+    )
     return hashlib.sha256(
         json.dumps(
-            {"command": command, "operation": operation.model_dump(mode="json")},
+            {"command": command, "operation_kind": operation.kind},
             sort_keys=True,
             separators=(",", ":"),
         ).encode()

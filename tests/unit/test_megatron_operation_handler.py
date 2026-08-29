@@ -48,7 +48,7 @@ from art.training import (
 from art.trajectories import TrajectoryGroup
 
 
-def _packed_batch() -> DistributedPackedBatch:
+def _packed_batch(*, content_sha256: str | None = None) -> DistributedPackedBatch:
     item_sizes = {
         "tokens": ("int64", 8),
         "group_ids": ("int64", 8),
@@ -84,6 +84,7 @@ def _packed_batch() -> DistributedPackedBatch:
         sequence_length=8,
         byte_count=offset,
         storage_byte_count=offset,
+        content_sha256=content_sha256,
         pixel_values_present=(False,),
         image_grid_thw_present=(False,),
         prefix_tree_packing_stats=PrefixTreePackingStatsSpec(
@@ -326,6 +327,81 @@ async def test_handler_retains_f_b_input_until_optimizer_commit() -> None:
     assert handler.retained_contribution_inputs() == ()
     await handler.release_operation_input("forward")
     assert runtime.released[-1] == runtime.packed
+
+
+@pytest.mark.asyncio
+async def test_replay_capture_survives_optimizer_until_explicit_release() -> None:
+    runtime = _Runtime()
+    runtime.packed = _packed_batch(content_sha256="b" * 64)
+    trainer = _Trainer()
+    trainer.fail_optimizer = False
+    handler = MegatronOperationHandler(
+        runtime,  # type: ignore[arg-type]
+        trainer,
+        MegatronOperationConfig(
+            run_id="run",
+            training_session_id="session",
+            source=TrainerGeneration(
+                training_session_id="session",
+                policy_step=0,
+                generation_id=f"step-00000000-{'a' * 32}",
+                adapter_path="/adapter/0",
+            ),
+            optimizer_state_path="/optimizer",
+            rollout_model=RolloutModelSpec(payload={}),
+            output_adapter_root="/adapter",
+        ),
+    )
+    first = await handler(
+        ForwardBackwardRequest(
+            run_id="run",
+            request_id="fb",
+            sequence_id=0,
+            batch=_batch(),
+            loss=LossConfig(name="cispo"),
+            retain_packed_input=True,
+        ),
+        _operation("fb", "forward_backward", 0),
+        (),
+    )
+    capture = first.packed_input_capture
+    assert capture is not None and capture.content_sha256 == "b" * 64
+    await handler(
+        OptimStepRequest(
+            run_id="run",
+            request_id="optim",
+            sequence_id=1,
+            optimizer=AdamConfig(learning_rate=1e-5),
+        ),
+        _operation("optim", "optim_step", 1, output=1),
+        ("fb",),
+    )
+    assert runtime.released == []
+
+    await handler(
+        ForwardBackwardRequest(
+            run_id="run",
+            request_id="replay",
+            sequence_id=2,
+            batch=capture,
+            loss=LossConfig(name="cispo"),
+        ),
+        _operation("replay", "forward_backward", 2, parent=1),
+        (),
+    )
+    await handler(
+        OptimStepRequest(
+            run_id="run",
+            request_id="replay-optim",
+            sequence_id=3,
+            optimizer=AdamConfig(learning_rate=1e-5),
+        ),
+        _operation("replay-optim", "optim_step", 3, parent=1, output=2),
+        ("replay",),
+    )
+    assert runtime.released == []
+    await handler.discard_prepared_input(capture)
+    assert runtime.released == [runtime.packed]
 
 
 @pytest.mark.asyncio
