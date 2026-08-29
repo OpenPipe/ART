@@ -11,6 +11,7 @@ from art.training import (
     OptimStepRequest,
     RunCommandLedger,
     SupervisedTrajectoryBatch,
+    TokenLogprobs,
 )
 
 
@@ -114,3 +115,11 @@ async def test_load_cannot_discard_open_gradients() -> None:
             ),
             kind="load_state",
         )
+
+
+def test_token_logprobs_preserve_candidate_shape() -> None:
+    values = TokenLogprobs.from_values([-0.5, -1.0, -1.5, -2.0], shape=(2, 2))
+
+    assert values.shape == (2, 2)
+    assert values.value_count == 4
+    assert len(values.data) == 16

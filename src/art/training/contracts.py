@@ -209,11 +209,13 @@ class TokenLogprobs(Contract):
         return result
 
     @classmethod
-    def from_values(cls, values: list[float]) -> "TokenLogprobs":
+    def from_values(
+        cls, values: list[float], *, shape: tuple[int, ...] | None = None
+    ) -> "TokenLogprobs":
         buffer = array("f", values)
         if sys.byteorder != "little":
             buffer.byteswap()
-        return cls(shape=(len(values),), data=buffer.tobytes())
+        return cls(shape=shape or (len(values),), data=buffer.tobytes())
 
 
 class OperationResult(Contract):

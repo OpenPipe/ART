@@ -122,13 +122,11 @@ class GradientAccumulator:
             )
         self._sealed = operation_ids
 
-    def prepare_optimizer(self) -> AccumulatedGradientSums:
+    def prepare_local_sums(self) -> AccumulatedGradientSums:
         if self._sealed is None:
             raise RuntimeError("gradient accumulator must be sealed before optimizer")
         if self._resident_tokens is None:
             raise RuntimeError("last gradient contribution is not resident")
-        if self._expected_global_tokens is None:
-            raise RuntimeError("optimizer gradients lack global token provenance")
         if self._flush_gradients is not None:
             self._flush_gradients(self.model_chunks)
         gradients = self._main_gradients()
@@ -145,6 +143,12 @@ class GradientAccumulator:
             expected_global_token_count=self._expected_global_tokens,
             reduction=self._reduction,
         )
+
+    def prepare_optimizer(self) -> AccumulatedGradientSums:
+        prepared = self.prepare_local_sums()
+        if prepared.expected_global_token_count is None:
+            raise RuntimeError("optimizer gradients lack global token provenance")
+        return prepared
 
     def consume(self) -> tuple[str, ...]:
         if self._sealed is None:

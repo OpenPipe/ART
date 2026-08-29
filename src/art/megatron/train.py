@@ -71,6 +71,7 @@ from art.megatron.routing_replay import (
 )
 from art.megatron.runtime.data_plane import SFTBatchData
 from art.megatron.runtime.specs import (
+    ForwardBackwardJobSpec,
     PackedTokenScore,
     ResidentLoraExport,
     ResidentLoraInspectionShard,
@@ -253,6 +254,7 @@ class RLForwardBackwardState(BaseModel):
     probs_corr_total: torch.Tensor
     kl_values: tuple[float, ...]
     new_logprobs: tuple[torch.Tensor, ...]
+    sample_indices: tuple[int | None, ...]
     token_count: torch.Tensor
     micro_count: int = Field(ge=1)
     schedule: MCoreScheduleAdapter[PreparedRLMicroInputs]
@@ -267,6 +269,14 @@ class SFTForwardBackwardState(BaseModel):
     prepared_micros: tuple[PreparedSFTMicroInputs, ...]
     device: torch.device
     schedule: MCoreScheduleAdapter[PreparedSFTMicroInputs]
+
+
+class MegatronForwardBackwardJobResult(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    new_logprobs: tuple[torch.Tensor, ...]
+    local_token_count: torch.Tensor
+    metrics: dict[str, float] = Field(default_factory=dict)
 
 
 def print0(rank: int, *values: Any) -> None:
@@ -591,35 +601,24 @@ def build_training_runtime(
     return runtime
 
 
-def execute_megatron_rl_job(
+def _execute_megatron_rl_forward_backward_steps(
     runtime: TrainingRuntime,
-    job: TrainJobSpec,
+    job: TrainJobSpec | ForwardBackwardJobSpec,
     packed_tensors: PackedTensors,
     *,
-    progress_sink: Callable[[int, int, dict[str, float]], None],
-    adapter_ready_sink: Callable[[], None] | None,
-    snapshot_sink: Callable[
-        [TrainJobSpec, dict[str, torch.dtype], dict[str, Any], bool],
-        dict[str, float],
-    ]
-    | None = None,
+    before_step: Callable[[int], None],
+    after_step: Callable[[int, int, RLForwardBackwardState, float, float, float], None],
     cancelled: Event | None = None,
     replay_bundle: MoeRoutingReplayBundle | None = None,
-) -> dict[str, float]:
-    """Execute one current RL update from an in-memory packed batch."""
+    defer_grad_sync: bool = False,
+) -> tuple[dict[str, torch.dtype], float]:
     job_prepare_started = time.perf_counter()
-    adapter_dtypes = None
     template = None
     zero_template = None
     ref_logprobs_by_index = None
     cp_lookahead_state = None
-    inter_schedule_metrics: dict[str, float] = {}
     next_step_first_micro = None
     next_step_first_ref_logprobs = None
-    step_result = None
-    job_succeeded = False
-    final_metrics: dict[str, float] = {}
-
     try:
         global_grad_accumulation_sequences = resolve_global_grad_accumulation_sequences(
             job.config.grad_accumulation_sequences
@@ -640,7 +639,6 @@ def execute_megatron_rl_job(
         )
         replay_finalize_s = time.perf_counter() - replay_finalize_started
         adapter_dtypes = _prepare_rl_training_state(runtime, job)
-
         template = _clone_packed_tensors(select_indexed_inputs(packed_tensors, 0))
         zero_template = _zero_contribution_inputs(template)
         num_sequences, packed_sequence_length = map(int, packed_tensors["tokens"].shape)
@@ -691,7 +689,8 @@ def execute_megatron_rl_job(
             if cancelled is not None and cancelled.is_set():
                 from art.megatron.runtime.trainer_run import TrainingCancelledError
 
-                raise TrainingCancelledError("train job was cancelled")
+                raise TrainingCancelledError("F/B command was cancelled")
+            before_step(step_index)
             hybridep_token_counts = (
                 None
                 if hybridep_token_counts_by_step is None
@@ -745,13 +744,11 @@ def execute_megatron_rl_job(
                 else None
             )
             step_input_prepare_s = time.perf_counter() - step_input_prepare_started
-            train_step_started = time.perf_counter()
-            step_result = run_training_step(
+            started = time.perf_counter()
+            state = run_megatron_rl_forward_backward_step(
                 model_chunks=runtime.model,
                 provider=runtime.provider,
                 model_support_handler=runtime.model_support_handler,
-                optimizer=runtime.optimizer,
-                learning_rate=job.config.learning_rate,
                 inputs=micro_inputs,
                 config=job.config,
                 experimental_config=_experimental_train_config(job),
@@ -763,53 +760,140 @@ def execute_megatron_rl_job(
                 next_step_first_micro=next_step_first_micro,
                 next_step_first_ref_logprobs=next_step_first_ref_logprobs,
                 hybridep_token_counts=hybridep_token_counts,
-                before_optimizer_step=(
-                    runtime.optimizer_snapshot_barrier.wait_before_mutation
-                ),
                 inter_forward_backward_timing=(runtime.inter_forward_backward_timing),
+                defer_grad_sync=defer_grad_sync,
             )
-            train_step_s = time.perf_counter() - train_step_started
-            result_finalize_started = time.perf_counter()
-            print0(
-                runtime.rank,
-                "Correlation between old and new probabilities:",
-                step_result.probs_corr,
+            after_step(
+                step_index,
+                num_steps,
+                state,
+                time.perf_counter() - started,
+                replay_finalize_s,
+                step_input_prepare_s,
             )
-            _validate_train_step_result_finite(runtime, step_result)
-            final_metrics = _rl_step_metrics(
-                step_result,
-                num_gradient_steps=num_steps,
-                train_step_s=train_step_s,
-            )
-            if step_index == 0:
-                inter_schedule_metrics = {
-                    name: value
-                    for name, value in step_result.pipeline_metrics.items()
-                    if name.startswith(
-                        (
-                            _INTER_FORWARD_BACKWARD_GAP_PREFIX,
-                            _INTER_FORWARD_BACKWARD_GPU_GAP_PREFIX,
-                        )
-                    )
-                }
-            final_metrics.update(inter_schedule_metrics)
-            final_metrics["time/replay_finalize_s"] = replay_finalize_s
-            final_metrics["time/step_input_prepare_s"] = step_input_prepare_s
-            final_metrics["time/step_result_finalize_s"] = (
-                time.perf_counter() - result_finalize_started
-            )
-            if runtime.rank == 0:
-                progress_started = time.perf_counter()
-                progress_sink(step_index, num_steps, final_metrics)
-                final_metrics["time/step_progress_emit_s"] = (
-                    time.perf_counter() - progress_started
-                )
+        return adapter_dtypes, job_prepare_s
+    finally:
+        if template is not None:
+            del template
+        if zero_template is not None:
+            del zero_template
+        if ref_logprobs_by_index is not None:
+            del ref_logprobs_by_index
+        if "micro_inputs" in locals():
+            del micro_inputs
+        if next_step_first_micro is not None:
+            del next_step_first_micro
+        if next_step_first_ref_logprobs is not None:
+            del next_step_first_ref_logprobs
+        if cp_lookahead_state is not None:
+            cp_lookahead_state.pending_prepared_micro = None
 
+
+def execute_megatron_rl_job(
+    runtime: TrainingRuntime,
+    job: TrainJobSpec,
+    packed_tensors: PackedTensors,
+    *,
+    progress_sink: Callable[[int, int, dict[str, float]], None],
+    adapter_ready_sink: Callable[[], None] | None,
+    snapshot_sink: Callable[
+        [TrainJobSpec, dict[str, torch.dtype], dict[str, Any], bool],
+        dict[str, float],
+    ]
+    | None = None,
+    cancelled: Event | None = None,
+    replay_bundle: MoeRoutingReplayBundle | None = None,
+) -> dict[str, float]:
+    """Execute one current fused RL update from an in-memory packed batch."""
+    adapter_dtypes = None
+    inter_schedule_metrics: dict[str, float] = {}
+    final_metrics: dict[str, float] = {}
+    job_succeeded = False
+
+    def finish_step(
+        step_index: int,
+        num_steps: int,
+        state: RLForwardBackwardState,
+        forward_backward_s: float,
+        replay_finalize_s: float,
+        step_input_prepare_s: float,
+    ) -> None:
+        nonlocal final_metrics, inter_schedule_metrics
+        assert runtime.optimizer is not None
+        optimizer_started = time.perf_counter()
+        optimizer_result = run_megatron_optimizer_step(
+            optimizer=runtime.optimizer,
+            learning_rate=job.config.learning_rate,
+            model_support_handler=runtime.model_support_handler,
+            model_chunks=runtime.model,
+            before_step=runtime.optimizer_snapshot_barrier.wait_before_mutation,
+        )
+        optimizer_s = time.perf_counter() - optimizer_started
+        result_finalize_started = time.perf_counter()
+        result_build_started = time.perf_counter()
+        step_result = TrainStepResult(
+            **_finish_megatron_rl_forward_backward_step(state).model_dump(),
+            update_successful=optimizer_result.update_successful,
+            grad_norm=optimizer_result.grad_norm,
+            num_zeros_in_grad=optimizer_result.num_zeros_in_grad,
+        )
+        step_result.pipeline_metrics.update(
+            {
+                "time/post_schedule_optimizer_s": optimizer_s,
+                "time/post_schedule_result_build_s": (
+                    time.perf_counter() - result_build_started
+                ),
+            }
+        )
+        print0(
+            runtime.rank,
+            "Correlation between old and new probabilities:",
+            step_result.probs_corr,
+        )
+        _validate_train_step_result_finite(runtime, step_result)
+        final_metrics = _rl_step_metrics(
+            step_result,
+            num_gradient_steps=num_steps,
+            train_step_s=forward_backward_s + optimizer_s,
+        )
+        if step_index == 0:
+            inter_schedule_metrics = {
+                name: value
+                for name, value in step_result.pipeline_metrics.items()
+                if name.startswith(
+                    (
+                        _INTER_FORWARD_BACKWARD_GAP_PREFIX,
+                        _INTER_FORWARD_BACKWARD_GPU_GAP_PREFIX,
+                    )
+                )
+            }
+        final_metrics.update(inter_schedule_metrics)
+        final_metrics["time/replay_finalize_s"] = replay_finalize_s
+        final_metrics["time/step_input_prepare_s"] = step_input_prepare_s
+        final_metrics["time/step_result_finalize_s"] = (
+            time.perf_counter() - result_finalize_started
+        )
+        if runtime.rank == 0:
+            progress_started = time.perf_counter()
+            progress_sink(step_index, num_steps, final_metrics)
+            final_metrics["time/step_progress_emit_s"] = (
+                time.perf_counter() - progress_started
+            )
+
+    try:
+        adapter_dtypes, job_prepare_s = _execute_megatron_rl_forward_backward_steps(
+            runtime,
+            job,
+            packed_tensors,
+            before_step=lambda _step_index: None,
+            after_step=finish_step,
+            cancelled=cancelled,
+            replay_bundle=replay_bundle,
+        )
         if cancelled is not None and cancelled.is_set():
             from art.megatron.runtime.trainer_run import TrainingCancelledError
 
             raise TrainingCancelledError("train job was cancelled")
-
         if snapshot_sink is None or adapter_ready_sink is None:
             raise RuntimeError("Typed training requires a snapshot publisher")
         if runtime.adapter_export_config is None:
@@ -847,23 +931,98 @@ def execute_megatron_rl_job(
             runtime.optimizer_state_loaded = False
         if adapter_dtypes is not None:
             del adapter_dtypes
-        if template is not None:
-            del template
-        if zero_template is not None:
-            del zero_template
-        if ref_logprobs_by_index is not None:
-            del ref_logprobs_by_index
-        if "micro_inputs" in locals():
-            del micro_inputs
-        if next_step_first_micro is not None:
-            del next_step_first_micro
-        if next_step_first_ref_logprobs is not None:
-            del next_step_first_ref_logprobs
-        if step_result is not None:
-            del step_result
-        if cp_lookahead_state is not None:
-            cp_lookahead_state.pending_prepared_micro = None
-            del cp_lookahead_state
+
+
+def execute_megatron_rl_forward_backward_job(
+    runtime: TrainingRuntime,
+    job: ForwardBackwardJobSpec,
+    packed_tensors: PackedTensors,
+    *,
+    gradient_accumulator: Any,
+    cancelled: Event | None = None,
+) -> MegatronForwardBackwardJobResult:
+    """Execute one independently admitted F/B contribution."""
+    from art.megatron.training.gradient_accumulator import GradientAccumulator
+
+    observed_tokens = int(packed_tensors["assistant_mask"][:, 1:].sum().item())
+    if observed_tokens != job.expected_global_loss_bearing_tokens:
+        raise RuntimeError(
+            "packed F/B loss-bearing token count differs from command provenance: "
+            f"observed={observed_tokens}, "
+            f"expected={job.expected_global_loss_bearing_tokens}"
+        )
+    gradient_accumulator.before_forward_backward()
+    internal = GradientAccumulator(
+        runtime.model,
+        flush_gradients=flush_param_grads_to_main_grads,
+    )
+    states: list[RLForwardBackwardState] = []
+    durations: list[float] = []
+
+    def before_step(step_index: int) -> None:
+        if step_index:
+            internal.before_forward_backward()
+
+    def record_step(
+        step_index: int,
+        _num_steps: int,
+        state: RLForwardBackwardState,
+        duration_s: float,
+        _replay_finalize_s: float,
+        _step_input_prepare_s: float,
+    ) -> None:
+        internal.record(f"{job.operation_id}:{step_index}", state.token_count)
+        states.append(state)
+        durations.append(duration_s)
+
+    _, job_prepare_s = _execute_megatron_rl_forward_backward_steps(
+        runtime,
+        job,
+        packed_tensors,
+        before_step=before_step,
+        after_step=record_step,
+        cancelled=cancelled,
+        defer_grad_sync=True,
+    )
+    internal.seal(internal.contribution_ids)
+    local_sums = internal.prepare_local_sums()
+    gradient_accumulator.record(
+        job.operation_id,
+        local_sums.local_token_count,
+        expected_global_token_count=job.expected_global_loss_bearing_tokens,
+    )
+    internal.consume()
+    results = tuple(
+        _finish_megatron_rl_forward_backward_step(state) for state in states
+    )
+    if any(not torch.isfinite(result.reduced_loss).item() for result in results):
+        raise RuntimeError("Megatron F/B produced a non-finite loss")
+    runtime.resident_training_session_id = job.training_session_id
+    runtime.resident_policy_step = job.expected_learner_version
+    runtime.resident_generation_id = job.source.generation_id
+    runtime.optimizer_state_loaded = True
+    return MegatronForwardBackwardJobResult(
+        new_logprobs=tuple(
+            values
+            for _, values in sorted(
+                (
+                    (sample_index, values)
+                    for state in states
+                    for sample_index, values in zip(
+                        state.sample_indices, state.new_logprobs, strict=True
+                    )
+                    if sample_index is not None
+                ),
+                key=lambda item: item[0],
+            )
+        ),
+        local_token_count=local_sums.local_token_count,
+        metrics={
+            "time/forward_backward_s": sum(durations),
+            "time/job_prepare_s": job_prepare_s,
+            "data/gradient_steps": float(len(results)),
+        },
+    )
 
 
 def execute_megatron_sft_job(
@@ -996,20 +1155,22 @@ def execute_megatron_sft_job(
             del adapter_dtypes
 
 
-def _experimental_train_config(job: TrainJobSpec) -> dev.TrainConfig:
+def _experimental_train_config(
+    job: TrainJobSpec | ForwardBackwardJobSpec,
+) -> dev.TrainConfig:
     return cast(
         dev.TrainConfig,
         job.experimental_config.model_dump(exclude_none=True),
     )
 
 
-def _moe_replay_strict(job: TrainJobSpec) -> bool:
+def _moe_replay_strict(job: TrainJobSpec | ForwardBackwardJobSpec) -> bool:
     return job.experimental_config.moe_routing_replay_strict
 
 
 def _prepare_rl_training_state(
     runtime: TrainingRuntime,
-    job: TrainJobSpec | SFTJobSpec,
+    job: TrainJobSpec | SFTJobSpec | ForwardBackwardJobSpec,
 ) -> dict[str, torch.dtype]:
     state_is_resident = (
         runtime.optimizer_persistent
@@ -2353,7 +2514,7 @@ def _reference_sample_step_indices(
 def _prepare_kl_reference_logprobs(
     *,
     runtime: TrainingRuntime,
-    job: TrainJobSpec,
+    job: TrainJobSpec | ForwardBackwardJobSpec,
     packed_tensors: PackedTensors,
     num_sequences: int,
     num_steps: int,
@@ -2950,6 +3111,7 @@ def run_megatron_rl_forward_backward_step(
         new_logprobs=tuple(
             cast(torch.Tensor, data["new_logprobs"]) for data in pipeline_results
         ),
+        sample_indices=tuple(micro_sample_indices),
         token_count=token_count,
         micro_count=micro_count,
         schedule=schedule,

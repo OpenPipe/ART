@@ -11,6 +11,7 @@ from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, model_validator
 from art.distributed.adapter_transport import AdapterTransferTarget
 from art.distributed.data_plane import PackedBatchRef
 from art.distributed.specs import NixlTransportSpec, TrainerMeshSpec
+from art.training.contracts import AdamConfig, OperationRef
 from art.types import TrainConfig, TrainSFTConfig
 
 
@@ -215,6 +216,131 @@ class TrainJobSpec(_TrainerJobSpec):
                 "batch source policy version cannot be newer than the learner"
             )
         return self
+
+
+class _ForwardCommandJobSpec(_Spec):
+    operation: OperationRef
+    training_session_id: str = Field(min_length=1)
+    source: TrainerGeneration
+    optimizer_state_path: str = Field(min_length=1)
+    batch: PackedBatchRef
+    expected_global_loss_bearing_tokens: int = Field(ge=1)
+    config: CurrentTrainConfig
+    experimental_config: ExperimentalTrainConfig = ExperimentalTrainConfig()
+    return_token_logprobs: bool = True
+
+    @model_validator(mode="after")
+    def _validate_source(self) -> "_ForwardCommandJobSpec":
+        if (
+            self.source.training_session_id != self.training_session_id
+            or self.source.policy_step != self.operation.learner_parent_version
+        ):
+            raise ValueError("source generation does not identify the command parent")
+        if self.batch.max_source_version > self.operation.learner_parent_version:
+            raise ValueError(
+                "batch source policy version cannot be newer than the learner"
+            )
+        return self
+
+    @property
+    def operation_id(self) -> str:
+        return self.operation.operation_id
+
+    @property
+    def run_id(self) -> str:
+        return self.operation.run_id
+
+    @property
+    def sequence_id(self) -> int:
+        return self.operation.sequence_id
+
+    @property
+    def expected_learner_version(self) -> int:
+        return self.operation.learner_parent_version
+
+    @property
+    def source_policy_step(self) -> int:
+        return self.expected_learner_version
+
+    @property
+    def source_adapter_path(self) -> str:
+        return self.source.adapter_path
+
+    @property
+    def fingerprint(self) -> str:
+        return _fingerprint(self)
+
+
+class ForwardBackwardJobSpec(_ForwardCommandJobSpec):
+    """One admitted packed F/B contribution against a fixed learner."""
+
+    @model_validator(mode="after")
+    def _validate_operation(self) -> "ForwardBackwardJobSpec":
+        if self.operation.kind != "forward_backward":
+            raise ValueError("F/B job requires a forward_backward operation")
+        return self
+
+
+class ForwardJobSpec(_ForwardCommandJobSpec):
+    """One forward-only command against a fixed learner."""
+
+    @model_validator(mode="after")
+    def _validate_operation(self) -> "ForwardJobSpec":
+        if self.operation.kind != "forward":
+            raise ValueError("forward job requires a forward operation")
+        return self
+
+
+class OptimizerJobSpec(_Spec):
+    """Seal exact F/B contributions into one learner transition."""
+
+    operation: OperationRef
+    training_session_id: str = Field(min_length=1)
+    generation: TrainerGeneration
+    contributing_forward_backward_operation_ids: tuple[str, ...] = Field(min_length=1)
+    optimizer: AdamConfig
+
+    @model_validator(mode="after")
+    def _validate_transition(self) -> "OptimizerJobSpec":
+        output_version = self.operation.reserved_output_learner_version
+        if self.operation.kind != "optim_step" or output_version is None:
+            raise ValueError("optimizer job requires an optim_step operation")
+        if (
+            self.generation.training_session_id != self.training_session_id
+            or self.generation.policy_step != output_version
+        ):
+            raise ValueError("optimizer generation does not identify the new learner")
+        if len(set(self.contributing_forward_backward_operation_ids)) != len(
+            self.contributing_forward_backward_operation_ids
+        ):
+            raise ValueError("optimizer contribution IDs must be unique")
+        return self
+
+    @property
+    def operation_id(self) -> str:
+        return self.operation.operation_id
+
+    @property
+    def run_id(self) -> str:
+        return self.operation.run_id
+
+    @property
+    def sequence_id(self) -> int:
+        return self.operation.sequence_id
+
+    @property
+    def expected_learner_version(self) -> int:
+        return self.operation.learner_parent_version
+
+    @property
+    def learner_version(self) -> int:
+        value = self.operation.reserved_output_learner_version
+        assert value is not None
+        return value
+
+    @property
+    def fingerprint(self) -> str:
+        return _fingerprint(self)
 
 
 class SFTJobSpec(_TrainerJobSpec):
