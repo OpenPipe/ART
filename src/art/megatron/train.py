@@ -228,6 +228,47 @@ class TrainStepResult(BaseModel):
     pipeline_metrics: dict[str, float] = Field(default_factory=dict)
 
 
+class MegatronOptimizerStepResult(BaseModel):
+    update_successful: bool
+    grad_norm: float
+    num_zeros_in_grad: int | None
+
+
+class MegatronForwardBackwardStepResult(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    reduced_loss: torch.Tensor
+    probs_corr: float
+    kl_policy_ref: float | None = None
+    new_logprobs: list[torch.Tensor]
+    workload: TrainingStepWorkload
+    loss_metrics: dict[str, float] = Field(default_factory=dict)
+    pipeline_metrics: dict[str, float] = Field(default_factory=dict)
+
+
+class RLForwardBackwardState(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    raw_loss_sum: torch.Tensor
+    probs_corr_total: torch.Tensor
+    kl_values: tuple[float, ...]
+    new_logprobs: tuple[torch.Tensor, ...]
+    token_count: torch.Tensor
+    micro_count: int = Field(ge=1)
+    schedule: MCoreScheduleAdapter[PreparedRLMicroInputs]
+    loss_diagnostics: LossOffPolicyDiagnosticsAccumulator
+    inter_schedule_metrics: dict[str, float] = Field(default_factory=dict)
+
+
+class SFTForwardBackwardState(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    raw_loss_sum: torch.Tensor
+    prepared_micros: tuple[PreparedSFTMicroInputs, ...]
+    device: torch.device
+    schedule: MCoreScheduleAdapter[PreparedSFTMicroInputs]
+
+
 def print0(rank: int, *values: Any) -> None:
     if rank == 0:
         print(*values)
@@ -1209,6 +1250,28 @@ def _optimizer_step(
     return update_successful, grad_norm, num_zeros_in_grad
 
 
+def run_megatron_optimizer_step(
+    *,
+    optimizer: Any,
+    learning_rate: float,
+    model_support_handler: Any | None = None,
+    model_chunks: ModelChunks | None = None,
+    before_step: Callable[[], None] | None = None,
+) -> MegatronOptimizerStepResult:
+    update_successful, grad_norm, num_zeros_in_grad = _optimizer_step(
+        optimizer,
+        learning_rate,
+        model_support_handler=model_support_handler,
+        model_chunks=model_chunks,
+        before_step=before_step,
+    )
+    return MegatronOptimizerStepResult(
+        update_successful=update_successful,
+        grad_norm=grad_norm,
+        num_zeros_in_grad=num_zeros_in_grad,
+    )
+
+
 def _reduce_loss_sum(
     loss_sum: torch.Tensor,
     token_count: torch.Tensor,
@@ -1408,14 +1471,28 @@ def _forward_prepared_rl_micro(
         return TokenLossOutput(token_losses=output)
 
 
-def _install_schedule_finalize(model_chunks: ModelChunks) -> None:
+def _defer_model_grad_finalization(
+    model: list[MegatronModule],
+    num_tokens: torch.Tensor | None = None,
+    **kwargs: Any,
+) -> None:
+    del model, num_tokens, kwargs
+
+
+def _install_schedule_finalize(
+    model_chunks: ModelChunks, *, defer_grad_sync: bool = False
+) -> None:
     seen: set[int] = set()
     for chunk in model_chunks:
         config = _unwrap_model_config([chunk])
         if config is None or id(config) in seen:
             continue
         seen.add(id(config))
-        config.finalize_model_grads_func = finalize_model_grads_extended
+        config.finalize_model_grads_func = (
+            _defer_model_grad_finalization
+            if defer_grad_sync
+            else finalize_model_grads_extended
+        )
 
 
 def _zero_logprob_graph_contribution(
@@ -2347,23 +2424,21 @@ def _snapshot_trainable_parameters(
     return snapshot
 
 
-def run_megatron_sft_step(
+def run_megatron_sft_forward_backward_step(
     *,
     model_chunks: ModelChunks,
     provider: Any,
     model_support_handler: Any,
-    optimizer: Any,
-    learning_rate: float,
     inputs: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]],
     step_index: int,
     sample_index: int | list[int | None],
     moe_routing_replay_controller: MoeRoutingReplayController | None = None,
     hybridep_token_counts: list[int] | None = None,
-    before_optimizer_step: Callable[[], None] | None = None,
-) -> TrainStepResult:
+    defer_grad_sync: bool = False,
+) -> SFTForwardBackwardState:
     micro_inputs = inputs if isinstance(inputs, list) else [inputs]
     if not micro_inputs:
-        raise ValueError("run_megatron_sft_step requires at least one trajectory")
+        raise ValueError("SFT forward/backward requires at least one trajectory")
 
     micro_sample_indices: list[int | None]
     if isinstance(sample_index, list):
@@ -2393,7 +2468,7 @@ def run_megatron_sft_step(
     )
 
     _zero_grad_buffers(model_chunks)
-    _install_schedule_finalize(model_chunks)
+    _install_schedule_finalize(model_chunks, defer_grad_sync=defer_grad_sync)
 
     pending_prepared_micro: PreparedMegatronBatch | None = None
     prepared_micros: list[PreparedSFTMicroInputs] = []
@@ -2476,30 +2551,70 @@ def run_megatron_sft_step(
         ),
         torch.zeros([], device=device, dtype=torch.float32),
     )
-    update_successful, grad_norm, num_zeros_in_grad = _optimizer_step(
-        optimizer,
-        learning_rate,
-        model_support_handler=model_support_handler,
-        model_chunks=model_chunks,
-        before_step=before_optimizer_step,
+    return SFTForwardBackwardState(
+        raw_loss_sum=raw_loss_sum,
+        prepared_micros=tuple(prepared_micros),
+        device=device,
+        schedule=schedule,
     )
-    num_tokens = _local_trainable_sft_token_count_tensor(prepared_micros, device=device)
+
+
+def _finish_megatron_sft_step(
+    state: SFTForwardBackwardState,
+    optimizer_result: MegatronOptimizerStepResult,
+) -> TrainStepResult:
+    num_tokens = _local_trainable_sft_token_count_tensor(
+        state.prepared_micros, device=state.device
+    )
     reduced_loss = _reduce_loss_sum(
-        raw_loss_sum,
+        state.raw_loss_sum,
         num_tokens,
         group=ps.get_data_parallel_group(with_context_parallel=True),
     )
-
     return TrainStepResult(
         reduced_loss=reduced_loss,
         probs_corr=1.0,
         new_logprobs=None,
-        update_successful=update_successful,
-        grad_norm=grad_norm,
-        num_zeros_in_grad=num_zeros_in_grad,
-        workload=schedule.training_workload(),
-        pipeline_metrics=schedule.telemetry.metrics(),
+        update_successful=optimizer_result.update_successful,
+        grad_norm=optimizer_result.grad_norm,
+        num_zeros_in_grad=optimizer_result.num_zeros_in_grad,
+        workload=state.schedule.training_workload(),
+        pipeline_metrics=state.schedule.telemetry.metrics(),
     )
+
+
+def run_megatron_sft_step(
+    *,
+    model_chunks: ModelChunks,
+    provider: Any,
+    model_support_handler: Any,
+    optimizer: Any,
+    learning_rate: float,
+    inputs: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]],
+    step_index: int,
+    sample_index: int | list[int | None],
+    moe_routing_replay_controller: MoeRoutingReplayController | None = None,
+    hybridep_token_counts: list[int] | None = None,
+    before_optimizer_step: Callable[[], None] | None = None,
+) -> TrainStepResult:
+    state = run_megatron_sft_forward_backward_step(
+        model_chunks=model_chunks,
+        provider=provider,
+        model_support_handler=model_support_handler,
+        inputs=inputs,
+        step_index=step_index,
+        sample_index=sample_index,
+        moe_routing_replay_controller=moe_routing_replay_controller,
+        hybridep_token_counts=hybridep_token_counts,
+    )
+    optimizer_result = run_megatron_optimizer_step(
+        optimizer=optimizer,
+        learning_rate=learning_rate,
+        model_support_handler=model_support_handler,
+        model_chunks=model_chunks,
+        before_step=before_optimizer_step,
+    )
+    return _finish_megatron_sft_step(state, optimizer_result)
 
 
 def _run_training_schedule(
@@ -2605,13 +2720,11 @@ def _run_training_schedule(
     return outputs, metrics
 
 
-def run_training_step(
+def run_megatron_rl_forward_backward_step(
     *,
     model_chunks: ModelChunks,
     provider: Any,
     model_support_handler: Any,
-    optimizer: Any,
-    learning_rate: float,
     inputs: PackedTensors | list[PackedTensors],
     config: types.TrainConfig,
     experimental_config: dev.TrainConfig,
@@ -2623,13 +2736,13 @@ def run_training_step(
     next_step_first_micro: PackedTensors | None = None,
     next_step_first_ref_logprobs: torch.Tensor | None = None,
     hybridep_token_counts: list[int] | None = None,
-    before_optimizer_step: Callable[[], None] | None = None,
     inter_forward_backward_timing: _InterForwardBackwardTiming | None = None,
-) -> TrainStepResult:
+    defer_grad_sync: bool = False,
+) -> RLForwardBackwardState:
     schedule_prepare_started = time.perf_counter()
     micro_inputs = inputs if isinstance(inputs, list) else [inputs]
     if not micro_inputs:
-        raise ValueError("run_training_step requires at least one packed sequence")
+        raise ValueError("RL forward/backward requires at least one packed sequence")
 
     micro_sample_indices: list[int | None]
     if isinstance(sample_index, list):
@@ -2666,7 +2779,7 @@ def run_training_step(
         cp_lookahead_state.pending_prepared_micro = None
 
     _zero_grad_buffers(model_chunks)
-    _install_schedule_finalize(model_chunks)
+    _install_schedule_finalize(model_chunks, defer_grad_sync=defer_grad_sync)
 
     micro_count = len(micro_inputs)
     prepared_micros: list[PreparedRLMicroInputs] = []
@@ -2819,57 +2932,121 @@ def run_training_step(
         device=device,
     )
     result_collect_s = time.perf_counter() - result_collect_started
+    inter_metrics_started = time.perf_counter()
+    inter_metrics = collect_inter_schedule_metrics()
+    inter_metrics_s = time.perf_counter() - inter_metrics_started
+    inter_metrics.update(
+        {
+            "time/schedule_prepare_s": schedule_prepare_s,
+            "time/post_schedule_replay_finalize_s": replay_finalize_s,
+            "time/post_schedule_result_collect_s": result_collect_s,
+            "time/post_schedule_inter_metrics_s": inter_metrics_s,
+        }
+    )
+    return RLForwardBackwardState(
+        raw_loss_sum=raw_loss_sum,
+        probs_corr_total=probs_corr_total,
+        kl_values=tuple(kl_values),
+        new_logprobs=tuple(
+            cast(torch.Tensor, data["new_logprobs"]) for data in pipeline_results
+        ),
+        token_count=token_count,
+        micro_count=micro_count,
+        schedule=schedule,
+        loss_diagnostics=loss_diagnostics,
+        inter_schedule_metrics=inter_metrics,
+    )
+
+
+def _finish_megatron_rl_forward_backward_step(
+    state: RLForwardBackwardState,
+) -> MegatronForwardBackwardStepResult:
+    loss_reduce_started = time.perf_counter()
+    reduced_loss = _reduce_loss_sum(
+        state.raw_loss_sum,
+        state.token_count,
+        group=ps.get_data_parallel_group(with_context_parallel=True),
+    )
+    loss_reduce_s = time.perf_counter() - loss_reduce_started
+    loss_metrics_started = time.perf_counter()
+    loss_metrics = state.loss_diagnostics.to_metrics(
+        group=ps.get_data_parallel_group(with_context_parallel=True),
+    )
+    loss_metrics_s = time.perf_counter() - loss_metrics_started
+    return MegatronForwardBackwardStepResult(
+        reduced_loss=reduced_loss,
+        probs_corr=float((state.probs_corr_total / state.micro_count).item()),
+        kl_policy_ref=(
+            sum(state.kl_values) / len(state.kl_values) if state.kl_values else None
+        ),
+        new_logprobs=list(state.new_logprobs),
+        workload=state.schedule.training_workload(),
+        loss_metrics=loss_metrics,
+        pipeline_metrics={
+            **state.schedule.telemetry.metrics(),
+            **state.inter_schedule_metrics,
+            "time/post_schedule_loss_reduce_s": loss_reduce_s,
+            "time/post_schedule_loss_metrics_s": loss_metrics_s,
+        },
+    )
+
+
+def run_training_step(
+    *,
+    model_chunks: ModelChunks,
+    provider: Any,
+    model_support_handler: Any,
+    optimizer: Any,
+    learning_rate: float,
+    inputs: PackedTensors | list[PackedTensors],
+    config: types.TrainConfig,
+    experimental_config: dev.TrainConfig,
+    step_index: int,
+    sample_index: int | list[int | None],
+    ref_logprobs: torch.Tensor | list[torch.Tensor] | None = None,
+    moe_routing_replay_controller: MoeRoutingReplayController | None = None,
+    cp_lookahead_state: CpBatchLookaheadState | None = None,
+    next_step_first_micro: PackedTensors | None = None,
+    next_step_first_ref_logprobs: torch.Tensor | None = None,
+    hybridep_token_counts: list[int] | None = None,
+    before_optimizer_step: Callable[[], None] | None = None,
+    inter_forward_backward_timing: _InterForwardBackwardTiming | None = None,
+) -> TrainStepResult:
+    state = run_megatron_rl_forward_backward_step(
+        model_chunks=model_chunks,
+        provider=provider,
+        model_support_handler=model_support_handler,
+        inputs=inputs,
+        config=config,
+        experimental_config=experimental_config,
+        step_index=step_index,
+        sample_index=sample_index,
+        ref_logprobs=ref_logprobs,
+        moe_routing_replay_controller=moe_routing_replay_controller,
+        cp_lookahead_state=cp_lookahead_state,
+        next_step_first_micro=next_step_first_micro,
+        next_step_first_ref_logprobs=next_step_first_ref_logprobs,
+        hybridep_token_counts=hybridep_token_counts,
+        inter_forward_backward_timing=inter_forward_backward_timing,
+    )
     optimizer_started = time.perf_counter()
-    update_successful, grad_norm, num_zeros_in_grad = _optimizer_step(
-        optimizer,
-        learning_rate,
+    optimizer_result = run_megatron_optimizer_step(
+        optimizer=optimizer,
+        learning_rate=learning_rate,
         model_support_handler=model_support_handler,
         model_chunks=model_chunks,
         before_step=before_optimizer_step,
     )
     optimizer_s = time.perf_counter() - optimizer_started
-    loss_reduce_started = time.perf_counter()
-    reduced_loss = _reduce_loss_sum(
-        raw_loss_sum,
-        token_count,
-        group=ps.get_data_parallel_group(with_context_parallel=True),
-    )
-    loss_reduce_s = time.perf_counter() - loss_reduce_started
-    loss_metrics_started = time.perf_counter()
-    loss_metrics = loss_diagnostics.to_metrics(
-        group=ps.get_data_parallel_group(with_context_parallel=True),
-    )
-    loss_metrics_s = time.perf_counter() - loss_metrics_started
-    inter_metrics_started = time.perf_counter()
-    inter_metrics = collect_inter_schedule_metrics()
-    inter_metrics_s = time.perf_counter() - inter_metrics_started
-
     result_build_started = time.perf_counter()
-    pipeline_metrics = {
-        **schedule.telemetry.metrics(),
-        **inter_metrics,
-        "time/schedule_prepare_s": schedule_prepare_s,
-        "time/post_schedule_replay_finalize_s": replay_finalize_s,
-        "time/post_schedule_result_collect_s": result_collect_s,
-        "time/post_schedule_optimizer_s": optimizer_s,
-        "time/post_schedule_loss_reduce_s": loss_reduce_s,
-        "time/post_schedule_loss_metrics_s": loss_metrics_s,
-        "time/post_schedule_inter_metrics_s": inter_metrics_s,
-    }
+    forward_backward = _finish_megatron_rl_forward_backward_step(state)
     result = TrainStepResult(
-        reduced_loss=reduced_loss,
-        probs_corr=float((probs_corr_total / micro_count).item()),
-        kl_policy_ref=(sum(kl_values) / len(kl_values) if kl_values else None),
-        new_logprobs=[
-            cast(torch.Tensor, data["new_logprobs"]) for data in pipeline_results
-        ],
-        update_successful=update_successful,
-        grad_norm=grad_norm,
-        num_zeros_in_grad=num_zeros_in_grad,
-        workload=schedule.training_workload(),
-        loss_metrics=loss_metrics,
-        pipeline_metrics=pipeline_metrics,
+        **forward_backward.model_dump(),
+        update_successful=optimizer_result.update_successful,
+        grad_norm=optimizer_result.grad_norm,
+        num_zeros_in_grad=optimizer_result.num_zeros_in_grad,
     )
+    result.pipeline_metrics["time/post_schedule_optimizer_s"] = optimizer_s
     result.pipeline_metrics["time/post_schedule_result_build_s"] = (
         time.perf_counter() - result_build_started
     )
