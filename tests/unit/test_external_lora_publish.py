@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+from pathlib import Path
 
+import pytest
 from safetensors.torch import load
 import torch
 
@@ -112,6 +115,21 @@ def _ref(locator: str, payload: bytes) -> ExternalLoraObjectRef:
     )
 
 
+def _target(*, shard_bytes: int) -> ExternalLoraTarget:
+    return ExternalLoraTarget(
+        tenant_id="tenant",
+        run_id="run",
+        operation_id="operation",
+        training_session_id="session",
+        publication_id="publication",
+        generation_id="generation",
+        model_identity="test/model",
+        active_alias="run",
+        runtime_fingerprint="1" * 64,
+        shard_bytes=shard_bytes,
+    )
+
+
 def _prepared(*, shard_bytes: int = 32):
     key = "base_model.model.layers.0.self_attn.q_proj.lora_A.weight"
     tensor = torch.arange(24, dtype=torch.float32).reshape(4, 6)
@@ -124,18 +142,7 @@ def _prepared(*, shard_bytes: int = 32):
         block="layers.0",
     )
     pending = prepare_external_lora(
-        target=ExternalLoraTarget(
-            tenant_id="tenant",
-            run_id="run",
-            operation_id="operation",
-            training_session_id="session",
-            publication_id="publication",
-            generation_id="generation",
-            model_identity="test/model",
-            active_alias="run",
-            runtime_fingerprint="1" * 64,
-            shard_bytes=shard_bytes,
-        ),
+        target=_target(shard_bytes=shard_bytes),
         source_topology="tp1-cp1-ep1",
         local_tensors={key: tensor},
         local_metadata=[metadata],
@@ -205,3 +212,82 @@ def test_external_lora_rejects_changed_grant_before_writes() -> None:
 
     assert sink.events == [("authorize", None)]
     assert sink.objects == {}
+
+
+def test_external_lora_nccl_exchanges_rank_owned_blocks() -> None:
+    root_value = os.environ.get("ART_EXTERNAL_LORA_NCCL_DIR")
+    if root_value is None:
+        pytest.skip("set ART_EXTERNAL_LORA_NCCL_DIR under a two-rank torchrun")
+    rank = int(os.environ["RANK"])
+    world_size = int(os.environ["WORLD_SIZE"])
+    if world_size != 2:
+        raise RuntimeError("external LoRA NCCL conformance requires two ranks")
+    torch.cuda.set_device(rank)
+    torch.distributed.init_process_group("nccl")
+    try:
+        tensors = {}
+        metadata = []
+        if rank == 0:
+            for layer in range(2):
+                key = f"base_model.model.layers.{layer}.self_attn.q_proj.lora_A.weight"
+                tensor = torch.arange(
+                    layer * 24, (layer + 1) * 24, dtype=torch.float32, device="cuda"
+                ).reshape(4, 6)
+                tensors[key] = tensor
+                metadata.append(
+                    LoraShardMeta(
+                        key=key,
+                        owner_rank=0,
+                        shape=tuple(tensor.shape),
+                        dtype_name="float32",
+                        manifest={
+                            "sharded": False,
+                            "shard_world_size": 1,
+                            "shard_rank": 0,
+                        },
+                        block=f"layers.{layer}",
+                    )
+                )
+        pending = prepare_external_lora(
+            target=_target(shard_bytes=32),
+            source_topology="tp1-cp2-ep1",
+            local_tensors=tensors,
+            local_metadata=metadata,
+            local_packed_tensors={},
+            local_packed_metadata=[],
+            handler=_Handler(),
+            adapter_config={"r": 4, "target_modules": {"q_proj"}},
+            exchange_device=torch.device("cuda", rank),
+            stager=PinnedCpuSnapshotStager(),
+        )
+        prepared = pending.resolve()
+        root = Path(root_value)
+        root.mkdir(parents=True, exist_ok=True)
+        for index, chunks in prepared.shard_payloads().items():
+            (root / str(index)).write_bytes(b"".join(chunks))
+        torch.distributed.barrier()
+        if rank == 0:
+            files = {
+                item.relative_path: bytearray(item.size_bytes)
+                for item in prepared.plan.files
+            }
+            for shard in prepared.plan.shards:
+                payload = (root / str(shard.index)).read_bytes()
+                files[shard.relative_path][
+                    shard.file_offset : shard.file_offset + shard.size_bytes
+                ] = payload
+            result = load(bytes(files["adapter_model.safetensors"]))
+            assert len(result) == 2
+            for layer in range(2):
+                key = f"base_model.model.layers.{layer}.self_attn.q_proj.lora_A.weight"
+                assert torch.equal(
+                    result[key],
+                    torch.arange(
+                        layer * 24, (layer + 1) * 24, dtype=torch.float32
+                    ).reshape(4, 6),
+                )
+            for shard in prepared.plan.shards:
+                (root / str(shard.index)).unlink()
+            root.rmdir()
+    finally:
+        torch.distributed.destroy_process_group()
