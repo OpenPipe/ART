@@ -2,6 +2,8 @@ from typing import Any
 
 __all__ = [
     "MegatronBackend",
+    "MegatronGateCheckpointOperations",
+    "MegatronGateEvidenceRecorder",
     "MegatronOperationConfig",
     "MegatronOperationHandler",
     "MegatronOperationRuntime",
@@ -37,6 +39,13 @@ def __getattr__(name: str) -> Any:
         from .backend import MegatronBackend
 
         return MegatronBackend
+    if name in {
+        "MegatronGateCheckpointOperations",
+        "MegatronGateEvidenceRecorder",
+    }:
+        from . import gate_evidence
+
+        return getattr(gate_evidence, name)
     if name in {
         "MegatronOperationConfig",
         "MegatronOperationHandler",
