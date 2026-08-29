@@ -173,6 +173,7 @@ class _Trainer:
         self.registered_adapters: dict[str, tuple[int, tuple[str, ...]]] = {}
         self.run_states: dict[str, TrainerCommandRunState] = {}
         self.migration_releases: list[str] = []
+        self.optimizer_jobs = []
 
     async def register_command_run(self, run_spec):
         self.registered_runs.add(run_spec.run_id)
@@ -287,6 +288,7 @@ class _Trainer:
     async def optim_step(self, job):
         if self.fail_optimizer:
             raise RuntimeError("optimizer failed")
+        self.optimizer_jobs.append(job)
         self._advance(job, optimizer=True)
         return {
             "operation_id": job.operation_id,
@@ -484,6 +486,148 @@ async def test_handler_retains_f_b_input_until_optimizer_commit() -> None:
     assert handler.retained_contribution_inputs() == ()
     await handler.release_operation_input("forward")
     assert runtime.released[-1] == runtime.packed
+
+
+@pytest.mark.asyncio
+async def test_handler_connects_optimizer_snapshot_to_paired_publication() -> None:
+    class _Publisher:
+        def __init__(self) -> None:
+            self.calls = []
+
+        async def aclose(self):
+            pass
+
+        async def plan_artifacts(self, request, generation, *, template_adapter_path):
+            del request, generation, template_adapter_path
+            return SimpleNamespace()
+
+        async def save_weights_for_sampler(
+            self,
+            request,
+            operation,
+            generation,
+            *,
+            template_adapter_path,
+            optimizer_state_path,
+            staging_adapter_path,
+        ):
+            self.calls.append(
+                (
+                    generation,
+                    template_adapter_path,
+                    optimizer_state_path,
+                    staging_adapter_path,
+                )
+            )
+            timing = MegatronPolicyActivationTiming(
+                trainer_completed_monotonic_s=1,
+                serving_activated_monotonic_s=2,
+            )
+            result = SamplerWeightsResult(
+                operation_id=operation.operation_id,
+                metrics={POLICY_ACTIVATION_LAG_METRIC: 1.0},
+                checkpoint=CheckpointRef(
+                    run_id=operation.run_id,
+                    learner_version=generation.policy_step,
+                    checkpoint_id=request.checkpoint_name,
+                ),
+                lora="run:active",
+            )
+            return MegatronSamplerPublicationReceipt(
+                operation_id=operation.operation_id,
+                request_id=request.request_id,
+                publication_mode="in_flight_lora",
+                requested_public_alias="run",
+                runtime_model_name="model",
+                runtime_lora_name="run:active",
+                serving_generation_id=generation.generation_id,
+                learner_version=generation.policy_step,
+                policy_activation_timing=timing,
+                holder_update_sequence=1,
+                holder_update_id="update-1",
+                retained=(
+                    MegatronRetainedState(
+                        owner_id="owner",
+                        resource="lora",
+                        bytes=4096,
+                        work_fingerprint="f" * 64,
+                    ),
+                ),
+                result=result,
+            )
+
+    runtime = _Runtime()
+    trainer = _Trainer()
+    trainer.fail_optimizer = False
+    trainer.run_states["run"] = TrainerCommandRunState(
+        run_id="run",
+        training_session_id="session",
+        learner_version=0,
+        next_operation_sequence=0,
+        open_forward_backward_operation_ids=(),
+    )
+    publisher = _Publisher()
+    handler = MegatronOperationHandler(
+        runtime,  # type: ignore[arg-type]
+        trainer,
+        MegatronOperationConfig(
+            run_id="run",
+            training_session_id="session",
+            adapter=AdapterSpec(rank=8, target_modules=("q_proj",)),
+            source=TrainerGeneration(
+                training_session_id="session",
+                policy_step=0,
+                generation_id=f"step-00000000-{'a' * 32}",
+                adapter_path="/adapter/0",
+            ),
+            optimizer_state_path="/optimizer",
+            rollout_model=RolloutModelSpec(payload={}),
+            output_adapter_root="/adapter",
+        ),
+        publisher=publisher,
+    )
+    await handler(
+        ForwardBackwardRequest(
+            run_id="run",
+            request_id="fb",
+            sequence_id=0,
+            batch=_batch(),
+            loss=LossConfig(name="cispo"),
+        ),
+        _operation("fb", "forward_backward", 0),
+        (),
+    )
+    await handler(
+        OptimStepRequest(
+            run_id="run",
+            request_id="optim",
+            sequence_id=1,
+            optimizer=AdamConfig(learning_rate=1e-5),
+        ),
+        _operation("optim", "optim_step", 1, output=1),
+        ("fb",),
+    )
+    saved = await handler(
+        SaveWeightsForSamplerRequest(
+            run_id="run",
+            request_id="save",
+            sequence_id=2,
+            checkpoint_name="step-1",
+            publication=SamplerPublication(mode="in_flight_lora", model_alias="run"),
+        ),
+        _operation("save", "save_sampler", 2, parent=1),
+        (),
+    )
+
+    assert publisher.calls == [
+        (
+            trainer.optimizer_jobs[-1].generation,
+            "/adapter/0",
+            "/optimizer",
+            f"/megatron_runtime/staging/step-00000001-{'b' * 32}",
+        )
+    ]
+    assert saved.lora == "run:active"
 
 
 @pytest.mark.asyncio

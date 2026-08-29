@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
+from art.distributed.adapter_transport import AdapterTransferTarget
 from art.training.contracts import TokenLogprobs
 from art.utils.safetensors import PreparedSafetensors, SafetensorsLayout
 
@@ -23,11 +24,13 @@ from ..training.gradient_accumulator import GradientAccumulator
 from .data_plane import InMemoryPackedBatch, SFTBatchData, validate_packed_batch
 from .device_usage import measure_cuda_call
 from .publication import (
+    TrainerPublicationEvent,
     TrainerPublicationFailed,
     TrainerPublicationSucceeded,
     TrainerRankPublication,
 )
 from .specs import (
+    CommandPublicationSpec,
     ForwardBackwardJobSpec,
     ForwardJobSpec,
     OptimizerJobSpec,
@@ -46,6 +49,7 @@ from .specs import (
 from .trainer_run import EventSink
 
 if TYPE_CHECKING:
+    from art.megatron.lora import LoRASlotRef
     from art.megatron.optimizer_state import OptimizerAdapter
     from art.megatron.runtime.numerical_capture import (
         ForwardBackwardNumericalRankReceipt,
@@ -134,6 +138,10 @@ class MegatronTrainJobExecutor:
         self._accumulator_l1_budget_bytes = accumulator_l1_budget_bytes
         self._python_gc_stabilized = False
         self._closed = False
+
+    @property
+    def publisher(self) -> "_GenerationPublisher":
+        return self._publisher
 
     def execute(
         self,
@@ -586,6 +594,34 @@ class _ResidentCommandRun:
     portable_read: PortableSnapshotReadReceipt | None = None
 
 
+class _CommandPublicationSink:
+    def __init__(self) -> None:
+        self.future: Future[TrainerRankPublication] = Future()
+
+    def progress(
+        self, *, step_index: int, num_steps: int, metrics: dict[str, float]
+    ) -> None:
+        del step_index, num_steps, metrics
+
+    def adapter_ready(self, *, learner_version: int, adapter_path: str) -> None:
+        del learner_version, adapter_path
+
+    def publication(self, event: TrainerPublicationEvent) -> None:
+        if self.future.done():
+            raise RuntimeError("command publication settled twice")
+        if isinstance(event, TrainerPublicationSucceeded):
+            self.future.set_result(event.record)
+            return
+        if not isinstance(event, TrainerPublicationFailed):
+            raise TypeError("command publication returned an unknown event")
+        self.future.set_exception(
+            RuntimeError(
+                f"rank {event.rank} publication failed "
+                f"({event.error_type}): {event.message}"
+            )
+        )
+
+
 class MCoreRunSlotExecutor:
     """Execute independent exact-shape LoRAs on one warm MCore rank."""
 
@@ -596,6 +632,7 @@ class MCoreRunSlotExecutor:
         accumulator_l1_budget_bytes: int = 16 * 1024**3,
         portable_snapshot_source: PortableSnapshotSource | None = None,
         portable_snapshot_sink: PortableSnapshotSink | None = None,
+        publisher: "_GenerationPublisher | None" = None,
     ) -> None:
         from art.trainer_rank import TrainerRank
 
@@ -605,6 +642,10 @@ class MCoreRunSlotExecutor:
         self._accumulator_l1_budget_bytes = accumulator_l1_budget_bytes
         self._portable_snapshot_source = portable_snapshot_source
         self._portable_snapshot_sink = portable_snapshot_sink
+        self._publisher = publisher or _GenerationPublisher(
+            runtime, capacity=int(runtime.snapshot_pool_capacity)
+        )
+        self._owns_publisher = publisher is None
         self._closed = False
 
     def register_run(self, spec: TrainingRunSpec) -> PortableSnapshotReadReceipt | None:
@@ -986,6 +1027,25 @@ class MCoreRunSlotExecutor:
             },
         }
 
+    def publish_generation(self, spec: CommandPublicationSpec) -> dict[str, Any]:
+        state = self._runs.get(spec.run_id)
+        if state is None or state.learner_version != spec.generation.policy_step:
+            raise RuntimeError("published generation is not resident")
+        if state.spec.training_session_id != spec.generation.training_session_id:
+            raise RuntimeError("published generation belongs to another session")
+        if state.gradients.contribution_ids:
+            raise RuntimeError("cannot publish a generation with open gradients")
+        sink = _CommandPublicationSink()
+        metrics = self._publisher.submit_command(spec, sink=sink)
+        record = sink.future.result()
+        return {
+            "run_id": spec.run_id,
+            "generation_id": spec.generation.generation_id,
+            "rank": int(self.runtime.rank),
+            "record": record.model_dump(mode="json"),
+            "metrics": metrics,
+        }
+
     def run_gradient_ids(self, run_id: str) -> tuple[str, ...]:
         state = self._runs.get(run_id)
         return () if state is None else state.gradients.contribution_ids
@@ -1019,6 +1079,8 @@ class MCoreRunSlotExecutor:
         if self._closed:
             return
         self._closed = True
+        if self._owns_publisher:
+            self._publisher.close()
         for state in self._runs.values():
             state.gradients.discard()
         self._runs.clear()
@@ -1101,6 +1163,55 @@ class _GenerationPublisher:
         *,
         sink: EventSink,
     ) -> dict[str, float]:
+        return self._submit(
+            generation=job.output.generation,
+            optimizer_state_path=job.output.optimizer_state_path,
+            staging_adapter_path=job.output.staging_adapter_path,
+            adapter_dtypes=adapter_dtypes,
+            adapter_config=adapter_config,
+            save_optimizer=save_optimizer,
+            publication_targets=job.publication_targets,
+            sink=sink,
+        )
+
+    def submit_command(
+        self,
+        spec: CommandPublicationSpec,
+        *,
+        sink: EventSink,
+    ) -> dict[str, float]:
+        from art.megatron.lora import LoRASlotRef
+
+        runtime = self.runtime
+        adapter_dtypes = runtime.adapter_export_dtypes
+        adapter_config = runtime.adapter_export_config
+        if adapter_dtypes is None or adapter_config is None:
+            raise RuntimeError("resident command adapter export is not configured")
+        return self._submit(
+            generation=spec.generation,
+            optimizer_state_path=spec.optimizer_state_path,
+            staging_adapter_path=spec.staging_adapter_path,
+            adapter_dtypes=adapter_dtypes,
+            adapter_config=adapter_config,
+            save_optimizer=False,
+            publication_targets=spec.publication_targets,
+            slot_ref=LoRASlotRef("checkpoint", spec.run_id),
+            sink=sink,
+        )
+
+    def _submit(
+        self,
+        *,
+        generation: TrainerGeneration,
+        optimizer_state_path: str,
+        staging_adapter_path: str,
+        adapter_dtypes: dict[str, Any],
+        adapter_config: dict[str, Any],
+        save_optimizer: bool,
+        publication_targets: tuple[AdapterTransferTarget, ...],
+        slot_ref: "LoRASlotRef | None" = None,
+        sink: EventSink,
+    ) -> dict[str, float]:
         from art.megatron.optimizer_state import stage_optimizer_state_snapshot
         from art.megatron.weights.lora_publish import (
             stage_vllm_lora_snapshot_from_model,
@@ -1119,25 +1230,26 @@ class _GenerationPublisher:
                 rank=self.runtime.rank,
                 world_size=self.runtime.world_size,
                 stager=stager,
+                slot_ref=slot_ref,
             )
             lora_launch_s = time.perf_counter() - prepare_started
             if lora is not None:
                 self.runtime.optimizer_snapshot_barrier.register(lora)
             transport = self._enqueue_transport(
-                generation=job.output.generation,
-                optimizer_state_path=job.output.optimizer_state_path,
-                staging_adapter_path=job.output.staging_adapter_path,
+                generation=generation,
+                optimizer_state_path=optimizer_state_path,
+                staging_adapter_path=staging_adapter_path,
                 lora=lora,
                 adapter=None,
                 optimizer=optimizer_handoff,
-                publication_targets=getattr(job, "publication_targets", ()),
+                publication_targets=publication_targets,
             )
             optimizer_started = time.perf_counter()
             optimizer = (
                 stage_optimizer_state_snapshot(
                     self.runtime,
-                    generation_id=job.output_generation_id,
-                    step=job.learner_version,
+                    generation_id=generation.generation_id,
+                    step=generation.policy_step,
                     stager=stager,
                 )
                 if save_optimizer
@@ -1152,7 +1264,7 @@ class _GenerationPublisher:
                 lambda done: self._transport_ready(
                     done,
                     sink=sink,
-                    generation=job.output.generation,
+                    generation=generation,
                     stager=stager,
                 )
             )
@@ -1165,7 +1277,7 @@ class _GenerationPublisher:
             self._report_failure(
                 publication_error,
                 sink=sink,
-                generation=job.output.generation,
+                generation=generation,
                 remember=False,
                 stager=stager,
             )

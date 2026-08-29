@@ -467,6 +467,14 @@ class OptimizerJobSpec(_Spec):
         return _fingerprint(self)
 
 
+class CommandPublicationSpec(_Spec):
+    run_id: str = Field(min_length=1)
+    generation: TrainerGeneration
+    optimizer_state_path: str = Field(min_length=1)
+    staging_adapter_path: str = Field(min_length=1)
+    publication_targets: tuple[AdapterTransferTarget, ...] = Field(min_length=1)
+
+
 class SFTJobSpec(_TrainerJobSpec):
     kind: Literal["sft"] = "sft"
     batch_id: str = Field(min_length=1)

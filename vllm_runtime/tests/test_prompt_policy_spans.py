@@ -56,9 +56,12 @@ def test_prompt_spans_follow_executed_prefill_chunks() -> None:
         input_batch=split_batch,
         lora_state=SimpleNamespace(lora_requests={"request": request}),
     )
-    assert policy_spans._policy_context_from_runner(
-        split_runner, SimpleNamespace(num_scheduled_tokens={"dummy": 64})
-    ) == context
+    assert (
+        policy_spans._policy_context_from_runner(
+            split_runner, SimpleNamespace(num_scheduled_tokens={"dummy": 64})
+        )
+        == context
+    )
 
 
 def test_prompt_accumulator_keeps_real_boundaries_and_flushes_with_output() -> None:
@@ -154,5 +157,30 @@ def test_update_requires_exact_current_generation() -> None:
         )
         assert sequence == 2
         await coordinator.cancel_update("run:active", sequence)
+
+    asyncio.run(exercise())
+
+
+def test_publication_initializes_an_empty_mutable_slot_once() -> None:
+    async def exercise() -> None:
+        coordinator = policy_spans.LoraUpdateCoordinator()
+        slot = "run:active"
+        sequence = await coordinator.begin_publication(
+            slot, expected_generation_id=None
+        )
+        initial = policy_spans.PolicyLoRARequest(
+            lora_name=slot,
+            lora_int_id=1,
+            lora_path="/generation-a",
+            generation_id="generation-a",
+            policy_version=1,
+            update_seq=sequence,
+        )
+        await coordinator.commit_update(slot, initial)
+
+        async with coordinator.admission(slot) as admitted:
+            assert admitted == initial
+        with pytest.raises(RuntimeError, match="already active"):
+            await coordinator.begin_publication(slot, expected_generation_id=None)
 
     asyncio.run(exercise())

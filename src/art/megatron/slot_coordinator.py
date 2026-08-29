@@ -33,6 +33,7 @@ from .operation_handler import (
     MegatronCheckpointOperations,
     MegatronOperationConfig,
     MegatronOperationHandler,
+    MegatronPairedPublisher,
     MegatronSamplerPublicationReceipt,
 )
 from .route_retention import (
@@ -46,7 +47,9 @@ from .runtime.portable_snapshot import (
     PortableSnapshotInstallReceipt,
     PortableSnapshotLoadReceipt,
 )
+from .runtime.publication import TrainerRankPublication
 from .runtime.specs import (
+    CommandPublicationSpec,
     TrainerCommandRunState,
     TrainerGeneration,
     TrainingRunSpec,
@@ -132,6 +135,10 @@ class _SharedTrainer(Protocol):
     async def sft_forward_backward(self, job: Any, batch: Any) -> dict[str, Any]: ...
 
     async def optim_step(self, job: Any) -> dict[str, Any]: ...
+
+    async def publish_command_generation(
+        self, spec: CommandPublicationSpec
+    ) -> tuple[tuple[TrainerRankPublication, ...], dict[str, float]]: ...
 
     async def publish_external_lora(
         self,
@@ -300,12 +307,14 @@ class MegatronSlotCoordinator:
         *,
         resources: MegatronSlotResourceManager | None = None,
         schedule: MegatronSlotScheduleConfig | None = None,
+        publisher: MegatronPairedPublisher | None = None,
         route_ownership: RouteBundleOwnershipProvider | None = None,
     ) -> None:
         self.runtime = runtime
         self.trainer = trainer
         self.resources = resources or InlineMegatronSlotResources()
         self.schedule = schedule or MegatronSlotScheduleConfig()
+        self.publisher = publisher
         self.route_ownership = route_ownership
         self._runs: dict[str, _RunState] = {}
         self._ready: list[_ReadyCommand] = []
@@ -441,6 +450,7 @@ class MegatronSlotCoordinator:
                 self.trainer,
                 config,
                 checkpoints=checkpoints,
+                publisher=self.publisher,
                 route_ownership=self.route_ownership,
             )
             scheduled = _ScheduledRunHandler(self, config.run_id)
@@ -1124,6 +1134,8 @@ class MegatronSlotCoordinator:
             await self.drain_run(run_id)
         if self._pump_task is not None:
             await self._pump_task
+        if self.publisher is not None:
+            await self.publisher.aclose()
 
     async def _execute(
         self,

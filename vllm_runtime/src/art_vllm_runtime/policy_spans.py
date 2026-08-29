@@ -260,13 +260,28 @@ class LoraUpdateCoordinator:
             state.next_update_seq = lora_request.update_seq + 1
 
     async def begin_update(self, lora_slot: str, *, expected_generation_id: str) -> int:
+        return await self.begin_publication(
+            lora_slot, expected_generation_id=expected_generation_id
+        )
+
+    async def begin_publication(
+        self,
+        lora_slot: str,
+        *,
+        expected_generation_id: str | None,
+    ) -> int:
         state = self._state(lora_slot)
         async with state.condition:
             await state.condition.wait_for(lambda: not state.update_active)
             current = state.lora_request
             if current is None:
-                raise RuntimeError(f"LoRA slot {lora_slot!r} has no active generation")
-            if current.generation_id != expected_generation_id:
+                if expected_generation_id is not None:
+                    raise RuntimeError(
+                        f"LoRA slot {lora_slot!r} has no active generation"
+                    )
+            elif expected_generation_id is None:
+                raise RuntimeError(f"LoRA slot {lora_slot!r} is already active")
+            elif current.generation_id != expected_generation_id:
                 raise RuntimeError(
                     f"LoRA slot {lora_slot!r} is generation "
                     f"{current.generation_id!r}, expected {expected_generation_id!r}"

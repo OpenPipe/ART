@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 import hashlib
 import json
+from pathlib import Path
 from typing import Any, Literal, Protocol, cast
 
 from pydantic import BaseModel, ConfigDict, Field, FiniteFloat, model_validator
@@ -52,7 +53,9 @@ from .route_retention import (
 )
 from .runtime.data_plane import SFTBatchData
 from .runtime.numerical_capture import ForwardBackwardNumericalCaptureReceipt
+from .runtime.publication import TrainerRankPublication
 from .runtime.specs import (
+    CommandPublicationSpec,
     CurrentTrainConfig,
     ExperimentalTrainConfig,
     ForwardBackwardJobSpec,
@@ -93,6 +96,29 @@ class MegatronCheckpointOperations(Protocol):
         self,
         request: SaveWeightsForSamplerRequest | SaveStateRequest | LoadStateRequest,
         generation: TrainerGeneration,
+    ) -> "MegatronArtifactResourcePlan": ...
+
+
+class MegatronPairedPublisher(Protocol):
+    async def aclose(self) -> None: ...
+
+    async def save_weights_for_sampler(
+        self,
+        request: SaveWeightsForSamplerRequest,
+        operation: OperationRef,
+        generation: TrainerGeneration,
+        *,
+        template_adapter_path: str,
+        optimizer_state_path: str,
+        staging_adapter_path: str,
+    ) -> "MegatronSamplerPublicationReceipt": ...
+
+    async def plan_artifacts(
+        self,
+        request: SaveWeightsForSamplerRequest,
+        generation: TrainerGeneration,
+        *,
+        template_adapter_path: str,
     ) -> "MegatronArtifactResourcePlan": ...
 
 
@@ -280,6 +306,10 @@ class _ResidentTrainer(Protocol):
 
     async def optim_step(self, job: OptimizerJobSpec) -> dict[str, Any]: ...
 
+    async def publish_command_generation(
+        self, spec: CommandPublicationSpec
+    ) -> tuple[tuple[TrainerRankPublication, ...], dict[str, float]]: ...
+
     async def capture_forward_backward_numerics(
         self,
         run_id: str,
@@ -311,6 +341,7 @@ class MegatronOperationHandler:
         config: MegatronOperationConfig,
         *,
         checkpoints: MegatronCheckpointOperations | None = None,
+        publisher: MegatronPairedPublisher | None = None,
         route_ownership: RouteBundleOwnershipProvider | None = None,
     ) -> None:
         if config.source.training_session_id != config.training_session_id:
@@ -319,6 +350,7 @@ class MegatronOperationHandler:
         self.trainer = trainer
         self.config = config
         self.checkpoints = checkpoints
+        self.publisher = publisher
         self.route_ownership = route_ownership
         self._generation = config.source
         self._optimizer_state_path = config.optimizer_state_path
@@ -528,15 +560,31 @@ class MegatronOperationHandler:
             return await self._optim_step(
                 request, operation, contributing_forward_backward_operation_ids
             )
-        if self.checkpoints is None:
+        paired_publication = isinstance(
+            request, SaveWeightsForSamplerRequest
+        ) and request.publication.mode in {"versioned_lora", "in_flight_lora"}
+        if self.checkpoints is None and not (paired_publication and self.publisher):
             raise OperationExecutionError(
                 "execution_failed",
                 "Megatron checkpoint operations are not configured",
                 usage=CommandExecutionUsage.no_work(),
             )
         if isinstance(request, SaveWeightsForSamplerRequest):
-            saved = await self.checkpoints.save_weights_for_sampler(
-                request, operation, self._generation
+            saved = (
+                await self.publisher.save_weights_for_sampler(
+                    request,
+                    operation,
+                    self._generation,
+                    template_adapter_path=self.config.source.adapter_path,
+                    optimizer_state_path=self._optimizer_state_path,
+                    staging_adapter_path=_staging_adapter_path(
+                        self.config, self._generation.generation_id
+                    ),
+                )
+                if paired_publication and self.publisher is not None
+                else await cast(
+                    MegatronCheckpointOperations, self.checkpoints
+                ).save_weights_for_sampler(request, operation, self._generation)
             )
             if isinstance(saved, MegatronSamplerPublicationReceipt):
                 saved.validate_command(request, operation, self._generation)
@@ -554,15 +602,17 @@ class MegatronOperationHandler:
                 self._sampler_publications[operation.operation_id] = saved
             return result
         if isinstance(request, SaveStateRequest):
-            result = await self.checkpoints.save_state(
-                request, operation, self._generation
-            )
+            result = await cast(
+                MegatronCheckpointOperations, self.checkpoints
+            ).save_state(request, operation, self._generation)
             await self.trainer.record_control_command(
                 operation, self._generation.policy_step
             )
             return result
         if isinstance(request, LoadStateRequest):
-            loaded = await self.checkpoints.load_state(request, operation)
+            loaded = await cast(
+                MegatronCheckpointOperations, self.checkpoints
+            ).load_state(request, operation)
             if loaded.result.operation_id != operation.operation_id:
                 raise RuntimeError("checkpoint loader changed operation identity")
             if (
@@ -683,6 +733,16 @@ class MegatronOperationHandler:
                 lora_bytes=0,
                 transfer_bytes=0,
                 storage_bytes=0,
+            )
+        if (
+            isinstance(request, SaveWeightsForSamplerRequest)
+            and request.publication.mode in {"versioned_lora", "in_flight_lora"}
+            and self.publisher is not None
+        ):
+            return await self.publisher.plan_artifacts(
+                request,
+                self._generation,
+                template_adapter_path=self.config.source.adapter_path,
             )
         if self.checkpoints is None:
             raise RuntimeError("Megatron checkpoint operations are not configured")
@@ -1126,8 +1186,13 @@ def _next_generation(
         training_session_id=config.training_session_id,
         policy_step=version,
         generation_id=generation_id,
-        adapter_path=f"{config.output_adapter_root.rstrip('/')}/{generation_id}",
+        adapter_path=f"{config.output_adapter_root.rstrip('/')}/{version:04d}",
     )
+
+
+def _staging_adapter_path(config: MegatronOperationConfig, generation_id: str) -> str:
+    output_root = Path(config.output_adapter_root).absolute().parent
+    return str(output_root / "megatron_runtime" / "staging" / generation_id)
 
 
 def _input_fingerprint(

@@ -26,6 +26,7 @@ from .optimizer_state import (
     read_committed_optimizer_pointer,
     resolve_committed_optimizer_policy,
 )
+from .paired_inference import MegatronPairedInferencePublisher
 from .route_retention import RouteBundleOwnershipProvider
 from .runtime.build import build_trainer_runtime_spec
 from .runtime.portable_snapshot import PortableSnapshotArchive
@@ -104,6 +105,7 @@ class MegatronSlotRuntime:
     runtime: ArtRuntime
     coordinator: MegatronSlotCoordinator
     descriptor: MegatronSlotRuntimeDescriptor
+    paired_inference: MegatronPairedInferencePublisher | None = None
 
     async def bind_run(
         self,
@@ -175,11 +177,23 @@ async def launch_megatron_slot(
             command_timeout_s=config.command_timeout_s,
             shutdown_timeout_s=config.shutdown_timeout_s,
         )
+        paired_inference = (
+            await MegatronPairedInferencePublisher.start(
+                runtime,
+                trainer,
+                base_model=config.base_model,
+                config=cast(dev.BackendModelConfig, dict(config.model)),
+                runtime_spec=runtime_spec,
+            )
+            if config.topology.model_services
+            else None
+        )
         coordinator = MegatronSlotCoordinator(
             runtime,
             trainer,
             resources=resources,
             schedule=config.schedule,
+            publisher=paired_inference,
             route_ownership=route_bundle_ownership,
         )
         runtime.register_closeable(coordinator)
@@ -194,6 +208,7 @@ async def launch_megatron_slot(
             runtime_source_epoch=config.runtime_source_epoch,
             runtime_fingerprint=runtime_spec.fingerprint,
         ),
+        paired_inference=paired_inference,
     )
 
 

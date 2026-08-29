@@ -65,6 +65,7 @@ from .publication import (
 from .specs import (
     TRAIN_EVENT_ADAPTER,
     AdapterReady,
+    CommandPublicationSpec,
     ForwardBackwardJobSpec,
     ForwardJobSpec,
     HybridEpRuntimeSpec,
@@ -494,6 +495,7 @@ class MonarchTrainerActor(Actor):
                 run_id=run_id,
                 rank=rank,
             ),
+            publisher=self._executor.publisher,
         )
         self._weight_offload = WeightOffloadManager.from_config(
             model=self._runtime.model,
@@ -926,6 +928,13 @@ class MonarchTrainerActor(Actor):
             ):
                 self._weight_offload.after_job()
                 self._command_job_open = False
+
+    @endpoint
+    def publish_command_generation(self, spec_json: str) -> dict[str, Any]:
+        if not self._valid:
+            raise RuntimeError("trainer actor runtime is invalid")
+        spec = CommandPublicationSpec.model_validate_json(spec_json)
+        return self._run_slot_executor.publish_generation(spec)
 
     @endpoint
     def release_command_run_for_migration(
@@ -2162,6 +2171,59 @@ class MonarchTrainerRun:
                 self._learner_version = job.learner_version
             self._cache_operation(job.operation_id, job.fingerprint, result)
             return result
+
+    async def publish_command_generation(
+        self, spec: CommandPublicationSpec
+    ) -> tuple[tuple[TrainerRankPublication, ...], dict[str, float]]:
+        async with self._lock:
+            if self._closed or not self._valid:
+                raise RuntimeError("trainer runtime is invalid")
+            state = self._command_runs.get(spec.run_id)
+            if state is None or state.learner_version != spec.generation.policy_step:
+                raise RuntimeError("published generation is not resident")
+            if state.spec.training_session_id != spec.generation.training_session_id:
+                raise RuntimeError("published generation belongs to another session")
+            if state.open_forward_backward_ids:
+                raise RuntimeError("cannot publish a generation with open gradients")
+            try:
+                values = await self._run_resident_collective(
+                    spec.generation.generation_id,
+                    self._actors.publish_command_generation.call(
+                        spec.model_dump_json()
+                    ),
+                    invalidate_on_error=True,
+                )
+                results = list(values.values())
+                expected_ranks = set(range(len(self.runtime_spec.trainer_mesh.ranks)))
+                if (
+                    {result["rank"] for result in results} != expected_ranks
+                    or {result["run_id"] for result in results} != {spec.run_id}
+                    or {result["generation_id"] for result in results}
+                    != {spec.generation.generation_id}
+                ):
+                    raise RuntimeError("trainer ranks disagreed on command publication")
+                records = tuple(
+                    sorted(
+                        (
+                            TrainerRankPublication.model_validate(result["record"])
+                            for result in results
+                        ),
+                        key=lambda record: record.rank,
+                    )
+                )
+                metric_names = {
+                    name for result in results for name in result["metrics"]
+                }
+                metrics = {
+                    name: max(
+                        float(result["metrics"].get(name, 0.0)) for result in results
+                    )
+                    for name in metric_names
+                }
+                return records, metrics
+            except BaseException as error:
+                await self._invalidate_after_command_failure(error)
+                raise
 
     def _cache_operation(
         self, operation_id: str, fingerprint: str, result: dict[str, Any]

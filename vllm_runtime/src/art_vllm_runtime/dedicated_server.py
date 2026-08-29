@@ -645,7 +645,7 @@ class _InFlightLoraUpdateRequest(BaseModel):
     model_name: str = Field(min_length=1)
     lora_path: str = Field(min_length=1)
     generation_id: str = Field(min_length=1)
-    expected_generation_id: str = Field(min_length=1)
+    expected_generation_id: str | None = Field(default=None, min_length=1)
     policy_version: int = Field(ge=0)
     lora_slot: str | None = Field(default=None, min_length=1)
     base_model_name: str | None = None
@@ -1271,12 +1271,15 @@ def _patch_art_runtime_routes() -> None:
             models = raw_request.app.state.openai_serving_models
             engine_client = engine(raw_request)
             coordinator = lora_update_coordinator(models, engine_client)
-            if generation_id == body.expected_generation_id:
+            if (
+                body.expected_generation_id is not None
+                and generation_id == body.expected_generation_id
+            ):
                 return JSONResponse(
                     content={"error": "generation_id must advance"}, status_code=409
                 )
             try:
-                update_seq = await coordinator.begin_update(
+                update_seq = await coordinator.begin_publication(
                     lora_slot, expected_generation_id=body.expected_generation_id
                 )
             except RuntimeError as error:
@@ -1380,17 +1383,17 @@ def _patch_art_runtime_routes() -> None:
                         coordinator.cancel_update(lora_slot, update_seq)
                     )
                 raise
-            return JSONResponse(
-                content={
-                    "status": "updated",
-                    "model_name": public_model_name,
-                    "lora_slot": lora_slot,
-                    "generation_id": generation_id,
-                    "policy_version": policy_version,
-                    "update_seq": update_seq,
-                    "cache_transition": cache_transition,
-                }
-            )
+            result: dict[str, object] = {
+                "status": "updated",
+                "model_name": public_model_name,
+                "lora_slot": lora_slot,
+                "generation_id": generation_id,
+                "policy_version": policy_version,
+                "update_seq": update_seq,
+                "update_identity": f"lora:{lora_slot}:{generation_id}:{update_seq}",
+                "cache_transition": cache_transition,
+            }
+            return JSONResponse(content=result)
 
         app.include_router(router)
         return app
