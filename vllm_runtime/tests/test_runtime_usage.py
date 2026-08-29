@@ -1,5 +1,6 @@
 from types import SimpleNamespace
 
+from art_vllm_runtime.resource_usage import KVUsageOwner
 from art_vllm_runtime.runtime_usage import (
     RuntimeRequestContext,
     RuntimeUsageCapacityError,
@@ -57,6 +58,7 @@ def test_runtime_usage_pages_are_gapless_bounded_and_acknowledged() -> None:
     assert first["failure_attribution"] is None
     assert first["measurements"] == (
         {"metric": "live_request_ms", "quantity": "125.000"},
+        {"metric": "inference_gpu_ms", "quantity": "0"},
         {"metric": "cached_prefill_tokens", "quantity": 5},
         {"metric": "uncached_prefill_tokens", "quantity": 7},
         {"metric": "decode_tokens", "quantity": 3},
@@ -86,3 +88,48 @@ def test_runtime_usage_preserves_unknown_terminal_measurements() -> None:
     assert receipt["failure_attribution"] == "unknown"
     assert receipt["coverage"] == "unknown"
     assert receipt["measurements"] == ()
+
+
+def test_runtime_usage_emits_exact_gpu_and_closed_kv_usage() -> None:
+    journal = RuntimeUsageJournal(
+        "paired-runtime",
+        0,
+        clock=lambda: 100.0,
+        monotonic_ns=lambda: 1_000,
+    )
+    journal.reserve("request", _context("tenant"))
+    journal.record_gpu_service("request", 3_000_000)
+    assert journal.record_finished(_finished("request"), observed_unix_s=100.125)
+    owner = KVUsageOwner("tenant", "run-tenant", "standard", "test-model")
+    journal.record_kv_residency(0, owner, byte_count=8, monotonic_ns=1_000)
+    journal.record_kv_residency(0, owner, byte_count=0, monotonic_ns=2_000)
+
+    request, residency = journal.read(after_sequence=0)["receipts"]
+    assert {item["metric"]: item["quantity"] for item in request["measurements"]}[
+        "inference_gpu_ms"
+    ] == "3"
+    assert residency["producer"] == "residency"
+    assert residency["measurements"] == ({"metric": "kv_byte_ms", "quantity": "0.008"},)
+
+
+def test_empty_page_observation_advances_only_after_activity_drains() -> None:
+    wall = iter((100.0, 110.0, 120.0, 130.0))
+    journal = RuntimeUsageJournal(
+        "paired-runtime",
+        0,
+        clock=lambda: next(wall),
+        monotonic_ns=lambda: 1_000,
+    )
+
+    first = journal.read(after_sequence=0)["observed_at"]
+    journal.reserve("request", _context("tenant"))
+    assert journal.read(after_sequence=0)["observed_at"] == first
+    journal.discard("request")
+    drained = journal.read(after_sequence=0)["observed_at"]
+    assert drained != first
+    owner = KVUsageOwner("tenant", "run-tenant", "standard", "test-model")
+    journal.record_kv_residency(0, owner, byte_count=8, monotonic_ns=1_000)
+    assert journal.read(after_sequence=0)["observed_at"] == drained
+    journal.record_kv_residency(0, owner, byte_count=0, monotonic_ns=2_000)
+    journal.acknowledge(1)
+    assert journal.read(after_sequence=1)["observed_at"] != drained

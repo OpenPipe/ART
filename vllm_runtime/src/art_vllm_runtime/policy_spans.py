@@ -103,6 +103,9 @@ def patch_policy_token_spans() -> None:
     _patch_policy_cache_hashing()
     _patch_model_runner_output_type()
     _patch_engine_core_output_type()
+    from art_vllm_runtime.resource_usage import patch_resource_usage
+
+    patch_resource_usage()
     _patch_worker_policy_span_capture()
     _patch_scheduler_policy_span_transport()
     _patch_output_processor_policy_span_accumulation()
@@ -140,6 +143,10 @@ def _patch_policy_cache_hashing() -> None:
                 if extra_keys
                 else ((_POLICY_CACHE_TRANSITION_KEY, transitions),)
             )
+        from art_vllm_runtime.resource_usage import usage_cache_extra_key
+
+        if owner_key := usage_cache_extra_key(request):
+            extra_keys = (*extra_keys, owner_key) if extra_keys else (owner_key,)
         return extra_keys, next_mm_idx
 
     setattr(generate_block_hash_extra_keys, "__art_policy_spans_patched__", True)
@@ -252,9 +259,7 @@ class LoraUpdateCoordinator:
             state.lora_request = lora_request
             state.next_update_seq = lora_request.update_seq + 1
 
-    async def begin_update(
-        self, lora_slot: str, *, expected_generation_id: str
-    ) -> int:
+    async def begin_update(self, lora_slot: str, *, expected_generation_id: str) -> int:
         state = self._state(lora_slot)
         async with state.condition:
             await state.condition.wait_for(lambda: not state.update_active)
@@ -643,6 +648,7 @@ def _patch_engine_core_output_type() -> None:
         finished_requests: set[str] | None = None
         wave_complete: int | None = None
         start_wave: int | None = None
+        art_runtime_usage_updates: list[dict[str, Any]] | None = None
 
     EngineCoreOutput.__module__ = engine_mod.__name__
     UtilityOutput.__module__ = engine_mod.__name__
@@ -652,7 +658,10 @@ def _patch_engine_core_output_type() -> None:
     engine_mod.EngineCoreOutputs = EngineCoreOutputs
     for module_name in (
         "vllm.v1.core.sched.scheduler",
+        "vllm.v1.engine.async_llm",
+        "vllm.v1.engine.coordinator",
         "vllm.v1.engine.core",
+        "vllm.v1.engine.core_client",
         "vllm.v1.engine.output_processor",
     ):
         module = sys.modules.get(module_name)
@@ -812,6 +821,9 @@ def _patch_scheduler_policy_span_transport() -> None:
                     _flush_complete_prompt_spans(
                         request, outputs_by_request.get(req_id)
                     )
+            from art_vllm_runtime.resource_usage import attach_scheduler_usage
+
+            attach_scheduler_usage(self, scheduler_output, outputs_by_client)
             return outputs_by_client
 
         update_from_output.__art_policy_spans_patched__ = True  # type: ignore[attr-defined]
@@ -1099,6 +1111,9 @@ def _patch_engine_request_admission() -> None:
         if lease is not None:
             if lease.request_id not in (None, request_id):
                 raise RuntimeError("One admission lease received multiple requests")
+        from art_vllm_runtime.resource_usage import bind_request_usage_owner
+
+        bind_request_usage_owner(request)
         lora_request = request.lora_request
         coordinator = getattr(self, _LORA_UPDATE_COORDINATOR_FIELD, None)
         if coordinator is None or lora_request is None:

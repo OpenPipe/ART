@@ -94,6 +94,9 @@ async def test_external_runtime_server_live_smoke(
                 os.environ.get("ART_TEST_MAX_MODEL_LEN", str(DEFAULT_MAX_MODEL_LEN))
             ),
             "max_num_seqs": 4,
+            "tensor_parallel_size": int(
+                os.environ.get("ART_TEST_TENSOR_PARALLEL_SIZE", "1")
+            ),
             "enforce_eager": True,
         },
     )
@@ -215,19 +218,24 @@ async def test_external_runtime_server_live_smoke(
                 f"/art/internal/v1/requests/{'e' * 64}",
                 headers=endpoint.runtime_headers(),
             )
-            usage_page = {}
+            request_usage_page = {}
             for _ in range(100):
                 usage_response = await client.get(
                     "/art/internal/v1/usage",
                     headers=endpoint.runtime_headers(),
                 )
                 usage_response.raise_for_status()
-                usage_page = usage_response.json()
-                if usage_page["high_watermark_sequence"] == 1:
+                request_usage_page = usage_response.json()
+                if any(
+                    receipt["producer"] == "inference_request"
+                    for receipt in request_usage_page["receipts"]
+                ):
                     break
                 await asyncio.sleep(0.05)
             else:
-                raise AssertionError(f"terminal usage was not published: {usage_page}")
+                raise AssertionError(
+                    f"terminal usage was not published: {request_usage_page}"
+                )
             duplicate_private_completion = await client.post(
                 endpoint.url.path,
                 headers=endpoint.request_headers(
@@ -245,13 +253,33 @@ async def test_external_runtime_server_live_smoke(
                     "top_logprobs": 0,
                 },
             )
+            reset_cache = await client.post("/art/reset_prefix_cache", json={})
+            reset_cache.raise_for_status()
+            assert reset_cache.json()["success"] is True
+            usage_page = {}
+            for _ in range(100):
+                usage_response = await client.get(
+                    "/art/internal/v1/usage",
+                    headers=endpoint.runtime_headers(),
+                )
+                usage_response.raise_for_status()
+                usage_page = usage_response.json()
+                if {receipt["producer"] for receipt in usage_page["receipts"]} == {
+                    "inference_request",
+                    "residency",
+                }:
+                    break
+                await asyncio.sleep(0.05)
+            else:
+                raise AssertionError(f"KV usage was not published: {usage_page}")
+            usage_high_watermark = usage_page["high_watermark_sequence"]
             usage_ack = await client.post(
                 "/art/internal/v1/usage:ack",
                 headers=endpoint.runtime_headers(),
                 json={
                     "source_id": "live-smoke-runtime",
                     "source_epoch": 0,
-                    "through_sequence": 1,
+                    "through_sequence": usage_high_watermark,
                 },
             )
             usage_ack.raise_for_status()
@@ -306,18 +334,42 @@ async def test_external_runtime_server_live_smoke(
         assert duplicate_private_completion.status_code == 409
         assert duplicate_private_completion.json()["execution"] == "completed"
         assert usage_page["source_id"] == "live-smoke-runtime"
-        assert usage_page["high_watermark_sequence"] == 1
-        assert usage_page["receipts"][0]["tenant_id"] == "tenant-live"
-        assert {
-            measurement["metric"]
-            for measurement in usage_page["receipts"][0]["measurements"]
-        } == {
+        assert usage_page["high_watermark_sequence"] == 2
+        request_usage = next(
+            receipt
+            for receipt in usage_page["receipts"]
+            if receipt["producer"] == "inference_request"
+        )
+        kv_usage = next(
+            receipt
+            for receipt in usage_page["receipts"]
+            if receipt["producer"] == "residency"
+        )
+        assert request_usage["tenant_id"] == "tenant-live"
+        request_measurements = {
+            measurement["metric"] for measurement in request_usage["measurements"]
+        }
+        assert request_measurements == {
+            "inference_gpu_ms",
             "live_request_ms",
             "cached_prefill_tokens",
             "uncached_prefill_tokens",
             "decode_tokens",
         }
-        assert usage_state.json()["acknowledged_through_sequence"] == 1
+        assert (
+            float(
+                next(
+                    measurement["quantity"]
+                    for measurement in request_usage["measurements"]
+                    if measurement["metric"] == "inference_gpu_ms"
+                )
+            )
+            > 0
+        )
+        assert kv_usage["measurements"][0]["metric"] == "kv_byte_ms"
+        assert float(kv_usage["measurements"][0]["quantity"]) > 0
+        assert usage_state.json()["acknowledged_through_sequence"] == 2
+        assert usage_state.json()["active_kv_residencies"] == 0
         assert usage_state.json()["retained_receipts"] == 0
     finally:
         process.terminate()

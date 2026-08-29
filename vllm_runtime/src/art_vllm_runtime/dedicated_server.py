@@ -3,6 +3,7 @@
 import argparse
 import asyncio
 from collections import OrderedDict
+from contextlib import nullcontext
 from dataclasses import dataclass
 from functools import lru_cache
 import hashlib
@@ -29,6 +30,10 @@ from art_vllm_runtime.binary_routes import (
 )
 from art_vllm_runtime.fast_metrics import FastMetricsSidecar
 from art_vllm_runtime.patches import apply_vllm_runtime_patches
+from art_vllm_runtime.resource_usage import (
+    bind_runtime_usage_context,
+    drain_runtime_usage,
+)
 from art_vllm_runtime.runtime_usage import (
     RuntimeRequestContext,
     RuntimeUsageCapacityError,
@@ -400,10 +405,17 @@ async def _track_private_stream(
     request_identity: str,
     fingerprint: str,
     body_iterator: Any,
+    usage_context: RuntimeRequestContext | None = None,
 ):
     try:
-        async for chunk in body_iterator:
-            yield chunk
+        binding = (
+            nullcontext()
+            if usage_context is None
+            else bind_runtime_usage_context(request_identity, usage_context)
+        )
+        with binding:
+            async for chunk in body_iterator:
+                yield chunk
     except BaseException:
         await _private_execution_receipts.settle(
             request_identity, fingerprint, "ambiguous"
@@ -657,17 +669,15 @@ def _patch_art_runtime_routes() -> None:
                     existing,
                     fingerprint=fingerprint,
                 )
+            usage_context = RuntimeRequestContext(
+                tenant_id=tenant_id,
+                run_id=run_id,
+                operation_id=request_identity,
+                service_tier=service_tier,
+                model=request.model or "",
+            )
             try:
-                runtime_usage_journal().reserve(
-                    request_identity,
-                    RuntimeRequestContext(
-                        tenant_id=tenant_id,
-                        run_id=run_id,
-                        operation_id=request_identity,
-                        service_tier=service_tier,
-                        model=request.model or "",
-                    ),
-                )
+                runtime_usage_journal().reserve(request_identity, usage_context)
             except RuntimeUsageCapacityError:
                 await _private_execution_receipts.release_not_started(
                     request_identity, fingerprint
@@ -693,7 +703,8 @@ def _patch_art_runtime_routes() -> None:
                     status_code=HTTPStatus.BAD_REQUEST.value,
                 )
             try:
-                response = await create_chat_completion(request, raw_request)
+                with bind_runtime_usage_context(request_identity, usage_context):
+                    response = await create_chat_completion(request, raw_request)
             except BaseException:
                 await _private_execution_receipts.settle(
                     request_identity, fingerprint, "ambiguous"
@@ -716,6 +727,7 @@ def _patch_art_runtime_routes() -> None:
                     request_identity,
                     fingerprint,
                     body_iterator,
+                    usage_context,
                 )
             else:
                 await _private_execution_receipts.settle(
@@ -870,6 +882,7 @@ def _patch_art_runtime_routes() -> None:
                 reset_running_requests=body.reset_running_requests,
                 reset_connector=body.reset_connector,
             )
+            await drain_runtime_usage(engine(raw_request))
             return JSONResponse(content={"success": success})
 
         @router.post("/art/in_flight_lora_update")
