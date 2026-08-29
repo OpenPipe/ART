@@ -1,3 +1,4 @@
+from datetime import UTC, datetime
 from typing import Any, cast
 
 import pytest
@@ -109,6 +110,15 @@ def _operation(
         learner_parent_version=0,
         reserved_output_learner_version=None,
         contributing_operation_ids=(),
+        command=request.model_dump(mode="json"),
+        command_digest=f"sha256:{'a' * 64}",
+        admitted_at=datetime(2026, 8, 29, tzinfo=UTC),
+        execution_started_at=datetime(2026, 8, 29, tzinfo=UTC),
+        execution_ended_at=(
+            datetime(2026, 8, 29, tzinfo=UTC)
+            if status in {"succeeded", "failed", "cancelled"}
+            else None
+        ),
         cancel_requested=False,
         event_cursor=1,
         result=result,
@@ -138,4 +148,7 @@ async def test_native_client_retains_run_and_terminal_operation_identity() -> No
     assert client.operation_ids == ("operation-native",)
     assert replay is operation
     assert operation.ref.operation_id == result.operation_id == "operation-native"
+    evidence = await client.operation_evidence(operation.ref.operation_id)
+    assert evidence.command_digest == f"sha256:{'a' * 64}"
+    assert evidence.execution_ended_at is not None
     assert service.submissions == 1

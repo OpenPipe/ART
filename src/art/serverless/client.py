@@ -1,3 +1,4 @@
+from datetime import datetime
 import os
 from typing import Any, Iterable, Literal, Type, TypedDict, TypeVar, cast
 
@@ -17,6 +18,7 @@ from openai._types import NOT_GIVEN, NotGiven, Omit
 from openai._utils import is_mapping, maybe_transform
 from openai._version import __version__
 from openai.pagination import AsyncCursorPage
+from pydantic import Field, model_validator
 from typing_extensions import override
 
 from art.training import LoadStateRequest, RunCommand, TrainingRunSpec
@@ -151,10 +153,27 @@ class NativeTrainingOperation(BaseModel):
     learner_parent_version: int
     reserved_output_learner_version: int | None
     contributing_operation_ids: tuple[str, ...]
+    command: dict[str, Any]
+    command_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+    admitted_at: datetime
+    execution_started_at: datetime | None
+    execution_ended_at: datetime | None
     cancel_requested: bool
     event_cursor: int
     result: dict[str, Any] | None
     error: dict[str, Any] | None
+
+    @model_validator(mode="after")
+    def _validate_execution_timeline(self) -> "NativeTrainingOperation":
+        if (
+            self.execution_started_at is not None
+            and self.execution_started_at < self.admitted_at
+        ):
+            raise ValueError("operation execution starts before admission")
+        lower = self.execution_started_at or self.admitted_at
+        if self.execution_ended_at is not None and self.execution_ended_at < lower:
+            raise ValueError("operation execution ends before it starts")
+        return self
 
 
 class Models(AsyncAPIResource):
