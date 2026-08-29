@@ -284,6 +284,9 @@ def test_private_dispatch_uses_distinct_auth_and_fences_runtime_target(
             (b"x-art-runtime-target", b"a" * 64),
             (b"x-art-request-identity", b"b" * 64),
             (b"x-art-cache-identity", b"c" * 64),
+            (b"x-art-tenant-id", b"tenant"),
+            (b"x-art-run-id", b"run"),
+            (b"x-art-service-tier", b"standard"),
         ],
     }
     request = Request(scope)
@@ -292,6 +295,9 @@ def test_private_dispatch_uses_distinct_auth_and_fences_runtime_target(
     assert dedicated_server._private_dispatch_context(request) == (
         "b" * 64,
         "c" * 64,
+        "tenant",
+        "run",
+        "standard",
     )
     scope["headers"][1] = (b"x-art-runtime-target", b"d" * 64)
     stale = dedicated_server._private_dispatch_context(Request(scope))

@@ -88,6 +88,8 @@ class VllmRuntimeLaunchConfig(BaseModel):
     replica_generation: int = Field(default=0, ge=0)
     process_uuid: str | None = None
     runtime_target_id: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    runtime_source_id: str | None = Field(default=None, min_length=1, max_length=512)
+    runtime_source_epoch: int | None = Field(default=None, ge=0)
     private_dispatch_token: str | None = Field(default=None, min_length=32, repr=False)
     update_identity: str | None = None
     initial_generation_id: str | None = Field(default=None, min_length=1)
@@ -113,9 +115,18 @@ class VllmRuntimeLaunchConfig(BaseModel):
             raise ValueError(
                 "initial_generation_id and initial_policy_version must be set together"
             )
-        if (self.runtime_target_id is None) != (self.private_dispatch_token is None):
+        private_runtime_values = (
+            self.runtime_target_id,
+            self.runtime_source_id,
+            self.runtime_source_epoch,
+            self.private_dispatch_token,
+        )
+        if any(value is not None for value in private_runtime_values) and not all(
+            value is not None for value in private_runtime_values
+        ):
             raise ValueError(
-                "runtime_target_id and private_dispatch_token must be set together"
+                "runtime_target_id, runtime_source_id, runtime_source_epoch, and "
+                "private_dispatch_token must be set together"
             )
         if self.node_rank >= self.nnodes:
             raise ValueError("node_rank must be smaller than nnodes")
@@ -926,6 +937,10 @@ def build_vllm_runtime_server_cmd(config: VllmRuntimeLaunchConfig) -> list[str]:
         )
     if config.runtime_target_id is not None:
         command.append(f"--runtime-target-id={config.runtime_target_id}")
+    if config.runtime_source_id is not None:
+        command.append(f"--runtime-source-id={config.runtime_source_id}")
+    if config.runtime_source_epoch is not None:
+        command.append(f"--runtime-source-epoch={config.runtime_source_epoch}")
     if config.update_identity is not None:
         command.append(f"--update-identity={config.update_identity}")
     if config.initial_generation_id is not None:

@@ -1905,6 +1905,8 @@ class DistributedMegatronService:
             url=f"{base_url.rstrip('/')}/art/internal/v1/chat/completions",
             target_id=credentials.target_id,
             runtime_generation=credentials.runtime_generation,
+            runtime_source_id=credentials.runtime_source_id,
+            runtime_source_epoch=credentials.runtime_source_epoch,
             authorization_token=credentials.authorization_token,
             profile=profile,
         )

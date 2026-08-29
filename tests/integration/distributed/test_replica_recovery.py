@@ -85,12 +85,17 @@ async def test_failure_stops_whole_gang_before_callback_and_restarts_generation(
     manager = ReplicaManager(
         _spec(),
         cast(Any, launchers),
-        ReplicaLaunchTemplate(served_model_name="model@0", lora_path="/step/0000"),
+        ReplicaLaunchTemplate(
+            served_model_name="model@0",
+            lora_path="/step/0000",
+            runtime_source_epoch_base=11,
+        ),
         on_failure=failed,
         monitor_interval_s=60,
     )
     await manager.start()
     initial_credentials = manager.dispatch_credentials
+    assert initial_credentials.runtime_source_epoch == 11
     launchers["host1"].failed = True
 
     await manager.poll()
@@ -114,6 +119,7 @@ async def test_failure_stops_whole_gang_before_callback_and_restarts_generation(
     assert restarted.generation == 1
     assert restarted.generation_digest != failures[0].generation_digest
     assert manager.dispatch_credentials.target_id == restarted.generation_digest
+    assert manager.dispatch_credentials.runtime_source_epoch == 12
     assert (
         manager.dispatch_credentials.authorization_token
         != initial_credentials.authorization_token

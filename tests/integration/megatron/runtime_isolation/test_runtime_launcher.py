@@ -43,6 +43,10 @@ def test_build_runtime_server_cmd_uses_runtime_project(
             served_model_name="test@0",
             initial_generation_id="generation-7",
             initial_policy_version=7,
+            runtime_target_id="a" * 64,
+            runtime_source_id="paired-runtime",
+            runtime_source_epoch=7,
+            private_dispatch_token="private-dispatch-token" * 2,
             engine_args={"weight_transfer_config": {"backend": "nccl"}},
             server_args={"tool_call_parser": "hermes"},
         )
@@ -55,6 +59,9 @@ def test_build_runtime_server_cmd_uses_runtime_project(
     assert '--server-args-json={"tool_call_parser": "hermes"}' in command
     assert "--initial-generation-id=generation-7" in command
     assert "--initial-policy-version=7" in command
+    assert "--runtime-target-id=" + "a" * 64 in command
+    assert "--runtime-source-id=paired-runtime" in command
+    assert "--runtime-source-epoch=7" in command
 
 
 def test_build_runtime_server_cmd_honors_runtime_bin_override(monkeypatch) -> None:

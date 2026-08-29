@@ -49,7 +49,9 @@ def manager(*, engine_args: dict[str, object] | None = None) -> ReplicaManager:
             {"host0": SimpleNamespace(), "host1": SimpleNamespace()},
         ),
         ReplicaLaunchTemplate(
-            served_model_name="model@1", engine_args=engine_args or {}
+            served_model_name="model@1",
+            engine_args=engine_args or {},
+            runtime_source_epoch_base=7,
         ),
     )
     value._state = ReplicaState(
@@ -156,6 +158,8 @@ def test_launch_preserves_user_args_and_owns_native_gang_topology() -> None:
     assert follower.host == "127.0.0.1" and follower.headless
     assert leader.nnodes == follower.nnodes == 2
     assert leader.runtime_target_id == follower.runtime_target_id
+    assert leader.runtime_source_id == follower.runtime_source_id == value.spec.name
+    assert leader.runtime_source_epoch == follower.runtime_source_epoch == 7
     assert leader.private_dispatch_token == follower.private_dispatch_token
     assert "kv_events_config" not in leader.engine_args
 

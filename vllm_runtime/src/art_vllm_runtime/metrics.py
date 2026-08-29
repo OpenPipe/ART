@@ -9,6 +9,7 @@ from typing import Any
 from vllm.v1.metrics.loggers import StatLoggerBase
 
 from art_vllm_runtime.fast_metrics import FastMetricsSharedWriter
+from art_vllm_runtime.runtime_usage import record_finished_requests
 
 
 class _ArtRuntimeMetricsState:
@@ -100,6 +101,7 @@ class _ArtRuntimeMetricsState:
                         connector.hits
                     )
             if iteration_stats is not None:
+                record_finished_requests(iteration_stats)
                 prompt_stats = iteration_stats.prompt_token_stats
                 self._counters["prompt_tokens_total"] += float(
                     iteration_stats.num_prompt_tokens

@@ -68,6 +68,8 @@ async def test_external_runtime_server_live_smoke(
         cuda_visible_devices=os.environ.get("CUDA_VISIBLE_DEVICES", "0"),
         served_model_name=served_model_name,
         runtime_target_id=runtime_target_id,
+        runtime_source_id="live-smoke-runtime",
+        runtime_source_epoch=0,
         private_dispatch_token=private_dispatch_token,
         serving_profile_identity=ServingProfileIdentity(
             base_model=os.environ.get("BASE_MODEL", DEFAULT_BASE_MODEL),
@@ -131,6 +133,8 @@ async def test_external_runtime_server_live_smoke(
                 url=f"{client.base_url}/art/internal/v1/chat/completions",
                 target_id=runtime_target_id,
                 runtime_generation=0,
+                runtime_source_id="live-smoke-runtime",
+                runtime_source_epoch=0,
                 authorization_token=private_dispatch_token,
                 profile=profile,
             )
@@ -145,6 +149,9 @@ async def test_external_runtime_server_live_smoke(
             stale_headers = endpoint.request_headers(
                 request_identity="b" * 64,
                 cache_identity="c" * 64,
+                tenant_id="tenant-live",
+                run_id="run-live",
+                service_tier="standard",
             )
             stale_headers["x-art-runtime-target"] = "d" * 64
             stale = await client.post(
@@ -189,6 +196,9 @@ async def test_external_runtime_server_live_smoke(
                 headers=endpoint.request_headers(
                     request_identity="e" * 64,
                     cache_identity="f" * 64,
+                    tenant_id="tenant-live",
+                    run_id="run-live",
+                    service_tier="standard",
                 ),
                 json={
                     "model": served_model_name,
@@ -202,16 +212,22 @@ async def test_external_runtime_server_live_smoke(
             private_completion = private_completion_response.json()
             private_receipt = await client.get(
                 f"/art/internal/v1/requests/{'e' * 64}",
-                headers=endpoint.request_headers(
-                    request_identity="e" * 64,
-                    cache_identity="f" * 64,
-                ),
+                headers=endpoint.runtime_headers(),
             )
+            usage_response = await client.get(
+                "/art/internal/v1/usage",
+                headers=endpoint.runtime_headers(),
+            )
+            usage_response.raise_for_status()
+            usage_page = usage_response.json()
             duplicate_private_completion = await client.post(
                 endpoint.url.path,
                 headers=endpoint.request_headers(
                     request_identity="e" * 64,
                     cache_identity="f" * 64,
+                    tenant_id="tenant-live",
+                    run_id="run-live",
+                    service_tier="standard",
                 ),
                 json={
                     "model": served_model_name,
@@ -221,6 +237,21 @@ async def test_external_runtime_server_live_smoke(
                     "top_logprobs": 0,
                 },
             )
+            usage_ack = await client.post(
+                "/art/internal/v1/usage:ack",
+                headers=endpoint.runtime_headers(),
+                json={
+                    "source_id": "live-smoke-runtime",
+                    "source_epoch": 0,
+                    "through_sequence": 1,
+                },
+            )
+            usage_ack.raise_for_status()
+            usage_state = await client.get(
+                "/art/internal/v1/usage/state",
+                headers=endpoint.runtime_headers(),
+            )
+            usage_state.raise_for_status()
 
         (artifact_dir / "runtime_smoke_result.json").write_text(
             json.dumps(
@@ -241,6 +272,8 @@ async def test_external_runtime_server_live_smoke(
                     "duplicate_private_execution": (
                         duplicate_private_completion.json()["execution"]
                     ),
+                    "usage_page": usage_page,
+                    "usage_state": usage_state.json(),
                     "stale_status": stale.status_code,
                     "unauthorized_status": unauthorized.status_code,
                 },
@@ -264,6 +297,20 @@ async def test_external_runtime_server_live_smoke(
         assert private_receipt.json()["execution"] == "completed"
         assert duplicate_private_completion.status_code == 409
         assert duplicate_private_completion.json()["execution"] == "completed"
+        assert usage_page["source_id"] == "live-smoke-runtime"
+        assert usage_page["high_watermark_sequence"] == 1
+        assert usage_page["receipts"][0]["tenant_id"] == "tenant-live"
+        assert {
+            measurement["metric"]
+            for measurement in usage_page["receipts"][0]["measurements"]
+        } == {
+            "live_request_ms",
+            "cached_prefill_tokens",
+            "uncached_prefill_tokens",
+            "decode_tokens",
+        }
+        assert usage_state.json()["acknowledged_through_sequence"] == 1
+        assert usage_state.json()["retained_receipts"] == 0
     finally:
         process.terminate()
         try:

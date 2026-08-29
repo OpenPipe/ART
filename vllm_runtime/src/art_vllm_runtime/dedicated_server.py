@@ -29,13 +29,24 @@ from art_vllm_runtime.binary_routes import (
 )
 from art_vllm_runtime.fast_metrics import FastMetricsSidecar
 from art_vllm_runtime.patches import apply_vllm_runtime_patches
+from art_vllm_runtime.runtime_usage import (
+    RuntimeRequestContext,
+    RuntimeUsageCapacityError,
+    RuntimeUsageCursorError,
+    configure_runtime_usage,
+    runtime_usage_journal,
+)
 
-ART_SERVING_PROTOCOL_VERSION = 7
+ART_SERVING_PROTOCOL_VERSION = 8
 _PRIVATE_CACHE_IDENTITY_HEADER = "x-art-cache-identity"
 _PRIVATE_DISPATCH_PATH = "/art/internal/v1/chat/completions"
 _PRIVATE_EXECUTION_RECEIPT_CAPACITY = 4096
 _PRIVATE_EXECUTION_RECEIPT_PREFIX = "/art/internal/v1/requests"
 _PRIVATE_REQUEST_IDENTITY_HEADER = "x-art-request-identity"
+_PRIVATE_RUN_ID_HEADER = "x-art-run-id"
+_PRIVATE_SERVICE_TIER_HEADER = "x-art-service-tier"
+_PRIVATE_TENANT_ID_HEADER = "x-art-tenant-id"
+_PRIVATE_USAGE_PATH = "/art/internal/v1/usage"
 _RUNTIME_TARGET_HEADER = "x-art-runtime-target"
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _runtime_state: dict[str, object] = {}
@@ -258,8 +269,10 @@ class _ArtAuthenticationMiddleware(AuthenticationMiddleware):
         ):
             return self.app(scope, receive, send)
         headers = Headers(scope=scope)
-        if path == _PRIVATE_DISPATCH_PATH or path.startswith(
-            f"{_PRIVATE_EXECUTION_RECEIPT_PREFIX}/"
+        if (
+            path == _PRIVATE_DISPATCH_PATH
+            or path.startswith(f"{_PRIVATE_EXECUTION_RECEIPT_PREFIX}/")
+            or path.startswith(_PRIVATE_USAGE_PATH)
         ):
             if _verify_bearer(headers, _private_dispatch_token):
                 return self.app(scope, receive, send)
@@ -309,7 +322,9 @@ def _private_runtime_target_error(
     return None
 
 
-def _private_dispatch_context(request: Any) -> tuple[str, str] | JSONResponse:
+def _private_dispatch_context(
+    request: Any,
+) -> tuple[str, str, str, str, str] | JSONResponse:
     target_error = _private_runtime_target_error(request)
     if target_error is not None:
         return target_error
@@ -330,7 +345,24 @@ def _private_dispatch_context(request: Any) -> tuple[str, str] | JSONResponse:
                 status_code=HTTPStatus.BAD_REQUEST.value,
             )
         identities.append(values[0])
-    return identities[0], identities[1]
+    bounded = []
+    for header, maximum in (
+        (_PRIVATE_TENANT_ID_HEADER, 255),
+        (_PRIVATE_RUN_ID_HEADER, 255),
+        (_PRIVATE_SERVICE_TIER_HEADER, 128),
+    ):
+        values = headers.getlist(header)
+        if len(values) != 1 or not values[0] or len(values[0]) > maximum:
+            return JSONResponse(
+                content={
+                    "error": f"Invalid {header}",
+                    "type": "invalid_private_context",
+                    "execution": "not_started",
+                },
+                status_code=HTTPStatus.BAD_REQUEST.value,
+            )
+        bounded.append(values[0])
+    return identities[0], identities[1], bounded[0], bounded[1], bounded[2]
 
 
 def _private_request_fingerprint(request: Any) -> str:
@@ -386,6 +418,12 @@ async def _track_private_stream(
 class _ResetPrefixCacheRequest(BaseModel):
     reset_running_requests: bool = False
     reset_connector: bool = True
+
+
+class _RuntimeUsageAckRequest(BaseModel):
+    source_id: str = Field(min_length=1, max_length=512)
+    source_epoch: int = Field(ge=0)
+    through_sequence: int = Field(ge=0)
 
 
 class _InFlightLoraUpdateRequest(BaseModel):
@@ -484,6 +522,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--replica-generation", type=int, default=0)
     parser.add_argument("--process-uuid")
     parser.add_argument("--runtime-target-id")
+    parser.add_argument("--runtime-source-id")
+    parser.add_argument("--runtime-source-epoch", type=int)
     parser.add_argument("--update-identity")
     parser.add_argument("--initial-generation-id")
     parser.add_argument("--initial-policy-version", type=int)
@@ -595,7 +635,7 @@ def _patch_art_runtime_routes() -> None:
             context = _private_dispatch_context(raw_request)
             if isinstance(context, JSONResponse):
                 return context
-            request_identity, cache_identity = context
+            request_identity, cache_identity, tenant_id, run_id, service_tier = context
             request.request_id = request_identity
             request.cache_salt = f"art-private-cache-v1:{cache_identity}"
             fingerprint = _private_request_fingerprint(request)
@@ -618,6 +658,41 @@ def _patch_art_runtime_routes() -> None:
                     fingerprint=fingerprint,
                 )
             try:
+                runtime_usage_journal().reserve(
+                    request_identity,
+                    RuntimeRequestContext(
+                        tenant_id=tenant_id,
+                        run_id=run_id,
+                        operation_id=request_identity,
+                        service_tier=service_tier,
+                        model=request.model or "",
+                    ),
+                )
+            except RuntimeUsageCapacityError:
+                await _private_execution_receipts.release_not_started(
+                    request_identity, fingerprint
+                )
+                return JSONResponse(
+                    content={
+                        "error": "Runtime usage journal is full",
+                        "type": "runtime_usage_capacity_exhausted",
+                        "execution": "not_started",
+                    },
+                    status_code=HTTPStatus.SERVICE_UNAVAILABLE.value,
+                )
+            except ValueError as error:
+                await _private_execution_receipts.release_not_started(
+                    request_identity, fingerprint
+                )
+                return JSONResponse(
+                    content={
+                        "error": str(error),
+                        "type": "invalid_private_context",
+                        "execution": "not_started",
+                    },
+                    status_code=HTTPStatus.BAD_REQUEST.value,
+                )
+            try:
                 response = await create_chat_completion(request, raw_request)
             except BaseException:
                 await _private_execution_receipts.settle(
@@ -633,6 +708,7 @@ def _patch_art_runtime_routes() -> None:
                 await _private_execution_receipts.release_not_started(
                     request_identity, fingerprint
                 )
+                runtime_usage_journal().discard(request_identity)
                 return response
             body_iterator = getattr(response, "body_iterator", None)
             if body_iterator is not None:
@@ -680,6 +756,76 @@ def _patch_art_runtime_routes() -> None:
                     "execution": receipt.execution,
                 }
             )
+
+        @router.get(_PRIVATE_USAGE_PATH)
+        async def private_runtime_usage(
+            raw_request: Request,
+            after_sequence: int = Query(default=0, ge=0),
+            limit: int = Query(default=64, ge=1, le=64),
+        ) -> JSONResponse:
+            target_error = _private_runtime_target_error(
+                raw_request, execution="unknown"
+            )
+            if target_error is not None:
+                return target_error
+            try:
+                page = runtime_usage_journal().read(
+                    after_sequence=after_sequence, limit=limit
+                )
+            except RuntimeUsageCursorError as error:
+                return JSONResponse(
+                    content={
+                        "error": str(error),
+                        "type": "runtime_usage_cursor_conflict",
+                    },
+                    status_code=HTTPStatus.CONFLICT.value,
+                )
+            return JSONResponse(content=page)
+
+        @router.post(
+            f"{_PRIVATE_USAGE_PATH}:ack",
+            dependencies=[Depends(validate_json_request)],
+        )
+        async def acknowledge_private_runtime_usage(
+            body: _RuntimeUsageAckRequest, raw_request: Request
+        ) -> JSONResponse:
+            target_error = _private_runtime_target_error(
+                raw_request, execution="unknown"
+            )
+            if target_error is not None:
+                return target_error
+            journal = runtime_usage_journal()
+            if (
+                body.source_id != journal.source_id
+                or body.source_epoch != journal.source_epoch
+            ):
+                return JSONResponse(
+                    content={
+                        "error": "Runtime usage source identity changed",
+                        "type": "runtime_usage_source_conflict",
+                    },
+                    status_code=HTTPStatus.CONFLICT.value,
+                )
+            try:
+                acknowledged = journal.acknowledge(body.through_sequence)
+            except RuntimeUsageCursorError as error:
+                return JSONResponse(
+                    content={
+                        "error": str(error),
+                        "type": "runtime_usage_cursor_conflict",
+                    },
+                    status_code=HTTPStatus.CONFLICT.value,
+                )
+            return JSONResponse(content={"acknowledged_through_sequence": acknowledged})
+
+        @router.get(f"{_PRIVATE_USAGE_PATH}/state")
+        async def private_runtime_usage_state(raw_request: Request) -> JSONResponse:
+            target_error = _private_runtime_target_error(
+                raw_request, execution="unknown"
+            )
+            if target_error is not None:
+                return target_error
+            return JSONResponse(content=runtime_usage_journal().state())
 
         @router.post(
             "/art/v1/chat/completions",
@@ -988,15 +1134,31 @@ def main(argv: list[str] | None = None) -> None:
             "--initial-generation-id and --initial-policy-version must be set together"
         )
     private_dispatch_token = os.environ.pop("ART_PRIVATE_DISPATCH_TOKEN", None)
-    if (args.runtime_target_id is None) != (private_dispatch_token is None):
+    private_runtime_values = (
+        args.runtime_target_id,
+        private_dispatch_token,
+        args.runtime_source_id,
+        args.runtime_source_epoch,
+    )
+    if any(value is not None for value in private_runtime_values) and not all(
+        value is not None for value in private_runtime_values
+    ):
         raise ValueError(
-            "--runtime-target-id and ART_PRIVATE_DISPATCH_TOKEN must be set together"
+            "--runtime-target-id, --runtime-source-id, --runtime-source-epoch, "
+            "and ART_PRIVATE_DISPATCH_TOKEN must be set together"
         )
     if (
         args.runtime_target_id is not None
         and _SHA256_RE.fullmatch(args.runtime_target_id) is None
     ):
         raise ValueError("--runtime-target-id must be a lowercase SHA-256")
+    if (
+        args.runtime_source_id is not None
+        and not 1 <= len(args.runtime_source_id) <= 512
+    ):
+        raise ValueError("--runtime-source-id must contain 1-512 characters")
+    if args.runtime_source_epoch is not None and args.runtime_source_epoch < 0:
+        raise ValueError("--runtime-source-epoch must be nonnegative")
     if private_dispatch_token is not None and len(private_dispatch_token) < 32:
         raise ValueError(
             "ART_PRIVATE_DISPATCH_TOKEN must contain at least 32 characters"
@@ -1055,6 +1217,8 @@ def main(argv: list[str] | None = None) -> None:
         protocol_version=ART_SERVING_PROTOCOL_VERSION,
         process_uuid=process_uuid,
         generation=args.replica_generation,
+        runtime_source_id=args.runtime_source_id,
+        runtime_source_epoch=args.runtime_source_epoch,
         node_rank=args.node_rank,
         nnodes=args.nnodes,
         headless=args.headless,
@@ -1075,6 +1239,8 @@ def main(argv: list[str] | None = None) -> None:
         route_capture=route_capture,
         serving_profile_identity=serving_profile_identity,
     )
+    if args.runtime_source_id is not None:
+        configure_runtime_usage(args.runtime_source_id, args.runtime_source_epoch)
 
     os.environ["CUDA_VISIBLE_DEVICES"] = args.cuda_visible_devices
     os.environ["VLLM_ALLOW_RUNTIME_LORA_UPDATING"] = "1"

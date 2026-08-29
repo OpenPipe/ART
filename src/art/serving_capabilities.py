@@ -12,10 +12,13 @@ from pydantic import (
     model_validator,
 )
 
-ART_SERVING_PROTOCOL_VERSION = 7
+ART_SERVING_PROTOCOL_VERSION = 8
 
 ART_PRIVATE_CACHE_IDENTITY_HEADER = "x-art-cache-identity"
 ART_PRIVATE_REQUEST_IDENTITY_HEADER = "x-art-request-identity"
+ART_PRIVATE_RUN_ID_HEADER = "x-art-run-id"
+ART_PRIVATE_SERVICE_TIER_HEADER = "x-art-service-tier"
+ART_PRIVATE_TENANT_ID_HEADER = "x-art-tenant-id"
 ART_RUNTIME_TARGET_HEADER = "x-art-runtime-target"
 _SHA256_PATTERN = r"^[0-9a-f]{64}$"
 
@@ -166,6 +169,8 @@ class PairedInferenceEndpoint(BaseModel):
     url: AnyHttpUrl
     target_id: str = Field(pattern=_SHA256_PATTERN)
     runtime_generation: int = Field(ge=0)
+    runtime_source_id: str = Field(min_length=1, max_length=512)
+    runtime_source_epoch: int = Field(ge=0)
     authorization_token: str = Field(min_length=32, repr=False)
     profile: ServingProfile
 
@@ -174,6 +179,9 @@ class PairedInferenceEndpoint(BaseModel):
         *,
         request_identity: str,
         cache_identity: str,
+        tenant_id: str,
+        run_id: str,
+        service_tier: str,
     ) -> dict[str, str]:
         for name, value in (
             ("request_identity", request_identity),
@@ -181,12 +189,27 @@ class PairedInferenceEndpoint(BaseModel):
         ):
             if not re.fullmatch(_SHA256_PATTERN, value):
                 raise ValueError(f"{name} must be a lowercase SHA-256")
+        for name, value, maximum in (
+            ("tenant_id", tenant_id, 255),
+            ("run_id", run_id, 255),
+            ("service_tier", service_tier, 128),
+        ):
+            if not value or len(value) > maximum:
+                raise ValueError(f"{name} must contain 1-{maximum} characters")
+        return {
+            **self.runtime_headers(),
+            ART_PRIVATE_REQUEST_IDENTITY_HEADER: request_identity,
+            ART_PRIVATE_CACHE_IDENTITY_HEADER: cache_identity,
+            ART_PRIVATE_TENANT_ID_HEADER: tenant_id,
+            ART_PRIVATE_RUN_ID_HEADER: run_id,
+            ART_PRIVATE_SERVICE_TIER_HEADER: service_tier,
+            "x-request-id": request_identity,
+        }
+
+    def runtime_headers(self) -> dict[str, str]:
         return {
             "Authorization": f"Bearer {self.authorization_token}",
             ART_RUNTIME_TARGET_HEADER: self.target_id,
-            ART_PRIVATE_REQUEST_IDENTITY_HEADER: request_identity,
-            ART_PRIVATE_CACHE_IDENTITY_HEADER: cache_identity,
-            "x-request-id": request_identity,
         }
 
 

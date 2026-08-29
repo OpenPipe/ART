@@ -36,6 +36,7 @@ class ReplicaLaunchTemplate(_Message):
     engine_args: dict[str, object] = Field(default_factory=dict)
     server_args: dict[str, object] = Field(default_factory=dict)
     serving_profile_identity: ServingProfileIdentity | None = None
+    runtime_source_epoch_base: int = Field(default=0, ge=0)
 
 
 class HostMemberLaunchRequest(_Message):
@@ -83,6 +84,8 @@ class ReplicaState(_Message):
 class ReplicaDispatchCredentials(_Message):
     target_id: str = Field(pattern=r"^[0-9a-f]{64}$")
     runtime_generation: int = Field(ge=0)
+    runtime_source_id: str = Field(min_length=1, max_length=512)
+    runtime_source_epoch: int = Field(ge=0)
     authorization_token: str = Field(min_length=32, repr=False)
 
 
@@ -290,6 +293,10 @@ class ReplicaManager:
         return ReplicaDispatchCredentials(
             target_id=self._state.generation_digest,
             runtime_generation=self._state.generation,
+            runtime_source_id=self._spec.name,
+            runtime_source_epoch=(
+                self._template.runtime_source_epoch_base + self._state.generation
+            ),
             authorization_token=self._private_dispatch_token,
         )
 
@@ -653,6 +660,10 @@ class ReplicaManager:
             replica_generation=self._state.generation,
             process_uuid=process_uuid,
             runtime_target_id=self._state.generation_digest,
+            runtime_source_id=self._spec.name,
+            runtime_source_epoch=(
+                self._template.runtime_source_epoch_base + self._state.generation
+            ),
             private_dispatch_token=self._private_dispatch_token,
             update_identity=self._state.update_identity,
             initial_generation_id=self._template.initial_generation_id,
