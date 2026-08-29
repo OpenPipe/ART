@@ -64,6 +64,10 @@ def main(
         runtime.adapter_export_dtypes = {}
         runtime.adapter_export_config = {}
 
+        from megatron.core import parallel_state as ps
+
+        global_batch_sequences = int(ps.get_data_parallel_world_size())
+
         executor = MegatronTrainJobExecutor(runtime)
         store = SharedMemoryPackedBatchStore(
             owner_actor_id=f"rank-{dist.get_rank()}", capacity_bytes=64 << 20
@@ -73,7 +77,9 @@ def main(
         with ExitStack() as batches:
             for index in range(contributions):
                 tensors = _packed_tensors(
-                    sequence_length, offset=index * sequence_length
+                    sequence_length,
+                    sequences=global_batch_sequences,
+                    offset=index * global_batch_sequences * sequence_length,
                 )
                 ref = store.create(tensors, batch_id=f"batch-{index}")
                 batch = InMemoryPackedBatch.open(ref, ref)
@@ -95,7 +101,9 @@ def main(
                     expected_global_loss_bearing_tokens=int(
                         tensors["assistant_mask"][:, 1:].sum().item()
                     ),
-                    config=CurrentTrainConfig(grad_accumulation_sequences=1),
+                    config=CurrentTrainConfig(
+                        grad_accumulation_sequences=global_batch_sequences
+                    ),
                 )
                 result = executor.execute_forward_backward(
                     job, batch, cancelled=Event()
@@ -130,8 +138,6 @@ def main(
             raise RuntimeError("optimizer consumed the wrong F/B contributions")
         dist.barrier()
         if dist.get_rank() == 0:
-            from megatron.core import parallel_state as ps
-
             print(
                 json.dumps(
                     {
@@ -171,10 +177,13 @@ def _generation(step: int) -> TrainerGeneration:
     )
 
 
-def _packed_tensors(sequence_length: int, *, offset: int) -> PackedTensors:
-    shape = (1, sequence_length)
+def _packed_tensors(
+    sequence_length: int, *, sequences: int, offset: int
+) -> PackedTensors:
+    shape = (sequences, sequence_length)
     tokens = (
-        torch.arange(sequence_length, dtype=torch.long).reshape(shape) + offset
+        torch.arange(sequences * sequence_length, dtype=torch.long).reshape(shape)
+        + offset
     ) % 32_000 + 100
     assistant_mask = torch.zeros(shape, dtype=torch.bool)
     assistant_mask[:, sequence_length // 2 :] = True
@@ -182,7 +191,9 @@ def _packed_tensors(sequence_length: int, *, offset: int) -> PackedTensors:
         "tokens": tokens,
         "group_ids": torch.zeros(shape, dtype=torch.long),
         "parent_ids": torch.zeros(shape, dtype=torch.long),
-        "input_pos": torch.arange(sequence_length, dtype=torch.long).reshape(shape),
+        "input_pos": torch.arange(sequence_length, dtype=torch.long)
+        .expand(shape)
+        .clone(),
         "assistant_mask": assistant_mask,
         "logprobs": torch.where(
             assistant_mask,
@@ -191,8 +202,8 @@ def _packed_tensors(sequence_length: int, *, offset: int) -> PackedTensors:
         ),
         "advantages": assistant_mask.to(dtype=torch.float32),
         "weights": assistant_mask.to(dtype=torch.float32),
-        "pixel_values": [None],
-        "image_grid_thw": [None],
+        "pixel_values": [None] * sequences,
+        "image_grid_thw": [None] * sequences,
         "moe_routing_replay": None,
     }
 
