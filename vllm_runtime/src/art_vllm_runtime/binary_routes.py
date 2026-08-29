@@ -48,17 +48,18 @@ def capture_routed_experts() -> Iterator[_CapturedRoutes]:
         _CAPTURE.reset(token)
 
 
-def mark_route_request(request: Any) -> None:
+def mark_route_request(request: Any, *, route_identity: str) -> None:
+    if not route_identity:
+        raise ValueError("route identity must be non-empty")
     xargs = dict(getattr(request, "vllm_xargs", None) or {})
     xargs[ROUTE_REQUEST_XARG] = 1
     request.vllm_xargs = xargs
+    route_salt = f"{ROUTE_CACHE_SALT}:{route_identity}"
     cache_salt = getattr(request, "cache_salt", None)
     if not cache_salt:
-        request.cache_salt = ROUTE_CACHE_SALT
-    elif cache_salt != ROUTE_CACHE_SALT and not cache_salt.endswith(
-        f"|{ROUTE_CACHE_SALT}"
-    ):
-        request.cache_salt = f"{cache_salt}|{ROUTE_CACHE_SALT}"
+        request.cache_salt = route_salt
+    elif cache_salt != route_salt and not cache_salt.endswith(f"|{route_salt}"):
+        request.cache_salt = f"{cache_salt}|{route_salt}"
 
 
 def _sampling_requests_routes(sampling_params: Any) -> bool:

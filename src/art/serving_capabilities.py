@@ -12,10 +12,12 @@ from pydantic import (
     model_validator,
 )
 
-ART_SERVING_PROTOCOL_VERSION = 8
+ART_SERVING_PROTOCOL_VERSION = 9
 
 ART_PRIVATE_CACHE_IDENTITY_HEADER = "x-art-cache-identity"
 ART_PRIVATE_REQUEST_IDENTITY_HEADER = "x-art-request-identity"
+ART_PRIVATE_ROUTE_CAPTURE_HEADER = "x-art-route-capture"
+ART_PRIVATE_ROUTE_MAX_BYTES_HEADER = "x-art-route-max-bytes"
 ART_PRIVATE_RUN_ID_HEADER = "x-art-run-id"
 ART_PRIVATE_SERVICE_TIER_HEADER = "x-art-service-tier"
 ART_PRIVATE_TENANT_ID_HEADER = "x-art-tenant-id"
@@ -182,6 +184,7 @@ class PairedInferenceEndpoint(BaseModel):
         tenant_id: str,
         run_id: str,
         service_tier: str,
+        route_capture_max_bytes: int | None = None,
     ) -> dict[str, str]:
         for name, value in (
             ("request_identity", request_identity),
@@ -196,7 +199,7 @@ class PairedInferenceEndpoint(BaseModel):
         ):
             if not value or len(value) > maximum:
                 raise ValueError(f"{name} must contain 1-{maximum} characters")
-        return {
+        headers = {
             **self.runtime_headers(),
             ART_PRIVATE_REQUEST_IDENTITY_HEADER: request_identity,
             ART_PRIVATE_CACHE_IDENTITY_HEADER: cache_identity,
@@ -205,6 +208,20 @@ class PairedInferenceEndpoint(BaseModel):
             ART_PRIVATE_SERVICE_TIER_HEADER: service_tier,
             "x-request-id": request_identity,
         }
+        if route_capture_max_bytes is not None:
+            identity = self.profile.identity
+            if (
+                isinstance(route_capture_max_bytes, bool)
+                or route_capture_max_bytes < 1
+                or identity.retained_route_transport != "caios_lota"
+                or route_capture_max_bytes > identity.retained_route_max_bytes
+            ):
+                raise ValueError(
+                    "route capture bytes must fit the retained-route capacity"
+                )
+            headers[ART_PRIVATE_ROUTE_CAPTURE_HEADER] = "retained"
+            headers[ART_PRIVATE_ROUTE_MAX_BYTES_HEADER] = str(route_capture_max_bytes)
+        return headers
 
     def runtime_headers(self) -> dict[str, str]:
         return {

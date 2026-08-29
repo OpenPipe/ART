@@ -11,7 +11,7 @@ from fastapi.testclient import TestClient
 import pytest
 from starlette.datastructures import URL
 
-from art.serving_capabilities import ServingProfile
+from art.serving_capabilities import PairedInferenceEndpoint, ServingProfile
 
 _PAYLOAD: dict[str, object] = {
     "schema_version": 1,
@@ -158,9 +158,9 @@ async def test_serving_profile_reports_resolved_runtime_geometry(monkeypatch) ->
         "trainer_dtype": "bfloat16",
         "route_replay": True,
         "lora_transport": "nixl",
-        "retained_route_transport": "none",
-        "retained_route_max_bytes": 0,
-        "retained_route_max_bundles": 0,
+        "retained_route_transport": "caios_lota",
+        "retained_route_max_bytes": 4096,
+        "retained_route_max_bundles": 4,
     }
     monkeypatch.setitem(
         dedicated_server._runtime_state, "serving_profile_identity", identity
@@ -225,6 +225,25 @@ async def test_serving_profile_reports_resolved_runtime_geometry(monkeypatch) ->
     assert profile.kv_block_bytes_per_rank == 65_536
     assert profile.kv_capacity_bytes_per_rank == 268_435_456
     assert profile.route_capture_format == "art_inference_route_bundle_v1"
+    endpoint = PairedInferenceEndpoint(
+        url="http://127.0.0.1:8000/art/internal/v1/chat/completions",
+        target_id="a" * 64,
+        runtime_generation=1,
+        runtime_source_id="source",
+        runtime_source_epoch=1,
+        authorization_token="secret" * 6,
+        profile=profile,
+    )
+    headers = endpoint.request_headers(
+        request_identity="b" * 64,
+        cache_identity="c" * 64,
+        tenant_id="tenant",
+        run_id="run",
+        service_tier="standard",
+        route_capture_max_bytes=2048,
+    )
+    assert headers["x-art-route-capture"] == "retained"
+    assert headers["x-art-route-max-bytes"] == "2048"
 
 
 def test_private_dispatch_uses_distinct_auth_and_fences_runtime_target(
@@ -235,6 +254,16 @@ def test_private_dispatch_uses_distinct_auth_and_fences_runtime_target(
     monkeypatch.setattr(dedicated_server, "_auth_tokens", ["public-token"])
     monkeypatch.setattr(dedicated_server, "_private_dispatch_token", "p" * 32)
     monkeypatch.setattr(dedicated_server, "_runtime_target_id", "a" * 64)
+    monkeypatch.setitem(dedicated_server._runtime_state, "route_capture", True)
+    monkeypatch.setitem(
+        dedicated_server._runtime_state,
+        "serving_profile_identity",
+        {
+            "retained_route_transport": "caios_lota",
+            "retained_route_max_bytes": 4096,
+            "retained_route_max_bundles": 4,
+        },
+    )
 
     app = FastAPI()
     app.get("/v1/models")(lambda: {"ok": True})
@@ -287,6 +316,8 @@ def test_private_dispatch_uses_distinct_auth_and_fences_runtime_target(
             (b"x-art-tenant-id", b"tenant"),
             (b"x-art-run-id", b"run"),
             (b"x-art-service-tier", b"standard"),
+            (b"x-art-route-capture", b"retained"),
+            (b"x-art-route-max-bytes", b"2048"),
         ],
     }
     request = Request(scope)
@@ -299,6 +330,7 @@ def test_private_dispatch_uses_distinct_auth_and_fences_runtime_target(
         "run",
         "standard",
     )
+    assert dedicated_server._private_route_capture_max_bytes(request) == 2048
     scope["headers"][1] = (b"x-art-runtime-target", b"d" * 64)
     stale = dedicated_server._private_dispatch_context(Request(scope))
     assert stale.status_code == 409
@@ -330,6 +362,39 @@ async def test_private_execution_receipts_are_bounded_and_fail_closed() -> None:
         await receipts.claim("d" * 64, "payload-d")
 
 
+@pytest.mark.asyncio
+async def test_private_route_responses_reserve_replay_and_ack_exact_bytes() -> None:
+    responses = dedicated_server._PrivateRouteResponses()
+    identity = "a" * 64
+    await responses.reserve(
+        identity,
+        "payload-a",
+        8,
+        capacity_bytes=8,
+        capacity_bundles=1,
+    )
+    with pytest.raises(RuntimeError, match="capacity is exhausted"):
+        await responses.reserve(
+            "b" * 64,
+            "payload-b",
+            1,
+            capacity_bytes=8,
+            capacity_bundles=1,
+        )
+    await responses.complete(identity, "payload-a", b"route")
+    assert await responses.replay(identity, "payload-a") == b"route"
+    with pytest.raises(RuntimeError, match="identity was reused"):
+        await responses.replay(identity, "different")
+    assert await responses.state() == {
+        "active_route_reservations": 0,
+        "retained_route_responses": 1,
+        "reserved_route_bytes": 8,
+        "retained_route_bytes": 5,
+    }
+    assert await responses.acknowledge(identity) == 5
+    assert await responses.acknowledge(identity) is None
+
+
 def test_private_request_fingerprint_uses_authenticated_request_identity() -> None:
     from vllm.entrypoints.openai.chat_completion.protocol import (
         ChatCompletionRequest,
@@ -348,6 +413,9 @@ def test_private_request_fingerprint_uses_authenticated_request_identity() -> No
     assert dedicated_server._private_request_fingerprint(
         requests[0]
     ) == dedicated_server._private_request_fingerprint(requests[1])
+    assert dedicated_server._private_request_fingerprint(
+        requests[0], route_capture_max_bytes=4096
+    ) != dedicated_server._private_request_fingerprint(requests[0])
 
 
 @pytest.mark.asyncio

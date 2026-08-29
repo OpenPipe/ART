@@ -42,12 +42,14 @@ from art_vllm_runtime.runtime_usage import (
     runtime_usage_journal,
 )
 
-ART_SERVING_PROTOCOL_VERSION = 8
+ART_SERVING_PROTOCOL_VERSION = 9
 _PRIVATE_CACHE_IDENTITY_HEADER = "x-art-cache-identity"
 _PRIVATE_DISPATCH_PATH = "/art/internal/v1/chat/completions"
 _PRIVATE_EXECUTION_RECEIPT_CAPACITY = 4096
 _PRIVATE_EXECUTION_RECEIPT_PREFIX = "/art/internal/v1/requests"
 _PRIVATE_REQUEST_IDENTITY_HEADER = "x-art-request-identity"
+_PRIVATE_ROUTE_CAPTURE_HEADER = "x-art-route-capture"
+_PRIVATE_ROUTE_MAX_BYTES_HEADER = "x-art-route-max-bytes"
 _PRIVATE_RUN_ID_HEADER = "x-art-run-id"
 _PRIVATE_SERVICE_TIER_HEADER = "x-art-service-tier"
 _PRIVATE_TENANT_ID_HEADER = "x-art-tenant-id"
@@ -126,9 +128,118 @@ class _PrivateExecutionReceipts:
             return self._receipts.get(request_identity)
 
 
+@dataclass(frozen=True)
+class _PrivateRouteResponse:
+    fingerprint: str
+    reserved_bytes: int
+    body: bytes | None = None
+
+
+class _PrivateRouteResponses:
+    """Bound exact route responses until the service commits their CAIOS ref."""
+
+    def __init__(self) -> None:
+        self._lock = asyncio.Lock()
+        self._responses: dict[str, _PrivateRouteResponse] = {}
+        self._reserved_bytes = 0
+
+    async def reserve(
+        self,
+        request_identity: str,
+        fingerprint: str,
+        reserved_bytes: int,
+        *,
+        capacity_bytes: int,
+        capacity_bundles: int,
+    ) -> None:
+        async with self._lock:
+            if request_identity in self._responses:
+                raise RuntimeError("private route response is already reserved")
+            if (
+                reserved_bytes < 1
+                or capacity_bytes < reserved_bytes
+                or capacity_bundles < 1
+                or len(self._responses) >= capacity_bundles
+                or self._reserved_bytes + reserved_bytes > capacity_bytes
+            ):
+                raise RuntimeUsageCapacityError(
+                    "private route response capacity is exhausted"
+                )
+            self._responses[request_identity] = _PrivateRouteResponse(
+                fingerprint=fingerprint,
+                reserved_bytes=reserved_bytes,
+            )
+            self._reserved_bytes += reserved_bytes
+
+    async def complete(
+        self, request_identity: str, fingerprint: str, body: bytes
+    ) -> None:
+        async with self._lock:
+            response = self._responses.get(request_identity)
+            if response is None or response.fingerprint != fingerprint:
+                raise RuntimeError("private route response identity changed")
+            if response.body is not None:
+                raise RuntimeError("private route response is already complete")
+            if not body or len(body) > response.reserved_bytes:
+                raise RuntimeError("private route response exceeded its reservation")
+            self._responses[request_identity] = _PrivateRouteResponse(
+                fingerprint=fingerprint,
+                reserved_bytes=response.reserved_bytes,
+                body=body,
+            )
+
+    async def replay(self, request_identity: str, fingerprint: str) -> bytes | None:
+        async with self._lock:
+            response = self._responses.get(request_identity)
+            if response is None:
+                return None
+            if response.fingerprint != fingerprint:
+                raise RuntimeError("private route request identity was reused")
+            return response.body
+
+    async def release(self, request_identity: str, fingerprint: str) -> bool:
+        async with self._lock:
+            response = self._responses.get(request_identity)
+            if response is None:
+                return False
+            if response.fingerprint != fingerprint:
+                raise RuntimeError("private route response identity changed")
+            self._responses.pop(request_identity)
+            self._reserved_bytes -= response.reserved_bytes
+            return True
+
+    async def acknowledge(self, request_identity: str) -> int | None:
+        async with self._lock:
+            response = self._responses.get(request_identity)
+            if response is None:
+                return None
+            if response.body is None:
+                raise RuntimeError("private route response is not complete")
+            self._responses.pop(request_identity)
+            self._reserved_bytes -= response.reserved_bytes
+            return len(response.body)
+
+    async def state(self) -> dict[str, int]:
+        async with self._lock:
+            completed = tuple(
+                response
+                for response in self._responses.values()
+                if response.body is not None
+            )
+            return {
+                "active_route_reservations": len(self._responses) - len(completed),
+                "retained_route_responses": len(completed),
+                "reserved_route_bytes": self._reserved_bytes,
+                "retained_route_bytes": sum(
+                    len(response.body or b"") for response in completed
+                ),
+            }
+
+
 _private_execution_receipts = _PrivateExecutionReceipts(
     _PRIVATE_EXECUTION_RECEIPT_CAPACITY
 )
+_private_route_responses = _PrivateRouteResponses()
 
 
 def _patch_prebound_listener_tcp_nodelay(api_server: Any) -> None:
@@ -370,9 +481,84 @@ def _private_dispatch_context(
     return identities[0], identities[1], bounded[0], bounded[1], bounded[2]
 
 
-def _private_request_fingerprint(request: Any) -> str:
+def _private_route_capture_max_bytes(request: Any) -> int | None | JSONResponse:
+    headers = request.headers
+    modes = headers.getlist(_PRIVATE_ROUTE_CAPTURE_HEADER)
+    bounds = headers.getlist(_PRIVATE_ROUTE_MAX_BYTES_HEADER)
+    if not modes and not bounds:
+        return None
+    if len(modes) != 1 or modes[0] != "retained" or len(bounds) != 1:
+        return JSONResponse(
+            content={
+                "error": "Invalid private retained-route reservation",
+                "type": "invalid_private_context",
+                "execution": "not_started",
+            },
+            status_code=HTTPStatus.BAD_REQUEST.value,
+        )
+    try:
+        maximum = int(bounds[0])
+    except ValueError:
+        maximum = 0
+    identity = _runtime_state.get("serving_profile_identity")
+    if not isinstance(identity, dict):
+        maximum_available = bundles_available = 0
+    else:
+        maximum_available = identity.get("retained_route_max_bytes", 0)
+        bundles_available = identity.get("retained_route_max_bundles", 0)
+    valid_capacity = (
+        _runtime_state.get("route_capture") is True
+        and isinstance(identity, dict)
+        and identity.get("retained_route_transport") == "caios_lota"
+        and not isinstance(maximum_available, bool)
+        and isinstance(maximum_available, int)
+        and not isinstance(bundles_available, bool)
+        and isinstance(bundles_available, int)
+        and 1 <= maximum <= maximum_available
+        and bundles_available >= 1
+    )
+    if not valid_capacity:
+        return JSONResponse(
+            content={
+                "error": "Retained-route capture is unavailable or exceeds capacity",
+                "type": "invalid_private_context",
+                "execution": "not_started",
+            },
+            status_code=HTTPStatus.BAD_REQUEST.value,
+        )
+    return maximum
+
+
+def _private_route_capacity() -> tuple[int, int]:
+    identity = _runtime_state.get("serving_profile_identity")
+    if not isinstance(identity, dict):
+        raise RuntimeError("retained-route profile identity is unavailable")
+    maximum = identity.get("retained_route_max_bytes")
+    bundles = identity.get("retained_route_max_bundles")
+    if (
+        isinstance(maximum, bool)
+        or not isinstance(maximum, int)
+        or maximum < 1
+        or isinstance(bundles, bool)
+        or not isinstance(bundles, int)
+        or bundles < 1
+    ):
+        raise RuntimeError("retained-route profile capacity is invalid")
+    return maximum, bundles
+
+
+def _private_request_fingerprint(
+    request: Any, *, route_capture_max_bytes: int | None = None
+) -> str:
     return hashlib.sha256(
-        request.model_dump_json(exclude_none=False).encode()
+        json.dumps(
+            {
+                "request": json.loads(request.model_dump_json(exclude_none=False)),
+                "route_capture_max_bytes": route_capture_max_bytes,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
     ).hexdigest()
 
 
@@ -650,7 +836,42 @@ def _patch_art_runtime_routes() -> None:
             request_identity, cache_identity, tenant_id, run_id, service_tier = context
             request.request_id = request_identity
             request.cache_salt = f"art-private-cache-v1:{cache_identity}"
-            fingerprint = _private_request_fingerprint(request)
+            route_capture_max_bytes = _private_route_capture_max_bytes(raw_request)
+            if isinstance(route_capture_max_bytes, JSONResponse):
+                return route_capture_max_bytes
+            if route_capture_max_bytes is not None:
+                if request.stream:
+                    return JSONResponse(
+                        content={
+                            "error": "Retained-route capture requires stream=false",
+                            "type": "invalid_private_context",
+                            "execution": "not_started",
+                        },
+                        status_code=HTTPStatus.BAD_REQUEST.value,
+                    )
+                mark_route_request(request, route_identity=request_identity)
+            fingerprint = _private_request_fingerprint(
+                request, route_capture_max_bytes=route_capture_max_bytes
+            )
+            if route_capture_max_bytes is not None:
+                try:
+                    retained = await _private_route_responses.replay(
+                        request_identity, fingerprint
+                    )
+                except RuntimeError:
+                    return JSONResponse(
+                        content={
+                            "error": "Request identity was reused for different content",
+                            "type": "request_identity_conflict",
+                            "execution": "not_started",
+                        },
+                        status_code=HTTPStatus.CONFLICT.value,
+                    )
+                if retained is not None:
+                    return Response(
+                        content=retained,
+                        media_type="application/vnd.art.routed-experts-v2",
+                    )
             try:
                 existing = await _private_execution_receipts.claim(
                     request_identity, fingerprint
@@ -669,6 +890,28 @@ def _patch_art_runtime_routes() -> None:
                     existing,
                     fingerprint=fingerprint,
                 )
+            if route_capture_max_bytes is not None:
+                capacity_bytes, capacity_bundles = _private_route_capacity()
+                try:
+                    await _private_route_responses.reserve(
+                        request_identity,
+                        fingerprint,
+                        route_capture_max_bytes,
+                        capacity_bytes=capacity_bytes,
+                        capacity_bundles=capacity_bundles,
+                    )
+                except RuntimeUsageCapacityError:
+                    await _private_execution_receipts.release_not_started(
+                        request_identity, fingerprint
+                    )
+                    return JSONResponse(
+                        content={
+                            "error": "Retained-route response capacity is exhausted",
+                            "type": "route_capacity_exhausted",
+                            "execution": "not_started",
+                        },
+                        status_code=HTTPStatus.SERVICE_UNAVAILABLE.value,
+                    )
             usage_context = RuntimeRequestContext(
                 tenant_id=tenant_id,
                 run_id=run_id,
@@ -679,6 +922,10 @@ def _patch_art_runtime_routes() -> None:
             try:
                 runtime_usage_journal().reserve(request_identity, usage_context)
             except RuntimeUsageCapacityError:
+                if route_capture_max_bytes is not None:
+                    await _private_route_responses.release(
+                        request_identity, fingerprint
+                    )
                 await _private_execution_receipts.release_not_started(
                     request_identity, fingerprint
                 )
@@ -691,6 +938,10 @@ def _patch_art_runtime_routes() -> None:
                     status_code=HTTPStatus.SERVICE_UNAVAILABLE.value,
                 )
             except ValueError as error:
+                if route_capture_max_bytes is not None:
+                    await _private_route_responses.release(
+                        request_identity, fingerprint
+                    )
                 await _private_execution_receipts.release_not_started(
                     request_identity, fingerprint
                 )
@@ -704,23 +955,91 @@ def _patch_art_runtime_routes() -> None:
                 )
             try:
                 with bind_runtime_usage_context(request_identity, usage_context):
-                    response = await create_chat_completion(request, raw_request)
+                    if route_capture_max_bytes is None:
+                        response = await create_chat_completion(request, raw_request)
+                        routes = None
+                    else:
+                        with capture_routed_experts() as routes:
+                            response = await create_chat_completion(
+                                request, raw_request
+                            )
             except BaseException:
+                if route_capture_max_bytes is not None:
+                    await _private_route_responses.release(
+                        request_identity, fingerprint
+                    )
                 await _private_execution_receipts.settle(
                     request_identity, fingerprint, "ambiguous"
                 )
                 raise
             if response is None:
+                if route_capture_max_bytes is not None:
+                    await _private_route_responses.release(
+                        request_identity, fingerprint
+                    )
                 await _private_execution_receipts.settle(
                     request_identity, fingerprint, "ambiguous"
                 )
                 return Response(status_code=499)
             if response.status_code >= HTTPStatus.BAD_REQUEST.value:
+                if route_capture_max_bytes is not None:
+                    await _private_route_responses.release(
+                        request_identity, fingerprint
+                    )
                 await _private_execution_receipts.release_not_started(
                     request_identity, fingerprint
                 )
                 runtime_usage_journal().discard(request_identity)
                 return response
+            if route_capture_max_bytes is not None:
+                if not routes:
+                    await _private_route_responses.release(
+                        request_identity, fingerprint
+                    )
+                    await _private_execution_receipts.settle(
+                        request_identity, fingerprint, "completed"
+                    )
+                    return JSONResponse(
+                        content={
+                            "error": "vLLM returned no routed experts",
+                            "type": "route_capture_incomplete",
+                            "execution": "completed",
+                        },
+                        status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value,
+                    )
+                try:
+                    retained = encode_routed_experts_response(response.body, routes)
+                    await _private_route_responses.complete(
+                        request_identity, fingerprint, retained
+                    )
+                except RuntimeError as error:
+                    await _private_route_responses.release(
+                        request_identity, fingerprint
+                    )
+                    await _private_execution_receipts.settle(
+                        request_identity, fingerprint, "completed"
+                    )
+                    return JSONResponse(
+                        content={
+                            "error": str(error),
+                            "type": "route_capture_incomplete",
+                            "execution": "completed",
+                        },
+                        status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value,
+                    )
+                await _private_execution_receipts.settle(
+                    request_identity, fingerprint, "completed"
+                )
+                headers = {
+                    key: value
+                    for key, value in response.headers.items()
+                    if key.lower() not in {"content-length", "content-type"}
+                }
+                return Response(
+                    content=retained,
+                    media_type="application/vnd.art.routed-experts-v2",
+                    headers=headers,
+                )
             body_iterator = getattr(response, "body_iterator", None)
             if body_iterator is not None:
                 response.body_iterator = _track_private_stream(
@@ -766,6 +1085,46 @@ def _patch_art_runtime_routes() -> None:
                 content={
                     "type": "execution_receipt",
                     "execution": receipt.execution,
+                }
+            )
+
+        @router.post(
+            f"{_PRIVATE_EXECUTION_RECEIPT_PREFIX}/{{request_identity}}/routes:ack"
+        )
+        async def acknowledge_private_route_response(
+            request_identity: str, raw_request: Request
+        ) -> JSONResponse:
+            target_error = _private_runtime_target_error(
+                raw_request, execution="unknown"
+            )
+            if target_error is not None:
+                return target_error
+            if _SHA256_RE.fullmatch(request_identity) is None:
+                return JSONResponse(
+                    content={
+                        "error": "Invalid private request identity",
+                        "type": "invalid_private_context",
+                        "execution": "not_started",
+                    },
+                    status_code=HTTPStatus.BAD_REQUEST.value,
+                )
+            try:
+                released_bytes = await _private_route_responses.acknowledge(
+                    request_identity
+                )
+            except RuntimeError as error:
+                return JSONResponse(
+                    content={
+                        "error": str(error),
+                        "type": "route_response_not_ready",
+                        "execution": "started",
+                    },
+                    status_code=HTTPStatus.CONFLICT.value,
+                )
+            return JSONResponse(
+                content={
+                    "acknowledged": released_bytes is not None,
+                    "released_bytes": released_bytes or 0,
                 }
             )
 
@@ -837,7 +1196,12 @@ def _patch_art_runtime_routes() -> None:
             )
             if target_error is not None:
                 return target_error
-            return JSONResponse(content=runtime_usage_journal().state())
+            return JSONResponse(
+                content={
+                    **runtime_usage_journal().state(),
+                    **await _private_route_responses.state(),
+                }
+            )
 
         @router.post(
             "/art/v1/chat/completions",
@@ -851,7 +1215,9 @@ def _patch_art_runtime_routes() -> None:
                     content={"error": "ART binary routed experts require stream=false"},
                     status_code=HTTPStatus.BAD_REQUEST.value,
                 )
-            mark_route_request(request)
+            route_identity = request.request_id or uuid.uuid4().hex
+            request.request_id = route_identity
+            mark_route_request(request, route_identity=route_identity)
             with capture_routed_experts() as routes:
                 response = await create_chat_completion(request, raw_request)
             if response is None:
