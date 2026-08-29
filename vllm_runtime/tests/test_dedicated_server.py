@@ -324,6 +324,26 @@ async def test_private_execution_receipts_are_bounded_and_fail_closed() -> None:
         await receipts.claim("d" * 64, "payload-d")
 
 
+def test_private_request_fingerprint_uses_authenticated_request_identity() -> None:
+    from vllm.entrypoints.openai.chat_completion.protocol import (
+        ChatCompletionRequest,
+    )
+
+    payload = {
+        "model": "test-model",
+        "messages": [{"role": "user", "content": "Say hello."}],
+        "max_tokens": 8,
+    }
+    requests = [ChatCompletionRequest.model_validate(payload) for _ in range(2)]
+    assert requests[0].request_id != requests[1].request_id
+    for request in requests:
+        request.request_id = "a" * 64
+        request.cache_salt = "art-private-cache-v1:" + "b" * 64
+    assert dedicated_server._private_request_fingerprint(
+        requests[0]
+    ) == dedicated_server._private_request_fingerprint(requests[1])
+
+
 @pytest.mark.asyncio
 async def test_private_stream_receipt_is_completed_only_at_terminal_chunk(
     monkeypatch,

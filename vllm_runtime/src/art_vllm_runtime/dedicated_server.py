@@ -596,6 +596,7 @@ def _patch_art_runtime_routes() -> None:
             if isinstance(context, JSONResponse):
                 return context
             request_identity, cache_identity = context
+            request.request_id = request_identity
             request.cache_salt = f"art-private-cache-v1:{cache_identity}"
             fingerprint = _private_request_fingerprint(request)
             try:
