@@ -105,6 +105,7 @@ async def test_failure_stops_whole_gang_before_callback_and_restarts_generation(
     restarted = await manager.restart(
         served_model_name="model@1",
         lora_path="/step/0001",
+        initial_generation_id="generation-1",
         initial_policy_version=1,
     )
 

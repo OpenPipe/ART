@@ -1754,6 +1754,7 @@ class DistributedMegatronService:
         template = ReplicaLaunchTemplate(
             served_model_name=self._serving_lora_name(step),
             lora_path=lora_path,
+            initial_generation_id=self._generation_id_for_step(step),
             initial_policy_version=step,
             engine_args=self._engine_args(config),
             server_args=self._server_args(config),
@@ -1885,6 +1886,7 @@ class DistributedMegatronService:
             state = await manager.restart(
                 served_model_name=bootstrap_name,
                 lora_path=checkpoint,
+                initial_generation_id=generation_id,
                 initial_policy_version=serving_step,
             )
             self._vllm_sleeping = False
@@ -2109,6 +2111,8 @@ class DistributedMegatronService:
                 "model_name": name,
                 "lora_slot": name,
                 "lora_path": path,
+                "generation_id": self._generation_id_for_step(step),
+                "expected_generation_id": self._generation_id_for_step(active_step),
                 "policy_version": step,
             }
             if in_flight

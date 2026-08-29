@@ -80,6 +80,7 @@ def _chunks() -> list[ChatCompletionChunk]:
     first_span = {
         "start_token": 0,
         "end_token": 1,
+        "generation_id": "generation-1",
         "policy_version": 1,
         "lora_slot": "slot",
         "update_seq": 2,
@@ -264,6 +265,7 @@ def test_stream_consumer_matches_auto_capture_reconstruction() -> None:
             {
                 "start_token": 0,
                 "end_token": 1,
+                "generation_id": "generation-1",
                 "policy_version": 1,
                 "lora_slot": "slot",
                 "update_seq": 2,
@@ -271,6 +273,7 @@ def test_stream_consumer_matches_auto_capture_reconstruction() -> None:
             {
                 "start_token": 1,
                 "end_token": 2,
+                "generation_id": "generation-1",
                 "policy_version": 1,
                 "lora_slot": "slot",
                 "update_seq": 2,

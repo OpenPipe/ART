@@ -25,7 +25,7 @@ from art_vllm_runtime.binary_routes import (
 from art_vllm_runtime.fast_metrics import FastMetricsSidecar
 from art_vllm_runtime.patches import apply_vllm_runtime_patches
 
-ART_SERVING_PROTOCOL_VERSION = 4
+ART_SERVING_PROTOCOL_VERSION = 5
 _runtime_state: dict[str, object] = {}
 _auth_tokens: list[str] = []
 _fast_metrics_port: int | None = None
@@ -110,6 +110,8 @@ class _ResetPrefixCacheRequest(BaseModel):
 class _InFlightLoraUpdateRequest(BaseModel):
     model_name: str = Field(min_length=1)
     lora_path: str = Field(min_length=1)
+    generation_id: str = Field(min_length=1)
+    expected_generation_id: str = Field(min_length=1)
     policy_version: int = Field(ge=0)
     lora_slot: str | None = Field(default=None, min_length=1)
     base_model_name: str | None = None
@@ -201,6 +203,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--replica-generation", type=int, default=0)
     parser.add_argument("--process-uuid")
     parser.add_argument("--update-identity")
+    parser.add_argument("--initial-generation-id")
     parser.add_argument("--initial-policy-version", type=int)
     parser.add_argument("--lora-path", help="Optional initial checkpoint path")
     parser.add_argument("--served-model-name", required=True)
@@ -356,12 +359,25 @@ def _patch_art_runtime_routes() -> None:
 
             public_model_name = body.model_name
             lora_path = body.lora_path
+            generation_id = body.generation_id
             policy_version = body.policy_version
             lora_slot = body.lora_slot or public_model_name.rsplit("@", 1)[0]
             models = raw_request.app.state.openai_serving_models
             engine_client = engine(raw_request)
             coordinator = lora_update_coordinator(models, engine_client)
-            update_seq = await coordinator.begin_update(lora_slot)
+            if generation_id == body.expected_generation_id:
+                return JSONResponse(
+                    content={"error": "generation_id must advance"}, status_code=409
+                )
+            try:
+                update_seq = await coordinator.begin_update(
+                    lora_slot, expected_generation_id=body.expected_generation_id
+                )
+            except RuntimeError as error:
+                return JSONResponse(
+                    content={"error": str(error), "type": "generation_conflict"},
+                    status_code=409,
+                )
             mutation_started = False
             try:
                 async with models.lora_resolver_lock[lora_slot]:
@@ -397,6 +413,7 @@ def _patch_art_runtime_routes() -> None:
                         ),
                         load_inplace=True,
                         is_3d_lora_weight=body.is_3d_lora_weight,
+                        generation_id=generation_id,
                         policy_version=policy_version,
                         update_seq=update_seq,
                     )
@@ -425,6 +442,7 @@ def _patch_art_runtime_routes() -> None:
                     publish_lora_slot_policy(
                         models,
                         lora_slot=lora_slot,
+                        generation_id=generation_id,
                         policy_version=policy_version,
                         update_seq=update_seq,
                     )
@@ -435,8 +453,9 @@ def _patch_art_runtime_routes() -> None:
                     mutation_started = False
                 _runtime_state.update(
                     loaded_adapter=public_model_name,
+                    generation_id=generation_id,
                     policy_version=policy_version,
-                    update_identity=(f"lora:{lora_slot}:{policy_version}:{update_seq}"),
+                    update_identity=f"lora:{lora_slot}:{generation_id}:{update_seq}",
                 )
             except BaseException:
                 if mutation_started:
@@ -460,6 +479,7 @@ def _patch_art_runtime_routes() -> None:
                     "status": "updated",
                     "model_name": public_model_name,
                     "lora_slot": lora_slot,
+                    "generation_id": generation_id,
                     "policy_version": policy_version,
                     "update_seq": update_seq,
                     "cache_transition": cache_transition,
@@ -482,6 +502,7 @@ def _patch_art_runtime_routes() -> None:
             state.openai_serving_models,
             engine_client,
             lora_slot=str(_runtime_state["loaded_adapter"]),
+            generation_id=str(_runtime_state["initial_generation_id"]),
             policy_version=int(policy_version),
         )
 
@@ -578,6 +599,12 @@ def main(argv: list[str] | None = None) -> None:
     global _fast_metrics_port
 
     args = parse_args(argv)
+    if (args.initial_generation_id is None) != (
+        args.initial_policy_version is None
+    ):
+        raise ValueError(
+            "--initial-generation-id and --initial-policy-version must be set together"
+        )
     engine_args = json.loads(args.engine_args_json)
     server_args = json.loads(args.server_args_json)
     route_capture = engine_args.get("enable_return_routed_experts", False)
@@ -625,6 +652,7 @@ def main(argv: list[str] | None = None) -> None:
         nnodes=args.nnodes,
         headless=args.headless,
         loaded_adapter=args.served_model_name if args.lora_path else None,
+        generation_id=args.initial_generation_id,
         policy_version=args.initial_policy_version
         if args.initial_policy_version is not None
         else (
@@ -634,6 +662,7 @@ def main(argv: list[str] | None = None) -> None:
             else None
         ),
         update_identity=args.update_identity,
+        initial_generation_id=args.initial_generation_id,
         initial_policy_version=args.initial_policy_version,
         pp_layer_partition=pp_layer_partition,
     )

@@ -87,6 +87,7 @@ class VllmRuntimeLaunchConfig(BaseModel):
     replica_generation: int = Field(default=0, ge=0)
     process_uuid: str | None = None
     update_identity: str | None = None
+    initial_generation_id: str | None = Field(default=None, min_length=1)
     initial_policy_version: int | None = Field(default=None, ge=0)
 
     @model_validator(mode="after")
@@ -102,6 +103,12 @@ class VllmRuntimeLaunchConfig(BaseModel):
                 raise ValueError("cuda_visible_devices must match local_gpu_ids")
         elif not self.cuda_visible_devices:
             raise ValueError("cuda_visible_devices or local_gpu_ids is required")
+        if (self.initial_generation_id is None) != (
+            self.initial_policy_version is None
+        ):
+            raise ValueError(
+                "initial_generation_id and initial_policy_version must be set together"
+            )
         if self.node_rank >= self.nnodes:
             raise ValueError("node_rank must be smaller than nnodes")
         if self.nnodes == 1:
@@ -909,6 +916,8 @@ def build_vllm_runtime_server_cmd(config: VllmRuntimeLaunchConfig) -> list[str]:
         )
     if config.update_identity is not None:
         command.append(f"--update-identity={config.update_identity}")
+    if config.initial_generation_id is not None:
+        command.append(f"--initial-generation-id={config.initial_generation_id}")
     if config.initial_policy_version is not None:
         command.append(f"--initial-policy-version={config.initial_policy_version}")
     return command

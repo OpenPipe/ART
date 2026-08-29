@@ -191,6 +191,9 @@ class UnslothService:
             return f"{self.model_name}:eval@{step}"
         return f"{self.model_name}@{step}"
 
+    def _generation_id(self, step: int) -> str:
+        return f"{self.model_name}@{step}"
+
     @property
     def _vllm_base_url(self) -> str:
         return self._vllm_runtime.base_url
@@ -292,6 +295,16 @@ class UnslothService:
                 cuda_visible_devices=self._runtime_cuda_visible_devices(),
                 lora_path=lora_path,
                 served_model_name=self._initial_served_model_name,
+                initial_generation_id=(
+                    self._generation_id(self._latest_step)
+                    if self.rollout_weight_update_mode == "in_flight_lora"
+                    else None
+                ),
+                initial_policy_version=(
+                    self._latest_step
+                    if self.rollout_weight_update_mode == "in_flight_lora"
+                    else None
+                ),
                 engine_args=self._runtime_engine_args(config),
                 server_args=server_args,
             ),
@@ -357,6 +370,8 @@ class UnslothService:
                     "model_name": self._in_flight_lora_slot,
                     "lora_slot": self._in_flight_lora_slot,
                     "lora_path": checkpoint_path,
+                    "generation_id": self._generation_id(step),
+                    "expected_generation_id": self._generation_id(self._latest_step),
                     "policy_version": step,
                 },
                 **self._runtime_request_kwargs(),

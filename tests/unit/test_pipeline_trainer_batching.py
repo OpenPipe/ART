@@ -41,6 +41,7 @@ def test_eval_rejects_tokens_from_another_policy() -> None:
         {
             "start_token": 0,
             "end_token": 4,
+            "generation_id": "generation-6",
             "policy_version": 6,
             "lora_slot": "slot",
             "update_seq": 1,

@@ -11,7 +11,7 @@ from pydantic import (
     model_validator,
 )
 
-ART_SERVING_PROTOCOL_VERSION = 4
+ART_SERVING_PROTOCOL_VERSION = 5
 
 ServingFeature = Literal[
     "binary_routed_experts",

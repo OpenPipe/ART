@@ -26,18 +26,24 @@ from vllm.lora.request import LoRARequest
 POLICY_TOKEN_SPANS_FIELD = "policy_token_spans"
 ART_POLICY_TOKEN_SPANS_FIELD = "art_policy_token_spans"
 _PARENT_POLICY_TOKEN_SPANS_FIELD = "_art_policy_token_spans_by_choice"
+PROMPT_POLICY_TOKEN_SPANS_FIELD = "prompt_policy_token_spans"
+ART_PROMPT_POLICY_TOKEN_SPANS_FIELD = "art_prompt_policy_token_spans"
+_PARENT_PROMPT_POLICY_TOKEN_SPANS_FIELD = "_art_prompt_policy_token_spans_by_choice"
 
 _CURRENT_ENGINE_POLICY_SPANS: dict[str, list[dict[str, Any]]] = {}
+_CURRENT_ENGINE_PROMPT_POLICY_SPANS: dict[str, list[dict[str, Any]]] = {}
 _WORKER_LORA_POLICY_BY_ID: dict[int, dict[str, Any]] = {}
 _POLICY_CACHE_SALT_PREFIX = "art_policy_cache_salt="
 _POLICY_CACHE_SALT_MARKER = f"|{_POLICY_CACHE_SALT_PREFIX}"
-_POLICY_CACHE_SALT_VERSION = "v1:"
+_POLICY_CACHE_SALT_VERSION = "v2:"
 _LORA_UPDATE_COORDINATOR_FIELD = "_art_lora_update_coordinator"
 _EXECUTING_POLICY_CONTEXT_FIELD = "_art_executing_policy_context"
 _POLICY_EXECUTION_MARKER_FIELD = "_art_policy_execution_marker"
 _POLICY_HISTORY_BASE_FIELD = "_art_policy_history_before_current"
 _POLICY_CACHE_TRANSITIONS_FIELD = "_art_policy_cache_transitions"
 _POLICY_CACHE_TRANSITION_KEY = "art_policy_transition_v1"
+_PROMPT_POLICY_SPANS_COMPLETE_FIELD = "_art_prompt_policy_spans_complete"
+_CACHED_PROMPT_POLICY_SPAN_FIELD = "_art_cached_prompt_policy_span"
 
 
 class _RequestAdmissionLease:
@@ -81,11 +87,14 @@ _GPU_MODEL_RUNNER_MODULES = (
 class PolicyLoRARequest(LoRARequest, omit_defaults=True, array_like=True):  # type: ignore[call-arg]
     """LoRA request carrying ART's exact executing-policy identity."""
 
+    generation_id: str = ""
     policy_version: int = 0
     update_seq: int = 0
 
     def __post_init__(self) -> None:
         super().__post_init__()
+        if not self.generation_id:
+            raise ValueError("generation_id must be non-empty")
         if self.policy_version < 0 or self.update_seq < 0:
             raise ValueError("policy_version and update_seq must be non-negative")
 
@@ -243,10 +252,20 @@ class LoraUpdateCoordinator:
             state.lora_request = lora_request
             state.next_update_seq = lora_request.update_seq + 1
 
-    async def begin_update(self, lora_slot: str) -> int:
+    async def begin_update(
+        self, lora_slot: str, *, expected_generation_id: str
+    ) -> int:
         state = self._state(lora_slot)
         async with state.condition:
             await state.condition.wait_for(lambda: not state.update_active)
+            current = state.lora_request
+            if current is None:
+                raise RuntimeError(f"LoRA slot {lora_slot!r} has no active generation")
+            if current.generation_id != expected_generation_id:
+                raise RuntimeError(
+                    f"LoRA slot {lora_slot!r} is generation "
+                    f"{current.generation_id!r}, expected {expected_generation_id!r}"
+                )
             state.update_active = True
             state.blocked = True
             update_seq = state.next_update_seq
@@ -323,6 +342,7 @@ async def declare_initial_lora_policy(
     engine_client: Any,
     *,
     lora_slot: str,
+    generation_id: str,
     policy_version: int,
 ) -> None:
     loaded = models.lora_requests.get(lora_slot)
@@ -335,6 +355,7 @@ async def declare_initial_lora_policy(
         base_model_name=loaded.base_model_name,
         tensorizer_config_dict=loaded.tensorizer_config_dict,
         is_3d_lora_weight=loaded.is_3d_lora_weight,
+        generation_id=generation_id,
         policy_version=policy_version,
         update_seq=1,
     )
@@ -347,6 +368,7 @@ async def declare_initial_lora_policy(
     publish_lora_slot_policy(
         models,
         lora_slot=lora_slot,
+        generation_id=generation_id,
         policy_version=policy_version,
         update_seq=request.update_seq,
     )
@@ -369,6 +391,7 @@ def _patch_model_runner_output_type() -> None:
         # attrs are not part of that transport contract, so ART span metadata
         # must be a declared field.
         art_policy_token_spans: dict[str, list[dict[str, Any]]] | None = None
+        art_prompt_policy_token_spans: dict[str, list[dict[str, Any]]] | None = None
 
     ModelRunnerOutput.__module__ = outputs_mod.__name__
     ModelRunnerOutput.__qualname__ = "ModelRunnerOutput"
@@ -406,6 +429,7 @@ def publish_lora_slot_policy(
     models: Any,
     *,
     lora_slot: str,
+    generation_id: str,
     policy_version: int,
     update_seq: int,
 ) -> None:
@@ -413,7 +437,7 @@ def publish_lora_slot_policy(
     if identities is None:
         identities = {}
         setattr(models, "_art_lora_slot_policy_identities", identities)
-    identities[lora_slot] = (int(policy_version), int(update_seq))
+    identities[lora_slot] = (generation_id, int(policy_version), int(update_seq))
 
 
 def _resolve_lora_alias(models: Any, model_name: str | None) -> Any | None:
@@ -425,12 +449,12 @@ def _resolve_lora_alias(models: Any, model_name: str | None) -> Any | None:
     return models.lora_requests.get(slot)
 
 
-def _slot_policy_identity(models: Any, lora_slot: str) -> tuple[int, int] | None:
+def _slot_policy_identity(models: Any, lora_slot: str) -> tuple[str, int, int] | None:
     identity = getattr(models, "_art_lora_slot_policy_identities", {}).get(lora_slot)
     if identity is None:
         return None
-    policy_version, update_seq = identity
-    return int(policy_version), int(update_seq)
+    generation_id, policy_version, update_seq = identity
+    return str(generation_id), int(policy_version), int(update_seq)
 
 
 def _strip_policy_cache_salt(cache_salt: str | None) -> str | None:
@@ -465,6 +489,7 @@ def _extend_policy_history(
     previous_digest: str | None,
     *,
     lora_slot: str,
+    generation_id: str,
     policy_version: int,
     update_seq: int,
 ) -> str:
@@ -473,6 +498,8 @@ def _extend_policy_history(
     if previous_digest is not None:
         digest.update(bytes.fromhex(previous_digest))
     digest.update(lora_slot.encode())
+    digest.update(b"\0")
+    digest.update(generation_id.encode())
     digest.update(b"\0")
     digest.update(str(policy_version).encode())
     digest.update(b"\0")
@@ -495,6 +522,7 @@ def _set_policy_cache_salt(
     request: Any,
     *,
     lora_slot: str,
+    generation_id: str,
     policy_version: int,
     update_seq: int,
     previous_digest: str | None = None,
@@ -509,6 +537,7 @@ def _set_policy_cache_salt(
         history_digest=_extend_policy_history(
             previous_digest,
             lora_slot=lora_slot,
+            generation_id=generation_id,
             policy_version=policy_version,
             update_seq=update_seq,
         ),
@@ -529,10 +558,11 @@ def _apply_lora_alias_policy_cache_salt(
     identity = _slot_policy_identity(models, lora_slot)
     if identity is None:
         return
-    policy_version, update_seq = identity
+    generation_id, policy_version, update_seq = identity
     _set_policy_cache_salt(
         request,
         lora_slot=lora_slot,
+        generation_id=generation_id,
         policy_version=policy_version,
         update_seq=update_seq,
     )
@@ -584,6 +614,7 @@ def _patch_engine_core_output_type() -> None:
         routed_experts: np.ndarray | None = None
         num_nans_in_logits: int = 0
         art_policy_token_spans: list[dict[str, Any]] | None = None
+        art_prompt_policy_token_spans: list[dict[str, Any]] | None = None
 
         @property
         def finished(self) -> bool:
@@ -662,7 +693,10 @@ def _patch_worker_policy_span_capture() -> None:
                     output = original(self, *args, **kwargs)
                     # The input batch is current only after execute_model, and the
                     # next serial worker RPC may replace this adapter before sampling.
-                    context = _policy_context_from_runner(self)
+                    scheduler_output = (
+                        args[0] if args else kwargs.get("scheduler_output")
+                    )
+                    context = _policy_context_from_runner(self, scheduler_output)
                     if getattr(self, "execute_model_state", None) is not None:
                         setattr(self, _EXECUTING_POLICY_CONTEXT_FIELD, context)
                     elif context and hasattr(output, "req_ids"):
@@ -738,21 +772,45 @@ def _patch_scheduler_policy_span_transport() -> None:
         def update_from_output(
             self: Any, scheduler_output: Any, model_runner_output: Any
         ):
+            requests = {
+                req_id: self.requests.get(req_id)
+                for req_id in scheduler_output.num_scheduled_tokens
+            }
             outputs_by_client = original_update(
                 self, scheduler_output, model_runner_output
             )
             spans_by_req = getattr(
                 model_runner_output, ART_POLICY_TOKEN_SPANS_FIELD, None
             )
-            if not spans_by_req:
-                return outputs_by_client
+            prompt_spans_by_req = getattr(
+                model_runner_output, ART_PROMPT_POLICY_TOKEN_SPANS_FIELD, None
+            )
+            for req_id, step_spans in (prompt_spans_by_req or {}).items():
+                request = requests.get(req_id)
+                if request is None or getattr(
+                    request, _PROMPT_POLICY_SPANS_COMPLETE_FIELD, False
+                ):
+                    continue
+                accumulated = getattr(
+                    request, ART_PROMPT_POLICY_TOKEN_SPANS_FIELD, None
+                )
+                if accumulated is None:
+                    accumulated = []
+                    setattr(request, ART_PROMPT_POLICY_TOKEN_SPANS_FIELD, accumulated)
+                _append_absolute_prompt_spans(accumulated, step_spans)
+            outputs_by_request = {}
             for client_outputs in outputs_by_client.values():
                 for output in client_outputs.outputs:
-                    spans = spans_by_req.get(output.request_id)
-                    if not spans:
-                        continue
-                    output.art_policy_token_spans = _trim_step_spans(
-                        spans, len(output.new_token_ids)
+                    outputs_by_request[output.request_id] = output
+                    spans = (spans_by_req or {}).get(output.request_id)
+                    if spans:
+                        output.art_policy_token_spans = _trim_step_spans(
+                            spans, len(output.new_token_ids)
+                        )
+            for req_id, request in requests.items():
+                if request is not None:
+                    _flush_complete_prompt_spans(
+                        request, outputs_by_request.get(req_id)
                     )
             return outputs_by_client
 
@@ -765,6 +823,8 @@ def _patch_scheduler_policy_span_transport() -> None:
 
     def _preempt_request(self: Any, request: Any, timestamp: float) -> None:
         original_preempt(self, request, timestamp)
+        if hasattr(request, ART_PROMPT_POLICY_TOKEN_SPANS_FIELD):
+            delattr(request, ART_PROMPT_POLICY_TOKEN_SPANS_FIELD)
         _rebase_preempted_request_policy_history(request)
 
     _preempt_request.__art_policy_spans_patched__ = True  # type: ignore[attr-defined]
@@ -781,9 +841,14 @@ def _patch_output_processor_policy_span_accumulation() -> None:
             self: Any, engine_core_outputs: list[Any], *args: Any, **kwargs: Any
         ):
             global _CURRENT_ENGINE_POLICY_SPANS
+            global _CURRENT_ENGINE_PROMPT_POLICY_SPANS
             previous = _CURRENT_ENGINE_POLICY_SPANS
+            previous_prompt = _CURRENT_ENGINE_PROMPT_POLICY_SPANS
             _CURRENT_ENGINE_POLICY_SPANS = _engine_core_policy_spans_by_request(
-                engine_core_outputs
+                engine_core_outputs, ART_POLICY_TOKEN_SPANS_FIELD
+            )
+            _CURRENT_ENGINE_PROMPT_POLICY_SPANS = _engine_core_policy_spans_by_request(
+                engine_core_outputs, ART_PROMPT_POLICY_TOKEN_SPANS_FIELD
             )
             try:
                 return original_process_outputs(
@@ -791,6 +856,7 @@ def _patch_output_processor_policy_span_accumulation() -> None:
                 )
             finally:
                 _CURRENT_ENGINE_POLICY_SPANS = previous
+                _CURRENT_ENGINE_PROMPT_POLICY_SPANS = previous_prompt
 
         process_outputs.__art_policy_spans_patched__ = True  # type: ignore[attr-defined]
         OutputProcessor.process_outputs = process_outputs  # type: ignore[method-assign]
@@ -807,6 +873,13 @@ def _patch_output_processor_policy_span_accumulation() -> None:
     ):
         _append_current_policy_spans(self, len(new_token_ids))
         spans = getattr(self, ART_POLICY_TOKEN_SPANS_FIELD, None)
+        prompt_spans = _CURRENT_ENGINE_PROMPT_POLICY_SPANS.get(self.request_id)
+        if prompt_spans:
+            setattr(
+                self,
+                ART_PROMPT_POLICY_TOKEN_SPANS_FIELD,
+                [dict(span) for span in prompt_spans],
+            )
         parent_req = getattr(self, "parent_req", None)
         if spans and parent_req is not None:
             spans_by_choice = getattr(
@@ -818,6 +891,20 @@ def _patch_output_processor_policy_span_accumulation() -> None:
             spans_by_choice[int(getattr(self, "request_index", 0))] = [
                 dict(span) for span in spans
             ]
+        if prompt_spans and parent_req is not None:
+            prompt_spans_by_choice = getattr(
+                parent_req, _PARENT_PROMPT_POLICY_TOKEN_SPANS_FIELD, None
+            )
+            if prompt_spans_by_choice is None:
+                prompt_spans_by_choice = {}
+                setattr(
+                    parent_req,
+                    _PARENT_PROMPT_POLICY_TOKEN_SPANS_FIELD,
+                    prompt_spans_by_choice,
+                )
+            prompt_spans_by_choice[int(getattr(self, "request_index", 0))] = [
+                dict(span) for span in prompt_spans
+            ]
 
         request_output = original_make(self, new_token_ids, *args, **kwargs)
         if request_output is not None and hasattr(request_output, "outputs"):
@@ -827,6 +914,20 @@ def _patch_output_processor_policy_span_accumulation() -> None:
                 else {int(getattr(self, "request_index", 0)): spans}
             )
             _record_request_output_spans(request_output, spans_by_choice)
+            prompt_spans_by_choice = (
+                getattr(parent_req, _PARENT_PROMPT_POLICY_TOKEN_SPANS_FIELD, {})
+                if parent_req is not None
+                else {
+                    int(getattr(self, "request_index", 0)): getattr(
+                        self, ART_PROMPT_POLICY_TOKEN_SPANS_FIELD, None
+                    )
+                }
+            )
+            _record_request_output_spans(
+                request_output,
+                prompt_spans_by_choice,
+                field=ART_PROMPT_POLICY_TOKEN_SPANS_FIELD,
+            )
         return request_output
 
     make_request_output.__art_policy_spans_patched__ = True  # type: ignore[attr-defined]
@@ -868,11 +969,21 @@ def _patch_openai_response_policy_spans() -> None:
             **kwargs,
         )
         if isinstance(response, ChatCompletionResponse):
-            spans_by_choice = _policy_spans_by_choice_from_final_output(final_res)
+            spans_by_choice = _policy_spans_by_choice_from_final_output(
+                final_res, ART_POLICY_TOKEN_SPANS_FIELD
+            )
+            prompt_spans_by_choice = _policy_spans_by_choice_from_final_output(
+                final_res, ART_PROMPT_POLICY_TOKEN_SPANS_FIELD
+            )
             for choice in response.choices:
                 spans = spans_by_choice.get(choice.index)
                 if spans:
                     _set_pydantic_extra(choice, POLICY_TOKEN_SPANS_FIELD, spans)
+                prompt_spans = prompt_spans_by_choice.get(choice.index)
+                if prompt_spans:
+                    _set_pydantic_extra(
+                        choice, PROMPT_POLICY_TOKEN_SPANS_FIELD, prompt_spans
+                    )
             if _resolve_lora_alias(self.models, getattr(request, "model", None)):
                 response.model = request.model
         return response
@@ -1063,6 +1174,7 @@ def _bind_admitted_lora(
         _set_policy_cache_salt(
             request,
             lora_slot=lora_slot,
+            generation_id=lora_request.generation_id,
             policy_version=lora_request.policy_version,
             update_seq=lora_request.update_seq,
         )
@@ -1233,6 +1345,7 @@ def _transition_scheduler_policy_history(
                 previous_digest = _extend_policy_history(
                     None,
                     lora_slot=str(previous_policy["lora_slot"]),
+                    generation_id=str(previous_policy["generation_id"]),
                     policy_version=int(previous_policy["policy_version"]),
                     update_seq=0,
                 )
@@ -1241,6 +1354,7 @@ def _transition_scheduler_policy_history(
         _set_policy_cache_salt(
             request,
             lora_slot=lora_request.lora_name,
+            generation_id=lora_request.generation_id,
             policy_version=lora_request.policy_version,
             update_seq=lora_request.update_seq,
             previous_digest=previous_digest,
@@ -1315,7 +1429,8 @@ def _rebase_preempted_request_policy_history(request: Any) -> None:
     lora_request = request.lora_request
     policy_version = getattr(lora_request, "policy_version", None)
     update_seq = getattr(lora_request, "update_seq", None)
-    if policy_version is None or update_seq is None:
+    generation_id = getattr(lora_request, "generation_id", None)
+    if generation_id is None or policy_version is None or update_seq is None:
         raise RuntimeError(
             f"Preempted request {request.request_id!r} lost its policy identity"
         )
@@ -1323,6 +1438,7 @@ def _rebase_preempted_request_policy_history(request: Any) -> None:
     _set_policy_cache_salt(
         request,
         lora_slot=str(lora_request.lora_name),
+        generation_id=str(generation_id),
         policy_version=int(policy_version),
         update_seq=int(update_seq),
     )
@@ -1358,6 +1474,7 @@ def _policy_lora_request_from_payload(
         tensorizer_config_dict=payload.get("tensorizer_config_dict"),
         load_inplace=load_inplace,
         is_3d_lora_weight=bool(payload.get("is_3d_lora_weight", False)),
+        generation_id=str(payload["generation_id"]),
         policy_version=int(payload["policy_version"]),
         update_seq=int(payload["update_seq"]),
     )
@@ -1371,6 +1488,7 @@ def policy_lora_request_payload(lora_request: PolicyLoRARequest) -> dict[str, An
         "base_model_name": lora_request.base_model_name,
         "tensorizer_config_dict": lora_request.tensorizer_config_dict,
         "is_3d_lora_weight": lora_request.is_3d_lora_weight,
+        "generation_id": lora_request.generation_id,
         "policy_version": lora_request.policy_version,
         "update_seq": lora_request.update_seq,
     }
@@ -1384,6 +1502,7 @@ def _normalized_lora_request(lora_request: Any) -> LoRARequest:
     )
     policy_fields = (
         {
+            "generation_id": lora_request.generation_id,
             "policy_version": lora_request.policy_version,
             "update_seq": lora_request.update_seq,
         }
@@ -1409,6 +1528,7 @@ def _validate_worker_lora_update(
     if not acknowledgements:
         raise RuntimeError("Policy LoRA update returned no worker acknowledgements")
     expected = {
+        "generation_id": lora_request.generation_id,
         "policy_version": lora_request.policy_version,
         "lora_slot": lora_request.lora_name,
         "lora_path": lora_request.lora_path,
@@ -1452,20 +1572,58 @@ def _request_has_executed(request: Any) -> bool:
     return bool(computed_tokens or output_tokens or preemptions)
 
 
-def _policy_context_from_runner(runner: Any) -> dict[str, dict[str, Any]]:
+def _policy_context_from_runner(
+    runner: Any, scheduler_output: Any | None
+) -> dict[str, dict[str, Any]]:
     input_batch = getattr(runner, "input_batch", None)
     if input_batch is None:
         state = getattr(runner, "execute_model_state", None)
         input_batch = getattr(state, "input_batch", None)
     if input_batch is None:
         return {}
+    num_reqs = int(input_batch.num_reqs)
+    req_ids = input_batch.req_ids[:num_reqs]
+    if scheduler_output is None:
+        raise RuntimeError("vLLM scheduler output is required for policy spans")
+    scheduled_by_request = scheduler_output.num_scheduled_tokens
+    scheduled_tokens = [scheduled_by_request[req_id] for req_id in req_ids]
+    computed_tokens = getattr(
+        input_batch,
+        "num_computed_tokens_np",
+        getattr(input_batch, "num_computed_tokens_cpu", ()),
+    )[:num_reqs]
+    prompt_tokens = getattr(
+        input_batch,
+        "prefill_len_np",
+        getattr(input_batch, "num_prompt_tokens", ()),
+    )[:num_reqs]
+    if not (
+        len(req_ids)
+        == len(scheduled_tokens)
+        == len(computed_tokens)
+        == len(prompt_tokens)
+        == num_reqs
+    ):
+        raise RuntimeError("vLLM input batch policy-span state is inconsistent")
     lora_state = getattr(runner, "lora_state", None)
+    lora_requests = {} if lora_state is None else lora_state.lora_requests
     context: dict[str, dict[str, Any]] = {}
-    for req_id in input_batch.req_ids:
-        lora_request = _lora_request_for_input_batch_req(input_batch, req_id)
-        if lora_request is None and lora_state is not None:
-            lora_request = getattr(lora_state, "lora_requests", {}).get(req_id)
-        context[req_id] = _policy_metadata_for_lora_request(lora_request)
+    for batch_index, req_id in enumerate(req_ids):
+        lora_request = lora_requests.get(req_id)
+        if lora_request is None:
+            lora_request = _lora_request_for_input_batch_req(input_batch, req_id)
+        metadata = dict(_policy_metadata_for_lora_request(lora_request))
+        scheduled = int(scheduled_tokens[batch_index])
+        computed = int(computed_tokens[batch_index])
+        prompt_length = int(prompt_tokens[batch_index])
+        if scheduled < 0 or computed < 0 or prompt_length < 0:
+            raise RuntimeError("vLLM input batch policy-span counts are invalid")
+        metadata["prompt_span"] = (
+            min(computed + 1, prompt_length),
+            min(computed + scheduled + 1, prompt_length),
+        )
+        metadata["prompt_tokens"] = prompt_length
+        context[req_id] = metadata
     return context
 
 
@@ -1482,7 +1640,12 @@ def _lora_request_for_input_batch_req(input_batch: Any, req_id: str) -> Any | No
 
 def _policy_metadata_for_lora_request(lora_request: Any | None) -> dict[str, Any]:
     if lora_request is None:
-        return {"policy_version": 0, "lora_slot": "base", "update_seq": 0}
+        return {
+            "generation_id": "base",
+            "policy_version": 0,
+            "lora_slot": "base",
+            "update_seq": 0,
+        }
     state = _WORKER_LORA_POLICY_BY_ID.get(lora_request.lora_int_id)
     if state is None:
         state = _record_worker_lora_policy(lora_request)
@@ -1494,6 +1657,7 @@ def _policy_metadata_for_lora_request(lora_request: Any | None) -> dict[str, Any
 
 
 def _record_worker_lora_policy(lora_request: Any) -> dict[str, Any]:
+    generation_id = getattr(lora_request, "generation_id", None)
     policy_version = getattr(lora_request, "policy_version", None)
     update_seq = getattr(lora_request, "update_seq", None)
     if policy_version is None:
@@ -1502,6 +1666,7 @@ def _record_worker_lora_policy(lora_request: Any) -> dict[str, Any]:
         )
         update_seq = int(policy_version or 0)
     state = {
+        "generation_id": str(generation_id or lora_request.lora_name),
         "policy_version": int(policy_version or 0),
         "lora_slot": str(lora_request.lora_name),
         "lora_path": str(lora_request.lora_path),
@@ -1522,6 +1687,7 @@ def get_worker_lora_states(lora_ids: set[int]) -> tuple[dict[str, Any], ...]:
                 "lora_id": lora_id,
                 "lora_name": state["lora_slot"],
                 "lora_path": state["lora_path"],
+                "generation_id": state["generation_id"],
                 "policy_version": state["policy_version"],
                 "update_seq": state["update_seq"],
             }
@@ -1549,6 +1715,7 @@ def _attach_policy_spans_to_model_output(
             {
                 "start_token": 0,
                 "end_token": num_tokens,
+                "generation_id": metadata["generation_id"],
                 "policy_version": metadata["policy_version"],
                 "lora_slot": metadata["lora_slot"],
                 "update_seq": metadata["update_seq"],
@@ -1556,6 +1723,45 @@ def _attach_policy_spans_to_model_output(
         ]
     if spans_by_req:
         setattr(output, ART_POLICY_TOKEN_SPANS_FIELD, spans_by_req)
+    prompt_spans_by_req = {}
+    sampled_req_ids = {
+        req_id
+        for req_id, token_ids in zip(output.req_ids, output.sampled_token_ids or ())
+        if token_ids
+    }
+    for req_id, metadata in context.items():
+        start, end = metadata["prompt_span"]
+        prompt_tokens = int(metadata["prompt_tokens"])
+        step_spans = []
+        if start > 1:
+            step_spans.append(
+                {
+                    "start_token": 1,
+                    "end_token": start,
+                    "generation_id": metadata["generation_id"],
+                    "policy_version": metadata["policy_version"],
+                    "lora_slot": metadata["lora_slot"],
+                    "update_seq": metadata["update_seq"],
+                    _CACHED_PROMPT_POLICY_SPAN_FIELD: True,
+                }
+            )
+        if end > start:
+            step_spans.append(
+                {
+                    "start_token": start,
+                    "end_token": end,
+                    "generation_id": metadata["generation_id"],
+                    "policy_version": metadata["policy_version"],
+                    "lora_slot": metadata["lora_slot"],
+                    "update_seq": metadata["update_seq"],
+                    _CACHED_PROMPT_POLICY_SPAN_FIELD: False,
+                }
+            )
+        if not step_spans or (end <= start and req_id not in sampled_req_ids):
+            continue
+        prompt_spans_by_req[req_id] = step_spans
+    if prompt_spans_by_req:
+        setattr(output, ART_PROMPT_POLICY_TOKEN_SPANS_FIELD, prompt_spans_by_req)
 
 
 def _attach_policy_span_context_to_sample_output(
@@ -1582,6 +1788,7 @@ def _policy_span_context_from_sample_output(output: Any) -> dict[str, dict[str, 
 
 def _engine_core_policy_spans_by_request(
     engine_core_outputs: list[Any],
+    field: str,
 ) -> dict[str, list[dict[str, Any]]]:
     spans_by_request: dict[str, list[dict[str, Any]]] = {}
     for item in engine_core_outputs:
@@ -1589,10 +1796,41 @@ def _engine_core_policy_spans_by_request(
         if outputs is None:
             outputs = (item,)
         for output in outputs:
-            spans = getattr(output, ART_POLICY_TOKEN_SPANS_FIELD, None)
+            spans = getattr(output, field, None)
             if spans:
                 spans_by_request[output.request_id] = spans
     return spans_by_request
+
+
+def _append_absolute_prompt_spans(
+    accumulated: list[dict[str, Any]], step_spans: list[dict[str, Any]]
+) -> None:
+    for span in step_spans:
+        current = dict(span)
+        cached_prompt = bool(current.pop(_CACHED_PROMPT_POLICY_SPAN_FIELD, False))
+        if cached_prompt and accumulated:
+            continue
+        cursor = int(accumulated[-1]["end_token"]) if accumulated else 1
+        start = int(current["start_token"])
+        if start < cursor:
+            raise RuntimeError("prompt policy token spans overlap")
+        if start > cursor:
+            raise RuntimeError("prompt policy token spans have a gap")
+        if accumulated and _can_merge_spans(accumulated[-1], current):
+            accumulated[-1]["end_token"] = current["end_token"]
+        else:
+            accumulated.append(current)
+
+
+def _flush_complete_prompt_spans(request: Any, output: Any | None) -> None:
+    if output is None or getattr(request, _PROMPT_POLICY_SPANS_COMPLETE_FIELD, False):
+        return
+    accumulated = getattr(request, ART_PROMPT_POLICY_TOKEN_SPANS_FIELD, None)
+    if not accumulated or accumulated[-1]["end_token"] != request.num_prompt_tokens:
+        return
+    output.art_prompt_policy_token_spans = [dict(span) for span in accumulated]
+    delattr(request, ART_PROMPT_POLICY_TOKEN_SPANS_FIELD)
+    setattr(request, _PROMPT_POLICY_SPANS_COMPLETE_FIELD, True)
 
 
 def _trim_step_spans(
@@ -1640,6 +1878,7 @@ def _append_current_policy_spans(req_state: Any, token_count: int) -> None:
 def _can_merge_spans(left: dict[str, Any], right: dict[str, Any]) -> bool:
     return (
         left.get("end_token") == right.get("start_token")
+        and left.get("generation_id") == right.get("generation_id")
         and left.get("policy_version") == right.get("policy_version")
         and left.get("lora_slot") == right.get("lora_slot")
         and left.get("update_seq") == right.get("update_seq")
@@ -1649,24 +1888,27 @@ def _can_merge_spans(left: dict[str, Any], right: dict[str, Any]) -> bool:
 def _record_request_output_spans(
     request_output: Any,
     spans_by_choice: Mapping[int, list[dict[str, Any]] | None],
+    *,
+    field: str = ART_POLICY_TOKEN_SPANS_FIELD,
 ) -> None:
     for output in request_output.outputs:
         spans = spans_by_choice.get(int(output.index))
         if not spans:
             continue
         copied = [dict(span) for span in spans]
-        setattr(output, ART_POLICY_TOKEN_SPANS_FIELD, copied)
+        setattr(output, field, copied)
 
 
 def _policy_spans_by_choice_from_final_output(
     final_res: Any,
+    field: str,
 ) -> dict[int, list[dict[str, Any]]]:
     outputs = getattr(final_res, "outputs", None)
     if not outputs:
         return {}
     spans_by_choice: dict[int, list[dict[str, Any]]] = {}
     for output in outputs:
-        spans = getattr(output, ART_POLICY_TOKEN_SPANS_FIELD, None)
+        spans = getattr(output, field, None)
         if spans:
             spans_by_choice[int(output.index)] = [dict(span) for span in spans]
     return spans_by_choice

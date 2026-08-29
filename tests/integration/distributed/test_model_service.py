@@ -268,6 +268,7 @@ async def test_recovery_uses_serving_generation_while_learner_is_ahead(
     manager.restart.assert_awaited_once_with(
         served_model_name="model@5",
         lora_path=serving_path,
+        initial_generation_id="serving-generation",
         initial_policy_version=5,
     )
     report = manager.verify_update.call_args.args[0]

@@ -23,6 +23,7 @@ def initialize_policy_requests():
 def policy_lora(path, policy_version, update_seq):
     return PolicyLoRARequest(
         lora_name="model:active", lora_int_id=1, lora_path=path,
+        generation_id=f"generation-{update_seq}",
         policy_version=policy_version, update_seq=update_seq,
     )
 
@@ -36,6 +37,7 @@ def make_policy_request(
     request.cache_salt = user_cache_salt
     _set_policy_cache_salt(
         request, lora_slot=lora_request.lora_name,
+        generation_id=lora_request.generation_id,
         policy_version=lora_request.policy_version,
         update_seq=lora_request.update_seq,
     )
@@ -137,24 +139,28 @@ async def main():
     slot = "model:active"
     old = PolicyLoRARequest(
         lora_name=slot, lora_int_id=1, lora_path="old",
+        generation_id="generation-1",
         policy_version=4, update_seq=1,
     )
     new = PolicyLoRARequest(
         lora_name=slot, lora_int_id=1, lora_path="new",
+        generation_id="generation-2",
         policy_version=5, update_seq=2,
     )
     models = SimpleNamespace(lora_requests={slot: new})
     register_lora_alias(models, public_model_name="model@4", lora_slot=slot)
     publish_lora_slot_policy(
-        models, lora_slot=slot, policy_version=5, update_seq=2
+        models, lora_slot=slot, generation_id="generation-2",
+        policy_version=5, update_seq=2
     )
     request = SimpleNamespace(model="model@4", cache_salt=None)
     _apply_lora_alias_policy_cache_salt(models, request, new)
 
     coordinator = LoraUpdateCoordinator()
-    assert await coordinator.begin_update(slot) == 1
-    await coordinator.commit_update(slot, old)
-    assert await coordinator.begin_update(slot) == 2
+    await coordinator.declare_initial(slot, old)
+    assert await coordinator.begin_update(
+        slot, expected_generation_id="generation-1"
+    ) == 2
 
     async def admit():
         async with coordinator.admission(slot) as state:
@@ -184,8 +190,8 @@ asyncio.run(main())
         "lora_path": "new",
         "policy_version": 5,
     }
-    assert cache_salt.startswith("art_policy_cache_salt=v1:")
-    assert len(cache_salt) == len("art_policy_cache_salt=v1:") + 64
+    assert cache_salt.startswith("art_policy_cache_salt=v2:")
+    assert len(cache_salt) == len("art_policy_cache_salt=v2:") + 64
 
 
 def test_runtime_parallel_admission_is_atomic_and_cancellation_safe(
@@ -253,15 +259,16 @@ async def main():
     slot = "model:active"
     old = PolicyLoRARequest(
         lora_name=slot, lora_int_id=1, lora_path="old",
+        generation_id="generation-1",
         policy_version=1, update_seq=1,
     )
     new = PolicyLoRARequest(
         lora_name=slot, lora_int_id=1, lora_path="new",
+        generation_id="generation-2",
         policy_version=2, update_seq=2,
     )
     coordinator = LoraUpdateCoordinator()
-    assert await coordinator.begin_update(slot) == 1
-    await coordinator.commit_update(slot, old)
+    await coordinator.declare_initial(slot, old)
     engine = object.__new__(AsyncLLM)
     engine.engine_core = Core()
     engine.output_handler = None
@@ -295,7 +302,9 @@ async def main():
         engine.add_request("parent", request, params, prompt_text="x")
     )
     await engine.engine_core.first.wait()
-    update = asyncio.create_task(coordinator.begin_update(slot))
+    update = asyncio.create_task(coordinator.begin_update(
+        slot, expected_generation_id="generation-1"
+    ))
     await asyncio.sleep(0)
     blocked_after_first = not update.done()
     engine.engine_core.release_first.set()
@@ -374,6 +383,11 @@ from art_vllm_runtime.policy_spans import LoraUpdateCoordinator, PolicyLoRAReque
 async def main():
     coordinator = LoraUpdateCoordinator()
     slot = "model:active"
+    initial = PolicyLoRARequest(
+        lora_name=slot, lora_int_id=1, lora_path="initial",
+        generation_id="generation-1", policy_version=1, update_seq=1,
+    )
+    await coordinator.declare_initial(slot, initial)
     entered = asyncio.Event()
     release = asyncio.Event()
 
@@ -384,7 +398,9 @@ async def main():
 
     holder = asyncio.create_task(hold_admission())
     await entered.wait()
-    update = asyncio.create_task(coordinator.begin_update(slot))
+    update = asyncio.create_task(coordinator.begin_update(
+        slot, expected_generation_id="generation-1"
+    ))
     await asyncio.sleep(0)
     update.cancel()
     try:
@@ -396,9 +412,13 @@ async def main():
     async with asyncio.timeout(1):
         async with coordinator.admission(slot):
             admitted = True
-    failed_seq = await coordinator.begin_update(slot)
+    failed_seq = await coordinator.begin_update(
+        slot, expected_generation_id="generation-1"
+    )
     await coordinator.fail_update(slot, failed_seq)
-    cancelled_retry = await coordinator.begin_update(slot)
+    cancelled_retry = await coordinator.begin_update(
+        slot, expected_generation_id="generation-1"
+    )
     await coordinator.cancel_update(slot, cancelled_retry)
 
     async def admit_after_failure():
@@ -408,9 +428,12 @@ async def main():
     quarantined_admission = asyncio.create_task(admit_after_failure())
     await asyncio.sleep(0)
     quarantine_preserved = not quarantined_admission.done()
-    recovery_seq = await coordinator.begin_update(slot)
+    recovery_seq = await coordinator.begin_update(
+        slot, expected_generation_id="generation-1"
+    )
     await coordinator.commit_update(slot, PolicyLoRARequest(
         lora_name=slot, lora_int_id=1, lora_path="recovered",
+        generation_id="generation-2",
         policy_version=2, update_seq=recovery_seq,
     ))
     recovered = await quarantined_admission
@@ -477,6 +500,7 @@ not_executed_after_update = not _request_has_executed(continued)
 fresh = make_policy_request("fresh", old)
 _set_policy_cache_salt(
     fresh, lora_slot=new.lora_name,
+    generation_id=new.generation_id,
     policy_version=new.policy_version, update_seq=new.update_seq,
 )
 fresh.block_hashes.clear()
@@ -518,6 +542,7 @@ old_history = _policy_history_from_cache_salt(
 expected_third = make_policy_request("expected-third", old)
 _set_policy_cache_salt(
     expected_third, lora_slot=third.lora_name,
+    generation_id=third.generation_id,
     policy_version=third.policy_version, update_seq=third.update_seq,
     previous_digest=old_history,
 )
@@ -801,7 +826,8 @@ from art_vllm_runtime.policy_spans import (
 
 declared = PolicyLoRARequest(
     lora_name="model:active", lora_int_id=1,
-    lora_path="/mapped/step-999-deadbeef", policy_version=7, update_seq=3,
+    lora_path="/mapped/step-999-deadbeef", generation_id="generation-7",
+    policy_version=7, update_seq=3,
 )
 declared_state = _record_worker_lora_policy(declared)
 bootstrap_state = _record_worker_lora_policy(LoRARequest(
@@ -839,6 +865,7 @@ try:
         "base_model_name": None,
         "tensorizer_config_dict": None,
         "is_3d_lora_weight": False,
+        "generation_id": declared.generation_id,
         "policy_version": declared.policy_version,
         "update_seq": declared.update_seq,
     })
@@ -944,6 +971,7 @@ def policy_payload(path, policy_version, update_seq):
         "base_model_name": None,
         "tensorizer_config_dict": None,
         "is_3d_lora_weight": False,
+        "generation_id": f"generation-{update_seq}",
         "policy_version": policy_version,
         "update_seq": update_seq,
     }
@@ -1058,13 +1086,16 @@ async def main():
     core = Core()
     engine = SimpleNamespace(engine_core=core)
     await declare_initial_lora_policy(
-        models, engine, lora_slot=slot, policy_version=7
+        models, engine, lora_slot=slot, generation_id="generation-7",
+        policy_version=7
     )
     declared = models.lora_requests[slot]
     coordinator = lora_update_coordinator(models, engine)
     async with coordinator.admission(slot) as admitted:
         admitted_identity = [admitted.policy_version, admitted.update_seq]
-    next_sequence = await coordinator.begin_update(slot)
+    next_sequence = await coordinator.begin_update(
+        slot, expected_generation_id="generation-7"
+    )
     await coordinator.cancel_update(slot, next_sequence)
     return {
         "declared_type": type(declared).__name__,

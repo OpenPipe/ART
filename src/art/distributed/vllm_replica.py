@@ -29,6 +29,7 @@ ReplicaPhase = Literal[
 class ReplicaLaunchTemplate(_Message):
     served_model_name: str = Field(min_length=1)
     lora_path: str | None = None
+    initial_generation_id: str | None = Field(default=None, min_length=1)
     initial_policy_version: int | None = Field(default=None, ge=0)
     engine_args: dict[str, object] = Field(default_factory=dict)
     server_args: dict[str, object] = Field(default_factory=dict)
@@ -337,6 +338,7 @@ class ReplicaManager:
         *,
         served_model_name: str,
         lora_path: str | None,
+        initial_generation_id: str | None,
         initial_policy_version: int | None,
     ) -> ReplicaState:
         async with self._lock:
@@ -345,6 +347,7 @@ class ReplicaManager:
                 update={
                     "served_model_name": served_model_name,
                     "lora_path": lora_path,
+                    "initial_generation_id": initial_generation_id,
                     "initial_policy_version": initial_policy_version,
                 }
             )
@@ -623,6 +626,7 @@ class ReplicaManager:
             replica_generation=self._state.generation,
             process_uuid=process_uuid,
             update_identity=self._state.update_identity,
+            initial_generation_id=self._template.initial_generation_id,
             initial_policy_version=self._template.initial_policy_version,
         )
         return HostMemberLaunchRequest(

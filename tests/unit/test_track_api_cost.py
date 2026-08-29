@@ -731,6 +731,7 @@ class TestTrackApiCostIntegration:
                                 {
                                     "start_token": 0,
                                     "end_token": 1,
+                                    "generation_id": "generation-1",
                                     "policy_version": 1,
                                     "lora_slot": "active",
                                     "update_seq": 1,
