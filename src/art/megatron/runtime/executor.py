@@ -702,7 +702,12 @@ class _GenerationPublisher:
             publish_external_lora_rank,
         )
 
-        return publish_external_lora_rank(pending.resolve(), sink)
+        try:
+            return publish_external_lora_rank(pending.resolve(), sink)
+        finally:
+            close = getattr(sink, "close", None)
+            if close is not None:
+                close()
 
     def _transport_ready(
         self,

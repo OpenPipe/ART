@@ -117,6 +117,14 @@ class _SharedTrainer(Protocol):
 
     async def optim_step(self, job: Any) -> dict[str, Any]: ...
 
+    async def publish_external_lora(
+        self,
+        target: Any,
+        sink_spec: Any,
+        *,
+        source_topology: str,
+    ) -> tuple[Any, Any, dict[str, float]]: ...
+
     def register_command_run(self, run_spec: TrainingRunSpec) -> None: ...
 
     async def command_run_state(self, run_id: str) -> TrainerCommandRunState: ...

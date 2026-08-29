@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections import defaultdict
 from collections.abc import Callable, Mapping, Sequence
 import hashlib
+import importlib
 import json
 import math
 import struct
@@ -91,6 +92,32 @@ class ExternalLoraTargetGrant(_Record):
     authorization_id: str = Field(min_length=1, max_length=255)
     target_revision: str = Field(min_length=1, max_length=255)
     plan_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+class ExternalLoraSinkSpec(_Record):
+    """Trusted installed service factory for one rank-local publication sink."""
+
+    module: str = Field(min_length=1, max_length=255)
+    qualname: str = Field(min_length=1, max_length=255)
+    config: dict[str, Any]
+
+    @model_validator(mode="after")
+    def _validate_config(self) -> ExternalLoraSinkSpec:
+        if len(_canonical_bytes(self.config)) > 64 << 10:
+            raise ValueError("external LoRA sink config exceeds 64 KiB")
+        return self
+
+    def create(self) -> ExternalLoraPublicationSink:
+        value: Any = importlib.import_module(self.module)
+        for component in self.qualname.split("."):
+            value = getattr(value, component)
+        sink = value(self.config)
+        for method in ("authorize", "put_shard", "complete", "abort"):
+            if not callable(getattr(sink, method, None)):
+                raise TypeError(
+                    f"external LoRA sink factory returned no {method} method"
+                )
+        return cast(ExternalLoraPublicationSink, sink)
 
 
 class ExternalLoraObjectRef(_Record):
@@ -280,11 +307,12 @@ class ExternalLoraPublicationSink(Protocol):
         chunks: Sequence[memoryview],
     ) -> ExternalLoraObjectRef: ...
 
-    def complete_rank(
+    def complete(
         self,
         grant: ExternalLoraTargetGrant,
-        completion: ExternalLoraRankCompletion,
-    ) -> ExternalLoraPublication | None: ...
+        plan: ExternalLoraPlan,
+        completions: Sequence[ExternalLoraRankCompletion],
+    ) -> ExternalLoraPublication: ...
 
     def abort(
         self,
@@ -540,10 +568,34 @@ def publish_external_lora_rank(
         if sum(chunk.nbytes for chunk in chunks) != plan.shards[index].size_bytes:
             raise RuntimeError("external LoRA rank payload changed its shard size")
 
-    grant = sink.authorize(plan)
-    if grant.plan_sha256 != plan.sha256:
-        raise RuntimeError("external LoRA authorization changed its plan")
+    grant: ExternalLoraTargetGrant | None = None
+    grant_error = None
+    try:
+        grant = sink.authorize(plan)
+        if grant.plan_sha256 != plan.sha256:
+            raise RuntimeError("external LoRA authorization changed its plan")
+    except BaseException as error:
+        grant_error = _error_text(error)
+    grants = _gather_values(
+        (None if grant is None else grant.model_dump(mode="json"), grant_error),
+        world_size,
+        group,
+    )
+    grant_errors = [error for _value, error in grants if error]
+    if grant_errors:
+        raise RuntimeError(
+            "external LoRA authorization failed: " + "; ".join(grant_errors)
+        )
+    grant_values = [value for value, _error in grants]
+    if (
+        None in grant_values
+        or len({_canonical_bytes(value) for value in grant_values}) != 1
+    ):
+        raise RuntimeError("external LoRA ranks received different authorizations")
+    assert grant is not None
+
     receipts: list[ExternalLoraShardReceipt] = []
+    upload_error = None
     try:
         for index, chunks in payloads.items():
             shard = plan.shards[index]
@@ -551,28 +603,68 @@ def publish_external_lora_rank(
             if ref.size_bytes != shard.size_bytes:
                 raise RuntimeError("external LoRA sink changed a shard size")
             receipts.append(ExternalLoraShardReceipt(index=index, ref=ref))
-        completion = ExternalLoraRankCompletion(
-            plan_sha256=plan.sha256,
-            rank=rank,
-            shards=tuple(receipts),
-        )
-        publication = sink.complete_rank(grant, completion)
-        if publication is not None and publication.manifest.plan_sha256 != plan.sha256:
-            raise RuntimeError("external LoRA settlement changed its plan")
-        return publication
     except BaseException as error:
-        completion = ExternalLoraRankCompletion(
-            plan_sha256=plan.sha256,
-            rank=rank,
-            shards=tuple(receipts),
-        )
+        upload_error = _error_text(error)
+
+    completion = ExternalLoraRankCompletion(
+        plan_sha256=plan.sha256,
+        rank=rank,
+        shards=tuple(receipts),
+    )
+    upload_errors = [
+        error for error in _gather_values(upload_error, world_size, group) if error
+    ]
+    if upload_errors:
+        cleanup_error = None
         try:
-            sink.abort(grant, completion, _error_text(error))
-        except BaseException as abort_error:
-            raise BaseExceptionGroup(
-                "external LoRA publication and abort failed", [error, abort_error]
-            ) from None
-        raise
+            sink.abort(grant, completion, "; ".join(upload_errors))
+        except BaseException as error:
+            cleanup_error = _error_text(error)
+        cleanup_errors = [
+            error for error in _gather_values(cleanup_error, world_size, group) if error
+        ]
+        detail = "; ".join((*upload_errors, *cleanup_errors))
+        raise RuntimeError(f"external LoRA upload failed: {detail}")
+
+    completions = tuple(
+        ExternalLoraRankCompletion.model_validate(value)
+        for value in _gather_values(
+            completion.model_dump(mode="json"), world_size, group
+        )
+    )
+    publication = None
+    settlement_error = None
+    if rank == plan.coordinator_rank:
+        try:
+            publication = sink.complete(grant, plan, completions)
+            if publication.manifest.plan_sha256 != plan.sha256:
+                raise RuntimeError("external LoRA settlement changed its plan")
+        except BaseException as error:
+            settlement_error = _error_text(error)
+    settlement = _gather_values(
+        (
+            None if publication is None else publication.model_dump(mode="json"),
+            settlement_error,
+        ),
+        world_size,
+        group,
+    )[plan.coordinator_rank]
+    publication_value, settlement_error = settlement
+    if settlement_error:
+        cleanup_error = None
+        try:
+            sink.abort(grant, completion, settlement_error)
+        except BaseException as error:
+            cleanup_error = _error_text(error)
+        cleanup_errors = [
+            error for error in _gather_values(cleanup_error, world_size, group) if error
+        ]
+        detail = "; ".join((settlement_error, *cleanup_errors))
+        raise RuntimeError(f"external LoRA settlement failed: {detail}")
+    if publication_value is None:
+        raise RuntimeError("external LoRA coordinator returned no publication")
+    resolved = ExternalLoraPublication.model_validate(publication_value)
+    return resolved if rank == plan.coordinator_rank else None
 
 
 def _rank_world(group: Any | None) -> tuple[int, int]:

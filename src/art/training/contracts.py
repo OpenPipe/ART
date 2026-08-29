@@ -168,7 +168,13 @@ class OptimStepRequest(RunCommand):
 
 
 class SamplerPublication(Contract):
-    mode: Literal["none", "versioned_lora", "in_flight_lora", "merged_weights"]
+    mode: Literal[
+        "none",
+        "versioned_lora",
+        "in_flight_lora",
+        "external_lora",
+        "merged_weights",
+    ]
     model_alias: str | None = Field(
         default=None, min_length=1, max_length=MAX_CONTROL_IDENTIFIER_LENGTH
     )
@@ -233,6 +239,19 @@ class CheckpointRef(Contract):
     run_id: str = Field(min_length=1, max_length=MAX_CONTROL_IDENTIFIER_LENGTH)
     learner_version: int = Field(ge=0)
     checkpoint_id: str = Field(min_length=1, max_length=MAX_CHECKPOINT_REFERENCE_LENGTH)
+
+
+class ImmutablePublicationRef(Contract):
+    locator: str = Field(min_length=1, max_length=MAX_CHECKPOINT_REFERENCE_LENGTH)
+    size_bytes: int = Field(gt=0)
+    sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+class ExternalLoraReceipt(Contract):
+    generation_id: str = Field(min_length=1, max_length=MAX_CONTROL_IDENTIFIER_LENGTH)
+    active_alias: str = Field(min_length=1, max_length=MAX_CONTROL_IDENTIFIER_LENGTH)
+    manifest: ImmutablePublicationRef
+    shards: tuple[ImmutablePublicationRef, ...] = Field(min_length=1, max_length=10_000)
 
 
 class PackingOutcome(Contract):
@@ -395,6 +414,16 @@ class SamplerWeightsResult(OperationResult):
     kind: Literal["save_sampler"] = "save_sampler"
     checkpoint: CheckpointRef
     lora: str = Field(min_length=1, max_length=MAX_CHECKPOINT_REFERENCE_LENGTH)
+    external_lora: ExternalLoraReceipt | None = None
+
+    @model_validator(mode="after")
+    def _validate_external_lora(self) -> "SamplerWeightsResult":
+        if (
+            self.external_lora is not None
+            and self.lora != self.external_lora.manifest.locator
+        ):
+            raise ValueError("external LoRA result differs from its manifest")
+        return self
 
 
 class SaveStateResult(OperationResult):

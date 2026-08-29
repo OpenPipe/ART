@@ -75,18 +75,21 @@ class _Sink:
         self.objects[shard.index] = payload
         return _ref(f"shard/{plan.target.publication_id}/{shard.index}", payload)
 
-    def complete_rank(
+    def complete(
         self,
         grant: ExternalLoraTargetGrant,
-        completion: ExternalLoraRankCompletion,
+        plan: ExternalLoraPlan,
+        completions: tuple[ExternalLoraRankCompletion, ...],
     ) -> ExternalLoraPublication:
-        plan = self._plan()
+        assert plan == self._plan()
         assert grant.plan_sha256 == plan.sha256
         self.events.append(("manifest", None))
         manifest = ExternalLoraManifest(
             plan=plan,
             plan_sha256=plan.sha256,
-            shards=completion.shards,
+            shards=tuple(
+                receipt for completion in completions for receipt in completion.shards
+            ),
         )
         payload = manifest.canonical_bytes()
         return ExternalLoraPublication(

@@ -20,6 +20,12 @@ from pydantic import BaseModel, ConfigDict
 from art.distributed.data_plane import PackedBatchLeaseSet
 from art.distributed.monarch_bootstrap import activate_cuda_device
 from art.distributed.specs import GpuId
+from art.megatron.weights.external_lora_publish import (
+    ExternalLoraPlan,
+    ExternalLoraPublication,
+    ExternalLoraSinkSpec,
+    ExternalLoraTarget,
+)
 from art.training import (
     CommandExecutionUsage,
     OperationExecutionError,
@@ -821,6 +827,41 @@ class MonarchTrainerActor(Actor):
         with self._weight_offload.job():
             result = self._executor.inspect_resident_lora(request)
         return result.model_dump(mode="json")
+
+    @endpoint
+    def publish_external_lora(
+        self,
+        target_json: str,
+        sink_spec_json: str,
+        source_topology: str,
+    ) -> dict[str, Any]:
+        if not self._valid:
+            raise RuntimeError("trainer actor runtime is invalid")
+        target = ExternalLoraTarget.model_validate_json(target_json)
+        sink = ExternalLoraSinkSpec.model_validate_json(sink_spec_json).create()
+        submitted = False
+        try:
+            with self._weight_offload.job():
+                plan, future, metrics = self._executor.publish_external_lora(
+                    target,
+                    sink,
+                    source_topology=source_topology,
+                )
+                submitted = True
+                publication = future.result()
+        finally:
+            if not submitted:
+                close = getattr(sink, "close", None)
+                if close is not None:
+                    close()
+        return {
+            "rank": self._runtime.rank,
+            "plan": plan.model_dump(mode="json"),
+            "publication": (
+                None if publication is None else publication.model_dump(mode="json")
+            ),
+            "metrics": metrics,
+        }
 
     @endpoint
     def close(self) -> None:
@@ -1667,6 +1708,53 @@ class MonarchTrainerRun:
                 request=request,
                 world_size=len(self.runtime_spec.trainer_mesh.ranks),
             )
+
+    async def publish_external_lora(
+        self,
+        target: ExternalLoraTarget,
+        sink_spec: ExternalLoraSinkSpec,
+        *,
+        source_topology: str,
+    ) -> tuple[ExternalLoraPlan, ExternalLoraPublication, dict[str, float]]:
+        """Publish rank-owned adapter views and settle one manifest last."""
+
+        async with self._lock:
+            values = await self._run_resident_collective(
+                target.operation_id,
+                self._actors.publish_external_lora.call(
+                    target.model_dump_json(),
+                    sink_spec.model_dump_json(),
+                    source_topology,
+                ),
+                invalidate_on_error=False,
+            )
+            results = list(values.values())
+            expected_ranks = set(range(len(self.runtime_spec.trainer_mesh.ranks)))
+            if {result["rank"] for result in results} != expected_ranks:
+                raise RuntimeError("external LoRA publication omitted a trainer rank")
+            plans = tuple(
+                ExternalLoraPlan.model_validate(result["plan"]) for result in results
+            )
+            if any(plan != plans[0] for plan in plans[1:]):
+                raise RuntimeError("trainer ranks returned different external plans")
+            publications = tuple(
+                (result["rank"], ExternalLoraPublication.model_validate(value))
+                for result in results
+                if (value := result["publication"]) is not None
+            )
+            if (
+                len(publications) != 1
+                or publications[0][0] != plans[0].coordinator_rank
+            ):
+                raise RuntimeError(
+                    "external LoRA publication requires one coordinator result"
+                )
+            metric_names = {name for result in results for name in result["metrics"]}
+            metrics = {
+                name: max(float(result["metrics"].get(name, 0.0)) for result in results)
+                for name in metric_names
+            }
+            return plans[0], publications[0][1], metrics
 
     async def _run_resident_collective(
         self,
