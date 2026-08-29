@@ -1,6 +1,11 @@
 from art.distributed.data_plane import PackedBatchLeaseSet, PackedBatchRef
 
 from .data_plane import InMemoryPackedBatch
+from .numerical_capture import (
+    ForwardBackwardNumericalCaptureReceipt,
+    ForwardBackwardNumericalRankReceipt,
+    NumericalTensorArtifact,
+)
 from .portable_snapshot import (
     ART_PORTABLE_SNAPSHOT_SINK_FACTORY_ENV,
     ART_PORTABLE_SNAPSHOT_SOURCE_FACTORY_ENV,
@@ -44,7 +49,10 @@ __all__ = [
     "CurrentTrainConfig",
     "DurableTrainOutput",
     "ExperimentalTrainConfig",
+    "ForwardBackwardNumericalCaptureReceipt",
+    "ForwardBackwardNumericalRankReceipt",
     "InMemoryPackedBatch",
+    "NumericalTensorArtifact",
     "PackedBatchRef",
     "PackedBatchLeaseSet",
     "ART_PORTABLE_SNAPSHOT_SINK_FACTORY_ENV",

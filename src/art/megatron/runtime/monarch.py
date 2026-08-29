@@ -30,12 +30,18 @@ from art.training import (
     CommandExecutionUsage,
     OperationExecutionError,
     OperationRef,
+    TokenLogprobs,
     UsageMeasurement,
 )
 from art.utils.cache_dirs import configure_model_cache_env
 from art.utils.lifecycle import cleanup_after_failure, consume_future_exception
 
 from .data_plane import InMemoryPackedBatch, SFTBatchData
+from .numerical_capture import (
+    ForwardBackwardNumericalCaptureReceipt,
+    ForwardBackwardNumericalRankReceipt,
+    build_forward_backward_capture,
+)
 from .portable_snapshot import (
     PortableSnapshotArchive,
     PortableSnapshotExportReceipt,
@@ -753,6 +759,34 @@ class MonarchTrainerActor(Actor):
                 batch.close()
 
     @endpoint
+    def capture_forward_backward_numerics(
+        self,
+        run_id: str,
+        operation_id: str,
+        batch_json: str,
+        token_logprobs_json: tuple[str, ...],
+        root: str,
+    ) -> dict[str, Any]:
+        if not self._valid:
+            raise RuntimeError("trainer actor runtime is invalid")
+        leases = PackedBatchLeaseSet.model_validate_json(batch_json)
+        batch = InMemoryPackedBatch.open(leases.ref, leases.host_refs[self._host_id])
+        try:
+            receipt = self._run_slot_executor.capture_forward_backward_numerics(
+                run_id=run_id,
+                operation_id=operation_id,
+                batch=batch,
+                token_logprobs=tuple(
+                    TokenLogprobs.model_validate_json(value)
+                    for value in token_logprobs_json
+                ),
+                root=root,
+            )
+            return receipt.model_dump(mode="json")
+        finally:
+            batch.close()
+
+    @endpoint
     def execute_forward(
         self,
         job_json: str,
@@ -1330,6 +1364,9 @@ class MonarchTrainerRun:
             str, tuple[tuple[str, TrainerGeneration], PortableSnapshotExportReceipt]
         ] = {}
         self._checkpoint_loads: dict[str, tuple[str, PortableSnapshotLoadReceipt]] = {}
+        self._numerical_captures: dict[
+            str, tuple[tuple[str, str], ForwardBackwardNumericalCaptureReceipt]
+        ] = {}
         self._command_mode = False
         self._lock = asyncio.Lock()
         self._cp_lookahead_lock = asyncio.Lock()
@@ -1454,6 +1491,60 @@ class MonarchTrainerRun:
                     state.open_forward_backward_ids
                 ),
             )
+
+    async def capture_forward_backward_numerics(
+        self,
+        run_id: str,
+        operation_id: str,
+        batch: PackedBatchLeaseSet,
+        root: str,
+    ) -> ForwardBackwardNumericalCaptureReceipt:
+        identity = (run_id, os.path.abspath(root))
+        prior = self._numerical_captures.get(operation_id)
+        if prior is not None:
+            if prior[0] != identity:
+                raise RuntimeError("numerical capture operation was reused")
+            return prior[1]
+        async with self._lock:
+            prior = self._numerical_captures.get(operation_id)
+            if prior is not None:
+                if prior[0] != identity:
+                    raise RuntimeError("numerical capture operation was reused")
+                return prior[1]
+            state = self._command_runs.get(run_id)
+            cached = self._operations.get(operation_id)
+            if (
+                state is None
+                or not state.open_forward_backward_ids
+                or state.open_forward_backward_ids[-1] != operation_id
+                or cached is None
+            ):
+                raise RuntimeError("numerical capture is not the open F/B suffix")
+            result = cached[1]
+            token_logprobs = tuple(
+                TokenLogprobs.model_validate(value).model_dump_json()
+                for value in result.get("token_logprobs", ())
+            )
+            values = await asyncio.wait_for(
+                self._actors.capture_forward_backward_numerics.call(
+                    run_id,
+                    operation_id,
+                    batch.model_dump_json(),
+                    token_logprobs,
+                    identity[1],
+                ),
+                timeout=state.spec.event_timeout_s,
+            )
+            receipt = build_forward_backward_capture(
+                tuple(
+                    ForwardBackwardNumericalRankReceipt.model_validate(value)
+                    for value in values.values()
+                )
+            )
+            self._numerical_captures[operation_id] = (identity, receipt)
+            while len(self._numerical_captures) > _MAX_CACHED_COMMAND_OPERATIONS:
+                self._numerical_captures.pop(next(iter(self._numerical_captures)))
+            return receipt
 
     async def export_command_run_checkpoint(
         self,

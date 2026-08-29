@@ -313,6 +313,20 @@ class ParameterGradientAccumulator:
             )
         self._sealed = operation_ids
 
+    def snapshot_local_sums(self) -> AccumulatedGradientSums:
+        """Read the exact open sum for numerical qualification without sealing it."""
+
+        if self._sealed is not None:
+            raise RuntimeError("cannot capture a sealed gradient accumulator")
+        if self._gradients is None or self._local_tokens is None:
+            raise RuntimeError("gradient accumulator has no contributions")
+        return AccumulatedGradientSums(
+            gradients=self._gradients,
+            local_token_count=self._local_tokens,
+            expected_global_token_count=self._expected_global_tokens,
+            reduction="token_mean",
+        )
+
     def prepare_local_sums(
         self,
     ) -> tuple[AccumulatedGradientSums, tuple[bool, ...]]:

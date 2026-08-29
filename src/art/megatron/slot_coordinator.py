@@ -38,6 +38,7 @@ from .route_retention import (
     RouteBundleOwnershipProvider,
     RouteBundleOwnershipTransfer,
 )
+from .runtime.numerical_capture import ForwardBackwardNumericalCaptureReceipt
 from .runtime.portable_snapshot import (
     PortableSnapshotArchive,
     PortableSnapshotExportReceipt,
@@ -140,6 +141,14 @@ class _SharedTrainer(Protocol):
     ) -> PortableSnapshotInstallReceipt | None: ...
 
     async def command_run_state(self, run_id: str) -> TrainerCommandRunState: ...
+
+    async def capture_forward_backward_numerics(
+        self,
+        run_id: str,
+        operation_id: str,
+        batch: Any,
+        root: str,
+    ) -> ForwardBackwardNumericalCaptureReceipt: ...
 
     async def export_command_run_checkpoint(
         self,
@@ -700,6 +709,48 @@ class MegatronSlotCoordinator:
         finally:
             async with self._condition:
                 if self._runs.get(ref.run_id) is state:
+                    state.maintenance = False
+                self._condition.notify_all()
+
+    async def capture_forward_backward_numerics(
+        self,
+        *,
+        run_id: str,
+        operation_id: str,
+        root: str,
+    ) -> ForwardBackwardNumericalCaptureReceipt:
+        """Capture exact gate evidence while the selected F/B suffix is open."""
+
+        async with self._condition:
+            state = self._runs.get(run_id)
+            if (
+                state is None
+                or state.draining
+                or state.maintenance
+                or state.migration_fence_id is not None
+                or state.migration_restore_id is not None
+            ):
+                raise RuntimeError("Megatron slot run is unavailable for capture")
+            state.maintenance = True
+            try:
+                while (
+                    state.preparing
+                    or state.worker_calls
+                    or self._active_run_id == run_id
+                    or any(item.run_id == run_id for item in self._ready)
+                ):
+                    await self._condition.wait()
+            except BaseException:
+                state.maintenance = False
+                self._condition.notify_all()
+                raise
+        try:
+            return await state.handler.capture_forward_backward_numerics(
+                operation_id, root
+            )
+        finally:
+            async with self._condition:
+                if self._runs.get(run_id) is state:
                     state.maintenance = False
                 self._condition.notify_all()
 

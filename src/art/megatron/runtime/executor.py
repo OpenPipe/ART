@@ -43,6 +43,9 @@ from .trainer_run import EventSink
 
 if TYPE_CHECKING:
     from art.megatron.optimizer_state import OptimizerAdapter
+    from art.megatron.runtime.numerical_capture import (
+        ForwardBackwardNumericalRankReceipt,
+    )
     from art.megatron.runtime.portable_snapshot import (
         PortableSnapshotArchive,
         PortableSnapshotRankReceipt,
@@ -798,6 +801,38 @@ class MCoreRunSlotExecutor:
             else (),
             "metrics": result.metrics,
         }
+
+    def capture_forward_backward_numerics(
+        self,
+        *,
+        run_id: str,
+        operation_id: str,
+        batch: InMemoryPackedBatch,
+        token_logprobs: tuple[TokenLogprobs, ...],
+        root: str,
+    ) -> "ForwardBackwardNumericalRankReceipt":
+        """Persist exact rank-local evidence for an open F/B contribution."""
+
+        state = self._runs.get(run_id)
+        if state is None:
+            raise KeyError(f"trainer command run {run_id!r} is absent")
+        contribution_ids = state.gradients.contribution_ids
+        if not contribution_ids or contribution_ids[-1] != operation_id:
+            raise RuntimeError("numerical capture is not the open F/B suffix")
+        validate_packed_batch(batch)
+        from .numerical_capture import capture_forward_backward_rank
+
+        gradients = state.gradients.snapshot_local_sums().gradients
+        return capture_forward_backward_rank(
+            root=root,
+            run_id=run_id,
+            operation_id=operation_id,
+            contribution_ids=contribution_ids,
+            rank=int(self.runtime.rank),
+            packed_tensors=batch.tensors,
+            token_logprobs=token_logprobs,
+            gradients=gradients,
+        )
 
     def execute_optimizer(self, job: OptimizerJobSpec) -> dict[str, Any]:
         state = self._require_parent(job)

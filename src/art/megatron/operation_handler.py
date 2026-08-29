@@ -47,6 +47,7 @@ from .route_retention import (
     RouteBundleOwnershipHandle,
     RouteBundleOwnershipProvider,
 )
+from .runtime.numerical_capture import ForwardBackwardNumericalCaptureReceipt
 from .runtime.specs import (
     CurrentTrainConfig,
     ExperimentalTrainConfig,
@@ -262,6 +263,14 @@ class _ResidentTrainer(Protocol):
     ) -> dict[str, Any]: ...
 
     async def optim_step(self, job: OptimizerJobSpec) -> dict[str, Any]: ...
+
+    async def capture_forward_backward_numerics(
+        self,
+        run_id: str,
+        operation_id: str,
+        batch: Any,
+        root: str,
+    ) -> ForwardBackwardNumericalCaptureReceipt: ...
 
     async def record_control_command(
         self,
@@ -504,6 +513,22 @@ class MegatronOperationHandler:
 
     async def packing_for(self, ref: PackedInputCaptureRef) -> PackingOutcome:
         return (await self._require_capture(ref, None)).packing
+
+    async def capture_forward_backward_numerics(
+        self, operation_id: str, root: str
+    ) -> ForwardBackwardNumericalCaptureReceipt:
+        capture_id = self._contributions.get(operation_id)
+        if capture_id is None:
+            raise RuntimeError("numerical capture operation is not an open F/B")
+        captured = self._captures.get(capture_id)
+        if captured is None:
+            raise RuntimeError("numerical capture packed input is absent")
+        return await self.trainer.capture_forward_backward_numerics(
+            self.config.run_id,
+            operation_id,
+            captured.packed.leases,
+            root,
+        )
 
     async def retry_releases(self) -> None:
         for capture_id in tuple(self._release_failures):
