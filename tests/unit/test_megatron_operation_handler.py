@@ -31,9 +31,11 @@ from art.training import (
     AdamConfig,
     CheckpointRef,
     CommandAdmission,
+    ExternalLoraReceipt,
     ForwardBackwardRequest,
     ForwardBackwardResult,
     ForwardRequest,
+    ImmutablePublicationRef,
     LossConfig,
     OperationExecutionError,
     OperationRef,
@@ -463,6 +465,80 @@ async def test_sampler_publication_receipt_lives_until_operation_retirement() ->
     run.worker.retire("publish")
     assert slot.sampler_publication_receipt("run", "publish") is None
     await slot.aclose()
+
+
+def test_external_sampler_receipt_requires_manifest_without_holder_update() -> None:
+    generation = TrainerGeneration(
+        training_session_id="session",
+        policy_step=0,
+        generation_id=f"step-00000000-{'a' * 32}",
+        adapter_path="/adapter/0",
+    )
+    operation = _operation("publish", "save_sampler", 0)
+    request = SaveWeightsForSamplerRequest(
+        run_id="run",
+        request_id="publish-request",
+        sequence_id=0,
+        checkpoint_name="step-0",
+        publication=SamplerPublication(
+            mode="external_lora",
+            model_alias="public-policy",
+        ),
+    )
+    manifest = ImmutablePublicationRef(
+        locator="caios://manifest",
+        size_bytes=1024,
+        sha256="a" * 64,
+    )
+    result = SamplerWeightsResult(
+        operation_id="publish",
+        checkpoint=CheckpointRef(
+            run_id="run",
+            learner_version=0,
+            checkpoint_id="step-0",
+        ),
+        lora=manifest.locator,
+        external_lora=ExternalLoraReceipt(
+            generation_id=generation.generation_id,
+            active_alias="public-policy",
+            manifest=manifest,
+            shards=(
+                ImmutablePublicationRef(
+                    locator="caios://shard-0",
+                    size_bytes=4096,
+                    sha256="b" * 64,
+                ),
+            ),
+        ),
+    )
+    receipt = MegatronSamplerPublicationReceipt(
+        operation_id="publish",
+        request_id="publish-request",
+        publication_mode="external_lora",
+        requested_public_alias="public-policy",
+        runtime_model_name="model@revision",
+        serving_generation_id=generation.generation_id,
+        learner_version=0,
+        retained=(
+            MegatronRetainedState(
+                owner_id="external-lora:manifest",
+                resource="lora",
+                bytes=4096,
+                work_fingerprint="f" * 64,
+            ),
+        ),
+        result=result,
+    )
+
+    receipt.validate_command(request, operation, generation)
+    with pytest.raises(RuntimeError, match="wrong resource kind"):
+        receipt.model_copy(
+            update={"result": result.model_copy(update={"external_lora": None})}
+        ).validate_command(request, operation, generation)
+    with pytest.raises(RuntimeError, match="holder update evidence"):
+        receipt.model_copy(update={"holder_update_sequence": 1}).validate_command(
+            request, operation, generation
+        )
 
 
 @pytest.mark.asyncio

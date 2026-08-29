@@ -118,14 +118,16 @@ class MegatronSamplerPublicationReceipt(BaseModel):
 
     operation_id: str = Field(min_length=1, max_length=64)
     request_id: str = Field(min_length=1)
-    publication_mode: Literal["versioned_lora", "in_flight_lora", "merged_weights"]
+    publication_mode: Literal[
+        "versioned_lora", "in_flight_lora", "external_lora", "merged_weights"
+    ]
     requested_public_alias: str = Field(min_length=1)
     runtime_model_name: str = Field(min_length=1)
     runtime_lora_name: str | None = Field(default=None, min_length=1)
     serving_generation_id: str = Field(min_length=1)
     learner_version: int = Field(ge=0)
-    holder_update_sequence: int = Field(ge=0)
-    holder_update_id: str = Field(min_length=1)
+    holder_update_sequence: int | None = Field(default=None, ge=0)
+    holder_update_id: str | None = Field(default=None, min_length=1)
     retained: tuple[MegatronRetainedState, ...] = Field(min_length=1, max_length=16)
     result: SamplerWeightsResult
 
@@ -150,12 +152,26 @@ class MegatronSamplerPublicationReceipt(BaseModel):
             or self.result.checkpoint.learner_version != generation.policy_step
         ):
             raise RuntimeError("sampler publication receipt changed command identity")
-        lora_mode = self.publication_mode in {"versioned_lora", "in_flight_lora"}
-        if lora_mode != (self.runtime_lora_name is not None) or any(
-            item.resource != ("lora" if lora_mode else "storage")
-            for item in self.retained
+        paired_lora = self.publication_mode in {"versioned_lora", "in_flight_lora"}
+        external_lora = self.publication_mode == "external_lora"
+        holder_update = (
+            self.holder_update_sequence is not None
+            and self.holder_update_id is not None
+        )
+        if (
+            paired_lora != (self.runtime_lora_name is not None)
+            or paired_lora != holder_update
+            or external_lora != (self.result.external_lora is not None)
+            or any(
+                item.resource != ("lora" if paired_lora or external_lora else "storage")
+                for item in self.retained
+            )
         ):
             raise RuntimeError("sampler publication retained the wrong resource kind")
+        if not paired_lora and (
+            self.holder_update_sequence is not None or self.holder_update_id is not None
+        ):
+            raise RuntimeError("non-holder publication returned holder update evidence")
         if len({item.owner_id for item in self.retained}) != len(self.retained):
             raise RuntimeError("sampler publication owner IDs must be unique")
 
