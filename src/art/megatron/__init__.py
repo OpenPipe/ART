@@ -16,7 +16,11 @@ __all__ = [
     "MegatronSlotResourceRequest",
     "MegatronSlotRun",
     "MegatronSlotScheduleConfig",
+    "MegatronSlotLaunchConfig",
+    "MegatronSlotRuntime",
+    "MegatronSlotRuntimeDescriptor",
     "bootstrap_megatron_operation_worker",
+    "launch_megatron_slot",
 ]
 
 
@@ -50,4 +54,13 @@ def __getattr__(name: str) -> Any:
         from . import slot_coordinator
 
         return getattr(slot_coordinator, name)
+    if name in {
+        "MegatronSlotLaunchConfig",
+        "MegatronSlotRuntime",
+        "MegatronSlotRuntimeDescriptor",
+        "launch_megatron_slot",
+    }:
+        from . import slot_runtime
+
+        return getattr(slot_runtime, name)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

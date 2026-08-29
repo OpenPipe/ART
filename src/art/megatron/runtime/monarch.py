@@ -1177,6 +1177,8 @@ class MonarchTrainerRun:
         supervision: MonarchTrainerSupervision,
         rank_processes: tuple[_TrainerRankReady, ...],
         cp_lookahead_ports: tuple[Port[Any], ...],
+        *,
+        register_initial_run: bool = True,
     ) -> None:
         if run_spec.runtime_fingerprint != runtime_spec.fingerprint:
             raise ValueError(
@@ -1190,13 +1192,17 @@ class MonarchTrainerRun:
         self._rank_processes = rank_processes
         self._cp_lookahead_ports = cp_lookahead_ports
         self._learner_version = run_spec.initial_learner_version
-        self._command_runs = {
-            run_spec.run_id: _CommandRunState(
-                spec=run_spec,
-                learner_version=run_spec.initial_learner_version,
-                next_operation_sequence=run_spec.initial_operation_sequence,
-            )
-        }
+        self._command_runs = (
+            {
+                run_spec.run_id: _CommandRunState(
+                    spec=run_spec,
+                    learner_version=run_spec.initial_learner_version,
+                    next_operation_sequence=run_spec.initial_operation_sequence,
+                )
+            }
+            if register_initial_run
+            else {}
+        )
         self._jobs: dict[str, tuple[str, tuple[TrainEvent, ...]]] = {}
         self._operations: dict[str, tuple[str, dict[str, Any]]] = {}
         self._command_mode = False

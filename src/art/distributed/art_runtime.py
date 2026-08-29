@@ -966,6 +966,47 @@ class ArtRuntime:
     async def start_trainer(
         self, runtime_spec: TrainerRuntimeSpec, run_spec: TrainingRunSpec
     ) -> Any:
+        return await self._start_trainer(
+            runtime_spec,
+            run_spec,
+            register_initial_run=True,
+        )
+
+    async def start_shared_trainer(
+        self,
+        runtime_spec: TrainerRuntimeSpec,
+        *,
+        launch_id: str,
+        command_timeout_s: float = 300.0,
+        shutdown_timeout_s: float = 240.0,
+    ) -> Any:
+        """Start one command-only trainer without creating a synthetic tenant run."""
+
+        if not launch_id:
+            raise ValueError("shared trainer launch_id must not be empty")
+        run_spec = TrainingRunSpec(
+            run_id=f"art-slot:{launch_id}",
+            runtime_fingerprint=runtime_spec.fingerprint,
+            training_session_id=f"art-slot:{launch_id}",
+            initial_learner_version=0,
+            initial_adapter_path=f"art-slot:{launch_id}:adapter",
+            optimizer_state_path=f"art-slot:{launch_id}:optimizer",
+            event_timeout_s=command_timeout_s,
+            shutdown_timeout_s=shutdown_timeout_s,
+        )
+        return await self._start_trainer(
+            runtime_spec,
+            run_spec,
+            register_initial_run=False,
+        )
+
+    async def _start_trainer(
+        self,
+        runtime_spec: TrainerRuntimeSpec,
+        run_spec: TrainingRunSpec,
+        *,
+        register_initial_run: bool,
+    ) -> Any:
         self._require_open()
         if self.topology.trainer is None:
             raise RuntimeError("runtime topology has no trainer mesh")
@@ -1053,6 +1094,7 @@ class ArtRuntime:
             supervision,
             rank_processes,
             cp_lookahead_ports,
+            register_initial_run=register_initial_run,
         )
         self._trainer_runs.add(run)
         return run
