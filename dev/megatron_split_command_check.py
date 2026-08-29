@@ -117,6 +117,8 @@ def main(
                 kind="optim_step",
             ),
             training_session_id=source.training_session_id,
+            source=source,
+            optimizer_state_path="unused-resident-optimizer",
             generation=_generation(1),
             contributing_forward_backward_operation_ids=tuple(contribution_ids),
             optimizer=AdamConfig(learning_rate=1e-5),

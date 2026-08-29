@@ -54,6 +54,7 @@ class TrainerRuntimeSpec(_Spec):
     random_state: int | None = None
     hybrid_ep: HybridEpRuntimeSpec | None = None
     snapshot_pool_capacity: int = Field(default=2, ge=1, le=4)
+    accumulator_l1_budget_bytes: int = Field(default=16 * 1024**3, ge=1)
 
     @model_validator(mode="after")
     def _validate_lora_targets(self) -> "TrainerRuntimeSpec":
@@ -296,6 +297,8 @@ class OptimizerJobSpec(_Spec):
 
     operation: OperationRef
     training_session_id: str = Field(min_length=1)
+    source: TrainerGeneration
+    optimizer_state_path: str = Field(min_length=1)
     generation: TrainerGeneration
     contributing_forward_backward_operation_ids: tuple[str, ...] = Field(min_length=1)
     optimizer: AdamConfig
@@ -305,6 +308,11 @@ class OptimizerJobSpec(_Spec):
         output_version = self.operation.reserved_output_learner_version
         if self.operation.kind != "optim_step" or output_version is None:
             raise ValueError("optimizer job requires an optim_step operation")
+        if (
+            self.source.training_session_id != self.training_session_id
+            or self.source.policy_step != self.operation.learner_parent_version
+        ):
+            raise ValueError("optimizer source does not identify the command parent")
         if (
             self.generation.training_session_id != self.training_session_id
             or self.generation.policy_step != output_version
@@ -331,6 +339,14 @@ class OptimizerJobSpec(_Spec):
     @property
     def expected_learner_version(self) -> int:
         return self.operation.learner_parent_version
+
+    @property
+    def source_policy_step(self) -> int:
+        return self.expected_learner_version
+
+    @property
+    def source_adapter_path(self) -> str:
+        return self.source.adapter_path
 
     @property
     def learner_version(self) -> int:

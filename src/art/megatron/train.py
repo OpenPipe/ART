@@ -70,9 +70,11 @@ from art.megatron.routing_replay import (
     prepare_moe_routing_replay_boundaries,
 )
 from art.megatron.runtime.data_plane import SFTBatchData
+from art.megatron.runtime.device_usage import measure_cuda_call
 from art.megatron.runtime.specs import (
     ForwardBackwardJobSpec,
     ForwardJobSpec,
+    OptimizerJobSpec,
     PackedTokenScore,
     ResidentLoraExport,
     ResidentLoraInspectionShard,
@@ -280,6 +282,7 @@ class MegatronForwardBackwardJobResult(BaseModel):
     completed_gradient_steps: int = Field(ge=0)
     logical_nonpadding_tokens: int = Field(ge=0)
     executed_token_equivalents: int = Field(ge=0)
+    gpu_service_ns: int = Field(ge=0)
     metrics: dict[str, float] = Field(default_factory=dict)
 
 
@@ -289,6 +292,7 @@ class MegatronForwardJobResult(BaseModel):
     new_logprobs: tuple[torch.Tensor, ...]
     logical_nonpadding_tokens: int = Field(ge=0)
     executed_token_equivalents: int = Field(ge=0)
+    gpu_service_ns: int = Field(ge=0)
     metrics: dict[str, float] = Field(default_factory=dict)
 
 
@@ -774,7 +778,7 @@ def _execute_megatron_rl_forward_backward_steps(
                 next_step_first_micro=next_step_first_micro,
                 next_step_first_ref_logprobs=next_step_first_ref_logprobs,
                 hybridep_token_counts=hybridep_token_counts,
-                inter_forward_backward_timing=(runtime.inter_forward_backward_timing),
+                inter_forward_backward_timing=runtime.inter_forward_backward_timing,
                 defer_grad_sync=defer_grad_sync,
                 forward_only=forward_only,
             )
@@ -966,13 +970,12 @@ def execute_megatron_rl_forward_backward_job(
             f"observed={observed_tokens}, "
             f"expected={job.expected_global_loss_bearing_tokens}"
         )
-    gradient_accumulator.before_forward_backward()
+    states: list[RLForwardBackwardState] = []
+    durations: list[float] = []
     internal = GradientAccumulator(
         runtime.model,
         flush_gradients=flush_param_grads_to_main_grads,
     )
-    states: list[RLForwardBackwardState] = []
-    durations: list[float] = []
 
     def before_step(step_index: int) -> None:
         if step_index:
@@ -990,32 +993,37 @@ def execute_megatron_rl_forward_backward_job(
         states.append(state)
         durations.append(duration_s)
 
-    _, job_prepare_s = _execute_megatron_rl_forward_backward_steps(
-        runtime,
-        job,
-        packed_tensors,
-        before_step=before_step,
-        after_step=record_step,
-        cancelled=cancelled,
-        defer_grad_sync=True,
-    )
-    internal.seal(internal.contribution_ids)
-    local_sums = internal.prepare_local_sums()
-    gradient_accumulator.record(
-        job.operation_id,
-        local_sums.local_token_count,
-        expected_global_token_count=job.expected_global_loss_bearing_tokens,
-    )
-    internal.consume()
-    results = tuple(
-        _finish_megatron_rl_forward_backward_step(state) for state in states
-    )
-    if any(not torch.isfinite(result.reduced_loss).item() for result in results):
-        raise RuntimeError("Megatron F/B produced a non-finite loss")
+    def execute() -> tuple[float, Any, tuple[MegatronForwardBackwardStepResult, ...]]:
+        gradient_accumulator.before_forward_backward()
+        _, job_prepare_s = _execute_megatron_rl_forward_backward_steps(
+            runtime,
+            job,
+            packed_tensors,
+            before_step=before_step,
+            after_step=record_step,
+            cancelled=cancelled,
+            defer_grad_sync=True,
+        )
+        internal.seal(internal.contribution_ids)
+        local_sums = internal.prepare_local_sums()
+        gradient_accumulator.record(
+            job.operation_id,
+            local_sums.local_token_count,
+            expected_global_token_count=job.expected_global_loss_bearing_tokens,
+        )
+        internal.consume()
+        results = tuple(
+            _finish_megatron_rl_forward_backward_step(state) for state in states
+        )
+        if any(not torch.isfinite(result.reduced_loss).item() for result in results):
+            raise RuntimeError("Megatron F/B produced a non-finite loss")
+        return job_prepare_s, local_sums, results
+
+    (job_prepare_s, local_sums, results), gpu_service_ns = measure_cuda_call(execute)
+    runtime.resident_run_id = job.run_id
     runtime.resident_training_session_id = job.training_session_id
     runtime.resident_policy_step = job.expected_learner_version
     runtime.resident_generation_id = job.source.generation_id
-    runtime.optimizer_state_loaded = True
     return MegatronForwardBackwardJobResult(
         new_logprobs=tuple(
             values
@@ -1039,6 +1047,7 @@ def execute_megatron_rl_forward_backward_job(
         executed_token_equivalents=sum(
             result.workload.executed_token_equivalents for result in results
         ),
+        gpu_service_ns=gpu_service_ns,
         metrics={
             "time/forward_backward_s": sum(durations),
             "time/job_prepare_s": job_prepare_s,
@@ -1071,19 +1080,23 @@ def execute_megatron_rl_forward_job(
         results.append(state)
         durations.append(duration_s)
 
-    _, job_prepare_s = _execute_megatron_rl_forward_backward_steps(
-        runtime,
-        job,
-        packed_tensors,
-        before_step=lambda _step_index: None,
-        after_step=record_step,
-        cancelled=cancelled,
-        replay_bundle=replay_bundle,
-        forward_only=True,
-    )
-    finished = tuple(
-        _finish_megatron_rl_forward_backward_step(state) for state in results
-    )
+    def execute() -> tuple[float, tuple[MegatronForwardBackwardStepResult, ...]]:
+        _, job_prepare_s = _execute_megatron_rl_forward_backward_steps(
+            runtime,
+            job,
+            packed_tensors,
+            before_step=lambda _step_index: None,
+            after_step=record_step,
+            cancelled=cancelled,
+            replay_bundle=replay_bundle,
+            forward_only=True,
+        )
+        finished = tuple(
+            _finish_megatron_rl_forward_backward_step(state) for state in results
+        )
+        return job_prepare_s, finished
+
+    (job_prepare_s, finished), gpu_service_ns = measure_cuda_call(execute)
     return MegatronForwardJobResult(
         new_logprobs=tuple(
             value for result in finished for value in result.new_logprobs
@@ -1094,6 +1107,7 @@ def execute_megatron_rl_forward_job(
         executed_token_equivalents=sum(
             result.workload.executed_token_equivalents for result in finished
         ),
+        gpu_service_ns=gpu_service_ns,
         metrics={
             "time/forward_s": sum(durations),
             "time/job_prepare_s": job_prepare_s,
@@ -1248,65 +1262,73 @@ def _moe_replay_strict(
 
 def _prepare_rl_training_state(
     runtime: TrainingRuntime,
-    job: TrainJobSpec | SFTJobSpec | ForwardBackwardJobSpec | ForwardJobSpec,
+    job: (
+        TrainJobSpec
+        | SFTJobSpec
+        | ForwardBackwardJobSpec
+        | ForwardJobSpec
+        | OptimizerJobSpec
+    ),
 ) -> dict[str, torch.dtype]:
-    state_is_resident = (
-        runtime.optimizer_persistent
+    weights_are_resident = (
+        runtime.resident_run_id == job.run_id
         and runtime.resident_training_session_id == job.training_session_id
         and runtime.resident_policy_step == job.source_policy_step
         and runtime.resident_generation_id == job.source.generation_id
-        and runtime.optimizer_state_loaded
-        and runtime.optimizer is not None
     )
-    if state_is_resident:
+    if weights_are_resident:
         if (
             runtime.adapter_export_dtypes is None
             or runtime.adapter_export_config is None
         ):
             raise RuntimeError("Resident Megatron state has no LoRA export metadata")
-        return runtime.adapter_export_dtypes
+    else:
+        runtime.optimizer_snapshot_barrier.synchronize()
+        replacing_resident_state = runtime.resident_run_id is not None
+        runtime.resident_run_id = None
+        runtime.resident_training_session_id = None
+        runtime.resident_policy_step = None
+        runtime.resident_generation_id = None
+        runtime.optimizer_state_loaded = False
+        runtime.adapter_export_config = None
+        if replacing_resident_state or not runtime.optimizer_persistent:
+            runtime.optimizer = None
 
-    runtime.optimizer_snapshot_barrier.synchronize()
-    replacing_resident_state = runtime.resident_training_session_id is not None
-    runtime.resident_training_session_id = None
-    runtime.resident_policy_step = None
-    runtime.resident_generation_id = None
-    runtime.optimizer_state_loaded = False
-    runtime.adapter_export_config = None
-    if replacing_resident_state or not runtime.optimizer_persistent:
-        runtime.optimizer = None
+        _load_adapter_into_model(
+            runtime.model,
+            job.source_adapter_path,
+            runtime.rank,
+            handler=runtime.model_support_handler,
+            optimizer=runtime.optimizer,
+        )
+        # Serialize the live LoRA dtype instead of perpetuating a source
+        # checkpoint's PEFT-upcast FP32 dtype.
+        runtime.adapter_export_dtypes = {}
+        runtime.adapter_export_config = load_adapter_config(job.source_adapter_path)
+        runtime.resident_run_id = job.run_id
+        runtime.resident_training_session_id = job.training_session_id
+        runtime.resident_policy_step = job.source_policy_step
+        runtime.resident_generation_id = job.source.generation_id
 
-    _load_adapter_into_model(
-        runtime.model,
-        job.source_adapter_path,
-        runtime.rank,
-        handler=runtime.model_support_handler,
-        optimizer=runtime.optimizer,
-    )
-    if runtime.optimizer is None:
-        runtime.optimizer = _build_optimizer(runtime.model, runtime.optimizer_config)
-    assert runtime.optimizer is not None
-
-    _load_optimizer(
-        runtime,
-        optimizer_state_path=job.optimizer_state_path,
-        adapter_path=job.source_adapter_path,
-        adapter_step=job.source_policy_step,
-        allow_missing=(
-            job.source_policy_step == 0
-            or os.environ.get(ALLOW_UNPAIRED_MEGATRON_RESUME_ENV, "").lower()
-            in {"1", "true", "yes"}
-        ),
-    )
-
-    # Serialize the live LoRA dtype instead of perpetuating a source checkpoint's
-    # PEFT-upcast FP32 dtype.
-    runtime.adapter_export_dtypes = {}
-    runtime.adapter_export_config = load_adapter_config(job.source_adapter_path)
-    runtime.resident_training_session_id = job.training_session_id
-    runtime.resident_policy_step = job.source_policy_step
-    runtime.resident_generation_id = job.source.generation_id
-    runtime.optimizer_state_loaded = True
+    requires_optimizer = isinstance(job, (TrainJobSpec, SFTJobSpec, OptimizerJobSpec))
+    if requires_optimizer and not runtime.optimizer_state_loaded:
+        if runtime.optimizer is None:
+            runtime.optimizer = _build_optimizer(
+                runtime.model, runtime.optimizer_config
+            )
+        _load_optimizer(
+            runtime,
+            optimizer_state_path=job.optimizer_state_path,
+            adapter_path=job.source_adapter_path,
+            adapter_step=job.source_policy_step,
+            allow_missing=(
+                job.source_policy_step == 0
+                or os.environ.get(ALLOW_UNPAIRED_MEGATRON_RESUME_ENV, "").lower()
+                in {"1", "true", "yes"}
+            ),
+        )
+        runtime.optimizer_state_loaded = True
+    assert runtime.adapter_export_dtypes is not None
     return runtime.adapter_export_dtypes
 
 

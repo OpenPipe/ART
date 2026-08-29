@@ -56,9 +56,21 @@ class GradientAccumulator:
             *(self._saved_gradients or ()),
         )
 
+    @property
+    def residency_nbytes(self) -> int:
+        return sum(
+            tensor.numel() * tensor.element_size()
+            for tensor in self.residency_tensors()
+        )
+
     def before_forward_backward(self) -> None:
         if self._sealed is not None:
             raise RuntimeError("cannot add gradients to a sealed accumulator")
+        self.stash_resident()
+
+    def stash_resident(self) -> None:
+        """Move the live model gradients into this accumulator's private image."""
+
         if self._resident_tokens is None:
             return
         if self._flush_gradients is not None:
@@ -73,6 +85,7 @@ class GradientAccumulator:
                 saved.add_(gradient)
             self._saved_tokens.add_(self._resident_tokens)
         self._resident_tokens = None
+        self._zero_grad_buffers()
 
     def record(
         self,
@@ -125,21 +138,16 @@ class GradientAccumulator:
     def prepare_local_sums(self) -> AccumulatedGradientSums:
         if self._sealed is None:
             raise RuntimeError("gradient accumulator must be sealed before optimizer")
-        if self._resident_tokens is None:
-            raise RuntimeError("last gradient contribution is not resident")
-        if self._flush_gradients is not None:
-            self._flush_gradients(self.model_chunks)
+        self.stash_resident()
+        if self._saved_gradients is None or self._saved_tokens is None:
+            raise RuntimeError("gradient accumulator has no resident contributions")
         gradients = self._main_gradients()
-        local_tokens = self._resident_tokens
-        if self._saved_gradients is not None:
-            assert self._saved_tokens is not None
-            for gradient, saved in zip(gradients, self._saved_gradients, strict=True):
-                gradient.add_(saved)
-            local_tokens = local_tokens + self._saved_tokens
+        for gradient, saved in zip(gradients, self._saved_gradients, strict=True):
+            gradient.copy_(saved)
         assert self._reduction is not None
         return AccumulatedGradientSums(
             gradients=gradients,
-            local_token_count=local_tokens,
+            local_token_count=self._saved_tokens,
             expected_global_token_count=self._expected_global_tokens,
             reduction=self._reduction,
         )
@@ -158,6 +166,10 @@ class GradientAccumulator:
         return consumed
 
     def discard(self) -> None:
+        self._zero_grad_buffers()
+        self._clear()
+
+    def _zero_grad_buffers(self) -> None:
         for chunk in self.model_chunks:
             zero_grad_buffer = getattr(chunk, "zero_grad_buffer", None)
             if not callable(zero_grad_buffer):
@@ -165,7 +177,6 @@ class GradientAccumulator:
                     f"{type(chunk).__name__} has no zero_grad_buffer method"
                 )
             zero_grad_buffer()
-        self._clear()
 
     def _clear(self) -> None:
         self._operation_ids.clear()

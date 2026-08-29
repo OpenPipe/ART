@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator, Awaitable
+from dataclasses import dataclass, field
 import hashlib
 import json
 import os
@@ -19,6 +20,11 @@ from pydantic import BaseModel, ConfigDict
 from art.distributed.data_plane import PackedBatchLeaseSet
 from art.distributed.monarch_bootstrap import activate_cuda_device
 from art.distributed.specs import GpuId
+from art.training import (
+    CommandExecutionUsage,
+    OperationExecutionError,
+    UsageMeasurement,
+)
 from art.utils.cache_dirs import configure_model_cache_env
 from art.utils.lifecycle import cleanup_after_failure, consume_future_exception
 
@@ -60,6 +66,24 @@ from .specs import (
 )
 
 _MAX_CACHED_COMMAND_OPERATIONS = 65
+
+
+def _rank_command_failure(rank: int, error: BaseException) -> dict[str, Any]:
+    source = getattr(error, "source", error)
+    gpu_service_ns = getattr(error, "gpu_service_ns", None)
+    message = str(source).strip() or type(source).__name__
+    return {
+        "command_status": "failed",
+        "rank": rank,
+        "error_type": type(source).__name__,
+        "message": message[:2048],
+        "cancelled": type(source).__name__
+        in {
+            "CancelledError",
+            "TrainingCancelledError",
+        },
+        "gpu_service_ns": (int(gpu_service_ns) if gpu_service_ns is not None else None),
+    }
 
 
 class _ActorEventSink:
@@ -426,7 +450,10 @@ class MonarchTrainerActor(Actor):
 
         from .executor import MegatronTrainJobExecutor
 
-        self._executor = MegatronTrainJobExecutor(self._runtime)
+        self._executor = MegatronTrainJobExecutor(
+            self._runtime,
+            accumulator_l1_budget_bytes=runtime_spec.accumulator_l1_budget_bytes,
+        )
         self._weight_offload = WeightOffloadManager.from_config(
             model=self._runtime.model,
             rank=self._runtime.rank,
@@ -603,6 +630,7 @@ class MonarchTrainerActor(Actor):
             coordinator = self._runtime.rank == 0
             return {
                 **result,
+                "command_status": "succeeded",
                 "rank": self._runtime.rank,
                 "metrics": result["metrics"] if coordinator else {},
                 "token_logprobs": result["token_logprobs"] if coordinator else (),
@@ -612,10 +640,11 @@ class MonarchTrainerActor(Actor):
             try:
                 self._abort_command_job()
             except BaseException as cleanup_error:
-                raise BaseExceptionGroup(
-                    "F/B command and actor cleanup failed", [error, cleanup_error]
-                ) from None
-            raise
+                error.add_note(
+                    "F/B actor cleanup also failed: "
+                    f"{type(cleanup_error).__name__}: {cleanup_error}"
+                )
+            return _rank_command_failure(self._runtime.rank, error)
         finally:
             if batch is not None:
                 batch.close()
@@ -641,13 +670,14 @@ class MonarchTrainerActor(Actor):
             coordinator = self._runtime.rank == 0
             return {
                 **result,
+                "command_status": "succeeded",
                 "rank": self._runtime.rank,
                 "metrics": result["metrics"] if coordinator else {},
                 "token_logprobs": result["token_logprobs"] if coordinator else (),
             }
-        except BaseException:
+        except BaseException as error:
             self._valid = False
-            raise
+            return _rank_command_failure(self._runtime.rank, error)
         finally:
             if batch is not None:
                 batch.close()
@@ -665,6 +695,7 @@ class MonarchTrainerActor(Actor):
             result = self._executor.execute_optimizer(job)
             return {
                 **result,
+                "command_status": "succeeded",
                 "rank": self._runtime.rank,
                 "metrics": result["metrics"] if self._runtime.rank == 0 else {},
             }
@@ -673,10 +704,11 @@ class MonarchTrainerActor(Actor):
             try:
                 self._executor.discard_open_gradients()
             except BaseException as cleanup_error:
-                raise BaseExceptionGroup(
-                    "optimizer command and actor cleanup failed", [error, cleanup_error]
-                ) from None
-            raise
+                error.add_note(
+                    "optimizer actor cleanup also failed: "
+                    f"{type(cleanup_error).__name__}: {cleanup_error}"
+                )
+            return _rank_command_failure(self._runtime.rank, error)
         finally:
             if self._command_job_open:
                 self._weight_offload.after_job()
@@ -1035,6 +1067,25 @@ def _merge_resident_lora_shards(
     )
 
 
+@dataclass(slots=True)
+class _CommandRunState:
+    spec: TrainingRunSpec
+    learner_version: int
+    next_operation_sequence: int = 0
+    open_forward_backward_ids: list[str] = field(default_factory=list)
+
+
+def _command_run_identity(spec: TrainingRunSpec) -> tuple[Any, ...]:
+    return (
+        spec.run_id,
+        spec.runtime_fingerprint,
+        spec.training_session_id,
+        spec.initial_learner_version,
+        spec.initial_adapter_path,
+        spec.optimizer_state_path,
+    )
+
+
 class MonarchTrainerRun:
     def __init__(
         self,
@@ -1058,11 +1109,15 @@ class MonarchTrainerRun:
         self._rank_processes = rank_processes
         self._cp_lookahead_ports = cp_lookahead_ports
         self._learner_version = run_spec.initial_learner_version
+        self._command_runs = {
+            run_spec.run_id: _CommandRunState(
+                spec=run_spec,
+                learner_version=run_spec.initial_learner_version,
+            )
+        }
         self._jobs: dict[str, tuple[str, tuple[TrainEvent, ...]]] = {}
         self._operations: dict[str, tuple[str, dict[str, Any]]] = {}
         self._command_mode = False
-        self._next_operation_sequence = 0
-        self._open_forward_backward_ids: list[str] = []
         self._lock = asyncio.Lock()
         self._cp_lookahead_lock = asyncio.Lock()
         self._active_job_id: str | None = None
@@ -1077,11 +1132,40 @@ class MonarchTrainerRun:
 
     @property
     def learner_version(self) -> int:
-        return self._learner_version
+        state = self._command_runs.get(self.run_spec.run_id)
+        return self._learner_version if state is None else state.learner_version
 
     @property
     def valid(self) -> bool:
         return self._valid
+
+    def register_command_run(self, run_spec: TrainingRunSpec) -> None:
+        if run_spec.runtime_fingerprint != self.runtime_spec.fingerprint:
+            raise ValueError(
+                "training run does not match the trainer runtime fingerprint"
+            )
+        if self._closed or not self._valid:
+            raise RuntimeError("trainer runtime is invalid")
+        prior = self._command_runs.get(run_spec.run_id)
+        if prior is not None:
+            if _command_run_identity(prior.spec) != _command_run_identity(run_spec):
+                raise RuntimeError("run_id was reused with different trainer state")
+            return
+        if self._jobs:
+            raise RuntimeError("command runs cannot be registered after fused jobs")
+        self._command_runs[run_spec.run_id] = _CommandRunState(
+            spec=run_spec,
+            learner_version=run_spec.initial_learner_version,
+        )
+
+    async def drain_command_run(self, run_id: str) -> None:
+        async with self._lock:
+            state = self._command_runs.get(run_id)
+            if state is None:
+                return
+            if state.open_forward_backward_ids:
+                raise RuntimeError("cannot drain a run with open F/B contributions")
+            self._command_runs.pop(run_id)
 
     async def forward_backward(
         self,
@@ -1097,7 +1181,7 @@ class MonarchTrainerRun:
                 if cached[0] != job.fingerprint:
                     raise RuntimeError("operation_id was reused for a different F/B")
                 return cached[1]
-            self._validate_command(job)
+            state = self._validate_command(job)
             if batch.ref != job.batch:
                 raise ValueError("F/B batch ref does not match its leases")
             if job.batch.sequence_length != self.runtime_spec.packed_sequence_length:
@@ -1117,6 +1201,7 @@ class MonarchTrainerRun:
                     invalidate_on_error=True,
                 )
                 results = list(values.values())
+                self._raise_command_failure(results)
                 self._validate_command_results(
                     results,
                     operation_id=job.operation_id,
@@ -1140,9 +1225,12 @@ class MonarchTrainerRun:
                 await self._invalidate_after_command_failure(error)
                 raise
             result = next(result for result in results if result["rank"] == 0)
+            result["gpu_service_ns"], result["gpu_count"] = self._aggregate_gpu_service(
+                results
+            )
             self._command_mode = True
-            self._open_forward_backward_ids.append(job.operation_id)
-            self._next_operation_sequence += 1
+            state.open_forward_backward_ids.append(job.operation_id)
+            state.next_operation_sequence += 1
             self._cache_operation(job.operation_id, job.fingerprint, result)
             return result
 
@@ -1162,7 +1250,7 @@ class MonarchTrainerRun:
                         "operation_id was reused for a different forward"
                     )
                 return cached[1]
-            self._validate_command(job)
+            state = self._validate_command(job)
             if batch.ref != job.batch:
                 raise ValueError("forward batch ref does not match its leases")
             if job.batch.sequence_length != self.runtime_spec.packed_sequence_length:
@@ -1182,6 +1270,7 @@ class MonarchTrainerRun:
                     invalidate_on_error=True,
                 )
                 results = list(values.values())
+                self._raise_command_failure(results)
                 self._validate_command_results(
                     results,
                     operation_id=job.operation_id,
@@ -1200,8 +1289,11 @@ class MonarchTrainerRun:
                 await self._invalidate_after_command_failure(error)
                 raise
             result = next(result for result in results if result["rank"] == 0)
+            result["gpu_service_ns"], result["gpu_count"] = self._aggregate_gpu_service(
+                results
+            )
             self._command_mode = True
-            self._next_operation_sequence += 1
+            state.next_operation_sequence += 1
             self._cache_operation(job.operation_id, job.fingerprint, result)
             return result
 
@@ -1217,8 +1309,8 @@ class MonarchTrainerRun:
                         "operation_id was reused for a different optimizer"
                     )
                 return cached[1]
-            self._validate_command(job)
-            contributions = tuple(self._open_forward_backward_ids)
+            state = self._validate_command(job)
+            contributions = tuple(state.open_forward_backward_ids)
             if job.contributing_forward_backward_operation_ids != contributions:
                 raise RuntimeError("optimizer does not seal the exact open F/B set")
             try:
@@ -1228,6 +1320,7 @@ class MonarchTrainerRun:
                     invalidate_on_error=True,
                 )
                 results = list(values.values())
+                self._raise_command_failure(results)
                 self._validate_command_results(
                     results,
                     operation_id=job.operation_id,
@@ -1245,9 +1338,14 @@ class MonarchTrainerRun:
                 await self._invalidate_after_command_failure(error)
                 raise
             result = next(result for result in results if result["rank"] == 0)
-            self._open_forward_backward_ids.clear()
-            self._learner_version = job.learner_version
-            self._next_operation_sequence += 1
+            result["gpu_service_ns"], result["gpu_count"] = self._aggregate_gpu_service(
+                results
+            )
+            state.open_forward_backward_ids.clear()
+            state.learner_version = job.learner_version
+            state.next_operation_sequence += 1
+            if job.run_id == self.run_spec.run_id:
+                self._learner_version = job.learner_version
             self._cache_operation(job.operation_id, job.fingerprint, result)
             return result
 
@@ -1272,28 +1370,30 @@ class MonarchTrainerRun:
 
     def _validate_command(
         self, job: ForwardJobSpec | ForwardBackwardJobSpec | OptimizerJobSpec
-    ) -> None:
+    ) -> _CommandRunState:
         if self._closed or not self._valid:
             raise RuntimeError("trainer runtime is invalid")
         if self._active_job_id is not None:
             raise RuntimeError("trainer has an active operation")
         if self._jobs:
             raise RuntimeError("fused jobs cannot be mixed with command operations")
-        if job.run_id != self.run_spec.run_id:
-            raise ValueError("operation run_id does not match this training run")
-        if job.training_session_id != self.run_spec.training_session_id:
+        state = self._command_runs.get(job.run_id)
+        if state is None:
+            raise ValueError("operation run_id is not registered on this trainer slot")
+        if job.training_session_id != state.spec.training_session_id:
             raise ValueError("operation training session does not match this run")
-        if job.sequence_id != self._next_operation_sequence:
+        if job.sequence_id != state.next_operation_sequence:
             raise RuntimeError(
                 "trainer operation sequence must be gapless: "
-                f"expected={self._next_operation_sequence}, got={job.sequence_id}"
+                f"expected={state.next_operation_sequence}, got={job.sequence_id}"
             )
-        if job.expected_learner_version != self._learner_version:
+        if job.expected_learner_version != state.learner_version:
             raise ValueError(
                 "operation learner parent mismatch: "
                 f"operation={job.expected_learner_version}, "
-                f"runtime={self._learner_version}"
+                f"runtime={state.learner_version}"
             )
+        return state
 
     def _validate_command_results(
         self,
@@ -1309,6 +1409,59 @@ class MonarchTrainerRun:
             or {result["learner_version"] for result in results} != {learner_version}
         ):
             raise RuntimeError("trainer ranks disagree on command completion")
+
+    def _raise_command_failure(self, results: list[dict[str, Any]]) -> None:
+        failures = [
+            result for result in results if result.get("command_status") != "succeeded"
+        ]
+        if not failures:
+            return
+        expected_ranks = set(range(len(self.runtime_spec.trainer_mesh.ranks)))
+        complete_rank_set = {result.get("rank") for result in results} == expected_ranks
+        measured = [result.get("gpu_service_ns") for result in results]
+        complete_timing = complete_rank_set and all(
+            isinstance(value, int) and value >= 0 for value in measured
+        )
+        usage = CommandExecutionUsage(
+            logical_nonpadding_tokens=UsageMeasurement.unknown(),
+            executed_token_equivalents=UsageMeasurement.unknown(),
+            gpu_count=(
+                UsageMeasurement.complete(len(expected_ranks))
+                if complete_rank_set
+                else UsageMeasurement.unknown()
+            ),
+            gpu_service_ns=(
+                UsageMeasurement.exact_partial(max(measured))
+                if complete_timing
+                else UsageMeasurement.unknown()
+            ),
+        )
+        code = (
+            "cancelled"
+            if failures and all(result.get("cancelled") is True for result in failures)
+            else "execution_failed"
+        )
+        details = "; ".join(
+            f"rank {result.get('rank')}: {result.get('error_type')}: "
+            f"{result.get('message')}"
+            for result in failures[:4]
+        )
+        raise OperationExecutionError(code, details, usage=usage)
+
+    def _aggregate_gpu_service(self, results: list[dict[str, Any]]) -> tuple[int, int]:
+        expected_ranks = set(range(len(self.runtime_spec.trainer_mesh.ranks)))
+        if {result.get("rank") for result in results} != expected_ranks:
+            raise OperationExecutionError(
+                "execution_failed",
+                "trainer rank coverage is incomplete for GPU service",
+            )
+        measured = [result.get("gpu_service_ns") for result in results]
+        if not all(isinstance(value, int) and value >= 0 for value in measured):
+            raise OperationExecutionError(
+                "execution_failed",
+                "trainer rank GPU service timing is incomplete",
+            )
+        return max(measured), len(expected_ranks)
 
     async def prepare_cp_lookahead(
         self,
@@ -1956,16 +2109,21 @@ class MonarchTrainerRun:
             return RuntimeError("trainer runtime is invalid")
         if self._active_job_id is not None:
             return RuntimeError("trainer has an active job")
-        if self._open_forward_backward_ids:
+        if any(
+            state.open_forward_backward_ids for state in self._command_runs.values()
+        ):
             return RuntimeError("diagnostics cannot run with open gradients")
-        if run_id != self.run_spec.run_id:
-            return ValueError("diagnostic run_id does not match this training run")
-        if learner.training_session_id != self.run_spec.training_session_id:
+        state = self._command_runs.get(run_id)
+        if state is None:
+            return ValueError(
+                "diagnostic run_id is not registered on this trainer slot"
+            )
+        if learner.training_session_id != state.spec.training_session_id:
             return ValueError("diagnostic learner does not match the training session")
-        if learner.policy_step != self._learner_version:
+        if learner.policy_step != state.learner_version:
             return ValueError(
                 "diagnostic learner version mismatch: "
-                f"request={learner.policy_step}, runtime={self._learner_version}"
+                f"request={learner.policy_step}, runtime={state.learner_version}"
             )
         return None
 

@@ -331,10 +331,11 @@ class UsageMeasurement(Contract):
 
 
 class CommandExecutionUsage(Contract):
-    """ART-owned producer facts; durable accounting remains service-owned."""
+    """ART facts; GPU service is max-rank duration and count stays separate."""
 
     logical_nonpadding_tokens: UsageMeasurement
     executed_token_equivalents: UsageMeasurement
+    gpu_count: UsageMeasurement
     gpu_service_ns: UsageMeasurement
 
     @classmethod
@@ -342,6 +343,7 @@ class CommandExecutionUsage(Contract):
         return cls(
             logical_nonpadding_tokens=UsageMeasurement.unknown(),
             executed_token_equivalents=UsageMeasurement.unknown(),
+            gpu_count=UsageMeasurement.unknown(),
             gpu_service_ns=UsageMeasurement.unknown(),
         )
 
@@ -350,6 +352,7 @@ class CommandExecutionUsage(Contract):
         return cls(
             logical_nonpadding_tokens=UsageMeasurement.exact_partial(0),
             executed_token_equivalents=UsageMeasurement.exact_partial(0),
+            gpu_count=UsageMeasurement.exact_partial(0),
             gpu_service_ns=UsageMeasurement.exact_partial(0),
         )
 
@@ -358,6 +361,7 @@ class CommandExecutionUsage(Contract):
         return cls(
             logical_nonpadding_tokens=UsageMeasurement.not_applicable(),
             executed_token_equivalents=UsageMeasurement.not_applicable(),
+            gpu_count=UsageMeasurement.not_applicable(),
             gpu_service_ns=UsageMeasurement.not_applicable(),
         )
 

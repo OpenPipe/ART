@@ -4,7 +4,7 @@ import asyncio
 from dataclasses import dataclass, field
 import hashlib
 import json
-from typing import Any, Protocol, cast
+from typing import Any, Literal, Protocol, cast
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -71,6 +71,24 @@ class MegatronCheckpointOperations(Protocol):
         request: LoadStateRequest,
         operation: OperationRef,
     ) -> "MegatronLoadedState": ...
+
+    async def plan_artifacts(
+        self,
+        request: SaveWeightsForSamplerRequest | SaveStateRequest | LoadStateRequest,
+        generation: TrainerGeneration,
+    ) -> "MegatronArtifactResourcePlan": ...
+
+
+class MegatronArtifactResourcePlan(BaseModel):
+    """Checkpoint bytes reserved before a command enters service admission."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    basis: Literal["exact", "bounded"]
+    checkpoint_objects: int = Field(ge=0)
+    lora_bytes: int = Field(ge=0)
+    transfer_bytes: int = Field(ge=0)
+    storage_bytes: int = Field(ge=0)
 
 
 class MegatronLoadedState(BaseModel):
@@ -143,6 +161,10 @@ class MegatronOperationHandler:
     @property
     def generation(self) -> TrainerGeneration:
         return self._generation
+
+    @property
+    def optimizer_state_path(self) -> str:
+        return self._optimizer_state_path
 
     async def prepare_input(
         self,
@@ -273,6 +295,9 @@ class MegatronOperationHandler:
             raise RuntimeError("cannot discard packed input owned by an operation")
         await self._release_if_unowned(ref.capture_id)
 
+    async def packing_for(self, ref: PackedInputCaptureRef) -> PackingOutcome:
+        return (await self._require_capture(ref, None)).packing
+
     async def retry_releases(self) -> None:
         for capture_id in tuple(self._release_failures):
             await self._release_if_unowned(capture_id)
@@ -284,6 +309,32 @@ class MegatronOperationHandler:
             (operation_id, self._captures[capture_id].ref)
             for operation_id, capture_id in self._contributions.items()
         )
+
+    async def plan_artifacts(self, request: RunCommand) -> MegatronArtifactResourcePlan:
+        if not isinstance(
+            request,
+            (SaveWeightsForSamplerRequest, SaveStateRequest, LoadStateRequest),
+        ):
+            return MegatronArtifactResourcePlan(
+                basis="exact",
+                checkpoint_objects=0,
+                lora_bytes=0,
+                transfer_bytes=0,
+                storage_bytes=0,
+            )
+        if self.checkpoints is None:
+            raise RuntimeError("Megatron checkpoint operations are not configured")
+        return await self.checkpoints.plan_artifacts(request, self._generation)
+
+    async def aclose(self) -> None:
+        if self._contributions:
+            raise RuntimeError("cannot close a run with open F/B contributions")
+        for captured in self._captures.values():
+            captured.owners.clear()
+        for capture_id in tuple(self._captures):
+            await self._release_if_unowned(capture_id)
+        if self._captures:
+            raise RuntimeError("packed inputs remain after run drain")
 
     async def _forward(
         self,
@@ -318,7 +369,9 @@ class MegatronOperationHandler:
                 )
         except BaseException as error:
             await self._release_after_failed_execution(capture_ref.capture_id, error)
-            raise
+            if isinstance(error, OperationExecutionError):
+                raise
+            raise _dispatched_execution_error(error, self.trainer) from error
         captured.owners.add(operation.operation_id)
         if backward:
             self._contributions[operation.operation_id] = capture_ref.capture_id
@@ -329,7 +382,8 @@ class MegatronOperationHandler:
             executed_token_equivalents=UsageMeasurement.complete(
                 int(raw["executed_token_equivalents"])
             ),
-            gpu_service_ns=UsageMeasurement.unknown(),
+            gpu_count=UsageMeasurement.complete(int(raw["gpu_count"])),
+            gpu_service_ns=UsageMeasurement.complete(int(raw["gpu_service_ns"])),
         )
         result_type = ForwardBackwardResult if backward else ForwardResult
         return result_type(
@@ -354,15 +408,22 @@ class MegatronOperationHandler:
         if missing:
             raise ValueError(f"optimizer input captures are missing: {missing}")
         generation = _next_generation(self.config, operation)
-        raw = await self.trainer.optim_step(
-            OptimizerJobSpec(
-                operation=operation,
-                training_session_id=self.config.training_session_id,
-                generation=generation,
-                contributing_forward_backward_operation_ids=contributions,
-                optimizer=request.optimizer,
+        try:
+            raw = await self.trainer.optim_step(
+                OptimizerJobSpec(
+                    operation=operation,
+                    training_session_id=self.config.training_session_id,
+                    source=self._generation,
+                    optimizer_state_path=self._optimizer_state_path,
+                    generation=generation,
+                    contributing_forward_backward_operation_ids=contributions,
+                    optimizer=request.optimizer,
+                )
             )
-        )
+        except BaseException as error:
+            if isinstance(error, OperationExecutionError):
+                raise
+            raise _dispatched_execution_error(error, self.trainer) from error
         consumed = tuple(raw["contributing_forward_backward_operation_ids"])
         if consumed != contributions:
             raise RuntimeError("trainer consumed the wrong packed-input captures")
@@ -383,7 +444,12 @@ class MegatronOperationHandler:
                 checkpoint_id=generation.generation_id,
             ),
             metrics=raw.get("metrics", {}),
-            usage=CommandExecutionUsage.not_applicable(),
+            usage=CommandExecutionUsage(
+                logical_nonpadding_tokens=UsageMeasurement.not_applicable(),
+                executed_token_equivalents=UsageMeasurement.not_applicable(),
+                gpu_count=UsageMeasurement.complete(int(raw["gpu_count"])),
+                gpu_service_ns=UsageMeasurement.complete(int(raw["gpu_service_ns"])),
+            ),
         )
 
     async def _require_capture(
@@ -600,6 +666,24 @@ def _capture_manifest_sha256(
             separators=(",", ":"),
         ).encode()
     ).hexdigest()
+
+
+def _dispatched_execution_error(
+    error: BaseException, trainer: _ResidentTrainer
+) -> OperationExecutionError:
+    gpu_count = len(trainer.runtime_spec.trainer_mesh.ranks)
+    return OperationExecutionError(
+        "cancelled"
+        if isinstance(error, asyncio.CancelledError)
+        else "execution_failed",
+        str(error).strip() or type(error).__name__,
+        usage=CommandExecutionUsage(
+            logical_nonpadding_tokens=UsageMeasurement.unknown(),
+            executed_token_equivalents=UsageMeasurement.unknown(),
+            gpu_count=UsageMeasurement.complete(gpu_count),
+            gpu_service_ns=UsageMeasurement.unknown(),
+        ),
+    )
 
 
 def _packing_metrics(packed: DistributedPackedBatch) -> dict[str, float]:

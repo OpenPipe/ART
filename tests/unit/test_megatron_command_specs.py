@@ -102,6 +102,8 @@ def test_optimizer_job_requires_exact_next_generation_and_unique_inputs() -> Non
     job = OptimizerJobSpec(
         operation=operation,
         training_session_id="session",
+        source=_generation(0),
+        optimizer_state_path="/optimizer",
         generation=_generation(1),
         contributing_forward_backward_operation_ids=("fb-1", "fb-2"),
         optimizer=AdamConfig(learning_rate=1e-5),
