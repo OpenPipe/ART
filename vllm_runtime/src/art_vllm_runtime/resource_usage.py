@@ -620,8 +620,7 @@ def _patch_executor(executor_class: type[Any]) -> None:
     original_sample = executor_class.sample_tokens
 
     def execute_model(self: Any, scheduler_output: Any, non_block: bool = False) -> Any:
-        tracker: GPUServiceTracker = getattr(self, _GPU_TRACKER)
-        stages: _StageCoordinator = getattr(self, _GPU_STAGES)
+        tracker, stages = _gpu_tracking(self)
         pending = stages.register(scheduler_output)
         sequence = tracker.start(scheduler_output)
 
@@ -643,8 +642,8 @@ def _patch_executor(executor_class: type[Any]) -> None:
         return _account_future(result, finish, fail)
 
     def sample_tokens(self: Any, grammar_output: Any, non_block: bool = False) -> Any:
-        tracker: GPUServiceTracker = getattr(self, _GPU_TRACKER)
-        scheduler_output = getattr(self, _GPU_STAGES).claim()
+        tracker, stages = _gpu_tracking(self)
+        scheduler_output = stages.claim()
         sequence = tracker.start(scheduler_output)
 
         def finish(value: Any) -> Any:
@@ -662,6 +661,7 @@ def _patch_executor(executor_class: type[Any]) -> None:
         return _account_future(result, finish, fail)
 
     setattr(execute_model, "__art_resource_usage_patched__", True)
+    setattr(sample_tokens, "__art_resource_usage_patched__", True)
     executor_class.execute_model = execute_model
     executor_class.sample_tokens = sample_tokens
 
@@ -691,20 +691,31 @@ def _account_future(result: Any, finish: Any, fail: Any) -> Any:
     return accounted
 
 
-def _patch_engine_core() -> None:
+def _gpu_tracking(executor: Any) -> tuple[GPUServiceTracker, _StageCoordinator]:
+    tracker = getattr(executor, _GPU_TRACKER, None)
+    stages = getattr(executor, _GPU_STAGES, None)
+    if tracker is None and stages is None:
+        tracker = GPUServiceTracker(executor.vllm_config.parallel_config.world_size)
+        stages = _StageCoordinator()
+        setattr(executor, _GPU_TRACKER, tracker)
+        setattr(executor, _GPU_STAGES, stages)
+    if not isinstance(tracker, GPUServiceTracker) or not isinstance(
+        stages, _StageCoordinator
+    ):
+        raise RuntimeError("GPU service tracker state is invalid")
+    return tracker, stages
+
+
+def _patch_executors() -> None:
+    from vllm.v1.executor.multiproc_executor import MultiprocExecutor
+    from vllm.v1.executor.uniproc_executor import UniProcExecutor
+
+    _patch_executor(MultiprocExecutor)
+    _patch_executor(UniProcExecutor)
+
+
+def _patch_engine_core_drain() -> None:
     from vllm.v1.engine.core import EngineCore
-
-    original = EngineCore.__init__
-    if getattr(original, "__art_resource_usage_patched__", False):
-        return
-
-    def __init__(self: Any, *args: Any, **kwargs: Any) -> None:
-        original(self, *args, **kwargs)
-        _patch_executor(type(self.model_executor))
-        self.model_executor._art_gpu_tracker = GPUServiceTracker(
-            self.vllm_config.parallel_config.world_size
-        )
-        self.model_executor._art_gpu_stages = _StageCoordinator()
 
     def art_drain_usage(self: Any) -> dict[str, object]:
         tracker = getattr(self.scheduler.kv_cache_manager.block_pool, _KV_TRACKER)
@@ -713,8 +724,6 @@ def _patch_engine_core() -> None:
             "updates": tracker.take_updates(),
         }
 
-    setattr(__init__, "__art_resource_usage_patched__", True)
-    EngineCore.__init__ = __init__  # type: ignore[method-assign]
     setattr(EngineCore, "art_drain_usage", art_drain_usage)
 
 
@@ -851,6 +860,7 @@ def _patch_output_transport() -> None:
 
 def patch_resource_usage() -> None:
     _patch_scheduler()
-    _patch_engine_core()
+    _patch_executors()
+    _patch_engine_core_drain()
     _patch_kv()
     _patch_output_transport()
