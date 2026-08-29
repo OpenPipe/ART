@@ -69,13 +69,20 @@ class ExternalLoraTarget(_Record):
     operation_id: str = Field(min_length=1, max_length=255)
     training_session_id: str = Field(min_length=1, max_length=255)
     publication_id: str = Field(min_length=1, max_length=255)
-    generation_id: str = Field(min_length=1, max_length=255)
+    policy_step: int = Field(ge=0)
+    generation_id: str = Field(pattern=r"^step-\d{8,}-[0-9a-f]{32}$")
     model_identity: str = Field(min_length=1, max_length=4096)
     active_alias: str = Field(min_length=1, max_length=255)
     runtime_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
     shard_bytes: int = Field(default=64 << 20, ge=1, le=5 << 30)
     max_shards: int = Field(default=1024, ge=1, le=10_000)
     max_bytes: int = Field(default=64 << 30, ge=1)
+
+    @model_validator(mode="after")
+    def _validate_generation_step(self) -> ExternalLoraTarget:
+        if int(self.generation_id.split("-", 2)[1]) != self.policy_step:
+            raise ValueError("external LoRA generation and policy step differ")
+        return self
 
 
 class ExternalLoraTargetGrant(_Record):

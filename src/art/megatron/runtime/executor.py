@@ -40,6 +40,12 @@ from .trainer_run import EventSink
 
 if TYPE_CHECKING:
     from art.megatron.optimizer_state import OptimizerAdapter
+    from art.megatron.weights.external_lora_publish import (
+        ExternalLoraPlan,
+        ExternalLoraPublication,
+        ExternalLoraPublicationSink,
+        ExternalLoraTarget,
+    )
 
 
 class MegatronTrainJobExecutor:
@@ -312,6 +318,40 @@ class MegatronTrainJobExecutor:
 
         return inspect_resident_lora(self.runtime, request)
 
+    def publish_external_lora(
+        self,
+        target: "ExternalLoraTarget",
+        sink: "ExternalLoraPublicationSink",
+        *,
+        source_topology: str,
+    ) -> tuple[
+        "ExternalLoraPlan",
+        Future["ExternalLoraPublication | None"],
+        dict[str, float],
+    ]:
+        if self._closed:
+            raise RuntimeError("Megatron executor is closed")
+        self._publisher.raise_if_failed()
+        runtime = self.runtime
+        if (
+            runtime.resident_run_id != target.run_id
+            or runtime.resident_training_session_id != target.training_session_id
+            or runtime.resident_policy_step != target.policy_step
+            or runtime.resident_generation_id != target.generation_id
+            or runtime.adapter_export_dtypes is None
+            or runtime.adapter_export_config is None
+        ):
+            raise RuntimeError(
+                "resident trainer state does not match external LoRA target"
+            )
+        return self._publisher.submit_external(
+            target,
+            sink,
+            source_topology=source_topology,
+            adapter_dtypes=runtime.adapter_export_dtypes,
+            adapter_config=runtime.adapter_export_config,
+        )
+
     def _validate_diagnostic_runtime(self) -> None:
         if self._closed:
             raise RuntimeError("Megatron executor is closed")
@@ -453,6 +493,9 @@ class _GenerationPublisher:
         self._durability_pool = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="art-publish-durable"
         )
+        self._external_pool = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="art-publish-external"
+        )
         self._transport_sender: Any | None = None
         self._lora_layout: SafetensorsLayout | None = None
         self._failures: list[BaseException] = []
@@ -487,9 +530,8 @@ class _GenerationPublisher:
                 stager=stager,
             )
             lora_launch_s = time.perf_counter() - prepare_started
-            lora_resolve_started = time.perf_counter()
-            lora = None if lora is None else lora.resolve()
-            lora_resolve_s = time.perf_counter() - lora_resolve_started
+            if lora is not None:
+                self.runtime.optimizer_snapshot_barrier.register(lora)
             transport = self._enqueue_transport(
                 generation=job.output.generation,
                 optimizer_state_path=job.output.optimizer_state_path,
@@ -542,11 +584,69 @@ class _GenerationPublisher:
             "snapshot_pool_in_use": float(in_flight),
             "snapshot_pool_pressure": in_flight / self.capacity,
             "snapshot_lora_launch_s": lora_launch_s,
-            "snapshot_lora_resolve_s": lora_resolve_s,
             "snapshot_optimizer_launch_s": optimizer_launch_s,
             "snapshot_transport_handoff_wait_s": transport_handoff_wait_s,
             "snapshot_launch_s": time.perf_counter() - prepare_started,
         }
+
+    def submit_external(
+        self,
+        target: "ExternalLoraTarget",
+        sink: "ExternalLoraPublicationSink",
+        *,
+        source_topology: str,
+        adapter_dtypes: dict[str, Any],
+        adapter_config: dict[str, Any],
+    ) -> tuple[
+        "ExternalLoraPlan",
+        Future["ExternalLoraPublication | None"],
+        dict[str, float],
+    ]:
+        from art.megatron.weights.external_lora_publish import (
+            stage_external_lora_from_model,
+        )
+
+        wait_s, in_flight, stager = self._acquire_slot()
+        started = time.perf_counter()
+        try:
+            pending = stage_external_lora_from_model(
+                model=self.runtime.model,
+                adapter_dtypes=adapter_dtypes,
+                handler=self.runtime.model_support_handler,
+                adapter_config=adapter_config,
+                target=target,
+                source_topology=source_topology,
+                stager=stager,
+            )
+            self.runtime.optimizer_snapshot_barrier.register(pending)
+            publication = self._external_pool.submit(
+                self._publish_external, pending, sink
+            )
+            publication.add_done_callback(lambda _done: self._release_slot(stager))
+        except BaseException:
+            self._release_slot(stager)
+            raise
+        return (
+            pending.payload.plan,
+            publication,
+            {
+                "snapshot_pool_wait_s": wait_s,
+                "snapshot_pool_in_use": float(in_flight),
+                "snapshot_pool_pressure": in_flight / self.capacity,
+                "snapshot_external_prepare_s": time.perf_counter() - started,
+            },
+        )
+
+    @staticmethod
+    def _publish_external(
+        pending: Any,
+        sink: "ExternalLoraPublicationSink",
+    ) -> "ExternalLoraPublication | None":
+        from art.megatron.weights.external_lora_publish import (
+            publish_external_lora_rank,
+        )
+
+        return publish_external_lora_rank(pending.resolve(), sink)
 
     def _transport_ready(
         self,
@@ -609,6 +709,7 @@ class _GenerationPublisher:
         optimizer: Future[Any],
         publication_targets: tuple[Any, ...],
     ) -> Future[TrainerRankPublication]:
+        lora = None if lora is None else lora.resolve()
         prepared_tensors = None
         if lora is not None:
             if self._lora_layout is None:
@@ -826,6 +927,7 @@ class _GenerationPublisher:
             raise BaseExceptionGroup("trainer generation publication failed", failures)
 
     def close(self) -> None:
+        self._external_pool.shutdown(wait=True)
         self._transport_pool.shutdown(wait=True)
         self._durability_pool.shutdown(wait=True)
         if self._transport_sender is not None:
