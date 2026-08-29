@@ -83,6 +83,8 @@ from art.megatron.runtime.specs import (
     ResidentLoraInspectionSpec,
     ResidentScoreJobSpec,
     ResidentScoreShard,
+    SftForwardBackwardJobSpec,
+    SftForwardJobSpec,
     SFTJobSpec,
     TrainJobSpec,
 )
@@ -275,6 +277,8 @@ class SFTForwardBackwardState(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
     raw_loss_sum: torch.Tensor
+    new_logprobs: tuple[torch.Tensor, ...]
+    sample_indices: tuple[int | None, ...]
     prepared_micros: tuple[PreparedSFTMicroInputs, ...]
     device: torch.device
     schedule: MCoreScheduleAdapter[PreparedSFTMicroInputs]
@@ -1212,6 +1216,359 @@ def execute_megatron_dynamic_lora_forward_backward_job(
     )
 
 
+def _sft_command_step_inputs(
+    runtime: TrainingRuntime,
+    job: SftForwardBackwardJobSpec | SftForwardJobSpec,
+    batch: SFTBatchData,
+    step_index: int,
+) -> tuple[list[dict[str, torch.Tensor]], list[int | None], list[int] | None]:
+    trajectories = list(batch.trajectory_tensors)
+    global_sequences = resolve_global_grad_accumulation_sequences(
+        job.config.grad_accumulation_sequences
+    )
+    indices = build_micro_sample_indices(
+        step_index=step_index,
+        num_sequences=len(trajectories),
+        global_grad_accumulation_sequences=global_sequences,
+    )
+    topology = _infer_parallel_topology(runtime.model)
+    hybridep_token_counts = (
+        build_sft_hybridep_token_counts(
+            trajectory_tensors=trajectories,
+            step_index=step_index,
+            global_grad_accumulation_sequences=global_sequences,
+            topology=topology,
+            provider=runtime.provider,
+            model_support_handler=runtime.model_support_handler,
+        )
+        if ps.get_expert_model_parallel_world_size() > 1
+        else None
+    )
+    _ensure_hybridep_capacity(
+        runtime,
+        packed_sequence_length=max(
+            int(inputs["input_ids"].numel()) for inputs in trajectories
+        ),
+        context_parallel_size=topology.cp,
+        required_capacity=max(hybridep_token_counts or (), default=0),
+    )
+    return (
+        select_sft_micro_inputs(
+            trajectories,
+            indices,
+            _zero_contribution_sft_inputs(_clone_sft_tensors(trajectories[0])),
+        ),
+        indices,
+        hybridep_token_counts,
+    )
+
+
+def _validate_sft_command_batch(
+    job: SftForwardBackwardJobSpec | SftForwardJobSpec,
+    batch: SFTBatchData,
+) -> None:
+    if batch.fingerprint != job.batch_fingerprint:
+        raise ValueError("SFT payload fingerprint differs from its command")
+    if (
+        batch.num_tokens != job.expected_global_nonpadding_tokens
+        or batch.num_trainable_tokens != job.expected_global_loss_bearing_tokens
+    ):
+        raise ValueError("SFT payload token counts differ from its command")
+
+
+def _sft_command_result(
+    states: list[SFTForwardBackwardState],
+    batch: SFTBatchData,
+    *,
+    return_token_logprobs: bool,
+) -> tuple[torch.Tensor, tuple[torch.Tensor, ...], int]:
+    if not states:
+        raise RuntimeError("SFT command executed no schedule steps")
+    device = states[0].device
+    local_tokens = sum(
+        (
+            _local_trainable_sft_token_count_tensor(
+                state.prepared_micros, device=device
+            )
+            for state in states
+        ),
+        torch.zeros([], device=device, dtype=torch.float32),
+    )
+    raw_loss_sum = sum(
+        (state.raw_loss_sum for state in states),
+        torch.zeros([], device=device, dtype=torch.float32),
+    )
+    if torch.distributed.is_initialized():
+        group = ps.get_data_parallel_group(with_context_parallel=True)
+        torch.distributed.all_reduce(local_tokens, group=group)
+        torch.distributed.all_reduce(raw_loss_sum, group=group)
+    if int(local_tokens.item()) != batch.num_trainable_tokens:
+        raise RuntimeError(
+            "SFT command trainable-token provenance changed: "
+            f"observed={int(local_tokens.item())}, "
+            f"expected={batch.num_trainable_tokens}"
+        )
+
+    executed = torch.tensor(
+        sum(
+            state.schedule.training_workload().executed_token_equivalents
+            for state in states
+        ),
+        device=device,
+        dtype=torch.int64,
+    )
+    if torch.distributed.is_initialized():
+        torch.distributed.all_reduce(
+            executed,
+            op=torch.distributed.ReduceOp.MAX,
+        )
+    if not return_token_logprobs:
+        return raw_loss_sum / local_tokens, (), int(executed.item())
+
+    lengths = [
+        int(tensors["attention_mask"].sum().item())
+        for tensors in batch.trajectory_tensors
+    ]
+    values = states[0].new_logprobs[0].new_zeros((len(lengths), max(lengths)))
+    present = torch.zeros(len(lengths), device=device, dtype=torch.int32)
+    for state in states:
+        if len(state.new_logprobs) != len(state.sample_indices):
+            raise RuntimeError("SFT logprob/sample counts differ")
+        for sample_index, logprobs in zip(
+            state.sample_indices, state.new_logprobs, strict=True
+        ):
+            if sample_index is None:
+                continue
+            length = lengths[sample_index]
+            if int(logprobs.numel()) != length:
+                raise RuntimeError("SFT logprob length differs from its trajectory")
+            values[sample_index, :length] = logprobs.reshape(-1)
+            present[sample_index] = 1
+    if ps.get_data_parallel_world_size() > 1:
+        group = ps.get_data_parallel_group()
+        torch.distributed.all_reduce(values, group=group)
+        torch.distributed.all_reduce(present, group=group)
+    if not torch.all(present == 1):
+        raise RuntimeError("SFT command did not return every trajectory exactly once")
+    host = values.cpu()
+    return (
+        raw_loss_sum / local_tokens,
+        tuple(host[index : index + 1, :length] for index, length in enumerate(lengths)),
+        int(executed.item()),
+    )
+
+
+def _sft_command_metrics(
+    states: list[SFTForwardBackwardState],
+    *,
+    reduced_loss: torch.Tensor,
+    elapsed_s: float,
+    backward: bool,
+    dropped_trajectories: int,
+) -> dict[str, float]:
+    metrics = {
+        "loss/train": float(reduced_loss.item()),
+        "data/gradient_steps": float(len(states) if backward else 0),
+        "data/dropped_sft_trajectories": float(dropped_trajectories),
+        "time/forward_backward_s" if backward else "time/forward_s": elapsed_s,
+    }
+    for state in states:
+        for name, value in state.schedule.telemetry.metrics().items():
+            metrics[name] = metrics.get(name, 0.0) + float(value)
+    return metrics
+
+
+def execute_megatron_dynamic_lora_sft_forward_backward_job(
+    runtime: TrainingRuntime,
+    job: SftForwardBackwardJobSpec,
+    batch: SFTBatchData,
+    *,
+    slot_trainer: Any,
+    gradient_accumulator: Any,
+    cancelled: Event | None = None,
+) -> MegatronForwardBackwardJobResult:
+    """Execute one exact SFT contribution against a resident LoRA slot."""
+
+    from art.megatron.lora import LoRASlotRef, use_lora_slot
+    from art.megatron.training.gradient_accumulator import (
+        ParameterGradientAccumulator,
+    )
+
+    _validate_sft_command_batch(job, batch)
+    parameters = slot_trainer.checkpoint_slot_parameters(job.run_id)
+    internal = ParameterGradientAccumulator(parameters)
+    states: list[SFTForwardBackwardState] = []
+    global_sequences = resolve_global_grad_accumulation_sequences(
+        job.config.grad_accumulation_sequences
+    )
+    num_steps = math.ceil(batch.num_trajectories / global_sequences)
+
+    def execute() -> tuple[Any, torch.Tensor, tuple[torch.Tensor, ...], int, float]:
+        configure_moe_routing_replay(runtime)
+        started = time.perf_counter()
+        try:
+            with use_lora_slot(LoRASlotRef("checkpoint", job.run_id)):
+                for step_index in range(num_steps):
+                    if cancelled is not None and cancelled.is_set():
+                        from art.megatron.runtime.trainer_run import (
+                            TrainingCancelledError,
+                        )
+
+                        raise TrainingCancelledError("SFT F/B job was cancelled")
+                    slot_trainer.clear_checkpoint_slot_grads(job.run_id)
+                    inputs, indices, hybridep_counts = _sft_command_step_inputs(
+                        runtime, job, batch, step_index
+                    )
+                    state = run_megatron_sft_forward_backward_step(
+                        model_chunks=runtime.model,
+                        provider=runtime.provider,
+                        model_support_handler=runtime.model_support_handler,
+                        inputs=inputs,
+                        step_index=step_index,
+                        sample_index=indices,
+                        moe_routing_replay_controller=(
+                            runtime.moe_routing_replay_controller
+                        ),
+                        hybridep_token_counts=hybridep_counts,
+                        defer_grad_sync=True,
+                        return_token_logprobs=job.return_token_logprobs,
+                    )
+                    gradients = tuple(
+                        (
+                            torch.zeros_like(parameter, dtype=torch.float32)
+                            if parameter.grad is None
+                            else parameter.grad.detach().float()
+                        )
+                        for parameter in parameters
+                    )
+                    internal.record(
+                        f"{job.operation_id}:{step_index}",
+                        _local_trainable_sft_token_count_tensor(
+                            state.prepared_micros, device=state.device
+                        ),
+                        gradients,
+                        step_flags=tuple(
+                            parameter.grad is not None for parameter in parameters
+                        ),
+                        reduction="token_mean",
+                    )
+                    states.append(state)
+            internal.seal(internal.contribution_ids)
+            local_sums, step_flags = internal.prepare_local_sums()
+            gradient_accumulator.record(
+                job.operation_id,
+                local_sums.local_token_count,
+                local_sums.gradients,
+                expected_global_token_count=batch.num_trainable_tokens,
+                step_flags=step_flags,
+                reduction="token_mean",
+            )
+            internal.consume()
+            reduced_loss, logprobs, executed = _sft_command_result(
+                states,
+                batch,
+                return_token_logprobs=job.return_token_logprobs,
+            )
+            return (
+                local_sums,
+                reduced_loss,
+                logprobs,
+                executed,
+                time.perf_counter() - started,
+            )
+        finally:
+            slot_trainer.clear_checkpoint_slot_grads(job.run_id)
+
+    (local_sums, reduced_loss, logprobs, executed, elapsed), gpu_service_ns = (
+        measure_cuda_call(execute)
+    )
+    return MegatronForwardBackwardJobResult(
+        new_logprobs=logprobs,
+        local_token_count=local_sums.local_token_count,
+        completed_gradient_steps=len(states),
+        logical_nonpadding_tokens=batch.num_tokens,
+        executed_token_equivalents=executed,
+        gpu_service_ns=gpu_service_ns,
+        metrics=_sft_command_metrics(
+            states,
+            reduced_loss=reduced_loss,
+            elapsed_s=elapsed,
+            backward=True,
+            dropped_trajectories=batch.num_dropped_trajectories,
+        ),
+    )
+
+
+def execute_megatron_dynamic_lora_sft_forward_job(
+    runtime: TrainingRuntime,
+    job: SftForwardJobSpec,
+    batch: SFTBatchData,
+    *,
+    cancelled: Event | None = None,
+) -> MegatronForwardJobResult:
+    """Execute one exact forward-only SFT command against a resident LoRA slot."""
+
+    from art.megatron.lora import LoRASlotRef, use_lora_slot
+
+    _validate_sft_command_batch(job, batch)
+    states: list[SFTForwardBackwardState] = []
+    global_sequences = resolve_global_grad_accumulation_sequences(
+        job.config.grad_accumulation_sequences
+    )
+    num_steps = math.ceil(batch.num_trajectories / global_sequences)
+
+    def execute() -> tuple[torch.Tensor, tuple[torch.Tensor, ...], int, float]:
+        configure_moe_routing_replay(runtime)
+        started = time.perf_counter()
+        with use_lora_slot(LoRASlotRef("checkpoint", job.run_id)):
+            for step_index in range(num_steps):
+                if cancelled is not None and cancelled.is_set():
+                    from art.megatron.runtime.trainer_run import TrainingCancelledError
+
+                    raise TrainingCancelledError("SFT forward job was cancelled")
+                inputs, indices, hybridep_counts = _sft_command_step_inputs(
+                    runtime, job, batch, step_index
+                )
+                states.append(
+                    run_megatron_sft_forward_step(
+                        model_chunks=runtime.model,
+                        provider=runtime.provider,
+                        model_support_handler=runtime.model_support_handler,
+                        inputs=inputs,
+                        step_index=step_index,
+                        sample_index=indices,
+                        moe_routing_replay_controller=(
+                            runtime.moe_routing_replay_controller
+                        ),
+                        hybridep_token_counts=hybridep_counts,
+                        return_token_logprobs=job.return_token_logprobs,
+                    )
+                )
+        reduced_loss, logprobs, executed = _sft_command_result(
+            states,
+            batch,
+            return_token_logprobs=job.return_token_logprobs,
+        )
+        return reduced_loss, logprobs, executed, time.perf_counter() - started
+
+    (reduced_loss, logprobs, executed, elapsed), gpu_service_ns = measure_cuda_call(
+        execute
+    )
+    return MegatronForwardJobResult(
+        new_logprobs=logprobs,
+        logical_nonpadding_tokens=batch.num_tokens,
+        executed_token_equivalents=executed,
+        gpu_service_ns=gpu_service_ns,
+        metrics=_sft_command_metrics(
+            states,
+            reduced_loss=reduced_loss,
+            elapsed_s=elapsed,
+            backward=False,
+            dropped_trajectories=batch.num_dropped_trajectories,
+        ),
+    )
+
+
 def execute_megatron_rl_forward_job(
     runtime: TrainingRuntime,
     job: ForwardJobSpec,
@@ -1926,14 +2283,18 @@ def _globalize_context_parallel_logprob_batch(
     *,
     local_logprobs: list[torch.Tensor],
     attention_states: list[Any],
-    seq_len: int,
+    sequence_lengths: list[int],
 ) -> list[torch.Tensor]:
-    if len(local_logprobs) != len(attention_states):
-        raise ValueError("Context-parallel logprob/state counts differ")
+    if not (len(local_logprobs) == len(attention_states) == len(sequence_lengths)):
+        raise ValueError("Context-parallel logprob/state/length counts differ")
     trailing_shape = tuple(local_logprobs[0].shape[2:])
-    rows: list[torch.Tensor] = []
+    rows = local_logprobs[0].new_zeros(
+        (len(local_logprobs), max(sequence_lengths), *trailing_shape)
+    )
     cp_group = None
-    for values, attention_state in zip(local_logprobs, attention_states, strict=True):
+    for index, (values, attention_state, seq_len) in enumerate(
+        zip(local_logprobs, attention_states, sequence_lengths, strict=True)
+    ):
         rank_plan = getattr(attention_state, "rank_plan", None)
         micro_cp_group = getattr(attention_state, "cp_group", None)
         if rank_plan is None or micro_cp_group is None:
@@ -1947,7 +2308,6 @@ def _globalize_context_parallel_logprob_batch(
         cp_group = micro_cp_group
         if tuple(values.shape[2:]) != trailing_shape:
             raise ValueError("Context-parallel logprob trailing shapes differ")
-        row = values.new_zeros((1, seq_len, *trailing_shape))
         local_values = values.reshape(-1, *trailing_shape)
         cursor = 0
         for range_ in rank_plan.local_row_ranges:
@@ -1956,7 +2316,7 @@ def _globalize_context_parallel_logprob_batch(
             size = int(range_.size())
             if size <= 0:
                 continue
-            row[0, int(range_.start) : int(range_.end)] = local_values[
+            rows[index, int(range_.start) : int(range_.end)] = local_values[
                 cursor : cursor + size
             ]
             cursor += size
@@ -1965,13 +2325,13 @@ def _globalize_context_parallel_logprob_batch(
                 "Context-parallel reference-logprob layout did not consume all values: "
                 f"consumed={cursor}, values={local_values.shape[0]}"
             )
-        rows.append(row)
-
-    global_logprobs = torch.cat(rows)
     torch.distributed.all_reduce(  # ty: ignore[possibly-missing-attribute]
-        global_logprobs, group=cp_group
+        rows, group=cp_group
     )
-    return list(global_logprobs.split(1))
+    return [
+        rows[index : index + 1, :length]
+        for index, length in enumerate(sequence_lengths)
+    ]
 
 
 def _globalize_data_parallel_logprob_batch(
@@ -2163,7 +2523,9 @@ def _calculate_megatron_logprob_batch(
                 attention_states=[
                     prepared.attention_state for prepared in prepared_micros
                 ],
-                seq_len=int(inputs[0]["tokens"].shape[1]),
+                sequence_lengths=[
+                    int(inputs[0]["tokens"].shape[1]) for _ in prepared_micros
+                ],
             )
         host_logprobs = torch.cat(logprobs).detach().cpu()
         forward_succeeded = True
@@ -2888,7 +3250,7 @@ def _snapshot_trainable_parameters(
     return snapshot
 
 
-def run_megatron_sft_forward_backward_step(
+def _run_megatron_sft_schedule(
     *,
     model_chunks: ModelChunks,
     provider: Any,
@@ -2899,6 +3261,8 @@ def run_megatron_sft_forward_backward_step(
     moe_routing_replay_controller: MoeRoutingReplayController | None = None,
     hybridep_token_counts: list[int] | None = None,
     defer_grad_sync: bool = False,
+    forward_only: bool,
+    return_token_logprobs: bool,
 ) -> SFTForwardBackwardState:
     micro_inputs = inputs if isinstance(inputs, list) else [inputs]
     if not micro_inputs:
@@ -2931,8 +3295,9 @@ def run_megatron_sft_forward_backward_step(
         moe_routing_replay_controller,
     )
 
-    _zero_grad_buffers(model_chunks)
-    _install_schedule_finalize(model_chunks, defer_grad_sync=defer_grad_sync)
+    if not forward_only:
+        _zero_grad_buffers(model_chunks)
+        _install_schedule_finalize(model_chunks, defer_grad_sync=defer_grad_sync)
 
     pending_prepared_micro: PreparedMegatronBatch | None = None
     prepared_micros: list[PreparedSFTMicroInputs] = []
@@ -2992,22 +3357,44 @@ def run_megatron_sft_forward_backward_step(
                 output = model(**kwargs, labels=None)
                 token_output = None
 
-        def reduce_loss(output_tensor: torch.Tensor):
+        def collect(output_tensor: torch.Tensor, **_kwargs: Any):
             assert token_output is not None
             masked_loss = token_output.masked_sum(prepared.loss_mask)
-            num_tokens = _local_trainable_sft_token_count_tensor(
-                [prepared], device=device
+            values = {
+                "order": item.order,
+                "raw_loss_sum": masked_loss.detach(),
+                "logprobs": (
+                    token_output.restore(-output_tensor).detach()
+                    if return_token_logprobs
+                    else None
+                ),
+            }
+            if forward_only:
+                return values
+            return (
+                masked_loss,
+                _local_trainable_sft_token_count_tensor([prepared], device=device),
+                values,
             )
-            return masked_loss, num_tokens, {"raw_loss_sum": masked_loss.detach()}
 
-        return output, reduce_loss
+        return output, collect
 
-    forward_data_store = schedule.run(forward_step_func, forward_only=False)
+    forward_data_store = schedule.run(
+        forward_step_func,
+        forward_only=forward_only,
+        collect_non_loss_data=forward_only,
+    )
     if moe_routing_replay_controller is not None:
-        moe_routing_replay_controller.finalize_step(expect_recompute=True)
+        moe_routing_replay_controller.finalize_step(expect_recompute=not forward_only)
     forward_data_store = cast(
         list[dict[str, Any]], _broadcast_from_pipeline_last(forward_data_store)
     )
+    if len(forward_data_store) != len(prepared_micros):
+        raise RuntimeError(
+            "SFT pipeline did not return one result per local microbatch: "
+            f"expected={len(prepared_micros)}, got={len(forward_data_store)}"
+        )
+    forward_data_store.sort(key=lambda data: int(data["order"]))
     raw_loss_sum = sum(
         (
             cast(torch.Tensor, data["raw_loss_sum"]).to(device)
@@ -3015,11 +3402,82 @@ def run_megatron_sft_forward_backward_step(
         ),
         torch.zeros([], device=device, dtype=torch.float32),
     )
+    new_logprobs = [
+        cast(torch.Tensor, data["logprobs"])
+        for data in forward_data_store
+        if data["logprobs"] is not None
+    ]
+    if new_logprobs and int(topology.cp) > 1:
+        new_logprobs = _globalize_context_parallel_logprob_batch(
+            local_logprobs=new_logprobs,
+            attention_states=[prepared.attention_state for prepared in prepared_micros],
+            sequence_lengths=[
+                int(micro["attention_mask"].sum().item()) for micro in micro_inputs
+            ],
+        )
     return SFTForwardBackwardState(
         raw_loss_sum=raw_loss_sum,
+        new_logprobs=tuple(new_logprobs),
+        sample_indices=tuple(micro_sample_indices),
         prepared_micros=tuple(prepared_micros),
         device=device,
         schedule=schedule,
+    )
+
+
+def run_megatron_sft_forward_backward_step(
+    *,
+    model_chunks: ModelChunks,
+    provider: Any,
+    model_support_handler: Any,
+    inputs: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]],
+    step_index: int,
+    sample_index: int | list[int | None],
+    moe_routing_replay_controller: MoeRoutingReplayController | None = None,
+    hybridep_token_counts: list[int] | None = None,
+    defer_grad_sync: bool = False,
+    return_token_logprobs: bool = True,
+) -> SFTForwardBackwardState:
+    return _run_megatron_sft_schedule(
+        model_chunks=model_chunks,
+        provider=provider,
+        model_support_handler=model_support_handler,
+        inputs=inputs,
+        step_index=step_index,
+        sample_index=sample_index,
+        moe_routing_replay_controller=moe_routing_replay_controller,
+        hybridep_token_counts=hybridep_token_counts,
+        defer_grad_sync=defer_grad_sync,
+        forward_only=False,
+        return_token_logprobs=return_token_logprobs,
+    )
+
+
+@torch.no_grad()
+def run_megatron_sft_forward_step(
+    *,
+    model_chunks: ModelChunks,
+    provider: Any,
+    model_support_handler: Any,
+    inputs: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]],
+    step_index: int,
+    sample_index: int | list[int | None],
+    moe_routing_replay_controller: MoeRoutingReplayController | None = None,
+    hybridep_token_counts: list[int] | None = None,
+    return_token_logprobs: bool = True,
+) -> SFTForwardBackwardState:
+    return _run_megatron_sft_schedule(
+        model_chunks=model_chunks,
+        provider=provider,
+        model_support_handler=model_support_handler,
+        inputs=inputs,
+        step_index=step_index,
+        sample_index=sample_index,
+        moe_routing_replay_controller=moe_routing_replay_controller,
+        hybridep_token_counts=hybridep_token_counts,
+        forward_only=True,
+        defer_grad_sync=False,
+        return_token_logprobs=return_token_logprobs,
     )
 
 
@@ -3527,7 +3985,9 @@ def run_megatron_rl_forward_backward_step(
         new_logprobs = _globalize_context_parallel_logprob_batch(
             local_logprobs=new_logprobs,
             attention_states=[prepared.attention_state for prepared in prepared_micros],
-            seq_len=int(micro_inputs[0]["tokens"].shape[1]),
+            sequence_lengths=[
+                int(micro_inputs[0]["tokens"].shape[1]) for _ in prepared_micros
+            ],
         )
     if loss is not None:
         new_logprobs, returned_sample_indices = _globalize_data_parallel_logprob_batch(

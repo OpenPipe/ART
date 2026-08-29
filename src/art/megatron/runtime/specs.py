@@ -336,6 +336,69 @@ class ForwardJobSpec(_ForwardCommandJobSpec):
         return self
 
 
+class _SftForwardCommandJobSpec(_Spec):
+    operation: OperationRef
+    training_session_id: str = Field(min_length=1)
+    source: TrainerGeneration
+    optimizer_state_path: str = Field(min_length=1)
+    batch_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
+    expected_global_nonpadding_tokens: int = Field(ge=1)
+    expected_global_loss_bearing_tokens: int = Field(ge=1)
+    config: CurrentTrainConfig
+    return_token_logprobs: bool = True
+
+    @model_validator(mode="after")
+    def _validate_source(self) -> "_SftForwardCommandJobSpec":
+        if (
+            self.source.training_session_id != self.training_session_id
+            or self.source.policy_step != self.operation.learner_parent_version
+        ):
+            raise ValueError(
+                "source generation does not identify the SFT command parent"
+            )
+        return self
+
+    @property
+    def operation_id(self) -> str:
+        return self.operation.operation_id
+
+    @property
+    def run_id(self) -> str:
+        return self.operation.run_id
+
+    @property
+    def sequence_id(self) -> int:
+        return self.operation.sequence_id
+
+    @property
+    def expected_learner_version(self) -> int:
+        return self.operation.learner_parent_version
+
+    @property
+    def fingerprint(self) -> str:
+        return _fingerprint(self)
+
+
+class SftForwardBackwardJobSpec(_SftForwardCommandJobSpec):
+    """One supervised F/B contribution against a fixed learner."""
+
+    @model_validator(mode="after")
+    def _validate_operation(self) -> "SftForwardBackwardJobSpec":
+        if self.operation.kind != "forward_backward":
+            raise ValueError("SFT F/B job requires a forward_backward operation")
+        return self
+
+
+class SftForwardJobSpec(_SftForwardCommandJobSpec):
+    """One supervised forward-only command against a fixed learner."""
+
+    @model_validator(mode="after")
+    def _validate_operation(self) -> "SftForwardJobSpec":
+        if self.operation.kind != "forward":
+            raise ValueError("SFT forward job requires a forward operation")
+        return self
+
+
 class OptimizerJobSpec(_Spec):
     """Seal exact F/B contributions into one learner transition."""
 

@@ -25,6 +25,7 @@ from art.training import (
     RunCommand,
     SaveStateRequest,
     SaveWeightsForSamplerRequest,
+    SupervisedTrajectoryBatch,
 )
 
 from .operation_handler import (
@@ -126,6 +127,10 @@ class _SharedTrainer(Protocol):
 
     async def forward_backward(self, job: Any, batch: Any) -> dict[str, Any]: ...
 
+    async def sft_forward(self, job: Any, batch: Any) -> dict[str, Any]: ...
+
+    async def sft_forward_backward(self, job: Any, batch: Any) -> dict[str, Any]: ...
+
     async def optim_step(self, job: Any) -> dict[str, Any]: ...
 
     async def publish_external_lora(
@@ -165,6 +170,12 @@ class _SharedTrainer(Protocol):
     ) -> PortableSnapshotLoadReceipt: ...
 
     async def record_control_command(
+        self,
+        operation: OperationRef,
+        learner_version: int,
+    ) -> None: ...
+
+    async def record_no_work_command(
         self,
         operation: OperationRef,
         learner_version: int,
@@ -1136,21 +1147,38 @@ class MegatronSlotCoordinator:
         capture: PackedInputCaptureRef | None = None
         try:
             components = _components(request)
-            resource_request = MegatronSlotResourceRequest(
-                run_id=operation.run_id,
-                operation_id=operation.operation_id,
-                source=state.handler.generation,
-                optimizer_state_path=state.handler.optimizer_state_path,
-                components=components,
-            )
-            self.resources.prefetch(resource_request)
+            raw_sft = isinstance(
+                request, (ForwardRequest, ForwardBackwardRequest)
+            ) and (isinstance(request.batch, SupervisedTrajectoryBatch))
+            resource_request: MegatronSlotResourceRequest | None = None
+            if not raw_sft:
+                resource_request = MegatronSlotResourceRequest(
+                    run_id=operation.run_id,
+                    operation_id=operation.operation_id,
+                    source=state.handler.generation,
+                    optimizer_state_path=state.handler.optimizer_state_path,
+                    components=components,
+                )
+                self.resources.prefetch(resource_request)
             cost = 1
             if isinstance(request, (ForwardRequest, ForwardBackwardRequest)):
                 capture = await state.handler.prepare_input(request, operation)
                 packing = await state.handler.packing_for(capture)
                 request = request.model_copy(update={"batch": capture})
                 cost = max(1, packing.physical_tokens)
-            await self.resources.ensure(resource_request)
+                if raw_sft:
+                    resource_request = MegatronSlotResourceRequest(
+                        run_id=operation.run_id,
+                        operation_id=operation.operation_id,
+                        source=state.handler.generation,
+                        optimizer_state_path=state.handler.optimizer_state_path,
+                        components=(components if packing.loss_bearing_tokens else ()),
+                    )
+                    if resource_request.components:
+                        self.resources.prefetch(resource_request)
+            assert resource_request is not None
+            if resource_request.components:
+                await self.resources.ensure(resource_request)
             loop = asyncio.get_running_loop()
             future: asyncio.Future[OperationResultType] = loop.create_future()
             ready = _ReadyCommand(

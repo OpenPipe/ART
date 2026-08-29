@@ -77,6 +77,8 @@ from .specs import (
     ResidentScoreJobSpec,
     ResidentScoreResult,
     ResidentScoreShard,
+    SftForwardBackwardJobSpec,
+    SftForwardJobSpec,
     SFTJobSpec,
     TrainAccepted,
     TrainCancelled,
@@ -757,6 +759,75 @@ class MonarchTrainerActor(Actor):
         finally:
             if batch is not None:
                 batch.close()
+
+    @endpoint
+    def execute_sft_forward_backward(
+        self,
+        job_json: str,
+        batch: SFTBatchData,
+    ) -> dict[str, Any]:
+        try:
+            if not self._valid:
+                raise RuntimeError("trainer actor runtime is invalid")
+            job = SftForwardBackwardJobSpec.model_validate_json(job_json)
+            self._migration_release_receipts.pop(job.run_id, None)
+            if not self._command_job_open:
+                self._weight_offload.before_job()
+                self._command_job_open = True
+            result = self._run_slot_executor.execute_sft_forward_backward(
+                job, batch, Event()
+            )
+            return {
+                **result,
+                "command_status": "succeeded",
+                "rank": self._runtime.rank,
+                "metrics": result["metrics"] if self._runtime.rank == 0 else {},
+                "token_logprobs": (
+                    result["token_logprobs"] if self._runtime.rank == 0 else ()
+                ),
+            }
+        except BaseException as error:
+            self._valid = False
+            try:
+                self._abort_command_job()
+            except BaseException as cleanup_error:
+                error.add_note(
+                    "SFT F/B actor cleanup also failed: "
+                    f"{type(cleanup_error).__name__}: {cleanup_error}"
+                )
+            return _rank_command_failure(self._runtime.rank, error)
+
+    @endpoint
+    def execute_sft_forward(
+        self,
+        job_json: str,
+        batch: SFTBatchData,
+    ) -> dict[str, Any]:
+        opened_job = False
+        try:
+            if not self._valid:
+                raise RuntimeError("trainer actor runtime is invalid")
+            job = SftForwardJobSpec.model_validate_json(job_json)
+            self._migration_release_receipts.pop(job.run_id, None)
+            if not self._command_job_open:
+                self._weight_offload.before_job()
+                opened_job = True
+            result = self._run_slot_executor.execute_sft_forward(job, batch, Event())
+            return {
+                **result,
+                "command_status": "succeeded",
+                "rank": self._runtime.rank,
+                "metrics": result["metrics"] if self._runtime.rank == 0 else {},
+                "token_logprobs": (
+                    result["token_logprobs"] if self._runtime.rank == 0 else ()
+                ),
+            }
+        except BaseException as error:
+            self._valid = False
+            return _rank_command_failure(self._runtime.rank, error)
+        finally:
+            if opened_job:
+                self._weight_offload.after_job()
 
     @endpoint
     def capture_forward_backward_numerics(
@@ -1729,6 +1800,26 @@ class MonarchTrainerRun:
                 raise RuntimeError("invalid non-GPU control command transition")
             state.next_operation_sequence += 1
 
+    async def record_no_work_command(
+        self,
+        operation: OperationRef,
+        learner_version: int,
+    ) -> None:
+        async with self._lock:
+            state = self._command_runs.get(operation.run_id)
+            if state is None:
+                raise KeyError(f"trainer command run {operation.run_id!r} is absent")
+            if (
+                operation.kind not in {"forward", "forward_backward"}
+                or operation.sequence_id != state.next_operation_sequence
+                or operation.learner_parent_version != state.learner_version
+                or operation.reserved_output_learner_version is not None
+                or learner_version != state.learner_version
+            ):
+                raise RuntimeError("invalid zero-work command transition")
+            self._command_mode = True
+            state.next_operation_sequence += 1
+
     async def release_command_run_for_migration(self, run_id: str) -> None:
         async with self._lock:
             state = self._command_runs.get(run_id)
@@ -1904,6 +1995,122 @@ class MonarchTrainerRun:
             self._cache_operation(job.operation_id, job.fingerprint, result)
             return result
 
+    async def sft_forward_backward(
+        self,
+        job: SftForwardBackwardJobSpec,
+        batch: SFTBatchData,
+    ) -> dict[str, Any]:
+        cached = self._operations.get(job.operation_id)
+        if cached is not None and cached[0] == job.fingerprint:
+            return cached[1]
+        async with self._lock:
+            cached = self._operations.get(job.operation_id)
+            if cached is not None:
+                if cached[0] != job.fingerprint:
+                    raise RuntimeError(
+                        "operation_id was reused for a different SFT F/B"
+                    )
+                return cached[1]
+            state = self._validate_command(job)
+            if batch.fingerprint != job.batch_fingerprint:
+                raise ValueError("SFT F/B payload fingerprint differs from its command")
+            try:
+                values = await self._run_resident_collective(
+                    job.operation_id,
+                    self._actors.execute_sft_forward_backward.call(
+                        job.model_dump_json(), batch
+                    ),
+                    invalidate_on_error=True,
+                )
+                results = list(values.values())
+                self._raise_command_failure(results)
+                self._validate_command_results(
+                    results,
+                    operation_id=job.operation_id,
+                    learner_version=job.expected_learner_version,
+                )
+                if {result["loss_bearing_token_count"] for result in results} != {
+                    job.expected_global_loss_bearing_tokens
+                }:
+                    raise RuntimeError("trainer ranks disagree on SFT token provenance")
+                usage = {
+                    (
+                        result["completed_gradient_steps"],
+                        result["logical_nonpadding_tokens"],
+                        result["executed_token_equivalents"],
+                    )
+                    for result in results
+                }
+                if len(usage) != 1:
+                    raise RuntimeError("trainer ranks disagree on SFT execution usage")
+            except BaseException as error:
+                await self._invalidate_after_command_failure(error)
+                raise
+            result = next(result for result in results if result["rank"] == 0)
+            result["gpu_service_ns"], result["gpu_count"] = self._aggregate_gpu_service(
+                results
+            )
+            self._command_mode = True
+            state.open_forward_backward_ids.append(job.operation_id)
+            state.next_operation_sequence += 1
+            self._cache_operation(job.operation_id, job.fingerprint, result)
+            return result
+
+    async def sft_forward(
+        self,
+        job: SftForwardJobSpec,
+        batch: SFTBatchData,
+    ) -> dict[str, Any]:
+        cached = self._operations.get(job.operation_id)
+        if cached is not None and cached[0] == job.fingerprint:
+            return cached[1]
+        async with self._lock:
+            cached = self._operations.get(job.operation_id)
+            if cached is not None:
+                if cached[0] != job.fingerprint:
+                    raise RuntimeError(
+                        "operation_id was reused for a different SFT forward"
+                    )
+                return cached[1]
+            state = self._validate_command(job)
+            if batch.fingerprint != job.batch_fingerprint:
+                raise ValueError(
+                    "SFT forward payload fingerprint differs from its command"
+                )
+            try:
+                values = await self._run_resident_collective(
+                    job.operation_id,
+                    self._actors.execute_sft_forward.call(job.model_dump_json(), batch),
+                    invalidate_on_error=True,
+                )
+                results = list(values.values())
+                self._raise_command_failure(results)
+                self._validate_command_results(
+                    results,
+                    operation_id=job.operation_id,
+                    learner_version=job.expected_learner_version,
+                )
+                usage = {
+                    (
+                        result["logical_nonpadding_tokens"],
+                        result["executed_token_equivalents"],
+                    )
+                    for result in results
+                }
+                if len(usage) != 1:
+                    raise RuntimeError("trainer ranks disagree on SFT forward usage")
+            except BaseException as error:
+                await self._invalidate_after_command_failure(error)
+                raise
+            result = next(result for result in results if result["rank"] == 0)
+            result["gpu_service_ns"], result["gpu_count"] = self._aggregate_gpu_service(
+                results
+            )
+            self._command_mode = True
+            state.next_operation_sequence += 1
+            self._cache_operation(job.operation_id, job.fingerprint, result)
+            return result
+
     async def optim_step(self, job: OptimizerJobSpec) -> dict[str, Any]:
         cached = self._operations.get(job.operation_id)
         if cached is not None and cached[0] == job.fingerprint:
@@ -1976,7 +2183,14 @@ class MonarchTrainerRun:
         )
 
     def _validate_command(
-        self, job: ForwardJobSpec | ForwardBackwardJobSpec | OptimizerJobSpec
+        self,
+        job: (
+            ForwardJobSpec
+            | ForwardBackwardJobSpec
+            | SftForwardJobSpec
+            | SftForwardBackwardJobSpec
+            | OptimizerJobSpec
+        ),
     ) -> _CommandRunState:
         if self._closed or not self._valid:
             raise RuntimeError("trainer runtime is invalid")

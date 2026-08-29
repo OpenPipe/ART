@@ -109,6 +109,22 @@ class RunCommandLedger:
             self._failure = self._failure or error
             self._open_forward_backward_ids.clear()
 
+    def cancel_pending_forward_backward(
+        self, request_id: str, admission: CommandAdmission
+    ) -> None:
+        """Remove an admitted F/B that completed without producing gradients."""
+
+        record = self._records.get(request_id)
+        if record is None:
+            return
+        if record.admission != admission:
+            raise RuntimeError("F/B cancellation does not match its admission")
+        operation_id = admission.ref.operation_id
+        if admission.ref.kind != "forward_backward":
+            raise RuntimeError("only a forward_backward admission can be cancelled")
+        if operation_id in self._open_forward_backward_ids:
+            self._open_forward_backward_ids.remove(operation_id)
+
     def _admit(self, request: RunCommand, *, kind: OperationKind) -> CommandAdmission:
         self._validate_request_kind(request, kind)
         if request.run_id != self.run_id:

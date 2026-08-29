@@ -35,6 +35,8 @@ from .specs import (
     ResidentLoraInspectionSpec,
     ResidentScoreJobSpec,
     ResidentScoreShard,
+    SftForwardBackwardJobSpec,
+    SftForwardJobSpec,
     SFTJobSpec,
     TrainerGeneration,
     TrainerJobSpec,
@@ -103,6 +105,17 @@ def _command_token_logprobs(
             ).model_dump(mode="python")
         )
     return tuple(logical)
+
+
+def _sft_token_logprobs(
+    outputs: tuple[torch.Tensor, ...],
+) -> tuple[dict[str, Any], ...]:
+    return tuple(
+        TokenLogprobs.from_values(
+            values.flatten().tolist(), shape=tuple(values.shape)
+        ).model_dump(mode="python")
+        for values in outputs
+    )
 
 
 class MegatronTrainJobExecutor:
@@ -810,6 +823,72 @@ class MCoreRunSlotExecutor:
             "metrics": result.metrics,
         }
 
+    def execute_sft_forward_backward(
+        self,
+        job: SftForwardBackwardJobSpec,
+        batch: SFTBatchData,
+        cancelled: Event,
+    ) -> dict[str, Any]:
+        state = self._require_parent(job)
+        from art.megatron.train import (
+            execute_megatron_dynamic_lora_sft_forward_backward_job,
+        )
+
+        try:
+            result = execute_megatron_dynamic_lora_sft_forward_backward_job(
+                self.runtime,
+                job,
+                batch,
+                slot_trainer=self._trainer,
+                gradient_accumulator=state.gradients,
+                cancelled=cancelled,
+            )
+        except BaseException:
+            self._trainer.clear_checkpoint_slot_grads(job.run_id)
+            raise
+        self._enforce_accumulator_budget()
+        return {
+            "operation_id": job.operation_id,
+            "learner_version": job.expected_learner_version,
+            "loss_bearing_token_count": job.expected_global_loss_bearing_tokens,
+            "completed_gradient_steps": result.completed_gradient_steps,
+            "logical_nonpadding_tokens": result.logical_nonpadding_tokens,
+            "executed_token_equivalents": result.executed_token_equivalents,
+            "gpu_service_ns": result.gpu_service_ns,
+            "token_logprobs": (
+                _sft_token_logprobs(result.new_logprobs)
+                if job.return_token_logprobs
+                else ()
+            ),
+            "metrics": result.metrics,
+        }
+
+    def execute_sft_forward(
+        self,
+        job: SftForwardJobSpec,
+        batch: SFTBatchData,
+        cancelled: Event,
+    ) -> dict[str, Any]:
+        self._require_parent(job)
+        from art.megatron.train import execute_megatron_dynamic_lora_sft_forward_job
+
+        result = execute_megatron_dynamic_lora_sft_forward_job(
+            self.runtime, job, batch, cancelled=cancelled
+        )
+        return {
+            "operation_id": job.operation_id,
+            "learner_version": job.expected_learner_version,
+            "logical_nonpadding_tokens": result.logical_nonpadding_tokens,
+            "executed_token_equivalents": result.executed_token_equivalents,
+            "gpu_service_ns": result.gpu_service_ns,
+            "token_logprobs": (
+                _sft_token_logprobs(result.new_logprobs)
+                if job.return_token_logprobs
+                else ()
+            ),
+            "metrics": result.metrics,
+        }
+
     def capture_forward_backward_numerics(
         self,
         *,
@@ -951,7 +1030,14 @@ class MCoreRunSlotExecutor:
             sink.close()
 
     def _require_parent(
-        self, job: ForwardBackwardJobSpec | ForwardJobSpec | OptimizerJobSpec
+        self,
+        job: (
+            ForwardBackwardJobSpec
+            | ForwardJobSpec
+            | SftForwardBackwardJobSpec
+            | SftForwardJobSpec
+            | OptimizerJobSpec
+        ),
     ) -> _ResidentCommandRun:
         if self._closed:
             raise RuntimeError("Megatron run slot executor is closed")

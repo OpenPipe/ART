@@ -121,6 +121,18 @@ async def test_load_cannot_discard_open_gradients() -> None:
         )
 
 
+@pytest.mark.asyncio
+async def test_zero_work_forward_backward_cancels_its_contribution() -> None:
+    ledger = RunCommandLedger("run", learner_version=2)
+    admission = await ledger.admit(_forward(0, "empty"), kind="forward_backward")
+
+    ledger.cancel_pending_forward_backward("empty", admission)
+
+    assert ledger.next_sequence_id == 1
+    assert ledger.projected_learner_version == 2
+    assert ledger.open_forward_backward_operation_ids == ()
+
+
 def test_token_logprobs_preserve_candidate_shape() -> None:
     values = TokenLogprobs.from_values([-0.5, -1.0, -1.5, -2.0], shape=(2, 2))
 

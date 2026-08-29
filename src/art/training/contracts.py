@@ -404,6 +404,18 @@ class ForwardResult(OperationResult):
 
 class ForwardBackwardResult(ForwardResult):
     kind: Literal["forward_backward"] = "forward_backward"
+    produced_gradient: bool = True
+
+    @model_validator(mode="after")
+    def _validate_gradient(self) -> "ForwardBackwardResult":
+        expected = self.packing.loss_bearing_tokens > 0
+        if self.produced_gradient != expected:
+            raise ValueError("gradient production must match loss-bearing tokens")
+        if not self.produced_gradient and (
+            self.packed_input_capture is not None or self.token_logprobs
+        ):
+            raise ValueError("zero-work F/B cannot retain input or token outputs")
+        return self
 
 
 class OptimStepResult(OperationResult):
