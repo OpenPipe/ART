@@ -737,6 +737,7 @@ payload = {
     "lora_name": old.lora_name, "lora_int_id": old.lora_int_id,
     "lora_path": "new", "base_model_name": None,
     "tensorizer_config_dict": None, "is_3d_lora_weight": False,
+    "generation_id": "generation-2",
     "policy_version": 2, "update_seq": 2,
 }
 
