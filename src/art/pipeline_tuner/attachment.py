@@ -17,6 +17,7 @@ from .autotune import (
     PipelineAutotuner,
     _vllm_sample_intervals,
     _vllm_sample_max_age_s,
+    build_black_box_initial_settings,
     build_initial_settings,
     freshness_worker_limit,
     recommended_queue_size,
@@ -92,6 +93,17 @@ class PipelineAutotunerAttachment:
         self._poll_health: list[VllmMetricPollHealth] = []
         self._train_step_vllm_metrics: dict[str, tuple[float, int]] = {}
         self._sampler_error: BaseException | None = None
+        self._inference_observer: Literal["direct_vllm", "rollout_supply"] = (
+            "direct_vllm"
+        )
+        self._pending_metrics: list[PipelineMetric] = []
+        self._pending_packed_groups: list[PackedGroupObservation] = []
+        self._packed_sequence_length: int | None = None
+        self._target_packed_sequences: int | None = None
+        self._loaded_profile: PipelineAutotunerProfile | None = None
+        self._initial_settings: PipelineTuneSettings | None = None
+        self._starting_step = 0
+        self._geometry_validated = False
         self._started = False
 
     async def on_start(self, trainer: Any) -> None:
@@ -100,6 +112,15 @@ class PipelineAutotunerAttachment:
         self.trainer = trainer
         self.store = PipelineTunerProfileStore.for_model(trainer.model)
         self._validate_weight_update_mode(trainer)
+        observer = getattr(
+            trainer.backend, "pipeline_autotuner_inference_observer", None
+        )
+        if callable(observer):
+            self._inference_observer = observer()
+        if self._inference_observer == "rollout_supply":
+            self._start_rollout_supply_observer(trainer)
+            self._started = True
+            return
         initial_poll: _VllmMetricPollResult | None = None
         try:
             if self.config.mode == "online":
@@ -121,6 +142,11 @@ class PipelineAutotunerAttachment:
                 policy_age_limit_steps,
                 rollout_worker_capacity,
             )
+            if loaded is not None and loaded.inference_observer != "direct_vllm":
+                raise ValueError(
+                    "Autotuner profile inference observer does not match the local "
+                    "ART vLLM backend."
+                )
             if loaded is not None:
                 settings = self._settings_with_current_queue(
                     loaded.settings, policy_age_limit_steps
@@ -161,6 +187,16 @@ class PipelineAutotunerAttachment:
             raise
 
     async def on_metric(self, metric: PipelineMetric) -> None:
+        if self._inference_observer == "rollout_supply" and self.tuner is None:
+            if self._geometry_validated:
+                return
+            self._pending_metrics.append(metric)
+            if metric.name == "pipeline/packed_sequence_length":
+                self._packed_sequence_length = int(round(metric.value))
+            elif metric.name == "pipeline/target_packed_sequences":
+                self._target_packed_sequences = int(round(metric.value))
+            self._initialize_rollout_supply_tuner_if_ready()
+            return
         if self.tuner is None:
             return
         self._drain_metric_polls()
@@ -168,17 +204,22 @@ class PipelineAutotunerAttachment:
         decision = self.tuner.on_metric(metric)
         if decision is None:
             return
-        self._raise_if_unhealthy_metric_window(decision)
+        if self._inference_observer == "direct_vllm":
+            self._raise_if_unhealthy_metric_window(decision)
         assert self.trainer is not None
         self.trainer.apply_pipeline_settings(decision.updated)
         self._save_profile()
 
     async def on_packed_group(self, observation: PackedGroupObservation) -> None:
-        if self.tuner is not None:
+        if self.tuner is None and self._inference_observer == "rollout_supply":
+            self._pending_packed_groups.append(observation)
+        elif self.tuner is not None:
             self.tuner.on_packed_group(observation)
 
     def owns_train_step_vllm_metrics(self) -> bool:
-        return self.config.mode == "online"
+        return (
+            self.config.mode == "online" and self._inference_observer == "direct_vllm"
+        )
 
     async def on_stop(self, *, training_failed: bool = False) -> None:
         await self._stop_metric_sampler()
@@ -186,6 +227,108 @@ class PipelineAutotunerAttachment:
             self._save_profile()
         if not training_failed:
             self._raise_sampler_error()
+
+    def _start_rollout_supply_observer(self, trainer: Any) -> None:
+        assert self.store is not None
+        self._starting_step = trainer.state.next_training_step
+        policy_age_limit_steps = self._policy_age_limit_steps(trainer)
+        rollout_worker_capacity = trainer.rollout_worker_capacity
+        loaded = self._read_profile_if_requested()
+        if loaded is not None:
+            self._validate_loaded_profile_limits(loaded, rollout_worker_capacity)
+            if loaded.inference_observer != "rollout_supply":
+                raise ValueError(
+                    "Autotuner profile inference observer does not match the remote "
+                    "rollout-supply backend."
+                )
+            settings = self._settings_with_current_queue(
+                loaded.settings, policy_age_limit_steps
+            )
+            self.profile_name = self.config.profile or self.config.output_name
+            trainer._pipeline_tuner_profile = self.store.resolve(
+                self.config.profile
+            ).stem
+        else:
+            settings = build_black_box_initial_settings(
+                config=self.config,
+                policy_age_limit_steps=policy_age_limit_steps,
+                rollout_worker_capacity=rollout_worker_capacity,
+            )
+        self._loaded_profile = loaded
+        self._initial_settings = settings
+        trainer.apply_pipeline_settings(settings)
+
+    def _initialize_rollout_supply_tuner_if_ready(self) -> None:
+        if (
+            self._packed_sequence_length is None
+            or self._target_packed_sequences is None
+            or self.trainer is None
+        ):
+            return
+        trainer = self.trainer
+        policy_age_limit_steps = self._policy_age_limit_steps(trainer)
+        loaded = self._loaded_profile
+        if loaded is not None:
+            self._warn_profile_geometry(
+                loaded,
+                self._packed_sequence_length,
+                self._target_packed_sequences,
+                policy_age_limit_steps,
+            )
+        self._geometry_validated = True
+        if loaded is None:
+            exact = build_initial_settings(
+                config=self.config,
+                inference_gpu_count=1,
+                target_packed_sequences=self._target_packed_sequences,
+                policy_age_limit_steps=policy_age_limit_steps,
+                rollout_worker_capacity=trainer.rollout_worker_capacity,
+            ).model_copy(
+                update={
+                    "num_rollout_workers": self._initial_settings.num_rollout_workers
+                    if self._initial_settings is not None
+                    else trainer.num_rollout_workers
+                }
+            )
+            self._initial_settings = exact
+            trainer.apply_pipeline_settings(exact)
+        if self.config.mode != "online":
+            self._pending_metrics.clear()
+            self._pending_packed_groups.clear()
+            return
+        self.tuner = PipelineAutotuner(
+            config=self.config,
+            settings=self._initial_settings
+            or PipelineTuneSettings(
+                num_rollout_workers=trainer.num_rollout_workers,
+                min_batch_size=trainer.min_batch_size,
+                max_batch_size=trainer.max_batch_size,
+                queue_maxsize=trainer.queue_maxsize,
+                target_groups_per_step=trainer.target_groups_per_step,
+            ),
+            model_name=trainer.model.run_name,
+            backend_name=type(trainer.backend).__name__,
+            packed_sequence_length=self._packed_sequence_length,
+            target_packed_sequences=self._target_packed_sequences,
+            inference_gpu_count=None,
+            inference_observer="rollout_supply",
+            rollout_supply_observer=(
+                loaded.rollout_supply_observer if loaded is not None else None
+            ),
+            policy_age_limit_steps=policy_age_limit_steps,
+            starting_step=self._starting_step,
+            rollout_worker_capacity=trainer.rollout_worker_capacity,
+        )
+        for observation in self._pending_packed_groups:
+            self.tuner.on_packed_group(observation)
+        decision = None
+        for metric in self._pending_metrics:
+            decision = self.tuner.on_metric(metric) or decision
+        self._pending_packed_groups.clear()
+        self._pending_metrics.clear()
+        if decision is not None:
+            trainer.apply_pipeline_settings(decision.updated)
+        self._save_profile()
 
     def _start_metric_sampler(self) -> None:
         if self._sampler_thread is not None:
@@ -514,10 +657,29 @@ class PipelineAutotunerAttachment:
         policy_age_limit_steps: float,
         rollout_worker_capacity: int | None,
     ) -> PipelineAutotunerProfile | None:
+        profile = self._read_profile_if_requested()
+        if profile is None:
+            return None
+        self._validate_loaded_profile_limits(profile, rollout_worker_capacity)
+        self._warn_profile_geometry(
+            profile,
+            active_packed_sequence_length,
+            target_packed_sequences,
+            policy_age_limit_steps,
+        )
+        return profile
+
+    def _read_profile_if_requested(self) -> PipelineAutotunerProfile | None:
         if self.config.mode == "online" and not self.config.profile:
             return None
         assert self.store is not None
-        profile = self.store.load(self.config.profile)
+        return self.store.load(self.config.profile)
+
+    def _validate_loaded_profile_limits(
+        self,
+        profile: PipelineAutotunerProfile,
+        rollout_worker_capacity: int | None,
+    ) -> None:
         if profile.settings.num_rollout_workers > self.config.max_rollout_workers:
             raise ValueError(
                 "Autotuner profile requests "
@@ -534,6 +696,14 @@ class PipelineAutotunerAttachment:
                 f"num_rollout_workers={profile.settings.num_rollout_workers}, above "
                 f"current rollout executor capacity {rollout_worker_capacity}."
             )
+
+    @staticmethod
+    def _warn_profile_geometry(
+        profile: PipelineAutotunerProfile,
+        active_packed_sequence_length: int,
+        target_packed_sequences: int,
+        policy_age_limit_steps: float,
+    ) -> None:
         if (
             profile.packed_sequence_length is not None
             and profile.packed_sequence_length != active_packed_sequence_length
@@ -567,7 +737,6 @@ class PipelineAutotunerAttachment:
                 "the active limit.",
                 stacklevel=2,
             )
-        return profile
 
     def _settings_with_current_queue(
         self, settings: PipelineTuneSettings, policy_age_limit_steps: float

@@ -43,6 +43,11 @@ class PipelineAutotuneConfig(pydantic.BaseModel):
     initial_model_calls_per_inference_gpu: int = pydantic.Field(default=8, ge=1)
     initial_min_groups_per_packed_sequence: int = pydantic.Field(default=8, ge=1)
     initial_max_groups_per_packed_sequence: int = pydantic.Field(default=8, ge=1)
+    black_box_initial_rollout_workers: int = pydantic.Field(default=16, ge=1)
+    black_box_history_windows: int = pydantic.Field(default=64, ge=4)
+    black_box_decay_half_life_windows: float = pydantic.Field(default=8.0, gt=0.0)
+    black_box_min_supply_gain_ratio: float = pydantic.Field(default=0.03, ge=0.0)
+    black_box_decision_probability: float = pydantic.Field(default=0.60, gt=0.5, lt=1.0)
     packing_trials: int = pydantic.Field(default=48, ge=16)
     packing_reservoir_multiplier: int = pydantic.Field(default=2, ge=2)
     packing_reservoir_min_groups: int = pydantic.Field(default=32, ge=16)
@@ -118,6 +123,17 @@ class PackingLeafShape(pydantic.BaseModel):
     token_ids: array
     shareable_length: int = pydantic.Field(ge=0)
 
+    @pydantic.field_validator("token_ids", mode="before")
+    @classmethod
+    def deserialize_token_ids(cls, value: object) -> object:
+        if isinstance(value, list):
+            return array("I", value)
+        return value
+
+    @pydantic.field_serializer("token_ids", when_used="json")
+    def serialize_token_ids(self, value: array) -> list[int]:
+        return value.tolist()
+
     @pydantic.model_validator(mode="after")
     def validate_shape(self) -> "PackingLeafShape":
         if self.token_ids.typecode != "I":
@@ -143,6 +159,17 @@ class TunerWindowStats(pydantic.BaseModel):
     collect_batch_s: float = 0.0
     trainer_underfeed_score: float = 0.0
     vllm_pressure: float = 0.0
+    inference_load_state: Literal[
+        "underloaded", "balanced", "saturated", "unknown", "settling"
+    ] = "unknown"
+    inference_load_confidence: float = pydantic.Field(default=0.0, ge=0.0, le=1.0)
+    inference_supply_groups_per_s: float = pydantic.Field(default=0.0, ge=0.0)
+    inference_supply_completed_groups: float = pydantic.Field(default=0.0, ge=0.0)
+    inference_supply_errored_groups: float = pydantic.Field(default=0.0, ge=0.0)
+    inference_supply_latency_p50_s: float = pydantic.Field(default=0.0, ge=0.0)
+    inference_supply_latency_p95_s: float = pydantic.Field(default=0.0, ge=0.0)
+    inference_supply_trial_ratio: float | None = pydantic.Field(default=None, ge=0.0)
+    inference_revert_to_workers: int | None = pydantic.Field(default=None, ge=1)
     vllm_waiting_capacity_request_s: float = pydantic.Field(default=0.0, ge=0.0)
     vllm_running_request_s: float = pydantic.Field(default=0.0, ge=0.0)
     queue_put_wait_frac: float = 0.0
@@ -177,9 +204,48 @@ class PipelineAutotunerProfile(pydantic.BaseModel):
     packed_sequence_length: int | None = None
     target_packed_sequences: int | None = None
     inference_gpu_count: int | None = None
+    inference_observer: Literal["direct_vllm", "rollout_supply"] = "direct_vllm"
+    rollout_supply_observer: "RolloutSupplyObserverState | None" = None
     rollout_worker_capacity: int | None = pydantic.Field(default=None, ge=1)
     policy_age_limit_steps: float | None = None
     settings: PipelineTuneSettings
     config: PipelineAutotuneConfig
     decisions: list[TunerDecision] = pydantic.Field(default_factory=list)
     notes: list[str] = pydantic.Field(default_factory=list)
+
+
+class RolloutSupplyWindow(pydantic.BaseModel):
+    end_step: int = pydantic.Field(ge=1)
+    workers: int = pydantic.Field(ge=1)
+    duration_s: float = pydantic.Field(gt=0.0)
+    completed_groups: float = pydantic.Field(ge=0.0)
+    errored_groups: float = pydantic.Field(ge=0.0)
+    latency_p50_s: float = pydantic.Field(ge=0.0)
+    latency_p95_s: float = pydantic.Field(ge=0.0)
+
+
+class RolloutSupplyTrial(pydantic.BaseModel):
+    baseline_workers: int = pydantic.Field(ge=1)
+    trial_workers: int = pydantic.Field(ge=1)
+    started_step: int = pydantic.Field(ge=1)
+
+
+class RolloutSupplyEvidence(pydantic.BaseModel):
+    workers: int = pydantic.Field(ge=1)
+    end_step: int = pydantic.Field(ge=1)
+    confidence: float = pydantic.Field(ge=0.0, le=1.0)
+
+
+class RolloutSupplyObserverState(pydantic.BaseModel):
+    windows: list[RolloutSupplyWindow] = pydantic.Field(default_factory=list)
+    trial: RolloutSupplyTrial | None = None
+    successful: RolloutSupplyEvidence | None = None
+    saturated: RolloutSupplyEvidence | None = None
+
+
+class InferenceLoadObservation(pydantic.BaseModel):
+    state: Literal["underloaded", "balanced", "saturated", "unknown", "settling"]
+    confidence: float = pydantic.Field(ge=0.0, le=1.0)
+    supply_groups_per_s: float = pydantic.Field(ge=0.0)
+    trial_ratio: float | None = pydantic.Field(default=None, ge=0.0)
+    revert_to_workers: int | None = pydantic.Field(default=None, ge=1)

@@ -97,6 +97,9 @@ class ServerlessBackend:
     def logs_sft_metrics_remotely(self) -> bool:
         return True
 
+    def pipeline_autotuner_inference_observer(self) -> Literal["rollout_supply"]:
+        return "rollout_supply"
+
     async def close(self) -> None:
         await self._client.close()  # ty:ignore[possibly-missing-attribute]
 

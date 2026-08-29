@@ -5,7 +5,7 @@ from collections.abc import Sequence
 import math
 import random
 import statistics
-from typing import cast
+from typing import Any, Literal, cast
 import warnings
 
 import pydantic
@@ -16,9 +16,12 @@ from .config import (
     PipelineAutotunerProfile,
     PipelineMetric,
     PipelineTuneSettings,
+    RolloutSupplyObserverState,
+    RolloutSupplyWindow,
     TunerDecision,
     TunerWindowStats,
 )
+from .inference import RolloutSupplyInferenceObserver
 
 
 def _mean(values: list[float]) -> float:
@@ -129,7 +132,9 @@ class PipelineAutotuner:
         backend_name: str | None,
         packed_sequence_length: int,
         target_packed_sequences: int,
-        inference_gpu_count: int,
+        inference_gpu_count: int | None,
+        inference_observer: Literal["direct_vllm", "rollout_supply"] = "direct_vllm",
+        rollout_supply_observer: RolloutSupplyObserverState | None = None,
         policy_age_limit_steps: float,
         starting_step: int = 0,
         rollout_worker_capacity: int | None = None,
@@ -148,6 +153,12 @@ class PipelineAutotuner:
         self.packed_sequence_length = packed_sequence_length
         self.target_packed_sequences = max(1, int(target_packed_sequences))
         self.inference_gpu_count = inference_gpu_count
+        self.inference_observer = inference_observer
+        self._rollout_supply_observer = (
+            RolloutSupplyInferenceObserver(config, rollout_supply_observer)
+            if inference_observer == "rollout_supply"
+            else None
+        )
         self.policy_age_limit_steps = policy_age_limit_steps
         self.rollout_worker_capacity = rollout_worker_capacity
         self.metrics: list[PipelineMetric] = []
@@ -327,17 +338,83 @@ class PipelineAutotuner:
             by_step=by_step,
             window_steps=window_steps,
         )
-        if not vllm_pressure_samples:
-            vllm_pressure_samples = _vllm_samples_from_metrics(vllm_metrics)
-        waiting_capacity_request_s, running_request_s = (
-            _vllm_request_seconds_from_samples(
-                vllm_pressure_samples,
-                window_start_s=t0,
-                window_end_s=t1,
-                metric_interval_s=self.config.vllm_metric_interval_s,
-                min_coverage=1.0 - self.config.vllm_metric_timeout_window_frac,
+        inference_metrics: dict[str, Any]
+        if self._rollout_supply_observer is None:
+            if not vllm_pressure_samples:
+                vllm_pressure_samples = _vllm_samples_from_metrics(vllm_metrics)
+            waiting_capacity_request_s, running_request_s = (
+                _vllm_request_seconds_from_samples(
+                    vllm_pressure_samples,
+                    window_start_s=t0,
+                    window_end_s=t1,
+                    metric_interval_s=self.config.vllm_metric_interval_s,
+                    min_coverage=1.0 - self.config.vllm_metric_timeout_window_frac,
+                )
             )
-        )
+            pressure = _vllm_pressure_ratio(
+                waiting_capacity_request_s, running_request_s
+            )
+            inference_metrics = {
+                "vllm_pressure": pressure,
+                "vllm_waiting_capacity_request_s": waiting_capacity_request_s,
+                "vllm_running_request_s": running_request_s,
+                "inference_load_state": (
+                    "saturated"
+                    if pressure > self.config.vllm_pressure_over_ratio
+                    else "underloaded"
+                    if pressure <= self.config.vllm_pressure_under_ratio
+                    else "balanced"
+                ),
+                "inference_load_confidence": 1.0,
+            }
+        else:
+            completed = _required_step_values(
+                by_step, window_steps, "rollout/step/completed_groups"
+            )
+            errored = _required_step_values(
+                by_step, window_steps, "rollout/step/errored_groups"
+            )
+            latency_p50 = _required_step_values(
+                by_step, window_steps, "rollout/step/latency_p50_s"
+            )
+            latency_p95 = _required_step_values(
+                by_step, window_steps, "rollout/step/latency_p95_s"
+            )
+            completed_total = sum(completed)
+
+            def weighted_latency(values: list[float]) -> float:
+                return (
+                    sum(
+                        value * count
+                        for value, count in zip(values, completed, strict=True)
+                    )
+                    / completed_total
+                    if completed_total > 0.0
+                    else 0.0
+                )
+
+            observation = self._rollout_supply_observer.observe(
+                RolloutSupplyWindow(
+                    end_step=window_steps[-1],
+                    workers=self.settings.num_rollout_workers,
+                    duration_s=max(wall, 1e-9),
+                    completed_groups=completed_total,
+                    errored_groups=sum(errored),
+                    latency_p50_s=weighted_latency(latency_p50),
+                    latency_p95_s=weighted_latency(latency_p95),
+                )
+            )
+            inference_metrics = {
+                "inference_load_state": observation.state,
+                "inference_load_confidence": observation.confidence,
+                "inference_supply_groups_per_s": observation.supply_groups_per_s,
+                "inference_supply_completed_groups": completed_total,
+                "inference_supply_errored_groups": sum(errored),
+                "inference_supply_latency_p50_s": weighted_latency(latency_p50),
+                "inference_supply_latency_p95_s": weighted_latency(latency_p95),
+                "inference_supply_trial_ratio": observation.trial_ratio,
+                "inference_revert_to_workers": observation.revert_to_workers,
+            }
         return TunerWindowStats(
             start_step=window_steps[0],
             end_step=window_steps[-1],
@@ -348,11 +425,7 @@ class PipelineAutotuner:
                 idle_frac=trainer_idle_frac,
                 unused_and_dummy_ratio=unused_and_dummy_ratio_mean,
             ),
-            vllm_pressure=_vllm_pressure_ratio(
-                waiting_capacity_request_s, running_request_s
-            ),
-            vllm_waiting_capacity_request_s=waiting_capacity_request_s,
-            vllm_running_request_s=running_request_s,
+            **inference_metrics,
             queue_put_wait_frac=queue_put_wait_s
             / max(queue_put_wait_s + rollout_s, 1e-9),
             predicted_stale_frac=_mean(step_values("queue/predicted_stale_fraction")),
@@ -405,7 +478,11 @@ class PipelineAutotuner:
         }
 
     def _decide(self, stats: TunerWindowStats) -> TunerDecision:
-        inference_over = stats.vllm_pressure > self.config.vllm_pressure_over_ratio
+        inference_over = (
+            stats.vllm_pressure > self.config.vllm_pressure_over_ratio
+            if self.inference_observer == "direct_vllm"
+            else stats.inference_load_state == "saturated"
+        )
         trainer_under = (
             stats.trainer_underfeed_score > self.config.trainer_load_under_score
         )
@@ -413,8 +490,16 @@ class PipelineAutotuner:
             stats.trainer_underfeed_score <= self.config.trainer_load_over_score
         )
         inference_under = (
-            not inference_over
-            and stats.vllm_pressure <= self.config.vllm_pressure_under_ratio
+            stats.vllm_pressure <= self.config.vllm_pressure_under_ratio
+            if self.inference_observer == "direct_vllm"
+            else stats.inference_load_state == "underloaded"
+        )
+        inference_balanced = not inference_over and not inference_under
+        black_box_probe = (
+            self.inference_observer == "rollout_supply"
+            and stats.inference_load_state == "unknown"
+            and stats.trainer_underfeed_score
+            >= self.config.trainer_load_severe_under_score
         )
         inference_state = (
             "inference_over"
@@ -422,6 +507,8 @@ class PipelineAutotuner:
             else "inference_under"
             if inference_under
             else "inference_balanced"
+            if self.inference_observer == "direct_vllm"
+            else f"inference_{stats.inference_load_state}"
         )
         trainer_state = (
             "train_under"
@@ -447,7 +534,17 @@ class PipelineAutotuner:
         pending_worker_action = "hold"
         reason = "inside hysteresis band or already balanced"
 
-        if stale_backlog_active and updated.min_batch_size < updated.max_batch_size:
+        if (
+            stats.inference_revert_to_workers is not None
+            and updated.num_rollout_workers > stats.inference_revert_to_workers
+        ):
+            self._clear_worker_load_candidate()
+            updated = updated.model_copy(
+                update={"num_rollout_workers": stats.inference_revert_to_workers}
+            )
+            action = "revert_worker_probe"
+            reason = "additional rollout workers did not increase rollout supply"
+        elif stale_backlog_active and updated.min_batch_size < updated.max_batch_size:
             self._clear_worker_load_candidate()
             updated = updated.model_copy(
                 update={
@@ -498,10 +595,11 @@ class PipelineAutotuner:
         elif stats.queue_put_wait_frac >= self.config.queue_put_severe_frac:
             self._clear_worker_load_candidate()
             reason = "completed-group queue backpressure is active"
-        elif state in {
-            "inference_under_train_under",
-            "inference_balanced_train_under",
-        }:
+        elif trainer_under and (
+            inference_under
+            or (self.inference_observer == "direct_vllm" and inference_balanced)
+            or black_box_probe
+        ):
             pending_worker_action = "increase_workers"
             if self._worker_load_change_ready(+1):
                 updated = updated.model_copy(
@@ -512,7 +610,11 @@ class PipelineAutotuner:
                     }
                 )
                 action = pending_worker_action
-                reason = "sustained vLLM pressure is low and trainer is underfed"
+                reason = (
+                    "rollout supply supports a bounded worker probe"
+                    if self.inference_observer == "rollout_supply"
+                    else "sustained vLLM pressure is low and trainer is underfed"
+                )
             else:
                 reason = self._pending_worker_load_reason("increase")
         elif state == "inference_over_train_over":
@@ -729,8 +831,16 @@ class PipelineAutotuner:
         stats = decision.stats
         if stats is None:
             return []
-        vllm_saturated = stats.vllm_pressure > self.config.vllm_pressure_over_ratio
-        vllm_underloaded = stats.vllm_pressure <= self.config.vllm_pressure_under_ratio
+        inference_saturated = (
+            stats.vllm_pressure > self.config.vllm_pressure_over_ratio
+            if self.inference_observer == "direct_vllm"
+            else stats.inference_load_state == "saturated"
+        )
+        inference_underloaded = (
+            stats.vllm_pressure <= self.config.vllm_pressure_under_ratio
+            if self.inference_observer == "direct_vllm"
+            else stats.inference_load_state == "underloaded"
+        )
         trainer_severely_underloaded = (
             stats.trainer_underfeed_score >= self.config.trainer_load_severe_under_score
         )
@@ -738,20 +848,20 @@ class PipelineAutotuner:
             stats.trainer_underfeed_score <= self.config.trainer_load_over_score
         )
         recommendations: list[tuple[str, str]] = []
-        if vllm_saturated and trainer_severely_underloaded:
+        if inference_saturated and trainer_severely_underloaded:
             recommendations.append(
                 (
                     "increase_inference_gpus",
-                    "Pipeline autotuner observes saturated vLLM request pressure "
+                    "Pipeline autotuner observes saturated inference supply "
                     "while Megatron is severely underloaded; increase inference GPUs "
                     "if possible.",
                 )
             )
-        if vllm_underloaded and trainer_saturated:
+        if inference_underloaded and trainer_saturated:
             recommendations.append(
                 (
                     "increase_group_size_or_training_gpus",
-                    "Pipeline autotuner observes severely underloaded vLLM request "
+                    "Pipeline autotuner observes severely underloaded inference "
                     "pressure while Megatron is saturated; increase rollout group "
                     "size to use spare inference capacity, or increase training GPUs "
                     "if possible.",
@@ -760,13 +870,13 @@ class PipelineAutotuner:
         if (
             stats.unused_and_dummy_ratio_mean >= self.config.unused_and_dummy_high_frac
             and trainer_saturated
-            and vllm_saturated
+            and inference_saturated
         ):
             recommendations.append(
                 (
                     "decrease_packed_sequence_length",
                     "Pipeline autotuner observes high unused or dummy capacity while "
-                    "Megatron and vLLM "
+                    "Megatron and inference "
                     "are both saturated; decrease packed_sequence_length to reduce "
                     "schedule waste.",
                 )
@@ -1095,6 +1205,12 @@ class PipelineAutotuner:
             packed_sequence_length=self.packed_sequence_length,
             target_packed_sequences=self.target_packed_sequences,
             inference_gpu_count=self.inference_gpu_count,
+            inference_observer=self.inference_observer,
+            rollout_supply_observer=(
+                self._rollout_supply_observer.snapshot()
+                if self._rollout_supply_observer is not None
+                else None
+            ),
             rollout_worker_capacity=self.rollout_worker_capacity,
             policy_age_limit_steps=self.policy_age_limit_steps,
             settings=self.settings,
@@ -1166,6 +1282,33 @@ def build_initial_settings(
         queue_maxsize=queue,
         target_groups_per_step=max_batch,
     )
+
+
+def build_black_box_initial_settings(
+    *,
+    config: PipelineAutotuneConfig,
+    policy_age_limit_steps: float,
+    rollout_worker_capacity: int | None,
+) -> PipelineTuneSettings:
+    settings = build_initial_settings(
+        config=config,
+        inference_gpu_count=1,
+        target_packed_sequences=1,
+        policy_age_limit_steps=policy_age_limit_steps,
+        rollout_worker_capacity=rollout_worker_capacity,
+    )
+    workers = min(config.black_box_initial_rollout_workers, config.max_rollout_workers)
+    if rollout_worker_capacity is not None:
+        workers = min(workers, rollout_worker_capacity)
+    worker_limit = freshness_worker_limit(
+        target_groups_per_step=settings.target_groups_per_step,
+        limit_steps_off_policy=policy_age_limit_steps,
+        running_reserve_fraction=config.queue_running_reserve_fraction,
+        worker_step=config.worker_step,
+    )
+    if worker_limit is not None:
+        workers = min(workers, worker_limit)
+    return settings.model_copy(update={"num_rollout_workers": max(1, workers)})
 
 
 def freshness_worker_limit(
