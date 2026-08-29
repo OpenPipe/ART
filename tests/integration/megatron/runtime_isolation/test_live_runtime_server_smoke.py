@@ -1,3 +1,4 @@
+import asyncio
 import json
 import os
 from pathlib import Path
@@ -214,12 +215,19 @@ async def test_external_runtime_server_live_smoke(
                 f"/art/internal/v1/requests/{'e' * 64}",
                 headers=endpoint.runtime_headers(),
             )
-            usage_response = await client.get(
-                "/art/internal/v1/usage",
-                headers=endpoint.runtime_headers(),
-            )
-            usage_response.raise_for_status()
-            usage_page = usage_response.json()
+            usage_page = {}
+            for _ in range(100):
+                usage_response = await client.get(
+                    "/art/internal/v1/usage",
+                    headers=endpoint.runtime_headers(),
+                )
+                usage_response.raise_for_status()
+                usage_page = usage_response.json()
+                if usage_page["high_watermark_sequence"] == 1:
+                    break
+                await asyncio.sleep(0.05)
+            else:
+                raise AssertionError(f"terminal usage was not published: {usage_page}")
             duplicate_private_completion = await client.post(
                 endpoint.url.path,
                 headers=endpoint.request_headers(
