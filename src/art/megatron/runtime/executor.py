@@ -128,6 +128,9 @@ class MegatronTrainJobExecutor:
             "operation_id": job.operation_id,
             "learner_version": job.expected_learner_version,
             "loss_bearing_token_count": job.expected_global_loss_bearing_tokens,
+            "completed_gradient_steps": result.completed_gradient_steps,
+            "logical_nonpadding_tokens": result.logical_nonpadding_tokens,
+            "executed_token_equivalents": result.executed_token_equivalents,
             "token_logprobs": tuple(
                 TokenLogprobs.from_values(
                     values.detach()

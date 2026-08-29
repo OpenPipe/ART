@@ -276,6 +276,9 @@ class MegatronForwardBackwardJobResult(BaseModel):
 
     new_logprobs: tuple[torch.Tensor, ...]
     local_token_count: torch.Tensor
+    completed_gradient_steps: int = Field(ge=0)
+    logical_nonpadding_tokens: int = Field(ge=0)
+    executed_token_equivalents: int = Field(ge=0)
     metrics: dict[str, float] = Field(default_factory=dict)
 
 
@@ -1017,6 +1020,13 @@ def execute_megatron_rl_forward_backward_job(
             )
         ),
         local_token_count=local_sums.local_token_count,
+        completed_gradient_steps=len(results),
+        logical_nonpadding_tokens=sum(
+            result.workload.logical_nonpadding_tokens for result in results
+        ),
+        executed_token_equivalents=sum(
+            result.workload.executed_token_equivalents for result in results
+        ),
         metrics={
             "time/forward_backward_s": sum(durations),
             "time/job_prepare_s": job_prepare_s,

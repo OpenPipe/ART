@@ -1091,6 +1091,16 @@ class MonarchTrainerRun:
                     job.expected_global_loss_bearing_tokens
                 }:
                     raise RuntimeError("trainer ranks disagree on F/B token provenance")
+                usage = {
+                    (
+                        result["completed_gradient_steps"],
+                        result["logical_nonpadding_tokens"],
+                        result["executed_token_equivalents"],
+                    )
+                    for result in results
+                }
+                if len(usage) != 1:
+                    raise RuntimeError("trainer ranks disagree on F/B execution usage")
             except BaseException as error:
                 await self._invalidate_after_command_failure(error)
                 raise

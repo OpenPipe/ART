@@ -274,9 +274,74 @@ class TokenLogprobs(Contract):
         return buffer.tolist()
 
 
+UsageCoverage = Literal["complete", "exact_partial", "unknown", "not_applicable"]
+
+
+class UsageMeasurement(Contract):
+    coverage: UsageCoverage
+    value: int | None = Field(default=None, ge=0)
+
+    @model_validator(mode="after")
+    def _validate_coverage(self) -> "UsageMeasurement":
+        if (self.coverage in {"complete", "exact_partial"}) != (self.value is not None):
+            raise ValueError("known usage coverage requires a value")
+        return self
+
+    @classmethod
+    def complete(cls, value: int) -> "UsageMeasurement":
+        return cls(coverage="complete", value=value)
+
+    @classmethod
+    def exact_partial(cls, value: int) -> "UsageMeasurement":
+        return cls(coverage="exact_partial", value=value)
+
+    @classmethod
+    def unknown(cls) -> "UsageMeasurement":
+        return cls(coverage="unknown")
+
+    @classmethod
+    def not_applicable(cls) -> "UsageMeasurement":
+        return cls(coverage="not_applicable")
+
+
+class CommandExecutionUsage(Contract):
+    """ART-owned producer facts; durable accounting remains service-owned."""
+
+    logical_nonpadding_tokens: UsageMeasurement
+    executed_token_equivalents: UsageMeasurement
+    gpu_service_ns: UsageMeasurement
+
+    @classmethod
+    def unknown(cls) -> "CommandExecutionUsage":
+        return cls(
+            logical_nonpadding_tokens=UsageMeasurement.unknown(),
+            executed_token_equivalents=UsageMeasurement.unknown(),
+            gpu_service_ns=UsageMeasurement.unknown(),
+        )
+
+    @classmethod
+    def no_work(cls) -> "CommandExecutionUsage":
+        return cls(
+            logical_nonpadding_tokens=UsageMeasurement.exact_partial(0),
+            executed_token_equivalents=UsageMeasurement.exact_partial(0),
+            gpu_service_ns=UsageMeasurement.exact_partial(0),
+        )
+
+    @classmethod
+    def not_applicable(cls) -> "CommandExecutionUsage":
+        return cls(
+            logical_nonpadding_tokens=UsageMeasurement.not_applicable(),
+            executed_token_equivalents=UsageMeasurement.not_applicable(),
+            gpu_service_ns=UsageMeasurement.not_applicable(),
+        )
+
+
 class OperationResult(Contract):
     operation_id: str = Field(min_length=1, max_length=64)
     metrics: dict[str, FiniteFloat] = Field(default_factory=dict)
+    usage: CommandExecutionUsage = Field(
+        default_factory=CommandExecutionUsage.not_applicable
+    )
 
 
 class ForwardResult(OperationResult):
@@ -304,9 +369,6 @@ class SamplerWeightsResult(OperationResult):
 class SaveStateResult(OperationResult):
     kind: Literal["save_state"] = "save_state"
     checkpoint: CheckpointRef
-    optimizer_state: str = Field(
-        min_length=1, max_length=MAX_CHECKPOINT_REFERENCE_LENGTH
-    )
 
 
 class LoadStateResult(OperationResult):
