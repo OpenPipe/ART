@@ -34,6 +34,7 @@ class HybridEpRuntimeSpec(_Spec):
 class TrainerRuntimeSpec(_Spec):
     art_revision: str = Field(min_length=1)
     model_identifier: str = Field(min_length=1)
+    model_source: str = Field(min_length=1)
     model_revision: str = Field(min_length=1)
     model_initialization: Literal["pretrained", "random"] = "pretrained"
     cache_root: str | None = Field(default=None, min_length=1)

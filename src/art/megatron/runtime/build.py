@@ -49,8 +49,8 @@ def build_trainer_runtime_spec(
     handler = get_model_support_handler_for_spec(support_spec)
     targets = lora.get("target_modules") or default_target_modules(base_model)
     init_args = config.get("init_args", {})
-    model_identifier = init_args.get("model_name", base_model)
-    if not isinstance(model_identifier, str) or not model_identifier:
+    model_source = init_args.get("model_name", base_model)
+    if not isinstance(model_source, str) or not model_source:
         raise ValueError("init_args.model_name must be a non-empty string")
     revision = str(init_args.get("revision") or "default")
     compile_enabled = os.environ.get(
@@ -58,7 +58,8 @@ def build_trainer_runtime_spec(
     ).lower() not in {"1", "true", "yes", "on"}
     identity = {
         "art": _art_source_revision(),
-        "model": model_identifier,
+        "model": base_model,
+        "model_source": model_source,
         "support_model": base_model,
         "revision": revision,
         "handler": handler.key,
@@ -69,7 +70,8 @@ def build_trainer_runtime_spec(
     }
     return TrainerRuntimeSpec(
         art_revision=identity["art"],
-        model_identifier=model_identifier,
+        model_identifier=base_model,
+        model_source=model_source,
         model_revision=revision,
         model_initialization=identity["model_initialization"],
         cache_root=runtime.topology.cluster.cache_root,

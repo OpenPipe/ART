@@ -209,7 +209,7 @@ def _build_training_runtime(spec: TrainerRuntimeSpec, *, rank: int) -> Any:
     from art.megatron.train import build_training_runtime
 
     return build_training_runtime(
-        model_identifier=spec.model_identifier,
+        model_identifier=spec.model_source,
         model_initialization=spec.model_initialization,
         provider_torch_dtype={
             "bfloat16": torch.bfloat16,
@@ -379,7 +379,7 @@ class MonarchTrainerActor(Actor):
         cache_root = configure_model_cache_env(cache_root=runtime_spec.cache_root)
         os.environ.update(
             {
-                "MODEL_IDENTIFIER": runtime_spec.model_identifier,
+                "MODEL_IDENTIFIER": runtime_spec.model_source,
                 "ART_MEGATRON_TENSOR_MODEL_PARALLEL_SIZE": str(topology.tp),
                 "ART_MEGATRON_CONTEXT_PARALLEL_SIZE": str(topology.cp),
                 "ART_MEGATRON_EXPERT_MODEL_PARALLEL_SIZE": str(topology.ep),
