@@ -284,6 +284,8 @@ class MegatronForwardBackwardJobResult(BaseModel):
 
 
 class MegatronForwardJobResult(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
     new_logprobs: tuple[torch.Tensor, ...]
     logical_nonpadding_tokens: int = Field(ge=0)
     executed_token_equivalents: int = Field(ge=0)
