@@ -7,7 +7,12 @@ import unittest
 from art_vllm_runtime import binary_routes
 import numpy as np
 
-from art.vllm_route_transport import decode_routed_experts_response
+from art.vllm_route_transport import (
+    decode_retained_route_bundle,
+    decode_routed_experts_response,
+    retained_route_bundle_from_response,
+    route_bundle_id,
+)
 
 
 class BinaryRoutesProtocolTest(unittest.TestCase):
@@ -65,6 +70,50 @@ class BinaryRoutesProtocolTest(unittest.TestCase):
             self.assertEqual(routes[0].num_experts, num_experts)
             self.assertEqual(routes[0].dtype, np.dtype(dtype))
             np.testing.assert_array_equal(routes[0], values)
+
+    def test_retained_bundle_preserves_exact_bytes_and_token_identity(self) -> None:
+        response = json.dumps(
+            {
+                "id": "route-retained",
+                "choices": [
+                    {
+                        "finish_reason": "stop",
+                        "index": 0,
+                        "logprobs": None,
+                        "message": {"content": "ok", "role": "assistant"},
+                        "output_token_ids": [13],
+                    }
+                ],
+                "created": 0,
+                "model": "test-model",
+                "object": "chat.completion",
+                "prompt_token_ids": [11, 12],
+            }
+        ).encode()
+        values = np.asarray([[[1]], [[2]], [[3]]], dtype=np.uint8)
+        body = binary_routes.encode_routed_experts_response(
+            response, {0: values}, num_experts=8
+        )
+
+        decoded_response, bundle = retained_route_bundle_from_response(
+            body,
+            request_id="request",
+            owner_id="tenant/run",
+            model_identity="test-model@generation-3",
+        )
+        payload = b"".join(bundle.chunks)
+        routes = decode_retained_route_bundle(
+            bundle.layout, payload, token_ids={0: (11, 12, 13)}
+        )
+
+        self.assertEqual(decoded_response.id, "route-retained")
+        self.assertEqual(bundle.layout.byte_count, values.nbytes)
+        self.assertEqual(bundle.layout.bundle_id, route_bundle_id(bundle.layout))
+        np.testing.assert_array_equal(routes[0], values)
+        with self.assertRaisesRegex(RuntimeError, "token identity"):
+            decode_retained_route_bundle(
+                bundle.layout, payload, token_ids={0: (11, 12, 14)}
+            )
 
     def test_rejects_expert_count_beyond_uint16_protocol(self) -> None:
         with self.assertRaisesRegex(RuntimeError, r"\[1, 65536\]"):

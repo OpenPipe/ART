@@ -1958,56 +1958,19 @@ async def _run_e2e_throughput_async(
             ] = {}
             original_train = backend.train
             original_finish_training_batch = backend._finish_training_batch
-            original_release_trajectory_sources = backend._release_trajectory_sources
             train_call_count = 0
 
-            async def capture_then_release(
-                batch: Any,
-                payload: Any,
-                prepared: Any,
-                selections: tuple[Any, ...],
-                settings: dict[str, int],
-            ) -> tuple[tuple[Any, ...], str, str, dict[str, int]]:
-                captured = None
-                failures = []
-                try:
-                    captured = await _capture_training_input(
-                        prepared, selections, settings
-                    )
-                except BaseException as error:
-                    failures.append(error)
-                try:
-                    await original_release_trajectory_sources(batch, payload)
-                except BaseException as error:
-                    failures.append(error)
-                if failures:
-                    raise BaseExceptionGroup(
-                        "throughput input capture or source release failed", failures
-                    )
-                assert captured is not None
-                return captured
-
-            async def release_trajectory_sources(batch: Any, payload: Any) -> None:
-                request = capture_requests.pop(id(batch), None)
-                if request is None:
-                    await original_release_trajectory_sources(batch, payload)
-                    return
-                prepared, selections, settings = request
-                capture_tasks[id(batch)] = asyncio.create_task(
-                    capture_then_release(batch, payload, prepared, selections, settings)
-                )
-
             async def finish_training_batch(batch: Any, *, failed: bool) -> None:
-                capture_task = capture_tasks.get(id(batch))
                 failures = []
-                if capture_task is not None:
+                request = capture_requests.pop(id(batch), None)
+                if request is not None:
+                    prepared, selections, settings = request
+                    capture_task = asyncio.create_task(
+                        _capture_training_input(prepared, selections, settings)
+                    )
+                    capture_tasks[id(batch)] = capture_task
                     try:
                         await capture_task
-                    except BaseException as error:
-                        failures.append(error)
-                elif capture_requests.pop(id(batch), None) is not None:
-                    try:
-                        await original_release_trajectory_sources(batch, batch.payload)
                     except BaseException as error:
                         failures.append(error)
                 try:
@@ -2077,11 +2040,6 @@ async def _run_e2e_throughput_async(
 
             setattr(backend, "train", tracked_train)
             setattr(backend, "_finish_training_batch", finish_training_batch)
-            setattr(
-                backend,
-                "_release_trajectory_sources",
-                release_trajectory_sources,
-            )
             try:
                 measurement_start = (
                     config.max_steps - tail_windows * autotune.window_steps + 1
@@ -2103,11 +2061,6 @@ async def _run_e2e_throughput_async(
                     backend,
                     "_finish_training_batch",
                     original_finish_training_batch,
-                )
-                setattr(
-                    backend,
-                    "_release_trajectory_sources",
-                    original_release_trajectory_sources,
                 )
                 await _cancel_activation_tasks(activation_tasks)
             if len(captured_training_inputs) != _MATCHED_MEASURED_STEPS:
