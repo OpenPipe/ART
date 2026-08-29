@@ -11,6 +11,10 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from art.preprocessing.policy_spans import PolicyTokenSpan
 from art.trajectories import MetadataValue, Trajectory, TrajectoryGroup
+from art.vllm_route_transport import (
+    RetainedRouteBundleRef,
+    unique_retained_route_bundles,
+)
 
 from .data_plane import (
     ByteStreamPublisher,
@@ -51,6 +55,7 @@ class TrajectoryGroupDescriptor(_Contract):
     group_metadata: dict[str, MetadataValue]
     group_metrics: dict[str, float | int | bool]
     exceptions: tuple[tuple[str, str], ...]
+    retained_route_bundles: tuple[RetainedRouteBundleRef, ...] = ()
     byte_count: int = Field(ge=0)
 
     @model_validator(mode="after")
@@ -73,6 +78,13 @@ class TrajectoryGroupDescriptor(_Contract):
 
 class TrajectoryGroupBundle(_Contract):
     """Binary trajectory records for bulk transport across actor boundaries."""
+
+    model_config = ConfigDict(
+        extra="forbid",
+        frozen=True,
+        ser_json_bytes="base64",
+        val_json_bytes="base64",
+    )
 
     header: bytes
     records: tuple[bytes, ...]
@@ -110,8 +122,25 @@ class TrajectoryGroupBundle(_Contract):
         )
         return TrajectoryGroupPayload.model_validate(header)
 
+    def retained_routes(self) -> tuple[RetainedRouteBundleRef, ...]:
+        from msgspec import msgpack
+
+        header = msgpack.decode(self.header)
+        return tuple(
+            RetainedRouteBundleRef.model_validate(value)
+            for value in header.get("retained_route_bundles", ())
+        )
+
     def build(self) -> TrajectoryGroup:
         return self.payload().build()
+
+
+def retained_route_bundles_from_bundles(
+    bundles: tuple[TrajectoryGroupBundle, ...],
+) -> tuple[RetainedRouteBundleRef, ...]:
+    return unique_retained_route_bundles(
+        ref for bundle in bundles for ref in bundle.retained_routes()
+    )
 
 
 class TrajectoryGroupLayout(_Contract):
@@ -403,6 +432,7 @@ class TrajectoryRecordStore:
             exceptions=tuple(
                 (exception.type, exception.message) for exception in group.exceptions
             ),
+            retained_route_bundles=payload.retained_route_bundles,
             byte_count=byte_count,
         )
         ref = TrajectoryGroupRef(

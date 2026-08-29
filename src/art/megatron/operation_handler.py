@@ -11,6 +11,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from art.distributed.art_runtime import ArtRuntime, DistributedPackedBatch
 from art.distributed.packing import PackingRequest
 from art.distributed.rollout import RolloutModelSpec
+from art.distributed.trajectory_store import retained_route_bundles_from_bundles
 from art.training import (
     CheckpointRef,
     CommandExecutionUsage,
@@ -499,6 +500,9 @@ class MegatronOperationHandler:
             model=self.config.rollout_model,
             generation_id=operation.operation_id,
             trajectory_groups=request.batch.groups,
+            retained_route_bundles=retained_route_bundles_from_bundles(
+                request.batch.groups
+            ),
             advantage_balance=experimental.advantage_balance,
             allow_training_without_logprobs=bool(
                 experimental.allow_training_without_logprobs
@@ -689,6 +693,7 @@ def _dispatched_execution_error(
 def _packing_metrics(packed: DistributedPackedBatch) -> dict[str, float]:
     return {
         "time/step_trajectory_fetch_s": packed.trajectory_fetch_s,
+        "time/step_route_fetch_s": packed.route_fetch_s,
         "time/step_packing_core_s": packed.packing_core_s,
         "time/step_trajectory_log_wait_s": packed.trajectory_log_wait_s,
         "time/step_packed_batch_finalize_s": packed.packed_batch_finalize_s,

@@ -18,6 +18,7 @@ from ..trajectories import TrajectoryGroup
 from ..types import LocalTrainResult
 from ..utils.lifecycle import complete_task
 from ..utils.output_dirs import get_model_dir, get_step_checkpoint_dir
+from ..vllm_route_transport import RouteBundleReader, unique_retained_route_bundles
 from ..vllm_runtime import get_external_vllm_runtime_config
 from .migrations import apply_megatron_migrations
 from .runtime.specs import ResidentLoraInspectionResult, ResidentScoreResult
@@ -88,6 +89,7 @@ class MegatronBackend(LocalBackend):
         path: str | None = None,
         enable_expert_replay: bool = True,
         runtime: ArtRuntime | None = None,
+        route_bundle_reader: RouteBundleReader | None = None,
     ) -> None:
         if in_process:
             raise ValueError(
@@ -114,6 +116,7 @@ class MegatronBackend(LocalBackend):
         self._packed_sequence_length_requires_chunk_alignment = False
         self._supports_result_packing = True
         self._runtime = runtime
+        self._route_bundle_reader = route_bundle_reader
         self._owns_runtime = runtime is None
         self._runtime_lock = asyncio.Lock()
         self._service_lock = asyncio.Lock()
@@ -207,7 +210,10 @@ class MegatronBackend(LocalBackend):
                             "backend-owned per-model runtimes require disjoint GPU "
                             f"placements; {storage_key!r} conflicts with {conflicts}"
                         )
-                    runtime = await ArtRuntime.start_local(topology)
+                    runtime = await ArtRuntime.start_local(
+                        topology,
+                        route_bundle_reader=self._route_bundle_reader,
+                    )
                 except BaseException:
                     if ports is not None:
                         self._local_endpoints.release(ports)
@@ -604,7 +610,10 @@ class MegatronBackend(LocalBackend):
             DistributedTrajectorySelection,
             RolloutModelSpec,
         )
-        from ..distributed.trajectory_store import TrajectoryGroupBundle
+        from ..distributed.trajectory_store import (
+            TrajectoryGroupBundle,
+            retained_route_bundles_from_bundles,
+        )
 
         selections = tuple(group._distributed_lease for group in trajectory_groups)
         selected = tuple(
@@ -699,20 +708,32 @@ class MegatronBackend(LocalBackend):
                 if queue is not None and local_selections
                 else ()
             )
+            bundles = tuple(
+                TrajectoryGroupBundle.from_group(group)
+                for group in (local_groups if selected else tuple(trajectory_groups))
+            )
+            sources = (
+                ()
+                if local_selections
+                else tuple(selection.lease.item for selection in selected)
+            )
+            retained_routes = (
+                unique_retained_route_bundles(
+                    (
+                        ref
+                        for source in sources
+                        for ref in source.ref.descriptor.retained_route_bundles
+                    ),
+                )
+                if sources
+                else retained_route_bundles_from_bundles(bundles)
+            )
             request = PackingRequest(
                 model=RolloutModelSpec.from_model(model),
                 generation_id=generation_id,
-                trajectory_groups=tuple(
-                    TrajectoryGroupBundle.from_group(group)
-                    for group in (
-                        local_groups if selected else tuple(trajectory_groups)
-                    )
-                ),
-                trajectory_sources=(
-                    ()
-                    if local_selections
-                    else tuple(selection.lease.item for selection in selected)
-                ),
+                trajectory_groups=bundles,
+                trajectory_sources=sources,
+                retained_route_bundles=retained_routes,
                 trajectory_log_path=trajectory_log_path,
                 group_ids=group_ids,
                 record_ids=record_ids,
@@ -865,6 +886,7 @@ class MegatronBackend(LocalBackend):
         distributed = payload.packed
         metrics = {
             "time/step_trajectory_fetch_s": distributed.trajectory_fetch_s,
+            "time/step_route_fetch_s": distributed.route_fetch_s,
             "time/step_packing_core_s": distributed.packing_core_s,
             "time/step_trajectory_log_wait_s": distributed.trajectory_log_wait_s,
             "time/step_packed_batch_finalize_s": distributed.packed_batch_finalize_s,

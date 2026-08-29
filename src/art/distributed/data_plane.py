@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable, Mapping
+from collections.abc import AsyncIterable, Callable, Mapping
 from multiprocessing import resource_tracker, shared_memory
 import os
 import secrets
@@ -680,6 +680,63 @@ class ByteStreamPublisher(_AuthenticatedStreamPublisher):
     def _sent(self) -> None:
         if self.on_sent is not None:
             self.on_sent()
+
+
+class AsyncByteStreamPublisher(_AuthenticatedStreamPublisher):
+    """Authenticated stream that pulls immutable chunks only after connect."""
+
+    def __init__(
+        self,
+        stream_id: str,
+        advertise_host: str,
+        byte_count: int,
+        source: Callable[[], AsyncIterable[bytes | bytearray | memoryview]],
+    ) -> None:
+        super().__init__(advertise_host)
+        if not stream_id or byte_count < 1:
+            raise ValueError("async byte stream ID and payload must be non-empty")
+        self.stream_id = stream_id
+        self.byte_count = byte_count
+        self.source = source
+
+    @classmethod
+    async def create(
+        cls,
+        stream_id: str,
+        *,
+        advertise_host: str,
+        byte_count: int,
+        source: Callable[[], AsyncIterable[bytes | bytearray | memoryview]],
+    ) -> "AsyncByteStreamPublisher":
+        publisher = cls(stream_id, advertise_host, byte_count, source)
+        await publisher.start()
+        return publisher
+
+    @property
+    def transfer(self) -> ByteStreamTransfer:
+        return ByteStreamTransfer(
+            stream_id=self.stream_id,
+            host=self.advertise_host,
+            port=self._port(),
+            token=self._token.hex(),
+            byte_count=self.byte_count,
+        )
+
+    async def _write(self, writer: asyncio.StreamWriter) -> None:
+        written = 0
+        async for chunk in self.source():
+            view = memoryview(chunk).cast("B")
+            try:
+                if not view.nbytes:
+                    continue
+                written += view.nbytes
+                if written > self.byte_count:
+                    raise RuntimeError("async byte source exceeded its exact size")
+                await _write_stream_chunk(writer, view)
+            finally:
+                view.release()
+        if written != self.byte_count:
+            raise RuntimeError("async byte source ended before its exact size")
 
 
 class PackedBatchPublisher(_AuthenticatedStreamPublisher):

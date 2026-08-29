@@ -1,22 +1,36 @@
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections import defaultdict
+from collections.abc import AsyncIterator, Iterable, Mapping
 from dataclasses import dataclass
 import hashlib
 import json
 import struct
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal, Protocol
 
 from openai.types.chat import ChatCompletion
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from art.preprocessing.moe_routing import MoeRouteArray
+from art.distributed.data_plane import (
+    AsyncByteStreamPublisher,
+    ByteStreamTransfer,
+    receive_byte_stream,
+)
+from art.preprocessing.moe_routing import (
+    ART_MOE_ROUTING_METADATA_KEY,
+    MoeRouteArray,
+    attach_moe_routing_metadata_to_choice,
+)
+
+if TYPE_CHECKING:
+    from art.trajectories import TrajectoryGroup
 
 MAGIC = b"ARTRTE2\0"
 HEADER = struct.Struct("<8sQII")
 ROUTE_HEADER = struct.Struct("<IB3xQQQ")
 DTYPES = {1: "u1", 2: "<u2"}
 ROUTE_BUNDLE_FORMAT = "art_inference_route_bundle_v1"
+RETAINED_ROUTE_BUNDLE_KEY = "retained_route_bundle"
 
 
 class _Contract(BaseModel):
@@ -82,10 +96,222 @@ class RouteBundleLayout(_Contract):
         return self
 
 
+class RouteBundleObjectRef(_Contract):
+    """Provider-neutral authenticated identity for one CAIOS route object."""
+
+    store: Literal["caios"] = "caios"
+    locator: str = Field(min_length=1, max_length=4096)
+    size_bytes: int = Field(gt=0)
+    sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+class RetainedRouteBundleRef(_Contract):
+    object: RouteBundleObjectRef
+    layout: RouteBundleLayout
+    lease_id: str = Field(min_length=1, max_length=512)
+
+    @model_validator(mode="after")
+    def _validate_object(self) -> "RetainedRouteBundleRef":
+        if (
+            self.object.size_bytes != self.layout.byte_count
+            or self.object.sha256 != self.layout.sha256
+        ):
+            raise ValueError("retained route object differs from its exact layout")
+        return self
+
+
+class RouteBundleBatchTransfer(_Contract):
+    stream: ByteStreamTransfer
+    layouts: tuple[RouteBundleLayout, ...] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def _validate_stream(self) -> "RouteBundleBatchTransfer":
+        if len({layout.bundle_id for layout in self.layouts}) != len(self.layouts):
+            raise ValueError("retained route transfer repeats a bundle")
+        if len({layout.response_id for layout in self.layouts}) != len(self.layouts):
+            raise ValueError("retained route transfer repeats a response")
+        if sum(layout.byte_count for layout in self.layouts) != self.stream.byte_count:
+            raise ValueError("retained route transfer size differs from its layouts")
+        return self
+
+    async def receive_into(
+        self,
+        groups: Iterable["TrajectoryGroup"],
+        *,
+        timeout_s: float,
+    ) -> int:
+        payload = await receive_byte_stream(self.stream, timeout_s=timeout_s)
+        return hydrate_retained_route_bundles(groups, self.layouts, payload)
+
+
+class RouteBundleReader(Protocol):
+    """Service-injected lease-aware reader; provider access stays outside ART."""
+
+    def read_stream(
+        self, ref: RouteBundleObjectRef, *, lease_id: str
+    ) -> AsyncIterator[bytes | bytearray | memoryview]: ...
+
+
 @dataclass(frozen=True)
 class RouteBundlePayload:
     layout: RouteBundleLayout
     chunks: tuple[memoryview, ...]
+
+
+async def publish_retained_route_bundle_transfer(
+    refs: tuple[RetainedRouteBundleRef, ...],
+    *,
+    reader: RouteBundleReader,
+    stream_id: str,
+    advertise_host: str,
+) -> tuple[RouteBundleBatchTransfer, AsyncByteStreamPublisher]:
+    """Expose one bounded pull stream over service-owned local-LOTA reads."""
+
+    if not refs:
+        raise ValueError("retained route transfer requires at least one bundle")
+    if len({ref.layout.bundle_id for ref in refs}) != len(refs):
+        raise ValueError("retained route transfer repeats a bundle")
+
+    async def source() -> AsyncIterator[bytes | bytearray | memoryview]:
+        for ref in refs:
+            async for chunk in reader.read_stream(ref.object, lease_id=ref.lease_id):
+                yield chunk
+
+    publisher = await AsyncByteStreamPublisher.create(
+        stream_id,
+        advertise_host=advertise_host,
+        byte_count=sum(ref.object.size_bytes for ref in refs),
+        source=source,
+    )
+    try:
+        transfer = RouteBundleBatchTransfer(
+            stream=publisher.transfer,
+            layouts=tuple(ref.layout for ref in refs),
+        )
+    except BaseException:
+        await publisher.close()
+        raise
+    return transfer, publisher
+
+
+def attach_retained_route_bundle(
+    response: ChatCompletion, ref: RetainedRouteBundleRef
+) -> None:
+    """Attach one private retained handle without exposing route bytes."""
+
+    _validate_response_binding(response, ref.layout)
+    marker = {RETAINED_ROUTE_BUNDLE_KEY: ref.model_dump(mode="json")}
+    for choice in response.choices:
+        extra = choice.model_extra
+        if extra is None:
+            raise RuntimeError("OpenAI Choice.model_extra is unavailable")
+        if ART_MOE_ROUTING_METADATA_KEY in extra:
+            raise RuntimeError("response already carries MoE routing metadata")
+        extra[ART_MOE_ROUTING_METADATA_KEY] = marker
+
+
+def retained_route_bundles_from_groups(
+    groups: Iterable["TrajectoryGroup"],
+) -> tuple[RetainedRouteBundleRef, ...]:
+    refs = []
+    for group in groups:
+        for trajectory in group.trajectories:
+            for exchange in trajectory.exchanges.chat_completions:
+                response = exchange.response
+                marked = tuple(
+                    ref
+                    for choice in response.choices
+                    if (ref := _retained_ref_from_choice(choice)) is not None
+                )
+                if not marked:
+                    continue
+                if len(marked) != len(response.choices) or any(
+                    ref != marked[0] for ref in marked[1:]
+                ):
+                    raise RuntimeError(
+                        "retained route handle does not cover the whole response"
+                    )
+                ref = marked[0]
+                _validate_response_binding(response, ref.layout)
+                refs.append(ref)
+    return unique_retained_route_bundles(refs)
+
+
+def unique_retained_route_bundles(
+    refs: Iterable[RetainedRouteBundleRef],
+) -> tuple[RetainedRouteBundleRef, ...]:
+    unique: dict[str, RetainedRouteBundleRef] = {}
+    responses: dict[str, str] = {}
+    for ref in refs:
+        previous = unique.setdefault(ref.layout.bundle_id, ref)
+        if previous != ref:
+            raise RuntimeError("retained route bundle identity changed")
+        previous_bundle = responses.setdefault(
+            ref.layout.response_id, ref.layout.bundle_id
+        )
+        if previous_bundle != ref.layout.bundle_id:
+            raise RuntimeError("retained response maps to multiple route bundles")
+    return tuple(unique.values())
+
+
+def hydrate_retained_route_bundles(
+    groups: Iterable["TrajectoryGroup"],
+    layouts: tuple[RouteBundleLayout, ...],
+    payload: bytes | bytearray | memoryview,
+) -> int:
+    """Hydrate private references directly into ART's existing route arrays."""
+
+    responses: dict[str, list[ChatCompletion]] = defaultdict(list)
+    for group in groups:
+        for trajectory in group.trajectories:
+            for exchange in trajectory.exchanges.chat_completions:
+                responses[exchange.response.id].append(exchange.response)
+    view = memoryview(payload).cast("B").toreadonly()
+    try:
+        offset = 0
+        hydrated = 0
+        for layout in layouts:
+            bound = responses.get(layout.response_id)
+            if not bound:
+                raise RuntimeError("retained route bundle has no selected response")
+            end = offset + layout.byte_count
+            if end > len(view):
+                raise RuntimeError("retained route transfer ended before its layout")
+            first_payload = bound[0].model_dump(mode="python")
+            token_ids = {
+                choice.choice_index: _response_token_ids(
+                    first_payload, choice.choice_index
+                )
+                for choice in layout.choices
+            }
+            routes = decode_retained_route_bundle(
+                layout, view[offset:end], token_ids=token_ids
+            )
+            for response in bound:
+                _validate_response_binding(response, layout)
+                response_payload = response.model_dump(mode="python")
+                for position, choice in enumerate(response.choices):
+                    extra = choice.model_extra
+                    if extra is None:
+                        raise RuntimeError("OpenAI Choice.model_extra is unavailable")
+                    if ART_MOE_ROUTING_METADATA_KEY in extra:
+                        raise RuntimeError(
+                            "selected response already carries MoE routing metadata"
+                        )
+                    attach_moe_routing_metadata_to_choice(
+                        choice=choice,
+                        response_payload=response_payload,
+                        choice_index=position,
+                        routed_experts=routes[int(choice.index)],
+                        num_experts=layout.num_experts,
+                    )
+                hydrated += 1
+            offset = end
+        if offset != len(view):
+            raise RuntimeError("retained route transfer has trailing bytes")
+        return hydrated
+    finally:
+        view.release()
 
 
 def is_routed_experts_response(body: bytes) -> bool:
@@ -285,6 +511,39 @@ def _response_token_ids(
     ):
         raise RuntimeError("retained routes require nonnegative exact token IDs")
     return tuple((*prompt, *completion))
+
+
+def _retained_ref_from_choice(choice: Any) -> RetainedRouteBundleRef | None:
+    extra = choice.model_extra
+    nested = (extra or {}).get(ART_MOE_ROUTING_METADATA_KEY)
+    if nested is None:
+        return None
+    if not isinstance(nested, dict):
+        raise RuntimeError("MoE routing metadata must be an object")
+    payload = nested.get(RETAINED_ROUTE_BUNDLE_KEY)
+    if payload is None:
+        return None
+    try:
+        return RetainedRouteBundleRef.model_validate(payload)
+    except ValueError as error:
+        raise RuntimeError("retained route handle is malformed") from error
+
+
+def _validate_response_binding(
+    response: ChatCompletion, layout: RouteBundleLayout
+) -> None:
+    if response.id != layout.response_id:
+        raise RuntimeError("retained routes belong to another response")
+    choice_indices = tuple(sorted(int(choice.index) for choice in response.choices))
+    if choice_indices != tuple(choice.choice_index for choice in layout.choices):
+        raise RuntimeError("retained routes do not match response choices")
+    payload = response.model_dump(mode="python")
+    for choice in layout.choices:
+        if (
+            _token_ids_sha256(_response_token_ids(payload, choice.choice_index))
+            != choice.token_ids_sha256
+        ):
+            raise RuntimeError("retained routes do not match response tokens")
 
 
 def _token_ids_sha256(token_ids: tuple[int, ...]) -> str:

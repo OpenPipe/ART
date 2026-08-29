@@ -14,6 +14,10 @@ from pydantic import BaseModel, ConfigDict
 from art.megatron.runtime.managed import MegatronRuntimeInfo
 from art.megatron.runtime.specs import TrainerRuntimeSpec, TrainingRunSpec
 from art.utils.lifecycle import complete_task
+from art.vllm_route_transport import (
+    RouteBundleReader,
+    publish_retained_route_bundle_transfer,
+)
 
 from .artifact_preflight import (
     ArtifactProbeCommand,
@@ -89,6 +93,7 @@ class DistributedPackedBatch(BaseModel):
     trajectory_log_path: str | None = None
     packing_rpc_s: float = 0.0
     trajectory_fetch_s: float = 0.0
+    route_fetch_s: float = 0.0
     packing_core_s: float = 0.0
     trajectory_log_wait_s: float = 0.0
     packed_batch_finalize_s: float = 0.0
@@ -106,11 +111,13 @@ class ArtRuntime:
         *,
         config: ArtRuntimeConfig | None = None,
         owns_host_mesh: bool = False,
+        route_bundle_reader: RouteBundleReader | None = None,
     ) -> None:
         self.host_mesh = host_mesh
         self.topology = topology
         self.config = config or ArtRuntimeConfig()
         self.owns_host_mesh = owns_host_mesh
+        self._route_bundle_reader = route_bundle_reader
         self.runtime_id = uuid.uuid4().hex
         self._host_procs: dict[str, Any] = {}
         self._host_services: dict[str, Any] = {}
@@ -156,12 +163,14 @@ class ArtRuntime:
         *,
         config: ArtRuntimeConfig | None = None,
         owns_host_mesh: bool = False,
+        route_bundle_reader: RouteBundleReader | None = None,
     ) -> "ArtRuntime":
         runtime = cls(
             host_mesh,
             topology,
             config=config,
             owns_host_mesh=owns_host_mesh,
+            route_bundle_reader=route_bundle_reader,
         )
         return await runtime._start()
 
@@ -171,6 +180,7 @@ class ArtRuntime:
         topology: RuntimeTopology,
         *,
         config: ArtRuntimeConfig | None = None,
+        route_bundle_reader: RouteBundleReader | None = None,
     ) -> "ArtRuntime":
         requested_address = require_local_worker_address(
             tuple(host.worker_address for host in topology.cluster.hosts)
@@ -208,7 +218,13 @@ class ArtRuntime:
                 ) from None
             raise
         try:
-            runtime = cls(host_mesh, topology, config=config, owns_host_mesh=True)
+            runtime = cls(
+                host_mesh,
+                topology,
+                config=config,
+                owns_host_mesh=True,
+                route_bundle_reader=route_bundle_reader,
+            )
         except BaseException as startup_error:
             try:
                 await asyncio.wait_for(
@@ -795,24 +811,61 @@ class ArtRuntime:
         batch_id = uuid.uuid4().hex
         self._live_batches[batch_id] = trainer_hosts
         try:
-            publisher = None
+            publishers = []
             wire_request = request
-            if request.trajectory_groups:
-                from .trajectory_store import publish_trajectory_bundles
-
+            if request.trajectory_groups or request.retained_route_bundles:
                 controller = self._host(self.topology.cluster.controller_host_id)
                 data_plane_host = urlparse(controller.worker_address).hostname
                 if data_plane_host is None:
                     raise ValueError("controller has no routable address")
-                transfer, publisher = await publish_trajectory_bundles(
-                    request.trajectory_groups,
-                    stream_id=batch_id,
-                    advertise_host=data_plane_host,
-                )
-                wire_request = request.model_copy(
-                    update={"trajectory_groups": (), "trajectory_transfer": transfer}
-                )
             try:
+                if request.trajectory_groups:
+                    from .trajectory_store import publish_trajectory_bundles
+
+                    transfer, publisher = await publish_trajectory_bundles(
+                        request.trajectory_groups,
+                        stream_id=batch_id,
+                        advertise_host=data_plane_host,
+                    )
+                    publishers.append(publisher)
+                    wire_request = wire_request.model_copy(
+                        update={
+                            "trajectory_groups": (),
+                            "trajectory_transfer": transfer,
+                        }
+                    )
+                if request.retained_route_bundles:
+                    if self._route_bundle_reader is None:
+                        raise RuntimeError(
+                            "retained routes require a service-owned route reader"
+                        )
+                    refs = request.retained_route_bundles
+                    if len(refs) > self.config.route_bundle_prefetch_max_bundles:
+                        raise RuntimeError(
+                            "retained route bundle count exceeds capacity"
+                        )
+                    if sum(ref.object.size_bytes for ref in refs) > (
+                        self.config.route_bundle_prefetch_capacity_bytes
+                    ):
+                        raise RuntimeError(
+                            "retained route bytes exceed prefetch capacity"
+                        )
+                    (
+                        route_transfer,
+                        route_publisher,
+                    ) = await publish_retained_route_bundle_transfer(
+                        refs,
+                        reader=self._route_bundle_reader,
+                        stream_id=f"{batch_id}:routes",
+                        advertise_host=data_plane_host,
+                    )
+                    publishers.append(route_publisher)
+                    wire_request = wire_request.model_copy(
+                        update={
+                            "retained_route_bundles": (),
+                            "route_bundle_transfer": route_transfer,
+                        }
+                    )
                 packing_rpc_started = time.monotonic()
                 result: PackingResult = await MonarchPackingEndpoint(
                     source_service
@@ -823,8 +876,7 @@ class ArtRuntime:
                 )
                 packing_rpc_s = time.monotonic() - packing_rpc_started
             finally:
-                if publisher is not None:
-                    await publisher.close()
+                await asyncio.gather(*(publisher.close() for publisher in publishers))
             if result.ref is None:
                 self._live_batches.pop(batch_id)
                 return None
@@ -862,6 +914,7 @@ class ArtRuntime:
             trajectory_log_path=result.trajectory_log_path,
             packing_rpc_s=packing_rpc_s,
             trajectory_fetch_s=result.trajectory_fetch_s,
+            route_fetch_s=result.route_fetch_s,
             packing_core_s=result.packing_core_s,
             trajectory_log_wait_s=result.trajectory_log_wait_s,
             packed_batch_finalize_s=result.packed_batch_finalize_s,

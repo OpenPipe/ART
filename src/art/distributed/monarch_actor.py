@@ -21,6 +21,7 @@ from monarch.actor import (  # ty: ignore[unresolved-import]
 
 from art.megatron.runtime.managed import MegatronRuntimeInfo
 from art.utils.lifecycle import complete_task, complete_to_thread
+from art.vllm_route_transport import hydrate_retained_route_bundles
 
 from .adapter_transport import AdapterSnapshotReceiver
 from .artifact_preflight import (
@@ -36,6 +37,7 @@ from .data_plane import (
     PackedBatchPublisher,
     PackedBatchRef,
     PackedBatchTransfer,
+    receive_byte_stream,
 )
 from .host_admission import (
     HostAdmissionReport,
@@ -527,29 +529,61 @@ class ArtHostService(Actor):
     async def pack_batch(
         self, request: PackingRequest, batch_id: str, transfer_timeout_s: float
     ) -> PackingResult:
-        fetch_started = time.monotonic()
-        if request.trajectory_sources:
-            groups = list(
-                await asyncio.gather(
-                    *(
-                        source.receive(timeout_s=transfer_timeout_s)
-                        for source in request.trajectory_sources
+        async def receive_groups() -> tuple[list[Any], float]:
+            fetch_started = time.monotonic()
+            if request.trajectory_sources:
+                groups = list(
+                    await asyncio.gather(
+                        *(
+                            source.receive(timeout_s=transfer_timeout_s)
+                            for source in request.trajectory_sources
+                        )
                     )
                 )
-            )
-        elif request.trajectory_transfer is None:
-            groups = [payload.build() for payload in request.trajectory_groups]
-        else:
-            if request.trajectory_groups:
-                raise ValueError("packing request has inline and streamed trajectories")
-            if request.trajectory_transfer.stream.stream_id != batch_id:
-                raise ValueError("packing request has the wrong trajectory stream")
-            groups = list(
-                await request.trajectory_transfer.receive_groups(
-                    timeout_s=transfer_timeout_s
+            elif request.trajectory_transfer is None:
+                groups = [payload.build() for payload in request.trajectory_groups]
+            else:
+                if request.trajectory_groups:
+                    raise ValueError(
+                        "packing request has inline and streamed trajectories"
+                    )
+                if request.trajectory_transfer.stream.stream_id != batch_id:
+                    raise ValueError("packing request has the wrong trajectory stream")
+                groups = list(
+                    await request.trajectory_transfer.receive_groups(
+                        timeout_s=transfer_timeout_s
+                    )
                 )
+            return groups, time.monotonic() - fetch_started
+
+        route_transfer = request.route_bundle_transfer
+        if route_transfer is not None:
+            if route_transfer.stream.stream_id != f"{batch_id}:routes":
+                raise ValueError("packing request has the wrong route stream")
+
+            async def receive_routes() -> tuple[bytearray, float]:
+                started = time.monotonic()
+                payload = await receive_byte_stream(
+                    route_transfer.stream, timeout_s=transfer_timeout_s
+                )
+                return payload, time.monotonic() - started
+
+            async with asyncio.TaskGroup() as tasks:
+                groups_task = tasks.create_task(receive_groups())
+                routes_task = tasks.create_task(receive_routes())
+            groups, trajectory_fetch_s = groups_task.result()
+            route_payload, route_fetch_s = routes_task.result()
+            hydration_started = time.monotonic()
+            await asyncio.to_thread(
+                hydrate_retained_route_bundles,
+                groups,
+                route_transfer.layouts,
+                route_payload,
             )
-        trajectory_fetch_s = time.monotonic() - fetch_started
+            route_fetch_s += time.monotonic() - hydration_started
+        else:
+            groups, trajectory_fetch_s = await receive_groups()
+            route_fetch_s = 0.0
         if request.collect_packing_shapes:
             for group in groups:
                 group._collect_packing_shape = True
@@ -627,6 +661,7 @@ class ArtHostService(Actor):
                 packed_group_shapes=shapes,
                 generation_id=request.generation_id,
                 trajectory_fetch_s=trajectory_fetch_s,
+                route_fetch_s=route_fetch_s,
                 packing_core_s=packing_core_s,
                 trajectory_log_wait_s=trajectory_log_wait_s,
             )
@@ -652,6 +687,7 @@ class ArtHostService(Actor):
             non_padding_tokens=non_padding_tokens,
             trajectory_log_path=request.trajectory_log_path,
             trajectory_fetch_s=trajectory_fetch_s,
+            route_fetch_s=route_fetch_s,
             packing_core_s=packing_core_s,
             trajectory_log_wait_s=trajectory_log_wait_s,
             packed_batch_finalize_s=packed_batch_finalize_s,

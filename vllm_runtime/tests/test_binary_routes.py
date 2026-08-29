@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+from datetime import datetime
 import json
 from types import SimpleNamespace
 import unittest
@@ -7,9 +9,25 @@ import unittest
 from art_vllm_runtime import binary_routes
 import numpy as np
 
+from art.distributed.trajectory_store import TrajectoryGroupBundle
+from art.preprocessing.moe_routing import (
+    ROUTED_EXPERTS_KEY,
+    choice_moe_routing_metadata,
+)
+from art.trajectories import (
+    ChatCompletionsExchange,
+    ChatCompletionsRequest,
+    Trajectory,
+    TrajectoryExchanges,
+    TrajectoryGroup,
+)
 from art.vllm_route_transport import (
+    RetainedRouteBundleRef,
+    RouteBundleObjectRef,
+    attach_retained_route_bundle,
     decode_retained_route_bundle,
     decode_routed_experts_response,
+    publish_retained_route_bundle_transfer,
     retained_route_bundle_from_response,
     route_bundle_id,
 )
@@ -114,6 +132,66 @@ class BinaryRoutesProtocolTest(unittest.TestCase):
             decode_retained_route_bundle(
                 bundle.layout, payload, token_ids={0: (11, 12, 14)}
             )
+
+        ref = RetainedRouteBundleRef(
+            object=RouteBundleObjectRef(
+                locator="routes/route-retained",
+                size_bytes=len(payload),
+                sha256=bundle.layout.sha256,
+            ),
+            layout=bundle.layout,
+            lease_id="route-lease",
+        )
+        attach_retained_route_bundle(decoded_response, ref)
+        exchange = ChatCompletionsExchange(
+            request=ChatCompletionsRequest(
+                model="test-model",
+                messages=[{"role": "user", "content": "prompt"}],
+            ),
+            response=decoded_response,
+            start_time=datetime.now(),
+            end_time=datetime.now(),
+        )
+        group = TrajectoryGroup(
+            [
+                Trajectory(
+                    exchanges=TrajectoryExchanges(chat_completions=[exchange]),
+                    reward=1,
+                )
+            ]
+        )
+        transported = TrajectoryGroupBundle.from_group(group)
+        selected = transported.build()
+
+        self.assertEqual(transported.retained_routes(), (ref,))
+        bundle_ref = ref
+
+        class Reader:
+            async def read_stream(self, ref, *, lease_id):
+                if ref != bundle_ref.object or lease_id != "route-lease":
+                    raise AssertionError("route reader received the wrong identity")
+                yield payload[:1]
+                yield payload[1:]
+
+        async def transfer() -> int:
+            transfer, publisher = await publish_retained_route_bundle_transfer(
+                (bundle_ref,),
+                reader=Reader(),
+                stream_id="route-test",
+                advertise_host="127.0.0.1",
+            )
+            try:
+                return await transfer.receive_into((selected,), timeout_s=5)
+            finally:
+                await publisher.close()
+
+        self.assertEqual(asyncio.run(transfer()), 1)
+        metadata = choice_moe_routing_metadata(
+            selected.trajectories[0].exchanges.chat_completions[0].response.choices[0]
+        )
+        if metadata is None:
+            self.fail("hydrated response has no route metadata")
+        np.testing.assert_array_equal(metadata[ROUTED_EXPERTS_KEY], values)
 
     def test_rejects_expert_count_beyond_uint16_protocol(self) -> None:
         with self.assertRaisesRegex(RuntimeError, r"\[1, 65536\]"):

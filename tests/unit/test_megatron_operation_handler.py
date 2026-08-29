@@ -29,6 +29,7 @@ from art.training import (
     OptimStepRequest,
     RlTrajectoryBatch,
 )
+from art.trajectories import TrajectoryGroup
 
 
 def _packed_batch() -> DistributedPackedBatch:
@@ -179,7 +180,7 @@ def _operation(
 
 def _batch() -> RlTrajectoryBatch:
     return RlTrajectoryBatch(
-        groups=(TrajectoryGroupBundle(header=b"unused", records=()),),
+        groups=(TrajectoryGroupBundle.from_group(TrajectoryGroup()),),
         min_source_version=0,
         max_source_version=0,
     )

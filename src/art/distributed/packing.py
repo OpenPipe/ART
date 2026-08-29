@@ -22,6 +22,12 @@ from art.trajectories import (
     Trajectory,
     TrajectoryGroup,
 )
+from art.vllm_route_transport import (
+    RETAINED_ROUTE_BUNDLE_KEY,
+    RetainedRouteBundleRef,
+    RouteBundleBatchTransfer,
+    retained_route_bundles_from_groups,
+)
 
 from .data_plane import PackedBatchRef
 from .rollout import RolloutModelSpec
@@ -105,12 +111,26 @@ class TrajectoryPayload(BaseModel):
             for exchange in trajectory.exchanges.chat_completions
         )
         exclude: dict[str, Any] = {
-            "messages_and_choices": _routing_exclude(choice_routing),
+            "messages_and_choices": _routing_exclude(trajectory.messages_and_choices),
             "additional_histories": {
                 index: {
-                    "messages_and_choices": _routing_exclude(routing),
+                    "messages_and_choices": _routing_exclude(
+                        history.messages_and_choices
+                    ),
                 }
-                for index, routing in enumerate(history_routing)
+                for index, history in enumerate(trajectory.additional_histories)
+            },
+            "exchanges": {
+                "chat_completions": {
+                    index: {
+                        "response": {
+                            "choices": _routing_exclude(exchange.response.choices)
+                        }
+                    }
+                    for index, exchange in enumerate(
+                        trajectory.exchanges.chat_completions
+                    )
+                }
             },
         }
         return cls(
@@ -176,21 +196,28 @@ class TrajectoryPayload(BaseModel):
 
 
 def _choice_routing_metadata(items: list[Any]) -> dict[int, _ChoiceRoutingPayload]:
-    return {
-        index: _ChoiceRoutingPayload.from_metadata(metadata)
-        for index, item in enumerate(items)
-        if isinstance(item, Choice)
-        and isinstance(
-            metadata := (item.model_extra or {}).get(ART_MOE_ROUTING_METADATA_KEY),
-            dict,
-        )
-    }
+    routing = {}
+    for index, item in enumerate(items):
+        if not isinstance(item, Choice):
+            continue
+        metadata = (item.model_extra or {}).get(ART_MOE_ROUTING_METADATA_KEY)
+        if not isinstance(metadata, dict):
+            continue
+        if RETAINED_ROUTE_BUNDLE_KEY in metadata:
+            continue
+        routing[index] = _ChoiceRoutingPayload.from_metadata(metadata)
+    return routing
 
 
 def _routing_exclude(
-    routing: dict[int, _ChoiceRoutingPayload],
+    items: list[Any],
 ) -> dict[int, set[str]]:
-    return {index: {ART_MOE_ROUTING_METADATA_KEY} for index in routing}
+    return {
+        index: {ART_MOE_ROUTING_METADATA_KEY}
+        for index, item in enumerate(items)
+        if isinstance(item, Choice)
+        and ART_MOE_ROUTING_METADATA_KEY in (item.model_extra or {})
+    }
 
 
 def _build_choice(payload: Any, routing: _ChoiceRoutingPayload | None) -> Choice:
@@ -211,6 +238,7 @@ class TrajectoryGroupPayload(BaseModel):
     metrics: dict[str, float | int | bool] = Field(default_factory=dict)
     logs: tuple[str, ...] = ()
     collect_packing_shape: bool = False
+    retained_route_bundles: tuple[RetainedRouteBundleRef, ...] = ()
 
     @classmethod
     def from_group(cls, group: TrajectoryGroup) -> "TrajectoryGroupPayload":
@@ -226,6 +254,7 @@ class TrajectoryGroupPayload(BaseModel):
             metrics=group.metrics,
             logs=tuple(group.logs),
             collect_packing_shape=group._collect_packing_shape,
+            retained_route_bundles=retained_route_bundles_from_groups((group,)),
         )
 
     def build(self) -> TrajectoryGroup:
@@ -252,6 +281,8 @@ class PackingRequest(BaseModel):
     trajectory_groups: tuple[TrajectoryGroupBundle, ...] = ()
     trajectory_transfer: TrajectoryBatchTransfer | None = None
     trajectory_sources: tuple[TrajectoryQueueItem, ...] = ()
+    retained_route_bundles: tuple[RetainedRouteBundleRef, ...] = ()
+    route_bundle_transfer: RouteBundleBatchTransfer | None = None
     trajectory_log_path: str | None = None
     advantage_balance: float = 0.0
     allow_training_without_logprobs: bool = False
@@ -275,6 +306,17 @@ class PackingRequest(BaseModel):
         )
         if sum(inputs) != 1:
             raise ValueError("packing requires exactly one trajectory input")
+        if self.retained_route_bundles and self.route_bundle_transfer is not None:
+            raise ValueError("packing cannot mix retained refs and route transfer")
+        if (self.retained_route_bundles or self.route_bundle_transfer) and not (
+            self.include_moe_routing
+        ):
+            raise ValueError("retained routes require MoE routing replay")
+        refs = self.retained_route_bundles
+        if len({ref.layout.bundle_id for ref in refs}) != len(refs):
+            raise ValueError("packing repeats a retained route bundle")
+        if len({ref.layout.response_id for ref in refs}) != len(refs):
+            raise ValueError("packing repeats a retained route response")
         return self
 
     @classmethod
@@ -297,12 +339,14 @@ class PackingRequest(BaseModel):
     ) -> "PackingRequest":
         """Build a serializable packing request from public ART objects."""
 
+        groups = tuple(trajectory_groups)
         return cls(
             model=RolloutModelSpec.from_model(model),
             generation_id=secrets.token_hex(16),
             trajectory_groups=tuple(
-                TrajectoryGroupBundle.from_group(group) for group in trajectory_groups
+                TrajectoryGroupBundle.from_group(group) for group in groups
             ),
+            retained_route_bundles=retained_route_bundles_from_groups(groups),
             advantage_balance=advantage_balance,
             allow_training_without_logprobs=allow_training_without_logprobs,
             scale_rewards=scale_rewards,
@@ -311,7 +355,7 @@ class PackingRequest(BaseModel):
             logprob_calculation_chunk_size=logprob_calculation_chunk_size,
             include_moe_routing=include_moe_routing,
             collect_packing_shapes=any(
-                group._collect_packing_shape for group in trajectory_groups
+                group._collect_packing_shape for group in groups
             ),
             group_ids=group_ids,
             record_ids=record_ids,
@@ -330,6 +374,7 @@ class PackingResult(BaseModel):
     non_padding_tokens: int = Field(default=0, ge=0)
     trajectory_log_path: str | None = None
     trajectory_fetch_s: float = Field(default=0.0, ge=0)
+    route_fetch_s: float = Field(default=0.0, ge=0)
     packing_core_s: float = Field(default=0.0, ge=0)
     trajectory_log_wait_s: float = Field(default=0.0, ge=0)
     packed_batch_finalize_s: float = Field(default=0.0, ge=0)
