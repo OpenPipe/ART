@@ -200,6 +200,27 @@ async def test_external_runtime_server_live_smoke(
             )
             private_completion_response.raise_for_status()
             private_completion = private_completion_response.json()
+            private_receipt = await client.get(
+                f"/art/internal/v1/requests/{'e' * 64}",
+                headers=endpoint.request_headers(
+                    request_identity="e" * 64,
+                    cache_identity="f" * 64,
+                ),
+            )
+            duplicate_private_completion = await client.post(
+                endpoint.url.path,
+                headers=endpoint.request_headers(
+                    request_identity="e" * 64,
+                    cache_identity="f" * 64,
+                ),
+                json={
+                    "model": served_model_name,
+                    "messages": [{"role": "user", "content": "Say hello."}],
+                    "max_tokens": 8,
+                    "logprobs": True,
+                    "top_logprobs": 0,
+                },
+            )
 
         (artifact_dir / "runtime_smoke_result.json").write_text(
             json.dumps(
@@ -216,6 +237,10 @@ async def test_external_runtime_server_live_smoke(
                     "private_text": private_completion["choices"][0]["message"][
                         "content"
                     ],
+                    "private_receipt": private_receipt.json(),
+                    "duplicate_private_execution": (
+                        duplicate_private_completion.json()["execution"]
+                    ),
                     "stale_status": stale.status_code,
                     "unauthorized_status": unauthorized.status_code,
                 },
@@ -235,6 +260,10 @@ async def test_external_runtime_server_live_smoke(
         assert stale.status_code == 409
         assert stale.json()["execution"] == "not_started"
         assert private_completion["choices"][0]["logprobs"] is not None
+        assert private_receipt.status_code == 200
+        assert private_receipt.json()["execution"] == "completed"
+        assert duplicate_private_completion.status_code == 409
+        assert duplicate_private_completion.json()["execution"] == "completed"
     finally:
         process.terminate()
         try:

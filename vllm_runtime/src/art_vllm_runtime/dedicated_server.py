@@ -2,7 +2,10 @@
 
 import argparse
 import asyncio
+from collections import OrderedDict
+from dataclasses import dataclass
 from functools import lru_cache
+import hashlib
 import hmac
 from http import HTTPStatus
 from ipaddress import ip_address
@@ -30,6 +33,8 @@ from art_vllm_runtime.patches import apply_vllm_runtime_patches
 ART_SERVING_PROTOCOL_VERSION = 7
 _PRIVATE_CACHE_IDENTITY_HEADER = "x-art-cache-identity"
 _PRIVATE_DISPATCH_PATH = "/art/internal/v1/chat/completions"
+_PRIVATE_EXECUTION_RECEIPT_CAPACITY = 4096
+_PRIVATE_EXECUTION_RECEIPT_PREFIX = "/art/internal/v1/requests"
 _PRIVATE_REQUEST_IDENTITY_HEADER = "x-art-request-identity"
 _RUNTIME_TARGET_HEADER = "x-art-runtime-target"
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -38,6 +43,76 @@ _auth_tokens: list[str] = []
 _fast_metrics_port: int | None = None
 _private_dispatch_token: str | None = None
 _runtime_target_id: str | None = None
+
+
+@dataclass(frozen=True)
+class _PrivateExecutionReceipt:
+    fingerprint: str
+    execution: str
+
+
+class _PrivateExecutionReceipts:
+    def __init__(self, capacity: int) -> None:
+        if capacity < 1:
+            raise ValueError("private execution receipt capacity must be positive")
+        self.capacity = capacity
+        self._lock = asyncio.Lock()
+        self._receipts: OrderedDict[str, _PrivateExecutionReceipt] = OrderedDict()
+
+    async def claim(
+        self, request_identity: str, fingerprint: str
+    ) -> _PrivateExecutionReceipt | None:
+        async with self._lock:
+            existing = self._receipts.get(request_identity)
+            if existing is not None:
+                return existing
+            if len(self._receipts) >= self.capacity:
+                terminal = next(
+                    (
+                        identity
+                        for identity, receipt in self._receipts.items()
+                        if receipt.execution != "started"
+                    ),
+                    None,
+                )
+                if terminal is None:
+                    raise RuntimeError("private execution receipt capacity exhausted")
+                self._receipts.pop(terminal)
+            self._receipts[request_identity] = _PrivateExecutionReceipt(
+                fingerprint=fingerprint,
+                execution="started",
+            )
+            return None
+
+    async def settle(
+        self, request_identity: str, fingerprint: str, execution: str
+    ) -> None:
+        async with self._lock:
+            current = self._receipts.get(request_identity)
+            if current is None or current.fingerprint != fingerprint:
+                raise RuntimeError("private execution receipt identity changed")
+            self._receipts[request_identity] = _PrivateExecutionReceipt(
+                fingerprint=fingerprint,
+                execution=execution,
+            )
+            self._receipts.move_to_end(request_identity)
+
+    async def release_not_started(
+        self, request_identity: str, fingerprint: str
+    ) -> None:
+        async with self._lock:
+            current = self._receipts.get(request_identity)
+            if current is not None and current.fingerprint == fingerprint:
+                self._receipts.pop(request_identity)
+
+    async def get(self, request_identity: str) -> _PrivateExecutionReceipt | None:
+        async with self._lock:
+            return self._receipts.get(request_identity)
+
+
+_private_execution_receipts = _PrivateExecutionReceipts(
+    _PRIVATE_EXECUTION_RECEIPT_CAPACITY
+)
 
 
 def _patch_prebound_listener_tcp_nodelay(api_server: Any) -> None:
@@ -183,7 +258,9 @@ class _ArtAuthenticationMiddleware(AuthenticationMiddleware):
         ):
             return self.app(scope, receive, send)
         headers = Headers(scope=scope)
-        if path == _PRIVATE_DISPATCH_PATH:
+        if path == _PRIVATE_DISPATCH_PATH or path.startswith(
+            f"{_PRIVATE_EXECUTION_RECEIPT_PREFIX}/"
+        ):
             if _verify_bearer(headers, _private_dispatch_token):
                 return self.app(scope, receive, send)
         elif not _auth_tokens:
@@ -211,7 +288,9 @@ def _verify_bearer(headers: Headers, token: str | None) -> bool:
     )
 
 
-def _private_dispatch_context(request: Any) -> tuple[str, str] | JSONResponse:
+def _private_runtime_target_error(
+    request: Any, *, execution: str = "not_started"
+) -> JSONResponse | None:
     headers = request.headers
     target_values = headers.getlist(_RUNTIME_TARGET_HEADER)
     if (
@@ -223,10 +302,18 @@ def _private_dispatch_context(request: Any) -> tuple[str, str] | JSONResponse:
             content={
                 "error": "Runtime target is no longer active",
                 "type": "stale_runtime_target",
-                "execution": "not_started",
+                "execution": execution,
             },
             status_code=HTTPStatus.CONFLICT.value,
         )
+    return None
+
+
+def _private_dispatch_context(request: Any) -> tuple[str, str] | JSONResponse:
+    target_error = _private_runtime_target_error(request)
+    if target_error is not None:
+        return target_error
+    headers = request.headers
     identities = []
     for header in (
         _PRIVATE_REQUEST_IDENTITY_HEADER,
@@ -244,6 +331,56 @@ def _private_dispatch_context(request: Any) -> tuple[str, str] | JSONResponse:
             )
         identities.append(values[0])
     return identities[0], identities[1]
+
+
+def _private_request_fingerprint(request: Any) -> str:
+    return hashlib.sha256(
+        request.model_dump_json(exclude_none=False).encode()
+    ).hexdigest()
+
+
+def _private_duplicate_response(
+    receipt: _PrivateExecutionReceipt,
+    *,
+    fingerprint: str,
+) -> JSONResponse:
+    if receipt.fingerprint != fingerprint:
+        return JSONResponse(
+            content={
+                "error": "Request identity was reused for different content",
+                "type": "request_identity_conflict",
+                "execution": "not_started",
+                "prior_execution": receipt.execution,
+            },
+            status_code=HTTPStatus.CONFLICT.value,
+        )
+    return JSONResponse(
+        content={
+            "error": "Request identity already reached the paired runtime",
+            "type": "duplicate_request_identity",
+            "execution": receipt.execution,
+        },
+        status_code=HTTPStatus.CONFLICT.value,
+    )
+
+
+async def _track_private_stream(
+    request_identity: str,
+    fingerprint: str,
+    body_iterator: Any,
+):
+    try:
+        async for chunk in body_iterator:
+            yield chunk
+    except BaseException:
+        await _private_execution_receipts.settle(
+            request_identity, fingerprint, "ambiguous"
+        )
+        raise
+    else:
+        await _private_execution_receipts.settle(
+            request_identity, fingerprint, "completed"
+        )
 
 
 class _ResetPrefixCacheRequest(BaseModel):
@@ -458,10 +595,90 @@ def _patch_art_runtime_routes() -> None:
             context = _private_dispatch_context(raw_request)
             if isinstance(context, JSONResponse):
                 return context
-            _request_identity, cache_identity = context
+            request_identity, cache_identity = context
             request.cache_salt = f"art-private-cache-v1:{cache_identity}"
-            response = await create_chat_completion(request, raw_request)
-            return Response(status_code=499) if response is None else response
+            fingerprint = _private_request_fingerprint(request)
+            try:
+                existing = await _private_execution_receipts.claim(
+                    request_identity, fingerprint
+                )
+            except RuntimeError:
+                return JSONResponse(
+                    content={
+                        "error": "Private execution receipt capacity is exhausted",
+                        "type": "receipt_capacity_exhausted",
+                        "execution": "not_started",
+                    },
+                    status_code=HTTPStatus.SERVICE_UNAVAILABLE.value,
+                )
+            if existing is not None:
+                return _private_duplicate_response(
+                    existing,
+                    fingerprint=fingerprint,
+                )
+            try:
+                response = await create_chat_completion(request, raw_request)
+            except BaseException:
+                await _private_execution_receipts.settle(
+                    request_identity, fingerprint, "ambiguous"
+                )
+                raise
+            if response is None:
+                await _private_execution_receipts.settle(
+                    request_identity, fingerprint, "ambiguous"
+                )
+                return Response(status_code=499)
+            if response.status_code >= HTTPStatus.BAD_REQUEST.value:
+                await _private_execution_receipts.release_not_started(
+                    request_identity, fingerprint
+                )
+                return response
+            body_iterator = getattr(response, "body_iterator", None)
+            if body_iterator is not None:
+                response.body_iterator = _track_private_stream(
+                    request_identity,
+                    fingerprint,
+                    body_iterator,
+                )
+            else:
+                await _private_execution_receipts.settle(
+                    request_identity, fingerprint, "completed"
+                )
+            return response
+
+        @router.get(f"{_PRIVATE_EXECUTION_RECEIPT_PREFIX}/{{request_identity}}")
+        async def private_execution_receipt(
+            request_identity: str, raw_request: Request
+        ) -> JSONResponse:
+            target_error = _private_runtime_target_error(
+                raw_request, execution="unknown"
+            )
+            if target_error is not None:
+                return target_error
+            if _SHA256_RE.fullmatch(request_identity) is None:
+                return JSONResponse(
+                    content={
+                        "error": "Invalid private request identity",
+                        "type": "invalid_private_context",
+                        "execution": "not_started",
+                    },
+                    status_code=HTTPStatus.BAD_REQUEST.value,
+                )
+            receipt = await _private_execution_receipts.get(request_identity)
+            if receipt is None:
+                return JSONResponse(
+                    content={
+                        "type": "execution_receipt_missing",
+                        "execution": "unknown",
+                    },
+                    status_code=HTTPStatus.NOT_FOUND.value,
+                )
+            return JSONResponse(
+                content={
+                    "type": "execution_receipt",
+                    "execution": receipt.execution,
+                }
+            )
 
         @router.post(
             "/art/v1/chat/completions",

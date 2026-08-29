@@ -297,6 +297,56 @@ def test_private_dispatch_uses_distinct_auth_and_fences_runtime_target(
     stale = dedicated_server._private_dispatch_context(Request(scope))
     assert stale.status_code == 409
     assert b'"execution":"not_started"' in stale.body
+    stale_receipt = dedicated_server._private_runtime_target_error(
+        Request(scope), execution="unknown"
+    )
+    assert stale_receipt is not None
+    assert b'"execution":"unknown"' in stale_receipt.body
+
+
+@pytest.mark.asyncio
+async def test_private_execution_receipts_are_bounded_and_fail_closed() -> None:
+    receipts = dedicated_server._PrivateExecutionReceipts(capacity=2)
+
+    assert await receipts.claim("a" * 64, "payload-a") is None
+    duplicate = await receipts.claim("a" * 64, "payload-a")
+    assert duplicate is not None
+    assert duplicate.execution == "started"
+    assert duplicate.fingerprint == "payload-a"
+
+    await receipts.settle("a" * 64, "payload-a", "completed")
+    assert await receipts.claim("b" * 64, "payload-b") is None
+    assert await receipts.claim("c" * 64, "payload-c") is None
+    assert await receipts.get("a" * 64) is None
+    assert (await receipts.get("b" * 64)).execution == "started"  # type: ignore[union-attr]
+
+    with pytest.raises(RuntimeError, match="capacity exhausted"):
+        await receipts.claim("d" * 64, "payload-d")
+
+
+@pytest.mark.asyncio
+async def test_private_stream_receipt_is_completed_only_at_terminal_chunk(
+    monkeypatch,
+) -> None:
+    receipts = dedicated_server._PrivateExecutionReceipts(capacity=2)
+    monkeypatch.setattr(dedicated_server, "_private_execution_receipts", receipts)
+    identity = "a" * 64
+    fingerprint = "payload"
+    assert await receipts.claim(identity, fingerprint) is None
+
+    async def chunks():
+        yield b"first"
+        yield b"second"
+
+    observed = []
+    async for chunk in dedicated_server._track_private_stream(
+        identity, fingerprint, chunks()
+    ):
+        observed.append(chunk)
+        assert (await receipts.get(identity)).execution == "started"  # type: ignore[union-attr]
+
+    assert observed == [b"first", b"second"]
+    assert (await receipts.get(identity)).execution == "completed"  # type: ignore[union-attr]
 
 
 def test_runtime_sleep_route_returns_engine_validation_error(monkeypatch) -> None:
