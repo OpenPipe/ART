@@ -497,12 +497,13 @@ class MegatronTrainJobExecutor:
         self._gradient_parent_versions.clear()
 
     def discard_run_gradients(self, run_id: str) -> tuple[str, ...]:
-        gradients = self._gradients.pop(run_id, None)
-        self._gradient_parent_versions.pop(run_id, None)
+        gradients = self._gradients.get(run_id)
         if gradients is None:
             return ()
         contributions = gradients.contribution_ids
         gradients.discard()
+        self._gradients.pop(run_id)
+        self._gradient_parent_versions.pop(run_id, None)
         return contributions
 
     def run_gradient_ids(self, run_id: str) -> tuple[str, ...]:

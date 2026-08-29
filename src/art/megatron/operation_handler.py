@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field
+from datetime import datetime
 import hashlib
 import json
 from typing import Any, Literal, Protocol, cast
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from art.distributed.art_runtime import ArtRuntime, DistributedPackedBatch
 from art.distributed.packing import PackingRequest
@@ -58,7 +59,7 @@ class MegatronCheckpointOperations(Protocol):
         request: SaveWeightsForSamplerRequest,
         operation: OperationRef,
         generation: TrainerGeneration,
-    ) -> SamplerWeightsResult: ...
+    ) -> SamplerWeightsResult | "MegatronSamplerPublicationReceipt": ...
 
     async def save_state(
         self,
@@ -90,6 +91,73 @@ class MegatronArtifactResourcePlan(BaseModel):
     lora_bytes: int = Field(ge=0)
     transfer_bytes: int = Field(ge=0)
     storage_bytes: int = Field(ge=0)
+
+
+class MegatronRetainedState(BaseModel):
+    """Exact durable owner transferred into service retention after success."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    owner_id: str = Field(min_length=1)
+    resource: Literal["lora", "storage"]
+    bytes: int = Field(gt=0)
+    work_fingerprint: str = Field(min_length=1)
+    expires_at: datetime | None = None
+
+    @model_validator(mode="after")
+    def _validate_expiry(self) -> "MegatronRetainedState":
+        if self.expires_at is not None and self.expires_at.utcoffset() is None:
+            raise ValueError("retained-state expiry must include a timezone")
+        return self
+
+
+class MegatronSamplerPublicationReceipt(BaseModel):
+    """Private durable proof for one operation-keyed serving publication."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    operation_id: str = Field(min_length=1, max_length=64)
+    request_id: str = Field(min_length=1)
+    publication_mode: Literal["versioned_lora", "in_flight_lora", "merged_weights"]
+    requested_public_alias: str = Field(min_length=1)
+    runtime_model_name: str = Field(min_length=1)
+    runtime_lora_name: str | None = Field(default=None, min_length=1)
+    serving_generation_id: str = Field(min_length=1)
+    learner_version: int = Field(ge=0)
+    holder_update_sequence: int = Field(ge=0)
+    holder_update_id: str = Field(min_length=1)
+    retained: tuple[MegatronRetainedState, ...] = Field(min_length=1, max_length=16)
+    result: SamplerWeightsResult
+
+    def validate_command(
+        self,
+        request: SaveWeightsForSamplerRequest,
+        operation: OperationRef,
+        generation: TrainerGeneration,
+    ) -> None:
+        alias = request.publication.model_alias
+        if (
+            request.publication.mode == "none"
+            or alias is None
+            or self.operation_id != operation.operation_id
+            or self.request_id != request.request_id
+            or self.publication_mode != request.publication.mode
+            or self.requested_public_alias != alias
+            or self.serving_generation_id != generation.generation_id
+            or self.learner_version != generation.policy_step
+            or self.result.operation_id != operation.operation_id
+            or self.result.checkpoint.run_id != operation.run_id
+            or self.result.checkpoint.learner_version != generation.policy_step
+        ):
+            raise RuntimeError("sampler publication receipt changed command identity")
+        lora_mode = self.publication_mode in {"versioned_lora", "in_flight_lora"}
+        if lora_mode != (self.runtime_lora_name is not None) or any(
+            item.resource != ("lora" if lora_mode else "storage")
+            for item in self.retained
+        ):
+            raise RuntimeError("sampler publication retained the wrong resource kind")
+        if len({item.owner_id for item in self.retained}) != len(self.retained):
+            raise RuntimeError("sampler publication owner IDs must be unique")
 
 
 class MegatronLoadedState(BaseModel):
@@ -165,6 +233,7 @@ class MegatronOperationHandler:
         self._contributions: dict[str, str] = {}
         self._capture_lock = asyncio.Lock()
         self._release_failures: dict[str, BaseException] = {}
+        self._sampler_publications: dict[str, MegatronSamplerPublicationReceipt] = {}
 
     @property
     def generation(self) -> TrainerGeneration:
@@ -269,12 +338,23 @@ class MegatronOperationHandler:
                 usage=CommandExecutionUsage.no_work(),
             )
         if isinstance(request, SaveWeightsForSamplerRequest):
-            result = await self.checkpoints.save_weights_for_sampler(
+            saved = await self.checkpoints.save_weights_for_sampler(
                 request, operation, self._generation
             )
+            if isinstance(saved, MegatronSamplerPublicationReceipt):
+                saved.validate_command(request, operation, self._generation)
+                result = saved.result
+            else:
+                if request.publication.mode != "none":
+                    raise RuntimeError(
+                        "sampler publication returned no durable holder receipt"
+                    )
+                result = saved
             await self.trainer.record_control_command(
                 operation, self._generation.policy_step
             )
+            if isinstance(saved, MegatronSamplerPublicationReceipt):
+                self._sampler_publications[operation.operation_id] = saved
             return result
         if isinstance(request, SaveStateRequest):
             result = await self.checkpoints.save_state(
@@ -335,6 +415,14 @@ class MegatronOperationHandler:
             for operation_id, capture_id in self._contributions.items()
         )
 
+    def sampler_publication_receipt(
+        self, operation_id: str
+    ) -> MegatronSamplerPublicationReceipt | None:
+        return self._sampler_publications.get(operation_id)
+
+    def retire_operation(self, operation_id: str) -> None:
+        self._sampler_publications.pop(operation_id, None)
+
     async def plan_artifacts(self, request: RunCommand) -> MegatronArtifactResourcePlan:
         if not isinstance(
             request,
@@ -360,6 +448,7 @@ class MegatronOperationHandler:
             await self._release_if_unowned(capture_id)
         if self._captures:
             raise RuntimeError("packed inputs remain after run drain")
+        self._sampler_publications.clear()
 
     async def release_after_migration(self) -> None:
         """Release source-local replay leases after target activation."""
@@ -371,6 +460,7 @@ class MegatronOperationHandler:
             await self._release_if_unowned(capture_id)
         if self._captures:
             raise RuntimeError("packed inputs remain after migration source release")
+        self._sampler_publications.clear()
 
     async def _forward(
         self,
@@ -698,7 +788,15 @@ def _capture_manifest_sha256(
             {
                 "operation_id": operation.operation_id,
                 "request_fingerprint": request_fingerprint,
-                "packed": packed.leases.ref.model_dump(mode="json"),
+                "packed": packed.leases.ref.model_dump(
+                    mode="json",
+                    exclude={
+                        "owner_actor_id",
+                        "lease_id",
+                        "shared_memory_name",
+                        "owner_process_id",
+                    },
+                ),
                 "packing": packing.model_dump(mode="json"),
             },
             sort_keys=True,

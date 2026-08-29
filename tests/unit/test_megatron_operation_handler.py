@@ -1,4 +1,5 @@
 import asyncio
+from datetime import UTC, datetime
 from types import SimpleNamespace
 
 import pytest
@@ -15,6 +16,8 @@ from art.distributed.trajectory_store import TrajectoryGroupBundle
 from art.megatron.operation_handler import (
     MegatronOperationConfig,
     MegatronOperationHandler,
+    MegatronRetainedState,
+    MegatronSamplerPublicationReceipt,
 )
 from art.megatron.runtime.monarch import MonarchTrainerRun
 from art.megatron.runtime.specs import TrainerCommandRunState, TrainerGeneration
@@ -26,6 +29,7 @@ from art.megatron.slot_coordinator import (
 )
 from art.training import (
     AdamConfig,
+    CheckpointRef,
     CommandAdmission,
     ForwardBackwardRequest,
     ForwardBackwardResult,
@@ -35,6 +39,9 @@ from art.training import (
     OperationRef,
     OptimStepRequest,
     RlTrajectoryBatch,
+    SamplerPublication,
+    SamplerWeightsResult,
+    SaveWeightsForSamplerRequest,
 )
 from art.trajectories import TrajectoryGroup
 
@@ -379,6 +386,86 @@ async def test_slot_coordinator_serializes_four_logical_runs() -> None:
 
 
 @pytest.mark.asyncio
+async def test_sampler_publication_receipt_lives_until_operation_retirement() -> None:
+    class _Checkpoints:
+        async def save_weights_for_sampler(self, request, operation, generation):
+            result = SamplerWeightsResult(
+                operation_id=operation.operation_id,
+                checkpoint=CheckpointRef(
+                    run_id=operation.run_id,
+                    learner_version=generation.policy_step,
+                    checkpoint_id="public-checkpoint",
+                ),
+                lora="public-lora",
+            )
+            return MegatronSamplerPublicationReceipt(
+                operation_id=operation.operation_id,
+                request_id=request.request_id,
+                publication_mode=request.publication.mode,
+                requested_public_alias=request.publication.model_alias,
+                runtime_model_name="paired-model",
+                runtime_lora_name="paired-model@step-0",
+                serving_generation_id=generation.generation_id,
+                learner_version=generation.policy_step,
+                holder_update_sequence=3,
+                holder_update_id="holder-update-3",
+                retained=(
+                    MegatronRetainedState(
+                        owner_id="lora-owner/run/publish",
+                        resource="lora",
+                        bytes=4096,
+                        work_fingerprint="f" * 64,
+                        expires_at=datetime(2026, 8, 30, tzinfo=UTC),
+                    ),
+                ),
+                result=result,
+            )
+
+    runtime = _Runtime()
+    trainer = _Trainer()
+    slot = MegatronSlotCoordinator(runtime, trainer)  # type: ignore[arg-type]
+    run = await slot.register_run(
+        MegatronOperationConfig(
+            run_id="run",
+            training_session_id="session",
+            source=TrainerGeneration(
+                training_session_id="session",
+                policy_step=0,
+                generation_id=f"step-00000000-{'a' * 32}",
+                adapter_path="/adapter/0",
+            ),
+            optimizer_state_path="/optimizer",
+            rollout_model=RolloutModelSpec(payload={}),
+            output_adapter_root="/adapter",
+        ),
+        checkpoints=_Checkpoints(),  # type: ignore[arg-type]
+    )
+    outcome = await run.worker.execute(
+        SaveWeightsForSamplerRequest(
+            run_id="run",
+            request_id="publish-request",
+            sequence_id=0,
+            checkpoint_name="step-0",
+            ttl_seconds=60,
+            publication=SamplerPublication(
+                mode="in_flight_lora",
+                model_alias="public-policy",
+            ),
+        ),
+        _operation("publish", "save_sampler", 0),
+    )
+
+    assert outcome.status == "succeeded"
+    receipt = slot.sampler_publication_receipt("run", "publish")
+    assert receipt is not None
+    assert receipt.requested_public_alias == "public-policy"
+    assert receipt.retained[0].owner_id == "lora-owner/run/publish"
+    run.worker.retire("publish")
+    assert slot.sampler_publication_receipt("run", "publish") is None
+    await slot.aclose()
+
+
+@pytest.mark.asyncio
 async def test_slot_migration_fences_replays_and_releases_one_run() -> None:
     runtime = _Runtime()
     trainer = _Trainer()
@@ -412,43 +499,51 @@ async def test_slot_migration_fences_replays_and_releases_one_run() -> None:
     )
     operation = _operation("fb-replay", "forward_backward", 4, parent=2)
 
+    replays = (
+        MegatronMigrationReplay(
+            request=request,
+            admission=CommandAdmission(ref=operation),
+        ),
+    )
     outcomes = await slot.replay_migration_operations(
         "run",
         "restore-1",
-        (
-            MegatronMigrationReplay(
-                request=request,
-                admission=CommandAdmission(ref=operation),
-            ),
-        ),
+        replays,
     )
     assert [outcome.status for outcome in outcomes] == ["succeeded"]
+    assert (
+        await slot.replay_migration_operations("run", "restore-1", replays) == outcomes
+    )
     result = outcomes[0]
     assert result.status == "succeeded"
     assert isinstance(result.result, ForwardBackwardResult)
     assert result.result.packed_input_capture is not None
-    await slot.activate_migration_run(
-        "run",
-        "restore-1",
-        MegatronMigrationFence(
-            fence_id="source-fence",
-            run_id="run",
-            generation=TrainerGeneration(
-                training_session_id="session",
-                policy_step=2,
-                generation_id=f"step-00000002-{'a' * 32}",
-                adapter_path="/adapter/2",
-            ),
-            optimizer_state_path="/optimizer/2",
-            next_operation_sequence=5,
-            open_contributions=(
-                MegatronMigrationContribution(
-                    operation_id="fb-replay",
-                    packed_input=result.result.packed_input_capture,
-                ),
+    source_fence = MegatronMigrationFence(
+        fence_id="source-fence",
+        run_id="run",
+        generation=TrainerGeneration(
+            training_session_id="session",
+            policy_step=2,
+            generation_id=f"step-00000002-{'a' * 32}",
+            adapter_path="/source-adapter/2",
+        ),
+        optimizer_state_path="/optimizer/2",
+        next_operation_sequence=5,
+        open_contributions=(
+            MegatronMigrationContribution(
+                operation_id="fb-replay",
+                packed_input=result.result.packed_input_capture,
             ),
         ),
     )
+    await slot.activate_migration_run("run", "restore-1", source_fence)
+    assert await slot.activate_migration_run("run", "restore-1", source_fence) == run
+    with pytest.raises(RuntimeError, match="source fence changed"):
+        await slot.activate_migration_run(
+            "run",
+            "restore-1",
+            source_fence.model_copy(update={"fence_id": "other-source"}),
+        )
     assert slot.resolve_run("run") == run
 
     fence = await slot.fence_and_quiesce_run("run", "fence-2")
@@ -461,6 +556,8 @@ async def test_slot_migration_fences_replays_and_releases_one_run() -> None:
 
     await slot.resume_migration_source("run", "fence-2")
     assert slot.resolve_run("run") == run
+    with pytest.raises(RuntimeError, match="already resumed"):
+        await slot.fence_and_quiesce_run("run", "fence-2")
     fence = await slot.fence_and_quiesce_run("run", "fence-3")
     await slot.release_migration_source(fence)
     await slot.release_migration_source(fence)
@@ -468,6 +565,32 @@ async def test_slot_migration_fences_replays_and_releases_one_run() -> None:
     assert runtime.released == [runtime.packed]
     with pytest.raises(KeyError):
         slot.resolve_run("run")
+
+    abort_config = MegatronOperationConfig(
+        run_id="abort-run",
+        training_session_id="abort-session",
+        source=TrainerGeneration(
+            training_session_id="abort-session",
+            policy_step=0,
+            generation_id=f"step-00000000-{'b' * 32}",
+            adapter_path="/adapter/abort",
+        ),
+        optimizer_state_path="/optimizer/abort",
+        rollout_model=RolloutModelSpec(payload={}),
+        output_adapter_root="/adapter",
+    )
+    abort = await slot.install_migration_run(
+        abort_config,
+        restore_id="abort-restore",
+    )
+    assert abort.run_id == "abort-run"
+    await slot.abort_migration_run("abort-run", "abort-restore")
+    await slot.abort_migration_run("abort-run", "abort-restore")
+    with pytest.raises(RuntimeError, match="already aborted"):
+        await slot.install_migration_run(
+            abort_config,
+            restore_id="abort-restore",
+        )
     await slot.aclose()
 
 
