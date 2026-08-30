@@ -18,15 +18,21 @@ esac
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 cd "${script_dir}"
+runtime_env="${UV_PROJECT_ENVIRONMENT:-${script_dir}/.venv}"
+if [[ "${runtime_env}" != /* ]]; then
+    runtime_env="${script_dir}/${runtime_env}"
+fi
+runtime_python="${runtime_env}/bin/python"
 uv_bin="uv"
 if [ -x "${HOME}/.local/bin/uv" ]; then
     uv_bin="${HOME}/.local/bin/uv"
 fi
 echo "[art-vllm-runtime-setup] CUDA_HOME=${cuda_home}, profile=${runtime_extra}"
-"${uv_bin}" sync --extra "${runtime_extra}" --frozen --no-dev
+UV_PROJECT_ENVIRONMENT="${runtime_env}" \
+    "${uv_bin}" sync --extra "${runtime_extra}" --frozen --no-dev
 
 cutlass_cu13_intact() {
-    ".venv/bin/python" - <<'PY'
+    "${runtime_python}" - <<'PY'
 import base64
 import hashlib
 from importlib.metadata import PackageNotFoundError, distribution
@@ -54,11 +60,11 @@ PY
 
 if [ "${cuda_major}" = 13 ] && ! cutlass_cu13_intact; then
     echo "[art-vllm-runtime-setup] Repairing CUTLASS DSL install-order race"
-    site_packages="$(".venv/bin/python" -c \
+    site_packages="$("${runtime_python}" -c \
         'import sysconfig; print(sysconfig.get_paths()["purelib"])')"
     # Overlay the wheel because its files share directories with libs-base;
     # uninstalling either wheel first can delete files owned by the other.
-    "${uv_bin}" pip install --python .venv/bin/python --target "${site_packages}" \
+    "${uv_bin}" pip install --python "${runtime_python}" --target "${site_packages}" \
         --reinstall --no-deps \
         nvidia-cutlass-dsl-libs-cu13==4.5.2
     cutlass_cu13_intact || {
@@ -67,7 +73,7 @@ if [ "${cuda_major}" = 13 ] && ! cutlass_cu13_intact; then
     }
 fi
 
-".venv/bin/python" - <<'PY'
+"${runtime_python}" - <<'PY'
 import torch
 import vllm
 
