@@ -6,6 +6,7 @@ from art_vllm_runtime.resource_usage import (
     KVUsageOwner,
     PhysicalKVTracker,
     _account_future,
+    _GPUUsageBatchTracker,
 )
 
 
@@ -59,6 +60,16 @@ def test_physical_kv_counts_cached_blocks_once_until_eviction() -> None:
     tracker.release_unresident(blocks)
 
     assert [update["byte_count"] for update in tracker.take_updates()] == [128, 64, 0]
+
+
+def test_gpu_usage_completes_after_all_queued_batches_drain() -> None:
+    tracker = _GPUUsageBatchTracker()
+    owners = {"engine-request": object()}
+    tracker.register(owners)
+    tracker.register(owners)
+
+    assert tracker.finish(owners, {}) == set()
+    assert tracker.finish(owners, {}) == {"engine-request"}
 
 
 def test_accounting_future_drives_lazy_vllm_future() -> None:

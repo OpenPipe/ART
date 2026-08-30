@@ -37,6 +37,8 @@ def test_runtime_usage_pages_are_gapless_bounded_and_acknowledged() -> None:
     journal = RuntimeUsageJournal("paired-runtime", 4, capacity=2, clock=lambda: now[0])
     journal.reserve("request-a", _context("tenant-a"))
     journal.reserve("request-b", _context("tenant-b"))
+    journal.record_gpu_complete("request-a")
+    journal.record_gpu_complete("request-b")
     assert journal.record_finished(
         _finished("chatcmpl-request-a"), observed_unix_s=10.0
     )
@@ -79,6 +81,7 @@ def test_runtime_usage_pages_are_gapless_bounded_and_acknowledged() -> None:
 def test_runtime_usage_preserves_unknown_terminal_measurements() -> None:
     journal = RuntimeUsageJournal("paired-runtime", 0)
     journal.reserve("request", _context("tenant"))
+    journal.record_gpu_complete("request")
     malformed = _finished("request")
     malformed.num_cached_tokens = 13
 
@@ -99,6 +102,7 @@ def test_runtime_usage_emits_exact_gpu_and_closed_kv_usage() -> None:
     )
     journal.reserve("request", _context("tenant"))
     journal.record_gpu_service("request", 3_000_000)
+    journal.record_gpu_complete("request")
     assert journal.record_finished(_finished("request"), observed_unix_s=100.125)
     owner = KVUsageOwner("tenant", "run-tenant", "standard", "test-model")
     journal.record_kv_residency(0, owner, byte_count=8, monotonic_ns=1_000)
@@ -110,6 +114,22 @@ def test_runtime_usage_emits_exact_gpu_and_closed_kv_usage() -> None:
     ] == "3"
     assert residency["producer"] == "residency"
     assert residency["measurements"] == ({"metric": "kv_byte_ms", "quantity": "0.008"},)
+
+
+def test_runtime_usage_waits_for_late_gpu_service_before_sealing() -> None:
+    journal = RuntimeUsageJournal("paired-runtime", 0)
+    journal.reserve("request", _context("tenant"))
+    journal.record_gpu_service("request", 1_000_000)
+
+    assert journal.record_finished(_finished("request"), observed_unix_s=100.125)
+    assert journal.read(after_sequence=0)["receipts"] == ()
+
+    journal.record_gpu_service("request", 2_000_000)
+    journal.record_gpu_complete("request")
+    receipt = journal.read(after_sequence=0)["receipts"][0]
+    assert {item["metric"]: item["quantity"] for item in receipt["measurements"]}[
+        "inference_gpu_ms"
+    ] == "3"
 
 
 def test_empty_page_observation_advances_only_after_activity_drains() -> None:

@@ -33,6 +33,9 @@ class RuntimeRequestContext:
 class _PendingRequest:
     context: RuntimeRequestContext
     gpu_service_ns: int = 0
+    gpu_complete: bool = False
+    finished: Any | None = None
+    observed_unix_s: float | None = None
 
 
 @dataclass(slots=True)
@@ -98,6 +101,17 @@ class RuntimeUsageJournal:
                 raise RuntimeError("GPU service belongs to an inactive request")
             pending.gpu_service_ns += gpu_service_ns
 
+    def record_gpu_complete(self, request_identity: Any) -> None:
+        request_identity = _identity(request_identity, "request_identity", 255)
+        with self._lock:
+            pending = self._pending.get(request_identity)
+            if pending is None:
+                raise RuntimeError("GPU completion belongs to an inactive request")
+            if pending.gpu_complete:
+                raise RuntimeError("GPU completion was reported more than once")
+            pending.gpu_complete = True
+            self._finalize_request(request_identity, pending)
+
     def record_kv_residency(
         self,
         engine_index: Any,
@@ -148,25 +162,39 @@ class RuntimeUsageJournal:
             return False
         with self._lock:
             receipt_id = request_id
-            pending = self._pending.pop(receipt_id, None)
+            pending = self._pending.get(receipt_id)
             if pending is None and request_id.startswith("chatcmpl-"):
                 receipt_id = request_id.removeprefix("chatcmpl-")
-                pending = self._pending.pop(receipt_id, None)
+                pending = self._pending.get(receipt_id)
             if pending is None:
                 return False
-            sequence = self._next_sequence
-            self._next_sequence += 1
+            if pending.finished is not None:
+                return False
             observed = max(
                 self._last_observed_unix_s,
                 _clock_now(
                     self._clock if observed_unix_s is None else lambda: observed_unix_s
                 ),
             )
-            self._receipts[sequence] = self._receipt(
-                receipt_id, pending, finished, sequence, observed
-            )
-            self._last_observed_unix_s = observed
+            pending.finished = finished
+            pending.observed_unix_s = observed
+            self._finalize_request(receipt_id, pending)
             return True
+
+    def _finalize_request(self, request_id: str, pending: _PendingRequest) -> None:
+        if not pending.gpu_complete or pending.finished is None:
+            return
+        observed = pending.observed_unix_s
+        if observed is None:
+            raise RuntimeError("terminal usage observation is unavailable")
+        if self._pending.pop(request_id, None) is not pending:
+            raise RuntimeError("terminal usage request changed before completion")
+        sequence = self._next_sequence
+        self._next_sequence += 1
+        self._receipts[sequence] = self._receipt(
+            request_id, pending, pending.finished, sequence, observed
+        )
+        self._last_observed_unix_s = observed
 
     def read(self, *, after_sequence: int, limit: int = 64) -> dict[str, object]:
         after_sequence = _nonnegative_int(after_sequence, "after_sequence")

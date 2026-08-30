@@ -22,6 +22,7 @@ _GPU_OWNERS = "_art_gpu_owners"
 _GPU_ALLOCATIONS = "_art_gpu_allocations"
 _GPU_TRACKER = "_art_gpu_tracker"
 _GPU_STAGES = "_art_gpu_stages"
+_GPU_BATCH_TRACKER = "_art_gpu_batch_tracker"
 _KV_TRACKER = "_art_kv_tracker"
 _KV_BYTES_PER_BLOCK = "_art_physical_kv_bytes_per_block"
 _OUTPUT_FIELD = "art_runtime_usage_updates"
@@ -353,6 +354,45 @@ class _StageCoordinator:
             return pending.scheduler_output
 
 
+class _GPUUsageBatchTracker:
+    """Mark request GPU usage complete after every queued batch has drained."""
+
+    def __init__(self, max_batches: int = _MAX_BATCHES) -> None:
+        self._max_batches = max_batches
+        self._batch_count = 0
+        self._pending: dict[str, int] = {}
+
+    def register(self, owners: Mapping[str, object]) -> None:
+        if not owners:
+            return
+        if self._batch_count >= self._max_batches:
+            raise RuntimeError("GPU usage batch capacity exhausted")
+        self._batch_count += 1
+        for request_id in owners:
+            self._pending[request_id] = self._pending.get(request_id, 0) + 1
+
+    def finish(
+        self, owners: Mapping[str, object], active_requests: Mapping[str, object]
+    ) -> set[str]:
+        if not owners:
+            return set()
+        if self._batch_count <= 0:
+            raise RuntimeError("GPU usage batch completion is stale")
+        self._batch_count -= 1
+        completed = set()
+        for request_id in owners:
+            pending = self._pending.get(request_id)
+            if pending is None or pending <= 0:
+                raise RuntimeError("GPU usage request completion is stale")
+            if pending == 1:
+                self._pending.pop(request_id)
+                if request_id not in active_requests:
+                    completed.add(request_id)
+            else:
+                self._pending[request_id] = pending - 1
+        return completed
+
+
 class PhysicalKVTracker:
     """Track each resident physical block once, including prefix-cache blocks."""
 
@@ -492,9 +532,13 @@ def attach_scheduler_usage(
 ) -> None:
     allocations = getattr(scheduler_output, _GPU_ALLOCATIONS, None)
     owners = getattr(scheduler_output, _GPU_OWNERS, None)
+    batch_tracker = getattr(scheduler, _GPU_BATCH_TRACKER, None)
+    if not isinstance(batch_tracker, _GPUUsageBatchTracker):
+        raise RuntimeError("GPU usage batch tracker is unavailable")
+    if not isinstance(owners, Mapping):
+        raise RuntimeError("GPU service owner transport is unavailable")
+    completed = batch_tracker.finish(owners, scheduler.requests)
     if scheduler_output.total_num_scheduled_tokens:
-        if not isinstance(owners, Mapping):
-            raise RuntimeError("GPU service owner transport is unavailable")
         if not isinstance(allocations, Mapping):
             if owners:
                 raise RuntimeError("GPU service allocation transport is unavailable")
@@ -509,16 +553,25 @@ def attach_scheduler_usage(
 
                 target = outputs_by_client[client_index] = EngineCoreOutputs()
             owner = RuntimeUsageOwner.from_payload(owner_payload)
-            _append_updates(
-                target,
-                [
+            updates: list[dict[str, object]] = [
+                {
+                    "gpu_service_ns": allocations[request_id],
+                    "kind": "gpu",
+                    "request_id": owner.request_id,
+                    "version": 1,
+                }
+            ]
+            if request_id in completed:
+                updates.append(
                     {
-                        "gpu_service_ns": allocations[request_id],
-                        "kind": "gpu",
+                        "kind": "gpu_complete",
                         "request_id": owner.request_id,
                         "version": 1,
                     }
-                ],
+                )
+            _append_updates(
+                target,
+                updates,
             )
     tracker = getattr(scheduler.kv_cache_manager.block_pool, _KV_TRACKER, None)
     if not isinstance(tracker, PhysicalKVTracker):
@@ -559,6 +612,12 @@ def _consume_updates(engine_index: Any, updates: Any) -> None:
             "version",
         }:
             journal.record_gpu_service(update["request_id"], update["gpu_service_ns"])
+        elif kind == "gpu_complete" and set(update) == {
+            "kind",
+            "request_id",
+            "version",
+        }:
+            journal.record_gpu_complete(update["request_id"])
         elif kind == "kv" and set(update) == {
             "byte_count",
             "kind",
@@ -606,6 +665,13 @@ def _patch_scheduler() -> None:
             owner = request_usage_owner(request)
             if owner is not None:
                 owners[request_id] = (request.client_index, owner.payload())
+        batch_tracker = getattr(self, _GPU_BATCH_TRACKER, None)
+        if batch_tracker is None:
+            batch_tracker = _GPUUsageBatchTracker()
+            setattr(self, _GPU_BATCH_TRACKER, batch_tracker)
+        if not isinstance(batch_tracker, _GPUUsageBatchTracker):
+            raise RuntimeError("GPU usage batch tracker state is invalid")
+        batch_tracker.register(owners)
         setattr(output, _GPU_OWNERS, owners)
         return output
 
