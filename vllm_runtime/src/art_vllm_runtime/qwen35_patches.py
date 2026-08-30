@@ -1,53 +1,6 @@
 """Qwen3.5 compatibility patches for the ART-owned vLLM runtime."""
 
-from typing import Any, Literal
-
-GdnPrefillBackend = Literal["triton", "flashinfer", "cutedsl"]
-
-
-def _select_blackwell_gdn_prefill_backend(
-    *,
-    model_type: str,
-    requested: str,
-    active: GdnPrefillBackend,
-    is_sm10x: bool,
-) -> GdnPrefillBackend:
-    if (
-        model_type.startswith("qwen3_5")
-        and requested == "auto"
-        and active == "flashinfer"
-        and is_sm10x
-    ):
-        return "triton"
-    return active
-
-
-def patch_blackwell_gdn_prefill_backend() -> None:
-    """Use the reliable Triton/FLA GDN prefill path for Qwen3.5 on SM10x."""
-    from vllm.model_executor.layers.mamba.gdn import qwen_gdn_linear_attn
-
-    current = qwen_gdn_linear_attn._resolve_gdn_prefill_backend
-    if getattr(current, "__art_blackwell_gdn_patched__", False):
-        return
-    original = current
-
-    def resolve(
-        vllm_config: Any,
-    ) -> tuple[str, GdnPrefillBackend]:
-        requested, active = original(vllm_config)
-        model_type = str(vllm_config.model_config.hf_text_config.model_type)
-        return requested, _select_blackwell_gdn_prefill_backend(
-            model_type=model_type,
-            requested=requested,
-            active=active,
-            is_sm10x=qwen_gdn_linear_attn.current_platform.is_device_capability_family(
-                100
-            ),
-        )
-
-    setattr(resolve, "__art_blackwell_gdn_patched__", True)
-    setattr(resolve, "__art_original__", original)
-    setattr(qwen_gdn_linear_attn, "_resolve_gdn_prefill_backend", resolve)
+from typing import Any
 
 
 def patch_trtllm_monolithic_route_capture() -> None:
@@ -163,5 +116,4 @@ def patch_trtllm_monolithic_route_capture() -> None:
 
 
 def apply_qwen35_vllm_runtime_patches() -> None:
-    patch_blackwell_gdn_prefill_backend()
     patch_trtllm_monolithic_route_capture()

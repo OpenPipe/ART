@@ -278,13 +278,14 @@ def patch_binary_routed_experts_response() -> None:
         **kwargs: Any,
     ) -> Any:
         capture = _CAPTURE.get()
+        if capture is None:
+            return await original(self, request, result_generator, *args, **kwargs)
 
         async def stripped_results() -> AsyncIterator[Any]:
             async for result in result_generator:
                 for output in result.outputs:
                     if output.routed_experts is not None:
-                        if capture is not None:
-                            capture[int(output.index)] = output.routed_experts
+                        capture[int(output.index)] = output.routed_experts
                         output.routed_experts = None
                 yield result
 
