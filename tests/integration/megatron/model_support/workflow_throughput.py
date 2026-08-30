@@ -19,6 +19,7 @@ import uuid
 
 from art.megatron.model_support.registry import get_model_support_spec
 from art.megatron.model_support.spec import ArchitectureReport
+from art.vllm_runtime import _resolve_vllm_runtime_python
 
 from .validation_spec import ValidationStageResult
 from .workflow_fixtures import (
@@ -401,7 +402,7 @@ def _source_provenance() -> dict[str, Any]:
             Path(sys.executable), _MAIN_RUNTIME_PACKAGES
         ),
         "vllm_environment": _environment_provenance(
-            _REPO_ROOT / "vllm_runtime/.venv/bin/python", _VLLM_RUNTIME_PACKAGES
+            _resolve_vllm_runtime_python(), _VLLM_RUNTIME_PACKAGES
         ),
     }
 
