@@ -75,3 +75,22 @@ def test_accounting_future_drives_lazy_vllm_future() -> None:
     )
 
     assert completed.result() == "worker-output-accounted"
+
+
+def test_accounting_future_finishes_when_source_is_consumed_elsewhere() -> None:
+    class LazyFuture(Future[str]):
+        def result(self, timeout: float | None = None) -> str:
+            if not self.done():
+                self.set_result("worker-output")
+            return super().result(timeout)
+
+    source = LazyFuture()
+    completed = _account_future(
+        source,
+        lambda value: f"{value}-accounted",
+        lambda: None,
+    )
+
+    assert source.result() == "worker-output"
+    assert completed.done()
+    assert completed.result() == "worker-output-accounted"

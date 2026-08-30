@@ -679,24 +679,36 @@ class _AccountingFuture(Future[Any]):
         self._finish = finish
         self._fail = fail
         self._resolve_lock = RLock()
+        source.add_done_callback(self._source_completed)
+
+    def _source_completed(self, source: Future[Any]) -> None:
+        with self._resolve_lock:
+            if self.done():
+                return
+            try:
+                value = source.result()
+            except BaseException as execution_error:
+                try:
+                    self._fail()
+                except BaseException as accounting_error:
+                    self.set_exception(accounting_error)
+                else:
+                    self.set_exception(execution_error)
+            else:
+                try:
+                    self.set_result(self._finish(value))
+                except BaseException as accounting_error:
+                    self.set_exception(accounting_error)
 
     def result(self, timeout: float | None = None) -> Any:
-        with self._resolve_lock:
-            if not self.done():
-                try:
-                    value = self._source.result(timeout)
-                except BaseException as execution_error:
-                    try:
-                        self._fail()
-                    except BaseException as accounting_error:
-                        self.set_exception(accounting_error)
-                    else:
-                        self.set_exception(execution_error)
-                else:
-                    try:
-                        self.set_result(self._finish(value))
-                    except BaseException as accounting_error:
-                        self.set_exception(accounting_error)
+        if not self.done():
+            try:
+                self._source.result(timeout)
+            except BaseException:
+                if not self._source.done():
+                    raise
+            if self._source.done():
+                self._source_completed(self._source)
         return super().result(timeout)
 
 
