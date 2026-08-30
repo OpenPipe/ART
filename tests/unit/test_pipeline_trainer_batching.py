@@ -33,6 +33,35 @@ def _group() -> TrajectoryGroup:
     )
 
 
+def _packed_trainer(
+    tmp_path: Path, backend: Any, *, run_name: str
+) -> PipelineTrainer[Any, Any]:
+    trainer = PipelineTrainer(
+        model=TrainableModel(
+            run_name=run_name,
+            name=run_name,
+            project="pipeline-tests",
+            base_model="test-model",
+            base_path=str(tmp_path),
+            report_metrics=[],
+        ),
+        backend=backend,
+        rollout_fn=_noop_rollout,
+        scenarios=[],
+        config={},
+        pipeline=PipelineRuntimeConfig(
+            num_rollout_workers=1,
+            min_batch_size=1,
+            max_batch_size=1,
+        ),
+        max_steps=2,
+        eval_fn=None,
+    )
+    trainer._output_queue = asyncio.Queue()
+    trainer._packed_queue = asyncio.Queue(maxsize=1)
+    return trainer
+
+
 def test_eval_rejects_tokens_from_another_policy() -> None:
     choice = Choice(
         index=0,
@@ -94,36 +123,13 @@ async def test_collect_batch_respects_max_batch_size(tmp_path: Path) -> None:
 
 @pytest.mark.asyncio
 async def test_pre_next_dispatch_hook_blocks_packed_lookahead(tmp_path: Path) -> None:
-    model = TrainableModel(
-        run_name="pipeline-dispatch-hook-test",
-        name="pipeline-dispatch-hook-test",
-        project="pipeline-tests",
-        base_model="test-model",
-        base_path=str(tmp_path),
-        report_metrics=[],
-    )
     backend = MagicMock()
 
     async def train(*_args: object, **_kwargs: object) -> SimpleNamespace:
         return SimpleNamespace(step=backend.train.await_count, metrics={})
 
     backend.train = AsyncMock(side_effect=train)
-    trainer = PipelineTrainer(
-        model=model,
-        backend=backend,  # type: ignore[arg-type]
-        rollout_fn=_noop_rollout,
-        scenarios=[],
-        config={},
-        pipeline=PipelineRuntimeConfig(
-            num_rollout_workers=1,
-            min_batch_size=1,
-            max_batch_size=1,
-        ),
-        max_steps=2,
-        eval_fn=None,
-    )
-    trainer._output_queue = asyncio.Queue()
-    trainer._packed_queue = asyncio.Queue(maxsize=1)
+    trainer = _packed_trainer(tmp_path, backend, run_name="pipeline-dispatch-hook-test")
     hook_started = asyncio.Event()
     release_hook = asyncio.Event()
     second_prepared = asyncio.Event()
@@ -163,3 +169,59 @@ async def test_pre_next_dispatch_hook_blocks_packed_lookahead(tmp_path: Path) ->
     release_hook.set()
     await asyncio.wait_for(asyncio.gather(producer, training), timeout=2.0)
     assert backend.train.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_packed_lookahead_does_not_wait_for_prior_settlement(
+    tmp_path: Path,
+) -> None:
+    second_train_started = asyncio.Event()
+    finish_second_train = asyncio.Event()
+
+    async def train(*_args: object, **_kwargs: object) -> SimpleNamespace:
+        if backend.train.await_count == 2:
+            second_train_started.set()
+            await finish_second_train.wait()
+        return SimpleNamespace(step=backend.train.await_count, metrics={})
+
+    backend = MagicMock()
+    backend.supports_pipeline_train_dispatch_fence = False
+    backend.train = AsyncMock(side_effect=train)
+    trainer = _packed_trainer(tmp_path, backend, run_name="pipeline-lookahead-test")
+    release_settlement = asyncio.Event()
+
+    async def block_settlement(
+        _item: object, next_train_dispatched: asyncio.Event
+    ) -> None:
+        await next_train_dispatched.wait()
+        await release_settlement.wait()
+
+    trainer._finalize_post_train = block_settlement  # type: ignore[method-assign]
+    first = _PreparedPipelineItem(
+        batch=[_group()],
+        discarded=0,
+        zero_variance_discarded=0,
+        saw_sentinel=False,
+        packing_policy_step=0,
+        selection_s=0.0,
+        preparation_s=0.0,
+        preparation_metrics={},
+    )
+    second = first.model_copy(
+        update={"batch": [_group()], "saw_sentinel": True, "handoff": asyncio.Event()}
+    )
+
+    async def prepare() -> None:
+        await trainer._packed_queue.put(first)
+        await first.handoff.wait()
+        await trainer._packed_queue.put(second)
+        await second.handoff.wait()
+
+    producer = asyncio.create_task(prepare())
+    training = asyncio.create_task(trainer._training_stage())
+    await asyncio.wait_for(second_train_started.wait(), timeout=2.0)
+    await asyncio.wait_for(second.handoff.wait(), timeout=0.1)
+
+    release_settlement.set()
+    finish_second_train.set()
+    await asyncio.wait_for(asyncio.gather(producer, training), timeout=2.0)

@@ -1324,15 +1324,8 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
             should_checkpoint = self.save_checkpoint and should_eval_step
 
             self.state.next_training_step = expected_step
-            if self._packed_queue is not None:
-                if fence_next_dispatch:
-                    pass
-                elif post_train_task is None:
-                    prepared.handoff.set()
-                else:
-                    post_train_task.add_done_callback(
-                        lambda _task, event=prepared.handoff: event.set()
-                    )
+            if self._packed_queue is not None and not fence_next_dispatch:
+                prepared.handoff.set()
 
             self._status.note_training_start(len(batch))
             train_call_start = time.monotonic()
