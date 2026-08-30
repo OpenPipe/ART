@@ -14,6 +14,7 @@ from art.utils.safetensors import (
 
 ART_LORA_FORMAT_CONFIG_KEY = "art_lora_format"
 ART_LORA_FORMAT_VLLM = "vllm"
+ART_LORA_TRAINING_TARGETS_CONFIG_KEY = "art_training_target_modules"
 
 safetensors = importlib.import_module("safetensors")
 safe_open = safetensors.safe_open
@@ -36,6 +37,24 @@ def load_adapter_config(lora_path: str | Path) -> dict[str, Any]:
     with config_path.open("r", encoding="utf-8") as config_file:
         config = json.load(config_file)
     return config if isinstance(config, dict) else {}
+
+
+def training_target_modules(adapter_config: dict[str, Any]) -> tuple[str, ...]:
+    targets = adapter_config.get(
+        ART_LORA_TRAINING_TARGETS_CONFIG_KEY,
+        adapter_config.get("target_modules"),
+    )
+    if isinstance(targets, str):
+        return (targets,)
+    if isinstance(targets, (set, frozenset)) and all(
+        isinstance(target, str) for target in targets
+    ):
+        return tuple(sorted(targets))
+    if isinstance(targets, (list, tuple)) and all(
+        isinstance(target, str) for target in targets
+    ):
+        return tuple(targets)
+    return ()
 
 
 def save_adapter_config(lora_path: str | Path, adapter_config: dict[str, Any]) -> None:
@@ -110,6 +129,10 @@ def normalize_lora_checkpoint_to_vllm(
         adapter_config = load_adapter_config(lora_path)
     if adapter_config.get(ART_LORA_FORMAT_CONFIG_KEY) == ART_LORA_FORMAT_VLLM:
         return
+    adapter_config = dict(adapter_config)
+    adapter_config[ART_LORA_TRAINING_TARGETS_CONFIG_KEY] = list(
+        training_target_modules(adapter_config)
+    )
     resolved_handler = resolve_lora_handler(
         lora_path,
         handler,

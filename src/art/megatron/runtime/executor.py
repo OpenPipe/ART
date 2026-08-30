@@ -748,7 +748,10 @@ class MCoreRunSlotExecutor:
             if prior.spec != spec:
                 raise RuntimeError("run_id was reused with different trainer state")
             return prior.portable_read
-        from art.megatron.model_support.lora_disk import load_adapter_config
+        from art.megatron.model_support.lora_disk import (
+            load_adapter_config,
+            training_target_modules,
+        )
         from art.megatron.training.gradient_accumulator import (
             ParameterGradientAccumulator,
         )
@@ -760,12 +763,8 @@ class MCoreRunSlotExecutor:
         try:
             if spec.initial_portable_snapshot is None:
                 adapter_config = load_adapter_config(spec.initial_adapter_path)
-                targets = adapter_config.get("target_modules")
-                target_modules = (
-                    (targets,) if isinstance(targets, str) else tuple(targets or ())
-                )
                 if int(adapter_config.get("r", 0)) != spec.lora_rank or set(
-                    target_modules
+                    training_target_modules(adapter_config)
                 ) != set(spec.lora_target_modules):
                     raise RuntimeError(
                         "resident adapter shape differs from run admission"

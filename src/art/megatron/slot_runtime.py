@@ -306,17 +306,17 @@ def prepare_megatron_run_config(
                     str(optimizer_state),
                     initial_adapter_path=str(initial_adapter),
                 ).policy_adapter
-        from .model_support.lora_disk import load_adapter_config
+        from .model_support.lora_disk import (
+            load_adapter_config,
+            training_target_modules,
+        )
 
         adapter_config = load_adapter_config(adapter.identity)
-        targets = adapter_config.get("target_modules")
-        actual_targets = (
-            (targets,) if isinstance(targets, str) else tuple(targets or ())
-        )
         if (
             adapter.training_session_id != request.training_session_id
             or int(adapter_config.get("r", 0)) != spec.adapter.rank
-            or set(actual_targets) != set(spec.adapter.target_modules)
+            or set(training_target_modules(adapter_config))
+            != set(spec.adapter.target_modules)
             or adapter_config.get("base_model_name_or_path") != spec.base_model
         ):
             raise RuntimeError("recovered trainer state differs from run admission")

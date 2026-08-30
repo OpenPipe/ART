@@ -2,6 +2,8 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from safetensors.torch import save_file
+import torch
 
 import art
 from art.distributed import (
@@ -12,6 +14,35 @@ from art.distributed import (
     TrainerMeshSpec,
 )
 from art.megatron import MegatronSlotLaunchConfig, launch_megatron_slot
+from art.megatron.model_support.lora_disk import (
+    load_adapter_config,
+    normalize_lora_checkpoint_to_vllm,
+)
+
+
+def test_serving_normalization_retains_exact_training_targets(tmp_path) -> None:
+    save_file({"weight": torch.ones(1)}, tmp_path / "adapter_model.safetensors")
+    normalize_lora_checkpoint_to_vllm(
+        tmp_path,
+        handler=SimpleNamespace(
+            to_vllm_lora_tensors=lambda tensors, *, adapter_config: (
+                tensors,
+                {**adapter_config, "target_modules": ["q_proj", "experts"]},
+            )
+        ),  # ty: ignore[invalid-argument-type]
+        adapter_config={
+            "r": 1,
+            "target_modules": ["q_proj", "gate_proj", "up_proj", "down_proj"],
+        },
+    )
+    config = load_adapter_config(tmp_path)
+    assert config["target_modules"] == ["q_proj", "experts"]
+    assert config["art_training_target_modules"] == [
+        "q_proj",
+        "gate_proj",
+        "up_proj",
+        "down_proj",
+    ]
 
 
 @pytest.mark.asyncio
