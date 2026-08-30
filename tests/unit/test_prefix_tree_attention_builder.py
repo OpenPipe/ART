@@ -105,18 +105,22 @@ def test_prefix_tree_can_build_context_parallel_layout() -> None:
 
 
 def test_cp2_score_rebalance_crosses_multi_chunk_plateau() -> None:
+    evaluated: list[tuple[int, ...]] = []
+
+    def evaluate(*, owners: tuple[int, ...]) -> dict[str, object]:
+        evaluated.append(owners)
+        scores = (5.0 * owners.count(0), 10.0 * owners.count(1))
+        return {"score": max(scores), "rank_scores": scores}
+
     rebalanced = _score_rebalanced_cp2_assignment(
         current_owners=(0,) * 8 + (1,) * 8,
         current_eval={"score": 80.0, "rank_scores": (40.0, 80.0)},
-        evaluate_candidate=lambda *, owners: {
-            "score": 60.0,
-            "rank_scores": (60.0, 60.0),
-            "owners": owners,
-        },
+        evaluate_candidate=evaluate,
     )
 
     assert rebalanced is not None
     assert rebalanced[0] == (0,) * 11 + (1,) * 5
+    assert evaluated == [rebalanced[0]]
 
 
 def test_sparse_block_mask_exact_predicate_matches_dense_reference() -> None:
