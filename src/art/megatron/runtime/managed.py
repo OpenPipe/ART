@@ -395,8 +395,9 @@ def _fingerprint(
 
 
 def _hybrid_ep_launcher(python: Path, overlay: Path) -> Path:
+    python = python.absolute()
     identity = hashlib.sha256(
-        f"{python.resolve()}\0{overlay.resolve()}".encode()
+        f"{python}\0{overlay.resolve()}".encode()
     ).hexdigest()
     root = overlay.parent / "launchers"
     root.mkdir(parents=True, exist_ok=True)
@@ -408,7 +409,7 @@ def _hybrid_ep_launcher(python: Path, overlay: Path) -> Path:
         'export ART_MONARCH_PROGRAM_PYTHONPATH="$overlay'
         '${ART_MONARCH_PROGRAM_PYTHONPATH:+:$ART_MONARCH_PROGRAM_PYTHONPATH}"\n'
         'export PYTHONPATH="$ART_MONARCH_PROGRAM_PYTHONPATH"\n'
-        f'exec {shlex.quote(str(python.resolve()))} "$@"\n'
+        f'exec {shlex.quote(str(python))} "$@"\n'
     )
     lock_path = root / f".{identity}.lock"
     with lock_path.open("w") as lock:

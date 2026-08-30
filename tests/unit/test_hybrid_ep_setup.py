@@ -86,6 +86,7 @@ def test_hybrid_ep_launcher_pins_overlay(monkeypatch, tmp_path: Path) -> None:
 
     launcher = managed._hybrid_ep_launcher(python, overlay)
 
+    assert str(python.absolute()) in launcher.read_text()
     assert subprocess.check_output([launcher], text=True).strip() == (
         f"{overlay.resolve()}:/art/source"
     )
