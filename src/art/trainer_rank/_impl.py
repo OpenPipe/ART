@@ -77,7 +77,6 @@ class AdamParams:
     learning_rate: float
     beta1: float = 0.9
     beta2: float = 0.99
-    eps: float = 1e-13
     weight_decay: float = 0.1
     grad_clip_norm: float = 0.1
 
@@ -826,7 +825,6 @@ class TrainerRank:
         shared_prefix_max_depth: int = 1,
         memory_safety_factor: float = 1.10,
         memory_reserve_fraction: float = 0.03,
-        initialize_gradients: bool = True,
     ) -> None:
         pp_size = int(getattr(runtime.provider, "pipeline_model_parallel_size", 1) or 1)
         if pp_size > 1 or len(runtime.model) > 1:
@@ -898,8 +896,7 @@ class TrainerRank:
             OrderedDict()
         )
         self._last_global_micro_batch_size: int | None = None
-        if initialize_gradients:
-            self.zero_grad()
+        self.zero_grad()
 
     def zero_grad(self) -> None:
         for chunk in self.runtime.model:
@@ -2119,132 +2116,6 @@ class TrainerRank:
             )
             selected.append((name, slot_params, slot_grads, step_flags))
 
-        return self._step_dynamic_optimizer(selected, params=params)
-
-    def checkpoint_slot_parameters(self, name: str) -> tuple[torch.nn.Parameter, ...]:
-        try:
-            return self._checkpoint_slots[name].params
-        except KeyError as error:
-            raise ValueError(f"Unknown checkpoint slot: {name!r}") from error
-
-    def checkpoint_slot_optimizer_tensors(self, name: str) -> tuple[torch.Tensor, ...]:
-        try:
-            dynamic = self._checkpoint_slots[name].optimizer
-        except KeyError as error:
-            raise ValueError(f"Unknown checkpoint slot: {name!r}") from error
-        if dynamic is None:
-            return ()
-
-        tensors: list[torch.Tensor] = []
-        seen: set[int] = set()
-        for master in dynamic.master_params:
-            if master.device.type == "cuda" and id(master) not in seen:
-                tensors.append(master)
-                seen.add(id(master))
-            state = dynamic.optimizer.state.get(master, {})
-            for key in sorted(state):
-                value = state[key]
-                if (
-                    isinstance(value, torch.Tensor)
-                    and value.device.type == "cuda"
-                    and id(value) not in seen
-                ):
-                    tensors.append(value)
-                    seen.add(id(value))
-        return tuple(tensors)
-
-    def prepare_checkpoint_slot_optimizer(
-        self, name: str, params: AdamParams
-    ) -> tuple[torch.Tensor, ...]:
-        """Create the complete CUDA optimizer image before command admission."""
-
-        dynamic = self._dynamic_optimizer(name, params)
-        group = dynamic.optimizer.param_groups[0]
-        capturable = bool(group.get("capturable", False))
-        fused = bool(group.get("fused", False))
-        for master in dynamic.master_params:
-            state = dynamic.optimizer.state[master]
-            if state:
-                continue
-            step_device = master.device if capturable or fused else torch.device("cpu")
-            state["step"] = torch.zeros((), dtype=torch.float32, device=step_device)
-            state["exp_avg"] = torch.zeros_like(
-                master, memory_format=torch.preserve_format
-            )
-            state["exp_avg_sq"] = torch.zeros_like(
-                master, memory_format=torch.preserve_format
-            )
-            if bool(group.get("amsgrad", False)):
-                state["max_exp_avg_sq"] = torch.zeros_like(
-                    master, memory_format=torch.preserve_format
-                )
-        return self.checkpoint_slot_optimizer_tensors(name)
-
-    def clear_checkpoint_slot_grads(self, name: str) -> None:
-        for parameter in self.checkpoint_slot_parameters(name):
-            parameter.grad = None
-
-    def release_checkpoint_slot(self, name: str) -> None:
-        ref = self._slot_ref(name)
-        if ref in self._slot_stack or self._default_slot_ref == ref:
-            raise TrainerRankSlotStateError(
-                f"Cannot release active checkpoint slot {name!r}"
-            )
-        self._guard_slot_can_load(ref)
-        from art.megatron.lora import LoRA
-
-        for chunk in self.runtime.model:
-            for module in chunk.modules():
-                if not isinstance(module, LoRA):
-                    continue
-                key = module._slot_keys.pop(ref, None)
-                if key is not None:
-                    del module._slot_modules[key]
-        self._checkpoint_slots.pop(name, None)
-        self._slot_graphs().pop(ref, None)
-
-    def optim_step_reduced(
-        self,
-        name: str,
-        *,
-        params: AdamParams,
-        gradients: Sequence[torch.Tensor],
-        step_flags: Sequence[bool],
-    ) -> dict[str, float]:
-        slot_params = self.checkpoint_slot_parameters(name)
-        gradients = tuple(gradients)
-        step_flags = tuple(step_flags)
-        if len(gradients) != len(slot_params) or any(
-            tuple(gradient.shape) != tuple(parameter.shape)
-            for gradient, parameter in zip(gradients, slot_params, strict=True)
-        ):
-            raise ValueError("reduced gradient layout does not match checkpoint slot")
-        if len(step_flags) != len(slot_params):
-            raise ValueError("gradient step flags do not match checkpoint slot")
-        return self._step_dynamic_optimizer(
-            [(name, slot_params, gradients, step_flags)], params=params
-        )
-
-    def _step_dynamic_optimizer(
-        self,
-        selected: Sequence[
-            tuple[
-                str,
-                tuple[torch.nn.Parameter, ...],
-                Sequence[torch.Tensor],
-                Sequence[bool],
-            ]
-        ],
-        *,
-        params: AdamParams,
-    ) -> dict[str, float]:
-        for name, _model_params, grads, _step_flags in selected:
-            for grad, mask in zip(
-                grads,
-                self._dynamic_optimizer_padding_masks(name),
-                strict=True,
-            ):
-                grad.masked_fill_(mask, 0)
         all_params = tuple(
             param for _, slot_params, _, _ in selected for param in slot_params
         )
@@ -2324,9 +2195,7 @@ class TrainerRank:
         for group in dynamic.optimizer.param_groups:
             group["lr"] = params.learning_rate
             group["betas"] = (params.beta1, params.beta2)
-            group["eps"] = params.eps
             group["weight_decay"] = params.weight_decay
-        self._zero_dynamic_optimizer_padding(name, dynamic)
         return dynamic
 
     def _new_dynamic_optimizer(
@@ -2366,7 +2235,6 @@ class TrainerRank:
             masters,
             lr=params.learning_rate,
             betas=(params.beta1, params.beta2),
-            eps=params.eps,
             weight_decay=params.weight_decay,
         )
         dynamic = _DynamicOptimizer(optimizer, masters)
@@ -2522,43 +2390,6 @@ class TrainerRank:
         *,
         scale_grads: float,
     ) -> tuple[torch.Tensor, ...]:
-        gradients = tuple(
-            (
-                torch.zeros_like(param, dtype=torch.float32)
-                if param.grad is None
-                else param.grad.detach()
-            )
-            for param in params
-        )
-        return self._reduce_dynamic_gradient_tensors(
-            params, gradients, scale_grads=scale_grads
-        )
-
-    def reduce_checkpoint_slot_grads(
-        self,
-        name: str,
-        gradients: Sequence[torch.Tensor],
-        *,
-        scale_grads: float,
-    ) -> tuple[torch.Tensor, ...]:
-        params = self.checkpoint_slot_parameters(name)
-        gradients = tuple(gradients)
-        if len(gradients) != len(params) or any(
-            tuple(gradient.shape) != tuple(parameter.shape)
-            for gradient, parameter in zip(gradients, params, strict=True)
-        ):
-            raise ValueError("gradient layout does not match checkpoint slot")
-        return self._reduce_dynamic_gradient_tensors(
-            params, gradients, scale_grads=scale_grads
-        )
-
-    def _reduce_dynamic_gradient_tensors(
-        self,
-        params: Sequence[torch.nn.Parameter],
-        gradients: Sequence[torch.Tensor],
-        *,
-        scale_grads: float,
-    ) -> tuple[torch.Tensor, ...]:
         from megatron.core import parallel_state as ps
 
         from art.megatron.training.finalize_grads import (
@@ -2580,7 +2411,12 @@ class TrainerRank:
             buckets.setdefault(key, (group, op, []))[2].append(grad)
 
         grads = tuple(
-            gradient.detach().float().mul(scale_grads) for gradient in gradients
+            (
+                torch.zeros_like(param, dtype=torch.float32)
+                if param.grad is None
+                else param.grad.detach().float().mul(scale_grads)
+            )
+            for param in params
         )
         for param, grad in zip(params, grads, strict=True):
             if bool(getattr(param, "allreduce", True)):

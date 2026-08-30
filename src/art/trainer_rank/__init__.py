@@ -62,7 +62,6 @@ class TrainerRank(_impl.TrainerRank):
         shared_prefix_max_depth: int = 1,
         memory_safety_factor: float = 1.10,
         memory_reserve_fraction: float = 0.03,
-        initialize_gradients: bool = True,
     ) -> None:
         super().__init__(
             runtime,
@@ -70,7 +69,6 @@ class TrainerRank(_impl.TrainerRank):
             shared_prefix_max_depth=shared_prefix_max_depth,
             memory_safety_factor=memory_safety_factor,
             memory_reserve_fraction=memory_reserve_fraction,
-            initialize_gradients=initialize_gradients,
         )
 
     def zero_grad(self) -> None:
@@ -131,25 +129,6 @@ class TrainerRank(_impl.TrainerRank):
         checkpoint_path: str | Literal["active"] = "active",
     ) -> None:
         super().save_checkpoint(output_dir, checkpoint_path)
-
-    def checkpoint_slot_tensor_owners(self, name: str) -> tuple[tuple[str, int], ...]:
-        self.checkpoint_slot_parameters(name)
-        from art.megatron.weights.lora_publish import collect_local_lora_entries
-
-        _tensors, metadata = collect_local_lora_entries(
-            self.runtime.model,
-            {},
-            owner_rank=dist.get_rank() if dist.is_initialized() else 0,
-            slot_ref=self._slot_ref(name),
-        )
-        return tuple(
-            sorted(
-                {
-                    (item.key, int(item.manifest.get("shard_rank", 0)))
-                    for item in metadata
-                }
-            )
-        )
 
     def prepare_checkpoint_save(
         self,
@@ -370,49 +349,6 @@ class TrainerRank(_impl.TrainerRank):
             scale_grads=scale_grads,
             checkpoints=checkpoints,
             on_live_graphs=on_live_graphs,
-        )
-
-    def checkpoint_slot_parameters(self, name: str) -> tuple[torch.nn.Parameter, ...]:
-        return super().checkpoint_slot_parameters(name)
-
-    def checkpoint_slot_optimizer_tensors(self, name: str) -> tuple[torch.Tensor, ...]:
-        return super().checkpoint_slot_optimizer_tensors(name)
-
-    def prepare_checkpoint_slot_optimizer(
-        self, name: str, params: AdamParams
-    ) -> tuple[torch.Tensor, ...]:
-        return super().prepare_checkpoint_slot_optimizer(name, params)
-
-    def clear_checkpoint_slot_grads(self, name: str) -> None:
-        super().clear_checkpoint_slot_grads(name)
-
-    def release_checkpoint_slot(self, name: str) -> None:
-        super().release_checkpoint_slot(name)
-
-    def reduce_checkpoint_slot_grads(
-        self,
-        name: str,
-        gradients: Sequence[torch.Tensor],
-        *,
-        scale_grads: float,
-    ) -> tuple[torch.Tensor, ...]:
-        return super().reduce_checkpoint_slot_grads(
-            name, gradients, scale_grads=scale_grads
-        )
-
-    def optim_step_reduced(
-        self,
-        name: str,
-        *,
-        params: AdamParams,
-        gradients: Sequence[torch.Tensor],
-        step_flags: Sequence[bool],
-    ) -> dict[str, float]:
-        return super().optim_step_reduced(
-            name,
-            params=params,
-            gradients=gradients,
-            step_flags=step_flags,
         )
 
 

@@ -24,7 +24,7 @@ import os
 import random
 from threading import Event
 import time
-from typing import Any, Callable, Iterator, Literal, cast
+from typing import TYPE_CHECKING, Any, Callable, Iterator, Literal, Protocol, cast
 
 from megatron.core import parallel_state as ps
 from megatron.core.distributed import DistributedDataParallelConfig
@@ -33,6 +33,11 @@ from megatron.core.transformer.module import MegatronModule
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 import torch
 from torch._inductor.runtime.cache_dir_utils import cache_dir as inductor_cache_dir
+
+if TYPE_CHECKING:
+    from art.megatron.training.gradient_accumulator import (
+        ParameterGradientAccumulator,
+    )
 
 from art import dev, types
 from art.loss import (
@@ -155,6 +160,15 @@ _optimizer_stats_printed = False
 _INTER_FORWARD_BACKWARD_GAP_PREFIX = "time/inter_forward_backward_gap_rank_"
 _INTER_FORWARD_BACKWARD_GPU_GAP_PREFIX = "time/inter_forward_backward_gpu_gap_rank_"
 _INTER_FORWARD_BACKWARD_PHASE_PREFIX = "time/inter_forward_backward_"
+
+
+class _RunSlotParameters(Protocol):
+    def checkpoint_slot_parameters(
+        self, name: str
+    ) -> tuple[torch.nn.Parameter, ...]: ...
+
+    def clear_checkpoint_slot_grads(self, name: str) -> None: ...
+
 
 __all__ = [
     "DEFAULT_MODEL_IDENTIFIER",
@@ -1088,8 +1102,8 @@ def execute_megatron_dynamic_lora_forward_backward_job(
     job: ForwardBackwardJobSpec,
     packed_tensors: PackedTensors,
     *,
-    run_slots: Any,
-    gradient_accumulator: Any,
+    run_slots: _RunSlotParameters,
+    gradient_accumulator: "ParameterGradientAccumulator",
     cancelled: Event | None = None,
 ) -> MegatronForwardBackwardJobResult:
     """Execute F/B against one exact-shape resident Megatron run slot."""
@@ -1383,8 +1397,8 @@ def execute_megatron_dynamic_lora_sft_forward_backward_job(
     job: SftForwardBackwardJobSpec,
     batch: SFTBatchData,
     *,
-    run_slots: Any,
-    gradient_accumulator: Any,
+    run_slots: _RunSlotParameters,
+    gradient_accumulator: "ParameterGradientAccumulator",
     cancelled: Event | None = None,
 ) -> MegatronForwardBackwardJobResult:
     """Execute one exact SFT contribution against a resident LoRA slot."""
