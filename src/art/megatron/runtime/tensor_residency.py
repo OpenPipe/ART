@@ -360,12 +360,35 @@ class TensorResidencyMover:
         staging: "_PinnedStagerLease | None" = None,
     ) -> TensorResidencyTransition:
         """Move tensor storage and consume any caller-owned staging lease."""
+        return self._move_groups(self._groups(tensors), target, staging=staging)
+
+    def move_host_images(
+        self,
+        images: Iterable[HostTensorImage],
+        target: torch.device | str,
+        *,
+        staging: "_PinnedStagerLease | None" = None,
+    ) -> TensorResidencyTransition:
+        """Move the exact authenticated storage groups in host images."""
+        return self._move_groups(
+            tuple(group for image in images for group in image.groups()),
+            target,
+            staging=staging,
+        )
+
+    def _move_groups(
+        self,
+        groups: Iterable[_StorageGroup],
+        target: torch.device | str,
+        *,
+        staging: "_PinnedStagerLease | None" = None,
+    ) -> TensorResidencyTransition:
         owned_staging = staging
         try:
             target = self._normalized_device(torch.device(target))
             groups = tuple(
                 group
-                for group in self._groups(tensors)
+                for group in groups
                 if self._normalized_device(group.source.device) != target
             )
         except BaseException:

@@ -548,6 +548,7 @@ class RunResidencyManager:
                 )
                 reservations = self._reserve_many(demands)
             authoritative: list[HostTensorImage | TensorResidencySnapshot] = []
+            transfer_images: list[HostTensorImage] = []
             transition: TensorResidencyTransition | None = None
             staging = None
             try:
@@ -575,15 +576,12 @@ class RunResidencyManager:
                         )
                     elif staging is not None:
                         image = self._mover.stage_host_image(image, staging)
-                    image.activate()
-                source_bytes = self._mover.byte_count(
-                    tuple(tensor for state in missing for tensor in state.tensors),
-                    "cpu",
-                )
+                    transfer_images.append(image)
+                source_bytes = sum(image.stats.byte_count for image in transfer_images)
                 transfer_staging = staging
                 staging = None
-                transition = self._mover.move(
-                    tuple(tensor for state in missing for tensor in state.tensors),
+                transition = self._mover.move_host_images(
+                    transfer_images,
                     self.config.device,
                     staging=transfer_staging,
                 )
