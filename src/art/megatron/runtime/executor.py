@@ -947,14 +947,19 @@ class MCoreRunSlotExecutor:
         requested: tuple[str, ...],
         keys: tuple[ResidencyKey, ...],
     ) -> dict[str, Any]:
+        state = self._runs.get(run_id)
+        if state is None:
+            raise KeyError(f"trainer command run {run_id!r} is absent")
+        required = set(keys)
         components = []
-        for key in keys:
+        for key in self._state_keys(state):
             entry = self._residency.ledger.entry(key)
             l1 = next((copy for copy in entry.copies if copy.tier == "l1_gpu"), None)
             components.append(
                 {
                     "component": key.representation,
                     "generation_id": key.generation_id,
+                    "required_for_operation": key in required,
                     "byte_count": 0 if l1 is None else l1.byte_count,
                     "tiers": tuple(copy.tier for copy in entry.copies),
                     "l1_ready": l1 is not None,

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 from pathlib import Path
 import tempfile
@@ -127,6 +128,17 @@ class MegatronGateEvidenceRecorder:
             / f"{admission.ref.operation_id}.json",
             outcome.model_dump_json(indent=2).encode() + b"\n",
         )
+        residency = self.coordinator.residency_evidence(
+            request.run_id, admission.ref.operation_id
+        )
+        if residency is not None:
+            _write_json(
+                self.root
+                / "receipts"
+                / "residency"
+                / f"{admission.ref.operation_id}.json",
+                json.dumps(residency, indent=2, sort_keys=True).encode() + b"\n",
+            )
         if gradient_produced and capture_numerics:
             receipt = await self.coordinator.capture_forward_backward_numerics(
                 run_id=request.run_id,
