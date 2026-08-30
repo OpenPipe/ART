@@ -1927,7 +1927,7 @@ class DistributedMegatronService:
         retained_routes = self.runtime.retained_route_prefetch_enabled
         return ServingProfileIdentity(
             base_model=self.base_model,
-            model_identifier=spec.model_identifier,
+            model_identifier=spec.model_source,
             model_revision=spec.model_revision,
             model_support_key=spec.model_support_key,
             handler_name=spec.handler_name,
