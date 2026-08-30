@@ -48,6 +48,10 @@ from .runtime.portable_snapshot import (
     PortableSnapshotLoadReceipt,
 )
 from .runtime.publication import TrainerRankPublication
+from .runtime.residency import (
+    ResidencyCapacityUnavailable,
+    ResidencyWorkingSetTooLarge,
+)
 from .runtime.specs import (
     CommandPublicationSpec,
     TrainerCommandRunState,
@@ -113,6 +117,12 @@ class MegatronSlotResourceManager(Protocol):
     async def release_run(self, run_id: str) -> None: ...
 
 
+class MegatronOperationEvidenceSink(Protocol):
+    """Idempotently retain private command evidence before ART releases replay state."""
+
+    def retain_residency_evidence(self, evidence: dict[str, Any]) -> None: ...
+
+
 class InlineMegatronSlotResources:
     """Use the rank-local command ensure path without speculative readiness."""
 
@@ -136,16 +146,18 @@ class TrainerMegatronSlotResources:
     def __init__(self, trainer: "_SharedTrainer") -> None:
         self._trainer = trainer
         self._prefetches: dict[str, tuple[str, asyncio.Task[dict[str, Any]]]] = {}
+        # One executing command plus one command preparing ahead of it.
+        self._admission_slots = asyncio.Semaphore(2)
+        self._prepare_lock = asyncio.Lock()
+        self._capacity_changed = asyncio.Condition()
+        self._capacity_epoch = 0
+        self._admitted: set[str] = set()
 
     def prefetch(self, request: MegatronSlotResourceRequest) -> None:
         if request.operation_id in self._prefetches:
             return
         task = asyncio.create_task(
-            self._trainer.prefetch_command_run_residency(
-                request.run_id,
-                request.components,
-                request.source.policy_step,
-            ),
+            self._admit_when_available(request),
             name=f"megatron-residency-prefetch-{request.operation_id}",
         )
         self._prefetches[request.operation_id] = (request.run_id, task)
@@ -153,14 +165,9 @@ class TrainerMegatronSlotResources:
 
     async def ensure(self, request: MegatronSlotResourceRequest) -> dict[str, Any]:
         pending = self._prefetches.pop(request.operation_id, None)
-        if pending is not None:
-            await pending[1]
-        return await self._trainer.admit_command_run_residency(
-            request.operation_id,
-            request.run_id,
-            request.components,
-            request.source.policy_step,
-        )
+        if pending is None:
+            return await self._admit_when_available(request)
+        return await pending[1]
 
     async def release(self, request: MegatronSlotResourceRequest) -> None:
         pending = self._prefetches.pop(request.operation_id, None)
@@ -170,6 +177,8 @@ class TrainerMegatronSlotResources:
         await self._trainer.release_command_run_residency_admission(
             request.operation_id
         )
+        self._release_admission_slot(request.operation_id)
+        await self._notify_capacity_changed()
 
     async def release_run(self, run_id: str) -> None:
         pending = tuple(
@@ -184,6 +193,54 @@ class TrainerMegatronSlotResources:
             await asyncio.gather(
                 *(task for _operation_id, task in pending), return_exceptions=True
             )
+            for operation_id, _task in pending:
+                await self._trainer.release_command_run_residency_admission(
+                    operation_id
+                )
+                self._release_admission_slot(operation_id)
+            await self._notify_capacity_changed()
+
+    async def _admit_when_available(
+        self, request: MegatronSlotResourceRequest
+    ) -> dict[str, Any]:
+        acquired = False
+        try:
+            await self._admission_slots.acquire()
+            acquired = True
+            async with self._prepare_lock:
+                while True:
+                    observed_epoch = self._capacity_epoch
+                    try:
+                        evidence = await self._trainer.admit_command_run_residency(
+                            request.operation_id,
+                            request.run_id,
+                            request.components,
+                            request.source.policy_step,
+                        )
+                    except ResidencyWorkingSetTooLarge:
+                        raise
+                    except ResidencyCapacityUnavailable:
+                        async with self._capacity_changed:
+                            await self._capacity_changed.wait_for(
+                                lambda: self._capacity_epoch != observed_epoch
+                            )
+                    else:
+                        self._admitted.add(request.operation_id)
+                        return evidence
+        except BaseException:
+            if acquired:
+                self._admission_slots.release()
+            raise
+
+    def _release_admission_slot(self, operation_id: str) -> None:
+        if operation_id in self._admitted:
+            self._admitted.remove(operation_id)
+            self._admission_slots.release()
+
+    async def _notify_capacity_changed(self) -> None:
+        async with self._capacity_changed:
+            self._capacity_epoch += 1
+            self._capacity_changed.notify_all()
 
 
 def _consume_task_exception(task: asyncio.Task[Any]) -> None:
@@ -392,8 +449,8 @@ class _SlotOperationWorker(OperationWorker):
         )
 
     def retire(self, operation_id: str) -> None:
-        super().retire(operation_id)
         self._slot._retire_operation(self._run_id, self, operation_id)
+        super().retire(operation_id)
 
 
 class MegatronSlotCoordinator:
@@ -408,6 +465,7 @@ class MegatronSlotCoordinator:
         schedule: MegatronSlotScheduleConfig | None = None,
         publisher: MegatronPairedPublisher | None = None,
         route_ownership: RouteBundleOwnershipProvider | None = None,
+        operation_evidence_sink: MegatronOperationEvidenceSink | None = None,
         command_timeout_s: float = 300.0,
     ) -> None:
         if command_timeout_s <= 0:
@@ -418,6 +476,7 @@ class MegatronSlotCoordinator:
         self.schedule = schedule or MegatronSlotScheduleConfig()
         self.publisher = publisher
         self.route_ownership = route_ownership
+        self.operation_evidence_sink = operation_evidence_sink
         self.command_timeout_s = command_timeout_s
         self._runs: dict[str, _RunState] = {}
         self._ready: list[_ReadyCommand] = []
@@ -796,6 +855,9 @@ class MegatronSlotCoordinator:
     ) -> None:
         state = self._runs.get(run_id)
         if state is not None and state.worker is worker:
+            evidence = self._residency_evidence.get((run_id, operation_id))
+            if evidence is not None and self.operation_evidence_sink is not None:
+                self.operation_evidence_sink.retain_residency_evidence(evidence)
             state.handler.retire_operation(operation_id)
             self._residency_evidence.pop((run_id, operation_id), None)
 
@@ -1370,7 +1432,6 @@ class MegatronSlotCoordinator:
                 raise _not_executed("cancelled", "Megatron slot run is draining")
             state.preparing += 1
         capture: PackedInputCaptureRef | None = None
-        resource_admitted = False
         resource_request: MegatronSlotResourceRequest | None = None
         try:
             components = _components(request)
@@ -1403,7 +1464,6 @@ class MegatronSlotCoordinator:
                     self.resources.prefetch(resource_request)
             assert resource_request is not None
             evidence = await self.resources.ensure(resource_request)
-            resource_admitted = True
             self._residency_evidence[(operation.run_id, operation.operation_id)] = (
                 evidence
             )
@@ -1434,10 +1494,9 @@ class MegatronSlotCoordinator:
                         "capacity_exhausted", "Megatron slot ready queue is full"
                     )
                 self._ready.append(ready)
-                resource_admitted = False
                 self._condition.notify_all()
         except BaseException as error:
-            if resource_admitted and resource_request is not None:
+            if resource_request is not None:
                 try:
                     await self.resources.release(resource_request)
                 except BaseException as cleanup_error:

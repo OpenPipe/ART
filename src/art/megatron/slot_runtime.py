@@ -34,6 +34,7 @@ from .runtime.run_residency import RunResidencyPolicy
 from .runtime.specs import TrainerGeneration, TrainerRuntimeSpec
 from .runtime_config import init_megatron_runtime_config
 from .slot_coordinator import (
+    MegatronOperationEvidenceSink,
     MegatronSlotCoordinator,
     MegatronSlotResourceManager,
     MegatronSlotRun,
@@ -147,6 +148,7 @@ async def launch_megatron_slot(
     route_bundle_reader: RouteBundleReader | None = None,
     route_bundle_ownership: RouteBundleOwnershipProvider | None = None,
     resources: MegatronSlotResourceManager | None = None,
+    operation_evidence_sink: MegatronOperationEvidenceSink | None = None,
 ) -> MegatronSlotRuntime:
     """Start one shared trainer and return its only service-facing command root."""
 
@@ -198,6 +200,7 @@ async def launch_megatron_slot(
             schedule=config.schedule,
             publisher=paired_inference,
             route_ownership=route_bundle_ownership,
+            operation_evidence_sink=operation_evidence_sink,
             command_timeout_s=config.command_timeout_s,
         )
         runtime.register_closeable(coordinator)

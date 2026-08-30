@@ -68,6 +68,7 @@ from .publication import (
     TrainerPublicationSucceeded,
     TrainerRankPublication,
 )
+from .residency import ResidencyCapacityUnavailable, ResidencyWorkingSetTooLarge
 from .specs import (
     TRAIN_EVENT_ADAPTER,
     AdapterReady,
@@ -2838,6 +2839,11 @@ class MonarchTrainerRun:
                     f"{result.traceback_text or ''}"
                     for result in failures
                 )
+                error_types = {result.error_type for result in failures}
+                if error_types == {ResidencyWorkingSetTooLarge.__name__}:
+                    raise ResidencyWorkingSetTooLarge(details)
+                if error_types == {ResidencyCapacityUnavailable.__name__}:
+                    raise ResidencyCapacityUnavailable(details)
                 raise RuntimeError(f"residency preparation failed:\n{details}")
             if any(result.evidence is None for result in results):
                 raise RuntimeError("residency preparation returned no evidence")
@@ -3525,12 +3531,8 @@ class MonarchTrainerRun:
 
     def _record_fused_job_completion(self, job: TrainerJobSpec) -> None:
         state = self._command_runs.get(job.run_id)
-        if (
-            self._learner_version != job.expected_learner_version
-            or (
-                state is not None
-                and state.learner_version != job.expected_learner_version
-            )
+        if self._learner_version != job.expected_learner_version or (
+            state is not None and state.learner_version != job.expected_learner_version
         ):
             raise RuntimeError("fused job completion changed learner lineage")
         self._learner_version = job.learner_version

@@ -23,6 +23,7 @@ from .residency import (
     ResidencyLimits,
     ResidencyReservation,
     ResidencyTier,
+    ResidencyWorkingSetTooLarge,
     TierCapacity,
 )
 from .tensor_residency import (
@@ -508,7 +509,7 @@ class RunResidencyManager:
                 }
             capacity = self.config.limits.l1_gpu.max_bytes
             if demanded_bytes > capacity:
-                raise ResidencyCapacityUnavailable(
+                raise ResidencyWorkingSetTooLarge(
                     "l1_gpu demanded working set exceeds capacity: "
                     f"demanded={demanded_bytes}, max={capacity}"
                 )

@@ -34,12 +34,15 @@ from art.megatron.runtime.portable_snapshot import (
     PortableSnapshotReadReceipt,
     build_portable_snapshot_archive,
 )
+from art.megatron.runtime.residency import ResidencyCapacityUnavailable
 from art.megatron.runtime.specs import TrainerCommandRunState, TrainerGeneration
 from art.megatron.slot_coordinator import (
     MegatronMigrationContribution,
     MegatronMigrationFence,
     MegatronMigrationReplay,
     MegatronSlotCoordinator,
+    MegatronSlotResourceRequest,
+    TrainerMegatronSlotResources,
 )
 from art.training import (
     AdamConfig,
@@ -344,6 +347,71 @@ class _Trainer:
             "gpu_count": 4,
             "gpu_service_ns": 3_000_000,
         }
+
+
+@pytest.mark.asyncio
+async def test_slot_resources_keep_only_one_command_ahead_under_pressure() -> None:
+    class _CapacityTrainer:
+        def __init__(self) -> None:
+            self.attempts: list[str] = []
+            self.admitted: set[str] = set()
+
+        async def admit_command_run_residency(
+            self, operation_id, run_id, components, learner_version
+        ):
+            del run_id, components, learner_version
+            self.attempts.append(operation_id)
+            if self.admitted:
+                raise ResidencyCapacityUnavailable("current command pins L1")
+            self.admitted.add(operation_id)
+            return {"operation_id": operation_id}
+
+        async def release_command_run_residency_admission(self, operation_id):
+            self.admitted.discard(operation_id)
+
+    generation = TrainerGeneration(
+        training_session_id="session",
+        policy_step=0,
+        generation_id=f"step-00000000-{'a' * 32}",
+        adapter_path="/adapter/0",
+    )
+
+    def request(index: int) -> MegatronSlotResourceRequest:
+        return MegatronSlotResourceRequest(
+            run_id=f"run-{index}",
+            operation_id=f"operation-{index}",
+            source=generation,
+            optimizer_state_path=f"/optimizer/{index}",
+            components=("weights", "accumulator"),
+        )
+
+    trainer = _CapacityTrainer()
+    resources = TrainerMegatronSlotResources(trainer)  # type: ignore[arg-type]
+    requests = tuple(request(index) for index in range(3))
+    for item in requests:
+        resources.prefetch(item)
+
+    assert await resources.ensure(requests[0]) == {"operation_id": "operation-0"}
+    second = asyncio.create_task(resources.ensure(requests[1]))
+    await asyncio.sleep(0)
+    assert trainer.attempts == ["operation-0", "operation-1"]
+    assert "operation-2" not in trainer.attempts
+
+    await resources.release(requests[0])
+    assert await asyncio.wait_for(second, timeout=1.0) == {
+        "operation_id": "operation-1"
+    }
+    await asyncio.sleep(0)
+    assert trainer.attempts == [
+        "operation-0",
+        "operation-1",
+        "operation-1",
+        "operation-2",
+    ]
+
+    await resources.release(requests[1])
+    assert await resources.ensure(requests[2]) == {"operation_id": "operation-2"}
+    await resources.release(requests[2])
 
 
 def _operation(
@@ -910,6 +978,17 @@ async def test_slot_coordinator_serializes_gpu_work_before_result_settlement() -
 
 @pytest.mark.asyncio
 async def test_sampler_publication_receipt_lives_until_operation_retirement() -> None:
+    class _EvidenceSink:
+        def __init__(self) -> None:
+            self.attempts = 0
+            self.evidence = []
+
+        def retain_residency_evidence(self, evidence):
+            self.attempts += 1
+            if self.attempts == 1:
+                raise RuntimeError("evidence store unavailable")
+            self.evidence.append(evidence)
+
     class _Checkpoints:
         async def save_weights_for_sampler(self, request, operation, generation):
             result = SamplerWeightsResult(
@@ -955,7 +1034,10 @@ async def test_sampler_publication_receipt_lives_until_operation_retirement() ->
 
     runtime = _Runtime()
     trainer = _Trainer()
-    slot = MegatronSlotCoordinator(runtime, trainer)  # type: ignore[arg-type]
+    evidence_sink = _EvidenceSink()
+    slot = MegatronSlotCoordinator(  # type: ignore[arg-type]
+        runtime, trainer, operation_evidence_sink=evidence_sink
+    )
     run = await slot.register_run(
         MegatronOperationConfig(
             run_id="run",
@@ -993,7 +1075,29 @@ async def test_sampler_publication_receipt_lives_until_operation_retirement() ->
     assert receipt is not None
     assert receipt.requested_public_alias == "public-policy"
     assert receipt.retained[0].owner_id == "lora-owner/run/publish"
+    with pytest.raises(RuntimeError, match="evidence store unavailable"):
+        run.worker.retire("publish")
+    assert slot.sampler_publication_receipt("run", "publish") is receipt
+    assert (
+        await run.worker.execute(
+            SaveWeightsForSamplerRequest(
+                run_id="run",
+                request_id="publish-request",
+                sequence_id=0,
+                checkpoint_name="step-0",
+                ttl_seconds=60,
+                publication=SamplerPublication(
+                    mode="in_flight_lora",
+                    model_alias="public-policy",
+                ),
+            ),
+            _operation("publish", "save_sampler", 0),
+        )
+        == outcome
+    )
     run.worker.retire("publish")
+    assert evidence_sink.evidence[0]["operation_id"] == "publish"
+    assert evidence_sink.evidence[0]["requested_components"] == ()
     assert slot.sampler_publication_receipt("run", "publish") is None
     await slot.aclose()
 
