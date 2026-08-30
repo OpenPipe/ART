@@ -437,7 +437,7 @@ def _serving_profile_identity(
         trainer_dtype=spec.dtype,
         route_replay=spec.enable_moe_routing_replay,
         lora_transport="nixl" if runtime.nixl_transport else "local",
-        retained_route_transport="holder_local" if retained_routes else "none",
+        retained_route_transport=runtime.retained_route_transport,
         retained_route_max_bytes=(
             runtime.config.route_bundle_prefetch_capacity_bytes
             if retained_routes

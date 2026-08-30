@@ -1,10 +1,15 @@
 from __future__ import annotations
 
+import asyncio
+import base64
 from collections import defaultdict
 from collections.abc import AsyncIterator, Iterable, Mapping
 from dataclasses import dataclass
 import hashlib
 import json
+import os
+from pathlib import Path
+import stat
 import struct
 from typing import TYPE_CHECKING, Any, Literal, Protocol
 
@@ -31,6 +36,7 @@ ROUTE_HEADER = struct.Struct("<IB3xQQQ")
 DTYPES = {1: "u1", 2: "<u2"}
 ROUTE_BUNDLE_FORMAT = "art_inference_route_bundle_v1"
 RETAINED_ROUTE_BUNDLE_KEY = "retained_route_bundle"
+ART_PRIVATE_ROUTE_OBJECT_HEADER = "x-art-route-object"
 
 
 class _Contract(BaseModel):
@@ -126,7 +132,8 @@ class RetainedRouteBundleRef(_Contract):
 
 
 class RouteBundleBatchTransfer(_Contract):
-    stream: ByteStreamTransfer
+    stream: ByteStreamTransfer | None = None
+    local_objects: tuple[RouteBundleObjectRef, ...] = ()
     layouts: tuple[RouteBundleLayout, ...] = Field(min_length=1)
 
     @model_validator(mode="after")
@@ -135,9 +142,30 @@ class RouteBundleBatchTransfer(_Contract):
             raise ValueError("retained route transfer repeats a bundle")
         if len({layout.response_id for layout in self.layouts}) != len(self.layouts):
             raise ValueError("retained route transfer repeats a response")
-        if sum(layout.byte_count for layout in self.layouts) != self.stream.byte_count:
+        if (self.stream is None) == (not self.local_objects):
+            raise ValueError("retained route transfer must use one transport")
+        if (
+            self.stream is not None
+            and sum(layout.byte_count for layout in self.layouts)
+            != self.stream.byte_count
+        ):
             raise ValueError("retained route transfer size differs from its layouts")
+        if self.local_objects and (
+            len(self.local_objects) != len(self.layouts)
+            or any(
+                ref.store != "holder_local"
+                or ref.size_bytes != layout.byte_count
+                or ref.sha256 != layout.sha256
+                for ref, layout in zip(self.local_objects, self.layouts, strict=True)
+            )
+        ):
+            raise ValueError("local route objects differ from their layouts")
         return self
+
+    async def receive_payload(self, *, timeout_s: float) -> bytearray:
+        if self.stream is not None:
+            return await receive_byte_stream(self.stream, timeout_s=timeout_s)
+        return await asyncio.to_thread(_read_local_route_objects, self.local_objects)
 
     async def receive_into(
         self,
@@ -145,12 +173,15 @@ class RouteBundleBatchTransfer(_Contract):
         *,
         timeout_s: float,
     ) -> int:
-        payload = await receive_byte_stream(self.stream, timeout_s=timeout_s)
+        payload = await self.receive_payload(timeout_s=timeout_s)
         return hydrate_retained_route_bundles(groups, self.layouts, payload)
 
 
 class RouteBundleReader(Protocol):
     """Service-injected lease-aware reader; provider access stays outside ART."""
+
+    @property
+    def retained_route_transport(self) -> Literal["holder_local", "caios_lota"]: ...
 
     def read_stream(
         self, ref: RouteBundleObjectRef, *, lease_id: str
@@ -197,6 +228,17 @@ async def publish_retained_route_bundle_transfer(
         await publisher.close()
         raise
     return transfer, publisher
+
+
+def local_retained_route_bundle_transfer(
+    refs: tuple[RetainedRouteBundleRef, ...],
+) -> RouteBundleBatchTransfer:
+    if not refs:
+        raise ValueError("local retained route transfer requires at least one bundle")
+    return RouteBundleBatchTransfer(
+        local_objects=tuple(ref.object for ref in refs),
+        layouts=tuple(ref.layout for ref in refs),
+    )
 
 
 def attach_retained_route_bundle(
@@ -384,6 +426,84 @@ def retained_route_bundle_from_response(
     }
     layout = RouteBundleLayout(bundle_id=route_bundle_id(identity), **identity)
     return response, RouteBundlePayload(layout=layout, chunks=tuple(chunks))
+
+
+def retained_local_route_bundle_from_response(
+    body: bytes,
+    *,
+    object_header: str,
+    request_id: str,
+    owner_id: str,
+    model_identity: str,
+    lease_id: str,
+) -> tuple[ChatCompletion, RetainedRouteBundleRef]:
+    """Bind an authenticated local object header to the exact binary response."""
+
+    response, payload = retained_route_bundle_from_response(
+        body,
+        request_id=request_id,
+        owner_id=owner_id,
+        model_identity=model_identity,
+    )
+    if not object_header or len(object_header) > 16_384:
+        raise ValueError("local route object header is missing or oversized")
+    padding = "=" * (-len(object_header) % 4)
+    try:
+        decoded = base64.b64decode(
+            object_header + padding,
+            altchars=b"-_",
+            validate=True,
+        )
+        object_ref = RouteBundleObjectRef.model_validate_json(decoded)
+    except (ValueError, TypeError) as error:
+        raise ValueError("local route object header is malformed") from error
+    if object_ref.store != "holder_local":
+        raise ValueError("local route response referenced another object store")
+    if (
+        object_ref.size_bytes != payload.layout.byte_count
+        or object_ref.sha256 != payload.layout.sha256
+    ):
+        raise ValueError("local route object differs from the binary response")
+    return response, RetainedRouteBundleRef(
+        object=object_ref,
+        layout=payload.layout,
+        lease_id=lease_id,
+    )
+
+
+def _read_local_route_objects(
+    refs: tuple[RouteBundleObjectRef, ...],
+) -> bytearray:
+    root = Path(
+        os.environ.get("ART_VLLM_ROUTE_SHM_ROOT", "/dev/shm/art_vllm_routes")
+    ).resolve()
+    payload = bytearray()
+    for ref in refs:
+        target = Path(ref.locator).resolve()
+        if (
+            ref.store != "holder_local"
+            or target.suffix != ".routes"
+            or root not in target.parents
+        ):
+            raise RuntimeError("local route object escaped its runtime namespace")
+        descriptor = os.open(target, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        try:
+            metadata = os.fstat(descriptor)
+            if not stat.S_ISREG(metadata.st_mode) or metadata.st_size != ref.size_bytes:
+                raise RuntimeError("local route object changed size or type")
+            digest = hashlib.sha256()
+            start = len(payload)
+            while chunk := os.read(descriptor, 1 << 20):
+                payload.extend(chunk)
+                digest.update(chunk)
+            if (
+                len(payload) - start != ref.size_bytes
+                or digest.hexdigest() != ref.sha256
+            ):
+                raise RuntimeError("local route object changed digest")
+        finally:
+            os.close(descriptor)
+    return payload
 
 
 def decode_retained_route_bundle(

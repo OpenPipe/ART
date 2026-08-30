@@ -29,6 +29,10 @@ from art_vllm_runtime.binary_routes import (
     _register_model_route_layout,
 )
 from art_vllm_runtime.fast_metrics import FastMetricsSidecar
+from art_vllm_runtime.local_route_store import (
+    LocalRouteStore,
+    encode_route_object_header,
+)
 from art_vllm_runtime.patches import apply_vllm_runtime_patches
 from art_vllm_runtime.resource_usage import (
     bind_runtime_usage_context,
@@ -50,6 +54,7 @@ _PRIVATE_EXECUTION_RECEIPT_PREFIX = "/art/internal/v1/requests"
 _PRIVATE_REQUEST_IDENTITY_HEADER = "x-art-request-identity"
 _PRIVATE_ROUTE_CAPTURE_HEADER = "x-art-route-capture"
 _PRIVATE_ROUTE_MAX_BYTES_HEADER = "x-art-route-max-bytes"
+_PRIVATE_ROUTE_OBJECT_HEADER = "x-art-route-object"
 _PRIVATE_RUN_ID_HEADER = "x-art-run-id"
 _PRIVATE_SERVICE_TIER_HEADER = "x-art-service-tier"
 _PRIVATE_TENANT_ID_HEADER = "x-art-tenant-id"
@@ -61,6 +66,7 @@ _auth_tokens: list[str] = []
 _fast_metrics_port: int | None = None
 _private_dispatch_token: str | None = None
 _runtime_target_id: str | None = None
+_local_route_store: LocalRouteStore | None = None
 
 
 @dataclass(frozen=True)
@@ -133,6 +139,8 @@ class _PrivateRouteResponse:
     fingerprint: str
     reserved_bytes: int
     body: bytes | None = None
+    retained_bytes: int = 0
+    object_ref: dict[str, object] | None = None
 
 
 class _PrivateRouteResponses:
@@ -172,7 +180,13 @@ class _PrivateRouteResponses:
             self._reserved_bytes += reserved_bytes
 
     async def complete(
-        self, request_identity: str, fingerprint: str, body: bytes
+        self,
+        request_identity: str,
+        fingerprint: str,
+        body: bytes,
+        *,
+        retained_bytes: int,
+        object_ref: dict[str, object] | None,
     ) -> None:
         async with self._lock:
             response = self._responses.get(request_identity)
@@ -180,22 +194,30 @@ class _PrivateRouteResponses:
                 raise RuntimeError("private route response identity changed")
             if response.body is not None:
                 raise RuntimeError("private route response is already complete")
-            if not body or len(body) > response.reserved_bytes:
+            if (
+                not body
+                or len(body) > response.reserved_bytes
+                or not 1 <= retained_bytes <= response.reserved_bytes
+            ):
                 raise RuntimeError("private route response exceeded its reservation")
             self._responses[request_identity] = _PrivateRouteResponse(
                 fingerprint=fingerprint,
                 reserved_bytes=response.reserved_bytes,
                 body=body,
+                retained_bytes=retained_bytes,
+                object_ref=object_ref,
             )
 
-    async def replay(self, request_identity: str, fingerprint: str) -> bytes | None:
+    async def replay(
+        self, request_identity: str, fingerprint: str
+    ) -> _PrivateRouteResponse | None:
         async with self._lock:
             response = self._responses.get(request_identity)
             if response is None:
                 return None
             if response.fingerprint != fingerprint:
                 raise RuntimeError("private route request identity was reused")
-            return response.body
+            return response if response.body is not None else None
 
     async def release(self, request_identity: str, fingerprint: str) -> bool:
         async with self._lock:
@@ -206,6 +228,8 @@ class _PrivateRouteResponses:
                 raise RuntimeError("private route response identity changed")
             self._responses.pop(request_identity)
             self._reserved_bytes -= response.reserved_bytes
+            if response.object_ref is not None and _local_route_store is not None:
+                _local_route_store.release(response.object_ref)
             return True
 
     async def acknowledge(self, request_identity: str) -> int | None:
@@ -217,7 +241,7 @@ class _PrivateRouteResponses:
                 raise RuntimeError("private route response is not complete")
             self._responses.pop(request_identity)
             self._reserved_bytes -= response.reserved_bytes
-            return len(response.body)
+            return response.retained_bytes
 
     async def state(self) -> dict[str, int]:
         async with self._lock:
@@ -231,7 +255,7 @@ class _PrivateRouteResponses:
                 "retained_route_responses": len(completed),
                 "reserved_route_bytes": self._reserved_bytes,
                 "retained_route_bytes": sum(
-                    len(response.body or b"") for response in completed
+                    response.retained_bytes for response in completed
                 ),
             }
 
@@ -546,6 +570,16 @@ def _private_route_capture_max_bytes(request: Any) -> int | None | JSONResponse:
     return maximum
 
 
+def _retained_route_transport() -> str:
+    identity = _runtime_state.get("serving_profile_identity")
+    if not isinstance(identity, dict):
+        raise RuntimeError("retained-route profile identity is unavailable")
+    transport = identity.get("retained_route_transport")
+    if transport not in {"holder_local", "caios_lota"}:
+        raise RuntimeError("retained-route transport is unavailable")
+    return str(transport)
+
+
 def _private_route_capacity() -> tuple[int, int]:
     identity = _runtime_state.get("serving_profile_identity")
     if not isinstance(identity, dict):
@@ -771,6 +805,7 @@ def _patch_art_runtime_routes() -> None:
     from art_vllm_runtime.binary_routes import (
         capture_routed_experts,
         encode_routed_experts_response,
+        encode_routed_experts_response_parts,
         mark_route_request,
     )
 
@@ -885,9 +920,15 @@ def _patch_art_runtime_routes() -> None:
                         status_code=HTTPStatus.CONFLICT.value,
                     )
                 if retained is not None:
+                    headers = {}
+                    if retained.object_ref is not None:
+                        headers[_PRIVATE_ROUTE_OBJECT_HEADER] = (
+                            encode_route_object_header(retained.object_ref)
+                        )
                     return Response(
-                        content=retained,
+                        content=retained.body,
                         media_type="application/vnd.art.routed-experts-v2",
+                        headers=headers,
                     )
             try:
                 existing = await _private_execution_receipts.claim(
@@ -1015,12 +1056,28 @@ def _patch_art_runtime_routes() -> None:
                         fingerprint,
                         "vLLM returned no routed experts",
                     )
+                object_ref = None
                 try:
-                    retained = encode_routed_experts_response(response.body, routes)
-                    await _private_route_responses.complete(
-                        request_identity, fingerprint, retained
+                    retained, route_payload = encode_routed_experts_response_parts(
+                        response.body, routes
                     )
-                except RuntimeError as error:
+                    object_ref = None
+                    if _retained_route_transport() == "holder_local":
+                        if _local_route_store is None:
+                            raise RuntimeError("local route store is unavailable")
+                        object_ref = _local_route_store.retain(
+                            request_identity, route_payload
+                        )
+                    await _private_route_responses.complete(
+                        request_identity,
+                        fingerprint,
+                        retained,
+                        retained_bytes=len(route_payload),
+                        object_ref=object_ref,
+                    )
+                except (OSError, RuntimeError, ValueError) as error:
+                    if object_ref is not None and _local_route_store is not None:
+                        _local_route_store.release(object_ref)
                     return await _private_route_capture_failed(
                         request_identity, fingerprint, str(error)
                     )
@@ -1032,6 +1089,10 @@ def _patch_art_runtime_routes() -> None:
                     for key, value in response.headers.items()
                     if key.lower() not in {"content-length", "content-type"}
                 }
+                if object_ref is not None:
+                    headers[_PRIVATE_ROUTE_OBJECT_HEADER] = encode_route_object_header(
+                        object_ref
+                    )
                 return Response(
                     content=retained,
                     media_type="application/vnd.art.routed-experts-v2",
@@ -1505,7 +1566,8 @@ def _validate_pipeline_route_config(config: Any) -> None:
 
 
 def main(argv: list[str] | None = None) -> None:
-    global _fast_metrics_port, _private_dispatch_token, _runtime_target_id
+    global _fast_metrics_port, _local_route_store
+    global _private_dispatch_token, _runtime_target_id
 
     args = parse_args(argv)
     if (args.initial_generation_id is None) != (args.initial_policy_version is None):
@@ -1590,6 +1652,21 @@ def main(argv: list[str] | None = None) -> None:
         os.environ.pop(PIPELINE_ROUTES_ENV, None)
 
     process_uuid = args.process_uuid or uuid.uuid4().hex
+    retained_route_transport = (
+        serving_profile_identity.get("retained_route_transport")
+        if serving_profile_identity is not None
+        else None
+    )
+    if retained_route_transport == "holder_local" and not args.headless:
+        if args.runtime_source_id is None or args.runtime_source_epoch is None:
+            raise ValueError(
+                "holder-local route transport requires a runtime source identity"
+            )
+        _local_route_store = LocalRouteStore(
+            f"{args.runtime_source_id}:{args.runtime_source_epoch}:{process_uuid}"
+        )
+    else:
+        _local_route_store = None
 
     _runtime_state.update(
         runtime="art_vllm",
@@ -1709,6 +1786,9 @@ def main(argv: list[str] | None = None) -> None:
             _fast_metrics_port = None
             set_fast_metrics_writer(None)
             metrics_sidecar.close()
+            if _local_route_store is not None:
+                _local_route_store.close()
+                _local_route_store = None
 
 
 if __name__ == "__main__":

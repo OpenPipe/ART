@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Literal, Protocol
 
 from art.training import OperationRef, PackedInputCaptureRef
 from art.vllm_route_transport import RetainedRouteBundleRef
@@ -23,6 +23,9 @@ class RouteBundleOwnershipProvider(Protocol):
     transfer adds a target owner without invalidating the source; and the
     caller owns every returned handle until an idempotent release.
     """
+
+    @property
+    def retained_route_transport(self) -> Literal["holder_local", "caios_lota"]: ...
 
     async def acquire(
         self,

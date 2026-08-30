@@ -396,6 +396,7 @@ def _batch_with_retained_route() -> tuple[RlTrajectoryBatch, RetainedRouteBundle
     layout = RouteBundleLayout(bundle_id=route_bundle_id(identity), **identity)
     ref = RetainedRouteBundleRef(
         object=RouteBundleObjectRef(
+            store="caios",
             locator="caios://route",
             size_bytes=1,
             sha256=layout.sha256,

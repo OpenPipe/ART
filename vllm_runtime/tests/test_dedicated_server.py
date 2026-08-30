@@ -384,8 +384,15 @@ async def test_private_route_responses_reserve_replay_and_ack_exact_bytes() -> N
             capacity_bytes=8,
             capacity_bundles=1,
         )
-    await responses.complete(identity, "payload-a", b"route")
-    assert await responses.replay(identity, "payload-a") == b"route"
+    await responses.complete(
+        identity,
+        "payload-a",
+        b"response",
+        retained_bytes=5,
+        object_ref=None,
+    )
+    replay = await responses.replay(identity, "payload-a")
+    assert replay is not None and replay.body == b"response"
     with pytest.raises(RuntimeError, match="identity was reused"):
         await responses.replay(identity, "different")
     assert await responses.state() == {

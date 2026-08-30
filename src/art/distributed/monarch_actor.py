@@ -571,13 +571,16 @@ class ArtHostService(Actor):
 
         route_transfer = request.route_bundle_transfer
         if route_transfer is not None:
-            if route_transfer.stream.stream_id != f"{batch_id}:routes":
+            if (
+                route_transfer.stream is not None
+                and route_transfer.stream.stream_id != f"{batch_id}:routes"
+            ):
                 raise ValueError("packing request has the wrong route stream")
 
             async def receive_routes() -> tuple[bytearray, float]:
                 started = time.monotonic()
-                payload = await receive_byte_stream(
-                    route_transfer.stream, timeout_s=transfer_timeout_s
+                payload = await route_transfer.receive_payload(
+                    timeout_s=transfer_timeout_s
                 )
                 return payload, time.monotonic() - started
 

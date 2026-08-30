@@ -1936,7 +1936,7 @@ class DistributedMegatronService:
             trainer_dtype=spec.dtype,
             route_replay=spec.enable_moe_routing_replay,
             lora_transport="nixl" if self.runtime.nixl_transport else "local",
-            retained_route_transport=("holder_local" if retained_routes else "none"),
+            retained_route_transport=self.runtime.retained_route_transport,
             retained_route_max_bytes=(
                 self.runtime.config.route_bundle_prefetch_capacity_bytes
                 if retained_routes

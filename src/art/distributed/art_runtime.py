@@ -16,6 +16,7 @@ from art.megatron.runtime.specs import TrainerRuntimeSpec, TrainingRunSpec
 from art.utils.lifecycle import complete_task
 from art.vllm_route_transport import (
     RouteBundleReader,
+    local_retained_route_bundle_transfer,
     publish_retained_route_bundle_transfer,
 )
 
@@ -364,6 +365,17 @@ class ArtRuntime:
     @property
     def retained_route_prefetch_enabled(self) -> bool:
         return self._route_bundle_reader is not None
+
+    @property
+    def retained_route_transport(
+        self,
+    ) -> Literal["none", "holder_local", "caios_lota"]:
+        if self._route_bundle_reader is None:
+            return "none"
+        transport = self._route_bundle_reader.retained_route_transport
+        if transport not in {"holder_local", "caios_lota"}:
+            raise RuntimeError("route reader returned an unsupported transport")
+        return transport
 
     async def _resolve_nixl_transport(self) -> None:
         transport = self._nixl_transport
@@ -878,16 +890,26 @@ class ArtRuntime:
                         raise RuntimeError(
                             "retained route bytes exceed prefetch capacity"
                         )
-                    (
-                        route_transfer,
-                        route_publisher,
-                    ) = await publish_retained_route_bundle_transfer(
-                        refs,
-                        reader=self._route_bundle_reader,
-                        stream_id=f"{batch_id}:routes",
-                        advertise_host=data_plane_host,
-                    )
-                    publishers.append(route_publisher)
+                    if (
+                        self._route_bundle_reader.retained_route_transport
+                        == "holder_local"
+                    ):
+                        if len(trainer_hosts) != 1:
+                            raise RuntimeError(
+                                "local retained routes require one physical host"
+                            )
+                        route_transfer = local_retained_route_bundle_transfer(refs)
+                    else:
+                        (
+                            route_transfer,
+                            route_publisher,
+                        ) = await publish_retained_route_bundle_transfer(
+                            refs,
+                            reader=self._route_bundle_reader,
+                            stream_id=f"{batch_id}:routes",
+                            advertise_host=data_plane_host,
+                        )
+                        publishers.append(route_publisher)
                     wire_request = wire_request.model_copy(
                         update={
                             "retained_route_bundles": (),

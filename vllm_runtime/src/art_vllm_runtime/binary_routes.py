@@ -86,12 +86,48 @@ def encode_routed_experts_response(
     *,
     num_experts: int | None = None,
 ) -> bytes:
+    response, _ = encode_routed_experts_response_parts(
+        json_body,
+        routes,
+        num_experts=num_experts,
+    )
+    return response
+
+
+def encode_routed_experts_response_parts(
+    json_body: bytes,
+    routes: dict[int, np.ndarray],
+    *,
+    num_experts: int | None = None,
+) -> tuple[bytes, bytes]:
+    """Encode the response and return the exact concatenated route payload."""
+
     num_experts = int(num_experts or getattr(routes, "num_experts", 0))
-    dtype = _route_dtype(num_experts)
     chunks: list[bytes | memoryview] = [
         HEADER.pack(MAGIC, len(json_body), len(routes), num_experts),
         json_body,
     ]
+    route_chunks: list[memoryview] = []
+    for choice_index, dtype_code, array in _encoded_route_arrays(
+        routes, num_experts=num_experts
+    ):
+        route_bytes = memoryview(array).cast("B")
+        if array.ndim != 3:
+            raise RuntimeError(f"Routed experts must have rank 3, got {array.shape}")
+        chunks.extend(
+            (
+                ROUTE_HEADER.pack(choice_index, dtype_code, *array.shape),
+                route_bytes,
+            )
+        )
+        route_chunks.append(route_bytes)
+    return b"".join(chunks), b"".join(route_chunks)
+
+
+def _encoded_route_arrays(
+    routes: dict[int, np.ndarray], *, num_experts: int
+) -> Iterator[tuple[int, int, np.ndarray]]:
+    dtype = _route_dtype(num_experts)
     for choice_index, array in sorted(routes.items()):
         if array.ndim != 3:
             raise RuntimeError(f"Routed experts must have rank 3, got {array.shape}")
@@ -105,18 +141,12 @@ def encode_routed_experts_response(
                 f"vLLM routed experts for {num_experts} experts must use "
                 f"{dtype}, got {array.dtype}"
             )
+        array = np.ascontiguousarray(array)
         _resolve_padding_routes(
             array, padding_layers=getattr(routes, "padding_layers", ())
         )
         _validate_route_ids(array, num_experts=num_experts)
-        array = np.ascontiguousarray(array)
-        chunks.extend(
-            (
-                ROUTE_HEADER.pack(choice_index, dtype_code, *array.shape),
-                memoryview(array).cast("B"),
-            )
-        )
-    return b"".join(chunks)
+        yield choice_index, dtype_code, array
 
 
 def _route_dtype(num_experts: int) -> np.dtype[Any]:

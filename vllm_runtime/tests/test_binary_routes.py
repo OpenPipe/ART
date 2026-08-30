@@ -139,6 +139,7 @@ class BinaryRoutesProtocolTest(unittest.TestCase):
 
         ref = RetainedRouteBundleRef(
             object=RouteBundleObjectRef(
+                store="caios",
                 locator="routes/route-retained",
                 size_bytes=len(payload),
                 sha256=bundle.layout.sha256,
