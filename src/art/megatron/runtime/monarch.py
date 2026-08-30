@@ -2588,9 +2588,18 @@ class MonarchTrainerRun:
                     raise RuntimeError("trainer mesh failed: " + supervision.result())
                 if readiness not in done:
                     await rank_call
-                    raise RuntimeError(
-                        f"trainer {label} returned before every rank reported ready"
-                    )
+                    try:
+                        await asyncio.wait_for(
+                            asyncio.shield(readiness),
+                            timeout=max(
+                                0.0,
+                                deadline - asyncio.get_running_loop().time(),
+                            ),
+                        )
+                    except TimeoutError as error:
+                        raise TimeoutError(
+                            f"trainer ranks did not reach {label} readiness"
+                        ) from error
                 readiness.result()
                 self._command_mode = True
                 if backward:
