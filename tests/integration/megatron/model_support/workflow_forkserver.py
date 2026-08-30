@@ -255,14 +255,12 @@ class _HostForkserver:
         local_names = {socket.gethostname(), socket.getfqdn(), "localhost"}
         if self.host not in local_names:
             profile = Path(sys.prefix) / "art-megatron-env.sh"
-            if not profile.is_file():
-                raise RuntimeError(
-                    f"remote workflow forkserver requires runtime profile: {profile}"
-                )
+            activate = (
+                f"source {shlex.quote(str(profile))} && " if profile.is_file() else ""
+            )
             remote = (
-                "unset LD_LIBRARY_PATH && "
-                f"source {shlex.quote(str(profile))} && "
-                f"cd {shlex.quote(str(self.repo_root))} && exec "
+                activate
+                + f"cd {shlex.quote(str(self.repo_root))} && exec "
                 + shlex.join(
                     [
                         "env",
