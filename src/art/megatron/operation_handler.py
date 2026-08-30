@@ -52,6 +52,7 @@ from .route_retention import (
     RouteBundleOwnershipProvider,
 )
 from .runtime.data_plane import SFTBatchData
+from .runtime.l4_hydration import L4HydrationSidecar
 from .runtime.numerical_capture import ForwardBackwardNumericalCaptureReceipt
 from .runtime.publication import TrainerRankPublication
 from .runtime.specs import (
@@ -346,6 +347,14 @@ class _ResidentTrainer(Protocol):
         root: str,
     ) -> ForwardBackwardNumericalCaptureReceipt: ...
 
+    async def commit_prepared_command_run_checkpoint(
+        self, operation: OperationRef
+    ) -> Any: ...
+
+    async def discard_prepared_command_run_checkpoint(
+        self, operation: OperationRef
+    ) -> None: ...
+
     async def record_control_command(
         self,
         operation: OperationRef,
@@ -399,6 +408,7 @@ class MegatronOperationHandler:
         self._release_failures: dict[str, BaseException] = {}
         self._sampler_publications: dict[str, MegatronSamplerPublicationReceipt] = {}
         self._sft_tokenizer = SftBatchTokenizer()
+        self._l4_hydration = L4HydrationSidecar[MegatronLoadedState]()
 
     @property
     def generation(self) -> TrainerGeneration:
@@ -407,6 +417,31 @@ class MegatronOperationHandler:
     @property
     def optimizer_state_path(self) -> str:
         return self._optimizer_state_path
+
+    async def prefetch_load_state(
+        self, request: LoadStateRequest, operation: OperationRef
+    ) -> MegatronLoadedState:
+        if self.checkpoints is None:
+            raise RuntimeError("Megatron checkpoint operations are not configured")
+        if (
+            operation.kind != "load_state"
+            or request.run_id != operation.run_id
+            or operation.run_id != self.config.run_id
+        ):
+            raise ValueError("load hydration changed command identity")
+        fingerprint = _load_hydration_fingerprint(request, operation)
+        checkpoints = self.checkpoints
+        return await self._l4_hydration.prefetch(
+            operation_id=operation.operation_id,
+            fingerprint=fingerprint,
+            hydrate=lambda: checkpoints.load_state(request, operation),
+            discard=lambda: self.trainer.discard_prepared_command_run_checkpoint(
+                operation
+            ),
+        )
+
+    async def discard_load_state(self, operation: OperationRef) -> None:
+        await self._l4_hydration.discard(operation.operation_id)
 
     async def prepare_input(
         self,
@@ -671,17 +706,32 @@ class MegatronOperationHandler:
             )
             return result
         if isinstance(request, LoadStateRequest):
-            loaded = await cast(
-                MegatronCheckpointOperations, self.checkpoints
-            ).load_state(request, operation)
-            if loaded.result.operation_id != operation.operation_id:
-                raise RuntimeError("checkpoint loader changed operation identity")
-            if (
-                loaded.generation.training_session_id != self.config.training_session_id
-                or loaded.generation.policy_step
-                != operation.reserved_output_learner_version
-            ):
-                raise RuntimeError("checkpoint loader changed learner lineage")
+            fingerprint = _load_hydration_fingerprint(request, operation)
+            try:
+                loaded = await self.prefetch_load_state(request, operation)
+                if loaded.result.operation_id != operation.operation_id:
+                    raise RuntimeError("checkpoint loader changed operation identity")
+                if (
+                    loaded.generation.training_session_id
+                    != self.config.training_session_id
+                    or loaded.generation.policy_step
+                    != operation.reserved_output_learner_version
+                ):
+                    raise RuntimeError("checkpoint loader changed learner lineage")
+                await self.trainer.commit_prepared_command_run_checkpoint(operation)
+                await self._l4_hydration.acknowledge(
+                    operation_id=operation.operation_id,
+                    fingerprint=fingerprint,
+                )
+            except BaseException as error:
+                try:
+                    await self.discard_load_state(operation)
+                except BaseException as cleanup_error:
+                    error.add_note(
+                        "L4 hydration cleanup also failed: "
+                        f"{type(cleanup_error).__name__}: {cleanup_error}"
+                    )
+                raise
             await self.trainer.record_control_command(
                 operation, loaded.generation.policy_step
             )
@@ -819,6 +869,7 @@ class MegatronOperationHandler:
             await self._release_if_unowned(capture_id)
         if self._captures:
             raise RuntimeError("packed inputs remain after run drain")
+        await self._l4_hydration.aclose()
         self._sampler_publications.clear()
 
     async def release_after_migration(self) -> None:
@@ -1289,6 +1340,21 @@ def _next_generation(
 def _staging_adapter_path(config: MegatronOperationConfig, generation_id: str) -> str:
     output_root = Path(config.output_adapter_root).absolute().parent
     return str(output_root / "megatron_runtime" / "staging" / generation_id)
+
+
+def _load_hydration_fingerprint(
+    request: LoadStateRequest, operation: OperationRef
+) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            {
+                "request": request.model_dump(mode="json"),
+                "operation": operation.model_dump(mode="json"),
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
 
 
 def _input_fingerprint(

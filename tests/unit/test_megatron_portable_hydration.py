@@ -224,6 +224,7 @@ def _executor(executor_module: Any) -> tuple[Any, Any, _Residency]:
     executor = object.__new__(executor_module.MCoreRunSlotExecutor)
     executor._runs = {"run": state}
     executor._residency = residency
+    executor._checkpoint_hydrations = {}
     executor._portable_snapshot_source = object()
     executor._topology_fingerprint = "topology"
     executor.runtime = SimpleNamespace(rank=0)
@@ -258,8 +259,12 @@ def test_restore_preparation_failure_preserves_existing_run(
     monkeypatch.setattr(portable_snapshot, "prepare_portable_checkpoint", fail_prepare)
 
     with pytest.raises(RuntimeError, match="archive read failed"):
-        executor.install_run_checkpoint(
-            "run", _generation(), _archive(), restore_optimizer=False
+        executor.prepare_run_checkpoint(
+            "load-operation",
+            "run",
+            _generation(),
+            _archive(),
+            restore_optimizer=False,
         )
 
     assert residency.events == []
@@ -316,14 +321,25 @@ def test_restore_adopts_prepared_cpu_working_set_before_commit(
         portable_snapshot, "commit_prepared_portable_checkpoint", commit
     )
 
-    observed = executor.install_run_checkpoint(
-        "run", generation, archive, restore_optimizer=False
+    observed = executor.prepare_run_checkpoint(
+        "load-operation",
+        "run",
+        generation,
+        archive,
+        restore_optimizer=False,
     )
 
     assert observed is receipt
     assert prepared_call["restore_optimizer"] is False
     assert prepared_call["generation_id"] == generation.generation_id
     assert prepared_call["archive"] is archive
+    assert [event for event, _value in residency.events] == ["register_l2"]
+    assert state.learner_version == 2
+    assert (state.weights_key, state.optimizer_key) == old_keys
+
+    committed = executor.commit_prepared_run_checkpoint("load-operation", "run")
+
+    assert committed is receipt
     assert [event for event, _value in residency.events] == [
         "register_l2",
         "commit",

@@ -43,6 +43,7 @@ from art.utils.lifecycle import (
 )
 
 from .data_plane import InMemoryPackedBatch, SFTBatchData
+from .l4_hydration import RankL4HydrationService, raise_l4_hydration_failures
 from .numerical_capture import (
     ForwardBackwardNumericalCaptureReceipt,
     ForwardBackwardNumericalRankReceipt,
@@ -594,6 +595,8 @@ class MonarchTrainerActor(Actor):
         self._cp_lookahead_thread = None
         self._residency_prefetch_port = None
         self._residency_prefetch_thread = None
+        self._l4_hydration_port = None
+        self._l4_hydration_thread = None
         self._residency_prefetch_port, receiver = Channel.open()
         self._residency_prefetch_thread = Thread(
             target=self._run_residency_prefetch,
@@ -602,6 +605,14 @@ class MonarchTrainerActor(Actor):
             daemon=True,
         )
         self._residency_prefetch_thread.start()
+        self._l4_hydration_port, receiver = Channel.open()
+        self._l4_hydration_thread = Thread(
+            target=RankL4HydrationService(self._run_slot_executor, rank=rank).run,
+            args=(receiver,),
+            name=f"art-l4-hydration-rank-{rank}",
+            daemon=True,
+        )
+        self._l4_hydration_thread.start()
         if topology.cp > 1:
             from art.megatron.training.microbatches import CpBatchPreplanner
 
@@ -826,6 +837,18 @@ class MonarchTrainerActor(Actor):
                 "residency prefetch service did not stop within 30 seconds"
             )
 
+    def _stop_l4_hydration(self) -> None:
+        thread, self._l4_hydration_thread = self._l4_hydration_thread, None
+        if thread is None:
+            return
+        port = self._l4_hydration_port
+        if port is None:
+            raise RuntimeError("L4 hydration thread has no request port")
+        port.send(None)
+        thread.join(timeout=30.0)
+        if thread.is_alive():
+            raise RuntimeError("L4 hydration service did not stop within 30 seconds")
+
     def _publish_compile_cache(self) -> None:
         if self._compile_cache is None or "publish_s" in self._compile_cache_metrics:
             return
@@ -911,29 +934,86 @@ class MonarchTrainerActor(Actor):
             "tensor_owners": self._run_slot_executor.run_tensor_owners(run_id),
         }
 
-    @endpoint
+    @endpoint(explicit_response_port=True)
     def install_command_run_checkpoint(
         self,
+        response_port: Port[dict[str, Any]],
+        operation_id: str,
         run_id: str,
         generation_json: str,
         archive_json: str,
         restore_optimizer: bool,
-    ) -> dict[str, Any]:
-        if not self._valid:
-            raise RuntimeError("trainer actor runtime is invalid")
-        generation = TrainerGeneration.model_validate_json(generation_json)
-        archive = PortableSnapshotArchive.model_validate_json(archive_json)
-        receipt = self._run_slot_executor.install_run_checkpoint(
+    ) -> None:
+        self._enqueue_l4_hydration(
+            response_port,
+            "prepare",
+            operation_id,
             run_id,
-            generation,
-            archive,
-            restore_optimizer=restore_optimizer,
+            generation_json,
+            archive_json,
+            restore_optimizer,
         )
-        return {
-            "rank": self._runtime.rank,
-            "run_id": run_id,
-            "receipt": receipt.model_dump(mode="json"),
-        }
+
+    @endpoint(explicit_response_port=True)
+    def commit_prepared_command_run_checkpoint(
+        self,
+        response_port: Port[dict[str, Any]],
+        operation_id: str,
+        run_id: str,
+    ) -> None:
+        self._enqueue_l4_hydration(
+            response_port, "commit", operation_id, run_id, "", "", False
+        )
+
+    @endpoint(explicit_response_port=True)
+    def discard_prepared_command_run_checkpoint(
+        self,
+        response_port: Port[dict[str, Any]],
+        operation_id: str,
+        run_id: str,
+    ) -> None:
+        self._enqueue_l4_hydration(
+            response_port, "discard", operation_id, run_id, "", "", False
+        )
+
+    def _enqueue_l4_hydration(
+        self,
+        response_port: Port[dict[str, Any]],
+        action: str,
+        operation_id: str,
+        run_id: str,
+        generation_json: str,
+        archive_json: str,
+        restore_optimizer: bool,
+    ) -> None:
+        port = self._l4_hydration_port
+        if not self._valid or port is None:
+            message = (
+                "trainer actor runtime is invalid"
+                if not self._valid
+                else "trainer actor has no L4 hydration service"
+            )
+            response_port.send(
+                {
+                    "rank": self._runtime.rank,
+                    "run_id": run_id,
+                    "operation_id": operation_id,
+                    "error_type": "RuntimeError",
+                    "message": message,
+                }
+            )
+            return
+        port.send(
+            (
+                action,
+                operation_id,
+                run_id,
+                generation_json,
+                archive_json,
+                restore_optimizer,
+                response_port,
+            )
+        )
 
     @endpoint
     def execute(
@@ -1368,6 +1448,7 @@ class MonarchTrainerActor(Actor):
 
     @endpoint
     def close(self) -> None:
+        self._stop_l4_hydration()
         self._stop_residency_prefetch()
         self._stop_cp_lookahead()
         self._stop_deferred_results()
@@ -1428,6 +1509,7 @@ class MonarchTrainerActor(Actor):
     def __cleanup__(self, exc: Exception | None) -> None:
         if exc is not None:
             self._valid = False
+        self._stop_l4_hydration()
         self._stop_residency_prefetch()
         self._stop_cp_lookahead()
         self._stop_deferred_results()
@@ -1752,6 +1834,9 @@ class MonarchTrainerRun:
             str, tuple[tuple[str, TrainerGeneration], PortableSnapshotExportReceipt]
         ] = {}
         self._checkpoint_loads: dict[str, tuple[str, PortableSnapshotLoadReceipt]] = {}
+        self._checkpoint_load_preparations: dict[
+            str, tuple[str, OperationRef, PortableSnapshotLoadReceipt]
+        ] = {}
         self._numerical_captures: dict[
             str, tuple[tuple[str, str], ForwardBackwardNumericalCaptureReceipt]
         ] = {}
@@ -1759,6 +1844,7 @@ class MonarchTrainerRun:
         self._lock = asyncio.Lock()
         self._cp_lookahead_lock = asyncio.Lock()
         self._residency_prefetch_lock = asyncio.Lock()
+        self._checkpoint_hydration_lock = asyncio.Lock()
         self._active_job_id: str | None = None
         self._active_collective: asyncio.Future[Any] | None = None
         self._active_receive: asyncio.Future[Any] | None = None
@@ -2042,12 +2128,22 @@ class MonarchTrainerRun:
             if prior[0] != fingerprint:
                 raise RuntimeError("checkpoint load operation was reused")
             return prior[1]
-        async with self._lock:
+        prepared = self._checkpoint_load_preparations.get(operation.operation_id)
+        if prepared is not None:
+            if prepared[0] != fingerprint or prepared[1] != operation:
+                raise RuntimeError("checkpoint load operation was reused")
+            return prepared[2]
+        async with self._checkpoint_hydration_lock:
             prior = self._checkpoint_loads.get(operation.operation_id)
             if prior is not None:
                 if prior[0] != fingerprint:
                     raise RuntimeError("checkpoint load operation was reused")
                 return prior[1]
+            prepared = self._checkpoint_load_preparations.get(operation.operation_id)
+            if prepared is not None:
+                if prepared[0] != fingerprint or prepared[1] != operation:
+                    raise RuntimeError("checkpoint load operation was reused")
+                return prepared[2]
             state = self._command_runs.get(operation.run_id)
             if (
                 operation.kind != "load_state"
@@ -2059,20 +2155,46 @@ class MonarchTrainerRun:
                 or state.spec.training_session_id != generation.training_session_id
             ):
                 raise RuntimeError("checkpoint load command changed run state")
-            values = await asyncio.wait_for(
-                self._actors.install_command_run_checkpoint.call(
-                    operation.run_id,
-                    generation.model_dump_json(),
-                    archive.model_dump_json(),
-                    restore_optimizer,
-                ),
-                timeout=state.spec.event_timeout_s,
-            )
+            try:
+                values = await asyncio.wait_for(
+                    self._actors.install_command_run_checkpoint.call(
+                        operation.operation_id,
+                        operation.run_id,
+                        generation.model_dump_json(),
+                        archive.model_dump_json(),
+                        restore_optimizer,
+                    ),
+                    timeout=state.spec.event_timeout_s,
+                )
+            except BaseException as error:
+                try:
+                    await asyncio.wait_for(
+                        self._actors.discard_prepared_command_run_checkpoint.call(
+                            operation.operation_id, operation.run_id
+                        ),
+                        timeout=state.spec.event_timeout_s,
+                    )
+                except BaseException as cleanup_error:
+                    error.add_note(
+                        "rank checkpoint hydration cleanup also failed: "
+                        f"{type(cleanup_error).__name__}: {cleanup_error}"
+                    )
+                raise
+            results = tuple(values.values())
+            raise_l4_hydration_failures(results, label="preparation")
+            world_size = len(self.runtime_spec.trainer_mesh.ranks)
+            if (
+                {result["rank"] for result in results} != set(range(world_size))
+                or {result["run_id"] for result in results} != {operation.run_id}
+                or {result["operation_id"] for result in results}
+                != {operation.operation_id}
+            ):
+                raise RuntimeError("trainer ranks disagreed on checkpoint hydration")
             reads = tuple(
                 sorted(
                     (
                         PortableSnapshotReadReceipt.model_validate(result["receipt"])
-                        for result in values.values()
+                        for result in results
                     ),
                     key=lambda item: item.destination_rank,
                 )
@@ -2093,10 +2215,107 @@ class MonarchTrainerRun:
                 ),
                 install=install,
             )
+            self._checkpoint_load_preparations[operation.operation_id] = (
+                fingerprint,
+                operation,
+                receipt,
+            )
+            return receipt
+
+    async def commit_prepared_command_run_checkpoint(
+        self, operation: OperationRef
+    ) -> PortableSnapshotLoadReceipt:
+        prior = self._checkpoint_loads.get(operation.operation_id)
+        if prior is not None:
+            return prior[1]
+        async with self._checkpoint_hydration_lock:
+            prior = self._checkpoint_loads.get(operation.operation_id)
+            if prior is not None:
+                return prior[1]
+            prepared = self._checkpoint_load_preparations.get(operation.operation_id)
+            if prepared is None:
+                raise RuntimeError("checkpoint hydration was not prepared")
+            fingerprint, prepared_operation, receipt = prepared
+            if prepared_operation != operation:
+                raise RuntimeError("checkpoint hydration changed operation identity")
+            state = self._command_runs.get(operation.run_id)
+            if (
+                operation.kind != "load_state"
+                or state is None
+                or state.open_forward_backward_ids
+                or state.learner_version != operation.learner_parent_version
+                or state.next_operation_sequence != operation.sequence_id
+            ):
+                raise RuntimeError("checkpoint load command changed after hydration")
+            try:
+                values = await asyncio.wait_for(
+                    self._actors.commit_prepared_command_run_checkpoint.call(
+                        operation.operation_id, operation.run_id
+                    ),
+                    timeout=state.spec.event_timeout_s,
+                )
+                results = tuple(values.values())
+                raise_l4_hydration_failures(results, label="commit")
+                world_size = len(self.runtime_spec.trainer_mesh.ranks)
+                if (
+                    {result["rank"] for result in results} != set(range(world_size))
+                    or {result["run_id"] for result in results} != {operation.run_id}
+                    or {result["operation_id"] for result in results}
+                    != {operation.operation_id}
+                ):
+                    raise RuntimeError("trainer ranks disagreed on checkpoint commit")
+                reads = tuple(
+                    sorted(
+                        (
+                            PortableSnapshotReadReceipt.model_validate(
+                                result["receipt"]
+                            )
+                            for result in results
+                        ),
+                        key=lambda item: item.destination_rank,
+                    )
+                )
+                if reads != receipt.install.ranks:
+                    raise RuntimeError("checkpoint commit changed hydration evidence")
+            except BaseException as error:
+                await self._invalidate_after_command_failure(error)
+                raise
+            self._checkpoint_load_preparations.pop(operation.operation_id)
             self._checkpoint_loads[operation.operation_id] = (fingerprint, receipt)
             while len(self._checkpoint_loads) > 128:
                 self._checkpoint_loads.pop(next(iter(self._checkpoint_loads)))
             return receipt
+
+    async def discard_prepared_command_run_checkpoint(
+        self, operation: OperationRef
+    ) -> None:
+        async with self._checkpoint_hydration_lock:
+            if operation.operation_id in self._checkpoint_loads:
+                return
+            prepared = self._checkpoint_load_preparations.get(operation.operation_id)
+            if prepared is not None and prepared[1] != operation:
+                raise RuntimeError("checkpoint hydration changed operation identity")
+            state = self._command_runs.get(operation.run_id)
+            if state is None:
+                raise RuntimeError("checkpoint hydration run is absent")
+            values = await asyncio.wait_for(
+                self._actors.discard_prepared_command_run_checkpoint.call(
+                    operation.operation_id, operation.run_id
+                ),
+                timeout=state.spec.event_timeout_s,
+            )
+            results = tuple(values.values())
+            raise_l4_hydration_failures(results, label="discard")
+            world_size = len(self.runtime_spec.trainer_mesh.ranks)
+            if (
+                {result["rank"] for result in results} != set(range(world_size))
+                or {result["run_id"] for result in results} != {operation.run_id}
+                or {result["operation_id"] for result in results}
+                != {operation.operation_id}
+            ):
+                raise RuntimeError("trainer ranks disagreed on checkpoint discard")
+            if prepared is not None:
+                self._checkpoint_load_preparations.pop(operation.operation_id)
 
     async def record_control_command(
         self,

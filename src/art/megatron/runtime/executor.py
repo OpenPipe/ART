@@ -678,6 +678,22 @@ class _PreparedPortableRun:
     optimizer_tensors: tuple[torch.Tensor, ...]
 
 
+@dataclass(slots=True)
+class _PreparedRunCheckpoint:
+    operation_id: str
+    fingerprint: str
+    run_id: str
+    learner_version: int
+    previous_learner_version: int
+    previous_keys: tuple[ResidencyKey, ...]
+    prepared: _PreparedPortableRun
+    gradients: Any
+    weights_key: ResidencyKey
+    optimizer_key: ResidencyKey
+    remaining_keys: set[ResidencyKey]
+    staging_live: bool = True
+
+
 class _CommandPublicationSink:
     def __init__(self) -> None:
         self.future: Future[TrainerRankPublication] = Future()
@@ -732,6 +748,7 @@ class MCoreRunSlotExecutor:
         )
         self._residency_admission_lock = Lock()
         self._residency_admissions: dict[str, tuple[ResidencyKey, ...]] = {}
+        self._checkpoint_hydrations: dict[str, _PreparedRunCheckpoint] = {}
         self._portable_snapshot_source = portable_snapshot_source
         self._portable_snapshot_sink = portable_snapshot_sink
         self._publisher = publisher or _GenerationPublisher(
@@ -1231,14 +1248,35 @@ class MCoreRunSlotExecutor:
             raise KeyError(f"trainer command run {run_id!r} is absent")
         return self._slots.checkpoint_slot_tensor_owners(run_id)
 
-    def install_run_checkpoint(
+    def prepare_run_checkpoint(
         self,
+        operation_id: str,
         run_id: str,
         generation: TrainerGeneration,
         archive: PortableSnapshotArchive,
         *,
         restore_optimizer: bool,
     ) -> PortableSnapshotReadReceipt:
+        fingerprint = hashlib.sha256(
+            (
+                run_id
+                + "\0"
+                + generation.model_dump_json()
+                + "\0"
+                + archive.archive_sha256
+                + "\0"
+                + json.dumps(restore_optimizer)
+            ).encode()
+        ).hexdigest()
+        prior = self._checkpoint_hydrations.get(operation_id)
+        if prior is not None:
+            if prior.fingerprint != fingerprint or prior.run_id != run_id:
+                raise RuntimeError("checkpoint hydration operation was reused")
+            return prior.prepared.receipt
+        if any(
+            pending.run_id == run_id for pending in self._checkpoint_hydrations.values()
+        ):
+            raise RuntimeError("another checkpoint hydration is pending for this run")
         state = self._runs.get(run_id)
         if state is None:
             raise KeyError(f"trainer command run {run_id!r} is absent")
@@ -1252,78 +1290,135 @@ class MCoreRunSlotExecutor:
             ParameterGradientAccumulator,
         )
 
-        previous_keys = self._state_keys(state)
-        prepared = self._prepare_portable_run(
-            run_id=run_id,
-            generation_id=generation.generation_id,
-            archive=archive,
-            expected_lora_rank=state.spec.lora_rank,
-            expected_lora_target_modules=state.spec.lora_target_modules,
-            restore_optimizer=restore_optimizer,
-        )
-        gradients = ParameterGradientAccumulator(prepared.weights)
-        weights_key = self._residency_key(
-            state,
-            generation_id=generation.generation_id,
-            representation="weights",
-            adapter_config=prepared.adapter_config,
-        )
-        optimizer_key = self._residency_key(
-            state,
-            generation_id=generation.generation_id,
-            representation="optimizer",
-            adapter_config=prepared.adapter_config,
-        )
-        prepared_keys = (weights_key, optimizer_key)
-        registered = False
+        prepared: _PreparedPortableRun | None = None
         try:
+            prepared = self._prepare_portable_run(
+                run_id=run_id,
+                generation_id=generation.generation_id,
+                archive=archive,
+                expected_lora_rank=state.spec.lora_rank,
+                expected_lora_target_modules=state.spec.lora_target_modules,
+                restore_optimizer=restore_optimizer,
+            )
+            gradients = ParameterGradientAccumulator(prepared.weights)
+            weights_key = self._residency_key(
+                state,
+                generation_id=generation.generation_id,
+                representation="weights",
+                adapter_config=prepared.adapter_config,
+            )
+            optimizer_key = self._residency_key(
+                state,
+                generation_id=generation.generation_id,
+                representation="optimizer",
+                adapter_config=prepared.adapter_config,
+            )
             self._register_portable_l2_working_set(
                 (
                     (weights_key, prepared.weights),
                     (optimizer_key, prepared.optimizer_tensors),
                 )
             )
-            registered = True
-            from .portable_snapshot import commit_prepared_portable_checkpoint
-
-            commit_prepared_portable_checkpoint(
-                self._slots,
-                staging_name=prepared.staging_name,
-                name=run_id,
+            pending = _PreparedRunCheckpoint(
+                operation_id=operation_id,
+                fingerprint=fingerprint,
+                run_id=run_id,
+                learner_version=generation.policy_step,
+                previous_learner_version=state.learner_version,
+                previous_keys=self._state_keys(state),
+                prepared=prepared,
+                gradients=gradients,
+                weights_key=weights_key,
+                optimizer_key=optimizer_key,
+                remaining_keys={weights_key, optimizer_key},
             )
+            self._checkpoint_hydrations[operation_id] = pending
         except BaseException as error:
-            if registered:
-                for key in prepared_keys:
-                    try:
-                        self._residency.retire_async(key).result(
-                            timeout=self._residency.config.shutdown_timeout_s
-                        )
-                    except BaseException as cleanup_error:
-                        error.add_note(
-                            "portable restore residency cleanup failed: "
-                            f"{type(cleanup_error).__name__}: {cleanup_error}"
-                        )
-            try:
-                self._discard_prepared_portable_run(prepared)
-            except BaseException as cleanup_error:
-                error.add_note(
-                    "portable restore staging cleanup failed: "
-                    f"{type(cleanup_error).__name__}: {cleanup_error}"
-                )
+            if prepared is not None:
+                try:
+                    self._discard_prepared_portable_run(prepared)
+                except BaseException as cleanup_error:
+                    error.add_note(
+                        "portable restore staging cleanup failed: "
+                        f"{type(cleanup_error).__name__}: {cleanup_error}"
+                    )
             raise
+        return pending.prepared.receipt
 
-        state.gradients = gradients
-        state.learner_version = generation.policy_step
-        state.adapter_config = prepared.adapter_config
-        state.portable_read = prepared.receipt
+    def commit_prepared_run_checkpoint(
+        self, operation_id: str, run_id: str
+    ) -> PortableSnapshotReadReceipt:
+        pending = self._checkpoint_hydrations.get(operation_id)
+        if pending is None:
+            raise RuntimeError("prepared checkpoint hydration is absent")
+        if pending.run_id != run_id:
+            raise RuntimeError("prepared checkpoint hydration changed run identity")
+        state = self._runs.get(run_id)
+        if state is None:
+            raise KeyError(f"trainer command run {run_id!r} is absent")
+        if state.gradients.contribution_ids:
+            raise RuntimeError("cannot load state with open gradient contributions")
+        if (
+            state.learner_version != pending.previous_learner_version
+            or self._state_keys(state) != pending.previous_keys
+        ):
+            raise RuntimeError("run state changed after checkpoint hydration")
+
+        from .portable_snapshot import commit_prepared_portable_checkpoint
+
+        commit_prepared_portable_checkpoint(
+            self._slots,
+            staging_name=pending.prepared.staging_name,
+            name=run_id,
+        )
+        pending.staging_live = False
+        state.gradients = pending.gradients
+        state.learner_version = pending.learner_version
+        state.adapter_config = pending.prepared.adapter_config
+        state.portable_read = pending.prepared.receipt
         state.accumulator_key = None
         state.next_accumulator_revision = 1
-        state.weights_key = weights_key
-        state.optimizer_key = optimizer_key
-        for key in previous_keys:
-            if key not in prepared_keys:
+        state.weights_key = pending.weights_key
+        state.optimizer_key = pending.optimizer_key
+        pending.remaining_keys.clear()
+        self._checkpoint_hydrations.pop(operation_id)
+        for key in pending.previous_keys:
+            if key not in (pending.weights_key, pending.optimizer_key):
                 self._residency.retire_async(key)
-        return prepared.receipt
+        return pending.prepared.receipt
+
+    def discard_prepared_run_checkpoint(
+        self, operation_id: str, run_id: str | None = None
+    ) -> bool:
+        pending = self._checkpoint_hydrations.get(operation_id)
+        if pending is None:
+            return False
+        if run_id is not None and pending.run_id != run_id:
+            raise RuntimeError("checkpoint hydration discard changed run identity")
+        failures: list[BaseException] = []
+        for key in tuple(pending.remaining_keys):
+            try:
+                self._residency.retire_async(key).result(
+                    timeout=self._residency.config.shutdown_timeout_s
+                )
+                pending.remaining_keys.remove(key)
+            except BaseException as error:
+                failures.append(error)
+        if pending.staging_live:
+            try:
+                self._discard_prepared_portable_run(pending.prepared)
+                pending.staging_live = False
+            except BaseException as error:
+                failures.append(error)
+        if not pending.remaining_keys and not pending.staging_live:
+            self._checkpoint_hydrations.pop(operation_id)
+        if len(failures) == 1:
+            raise failures[0]
+        if failures:
+            raise BaseExceptionGroup(
+                "prepared checkpoint hydration cleanup failed", failures
+            )
+        return True
 
     def _register_accumulator_residency(self, state: _ResidentCommandRun) -> None:
         if state.accumulator_key is not None:
@@ -1705,6 +1800,9 @@ class MCoreRunSlotExecutor:
             raise RuntimeError(
                 f"cannot release a run with residency admissions: {active}"
             )
+        for operation_id, pending in tuple(self._checkpoint_hydrations.items()):
+            if pending.run_id == run_id:
+                self.discard_prepared_run_checkpoint(operation_id, run_id)
         retirements = tuple(
             self._residency.retire_async(key) for key in self._residency.keys(run_id)
         )
@@ -1730,6 +1828,8 @@ class MCoreRunSlotExecutor:
             operation_ids = tuple(self._residency_admissions)
         for operation_id in operation_ids:
             self.release_residency_admission(operation_id)
+        for operation_id in tuple(self._checkpoint_hydrations):
+            self.discard_prepared_run_checkpoint(operation_id)
         for state in tuple(self._runs.values()):
             state.gradients.discard()
             retirements = tuple(

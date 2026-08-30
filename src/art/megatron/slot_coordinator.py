@@ -335,6 +335,14 @@ class _SharedTrainer(Protocol):
         restore_optimizer: bool,
     ) -> PortableSnapshotLoadReceipt: ...
 
+    async def commit_prepared_command_run_checkpoint(
+        self, operation: OperationRef
+    ) -> PortableSnapshotLoadReceipt: ...
+
+    async def discard_prepared_command_run_checkpoint(
+        self, operation: OperationRef
+    ) -> None: ...
+
     async def record_control_command(
         self,
         operation: OperationRef,
@@ -366,6 +374,7 @@ class _RunState:
     draining: bool = False
     maintenance: bool = False
     preparing: int = 0
+    l4_hydration_operation_id: str | None = None
     worker_calls: int = 0
     settling: int = 0
     migration_fence_id: str | None = None
@@ -817,21 +826,25 @@ class MegatronSlotCoordinator:
         *,
         restore_optimizer: bool,
     ) -> PortableSnapshotLoadReceipt:
-        """Install one authenticated checkpoint for the active load-state command."""
+        """Prepare one authenticated checkpoint for an admitted load command."""
 
         async with self._condition:
             state = self._runs.get(operation.run_id)
+            preparing = (
+                state is not None
+                and state.l4_hydration_operation_id == operation.operation_id
+            )
             if (
                 operation.kind != "load_state"
                 or state is None
                 or state.draining
                 or state.migration_fence_id is not None
                 or state.migration_restore_id is not None
-                or self._active_run_id != operation.run_id
+                or not (preparing or self._active_run_id == operation.run_id)
                 or state.handler.retained_contribution_inputs()
             ):
                 raise RuntimeError(
-                    "checkpoint load is not the active quiescent command"
+                    "checkpoint load is not the admitted quiescent command"
                 )
         return await self.trainer.install_command_run_checkpoint(
             operation,
@@ -1435,10 +1448,16 @@ class MegatronSlotCoordinator:
                 or self._closed
             ):
                 raise _not_executed("cancelled", "Megatron slot run is draining")
+            if isinstance(request, LoadStateRequest):
+                if state.l4_hydration_operation_id is not None:
+                    raise RuntimeError("another L4 hydration is preparing for this run")
+                state.l4_hydration_operation_id = operation.operation_id
             state.preparing += 1
         capture: PackedInputCaptureRef | None = None
         resource_request: MegatronSlotResourceRequest | None = None
         try:
+            if isinstance(request, LoadStateRequest):
+                await state.handler.prefetch_load_state(request, operation)
             components = _components(request)
             raw_sft = isinstance(
                 request, (ForwardRequest, ForwardBackwardRequest)
@@ -1501,6 +1520,14 @@ class MegatronSlotCoordinator:
                 self._ready.append(ready)
                 self._condition.notify_all()
         except BaseException as error:
+            if isinstance(request, LoadStateRequest):
+                try:
+                    await state.handler.discard_load_state(operation)
+                except BaseException as cleanup_error:
+                    error.add_note(
+                        "L4 hydration cleanup also failed: "
+                        f"{type(cleanup_error).__name__}: {cleanup_error}"
+                    )
             if resource_request is not None:
                 try:
                     await self.resources.release(resource_request)
@@ -1521,6 +1548,8 @@ class MegatronSlotCoordinator:
         finally:
             async with self._condition:
                 state.preparing -= 1
+                if state.l4_hydration_operation_id == operation.operation_id:
+                    state.l4_hydration_operation_id = None
                 self._condition.notify_all()
         return await _await_terminal(future)
 
