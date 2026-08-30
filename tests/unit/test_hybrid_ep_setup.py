@@ -73,7 +73,7 @@ def test_prepare_overlay_does_not_mutate_shared_environment(
     assert first[1].is_dir()
     assert len(installs) == 1
     assert installs[0][1:4] == ["pip", "install", "--target"]
-    assert "--python" not in installs[0]
+    assert installs[0][5:7] == ["--python", hybrid_ep_setup.sys.executable]
 
 
 def test_hybrid_ep_launcher_pins_overlay(monkeypatch, tmp_path: Path) -> None:

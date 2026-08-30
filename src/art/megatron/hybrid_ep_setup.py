@@ -412,6 +412,8 @@ def prepare_hybrid_ep_overlay() -> tuple[str, Path]:
                     "install",
                     "--target",
                     str(stage),
+                    "--python",
+                    sys.executable,
                     "--reinstall",
                     "--no-deps",
                     str(wheel),
