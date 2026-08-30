@@ -835,46 +835,6 @@ def _contiguous_chunk_assignment(
     return tuple(owners)
 
 
-def _score_rebalanced_cp2_assignment(
-    *,
-    current_owners: tuple[int, ...],
-    current_eval: dict[str, Any],
-    evaluate_candidate: Any,
-) -> tuple[tuple[int, ...], dict[str, Any]] | None:
-    """Move a contiguous CP2 boundary across a multi-chunk score plateau."""
-    chunk_count = len(current_owners)
-    if chunk_count < 2:
-        return None
-    boundary = next(
-        (index for index, owner in enumerate(current_owners) if int(owner) == 1),
-        chunk_count,
-    )
-    if not 0 < boundary < chunk_count or current_owners != (
-        (0,) * boundary + (1,) * (chunk_count - boundary)
-    ):
-        return None
-
-    rank_scores = cast(tuple[float, ...], current_eval["rank_scores"])
-    if len(rank_scores) != 2 or min(rank_scores) <= 0.0:
-        return None
-    rank_costs = (
-        float(rank_scores[0]) / float(boundary),
-        float(rank_scores[1]) / float(chunk_count - boundary),
-    )
-    proposed = round(
-        float(chunk_count) * rank_costs[1] / (rank_costs[0] + rank_costs[1])
-    )
-    proposed = max(1, min(proposed, chunk_count - 1))
-    if proposed == boundary:
-        return None
-
-    candidate_owners = (0,) * proposed + (1,) * (chunk_count - proposed)
-    candidate_eval = evaluate_candidate(owners=candidate_owners)
-    if float(candidate_eval["score"]) + 1e-9 >= float(current_eval["score"]):
-        return None
-    return candidate_owners, candidate_eval
-
-
 def _candidate_chunk_indices(
     *,
     owners: tuple[int, ...],
@@ -1482,23 +1442,6 @@ def _search_generic_chunk_assignment(
             best = (current_owners, wave_assignment, current_eval)
     if best is None:
         raise RuntimeError("Failed to evaluate any CP planner wave assignment.")
-    if cp_size == 2:
-        contiguous_eval = _evaluate_candidate(
-            owners=contiguous_owners,
-            wave_assignment=best[1],
-        )
-        rebalanced = _score_rebalanced_cp2_assignment(
-            current_owners=contiguous_owners,
-            current_eval=contiguous_eval,
-            evaluate_candidate=lambda *, owners: _evaluate_candidate(
-                owners=owners,
-                wave_assignment=best[1],
-            ),
-        )
-        if rebalanced is not None and float(rebalanced[1]["score"]) + 1e-9 < float(
-            best[2]["score"]
-        ):
-            best = (rebalanced[0], best[1], rebalanced[1])
     return best
 
 
