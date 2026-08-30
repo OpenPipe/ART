@@ -51,6 +51,26 @@ async def test_publication_wait_is_reserved_before_next_train_can_expire_it() ->
     assert state.generation_id not in run._publications
 
 
+def test_fused_job_completion_advances_diagnostic_run_state() -> None:
+    from art.megatron.runtime.monarch import MonarchTrainerRun
+
+    run = MonarchTrainerRun.__new__(MonarchTrainerRun)
+    state = SimpleNamespace(learner_version=0)
+    run._learner_version = 0
+    run._command_runs = {"run-1": state}
+
+    run._record_fused_job_completion(
+        SimpleNamespace(
+            run_id="run-1",
+            expected_learner_version=0,
+            learner_version=1,
+        )
+    )
+
+    assert run._learner_version == 1
+    assert state.learner_version == 1
+
+
 @pytest.mark.skipif(
     sys.platform != "linux", reason="requires Linux parent-death signal"
 )

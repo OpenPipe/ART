@@ -3242,7 +3242,7 @@ class MonarchTrainerRun:
                             drain.add_done_callback(self._publication_drains.discard)
                             drain.add_done_callback(consume_future_exception)
                         yield completed
-                        self._learner_version = job.learner_version
+                        self._record_fused_job_completion(job)
                         emit(completed)
                         self._clear_active(job.job_id)
                         break
@@ -3522,6 +3522,20 @@ class MonarchTrainerRun:
                 f"request={learner.policy_step}, runtime={state.learner_version}"
             )
         return None
+
+    def _record_fused_job_completion(self, job: TrainerJobSpec) -> None:
+        state = self._command_runs.get(job.run_id)
+        if (
+            self._learner_version != job.expected_learner_version
+            or (
+                state is not None
+                and state.learner_version != job.expected_learner_version
+            )
+        ):
+            raise RuntimeError("fused job completion changed learner lineage")
+        self._learner_version = job.learner_version
+        if state is not None:
+            state.learner_version = job.learner_version
 
     def _validate_resident_score(
         self,
