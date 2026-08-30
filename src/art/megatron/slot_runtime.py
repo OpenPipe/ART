@@ -122,6 +122,7 @@ class MegatronSlotRuntime:
             prepare_megatron_run_config,
             request,
             self.coordinator.trainer.runtime_spec,
+            portable_archive=portable_archive,
         )
         run = await self.coordinator.register_run(
             config,
@@ -222,6 +223,8 @@ async def launch_megatron_slot(
 def prepare_megatron_run_config(
     request: MegatronRunBootstrapConfig,
     runtime_spec: TrainerRuntimeSpec,
+    *,
+    portable_archive: PortableSnapshotArchive | None = None,
 ) -> MegatronOperationConfig:
     """Create or recover exact ART-owned paths for one logical trainer run."""
 
@@ -238,64 +241,91 @@ def prepare_megatron_run_config(
 
     output_dir = Path(request.output_dir).absolute()
     optimizer_state = output_dir / "optimizer_states"
+    if portable_archive is not None:
+        archive = PortableSnapshotArchive.model_validate(
+            portable_archive.model_dump(mode="json")
+        )
+        portable_generation = archive.generation
+        if portable_generation.training_session_id != request.training_session_id:
+            raise RuntimeError("portable trainer state differs from run admission")
+        generation = TrainerGeneration(
+            training_session_id=portable_generation.training_session_id,
+            policy_step=portable_generation.policy_step,
+            generation_id=portable_generation.generation_id,
+            adapter_path=str(
+                output_dir / "checkpoints" / portable_generation.generation_id
+            ),
+        )
+    else:
+        generation = None
+
     initial_adapter = Path(get_step_checkpoint_dir(str(output_dir), 0))
-    with optimizer_model_lease(optimizer_state):
-        pointer = read_committed_optimizer_pointer(str(optimizer_state))
-        if pointer is None and not initial_adapter.exists():
-            initial_adapter.parent.mkdir(parents=True, exist_ok=True)
-            with tempfile.TemporaryDirectory(
-                prefix=".art-bootstrap-", dir=initial_adapter.parent
-            ) as temporary:
-                staged = Path(temporary) / "adapter"
-                from .identity_lora import create_identity_lora
-                from .model_support import get_model_support_handler
+    if generation is None:
+        with optimizer_model_lease(optimizer_state):
+            pointer = read_committed_optimizer_pointer(str(optimizer_state))
+            if pointer is None and not initial_adapter.exists():
+                initial_adapter.parent.mkdir(parents=True, exist_ok=True)
+                with tempfile.TemporaryDirectory(
+                    prefix=".art-bootstrap-", dir=initial_adapter.parent
+                ) as temporary:
+                    staged = Path(temporary) / "adapter"
+                    from .identity_lora import create_identity_lora
+                    from .model_support import get_model_support_handler
 
-                create_identity_lora(
-                    spec.base_model,
-                    str(staged),
-                    rank=spec.adapter.rank,
-                    target_modules=list(spec.adapter.target_modules),
-                    lora_alpha=int(runtime_spec.lora_alpha),
-                    random_state=(
-                        spec.seed
-                        if spec.seed is not None
-                        else runtime_spec.random_state
-                    ),
-                    allow_unvalidated_arch=runtime_spec.allow_unvalidated_arch,
-                    handler=get_model_support_handler(
+                    create_identity_lora(
                         spec.base_model,
+                        str(staged),
+                        rank=spec.adapter.rank,
+                        target_modules=list(spec.adapter.target_modules),
+                        lora_alpha=int(runtime_spec.lora_alpha),
+                        random_state=(
+                            spec.seed
+                            if spec.seed is not None
+                            else runtime_spec.random_state
+                        ),
                         allow_unvalidated_arch=runtime_spec.allow_unvalidated_arch,
-                    ),
+                        handler=get_model_support_handler(
+                            spec.base_model,
+                            allow_unvalidated_arch=runtime_spec.allow_unvalidated_arch,
+                        ),
+                    )
+                    os.rename(staged, initial_adapter)
+                    directory_fd = os.open(initial_adapter.parent, os.O_RDONLY)
+                    try:
+                        os.fsync(directory_fd)
+                    finally:
+                        os.close(directory_fd)
+            if pointer is None:
+                adapter = optimizer_adapter(
+                    initial_adapter,
+                    0,
+                    training_session_id=request.training_session_id,
                 )
-                os.rename(staged, initial_adapter)
-                directory_fd = os.open(initial_adapter.parent, os.O_RDONLY)
-                try:
-                    os.fsync(directory_fd)
-                finally:
-                    os.close(directory_fd)
-        if pointer is None:
-            adapter = optimizer_adapter(
-                initial_adapter,
-                0,
-                training_session_id=request.training_session_id,
-            )
-        else:
-            adapter = resolve_committed_optimizer_policy(
-                str(optimizer_state),
-                initial_adapter_path=str(initial_adapter),
-            ).policy_adapter
-    from .model_support.lora_disk import load_adapter_config
+            else:
+                adapter = resolve_committed_optimizer_policy(
+                    str(optimizer_state),
+                    initial_adapter_path=str(initial_adapter),
+                ).policy_adapter
+        from .model_support.lora_disk import load_adapter_config
 
-    adapter_config = load_adapter_config(adapter.identity)
-    targets = adapter_config.get("target_modules")
-    actual_targets = (targets,) if isinstance(targets, str) else tuple(targets or ())
-    if (
-        adapter.training_session_id != request.training_session_id
-        or int(adapter_config.get("r", 0)) != spec.adapter.rank
-        or set(actual_targets) != set(spec.adapter.target_modules)
-        or adapter_config.get("base_model_name_or_path") != spec.base_model
-    ):
-        raise RuntimeError("recovered trainer state differs from run admission")
+        adapter_config = load_adapter_config(adapter.identity)
+        targets = adapter_config.get("target_modules")
+        actual_targets = (
+            (targets,) if isinstance(targets, str) else tuple(targets or ())
+        )
+        if (
+            adapter.training_session_id != request.training_session_id
+            or int(adapter_config.get("r", 0)) != spec.adapter.rank
+            or set(actual_targets) != set(spec.adapter.target_modules)
+            or adapter_config.get("base_model_name_or_path") != spec.base_model
+        ):
+            raise RuntimeError("recovered trainer state differs from run admission")
+        generation = TrainerGeneration(
+            training_session_id=adapter.training_session_id,
+            policy_step=adapter.step,
+            generation_id=adapter.generation_id,
+            adapter_path=adapter.identity,
+        )
 
     rollout_model = RolloutModelSpec.from_model(
         TrainableModel(
@@ -308,12 +338,6 @@ def prepare_megatron_run_config(
                 "target_modules": list(spec.adapter.target_modules),
             },
         )
-    )
-    generation = TrainerGeneration(
-        training_session_id=adapter.training_session_id,
-        policy_step=adapter.step,
-        generation_id=adapter.generation_id,
-        adapter_path=adapter.identity,
     )
     return MegatronOperationConfig(
         run_id=request.run_id,

@@ -668,6 +668,15 @@ class _ResidentCommandRun:
     next_accumulator_revision: int = 1
 
 
+@dataclass(slots=True)
+class _PreparedPortableRun:
+    receipt: PortableSnapshotReadReceipt
+    staging_name: str
+    adapter_config: dict[str, Any]
+    weights: tuple[torch.nn.Parameter, ...]
+    optimizer_tensors: tuple[torch.Tensor, ...]
+
+
 class _CommandPublicationSink:
     def __init__(self) -> None:
         self.future: Future[TrainerRankPublication] = Future()
@@ -749,6 +758,8 @@ class MCoreRunSlotExecutor:
         from art.trainer_rank import MaterializedCheckpoint
 
         portable_read = None
+        prepared_portable: _PreparedPortableRun | None = None
+        registered_keys: tuple[ResidencyKey, ...] = ()
         installed = False
         try:
             if spec.initial_portable_snapshot is None:
@@ -770,12 +781,15 @@ class MCoreRunSlotExecutor:
                     )
                 ):
                     pass
+                installed = True
+                parameters = self._trainer.checkpoint_slot_parameters(spec.run_id)
+                from art.trainer_rank import AdamParams
+
+                optimizer_tensors = self._trainer.prepare_checkpoint_slot_optimizer(
+                    spec.run_id, AdamParams(learning_rate=0.0)
+                )
             else:
                 archive = spec.initial_portable_snapshot
-                if self._portable_snapshot_source is None:
-                    raise RuntimeError(
-                        "portable run registration requires a snapshot source"
-                    )
                 generation = archive.generation
                 if (
                     generation.training_session_id != spec.training_session_id
@@ -783,25 +797,18 @@ class MCoreRunSlotExecutor:
                     or generation.generation_id != spec.initial_generation_id
                 ):
                     raise RuntimeError("portable archive identifies another generation")
-                from .portable_snapshot import install_portable_checkpoint
-
-                portable_read, adapter_config = install_portable_checkpoint(
-                    self._trainer,
-                    self._portable_snapshot_source,
-                    archive,
-                    name=spec.run_id,
-                    destination_rank=int(self.runtime.rank),
+                prepared_portable = self._prepare_portable_run(
+                    run_id=spec.run_id,
+                    generation_id=generation.generation_id,
+                    archive=archive,
                     expected_lora_rank=spec.lora_rank,
                     expected_lora_target_modules=spec.lora_target_modules,
                     restore_optimizer=True,
                 )
-            installed = True
-            parameters = self._trainer.checkpoint_slot_parameters(spec.run_id)
-            from art.trainer_rank import AdamParams
-
-            optimizer_tensors = self._trainer.prepare_checkpoint_slot_optimizer(
-                spec.run_id, AdamParams(learning_rate=0.0)
-            )
+                portable_read = prepared_portable.receipt
+                adapter_config = prepared_portable.adapter_config
+                parameters = prepared_portable.weights
+                optimizer_tensors = prepared_portable.optimizer_tensors
             state = _ResidentCommandRun(
                 spec=spec,
                 learner_version=spec.initial_learner_version,
@@ -819,22 +826,61 @@ class MCoreRunSlotExecutor:
             state.optimizer_key = self._residency_key(
                 state, generation_id=generation_id, representation="optimizer"
             )
-            initial_l2 = (
-                self._residency.register_l1(state.weights_key, parameters),
-                self._residency.register_l1(state.optimizer_key, optimizer_tensors),
-            )
-            for future in initial_l2:
-                future.result()
+            if prepared_portable is None:
+                weights_l2 = self._residency.register_l1(state.weights_key, parameters)
+                registered_keys = (state.weights_key,)
+                optimizer_l2 = self._residency.register_l1(
+                    state.optimizer_key, optimizer_tensors
+                )
+                registered_keys = (state.weights_key, state.optimizer_key)
+                for future in (weights_l2, optimizer_l2):
+                    future.result()
+            else:
+                self._register_portable_l2_working_set(
+                    (
+                        (state.weights_key, parameters),
+                        (state.optimizer_key, optimizer_tensors),
+                    )
+                )
+                registered_keys = (state.weights_key, state.optimizer_key)
+                from .portable_snapshot import commit_prepared_portable_checkpoint
+
+                commit_prepared_portable_checkpoint(
+                    self._trainer,
+                    staging_name=prepared_portable.staging_name,
+                    name=spec.run_id,
+                )
+                installed = True
+                prepared_portable = None
             self._runs[spec.run_id] = state
-        except BaseException:
+        except BaseException as error:
             retirements = tuple(
-                self._residency.retire_async(key)
-                for key in self._residency.keys(spec.run_id)
+                self._residency.retire_async(key) for key in registered_keys
             )
             for retirement in retirements:
-                retirement.result(timeout=self._residency.config.shutdown_timeout_s)
+                try:
+                    retirement.result(timeout=self._residency.config.shutdown_timeout_s)
+                except BaseException as cleanup_error:
+                    error.add_note(
+                        "run registration residency cleanup failed: "
+                        f"{type(cleanup_error).__name__}: {cleanup_error}"
+                    )
+            if prepared_portable is not None:
+                try:
+                    self._discard_prepared_portable_run(prepared_portable)
+                except BaseException as cleanup_error:
+                    error.add_note(
+                        "portable registration staging cleanup failed: "
+                        f"{type(cleanup_error).__name__}: {cleanup_error}"
+                    )
             if installed:
-                self._trainer.release_checkpoint_slot(spec.run_id)
+                try:
+                    self._trainer.release_checkpoint_slot(spec.run_id)
+                except BaseException as cleanup_error:
+                    error.add_note(
+                        "run registration slot cleanup failed: "
+                        f"{type(cleanup_error).__name__}: {cleanup_error}"
+                    )
             raise
         return portable_read
 
@@ -845,9 +891,12 @@ class MCoreRunSlotExecutor:
         generation_id: str,
         representation: Literal["weights", "optimizer", "accumulator"],
         accumulator_revision: int = 0,
+        adapter_config: dict[str, Any] | None = None,
     ) -> ResidencyKey:
         adapter_layout = json.dumps(
-            state.adapter_config, separators=(",", ":"), sort_keys=True
+            state.adapter_config if adapter_config is None else adapter_config,
+            separators=(",", ":"),
+            sort_keys=True,
         ).encode()
         return ResidencyKey(
             training_session_id=state.spec.training_session_id,
@@ -858,6 +907,144 @@ class MCoreRunSlotExecutor:
             topology_fingerprint=self._topology_fingerprint,
             adapter_layout_fingerprint=hashlib.sha256(adapter_layout).hexdigest(),
         )
+
+    def _prepare_portable_run(
+        self,
+        *,
+        run_id: str,
+        generation_id: str,
+        archive: PortableSnapshotArchive,
+        expected_lora_rank: int,
+        expected_lora_target_modules: tuple[str, ...],
+        restore_optimizer: bool,
+    ) -> _PreparedPortableRun:
+        source = self._portable_snapshot_source
+        if source is None:
+            raise RuntimeError("portable checkpoint source is not configured")
+        from art.trainer_rank import AdamParams, _checkpoint
+
+        from .portable_snapshot import (
+            install_prepared_portable_checkpoint,
+            prepare_portable_checkpoint,
+        )
+
+        staging_digest = hashlib.sha256(
+            (
+                run_id
+                + "\0"
+                + generation_id
+                + "\0"
+                + archive.archive_sha256
+                + "\0"
+                + json.dumps(restore_optimizer)
+            ).encode()
+        ).hexdigest()[:32]
+        staging_name = f"__art_portable_{staging_digest}"
+        installed = False
+        try:
+            with prepare_portable_checkpoint(
+                self._trainer,
+                source,
+                archive,
+                destination_rank=int(self.runtime.rank),
+                expected_lora_rank=expected_lora_rank,
+                expected_lora_target_modules=expected_lora_target_modules,
+                restore_optimizer=restore_optimizer,
+            ) as prepared:
+                install_prepared_portable_checkpoint(
+                    self._trainer, prepared, name=staging_name
+                )
+                installed = True
+                prepared_run = None
+                preparation_error: BaseException | None = None
+                try:
+                    if not restore_optimizer:
+                        self._trainer.prepare_checkpoint_slot_optimizer(
+                            staging_name, AdamParams(learning_rate=0.0)
+                        )
+                    weights = self._trainer.checkpoint_slot_parameters(staging_name)
+                    optimizer_tensors = self._trainer.checkpoint_slot_optimizer_tensors(
+                        staging_name
+                    )
+                    if not weights or not optimizer_tensors:
+                        raise RuntimeError(
+                            "prepared portable checkpoint lacks a complete working set"
+                        )
+                    with torch.no_grad():
+                        for tensor in (*weights, *optimizer_tensors):
+                            tensor.data = tensor.detach().to(device="cpu")
+                    if any(
+                        tensor.device.type != "cpu"
+                        for tensor in (*weights, *optimizer_tensors)
+                    ):
+                        raise RuntimeError(
+                            "prepared portable checkpoint is not entirely CPU resident"
+                        )
+                    prepared_run = _PreparedPortableRun(
+                        receipt=prepared.receipt,
+                        staging_name=staging_name,
+                        adapter_config=dict(prepared.config),
+                        weights=weights,
+                        optimizer_tensors=optimizer_tensors,
+                    )
+                except BaseException as error:
+                    preparation_error = error
+                _checkpoint.raise_distributed(
+                    preparation_error,
+                    "prepare portable checkpoint CPU working set",
+                    _checkpoint._ensure_group(self._trainer),
+                )
+                assert prepared_run is not None
+                return prepared_run
+        except BaseException as error:
+            if installed:
+                try:
+                    self._trainer.release_checkpoint_slot(staging_name)
+                except BaseException as cleanup_error:
+                    error.add_note(
+                        "portable preparation cleanup failed: "
+                        f"{type(cleanup_error).__name__}: {cleanup_error}"
+                    )
+            raise
+
+    def _discard_prepared_portable_run(self, prepared: _PreparedPortableRun) -> None:
+        self._trainer.release_checkpoint_slot(prepared.staging_name)
+
+    def _register_portable_l2_working_set(
+        self,
+        working_set: tuple[
+            tuple[ResidencyKey, tuple[torch.Tensor, ...]],
+            ...,
+        ],
+    ) -> None:
+        from art.trainer_rank import _checkpoint
+
+        registered = False
+        registration_error: BaseException | None = None
+        try:
+            self._residency.register_l2_working_set(working_set)
+            registered = True
+        except BaseException as error:
+            registration_error = error
+        try:
+            _checkpoint.raise_distributed(
+                registration_error,
+                "register portable checkpoint L2 working set",
+                _checkpoint._ensure_group(self._trainer),
+            )
+        except BaseException as error:
+            if registered:
+                for key, _tensors in working_set:
+                    try:
+                        self._residency.retire_async(key).result(
+                            timeout=self._residency.config.shutdown_timeout_s
+                        )
+                    except BaseException as cleanup_error:
+                        error.add_note(
+                            "portable L2 registration cleanup failed: "
+                            f"{type(cleanup_error).__name__}: {cleanup_error}"
+                        )
+            raise
 
     @staticmethod
     def _state_keys(state: _ResidentCommandRun) -> tuple[ResidencyKey, ...]:
@@ -1078,52 +1265,78 @@ class MCoreRunSlotExecutor:
             ParameterGradientAccumulator,
         )
 
-        from .portable_snapshot import install_portable_checkpoint
-
         previous_keys = self._state_keys(state)
-        for key in previous_keys:
-            self._residency.retire_async(key).result()
-        receipt, adapter_config = install_portable_checkpoint(
-            self._trainer,
-            self._portable_snapshot_source,
-            archive,
-            name=run_id,
-            destination_rank=int(self.runtime.rank),
+        prepared = self._prepare_portable_run(
+            run_id=run_id,
+            generation_id=generation.generation_id,
+            archive=archive,
             expected_lora_rank=state.spec.lora_rank,
             expected_lora_target_modules=state.spec.lora_target_modules,
             restore_optimizer=restore_optimizer,
         )
-        state.gradients = ParameterGradientAccumulator(
-            self._trainer.checkpoint_slot_parameters(run_id)
-        )
-        state.learner_version = generation.policy_step
-        state.adapter_config = adapter_config
-        state.accumulator_key = None
-        state.next_accumulator_revision = 1
-        state.weights_key = self._residency_key(
+        gradients = ParameterGradientAccumulator(prepared.weights)
+        weights_key = self._residency_key(
             state,
             generation_id=generation.generation_id,
             representation="weights",
+            adapter_config=prepared.adapter_config,
         )
-        from art.trainer_rank import AdamParams
-
-        optimizer_tensors = self._trainer.prepare_checkpoint_slot_optimizer(
-            run_id, AdamParams(learning_rate=0.0)
-        )
-        state.optimizer_key = self._residency_key(
+        optimizer_key = self._residency_key(
             state,
             generation_id=generation.generation_id,
             representation="optimizer",
+            adapter_config=prepared.adapter_config,
         )
-        initial_l2 = (
-            self._residency.register_l1(
-                state.weights_key, self._trainer.checkpoint_slot_parameters(run_id)
-            ),
-            self._residency.register_l1(state.optimizer_key, optimizer_tensors),
-        )
-        for future in initial_l2:
-            future.result()
-        return receipt
+        prepared_keys = (weights_key, optimizer_key)
+        registered = False
+        try:
+            self._register_portable_l2_working_set(
+                (
+                    (weights_key, prepared.weights),
+                    (optimizer_key, prepared.optimizer_tensors),
+                )
+            )
+            registered = True
+            from .portable_snapshot import commit_prepared_portable_checkpoint
+
+            commit_prepared_portable_checkpoint(
+                self._trainer,
+                staging_name=prepared.staging_name,
+                name=run_id,
+            )
+        except BaseException as error:
+            if registered:
+                for key in prepared_keys:
+                    try:
+                        self._residency.retire_async(key).result(
+                            timeout=self._residency.config.shutdown_timeout_s
+                        )
+                    except BaseException as cleanup_error:
+                        error.add_note(
+                            "portable restore residency cleanup failed: "
+                            f"{type(cleanup_error).__name__}: {cleanup_error}"
+                        )
+            try:
+                self._discard_prepared_portable_run(prepared)
+            except BaseException as cleanup_error:
+                error.add_note(
+                    "portable restore staging cleanup failed: "
+                    f"{type(cleanup_error).__name__}: {cleanup_error}"
+                )
+            raise
+
+        state.gradients = gradients
+        state.learner_version = generation.policy_step
+        state.adapter_config = prepared.adapter_config
+        state.portable_read = prepared.receipt
+        state.accumulator_key = None
+        state.next_accumulator_revision = 1
+        state.weights_key = weights_key
+        state.optimizer_key = optimizer_key
+        for key in previous_keys:
+            if key not in prepared_keys:
+                self._residency.retire_async(key)
+        return prepared.receipt
 
     def _register_accumulator_residency(self, state: _ResidentCommandRun) -> None:
         if state.accumulator_key is not None:

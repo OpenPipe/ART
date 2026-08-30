@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
-from dataclasses import replace
+from dataclasses import dataclass, replace
 import hashlib
 import importlib
 import json
@@ -290,6 +290,31 @@ class PortableSnapshotSink(Protocol):
     def close(self, *, deadline: float | None = None) -> None: ...
 
 
+@dataclass(slots=True)
+class PreparedPortableCheckpoint:
+    """Authenticated rank-local files retained until trainer installation."""
+
+    archive: PortableSnapshotArchive
+    receipt: PortableSnapshotReadReceipt
+    checkpoint: Any
+    config: dict[str, object]
+    restore_optimizer: bool
+    _temporary: tempfile.TemporaryDirectory[str] | None
+
+    def close(self) -> None:
+        temporary, self._temporary = self._temporary, None
+        if temporary is not None:
+            temporary.cleanup()
+
+    def __enter__(self) -> "PreparedPortableCheckpoint":
+        if self._temporary is None:
+            raise RuntimeError("prepared portable checkpoint is closed")
+        return self
+
+    def __exit__(self, *_error: object) -> None:
+        self.close()
+
+
 def build_portable_snapshot_archive(
     *,
     generation: PortableSnapshotGeneration,
@@ -475,18 +500,17 @@ def export_portable_checkpoint(
         clean_rank_snapshots()
 
 
-def install_portable_checkpoint(
+def prepare_portable_checkpoint(
     trainer: TrainerRank,
     source: PortableSnapshotSource,
     archive: PortableSnapshotArchive,
     *,
-    name: str,
     destination_rank: int,
     expected_lora_rank: int,
     expected_lora_target_modules: tuple[str, ...],
     restore_optimizer: bool,
-) -> tuple[PortableSnapshotReadReceipt, dict[str, object]]:
-    """Read, authenticate, repartition, and atomically install one checkpoint."""
+) -> PreparedPortableCheckpoint:
+    """Read and authenticate one destination-rank checkpoint without installing it."""
 
     owned = {
         file.relative_path: (receipt, file)
@@ -494,8 +518,9 @@ def install_portable_checkpoint(
         for file in receipt.files
     }
     read: dict[str, PortableSnapshotReadFile] = {}
-    with tempfile.TemporaryDirectory(prefix="art-portable-restore-") as temporary:
-        root = Path(temporary)
+    temporary = tempfile.TemporaryDirectory(prefix="art-portable-restore-")
+    try:
+        root = Path(temporary.name)
 
         def materialize(paths: set[str]) -> None:
             missing = paths.difference(owned)
@@ -527,21 +552,21 @@ def install_portable_checkpoint(
 
         from art.trainer_rank import _checkpoint
 
-        prepared = None
+        checkpoint = None
         read_error: BaseException | None = None
         try:
             materialize(set(_CHECKPOINT_IDENTITY_FILES))
             entries = tuple(sorted(owned))
-            prepared = _checkpoint.prepare_checkpoint(
+            checkpoint = _checkpoint.prepare_checkpoint(
                 str(root), artifact_entries=entries
             )
-            if prepared.digest != archive.checkpoint_digest:
+            if checkpoint.digest != archive.checkpoint_digest:
                 raise RuntimeError("portable checkpoint digest changed")
-            assert prepared.manifest is not None
-            expected_files = {"checkpoint.json", *prepared.manifest["files"]}
+            assert checkpoint.manifest is not None
+            expected_files = {"checkpoint.json", *checkpoint.manifest["files"]}
             if set(entries) != expected_files:
                 raise RuntimeError("portable archive file inventory changed")
-            actual_rank, actual_targets = _adapter_shape(prepared.config)
+            actual_rank, actual_targets = _adapter_shape(checkpoint.config)
             if actual_rank != expected_lora_rank or set(actual_targets) != set(
                 expected_lora_target_modules
             ):
@@ -549,7 +574,7 @@ def install_portable_checkpoint(
                     "portable checkpoint adapter shape differs from run admission"
                 )
             required = (
-                _checkpoint.required_local_checkpoint_files(trainer, prepared)
+                _checkpoint.required_local_checkpoint_files(trainer, checkpoint)
                 if restore_optimizer
                 else tuple(
                     sorted(
@@ -562,34 +587,34 @@ def install_portable_checkpoint(
             materialize(set(required))
             for relative in set(required) - {"checkpoint.json"}:
                 actual = _checkpoint._file_digest(root / relative)
-                expected = prepared.manifest["files"][relative]
+                expected = checkpoint.manifest["files"][relative]
                 if actual != expected:
                     raise RuntimeError(
                         f"portable checkpoint manifest digest changed: {relative}"
                     )
-            prepared = _checkpoint.prepare_checkpoint(
+            checkpoint = _checkpoint.prepare_checkpoint(
                 str(root), artifact_entries=entries
             )
             if not restore_optimizer:
-                assert prepared.manifest is not None
+                assert checkpoint.manifest is not None
                 # Keep the authenticated canonical checkpoint identity while
                 # presenting only its materialized adapter state to the loader.
                 adapter_manifest = cast(
                     Any,
                     {
-                        **prepared.manifest,
+                        **checkpoint.manifest,
                         "optimizer": None,
                         "parameters": {},
                         "steps": {},
                         "files": {
                             relative: digest
-                            for relative, digest in prepared.manifest["files"].items()
+                            for relative, digest in checkpoint.manifest["files"].items()
                             if _checkpoint_component(relative) != "optimizer"
                         },
                     },
                 )
-                prepared = replace(
-                    prepared,
+                checkpoint = replace(
+                    checkpoint,
                     manifest=adapter_manifest,
                     custom=(
                         _checkpoint._load_custom_payload(root, adapter_manifest)
@@ -597,12 +622,12 @@ def install_portable_checkpoint(
                         else None
                     ),
                 )
-            elif prepared.manifest is not None and prepared.manifest.get(
+            elif checkpoint.manifest is not None and checkpoint.manifest.get(
                 "custom_tensors"
             ):
-                prepared = replace(
-                    prepared,
-                    custom=_checkpoint._load_custom_payload(root, prepared.manifest),
+                checkpoint = replace(
+                    checkpoint,
+                    custom=_checkpoint._load_custom_payload(root, checkpoint.manifest),
                 )
         except BaseException as error:
             read_error = error
@@ -611,15 +636,120 @@ def install_portable_checkpoint(
             "prepare portable checkpoint",
             _checkpoint._ensure_group(trainer),
         )
-        assert prepared is not None
-        _checkpoint.load_checkpoint(trainer, prepared, name)
-        config = dict(prepared.config)
-    receipt = PortableSnapshotReadReceipt(
-        archive_sha256=archive.archive_sha256,
-        destination_rank=destination_rank,
-        files=tuple(read[path] for path in sorted(read)),
+        assert checkpoint is not None
+        return PreparedPortableCheckpoint(
+            archive=archive,
+            receipt=PortableSnapshotReadReceipt(
+                archive_sha256=archive.archive_sha256,
+                destination_rank=destination_rank,
+                files=tuple(read[path] for path in sorted(read)),
+            ),
+            checkpoint=checkpoint,
+            config=dict(checkpoint.config),
+            restore_optimizer=restore_optimizer,
+            _temporary=temporary,
+        )
+    except BaseException:
+        temporary.cleanup()
+        raise
+
+
+def install_prepared_portable_checkpoint(
+    trainer: TrainerRank,
+    prepared: PreparedPortableCheckpoint,
+    *,
+    name: str,
+) -> None:
+    """Install already authenticated files into one trainer checkpoint slot."""
+
+    if prepared._temporary is None:
+        raise RuntimeError("prepared portable checkpoint is closed")
+    from art.trainer_rank import _checkpoint
+
+    _checkpoint.load_checkpoint(trainer, prepared.checkpoint, name)
+
+
+def commit_prepared_portable_checkpoint(
+    trainer: TrainerRank,
+    *,
+    staging_name: str,
+    name: str,
+) -> None:
+    """Atomically replace one live slot with an already prepared CPU slot."""
+
+    if not staging_name or not name or staging_name == name:
+        raise ValueError("portable checkpoint commit names are invalid")
+    from art.trainer_rank import _checkpoint
+
+    group = _checkpoint._ensure_group(trainer)
+    _checkpoint._phase(
+        lambda: trainer._guard_slot_can_load(trainer._slot_ref(name)),
+        "validate prepared checkpoint target",
+        group,
     )
-    return receipt, config
+    snapshot = _checkpoint._slot_snapshot(trainer)
+    try:
+        staged = trainer._checkpoint_slots[staging_name]
+    except KeyError as error:
+        raise RuntimeError("prepared portable checkpoint slot is absent") from error
+    previous = trainer._checkpoint_slots.get(name)
+    staged_revision = staged.revision
+
+    def commit() -> None:
+        _checkpoint._commit_slot(trainer, staging_name, name)
+        installed = trainer._checkpoint_slots.pop(staging_name)
+        installed.revision = 0 if previous is None else previous.revision + 1
+        trainer._checkpoint_slots[name] = installed
+
+    try:
+        _checkpoint._phase(commit, "commit prepared portable checkpoint", group)
+    except BaseException as error:
+
+        def rollback() -> None:
+            _checkpoint._restore_slots(snapshot)
+            staged.revision = staged_revision
+            trainer._checkpoint_slots[staging_name] = staged
+            if previous is None:
+                trainer._checkpoint_slots.pop(name, None)
+            else:
+                trainer._checkpoint_slots[name] = previous
+
+        try:
+            _checkpoint._phase(
+                rollback, "roll back prepared portable checkpoint", group
+            )
+        except BaseException as rollback_error:
+            raise BaseExceptionGroup(
+                "portable checkpoint commit and rollback failed",
+                [error, rollback_error],
+            ) from None
+        raise
+
+
+def install_portable_checkpoint(
+    trainer: TrainerRank,
+    source: PortableSnapshotSource,
+    archive: PortableSnapshotArchive,
+    *,
+    name: str,
+    destination_rank: int,
+    expected_lora_rank: int,
+    expected_lora_target_modules: tuple[str, ...],
+    restore_optimizer: bool,
+) -> tuple[PortableSnapshotReadReceipt, dict[str, object]]:
+    """Read, authenticate, repartition, and atomically install one checkpoint."""
+
+    with prepare_portable_checkpoint(
+        trainer,
+        source,
+        archive,
+        destination_rank=destination_rank,
+        expected_lora_rank=expected_lora_rank,
+        expected_lora_target_modules=expected_lora_target_modules,
+        restore_optimizer=restore_optimizer,
+    ) as prepared:
+        install_prepared_portable_checkpoint(trainer, prepared, name=name)
+        return prepared.receipt, prepared.config
 
 
 def _read_rank_files(
