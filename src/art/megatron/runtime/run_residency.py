@@ -155,7 +155,9 @@ class RunResidencyManager:
         self._failures: list[BaseException] = []
         self._lock = RLock()
         self._admission_locks = {
-            tier: Lock() for tier in ("l1_gpu", "l2_cpu", "l3_nvme")
+            "l1_gpu": RLock(),
+            "l2_cpu": Lock(),
+            "l3_nvme": Lock(),
         }
         self._transition_slots = Condition(self._lock)
         self._active_transitions = 0
@@ -617,27 +619,30 @@ class RunResidencyManager:
         keys = self._working_set_keys(keys)
         if not keys:
             return
-        with self._lock:
-            needs_prepare = any(
-                not self.ledger.has_copy(key, "l1_gpu")
-                and self._state(key).l1_transition is None
-                for key in keys
-            )
-        if needs_prepare:
-            self.prepare_l1_working_set(keys)
-        with self._lock:
-            for key in keys:
-                self._require_not_retiring(key)
-            transitions = {
-                id(transition): transition
-                for key in keys
-                if (transition := self._state(key).l1_transition) is not None
-            }
-            for transition in transitions.values():
-                self._finish_l1_transfer_locked(transition)
-            if any(not self.ledger.has_copy(key, "l1_gpu") for key in keys):
-                raise RuntimeError("demanded working set did not become L1 resident")
-            self.ledger.pin_many((key, "l1_gpu") for key in keys)
+        with self._admission_locks["l1_gpu"]:
+            with self._lock:
+                needs_prepare = any(
+                    not self.ledger.has_copy(key, "l1_gpu")
+                    and self._state(key).l1_transition is None
+                    for key in keys
+                )
+            if needs_prepare:
+                self.prepare_l1_working_set(keys)
+            with self._lock:
+                for key in keys:
+                    self._require_not_retiring(key)
+                transitions = {
+                    id(transition): transition
+                    for key in keys
+                    if (transition := self._state(key).l1_transition) is not None
+                }
+                for transition in transitions.values():
+                    self._finish_l1_transfer_locked(transition)
+                if any(not self.ledger.has_copy(key, "l1_gpu") for key in keys):
+                    raise RuntimeError(
+                        "demanded working set did not become L1 resident"
+                    )
+                self.ledger.pin_many((key, "l1_gpu") for key in keys)
 
     def prefetch_l1(self, key: ResidencyKey) -> None:
         self.prefetch_l1_working_set((key,))

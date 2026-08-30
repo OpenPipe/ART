@@ -1,5 +1,6 @@
 import asyncio
 from datetime import UTC, datetime
+from threading import RLock
 from types import SimpleNamespace
 
 import pytest
@@ -34,7 +35,8 @@ from art.megatron.runtime.portable_snapshot import (
     PortableSnapshotReadReceipt,
     build_portable_snapshot_archive,
 )
-from art.megatron.runtime.residency import ResidencyCapacityUnavailable
+from art.megatron.runtime.residency import ResidencyCapacityUnavailable, ResidencyKey
+from art.megatron.runtime.run_residency import RunResidencyManager
 from art.megatron.runtime.specs import TrainerCommandRunState, TrainerGeneration
 from art.megatron.slot_coordinator import (
     MegatronMigrationContribution,
@@ -412,6 +414,61 @@ async def test_slot_resources_keep_only_one_command_ahead_under_pressure() -> No
     await resources.release(requests[1])
     assert await resources.ensure(requests[2]) == {"operation_id": "operation-2"}
     await resources.release(requests[2])
+
+
+def test_run_residency_pins_under_l1_admission_lock() -> None:
+    class _TrackedRLock:
+        def __init__(self) -> None:
+            self._lock = RLock()
+            self.depth = 0
+
+        def __enter__(self):
+            self._lock.acquire()
+            self.depth += 1
+            return self
+
+        def __exit__(self, *_args) -> None:
+            self.depth -= 1
+            self._lock.release()
+
+    class _Ledger:
+        present = False
+        pinned: tuple[tuple[ResidencyKey, str], ...] = ()
+
+        def has_copy(self, _key, tier) -> bool:
+            return tier == "l1_gpu" and self.present
+
+        def pin_many(self, copies) -> None:
+            assert admission.depth > 0
+            self.pinned = tuple(copies)
+
+    key = ResidencyKey(
+        training_session_id="session",
+        run_id="run",
+        generation_id="generation",
+        topology_fingerprint="topology",
+        adapter_layout_fingerprint="adapter",
+    )
+    admission = _TrackedRLock()
+    ledger = _Ledger()
+    manager = object.__new__(RunResidencyManager)
+    manager._admission_locks = {"l1_gpu": admission}  # type: ignore[assignment]
+    manager._lock = RLock()
+    manager._states = {key: SimpleNamespace(l1_transition=None)}  # type: ignore[assignment]
+    manager._retirements = {}
+    manager._failures = []
+    manager._closing = False
+    manager._closed = False
+
+    def prepare(_keys) -> None:
+        assert admission.depth > 0
+        ledger.present = True
+
+    manager.ledger = ledger  # type: ignore[assignment]
+    manager.prepare_l1_working_set = prepare  # type: ignore[method-assign]
+    manager.acquire_l1_working_set((key,))
+
+    assert ledger.pinned == ((key, "l1_gpu"),)
 
 
 def _operation(
