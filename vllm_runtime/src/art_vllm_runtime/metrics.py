@@ -27,6 +27,9 @@ class _ArtRuntimeMetricsState:
             "prompt_tokens_local_cache_hit_total": 0.0,
             "prompt_tokens_external_kv_transfer_total": 0.0,
             "generation_tokens_total": 0.0,
+            "spec_decode_drafts_total": 0.0,
+            "spec_decode_draft_tokens_total": 0.0,
+            "spec_decode_accepted_tokens_total": 0.0,
             "prefix_cache_queries_total": 0.0,
             "prefix_cache_hits_total": 0.0,
             "external_prefix_cache_queries_total": 0.0,
@@ -99,6 +102,17 @@ class _ArtRuntimeMetricsState:
                     )
                     self._counters["external_prefix_cache_hits_total"] += float(
                         connector.hits
+                    )
+                spec_decode = scheduler_stats.spec_decoding_stats
+                if spec_decode is not None:
+                    self._counters["spec_decode_drafts_total"] += float(
+                        spec_decode.num_drafts
+                    )
+                    self._counters["spec_decode_draft_tokens_total"] += float(
+                        spec_decode.num_draft_tokens
+                    )
+                    self._counters["spec_decode_accepted_tokens_total"] += float(
+                        spec_decode.num_accepted_tokens
                     )
             if iteration_stats is not None:
                 record_finished_requests(iteration_stats)
