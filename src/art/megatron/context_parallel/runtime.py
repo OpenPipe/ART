@@ -1483,15 +1483,21 @@ def _search_generic_chunk_assignment(
     if best is None:
         raise RuntimeError("Failed to evaluate any CP planner wave assignment.")
     if cp_size == 2:
+        contiguous_eval = _evaluate_candidate(
+            owners=contiguous_owners,
+            wave_assignment=best[1],
+        )
         rebalanced = _score_rebalanced_cp2_assignment(
-            current_owners=best[0],
-            current_eval=best[2],
+            current_owners=contiguous_owners,
+            current_eval=contiguous_eval,
             evaluate_candidate=lambda *, owners: _evaluate_candidate(
                 owners=owners,
                 wave_assignment=best[1],
             ),
         )
-        if rebalanced is not None:
+        if rebalanced is not None and float(rebalanced[1]["score"]) + 1e-9 < float(
+            best[2]["score"]
+        ):
             best = (rebalanced[0], best[1], rebalanced[1])
     return best
 
