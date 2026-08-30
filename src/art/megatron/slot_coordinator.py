@@ -64,6 +64,7 @@ class MegatronSlotScheduleConfig(BaseModel):
     deficit_quantum_tokens: int = Field(default=32_768, ge=1)
     optimizer_turn_limit: int = Field(default=2, ge=1, le=16)
     max_ready_commands: int = Field(default=256, ge=1, le=4096)
+    max_pending_results: int = Field(default=8, ge=1, le=64)
 
 
 class MegatronSlotResourceRequest(BaseModel):
@@ -128,11 +129,19 @@ class _SharedTrainer(Protocol):
 
     async def forward(self, job: Any, batch: Any) -> dict[str, Any]: ...
 
+    async def start_forward(self, job: Any, batch: Any) -> Any: ...
+
     async def forward_backward(self, job: Any, batch: Any) -> dict[str, Any]: ...
+
+    async def start_forward_backward(self, job: Any, batch: Any) -> Any: ...
 
     async def sft_forward(self, job: Any, batch: Any) -> dict[str, Any]: ...
 
+    async def start_sft_forward(self, job: Any, batch: Any) -> Any: ...
+
     async def sft_forward_backward(self, job: Any, batch: Any) -> dict[str, Any]: ...
+
+    async def start_sft_forward_backward(self, job: Any, batch: Any) -> Any: ...
 
     async def optim_step(self, job: Any) -> dict[str, Any]: ...
 
@@ -208,6 +217,7 @@ class _RunState:
     maintenance: bool = False
     preparing: int = 0
     worker_calls: int = 0
+    settling: int = 0
     migration_fence_id: str | None = None
     migration_fence: MegatronMigrationFence | None = None
     migration_restore_id: str | None = None
@@ -309,13 +319,17 @@ class MegatronSlotCoordinator:
         schedule: MegatronSlotScheduleConfig | None = None,
         publisher: MegatronPairedPublisher | None = None,
         route_ownership: RouteBundleOwnershipProvider | None = None,
+        command_timeout_s: float = 300.0,
     ) -> None:
+        if command_timeout_s <= 0:
+            raise ValueError("command_timeout_s must be positive")
         self.runtime = runtime
         self.trainer = trainer
         self.resources = resources or InlineMegatronSlotResources()
         self.schedule = schedule or MegatronSlotScheduleConfig()
         self.publisher = publisher
         self.route_ownership = route_ownership
+        self.command_timeout_s = command_timeout_s
         self._runs: dict[str, _RunState] = {}
         self._ready: list[_ReadyCommand] = []
         self._deficit: dict[str, int] = {}
@@ -325,6 +339,10 @@ class MegatronSlotCoordinator:
         self._condition = asyncio.Condition()
         self._active_run_id: str | None = None
         self._pump_task: asyncio.Task[None] | None = None
+        self._settlement_slots = asyncio.BoundedSemaphore(
+            self.schedule.max_pending_results
+        )
+        self._settlement_tasks: set[asyncio.Task[None]] = set()
         self._released_migration_fences: dict[str, MegatronMigrationFence] = {}
         self._resumed_migration_fences: dict[tuple[str, str], None] = {}
         self._aborted_migration_restores: dict[
@@ -384,6 +402,7 @@ class MegatronSlotCoordinator:
             initial_adapter_path=config.source.adapter_path,
             optimizer_state_path=config.optimizer_state_path,
             initial_portable_snapshot=portable_archive,
+            event_timeout_s=self.command_timeout_s,
         )
         registration_identity = (config, archive_sha256, restore_id)
         aborted_key = None if restore_id is None else (config.run_id, restore_id)
@@ -1134,6 +1153,8 @@ class MegatronSlotCoordinator:
             await self.drain_run(run_id)
         if self._pump_task is not None:
             await self._pump_task
+        if self._settlement_tasks:
+            await asyncio.gather(*tuple(self._settlement_tasks))
         if self.publisher is not None:
             await self.publisher.aclose()
 
@@ -1238,34 +1259,90 @@ class MegatronSlotCoordinator:
     async def _pump(self) -> None:
         while True:
             async with self._condition:
-                while not self._ready and not self._closed:
+                while not any(
+                    not self._runs[item.run_id].settling for item in self._ready
+                ):
+                    if self._closed and not self._ready:
+                        return
                     await self._condition.wait()
-                if self._closed and not self._ready:
-                    return
                 command = self._select_ready()
                 self._ready.remove(command)
                 self._active_run_id = command.run_id
+            settlement_slot = False
             try:
                 state = self._runs[command.run_id]
-                result = await state.handler(
-                    command.request,
-                    command.operation,
-                    command.contributions,
-                )
+                if isinstance(
+                    command.request, (ForwardRequest, ForwardBackwardRequest)
+                ):
+                    await self._settlement_slots.acquire()
+                    settlement_slot = True
+                    launch = await state.handler.launch(
+                        command.request,
+                        command.operation,
+                        command.contributions,
+                    )
+                    if launch is None:
+                        raise RuntimeError("forward command returned no trainer launch")
+                    async with self._condition:
+                        state.settling += 1
+                        self._condition.notify_all()
+                    task = asyncio.create_task(
+                        self._settle_command(command, state, launch.completion),
+                        name=f"megatron-slot-result-{command.operation.operation_id}",
+                    )
+                    self._settlement_tasks.add(task)
+                    task.add_done_callback(self._settlement_tasks.discard)
+                    settlement_slot = False
+                else:
+                    result = await state.handler(
+                        command.request,
+                        command.operation,
+                        command.contributions,
+                    )
             except BaseException as error:
                 if not command.future.done():
                     command.future.set_exception(error)
             else:
-                if not command.future.done():
+                if (
+                    not isinstance(
+                        command.request, (ForwardRequest, ForwardBackwardRequest)
+                    )
+                    and not command.future.done()
+                ):
                     command.future.set_result(result)
             finally:
+                if settlement_slot:
+                    self._settlement_slots.release()
                 async with self._condition:
                     self._active_run_id = None
                     self._condition.notify_all()
 
+    async def _settle_command(
+        self,
+        command: _ReadyCommand,
+        state: _RunState,
+        completion: asyncio.Future[OperationResultType],
+    ) -> None:
+        try:
+            result = await asyncio.shield(completion)
+        except BaseException as error:
+            if not command.future.done():
+                command.future.set_exception(error)
+        else:
+            if not command.future.done():
+                command.future.set_result(result)
+        finally:
+            async with self._condition:
+                state.settling -= 1
+                self._settlement_slots.release()
+                self._condition.notify_all()
+
     def _select_ready(self) -> _ReadyCommand:
-        optimizers = [item for item in self._ready if item.optimizer]
-        forwards = [item for item in self._ready if not item.optimizer]
+        available = [
+            item for item in self._ready if not self._runs[item.run_id].settling
+        ]
+        optimizers = [item for item in available if item.optimizer]
+        forwards = [item for item in available if not item.optimizer]
         if optimizers and (self._optimizer_turn_remaining > 0 or not forwards):
             candidates = optimizers
             if self._optimizer_turn_remaining > 0:

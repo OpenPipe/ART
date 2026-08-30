@@ -292,17 +292,33 @@ class _ResidentTrainer(Protocol):
 
     async def forward(self, job: ForwardJobSpec, batch: Any) -> dict[str, Any]: ...
 
+    async def start_forward(
+        self, job: ForwardJobSpec, batch: Any
+    ) -> "_TrainerCommandLaunch": ...
+
     async def forward_backward(
         self, job: ForwardBackwardJobSpec, batch: Any
     ) -> dict[str, Any]: ...
+
+    async def start_forward_backward(
+        self, job: ForwardBackwardJobSpec, batch: Any
+    ) -> "_TrainerCommandLaunch": ...
 
     async def sft_forward(
         self, job: SftForwardJobSpec, batch: SFTBatchData
     ) -> dict[str, Any]: ...
 
+    async def start_sft_forward(
+        self, job: SftForwardJobSpec, batch: SFTBatchData
+    ) -> "_TrainerCommandLaunch": ...
+
     async def sft_forward_backward(
         self, job: SftForwardBackwardJobSpec, batch: SFTBatchData
     ) -> dict[str, Any]: ...
+
+    async def start_sft_forward_backward(
+        self, job: SftForwardBackwardJobSpec, batch: SFTBatchData
+    ) -> "_TrainerCommandLaunch": ...
 
     async def optim_step(self, job: OptimizerJobSpec) -> dict[str, Any]: ...
 
@@ -329,6 +345,16 @@ class _ResidentTrainer(Protocol):
         operation: OperationRef,
         learner_version: int,
     ) -> None: ...
+
+
+class _TrainerCommandLaunch(Protocol):
+    @property
+    def completion(self) -> asyncio.Future[dict[str, Any]]: ...
+
+
+@dataclass(frozen=True, slots=True)
+class MegatronOperationLaunch:
+    completion: asyncio.Future[OperationResultType]
 
 
 class MegatronOperationHandler:
@@ -550,12 +576,35 @@ class MegatronOperationHandler:
         operation: OperationRef,
         contributing_forward_backward_operation_ids: tuple[str, ...],
     ) -> OperationResultType:
+        launch = await self.launch(
+            request, operation, contributing_forward_backward_operation_ids
+        )
+        if launch is not None:
+            return await asyncio.shield(launch.completion)
+        return await self._execute_control(
+            request, operation, contributing_forward_backward_operation_ids
+        )
+
+    async def launch(
+        self,
+        request: RunCommand,
+        operation: OperationRef,
+        contributing_forward_backward_operation_ids: tuple[str, ...],
+    ) -> MegatronOperationLaunch | None:
         if operation.run_id != self.config.run_id:
             raise ValueError("operation belongs to another run")
         if isinstance(request, ForwardBackwardRequest):
-            return await self._forward(request, operation, backward=True)
+            return await self._start_forward(request, operation, backward=True)
         if isinstance(request, ForwardRequest):
-            return await self._forward(request, operation, backward=False)
+            return await self._start_forward(request, operation, backward=False)
+        return None
+
+    async def _execute_control(
+        self,
+        request: RunCommand,
+        operation: OperationRef,
+        contributing_forward_backward_operation_ids: tuple[str, ...],
+    ) -> OperationResultType:
         if isinstance(request, OptimStepRequest):
             return await self._optim_step(
                 request, operation, contributing_forward_backward_operation_ids
@@ -773,13 +822,13 @@ class MegatronOperationHandler:
             raise RuntimeError("packed inputs remain after migration source release")
         self._sampler_publications.clear()
 
-    async def _forward(
+    async def _start_forward(
         self,
         request: ForwardRequest | ForwardBackwardRequest,
         operation: OperationRef,
         *,
         backward: bool,
-    ) -> ForwardResult | ForwardBackwardResult:
+    ) -> MegatronOperationLaunch:
         capture_ref = await self.prepare_input(request, operation)
         captured = await self._require_capture(capture_ref, operation)
         if captured.packing.loss_bearing_tokens == 0:
@@ -793,7 +842,7 @@ class MegatronOperationHandler:
                 "data/sft_zero_work": 1.0,
             }
             if backward:
-                return ForwardBackwardResult(
+                result: OperationResultType = ForwardBackwardResult(
                     operation_id=operation.operation_id,
                     packing=captured.packing,
                     packed_input_capture=None,
@@ -802,14 +851,18 @@ class MegatronOperationHandler:
                     usage=_complete_zero_usage(),
                     produced_gradient=False,
                 )
-            return ForwardResult(
-                operation_id=operation.operation_id,
-                packing=captured.packing,
-                packed_input_capture=None,
-                token_logprobs=(),
-                metrics=metrics,
-                usage=_complete_zero_usage(),
-            )
+            else:
+                result = ForwardResult(
+                    operation_id=operation.operation_id,
+                    packing=captured.packing,
+                    packed_input_capture=None,
+                    token_logprobs=(),
+                    metrics=metrics,
+                    usage=_complete_zero_usage(),
+                )
+            completion = asyncio.get_running_loop().create_future()
+            completion.set_result(result)
+            return MegatronOperationLaunch(completion=completion)
         try:
             if captured.sft is not None:
                 sft_common = {
@@ -828,12 +881,14 @@ class MegatronOperationHandler:
                     "return_token_logprobs": request.return_token_logprobs,
                 }
                 if backward:
-                    raw = await self.trainer.sft_forward_backward(
-                        SftForwardBackwardJobSpec(**sft_common), captured.sft
+                    trainer_launch = await self.trainer.start_sft_forward_backward(
+                        SftForwardBackwardJobSpec(**sft_common),
+                        captured.sft,
                     )
                 else:
-                    raw = await self.trainer.sft_forward(
-                        SftForwardJobSpec(**sft_common), captured.sft
+                    trainer_launch = await self.trainer.start_sft_forward(
+                        SftForwardJobSpec(**sft_common),
+                        captured.sft,
                     )
             else:
                 if captured.packed is None:
@@ -855,14 +910,43 @@ class MegatronOperationHandler:
                     "return_token_logprobs": request.return_token_logprobs,
                 }
                 if backward:
-                    raw = await self.trainer.forward_backward(
+                    trainer_launch = await self.trainer.start_forward_backward(
                         ForwardBackwardJobSpec(**packed_common),
                         captured.packed.leases,
                     )
                 else:
-                    raw = await self.trainer.forward(
-                        ForwardJobSpec(**packed_common), captured.packed.leases
+                    trainer_launch = await self.trainer.start_forward(
+                        ForwardJobSpec(**packed_common),
+                        captured.packed.leases,
                     )
+        except BaseException as error:
+            await self._release_after_failed_execution(capture_ref.capture_id, error)
+            if isinstance(error, OperationExecutionError):
+                raise
+            raise _dispatched_execution_error(error, self.trainer) from error
+        completion = asyncio.create_task(
+            self._complete_forward(
+                trainer_launch.completion,
+                capture_ref,
+                captured,
+                operation,
+                backward=backward,
+            ),
+            name=f"megatron-operation-result-{operation.operation_id}",
+        )
+        return MegatronOperationLaunch(completion=completion)
+
+    async def _complete_forward(
+        self,
+        completion: asyncio.Future[dict[str, Any]],
+        capture_ref: PackedInputCaptureRef,
+        captured: _CapturedInput,
+        operation: OperationRef,
+        *,
+        backward: bool,
+    ) -> OperationResultType:
+        try:
+            raw = await asyncio.shield(completion)
         except BaseException as error:
             await self._release_after_failed_execution(capture_ref.capture_id, error)
             if isinstance(error, OperationExecutionError):

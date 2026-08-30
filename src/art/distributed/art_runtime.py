@@ -1098,7 +1098,12 @@ class ArtRuntime:
                     actors,
                     rank_processes,
                     cp_lookahead_ports,
-                ) = await spawn_monarch_trainer_actors(proc, runtime_spec, supervision)
+                ) = await spawn_monarch_trainer_actors(
+                    proc,
+                    runtime_spec,
+                    supervision,
+                    run_spec.event_timeout_s,
+                )
         except BaseException as startup_error:
             try:
                 if proc is not None:

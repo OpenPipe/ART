@@ -45,14 +45,6 @@ _POINTER_TEMP_RE = re.compile(r"^\.committed\.json\.\d+\.[0-9a-f]{32}\.tmp$")
 _POLICY_TEMP_RE = re.compile(r"^\.policy\.json\.\d+\.[0-9a-f]{32}\.tmp$")
 _SHA256_PATTERN = r"^[0-9a-f]{64}$"
 _POINTER_UNSET = object()
-_SCHEDULE_PROVIDER_FIELDS = {
-    "batch_p2p_comm",
-    "batch_p2p_sync",
-    "finalize_model_grads_func",
-    "microbatch_group_size_per_vp_stage",
-    "overlap_p2p_comm",
-    "variable_seq_lengths",
-}
 
 
 class _OptimizerRecord(BaseModel):
@@ -1279,13 +1271,11 @@ def _model_runtime_sha256(runtime: Any) -> str:
     runtime.optimizer_runtime_sha256 = _json_sha256(
         {
             "model_support": runtime.model_support_spec,
-            "provider": {
-                "type": _type_identity(runtime.provider),
-                "fields": _public_fields(
-                    runtime.provider,
-                    exclude=_SCHEDULE_PROVIDER_FIELDS,
-                ),
-            },
+            # Parameter ownership is authenticated separately by
+            # _optimizer_layout_sha256. Provider instances may retain live HF
+            # state on only one rank, so traversing their fields is neither
+            # bounded nor rank-stable.
+            "provider": _type_identity(runtime.provider),
             "optimizer": _type_identity(runtime.optimizer),
             "optimizer_config": _public_fields(runtime.optimizer_config),
             "compile": runtime.transformer_layers_compiled,

@@ -169,8 +169,10 @@ class _Trainer:
         self.active = 0
         self.max_active = 0
         self.executed_runs: list[str] = []
+        self.result_gates: dict[str, asyncio.Event] = {}
         self.registered_runs: set[str] = set()
         self.registered_adapters: dict[str, tuple[int, tuple[str, ...]]] = {}
+        self.registered_timeouts: dict[str, float] = {}
         self.run_states: dict[str, TrainerCommandRunState] = {}
         self.migration_releases: list[str] = []
         self.optimizer_jobs = []
@@ -181,6 +183,7 @@ class _Trainer:
             run_spec.lora_rank,
             run_spec.lora_target_modules,
         )
+        self.registered_timeouts[run_spec.run_id] = run_spec.event_timeout_s
         self.run_states[run_spec.run_id] = TrainerCommandRunState(
             run_id=run_spec.run_id,
             training_session_id=run_spec.training_session_id,
@@ -261,10 +264,10 @@ class _Trainer:
         await asyncio.sleep(0)
         self.active -= 1
 
-    async def forward(self, job, _batch):
+    async def start_forward(self, job, _batch):
         await self._enter(job.run_id)
         self._advance(job)
-        return {
+        result = {
             "operation_id": job.operation_id,
             "learner_version": job.expected_learner_version,
             "logical_nonpadding_tokens": 7,
@@ -273,10 +276,20 @@ class _Trainer:
             "gpu_service_ns": 12_000_000,
         }
 
-    async def forward_backward(self, job, _batch):
+        async def settle():
+            if gate := self.result_gates.get(job.run_id):
+                await gate.wait()
+            return result
+
+        return SimpleNamespace(completion=asyncio.create_task(settle()))
+
+    async def forward(self, job, batch):
+        return await (await self.start_forward(job, batch)).completion
+
+    async def start_forward_backward(self, job, _batch):
         await self._enter(job.run_id)
         self._advance(job, backward=True)
-        return {
+        result = {
             "operation_id": job.operation_id,
             "learner_version": job.expected_learner_version,
             "logical_nonpadding_tokens": 7,
@@ -284,6 +297,16 @@ class _Trainer:
             "gpu_count": 4,
             "gpu_service_ns": 12_000_000,
         }
+
+        async def settle():
+            if gate := self.result_gates.get(job.run_id):
+                await gate.wait()
+            return result
+
+        return SimpleNamespace(completion=asyncio.create_task(settle()))
+
+    async def forward_backward(self, job, batch):
+        return await (await self.start_forward_backward(job, batch)).completion
 
     async def optim_step(self, job):
         if self.fail_optimizer:
@@ -771,11 +794,13 @@ async def test_replay_capture_survives_optimizer_until_explicit_release() -> Non
 
 
 @pytest.mark.asyncio
-async def test_slot_coordinator_serializes_four_logical_runs() -> None:
+async def test_slot_coordinator_serializes_gpu_work_before_result_settlement() -> None:
     runtime = _Runtime()
     trainer = _Trainer()
     trainer.fail_optimizer = False
-    slot = MegatronSlotCoordinator(runtime, trainer)  # type: ignore[arg-type]
+    slot = MegatronSlotCoordinator(  # type: ignore[arg-type]
+        runtime, trainer, command_timeout_s=1_200
+    )
     runs = []
     for index in range(4):
         run_id = f"run-{index}"
@@ -808,8 +833,10 @@ async def test_slot_coordinator_serializes_four_logical_runs() -> None:
             )
         )
 
-    outcomes = await asyncio.gather(
-        *(
+    result_gate = asyncio.Event()
+    trainer.result_gates = {run.run_id: result_gate for run in runs}
+    tasks = [
+        asyncio.create_task(
             run.worker.execute(
                 ForwardRequest(
                     run_id=run.run_id,
@@ -826,9 +853,14 @@ async def test_slot_coordinator_serializes_four_logical_runs() -> None:
                     kind="forward",
                 ),
             )
-            for run in runs
         )
-    )
+        for run in runs
+    ]
+    while len(trainer.executed_runs) < len(runs):
+        await asyncio.sleep(0)
+    assert all(not task.done() for task in tasks)
+    result_gate.set()
+    outcomes = await asyncio.gather(*tasks)
 
     assert {outcome.status for outcome in outcomes} == {"succeeded"}
     assert trainer.max_active == 1
@@ -842,6 +874,7 @@ async def test_slot_coordinator_serializes_four_logical_runs() -> None:
         )
         for index in range(4)
     }
+    assert set(trainer.registered_timeouts.values()) == {1_200}
     await slot.drain_run("run-0")
     with pytest.raises(KeyError):
         slot.resolve_run("run-0")

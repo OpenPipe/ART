@@ -3,11 +3,12 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncIterator, Awaitable
 from dataclasses import dataclass, field
+from datetime import timedelta
 import hashlib
 import json
 import os
 import socket
-from threading import Event, Lock, Thread
+from threading import BoundedSemaphore, Event, Lock, Thread
 import time
 import traceback
 from typing import Any, Callable
@@ -34,7 +35,11 @@ from art.training import (
     UsageMeasurement,
 )
 from art.utils.cache_dirs import configure_model_cache_env
-from art.utils.lifecycle import cleanup_after_failure, consume_future_exception
+from art.utils.lifecycle import (
+    cleanup_after_failure,
+    consume_future_exception,
+    process_shutdown_timeout,
+)
 
 from .data_plane import InMemoryPackedBatch, SFTBatchData
 from .numerical_capture import (
@@ -96,6 +101,31 @@ from .specs import (
 )
 
 _MAX_CACHED_COMMAND_OPERATIONS = 65
+_MAX_DEFERRED_COMMAND_RESULTS = 8
+_DEFERRED_RESULT_JOIN_TIMEOUT_S = process_shutdown_timeout(2)
+type _DeferredCommandJob = (
+    ForwardJobSpec
+    | ForwardBackwardJobSpec
+    | SftForwardJobSpec
+    | SftForwardBackwardJobSpec
+)
+
+
+class _CommandReady(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    rank: int
+    operation_id: str
+    learner_version: int
+    error_type: str | None = None
+    message: str | None = None
+    traceback_text: str | None = None
+
+
+def _response_exception(error: BaseException) -> Exception:
+    if isinstance(error, Exception):
+        return error
+    return RuntimeError(f"{type(error).__name__}: {error}")
 
 
 def _rank_command_failure(rank: int, error: BaseException) -> dict[str, Any]:
@@ -204,10 +234,19 @@ def _configure_hybrid_ep_env(
             os.environ[name] = value
 
 
-def _build_training_runtime(spec: TrainerRuntimeSpec, *, rank: int) -> Any:
+def _build_training_runtime(
+    spec: TrainerRuntimeSpec, *, rank: int, distributed_timeout_s: float
+) -> Any:
     import torch
 
     from art.megatron.train import build_training_runtime
+
+    if distributed_timeout_s <= 0:
+        raise ValueError("distributed timeout must be positive")
+    if not torch.distributed.is_initialized():
+        torch.distributed.init_process_group(
+            "nccl", timeout=timedelta(seconds=distributed_timeout_s)
+        )
 
     return build_training_runtime(
         model_identifier=spec.model_source,
@@ -374,6 +413,7 @@ class MonarchTrainerActor(Actor):
         self,
         runtime_spec_json: str,
         run_id: str,
+        distributed_timeout_s: float,
     ) -> None:
         runtime_spec = TrainerRuntimeSpec.model_validate_json(runtime_spec_json)
         topology = runtime_spec.trainer_mesh.topology
@@ -465,7 +505,11 @@ class MonarchTrainerActor(Actor):
                 run_id=f"{hybrid_ep.run_id}-{run_id}-g{group_index}",
             )
             validate_hybrid_ep(require_multinode=hybrid_ep.multinode)
-        self._runtime = _build_training_runtime(runtime_spec, rank=rank)
+        self._runtime = _build_training_runtime(
+            runtime_spec,
+            rank=rank,
+            distributed_timeout_s=distributed_timeout_s,
+        )
         self._runtime.resident_run_id = run_id
         if self._runtime.model_support_handler.key != runtime_spec.handler_name:
             raise RuntimeError(
@@ -506,6 +550,10 @@ class MonarchTrainerActor(Actor):
         )
         self._weight_offload.install()
         self._command_job_open = False
+        self._deferred_result_lock = Lock()
+        self._deferred_result_slots = BoundedSemaphore(_MAX_DEFERRED_COMMAND_RESULTS)
+        self._deferred_result_threads: set[Thread] = set()
+        self._deferred_result_stopping = False
         self._migration_release_receipts: dict[str, tuple[str, ...]] = {}
         self._cp_preplanner = None
         self._cp_lookahead_port = None
@@ -528,6 +576,107 @@ class MonarchTrainerActor(Actor):
             )
             self._cp_lookahead_thread.start()
         self._valid = True
+
+    def _defer_result(
+        self,
+        response_port: Port[dict[str, Any]],
+        materialize: Callable[[], dict[str, Any]],
+        *,
+        name: str,
+    ) -> None:
+        self._deferred_result_slots.acquire()
+        with self._deferred_result_lock:
+            if self._deferred_result_stopping:
+                self._deferred_result_slots.release()
+                raise RuntimeError("trainer actor is stopping")
+
+            def settle() -> None:
+                try:
+                    response_port.send(materialize())
+                except BaseException as error:
+                    self._valid = False
+                    try:
+                        response_port.exception(_response_exception(error))
+                    except BaseException:
+                        pass
+                finally:
+                    with self._deferred_result_lock:
+                        self._deferred_result_threads.discard(thread)
+                    self._deferred_result_slots.release()
+
+            thread = Thread(target=settle, name=name, daemon=True)
+            self._deferred_result_threads.add(thread)
+            thread.start()
+
+    def _stop_deferred_results(self) -> None:
+        with self._deferred_result_lock:
+            self._deferred_result_stopping = True
+            threads = tuple(self._deferred_result_threads)
+        deadline = time.monotonic() + _DEFERRED_RESULT_JOIN_TIMEOUT_S
+        for thread in threads:
+            thread.join(timeout=max(0.0, deadline - time.monotonic()))
+        alive = [thread.name for thread in threads if thread.is_alive()]
+        if alive:
+            raise RuntimeError(
+                "trainer result settlement did not stop within "
+                f"{_DEFERRED_RESULT_JOIN_TIMEOUT_S:g}s: {alive}"
+            )
+
+    def _defer_command_launch(
+        self,
+        response_port: Port[dict[str, Any]],
+        ready_port: Port[dict[str, Any]],
+        job: _DeferredCommandJob,
+        launch: Any,
+        *,
+        label: str,
+    ) -> None:
+        ready_port.send(
+            _CommandReady(
+                rank=self._runtime.rank,
+                operation_id=job.operation_id,
+                learner_version=job.expected_learner_version,
+            ).model_dump(mode="json")
+        )
+
+        def materialize() -> dict[str, Any]:
+            result = launch.materialize()
+            coordinator = self._runtime.rank == 0
+            return {
+                **result,
+                "command_status": "succeeded",
+                "rank": self._runtime.rank,
+                "metrics": result["metrics"] if coordinator else {},
+                "token_logprobs": result["token_logprobs"] if coordinator else (),
+            }
+
+        self._defer_result(
+            response_port,
+            materialize,
+            name=f"art-{label}-result-{job.operation_id}",
+        )
+
+    def _fail_command_launch(
+        self,
+        response_port: Port[dict[str, Any]],
+        ready_port: Port[dict[str, Any]],
+        job: _DeferredCommandJob | None,
+        error: BaseException,
+    ) -> None:
+        if job is None:
+            response_port.exception(_response_exception(error))
+            return
+        ready_port.send(
+            _CommandReady(
+                rank=self._runtime.rank,
+                operation_id=job.operation_id,
+                learner_version=job.expected_learner_version,
+                error_type=type(error).__name__,
+                message=str(error),
+                traceback_text=traceback.format_exc(),
+            ).model_dump(mode="json")
+        )
+        response_port.send(_rank_command_failure(self._runtime.rank, error))
 
     def _run_cp_lookahead(self, receiver: Any) -> None:
         while (request := receiver.recv().get()) is not None:
@@ -720,13 +869,16 @@ class MonarchTrainerActor(Actor):
             if batch is not None:
                 batch.close()
 
-    @endpoint
+    @endpoint(explicit_response_port=True)
     def execute_forward_backward(
         self,
+        response_port: Port[dict[str, Any]],
         job_json: str,
         batch_json: str,
-    ) -> dict[str, Any]:
+        ready_port: Port[dict[str, Any]],
+    ) -> None:
         batch = None
+        job = None
         try:
             if not self._valid:
                 raise RuntimeError("trainer actor runtime is invalid")
@@ -737,17 +889,19 @@ class MonarchTrainerActor(Actor):
             if not self._command_job_open:
                 self._weight_offload.before_job()
                 self._command_job_open = True
-            result = self._run_slot_executor.execute_forward_backward(
-                job, batch, Event()
+            execute_job = (
+                job
+                if self._runtime.rank == 0
+                else job.model_copy(update={"return_token_logprobs": False})
             )
-            coordinator = self._runtime.rank == 0
-            return {
-                **result,
-                "command_status": "succeeded",
-                "rank": self._runtime.rank,
-                "metrics": result["metrics"] if coordinator else {},
-                "token_logprobs": result["token_logprobs"] if coordinator else (),
-            }
+            launch = self._run_slot_executor.execute_forward_backward(
+                execute_job, batch, Event()
+            )
+            batch.close()
+            batch = None
+            self._defer_command_launch(
+                response_port, ready_port, job, launch, label="fb"
+            )
         except BaseException as error:
             self._valid = False
             try:
@@ -757,17 +911,20 @@ class MonarchTrainerActor(Actor):
                     "F/B actor cleanup also failed: "
                     f"{type(cleanup_error).__name__}: {cleanup_error}"
                 )
-            return _rank_command_failure(self._runtime.rank, error)
+            self._fail_command_launch(response_port, ready_port, job, error)
         finally:
             if batch is not None:
                 batch.close()
 
-    @endpoint
+    @endpoint(explicit_response_port=True)
     def execute_sft_forward_backward(
         self,
+        response_port: Port[dict[str, Any]],
         job_json: str,
         batch: SFTBatchData,
-    ) -> dict[str, Any]:
+        ready_port: Port[dict[str, Any]],
+    ) -> None:
+        job = None
         try:
             if not self._valid:
                 raise RuntimeError("trainer actor runtime is invalid")
@@ -776,18 +933,17 @@ class MonarchTrainerActor(Actor):
             if not self._command_job_open:
                 self._weight_offload.before_job()
                 self._command_job_open = True
-            result = self._run_slot_executor.execute_sft_forward_backward(
-                job, batch, Event()
+            execute_job = (
+                job
+                if self._runtime.rank == 0
+                else job.model_copy(update={"return_token_logprobs": False})
             )
-            return {
-                **result,
-                "command_status": "succeeded",
-                "rank": self._runtime.rank,
-                "metrics": result["metrics"] if self._runtime.rank == 0 else {},
-                "token_logprobs": (
-                    result["token_logprobs"] if self._runtime.rank == 0 else ()
-                ),
-            }
+            launch = self._run_slot_executor.execute_sft_forward_backward(
+                execute_job, batch, Event()
+            )
+            self._defer_command_launch(
+                response_port, ready_port, job, launch, label="sft-fb"
+            )
         except BaseException as error:
             self._valid = False
             try:
@@ -797,15 +953,18 @@ class MonarchTrainerActor(Actor):
                     "SFT F/B actor cleanup also failed: "
                     f"{type(cleanup_error).__name__}: {cleanup_error}"
                 )
-            return _rank_command_failure(self._runtime.rank, error)
+            self._fail_command_launch(response_port, ready_port, job, error)
 
-    @endpoint
+    @endpoint(explicit_response_port=True)
     def execute_sft_forward(
         self,
+        response_port: Port[dict[str, Any]],
         job_json: str,
         batch: SFTBatchData,
-    ) -> dict[str, Any]:
+        ready_port: Port[dict[str, Any]],
+    ) -> None:
         opened_job = False
+        job = None
         try:
             if not self._valid:
                 raise RuntimeError("trainer actor runtime is invalid")
@@ -814,19 +973,20 @@ class MonarchTrainerActor(Actor):
             if not self._command_job_open:
                 self._weight_offload.before_job()
                 opened_job = True
-            result = self._run_slot_executor.execute_sft_forward(job, batch, Event())
-            return {
-                **result,
-                "command_status": "succeeded",
-                "rank": self._runtime.rank,
-                "metrics": result["metrics"] if self._runtime.rank == 0 else {},
-                "token_logprobs": (
-                    result["token_logprobs"] if self._runtime.rank == 0 else ()
-                ),
-            }
+            execute_job = (
+                job
+                if self._runtime.rank == 0
+                else job.model_copy(update={"return_token_logprobs": False})
+            )
+            launch = self._run_slot_executor.execute_sft_forward(
+                execute_job, batch, Event()
+            )
+            self._defer_command_launch(
+                response_port, ready_port, job, launch, label="sft-forward"
+            )
         except BaseException as error:
             self._valid = False
-            return _rank_command_failure(self._runtime.rank, error)
+            self._fail_command_launch(response_port, ready_port, job, error)
         finally:
             if opened_job:
                 self._weight_offload.after_job()
@@ -859,14 +1019,17 @@ class MonarchTrainerActor(Actor):
         finally:
             batch.close()
 
-    @endpoint
+    @endpoint(explicit_response_port=True)
     def execute_forward(
         self,
+        response_port: Port[dict[str, Any]],
         job_json: str,
         batch_json: str,
-    ) -> dict[str, Any]:
+        ready_port: Port[dict[str, Any]],
+    ) -> None:
         batch = None
         opened_job = False
+        job = None
         try:
             if not self._valid:
                 raise RuntimeError("trainer actor runtime is invalid")
@@ -877,18 +1040,22 @@ class MonarchTrainerActor(Actor):
             if not self._command_job_open:
                 self._weight_offload.before_job()
                 opened_job = True
-            result = self._run_slot_executor.execute_forward(job, batch, Event())
-            coordinator = self._runtime.rank == 0
-            return {
-                **result,
-                "command_status": "succeeded",
-                "rank": self._runtime.rank,
-                "metrics": result["metrics"] if coordinator else {},
-                "token_logprobs": result["token_logprobs"] if coordinator else (),
-            }
+            execute_job = (
+                job
+                if self._runtime.rank == 0
+                else job.model_copy(update={"return_token_logprobs": False})
+            )
+            launch = self._run_slot_executor.execute_forward(
+                execute_job, batch, Event()
+            )
+            batch.close()
+            batch = None
+            self._defer_command_launch(
+                response_port, ready_port, job, launch, label="forward"
+            )
         except BaseException as error:
             self._valid = False
-            return _rank_command_failure(self._runtime.rank, error)
+            self._fail_command_launch(response_port, ready_port, job, error)
         finally:
             if batch is not None:
                 batch.close()
@@ -1089,6 +1256,7 @@ class MonarchTrainerActor(Actor):
     @endpoint
     def close(self) -> None:
         self._stop_cp_lookahead()
+        self._stop_deferred_results()
         self._abort_command_job()
         self._run_slot_executor.close()
         self._executor.close()
@@ -1147,6 +1315,7 @@ class MonarchTrainerActor(Actor):
         if exc is not None:
             self._valid = False
         self._stop_cp_lookahead()
+        self._stop_deferred_results()
         self._run_slot_executor.close()
         self._executor.close()
 
@@ -1155,6 +1324,7 @@ async def spawn_monarch_trainer_actors(
     proc_mesh: ProcMesh,
     runtime_spec: TrainerRuntimeSpec,
     supervision: MonarchTrainerSupervision,
+    distributed_timeout_s: float,
 ) -> tuple[Any, tuple[_TrainerRankReady, ...], tuple[Port[Any], ...]]:
     """Configure torch-elastic first, then initialize exactly one actor per rank."""
     spmd: Any = proc_mesh.spawn(
@@ -1169,6 +1339,7 @@ async def spawn_monarch_trainer_actors(
         MonarchTrainerActor,
         runtime_spec.model_dump_json(),
         supervision.run_id,
+        distributed_timeout_s,
     )
     supervision.own_mesh(await actors._name)
     await actors.initialized
@@ -1382,6 +1553,13 @@ class _CommandRunState:
     portable_install: PortableSnapshotInstallReceipt | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class TrainerCommandLaunch:
+    """The trainer GPU turn is complete; bounded result settlement remains."""
+
+    completion: asyncio.Future[dict[str, Any]]
+
+
 def _command_run_identity(spec: TrainingRunSpec) -> tuple[Any, ...]:
     return (
         spec.run_id,
@@ -1440,6 +1618,7 @@ class MonarchTrainerRun:
         )
         self._jobs: dict[str, tuple[str, tuple[TrainEvent, ...]]] = {}
         self._operations: dict[str, tuple[str, dict[str, Any]]] = {}
+        self._command_launches: dict[str, tuple[str, TrainerCommandLaunch]] = {}
         self._checkpoint_exports: dict[
             str, tuple[tuple[str, TrainerGeneration], PortableSnapshotExportReceipt]
         ] = {}
@@ -1879,16 +2058,15 @@ class MonarchTrainerRun:
         job: ForwardBackwardJobSpec,
         batch: PackedBatchLeaseSet,
     ) -> dict[str, Any]:
-        cached = self._operations.get(job.operation_id)
-        if cached is not None and cached[0] == job.fingerprint:
-            return cached[1]
-        async with self._lock:
-            cached = self._operations.get(job.operation_id)
-            if cached is not None:
-                if cached[0] != job.fingerprint:
-                    raise RuntimeError("operation_id was reused for a different F/B")
-                return cached[1]
-            state = self._validate_command(job)
+        launch = await self.start_forward_backward(job, batch)
+        return await asyncio.shield(launch.completion)
+
+    async def start_forward_backward(
+        self,
+        job: ForwardBackwardJobSpec,
+        batch: PackedBatchLeaseSet,
+    ) -> TrainerCommandLaunch:
+        def validate() -> None:
             if batch.ref != job.batch:
                 raise ValueError("F/B batch ref does not match its leases")
             if job.batch.sequence_length != self.runtime_spec.packed_sequence_length:
@@ -1899,65 +2077,31 @@ class MonarchTrainerRun:
                 raise ValueError(
                     "F/B routing replay does not match the trainer runtime"
                 )
-            try:
-                values = await self._run_resident_collective(
-                    job.operation_id,
-                    self._actors.execute_forward_backward.call(
-                        job.model_dump_json(), batch.model_dump_json()
-                    ),
-                    invalidate_on_error=True,
-                )
-                results = list(values.values())
-                self._raise_command_failure(results)
-                self._validate_command_results(
-                    results,
-                    operation_id=job.operation_id,
-                    learner_version=job.expected_learner_version,
-                )
-                if {result["loss_bearing_token_count"] for result in results} != {
-                    job.expected_global_loss_bearing_tokens
-                }:
-                    raise RuntimeError("trainer ranks disagree on F/B token provenance")
-                usage = {
-                    (
-                        result["completed_gradient_steps"],
-                        result["logical_nonpadding_tokens"],
-                        result["executed_token_equivalents"],
-                    )
-                    for result in results
-                }
-                if len(usage) != 1:
-                    raise RuntimeError("trainer ranks disagree on F/B execution usage")
-            except BaseException as error:
-                await self._invalidate_after_command_failure(error)
-                raise
-            result = next(result for result in results if result["rank"] == 0)
-            result["gpu_service_ns"], result["gpu_count"] = self._aggregate_gpu_service(
-                results
-            )
-            self._command_mode = True
-            state.open_forward_backward_ids.append(job.operation_id)
-            state.next_operation_sequence += 1
-            self._cache_operation(job.operation_id, job.fingerprint, result)
-            return result
+
+        return await self._start_command(
+            job,
+            lambda ready: self._actors.execute_forward_backward.call(
+                job.model_dump_json(), batch.model_dump_json(), ready
+            ),
+            validate=validate,
+            label="F/B",
+            backward=True,
+        )
 
     async def forward(
         self,
         job: ForwardJobSpec,
         batch: PackedBatchLeaseSet,
     ) -> dict[str, Any]:
-        cached = self._operations.get(job.operation_id)
-        if cached is not None and cached[0] == job.fingerprint:
-            return cached[1]
-        async with self._lock:
-            cached = self._operations.get(job.operation_id)
-            if cached is not None:
-                if cached[0] != job.fingerprint:
-                    raise RuntimeError(
-                        "operation_id was reused for a different forward"
-                    )
-                return cached[1]
-            state = self._validate_command(job)
+        launch = await self.start_forward(job, batch)
+        return await asyncio.shield(launch.completion)
+
+    async def start_forward(
+        self,
+        job: ForwardJobSpec,
+        batch: PackedBatchLeaseSet,
+    ) -> TrainerCommandLaunch:
+        def validate() -> None:
             if batch.ref != job.batch:
                 raise ValueError("forward batch ref does not match its leases")
             if job.batch.sequence_length != self.runtime_spec.packed_sequence_length:
@@ -1968,157 +2112,243 @@ class MonarchTrainerRun:
                 raise ValueError(
                     "forward routing replay does not match the trainer runtime"
                 )
-            try:
-                values = await self._run_resident_collective(
-                    job.operation_id,
-                    self._actors.execute_forward.call(
-                        job.model_dump_json(), batch.model_dump_json()
-                    ),
-                    invalidate_on_error=True,
-                )
-                results = list(values.values())
-                self._raise_command_failure(results)
-                self._validate_command_results(
-                    results,
-                    operation_id=job.operation_id,
-                    learner_version=job.expected_learner_version,
-                )
-                usage = {
-                    (
-                        result["logical_nonpadding_tokens"],
-                        result["executed_token_equivalents"],
-                    )
-                    for result in results
-                }
-                if len(usage) != 1:
-                    raise RuntimeError("trainer ranks disagree on forward usage")
-            except BaseException as error:
-                await self._invalidate_after_command_failure(error)
-                raise
-            result = next(result for result in results if result["rank"] == 0)
-            result["gpu_service_ns"], result["gpu_count"] = self._aggregate_gpu_service(
-                results
-            )
-            self._command_mode = True
-            state.next_operation_sequence += 1
-            self._cache_operation(job.operation_id, job.fingerprint, result)
-            return result
+
+        return await self._start_command(
+            job,
+            lambda ready: self._actors.execute_forward.call(
+                job.model_dump_json(), batch.model_dump_json(), ready
+            ),
+            validate=validate,
+            label="forward",
+            backward=False,
+        )
 
     async def sft_forward_backward(
         self,
         job: SftForwardBackwardJobSpec,
         batch: SFTBatchData,
     ) -> dict[str, Any]:
-        cached = self._operations.get(job.operation_id)
-        if cached is not None and cached[0] == job.fingerprint:
-            return cached[1]
-        async with self._lock:
-            cached = self._operations.get(job.operation_id)
-            if cached is not None:
-                if cached[0] != job.fingerprint:
-                    raise RuntimeError(
-                        "operation_id was reused for a different SFT F/B"
-                    )
-                return cached[1]
-            state = self._validate_command(job)
+        launch = await self.start_sft_forward_backward(job, batch)
+        return await asyncio.shield(launch.completion)
+
+    async def start_sft_forward_backward(
+        self,
+        job: SftForwardBackwardJobSpec,
+        batch: SFTBatchData,
+    ) -> TrainerCommandLaunch:
+        def validate() -> None:
             if batch.fingerprint != job.batch_fingerprint:
                 raise ValueError("SFT F/B payload fingerprint differs from its command")
-            try:
-                values = await self._run_resident_collective(
-                    job.operation_id,
-                    self._actors.execute_sft_forward_backward.call(
-                        job.model_dump_json(), batch
-                    ),
-                    invalidate_on_error=True,
-                )
-                results = list(values.values())
-                self._raise_command_failure(results)
-                self._validate_command_results(
-                    results,
-                    operation_id=job.operation_id,
-                    learner_version=job.expected_learner_version,
-                )
-                if {result["loss_bearing_token_count"] for result in results} != {
-                    job.expected_global_loss_bearing_tokens
-                }:
-                    raise RuntimeError("trainer ranks disagree on SFT token provenance")
-                usage = {
-                    (
-                        result["completed_gradient_steps"],
-                        result["logical_nonpadding_tokens"],
-                        result["executed_token_equivalents"],
-                    )
-                    for result in results
-                }
-                if len(usage) != 1:
-                    raise RuntimeError("trainer ranks disagree on SFT execution usage")
-            except BaseException as error:
-                await self._invalidate_after_command_failure(error)
-                raise
-            result = next(result for result in results if result["rank"] == 0)
-            result["gpu_service_ns"], result["gpu_count"] = self._aggregate_gpu_service(
-                results
-            )
-            self._command_mode = True
-            state.open_forward_backward_ids.append(job.operation_id)
-            state.next_operation_sequence += 1
-            self._cache_operation(job.operation_id, job.fingerprint, result)
-            return result
+
+        return await self._start_command(
+            job,
+            lambda ready: self._actors.execute_sft_forward_backward.call(
+                job.model_dump_json(), batch, ready
+            ),
+            validate=validate,
+            label="SFT F/B",
+            backward=True,
+        )
 
     async def sft_forward(
         self,
         job: SftForwardJobSpec,
         batch: SFTBatchData,
     ) -> dict[str, Any]:
-        cached = self._operations.get(job.operation_id)
-        if cached is not None and cached[0] == job.fingerprint:
-            return cached[1]
+        launch = await self.start_sft_forward(job, batch)
+        return await asyncio.shield(launch.completion)
+
+    async def start_sft_forward(
+        self,
+        job: SftForwardJobSpec,
+        batch: SFTBatchData,
+    ) -> TrainerCommandLaunch:
+        def validate() -> None:
+            if batch.fingerprint != job.batch_fingerprint:
+                raise ValueError(
+                    "SFT forward payload fingerprint differs from its command"
+                )
+
+        return await self._start_command(
+            job,
+            lambda ready: self._actors.execute_sft_forward.call(
+                job.model_dump_json(), batch, ready
+            ),
+            validate=validate,
+            label="SFT forward",
+            backward=False,
+        )
+
+    async def _start_command(
+        self,
+        job: _DeferredCommandJob,
+        invoke: Callable[[Port[dict[str, Any]]], Awaitable[Any]],
+        *,
+        validate: Callable[[], None],
+        label: str,
+        backward: bool,
+    ) -> TrainerCommandLaunch:
         async with self._lock:
             cached = self._operations.get(job.operation_id)
             if cached is not None:
                 if cached[0] != job.fingerprint:
                     raise RuntimeError(
-                        "operation_id was reused for a different SFT forward"
+                        "operation_id was reused for a different command"
                     )
-                return cached[1]
+                completion = asyncio.get_running_loop().create_future()
+                completion.set_result(cached[1])
+                return TrainerCommandLaunch(completion=completion)
+            inflight = self._command_launches.get(job.operation_id)
+            if inflight is not None:
+                if inflight[0] != job.fingerprint:
+                    raise RuntimeError(
+                        "operation_id was reused for a different command"
+                    )
+                return inflight[1]
             state = self._validate_command(job)
-            if batch.fingerprint != job.batch_fingerprint:
-                raise ValueError(
-                    "SFT forward payload fingerprint differs from its command"
-                )
+            validate()
+            ready_port, receiver = Channel.open()
+            rank_call = asyncio.ensure_future(invoke(ready_port))
+            readiness = asyncio.create_task(
+                self._collect_command_ready(receiver, job, label=label),
+                name=f"megatron-{label.lower().replace(' ', '-')}-ready-"
+                f"{job.operation_id}",
+            )
+            supervision = asyncio.create_task(self._supervision.wait())
+            self._active_job_id = job.operation_id
+            self._active_collective = rank_call
+            deadline = asyncio.get_running_loop().time() + state.spec.event_timeout_s
             try:
-                values = await self._run_resident_collective(
-                    job.operation_id,
-                    self._actors.execute_sft_forward.call(job.model_dump_json(), batch),
-                    invalidate_on_error=True,
+                done, _ = await asyncio.wait(
+                    {rank_call, readiness, supervision},
+                    timeout=max(0.0, deadline - asyncio.get_running_loop().time()),
+                    return_when=asyncio.FIRST_COMPLETED,
                 )
-                results = list(values.values())
-                self._raise_command_failure(results)
-                self._validate_command_results(
-                    results,
-                    operation_id=job.operation_id,
-                    learner_version=job.expected_learner_version,
-                )
-                usage = {
-                    (
-                        result["logical_nonpadding_tokens"],
-                        result["executed_token_equivalents"],
+                if not done:
+                    raise TimeoutError(f"trainer ranks did not reach {label} readiness")
+                if supervision in done:
+                    raise RuntimeError("trainer mesh failed: " + supervision.result())
+                if readiness not in done:
+                    await rank_call
+                    raise RuntimeError(
+                        f"trainer {label} returned before every rank reported ready"
                     )
-                    for result in results
-                }
-                if len(usage) != 1:
-                    raise RuntimeError("trainer ranks disagree on SFT forward usage")
+                readiness.result()
+                self._command_mode = True
+                if backward:
+                    state.open_forward_backward_ids.append(job.operation_id)
+                state.next_operation_sequence += 1
+                self._clear_active(job.operation_id)
+                completion = asyncio.create_task(
+                    self._complete_command(
+                        job,
+                        rank_call,
+                        deadline=deadline,
+                        label=label,
+                        backward=backward,
+                    ),
+                    name=f"megatron-{label.lower().replace(' ', '-')}-result-"
+                    f"{job.operation_id}",
+                )
+                completion.add_done_callback(consume_future_exception)
+                launch = TrainerCommandLaunch(completion=completion)
+                self._command_launches[job.operation_id] = (job.fingerprint, launch)
+                return launch
             except BaseException as error:
+                for task in (readiness, rank_call):
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(readiness, rank_call, return_exceptions=True)
                 await self._invalidate_after_command_failure(error)
                 raise
-            result = next(result for result in results if result["rank"] == 0)
+            finally:
+                supervision.cancel()
+                supervision.add_done_callback(consume_future_exception)
+                self._clear_active(job.operation_id)
+
+    async def _collect_command_ready(
+        self,
+        receiver: Any,
+        job: _DeferredCommandJob,
+        *,
+        label: str,
+    ) -> None:
+        results = [
+            _CommandReady.model_validate(await receiver.recv())
+            for _ in self.runtime_spec.trainer_mesh.ranks
+        ]
+        if {item.rank for item in results} != set(range(len(results))) or any(
+            (item.operation_id, item.learner_version)
+            != (job.operation_id, job.expected_learner_version)
+            for item in results
+        ):
+            raise RuntimeError(f"trainer {label} readiness changed rank identity")
+        failures = [item for item in results if item.error_type is not None]
+        if failures:
+            details = "\n".join(
+                f"rank {item.rank}: {item.error_type}: {item.message}\n"
+                f"{item.traceback_text or ''}"
+                for item in failures
+            )
+            raise RuntimeError(f"trainer {label} failed before GPU release:\n{details}")
+
+    async def _complete_command(
+        self,
+        job: _DeferredCommandJob,
+        rank_call: asyncio.Future[Any],
+        *,
+        deadline: float,
+        label: str,
+        backward: bool,
+    ) -> dict[str, Any]:
+        supervision = asyncio.create_task(self._supervision.wait())
+        try:
+            done, _ = await asyncio.wait(
+                {rank_call, supervision},
+                timeout=max(0.0, deadline - asyncio.get_running_loop().time()),
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if not done:
+                raise TimeoutError(f"trainer {label} result settlement timed out")
+            if supervision in done:
+                raise RuntimeError("trainer mesh failed: " + supervision.result())
+            values = await asyncio.shield(rank_call)
+            results = list(values.values())
+            self._raise_command_failure(results)
+            self._validate_command_results(
+                results,
+                operation_id=job.operation_id,
+                learner_version=job.expected_learner_version,
+            )
+            if backward and {
+                result["loss_bearing_token_count"] for result in results
+            } != {job.expected_global_loss_bearing_tokens}:
+                raise RuntimeError(
+                    f"trainer ranks disagree on {label} token provenance"
+                )
+            usage = {
+                (
+                    *((result["completed_gradient_steps"],) if backward else ()),
+                    result["logical_nonpadding_tokens"],
+                    result["executed_token_equivalents"],
+                )
+                for result in results
+            }
+            if len(usage) != 1:
+                raise RuntimeError(f"trainer ranks disagree on {label} execution usage")
+            result = dict(next(item for item in results if item["rank"] == 0))
             result["gpu_service_ns"], result["gpu_count"] = self._aggregate_gpu_service(
                 results
             )
-            self._command_mode = True
-            state.next_operation_sequence += 1
             self._cache_operation(job.operation_id, job.fingerprint, result)
             return result
+        except BaseException as error:
+            await self._invalidate_after_command_failure(error)
+            raise
+        finally:
+            supervision.cancel()
+            supervision.add_done_callback(consume_future_exception)
+            self._command_launches.pop(job.operation_id, None)
 
     async def optim_step(self, job: OptimizerJobSpec) -> dict[str, Any]:
         cached = self._operations.get(job.operation_id)

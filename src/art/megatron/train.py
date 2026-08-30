@@ -2284,16 +2284,30 @@ def _globalize_context_parallel_logprob_batch(
     local_logprobs: list[torch.Tensor],
     attention_states: list[Any],
     sequence_lengths: list[int],
+    empty_template: torch.Tensor | None = None,
 ) -> list[torch.Tensor]:
-    if not (len(local_logprobs) == len(attention_states) == len(sequence_lengths)):
+    if len(attention_states) != len(sequence_lengths):
         raise ValueError("Context-parallel logprob/state/length counts differ")
-    trailing_shape = tuple(local_logprobs[0].shape[2:])
-    rows = local_logprobs[0].new_zeros(
+    if local_logprobs and len(local_logprobs) != len(attention_states):
+        raise ValueError("Context-parallel logprob/state/length counts differ")
+    if not attention_states:
+        return []
+    if local_logprobs:
+        template = local_logprobs[0]
+        trailing_shape = tuple(template.shape[2:])
+    else:
+        if empty_template is None:
+            raise ValueError("Empty context-parallel logprobs require a template")
+        template = empty_template
+        trailing_shape = ()
+    rows = template.new_zeros(
         (len(local_logprobs), max(sequence_lengths), *trailing_shape)
+        if local_logprobs
+        else (len(attention_states), max(sequence_lengths))
     )
     cp_group = None
-    for index, (values, attention_state, seq_len) in enumerate(
-        zip(local_logprobs, attention_states, sequence_lengths, strict=True)
+    for index, (attention_state, seq_len) in enumerate(
+        zip(attention_states, sequence_lengths, strict=True)
     ):
         rank_plan = getattr(attention_state, "rank_plan", None)
         micro_cp_group = getattr(attention_state, "cp_group", None)
@@ -2306,6 +2320,9 @@ def _globalize_context_parallel_logprob_batch(
                 "Context-parallel microbatches use different process groups"
             )
         cp_group = micro_cp_group
+        if not local_logprobs:
+            continue
+        values = local_logprobs[index]
         if tuple(values.shape[2:]) != trailing_shape:
             raise ValueError("Context-parallel logprob trailing shapes differ")
         local_values = values.reshape(-1, *trailing_shape)
@@ -3407,13 +3424,14 @@ def _run_megatron_sft_schedule(
         for data in forward_data_store
         if data["logprobs"] is not None
     ]
-    if new_logprobs and int(topology.cp) > 1:
+    if return_token_logprobs and int(topology.cp) > 1:
         new_logprobs = _globalize_context_parallel_logprob_batch(
             local_logprobs=new_logprobs,
             attention_states=[prepared.attention_state for prepared in prepared_micros],
             sequence_lengths=[
                 int(micro["attention_mask"].sum().item()) for micro in micro_inputs
             ],
+            empty_template=raw_loss_sum,
         )
     return SFTForwardBackwardState(
         raw_loss_sum=raw_loss_sum,

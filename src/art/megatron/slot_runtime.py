@@ -195,6 +195,7 @@ async def launch_megatron_slot(
             schedule=config.schedule,
             publisher=paired_inference,
             route_ownership=route_bundle_ownership,
+            command_timeout_s=config.command_timeout_s,
         )
         runtime.register_closeable(coordinator)
     except BaseException:

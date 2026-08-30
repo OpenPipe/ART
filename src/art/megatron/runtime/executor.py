@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 import gc
@@ -15,7 +16,7 @@ from art.distributed.adapter_transport import AdapterTransferTarget
 from art.training.contracts import TokenLogprobs
 from art.utils.safetensors import PreparedSafetensors, SafetensorsLayout
 
-from ..tensor_snapshot import PinnedCpuSnapshotStager
+from ..tensor_snapshot import PendingCpuSnapshot, PinnedCpuSnapshotStager
 from ..training.finalize_grads import (
     finalize_accumulated_model_grads,
     flush_param_grads_to_main_grads,
@@ -73,14 +74,15 @@ def _command_token_logprobs(
     batch: InMemoryPackedBatch,
     outputs: tuple[torch.Tensor, ...],
 ) -> tuple[dict[str, Any], ...]:
+    decoder = _command_token_logprob_decoder(batch)
+    return decoder(tuple(value.detach().to(device="cpu") for value in outputs))
+
+
+def _command_token_logprob_decoder(
+    batch: InMemoryPackedBatch,
+) -> Callable[[tuple[torch.Tensor, ...]], tuple[dict[str, Any], ...]]:
     if batch.ref.training_kind != "tokenized":
-        return tuple(
-            TokenLogprobs.from_values(
-                values.detach().to(device="cpu").flatten().tolist(),
-                shape=tuple(values.shape),
-            ).model_dump(mode="python")
-            for values in outputs
-        )
+        return _sft_token_logprobs
     output_map = batch.ref.tokenized_output_map
     if output_map is None:
         raise RuntimeError("tokenized batch has no output map")
@@ -88,21 +90,39 @@ def _command_token_logprobs(
     if target_tokens is None:
         raise RuntimeError("tokenized batch has no target tensor")
     candidate_capacity = int(target_tokens.shape[2])
+    expected_rows = batch.ref.num_sequences * batch.ref.sequence_length
+
+    def decode(outputs: tuple[torch.Tensor, ...]) -> tuple[dict[str, Any], ...]:
+        return _decode_tokenized_logprobs(
+            outputs,
+            candidate_capacity=candidate_capacity,
+            expected_rows=expected_rows,
+            packed_positions=output_map.packed_positions,
+            candidate_counts=output_map.candidate_counts,
+        )
+
+    return decode
+
+
+def _decode_tokenized_logprobs(
+    outputs: tuple[torch.Tensor, ...],
+    *,
+    candidate_capacity: int,
+    expected_rows: int,
+    packed_positions: tuple[tuple[int, ...], ...],
+    candidate_counts: tuple[int, ...],
+) -> tuple[dict[str, Any], ...]:
     physical = torch.cat(
         [values.reshape(-1, candidate_capacity) for values in outputs], dim=0
     )
-    expected_rows = batch.ref.num_sequences * batch.ref.sequence_length
     if int(physical.shape[0]) != expected_rows:
         raise RuntimeError(
             "tokenized command did not return every physical packed row: "
             f"returned={physical.shape[0]}, expected={expected_rows}"
         )
-    host = physical.detach().cpu()
     logical = []
-    for positions, candidates in zip(
-        output_map.packed_positions, output_map.candidate_counts, strict=True
-    ):
-        values = host[list(positions), :candidates]
+    for positions, candidates in zip(packed_positions, candidate_counts, strict=True):
+        values = physical[list(positions), :candidates]
         logical.append(
             TokenLogprobs.from_values(
                 values.flatten().tolist(), shape=tuple(values.shape)
@@ -119,6 +139,50 @@ def _sft_token_logprobs(
             values.flatten().tolist(), shape=tuple(values.shape)
         ).model_dump(mode="python")
         for values in outputs
+    )
+
+
+@dataclass(slots=True)
+class CommandResultLaunch:
+    """GPU-complete command whose bounded host result is still materializing."""
+
+    result: dict[str, Any]
+    pending: PendingCpuSnapshot[tuple[torch.Tensor, ...]] | None = None
+    decoder: Callable[[tuple[torch.Tensor, ...]], tuple[dict[str, Any], ...]] | None = (
+        None
+    )
+    _stager: PinnedCpuSnapshotStager | None = None
+
+    def materialize(self) -> dict[str, Any]:
+        if self.pending is not None:
+            outputs = self.pending.resolve()
+            if self.decoder is None:
+                raise RuntimeError("deferred command result has no decoder")
+            self.result["token_logprobs"] = self.decoder(outputs)
+            self.pending = None
+            self.decoder = None
+            self._stager = None
+        return self.result
+
+
+def _defer_command_result(
+    result: dict[str, Any],
+    outputs: tuple[torch.Tensor, ...],
+    decoder: Callable[[tuple[torch.Tensor, ...]], tuple[dict[str, Any], ...]] | None,
+) -> CommandResultLaunch:
+    if not outputs:
+        result["token_logprobs"] = ()
+        return CommandResultLaunch(result=result)
+    if decoder is None:
+        raise RuntimeError("deferred command result has no decoder")
+    stager = PinnedCpuSnapshotStager()
+    builder = stager.begin()
+    pending = builder.finish(tuple(builder.stage(value) for value in outputs))
+    return CommandResultLaunch(
+        result=result,
+        pending=pending,
+        decoder=decoder,
+        _stager=stager,
     )
 
 
@@ -801,7 +865,7 @@ class MCoreRunSlotExecutor:
         job: ForwardBackwardJobSpec,
         batch: InMemoryPackedBatch,
         cancelled: Event,
-    ) -> dict[str, Any]:
+    ) -> CommandResultLaunch:
         state = self._require_parent(job)
         validate_packed_batch(batch)
         from art.megatron.train import (
@@ -821,26 +885,29 @@ class MCoreRunSlotExecutor:
             self._trainer.clear_checkpoint_slot_grads(job.run_id)
             raise
         self._enforce_accumulator_budget()
-        return {
-            "operation_id": job.operation_id,
-            "learner_version": job.expected_learner_version,
-            "loss_bearing_token_count": job.expected_global_loss_bearing_tokens,
-            "completed_gradient_steps": result.completed_gradient_steps,
-            "logical_nonpadding_tokens": result.logical_nonpadding_tokens,
-            "executed_token_equivalents": result.executed_token_equivalents,
-            "gpu_service_ns": result.gpu_service_ns,
-            "token_logprobs": _command_token_logprobs(batch, result.new_logprobs)
+        return _defer_command_result(
+            {
+                "operation_id": job.operation_id,
+                "learner_version": job.expected_learner_version,
+                "loss_bearing_token_count": job.expected_global_loss_bearing_tokens,
+                "completed_gradient_steps": result.completed_gradient_steps,
+                "logical_nonpadding_tokens": result.logical_nonpadding_tokens,
+                "executed_token_equivalents": result.executed_token_equivalents,
+                "gpu_service_ns": result.gpu_service_ns,
+                "metrics": result.metrics,
+            },
+            result.new_logprobs if job.return_token_logprobs else (),
+            _command_token_logprob_decoder(batch)
             if job.return_token_logprobs
-            else (),
-            "metrics": result.metrics,
-        }
+            else None,
+        )
 
     def execute_forward(
         self,
         job: ForwardJobSpec,
         batch: InMemoryPackedBatch,
         cancelled: Event,
-    ) -> dict[str, Any]:
+    ) -> CommandResultLaunch:
         self._require_parent(job)
         validate_packed_batch(batch)
         from art.megatron.lora import LoRASlotRef, use_lora_slot
@@ -854,24 +921,27 @@ class MCoreRunSlotExecutor:
                 cancelled=cancelled,
                 state_is_resident=True,
             )
-        return {
-            "operation_id": job.operation_id,
-            "learner_version": job.expected_learner_version,
-            "logical_nonpadding_tokens": result.logical_nonpadding_tokens,
-            "executed_token_equivalents": result.executed_token_equivalents,
-            "gpu_service_ns": result.gpu_service_ns,
-            "token_logprobs": _command_token_logprobs(batch, result.new_logprobs)
+        return _defer_command_result(
+            {
+                "operation_id": job.operation_id,
+                "learner_version": job.expected_learner_version,
+                "logical_nonpadding_tokens": result.logical_nonpadding_tokens,
+                "executed_token_equivalents": result.executed_token_equivalents,
+                "gpu_service_ns": result.gpu_service_ns,
+                "metrics": result.metrics,
+            },
+            result.new_logprobs if job.return_token_logprobs else (),
+            _command_token_logprob_decoder(batch)
             if job.return_token_logprobs
-            else (),
-            "metrics": result.metrics,
-        }
+            else None,
+        )
 
     def execute_sft_forward_backward(
         self,
         job: SftForwardBackwardJobSpec,
         batch: SFTBatchData,
         cancelled: Event,
-    ) -> dict[str, Any]:
+    ) -> CommandResultLaunch:
         state = self._require_parent(job)
         from art.megatron.train import (
             execute_megatron_dynamic_lora_sft_forward_backward_job,
@@ -890,47 +960,45 @@ class MCoreRunSlotExecutor:
             self._trainer.clear_checkpoint_slot_grads(job.run_id)
             raise
         self._enforce_accumulator_budget()
-        return {
-            "operation_id": job.operation_id,
-            "learner_version": job.expected_learner_version,
-            "loss_bearing_token_count": job.expected_global_loss_bearing_tokens,
-            "completed_gradient_steps": result.completed_gradient_steps,
-            "logical_nonpadding_tokens": result.logical_nonpadding_tokens,
-            "executed_token_equivalents": result.executed_token_equivalents,
-            "gpu_service_ns": result.gpu_service_ns,
-            "token_logprobs": (
-                _sft_token_logprobs(result.new_logprobs)
-                if job.return_token_logprobs
-                else ()
-            ),
-            "metrics": result.metrics,
-        }
+        return _defer_command_result(
+            {
+                "operation_id": job.operation_id,
+                "learner_version": job.expected_learner_version,
+                "loss_bearing_token_count": job.expected_global_loss_bearing_tokens,
+                "completed_gradient_steps": result.completed_gradient_steps,
+                "logical_nonpadding_tokens": result.logical_nonpadding_tokens,
+                "executed_token_equivalents": result.executed_token_equivalents,
+                "gpu_service_ns": result.gpu_service_ns,
+                "metrics": result.metrics,
+            },
+            result.new_logprobs if job.return_token_logprobs else (),
+            _sft_token_logprobs,
+        )
 
     def execute_sft_forward(
         self,
         job: SftForwardJobSpec,
         batch: SFTBatchData,
         cancelled: Event,
-    ) -> dict[str, Any]:
+    ) -> CommandResultLaunch:
         self._require_parent(job)
         from art.megatron.train import execute_megatron_dynamic_lora_sft_forward_job
 
         result = execute_megatron_dynamic_lora_sft_forward_job(
             self.runtime, job, batch, cancelled=cancelled
         )
-        return {
-            "operation_id": job.operation_id,
-            "learner_version": job.expected_learner_version,
-            "logical_nonpadding_tokens": result.logical_nonpadding_tokens,
-            "executed_token_equivalents": result.executed_token_equivalents,
-            "gpu_service_ns": result.gpu_service_ns,
-            "token_logprobs": (
-                _sft_token_logprobs(result.new_logprobs)
-                if job.return_token_logprobs
-                else ()
-            ),
-            "metrics": result.metrics,
-        }
+        return _defer_command_result(
+            {
+                "operation_id": job.operation_id,
+                "learner_version": job.expected_learner_version,
+                "logical_nonpadding_tokens": result.logical_nonpadding_tokens,
+                "executed_token_equivalents": result.executed_token_equivalents,
+                "gpu_service_ns": result.gpu_service_ns,
+                "metrics": result.metrics,
+            },
+            result.new_logprobs if job.return_token_logprobs else (),
+            _sft_token_logprobs,
+        )
 
     def capture_forward_backward_numerics(
         self,
