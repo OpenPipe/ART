@@ -818,8 +818,12 @@ class MCoreRunSlotExecutor:
             state.optimizer_key = self._residency_key(
                 state, generation_id=generation_id, representation="optimizer"
             )
-            self._residency.register_l1(state.weights_key, parameters)
-            self._residency.register_l1(state.optimizer_key, optimizer_tensors)
+            initial_l2 = (
+                self._residency.register_l1(state.weights_key, parameters),
+                self._residency.register_l1(state.optimizer_key, optimizer_tensors),
+            )
+            for future in initial_l2:
+                future.result()
             self._runs[spec.run_id] = state
         except BaseException:
             retirements = tuple(
@@ -1107,10 +1111,14 @@ class MCoreRunSlotExecutor:
             generation_id=generation.generation_id,
             representation="optimizer",
         )
-        self._residency.register_l1(
-            state.weights_key, self._trainer.checkpoint_slot_parameters(run_id)
+        initial_l2 = (
+            self._residency.register_l1(
+                state.weights_key, self._trainer.checkpoint_slot_parameters(run_id)
+            ),
+            self._residency.register_l1(state.optimizer_key, optimizer_tensors),
         )
-        self._residency.register_l1(state.optimizer_key, optimizer_tensors)
+        for future in initial_l2:
+            future.result()
         return receipt
 
     def _register_accumulator_residency(self, state: _ResidentCommandRun) -> None:
