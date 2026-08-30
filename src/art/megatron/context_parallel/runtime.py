@@ -1435,17 +1435,6 @@ def _search_generic_chunk_assignment(
             owners=current_owners,
             wave_assignment=wave_assignment,
         )
-        if cp_size == 2:
-            rebalanced = _score_rebalanced_cp2_assignment(
-                current_owners=current_owners,
-                current_eval=current_eval,
-                evaluate_candidate=lambda *, owners: _evaluate_candidate(
-                    owners=owners,
-                    wave_assignment=wave_assignment,
-                ),
-            )
-            if rebalanced is not None:
-                current_owners, current_eval = rebalanced
 
         search_steps_remaining = (
             0 if cp_size >= 8 else int(config.planner_max_search_steps)
@@ -1493,6 +1482,17 @@ def _search_generic_chunk_assignment(
             best = (current_owners, wave_assignment, current_eval)
     if best is None:
         raise RuntimeError("Failed to evaluate any CP planner wave assignment.")
+    if cp_size == 2:
+        rebalanced = _score_rebalanced_cp2_assignment(
+            current_owners=best[0],
+            current_eval=best[2],
+            evaluate_candidate=lambda *, owners: _evaluate_candidate(
+                owners=owners,
+                wave_assignment=best[1],
+            ),
+        )
+        if rebalanced is not None:
+            best = (rebalanced[0], best[1], rebalanced[1])
     return best
 
 
