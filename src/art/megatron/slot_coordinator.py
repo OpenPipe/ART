@@ -655,64 +655,94 @@ class MegatronSlotCoordinator:
             operation.operation_id,
         )
 
-    async def capture_run_checkpoint(
+    async def capture_run_checkpoints(
         self,
-        run_id: str,
-        export_id: str,
-    ) -> PortableSnapshotExportReceipt:
-        """Export immutable gate evidence at a quiescent slot boundary."""
+        exports: tuple[tuple[str, str], ...],
+    ) -> tuple[PortableSnapshotExportReceipt, ...]:
+        """Export all resident runs at one quiescent gate boundary."""
 
-        if not export_id:
-            raise ValueError("checkpoint capture export_id must not be empty")
+        run_ids = tuple(run_id for run_id, _export_id in exports)
+        export_ids = tuple(export_id for _run_id, export_id in exports)
+        if (
+            not exports
+            or len(exports) > 4
+            or len(set(run_ids)) != len(run_ids)
+            or len(set(export_ids)) != len(export_ids)
+            or any(not value for value in (*run_ids, *export_ids))
+        ):
+            raise ValueError(
+                "checkpoint capture identities must be nonempty and unique"
+            )
         async with self._condition:
-            state = self._runs.get(run_id)
-            if (
+            states = tuple(self._runs.get(run_id) for run_id in run_ids)
+            if set(run_ids) != set(self._runs) or any(
                 state is None
                 or state.draining
                 or state.maintenance
                 or state.migration_fence_id is not None
                 or state.migration_restore_id is not None
+                for state in states
             ):
                 raise RuntimeError("Megatron slot run is unavailable for capture")
-            state.maintenance = True
+            resident = tuple(state for state in states if state is not None)
+            for state in resident:
+                state.maintenance = True
             try:
                 while (
-                    state.preparing
-                    or state.worker_calls
-                    or state.settling
-                    or self._active_run_id == run_id
-                    or any(item.run_id == run_id for item in self._ready)
+                    self._active_run_id is not None
+                    or self._ready
+                    or any(
+                        state.preparing or state.worker_calls or state.settling
+                        for state in resident
+                    )
                 ):
                     await self._condition.wait()
-                if self._runs.get(run_id) is not state or state.draining:
+                if any(
+                    self._runs.get(run_id) is not state or state.draining
+                    for run_id, state in zip(run_ids, resident, strict=True)
+                ):
                     raise RuntimeError("Megatron slot run changed during capture")
-                generation = state.handler.generation
+                generations = tuple(state.handler.generation for state in resident)
             except BaseException:
-                state.maintenance = False
+                for state in resident:
+                    state.maintenance = False
                 self._condition.notify_all()
                 raise
         try:
-            receipt = await self.trainer.export_command_run_checkpoint(
-                run_id,
-                generation,
-                export_id,
-            )
-            exported = receipt.generation
-            if receipt.export_id != export_id or (
-                exported.training_session_id,
-                exported.policy_step,
-                exported.generation_id,
-            ) != (
-                generation.training_session_id,
-                generation.policy_step,
-                generation.generation_id,
+            captured: list[PortableSnapshotExportReceipt] = []
+            for (run_id, export_id), generation in zip(
+                exports, generations, strict=True
             ):
-                raise RuntimeError("checkpoint capture changed its generation identity")
-            return receipt
+                captured.append(
+                    await self.trainer.export_command_run_checkpoint(
+                        run_id,
+                        generation,
+                        export_id,
+                    )
+                )
+            receipts = tuple(captured)
+            for receipt, export_id, generation in zip(
+                receipts, export_ids, generations, strict=True
+            ):
+                exported = receipt.generation
+                if receipt.export_id != export_id or (
+                    exported.training_session_id,
+                    exported.policy_step,
+                    exported.generation_id,
+                ) != (
+                    generation.training_session_id,
+                    generation.policy_step,
+                    generation.generation_id,
+                ):
+                    raise RuntimeError(
+                        "checkpoint capture changed its generation identity"
+                    )
+            return receipts
         finally:
             async with self._condition:
-                if self._runs.get(run_id) is state:
-                    state.maintenance = False
+                for run_id, state in zip(run_ids, resident, strict=True):
+                    if self._runs.get(run_id) is state:
+                        state.maintenance = False
                 self._condition.notify_all()
 
     async def install_run_checkpoint(

@@ -201,11 +201,17 @@ class MegatronGateEvidenceRecorder:
         phase: Literal["before", "after"],
         run_ids: tuple[str, ...],
     ) -> None:
-        for run_index, run_id in enumerate(run_ids):
-            export_id = hashlib.sha256(
-                f"gate-isolation\0{turn_index}\0{phase}\0{run_id}".encode()
-            ).hexdigest()
-            receipt = await self.coordinator.capture_run_checkpoint(run_id, export_id)
+        exports = tuple(
+            (
+                run_id,
+                hashlib.sha256(
+                    f"gate-isolation\0{turn_index}\0{phase}\0{run_id}".encode()
+                ).hexdigest(),
+            )
+            for run_id in run_ids
+        )
+        receipts = await self.coordinator.capture_run_checkpoints(exports)
+        for run_index, receipt in enumerate(receipts):
             path = (
                 self.root
                 / "receipts"
