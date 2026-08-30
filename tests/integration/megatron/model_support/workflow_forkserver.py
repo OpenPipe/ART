@@ -18,6 +18,14 @@ from typing import Any
 import uuid
 
 _PREFIX = "ART_WORKFLOW_FORKSERVER\t"
+_PASSTHROUGH_ENV = (
+    "ART_MEGATRON_RUNTIME_PYTHON",
+    "ART_VLLM_RUNTIME_BIN",
+    "ART_DEPLOYED_SOURCE_ROOT",
+    "ART_DEPLOYED_SOURCE_COMMIT",
+    "ART_DEPLOYED_SOURCE_TREE",
+    "ART_DEPLOYED_SOURCE_BRANCH",
+)
 _MODULE = "integration.megatron.model_support.workflow_forkserver"
 _TERMINATION_GRACE_S = 10.0
 
@@ -258,6 +266,11 @@ class _HostForkserver:
             activate = (
                 f"source {shlex.quote(str(profile))} && " if profile.is_file() else ""
             )
+            passthrough = [
+                f"{key}={environment[key]}"
+                for key in _PASSTHROUGH_ENV
+                if environment.get(key)
+            ]
             remote = (
                 activate
                 + f"cd {shlex.quote(str(self.repo_root))} && exec "
@@ -269,6 +282,7 @@ class _HostForkserver:
                         f"_RJEM_MALLOC_CONF={environment['_RJEM_MALLOC_CONF']}",
                         f"PYTHONPATH={environment['PYTHONPATH']}",
                         "WANDB_MODE=disabled",
+                        *passthrough,
                         *command,
                     ]
                 )
@@ -378,7 +392,7 @@ class _HostForkserver:
     ) -> dict[str, Any]:
         child_environment: dict[str, str | None] = {
             key: environment.get(key)
-            for key in ("OMP_NUM_THREADS", "_RJEM_MALLOC_CONF")
+            for key in ("OMP_NUM_THREADS", "_RJEM_MALLOC_CONF", *_PASSTHROUGH_ENV)
         }
         child_environment.update(
             {
