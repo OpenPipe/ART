@@ -15,7 +15,10 @@ from art.megatron.context_parallel.builder import (
     build_dense_reference_mask,
     build_prefix_tree_attention_spec,
 )
-from art.megatron.context_parallel.runtime import get_or_build_runtime_plan
+from art.megatron.context_parallel.runtime import (
+    _score_rebalanced_cp2_assignment,
+    get_or_build_runtime_plan,
+)
 from art.megatron.context_parallel.types import (
     AttnMaskKind,
     AttnSlice,
@@ -99,6 +102,21 @@ def test_prefix_tree_can_build_context_parallel_layout() -> None:
     assert sum(plan[rank].local_valid_lengths[0] for rank in range(2)) == int(
         group_ids.numel()
     )
+
+
+def test_cp2_score_rebalance_crosses_multi_chunk_plateau() -> None:
+    rebalanced = _score_rebalanced_cp2_assignment(
+        current_owners=(0,) * 8 + (1,) * 8,
+        current_eval={"score": 80.0, "rank_scores": (40.0, 80.0)},
+        evaluate_candidate=lambda *, owners: {
+            "score": 60.0,
+            "rank_scores": (60.0, 60.0),
+            "owners": owners,
+        },
+    )
+
+    assert rebalanced is not None
+    assert rebalanced[0] == (0,) * 11 + (1,) * 5
 
 
 def test_sparse_block_mask_exact_predicate_matches_dense_reference() -> None:
