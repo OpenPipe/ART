@@ -344,9 +344,7 @@ def _install_runtime(
         )
         python = _runtime_python(stage)
         _copy_art(python)
-        launcher = _write_runtime_launcher(stage)
-        if variant != "base":
-            _prepare_hybrid_ep(launcher, multinode=variant == "hybrid_ep_multinode")
+        _write_runtime_launcher(stage)
         if runtime_dir.exists():
             if existing := _valid_runtime(
                 runtime_dir,
@@ -396,14 +394,49 @@ def _fingerprint(
     )
 
 
-def _prepare_hybrid_ep(python: Path, *, multinode: bool) -> None:
+def _hybrid_ep_launcher(python: Path, overlay: Path) -> Path:
+    identity = hashlib.sha256(
+        f"{python.resolve()}\0{overlay.resolve()}".encode()
+    ).hexdigest()
+    root = overlay.parent / "launchers"
+    root.mkdir(parents=True, exist_ok=True)
+    launcher = root / identity
+    content = (
+        "#!/bin/sh\n"
+        "set -eu\n"
+        f"overlay={shlex.quote(str(overlay.resolve()))}\n"
+        'export ART_MONARCH_PROGRAM_PYTHONPATH="$overlay'
+        '${ART_MONARCH_PROGRAM_PYTHONPATH:+:$ART_MONARCH_PROGRAM_PYTHONPATH}"\n'
+        'export PYTHONPATH="$ART_MONARCH_PROGRAM_PYTHONPATH"\n'
+        f'exec {shlex.quote(str(python.resolve()))} "$@"\n'
+    )
+    lock_path = root / f".{identity}.lock"
+    with lock_path.open("w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if launcher.exists():
+            if launcher.read_text() != content or not os.access(launcher, os.X_OK):
+                raise RuntimeError(f"Invalid immutable HybridEP launcher: {launcher}")
+        else:
+            temporary = root / f".{identity}.{os.getpid()}.tmp"
+            temporary.write_text(content)
+            temporary.chmod(0o755)
+            temporary.rename(launcher)
+    return launcher
+
+
+def _prepare_hybrid_ep(python: Path, *, multinode: bool) -> Path:
     environment = os.environ.copy()
     environment.update(
         HYBRID_EP_MULTINODE="1" if multinode else "0",
         USE_NIXL="1" if multinode else "0",
     )
+    script = (
+        "from art.megatron.hybrid_ep_setup import prepare_hybrid_ep_overlay; "
+        "_version, path = prepare_hybrid_ep_overlay(); "
+        "print('ART_HYBRID_EP_OVERLAY=' + str(path))"
+    )
     result = subprocess.run(
-        [str(python), "-m", "art.megatron.hybrid_ep_setup"],
+        [str(python), "-c", script],
         env=environment,
         capture_output=True,
         text=True,
@@ -411,6 +444,21 @@ def _prepare_hybrid_ep(python: Path, *, multinode: bool) -> None:
     if result.returncode:
         detail = (result.stdout + result.stderr)[-8000:]
         raise RuntimeError(f"HybridEP runtime preparation failed:\n{detail}")
+    prefix = "ART_HYBRID_EP_OVERLAY="
+    paths = [
+        line.removeprefix(prefix)
+        for line in result.stdout.splitlines()
+        if line.startswith(prefix)
+    ]
+    if len(paths) != 1:
+        detail = (result.stdout + result.stderr)[-8000:]
+        raise RuntimeError(
+            "HybridEP runtime preparation did not return one overlay path:\n" + detail
+        )
+    overlay = Path(paths[0])
+    if not overlay.is_dir():
+        raise RuntimeError(f"HybridEP runtime overlay does not exist: {overlay}")
+    return _hybrid_ep_launcher(python, overlay)
 
 
 def ensure_megatron_runtime(
@@ -429,7 +477,6 @@ def ensure_megatron_runtime(
         if require_hybrid_ep
         else "base"
     )
-    managed = False
     if override := os.environ.get("ART_MEGATRON_RUNTIME_PYTHON"):
         python = Path(override).expanduser().absolute()
         identity = hashlib.sha256(
@@ -448,7 +495,6 @@ def ensure_megatron_runtime(
                 f"source:{art_build_sha256}:{python}:{platform.python_version()}:{variant}".encode()
             ).hexdigest()
         else:
-            managed = True
             manifest = _load_manifest(bundle)
             identity = _manifest_hash(manifest, profile, variant, art_build_sha256)
             cache_root = _runtime_cache_root()
@@ -470,8 +516,8 @@ def ensure_megatron_runtime(
                 )
     if not os.access(python, os.X_OK):
         raise RuntimeError(f"Megatron runtime Python is not executable: {python}")
-    if require_hybrid_ep and not managed:
-        _prepare_hybrid_ep(python, multinode=multinode)
+    if require_hybrid_ep:
+        python = _prepare_hybrid_ep(python, multinode=multinode)
     return MegatronRuntimeInfo(
         python=str(python),
         profile=profile,

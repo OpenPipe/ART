@@ -359,6 +359,73 @@ def setup_hybrid_ep() -> str:
             fcntl.flock(lock, fcntl.LOCK_UN)
 
 
+def _validate_overlay(destination: Path, *, build_version: str, arch_list: str) -> None:
+    environment = os.environ.copy()
+    pythonpath = environment.get("ART_MONARCH_PROGRAM_PYTHONPATH") or environment.get(
+        "PYTHONPATH"
+    )
+    overlay_path = str(destination)
+    if pythonpath:
+        overlay_path += os.pathsep + pythonpath
+    environment["ART_MONARCH_PROGRAM_PYTHONPATH"] = overlay_path
+    environment["PYTHONPATH"] = overlay_path
+    subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "from importlib.metadata import version; "
+            f"assert version({PACKAGE!r}) == {build_version!r}; "
+            "import deep_ep, hybrid_ep_cpp; "
+            f"assert hybrid_ep_cpp.SM_ARCH == {arch_list!r}",
+        ],
+        env=environment,
+        check=True,
+    )
+
+
+def prepare_hybrid_ep_overlay() -> tuple[str, Path]:
+    """Build one immutable HybridEP package view without mutating its Python env."""
+
+    build_version, arch_list = _build_identity()
+    root = _cache_root() / "overlays"
+    root.mkdir(parents=True, exist_ok=True)
+    destination = root / build_version
+    lock_path = root / f".{build_version}.lock"
+    with lock_path.open("w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if destination.is_dir():
+            _validate_overlay(
+                destination, build_version=build_version, arch_list=arch_list
+            )
+            return build_version, destination
+        if destination.exists():
+            raise RuntimeError(
+                f"HybridEP overlay destination is not a directory: {destination}"
+            )
+        wheel = _build_wheel(build_version, arch_list)
+        stage = Path(tempfile.mkdtemp(prefix=f".{build_version}.tmp-", dir=root))
+        try:
+            subprocess.run(
+                [
+                    _uv(),
+                    "pip",
+                    "install",
+                    "--target",
+                    str(stage),
+                    "--reinstall",
+                    "--no-deps",
+                    str(wheel),
+                ],
+                check=True,
+            )
+            _validate_overlay(stage, build_version=build_version, arch_list=arch_list)
+            stage.rename(destination)
+        finally:
+            if stage.exists():
+                shutil.rmtree(stage)
+    return build_version, destination
+
+
 def validate_hybrid_ep(*, require_multinode: bool = False) -> None:
     candidates = [_build_identity(enable_multinode=True, use_nixl=True)[0]]
     if not require_multinode:
