@@ -651,16 +651,9 @@ def publish_external_lora_rank(
     )[plan.coordinator_rank]
     publication_value, settlement_error = settlement
     if settlement_error:
-        cleanup_error = None
-        try:
-            sink.abort(grant, completion, settlement_error)
-        except BaseException as error:
-            cleanup_error = _error_text(error)
-        cleanup_errors = [
-            error for error in _gather_values(cleanup_error, world_size, group) if error
-        ]
-        detail = "; ".join((settlement_error, *cleanup_errors))
-        raise RuntimeError(f"external LoRA settlement failed: {detail}")
+        # Settlement may have committed the immutable manifest before its response was
+        # lost. Preserve the shards so an exact retry can reconcile the publication.
+        raise RuntimeError(f"external LoRA settlement failed: {settlement_error}")
     if publication_value is None:
         raise RuntimeError("external LoRA coordinator returned no publication")
     resolved = ExternalLoraPublication.model_validate(publication_value)

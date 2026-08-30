@@ -39,9 +39,14 @@ class _Handler:
 
 class _Sink:
     def __init__(
-        self, *, fail_index: int | None = None, wrong_plan: bool = False
+        self,
+        *,
+        fail_index: int | None = None,
+        fail_after_manifest: bool = False,
+        wrong_plan: bool = False,
     ) -> None:
         self.fail_index = fail_index
+        self.fail_after_manifest = fail_after_manifest
         self.wrong_plan = wrong_plan
         self.events: list[tuple[str, int | None]] = []
         self.objects: dict[int, bytes] = {}
@@ -84,6 +89,8 @@ class _Sink:
         assert plan == self._plan()
         assert grant.plan_sha256 == plan.sha256
         self.events.append(("manifest", None))
+        if self.fail_after_manifest:
+            raise TimeoutError("injected ambiguous manifest settlement")
         manifest = ExternalLoraManifest(
             plan=plan,
             plan_sha256=plan.sha256,
@@ -201,6 +208,18 @@ def test_external_lora_upload_failure_cleans_committed_shards() -> None:
     assert sink.objects == {}
     assert ("manifest", None) not in sink.events
     assert ("abort", 0) in sink.events
+
+
+def test_external_lora_ambiguous_settlement_preserves_committed_shards() -> None:
+    prepared, _key, _expected = _prepared(shard_bytes=16)
+    sink = _Sink(fail_after_manifest=True)
+
+    with pytest.raises(RuntimeError, match="ambiguous manifest settlement"):
+        publish_external_lora_rank(prepared, sink)
+
+    assert sink.objects
+    assert sink.events[-1] == ("manifest", None)
+    assert ("abort", 0) not in sink.events
 
 
 def test_external_lora_rejects_changed_grant_before_writes() -> None:
