@@ -5,6 +5,7 @@ import pytest
 
 from art.megatron.paired_inference import (
     MegatronPairedInferencePublisher,
+    _engine_args,
     _paired_lora_transport,
 )
 
@@ -55,6 +56,32 @@ def test_paired_lora_transport_follows_resolved_placement() -> None:
         )
         == "nixl"
     )
+
+
+def test_paired_engine_args_require_raw_vllm_sampling_defaults() -> None:
+    args = _engine_args(
+        {},
+        False,
+        "Qwen/Qwen3.5-35B-A3B",
+        enable_moe_routing_replay=True,
+    )
+
+    assert args["generation_config"] == "vllm"
+    assert args["logprobs_mode"] == "raw_logprobs"
+    with pytest.raises(ValueError, match="raw model logprobs"):
+        _engine_args(
+            {"engine_args": {"logprobs_mode": "processed_logprobs"}},
+            False,
+            "Qwen/Qwen3.5-35B-A3B",
+            enable_moe_routing_replay=True,
+        )
+    with pytest.raises(ValueError, match="vLLM generation defaults"):
+        _engine_args(
+            {"engine_args": {"generation_config": "auto"}},
+            False,
+            "Qwen/Qwen3.5-35B-A3B",
+            enable_moe_routing_replay=True,
+        )
 
 
 @pytest.mark.asyncio

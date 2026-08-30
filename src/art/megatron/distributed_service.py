@@ -2023,13 +2023,18 @@ class DistributedMegatronService:
         values.update(dict((server or {}).get("engine_args", {})))
         for key, value in handler.vllm_engine_args().items():
             values.setdefault(key, value)
+        if values.get("generation_config", "vllm") != "vllm":
+            raise ValueError("paired inference requires vLLM generation defaults")
+        if values.get("logprobs_mode", "raw_logprobs") != "raw_logprobs":
+            raise ValueError("paired inference requires raw model logprobs")
         values["enable_sleep_mode"] = self._temporal_gpu_sharing
         values["enable_lora"] = True
         values["enable_return_routed_experts"] = (
             self._runtime_spec().enable_moe_routing_replay
         )
         values.setdefault("max_loras", 2)
-        values.setdefault("generation_config", "vllm")
+        values["generation_config"] = "vllm"
+        values["logprobs_mode"] = "raw_logprobs"
         for key in ("model", "served_model_name"):
             values.pop(key, None)
         return values
