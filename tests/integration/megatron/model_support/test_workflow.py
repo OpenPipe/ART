@@ -27,6 +27,7 @@ from .workflow import (
 from .workflow_fixtures import (
     FIXTURE_PATH_ENV,
     WorkflowFixture,
+    _fixture_paths,
     _validate_tokenizer_compatible_fixture,
 )
 from .workflow_resources import (
@@ -114,6 +115,10 @@ def _fixture(tmp_path: Path, model_key: str) -> WorkflowFixture:
         canonical_path=str(tmp_path / "canonical"),
         canonical_hf_home=str(tmp_path / "canonical_cache"),
     )
+
+
+def test_shared_fixture_root_rehomes_node_local_paths(tmp_path: Path) -> None:
+    assert all(path.parent == tmp_path for path in _fixture_paths(str(tmp_path)))
 
 
 def test_fixture_stage_contracts(tmp_path: Path) -> None:

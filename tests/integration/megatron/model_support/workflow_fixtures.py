@@ -16,15 +16,36 @@ from pydantic import BaseModel, ConfigDict
 FIXTURE_PATH_ENV = "ART_MODEL_SUPPORT_FIXTURE_PATH"
 FIXTURE_CACHE_ENV = "ART_MODEL_SUPPORT_FIXTURE_CACHE"
 FIXTURE_ROOT_ENV = "ART_MODEL_SUPPORT_FIXTURE_ROOT"
+WORKFLOW_FIXTURE_SHARED_ROOT_ENV = "ART_MODEL_SUPPORT_WORKFLOW_FIXTURE_SHARED_ROOT"
 FIXTURE_VERSION = 18
 _CANONICAL_CACHE_VERSION = 16
-_ROOT = Path("/tmp/art-models/main-merge-oracle")
-_CACHE_ROOT = Path("/tmp/art-model-support-workflow/hf-cache")
-_TOKENIZER_FIXTURE_ROOT = Path("/tmp/art-model-support-workflow/tokenizer-compatible")
-_TOKENIZER_CACHE_ROOT = Path("/tmp/art-model-support-workflow/tokenizer-hf-cache")
-_CANONICAL_CACHE_ROOT = Path("/tmp/art-model-support-workflow/canonical-hf-cache")
-_FUNCTIONAL_FIXTURE_ROOT = Path("/tmp/art-model-support-workflow/functional")
-_FUNCTIONAL_CACHE_ROOT = Path("/tmp/art-model-support-workflow/functional-hf-cache")
+_DEFAULT_FIXTURE_PATHS = (
+    Path("/tmp/art-models/main-merge-oracle"),
+    Path("/tmp/art-model-support-workflow/hf-cache"),
+    Path("/tmp/art-model-support-workflow/tokenizer-compatible"),
+    Path("/tmp/art-model-support-workflow/tokenizer-hf-cache"),
+    Path("/tmp/art-model-support-workflow/canonical-hf-cache"),
+    Path("/tmp/art-model-support-workflow/functional"),
+    Path("/tmp/art-model-support-workflow/functional-hf-cache"),
+)
+
+
+def _fixture_paths(shared_root: str | None) -> tuple[Path, ...]:
+    if shared_root is None:
+        return _DEFAULT_FIXTURE_PATHS
+    root = Path(shared_root)
+    return tuple(root / path.name for path in _DEFAULT_FIXTURE_PATHS)
+
+
+(
+    _ROOT,
+    _CACHE_ROOT,
+    _TOKENIZER_FIXTURE_ROOT,
+    _TOKENIZER_CACHE_ROOT,
+    _CANONICAL_CACHE_ROOT,
+    _FUNCTIONAL_FIXTURE_ROOT,
+    _FUNCTIONAL_CACHE_ROOT,
+) = _fixture_paths(os.environ.get(WORKFLOW_FIXTURE_SHARED_ROOT_ENV))
 _GEMMA_CANONICAL_WEIGHT_STAGES = frozenset({"hf_parity", "packing_invariance"})
 _PRETRAINED_WEIGHT_STAGES = frozenset({"length_trainability"})
 _FUNCTIONAL_STAGES = frozenset(
