@@ -48,8 +48,7 @@ _FRESHNESS_DISCOUNT = "sample_efficiency/freshness_discount"
 _STALE_GROUPS = "discarded/step/stale_groups"
 _ZERO_VARIANCE_GROUPS = "discarded/step/zero_variance_groups"
 _INTER_FORWARD_BACKWARD_GAP_PREFIX = "time/inter_forward_backward_gpu_gap_rank_"
-_MEASUREMENT_CONTRACT_VERSION = 21
-_THROUGHPUT_SHARED_PREFIX_UNITS = 32
+_MEASUREMENT_CONTRACT_VERSION = 20
 _ISOLATED_WARMUP_STEPS = 1
 _MATCHED_MEASURED_STEPS = 3
 _PACKING_DRAIN_WINDOWS = 1
@@ -889,7 +888,6 @@ def _calibration_contract(
     stage: Any,
     config: ThroughputWorkflowConfig,
     autotune: Any,
-    prompt: str,
     actual_prompt_tokens: int,
     gpu_identities: list[dict[str, Any]],
 ) -> dict[str, Any]:
@@ -934,11 +932,7 @@ def _calibration_contract(
             "model": f"fixture-sha256:{manifest['sized_config_sha256']}",
         },
         "autotuner_config": autotune.model_dump(mode="json"),
-        "workload_config": {
-            **workload,
-            "actual_prompt_tokens": actual_prompt_tokens,
-            "prompt_template_sha256": hashlib.sha256(prompt.encode()).hexdigest(),
-        },
+        "workload_config": {**workload, "actual_prompt_tokens": actual_prompt_tokens},
         "random_initialization": {
             "version": config.random_initialization_version,
             "seed": config.random_seed,
@@ -996,18 +990,16 @@ def _chat_token_count(tokenizer: Any, prompt: str) -> int:
 def _sized_prompt(tokenizer: Any, *, target_tokens: int) -> str:
     prefix = "Process the following neutral record.\n"
     unit = " measured context item"
-    shared_units = min(_THROUGHPUT_SHARED_PREFIX_UNITS, max(1, target_tokens // 12))
-    prefix += unit * shared_units
-    discriminator = "\nThroughput scenario 00000000.\n"
+    suffix = "\nThroughput scenario 00000000."
     lower, upper = 0, target_tokens
     while lower < upper:
         middle = (lower + upper + 1) // 2
-        candidate = prefix + discriminator + unit * middle
+        candidate = prefix + unit * middle + suffix
         if _chat_token_count(tokenizer, candidate) <= target_tokens:
             lower = middle
         else:
             upper = middle - 1
-    prompt = prefix + discriminator + unit * lower
+    prompt = prefix + unit * lower + suffix
     actual = _chat_token_count(tokenizer, prompt)
     if actual < target_tokens - 64:
         raise RuntimeError(
@@ -1842,7 +1834,6 @@ async def _run_e2e_throughput_async(
         stage=stage,
         config=config,
         autotune=autotune,
-        prompt=prompt,
         actual_prompt_tokens=actual_prompt_tokens,
         gpu_identities=gpu_identities,
     )

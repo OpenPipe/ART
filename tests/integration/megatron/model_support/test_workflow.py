@@ -892,7 +892,7 @@ def test_build_validation_stage_names_has_fixed_order() -> None:
     assert build_validation_stage_names() == list(MANDATORY_VALIDATION_STAGES)
 
 
-def test_throughput_prompt_bounds_shared_context_before_scenario_identity() -> None:
+def test_throughput_prompt_keeps_scenario_identity_after_shared_context() -> None:
     tokenizer = SimpleNamespace(
         apply_chat_template=lambda messages, **_kwargs: list(
             range(len(messages[0]["content"].split()))
@@ -901,11 +901,9 @@ def test_throughput_prompt_bounds_shared_context_before_scenario_identity() -> N
 
     prompt = _sized_prompt(tokenizer, target_tokens=64)
 
-    first_context = prompt.find("measured context item")
-    scenario = prompt.find("Throughput scenario 00000000.")
-    last_context = prompt.rfind("measured context item")
-
-    assert 0 <= first_context < scenario < last_context
+    assert prompt.rfind("measured context item") < prompt.rfind(
+        "Throughput scenario 00000000."
+    )
 
 
 def test_validated_architecture_representative_models_are_fixed() -> None:
