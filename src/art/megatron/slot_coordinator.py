@@ -655,6 +655,66 @@ class MegatronSlotCoordinator:
             operation.operation_id,
         )
 
+    async def capture_run_checkpoint(
+        self,
+        run_id: str,
+        export_id: str,
+    ) -> PortableSnapshotExportReceipt:
+        """Export immutable gate evidence at a quiescent slot boundary."""
+
+        if not export_id:
+            raise ValueError("checkpoint capture export_id must not be empty")
+        async with self._condition:
+            state = self._runs.get(run_id)
+            if (
+                state is None
+                or state.draining
+                or state.maintenance
+                or state.migration_fence_id is not None
+                or state.migration_restore_id is not None
+            ):
+                raise RuntimeError("Megatron slot run is unavailable for capture")
+            state.maintenance = True
+            try:
+                while (
+                    state.preparing
+                    or state.worker_calls
+                    or state.settling
+                    or self._active_run_id == run_id
+                    or any(item.run_id == run_id for item in self._ready)
+                ):
+                    await self._condition.wait()
+                if self._runs.get(run_id) is not state or state.draining:
+                    raise RuntimeError("Megatron slot run changed during capture")
+                generation = state.handler.generation
+            except BaseException:
+                state.maintenance = False
+                self._condition.notify_all()
+                raise
+        try:
+            receipt = await self.trainer.export_command_run_checkpoint(
+                run_id,
+                generation,
+                export_id,
+            )
+            exported = receipt.generation
+            if receipt.export_id != export_id or (
+                exported.training_session_id,
+                exported.policy_step,
+                exported.generation_id,
+            ) != (
+                generation.training_session_id,
+                generation.policy_step,
+                generation.generation_id,
+            ):
+                raise RuntimeError("checkpoint capture changed its generation identity")
+            return receipt
+        finally:
+            async with self._condition:
+                if self._runs.get(run_id) is state:
+                    state.maintenance = False
+                self._condition.notify_all()
+
     async def install_run_checkpoint(
         self,
         operation: OperationRef,

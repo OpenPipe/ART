@@ -7,6 +7,7 @@ __all__ = [
     "MegatronGateCommand",
     "MegatronGateEvidenceRecorder",
     "MegatronGateRunPlan",
+    "MegatronGateTurn",
     "MegatronOperationConfig",
     "MegatronOperationHandler",
     "MegatronOperationRuntime",
@@ -50,6 +51,7 @@ def __getattr__(name: str) -> Any:
         "MegatronGateCommand",
         "MegatronGateEvidenceRecorder",
         "MegatronGateRunPlan",
+        "MegatronGateTurn",
         "run_megatron_gate_attempt",
     }:
         from . import gate_evidence

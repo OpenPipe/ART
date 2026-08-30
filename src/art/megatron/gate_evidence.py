@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -74,16 +76,54 @@ class MegatronGateRunPlan(_GateContract):
     commands: tuple[MegatronGateCommand, ...] = Field(min_length=1, max_length=128)
 
 
+class MegatronGateTurn(_GateContract):
+    run_id: str = Field(min_length=1)
+    command_count: int = Field(ge=1, le=128)
+    capture_isolation: bool = False
+
+
 class MegatronGateAttemptPlan(_GateContract):
     slot: MegatronSlotLaunchConfig
     attempt_root: str = Field(min_length=1)
     runs: tuple[MegatronGateRunPlan, ...] = Field(min_length=1, max_length=4)
+    schedule: tuple[MegatronGateTurn, ...] = Field(default=(), max_length=512)
 
     @model_validator(mode="after")
     def _validate_runs(self) -> "MegatronGateAttemptPlan":
         run_ids = tuple(run.bootstrap.run_id for run in self.runs)
         if len(set(run_ids)) != len(run_ids):
             raise ValueError("gate run IDs must be unique")
+        if not self.schedule:
+            return self
+        if len(run_ids) < 2:
+            raise ValueError("gate isolation schedule requires multiple resident runs")
+        runs = {run.bootstrap.run_id: run for run in self.runs}
+        consumed = dict.fromkeys(run_ids, 0)
+        captured: set[str] = set()
+        for turn in self.schedule:
+            run = runs.get(turn.run_id)
+            if run is None:
+                raise ValueError("gate schedule names an unknown run")
+            start = consumed[turn.run_id]
+            stop = start + turn.command_count
+            if stop > len(run.commands):
+                raise ValueError("gate schedule consumes beyond a run command stream")
+            commands = run.commands[start:stop]
+            if turn.capture_isolation:
+                if not any(
+                    command.kind in {"optim_step", "load_state"} for command in commands
+                ):
+                    raise ValueError(
+                        "isolation capture must contain a state-changing command"
+                    )
+                captured.add(turn.run_id)
+            consumed[turn.run_id] = stop
+        if any(consumed[run_id] != len(runs[run_id].commands) for run_id in run_ids):
+            raise ValueError(
+                "gate schedule must consume every run command exactly once"
+            )
+        if captured != set(run_ids):
+            raise ValueError("gate schedule must capture an active turn for every run")
         return self
 
 
@@ -153,6 +193,31 @@ class MegatronGateEvidenceRecorder:
                 receipt.model_dump_json(indent=2).encode() + b"\n",
             )
         return outcome
+
+    async def capture_slot_state(
+        self,
+        *,
+        turn_index: int,
+        phase: Literal["before", "after"],
+        run_ids: tuple[str, ...],
+    ) -> None:
+        for run_index, run_id in enumerate(run_ids):
+            export_id = hashlib.sha256(
+                f"gate-isolation\0{turn_index}\0{phase}\0{run_id}".encode()
+            ).hexdigest()
+            receipt = await self.coordinator.capture_run_checkpoint(run_id, export_id)
+            path = (
+                self.root
+                / "receipts"
+                / "isolation"
+                / f"turn-{turn_index:03d}"
+                / phase
+                / f"run-{run_index:03d}.json"
+            )
+            _write_json(
+                path,
+                receipt.model_dump_json(indent=2).encode() + b"\n",
+            )
 
 
 class MegatronGateCheckpointOperations:
@@ -233,14 +298,69 @@ async def run_megatron_gate_attempt(launch: ArtLaunchContext) -> None:
                 ),
             )
             bound.append((run_plan, binding))
-        await asyncio.gather(
-            *(
-                _execute_run_plan(recorder, run_plan, binding)
-                for run_plan, binding in bound
+        if plan.schedule:
+            await _execute_schedule(recorder, plan, bound)
+        else:
+            await asyncio.gather(
+                *(
+                    _execute_run_plan(recorder, run_plan, binding)
+                    for run_plan, binding in bound
+                )
             )
-        )
     finally:
         await slot.aclose()
+
+
+@dataclass(slots=True)
+class _GateRunExecution:
+    plan: MegatronGateRunPlan
+    binding: MegatronRunBinding
+    ledger: RunCommandLedger
+    cursor: int = 0
+
+
+async def _execute_schedule(
+    recorder: MegatronGateEvidenceRecorder,
+    plan: MegatronGateAttemptPlan,
+    bound: list[tuple[MegatronGateRunPlan, MegatronRunBinding]],
+) -> None:
+    runs = {
+        run_plan.bootstrap.run_id: _GateRunExecution(
+            plan=run_plan,
+            binding=binding,
+            ledger=RunCommandLedger(
+                run_plan.bootstrap.run_id,
+                learner_version=binding.config.source.policy_step,
+            ),
+        )
+        for run_plan, binding in bound
+    }
+    run_ids = tuple(run.bootstrap.run_id for run in plan.runs)
+    for turn_index, turn in enumerate(plan.schedule):
+        execution = runs[turn.run_id]
+        if turn.capture_isolation:
+            await recorder.capture_slot_state(
+                turn_index=turn_index,
+                phase="before",
+                run_ids=run_ids,
+            )
+        stop = execution.cursor + turn.command_count
+        await _execute_commands(
+            recorder,
+            execution.plan.commands[execution.cursor : stop],
+            execution.binding,
+            execution.ledger,
+        )
+        execution.cursor = stop
+        if turn.capture_isolation:
+            await recorder.capture_slot_state(
+                turn_index=turn_index,
+                phase="after",
+                run_ids=run_ids,
+            )
+    for execution in runs.values():
+        if execution.ledger.open_forward_backward_operation_ids:
+            raise RuntimeError("gate run ended with open F/B contributions")
 
 
 async def _execute_run_plan(
@@ -253,20 +373,29 @@ async def _execute_run_plan(
         learner_version=binding.config.source.policy_step,
     )
     try:
-        for command in plan.commands:
-            request = _parse_command(command)
-            outcome = await recorder.execute(
-                binding.run,
-                ledger,
-                request,
-                capture_numerics=command.capture_numerics,
-            )
-            if isinstance(outcome, OperationFailed):
-                raise RuntimeError(f"{outcome.failure.code}: {outcome.failure.message}")
+        await _execute_commands(recorder, plan.commands, binding, ledger)
         if ledger.open_forward_backward_operation_ids:
             raise RuntimeError("gate run ended with open F/B contributions")
     finally:
         await recorder.coordinator.drain_run(plan.bootstrap.run_id)
+
+
+async def _execute_commands(
+    recorder: MegatronGateEvidenceRecorder,
+    commands: tuple[MegatronGateCommand, ...],
+    binding: MegatronRunBinding,
+    ledger: RunCommandLedger,
+) -> None:
+    for command in commands:
+        request = _parse_command(command)
+        outcome = await recorder.execute(
+            binding.run,
+            ledger,
+            request,
+            capture_numerics=command.capture_numerics,
+        )
+        if isinstance(outcome, OperationFailed):
+            raise RuntimeError(f"{outcome.failure.code}: {outcome.failure.message}")
 
 
 def _parse_command(command: MegatronGateCommand) -> RunCommand:
