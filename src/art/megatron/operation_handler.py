@@ -173,6 +173,15 @@ class MegatronPolicyActivationTiming(BaseModel):
         )
 
 
+class MegatronInferenceUpdateUsage(BaseModel):
+    """Disjoint service-visible time spent staging and applying one LoRA update."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    staging_s: FiniteFloat = Field(ge=0)
+    apply_s: FiniteFloat = Field(ge=0)
+
+
 class MegatronSamplerPublicationReceipt(BaseModel):
     """Private durable proof for one operation-keyed serving publication."""
 
@@ -189,6 +198,7 @@ class MegatronSamplerPublicationReceipt(BaseModel):
     serving_generation_id: str = Field(min_length=1, max_length=255)
     learner_version: int = Field(ge=0)
     policy_activation_timing: MegatronPolicyActivationTiming | None = None
+    inference_update_usage: MegatronInferenceUpdateUsage | None = None
     holder_update_sequence: int | None = Field(default=None, ge=0)
     holder_update_id: str | None = Field(default=None, min_length=1, max_length=255)
     retained: tuple[MegatronRetainedState, ...] = Field(min_length=1, max_length=8)
@@ -235,6 +245,8 @@ class MegatronSamplerPublicationReceipt(BaseModel):
         timing = self.policy_activation_timing
         if paired_lora and timing is None:
             raise RuntimeError("paired publication omitted policy activation timing")
+        if paired_lora != (self.inference_update_usage is not None):
+            raise RuntimeError("sampler publication returned the wrong update usage")
         if (
             timing is not None
             and self.result.metrics.get(POLICY_ACTIVATION_LAG_METRIC)

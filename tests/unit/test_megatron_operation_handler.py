@@ -16,6 +16,7 @@ from art.distributed.rollout import RolloutModelSpec
 from art.distributed.trajectory_store import TrajectoryGroupBundle
 from art.megatron.operation_handler import (
     POLICY_ACTIVATION_LAG_METRIC,
+    MegatronInferenceUpdateUsage,
     MegatronOperationConfig,
     MegatronOperationHandler,
     MegatronPolicyActivationTiming,
@@ -566,6 +567,10 @@ async def test_handler_connects_optimizer_snapshot_to_paired_publication() -> No
                 serving_generation_id=generation.generation_id,
                 learner_version=generation.policy_step,
                 policy_activation_timing=timing,
+                inference_update_usage=MegatronInferenceUpdateUsage(
+                    staging_s=0.25,
+                    apply_s=0.75,
+                ),
                 holder_update_sequence=1,
                 holder_update_id="update-1",
                 retained=(
@@ -907,6 +912,10 @@ async def test_sampler_publication_receipt_lives_until_operation_retirement() ->
                 policy_activation_timing=MegatronPolicyActivationTiming(
                     trainer_completed_monotonic_s=10.0,
                     serving_activated_monotonic_s=11.25,
+                ),
+                inference_update_usage=MegatronInferenceUpdateUsage(
+                    staging_s=0.25,
+                    apply_s=1.0,
                 ),
                 holder_update_sequence=3,
                 holder_update_id="holder-update-3",

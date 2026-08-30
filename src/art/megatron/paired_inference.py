@@ -36,6 +36,7 @@ from .model_support import get_model_support_handler
 from .operation_handler import (
     POLICY_ACTIVATION_LAG_METRIC,
     MegatronArtifactResourcePlan,
+    MegatronInferenceUpdateUsage,
     MegatronPolicyActivationTiming,
     MegatronRetainedState,
     MegatronSamplerPublicationReceipt,
@@ -227,7 +228,9 @@ class MegatronPairedInferencePublisher:
                 "policy_version": generation.policy_step,
             }
             try:
+                update_apply_started = time.monotonic()
                 response = await self._post_update(payload)
+                update_apply_s = time.monotonic() - update_apply_started
                 update_sequence = _response_int(response, "update_seq")
                 update_identity = str(response["update_identity"])
                 if (
@@ -294,6 +297,10 @@ class MegatronPairedInferencePublisher:
                 serving_generation_id=generation.generation_id,
                 learner_version=generation.policy_step,
                 policy_activation_timing=lag,
+                inference_update_usage=MegatronInferenceUpdateUsage(
+                    staging_s=max(float(item.materialization_s) for item in received),
+                    apply_s=update_apply_s,
+                ),
                 holder_update_sequence=update_sequence,
                 holder_update_id=update_identity,
                 retained=(
