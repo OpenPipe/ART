@@ -643,7 +643,7 @@ class ReplicaManager:
         process_uuid = uuid.uuid4().hex
         physical_ids = all(isinstance(gpu_id, int) for gpu_id in member.gpu_ids)
         launch = VllmRuntimeLaunchConfig(
-            base_model=self._spec.base_model,
+            base_model=self._spec.runtime_model,
             port=self._spec.leader_endpoint.port,
             host=(
                 self._spec.leader_endpoint.host

@@ -12,7 +12,12 @@ from art.distributed.specs import (
     ModelServiceSpec,
     VllmParallelSpec,
 )
-from art.distributed.vllm_replica import ReplicaFailure, ReplicaState
+from art.distributed.vllm_replica import (
+    ReplicaFailure,
+    ReplicaLaunchTemplate,
+    ReplicaManager,
+    ReplicaState,
+)
 from art.local import checkpoints as checkpoints_module
 from art.megatron import distributed_service as service_module
 from art.megatron.backend import MegatronBackend
@@ -97,6 +102,21 @@ def test_multihost_model_service_requires_routable_leader() -> None:
             runtime_fingerprint="runtime",
             parallel=VllmParallelSpec(tp=2),
         )
+
+
+def test_model_service_launches_explicit_physical_source() -> None:
+    spec = _spec().model_copy(update={"model_source": "quantized/model"})
+    manager = ReplicaManager(
+        spec,
+        cast(Any, {"host0": SimpleNamespace()}),
+        ReplicaLaunchTemplate(served_model_name="model"),
+    )
+    manager._private_dispatch_token = "private-dispatch-token" * 2
+
+    request = manager._launch_request(spec.members[0])
+
+    assert spec.base_model == "base"
+    assert request.launch_config.base_model == "quantized/model"
 
 
 @pytest.mark.asyncio

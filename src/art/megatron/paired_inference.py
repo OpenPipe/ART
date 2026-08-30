@@ -488,8 +488,8 @@ def _serving_profile_identity(
     retained_routes = runtime.retained_route_prefetch_enabled
     return ServingProfileIdentity(
         base_model=base_model,
-        model_identifier=spec.model_source,
-        model_revision=spec.model_revision,
+        model_identifier=service.runtime_model,
+        model_revision=service.model_revision or "default",
         model_support_key=spec.model_support_key,
         handler_name=spec.handler_name,
         lora_rank=spec.lora_rank,

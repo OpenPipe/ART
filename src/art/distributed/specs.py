@@ -221,10 +221,15 @@ class ModelServiceSpec(_Spec):
     leader_endpoint: EndpointSpec
     rendezvous: EndpointSpec
     base_model: str = Field(min_length=1)
+    model_source: str | None = Field(default=None, min_length=1)
     model_revision: str | None = Field(default=None, min_length=1)
     runtime_fingerprint: str = Field(min_length=1)
     parallel: VllmParallelSpec
     temporal_gpu_sharing: bool = False
+
+    @property
+    def runtime_model(self) -> str:
+        return self.model_source or self.base_model
 
     @model_validator(mode="after")
     def _validate_members(self) -> "ModelServiceSpec":
