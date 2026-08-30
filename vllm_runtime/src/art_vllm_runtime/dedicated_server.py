@@ -322,6 +322,10 @@ class _PrivateRouteResponses:
                 return None
             if response.body is None:
                 raise RuntimeError("private route response is not complete")
+            if response.object_ref is not None:
+                if _local_route_store is None:
+                    raise RuntimeError("local route store is unavailable")
+                _local_route_store.discard(response.object_ref)
             self._responses.pop(request_identity)
             self._reserved_bytes -= response.reserved_bytes
             return response.retained_bytes

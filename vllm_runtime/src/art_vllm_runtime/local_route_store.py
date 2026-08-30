@@ -77,6 +77,11 @@ class LocalRouteStore:
             self._verify(target, size_bytes=size_bytes, sha256=sha256)
             target.unlink()
 
+    def discard(self, ref: dict[str, object]) -> None:
+        """Remove a source object after its verified destination copy commits."""
+
+        self._target(ref).unlink(missing_ok=True)
+
     def close(self) -> None:
         shutil.rmtree(self.root, ignore_errors=True)
 

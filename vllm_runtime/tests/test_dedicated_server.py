@@ -431,9 +431,13 @@ async def test_private_execution_receipts_are_bounded_and_fail_closed() -> None:
 
 
 @pytest.mark.asyncio
-async def test_private_route_responses_reserve_replay_and_ack_exact_bytes() -> None:
+async def test_private_route_responses_reserve_replay_and_ack_exact_bytes(
+    monkeypatch,
+) -> None:
     responses = dedicated_server._PrivateRouteResponses()
     identity = "a" * 64
+    object_ref = {"store": "holder_local", "locator": "/route"}
+    released: list[dict[str, object]] = []
     await responses.reserve(
         identity,
         "payload-a",
@@ -454,7 +458,7 @@ async def test_private_route_responses_reserve_replay_and_ack_exact_bytes() -> N
         "payload-a",
         b"response",
         retained_bytes=5,
-        object_ref=None,
+        object_ref=object_ref,
     )
     replay = await responses.replay(identity, "payload-a")
     assert replay is not None and replay.body == b"response"
@@ -466,7 +470,16 @@ async def test_private_route_responses_reserve_replay_and_ack_exact_bytes() -> N
         "reserved_route_bytes": 8,
         "retained_route_bytes": 5,
     }
+    monkeypatch.setattr(dedicated_server, "_local_route_store", None)
+    with pytest.raises(RuntimeError, match="local route store is unavailable"):
+        await responses.acknowledge(identity)
+    monkeypatch.setattr(
+        dedicated_server,
+        "_local_route_store",
+        SimpleNamespace(discard=released.append),
+    )
     assert await responses.acknowledge(identity) == 5
+    assert released == [object_ref]
     assert await responses.acknowledge(identity) is None
 
 
