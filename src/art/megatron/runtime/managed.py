@@ -431,7 +431,7 @@ def ensure_megatron_runtime(
     )
     managed = False
     if override := os.environ.get("ART_MEGATRON_RUNTIME_PYTHON"):
-        python = Path(override).expanduser().resolve()
+        python = Path(override).expanduser().absolute()
         identity = hashlib.sha256(
             f"{art_build_sha256}:{python}:{variant}".encode()
         ).hexdigest()
