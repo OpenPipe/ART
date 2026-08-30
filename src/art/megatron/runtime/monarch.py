@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncIterator, Awaitable
 from dataclasses import dataclass, field
-from datetime import timedelta
 import hashlib
 import json
 import os
@@ -246,10 +245,6 @@ def _build_training_runtime(
 
     if distributed_timeout_s <= 0:
         raise ValueError("distributed timeout must be positive")
-    if not torch.distributed.is_initialized():
-        torch.distributed.init_process_group(
-            "nccl", timeout=timedelta(seconds=distributed_timeout_s)
-        )
 
     return build_training_runtime(
         model_identifier=spec.model_source,
