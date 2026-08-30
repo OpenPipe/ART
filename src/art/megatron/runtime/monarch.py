@@ -808,13 +808,17 @@ class MonarchTrainerActor(Actor):
         run_id: str,
         generation_json: str,
         archive_json: str,
+        restore_optimizer: bool,
     ) -> dict[str, Any]:
         if not self._valid:
             raise RuntimeError("trainer actor runtime is invalid")
         generation = TrainerGeneration.model_validate_json(generation_json)
         archive = PortableSnapshotArchive.model_validate_json(archive_json)
         receipt = self._run_slot_executor.install_run_checkpoint(
-            run_id, generation, archive
+            run_id,
+            generation,
+            archive,
+            restore_optimizer=restore_optimizer,
         )
         return {
             "rank": self._runtime.rank,
@@ -1710,6 +1714,7 @@ class MonarchTrainerRun:
                             run_spec.initial_portable_snapshot.archive_sha256
                         ),
                         runtime_fingerprint=self.runtime_spec.fingerprint,
+                        restore_optimizer=True,
                         ranks=reads,
                     )
                     portable_install.validate_archive(
@@ -1892,6 +1897,8 @@ class MonarchTrainerRun:
         operation: OperationRef,
         generation: TrainerGeneration,
         archive: PortableSnapshotArchive,
+        *,
+        restore_optimizer: bool,
     ) -> PortableSnapshotLoadReceipt:
         fingerprint = hashlib.sha256(
             (
@@ -1900,6 +1907,8 @@ class MonarchTrainerRun:
                 + generation.model_dump_json()
                 + "\0"
                 + archive.archive_sha256
+                + "\0"
+                + json.dumps(restore_optimizer)
             ).encode()
         ).hexdigest()
         prior = self._checkpoint_loads.get(operation.operation_id)
@@ -1929,6 +1938,7 @@ class MonarchTrainerRun:
                     operation.run_id,
                     generation.model_dump_json(),
                     archive.model_dump_json(),
+                    restore_optimizer,
                 ),
                 timeout=state.spec.event_timeout_s,
             )
@@ -1944,6 +1954,7 @@ class MonarchTrainerRun:
             install = PortableSnapshotInstallReceipt(
                 archive_sha256=archive.archive_sha256,
                 runtime_fingerprint=self.runtime_spec.fingerprint,
+                restore_optimizer=restore_optimizer,
                 ranks=reads,
             )
             install.validate_archive(archive)

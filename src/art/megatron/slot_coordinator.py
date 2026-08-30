@@ -183,6 +183,8 @@ class _SharedTrainer(Protocol):
         operation: OperationRef,
         generation: TrainerGeneration,
         archive: PortableSnapshotArchive,
+        *,
+        restore_optimizer: bool,
     ) -> PortableSnapshotLoadReceipt: ...
 
     async def record_control_command(
@@ -570,6 +572,8 @@ class MegatronSlotCoordinator:
         operation: OperationRef,
         generation: TrainerGeneration,
         archive: PortableSnapshotArchive,
+        *,
+        restore_optimizer: bool,
     ) -> PortableSnapshotLoadReceipt:
         """Install one authenticated checkpoint for the active load-state command."""
 
@@ -591,6 +595,7 @@ class MegatronSlotCoordinator:
             operation,
             generation,
             archive,
+            restore_optimizer=restore_optimizer,
         )
 
     def sampler_publication_receipt(

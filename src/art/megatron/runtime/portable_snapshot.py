@@ -11,7 +11,7 @@ from pathlib import Path, PurePosixPath
 import re
 import shutil
 import tempfile
-from typing import TYPE_CHECKING, BinaryIO, Literal, Protocol, cast
+from typing import TYPE_CHECKING, Any, BinaryIO, Literal, Protocol, cast
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -26,7 +26,7 @@ _ENTRYPOINT = re.compile(
     r"^(?P<module>[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*):"
     r"(?P<callable>[A-Za-z_]\w*)$"
 )
-_METADATA_FILES = (
+_CHECKPOINT_IDENTITY_FILES = (
     "adapter_config.json",
     "adapter_model.safetensors",
     "checkpoint.json",
@@ -97,6 +97,8 @@ class PortableSnapshotFile(_Contract):
             or "\0" in self.relative_path
         ):
             raise ValueError("portable snapshot path must be normalized")
+        if self.component != _checkpoint_component(self.relative_path):
+            raise ValueError("portable snapshot file component changed")
         return self
 
 
@@ -138,7 +140,7 @@ class PortableSnapshotArchive(_Contract):
         paths = tuple(file.relative_path for file in files)
         if len(paths) != len(set(paths)):
             raise ValueError("portable snapshot file ownership overlaps")
-        if not set(_METADATA_FILES).issubset(paths):
+        if not set(_CHECKPOINT_IDENTITY_FILES).issubset(paths):
             raise ValueError("portable snapshot lacks canonical checkpoint metadata")
         if self.archive_sha256 != _json_sha256(_archive_payload(self)):
             raise ValueError("portable snapshot archive digest changed")
@@ -209,6 +211,7 @@ class PortableSnapshotReadReceipt(_Contract):
 class PortableSnapshotInstallReceipt(_Contract):
     archive_sha256: str = Field(pattern=_SHA256)
     runtime_fingerprint: str = Field(pattern=_SHA256)
+    restore_optimizer: bool = True
     ranks: tuple[PortableSnapshotReadReceipt, ...] = Field(min_length=1)
 
     @model_validator(mode="after")
@@ -231,6 +234,7 @@ class PortableSnapshotInstallReceipt(_Contract):
             )
             for receipt in archive.ranks
             for file in receipt.files
+            if self.restore_optimizer or file.component != "optimizer"
         }
         observed: dict[str, tuple[int, int, str]] = {}
         for receipt in self.ranks:
@@ -480,6 +484,7 @@ def install_portable_checkpoint(
     destination_rank: int,
     expected_lora_rank: int,
     expected_lora_target_modules: tuple[str, ...],
+    restore_optimizer: bool,
 ) -> tuple[PortableSnapshotReadReceipt, dict[str, object]]:
     """Read, authenticate, repartition, and atomically install one checkpoint."""
 
@@ -525,7 +530,7 @@ def install_portable_checkpoint(
         prepared = None
         read_error: BaseException | None = None
         try:
-            materialize(set(_METADATA_FILES))
+            materialize(set(_CHECKPOINT_IDENTITY_FILES))
             entries = tuple(sorted(owned))
             prepared = _checkpoint.prepare_checkpoint(
                 str(root), artifact_entries=entries
@@ -543,7 +548,17 @@ def install_portable_checkpoint(
                 raise RuntimeError(
                     "portable checkpoint adapter shape differs from run admission"
                 )
-            required = _checkpoint.required_local_checkpoint_files(trainer, prepared)
+            required = (
+                _checkpoint.required_local_checkpoint_files(trainer, prepared)
+                if restore_optimizer
+                else tuple(
+                    sorted(
+                        relative
+                        for relative, (_receipt, file) in owned.items()
+                        if file.component != "optimizer"
+                    )
+                )
+            )
             materialize(set(required))
             for relative in set(required) - {"checkpoint.json"}:
                 actual = _checkpoint._file_digest(root / relative)
@@ -555,7 +570,34 @@ def install_portable_checkpoint(
             prepared = _checkpoint.prepare_checkpoint(
                 str(root), artifact_entries=entries
             )
-            if prepared.manifest is not None and prepared.manifest.get(
+            if not restore_optimizer:
+                assert prepared.manifest is not None
+                # Keep the authenticated canonical checkpoint identity while
+                # presenting only its materialized adapter state to the loader.
+                adapter_manifest = cast(
+                    Any,
+                    {
+                        **prepared.manifest,
+                        "optimizer": None,
+                        "parameters": {},
+                        "steps": {},
+                        "files": {
+                            relative: digest
+                            for relative, digest in prepared.manifest["files"].items()
+                            if _checkpoint_component(relative) != "optimizer"
+                        },
+                    },
+                )
+                prepared = replace(
+                    prepared,
+                    manifest=adapter_manifest,
+                    custom=(
+                        _checkpoint._load_custom_payload(root, adapter_manifest)
+                        if adapter_manifest.get("custom_tensors")
+                        else None
+                    ),
+                )
+            elif prepared.manifest is not None and prepared.manifest.get(
                 "custom_tensors"
             ):
                 prepared = replace(

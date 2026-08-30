@@ -772,6 +772,7 @@ class MCoreRunSlotExecutor:
                     destination_rank=int(self.runtime.rank),
                     expected_lora_rank=spec.lora_rank,
                     expected_lora_target_modules=spec.lora_target_modules,
+                    restore_optimizer=True,
                 )
             installed = True
             parameters = self._trainer.checkpoint_slot_parameters(spec.run_id)
@@ -829,6 +830,8 @@ class MCoreRunSlotExecutor:
         run_id: str,
         generation: TrainerGeneration,
         archive: PortableSnapshotArchive,
+        *,
+        restore_optimizer: bool,
     ) -> PortableSnapshotReadReceipt:
         state = self._runs.get(run_id)
         if state is None:
@@ -853,6 +856,7 @@ class MCoreRunSlotExecutor:
             destination_rank=int(self.runtime.rank),
             expected_lora_rank=state.spec.lora_rank,
             expected_lora_target_modules=state.spec.lora_target_modules,
+            restore_optimizer=restore_optimizer,
         )
         state.gradients = ParameterGradientAccumulator(
             self._trainer.checkpoint_slot_parameters(run_id)
