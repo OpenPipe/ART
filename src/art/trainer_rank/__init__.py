@@ -62,6 +62,7 @@ class TrainerRank(_impl.TrainerRank):
         shared_prefix_max_depth: int = 1,
         memory_safety_factor: float = 1.10,
         memory_reserve_fraction: float = 0.03,
+        initialize_gradients: bool = True,
     ) -> None:
         super().__init__(
             runtime,
@@ -69,6 +70,7 @@ class TrainerRank(_impl.TrainerRank):
             shared_prefix_max_depth=shared_prefix_max_depth,
             memory_safety_factor=memory_safety_factor,
             memory_reserve_fraction=memory_reserve_fraction,
+            initialize_gradients=initialize_gradients,
         )
 
     def zero_grad(self) -> None:

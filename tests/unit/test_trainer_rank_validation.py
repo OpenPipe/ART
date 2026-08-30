@@ -2189,6 +2189,14 @@ def test_trainer_rank_default_forward_uses_explicit_base_slot() -> None:
     assert getattr(slot, "name") is None
 
 
+def test_trainer_rank_can_preserve_initialized_runtime_gradients() -> None:
+    optimizer = _NativeOptimizer()
+
+    TrainerRank(_runtime(optimizer=optimizer), initialize_gradients=False)
+
+    assert optimizer.zero_grad_calls == 0
+
+
 def test_optim_step_requires_loaded_checkpoint_slot() -> None:
     optimizer = _NativeOptimizer()
     trainer = TrainerRank(_runtime(optimizer=optimizer))

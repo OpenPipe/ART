@@ -713,7 +713,8 @@ class MCoreRunSlotExecutor:
         from art.trainer_rank import TrainerRank
 
         self.runtime = runtime
-        self._trainer = TrainerRank(runtime)
+        # The shared runtime already initialized DDP and its gradient buffers.
+        self._trainer = TrainerRank(runtime, initialize_gradients=False)
         self._runs: dict[str, _ResidentCommandRun] = {}
         self._accumulator_l1_budget_bytes = accumulator_l1_budget_bytes
         self._topology_fingerprint = topology_fingerprint

@@ -826,6 +826,7 @@ class TrainerRank:
         shared_prefix_max_depth: int = 1,
         memory_safety_factor: float = 1.10,
         memory_reserve_fraction: float = 0.03,
+        initialize_gradients: bool = True,
     ) -> None:
         pp_size = int(getattr(runtime.provider, "pipeline_model_parallel_size", 1) or 1)
         if pp_size > 1 or len(runtime.model) > 1:
@@ -897,7 +898,8 @@ class TrainerRank:
             OrderedDict()
         )
         self._last_global_micro_batch_size: int | None = None
-        self.zero_grad()
+        if initialize_gradients:
+            self.zero_grad()
 
     def zero_grad(self) -> None:
         for chunk in self.runtime.model:
