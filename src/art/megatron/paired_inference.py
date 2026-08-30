@@ -120,6 +120,7 @@ class MegatronPairedInferencePublisher:
                 runtime_source_epoch=credentials.runtime_source_epoch,
                 authorization_token=credentials.authorization_token,
                 profile=cast(Any, capabilities.profile),
+                fast_metrics=capabilities.fast_metrics,
             )
         except BaseException as error:
             if started:

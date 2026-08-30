@@ -175,6 +175,7 @@ class PairedInferenceEndpoint(BaseModel):
     runtime_source_epoch: int = Field(ge=0)
     authorization_token: str = Field(min_length=32, repr=False)
     profile: ServingProfile
+    fast_metrics: FastMetricsEndpoint | None = None
 
     def request_headers(
         self,

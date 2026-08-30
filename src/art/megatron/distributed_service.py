@@ -1918,6 +1918,7 @@ class DistributedMegatronService:
             runtime_source_epoch=credentials.runtime_source_epoch,
             authorization_token=credentials.authorization_token,
             profile=profile,
+            fast_metrics=capabilities.fast_metrics,
         )
 
     def _serving_profile_identity(self) -> ServingProfileIdentity:

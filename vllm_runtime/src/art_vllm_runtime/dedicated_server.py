@@ -1690,7 +1690,14 @@ def main(argv: list[str] | None = None) -> None:
 
         metrics_sidecar = FastMetricsSidecar.start(
             args.host,
-            _auth_tokens,
+            [
+                *_auth_tokens,
+                *(
+                    [_private_dispatch_token]
+                    if _private_dispatch_token is not None
+                    else []
+                ),
+            ],
             process_uuid=process_uuid,
             generation=args.replica_generation,
         )
