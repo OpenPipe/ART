@@ -18,6 +18,7 @@ from .workflow import (
     MANDATORY_VALIDATION_STAGES,
     WORKFLOW_STAGE_DIR_ENV,
     _inspect_architecture_for_workflow,
+    _prune_runtime_artifacts,
     build_validation_report,
     build_validation_stage_names,
     run_lora_coverage_stage,
@@ -864,6 +865,26 @@ def _without_stage_duration(stage: ValidationStageResult) -> dict[str, object]:
     metrics.pop("workflow_pruned_runtime_artifact_dirs", None)
     metrics.pop("workflow_pruned_runtime_artifact_bytes", None)
     return metrics
+
+
+def test_runtime_pruning_retains_vllm_log(tmp_path: Path) -> None:
+    runtime_dir = tmp_path / "attempt" / "megatron_runtime"
+    log_path = runtime_dir / "logs" / "vllm-runtime.log"
+    log_path.parent.mkdir(parents=True)
+    log_path.write_text("runtime failure\n")
+
+    metrics = _prune_runtime_artifacts(tmp_path)
+
+    assert metrics["workflow_pruned_runtime_artifact_dirs"] == 1
+    assert not runtime_dir.exists()
+    assert (
+        tmp_path
+        / "retained_runtime_logs"
+        / "attempt"
+        / "megatron_runtime"
+        / "logs"
+        / "vllm-runtime.log"
+    ).read_text() == "runtime failure\n"
 
 
 def test_build_validation_stage_names_has_fixed_order() -> None:

@@ -299,6 +299,12 @@ def _prune_runtime_artifacts(stage_dir: Path) -> dict[str, int]:
     )
     removed_bytes = 0
     for path in paths:
+        for log_path in path.rglob("vllm-runtime.log"):
+            retained_path = (
+                stage_dir / "retained_runtime_logs" / log_path.relative_to(stage_dir)
+            )
+            retained_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(log_path, retained_path)
         removed_bytes += sum(
             child.stat().st_size for child in path.rglob("*") if child.is_file()
         )
