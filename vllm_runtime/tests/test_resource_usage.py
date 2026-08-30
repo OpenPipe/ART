@@ -37,6 +37,15 @@ def test_gpu_service_conserves_overlapping_world_time() -> None:
     )
 
 
+def test_gpu_service_skips_unattributed_batches_without_reading_the_clock() -> None:
+    tracker = GPUServiceTracker(
+        2,
+        monotonic_ns=lambda: (_ for _ in ()).throw(AssertionError("clock read")),
+    )
+
+    assert tracker.start(_scheduled(a=1, b=1), ()) is None
+
+
 def test_physical_kv_counts_cached_blocks_once_until_eviction() -> None:
     timestamps = iter((10, 20, 30))
     config = SimpleNamespace(

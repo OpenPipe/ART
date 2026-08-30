@@ -3,7 +3,14 @@
 from __future__ import annotations
 
 from collections import deque
-from collections.abc import Iterable, Iterator, Mapping, MutableMapping, Sequence
+from collections.abc import (
+    Collection,
+    Iterable,
+    Iterator,
+    Mapping,
+    MutableMapping,
+    Sequence,
+)
 from concurrent.futures import Future
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -238,7 +245,13 @@ class GPUServiceTracker:
         self._last_ns: int | None = None
         self._lock = RLock()
 
-    def start(self, scheduler_output: Any) -> int | None:
+    def start(
+        self,
+        scheduler_output: Any,
+        tracked_request_ids: Collection[str] | None = None,
+    ) -> int | None:
+        if tracked_request_ids is not None and not tracked_request_ids:
+            return None
         weights = dict(scheduler_output.num_scheduled_tokens)
         if not weights:
             return None
@@ -688,7 +701,10 @@ def _patch_executor(executor_class: type[Any]) -> None:
     def execute_model(self: Any, scheduler_output: Any, non_block: bool = False) -> Any:
         tracker, stages = _gpu_tracking(self)
         pending = stages.register(scheduler_output)
-        sequence = tracker.start(scheduler_output)
+        owners = getattr(scheduler_output, _GPU_OWNERS, None)
+        if not isinstance(owners, Mapping):
+            raise RuntimeError("GPU service owner transport is unavailable")
+        sequence = tracker.start(scheduler_output, owners.keys())
 
         def finish(value: Any) -> Any:
             stages.resolve(pending, value is None)
@@ -710,7 +726,10 @@ def _patch_executor(executor_class: type[Any]) -> None:
     def sample_tokens(self: Any, grammar_output: Any, non_block: bool = False) -> Any:
         tracker, stages = _gpu_tracking(self)
         scheduler_output = stages.claim()
-        sequence = tracker.start(scheduler_output)
+        owners = getattr(scheduler_output, _GPU_OWNERS, None)
+        if not isinstance(owners, Mapping):
+            raise RuntimeError("GPU service owner transport is unavailable")
+        sequence = tracker.start(scheduler_output, owners.keys())
 
         def finish(value: Any) -> Any:
             tracker.finish(sequence, scheduler_output)
@@ -857,6 +876,8 @@ def _patch_kv() -> None:
     def allocate_slots(self: Any, request: Any, *args: Any, **kwargs: Any) -> Any:
         tracker: PhysicalKVTracker = getattr(self.block_pool, _KV_TRACKER)
         owner = request_usage_owner(request)
+        if owner is None:
+            return original_allocate(self, request, *args, **kwargs)
         token = _CURRENT_BLOCK_OWNER.set(None if owner is None else owner.kv_owner)
         try:
             with tracker.batch():
@@ -868,13 +889,17 @@ def _patch_kv() -> None:
 
     def get_new_blocks(self: Any, num_blocks: int) -> list[Any]:
         blocks = original_get(self, num_blocks)
-        getattr(self, _KV_TRACKER).assign(blocks, _CURRENT_BLOCK_OWNER.get())
+        owner = _CURRENT_BLOCK_OWNER.get()
+        if owner is not None:
+            getattr(self, _KV_TRACKER).assign(blocks, owner)
         return blocks
 
     original_touch = BlockPool.touch
 
     def touch(self: Any, blocks: Sequence[Any]) -> None:
-        getattr(self, _KV_TRACKER).assign(blocks, _CURRENT_BLOCK_OWNER.get())
+        owner = _CURRENT_BLOCK_OWNER.get()
+        if owner is not None:
+            getattr(self, _KV_TRACKER).assign(blocks, owner)
         original_touch(self, blocks)
 
     original_free = BlockPool.free_blocks
