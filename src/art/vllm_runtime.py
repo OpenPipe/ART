@@ -354,6 +354,17 @@ def _vllm_runtime_subprocess_env(
     return env
 
 
+def _set_vllm_internal_port_base(env: dict[str, str], visible_devices: str) -> None:
+    if "VLLM_PORT" in env:
+        return
+    device_ids = visible_devices.split(",")
+    if not device_ids or any(not device_id.isdigit() for device_id in device_ids):
+        return
+    port = 20_000 + min(map(int, device_ids)) * 512
+    if port + 511 <= 65_535:
+        env["VLLM_PORT"] = str(port)
+
+
 class ManagedVllmRuntime:
     def __init__(self, *, host: str = "127.0.0.1") -> None:
         self.host = host
@@ -396,6 +407,7 @@ class ManagedVllmRuntime:
         self.log_path = os.path.join(log_dir, "vllm-runtime.log")
         self.log_file = open(self.log_path, "w", buffering=1)
         env = _vllm_runtime_subprocess_env(cmd)
+        _set_vllm_internal_port_base(env, launch_config.visible_devices)
         env.pop("VLLM_API_KEY", None)
         if self.api_key is not None:
             env["VLLM_API_KEY"] = self.api_key

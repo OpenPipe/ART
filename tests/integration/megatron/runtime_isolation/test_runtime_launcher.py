@@ -239,6 +239,23 @@ def test_vllm_runtime_subprocess_env_honors_flashinfer_workspace_override(
     assert env["FLASHINFER_WORKSPACE_BASE"] == str(override)
 
 
+def test_vllm_internal_ports_are_disjoint_per_gpu_allocation() -> None:
+    lower: dict[str, str] = {}
+    upper: dict[str, str] = {}
+    explicit = {"VLLM_PORT": "31000"}
+    opaque: dict[str, str] = {}
+
+    runtime._set_vllm_internal_port_base(lower, "2,3")
+    runtime._set_vllm_internal_port_base(upper, "6,7")
+    runtime._set_vllm_internal_port_base(explicit, "0,1")
+    runtime._set_vllm_internal_port_base(opaque, "GPU-a,GPU-b")
+
+    assert lower["VLLM_PORT"] == "21024"
+    assert upper["VLLM_PORT"] == "23072"
+    assert explicit["VLLM_PORT"] == "31000"
+    assert "VLLM_PORT" not in opaque
+
+
 def test_cleanup_old_managed_runtimes_only_deletes_marked_venvs(
     monkeypatch,
     tmp_path: Path,
