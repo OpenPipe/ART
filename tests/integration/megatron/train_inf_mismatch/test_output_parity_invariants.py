@@ -37,11 +37,20 @@ from .real_path import (
     RealPathConfig,
     _choice_score_index,
     _collect_real_trajectory_groups,
+    _default_adapter_cache_dir,
     _delete_adapter_safetensors_on_pass,
     _real_path_rollout_mode,
     _topk_from_chat_logprob,
     _vllm_scores_from_real_choices,
 )
+
+
+def test_workflow_adapter_cache_stays_outside_the_source_view(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("ART_TRAIN_INF_MISMATCH_ARTIFACTS_ROOT", str(tmp_path))
+
+    assert _default_adapter_cache_dir() == tmp_path / "adapter_cache"
 
 
 def test_choice_score_index_disambiguates_equal_completions_by_prompt() -> None:

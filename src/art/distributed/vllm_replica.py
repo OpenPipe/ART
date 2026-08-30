@@ -621,6 +621,20 @@ class ReplicaManager:
             "data_parallel_size": parallel.dp,
             "enable_expert_parallel": parallel.enable_expert_parallel,
         }
+        if engine_args.get("disable_custom_all_reduce"):
+            raw_compilation = engine_args.get("compilation_config")
+            if raw_compilation is not None and not isinstance(raw_compilation, Mapping):
+                raise ValueError(
+                    "disable_custom_all_reduce requires mapping compilation_config"
+                )
+            compilation = dict(raw_compilation or {})
+            raw_passes = compilation.get("pass_config")
+            if raw_passes is not None and not isinstance(raw_passes, Mapping):
+                raise ValueError("compilation_config.pass_config must be a mapping")
+            passes = dict(raw_passes or {})
+            passes["fuse_allreduce_rms"] = False
+            compilation["pass_config"] = passes
+            engine_args["compilation_config"] = compilation
         if self._spec.model_revision is not None:
             engine_args.update(
                 revision=self._spec.model_revision,

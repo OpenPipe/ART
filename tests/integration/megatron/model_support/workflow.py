@@ -638,6 +638,7 @@ def run_train_inf_mismatch_stage(
     report = train_inf_mismatch.run_train_inf_mismatch(
         base_model=base_model,
         allow_unvalidated_arch=allow_unvalidated_arch,
+        artifacts_root=_workflow_stage_dir() / "train_inf_mismatch_attempts",
     )
     return ValidationStageResult(
         name="train_inf_mismatch",

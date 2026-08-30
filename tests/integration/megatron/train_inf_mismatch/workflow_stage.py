@@ -7,7 +7,12 @@ from typing import Literal
 
 from pydantic import BaseModel
 
-from .artifacts import REPO_ROOT, TEST_ROOT, create_artifact_dir
+from .artifacts import (
+    ARTIFACTS_ROOT_ENV,
+    REPO_ROOT,
+    TEST_ROOT,
+    create_artifact_dir,
+)
 
 DEFAULT_ATTEMPTS = 3
 MAX_ATTEMPTS = 5
@@ -143,9 +148,14 @@ def run_train_inf_mismatch(
     *,
     base_model: str,
     allow_unvalidated_arch: bool = False,
+    artifacts_root: Path | None = None,
 ) -> TrainInfMismatchReport:
     started = time.monotonic()
-    artifact_dir = create_artifact_dir("workflow::train_inf_mismatch")
+    artifact_dir = (
+        create_artifact_dir("workflow::train_inf_mismatch")
+        if artifacts_root is None
+        else create_artifact_dir("workflow::train_inf_mismatch", artifacts_root)
+    )
     max_attempts = _attempt_limit()
     env = os.environ.copy()
     env["BASE_MODEL"] = base_model
@@ -154,6 +164,8 @@ def run_train_inf_mismatch(
     env["ART_TRAIN_INF_MISMATCH_ALLOW_UNVALIDATED_ARCH"] = (
         "1" if allow_unvalidated_arch else "0"
     )
+    if artifacts_root is not None:
+        env[ARTIFACTS_ROOT_ENV] = str(artifacts_root)
     env["ART_REAL_PATH_MAX_COMPLETION_TOKENS"] = "16"
     env.setdefault("ART_TRAIN_INF_MISMATCH_VLLM_GPU_MEMORY_UTILIZATION", "0.50")
     existing_pythonpath = env.get("PYTHONPATH")

@@ -406,6 +406,8 @@ def config_from_env() -> TrainInfOutputParityConfig:
             **stage_resources.megatron_env,
             **config.megatron_env,
         }
+    if len(config.inference_gpu_ids) > 1:
+        config.engine_args.setdefault("disable_custom_all_reduce", True)
     if raw_modes := os.environ.get("ART_TRAIN_INF_MISMATCH_ROLLOUT_MODES"):
         config.rollout_modes = _parse_rollout_modes(raw_modes)
     if raw_seq_len := os.environ.get("ART_TRAIN_INF_MISMATCH_SEQUENCE_LENGTH"):

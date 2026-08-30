@@ -35,7 +35,7 @@ from art.preprocessing.policy_spans import (
 )
 from art.preprocessing.vllm_tokens import choice_vllm_token_metadata
 
-from .artifacts import REPO_ROOT
+from .artifacts import ARTIFACTS_ROOT_ENV, REPO_ROOT
 from .output_parity import (
     TOP_K,
     LogicalToken,
@@ -1293,6 +1293,8 @@ def _adapter_cache_key(config: TrainInfOutputParityConfig) -> str:
 
 
 def _default_adapter_cache_dir() -> Path:
+    if artifacts_root := os.environ.get(ARTIFACTS_ROOT_ENV):
+        return Path(artifacts_root) / "adapter_cache"
     return REPO_ROOT / "scratch" / "train_inf_mismatch_adapters"
 
 

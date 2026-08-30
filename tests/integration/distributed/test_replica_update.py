@@ -164,6 +164,23 @@ def test_launch_preserves_user_args_and_owns_native_gang_topology() -> None:
     assert "kv_events_config" not in leader.engine_args
 
 
+def test_disabled_custom_all_reduce_disables_fused_compiler_pass() -> None:
+    value = manager(
+        engine_args={
+            "disable_custom_all_reduce": True,
+            "compilation_config": {"pass_config": {"fuse_norm_quant": True}},
+        }
+    )
+    launch = value._launch_request(value.spec.members[0]).launch_config
+
+    assert launch.engine_args["compilation_config"] == {
+        "pass_config": {
+            "fuse_norm_quant": True,
+            "fuse_allreduce_rms": False,
+        }
+    }
+
+
 def test_conflicting_untyped_revision_is_rejected() -> None:
     value = manager()
     with pytest.raises(ValueError, match="revision conflicts"):
