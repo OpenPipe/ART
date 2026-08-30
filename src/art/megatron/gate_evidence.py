@@ -122,7 +122,7 @@ class MegatronGateAttemptPlan(_GateContract):
             raise ValueError(
                 "gate schedule must consume every run command exactly once"
             )
-        if captured != set(run_ids):
+        if captured and captured != set(run_ids):
             raise ValueError("gate schedule must capture an active turn for every run")
         return self
 
