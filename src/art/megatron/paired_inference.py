@@ -94,7 +94,12 @@ class MegatronPairedInferencePublisher:
         profile = _serving_profile_identity(runtime, runtime_spec, base_model)
         template = ReplicaLaunchTemplate(
             served_model_name=service.name,
-            engine_args=_engine_args(config, service.temporal_gpu_sharing, base_model),
+            engine_args=_engine_args(
+                config,
+                service.temporal_gpu_sharing,
+                base_model,
+                enable_moe_routing_replay=runtime_spec.enable_moe_routing_replay,
+            ),
             server_args=_server_args(config, base_model),
             serving_profile_identity=profile,
         )
@@ -484,6 +489,8 @@ def _engine_args(
     config: dev.BackendModelConfig,
     temporal_gpu_sharing: bool,
     base_model: str,
+    *,
+    enable_moe_routing_replay: bool,
 ) -> dict[str, object]:
     allow_unvalidated = bool(config.get("allow_unvalidated_arch", False))
     handler = get_model_support_handler(
@@ -494,6 +501,7 @@ def _engine_args(
         values.setdefault(key, value)
     values["enable_sleep_mode"] = temporal_gpu_sharing
     values["enable_lora"] = True
+    values["enable_return_routed_experts"] = enable_moe_routing_replay
     values.setdefault("max_loras", 2)
     values.setdefault("generation_config", "vllm")
     for key in ("model", "served_model_name"):

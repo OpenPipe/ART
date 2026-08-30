@@ -2024,6 +2024,9 @@ class DistributedMegatronService:
             values.setdefault(key, value)
         values["enable_sleep_mode"] = self._temporal_gpu_sharing
         values["enable_lora"] = True
+        values["enable_return_routed_experts"] = (
+            self._runtime_spec().enable_moe_routing_replay
+        )
         values.setdefault("max_loras", 2)
         values.setdefault("generation_config", "vllm")
         for key in ("model", "served_model_name"):
