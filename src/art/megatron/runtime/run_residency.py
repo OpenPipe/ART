@@ -392,6 +392,53 @@ class RunResidencyManager:
     def ensure_l2(self, key: ResidencyKey) -> Future[HostTensorImage]:
         return self._ensure_l2(key, protected={key})
 
+    def prefetch_l2_from_lower(
+        self, key: ResidencyKey
+    ) -> Future[HostTensorImage] | None:
+        """Materialize an immutable L3 copy in L2 without snapshotting live L1."""
+
+        self._require_open()
+        protected = {key}
+        with self._lock:
+            self._require_not_retiring(key)
+            state = self._state(key)
+            if state.l2 is not None:
+                return _resolved_future(state.l2)
+            if state.l2_future is not None:
+                return state.l2_future
+            if not self.ledger.has_copy(key, "l3_nvme"):
+                return None
+            if state.l3_manifest is None:
+                raise RuntimeError("L3 residency has no committed manifest")
+            byte_count = state.l3_manifest.payload_bytes
+        with self._admission_locks["l2_cpu"]:
+            with self._lock:
+                state = self._state(key)
+                if state.l2 is not None:
+                    return _resolved_future(state.l2)
+                if state.l2_future is not None:
+                    return state.l2_future
+                if not self.ledger.has_copy(key, "l3_nvme"):
+                    return None
+            self._reclaim("l2_cpu", byte_count, protected=protected)
+            with self._lock:
+                state = self._state(key)
+                if state.l2 is not None:
+                    return _resolved_future(state.l2)
+                if state.l2_future is not None:
+                    return state.l2_future
+                if not self.ledger.has_copy(key, "l3_nvme"):
+                    return None
+                reservation = self._reserve(
+                    key,
+                    source="l3_nvme",
+                    target="l2_cpu",
+                    byte_count=byte_count,
+                )
+                future = self._submit(self._restore_l2, state, reservation)
+                state.l2_future = future
+                return future
+
     def _ensure_l2(
         self, key: ResidencyKey, *, protected: set[ResidencyKey]
     ) -> Future[HostTensorImage]:

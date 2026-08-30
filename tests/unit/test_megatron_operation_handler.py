@@ -358,6 +358,12 @@ async def test_slot_resources_keep_only_one_command_ahead_under_pressure() -> No
             self.attempts: list[str] = []
             self.admitted: set[str] = set()
 
+        async def prefetch_command_run_residency(
+            self, run_id, components, learner_version
+        ):
+            del run_id, components, learner_version
+            return {}
+
         async def admit_command_run_residency(
             self, operation_id, run_id, components, learner_version
         ):

@@ -896,7 +896,10 @@ class MCoreRunSlotExecutor:
     ) -> dict[str, Any]:
         state = self._require_residency_parent(run_id, learner_version)
         keys = self._component_keys(state, components)
-        self._residency.prefetch_l1_working_set(keys)
+        for key in keys:
+            lower = self._residency.prefetch_l2_from_lower(key)
+            if lower is not None:
+                lower.result()
         return self._residency_evidence(run_id, None, components, keys)
 
     def admit_residency(

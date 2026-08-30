@@ -205,6 +205,11 @@ class TrainerMegatronSlotResources:
     ) -> dict[str, Any]:
         acquired = False
         try:
+            await self._trainer.prefetch_command_run_residency(
+                request.run_id,
+                request.components,
+                request.source.policy_step,
+            )
             await self._admission_slots.acquire()
             acquired = True
             async with self._prepare_lock:
