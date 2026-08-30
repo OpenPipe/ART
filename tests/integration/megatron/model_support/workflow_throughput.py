@@ -1964,22 +1964,14 @@ async def _run_e2e_throughput_async(
                 int,
                 asyncio.Task[tuple[tuple[Any, ...], str, str, dict[str, int]]],
             ] = {}
-            capture_requests: dict[
-                int, tuple[Any, tuple[Any, ...], dict[str, int]]
-            ] = {}
             original_train = backend.train
             original_finish_training_batch = backend._finish_training_batch
             train_call_count = 0
 
             async def finish_training_batch(batch: Any, *, failed: bool) -> None:
                 failures = []
-                request = capture_requests.pop(id(batch), None)
-                if request is not None:
-                    prepared, selections, settings = request
-                    capture_task = asyncio.create_task(
-                        _capture_training_input(prepared, selections, settings)
-                    )
-                    capture_tasks[id(batch)] = capture_task
+                capture_task = capture_tasks.get(id(batch))
+                if capture_task is not None:
                     try:
                         await capture_task
                     except BaseException as error:
@@ -2014,15 +2006,22 @@ async def _run_e2e_throughput_async(
                                 "prepared throughput batch lacks exact queue selections"
                             )
                         captured_batch_id = id(prepared.batch)
-                        capture_requests[captured_batch_id] = (
-                            prepared,
-                            selections,
-                            _current_pipeline_settings(trainer),
+                        capture_tasks[captured_batch_id] = asyncio.create_task(
+                            _capture_training_input(
+                                prepared,
+                                selections,
+                                _current_pipeline_settings(trainer),
+                            )
                         )
                     except BaseException:
                         await _discard_prepared_pipeline_batch(backend, groups)
                         raise
-                result = await original_train(*args, **kwargs)
+                try:
+                    result = await original_train(*args, **kwargs)
+                except BaseException:
+                    if captured_batch_id is not None:
+                        capture_tasks.pop(captured_batch_id, None)
+                    raise
                 step = int(result.step)
                 if step in activation_tasks:
                     raise RuntimeError(
