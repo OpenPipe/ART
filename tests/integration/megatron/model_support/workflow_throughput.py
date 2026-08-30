@@ -49,7 +49,6 @@ _STALE_GROUPS = "discarded/step/stale_groups"
 _ZERO_VARIANCE_GROUPS = "discarded/step/zero_variance_groups"
 _INTER_FORWARD_BACKWARD_GAP_PREFIX = "time/inter_forward_backward_gpu_gap_rank_"
 _MEASUREMENT_CONTRACT_VERSION = 21
-_THROUGHPUT_SHARED_PREFIX_UNITS = 32
 _ISOLATED_WARMUP_STEPS = 1
 _MATCHED_MEASURED_STEPS = 3
 _PACKING_DRAIN_WINDOWS = 1
@@ -996,18 +995,16 @@ def _chat_token_count(tokenizer: Any, prompt: str) -> int:
 def _sized_prompt(tokenizer: Any, *, target_tokens: int) -> str:
     prefix = "Process the following neutral record.\n"
     unit = " measured context item"
-    shared_units = min(_THROUGHPUT_SHARED_PREFIX_UNITS, max(1, target_tokens // 12))
-    prefix += unit * shared_units
-    discriminator = "\nThroughput scenario 00000000.\n"
+    suffix = "\nThroughput scenario 00000000."
     lower, upper = 0, target_tokens
     while lower < upper:
         middle = (lower + upper + 1) // 2
-        candidate = prefix + discriminator + unit * middle
+        candidate = prefix + unit * middle + suffix
         if _chat_token_count(tokenizer, candidate) <= target_tokens:
             lower = middle
         else:
             upper = middle - 1
-    prompt = prefix + discriminator + unit * lower
+    prompt = prefix + unit * lower + suffix
     actual = _chat_token_count(tokenizer, prompt)
     if actual < target_tokens - 64:
         raise RuntimeError(
