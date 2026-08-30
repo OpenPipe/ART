@@ -276,6 +276,12 @@ def _uv() -> str:
     raise RuntimeError("HybridEP setup requires uv")
 
 
+def _environment_install_lock() -> Path:
+    environment = Path(sys.prefix).resolve()
+    environment.mkdir(parents=True, exist_ok=True)
+    return environment / ".art-hybrid-ep.install.lock"
+
+
 def _build_wheel(build_version: str, arch_list: str) -> Path:
     uv = _uv()
     cache = _cache_root() / build_version
@@ -319,32 +325,38 @@ def _build_wheel(build_version: str, arch_list: str) -> Path:
 
 
 def setup_hybrid_ep() -> str:
-    build_version, arch_list = _build_identity()
-    if _installed_version() != build_version:
-        wheel = _build_wheel(build_version, arch_list)
-        subprocess.run(
-            [
-                _uv(),
-                "pip",
-                "install",
-                "--python",
-                sys.executable,
-                "--reinstall",
-                "--no-deps",
-                str(wheel),
-            ],
-            check=True,
-        )
-    subprocess.run(
-        [
-            sys.executable,
-            "-c",
-            "import deep_ep, hybrid_ep_cpp; "
-            f"assert hybrid_ep_cpp.SM_ARCH == {arch_list!r}",
-        ],
-        check=True,
-    )
-    return build_version
+    lock_path = _environment_install_lock()
+    with lock_path.open("w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            build_version, arch_list = _build_identity()
+            if _installed_version() != build_version:
+                wheel = _build_wheel(build_version, arch_list)
+                subprocess.run(
+                    [
+                        _uv(),
+                        "pip",
+                        "install",
+                        "--python",
+                        sys.executable,
+                        "--reinstall",
+                        "--no-deps",
+                        str(wheel),
+                    ],
+                    check=True,
+                )
+            subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    "import deep_ep, hybrid_ep_cpp; "
+                    f"assert hybrid_ep_cpp.SM_ARCH == {arch_list!r}",
+                ],
+                check=True,
+            )
+            return build_version
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
 
 
 def validate_hybrid_ep(*, require_multinode: bool = False) -> None:
