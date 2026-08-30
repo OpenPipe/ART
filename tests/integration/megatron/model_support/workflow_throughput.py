@@ -988,17 +988,18 @@ def _chat_token_count(tokenizer: Any, prompt: str) -> int:
 
 
 def _sized_prompt(tokenizer: Any, *, target_tokens: int) -> str:
-    prefix = "Throughput scenario 00000000. Process the following neutral record.\n"
+    prefix = "Process the following neutral record.\n"
     unit = " measured context item"
+    suffix = "\nThroughput scenario 00000000."
     lower, upper = 0, target_tokens
     while lower < upper:
         middle = (lower + upper + 1) // 2
-        candidate = prefix + unit * middle
+        candidate = prefix + unit * middle + suffix
         if _chat_token_count(tokenizer, candidate) <= target_tokens:
             lower = middle
         else:
             upper = middle - 1
-    prompt = prefix + unit * lower
+    prompt = prefix + unit * lower + suffix
     actual = _chat_token_count(tokenizer, prompt)
     if actual < target_tokens - 64:
         raise RuntimeError(
