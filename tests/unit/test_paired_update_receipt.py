@@ -3,7 +3,10 @@ from types import SimpleNamespace
 import httpx
 import pytest
 
-from art.megatron.paired_inference import MegatronPairedInferencePublisher
+from art.megatron.paired_inference import (
+    MegatronPairedInferencePublisher,
+    _paired_lora_transport,
+)
 
 
 class _ReceiptClient:
@@ -31,6 +34,27 @@ def _publisher() -> MegatronPairedInferencePublisher:
     )
     publisher.api_key = "secret"
     return publisher
+
+
+def test_paired_lora_transport_follows_resolved_placement() -> None:
+    spec = SimpleNamespace(
+        trainer_mesh=SimpleNamespace(ranks=(SimpleNamespace(host_id="trainer"),))
+    )
+
+    assert (
+        _paired_lora_transport(
+            spec,
+            SimpleNamespace(members=(SimpleNamespace(host_id="trainer"),)),
+        )
+        == "local"
+    )
+    assert (
+        _paired_lora_transport(
+            spec,
+            SimpleNamespace(members=(SimpleNamespace(host_id="inference"),)),
+        )
+        == "nixl"
+    )
 
 
 @pytest.mark.asyncio

@@ -93,7 +93,7 @@ class MegatronPairedInferencePublisher:
         if len(services) != 1:
             raise RuntimeError("paired slot requires one matching inference service")
         service = services[0]
-        profile = _serving_profile_identity(runtime, runtime_spec, base_model)
+        profile = _serving_profile_identity(runtime, runtime_spec, base_model, service)
         template = ReplicaLaunchTemplate(
             served_model_name=service.name,
             engine_args=_engine_args(
@@ -168,12 +168,12 @@ class MegatronPairedInferencePublisher:
             self._require_open()
             manager = self.runtime.model_service(self.service.name)
             await self._release_pending_transfers()
-            trainer_host = self.trainer.runtime_spec.trainer_mesh.ranks[0].host_id
-            inference_hosts = {member.host_id for member in self.service.members}
             targets = await manager.prepare_adapter_transfer(
                 generation.generation_id,
                 template_adapter_path,
-                transport="local" if inference_hosts == {trainer_host} else "nixl",
+                transport=_paired_lora_transport(
+                    self.trainer.runtime_spec, self.service
+                ),
             )
             if not targets:
                 raise RuntimeError("paired inference returned no transfer targets")
@@ -483,6 +483,7 @@ def _serving_profile_identity(
     runtime: ArtRuntime,
     spec: TrainerRuntimeSpec,
     base_model: str,
+    service: ModelServiceSpec,
 ) -> ServingProfileIdentity:
     retained_routes = runtime.retained_route_prefetch_enabled
     return ServingProfileIdentity(
@@ -496,7 +497,7 @@ def _serving_profile_identity(
         lora_target_modules=spec.lora_target_modules,
         trainer_dtype=spec.dtype,
         route_replay=spec.enable_moe_routing_replay,
-        lora_transport="nixl" if runtime.nixl_transport else "local",
+        lora_transport=_paired_lora_transport(spec, service),
         retained_route_transport=runtime.retained_route_transport,
         retained_route_max_bytes=(
             runtime.config.route_bundle_prefetch_capacity_bytes
@@ -507,6 +508,14 @@ def _serving_profile_identity(
             runtime.config.route_bundle_prefetch_max_bundles if retained_routes else 0
         ),
     )
+
+
+def _paired_lora_transport(
+    spec: TrainerRuntimeSpec, service: ModelServiceSpec
+) -> Literal["local", "nixl"]:
+    trainer_host = spec.trainer_mesh.ranks[0].host_id
+    inference_hosts = {member.host_id for member in service.members}
+    return "local" if inference_hosts == {trainer_host} else "nixl"
 
 
 def _validate_serving_profile(
