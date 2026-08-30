@@ -3,6 +3,7 @@
 import asyncio
 from dataclasses import dataclass, field
 from functools import cached_property
+import hashlib
 import logging
 import os
 from typing import Any, AsyncIterator, Literal, TypedDict, cast
@@ -364,13 +365,17 @@ class UnslothService:
             "policy_token_spans", operation="In-flight LoRA updates"
         )
         async with httpx.AsyncClient() as client:
+            generation_id = self._generation_id(step)
             response = await client.post(
                 f"{self._vllm_base_url}/art/in_flight_lora_update",
                 json={
+                    "operation_id": hashlib.sha256(
+                        f"unsloth:{self._in_flight_lora_slot}:{generation_id}".encode()
+                    ).hexdigest(),
                     "model_name": self._in_flight_lora_slot,
                     "lora_slot": self._in_flight_lora_slot,
                     "lora_path": checkpoint_path,
-                    "generation_id": self._generation_id(step),
+                    "generation_id": generation_id,
                     "expected_generation_id": self._generation_id(self._latest_step),
                     "policy_version": step,
                 },

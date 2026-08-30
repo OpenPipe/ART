@@ -2,6 +2,7 @@ from http.client import HTTPConnection
 import json
 import os
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import AsyncMock
 
 from art_vllm_runtime import dedicated_server
@@ -127,6 +128,70 @@ def test_fast_metrics_listener_stops_and_restarts_on_same_port() -> None:
         connection.close()
         restarted.close()
     assert restarted.process.poll() == 0
+
+
+@pytest.mark.asyncio
+async def test_lora_update_receipts_replay_exact_terminal_result() -> None:
+    receipts = dedicated_server._LoraUpdateReceipts(2)
+    assert await receipts.claim("operation-1", "a" * 64) is None
+    await receipts.settle(
+        "operation-1",
+        "a" * 64,
+        response_status=200,
+        response={"status": "updated", "apply_s": 0.25},
+    )
+
+    replay = await receipts.claim("operation-1", "a" * 64)
+    assert replay is not None
+    assert dedicated_server._lora_update_receipt_payload("operation-1", replay) == {
+        "operation_id": "operation-1",
+        "state": "settled",
+        "response_status": 200,
+        "response": {"status": "updated", "apply_s": 0.25},
+    }
+
+    conflict = await receipts.claim("operation-1", "b" * 64)
+    assert conflict is replay
+
+
+@pytest.mark.asyncio
+async def test_lora_update_receipts_do_not_evict_live_operations() -> None:
+    receipts = dedicated_server._LoraUpdateReceipts(2)
+    assert await receipts.claim("operation-1", "a" * 64) is None
+    assert await receipts.claim("operation-2", "b" * 64) is None
+    with pytest.raises(RuntimeError, match="capacity exhausted"):
+        await receipts.claim("operation-3", "c" * 64)
+
+    await receipts.mark_ambiguous("operation-1", "a" * 64)
+    assert await receipts.claim("operation-3", "c" * 64) is None
+    assert await receipts.get("operation-1") is None
+
+
+def test_lora_update_fingerprint_excludes_only_operation_identity() -> None:
+    common: dict[str, Any] = {
+        "model_name": "policy:active",
+        "lora_path": "/adapter/generation-2",
+        "generation_id": "generation-2",
+        "expected_generation_id": "generation-1",
+        "policy_version": 2,
+        "lora_slot": "policy:active",
+    }
+    first = dedicated_server._InFlightLoraUpdateRequest(
+        operation_id="operation-1", **common
+    )
+    replay = dedicated_server._InFlightLoraUpdateRequest(
+        operation_id="operation-2", **common
+    )
+    changed = dedicated_server._InFlightLoraUpdateRequest(
+        operation_id="operation-1", **{**common, "generation_id": "generation-3"}
+    )
+
+    assert dedicated_server._lora_update_fingerprint(
+        first
+    ) == dedicated_server._lora_update_fingerprint(replay)
+    assert dedicated_server._lora_update_fingerprint(
+        first
+    ) != dedicated_server._lora_update_fingerprint(changed)
 
 
 def test_fast_metrics_url_uses_controller_routable_host(monkeypatch) -> None:

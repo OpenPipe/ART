@@ -12,7 +12,7 @@ from pydantic import (
     model_validator,
 )
 
-ART_SERVING_PROTOCOL_VERSION = 9
+ART_SERVING_PROTOCOL_VERSION = 10
 
 ART_PRIVATE_CACHE_IDENTITY_HEADER = "x-art-cache-identity"
 ART_PRIVATE_REQUEST_IDENTITY_HEADER = "x-art-request-identity"

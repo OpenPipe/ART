@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+from http import HTTPStatus
 import json
+import math
 from pathlib import Path
 import time
 from typing import Any, Literal, cast
@@ -225,6 +227,7 @@ class MegatronPairedInferencePublisher:
                 else None
             )
             payload: dict[str, object] = {
+                "operation_id": operation.operation_id,
                 "model_name": runtime_lora_name,
                 "lora_slot": runtime_lora_name,
                 "lora_path": map_checkpoint_path_for_vllm(self.config, checkpoint),
@@ -233,9 +236,8 @@ class MegatronPairedInferencePublisher:
                 "policy_version": generation.policy_step,
             }
             try:
-                update_apply_started = time.monotonic()
                 response = await self._post_update(payload)
-                update_apply_s = time.monotonic() - update_apply_started
+                update_apply_s = _response_float(response, "apply_s")
                 update_sequence = _response_int(response, "update_seq")
                 update_identity = str(response["update_identity"])
                 if (
@@ -371,16 +373,69 @@ class MegatronPairedInferencePublisher:
     async def _post_update(self, payload: dict[str, object]) -> dict[str, object]:
         url = f"{self.service.leader_endpoint.url}/art/in_flight_lora_update"
         async with httpx.AsyncClient(timeout=60.0) as client:
-            response = await client.post(
-                url,
-                json=payload,
-                headers=_headers(self.api_key),
-            )
+            try:
+                response = await client.post(
+                    url,
+                    json=payload,
+                    headers=_headers(self.api_key),
+                )
+            except httpx.TransportError as error:
+                return await self._recover_update_receipt(client, payload, error)
         response.raise_for_status()
-        value = response.json()
-        if not isinstance(value, dict):
-            raise RuntimeError("paired holder returned a non-object receipt")
-        return cast(dict[str, object], value)
+        return _response_object(response)
+
+    async def _recover_update_receipt(
+        self,
+        client: Any,
+        payload: dict[str, object],
+        original_error: httpx.TransportError,
+    ) -> dict[str, object]:
+        url = f"{self.service.leader_endpoint.url}/art/in_flight_lora_update/receipt"
+        deadline = asyncio.get_running_loop().time() + 5.0
+        last_error: BaseException = original_error
+        while True:
+            try:
+                response = await client.post(
+                    url,
+                    json=payload,
+                    headers=_headers(self.api_key),
+                    timeout=1.0,
+                )
+                if response.status_code == HTTPStatus.NOT_FOUND.value:
+                    state = "missing"
+                else:
+                    response.raise_for_status()
+                    receipt = _response_object(response)
+                    state = str(receipt.get("state"))
+                    if state == "settled":
+                        status = receipt.get("response_status")
+                        value = receipt.get("response")
+                        if (
+                            isinstance(status, bool)
+                            or not isinstance(status, int)
+                            or not isinstance(value, dict)
+                        ):
+                            raise RuntimeError(
+                                "paired holder returned an invalid update receipt"
+                            )
+                        if not 200 <= status < 300:
+                            raise RuntimeError(
+                                "paired holder update failed before its response "
+                                f"was received: {value!r}"
+                            ) from original_error
+                        return cast(dict[str, object], value)
+                    if state == "ambiguous":
+                        raise RuntimeError(
+                            "paired holder update outcome is ambiguous"
+                        ) from original_error
+            except httpx.TransportError as error:
+                last_error = error
+                state = "unreachable"
+            if asyncio.get_running_loop().time() >= deadline:
+                raise RuntimeError(
+                    f"paired holder update outcome could not be reconciled ({state})"
+                ) from last_error
+            await asyncio.sleep(0.05)
 
     async def _release_pending_transfers(self) -> None:
         for name, (manager, generation_id) in tuple(self._retained_transfers.items()):
@@ -536,6 +591,25 @@ def _api_key(config: dev.BackendModelConfig) -> str | None:
 
 def _headers(api_key: str | None) -> dict[str, str] | None:
     return None if api_key is None else {"Authorization": f"Bearer {api_key}"}
+
+
+def _response_object(response: httpx.Response) -> dict[str, object]:
+    value = response.json()
+    if not isinstance(value, dict):
+        raise RuntimeError("paired holder returned a non-object receipt")
+    return cast(dict[str, object], value)
+
+
+def _response_float(response: dict[str, object], field: str) -> float:
+    value = response.get(field)
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+        or value < 0
+    ):
+        raise RuntimeError(f"paired holder returned invalid {field}")
+    return float(value)
 
 
 def _response_int(response: dict[str, object], field: str) -> int:

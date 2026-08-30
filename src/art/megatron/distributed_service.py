@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager, nullcontext
+import hashlib
 import logging
 import os
 from pathlib import Path
@@ -2133,6 +2134,9 @@ class DistributedMegatronService:
         )
         payload = (
             {
+                "operation_id": hashlib.sha256(
+                    f"megatron:{name}:{self._generation_id_for_step(step)}".encode()
+                ).hexdigest(),
                 "model_name": name,
                 "lora_slot": name,
                 "lora_path": path,

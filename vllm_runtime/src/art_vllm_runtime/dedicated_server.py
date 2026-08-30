@@ -14,6 +14,7 @@ import json
 import os
 import re
 import socket
+import time
 from typing import Any
 import uuid
 
@@ -46,11 +47,12 @@ from art_vllm_runtime.runtime_usage import (
     runtime_usage_journal,
 )
 
-ART_SERVING_PROTOCOL_VERSION = 9
+ART_SERVING_PROTOCOL_VERSION = 10
 _PRIVATE_CACHE_IDENTITY_HEADER = "x-art-cache-identity"
 _PRIVATE_DISPATCH_PATH = "/art/internal/v1/chat/completions"
 _PRIVATE_EXECUTION_RECEIPT_CAPACITY = 4096
 _PRIVATE_EXECUTION_RECEIPT_PREFIX = "/art/internal/v1/requests"
+_LORA_UPDATE_RECEIPT_CAPACITY = 4096
 _PRIVATE_REQUEST_IDENTITY_HEADER = "x-art-request-identity"
 _PRIVATE_ROUTE_CAPTURE_HEADER = "x-art-route-capture"
 _PRIVATE_ROUTE_MAX_BYTES_HEADER = "x-art-route-max-bytes"
@@ -132,6 +134,87 @@ class _PrivateExecutionReceipts:
     async def get(self, request_identity: str) -> _PrivateExecutionReceipt | None:
         async with self._lock:
             return self._receipts.get(request_identity)
+
+
+@dataclass(frozen=True)
+class _LoraUpdateReceipt:
+    fingerprint: str
+    state: str
+    response_status: int | None = None
+    response_json: str | None = None
+
+
+class _LoraUpdateReceipts:
+    """Bound operation-keyed holder results for exact lost-response recovery."""
+
+    def __init__(self, capacity: int) -> None:
+        if capacity < 1:
+            raise ValueError("LoRA update receipt capacity must be positive")
+        self.capacity = capacity
+        self._lock = asyncio.Lock()
+        self._receipts: OrderedDict[str, _LoraUpdateReceipt] = OrderedDict()
+
+    async def claim(
+        self, operation_id: str, fingerprint: str
+    ) -> _LoraUpdateReceipt | None:
+        async with self._lock:
+            existing = self._receipts.get(operation_id)
+            if existing is not None:
+                self._receipts.move_to_end(operation_id)
+                return existing
+            if len(self._receipts) >= self.capacity:
+                terminal = next(
+                    (
+                        identity
+                        for identity, receipt in self._receipts.items()
+                        if receipt.state != "started"
+                    ),
+                    None,
+                )
+                if terminal is None:
+                    raise RuntimeError("LoRA update receipt capacity exhausted")
+                self._receipts.pop(terminal)
+            self._receipts[operation_id] = _LoraUpdateReceipt(
+                fingerprint=fingerprint,
+                state="started",
+            )
+            return None
+
+    async def settle(
+        self,
+        operation_id: str,
+        fingerprint: str,
+        *,
+        response_status: int,
+        response: dict[str, object],
+    ) -> None:
+        response_json = json.dumps(response, sort_keys=True, separators=(",", ":"))
+        async with self._lock:
+            current = self._receipts.get(operation_id)
+            if current is None or current.fingerprint != fingerprint:
+                raise RuntimeError("LoRA update receipt identity changed")
+            self._receipts[operation_id] = _LoraUpdateReceipt(
+                fingerprint=fingerprint,
+                state="settled",
+                response_status=response_status,
+                response_json=response_json,
+            )
+            self._receipts.move_to_end(operation_id)
+
+    async def mark_ambiguous(self, operation_id: str, fingerprint: str) -> None:
+        async with self._lock:
+            current = self._receipts.get(operation_id)
+            if current is None or current.fingerprint != fingerprint:
+                raise RuntimeError("LoRA update receipt identity changed")
+            self._receipts[operation_id] = _LoraUpdateReceipt(
+                fingerprint=fingerprint,
+                state="ambiguous",
+            )
+            self._receipts.move_to_end(operation_id)
+
+    async def get(self, operation_id: str) -> _LoraUpdateReceipt | None:
+        async with self._lock:
+            return self._receipts.get(operation_id)
 
 
 @dataclass(frozen=True)
@@ -263,6 +346,7 @@ class _PrivateRouteResponses:
 _private_execution_receipts = _PrivateExecutionReceipts(
     _PRIVATE_EXECUTION_RECEIPT_CAPACITY
 )
+_lora_update_receipts = _LoraUpdateReceipts(_LORA_UPDATE_RECEIPT_CAPACITY)
 _private_route_responses = _PrivateRouteResponses()
 
 
@@ -676,6 +760,7 @@ class _RuntimeUsageAckRequest(BaseModel):
 
 
 class _InFlightLoraUpdateRequest(BaseModel):
+    operation_id: str = Field(min_length=1, max_length=64)
     model_name: str = Field(min_length=1)
     lora_path: str = Field(min_length=1)
     generation_id: str = Field(min_length=1)
@@ -684,6 +769,31 @@ class _InFlightLoraUpdateRequest(BaseModel):
     lora_slot: str | None = Field(default=None, min_length=1)
     base_model_name: str | None = None
     is_3d_lora_weight: bool = False
+
+
+def _lora_update_fingerprint(body: _InFlightLoraUpdateRequest) -> str:
+    payload = body.model_dump_json(exclude={"operation_id"})
+    return hashlib.sha256(payload.encode()).hexdigest()
+
+
+def _lora_update_receipt_payload(
+    operation_id: str, receipt: _LoraUpdateReceipt
+) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "operation_id": operation_id,
+        "state": receipt.state,
+    }
+    if receipt.state == "settled":
+        if receipt.response_status is None or receipt.response_json is None:
+            raise RuntimeError("settled LoRA update receipt is incomplete")
+        response = json.loads(receipt.response_json)
+        if not isinstance(response, dict):
+            raise RuntimeError("settled LoRA update response is not an object")
+        payload.update(
+            response_status=receipt.response_status,
+            response=response,
+        )
+    return payload
 
 
 def _index_shared_pp_partition(config: Any, pp_size: int) -> tuple[int, ...] | None:
@@ -1332,21 +1442,88 @@ def _patch_art_runtime_routes() -> None:
             models = raw_request.app.state.openai_serving_models
             engine_client = engine(raw_request)
             coordinator = lora_update_coordinator(models, engine_client)
+            fingerprint = _lora_update_fingerprint(body)
+            try:
+                existing = await _lora_update_receipts.claim(
+                    body.operation_id, fingerprint
+                )
+            except RuntimeError:
+                return JSONResponse(
+                    content={
+                        "error": "LoRA update receipt capacity is exhausted",
+                        "type": "receipt_capacity_exhausted",
+                        "execution": "not_started",
+                    },
+                    status_code=HTTPStatus.SERVICE_UNAVAILABLE.value,
+                )
+            if existing is not None:
+                if existing.fingerprint != fingerprint:
+                    return JSONResponse(
+                        content={
+                            "error": "LoRA update operation identity was reused",
+                            "type": "operation_identity_conflict",
+                            "execution": "not_started",
+                        },
+                        status_code=HTTPStatus.CONFLICT.value,
+                    )
+                if existing.state == "settled":
+                    if (
+                        existing.response_status is None
+                        or existing.response_json is None
+                    ):
+                        raise RuntimeError("settled LoRA update receipt is incomplete")
+                    replay = json.loads(existing.response_json)
+                    if not isinstance(replay, dict):
+                        raise RuntimeError(
+                            "settled LoRA update response is not an object"
+                        )
+                    return JSONResponse(
+                        content=replay,
+                        status_code=existing.response_status,
+                    )
+                return JSONResponse(
+                    content={
+                        "error": "LoRA update outcome is not settled",
+                        "type": (
+                            "update_in_progress"
+                            if existing.state == "started"
+                            else "update_outcome_ambiguous"
+                        ),
+                        "execution": "ambiguous",
+                    },
+                    status_code=HTTPStatus.CONFLICT.value,
+                )
+
+            async def settled_response(
+                content: dict[str, object], status_code: int = HTTPStatus.OK.value
+            ) -> JSONResponse:
+                await asyncio.shield(
+                    _lora_update_receipts.settle(
+                        body.operation_id,
+                        fingerprint,
+                        response_status=status_code,
+                        response=content,
+                    )
+                )
+                return JSONResponse(content=content, status_code=status_code)
+
             if (
                 body.expected_generation_id is not None
                 and generation_id == body.expected_generation_id
             ):
-                return JSONResponse(
-                    content={"error": "generation_id must advance"}, status_code=409
+                return await settled_response(
+                    {"error": "generation_id must advance"},
+                    HTTPStatus.CONFLICT.value,
                 )
+            apply_started = time.monotonic()
             try:
                 update_seq = await coordinator.begin_publication(
                     lora_slot, expected_generation_id=body.expected_generation_id
                 )
             except RuntimeError as error:
-                return JSONResponse(
-                    content={"error": str(error), "type": "generation_conflict"},
-                    status_code=409,
+                return await settled_response(
+                    {"error": str(error), "type": "generation_conflict"},
+                    HTTPStatus.CONFLICT.value,
                 )
             mutation_started = False
             try:
@@ -1362,9 +1539,9 @@ def _patch_art_runtime_routes() -> None:
                     )
                     if isinstance(load_error, ErrorResponse):
                         await coordinator.cancel_update(lora_slot, update_seq)
-                        return JSONResponse(
-                            content=load_error.model_dump(mode="python"),
-                            status_code=load_error.error.code,
+                        return await settled_response(
+                            load_error.model_dump(mode="python"),
+                            load_error.error.code,
                         )
                     lora_int_id = (
                         models.lora_requests[lora_slot].lora_int_id
@@ -1421,6 +1598,7 @@ def _patch_art_runtime_routes() -> None:
                     )
                     await coordinator.commit_update(lora_slot, serving_request)
                     mutation_started = False
+                    apply_s = time.monotonic() - apply_started
                 _runtime_state.update(
                     loaded_adapter=public_model_name,
                     generation_id=generation_id,
@@ -1443,6 +1621,9 @@ def _patch_art_runtime_routes() -> None:
                     await asyncio.shield(
                         coordinator.cancel_update(lora_slot, update_seq)
                     )
+                await asyncio.shield(
+                    _lora_update_receipts.mark_ambiguous(body.operation_id, fingerprint)
+                )
                 raise
             result: dict[str, object] = {
                 "status": "updated",
@@ -1452,9 +1633,35 @@ def _patch_art_runtime_routes() -> None:
                 "policy_version": policy_version,
                 "update_seq": update_seq,
                 "update_identity": f"lora:{lora_slot}:{generation_id}:{update_seq}",
+                "apply_s": apply_s,
                 "cache_transition": cache_transition,
             }
-            return JSONResponse(content=result)
+            return await settled_response(result)
+
+        @router.post("/art/in_flight_lora_update/receipt")
+        async def in_flight_lora_update_receipt(
+            body: _InFlightLoraUpdateRequest,
+        ) -> JSONResponse:
+            receipt = await _lora_update_receipts.get(body.operation_id)
+            if receipt is None:
+                return JSONResponse(
+                    content={
+                        "error": "LoRA update receipt is unavailable",
+                        "type": "update_receipt_missing",
+                    },
+                    status_code=HTTPStatus.NOT_FOUND.value,
+                )
+            if receipt.fingerprint != _lora_update_fingerprint(body):
+                return JSONResponse(
+                    content={
+                        "error": "LoRA update operation identity was reused",
+                        "type": "operation_identity_conflict",
+                    },
+                    status_code=HTTPStatus.CONFLICT.value,
+                )
+            return JSONResponse(
+                content=_lora_update_receipt_payload(body.operation_id, receipt)
+            )
 
         app.include_router(router)
         return app
