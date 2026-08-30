@@ -719,18 +719,14 @@ class MCoreRunSlotExecutor:
         portable_snapshot_sink: PortableSnapshotSink | None = None,
         publisher: "_GenerationPublisher | None" = None,
     ) -> None:
-        from art.trainer_rank import TrainerRank
-
         self.runtime = runtime
-        # The shared runtime already initialized DDP and its gradient buffers.
-        self._trainer = TrainerRank(runtime, initialize_gradients=False)
+        self._trainer_instance: Any | None = None
         self._runs: dict[str, _ResidentCommandRun] = {}
         self._accumulator_l1_budget_bytes = accumulator_l1_budget_bytes
         self._topology_fingerprint = topology_fingerprint
+        device = next(runtime.model[0].parameters()).device
         self._residency = RunResidencyManager(
-            run_residency_config.model_copy(
-                update={"device": str(self._trainer.device)}
-            ),
+            run_residency_config.model_copy(update={"device": str(device)}),
             snapshot_barrier=runtime.optimizer_snapshot_barrier,
         )
         self._residency_admission_lock = Lock()
@@ -742,6 +738,17 @@ class MCoreRunSlotExecutor:
         )
         self._owns_publisher = publisher is None
         self._closed = False
+
+    @property
+    def _trainer(self) -> Any:
+        trainer = self._trainer_instance
+        if trainer is None:
+            from art.trainer_rank import TrainerRank
+
+            # Construct on the command endpoint stream, after DDP initialization.
+            trainer = TrainerRank(self.runtime, initialize_gradients=False)
+            self._trainer_instance = trainer
+        return trainer
 
     def register_run(self, spec: TrainingRunSpec) -> PortableSnapshotReadReceipt | None:
         if self._closed:
