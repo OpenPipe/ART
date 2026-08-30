@@ -2464,6 +2464,9 @@ def dispatch_megatron_context_parallel_training_tensors(
         return None if tensor is None else dispatch(tensor, pad_value)
 
     local_labels = dispatch(labels, -100, move_to_target=False)
+    local_assistant_mask = dispatch(assistant_mask, False, move_to_target=False).to(
+        dtype=torch.bool
+    )
     lm_head_selection = LmHeadTokenSelection.from_labels(
         local_labels,
         target_device=target_device,
@@ -2475,7 +2478,7 @@ def dispatch_megatron_context_parallel_training_tensors(
         tokens=dispatch(micro["tokens"], 0),
         labels=_to_target_device(local_labels, target_device),
         input_pos=dispatch(micro["input_pos"], 0),
-        assistant_mask=dispatch(assistant_mask, False).to(dtype=torch.bool),
+        assistant_mask=_to_target_device(local_assistant_mask, target_device),
         group_ids=dispatch(shifted_group_ids, 0),
         old_logprobs=dispatch(old_logprobs, float("nan")),
         advantages=dispatch(advantages, 0.0),
@@ -2493,7 +2496,7 @@ def dispatch_megatron_context_parallel_training_tensors(
     )
     workload = TrainingMicrobatchWorkload(
         logical_nonpadding_tokens=sum(rank_plan.local_valid_lengths),
-        loss_bearing_tokens=int(tensors.assistant_mask.sum().item()),
+        loss_bearing_tokens=int(local_assistant_mask.sum().item()),
         executed_token_equivalents=int(local_labels.numel()),
         nominal_schedule_capacity_tokens=rank_plan.original_seq_len,
     )

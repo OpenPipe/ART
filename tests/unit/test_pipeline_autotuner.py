@@ -7,7 +7,7 @@ from art.pipeline_tuner.attachment import (
     PipelineAutotunerAttachment,
     VllmMetricPollHealth,
 )
-from art.pipeline_tuner.autotune import PipelineAutotuner
+from art.pipeline_tuner.autotune import PipelineAutotuner, build_initial_settings
 from art.pipeline_tuner.config import (
     PipelineTuneSettings,
     TunerDecision,
@@ -37,6 +37,24 @@ def _decision() -> TunerDecision:
             window_end_s=5.0,
         ),
     )
+
+
+def test_initial_workers_cover_one_minimum_batch_wave() -> None:
+    settings = build_initial_settings(
+        config=PipelineAutotuneConfig(
+            initial_model_calls_per_inference_gpu=2,
+            initial_min_groups_per_packed_sequence=7,
+            initial_max_groups_per_packed_sequence=9,
+            worker_step=2,
+        ),
+        inference_gpu_count=2,
+        target_packed_sequences=2,
+        policy_age_limit_steps=100.0,
+        rollout_worker_capacity=None,
+    )
+
+    assert settings.min_batch_size == 16
+    assert settings.num_rollout_workers == 16
 
 
 def test_queue_backpressure_does_not_mask_trainer_underfeed(

@@ -1253,10 +1253,17 @@ def build_initial_settings(
         int(config.initial_min_groups_per_packed_sequence) * target_slots,
         max_batch,
     )
+    min_batch = max(
+        min_batch,
+        math.ceil(max_batch * config.freshness_min_batch_floor_fraction),
+    )
     workers = min(
         config.max_rollout_workers,
         _ceil_to_multiple(
-            config.initial_model_calls_per_inference_gpu * inference_gpu_count,
+            max(
+                config.initial_model_calls_per_inference_gpu * inference_gpu_count,
+                min_batch,
+            ),
             config.worker_step,
             minimum=config.worker_step,
         ),
@@ -1271,10 +1278,6 @@ def build_initial_settings(
         workers = min(workers, worker_limit)
     if rollout_worker_capacity is not None:
         workers = min(workers, rollout_worker_capacity)
-    min_batch = max(
-        min_batch,
-        math.ceil(max_batch * config.freshness_min_batch_floor_fraction),
-    )
     queue = recommended_queue_size(
         target_groups_per_step=max_batch,
     )
