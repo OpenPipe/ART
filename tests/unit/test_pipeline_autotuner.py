@@ -7,6 +7,7 @@ from art.pipeline_tuner.attachment import (
     PipelineAutotunerAttachment,
     VllmMetricPollHealth,
 )
+from art.pipeline_tuner.autotune import PipelineAutotuner
 from art.pipeline_tuner.config import (
     PipelineTuneSettings,
     TunerDecision,
@@ -36,6 +37,46 @@ def _decision() -> TunerDecision:
             window_end_s=5.0,
         ),
     )
+
+
+def test_queue_backpressure_does_not_mask_trainer_underfeed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = PipelineTuneSettings(
+        num_rollout_workers=12,
+        min_batch_size=4,
+        max_batch_size=4,
+        queue_maxsize=4,
+        target_groups_per_step=4,
+    )
+    tuner = PipelineAutotuner(
+        config=PipelineAutotuneConfig(worker_load_change_windows=1),
+        settings=settings,
+        model_name="test",
+        backend_name="test",
+        packed_sequence_length=32768,
+        target_packed_sequences=2,
+        inference_gpu_count=2,
+        policy_age_limit_steps=4.0,
+    )
+    monkeypatch.setattr(
+        tuner,
+        "_settings_with_recomputed_queue",
+        lambda current, _stats, *, adapt_target: current,
+    )
+
+    decision = tuner._decide(
+        TunerWindowStats(
+            start_step=4,
+            end_step=5,
+            trainer_underfeed_score=0.3,
+            vllm_pressure=0.4,
+            queue_put_wait_frac=0.8,
+        )
+    )
+
+    assert decision.action == "increase_workers"
+    assert decision.updated.num_rollout_workers > settings.num_rollout_workers
 
 
 @pytest.mark.parametrize("timeouts,raises", [(1, False), (2, True)])

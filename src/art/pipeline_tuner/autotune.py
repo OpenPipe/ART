@@ -592,7 +592,10 @@ class PipelineAutotuner:
                 )
             else:
                 reason = self._pending_worker_load_reason("decrease")
-        elif stats.queue_put_wait_frac >= self.config.queue_put_severe_frac:
+        elif (
+            stats.queue_put_wait_frac >= self.config.queue_put_severe_frac
+            and not trainer_under
+        ):
             self._clear_worker_load_candidate()
             reason = "completed-group queue backpressure is active"
         elif trainer_under and (
