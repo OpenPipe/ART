@@ -3,6 +3,7 @@ from __future__ import annotations
 from concurrent.futures import Future
 import hashlib
 import importlib
+import inspect
 import sys
 from types import ModuleType, SimpleNamespace
 from typing import Any, Iterator, Literal, cast
@@ -67,6 +68,15 @@ def executor_module(monkeypatch: pytest.MonkeyPatch) -> Iterator[Any]:
         for name in set(sys.modules).difference(prior_modules):
             if name.startswith("art.megatron."):
                 sys.modules.pop(name, None)
+
+
+def test_production_run_slots_do_not_depend_on_trainer_rank(
+    executor_module: Any,
+) -> None:
+    from art.megatron.runtime import run_slots
+
+    assert "art.trainer_rank" not in inspect.getsource(executor_module)
+    assert "art.trainer_rank" not in inspect.getsource(run_slots)
 
 
 def _archive(*, step: int = 7) -> Any:
@@ -217,7 +227,7 @@ def _executor(executor_module: Any) -> tuple[Any, Any, _Residency]:
     executor._portable_snapshot_source = object()
     executor._topology_fingerprint = "topology"
     executor.runtime = SimpleNamespace(rank=0)
-    executor._trainer = SimpleNamespace(release_checkpoint_slot=lambda _name: None)
+    executor._slots = SimpleNamespace(release_checkpoint_slot=lambda _name: None)
     return executor, state, residency
 
 

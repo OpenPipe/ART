@@ -35,6 +35,7 @@ from .publication import (
 )
 from .residency import ResidencyKey
 from .run_residency import RunResidencyConfig, RunResidencyManager
+from .run_slots import MegatronRunSlots, OptimizerConfig
 from .specs import (
     CommandPublicationSpec,
     ForwardBackwardJobSpec,
@@ -720,7 +721,7 @@ class MCoreRunSlotExecutor:
         publisher: "_GenerationPublisher | None" = None,
     ) -> None:
         self.runtime = runtime
-        self._trainer_instance: Any | None = None
+        self._slots = MegatronRunSlots(runtime)
         self._runs: dict[str, _ResidentCommandRun] = {}
         self._accumulator_l1_budget_bytes = accumulator_l1_budget_bytes
         self._topology_fingerprint = topology_fingerprint
@@ -739,17 +740,6 @@ class MCoreRunSlotExecutor:
         self._owns_publisher = publisher is None
         self._closed = False
 
-    @property
-    def _trainer(self) -> Any:
-        trainer = self._trainer_instance
-        if trainer is None:
-            from art.trainer_rank import TrainerRank
-
-            # Construct on the command endpoint stream, after DDP initialization.
-            trainer = TrainerRank(self.runtime, initialize_gradients=False)
-            self._trainer_instance = trainer
-        return trainer
-
     def register_run(self, spec: TrainingRunSpec) -> PortableSnapshotReadReceipt | None:
         if self._closed:
             raise RuntimeError("Megatron run slot executor is closed")
@@ -762,7 +752,6 @@ class MCoreRunSlotExecutor:
         from art.megatron.training.gradient_accumulator import (
             ParameterGradientAccumulator,
         )
-        from art.trainer_rank import MaterializedCheckpoint
 
         portable_read = None
         prepared_portable: _PreparedPortableRun | None = None
@@ -781,19 +770,11 @@ class MCoreRunSlotExecutor:
                     raise RuntimeError(
                         "resident adapter shape differs from run admission"
                     )
-                with self._trainer.push_checkpoint(
-                    MaterializedCheckpoint(
-                        path=spec.run_id,
-                        directory=spec.initial_adapter_path,
-                    )
-                ):
-                    pass
+                self._slots.load_checkpoint(spec.run_id, spec.initial_adapter_path)
                 installed = True
-                parameters = self._trainer.checkpoint_slot_parameters(spec.run_id)
-                from art.trainer_rank import AdamParams
-
-                optimizer_tensors = self._trainer.prepare_checkpoint_slot_optimizer(
-                    spec.run_id, AdamParams(learning_rate=0.0)
+                parameters = self._slots.checkpoint_slot_parameters(spec.run_id)
+                optimizer_tensors = self._slots.prepare_checkpoint_slot_optimizer(
+                    spec.run_id, OptimizerConfig(learning_rate=0.0)
                 )
             else:
                 archive = spec.initial_portable_snapshot
@@ -853,7 +834,7 @@ class MCoreRunSlotExecutor:
                 from .portable_snapshot import commit_prepared_portable_checkpoint
 
                 commit_prepared_portable_checkpoint(
-                    self._trainer,
+                    self._slots,
                     staging_name=prepared_portable.staging_name,
                     name=spec.run_id,
                 )
@@ -882,7 +863,7 @@ class MCoreRunSlotExecutor:
                     )
             if installed:
                 try:
-                    self._trainer.release_checkpoint_slot(spec.run_id)
+                    self._slots.release_checkpoint_slot(spec.run_id)
                 except BaseException as cleanup_error:
                     error.add_note(
                         "run registration slot cleanup failed: "
@@ -928,7 +909,7 @@ class MCoreRunSlotExecutor:
         source = self._portable_snapshot_source
         if source is None:
             raise RuntimeError("portable checkpoint source is not configured")
-        from art.trainer_rank import AdamParams, _checkpoint
+        from art.megatron import checkpoint as _checkpoint
 
         from .portable_snapshot import (
             install_prepared_portable_checkpoint,
@@ -950,7 +931,7 @@ class MCoreRunSlotExecutor:
         installed = False
         try:
             with prepare_portable_checkpoint(
-                self._trainer,
+                self._slots,
                 source,
                 archive,
                 destination_rank=int(self.runtime.rank),
@@ -959,18 +940,18 @@ class MCoreRunSlotExecutor:
                 restore_optimizer=restore_optimizer,
             ) as prepared:
                 install_prepared_portable_checkpoint(
-                    self._trainer, prepared, name=staging_name
+                    self._slots, prepared, name=staging_name
                 )
                 installed = True
                 prepared_run = None
                 preparation_error: BaseException | None = None
                 try:
                     if not restore_optimizer:
-                        self._trainer.prepare_checkpoint_slot_optimizer(
-                            staging_name, AdamParams(learning_rate=0.0)
+                        self._slots.prepare_checkpoint_slot_optimizer(
+                            staging_name, OptimizerConfig(learning_rate=0.0)
                         )
-                    weights = self._trainer.checkpoint_slot_parameters(staging_name)
-                    optimizer_tensors = self._trainer.checkpoint_slot_optimizer_tensors(
+                    weights = self._slots.checkpoint_slot_parameters(staging_name)
+                    optimizer_tensors = self._slots.checkpoint_slot_optimizer_tensors(
                         staging_name
                     )
                     if not weights or not optimizer_tensors:
@@ -999,14 +980,14 @@ class MCoreRunSlotExecutor:
                 _checkpoint.raise_distributed(
                     preparation_error,
                     "prepare portable checkpoint CPU working set",
-                    _checkpoint._ensure_group(self._trainer),
+                    _checkpoint._ensure_group(self._slots),
                 )
                 assert prepared_run is not None
                 return prepared_run
         except BaseException as error:
             if installed:
                 try:
-                    self._trainer.release_checkpoint_slot(staging_name)
+                    self._slots.release_checkpoint_slot(staging_name)
                 except BaseException as cleanup_error:
                     error.add_note(
                         "portable preparation cleanup failed: "
@@ -1015,7 +996,7 @@ class MCoreRunSlotExecutor:
             raise
 
     def _discard_prepared_portable_run(self, prepared: _PreparedPortableRun) -> None:
-        self._trainer.release_checkpoint_slot(prepared.staging_name)
+        self._slots.release_checkpoint_slot(prepared.staging_name)
 
     def _register_portable_l2_working_set(
         self,
@@ -1024,7 +1005,7 @@ class MCoreRunSlotExecutor:
             ...,
         ],
     ) -> None:
-        from art.trainer_rank import _checkpoint
+        from art.megatron import checkpoint as _checkpoint
 
         registered = False
         registration_error: BaseException | None = None
@@ -1037,7 +1018,7 @@ class MCoreRunSlotExecutor:
             _checkpoint.raise_distributed(
                 registration_error,
                 "register portable checkpoint L2 working set",
-                _checkpoint._ensure_group(self._trainer),
+                _checkpoint._ensure_group(self._slots),
             )
         except BaseException as error:
             if registered:
@@ -1234,7 +1215,7 @@ class MCoreRunSlotExecutor:
 
         with self._maintenance_resident(state, ("weights", "optimizer")):
             return export_portable_checkpoint(
-                self._trainer,
+                self._slots,
                 self._portable_snapshot_sink,
                 PortableSnapshotGeneration(
                     training_session_id=generation.training_session_id,
@@ -1249,7 +1230,7 @@ class MCoreRunSlotExecutor:
     def run_tensor_owners(self, run_id: str) -> tuple[tuple[str, int], ...]:
         if run_id not in self._runs:
             raise KeyError(f"trainer command run {run_id!r} is absent")
-        return self._trainer.checkpoint_slot_tensor_owners(run_id)
+        return self._slots.checkpoint_slot_tensor_owners(run_id)
 
     def install_run_checkpoint(
         self,
@@ -1307,7 +1288,7 @@ class MCoreRunSlotExecutor:
             from .portable_snapshot import commit_prepared_portable_checkpoint
 
             commit_prepared_portable_checkpoint(
-                self._trainer,
+                self._slots,
                 staging_name=prepared.staging_name,
                 name=run_id,
             )
@@ -1389,12 +1370,12 @@ class MCoreRunSlotExecutor:
                     self.runtime,
                     job,
                     batch.tensors,
-                    slot_trainer=self._trainer,
+                    run_slots=self._slots,
                     gradient_accumulator=state.gradients,
                     cancelled=cancelled,
                 )
             except BaseException:
-                self._trainer.clear_checkpoint_slot_grads(job.run_id)
+                self._slots.clear_checkpoint_slot_grads(job.run_id)
                 raise
             self._register_accumulator_residency(state)
         self._enforce_accumulator_budget()
@@ -1474,12 +1455,12 @@ class MCoreRunSlotExecutor:
                     self.runtime,
                     job,
                     batch,
-                    slot_trainer=self._trainer,
+                    run_slots=self._slots,
                     gradient_accumulator=state.gradients,
                     cancelled=cancelled,
                 )
             except BaseException:
-                self._trainer.clear_checkpoint_slot_grads(job.run_id)
+                self._slots.clear_checkpoint_slot_grads(job.run_id)
                 raise
             self._register_accumulator_residency(state)
         self._enforce_accumulator_budget()
@@ -1559,8 +1540,6 @@ class MCoreRunSlotExecutor:
 
     def execute_optimizer(self, job: OptimizerJobSpec) -> dict[str, Any]:
         state = self._require_parent(job)
-        from art.trainer_rank import AdamParams
-
         with self._resident_operation(
             job.operation_id, state, ("weights", "optimizer", "accumulator")
         ):
@@ -1594,16 +1573,16 @@ class MCoreRunSlotExecutor:
                         "accumulated trainable-token count differs from packed "
                         f"provenance: observed={observed}, expected={expected}"
                     )
-                gradients = self._trainer.reduce_checkpoint_slot_grads(
+                gradients = self._slots.reduce_checkpoint_slot_grads(
                     job.run_id,
                     local_sums.gradients,
                     scale_grads=(
                         1.0 if local_sums.reduction == "sum" else 1.0 / observed
                     ),
                 )
-                result = self._trainer.optim_step_reduced(
+                result = self._slots.optim_step_reduced(
                     job.run_id,
-                    params=AdamParams(
+                    params=OptimizerConfig(
                         learning_rate=job.optimizer.learning_rate,
                         beta1=job.optimizer.beta1,
                         beta2=job.optimizer.beta2,
@@ -1640,14 +1619,14 @@ class MCoreRunSlotExecutor:
             self._residency.advance_l1(
                 weights_key,
                 output_weights,
-                self._trainer.checkpoint_slot_parameters(job.run_id),
+                self._slots.checkpoint_slot_parameters(job.run_id),
                 retire_source=True,
             )
             self._replace_admission_key(job.operation_id, weights_key, output_weights)
             self._residency.advance_l1(
                 optimizer_key,
                 output_optimizer,
-                self._trainer.checkpoint_slot_optimizer_tensors(job.run_id),
+                self._slots.checkpoint_slot_optimizer_tensors(job.run_id),
                 retire_source=True,
             )
             self._replace_admission_key(
@@ -1732,7 +1711,7 @@ class MCoreRunSlotExecutor:
         )
         for retirement in retirements:
             retirement.result(timeout=self._residency.config.shutdown_timeout_s)
-        self._trainer.release_checkpoint_slot(run_id)
+        self._slots.release_checkpoint_slot(run_id)
         self._runs.pop(run_id)
 
     def discard_open_gradients(self) -> None:
@@ -1760,7 +1739,7 @@ class MCoreRunSlotExecutor:
             )
             for retirement in retirements:
                 retirement.result(timeout=self._residency.config.shutdown_timeout_s)
-            self._trainer.release_checkpoint_slot(state.spec.run_id)
+            self._slots.release_checkpoint_slot(state.spec.run_id)
         self._residency.close()
         self._runs.clear()
         source, self._portable_snapshot_source = self._portable_snapshot_source, None

@@ -1088,11 +1088,11 @@ def execute_megatron_dynamic_lora_forward_backward_job(
     job: ForwardBackwardJobSpec,
     packed_tensors: PackedTensors,
     *,
-    slot_trainer: Any,
+    run_slots: Any,
     gradient_accumulator: Any,
     cancelled: Event | None = None,
 ) -> MegatronForwardBackwardJobResult:
-    """Execute F/B against one exact-shape resident TrainerRank slot."""
+    """Execute F/B against one exact-shape resident Megatron run slot."""
     from art.megatron.lora import LoRASlotRef, use_lora_slot
     from art.megatron.training.gradient_accumulator import (
         ParameterGradientAccumulator,
@@ -1117,14 +1117,14 @@ def execute_megatron_dynamic_lora_forward_backward_job(
         raise NotImplementedError(
             "resident dynamic LoRA requires the KL reference to be the learner"
         )
-    parameters = slot_trainer.checkpoint_slot_parameters(job.run_id)
+    parameters = run_slots.checkpoint_slot_parameters(job.run_id)
     internal = ParameterGradientAccumulator(parameters)
     reduction = "sum" if job.loss is not None else "token_mean"
     states: list[RLForwardBackwardState] = []
     durations: list[float] = []
 
     def before_step(_step_index: int) -> None:
-        slot_trainer.clear_checkpoint_slot_grads(job.run_id)
+        run_slots.clear_checkpoint_slot_grads(job.run_id)
 
     def record_step(
         step_index: int,
@@ -1175,7 +1175,7 @@ def execute_megatron_dynamic_lora_forward_backward_job(
             reduction=reduction,
         )
         internal.consume()
-        slot_trainer.clear_checkpoint_slot_grads(job.run_id)
+        run_slots.clear_checkpoint_slot_grads(job.run_id)
         results = tuple(
             _finish_megatron_rl_forward_backward_step(state) for state in states
         )
@@ -1383,7 +1383,7 @@ def execute_megatron_dynamic_lora_sft_forward_backward_job(
     job: SftForwardBackwardJobSpec,
     batch: SFTBatchData,
     *,
-    slot_trainer: Any,
+    run_slots: Any,
     gradient_accumulator: Any,
     cancelled: Event | None = None,
 ) -> MegatronForwardBackwardJobResult:
@@ -1395,7 +1395,7 @@ def execute_megatron_dynamic_lora_sft_forward_backward_job(
     )
 
     _validate_sft_command_batch(job, batch)
-    parameters = slot_trainer.checkpoint_slot_parameters(job.run_id)
+    parameters = run_slots.checkpoint_slot_parameters(job.run_id)
     internal = ParameterGradientAccumulator(parameters)
     states: list[SFTForwardBackwardState] = []
     global_sequences = resolve_global_grad_accumulation_sequences(
@@ -1415,7 +1415,7 @@ def execute_megatron_dynamic_lora_sft_forward_backward_job(
                         )
 
                         raise TrainingCancelledError("SFT F/B job was cancelled")
-                    slot_trainer.clear_checkpoint_slot_grads(job.run_id)
+                    run_slots.clear_checkpoint_slot_grads(job.run_id)
                     inputs, indices, hybridep_counts = _sft_command_step_inputs(
                         runtime, job, batch, step_index
                     )
@@ -1477,7 +1477,7 @@ def execute_megatron_dynamic_lora_sft_forward_backward_job(
                 time.perf_counter() - started,
             )
         finally:
-            slot_trainer.clear_checkpoint_slot_grads(job.run_id)
+            run_slots.clear_checkpoint_slot_grads(job.run_id)
 
     (local_sums, reduced_loss, logprobs, executed, elapsed), gpu_service_ns = (
         measure_cuda_call(execute)

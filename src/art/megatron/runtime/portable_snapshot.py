@@ -11,12 +11,11 @@ from pathlib import Path, PurePosixPath
 import re
 import shutil
 import tempfile
-from typing import TYPE_CHECKING, Any, BinaryIO, Literal, Protocol, cast
+from typing import Any, BinaryIO, Literal, Protocol, cast
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-if TYPE_CHECKING:
-    from art.trainer_rank import TrainerRank
+CheckpointHost = Any
 
 ART_PORTABLE_SNAPSHOT_SOURCE_FACTORY_ENV = "ART_PORTABLE_SNAPSHOT_SOURCE_FACTORY"
 ART_PORTABLE_SNAPSHOT_SINK_FACTORY_ENV = "ART_PORTABLE_SNAPSHOT_SINK_FACTORY"
@@ -118,7 +117,7 @@ class PortableSnapshotRankReceipt(_Contract):
 
 
 class PortableSnapshotArchive(_Contract):
-    """Transport receipt over canonical TrainerRank files, not another format."""
+    """Transport receipt over canonical Megatron checkpoint files."""
 
     format: Literal["art_trainer_rank_checkpoint_v1"] = "art_trainer_rank_checkpoint_v1"
     generation: PortableSnapshotGeneration
@@ -413,7 +412,7 @@ def portable_snapshot_sink_from_local_runtime(
 
 
 def export_portable_checkpoint(
-    trainer: TrainerRank,
+    trainer: CheckpointHost,
     sink: PortableSnapshotSink,
     generation: PortableSnapshotGeneration,
     *,
@@ -421,11 +420,11 @@ def export_portable_checkpoint(
     name: str,
     rank: int,
 ) -> PortableSnapshotRankReceipt | None:
-    """Commit canonical TrainerRank files and return private immutable refs."""
+    """Commit canonical Megatron checkpoint files and return immutable refs."""
 
     if not export_id or not name or rank < 0:
         raise ValueError("portable checkpoint export identity is invalid")
-    from art.trainer_rank import _checkpoint
+    from art.megatron import checkpoint as _checkpoint
 
     digest = hashlib.sha256(f"{name}\0{export_id}".encode()).hexdigest()
     root = Path(tempfile.gettempdir()) / f"art-portable-export-{digest}"
@@ -501,7 +500,7 @@ def export_portable_checkpoint(
 
 
 def prepare_portable_checkpoint(
-    trainer: TrainerRank,
+    trainer: CheckpointHost,
     source: PortableSnapshotSource,
     archive: PortableSnapshotArchive,
     *,
@@ -550,7 +549,7 @@ def prepare_portable_checkpoint(
                     for file in selected
                 )
 
-        from art.trainer_rank import _checkpoint
+        from art.megatron import checkpoint as _checkpoint
 
         checkpoint = None
         read_error: BaseException | None = None
@@ -655,7 +654,7 @@ def prepare_portable_checkpoint(
 
 
 def install_prepared_portable_checkpoint(
-    trainer: TrainerRank,
+    trainer: CheckpointHost,
     prepared: PreparedPortableCheckpoint,
     *,
     name: str,
@@ -664,13 +663,13 @@ def install_prepared_portable_checkpoint(
 
     if prepared._temporary is None:
         raise RuntimeError("prepared portable checkpoint is closed")
-    from art.trainer_rank import _checkpoint
+    from art.megatron import checkpoint as _checkpoint
 
     _checkpoint.load_checkpoint(trainer, prepared.checkpoint, name)
 
 
 def commit_prepared_portable_checkpoint(
-    trainer: TrainerRank,
+    trainer: CheckpointHost,
     *,
     staging_name: str,
     name: str,
@@ -679,7 +678,7 @@ def commit_prepared_portable_checkpoint(
 
     if not staging_name or not name or staging_name == name:
         raise ValueError("portable checkpoint commit names are invalid")
-    from art.trainer_rank import _checkpoint
+    from art.megatron import checkpoint as _checkpoint
 
     group = _checkpoint._ensure_group(trainer)
     _checkpoint._phase(
@@ -727,7 +726,7 @@ def commit_prepared_portable_checkpoint(
 
 
 def install_portable_checkpoint(
-    trainer: TrainerRank,
+    trainer: CheckpointHost,
     source: PortableSnapshotSource,
     archive: PortableSnapshotArchive,
     *,
