@@ -576,6 +576,10 @@ class RunResidencyManager:
                     elif staging is not None:
                         image = self._mover.stage_host_image(image, staging)
                     image.activate()
+                source_bytes = self._mover.byte_count(
+                    tuple(tensor for state in missing for tensor in state.tensors),
+                    "cpu",
+                )
                 transfer_staging = staging
                 staging = None
                 transition = self._mover.move(
@@ -584,7 +588,11 @@ class RunResidencyManager:
                     staging=transfer_staging,
                 )
                 if transition.stats.byte_count != incoming_bytes:
-                    raise RuntimeError("L1 working-set transfer byte count changed")
+                    raise RuntimeError(
+                        "L1 working-set transfer byte count changed: "
+                        f"reserved={incoming_bytes}, source={source_bytes}, "
+                        f"transferred={transition.stats.byte_count}"
+                    )
                 with self._lock:
                     # Storage is allocated; the retained event gates authoritative use.
                     self.ledger.commit_many(reservations)
