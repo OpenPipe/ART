@@ -1266,10 +1266,18 @@ def run_prepared_workflows(
                     else workflow._subprocess_log_tail(session_log)
                     or f"session exited with code {returncode}"
                 )
+                metrics: dict[str, Any] = {"error": detail}
+                if len(session.operations) == 1:
+                    metrics.update(
+                        {
+                            "workflow_stage_duration_s": worker_wall_s,
+                            "workflow_stage_duration_basis": "session_worker_failure",
+                        }
+                    )
                 result = ValidationStageResult(
                     name=operation.stage,
                     passed=False,
-                    metrics={"error": detail},
+                    metrics=metrics,
                 )
             result.metrics["workflow_session_id"] = session.id
             result.metrics["workflow_gpu_ids"] = [
