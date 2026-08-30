@@ -79,14 +79,14 @@ class ServingProfileIdentity(BaseModel):
     trainer_dtype: Literal["bfloat16", "float16", "float32"]
     route_replay: bool
     lora_transport: Literal["local", "nixl"]
-    retained_route_transport: Literal["none", "caios_lota"]
+    retained_route_transport: Literal["none", "holder_local", "caios_lota"]
     retained_route_max_bytes: int = Field(ge=0)
     retained_route_max_bundles: int = Field(ge=0)
 
     @model_validator(mode="after")
     def _validate_bounds(self) -> "ServingProfileIdentity":
         bounds = (self.retained_route_max_bytes, self.retained_route_max_bundles)
-        if self.retained_route_transport == "caios_lota":
+        if self.retained_route_transport != "none":
             valid_bounds = all(value > 0 for value in bounds)
         else:
             valid_bounds = bounds == (0, 0)
@@ -214,7 +214,7 @@ class PairedInferenceEndpoint(BaseModel):
             if (
                 isinstance(route_capture_max_bytes, bool)
                 or route_capture_max_bytes < 1
-                or identity.retained_route_transport != "caios_lota"
+                or identity.retained_route_transport == "none"
                 or route_capture_max_bytes > identity.retained_route_max_bytes
             ):
                 raise ValueError(

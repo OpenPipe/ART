@@ -158,7 +158,7 @@ async def test_serving_profile_reports_resolved_runtime_geometry(monkeypatch) ->
         "trainer_dtype": "bfloat16",
         "route_replay": True,
         "lora_transport": "nixl",
-        "retained_route_transport": "caios_lota",
+        "retained_route_transport": "holder_local",
         "retained_route_max_bytes": 4096,
         "retained_route_max_bundles": 4,
     }
@@ -262,7 +262,7 @@ def test_private_dispatch_uses_distinct_auth_and_fences_runtime_target(
         dedicated_server._runtime_state,
         "serving_profile_identity",
         {
-            "retained_route_transport": "caios_lota",
+            "retained_route_transport": "holder_local",
             "retained_route_max_bytes": 4096,
             "retained_route_max_bundles": 4,
         },

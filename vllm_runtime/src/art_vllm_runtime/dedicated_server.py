@@ -526,7 +526,7 @@ def _private_route_capture_max_bytes(request: Any) -> int | None | JSONResponse:
     valid_capacity = (
         _runtime_state.get("route_capture") is True
         and isinstance(identity, dict)
-        and identity.get("retained_route_transport") == "caios_lota"
+        and identity.get("retained_route_transport") in {"holder_local", "caios_lota"}
         and not isinstance(maximum_available, bool)
         and isinstance(maximum_available, int)
         and not isinstance(bundles_available, bool)

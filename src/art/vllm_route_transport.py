@@ -97,9 +97,14 @@ class RouteBundleLayout(_Contract):
 
 
 class RouteBundleObjectRef(_Contract):
-    """Provider-neutral authenticated identity for one CAIOS route object."""
+    """Provider-neutral authenticated identity for one retained route object.
 
-    store: Literal["caios"] = "caios"
+    ``holder_local`` locators are opaque to ART and name a lease-fenced object
+    exposed by the paired holder through its injected reader. The reader may
+    use NIXL or POSIX shared memory without changing the route contract.
+    """
+
+    store: Literal["caios", "holder_local"] = "caios"
     locator: str = Field(min_length=1, max_length=4096)
     size_bytes: int = Field(gt=0)
     sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
@@ -165,7 +170,7 @@ async def publish_retained_route_bundle_transfer(
     stream_id: str,
     advertise_host: str,
 ) -> tuple[RouteBundleBatchTransfer, AsyncByteStreamPublisher]:
-    """Expose one bounded pull stream over service-owned local-LOTA reads."""
+    """Expose one bounded pull stream over the object reader selected by service."""
 
     if not refs:
         raise ValueError("retained route transfer requires at least one bundle")
@@ -387,7 +392,7 @@ def decode_retained_route_bundle(
     *,
     token_ids: Mapping[int, tuple[int, ...]],
 ) -> dict[int, MoeRouteArray]:
-    """Validate one fetched CAIOS object before exposing route array views."""
+    """Validate one fetched retained object before exposing route array views."""
 
     import numpy as np
 
