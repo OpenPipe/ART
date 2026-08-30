@@ -2207,11 +2207,12 @@ class MonarchTrainerRun:
                 raise ValueError("F/B batch ref does not match its leases")
             if job.batch.sequence_length != self.runtime_spec.packed_sequence_length:
                 raise ValueError("F/B batch length does not match the trainer runtime")
-            if bool(job.batch.moe_routing_replay) != bool(
-                self.runtime_spec.enable_moe_routing_replay
+            if (
+                job.batch.moe_routing_replay is not None
+                and not self.runtime_spec.enable_moe_routing_replay
             ):
                 raise ValueError(
-                    "F/B routing replay does not match the trainer runtime"
+                    "F/B routing replay is disabled on this trainer runtime"
                 )
 
         return await self._start_command(
@@ -2242,11 +2243,12 @@ class MonarchTrainerRun:
                 raise ValueError("forward batch ref does not match its leases")
             if job.batch.sequence_length != self.runtime_spec.packed_sequence_length:
                 raise ValueError("forward batch length does not match trainer runtime")
-            if bool(job.batch.moe_routing_replay) != bool(
-                self.runtime_spec.enable_moe_routing_replay
+            if (
+                job.batch.moe_routing_replay is not None
+                and not self.runtime_spec.enable_moe_routing_replay
             ):
                 raise ValueError(
-                    "forward routing replay does not match the trainer runtime"
+                    "forward routing replay is disabled on this trainer runtime"
                 )
 
         return await self._start_command(
@@ -3537,11 +3539,12 @@ class MonarchTrainerRun:
             return ValueError(
                 "resident score batch length does not match the trainer runtime"
             )
-        if bool(job.batch.moe_routing_replay) != bool(
-            self.runtime_spec.enable_moe_routing_replay
+        if (
+            job.batch.moe_routing_replay is not None
+            and not self.runtime_spec.enable_moe_routing_replay
         ):
             return ValueError(
-                "resident score routing replay does not match the trainer runtime"
+                "resident score routing replay is disabled on this trainer runtime"
             )
         return None
 
