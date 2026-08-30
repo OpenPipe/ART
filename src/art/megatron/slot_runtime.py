@@ -30,6 +30,7 @@ from .paired_inference import MegatronPairedInferencePublisher
 from .route_retention import RouteBundleOwnershipProvider
 from .runtime.build import build_trainer_runtime_spec
 from .runtime.portable_snapshot import PortableSnapshotArchive
+from .runtime.run_residency import RunResidencyPolicy
 from .runtime.specs import TrainerGeneration, TrainerRuntimeSpec
 from .runtime_config import init_megatron_runtime_config
 from .slot_coordinator import (
@@ -58,6 +59,7 @@ class MegatronSlotLaunchConfig(BaseModel):
     schedule: MegatronSlotScheduleConfig = Field(
         default_factory=MegatronSlotScheduleConfig
     )
+    residency: RunResidencyPolicy = Field(default_factory=RunResidencyPolicy)
 
     @model_validator(mode="after")
     def _validate_trainer_topology(self) -> "MegatronSlotLaunchConfig":
@@ -170,6 +172,7 @@ async def launch_megatron_slot(
             config=cast(dev.BackendModelConfig, dict(config.model)),
             enable_expert_replay=config.enable_moe_routing_replay,
             offload_between_jobs=False,
+            run_residency=config.residency,
         )
         trainer = await runtime.start_shared_trainer(
             runtime_spec,

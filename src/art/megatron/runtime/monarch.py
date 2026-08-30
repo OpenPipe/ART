@@ -7,6 +7,7 @@ from datetime import timedelta
 import hashlib
 import json
 import os
+from pathlib import Path
 import socket
 from threading import BoundedSemaphore, Event, Lock, Thread
 import time
@@ -284,6 +285,21 @@ class _CpLookaheadResult(BaseModel):
     traceback_text: str | None = None
 
 
+class _ResidencyPrefetchResult(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    rank: int
+    operation_id: str | None
+    run_id: str
+    requested_components: tuple[str, ...]
+    learner_version: int
+    evidence: dict[str, Any] | None = None
+    elapsed_s: float = 0.0
+    error_type: str | None = None
+    message: str | None = None
+    traceback_text: str | None = None
+
+
 def _dispatch_trainer_fault(failure: MeshFailure) -> None:
     message = str(failure)
     with _SUPERVISION_LOCK:
@@ -528,9 +544,26 @@ class MonarchTrainerActor(Actor):
             self._runtime,
             accumulator_l1_budget_bytes=runtime_spec.accumulator_l1_budget_bytes,
         )
+        device = torch.cuda.get_device_properties(local_rank)
+        residency_mount = Path(
+            runtime_spec.run_residency.nvme_root
+            or cache_root / "megatron" / "run_residency"
+        ).resolve()
+        residency_config = runtime_spec.run_residency.resolve(
+            root=str(
+                residency_mount
+                / hashlib.sha256(run_id.encode()).hexdigest()
+                / f"rank-{rank}"
+            ),
+            mount=str(residency_mount),
+            device_name=device.name,
+            device_total_bytes=device.total_memory,
+        )
         self._run_slot_executor = MCoreRunSlotExecutor(
             self._runtime,
             accumulator_l1_budget_bytes=runtime_spec.accumulator_l1_budget_bytes,
+            run_residency_config=residency_config,
+            topology_fingerprint=runtime_spec.optimizer_layout_fingerprint,
             portable_snapshot_source=portable_snapshot_source_from_local_runtime(
                 run_id=run_id,
                 rank=rank,
@@ -558,6 +591,16 @@ class MonarchTrainerActor(Actor):
         self._cp_preplanner = None
         self._cp_lookahead_port = None
         self._cp_lookahead_thread = None
+        self._residency_prefetch_port = None
+        self._residency_prefetch_thread = None
+        self._residency_prefetch_port, receiver = Channel.open()
+        self._residency_prefetch_thread = Thread(
+            target=self._run_residency_prefetch,
+            args=(receiver,),
+            name=f"art-residency-prefetch-rank-{rank}",
+            daemon=True,
+        )
+        self._residency_prefetch_thread.start()
         if topology.cp > 1:
             from art.megatron.training.microbatches import CpBatchPreplanner
 
@@ -716,6 +759,43 @@ class MonarchTrainerActor(Actor):
                     batch.close()
             reply.send(result.model_dump(mode="json"))
 
+    def _run_residency_prefetch(self, receiver: Any) -> None:
+        while (request := receiver.recv().get()) is not None:
+            operation_id, run_id, components, learner_version, reply = request
+            started = time.perf_counter()
+            try:
+                evidence = (
+                    self._run_slot_executor.prefetch_residency(
+                        run_id, components, learner_version
+                    )
+                    if operation_id is None
+                    else self._run_slot_executor.admit_residency(
+                        operation_id, run_id, components, learner_version
+                    )
+                )
+                result = _ResidencyPrefetchResult(
+                    rank=self._runtime.rank,
+                    operation_id=operation_id,
+                    run_id=run_id,
+                    requested_components=components,
+                    learner_version=learner_version,
+                    evidence=evidence,
+                    elapsed_s=time.perf_counter() - started,
+                )
+            except BaseException as error:
+                result = _ResidencyPrefetchResult(
+                    rank=self._runtime.rank,
+                    operation_id=operation_id,
+                    run_id=run_id,
+                    requested_components=components,
+                    learner_version=learner_version,
+                    elapsed_s=time.perf_counter() - started,
+                    error_type=type(error).__name__,
+                    message=str(error),
+                    traceback_text=traceback.format_exc(),
+                )
+            reply.send(result.model_dump(mode="json"))
+
     def _stop_cp_lookahead(self) -> None:
         thread, self._cp_lookahead_thread = self._cp_lookahead_thread, None
         if thread is None:
@@ -727,6 +807,23 @@ class MonarchTrainerActor(Actor):
         thread.join(timeout=30.0)
         if thread.is_alive():
             raise RuntimeError("CP lookahead service did not stop within 30 seconds")
+
+    def _stop_residency_prefetch(self) -> None:
+        thread, self._residency_prefetch_thread = (
+            self._residency_prefetch_thread,
+            None,
+        )
+        if thread is None:
+            return
+        port = self._residency_prefetch_port
+        if port is None:
+            raise RuntimeError("residency prefetch thread has no request port")
+        port.send(None)
+        thread.join(timeout=30.0)
+        if thread.is_alive():
+            raise RuntimeError(
+                "residency prefetch service did not stop within 30 seconds"
+            )
 
     def _publish_compile_cache(self) -> None:
         if self._compile_cache is None or "publish_s" in self._compile_cache_metrics:
@@ -755,6 +852,17 @@ class MonarchTrainerActor(Actor):
         if self._cp_lookahead_port is None:
             return None
         return {"rank": self._runtime.rank, "port": self._cp_lookahead_port}
+
+    @endpoint
+    def residency_prefetch_port(self) -> dict[str, Any]:
+        if self._residency_prefetch_port is None:
+            raise RuntimeError("residency prefetch service is unavailable")
+        return {"rank": self._runtime.rank, "port": self._residency_prefetch_port}
+
+    @endpoint
+    def release_residency_admission(self, operation_id: str) -> dict[str, Any]:
+        self._run_slot_executor.release_residency_admission(operation_id)
+        return {"rank": self._runtime.rank, "operation_id": operation_id}
 
     @endpoint
     def register_command_run(self, run_spec_json: str) -> dict[str, Any]:
@@ -1259,6 +1367,7 @@ class MonarchTrainerActor(Actor):
 
     @endpoint
     def close(self) -> None:
+        self._stop_residency_prefetch()
         self._stop_cp_lookahead()
         self._stop_deferred_results()
         self._abort_command_job()
@@ -1318,6 +1427,7 @@ class MonarchTrainerActor(Actor):
     def __cleanup__(self, exc: Exception | None) -> None:
         if exc is not None:
             self._valid = False
+        self._stop_residency_prefetch()
         self._stop_cp_lookahead()
         self._stop_deferred_results()
         self._run_slot_executor.close()
@@ -1329,7 +1439,12 @@ async def spawn_monarch_trainer_actors(
     runtime_spec: TrainerRuntimeSpec,
     supervision: MonarchTrainerSupervision,
     distributed_timeout_s: float,
-) -> tuple[Any, tuple[_TrainerRankReady, ...], tuple[Port[Any], ...]]:
+) -> tuple[
+    Any,
+    tuple[_TrainerRankReady, ...],
+    tuple[Port[Any], ...],
+    tuple[Port[Any], ...],
+]:
     """Configure torch-elastic first, then initialize exactly one actor per rank."""
     spmd: Any = proc_mesh.spawn(
         f"art_torch_elastic_{supervision.token}", _TrainerSPMDActor
@@ -1376,7 +1491,14 @@ async def spawn_monarch_trainer_actors(
     )
     if len(lookahead_ports) != expected_port_count:
         raise RuntimeError("trainer ranks returned an incomplete CP lookahead service")
-    return actors, ready, lookahead_ports
+    residency_values = await actors.residency_prefetch_port.call()
+    residency_ports = tuple(
+        value["port"]
+        for value in sorted(residency_values.values(), key=lambda value: value["rank"])
+    )
+    if len(residency_ports) != len(placements):
+        raise RuntimeError("trainer ranks returned incomplete residency services")
+    return actors, ready, lookahead_ports, residency_ports
 
 
 class _PublicationState:
@@ -1594,6 +1716,7 @@ class MonarchTrainerRun:
         supervision: MonarchTrainerSupervision,
         rank_processes: tuple[_TrainerRankReady, ...],
         cp_lookahead_ports: tuple[Port[Any], ...],
+        residency_prefetch_ports: tuple[Port[Any], ...],
         *,
         register_initial_run: bool = True,
     ) -> None:
@@ -1608,6 +1731,7 @@ class MonarchTrainerRun:
         self._supervision = supervision
         self._rank_processes = rank_processes
         self._cp_lookahead_ports = cp_lookahead_ports
+        self._residency_prefetch_ports = residency_prefetch_ports
         self._learner_version = run_spec.initial_learner_version
         self._command_runs = (
             {
@@ -1633,6 +1757,7 @@ class MonarchTrainerRun:
         self._command_mode = False
         self._lock = asyncio.Lock()
         self._cp_lookahead_lock = asyncio.Lock()
+        self._residency_prefetch_lock = asyncio.Lock()
         self._active_job_id: str | None = None
         self._active_collective: asyncio.Future[Any] | None = None
         self._active_receive: asyncio.Future[Any] | None = None
@@ -2636,6 +2761,104 @@ class MonarchTrainerRun:
                     max(result.planned_sequences for result in results)
                 ),
             }
+
+    async def prefetch_command_run_residency(
+        self,
+        run_id: str,
+        components: tuple[str, ...],
+        learner_version: int,
+    ) -> dict[str, Any]:
+        return await self._prepare_command_run_residency(
+            None, run_id, components, learner_version
+        )
+
+    async def admit_command_run_residency(
+        self,
+        operation_id: str,
+        run_id: str,
+        components: tuple[str, ...],
+        learner_version: int,
+    ) -> dict[str, Any]:
+        try:
+            return await self._prepare_command_run_residency(
+                operation_id, run_id, components, learner_version
+            )
+        except BaseException as error:
+            try:
+                await self.release_command_run_residency_admission(operation_id)
+            except BaseException as cleanup_error:
+                raise BaseExceptionGroup(
+                    "residency admission and rollback failed",
+                    [error, cleanup_error],
+                ) from None
+            raise
+
+    async def _prepare_command_run_residency(
+        self,
+        operation_id: str | None,
+        run_id: str,
+        components: tuple[str, ...],
+        learner_version: int,
+    ) -> dict[str, Any]:
+        if not self._residency_prefetch_ports:
+            raise RuntimeError("trainer slot has no residency prefetch service")
+        async with self._residency_prefetch_lock:
+            if self._closed or not self._valid:
+                raise RuntimeError("trainer run is not available for residency work")
+            reply, receiver = Channel.open()
+            request = (operation_id, run_id, components, learner_version, reply)
+            started = time.perf_counter()
+            for port in self._residency_prefetch_ports:
+                port.send(request)
+            async with asyncio.timeout(self.run_spec.event_timeout_s):
+                results = tuple(
+                    [
+                        _ResidencyPrefetchResult.model_validate(await receiver.recv())
+                        for _ in self._residency_prefetch_ports
+                    ]
+                )
+            expected_ranks = set(range(len(self._residency_prefetch_ports)))
+            if {result.rank for result in results} != expected_ranks or any(
+                (
+                    result.operation_id,
+                    result.run_id,
+                    result.requested_components,
+                    result.learner_version,
+                )
+                != (operation_id, run_id, components, learner_version)
+                for result in results
+            ):
+                raise RuntimeError("residency preparation returned mismatched identity")
+            failures = [result for result in results if result.error_type is not None]
+            if failures:
+                details = "\n".join(
+                    f"rank {result.rank}: {result.error_type}: {result.message}\n"
+                    f"{result.traceback_text or ''}"
+                    for result in failures
+                )
+                raise RuntimeError(f"residency preparation failed:\n{details}")
+            if any(result.evidence is None for result in results):
+                raise RuntimeError("residency preparation returned no evidence")
+            return {
+                "operation_id": operation_id,
+                "run_id": run_id,
+                "requested_components": components,
+                "learner_version": learner_version,
+                "rank_evidence": tuple(result.evidence for result in results),
+                "wait_s": time.perf_counter() - started,
+                "rank_max_s": max(result.elapsed_s for result in results),
+            }
+
+    async def release_command_run_residency_admission(self, operation_id: str) -> None:
+        values = await asyncio.wait_for(
+            self._actors.release_residency_admission.call(operation_id),
+            timeout=self.run_spec.event_timeout_s,
+        )
+        results = list(values.values())
+        if {result["rank"] for result in results} != set(
+            range(len(self._rank_processes))
+        ) or {result["operation_id"] for result in results} != {operation_id}:
+            raise RuntimeError("trainer ranks released another residency admission")
 
     async def score(
         self,

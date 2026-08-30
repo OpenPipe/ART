@@ -2125,6 +2125,59 @@ class TrainerRank:
         except KeyError as error:
             raise ValueError(f"Unknown checkpoint slot: {name!r}") from error
 
+    def checkpoint_slot_optimizer_tensors(self, name: str) -> tuple[torch.Tensor, ...]:
+        try:
+            dynamic = self._checkpoint_slots[name].optimizer
+        except KeyError as error:
+            raise ValueError(f"Unknown checkpoint slot: {name!r}") from error
+        if dynamic is None:
+            return ()
+
+        tensors: list[torch.Tensor] = []
+        seen: set[int] = set()
+        for master in dynamic.master_params:
+            if master.device.type == "cuda" and id(master) not in seen:
+                tensors.append(master)
+                seen.add(id(master))
+            state = dynamic.optimizer.state.get(master, {})
+            for key in sorted(state):
+                value = state[key]
+                if (
+                    isinstance(value, torch.Tensor)
+                    and value.device.type == "cuda"
+                    and id(value) not in seen
+                ):
+                    tensors.append(value)
+                    seen.add(id(value))
+        return tuple(tensors)
+
+    def prepare_checkpoint_slot_optimizer(
+        self, name: str, params: AdamParams
+    ) -> tuple[torch.Tensor, ...]:
+        """Create the complete CUDA optimizer image before command admission."""
+
+        dynamic = self._dynamic_optimizer(name, params)
+        group = dynamic.optimizer.param_groups[0]
+        capturable = bool(group.get("capturable", False))
+        fused = bool(group.get("fused", False))
+        for master in dynamic.master_params:
+            state = dynamic.optimizer.state[master]
+            if state:
+                continue
+            step_device = master.device if capturable or fused else torch.device("cpu")
+            state["step"] = torch.zeros((), dtype=torch.float32, device=step_device)
+            state["exp_avg"] = torch.zeros_like(
+                master, memory_format=torch.preserve_format
+            )
+            state["exp_avg_sq"] = torch.zeros_like(
+                master, memory_format=torch.preserve_format
+            )
+            if bool(group.get("amsgrad", False)):
+                state["max_exp_avg_sq"] = torch.zeros_like(
+                    master, memory_format=torch.preserve_format
+                )
+        return self.checkpoint_slot_optimizer_tensors(name)
+
     def clear_checkpoint_slot_grads(self, name: str) -> None:
         for parameter in self.checkpoint_slot_parameters(name):
             parameter.grad = None

@@ -244,14 +244,17 @@ class ParameterGradientAccumulator:
     def contribution_ids(self) -> tuple[str, ...]:
         return tuple(self._operation_ids)
 
+    def residency_tensors(self) -> tuple[torch.Tensor, ...]:
+        return (
+            *((self._local_tokens,) if self._local_tokens is not None else ()),
+            *(self._gradients or ()),
+        )
+
     @property
     def residency_nbytes(self) -> int:
         return sum(
             tensor.numel() * tensor.element_size()
-            for tensor in (
-                *((self._local_tokens,) if self._local_tokens is not None else ()),
-                *(self._gradients or ()),
-            )
+            for tensor in self.residency_tensors()
         )
 
     def record(

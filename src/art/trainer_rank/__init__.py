@@ -373,6 +373,14 @@ class TrainerRank(_impl.TrainerRank):
     def checkpoint_slot_parameters(self, name: str) -> tuple[torch.nn.Parameter, ...]:
         return super().checkpoint_slot_parameters(name)
 
+    def checkpoint_slot_optimizer_tensors(self, name: str) -> tuple[torch.Tensor, ...]:
+        return super().checkpoint_slot_optimizer_tensors(name)
+
+    def prepare_checkpoint_slot_optimizer(
+        self, name: str, params: AdamParams
+    ) -> tuple[torch.Tensor, ...]:
+        return super().prepare_checkpoint_slot_optimizer(name, params)
+
     def clear_checkpoint_slot_grads(self, name: str) -> None:
         super().clear_checkpoint_slot_grads(name)
 

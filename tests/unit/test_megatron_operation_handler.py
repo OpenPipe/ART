@@ -178,6 +178,27 @@ class _Trainer:
         self.migration_releases: list[str] = []
         self.optimizer_jobs = []
 
+    async def prefetch_command_run_residency(self, run_id, components, learner_version):
+        return {
+            "run_id": run_id,
+            "requested_components": components,
+            "learner_version": learner_version,
+        }
+
+    async def admit_command_run_residency(
+        self, operation_id, run_id, components, learner_version
+    ):
+        return {
+            "operation_id": operation_id,
+            "run_id": run_id,
+            "requested_components": components,
+            "learner_version": learner_version,
+            "rank_evidence": (),
+        }
+
+    async def release_command_run_residency_admission(self, operation_id):
+        del operation_id
+
     async def register_command_run(self, run_spec):
         self.registered_runs.add(run_spec.run_id)
         self.registered_adapters[run_spec.run_id] = (

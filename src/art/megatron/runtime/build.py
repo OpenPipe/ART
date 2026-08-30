@@ -19,6 +19,7 @@ from ..model_support import (
     model_uses_expert_parallel,
 )
 from ..runtime_config import get_megatron_runtime_config
+from .run_residency import RunResidencyPolicy
 from .specs import HybridEpRuntimeSpec, TrainerRuntimeSpec
 
 
@@ -29,6 +30,7 @@ def build_trainer_runtime_spec(
     config: dev.BackendModelConfig,
     enable_expert_replay: bool,
     offload_between_jobs: bool,
+    run_residency: RunResidencyPolicy | None = None,
 ) -> TrainerRuntimeSpec:
     """Build the immutable trainer identity for a started ART runtime."""
 
@@ -84,6 +86,7 @@ def build_trainer_runtime_spec(
         trainer_mesh=mesh,
         packed_sequence_length=runtime_config.packed_sequence_length,
         snapshot_pool_capacity=runtime_config.snapshot_pool_capacity,
+        run_residency=run_residency or RunResidencyPolicy(),
         compile_enabled=compile_enabled,
         compile_cache=runtime_config.compile_cache and compile_enabled,
         compile_fingerprint=_digest({**identity, "compile": compile_enabled}),

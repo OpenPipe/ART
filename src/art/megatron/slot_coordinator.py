@@ -102,11 +102,13 @@ class MegatronMigrationReplay:
 
 
 class MegatronSlotResourceManager(Protocol):
-    """Optional off-loop residency planner; rank execution remains authoritative."""
+    """Off-loop residency planner; rank execution remains authoritative."""
 
     def prefetch(self, request: MegatronSlotResourceRequest) -> None: ...
 
-    async def ensure(self, request: MegatronSlotResourceRequest) -> None: ...
+    async def ensure(self, request: MegatronSlotResourceRequest) -> dict[str, Any]: ...
+
+    async def release(self, request: MegatronSlotResourceRequest) -> None: ...
 
     async def release_run(self, run_id: str) -> None: ...
 
@@ -117,11 +119,76 @@ class InlineMegatronSlotResources:
     def prefetch(self, request: MegatronSlotResourceRequest) -> None:
         del request
 
-    async def ensure(self, request: MegatronSlotResourceRequest) -> None:
+    async def ensure(self, request: MegatronSlotResourceRequest) -> dict[str, Any]:
+        del request
+        return {}
+
+    async def release(self, request: MegatronSlotResourceRequest) -> None:
         del request
 
     async def release_run(self, run_id: str) -> None:
         del run_id
+
+
+class TrainerMegatronSlotResources:
+    """Drive rank-local L1-L3 preparation ahead of serialized GPU commands."""
+
+    def __init__(self, trainer: "_SharedTrainer") -> None:
+        self._trainer = trainer
+        self._prefetches: dict[str, tuple[str, asyncio.Task[dict[str, Any]]]] = {}
+
+    def prefetch(self, request: MegatronSlotResourceRequest) -> None:
+        if request.operation_id in self._prefetches:
+            return
+        task = asyncio.create_task(
+            self._trainer.prefetch_command_run_residency(
+                request.run_id,
+                request.components,
+                request.source.policy_step,
+            ),
+            name=f"megatron-residency-prefetch-{request.operation_id}",
+        )
+        self._prefetches[request.operation_id] = (request.run_id, task)
+        task.add_done_callback(_consume_task_exception)
+
+    async def ensure(self, request: MegatronSlotResourceRequest) -> dict[str, Any]:
+        pending = self._prefetches.pop(request.operation_id, None)
+        if pending is not None:
+            await pending[1]
+        return await self._trainer.admit_command_run_residency(
+            request.operation_id,
+            request.run_id,
+            request.components,
+            request.source.policy_step,
+        )
+
+    async def release(self, request: MegatronSlotResourceRequest) -> None:
+        pending = self._prefetches.pop(request.operation_id, None)
+        if pending is not None:
+            pending[1].cancel()
+            await asyncio.gather(pending[1], return_exceptions=True)
+        await self._trainer.release_command_run_residency_admission(
+            request.operation_id
+        )
+
+    async def release_run(self, run_id: str) -> None:
+        pending = tuple(
+            (operation_id, task)
+            for operation_id, (pending_run_id, task) in self._prefetches.items()
+            if pending_run_id == run_id
+        )
+        for operation_id, task in pending:
+            self._prefetches.pop(operation_id, None)
+            task.cancel()
+        if pending:
+            await asyncio.gather(
+                *(task for _operation_id, task in pending), return_exceptions=True
+            )
+
+
+def _consume_task_exception(task: asyncio.Task[Any]) -> None:
+    if not task.cancelled():
+        task.exception()
 
 
 class _SharedTrainer(Protocol):
@@ -142,6 +209,25 @@ class _SharedTrainer(Protocol):
     async def sft_forward_backward(self, job: Any, batch: Any) -> dict[str, Any]: ...
 
     async def start_sft_forward_backward(self, job: Any, batch: Any) -> Any: ...
+
+    async def prefetch_command_run_residency(
+        self,
+        run_id: str,
+        components: tuple[str, ...],
+        learner_version: int,
+    ) -> dict[str, Any]: ...
+
+    async def admit_command_run_residency(
+        self,
+        operation_id: str,
+        run_id: str,
+        components: tuple[str, ...],
+        learner_version: int,
+    ) -> dict[str, Any]: ...
+
+    async def release_command_run_residency_admission(
+        self, operation_id: str
+    ) -> None: ...
 
     async def optim_step(self, job: Any) -> dict[str, Any]: ...
 
@@ -241,6 +327,7 @@ class _ReadyCommand:
     contributions: tuple[str, ...]
     cost: int
     future: asyncio.Future[OperationResultType]
+    resources: MegatronSlotResourceRequest
 
     @property
     def optimizer(self) -> bool:
@@ -327,7 +414,7 @@ class MegatronSlotCoordinator:
             raise ValueError("command_timeout_s must be positive")
         self.runtime = runtime
         self.trainer = trainer
-        self.resources = resources or InlineMegatronSlotResources()
+        self.resources = resources or TrainerMegatronSlotResources(trainer)
         self.schedule = schedule or MegatronSlotScheduleConfig()
         self.publisher = publisher
         self.route_ownership = route_ownership
@@ -350,6 +437,7 @@ class MegatronSlotCoordinator:
         self._aborted_migration_restores: dict[
             tuple[str, str], tuple[MegatronOperationConfig, str | None]
         ] = {}
+        self._residency_evidence: dict[tuple[str, str], dict[str, Any]] = {}
         self._registering_runs: dict[
             str, tuple[MegatronOperationConfig, str | None, str | None]
         ] = {}
@@ -619,6 +707,14 @@ class MegatronSlotCoordinator:
         state = self._runs.get(run_id)
         if state is not None and state.worker is worker:
             state.handler.retire_operation(operation_id)
+            self._residency_evidence.pop((run_id, operation_id), None)
+
+    def residency_evidence(
+        self, run_id: str, operation_id: str
+    ) -> dict[str, Any] | None:
+        """Return exact rank readiness evidence until operation retirement."""
+
+        return self._residency_evidence.get((run_id, operation_id))
 
     async def _enter_worker_call(
         self,
@@ -1184,12 +1280,13 @@ class MegatronSlotCoordinator:
                 raise _not_executed("cancelled", "Megatron slot run is draining")
             state.preparing += 1
         capture: PackedInputCaptureRef | None = None
+        resource_admitted = False
+        resource_request: MegatronSlotResourceRequest | None = None
         try:
             components = _components(request)
             raw_sft = isinstance(
                 request, (ForwardRequest, ForwardBackwardRequest)
             ) and (isinstance(request.batch, SupervisedTrajectoryBatch))
-            resource_request: MegatronSlotResourceRequest | None = None
             if not raw_sft:
                 resource_request = MegatronSlotResourceRequest(
                     run_id=operation.run_id,
@@ -1213,11 +1310,13 @@ class MegatronSlotCoordinator:
                         optimizer_state_path=state.handler.optimizer_state_path,
                         components=(components if packing.loss_bearing_tokens else ()),
                     )
-                    if resource_request.components:
-                        self.resources.prefetch(resource_request)
+                    self.resources.prefetch(resource_request)
             assert resource_request is not None
-            if resource_request.components:
-                await self.resources.ensure(resource_request)
+            evidence = await self.resources.ensure(resource_request)
+            resource_admitted = True
+            self._residency_evidence[(operation.run_id, operation.operation_id)] = (
+                evidence
+            )
             loop = asyncio.get_running_loop()
             future: asyncio.Future[OperationResultType] = loop.create_future()
             ready = _ReadyCommand(
@@ -1227,6 +1326,7 @@ class MegatronSlotCoordinator:
                 contributions=contributions,
                 cost=cost,
                 future=future,
+                resources=resource_request,
             )
             async with self._condition:
                 if (
@@ -1244,8 +1344,17 @@ class MegatronSlotCoordinator:
                         "capacity_exhausted", "Megatron slot ready queue is full"
                     )
                 self._ready.append(ready)
+                resource_admitted = False
                 self._condition.notify_all()
         except BaseException as error:
+            if resource_admitted and resource_request is not None:
+                try:
+                    await self.resources.release(resource_request)
+                except BaseException as cleanup_error:
+                    error.add_note(
+                        "residency cleanup also failed: "
+                        f"{type(cleanup_error).__name__}: {cleanup_error}"
+                    )
             if capture is not None:
                 try:
                     await state.handler.discard_prepared_input(capture)
@@ -1316,6 +1425,11 @@ class MegatronSlotCoordinator:
                 ):
                     command.future.set_result(result)
             finally:
+                try:
+                    await self.resources.release(command.resources)
+                except BaseException as cleanup_error:
+                    if not command.future.done():
+                        command.future.set_exception(cleanup_error)
                 if settlement_slot:
                     self._settlement_slots.release()
                 async with self._condition:

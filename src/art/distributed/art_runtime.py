@@ -1098,6 +1098,7 @@ class ArtRuntime:
                     actors,
                     rank_processes,
                     cp_lookahead_ports,
+                    residency_prefetch_ports,
                 ) = await spawn_monarch_trainer_actors(
                     proc,
                     runtime_spec,
@@ -1125,6 +1126,7 @@ class ArtRuntime:
             supervision,
             rank_processes,
             cp_lookahead_ports,
+            residency_prefetch_ports,
             register_initial_run=register_initial_run,
         )
         self._trainer_runs.add(run)

@@ -23,6 +23,7 @@ __all__ = [
     "MegatronSlotResourceRequest",
     "MegatronSlotRun",
     "MegatronSlotScheduleConfig",
+    "TrainerMegatronSlotResources",
     "MegatronSlotLaunchConfig",
     "MegatronRunBinding",
     "MegatronRunBootstrapConfig",
@@ -77,6 +78,7 @@ def __getattr__(name: str) -> Any:
         "MegatronSlotResourceRequest",
         "MegatronSlotRun",
         "MegatronSlotScheduleConfig",
+        "TrainerMegatronSlotResources",
     }:
         from . import slot_coordinator
 

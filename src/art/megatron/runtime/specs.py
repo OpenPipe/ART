@@ -15,6 +15,7 @@ from art.training.contracts import AdamConfig, LossConfig, OperationRef
 from art.types import TrainConfig, TrainSFTConfig
 
 from .portable_snapshot import PortableSnapshotArchive
+from .run_residency import RunResidencyPolicy
 
 
 class _Spec(BaseModel):
@@ -58,6 +59,7 @@ class TrainerRuntimeSpec(_Spec):
     hybrid_ep: HybridEpRuntimeSpec | None = None
     snapshot_pool_capacity: int = Field(default=2, ge=1, le=4)
     accumulator_l1_budget_bytes: int = Field(default=16 * 1024**3, ge=1)
+    run_residency: RunResidencyPolicy = Field(default_factory=RunResidencyPolicy)
 
     @model_validator(mode="after")
     def _validate_lora_targets(self) -> "TrainerRuntimeSpec":
