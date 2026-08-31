@@ -195,6 +195,44 @@ def test_successful_min_batch_trial_is_not_immediately_reversed() -> None:
     )
     assert tuner._min_batch_trial_baseline_collect_s is None
 
+    # One healthy window after renewed underfeed is not enough to oscillate back.
+    underfed = TunerWindowStats(
+        start_step=18,
+        end_step=19,
+        collect_batch_s=0.3,
+        trainer_underfeed_score=0.27,
+        vllm_pressure=1.1,
+    )
+    assert (
+        tuner._min_batch_adjustment(
+            lowered_settings, underfed, "hold", inference_over=True
+        )
+        is None
+    )
+    healthy = TunerWindowStats(
+        start_step=20,
+        end_step=21,
+        collect_batch_s=0.0,
+        trainer_underfeed_score=0.0,
+        vllm_pressure=0.47,
+    )
+    assert (
+        tuner._min_batch_adjustment(
+            lowered_settings, healthy, "hold", inference_over=False
+        )
+        is None
+    )
+    raised = tuner._min_batch_adjustment(
+        lowered_settings,
+        healthy.model_copy(update={"start_step": 22, "end_step": 23}),
+        "hold",
+        inference_over=False,
+    )
+    assert raised is not None
+    raised_settings, action, _ = raised
+    assert action == "raise_min_batch_size"
+    assert raised_settings.min_batch_size == 30
+
 
 @pytest.mark.parametrize("timeouts,raises", [(1, False), (2, True)])
 def test_metric_poll_health_contract(timeouts: int, raises: bool) -> None:

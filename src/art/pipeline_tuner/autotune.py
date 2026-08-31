@@ -177,6 +177,7 @@ class PipelineAutotuner:
         self._min_batch_trial_baseline_collect_s: float | None = None
         self._min_batch_trial_batch_size: int | None = None
         self._min_batch_trial_failed_windows = 0
+        self._min_batch_raise_candidate_count = 0
         self._emitted_recommendations: set[str] = set()
 
     def on_metric(self, rec: PipelineMetric) -> TunerDecision | None:
@@ -764,6 +765,7 @@ class PipelineAutotuner:
             )
             new_min = max(floor, round(settings.min_batch_size * 0.85))
             if new_min < settings.min_batch_size:
+                self._min_batch_raise_candidate_count = 0
                 self._min_batch_trial_baseline_collect_s = stats.collect_batch_s
                 self._min_batch_trial_batch_size = new_min
                 self._min_batch_trial_failed_windows = 0
@@ -778,11 +780,20 @@ class PipelineAutotuner:
             not inference_over
             and stats.trainer_underfeed_score
             <= self.config.trainer_min_batch_raise_score
+            and settings.min_batch_size < settings.max_batch_size
         ):
+            self._min_batch_raise_candidate_count += 1
+            if (
+                self._min_batch_raise_candidate_count
+                < self.config.min_batch_trial_windows
+            ):
+                return None
+            self._min_batch_raise_candidate_count = 0
             return self._raise_min_batch(
                 settings,
-                "trainer collection idle is low enough to use denser batches",
+                "trainer collection idle stayed low enough to use denser batches",
             )
+        self._min_batch_raise_candidate_count = 0
         return None
 
     def _raise_min_batch(
