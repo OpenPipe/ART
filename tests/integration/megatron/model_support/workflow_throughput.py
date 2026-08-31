@@ -507,12 +507,6 @@ def _matched_input_fingerprints(
     )
 
 
-async def _discard_prepared_pipeline_batch(backend: Any, groups: list[Any]) -> None:
-    for group in groups:
-        group._distributed_lease = None
-    await backend.discard_pipeline_batch(groups)
-
-
 def _matched_capture_steps(max_steps: int) -> tuple[int, ...]:
     first = max_steps - _MATCHED_MEASURED_STEPS + 1
     return tuple(range(first, first + _MATCHED_MEASURED_STEPS))
@@ -578,10 +572,6 @@ def _packed_batch_fingerprint(prepared: Any) -> str:
     finally:
         shm.close()
     return digest.hexdigest()
-
-
-def _packed_input_fingerprint(groups: list[Any]) -> str:
-    return _packed_batch_fingerprint(_prepared_pipeline_batch(groups))
 
 
 async def _capture_training_bundles(selections: tuple[Any, ...]) -> tuple[Any, ...]:
@@ -1265,7 +1255,6 @@ async def _run_isolated_backend_phase(
     backend: Any,
     model: Any,
     service: Any,
-    train: Callable[..., Awaitable[Any]],
     captured_inputs: tuple[CapturedTrainingInput, ...],
 ) -> TrainerPhaseEvidence:
     from art.distributed.trajectory_store import TrajectoryGroupBundle
@@ -1286,25 +1275,35 @@ async def _run_isolated_backend_phase(
         ):
             raise RuntimeError("isolated trajectory input changed during round trip")
         _collect_matched_packing_shapes(groups)
-        packing = await backend.prepare_pipeline_batch(model, groups)
-        if packing is None:
-            raise RuntimeError("isolated backend benchmark produced no packed batch")
-        try:
-            current_packed_fingerprint = _packed_input_fingerprint(groups)
-        except BaseException:
-            await _discard_prepared_pipeline_batch(backend, groups)
-            raise
-        result = await train(
+        parent_step = int(await backend._get_step(model))
+        context = await backend.prepare_pipeline_commands(
             model,
             groups,
-            learning_rate=1e-6,
-            loss_fn="cispo",
-            loss_fn_config=None,
-            normalize_advantages=True,
-            save_checkpoint=False,
-            adam_params=None,
-            optimizer_save_interval=5,
+            learner_parent_version=parent_step,
+            train_kwargs={
+                "learning_rate": 1e-6,
+                "loss_fn": "cispo",
+                "loss_fn_config": None,
+                "normalize_advantages": True,
+                "save_checkpoint": False,
+                "adam_params": None,
+                "optimizer_save_interval": 5,
+            },
         )
+        if context is None:
+            raise RuntimeError("isolated backend benchmark produced no packed batch")
+        try:
+            current_packed_fingerprint = _packed_batch_fingerprint(context._prepared)
+        except BaseException as fingerprint_error:
+            try:
+                await context.abort()
+            except BaseException as abort_error:
+                raise BaseExceptionGroup(
+                    "isolated fingerprint and split command abort failed",
+                    [fingerprint_error, abort_error],
+                ) from None
+            raise
+        result = await context.complete(None, None)
         if sample_index >= _ISOLATED_WARMUP_STEPS:
             packed_input_fingerprints.append(current_packed_fingerprint)
             samples.append((result.metrics, int(result.step)))
@@ -1983,7 +1982,6 @@ async def _run_e2e_throughput_async(
                 int,
                 asyncio.Task[tuple[tuple[Any, ...], str, str, dict[str, int]]],
             ] = {}
-            original_train = backend.train
             original_prepare_pipeline_commands = backend.prepare_pipeline_commands
             original_finish_training_batch = backend._finish_training_batch
             command_count = 0
@@ -2179,7 +2177,6 @@ async def _run_e2e_throughput_async(
                 backend=backend,
                 model=model,
                 service=service,
-                train=original_train,
                 captured_inputs=tuple(captured_training_inputs),
             )
         finally:
