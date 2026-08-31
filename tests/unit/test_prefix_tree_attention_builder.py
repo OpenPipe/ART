@@ -19,7 +19,7 @@ from art.megatron.context_parallel.builder import (
     build_prefix_tree_attention_spec,
 )
 from art.megatron.context_parallel.runtime import (
-    _fuse_underfilled_remote_stage,
+    _fuse_remote_stage_when_faster,
     get_or_build_runtime_plan,
 )
 from art.megatron.context_parallel.types import (
@@ -369,7 +369,7 @@ def test_context_parallel_stage_masks_match_dense_nested_tree() -> None:
     )
 
 
-def test_underfilled_remote_keys_fuse_into_the_local_stage() -> None:
+def test_remote_keys_fuse_only_when_planner_cost_wins() -> None:
     q_range = TokenRange(0, 4)
     local_stage = StagePlan(
         stage_index=0,
@@ -415,11 +415,11 @@ def test_underfilled_remote_keys_fuse_into_the_local_stage() -> None:
         dkv_reduce_plan=DkvReducePlan((0, 3), (0, 0), ((), ())),
     )
 
-    fused = _fuse_underfilled_remote_stage(
+    fused = _fuse_remote_stage_when_faster(
         local_stage,
         remote_stage,
         block_size=2,
-        remote_stage_fuse_limit=4,
+        config=ContextParallelConfig(),
     )
 
     assert fused is not None
@@ -438,6 +438,28 @@ def test_underfilled_remote_keys_fuse_into_the_local_stage() -> None:
     ]
     assert fused.slices[-1].q_range == TokenRange(2, 4)
     assert fused.slices[-1].k_range == TokenRange(4, 7)
+    assert (
+        _fuse_remote_stage_when_faster(
+            local_stage,
+            remote_stage,
+            block_size=2,
+            config=ContextParallelConfig(
+                planner_stage_overhead_ms=0.0,
+                planner_comm_stage_overhead_ms=10.0,
+                planner_interval_overhead_ms=0.0,
+                planner_fetch_token_ms=0.0,
+                planner_reduce_token_ms=0.0,
+                planner_local_pair_ms=1.0,
+                planner_remote_pair_ms=1.0,
+                planner_local_backward_pair_ms=1.0,
+                planner_remote_backward_pair_ms=1.0,
+                planner_remote_stage_token_floor=1,
+                planner_remote_stage_pair_floor=1,
+                planner_remote_stage_underfill_ms=0.0,
+            ),
+        )
+        is None
+    )
     glm_state = build_glm52_context_parallel_state(
         position_ids=torch.arange(7).unsqueeze(0),
         context_parallel_state=SimpleNamespace(
@@ -548,7 +570,9 @@ def _assert_context_parallel_stage_masks_match_dense(
             assert _effective_block_mask(block_mask).equal(expected)
             _assert_matches_torch_block_mask(block_mask)
             checked_stages += 1
-            checked_remote_stages += int(not stage.is_local_stage)
+            checked_remote_stages += int(
+                not stage.is_local_stage or stage.fused_remote_k_len > 0
+            )
 
     assert checked_stages
     if require_remote_stage:

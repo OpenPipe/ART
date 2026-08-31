@@ -55,7 +55,7 @@ class _PlanningBundle:
     owners: tuple[int, ...]
     wave_assignment: tuple[int, ...]
     token_layout_index: TokenLayoutIndex
-    remote_stage_fuse_limit: int
+    config: ContextParallelConfig
     gdn_execution_spec: Any | None = None
 
 
@@ -176,7 +176,7 @@ def _get_or_build_planning_bundle(
             owners=owners,
             cp_size=max(int(topology.cp), 1),
         ),
-        remote_stage_fuse_limit=int(config.planner_remote_stage_token_floor),
+        config=config,
         gdn_execution_spec=gdn_execution_spec,
     )
     _cache_put(_PLANNING_BUNDLE_CACHE, planning_key, bundle)
@@ -212,7 +212,7 @@ def _get_or_build_bundle_rank_plan(
         original_seq_len=original_seq_len,
         target_rank=target_rank,
         block_size=block_size,
-        remote_stage_fuse_limit=bundle.remote_stage_fuse_limit,
+        config=bundle.config,
     )
     _cache_put(_RANK_RUNTIME_PLAN_CACHE, cache_key, plan)
     return plan
@@ -2010,12 +2010,116 @@ def _build_stage_from_pieces(
     )
 
 
-def _fuse_underfilled_remote_stage(
+def _stage_plan_pair_count(stage: StagePlan) -> int:
+    metadata = stage.mask_metadata
+    if metadata is None:
+        return 0
+    pair_count = 0
+    for slice_ in stage.slices:
+        q_len = slice_.q_range.size()
+        k_len = slice_.k_range.size()
+        if q_len <= 0 or k_len <= 0:
+            continue
+        if slice_.mask_kind == AttnMaskKind.FULL:
+            pair_count += q_len * k_len
+            continue
+        q_start = int(metadata.q_token_indices[slice_.q_range.start].item())
+        k_start = int(metadata.k_token_indices[slice_.k_range.start].item())
+        pair_count += _causal_piece_pair_count_from_bounds(
+            q_start=q_start,
+            q_end=q_start + q_len,
+            k_start=k_start,
+            k_end=k_start + k_len,
+        )
+    return pair_count
+
+
+def _fusion_reduces_predicted_runtime(
+    local_stage: StagePlan,
+    remote_stage: StagePlan,
+    *,
+    config: ContextParallelConfig,
+) -> bool:
+    def stage_cost(stage: StagePlan, *, backward: bool, local: bool) -> float:
+        return _stage_cost_ms(
+            pair_count=_stage_plan_pair_count(stage),
+            q_tokens=_ranges_size(stage.owner_local_q_ranges),
+            k_tokens=_ranges_size(stage.owner_local_k_ranges),
+            q_range_count=len(stage.owner_local_q_ranges),
+            k_range_count=len(stage.owner_local_k_ranges),
+            config=config,
+            backward=backward,
+            local=local,
+        )
+
+    def comm_cost(*, backward: bool) -> float:
+        plan = remote_stage.dkv_reduce_plan if backward else remote_stage.kv_fetch_plan
+        assert plan is not None
+        peer_ranges = (
+            cast(DkvReducePlan, plan).recv_ranges_by_peer
+            if backward
+            else cast(KvFetchPlan, plan).send_ranges_by_peer
+        )
+        return _comm_cost_ms(
+            tokens=max(sum(plan.send_splits), sum(plan.recv_splits)),
+            range_count=max(
+                sum(len(ranges) for ranges in peer_ranges),
+                len(remote_stage.global_k_ranges),
+            ),
+            config=config,
+            backward=backward,
+        )
+
+    local_forward_ms, local_backward_ms = (
+        stage_cost(local_stage, backward=backward, local=True)
+        for backward in (False, True)
+    )
+    remote_forward_ms, remote_backward_ms = (
+        stage_cost(remote_stage, backward=backward, local=False)
+        for backward in (False, True)
+    )
+    fetch_ms, reduce_ms = (comm_cost(backward=value) for value in (False, True))
+
+    separate_ms = _simulate_forward_time_ms(
+        local_stage_ms=local_forward_ms,
+        remote_stage_ms=(remote_forward_ms,),
+        remote_fetch_ms=(fetch_ms,),
+    ) + _simulate_backward_time_ms(
+        local_stage_ms=local_backward_ms,
+        remote_stage_ms=(remote_backward_ms,),
+        remote_reduce_ms=(reduce_ms,),
+    )
+    combined_pairs = _stage_plan_pair_count(local_stage) + _stage_plan_pair_count(
+        remote_stage
+    )
+    combined_q_tokens = _ranges_size(local_stage.owner_local_q_ranges)
+    combined_k_tokens = _ranges_size(local_stage.owner_local_k_ranges) + _ranges_size(
+        remote_stage.owner_local_k_ranges
+    )
+    fused_stage_ms = sum(
+        _stage_cost_ms(
+            pair_count=combined_pairs,
+            q_tokens=combined_q_tokens,
+            k_tokens=combined_k_tokens,
+            q_range_count=len(local_stage.owner_local_q_ranges),
+            k_range_count=len(local_stage.owner_local_k_ranges)
+            + len(remote_stage.owner_local_k_ranges),
+            config=config,
+            backward=backward,
+            local=True,
+        )
+        for backward in (False, True)
+    )
+    fused_ms = fetch_ms + fused_stage_ms + reduce_ms
+    return fused_ms < separate_ms
+
+
+def _fuse_remote_stage_when_faster(
     local_stage: StagePlan,
     remote_stage: StagePlan,
     *,
     block_size: int,
-    remote_stage_fuse_limit: int,
+    config: ContextParallelConfig,
 ) -> StagePlan | None:
     if (
         not local_stage.is_local_stage
@@ -2035,7 +2139,11 @@ def _fuse_underfilled_remote_stage(
         logical_q_len <= 0
         or local_k_len <= 0
         or remote_k_len <= 0
-        or remote_k_len > int(remote_stage_fuse_limit)
+        or not _fusion_reduces_predicted_runtime(
+            local_stage,
+            remote_stage,
+            config=config,
+        )
     ):
         return None
 
@@ -2138,7 +2246,7 @@ def _build_rank_runtime_plan(
     original_seq_len: int,
     target_rank: int,
     block_size: int,
-    remote_stage_fuse_limit: int,
+    config: ContextParallelConfig,
 ) -> RankRuntimePlan:
     host_local_ranges = _chunk_ranges_for_owner(
         chunk_ranges=chunk_ranges,
@@ -2274,11 +2382,11 @@ def _build_rank_runtime_plan(
             remote_buffer_range=remote_buffer_range,
             block_size=block_size,
         )
-        fused_local_stage = _fuse_underfilled_remote_stage(
+        fused_local_stage = _fuse_remote_stage_when_faster(
             stage_plans[0],
             stage_plan,
             block_size=block_size,
-            remote_stage_fuse_limit=remote_stage_fuse_limit,
+            config=config,
         )
         if fused_local_stage is not None:
             stage_plans[0] = fused_local_stage
@@ -2738,7 +2846,7 @@ def _build_runtime_plan(
             original_seq_len=original_seq_len,
             target_rank=rank,
             block_size=int(config.block_size),
-            remote_stage_fuse_limit=int(config.planner_remote_stage_token_floor),
+            config=config,
         )
         for rank in range(cp_size)
     )
