@@ -48,7 +48,6 @@ class _DistributedBatchPayload(BaseModel):
     packed: Any
     selections: tuple[Any, ...]
     generation_id: str = Field(min_length=1)
-    mark_packed_task: asyncio.Task[None] | None = None
     runtime: Any
 
 
@@ -137,26 +136,6 @@ class _MegatronPipelineCommandContext:
         self._train_kwargs = train_kwargs
         self._claimed = False
 
-    async def _start_optimizer_after_packing_mark(self, forward: Any) -> Any:
-        try:
-            await self._backend._await_batch_packing_mark(
-                cast(_PackedTrainingBatch, self._prepared.batch)
-            )
-        except BaseException as marking_error:
-            forward_result = await asyncio.gather(
-                forward.completion, return_exceptions=True
-            )
-            if isinstance(forward_result[0], BaseException):
-                raise BaseExceptionGroup(
-                    "trajectory lease marking and Megatron F/B failed",
-                    [marking_error, forward_result[0]],
-                ) from None
-            raise
-        return await self._service.start_pipeline_optimizer(
-            forward,
-            learning_rate=self._config.learning_rate,
-        )
-
     async def complete(
         self,
         next_train_dispatched: asyncio.Event | None,
@@ -180,7 +159,10 @@ class _MegatronPipelineCommandContext:
                 self._experimental_config,
                 expected_learner_version=self._learner_parent_version,
             )
-            optimizer = await self._start_optimizer_after_packing_mark(forward)
+            optimizer = await self._service.start_pipeline_optimizer(
+                forward,
+                learning_rate=self._config.learning_rate,
+            )
             values = await asyncio.gather(
                 forward.completion,
                 optimizer.completion,
@@ -929,7 +911,28 @@ class MegatronBackend(LocalBackend):
                 mark_packed_task = asyncio.create_task(
                     queue.mark_packed(selected, generation_id)
                 )
-            packed = await runtime.pack(request)
+            try:
+                packed = await runtime.pack(request)
+            except BaseException as packing_error:
+                if mark_packed_task is not None:
+                    try:
+                        _, cancelled = await complete_task(mark_packed_task)
+                        marked_packed = True
+                    except BaseException as marking_error:
+                        raise BaseExceptionGroup(
+                            "packing and trajectory lease marking failed",
+                            [packing_error, marking_error],
+                        ) from None
+                    if cancelled is not None:
+                        packing_error.add_note(
+                            "trajectory lease marking observed cancellation"
+                        )
+                raise
+            if mark_packed_task is not None:
+                _, cancelled = await complete_task(mark_packed_task)
+                marked_packed = True
+                if cancelled is not None:
+                    raise cancelled
             if packed is None:
                 return None
             shapes = tuple(packed.packed_group_shapes)
@@ -946,7 +949,6 @@ class MegatronBackend(LocalBackend):
                     packed=packed,
                     selections=selected,
                     generation_id=generation_id,
-                    mark_packed_task=mark_packed_task,
                     runtime=runtime,
                 ),
                 num_sequences=ref.num_sequences,
@@ -968,14 +970,6 @@ class MegatronBackend(LocalBackend):
         finally:
             if not transferred:
                 primary = sys.exception()
-                marking_failure: BaseException | None = None
-                if mark_packed_task is not None:
-                    try:
-                        _, cancelled = await complete_task(mark_packed_task)
-                        marked_packed = True
-                        marking_failure = cancelled
-                    except BaseException as error:
-                        marking_failure = error
                 try:
                     _, cancelled = await complete_task(
                         asyncio.create_task(
@@ -993,23 +987,11 @@ class MegatronBackend(LocalBackend):
                     if cancelled is not None:
                         raise cancelled
                 except BaseException as cleanup_error:
-                    failures = [
-                        error
-                        for error in (primary, marking_failure, cleanup_error)
-                        if error is not None
-                    ]
-                    if len(failures) == 1:
+                    if primary is None:
                         raise
                     raise BaseExceptionGroup(
                         "packing and source cleanup failed",
-                        failures,
-                    ) from None
-                if marking_failure is not None:
-                    if primary is None:
-                        raise marking_failure
-                    raise BaseExceptionGroup(
-                        "packing and trajectory lease marking failed",
-                        [primary, marking_failure],
+                        [primary, cleanup_error],
                     ) from None
 
     async def _cleanup_packing_ownership(
@@ -1525,45 +1507,22 @@ class MegatronBackend(LocalBackend):
             raise RuntimeError("Megatron batch has no owning typed runtime")
         runtime = cast(ArtRuntime, payload.runtime)
         distributed_batch = cast(DistributedPackedBatch, payload.packed)
-        marking_failure: BaseException | None = None
-        marked_packed = True
-        if payload.mark_packed_task is not None:
-            try:
-                _, cancelled = await complete_task(payload.mark_packed_task)
-                marking_failure = cancelled
-            except BaseException as error:
-                marked_packed = False
-                marking_failure = error
         releases: list[Any] = [runtime.release_batch(distributed_batch)]
         if payload.selections:
             queue = payload.selections[0].queue
             releases.append(
                 queue.release_selections(
                     payload.selections,
-                    disposition=disposition if marked_packed else "discarded",
-                    generation_id=(payload.generation_id if marked_packed else None),
+                    disposition=disposition,
+                    generation_id=payload.generation_id,
                 )
             )
         results = await asyncio.gather(*releases, return_exceptions=True)
-        failures = [
-            error
-            for error in (marking_failure, *results)
-            if isinstance(error, BaseException)
-        ]
+        failures = [result for result in results if isinstance(result, BaseException)]
         if failures:
             raise BaseExceptionGroup(
                 "distributed training batch release failed", failures
             )
-
-    async def _await_batch_packing_mark(self, batch: _PackedTrainingBatch) -> None:
-        payload = batch.payload
-        if not isinstance(payload, _DistributedBatchPayload):
-            raise RuntimeError("Megatron batch has no owning typed runtime")
-        if payload.mark_packed_task is None:
-            return
-        _, cancelled = await complete_task(payload.mark_packed_task)
-        if cancelled is not None:
-            raise cancelled
 
     async def _delete_checkpoint_files(
         self,

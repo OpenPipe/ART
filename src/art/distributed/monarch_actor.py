@@ -469,7 +469,7 @@ class ArtHostService(Actor):
     ) -> TrajectoryQueueTake:
         return self._trajectory_queue(queue_id).take(consumer_id, count)
 
-    @resilient_endpoint
+    @resilient_endpoint(concurrent=True)
     async def mark_trajectories_packed(self, operation: TrajectoryQueuePacking) -> None:
         self._trajectory_queue(operation.queue_id).mark_packed(operation)
 

@@ -21,11 +21,12 @@ def _process_is_running(pid: int) -> bool:
     return state != "Z"
 
 
-def test_vllm_start_releases_the_host_service_mailbox() -> None:
+def test_concurrent_host_operations_release_the_service_mailbox() -> None:
     from art.distributed.monarch_actor import ArtHostService
 
-    start = ArtHostService.__dict__["start_vllm_member"]
-    assert getattr(start._method, "_monarch_concurrent_endpoint_wrapper", False)
+    for name in ("start_vllm_member", "mark_trajectories_packed"):
+        operation = ArtHostService.__dict__[name]
+        assert getattr(operation._method, "_monarch_concurrent_endpoint_wrapper", False)
 
 
 @pytest.mark.asyncio
