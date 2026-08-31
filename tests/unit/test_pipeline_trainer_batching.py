@@ -187,19 +187,23 @@ def test_async_packing_queue_reserves_ready_batch_across_target_shrink(
     )
 
     assert trainer.queue_maxsize == 31
-    assert output_queue.maxsize == 97
+    assert output_queue.maxsize == 130
 
 
 @pytest.mark.asyncio
-async def test_command_preparation_is_bounded_to_one_ready_batch(
+async def test_command_preparation_keeps_one_ready_while_preparing_next(
     tmp_path: Path,
 ) -> None:
     backend = MagicMock()
     contexts: list[SimpleNamespace] = []
+    second_prepared = asyncio.Event()
 
-    async def prepare_commands(*_args: object, **_kwargs: object) -> SimpleNamespace:
+    async def prepare_commands(*_args: object, **kwargs: object) -> SimpleNamespace:
         context = SimpleNamespace(preparation_metrics={}, abort=AsyncMock())
         contexts.append(context)
+        if len(contexts) == 2:
+            second_prepared.set()
+        assert kwargs["learner_parent_version"] == len(contexts) - 1
         return context
 
     backend.prepare_pipeline_commands = AsyncMock(side_effect=prepare_commands)
@@ -210,17 +214,13 @@ async def test_command_preparation_is_bounded_to_one_ready_batch(
     await trainer._output_queue.put(None)
 
     packing = asyncio.create_task(trainer._packing_stage())
+    await asyncio.wait_for(second_prepared.wait(), timeout=2.0)
+    assert len(contexts) == 2
+
     first = await asyncio.wait_for(trainer._packed_queue.get(), timeout=2.0)
     assert first is not None
-    assert len(contexts) == 1
-    await asyncio.sleep(0)
-    assert len(contexts) == 1
-
-    first.handoff.set()
     second = await asyncio.wait_for(trainer._packed_queue.get(), timeout=2.0)
     assert second is not None
-    assert len(contexts) == 2
-    second.handoff.set()
     assert await asyncio.wait_for(trainer._packed_queue.get(), timeout=2.0) is None
     await asyncio.wait_for(packing, timeout=2.0)
 

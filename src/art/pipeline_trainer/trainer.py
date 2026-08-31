@@ -475,9 +475,9 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
         ):
             data_plane_maxsize = queue_maxsize
             if supports_preparation:
-                # The executing command and each command prepared ahead retain
-                # their trajectory leases through optimizer commit.
-                data_plane_maxsize += (_PACKED_READY_AHEAD + 1) * self.max_batch_size
+                # The executing command, queued command, and command being
+                # prepared retain their trajectory leases through optimizer commit.
+                data_plane_maxsize += (_PACKED_READY_AHEAD + 2) * self.max_batch_size
             self._output_queue = result_queue_factory(data_plane_maxsize)
             await self._output_queue.start()
         else:
@@ -685,7 +685,7 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
             if isinstance(self._output_queue, DistributedTrajectoryQueue):
                 data_plane_maxsize = self.queue_maxsize
                 if self._packed_queue is not None:
-                    data_plane_maxsize += (_PACKED_READY_AHEAD + 1) * max(
+                    data_plane_maxsize += (_PACKED_READY_AHEAD + 2) * max(
                         previous_max_batch_size, self.max_batch_size
                     )
                 self._output_queue.set_maxsize(data_plane_maxsize)
@@ -1115,8 +1115,11 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
         assert self._packed_queue is not None
         prepare_commands = getattr(self.backend, "prepare_pipeline_commands", None)
         prepare_batch = getattr(self.backend, "prepare_pipeline_batch", None)
+        next_packing_policy_step = self.state.next_training_step
         while True:
-            packing_policy_step = self.state.next_training_step
+            packing_policy_step = max(
+                next_packing_policy_step, self.state.next_training_step
+            )
             if (
                 self._stop_training_step is not None
                 and packing_policy_step >= self._stop_training_step
@@ -1196,11 +1199,9 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                     await command_context.abort()
                 return
             await self._packed_queue.put(item)
+            next_packing_policy_step = packing_policy_step + 1
             fence_step = min(self._pre_next_dispatch_hooks, default=None)
-            if command_context is not None or (
-                fence_step is not None
-                and fence_step <= self.state.next_training_step + _PACKED_READY_AHEAD
-            ):
+            if fence_step is not None and fence_step <= packing_policy_step + 1:
                 await item.handoff.wait()
             if not self._accept_prepared_batches:
                 return
