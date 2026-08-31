@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -33,6 +34,7 @@ from art.megatron.context_parallel.types import (
     StagePlan,
     TokenRange,
 )
+from art.megatron.glm52.state import build_glm52_context_parallel_state
 from art.megatron.prefix_tree_packing import PrefixTreePack, prefix_tree_pack
 from art.megatron.prefix_tree_state import create_prefix_tree_state
 
@@ -436,6 +438,19 @@ def test_underfilled_remote_keys_fuse_into_the_local_stage() -> None:
     ]
     assert fused.slices[-1].q_range == TokenRange(2, 4)
     assert fused.slices[-1].k_range == TokenRange(4, 7)
+    glm_state = build_glm52_context_parallel_state(
+        position_ids=torch.arange(7).unsqueeze(0),
+        context_parallel_state=SimpleNamespace(
+            rank_plan=SimpleNamespace(
+                stage_plans=(fused,),
+                original_seq_len=7,
+            )
+        ),
+        device=torch.device("cpu"),
+    )
+    assert glm_state.stages[0].global_k_ids.tolist() == [3, 4, 5, 6, 0, 1, 2]
+    assert glm_state.route_by_global_id is not None
+    assert glm_state.route_by_global_id.tolist() == [4, 5, 6, 0, 1, 2, 3]
     block_mask = build_block_mask(
         FlexMaskSpec(
             q_len=fused.q_len,
