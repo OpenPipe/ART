@@ -466,7 +466,12 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
         if callable(result_queue_factory) and (
             supports_preparation or not local_data_plane
         ):
-            self._output_queue = result_queue_factory(queue_maxsize)
+            data_plane_maxsize = queue_maxsize
+            if supports_preparation:
+                # The current packed batch retains its trajectory leases through
+                # optimizer commit. Preserve one logical batch of ready-ahead room.
+                data_plane_maxsize += self.max_batch_size
+            self._output_queue = result_queue_factory(data_plane_maxsize)
             await self._output_queue.start()
         else:
             self._output_queue = _ResizableAsyncQueue(maxsize=queue_maxsize)
@@ -660,6 +665,7 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                 f"num_rollout_workers={settings.num_rollout_workers} exceeds rollout "
                 f"executor capacity {self.rollout_worker_capacity}"
             )
+        previous_max_batch_size = self.max_batch_size
         self.num_rollout_workers = settings.num_rollout_workers
         self.min_batch_size = settings.min_batch_size
         self.max_batch_size = settings.max_batch_size
@@ -670,7 +676,12 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
         self._rollout_executor.set_target(self.num_rollout_workers)
         if self._output_queue is not None:
             if isinstance(self._output_queue, DistributedTrajectoryQueue):
-                self._output_queue.set_maxsize(self.queue_maxsize)
+                data_plane_maxsize = self.queue_maxsize
+                if self._packed_queue is not None:
+                    data_plane_maxsize += max(
+                        previous_max_batch_size, self.max_batch_size
+                    )
+                self._output_queue.set_maxsize(data_plane_maxsize)
             else:
                 cast(
                     _ResizableAsyncQueue[TrajectoryGroup | None], self._output_queue

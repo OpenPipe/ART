@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 import torch
 from torch.nn.attention.flex_attention import BlockMask
@@ -15,14 +17,20 @@ from art.megatron.context_parallel.builder import (
     build_dense_reference_mask,
     build_prefix_tree_attention_spec,
 )
-from art.megatron.context_parallel.runtime import get_or_build_runtime_plan
+from art.megatron.context_parallel.runtime import (
+    _fuse_underfilled_remote_stage,
+    get_or_build_runtime_plan,
+)
 from art.megatron.context_parallel.types import (
     AttnMaskKind,
     AttnSlice,
     ContextParallelConfig,
+    DkvReducePlan,
     ExactMaskMetadata,
     FlexMaskSpec,
+    KvFetchPlan,
     ParallelTopology,
+    StagePlan,
     TokenRange,
 )
 from art.megatron.prefix_tree_packing import PrefixTreePack, prefix_tree_pack
@@ -356,6 +364,107 @@ def test_context_parallel_stage_masks_match_dense_nested_tree() -> None:
             max_depth=3,
         ),
         require_remote_stage=False,
+    )
+
+
+def test_underfilled_remote_keys_fuse_into_the_local_stage() -> None:
+    q_range = TokenRange(0, 4)
+    local_stage = StagePlan(
+        stage_index=0,
+        source_rank=0,
+        is_local_stage=True,
+        slices=(AttnSlice(q_range, TokenRange(0, 4), AttnMaskKind.CAUSAL, 0),),
+        owner_local_q_ranges=(q_range,),
+        owner_local_k_ranges=(TokenRange(0, 4),),
+        q_len=4,
+        k_len=4,
+        global_q_ranges=(TokenRange(3, 7),),
+        global_k_ranges=(TokenRange(3, 7),),
+        mask_metadata=ExactMaskMetadata(
+            q_token_indices=torch.tensor([3, 4, 5, 6]),
+            k_token_indices=torch.tensor([3, 4, 5, 6]),
+            cache_key="local",
+        ),
+    )
+    remote_stage = replace(
+        local_stage,
+        stage_index=1,
+        source_rank=1,
+        is_local_stage=False,
+        slices=(
+            AttnSlice(
+                TokenRange(0, 2),
+                TokenRange(0, 3),
+                AttnMaskKind.FULL,
+                0,
+            ),
+        ),
+        owner_local_q_ranges=(TokenRange(2, 4),),
+        owner_local_k_ranges=(TokenRange(0, 3),),
+        q_len=2,
+        global_q_ranges=(TokenRange(5, 7),),
+        global_k_ranges=(TokenRange(0, 3),),
+        mask_metadata=ExactMaskMetadata(
+            q_token_indices=torch.tensor([5, 6]),
+            k_token_indices=torch.tensor([0, 1, 2, -1]),
+            cache_key="remote",
+        ),
+        kv_fetch_plan=KvFetchPlan((0, 0), (0, 3), ((), ())),
+        dkv_reduce_plan=DkvReducePlan((0, 3), (0, 0), ((), ())),
+    )
+
+    fused = _fuse_underfilled_remote_stage(
+        local_stage,
+        remote_stage,
+        block_size=2,
+        remote_stage_fuse_limit=4,
+    )
+
+    assert fused is not None
+    assert fused.fused_remote_k_len == 3
+    assert fused.k_len == 8
+    assert fused.mask_metadata is not None
+    assert fused.mask_metadata.k_token_indices.tolist() == [
+        3,
+        4,
+        5,
+        6,
+        0,
+        1,
+        2,
+        -1,
+    ]
+    assert fused.slices[-1].q_range == TokenRange(2, 4)
+    assert fused.slices[-1].k_range == TokenRange(4, 7)
+    block_mask = build_block_mask(
+        FlexMaskSpec(
+            q_len=fused.q_len,
+            k_len=fused.k_len,
+            block_size=(2, 2),
+            slices=fused.slices,
+            exact_mask=fused.mask_metadata,
+        ),
+        group_ids=torch.tensor([1, 1, 1, 2, 2, 3, 3]),
+        parent_ids=torch.tensor([1, 1, 1, 2, 2, 1, 1]),
+        device=torch.device("cpu"),
+    )
+    assert block_mask is not None
+    q_indices = torch.arange(4)[:, None]
+    k_indices = torch.arange(8)[None, :]
+    assert block_mask.mask_mod(
+        torch.zeros_like(q_indices),
+        torch.zeros_like(q_indices),
+        q_indices,
+        k_indices,
+    ).equal(
+        torch.tensor(
+            [
+                [True, False, False, False, False, False, False, False],
+                [True, True, False, False, False, False, False, False],
+                [False, False, True, False, True, True, True, False],
+                [False, False, True, True, True, True, True, False],
+            ]
+        )
     )
 
 

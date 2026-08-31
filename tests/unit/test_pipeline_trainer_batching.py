@@ -9,7 +9,12 @@ from openai.types.chat.chat_completion_message import ChatCompletionMessage
 import pytest
 
 from art import PipelineRuntimeConfig, TrainableModel, Trajectory, TrajectoryGroup
+from art.distributed.rollout import (
+    DistributedTrajectoryQueue,
+    _InProcessTrajectoryQueueEndpoint,
+)
 from art.pipeline_trainer.trainer import PipelineTrainer, _PreparedPipelineItem
+from art.pipeline_tuner.config import PipelineTuneSettings
 
 
 async def _noop_rollout(*_args: object, **_kwargs: object) -> TrajectoryGroup:
@@ -119,6 +124,36 @@ async def test_collect_batch_respects_max_batch_size(tmp_path: Path) -> None:
 
     batch, discarded, saw_sentinel = await trainer._collect_batch(current_step=0)
     assert (batch, discarded, saw_sentinel) == (groups[2:], 0, True)
+
+
+def test_async_packing_queue_reserves_ready_batch_across_target_shrink(
+    tmp_path: Path,
+) -> None:
+    trainer = _packed_trainer(
+        tmp_path, MagicMock(), run_name="pipeline-queue-reserve-test"
+    )
+    trainer.max_batch_size = 33
+    output_queue = DistributedTrajectoryQueue(
+        endpoint=_InProcessTrajectoryQueueEndpoint(),
+        owner_endpoints={},
+        maxsize=66,
+        capacity_records=128,
+        capacity_bytes=128,
+    )
+    trainer._output_queue = output_queue
+
+    trainer.apply_pipeline_settings(
+        PipelineTuneSettings(
+            num_rollout_workers=1,
+            min_batch_size=31,
+            max_batch_size=31,
+            target_groups_per_step=31,
+            queue_maxsize=31,
+        )
+    )
+
+    assert trainer.queue_maxsize == 31
+    assert output_queue.maxsize == 64
 
 
 @pytest.mark.asyncio

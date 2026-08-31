@@ -55,6 +55,7 @@ class _PlanningBundle:
     owners: tuple[int, ...]
     wave_assignment: tuple[int, ...]
     token_layout_index: TokenLayoutIndex
+    remote_stage_fuse_limit: int
     gdn_execution_spec: Any | None = None
 
 
@@ -175,6 +176,7 @@ def _get_or_build_planning_bundle(
             owners=owners,
             cp_size=max(int(topology.cp), 1),
         ),
+        remote_stage_fuse_limit=int(config.planner_remote_stage_token_floor),
         gdn_execution_spec=gdn_execution_spec,
     )
     _cache_put(_PLANNING_BUNDLE_CACHE, planning_key, bundle)
@@ -210,6 +212,7 @@ def _get_or_build_bundle_rank_plan(
         original_seq_len=original_seq_len,
         target_rank=target_rank,
         block_size=block_size,
+        remote_stage_fuse_limit=bundle.remote_stage_fuse_limit,
     )
     _cache_put(_RANK_RUNTIME_PLAN_CACHE, cache_key, plan)
     return plan
@@ -2007,6 +2010,123 @@ def _build_stage_from_pieces(
     )
 
 
+def _fuse_underfilled_remote_stage(
+    local_stage: StagePlan,
+    remote_stage: StagePlan,
+    *,
+    block_size: int,
+    remote_stage_fuse_limit: int,
+) -> StagePlan | None:
+    if (
+        not local_stage.is_local_stage
+        or local_stage.fused_remote_k_len
+        or remote_stage.is_local_stage
+        or local_stage.mask_metadata is None
+        or remote_stage.mask_metadata is None
+        or remote_stage.kv_fetch_plan is None
+        or remote_stage.dkv_reduce_plan is None
+    ):
+        return None
+
+    local_k_len = _ranges_size(local_stage.owner_local_k_ranges)
+    remote_k_len = _ranges_size(remote_stage.owner_local_k_ranges)
+    logical_q_len = _ranges_size(local_stage.owner_local_q_ranges)
+    if (
+        logical_q_len <= 0
+        or local_k_len <= 0
+        or remote_k_len <= 0
+        or remote_k_len > int(remote_stage_fuse_limit)
+    ):
+        return None
+
+    shifted_remote_slices: list[AttnSlice] = []
+    for slice_ in remote_stage.slices:
+        try:
+            global_q_range = _unmap_stage_subrange(
+                slice_.q_range,
+                remote_stage.global_q_ranges,
+            )
+            local_q_range = _remap_subrange(
+                global_q_range,
+                local_stage.global_q_ranges,
+            )
+        except RuntimeError:
+            return None
+        remote_q_indices = remote_stage.mask_metadata.q_token_indices[
+            slice_.q_range.start : slice_.q_range.end
+        ]
+        local_q_indices = local_stage.mask_metadata.q_token_indices[
+            local_q_range.start : local_q_range.end
+        ]
+        if not torch.equal(local_q_indices, remote_q_indices):
+            return None
+        shifted_remote_slices.append(
+            replace(
+                slice_,
+                q_range=local_q_range,
+                k_range=TokenRange(
+                    start=int(slice_.k_range.start) + local_k_len,
+                    end=int(slice_.k_range.end) + local_k_len,
+                ),
+            )
+        )
+
+    combined_k_len = local_k_len + remote_k_len
+    padded_k_len = ((combined_k_len + int(block_size) - 1) // int(block_size)) * int(
+        block_size
+    )
+    k_token_indices = torch.cat(
+        (
+            local_stage.mask_metadata.k_token_indices[:local_k_len],
+            remote_stage.mask_metadata.k_token_indices[:remote_k_len],
+            torch.full(
+                (padded_k_len - combined_k_len,),
+                -1,
+                dtype=local_stage.mask_metadata.k_token_indices.dtype,
+                device=local_stage.mask_metadata.k_token_indices.device,
+            ),
+        )
+    )
+    q_token_indices = local_stage.mask_metadata.q_token_indices.clone()
+    return replace(
+        local_stage,
+        source_ranks=remote_stage.source_ranks,
+        wave_index=remote_stage.wave_index,
+        slices=local_stage.slices + tuple(shifted_remote_slices),
+        global_k_ranges=local_stage.global_k_ranges + remote_stage.global_k_ranges,
+        mask_metadata=ExactMaskMetadata(
+            q_token_indices=q_token_indices,
+            k_token_indices=k_token_indices,
+            cache_key=_exact_mask_metadata_cache_key(
+                q_token_indices=q_token_indices,
+                k_token_indices=k_token_indices,
+            ),
+        ),
+        remote_buffer_range=remote_stage.remote_buffer_range,
+        fused_remote_k_len=remote_k_len,
+        k_len=padded_k_len,
+        kv_fetch_plan=remote_stage.kv_fetch_plan,
+        dkv_reduce_plan=remote_stage.dkv_reduce_plan,
+    )
+
+
+def _empty_remote_stage(stage: StagePlan) -> StagePlan:
+    return replace(
+        stage,
+        slices=(),
+        owner_local_q_ranges=(),
+        owner_local_k_ranges=(),
+        q_len=0,
+        k_len=0,
+        global_q_ranges=(),
+        global_k_ranges=(),
+        mask_metadata=None,
+        remote_buffer_range=None,
+        kv_fetch_plan=None,
+        dkv_reduce_plan=None,
+    )
+
+
 def _build_rank_runtime_plan(
     *,
     row_spec: PackedRowAttentionSpec,
@@ -2018,6 +2138,7 @@ def _build_rank_runtime_plan(
     original_seq_len: int,
     target_rank: int,
     block_size: int,
+    remote_stage_fuse_limit: int,
 ) -> RankRuntimePlan:
     host_local_ranges = _chunk_ranges_for_owner(
         chunk_ranges=chunk_ranges,
@@ -2153,8 +2274,19 @@ def _build_rank_runtime_plan(
             remote_buffer_range=remote_buffer_range,
             block_size=block_size,
         )
+        fused_local_stage = _fuse_underfilled_remote_stage(
+            stage_plans[0],
+            stage_plan,
+            block_size=block_size,
+            remote_stage_fuse_limit=remote_stage_fuse_limit,
+        )
+        if fused_local_stage is not None:
+            stage_plans[0] = fused_local_stage
+            backward_stage_indices.append(0)
+            stage_plan = _empty_remote_stage(stage_plan)
+        else:
+            backward_stage_indices.append(int(stage_plan.stage_index))
         stage_plans.append(stage_plan)
-        backward_stage_indices.append(int(stage_plan.stage_index))
 
     aggregate_send_ranges = tuple(
         tuple(peer_ranges) for peer_ranges in aggregate_send_ranges_by_peer
@@ -2169,7 +2301,9 @@ def _build_rank_runtime_plan(
         local_valid_lengths=(local_token_count,),
         local_row_ranges=local_row_ranges,
         stage_plans=tuple(stage_plans),
-        backward_stage_indices=tuple(backward_stage_indices + [0]),
+        backward_stage_indices=tuple(
+            backward_stage_indices + ([] if stage_plans[0].fused_remote_k_len else [0])
+        ),
         remote_dkv_reduce_plan=DkvReducePlan(
             send_splits=tuple(aggregate_recv_splits),
             recv_splits=aggregate_send_splits,
@@ -2604,6 +2738,7 @@ def _build_runtime_plan(
             original_seq_len=original_seq_len,
             target_rank=rank,
             block_size=int(config.block_size),
+            remote_stage_fuse_limit=int(config.planner_remote_stage_token_floor),
         )
         for rank in range(cp_size)
     )
@@ -2756,6 +2891,25 @@ def _remap_subrange(
         stage_offset += merged_range.size()
     raise RuntimeError(
         "Failed to remap subrange into merged ranges: "
+        f"subrange={subrange}, merged_ranges={merged_ranges}"
+    )
+
+
+def _unmap_stage_subrange(
+    subrange: TokenRange,
+    merged_ranges: tuple[TokenRange, ...],
+) -> TokenRange:
+    stage_offset = 0
+    for merged_range in merged_ranges:
+        stage_end = stage_offset + merged_range.size()
+        if subrange.start >= stage_offset and subrange.end <= stage_end:
+            return TokenRange(
+                start=merged_range.start + subrange.start - stage_offset,
+                end=merged_range.start + subrange.end - stage_offset,
+            )
+        stage_offset = stage_end
+    raise RuntimeError(
+        "Failed to map stage subrange into global ranges: "
         f"subrange={subrange}, merged_ranges={merged_ranges}"
     )
 

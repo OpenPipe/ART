@@ -7,7 +7,12 @@ from art.pipeline_tuner.attachment import (
     PipelineAutotunerAttachment,
     VllmMetricPollHealth,
 )
-from art.pipeline_tuner.autotune import PipelineAutotuner, build_initial_settings
+from art.pipeline_tuner.autotune import (
+    PackingOutcome,
+    PackingProjection,
+    PipelineAutotuner,
+    build_initial_settings,
+)
 from art.pipeline_tuner.config import (
     PipelineTuneSettings,
     TunerDecision,
@@ -95,6 +100,100 @@ def test_queue_backpressure_does_not_mask_trainer_underfeed(
 
     assert decision.action == "increase_workers"
     assert decision.updated.num_rollout_workers > settings.num_rollout_workers
+
+
+def test_actual_packing_spill_backs_off_across_target_hysteresis(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = PipelineTuneSettings(
+        num_rollout_workers=40,
+        min_batch_size=29,
+        max_batch_size=33,
+        queue_maxsize=33,
+        target_groups_per_step=33,
+    )
+    tuner = PipelineAutotuner(
+        config=PipelineAutotuneConfig(target_group_min_relative_change=0.10),
+        settings=settings,
+        model_name="test",
+        backend_name="test",
+        packed_sequence_length=131072,
+        target_packed_sequences=1,
+        inference_gpu_count=8,
+        policy_age_limit_steps=4.0,
+    )
+    tuner._packing_outcomes.append(
+        PackingOutcome(step=7, groups=33, packed_sequences=2)
+    )
+    monkeypatch.setattr(
+        tuner,
+        "_packing_projections",
+        lambda _settings, _stats: [
+            PackingProjection(groups=32, spill_probability=0.0),
+            PackingProjection(groups=33, spill_probability=1.0),
+        ],
+    )
+
+    assert (
+        tuner._adaptive_target_groups(
+            settings,
+            TunerWindowStats(start_step=6, end_step=7),
+        )
+        == 32
+    )
+
+
+def test_successful_min_batch_trial_is_not_immediately_reversed() -> None:
+    settings = PipelineTuneSettings(
+        num_rollout_workers=46,
+        min_batch_size=30,
+        max_batch_size=30,
+        queue_maxsize=30,
+        target_groups_per_step=30,
+    )
+    tuner = PipelineAutotuner(
+        config=PipelineAutotuneConfig(),
+        settings=settings,
+        model_name="test",
+        backend_name="test",
+        packed_sequence_length=131072,
+        target_packed_sequences=1,
+        inference_gpu_count=2,
+        policy_age_limit_steps=4.0,
+    )
+    lowered = tuner._min_batch_adjustment(
+        settings,
+        TunerWindowStats(
+            start_step=14,
+            end_step=15,
+            collect_batch_s=0.35,
+            trainer_underfeed_score=0.27,
+            vllm_pressure=1.4,
+        ),
+        "hold",
+        inference_over=True,
+    )
+    assert lowered is not None
+    lowered_settings, action, _ = lowered
+    assert action == "lower_min_batch_size"
+    assert lowered_settings.min_batch_size == 26
+
+    assert (
+        tuner._min_batch_adjustment(
+            lowered_settings,
+            TunerWindowStats(
+                start_step=16,
+                end_step=17,
+                collect_batch_s=0.0,
+                trainer_underfeed_score=0.0,
+                vllm_pressure=0.47,
+            ),
+            "hold",
+            inference_over=False,
+        )
+        is None
+    )
+    assert tuner._min_batch_trial_baseline_collect_s is None
 
 
 @pytest.mark.parametrize("timeouts,raises", [(1, False), (2, True)])

@@ -714,6 +714,12 @@ class PipelineAutotuner:
         if self._min_batch_trial_baseline_collect_s is not None:
             if settings.min_batch_size != self._min_batch_trial_batch_size:
                 self._clear_min_batch_trial()
+            elif stats.collect_batch_s < (
+                self._min_batch_trial_baseline_collect_s
+                * self.config.min_batch_collect_improvement_ratio
+            ):
+                self._clear_min_batch_trial()
+                return None
             elif (
                 not inference_over
                 and stats.trainer_underfeed_score
@@ -985,6 +991,15 @@ class PipelineAutotuner:
             1, math.ceil(current * self.config.target_group_min_relative_change)
         )
         delta = observed - current
+        current_spilled = any(
+            outcome.groups == current
+            and outcome.packed_sequences > self.target_packed_sequences
+            for outcome in self._packing_outcomes
+        )
+        if delta < 0 and current_spilled:
+            self._target_candidate = None
+            self._target_candidate_count = 0
+            return observed
         if abs(delta) < min_delta:
             self._target_candidate = None
             self._target_candidate_count = 0
@@ -1221,8 +1236,9 @@ class PipelineAutotuner:
             decisions=self.decisions,
             notes=[
                 "The first warmup_ignore_steps are excluded from throughput decisions.",
-                "queue_maxsize bounds ready, packing, and packed groups to one target "
-                "batch; active rollouts add at most one worker wave.",
+                "queue_maxsize bounds the ready-ahead queue to one target batch; "
+                "distributed async packing reserves one additional bounded batch for "
+                "the current lease set, and active rollouts add at most one worker wave.",
                 *self._profile_recommendations(),
             ],
         )

@@ -102,7 +102,9 @@ def _backward(
         start, end = stage_starts[int(stage_index) : int(stage_index) + 2]
         dkv_stage = combined_dkv[0, start:end]
         if stage_plan.is_local_stage:
-            reduce_local_stage_rows_(dkv, dkv_stage, stage_plan, cp_state)
+            reduction = reduce_local_stage_rows_(dkv, dkv_stage, stage_plan, cp_state)
+            if reduction is not None:
+                reductions.append(reduction)
         else:
             reductions.append(
                 launch_remote_stage_reduce(dkv_stage, stage_plan, cp_state, dkv)
