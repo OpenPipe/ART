@@ -470,8 +470,8 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
             data_plane_maxsize = queue_maxsize
             if supports_preparation:
                 # The current packed batch retains its trajectory leases through
-                # optimizer commit. Preserve one logical batch of ready-ahead room.
-                data_plane_maxsize += self.max_batch_size
+                # optimizer commit. Preserve the bounded ready-ahead window.
+                data_plane_maxsize += _PACKED_READY_AHEAD * self.max_batch_size
             self._output_queue = result_queue_factory(data_plane_maxsize)
             await self._output_queue.start()
         else:
@@ -480,7 +480,7 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
             isinstance(self._output_queue, DistributedTrajectoryQueue)
             and supports_preparation
         ):
-            self._packed_queue = asyncio.Queue(maxsize=1)
+            self._packed_queue = asyncio.Queue(maxsize=_PACKED_READY_AHEAD)
         self._eval_queue = asyncio.Queue()
 
         loop = asyncio.get_running_loop()
@@ -679,7 +679,7 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
             if isinstance(self._output_queue, DistributedTrajectoryQueue):
                 data_plane_maxsize = self.queue_maxsize
                 if self._packed_queue is not None:
-                    data_plane_maxsize += max(
+                    data_plane_maxsize += _PACKED_READY_AHEAD * max(
                         previous_max_batch_size, self.max_batch_size
                     )
                 self._output_queue.set_maxsize(data_plane_maxsize)
