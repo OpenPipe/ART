@@ -1,4 +1,4 @@
-from typing import Literal
+from typing import Literal, cast
 
 from typing_extensions import TypedDict
 
@@ -18,6 +18,16 @@ def get_openai_server_config(
         config = OpenAIServerConfig()
     log_file = config.get("log_file", log_file)
 
+    from art.megatron.model_support.registry import (
+        UnsupportedModelArchitectureError,
+        get_model_support_handler,
+    )
+
+    try:
+        handler = get_model_support_handler(base_model)
+    except UnsupportedModelArchitectureError:
+        handler = None
+
     # Build LoRA modules list for multi-checkpoint support.
     # Only register the explicit step-qualified name so unsuffixed
     # trainable model names fail loudly.
@@ -33,6 +43,8 @@ def get_openai_server_config(
         enable_auto_tool_choice=True,
         tool_call_parser="hermes",
     )
+    if handler is not None:
+        server_args.update(cast(ServerArgs, handler.vllm_server_args()))
     server_args.update(config.get("server_args", {}))
     engine_args = EngineArgs(
         model=base_model,
@@ -41,6 +53,8 @@ def get_openai_server_config(
         served_model_name=base_model if lora_path else model_name,
         generation_config="vllm",
     )
+    if handler is not None:
+        engine_args.update(cast(EngineArgs, handler.vllm_engine_args()))
     engine_args.update(config.get("engine_args", {}))
     return OpenAIServerConfig(
         log_file=log_file, server_args=server_args, engine_args=engine_args

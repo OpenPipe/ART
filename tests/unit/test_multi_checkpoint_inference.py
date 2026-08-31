@@ -250,6 +250,29 @@ class TestOpenAIServerConfigLoraName:
             == "meta-llama/Llama-3.1-8B"
         )
 
+    def test_model_defaults_precede_explicit_server_config(self):
+        from art.dev.openai_server import get_openai_server_config
+
+        defaults = get_openai_server_config(
+            model_name="gpt-oss",
+            base_model="openai/gpt-oss-20b",
+            log_file="/tmp/test.log",
+        )
+        assert defaults["server_args"]["tool_call_parser"] == "openai"
+        assert defaults["engine_args"]["moe_backend"] == "triton_unfused"
+
+        overridden = get_openai_server_config(
+            model_name="gpt-oss",
+            base_model="openai/gpt-oss-20b",
+            log_file="/tmp/test.log",
+            config={
+                "server_args": {"tool_call_parser": "hermes"},
+                "engine_args": {"moe_backend": "flashinfer"},
+            },
+        )
+        assert overridden["server_args"]["tool_call_parser"] == "hermes"
+        assert overridden["engine_args"]["moe_backend"] == "flashinfer"
+
 
 # =============================================================================
 # Step Parsing Tests
