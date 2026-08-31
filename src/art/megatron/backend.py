@@ -30,6 +30,10 @@ _CONTEXT_PARALLEL_MIN_PREFIX_TREE_SHARED_SEGMENT_LENGTH = 256
 _PIPELINE_TRAIN_DISPATCH: ContextVar[asyncio.Event | None] = ContextVar(
     "megatron_pipeline_train_dispatch", default=None
 )
+_PIPELINE_TRAIN_STEP: ContextVar[int | None] = ContextVar(
+    "megatron_pipeline_train_step", default=None
+)
+_COMMITTED_LEARNER_STEP_METRIC = "_art/committed_learner_step"
 
 
 class _DistributedBatchPayload(BaseModel):
@@ -389,6 +393,7 @@ class MegatronBackend(LocalBackend):
         if dispatch_event is not None and dispatch_event.is_set():
             raise RuntimeError("pipeline train dispatch fence is already set")
         token = _PIPELINE_TRAIN_DISPATCH.set(dispatch_event)
+        step_token = _PIPELINE_TRAIN_STEP.set(None)
         try:
             if dispatch_event is not None and not pipeline_call:
                 raise RuntimeError("trainer dispatch fencing requires a prepared batch")
@@ -401,6 +406,7 @@ class MegatronBackend(LocalBackend):
                 **kwargs,
             )
         finally:
+            _PIPELINE_TRAIN_STEP.reset(step_token)
             _PIPELINE_TRAIN_DISPATCH.reset(token)
         service = cast(DistributedMegatronService, await self._get_service(model))
         final_step = kwargs.get("final_training_step")
@@ -1203,6 +1209,12 @@ class MegatronBackend(LocalBackend):
             service_dev_config,
             dispatch_event=_PIPELINE_TRAIN_DISPATCH.get(),
         ):
+            committed_step = result.pop(_COMMITTED_LEARNER_STEP_METRIC, None)
+            if committed_step is not None:
+                exact_step = int(committed_step)
+                if float(exact_step) != committed_step:
+                    raise RuntimeError("trainer committed a non-integral learner step")
+                _PIPELINE_TRAIN_STEP.set(exact_step)
             yield {
                 **result,
                 **distributed_service.drain_publication_metrics(),
@@ -1414,6 +1426,8 @@ class MegatronBackend(LocalBackend):
     async def _get_step(self, model: AnyTrainableModel) -> int:
         if not model.trainable:
             return 0
+        if (pipeline_step := _PIPELINE_TRAIN_STEP.get()) is not None:
+            return pipeline_step
         await self._get_service(cast(TrainableModel, model))
         storage_key = self._model_storage_key(model)
         if storage_key in self._services:

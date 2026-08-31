@@ -1062,6 +1062,7 @@ class DistributedMegatronService:
                 await self.wait_for_serving(next_step)
             final_metrics.update(
                 {
+                    "_art/committed_learner_step": float(next_step),
                     "time/step_service_lock_wait_s": lock_wait_s,
                     "time/step_service_trainer_prepare_s": (
                         self._trainer_preparation_s
