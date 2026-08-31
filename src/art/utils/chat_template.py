@@ -12,19 +12,46 @@ _QWEN_PRESERVE_PRIOR_THINKING = (
     "{%- if (preserve_thinking is defined and preserve_thinking is true) or "
     "(loop.index0 > ns.last_query_index) %}"
 )
+_GEMMA_DROP_PRIOR_THINKING = (
+    "thinking_text and loop.index0 > ns_turn.last_user_idx and "
+    "message.get('tool_calls')"
+)
+_GEMMA_PRESERVE_PRIOR_THINKING = (
+    "thinking_text and ((preserve_thinking is defined and preserve_thinking is true) "
+    "or loop.index0 > ns_turn.last_user_idx) and message.get('tool_calls')"
+)
+_MINIMAX_DROP_PRIOR_THINKING = "reasoning_content and loop.index0 > ns.last_user_index"
+_MINIMAX_PRESERVE_PRIOR_THINKING = (
+    "reasoning_content and ((preserve_thinking is defined and preserve_thinking is "
+    "true) or loop.index0 > ns.last_user_index)"
+)
 
 
 def chat_template_with_preserved_thinking(chat_template: object) -> object:
-    """Add Qwen's newer opt-in prior-turn reasoning gate to older templates."""
-    if (
-        not isinstance(chat_template, str)
-        or "enable_thinking" not in chat_template
-        or chat_template.count(_QWEN_DROP_PRIOR_THINKING) != 1
-    ):
+    """Add opt-in prior-turn reasoning gates to supported templates."""
+    if not isinstance(chat_template, str):
         return chat_template
-    return chat_template.replace(
-        _QWEN_DROP_PRIOR_THINKING, _QWEN_PRESERVE_PRIOR_THINKING
+    replacements = (
+        (
+            _QWEN_DROP_PRIOR_THINKING,
+            _QWEN_PRESERVE_PRIOR_THINKING,
+            "enable_thinking" in chat_template,
+        ),
+        (
+            _GEMMA_DROP_PRIOR_THINKING,
+            _GEMMA_PRESERVE_PRIOR_THINKING,
+            True,
+        ),
+        (
+            _MINIMAX_DROP_PRIOR_THINKING,
+            _MINIMAX_PRESERVE_PRIOR_THINKING,
+            True,
+        ),
     )
+    for old, new, supported in replacements:
+        if supported and chat_template.count(old) == 1:
+            chat_template = chat_template.replace(old, new)
+    return chat_template
 
 
 def configure_preserved_thinking_chat_template(tokenizer: object) -> object:
@@ -45,6 +72,10 @@ def default_chat_template_kwargs_for_template(
         kwargs["enable_thinking"] = False
     if "preserve_thinking" in chat_template:
         kwargs["preserve_thinking"] = True
+    if "clear_thinking" in chat_template:
+        kwargs["clear_thinking"] = False
+    if "deepseek_v4_python_encoder" in chat_template:
+        kwargs["drop_thinking"] = False
     return kwargs
 
 

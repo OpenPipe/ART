@@ -445,6 +445,37 @@ def test_native_or_unrecognized_thinking_templates_are_unchanged() -> None:
     assert chat_template_with_preserved_thinking(unrelated) == unrelated
 
 
+@pytest.mark.parametrize(
+    ("template", "expected_kwargs"),
+    (
+        (
+            "{% if enable_thinking %}x{% endif %} "
+            "thinking_text and loop.index0 > ns_turn.last_user_idx and "
+            "message.get('tool_calls')",
+            {"enable_thinking": False, "preserve_thinking": True},
+        ),
+        (
+            "reasoning_content and loop.index0 > ns.last_user_index",
+            {"preserve_thinking": True},
+        ),
+        (
+            "{% if enable_thinking %}x{% endif %} {% if clear_thinking %}x{% endif %}",
+            {"enable_thinking": False, "clear_thinking": False},
+        ),
+        (
+            "deepseek_v4_python_encoder enable_thinking",
+            {"enable_thinking": False, "drop_thinking": False},
+        ),
+    ),
+)
+def test_thinking_template_family_defaults(
+    template: str, expected_kwargs: dict[str, bool]
+) -> None:
+    configured = chat_template_with_preserved_thinking(template)
+
+    assert default_chat_template_kwargs_for_template(configured) == expected_kwargs
+
+
 def test_tokenize_sft_batch_masks_response_tokens_without_unsloth_import() -> None:
     tokenizer = _FakeTokenizer()
     messages = cast(

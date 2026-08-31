@@ -105,6 +105,12 @@ class TensorizedHistory(_StringInterningModel):
     def validate_tokenwise_lengths(self) -> Self:
         if not (len(self.tokens) == len(self.logprobs) == len(self.flags)):
             raise ValueError("Tensorized history fields differ in length")
+        sampled = self.flags.bitwise_and(int(TokenFlag.SAMPLED)).bool()
+        exact = self.flags.bitwise_and(int(TokenFlag.EXACT)).bool()
+        if bool((sampled & ~exact).any().item()):
+            raise ValueError(
+                "SAMPLED tokens must also be EXACT; regenerate this tokenization"
+            )
         return self
 
     def to(self, device: torch.device | str) -> Self:

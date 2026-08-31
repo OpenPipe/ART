@@ -15,9 +15,41 @@ def _history() -> tr.TokenizedHistory:
         logprobs=[math.nan, -0.25],
         flags=[
             tr.TokenFlag.EXACT,
-            tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED,
+            tr.TokenFlag.EXACT
+            | tr.TokenFlag.SAMPLED
+            | tr.TokenFlag.ASSISTANT
+            | tr.TokenFlag.STOP,
         ],
     )
+
+
+def test_token_provenance_flag_values_and_invariant() -> None:
+    assert tr.TokenFlag.EXACT == 1
+    assert tr.TokenFlag.SAMPLED == 2
+    assert tr.TokenFlag.ASSISTANT == 4
+    assert tr.TokenFlag.STOP == 8
+    assert not hasattr(tr.TokenizedHistory, "exact_mask")
+    assert not hasattr(tr.TokenizedHistory, "sampled_mask")
+    assert not hasattr(tr.TokenizedHistory, "assistant_mask")
+    assert not hasattr(tr.TokenizedHistory, "stop_mask")
+
+    with pytest.raises(ValueError, match="SAMPLED tokens must also be EXACT"):
+        tr.TokenizedHistory(
+            history=tr.LegacyHistory(messages_and_choices=[]),
+            model="policy",
+            tokens=[1],
+            logprobs=[math.nan],
+            flags=[tr.TokenFlag.SAMPLED],
+        )
+
+    value = tr.TokenizedHistory(
+        history=tr.LegacyHistory(messages_and_choices=[]),
+        model="policy",
+        tokens=[1],
+        logprobs=[math.nan],
+        flags=[tr.TokenFlag.ASSISTANT],
+    )
+    assert value.flags == [tr.TokenFlag.ASSISTANT]
 
 
 def _assert_history_round_trip(

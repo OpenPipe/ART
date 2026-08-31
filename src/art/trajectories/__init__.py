@@ -150,8 +150,12 @@ class TokenFlag(IntFlag):
 
     # The ID came from inference metadata rather than client-side tokenization.
     EXACT = 1 << 0
-    # The token belongs to a model-sampled response rather than its prompt.
+    # The exact token ID belongs to a model-sampled response rather than its prompt.
     SAMPLED = 1 << 1
+    # The token is in a rendered assistant continuation and may be inexact.
+    ASSISTANT = 1 << 2
+    # The token belongs to a generation-terminating token or sequence.
+    STOP = 1 << 3
 
 
 class ChatCompletionsRequest(TypedDict, total=False, extra_items=Any):
@@ -1081,6 +1085,13 @@ class TokenizedHistory(_StringInterningModel):
     def validate_tokenwise_lengths(self) -> TokenizedHistory:
         if not (len(self.tokens) == len(self.logprobs) == len(self.flags)):
             raise ValueError("Tokenized history fields differ in length")
+        if any(
+            flag & TokenFlag.SAMPLED and not flag & TokenFlag.EXACT
+            for flag in self.flags
+        ):
+            raise ValueError(
+                "SAMPLED tokens must also be EXACT; regenerate this tokenization"
+            )
         return self
 
     def tensorize(

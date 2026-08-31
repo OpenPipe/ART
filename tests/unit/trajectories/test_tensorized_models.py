@@ -22,8 +22,26 @@ def _tokenized_history() -> tr.TokenizedHistory:
         model="policy",
         tokens=[1, 2],
         logprobs=[math.nan, -0.25],
-        flags=[tr.TokenFlag.EXACT, tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED],
+        flags=[
+            tr.TokenFlag.EXACT,
+            tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED | tr.TokenFlag.STOP,
+        ],
     )
+
+
+def test_tensorized_history_rejects_sampled_without_exact() -> None:
+    assert not hasattr(tr.TensorizedHistory, "exact_mask")
+    assert not hasattr(tr.TensorizedHistory, "sampled_mask")
+    assert not hasattr(tr.TensorizedHistory, "assistant_mask")
+    assert not hasattr(tr.TensorizedHistory, "stop_mask")
+    with pytest.raises(ValueError, match="SAMPLED tokens must also be EXACT"):
+        tr.TensorizedHistory(
+            history=tr.LegacyHistory(messages_and_choices=[]),
+            model="policy",
+            tokens=[1],
+            logprobs=[math.nan],
+            flags=[tr.TokenFlag.SAMPLED],
+        )
 
 
 def _trajectory() -> art.Trajectory:

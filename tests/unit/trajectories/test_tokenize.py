@@ -9,7 +9,7 @@ from statistics import median
 import sys
 from time import perf_counter
 from types import ModuleType, SimpleNamespace
-from typing import Any, cast
+from typing import Any, Never, cast
 
 from anthropic.types import ImageBlockParam, Message, MessageParam
 from openai.types import Completion
@@ -163,6 +163,489 @@ def _message_exchange(
     )
 
 
+class _StopTokenizer:
+    eos_token_id = 9
+    unk_token_id = 0
+    all_special_tokens = ["<|im_end|>"]
+    special_tokens_map = {"eos_token": "<|im_end|>"}
+
+    def __call__(self, text: str, **kwargs: object) -> list[int]:
+        del kwargs
+        return {
+            "answer": [2],
+            "END": [8, 9],
+            "question": [1],
+            "turn 0": [1],
+            "turn 1": [3],
+        }[text]
+
+    def convert_tokens_to_ids(self, token: str) -> int:
+        return 9 if token == "<|im_end|>" else 0
+
+    def decode(self, token_ids: list[int], **kwargs: object) -> str:
+        del kwargs
+        return "".join("<|im_end|>" if token == 9 else "answer" for token in token_ids)
+
+    def apply_chat_template(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        add_generation_prompt: bool,
+        **kwargs: object,
+    ) -> list[int]:
+        del kwargs
+        content = [message.get("content") for message in messages]
+        if content == ["question", "answer"]:
+            assert not add_generation_prompt
+            return [1, 2, 9]
+        if content == ["question"]:
+            assert add_generation_prompt
+            return [1]
+        if content == ["turn 0", "answer", "turn 1", "answer"]:
+            assert not add_generation_prompt
+            return [1, 2, 9, 3, 4, 9]
+        if content == ["turn 0", "answer", "turn 1"]:
+            assert add_generation_prompt
+            return [1, 2, 9, 3]
+        if content == ["turn 0", "answer"]:
+            assert not add_generation_prompt
+            return [1, 2, 9]
+        if content == ["turn 0", ""]:
+            assert not add_generation_prompt
+            return [1, 9]
+        if content == ["turn 0"]:
+            assert add_generation_prompt
+            return [1]
+        raise AssertionError(content)
+
+
+def test_exact_sampled_eos_is_stop_when_tokenizer_identifies_it() -> None:
+    exchange = _chat_exchange([1], [2, 9])
+
+    tokenized = art.Trajectory(
+        exchanges=TrajectoryExchanges(chat_completions=[exchange])
+    ).tokenize(tokenizer=_StopTokenizer())
+
+    assert tokenized.flags[-1] == (
+        tr.TokenFlag.EXACT
+        | tr.TokenFlag.SAMPLED
+        | tr.TokenFlag.ASSISTANT
+        | tr.TokenFlag.STOP
+    )
+
+
+def test_exact_sampled_tool_stop_is_stop_when_tokenizer_identifies_it() -> None:
+    exchange = _chat_exchange([1], [4, 9])
+    data = exchange.response.model_dump(mode="python")
+    data["choices"][0]["finish_reason"] = "tool_calls"
+    data["choices"][0]["message"]["content"] = None
+    data["choices"][0]["message"]["tool_calls"] = [
+        {
+            "id": "call-1",
+            "type": "function",
+            "function": {"name": "lookup", "arguments": "{}"},
+        }
+    ]
+    exchange.response = ChatCompletion.model_validate(data)
+
+    tokenized = art.Trajectory(
+        exchanges=TrajectoryExchanges(chat_completions=[exchange])
+    ).tokenize(tokenizer=_StopTokenizer())
+
+    assert tokenized.flags[-1] == (
+        tr.TokenFlag.EXACT
+        | tr.TokenFlag.SAMPLED
+        | tr.TokenFlag.ASSISTANT
+        | tr.TokenFlag.STOP
+    )
+
+
+def test_length_stop_keeps_sampled_content_and_adds_synthetic_stop() -> None:
+    exchange = _chat_exchange([1], [2])
+    exchange.response.choices[0].finish_reason = "length"
+
+    tokenized = art.Trajectory(
+        exchanges=TrajectoryExchanges(chat_completions=[exchange])
+    ).tokenize(tokenizer=_StopTokenizer())
+
+    assert tokenized.tokens == [1, 2, 9]
+    assert tokenized.flags == [
+        tr.TokenFlag.EXACT,
+        tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED | tr.TokenFlag.ASSISTANT,
+        tr.TokenFlag.ASSISTANT | tr.TokenFlag.STOP,
+    ]
+
+
+def test_later_exact_prompt_upgrades_synthetic_stop_without_sampling_it() -> None:
+    first = _chat_exchange([1], [2])
+    first.response.choices[0].finish_reason = "length"
+    second = _chat_exchange([1, 2, 9, 3], [4, 9], offset=1)
+
+    tokenized = art.Trajectory(
+        exchanges=TrajectoryExchanges(chat_completions=[first, second])
+    ).tokenize(tokenizer=_StopTokenizer())
+
+    assert tokenized.tokens == [1, 2, 9, 3, 4, 9]
+    assert tokenized.flags[2] == (
+        tr.TokenFlag.EXACT | tr.TokenFlag.ASSISTANT | tr.TokenFlag.STOP
+    )
+    assert not tokenized.flags[2] & tr.TokenFlag.SAMPLED
+
+
+def test_integer_stop_reason_marks_raw_completions_without_assistant() -> None:
+    exchange = _completion_exchange()
+    choice = exchange.response.choices[0]
+    choice.__pydantic_extra__ = {**(choice.__pydantic_extra__ or {}), "stop_reason": 2}
+
+    tokenized = art.Trajectory(
+        exchanges=TrajectoryExchanges(completions=[exchange])
+    ).tokenize(tokenizer=_StopTokenizer())
+
+    assert tokenized.flags[-1] == (
+        tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED | tr.TokenFlag.STOP
+    )
+
+
+def test_stop_string_marks_only_its_exact_terminal_sequence() -> None:
+    exchange = _completion_exchange()
+    choice = exchange.response.choices[0]
+    choice.__pydantic_extra__ = {
+        **(choice.__pydantic_extra__ or {}),
+        "stop_reason": "END",
+    }
+    choice.__pydantic_extra__["token_ids"] = [2, 8, 9]
+    assert choice.logprobs is not None
+    choice.logprobs.tokens = ["token_id:2", "token_id:8", "token_id:9"]
+    choice.logprobs.token_logprobs = [-0.2, -0.8, -0.9]
+    choice.text = "answer"
+
+    tokenized = art.Trajectory(
+        exchanges=TrajectoryExchanges(completions=[exchange])
+    ).tokenize(tokenizer=_StopTokenizer())
+
+    assert not tokenized.flags[-3] & tr.TokenFlag.STOP
+    assert all(flag & tr.TokenFlag.STOP for flag in tokenized.flags[-2:])
+
+
+def test_metadata_only_final_token_is_preserved_as_sampled_stop() -> None:
+    exchange = _chat_exchange([1], [9])
+    exchange.response.choices[0].message.content = ""
+
+    tokenized = art.Trajectory(
+        exchanges=TrajectoryExchanges(chat_completions=[exchange])
+    ).tokenize()
+
+    assert tokenized.tokens == [1, 9]
+    assert tokenized.flags[-1] == (
+        tr.TokenFlag.EXACT
+        | tr.TokenFlag.SAMPLED
+        | tr.TokenFlag.ASSISTANT
+        | tr.TokenFlag.STOP
+    )
+
+
+def test_empty_output_materializes_a_synthetic_stop() -> None:
+    exchange = _chat_exchange([1], [])
+    exchange.response.choices[0].message.content = ""
+
+    tokenized = art.Trajectory(
+        exchanges=TrajectoryExchanges(chat_completions=[exchange])
+    ).tokenize(tokenizer=_StopTokenizer())
+
+    assert tokenized.tokens == [1, 9]
+    assert tokenized.flags == [
+        tr.TokenFlag.EXACT,
+        tr.TokenFlag.ASSISTANT | tr.TokenFlag.STOP,
+    ]
+
+
+class _RoleBoundaryTokenizer:
+    unk_token_id = 0
+    all_special_tokens = ["<|user|>", "<|observation|>"]
+
+    def __call__(self, text: str, **kwargs: object) -> list[int]:
+        del kwargs
+        return {"turn 0": [1], "turn 1": [3], "answer": [2]}.get(text, [4])
+
+    def convert_tokens_to_ids(self, token: str) -> int:
+        return {"<|user|>": 10, "<|observation|>": 11}.get(token, 0)
+
+    def decode(self, token_ids: list[int], **kwargs: object) -> str:
+        del kwargs
+        return "".join(
+            {10: "<|user|>", 11: "<|observation|>"}.get(token, "x")
+            for token in token_ids
+        )
+
+    def apply_chat_template(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        add_generation_prompt: bool,
+        **kwargs: object,
+    ) -> list[int]:
+        del add_generation_prompt, kwargs
+        rendered: list[int] = []
+        for index, message in enumerate(messages):
+            if message["role"] == "user":
+                rendered.append(1 if message.get("content") == "turn 0" else 3)
+                continue
+            rendered.append(4 if message.get("tool_calls") else 2)
+            if index < len(messages) - 1:
+                rendered.append(11 if message.get("tool_calls") else 10)
+        return rendered
+
+
+@pytest.mark.parametrize(
+    ("message", "stop_id"),
+    [
+        ({"role": "assistant", "content": "answer"}, 10),
+        (
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call-1",
+                        "type": "function",
+                        "function": {"name": "lookup", "arguments": "{}"},
+                    }
+                ],
+            },
+            11,
+        ),
+    ],
+)
+def test_glm_final_assistant_materializes_role_stop(
+    message: dict[str, Any], stop_id: int
+) -> None:
+    history = tr.ChatCompletionsHistory(
+        model="test/glm",
+        messages=[{"role": "user", "content": "turn 0"}, message],
+        message_sources=[None, None],
+    )
+
+    tokenized = history.tokenize(tokenizer=_RoleBoundaryTokenizer())
+
+    assert tokenized.tokens[-1] == stop_id
+    assert tokenized.flags[-1] == tr.TokenFlag.ASSISTANT | tr.TokenFlag.STOP
+
+
+def test_glm_following_role_prefix_is_owned_by_preceding_assistant() -> None:
+    history = tr.ChatCompletionsHistory(
+        model="test/glm",
+        messages=[
+            {"role": "user", "content": "turn 0"},
+            {"role": "assistant", "content": "answer"},
+            {"role": "user", "content": "turn 1"},
+        ],
+        message_sources=[None, None, None],
+    )
+
+    tokenized = history.tokenize(tokenizer=_RoleBoundaryTokenizer())
+
+    assert tokenized.tokens == [1, 2, 10, 3]
+    assert tokenized.flags[2] == tr.TokenFlag.ASSISTANT | tr.TokenFlag.STOP
+    assert tokenized.flags[3] == tr.TokenFlag(0)
+
+
+class _CanonicalStopTokenizer:
+    eos_token_id = 9
+    unk_token_id = 0
+
+    def __init__(self, stop_token: str) -> None:
+        self.stop_token = stop_token
+        self.all_special_tokens = [stop_token, "<|tool_response>"]
+        self.special_tokens_map = {"eos_token": stop_token}
+
+    def __call__(self, text: str, **kwargs: object) -> list[int]:
+        del kwargs
+        return {"question": [1], "answer": [2]}.get(text, [8])
+
+    def convert_tokens_to_ids(self, token: str) -> int:
+        return {self.stop_token: 9, "<|tool_response>": 8}.get(token, 0)
+
+    def decode(self, token_ids: list[int], **kwargs: object) -> str:
+        del kwargs
+        return "".join(
+            self.stop_token if token == 9 else "<|tool_response>" if token == 8 else "x"
+            for token in token_ids
+        )
+
+    def apply_chat_template(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        add_generation_prompt: bool,
+        **kwargs: object,
+    ) -> list[int]:
+        del add_generation_prompt, kwargs
+        if messages[-1]["role"] != "assistant":
+            return [1]
+        if messages[-1].get("tool_calls"):
+            return [1, 8 if self.stop_token == "<turn|>" else 9]
+        return [1, 2, 9]
+
+
+@pytest.mark.parametrize(
+    ("model", "stop_token"),
+    [
+        ("test/qwen", "<|im_end|>"),
+        ("test/gemma", "<turn|>"),
+        ("test/deepseek", "<｜end▁of▁sentence｜>"),
+        ("test/minimax", "</s>"),
+        ("openai/gpt-oss-20b", "<|return|>"),
+    ],
+)
+def test_template_family_canonical_stop_is_assistant_stop(
+    model: str, stop_token: str
+) -> None:
+    history = tr.ChatCompletionsHistory(
+        model=model,
+        messages=[
+            {"role": "user", "content": "question"},
+            {"role": "assistant", "content": "answer"},
+        ],
+        message_sources=[None, None],
+    )
+
+    tokenized = history.tokenize(tokenizer=_CanonicalStopTokenizer(stop_token))
+
+    assert tokenized.tokens[-1] == 9
+    assert tokenized.flags[-1] == tr.TokenFlag.ASSISTANT | tr.TokenFlag.STOP
+
+
+def test_gemma_tool_response_marker_is_the_tool_call_stop() -> None:
+    history = tr.ChatCompletionsHistory(
+        model="test/gemma",
+        messages=[
+            {"role": "user", "content": "question"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call-1",
+                        "type": "function",
+                        "function": {"name": "lookup", "arguments": "{}"},
+                    }
+                ],
+            },
+        ],
+        message_sources=[None, None],
+    )
+
+    tokenized = history.tokenize(tokenizer=_CanonicalStopTokenizer("<turn|>"))
+
+    assert tokenized.tokens[-1] == 8
+    assert tokenized.flags[-1] == tr.TokenFlag.ASSISTANT | tr.TokenFlag.STOP
+
+
+def test_gpt_oss_tool_stop_is_black_box() -> None:
+    history = tr.ChatCompletionsHistory(
+        model="openai/gpt-oss-20b",
+        messages=[
+            {"role": "user", "content": "question"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call-1",
+                        "type": "function",
+                        "function": {"name": "lookup", "arguments": "{}"},
+                    }
+                ],
+            },
+        ],
+        message_sources=[None, None],
+    )
+
+    tokenized = history.tokenize(tokenizer=_CanonicalStopTokenizer("<|call|>"))
+
+    assert tokenized.tokens[-1] == 9
+    assert tokenized.flags[-1] == tr.TokenFlag.ASSISTANT | tr.TokenFlag.STOP
+
+
+def test_messages_sampled_stop_and_length_stop_provenance() -> None:
+    stopped = _message_exchange(
+        MessagesRequest(
+            model="test/model",
+            messages=[{"role": "user", "content": "question"}],
+            max_tokens=16,
+        ),
+        prompt_token_ids=[1],
+        token_ids=[2, 9],
+        logprobs=[-0.2, -0.9],
+    )
+    length = _message_exchange(
+        stopped.request,
+        identifier="message-length",
+        prompt_token_ids=[1],
+        token_ids=[2],
+        logprobs=[-0.2],
+        stop_reason="max_tokens",
+    )
+
+    sampled = (
+        art.Trajectory(exchanges=TrajectoryExchanges(messages=[stopped]))
+        .anthropic_messages_history()
+        .tokenize(tokenizer=_StopTokenizer())
+    )
+    synthetic = (
+        art.Trajectory(exchanges=TrajectoryExchanges(messages=[length]))
+        .anthropic_messages_history()
+        .tokenize(tokenizer=_StopTokenizer())
+    )
+
+    assert sampled.flags[-1] == (
+        tr.TokenFlag.EXACT
+        | tr.TokenFlag.SAMPLED
+        | tr.TokenFlag.ASSISTANT
+        | tr.TokenFlag.STOP
+    )
+    assert synthetic.tokens == [1, 2, 9]
+    assert synthetic.flags[-1] == tr.TokenFlag.ASSISTANT | tr.TokenFlag.STOP
+
+
+def test_responses_sampled_stop_and_length_stop_provenance() -> None:
+    stopped = _response_exchange("response-stop", 2, prompt_token_ids=[1])
+    stopped_data = stopped.response.model_dump(mode="python")
+    stopped_data["status"] = "completed"
+    stopped_data["token_generations"][0]["output_tokens"] = [
+        {"token_id": 2, "logprob": -0.2},
+        {"token_id": 9, "logprob": -0.9},
+    ]
+    stopped.response = Response.model_validate(stopped_data)
+
+    length = _response_exchange("response-length", 2, prompt_token_ids=[1])
+    length_data = length.response.model_dump(mode="python")
+    length_data["status"] = "incomplete"
+    length_data["incomplete_details"] = {"reason": "max_output_tokens"}
+    length_data["output"][0]["status"] = "incomplete"
+    length.response = Response.model_validate(length_data)
+
+    sampled = (
+        art.Trajectory(exchanges=TrajectoryExchanges(responses=[stopped]))
+        .responses_history()
+        .tokenize(tokenizer=_StopTokenizer())
+    )
+    synthetic = (
+        art.Trajectory(exchanges=TrajectoryExchanges(responses=[length]))
+        .responses_history()
+        .tokenize(tokenizer=_StopTokenizer())
+    )
+
+    assert sampled.flags[-1] == (
+        tr.TokenFlag.EXACT
+        | tr.TokenFlag.SAMPLED
+        | tr.TokenFlag.ASSISTANT
+        | tr.TokenFlag.STOP
+    )
+    assert synthetic.tokens == [1, 2, 9]
+    assert synthetic.flags[-1] == tr.TokenFlag.ASSISTANT | tr.TokenFlag.STOP
+
+
 def test_exact_tokens_form_one_append_only_history_without_tokenizer(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -193,14 +676,42 @@ def test_exact_tokens_form_one_append_only_history_without_tokenizer(
     assert tokenized.tokens == [1, 2, 3, 4]
     assert tokenized.flags == [
         tr.TokenFlag.EXACT,
-        tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED,
+        tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED | tr.TokenFlag.ASSISTANT,
         tr.TokenFlag.EXACT,
-        tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED,
+        tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED | tr.TokenFlag.ASSISTANT,
     ]
     assert math.isnan(tokenized.logprobs[0])
     assert tokenized.logprobs[1] == -0.2
     assert math.isnan(tokenized.logprobs[2])
     assert tokenized.logprobs[3] == -0.4
+
+
+def test_gpt_oss_exact_provenance_is_black_box() -> None:
+    exchange = _chat_exchange(
+        [101, 102],
+        [201, 202],
+        model="openai/gpt-oss-20b",
+    )
+    choice = exchange.response.choices[0]
+    choice.__pydantic_extra__ = {
+        **(choice.__pydantic_extra__ or {}),
+        "stop_reason": 202,
+    }
+
+    tokenized = art.Trajectory(
+        exchanges=TrajectoryExchanges(chat_completions=[exchange])
+    ).tokenize()
+
+    assert tokenized.tokens == [101, 102, 201, 202]
+    assert tokenized.flags == [
+        tr.TokenFlag.EXACT,
+        tr.TokenFlag.EXACT,
+        tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED | tr.TokenFlag.ASSISTANT,
+        tr.TokenFlag.EXACT
+        | tr.TokenFlag.SAMPLED
+        | tr.TokenFlag.ASSISTANT
+        | tr.TokenFlag.STOP,
+    ]
 
 
 def test_empty_tool_calls_normalization_preserves_exact_continuation() -> None:
@@ -251,7 +762,7 @@ def test_messages_exact_prompt_and_output_do_not_load_a_tokenizer(
     assert tokenized.flags == [
         tr.TokenFlag.EXACT,
         tr.TokenFlag.EXACT,
-        tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED,
+        tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED | tr.TokenFlag.ASSISTANT,
     ]
 
 
@@ -352,7 +863,9 @@ def test_converted_anthropic_system_history_preserves_exact_assistant_evidence(
 
     assert tokenized.tokens == [10, 11, 12]
     assert tokenized.logprobs[-1] == pytest.approx(-0.12)
-    assert tokenized.flags[-1] == tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED
+    assert tokenized.flags[-1] == (
+        tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED | tr.TokenFlag.ASSISTANT
+    )
 
 
 def test_converted_anthropic_system_source_rejects_sampled_response_mutation() -> None:
@@ -400,7 +913,9 @@ def test_converted_responses_history_tokenizes_without_native_chat_exchange(
 
     assert tokenized.tokens == [10, 11, 12]
     assert tokenized.logprobs[-1] == pytest.approx(-0.1)
-    assert tokenized.flags[-1] == tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED
+    assert tokenized.flags[-1] == (
+        tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED | tr.TokenFlag.ASSISTANT
+    )
 
 
 def test_malformed_explicit_exact_token_metadata_fails_closed() -> None:
@@ -528,10 +1043,11 @@ def test_completions_echo_does_not_strip_repeated_prompt_token_from_completion()
     assert tokenized.tokens == [1, 1, 2]
     assert tokenized.flags == [
         tr.TokenFlag.EXACT,
-        tr.TokenFlag.SAMPLED,
-        tr.TokenFlag.SAMPLED,
+        tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED,
+        tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED,
     ]
-    assert all(math.isnan(logprob) for logprob in tokenized.logprobs)
+    assert math.isnan(tokenized.logprobs[0])
+    assert tokenized.logprobs[1:] == [-0.2, -0.3]
 
 
 def test_completions_echo_strips_prompt_from_proven_combined_token_carrier() -> None:
@@ -641,7 +1157,7 @@ def test_completions_echo_without_prompt_ids_falls_back_without_sampling_prompt(
     assert tokenized.tokens == [1, 2]
     assert tokenized.flags == [
         tr.TokenFlag(0),
-        tr.TokenFlag.SAMPLED,
+        tr.TokenFlag(0),
     ]
     assert all(math.isnan(logprob) for logprob in tokenized.logprobs)
 
@@ -822,7 +1338,7 @@ def test_completions_string_history_preserves_textual_logprobs() -> None:
 
     assert tokenized.tokens == [1, 2]
     assert tokenized.logprobs[1] == -0.8
-    assert tokenized.flags[1] == tr.TokenFlag.SAMPLED
+    assert tokenized.flags[1] == tr.TokenFlag(0)
 
 
 def test_mutated_completions_string_prompt_retokens_without_stale_exact() -> None:
@@ -1098,8 +1614,11 @@ def test_fallback_upgrades_legacy_qwen_template_when_preservation_is_requested()
     )
     history = tr.ChatCompletionsHistory(
         model="test/model",
-        messages=[{"role": "assistant", "content": "answer"}],
-        message_sources=[None],
+        messages=[
+            {"role": "user", "content": "question"},
+            {"role": "assistant", "content": "answer"},
+        ],
+        message_sources=[None, None],
         chat_template=template,
         chat_template_kwargs={"preserve_thinking": True},
     )
@@ -1112,11 +1631,353 @@ def test_fallback_upgrades_legacy_qwen_template_when_preservation_is_requested()
     assert "preserve_thinking is defined and preserve_thinking is true" in configured
 
 
+_QWEN_LIKE_TEMPLATE = (
+    "{% if enable_thinking %}thinking{% endif %}"
+    "{%- if loop.index0 > ns.last_query_index %}reasoning{% endif %}"
+)
+
+
+class _QwenLikeCharacterTokenizer:
+    chat_template = _QWEN_LIKE_TEMPLATE
+
+    def __call__(self, text: str, *, add_special_tokens: bool = False) -> list[int]:
+        del add_special_tokens
+        return [ord(character) for character in text]
+
+    def apply_chat_template(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        tokenize: bool,
+        add_generation_prompt: bool,
+        enable_thinking: bool = False,
+        preserve_thinking: bool = True,
+        **kwargs: object,
+    ) -> str | list[int]:
+        del kwargs
+        last_user = max(
+            (
+                index
+                for index, message in enumerate(messages)
+                if message["role"] == "user"
+            ),
+            default=-1,
+        )
+        parts: list[str] = []
+        for index, message in enumerate(messages):
+            if message["role"] == "user":
+                parts.append(f"<u>{message['content']}</u>")
+                continue
+            reasoning = message.get("reasoning") or message.get("reasoning_content")
+            if reasoning and (preserve_thinking or index > last_user):
+                parts.append(f"<a><think>\n{reasoning}\n</think>\n\n")
+            elif reasoning:
+                parts.append("<a>")
+            elif enable_thinking:
+                parts.append("<a><think>\n")
+            else:
+                parts.append("<a><think>\n\n</think>\n\n")
+            if message.get("content"):
+                parts.append(str(message["content"]))
+            for call in message.get("tool_calls") or []:
+                function = call["function"]
+                parts.append(
+                    f"<tool_call>{function['name']}({function['arguments']})</tool_call>"
+                )
+            parts.append("</a>")
+        if add_generation_prompt:
+            parts.append(
+                "<a><think>\n" if enable_thinking else "<a><think>\n\n</think>\n\n"
+            )
+        rendered = "".join(parts)
+        return self(rendered) if tokenize else rendered
+
+
+def _flagged_text(tokenized: tr.TokenizedHistory, flag: tr.TokenFlag) -> str:
+    return "".join(
+        chr(token)
+        for token, flags in zip(tokenized.tokens, tokenized.flags, strict=True)
+        if flags & flag
+    )
+
+
+def test_qwen_disabled_thinking_starts_assistant_at_tool_call() -> None:
+    history = tr.ChatCompletionsHistory(
+        model="test/qwen",
+        messages=[
+            {"role": "user", "content": "question"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call-1",
+                        "type": "function",
+                        "function": {"name": "lookup", "arguments": "{}"},
+                    }
+                ],
+            },
+        ],
+        message_sources=[None, None],
+        chat_template=_QWEN_LIKE_TEMPLATE,
+    )
+
+    tokenized = history.tokenize(tokenizer=_QwenLikeCharacterTokenizer())
+    rendered = "".join(map(chr, tokenized.tokens))
+    assistant = _flagged_text(tokenized, tr.TokenFlag.ASSISTANT)
+
+    assert rendered[: rendered.index("<tool_call>")].endswith(
+        "<a><think>\n\n</think>\n\n"
+    )
+    assert assistant == "<tool_call>lookup({})</tool_call></a>"
+    assert not any(flag & tr.TokenFlag.SAMPLED for flag in tokenized.flags)
+
+
+def test_unretained_disabled_thinking_scaffold_is_not_assistant() -> None:
+    history = tr.ChatCompletionsHistory(
+        model="test/thinking",
+        messages=[
+            {"role": "user", "content": "question"},
+            {"role": "assistant", "content": "answer"},
+        ],
+        message_sources=[None, None],
+    )
+
+    class Tokenizer(_QwenLikeCharacterTokenizer):
+        def apply_chat_template(
+            self,
+            messages: list[dict[str, Any]],
+            *,
+            tokenize: bool,
+            add_generation_prompt: bool,
+            **kwargs: object,
+        ) -> str | list[int]:
+            del kwargs
+            rendered = "<u>question</u>"
+            if len(messages) == 2:
+                rendered += "<a>answer</a>"
+            elif add_generation_prompt:
+                rendered += "<a><thought></thought>"
+            result = self(rendered) if tokenize else rendered
+            return result
+
+    tokenized = history.tokenize(tokenizer=Tokenizer())
+
+    assert "".join(map(chr, tokenized.tokens)) == "<u>question</u><a>answer</a>"
+    assert _flagged_text(tokenized, tr.TokenFlag.ASSISTANT) == "answer</a>"
+
+
+def test_qwen_enabled_thinking_excludes_opening_scaffold() -> None:
+    history = tr.ChatCompletionsHistory(
+        model="test/qwen",
+        messages=[
+            {"role": "user", "content": "question"},
+            {
+                "role": "assistant",
+                "reasoning": "reason",
+                "content": "answer",
+            },
+        ],
+        message_sources=[None, None],
+        chat_template=_QWEN_LIKE_TEMPLATE,
+        chat_template_kwargs={"enable_thinking": True},
+    )
+
+    tokenized = history.tokenize(tokenizer=_QwenLikeCharacterTokenizer())
+
+    assert _flagged_text(tokenized, tr.TokenFlag.ASSISTANT) == (
+        "reason\n</think>\n\nanswer</a>"
+    )
+
+
+@pytest.mark.parametrize("suffix", ["\n", "TAIL"])
+def test_assistant_span_excludes_template_tokens_after_eot(suffix: str) -> None:
+    class Tokenizer(_QwenLikeCharacterTokenizer):
+        eos_token_id = ord("§")
+
+        def decode(self, tokens: list[int], **kwargs: object) -> str:
+            del kwargs
+            return "".join(map(chr, tokens))
+
+        def apply_chat_template(
+            self,
+            messages: list[dict[str, Any]],
+            *,
+            tokenize: bool,
+            add_generation_prompt: bool,
+            enable_thinking: bool = False,
+            preserve_thinking: bool = True,
+            **kwargs: object,
+        ) -> str | list[int]:
+            rendered = super().apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=add_generation_prompt,
+                enable_thinking=enable_thinking,
+                preserve_thinking=preserve_thinking,
+                **kwargs,
+            )
+            assert isinstance(rendered, str)
+            if messages and messages[-1]["role"] == "assistant":
+                assert rendered.endswith("</a>")
+                rendered = rendered[:-4] + "§" + suffix
+            return self(rendered) if tokenize else rendered
+
+    history = tr.ChatCompletionsHistory(
+        model="test/qwen",
+        messages=[
+            {"role": "user", "content": "question"},
+            {"role": "assistant", "content": "answer"},
+        ],
+        message_sources=[None, None],
+        chat_template=_QWEN_LIKE_TEMPLATE,
+    )
+
+    tokenized = history.tokenize(tokenizer=Tokenizer())
+
+    assert "".join(map(chr, tokenized.tokens)).endswith("answer§" + suffix)
+    assert _flagged_text(tokenized, tr.TokenFlag.ASSISTANT) == "answer§"
+    assert _flagged_text(tokenized, tr.TokenFlag.STOP) == "§"
+    assert all(flag == tr.TokenFlag(0) for flag in tokenized.flags[-len(suffix) :])
+
+
+def test_assistant_spans_map_rewritten_and_reasoning_stripped_prior_turns() -> None:
+    class Tokenizer:
+        def __call__(self, text: str, **kwargs: object) -> list[int]:
+            del kwargs
+            return [ord(character) for character in text]
+
+        def apply_chat_template(
+            self,
+            messages: list[dict[str, Any]],
+            *,
+            tokenize: bool,
+            add_generation_prompt: bool,
+            **kwargs: object,
+        ) -> str | list[int]:
+            del kwargs
+            parts: list[str] = []
+            for index, message in enumerate(messages):
+                if message["role"] == "user":
+                    parts.append(f"<u>{message['content']}</u>")
+                    continue
+                parts.append("<a>")
+                if index == len(messages) - 1 and not add_generation_prompt:
+                    if thinking := message.get("thinking"):
+                        parts.append(f"{thinking}|")
+                    parts.append(f"{message['content']}§")
+                else:
+                    parts.append(f"{message['content']}¶")
+            if add_generation_prompt:
+                parts.append("<a>")
+            rendered = "".join(parts)
+            return self(rendered) if tokenize else rendered
+
+    history = tr.ChatCompletionsHistory(
+        model="test/rewritten-history",
+        messages=[
+            {"role": "user", "content": "one"},
+            {
+                "role": "assistant",
+                "thinking": "thought-one",
+                "content": "first",
+            },
+            {"role": "user", "content": "two"},
+            {
+                "role": "assistant",
+                "thinking": "thought-two",
+                "content": "second",
+            },
+        ],
+        message_sources=[None] * 4,
+    )
+
+    tokenized = history.tokenize(tokenizer=Tokenizer())
+
+    assert _flagged_text(tokenized, tr.TokenFlag.ASSISTANT) == (
+        "first¶thought-two|second§"
+    )
+    assert not any(flag & tr.TokenFlag.SAMPLED for flag in tokenized.flags)
+
+
+def test_assistant_spans_anchor_final_turn_after_prior_turn_rewrite() -> None:
+    from art.trajectories._tokenize import _assistant_char_spans
+
+    messages = [
+        {"role": "user", "content": "question"},
+        {"role": "assistant", "content": "first"},
+        {"role": "tool", "content": "result"},
+        {"role": "assistant", "content": "final"},
+    ]
+
+    def render(
+        selected_messages: list[dict[str, Any]], *, add_generation_prompt: bool
+    ) -> str:
+        multiple_assistants = (
+            sum(item["role"] == "assistant" for item in selected_messages) > 1
+        )
+        parts: list[str] = []
+        for item in selected_messages:
+            if item["role"] == "assistant":
+                parts.append(f"<a>{item['content']}END")
+            elif item["role"] == "tool":
+                terminator = "END" if multiple_assistants else "CALL"
+                parts.append(f"<tool>{item['content']}{terminator}")
+            else:
+                parts.append(f"<{item['role']}>{item['content']}")
+        if add_generation_prompt:
+            parts.append("<a>")
+        return "".join(parts)
+
+    rendered = render(messages, add_generation_prompt=False)
+    spans = _assistant_char_spans(
+        messages,
+        rendered,
+        render,
+        add_generation_prompt=False,
+    )
+
+    assert [rendered[start:end] for start, end in spans] == ["firstEND", "finalEND"]
+
+
+@pytest.mark.parametrize("preserve_thinking", (True, False))
+def test_qwen_prior_thinking_preservation_maps_retained_continuations(
+    preserve_thinking: bool,
+) -> None:
+    history = tr.ChatCompletionsHistory(
+        model="test/qwen",
+        messages=[
+            {"role": "user", "content": "one"},
+            {"role": "assistant", "reasoning": "r1", "content": "a1"},
+            {"role": "user", "content": "two"},
+            {"role": "assistant", "reasoning": "r2", "content": "a2"},
+        ],
+        message_sources=[None, None, None, None],
+        chat_template=_QWEN_LIKE_TEMPLATE,
+        chat_template_kwargs={
+            "enable_thinking": True,
+            "preserve_thinking": preserve_thinking,
+        },
+    )
+
+    tokenized = history.tokenize(tokenizer=_QwenLikeCharacterTokenizer())
+    rendered = "".join(map(chr, tokenized.tokens))
+    assistant = _flagged_text(tokenized, tr.TokenFlag.ASSISTANT)
+
+    assert ("r1" in rendered) is preserve_thinking
+    assert ("r1\n</think>\n\na1</a>" in assistant) is preserve_thinking
+    assert ("a1</a>" in assistant) is True
+    assert "r2\n</think>\n\na2</a>" in assistant
+
+
 def test_tokenizer_dict_chat_template_fallback_is_not_forwarded() -> None:
     history = tr.ChatCompletionsHistory(
         model="test/model",
-        messages=[{"role": "assistant", "content": "answer"}],
-        message_sources=[None],
+        messages=[
+            {"role": "user", "content": "question"},
+            {"role": "assistant", "content": "answer"},
+        ],
+        message_sources=[None, None],
     )
 
     class Tokenizer:
@@ -1173,16 +2034,10 @@ def test_fallback_uses_template_overrides_and_nan_logprobs(
     assert loaded_base_models == ["base/model"]
     assert result.flags == [
         tr.TokenFlag(0),
-        tr.TokenFlag.SAMPLED,
+        tr.TokenFlag.ASSISTANT,
     ]
     assert math.isnan(result.logprobs[1])
-    assert len(tokenizer.calls) == 3
-    assert [call["add_generation_prompt"] for call in tokenizer.calls] == [
-        False,
-        False,
-        True,
-    ]
-    assert [call["tokenize"] for call in tokenizer.calls] == [True, False, True]
+    assert tokenizer.calls
     assert all(
         {
             key: value
@@ -1297,8 +2152,6 @@ def test_loaded_tokenizers_are_cached_by_model_and_revision(
 def test_deepseek_v4_uses_arts_protocol_renderer(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from art.trajectories._tokenize import _cached_tokenizer
-
     raw = object()
     wrapped = object()
 
@@ -1310,10 +2163,20 @@ def test_deepseek_v4_uses_arts_protocol_renderer(
             return raw
 
     transformers = ModuleType("transformers")
+    transformers.__path__ = []  # type: ignore[attr-defined]
     setattr(transformers, "AutoTokenizer", AutoTokenizer)
+    tokenizer_base = ModuleType("transformers.tokenization_utils_base")
+    setattr(tokenizer_base, "PreTrainedTokenizerBase", object)
     monkeypatch.setitem(sys.modules, "transformers", transformers)
+    monkeypatch.setitem(
+        sys.modules, "transformers.tokenization_utils_base", tokenizer_base
+    )
+    from art.megatron.dsv4 import tokenizer as dsv4_tokenizer
+    from art.trajectories._tokenize import _cached_tokenizer
+
     monkeypatch.setattr(
-        "art.megatron.dsv4.tokenizer.get_dsv4_tokenizer",
+        dsv4_tokenizer,
+        "get_dsv4_tokenizer",
         lambda tokenizer: (
             wrapped if tokenizer is raw else pytest.fail("wrong tokenizer")
         ),
@@ -1498,12 +2361,12 @@ def test_reasoning_stripped_messages_history_preserves_exact_tokens(
     assert tokenized.logprobs[-2] == pytest.approx(-10.0)
     assert tokenized.logprobs[-1] == pytest.approx(-20.1)
     assert tokenized.flags[1:3] == [
-        tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED,
-        tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED,
+        tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED | tr.TokenFlag.ASSISTANT,
+        tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED | tr.TokenFlag.ASSISTANT,
     ]
     assert tokenized.flags[-2:] == [
-        tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED,
-        tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED,
+        tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED | tr.TokenFlag.ASSISTANT,
+        tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED | tr.TokenFlag.ASSISTANT,
     ]
 
 
@@ -1697,9 +2560,9 @@ def test_chat_exact_hidden_suffix_preserves_rendered_trailing_scaffold() -> None
     assert tokenized.flags == [
         tr.TokenFlag(0),
         tr.TokenFlag(0),
-        tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED,
-        tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED,
-        tr.TokenFlag(0),
+        tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED | tr.TokenFlag.ASSISTANT,
+        tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED | tr.TokenFlag.ASSISTANT,
+        tr.TokenFlag.ASSISTANT,
     ]
 
 
@@ -1757,7 +2620,7 @@ def test_each_chat_choice_preserves_its_visible_fallback_logprobs() -> None:
     assert [history.logprobs[-1] for history in traced.histories] == [-0.1, -0.2]
     assert [
         {key.index for key in trace.source_keys if key is not None} for trace in traces
-    ] == [{0}, {1}]
+    ] == [set(), set()]
 
 
 def test_chat_fallback_anchors_sampled_text_away_from_equal_user_text() -> None:
@@ -1820,9 +2683,9 @@ def test_chat_fallback_anchors_sampled_text_away_from_equal_user_text() -> None:
     assert tokenized.tokens == [1, 2, 2, 3]
     assert tokenized.flags == [
         tr.TokenFlag(0),
-        tr.TokenFlag.SAMPLED,
+        tr.TokenFlag.ASSISTANT,
         tr.TokenFlag(0),
-        tr.TokenFlag.SAMPLED,
+        tr.TokenFlag.ASSISTANT,
     ]
     assert tokenized.logprobs[1] == -0.1
     assert math.isnan(tokenized.logprobs[2])
@@ -1899,9 +2762,9 @@ def test_chat_view_preserves_two_turn_textual_logprobs_without_exact_ids() -> No
     assert tokenized.logprobs[3] == pytest.approx(-0.5)
     assert tokenized.flags == [
         tr.TokenFlag(0),
-        tr.TokenFlag.SAMPLED,
+        tr.TokenFlag.ASSISTANT,
         tr.TokenFlag(0),
-        tr.TokenFlag.SAMPLED,
+        tr.TokenFlag.ASSISTANT,
     ]
 
 
@@ -1963,9 +2826,9 @@ def test_chat_view_uses_later_exact_prompt_when_first_is_missing() -> None:
     assert tokenized.logprobs[-1] == pytest.approx(-0.5)
     assert tokenized.flags == [
         tr.TokenFlag.EXACT,
-        tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED,
+        tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED | tr.TokenFlag.ASSISTANT,
         tr.TokenFlag.EXACT,
-        tr.TokenFlag.SAMPLED,
+        tr.TokenFlag.ASSISTANT,
     ]
 
 
@@ -2092,7 +2955,7 @@ def test_empty_chat_prompt_ids_are_missing_evidence(
     assert tokenized.tokens == [10, 2]
     assert tokenized.flags == [
         tr.TokenFlag(0),
-        tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED,
+        tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED | tr.TokenFlag.ASSISTANT,
     ]
 
 
@@ -2140,7 +3003,7 @@ def test_missing_completion_renders_only_missing_region_when_prompt_is_exact(
     assert tokenized.logprobs[1] == -0.5
     assert tokenized.flags == [
         tr.TokenFlag.EXACT,
-        tr.TokenFlag.SAMPLED,
+        tr.TokenFlag.ASSISTANT,
     ]
 
 
@@ -2395,9 +3258,9 @@ def test_cross_exchange_responses_reasoning_split_uses_later_prompt_backbone() -
     assert tokenized.histories[1].logprobs[3] == -0.1
     assert tokenized.histories[1].flags == [
         tr.TokenFlag.EXACT,
-        tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED,
+        tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED | tr.TokenFlag.ASSISTANT,
         tr.TokenFlag.EXACT,
-        tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED,
+        tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED | tr.TokenFlag.ASSISTANT,
     ]
 
 
@@ -2463,8 +3326,8 @@ def test_responses_aggregates_complete_exact_pairs_across_content_blocks(
     assert result.tokens == [10, 11, 12]
     assert result.logprobs[1:] == [-0.1, -0.2]
     assert result.flags[1:] == [
-        tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED,
-        tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED,
+        tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED | tr.TokenFlag.ASSISTANT,
+        tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED | tr.TokenFlag.ASSISTANT,
     ]
 
 
@@ -2752,9 +3615,9 @@ def test_responses_token_generations_preserve_every_generation() -> None:
     assert tokenized.logprobs[3] == -0.4
     assert tokenized.flags == [
         tr.TokenFlag.EXACT,
-        tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED,
+        tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED | tr.TokenFlag.ASSISTANT,
         tr.TokenFlag.EXACT,
-        tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED,
+        tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED | tr.TokenFlag.ASSISTANT,
     ]
 
 
@@ -2871,7 +3734,9 @@ def test_responses_split_preserves_unchanged_prior_generation_provenance() -> No
     tokenized = final.tokenize()
 
     assert tokenized.tokens == [1, 2, 3, 500, 5, 6]
-    assert tokenized.flags[1] == tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED
+    assert tokenized.flags[1] == (
+        tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED | tr.TokenFlag.ASSISTANT
+    )
     assert tokenized.logprobs[1] == -0.2
     assert tokenized.flags[3] == tr.TokenFlag.EXACT
     assert math.isnan(tokenized.logprobs[3])
@@ -2963,7 +3828,10 @@ def test_responses_terminal_generation_without_output_items_is_tokenized() -> No
     assert tokenized.logprobs[1] == pytest.approx(-0.2)
     assert tokenized.flags == [
         tr.TokenFlag.EXACT,
-        tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED,
+        tr.TokenFlag.EXACT
+        | tr.TokenFlag.SAMPLED
+        | tr.TokenFlag.ASSISTANT
+        | tr.TokenFlag.STOP,
     ]
     assert history.as_chat_completions_history().messages[-1] == {
         "role": "assistant",
@@ -3007,7 +3875,10 @@ def test_responses_terminal_generation_without_output_items_survives_rerender() 
     assert tokenized.logprobs[1] == pytest.approx(-0.2)
     assert tokenized.flags == [
         tr.TokenFlag(0),
-        tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED,
+        tr.TokenFlag.EXACT
+        | tr.TokenFlag.SAMPLED
+        | tr.TokenFlag.ASSISTANT
+        | tr.TokenFlag.STOP,
     ]
 
 
@@ -3059,7 +3930,9 @@ def test_chat_rerender_normalizes_tool_arguments(arguments: object) -> None:
     tokenized = history.tokenize(tokenizer=Tokenizer())
 
     assert tokenized.tokens == [1, 2, 3]
-    assert rendered_arguments == [{"id": 3}]
+    assert rendered_arguments and all(
+        value == {"id": 3} for value in rendered_arguments
+    )
 
 
 @pytest.mark.parametrize("reasoning", (None, "think"), ids=("tool-only", "reasoning"))
@@ -3137,9 +4010,11 @@ def test_structured_tool_arguments_remain_in_sampled_region_without_exact_tokens
     assert tokenized.flags[: len(exact_prompt)] == [tr.TokenFlag.EXACT] * len(
         exact_prompt
     )
-    sampled = slice(len(exact_prompt), -1)
-    assert tokenized.flags[sampled] == [tr.TokenFlag.SAMPLED] * len(sampled_tokens)
-    assert all(math.isnan(value) for value in tokenized.logprobs[sampled])
+    assistant = slice(len(exact_prompt), None)
+    assert tokenized.flags[assistant] == [tr.TokenFlag.ASSISTANT] * (
+        len(sampled_tokens) + 1
+    )
+    assert all(math.isnan(value) for value in tokenized.logprobs[assistant])
 
 
 def test_reasoning_probe_failure_does_not_override_authoritative_render() -> None:
@@ -3177,7 +4052,7 @@ def test_reasoning_probe_failure_does_not_override_authoritative_render() -> Non
     tokenized = history.tokenize(tokenizer=Tokenizer())
 
     assert tokenized.tokens == [1, 20, 30]
-    assert tokenized.flags[1:] == [tr.TokenFlag.SAMPLED] * 2
+    assert tokenized.flags[1:] == [tr.TokenFlag.ASSISTANT] * 2
 
 
 @pytest.mark.parametrize("arguments", ("not-json", "[]"))
@@ -3590,7 +4465,9 @@ def test_template_change_rerenders_scaffold_but_preserves_sampled_output() -> No
 
     assert tokenized.tokens == [10, 2, 30]
     assert tokenized.logprobs[1] == -0.2
-    assert tokenized.flags[1] == tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED
+    assert tokenized.flags[1] == (
+        tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED | tr.TokenFlag.ASSISTANT
+    )
 
 
 def test_template_change_preserves_complete_exact_sampled_suffix() -> None:
@@ -3621,9 +4498,9 @@ def test_template_change_preserves_complete_exact_sampled_suffix() -> None:
     assert tokenized.logprobs[1:3] == pytest.approx([-0.2, -0.3])
     assert math.isnan(tokenized.logprobs[3])
     assert tokenized.flags[1:] == [
-        tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED,
-        tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED,
-        tr.TokenFlag(0),
+        tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED | tr.TokenFlag.ASSISTANT,
+        tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED | tr.TokenFlag.ASSISTANT,
+        tr.TokenFlag.ASSISTANT,
     ]
 
 
@@ -3728,7 +4605,7 @@ def test_responses_generation_evidence_is_atomic_and_partial_edits_do_not_replay
     partial = history.tokenize(tokenizer=Tokenizer(), chat_template="custom")
     assert partial.tokens == [1, 30, 9]
     assert 2 not in partial.tokens
-    assert partial.flags[1] == tr.TokenFlag.SAMPLED
+    assert partial.flags[1] == tr.TokenFlag.ASSISTANT
     assert math.isnan(partial.logprobs[1])
 
 
@@ -3863,9 +4740,9 @@ def test_responses_chat_rerender_preserves_equal_length_generation_evidence() ->
     assert tokenized.logprobs[1::2] == pytest.approx([-0.2, -0.4])
     assert tokenized.flags == [
         tr.TokenFlag(0),
-        tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED,
+        tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED | tr.TokenFlag.ASSISTANT,
         tr.TokenFlag(0),
-        tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED,
+        tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED | tr.TokenFlag.ASSISTANT,
     ]
 
 
@@ -3931,7 +4808,9 @@ def test_responses_chat_output_indices_reuse_one_complete_generation() -> None:
 
     assert tokenized.tokens == [1, 2]
     assert tokenized.logprobs[-1] == pytest.approx(-0.1)
-    assert tokenized.flags[-1] == tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED
+    assert tokenized.flags[-1] == (
+        tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED | tr.TokenFlag.ASSISTANT
+    )
 
 
 def test_responses_chat_output_indices_are_bounds_checked() -> None:
@@ -4031,8 +4910,8 @@ def test_responses_multi_output_generation_is_rendered_without_duplicate_evidenc
     assert all(math.isnan(value) for value in tokenized.logprobs)
     assert tokenized.flags == [
         tr.TokenFlag(0),
-        tr.TokenFlag.SAMPLED,
-        tr.TokenFlag.SAMPLED,
+        tr.TokenFlag.ASSISTANT,
+        tr.TokenFlag.ASSISTANT,
     ]
 
 
@@ -4084,8 +4963,8 @@ def test_responses_multi_output_chat_conversion_preserves_item_logprobs() -> Non
     assert tokenized.logprobs[1:] == [-0.1, -0.2]
     assert tokenized.flags == [
         tr.TokenFlag(0),
-        tr.TokenFlag.SAMPLED,
-        tr.TokenFlag.SAMPLED,
+        tr.TokenFlag.ASSISTANT,
+        tr.TokenFlag.ASSISTANT,
     ]
 
 
@@ -4133,12 +5012,12 @@ def test_mutable_chat_history_is_authoritative_and_does_not_replay_removed_turns
     assert 20 not in tokenized.tokens
     assert tokenized.flags == [
         tr.TokenFlag(0),
-        tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED,
-        tr.TokenFlag(0),
+        tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED | tr.TokenFlag.ASSISTANT,
+        tr.TokenFlag.ASSISTANT,
     ]
 
 
-def test_request_assistant_messages_are_not_marked_sampled() -> None:
+def test_request_assistant_messages_are_marked_assistant_not_sampled() -> None:
     exchange = _chat_exchange([10], [40])
     exchange.request["messages"] = [
         {"role": "assistant", "content": "seed"},
@@ -4162,6 +5041,12 @@ def test_request_assistant_messages_are_not_marked_sampled() -> None:
             **kwargs: object,
         ) -> list[int]:
             del kwargs
+            if not messages:
+                assert add_generation_prompt
+                return [5]
+            if len(messages) == 1:
+                assert messages[-1]["role"] == "assistant"
+                return [5, 20, 6]
             if messages[-1]["role"] == "assistant" and len(messages) == 3:
                 if str(messages[-1]["content"]).startswith("ART_TRAJECTORY_"):
                     return [5, 20, 6, 30, 7, 99, 8]
@@ -4173,7 +5058,10 @@ def test_request_assistant_messages_are_not_marked_sampled() -> None:
 
     assert tokenized.tokens == [5, 20, 6, 30, 7, 40, 8]
     assert not tokenized.flags[1] & tr.TokenFlag.SAMPLED
-    assert tokenized.flags[5] == tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED
+    assert tokenized.flags[1] & tr.TokenFlag.ASSISTANT
+    assert tokenized.flags[5] == (
+        tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED | tr.TokenFlag.ASSISTANT
+    )
 
 
 def test_rerender_constrains_exact_output_to_its_message_region() -> None:
@@ -4209,7 +5097,7 @@ def test_rerender_constrains_exact_output_to_its_message_region() -> None:
     assert tokenized.flags == [
         tr.TokenFlag(0),
         tr.TokenFlag(0),
-        tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED,
+        tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED | tr.TokenFlag.ASSISTANT,
     ]
     assert math.isnan(tokenized.logprobs[0])
     assert tokenized.logprobs[2] == -0.7
@@ -4269,7 +5157,9 @@ def test_rerender_does_not_bind_unique_exact_id_outside_sampled_message() -> Non
 
     assert tokenized.tokens == [42, 7, 99, 7]
     assert not tokenized.flags[1] & tr.TokenFlag.SAMPLED
-    assert tokenized.flags[-1] == (tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED)
+    assert tokenized.flags[-1] == (
+        tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED | tr.TokenFlag.ASSISTANT
+    )
     assert math.isnan(tokenized.logprobs[1])
     assert tokenized.logprobs[-1] == -0.7
 
@@ -4308,6 +5198,8 @@ def test_rerender_does_not_duplicate_sampled_trailing_eos() -> None:
     history.chat_template = "rerender"
 
     class Tokenizer:
+        eos_token_id = 2
+
         def __call__(self, text: str, **kwargs: object) -> list[int]:
             del kwargs
             return {"question": [1], "answer": [7]}[text]
@@ -4330,8 +5222,11 @@ def test_rerender_does_not_duplicate_sampled_trailing_eos() -> None:
     assert tokenized.tokens == [1, 99, 7, 2]
     assert tokenized.tokens.count(2) == 1
     assert tokenized.flags[-2:] == [
-        tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED,
-        tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED,
+        tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED | tr.TokenFlag.ASSISTANT,
+        tr.TokenFlag.EXACT
+        | tr.TokenFlag.SAMPLED
+        | tr.TokenFlag.ASSISTANT
+        | tr.TokenFlag.STOP,
     ]
     assert tokenized.logprobs[-2:] == [-0.7, -0.2]
 
@@ -4375,7 +5270,7 @@ def test_reasoning_stripped_chat_histories_tokenize_authoritative_views() -> Non
     }
     first.response = ChatCompletion.model_validate(first_data)
 
-    second = _chat_exchange([1, 101, 102, 9, 4], [5, 6], offset=1)
+    second = _chat_exchange([1, 101, 102, 9, 4], [5, 6, 9], offset=1)
     second.request["messages"] = [
         {"role": "user", "content": "one"},
         {"role": "assistant", "content": "first"},
@@ -4394,40 +5289,32 @@ def test_reasoning_stripped_chat_histories_tokenize_authoritative_views() -> Non
 
     class Tokenizer:
         name_or_path = "test/model"
+        eos_token_id = 9
 
-        def __call__(self, text: str, **kwargs: object) -> list[int]:
-            del kwargs
-            return {
-                "one": [1],
-                "first": [500],
-                "two": [4],
-                "thought-two": [5],
-                "second": [6],
-            }[text]
+        def __call__(self, text: str, **kwargs: object) -> Never:
+            del text, kwargs
+            pytest.fail("authoritative token IDs should not be rendered")
 
         def apply_chat_template(
             self, messages: list[dict[str, Any]], **kwargs: object
-        ) -> list[int]:
-            del kwargs
-            assert [message.get("content") for message in messages] == [
-                "one",
-                "first",
-                "two",
-                "second",
-            ]
-            return [1, 500, 9, 4, 5, 6]
+        ) -> Never:
+            del messages, kwargs
+            pytest.fail("authoritative token IDs should not use a chat template")
 
     tokenized = trajectory.tokenize(multi_history=True, tokenizer=Tokenizer())
 
     assert [history.tokens for history in tokenized.histories] == [
         [1, 2, 101, 102, 9],
-        [1, 101, 102, 9, 4, 5, 6],
+        [1, 101, 102, 9, 4, 5, 6, 9],
     ]
     assert tokenized.histories[1].flags[1] & tr.TokenFlag.SAMPLED
     assert tokenized.histories[1].flags[1] & tr.TokenFlag.EXACT
     assert tokenized.histories[1].logprobs[1:3] == [-10.1, -10.2]
     assert tokenized.histories[1].flags[3] == (
-        tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED
+        tr.TokenFlag.EXACT
+        | tr.TokenFlag.SAMPLED
+        | tr.TokenFlag.ASSISTANT
+        | tr.TokenFlag.STOP
     )
     assert tokenized.histories[1].logprobs[3] == -0.9
     assert 2 not in tokenized.histories[1].tokens
@@ -4593,8 +5480,8 @@ def test_reasoning_stripped_tool_call_keeps_exact_evidence_for_strict_training(
     assert second_history.tokens == [1, 7, 8, 4, 5]
     assert second_history.logprobs[1:3] == [-0.7, -0.8]
     assert second_history.flags[1:3] == [
-        tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED,
-        tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED,
+        tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED | tr.TokenFlag.ASSISTANT,
+        tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED | tr.TokenFlag.ASSISTANT,
     ]
 
     preprocessing = list(
@@ -4743,8 +5630,8 @@ def test_rerender_marks_tool_call_only_generated_region_sampled() -> None:
     tokenized = history.tokenize(tokenizer=Tokenizer())
 
     assert tokenized.tokens == [1, 10, 20, 25, 30, 31, 26]
-    assert tokenized.flags[2:6] == [tr.TokenFlag.SAMPLED] * 4
-    assert all(math.isnan(value) for value in tokenized.logprobs[2:6])
+    assert tokenized.flags[2:] == [tr.TokenFlag.ASSISTANT] * 5
+    assert all(math.isnan(value) for value in tokenized.logprobs[2:])
     assert not tokenized.flags[0] & tr.TokenFlag.SAMPLED
 
 
@@ -4803,8 +5690,8 @@ def test_tool_call_probe_handles_contextual_tokenization(
     tokenized = history.tokenize(tokenizer=Tokenizer())
 
     assert tokenized.tokens == [1, 10, 20, 25, 30, 26]
-    assert tokenized.flags[2:5] == [tr.TokenFlag.SAMPLED] * 3
-    assert all(math.isnan(value) for value in tokenized.logprobs[2:5])
+    assert tokenized.flags[2:] == [tr.TokenFlag.ASSISTANT] * 4
+    assert all(math.isnan(value) for value in tokenized.logprobs[2:])
 
 
 def test_rerender_proves_each_reasoning_and_content_part_separately() -> None:
@@ -4859,7 +5746,11 @@ def test_rerender_proves_each_reasoning_and_content_part_separately() -> None:
             self, messages: list[dict[str, Any]], **kwargs: object
         ) -> object:
             tokenize = kwargs.pop("tokenize")
+            add_generation_prompt = kwargs.pop("add_generation_prompt")
             del kwargs
+            if messages[-1]["role"] != "assistant":
+                assert add_generation_prompt
+                return "<user>turn 0</user><assistant>" if not tokenize else [1, 10]
             assistant = messages[-1]
             reasoning = assistant.get("reasoning") or assistant.get("reasoning_content")
             rendered = (
@@ -4878,10 +5769,10 @@ def test_rerender_proves_each_reasoning_and_content_part_separately() -> None:
     assert tokenized.flags == [
         tr.TokenFlag(0),
         tr.TokenFlag(0),
-        tr.TokenFlag.SAMPLED,
-        tr.TokenFlag(0),
-        tr.TokenFlag.SAMPLED,
-        tr.TokenFlag(0),
+        tr.TokenFlag.ASSISTANT,
+        tr.TokenFlag.ASSISTANT,
+        tr.TokenFlag.ASSISTANT,
+        tr.TokenFlag.ASSISTANT,
     ]
     assert tokenized.logprobs[4] == -0.7
 
@@ -4996,7 +5887,12 @@ def test_empty_sampled_message_inserts_exact_control_token() -> None:
 
     assert tokenized.tokens == [1, 99, 2, 9]
     assert tokenized.logprobs[2] == -0.2
-    assert tokenized.flags[2] == tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED
+    assert tokenized.flags[2] == (
+        tr.TokenFlag.EXACT
+        | tr.TokenFlag.SAMPLED
+        | tr.TokenFlag.ASSISTANT
+        | tr.TokenFlag.STOP
+    )
 
 
 def test_renderer_ignored_refusal_is_appended_for_tokenization() -> None:
@@ -5077,7 +5973,7 @@ def test_renderer_ignored_refusal_is_appended_for_tokenization() -> None:
 
     assert tokenized.tokens == [1, 4, 5]
     assert tokenized.logprobs[1:] == [-0.4, -0.5]
-    assert tokenized.flags[1:] == [tr.TokenFlag.SAMPLED] * 2
+    assert tokenized.flags[1:] == [tr.TokenFlag.ASSISTANT] * 2
 
 
 def test_renderer_reasoning_content_alias_preserves_reasoning() -> None:
@@ -5119,8 +6015,8 @@ def test_renderer_reasoning_content_alias_preserves_reasoning() -> None:
     assert tokenized.tokens == [1, 2, 3]
     assert tokenized.flags == [
         tr.TokenFlag(0),
-        tr.TokenFlag.SAMPLED,
-        tr.TokenFlag.SAMPLED,
+        tr.TokenFlag.ASSISTANT,
+        tr.TokenFlag.ASSISTANT,
     ]
 
 
@@ -5205,7 +6101,12 @@ def test_trimmed_render_preserves_authoritative_textual_logprob_tokens() -> None
             self, messages: list[dict[str, Any]], **kwargs: object
         ) -> object:
             tokenize = kwargs.pop("tokenize")
+            add_generation_prompt = kwargs.pop("add_generation_prompt")
             del kwargs
+            if messages[-1]["role"] != "assistant":
+                assert add_generation_prompt
+                rendered = f"<user>{messages[0]['content']}</user><assistant>"
+                return [1] if tokenize else rendered
             rendered = (
                 f"<user>{messages[0]['content']}</user>"
                 f"<assistant>{str(messages[-1]['content']).strip()}</assistant>"
@@ -5218,7 +6119,7 @@ def test_trimmed_render_preserves_authoritative_textual_logprob_tokens() -> None
 
     assert tokenized.tokens == [1, 1118, 2222, 220]
     assert tokenized.logprobs[1:] == [-0.4, -0.45, -0.5]
-    assert tokenized.flags[1:] == [tr.TokenFlag.SAMPLED] * 3
+    assert tokenized.flags[1:] == [tr.TokenFlag.ASSISTANT] * 3
 
 
 def test_textual_logprobs_reconstruct_split_utf8_bytes() -> None:
@@ -5393,7 +6294,12 @@ def test_trimmed_whitespace_output_inserts_authoritative_logprob_token(
             self, messages: list[dict[str, Any]], **kwargs: object
         ) -> object:
             tokenize = kwargs.pop("tokenize")
+            add_generation_prompt = kwargs.pop("add_generation_prompt")
             del kwargs
+            if messages[-1]["role"] != "assistant":
+                assert add_generation_prompt
+                rendered = f"<user>{messages[0]['content']}</user><assistant>"
+                return [1] if tokenize else rendered
             content_value = str(messages[-1]["content"])
             if trim:
                 content_value = content_value.strip()
@@ -5423,9 +6329,9 @@ def test_trimmed_whitespace_output_inserts_authoritative_logprob_token(
         9,
     ]
     assert tokenized.logprobs[1] == -0.5
-    assert tokenized.flags[1] == tr.TokenFlag.SAMPLED
+    assert tokenized.flags[1] == tr.TokenFlag.ASSISTANT
     if adjacent_scaffold:
-        assert tokenized.flags[2] == tr.TokenFlag(0)
+        assert tokenized.flags[2] == tr.TokenFlag.ASSISTANT
 
 
 def _repeated_text_rerender_history(
@@ -5455,7 +6361,19 @@ class _RepeatedTextTokenizer:
 
     def __call__(self, text: str, **kwargs: object) -> object:
         if not kwargs.get("return_offsets_mapping"):
-            return [1000] if text == "answer" else [2000 + int(text[1:])]
+            if "<" not in text:
+                return [1000] if text == "answer" else [2000 + int(text[1:])]
+            return [
+                token
+                for match in re.finditer(r"<([ua])>(.*?)</\1>", text)
+                for token in (
+                    3000 if match.group(1) == "u" else 3001,
+                    1000
+                    if match.group(2) == "answer"
+                    else 2000 + int(match.group(2)[1:]),
+                    3002,
+                )
+            ]
         token_ids: list[int] = []
         offsets: list[tuple[int, int]] = []
         for match in re.finditer(r"<([ua])>(.*?)</\1>", text):
@@ -5501,7 +6419,7 @@ def test_rerender_calls_chat_template_once_for_many_turns() -> None:
     tokenizer = _RepeatedTextTokenizer()
     history.tokenize(tokenizer=tokenizer)
 
-    assert tokenizer.apply_calls == 2
+    assert tokenizer.apply_calls == 3 + 2 * 32
 
 
 def test_repeated_text_rerender_scaling_is_near_linear() -> None:
@@ -5514,7 +6432,7 @@ def test_repeated_text_rerender_scaling_is_near_linear() -> None:
             started = perf_counter()
             history.tokenize(tokenizer=tokenizer)
             samples.append(perf_counter() - started)
-            assert tokenizer.apply_calls == 2
+            assert tokenizer.apply_calls == 3 + 2 * turn_count
         medians.append(median(samples))
 
     assert medians[1] < medians[0] * 3
@@ -5652,7 +6570,7 @@ def test_responses_external_context_requires_or_uses_exact_prompt_tokens() -> No
     assert tokenized.flags == [
         tr.TokenFlag.EXACT,
         tr.TokenFlag.EXACT,
-        tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED,
+        tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED | tr.TokenFlag.ASSISTANT,
     ]
 
 
@@ -5870,8 +6788,8 @@ def test_responses_fallback_trace_does_not_retrain_echoed_output_items() -> None
                 first_response_indices.add(key.index)
                 trained_first_response += selected
 
-    assert first_response_indices == {0}
-    assert trained_first_response == 2
+    assert first_response_indices == set()
+    assert trained_first_response == 0
 
 
 def test_completions_history_requires_exhaustive_source_spans() -> None:
