@@ -104,7 +104,7 @@ class _PipelinePreparedBatch(BaseModel):
 
 
 class _MegatronPipelineCommandContext:
-    """One packed batch whose F/B is active before the trainer consumes it."""
+    """One exact packed command ready for the serialized trainer GPU loop."""
 
     def __init__(
         self,
@@ -115,11 +115,12 @@ class _MegatronPipelineCommandContext:
         prepared: _PipelinePreparedBatch,
         service: Any,
         batch: _PackedTrainingBatch,
-        forward: Any,
+        packed: Any,
         config: types.TrainConfig,
+        experimental_config: dev.TrainConfig,
+        learner_parent_version: int,
         train_kwargs: dict[str, Any],
         preparation_metrics: dict[str, float],
-        started: float,
     ) -> None:
         self.preparation_metrics = preparation_metrics
         self._backend = backend
@@ -128,10 +129,11 @@ class _MegatronPipelineCommandContext:
         self._prepared = prepared
         self._service = service
         self._batch: _PackedTrainingBatch | None = batch
-        self._forward = forward
+        self._packed = packed
         self._config = config
+        self._experimental_config = experimental_config
+        self._learner_parent_version = learner_parent_version
         self._train_kwargs = train_kwargs
-        self._started = started
         self._claimed = False
 
     async def complete(
@@ -142,17 +144,27 @@ class _MegatronPipelineCommandContext:
         if self._claimed:
             raise RuntimeError("pipeline train context was consumed twice")
         self._claimed = True
+        trainer_started = time.monotonic()
         if next_train_dispatched is not None:
             next_train_dispatched.set()
+        if next_batch_handoff is not None:
+            # CPU selection, packing, and materialization for the next command can
+            # overlap this command's GPU turn. The prepared queue remains bounded
+            # to one item, and only the consumer dispatches trainer work.
+            next_batch_handoff.set()
         try:
+            forward = await self._service.start_pipeline_forward_backward(
+                self._packed,
+                self._config,
+                self._experimental_config,
+                expected_learner_version=self._learner_parent_version,
+            )
             optimizer = await self._service.start_pipeline_optimizer(
-                self._forward,
+                forward,
                 learning_rate=self._config.learning_rate,
             )
-            if next_batch_handoff is not None:
-                next_batch_handoff.set()
             values = await asyncio.gather(
-                self._forward.completion,
+                forward.completion,
                 optimizer.completion,
                 return_exceptions=True,
             )
@@ -177,13 +189,13 @@ class _MegatronPipelineCommandContext:
                             forward_result.get("metrics", {}),
                             raw_optimizer.get("metrics", {}),
                         ),
-                        **self._forward.setup_metrics,
+                        **forward.setup_metrics,
                         **publication_metrics,
                         **self._service.drain_publication_metrics(),
                     }
                 ],
                 trajectory_groups=self._groups,
-                trainer_started=self._started,
+                trainer_started=trainer_started,
             )
             batch = cast(_PackedTrainingBatch, self._prepared.batch)
             metrics.update(
@@ -229,25 +241,7 @@ class _MegatronPipelineCommandContext:
         if self._claimed:
             return
         self._claimed = True
-        try:
-            optimizer = await self._service.start_pipeline_optimizer(
-                self._forward,
-                learning_rate=self._config.learning_rate,
-            )
-            values = await asyncio.gather(
-                self._forward.completion,
-                optimizer.completion,
-                return_exceptions=True,
-            )
-            failures = [value for value in values if isinstance(value, BaseException)]
-            await self._finish(failed=bool(failures))
-            if failures:
-                raise BaseExceptionGroup(
-                    "abandoned Megatron pipeline commands failed", failures
-                )
-        except BaseException:
-            await self._finish(failed=True)
-            raise
+        await self._finish(failed=True)
 
     async def _finish(self, *, failed: bool) -> None:
         batch, self._batch = self._batch, None
@@ -1175,7 +1169,6 @@ class MegatronBackend(LocalBackend):
                 int | None, train_kwargs.get("grad_accumulation_sequences")
             ),
         )
-        started = time.monotonic()
         metrics = await self.prepare_pipeline_batch(
             model,
             trajectory_groups,
@@ -1208,16 +1201,6 @@ class MegatronBackend(LocalBackend):
             DistributedMegatronService,
             await self._get_service(model),
         )
-        try:
-            forward = await service.start_pipeline_forward_backward(
-                payload.packed,
-                config,
-                dev_config,
-                expected_learner_version=learner_parent_version,
-            )
-        except BaseException:
-            await self._finish_training_batch(batch, failed=True)
-            raise
         return _MegatronPipelineCommandContext(
             self,
             model,
@@ -1225,11 +1208,12 @@ class MegatronBackend(LocalBackend):
             prepared=prepared,
             service=service,
             batch=batch,
-            forward=forward,
+            packed=payload.packed,
             config=config,
+            experimental_config=dev_config,
+            learner_parent_version=learner_parent_version,
             train_kwargs=dict(train_kwargs),
             preparation_metrics=metrics,
-            started=started,
         )
 
     async def discard_pipeline_batch(

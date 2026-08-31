@@ -276,7 +276,7 @@ async def test_pre_next_dispatch_hook_blocks_packed_lookahead(tmp_path: Path) ->
 
 
 @pytest.mark.asyncio
-async def test_command_lookahead_waits_only_for_optimizer_admission(
+async def test_command_lookahead_overlaps_current_command_execution(
     tmp_path: Path,
 ) -> None:
     backend = MagicMock()
@@ -309,9 +309,9 @@ async def test_command_lookahead_waits_only_for_optimizer_admission(
             self.started.set()
             if next_train_dispatched is not None:
                 next_train_dispatched.set()
-            await self.admitted.wait()
             if next_batch_handoff is not None:
                 next_batch_handoff.set()
+            await self.admitted.wait()
             await self.finished.wait()
             return SimpleNamespace(step=self.step, metrics={})
 
@@ -366,11 +366,11 @@ async def test_command_lookahead_waits_only_for_optimizer_admission(
     producer = asyncio.create_task(prepare())
     training = asyncio.create_task(trainer._training_stage())
     await asyncio.wait_for(first_started.wait(), timeout=2.0)
-    assert not first.handoff.is_set()
-    assert not second_queued.is_set()
+    await asyncio.wait_for(second_queued.wait(), timeout=2.0)
+    assert first.handoff.is_set()
+    assert not first_admitted.is_set()
 
     first_admitted.set()
-    await asyncio.wait_for(second_queued.wait(), timeout=2.0)
     assert not finish_first.is_set()
     finish_first.set()
     await asyncio.wait_for(asyncio.gather(producer, training), timeout=2.0)
