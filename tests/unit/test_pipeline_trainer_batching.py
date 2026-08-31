@@ -187,7 +187,7 @@ def test_async_packing_queue_reserves_ready_batch_across_target_shrink(
     )
 
     assert trainer.queue_maxsize == 31
-    assert output_queue.maxsize == 64
+    assert output_queue.maxsize == 97
 
 
 @pytest.mark.asyncio
