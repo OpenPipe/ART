@@ -17,6 +17,7 @@ from art.preprocessing.moe_routing import (
     MoeRouteArray,
     moe_route_dtype,
 )
+from art.preprocessing.pack import DEFAULT_MIN_PREFIX_TREE_SHARED_SEGMENT_LENGTH
 from art.training.contracts import TokenizedTrainingBatch
 from art.training.tokenized import TokenizedLossName
 from art.trajectories import (
@@ -314,6 +315,10 @@ class PackingRequest(BaseModel):
     logprob_calculation_chunk_size: int = Field(default=1024, ge=1)
     include_moe_routing: bool = False
     collect_packing_shapes: bool = False
+    min_prefix_tree_shared_segment_length: int = Field(
+        default=DEFAULT_MIN_PREFIX_TREE_SHARED_SEGMENT_LENGTH,
+        ge=0,
+    )
     compute_content_sha256: bool = False
     group_ids: tuple[str, ...] = ()
     record_ids: tuple[str, ...] = ()

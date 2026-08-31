@@ -629,6 +629,9 @@ class ArtHostService(Actor):
                             tokenized_batch.datums,
                             loss=tokenized_loss,
                             seq_len=request.packed_sequence_length,
+                            min_prefix_tree_shared_segment_length=(
+                                request.min_prefix_tree_shared_segment_length
+                            ),
                         )
                     )
                     if cancelled is not None:
@@ -658,6 +661,9 @@ class ArtHostService(Actor):
                                 request.logprob_calculation_chunk_size
                             ),
                             include_moe_routing=request.include_moe_routing,
+                            min_prefix_tree_shared_segment_length=(
+                                request.min_prefix_tree_shared_segment_length
+                            ),
                         )
                     )
                     if cancelled is not None:

@@ -14,6 +14,7 @@ from ..distributed.art_runtime import ArtRuntime
 from ..local.backend import LocalBackend, _PackedTrainingBatch
 from ..local.service import ModelService
 from ..model import Model, TrainableModel
+from ..preprocessing.pack import DEFAULT_MIN_PREFIX_TREE_SHARED_SEGMENT_LENGTH
 from ..trajectories import TrajectoryGroup
 from ..types import LocalTrainResult
 from ..utils.lifecycle import complete_task
@@ -23,6 +24,8 @@ from ..vllm_runtime import get_external_vllm_runtime_config
 from .migrations import apply_megatron_migrations
 from .runtime.specs import ResidentLoraInspectionResult, ResidentScoreResult
 from .runtime_config import get_megatron_runtime_config
+
+_CONTEXT_PARALLEL_MIN_PREFIX_TREE_SHARED_SEGMENT_LENGTH = 256
 
 
 class _DistributedBatchPayload(BaseModel):
@@ -45,6 +48,7 @@ class _PackingConfig(BaseModel):
     logprob_calculation_chunk_size: int = Field(ge=1)
     include_moe_routing: bool
     collect_packing_shapes: bool
+    min_prefix_tree_shared_segment_length: int = Field(ge=0)
 
     @classmethod
     def from_dev_config(
@@ -54,6 +58,7 @@ class _PackingConfig(BaseModel):
         include_moe_routing: bool,
         collect_packing_shapes: bool,
     ) -> "_PackingConfig":
+        topology = get_megatron_runtime_config().topology
         return cls(
             advantage_balance=config.get("advantage_balance", 0.0),
             allow_training_without_logprobs=config.get(
@@ -67,6 +72,11 @@ class _PackingConfig(BaseModel):
             ),
             include_moe_routing=include_moe_routing,
             collect_packing_shapes=collect_packing_shapes,
+            min_prefix_tree_shared_segment_length=(
+                _CONTEXT_PARALLEL_MIN_PREFIX_TREE_SHARED_SEGMENT_LENGTH
+                if topology.cp > 1
+                else DEFAULT_MIN_PREFIX_TREE_SHARED_SEGMENT_LENGTH
+            ),
         )
 
 

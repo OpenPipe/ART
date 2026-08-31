@@ -84,6 +84,7 @@ from ..pipeline_tuner import (
     PackingLeafShape,
 )
 from ..preprocessing.pack import (
+    DEFAULT_MIN_PREFIX_TREE_SHARED_SEGMENT_LENGTH,
     PackedTensors,
     packed_tensors_from_tokenized_results,
     packed_tensors_to_dir,
@@ -1001,6 +1002,9 @@ class LocalBackend:
         packed_sequence_length: int | None,
         logprob_calculation_chunk_size: int,
         include_moe_routing: bool = False,
+        min_prefix_tree_shared_segment_length: int = (
+            DEFAULT_MIN_PREFIX_TREE_SHARED_SEGMENT_LENGTH
+        ),
     ) -> PackedTensors | None:
         internal_config = cast(dev.InternalModelConfig, model._internal_config or {})
         tokenizer_key = _tokenizer_cache_key(model.base_model, internal_config)
@@ -1123,6 +1127,9 @@ class LocalBackend:
             advantage_balance=advantage_balance,
             pack_results=self._supports_result_packing,
             include_moe_routing=include_moe_routing,
+            min_prefix_tree_shared_segment_length=(
+                min_prefix_tree_shared_segment_length
+            ),
         )
         if (
             not allow_training_without_logprobs
