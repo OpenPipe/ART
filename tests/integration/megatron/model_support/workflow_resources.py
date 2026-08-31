@@ -389,11 +389,11 @@ _B300_THROUGHPUT_FLOORS = {
         (38_500, 37_300, 10_500, 0.93, 4.5),
     ),
     "qwen3_dense": (
-        "fde06e40ef5a363a7910b349b5364dc84992a6aa31c7b1267d63d870fd57fd69",
+        "a1383c2dc83f79381ee61373addd9d1a9c3f964d84eedee49de3df884a53d96c",
         (40_200, 37_600, 8_600, 0.88, 4.5),
     ),
     "qwen3_moe": (
-        "d41841a7ff6d0fcca3fe9f3ce240519143da1a1e7931fc313a88b11734535a62",
+        "1c505e8944839c9857a2298e9f5c20494bdc4e7a3a76ab79af94be91d7b30d13",
         (49_900, 43_700, 2_050, 0.82, 4.5),
     ),
     "qwen3_5_dense": (
@@ -401,7 +401,7 @@ _B300_THROUGHPUT_FLOORS = {
         (64_800, 60_000, 3_750, 0.87, 3.5),
     ),
     "qwen3_5_moe": (
-        "72172ac8d112af1dd7248f52e36ff5cf4cd6c2407d4a6ffb50e2b4758e8bb98d",
+        "b20c9fe142793e5284d76fac30f0757e79e87b3abfa1ae49b434802ed12fe680",
         (32_600, 30_800, 257, 0.89, 5.5),
     ),
     "gemma4_dense": (
