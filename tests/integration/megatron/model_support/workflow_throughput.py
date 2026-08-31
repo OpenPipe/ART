@@ -22,6 +22,7 @@ from art.megatron.model_support.spec import ArchitectureReport
 from art.vllm_runtime import _resolve_vllm_runtime_python
 
 from .validation_spec import ValidationStageResult
+from .workflow_cleanup import prune_runtime_artifacts
 from .workflow_fixtures import (
     FIXTURE_PATH_ENV,
     _flatten_token_ids,
@@ -1696,6 +1697,10 @@ def _run_throughput_attempts(
     stage_dir: Path,
     run_attempt: Callable[[int, Path], ValidationStageResult],
 ) -> ValidationStageResult:
+    def record_cleanup(result: ValidationStageResult, root: Path) -> None:
+        for name, value in prune_runtime_artifacts(root).items():
+            result.metrics[name] = int(result.metrics.get(name, 0)) + value
+
     stage_dir.mkdir(parents=True, exist_ok=True)
     attempts: list[dict[str, Any]] = []
     for attempt in range(1, _THROUGHPUT_MAX_ATTEMPTS + 1):
@@ -1704,17 +1709,30 @@ def _run_throughput_attempts(
         try:
             result = run_attempt(attempt, artifact_dir)
         except _ThroughputEvidenceInconclusive as error:
+            cleanup = prune_runtime_artifacts(artifact_dir)
             attempts.append(
                 {
                     "attempt": attempt,
                     "artifact_dir": str(artifact_dir),
                     "acceptance_status": "evidence_inconclusive",
                     "acceptance_failures": [str(error)],
+                    **cleanup,
                 }
             )
             if attempt == _THROUGHPUT_MAX_ATTEMPTS:
+                prune_runtime_artifacts(stage_dir)
                 raise
             continue
+        except BaseException as error:
+            try:
+                prune_runtime_artifacts(stage_dir)
+            except BaseException as cleanup_error:
+                raise BaseExceptionGroup(
+                    "throughput attempt and runtime cleanup failed",
+                    [error, cleanup_error],
+                ) from None
+            raise
+        record_cleanup(result, artifact_dir)
         status = result.metrics["acceptance_status"]
         _require(
             status in {"accepted", "rejected", "load_inconclusive"},
@@ -1738,6 +1756,7 @@ def _run_throughput_attempts(
             status == "accepted" or not retryable or attempt == _THROUGHPUT_MAX_ATTEMPTS
         )
         if terminal:
+            record_cleanup(result, stage_dir)
             result.metrics.update(
                 throughput_attempt_count=len(attempts),
                 throughput_retry_performed=len(attempts) > 1,

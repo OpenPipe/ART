@@ -647,6 +647,9 @@ def test_throughput_retry_is_bounded_and_preserves_attempts(
         def run_attempt(attempt: int, artifact_dir: Path) -> ValidationStageResult:
             calls.append(attempt)
             (artifact_dir / "complete.txt").write_text(str(attempt))
+            runtime_dir = artifact_dir / "optimizer_states"
+            runtime_dir.mkdir()
+            (runtime_dir / "state.pt").write_bytes(b"state")
             classification = _classify_acceptance_failures(
                 failures_by_attempt[attempt - 1]
             )
@@ -667,6 +670,7 @@ def test_throughput_retry_is_bounded_and_preserves_attempts(
             (stage_dir / f"attempt_{attempt}" / "complete.txt").is_file()
             for attempt in calls
         )
+        assert not any(stage_dir.rglob("optimizer_states"))
 
 
 def test_throughput_measurement_freezes_actual_settings() -> None:
@@ -869,6 +873,7 @@ def _without_stage_duration(stage: ValidationStageResult) -> dict[str, object]:
     metrics.pop("fixture_provisioning_s", None)
     metrics.pop("workflow_pruned_runtime_artifact_dirs", None)
     metrics.pop("workflow_pruned_runtime_artifact_bytes", None)
+    metrics.pop("workflow_pruned_runtime_filesystem_bytes", None)
     return metrics
 
 
@@ -881,6 +886,8 @@ def test_runtime_pruning_retains_vllm_log(tmp_path: Path) -> None:
     metrics = _prune_runtime_artifacts(tmp_path)
 
     assert metrics["workflow_pruned_runtime_artifact_dirs"] == 1
+    assert metrics["workflow_pruned_runtime_artifact_bytes"] > 0
+    assert metrics["workflow_pruned_runtime_filesystem_bytes"] >= 0
     assert not runtime_dir.exists()
     assert (
         tmp_path

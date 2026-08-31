@@ -29,6 +29,7 @@ from .validation_spec import (
     ValidationReport,
     ValidationStageResult,
 )
+from .workflow_cleanup import prune_runtime_artifacts as _prune_runtime_artifacts
 from .workflow_fixtures import WorkflowFixture, ensure_workflow_fixture
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
@@ -88,14 +89,6 @@ SUBPROCESS_VALIDATION_STAGES = frozenset(
     }
 )
 _RUNTIME_CLEANUP_STAGES = frozenset({"length_trainability", "e2e_throughput"})
-_RUNTIME_ARTIFACT_DIR_NAMES = frozenset(
-    {
-        "checkpoints",
-        "megatron_runtime",
-        "optimizer_states",
-        "trajectories",
-    }
-)
 _WORKFLOW_STAGE_TIMEOUT_S = 30 * 60
 _WORKFLOW_STAGE_TIMEOUT_OVERRIDES_S = {
     ("e2e_throughput", "deepseek-ai/DeepSeek-V4-Flash"): 40 * 60,
@@ -285,34 +278,6 @@ def _write_validation_report(
 
 def _record_stage_duration(stage: ValidationStageResult, *, started: float) -> None:
     stage.metrics["workflow_stage_duration_s"] = time.monotonic() - started
-
-
-def _prune_runtime_artifacts(stage_dir: Path) -> dict[str, int]:
-    paths = sorted(
-        (
-            path
-            for path in stage_dir.rglob("*")
-            if path.is_dir() and path.name in _RUNTIME_ARTIFACT_DIR_NAMES
-        ),
-        key=lambda path: len(path.parts),
-        reverse=True,
-    )
-    removed_bytes = 0
-    for path in paths:
-        for log_path in path.rglob("vllm-runtime.log"):
-            retained_path = (
-                stage_dir / "retained_runtime_logs" / log_path.relative_to(stage_dir)
-            )
-            retained_path.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(log_path, retained_path)
-        removed_bytes += sum(
-            child.stat().st_size for child in path.rglob("*") if child.is_file()
-        )
-        shutil.rmtree(path)
-    return {
-        "workflow_pruned_runtime_artifact_dirs": len(paths),
-        "workflow_pruned_runtime_artifact_bytes": removed_bytes,
-    }
 
 
 def _write_all_architectures_report(
