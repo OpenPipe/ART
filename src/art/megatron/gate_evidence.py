@@ -225,6 +225,36 @@ class MegatronGateEvidenceRecorder:
                 receipt.model_dump_json(indent=2).encode() + b"\n",
             )
 
+    def reuse_slot_state(
+        self,
+        *,
+        source_turn_index: int,
+        turn_index: int,
+        run_count: int,
+    ) -> None:
+        """Reuse an adjacent turn's immutable after-boundary as the next before."""
+
+        for run_index in range(run_count):
+            source = (
+                self.root
+                / "receipts"
+                / "isolation"
+                / f"turn-{source_turn_index:03d}"
+                / "after"
+                / f"run-{run_index:03d}.json"
+            )
+            if not source.is_file():
+                raise RuntimeError("prior gate isolation boundary is unavailable")
+            target = (
+                self.root
+                / "receipts"
+                / "isolation"
+                / f"turn-{turn_index:03d}"
+                / "before"
+                / f"run-{run_index:03d}.json"
+            )
+            _write_json(target, source.read_bytes())
+
 
 class MegatronGateCheckpointOperations:
     """Gate-only save-state port that records the live portable export receipt."""
@@ -342,14 +372,22 @@ async def _execute_schedule(
         for run_plan, binding in bound
     }
     run_ids = tuple(run.bootstrap.run_id for run in plan.runs)
+    previous_captured_turn: int | None = None
     for turn_index, turn in enumerate(plan.schedule):
         execution = runs[turn.run_id]
         if turn.capture_isolation:
-            await recorder.capture_slot_state(
-                turn_index=turn_index,
-                phase="before",
-                run_ids=run_ids,
-            )
+            if previous_captured_turn is None:
+                await recorder.capture_slot_state(
+                    turn_index=turn_index,
+                    phase="before",
+                    run_ids=run_ids,
+                )
+            else:
+                recorder.reuse_slot_state(
+                    source_turn_index=previous_captured_turn,
+                    turn_index=turn_index,
+                    run_count=len(run_ids),
+                )
         stop = execution.cursor + turn.command_count
         await _execute_commands(
             recorder,
@@ -364,6 +402,9 @@ async def _execute_schedule(
                 phase="after",
                 run_ids=run_ids,
             )
+            previous_captured_turn = turn_index
+        else:
+            previous_captured_turn = None
     for execution in runs.values():
         if execution.ledger.open_forward_backward_operation_ids:
             raise RuntimeError("gate run ended with open F/B contributions")
