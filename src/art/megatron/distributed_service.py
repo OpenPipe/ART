@@ -962,6 +962,7 @@ class DistributedMegatronService:
         *,
         lineage_error: str,
         wait_for_serving: bool = False,
+        execution_gate: asyncio.Future[bool] | None = None,
     ) -> AsyncIterator[dict[str, float]]:
         trainer_prepare_started = time.perf_counter()
         await self._await_trainer_preparation()
@@ -970,6 +971,7 @@ class DistributedMegatronService:
         async with self._train_lock:
             lock_wait_s = time.perf_counter() - lock_started
             setup_started = time.perf_counter()
+            dispatch_allowed = True
             async with self._trainer_failure_boundary():
                 if self._temporal_gpu_sharing and self._base_url is not None:
                     previous = self._serving_futures.get(self._latest_step)
@@ -1030,8 +1032,28 @@ class DistributedMegatronService:
                     reconcile_step, checkpoint = reconcile
                     async with self._serving_lock:
                         await self._reconcile_serving_locked(reconcile_step, checkpoint)
-                self._prefetch_publication_preparation(trainer, next_step + 1)
+                if execution_gate is not None:
+                    dispatch_allowed = await asyncio.shield(execution_gate)
+                if dispatch_allowed:
+                    self._prefetch_publication_preparation(trainer, next_step + 1)
             setup_s = time.perf_counter() - setup_started
+
+            if not dispatch_allowed:
+                cancelled = asyncio.CancelledError(
+                    "prepared pipeline command was not admitted for execution"
+                )
+                manager = self._prepared_adapter_transfers.pop(
+                    output_generation.generation_id, None
+                )
+                if manager is not None:
+                    interrupted = await self._release_adapter_transfer(
+                        manager, output_generation.generation_id, cancelled
+                    )
+                    if interrupted is not None:
+                        cancelled.add_note(
+                            "prepared trainer dispatch cleanup observed cancellation"
+                        )
+                raise cancelled
 
             final_metrics: dict[str, float] | None = None
             async with self._trainer_transaction(
@@ -1086,6 +1108,7 @@ class DistributedMegatronService:
         experimental_config: dev.TrainConfig,
         *,
         dispatch_event: asyncio.Event | None = None,
+        execution_gate: asyncio.Future[bool] | None = None,
     ) -> AsyncIterator[dict[str, float]]:
         def build_job(fields: _TrainerJobFields) -> TrainerJobSpec:
             values = {
@@ -1110,6 +1133,7 @@ class DistributedMegatronService:
                 else None,
             ),
             lineage_error="learner lineage changed during training",
+            execution_gate=execution_gate,
         ):
             yield metrics
 
