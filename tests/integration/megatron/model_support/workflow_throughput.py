@@ -882,6 +882,17 @@ def _groups_per_packed_sequence(stage: Any, config: ThroughputWorkflowConfig) ->
     return groups
 
 
+def _synthetic_sampling_constraints(
+    tokenizer: Any, *, model_key: str
+) -> dict[str, Any]:
+    if model_key != "gpt_oss_moe":
+        return {}
+    message_token_id = tokenizer.convert_tokens_to_ids("<|message|>")
+    if not isinstance(message_token_id, int) or message_token_id < 0:
+        raise RuntimeError("GPT-OSS tokenizer lacks the Harmony message delimiter")
+    return {"logit_bias": {str(message_token_id): -100.0}}
+
+
 def _calibration_contract(
     *,
     base_model: str,
@@ -892,6 +903,7 @@ def _calibration_contract(
     prompt: str,
     actual_prompt_tokens: int,
     gpu_identities: list[dict[str, Any]],
+    sampling_constraints: Mapping[str, Any],
 ) -> dict[str, Any]:
     manifest = fixture.manifest
     _require(
@@ -938,6 +950,7 @@ def _calibration_contract(
             **workload,
             "actual_prompt_tokens": actual_prompt_tokens,
             "prompt_template_sha256": hashlib.sha256(prompt.encode()).hexdigest(),
+            "sampling_constraints": sampling_constraints,
         },
         "random_initialization": {
             "version": config.random_initialization_version,
@@ -1802,6 +1815,9 @@ async def _run_e2e_throughput_async(
     )
     prompt = _sized_prompt(tokenizer, target_tokens=config.prompt_tokens)
     actual_prompt_tokens = _chat_token_count(tokenizer, prompt)
+    sampling_constraints = _synthetic_sampling_constraints(
+        tokenizer, model_key=fixture.model_key
+    )
     run_name = f"throughput-{fixture.model_key}-{uuid.uuid4().hex[:8]}"
     model_output_dir: Path | None = None
     events: list[PolicyActivationEvent] = []
@@ -1845,6 +1861,7 @@ async def _run_e2e_throughput_async(
         prompt=prompt,
         actual_prompt_tokens=actual_prompt_tokens,
         gpu_identities=gpu_identities,
+        sampling_constraints=sampling_constraints,
     )
     calibration_fingerprint = _calibration_fingerprint(runtime_contract)
 
@@ -1877,6 +1894,7 @@ async def _run_e2e_throughput_async(
                 extra_body={
                     "ignore_eos": True,
                     "min_tokens": config.completion_tokens,
+                    **sampling_constraints,
                 },
             )
 
@@ -1898,6 +1916,7 @@ async def _run_e2e_throughput_async(
                     extra_body={
                         "ignore_eos": True,
                         "min_tokens": config.completion_tokens,
+                        **sampling_constraints,
                     },
                 )
                 if len(response.choices) != config.rollouts_per_group:

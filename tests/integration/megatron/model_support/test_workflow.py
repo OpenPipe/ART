@@ -50,6 +50,7 @@ from .workflow_throughput import (
     _run_throughput_attempts,
     _settled_execution_decision_suffix,
     _sized_prompt,
+    _synthetic_sampling_constraints,
     acceptance_failures,
 )
 
@@ -911,6 +912,15 @@ def test_throughput_prompt_bounds_shared_context_before_scenario_identity() -> N
     last_context = prompt.rfind("measured context item")
 
     assert 0 <= first_context < scenario < last_context
+
+
+def test_gpt_oss_random_fixture_cannot_open_a_harmony_message() -> None:
+    tokenizer = SimpleNamespace(convert_tokens_to_ids=lambda _token: 200008)
+
+    assert _synthetic_sampling_constraints(tokenizer, model_key="gpt_oss_moe") == {
+        "logit_bias": {"200008": -100.0}
+    }
+    assert _synthetic_sampling_constraints(tokenizer, model_key="qwen3_moe") == {}
 
 
 def test_validated_architecture_representative_models_are_fixed() -> None:
