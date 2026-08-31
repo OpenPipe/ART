@@ -45,7 +45,7 @@ from .workflow_throughput import (
     _collect_measurements,
     _current_pipeline_settings,
     _freeze_pipeline_settings_from_step,
-    _packed_input_fingerprint,
+    _packed_batch_fingerprint,
     _phase_evidence,
     _run_throughput_attempts,
     _settled_execution_decision_suffix,
@@ -840,11 +840,9 @@ def test_throughput_packed_input_fingerprint_hashes_data_plane_bytes() -> None:
                 model_dump=lambda **kwargs: {"packed_sequence_length": 4}
             ),
         )
-        groups = [SimpleNamespace(_prepared_training_batch=prepared)]
-
-        before = _packed_input_fingerprint(groups)
+        before = _packed_batch_fingerprint(prepared)
         buffer[0] = ord("z")
-        changed_bytes = _packed_input_fingerprint(groups)
+        changed_bytes = _packed_batch_fingerprint(prepared)
         buffer[0] = ord("a")
         packed.packed_group_shapes = (
             PackedGroupShape(
@@ -855,7 +853,7 @@ def test_throughput_packed_input_fingerprint_hashes_data_plane_bytes() -> None:
                 )
             ),
         )
-        changed_shape = _packed_input_fingerprint(groups)
+        changed_shape = _packed_batch_fingerprint(prepared)
 
         assert before != changed_bytes
         assert before != changed_shape
