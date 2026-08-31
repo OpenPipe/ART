@@ -385,7 +385,7 @@ _THROUGHPUT_CONFIGS = {
 # values are estimates from the prior H200 workflow and remain fingerprint-free.
 _B300_THROUGHPUT_FLOORS = {
     "llama3_dense": (
-        "b777d6c00d6574a9445b5a460f36909ba48155355e51034867aa286be171894d",
+        "95227ef5eb23246f3e3e04d824767f492845fe50c3286b54c3745e217e040218",
         (38_500, 37_300, 10_500, 0.93, 4.5),
     ),
     "qwen3_dense": (
