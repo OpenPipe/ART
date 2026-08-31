@@ -887,7 +887,7 @@ def test_runtime_pruning_retains_vllm_log(tmp_path: Path) -> None:
 
     assert metrics["workflow_pruned_runtime_artifact_dirs"] == 1
     assert metrics["workflow_pruned_runtime_artifact_bytes"] > 0
-    assert metrics["workflow_pruned_runtime_filesystem_bytes"] >= 0
+    assert isinstance(metrics["workflow_pruned_runtime_filesystem_bytes"], int)
     assert not runtime_dir.exists()
     assert (
         tmp_path
