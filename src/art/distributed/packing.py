@@ -38,7 +38,7 @@ from .rollout import RolloutModelSpec
 from .trajectory_store import (
     TrajectoryBatchTransfer,
     TrajectoryGroupBundle,
-    TrajectoryQueueItem,
+    TrajectoryPackingSource,
 )
 
 if TYPE_CHECKING:
@@ -300,7 +300,7 @@ class PackingRequest(BaseModel):
     generation_id: str = Field(min_length=1)
     trajectory_groups: tuple[TrajectoryGroupBundle, ...] = ()
     trajectory_transfer: TrajectoryBatchTransfer | None = None
-    trajectory_sources: tuple[TrajectoryQueueItem, ...] = ()
+    trajectory_sources: tuple[TrajectoryPackingSource, ...] = ()
     tokenized_batch: TokenizedTrainingBatch | None = None
     tokenized_transfer: TokenizedBatchTransfer | None = None
     tokenized_loss: TokenizedLossName | None = None

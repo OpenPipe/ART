@@ -777,6 +777,7 @@ class MegatronBackend(LocalBackend):
         )
         from ..distributed.trajectory_store import (
             TrajectoryGroupBundle,
+            TrajectoryPackingSource,
             retained_route_bundles_from_bundles,
         )
 
@@ -898,7 +899,9 @@ class MegatronBackend(LocalBackend):
                 model=RolloutModelSpec.from_model(model),
                 generation_id=generation_id,
                 trajectory_groups=bundles,
-                trajectory_sources=sources,
+                trajectory_sources=tuple(
+                    TrajectoryPackingSource.from_item(source) for source in sources
+                ),
                 retained_route_bundles=retained_routes,
                 trajectory_log_path=trajectory_log_path,
                 group_ids=group_ids,

@@ -4,17 +4,21 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from art.distributed.data_plane import ByteStreamTransfer
 from art.distributed.rollout import (
     DistributedTrajectoryQueue,
     DistributedTrajectorySelection,
     _InProcessTrajectoryQueueEndpoint,
 )
 from art.distributed.trajectory_store import (
+    TrajectoryBatchTransfer,
     TrajectoryCapacityError,
     TrajectoryEnqueueResult,
     TrajectoryGroupAnnotations,
     TrajectoryGroupDescriptor,
+    TrajectoryGroupLayout,
     TrajectoryGroupRef,
+    TrajectoryPackingSource,
     TrajectoryQueueItem,
     TrajectoryRecordRef,
 )
@@ -80,6 +84,28 @@ async def _wait_until(condition: Callable[[], bool]) -> None:
             return
         await asyncio.sleep(0)
     raise AssertionError("condition was not reached")
+
+
+def test_packing_source_omits_queue_descriptor_summaries() -> None:
+    item = _item("result", byte_count=2)
+    transfer = TrajectoryBatchTransfer(
+        stream=ByteStreamTransfer(
+            stream_id="result", host="127.0.0.1", port=1, token="0" * 64, byte_count=2
+        ),
+        groups=(TrajectoryGroupLayout(header_byte_count=1, record_byte_counts=(1,)),),
+    )
+    item = item.model_copy(
+        update={"ref": item.ref.model_copy(update={"transfer": transfer})}
+    )
+
+    source = TrajectoryPackingSource.from_item(item)
+
+    assert source.model_dump() == {
+        "result_id": "result",
+        "byte_count": 2,
+        "transfer": transfer.model_dump(),
+        "annotations": item.annotations.model_dump(),
+    }
 
 
 class _ObservedQueueEndpoint(_InProcessTrajectoryQueueEndpoint):

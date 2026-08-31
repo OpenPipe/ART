@@ -250,6 +250,21 @@ class TrajectoryGroupAnnotations(_Contract):
     queue_wait_s: float = Field(default=0.0, ge=0)
 
 
+def _apply_annotations(
+    group: TrajectoryGroup, annotations: TrajectoryGroupAnnotations
+) -> TrajectoryGroup:
+    group.metadata.update(annotations.metadata)
+    group.metadata["_art_rollout_wall_s"] = annotations.rollout_wall_s
+    group.metadata["_art_actor_idle_s"] = annotations.actor_idle_s
+    group.metadata["_art_queue_wait_s"] = annotations.queue_wait_s
+    for trajectory in group.trajectories:
+        if trajectory.initial_policy_version is None:
+            trajectory.initial_policy_version = annotations.initial_policy_version
+        if trajectory.final_policy_version is None:
+            trajectory.final_policy_version = annotations.final_policy_version
+    return group
+
+
 class TrajectoryQueueItem(_Contract):
     ref: TrajectoryGroupRef
     annotations: TrajectoryGroupAnnotations
@@ -268,17 +283,38 @@ class TrajectoryQueueItem(_Contract):
         return self.apply_annotations(groups[0])
 
     def apply_annotations(self, group: TrajectoryGroup) -> TrajectoryGroup:
-        annotations = self.annotations
-        group.metadata.update(annotations.metadata)
-        group.metadata["_art_rollout_wall_s"] = annotations.rollout_wall_s
-        group.metadata["_art_actor_idle_s"] = annotations.actor_idle_s
-        group.metadata["_art_queue_wait_s"] = annotations.queue_wait_s
-        for trajectory in group.trajectories:
-            if trajectory.initial_policy_version is None:
-                trajectory.initial_policy_version = annotations.initial_policy_version
-            if trajectory.final_policy_version is None:
-                trajectory.final_policy_version = annotations.final_policy_version
-        return group
+        return _apply_annotations(group, self.annotations)
+
+
+class TrajectoryPackingSource(_Contract):
+    """Minimal queue-owned source sent to the remote packing host."""
+
+    result_id: str = Field(min_length=1)
+    byte_count: int = Field(ge=0)
+    transfer: TrajectoryBatchTransfer
+    annotations: TrajectoryGroupAnnotations
+
+    @classmethod
+    def from_item(cls, item: TrajectoryQueueItem) -> "TrajectoryPackingSource":
+        transfer = item.ref.transfer
+        if transfer is None:
+            raise RuntimeError("remote trajectory has no data-plane transfer")
+        return cls(
+            result_id=item.ref.result_id,
+            byte_count=item.ref.descriptor.byte_count,
+            transfer=transfer,
+            annotations=item.annotations,
+        )
+
+    async def receive(self, *, timeout_s: float) -> TrajectoryGroup:
+        if self.transfer.stream.stream_id != self.result_id:
+            raise RuntimeError("trajectory owner returned the wrong result ID")
+        if self.transfer.stream.byte_count != self.byte_count:
+            raise RuntimeError("trajectory owner returned the wrong byte count")
+        groups = await self.transfer.receive_groups(timeout_s=timeout_s)
+        if len(groups) != 1:
+            raise RuntimeError("trajectory owner returned the wrong group count")
+        return _apply_annotations(groups[0], self.annotations)
 
 
 class TrajectoryQueueResize(_Contract):
