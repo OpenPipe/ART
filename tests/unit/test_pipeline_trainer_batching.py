@@ -139,6 +139,7 @@ async def test_async_packing_prepares_beyond_ready_batch(tmp_path: Path) -> None
         return {}
 
     backend.prepare_pipeline_batch = AsyncMock(side_effect=prepare)
+    backend.prepare_pipeline_commands = None
     trainer = _packed_trainer(tmp_path, backend, run_name="pipeline-ready-ahead-test")
     groups = [_group(), _group()]
     for group in groups:
@@ -186,7 +187,42 @@ def test_async_packing_queue_reserves_ready_batch_across_target_shrink(
     )
 
     assert trainer.queue_maxsize == 31
-    assert output_queue.maxsize == 97
+    assert output_queue.maxsize == 64
+
+
+@pytest.mark.asyncio
+async def test_command_preparation_is_bounded_to_one_ready_batch(
+    tmp_path: Path,
+) -> None:
+    backend = MagicMock()
+    contexts: list[SimpleNamespace] = []
+
+    async def prepare_commands(*_args: object, **_kwargs: object) -> SimpleNamespace:
+        context = SimpleNamespace(preparation_metrics={}, abort=AsyncMock())
+        contexts.append(context)
+        return context
+
+    backend.prepare_pipeline_commands = AsyncMock(side_effect=prepare_commands)
+    backend.prepare_pipeline_batch = None
+    trainer = _packed_trainer(tmp_path, backend, run_name="pipeline-command-ahead")
+    for group in (_group(), _group()):
+        await trainer._output_queue.put(group)
+    await trainer._output_queue.put(None)
+
+    packing = asyncio.create_task(trainer._packing_stage())
+    first = await asyncio.wait_for(trainer._packed_queue.get(), timeout=2.0)
+    assert first is not None
+    assert len(contexts) == 1
+    await asyncio.sleep(0)
+    assert len(contexts) == 1
+
+    first.handoff.set()
+    second = await asyncio.wait_for(trainer._packed_queue.get(), timeout=2.0)
+    assert second is not None
+    assert len(contexts) == 2
+    second.handoff.set()
+    assert await asyncio.wait_for(trainer._packed_queue.get(), timeout=2.0) is None
+    await asyncio.wait_for(packing, timeout=2.0)
 
 
 @pytest.mark.asyncio

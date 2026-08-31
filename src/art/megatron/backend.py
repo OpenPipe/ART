@@ -1,5 +1,6 @@
 import asyncio
 from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from pathlib import Path
 import secrets
 import sys
@@ -26,6 +27,9 @@ from .runtime.specs import ResidentLoraInspectionResult, ResidentScoreResult
 from .runtime_config import get_megatron_runtime_config
 
 _CONTEXT_PARALLEL_MIN_PREFIX_TREE_SHARED_SEGMENT_LENGTH = 256
+_PIPELINE_TRAIN_DISPATCH: ContextVar[asyncio.Event | None] = ContextVar(
+    "megatron_pipeline_train_dispatch", default=None
+)
 
 
 class _DistributedBatchPayload(BaseModel):
@@ -87,6 +91,105 @@ class _PipelinePreparedBatch(BaseModel):
     groups: tuple[Any, ...]
     packing_config: _PackingConfig
     metrics: dict[str, float]
+
+
+def _consume_pipeline_task_exception(task: asyncio.Task[Any]) -> None:
+    if not task.cancelled():
+        task.exception()
+
+
+class _MegatronPipelineCommandContext:
+    """One packed batch whose existing service transaction is queued ahead."""
+
+    def __init__(
+        self,
+        backend: "MegatronBackend",
+        model: TrainableModel,
+        groups: tuple[TrajectoryGroup, ...],
+        *,
+        learner_parent_version: int,
+        train_kwargs: dict[str, Any],
+        preparation_metrics: dict[str, float],
+    ) -> None:
+        self.preparation_metrics = preparation_metrics
+        self._backend = backend
+        self._model = model
+        self._groups = groups
+        self._learner_parent_version = learner_parent_version
+        self._train_kwargs = train_kwargs
+        self._dispatched = asyncio.Event()
+        self._claimed = False
+        self._task = asyncio.create_task(
+            self._run(),
+            name=f"megatron-pipeline-train-{learner_parent_version + 1}",
+        )
+        self._task.add_done_callback(_consume_pipeline_task_exception)
+
+    async def _run(self) -> LocalTrainResult:
+        result = await self._backend.train(
+            self._model,
+            self._groups,
+            _pipeline_train_dispatch_event=self._dispatched,
+            **self._train_kwargs,
+        )
+        expected = self._learner_parent_version + 1
+        if result.step != expected:
+            raise RuntimeError(
+                "ready-ahead trainer advanced another learner: "
+                f"expected={expected}, actual={result.step}"
+            )
+        return result
+
+    async def complete(
+        self, next_train_dispatched: asyncio.Event | None
+    ) -> LocalTrainResult:
+        if self._claimed:
+            raise RuntimeError("pipeline train context was consumed twice")
+        self._claimed = True
+
+        relay: asyncio.Task[None] | None = None
+        if next_train_dispatched is not None:
+
+            async def relay_dispatch() -> None:
+                await self._dispatched.wait()
+                next_train_dispatched.set()
+
+            relay = asyncio.create_task(
+                relay_dispatch(),
+                name=f"megatron-pipeline-dispatch-{self._learner_parent_version + 1}",
+            )
+        try:
+            try:
+                return await self._task
+            except BaseException:
+                await self._discard_unconsumed()
+                raise
+        finally:
+            if next_train_dispatched is not None and self._dispatched.is_set():
+                next_train_dispatched.set()
+            if relay is not None and not relay.done():
+                relay.cancel()
+                await asyncio.gather(relay, return_exceptions=True)
+
+    async def abort(self) -> None:
+        if self._claimed:
+            return
+        self._claimed = True
+        if self._task.done() and not self._task.cancelled():
+            error = self._task.exception()
+            if error is None:
+                raise RuntimeError("cannot discard a completed pipeline train")
+        elif not self._task.done():
+            self._task.cancel()
+            await asyncio.gather(self._task, return_exceptions=True)
+        await self._discard_unconsumed()
+
+    async def _discard_unconsumed(self) -> None:
+        prepared = self._groups[0]._prepared_training_batch
+        if isinstance(prepared, _PipelinePreparedBatch) and all(
+            group._prepared_training_batch is prepared for group in self._groups
+        ):
+            await self._backend.discard_pipeline_batch(list(self._groups))
 
 
 class MegatronBackend(LocalBackend):
@@ -283,15 +386,12 @@ class MegatronBackend(LocalBackend):
         )
         from .distributed_service import DistributedMegatronService
 
-        dispatch_armed = dispatch_event is not None and not dispatch_event.is_set()
-        service: DistributedMegatronService | None = None
-        if dispatch_armed:
-            if not pipeline_call:
-                raise RuntimeError("trainer dispatch fencing requires a prepared batch")
-            assert dispatch_event is not None
-            service = cast(DistributedMegatronService, await self._get_service(model))
-            service.arm_pipeline_train_dispatch(dispatch_event)
+        if dispatch_event is not None and dispatch_event.is_set():
+            raise RuntimeError("pipeline train dispatch fence is already set")
+        token = _PIPELINE_TRAIN_DISPATCH.set(dispatch_event)
         try:
+            if dispatch_event is not None and not pipeline_call:
+                raise RuntimeError("trainer dispatch fencing requires a prepared batch")
             result = await super().train(
                 model,
                 groups,
@@ -301,12 +401,8 @@ class MegatronBackend(LocalBackend):
                 **kwargs,
             )
         finally:
-            if dispatch_armed:
-                assert dispatch_event is not None
-                assert service is not None
-                service.cancel_pipeline_train_dispatch(dispatch_event)
-        if service is None:
-            service = cast(DistributedMegatronService, await self._get_service(model))
+            _PIPELINE_TRAIN_DISPATCH.reset(token)
+        service = cast(DistributedMegatronService, await self._get_service(model))
         final_step = kwargs.get("final_training_step")
         if final_step is not None and result.step >= final_step:
             result.metrics.update(
@@ -961,6 +1057,42 @@ class MegatronBackend(LocalBackend):
             group._prepared_training_batch = prepared
         return metrics
 
+    async def prepare_pipeline_commands(
+        self,
+        model: TrainableModel,
+        trajectory_groups: list[TrajectoryGroup],
+        *,
+        learner_parent_version: int,
+        train_kwargs: dict[str, Any],
+    ) -> _MegatronPipelineCommandContext | None:
+        metrics = await self.prepare_pipeline_batch(
+            model,
+            trajectory_groups,
+            normalize_advantages=bool(train_kwargs.get("normalize_advantages", True)),
+            advantage_balance=float(train_kwargs.get("advantage_balance", 0.0)),
+            scale_rewards=bool(train_kwargs.get("scale_rewards", True)),
+            allow_training_without_logprobs=bool(
+                train_kwargs.get("allow_training_without_logprobs", False)
+            ),
+            plot_tensors=bool(train_kwargs.get("plot_tensors", False)),
+            logprob_calculation_chunk_size=int(
+                train_kwargs.get("logprob_calculation_chunk_size", 1024)
+            ),
+            grad_accumulation_sequences=cast(
+                int | None, train_kwargs.get("grad_accumulation_sequences")
+            ),
+        )
+        if metrics is None:
+            return None
+        return _MegatronPipelineCommandContext(
+            self,
+            model,
+            tuple(trajectory_groups),
+            learner_parent_version=learner_parent_version,
+            train_kwargs=dict(train_kwargs),
+            preparation_metrics=metrics,
+        )
+
     async def discard_pipeline_batch(
         self, trajectory_groups: list[TrajectoryGroup]
     ) -> None:
@@ -1066,7 +1198,10 @@ class MegatronBackend(LocalBackend):
                 raise RuntimeError("packed batch policy provenance does not match")
         distributed_service = cast(DistributedMegatronService, service)
         async for result in distributed_service.train_packed(
-            distributed_batch, config, service_dev_config
+            distributed_batch,
+            config,
+            service_dev_config,
+            dispatch_event=_PIPELINE_TRAIN_DISPATCH.get(),
         ):
             yield {
                 **result,

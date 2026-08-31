@@ -72,7 +72,7 @@ _SCORE_FRESHNESS_TAU_STEPS = 8.0
 # Rollout critical batch size from the best current GRPO/RLVR evidence. This is
 # grounded in reported experiments, not a well-validated universal constant.
 _SCORE_CRITICAL_ROLLOUT_BATCH_SIZE = 300.0
-_PACKED_READY_AHEAD = 2
+_PACKED_READY_AHEAD = 1
 
 
 class _ResizableAsyncQueue(asyncio.Queue[T]):
@@ -98,6 +98,7 @@ class _PreparedPipelineItem(BaseModel):
     selection_s: float = Field(ge=0)
     preparation_s: float = Field(ge=0)
     preparation_metrics: dict[str, float]
+    command_context: Any | None = Field(default=None, exclude=True)
     handoff: asyncio.Event = Field(default_factory=asyncio.Event, exclude=True)
 
 
@@ -377,6 +378,7 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
         self._producer_rollout_timings = (0.0, 0.0, 0.0)
         self._reported_producer_rollout_timings = (0.0, 0.0, 0.0)
         self._packed_queue: asyncio.Queue[_PreparedPipelineItem | None] | None = None
+        self._stop_training_step: int | None = None
         self._accept_prepared_batches = True
         self._eval_queue: asyncio.Queue[int] | None = None
         self._rollout_worker_controller = RolloutWorkerController(
@@ -414,6 +416,9 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
 
         self.state.policy_version = start_step
         self.state.next_training_step = start_step
+        self._stop_training_step = (
+            start_step + self.max_steps if self.max_steps is not None else None
+        )
         self.state.scenario_offset = scenario_offset
         self.state.total_scenarios_consumed = int(
             pipeline_state.get("total_scenarios_consumed", scenario_offset) or 0
@@ -458,8 +463,9 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
             self._rollout_executor, "create_result_queue", None
         )
         local_data_plane = isinstance(self._rollout_executor, LocalRolloutExecutor)
-        supports_preparation = callable(
-            getattr(self.backend, "prepare_pipeline_batch", None)
+        supports_preparation = any(
+            callable(getattr(self.backend, name, None))
+            for name in ("prepare_pipeline_commands", "prepare_pipeline_batch")
         )
         packing_support = getattr(self.backend, "supports_async_pipeline_packing", None)
         if supports_preparation and callable(packing_support):
@@ -1079,11 +1085,44 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                 return
             await self._await_or_stop(self._output_queue.put(None))
 
+    def _train_kwargs(
+        self, current_step: int, *, should_checkpoint: bool
+    ) -> dict[str, Any]:
+        values: dict[str, Any] = {
+            "learning_rate": self.learning_rate,
+            "loss_fn": self.loss_fn,
+            "loss_fn_config": self.loss_fn_config,
+            "normalize_advantages": self.normalize_advantages,
+            "save_checkpoint": should_checkpoint,
+            "adam_params": self.adam_params,
+            "optimizer_save_interval": self.optimizer_save_interval,
+        }
+        if self.grad_accumulation_sequences is not None:
+            values["grad_accumulation_sequences"] = self.grad_accumulation_sequences
+        if self.kl_penalty_coef > 0.0:
+            values.update(
+                {
+                    "kl_penalty_coef": self.kl_penalty_coef,
+                    "kl_penalty_source": "sample",
+                    "kl_penalty_reference_step": self._kl_penalty_reference_step(
+                        current_step
+                    ),
+                }
+            )
+        return values
+
     async def _packing_stage(self) -> None:
         assert self._packed_queue is not None
-        prepare = getattr(self.backend, "prepare_pipeline_batch")
+        prepare_commands = getattr(self.backend, "prepare_pipeline_commands", None)
+        prepare_batch = getattr(self.backend, "prepare_pipeline_batch", None)
         while True:
             packing_policy_step = self.state.next_training_step
+            if (
+                self._stop_training_step is not None
+                and packing_policy_step >= self._stop_training_step
+            ):
+                await self._packed_queue.put(None)
+                return
             started = time.monotonic()
             zero_variance_before = self.state.discarded_zero_variance_groups
             batch, discarded, saw_sentinel = await self._collect_batch(
@@ -1104,12 +1143,35 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                 for group in batch:
                     group._collect_packing_shape = True
             started = time.monotonic()
-            preparation_metrics = await prepare(
-                self.model,
-                batch,
-                normalize_advantages=self.normalize_advantages,
-                grad_accumulation_sequences=self.grad_accumulation_sequences,
-            )
+            command_context = None
+            if callable(prepare_commands):
+                expected_step = packing_policy_step + 1
+                command_context = await prepare_commands(
+                    self.model,
+                    batch,
+                    learner_parent_version=packing_policy_step,
+                    train_kwargs=self._train_kwargs(
+                        packing_policy_step,
+                        should_checkpoint=(
+                            self.save_checkpoint
+                            and self._should_eval_step(expected_step)
+                        ),
+                    ),
+                )
+                preparation_metrics = (
+                    None
+                    if command_context is None
+                    else command_context.preparation_metrics
+                )
+            else:
+                if not callable(prepare_batch):
+                    raise RuntimeError("pipeline backend has no preparation method")
+                preparation_metrics = await prepare_batch(
+                    self.model,
+                    batch,
+                    normalize_advantages=self.normalize_advantages,
+                    grad_accumulation_sequences=self.grad_accumulation_sequences,
+                )
             preparation_s = time.monotonic() - started
             if preparation_metrics is None:
                 if saw_sentinel:
@@ -1125,13 +1187,17 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                 selection_s=selection_s,
                 preparation_s=preparation_s,
                 preparation_metrics=preparation_metrics,
+                command_context=command_context,
             )
             if not self._accept_prepared_batches:
-                await getattr(self.backend, "discard_pipeline_batch")(batch)
+                if command_context is None:
+                    await getattr(self.backend, "discard_pipeline_batch")(batch)
+                else:
+                    await command_context.abort()
                 return
             await self._packed_queue.put(item)
             fence_step = min(self._pre_next_dispatch_hooks, default=None)
-            if (
+            if command_context is not None or (
                 fence_step is not None
                 and fence_step <= self.state.next_training_step + _PACKED_READY_AHEAD
             ):
@@ -1243,9 +1309,9 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
             return
 
         current_step = self.state.next_training_step
-        stop_at_step = (
-            current_step + self.max_steps if self.max_steps is not None else None
-        )
+        stop_at_step = self._stop_training_step
+        if stop_at_step is None and self.max_steps is not None:
+            stop_at_step = current_step + self.max_steps
         if stop_at_step is not None and current_step >= stop_at_step:
             self._persist_state(current_step)
             self.request_stop()
@@ -1268,6 +1334,7 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
             packed_queue_depth = 0
             preparation_metrics: dict[str, float] = {}
             packing_policy_step = current_step
+            command_context = None
             if self._packed_queue is None:
                 if post_train_dispatch is not None:
                     post_train_dispatch.set()
@@ -1288,6 +1355,7 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                 preparation_s = prepared.preparation_s
                 preparation_metrics = prepared.preparation_metrics
                 packing_policy_step = prepared.packing_policy_step
+                command_context = prepared.command_context
             trainer_idle_s = time.monotonic() - collect_started
             zero_variance_discarded = (
                 prepared.zero_variance_discarded
@@ -1298,8 +1366,11 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
             if self._packed_queue is not None and any(
                 self._is_group_stale(group, current_step) for group in batch
             ):
-                discard = getattr(self.backend, "discard_pipeline_batch")
-                await discard(batch)
+                if command_context is None:
+                    discard = getattr(self.backend, "discard_pipeline_batch")
+                    await discard(batch)
+                else:
+                    await command_context.abort()
                 if post_train_dispatch is not None:
                     post_train_dispatch.set()
                 try:
@@ -1349,53 +1420,42 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
             if os.getenv("ART_TRAIN_STEP_LOG"):
                 print(f"[train] step {expected_step} starting (batch={len(batch)})")
             try:
-                train_kwargs: dict[str, Any] = {
-                    "learning_rate": self.learning_rate,
-                    "loss_fn": self.loss_fn,
-                    "loss_fn_config": self.loss_fn_config,
-                    "normalize_advantages": self.normalize_advantages,
-                    "save_checkpoint": should_checkpoint,
-                    "adam_params": self.adam_params,
-                    "optimizer_save_interval": self.optimizer_save_interval,
-                }
-                if self.grad_accumulation_sequences is not None:
-                    train_kwargs["grad_accumulation_sequences"] = (
-                        self.grad_accumulation_sequences
-                    )
-                if self.kl_penalty_coef > 0.0:
-                    kl_penalty_reference_step = self._kl_penalty_reference_step(
-                        current_step
-                    )
-                    train_kwargs["kl_penalty_coef"] = self.kl_penalty_coef
-                    train_kwargs["kl_penalty_source"] = "sample"
-                    train_kwargs["kl_penalty_reference_step"] = (
-                        kl_penalty_reference_step
-                    )
+                train_kwargs = self._train_kwargs(
+                    current_step, should_checkpoint=should_checkpoint
+                )
                 if self.autotune.mode != "off":
                     for group in batch:
                         group._collect_packing_shape = True
-                if post_train_dispatch is not None:
-                    if getattr(
-                        self.backend, "supports_pipeline_train_dispatch_fence", False
-                    ):
-                        train_kwargs["_pipeline_train_dispatch_event"] = (
-                            post_train_dispatch
-                        )
-                    else:
-                        post_train_dispatch.set()
-                result = await self.backend.train(
-                    self.model,
-                    batch,
-                    **train_kwargs,
-                )
+                if command_context is not None:
+                    result = await command_context.complete(post_train_dispatch)
+                else:
+                    if post_train_dispatch is not None:
+                        if getattr(
+                            self.backend,
+                            "supports_pipeline_train_dispatch_fence",
+                            False,
+                        ):
+                            train_kwargs["_pipeline_train_dispatch_event"] = (
+                                post_train_dispatch
+                            )
+                        else:
+                            post_train_dispatch.set()
+                    result = await self.backend.train(
+                        self.model,
+                        batch,
+                        **train_kwargs,
+                    )
                 self._backend_training_completed = True
             except Exception:
                 if post_train_dispatch is not None:
                     post_train_dispatch.set()
-                for group in batch:
-                    group._collect_packing_shape = False
-                    group._packed_group_shape = None
-                    await self._discard_collected_group(group)
+                if command_context is not None:
+                    await command_context.abort()
+                else:
+                    for group in batch:
+                        group._collect_packing_shape = False
+                        group._packed_group_shape = None
+                        await self._discard_collected_group(group)
                 self._status.note_training_end()
                 await self._await_post_train(post_train_task)
                 if fence_next_dispatch and self._packed_queue is not None:
@@ -1531,7 +1591,10 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
         while not self._packed_queue.empty():
             pending = self._packed_queue.get_nowait()
             if pending is not None:
-                await discard(pending.batch)
+                if pending.command_context is None:
+                    await discard(pending.batch)
+                else:
+                    await pending.command_context.abort()
                 pending.handoff.set()
 
     async def _collect_batch(
