@@ -795,6 +795,7 @@ class MegatronBackend(LocalBackend):
         runtime: ArtRuntime | None = None
         packed: Any = None
         marked_packed = False
+        mark_packed_task: asyncio.Task[None] | None = None
         transferred = False
         try:
             packing_config = _PackingConfig.from_dev_config(
@@ -906,16 +907,34 @@ class MegatronBackend(LocalBackend):
                 max_source_version=max(versions, default=current_step),
                 **packing_config.model_dump(),
             )
-            packed = await runtime.pack(request)
-            if packed is None:
-                return None
             if queue is not None:
-                _, cancelled = await complete_task(
-                    asyncio.create_task(queue.mark_packed(selected, generation_id))
+                mark_packed_task = asyncio.create_task(
+                    queue.mark_packed(selected, generation_id)
                 )
+            try:
+                packed = await runtime.pack(request)
+            except BaseException as packing_error:
+                if mark_packed_task is not None:
+                    try:
+                        _, cancelled = await complete_task(mark_packed_task)
+                        marked_packed = True
+                    except BaseException as marking_error:
+                        raise BaseExceptionGroup(
+                            "packing and trajectory lease marking failed",
+                            [packing_error, marking_error],
+                        ) from None
+                    if cancelled is not None:
+                        packing_error.add_note(
+                            "trajectory lease marking observed cancellation"
+                        )
+                raise
+            if mark_packed_task is not None:
+                _, cancelled = await complete_task(mark_packed_task)
                 marked_packed = True
                 if cancelled is not None:
                     raise cancelled
+            if packed is None:
+                return None
             shapes = tuple(packed.packed_group_shapes)
             if len(shapes) != len(trajectory_groups):
                 raise RuntimeError("packed-group shapes do not match trajectory groups")
