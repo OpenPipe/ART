@@ -72,6 +72,7 @@ _SCORE_FRESHNESS_TAU_STEPS = 8.0
 # Rollout critical batch size from the best current GRPO/RLVR evidence. This is
 # grounded in reported experiments, not a well-validated universal constant.
 _SCORE_CRITICAL_ROLLOUT_BATCH_SIZE = 300.0
+_PACKED_READY_AHEAD = 2
 
 
 class _ResizableAsyncQueue(asyncio.Queue[T]):
@@ -1129,7 +1130,12 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                 await getattr(self.backend, "discard_pipeline_batch")(batch)
                 return
             await self._packed_queue.put(item)
-            await item.handoff.wait()
+            fence_step = min(self._pre_next_dispatch_hooks, default=None)
+            if (
+                fence_step is not None
+                and fence_step <= self.state.next_training_step + _PACKED_READY_AHEAD
+            ):
+                await item.handoff.wait()
             if not self._accept_prepared_batches:
                 return
             if saw_sentinel:

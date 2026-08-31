@@ -126,6 +126,39 @@ async def test_collect_batch_respects_max_batch_size(tmp_path: Path) -> None:
     assert (batch, discarded, saw_sentinel) == (groups[2:], 0, True)
 
 
+@pytest.mark.asyncio
+async def test_async_packing_prepares_beyond_ready_batch(tmp_path: Path) -> None:
+    backend = MagicMock()
+    second_prepared = asyncio.Event()
+
+    async def prepare(
+        _model: object, batch: list[TrajectoryGroup], **_kwargs: object
+    ) -> dict[str, float]:
+        if backend.prepare_pipeline_batch.await_count == 2:
+            second_prepared.set()
+        return {}
+
+    backend.prepare_pipeline_batch = AsyncMock(side_effect=prepare)
+    trainer = _packed_trainer(tmp_path, backend, run_name="pipeline-ready-ahead-test")
+    groups = [_group(), _group()]
+    for group in groups:
+        await trainer._output_queue.put(group)
+    await trainer._output_queue.put(None)
+
+    packing = asyncio.create_task(trainer._packing_stage())
+    await asyncio.wait_for(second_prepared.wait(), timeout=2.0)
+
+    first = await trainer._packed_queue.get()
+    second = await trainer._packed_queue.get()
+    terminal = await trainer._packed_queue.get()
+    await asyncio.wait_for(packing, timeout=2.0)
+
+    assert first is not None and first.batch == groups[:1]
+    assert not first.handoff.is_set()
+    assert second is not None and second.batch == groups[1:]
+    assert terminal is None
+
+
 def test_async_packing_queue_reserves_ready_batch_across_target_shrink(
     tmp_path: Path,
 ) -> None:
