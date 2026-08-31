@@ -13,6 +13,7 @@ from art.distributed.rollout import (
     DistributedTrajectoryQueue,
     _InProcessTrajectoryQueueEndpoint,
 )
+from art.megatron.backend import _MegatronPipelineCommandContext
 from art.pipeline_trainer.trainer import PipelineTrainer, _PreparedPipelineItem
 from art.pipeline_tuner.config import PipelineTuneSettings
 
@@ -65,6 +66,36 @@ def _packed_trainer(
     trainer._output_queue = asyncio.Queue()
     trainer._packed_queue = asyncio.Queue(maxsize=1)
     return trainer
+
+
+@pytest.mark.asyncio
+async def test_megatron_pipeline_marks_lease_before_optimizer_not_forward() -> None:
+    mark_allowed = asyncio.Event()
+    command_done = asyncio.Event()
+
+    async def await_mark(_batch: object) -> None:
+        await mark_allowed.wait()
+
+    optimizer = object()
+    start_optimizer = AsyncMock(return_value=optimizer)
+    context = cast(Any, object.__new__(_MegatronPipelineCommandContext))
+    context._backend = SimpleNamespace(_await_batch_packing_mark=await_mark)
+    context._prepared = SimpleNamespace(batch=object())
+    context._service = SimpleNamespace(start_pipeline_optimizer=start_optimizer)
+    context._config = SimpleNamespace(learning_rate=1e-6)
+    forward = SimpleNamespace(completion=asyncio.create_task(command_done.wait()))
+
+    completion = asyncio.create_task(
+        context._start_optimizer_after_packing_mark(forward)
+    )
+    await asyncio.sleep(0)
+    start_optimizer.assert_not_awaited()
+    mark_allowed.set()
+
+    assert await completion is optimizer
+    start_optimizer.assert_awaited_once_with(forward, learning_rate=1e-6)
+    command_done.set()
+    await forward.completion
 
 
 def test_eval_rejects_tokens_from_another_policy() -> None:
