@@ -376,7 +376,7 @@ _THROUGHPUT_CONFIGS = {
         num_layers=4,
         initial_model_calls_per_inference_gpu=23,
         max_num_seqs=48,
-        max_steps=21,
+        max_steps=25,
     ),
 }
 
