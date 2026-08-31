@@ -70,7 +70,6 @@ from .runtime.publication import (
 )
 from .runtime.specs import (
     AdapterReady,
-    CommandPublicationSpec,
     CurrentSFTConfig,
     CurrentTrainConfig,
     DurableTrainOutput,
@@ -115,6 +114,7 @@ class _PipelineForwardLaunch:
     operation: OperationRef
     generation: TrainerGeneration
     publication_targets: tuple[Any, ...]
+    publication_job: TrainJobSpec
     completion: asyncio.Future[dict[str, Any]]
     setup_metrics: dict[str, float]
 
@@ -1223,6 +1223,26 @@ class DistributedMegatronService:
                     experimental_config=ExperimentalTrainConfig.model_validate(values),
                     return_token_logprobs=False,
                 )
+                publication_job = TrainJobSpec(
+                    job_id=uuid.uuid4().hex,
+                    run_id=state.run_id,
+                    training_session_id=self._training_session_id,
+                    expected_learner_version=expected_learner_version,
+                    learner_version=next_step,
+                    source=source,
+                    output=DurableTrainOutput(
+                        generation=generation,
+                        staging_adapter_path=(
+                            f"{self.output_dir}/megatron_runtime/staging/"
+                            f"{generation.generation_id}"
+                        ),
+                        optimizer_state_path=self._optimizer_state_path,
+                    ),
+                    publication_targets=publication_targets,
+                    batch=batch.leases.ref,
+                    config=current_config,
+                    experimental_config=ExperimentalTrainConfig.model_validate(values),
+                )
                 cold = self._trainer_resident_generation != source
                 source_adapter = (
                     self._published_adapters.get(source.policy_step) if cold else None
@@ -1240,7 +1260,9 @@ class DistributedMegatronService:
                     if source_adapter is not None
                     else nullcontext()
                 ):
-                    launch = await trainer.start_forward_backward(job, batch.leases)
+                    launch = await trainer.start_resident_forward_backward(
+                        job, batch.leases
+                    )
                 async with self._mutation_lock:
                     if (
                         self._trainer is not trainer
@@ -1257,6 +1279,7 @@ class DistributedMegatronService:
                 operation=operation,
                 generation=generation,
                 publication_targets=publication_targets,
+                publication_job=publication_job,
                 completion=launch.completion,
                 setup_metrics={
                     "time/step_service_lock_wait_s": lock_wait_s,
@@ -1332,21 +1355,11 @@ class DistributedMegatronService:
                     if not admitted.done():
                         admitted.set_result(forward.generation.policy_step)
 
-                    raw = await trainer.optim_step(job)
                     (
-                        records,
+                        raw,
                         publication_metrics,
-                    ) = await trainer.publish_command_generation(
-                        CommandPublicationSpec(
-                            run_id=operation.run_id,
-                            generation=forward.generation,
-                            optimizer_state_path=self._optimizer_state_path,
-                            staging_adapter_path=(
-                                f"{self.output_dir}/megatron_runtime/staging/"
-                                f"{forward.generation.generation_id}"
-                            ),
-                            publication_targets=forward.publication_targets,
-                        )
+                    ) = await trainer.resident_optim_step_and_publish(
+                        job, forward.publication_job
                     )
                     self._record_policy_timestamp(
                         self._trainer_completion_times,
@@ -1370,7 +1383,7 @@ class DistributedMegatronService:
                         )
                         self._schedule_publication(
                             forward.generation,
-                            rank_publications=records,
+                            trainer=trainer,
                             publication_targets=forward.publication_targets,
                         )
                     publication_metrics = {
@@ -1567,17 +1580,12 @@ class DistributedMegatronService:
         generation: TrainerGeneration,
         *,
         trainer: Any = None,
-        rank_publications: tuple[TrainerRankPublication, ...] | None = None,
         durable: DurableTrainerPublication | None = None,
         publication_targets: tuple[Any, ...] = (),
     ) -> None:
-        if (
-            sum(value is not None for value in (trainer, rank_publications, durable))
-            != 1
-        ):
+        if (trainer is None) == (durable is None):
             raise ValueError(
-                "publication requires exactly one trainer stream, rank receipt set, "
-                "or durable result"
+                "publication requires exactly one trainer stream or durable result"
             )
         step = generation.policy_step
         if step in self._publication_tasks:
@@ -1588,17 +1596,11 @@ class DistributedMegatronService:
         if publication_targets and transfer_manager is None:
             raise RuntimeError("adapter transfer publication is not prepared")
         loop = asyncio.get_running_loop()
-        publication_waiter: Awaitable[tuple[TrainerRankPublication, ...]] | None
-        if trainer is not None:
-            publication_waiter = trainer.wait_for_publication(generation.generation_id)
-        elif rank_publications is not None:
-            completed: asyncio.Future[tuple[TrainerRankPublication, ...]] = (
-                loop.create_future()
-            )
-            completed.set_result(rank_publications)
-            publication_waiter = completed
-        else:
-            publication_waiter = None
+        publication_waiter = (
+            trainer.wait_for_publication(generation.generation_id)
+            if trainer is not None
+            else None
+        )
         previous = self._serving_futures.get(step - 1)
         if previous is None:
             previous = loop.create_future()

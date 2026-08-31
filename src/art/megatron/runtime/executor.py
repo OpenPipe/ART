@@ -407,6 +407,45 @@ class MegatronTrainJobExecutor:
             },
         }
 
+    def publish_split_generation(
+        self,
+        job: TrainJobSpec,
+        *,
+        sink: EventSink,
+    ) -> dict[str, float]:
+        """Launch the ordinary fast snapshot after a split optimizer command."""
+
+        if self._closed:
+            raise RuntimeError("Megatron executor is closed")
+        self._require_no_open_gradients()
+        self._publisher.raise_if_failed()
+        runtime = self.runtime
+        if (
+            runtime.resident_run_id != job.run_id
+            or runtime.resident_training_session_id != job.training_session_id
+            or runtime.resident_policy_step != job.learner_version
+            or runtime.resident_generation_id != job.output_generation_id
+            or runtime.adapter_export_dtypes is None
+            or runtime.adapter_export_config is None
+        ):
+            raise RuntimeError(
+                "split publication does not match the resident learner generation"
+            )
+        from art.megatron.train import _should_snapshot_optimizer
+
+        return self._publisher.submit(
+            job,
+            runtime.adapter_export_dtypes,
+            runtime.adapter_export_config,
+            _should_snapshot_optimizer(
+                runtime,
+                step=job.learner_version,
+                optimizer_save_interval=job.config.optimizer_save_interval,
+                final_training_step=job.config.final_training_step,
+            ),
+            sink=sink,
+        )
+
     def execute_sft(
         self,
         job: SFTJobSpec,
