@@ -149,7 +149,7 @@ from art.megatron.training.trace import (
     attach_trace_token_uids,
     context_parallel_trace_token_uids_enabled,
 )
-from art.metrics_taxonomy import TRAIN_GRADIENT_STEPS_KEY
+from art.metrics_taxonomy import TRAIN_GRADIENT_STEPS_KEY, average_metric_samples
 from art.preprocessing.pack import PackedTensors
 from art.training.contracts import LossConfig
 from art.training.tokenized import tokenized_clip_bounds
@@ -984,6 +984,72 @@ def execute_megatron_rl_job(
             del adapter_dtypes
 
 
+def _forward_backward_command_metrics(
+    results: tuple[MegatronForwardBackwardStepResult, ...],
+    *,
+    durations: list[float],
+    job_prepare_s: float,
+) -> dict[str, float]:
+    samples = []
+    for result in results:
+        sample = {
+            "loss/train": float(result.reduced_loss.item()),
+            "loss/probs_corr": result.probs_corr,
+            **result.loss_metrics,
+            **result.pipeline_metrics,
+        }
+        if result.kl_policy_ref is not None:
+            sample["loss/kl_policy_ref"] = result.kl_policy_ref
+        samples.append(sample)
+    metrics = average_metric_samples(samples)
+    first_pipeline_metrics = results[0].pipeline_metrics
+    metrics.update(
+        {
+            name: value
+            for name, value in first_pipeline_metrics.items()
+            if name.startswith(
+                (
+                    _INTER_FORWARD_BACKWARD_GAP_PREFIX,
+                    _INTER_FORWARD_BACKWARD_GPU_GAP_PREFIX,
+                )
+            )
+        }
+    )
+    workloads = tuple(result.workload for result in results)
+    metrics.update(
+        {
+            TRAIN_GRADIENT_STEPS_KEY: float(len(results)),
+            "data/gradient_step_nonpadding_logical_tokens": float(
+                sum(workload.logical_nonpadding_tokens for workload in workloads)
+            ),
+            "data/gradient_step_loss_bearing_tokens": float(
+                sum(workload.loss_bearing_tokens for workload in workloads)
+            ),
+            "data/gradient_step_executed_token_equivalents": float(
+                sum(workload.executed_token_equivalents for workload in workloads)
+            ),
+            "data/gradient_step_nominal_schedule_capacity_tokens": float(
+                sum(workload.nominal_schedule_capacity_tokens for workload in workloads)
+            ),
+            "data/gradient_step_dummy_executed_token_equivalents": float(
+                sum(workload.dummy_executed_token_equivalents for workload in workloads)
+            ),
+            "data/gradient_step_dummy_schedule_capacity_tokens": float(
+                sum(workload.dummy_schedule_capacity_tokens for workload in workloads)
+            ),
+            "pipeline/gradient_step_real_microbatches": float(
+                sum(workload.real_microbatches for workload in workloads)
+            ),
+            "pipeline/gradient_step_dummy_microbatches": float(
+                sum(workload.dummy_microbatches for workload in workloads)
+            ),
+            "time/forward_backward_s": sum(durations),
+            "time/job_prepare_s": job_prepare_s,
+        }
+    )
+    return metrics
+
+
 def execute_megatron_rl_forward_backward_job(
     runtime: TrainingRuntime,
     job: ForwardBackwardJobSpec,
@@ -1089,11 +1155,11 @@ def execute_megatron_rl_forward_backward_job(
             result.workload.executed_token_equivalents for result in results
         ),
         gpu_service_ns=gpu_service_ns,
-        metrics={
-            "time/forward_backward_s": sum(durations),
-            "time/job_prepare_s": job_prepare_s,
-            "data/gradient_steps": float(len(results)),
-        },
+        metrics=_forward_backward_command_metrics(
+            results,
+            durations=durations,
+            job_prepare_s=job_prepare_s,
+        ),
     )
 
 
@@ -1222,11 +1288,11 @@ def execute_megatron_dynamic_lora_forward_backward_job(
             result.workload.executed_token_equivalents for result in results
         ),
         gpu_service_ns=gpu_service_ns,
-        metrics={
-            "time/forward_backward_s": sum(durations),
-            "time/job_prepare_s": job_prepare_s,
-            "data/gradient_steps": float(len(results)),
-        },
+        metrics=_forward_backward_command_metrics(
+            results,
+            durations=durations,
+            job_prepare_s=job_prepare_s,
+        ),
     )
 
 

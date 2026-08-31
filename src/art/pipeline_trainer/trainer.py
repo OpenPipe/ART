@@ -1412,7 +1412,11 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
             should_checkpoint = self.save_checkpoint and should_eval_step
 
             self.state.next_training_step = expected_step
-            if self._packed_queue is not None and not fence_next_dispatch:
+            if (
+                self._packed_queue is not None
+                and not fence_next_dispatch
+                and command_context is None
+            ):
                 prepared.handoff.set()
 
             self._status.note_training_start(len(batch))
@@ -1427,7 +1431,10 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                     for group in batch:
                         group._collect_packing_shape = True
                 if command_context is not None:
-                    result = await command_context.complete(post_train_dispatch)
+                    result = await command_context.complete(
+                        post_train_dispatch,
+                        None if fence_next_dispatch else prepared.handoff,
+                    )
                 else:
                     if post_train_dispatch is not None:
                         if getattr(

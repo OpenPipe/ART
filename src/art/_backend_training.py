@@ -34,6 +34,16 @@ _GRADIENT_WORKLOAD_METRICS = {
 _GRADIENT_TRAIN_TIME = "time/gradient_step_train_s"
 
 
+def merge_gradient_step_metrics(
+    forward_backward: dict[str, float], optimizer: dict[str, float]
+) -> dict[str, float]:
+    metrics = {**forward_backward, **optimizer}
+    metrics[_GRADIENT_TRAIN_TIME] = (
+        metrics["time/forward_backward_s"] + metrics["time/optimizer_step_s"]
+    )
+    return metrics
+
+
 def build_rl_train_configs(
     *,
     learning_rate: float,

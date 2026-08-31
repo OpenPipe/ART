@@ -276,31 +276,56 @@ async def test_pre_next_dispatch_hook_blocks_packed_lookahead(tmp_path: Path) ->
 
 
 @pytest.mark.asyncio
-async def test_packed_lookahead_does_not_wait_for_prior_settlement(
+async def test_command_lookahead_waits_only_for_optimizer_admission(
     tmp_path: Path,
 ) -> None:
-    second_train_started = asyncio.Event()
-    finish_second_train = asyncio.Event()
-
-    async def train(*_args: object, **_kwargs: object) -> SimpleNamespace:
-        if backend.train.await_count == 2:
-            second_train_started.set()
-            await finish_second_train.wait()
-        return SimpleNamespace(step=backend.train.await_count, metrics={})
-
     backend = MagicMock()
-    backend.supports_pipeline_train_dispatch_fence = False
-    backend.train = AsyncMock(side_effect=train)
+    backend.discard_pipeline_batch = AsyncMock()
     trainer = _packed_trainer(tmp_path, backend, run_name="pipeline-lookahead-test")
-    release_settlement = asyncio.Event()
+    first_started = asyncio.Event()
+    first_admitted = asyncio.Event()
+    finish_first = asyncio.Event()
+    second_queued = asyncio.Event()
+
+    class CommandContext:
+        def __init__(
+            self,
+            step: int,
+            *,
+            started: asyncio.Event,
+            admitted: asyncio.Event,
+            finished: asyncio.Event,
+        ) -> None:
+            self.step = step
+            self.started = started
+            self.admitted = admitted
+            self.finished = finished
+
+        async def complete(
+            self,
+            next_train_dispatched: asyncio.Event | None,
+            next_batch_handoff: asyncio.Event | None,
+        ) -> SimpleNamespace:
+            self.started.set()
+            if next_train_dispatched is not None:
+                next_train_dispatched.set()
+            await self.admitted.wait()
+            if next_batch_handoff is not None:
+                next_batch_handoff.set()
+            await self.finished.wait()
+            return SimpleNamespace(step=self.step, metrics={})
+
+        async def abort(self) -> None:
+            raise AssertionError("command context was not consumed")
 
     async def block_settlement(
         _item: object, next_train_dispatched: asyncio.Event
     ) -> None:
         await next_train_dispatched.wait()
-        await release_settlement.wait()
 
     trainer._finalize_post_train = block_settlement  # type: ignore[method-assign]
+    ready = asyncio.Event()
+    ready.set()
     first = _PreparedPipelineItem(
         batch=[_group()],
         discarded=0,
@@ -310,22 +335,42 @@ async def test_packed_lookahead_does_not_wait_for_prior_settlement(
         selection_s=0.0,
         preparation_s=0.0,
         preparation_metrics={},
+        command_context=CommandContext(
+            1,
+            started=first_started,
+            admitted=first_admitted,
+            finished=finish_first,
+        ),
     )
     second = first.model_copy(
-        update={"batch": [_group()], "saw_sentinel": True, "handoff": asyncio.Event()}
+        update={
+            "batch": [_group()],
+            "saw_sentinel": True,
+            "handoff": asyncio.Event(),
+            "command_context": CommandContext(
+                2,
+                started=asyncio.Event(),
+                admitted=ready,
+                finished=ready,
+            ),
+        }
     )
 
     async def prepare() -> None:
         await trainer._packed_queue.put(first)
         await first.handoff.wait()
         await trainer._packed_queue.put(second)
+        second_queued.set()
         await second.handoff.wait()
 
     producer = asyncio.create_task(prepare())
     training = asyncio.create_task(trainer._training_stage())
-    await asyncio.wait_for(second_train_started.wait(), timeout=2.0)
-    await asyncio.wait_for(second.handoff.wait(), timeout=0.1)
+    await asyncio.wait_for(first_started.wait(), timeout=2.0)
+    assert not first.handoff.is_set()
+    assert not second_queued.is_set()
 
-    release_settlement.set()
-    finish_second_train.set()
+    first_admitted.set()
+    await asyncio.wait_for(second_queued.wait(), timeout=2.0)
+    assert not finish_first.is_set()
+    finish_first.set()
     await asyncio.wait_for(asyncio.gather(producer, training), timeout=2.0)

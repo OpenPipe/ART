@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager, nullcontext
+from dataclasses import dataclass
 import hashlib
 import logging
 import os
@@ -29,6 +30,7 @@ from art.serving_capabilities import (
     ServingProfileIdentity,
     discover_serving_capabilities,
 )
+from art.training import AdamConfig, OperationRef
 from art.utils.lifecycle import (
     complete_task,
     complete_to_thread,
@@ -68,10 +70,13 @@ from .runtime.publication import (
 )
 from .runtime.specs import (
     AdapterReady,
+    CommandPublicationSpec,
     CurrentSFTConfig,
     CurrentTrainConfig,
     DurableTrainOutput,
     ExperimentalTrainConfig,
+    ForwardBackwardJobSpec,
+    OptimizerJobSpec,
     ResidentLoraInspectionResult,
     ResidentLoraInspectionSpec,
     ResidentScoreJobSpec,
@@ -102,6 +107,28 @@ class _TrainerJobFields(TypedDict):
     source: TrainerGeneration
     output: DurableTrainOutput
     publication_targets: tuple[Any, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _PipelineForwardLaunch:
+    trainer: Any
+    operation: OperationRef
+    generation: TrainerGeneration
+    publication_targets: tuple[Any, ...]
+    completion: asyncio.Future[dict[str, Any]]
+    setup_metrics: dict[str, float]
+
+
+@dataclass(frozen=True, slots=True)
+class _PipelineOptimizerResult:
+    raw: dict[str, Any]
+    publication_metrics: dict[str, float]
+
+
+@dataclass(frozen=True, slots=True)
+class _PipelineOptimizerLaunch:
+    step: int
+    completion: asyncio.Task[_PipelineOptimizerResult]
 
 
 async def _post_vllm(
@@ -1113,6 +1140,262 @@ class DistributedMegatronService:
         ):
             yield metrics
 
+    async def start_pipeline_forward_backward(
+        self,
+        batch: DistributedPackedBatch,
+        config: types.TrainConfig,
+        experimental_config: dev.TrainConfig,
+        *,
+        expected_learner_version: int,
+    ) -> _PipelineForwardLaunch:
+        """Submit one already-packed F/B and return after every rank is ready."""
+
+        trainer_prepare_started = time.perf_counter()
+        await self._await_trainer_preparation()
+        trainer_prepare_wait_s = time.perf_counter() - trainer_prepare_started
+        lock_started = time.perf_counter()
+        async with self._train_lock:
+            lock_wait_s = time.perf_counter() - lock_started
+            setup_started = time.perf_counter()
+            async with self._trainer_failure_boundary():
+                if self._temporal_gpu_sharing and self._base_url is not None:
+                    previous = self._serving_futures.get(self._latest_step)
+                    if previous is not None:
+                        await asyncio.shield(previous)
+                    async with self._serving_lock:
+                        await self._sleep_for_training_locked()
+                async with self._mutation_lock:
+                    self._require_open()
+                    self._raise_publication_failure()
+                    trainer, reconcile = await self._ensure_trainer_locked()
+                    source = self._learner_generation
+                    if source is None:
+                        raise RuntimeError("trainer has no source generation")
+                    if expected_learner_version != self._latest_step:
+                        raise RuntimeError(
+                            "pipeline F/B learner parent changed: "
+                            f"expected={expected_learner_version}, "
+                            f"current={self._latest_step}"
+                        )
+                    next_step = expected_learner_version + 1
+
+                preparation_started = time.perf_counter()
+                (
+                    generation,
+                    publication_targets,
+                ) = await self._take_publication_preparation(trainer, next_step)
+                preparation_wait_s = time.perf_counter() - preparation_started
+
+                if reconcile is not None:
+                    reconcile_step, checkpoint = reconcile
+                    async with self._serving_lock:
+                        await self._reconcile_serving_locked(reconcile_step, checkpoint)
+
+                state = await trainer.command_run_state(trainer.run_spec.run_id)
+                if (
+                    state.learner_version != expected_learner_version
+                    or state.open_forward_backward_operation_ids
+                ):
+                    raise RuntimeError(
+                        "pipeline F/B does not follow a quiescent learner state"
+                    )
+                operation = OperationRef(
+                    run_id=state.run_id,
+                    operation_id=uuid.uuid4().hex,
+                    sequence_id=state.next_operation_sequence,
+                    learner_parent_version=expected_learner_version,
+                    kind="forward_backward",
+                )
+                current_config = CurrentTrainConfig.model_validate(config.model_dump())
+                values = {
+                    key: value
+                    for key, value in experimental_config.items()
+                    if key in ExperimentalTrainConfig.model_fields and value is not None
+                }
+                job = ForwardBackwardJobSpec(
+                    operation=operation,
+                    training_session_id=self._training_session_id,
+                    source=source,
+                    optimizer_state_path=self._optimizer_state_path,
+                    batch=batch.leases.ref,
+                    expected_global_loss_bearing_tokens=batch.loss_bearing_tokens,
+                    config=current_config,
+                    experimental_config=ExperimentalTrainConfig.model_validate(values),
+                    return_token_logprobs=False,
+                )
+                cold = self._trainer_resident_generation != source
+                source_adapter = (
+                    self._published_adapters.get(source.policy_step) if cold else None
+                )
+                if cold and (
+                    source_adapter is None
+                    or source_adapter.training_session_id != source.training_session_id
+                    or source_adapter.generation_id != source.generation_id
+                    or source_adapter.identity
+                    != str(Path(source.adapter_path).absolute())
+                ):
+                    raise RuntimeError("cold pipeline F/B source is not registered")
+                with (
+                    adapter_generation_lease(source_adapter)
+                    if source_adapter is not None
+                    else nullcontext()
+                ):
+                    launch = await trainer.start_forward_backward(job, batch.leases)
+                async with self._mutation_lock:
+                    if (
+                        self._trainer is not trainer
+                        or self._learner_generation != source
+                        or self._latest_step != expected_learner_version
+                    ):
+                        raise RuntimeError(
+                            "pipeline learner changed while F/B was dispatched"
+                        )
+                    self._trainer_resident_generation = source
+                self._prefetch_publication_preparation(trainer, next_step + 1)
+            return _PipelineForwardLaunch(
+                trainer=trainer,
+                operation=operation,
+                generation=generation,
+                publication_targets=publication_targets,
+                completion=launch.completion,
+                setup_metrics={
+                    "time/step_service_lock_wait_s": lock_wait_s,
+                    "time/step_service_trainer_prepare_s": (
+                        self._trainer_preparation_s
+                    ),
+                    "time/step_service_trainer_prepare_wait_s": (
+                        trainer_prepare_wait_s
+                    ),
+                    "time/step_service_job_setup_s": (
+                        time.perf_counter() - setup_started
+                    ),
+                    "time/step_service_publication_prepare_wait_s": (
+                        preparation_wait_s
+                    ),
+                },
+            )
+
+    async def start_pipeline_optimizer(
+        self,
+        forward: _PipelineForwardLaunch,
+        *,
+        learning_rate: float,
+    ) -> _PipelineOptimizerLaunch:
+        """Queue optimizer and its fast publication before the following F/B."""
+
+        loop = asyncio.get_running_loop()
+        admitted: asyncio.Future[int] = loop.create_future()
+
+        async def execute() -> _PipelineOptimizerResult:
+            try:
+                async with self._train_lock, self._trainer_failure_boundary():
+                    trainer = forward.trainer
+                    async with self._mutation_lock:
+                        self._require_open()
+                        self._raise_publication_failure()
+                        source = self._learner_generation
+                        if (
+                            self._trainer is not trainer
+                            or source is None
+                            or source.policy_step
+                            != forward.operation.learner_parent_version
+                            or forward.generation.policy_step != source.policy_step + 1
+                        ):
+                            raise RuntimeError(
+                                "pipeline optimizer learner parent changed"
+                            )
+                    state = await trainer.command_run_state(forward.operation.run_id)
+                    contributions = state.open_forward_backward_operation_ids
+                    if contributions != (forward.operation.operation_id,):
+                        raise RuntimeError(
+                            "pipeline optimizer does not own the exact open F/B"
+                        )
+                    operation = OperationRef(
+                        run_id=state.run_id,
+                        operation_id=uuid.uuid4().hex,
+                        sequence_id=state.next_operation_sequence,
+                        learner_parent_version=source.policy_step,
+                        reserved_output_learner_version=(
+                            forward.generation.policy_step
+                        ),
+                        kind="optim_step",
+                    )
+                    job = OptimizerJobSpec(
+                        operation=operation,
+                        training_session_id=self._training_session_id,
+                        source=source,
+                        optimizer_state_path=self._optimizer_state_path,
+                        generation=forward.generation,
+                        contributing_forward_backward_operation_ids=contributions,
+                        optimizer=AdamConfig(learning_rate=learning_rate),
+                    )
+                    if not admitted.done():
+                        admitted.set_result(forward.generation.policy_step)
+
+                    raw = await trainer.optim_step(job)
+                    (
+                        records,
+                        publication_metrics,
+                    ) = await trainer.publish_command_generation(
+                        CommandPublicationSpec(
+                            run_id=operation.run_id,
+                            generation=forward.generation,
+                            optimizer_state_path=self._optimizer_state_path,
+                            staging_adapter_path=(
+                                f"{self.output_dir}/megatron_runtime/staging/"
+                                f"{forward.generation.generation_id}"
+                            ),
+                            publication_targets=forward.publication_targets,
+                        )
+                    )
+                    self._record_policy_timestamp(
+                        self._trainer_completion_times,
+                        forward.generation.policy_step,
+                    )
+                    commit_started = time.perf_counter()
+                    async with self._mutation_lock:
+                        if (
+                            self._trainer is not trainer
+                            or self._learner_generation != source
+                            or self._latest_step != source.policy_step
+                        ):
+                            raise RuntimeError(
+                                "pipeline learner changed while optimizer executed"
+                            )
+                        self._latest_step = forward.generation.policy_step
+                        self._learner_generation = forward.generation
+                        self._trainer_resident_generation = forward.generation
+                        self._publication_metrics[forward.generation.policy_step] = (
+                            dict(publication_metrics)
+                        )
+                        self._schedule_publication(
+                            forward.generation,
+                            rank_publications=records,
+                            publication_targets=forward.publication_targets,
+                        )
+                    publication_metrics = {
+                        **publication_metrics,
+                        "time/step_service_generation_commit_s": (
+                            time.perf_counter() - commit_started
+                        ),
+                    }
+                    return _PipelineOptimizerResult(
+                        raw=raw,
+                        publication_metrics=publication_metrics,
+                    )
+            except BaseException as error:
+                if not admitted.done():
+                    admitted.set_exception(error)
+                raise
+
+        completion = asyncio.create_task(
+            execute(),
+            name=(f"megatron-pipeline-optimizer-{forward.generation.policy_step}"),
+        )
+        completion.add_done_callback(consume_future_exception)
+        step = await asyncio.shield(admitted)
+        return _PipelineOptimizerLaunch(step=step, completion=completion)
+
     def _require_resident_score_locked(
         self,
         expected_learner_version: int,
@@ -1284,12 +1567,17 @@ class DistributedMegatronService:
         generation: TrainerGeneration,
         *,
         trainer: Any = None,
+        rank_publications: tuple[TrainerRankPublication, ...] | None = None,
         durable: DurableTrainerPublication | None = None,
         publication_targets: tuple[Any, ...] = (),
     ) -> None:
-        if (trainer is None) == (durable is None):
+        if (
+            sum(value is not None for value in (trainer, rank_publications, durable))
+            != 1
+        ):
             raise ValueError(
-                "publication requires exactly one trainer stream or durable result"
+                "publication requires exactly one trainer stream, rank receipt set, "
+                "or durable result"
             )
         step = generation.policy_step
         if step in self._publication_tasks:
@@ -1299,12 +1587,18 @@ class DistributedMegatronService:
         )
         if publication_targets and transfer_manager is None:
             raise RuntimeError("adapter transfer publication is not prepared")
-        publication_waiter = (
-            trainer.wait_for_publication(generation.generation_id)
-            if trainer is not None
-            else None
-        )
         loop = asyncio.get_running_loop()
+        publication_waiter: Awaitable[tuple[TrainerRankPublication, ...]] | None
+        if trainer is not None:
+            publication_waiter = trainer.wait_for_publication(generation.generation_id)
+        elif rank_publications is not None:
+            completed: asyncio.Future[tuple[TrainerRankPublication, ...]] = (
+                loop.create_future()
+            )
+            completed.set_result(rank_publications)
+            publication_waiter = completed
+        else:
+            publication_waiter = None
         previous = self._serving_futures.get(step - 1)
         if previous is None:
             previous = loop.create_future()

@@ -4,12 +4,18 @@ from contextvars import ContextVar
 from pathlib import Path
 import secrets
 import sys
+import time
 from typing import Any, AsyncIterator, Iterable, Literal, cast
 import uuid
 
 from pydantic import BaseModel, ConfigDict, Field
 
 from .. import dev, types
+from .._backend_training import (
+    aggregate_rl_training_metrics,
+    build_rl_train_configs,
+    merge_gradient_step_metrics,
+)
 from ..backend import AnyTrainableModel
 from ..distributed.art_runtime import ArtRuntime
 from ..local.backend import LocalBackend, _PackedTrainingBatch
@@ -97,13 +103,8 @@ class _PipelinePreparedBatch(BaseModel):
     metrics: dict[str, float]
 
 
-def _consume_pipeline_task_exception(task: asyncio.Task[Any]) -> None:
-    if not task.cancelled():
-        task.exception()
-
-
 class _MegatronPipelineCommandContext:
-    """One packed batch whose existing service transaction is queued ahead."""
+    """One packed batch whose F/B is active before the trainer consumes it."""
 
     def __init__(
         self,
@@ -111,89 +112,131 @@ class _MegatronPipelineCommandContext:
         model: TrainableModel,
         groups: tuple[TrajectoryGroup, ...],
         *,
-        learner_parent_version: int,
+        service: Any,
+        batch: _PackedTrainingBatch,
+        forward: Any,
+        config: types.TrainConfig,
         train_kwargs: dict[str, Any],
         preparation_metrics: dict[str, float],
+        started: float,
     ) -> None:
         self.preparation_metrics = preparation_metrics
         self._backend = backend
         self._model = model
         self._groups = groups
-        self._learner_parent_version = learner_parent_version
+        self._service = service
+        self._batch: _PackedTrainingBatch | None = batch
+        self._forward = forward
+        self._config = config
         self._train_kwargs = train_kwargs
-        self._dispatched = asyncio.Event()
+        self._started = started
         self._claimed = False
-        self._task = asyncio.create_task(
-            self._run(),
-            name=f"megatron-pipeline-train-{learner_parent_version + 1}",
-        )
-        self._task.add_done_callback(_consume_pipeline_task_exception)
-
-    async def _run(self) -> LocalTrainResult:
-        result = await self._backend.train(
-            self._model,
-            self._groups,
-            _pipeline_train_dispatch_event=self._dispatched,
-            **self._train_kwargs,
-        )
-        expected = self._learner_parent_version + 1
-        if result.step != expected:
-            raise RuntimeError(
-                "ready-ahead trainer advanced another learner: "
-                f"expected={expected}, actual={result.step}"
-            )
-        return result
 
     async def complete(
-        self, next_train_dispatched: asyncio.Event | None
+        self,
+        next_train_dispatched: asyncio.Event | None,
+        next_batch_handoff: asyncio.Event | None,
     ) -> LocalTrainResult:
         if self._claimed:
             raise RuntimeError("pipeline train context was consumed twice")
         self._claimed = True
-
-        relay: asyncio.Task[None] | None = None
         if next_train_dispatched is not None:
-
-            async def relay_dispatch() -> None:
-                await self._dispatched.wait()
-                next_train_dispatched.set()
-
-            relay = asyncio.create_task(
-                relay_dispatch(),
-                name=f"megatron-pipeline-dispatch-{self._learner_parent_version + 1}",
-            )
+            next_train_dispatched.set()
         try:
-            try:
-                return await self._task
-            except BaseException:
-                await self._discard_unconsumed()
-                raise
+            optimizer = await self._service.start_pipeline_optimizer(
+                self._forward,
+                learning_rate=self._config.learning_rate,
+            )
+            if next_batch_handoff is not None:
+                next_batch_handoff.set()
+            values = await asyncio.gather(
+                self._forward.completion,
+                optimizer.completion,
+                return_exceptions=True,
+            )
+            failures = [value for value in values if isinstance(value, BaseException)]
+            if failures:
+                raise BaseExceptionGroup("Megatron pipeline commands failed", failures)
+            forward_result, optimizer_result = values
+            if not isinstance(forward_result, dict):
+                raise TypeError("Megatron pipeline F/B returned an invalid result")
+            raw_optimizer = getattr(optimizer_result, "raw", None)
+            publication_metrics = getattr(optimizer_result, "publication_metrics", None)
+            if not isinstance(raw_optimizer, dict) or not isinstance(
+                publication_metrics, dict
+            ):
+                raise TypeError(
+                    "Megatron pipeline optimizer returned an invalid result"
+                )
+            metrics = aggregate_rl_training_metrics(
+                training_metrics=[
+                    {
+                        **merge_gradient_step_metrics(
+                            forward_result.get("metrics", {}),
+                            raw_optimizer.get("metrics", {}),
+                        ),
+                        **self._forward.setup_metrics,
+                        **publication_metrics,
+                        **self._service.drain_publication_metrics(),
+                    }
+                ],
+                trajectory_groups=self._groups,
+                trainer_started=self._started,
+            )
+            step = optimizer.step
+            final_step = self._config.final_training_step
+            if final_step is not None and step >= final_step:
+                metrics.update(await self._service.finalize_publication_metrics(step))
+            result = LocalTrainResult(step=step, metrics=metrics)
+            if self._train_kwargs.get("save_checkpoint", True):
+                result.checkpoint_path = get_step_checkpoint_dir(
+                    get_model_dir(model=self._model, art_path=self._backend._path),
+                    step,
+                )
+                if not Path(result.checkpoint_path).exists():
+                    result.checkpoint_ready = self._service.checkpoint_materialization(
+                        step
+                    )
+            wandb_run = self._model._get_wandb_run()
+            if wandb_run is not None:
+                self._backend._record_provenance_nonblocking(wandb_run, "local-rl")
+            await self._finish(failed=False)
+            return result
+        except BaseException:
+            await self._finish(failed=True)
+            raise
         finally:
-            if next_train_dispatched is not None and self._dispatched.is_set():
-                next_train_dispatched.set()
-            if relay is not None and not relay.done():
-                relay.cancel()
-                await asyncio.gather(relay, return_exceptions=True)
+            if next_batch_handoff is not None:
+                next_batch_handoff.set()
 
     async def abort(self) -> None:
         if self._claimed:
             return
         self._claimed = True
-        if self._task.done() and not self._task.cancelled():
-            error = self._task.exception()
-            if error is None:
-                raise RuntimeError("cannot discard a completed pipeline train")
-        elif not self._task.done():
-            self._task.cancel()
-            await asyncio.gather(self._task, return_exceptions=True)
-        await self._discard_unconsumed()
+        try:
+            optimizer = await self._service.start_pipeline_optimizer(
+                self._forward,
+                learning_rate=self._config.learning_rate,
+            )
+            values = await asyncio.gather(
+                self._forward.completion,
+                optimizer.completion,
+                return_exceptions=True,
+            )
+            failures = [value for value in values if isinstance(value, BaseException)]
+            await self._finish(failed=bool(failures))
+            if failures:
+                raise BaseExceptionGroup(
+                    "abandoned Megatron pipeline commands failed", failures
+                )
+        except BaseException:
+            await self._finish(failed=True)
+            raise
 
-    async def _discard_unconsumed(self) -> None:
-        prepared = self._groups[0]._prepared_training_batch
-        if isinstance(prepared, _PipelinePreparedBatch) and all(
-            group._prepared_training_batch is prepared for group in self._groups
-        ):
-            await self._backend.discard_pipeline_batch(list(self._groups))
+    async def _finish(self, *, failed: bool) -> None:
+        batch, self._batch = self._batch, None
+        if batch is not None:
+            await self._backend._finish_training_batch(batch, failed=failed)
 
 
 class MegatronBackend(LocalBackend):
@@ -1071,32 +1114,105 @@ class MegatronBackend(LocalBackend):
         learner_parent_version: int,
         train_kwargs: dict[str, Any],
     ) -> _MegatronPipelineCommandContext | None:
-        metrics = await self.prepare_pipeline_batch(
-            model,
-            trajectory_groups,
-            normalize_advantages=bool(train_kwargs.get("normalize_advantages", True)),
-            advantage_balance=float(train_kwargs.get("advantage_balance", 0.0)),
-            scale_rewards=bool(train_kwargs.get("scale_rewards", True)),
-            allow_training_without_logprobs=bool(
-                train_kwargs.get("allow_training_without_logprobs", False)
-            ),
-            plot_tensors=bool(train_kwargs.get("plot_tensors", False)),
-            logprob_calculation_chunk_size=int(
-                train_kwargs.get("logprob_calculation_chunk_size", 1024)
-            ),
+        supported = {
+            "adam_params",
+            "grad_accumulation_sequences",
+            "kl_penalty_coef",
+            "kl_penalty_reference_step",
+            "kl_penalty_source",
+            "learning_rate",
+            "loss_fn",
+            "loss_fn_config",
+            "normalize_advantages",
+            "optimizer_save_interval",
+            "save_checkpoint",
+        }
+        if unexpected := train_kwargs.keys() - supported:
+            raise TypeError(f"unsupported Megatron pipeline options: {unexpected}")
+        if train_kwargs.get("loss_fn", "cispo") not in {"cispo", "ppo"}:
+            raise ValueError("Megatron pipeline supports only cispo and ppo")
+        if train_kwargs.get("loss_fn_config") is not None:
+            raise ValueError("Megatron pipeline requires loss_fn_config=None")
+        if train_kwargs.get("adam_params") is not None:
+            raise ValueError("Megatron pipeline requires adam_params=None")
+        normalize_advantages = bool(train_kwargs.get("normalize_advantages", True))
+        kl_reference_step = cast(
+            int | None, train_kwargs.get("kl_penalty_reference_step")
+        )
+        kl_ref_adapter_path = (
+            get_step_checkpoint_dir(
+                get_model_dir(model=model, art_path=self._path), kl_reference_step
+            )
+            if kl_reference_step is not None
+            else None
+        )
+        config, dev_config = build_rl_train_configs(
+            learning_rate=float(train_kwargs.get("learning_rate", 5e-6)),
+            scale_rewards=normalize_advantages,
+            ppo=train_kwargs.get("loss_fn", "cispo") == "ppo",
+            kl_penalty_coef=float(train_kwargs.get("kl_penalty_coef", 0.0)),
+            kl_penalty_source=train_kwargs.get("kl_penalty_source", "current_learner"),
+            packed_sequence_length=get_megatron_runtime_config().packed_sequence_length,
+            kl_ref_adapter_path=kl_ref_adapter_path,
+            optimizer_save_interval=int(train_kwargs.get("optimizer_save_interval", 5)),
             grad_accumulation_sequences=cast(
                 int | None, train_kwargs.get("grad_accumulation_sequences")
             ),
         )
+        started = time.monotonic()
+        metrics = await self.prepare_pipeline_batch(
+            model,
+            trajectory_groups,
+            normalize_advantages=normalize_advantages,
+            advantage_balance=0.0,
+            scale_rewards=normalize_advantages,
+            allow_training_without_logprobs=False,
+            plot_tensors=False,
+            logprob_calculation_chunk_size=1024,
+            grad_accumulation_sequences=config.grad_accumulation_sequences,
+        )
         if metrics is None:
             return None
+        prepared = trajectory_groups[0]._prepared_training_batch
+        if not isinstance(prepared, _PipelinePreparedBatch) or any(
+            group._prepared_training_batch is not prepared
+            for group in trajectory_groups
+        ):
+            raise RuntimeError("pipeline batch preparation changed ownership")
+        for group in trajectory_groups:
+            group._prepared_training_batch = None
+        batch = cast(_PackedTrainingBatch, prepared.batch)
+        payload = batch.payload
+        if not isinstance(payload, _DistributedBatchPayload):
+            await self._finish_training_batch(batch, failed=True)
+            raise RuntimeError("Megatron pipeline batch lost its typed data plane")
+        from .distributed_service import DistributedMegatronService
+
+        service = cast(
+            DistributedMegatronService,
+            await self._get_service(model),
+        )
+        try:
+            forward = await service.start_pipeline_forward_backward(
+                payload.packed,
+                config,
+                dev_config,
+                expected_learner_version=learner_parent_version,
+            )
+        except BaseException:
+            await self._finish_training_batch(batch, failed=True)
+            raise
         return _MegatronPipelineCommandContext(
             self,
             model,
             tuple(trajectory_groups),
-            learner_parent_version=learner_parent_version,
+            service=service,
+            batch=batch,
+            forward=forward,
+            config=config,
             train_kwargs=dict(train_kwargs),
             preparation_metrics=metrics,
+            started=started,
         )
 
     async def discard_pipeline_batch(
