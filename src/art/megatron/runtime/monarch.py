@@ -717,20 +717,23 @@ class MonarchTrainerActor(Actor):
         ready_port: Port[dict[str, Any]],
         job: _DeferredCommandJob | None,
         error: BaseException,
+        *,
+        ready_already_sent: bool = False,
     ) -> None:
         if job is None:
             response_port.exception(_response_exception(error))
             return
-        ready_port.send(
-            _CommandReady(
-                rank=self._runtime.rank,
-                operation_id=job.operation_id,
-                learner_version=job.expected_learner_version,
-                error_type=type(error).__name__,
-                message=str(error),
-                traceback_text=traceback.format_exc(),
-            ).model_dump(mode="json")
-        )
+        if not ready_already_sent:
+            ready_port.send(
+                _CommandReady(
+                    rank=self._runtime.rank,
+                    operation_id=job.operation_id,
+                    learner_version=job.expected_learner_version,
+                    error_type=type(error).__name__,
+                    message=str(error),
+                    traceback_text=traceback.format_exc(),
+                ).model_dump(mode="json")
+            )
         response_port.send(_rank_command_failure(self._runtime.rank, error))
 
     def _run_cp_lookahead(self, receiver: Any) -> None:
@@ -1073,6 +1076,7 @@ class MonarchTrainerActor(Actor):
     ) -> None:
         batch = None
         job = None
+        ready_sent = False
         try:
             if not self._valid:
                 raise RuntimeError("trainer actor runtime is invalid")
@@ -1089,20 +1093,21 @@ class MonarchTrainerActor(Actor):
                 else job.model_copy(update={"return_token_logprobs": False})
             )
             if resident_executor:
-                # The service train lock admits this run's optimizer next, so the
-                # live gradient image cannot be overwritten by another command.
-                result = self._executor.execute_forward_backward(
-                    execute_job,
-                    batch,
-                    Event(),
-                    preserve_gradient_image=False,
-                )
+                # Admission lets the service queue this run's optimizer behind the
+                # synchronous actor call. The actor remains the serialized GPU owner.
                 ready_port.send(
                     _CommandReady(
                         rank=self._runtime.rank,
                         operation_id=job.operation_id,
                         learner_version=job.expected_learner_version,
                     ).model_dump(mode="json")
+                )
+                ready_sent = True
+                result = self._executor.execute_forward_backward(
+                    execute_job,
+                    batch,
+                    Event(),
+                    preserve_gradient_image=False,
                 )
                 response_port.send(
                     {
@@ -1135,7 +1140,13 @@ class MonarchTrainerActor(Actor):
                     "F/B actor cleanup also failed: "
                     f"{type(cleanup_error).__name__}: {cleanup_error}"
                 )
-            self._fail_command_launch(response_port, ready_port, job, error)
+            self._fail_command_launch(
+                response_port,
+                ready_port,
+                job,
+                error,
+                ready_already_sent=ready_sent,
+            )
         finally:
             if batch is not None:
                 batch.close()
