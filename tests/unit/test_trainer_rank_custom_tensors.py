@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Callable
 import copy
 from dataclasses import dataclass
@@ -19,6 +20,7 @@ import torch.multiprocessing as mp
 
 from art.trainer_rank import (
     AdamParams,
+    MaterializedCheckpoint,
     TrainerRank,
     TrainerRankSlotStateError,
     Unset,
@@ -552,6 +554,65 @@ def test_custom_objects_clone_factory_storage_and_deepcopy_independently() -> No
     assert isinstance(restored(torch.ones(1)), _HeadOutput)
 
 
+def test_forward_snapshot_clones_custom_tensor_state() -> None:
+    trainer, rank = _trainer("student")
+    source_parameter = rank.parameter(
+        "temperature", lambda: torch.tensor([2.0]), checkpoint="student"
+    )
+    source_buffer = rank.buffer(
+        "offset", lambda: torch.tensor([3.0]), checkpoint="student"
+    )
+    source_head = rank.module("head", _DirectHead, checkpoint="student")
+
+    assert trainer.snapshot_checkpoint("student", "saved")
+    saved_parameter = rank.parameter(
+        "temperature", lambda: torch.zeros(1), checkpoint="saved"
+    )
+    saved_buffer = rank.buffer("offset", lambda: torch.zeros(1), checkpoint="saved")
+    saved_head = rank.module("head", _DirectHead, checkpoint="saved")
+    source_parameter.data.fill_(7)
+    source_buffer.fill_(8)
+    source_head.weight.data.fill_(9)
+
+    torch.testing.assert_close(saved_parameter, torch.tensor([2.0]))
+    torch.testing.assert_close(saved_buffer, torch.tensor([3.0]))
+    torch.testing.assert_close(saved_head.weight, torch.tensor([2.0]))
+    assert not saved_parameter.requires_grad
+    assert not saved_head.weight.requires_grad
+
+    trainer._discard_snapshot_checkpoint("saved")
+    with pytest.raises(TrainerRankSlotStateError, match="stale"):
+        saved_parameter + 1
+
+
+def test_forward_snapshot_copies_unmaterialized_custom_payload() -> None:
+    trainer, rank = _trainer("student")
+    trainer._checkpoint_slots["student"].custom_payload = PreparedCustomPayload(
+        {
+            "temperature": cast(
+                Any,
+                {
+                    "kind": "parameter",
+                    "tensor_keys": ["temperature"],
+                    "trainable_keys": ["temperature"],
+                    "parameter_aliases": [["temperature"]],
+                    "buffer_aliases": [],
+                    "persistent_buffer_keys": [],
+                },
+            )
+        },
+        {"temperature": torch.tensor([4.0])},
+        {},
+    )
+
+    assert trainer.snapshot_checkpoint("student", "saved")
+    trainer._checkpoint_slots["student"].custom_payload.tensors["temperature"].fill_(9)
+    saved = rank.parameter("temperature", lambda: torch.zeros(1), checkpoint="saved")
+
+    torch.testing.assert_close(saved, torch.tensor([4.0]))
+    assert not saved.requires_grad
+
+
 def test_no_grad_custom_objects_do_not_create_graph_guards() -> None:
     trainer, rank = _trainer("student")
     head = rank.module("head", _ClassFactoryHead, checkpoint="student")
@@ -939,6 +1000,46 @@ def test_loaded_custom_payload_is_owned_after_source_removal(
 
 
 @pytest.mark.skipif(find_spec("megatron") is None, reason="requires Megatron")
+def test_prepared_forward_snapshot_restores_frozen_custom_tensors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from art.trainer_rank import _checkpoint
+
+    original, original_api = _real_lora_trainer()
+    original_head, original_temperature, original_running = _register_custom_tensors(
+        original_api
+    )
+    original_running.fill_(7)
+    _step_custom_tensors(original, original_head, original_temperature, monkeypatch)
+    saved = tmp_path / "saved"
+    original.save_checkpoint(str(saved), "student")
+
+    restored, api = _empty_real_lora_trainer()
+    assert _checkpoint.snapshot_prepared_checkpoint(
+        restored, prepare_checkpoint(str(saved)), "snapshot"
+    )
+    head = api.module("value_head", lambda: _ValueHead(3), checkpoint="snapshot")
+    temperature = api.parameter(
+        "temperature", lambda: torch.tensor(0.5), checkpoint="snapshot"
+    )
+    running = api.buffer("running_mean", lambda: torch.zeros(3), checkpoint="snapshot")
+
+    for expected, actual in zip(
+        original_head.parameters(), head.parameters(), strict=True
+    ):
+        torch.testing.assert_close(expected, actual)
+    torch.testing.assert_close(original_temperature, temperature)
+    torch.testing.assert_close(original_running, running)
+    assert not temperature.requires_grad
+    assert all(not parameter.requires_grad for parameter in head.parameters())
+    assert restored._checkpoint_slots["snapshot"].optimizer is None
+    with pytest.raises(TrainerRankSlotStateError, match="forward-only"):
+        restored.optim_step(
+            params=AdamParams(learning_rate=1e-3), checkpoints=["snapshot"]
+        )
+
+
+@pytest.mark.skipif(find_spec("megatron") is None, reason="requires Megatron")
 def test_custom_tensors_and_optimizer_restore_lazily_and_survive_unmaterialized_save(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -956,7 +1057,13 @@ def test_custom_tensors_and_optimizer_restore_lazily_and_survive_unmaterialized_
     original.save_checkpoint(str(saved), "student")
 
     restored, restored_api = _empty_real_lora_trainer()
-    _checkpoint.load_checkpoint(restored, prepare_checkpoint(str(saved)), "student")
+
+    async def prefetch() -> None:
+        await restored.prefetch_checkpoints(
+            MaterializedCheckpoint("student", str(saved))
+        )
+
+    asyncio.run(prefetch())
 
     resaved = tmp_path / "resaved-before-registration"
     restored.save_checkpoint(str(resaved), "student")

@@ -15,6 +15,7 @@ import struct
 import threading
 from typing import TYPE_CHECKING, Literal, NotRequired, TypedDict, cast
 import uuid
+import weakref
 
 import torch
 import torch.distributed as dist
@@ -529,6 +530,49 @@ def validate_checkpoint(
     return prepared.manifest
 
 
+def materialize_checkpoint(
+    path: str | Path,
+    output_dir: str | Path,
+    *,
+    require_optimizer: bool = False,
+    expected_digest: str | None = None,
+) -> str:
+    """Copy one validated checkpoint without loading it into a trainer slot."""
+    source = prepare_checkpoint(str(path))
+    if expected_digest is not None and source.digest != expected_digest:
+        raise RuntimeError(
+            f"Checkpoint digest mismatch: {source.digest} != {expected_digest}"
+        )
+    if require_optimizer and (
+        source.manifest is None or source.manifest["optimizer"] is None
+    ):
+        raise RuntimeError("Checkpoint does not contain optimizer state")
+    destination = Path(output_dir)
+    if destination.exists() and any(destination.iterdir()):
+        raise FileExistsError(
+            f"Checkpoint output directory is not empty: {destination}"
+        )
+    destination.mkdir(parents=True, exist_ok=True)
+    files = (
+        {"adapter_config.json", "adapter_model.safetensors"}
+        if source.manifest is None
+        else {*source.manifest["files"], MANIFEST_FILE}
+    )
+    for relative in files:
+        target = destination / _safe_relative(relative)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            os.link(source.path / relative, target)
+        except OSError:
+            shutil.copy2(source.path / relative, target)
+    actual = prepare_checkpoint(str(destination)).digest
+    if actual != source.digest:
+        raise RuntimeError(
+            f"Materialized checkpoint digest mismatch: {actual} != {source.digest}"
+        )
+    return source.digest
+
+
 def materialize_lora(
     path: str | Path,
     output_dir: str | Path,
@@ -618,6 +662,10 @@ def _validate_save_state(trainer: TrainerRank, name: str) -> _AdapterConfig:
     slot = trainer._checkpoint_slots.get(name)
     if slot is None or slot.config is None:
         raise trainer._slot_state_error(f"Unknown checkpoint: {name!r}")
+    if slot.snapshot:
+        raise trainer._slot_state_error(
+            f"Snapshot checkpoint {name!r} is forward-only and cannot be saved"
+        )
     if trainer._checkpoint_grad_flags((name,))[0]:
         raise trainer._slot_state_error(
             f"Checkpoint {name!r} has accumulated gradients"
@@ -1448,8 +1496,6 @@ def _localized(
 
 
 def _slot_snapshot(trainer: TrainerRank) -> _SlotSnapshot:
-    from art.megatron.lora import LoRA, LoRASlotRef
-
     return tuple(
         (
             module,
@@ -1459,7 +1505,7 @@ def _slot_snapshot(trainer: TrainerRank) -> _SlotSnapshot:
         )
         for chunk in trainer.runtime.model
         for module in chunk.modules()
-        if isinstance(module, LoRA)
+        if hasattr(module, "_slot_keys") and hasattr(module, "_slot_modules")
     )
 
 
@@ -1469,6 +1515,164 @@ def _restore_slots(snapshot: _SlotSnapshot) -> None:
             setattr(slot, "ref", refs[key])
         module._slot_keys = keys
         module._slot_modules = torch.nn.ModuleDict(slots)
+
+
+def _forward_custom_payload(
+    payload: PreparedCustomPayload | None,
+) -> PreparedCustomPayload | None:
+    payload = deepcopy(payload)
+    if payload is None:
+        return None
+    for record in payload.records.values():
+        record["trainable_keys"] = []
+    return PreparedCustomPayload(payload.records, payload.tensors, {})
+
+
+def snapshot_checkpoint(trainer: TrainerRank, source: str, destination: str) -> bool:
+    """Clone one loaded checkpoint into a forward-only resident slot."""
+    from art.trainer_rank._impl import (
+        _CheckpointSlot,
+        _CustomObject,
+        _CustomTensorTracker,
+        _track_custom_object,
+    )
+
+    group = _ensure_group(trainer)
+    error: BaseException | None = None
+    source_slot = trainer._checkpoint_slots.get(source)
+    destination_slot = trainer._checkpoint_slots.get(destination)
+    try:
+        if not source or not destination or source == destination:
+            raise ValueError("Snapshot source and destination must be distinct names")
+        if source_slot is None or source_slot.config is None:
+            raise trainer._slot_state_error(f"Unknown checkpoint: {source!r}")
+        if source_slot.snapshot:
+            raise trainer._slot_state_error(
+                f"Cannot snapshot forward-only checkpoint {source!r}"
+            )
+        if destination_slot is not None and not destination_slot.snapshot:
+            raise trainer._slot_state_error(
+                f"Checkpoint {destination!r} is already loaded"
+            )
+    except BaseException as exc:
+        error = exc
+    raise_distributed(error, "validate checkpoint snapshot", group)
+    assert source_slot is not None and source_slot.config is not None
+    identity = (
+        source,
+        destination,
+        dict(source_slot.config),
+        source_slot.revision,
+        destination_slot is not None,
+    )
+    if any(value != identity for value in _gather(identity, group)):
+        raise trainer._slot_state_error(
+            "Checkpoint snapshot state differs across ranks"
+        )
+    if destination_slot is not None:
+        return False
+
+    model_snapshot = _slot_snapshot(trainer)
+    destination_ref = trainer._slot_ref(destination)
+    custom: dict[str, _CustomObject] = {}
+    trackers: list[_CustomTensorTracker] = []
+    try:
+        for chunk in trainer.runtime.model:
+            for module in chunk.modules():
+                snapshot = getattr(module, "_snapshot_lora_slot", None)
+                if callable(snapshot):
+                    snapshot(trainer._slot_ref(source), destination_ref)
+        for name, item in source_slot.custom.items():
+            value = deepcopy(item.value)
+            if isinstance(value, torch.nn.Module):
+                value.requires_grad_(False)
+            elif isinstance(value, torch.nn.Parameter):
+                value.requires_grad_(False)
+            cloned = _CustomObject(item.kind, value, object())
+            tracker = _CustomTensorTracker(
+                weakref.ref(trainer),
+                destination_ref,
+                name,
+                cloned.generation,
+            )
+            cloned = _track_custom_object(cloned, tracker)
+            custom[name] = cloned
+            trackers.append(tracker)
+        params: list[torch.nn.Parameter] = []
+        seen: set[int] = set()
+        for chunk in trainer.runtime.model:
+            for module in chunk.modules():
+                slot_params = getattr(module, "lora_slot_params", None)
+                if not callable(slot_params):
+                    continue
+                for parameter in slot_params(destination_ref):
+                    if id(parameter) not in seen:
+                        seen.add(id(parameter))
+                        params.append(parameter)
+        trainer._checkpoint_slots[destination] = _CheckpointSlot(
+            params=tuple(params),
+            config=deepcopy(source_slot.config),
+            revision=source_slot.revision,
+            custom=custom,
+            custom_payload=_forward_custom_payload(source_slot.custom_payload),
+            snapshot=True,
+        )
+        for tracker in trackers:
+            tracker.active = True
+    except BaseException as exc:
+        _restore_slots(model_snapshot)
+        trainer._checkpoint_slots.pop(destination, None)
+        error = exc
+    try:
+        raise_distributed(error, "snapshot checkpoint", group)
+    except BaseException:
+        _restore_slots(model_snapshot)
+        trainer._checkpoint_slots.pop(destination, None)
+        raise
+    return True
+
+
+def discard_snapshot_checkpoint(trainer: TrainerRank, checkpoint: str) -> None:
+    """Collectively discard a forward-only resident checkpoint snapshot."""
+    group = _ensure_group(trainer)
+    slot = trainer._checkpoint_slots.get(checkpoint)
+    active = (
+        trainer._default_slot_ref is not None
+        and trainer._default_slot_ref.name == checkpoint
+    ) or any(ref.name == checkpoint for ref in trainer._slot_stack)
+    state = (slot is not None, False if slot is None else slot.snapshot, active)
+    if any(value != state for value in _gather(state, group)):
+        raise trainer._slot_state_error(
+            "Checkpoint snapshot state differs across ranks"
+        )
+    if slot is None:
+        return
+    if not slot.snapshot:
+        raise trainer._slot_state_error(
+            f"Checkpoint {checkpoint!r} is not a forward-only snapshot"
+        )
+    if active:
+        raise trainer._slot_state_error(
+            f"Cannot discard selected checkpoint snapshot {checkpoint!r}"
+        )
+    if any(_gather(trainer._has_live_slot_graph(trainer._slot_ref(checkpoint)), group)):
+        raise trainer._slot_state_error(
+            f"Cannot discard checkpoint snapshot {checkpoint!r} with live outputs"
+        )
+    model_snapshot = _slot_snapshot(trainer)
+    try:
+        ref = trainer._slot_ref(checkpoint)
+        for chunk in trainer.runtime.model:
+            for module in chunk.modules():
+                discard = getattr(module, "_discard_lora_slot", None)
+                if callable(discard):
+                    discard(ref)
+        trainer._checkpoint_slots.pop(checkpoint)
+        trainer._prune_slot_graphs(ref)
+    except BaseException:
+        _restore_slots(model_snapshot)
+        trainer._checkpoint_slots[checkpoint] = slot
+        raise
 
 
 def _commit_slot(trainer: TrainerRank, source: str, destination: str) -> None:
@@ -1620,7 +1824,11 @@ def _rollback_load(
 
 
 def load_checkpoint(
-    trainer: TrainerRank, source: PreparedCheckpoint, name: str
+    trainer: TrainerRank,
+    source: PreparedCheckpoint,
+    name: str,
+    *,
+    forward_only: bool = False,
 ) -> None:
     group = _ensure_group(trainer)
     if any(value != source.digest for value in _gather(source.digest, group)):
@@ -1688,17 +1896,31 @@ def load_checkpoint(
             "validate staged checkpoint",
             group,
         )
+        if forward_only:
+            for param in params:
+                param.requires_grad_(False)
         from art.trainer_rank._impl import _CheckpointSlot
 
         trainer._checkpoint_slots[temporary] = _CheckpointSlot(
-            params, config, custom_payload=source.custom
+            params,
+            config,
+            custom_payload=(
+                _forward_custom_payload(source.custom)
+                if forward_only
+                else source.custom
+            ),
+            snapshot=forward_only,
         )
         _phase(
             lambda: trainer._validate_loaded_checkpoint_config(temporary, config),
             "validate loaded checkpoint config",
             group,
         )
-        if source.manifest is not None and source.manifest["optimizer"] is not None:
+        if (
+            not forward_only
+            and source.manifest is not None
+            and source.manifest["optimizer"] is not None
+        ):
             optimizer_state = _phase(
                 lambda: _optimizer_state(trainer, source, temporary),
                 "read checkpoint optimizer",
@@ -1722,6 +1944,27 @@ def load_checkpoint(
     except BaseException:
         _rollback_load(trainer, snapshot, temporary, name, previous, group)
         raise
+
+
+def snapshot_prepared_checkpoint(
+    trainer: TrainerRank, source: PreparedCheckpoint, destination: str
+) -> bool:
+    """Load prepared state into a forward-only resident slot."""
+    group = _ensure_group(trainer)
+    slot = trainer._checkpoint_slots.get(destination)
+    state = None if slot is None else slot.snapshot
+    if any(value != state for value in _gather(state, group)):
+        raise trainer._slot_state_error(
+            "Checkpoint snapshot state differs across ranks"
+        )
+    if slot is not None:
+        if not slot.snapshot:
+            raise trainer._slot_state_error(
+                f"Checkpoint {destination!r} is already loaded"
+            )
+        return False
+    load_checkpoint(trainer, source, destination, forward_only=True)
+    return True
 
 
 def _ensure_groups(

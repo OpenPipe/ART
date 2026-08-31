@@ -9,7 +9,6 @@ weights for cross-topology comparison.
 from __future__ import annotations
 
 import argparse
-import asyncio
 import hashlib
 import json
 import os
@@ -43,10 +42,6 @@ def _digest(path: Path) -> str:
     return digest.hexdigest()
 
 
-async def _load(trainer: TrainerRank, source: str) -> None:
-    await trainer.load_checkpoint(source)
-
-
 def main() -> None:
     args = _args()
     os.environ.setdefault("ART_MEGATRON_TENSOR_MODEL_PARALLEL_SIZE", "1")
@@ -67,7 +62,7 @@ def main() -> None:
             print_env=rank == 0,
         )
         trainer = TrainerRank(runtime)
-        asyncio.run(_load(trainer, args.source))
+        trainer.load_checkpoint(args.source)
         loaded = time.perf_counter()
         if args.operation != "load":
             slot = trainer._checkpoint_slots[args.source]

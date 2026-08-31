@@ -18,13 +18,13 @@ ForwardInput = _impl.ForwardInput
 ForwardInputs = _impl.ForwardInputs
 ForwardOutput = _impl.ForwardOutput
 ForwardOutputs = _impl.ForwardOutputs
-HiddenStatesT = _impl.HiddenStatesT
-LogitsT = _impl.LogitsT
-LogprobsT = _impl.LogprobsT
 MicroBatch = _impl.MicroBatch
 MicroBatchStats = _impl.MicroBatchStats
 TopK = _impl.TopK
-TopKT = _impl.TopKT
+LogprobsT = TypeVar("LogprobsT", bound=torch.Tensor | None, covariant=True)
+TopKT = TypeVar("TopKT", bound=TopK | None, covariant=True)
+LogitsT = TypeVar("LogitsT", bound=torch.Tensor | None, covariant=True)
+HiddenStatesT = TypeVar("HiddenStatesT", bound=torch.Tensor | None, covariant=True)
 TrainerRankMemoryError = _impl.TrainerRankMemoryError
 TrainerRankSlotStateError = _impl.TrainerRankSlotStateError
 Unset = _impl.Unset
@@ -110,10 +110,12 @@ class TrainerRank(_impl.TrainerRank):
     ) -> asyncio.Task[None]:
         return super().prefetch_checkpoints(*checkpoints)
 
-    def load_checkpoint(
-        self, checkpoint: str | MaterializedCheckpoint | None
-    ) -> asyncio.Task[None]:
-        return super().load_checkpoint(checkpoint)
+    def load_checkpoint(self, checkpoint: str | MaterializedCheckpoint | None) -> None:
+        super().load_checkpoint(checkpoint)
+
+    def snapshot_checkpoint(self, source: str, destination: str) -> bool:
+        """Clone a loaded checkpoint into a forward-only resident snapshot."""
+        return super().snapshot_checkpoint(source, destination)
 
     def push_checkpoint(
         self, checkpoint: str | MaterializedCheckpoint | None
@@ -233,8 +235,9 @@ class TrainerRank(_impl.TrainerRank):
     ) -> Iterator[MicroBatch[ForwardInputs, ForwardOutputs]]:
         """Forward replicated inputs in adaptive data-parallel microbatches.
 
-        Per-input checkpoints override `checkpoint`. `no_grad=None` inherits the
-        ambient PyTorch grad mode; `True` disables grads and `False` enables them.
+        Per-input checkpoints and `no_grad` values override the method defaults.
+        `no_grad=None` inherits the ambient PyTorch grad mode; `True` disables
+        grads and `False` enables them.
         Input and target tensors may be on a different device from the trainer;
         ART moves its packed model inputs and labels internally without mutating
         the caller-owned `ForwardInput` objects.
@@ -308,8 +311,9 @@ class TrainerRank(_impl.TrainerRank):
     ) -> ForwardOutputs:
         """Forward inputs already local to this data-parallel rank.
 
-        Per-input checkpoints override `checkpoint`. `no_grad=None` inherits the
-        ambient PyTorch grad mode; `True` disables grads and `False` enables them.
+        Per-input checkpoints and `no_grad` values override the method defaults.
+        `no_grad=None` inherits the ambient PyTorch grad mode; `True` disables
+        grads and `False` enables them.
         Input and target tensors may be on a different device from the trainer;
         ART moves its packed model inputs and labels internally without mutating
         the caller-owned `ForwardInput` objects.

@@ -4,16 +4,15 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import (
-    Awaitable,
     Callable,
-    Generator,
     Iterable,
     Iterator,
     Mapping,
     Sequence,
 )
+from concurrent.futures import Future, ThreadPoolExecutor
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from dataclasses import field as dataclass_field
 import math
 import os
@@ -93,6 +92,23 @@ T = TypeVar("T")
 ModuleT = TypeVar("ModuleT", bound=torch.nn.Module)
 
 _MEMORY_PROFILE_TRUST_GROWTH = 8
+_CHECKPOINT_PREFETCH_EXECUTOR: tuple[int, ThreadPoolExecutor] | None = None
+_CHECKPOINT_PREFETCH_EXECUTOR_LOCK = threading.Lock()
+
+
+def _checkpoint_prefetch_executor() -> ThreadPoolExecutor:
+    global _CHECKPOINT_PREFETCH_EXECUTOR
+    pid = os.getpid()
+    with _CHECKPOINT_PREFETCH_EXECUTOR_LOCK:
+        if (
+            _CHECKPOINT_PREFETCH_EXECUTOR is None
+            or _CHECKPOINT_PREFETCH_EXECUTOR[0] != pid
+        ):
+            _CHECKPOINT_PREFETCH_EXECUTOR = (
+                pid,
+                ThreadPoolExecutor(thread_name_prefix="art-checkpoint-prefetch"),
+            )
+        return _CHECKPOINT_PREFETCH_EXECUTOR[1]
 
 
 class _AdapterConfig(TypedDict):
@@ -126,6 +142,8 @@ class ForwardOutput(Generic[LogprobsT, TopKT, LogitsT, HiddenStatesT]):
     top_k: TopKT
     logits: LogitsT
     hidden_states: HiddenStatesT
+    checkpoint: str | None = None
+    no_grad: bool = False
 
 
 @dataclass(slots=True)
@@ -135,6 +153,7 @@ class ForwardInput(Generic[LogprobsT, TopKT, LogitsT, HiddenStatesT]):
     top_k: int | None = None
     logits: bool = False
     hidden_states: bool = False
+    no_grad: bool | None = None
     checkpoint: AdapterSelection = Unset
 
     @overload
@@ -146,6 +165,7 @@ class ForwardInput(Generic[LogprobsT, TopKT, LogitsT, HiddenStatesT]):
         top_k: None = None,
         logits: Literal[False] = False,
         hidden_states: Literal[False] = False,
+        no_grad: bool | None = None,
         checkpoint: AdapterSelection = Unset,
     ) -> "ForwardInput[None, None, None, None]": ...
 
@@ -158,6 +178,7 @@ class ForwardInput(Generic[LogprobsT, TopKT, LogitsT, HiddenStatesT]):
         top_k: None = None,
         logits: Literal[False] = False,
         hidden_states: Literal[False] = False,
+        no_grad: bool | None = None,
         checkpoint: AdapterSelection = Unset,
     ) -> "ForwardInput[torch.Tensor, None, None, None]": ...
 
@@ -170,6 +191,7 @@ class ForwardInput(Generic[LogprobsT, TopKT, LogitsT, HiddenStatesT]):
         top_k: int,
         logits: Literal[False] = False,
         hidden_states: Literal[False] = False,
+        no_grad: bool | None = None,
         checkpoint: AdapterSelection = Unset,
     ) -> "ForwardInput[None, TopK, None, None]": ...
 
@@ -182,6 +204,7 @@ class ForwardInput(Generic[LogprobsT, TopKT, LogitsT, HiddenStatesT]):
         top_k: None = None,
         logits: Literal[True],
         hidden_states: Literal[False] = False,
+        no_grad: bool | None = None,
         checkpoint: AdapterSelection = Unset,
     ) -> "ForwardInput[None, None, torch.Tensor, None]": ...
 
@@ -194,6 +217,7 @@ class ForwardInput(Generic[LogprobsT, TopKT, LogitsT, HiddenStatesT]):
         top_k: None = None,
         logits: Literal[False] = False,
         hidden_states: Literal[True],
+        no_grad: bool | None = None,
         checkpoint: AdapterSelection = Unset,
     ) -> "ForwardInput[None, None, None, torch.Tensor]": ...
 
@@ -206,6 +230,7 @@ class ForwardInput(Generic[LogprobsT, TopKT, LogitsT, HiddenStatesT]):
         top_k: int,
         logits: Literal[False] = False,
         hidden_states: Literal[False] = False,
+        no_grad: bool | None = None,
         checkpoint: AdapterSelection = Unset,
     ) -> "ForwardInput[torch.Tensor, TopK, None, None]": ...
 
@@ -218,6 +243,7 @@ class ForwardInput(Generic[LogprobsT, TopKT, LogitsT, HiddenStatesT]):
         top_k: None = None,
         logits: Literal[True],
         hidden_states: Literal[False] = False,
+        no_grad: bool | None = None,
         checkpoint: AdapterSelection = Unset,
     ) -> "ForwardInput[torch.Tensor, None, torch.Tensor, None]": ...
 
@@ -230,6 +256,7 @@ class ForwardInput(Generic[LogprobsT, TopKT, LogitsT, HiddenStatesT]):
         top_k: None = None,
         logits: Literal[False] = False,
         hidden_states: Literal[True],
+        no_grad: bool | None = None,
         checkpoint: AdapterSelection = Unset,
     ) -> "ForwardInput[torch.Tensor, None, None, torch.Tensor]": ...
 
@@ -242,6 +269,7 @@ class ForwardInput(Generic[LogprobsT, TopKT, LogitsT, HiddenStatesT]):
         top_k: int,
         logits: Literal[True],
         hidden_states: Literal[False] = False,
+        no_grad: bool | None = None,
         checkpoint: AdapterSelection = Unset,
     ) -> "ForwardInput[None, TopK, torch.Tensor, None]": ...
 
@@ -254,6 +282,7 @@ class ForwardInput(Generic[LogprobsT, TopKT, LogitsT, HiddenStatesT]):
         top_k: int,
         logits: Literal[False] = False,
         hidden_states: Literal[True],
+        no_grad: bool | None = None,
         checkpoint: AdapterSelection = Unset,
     ) -> "ForwardInput[None, TopK, None, torch.Tensor]": ...
 
@@ -266,6 +295,7 @@ class ForwardInput(Generic[LogprobsT, TopKT, LogitsT, HiddenStatesT]):
         top_k: None = None,
         logits: Literal[True],
         hidden_states: Literal[True],
+        no_grad: bool | None = None,
         checkpoint: AdapterSelection = Unset,
     ) -> "ForwardInput[None, None, torch.Tensor, torch.Tensor]": ...
 
@@ -278,6 +308,7 @@ class ForwardInput(Generic[LogprobsT, TopKT, LogitsT, HiddenStatesT]):
         top_k: int,
         logits: Literal[True],
         hidden_states: Literal[False] = False,
+        no_grad: bool | None = None,
         checkpoint: AdapterSelection = Unset,
     ) -> "ForwardInput[torch.Tensor, TopK, torch.Tensor, None]": ...
 
@@ -290,6 +321,7 @@ class ForwardInput(Generic[LogprobsT, TopKT, LogitsT, HiddenStatesT]):
         top_k: int,
         logits: Literal[False] = False,
         hidden_states: Literal[True],
+        no_grad: bool | None = None,
         checkpoint: AdapterSelection = Unset,
     ) -> "ForwardInput[torch.Tensor, TopK, None, torch.Tensor]": ...
 
@@ -302,6 +334,7 @@ class ForwardInput(Generic[LogprobsT, TopKT, LogitsT, HiddenStatesT]):
         top_k: None = None,
         logits: Literal[True],
         hidden_states: Literal[True],
+        no_grad: bool | None = None,
         checkpoint: AdapterSelection = Unset,
     ) -> "ForwardInput[torch.Tensor, None, torch.Tensor, torch.Tensor]": ...
 
@@ -314,6 +347,7 @@ class ForwardInput(Generic[LogprobsT, TopKT, LogitsT, HiddenStatesT]):
         top_k: int,
         logits: Literal[True],
         hidden_states: Literal[True],
+        no_grad: bool | None = None,
         checkpoint: AdapterSelection = Unset,
     ) -> "ForwardInput[None, TopK, torch.Tensor, torch.Tensor]": ...
 
@@ -326,6 +360,7 @@ class ForwardInput(Generic[LogprobsT, TopKT, LogitsT, HiddenStatesT]):
         top_k: int,
         logits: Literal[True],
         hidden_states: Literal[True],
+        no_grad: bool | None = None,
         checkpoint: AdapterSelection = Unset,
     ) -> "ForwardInput[torch.Tensor, TopK, torch.Tensor, torch.Tensor]": ...
 
@@ -338,6 +373,7 @@ class ForwardInput(Generic[LogprobsT, TopKT, LogitsT, HiddenStatesT]):
         top_k: int | None = None,
         logits: bool = False,
         hidden_states: bool = False,
+        no_grad: bool | None = None,
         checkpoint: AdapterSelection = Unset,
     ) -> "ForwardInput[torch.Tensor | None, TopK | None, torch.Tensor | None, torch.Tensor | None]": ...
 
@@ -349,9 +385,30 @@ class ForwardInput(Generic[LogprobsT, TopKT, LogitsT, HiddenStatesT]):
         top_k: int | None = None,
         logits: bool = False,
         hidden_states: bool = False,
+        no_grad: bool | None = None,
         checkpoint: AdapterSelection = Unset,
     ) -> Self:
         return object.__new__(cls)
+
+    def __init__(
+        self,
+        *,
+        input_tokens: torch.Tensor,
+        target_tokens: torch.Tensor | None = None,
+        top_k: int | None = None,
+        logits: bool = False,
+        hidden_states: bool = False,
+        no_grad: bool | None = None,
+        checkpoint: AdapterSelection = Unset,
+    ) -> None:
+        self.input_tokens = input_tokens
+        self.target_tokens = target_tokens
+        self.top_k = top_k
+        self.logits = logits
+        self.hidden_states = hidden_states
+        self.no_grad = no_grad
+        self.checkpoint = checkpoint
+        self.__post_init__()
 
     def __post_init__(self) -> None:
         if self.top_k is not None and self.top_k < 1:
@@ -632,6 +689,7 @@ class _CheckpointSlot:
     revision: int = 0
     custom: dict[str, _CustomObject] = dataclass_field(default_factory=dict)
     custom_payload: "PreparedCustomPayload | None" = None
+    snapshot: bool = False
 
 
 @dataclass(frozen=True)
@@ -647,24 +705,13 @@ class PushedCheckpoint:
     _trainer: "TrainerRank"
     _path: str | None
     _directory: str | None
-    _task: asyncio.Task[None] | None = None
     _entered: bool = False
     _closed: bool = False
-
-    def __await__(self) -> Generator[object, None, None]:
-        return self._ensure_task().__await__()
 
     def __enter__(self) -> "PushedCheckpoint":
         if self._entered or self._closed:
             raise RuntimeError("Pushed checkpoint context cannot be entered twice")
-        if self._task is not None:
-            if not self._task.done():
-                raise RuntimeError(
-                    "Checkpoint push is running asynchronously; use 'async with'"
-                )
-            self._task.result()
-        else:
-            self._trainer._push_checkpoint_sync(self._path, self._directory)
+        self._trainer._push_checkpoint_sync(self._path, self._directory)
         self._entered = True
         return self
 
@@ -676,34 +723,6 @@ class PushedCheckpoint:
     ) -> bool:
         self._exit(exception)
         return False
-
-    async def __aenter__(self) -> "PushedCheckpoint":
-        if self._entered or self._closed:
-            raise RuntimeError("Pushed checkpoint context cannot be entered twice")
-        task = self._ensure_task()
-        try:
-            await task
-        except asyncio.CancelledError:
-            if task.done() and not task.cancelled() and task.exception() is None:
-                self._entered = True
-                self._pop()
-            raise
-        self._entered = True
-        return self
-
-    async def __aexit__(
-        self,
-        exception_type: type[BaseException] | None,
-        exception: BaseException | None,
-        traceback: TracebackType | None,
-    ) -> bool:
-        self._exit(exception)
-        return False
-
-    def _ensure_task(self) -> asyncio.Task[None]:
-        if self._task is None:
-            self._task = self._trainer._activate_checkpoint(self._path, self._directory)
-        return self._task
 
     def _exit(self, body_error: BaseException | None) -> None:
         try:
@@ -754,11 +773,13 @@ class _MemorySignature:
     slot_group_count: int
     request_mix: tuple[str, ...]
     grad_enabled: bool
+    grad_modes: tuple[bool, ...]
 
 
 @dataclass(frozen=True)
 class _ForwardGroupPlan:
     slot_ref: "LoRASlotRef | None"
+    grad_enabled: bool
     request_indices: tuple[int, ...]
     items: tuple[_ForwardItem, ...]
     packed: PrefixTreePack
@@ -767,6 +788,7 @@ class _ForwardGroupPlan:
 @dataclass(frozen=True)
 class _FlatForwardPlan:
     request_count: int
+    output_metadata: tuple[tuple[str | None, bool], ...]
     groups: tuple[_ForwardGroupPlan, ...]
     packed_tokens: int
     logical_tokens: int
@@ -823,8 +845,10 @@ class TrainerRank:
         self._slot_stack: list[LoRASlotRef] = []
         self._checkpoint_slots: dict[str, _CheckpointSlot] = {}
         self._prepared_lora_exports: dict[str, tuple[str, _PreparedLoraExport]] = {}
-        self._checkpoint_prefetches: dict[str, asyncio.Task[PreparedCheckpoint]] = {}
-        self._checkpoint_mutation_tail: asyncio.Task[None] | None = None
+        self._checkpoint_prefetches: dict[str, Future[PreparedCheckpoint]] = {}
+        self._checkpoint_prefetch_sources: dict[str, str] = {}
+        self._checkpoint_prefetch_lock = threading.Lock()
+        self._checkpoint_mutation_lock = threading.RLock()
         self._checkpoint_process_group: dist.ProcessGroup | None = None
         self._checkpoint_finalize_process_group: dist.ProcessGroup | None = None
         self._checkpoint_group_lock = threading.Lock()
@@ -956,11 +980,14 @@ class TrainerRank:
                 if not isinstance(value, torch.nn.Module):
                     raise TypeError("module() factory must return torch.nn.Module")
                 value = value.to(device=self.device)
+                if slot.snapshot:
+                    value.requires_grad_(False)
             elif kind == "parameter":
                 if not isinstance(value, torch.Tensor):
                     raise TypeError("parameter() factory must return torch.Tensor")
                 value = torch.nn.Parameter(
-                    value.detach().to(device=self.device).clone(), requires_grad=True
+                    value.detach().to(device=self.device).clone(),
+                    requires_grad=not slot.snapshot,
                 )
             else:
                 if not isinstance(value, torch.Tensor):
@@ -1019,6 +1046,7 @@ class TrainerRank:
             raise TrainerRankSlotStateError(
                 "Custom checkpoint objects require a loaded named checkpoint"
             )
+        self._ensure_checkpoint_slots((name,))
         if name not in self._checkpoint_slots:
             raise TrainerRankSlotStateError(f"Unknown checkpoint: {name!r}")
         return name
@@ -1135,50 +1163,154 @@ class TrainerRank:
     def prefetch_checkpoints(
         self, *checkpoints: str | MaterializedCheckpoint
     ) -> asyncio.Task[None]:
-        sources = tuple(
-            self._checkpoint_source(checkpoint)[1] for checkpoint in checkpoints
-        )
-        assert all(source is not None for source in sources)
+        futures = []
+        for checkpoint in checkpoints:
+            logical, source = self._checkpoint_source(checkpoint)
+            assert logical is not None and source is not None
+            futures.append(self._register_checkpoint_prefetch(logical, source))
 
         async def prefetch() -> None:
             await asyncio.gather(
-                *(
-                    self._prefetch_checkpoint(source)
-                    for source in sources
-                    if source is not None
-                )
+                *(self._await_checkpoint_prefetch(future) for future in futures)
             )
 
         return asyncio.create_task(prefetch())
 
-    def load_checkpoint(
-        self, checkpoint: str | MaterializedCheckpoint | None
-    ) -> asyncio.Task[None]:
+    @staticmethod
+    async def _await_checkpoint_prefetch(
+        future: Future[PreparedCheckpoint],
+    ) -> PreparedCheckpoint:
+        return await asyncio.shield(asyncio.wrap_future(future))
+
+    def _register_checkpoint_prefetch(
+        self,
+        checkpoint: str,
+        source: str,
+        prepare: Callable[[], PreparedCheckpoint] | None = None,
+    ) -> Future[PreparedCheckpoint]:
+        key = self._checkpoint_source_key(source)
+        with self._checkpoint_prefetch_lock:
+            previous = self._checkpoint_prefetch_sources.get(checkpoint)
+            self._checkpoint_prefetch_sources[checkpoint] = key
+            if (
+                previous is not None
+                and previous != key
+                and previous not in self._checkpoint_prefetch_sources.values()
+            ):
+                self._checkpoint_prefetches.pop(previous, None)
+            future = self._checkpoint_prefetches.get(key)
+            if future is None or (
+                future.done() and (future.cancelled() or future.exception() is not None)
+            ):
+                if prepare is None:
+                    from ._checkpoint import prepare_checkpoint
+
+                    prepare = lambda: prepare_checkpoint(key)
+                future = _checkpoint_prefetch_executor().submit(prepare)
+                self._checkpoint_prefetches[key] = future
+            return future
+
+    def _checkpoint_prefetch_waiter(self, *checkpoints: str) -> asyncio.Task[None]:
+        with self._checkpoint_prefetch_lock:
+            futures = [
+                self._checkpoint_prefetches[self._checkpoint_prefetch_sources[name]]
+                for name in checkpoints
+                if name not in self._checkpoint_slots
+            ]
+
+        async def wait() -> None:
+            await asyncio.gather(
+                *(self._await_checkpoint_prefetch(future) for future in futures)
+            )
+
+        return asyncio.create_task(wait())
+
+    def _prefetched_checkpoint(self, checkpoint: str) -> PreparedCheckpoint:
+        with self._checkpoint_prefetch_lock:
+            key = self._checkpoint_prefetch_sources.get(checkpoint)
+            future = None if key is None else self._checkpoint_prefetches.get(key)
+        if future is None:
+            raise TrainerRankSlotStateError(
+                f"Checkpoint {checkpoint!r} has not been prefetched"
+            )
+        return future.result()
+
+    def _load_registered_checkpoint(self, checkpoint: str) -> None:
+        from . import _checkpoint
+
+        source: PreparedCheckpoint | None = None
+        error: BaseException | None = None
+        try:
+            source = self._prefetched_checkpoint(checkpoint)
+        except BaseException as exc:
+            error = exc
+        group = _checkpoint._ensure_group(self)
+        _checkpoint.raise_distributed(error, "prepare checkpoint", group)
+        assert source is not None
+        _checkpoint.load_checkpoint(self, source, checkpoint)
+
+    def _ensure_checkpoint_slots(self, checkpoints: Iterable[str]) -> None:
+        from . import _checkpoint
+
+        requested = tuple(dict.fromkeys(checkpoints))
+        with self._checkpoint_mutation_lock:
+            group = _checkpoint._ensure_group(self)
+            names = sorted(
+                {
+                    name
+                    for rank_names in _checkpoint._gather(requested, group)
+                    for name in rank_names
+                }
+            )
+            for name in names:
+                with self._checkpoint_prefetch_lock:
+                    state = (
+                        name in self._checkpoint_slots,
+                        name in self._checkpoint_prefetch_sources,
+                    )
+                states = _checkpoint._gather(state, group)
+                if all(loaded for loaded, _prefetched in states):
+                    continue
+                if any(loaded for loaded, _prefetched in states):
+                    raise TrainerRankSlotStateError(
+                        f"Checkpoint {name!r} is not loaded consistently across ranks"
+                    )
+                if not all(prefetched for _loaded, prefetched in states):
+                    raise TrainerRankSlotStateError(
+                        f"Explicit selection references unloaded checkpoint {name!r}; "
+                        "it has not been prefetched on every rank"
+                    )
+                self._load_registered_checkpoint(name)
+
+    def load_checkpoint(self, checkpoint: str | MaterializedCheckpoint | None) -> None:
         logical, source = self._checkpoint_source(checkpoint)
-        return self._load_checkpoint(logical, source)
-
-    def _load_checkpoint(
-        self, logical_path: str | None, source_path: str | None
-    ) -> asyncio.Task[None]:
-        prefetch = (
-            None
-            if source_path is None
-            else asyncio.create_task(self._prefetch_checkpoint(source_path))
-        )
-
-        async def load() -> None:
+        with self._checkpoint_mutation_lock:
             if self._slot_stack:
                 raise RuntimeError("Cannot load a checkpoint while one is pushed")
-            if logical_path is None:
+            if logical is None:
                 self._set_default_slot(self._slot_ref(None))
                 return
-            assert source_path is not None and prefetch is not None
-            await self._load_checkpoint_path(
-                logical_path, source_path=source_path, prefetch=prefetch
-            )
-            self._set_default_slot(self._slot_ref(logical_path))
+            assert source is not None
+            if (
+                isinstance(checkpoint, MaterializedCheckpoint)
+                or logical not in self._checkpoint_prefetch_sources
+            ):
+                self._register_checkpoint_prefetch(logical, source)
+            self._load_registered_checkpoint(logical)
+            self._set_default_slot(self._slot_ref(logical))
 
-        return self._checkpoint_mutation_task(load)
+    def snapshot_checkpoint(self, source: str, destination: str) -> bool:
+        """Clone a loaded checkpoint into a forward-only resident snapshot."""
+        from . import _checkpoint
+
+        self._ensure_checkpoint_slots((source,))
+        return _checkpoint.snapshot_checkpoint(self, source, destination)
+
+    def _discard_snapshot_checkpoint(self, checkpoint: str) -> None:
+        """Discard a forward-only resident snapshot."""
+        from . import _checkpoint
+
+        _checkpoint.discard_snapshot_checkpoint(self, checkpoint)
 
     def push_checkpoint(
         self, checkpoint: str | MaterializedCheckpoint | None
@@ -1186,69 +1318,29 @@ class TrainerRank:
         logical, directory = self._checkpoint_source(checkpoint)
         return PushedCheckpoint(self, logical, directory)
 
-    def _activate_checkpoint(
-        self, logical_path: str | None, source_path: str | None
-    ) -> asyncio.Task[None]:
-        prefetch = (
-            asyncio.create_task(self._prefetch_checkpoint(source_path))
-            if source_path is not None and logical_path not in self._checkpoint_slots
-            else None
-        )
-
-        async def push() -> None:
-            if prefetch is not None and logical_path not in self._checkpoint_slots:
-                assert logical_path is not None and source_path is not None
-                await self._load_checkpoint_path(
-                    logical_path, source_path=source_path, prefetch=prefetch
-                )
-            self._slot_stack.append(self._slot_ref(logical_path))
-
-        return self._checkpoint_mutation_task(push)
+    def _push_checkpoint(self, checkpoint: str | MaterializedCheckpoint | None) -> None:
+        logical, source = self._checkpoint_source(checkpoint)
+        self._push_checkpoint_sync(logical, source)
 
     def _push_checkpoint_sync(
         self, logical_path: str | None, source_path: str | None
     ) -> None:
-        predecessor = self._checkpoint_mutation_tail
-        if predecessor is not None:
-            if not predecessor.done():
-                raise RuntimeError(
-                    "A checkpoint mutation is running asynchronously; use 'async with'"
-                )
-            if not predecessor.cancelled():
-                predecessor.exception()
-        if source_path is not None and logical_path not in self._checkpoint_slots:
-            assert logical_path is not None
-            from . import _checkpoint
-
-            source = _checkpoint.prepare_checkpoint(source_path)
-            _checkpoint.load_checkpoint(self, source, logical_path)
-        self._slot_stack.append(self._slot_ref(logical_path))
-
-    def _checkpoint_mutation_task(
-        self, operation: Callable[[], Awaitable[None]]
-    ) -> asyncio.Task[None]:
-        predecessor = self._checkpoint_mutation_tail
-
-        async def ordered() -> None:
-            if predecessor is not None:
-                try:
-                    await asyncio.shield(predecessor)
-                except asyncio.CancelledError:
-                    current = asyncio.current_task()
-                    if current is not None and current.cancelling():
-                        raise
-                except Exception:
-                    pass
-            await operation()
-
-        task = asyncio.create_task(ordered())
-        self._checkpoint_mutation_tail = task
-        return task
+        with self._checkpoint_mutation_lock:
+            if source_path is not None:
+                assert logical_path is not None
+                if (
+                    logical_path not in self._checkpoint_slots
+                    and logical_path not in self._checkpoint_prefetch_sources
+                ):
+                    self._register_checkpoint_prefetch(logical_path, source_path)
+                self._ensure_checkpoint_slots((logical_path,))
+            self._slot_stack.append(self._slot_ref(logical_path))
 
     def pop_checkpoint(self) -> None:
-        if not self._slot_stack:
-            raise RuntimeError("No pushed checkpoint to pop")
-        self._slot_stack.pop()
+        with self._checkpoint_mutation_lock:
+            if not self._slot_stack:
+                raise RuntimeError("No pushed checkpoint to pop")
+            self._slot_stack.pop()
 
     def save_checkpoint(
         self,
@@ -1332,46 +1424,9 @@ class TrainerRank:
             return checkpoint.path, checkpoint.directory
         return checkpoint, checkpoint
 
-    async def _prefetch_checkpoint(self, source_path: str) -> PreparedCheckpoint:
-        key = self._checkpoint_source_key(source_path)
-        task = self._checkpoint_prefetches.get(key)
-        if task is None:
-            from ._checkpoint import prepare_checkpoint
-
-            task = self._checkpoint_prefetches[key] = asyncio.create_task(
-                asyncio.to_thread(prepare_checkpoint, key)
-            )
-        try:
-            return await asyncio.shield(task)
-        except BaseException:
-            if task.done():
-                self._checkpoint_prefetches.pop(key, None)
-            raise
-
-    async def _load_checkpoint_path(
-        self,
-        logical_path: str,
-        *,
-        source_path: str,
-        prefetch: asyncio.Task[PreparedCheckpoint],
-    ) -> None:
-        from . import _checkpoint
-
-        key = self._checkpoint_source_key(source_path)
-        source: PreparedCheckpoint | None = None
-        error: BaseException | None = None
-        try:
-            source = await asyncio.shield(prefetch)
-        except BaseException as exc:
-            error = exc
-        group = _checkpoint._ensure_group(self)
-        _checkpoint.raise_distributed(error, "prepare checkpoint", group)
-        assert source is not None
-        _checkpoint.load_checkpoint(self, source, logical_path)
-        self._checkpoint_prefetches.pop(key, None)
-
     def _resolve_checkpoint_name(self, checkpoint_path: str | Literal["active"]) -> str:
         if checkpoint_path != "active":
+            self._ensure_checkpoint_slots((checkpoint_path,))
             return checkpoint_path
         ref = self._slot_stack[-1] if self._slot_stack else self._default_slot_ref
         if ref is None or ref.name is None:
@@ -1573,12 +1628,12 @@ class TrainerRank:
     ) -> Iterator[MicroBatch[ForwardInputs, ForwardOutputs]]:
         items = [_materialize(item) for item in inputs]
         requests = list(_flatten(items))
+        self._validate_replicated_top_level_count(len(items))
         for _, indices in self._group_active_request_indices(
             requests, checkpoint=checkpoint
         ):
             for index in indices:
                 self._forward_item(requests[index])
-        self._validate_replicated_top_level_count(len(items))
         start = 0
         while start < len(items):
             with _telemetry_phase(
@@ -1944,6 +1999,8 @@ class TrainerRank:
         self,
         checkpoints: Sequence[str] | None,
     ) -> tuple[str, ...]:
+        if checkpoints is not None:
+            self._ensure_checkpoint_slots(checkpoints)
         loaded = set(self._checkpoint_slots)
         if not loaded:
             raise TrainerRankSlotStateError(
@@ -1963,6 +2020,13 @@ class TrainerRank:
             )
         if unknown := set(requested) - loaded:
             raise ValueError(f"Unknown checkpoint slots: {sorted(unknown)}")
+        if snapshots := [
+            name for name in requested if self._checkpoint_slots[name].snapshot
+        ]:
+            raise TrainerRankSlotStateError(
+                "Snapshot checkpoints are forward-only and cannot be stepped: "
+                f"{snapshots}"
+            )
         flags = self._checkpoint_grad_flags(requested)
         selected = tuple(
             name for name, has_grad in zip(requested, flags, strict=True) if has_grad
@@ -2541,7 +2605,7 @@ class TrainerRank:
         output_bytes = self._estimate_group_request_output_bytes(requests)
         logical_tokens = sum(int(request.input_tokens.numel()) for request in requests)
         groups = self._group_active_request_indices(requests, checkpoint=checkpoint)
-        for slot_ref, group_indices in groups:
+        for (slot_ref, grad_enabled), group_indices in groups:
             items = tuple(
                 self._forward_item(requests[index]) for index in group_indices
             )
@@ -2552,6 +2616,7 @@ class TrainerRank:
             plans.append(
                 _ForwardGroupPlan(
                     slot_ref=slot_ref,
+                    grad_enabled=grad_enabled,
                     request_indices=tuple(group_indices),
                     items=items,
                     packed=packed,
@@ -2560,6 +2625,10 @@ class TrainerRank:
 
         return _FlatForwardPlan(
             request_count=len(requests),
+            output_metadata=tuple(
+                self._forward_output_metadata(request, checkpoint=checkpoint)
+                for request in requests
+            ),
             groups=tuple(plans),
             packed_tokens=sum(int(plan.packed.tokens.numel()) for plan in plans),
             logical_tokens=logical_tokens,
@@ -2567,6 +2636,7 @@ class TrainerRank:
             signature=self._memory_signature_from_requests(
                 requests,
                 slot_group_count=len(plans),
+                grad_modes=tuple(mode for (_, mode), _ in groups),
             ),
         )
 
@@ -2593,6 +2663,7 @@ class TrainerRank:
             self._memory_signature_from_requests(
                 requests,
                 slot_group_count=len(groups),
+                grad_modes=tuple(mode for (_, mode), _ in groups),
             ),
         )
 
@@ -2601,8 +2672,27 @@ class TrainerRank:
         requests: Sequence[AnyForwardInput],
         *,
         checkpoint: AdapterSelection = Unset,
-    ) -> tuple[tuple["LoRASlotRef | None", tuple[int, ...]], ...]:
-        groups: dict[LoRASlotRef | None, list[int]] = {}
+    ) -> tuple[tuple[tuple["LoRASlotRef | None", bool], tuple[int, ...]], ...]:
+        self._ensure_checkpoint_slots(
+            cast(str, selection)
+            for request in requests
+            if (
+                request.target_tokens is not None
+                or request.logits
+                or request.top_k is not None
+                or request.hidden_states
+            )
+            if (
+                selection := (
+                    request.checkpoint
+                    if request.checkpoint is not Unset
+                    else checkpoint
+                )
+            )
+            is not Unset
+            and selection is not None
+        )
+        groups: dict[tuple[LoRASlotRef | None, bool], list[int]] = {}
         for index, request in enumerate(requests):
             if (
                 request.target_tokens is not None
@@ -2611,7 +2701,15 @@ class TrainerRank:
                 or request.hidden_states
             ):
                 groups.setdefault(
-                    self._resolve_slot_ref(request, checkpoint=checkpoint), []
+                    (
+                        self._resolve_slot_ref(request, checkpoint=checkpoint),
+                        (
+                            torch.is_grad_enabled()
+                            if request.no_grad is None
+                            else not request.no_grad
+                        ),
+                    ),
+                    [],
                 ).append(index)
         return tuple((slot_ref, tuple(indices)) for slot_ref, indices in groups.items())
 
@@ -2665,6 +2763,7 @@ class TrainerRank:
             "slot_group_count": plan.signature.slot_group_count,
             "request_mix": plan.signature.request_mix,
             "grad_enabled": plan.signature.grad_enabled,
+            "grad_modes": plan.signature.grad_modes,
         }
 
     @classmethod
@@ -2684,7 +2783,8 @@ class TrainerRank:
 
     def _execute_flat_plan(self, plan: _FlatForwardPlan) -> list[AnyForwardOutput]:
         outputs = [
-            ForwardOutput(None, None, None, None) for _ in range(plan.request_count)
+            ForwardOutput(None, None, None, None, checkpoint, no_grad)
+            for checkpoint, no_grad in plan.output_metadata
         ]
         self._validate_hybridep_topology()
         hybridep = (
@@ -2700,12 +2800,23 @@ class TrainerRank:
 
                 if hybridep is not None:
                     self._set_hybridep_rows(hybridep[0][group_index])
-                with use_lora_slot(group.slot_ref):
-                    prepared = self._prepare_packed_forward(group.packed)
-                    item_outputs = self._forward_packed(group.items, prepared)
-                item_outputs = self._track_slot_graph_outputs(
-                    group.slot_ref, item_outputs
-                )
+                with torch.set_grad_enabled(group.grad_enabled):
+                    with use_lora_slot(group.slot_ref):
+                        prepared = self._prepare_packed_forward(group.packed)
+                        item_outputs = self._forward_packed(group.items, prepared)
+                    item_outputs = [
+                        replace(
+                            output,
+                            checkpoint=(
+                                None if group.slot_ref is None else group.slot_ref.name
+                            ),
+                            no_grad=not group.grad_enabled,
+                        )
+                        for output in item_outputs
+                    ]
+                    item_outputs = self._track_slot_graph_outputs(
+                        group.slot_ref, item_outputs
+                    )
                 for index, output in zip(
                     group.request_indices, item_outputs, strict=True
                 ):
@@ -2748,6 +2859,8 @@ class TrainerRank:
                 ),
                 logits=track(output.logits),
                 hidden_states=track(output.hidden_states),
+                checkpoint=output.checkpoint,
+                no_grad=output.no_grad,
             )
             for output in outputs
         ]
@@ -2758,6 +2871,25 @@ class TrainerRank:
             if track_hybridep:
                 self._hybridep_graphs().append(marker_ref)
         return tracked_outputs
+
+    def _forward_output_metadata(
+        self,
+        request: AnyForwardInput,
+        *,
+        checkpoint: AdapterSelection,
+    ) -> tuple[str | None, bool]:
+        selection = (
+            request.checkpoint if request.checkpoint is not Unset else checkpoint
+        )
+        if selection is Unset:
+            ref = self._slot_stack[-1] if self._slot_stack else self._default_slot_ref
+            name = None if ref is None else ref.name
+        else:
+            name = cast(str | None, selection)
+        enabled = (
+            torch.is_grad_enabled() if request.no_grad is None else not request.no_grad
+        )
+        return name, not enabled
 
     def _hybridep_graphs(self) -> list[weakref.ReferenceType[torch.Tensor]]:
         graphs = getattr(self, "_pending_hybridep_graphs", None)
@@ -2800,6 +2932,10 @@ class TrainerRank:
 
     def _guard_slot_can_load(self, ref: "LoRASlotRef") -> None:
         slot = None if ref.name is None else self._checkpoint_slots.get(ref.name)
+        if slot is not None and slot.snapshot:
+            raise TrainerRankSlotStateError(
+                f"Cannot load over forward-only snapshot checkpoint {ref.name!r}"
+            )
         if slot is not None and any(param.grad is not None for param in slot.params):
             raise TrainerRankSlotStateError(
                 f"Cannot load checkpoint {ref.name!r} while it has accumulated "
@@ -2881,7 +3017,9 @@ class TrainerRank:
         requests: Sequence[AnyForwardInput],
         *,
         slot_group_count: int,
+        grad_modes: Iterable[bool],
     ) -> _MemorySignature:
+        modes = tuple(sorted(grad_modes))
         return _MemorySignature(
             topology=self._topology_key(),
             shared_prefix_max_depth=self.shared_prefix_max_depth,
@@ -2889,7 +3027,8 @@ class TrainerRank:
             request_mix=tuple(
                 sorted({_request_mix_key(request) for request in requests})
             ),
-            grad_enabled=torch.is_grad_enabled(),
+            grad_enabled=any(modes),
+            grad_modes=modes,
         )
 
     def _topology_key(self) -> tuple[int, int, int, int]:

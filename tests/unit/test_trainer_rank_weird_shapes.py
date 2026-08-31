@@ -392,6 +392,8 @@ def test_adaptive_planner_probes_new_heterogeneous_signatures(
         "_resolve_slot_ref",
         lambda request, **_kwargs: request.checkpoint,
     )
+    for index in range(4):
+        rank._checkpoint_slots.setdefault(f"S{index}", _CheckpointSlot()).params = ()
     inputs = [
         _target_request(_tokens(index), checkpoint=f"S{index % 4}")
         for index in range(16)
@@ -487,11 +489,19 @@ def test_forward_micro_batches_shrinks_when_memory_budget_drops(
 def test_heterogeneous_slots_split_packing_without_losing_output_estimates(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    class SlotRef(str):
+        @property
+        def name(self) -> str:
+            return str(self)
+
+    def slot_ref(name: str | None) -> SlotRef | None:
+        return None if name is None else SlotRef(name)
+
     rank = TrainerRank(_runtime(), shared_prefix_max_depth=4)
     monkeypatch.setattr(
         TrainerRank,
         "_slot_ref",
-        staticmethod(lambda name: name),
+        staticmethod(slot_ref),
     )
     rank._default_slot_ref = rank._slot_ref("student")
     for name in ("student", "teacher", "critic"):

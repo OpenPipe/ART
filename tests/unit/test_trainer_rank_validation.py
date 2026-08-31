@@ -47,9 +47,11 @@ from art.trainer_rank._checkpoint import (
     _validate_save_state,
     abort_checkpoint_save,
     finish_checkpoint_save,
+    materialize_checkpoint,
     materialize_lora,
     prepare_checkpoint,
     prepare_checkpoint_save,
+    snapshot_prepared_checkpoint,
     validate_checkpoint,
 )
 from art.trainer_rank._impl import (
@@ -364,6 +366,88 @@ def test_dp_rank_forward_grad_mode(
     assert seen == [expected]
 
 
+@pytest.mark.parametrize("api", ("dp_rank_forward", "forward_micro_batches"))
+def test_forward_input_overrides_grad_mode_by_group(
+    monkeypatch: pytest.MonkeyPatch,
+    api: str,
+) -> None:
+    trainer = TrainerRank(_runtime())
+    seen: list[bool] = []
+
+    def execute(plan: object, **_kwargs: object) -> list[ForwardOutput]:
+        seen.extend(group.grad_enabled for group in cast(Any, plan).groups)
+        return _empty_outputs(plan)
+
+    _stub_forward(monkeypatch, trainer, execute, profiled=True)
+    inputs = [
+        ForwardInput(
+            input_tokens=torch.tensor([token, token + 1]),
+            target_tokens=torch.tensor([token, token + 1]),
+            no_grad=no_grad,
+        )
+        for token, no_grad in ((1, True), (2, False))
+    ]
+    if api == "dp_rank_forward":
+        trainer.dp_rank_forward(inputs)
+    else:
+        list(trainer.forward_micro_batches(inputs))
+
+    assert seen == [False, True]
+
+
+def test_forward_groups_execute_in_their_selected_grad_modes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trainer = TrainerRank(_runtime())
+    seen: list[bool] = []
+    groups = tuple(
+        SimpleNamespace(
+            slot_ref=_slot_ref(checkpoint),
+            grad_enabled=enabled,
+            packed=None,
+            items=(None,),
+            request_indices=(index,),
+        )
+        for index, (checkpoint, enabled) in enumerate(
+            (("teacher", False), ("student", True))
+        )
+    )
+    plan = SimpleNamespace(
+        request_count=2,
+        output_metadata=(("teacher", True), ("student", False)),
+        groups=groups,
+    )
+
+    monkeypatch.setattr(trainer, "_validate_hybridep_topology", lambda: None)
+    monkeypatch.setattr(trainer, "_topology", lambda: object())
+    monkeypatch.setattr(trainer, "_configure_hybridep", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(trainer, "_prepare_packed_forward", lambda _packed: None)
+
+    class UseLoRASlot:
+        def __enter__(self) -> None:
+            pass
+
+        def __exit__(self, *_args: object) -> None:
+            pass
+
+    lora = ModuleType("art.megatron.lora")
+    cast(Any, lora).use_lora_slot = lambda _slot: UseLoRASlot()
+    monkeypatch.setitem(sys.modules, "art.megatron.lora", lora)
+
+    def forward(_items: object, _prepared: object) -> list[ForwardOutput]:
+        seen.append(torch.is_grad_enabled())
+        return [ForwardOutput(None, None, None, None)]
+
+    monkeypatch.setattr(trainer, "_forward_packed", forward)
+    outputs = cast(Any, trainer)._execute_flat_plan(plan)
+
+    assert seen == [False, True]
+    assert [(output.checkpoint, output.no_grad) for output in outputs] == [
+        ("teacher", True),
+        ("student", False),
+    ]
+
+
 def test_forward_micro_batches_keeps_grad_mode_across_iteration(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -573,24 +657,23 @@ def test_hybridep_rejects_buffer_growth_with_live_graph(
         )
 
 
-async def test_trainer_rank_checkpoint_stack_errors() -> None:
+def test_trainer_rank_checkpoint_stack_errors() -> None:
     trainer = TrainerRank(_runtime())
 
     with pytest.raises(RuntimeError, match="No pushed checkpoint"):
         trainer.pop_checkpoint()
     trainer._slot_stack.append(object())  # type: ignore
     with pytest.raises(RuntimeError, match="Cannot load a checkpoint"):
-        await trainer.load_checkpoint("teacher")
+        trainer.load_checkpoint("teacher")
 
 
-async def test_checkpoint_tasks_and_async_context(
+async def test_checkpoint_prefetch_and_sync_mutations(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     trainer = TrainerRank(_runtime())
-    trainer._checkpoint_prefetches = {}
     fetched: list[str] = []
 
-    async def prefetch(path: str) -> object:
+    def prepare(path: str) -> object:
         fetched.append(path)
         return object()
 
@@ -598,34 +681,31 @@ async def test_checkpoint_tasks_and_async_context(
         trainer._checkpoint_slots.setdefault(path, _CheckpointSlot()).params = ()
         trainer._checkpoint_slots[path].revision = 0
 
-    monkeypatch.setattr(trainer, "_prefetch_checkpoint", prefetch)
+    monkeypatch.setattr("art.trainer_rank._checkpoint.prepare_checkpoint", prepare)
     monkeypatch.setattr("art.trainer_rank._checkpoint.load_checkpoint", install)
 
-    task = trainer.load_checkpoint("student")
-    assert isinstance(task, asyncio.Task)
-    await task
-    assert fetched == ["student"]
+    assert trainer.load_checkpoint("student") is None
+    assert fetched == [trainer._checkpoint_source_key("student")]
     assert trainer._default_slot_ref == trainer._slot_ref("student")
 
     task = trainer.prefetch_checkpoints("teacher", "reference")
     assert isinstance(task, asyncio.Task)
     await task
-    assert fetched[-2:] == ["teacher", "reference"]
+    assert fetched[-2:] == [
+        trainer._checkpoint_source_key("teacher"),
+        trainer._checkpoint_source_key("reference"),
+    ]
 
-    pushed = trainer.push_checkpoint("student")
-    await pushed
-    assert trainer._slot_stack == [trainer._slot_ref("student")]
-    trainer.pop_checkpoint()
-    async with trainer.push_checkpoint("student"):
+    with trainer.push_checkpoint("student"):
         assert trainer._slot_stack == [trainer._slot_ref("student")]
-        async with trainer.push_checkpoint("missing"):
+        with trainer.push_checkpoint("missing"):
             assert trainer._slot_stack == [
                 trainer._slot_ref("student"),
                 trainer._slot_ref("missing"),
             ]
         assert trainer._slot_stack == [trainer._slot_ref("student")]
     assert trainer._slot_stack == []
-    assert fetched[-1] == "missing"
+    assert fetched[-1] == trainer._checkpoint_source_key("missing")
 
 
 def test_checkpoint_sync_context_and_body_error_preservation(
@@ -652,69 +732,13 @@ def test_checkpoint_sync_context_and_body_error_preservation(
     }
 
 
-async def test_checkpoint_context_cancellation_after_successful_push_cleans_stack(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    trainer = TrainerRank(_runtime())
-    trainer._checkpoint_slots.setdefault("student", _CheckpointSlot()).params = ()
-    parent = asyncio.current_task()
-    assert parent is not None
-    original_slot_ref = trainer._slot_ref
-    cancellation_scheduled = False
-
-    def cancel_parent_after_resolving(path: str | None):
-        nonlocal cancellation_scheduled
-        ref = original_slot_ref(path)
-        if not cancellation_scheduled:
-            cancellation_scheduled = True
-            asyncio.get_running_loop().call_soon(parent.cancel)
-        return ref
-
-    monkeypatch.setattr(trainer, "_slot_ref", cancel_parent_after_resolving)
-    pushed = trainer.push_checkpoint("student")
-    entered = False
-
-    with pytest.raises(asyncio.CancelledError):
-        async with pushed:
-            entered = True
-
-    assert cancellation_scheduled
-    assert pushed._task is not None
-    assert pushed._task.done() and not pushed._task.cancelled()
-    assert not entered
-    assert trainer._slot_stack == []
-
-
-async def test_checkpoint_context_cancellation_while_push_is_pending_does_not_leak(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    trainer = TrainerRank(_runtime())
-    started = asyncio.Event()
-    release = asyncio.Event()
-
-    async def prefetch(_path: str) -> object:
-        started.set()
-        await release.wait()
-        return object()
-
-    monkeypatch.setattr(trainer, "_prefetch_checkpoint", prefetch)
-    pushed = trainer.push_checkpoint("student")
-    entering = asyncio.create_task(pushed.__aenter__())
-    await started.wait()
-    entering.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await entering
-    release.set()
-    await asyncio.sleep(0)
-
-    assert pushed._task is not None and pushed._task.cancelled()
-    assert trainer._slot_stack == []
-
-
 def test_pushed_checkpoint_cannot_be_reused() -> None:
     trainer = TrainerRank(_runtime())
     trainer._checkpoint_slots["student"] = _CheckpointSlot()
     pushed = trainer.push_checkpoint("student")
+    assert not isinstance(pushed, asyncio.Future)
+    assert not hasattr(pushed, "__await__")
+    assert not hasattr(pushed, "__aenter__")
 
     with pushed:
         pass
@@ -723,23 +747,174 @@ def test_pushed_checkpoint_cannot_be_reused() -> None:
             pass
 
 
-async def test_shared_checkpoint_prefetch_survives_waiter_cancellation(
+def test_snapshot_disposal_is_not_public() -> None:
+    assert not hasattr(TrainerRank, "discard_snapshot_checkpoint")
+
+
+@pytest.mark.parametrize(
+    "consumer",
+    (
+        "module",
+        "parameter",
+        "buffer",
+        "forward",
+        "forward_micro_batches",
+        "optim_step",
+        "save",
+        "export_lora",
+        "snapshot",
+    ),
+)
+def test_explicit_consumers_activate_prefetched_checkpoint(
+    consumer: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    trainer = TrainerRank(_runtime())
+    installed: list[str] = []
+
+    def install(target: TrainerRank, _source: object, name: str) -> None:
+        installed.append(name)
+        target._checkpoint_slots[name] = _CheckpointSlot()
+
+    trainer._register_checkpoint_prefetch(
+        "student", "student", lambda: cast(PreparedCheckpoint, object())
+    )
+    monkeypatch.setattr("art.trainer_rank._checkpoint.load_checkpoint", install)
+
+    if consumer == "module":
+        trainer.module("head", lambda: torch.nn.Linear(1, 1), checkpoint="student")
+    elif consumer == "parameter":
+        trainer.parameter("bias", lambda: torch.ones(1), checkpoint="student")
+    elif consumer == "buffer":
+        trainer.buffer("mean", lambda: torch.zeros(1), checkpoint="student")
+    elif consumer == "forward":
+        _stub_forward(monkeypatch, trainer)
+        trainer.dp_rank_forward([_target_request(1)], checkpoint="student")
+    elif consumer == "forward_micro_batches":
+        _stub_forward(monkeypatch, trainer, profiled=True)
+        list(trainer.forward_micro_batches([_target_request(1)], checkpoint="student"))
+    elif consumer == "optim_step":
+        with pytest.raises(TrainerRankSlotStateError, match="no gradients"):
+            trainer.optim_step(
+                checkpoints=["student"], params=AdamParams(learning_rate=1e-3)
+            )
+    elif consumer == "save":
+        monkeypatch.setattr(
+            "art.trainer_rank._checkpoint.prepare_checkpoint_save",
+            lambda *_args: None,
+        )
+        trainer.prepare_checkpoint_save(str(tmp_path), "student")
+    elif consumer == "export_lora":
+        monkeypatch.setattr(
+            "art.trainer_rank._lora_export.export_lora", lambda *_args: 1
+        )
+        assert trainer.export_lora(str(tmp_path), "student") == 1
+    else:
+        monkeypatch.setattr(
+            "art.trainer_rank._checkpoint.snapshot_checkpoint",
+            lambda *_args: True,
+        )
+        assert trainer.snapshot_checkpoint("student", "saved")
+
+    assert installed == ["student"]
+    assert trainer._default_slot_ref is None
+
+
+def test_implicit_optim_step_does_not_activate_prefetched_checkpoints() -> None:
+    trainer = TrainerRank(_runtime())
+    future = trainer._register_checkpoint_prefetch(
+        "student", "student", lambda: cast(PreparedCheckpoint, object())
+    )
+    future.result()
+
+    with pytest.raises(TrainerRankSlotStateError, match="requires a loaded checkpoint"):
+        trainer.optim_step(params=AdamParams(learning_rate=1e-3))
+
+    assert "student" not in trainer._checkpoint_slots
+    assert "student" in trainer._checkpoint_prefetch_sources
+
+
+def test_collective_activation_loads_required_union_deterministically(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     trainer = TrainerRank(_runtime())
-    started = asyncio.Event()
-    release = asyncio.Event()
-    source = object()
+    loaded: list[str] = []
+    for name in ("a", "b"):
+        trainer._register_checkpoint_prefetch(
+            name, name, lambda: cast(PreparedCheckpoint, object())
+        ).result()
 
-    async def delayed_to_thread(_function: object, *_args: object) -> object:
+    def gather(value: object, _group: object = None) -> tuple[object, ...]:
+        if isinstance(value, tuple) and value and isinstance(value[0], str):
+            return (("b",), ("a",))
+        return (value, value)
+
+    def install(target: TrainerRank, _source: object, name: str) -> None:
+        loaded.append(name)
+        target._checkpoint_slots[name] = _CheckpointSlot()
+
+    monkeypatch.setattr("art.trainer_rank._checkpoint._gather", gather)
+    monkeypatch.setattr("art.trainer_rank._checkpoint.load_checkpoint", install)
+
+    trainer._ensure_checkpoint_slots(("b",))
+
+    assert loaded == ["a", "b"]
+
+
+def test_concurrent_first_consumers_install_prefetched_slot_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trainer = TrainerRank(_runtime())
+    started = threading.Event()
+    release = threading.Event()
+    installed = 0
+    errors: list[BaseException] = []
+
+    def prepare() -> PreparedCheckpoint:
         started.set()
-        await release.wait()
+        assert release.wait(5)
+        return cast(PreparedCheckpoint, object())
+
+    def install(target: TrainerRank, _source: object, name: str) -> None:
+        nonlocal installed
+        installed += 1
+        target._checkpoint_slots[name] = _CheckpointSlot()
+
+    def consume() -> None:
+        try:
+            trainer._ensure_checkpoint_slots(("student",))
+        except BaseException as error:
+            errors.append(error)
+
+    trainer._register_checkpoint_prefetch("student", "student", prepare)
+    monkeypatch.setattr("art.trainer_rank._checkpoint.load_checkpoint", install)
+    first = threading.Thread(target=consume)
+    second = threading.Thread(target=consume)
+    first.start()
+    assert started.wait(5)
+    second.start()
+    release.set()
+    first.join()
+    second.join()
+
+    assert errors == []
+    assert installed == 1
+
+
+async def test_shared_checkpoint_prefetch_survives_waiter_cancellation() -> None:
+    trainer = TrainerRank(_runtime())
+    started = threading.Event()
+    release = threading.Event()
+    source = cast(PreparedCheckpoint, object())
+
+    def prepare() -> PreparedCheckpoint:
+        started.set()
+        release.wait()
         return source
 
-    monkeypatch.setattr(asyncio, "to_thread", delayed_to_thread)
-    first = asyncio.create_task(trainer._prefetch_checkpoint("student"))
-    second = asyncio.create_task(trainer._prefetch_checkpoint("student"))
-    await started.wait()
+    future = trainer._register_checkpoint_prefetch("student", "student", prepare)
+    first = asyncio.create_task(trainer._await_checkpoint_prefetch(future))
+    second = asyncio.create_task(trainer._await_checkpoint_prefetch(future))
+    await asyncio.to_thread(started.wait)
     first.cancel()
     with pytest.raises(asyncio.CancelledError):
         await first
@@ -750,27 +925,25 @@ async def test_shared_checkpoint_prefetch_survives_waiter_cancellation(
     assert cached.result() is source
 
 
-async def test_shared_checkpoint_prefetch_serves_successful_waiters(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+async def test_shared_checkpoint_prefetch_serves_successful_waiters() -> None:
     trainer = TrainerRank(_runtime())
-    started = asyncio.Event()
-    release = asyncio.Event()
-    source = object()
+    started = threading.Event()
+    release = threading.Event()
+    source = cast(PreparedCheckpoint, object())
     calls = 0
 
-    async def delayed_to_thread(_function: object, *_args: object) -> object:
+    def prepare() -> PreparedCheckpoint:
         nonlocal calls
         calls += 1
         started.set()
-        await release.wait()
+        release.wait()
         return source
 
-    monkeypatch.setattr(asyncio, "to_thread", delayed_to_thread)
-    first = asyncio.create_task(trainer._prefetch_checkpoint("student"))
-    second = asyncio.create_task(trainer._prefetch_checkpoint("student"))
-    await started.wait()
-    await asyncio.sleep(0)
+    first_future = trainer._register_checkpoint_prefetch("student", "shared", prepare)
+    second_future = trainer._register_checkpoint_prefetch("teacher", "shared", prepare)
+    first = asyncio.create_task(trainer._await_checkpoint_prefetch(first_future))
+    second = asyncio.create_task(trainer._await_checkpoint_prefetch(second_future))
+    await asyncio.to_thread(started.wait)
     release.set()
 
     assert await asyncio.gather(first, second) == [source, source]
@@ -805,14 +978,16 @@ async def test_materialized_sources_keep_logical_checkpoint_identities(
     logical_b = "wandb-artifact:///entity/project/run-teacher:step1"
     logical_c = "wandb-artifact:///entity/project/run-reference:step1"
 
-    await asyncio.gather(
-        trainer.load_checkpoint(MaterializedCheckpoint(logical_a, root_a)),
-        trainer.load_checkpoint(MaterializedCheckpoint(logical_b, root_a)),
+    await trainer.prefetch_checkpoints(
+        MaterializedCheckpoint(logical_a, root_a),
+        MaterializedCheckpoint(logical_b, root_a),
     )
+    trainer.load_checkpoint(MaterializedCheckpoint(logical_a, root_a))
+    trainer.load_checkpoint(MaterializedCheckpoint(logical_b, root_a))
     assert prepared == [trainer._checkpoint_source_key(root_a)]
 
     await trainer.prefetch_checkpoints(MaterializedCheckpoint(logical_c, root_b))
-    await trainer.load_checkpoint(MaterializedCheckpoint(logical_c, root_b))
+    trainer.load_checkpoint(MaterializedCheckpoint(logical_c, root_b))
     assert sorted(prepared) == sorted(
         (trainer._checkpoint_source_key(root_a), trainer._checkpoint_source_key(root_b))
     )
@@ -832,18 +1007,16 @@ async def test_materialized_sources_keep_logical_checkpoint_identities(
         assert trainer._resolve_slot_ref(request) == trainer._slot_ref(logical_path)
 
     refreshed_root = str(tmp_path / "immutable-new")
-    await trainer.load_checkpoint(MaterializedCheckpoint(logical_a, refreshed_root))
+    trainer.load_checkpoint(MaterializedCheckpoint(logical_a, refreshed_root))
     assert installed[-1][0] == logical_a
     assert prepared[-1] == trainer._checkpoint_source_key(refreshed_root)
 
     prepared_before_push = tuple(prepared)
-    pushed = trainer.push_checkpoint(
+    with trainer.push_checkpoint(
         MaterializedCheckpoint(logical_a, str(tmp_path / "unused-while-loaded"))
-    )
-    await pushed
-    assert tuple(prepared) == prepared_before_push
-    assert trainer._slot_stack == [trainer._slot_ref(logical_a)]
-    trainer.pop_checkpoint()
+    ):
+        assert tuple(prepared) == prepared_before_push
+        assert trainer._slot_stack == [trainer._slot_ref(logical_a)]
 
 
 async def test_prefetch_does_not_silently_ignore_empty_materialized_path(
@@ -852,29 +1025,22 @@ async def test_prefetch_does_not_silently_ignore_empty_materialized_path(
     trainer = TrainerRank(_runtime())
     seen: list[str] = []
 
-    async def prefetch(path: str) -> object:
+    def prepare(path: str) -> object:
         seen.append(path)
         return object()
 
-    monkeypatch.setattr(trainer, "_prefetch_checkpoint", prefetch)
+    monkeypatch.setattr("art.trainer_rank._checkpoint.prepare_checkpoint", prepare)
     await trainer.prefetch_checkpoints(MaterializedCheckpoint("logical", ""))
-    assert seen == [""]
+    assert seen == [trainer._checkpoint_source_key("")]
 
 
-async def test_checkpoint_mutations_follow_call_order_and_recover_from_failure(
+def test_checkpoint_mutations_are_synchronous_and_recover_from_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     trainer = TrainerRank(_runtime())
-    trainer._checkpoint_prefetches = {}
-    started = {name: asyncio.Event() for name in ("first", "second")}
-    ready = {name: asyncio.Event() for name in ("first", "second")}
     installed: list[str] = []
 
-    async def prefetch(path: str) -> object:
-        event = started.get(path)
-        if event is not None:
-            event.set()
-            await ready[path].wait()
+    def prepare(_path: str) -> object:
         return object()
 
     def install(trainer: TrainerRank, _source: object, path: str) -> None:
@@ -884,48 +1050,49 @@ async def test_checkpoint_mutations_follow_call_order_and_recover_from_failure(
         trainer._checkpoint_slots.setdefault(path, _CheckpointSlot()).params = ()
         trainer._checkpoint_slots[path].revision = 0
 
-    monkeypatch.setattr(trainer, "_prefetch_checkpoint", prefetch)
+    monkeypatch.setattr("art.trainer_rank._checkpoint.prepare_checkpoint", prepare)
     monkeypatch.setattr("art.trainer_rank._checkpoint.load_checkpoint", install)
-    first = trainer.load_checkpoint("first")
-    second = trainer.load_checkpoint("second")
-    await asyncio.gather(*(event.wait() for event in started.values()))
-    ready["second"].set()
-    await asyncio.sleep(0)
-    assert installed == []
-    ready["first"].set()
-    await asyncio.gather(first, second)
+    trainer.load_checkpoint("first")
+    trainer.load_checkpoint("second")
     assert installed == ["first", "second"]
 
-    bad = trainer.load_checkpoint("bad")
-    after = trainer.load_checkpoint("after")
     with pytest.raises(RuntimeError, match="injected load failure"):
-        await bad
-    await after
+        trainer.load_checkpoint("bad")
+    trainer.load_checkpoint("after")
     assert installed[-2:] == ["bad", "after"]
 
 
-@pytest.mark.parametrize("local_failure", [False, True])
-async def test_checkpoint_prefetch_failures_are_coordinated(
-    monkeypatch: pytest.MonkeyPatch, local_failure: bool
+def test_checkpoint_prefetch_failure_propagates_original_error(
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     trainer = TrainerRank(_runtime())
 
-    async def prefetch(_path: str) -> object:
-        if local_failure:
-            raise OSError("rank-local prefetch failed")
-        return object()
+    def prepare(_path: str) -> object:
+        raise OSError("rank-local prefetch failed")
+
+    monkeypatch.setattr("art.trainer_rank._checkpoint.prepare_checkpoint", prepare)
+    with pytest.raises(OSError, match="rank-local prefetch failed"):
+        trainer.load_checkpoint("student")
+
+
+def test_remote_checkpoint_prefetch_failures_are_coordinated(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trainer = TrainerRank(_runtime())
 
     def coordinated(
         error: BaseException | None, phase: str, _group: object | None = None
     ) -> None:
         assert phase == "prepare checkpoint"
-        assert isinstance(error, OSError) is local_failure
+        assert error is None
         raise RuntimeError("a rank failed to prepare checkpoint")
 
-    monkeypatch.setattr(trainer, "_prefetch_checkpoint", prefetch)
+    monkeypatch.setattr(
+        "art.trainer_rank._checkpoint.prepare_checkpoint", lambda _path: object()
+    )
     monkeypatch.setattr("art.trainer_rank._checkpoint.raise_distributed", coordinated)
     with pytest.raises(RuntimeError, match="a rank failed"):
-        await trainer.load_checkpoint("student")
+        trainer.load_checkpoint("student")
 
 
 def test_trainer_rank_rejects_adapter_keys_without_installed_lora_site() -> None:
@@ -1153,9 +1320,96 @@ def test_checkpoint_slot_snapshot_preserves_loaded_slot_refs(
     assert snapshot[0][3] == {"slot_0": ref}
 
 
+@pytest.mark.skipif(find_spec("megatron") is None, reason="requires Megatron")
+def test_forward_snapshot_is_independent_and_forward_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from art.megatron import lora as lora_module
+    from art.megatron.lora import LoRA, LoRASlotRef
+
+    monkeypatch.setattr(lora_module.ps, "get_expert_model_parallel_rank", lambda: 0)
+    lora = LoRA("layer", 3, 4, 2, 2, torch.float32, torch.device("cpu"))
+    trainer = TrainerRank(_runtime(lora))
+    source = LoRASlotRef("checkpoint", "student")
+    assert lora.load_lora_slot(
+        source,
+        {
+            "layer.lora_A.weight": torch.randn(2, 3),
+            "layer.lora_B.weight": torch.randn(4, 2),
+        },
+        alpha=2,
+        requires_grad=True,
+    )
+    trainer._checkpoint_slots["student"] = _CheckpointSlot(
+        tuple(lora.lora_slot_params(source)),
+        cast(
+            Any,
+            {
+                "base_model_name_or_path": "test/model",
+                "r": 2,
+                "lora_alpha": 2,
+                "target_modules": ["q_proj"],
+            },
+        ),
+    )
+
+    assert trainer.snapshot_checkpoint("student", "saved")
+    assert not trainer.snapshot_checkpoint("student", "saved")
+    saved = LoRASlotRef("checkpoint", "saved")
+    before = tuple(param.detach().clone() for param in lora.lora_slot_params(saved))
+    with torch.no_grad():
+        for param in lora.lora_slot_params(source):
+            param.add_(1)
+    assert all(
+        torch.equal(expected, actual)
+        for expected, actual in zip(before, lora.lora_slot_params(saved), strict=True)
+    )
+    assert all(not param.requires_grad for param in lora.lora_slot_params(saved))
+    request = ForwardInput(
+        input_tokens=torch.tensor([1]),
+        target_tokens=torch.tensor([1]),
+        checkpoint="saved",
+    )
+    assert trainer._resolve_slot_ref(request) == saved
+    with pytest.raises(TrainerRankSlotStateError, match="forward-only"):
+        trainer.optim_step(params=AdamParams(learning_rate=1e-3), checkpoints=["saved"])
+    with pytest.raises(TrainerRankSlotStateError, match="load over forward-only"):
+        trainer._guard_slot_can_load(saved)
+
+    trainer._discard_snapshot_checkpoint("saved")
+    assert "saved" not in trainer._checkpoint_slots
+    assert lora._slot(saved) is None
+
+
+def test_prepared_snapshot_loads_forward_only_without_replacing_slots(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trainer = TrainerRank(_runtime())
+    source = cast(Any, object())
+    calls: list[tuple[object, str, bool]] = []
+
+    def load(
+        target: TrainerRank,
+        prepared: object,
+        destination: str,
+        *,
+        forward_only: bool = False,
+    ) -> None:
+        calls.append((prepared, destination, forward_only))
+        target._checkpoint_slots[destination] = _CheckpointSlot(snapshot=forward_only)
+
+    monkeypatch.setattr("art.trainer_rank._checkpoint.load_checkpoint", load)
+    assert snapshot_prepared_checkpoint(trainer, source, "saved")
+    assert calls == [(source, "saved", True)]
+    assert not snapshot_prepared_checkpoint(trainer, source, "saved")
+    trainer._checkpoint_slots["loaded"] = _CheckpointSlot()
+    with pytest.raises(TrainerRankSlotStateError, match="already loaded"):
+        snapshot_prepared_checkpoint(trainer, source, "loaded")
+
+
 def test_checkpoint_export_requires_retained_adapter_config() -> None:
     trainer = TrainerRank(_runtime())
-    with pytest.raises(ValueError, match="Unknown checkpoint"):
+    with pytest.raises(TrainerRankSlotStateError, match="unloaded checkpoint"):
         trainer.export_lora("/unused", "missing")
 
     trainer._checkpoint_slots.setdefault("student", _CheckpointSlot()).params = ()
@@ -1296,6 +1550,15 @@ def test_weights_only_checkpoint_validation_is_canonical(tmp_path: Path) -> None
     assert validate_checkpoint(root) == manifest
     with pytest.raises(RuntimeError, match="does not contain optimizer state"):
         validate_checkpoint(root, require_optimizer=True)
+
+
+def test_materialize_checkpoint_preserves_validated_state(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    manifest = _canonical_checkpoint(source)
+    output = tmp_path / "output"
+
+    assert materialize_checkpoint(source, output) == manifest["digest"]
+    assert validate_checkpoint(output) == manifest
 
 
 def test_weights_only_load_replaces_stale_optimizer_and_recreates_it_lazily(
@@ -2585,15 +2848,20 @@ def test_optim_step_live_graph_error_is_collective(tmp_path: Path) -> None:
 
 def test_dp_rank_forward_preserves_nested_shape_for_inactive_requests() -> None:
     trainer = TrainerRank(_runtime())
+    trainer._default_slot_ref = _slot_ref("teacher")
     request_a = ForwardInput(input_tokens=torch.tensor([1]))
     request_b = ForwardInput(input_tokens=torch.tensor([2]))
 
-    outputs = trainer.dp_rank_forward([[request_a], [request_b]])
+    outputs = trainer.dp_rank_forward([[request_a], [request_b]], no_grad=True)
 
     assert len(outputs) == 2
     assert len(outputs[0]) == 1
     assert outputs[0][0].target_logprobs is None
     assert outputs[1][0].target_logprobs is None
+    assert outputs[0][0].checkpoint == "teacher"
+    assert outputs[1][0].checkpoint == "teacher"
+    assert outputs[0][0].no_grad
+    assert outputs[1][0].no_grad
     assert not hasattr(trainer, "forward")
     assert not hasattr(trainer, "micro_batches")
 

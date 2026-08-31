@@ -639,6 +639,36 @@ class LoRA(torch.nn.Module):
         )
         return True
 
+    def _snapshot_lora_slot(
+        self, source: LoRASlotRef, destination: LoRASlotRef
+    ) -> bool:
+        slot = self._slot(source)
+        if slot is None:
+            return False
+        if destination in self._slot_keys:
+            raise RuntimeError(
+                f"LoRA slot {destination.kind}:{destination.name} already exists"
+            )
+        index = len(self._slot_keys)
+        while (key := f"slot_{index}") in self._slot_modules:
+            index += 1
+        self._slot_keys[destination] = key
+        self._slot_modules[key] = LoRASlot(
+            ref=destination,
+            a_t=slot.A_T,
+            b_t=slot.B_T,
+            alpha=slot.alpha,
+            a_template=slot.A_T,
+            b_template=slot.B_T,
+            requires_grad=False,
+        )
+        return True
+
+    def _discard_lora_slot(self, ref: LoRASlotRef) -> None:
+        key = self._slot_keys.pop(ref, None)
+        if key is not None:
+            del self._slot_modules[key]
+
     def lora_slot_params(self, ref: LoRASlotRef) -> list[torch.nn.Parameter]:
         slot = self._slot(ref)
         if slot is None:

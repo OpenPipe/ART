@@ -5,6 +5,7 @@ from contextlib import contextmanager
 import os
 from pathlib import Path
 import socket
+import threading
 from types import SimpleNamespace
 from typing import cast
 
@@ -609,7 +610,9 @@ def _trainer_for(lora: LoRA, device: torch.device) -> TrainerRank:
         for name in ("A", "B")
     }
     trainer._checkpoint_prefetches = {}
-    trainer._checkpoint_mutation_tail = None
+    trainer._checkpoint_prefetch_sources = {}
+    trainer._checkpoint_prefetch_lock = threading.Lock()
+    trainer._checkpoint_mutation_lock = threading.RLock()
     return trainer
 
 
