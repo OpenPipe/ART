@@ -23,6 +23,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--prompt-tokens", type=int, default=3838)
     parser.add_argument("--completion-tokens", type=int, default=64)
     parser.add_argument("--bad-word", action="append", default=[])
+    parser.add_argument("--forbid-token-id", action="append", type=int, default=[])
     return parser.parse_args()
 
 
@@ -38,6 +39,10 @@ async def _run(args: argparse.Namespace) -> None:
     }
     if args.bad_word:
         extra_body["bad_words"] = args.bad_word
+    if args.forbid_token_id:
+        extra_body["logit_bias"] = {
+            str(token_id): -100.0 for token_id in args.forbid_token_id
+        }
 
     client = AsyncOpenAI(base_url=args.base_url, api_key=token)
     try:
@@ -59,6 +64,7 @@ async def _run(args: argparse.Namespace) -> None:
                 {
                     "scenario_id": args.scenario_id,
                     "bad_words": args.bad_word,
+                    "forbidden_token_ids": args.forbid_token_id,
                     "error_type": type(error).__name__,
                     "error": str(error),
                 },
@@ -74,6 +80,7 @@ async def _run(args: argparse.Namespace) -> None:
             {
                 "scenario_id": args.scenario_id,
                 "bad_words": args.bad_word,
+                "forbidden_token_ids": args.forbid_token_id,
                 "choice_count": len(response.choices),
                 "completion_tokens": response.usage.completion_tokens
                 if response.usage is not None
