@@ -112,6 +112,7 @@ class _MegatronPipelineCommandContext:
         model: TrainableModel,
         groups: tuple[TrajectoryGroup, ...],
         *,
+        prepared: _PipelinePreparedBatch,
         service: Any,
         batch: _PackedTrainingBatch,
         forward: Any,
@@ -124,6 +125,7 @@ class _MegatronPipelineCommandContext:
         self._backend = backend
         self._model = model
         self._groups = groups
+        self._prepared = prepared
         self._service = service
         self._batch: _PackedTrainingBatch | None = batch
         self._forward = forward
@@ -1206,6 +1208,7 @@ class MegatronBackend(LocalBackend):
             self,
             model,
             tuple(trajectory_groups),
+            prepared=prepared,
             service=service,
             batch=batch,
             forward=forward,

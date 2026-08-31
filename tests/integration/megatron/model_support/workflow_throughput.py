@@ -1984,7 +1984,9 @@ async def _run_e2e_throughput_async(
                 asyncio.Task[tuple[tuple[Any, ...], str, str, dict[str, int]]],
             ] = {}
             original_train = backend.train
+            original_prepare_pipeline_commands = backend.prepare_pipeline_commands
             original_finish_training_batch = backend._finish_training_batch
+            command_count = 0
             train_call_count = 0
 
             async def finish_training_batch(batch: Any, *, failed: bool) -> None:
@@ -2004,43 +2006,11 @@ async def _run_e2e_throughput_async(
                         "throughput input capture or batch release failed", failures
                     )
 
-            async def tracked_train(*args: Any, **kwargs: Any) -> Any:
+            async def record_train_result(
+                result: Any, captured_batch_id: int | None
+            ) -> None:
                 nonlocal train_call_count
                 train_call_count += 1
-                if len(args) < 2:
-                    raise RuntimeError(
-                        "PipelineTrainer did not pass trajectory groups positionally"
-                    )
-                groups = args[1]
-                captured_batch_id = None
-                if train_call_count in capture_train_calls:
-                    try:
-                        _collect_matched_packing_shapes(groups)
-                        prepared = _prepared_pipeline_batch(groups)
-                        selections = tuple(
-                            getattr(prepared.batch.payload, "selections", ())
-                        )
-                        if len(selections) != len(groups):
-                            raise RuntimeError(
-                                "prepared throughput batch lacks exact queue selections"
-                            )
-                        captured_batch_id = id(prepared.batch)
-                        capture_tasks[captured_batch_id] = asyncio.create_task(
-                            _capture_training_input(
-                                prepared,
-                                selections,
-                                _current_pipeline_settings(trainer),
-                            )
-                        )
-                    except BaseException:
-                        await _discard_prepared_pipeline_batch(backend, groups)
-                        raise
-                try:
-                    result = await original_train(*args, **kwargs)
-                except BaseException:
-                    if captured_batch_id is not None:
-                        capture_tasks.pop(captured_batch_id, None)
-                    raise
                 step = int(result.step)
                 if step in activation_tasks:
                     raise RuntimeError(
@@ -2049,25 +2019,100 @@ async def _run_e2e_throughput_async(
                 activation_tasks[step] = asyncio.create_task(
                     _activation_event(service, step)
                 )
-                if captured_batch_id is not None:
-                    capture_task = capture_tasks.get(captured_batch_id)
-                    if capture_task is None:
-                        raise RuntimeError("trainer did not release captured sources")
-                    bundles, trajectory, packed, settings = await capture_task
-                    capture_tasks.pop(captured_batch_id)
-                    captured_training_inputs.append(
-                        CapturedTrainingInput(
-                            bundles,
-                            trajectory,
-                            packed,
-                            settings,
-                            result.metrics,
-                            step,
-                        )
+                if captured_batch_id is None:
+                    return
+                capture_task = capture_tasks.get(captured_batch_id)
+                if capture_task is None:
+                    raise RuntimeError("trainer did not release captured sources")
+                bundles, trajectory, packed, settings = await capture_task
+                capture_tasks.pop(captured_batch_id)
+                captured_training_inputs.append(
+                    CapturedTrainingInput(
+                        bundles,
+                        trajectory,
+                        packed,
+                        settings,
+                        result.metrics,
+                        step,
                     )
-                return result
+                )
 
-            setattr(backend, "train", tracked_train)
+            async def start_capture(groups: Any, prepared: Any) -> int:
+                selections = tuple(getattr(prepared.batch.payload, "selections", ()))
+                if len(selections) != len(groups):
+                    raise RuntimeError(
+                        "prepared throughput batch lacks exact queue selections"
+                    )
+                captured_batch_id = id(prepared.batch)
+                capture_tasks[captured_batch_id] = asyncio.create_task(
+                    _capture_training_input(
+                        prepared,
+                        selections,
+                        _current_pipeline_settings(trainer),
+                    )
+                )
+                return captured_batch_id
+
+            async def tracked_prepare_pipeline_commands(
+                *args: Any, **kwargs: Any
+            ) -> Any:
+                nonlocal command_count
+                command_count += 1
+                command = command_count
+                if len(args) < 2:
+                    raise RuntimeError(
+                        "PipelineTrainer did not pass trajectory groups positionally"
+                    )
+                groups = args[1]
+                if command in capture_train_calls:
+                    _collect_matched_packing_shapes(groups)
+                context = await original_prepare_pipeline_commands(*args, **kwargs)
+                if context is None:
+                    command_count -= 1
+                    return None
+                captured_batch_id = None
+                if command in capture_train_calls:
+                    try:
+                        prepared = getattr(context, "_prepared", None)
+                        if prepared is None:
+                            raise RuntimeError(
+                                "split command lost its exact prepared capture"
+                            )
+                        captured_batch_id = await start_capture(groups, prepared)
+                    except BaseException as capture_error:
+                        try:
+                            await context.abort()
+                        except BaseException as abort_error:
+                            raise BaseExceptionGroup(
+                                "capture setup and split command abort failed",
+                                [capture_error, abort_error],
+                            ) from None
+                        raise
+                original_complete = context.complete
+
+                async def tracked_complete(
+                    next_train_dispatched: asyncio.Event | None,
+                    next_batch_handoff: asyncio.Event | None,
+                ) -> Any:
+                    try:
+                        result = await original_complete(
+                            next_train_dispatched, next_batch_handoff
+                        )
+                    except BaseException:
+                        if captured_batch_id is not None:
+                            capture_tasks.pop(captured_batch_id, None)
+                        raise
+                    await record_train_result(result, captured_batch_id)
+                    return result
+
+                setattr(context, "complete", tracked_complete)
+                return context
+
+            setattr(
+                backend,
+                "prepare_pipeline_commands",
+                tracked_prepare_pipeline_commands,
+            )
             setattr(backend, "_finish_training_batch", finish_training_batch)
             try:
                 measurement_start = (
@@ -2085,7 +2130,11 @@ async def _run_e2e_throughput_async(
                     key=lambda event: event.step,
                 )
             finally:
-                setattr(backend, "train", original_train)
+                setattr(
+                    backend,
+                    "prepare_pipeline_commands",
+                    original_prepare_pipeline_commands,
+                )
                 setattr(
                     backend,
                     "_finish_training_batch",
