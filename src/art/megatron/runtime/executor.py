@@ -254,6 +254,8 @@ class MegatronTrainJobExecutor:
         job: ForwardBackwardJobSpec,
         batch: InMemoryPackedBatch,
         cancelled: Event,
+        *,
+        preserve_gradient_image: bool = True,
     ) -> dict[str, Any]:
         if self._closed:
             raise RuntimeError("Megatron executor is closed")
@@ -286,7 +288,8 @@ class MegatronTrainJobExecutor:
             gradient_accumulator=gradients,
             cancelled=cancelled,
         )
-        gradients.stash_resident()
+        if preserve_gradient_image:
+            gradients.stash_resident()
         self._enforce_accumulator_budget()
         self._gradient_parent_versions[job.run_id] = job.expected_learner_version
         return {

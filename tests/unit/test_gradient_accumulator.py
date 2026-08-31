@@ -56,6 +56,7 @@ def test_accumulator_flushes_direct_parameter_gradients() -> None:
     accumulator.seal(("fb",))
 
     prepared = accumulator.prepare_optimizer()
+    assert prepared.gradients[0] is chunk.weight.main_grad
     torch.testing.assert_close(prepared.gradients[0], torch.tensor([2.0, 4.0]))
     assert chunk.weight.grad is None
 

@@ -1089,8 +1089,13 @@ class MonarchTrainerActor(Actor):
                 else job.model_copy(update={"return_token_logprobs": False})
             )
             if resident_executor:
+                # The service train lock admits this run's optimizer next, so the
+                # live gradient image cannot be overwritten by another command.
                 result = self._executor.execute_forward_backward(
-                    execute_job, batch, Event()
+                    execute_job,
+                    batch,
+                    Event(),
+                    preserve_gradient_image=False,
                 )
                 ready_port.send(
                     _CommandReady(

@@ -138,6 +138,17 @@ class GradientAccumulator:
     def prepare_local_sums(self) -> AccumulatedGradientSums:
         if self._sealed is None:
             raise RuntimeError("gradient accumulator must be sealed before optimizer")
+        if self._saved_gradients is None and self._resident_tokens is not None:
+            if self._flush_gradients is not None:
+                self._flush_gradients(self.model_chunks)
+            gradients = self._main_gradients()
+            assert self._reduction is not None
+            return AccumulatedGradientSums(
+                gradients=gradients,
+                local_token_count=self._resident_tokens,
+                expected_global_token_count=self._expected_global_tokens,
+                reduction=self._reduction,
+            )
         self.stash_resident()
         if self._saved_gradients is None or self._saved_tokens is None:
             raise RuntimeError("gradient accumulator has no resident contributions")
