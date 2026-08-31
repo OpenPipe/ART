@@ -2959,7 +2959,11 @@ def _history_has_length_stop(history: History) -> bool:
 def _history_needs_synthetic_stop(
     history: History, tokenizer: Tokenizer | None
 ) -> bool:
-    if tokenizer is None or not _terminator_ids(tokenizer):
+    if (
+        tokenizer is None
+        or not callable(getattr(tokenizer, "apply_chat_template", None))
+        or not _terminator_ids(tokenizer)
+    ):
         return False
     sources: Sequence[object]
     if isinstance(history, (ChatCompletionsHistory, AnthropicMessagesHistory)):
@@ -5742,7 +5746,10 @@ def _tokenize_history(
         if _projection_validated
         else _history_render_state(history)
     )
-    has_length_stop = _history_has_length_stop(history)
+    can_render = tokenizer is None or callable(
+        getattr(tokenizer, "apply_chat_template", None)
+    )
+    has_length_stop = can_render and _history_has_length_stop(history)
     needs_synthetic_stop = _history_needs_synthetic_stop(history, tokenizer)
     needs_render = (
         render_state.needs_render
