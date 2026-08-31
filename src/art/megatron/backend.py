@@ -185,6 +185,20 @@ class _MegatronPipelineCommandContext:
                 trajectory_groups=self._groups,
                 trainer_started=self._started,
             )
+            batch = cast(_PackedTrainingBatch, self._prepared.batch)
+            metrics.update(
+                {
+                    "data/step_trainable_assistant_tokens": float(
+                        batch.trainable_assistant_tokens
+                    ),
+                    "data/step_packed_sequences": float(batch.num_sequences),
+                    "prefix_tree/logical_tokens": float(batch.logical_tokens),
+                    "prefix_tree/physical_tokens": float(batch.physical_tokens),
+                    "prefix_tree/compression_ratio": (
+                        batch.logical_tokens / batch.physical_tokens
+                    ),
+                }
+            )
             step = optimizer.step
             final_step = self._config.final_training_step
             if final_step is not None and step >= final_step:
