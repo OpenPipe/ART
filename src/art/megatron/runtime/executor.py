@@ -395,19 +395,21 @@ class MegatronTrainJobExecutor:
         runtime.optimizer_state_loaded = True
         self._gradients.pop(job.run_id)
         self._gradient_parent_versions.pop(job.run_id)
+        metrics = {
+            "loss/learning_rate": job.optimizer.learning_rate,
+            "loss/grad_norm": float(result.grad_norm),
+            "optimizer/update_successful": 1.0,
+            "optimizer/num_zeros_in_grad": float(result.num_zeros_in_grad or 0),
+            "time/optimizer_step_s": time.perf_counter() - started,
+        }
+        metrics.update(self._stabilize_python_gc())
         runtime.inter_forward_backward_timing.previous_job_complete_s = time.monotonic()
         return {
             "operation_id": job.operation_id,
             "learner_version": job.learner_version,
             "contributing_forward_backward_operation_ids": consumed,
             "gpu_service_ns": gpu_service_ns,
-            "metrics": {
-                "loss/learning_rate": job.optimizer.learning_rate,
-                "loss/grad_norm": float(result.grad_norm),
-                "optimizer/update_successful": 1.0,
-                "optimizer/num_zeros_in_grad": float(result.num_zeros_in_grad or 0),
-                "time/optimizer_step_s": time.perf_counter() - started,
-            },
+            "metrics": metrics,
         }
 
     def publish_split_generation(
