@@ -13,7 +13,6 @@ from art.distributed.rollout import (
     DistributedTrajectoryQueue,
     _InProcessTrajectoryQueueEndpoint,
 )
-from art.megatron.backend import _MegatronPipelineCommandContext
 from art.pipeline_trainer.trainer import PipelineTrainer, _PreparedPipelineItem
 from art.pipeline_tuner.config import PipelineTuneSettings
 
@@ -224,34 +223,6 @@ async def test_command_preparation_is_bounded_to_one_ready_batch(
     second.handoff.set()
     assert await asyncio.wait_for(trainer._packed_queue.get(), timeout=2.0) is None
     await asyncio.wait_for(packing, timeout=2.0)
-
-
-@pytest.mark.asyncio
-async def test_prepared_command_waits_for_consumer_admission() -> None:
-    started = asyncio.Event()
-    executed = asyncio.Event()
-
-    async def train(*_args: object, **kwargs: Any) -> SimpleNamespace:
-        gate = kwargs.pop("_pipeline_train_execution_gate")
-        started.set()
-        assert await gate
-        executed.set()
-        return SimpleNamespace(step=1)
-
-    context = _MegatronPipelineCommandContext(
-        SimpleNamespace(train=train),
-        MagicMock(),
-        (_group(),),
-        learner_parent_version=0,
-        train_kwargs={},
-        preparation_metrics={},
-    )
-    await asyncio.wait_for(started.wait(), timeout=2.0)
-    assert not executed.is_set()
-
-    result = await asyncio.wait_for(context.complete(None), timeout=2.0)
-    assert result.step == 1
-    assert executed.is_set()
 
 
 @pytest.mark.asyncio

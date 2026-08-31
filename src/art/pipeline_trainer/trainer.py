@@ -1363,14 +1363,14 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                 else self.state.discarded_zero_variance_groups - zero_variance_before
             )
             dequeued_groups = len(batch) + discarded + zero_variance_discarded
-            if self._packed_queue is not None and any(
-                self._is_group_stale(group, current_step) for group in batch
+            # A command context has already been admitted against its exact lineage.
+            if (
+                command_context is None
+                and self._packed_queue is not None
+                and any(self._is_group_stale(group, current_step) for group in batch)
             ):
-                if command_context is None:
-                    discard = getattr(self.backend, "discard_pipeline_batch")
-                    await discard(batch)
-                else:
-                    await command_context.abort()
+                discard = getattr(self.backend, "discard_pipeline_batch")
+                await discard(batch)
                 if post_train_dispatch is not None:
                     post_train_dispatch.set()
                 try:

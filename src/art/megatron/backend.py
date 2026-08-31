@@ -30,9 +30,6 @@ _CONTEXT_PARALLEL_MIN_PREFIX_TREE_SHARED_SEGMENT_LENGTH = 256
 _PIPELINE_TRAIN_DISPATCH: ContextVar[asyncio.Event | None] = ContextVar(
     "megatron_pipeline_train_dispatch", default=None
 )
-_PIPELINE_TRAIN_EXECUTION_GATE: ContextVar[asyncio.Future[bool] | None] = ContextVar(
-    "megatron_pipeline_train_execution_gate", default=None
-)
 _PIPELINE_TRAIN_STEP: ContextVar[int | None] = ContextVar(
     "megatron_pipeline_train_step", default=None
 )
@@ -124,7 +121,6 @@ class _MegatronPipelineCommandContext:
         self._groups = groups
         self._learner_parent_version = learner_parent_version
         self._train_kwargs = train_kwargs
-        self._execution_allowed = asyncio.get_running_loop().create_future()
         self._dispatched = asyncio.Event()
         self._claimed = False
         self._task = asyncio.create_task(
@@ -137,7 +133,6 @@ class _MegatronPipelineCommandContext:
         result = await self._backend.train(
             self._model,
             self._groups,
-            _pipeline_train_execution_gate=self._execution_allowed,
             _pipeline_train_dispatch_event=self._dispatched,
             **self._train_kwargs,
         )
@@ -155,7 +150,6 @@ class _MegatronPipelineCommandContext:
         if self._claimed:
             raise RuntimeError("pipeline train context was consumed twice")
         self._claimed = True
-        self._execution_allowed.set_result(True)
 
         relay: asyncio.Task[None] | None = None
         if next_train_dispatched is not None:
@@ -190,7 +184,7 @@ class _MegatronPipelineCommandContext:
             if error is None:
                 raise RuntimeError("cannot discard a completed pipeline train")
         elif not self._task.done():
-            self._execution_allowed.set_result(False)
+            self._task.cancel()
             await asyncio.gather(self._task, return_exceptions=True)
         await self._discard_unconsumed()
 
@@ -389,11 +383,6 @@ class MegatronBackend(LocalBackend):
         dispatch_event = kwargs.pop("_pipeline_train_dispatch_event", None)
         if dispatch_event is not None and not isinstance(dispatch_event, asyncio.Event):
             raise TypeError("pipeline train dispatch fence must be an asyncio.Event")
-        execution_gate = kwargs.pop("_pipeline_train_execution_gate", None)
-        if execution_gate is not None and not isinstance(
-            execution_gate, asyncio.Future
-        ):
-            raise TypeError("pipeline train execution gate must be an asyncio.Future")
         groups = list(trajectory_groups)
         pipeline_call = bool(
             groups
@@ -403,14 +392,11 @@ class MegatronBackend(LocalBackend):
 
         if dispatch_event is not None and dispatch_event.is_set():
             raise RuntimeError("pipeline train dispatch fence is already set")
-        dispatch_token = _PIPELINE_TRAIN_DISPATCH.set(dispatch_event)
-        execution_token = _PIPELINE_TRAIN_EXECUTION_GATE.set(execution_gate)
+        token = _PIPELINE_TRAIN_DISPATCH.set(dispatch_event)
         step_token = _PIPELINE_TRAIN_STEP.set(None)
         try:
-            if (dispatch_event is not None or execution_gate is not None) and not (
-                pipeline_call
-            ):
-                raise RuntimeError("trainer dispatch controls require a prepared batch")
+            if dispatch_event is not None and not pipeline_call:
+                raise RuntimeError("trainer dispatch fencing requires a prepared batch")
             result = await super().train(
                 model,
                 groups,
@@ -421,8 +407,7 @@ class MegatronBackend(LocalBackend):
             )
         finally:
             _PIPELINE_TRAIN_STEP.reset(step_token)
-            _PIPELINE_TRAIN_EXECUTION_GATE.reset(execution_token)
-            _PIPELINE_TRAIN_DISPATCH.reset(dispatch_token)
+            _PIPELINE_TRAIN_DISPATCH.reset(token)
         service = cast(DistributedMegatronService, await self._get_service(model))
         final_step = kwargs.get("final_training_step")
         if final_step is not None and result.step >= final_step:
@@ -1223,7 +1208,6 @@ class MegatronBackend(LocalBackend):
             config,
             service_dev_config,
             dispatch_event=_PIPELINE_TRAIN_DISPATCH.get(),
-            execution_gate=_PIPELINE_TRAIN_EXECUTION_GATE.get(),
         ):
             committed_step = result.pop(_COMMITTED_LEARNER_STEP_METRIC, None)
             if committed_step is not None:
