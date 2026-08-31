@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 
 from art.megatron.model_support.discovery import inspect_architecture
+from art.megatron.model_support.spec import ArchitectureReport
 from tests.integration.megatron.model_support import workflow, workflow_throughput
 from tests.integration.megatron.model_support.workflow_fixtures import FIXTURE_PATH_ENV
 
@@ -18,6 +19,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--base-model", required=True)
     parser.add_argument("--artifact-root", type=Path, required=True)
     parser.add_argument("--fixture-path", type=Path)
+    parser.add_argument("--architecture-json", type=Path)
     parser.add_argument("--max-attempts", type=int, default=1)
     return parser.parse_args()
 
@@ -38,13 +40,20 @@ def main() -> None:
         os.environ[FIXTURE_PATH_ENV] = str(fixture_path)
         architecture_source = str(fixture_path)
 
+    architecture = (
+        ArchitectureReport.model_validate_json(
+            args.architecture_json.resolve(strict=True).read_text()
+        )
+        if args.architecture_json is not None
+        else inspect_architecture(
+            architecture_source,
+            allow_unvalidated_arch=True,
+        )
+    )
     workflow_throughput._THROUGHPUT_MAX_ATTEMPTS = args.max_attempts
     result = workflow.run_e2e_throughput_stage(
         base_model=args.base_model,
-        architecture=inspect_architecture(
-            architecture_source,
-            allow_unvalidated_arch=True,
-        ),
+        architecture=architecture,
         allow_unvalidated_arch=True,
     )
     (args.artifact_root / "result.json").write_text(
