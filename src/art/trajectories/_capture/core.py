@@ -3,7 +3,7 @@ from __future__ import annotations
 import contextvars
 from copy import deepcopy
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import UTC, datetime
 import json
 import logging
 from typing import Any, assert_never
@@ -66,7 +66,7 @@ class CaptureState:
     trajectory: Trajectory
     endpoint: Endpoint
     request: dict[str, Any]
-    start_time: datetime = field(default_factory=datetime.now)
+    start_time: datetime = field(default_factory=lambda: datetime.now(UTC))
     status_code: int | None = None
     body: bytearray = field(default_factory=bytearray)
     captured: bool = False
@@ -112,7 +112,7 @@ class CaptureState:
                 self.request,
                 bytes(self.body),
                 start_time=self.start_time,
-                end_time=datetime.now(),
+                end_time=datetime.now(UTC),
             )
         except Exception as exc:
             logger.debug("Ignoring incomplete trajectory exchange: %s", exc)

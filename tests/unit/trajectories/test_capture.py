@@ -9,7 +9,7 @@ from collections.abc import (
     Iterable,
 )
 import copy
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
 import gzip
 import json
 from typing import Any, cast
@@ -55,6 +55,39 @@ def test_root_trajectory_exports_are_minimal() -> None:
     assert all(
         not hasattr(art, name) for name in set(art.trajectories.__all__) - expected
     )
+
+
+def test_trajectory_timestamps_normalize_to_utc() -> None:
+    naive = datetime(2026, 1, 2, 3, 4, 5)
+    offset = timezone(timedelta(hours=-7))
+    exchange = cast(
+        ChatCompletionsExchange,
+        build_exchange(
+            "chat_completions",
+            {"model": "test/model", "messages": []},
+            json.dumps(CHAT).encode(),
+            start_time=naive,
+            end_time=naive.replace(tzinfo=offset),
+        ),
+    )
+    trajectory = art.Trajectory(start_time=naive)
+
+    assert exchange.start_time == naive.replace(tzinfo=UTC)
+    assert exchange.end_time == naive.replace(tzinfo=offset).astimezone(UTC)
+    assert trajectory.start_time == naive.replace(tzinfo=UTC)
+    exchange.start_time = naive
+    trajectory.start_time = naive
+    assert exchange.start_time.tzinfo is UTC
+    assert trajectory.start_time.tzinfo is UTC
+    restored_exchange = type(exchange).model_validate_json(exchange.model_dump_json())
+    assert restored_exchange.start_time.tzinfo is UTC
+    trajectory.exchanges.chat_completions.append(exchange)
+    restored = art.trajectories.compact_validate(
+        trajectory.compact_dump(), type=art.Trajectory
+    )
+    assert restored.exchanges.chat_completions[0].start_time.tzinfo is UTC
+    trajectory.finish()
+    assert trajectory.metrics["duration"] >= 0
 
 
 CHAT: dict[str, Any] = {

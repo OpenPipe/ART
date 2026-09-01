@@ -9,7 +9,7 @@ from collections.abc import (
     Mapping,
 )
 from contextlib import AbstractContextManager, asynccontextmanager
-from datetime import datetime
+from datetime import UTC, datetime
 from enum import IntFlag
 import time
 from types import TracebackType
@@ -84,6 +84,13 @@ from ._serialization import (
 from ._serialization import (
     _intern_strings as _intern_string_graph,
 )
+
+
+def _utc(value: datetime) -> datetime:
+    return value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
+
+
+_UtcDateTime = Annotated[datetime, pydantic.AfterValidator(_utc)]
 
 # Deliberately open: Pydantic enforces serializability when callers dump in JSON mode.
 MetadataValue = Any
@@ -226,11 +233,16 @@ class MessagesRequest(TypedDict, total=False, extra_items=Any):
     chat_template_kwargs: dict[str, Any]
 
 
-class ChatCompletionsExchange(pydantic.BaseModel):
+class _Exchange(pydantic.BaseModel):
+    model_config = pydantic.ConfigDict(validate_assignment=True)
+
+    start_time: _UtcDateTime
+    end_time: _UtcDateTime
+
+
+class ChatCompletionsExchange(_Exchange):
     request: _Preserved[ChatCompletionsRequest]
     response: ChatCompletion
-    start_time: datetime
-    end_time: datetime
 
     @pydantic.field_serializer("response", when_used="json")
     def serialize_response(self, response: ChatCompletion) -> dict[str, Any]:
@@ -243,11 +255,9 @@ class ChatCompletionsExchange(pydantic.BaseModel):
         return requested if isinstance(requested, str) else self.response.model
 
 
-class CompletionsExchange(pydantic.BaseModel):
+class CompletionsExchange(_Exchange):
     request: _Preserved[CompletionsRequest]
     response: Completion
-    start_time: datetime
-    end_time: datetime
 
     @pydantic.computed_field
     @property
@@ -256,11 +266,9 @@ class CompletionsExchange(pydantic.BaseModel):
         return requested if isinstance(requested, str) else self.response.model
 
 
-class ResponsesExchange(pydantic.BaseModel):
+class ResponsesExchange(_Exchange):
     request: _Preserved[ResponsesRequest]
     response: Response
-    start_time: datetime
-    end_time: datetime
 
     @pydantic.computed_field
     @property
@@ -269,11 +277,9 @@ class ResponsesExchange(pydantic.BaseModel):
         return requested if isinstance(requested, str) else self.response.model
 
 
-class MessagesExchange(pydantic.BaseModel):
+class MessagesExchange(_Exchange):
     request: _Preserved[MessagesRequest]
     response: AnthropicMessage
-    start_time: datetime
-    end_time: datetime
 
     @pydantic.computed_field
     @property
@@ -526,6 +532,8 @@ TrajectoryHistory: TypeAlias = (
 
 
 class Trajectory(_CompactModel):
+    model_config = pydantic.ConfigDict(validate_assignment=True)
+
     exchanges: TrajectoryExchanges = pydantic.Field(default_factory=TrajectoryExchanges)
     messages_and_choices: MessagesAndChoices = pydantic.Field(
         default_factory=list,
@@ -541,7 +549,9 @@ class Trajectory(_CompactModel):
     metrics: dict[str, float | int | bool] = pydantic.Field(default_factory=dict)
     metadata: dict[str, MetadataValue] = pydantic.Field(default_factory=dict)
     logs: list[str] = pydantic.Field(default_factory=list)
-    start_time: datetime = pydantic.Field(default_factory=datetime.now, exclude=True)
+    start_time: _UtcDateTime = pydantic.Field(
+        default_factory=lambda: datetime.now(UTC), exclude=True
+    )
     _policy_token_counts: dict[int, int] | None = pydantic.PrivateAttr(default=None)
 
     @pydantic.field_serializer("messages_and_choices", when_used="json")
@@ -586,7 +596,7 @@ class Trajectory(_CompactModel):
         self.logs.append(message)
 
     def finish(self) -> Trajectory:
-        self.metrics["duration"] = (datetime.now() - self.start_time).total_seconds()
+        self.metrics["duration"] = (datetime.now(UTC) - self.start_time).total_seconds()
         return self
 
     @asynccontextmanager

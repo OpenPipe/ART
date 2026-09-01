@@ -9,6 +9,7 @@ Tests cover:
 5. Golden file regression tests
 """
 
+from datetime import UTC
 import json
 import os
 from pathlib import Path
@@ -283,6 +284,7 @@ def test_legacy_serializer_round_trips_complete_exchange_group() -> None:
     assert loaded.model_dump(
         mode="json", exclude_defaults=False
     ) == original.model_dump(mode="json", exclude_defaults=False)
+    assert loaded.trajectories[0].exchanges.chat_completions[0].start_time.tzinfo is UTC
 
 
 def test_legacy_serializer_round_trips_complete_legacy_trajectory() -> None:
