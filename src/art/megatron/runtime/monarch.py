@@ -2067,7 +2067,7 @@ class MonarchTrainerRun:
                             run_spec.initial_portable_snapshot.archive_sha256
                         ),
                         runtime_fingerprint=self.runtime_spec.fingerprint,
-                        restore_optimizer=True,
+                        restore_optimizer=run_spec.initial_restore_optimizer,
                         ranks=reads,
                     )
                     portable_install.validate_archive(

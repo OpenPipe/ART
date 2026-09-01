@@ -695,7 +695,7 @@ class MegatronSlotCoordinator:
             tuple[str, str], MegatronOperationResidencySummary
         ] = {}
         self._registering_runs: dict[
-            str, tuple[MegatronOperationConfig, str | None, str | None]
+            str, tuple[MegatronOperationConfig, str | None, str | None, bool]
         ] = {}
         self._closed = False
 
@@ -706,6 +706,7 @@ class MegatronSlotCoordinator:
         checkpoints: MegatronCheckpointOperations | None = None,
         max_retained_operations: int = 128,
         portable_archive: PortableSnapshotArchive | None = None,
+        restore_optimizer: bool = True,
     ) -> MegatronSlotRun:
         return await self._register_run(
             config,
@@ -713,6 +714,7 @@ class MegatronSlotCoordinator:
             max_retained_operations=max_retained_operations,
             restore_id=None,
             portable_archive=portable_archive,
+            restore_optimizer=restore_optimizer,
         )
 
     async def _register_run(
@@ -723,6 +725,7 @@ class MegatronSlotCoordinator:
         max_retained_operations: int,
         restore_id: str | None,
         portable_archive: PortableSnapshotArchive | None,
+        restore_optimizer: bool = True,
     ) -> MegatronSlotRun:
         if config.source.training_session_id != config.training_session_id:
             raise ValueError("source generation belongs to another training session")
@@ -748,9 +751,15 @@ class MegatronSlotCoordinator:
             initial_adapter_path=config.source.adapter_path,
             optimizer_state_path=config.optimizer_state_path,
             initial_portable_snapshot=portable_archive,
+            initial_restore_optimizer=restore_optimizer,
             event_timeout_s=self.command_timeout_s,
         )
-        registration_identity = (config, archive_sha256, restore_id)
+        registration_identity = (
+            config,
+            archive_sha256,
+            restore_id,
+            restore_optimizer,
+        )
         aborted_key = None if restore_id is None else (config.run_id, restore_id)
         while True:
             async with self._condition:
@@ -790,6 +799,14 @@ class MegatronSlotCoordinator:
                     if prior.portable_archive_sha256 != archive_sha256:
                         raise RuntimeError(
                             "run_id was reused with another portable archive"
+                        )
+                    if (
+                        prior.portable_install is not None
+                        and prior.portable_install.restore_optimizer
+                        is not restore_optimizer
+                    ):
+                        raise RuntimeError(
+                            "run_id was reused with another restore selection"
                         )
                     return MegatronSlotRun(
                         config.run_id, prior.worker, prior.portable_install
@@ -1355,6 +1372,7 @@ class MegatronSlotCoordinator:
             max_retained_operations=max_retained_operations,
             restore_id=restore_id,
             portable_archive=portable_archive,
+            restore_optimizer=True,
         )
 
     async def replay_migration_operations(

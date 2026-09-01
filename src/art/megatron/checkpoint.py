@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Mapping, Sequence
+from contextlib import AbstractContextManager, nullcontext
 from copy import deepcopy
 from dataclasses import dataclass, field
 import hashlib
@@ -1633,7 +1634,10 @@ def abort_checkpoint_save(trainer: CheckpointHost, output_dir: str) -> None:
 
 
 def _load_adapter(
-    trainer: CheckpointHost, source: PreparedCheckpoint, keys: Iterable[str]
+    trainer: CheckpointHost,
+    source: PreparedCheckpoint,
+    keys: Iterable[str],
+    materialize: Callable[[str], AbstractContextManager[Path]] | None = None,
 ) -> dict[str, torch.Tensor]:
     if source.manifest is None:
         from art.megatron.model_support.lora_disk import (
@@ -1645,9 +1649,15 @@ def _load_adapter(
         )
         return {key: value for key, value in loaded.items() if key in set(keys)}
     safe_open = importlib.import_module("safetensors").safe_open
-    with safe_open(source.path / "adapter_model.safetensors", framework="pt") as handle:
-        available = set(handle.keys())
-        return {key: handle.get_tensor(key) for key in keys if key in available}
+    adapter = nullcontext() if materialize is None else materialize(
+        "adapter_model.safetensors"
+    )
+    with adapter:
+        with safe_open(
+            source.path / "adapter_model.safetensors", framework="pt"
+        ) as handle:
+            available = set(handle.keys())
+            return {key: handle.get_tensor(key) for key in keys if key in available}
 
 
 def _localized(
@@ -1766,6 +1776,82 @@ def _optimizer_state(
     )
 
 
+def _bounded_optimizer_state(
+    trainer: CheckpointHost,
+    source: PreparedCheckpoint,
+    name: str,
+    materialize: Callable[[str], AbstractContextManager[Path]],
+) -> LocalOptimizerState:
+    """Restore optimizer state while materializing only one canonical file."""
+
+    assert source.manifest is not None and source.manifest["optimizer"] is not None
+    from art.megatron.lora import LoRA
+
+    ref = trainer._slot_ref(name)
+    sites: list[tuple[LoRA, str, torch.nn.Parameter, list[str], tuple[str, ...]]] = []
+    groups: dict[tuple[str, ...], list[int]] = {}
+    for chunk in trainer.runtime.model:
+        for module in chunk.modules():
+            if not isinstance(module, LoRA) or module._slot(ref) is None:
+                continue
+            for suffix, parameter in module._lora_params(ref):
+                suffix = suffix.removesuffix(".weight")
+                keys = [
+                    key
+                    for key in module._expected_weight_keys(suffix)
+                    if isinstance(key, str)
+                ]
+                records = [tuple(source.manifest["parameters"][key]) for key in keys]
+                if records and len(set(records)) != 1:
+                    raise RuntimeError(
+                        f"Optimizer files differ within one LoRA site: {keys}"
+                    )
+                files = records[0] if records else ()
+                index = len(sites)
+                sites.append((module, suffix, parameter, keys, files))
+                groups.setdefault(files, []).append(index)
+
+    components: dict[str, list[torch.Tensor | None]] = {
+        name: [None] * len(sites) for name in ("master", "exp_avg", "exp_avg_sq")
+    }
+    steps: list[float] = [0.0] * len(sites)
+    safe_open = importlib.import_module("safetensors").safe_open
+    for files, indices in groups.items():
+        if not files:
+            for index in indices:
+                parameter = sites[index][2]
+                for values in components.values():
+                    values[index] = torch.zeros_like(parameter)
+            continue
+        for component_index, component in enumerate(components):
+            filename = files[component_index]
+            with materialize(filename):
+                with safe_open(source.path / filename, framework="pt") as handle:
+                    for index in indices:
+                        module, suffix, parameter, keys, _files = sites[index]
+                        tensors = {key: handle.get_tensor(key) for key in keys}
+                        full = module._adapter_weight(tensors, suffix=suffix)
+                        components[component][index] = _localized(
+                            module, full, parameter
+                        )
+        for index in indices:
+            keys = sites[index][3]
+            key_steps = {source.manifest["steps"][key] for key in keys}
+            if len(key_steps) != 1:
+                raise RuntimeError(f"Optimizer steps differ for {keys}")
+            steps[index] = key_steps.pop()
+
+    if any(value is None for values in components.values() for value in values):
+        raise RuntimeError("bounded optimizer restore left an incomplete component")
+    return LocalOptimizerState(
+        tuple(cast(torch.Tensor, value) for value in components["master"]),
+        tuple(cast(torch.Tensor, value) for value in components["exp_avg"]),
+        tuple(cast(torch.Tensor, value) for value in components["exp_avg_sq"]),
+        tuple(steps),
+        source.manifest["optimizer"],
+    )
+
+
 def _phase[T](
     action: Callable[[], T], phase: str, group: dist.ProcessGroup | None
 ) -> T:
@@ -1827,7 +1913,11 @@ def _rollback_load(
 
 
 def load_checkpoint(
-    trainer: CheckpointHost, source: PreparedCheckpoint, name: str
+    trainer: CheckpointHost,
+    source: PreparedCheckpoint,
+    name: str,
+    *,
+    materialize: Callable[[str], AbstractContextManager[Path]] | None = None,
 ) -> None:
     group = _ensure_group(trainer)
     if any(value != source.digest for value in _gather(source.digest, group)):
@@ -1858,7 +1948,7 @@ def load_checkpoint(
     )
     local_keys = trainer._local_lora_adapter_templates()
     adapter = _phase(
-        lambda: _load_adapter(trainer, source, local_keys),
+        lambda: _load_adapter(trainer, source, local_keys, materialize),
         "read checkpoint adapter",
         group,
     )
@@ -1905,7 +1995,13 @@ def load_checkpoint(
         )
         if source.manifest is not None and source.manifest["optimizer"] is not None:
             optimizer_state = _phase(
-                lambda: _optimizer_state(trainer, source, temporary),
+                lambda: (
+                    _optimizer_state(trainer, source, temporary)
+                    if materialize is None
+                    else _bounded_optimizer_state(
+                        trainer, source, temporary, materialize
+                    )
+                ),
                 "read checkpoint optimizer",
                 group,
             )

@@ -811,7 +811,7 @@ class MCoreRunSlotExecutor:
                     archive=archive,
                     expected_lora_rank=spec.lora_rank,
                     expected_lora_target_modules=spec.lora_target_modules,
-                    restore_optimizer=True,
+                    restore_optimizer=spec.initial_restore_optimizer,
                 )
                 portable_read = prepared_portable.receipt
                 adapter_config = prepared_portable.adapter_config
@@ -953,6 +953,7 @@ class MCoreRunSlotExecutor:
                         prepared.checkpoint,
                         restore_optimizer=restore_optimizer,
                         require_optimizer=restore_optimizer,
+                        materialize=prepared.materialize,
                     )
                 )
                 installed = True
@@ -1244,19 +1245,31 @@ class MCoreRunSlotExecutor:
             export_portable_checkpoint,
         )
 
-        with self._maintenance_resident(state, ("weights", "optimizer")):
-            return export_portable_checkpoint(
-                self._slots,
-                self._portable_snapshot_sink,
-                PortableSnapshotGeneration(
-                    training_session_id=generation.training_session_id,
-                    policy_step=generation.policy_step,
-                    generation_id=generation.generation_id,
-                ),
-                export_id=export_id,
-                name=run_id,
-                rank=int(self.runtime.rank),
-            )
+        return export_portable_checkpoint(
+            self._slots,
+            self._portable_snapshot_sink,
+            PortableSnapshotGeneration(
+                training_session_id=generation.training_session_id,
+                policy_step=generation.policy_step,
+                generation_id=generation.generation_id,
+            ),
+            export_id=export_id,
+            name=run_id,
+            rank=int(self.runtime.rank),
+            components=lambda component: self._portable_component(state, component),
+        )
+
+    @contextmanager
+    def _portable_component(
+        self,
+        state: _ResidentCommandRun,
+        component: Literal["weights", "optimizer"],
+    ) -> Any:
+        key = state.weights_key if component == "weights" else state.optimizer_key
+        if key is None:
+            raise RuntimeError(f"portable checkpoint lacks {component} residency")
+        with self._residency.borrow_l2(key) as image:
+            yield image.tensors()
 
     def run_tensor_owners(self, run_id: str) -> tuple[tuple[str, int], ...]:
         if run_id not in self._runs:

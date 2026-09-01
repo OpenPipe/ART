@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 from collections import OrderedDict
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from contextlib import AbstractContextManager, nullcontext
 from copy import deepcopy
 from dataclasses import dataclass, replace
 import threading
@@ -104,6 +105,7 @@ class MegatronRunSlots:
         *,
         restore_optimizer: bool,
         require_optimizer: bool,
+        materialize: Callable[[str], AbstractContextManager[Any]] | None = None,
     ) -> tuple[tuple[torch.nn.Parameter, ...], tuple[torch.Tensor, ...]]:
         """Install CPU weights and optimizer objects for atomic L2 admission."""
 
@@ -122,7 +124,13 @@ class MegatronRunSlots:
                     },
                 ),
             )
-        _checkpoint.load_checkpoint(self, weights_source, name)
+        adapter = (
+            nullcontext()
+            if materialize is None
+            else materialize("adapter_model.safetensors")
+        )
+        with adapter:
+            _checkpoint.load_checkpoint(self, weights_source, name)
         try:
             weights = self.checkpoint_slot_parameters(name)
             move_error: BaseException | None = None
@@ -141,7 +149,7 @@ class MegatronRunSlots:
             has_optimizer = manifest is not None and manifest["optimizer"] is not None
             if restore_optimizer and has_optimizer:
                 optimizer = self.prepare_checkpoint_slot_optimizer_for_residency(
-                    name, source
+                    name, source, materialize=materialize
                 )
             elif restore_optimizer and require_optimizer:
                 raise MegatronRunSlotStateError(
@@ -240,7 +248,11 @@ class MegatronRunSlots:
         return tensors
 
     def prepare_checkpoint_slot_optimizer_for_residency(
-        self, name: str, source: _checkpoint.PreparedCheckpoint
+        self,
+        name: str,
+        source: _checkpoint.PreparedCheckpoint,
+        *,
+        materialize: Callable[[str], AbstractContextManager[Any]] | None = None,
     ) -> tuple[torch.Tensor, ...]:
         """Restore exact optimizer state against an installed CPU adapter."""
 
@@ -256,7 +268,13 @@ class MegatronRunSlots:
                 "Checkpoint does not contain optimizer state"
             )
         optimizer_state = _checkpoint._phase(
-            lambda: _checkpoint._optimizer_state(self, source, name),
+            lambda: (
+                _checkpoint._optimizer_state(self, source, name)
+                if materialize is None
+                else _checkpoint._bounded_optimizer_state(
+                    self, source, name, materialize
+                )
+            ),
             "prepare checkpoint optimizer state",
             _checkpoint._ensure_group(self),
         )

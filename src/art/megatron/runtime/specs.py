@@ -90,6 +90,7 @@ class TrainingRunSpec(_Spec):
     initial_adapter_path: str = Field(min_length=1)
     optimizer_state_path: str = Field(min_length=1)
     initial_portable_snapshot: PortableSnapshotArchive | None = None
+    initial_restore_optimizer: bool = True
     initial_event_timeout_s: float | None = Field(default=None, gt=0)
     event_timeout_s: float = Field(default=300.0, gt=0)
     shutdown_timeout_s: float = Field(default=240.0, gt=0)
@@ -106,6 +107,8 @@ class TrainingRunSpec(_Spec):
             or archive.generation.generation_id != self.initial_generation_id
         ):
             raise ValueError("portable archive identifies another run generation")
+        if archive is None and not self.initial_restore_optimizer:
+            raise ValueError("weights-only initialization requires a portable archive")
         return self
 
 

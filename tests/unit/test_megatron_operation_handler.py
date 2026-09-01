@@ -291,6 +291,12 @@ class _Trainer:
             run_spec.lora_target_modules,
         )
         self.registered_timeouts[run_spec.run_id] = run_spec.event_timeout_s
+        self.registered_restore_optimizer = getattr(
+            self, "registered_restore_optimizer", {}
+        )
+        self.registered_restore_optimizer[run_spec.run_id] = (
+            run_spec.initial_restore_optimizer
+        )
         self.run_states[run_spec.run_id] = TrainerCommandRunState(
             run_id=run_spec.run_id,
             training_session_id=run_spec.training_session_id,
@@ -304,6 +310,7 @@ class _Trainer:
         return PortableSnapshotInstallReceipt(
             archive_sha256=archive.archive_sha256,
             runtime_fingerprint=self.runtime_spec.fingerprint,
+            restore_optimizer=run_spec.initial_restore_optimizer,
             ranks=(
                 PortableSnapshotReadReceipt(
                     archive_sha256=archive.archive_sha256,
@@ -1230,6 +1237,7 @@ async def test_slot_coordinator_serializes_gpu_work_before_result_settlement() -
                     if index == 0
                     else None
                 ),
+                restore_optimizer=index != 0,
             )
         )
 
@@ -1265,6 +1273,7 @@ async def test_slot_coordinator_serializes_gpu_work_before_result_settlement() -
     assert {outcome.status for outcome in outcomes} == {"succeeded"}
     assert trainer.max_active == 1
     assert runs[0].portable_install is not None
+    assert runs[0].portable_install.restore_optimizer is False
     assert all(run.portable_install is None for run in runs[1:])
     assert set(trainer.executed_runs) == {run.run_id for run in runs}
     assert trainer.registered_adapters == {

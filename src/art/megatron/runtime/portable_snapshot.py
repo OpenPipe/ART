@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
+from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass, replace
 import hashlib
 import importlib
@@ -9,9 +10,8 @@ import mmap
 import os
 from pathlib import Path, PurePosixPath
 import re
-import shutil
 import tempfile
-from typing import Any, BinaryIO, Literal, Protocol, cast
+from typing import Any, BinaryIO, Iterator, Literal, Protocol, cast
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -30,6 +30,7 @@ _CHECKPOINT_IDENTITY_FILES = (
     "adapter_model.safetensors",
     "checkpoint.json",
 )
+_CHECKPOINT_METADATA_FILES = ("adapter_config.json", "checkpoint.json")
 _MAX_PORTABLE_RANKS = 4096
 _MAX_PORTABLE_FILES = 65_536
 
@@ -294,11 +295,74 @@ class PreparedPortableCheckpoint:
     """Authenticated rank-local files retained until trainer installation."""
 
     archive: PortableSnapshotArchive
-    receipt: PortableSnapshotReadReceipt
     checkpoint: Any
     config: dict[str, object]
     restore_optimizer: bool
+    destination_rank: int
+    required_files: tuple[str, ...]
+    _source: PortableSnapshotSource
+    _owned: dict[str, tuple[PortableSnapshotRankReceipt, PortableSnapshotFile]]
+    _read: dict[str, PortableSnapshotReadFile]
     _temporary: tempfile.TemporaryDirectory[str] | None
+
+    @property
+    def receipt(self) -> PortableSnapshotReadReceipt:
+        return PortableSnapshotReadReceipt(
+            archive_sha256=self.archive.archive_sha256,
+            destination_rank=self.destination_rank,
+            files=tuple(self._read[path] for path in sorted(self._read)),
+        )
+
+    @contextmanager
+    def materialize(self, relative_path: str) -> Iterator[Path]:
+        if self._temporary is None:
+            raise RuntimeError("prepared portable checkpoint is closed")
+        if relative_path not in self.required_files:
+            raise RuntimeError(
+                f"portable checkpoint file is not required: {relative_path}"
+            )
+        root = Path(self._temporary.name)
+        path = root / relative_path
+        retained = relative_path in _CHECKPOINT_METADATA_FILES
+        if not path.is_file():
+            receipt, file = self._owned[relative_path]
+            try:
+                _read_rank_files(self._source, receipt, (file,), root)
+                self._record_read(receipt, file)
+            except BaseException:
+                try:
+                    path.unlink()
+                except FileNotFoundError:
+                    pass
+                raise
+        try:
+            yield path
+        finally:
+            if not retained:
+                try:
+                    path.unlink()
+                except FileNotFoundError:
+                    pass
+
+    def _record_read(
+        self, receipt: PortableSnapshotRankReceipt, file: PortableSnapshotFile
+    ) -> None:
+        manifest = self.checkpoint.manifest
+        if manifest is not None and file.relative_path in manifest["files"]:
+            assert self._temporary is not None
+            path = Path(self._temporary.name) / file.relative_path
+            actual = _checkpoint_blake2b(path)
+            expected = manifest["files"][file.relative_path]
+            if actual != expected:
+                raise RuntimeError(
+                    f"portable checkpoint manifest digest changed: {file.relative_path}"
+                )
+        self._read[file.relative_path] = PortableSnapshotReadFile(
+            source_rank=receipt.rank,
+            relative_path=file.relative_path,
+            byte_count=file.byte_count,
+            sha256=file.sha256,
+        )
 
     def close(self) -> None:
         temporary, self._temporary = self._temporary, None
@@ -419,84 +483,24 @@ def export_portable_checkpoint(
     export_id: str,
     name: str,
     rank: int,
+    components: Callable[
+        [Literal["weights", "optimizer"]],
+        AbstractContextManager[tuple[Any, ...]],
+    ],
 ) -> PortableSnapshotRankReceipt | None:
-    """Commit canonical Megatron checkpoint files and return immutable refs."""
+    """Commit canonical files from one lower-tier component window at a time."""
 
-    if not export_id or not name or rank < 0:
-        raise ValueError("portable checkpoint export identity is invalid")
-    from art.megatron import checkpoint as _checkpoint
+    from .portable_checkpoint_stream import export_portable_checkpoint_streamed
 
-    digest = hashlib.sha256(f"{name}\0{export_id}".encode()).hexdigest()
-    root = Path(tempfile.gettempdir()) / f"art-portable-export-{digest}"
-    reservation = root.with_name(f".{root.name}.reserved")
-
-    def clean_shared_paths() -> None:
-        for path in (root, reservation):
-            try:
-                shutil.rmtree(path)
-            except FileNotFoundError:
-                pass
-
-    def clean_rank_snapshots() -> None:
-        for path in root.parent.glob(f".{root.name}.snapshot-r{rank}-*"):
-            try:
-                shutil.rmtree(path)
-            except FileNotFoundError:
-                pass
-
-    clean_rank_snapshots()
-    _rank_zero_phase(rank, clean_shared_paths, "prepare portable checkpoint export")
-    try:
-        trainer.save_checkpoint(str(root), name)
-
-        def commit() -> PortableSnapshotRankReceipt:
-            prepared = _checkpoint.prepare_checkpoint(str(root))
-            manifest = prepared.manifest
-            if manifest is None or manifest["optimizer"] is None:
-                raise RuntimeError("portable export requires canonical optimizer state")
-            relative_paths = tuple(sorted({"checkpoint.json", *manifest["files"]}))
-            files = tuple(
-                PortableSnapshotPreparedFile(
-                    relative_path=relative,
-                    component=_checkpoint_component(relative),
-                    byte_count=(root / relative).stat().st_size,
-                    sha256=_file_sha256(root / relative),
-                )
-                for relative in relative_paths
-            )
-            committed = sink.commit_prepared(
-                export_id=export_id,
-                generation=generation,
-                rank=rank,
-                checkpoint_digest=prepared.digest,
-                directory=root,
-                files=files,
-            )
-            by_path = {file.relative_path: file for file in committed}
-            if len(by_path) != len(committed) or set(by_path) != set(relative_paths):
-                raise RuntimeError(
-                    "portable sink changed the checkpoint file inventory"
-                )
-            return PortableSnapshotRankReceipt(
-                rank=rank,
-                checkpoint_digest=prepared.digest,
-                files=tuple(
-                    PortableSnapshotFile(
-                        object_id=by_path[file.relative_path].object_id,
-                        relative_path=file.relative_path,
-                        component=file.component,
-                        byte_count=file.byte_count,
-                        sha256=file.sha256,
-                        source_ref=by_path[file.relative_path].source_ref,
-                    )
-                    for file in files
-                ),
-            )
-
-        return _rank_zero_phase(rank, commit, "commit portable checkpoint export")
-    finally:
-        _rank_zero_phase(rank, clean_shared_paths, "clean portable checkpoint export")
-        clean_rank_snapshots()
+    return export_portable_checkpoint_streamed(
+        trainer,
+        sink,
+        generation,
+        export_id=export_id,
+        name=name,
+        rank=rank,
+        components=cast(Any, components),
+    )
 
 
 def prepare_portable_checkpoint(
@@ -509,61 +513,44 @@ def prepare_portable_checkpoint(
     expected_lora_target_modules: tuple[str, ...],
     restore_optimizer: bool,
 ) -> PreparedPortableCheckpoint:
-    """Read and authenticate one destination-rank checkpoint without installing it."""
+    """Authenticate identity while deferring bounded data-file materialization."""
 
     owned = {
         file.relative_path: (receipt, file)
         for receipt in archive.ranks
         for file in receipt.files
     }
-    read: dict[str, PortableSnapshotReadFile] = {}
     temporary = tempfile.TemporaryDirectory(prefix="art-portable-restore-")
     try:
         root = Path(temporary.name)
-
-        def materialize(paths: set[str]) -> None:
-            missing = paths.difference(owned)
+        from art.megatron import checkpoint as _checkpoint
+        checkpoint = None
+        required: tuple[str, ...] = ()
+        read: dict[str, PortableSnapshotReadFile] = {}
+        read_error: BaseException | None = None
+        try:
+            missing = set(_CHECKPOINT_IDENTITY_FILES).difference(owned)
             if missing:
                 raise RuntimeError(
                     f"portable snapshot lacks required files: {sorted(missing)}"
                 )
-            for receipt in archive.ranks:
-                selected = tuple(
-                    file
-                    for file in receipt.files
-                    if file.relative_path in paths and file.relative_path not in read
+            for relative in _CHECKPOINT_IDENTITY_FILES:
+                receipt, file = owned[relative]
+                _read_rank_files(source, receipt, (file,), root)
+                read[relative] = PortableSnapshotReadFile(
+                    source_rank=receipt.rank,
+                    relative_path=relative,
+                    byte_count=file.byte_count,
+                    sha256=file.sha256,
                 )
-                if not selected:
-                    continue
-                _read_rank_files(source, receipt, selected, root)
-                read.update(
-                    (
-                        file.relative_path,
-                        PortableSnapshotReadFile(
-                            source_rank=receipt.rank,
-                            relative_path=file.relative_path,
-                            byte_count=file.byte_count,
-                            sha256=file.sha256,
-                        ),
-                    )
-                    for file in selected
-                )
-
-        from art.megatron import checkpoint as _checkpoint
-
-        checkpoint = None
-        read_error: BaseException | None = None
-        try:
-            materialize(set(_CHECKPOINT_IDENTITY_FILES))
-            entries = tuple(sorted(owned))
             checkpoint = _checkpoint.prepare_checkpoint(
-                str(root), artifact_entries=entries
+                str(root), artifact_entries=tuple(sorted(owned))
             )
             if checkpoint.digest != archive.checkpoint_digest:
                 raise RuntimeError("portable checkpoint digest changed")
             assert checkpoint.manifest is not None
             expected_files = {"checkpoint.json", *checkpoint.manifest["files"]}
-            if set(entries) != expected_files:
+            if set(owned) != expected_files:
                 raise RuntimeError("portable archive file inventory changed")
             actual_rank, actual_targets = _adapter_shape(checkpoint.config)
             if actual_rank != expected_lora_rank or set(actual_targets) != set(
@@ -583,50 +570,9 @@ def prepare_portable_checkpoint(
                     )
                 )
             )
-            materialize(set(required))
-            for relative in set(required) - {"checkpoint.json"}:
-                actual = _checkpoint._file_digest(root / relative)
-                expected = checkpoint.manifest["files"][relative]
-                if actual != expected:
-                    raise RuntimeError(
-                        f"portable checkpoint manifest digest changed: {relative}"
-                    )
-            checkpoint = _checkpoint.prepare_checkpoint(
-                str(root), artifact_entries=entries
-            )
-            if not restore_optimizer:
-                assert checkpoint.manifest is not None
-                # Keep the authenticated canonical checkpoint identity while
-                # presenting only its materialized adapter state to the loader.
-                adapter_manifest = cast(
-                    Any,
-                    {
-                        **checkpoint.manifest,
-                        "optimizer": None,
-                        "parameters": {},
-                        "steps": {},
-                        "files": {
-                            relative: digest
-                            for relative, digest in checkpoint.manifest["files"].items()
-                            if _checkpoint_component(relative) != "optimizer"
-                        },
-                    },
-                )
-                checkpoint = replace(
-                    checkpoint,
-                    manifest=adapter_manifest,
-                    custom=(
-                        _checkpoint._load_custom_payload(root, adapter_manifest)
-                        if adapter_manifest.get("custom_tensors")
-                        else None
-                    ),
-                )
-            elif checkpoint.manifest is not None and checkpoint.manifest.get(
-                "custom_tensors"
-            ):
-                checkpoint = replace(
-                    checkpoint,
-                    custom=_checkpoint._load_custom_payload(root, checkpoint.manifest),
+            if missing := set(required).difference(owned):
+                raise RuntimeError(
+                    f"portable snapshot lacks required files: {sorted(missing)}"
                 )
         except BaseException as error:
             read_error = error
@@ -638,14 +584,14 @@ def prepare_portable_checkpoint(
         assert checkpoint is not None
         return PreparedPortableCheckpoint(
             archive=archive,
-            receipt=PortableSnapshotReadReceipt(
-                archive_sha256=archive.archive_sha256,
-                destination_rank=destination_rank,
-                files=tuple(read[path] for path in sorted(read)),
-            ),
             checkpoint=checkpoint,
             config=dict(checkpoint.config),
             restore_optimizer=restore_optimizer,
+            destination_rank=destination_rank,
+            required_files=tuple(sorted(required)),
+            _source=source,
+            _owned=owned,
+            _read=read,
             _temporary=temporary,
         )
     except BaseException:
@@ -665,7 +611,29 @@ def install_prepared_portable_checkpoint(
         raise RuntimeError("prepared portable checkpoint is closed")
     from art.megatron import checkpoint as _checkpoint
 
-    _checkpoint.load_checkpoint(trainer, prepared.checkpoint, name)
+    checkpoint = prepared.checkpoint
+    if not prepared.restore_optimizer:
+        assert checkpoint.manifest is not None
+        checkpoint = replace(
+            checkpoint,
+            manifest=cast(
+                Any,
+                {
+                    **checkpoint.manifest,
+                    "optimizer": None,
+                    "parameters": {},
+                    "steps": {},
+                    "files": {
+                        relative: digest
+                        for relative, digest in checkpoint.manifest["files"].items()
+                        if _checkpoint_component(relative) != "optimizer"
+                    },
+                },
+            ),
+        )
+    _checkpoint.load_checkpoint(
+        trainer, checkpoint, name, materialize=prepared.materialize
+    )
 
 
 def commit_prepared_portable_checkpoint(
@@ -856,6 +824,14 @@ def _json_sha256(value: object) -> str:
 
 def _file_sha256(path: Path) -> str:
     digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while chunk := handle.read(8 * 1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _checkpoint_blake2b(path: Path) -> str:
+    digest = hashlib.blake2b(digest_size=32)
     with path.open("rb") as handle:
         while chunk := handle.read(8 * 1024 * 1024):
             digest.update(chunk)
