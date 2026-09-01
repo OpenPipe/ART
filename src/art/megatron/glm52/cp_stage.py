@@ -58,7 +58,7 @@ def launch_remote_stage_fetches(
             range_meta_cache=state.execution_cache.range_meta,
         )
         for stage in state.rank_plan.stage_plans
-        if stage.kv_fetch_plan is not None
+        if not stage.is_local_stage
     }
 
 
@@ -68,20 +68,11 @@ def stage_kv_rows(
     state: ArtContextParallelState,
     fetches: dict[int, Any],
 ) -> torch.Tensor:
-    if stage.is_local_stage:
-        local_rows = stage_local_kv_rows(tensor, stage, state)
-        if not stage.fused_remote_k_len:
-            return local_rows
-        remote_rows = fetches.pop(int(stage.stage_index)).wait_post_process()
-        if int(remote_rows.shape[0]) != stage.fused_remote_k_len:
-            raise RuntimeError(
-                "GLM-5.2 fused CP fetch returned the wrong number of rows: "
-                f"expected={stage.fused_remote_k_len}, actual={remote_rows.shape[0]}"
-            )
-        return torch.cat((local_rows, remote_rows))
-    if stage.kv_fetch_plan is None:
-        return tensor.new_empty((0, *tensor.shape[1:]))
-    return fetches.pop(int(stage.stage_index)).wait_post_process()
+    return (
+        stage_local_kv_rows(tensor, stage, state)
+        if stage.is_local_stage
+        else fetches.pop(int(stage.stage_index)).wait_post_process()
+    )
 
 
 def drain_stage_fetches(fetches: dict[int, Any]) -> None:
@@ -95,27 +86,12 @@ def reduce_local_stage_rows_(
     stage_grad: torch.Tensor,
     stage: StagePlan,
     state: ArtContextParallelState,
-) -> Any | None:
-    local_rows = int(sum(range_.size() for range_ in stage.owner_local_k_ranges))
-    expected_rows = local_rows + int(stage.fused_remote_k_len)
-    if int(stage_grad.shape[0]) != expected_rows:
-        raise RuntimeError(
-            "GLM-5.2 fused CP gradient has the wrong number of rows: "
-            f"expected={expected_rows}, actual={stage_grad.shape[0]}"
-        )
+) -> None:
     range_reduce_sum_(
-        stage_grad[:local_rows],
+        stage_grad,
         output_tensor=target,
         ranges=stage.owner_local_k_ranges,
         range_meta_cache=state.execution_cache.range_meta,
-    )
-    if not stage.fused_remote_k_len:
-        return None
-    return launch_remote_stage_reduce(
-        stage_grad[local_rows:],
-        stage,
-        state,
-        target,
     )
 
 

@@ -1,8 +1,5 @@
 from __future__ import annotations
 
-from dataclasses import replace
-from types import SimpleNamespace
-
 import pytest
 import torch
 from torch.nn.attention.flex_attention import BlockMask
@@ -18,23 +15,16 @@ from art.megatron.context_parallel.builder import (
     build_dense_reference_mask,
     build_prefix_tree_attention_spec,
 )
-from art.megatron.context_parallel.runtime import (
-    _fuse_remote_stage_when_faster,
-    get_or_build_runtime_plan,
-)
+from art.megatron.context_parallel.runtime import get_or_build_runtime_plan
 from art.megatron.context_parallel.types import (
     AttnMaskKind,
     AttnSlice,
     ContextParallelConfig,
-    DkvReducePlan,
     ExactMaskMetadata,
     FlexMaskSpec,
-    KvFetchPlan,
     ParallelTopology,
-    StagePlan,
     TokenRange,
 )
-from art.megatron.glm52.state import build_glm52_context_parallel_state
 from art.megatron.prefix_tree_packing import PrefixTreePack, prefix_tree_pack
 from art.megatron.prefix_tree_state import create_prefix_tree_state
 
@@ -369,142 +359,6 @@ def test_context_parallel_stage_masks_match_dense_nested_tree() -> None:
     )
 
 
-def test_remote_keys_fuse_only_when_planner_cost_wins() -> None:
-    q_range = TokenRange(0, 4)
-    local_stage = StagePlan(
-        stage_index=0,
-        source_rank=0,
-        is_local_stage=True,
-        slices=(AttnSlice(q_range, TokenRange(0, 4), AttnMaskKind.CAUSAL, 0),),
-        owner_local_q_ranges=(q_range,),
-        owner_local_k_ranges=(TokenRange(0, 4),),
-        q_len=4,
-        k_len=4,
-        global_q_ranges=(TokenRange(3, 7),),
-        global_k_ranges=(TokenRange(3, 7),),
-        mask_metadata=ExactMaskMetadata(
-            q_token_indices=torch.tensor([3, 4, 5, 6]),
-            k_token_indices=torch.tensor([3, 4, 5, 6]),
-            cache_key="local",
-        ),
-    )
-    remote_stage = replace(
-        local_stage,
-        stage_index=1,
-        source_rank=1,
-        is_local_stage=False,
-        slices=(
-            AttnSlice(
-                TokenRange(0, 2),
-                TokenRange(0, 3),
-                AttnMaskKind.FULL,
-                0,
-            ),
-        ),
-        owner_local_q_ranges=(TokenRange(2, 4),),
-        owner_local_k_ranges=(TokenRange(0, 3),),
-        q_len=2,
-        global_q_ranges=(TokenRange(5, 7),),
-        global_k_ranges=(TokenRange(0, 3),),
-        mask_metadata=ExactMaskMetadata(
-            q_token_indices=torch.tensor([5, 6]),
-            k_token_indices=torch.tensor([0, 1, 2, -1]),
-            cache_key="remote",
-        ),
-        kv_fetch_plan=KvFetchPlan((0, 0), (0, 3), ((), ())),
-        dkv_reduce_plan=DkvReducePlan((0, 3), (0, 0), ((), ())),
-    )
-
-    fused = _fuse_remote_stage_when_faster(
-        local_stage,
-        remote_stage,
-        block_size=2,
-        config=ContextParallelConfig(),
-    )
-
-    assert fused is not None
-    assert fused.fused_remote_k_len == 3
-    assert fused.k_len == 8
-    assert fused.mask_metadata is not None
-    assert fused.mask_metadata.k_token_indices.tolist() == [
-        3,
-        4,
-        5,
-        6,
-        0,
-        1,
-        2,
-        -1,
-    ]
-    assert fused.slices[-1].q_range == TokenRange(2, 4)
-    assert fused.slices[-1].k_range == TokenRange(4, 7)
-    assert (
-        _fuse_remote_stage_when_faster(
-            local_stage,
-            remote_stage,
-            block_size=2,
-            config=ContextParallelConfig(
-                planner_stage_overhead_ms=0.0,
-                planner_comm_stage_overhead_ms=10.0,
-                planner_interval_overhead_ms=0.0,
-                planner_fetch_token_ms=0.0,
-                planner_reduce_token_ms=0.0,
-                planner_local_pair_ms=1.0,
-                planner_remote_pair_ms=1.0,
-                planner_local_backward_pair_ms=1.0,
-                planner_remote_backward_pair_ms=1.0,
-                planner_remote_stage_token_floor=1,
-                planner_remote_stage_pair_floor=1,
-                planner_remote_stage_underfill_ms=0.0,
-            ),
-        )
-        is None
-    )
-    glm_state = build_glm52_context_parallel_state(
-        position_ids=torch.arange(7).unsqueeze(0),
-        context_parallel_state=SimpleNamespace(
-            rank_plan=SimpleNamespace(
-                stage_plans=(fused,),
-                original_seq_len=7,
-            )
-        ),
-        device=torch.device("cpu"),
-    )
-    assert glm_state.stages[0].global_k_ids.tolist() == [3, 4, 5, 6, 0, 1, 2]
-    assert glm_state.route_by_global_id is not None
-    assert glm_state.route_by_global_id.tolist() == [4, 5, 6, 0, 1, 2, 3]
-    block_mask = build_block_mask(
-        FlexMaskSpec(
-            q_len=fused.q_len,
-            k_len=fused.k_len,
-            block_size=(2, 2),
-            slices=fused.slices,
-            exact_mask=fused.mask_metadata,
-        ),
-        group_ids=torch.tensor([1, 1, 1, 2, 2, 3, 3]),
-        parent_ids=torch.tensor([1, 1, 1, 2, 2, 1, 1]),
-        device=torch.device("cpu"),
-    )
-    assert block_mask is not None
-    q_indices = torch.arange(4)[:, None]
-    k_indices = torch.arange(8)[None, :]
-    assert block_mask.mask_mod(
-        torch.zeros_like(q_indices),
-        torch.zeros_like(q_indices),
-        q_indices,
-        k_indices,
-    ).equal(
-        torch.tensor(
-            [
-                [True, False, False, False, False, False, False, False],
-                [True, True, False, False, False, False, False, False],
-                [False, False, True, False, True, True, True, False],
-                [False, False, True, True, True, True, True, False],
-            ]
-        )
-    )
-
-
 def _assert_context_parallel_stage_masks_match_dense(
     pack: PrefixTreePack,
     *,
@@ -570,9 +424,7 @@ def _assert_context_parallel_stage_masks_match_dense(
             assert _effective_block_mask(block_mask).equal(expected)
             _assert_matches_torch_block_mask(block_mask)
             checked_stages += 1
-            checked_remote_stages += int(
-                not stage.is_local_stage or stage.fused_remote_k_len > 0
-            )
+            checked_remote_stages += int(not stage.is_local_stage)
 
     assert checked_stages
     if require_remote_stage:

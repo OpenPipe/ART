@@ -145,7 +145,6 @@ class StagePlan:
     global_k_ranges: tuple[TokenRange, ...] = ()
     mask_metadata: "ExactMaskMetadata | None" = None
     remote_buffer_range: TokenRange | None = None
-    fused_remote_k_len: int = 0
     kv_fetch_plan: KvFetchPlan | None = None
     dkv_reduce_plan: DkvReducePlan | None = None
 

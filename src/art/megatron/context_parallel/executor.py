@@ -883,10 +883,7 @@ def _logical_stage_q_len(stage_plan: StagePlan) -> int:
 
 
 def _logical_stage_k_len(stage_plan: StagePlan) -> int:
-    return int(
-        sum(range_.size() for range_ in stage_plan.owner_local_k_ranges)
-        + stage_plan.fused_remote_k_len
-    )
+    return int(sum(range_.size() for range_ in stage_plan.owner_local_k_ranges))
 
 
 def _pad_stage_token_tensor(
@@ -1253,7 +1250,6 @@ def _stage_remote_kv_tensors(
     *,
     stage_plan: StagePlan,
     fetch_work: Any,
-    expected_rows: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, bool]:
     if fetch_work is None:
         raise RuntimeError(
@@ -1268,11 +1264,7 @@ def _stage_remote_kv_tensors(
     k_stage, v_stage = fetch_work.wait_post_process()
     k_rows = int(k_stage.shape[-2])
     v_rows = int(v_stage.shape[-2])
-    expected_rows = (
-        _logical_stage_k_len(stage_plan)
-        if expected_rows is None
-        else int(expected_rows)
-    )
+    expected_rows = _logical_stage_k_len(stage_plan)
     if k_rows != expected_rows or v_rows != expected_rows:
         raise RuntimeError(
             "Remote stage fetch returned the wrong number of rows: "
@@ -1583,16 +1575,9 @@ def _forward_stage_records(
         (stage for stage in ordered_stages if stage.is_local_stage), None
     )
     remote_stages = [stage for stage in ordered_stages if not stage.is_local_stage]
-    fetch_stages = sorted(
-        (stage for stage in ordered_stages if stage.kv_fetch_plan is not None),
-        key=lambda stage: (
-            -1 if stage.wave_index is None else int(stage.wave_index),
-            int(stage.stage_index),
-        ),
-    )
     wave_pipeline_enabled = _remote_comm_launch_enabled(
         state=state,
-        remote_stages=fetch_stages,
+        remote_stages=remote_stages,
     )
     replay_records: list[dict[str, Any]] = []
     produced_output = False
@@ -1600,7 +1585,7 @@ def _forward_stage_records(
     remote_fetch_works_by_stage_index: dict[int, Any] = {}
     remote_query_works_by_stage_index: dict[int, _StageQueryGatherWork] = {}
     if wave_pipeline_enabled:
-        for stage_plan in fetch_stages:
+        for stage_plan in remote_stages:
             remote_fetch_works_by_stage_index[int(stage_plan.stage_index)] = (
                 _COMMUNICATOR.launch_kv_fetch(
                     k_local=k_source,
@@ -1617,16 +1602,15 @@ def _forward_stage_records(
                     output_layout="head_major",
                 )
             )
-            if not stage_plan.is_local_stage:
-                query_work = _launch_stage_query_gather(
-                    q_flat=q_source,
-                    state=state,
-                    stage_plan=stage_plan,
+            query_work = _launch_stage_query_gather(
+                q_flat=q_source,
+                state=state,
+                stage_plan=stage_plan,
+            )
+            if query_work is not None:
+                remote_query_works_by_stage_index[int(stage_plan.stage_index)] = (
+                    query_work
                 )
-                if query_work is not None:
-                    remote_query_works_by_stage_index[int(stage_plan.stage_index)] = (
-                        query_work
-                    )
     pending_remote_stages = [
         stage_plan
         for stage_plan in remote_stages
@@ -1654,17 +1638,6 @@ def _forward_stage_records(
             state=state,
             stage_plan=local_stage,
         )
-        if local_stage.fused_remote_k_len:
-            fetch_work = remote_fetch_works_by_stage_index.pop(
-                int(local_stage.stage_index), None
-            )
-            remote_k, remote_v, _remote_head_major = _stage_remote_kv_tensors(
-                stage_plan=local_stage,
-                fetch_work=fetch_work,
-                expected_rows=local_stage.fused_remote_k_len,
-            )
-            k_stage = torch.cat((k_stage, remote_k), dim=1)
-            v_stage = torch.cat((v_stage, remote_v), dim=1)
         if record_for_backward:
             q_leaf = q_stage.detach().requires_grad_(bool(q_flat.requires_grad))
             k_leaf = k_stage.detach().requires_grad_(bool(k_flat.requires_grad))
@@ -2172,7 +2145,7 @@ def _run_context_parallel_backward(
     dv_flat = torch.zeros(v_flat.shape, device=v_flat.device, dtype=grad_accum_dtype)
     reduce_works: list[Any] = []
     needs_remote_reduce = any(
-        _stage_requires_reduce(stage_plan) for stage_plan in state.rank_plan.stage_plans
+        not stage_plan.is_local_stage for stage_plan in state.rank_plan.stage_plans
     )
     if needs_remote_reduce and not comm_async_enabled:
         raise RuntimeError(
@@ -2180,7 +2153,8 @@ def _run_context_parallel_backward(
             "dKV reduce."
         )
     if not any(
-        _stage_requires_reduce(stage_plan) for stage_plan in state.rank_plan.stage_plans
+        (not stage_plan.is_local_stage) and _stage_requires_reduce(stage_plan)
+        for stage_plan in state.rank_plan.stage_plans
     ) and (
         sum(state.rank_plan.remote_dkv_reduce_plan.send_splits) > 0
         or sum(state.rank_plan.remote_dkv_reduce_plan.recv_splits) > 0
@@ -2282,58 +2256,20 @@ def _run_context_parallel_backward(
             head_major=True,
         )
         if stage_plan.is_local_stage:
-            local_k_len = int(
-                sum(range_.size() for range_ in stage_plan.owner_local_k_ranges)
-            )
-            local_k_grad = grad_map.get("k_input")
-            local_v_grad = grad_map.get("v_input")
-            remote_k_grad = remote_v_grad = None
-            if stage_plan.fused_remote_k_len:
-                remote_end = local_k_len + int(stage_plan.fused_remote_k_len)
-                if local_k_grad is not None:
-                    remote_k_grad = local_k_grad[:, local_k_len:remote_end]
-                    local_k_grad = local_k_grad[:, :local_k_len]
-                if local_v_grad is not None:
-                    remote_v_grad = local_v_grad[:, local_k_len:remote_end]
-                    local_v_grad = local_v_grad[:, :local_k_len]
             _scatter_stage_grad(
                 target=dk_flat,
-                grad=local_k_grad,
+                grad=grad_map.get("k_input"),
                 ranges=stage_plan.owner_local_k_ranges,
                 state=state,
                 head_major=True,
             )
             _scatter_stage_grad(
                 target=dv_flat,
-                grad=local_v_grad,
+                grad=grad_map.get("v_input"),
                 ranges=stage_plan.owner_local_k_ranges,
                 state=state,
                 head_major=True,
             )
-            if stage_plan.fused_remote_k_len:
-                empty = k_flat.new_empty((k_flat.shape[0], 0, k_flat.shape[2]))
-                reduce_works.append(
-                    _COMMUNICATOR.launch_dkv_reduce(
-                        dk_remote=(
-                            empty
-                            if remote_k_grad is None
-                            else remote_k_grad.contiguous()
-                        ),
-                        dv_remote=(
-                            empty
-                            if remote_v_grad is None
-                            else remote_v_grad.contiguous()
-                        ),
-                        plan=cast(DkvReducePlan, stage_plan.dkv_reduce_plan),
-                        group=state.cp_group,
-                        async_op=comm_async_enabled,
-                        dk_local=dk_flat,
-                        dv_local=dv_flat,
-                        range_meta_cache=state.execution_cache.range_meta,
-                        label=f"dkv_reduce.fused.stage{stage_plan.stage_index}",
-                        input_layout="head_major",
-                    )
-                )
             grad_by_stage_index.pop(int(stage_plan.stage_index), None)
             _release_replay_record_tensors(stage_record)
             stage_record.clear()

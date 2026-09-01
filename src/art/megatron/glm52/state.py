@@ -194,9 +194,7 @@ def build_glm52_context_parallel_state(
     combined_k_start = 0
     for stage in rank_plan.stage_plans:
         q_len = sum(range_.size() for range_ in stage.owner_local_q_ranges)
-        k_len = sum(range_.size() for range_ in stage.owner_local_k_ranges) + int(
-            stage.fused_remote_k_len
-        )
+        k_len = sum(range_.size() for range_ in stage.owner_local_k_ranges)
         if combined_k_start + k_len > torch.iinfo(torch.int32).max:
             raise RuntimeError(
                 "GLM-5.2 combined CP KV rows exceed int32 index capacity."
