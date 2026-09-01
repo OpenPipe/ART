@@ -2,6 +2,9 @@ import asyncio
 import importlib
 import json
 
+from openai.types.chat.chat_completion_message_param import (
+    ChatCompletionMessageParam,
+)
 import pytest
 
 from art.metrics import MetricsBuilder
@@ -90,7 +93,7 @@ def _response(count: int, *, cost: float | None = None) -> _FakeResponse:
     )
 
 
-_TWO_TRAJECTORIES = [
+_TWO_TRAJECTORIES: list[list[ChatCompletionMessageParam]] = [
     [{"role": "user", "content": "first"}],
     [{"role": "user", "content": "second"}],
 ]
