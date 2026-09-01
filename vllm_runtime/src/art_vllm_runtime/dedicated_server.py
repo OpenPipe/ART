@@ -49,6 +49,7 @@ from art_vllm_runtime.runtime_usage import (
 
 ART_SERVING_PROTOCOL_VERSION = 11
 _PRIVATE_CACHE_IDENTITY_HEADER = "x-art-cache-identity"
+_PRIVATE_COMPLETION_PATH = "/art/internal/v1/completions"
 _PRIVATE_DISPATCH_PATH = "/art/internal/v1/chat/completions"
 _PRIVATE_EXECUTION_RECEIPT_CAPACITY = 4096
 _PRIVATE_EXECUTION_RECEIPT_PREFIX = "/art/internal/v1/requests"
@@ -976,6 +977,8 @@ def _patch_art_runtime_routes() -> None:
     from vllm.entrypoints.openai.chat_completion.protocol import (
         ChatCompletionRequest,
     )
+    from vllm.entrypoints.openai.completion.api_router import create_completion
+    from vllm.entrypoints.openai.completion.protocol import CompletionRequest
     from vllm.entrypoints.serve.utils.api_utils import validate_json_request
 
     from art_vllm_runtime.binary_routes import (
@@ -1051,12 +1054,8 @@ def _patch_art_runtime_routes() -> None:
                 }
             )
 
-        @router.post(
-            _PRIVATE_DISPATCH_PATH,
-            dependencies=[Depends(validate_json_request)],
-        )
-        async def private_chat_completion(
-            request: ChatCompletionRequest, raw_request: Request
+        async def private_completion_request(
+            request: Any, raw_request: Request, create_handler: Any
         ) -> Response:
             context = _private_dispatch_context(raw_request)
             if isinstance(context, JSONResponse):
@@ -1190,13 +1189,11 @@ def _patch_art_runtime_routes() -> None:
             try:
                 with bind_runtime_usage_context(request_identity, usage_context):
                     if route_capture_max_bytes is None:
-                        response = await create_chat_completion(request, raw_request)
+                        response = await create_handler(request, raw_request)
                         routes = None
                     else:
                         with capture_routed_experts() as routes:
-                            response = await create_chat_completion(
-                                request, raw_request
-                            )
+                            response = await create_handler(request, raw_request)
             except BaseException:
                 if route_capture_max_bytes is not None:
                     await _private_route_responses.release(
@@ -1287,6 +1284,28 @@ def _patch_art_runtime_routes() -> None:
                     request_identity, fingerprint, "completed"
                 )
             return response
+
+        @router.post(
+            _PRIVATE_DISPATCH_PATH,
+            dependencies=[Depends(validate_json_request)],
+        )
+        async def private_chat_completion(
+            request: ChatCompletionRequest, raw_request: Request
+        ) -> Response:
+            return await private_completion_request(
+                request, raw_request, create_chat_completion
+            )
+
+        @router.post(
+            _PRIVATE_COMPLETION_PATH,
+            dependencies=[Depends(validate_json_request)],
+        )
+        async def private_completion(
+            request: CompletionRequest, raw_request: Request
+        ) -> Response:
+            return await private_completion_request(
+                request, raw_request, create_completion
+            )
 
         @router.get(f"{_PRIVATE_EXECUTION_RECEIPT_PREFIX}/{{request_identity}}")
         async def private_execution_receipt(

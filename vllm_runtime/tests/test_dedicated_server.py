@@ -584,6 +584,10 @@ def test_runtime_sleep_route_returns_engine_validation_error(monkeypatch) -> Non
     monkeypatch.setattr(api_server, "_art_runtime_routes_patched", False, raising=False)
     dedicated_server._patch_art_runtime_routes()
     app = api_server.build_app()
+    assert {
+        "/art/internal/v1/chat/completions",
+        "/art/internal/v1/completions",
+    } <= {route.path for route in app.routes}
 
     class Engine:
         async def sleep(self, *, level: int, mode: str) -> None:
