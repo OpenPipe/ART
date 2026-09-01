@@ -27,6 +27,8 @@ import json
 import struct
 from typing import Literal, TypeAlias, overload
 
+import torch
+
 Fingerprint: TypeAlias = str
 DecisionSet: TypeAlias = frozenset[int]
 FixedPointScore: TypeAlias = int | tuple[int, ...]
@@ -55,10 +57,19 @@ def _fingerprint(payload: object) -> Fingerprint:
 
 
 def canonical_token_row_fingerprint(tokens: Iterable[int]) -> Fingerprint:
-    """Hash one token row with an explicit, cross-process int64 encoding."""
+    """Hash one token row with an explicit, cross-process int64 encoding.
+
+    Tensor rows take a vectorized path that produces byte-identical digests:
+    little-endian int64 element bytes followed by the element count.
+    """
 
     digest = hashlib.sha256()
     digest.update(_TOKEN_ROW_FINGERPRINT_DOMAIN)
+    if isinstance(tokens, torch.Tensor):
+        row = tokens.detach().reshape(-1).cpu().to(dtype=torch.long).contiguous()
+        digest.update(row.numpy().astype("<i8", copy=False).tobytes())
+        digest.update(_U64.pack(int(row.numel())))
+        return digest.hexdigest()
     count = 0
     for token in tokens:
         value = int(token)
@@ -92,16 +103,23 @@ def canonical_token_rows_fingerprint(
     return digest.hexdigest()
 
 
-def _content_fingerprint(rows: Sequence[Sequence[int]]) -> Fingerprint:
+def _content_fingerprint(rows: Sequence[torch.Tensor]) -> Fingerprint:
     """Hash ordered rows through composable per-row int64 fingerprints."""
 
     return canonical_token_rows_fingerprint(
-        tuple((len(row), canonical_token_row_fingerprint(row)) for row in rows)
+        tuple((int(row.numel()), canonical_token_row_fingerprint(row)) for row in rows)
     )
 
 
-def _token_row(sequence: Sequence[int]) -> tuple[int, ...]:
-    return tuple(int(token) for token in sequence)
+def _token_row(sequence: Sequence[int] | torch.Tensor) -> torch.Tensor:
+    """Normalize one input row to a contiguous CPU int64 tensor."""
+
+    if isinstance(sequence, torch.Tensor):
+        row = sequence.detach().reshape(-1)
+        if row.device.type != "cpu":
+            row = row.cpu()
+        return row.to(dtype=torch.long).contiguous()
+    return torch.as_tensor(tuple(int(token) for token in sequence), dtype=torch.long)
 
 
 @dataclass(frozen=True, slots=True)
@@ -277,22 +295,27 @@ def _finalize_canonical_prefix_tree(
 
 
 def build_canonical_prefix_tree(
-    sequences: Iterable[Sequence[int]],
+    sequences: Iterable[Sequence[int] | torch.Tensor],
 ) -> CanonicalPrefixTree:
     """Build a full radix tree iteratively, with no depth limit.
 
     The input order is semantic: sequence indices and first-seen sibling order
     are retained.  Parents are always emitted before children, which permits
     all subsequent transforms to remain iterative as well.
+
+    Token equality is the only thing the tree needs from the token values, so
+    each shared-segment scan is one vectorized comparison over the active
+    rows' candidate span rather than a per-position Python loop; the result is
+    identical to the scalar algorithm.
     """
 
     rows = tuple(_token_row(sequence) for sequence in sequences)
     if not rows:
         raise ValueError("a canonical prefix tree requires at least one sequence")
-    if any(not row for row in rows):
+    if any(int(row.numel()) == 0 for row in rows):
         raise ValueError("prefix-tree sequences must not be empty")
 
-    lengths = tuple(len(row) for row in rows)
+    lengths = tuple(int(row.numel()) for row in rows)
     segments: list[CanonicalSegment] = []
     tasks: list[tuple[tuple[int, ...], int, int | None]] = [
         (tuple(range(len(rows))), 0, None)
@@ -318,12 +341,16 @@ def build_canonical_prefix_tree(
             continue
 
         shared_end = min(lengths[index] for index in active)
-        reference = rows[active[0]]
         cursor = start
-        while cursor < shared_end and all(
-            rows[index][cursor] == reference[cursor] for index in active[1:]
-        ):
-            cursor += 1
+        if shared_end > start:
+            span = torch.stack([rows[index][start:shared_end] for index in active])
+            mismatch = (span[1:] != span[0]).any(dim=0)
+            first_mismatch = torch.nonzero(mismatch)
+            cursor = start + (
+                int(first_mismatch[0, 0])
+                if first_mismatch.numel()
+                else shared_end - start
+            )
         if cursor > start:
             segment_index = len(segments)
             segments.append(
@@ -344,7 +371,7 @@ def build_canonical_prefix_tree(
         groups: dict[int, list[int]] = {}
         sibling_tokens: list[int] = []
         for sequence_index in active:
-            token = rows[sequence_index][start]
+            token = int(rows[sequence_index][start])
             if token not in groups:
                 groups[token] = []
                 sibling_tokens.append(token)

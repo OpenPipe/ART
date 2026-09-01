@@ -61,6 +61,37 @@ class NonuniformSearchCandidate:
     decision_index: int | None
     parent_selected_decisions: tuple[int, ...] | None
     refinement_decision_indices: tuple[int, ...] = ()
+    # Derived, immutable orderings cached at construction: the Pareto beam
+    # compares every candidate against the frontier many times, and
+    # recomputing these tuples per comparison dominated search time.
+    sorted_decisions: tuple[int, ...] = ()
+    dominance: tuple[int, ...] = ()
+    beam_key: tuple[object, ...] = ()
+
+    def __post_init__(self) -> None:
+        layout = self.candidate.layout
+        sorted_decisions = tuple(sorted(layout.selected_decisions))
+        dominance = (
+            *self.score,
+            layout.packed_tokens,
+            len(layout.segments),
+            len(layout.selected_decisions),
+            layout.maximum_depth,
+        )
+        object.__setattr__(self, "sorted_decisions", sorted_decisions)
+        object.__setattr__(self, "dominance", dominance)
+        object.__setattr__(
+            self,
+            "beam_key",
+            (
+                self.score,
+                layout.packed_tokens,
+                len(layout.segments),
+                len(layout.selected_decisions),
+                layout.maximum_depth,
+                sorted_decisions,
+            ),
+        )
 
     @property
     def layout(self) -> PrefixTreeLayout:
@@ -107,7 +138,7 @@ class NonuniformLayoutSearch:
 def _candidate_rank_key(
     candidate: NonuniformSearchCandidate,
 ) -> tuple[tuple[int, ...], tuple[int, ...]]:
-    return candidate.score, tuple(sorted(candidate.layout.selected_decisions))
+    return candidate.score, candidate.sorted_decisions
 
 
 def _dominance_vector(candidate: NonuniformSearchCandidate) -> tuple[int, ...]:
@@ -119,49 +150,28 @@ def _dominance_vector(candidate: NonuniformSearchCandidate) -> tuple[int, ...]:
     the downstream exact lowerer.
     """
 
-    layout = candidate.layout
-    return (
-        *candidate.score,
-        layout.packed_tokens,
-        len(layout.segments),
-        len(layout.selected_decisions),
-        layout.maximum_depth,
-    )
+    return candidate.dominance
 
 
 def _dominates(
     left: NonuniformSearchCandidate,
     right: NonuniformSearchCandidate,
 ) -> bool:
-    left_values = _dominance_vector(left)
-    right_values = _dominance_vector(right)
-    return all(
-        left_value <= right_value
-        for left_value, right_value in zip(
-            left_values,
-            right_values,
-            strict=True,
-        )
-    ) and any(
-        left_value < right_value
-        for left_value, right_value in zip(
-            left_values,
-            right_values,
-            strict=True,
-        )
-    )
+    left_values = left.dominance
+    right_values = right.dominance
+    if len(left_values) != len(right_values):
+        raise ValueError("dominance vectors must have equal width")
+    strictly_better = False
+    for left_value, right_value in zip(left_values, right_values, strict=True):
+        if left_value > right_value:
+            return False
+        if left_value < right_value:
+            strictly_better = True
+    return strictly_better
 
 
 def _beam_key(candidate: NonuniformSearchCandidate) -> tuple[object, ...]:
-    layout = candidate.layout
-    return (
-        candidate.score,
-        layout.packed_tokens,
-        len(layout.segments),
-        len(layout.selected_decisions),
-        layout.maximum_depth,
-        tuple(sorted(layout.selected_decisions)),
-    )
+    return candidate.beam_key
 
 
 def _pareto_beam(

@@ -2569,8 +2569,10 @@ class TrainerRank:
 
         estimates: dict[int, tuple[_MemoryCheck, bool, bool] | None] = {}
         plans: dict[int, _FlatForwardPlan] = {}
+        exact_failed_width: int | None = None
 
         def estimate(width: int) -> tuple[_MemoryCheck, bool, bool] | None:
+            nonlocal exact_failed_width
             width = normalize(width)
             if width in estimates:
                 return estimates[width]
@@ -2591,11 +2593,16 @@ class TrainerRank:
                 ),
                 sync_across_dp=True,
             )
-            if not check.fits:
+            if not check.fits and (
+                exact_failed_width is None or width < exact_failed_width
+            ):
                 # The cheap no-sharing count is an upper bound: valid for
                 # accepting a width, not for rejecting one. Only when it
                 # rejects, price the width with the planner's actual layouts
                 # so prefix sharing's memory savings can buy a wider wave.
+                # Feasibility is treated as monotone in width (the search
+                # already relies on this), so widths at or above a width whose
+                # exact pricing failed skip the exact evaluation.
                 exact = self._estimate_flat_forward(
                     local_requests, checkpoint=checkpoint, exact=True
                 )
@@ -2613,6 +2620,12 @@ class TrainerRank:
                     ),
                     sync_across_dp=True,
                 )
+                if not check.fits:
+                    exact_failed_width = (
+                        width
+                        if exact_failed_width is None
+                        else min(exact_failed_width, width)
+                    )
             result = (
                 check,
                 self._all_ranks_have_memory_profile(

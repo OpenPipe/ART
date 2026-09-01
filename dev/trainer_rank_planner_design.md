@@ -91,6 +91,26 @@ GRPO cells (sealed: full-sharing arm 875.7 ms vs automatic 1,132.8 ms on the
 win cell). Constants are versioned (`coefficient_version`) for future
 recalibration; not addressed in this PR.
 
+## Planning cost engineering
+
+Two behavior-preserving optimizations keep exact width pricing cheap:
+- `build_canonical_prefix_tree` scans each shared segment with one vectorized
+  tensor comparison over the active rows' span (tokens only ever matter for
+  equality) and hashes row content from tensor bytes — 31 ms -> 2 ms on the
+  sealed win-cell shape, byte-identical output (300-seed equivalence test
+  against the scalar reference algorithm).
+- The bounded search caches each candidate's dominance vector and beam key at
+  construction instead of recomputing them per Pareto comparison — 28 ms ->
+  5 ms per search on an 8-decision tree, identical results (210 baseline
+  fingerprints).
+- Width probing skips exact pricing at or above a width whose exact pricing
+  already failed (feasibility is treated as monotone in width, as the search
+  already assumes).
+Benchmark (2-layer, fresh tokens, forced multi-wave): per-step planning
+67.7 ms -> 42.3 ms, step wall 185.8 ms -> 160.7 ms with sharing-aware widths
+(2 waves) — within ~5% of the no-sharing-bound 4-wave step (153.5 ms) while
+keeping the memory-to-throughput crossover.
+
 ## Overlapped (speculative) next-wave planning
 
 ``forward_micro_batches`` pre-plans the predicted next wave (exactly the
