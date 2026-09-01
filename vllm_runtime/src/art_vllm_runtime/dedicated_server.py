@@ -506,7 +506,11 @@ async def _serving_profile(engine_client: Any) -> dict[str, Any] | None:
         "context_parallel_size": int(parallel.prefill_context_parallel_size),
         "pipeline_parallel_size": int(parallel.pipeline_parallel_size),
         "expert_parallel_size": (
-            int(parallel.data_parallel_size) if parallel.enable_expert_parallel else 1
+            int(parallel.tensor_parallel_size)
+            * int(parallel.prefill_context_parallel_size)
+            * int(parallel.data_parallel_size)
+            if parallel.enable_expert_parallel
+            else 1
         ),
         "data_parallel_size": int(parallel.data_parallel_size),
         "world_size": world_size,

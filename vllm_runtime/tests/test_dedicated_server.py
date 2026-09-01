@@ -262,10 +262,10 @@ async def test_serving_profile_reports_resolved_runtime_geometry(monkeypatch) ->
                 max_model_len=16_384,
             ),
             parallel_config=SimpleNamespace(
-                tensor_parallel_size=2,
+                tensor_parallel_size=8,
                 pipeline_parallel_size=1,
                 data_parallel_size=1,
-                prefill_context_parallel_size=2,
+                prefill_context_parallel_size=1,
                 enable_expert_parallel=True,
             ),
             scheduler_config=SimpleNamespace(
@@ -295,8 +295,9 @@ async def test_serving_profile_reports_resolved_runtime_geometry(monkeypatch) ->
     assert profile.identity.model_identifier == "test/model"
     assert profile.architecture.loaded_layer_count == 24
     assert profile.architecture.handler_name == "test-handler"
+    assert profile.architecture.expert_parallel_size == 8
     assert profile.runtime_model == "test/model"
-    assert profile.tensor_parallel_size == 2
+    assert profile.tensor_parallel_size == 8
     assert profile.quantization == "fp8"
     assert profile.multi_token_prediction
     assert profile.kv_block_bytes_per_rank == 65_536
