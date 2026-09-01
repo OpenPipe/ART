@@ -2463,6 +2463,48 @@ def test_optim_step_implicitly_steps_only_slots_with_grads(
     torch.testing.assert_close(untouched, before_untouched)
 
 
+def test_optim_step_implicitly_ignores_resident_forward_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trainer = TrainerRank(_runtime())
+    student = torch.nn.Parameter(torch.ones(2))
+    student.grad = torch.ones_like(student)
+    snapshot = torch.nn.Parameter(torch.full((2,), 2.0), requires_grad=False)
+    trainer._checkpoint_slots["student"] = _CheckpointSlot(params=(student,))
+    trainer._checkpoint_slots["saved"] = _CheckpointSlot(
+        params=(snapshot,), snapshot=True
+    )
+    monkeypatch.setattr(trainer, "_slot_ref", _slot_ref)
+    trainer._set_default_slot(_slot_ref("student"))
+    _stub_forward(monkeypatch, trainer, profiled=True)
+    list(
+        trainer.forward_micro_batches(
+            [_target_request(1)], checkpoint="saved", no_grad=True
+        )
+    )
+    monkeypatch.setattr(
+        trainer,
+        "_reduce_dynamic_grads",
+        lambda params, **_kwargs: tuple(param.grad.float() for param in params),
+    )
+
+    before_student = student.detach().clone()
+    before_snapshot = snapshot.detach().clone()
+    trainer.optim_step(
+        params=AdamParams(learning_rate=1e-2, weight_decay=0.0, grad_clip_norm=10.0)
+    )
+
+    assert not torch.equal(before_student, student)
+    torch.testing.assert_close(snapshot, before_snapshot)
+    assert trainer._checkpoint_slots["saved"].optimizer is None
+    assert trainer._default_slot_ref == _slot_ref("student")
+    with pytest.raises(TrainerRankSlotStateError, match="forward-only"):
+        trainer.optim_step(params=AdamParams(learning_rate=1e-2), checkpoints=["saved"])
+    del trainer._checkpoint_slots["student"]
+    with pytest.raises(TrainerRankSlotStateError, match="trainable checkpoint"):
+        trainer.optim_step(params=AdamParams(learning_rate=1e-2))
+
+
 def test_dynamic_optimizer_zeroes_internal_padding_grads_before_step(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

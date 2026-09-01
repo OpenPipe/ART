@@ -2009,11 +2009,21 @@ class TrainerRank:
                 "that slot before stepping."
             )
         requested = (
-            tuple(sorted(loaded))
+            tuple(
+                sorted(
+                    name for name in loaded if not self._checkpoint_slots[name].snapshot
+                )
+            )
             if checkpoints is None
             else tuple(dict.fromkeys(checkpoints))
         )
         if not requested:
+            if checkpoints is None:
+                raise TrainerRankSlotStateError(
+                    "TrainerRank.optim_step requires a loaded trainable checkpoint "
+                    "slot. Call load_checkpoint(...) and run backward on outputs "
+                    "produced by that slot before stepping."
+                )
             raise TrainerRankSlotStateError(
                 "TrainerRank.optim_step(checkpoints=...) received no checkpoint "
                 "names. Pass at least one loaded checkpoint slot."
