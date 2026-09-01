@@ -48,6 +48,9 @@ DEFAULT_RUBRIC = dedent(
 """Default rubric used by RULER. This generic rubric works well for most tasks,
 as RULER extracts task understanding from the system prompts in the trajectories."""
 
+# A malformed relative ranking is usually transient; permit one bounded re-judge.
+_SCORE_COUNT_ATTEMPTS = 2
+
 
 def _judge_provider(judge_model: str) -> str | None:
     provider, separator, _ = judge_model.partition("/")
@@ -217,50 +220,53 @@ async def ruler(
         {"role": "user", "content": user_text},
     ]
 
-    response = await acompletion(
-        model=judge_model,
-        messages=messages,
-        response_format=Response,
-        caching=False,
-        **extra_litellm_params if extra_litellm_params else {},
-    )
-    assert isinstance(response, ModelResponse)
-    _record_ruler_cost(judge_model, response)
+    for attempt in range(_SCORE_COUNT_ATTEMPTS):
+        response = await acompletion(
+            model=judge_model,
+            messages=messages,
+            response_format=Response,
+            caching=False,
+            **extra_litellm_params if extra_litellm_params else {},
+        )
+        assert isinstance(response, ModelResponse)
+        _record_ruler_cost(judge_model, response)
 
-    if len(response.choices) == 0:
-        raise ValueError(f"No choices in response: {response}")
-    first_choice = response.choices[0]
+        if len(response.choices) == 0:
+            raise ValueError(f"No choices in response: {response}")
+        first_choice = response.choices[0]
 
-    if debug:
-        raw_content = first_choice.message.content or "{}"
-        try:
-            print("\n[RULER] Pretty-printed LLM choice JSON:")
-            print(json.loads(raw_content))
-        except json.JSONDecodeError as e:
-            print(f"[RULER] Could not parse choice content as JSON: {e}")
-            print(f"[RULER] Raw choice content: {raw_content}")
+        if debug:
+            raw_content = first_choice.message.content or "{}"
+            try:
+                print("\n[RULER] Pretty-printed LLM choice JSON:")
+                print(json.loads(raw_content))
+            except json.JSONDecodeError as e:
+                print(f"[RULER] Could not parse choice content as JSON: {e}")
+                print(f"[RULER] Raw choice content: {raw_content}")
 
-    content = first_choice.message.content or "{}"
-    parsed = Response.model_validate_json(content)
-
-    # If all trajectories were identical, we only sent one to the judge
-    # Duplicate the score for all trajectories
-    if all_identical:
-        if len(parsed.scores) != 1:
+        content = first_choice.message.content or "{}"
+        parsed = Response.model_validate_json(content)
+        expected_scores = 1 if all_identical else len(message_lists)
+        if len(parsed.scores) != expected_scores:
+            if attempt + 1 < _SCORE_COUNT_ATTEMPTS:
+                continue
+            qualifier = " for identical trajectories" if all_identical else ""
             raise ValueError(
-                f"Expected 1 score for identical trajectories, but got {len(parsed.scores)}"
+                f"Expected {expected_scores} score{'' if expected_scores == 1 else 's'}"
+                f"{qualifier}, but got {len(parsed.scores)}"
             )
-        single_score = parsed.scores[0]
-        return [
-            single_score.model_copy(update={"trajectory_id": str(i)})
-            for i in range(1, len(message_lists) + 1)
-        ]
-    else:
-        if len(parsed.scores) != len(message_lists):
-            raise ValueError(
-                f"Expected {len(message_lists)} scores, but got {len(parsed.scores)}"
-            )
+
+        # If all trajectories were identical, we only sent one to the judge.
+        # Duplicate the score for all trajectories.
+        if all_identical:
+            single_score = parsed.scores[0]
+            return [
+                single_score.model_copy(update={"trajectory_id": str(i)})
+                for i in range(1, len(message_lists) + 1)
+            ]
         return parsed.scores
+
+    raise AssertionError("RULER score-count retry loop did not return")
 
 
 async def ruler_score_group(
