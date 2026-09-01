@@ -282,7 +282,7 @@ class PortableSnapshotSink(Protocol):
         export_id: str,
         generation: PortableSnapshotGeneration,
         rank: int,
-        checkpoint_digest: str,
+        checkpoint_digest: str | None,
         directory: Path,
         files: tuple[PortableSnapshotPreparedFile, ...],
     ) -> tuple[PortableSnapshotCommittedFile, ...]: ...
