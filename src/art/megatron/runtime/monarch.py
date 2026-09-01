@@ -706,14 +706,16 @@ class MonarchTrainerActor(Actor):
         launch: Any,
         *,
         label: str,
+        ready_already_sent: bool = False,
     ) -> None:
-        ready_port.send(
-            _CommandReady(
-                rank=self._runtime.rank,
-                operation_id=job.operation_id,
-                learner_version=job.expected_learner_version,
-            ).model_dump(mode="json")
-        )
+        if not ready_already_sent:
+            ready_port.send(
+                _CommandReady(
+                    rank=self._runtime.rank,
+                    operation_id=job.operation_id,
+                    learner_version=job.expected_learner_version,
+                ).model_dump(mode="json")
+            )
 
         def materialize() -> dict[str, Any]:
             result = launch.materialize()
@@ -1097,7 +1099,6 @@ class MonarchTrainerActor(Actor):
         job_json: str,
         batch_json: str,
         ready_port: Port[dict[str, Any]],
-        resident_executor: bool = False,
     ) -> None:
         batch = None
         job = None
@@ -1117,45 +1118,27 @@ class MonarchTrainerActor(Actor):
                 if self._runtime.rank == 0
                 else job.model_copy(update={"return_token_logprobs": False})
             )
-            if resident_executor:
-                # Admission lets the service queue this run's optimizer behind the
-                # synchronous actor call. The actor remains the serialized GPU owner.
-                ready_port.send(
-                    _CommandReady(
-                        rank=self._runtime.rank,
-                        operation_id=job.operation_id,
-                        learner_version=job.expected_learner_version,
-                    ).model_dump(mode="json")
-                )
-                ready_sent = True
-                result = self._executor.execute_forward_backward(
-                    execute_job,
-                    batch,
-                    Event(),
-                    preserve_gradient_image=False,
-                )
-                response_port.send(
-                    {
-                        **result,
-                        "command_status": "succeeded",
-                        "rank": self._runtime.rank,
-                        "metrics": (
-                            result["metrics"] if self._runtime.rank == 0 else {}
-                        ),
-                        "token_logprobs": (
-                            result["token_logprobs"] if self._runtime.rank == 0 else ()
-                        ),
-                    }
-                )
-            else:
-                launch = self._run_slot_executor.execute_forward_backward(
-                    execute_job, batch, Event()
-                )
-                batch.close()
-                batch = None
-                self._defer_command_launch(
-                    response_port, ready_port, job, launch, label="fb"
-                )
+            ready_port.send(
+                _CommandReady(
+                    rank=self._runtime.rank,
+                    operation_id=job.operation_id,
+                    learner_version=job.expected_learner_version,
+                ).model_dump(mode="json")
+            )
+            ready_sent = True
+            launch = self._run_slot_executor.execute_forward_backward(
+                execute_job, batch, Event()
+            )
+            batch.close()
+            batch = None
+            self._defer_command_launch(
+                response_port,
+                ready_port,
+                job,
+                launch,
+                label="fb",
+                ready_already_sent=True,
+            )
         except BaseException as error:
             self._valid = False
             try:
@@ -1185,6 +1168,7 @@ class MonarchTrainerActor(Actor):
         ready_port: Port[dict[str, Any]],
     ) -> None:
         job = None
+        ready_sent = False
         try:
             if not self._valid:
                 raise RuntimeError("trainer actor runtime is invalid")
@@ -1198,11 +1182,24 @@ class MonarchTrainerActor(Actor):
                 if self._runtime.rank == 0
                 else job.model_copy(update={"return_token_logprobs": False})
             )
+            ready_port.send(
+                _CommandReady(
+                    rank=self._runtime.rank,
+                    operation_id=job.operation_id,
+                    learner_version=job.expected_learner_version,
+                ).model_dump(mode="json")
+            )
+            ready_sent = True
             launch = self._run_slot_executor.execute_sft_forward_backward(
                 execute_job, batch, Event()
             )
             self._defer_command_launch(
-                response_port, ready_port, job, launch, label="sft-fb"
+                response_port,
+                ready_port,
+                job,
+                launch,
+                label="sft-fb",
+                ready_already_sent=True,
             )
         except BaseException as error:
             self._valid = False
@@ -1213,7 +1210,13 @@ class MonarchTrainerActor(Actor):
                     "SFT F/B actor cleanup also failed: "
                     f"{type(cleanup_error).__name__}: {cleanup_error}"
                 )
-            self._fail_command_launch(response_port, ready_port, job, error)
+            self._fail_command_launch(
+                response_port,
+                ready_port,
+                job,
+                error,
+                ready_already_sent=ready_sent,
+            )
 
     @endpoint(explicit_response_port=True)
     def execute_sft_forward(
@@ -1324,6 +1327,7 @@ class MonarchTrainerActor(Actor):
 
     @endpoint
     def execute_optimizer(self, job_json: str) -> dict[str, Any]:
+        admitted = False
         try:
             if not self._valid:
                 raise RuntimeError("trainer actor runtime is invalid")
@@ -1331,6 +1335,13 @@ class MonarchTrainerActor(Actor):
                 raise RuntimeError("optimizer has no open F/B interval")
             job = OptimizerJobSpec.model_validate_json(job_json)
             self._migration_release_receipts.pop(job.run_id, None)
+            self._run_slot_executor.admit_residency(
+                job.operation_id,
+                job.run_id,
+                ("weights", "optimizer", "accumulator"),
+                job.expected_learner_version,
+            )
+            admitted = True
             result = self._run_slot_executor.execute_optimizer(job)
             return {
                 **result,
@@ -1340,6 +1351,16 @@ class MonarchTrainerActor(Actor):
             }
         except BaseException as error:
             self._valid = False
+            if admitted:
+                try:
+                    self._run_slot_executor.release_residency_admission(
+                        job.operation_id
+                    )
+                except BaseException as cleanup_error:
+                    error.add_note(
+                        "optimizer residency rollback also failed: "
+                        f"{type(cleanup_error).__name__}: {cleanup_error}"
+                    )
             try:
                 self._run_slot_executor.discard_open_gradients()
             except BaseException as cleanup_error:
@@ -1357,69 +1378,23 @@ class MonarchTrainerActor(Actor):
                 self._command_job_open = False
 
     @endpoint
-    def execute_resident_optimizer_and_publish(
-        self,
-        job_json: str,
-        publication_job_json: str,
-        event_port: Port[dict[str, Any]],
-    ) -> dict[str, Any]:
-        """Commit the fused-service optimizer and launch its ordinary snapshot."""
-
-        try:
-            if not self._valid:
-                raise RuntimeError("trainer actor runtime is invalid")
-            if not self._command_job_open:
-                raise RuntimeError("optimizer has no open F/B interval")
-            job = OptimizerJobSpec.model_validate_json(job_json)
-            publication_job = TrainJobSpec.model_validate_json(publication_job_json)
-            if (
-                publication_job.run_id != job.run_id
-                or publication_job.training_session_id != job.training_session_id
-                or publication_job.expected_learner_version
-                != job.expected_learner_version
-                or publication_job.learner_version != job.learner_version
-                or publication_job.source != job.source
-                or publication_job.output.generation != job.generation
-                or publication_job.optimizer_state_path != job.optimizer_state_path
-            ):
-                raise RuntimeError(
-                    "split optimizer and publication identities do not match"
-                )
-            result = self._executor.execute_optimizer(job)
-            publication_metrics = self._executor.publish_split_generation(
-                publication_job,
-                sink=_ActorEventSink(event_port, coordinator=self._runtime.rank == 0),
-            )
-            self._publish_compile_cache()
-            return {
-                **result,
-                "command_status": "succeeded",
-                "rank": self._runtime.rank,
-                "metrics": result["metrics"] if self._runtime.rank == 0 else {},
-                "publication_metrics": publication_metrics,
-                "compile_cache": self._compile_cache_metrics,
-            }
-        except BaseException as error:
-            self._valid = False
-            try:
-                self._abort_command_job()
-            except BaseException as cleanup_error:
-                error.add_note(
-                    "resident optimizer actor cleanup also failed: "
-                    f"{type(cleanup_error).__name__}: {cleanup_error}"
-                )
-            return _rank_command_failure(self._runtime.rank, error)
-        finally:
-            if self._command_job_open and not self._executor.has_open_gradients:
-                self._weight_offload.after_job()
-                self._command_job_open = False
-
-    @endpoint
     def publish_command_generation(self, spec_json: str) -> dict[str, Any]:
         if not self._valid:
             raise RuntimeError("trainer actor runtime is invalid")
         spec = CommandPublicationSpec.model_validate_json(spec_json)
         return self._run_slot_executor.publish_generation(spec)
+
+    @endpoint
+    def start_command_generation_publication(
+        self, spec_json: str, event_port: Port[dict[str, Any]]
+    ) -> dict[str, Any]:
+        if not self._valid:
+            raise RuntimeError("trainer actor runtime is invalid")
+        spec = CommandPublicationSpec.model_validate_json(spec_json)
+        return self._run_slot_executor.start_generation_publication(
+            spec,
+            _ActorEventSink(event_port, coordinator=self._runtime.rank == 0),
+        )
 
     @endpoint
     def release_command_run_for_migration(
@@ -2209,11 +2184,10 @@ class MonarchTrainerRun:
             state = self._command_runs.get(run_id)
             if (
                 state is None
-                or state.open_forward_backward_ids
                 or state.spec.training_session_id != generation.training_session_id
                 or state.learner_version != generation.policy_step
             ):
-                raise RuntimeError("checkpoint export generation is not quiescent")
+                raise RuntimeError("checkpoint export generation is not resident")
             values = await asyncio.wait_for(
                 self._actors.export_command_run_checkpoint.call(
                     run_id, generation.model_dump_json(), export_id
@@ -2611,36 +2585,6 @@ class MonarchTrainerRun:
             backward=True,
         )
 
-    async def start_resident_forward_backward(
-        self,
-        job: ForwardBackwardJobSpec,
-        batch: PackedBatchLeaseSet,
-    ) -> TrainerCommandLaunch:
-        """Run split F/B on the fused service's resident executor."""
-
-        def validate() -> None:
-            if batch.ref != job.batch:
-                raise ValueError("F/B batch ref does not match its leases")
-            if job.batch.sequence_length != self.runtime_spec.packed_sequence_length:
-                raise ValueError("F/B batch length does not match the trainer runtime")
-            if (
-                job.batch.moe_routing_replay is not None
-                and not self.runtime_spec.enable_moe_routing_replay
-            ):
-                raise ValueError(
-                    "F/B routing replay is disabled on this trainer runtime"
-                )
-
-        return await self._start_command(
-            job,
-            lambda ready: self._actors.execute_forward_backward.call(
-                job.model_dump_json(), batch.model_dump_json(), ready, True
-            ),
-            validate=validate,
-            label="resident F/B",
-            backward=True,
-        )
-
     async def forward(
         self,
         job: ForwardJobSpec,
@@ -2965,45 +2909,18 @@ class MonarchTrainerRun:
             self._cache_operation(job.operation_id, job.fingerprint, result)
             return result
 
-    async def resident_optim_step_and_publish(
-        self,
-        job: OptimizerJobSpec,
-        publication_job: TrainJobSpec,
-    ) -> tuple[dict[str, Any], dict[str, float]]:
-        """Commit the fused-service optimizer and launch its async publication."""
-
-        cached = self._operations.get(job.operation_id)
-        if cached is not None and cached[0] == job.fingerprint:
-            result = cached[1]
-            return result, dict(result["publication_metrics"])
+    async def start_command_generation_publication(
+        self, spec: CommandPublicationSpec
+    ) -> dict[str, float]:
         async with self._lock:
-            cached = self._operations.get(job.operation_id)
-            if cached is not None:
-                if cached[0] != job.fingerprint:
-                    raise RuntimeError(
-                        "operation_id was reused for a different optimizer"
-                    )
-                result = cached[1]
-                return result, dict(result["publication_metrics"])
-            state = self._validate_command(job)
-            contributions = tuple(state.open_forward_backward_ids)
-            if job.contributing_forward_backward_operation_ids != contributions:
-                raise RuntimeError("optimizer does not seal the exact open F/B set")
-            if (
-                publication_job.run_id != job.run_id
-                or publication_job.training_session_id != job.training_session_id
-                or publication_job.expected_learner_version
-                != job.expected_learner_version
-                or publication_job.learner_version != job.learner_version
-                or publication_job.source != job.source
-                or publication_job.output.generation != job.generation
-                or publication_job.optimizer_state_path != job.optimizer_state_path
-            ):
-                raise RuntimeError(
-                    "split optimizer and publication identities do not match"
-                )
-
-            generation_id = publication_job.output_generation_id
+            if self._closed or not self._valid:
+                raise RuntimeError("trainer runtime is invalid")
+            state = self._command_runs.get(spec.run_id)
+            if state is None or state.learner_version != spec.generation.policy_step:
+                raise RuntimeError("published generation is not resident")
+            if state.spec.training_session_id != spec.generation.training_session_id:
+                raise RuntimeError("published generation belongs to another session")
+            generation_id = spec.generation.generation_id
             if generation_id in self._publications:
                 raise RuntimeError(
                     f"publication generation already exists: {generation_id}"
@@ -3017,89 +2934,16 @@ class MonarchTrainerRun:
             send_port, receiver = Channel[dict[str, Any]].open()
             drain = asyncio.create_task(
                 self._drain_publication(receiver, publication_state),
-                name=f"megatron-split-publication-{generation_id}",
+                name=f"megatron-command-publication-{generation_id}",
             )
             self._publication_drains.add(drain)
             drain.add_done_callback(self._publication_drains.discard)
             drain.add_done_callback(consume_future_exception)
             try:
                 values = await self._run_resident_collective(
-                    job.operation_id,
-                    self._actors.execute_resident_optimizer_and_publish.call(
-                        job.model_dump_json(),
-                        publication_job.model_dump_json(),
-                        send_port,
-                    ),
-                    invalidate_on_error=True,
-                )
-                results = list(values.values())
-                self._raise_command_failure(results)
-                self._validate_command_results(
-                    results,
-                    operation_id=job.operation_id,
-                    learner_version=job.learner_version,
-                )
-                contribution_sets = {
-                    tuple(result["contributing_forward_backward_operation_ids"])
-                    for result in results
-                }
-                if contribution_sets != {contributions}:
-                    raise RuntimeError(
-                        "trainer ranks consumed different F/B operations"
-                    )
-                result = dict(next(item for item in results if item["rank"] == 0))
-                result["gpu_service_ns"], result["gpu_count"] = (
-                    self._aggregate_gpu_service(results)
-                )
-                metric_names = {
-                    name for item in results for name in item["publication_metrics"]
-                }
-                publication_metrics = {
-                    name: max(
-                        float(item["publication_metrics"].get(name, 0.0))
-                        for item in results
-                    )
-                    for name in metric_names
-                }
-                result["publication_metrics"] = publication_metrics
-                state.open_forward_backward_ids.clear()
-                state.learner_version = job.learner_version
-                state.next_operation_sequence += 1
-                if job.run_id == self.run_spec.run_id:
-                    self._learner_version = job.learner_version
-                self._cache_operation(job.operation_id, job.fingerprint, result)
-                return result, publication_metrics
-            except BaseException as error:
-                if not publication.done():
-                    publication.set_exception(error)
-                    publication_state.records.clear()
-                if not drain.done():
-                    drain.cancel()
-                    await asyncio.gather(drain, return_exceptions=True)
-                await self._invalidate_after_command_failure(error)
-                raise
-            finally:
-                publication_state.train_done = True
-                self._retire_publication(publication_state)
-
-    async def publish_command_generation(
-        self, spec: CommandPublicationSpec
-    ) -> tuple[tuple[TrainerRankPublication, ...], dict[str, float]]:
-        async with self._lock:
-            if self._closed or not self._valid:
-                raise RuntimeError("trainer runtime is invalid")
-            state = self._command_runs.get(spec.run_id)
-            if state is None or state.learner_version != spec.generation.policy_step:
-                raise RuntimeError("published generation is not resident")
-            if state.spec.training_session_id != spec.generation.training_session_id:
-                raise RuntimeError("published generation belongs to another session")
-            if state.open_forward_backward_ids:
-                raise RuntimeError("cannot publish a generation with open gradients")
-            try:
-                values = await self._run_resident_collective(
-                    spec.generation.generation_id,
-                    self._actors.publish_command_generation.call(
-                        spec.model_dump_json()
+                    generation_id,
+                    self._actors.start_command_generation_publication.call(
+                        spec.model_dump_json(), send_port
                     ),
                     invalidate_on_error=True,
                 )
@@ -3112,28 +2956,36 @@ class MonarchTrainerRun:
                     != {spec.generation.generation_id}
                 ):
                     raise RuntimeError("trainer ranks disagreed on command publication")
-                records = tuple(
-                    sorted(
-                        (
-                            TrainerRankPublication.model_validate(result["record"])
-                            for result in results
-                        ),
-                        key=lambda record: record.rank,
-                    )
-                )
                 metric_names = {
                     name for result in results for name in result["metrics"]
                 }
-                metrics = {
+                return {
                     name: max(
                         float(result["metrics"].get(name, 0.0)) for result in results
                     )
                     for name in metric_names
                 }
-                return records, metrics
             except BaseException as error:
+                if not publication.done():
+                    publication.set_exception(error)
+                    publication_state.records.clear()
+                publication_state.late_waitable = False
+                publication_state.outcome_observed = True
+                if not drain.done():
+                    drain.cancel()
+                    await asyncio.gather(drain, return_exceptions=True)
                 await self._invalidate_after_command_failure(error)
                 raise
+            finally:
+                publication_state.train_done = True
+                self._retire_publication(publication_state)
+
+    async def publish_command_generation(
+        self, spec: CommandPublicationSpec
+    ) -> tuple[tuple[TrainerRankPublication, ...], dict[str, float]]:
+        metrics = await self.start_command_generation_publication(spec)
+        records = await self.wait_for_publication(spec.generation.generation_id)
+        return records, metrics
 
     def _cache_operation(
         self, operation_id: str, fingerprint: str, result: dict[str, Any]

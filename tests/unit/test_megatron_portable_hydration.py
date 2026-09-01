@@ -125,6 +125,110 @@ def test_rank_residency_evidence_retains_bounded_copy_facts(
     )
 
 
+def test_fresh_optimizer_is_prepared_entirely_on_cpu(
+    monkeypatch: pytest.MonkeyPatch,
+    executor_module: Any,
+) -> None:
+    from art.megatron import checkpoint
+    from art.megatron.runtime.run_slots import MegatronRunSlots, OptimizerConfig
+
+    parameter = torch.nn.Parameter(torch.tensor([1.0, 2.0], dtype=torch.bfloat16))
+    slots = object.__new__(MegatronRunSlots)
+    slots._checkpoint_slots = {
+        "run": checkpoint.CheckpointSlot(params=(parameter,), config={})
+    }
+    monkeypatch.setattr(
+        MegatronRunSlots,
+        "_zero_dynamic_optimizer_padding",
+        lambda *_args, **_kwargs: None,
+    )
+    cuda_initialized = torch.cuda.is_initialized()
+
+    tensors = slots.prepare_fresh_checkpoint_slot_optimizer_for_residency(
+        "run", OptimizerConfig(learning_rate=0.0)
+    )
+
+    assert torch.cuda.is_initialized() == cuda_initialized
+    dynamic = slots._checkpoint_slots["run"].optimizer
+    assert dynamic is not None
+    assert len(dynamic.master_params) == 1
+    master = dynamic.master_params[0]
+    assert master.device.type == "cpu"
+    assert master.dtype == torch.float32
+    assert master.untyped_storage().data_ptr() != parameter.untyped_storage().data_ptr()
+    torch.testing.assert_close(master, parameter.float())
+    state = dynamic.optimizer.state[master]
+    assert set(state) == {"step", "exp_avg", "exp_avg_sq"}
+    assert all(tensor.device.type == "cpu" for tensor in tensors)
+    assert tuple(map(id, tensors)) == tuple(
+        map(id, (master, state["exp_avg"], state["exp_avg_sq"]))
+    )
+
+
+def test_cold_registration_atomically_adopts_cpu_working_set(
+    monkeypatch: pytest.MonkeyPatch,
+    executor_module: Any,
+) -> None:
+    from art.megatron.model_support import lora_disk
+
+    weights = (torch.nn.Parameter(torch.tensor([1.0])),)
+    optimizer = (torch.tensor([2.0]), torch.tensor([3.0]))
+
+    class Slots:
+        def __init__(self) -> None:
+            self.loads: list[tuple[str, str]] = []
+
+        def load_checkpoint_for_residency(
+            self, run_id: str, path: str
+        ) -> tuple[tuple[torch.nn.Parameter, ...], tuple[torch.Tensor, ...]]:
+            self.loads.append((run_id, path))
+            return weights, optimizer
+
+        def release_checkpoint_slot(self, _run_id: str) -> None:
+            raise AssertionError("successful cold registration released its slot")
+
+    monkeypatch.setattr(
+        lora_disk,
+        "load_adapter_config",
+        lambda _path: {"r": 4, "target_modules": ["q_proj"]},
+    )
+    monkeypatch.setattr(
+        lora_disk,
+        "training_target_modules",
+        lambda _config: ("q_proj",),
+    )
+    slots = Slots()
+    residency = _Residency(())
+    executor = object.__new__(executor_module.MCoreRunSlotExecutor)
+    executor._closed = False
+    executor._runs = {}
+    executor._slots = slots
+    executor._residency = residency
+    executor._topology_fingerprint = "topology"
+    spec = SimpleNamespace(
+        run_id="run",
+        training_session_id="session",
+        lora_rank=4,
+        lora_target_modules=("q_proj",),
+        initial_adapter_path="/adapter",
+        initial_portable_snapshot=None,
+        initial_learner_version=0,
+        initial_generation_id="generation",
+    )
+
+    assert executor.register_run(spec) is None
+
+    assert slots.loads == [("run", "/adapter")]
+    assert [event for event, _value in residency.events] == ["register_l2"]
+    working_set = residency.events[0][1]
+    assert tuple(key.representation for key, _tensors in working_set) == (
+        "weights",
+        "optimizer",
+    )
+    assert working_set[0][1] is weights
+    assert working_set[1][1] is optimizer
+
+
 def _archive(*, step: int = 7) -> Any:
     checkpoint_digest = "d" * 64
     files = tuple(
@@ -239,6 +343,9 @@ class _Residency:
         self.config = SimpleNamespace(shutdown_timeout_s=1.0)
         self.current = set(keys)
         self.events: list[tuple[str, Any]] = []
+
+    def register_l1(self, *_args: Any, **_kwargs: Any) -> None:
+        raise AssertionError("cold run registration eagerly registered L1 state")
 
     def register_l2_working_set(self, working_set: Any) -> None:
         working_set = tuple(working_set)

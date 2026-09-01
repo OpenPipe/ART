@@ -17,6 +17,7 @@ class _Record:
 class _Publisher:
     def __init__(self) -> None:
         self.adapter_config: dict[str, Any] | None = None
+        self.sink: Any = None
 
     def submit_command(
         self,
@@ -27,7 +28,9 @@ class _Publisher:
     ) -> dict[str, float]:
         del spec
         self.adapter_config = adapter_config
-        sink.future.set_result(_Record())
+        self.sink = sink
+        if hasattr(sink, "future"):
+            sink.future.set_result(_Record())
         return {"snapshot": 0.5}
 
 
@@ -48,6 +51,36 @@ def _publication_spec() -> Any:
 def test_command_publication_uses_resident_adapter_config() -> None:
     adapter_config = {"r": 4, "target_modules": ["q_proj", "v_proj"]}
     publisher = _Publisher()
+    weights_key = object()
+    executor = object.__new__(MCoreRunSlotExecutor)
+    executor.runtime = SimpleNamespace(rank=0)
+    executor._runs = {
+        "run": _ResidentCommandRun(
+            spec=cast(
+                TrainingRunSpec,
+                SimpleNamespace(training_session_id="session"),
+            ),
+            learner_version=3,
+            gradients=SimpleNamespace(contribution_ids=("fb-1",)),
+            adapter_config=adapter_config,
+            weights_key=cast(Any, weights_key),
+        )
+    }
+    executor._publisher = publisher
+    executor._residency = SimpleNamespace(
+        acquire_l1_working_set=lambda keys: None,
+        release_l1_working_set=lambda keys: None,
+    )
+
+    result = executor.publish_generation(_publication_spec())
+
+    assert publisher.adapter_config is adapter_config
+    assert result["record"] == {"rank": 0}
+    assert result["metrics"] == {"snapshot": 0.5}
+
+
+def test_command_publication_can_return_after_snapshot_handoff() -> None:
+    publisher = _Publisher()
     executor = object.__new__(MCoreRunSlotExecutor)
     executor.runtime = SimpleNamespace(rank=0)
     executor._runs = {
@@ -58,13 +91,18 @@ def test_command_publication_uses_resident_adapter_config() -> None:
             ),
             learner_version=3,
             gradients=SimpleNamespace(contribution_ids=()),
-            adapter_config=adapter_config,
+            adapter_config={},
+            weights_key=cast(Any, object()),
         )
     }
     executor._publisher = publisher
+    executor._residency = SimpleNamespace(
+        acquire_l1_working_set=lambda keys: None,
+        release_l1_working_set=lambda keys: None,
+    )
+    sink = SimpleNamespace()
 
-    result = executor.publish_generation(_publication_spec())
+    result = executor.start_generation_publication(_publication_spec(), cast(Any, sink))
 
-    assert publisher.adapter_config is adapter_config
-    assert result["record"] == {"rank": 0}
+    assert publisher.sink is sink
     assert result["metrics"] == {"snapshot": 0.5}

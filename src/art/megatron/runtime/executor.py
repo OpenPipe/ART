@@ -254,8 +254,6 @@ class MegatronTrainJobExecutor:
         job: ForwardBackwardJobSpec,
         batch: InMemoryPackedBatch,
         cancelled: Event,
-        *,
-        preserve_gradient_image: bool = True,
     ) -> dict[str, Any]:
         if self._closed:
             raise RuntimeError("Megatron executor is closed")
@@ -288,8 +286,7 @@ class MegatronTrainJobExecutor:
             gradient_accumulator=gradients,
             cancelled=cancelled,
         )
-        if preserve_gradient_image:
-            gradients.stash_resident()
+        gradients.stash_resident()
         self._enforce_accumulator_budget()
         self._gradient_parent_versions[job.run_id] = job.expected_learner_version
         return {
@@ -411,45 +408,6 @@ class MegatronTrainJobExecutor:
             "gpu_service_ns": gpu_service_ns,
             "metrics": metrics,
         }
-
-    def publish_split_generation(
-        self,
-        job: TrainJobSpec,
-        *,
-        sink: EventSink,
-    ) -> dict[str, float]:
-        """Launch the ordinary fast snapshot after a split optimizer command."""
-
-        if self._closed:
-            raise RuntimeError("Megatron executor is closed")
-        self._require_no_open_gradients()
-        self._publisher.raise_if_failed()
-        runtime = self.runtime
-        if (
-            runtime.resident_run_id != job.run_id
-            or runtime.resident_training_session_id != job.training_session_id
-            or runtime.resident_policy_step != job.learner_version
-            or runtime.resident_generation_id != job.output_generation_id
-            or runtime.adapter_export_dtypes is None
-            or runtime.adapter_export_config is None
-        ):
-            raise RuntimeError(
-                "split publication does not match the resident learner generation"
-            )
-        from art.megatron.train import _should_snapshot_optimizer
-
-        return self._publisher.submit(
-            job,
-            runtime.adapter_export_dtypes,
-            runtime.adapter_export_config,
-            _should_snapshot_optimizer(
-                runtime,
-                step=job.learner_version,
-                optimizer_save_interval=job.config.optimizer_save_interval,
-                final_training_step=job.config.final_training_step,
-            ),
-            sink=sink,
-        )
 
     def execute_sft(
         self,
@@ -830,12 +788,12 @@ class MCoreRunSlotExecutor:
                     raise RuntimeError(
                         "resident adapter shape differs from run admission"
                     )
-                self._slots.load_checkpoint(spec.run_id, spec.initial_adapter_path)
-                installed = True
-                parameters = self._slots.checkpoint_slot_parameters(spec.run_id)
-                optimizer_tensors = self._slots.prepare_checkpoint_slot_optimizer(
-                    spec.run_id, OptimizerConfig(learning_rate=0.0)
+                parameters, optimizer_tensors = (
+                    self._slots.load_checkpoint_for_residency(
+                        spec.run_id, spec.initial_adapter_path
+                    )
                 )
+                installed = True
             else:
                 archive = spec.initial_portable_snapshot
                 generation = archive.generation
@@ -874,23 +832,14 @@ class MCoreRunSlotExecutor:
             state.optimizer_key = self._residency_key(
                 state, generation_id=generation_id, representation="optimizer"
             )
-            if prepared_portable is None:
-                weights_l2 = self._residency.register_l1(state.weights_key, parameters)
-                registered_keys = (state.weights_key,)
-                optimizer_l2 = self._residency.register_l1(
-                    state.optimizer_key, optimizer_tensors
+            self._register_l2_working_set(
+                (
+                    (state.weights_key, parameters),
+                    (state.optimizer_key, optimizer_tensors),
                 )
-                registered_keys = (state.weights_key, state.optimizer_key)
-                for future in (weights_l2, optimizer_l2):
-                    future.result()
-            else:
-                self._register_portable_l2_working_set(
-                    (
-                        (state.weights_key, parameters),
-                        (state.optimizer_key, optimizer_tensors),
-                    )
-                )
-                registered_keys = (state.weights_key, state.optimizer_key)
+            )
+            registered_keys = (state.weights_key, state.optimizer_key)
+            if prepared_portable is not None:
                 from .portable_snapshot import commit_prepared_portable_checkpoint
 
                 commit_prepared_portable_checkpoint(
@@ -971,10 +920,7 @@ class MCoreRunSlotExecutor:
             raise RuntimeError("portable checkpoint source is not configured")
         from art.megatron import checkpoint as _checkpoint
 
-        from .portable_snapshot import (
-            install_prepared_portable_checkpoint,
-            prepare_portable_checkpoint,
-        )
+        from .portable_snapshot import prepare_portable_checkpoint
 
         staging_digest = hashlib.sha256(
             (
@@ -999,28 +945,22 @@ class MCoreRunSlotExecutor:
                 expected_lora_target_modules=expected_lora_target_modules,
                 restore_optimizer=restore_optimizer,
             ) as prepared:
-                install_prepared_portable_checkpoint(
-                    self._slots, prepared, name=staging_name
+                weights, optimizer_tensors = (
+                    self._slots.install_prepared_checkpoint_for_residency(
+                        staging_name,
+                        prepared.checkpoint,
+                        restore_optimizer=restore_optimizer,
+                        require_optimizer=restore_optimizer,
+                    )
                 )
                 installed = True
                 prepared_run = None
                 preparation_error: BaseException | None = None
                 try:
-                    if not restore_optimizer:
-                        self._slots.prepare_checkpoint_slot_optimizer(
-                            staging_name, OptimizerConfig(learning_rate=0.0)
-                        )
-                    weights = self._slots.checkpoint_slot_parameters(staging_name)
-                    optimizer_tensors = self._slots.checkpoint_slot_optimizer_tensors(
-                        staging_name
-                    )
                     if not weights or not optimizer_tensors:
                         raise RuntimeError(
                             "prepared portable checkpoint lacks a complete working set"
                         )
-                    with torch.no_grad():
-                        for tensor in (*weights, *optimizer_tensors):
-                            tensor.data = tensor.detach().to(device="cpu")
                     if any(
                         tensor.device.type != "cpu"
                         for tensor in (*weights, *optimizer_tensors)
@@ -1058,7 +998,7 @@ class MCoreRunSlotExecutor:
     def _discard_prepared_portable_run(self, prepared: _PreparedPortableRun) -> None:
         self._slots.release_checkpoint_slot(prepared.staging_name)
 
-    def _register_portable_l2_working_set(
+    def _register_l2_working_set(
         self,
         working_set: tuple[
             tuple[ResidencyKey, tuple[torch.Tensor, ...]],
@@ -1077,7 +1017,7 @@ class MCoreRunSlotExecutor:
         try:
             _checkpoint.raise_distributed(
                 registration_error,
-                "register portable checkpoint L2 working set",
+                "register run L2 working set",
                 _checkpoint._ensure_group(self._slots),
             )
         except BaseException as error:
@@ -1089,7 +1029,7 @@ class MCoreRunSlotExecutor:
                         )
                     except BaseException as cleanup_error:
                         error.add_note(
-                            "portable L2 registration cleanup failed: "
+                            "run L2 registration cleanup failed: "
                             f"{type(cleanup_error).__name__}: {cleanup_error}"
                         )
             raise
@@ -1367,7 +1307,7 @@ class MCoreRunSlotExecutor:
                 representation="optimizer",
                 adapter_config=prepared.adapter_config,
             )
-            self._register_portable_l2_working_set(
+            self._register_l2_working_set(
                 (
                     (weights_key, prepared.weights),
                     (optimizer_key, prepared.optimizer_tensors),
@@ -1701,6 +1641,7 @@ class MCoreRunSlotExecutor:
             self._residency.wait_before_mutation_working_set(
                 (weights_key, optimizer_key, accumulator_key)
             )
+            self.runtime.optimizer_snapshot_barrier.wait_before_mutation()
             state.gradients.seal(job.contributing_forward_backward_operation_ids)
             local_sums, step_flags = state.gradients.prepare_local_sums()
             expected = local_sums.expected_global_token_count
@@ -1799,29 +1740,32 @@ class MCoreRunSlotExecutor:
             },
         }
 
-    def publish_generation(self, spec: CommandPublicationSpec) -> dict[str, Any]:
+    def start_generation_publication(
+        self, spec: CommandPublicationSpec, sink: EventSink
+    ) -> dict[str, Any]:
         state = self._runs.get(spec.run_id)
         if state is None or state.learner_version != spec.generation.policy_step:
             raise RuntimeError("published generation is not resident")
         if state.spec.training_session_id != spec.generation.training_session_id:
             raise RuntimeError("published generation belongs to another session")
-        if state.gradients.contribution_ids:
-            raise RuntimeError("cannot publish a generation with open gradients")
         with self._maintenance_resident(state, ("weights",)):
-            sink = _CommandPublicationSink()
             metrics = self._publisher.submit_command(
                 spec,
                 adapter_config=state.adapter_config,
                 sink=sink,
             )
-            record = sink.future.result()
         return {
             "run_id": spec.run_id,
             "generation_id": spec.generation.generation_id,
             "rank": int(self.runtime.rank),
-            "record": record.model_dump(mode="json"),
             "metrics": metrics,
         }
+
+    def publish_generation(self, spec: CommandPublicationSpec) -> dict[str, Any]:
+        sink = _CommandPublicationSink()
+        result = self.start_generation_publication(spec, sink)
+        record = sink.future.result()
+        return {**result, "record": record.model_dump(mode="json")}
 
     def run_gradient_ids(self, run_id: str) -> tuple[str, ...]:
         state = self._runs.get(run_id)

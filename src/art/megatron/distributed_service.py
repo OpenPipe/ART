@@ -16,6 +16,7 @@ import uuid
 import httpx
 
 from art import dev, types
+from art._backend_training import merge_gradient_step_metrics
 from art.adapter_leases import in_flight_lora_name
 from art.distributed.art_runtime import ArtRuntime, DistributedPackedBatch
 from art.distributed.specs import ModelServiceSpec
@@ -70,6 +71,7 @@ from .runtime.publication import (
 )
 from .runtime.specs import (
     AdapterReady,
+    CommandPublicationSpec,
     CurrentSFTConfig,
     CurrentTrainConfig,
     DurableTrainOutput,
@@ -80,7 +82,7 @@ from .runtime.specs import (
     ResidentLoraInspectionSpec,
     ResidentScoreJobSpec,
     ResidentScoreResult,
-    SFTJobSpec,
+    SftForwardBackwardJobSpec,
     TrainAccepted,
     TrainCancelled,
     TrainCompleted,
@@ -89,7 +91,6 @@ from .runtime.specs import (
     TrainerRuntimeSpec,
     TrainFailed,
     TrainingRunSpec,
-    TrainJobSpec,
     TrainProgress,
 )
 
@@ -114,7 +115,6 @@ class _PipelineForwardLaunch:
     operation: OperationRef
     generation: TrainerGeneration
     publication_targets: tuple[Any, ...]
-    publication_job: TrainJobSpec
     completion: asyncio.Future[dict[str, Any]]
     setup_metrics: dict[str, float]
 
@@ -1114,31 +1114,29 @@ class DistributedMegatronService:
         *,
         dispatch_event: asyncio.Event | None = None,
     ) -> AsyncIterator[dict[str, float]]:
-        def build_job(fields: _TrainerJobFields) -> TrainerJobSpec:
-            values = {
-                key: value
-                for key, value in experimental_config.items()
-                if key in ExperimentalTrainConfig.model_fields and value is not None
-            }
-            return TrainJobSpec(
-                **fields,
-                batch=batch.leases.ref,
-                config=CurrentTrainConfig.model_validate(config.model_dump()),
-                experimental_config=ExperimentalTrainConfig.model_validate(values),
-            )
-
-        async for metrics in self._run_train_job(
-            build_job,
-            lambda trainer, job: trainer.train(
-                job,
-                batch.leases,
-                on_dispatched=dispatch_event.set
-                if dispatch_event is not None
-                else None,
+        forward = await self.start_pipeline_forward_backward(
+            batch,
+            config,
+            experimental_config,
+            expected_learner_version=self.active_learner_step,
+        )
+        if dispatch_event is not None:
+            dispatch_event.set()
+        optimizer = await self.start_pipeline_optimizer(
+            forward, learning_rate=config.learning_rate
+        )
+        forward_result, optimizer_result = await asyncio.gather(
+            forward.completion, optimizer.completion
+        )
+        yield {
+            **merge_gradient_step_metrics(
+                forward_result.get("metrics", {}),
+                optimizer_result.raw.get("metrics", {}),
             ),
-            lineage_error="learner lineage changed during training",
-        ):
-            yield metrics
+            **forward.setup_metrics,
+            **optimizer_result.publication_metrics,
+            "_art/committed_learner_step": float(optimizer.step),
+        }
 
     async def start_pipeline_forward_backward(
         self,
@@ -1149,6 +1147,40 @@ class DistributedMegatronService:
         expected_learner_version: int,
     ) -> _PipelineForwardLaunch:
         """Submit one already-packed F/B and return after every rank is ready."""
+
+        current_config = CurrentTrainConfig.model_validate(config.model_dump())
+        values = {
+            key: value
+            for key, value in experimental_config.items()
+            if key in ExperimentalTrainConfig.model_fields and value is not None
+        }
+        experimental = ExperimentalTrainConfig.model_validate(values)
+        return await self._start_pipeline_forward_backward_command(
+            expected_learner_version=expected_learner_version,
+            build_job=lambda operation, source: ForwardBackwardJobSpec(
+                operation=operation,
+                training_session_id=self._training_session_id,
+                source=source,
+                optimizer_state_path=self._optimizer_state_path,
+                batch=batch.leases.ref,
+                expected_global_loss_bearing_tokens=batch.loss_bearing_tokens,
+                config=current_config,
+                experimental_config=experimental,
+                return_token_logprobs=False,
+            ),
+            dispatch=lambda trainer, job: trainer.start_forward_backward(
+                job, batch.leases
+            ),
+        )
+
+    async def _start_pipeline_forward_backward_command(
+        self,
+        *,
+        expected_learner_version: int,
+        build_job: Callable[[OperationRef, TrainerGeneration], Any],
+        dispatch: Callable[[Any, Any], Awaitable[Any]],
+    ) -> _PipelineForwardLaunch:
+        """Submit one production F/B command and return at rank readiness."""
 
         trainer_prepare_started = time.perf_counter()
         await self._await_trainer_preparation()
@@ -1206,43 +1238,7 @@ class DistributedMegatronService:
                     learner_parent_version=expected_learner_version,
                     kind="forward_backward",
                 )
-                current_config = CurrentTrainConfig.model_validate(config.model_dump())
-                values = {
-                    key: value
-                    for key, value in experimental_config.items()
-                    if key in ExperimentalTrainConfig.model_fields and value is not None
-                }
-                job = ForwardBackwardJobSpec(
-                    operation=operation,
-                    training_session_id=self._training_session_id,
-                    source=source,
-                    optimizer_state_path=self._optimizer_state_path,
-                    batch=batch.leases.ref,
-                    expected_global_loss_bearing_tokens=batch.loss_bearing_tokens,
-                    config=current_config,
-                    experimental_config=ExperimentalTrainConfig.model_validate(values),
-                    return_token_logprobs=False,
-                )
-                publication_job = TrainJobSpec(
-                    job_id=uuid.uuid4().hex,
-                    run_id=state.run_id,
-                    training_session_id=self._training_session_id,
-                    expected_learner_version=expected_learner_version,
-                    learner_version=next_step,
-                    source=source,
-                    output=DurableTrainOutput(
-                        generation=generation,
-                        staging_adapter_path=(
-                            f"{self.output_dir}/megatron_runtime/staging/"
-                            f"{generation.generation_id}"
-                        ),
-                        optimizer_state_path=self._optimizer_state_path,
-                    ),
-                    publication_targets=publication_targets,
-                    batch=batch.leases.ref,
-                    config=current_config,
-                    experimental_config=ExperimentalTrainConfig.model_validate(values),
-                )
+                job = build_job(operation, source)
                 cold = self._trainer_resident_generation != source
                 source_adapter = (
                     self._published_adapters.get(source.policy_step) if cold else None
@@ -1255,14 +1251,36 @@ class DistributedMegatronService:
                     != str(Path(source.adapter_path).absolute())
                 ):
                     raise RuntimeError("cold pipeline F/B source is not registered")
-                with (
-                    adapter_generation_lease(source_adapter)
-                    if source_adapter is not None
-                    else nullcontext()
-                ):
-                    launch = await trainer.start_resident_forward_backward(
-                        job, batch.leases
-                    )
+                components = ("weights", "accumulator")
+                await trainer.prefetch_command_run_residency(
+                    operation.run_id,
+                    components,
+                    expected_learner_version,
+                )
+                await trainer.admit_command_run_residency(
+                    operation.operation_id,
+                    operation.run_id,
+                    components,
+                    expected_learner_version,
+                )
+                try:
+                    with (
+                        adapter_generation_lease(source_adapter)
+                        if source_adapter is not None
+                        else nullcontext()
+                    ):
+                        launch = await dispatch(trainer, job)
+                except BaseException as error:
+                    try:
+                        await trainer.release_command_run_residency_admission(
+                            operation.operation_id
+                        )
+                    except BaseException as cleanup_error:
+                        error.add_note(
+                            "pipeline F/B residency rollback also failed: "
+                            f"{type(cleanup_error).__name__}: {cleanup_error}"
+                        )
+                    raise
                 async with self._mutation_lock:
                     if (
                         self._trainer is not trainer
@@ -1279,7 +1297,6 @@ class DistributedMegatronService:
                 operation=operation,
                 generation=generation,
                 publication_targets=publication_targets,
-                publication_job=publication_job,
                 completion=launch.completion,
                 setup_metrics={
                     "time/step_service_lock_wait_s": lock_wait_s,
@@ -1303,6 +1320,8 @@ class DistributedMegatronService:
         forward: _PipelineForwardLaunch,
         *,
         learning_rate: float,
+        weight_decay: float = 0.1,
+        grad_clip_norm: float = 0.1,
     ) -> _PipelineOptimizerLaunch:
         """Queue optimizer and its fast publication before the following F/B."""
 
@@ -1350,16 +1369,35 @@ class DistributedMegatronService:
                         optimizer_state_path=self._optimizer_state_path,
                         generation=forward.generation,
                         contributing_forward_backward_operation_ids=contributions,
-                        optimizer=AdamConfig(learning_rate=learning_rate),
+                        optimizer=AdamConfig(
+                            learning_rate=learning_rate,
+                            weight_decay=weight_decay,
+                            grad_clip_norm=grad_clip_norm,
+                        ),
+                    )
+                    components = ("weights", "optimizer", "accumulator")
+                    await trainer.prefetch_command_run_residency(
+                        operation.run_id,
+                        components,
+                        source.policy_step,
                     )
                     if not admitted.done():
                         admitted.set_result(forward.generation.policy_step)
 
-                    (
-                        raw,
-                        publication_metrics,
-                    ) = await trainer.resident_optim_step_and_publish(
-                        job, forward.publication_job
+                    raw = await trainer.optim_step(job)
+                    publication_metrics = (
+                        await trainer.start_command_generation_publication(
+                            CommandPublicationSpec(
+                                run_id=operation.run_id,
+                                generation=forward.generation,
+                                optimizer_state_path=self._optimizer_state_path,
+                                staging_adapter_path=(
+                                    f"{self.output_dir}/megatron_runtime/staging/"
+                                    f"{forward.generation.generation_id}"
+                                ),
+                                publication_targets=forward.publication_targets,
+                            )
+                        )
                     )
                     self._record_policy_timestamp(
                         self._trainer_completion_times,
@@ -1596,11 +1634,11 @@ class DistributedMegatronService:
         if publication_targets and transfer_manager is None:
             raise RuntimeError("adapter transfer publication is not prepared")
         loop = asyncio.get_running_loop()
-        publication_waiter = (
-            trainer.wait_for_publication(generation.generation_id)
-            if trainer is not None
-            else None
-        )
+        publication_waiter: Awaitable[tuple[TrainerRankPublication, ...]] | None
+        if trainer is not None:
+            publication_waiter = trainer.wait_for_publication(generation.generation_id)
+        else:
+            publication_waiter = None
         previous = self._serving_futures.get(step - 1)
         if previous is None:
             previous = loop.create_future()
@@ -2781,27 +2819,62 @@ class DistributedMegatronService:
                 num_trajectories=int(batch.num_trajectories),
                 num_tokens=int(batch.num_tokens),
                 num_trainable_tokens=int(batch.num_trainable_tokens),
+                num_dropped_trajectories=int(
+                    getattr(batch, "num_dropped_trajectories", 0)
+                ),
             )
             for batch in batches
         )
         if not payload:
             return
-
-        def build_job(fields: _TrainerJobFields) -> TrainerJobSpec:
-            return SFTJobSpec(
-                **fields,
-                batch_id=uuid.uuid4().hex,
-                num_batches=len(payload),
-                config=CurrentSFTConfig.model_validate(config.model_dump()),
+        sft_config = CurrentSFTConfig.model_validate(config.model_dump())
+        if not isinstance(sft_config.batch_size, int):
+            raise ValueError("Megatron SFT requires a resolved integer batch size")
+        for batch in payload:
+            train_config = CurrentTrainConfig(
+                learning_rate=batch.learning_rate,
+                grad_accumulation_sequences=sft_config.batch_size,
             )
-
-        async for metrics in self._run_train_job(
-            build_job,
-            lambda trainer, job: trainer.train_sft(job, payload),
-            lineage_error="learner lineage changed during SFT",
-            wait_for_serving=True,
-        ):
-            yield metrics
+            forward = await self._start_pipeline_forward_backward_command(
+                expected_learner_version=self.active_learner_step,
+                build_job=lambda operation, source, batch=batch: (
+                    SftForwardBackwardJobSpec(
+                        operation=operation,
+                        training_session_id=self._training_session_id,
+                        source=source,
+                        optimizer_state_path=self._optimizer_state_path,
+                        batch_fingerprint=batch.fingerprint,
+                        expected_global_nonpadding_tokens=batch.num_tokens,
+                        expected_global_loss_bearing_tokens=(
+                            batch.num_trainable_tokens
+                        ),
+                        config=train_config,
+                        return_token_logprobs=False,
+                    )
+                ),
+                dispatch=lambda trainer, job, batch=batch: (
+                    trainer.start_sft_forward_backward(job, batch)
+                ),
+            )
+            optimizer = await self.start_pipeline_optimizer(
+                forward,
+                learning_rate=batch.learning_rate,
+                weight_decay=0.0,
+                grad_clip_norm=1.0,
+            )
+            forward_result, optimizer_result = await asyncio.gather(
+                forward.completion, optimizer.completion
+            )
+            await self.wait_for_serving(optimizer.step)
+            yield {
+                **merge_gradient_step_metrics(
+                    forward_result.get("metrics", {}),
+                    optimizer_result.raw.get("metrics", {}),
+                ),
+                **forward.setup_metrics,
+                **optimizer_result.publication_metrics,
+                "_art/committed_learner_step": float(optimizer.step),
+            }
 
     async def aclose(self) -> None:
         if self._close_task is not None and self._close_task.done():

@@ -887,10 +887,9 @@ class MegatronSlotCoordinator:
                 or state.migration_fence_id is not None
                 or state.migration_restore_id is not None
                 or self._active_run_id != operation.run_id
-                or state.handler.retained_contribution_inputs()
             ):
                 raise RuntimeError(
-                    "checkpoint export is not the active quiescent command"
+                    "checkpoint export is not the active save-state command"
                 )
             generation = state.handler.generation
         return await self.trainer.export_command_run_checkpoint(

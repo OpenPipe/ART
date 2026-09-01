@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections import OrderedDict
 from collections.abc import Iterator, Mapping, Sequence
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import threading
 from typing import TYPE_CHECKING, Any, Literal, NotRequired, TypedDict, cast
 
@@ -69,6 +69,25 @@ class MegatronRunSlots:
     def load_checkpoint(self, name: str, directory: str) -> None:
         """Synchronously load one rank-local materialized checkpoint directory."""
 
+        source = self._prepare_checkpoint(directory)
+        _checkpoint.load_checkpoint(self, source, name)
+
+    def load_checkpoint_for_residency(
+        self, name: str, directory: str
+    ) -> tuple[tuple[torch.nn.Parameter, ...], tuple[torch.Tensor, ...]]:
+        """Prepare one complete initial run working set in CPU residency."""
+
+        source = self._prepare_checkpoint(directory)
+        return self.install_prepared_checkpoint_for_residency(
+            name,
+            source,
+            restore_optimizer=True,
+            require_optimizer=False,
+        )
+
+    def _prepare_checkpoint(self, directory: str) -> _checkpoint.PreparedCheckpoint:
+        """Read and validate one checkpoint consistently across trainer ranks."""
+
         source: _checkpoint.PreparedCheckpoint | None = None
         error: BaseException | None = None
         try:
@@ -82,7 +101,75 @@ class MegatronRunSlots:
         group = _checkpoint._ensure_group(self)
         _checkpoint.raise_distributed(error, "prepare checkpoint", group)
         assert source is not None
-        _checkpoint.load_checkpoint(self, source, name)
+        return source
+
+    def install_prepared_checkpoint_for_residency(
+        self,
+        name: str,
+        source: _checkpoint.PreparedCheckpoint,
+        *,
+        restore_optimizer: bool,
+        require_optimizer: bool,
+    ) -> tuple[tuple[torch.nn.Parameter, ...], tuple[torch.Tensor, ...]]:
+        """Install CPU weights and optimizer objects for atomic L2 admission."""
+
+        manifest = source.manifest
+        weights_source = source
+        if manifest is not None and manifest["optimizer"] is not None:
+            weights_source = replace(
+                source,
+                manifest=cast(
+                    Any,
+                    {
+                        **manifest,
+                        "optimizer": None,
+                        "parameters": {},
+                        "steps": {},
+                    },
+                ),
+            )
+        _checkpoint.load_checkpoint(self, weights_source, name)
+        try:
+            weights = self.checkpoint_slot_parameters(name)
+            move_error: BaseException | None = None
+            try:
+                with torch.no_grad():
+                    for tensor in weights:
+                        tensor.data = tensor.detach().to(device="cpu")
+            except BaseException as error:
+                move_error = error
+            _checkpoint.raise_distributed(
+                move_error,
+                "prepare checkpoint weights for CPU residency",
+                _checkpoint._ensure_group(self),
+            )
+
+            has_optimizer = manifest is not None and manifest["optimizer"] is not None
+            if restore_optimizer and has_optimizer:
+                optimizer = self.prepare_checkpoint_slot_optimizer_for_residency(
+                    name, source
+                )
+            elif restore_optimizer and require_optimizer:
+                raise MegatronRunSlotStateError(
+                    "Checkpoint does not contain the required optimizer state"
+                )
+            else:
+                optimizer = self.prepare_fresh_checkpoint_slot_optimizer_for_residency(
+                    name, OptimizerConfig(learning_rate=0.0)
+                )
+            tensors = (*weights, *optimizer)
+            if (
+                not weights
+                or not optimizer
+                or any(tensor.device.type != "cpu" for tensor in tensors)
+            ):
+                raise MegatronRunSlotStateError(
+                    "Prepared run working set is not entirely CPU resident"
+                )
+            return weights, optimizer
+        except BaseException:
+            self.release_checkpoint_slot(name)
+            raise
 
     def save_checkpoint(self, output_dir: str, checkpoint_path: str) -> None:
         self.prepare_checkpoint_save(output_dir, checkpoint_path)
@@ -114,7 +201,7 @@ class MegatronRunSlots:
         tensors: list[torch.Tensor] = []
         seen: set[int] = set()
         for master in dynamic.master_params:
-            if master.device.type == "cuda" and id(master) not in seen:
+            if id(master) not in seen:
                 tensors.append(master)
                 seen.add(id(master))
             state = dynamic.optimizer.state.get(master, {})
@@ -122,12 +209,88 @@ class MegatronRunSlots:
                 value = state[key]
                 if (
                     isinstance(value, torch.Tensor)
-                    and value.device.type == "cuda"
+                    and (key != "step" or value.device.type == "cuda")
                     and id(value) not in seen
                 ):
                     tensors.append(value)
                     seen.add(id(value))
         return tuple(tensors)
+
+    def prepare_fresh_checkpoint_slot_optimizer_for_residency(
+        self, name: str, params: OptimizerConfig
+    ) -> tuple[torch.Tensor, ...]:
+        """Build a complete fresh optimizer while the run weights remain on CPU."""
+
+        weights = self.checkpoint_slot_parameters(name)
+        slot = self._checkpoint_slots[name]
+        if slot.optimizer is not None:
+            raise MegatronRunSlotStateError(
+                f"Checkpoint slot {name!r} already has optimizer state"
+            )
+        if not weights or any(weight.device.type != "cpu" for weight in weights):
+            raise MegatronRunSlotStateError(
+                "Fresh optimizer preparation requires non-empty CPU weights"
+            )
+        dynamic = self._new_dynamic_optimizer(name, params)
+        slot.optimizer = dynamic
+        group = dynamic.optimizer.param_groups[0]
+        for master in dynamic.master_params:
+            dynamic.optimizer.state[master] = {
+                "step": torch.zeros((), dtype=torch.float32),
+                "exp_avg": torch.zeros_like(
+                    master, memory_format=torch.preserve_format
+                ),
+                "exp_avg_sq": torch.zeros_like(
+                    master, memory_format=torch.preserve_format
+                ),
+            }
+            if bool(group.get("amsgrad", False)):
+                dynamic.optimizer.state[master]["max_exp_avg_sq"] = torch.zeros_like(
+                    master, memory_format=torch.preserve_format
+                )
+        self._zero_dynamic_optimizer_padding(name, dynamic)
+        tensors = self.checkpoint_slot_optimizer_tensors(name)
+        if not tensors or any(tensor.device.type != "cpu" for tensor in tensors):
+            slot.optimizer = None
+            raise MegatronRunSlotStateError(
+                "Fresh optimizer residency is not entirely CPU resident"
+            )
+        return tensors
+
+    def prepare_checkpoint_slot_optimizer_for_residency(
+        self, name: str, source: _checkpoint.PreparedCheckpoint
+    ) -> tuple[torch.Tensor, ...]:
+        """Restore exact optimizer state against an installed CPU adapter."""
+
+        slot = self._checkpoint_slots.get(name)
+        if slot is None:
+            raise ValueError(f"Unknown checkpoint slot: {name!r}")
+        if slot.optimizer is not None:
+            raise MegatronRunSlotStateError(
+                f"Checkpoint slot {name!r} already has optimizer state"
+            )
+        if source.manifest is None or source.manifest["optimizer"] is None:
+            raise MegatronRunSlotStateError(
+                "Checkpoint does not contain optimizer state"
+            )
+        optimizer_state = _checkpoint._phase(
+            lambda: _checkpoint._optimizer_state(self, source, name),
+            "prepare checkpoint optimizer state",
+            _checkpoint._ensure_group(self),
+        )
+        dynamic = _checkpoint._phase(
+            lambda: self._restore_canonical_optimizer(name, optimizer_state),
+            "restore checkpoint optimizer for CPU residency",
+            _checkpoint._ensure_group(self),
+        )
+        slot.optimizer = dynamic
+        tensors = self.checkpoint_slot_optimizer_tensors(name)
+        if not tensors or any(tensor.device.type != "cpu" for tensor in tensors):
+            slot.optimizer = None
+            raise MegatronRunSlotStateError(
+                "Restored optimizer residency is not entirely CPU resident"
+            )
+        return tensors
 
     def prepare_checkpoint_slot_optimizer(
         self, name: str, params: OptimizerConfig
