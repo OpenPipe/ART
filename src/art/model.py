@@ -1506,6 +1506,7 @@ class TrainableModel(Model[ModelConfig, StateType], Generic[ModelConfig, StateTy
             project=project,
             entity=entity,
             id=id,
+            run_id=run_id,
             config=config,
             base_model=base_model,
             lora_config=lora_config,

@@ -3240,6 +3240,14 @@ class MonarchTrainerRun:
                 raise RuntimeError(f"residency preparation failed:\n{details}")
             if any(result.evidence is None for result in results):
                 raise RuntimeError("residency preparation returned no evidence")
+            if any(
+                result.evidence["rank"] != result.rank
+                for result in results
+                if result.evidence is not None
+            ):
+                raise RuntimeError(
+                    "residency preparation inner rank differs from its trusted responder"
+                )
             return {
                 "operation_id": operation_id,
                 "run_id": run_id,

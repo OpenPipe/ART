@@ -61,6 +61,7 @@ class MegatronPairedInferencePublisher:
         service: ModelServiceSpec,
         config: dev.BackendModelConfig,
         endpoint: PairedInferenceEndpoint,
+        capabilities: ServingCapabilities,
         *,
         api_key: str | None,
     ) -> None:
@@ -69,6 +70,7 @@ class MegatronPairedInferencePublisher:
         self.service = service
         self.config = config
         self.endpoint = endpoint
+        self.capabilities = capabilities
         self.architecture_attestation = endpoint.profile.architecture
         self.api_key = api_key
         self._lock = asyncio.Lock()
@@ -147,6 +149,7 @@ class MegatronPairedInferencePublisher:
             service,
             config,
             endpoint,
+            capabilities,
             api_key=_api_key(config),
         )
 

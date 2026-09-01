@@ -124,12 +124,14 @@ class MegatronSlotRuntime:
         checkpoints: MegatronCheckpointOperations | None = None,
         max_retained_operations: int = 128,
         portable_archive: PortableSnapshotArchive | None = None,
+        rollout_model: RolloutModelSpec | None = None,
     ) -> MegatronRunBinding:
         config = await asyncio.to_thread(
             prepare_megatron_run_config,
             request,
             self.coordinator.trainer.runtime_spec,
             portable_archive=portable_archive,
+            rollout_model=rollout_model,
         )
         run = await self.coordinator.register_run(
             config,
@@ -257,6 +259,7 @@ def prepare_megatron_run_config(
     runtime_spec: TrainerRuntimeSpec,
     *,
     portable_archive: PortableSnapshotArchive | None = None,
+    rollout_model: RolloutModelSpec | None = None,
 ) -> MegatronOperationConfig:
     """Create or recover exact ART-owned paths for one logical trainer run."""
 
@@ -359,18 +362,21 @@ def prepare_megatron_run_config(
             adapter_path=adapter.identity,
         )
 
-    rollout_model = RolloutModelSpec.from_model(
-        TrainableModel(
-            name=spec.base_model,
-            run_name=request.run_id,
-            project="serverless-training",
-            base_model=spec.base_model,
-            lora_config={
-                "rank": spec.adapter.rank,
-                "target_modules": list(spec.adapter.target_modules),
-            },
+    if rollout_model is None:
+        rollout_model = RolloutModelSpec.from_model(
+            TrainableModel(
+                name=spec.base_model,
+                run_name=request.run_id,
+                project="serverless-training",
+                base_model=spec.base_model,
+                lora_config={
+                    "rank": spec.adapter.rank,
+                    "target_modules": list(spec.adapter.target_modules),
+                },
+            )
         )
-    )
+    elif rollout_model.build().base_model != spec.base_model:
+        raise ValueError("rollout model differs from the training run base model")
     return MegatronOperationConfig(
         run_id=request.run_id,
         training_session_id=request.training_session_id,

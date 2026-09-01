@@ -19,6 +19,7 @@ from .residency import (
     ResidencyCapacityUnavailable,
     ResidencyDemand,
     ResidencyKey,
+    ResidencyL1ReloadReceipt,
     ResidencyLedger,
     ResidencyLimits,
     ResidencyReservation,
@@ -660,12 +661,14 @@ class RunResidencyManager:
     def acquire_l1(self, key: ResidencyKey) -> None:
         self.acquire_l1_working_set((key,))
 
-    def acquire_l1_working_set(self, keys: Iterable[ResidencyKey]) -> None:
+    def acquire_l1_working_set(
+        self, keys: Iterable[ResidencyKey]
+    ) -> dict[ResidencyKey, ResidencyL1ReloadReceipt]:
         """Fence, commit, and pin a complete demanded trainer working set."""
         self._require_open()
         keys = self._working_set_keys(keys)
         if not keys:
-            return
+            return {}
         with self._admission_locks["l1_gpu"]:
             with self._lock:
                 needs_prepare = any(
@@ -690,6 +693,7 @@ class RunResidencyManager:
                         "demanded working set did not become L1 resident"
                     )
                 self.ledger.pin_many((key, "l1_gpu") for key in keys)
+                return self.ledger.claim_l1_reloads(keys)
 
     def prefetch_l1(self, key: ResidencyKey) -> None:
         self.prefetch_l1_working_set((key,))

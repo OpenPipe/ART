@@ -91,12 +91,14 @@ def test_rank_residency_evidence_retains_bounded_copy_facts(
         topology_fingerprint="topology",
         adapter_layout_fingerprint="layout",
     )
+    optimizer_key = key.model_copy(update={"representation": "optimizer"})
     state = executor_module._ResidentCommandRun(
         spec=SimpleNamespace(run_id="run"),
         learner_version=0,
         gradients=SimpleNamespace(contribution_ids=()),
         adapter_config={},
         weights_key=key,
+        optimizer_key=optimizer_key,
     )
     entry = SimpleNamespace(
         copies=(
@@ -114,13 +116,17 @@ def test_rank_residency_evidence_retains_bounded_copy_facts(
     executor._runs = {"run": state}
     executor._residency = SimpleNamespace(
         ledger=SimpleNamespace(
-            entry=lambda observed: entry if observed == key else None
+            entry=lambda observed: entry if observed in {key, optimizer_key} else None
         )
     )
     executor.runtime = SimpleNamespace(rank=0)
-    executor._reported_l1_reload_sequences = {}
-
-    evidence = executor._residency_evidence("run", "operation", ("weights",), (key,))
+    evidence = executor._residency_evidence(
+        "run",
+        "operation",
+        ("weights",),
+        (key,),
+        operation_reloads={key: entry.last_l1_reload},
+    )
 
     component = evidence["components"][0]
     assert component["byte_count"] == 1024
@@ -132,6 +138,11 @@ def test_rank_residency_evidence_retains_bounded_copy_facts(
     )
     assert component["reloaded_for_operation"] is True
     assert component["last_l1_reload"]["reload_sequence"] == 2
+    optimizer = evidence["components"][1]
+    assert optimizer["component"] == "optimizer"
+    assert optimizer["required_for_operation"] is False
+    assert optimizer["reloaded_for_operation"] is False
+    assert optimizer["last_l1_reload"] is None
 
 
 def test_fresh_optimizer_is_prepared_entirely_on_cpu(

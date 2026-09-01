@@ -5,7 +5,15 @@ import pytest
 from art.megatron import gate_evidence
 from art.megatron.gate_evidence import MegatronGateAttemptPlan, MegatronGateTurn
 from art.megatron.runtime.specs import TrainerGeneration
-from art.training import OperationRef, SamplerPublication, SaveWeightsForSamplerRequest
+from art.training import (
+    ForwardBackwardRequest,
+    ForwardBackwardResult,
+    OperationRef,
+    OperationSucceeded,
+    PackingOutcome,
+    SamplerPublication,
+    SaveWeightsForSamplerRequest,
+)
 
 
 @pytest.mark.asyncio
@@ -41,6 +49,64 @@ async def test_gate_checkpoint_adapter_accepts_nonpublishing_sampler_save(
     assert result.operation_id == operation.operation_id
     assert result.checkpoint.checkpoint_id == "open-accumulator"
     assert result.lora == "/tmp/adapter"
+
+
+@pytest.mark.asyncio
+async def test_gate_recorder_materializes_deployed_operation_receipts(tmp_path) -> None:
+    operation = OperationRef(
+        run_id="run-1",
+        operation_id="forward-backward-1",
+        sequence_id=4,
+        learner_parent_version=2,
+        kind="forward_backward",
+    )
+
+    class Receipt:
+        def model_dump_json(self, *, indent: int) -> str:
+            assert indent == 2
+            return '{"operation_id":"forward-backward-1"}'
+
+    class Coordinator:
+        def residency_evidence(self, run_id: str, operation_id: str):
+            assert (run_id, operation_id) == ("run-1", "forward-backward-1")
+            return {"run_id": run_id, "operation_id": operation_id}
+
+        async def capture_forward_backward_numerics(
+            self, *, run_id: str, operation_id: str, root: str
+        ):
+            assert (run_id, operation_id) == ("run-1", "forward-backward-1")
+            assert root.endswith("artifacts/numerics")
+            return Receipt()
+
+    await gate_evidence.MegatronGateEvidenceRecorder(
+        Coordinator(),
+        tmp_path,  # type: ignore[arg-type]
+    ).retain_outcome(
+        ForwardBackwardRequest.model_construct(
+            run_id="run-1", request_id="request-1", sequence_id=4
+        ),
+        OperationSucceeded.model_construct(
+            operation=operation,
+            result=ForwardBackwardResult(
+                operation_id=operation.operation_id,
+                packing=PackingOutcome(
+                    packed_sequence_length=8,
+                    packed_sequences=1,
+                    target_packed_sequences=1,
+                    physical_tokens=8,
+                    non_padding_tokens=8,
+                    loss_bearing_tokens=4,
+                    trainable_assistant_tokens=4,
+                ),
+                produced_gradient=True,
+            ),
+        ),
+        capture_numerics=True,
+    )
+
+    assert (tmp_path / "receipts/operations/forward-backward-1.json").is_file()
+    assert (tmp_path / "receipts/residency/forward-backward-1.json").is_file()
+    assert (tmp_path / "receipts/numerics/forward-backward-1.json").is_file()
 
 
 def test_gate_schedule_allows_serial_runs_without_isolation_capture() -> None:
@@ -93,10 +159,26 @@ async def test_gate_schedule_reuses_only_adjacent_isolation_boundaries(
         ) -> None:
             calls.append(("reuse", source_turn_index, turn_index, run_count))
 
+        def finish(self, client) -> None:
+            assert not client.open_forward_backward_operation_ids
+
+    class Client:
+        def __init__(self, run_id: str) -> None:
+            self.run_id = run_id
+            self.open_forward_backward_operation_ids = ()
+
+        async def close(self) -> None:
+            return None
+
     async def execute_commands(*_args: object) -> None:
         return None
 
     monkeypatch.setattr(gate_evidence, "_execute_commands", execute_commands)
+    monkeypatch.setattr(
+        gate_evidence.LocalMegatronTrainingClient,
+        "from_binding",
+        lambda binding: binding.client,
+    )
     run_ids = ("run-1", "run-2", "run-3", "run-4")
     runs = tuple(
         SimpleNamespace(
@@ -119,9 +201,7 @@ async def test_gate_schedule_reuses_only_adjacent_isolation_boundaries(
     bound = [
         (
             run,
-            SimpleNamespace(
-                config=SimpleNamespace(source=SimpleNamespace(policy_step=0))
-            ),
+            SimpleNamespace(client=Client(run.bootstrap.run_id)),
         )
         for run in runs
     ]

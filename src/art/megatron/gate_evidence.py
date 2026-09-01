@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import sys
 import tempfile
 from typing import Any, Literal, cast
 
@@ -23,13 +24,11 @@ from art.training import (
     OperationRef,
     OptimStepRequest,
     RunCommand,
-    RunCommandLedger,
     SamplerWeightsResult,
     SaveStateRequest,
     SaveStateResult,
     SaveWeightsForSamplerRequest,
 )
-from art.training.contracts import OperationKind
 
 from .operation_handler import (
     MegatronArtifactResourcePlan,
@@ -38,13 +37,14 @@ from .operation_handler import (
 )
 from .runtime.portable_snapshot import PortableSnapshotExportReceipt
 from .runtime.specs import TrainerGeneration
-from .slot_coordinator import MegatronSlotCoordinator, MegatronSlotRun
+from .slot_coordinator import MegatronSlotCoordinator
 from .slot_runtime import (
     MegatronRunBinding,
     MegatronRunBootstrapConfig,
     MegatronSlotLaunchConfig,
     launch_megatron_slot,
 )
+from .training import LocalMegatronTrainingClient, LocalMegatronTrainingOperation
 
 ART_MEGATRON_GATE_PLAN_ENV = "ART_MEGATRON_GATE_PLAN"
 
@@ -134,66 +134,105 @@ class MegatronGateEvidenceRecorder:
     def __init__(self, coordinator: MegatronSlotCoordinator, root: str | Path) -> None:
         self.coordinator = coordinator
         self.root = Path(root).resolve()
+        self._consumed_operation_ids: dict[str, list[str]] = {}
 
     async def execute(
         self,
-        run: MegatronSlotRun,
-        ledger: RunCommandLedger,
+        client: LocalMegatronTrainingClient,
         request: RunCommand,
         *,
         capture_numerics: bool = False,
     ) -> OperationExecutionOutcome:
-        kind = _command_kind(request)
-        admission = await ledger.admit(request, kind=kind)
-        outcome = await run.worker.execute(
+        operation = await _submit_command(client, request)
+        outcome = await operation.outcome()
+        await self.retain_outcome(
             request,
-            admission.ref,
-            admission.contributing_forward_backward_operation_ids,
+            outcome,
+            capture_numerics=capture_numerics,
         )
-        error = None
+        operation_id = operation.ref.operation_id
+        self._consumed_operation_ids.setdefault(client.run_id, []).append(operation_id)
+        self.retire_consumed(client)
+        return outcome
+
+    async def retain_outcome(
+        self,
+        request: RunCommand,
+        outcome: OperationExecutionOutcome,
+        *,
+        capture_numerics: bool = False,
+    ) -> None:
+        """Materialize existing live-slot receipts before public evidence retires."""
+
+        operation = outcome.operation
+        if (
+            operation.run_id != request.run_id
+            or operation.sequence_id != request.sequence_id
+            or operation.kind != _command_kind(request)
+        ):
+            raise RuntimeError("gate evidence operation differs from its command")
         gradient_produced = False
-        if isinstance(outcome, OperationFailed):
-            error = RuntimeError(f"{outcome.failure.code}: {outcome.failure.message}")
-        elif isinstance(request, ForwardBackwardRequest):
+        if not isinstance(outcome, OperationFailed) and isinstance(
+            request, ForwardBackwardRequest
+        ):
             result = outcome.result
             assert isinstance(result, ForwardBackwardResult)
             gradient_produced = result.produced_gradient
-            if not gradient_produced:
-                ledger.cancel_pending_forward_backward(request.request_id, admission)
-        ledger.mark_terminal(request.request_id, admission, error=error)
+        operation_id = operation.operation_id
 
         _write_json(
-            self.root
-            / "receipts"
-            / "operations"
-            / f"{admission.ref.operation_id}.json",
+            self.root / "receipts" / "operations" / f"{operation_id}.json",
             outcome.model_dump_json(indent=2).encode() + b"\n",
         )
-        residency = self.coordinator.residency_evidence(
-            request.run_id, admission.ref.operation_id
-        )
+        residency = self.coordinator.residency_evidence(request.run_id, operation_id)
         if residency is not None:
             _write_json(
-                self.root
-                / "receipts"
-                / "residency"
-                / f"{admission.ref.operation_id}.json",
+                self.root / "receipts" / "residency" / f"{operation_id}.json",
                 json.dumps(residency, indent=2, sort_keys=True).encode() + b"\n",
             )
         if gradient_produced and capture_numerics:
             receipt = await self.coordinator.capture_forward_backward_numerics(
                 run_id=request.run_id,
-                operation_id=admission.ref.operation_id,
+                operation_id=operation_id,
                 root=str(self.root / "artifacts" / "numerics"),
             )
             _write_json(
-                self.root
-                / "receipts"
-                / "numerics"
-                / f"{admission.ref.operation_id}.json",
+                self.root / "receipts" / "numerics" / f"{operation_id}.json",
                 receipt.model_dump_json(indent=2).encode() + b"\n",
             )
-        return outcome
+
+    def retire_consumed(self, client: LocalMegatronTrainingClient) -> None:
+        """Retire only evidence already persisted by this recorder."""
+
+        retained = self._consumed_operation_ids.get(client.run_id, [])
+        retained[:] = [
+            operation_id
+            for operation_id in retained
+            if not client.retire_operation(operation_id)
+        ]
+
+    def finish(self, client: LocalMegatronTrainingClient) -> None:
+        self.retire_consumed(client)
+        if self._consumed_operation_ids.get(client.run_id):
+            raise RuntimeError("gate run ended with unretired operation evidence")
+
+    def retain_portable_snapshot(
+        self,
+        operation: OperationRef,
+        receipt: PortableSnapshotExportReceipt,
+    ) -> None:
+        """Retain the existing portable receipt for one public save operation."""
+
+        if (
+            operation.kind != "save_state"
+            or receipt.export_id != operation.operation_id
+            or receipt.generation.policy_step != operation.learner_parent_version
+        ):
+            raise RuntimeError("portable evidence differs from its save operation")
+        _write_json(
+            self.root / "receipts" / "save-state" / f"{operation.operation_id}.json",
+            receipt.model_dump_json(indent=2).encode() + b"\n",
+        )
 
     async def capture_slot_state(
         self,
@@ -272,10 +311,9 @@ class MegatronGateCheckpointOperations:
     ) -> SaveStateResult:
         receipt = await self.coordinator.export_run_checkpoint(operation)
         _validate_export(receipt, operation, generation)
-        _write_json(
-            self.root / "receipts" / "save-state" / f"{operation.operation_id}.json",
-            receipt.model_dump_json(indent=2).encode() + b"\n",
-        )
+        MegatronGateEvidenceRecorder(
+            self.coordinator, self.root
+        ).retain_portable_snapshot(operation, receipt)
         return SaveStateResult(
             operation_id=operation.operation_id,
             checkpoint=CheckpointRef(
@@ -360,8 +398,7 @@ async def run_megatron_gate_attempt(launch: ArtLaunchContext) -> None:
 @dataclass(slots=True)
 class _GateRunExecution:
     plan: MegatronGateRunPlan
-    binding: MegatronRunBinding
-    ledger: RunCommandLedger
+    client: LocalMegatronTrainingClient
     cursor: int = 0
 
 
@@ -373,51 +410,49 @@ async def _execute_schedule(
     runs = {
         run_plan.bootstrap.run_id: _GateRunExecution(
             plan=run_plan,
-            binding=binding,
-            ledger=RunCommandLedger(
-                run_plan.bootstrap.run_id,
-                learner_version=binding.config.source.policy_step,
-            ),
+            client=LocalMegatronTrainingClient.from_binding(binding),
         )
         for run_plan, binding in bound
     }
     run_ids = tuple(run.bootstrap.run_id for run in plan.runs)
-    previous_captured_turn: int | None = None
-    for turn_index, turn in enumerate(plan.schedule):
-        execution = runs[turn.run_id]
-        if turn.capture_isolation:
-            if previous_captured_turn is None:
+    try:
+        previous_captured_turn: int | None = None
+        for turn_index, turn in enumerate(plan.schedule):
+            execution = runs[turn.run_id]
+            if turn.capture_isolation:
+                if previous_captured_turn is None:
+                    await recorder.capture_slot_state(
+                        turn_index=turn_index,
+                        phase="before",
+                        run_ids=run_ids,
+                    )
+                else:
+                    recorder.reuse_slot_state(
+                        source_turn_index=previous_captured_turn,
+                        turn_index=turn_index,
+                        run_count=len(run_ids),
+                    )
+            stop = execution.cursor + turn.command_count
+            await _execute_commands(
+                recorder,
+                execution.plan.commands[execution.cursor : stop],
+                execution.client,
+            )
+            execution.cursor = stop
+            if turn.capture_isolation:
                 await recorder.capture_slot_state(
                     turn_index=turn_index,
-                    phase="before",
+                    phase="after",
                     run_ids=run_ids,
                 )
+                previous_captured_turn = turn_index
             else:
-                recorder.reuse_slot_state(
-                    source_turn_index=previous_captured_turn,
-                    turn_index=turn_index,
-                    run_count=len(run_ids),
-                )
-        stop = execution.cursor + turn.command_count
-        await _execute_commands(
-            recorder,
-            execution.plan.commands[execution.cursor : stop],
-            execution.binding,
-            execution.ledger,
-        )
-        execution.cursor = stop
-        if turn.capture_isolation:
-            await recorder.capture_slot_state(
-                turn_index=turn_index,
-                phase="after",
-                run_ids=run_ids,
-            )
-            previous_captured_turn = turn_index
-        else:
-            previous_captured_turn = None
-    for execution in runs.values():
-        if execution.ledger.open_forward_backward_operation_ids:
-            raise RuntimeError("gate run ended with open F/B contributions")
+                previous_captured_turn = None
+        for execution in runs.values():
+            if execution.client.open_forward_backward_operation_ids:
+                raise RuntimeError("gate run ended with open F/B contributions")
+    finally:
+        await _close_gate_clients(recorder, tuple(run.client for run in runs.values()))
 
 
 async def _execute_run_plan(
@@ -425,29 +460,46 @@ async def _execute_run_plan(
     plan: MegatronGateRunPlan,
     binding: MegatronRunBinding,
 ) -> None:
-    ledger = RunCommandLedger(
-        plan.bootstrap.run_id,
-        learner_version=binding.config.source.policy_step,
-    )
+    client = LocalMegatronTrainingClient.from_binding(binding)
     try:
-        await _execute_commands(recorder, plan.commands, binding, ledger)
-        if ledger.open_forward_backward_operation_ids:
+        await _execute_commands(recorder, plan.commands, client)
+        if client.open_forward_backward_operation_ids:
             raise RuntimeError("gate run ended with open F/B contributions")
     finally:
+        await _close_gate_clients(recorder, (client,))
         await recorder.coordinator.drain_run(plan.bootstrap.run_id)
+
+
+async def _close_gate_clients(
+    recorder: MegatronGateEvidenceRecorder,
+    clients: tuple[LocalMegatronTrainingClient, ...],
+) -> None:
+    primary = sys.exception()
+    failures: list[BaseException] = []
+    for client in clients:
+        try:
+            recorder.finish(client)
+        except BaseException as error:
+            failures.append(error)
+        try:
+            await client.close()
+        except BaseException as error:
+            failures.append(error)
+    if failures:
+        if primary is not None:
+            failures.insert(0, primary)
+        raise BaseExceptionGroup("Megatron gate cleanup failed", failures) from None
 
 
 async def _execute_commands(
     recorder: MegatronGateEvidenceRecorder,
     commands: tuple[MegatronGateCommand, ...],
-    binding: MegatronRunBinding,
-    ledger: RunCommandLedger,
+    client: LocalMegatronTrainingClient,
 ) -> None:
     for command in commands:
         request = _parse_command(command)
         outcome = await recorder.execute(
-            binding.run,
-            ledger,
+            client,
             request,
             capture_numerics=command.capture_numerics,
         )
@@ -467,7 +519,39 @@ def _parse_command(command: MegatronGateCommand) -> RunCommand:
     return cast(RunCommand, request_type.model_validate(command.request))
 
 
-def _command_kind(request: RunCommand) -> OperationKind:
+async def _submit_command(
+    client: LocalMegatronTrainingClient,
+    request: RunCommand,
+) -> LocalMegatronTrainingOperation[Any]:
+    if isinstance(request, ForwardBackwardRequest):
+        return await client.forward_backward(request)
+    if isinstance(request, ForwardRequest):
+        return await client.forward(request)
+    if isinstance(request, OptimStepRequest):
+        return await client.optim_step(request)
+    if isinstance(request, SaveWeightsForSamplerRequest):
+        return await client.save_weights_for_sampler(request)
+    if isinstance(request, SaveStateRequest):
+        return await client.save_state(request)
+    if isinstance(request, LoadStateRequest):
+        return (
+            await client.load_state_with_optimizer(request)
+            if request.restore_optimizer
+            else await client.load_state(request)
+        )
+    raise TypeError(f"unsupported command type {type(request).__name__}")
+
+
+def _command_kind(
+    request: RunCommand,
+) -> Literal[
+    "forward",
+    "forward_backward",
+    "optim_step",
+    "save_sampler",
+    "save_state",
+    "load_state",
+]:
     if isinstance(request, ForwardBackwardRequest):
         return "forward_backward"
     if isinstance(request, ForwardRequest):

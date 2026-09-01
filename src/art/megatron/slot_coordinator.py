@@ -211,8 +211,8 @@ class _ResidencyRankComponentEvidence(BaseModel):
             l1 is None or self.last_l1_reload.byte_count != l1.byte_count
         ):
             raise ValueError("L1 reload evidence differs from the ready L1 copy")
-        if self.reloaded_for_operation and self.last_l1_reload is None:
-            raise ValueError("operation reload evidence has no exact reload receipt")
+        if self.reloaded_for_operation != (self.last_l1_reload is not None):
+            raise ValueError("operation reload flag and exact receipt disagree")
         return self
 
 
@@ -1701,6 +1701,7 @@ class MegatronSlotCoordinator:
             self._residency_evidence[evidence_key] = evidence
             self._residency_summaries[evidence_key] = _summarize_residency_evidence(
                 operation=operation,
+                expected_generation=resource_request.source,
                 runtime_spec=self.trainer.runtime_spec,
                 evidence=evidence,
             )
@@ -1909,6 +1910,7 @@ def _components(request: RunCommand) -> tuple[SlotComponent, ...]:
 def _summarize_residency_evidence(
     *,
     operation: OperationRef,
+    expected_generation: TrainerGeneration,
     runtime_spec: Any,
     evidence: dict[str, Any],
 ) -> MegatronOperationResidencySummary:
@@ -1916,8 +1918,10 @@ def _summarize_residency_evidence(
     if (
         detail.run_id != operation.run_id
         or detail.operation_id != operation.operation_id
+        or detail.learner_version != operation.learner_parent_version
+        or detail.learner_version != expected_generation.policy_step
     ):
-        raise RuntimeError("residency evidence changed operation identity")
+        raise RuntimeError("residency evidence changed operation or learner identity")
     if len(set(detail.requested_components)) != len(detail.requested_components):
         raise RuntimeError("residency evidence repeated a requested component")
 
@@ -1959,6 +1963,11 @@ def _summarize_residency_evidence(
                 component.tiers
             ) or component.required_for_operation != (component.component in requested):
                 raise RuntimeError("rank residency component evidence is inconsistent")
+            if (
+                component.required_for_operation
+                and component.generation_id != expected_generation.generation_id
+            ):
+                raise RuntimeError("required residency component changed generation")
             aggregate = aggregates[component.component]
             aggregate["observed"] += 1
             l1 = next(

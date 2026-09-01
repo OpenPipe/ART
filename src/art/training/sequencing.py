@@ -43,15 +43,18 @@ class RunCommandLedger:
         run_id: str,
         *,
         learner_version: int,
+        initial_operation_sequence: int = 0,
         policy: CommandAdmissionPolicy | None = None,
     ) -> None:
         if not run_id:
             raise ValueError("run_id must not be empty")
         if learner_version < 0:
             raise ValueError("learner_version must be non-negative")
+        if initial_operation_sequence < 0:
+            raise ValueError("initial_operation_sequence must be non-negative")
         self.run_id = run_id
         self._policy = policy or CommandAdmissionPolicy()
-        self._next_sequence_id = 0
+        self._next_sequence_id = initial_operation_sequence
         self._projected_learner_version = learner_version
         self._open_forward_backward_ids: list[str] = []
         self._records: dict[str, _AdmissionRecord] = {}

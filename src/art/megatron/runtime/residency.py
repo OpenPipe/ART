@@ -595,6 +595,21 @@ class ResidencyLedger:
                 last_l1_reload=self._l1_reloads.get(key),
             )
 
+    def claim_l1_reloads(
+        self, keys: Iterable[ResidencyKey]
+    ) -> dict[ResidencyKey, ResidencyL1ReloadReceipt]:
+        """Consume exact reload receipts for one admitted working set."""
+
+        keys = tuple(keys)
+        if len(set(keys)) != len(keys):
+            raise ValueError("residency reload claims must contain unique keys")
+        with self._lock:
+            return {
+                key: receipt
+                for key in keys
+                if (receipt := self._l1_reloads.pop(key, None)) is not None
+            }
+
     def entries(self) -> tuple[ResidencyEntry, ...]:
         with self._lock:
             keys = tuple(self._copies)

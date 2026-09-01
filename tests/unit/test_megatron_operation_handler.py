@@ -2,11 +2,14 @@ import asyncio
 from datetime import UTC, datetime
 import hashlib
 import json
+from pathlib import Path
 from threading import RLock
 from types import SimpleNamespace
 
 import pytest
+import torch
 
+from art import TrainableModel
 from art.distributed.art_runtime import DistributedPackedBatch
 from art.distributed.data_plane import (
     PackedBatchLeaseSet,
@@ -15,9 +18,9 @@ from art.distributed.data_plane import (
     TensorSpec,
 )
 from art.distributed.packing import TrajectoryGroupPayload
-from art.distributed.rollout import RolloutModelSpec
+from art.distributed.rollout import DistributedTrajectorySelection, RolloutModelSpec
 from art.distributed.trajectory_store import TrajectoryGroupBundle
-from art.megatron import MegatronOperationResidencySummary
+from art.megatron import MegatronBackend, MegatronOperationResidencySummary
 from art.megatron.operation_handler import (
     POLICY_ACTIVATION_LAG_METRIC,
     MegatronInferenceUpdateUsage,
@@ -57,7 +60,10 @@ from art.megatron.slot_coordinator import (
     MegatronSlotRun,
     TrainerMegatronSlotResources,
 )
+from art.megatron.slot_runtime import MegatronRunBinding
 from art.megatron.training import LocalMegatronTrainingClient
+from art.metrics_taxonomy import TRAIN_GRADIENT_STEPS_KEY
+from art.preprocessing.tokenize import SFTBatch
 from art.training import (
     AdamConfig,
     AdapterSpec,
@@ -67,6 +73,7 @@ from art.training import (
     ForwardBackwardRequest,
     ForwardBackwardResult,
     ForwardRequest,
+    ForwardResult,
     ImmutablePublicationRef,
     LossConfig,
     OperationExecutionError,
@@ -81,8 +88,10 @@ from art.training import (
     SaveWeightsForSamplerRequest,
     TrainingInputObject,
     TrainingInputObjectRef,
+    bootstrap_operation_worker,
 )
-from art.trajectories import TrajectoryGroup
+from art.trajectories import Trajectory, TrajectoryGroup
+from art.types import TrainSFTConfig
 from art.vllm_route_transport import (
     RetainedRouteBundleRef,
     RouteBundleChoiceLayout,
@@ -150,9 +159,11 @@ def _packed_batch(
 class _Runtime:
     def __init__(self) -> None:
         self.packed = _packed_batch()
+        self.pack_requests = []
         self.released: list[DistributedPackedBatch] = []
 
     async def pack(self, request):
+        self.pack_requests.append(request)
         if (
             request.compute_content_sha256
             and self.packed.leases.ref.content_sha256 is None
@@ -218,6 +229,7 @@ class _Trainer:
         self.registered_runs: set[str] = set()
         self.registered_adapters: dict[str, tuple[int, tuple[str, ...]]] = {}
         self.registered_timeouts: dict[str, float] = {}
+        self.run_generation_ids: dict[str, str] = {}
         self.run_states: dict[str, TrainerCommandRunState] = {}
         self.migration_releases: list[str] = []
         self.optimizer_jobs = []
@@ -246,7 +258,7 @@ class _Trainer:
                     "components": tuple(
                         {
                             "component": component,
-                            "generation_id": "generation",
+                            "generation_id": self.run_generation_ids[run_id],
                             "required_for_operation": True,
                             "byte_count": 1024,
                             "tiers": ("l1_gpu", "l2_cpu"),
@@ -297,6 +309,8 @@ class _Trainer:
         self.registered_restore_optimizer[run_spec.run_id] = (
             run_spec.initial_restore_optimizer
         )
+        assert run_spec.initial_generation_id is not None
+        self.run_generation_ids[run_spec.run_id] = run_spec.initial_generation_id
         self.run_states[run_spec.run_id] = TrainerCommandRunState(
             run_id=run_spec.run_id,
             training_session_id=run_spec.training_session_id,
@@ -363,6 +377,7 @@ class _Trainer:
         if optimizer:
             open_ids = ()
             learner_version = job.learner_version
+            self.run_generation_ids[job.run_id] = job.generation.generation_id
         self.run_states[job.run_id] = state.model_copy(
             update={
                 "learner_version": learner_version,
@@ -388,6 +403,17 @@ class _Trainer:
             "executed_token_equivalents": 8,
             "gpu_count": 4,
             "gpu_service_ns": 12_000_000,
+            "metrics": {
+                "data/gradient_step_nonpadding_logical_tokens": 7.0,
+                "data/gradient_step_loss_bearing_tokens": 4.0,
+                "data/gradient_step_executed_token_equivalents": 8.0,
+                "data/gradient_step_nominal_schedule_capacity_tokens": 8.0,
+                "data/gradient_step_dummy_executed_token_equivalents": 0.0,
+                "data/gradient_step_dummy_schedule_capacity_tokens": 0.0,
+                "pipeline/gradient_step_real_microbatches": 1.0,
+                "pipeline/gradient_step_dummy_microbatches": 0.0,
+                "time/forward_backward_s": 0.01,
+            },
         }
 
         async def settle():
@@ -410,6 +436,17 @@ class _Trainer:
             "executed_token_equivalents": 8,
             "gpu_count": 4,
             "gpu_service_ns": 12_000_000,
+            "metrics": {
+                "data/gradient_step_nonpadding_logical_tokens": 7.0,
+                "data/gradient_step_loss_bearing_tokens": 4.0,
+                "data/gradient_step_executed_token_equivalents": 8.0,
+                "data/gradient_step_nominal_schedule_capacity_tokens": 8.0,
+                "data/gradient_step_dummy_executed_token_equivalents": 0.0,
+                "data/gradient_step_dummy_schedule_capacity_tokens": 0.0,
+                "pipeline/gradient_step_real_microbatches": 1.0,
+                "pipeline/gradient_step_dummy_microbatches": 0.0,
+                "time/forward_backward_s": 0.01,
+            },
         }
 
         async def settle():
@@ -421,6 +458,12 @@ class _Trainer:
 
     async def forward_backward(self, job, batch):
         return await (await self.start_forward_backward(job, batch)).completion
+
+    async def start_sft_forward_backward(self, job, _batch):
+        return await self.start_forward_backward(job, _batch)
+
+    async def start_sft_forward(self, job, _batch):
+        return await self.start_forward(job, _batch)
 
     async def optim_step(self, job):
         if self.fail_optimizer:
@@ -435,6 +478,7 @@ class _Trainer:
             ),
             "gpu_count": 4,
             "gpu_service_ns": 3_000_000,
+            "metrics": {"time/optimizer_step_s": 0.005},
         }
 
 
@@ -534,6 +578,9 @@ def test_run_residency_pins_under_l1_admission_lock() -> None:
         def pin_many(self, copies) -> None:
             assert admission.depth > 0
             self.pinned = tuple(copies)
+
+        def claim_l1_reloads(self, _keys):
+            return {}
 
     key = ResidencyKey(
         training_session_id="session",
@@ -665,6 +712,7 @@ async def test_local_megatron_client_uses_slot_worker_and_exact_contributions() 
     class _Worker:
         def __init__(self) -> None:
             self.calls = []
+            self.retired = []
 
         async def execute(self, request, operation, contributions=()):
             self.calls.append((request, operation, contributions))
@@ -684,6 +732,9 @@ async def test_local_megatron_client_uses_slot_worker_and_exact_contributions() 
                     ),
                 )
             return OperationSucceeded(operation=operation, result=result)
+
+        def retire(self, operation_id):
+            self.retired.append(operation_id)
 
     worker = _Worker()
     client = LocalMegatronTrainingClient(
@@ -718,6 +769,142 @@ async def test_local_megatron_client_uses_slot_worker_and_exact_contributions() 
     assert (await client.operation_evidence(optimizer.ref.operation_id)).status == (
         "succeeded"
     )
+    assert not client._ledger._records
+    assert worker.retired == []
+    assert client.retire_operation(forward.ref.operation_id)
+    assert client.retire_operation(optimizer.ref.operation_id)
+    assert worker.retired == [forward.ref.operation_id, optimizer.ref.operation_id]
+    await client.close()
+
+
+@pytest.mark.asyncio
+async def test_local_client_resumes_sequence_and_retries_evidence_retirement() -> None:
+    class _Worker:
+        def __init__(self) -> None:
+            self.retire_attempts = 0
+
+        async def execute(self, request, operation, contributions=()):
+            assert request.sequence_id == 17
+            assert not contributions
+            return OperationSucceeded(
+                operation=operation,
+                result=ForwardResult(
+                    operation_id=operation.operation_id,
+                    packing=PackingOutcome(
+                        packed_sequence_length=1,
+                        packed_sequences=1,
+                        target_packed_sequences=1,
+                        physical_tokens=1,
+                        non_padding_tokens=1,
+                        loss_bearing_tokens=1,
+                        trainable_assistant_tokens=1,
+                    ),
+                ),
+            )
+
+        def retire(self, operation_id):
+            del operation_id
+            self.retire_attempts += 1
+            if self.retire_attempts == 1:
+                raise RuntimeError("evidence store unavailable")
+
+    worker = _Worker()
+    client = LocalMegatronTrainingClient(
+        MegatronSlotRun("run", worker),  # type: ignore[arg-type]
+        learner_version=3,
+        initial_operation_sequence=17,
+    )
+    operation = await client.forward(
+        ForwardRequest(
+            run_id="run",
+            request_id="forward-resumed",
+            sequence_id=17,
+            batch=_batch(),
+            loss=LossConfig(name="cispo"),
+        )
+    )
+    await operation.result()
+
+    with pytest.raises(RuntimeError, match="evidence store unavailable"):
+        client.retire_operation(operation.ref.operation_id)
+    assert client.operation_ids == (operation.ref.operation_id,)
+    assert (await client.operation_evidence(operation.ref.operation_id)).status == (
+        "succeeded"
+    )
+    assert client.retire_operation(operation.ref.operation_id)
+    assert client.operation_ids == ()
+    await client.close()
+
+
+@pytest.mark.asyncio
+async def test_local_megatron_client_retires_real_worker_records_across_window() -> (
+    None
+):
+    packing = PackingOutcome(
+        packed_sequence_length=8,
+        packed_sequences=1,
+        target_packed_sequences=1,
+        physical_tokens=8,
+        non_padding_tokens=8,
+        loss_bearing_tokens=8,
+        trainable_assistant_tokens=8,
+    )
+
+    async def handler(request, operation, contributions):
+        assert isinstance(request, ForwardRequest)
+        assert not contributions
+        return ForwardResult(operation_id=operation.operation_id, packing=packing)
+
+    worker = bootstrap_operation_worker(handler, max_retained_operations=2)
+    client = LocalMegatronTrainingClient(
+        MegatronSlotRun("run", worker),
+        learner_version=0,
+        max_retained_operations=2,
+    )
+    retained = []
+    for sequence_id in range(2):
+        request = ForwardRequest(
+            run_id="run",
+            request_id=f"forward-{sequence_id}",
+            sequence_id=sequence_id,
+            batch=_batch(),
+            loss=LossConfig(name="cispo"),
+        )
+        operation = await client.forward(request)
+        assert (await operation.result()).operation_id == operation.ref.operation_id
+        assert await client.forward(request) is operation
+        assert (await client.operation_evidence(operation.ref.operation_id)).status == (
+            "succeeded"
+        )
+        retained.append(operation)
+
+    with pytest.raises(RuntimeError, match="replay window is full"):
+        await client.forward(
+            ForwardRequest(
+                run_id="run",
+                request_id="forward-2",
+                sequence_id=2,
+                batch=_batch(),
+                loss=LossConfig(name="cispo"),
+            )
+        )
+
+    client.retire_operation(retained[0].ref.operation_id)
+    for sequence_id in range(2, 5):
+        operation = await client.forward(
+            ForwardRequest(
+                run_id="run",
+                request_id=f"forward-{sequence_id}",
+                sequence_id=sequence_id,
+                batch=_batch(),
+                loss=LossConfig(name="cispo"),
+            )
+        )
+        await operation.result()
+        client.retire_operation(operation.ref.operation_id)
+    client.retire_operation(retained[1].ref.operation_id)
+
+    assert client.operation_ids == ()
     await client.close()
 
 
@@ -1287,6 +1474,209 @@ async def test_slot_coordinator_serializes_gpu_work_before_result_settlement() -
     await slot.drain_run("run-0")
     with pytest.raises(KeyError):
         slot.resolve_run("run-0")
+    await slot.aclose()
+
+
+@pytest.mark.asyncio
+async def test_megatron_backend_lowers_rl_and_sft_through_one_bound_slot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class _Publisher:
+        async def aclose(self) -> None:
+            pass
+
+        async def plan_artifacts(self, *_args, **_kwargs):
+            return SimpleNamespace()
+
+        async def save_weights_for_sampler(
+            self,
+            request,
+            operation,
+            generation,
+            **_kwargs,
+        ):
+            alias = request.publication.model_alias
+            assert alias is not None
+            result = SamplerWeightsResult(
+                operation_id=operation.operation_id,
+                checkpoint=CheckpointRef(
+                    run_id=operation.run_id,
+                    learner_version=generation.policy_step,
+                    checkpoint_id=generation.generation_id,
+                ),
+                lora=f"{alias}@{generation.policy_step}",
+                metrics={POLICY_ACTIVATION_LAG_METRIC: 0.25},
+            )
+            return MegatronSamplerPublicationReceipt(
+                operation_id=operation.operation_id,
+                request_id=request.request_id,
+                publication_mode=request.publication.mode,
+                requested_public_alias=alias,
+                runtime_model_name=alias,
+                runtime_lora_name=result.lora,
+                serving_generation_id=generation.generation_id,
+                learner_version=generation.policy_step,
+                policy_activation_timing=MegatronPolicyActivationTiming(
+                    trainer_completed_monotonic_s=1.0,
+                    serving_activated_monotonic_s=1.25,
+                ),
+                inference_update_usage=MegatronInferenceUpdateUsage(
+                    staging_s=0.1,
+                    apply_s=0.15,
+                ),
+                holder_update_sequence=generation.policy_step,
+                holder_update_id=f"update-{generation.policy_step}",
+                retained=(
+                    MegatronRetainedState(
+                        owner_id=f"lora/{operation.operation_id}",
+                        resource="lora",
+                        bytes=1024,
+                        work_fingerprint="f" * 64,
+                    ),
+                ),
+                result=result,
+            )
+
+    class _Queue:
+        def __init__(self, materialized: TrajectoryGroup) -> None:
+            self.materialized = materialized
+            self.materializations = 0
+            self.marked = []
+            self.released = []
+
+        async def materialize_selection(self, selection):
+            assert selection.queue is self
+            self.materializations += 1
+            return self.materialized
+
+        async def mark_packed(self, selections, generation_id):
+            self.marked.append((tuple(selections), generation_id))
+
+        async def release_selections(
+            self, selections, *, disposition, generation_id=None
+        ):
+            assert trainer.optimizer_jobs
+            self.released.append((tuple(selections), disposition, generation_id))
+
+    class _SftTokenizer:
+        def tokenize(self, model, batch):
+            assert model.base_model == "test-model"
+            assert len(batch.trajectories) == 1
+            tensors = {
+                "input_ids": torch.tensor([[1, 2]], dtype=torch.long),
+                "attention_mask": torch.tensor([[1, 1]], dtype=torch.long),
+                "labels": torch.tensor([[-100, 2]], dtype=torch.long),
+            }
+            return SFTBatch(
+                trajectory_tensors=[tensors],
+                learning_rate=0.0,
+                num_trajectories=1,
+                num_tokens=2,
+                num_trainable_tokens=1,
+            )
+
+    runtime = _Runtime()
+    trainer = _Trainer()
+    trainer.fail_optimizer = False
+    slot = MegatronSlotCoordinator(  # type: ignore[arg-type]
+        runtime,
+        trainer,
+        publisher=_Publisher(),  # type: ignore[arg-type]
+    )
+    generation = TrainerGeneration(
+        training_session_id="session",
+        policy_step=1,
+        generation_id=f"step-00000001-{'a' * 32}",
+        adapter_path="/adapter/1",
+    )
+    model = TrainableModel(
+        run_name="registered-slot-run",
+        name="registered-slot-run",
+        run_id="run",
+        project="pipeline-tests",
+        base_model="test-model",
+        base_path=str(tmp_path),
+    )
+    model.inference_base_url = "http://inference.test/v1"
+    model.inference_api_key = "test-key"
+    model.inference_model_name = "registered-slot-run"
+    assert model.run_id == "run"
+    operation_config = MegatronOperationConfig(
+        run_id="run",
+        training_session_id="session",
+        adapter=AdapterSpec(rank=8, target_modules=("q_proj",)),
+        source=generation,
+        initial_operation_sequence=11,
+        optimizer_state_path="/optimizer",
+        rollout_model=RolloutModelSpec.from_model(model),
+        output_adapter_root="/adapter",
+    )
+    run = await slot.register_run(operation_config)
+    slot._runs["run"].handler._sft_tokenizer = _SftTokenizer()  # type: ignore[assignment]
+    binding = MegatronRunBinding(run=run, config=operation_config)
+    backend = MegatronBackend(path=str(tmp_path))
+
+    async def bind_owned_training_run(bound_model, openai_config):
+        assert bound_model is model
+        assert openai_config is None
+        backend._training_binding = binding
+        model.run_id = binding.config.run_id
+
+    monkeypatch.setattr(backend, "_bind_owned_training_run", bind_owned_training_run)
+    monkeypatch.setattr(TrainableModel, "_get_wandb_run", lambda _self: None)
+    monkeypatch.setattr(
+        "art.megatron.backend.get_megatron_runtime_config",
+        lambda: SimpleNamespace(packed_sequence_length=8),
+    )
+    await model.register(backend)
+    assert model.run_id == "run"
+    assert model.get_inference_name() == "registered-slot-run"
+    assert not backend.supports_async_pipeline_packing(model)
+
+    materialized = TrajectoryGroup(
+        [
+            Trajectory(reward=1.0, initial_policy_version=1),
+            Trajectory(reward=0.0, initial_policy_version=1),
+        ]
+    )
+    queue = _Queue(materialized)
+    selection = DistributedTrajectorySelection(queue, SimpleNamespace())  # type: ignore[arg-type]
+    group = TrajectoryGroup()
+    group._distributed_lease = selection
+
+    result = await backend.train(
+        model,
+        [group],
+        learning_rate=1e-5,
+        save_checkpoint=False,
+    )
+
+    assert result.step == 2
+    assert model.get_inference_name() == "registered-slot-run@2"
+    assert queue.materializations == 1
+    assert len(runtime.pack_requests) == 1
+    assert len(queue.marked) == 1
+    assert queue.released[0][1] == "consumed"
+    assert trainer.optimizer_jobs[-1].contributing_forward_backward_operation_ids
+    client = await backend.training_client(model)
+    assert client.operation_ids == ()
+
+    sft_metrics = [
+        metrics
+        async for metrics in backend._train_sft(
+            model,
+            [Trajectory()],
+            TrainSFTConfig(learning_rate=2e-5, batch_size=1),
+            {},
+        )
+    ]
+    assert sft_metrics[0][TRAIN_GRADIENT_STEPS_KEY] == 1.0
+    assert trainer.optimizer_jobs[-1].operation.kind == "optim_step"
+    assert client.projected_learner_version == 3
+    assert client.operation_ids == ()
+    assert not backend._services
+
+    await backend.close()
     await slot.aclose()
 
 
