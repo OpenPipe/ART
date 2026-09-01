@@ -1,5 +1,7 @@
 import asyncio
 from datetime import UTC, datetime
+import hashlib
+import json
 from threading import RLock
 from types import SimpleNamespace
 
@@ -15,6 +17,7 @@ from art.distributed.data_plane import (
 from art.distributed.packing import TrajectoryGroupPayload
 from art.distributed.rollout import RolloutModelSpec
 from art.distributed.trajectory_store import TrajectoryGroupBundle
+from art.megatron import MegatronOperationResidencySummary
 from art.megatron.operation_handler import (
     POLICY_ACTIVATION_LAG_METRIC,
     MegatronInferenceUpdateUsage,
@@ -222,7 +225,39 @@ class _Trainer:
             "run_id": run_id,
             "requested_components": components,
             "learner_version": learner_version,
-            "rank_evidence": (),
+            "rank_evidence": (
+                {
+                    "rank": 0,
+                    "run_id": run_id,
+                    "operation_id": operation_id,
+                    "requested_components": components,
+                    "components": tuple(
+                        {
+                            "component": component,
+                            "generation_id": "generation",
+                            "required_for_operation": True,
+                            "byte_count": 1024,
+                            "tiers": ("l1_gpu", "l2_cpu"),
+                            "l1_ready": True,
+                            "copies": (
+                                {
+                                    "tier": "l1_gpu",
+                                    "byte_count": 1024,
+                                    "ready": True,
+                                },
+                                {
+                                    "tier": "l2_cpu",
+                                    "byte_count": 1024,
+                                    "ready": True,
+                                },
+                            ),
+                        }
+                        for component in components
+                    ),
+                },
+            ),
+            "wait_s": 0.25,
+            "rank_max_s": 0.2,
         }
 
     async def release_command_run_residency_admission(self, operation_id):
@@ -1095,6 +1130,68 @@ async def test_slot_coordinator_serializes_gpu_work_before_result_settlement() -
 
 
 @pytest.mark.asyncio
+async def test_slot_coordinator_summarizes_private_residency_evidence() -> None:
+    runtime = _Runtime()
+    trainer = _Trainer()
+    slot = MegatronSlotCoordinator(runtime, trainer)  # type: ignore[arg-type]
+    run = await slot.register_run(
+        MegatronOperationConfig(
+            run_id="run",
+            training_session_id="session",
+            adapter=AdapterSpec(rank=8, target_modules=("q_proj",)),
+            source=TrainerGeneration(
+                training_session_id="session",
+                policy_step=0,
+                generation_id=f"step-00000000-{'a' * 32}",
+                adapter_path="/adapter/0",
+            ),
+            optimizer_state_path="/optimizer",
+            rollout_model=RolloutModelSpec(payload={}),
+            output_adapter_root="/adapter",
+        )
+    )
+    operation = _operation("forward", "forward", 0)
+    outcome = await run.worker.execute(
+        ForwardRequest(
+            run_id="run",
+            request_id="forward",
+            sequence_id=0,
+            batch=_batch(),
+            loss=LossConfig(name="cispo"),
+        ),
+        operation,
+    )
+
+    assert outcome.status == "succeeded"
+    detail = slot.residency_evidence("run", "forward")
+    summary = slot.residency_summary("run", "forward")
+    assert detail is not None
+    assert isinstance(summary, MegatronOperationResidencySummary)
+    assert summary.requested_components == ("weights",)
+    assert summary.topology.rank_count == 1
+    assert summary.all_ranks_reported
+    assert summary.all_requested_components_l1_ready
+    assert summary.l1_ready_bytes == 1024
+    assert summary.components[0].component == "weights"
+    assert summary.components[0].l1_ready_rank_count == 1
+    assert summary.components[1].component == "optimizer"
+    assert summary.components[1].observed_rank_count == 0
+    assert summary.tiers[0].tier == "l1_gpu"
+    assert summary.tiers[0].ready_bytes == 1024
+    assert summary.tiers[1].tier == "l2_cpu"
+    assert summary.tiers[1].ready_bytes == 1024
+    canonical = json.dumps(
+        detail, allow_nan=False, separators=(",", ":"), sort_keys=True
+    ).encode()
+    assert summary.detailed_evidence_sha256 == hashlib.sha256(canonical).hexdigest()
+    assert "rank_evidence" not in summary.model_dump(mode="json")
+
+    run.worker.retire("forward")
+    assert slot.residency_summary("run", "forward") is None
+    await slot.aclose()
+
+
+@pytest.mark.asyncio
 async def test_sampler_publication_receipt_lives_until_operation_retirement() -> None:
     class _EvidenceSink:
         def __init__(self) -> None:
@@ -1214,8 +1311,8 @@ async def test_sampler_publication_receipt_lives_until_operation_retirement() ->
         == outcome
     )
     run.worker.retire("publish")
-    assert evidence_sink.evidence[0]["operation_id"] == "publish"
-    assert evidence_sink.evidence[0]["requested_components"] == ()
+    assert evidence_sink.evidence[0].operation_id == "publish"
+    assert evidence_sink.evidence[0].requested_components == ()
     assert slot.sampler_publication_receipt("run", "publish") is None
     await slot.aclose()
 

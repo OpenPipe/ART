@@ -1197,6 +1197,15 @@ class MCoreRunSlotExecutor:
         components = []
         for key in self._state_keys(state):
             entry = self._residency.ledger.entry(key)
+            observed_at = time.monotonic()
+            copies = tuple(
+                {
+                    "tier": copy.tier,
+                    "byte_count": copy.byte_count,
+                    "ready": copy.ready_at <= observed_at,
+                }
+                for copy in entry.copies
+            )
             l1 = next((copy for copy in entry.copies if copy.tier == "l1_gpu"), None)
             components.append(
                 {
@@ -1206,6 +1215,7 @@ class MCoreRunSlotExecutor:
                     "byte_count": 0 if l1 is None else l1.byte_count,
                     "tiers": tuple(copy.tier for copy in entry.copies),
                     "l1_ready": l1 is not None,
+                    "copies": copies,
                 }
             )
         return {

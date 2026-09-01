@@ -80,6 +80,51 @@ def test_production_run_slots_do_not_depend_on_trainer_rank(
     assert "art.trainer_rank" not in inspect.getsource(run_slots)
 
 
+def test_rank_residency_evidence_retains_bounded_copy_facts(
+    executor_module: Any,
+) -> None:
+    key = ResidencyKey(
+        training_session_id="session",
+        run_id="run",
+        generation_id="generation",
+        representation="weights",
+        topology_fingerprint="topology",
+        adapter_layout_fingerprint="layout",
+    )
+    state = executor_module._ResidentCommandRun(
+        spec=SimpleNamespace(run_id="run"),
+        learner_version=0,
+        gradients=SimpleNamespace(contribution_ids=()),
+        adapter_config={},
+        weights_key=key,
+    )
+    entry = SimpleNamespace(
+        copies=(
+            SimpleNamespace(tier="l1_gpu", byte_count=1024, ready_at=0.0),
+            SimpleNamespace(tier="l2_cpu", byte_count=1024, ready_at=0.0),
+        )
+    )
+    executor = object.__new__(executor_module.MCoreRunSlotExecutor)
+    executor._runs = {"run": state}
+    executor._residency = SimpleNamespace(
+        ledger=SimpleNamespace(
+            entry=lambda observed: entry if observed == key else None
+        )
+    )
+    executor.runtime = SimpleNamespace(rank=0)
+
+    evidence = executor._residency_evidence("run", "operation", ("weights",), (key,))
+
+    component = evidence["components"][0]
+    assert component["byte_count"] == 1024
+    assert component["tiers"] == ("l1_gpu", "l2_cpu")
+    assert component["l1_ready"] is True
+    assert component["copies"] == (
+        {"tier": "l1_gpu", "byte_count": 1024, "ready": True},
+        {"tier": "l2_cpu", "byte_count": 1024, "ready": True},
+    )
+
+
 def _archive(*, step: int = 7) -> Any:
     checkpoint_digest = "d" * 64
     files = tuple(

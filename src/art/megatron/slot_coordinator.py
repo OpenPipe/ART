@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+import hashlib
+import json
 import math
 from typing import Any, Literal, Protocol
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, FiniteFloat, model_validator
 
 from art.distributed.art_runtime import ArtRuntime
 from art.training import (
@@ -52,6 +54,7 @@ from .runtime.portable_snapshot import (
 from .runtime.publication import TrainerRankPublication
 from .runtime.residency import (
     ResidencyCapacityUnavailable,
+    ResidencyTier,
     ResidencyWorkingSetTooLarge,
 )
 from .runtime.specs import (
@@ -62,6 +65,164 @@ from .runtime.specs import (
 )
 
 SlotComponent = Literal["weights", "optimizer", "accumulator"]
+_SLOT_COMPONENTS: tuple[SlotComponent, ...] = (
+    "weights",
+    "optimizer",
+    "accumulator",
+)
+_RESIDENCY_TIERS: tuple[ResidencyTier, ...] = (
+    "l1_gpu",
+    "l2_cpu",
+    "l3_nvme",
+)
+
+
+class MegatronResidencyTopologySummary(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    rank_count: int = Field(ge=1)
+    data_parallel_size: int = Field(ge=1)
+    tensor_parallel_size: int = Field(ge=1)
+    context_parallel_size: int = Field(ge=1)
+    expert_parallel_size: int = Field(ge=1)
+    pipeline_parallel_size: int = Field(ge=1)
+    virtual_pipeline_parallel_size: int | None = Field(default=None, ge=1)
+    expert_tensor_parallel_size: int = Field(ge=1)
+
+
+class MegatronResidencyComponentSummary(BaseModel):
+    """Bounded aggregate for one physical run-state component."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    component: SlotComponent
+    required_for_operation: bool
+    observed_rank_count: int = Field(ge=0)
+    l1_ready_rank_count: int = Field(ge=0)
+    l1_ready_bytes: int = Field(ge=0)
+    l2_present_rank_count: int = Field(ge=0)
+    l3_present_rank_count: int = Field(ge=0)
+    all_ranks_l1_ready: bool
+
+
+class MegatronResidencyTierSummary(BaseModel):
+    """Aggregate copy and byte facts for one bounded residency tier."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    tier: ResidencyTier
+    copy_count: int = Field(ge=0)
+    ready_copy_count: int = Field(ge=0)
+    byte_count: int = Field(ge=0)
+    ready_bytes: int = Field(ge=0)
+
+
+class MegatronOperationResidencySummary(BaseModel):
+    """Service-persistable aggregate backed by private ART rank evidence."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    schema_version: Literal["megatron-operation-residency.v1"] = (
+        "megatron-operation-residency.v1"
+    )
+    run_id: str = Field(min_length=1)
+    operation_id: str = Field(min_length=1, max_length=64)
+    operation_kind: Literal[
+        "forward",
+        "forward_backward",
+        "optim_step",
+        "save_sampler",
+        "save_state",
+        "load_state",
+    ]
+    operation_sequence: int = Field(ge=0)
+    learner_parent_version: int = Field(ge=0)
+    reserved_output_learner_version: int | None = Field(default=None, ge=1)
+    learner_version: int = Field(ge=0)
+    runtime_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
+    topology: MegatronResidencyTopologySummary
+    requested_components: tuple[SlotComponent, ...] = Field(max_length=3)
+    components: tuple[MegatronResidencyComponentSummary, ...] = Field(
+        min_length=3, max_length=3
+    )
+    tiers: tuple[MegatronResidencyTierSummary, ...] = Field(min_length=3, max_length=3)
+    observed_rank_count: int = Field(ge=0)
+    all_ranks_reported: bool
+    all_requested_components_l1_ready: bool
+    l1_ready_bytes: int = Field(ge=0)
+    residency_wait_s: FiniteFloat = Field(ge=0)
+    rank_max_prepare_s: FiniteFloat = Field(ge=0)
+    detailed_evidence_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+    @model_validator(mode="after")
+    def _validate_components(self) -> "MegatronOperationResidencySummary":
+        if len(set(self.requested_components)) != len(self.requested_components):
+            raise ValueError("requested residency components must be unique")
+        if tuple(item.component for item in self.components) != _SLOT_COMPONENTS:
+            raise ValueError("residency component aggregates must be canonical")
+        if tuple(item.tier for item in self.tiers) != _RESIDENCY_TIERS:
+            raise ValueError("residency tier aggregates must be canonical")
+        requested = set(self.requested_components)
+        if any(
+            item.required_for_operation != (item.component in requested)
+            for item in self.components
+        ):
+            raise ValueError("residency component requirement flags changed")
+        return self
+
+
+class _ResidencyRankCopyEvidence(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    tier: ResidencyTier
+    byte_count: int = Field(ge=1)
+    ready: bool
+
+
+class _ResidencyRankComponentEvidence(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    component: SlotComponent
+    generation_id: str = Field(min_length=1)
+    required_for_operation: bool
+    byte_count: int = Field(ge=0)
+    tiers: tuple[ResidencyTier, ...] = Field(max_length=3)
+    l1_ready: bool
+    copies: tuple[_ResidencyRankCopyEvidence, ...] = Field(max_length=3)
+
+    @model_validator(mode="after")
+    def _validate_copies(self) -> "_ResidencyRankComponentEvidence":
+        copy_tiers = tuple(copy.tier for copy in self.copies)
+        if len(set(copy_tiers)) != len(copy_tiers) or copy_tiers != self.tiers:
+            raise ValueError("residency copy tiers changed identity")
+        l1 = next((copy for copy in self.copies if copy.tier == "l1_gpu"), None)
+        if self.l1_ready != (l1 is not None) or self.byte_count != (
+            0 if l1 is None else l1.byte_count
+        ):
+            raise ValueError("legacy L1 residency facts disagree with copy evidence")
+        return self
+
+
+class _ResidencyRankEvidence(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    rank: int = Field(ge=0)
+    run_id: str = Field(min_length=1)
+    operation_id: str = Field(min_length=1, max_length=64)
+    requested_components: tuple[SlotComponent, ...] = Field(max_length=3)
+    components: tuple[_ResidencyRankComponentEvidence, ...] = Field(max_length=3)
+
+
+class _DetailedResidencyEvidence(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    operation_id: str = Field(min_length=1, max_length=64)
+    run_id: str = Field(min_length=1)
+    requested_components: tuple[SlotComponent, ...] = Field(max_length=3)
+    learner_version: int = Field(ge=0)
+    rank_evidence: tuple[_ResidencyRankEvidence, ...]
+    wait_s: FiniteFloat = Field(ge=0)
+    rank_max_s: FiniteFloat = Field(ge=0)
 
 
 class MegatronSlotScheduleConfig(BaseModel):
@@ -120,9 +281,11 @@ class MegatronSlotResourceManager(Protocol):
 
 
 class MegatronOperationEvidenceSink(Protocol):
-    """Idempotently retain private command evidence before ART releases replay state."""
+    """Idempotently retain a bounded summary before ART releases replay state."""
 
-    def retain_residency_evidence(self, evidence: dict[str, Any]) -> None: ...
+    def retain_residency_evidence(
+        self, evidence: MegatronOperationResidencySummary
+    ) -> None: ...
 
 
 class InlineMegatronSlotResources:
@@ -515,6 +678,9 @@ class MegatronSlotCoordinator:
             tuple[str, str], tuple[MegatronOperationConfig, str | None]
         ] = {}
         self._residency_evidence: dict[tuple[str, str], dict[str, Any]] = {}
+        self._residency_summaries: dict[
+            tuple[str, str], MegatronOperationResidencySummary
+        ] = {}
         self._registering_runs: dict[
             str, tuple[MegatronOperationConfig, str | None, str | None]
         ] = {}
@@ -878,11 +1044,12 @@ class MegatronSlotCoordinator:
     ) -> None:
         state = self._runs.get(run_id)
         if state is not None and state.worker is worker:
-            evidence = self._residency_evidence.get((run_id, operation_id))
-            if evidence is not None and self.operation_evidence_sink is not None:
-                self.operation_evidence_sink.retain_residency_evidence(evidence)
+            summary = self._residency_summaries.get((run_id, operation_id))
+            if summary is not None and self.operation_evidence_sink is not None:
+                self.operation_evidence_sink.retain_residency_evidence(summary)
             state.handler.retire_operation(operation_id)
             self._residency_evidence.pop((run_id, operation_id), None)
+            self._residency_summaries.pop((run_id, operation_id), None)
 
     def residency_evidence(
         self, run_id: str, operation_id: str
@@ -890,6 +1057,13 @@ class MegatronSlotCoordinator:
         """Return exact rank readiness evidence until operation retirement."""
 
         return self._residency_evidence.get((run_id, operation_id))
+
+    def residency_summary(
+        self, run_id: str, operation_id: str
+    ) -> MegatronOperationResidencySummary | None:
+        """Return the bounded service-facing aggregate until operation retirement."""
+
+        return self._residency_summaries.get((run_id, operation_id))
 
     async def _enter_worker_call(
         self,
@@ -1493,8 +1667,12 @@ class MegatronSlotCoordinator:
                     self.resources.prefetch(resource_request)
             assert resource_request is not None
             evidence = await self.resources.ensure(resource_request)
-            self._residency_evidence[(operation.run_id, operation.operation_id)] = (
-                evidence
+            evidence_key = (operation.run_id, operation.operation_id)
+            self._residency_evidence[evidence_key] = evidence
+            self._residency_summaries[evidence_key] = _summarize_residency_evidence(
+                operation=operation,
+                runtime_spec=self.trainer.runtime_spec,
+                evidence=evidence,
             )
             loop = asyncio.get_running_loop()
             future: asyncio.Future[OperationResultType] = loop.create_future()
@@ -1696,6 +1874,147 @@ def _components(request: RunCommand) -> tuple[SlotComponent, ...]:
     if isinstance(request, OptimStepRequest):
         return ("weights", "optimizer", "accumulator")
     return ()
+
+
+def _summarize_residency_evidence(
+    *,
+    operation: OperationRef,
+    runtime_spec: Any,
+    evidence: dict[str, Any],
+) -> MegatronOperationResidencySummary:
+    detail = _DetailedResidencyEvidence.model_validate(evidence)
+    if (
+        detail.run_id != operation.run_id
+        or detail.operation_id != operation.operation_id
+    ):
+        raise RuntimeError("residency evidence changed operation identity")
+    if len(set(detail.requested_components)) != len(detail.requested_components):
+        raise RuntimeError("residency evidence repeated a requested component")
+
+    rank_count = len(runtime_spec.trainer_mesh.ranks)
+    ranks = tuple(item.rank for item in detail.rank_evidence)
+    if len(set(ranks)) != len(ranks) or any(rank >= rank_count for rank in ranks):
+        raise RuntimeError("residency evidence returned invalid trainer ranks")
+    requested = set(detail.requested_components)
+    aggregates = {
+        component: {
+            "observed": 0,
+            "l1_ready": 0,
+            "l1_bytes": 0,
+            "l2_present": 0,
+            "l3_present": 0,
+        }
+        for component in _SLOT_COMPONENTS
+    }
+    tier_aggregates = {
+        tier: {"copies": 0, "ready_copies": 0, "bytes": 0, "ready_bytes": 0}
+        for tier in _RESIDENCY_TIERS
+    }
+    for rank in detail.rank_evidence:
+        if (
+            rank.run_id != operation.run_id
+            or rank.operation_id != operation.operation_id
+            or rank.requested_components != detail.requested_components
+        ):
+            raise RuntimeError("rank residency evidence changed operation identity")
+        names = tuple(item.component for item in rank.components)
+        if len(set(names)) != len(names):
+            raise RuntimeError("rank residency evidence repeated a component")
+        for component in rank.components:
+            tiers = set(component.tiers)
+            if len(tiers) != len(
+                component.tiers
+            ) or component.required_for_operation != (component.component in requested):
+                raise RuntimeError("rank residency component evidence is inconsistent")
+            aggregate = aggregates[component.component]
+            aggregate["observed"] += 1
+            l1 = next(
+                (copy for copy in component.copies if copy.tier == "l1_gpu"), None
+            )
+            aggregate["l1_ready"] += int(l1 is not None and l1.ready)
+            aggregate["l1_bytes"] += 0 if l1 is None or not l1.ready else l1.byte_count
+            aggregate["l2_present"] += int("l2_cpu" in tiers)
+            aggregate["l3_present"] += int("l3_nvme" in tiers)
+            for copy in component.copies:
+                tier = tier_aggregates[copy.tier]
+                tier["copies"] += 1
+                tier["ready_copies"] += int(copy.ready)
+                tier["bytes"] += copy.byte_count
+                tier["ready_bytes"] += copy.byte_count if copy.ready else 0
+
+    components = tuple(
+        MegatronResidencyComponentSummary(
+            component=component,
+            required_for_operation=component in requested,
+            observed_rank_count=values["observed"],
+            l1_ready_rank_count=values["l1_ready"],
+            l1_ready_bytes=values["l1_bytes"],
+            l2_present_rank_count=values["l2_present"],
+            l3_present_rank_count=values["l3_present"],
+            all_ranks_l1_ready=(
+                values["observed"] == rank_count and values["l1_ready"] == rank_count
+            ),
+        )
+        for component, values in aggregates.items()
+    )
+    tiers = tuple(
+        MegatronResidencyTierSummary(
+            tier=tier,
+            copy_count=values["copies"],
+            ready_copy_count=values["ready_copies"],
+            byte_count=values["bytes"],
+            ready_bytes=values["ready_bytes"],
+        )
+        for tier, values in tier_aggregates.items()
+    )
+    all_ranks_reported = len(detail.rank_evidence) == rank_count
+    topology = runtime_spec.trainer_mesh.topology
+    topology_width = topology.tp * topology.cp * topology.pp
+    if rank_count % topology_width:
+        raise RuntimeError("trainer topology does not divide its rank count")
+    canonical_detail = json.dumps(
+        detail.model_dump(mode="json"),
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode()
+    return MegatronOperationResidencySummary(
+        run_id=operation.run_id,
+        operation_id=operation.operation_id,
+        operation_kind=operation.kind,
+        operation_sequence=operation.sequence_id,
+        learner_parent_version=operation.learner_parent_version,
+        reserved_output_learner_version=operation.reserved_output_learner_version,
+        learner_version=detail.learner_version,
+        runtime_fingerprint=runtime_spec.fingerprint,
+        topology=MegatronResidencyTopologySummary(
+            rank_count=rank_count,
+            data_parallel_size=rank_count // topology_width,
+            tensor_parallel_size=topology.tp,
+            context_parallel_size=topology.cp,
+            expert_parallel_size=getattr(topology, "ep", 1),
+            pipeline_parallel_size=topology.pp,
+            virtual_pipeline_parallel_size=getattr(topology, "vpp", None),
+            expert_tensor_parallel_size=getattr(topology, "etp", 1),
+        ),
+        requested_components=detail.requested_components,
+        components=components,
+        tiers=tiers,
+        observed_rank_count=len(detail.rank_evidence),
+        all_ranks_reported=all_ranks_reported,
+        all_requested_components_l1_ready=(
+            all_ranks_reported
+            and all(
+                component.all_ranks_l1_ready
+                for component in components
+                if component.required_for_operation
+            )
+        ),
+        l1_ready_bytes=tiers[0].ready_bytes,
+        residency_wait_s=detail.wait_s,
+        rank_max_prepare_s=detail.rank_max_s,
+        detailed_evidence_sha256=hashlib.sha256(canonical_detail).hexdigest(),
+    )
 
 
 def _same_generation_identity(
