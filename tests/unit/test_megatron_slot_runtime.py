@@ -1,5 +1,5 @@
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 
 import pytest
 from safetensors.torch import save_file
@@ -13,12 +13,44 @@ from art.distributed import (
     RuntimeTopology,
     TrainerMeshSpec,
 )
+from art.distributed.host_admission import GpuIdentity, HostAdmissionReport
 from art.megatron import MegatronSlotLaunchConfig, launch_megatron_slot
 from art.megatron.model_support.lora_disk import (
     load_adapter_config,
     normalize_lora_checkpoint_to_vllm,
 )
-from art.runtime_attestation import RuntimeArchitectureAttestation
+from art.runtime_attestation import (
+    RuntimeArchitectureAttestation,
+    RuntimeHostAttestation,
+)
+
+
+def test_host_attestation_retains_driver_and_gpu_identity() -> None:
+    report = cast(
+        HostAdmissionReport,
+        SimpleNamespace(
+            host_id="host",
+            hostname="trainer-host",
+            boot_id="boot",
+            runtime=SimpleNamespace(sha256="a" * 64),
+            nvidia_driver_version="580.159.03",
+            assigned_gpus=(
+                GpuIdentity(
+                    index=0,
+                    product_name="NVIDIA B300 SXM6 PC",
+                    compute_capability="10.3",
+                    uuid="GPU-f7f178ce-8dac-92a7-71fc-b5ea257b8ff7",
+                    parent_uuid="GPU-f7f178ce-8dac-92a7-71fc-b5ea257b8ff7",
+                    pci_bus_id="00000000:1A:00.0",
+                ),
+            ),
+        ),
+    )
+
+    attestation = RuntimeHostAttestation.from_admission(report)
+
+    assert attestation.nvidia_driver_version == "580.159.03"
+    assert attestation.assigned_gpus == report.assigned_gpus
 
 
 def test_serving_normalization_retains_exact_training_targets(tmp_path) -> None:

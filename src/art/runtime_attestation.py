@@ -50,15 +50,22 @@ class RuntimeHostAttestation(BaseModel):
     hostname: str = Field(min_length=1)
     boot_id: str = Field(min_length=1)
     runtime_sha256: str = Field(pattern=_SHA256)
+    nvidia_driver_version: str = Field(
+        min_length=1, max_length=64, pattern=r"^[0-9]+(?:\.[0-9]+)*$"
+    )
     assigned_gpus: tuple[GpuIdentity, ...] = Field(min_length=1)
 
     @classmethod
     def from_admission(cls, report: HostAdmissionReport) -> Self:
+        driver = report.nvidia_driver_version
+        if driver is None:
+            raise ValueError("GPU host admission has no NVIDIA driver version")
         return cls(
             host_id=report.host_id,
             hostname=report.hostname,
             boot_id=report.boot_id,
             runtime_sha256=report.runtime.sha256,
+            nvidia_driver_version=driver,
             assigned_gpus=report.assigned_gpus,
         )
 
