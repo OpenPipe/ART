@@ -511,6 +511,45 @@ def test_dp_rank_forward_falls_back_to_memory_minimal_layout_before_refusing(
     assert rank.last_forward_telemetry()["selected_max_depth"] == 2
 
 
+def test_profiled_steady_state_keeps_the_wide_shared_wave(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Profile trust must judge the selected layout, not the no-sharing bound.
+
+    GRPO-16: sixteen rows sharing a 1,000-token prompt. The selected
+    (full-sharing) width-16 plan packs 1,016 tokens; the no-sharing bound is
+    16,016. With an existing profile of 1,016 tokens (trust growth 8x =>
+    8,128) and a 1,100-token budget, width 16 fits and is inside the profiled
+    regime, so a steady-state call must not regress to width 8 because the
+    stale bound looked untrusted.
+    """
+
+    prompt = tuple(range(20_000, 21_000))
+    inputs = [_target_request(_tokens(*prompt, tail)) for tail in range(16)]
+    rank = TrainerRank(_attention_runtime())
+    monkeypatch.setattr(rank, "_dp_rank_and_size", lambda: (0, 1))
+    monkeypatch.setattr(
+        rank,
+        "_run_flat_plan_with_memory_tracking",
+        lambda plan, **_kwargs: (
+            [ForwardOutput(None, None, None, None) for _ in range(plan.request_count)],
+            None,
+        ),
+    )
+    plan = rank._plan_flat_forward(inputs)
+    assert plan.packed_tokens == 1_016, plan.packed_tokens
+    # Steady state: a prior call profiled exactly this shape.
+    rank._memory_profiles[plan.signature] = _MemoryProfile(
+        bytes_per_token=1.0, packed_tokens=1_016
+    )
+    _set_packed_token_budget(monkeypatch, rank, 1_100)
+
+    batches = list(rank.forward_micro_batches(inputs))
+
+    assert [batch.stats.global_count for batch in batches] == [16]
+    assert not batches[0].stats.cold_start
+
+
 def test_forward_micro_batches_telemetry_reports_hidden_speculation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

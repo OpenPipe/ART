@@ -2599,78 +2599,98 @@ class TrainerRank:
                 estimates[width] = None
                 return None
             assert values is not None
-            packed_tokens, output_bytes, signature = values
-            logical_tokens: int | None = None
-            check = self._memory_check_required(
-                self._estimate_required_memory_bytes_from_values(
-                    packed_tokens=packed_tokens,
-                    output_bytes=output_bytes,
-                    signature=signature,
-                ),
-                sync_across_dp=True,
+            logical_tokens = sum(
+                int(request.input_tokens.numel()) for request in local_requests
             )
-            if not check.fits and (
-                exact_failed_width is None or width < exact_failed_width
-            ):
-                # The cheap no-sharing count is an upper bound: valid for
-                # accepting a width, not for rejecting one. When it rejects,
-                # price the width with the planner's cost-optimal layouts;
-                # if those still do not fit, price the memory-minimal (full
-                # sharing) layouts. The cost-optimal layout can decline
-                # sharing at one width and accept it at a wider one, so its
-                # packed count is not monotone in width — but full sharing's
-                # is, which makes "memory-minimal fits" the monotone
-                # feasibility predicate the outer search relies on. The
-                # admitted mode is recorded so materialization executes the
-                # same layouts that were priced.
-                logical_tokens = sum(
-                    int(request.input_tokens.numel()) for request in local_requests
-                )
 
-                def priced(exact: bool, memory_minimal: bool) -> _MemoryCheck | None:
-                    values = self._estimate_flat_forward(
-                        local_requests,
-                        checkpoint=checkpoint,
-                        exact=exact,
-                        memory_minimal=memory_minimal,
-                    )
-                    if values is None:
-                        return None
-                    return self._memory_check_required(
+            def priced(
+                packed_tokens: int,
+                output_bytes: int,
+                signature: _MemorySignature,
+            ) -> tuple[_MemoryCheck, int, int, _MemorySignature]:
+                return (
+                    self._memory_check_required(
                         self._estimate_required_memory_bytes_from_values(
-                            packed_tokens=values[0],
-                            output_bytes=values[1],
-                            signature=values[2],
+                            packed_tokens=packed_tokens,
+                            output_bytes=output_bytes,
+                            signature=signature,
                             logical_tokens=logical_tokens,
                         ),
                         sync_across_dp=True,
-                    )
+                    ),
+                    packed_tokens,
+                    output_bytes,
+                    signature,
+                )
 
-                # Cheap full-sharing bound first: if even the memory-minimal
-                # layouts cannot fit, no planner pricing is needed.
-                minimal_bound = priced(exact=False, memory_minimal=True)
-                if minimal_bound is not None and minimal_bound.fits:
+            def priced_estimate(
+                *, exact: bool, memory_minimal: bool
+            ) -> tuple[_MemoryCheck, int, int, _MemorySignature] | None:
+                estimated = self._estimate_flat_forward(
+                    local_requests,
+                    checkpoint=checkpoint,
+                    exact=exact,
+                    memory_minimal=memory_minimal,
+                )
+                return None if estimated is None else priced(*estimated)
+
+            def trusted(packed_tokens: int, signature: _MemorySignature) -> bool:
+                return self._all_ranks_have_memory_profile(
+                    packed_tokens=packed_tokens, signature=signature
+                )
+
+            # The cheap no-sharing count is an upper bound on any planner
+            # layout: valid for accepting a width (memory and profile trust),
+            # never for rejecting one. Exact pricing runs when the bound would
+            # reject on memory, or when it would reject on profile trust while
+            # a profile exists — the selected layout may be far smaller than
+            # the bound and squarely inside the profiled regime.
+            selected = priced(*values)
+            profiled = self._all_ranks_true(selected[3] in self._memory_profiles)
+            needs_exact = not selected[0].fits or (
+                profiled and not trusted(selected[1], selected[3])
+            )
+            if needs_exact and (
+                exact_failed_width is None or width < exact_failed_width
+            ):
+                # Feasibility must be monotone in width for the outer search:
+                # the cost-optimal layout can decline sharing at one width and
+                # accept it at a wider one, but the memory-minimal (full
+                # sharing) layout's packed count is monotone by construction.
+                # Its cheap bound decides feasibility; planner pricing then
+                # picks cost-optimal when that fits and memory-minimal
+                # otherwise, recording the mode so materialization executes
+                # exactly the layouts that were priced.
+                minimal_bound = priced_estimate(exact=False, memory_minimal=True)
+                if minimal_bound is not None and minimal_bound[0].fits:
                     for memory_minimal in (False, True):
-                        priced_check = priced(exact=True, memory_minimal=memory_minimal)
-                        assert priced_check is not None
-                        check = priced_check
-                        if check.fits:
+                        exact = priced_estimate(
+                            exact=True, memory_minimal=memory_minimal
+                        )
+                        assert exact is not None
+                        selected = exact
+                        if selected[0].fits and (
+                            not profiled or trusted(selected[1], selected[3])
+                        ):
                             layout_modes[width] = memory_minimal
                             break
+                    else:
+                        # Nothing fit and trusted; keep the memory-minimal
+                        # pricing so the recorded failure is the monotone one.
+                        if not selected[0].fits:
+                            layout_modes.pop(width, None)
                 elif minimal_bound is not None:
-                    check = minimal_bound
-                if not check.fits:
+                    selected = minimal_bound
+                if not selected[0].fits:
                     exact_failed_width = (
                         width
                         if exact_failed_width is None
                         else min(exact_failed_width, width)
                     )
+            check, packed_tokens, _output_bytes, signature = selected
             result = (
                 check,
-                self._all_ranks_have_memory_profile(
-                    packed_tokens=packed_tokens,
-                    signature=signature,
-                ),
+                trusted(packed_tokens, signature),
                 self._all_ranks_true(signature in self._memory_profiles),
             )
             estimates[width] = result
