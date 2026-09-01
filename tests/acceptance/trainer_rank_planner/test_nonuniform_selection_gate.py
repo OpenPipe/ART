@@ -36,7 +36,8 @@ refinement_work_budget)``, ``iter_all_prefix_tree_layouts(tree)``, and
 scorer injection. Assertion bodies are the acceptance criteria and must not
 be weakened.
 
-These tests are EXPECTED TO FAIL until the holistic planner lands.
+These tests define the landing contract: written and fail-verified before
+the implementation, they must pass unmodified on the landed tree.
 """
 
 from __future__ import annotations
@@ -229,8 +230,13 @@ def _win_cell_sequences() -> tuple[tuple[int, ...], ...]:
 
 
 def _heterogeneous_sequences() -> tuple[tuple[int, ...], ...]:
+    # A short shared root makes sharing *possible* (one real decision) so the
+    # control verifies the cost model declines it; fully disjoint rows would
+    # make the assertion vacuous.
+    root = tuple(range(8))
     return tuple(
-        tuple(range(row * 1_000_000, row * 1_000_000 + 4_000)) for row in range(16)
+        root + tuple(range(row * 1_000_000, row * 1_000_000 + 4_000))
+        for row in range(16)
     )
 
 
@@ -324,6 +330,7 @@ def test_win_cell_shape_selects_deep_sharing() -> None:
 def test_heterogeneous_control_declines_sharing() -> None:
     planner = _planner()
     tree = planner.build_canonical_prefix_tree(_heterogeneous_sequences())
+    assert tree.decision_indices, "control must offer a decision to decline"
     selected = planner.select_prefix_tree_layout(
         tree, refinement_work_budget=GENEROUS_BUDGET, cp_size=1, layers=2, uses_gdn=True
     )
@@ -370,7 +377,7 @@ def test_candidates_retain_mandatory_anchors(family: str) -> None:
     assert len(tree.decision_indices) in decision_counts, (
         f"{family}: full-sharing anchor missing"
     )
-    assert any(layout.maximum_depth == 1 for layout in layouts), (
+    assert any("depth_one" in candidate.labels for candidate in candidates), (
         f"{family}: depth-one-equivalent anchor missing"
     )
 

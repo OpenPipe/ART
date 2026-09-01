@@ -11,56 +11,24 @@ from art.megatron.prefix_tree_packing import PrefixTreePack, PrefixTreePackSegme
 from ._prefix_tree_planner import CanonicalPrefixTree, PrefixTreeLayout
 
 
-def materialize_prefix_tree_metadata(
-    layout: PrefixTreeLayout,
-    *,
-    pad_multiple: int = 1,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Build CPU group/parent metadata without allocating token tensors."""
-
-    if pad_multiple < 1:
-        raise ValueError("pad_multiple must be positive")
-    packed_length = int(layout.packed_tokens)
-    pad = -packed_length % pad_multiple
-    total_length = packed_length + pad
-    group_ids = torch.empty((1, total_length), dtype=torch.long)
-    parent_ids = torch.empty((1, total_length), dtype=torch.long)
-    cursor = 0
-    for segment_index, segment in enumerate(layout.segments):
-        group_id = segment_index + 1
-        parent_id = (
-            group_id
-            if segment.parent_segment_index is None
-            else segment.parent_segment_index + 1
-        )
-        end = cursor + int(segment.length)
-        group_ids[0, cursor:end].fill_(group_id)
-        parent_ids[0, cursor:end].fill_(parent_id)
-        cursor = end
-    if cursor != packed_length:
-        raise ValueError(
-            "layout packed-token count does not match its materialized segments"
-        )
-    next_group = len(layout.segments) + 1
-    if pad:
-        padding_ids = torch.arange(
-            next_group,
-            next_group + pad,
-            dtype=torch.long,
-        )
-        group_ids[0, cursor:] = padding_ids
-        parent_ids[0, cursor:] = padding_ids
-    return group_ids, parent_ids
-
-
 def materialize_prefix_tree_layout(
     sequences: Sequence[torch.Tensor],
     tree: CanonicalPrefixTree,
     layout: PrefixTreeLayout,
+    *,
+    verify_shared_tokens: bool = True,
 ) -> PrefixTreePack:
-    """Materialize one already-selected layout without making policy choices."""
+    """Materialize one already-selected layout without making policy choices.
 
-    tensors = tuple(sequence.reshape(-1) for sequence in sequences)
+    ``verify_shared_tokens`` re-checks that planned shared segments contain
+    byte-identical tokens across member rows. Callers that already verified
+    content identity (e.g. via a content-hash cache key over these exact
+    tensors) may disable it; on CUDA inputs each comparison is a device sync.
+    """
+
+    tensors = tuple(
+        sequence.detach().reshape(-1).to(dtype=torch.long) for sequence in sequences
+    )
     if not tensors:
         raise ValueError("a nonempty layout requires at least one sequence")
     if tuple(int(tensor.numel()) for tensor in tensors) != tree.sequence_lengths:
@@ -81,10 +49,11 @@ def materialize_prefix_tree_layout(
     cursor = 0
     for segment_index, segment in enumerate(layout.segments):
         source = tensors[segment.sequence_indices[0]][segment.start : segment.end]
-        for sequence_index in segment.sequence_indices[1:]:
-            candidate = tensors[sequence_index][segment.start : segment.end]
-            if not torch.equal(source, candidate):
-                raise ValueError("planned shared segment contains unequal tokens")
+        if verify_shared_tokens:
+            for sequence_index in segment.sequence_indices[1:]:
+                candidate = tensors[sequence_index][segment.start : segment.end]
+                if not torch.equal(source, candidate):
+                    raise ValueError("planned shared segment contains unequal tokens")
         group_id = segment_index + 1
         parent_id = (
             group_id

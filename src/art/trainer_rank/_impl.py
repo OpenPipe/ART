@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections import OrderedDict
 from collections.abc import (
     Callable,
     Iterable,
@@ -45,6 +46,7 @@ from typing_extensions import TypeIs
 from art.megatron.prefix_tree_packing import (
     PrefixTreePack,
     _local_position_pairs,
+    estimate_prefix_tree_packed_tokens,
 )
 from art.trainer_rank._planner_cost import COEFFICIENT_VERSION
 from art.trainer_rank._prefix_tree_materializer import materialize_prefix_tree_layout
@@ -109,6 +111,7 @@ _MEMORY_SAFETY_FACTOR = 1.10
 _MEMORY_RESERVE_FRACTION = 0.03
 _HEAD_CHUNK_TOKENS = 512
 _PLANNER_REFINEMENT_BUDGET = 2_000
+_LAYOUT_SELECTION_CACHE_LIMIT = 64
 
 # Test-only layout anchor forcing for paired acceptance measurement. Both
 # variables must be set; the hook is inert in production.
@@ -500,14 +503,28 @@ class TrainerRankMemoryError(RuntimeError):
         self,
         message: str,
         *,
-        predicted_peak_bytes: int,
-        usable_limit_bytes: int,
-        suggestion: str,
+        predicted_peak_bytes: int = 0,
+        usable_limit_bytes: int = 0,
+        suggestion: str = "",
     ) -> None:
         super().__init__(message)
         self.predicted_peak_bytes = predicted_peak_bytes
         self.usable_limit_bytes = usable_limit_bytes
         self.suggestion = suggestion
+
+    def __reduce__(self) -> tuple[object, ...]:
+        # Keyword-only fields do not survive the default Exception reduce;
+        # carry them as state so pickling across process boundaries keeps the
+        # actionable numbers.
+        return (
+            type(self),
+            (self.args[0] if self.args else "",),
+            {
+                "predicted_peak_bytes": self.predicted_peak_bytes,
+                "usable_limit_bytes": self.usable_limit_bytes,
+                "suggestion": self.suggestion,
+            },
+        )
 
 
 class TrainerRankRuntimeSupportError(RuntimeError):
@@ -529,6 +546,7 @@ class _MemoryCheck:
 class _MemoryProfile:
     bytes_per_token: float
     packed_tokens: int
+    logical_per_packed: float = 1.0
 
 
 @dataclass(frozen=True)
@@ -844,6 +862,7 @@ class _FlatForwardPlan:
     logical_tokens: int
     output_bytes: int
     signature: _MemorySignature
+    selected_max_depth: int = 0
 
 
 class TrainerRank:
@@ -856,6 +875,12 @@ class TrainerRank:
                 f"got pp={pp_size}, chunks={len(runtime.model)}"
             )
         tp_size = int(getattr(runtime.provider, "tensor_model_parallel_size", 1) or 1)
+        try:
+            from megatron.core import parallel_state as ps
+
+            tp_size = max(tp_size, int(ps.get_tensor_model_parallel_world_size()))
+        except (AssertionError, ImportError, RuntimeError, ValueError):
+            pass
         if tp_size > 1:
             raise TrainerRankRuntimeSupportError(
                 "TrainerRank automatic planning currently requires TP=1: the "
@@ -909,12 +934,14 @@ class TrainerRank:
         self._hybridep_rows_high_water = 0
         self._memory_profiles: dict[_MemorySignature, _MemoryProfile] = {}
         self._last_global_micro_batch_size: int | None = None
-        self._layout_selection_cache: dict[
+        # Bounded LRU: steady-state hits are temporally local (identical
+        # content on consecutive calls); fresh-token training steps must not
+        # accumulate entries for the lifetime of the rank.
+        self._layout_selection_cache: OrderedDict[
             tuple[str, int, int, bool, int, str | None],
             tuple[CanonicalPrefixTree, PrefixTreeLayout],
-        ] = {}
+        ] = OrderedDict()
         self._planning_seconds_accum = 0.0
-        self._planning_depth_max = 0
         self._last_forward_telemetry_snapshot: dict[str, float | int] | None = None
         self.zero_grad()
 
@@ -1679,8 +1706,8 @@ class TrainerRank:
             for index in indices:
                 self._forward_item(requests[index])
         start = 0
+        self._reset_planning_telemetry()
         while start < len(items):
-            self._reset_planning_telemetry()
             with _telemetry_phase(
                 "plan",
                 {"global_start": start, "global_remaining": len(items) - start},
@@ -1688,7 +1715,7 @@ class TrainerRank:
                 candidate = self._select_next_micro_batch(
                     items, start, checkpoint=checkpoint
                 )
-            self._snapshot_planning_telemetry()
+            self._snapshot_planning_telemetry(candidate.plan)
             tracked_outputs, memory_baseline = self._run_flat_plan_with_memory_tracking(
                 candidate.plan,
                 context="forward_micro_batches",
@@ -1800,6 +1827,7 @@ class TrainerRank:
             plan = self._plan_flat_forward(
                 list(_flatten(materialized)), checkpoint=checkpoint
             )
+            self._snapshot_planning_telemetry(plan)
             check = self._memory_check(plan)
             if not check.fits:
                 self._raise_memory_error(
@@ -1808,7 +1836,6 @@ class TrainerRank:
                     context="dp_rank_forward",
                     message="forward is predicted to exceed available memory",
                 )
-            self._snapshot_planning_telemetry()
             tracked_outputs, _memory_baseline = (
                 self._run_flat_plan_with_memory_tracking(
                     plan,
@@ -1820,16 +1847,21 @@ class TrainerRank:
 
     def _reset_planning_telemetry(self) -> None:
         self._planning_seconds_accum = 0.0
-        self._planning_depth_max = 0
 
-    def _snapshot_planning_telemetry(self) -> None:
+    def _snapshot_planning_telemetry(self, plan: _FlatForwardPlan) -> None:
         self._last_forward_telemetry_snapshot = {
             "planning_ms": self._planning_seconds_accum * 1_000.0,
-            "selected_max_depth": self._planning_depth_max,
+            "selected_max_depth": plan.selected_max_depth,
         }
 
     def last_forward_telemetry(self) -> dict[str, float | int]:
-        """Concise planner telemetry for the most recent public forward."""
+        """Concise planner telemetry for the most recent planned forward.
+
+        ``planning_ms`` accumulates across the whole public call (all waves of
+        ``forward_micro_batches``); ``selected_max_depth`` describes the most
+        recently materialized plan. The snapshot is taken before admission, so
+        a call refused with ``TrainerRankMemoryError`` is still reflected.
+        """
 
         if self._last_forward_telemetry_snapshot is None:
             raise RuntimeError("no forward has completed planning yet")
@@ -2691,8 +2723,9 @@ class TrainerRank:
         hasher = hashlib.sha256()
         for tensor in input_ids:
             row = tensor.detach().reshape(-1).cpu().contiguous()
+            hasher.update(str(row.dtype).encode("ascii"))
             hasher.update(_U64_STRUCT.pack(int(row.numel())))
-            hasher.update(row.numpy().tobytes())
+            hasher.update(row.numpy())
         key = (
             hasher.hexdigest(),
             cp_size,
@@ -2702,6 +2735,8 @@ class TrainerRank:
             anchor,
         )
         cached = self._layout_selection_cache.get(key)
+        if cached is not None:
+            self._layout_selection_cache.move_to_end(key)
         if cached is None:
             tree = build_canonical_prefix_tree(
                 tuple(tuple(tensor.reshape(-1).tolist()) for tensor in input_ids)
@@ -2724,10 +2759,9 @@ class TrainerRank:
                 ).layout
             cached = (tree, layout)
             self._layout_selection_cache[key] = cached
+            while len(self._layout_selection_cache) > _LAYOUT_SELECTION_CACHE_LIMIT:
+                self._layout_selection_cache.popitem(last=False)
         self._planning_seconds_accum += time.perf_counter() - started
-        self._planning_depth_max = max(
-            self._planning_depth_max, cached[1].maximum_depth
-        )
         return cached
 
     def _plan_flat_forward(
@@ -2740,16 +2774,17 @@ class TrainerRank:
         output_bytes = self._estimate_group_request_output_bytes(requests)
         logical_tokens = sum(int(request.input_tokens.numel()) for request in requests)
         groups = self._group_active_request_indices(requests, checkpoint=checkpoint)
+        selected_max_depth = 0
         for (slot_ref, grad_enabled), group_indices in groups:
             items = tuple(
                 self._forward_item(requests[index]) for index in group_indices
             )
-            tree, layout = self._select_group_layout(
-                tuple(item.input_ids for item in items)
-            )
+            group_input_ids = tuple(item.input_ids for item in items)
+            tree, layout = self._select_group_layout(group_input_ids)
+            selected_max_depth = max(selected_max_depth, layout.maximum_depth)
             started = time.perf_counter()
             packed = materialize_prefix_tree_layout(
-                tuple(item.input_ids for item in items), tree, layout
+                group_input_ids, tree, layout, verify_shared_tokens=False
             )
             self._planning_seconds_accum += time.perf_counter() - started
             plans.append(
@@ -2777,6 +2812,7 @@ class TrainerRank:
                 slot_group_count=len(plans),
                 grad_modes=tuple(mode for (_, mode), _ in groups),
             ),
+            selected_max_depth=selected_max_depth,
         )
 
     def _estimate_flat_forward(
@@ -2788,13 +2824,19 @@ class TrainerRank:
         groups = self._group_active_request_indices(requests, checkpoint=checkpoint)
         packed_tokens = 0
         for _, group_indices in groups:
-            _, layout = self._select_group_layout(
-                tuple(
-                    requests[index].input_tokens.reshape(-1).to(dtype=torch.long)
-                    for index in group_indices
-                )
+            # Width probing uses the cheap no-sharing token count: it is an
+            # exact upper bound on any planner-selected layout's packed tokens
+            # (conservative for admission), costs one O(tokens) CPU walk, and
+            # preserves the estimator's CUDA None-contract (callers fall back
+            # to full packing). The planner itself runs once per materialized
+            # plan in _plan_flat_forward.
+            group_packed_tokens = estimate_prefix_tree_packed_tokens(
+                (requests[index].input_tokens.reshape(-1) for index in group_indices),
+                max_depth=0,
             )
-            packed_tokens += layout.packed_tokens
+            if group_packed_tokens is None:
+                return None
+            packed_tokens += group_packed_tokens
 
         return (
             packed_tokens,
@@ -3193,6 +3235,7 @@ class TrainerRank:
                 packed_tokens=forward.packed_tokens,
                 output_bytes=forward.output_bytes,
                 signature=forward.signature,
+                logical_tokens=forward.logical_tokens,
             ),
             sync_across_dp=sync_across_dp,
         )
@@ -3260,6 +3303,7 @@ class TrainerRank:
         packed_tokens: int,
         output_bytes: int,
         signature: _MemorySignature,
+        logical_tokens: int | None = None,
     ) -> int:
         if packed_tokens <= 0:
             return output_bytes
@@ -3271,13 +3315,23 @@ class TrainerRank:
             * self._param_dtype_size
             * activation_factor
         )
+        # A profile learned under lighter sharing (lower logical/packed ratio)
+        # underestimates the per-packed-token footprint of a deeper-shared
+        # plan; scale the trusted estimate up by the ratio gap.
+        ratio_scale = 1.0
+        if profiled is not None and logical_tokens is not None:
+            current_ratio = logical_tokens / max(1, packed_tokens)
+            ratio_scale = max(1.0, current_ratio / profiled.logical_per_packed)
         if (
             profiled is None
             or profiled.packed_tokens * _MEMORY_PROFILE_TRUST_GROWTH < packed_tokens
         ):
             compute = static_compute
         else:
-            compute = max(static_compute, int(profiled.bytes_per_token * packed_tokens))
+            compute = max(
+                static_compute,
+                int(profiled.bytes_per_token * packed_tokens * ratio_scale),
+            )
         return int((output_bytes + compute) * _MEMORY_SAFETY_FACTOR)
 
     def _available_memory_bytes(self) -> int:
@@ -3330,6 +3384,10 @@ class TrainerRank:
             packed_tokens=max(
                 plan.packed_tokens,
                 0 if previous is None else previous.packed_tokens,
+            ),
+            logical_per_packed=max(
+                plan.logical_tokens / max(1, plan.packed_tokens),
+                1.0 if previous is None else previous.logical_per_packed,
             ),
         )
 

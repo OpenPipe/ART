@@ -59,9 +59,10 @@ class TrainerRank(_impl.TrainerRank):
     """Execute TrainerRank forwards using automatic, data-dependent planning.
 
     The constructor intentionally accepts only the training runtime. Prefix
-    sharing, internal forward partitioning, output-head chunking, microbatch
-    width, and memory headroom are planner decisions rather than user tuning
-    parameters.
+    sharing and microbatch width are data-dependent planner decisions;
+    output-head chunking and memory margins are internal calibrated policy.
+    None are user tuning parameters. Requires TP=1 and PP=1: unsupported
+    topologies raise ``TrainerRankRuntimeSupportError`` at construction.
     """
 
     def __init__(self, runtime: TrainingRuntime) -> None:

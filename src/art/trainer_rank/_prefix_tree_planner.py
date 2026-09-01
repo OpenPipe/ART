@@ -7,8 +7,7 @@ arrive at the same fingerprints and ordering.
 
 The policy that predicts execution time lives above these primitives.  In
 particular, :func:`prefix_tree_layout_candidates` constructs the mandatory
-unbounded candidate family, while :func:`select_layout` supplies only stable
-integer-score ordering and tie breaking.  :func:`select_prefix_tree_layout`
+unbounded candidate family, and :func:`select_prefix_tree_layout`
 composes the candidate family, the calibrated production score, and the
 bounded nonuniform refinement search into the one production selection entry
 point.
@@ -147,24 +146,6 @@ class CanonicalPrefixTree:
 
 
 @dataclass(frozen=True, slots=True)
-class CanonicalForestGroup:
-    """One checkpoint-equivalent tree and its global sequence membership."""
-
-    checkpoint_class: str
-    sequence_indices: tuple[int, ...]
-    tree: CanonicalPrefixTree
-
-
-@dataclass(frozen=True, slots=True)
-class CanonicalPrefixForest:
-    """Stable forest spanning all checkpoint-equivalence classes in a call."""
-
-    sequence_count: int
-    groups: tuple[CanonicalForestGroup, ...]
-    fingerprint: Fingerprint
-
-
-@dataclass(frozen=True, slots=True)
 class PlannedSegment:
     """One physical segment after applying arbitrary share/replay decisions."""
 
@@ -236,15 +217,6 @@ class LayoutCandidate:
     layout: PrefixTreeLayout
     labels: tuple[str, ...]
     effective_span_thresholds: tuple[int, ...]
-
-
-@dataclass(frozen=True, slots=True)
-class LayoutSelection:
-    """Deterministically selected layout plus the fixed-point score used."""
-
-    candidate: LayoutCandidate
-    score: tuple[int, ...]
-    evaluated_candidates: int
 
 
 def _finalize_canonical_prefix_tree(
@@ -384,59 +356,6 @@ def build_canonical_prefix_tree(
         sequence_lengths=lengths,
         segments=tuple(segments),
         content_fingerprint=_content_fingerprint(rows),
-    )
-
-
-def build_canonical_prefix_forest(
-    sequences: Sequence[Sequence[int]],
-    checkpoint_classes: Sequence[str],
-) -> CanonicalPrefixForest:
-    """Build a stable forest without sharing across checkpoint classes."""
-
-    if len(sequences) != len(checkpoint_classes):
-        raise ValueError("one checkpoint class is required per sequence")
-    if not sequences:
-        return CanonicalPrefixForest(
-            sequence_count=0,
-            groups=(),
-            fingerprint=_fingerprint(
-                {"schema": _TREE_SCHEMA_VERSION, "sequence_count": 0, "groups": ()}
-            ),
-        )
-
-    indices_by_class: dict[str, list[int]] = {}
-    for sequence_index, checkpoint_class in enumerate(checkpoint_classes):
-        if not isinstance(checkpoint_class, str):
-            raise TypeError("checkpoint classes must be canonical strings")
-        indices_by_class.setdefault(checkpoint_class, []).append(sequence_index)
-
-    groups = tuple(
-        CanonicalForestGroup(
-            checkpoint_class=checkpoint_class,
-            sequence_indices=tuple(indices),
-            tree=build_canonical_prefix_tree(
-                tuple(sequences[index] for index in indices)
-            ),
-        )
-        for checkpoint_class, indices in sorted(indices_by_class.items())
-    )
-    return CanonicalPrefixForest(
-        sequence_count=len(sequences),
-        groups=groups,
-        fingerprint=_fingerprint(
-            {
-                "schema": _TREE_SCHEMA_VERSION,
-                "sequence_count": len(sequences),
-                "groups": tuple(
-                    (
-                        group.checkpoint_class,
-                        group.sequence_indices,
-                        group.tree.fingerprint,
-                    )
-                    for group in groups
-                ),
-            }
-        ),
     )
 
 
@@ -771,266 +690,6 @@ def _normalize_score(score: FixedPointScore) -> tuple[int, ...]:
     return values
 
 
-def select_layout(
-    candidates: Sequence[LayoutCandidate],
-    score: Callable[[PrefixTreeLayout], FixedPointScore],
-) -> LayoutSelection:
-    """Select by integer score, then by stable layout fingerprint."""
-
-    if not candidates:
-        raise ValueError("at least one layout candidate is required")
-    evaluated = tuple(
-        (_normalize_score(score(candidate.layout)), candidate)
-        for candidate in candidates
-    )
-    selected_score, selected = min(
-        evaluated,
-        key=lambda value: (value[0], value[1].layout.fingerprint),
-    )
-    return LayoutSelection(
-        candidate=selected,
-        score=selected_score,
-        evaluated_candidates=len(evaluated),
-    )
-
-
-@dataclass(frozen=True, slots=True)
-class SubforwardMemory:
-    """Conservative incremental memory for one graph-producing subforward."""
-
-    retained_bytes: int
-    forward_peak_bytes: int
-    backward_workspace_bytes: int
-
-    def __post_init__(self) -> None:
-        if (
-            min(
-                self.retained_bytes,
-                self.forward_peak_bytes,
-                self.backward_workspace_bytes,
-            )
-            < 0
-        ):
-            raise ValueError("subforward memory values must be nonnegative")
-        if self.forward_peak_bytes < self.retained_bytes:
-            raise ValueError(
-                "forward peak must include the subforward's retained bytes"
-            )
-
-    @property
-    def ephemeral_tail_bytes(self) -> int:
-        """Ordering priority for minimizing cumulative forward peak."""
-
-        return self.forward_peak_bytes - self.retained_bytes
-
-
-@dataclass(frozen=True, slots=True)
-class LocalSubforward:
-    """One local execution unit; item order is part of the plan."""
-
-    item_indices: tuple[int, ...]
-    memory: SubforwardMemory
-    layout_fingerprints: tuple[Fingerprint, ...] = ()
-    compile_signatures: tuple[Fingerprint, ...] = ()
-
-    def __post_init__(self) -> None:
-        if not self.item_indices:
-            raise ValueError("a subforward must contain at least one item")
-        if len(set(self.item_indices)) != len(self.item_indices):
-            raise ValueError("an item may occur only once within a subforward")
-        if any(index < 0 for index in self.item_indices):
-            raise ValueError("item indices must be nonnegative")
-
-    @property
-    def fingerprint(self) -> Fingerprint:
-        return _fingerprint(
-            {
-                "schema": _PARTITION_SCHEMA_VERSION,
-                "items": self.item_indices,
-                "memory": (
-                    self.memory.retained_bytes,
-                    self.memory.forward_peak_bytes,
-                    self.memory.backward_workspace_bytes,
-                ),
-                "layouts": self.layout_fingerprints,
-                "compile": self.compile_signatures,
-            }
-        )
-
-
-@dataclass(frozen=True, slots=True)
-class LocalForwardPlan:
-    """Complete local partition for one user-visible ``dp_rank_forward``."""
-
-    item_count: int
-    subforwards: tuple[LocalSubforward, ...]
-    fingerprint: Fingerprint
-
-    @classmethod
-    def build(
-        cls,
-        item_count: int,
-        subforwards: Iterable[LocalSubforward],
-    ) -> LocalForwardPlan:
-        if item_count < 0:
-            raise ValueError("item_count must be nonnegative")
-        values = tuple(subforwards)
-        observed = tuple(
-            index for subforward in values for index in subforward.item_indices
-        )
-        if sorted(observed) != list(range(item_count)):
-            raise ValueError("subforwards must contain every item exactly once")
-        payload = {
-            "schema": _PARTITION_SCHEMA_VERSION,
-            "item_count": item_count,
-            "subforwards": tuple(value.fingerprint for value in values),
-        }
-        return cls(
-            item_count=item_count,
-            subforwards=values,
-            fingerprint=_fingerprint(payload),
-        )
-
-    @classmethod
-    def empty(cls) -> LocalForwardPlan:
-        return cls.build(0, ())
-
-
-@dataclass(frozen=True, slots=True)
-class CumulativeMemory:
-    """Complete-call memory bounds while all returned graphs stay live."""
-
-    forward_peak_bytes: int
-    returned_live_bytes: int
-    backward_upper_bound_bytes: int
-    peak_bytes: int
-
-
-def cumulative_memory(
-    subforwards: Sequence[LocalSubforward],
-    *,
-    base_bytes: int = 0,
-    gradient_bytes: int = 0,
-) -> CumulativeMemory:
-    """Evaluate the specified subforward order under the graph-live contract."""
-
-    if base_bytes < 0 or gradient_bytes < 0:
-        raise ValueError("base and gradient memory must be nonnegative")
-    if not subforwards:
-        return CumulativeMemory(
-            forward_peak_bytes=base_bytes,
-            returned_live_bytes=base_bytes,
-            backward_upper_bound_bytes=base_bytes,
-            peak_bytes=base_bytes,
-        )
-    retained = 0
-    forward_peak = base_bytes
-    maximum_backward_workspace = 0
-    for subforward in subforwards:
-        forward_peak = max(
-            forward_peak,
-            base_bytes + retained + subforward.memory.forward_peak_bytes,
-        )
-        retained += subforward.memory.retained_bytes
-        maximum_backward_workspace = max(
-            maximum_backward_workspace,
-            subforward.memory.backward_workspace_bytes,
-        )
-    returned_live = base_bytes + retained
-    backward_upper_bound = returned_live + gradient_bytes + maximum_backward_workspace
-    return CumulativeMemory(
-        forward_peak_bytes=forward_peak,
-        returned_live_bytes=returned_live,
-        backward_upper_bound_bytes=backward_upper_bound,
-        peak_bytes=max(forward_peak, returned_live, backward_upper_bound),
-    )
-
-
-def memory_optimal_subforward_order(
-    subforwards: Iterable[LocalSubforward],
-) -> tuple[LocalSubforward, ...]:
-    """Return the exact order minimizing the conservative forward peak.
-
-    This is the standard maximum-lateness interchange rule: execute larger
-    ``forward_peak - retained`` tails first.  Stable fingerprints break equal
-    tails, so independent ranks produce an identical order.
-    """
-
-    return tuple(
-        sorted(
-            subforwards,
-            key=lambda subforward: (
-                -subforward.memory.ephemeral_tail_bytes,
-                subforward.fingerprint,
-            ),
-        )
-    )
-
-
-def memory_feasible(
-    subforwards: Sequence[LocalSubforward],
-    *,
-    limit_bytes: int,
-    base_bytes: int = 0,
-    gradient_bytes: int = 0,
-) -> bool:
-    """Return whether the complete forward/returned/backward bound fits."""
-
-    if limit_bytes < 0:
-        raise ValueError("limit_bytes must be nonnegative")
-    return (
-        cumulative_memory(
-            subforwards,
-            base_bytes=base_bytes,
-            gradient_bytes=gradient_bytes,
-        ).peak_bytes
-        <= limit_bytes
-    )
-
-
-PlannerScope = Literal["global", "dp_local"]
-
-
-@dataclass(frozen=True, slots=True)
-class PlannerIdentity:
-    """Versioned common-state identity included in distributed plan digests."""
-
-    scope: PlannerScope
-    input_fingerprint: Fingerprint
-    topology_fingerprint: Fingerprint
-    capability_fingerprint: Fingerprint
-    planner_version: int
-    coefficient_version: int
-    seam_version: int
-
-    def __post_init__(self) -> None:
-        if self.scope not in ("global", "dp_local"):
-            raise ValueError(f"unknown planner scope: {self.scope}")
-        if (
-            min(
-                self.planner_version,
-                self.coefficient_version,
-                self.seam_version,
-            )
-            < 0
-        ):
-            raise ValueError("planner identity versions must be nonnegative")
-
-    @property
-    def fingerprint(self) -> Fingerprint:
-        return _fingerprint(
-            {
-                "scope": self.scope,
-                "input": self.input_fingerprint,
-                "topology": self.topology_fingerprint,
-                "capability": self.capability_fingerprint,
-                "planner": self.planner_version,
-                "coefficients": self.coefficient_version,
-                "seam": self.seam_version,
-            }
-        )
-
-
 def search_prefix_tree_layout(
     tree: CanonicalPrefixTree,
     score: Callable[[PrefixTreeLayout], FixedPointScore],
@@ -1092,34 +751,20 @@ def select_prefix_tree_layout(
 
 
 __all__ = [
-    "CanonicalForestGroup",
-    "CanonicalPrefixForest",
     "CanonicalPrefixTree",
     "CanonicalSegment",
-    "CumulativeMemory",
     "DecisionSet",
     "Fingerprint",
     "FixedPointScore",
     "LayoutCandidate",
-    "LayoutSelection",
-    "LocalForwardPlan",
-    "LocalSubforward",
     "PlannedSegment",
-    "PlannerIdentity",
-    "PlannerScope",
     "PrefixTreeLayout",
-    "SubforwardMemory",
-    "build_canonical_prefix_forest",
     "build_canonical_prefix_tree",
-    "cumulative_memory",
     "effective_span_breakpoints",
     "effective_span_decisions",
-    "memory_feasible",
-    "memory_optimal_subforward_order",
     "iter_all_prefix_tree_layouts",
     "plan_prefix_tree_layout",
     "prefix_tree_layout_candidates",
     "search_prefix_tree_layout",
-    "select_layout",
     "select_prefix_tree_layout",
 ]

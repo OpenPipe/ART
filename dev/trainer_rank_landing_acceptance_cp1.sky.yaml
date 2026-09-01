@@ -13,6 +13,11 @@ name: trainer-rank-landing-acceptance-cp1
 
 workdir: .
 
+# The corpus is git-ignored (customer-derived tokens) and SkyPilot workdir
+# sync respects .gitignore, so it must be mounted explicitly.
+file_mounts:
+  /tmp/trainer_rank_ellavox_corpus.json: dev/_trainer_rank_ellavox_qwen35_4b_tokens.json
+
 envs:
   RUN_ID: unset
 
@@ -35,6 +40,7 @@ run: |
   : "${RUN_ID:?RUN_ID is required}"
   root="scratch/trainer_rank_landing_acceptance/${RUN_ID}"
   mkdir -p "${root}"
+  cp /tmp/trainer_rank_ellavox_corpus.json dev/_trainer_rank_ellavox_qwen35_4b_tokens.json
 
   export ART_MEGATRON_TENSOR_MODEL_PARALLEL_SIZE=1
   export ART_MEGATRON_CONTEXT_PARALLEL_SIZE=1

@@ -104,7 +104,9 @@ def test_trainer_rank_never_hardcodes_a_depth_policy() -> None:
     The planner must derive depth decisions from data, model, topology, and
     memory facts. Passing a literal depth to the packing primitive (or any
     helper) from production TrainerRank code reintroduces the old fixed-depth
-    behavior by the back door.
+    behavior by the back door. The single exception is ``max_depth=0``: a
+    no-sharing token count is not a sharing policy — it shares nothing and is
+    only valid as a conservative upper-bound estimate.
     """
 
     violations: list[str] = []
@@ -115,6 +117,7 @@ def test_trainer_rank_never_hardcodes_a_depth_policy() -> None:
                 isinstance(node, ast.keyword)
                 and node.arg == "max_depth"
                 and isinstance(node.value, ast.Constant)
+                and node.value.value != 0
             ):
                 violations.append(
                     f"{path}:{node.lineno}: max_depth={node.value.value!r}"

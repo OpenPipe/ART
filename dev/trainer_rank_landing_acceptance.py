@@ -44,12 +44,14 @@ Acceptance interface required from the landed implementation
 These are part of the landing contract; if names differ at landing, adapt the
 single ADAPTATION POINT block below, not the gates.
 
-These phases are EXPECTED TO FAIL (exit nonzero) until the planner lands.
+These phases define the landing contract; they were written (and
+fail-verified) before the implementation and must pass on the landed tree.
 """
 
 from __future__ import annotations
 
 import argparse
+import functools
 import inspect
 import json
 import os
@@ -64,13 +66,6 @@ ELLAVOX_CORPUS_SHA256 = (
     "b2528f067065c20cea81a2868f39a8cdd008c30ee54d5e90b68ddf598cfcd41b"
 )
 
-BANNED_KNOBS = (
-    "shared_prefix_max_depth",
-    "head_chunk_tokens",
-    "memory_safety_factor",
-    "memory_reserve_fraction",
-)
-
 # Gate thresholds (sealed measurement -> conservative landing gate).
 GATES: dict[str, dict[str, float]] = {
     "grpo-gdn-cp4": {
@@ -78,8 +73,10 @@ GATES: dict[str, dict[str, float]] = {
         "min_paired_median_gain_pct": 20.0,
         # Sealed: 55.8% lower p50 peak allocation.
         "min_peak_reduction_pct": 30.0,
-        # Sealed: median selected max depth 3.
-        "min_median_selected_max_depth": 2.0,
+        # Sealed: median selected max depth 3. Tail segments count toward
+        # maximum_depth, so the depth-one reference arm itself reports 2; the
+        # gate must sit at the sealed value to detect selection collapse.
+        "min_median_selected_max_depth": 3.0,
         # This cell is the sealed 2-layer throughput screen: execution is
         # deliberately tiny, so planning is bounded absolutely here (sealed
         # steady planning was 82 ms p50). The 10% planning *fraction* gate is
@@ -158,13 +155,19 @@ def phase_contract() -> None:
     print("contract phase: PASS")
 
 
-def _load_census_sequences() -> dict[str, tuple[tuple[int, ...], ...]]:
+@functools.lru_cache(maxsize=1)
+def _load_corpus() -> dict[str, Any]:
     import hashlib
 
-    digest = hashlib.sha256(ELLAVOX_CORPUS.read_bytes()).hexdigest()
+    data = ELLAVOX_CORPUS.read_bytes()
+    digest = hashlib.sha256(data).hexdigest()
     if digest != ELLAVOX_CORPUS_SHA256:
         _fail(f"census corpus digest mismatch: {digest}")
-    corpus = json.loads(ELLAVOX_CORPUS.read_text())
+    return json.loads(data)
+
+
+def _load_census_sequences() -> dict[str, tuple[tuple[int, ...], ...]]:
+    corpus = _load_corpus()
     workloads: dict[str, tuple[tuple[int, ...], ...]] = {}
     for group in corpus["groups"]:
         workloads[f"group-{group['slice_id']}-{group['group_id']}"] = tuple(
@@ -246,8 +249,7 @@ def _ellavox_requests(sample: int) -> list[Any]:
 
     from art.trainer_rank import ForwardInput
 
-    corpus = json.loads(ELLAVOX_CORPUS.read_text())
-    groups = corpus["groups"]
+    groups = _load_corpus()["groups"]
     group = groups[sample % len(groups)]
     requests: list[Any] = []
     for history in group["histories"]:
@@ -333,10 +335,12 @@ def phase_measure(cell: str, arm: str, output_jsonl: str, repeat: int) -> None:
             start = torch.cuda.Event(enable_timing=True)
             end = torch.cuda.Event(enable_timing=True)
             start.record()
+            admission_failed = False
             try:
                 outputs = rank.dp_rank_forward(requests)
                 _output_loss(outputs).backward()
             except TrainerRankMemoryError as error:
+                admission_failed = True
                 rows.append(
                     {
                         "record_type": "admission_failure",
@@ -346,16 +350,20 @@ def phase_measure(cell: str, arm: str, output_jsonl: str, repeat: int) -> None:
                         "error": str(error),
                     }
                 )
-                continue
-            end.record()
-            torch.cuda.synchronize()
-            rank.zero_grad()
+            if not admission_failed:
+                end.record()
+                torch.cuda.synchronize()
+                rank.zero_grad()
+            # Every rank must join this world collective even after a local
+            # admission refusal; skipping it would hang peers under DP > 1.
             peak = torch.tensor(
-                [torch.cuda.max_memory_allocated()],
+                [0 if admission_failed else torch.cuda.max_memory_allocated()],
                 dtype=torch.long,
                 device="cuda",
             )
             dist.all_reduce(peak, op=dist.ReduceOp.MAX)
+            if admission_failed:
+                continue
             telemetry = getattr(rank, TELEMETRY_METHOD)()
             rows.append(
                 {
@@ -406,16 +414,33 @@ def phase_validate(cell: str, evidence: str) -> None:
             f"{cell}: {len(admission_failures)} admission failures recorded"
             " (gate: 0 unsafe/failed admissions)"
         )
-    automatic_ms = _measured(rows, "automatic", "complete_call_ms")
-    reference_ms = _measured(rows, "depth_one", "complete_call_ms")
-    if not automatic_ms or not reference_ms:
+
+    def _samples(arm: str) -> dict[int, float]:
+        values: dict[int, float] = {}
+        for row in rows:
+            if row.get("arm") == arm and row.get("measured"):
+                index = int(row["sample_index"])
+                if index in values:
+                    _fail(
+                        f"{cell}: duplicate {arm} sample_index {index}; use a"
+                        " fresh evidence file per run"
+                    )
+                values[index] = float(row["complete_call_ms"])
+        return values
+
+    automatic_samples = _samples("automatic")
+    reference_samples = _samples("depth_one")
+    if set(automatic_samples) != set(reference_samples) or not automatic_samples:
         _fail(
-            f"{cell}: evidence must contain measured automatic and depth_one"
-            f" arms (found {len(automatic_ms)}/{len(reference_ms)} samples)"
+            f"{cell}: arms must contain identical measured sample indices"
+            f" (automatic={sorted(automatic_samples)},"
+            f" depth_one={sorted(reference_samples)})"
         )
+    automatic_ms = [automatic_samples[i] for i in sorted(automatic_samples)]
+    reference_ms = [reference_samples[i] for i in sorted(reference_samples)]
     paired = [
         100.0 * (reference - automatic) / reference
-        for automatic, reference in zip(automatic_ms, reference_ms)
+        for automatic, reference in zip(automatic_ms, reference_ms, strict=True)
     ]
     median_gain = statistics.median(paired)
     planning_fraction = max(

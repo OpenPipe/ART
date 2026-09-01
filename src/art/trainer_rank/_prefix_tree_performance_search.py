@@ -18,9 +18,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-import hashlib
 from itertools import combinations
-import json
 from typing import Literal, TypeAlias
 
 from ._prefix_tree_planner import (
@@ -29,6 +27,8 @@ from ._prefix_tree_planner import (
     FixedPointScore,
     LayoutCandidate,
     PrefixTreeLayout,
+    _fingerprint,
+    _normalize_score,
     plan_prefix_tree_layout,
     prefix_tree_layout_candidates,
 )
@@ -47,27 +47,6 @@ SearchStopReason: TypeAlias = Literal[
 ]
 
 _SEARCH_SCHEMA_VERSION = 3
-
-
-def _fingerprint(payload: object) -> str:
-    encoded = json.dumps(
-        payload,
-        ensure_ascii=True,
-        separators=(",", ":"),
-        sort_keys=True,
-    ).encode("ascii")
-    return hashlib.sha256(encoded).hexdigest()
-
-
-def _normalize_score(score: FixedPointScore) -> tuple[int, ...]:
-    values = (
-        (score,) if isinstance(score, int) and not isinstance(score, bool) else score
-    )
-    if not isinstance(values, tuple) or not values:
-        raise TypeError("layout scores must be a nonempty int tuple")
-    if any(not isinstance(value, int) or isinstance(value, bool) for value in values):
-        raise TypeError("layout scores must contain only fixed-point integers")
-    return values
 
 
 @dataclass(frozen=True, slots=True)

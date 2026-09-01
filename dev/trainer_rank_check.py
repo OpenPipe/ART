@@ -15,8 +15,12 @@ from trainer_rank_diag import all_ranks_checked, rank0_checked
 from trainer_rank_support import load_random_checkpoints
 import typer
 
-ANCHOR_HOOKS_ENV = "ART_TRAINER_RANK_TEST_HOOKS"
-ANCHOR_ENV = "ART_TRAINER_RANK_TEST_ANCHOR"
+from art.trainer_rank._impl import (
+    _TEST_ANCHOR_ENV as ANCHOR_ENV,
+)
+from art.trainer_rank._impl import (
+    _TEST_HOOKS_ENV as ANCHOR_HOOKS_ENV,
+)
 
 
 @contextmanager
@@ -163,25 +167,26 @@ def _correctness(
     slot_grad_worst = Diff()
     rows: list[dict[str, object]] = []
     for anchor in anchors:
-        anchor_reference: list[dict[str, object]] | None = None
         with _forced_anchor(anchor):
             outputs = _global_outputs(rank, requests)
         comparison = rank0_checked(
             f"TrainerRank correctness anchor={anchor}",
-            lambda: _compare_iteration(outputs, reference, anchor_reference),
+            lambda: _compare_iteration(outputs, reference),
         )
         if dist.get_rank() == 0:
             assert comparison is not None and outputs is not None
-            independent_diff, chunk_diff = comparison
-            worst = worst.merge(independent_diff).merge(chunk_diff)
+            worst = worst.merge(comparison)
             rows.append(
                 {
                     "anchor": anchor,
-                    "independent_mean_abs_pct": independent_diff.mean_abs_pct,
+                    "independent_mean_abs_pct": comparison.mean_abs_pct,
                 }
             )
             print(rows[-1], flush=True)
-        grad_diff = _head_backward_chunk_parity(rank, requests)
+    # Head chunk parity is anchor-independent; exercise both a shallow and a
+    # deep-shared packing once each instead of once per anchor.
+    for parity_depth in (1, 4):
+        grad_diff = _head_backward_chunk_parity(rank, requests, pack_depth=parity_depth)
         grad_worst = grad_worst.merge(grad_diff)
     if len(slot_names) >= 2:
         with _forced_anchor("full_sharing"):
@@ -202,24 +207,18 @@ def _correctness(
 def _compare_iteration(
     outputs: list[dict[str, object]] | None,
     reference: list[dict[str, object]] | None,
-    depth_reference: list[dict[str, object]] | None,
-) -> tuple[Diff, Diff]:
+) -> Diff:
     assert outputs is not None and reference is not None
     _assert_topk_only_oracle(outputs)
     _assert_topk_only_oracle(reference)
     _assert_same_logits_topk(outputs)
     _assert_same_logits_topk(reference)
-    return (
-        _compare_outputs(
-            outputs,
-            reference,
-            tolerance=5e-3,
-            topk_tolerance=1e-2,
-            allow_topk_layout_ties=True,
-        ),
-        Diff()
-        if depth_reference is None
-        else _compare_outputs(outputs, depth_reference, tolerance=2e-5),
+    return _compare_outputs(
+        outputs,
+        reference,
+        tolerance=5e-3,
+        topk_tolerance=1e-2,
+        allow_topk_layout_ties=True,
     )
 
 
@@ -498,6 +497,8 @@ def _topk_boundary_margin(logits: torch.Tensor, k: int) -> float:
 def _head_backward_chunk_parity(
     rank: TrainerRank,
     requests: Sequence[ForwardInput],
+    *,
+    pack_depth: int = 1,
 ) -> Diff:
     from art.trainer_rank import _impl as trainer_rank_impl
 
@@ -510,27 +511,35 @@ def _head_backward_chunk_parity(
     prepared = rank._prepare_packed_forward(
         prefix_tree_pack(
             (item.input_ids for item in items),
-            max_depth=1,
+            max_depth=pack_depth,
         )
     )
     with torch.no_grad():
         hidden = rank._gather_sequence_parallel_hidden(rank._decoder_hidden(prepared))
     gradients: list[torch.Tensor] = []
+    logprob_sums: list[torch.Tensor] = []
     original_chunk = trainer_rank_impl._HEAD_CHUNK_TOKENS
     for chunk_tokens in (17, 8_192):
         trainer_rank_impl._HEAD_CHUNK_TOKENS = chunk_tokens
         try:
             candidate = hidden.detach().requires_grad_(True)
             outputs = rank._project_head(items, prepared, candidate)
-            _output_loss(outputs).backward()
+            loss = _output_loss(outputs)
+            logprob_sums.append(loss.detach())
+            loss.backward()
             assert candidate.grad is not None
             gradients.append(candidate.grad)
         finally:
             trainer_rank_impl._HEAD_CHUNK_TOKENS = original_chunk
+    forward_diff = _diff(logprob_sums[0], logprob_sums[1])
+    if forward_diff.mean_abs_pct > 2e-3:
+        raise AssertionError(
+            f"head forward chunk parity mean_abs_pct={forward_diff.mean_abs_pct}"
+        )
     diff = _diff(gradients[0], gradients[1])
     if diff.mean_abs_pct > 2e-3:
         raise AssertionError(f"head gradient mean_abs_pct={diff.mean_abs_pct}")
-    return diff
+    return diff.merge(forward_diff)
 
 
 def _slot_backward_parity(
@@ -860,10 +869,6 @@ def _diff(actual: torch.Tensor, expected: torch.Tensor) -> Diff:
 
 def _cpu(tensor: object) -> torch.Tensor | None:
     return tensor.detach().cpu() if isinstance(tensor, torch.Tensor) else None
-
-
-def _ints(value: str) -> tuple[int, ...]:
-    return tuple(int(item) for item in value.split(",") if item.strip())
 
 
 def _topology() -> dict[str, int]:
