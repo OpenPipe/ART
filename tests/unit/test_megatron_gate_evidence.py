@@ -4,6 +4,43 @@ import pytest
 
 from art.megatron import gate_evidence
 from art.megatron.gate_evidence import MegatronGateAttemptPlan, MegatronGateTurn
+from art.megatron.runtime.specs import TrainerGeneration
+from art.training import OperationRef, SamplerPublication, SaveWeightsForSamplerRequest
+
+
+@pytest.mark.asyncio
+async def test_gate_checkpoint_adapter_accepts_nonpublishing_sampler_save(
+    tmp_path,
+) -> None:
+    operation = OperationRef(
+        run_id="run-1",
+        operation_id="save-sampler-1",
+        sequence_id=1,
+        learner_parent_version=0,
+        kind="save_sampler",
+    )
+    result = await gate_evidence.MegatronGateCheckpointOperations(
+        SimpleNamespace(), tmp_path
+    ).save_weights_for_sampler(
+        SaveWeightsForSamplerRequest(
+            run_id="run-1",
+            request_id="save-sampler",
+            sequence_id=1,
+            checkpoint_name="open-accumulator",
+            publication=SamplerPublication(mode="none"),
+        ),
+        operation,
+        TrainerGeneration(
+            training_session_id="session-1",
+            policy_step=0,
+            generation_id="step-00000000-00000000000000000000000000000000",
+            adapter_path="/tmp/adapter",
+        ),
+    )
+
+    assert result.operation_id == operation.operation_id
+    assert result.checkpoint.checkpoint_id == "open-accumulator"
+    assert result.lora == "/tmp/adapter"
 
 
 def test_gate_schedule_allows_serial_runs_without_isolation_capture() -> None:

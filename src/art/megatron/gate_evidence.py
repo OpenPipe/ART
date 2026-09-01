@@ -24,6 +24,7 @@ from art.training import (
     OptimStepRequest,
     RunCommand,
     RunCommandLedger,
+    SamplerWeightsResult,
     SaveStateRequest,
     SaveStateResult,
     SaveWeightsForSamplerRequest,
@@ -289,10 +290,19 @@ class MegatronGateCheckpointOperations:
         request: SaveWeightsForSamplerRequest,
         operation: OperationRef,
         generation: TrainerGeneration,
-    ) -> MegatronSamplerPublicationReceipt:
-        del request, operation, generation
-        raise RuntimeError(
-            "Gate sampler publication requires the production checkpoint adapter"
+    ) -> SamplerWeightsResult | MegatronSamplerPublicationReceipt:
+        if request.publication.mode != "none":
+            raise RuntimeError(
+                "Gate sampler publication requires the production checkpoint adapter"
+            )
+        return SamplerWeightsResult(
+            operation_id=operation.operation_id,
+            checkpoint=CheckpointRef(
+                run_id=operation.run_id,
+                learner_version=generation.policy_step,
+                checkpoint_id=request.checkpoint_name,
+            ),
+            lora=generation.adapter_path,
         )
 
     async def load_state(
