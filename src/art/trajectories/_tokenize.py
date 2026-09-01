@@ -312,6 +312,7 @@ _TERMINATOR_TOKENS = (
     "<turn|>",
     "<|tool_response>",
     "</s>",
+    "<|end|>",
     "<|return|>",
     "<|call|>",
     "<｜end▁of▁sentence｜>",
@@ -522,6 +523,56 @@ def _prove_exact_sampled_assistant_span(
 def _rendered_flag(assistant: bool, stop: bool) -> TokenFlag:
     flag = TokenFlag.ASSISTANT if assistant else TokenFlag(0)
     return flag | TokenFlag.STOP if stop else flag
+
+
+def _synthetic_length_stop_mask(
+    messages: Sequence[Mapping[str, object]],
+    sources: Sequence[object | None],
+    assistant_mask: Sequence[bool],
+    stop_mask: Sequence[bool],
+) -> list[bool]:
+    """Identify template stops added after length-terminated assistant turns."""
+
+    assistant_sources = [
+        source
+        for message, source in zip(messages, sources, strict=True)
+        if message.get("role") == "assistant"
+    ]
+    length_turns: list[int] = []
+    for turn, source in enumerate(assistant_sources):
+        if source is None or not _source_is_sampled(source):
+            continue
+        source_key = _sampled_source_key(source)
+        if _source_stop_evidence(source, source_key)[0] == "length":
+            length_turns.append(turn)
+    mask = [False] * len(stop_mask)
+    if not length_turns or not any(stop_mask):
+        return mask
+    assistant_spans: list[tuple[int, int]] = []
+    start = 0
+    while start < len(assistant_mask):
+        if not assistant_mask[start]:
+            start += 1
+            continue
+        end = start + 1
+        while end < len(assistant_mask) and assistant_mask[end]:
+            end += 1
+        assistant_spans.append((start, end))
+        start = end
+    if len(assistant_spans) != len(assistant_sources):
+        raise ValueError(
+            "Could not uniquely attribute rendered assistant spans to source turns"
+        )
+    for turn in length_turns:
+        start, end = assistant_spans[turn]
+        stops = [index for index in range(start, end) if stop_mask[index]]
+        if len(stops) > 1:
+            raise ValueError(
+                "Could not uniquely attribute synthetic stops to assistant turns"
+            )
+        if stops:
+            mask[stops[0]] = True
+    return mask
 
 
 @dataclass(frozen=True)
@@ -3640,6 +3691,12 @@ def _source_stop_evidence(
             return "stop", exchange.response.stop_sequence
         return "other", None
     if isinstance(exchange, ResponsesExchange):
+        generations = _response_generations(exchange.response)
+        if generations:
+            if not 0 <= source_key.index < len(generations):
+                raise ValueError("Responses source generation index is out of bounds")
+            if source_key.index < len(generations) - 1:
+                return "stop", None
         data = _dump(exchange.response)
         status = data.get("status")
         details = _string_dict(data.get("incomplete_details"))
@@ -4400,12 +4457,29 @@ def _tokenize_chat_view(
 
     def source_matches_context(source: object) -> bool:
         exchange = getattr(source, "exchange", None)
+        if not isinstance(
+            exchange, (ChatCompletionsExchange, MessagesExchange, ResponsesExchange)
+        ):
+            return False
+        dialect = (
+            "chat"
+            if isinstance(exchange, ChatCompletionsExchange)
+            else "messages"
+            if isinstance(exchange, MessagesExchange)
+            else "responses"
+        )
+        request_template = exchange.request.get("chat_template")
+        request_kwargs = exchange.request.get("chat_template_kwargs")
         return (
-            isinstance(exchange, ChatCompletionsExchange)
-            and history.tools == exchange.request.get("tools")
-            and history.chat_template == exchange.request.get("chat_template")
-            and history.chat_template_kwargs
-            == exchange.request.get("chat_template_kwargs")
+            history.tools
+            == _openai_tools(exchange.request.get("tools"), dialect=dialect)
+            and history.chat_template == request_template
+            and history.chat_template_kwargs == request_kwargs
+            and (chat_template is None or chat_template == request_template)
+            and (
+                chat_template_kwargs is None
+                or dict(chat_template_kwargs) == (request_kwargs or {})
+            )
         )
 
     canonical_rendered = rendered
@@ -4435,21 +4509,19 @@ def _tokenize_chat_view(
                     canonical_prefix_length = len(rendered_prompt)
                     break
 
+    canonical_length_stop_mask = _synthetic_length_stop_mask(
+        messages,
+        history.message_sources,
+        canonical_assistant_mask,
+        canonical_stop_mask,
+    )
     assistant_mask = _translate_token_mask(
         canonical_rendered, rendered, canonical_assistant_mask
     )
     stop_mask = _translate_token_mask(canonical_rendered, rendered, canonical_stop_mask)
-    exact_coverage_length = exact_prefix_length
-    for source in history.message_sources:
-        if source is None or not source_matches_context(source):
-            continue
-        source_prompt = source_prompt_tokens(source)
-        if (
-            source_prompt is not None
-            and rendered[: len(source_prompt)] == source_prompt
-        ):
-            exact_coverage_length = max(exact_coverage_length, len(source_prompt))
-
+    length_stop_mask = _translate_token_mask(
+        canonical_rendered, rendered, canonical_length_stop_mask
+    )
     positions_by_first_token: dict[int, list[int]] = {}
     for index, token_id in enumerate(rendered):
         positions_by_first_token.setdefault(token_id, []).append(index)
@@ -5364,10 +5436,11 @@ def _tokenize_chat_view(
         token_ids.extend(rendered[cursor:start])
         logprobs.extend([math.nan] * (start - cursor))
         flags.extend(
-            _rendered_flag(assistant, stop)
-            for assistant, stop in zip(
+            _rendered_flag(assistant and not length_stop, stop)
+            for assistant, stop, length_stop in zip(
                 assistant_mask[cursor:start],
                 stop_mask[cursor:start],
+                length_stop_mask[cursor:start],
                 strict=True,
             )
         )
@@ -5378,6 +5451,9 @@ def _tokenize_chat_view(
             )
         except ValueError:
             replacement_stop_mask = [False] * len(replacement)
+        replacement_length_stop_mask = _translate_token_mask(
+            rendered[start:end], replacement, length_stop_mask[start:end]
+        )
         if exact:
             token_ids.extend(replacement)
             logprobs.extend(replacement_logprobs)
@@ -5398,21 +5474,42 @@ def _tokenize_chat_view(
                 else [math.nan] * len(replacement)
             )
             flags.extend(
-                TokenFlag.ASSISTANT | (TokenFlag.STOP if stop else TokenFlag(0))
-                for stop in replacement_stop_mask
+                _rendered_flag(not length_stop, stop)
+                for stop, length_stop in zip(
+                    replacement_stop_mask,
+                    replacement_length_stop_mask,
+                    strict=True,
+                )
             )
             source_keys.extend([None] * len(replacement))
         cursor = end
     token_ids.extend(rendered[cursor:])
     logprobs.extend([math.nan] * (len(rendered) - cursor))
     flags.extend(
-        _rendered_flag(assistant, stop)
-        for assistant, stop in zip(
-            assistant_mask[cursor:], stop_mask[cursor:], strict=True
+        _rendered_flag(assistant and not length_stop, stop)
+        for assistant, stop, length_stop in zip(
+            assistant_mask[cursor:],
+            stop_mask[cursor:],
+            length_stop_mask[cursor:],
+            strict=True,
         )
     )
     source_keys.extend([None] * (len(rendered) - cursor))
-    for index in range(min(exact_coverage_length, len(flags))):
+    exact_coverage_length = 0
+    for source in history.message_sources:
+        if (
+            source is None
+            or not _source_is_sampled(source)
+            or not source_matches_context(source)
+        ):
+            continue
+        source_prompt = source_prompt_tokens(source)
+        if (
+            source_prompt is not None
+            and token_ids[: len(source_prompt)] == source_prompt
+        ):
+            exact_coverage_length = max(exact_coverage_length, len(source_prompt))
+    for index in range(exact_coverage_length):
         flags[index] |= TokenFlag.EXACT
     if history.model is None:
         raise ValueError("History tokenization requires a model")

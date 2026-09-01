@@ -171,6 +171,8 @@ class _StopTokenizer:
 
     def __call__(self, text: str, **kwargs: object) -> list[int]:
         del kwargs
+        if "ART_TRAJECTORY_" in text:
+            return [77]
         return {
             "answer": [2],
             "END": [8, 9],
@@ -195,6 +197,8 @@ class _StopTokenizer:
     ) -> list[int]:
         del kwargs
         content = [message.get("content") for message in messages]
+        if "ART_TRAJECTORY_" in str(content[-1]):
+            return [1, 77, 9]
         if content == ["question", "answer"]:
             assert not add_generation_prompt
             return [1, 2, 9]
@@ -217,6 +221,39 @@ class _StopTokenizer:
             assert add_generation_prompt
             return [1]
         raise AssertionError(content)
+
+
+class _CharacterStopTokenizer:
+    eos_token_id = ord("§")
+
+    def __call__(self, text: str, **kwargs: object) -> list[int]:
+        del kwargs
+        return [ord(character) for character in text]
+
+    def apply_chat_template(
+        self,
+        messages: list[Any],
+        *,
+        add_generation_prompt: bool,
+        **kwargs: object,
+    ) -> list[int]:
+        del kwargs
+        rendered = ""
+        for message in messages:
+            content = message.get("content")
+            if isinstance(content, list):
+                content = "".join(
+                    str(block.get("text", ""))
+                    for block in content
+                    if isinstance(block, dict)
+                )
+            if message["role"] == "user":
+                rendered += f"U{content}|"
+            else:
+                rendered += f"A{content or ''}§"
+        if add_generation_prompt:
+            rendered += "A"
+        return self(rendered)
 
 
 class _BoundaryTokenizer(_StopTokenizer):
@@ -308,8 +345,72 @@ def test_length_stop_keeps_sampled_content_and_adds_synthetic_stop() -> None:
     assert tokenized.flags == [
         tr.TokenFlag.EXACT,
         tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED | tr.TokenFlag.ASSISTANT,
-        tr.TokenFlag.ASSISTANT | tr.TokenFlag.STOP,
+        tr.TokenFlag.STOP,
     ]
+
+
+def test_inexact_length_stop_is_not_attributed_to_the_assistant() -> None:
+    exchange = _chat_exchange([1], [2])
+    data = exchange.response.model_dump(mode="python")
+    choice = data["choices"][0]
+    choice["finish_reason"] = "length"
+    choice.pop("prompt_token_ids")
+    choice.pop("token_ids")
+    choice["logprobs"] = None
+    exchange.response = ChatCompletion.model_validate(data)
+
+    tokenized = art.Trajectory(
+        exchanges=TrajectoryExchanges(chat_completions=[exchange])
+    ).tokenize(tokenizer=_StopTokenizer())
+
+    assert tokenized.tokens == [1, 2, 9]
+    assert tokenized.flags == [
+        tr.TokenFlag(0),
+        tr.TokenFlag.ASSISTANT,
+        tr.TokenFlag.STOP,
+    ]
+
+
+def test_length_stop_without_a_template_terminator_does_not_raise() -> None:
+    exchange = _chat_exchange([1], [2])
+    exchange.response.choices[0].finish_reason = "length"
+
+    class Tokenizer:
+        def __call__(self, text: str, **kwargs: object) -> list[int]:
+            del kwargs
+            return {"answer": [2], "turn 0": [1]}[text]
+
+        def apply_chat_template(
+            self, messages: list[dict[str, Any]], **kwargs: object
+        ) -> list[int]:
+            del kwargs
+            return [1, 2] if messages[-1]["role"] == "assistant" else [1]
+
+    tokenized = art.Trajectory(
+        exchanges=TrajectoryExchanges(chat_completions=[exchange])
+    ).tokenize(tokenizer=Tokenizer())
+
+    assert tokenized.tokens == [1, 2]
+    assert not any(flag & tr.TokenFlag.STOP for flag in tokenized.flags)
+
+
+def test_length_stop_mapping_allows_another_assistant_without_a_stop() -> None:
+    first = _chat_exchange([1], [2])
+    second = _chat_exchange([1, 2, 3], [4], offset=1)
+    second.response.choices[0].finish_reason = "length"
+    tokenizer = _BoundaryTokenizer(
+        ("user", [1]),
+        ("assistant", [2]),
+        ("user", [3]),
+        ("assistant", [4, 9]),
+    )
+
+    tokenized = art.Trajectory(
+        exchanges=TrajectoryExchanges(chat_completions=[first, second])
+    ).tokenize(tokenizer=tokenizer)
+
+    assert tokenized.tokens == [1, 2, 3, 4, 9]
+    assert tokenized.flags[-1] == tr.TokenFlag.STOP
 
 
 def test_terminal_length_with_sampled_eos_still_adds_synthetic_stop() -> None:
@@ -323,8 +424,22 @@ def test_terminal_length_with_sampled_eos_still_adds_synthetic_stop() -> None:
     assert tokenized.tokens == [1, 2, 9, 9]
     assert tokenized.flags[-2:] == [
         tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED | tr.TokenFlag.ASSISTANT,
-        tr.TokenFlag.ASSISTANT | tr.TokenFlag.STOP,
+        tr.TokenFlag.STOP,
     ]
+
+
+def test_exact_coverage_stops_at_a_duplicated_length_terminator() -> None:
+    first = _chat_exchange([1], [2, 9])
+    first.response.choices[0].finish_reason = "length"
+    second = _chat_exchange([1, 2, 9, 3], [4, 9], offset=1)
+
+    tokenized = art.Trajectory(
+        exchanges=TrajectoryExchanges(chat_completions=[first, second])
+    ).tokenize(tokenizer=_StopTokenizer())
+
+    assert tokenized.tokens == [1, 2, 9, 9, 3, 4, 9]
+    assert tokenized.flags[3] == tr.TokenFlag.STOP
+    assert not tokenized.flags[4] & tr.TokenFlag.EXACT
 
 
 def test_terminal_length_stays_synthetic_after_an_earlier_length_stop() -> None:
@@ -340,7 +455,7 @@ def test_terminal_length_stays_synthetic_after_an_earlier_length_stop() -> None:
     assert tokenized.tokens == [1, 2, 9, 3, 4, 9, 9]
     assert tokenized.flags[-2:] == [
         tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED | tr.TokenFlag.ASSISTANT,
-        tr.TokenFlag.ASSISTANT | tr.TokenFlag.STOP,
+        tr.TokenFlag.STOP,
     ]
 
 
@@ -354,9 +469,7 @@ def test_later_exact_prompt_upgrades_synthetic_stop_without_sampling_it() -> Non
     ).tokenize(tokenizer=_StopTokenizer())
 
     assert tokenized.tokens == [1, 2, 9, 3, 4, 9]
-    assert tokenized.flags[2] == (
-        tr.TokenFlag.EXACT | tr.TokenFlag.ASSISTANT | tr.TokenFlag.STOP
-    )
+    assert tokenized.flags[2] == tr.TokenFlag.EXACT | tr.TokenFlag.STOP
     assert not tokenized.flags[2] & tr.TokenFlag.SAMPLED
 
 
@@ -389,6 +502,7 @@ def test_exact_output_boundaries_survive_prefix_order_drift_and_length_stop() ->
     assert [
         index for index, flag in enumerate(tokenized.flags) if flag & tr.TokenFlag.STOP
     ] == [2, 5, 8]
+    assert tokenized.flags[5] == tr.TokenFlag.EXACT | tr.TokenFlag.STOP
     assert all(math.isfinite(tokenized.logprobs[index]) for index in sampled)
 
     with pytest.raises(
@@ -452,6 +566,7 @@ def test_exact_output_boundary_after_sampled_tool_call() -> None:
     assert [
         index for index, flag in enumerate(tokenized.flags) if flag & tr.TokenFlag.STOP
     ] == [3, 6, 9]
+    assert tokenized.flags[9] == tr.TokenFlag.STOP
 
 
 def test_proven_exact_output_boundary_does_not_require_prompt_token_ids() -> None:
@@ -745,6 +860,49 @@ def test_template_family_canonical_stop_is_assistant_stop(
     assert tokenized.flags[-1] == tr.TokenFlag.ASSISTANT | tr.TokenFlag.STOP
 
 
+def test_harmony_intermediate_end_is_an_assistant_stop() -> None:
+    class Tokenizer(_CanonicalStopTokenizer):
+        def __init__(self) -> None:
+            super().__init__("<|return|>")
+            self.all_special_tokens.append("<|end|>")
+
+        def convert_tokens_to_ids(self, token: str) -> int:
+            return 8 if token == "<|end|>" else super().convert_tokens_to_ids(token)
+
+        def decode(self, token_ids: list[int], **kwargs: object) -> str:
+            return (
+                "<|end|>" if token_ids == [8] else super().decode(token_ids, **kwargs)
+            )
+
+        def apply_chat_template(
+            self,
+            messages: list[dict[str, Any]],
+            *,
+            add_generation_prompt: bool,
+            **kwargs: object,
+        ) -> list[int]:
+            del kwargs
+            if messages[-1]["role"] != "assistant":
+                assert add_generation_prompt
+                return [1]
+            assert not add_generation_prompt
+            content = str(messages[-1].get("content"))
+            return [1, 77 if "ART_TRAJECTORY_" in content else 2, 8]
+
+    history = tr.ChatCompletionsHistory(
+        model="openai/gpt-oss-20b",
+        messages=[
+            {"role": "user", "content": "question"},
+            {"role": "assistant", "content": "answer"},
+        ],
+        message_sources=[None, None],
+    )
+
+    tokenized = history.tokenize(tokenizer=Tokenizer())
+
+    assert tokenized.flags[-1] == tr.TokenFlag.ASSISTANT | tr.TokenFlag.STOP
+
+
 def test_gemma_tool_response_marker_is_the_tool_call_stop() -> None:
     history = tr.ChatCompletionsHistory(
         model="test/gemma",
@@ -835,7 +993,99 @@ def test_messages_sampled_stop_and_length_stop_provenance() -> None:
         | tr.TokenFlag.STOP
     )
     assert synthetic.tokens == [1, 2, 9]
-    assert synthetic.flags[-1] == tr.TokenFlag.ASSISTANT | tr.TokenFlag.STOP
+    assert synthetic.flags[-1] == tr.TokenFlag.STOP
+
+
+def test_messages_later_exact_prompt_upgrades_length_stop() -> None:
+    tokenizer = _CharacterStopTokenizer()
+    first_request = MessagesRequest(
+        model="test/model",
+        messages=[{"role": "user", "content": "turn 0"}],
+        max_tokens=16,
+    )
+    first = _message_exchange(
+        first_request,
+        identifier="message-length",
+        prompt_token_ids=tokenizer.apply_chat_template(
+            list(first_request["messages"]), add_generation_prompt=True
+        ),
+        token_ids=tokenizer("answer"),
+        logprobs=[-0.2] * len("answer"),
+        stop_reason="max_tokens",
+    )
+    second_messages: list[MessageParam] = [
+        {"role": "user", "content": "turn 0"},
+        {
+            "role": "assistant",
+            "content": [{"type": "text", "text": "answer"}],
+        },
+        {"role": "user", "content": "turn 1"},
+    ]
+    second = _message_exchange(
+        MessagesRequest(
+            model="test/model",
+            messages=second_messages,
+            max_tokens=16,
+        ),
+        identifier="message-stop",
+        prompt_token_ids=tokenizer.apply_chat_template(
+            second_messages, add_generation_prompt=True
+        ),
+        token_ids=tokenizer("answer§"),
+        logprobs=[-0.4] * len("answer§"),
+        offset=1,
+    )
+
+    tokenized = (
+        art.Trajectory(exchanges=TrajectoryExchanges(messages=[first, second]))
+        .anthropic_messages_history()
+        .tokenize(tokenizer=tokenizer)
+    )
+
+    first_stop = tokenized.tokens.index(ord("§"))
+    assert tokenized.flags[first_stop] == tr.TokenFlag.EXACT | tr.TokenFlag.STOP
+
+
+def test_messages_exact_prompt_coverage_survives_length_changing_replacement() -> None:
+    tokenizer = _CharacterStopTokenizer()
+    first_request = MessagesRequest(
+        model="test/model",
+        messages=[{"role": "user", "content": "turn 0"}],
+        max_tokens=16,
+    )
+    first = _message_exchange(
+        first_request,
+        identifier="message-exact-cat",
+        content=[{"type": "text", "text": "cat"}],
+        prompt_token_ids=tokenizer.apply_chat_template(
+            list(first_request["messages"]), add_generation_prompt=True
+        ),
+        token_ids=[101],
+        logprobs=[-0.1],
+    )
+    second_messages: list[MessageParam] = [
+        {"role": "user", "content": "turn 0"},
+        {"role": "assistant", "content": [{"type": "text", "text": "cat"}]},
+        {"role": "user", "content": "turn 1"},
+    ]
+    second = _message_exchange(
+        MessagesRequest(model="test/model", messages=second_messages, max_tokens=16),
+        identifier="message-inexact-dog",
+        content=[{"type": "text", "text": "dog"}],
+        prompt_token_ids=tokenizer.apply_chat_template(
+            second_messages, add_generation_prompt=True
+        ),
+        offset=1,
+    )
+
+    tokenized = (
+        art.Trajectory(exchanges=TrajectoryExchanges(messages=[first, second]))
+        .anthropic_messages_history(reconcile_text_equivalent_tokenizations=True)
+        .tokenize(tokenizer=tokenizer)
+    )
+
+    dog = tokenized.tokens.index(ord("d"))
+    assert not tokenized.flags[dog] & tr.TokenFlag.EXACT
 
 
 def test_responses_sampled_stop_and_length_stop_provenance() -> None:
@@ -873,7 +1123,135 @@ def test_responses_sampled_stop_and_length_stop_provenance() -> None:
         | tr.TokenFlag.STOP
     )
     assert synthetic.tokens == [1, 2, 9]
-    assert synthetic.flags[-1] == tr.TokenFlag.ASSISTANT | tr.TokenFlag.STOP
+    assert synthetic.flags[-1] == tr.TokenFlag.STOP
+
+
+def test_responses_later_exact_prompt_upgrades_length_stop() -> None:
+    tokenizer = _CharacterStopTokenizer()
+    first_prompt = tokenizer.apply_chat_template(
+        [{"role": "user", "content": "turn 0"}], add_generation_prompt=True
+    )
+    first = _response_exchange(
+        "response-length", ord("a"), prompt_token_ids=first_prompt
+    )
+    first_data = first.response.model_dump(mode="python")
+    first_data["status"] = "incomplete"
+    first_data["incomplete_details"] = {"reason": "max_output_tokens"}
+    first_data["output"][0]["status"] = "incomplete"
+    first_data["token_generations"][0]["output_tokens"] = [
+        {"token_id": token_id, "logprob": -0.2} for token_id in tokenizer("answer")
+    ]
+    first.response = Response.model_validate(first_data)
+    second_prompt = tokenizer.apply_chat_template(
+        [
+            {"role": "user", "content": "turn 0"},
+            {"role": "assistant", "content": "answer"},
+            {"role": "user", "content": "turn 1"},
+        ],
+        add_generation_prompt=True,
+    )
+    second = _response_exchange(
+        "response-stop",
+        ord("a"),
+        previous_response_id=first.response.id,
+        offset=1,
+        prompt_token_ids=second_prompt,
+    )
+    second_data = second.response.model_dump(mode="python")
+    second_data["token_generations"][0]["output_tokens"] = [
+        {"token_id": token_id, "logprob": -0.4} for token_id in tokenizer("answer§")
+    ]
+    second.response = Response.model_validate(second_data)
+
+    tokenized = (
+        art.Trajectory(exchanges=TrajectoryExchanges(responses=[first, second]))
+        .responses_history()
+        .tokenize(tokenizer=tokenizer)
+    )
+
+    first_stop = tokenized.tokens.index(ord("§"))
+    assert tokenized.flags[first_stop] == tr.TokenFlag.EXACT | tr.TokenFlag.STOP
+
+
+def test_responses_length_status_applies_only_to_the_terminal_generation() -> None:
+    tokenizer = _CharacterStopTokenizer()
+    exchange = _response_exchange("multi-generation-length", ord("a"))
+    data = exchange.response.model_dump(mode="python")
+    data["output"] = [
+        {
+            "id": "message-first",
+            "type": "message",
+            "role": "assistant",
+            "status": "completed",
+            "content": [
+                {
+                    "type": "output_text",
+                    "text": "answer",
+                    "annotations": [],
+                    "logprobs": [],
+                }
+            ],
+        },
+        {
+            "id": "message-second",
+            "type": "message",
+            "role": "assistant",
+            "status": "incomplete",
+            "content": [
+                {
+                    "type": "output_text",
+                    "text": "second",
+                    "annotations": [],
+                    "logprobs": [],
+                }
+            ],
+        },
+    ]
+    data["status"] = "incomplete"
+    data["incomplete_details"] = {"reason": "max_output_tokens"}
+    data["token_generations"] = [
+        {
+            "prompt_token_ids": tokenizer.apply_chat_template(
+                [{"role": "user", "content": "turn 0"}],
+                add_generation_prompt=True,
+            ),
+            "output_tokens": [
+                {"token_id": token_id, "logprob": -0.2}
+                for token_id in tokenizer("answer")
+            ],
+            "output_indices": [0],
+        },
+        {
+            "prompt_token_ids": tokenizer.apply_chat_template(
+                [
+                    {"role": "user", "content": "turn 0"},
+                    {"role": "assistant", "content": "answer"},
+                ],
+                add_generation_prompt=True,
+            ),
+            "output_tokens": [
+                {"token_id": token_id, "logprob": -0.4}
+                for token_id in tokenizer("second")
+            ],
+            "output_indices": [1],
+        },
+    ]
+    exchange.response = Response.model_validate(data)
+
+    tokenized = (
+        art.Trajectory(exchanges=TrajectoryExchanges(responses=[exchange]))
+        .responses_history()
+        .tokenize(tokenizer=tokenizer)
+    )
+
+    stops = [
+        index for index, flag in enumerate(tokenized.flags) if flag & tr.TokenFlag.STOP
+    ]
+    assert len(stops) == 2
+    assert tokenized.flags[stops[0]] == (
+        tr.TokenFlag.EXACT | tr.TokenFlag.ASSISTANT | tr.TokenFlag.STOP
+    )
+    assert tokenized.flags[stops[1]] == tr.TokenFlag.STOP
 
 
 def test_exact_tokens_form_one_append_only_history_without_tokenizer(
