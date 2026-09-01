@@ -30,10 +30,12 @@ envs:
   PYTHONUTF8: "1"  # avoids an encoding issue in unsloth-zoo
 
 setup: |
+  sudo apt-get update && sudo apt-get install -y python3.12-dev  # needed by torch inductor
   export PATH="$HOME/.local/bin:$PATH"  # make sure uv is on PATH
   uv venv --python 3.12 ~/art-venv
   source ~/art-venv/bin/activate
-  uv pip install "openpipe-art[backend]"
+  # --torch-backend matches CUDA wheels; ninja is needed by flashinfer
+  uv pip install --torch-backend=auto "openpipe-art[backend]" ninja
 
 run: |
   source ~/art-venv/bin/activate
