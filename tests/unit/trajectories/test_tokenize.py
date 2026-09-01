@@ -219,6 +219,42 @@ class _StopTokenizer:
         raise AssertionError(content)
 
 
+class _BoundaryTokenizer(_StopTokenizer):
+    def __init__(self, *segments: tuple[str, list[int]]) -> None:
+        self.renders: dict[tuple[str, ...], list[int]] = {}
+        roles: list[str] = []
+        rendered: list[int] = []
+        for role, tokens in segments:
+            roles.append(role)
+            rendered.extend(tokens)
+            self.renders[tuple(roles)] = list(rendered)
+
+    def __call__(self, text: str, **kwargs: object) -> list[int]:
+        del kwargs
+        return {
+            "answer": [2],
+            "complete answer": [2, 9],
+            "tool result": [3],
+            "turn 0": [1],
+            "turn 1": [3],
+            "turn 2": [5],
+        }.get(text, [77])
+
+    def apply_chat_template(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        add_generation_prompt: bool,
+        **kwargs: object,
+    ) -> list[int]:
+        del kwargs
+        if messages:
+            assert add_generation_prompt == (messages[-1].get("role") != "assistant")
+        return list(
+            self.renders[tuple(str(message.get("role")) for message in messages)]
+        )
+
+
 def test_exact_sampled_eos_is_stop_when_tokenizer_identifies_it() -> None:
     exchange = _chat_exchange([1], [2, 9])
 
@@ -276,6 +312,38 @@ def test_length_stop_keeps_sampled_content_and_adds_synthetic_stop() -> None:
     ]
 
 
+def test_terminal_length_with_sampled_eos_still_adds_synthetic_stop() -> None:
+    exchange = _chat_exchange([1], [2, 9])
+    exchange.response.choices[0].finish_reason = "length"
+
+    tokenized = art.Trajectory(
+        exchanges=TrajectoryExchanges(chat_completions=[exchange])
+    ).tokenize(tokenizer=_StopTokenizer())
+
+    assert tokenized.tokens == [1, 2, 9, 9]
+    assert tokenized.flags[-2:] == [
+        tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED | tr.TokenFlag.ASSISTANT,
+        tr.TokenFlag.ASSISTANT | tr.TokenFlag.STOP,
+    ]
+
+
+def test_terminal_length_stays_synthetic_after_an_earlier_length_stop() -> None:
+    first = _chat_exchange([1], [2])
+    first.response.choices[0].finish_reason = "length"
+    second = _chat_exchange([1, 2, 9, 3], [4, 9], offset=1)
+    second.response.choices[0].finish_reason = "length"
+
+    tokenized = art.Trajectory(
+        exchanges=TrajectoryExchanges(chat_completions=[first, second])
+    ).tokenize(tokenizer=_StopTokenizer())
+
+    assert tokenized.tokens == [1, 2, 9, 3, 4, 9, 9]
+    assert tokenized.flags[-2:] == [
+        tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED | tr.TokenFlag.ASSISTANT,
+        tr.TokenFlag.ASSISTANT | tr.TokenFlag.STOP,
+    ]
+
+
 def test_later_exact_prompt_upgrades_synthetic_stop_without_sampling_it() -> None:
     first = _chat_exchange([1], [2])
     first.response.choices[0].finish_reason = "length"
@@ -290,6 +358,168 @@ def test_later_exact_prompt_upgrades_synthetic_stop_without_sampling_it() -> Non
         tr.TokenFlag.EXACT | tr.TokenFlag.ASSISTANT | tr.TokenFlag.STOP
     )
     assert not tokenized.flags[2] & tr.TokenFlag.SAMPLED
+
+
+def test_exact_output_boundaries_survive_prefix_order_drift_and_length_stop() -> None:
+    first = _chat_exchange([1], [2, 9])
+    second = _chat_exchange([1, 2, 9, 3], [4], offset=1)
+    second.response.choices[0].finish_reason = "length"
+    third = _chat_exchange([1, 2, 9, 3, 4, 9, 5], [6, 9], offset=2)
+    history = art.Trajectory(
+        exchanges=TrajectoryExchanges(chat_completions=[first, second, third])
+    ).chat_completions_history()
+    tokenizer = _BoundaryTokenizer(
+        ("user", [8]),
+        ("assistant", [2, 9]),
+        ("user", [3]),
+        ("assistant", [4, 9]),
+        ("user", [5]),
+        ("assistant", [6, 9]),
+    )
+
+    tokenized = history.tokenize(tokenizer=tokenizer)
+
+    assert tokenized.tokens == [1, 2, 9, 3, 4, 9, 5, 6, 9]
+    sampled = [
+        index
+        for index, flag in enumerate(tokenized.flags)
+        if flag & tr.TokenFlag.SAMPLED
+    ]
+    assert sampled == [1, 2, 4, 7, 8]
+    assert [
+        index for index, flag in enumerate(tokenized.flags) if flag & tr.TokenFlag.STOP
+    ] == [2, 5, 8]
+    assert all(math.isfinite(tokenized.logprobs[index]) for index in sampled)
+
+    with pytest.raises(
+        ValueError,
+        match="Could not prove a sampled history message boundary",
+    ):
+        history.tokenize(tokenizer=tokenizer, chat_template="explicit override")
+
+
+def test_exact_output_boundary_after_sampled_tool_call() -> None:
+    first = _chat_exchange([1], [2, 7, 9])
+    first_data = first.response.model_dump(mode="python")
+    first_data["choices"][0]["finish_reason"] = "tool_calls"
+    first_data["choices"][0]["message"] = {
+        "role": "assistant",
+        "content": "answer",
+        "tool_calls": [
+            {
+                "id": "call-1",
+                "type": "function",
+                "function": {"name": "lookup", "arguments": "{}"},
+            }
+        ],
+    }
+    first.response = ChatCompletion.model_validate(first_data)
+
+    second = _chat_exchange([1, 2, 7, 9, 3], [4, 9], offset=1)
+    second.request["messages"] = [
+        {"role": "user", "content": "turn 0"},
+        first.response.choices[0].message.model_dump(mode="python", exclude_none=True),
+        {"role": "tool", "tool_call_id": "call-1", "content": "tool result"},
+    ]
+    third = _chat_exchange([1, 2, 7, 9, 3, 4, 9, 5], [6], offset=2)
+    third.request["messages"] = [
+        *second.request["messages"],
+        second.response.choices[0].message.model_dump(mode="python", exclude_none=True),
+        {"role": "user", "content": "turn 2"},
+    ]
+    third.response.choices[0].finish_reason = "length"
+    history = art.Trajectory(
+        exchanges=TrajectoryExchanges(chat_completions=[first, second, third])
+    ).chat_completions_history()
+    tokenizer = _BoundaryTokenizer(
+        ("user", [8]),
+        ("assistant", [2, 7, 9]),
+        ("tool", [3]),
+        ("assistant", [4, 9]),
+        ("user", [5]),
+        ("assistant", [6, 9]),
+    )
+
+    tokenized = history.tokenize(tokenizer=tokenizer)
+
+    assert tokenized.tokens == [1, 2, 7, 9, 3, 4, 9, 5, 6, 9]
+    sampled = [
+        index
+        for index, flag in enumerate(tokenized.flags)
+        if flag & tr.TokenFlag.SAMPLED
+    ]
+    assert sampled == [1, 2, 3, 5, 6, 8]
+    assert [
+        index for index, flag in enumerate(tokenized.flags) if flag & tr.TokenFlag.STOP
+    ] == [3, 6, 9]
+
+
+def test_proven_exact_output_boundary_does_not_require_prompt_token_ids() -> None:
+    first = _chat_exchange([1], [2, 9])
+    first.response.choices[0].message.content = "complete answer"
+    assert first.response.choices[0].model_extra is not None
+    first.response.choices[0].model_extra.pop("prompt_token_ids")
+    history = art.Trajectory(
+        exchanges=TrajectoryExchanges(chat_completions=[first])
+    ).chat_completions_history()
+    from art.trajectories._tokenize import _tokenize_chat_view
+
+    tokenized = _tokenize_chat_view(
+        history,
+        base_model=None,
+        tokenizer=_BoundaryTokenizer(
+            ("user", [8]),
+            ("assistant", [2, 9]),
+        ),
+        chat_template=None,
+        chat_template_kwargs=None,
+        _projection_matches=True,
+    )
+
+    assert tokenized.tokens == [8, 2, 9]
+    assert tokenized.flags[1] & tr.TokenFlag.SAMPLED
+    assert tokenized.flags[2] & tr.TokenFlag.SAMPLED
+
+
+@pytest.mark.parametrize(
+    ("matches", "assistant_mask", "after", "expected_start"),
+    [
+        ([(0, 2)], [False, False], 0, 0),  # a user quote
+        ([(6, 8)], [False, True, False, True, False, False, True, True], 1, 6),
+        ([(1, 3), (4, 6)], [False, True, True, False, True, True], 0, 1),
+        ([(2, 4)], [False, False, True, True], 0, 1),  # prefix drift
+        ([], [], 0, 0),
+    ],
+    ids=("user-quote", "later-assistant", "ambiguous", "prefix-drift", "empty"),
+)
+def test_exact_output_boundary_proof_rejects_unproved_spans(
+    matches: list[tuple[int, int]],
+    assistant_mask: list[bool],
+    after: int,
+    expected_start: int,
+) -> None:
+    from art.trajectories._tokenize import _prove_exact_sampled_assistant_span
+
+    assert (
+        _prove_exact_sampled_assistant_span(
+            matches,
+            assistant_mask,
+            after=after,
+            expected_start=expected_start,
+        )
+        is None
+    )
+
+
+def test_exact_output_boundary_proof_accepts_first_maximal_assistant_run() -> None:
+    from art.trajectories._tokenize import _prove_exact_sampled_assistant_span
+
+    assert _prove_exact_sampled_assistant_span(
+        [(4, 6)],
+        [False, True, True, False, True, True, False],
+        after=2,
+        expected_start=4,
+    ) == (4, 6)
 
 
 def test_integer_stop_reason_marks_raw_completions_without_assistant() -> None:

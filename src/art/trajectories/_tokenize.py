@@ -491,6 +491,34 @@ def _translate_token_mask(
     return translated
 
 
+def _prove_exact_sampled_assistant_span(
+    matches: Sequence[tuple[int, int]],
+    assistant_mask: Sequence[bool],
+    *,
+    after: int,
+    expected_start: int,
+) -> tuple[int, int] | None:
+    """Accept one exact output only at a provenance-backed assistant boundary."""
+
+    if len(matches) != 1 or matches[0][0] != expected_start:
+        return None
+    start, end = matches[0]
+    intervening_start = after
+    # ``after`` may still point into template-owned tail tokens in the assistant
+    # run that contained the preceding sampled output.
+    if after > 0 and assistant_mask[after - 1]:
+        while intervening_start < start and assistant_mask[intervening_start]:
+            intervening_start += 1
+    if (
+        any(assistant_mask[intervening_start:start])
+        or not all(assistant_mask[start:end])
+        or (start > 0 and assistant_mask[start - 1])
+        or (end < len(assistant_mask) and assistant_mask[end])
+    ):
+        return None
+    return start, end
+
+
 def _rendered_flag(assistant: bool, stop: bool) -> TokenFlag:
     flag = TokenFlag.ASSISTANT if assistant else TokenFlag(0)
     return flag | TokenFlag.STOP if stop else flag
@@ -4896,9 +4924,37 @@ def _tokenize_chat_view(
                 history.messages[message_index], source
             )
         )
+        authoritative_prompt = (
+            source_prompt_tokens(source) if sampled and source is not None else None
+        )
+        initial_proven_bounds = marked_bounds.get(message_index) or probed_bounds.get(
+            message_index
+        )
+        exact_output_matches: list[tuple[int, int]] | None = None
+        exact_output_span: tuple[int, int] | None = None
+        if (
+            complete_sampled_message
+            and source is not None
+            and full_exact
+            and _projection_matches is True
+            and chat_template is None
+            and chat_template_kwargs is None
+            and source_matches_context(source)
+            and _source_stop_evidence(source, _sampled_source_key(source))[0]
+            != "length"
+        ):
+            exact_output_matches = locations(full_exact, search_cursor)
+            if authoritative_prompt is not None:
+                exact_output_span = _prove_exact_sampled_assistant_span(
+                    exact_output_matches,
+                    assistant_mask,
+                    after=search_cursor,
+                    expected_start=len(authoritative_prompt),
+                )
         if (
             complete_sampled_message
             and full_exact is not None
+            and exact_output_span is None
             and message_index in marked_bounds
             and isinstance(getattr(source, "exchange", None), ChatCompletionsExchange)
             and marked_bounds[message_index][1] - marked_bounds[message_index][0]
@@ -4942,12 +4998,31 @@ def _tokenize_chat_view(
             else:
                 marked_bounds.pop(message_index, None)
                 marked_part_bounds.pop(message_index, None)
+        proven_bounds = (
+            marked_bounds.get(message_index)
+            or probed_bounds.get(message_index)
+            or initial_proven_bounds
+        )
+        if (
+            exact_output_span is None
+            and exact_output_matches is not None
+            and proven_bounds is not None
+        ):
+            exact_output_span = _prove_exact_sampled_assistant_span(
+                exact_output_matches,
+                assistant_mask,
+                after=search_cursor,
+                expected_start=proven_bounds[0],
+            )
         source_boundary = False
         generation_start: int | None = None
         sampled_bounds: tuple[int, int] | None = None
         content_bounds_proven = False
         if sampled:
-            if direct_bounds:
+            if exact_output_span is not None:
+                sampled_bounds = exact_output_span
+                content_bounds_proven = True
+            elif direct_bounds:
                 sampled_bounds = direct_bounds[message_index]
                 content_bounds_proven = True
             elif message_index in marked_bounds:
@@ -5016,6 +5091,7 @@ def _tokenize_chat_view(
             and full_matches
             and (
                 (source_boundary and full_matches[0][0] == search_cursor)
+                or exact_output_span is not None
                 or (
                     complete_sampled_message
                     and len(full_matches) == 1
