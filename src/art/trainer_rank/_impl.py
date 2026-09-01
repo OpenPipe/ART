@@ -865,6 +865,35 @@ class _FlatForwardPlan:
     selected_max_depth: int = 0
 
 
+def _wave_geometry(item_count: int, start: int, dp_size: int) -> tuple[int, int, int]:
+    """Return (remaining, min_width, granularity) for a wave starting at start."""
+
+    remaining = item_count - start
+    min_width = min(dp_size, remaining)
+    base_granularity = 1 if remaining < 64 else 8 if remaining < 256 else 32
+    granularity = max(1, ((base_granularity + dp_size - 1) // dp_size) * dp_size)
+    return remaining, min_width, granularity
+
+
+def _normalize_wave_width(
+    width: int, min_width: int, remaining: int, granularity: int
+) -> int:
+    width = max(min_width, min(width, remaining))
+    if width in (min_width, remaining) or granularity <= 1:
+        return width
+    if width < granularity:
+        return width
+    return max(min_width, (width // granularity) * granularity)
+
+
+def _local_wave_indices(
+    start: int, width: int, dp_rank: int, dp_size: int
+) -> tuple[int, ...]:
+    """This DP rank's strided share of the global wave [start, start + width)."""
+
+    return tuple(range(start + dp_rank, start + width, dp_size))
+
+
 class TrainerRank:
     def __init__(self, runtime: TrainingRuntime) -> None:
         pp_size = int(getattr(runtime.provider, "pipeline_model_parallel_size", 1) or 1)
@@ -945,6 +974,7 @@ class TrainerRank:
         self._speculative_planner: ThreadPoolExecutor | None = None
         self._speculative_planning_future: Future[None] | None = None
         self._planning_seconds_accum = 0.0
+        self._speculative_planning_seconds = 0.0
         self._last_forward_telemetry_snapshot: dict[str, float | int] | None = None
         self.zero_grad()
 
@@ -1718,7 +1748,6 @@ class TrainerRank:
                 candidate = self._select_next_micro_batch(
                     items, start, checkpoint=checkpoint
                 )
-            self._snapshot_planning_telemetry(candidate.plan)
             tracked_outputs, memory_baseline = self._run_flat_plan_with_memory_tracking(
                 candidate.plan,
                 context="forward_micro_batches",
@@ -1735,11 +1764,9 @@ class TrainerRank:
                 # width search seeds from the last wave's width, so pre-plan
                 # that slice while this generator is suspended at the yield.
                 self._submit_speculative_wave_planning(
-                    items,
-                    stop,
-                    candidate.stats_global_count,
-                    checkpoint=checkpoint,
+                    items, stop, checkpoint=checkpoint
                 )
+            self._snapshot_planning_telemetry(candidate.plan)
             with _telemetry_phase(
                 # This interval is controlled by the caller and normally contains
                 # loss construction and backward for the yielded microbatch.
@@ -1859,20 +1886,28 @@ class TrainerRank:
 
     def _reset_planning_telemetry(self) -> None:
         self._planning_seconds_accum = 0.0
+        with self._layout_cache_lock:
+            self._speculative_planning_seconds = 0.0
 
     def _snapshot_planning_telemetry(self, plan: _FlatForwardPlan) -> None:
+        with self._layout_cache_lock:
+            speculative_seconds = self._speculative_planning_seconds
         self._last_forward_telemetry_snapshot = {
             "planning_ms": self._planning_seconds_accum * 1_000.0,
+            "speculative_planning_ms": speculative_seconds * 1_000.0,
             "selected_max_depth": plan.selected_max_depth,
         }
 
     def last_forward_telemetry(self) -> dict[str, float | int]:
         """Concise planner telemetry for the most recent planned forward.
 
-        ``planning_ms`` accumulates across the whole public call (all waves of
-        ``forward_micro_batches``); ``selected_max_depth`` describes the most
-        recently materialized plan. The snapshot is taken before admission, so
-        a call refused with ``TrainerRankMemoryError`` is still reflected.
+        ``planning_ms`` is critical-path planning accumulated across the whole
+        public call (all waves of ``forward_micro_batches``, including the
+        synchronous cost of submitting speculative work);
+        ``speculative_planning_ms`` is worker CPU time hidden under the
+        caller's GPU work; ``selected_max_depth`` describes the most recently
+        materialized plan. The snapshot is taken before admission, so a call
+        refused with ``TrainerRankMemoryError`` is still reflected.
         """
 
         if self._last_forward_telemetry_snapshot is None:
@@ -2521,27 +2556,15 @@ class TrainerRank:
         checkpoint: AdapterSelection = Unset,
     ) -> _CandidateMicroBatch[ForwardInputsT]:
         dp_rank, dp_size = self._dp_rank_and_size()
-        remaining = len(items) - start
-        min_width = min(dp_size, remaining)
+        remaining, min_width, granularity = _wave_geometry(len(items), start, dp_size)
         if min_width <= 0:
             raise RuntimeError("cannot select an empty microbatch window")
-        base_granularity = 1 if remaining < 64 else 8 if remaining < 256 else 32
-        granularity = max(
-            1,
-            ((base_granularity + dp_size - 1) // dp_size) * dp_size,
-        )
 
         def normalize(width: int) -> int:
-            width = max(min_width, min(width, remaining))
-            if width in (min_width, remaining) or granularity <= 1:
-                return width
-            if width < granularity:
-                return width
-            return max(min_width, (width // granularity) * granularity)
+            return _normalize_wave_width(width, min_width, remaining, granularity)
 
         def local_slice(width: int) -> tuple[tuple[int, ...], list[ForwardInputsT]]:
-            stop = start + width
-            indices = tuple(range(start + dp_rank, stop, dp_size))
+            indices = _local_wave_indices(start, width, dp_rank, dp_size)
             return indices, [items[index] for index in indices]
 
         estimates: dict[int, tuple[_MemoryCheck, bool, bool] | None] = {}
@@ -2552,23 +2575,46 @@ class TrainerRank:
             if width in estimates:
                 return estimates[width]
             indices, local_inputs = local_slice(width)
-            values = self._estimate_flat_forward(
-                list(_flatten(local_inputs)), checkpoint=checkpoint
-            )
+            local_requests = list(_flatten(local_inputs))
+            values = self._estimate_flat_forward(local_requests, checkpoint=checkpoint)
             if not self._all_ranks_true(values is not None):
                 estimates[width] = None
                 return None
             assert values is not None
             packed_tokens, output_bytes, signature = values
-            result = (
-                self._memory_check_required(
+            logical_tokens: int | None = None
+            check = self._memory_check_required(
+                self._estimate_required_memory_bytes_from_values(
+                    packed_tokens=packed_tokens,
+                    output_bytes=output_bytes,
+                    signature=signature,
+                ),
+                sync_across_dp=True,
+            )
+            if not check.fits:
+                # The cheap no-sharing count is an upper bound: valid for
+                # accepting a width, not for rejecting one. Only when it
+                # rejects, price the width with the planner's actual layouts
+                # so prefix sharing's memory savings can buy a wider wave.
+                exact = self._estimate_flat_forward(
+                    local_requests, checkpoint=checkpoint, exact=True
+                )
+                assert exact is not None
+                packed_tokens, output_bytes, signature = exact
+                logical_tokens = sum(
+                    int(request.input_tokens.numel()) for request in local_requests
+                )
+                check = self._memory_check_required(
                     self._estimate_required_memory_bytes_from_values(
                         packed_tokens=packed_tokens,
                         output_bytes=output_bytes,
                         signature=signature,
+                        logical_tokens=logical_tokens,
                     ),
                     sync_across_dp=True,
-                ),
+                )
+            result = (
+                check,
                 self._all_ranks_have_memory_profile(
                     packed_tokens=packed_tokens,
                     signature=signature,
@@ -2821,52 +2867,88 @@ class TrainerRank:
         self,
         items: Sequence[ForwardInputs],
         start: int,
-        predicted_width: int,
         *,
         checkpoint: AdapterSelection,
     ) -> None:
         """Pre-plan the predicted next wave while the caller uses the GPU.
 
         Runs while this generator is suspended at a yield (the caller's
-        forward/backward time). Grouping and cache keys are computed on the
-        calling thread; the worker thread only executes the pure, memoized
-        planner, so speculation can never change a selected plan — a wrong
-        width prediction merely leaves an unused LRU entry. Planning time
-        spent here is deliberately not charged to planning telemetry: it is
-        hidden under the caller's GPU work.
+        forward/backward time). The prediction mirrors the width search
+        exactly: the next wave seeds from the largest width so far and plans
+        this DP rank's strided local slice. Grouping, immutable CPU token
+        snapshots, and cache keys are produced on the calling thread; the
+        worker only runs the pure, memoized planner over those snapshots, so
+        speculation can never change a selected plan and cannot be poisoned by
+        the caller mutating its tensors afterwards. A wrong prediction merely
+        leaves an unused LRU entry. Speculation is skipped for CUDA inputs so
+        the worker never touches the device.
+
+        The synchronous submission cost here is on the critical path (it
+        delays the yield) and is charged to planning telemetry; the worker's
+        hidden CPU time is reported separately as ``speculative_planning_ms``.
         """
 
-        predicted = items[start : start + max(1, predicted_width)]
-        if not predicted:
-            return
+        started = time.perf_counter()
         try:
-            requests = list(_flatten(list(predicted)))
-            groups = self._group_active_request_indices(requests, checkpoint=checkpoint)
-        except Exception:
-            # Prediction is best-effort; the real wave will surface any
-            # genuine input problem on the main thread.
-            return
-        pending: list[
-            tuple[
-                tuple[torch.Tensor, ...],
-                tuple[str, int, int, bool, int, str | None],
-            ]
-        ] = []
-        for _, group_indices in groups:
-            group_input_ids = tuple(
-                requests[index].input_tokens.detach().reshape(-1).to(dtype=torch.long)
-                for index in group_indices
+            dp_rank, dp_size = self._dp_rank_and_size()
+            remaining, min_width, granularity = _wave_geometry(
+                len(items), start, dp_size
             )
-            key = self._layout_cache_key(group_input_ids)
-            if self._cached_group_layout(key) is None:
-                pending.append((group_input_ids, key))
+            if min_width <= 0:
+                return
+            width = _normalize_wave_width(
+                self._last_global_micro_batch_size or min_width,
+                min_width,
+                remaining,
+                granularity,
+            )
+            indices = _local_wave_indices(start, width, dp_rank, dp_size)
+            requests = list(_flatten([items[index] for index in indices]))
+            if not requests:
+                return
+            if any(request.input_tokens.device.type != "cpu" for request in requests):
+                return
+            # Slots were ensured for every input when the call began; skip the
+            # ensure-collective so speculation adds no communication.
+            groups = self._group_active_request_indices(
+                requests, checkpoint=checkpoint, ensure_slots=False
+            )
+            pending: list[
+                tuple[
+                    tuple[torch.Tensor, ...],
+                    tuple[str, int, int, bool, int, str | None],
+                ]
+            ] = []
+            for _, group_indices in groups:
+                snapshots = tuple(
+                    requests[index]
+                    .input_tokens.detach()
+                    .reshape(-1)
+                    .to(dtype=torch.long)
+                    .clone()
+                    for index in group_indices
+                )
+                key = self._layout_cache_key(snapshots)
+                if self._cached_group_layout(key) is None:
+                    pending.append((snapshots, key))
+        except Exception:
+            # Prediction is best-effort; the real wave surfaces any genuine
+            # input problem on the main thread.
+            return
+        finally:
+            self._planning_seconds_accum += time.perf_counter() - started
         if not pending:
             return
 
         def warm() -> None:
-            for group_input_ids, key in pending:
+            worker_started = time.perf_counter()
+            for snapshots, key in pending:
                 if self._cached_group_layout(key) is None:
-                    self._compute_group_layout(group_input_ids, key)
+                    self._compute_group_layout(snapshots, key)
+            with self._layout_cache_lock:
+                self._speculative_planning_seconds += (
+                    time.perf_counter() - worker_started
+                )
 
         self._speculative_planning_future = (
             self._speculative_planning_executor().submit(warm)
@@ -2928,16 +3010,30 @@ class TrainerRank:
         requests: Sequence[AnyForwardInput],
         *,
         checkpoint: AdapterSelection = Unset,
+        exact: bool = False,
     ) -> tuple[int, int, _MemorySignature] | None:
+        """Estimate packed tokens for width probing.
+
+        The default is the cheap no-sharing token count: an exact upper bound
+        on any planner-selected layout (safe for accepting a width), one
+        O(tokens) CPU walk, and it preserves the estimator's CUDA
+        None-contract. ``exact=True`` prices the planner's actual layouts
+        (memoized by content) and is used only when the upper bound would
+        reject a width.
+        """
+
         groups = self._group_active_request_indices(requests, checkpoint=checkpoint)
         packed_tokens = 0
         for _, group_indices in groups:
-            # Width probing uses the cheap no-sharing token count: it is an
-            # exact upper bound on any planner-selected layout's packed tokens
-            # (conservative for admission), costs one O(tokens) CPU walk, and
-            # preserves the estimator's CUDA None-contract (callers fall back
-            # to full packing). The planner itself runs once per materialized
-            # plan in _plan_flat_forward.
+            if exact:
+                _, layout = self._select_group_layout(
+                    tuple(
+                        requests[index].input_tokens.reshape(-1).to(dtype=torch.long)
+                        for index in group_indices
+                    )
+                )
+                packed_tokens += layout.packed_tokens
+                continue
             group_packed_tokens = estimate_prefix_tree_packed_tokens(
                 (requests[index].input_tokens.reshape(-1) for index in group_indices),
                 max_depth=0,
@@ -2956,12 +3052,12 @@ class TrainerRank:
             ),
         )
 
-    def _group_active_request_indices(
+    def _ensure_checkpoint_slots_for(
         self,
         requests: Sequence[AnyForwardInput],
         *,
-        checkpoint: AdapterSelection = Unset,
-    ) -> tuple[tuple[tuple["LoRASlotRef | None", bool], tuple[int, ...]], ...]:
+        checkpoint: AdapterSelection,
+    ) -> None:
         self._ensure_checkpoint_slots(
             cast(str, selection)
             for request in requests
@@ -2981,6 +3077,16 @@ class TrainerRank:
             is not Unset
             and selection is not None
         )
+
+    def _group_active_request_indices(
+        self,
+        requests: Sequence[AnyForwardInput],
+        *,
+        checkpoint: AdapterSelection = Unset,
+        ensure_slots: bool = True,
+    ) -> tuple[tuple[tuple["LoRASlotRef | None", bool], tuple[int, ...]], ...]:
+        if ensure_slots:
+            self._ensure_checkpoint_slots_for(requests, checkpoint=checkpoint)
         groups: dict[tuple[LoRASlotRef | None, bool], list[int]] = {}
         for index, request in enumerate(requests):
             if (

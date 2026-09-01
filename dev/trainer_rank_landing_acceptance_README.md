@@ -24,7 +24,11 @@ fraction meaningless. The screen gates planning absolutely instead. Every
 measured sample uses fresh tokens, so these planning numbers are all
 cache-miss (cold) costs; steady-state identical-content calls are a content
 hash plus dictionary hit, and `forward_micro_batches` additionally pre-plans
-the predicted next wave in the background during the caller's GPU time.
+the predicted next wave in the background during the caller's GPU time
+(measured benefit is marginal — about 1 ms/step on a 2-wave GPU benchmark —
+because sharing-aware width pricing already plans the accepted width; it is
+kept as insurance for planning-heavy regimes and reported separately as
+`speculative_planning_ms`).
 
 Regression baseline: the existing suite (`uv run pytest tests/unit`,
 `uv run prek run --all-files`) stays green; the trainer-rank shard runs 144

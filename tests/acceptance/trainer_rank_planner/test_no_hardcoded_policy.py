@@ -1,18 +1,26 @@
-"""Landing acceptance: no hardcoded planner policy anywhere in production.
+"""Landing acceptance: no user policy knobs and no literal depth policy.
 
-The holistic-planner landing contract removes user-selected depth, width,
-head-chunk, and memory-safety decisions. Deleting the knobs from the public
-signature is not enough: the same policies must not survive as hardcoded
-constants or internal parameter defaults. This module statically scans
-production sources and fails on any residue.
+What this module enforces, precisely:
+- none of the removed user knobs (``shared_prefix_max_depth``,
+  ``head_chunk_tokens``, ``memory_safety_factor``,
+  ``memory_reserve_fraction``) survives as an identifier, parameter, or call
+  keyword anywhere in ``src/art`` — not renamed, not re-plumbed;
+- production TrainerRank never passes a literal sharing depth to the packing
+  primitive (``max_depth=<int>``), except the no-sharing upper-bound estimate
+  ``max_depth=0``;
+- user-facing docs and examples stop teaching the removed knobs.
 
-Exemptions, per the behavior spec:
-- The low-level Megatron packing primitive may retain ``max_depth`` for tests
-  and specialized preprocessing (``src/art/megatron/prefix_tree_packing.py``
-  and its ``prefix_tree*`` siblings). TrainerRank must never call it with a
-  literal policy value.
+What it deliberately does NOT claim: that every planning-related constant is
+data-dependent. Output-head chunking and memory margins are internal
+calibrated policy in this landing (``_HEAD_CHUNK_TOKENS``,
+``_MEMORY_SAFETY_FACTOR``, ``_MEMORY_RESERVE_FRACTION``); making them planner
+decisions is tracked as follow-up work, not gated here.
 
-These tests are EXPECTED TO FAIL until the holistic planner lands.
+Exemptions: the low-level Megatron packing primitive may retain ``max_depth``
+for tests and specialized preprocessing (``src/art/megatron/prefix_tree*``).
+
+These tests define the landing contract: written and fail-verified before
+the implementation, they must pass unmodified on the landed tree.
 """
 
 from __future__ import annotations

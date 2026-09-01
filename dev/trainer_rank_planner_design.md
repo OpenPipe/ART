@@ -25,10 +25,17 @@ document records the verified facts the acceptance suite pins).
    the induced-forest bridge and research-only surfaces removed.
 2. **Selection policy**: `select_prefix_tree_layout` = mandatory candidates +
    bounded refinement search under the calibrated production score.
-3. **Knob-free public API**: `TrainerRank(runtime)`; planner decides layout,
-   width, head chunking, splits; `TrainerRankMemoryError(predicted_peak_bytes,
-   usable_limit_bytes, suggestion)`; `TrainerRankRuntimeSupportError` refusal
-   at TP>1/PP>1 (documented limitation; follow-up widens the seam).
+3. **Knob-free public API**: `TrainerRank(runtime)`. Scope, precisely: the
+   planner decides the prefix-sharing layout (arbitrary depth, per-subtree
+   share/replay); microbatch width reuses main's adaptive selector, made
+   sharing-aware (a no-sharing token count accepts a width, and the planner's
+   actual layouts are priced only when that bound would reject one); head
+   chunking and memory margins are internal calibrated constants, not planner
+   decisions; `dp_rank_forward` plans once and raises
+   `TrainerRankMemoryError(predicted_peak_bytes, usable_limit_bytes,
+   suggestion)` when the unsplit plan cannot be admitted (best-effort internal
+   splitting is a follow-up PR); `TrainerRankRuntimeSupportError` at
+   TP>1/PP>1 (follow-up widens the seam).
 4. **Distributed identity WITHOUT a leader protocol** (deliberate deviation
    from the research design, in the spirit of "or whatever's simplest"):
    layout selection is a pure deterministic function of (content identity,
@@ -44,8 +51,9 @@ document records the verified facts the acceptance suite pins).
    collectives, bounded planning fraction) are enforced directly by the
    acceptance gates.
 5. **Telemetry**: `last_forward_telemetry()` with `selected_max_depth`,
-   `planning_ms`. Env-gated test anchor forcing (`ART_TRAINER_RANK_TEST_HOOKS`
-   + `ART_TRAINER_RANK_TEST_ANCHOR`).
+   `planning_ms` (critical path, including speculative submission cost), and
+   `speculative_planning_ms` (hidden worker time). Env-gated test anchor
+   forcing (`ART_TRAINER_RANK_TEST_HOOKS` + `ART_TRAINER_RANK_TEST_ANCHOR`).
 
 ## Verified facts the acceptance suite pins (empirical, research planner)
 
@@ -85,21 +93,24 @@ recalibration; not addressed in this PR.
 
 ## Overlapped (speculative) next-wave planning
 
-``forward_micro_batches`` pre-plans the predicted next wave (seeded by the
-current wave's width) on a single background thread while the generator is
+``forward_micro_batches`` pre-plans the predicted next wave (exactly the
+width the search will seed with — the largest width so far — over this DP
+rank's strided slice) on a single background thread while the generator is
 suspended at the yield — i.e. during the caller's forward/backward GPU time.
 Because selection is a pure memoized function, speculation can never change a
 plan: a correct prediction turns the next wave's selection into a cache hit,
 a wrong one leaves an unused LRU entry. No cancellation or stale-state
 machinery is needed (the hazard that kept this out of the research freeze).
-Measured on a launch-bound 2-layer benchmark: critical-path planning drops
-10.2 ms -> 4.5 ms per 4-wave step with wall time unchanged (GIL contention
-offsets the win when steps are CPU-bound); on GPU-bound full-height steps the
-worker overlaps the main thread's CUDA waits, where planning was previously
-pure wall-time addition after the admission sync.
+Token snapshots for the worker are immutable CPU clones taken on the calling
+thread (the same bytes that produced the cache key), so a caller mutating its
+tensors after the yield cannot poison the cache; CUDA inputs skip speculation
+so the worker never touches the device. The synchronous submission cost is
+charged to `planning_ms`; hidden worker time is reported separately as
+`speculative_planning_ms`. See the acceptance README for measured numbers.
 
-## Explicitly out of scope
+## Explicitly out of scope (follow-ups)
 
-Infeasibility proofs, all-rank planning/digest agreement, TP>1 admission
-seam, HybridEP/CUDA instrumentation from the research diff, cost-model
-recalibration.
+Best-effort internal splitting in `dp_rank_forward`; head chunking and memory
+margins as data-dependent planner decisions; TP>1 admission seam; cost-model
+recalibration. Not planned: infeasibility proofs, all-rank planning/digest
+agreement, HybridEP/CUDA instrumentation from the research diff.

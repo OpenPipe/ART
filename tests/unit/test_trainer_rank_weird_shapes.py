@@ -26,6 +26,7 @@ from art.trainer_rank._impl import (
     _MemoryCheck,
     _MemoryProfile,
 )
+from art.trainer_rank._prefix_tree_planner import build_canonical_prefix_tree
 
 if TYPE_CHECKING:
     from art.megatron.train import TrainingRuntime
@@ -306,6 +307,132 @@ def test_forward_micro_batches_prewarms_next_wave_during_yield(
 
     remaining = list(generator)
     assert [batch.stats.global_count for batch in remaining] == [4]
+
+
+def _prewarmed_rank(
+    monkeypatch: pytest.MonkeyPatch,
+    inputs: list[ForwardInput],
+    budget_rows: list[ForwardInput],
+    *,
+    dp: tuple[int, int] = (0, 1),
+) -> TrainerRank:
+    """Rank whose packed-token budget admits exactly ``budget_rows`` per wave."""
+
+    rank = TrainerRank(_runtime())
+    monkeypatch.setattr(rank, "_dp_rank_and_size", lambda: dp)
+    monkeypatch.setattr(rank, "_all_ranks_have_memory_profile", lambda **_kwargs: True)
+    limit = rank._estimate_flat_forward(budget_rows)
+    assert limit is not None
+    _set_packed_token_budget(monkeypatch, rank, lambda: limit[0])
+    monkeypatch.setattr(
+        rank,
+        "_run_flat_plan_with_memory_tracking",
+        lambda plan, **_kwargs: (
+            [ForwardOutput(None, None, None, None) for _ in range(plan.request_count)],
+            None,
+        ),
+    )
+    return rank
+
+
+def _rows(requests: Iterable[ForwardInput]) -> tuple[torch.Tensor, ...]:
+    return tuple(
+        request.input_tokens.detach().reshape(-1).to(dtype=torch.long)
+        for request in requests
+    )
+
+
+def test_speculative_planning_uses_immutable_snapshots(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Mutating caller tensors after the yield must not poison the cache."""
+
+    inputs = [_target_request(_tokens(1, 2, 3, index)) for index in range(8)]
+    rank = _prewarmed_rank(monkeypatch, inputs, inputs[:4])
+    original_rows = tuple(row.clone() for row in _rows(inputs[4:8]))
+    original_key = rank._layout_cache_key(original_rows)
+
+    generator = rank.forward_micro_batches(inputs)
+    next(generator)
+    # The caller mutates its (aliased) input tensors while suspended.
+    for request in inputs[4:8]:
+        request.input_tokens.fill_(999)
+    future = rank._speculative_planning_future
+    assert future is not None
+    future.result(timeout=30)
+
+    cached = rank._cached_group_layout(original_key)
+    assert cached is not None
+    expected_tree = build_canonical_prefix_tree(
+        tuple(tuple(row.tolist()) for row in original_rows)
+    )
+    assert cached[0].content_fingerprint == expected_tree.content_fingerprint
+    assert cached[0].fingerprint == expected_tree.fingerprint
+
+
+def test_speculative_planning_warms_this_dp_ranks_local_slice(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    inputs = [_target_request(_tokens(1, 2, 3, index)) for index in range(16)]
+    # Local budget of 4 items per rank -> global waves of 8 at DP2.
+    rank = _prewarmed_rank(monkeypatch, inputs, inputs[0:8:2], dp=(0, 2))
+
+    generator = rank.forward_micro_batches(inputs)
+    first = next(generator)
+    assert first.stats.global_count == 8
+    future = rank._speculative_planning_future
+    assert future is not None
+    future.result(timeout=30)
+
+    # Real planning on DP rank 0 uses the strided local slice of the next
+    # global wave [8, 16): items 8, 10, 12, 14 — not the whole global slice.
+    local_key = rank._layout_cache_key(_rows(inputs[8:16:2]))
+    global_key = rank._layout_cache_key(_rows(inputs[8:16]))
+    assert rank._cached_group_layout(local_key) is not None
+    assert rank._cached_group_layout(global_key) is None
+
+
+def test_width_search_lets_prefix_sharing_widen_the_wave(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A no-sharing upper bound may accept a width, never reject one."""
+
+    shared = tuple(range(10_000, 11_000))
+    inputs = [
+        _target_request(_tokens(*shared, 1)),
+        _target_request(_tokens(*shared, 2)),
+    ]
+    rank = TrainerRank(_runtime())
+    monkeypatch.setattr(rank, "_dp_rank_and_size", lambda: (0, 1))
+    monkeypatch.setattr(rank, "_all_ranks_have_memory_profile", lambda **_kwargs: True)
+    monkeypatch.setattr(
+        rank,
+        "_run_flat_plan_with_memory_tracking",
+        lambda plan, **_kwargs: (
+            [ForwardOutput(None, None, None, None) for _ in range(plan.request_count)],
+            None,
+        ),
+    )
+    plan = rank._plan_flat_forward(inputs)
+    assert plan.packed_tokens < 2_002, "planner must share the common prefix"
+    # Budget fits the shared plan (1,002 packed) but not the no-sharing bound
+    # (2,002); the wave must still take both requests.
+    _set_packed_token_budget(monkeypatch, rank, 1_200)
+
+    batches = list(rank.forward_micro_batches(inputs))
+
+    assert [batch.stats.global_count for batch in batches] == [2]
+
+
+def test_forward_micro_batches_telemetry_reports_hidden_speculation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    inputs = [_target_request(_tokens(1, 2, 3, index)) for index in range(8)]
+    rank = _prewarmed_rank(monkeypatch, inputs, inputs[:4])
+    list(rank.forward_micro_batches(inputs))
+    telemetry = rank.last_forward_telemetry()
+    assert telemetry["planning_ms"] > 0.0
+    assert "speculative_planning_ms" in telemetry
 
 
 @pytest.mark.parametrize("api", ("dp_rank_forward", "forward_micro_batches"))

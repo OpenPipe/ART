@@ -11,8 +11,8 @@ contract (research thread behavior spec, frozen 2026-08-31):
 - ``TrainerRankMemoryError`` reports only a predicted peak, the usable limit,
   and an actionable reduction suggestion. It carries no infeasibility proof.
 
-They are EXPECTED TO FAIL until the holistic planner lands. They must pass,
-unmodified, before the landing is complete.
+These tests define the landing contract: written and fail-verified before
+the implementation, they must pass unmodified on the landed tree.
 """
 
 from __future__ import annotations
