@@ -293,6 +293,21 @@ def _digest(value: Any) -> str:
     return hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()
 
 
+def _canonical_production_config_sha256(source_config_path: Path) -> str:
+    import torch
+    from transformers import AutoConfig
+
+    from art.runtime_attestation import canonical_config_sha256
+
+    resolved = AutoConfig.from_pretrained(
+        source_config_path.parent,
+        dtype=torch.bfloat16,
+        local_files_only=True,
+        trust_remote_code=True,
+    )
+    return canonical_config_sha256(resolved)
+
+
 def _files_digest(paths: list[Path]) -> str:
     digest = hashlib.sha256()
     for path in sorted(paths):
@@ -696,6 +711,9 @@ def ensure_throughput_fixture(
         "num_layers": num_layers,
         "source_config_sha256": _digest(source),
         "sized_config_sha256": _digest(sized),
+        "canonical_config_sha256": _canonical_production_config_sha256(
+            source_config_path
+        ),
         "initialization": initialization_version,
         "random_seed": random_seed,
         "vocabulary_contract": vocabulary_contract,
@@ -899,10 +917,15 @@ def _calibration_contract(
     manifest = fixture.manifest
     _require(
         all(
-            manifest.get(key) for key in ("source_config_sha256", "sized_config_sha256")
+            manifest.get(key)
+            for key in (
+                "source_config_sha256",
+                "sized_config_sha256",
+                "canonical_config_sha256",
+            )
         )
         and manifest.get("width_fingerprint") == fixture.width_fingerprint,
-        "throughput fixture lacks source/sized hashes or production width",
+        "throughput fixture lacks source/sized/canonical hashes or production width",
     )
     workload = config.model_dump(
         mode="json",

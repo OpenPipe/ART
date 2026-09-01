@@ -41,9 +41,11 @@ from .workflow_resources import (
 from .workflow_throughput import (
     PolicyActivationEvent,
     ThroughputFixture,
+    _canonical_production_config_sha256,
     _classify_acceptance_failures,
     _collect_measurements,
     _current_pipeline_settings,
+    _digest,
     _freeze_pipeline_settings_from_step,
     _packed_batch_fingerprint,
     _phase_evidence,
@@ -116,6 +118,27 @@ def _fixture(tmp_path: Path, model_key: str) -> WorkflowFixture:
         canonical_path=str(tmp_path / "canonical"),
         canonical_hf_home=str(tmp_path / "canonical_cache"),
     )
+
+
+def test_canonical_production_config_digest_uses_resolved_config(tmp_path: Path) -> None:
+    import torch
+    from transformers import AutoConfig, LlamaConfig
+
+    from art.runtime_attestation import canonical_config_sha256
+
+    production_config = tmp_path / "production_config"
+    LlamaConfig(num_hidden_layers=2).save_pretrained(production_config)
+    source = json.loads((production_config / "config.json").read_text())
+    resolved = AutoConfig.from_pretrained(
+        production_config,
+        dtype=torch.bfloat16,
+        local_files_only=True,
+        trust_remote_code=True,
+    )
+
+    digest = _canonical_production_config_sha256(production_config / "config.json")
+    assert digest == canonical_config_sha256(resolved)
+    assert digest != _digest(source)
 
 
 def test_shared_fixture_root_rehomes_node_local_paths(tmp_path: Path) -> None:
