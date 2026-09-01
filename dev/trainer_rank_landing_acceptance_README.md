@@ -23,7 +23,8 @@ deliberately uses a 2-layer model whose ~130 ms execution would make any
 fraction meaningless. The screen gates planning absolutely instead. Every
 measured sample uses fresh tokens, so these planning numbers are all
 cache-miss (cold) costs; steady-state identical-content calls are a content
-hash plus dictionary hit.
+hash plus dictionary hit, and `forward_micro_batches` additionally pre-plans
+the predicted next wave in the background during the caller's GPU time.
 
 Regression baseline: the existing suite (`uv run pytest tests/unit`,
 `uv run prek run --all-files`) stays green; the trainer-rank shard runs 144

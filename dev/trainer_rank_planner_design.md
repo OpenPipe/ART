@@ -83,8 +83,23 @@ GRPO cells (sealed: full-sharing arm 875.7 ms vs automatic 1,132.8 ms on the
 win cell). Constants are versioned (`coefficient_version`) for future
 recalibration; not addressed in this PR.
 
+## Overlapped (speculative) next-wave planning
+
+``forward_micro_batches`` pre-plans the predicted next wave (seeded by the
+current wave's width) on a single background thread while the generator is
+suspended at the yield — i.e. during the caller's forward/backward GPU time.
+Because selection is a pure memoized function, speculation can never change a
+plan: a correct prediction turns the next wave's selection into a cache hit,
+a wrong one leaves an unused LRU entry. No cancellation or stale-state
+machinery is needed (the hazard that kept this out of the research freeze).
+Measured on a launch-bound 2-layer benchmark: critical-path planning drops
+10.2 ms -> 4.5 ms per 4-wave step with wall time unchanged (GIL contention
+offsets the win when steps are CPU-bound); on GPU-bound full-height steps the
+worker overlaps the main thread's CUDA waits, where planning was previously
+pure wall-time addition after the admission sync.
+
 ## Explicitly out of scope
 
-Infeasibility proofs, all-rank planning/digest agreement, speculative
-next-wave planning, TP>1 admission seam, HybridEP/CUDA instrumentation from
-the research diff, cost-model recalibration.
+Infeasibility proofs, all-rank planning/digest agreement, TP>1 admission
+seam, HybridEP/CUDA instrumentation from the research diff, cost-model
+recalibration.

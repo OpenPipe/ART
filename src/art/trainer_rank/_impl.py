@@ -941,6 +941,9 @@ class TrainerRank:
             tuple[str, int, int, bool, int, str | None],
             tuple[CanonicalPrefixTree, PrefixTreeLayout],
         ] = OrderedDict()
+        self._layout_cache_lock = threading.Lock()
+        self._speculative_planner: ThreadPoolExecutor | None = None
+        self._speculative_planning_future: Future[None] | None = None
         self._planning_seconds_accum = 0.0
         self._last_forward_telemetry_snapshot: dict[str, float | int] | None = None
         self.zero_grad()
@@ -1727,6 +1730,15 @@ class TrainerRank:
                 self._last_global_micro_batch_size = max(
                     self._last_global_micro_batch_size or 0,
                     candidate.stats_global_count,
+                )
+                # Overlap next-wave planning with the caller's GPU time: the
+                # width search seeds from the last wave's width, so pre-plan
+                # that slice while this generator is suspended at the yield.
+                self._submit_speculative_wave_planning(
+                    items,
+                    stop,
+                    candidate.stats_global_count,
+                    checkpoint=checkpoint,
                 )
             with _telemetry_phase(
                 # This interval is controlled by the caller and normally contains
@@ -2706,18 +2718,10 @@ class TrainerRank:
         )
         return cp_size, self._num_layers, uses_gdn
 
-    def _select_group_layout(
+    def _layout_cache_key(
         self,
         input_ids: Sequence[torch.Tensor],
-    ) -> tuple[CanonicalPrefixTree, PrefixTreeLayout]:
-        """Select one group's prefix-sharing layout, cached by content identity.
-
-        The cache key is a raw-bytes content hash plus the topology, cost
-        coefficients, and (test-only) forced anchor, so identical steady-state
-        groups skip canonicalization and search entirely.
-        """
-
-        started = time.perf_counter()
+    ) -> tuple[str, int, int, bool, int, str | None]:
         cp_size, layers, uses_gdn = self._planner_topology_facts()
         anchor = self._forced_test_anchor()
         hasher = hashlib.sha256()
@@ -2726,7 +2730,7 @@ class TrainerRank:
             hasher.update(str(row.dtype).encode("ascii"))
             hasher.update(_U64_STRUCT.pack(int(row.numel())))
             hasher.update(row.numpy())
-        key = (
+        return (
             hasher.hexdigest(),
             cp_size,
             layers,
@@ -2734,35 +2738,139 @@ class TrainerRank:
             COEFFICIENT_VERSION,
             anchor,
         )
-        cached = self._layout_selection_cache.get(key)
-        if cached is not None:
-            self._layout_selection_cache.move_to_end(key)
-        if cached is None:
-            tree = build_canonical_prefix_tree(
-                tuple(tuple(tensor.reshape(-1).tolist()) for tensor in input_ids)
-            )
-            if anchor is not None:
-                candidates = prefix_tree_layout_candidates(tree)
-                matching = [
-                    candidate for candidate in candidates if anchor in candidate.labels
-                ]
-                if len(matching) != 1:
-                    raise ValueError(f"unknown forced test anchor {anchor!r}")
-                layout = matching[0].layout
-            else:
-                layout = select_prefix_tree_layout(
-                    tree,
-                    cp_size=cp_size,
-                    layers=layers,
-                    uses_gdn=uses_gdn,
-                    refinement_work_budget=_PLANNER_REFINEMENT_BUDGET,
-                ).layout
-            cached = (tree, layout)
+
+    def _cached_group_layout(
+        self,
+        key: tuple[str, int, int, bool, int, str | None],
+    ) -> tuple[CanonicalPrefixTree, PrefixTreeLayout] | None:
+        with self._layout_cache_lock:
+            cached = self._layout_selection_cache.get(key)
+            if cached is not None:
+                self._layout_selection_cache.move_to_end(key)
+            return cached
+
+    def _compute_group_layout(
+        self,
+        input_ids: Sequence[torch.Tensor],
+        key: tuple[str, int, int, bool, int, str | None],
+    ) -> tuple[CanonicalPrefixTree, PrefixTreeLayout]:
+        """Plan one group and memoize the result.
+
+        Pure with respect to TrainerRank state apart from the cache itself, so
+        it is safe to run on the speculative planning thread; a concurrent
+        duplicate computation of the same key is deterministic and harmless.
+        """
+
+        _, cp_size, layers, uses_gdn, _, anchor = key
+        tree = build_canonical_prefix_tree(
+            tuple(tuple(tensor.reshape(-1).tolist()) for tensor in input_ids)
+        )
+        if anchor is not None:
+            candidates = prefix_tree_layout_candidates(tree)
+            matching = [
+                candidate for candidate in candidates if anchor in candidate.labels
+            ]
+            if len(matching) != 1:
+                raise ValueError(f"unknown forced test anchor {anchor!r}")
+            layout = matching[0].layout
+        else:
+            layout = select_prefix_tree_layout(
+                tree,
+                cp_size=cp_size,
+                layers=layers,
+                uses_gdn=uses_gdn,
+                refinement_work_budget=_PLANNER_REFINEMENT_BUDGET,
+            ).layout
+        cached = (tree, layout)
+        with self._layout_cache_lock:
             self._layout_selection_cache[key] = cached
+            self._layout_selection_cache.move_to_end(key)
             while len(self._layout_selection_cache) > _LAYOUT_SELECTION_CACHE_LIMIT:
                 self._layout_selection_cache.popitem(last=False)
+        return cached
+
+    def _select_group_layout(
+        self,
+        input_ids: Sequence[torch.Tensor],
+    ) -> tuple[CanonicalPrefixTree, PrefixTreeLayout]:
+        """Select one group's prefix-sharing layout, cached by content identity.
+
+        The cache key is a raw-bytes content hash plus the topology, cost
+        coefficients, and (test-only) forced anchor, so identical steady-state
+        groups (or groups pre-planned speculatively during the caller's GPU
+        work) skip canonicalization and search entirely.
+        """
+
+        started = time.perf_counter()
+        key = self._layout_cache_key(input_ids)
+        cached = self._cached_group_layout(key)
+        if cached is None:
+            cached = self._compute_group_layout(input_ids, key)
         self._planning_seconds_accum += time.perf_counter() - started
         return cached
+
+    def _speculative_planning_executor(self) -> ThreadPoolExecutor:
+        if self._speculative_planner is None:
+            self._speculative_planner = ThreadPoolExecutor(
+                max_workers=1,
+                thread_name_prefix="trainer-rank-speculative-planner",
+            )
+        return self._speculative_planner
+
+    def _submit_speculative_wave_planning(
+        self,
+        items: Sequence[ForwardInputs],
+        start: int,
+        predicted_width: int,
+        *,
+        checkpoint: AdapterSelection,
+    ) -> None:
+        """Pre-plan the predicted next wave while the caller uses the GPU.
+
+        Runs while this generator is suspended at a yield (the caller's
+        forward/backward time). Grouping and cache keys are computed on the
+        calling thread; the worker thread only executes the pure, memoized
+        planner, so speculation can never change a selected plan — a wrong
+        width prediction merely leaves an unused LRU entry. Planning time
+        spent here is deliberately not charged to planning telemetry: it is
+        hidden under the caller's GPU work.
+        """
+
+        predicted = items[start : start + max(1, predicted_width)]
+        if not predicted:
+            return
+        try:
+            requests = list(_flatten(list(predicted)))
+            groups = self._group_active_request_indices(requests, checkpoint=checkpoint)
+        except Exception:
+            # Prediction is best-effort; the real wave will surface any
+            # genuine input problem on the main thread.
+            return
+        pending: list[
+            tuple[
+                tuple[torch.Tensor, ...],
+                tuple[str, int, int, bool, int, str | None],
+            ]
+        ] = []
+        for _, group_indices in groups:
+            group_input_ids = tuple(
+                requests[index].input_tokens.detach().reshape(-1).to(dtype=torch.long)
+                for index in group_indices
+            )
+            key = self._layout_cache_key(group_input_ids)
+            if self._cached_group_layout(key) is None:
+                pending.append((group_input_ids, key))
+        if not pending:
+            return
+
+        def warm() -> None:
+            for group_input_ids, key in pending:
+                if self._cached_group_layout(key) is None:
+                    self._compute_group_layout(group_input_ids, key)
+
+        self._speculative_planning_future = (
+            self._speculative_planning_executor().submit(warm)
+        )
 
     def _plan_flat_forward(
         self,

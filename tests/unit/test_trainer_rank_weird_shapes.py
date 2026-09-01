@@ -269,6 +269,45 @@ def test_forward_micro_batches_preserves_nested_vineppo_groups(
     )
 
 
+def test_forward_micro_batches_prewarms_next_wave_during_yield(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rank = TrainerRank(_runtime())
+    monkeypatch.setattr(rank, "_dp_rank_and_size", lambda: (0, 1))
+    monkeypatch.setattr(rank, "_all_ranks_have_memory_profile", lambda **_kwargs: True)
+    inputs = [_target_request(_tokens(1, 2, 3, index)) for index in range(8)]
+    limit = rank._estimate_flat_forward(inputs[:4])
+    assert limit is not None
+    _set_packed_token_budget(monkeypatch, rank, lambda: limit[0])
+    monkeypatch.setattr(
+        rank,
+        "_run_flat_plan_with_memory_tracking",
+        lambda plan, **_kwargs: (
+            [ForwardOutput(None, None, None, None) for _ in range(plan.request_count)],
+            None,
+        ),
+    )
+
+    generator = rank.forward_micro_batches(inputs)
+    first = next(generator)
+    assert first.stats.global_count == 4
+
+    # While the generator is suspended at the yield (the caller's GPU time),
+    # the predicted next wave must be planned in the background so the next
+    # wave's selection is a cache hit.
+    future = rank._speculative_planning_future
+    assert future is not None
+    future.result(timeout=30)
+    next_rows = tuple(
+        request.input_tokens.detach().reshape(-1).to(dtype=torch.long)
+        for request in inputs[4:8]
+    )
+    assert rank._cached_group_layout(rank._layout_cache_key(next_rows)) is not None
+
+    remaining = list(generator)
+    assert [batch.stats.global_count for batch in remaining] == [4]
+
+
 @pytest.mark.parametrize("api", ("dp_rank_forward", "forward_micro_batches"))
 def test_forward_preserves_caller_owned_nested_input_tensors(
     api: str,
