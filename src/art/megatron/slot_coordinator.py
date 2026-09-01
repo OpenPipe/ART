@@ -694,6 +694,9 @@ class MegatronSlotCoordinator:
         self._residency_summaries: dict[
             tuple[str, str], MegatronOperationResidencySummary
         ] = {}
+        self._portable_exports: dict[
+            tuple[str, str], PortableSnapshotExportReceipt
+        ] = {}
         self._registering_runs: dict[
             str, tuple[MegatronOperationConfig, str | None, str | None, bool]
         ] = {}
@@ -922,11 +925,27 @@ class MegatronSlotCoordinator:
                     "checkpoint export is not the active save-state command"
                 )
             generation = state.handler.generation
-        return await self.trainer.export_command_run_checkpoint(
+        receipt = await self.trainer.export_command_run_checkpoint(
             operation.run_id,
             generation,
             operation.operation_id,
         )
+        exported = receipt.generation
+        if receipt.export_id != operation.operation_id or (
+            exported.training_session_id,
+            exported.policy_step,
+            exported.generation_id,
+        ) != (
+            generation.training_session_id,
+            generation.policy_step,
+            generation.generation_id,
+        ):
+            raise RuntimeError("portable export changed the active save-state identity")
+        key = (operation.run_id, operation.operation_id)
+        prior = self._portable_exports.setdefault(key, receipt)
+        if prior != receipt:
+            raise RuntimeError("portable export changed operation-keyed evidence")
+        return receipt
 
     async def capture_run_checkpoints(
         self,
@@ -1065,6 +1084,26 @@ class MegatronSlotCoordinator:
             raise KeyError(f"Megatron slot run {run_id!r} is unavailable")
         return state.handler.sampler_publication_receipt(operation_id)
 
+    def portable_snapshot_receipt(
+        self,
+        run_id: str,
+        operation_id: str,
+    ) -> PortableSnapshotExportReceipt | None:
+        """Return exact private save-state evidence until operation retirement."""
+
+        state = self._runs.get(run_id)
+        if state is None:
+            raise KeyError(f"Megatron slot run {run_id!r} is unavailable")
+        return self._portable_exports.get((run_id, operation_id))
+
+    async def acknowledge_operation(self, run_id: str, operation_id: str) -> None:
+        """Release physical command inputs after an external durable acknowledgement."""
+
+        state = self._runs.get(run_id)
+        if state is None or state.draining:
+            raise KeyError(f"Megatron slot run {run_id!r} is unavailable")
+        await state.handler.acknowledge_operation(operation_id)
+
     def _retire_operation(
         self,
         run_id: str,
@@ -1079,6 +1118,7 @@ class MegatronSlotCoordinator:
             state.handler.retire_operation(operation_id)
             self._residency_evidence.pop((run_id, operation_id), None)
             self._residency_summaries.pop((run_id, operation_id), None)
+            self._portable_exports.pop((run_id, operation_id), None)
 
     def residency_evidence(
         self, run_id: str, operation_id: str
@@ -1576,6 +1616,7 @@ class MegatronSlotCoordinator:
                     self._bound_migration_tombstones(self._aborted_migration_restores)
                 self._runs.pop(run_id)
                 self._deficit.pop(run_id, None)
+                self._purge_run_evidence(run_id)
                 if run_id in self._order:
                     self._order.remove(run_id)
                 self._condition.notify_all()
@@ -1590,6 +1631,16 @@ class MegatronSlotCoordinator:
     def _bound_migration_tombstones(values: dict[Any, Any]) -> None:
         while len(values) > 128:
             values.pop(next(iter(values)))
+
+    def _purge_run_evidence(self, run_id: str) -> None:
+        for values in (
+            self._residency_evidence,
+            self._residency_summaries,
+            self._portable_exports,
+        ):
+            for key in tuple(values):
+                if key[0] == run_id:
+                    values.pop(key)
 
     async def drain_run(self, run_id: str) -> None:
         async with self._condition:
@@ -1619,6 +1670,7 @@ class MegatronSlotCoordinator:
         async with self._condition:
             self._runs.pop(run_id, None)
             self._deficit.pop(run_id, None)
+            self._purge_run_evidence(run_id)
             if run_id in self._order:
                 self._order.remove(run_id)
             self._condition.notify_all()
@@ -1684,6 +1736,7 @@ class MegatronSlotCoordinator:
             if isinstance(request, (ForwardRequest, ForwardBackwardRequest)):
                 capture = await state.handler.prepare_input(request, operation)
                 packing = await state.handler.packing_for(capture)
+                await state.handler.prepare_cp_lookahead(request, operation, capture)
                 request = request.model_copy(update={"batch": capture})
                 cost = max(1, packing.physical_tokens)
                 if raw_sft:

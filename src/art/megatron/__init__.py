@@ -8,6 +8,7 @@ __all__ = [
     "MegatronGateEvidenceRecorder",
     "MegatronGateRunPlan",
     "MegatronGateTurn",
+    "MegatronLocalCheckpointOperations",
     "MegatronOperationConfig",
     "MegatronOperationHandler",
     "MegatronOperationRuntime",
@@ -59,6 +60,10 @@ def __getattr__(name: str) -> Any:
         from . import gate_evidence
 
         return getattr(gate_evidence, name)
+    if name == "MegatronLocalCheckpointOperations":
+        from . import local_checkpoint
+
+        return getattr(local_checkpoint, name)
     if name in {
         "MegatronOperationConfig",
         "MegatronOperationHandler",

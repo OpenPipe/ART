@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
+from dataclasses import dataclass
 from pathlib import Path
 import secrets
 import sys
@@ -36,7 +37,10 @@ from .runtime.specs import ResidentLoraInspectionResult, ResidentScoreResult
 from .runtime_config import get_megatron_runtime_config
 
 if TYPE_CHECKING:
-    from .slot_runtime import MegatronRunBinding, MegatronSlotRuntime
+    from .slot_runtime import (
+        MegatronRunBinding,
+        MegatronSlotRuntime,
+    )
     from .training import LocalMegatronTrainingClient
 
 _CONTEXT_PARALLEL_MIN_PREFIX_TREE_SHARED_SEGMENT_LENGTH = 256
@@ -45,6 +49,9 @@ _PIPELINE_TRAIN_DISPATCH: ContextVar[asyncio.Event | None] = ContextVar(
 )
 _PIPELINE_TRAIN_STEP: ContextVar[int | None] = ContextVar(
     "megatron_pipeline_train_step", default=None
+)
+_BOUND_SAVE_CHECKPOINT: ContextVar[bool] = ContextVar(
+    "megatron_bound_save_checkpoint", default=True
 )
 _COMMITTED_LEARNER_STEP_METRIC = "_art/committed_learner_step"
 
@@ -130,6 +137,61 @@ class _PipelinePreparedBatch(BaseModel):
     groups: tuple[Any, ...]
     packing_config: _PackingConfig
     metrics: dict[str, float]
+
+
+@dataclass(slots=True)
+class _BoundPreparedBatch:
+    groups: tuple[TrajectoryGroup, ...]
+    materialized: tuple[TrajectoryGroup, ...]
+    selections: tuple[Any, ...]
+    queue: Any | None
+    packing_generation: str
+    claimed: bool = False
+    marked: bool = False
+    released: bool = False
+
+
+class _BoundPipelineCommandContext:
+    """One materialized batch retained one command ahead of the slot GPU loop."""
+
+    def __init__(
+        self,
+        backend: "MegatronBackend",
+        model: TrainableModel,
+        prepared: _BoundPreparedBatch,
+        *,
+        train_kwargs: dict[str, Any],
+    ) -> None:
+        self.preparation_metrics: dict[str, float] = {}
+        self._backend = backend
+        self._model = model
+        self._prepared = prepared
+        self._train_kwargs = train_kwargs
+
+    async def complete(
+        self,
+        next_train_dispatched: asyncio.Event | None,
+        next_batch_handoff: asyncio.Event | None,
+    ) -> LocalTrainResult:
+        if self._prepared.claimed:
+            raise RuntimeError("bound pipeline command was consumed twice")
+        if next_train_dispatched is not None:
+            next_train_dispatched.set()
+        if next_batch_handoff is not None:
+            next_batch_handoff.set()
+        return await self._backend.train(
+            self._model,
+            list(self._prepared.groups),
+            **self._train_kwargs,
+        )
+
+    async def abort(self) -> None:
+        if self._prepared.claimed:
+            return
+        self._prepared.claimed = True
+        await self._backend._release_bound_prepared(
+            self._prepared, disposition="discarded"
+        )
 
 
 class _MegatronPipelineCommandContext:
@@ -480,11 +542,13 @@ class MegatronBackend(LocalBackend):
             from ..dev.get_model_config import get_model_config
             from ..distributed.rollout import RolloutModelSpec
             from ..training import AdapterSpec, TrainingRunSpec
-            from .gate_evidence import MegatronGateCheckpointOperations
+            from .local_checkpoint import MegatronLocalCheckpointOperations
             from .slot_runtime import (
+                MegatronRunBinding,
                 MegatronRunBootstrapConfig,
                 MegatronSlotLaunchConfig,
                 launch_megatron_slot,
+                prepare_megatron_run_config,
             )
 
             output_dir = get_model_dir(model=model, art_path=self._path)
@@ -565,25 +629,44 @@ class MegatronBackend(LocalBackend):
                 runtime_spec = slot.coordinator.trainer.runtime_spec
                 run_id = model.run_id or model.run_name
                 model.run_id = run_id
-                binding = await slot.bind_run(
-                    MegatronRunBootstrapConfig(
-                        run_id=run_id,
-                        training_session_id=run_id,
-                        run=TrainingRunSpec(
-                            base_model=model.base_model,
-                            adapter=AdapterSpec(
-                                rank=runtime_spec.lora_rank,
-                                target_modules=runtime_spec.lora_target_modules,
-                            ),
-                            seed=runtime_spec.random_state,
-                            dtype="bfloat16",
+                bootstrap = MegatronRunBootstrapConfig(
+                    run_id=run_id,
+                    training_session_id=run_id,
+                    run=TrainingRunSpec(
+                        base_model=model.base_model,
+                        adapter=AdapterSpec(
+                            rank=runtime_spec.lora_rank,
+                            target_modules=runtime_spec.lora_target_modules,
                         ),
-                        output_dir=output_dir,
+                        seed=runtime_spec.random_state,
+                        dtype="bfloat16",
                     ),
-                    checkpoints=MegatronGateCheckpointOperations(
-                        slot.coordinator, Path(output_dir) / "operation_evidence"
-                    ),
-                    rollout_model=RolloutModelSpec.from_model(model),
+                    output_dir=output_dir,
+                )
+                rollout_model = RolloutModelSpec.from_model(model)
+                operation_config = await asyncio.to_thread(
+                    prepare_megatron_run_config,
+                    bootstrap,
+                    runtime_spec,
+                    rollout_model=rollout_model,
+                )
+                checkpoints = MegatronLocalCheckpointOperations(
+                    slot.coordinator,
+                    Path(output_dir) / "checkpoints",
+                    run_id=run_id,
+                    training_session_id=run_id,
+                    output_adapter_root=operation_config.output_adapter_root,
+                    optimizer_state_path=operation_config.optimizer_state_path,
+                )
+                run = await slot.coordinator.register_run(
+                    operation_config,
+                    checkpoints=checkpoints,
+                )
+                binding = MegatronRunBinding(
+                    run=run,
+                    config=operation_config,
+                    coordinator=slot.coordinator,
+                    publisher=publisher,
                 )
             except BaseException:
                 if slot is not None:
@@ -639,7 +722,10 @@ class MegatronBackend(LocalBackend):
         groups = list(trajectory_groups)
         pipeline_call = bool(
             groups
-            and isinstance(groups[0]._prepared_training_batch, _PipelinePreparedBatch)
+            and isinstance(
+                groups[0]._prepared_training_batch,
+                (_PipelinePreparedBatch, _BoundPreparedBatch),
+            )
         )
         from .distributed_service import DistributedMegatronService
 
@@ -647,6 +733,9 @@ class MegatronBackend(LocalBackend):
             raise RuntimeError("pipeline train dispatch fence is already set")
         token = _PIPELINE_TRAIN_DISPATCH.set(dispatch_event)
         step_token = _PIPELINE_TRAIN_STEP.set(None)
+        save_token = _BOUND_SAVE_CHECKPOINT.set(
+            bool(kwargs.get("save_checkpoint", True))
+        )
         try:
             if (
                 dispatch_event is not None
@@ -663,6 +752,7 @@ class MegatronBackend(LocalBackend):
                 **kwargs,
             )
         finally:
+            _BOUND_SAVE_CHECKPOINT.reset(save_token)
             _PIPELINE_TRAIN_STEP.reset(step_token)
             _PIPELINE_TRAIN_DISPATCH.reset(token)
         if self._training_binding is not None:
@@ -712,7 +802,6 @@ class MegatronBackend(LocalBackend):
         dev_config: dev.TrainConfig,
         verbose: bool,
     ) -> AsyncIterator[dict[str, float]]:
-        from ..distributed.rollout import DistributedTrajectorySelection
         from ..distributed.trajectory_store import TrajectoryGroupBundle
         from ..training import (
             AdamConfig,
@@ -731,38 +820,15 @@ class MegatronBackend(LocalBackend):
         if not trajectory_groups:
             raise ValueError("Megatron training requires at least one group")
         client = await self.training_client(model)
-        selections = tuple(group._distributed_lease for group in trajectory_groups)
-        selected = tuple(
-            selection
-            for selection in selections
-            if isinstance(selection, DistributedTrajectorySelection)
-        )
-        if selected and len(selected) != len(trajectory_groups):
-            raise RuntimeError("training batch mixes owned and controller groups")
-        queue = selected[0].queue if selected else None
-        if queue is not None and any(
-            selection.queue is not queue for selection in selected
-        ):
-            raise RuntimeError("training batch spans trajectory queues")
-        for group, selection in zip(trajectory_groups, selections, strict=True):
-            if isinstance(selection, DistributedTrajectorySelection):
-                group._distributed_lease = None
-
-        packing_generation = uuid.uuid4().hex
-        marked = False
-        selections_released = False
-        operations = []
+        prepared = await self._claim_or_prepare_bound_batch(trajectory_groups)
+        operations: list[tuple[Any, Any]] = []
+        acknowledged: set[str] = set()
         optimizer_committed = False
+        optimizer_completed = False
+        optimizer_operation_id: str | None = None
+        forward_produced_gradient = False
         try:
-            materialized = (
-                tuple(
-                    await asyncio.gather(
-                        *(queue.materialize_selection(item) for item in selected)
-                    )
-                )
-                if queue is not None
-                else tuple(trajectory_groups)
-            )
+            materialized = prepared.materialized
             if not any(group.trajectories for group in materialized):
                 raise ValueError("Megatron training requires at least one trajectory")
             versions = [
@@ -790,97 +856,36 @@ class MegatronBackend(LocalBackend):
             if dispatch is not None:
                 dispatch.set()
             request_id = secrets.token_hex(16)
-            forward = await client.forward_backward(
-                ForwardBackwardRequest(
-                    run_id=client.run_id,
-                    request_id=f"fb-{request_id}",
-                    sequence_id=client.next_sequence_id,
-                    batch=batch,
-                    loss=LossConfig(
-                        name="ppo" if dev_config.get("ppo", False) else "cispo",
-                        normalize_advantages=bool(
-                            dev_config.get("scale_rewards", True)
-                        ),
-                        values=cast(
-                            dict[str, Any],
-                            {
-                                **config.model_dump(mode="python"),
-                                **dict(dev_config),
-                            },
-                        ),
+            forward_request = ForwardBackwardRequest(
+                run_id=client.run_id,
+                request_id=f"fb-{request_id}",
+                sequence_id=client.next_sequence_id,
+                batch=batch,
+                loss=LossConfig(
+                    name="ppo" if dev_config.get("ppo", False) else "cispo",
+                    normalize_advantages=bool(dev_config.get("scale_rewards", True)),
+                    values=cast(
+                        dict[str, Any],
+                        {
+                            **config.model_dump(mode="python"),
+                            **dict(dev_config),
+                        },
                     ),
-                    collect_packing_shapes=any(
-                        group._collect_packing_shape for group in trajectory_groups
-                    ),
-                    return_token_logprobs=False,
-                )
+                ),
+                collect_packing_shapes=any(
+                    group._collect_packing_shape for group in trajectory_groups
+                ),
+                return_token_logprobs=False,
             )
-            operations.append(forward)
-            optimizer = await client.optim_step(
-                OptimStepRequest(
-                    run_id=client.run_id,
-                    request_id=f"optim-{request_id}",
-                    sequence_id=client.next_sequence_id,
-                    optimizer=AdamConfig(learning_rate=config.learning_rate),
-                )
+            forward = await client.forward_backward(forward_request)
+            operations.append((forward_request, forward))
+            forward_result = await forward.result()
+            if not isinstance(forward_result, ForwardBackwardResult):
+                raise TypeError("Megatron F/B returned an invalid result")
+            forward_produced_gradient = forward_result.produced_gradient
+            await self._acknowledge_bound_operation(
+                forward_request, forward, acknowledged
             )
-            operations.append(optimizer)
-            step = optimizer.ref.reserved_output_learner_version
-            if step is None:
-                raise RuntimeError("optimizer did not reserve a learner version")
-            sampler = await client.save_weights_for_sampler(
-                SaveWeightsForSamplerRequest(
-                    run_id=client.run_id,
-                    request_id=f"publish-{request_id}",
-                    sequence_id=client.next_sequence_id,
-                    checkpoint_name=f"step-{step}",
-                    publication=SamplerPublication(
-                        mode=_sampler_publication_mode(model),
-                        model_alias=model.name,
-                    ),
-                )
-            )
-            operations.append(sampler)
-            if _should_save_optimizer_state(step, config):
-                operations.append(
-                    await client.save_state(
-                        SaveStateRequest(
-                            run_id=client.run_id,
-                            request_id=f"state-{request_id}",
-                            sequence_id=client.next_sequence_id,
-                            checkpoint_name=f"step-{step}",
-                        )
-                    )
-                )
-            training_results = await asyncio.gather(
-                *(operation.result() for operation in operations[:2]),
-                return_exceptions=True,
-            )
-            optimizer_committed = isinstance(training_results[1], OptimStepResult)
-            if optimizer_committed and queue is not None:
-                await queue.mark_packed(selected, packing_generation)
-                marked = True
-                await queue.release_selections(
-                    selected,
-                    disposition="consumed",
-                    generation_id=packing_generation,
-                )
-                selections_released = True
-            control_results = await asyncio.gather(
-                *(operation.result() for operation in operations[2:]),
-                return_exceptions=True,
-            )
-            results = [*training_results, *control_results]
-            failures = [value for value in results if isinstance(value, BaseException)]
-            if failures:
-                raise BaseExceptionGroup("Megatron training commands failed", failures)
-            forward_result, optimizer_result, sampler_result = results[:3]
-            if (
-                not isinstance(forward_result, ForwardBackwardResult)
-                or not isinstance(optimizer_result, OptimStepResult)
-                or not isinstance(sampler_result, SamplerWeightsResult)
-            ):
-                raise TypeError("Megatron training returned invalid command results")
             if forward_result.packing.group_shapes:
                 if len(forward_result.packing.group_shapes) != len(trajectory_groups):
                     raise RuntimeError("packed-group shape cardinality changed")
@@ -890,11 +895,75 @@ class MegatronBackend(LocalBackend):
                     strict=True,
                 ):
                     group._packed_group_shape = shape
+            if not forward_result.produced_gradient:
+                yield {
+                    **forward_result.metrics,
+                    TRAIN_GRADIENT_STEPS_KEY: 0.0,
+                }
+                return
+
+            optimizer_request = OptimStepRequest(
+                run_id=client.run_id,
+                request_id=f"optim-{request_id}",
+                sequence_id=client.next_sequence_id,
+                optimizer=AdamConfig(learning_rate=config.learning_rate),
+            )
+            optimizer = await client.optim_step(optimizer_request)
+            operations.append((optimizer_request, optimizer))
+            optimizer_operation_id = optimizer.ref.operation_id
+            optimizer_result = await optimizer.result()
+            if not isinstance(optimizer_result, OptimStepResult):
+                raise TypeError("Megatron optimizer returned an invalid result")
+            optimizer_completed = True
+            await self._acknowledge_bound_operation(
+                optimizer_request, optimizer, acknowledged
+            )
+            optimizer_committed = True
+            step = optimizer.ref.reserved_output_learner_version
+            if step is None:
+                raise RuntimeError("optimizer did not reserve a learner version")
+            await self._release_bound_prepared(prepared, disposition="consumed")
+
+            sampler_request = SaveWeightsForSamplerRequest(
+                run_id=client.run_id,
+                request_id=f"publish-{request_id}",
+                sequence_id=client.next_sequence_id,
+                checkpoint_name=f"step-{step}",
+                publication=SamplerPublication(
+                    mode=_sampler_publication_mode(model),
+                    model_alias=model.name,
+                ),
+            )
+            sampler = await client.save_weights_for_sampler(sampler_request)
+            operations.append((sampler_request, sampler))
+            sampler_result = await sampler.result()
+            if not isinstance(sampler_result, SamplerWeightsResult):
+                raise TypeError("Megatron publication returned an invalid result")
+            await self._acknowledge_bound_operation(
+                sampler_request, sampler, acknowledged
+            )
+            if _BOUND_SAVE_CHECKPOINT.get() and _should_save_optimizer_state(
+                step, config
+            ):
+                state_request = SaveStateRequest(
+                    run_id=client.run_id,
+                    request_id=f"state-{request_id}",
+                    sequence_id=client.next_sequence_id,
+                    checkpoint_name=f"{step:04d}",
+                )
+                state = await client.save_state(state_request)
+                operations.append((state_request, state))
+                await state.result()
+                await self._acknowledge_bound_operation(
+                    state_request, state, acknowledged
+                )
             _PIPELINE_TRAIN_STEP.set(step)
             if verbose:
                 print(
                     "Megatron operations: "
-                    + ", ".join(operation.ref.operation_id for operation in operations)
+                    + ", ".join(
+                        operation.ref.operation_id for _request, operation in operations
+                    )
                 )
             yield {
                 **merge_gradient_step_metrics(
@@ -904,18 +973,40 @@ class MegatronBackend(LocalBackend):
             }
         finally:
             failures: list[BaseException] = []
-            if queue is not None and not selections_released:
+            for request, operation in operations:
+                if operation.ref.operation_id not in acknowledged:
+                    try:
+                        await self._acknowledge_bound_operation(
+                            request, operation, acknowledged
+                        )
+                    except BaseException as error:
+                        failures.append(error)
+            if (
+                optimizer_completed
+                and optimizer_operation_id is not None
+                and optimizer_operation_id in acknowledged
+            ):
+                optimizer_committed = True
+            if not prepared.released:
                 try:
-                    await queue.release_selections(
-                        selected,
-                        disposition=(
-                            "consumed" if optimizer_committed else "discarded"
-                        ),
-                        generation_id=packing_generation if marked else None,
-                    )
+                    operation_ids = {
+                        operation.ref.operation_id for _request, operation in operations
+                    }
+                    if optimizer_committed:
+                        await self._release_bound_prepared(
+                            prepared, disposition="consumed"
+                        )
+                    elif not forward_produced_gradient and operation_ids.issubset(
+                        acknowledged
+                    ):
+                        await self._release_bound_prepared(
+                            prepared, disposition="discarded"
+                        )
                 except BaseException as error:
                     failures.append(error)
-            for operation in operations:
+            for _request, operation in operations:
+                if operation.ref.operation_id not in acknowledged:
+                    continue
                 try:
                     if not client.retire_operation(operation.ref.operation_id):
                         raise RuntimeError(
@@ -925,6 +1016,122 @@ class MegatronBackend(LocalBackend):
                     failures.append(error)
             if failures:
                 raise BaseExceptionGroup("Megatron training cleanup failed", failures)
+
+    async def _claim_or_prepare_bound_batch(
+        self, trajectory_groups: list[TrajectoryGroup]
+    ) -> _BoundPreparedBatch:
+        retained = tuple(group._prepared_training_batch for group in trajectory_groups)
+        if any(item is not None for item in retained):
+            prepared = retained[0]
+            if (
+                not isinstance(prepared, _BoundPreparedBatch)
+                or any(item is not prepared for item in retained)
+                or prepared.groups != tuple(trajectory_groups)
+                or prepared.claimed
+            ):
+                raise RuntimeError("bound pipeline preparation changed ownership")
+        else:
+            prepared = await self._prepare_bound_batch(trajectory_groups)
+        prepared.claimed = True
+        for group in trajectory_groups:
+            group._prepared_training_batch = None
+        return prepared
+
+    async def _prepare_bound_batch(
+        self, trajectory_groups: list[TrajectoryGroup]
+    ) -> _BoundPreparedBatch:
+        from ..distributed.rollout import DistributedTrajectorySelection
+
+        if not trajectory_groups:
+            raise ValueError("Megatron training requires at least one group")
+        if any(
+            group._prepared_training_batch is not None for group in trajectory_groups
+        ):
+            raise RuntimeError("training batch is already prepared")
+        leases = tuple(group._distributed_lease for group in trajectory_groups)
+        selected = tuple(
+            lease
+            for lease in leases
+            if isinstance(lease, DistributedTrajectorySelection)
+        )
+        if selected and len(selected) != len(trajectory_groups):
+            raise RuntimeError("training batch mixes owned and controller groups")
+        queue = selected[0].queue if selected else None
+        if queue is not None and any(item.queue is not queue for item in selected):
+            raise RuntimeError("training batch spans trajectory queues")
+        for group, lease in zip(trajectory_groups, leases, strict=True):
+            if isinstance(lease, DistributedTrajectorySelection):
+                group._distributed_lease = None
+        try:
+            materialized = (
+                tuple(
+                    await asyncio.gather(
+                        *(queue.materialize_selection(item) for item in selected)
+                    )
+                )
+                if queue is not None
+                else tuple(trajectory_groups)
+            )
+        except BaseException:
+            if queue is not None:
+                await queue.release_selections(selected, disposition="discarded")
+            raise
+        prepared = _BoundPreparedBatch(
+            groups=tuple(trajectory_groups),
+            materialized=materialized,
+            selections=selected,
+            queue=queue,
+            packing_generation=uuid.uuid4().hex,
+        )
+        for group in trajectory_groups:
+            group._prepared_training_batch = prepared
+        return prepared
+
+    async def _release_bound_prepared(
+        self,
+        prepared: _BoundPreparedBatch,
+        *,
+        disposition: Literal["consumed", "discarded"],
+    ) -> None:
+        if prepared.released:
+            return
+        queue = prepared.queue
+        if queue is not None:
+            if disposition == "consumed" and not prepared.marked:
+                await queue.mark_packed(
+                    prepared.selections, prepared.packing_generation
+                )
+                prepared.marked = True
+            await queue.release_selections(
+                prepared.selections,
+                disposition=disposition,
+                generation_id=(
+                    prepared.packing_generation if prepared.marked else None
+                ),
+            )
+        prepared.released = True
+
+    async def _acknowledge_bound_operation(
+        self,
+        request: Any,
+        operation: Any,
+        acknowledged: set[str],
+    ) -> None:
+        operation_id = operation.ref.operation_id
+        if operation_id in acknowledged:
+            return
+        binding = self._training_binding
+        if binding is None:
+            raise RuntimeError("bound Megatron workflow lost its run binding")
+        if binding.outcome_sink is not None:
+            await binding.outcome_sink.retain_outcome(
+                request, await operation.outcome()
+            )
+        client = self._training_client
+        if client is None or client.run_id != operation.ref.run_id:
+            raise RuntimeError("bound Megatron client changed during acknowledgement")
+        await client.acknowledge_operation(operation_id)
+        acknowledged.add(operation_id)
 
     async def _train_sft(
         self,
@@ -956,6 +1163,13 @@ class MegatronBackend(LocalBackend):
 
         values = list(trajectories)
         if not values:
+            yield {
+                "data/step_num_trajectories": 0.0,
+                "data/step_trainable_assistant_tokens": 0.0,
+                "data/step_num_dropped_trajectories": 0.0,
+                "data/sft_zero_work": 1.0,
+                TRAIN_GRADIENT_STEPS_KEY: 0.0,
+            }
             return
         batch_size = resolve_sft_batch_size(
             batch_size=config.batch_size,
@@ -975,45 +1189,59 @@ class MegatronBackend(LocalBackend):
         client = await self.training_client(cast(TrainableModel, model))
         rows: list[dict[str, float]] = []
         final_step: int | None = None
+        gradient_steps = 0
         for batch, learning_rate in zip(batches, learning_rates, strict=True):
             request_id = secrets.token_hex(16)
-            operations = []
+            operations: list[tuple[Any, Any]] = []
+            acknowledged: set[str] = set()
             try:
-                forward = await client.forward_backward(
-                    ForwardBackwardRequest(
-                        run_id=client.run_id,
-                        request_id=f"sft-fb-{request_id}",
-                        sequence_id=client.next_sequence_id,
-                        batch=SupervisedTrajectoryBatch(
-                            trajectories=tuple(batch),
-                            assistant_turns=config.assistant_turns,
-                        ),
-                        loss=LossConfig(name="cross_entropy"),
-                        return_token_logprobs=False,
-                    )
+                forward_request = ForwardBackwardRequest(
+                    run_id=client.run_id,
+                    request_id=f"sft-fb-{request_id}",
+                    sequence_id=client.next_sequence_id,
+                    batch=SupervisedTrajectoryBatch(
+                        trajectories=tuple(batch),
+                        assistant_turns=config.assistant_turns,
+                    ),
+                    loss=LossConfig(name="cross_entropy"),
+                    return_token_logprobs=False,
                 )
-                operations.append(forward)
+                forward = await client.forward_backward(forward_request)
+                operations.append((forward_request, forward))
                 forward_result = await forward.result()
-                if not forward_result.produced_gradient:
-                    continue
-                optimizer = await client.optim_step(
-                    OptimStepRequest(
-                        run_id=client.run_id,
-                        request_id=f"sft-optim-{request_id}",
-                        sequence_id=client.next_sequence_id,
-                        optimizer=AdamConfig(
-                            learning_rate=learning_rate,
-                            weight_decay=0.0,
-                            grad_clip_norm=1.0,
-                        ),
-                    )
+                if not isinstance(forward_result, ForwardBackwardResult):
+                    raise TypeError("Megatron SFT F/B returned an invalid result")
+                await self._acknowledge_bound_operation(
+                    forward_request, forward, acknowledged
                 )
-                operations.append(optimizer)
+                if not forward_result.produced_gradient:
+                    rows.append(
+                        {
+                            **forward_result.metrics,
+                            "data/step_num_trajectories": float(len(batch)),
+                            "data/step_trainable_assistant_tokens": 0.0,
+                        }
+                    )
+                    continue
+                optimizer_request = OptimStepRequest(
+                    run_id=client.run_id,
+                    request_id=f"sft-optim-{request_id}",
+                    sequence_id=client.next_sequence_id,
+                    optimizer=AdamConfig(
+                        learning_rate=learning_rate,
+                        weight_decay=0.0,
+                        grad_clip_norm=1.0,
+                    ),
+                )
+                optimizer = await client.optim_step(optimizer_request)
+                operations.append((optimizer_request, optimizer))
                 optimizer_result = await optimizer.result()
-                if not isinstance(
-                    forward_result, ForwardBackwardResult
-                ) or not isinstance(optimizer_result, OptimStepResult):
-                    raise TypeError("Megatron SFT returned invalid command results")
+                if not isinstance(optimizer_result, OptimStepResult):
+                    raise TypeError("Megatron SFT optimizer returned an invalid result")
+                await self._acknowledge_bound_operation(
+                    optimizer_request, optimizer, acknowledged
+                )
+                gradient_steps += 1
                 final_step = optimizer_result.checkpoint.learner_version
                 rows.append(
                     {
@@ -1027,15 +1255,28 @@ class MegatronBackend(LocalBackend):
                     }
                 )
             finally:
-                for operation in operations:
+                failures: list[BaseException] = []
+                for request, operation in operations:
+                    if operation.ref.operation_id not in acknowledged:
+                        try:
+                            await self._acknowledge_bound_operation(
+                                request, operation, acknowledged
+                            )
+                        except BaseException as error:
+                            failures.append(error)
+                for _request, operation in operations:
+                    if operation.ref.operation_id not in acknowledged:
+                        continue
                     if not client.retire_operation(operation.ref.operation_id):
-                        raise RuntimeError(
-                            "completed SFT evidence still has live command lineage"
+                        failures.append(
+                            RuntimeError(
+                                "completed SFT evidence still has live command lineage"
+                            )
                         )
-        if final_step is None:
-            return
-        publication = await client.save_weights_for_sampler(
-            SaveWeightsForSamplerRequest(
+                if failures:
+                    raise BaseExceptionGroup("Megatron SFT cleanup failed", failures)
+        if final_step is not None:
+            publication_request = SaveWeightsForSamplerRequest(
                 run_id=client.run_id,
                 request_id=f"sft-publish-{secrets.token_hex(16)}",
                 sequence_id=client.next_sequence_id,
@@ -1045,19 +1286,27 @@ class MegatronBackend(LocalBackend):
                     model_alias=model.name,
                 ),
             )
-        )
-        try:
-            await publication.result()
-        finally:
-            if not client.retire_operation(publication.ref.operation_id):
-                raise RuntimeError(
-                    "completed SFT publication evidence is not retireable"
+            publication = await client.save_weights_for_sampler(publication_request)
+            acknowledged: set[str] = set()
+            try:
+                await publication.result()
+                await self._acknowledge_bound_operation(
+                    publication_request, publication, acknowledged
                 )
-        _PIPELINE_TRAIN_STEP.set(final_step)
-        if verbose:
-            print(f"Megatron SFT committed learner step {final_step}")
+            finally:
+                if publication.ref.operation_id not in acknowledged:
+                    await self._acknowledge_bound_operation(
+                        publication_request, publication, acknowledged
+                    )
+                if not client.retire_operation(publication.ref.operation_id):
+                    raise RuntimeError(
+                        "completed SFT publication evidence is not retireable"
+                    )
+            _PIPELINE_TRAIN_STEP.set(final_step)
+            if verbose:
+                print(f"Megatron SFT committed learner step {final_step}")
         for row in rows:
-            row[TRAIN_GRADIENT_STEPS_KEY] = float(len(rows))
+            row[TRAIN_GRADIENT_STEPS_KEY] = float(gradient_steps)
             yield row
 
     async def finalize_training_session(
@@ -1076,6 +1325,10 @@ class MegatronBackend(LocalBackend):
         *,
         expected_learner_version: int,
     ) -> ResidentLoraInspectionResult:
+        if self._training_binding is not None:
+            raise RuntimeError(
+                "resident inspection has no slot-owned diagnostic command boundary"
+            )
         from .distributed_service import DistributedMegatronService
 
         service = cast(DistributedMegatronService, await self._get_service(model))
@@ -1093,6 +1346,10 @@ class MegatronBackend(LocalBackend):
         top_k: int = 20,
         grad_accumulation_sequences: int | None = None,
     ) -> ResidentScoreResult:
+        if self._training_binding is not None:
+            raise RuntimeError(
+                "resident scoring has no slot-owned diagnostic command boundary"
+            )
         groups = list(trajectory_groups)
         if not groups or not any(group.trajectories for group in groups):
             raise ValueError("resident scoring requires at least one trajectory")
@@ -1214,34 +1471,29 @@ class MegatronBackend(LocalBackend):
 
     def supports_async_pipeline_packing(self, model: AnyTrainableModel) -> bool:
         del model
-        return self._training_binding is None
+        return True
 
     def _model_inference_name(self, model: Model, step: int | None = None) -> str:
         binding = self._training_binding
         if binding is not None:
-            from ..adapter_leases import in_flight_lora_name
+            from ..adapter_leases import pinned_inference_name
 
-            initial_step = binding.config.source.policy_step
-            current_step = (
-                self._training_client.projected_learner_version
-                if self._training_client is not None
-                else initial_step
-            )
-            requested_step = current_step if step is None else step
-            in_flight = (
-                isinstance(model, TrainableModel)
-                and (model._internal_config or {}).get("rollout_weight_update_mode")
-                == "in_flight_lora"
-            )
-            if in_flight:
-                if step is not None:
+            if pinned := pinned_inference_name(model.name, step):
+                return pinned
+            publisher = binding.publisher
+            if publisher is None:
+                raise RuntimeError("bound Megatron run has no paired publisher")
+            receipt = publisher.activated_publication(model.name, step)
+            if receipt is not None:
+                if step is not None and receipt.publication_mode == "in_flight_lora":
                     raise ValueError(
-                        "In-flight LoRA serving cannot address an immutable policy step"
+                        "In-flight LoRA serving requires an exact adapter lease"
                     )
-                if requested_step > initial_step:
-                    return in_flight_lora_name(model.name)
-            elif requested_step > initial_step:
-                return f"{model.name}@{requested_step}"
+                if receipt.runtime_lora_name is None:
+                    raise RuntimeError("paired publication omitted its serving name")
+                return receipt.runtime_lora_name
+            if step not in (None, 0) or binding.config.source.policy_step != 0:
+                raise RuntimeError("requested learner version is not activated")
             name = binding.config.rollout_model.payload.get("inference_model_name")
             if isinstance(name, str) and name:
                 return name
@@ -1253,9 +1505,41 @@ class MegatronBackend(LocalBackend):
         model: AnyTrainableModel,
         step: int,
     ) -> AsyncIterator[None]:
-        if self._training_binding is not None:
-            del model, step
-            yield
+        binding = self._training_binding
+        if binding is not None:
+            publisher = binding.publisher
+            if publisher is None:
+                raise RuntimeError("bound Megatron run has no paired publisher")
+            manager = self._adapter_lease_manager(model)
+            if step == 0 and publisher.activated_publication(model.name, step) is None:
+                from ..adapter_leases import pin_inference_target
+
+                async with (
+                    pin_inference_target(
+                        model.name,
+                        step=step,
+                        inference_name=binding.config.rollout_model.payload.get(
+                            "inference_model_name"
+                        ),
+                    ),
+                    manager.lease(step),
+                ):
+                    yield
+                return
+            from ..adapter_leases import pin_inference_target
+
+            receipt = publisher.activated_publication(model.name, step)
+            if receipt is None or receipt.runtime_lora_name is None:
+                raise RuntimeError("paired publication is not activated")
+            async with (
+                pin_inference_target(
+                    model.name,
+                    step=step,
+                    inference_name=receipt.runtime_lora_name,
+                ),
+                manager.lease(step),
+            ):
+                yield
             return
         from .distributed_service import DistributedMegatronService
 
@@ -1270,9 +1554,27 @@ class MegatronBackend(LocalBackend):
         model: AnyTrainableModel,
         step: int,
     ) -> AsyncIterator[None]:
-        if self._training_binding is not None:
-            del model, step
-            yield
+        binding = self._training_binding
+        if binding is not None:
+            publisher = binding.publisher
+            if publisher is None:
+                raise RuntimeError("bound Megatron run has no paired publisher")
+            from ..adapter_leases import pin_inference_target
+
+            async with publisher.exact_publication_lease(model.name, step) as receipt:
+                if receipt.runtime_lora_name is None:
+                    raise RuntimeError(
+                        "paired exact publication omitted its serving name"
+                    )
+                async with (
+                    pin_inference_target(
+                        model.name,
+                        step=step,
+                        inference_name=receipt.runtime_lora_name,
+                    ),
+                    self._adapter_lease_manager(model).lease(step),
+                ):
+                    yield
             return
         from .distributed_service import DistributedMegatronService
 
@@ -1282,6 +1584,10 @@ class MegatronBackend(LocalBackend):
             yield
 
     async def _get_service(self, model: TrainableModel) -> ModelService:
+        if self._training_binding is not None:
+            raise RuntimeError(
+                "a bound Megatron run cannot enter DistributedMegatronService"
+            )
         from ..dev.get_model_config import get_model_config
 
         storage_key = self._model_storage_key(model)
@@ -1792,7 +2098,7 @@ class MegatronBackend(LocalBackend):
         *,
         learner_parent_version: int,
         train_kwargs: dict[str, Any],
-    ) -> _MegatronPipelineCommandContext | None:
+    ) -> _MegatronPipelineCommandContext | _BoundPipelineCommandContext | None:
         supported = {
             "adam_params",
             "grad_accumulation_sequences",
@@ -1814,6 +2120,19 @@ class MegatronBackend(LocalBackend):
             raise ValueError("Megatron pipeline requires loss_fn_config=None")
         if train_kwargs.get("adam_params") is not None:
             raise ValueError("Megatron pipeline requires adam_params=None")
+        if self._training_binding is not None:
+            client = await self.training_client(model)
+            if client.projected_learner_version != learner_parent_version:
+                raise RuntimeError(
+                    "pipeline preparation learner lineage changed before materialization"
+                )
+            prepared = await self._prepare_bound_batch(trajectory_groups)
+            return _BoundPipelineCommandContext(
+                self,
+                model,
+                prepared,
+                train_kwargs=dict(train_kwargs),
+            )
         normalize_advantages = bool(train_kwargs.get("normalize_advantages", True))
         kl_reference_step = cast(
             int | None, train_kwargs.get("kl_penalty_reference_step")
@@ -1889,6 +2208,17 @@ class MegatronBackend(LocalBackend):
         self, trajectory_groups: list[TrajectoryGroup]
     ) -> None:
         prepared = trajectory_groups[0]._prepared_training_batch
+        if isinstance(prepared, _BoundPreparedBatch):
+            if any(
+                group._prepared_training_batch is not prepared
+                for group in trajectory_groups
+            ):
+                raise RuntimeError("bound pipeline batch preparation changed ownership")
+            prepared.claimed = True
+            for group in trajectory_groups:
+                group._prepared_training_batch = None
+            await self._release_bound_prepared(prepared, disposition="discarded")
+            return
         if not isinstance(prepared, _PipelinePreparedBatch) or any(
             group._prepared_training_batch is not prepared
             for group in trajectory_groups
@@ -2055,6 +2385,18 @@ class MegatronBackend(LocalBackend):
         *,
         retain_steps: set[int],
     ) -> None:
+        binding = self._training_binding
+        if binding is not None:
+            publisher = binding.publisher
+            if publisher is None:
+                raise RuntimeError("bound Megatron run has no paired publisher")
+            manager = self._adapter_lease_manager(model)
+            async with manager.prune_guard() as leased_steps:
+                await publisher.prune_versioned_adapters(
+                    model.name,
+                    retain_steps=set(retain_steps) | leased_steps,
+                )
+            return
         service = await self._get_service(cast(TrainableModel, model))
         if getattr(service, "rollout_weight_update_mode", None) == "in_flight_lora":
             return

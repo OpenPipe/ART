@@ -5,7 +5,7 @@ from dataclasses import dataclass
 import os
 from pathlib import Path
 import tempfile
-from typing import Any, Self, cast
+from typing import Any, Protocol, Self, cast
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -19,7 +19,13 @@ from art.runtime_attestation import (
     RuntimeArchitectureAttestation,
     RuntimeHostAttestation,
 )
-from art.training import TrainingInputResolver, TrainingRunSpec
+from art.training import (
+    CommandAdmission,
+    OperationExecutionOutcome,
+    RunCommand,
+    TrainingInputResolver,
+    TrainingRunSpec,
+)
 from art.types import MegatronRuntimeConfig
 from art.utils.output_dirs import get_step_checkpoint_dir
 from art.vllm_route_transport import RouteBundleReader
@@ -106,6 +112,25 @@ class MegatronRunBootstrapConfig(BaseModel):
 class MegatronRunBinding:
     run: MegatronSlotRun
     config: MegatronOperationConfig
+    coordinator: MegatronSlotCoordinator | None = None
+    publisher: MegatronPairedInferencePublisher | None = None
+    outcome_sink: MegatronOperationOutcomeSink | None = None
+
+
+class MegatronOperationOutcomeSink(Protocol):
+    """Durably acknowledge an operation before its local replay record retires."""
+
+    async def retain_admission(
+        self,
+        request: RunCommand,
+        admission: CommandAdmission,
+    ) -> None: ...
+
+    async def retain_outcome(
+        self,
+        request: RunCommand,
+        outcome: OperationExecutionOutcome,
+    ) -> None: ...
 
 
 @dataclass(slots=True)
@@ -122,6 +147,7 @@ class MegatronSlotRuntime:
         request: MegatronRunBootstrapConfig,
         *,
         checkpoints: MegatronCheckpointOperations | None = None,
+        outcome_sink: MegatronOperationOutcomeSink | None = None,
         max_retained_operations: int = 128,
         portable_archive: PortableSnapshotArchive | None = None,
         rollout_model: RolloutModelSpec | None = None,
@@ -139,7 +165,13 @@ class MegatronSlotRuntime:
             max_retained_operations=max_retained_operations,
             portable_archive=portable_archive,
         )
-        return MegatronRunBinding(run=run, config=config)
+        return MegatronRunBinding(
+            run=run,
+            config=config,
+            coordinator=self.coordinator,
+            publisher=self.paired_inference,
+            outcome_sink=outcome_sink,
+        )
 
     async def aclose(self) -> None:
         await self.runtime.close()

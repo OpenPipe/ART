@@ -1,4 +1,5 @@
 import asyncio
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 import hashlib
 import json
@@ -102,7 +103,12 @@ from art.vllm_route_transport import (
 
 
 def _packed_batch(
-    *, content_sha256: str | None = None, batch_id: str = "batch"
+    *,
+    content_sha256: str | None = None,
+    batch_id: str = "batch",
+    non_padding_tokens: int = 7,
+    loss_bearing_tokens: int = 4,
+    trainable_assistant_tokens: int = 4,
 ) -> DistributedPackedBatch:
     item_sizes = {
         "tokens": ("int64", 8),
@@ -149,9 +155,9 @@ def _packed_batch(
     return DistributedPackedBatch(
         leases=PackedBatchLeaseSet(ref=ref, host_refs={"host": ref}),
         packed_group_shapes=(),
-        trainable_assistant_tokens=4,
-        loss_bearing_tokens=4,
-        non_padding_tokens=7,
+        trainable_assistant_tokens=trainable_assistant_tokens,
+        loss_bearing_tokens=loss_bearing_tokens,
+        non_padding_tokens=non_padding_tokens,
         packing_generation_id="packing",
     )
 
@@ -233,6 +239,11 @@ class _Trainer:
         self.run_states: dict[str, TrainerCommandRunState] = {}
         self.migration_releases: list[str] = []
         self.optimizer_jobs = []
+        self.cp_lookaheads = []
+
+    async def prepare_cp_lookahead(self, batch, *, global_grad_accumulation_sequences):
+        self.cp_lookaheads.append((batch, global_grad_accumulation_sequences))
+        return {"time/step_cp_lookahead_wait_s": 0.25}
 
     async def prefetch_command_run_residency(self, run_id, components, learner_version):
         return {
@@ -356,6 +367,11 @@ class _Trainer:
                 "next_operation_sequence": state.next_operation_sequence + 1,
             }
         )
+
+    async def record_no_work_command(
+        self, operation: OperationRef, learner_version: int
+    ) -> None:
+        await self.record_control_command(operation, learner_version)
 
     async def release_command_run_for_migration(self, run_id: str) -> None:
         self.migration_releases.append(run_id)
@@ -825,6 +841,8 @@ async def test_local_client_resumes_sequence_and_retries_evidence_retirement() -
     )
     await operation.result()
 
+    with pytest.raises(RuntimeError, match="unconsumed local operation evidence"):
+        await client.close()
     with pytest.raises(RuntimeError, match="evidence store unavailable"):
         client.retire_operation(operation.ref.operation_id)
     assert client.operation_ids == (operation.ref.operation_id,)
@@ -1066,8 +1084,15 @@ async def test_handler_retains_f_b_input_until_optimizer_commit() -> None:
     assert result.checkpoint.learner_version == 1
     assert result.usage.gpu_count.value == 4
     assert result.usage.gpu_service_ns.value == 3_000_000
+    assert handler.retained_contribution_inputs() == (("fb", fb.packed_input_capture),)
+    assert runtime.released == []
+    with pytest.raises(RuntimeError, match="unacknowledged optimizer"):
+        handler.retire_operation("optim")
+
+    await handler.acknowledge_operation("optim")
     assert handler.retained_contribution_inputs() == ()
     assert runtime.released == [runtime.packed]
+    handler.retire_operation("optim")
 
     runtime.packed = _packed_batch()
     forward_request = ForwardRequest(
@@ -1482,8 +1507,37 @@ async def test_megatron_backend_lowers_rl_and_sft_through_one_bound_slot(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     class _Publisher:
+        def __init__(self) -> None:
+            self.receipts = {}
+            self.exact_leases = []
+
         async def aclose(self) -> None:
             pass
+
+        def activated_publication(self, alias, learner_version=None):
+            if learner_version is None:
+                matches = [
+                    receipt
+                    for (candidate, _step), receipt in self.receipts.items()
+                    if candidate == alias
+                ]
+                return max(matches, key=lambda item: item.learner_version, default=None)
+            return self.receipts.get((alias, learner_version))
+
+        @asynccontextmanager
+        async def exact_publication_lease(self, alias, learner_version):
+            self.exact_leases.append((alias, learner_version))
+            receipt = self.activated_publication(alias, learner_version)
+            if receipt is None:
+                raise RuntimeError("publication is not activated")
+            yield receipt
+
+        async def prune_versioned_adapters(self, alias, *, retain_steps):
+            self.receipts = {
+                key: receipt
+                for key, receipt in self.receipts.items()
+                if key[0] != alias or key[1] in retain_steps
+            }
 
         async def plan_artifacts(self, *_args, **_kwargs):
             return SimpleNamespace()
@@ -1507,7 +1561,7 @@ async def test_megatron_backend_lowers_rl_and_sft_through_one_bound_slot(
                 lora=f"{alias}@{generation.policy_step}",
                 metrics={POLICY_ACTIVATION_LAG_METRIC: 0.25},
             )
-            return MegatronSamplerPublicationReceipt(
+            receipt = MegatronSamplerPublicationReceipt(
                 operation_id=operation.operation_id,
                 request_id=request.request_id,
                 publication_mode=request.publication.mode,
@@ -1536,6 +1590,21 @@ async def test_megatron_backend_lowers_rl_and_sft_through_one_bound_slot(
                 ),
                 result=result,
             )
+            self.receipts[(alias, generation.policy_step)] = receipt
+            return receipt
+
+    class _OutcomeSink:
+        def __init__(self) -> None:
+            self.admissions = []
+            self.kinds = []
+
+        async def retain_admission(self, request, admission):
+            assert request.sequence_id == admission.ref.sequence_id
+            self.admissions.append(admission.ref.kind)
+
+        async def retain_outcome(self, request, outcome):
+            assert request.sequence_id == outcome.operation.sequence_id
+            self.kinds.append(outcome.operation.kind)
 
     class _Queue:
         def __init__(self, materialized: TrajectoryGroup) -> None:
@@ -1578,16 +1647,18 @@ async def test_megatron_backend_lowers_rl_and_sft_through_one_bound_slot(
     runtime = _Runtime()
     trainer = _Trainer()
     trainer.fail_optimizer = False
+    publisher = _Publisher()
+    sink = _OutcomeSink()
     slot = MegatronSlotCoordinator(  # type: ignore[arg-type]
         runtime,
         trainer,
-        publisher=_Publisher(),  # type: ignore[arg-type]
+        publisher=publisher,  # type: ignore[arg-type]
     )
     generation = TrainerGeneration(
         training_session_id="session",
-        policy_step=1,
-        generation_id=f"step-00000001-{'a' * 32}",
-        adapter_path="/adapter/1",
+        policy_step=0,
+        generation_id=f"step-00000000-{'a' * 32}",
+        adapter_path="/adapter/0",
     )
     model = TrainableModel(
         run_name="registered-slot-run",
@@ -1613,7 +1684,13 @@ async def test_megatron_backend_lowers_rl_and_sft_through_one_bound_slot(
     )
     run = await slot.register_run(operation_config)
     slot._runs["run"].handler._sft_tokenizer = _SftTokenizer()  # type: ignore[assignment]
-    binding = MegatronRunBinding(run=run, config=operation_config)
+    binding = MegatronRunBinding(
+        run=run,
+        config=operation_config,
+        coordinator=slot,
+        publisher=publisher,  # type: ignore[arg-type]
+        outcome_sink=sink,
+    )
     backend = MegatronBackend(path=str(tmp_path))
 
     async def bind_owned_training_run(bound_model, openai_config):
@@ -1631,12 +1708,12 @@ async def test_megatron_backend_lowers_rl_and_sft_through_one_bound_slot(
     await model.register(backend)
     assert model.run_id == "run"
     assert model.get_inference_name() == "registered-slot-run"
-    assert not backend.supports_async_pipeline_packing(model)
+    assert backend.supports_async_pipeline_packing(model)
 
     materialized = TrajectoryGroup(
         [
-            Trajectory(reward=1.0, initial_policy_version=1),
-            Trajectory(reward=0.0, initial_policy_version=1),
+            Trajectory(reward=1.0, initial_policy_version=0),
+            Trajectory(reward=0.0, initial_policy_version=0),
         ]
     )
     queue = _Queue(materialized)
@@ -1651,13 +1728,19 @@ async def test_megatron_backend_lowers_rl_and_sft_through_one_bound_slot(
         save_checkpoint=False,
     )
 
-    assert result.step == 2
-    assert model.get_inference_name() == "registered-slot-run@2"
+    assert result.step == 1
+    assert model.get_inference_name() == "registered-slot-run@1"
     assert queue.materializations == 1
     assert len(runtime.pack_requests) == 1
     assert len(queue.marked) == 1
     assert queue.released[0][1] == "consumed"
     assert trainer.optimizer_jobs[-1].contributing_forward_backward_operation_ids
+    async with backend.adapter_lease(model, 1):
+        assert model.get_inference_name() == "registered-slot-run@1"
+    assert publisher.exact_leases == []
+    async with backend.exact_adapter_lease(model, 1):
+        assert model.get_inference_name() == "registered-slot-run@1"
+    assert publisher.exact_leases == [("registered-slot-run", 1)]
     client = await backend.training_client(model)
     assert client.operation_ids == ()
 
@@ -1672,7 +1755,88 @@ async def test_megatron_backend_lowers_rl_and_sft_through_one_bound_slot(
     ]
     assert sft_metrics[0][TRAIN_GRADIENT_STEPS_KEY] == 1.0
     assert trainer.optimizer_jobs[-1].operation.kind == "optim_step"
-    assert client.projected_learner_version == 3
+    assert client.projected_learner_version == 2
+    assert client.operation_ids == ()
+    assert sink.kinds == [
+        "forward_backward",
+        "optim_step",
+        "save_sampler",
+        "forward_backward",
+        "optim_step",
+        "save_sampler",
+    ]
+    assert sink.admissions == sink.kinds
+
+    optimizer_count = len(trainer.optimizer_jobs)
+    runtime.packed = _packed_batch(
+        batch_id="zero-work",
+        loss_bearing_tokens=0,
+        trainable_assistant_tokens=0,
+    )
+    zero_rl = await backend.train(
+        model,
+        [TrajectoryGroup([Trajectory(initial_policy_version=2)])],
+        learning_rate=1e-5,
+        save_checkpoint=False,
+    )
+    assert zero_rl.step == 2
+    assert zero_rl.metrics[TRAIN_GRADIENT_STEPS_KEY] == 0.0
+    assert len(trainer.optimizer_jobs) == optimizer_count
+
+    class _ZeroSftTokenizer:
+        def tokenize(self, _model, _batch):
+            return SFTBatch(
+                trajectory_tensors=[],
+                learning_rate=0.0,
+                num_trajectories=0,
+                num_tokens=0,
+                num_trainable_tokens=0,
+            )
+
+    slot._runs["run"].handler._sft_tokenizer = _ZeroSftTokenizer()  # type: ignore[assignment]
+    zero_sft = [
+        metrics
+        async for metrics in backend._train_sft(
+            model,
+            [Trajectory()],
+            TrainSFTConfig(learning_rate=2e-5, batch_size=1),
+            {},
+        )
+    ]
+    assert len(zero_sft) == 1
+    assert zero_sft[0]["data/sft_zero_work"] == 1.0
+    assert zero_sft[0]["data/step_num_trajectories"] == 1.0
+    assert zero_sft[0]["data/step_trainable_assistant_tokens"] == 0.0
+    assert zero_sft[0][TRAIN_GRADIENT_STEPS_KEY] == 0.0
+    assert len(trainer.optimizer_jobs) == optimizer_count
+
+    runtime.packed = _packed_batch(batch_id="pipeline")
+    pipeline_materialized = TrajectoryGroup(
+        [Trajectory(reward=1.0, initial_policy_version=2)]
+    )
+    pipeline_queue = _Queue(pipeline_materialized)
+    pipeline_group = TrajectoryGroup()
+    pipeline_group._distributed_lease = DistributedTrajectorySelection(
+        pipeline_queue, SimpleNamespace()
+    )  # type: ignore[arg-type]
+    pack_count = len(runtime.pack_requests)
+    lookahead_count = len(trainer.cp_lookaheads)
+    context = await backend.prepare_pipeline_commands(
+        model,
+        [pipeline_group],
+        learner_parent_version=2,
+        train_kwargs={"learning_rate": 1e-5, "save_checkpoint": False},
+    )
+    assert context is not None
+    assert pipeline_queue.materializations == 1
+    assert len(runtime.pack_requests) == pack_count
+    assert len(trainer.cp_lookaheads) == lookahead_count
+    pipeline_result = await context.complete(None, None)
+    assert pipeline_result.step == 3
+    assert pipeline_queue.materializations == 1
+    assert len(runtime.pack_requests) == pack_count + 1
+    assert len(trainer.cp_lookaheads) == lookahead_count + 1
+    assert trainer.cp_lookaheads[-1] == (runtime.packed.leases, None)
     assert client.operation_ids == ()
     assert not backend._services
 

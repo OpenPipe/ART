@@ -74,7 +74,7 @@ class LocalMegatronTrainingOperation(Generic[ResultT]):
 
 
 class LocalMegatronTrainingClient:
-    """Serial oracle facade over the same slot worker used in production."""
+    """In-process command facade over the production slot worker."""
 
     def __init__(
         self,
@@ -83,6 +83,8 @@ class LocalMegatronTrainingClient:
         learner_version: int,
         initial_operation_sequence: int = 0,
         max_retained_operations: int = 128,
+        coordinator: object | None = None,
+        outcome_sink: object | None = None,
     ) -> None:
         if not 1 <= max_retained_operations <= 1024:
             raise ValueError("max_retained_operations must be between 1 and 1024")
@@ -93,6 +95,8 @@ class LocalMegatronTrainingClient:
             initial_operation_sequence=initial_operation_sequence,
         )
         self._max_retained_operations = max_retained_operations
+        self._coordinator = coordinator
+        self._outcome_sink = outcome_sink
         self._operations: dict[
             str, LocalMegatronTrainingOperation[OperationResult]
         ] = {}
@@ -108,6 +112,8 @@ class LocalMegatronTrainingClient:
         self._request_ids_by_operation: dict[str, str] = {}
         self._ledger_records: dict[str, tuple[str, CommandAdmission]] = {}
         self._terminal_operation_ids: set[str] = set()
+        self._awaiting_acknowledgement: set[str] = set()
+        self._acknowledged_operation_ids: set[str] = set()
         self._closed = False
 
     @classmethod
@@ -125,6 +131,8 @@ class LocalMegatronTrainingClient:
             learner_version=config.source.policy_step,
             initial_operation_sequence=config.initial_operation_sequence,
             max_retained_operations=max_retained_operations,
+            coordinator=binding.coordinator,
+            outcome_sink=binding.outcome_sink,
         )
 
     @property
@@ -220,16 +228,44 @@ class LocalMegatronTrainingClient:
             raise RuntimeError("cannot retire a nonterminal local operation")
         if operation_id in self._ledger_records:
             return False
+        if (
+            self._coordinator is not None or self._outcome_sink is not None
+        ) and operation_id not in self._acknowledged_operation_ids:
+            return False
         self._run.worker.retire(operation_id)
         request_id = self._request_ids_by_operation.pop(operation_id)
         self._requests.pop(request_id)
         self._retained_outcomes.pop(operation_id, None)
         self._terminal_operation_ids.discard(operation_id)
+        self._awaiting_acknowledgement.discard(operation_id)
+        self._acknowledged_operation_ids.discard(operation_id)
         self._operations.pop(operation_id)
         return True
 
+    async def acknowledge_operation(self, operation_id: str) -> None:
+        """Acknowledge externally retained evidence and release physical inputs."""
+
+        operation = self._operations.get(operation_id)
+        if operation is None:
+            if operation_id in self._acknowledged_operation_ids:
+                return
+            raise KeyError(f"local Megatron operation {operation_id!r} is unknown")
+        if not operation._completion.done():
+            raise RuntimeError("cannot acknowledge a nonterminal local operation")
+        if self._coordinator is not None:
+            acknowledge = getattr(self._coordinator, "acknowledge_operation", None)
+            if not callable(acknowledge):
+                raise RuntimeError("Megatron coordinator cannot acknowledge operations")
+            await acknowledge(self.run_id, operation_id)
+        self._awaiting_acknowledgement.discard(operation_id)
+        self._acknowledged_operation_ids.add(operation_id)
+
+    def retire_acknowledged_operations(self) -> None:
+        for operation_id in tuple(self._acknowledged_operation_ids):
+            self.retire_operation(operation_id)
+
     async def close(self) -> None:
-        if self._closed:
+        if self._closed and not self._operations:
             return
         self._closed = True
         pending = tuple(
@@ -240,18 +276,10 @@ class LocalMegatronTrainingClient:
         for task in pending:
             task.cancel()
         await asyncio.gather(*pending, return_exceptions=True)
-        failures: list[BaseException] = []
-        for operation_id in tuple(self._operations):
-            try:
-                if not self.retire_operation(operation_id):
-                    raise RuntimeError(
-                        "cannot close with retained open F/B command evidence"
-                    )
-            except BaseException as error:
-                failures.append(error)
-        if failures:
-            raise BaseExceptionGroup(
-                "local Megatron evidence retirement failed", failures
+        if self._operations:
+            raise RuntimeError(
+                "cannot close with unconsumed local operation evidence; "
+                "persist and retire every terminal outcome first"
             )
 
     async def _submit(
@@ -269,11 +297,20 @@ class LocalMegatronTrainingClient:
             if prior_request != request or prior_kind != kind:
                 raise RuntimeError("request_id was reused for a different command")
             return cast(LocalMegatronTrainingOperation[ResultT], prior_operation)
+        if self._awaiting_acknowledgement:
+            raise RuntimeError(
+                "prior terminal operation requires durable acknowledgement"
+            )
         if len(self._operations) >= self._max_retained_operations:
             raise RuntimeError(
                 "local operation replay window is full; retire consumed evidence"
             )
         admission = await self._ledger.admit(request, kind=kind)
+        if self._outcome_sink is not None:
+            retain_admission = getattr(self._outcome_sink, "retain_admission", None)
+            if not callable(retain_admission):
+                raise RuntimeError("operation outcome sink cannot retain admission")
+            await retain_admission(request, admission)
         prior = self._operations.get(admission.ref.operation_id)
         if prior is not None:
             return cast(LocalMegatronTrainingOperation[ResultT], prior)
@@ -305,6 +342,8 @@ class LocalMegatronTrainingClient:
                 raise
             finally:
                 self._terminal_operation_ids.add(admission.ref.operation_id)
+                if self._coordinator is not None or self._outcome_sink is not None:
+                    self._awaiting_acknowledgement.add(admission.ref.operation_id)
                 self._retire_terminal_ledger_records()
 
         completion = asyncio.create_task(

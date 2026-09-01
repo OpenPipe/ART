@@ -307,6 +307,13 @@ class _CapturedInput:
 class _ResidentTrainer(Protocol):
     runtime_spec: Any
 
+    async def prepare_cp_lookahead(
+        self,
+        batch: Any,
+        *,
+        global_grad_accumulation_sequences: int | None,
+    ) -> dict[str, float]: ...
+
     async def forward(self, job: ForwardJobSpec, batch: Any) -> dict[str, Any]: ...
 
     async def start_forward(
@@ -410,6 +417,7 @@ class MegatronOperationHandler:
         self._captures: dict[str, _CapturedInput] = {}
         self._released_captures: dict[str, PackedInputCaptureRef] = {}
         self._contributions: dict[str, str] = {}
+        self._pending_optimizer_acknowledgements: dict[str, tuple[str, ...]] = {}
         self._capture_lock = asyncio.Lock()
         self._release_failures: dict[str, BaseException] = {}
         self._sampler_publications: dict[str, MegatronSamplerPublicationReceipt] = {}
@@ -933,6 +941,25 @@ class MegatronOperationHandler:
     async def packing_for(self, ref: PackedInputCaptureRef) -> PackingOutcome:
         return (await self._require_capture(ref, None)).packing
 
+    async def prepare_cp_lookahead(
+        self,
+        request: ForwardRequest | ForwardBackwardRequest,
+        operation: OperationRef,
+        ref: PackedInputCaptureRef,
+    ) -> None:
+        """Preplan CP from the exact packed lease that the command will execute."""
+
+        captured = await self._require_capture(ref, operation)
+        if captured.packed is None:
+            return
+        config = _train_config(self.config.train_config, request)
+        captured.input_metrics.update(
+            await self.trainer.prepare_cp_lookahead(
+                captured.packed.leases,
+                global_grad_accumulation_sequences=(config.grad_accumulation_sequences),
+            )
+        )
+
     async def capture_forward_backward_numerics(
         self, operation_id: str, root: str
     ) -> ForwardBackwardNumericalCaptureReceipt:
@@ -1017,7 +1044,27 @@ class MegatronOperationHandler:
         return self._sampler_publications.get(operation_id)
 
     def retire_operation(self, operation_id: str) -> None:
+        if operation_id in self._pending_optimizer_acknowledgements:
+            raise RuntimeError("cannot retire an unacknowledged optimizer operation")
         self._sampler_publications.pop(operation_id, None)
+
+    async def acknowledge_operation(self, operation_id: str) -> None:
+        """Release optimizer inputs only after the terminal outcome is durable."""
+
+        contributions = self._pending_optimizer_acknowledgements.get(operation_id)
+        if contributions is None:
+            return
+        release_ids: set[str] = set()
+        for contribution in contributions:
+            capture_id = self._contributions.get(contribution)
+            if capture_id is None:
+                raise RuntimeError("optimizer acknowledgement lost an input capture")
+            self._contributions.pop(contribution)
+            self._captures[capture_id].owners.discard(contribution)
+            release_ids.add(capture_id)
+        for capture_id in release_ids:
+            await self._release_if_unowned(capture_id)
+        self._pending_optimizer_acknowledgements.pop(operation_id)
 
     async def plan_artifacts(self, request: RunCommand) -> MegatronArtifactResourcePlan:
         if not isinstance(
@@ -1244,6 +1291,8 @@ class MegatronOperationHandler:
         operation: OperationRef,
         contributions: tuple[str, ...],
     ) -> OptimStepResult:
+        if self._pending_optimizer_acknowledgements:
+            raise RuntimeError("another optimizer operation still awaits durable ack")
         missing = [item for item in contributions if item not in self._contributions]
         if missing:
             raise ValueError(f"optimizer input captures are missing: {missing}")
@@ -1268,13 +1317,7 @@ class MegatronOperationHandler:
         if consumed != contributions:
             raise RuntimeError("trainer consumed the wrong packed-input captures")
         self._generation = generation
-        release_ids = set()
-        for contribution in contributions:
-            capture_id = self._contributions.pop(contribution)
-            self._captures[capture_id].owners.discard(contribution)
-            release_ids.add(capture_id)
-        for capture_id in release_ids:
-            await self._release_if_unowned(capture_id)
+        self._pending_optimizer_acknowledgements[operation.operation_id] = contributions
         return OptimStepResult(
             operation_id=operation.operation_id,
             contributing_forward_backward_operation_ids=contributions,

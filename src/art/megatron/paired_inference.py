@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import asyncio
+from collections import Counter
+from contextlib import asynccontextmanager
 import hashlib
 from http import HTTPStatus
 import json
 import math
 from pathlib import Path
 import time
-from typing import Any, Literal, cast
+from typing import Any, AsyncIterator, Literal, cast
+import uuid
 
 import httpx
 
@@ -76,6 +79,17 @@ class MegatronPairedInferencePublisher:
         self._lock = asyncio.Lock()
         self._active_generations: dict[str, str] = {}
         self._retained_transfers: dict[str, tuple[Any, str]] = {}
+        self._retained_adapter_paths: dict[str, str] = {}
+        self._activated_publications: dict[
+            tuple[str, int], MegatronSamplerPublicationReceipt
+        ] = {}
+        self._latest_activated_publications: dict[
+            str, MegatronSamplerPublicationReceipt
+        ] = {}
+        self._exact_evaluation_publications: dict[
+            tuple[str, int], MegatronSamplerPublicationReceipt
+        ] = {}
+        self._activated_publication_leases: Counter[tuple[str, int]] = Counter()
         self._closed = False
 
     @classmethod
@@ -153,6 +167,42 @@ class MegatronPairedInferencePublisher:
             api_key=_api_key(config),
         )
 
+    def activated_publication(
+        self,
+        public_alias: str,
+        learner_version: int | None = None,
+    ) -> MegatronSamplerPublicationReceipt | None:
+        """Return the exact retained receipt for an activated public alias."""
+
+        self._require_open()
+        if learner_version is None:
+            return self._latest_activated_publications.get(public_alias)
+        return self._activated_publications.get((public_alias, learner_version))
+
+    @asynccontextmanager
+    async def exact_publication_lease(
+        self,
+        public_alias: str,
+        learner_version: int,
+    ) -> AsyncIterator[MegatronSamplerPublicationReceipt]:
+        """Lease the exact immutable holder alias for one activated learner."""
+
+        key = (public_alias, learner_version)
+        async with self._lock:
+            self._require_open()
+            receipt = self._activated_publications.get(key)
+            if receipt is None:
+                raise RuntimeError(
+                    "paired inference has no activated publication for "
+                    f"{public_alias!r} at learner version {learner_version}"
+                )
+            receipt = await self._acquire_exact_publication(key, receipt)
+        try:
+            yield receipt
+        finally:
+            async with self._lock:
+                await self._release_exact_publication(key, receipt)
+
     async def save_weights_for_sampler(
         self,
         request: SaveWeightsForSamplerRequest,
@@ -168,8 +218,35 @@ class MegatronPairedInferencePublisher:
         alias = request.publication.model_alias
         if alias is None:
             raise ValueError("paired publication requires a model alias")
+        publication_mode = cast(
+            Literal["versioned_lora", "in_flight_lora"], request.publication.mode
+        )
+        runtime_lora_name = (
+            in_flight_lora_name(alias)
+            if publication_mode == "in_flight_lora"
+            else f"{alias}@{generation.policy_step}"
+        )
+        publication_key = (alias, generation.policy_step)
         async with self._lock:
             self._require_open()
+            prior = self._activated_publications.get(publication_key)
+            if prior is not None:
+                if (
+                    prior.operation_id != operation.operation_id
+                    or prior.request_id != request.request_id
+                ):
+                    raise RuntimeError("learner publication identity changed")
+                prior.validate_command(request, operation, generation)
+                if prior.result.checkpoint.checkpoint_id != request.checkpoint_name:
+                    raise RuntimeError(
+                        "sampler publication receipt changed checkpoint identity"
+                    )
+                return prior
+            latest = self._latest_activated_publications.get(alias)
+            if latest is not None and generation.policy_step <= latest.learner_version:
+                raise RuntimeError(
+                    "paired publication learner lineage is not monotonic"
+                )
             manager = self.runtime.model_service(self.service.name)
             await self._release_pending_transfers()
             targets = await manager.prepare_adapter_transfer(
@@ -213,6 +290,7 @@ class MegatronPairedInferencePublisher:
                         manager.release_adapter_transfer(generation.generation_id)
                     )
                 except BaseException as cleanup_error:
+                    self._retain_pending_transfer(manager, generation.generation_id)
                     error.add_note(
                         "paired adapter transfer cleanup also failed: "
                         f"{type(cleanup_error).__name__}: {cleanup_error}"
@@ -220,14 +298,9 @@ class MegatronPairedInferencePublisher:
                 raise
 
             trainer_completed = time.monotonic()
-            runtime_lora_name = (
-                in_flight_lora_name(alias)
-                if request.publication.mode == "in_flight_lora"
-                else f"{alias}@{generation.policy_step}"
-            )
             expected_generation = (
                 self._active_generations.get(runtime_lora_name)
-                if request.publication.mode == "in_flight_lora"
+                if publication_mode == "in_flight_lora"
                 else None
             )
             payload: dict[str, object] = {
@@ -258,26 +331,13 @@ class MegatronPairedInferencePublisher:
                         manager.release_adapter_transfer(generation.generation_id)
                     )
                 except BaseException as cleanup_error:
+                    self._retain_pending_transfer(manager, generation.generation_id)
                     error.add_note(
                         "paired adapter transfer cleanup also failed: "
                         f"{type(cleanup_error).__name__}: {cleanup_error}"
                     )
                 raise
-            self._active_generations[runtime_lora_name] = generation.generation_id
             activated = time.monotonic()
-            if request.publication.mode == "versioned_lora":
-                self._retained_transfers[runtime_lora_name] = (
-                    manager,
-                    generation.generation_id,
-                )
-            else:
-                try:
-                    await manager.release_adapter_transfer(generation.generation_id)
-                except BaseException:
-                    self._retained_transfers[
-                        f"release-pending:{generation.generation_id}"
-                    ] = (manager, generation.generation_id)
-
             lag = MegatronPolicyActivationTiming(
                 trainer_completed_monotonic_s=trainer_completed,
                 serving_activated_monotonic_s=activated,
@@ -295,13 +355,10 @@ class MegatronPairedInferencePublisher:
                     separators=(",", ":"),
                 ).encode()
             ).hexdigest()
-            return MegatronSamplerPublicationReceipt(
+            receipt = MegatronSamplerPublicationReceipt(
                 operation_id=operation.operation_id,
                 request_id=request.request_id,
-                publication_mode=cast(
-                    Literal["versioned_lora", "in_flight_lora"],
-                    request.publication.mode,
-                ),
+                publication_mode=publication_mode,
                 requested_public_alias=alias,
                 runtime_model_name=self.service.base_model,
                 runtime_lora_name=runtime_lora_name,
@@ -342,6 +399,77 @@ class MegatronPairedInferencePublisher:
                     },
                 ),
             )
+            retained_path = map_checkpoint_path_for_vllm(self.config, checkpoint)
+            prior_transfer = self._retained_transfers.get(runtime_lora_name)
+            self._active_generations[runtime_lora_name] = generation.generation_id
+            self._retained_transfers[runtime_lora_name] = (
+                manager,
+                generation.generation_id,
+            )
+            self._retained_adapter_paths[runtime_lora_name] = retained_path
+            self._record_activated_publication(receipt)
+
+            transfer_to_release = (
+                prior_transfer
+                if prior_transfer is not None
+                and prior_transfer[1] != generation.generation_id
+                else None
+            )
+            if transfer_to_release is not None:
+                release_manager, release_generation = transfer_to_release
+                try:
+                    await release_manager.release_adapter_transfer(release_generation)
+                except BaseException:
+                    self._retain_pending_transfer(release_manager, release_generation)
+            return receipt
+
+    async def prune_versioned_adapters(
+        self,
+        public_alias: str,
+        *,
+        retain_steps: set[int],
+    ) -> None:
+        """Unload unprotected publisher-owned versioned adapters."""
+
+        async with self._lock:
+            self._require_open()
+            await self._release_pending_transfers()
+            protected = set(retain_steps)
+            latest = self._latest_activated_publications.get(public_alias)
+            if latest is not None and latest.publication_mode == "versioned_lora":
+                protected.add(latest.learner_version)
+            protected.update(
+                step
+                for (alias, step), count in self._activated_publication_leases.items()
+                if alias == public_alias and count > 0
+            )
+            candidates = sorted(
+                (
+                    (key, receipt)
+                    for key, receipt in self._activated_publications.items()
+                    if key[0] == public_alias
+                    and receipt.publication_mode == "versioned_lora"
+                    and key[1] not in protected
+                ),
+                key=lambda item: item[0][1],
+            )
+            for key, receipt in candidates:
+                runtime_lora_name = self._validate_prunable_publication(key, receipt)
+                manager, generation_id = self._retained_transfers[runtime_lora_name]
+                await self._post_unload(runtime_lora_name)
+                self._activated_publications.pop(key)
+                if (
+                    self._active_generations.get(runtime_lora_name)
+                    == receipt.serving_generation_id
+                ):
+                    self._active_generations.pop(runtime_lora_name)
+                self._retained_transfers.pop(runtime_lora_name)
+                self._retained_adapter_paths.pop(runtime_lora_name, None)
+                try:
+                    await manager.release_adapter_transfer(generation_id)
+                except BaseException:
+                    self._retain_pending_transfer(manager, generation_id)
+                    raise
 
     async def plan_artifacts(
         self,
@@ -367,12 +495,33 @@ class MegatronPairedInferencePublisher:
 
     async def aclose(self) -> None:
         async with self._lock:
-            if self._closed:
+            if self._closed and not self._retained_transfers:
                 return
+            if self._activated_publication_leases:
+                raise RuntimeError(
+                    "cannot close paired inference with activated publication leases"
+                )
+            if self._exact_evaluation_publications:
+                raise RuntimeError(
+                    "cannot close paired inference with materialized exact adapters"
+                )
             self._closed = True
-            retained, self._retained_transfers = self._retained_transfers, {}
-            for manager, generation_id in retained.values():
-                await manager.release_adapter_transfer(generation_id)
+            await self._release_transfers(tuple(self._retained_transfers.items()))
+            self._active_generations.clear()
+            self._retained_adapter_paths.clear()
+            self._activated_publications.clear()
+            self._latest_activated_publications.clear()
+
+    async def _post_unload(self, runtime_lora_name: str) -> None:
+        url = f"{self.service.leader_endpoint.url.rstrip('/')}/v1/unload_lora_adapter"
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.post(
+                url,
+                json={"lora_name": runtime_lora_name},
+                headers=_headers(self.api_key),
+            )
+        if response.status_code != HTTPStatus.NOT_FOUND.value:
+            response.raise_for_status()
 
     async def _post_update(self, payload: dict[str, object]) -> dict[str, object]:
         url = f"{self.service.leader_endpoint.url}/art/in_flight_lora_update"
@@ -442,11 +591,242 @@ class MegatronPairedInferencePublisher:
             await asyncio.sleep(0.05)
 
     async def _release_pending_transfers(self) -> None:
-        for name, (manager, generation_id) in tuple(self._retained_transfers.items()):
-            if not name.startswith("release-pending:"):
-                continue
-            await manager.release_adapter_transfer(generation_id)
-            self._retained_transfers.pop(name)
+        pending = tuple(
+            item
+            for item in self._retained_transfers.items()
+            if item[0].startswith("release-pending:")
+        )
+        await self._release_transfers(pending)
+
+    async def _release_transfers(
+        self,
+        retained: tuple[tuple[str, tuple[Any, str]], ...],
+    ) -> None:
+        failures: list[BaseException] = []
+        for name, transfer in retained:
+            manager, generation_id = transfer
+            try:
+                await manager.release_adapter_transfer(generation_id)
+            except BaseException as error:
+                failures.append(error)
+            else:
+                if self._retained_transfers.get(name) == transfer:
+                    self._retained_transfers.pop(name)
+        if failures:
+            raise BaseExceptionGroup("paired adapter transfer cleanup failed", failures)
+
+    def _retain_pending_transfer(self, manager: Any, generation_id: str) -> None:
+        key = f"release-pending:{generation_id}"
+        pending = self._retained_transfers.get(key)
+        transfer = (manager, generation_id)
+        if pending is not None and pending != transfer:
+            raise RuntimeError("paired pending transfer ownership changed")
+        self._retained_transfers[key] = transfer
+
+    def _record_activated_publication(
+        self, receipt: MegatronSamplerPublicationReceipt
+    ) -> None:
+        alias = receipt.requested_public_alias
+        key = (alias, receipt.learner_version)
+        runtime_lora_name = receipt.runtime_lora_name
+        if (
+            runtime_lora_name is None
+            or self._active_generations.get(runtime_lora_name)
+            != receipt.serving_generation_id
+        ):
+            raise RuntimeError("paired publication activation lineage changed")
+        if receipt.publication_mode == "versioned_lora":
+            transfer = self._retained_transfers.get(runtime_lora_name)
+            if transfer is None or transfer[1] != receipt.serving_generation_id:
+                raise RuntimeError("paired publication transfer ownership changed")
+
+        previous = self._latest_activated_publications.get(alias)
+        if (
+            previous is not None
+            and previous.publication_mode == "in_flight_lora"
+            and (previous.requested_public_alias, previous.learner_version) != key
+        ):
+            previous_key = (
+                previous.requested_public_alias,
+                previous.learner_version,
+            )
+            if not self._activated_publication_leases.get(previous_key, 0):
+                self._activated_publications.pop(previous_key, None)
+        self._activated_publications[key] = receipt
+        self._latest_activated_publications[alias] = receipt
+
+    async def _acquire_exact_publication(
+        self,
+        key: tuple[str, int],
+        receipt: MegatronSamplerPublicationReceipt,
+    ) -> MegatronSamplerPublicationReceipt:
+        if receipt.publication_mode == "versioned_lora":
+            self._validate_retained_versioned_publication(key, receipt)
+            self._activated_publication_leases[key] += 1
+            return receipt
+
+        existing = self._exact_evaluation_publications.get(key)
+        if existing is not None:
+            self._validate_exact_evaluation_publication(key, receipt, existing)
+            self._activated_publication_leases[key] += 1
+            return existing
+
+        await self._release_pending_transfers()
+        runtime_lora_name = receipt.runtime_lora_name
+        if (
+            receipt.publication_mode != "in_flight_lora"
+            or self._latest_activated_publications.get(key[0]) is not receipt
+            or runtime_lora_name is None
+            or receipt.requested_public_alias != key[0]
+            or receipt.learner_version != key[1]
+            or self._active_generations.get(runtime_lora_name)
+            != receipt.serving_generation_id
+        ):
+            raise RuntimeError("in-flight publication is no longer active")
+
+        transfer = self._retained_transfers.get(runtime_lora_name)
+        path = self._retained_adapter_paths.get(runtime_lora_name)
+        if (
+            transfer is None
+            or transfer[1] != receipt.serving_generation_id
+            or path is None
+        ):
+            raise RuntimeError("in-flight publication generation is not retained")
+
+        exact_name = f"{key[0]}:eval@{key[1]}"
+        if exact_name in self._active_generations:
+            raise RuntimeError("paired exact adapter slot ownership is ambiguous")
+        payload: dict[str, object] = {
+            "operation_id": uuid.uuid4().hex,
+            "model_name": exact_name,
+            "lora_slot": exact_name,
+            "lora_path": path,
+            "generation_id": receipt.serving_generation_id,
+            "expected_generation_id": None,
+            "policy_version": receipt.learner_version,
+        }
+        try:
+            response = await self._post_update(payload)
+            if (
+                response.get("generation_id") != receipt.serving_generation_id
+                or response.get("lora_slot") != exact_name
+                or _response_int(response, "policy_version") != receipt.learner_version
+            ):
+                transfer[0].quarantine(
+                    "paired exact holder returned another generation"
+                )
+                raise RuntimeError("paired exact holder changed policy identity")
+            exact_receipt = receipt.model_copy(
+                update={
+                    "runtime_lora_name": exact_name,
+                    "holder_update_sequence": _response_int(response, "update_seq"),
+                    "holder_update_id": str(response["update_identity"]),
+                    "result": receipt.result.model_copy(update={"lora": exact_name}),
+                }
+            )
+        except BaseException as error:
+            try:
+                await asyncio.shield(self._post_unload(exact_name))
+            except BaseException as cleanup_error:
+                transfer[0].quarantine("paired exact adapter cleanup failed")
+                error.add_note(
+                    "paired exact adapter cleanup also failed: "
+                    f"{type(cleanup_error).__name__}: {cleanup_error}"
+                )
+            raise
+        self._active_generations[exact_name] = receipt.serving_generation_id
+        self._exact_evaluation_publications[key] = exact_receipt
+        self._activated_publication_leases[key] = 1
+        return exact_receipt
+
+    async def _release_exact_publication(
+        self,
+        key: tuple[str, int],
+        receipt: MegatronSamplerPublicationReceipt,
+    ) -> None:
+        count = self._activated_publication_leases.get(key, 0)
+        if count <= 0:
+            raise RuntimeError("paired exact adapter lease ownership changed")
+        exact = self._exact_evaluation_publications.get(key)
+        if exact is None:
+            if receipt.publication_mode != "versioned_lora":
+                raise RuntimeError("paired exact adapter lease ownership changed")
+            self._validate_retained_versioned_publication(key, receipt)
+            if count == 1:
+                self._activated_publication_leases.pop(key)
+            else:
+                self._activated_publication_leases[key] = count - 1
+            return
+        self._validate_exact_evaluation_publication(
+            key, self._activated_publications.get(key), exact
+        )
+        if receipt != exact:
+            raise RuntimeError("paired exact adapter receipt changed")
+        if count > 1:
+            self._activated_publication_leases[key] = count - 1
+            return
+
+        exact_name = cast(str, exact.runtime_lora_name)
+        await self._post_unload(exact_name)
+        self._activated_publication_leases.pop(key)
+        self._exact_evaluation_publications.pop(key)
+        if self._active_generations.get(exact_name) == exact.serving_generation_id:
+            self._active_generations.pop(exact_name)
+        publication = self._activated_publications.get(key)
+        if self._latest_activated_publications.get(key[0]) is not publication:
+            self._activated_publications.pop(key, None)
+
+    def _validate_exact_evaluation_publication(
+        self,
+        key: tuple[str, int],
+        publication: MegatronSamplerPublicationReceipt | None,
+        exact: MegatronSamplerPublicationReceipt,
+    ) -> None:
+        alias, learner_version = key
+        exact_name = f"{alias}:eval@{learner_version}"
+        if (
+            publication is None
+            or publication.publication_mode != "in_flight_lora"
+            or publication.requested_public_alias != alias
+            or publication.learner_version != learner_version
+            or exact.runtime_lora_name != exact_name
+            or exact.serving_generation_id != publication.serving_generation_id
+            or exact.learner_version != learner_version
+            or self._active_generations.get(exact_name) != exact.serving_generation_id
+        ):
+            raise RuntimeError("paired exact adapter generation changed")
+
+    def _validate_prunable_publication(
+        self,
+        key: tuple[str, int],
+        receipt: MegatronSamplerPublicationReceipt,
+    ) -> str:
+        if self._activated_publication_leases.get(key, 0):
+            raise RuntimeError("cannot prune a leased paired publication")
+        if self._latest_activated_publications.get(key[0]) is receipt:
+            raise RuntimeError("cannot prune the current paired publication")
+        return self._validate_retained_versioned_publication(key, receipt)
+
+    def _validate_retained_versioned_publication(
+        self,
+        key: tuple[str, int],
+        receipt: MegatronSamplerPublicationReceipt,
+    ) -> str:
+        alias, learner_version = key
+        runtime_lora_name = receipt.runtime_lora_name
+        if (
+            receipt.publication_mode != "versioned_lora"
+            or receipt.requested_public_alias != alias
+            or receipt.learner_version != learner_version
+            or runtime_lora_name != f"{alias}@{learner_version}"
+            or self._active_generations.get(runtime_lora_name)
+            != receipt.serving_generation_id
+        ):
+            raise RuntimeError("paired versioned publication lineage changed")
+        transfer = self._retained_transfers.get(runtime_lora_name)
+        if transfer is None or transfer[1] != receipt.serving_generation_id:
+            raise RuntimeError("paired versioned publication ownership changed")
+        return cast(str, runtime_lora_name)
 
     def _require_open(self) -> None:
         if self._closed:
