@@ -88,6 +88,25 @@ class ResidencyCopy(BaseModel):
     ready_at: float = Field(ge=0.0)
 
 
+class ResidencyL1ReloadReceipt(BaseModel):
+    """Exact lower-tier reload paired with the preceding L1 eviction."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    source: Literal["l2_cpu", "l3_nvme"]
+    byte_count: int = Field(ge=1)
+    eviction_sequence: int = Field(ge=1)
+    reload_sequence: int = Field(ge=2)
+    source_immutable_ref: str | None = Field(default=None, min_length=1)
+    source_digest: str | None = Field(default=None, min_length=1)
+
+    @model_validator(mode="after")
+    def _validate_sequence(self) -> "ResidencyL1ReloadReceipt":
+        if self.reload_sequence <= self.eviction_sequence:
+            raise ValueError("L1 reload must follow its paired eviction")
+        return self
+
+
 class ResidencyEntry(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -95,6 +114,7 @@ class ResidencyEntry(BaseModel):
     copies: tuple[ResidencyCopy, ...]
     pin_counts: dict[ResidencyTier, int]
     last_access: float = Field(ge=0.0)
+    last_l1_reload: ResidencyL1ReloadReceipt | None = None
 
 
 class ResidencyReservation(BaseModel):
@@ -135,6 +155,9 @@ class ResidencyLedger:
         self._reservations: dict[str, ResidencyReservation] = {}
         self._ready_bytes = {tier: 0 for tier in RESIDENCY_TIERS}
         self._reserved_bytes = {tier: 0 for tier in RESIDENCY_TIERS}
+        self._transition_sequence = 0
+        self._l1_evictions: dict[ResidencyKey, int] = {}
+        self._l1_reloads: dict[ResidencyKey, ResidencyL1ReloadReceipt] = {}
         self._lock = Lock()
 
     def reserve(
@@ -240,6 +263,7 @@ class ResidencyLedger:
             self._ready_bytes[current.target] += current.byte_count
             self._reservations.pop(current.reservation_id)
             self._last_access[current.key] = now
+            self._record_l1_reload(current)
             return copy
 
     def abort(self, reservation: ResidencyReservation) -> None:
@@ -273,6 +297,7 @@ class ResidencyLedger:
                 self._ready_bytes[item.target] += item.byte_count
                 self._reservations.pop(item.reservation_id)
                 self._last_access[item.key] = now
+                self._record_l1_reload(item)
             return copies
 
     def abort_many(self, reservations: Iterable[ResidencyReservation]) -> None:
@@ -309,10 +334,16 @@ class ResidencyLedger:
                 raise RuntimeError("cannot drop the only ready residency copy")
             copy = copies.pop(tier)
             self._ready_bytes[tier] -= copy.byte_count
+            if tier == "l1_gpu" and not deleting_entry:
+                self._transition_sequence += 1
+                self._l1_evictions[key] = self._transition_sequence
+                self._l1_reloads.pop(key, None)
             if not copies:
                 self._copies.pop(key)
                 self._last_access.pop(key, None)
                 self._pins.pop(key, None)
+                self._l1_evictions.pop(key, None)
+                self._l1_reloads.pop(key, None)
 
     def advance(
         self,
@@ -371,6 +402,8 @@ class ResidencyLedger:
                 self._ready_bytes[tier] -= copy.byte_count
             self._last_access.pop(key, None)
             self._pins.pop(key, None)
+            self._l1_evictions.pop(key, None)
+            self._l1_reloads.pop(key, None)
 
     def has_copy(self, key: ResidencyKey, tier: ResidencyTier) -> bool:
         with self._lock:
@@ -559,6 +592,7 @@ class ResidencyLedger:
                     tier: self._pin_count(key, tier) for tier in RESIDENCY_TIERS
                 },
                 last_access=self._last_access[key],
+                last_l1_reload=self._l1_reloads.get(key),
             )
 
     def entries(self) -> tuple[ResidencyEntry, ...]:
@@ -597,6 +631,27 @@ class ResidencyLedger:
         if current is None or current != reservation:
             raise RuntimeError("residency reservation is stale or unknown")
         return current
+
+    def _record_l1_reload(self, reservation: ResidencyReservation) -> None:
+        source_tier = reservation.source
+        if reservation.target != "l1_gpu" or source_tier not in (
+            "l2_cpu",
+            "l3_nvme",
+        ):
+            return
+        eviction_sequence = self._l1_evictions.get(reservation.key)
+        if eviction_sequence is None:
+            return
+        source = self._copies[reservation.key][source_tier]
+        self._transition_sequence += 1
+        self._l1_reloads[reservation.key] = ResidencyL1ReloadReceipt(
+            source=source_tier,
+            byte_count=reservation.byte_count,
+            eviction_sequence=eviction_sequence,
+            reload_sequence=self._transition_sequence,
+            source_immutable_ref=source.immutable_ref,
+            source_digest=source.digest,
+        )
 
     def _pin_count(self, key: ResidencyKey, tier: ResidencyTier) -> int:
         return self._pins.get(key, {}).get(tier, 0)

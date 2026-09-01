@@ -54,6 +54,7 @@ from .runtime.portable_snapshot import (
 from .runtime.publication import TrainerRankPublication
 from .runtime.residency import (
     ResidencyCapacityUnavailable,
+    ResidencyL1ReloadReceipt,
     ResidencyTier,
     ResidencyWorkingSetTooLarge,
 )
@@ -103,6 +104,10 @@ class MegatronResidencyComponentSummary(BaseModel):
     l2_present_rank_count: int = Field(ge=0)
     l3_present_rank_count: int = Field(ge=0)
     all_ranks_l1_ready: bool
+    l1_reload_rank_count: int = Field(ge=0)
+    l1_reload_bytes: int = Field(ge=0)
+    l1_reload_sources: tuple[Literal["l2_cpu", "l3_nvme"], ...] = Field(max_length=2)
+    all_ranks_reloaded_after_eviction: bool
 
 
 class MegatronResidencyTierSummary(BaseModel):
@@ -122,8 +127,8 @@ class MegatronOperationResidencySummary(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    schema_version: Literal["megatron-operation-residency.v1"] = (
-        "megatron-operation-residency.v1"
+    schema_version: Literal["megatron-operation-residency.v2"] = (
+        "megatron-operation-residency.v2"
     )
     run_id: str = Field(min_length=1)
     operation_id: str = Field(min_length=1, max_length=64)
@@ -189,6 +194,8 @@ class _ResidencyRankComponentEvidence(BaseModel):
     tiers: tuple[ResidencyTier, ...] = Field(max_length=3)
     l1_ready: bool
     copies: tuple[_ResidencyRankCopyEvidence, ...] = Field(max_length=3)
+    last_l1_reload: ResidencyL1ReloadReceipt | None = None
+    reloaded_for_operation: bool = False
 
     @model_validator(mode="after")
     def _validate_copies(self) -> "_ResidencyRankComponentEvidence":
@@ -200,6 +207,12 @@ class _ResidencyRankComponentEvidence(BaseModel):
             0 if l1 is None else l1.byte_count
         ):
             raise ValueError("legacy L1 residency facts disagree with copy evidence")
+        if self.last_l1_reload is not None and (
+            l1 is None or self.last_l1_reload.byte_count != l1.byte_count
+        ):
+            raise ValueError("L1 reload evidence differs from the ready L1 copy")
+        if self.reloaded_for_operation and self.last_l1_reload is None:
+            raise ValueError("operation reload evidence has no exact reload receipt")
         return self
 
 
@@ -1895,13 +1908,16 @@ def _summarize_residency_evidence(
     if len(set(ranks)) != len(ranks) or any(rank >= rank_count for rank in ranks):
         raise RuntimeError("residency evidence returned invalid trainer ranks")
     requested = set(detail.requested_components)
-    aggregates = {
+    aggregates: dict[SlotComponent, dict[str, Any]] = {
         component: {
             "observed": 0,
             "l1_ready": 0,
             "l1_bytes": 0,
             "l2_present": 0,
             "l3_present": 0,
+            "l1_reload": 0,
+            "l1_reload_bytes": 0,
+            "l1_reload_sources": set(),
         }
         for component in _SLOT_COMPONENTS
     }
@@ -1934,6 +1950,12 @@ def _summarize_residency_evidence(
             aggregate["l1_bytes"] += 0 if l1 is None or not l1.ready else l1.byte_count
             aggregate["l2_present"] += int("l2_cpu" in tiers)
             aggregate["l3_present"] += int("l3_nvme" in tiers)
+            reload = component.last_l1_reload
+            if component.reloaded_for_operation:
+                assert reload is not None
+                aggregate["l1_reload"] += 1
+                aggregate["l1_reload_bytes"] += reload.byte_count
+                aggregate["l1_reload_sources"].add(reload.source)
             for copy in component.copies:
                 tier = tier_aggregates[copy.tier]
                 tier["copies"] += 1
@@ -1952,6 +1974,12 @@ def _summarize_residency_evidence(
             l3_present_rank_count=values["l3_present"],
             all_ranks_l1_ready=(
                 values["observed"] == rank_count and values["l1_ready"] == rank_count
+            ),
+            l1_reload_rank_count=values["l1_reload"],
+            l1_reload_bytes=values["l1_reload_bytes"],
+            l1_reload_sources=tuple(sorted(values["l1_reload_sources"])),
+            all_ranks_reloaded_after_eviction=(
+                values["observed"] == rank_count and values["l1_reload"] == rank_count
             ),
         )
         for component, values in aggregates.items()

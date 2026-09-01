@@ -750,6 +750,8 @@ class MCoreRunSlotExecutor:
         )
         self._residency_admission_lock = Lock()
         self._residency_admissions: dict[str, tuple[ResidencyKey, ...]] = {}
+        self._residency_admission_evidence: dict[str, dict[str, Any]] = {}
+        self._reported_l1_reload_sequences: dict[ResidencyKey, int] = {}
         self._checkpoint_hydrations: dict[str, _PreparedRunCheckpoint] = {}
         self._portable_snapshot_source = portable_snapshot_source
         self._portable_snapshot_sink = portable_snapshot_sink
@@ -1092,7 +1094,7 @@ class MCoreRunSlotExecutor:
         if retained is not None:
             if retained != keys:
                 raise RuntimeError("operation residency admission changed identity")
-            return self._residency_evidence(run_id, operation_id, components, keys)
+            return self._residency_admission_evidence[operation_id]
         self._residency.acquire_l1_working_set(keys)
         with self._residency_admission_lock:
             retained = self._residency_admissions.get(operation_id)
@@ -1102,11 +1104,17 @@ class MCoreRunSlotExecutor:
                     raise RuntimeError("operation residency admission changed identity")
             else:
                 self._residency_admissions[operation_id] = keys
-        return self._residency_evidence(run_id, operation_id, components, keys)
+                evidence = self._residency_evidence(
+                    run_id, operation_id, components, keys
+                )
+                self._residency_admission_evidence[operation_id] = evidence
+                return evidence
+        return self._residency_admission_evidence[operation_id]
 
     def release_residency_admission(self, operation_id: str) -> None:
         with self._residency_admission_lock:
             keys = self._residency_admissions.pop(operation_id, None)
+            self._residency_admission_evidence.pop(operation_id, None)
         if keys is not None:
             self._residency.release_l1_working_set(keys)
 
@@ -1147,6 +1155,13 @@ class MCoreRunSlotExecutor:
                 for copy in entry.copies
             )
             l1 = next((copy for copy in entry.copies if copy.tier == "l1_gpu"), None)
+            reload = entry.last_l1_reload
+            reloaded_for_operation = bool(
+                operation_id is not None
+                and reload is not None
+                and reload.reload_sequence
+                > self._reported_l1_reload_sequences.get(key, 0)
+            )
             components.append(
                 {
                     "component": key.representation,
@@ -1156,8 +1171,14 @@ class MCoreRunSlotExecutor:
                     "tiers": tuple(copy.tier for copy in entry.copies),
                     "l1_ready": l1 is not None,
                     "copies": copies,
+                    "last_l1_reload": (
+                        None if reload is None else reload.model_dump(mode="json")
+                    ),
+                    "reloaded_for_operation": reloaded_for_operation,
                 }
             )
+            if operation_id is not None and reload is not None:
+                self._reported_l1_reload_sequences[key] = reload.reload_sequence
         return {
             "rank": int(self.runtime.rank),
             "run_id": run_id,

@@ -38,7 +38,14 @@ from art.megatron.runtime.portable_snapshot import (
     PortableSnapshotReadReceipt,
     build_portable_snapshot_archive,
 )
-from art.megatron.runtime.residency import ResidencyCapacityUnavailable, ResidencyKey
+from art.megatron.runtime.residency import (
+    ResidencyCapacityUnavailable,
+    ResidencyKey,
+    ResidencyL1ReloadReceipt,
+    ResidencyLedger,
+    ResidencyLimits,
+    TierCapacity,
+)
 from art.megatron.runtime.run_residency import RunResidencyManager
 from art.megatron.runtime.specs import TrainerCommandRunState, TrainerGeneration
 from art.megatron.slot_coordinator import (
@@ -47,8 +54,10 @@ from art.megatron.slot_coordinator import (
     MegatronMigrationReplay,
     MegatronSlotCoordinator,
     MegatronSlotResourceRequest,
+    MegatronSlotRun,
     TrainerMegatronSlotResources,
 )
+from art.megatron.training import LocalMegatronTrainingClient
 from art.training import (
     AdamConfig,
     AdapterSpec,
@@ -62,7 +71,10 @@ from art.training import (
     LossConfig,
     OperationExecutionError,
     OperationRef,
+    OperationSucceeded,
     OptimStepRequest,
+    OptimStepResult,
+    PackingOutcome,
     RlTrajectoryBatch,
     SamplerPublication,
     SamplerWeightsResult,
@@ -251,6 +263,15 @@ class _Trainer:
                                     "ready": True,
                                 },
                             ),
+                            "last_l1_reload": {
+                                "source": "l2_cpu",
+                                "byte_count": 1024,
+                                "eviction_sequence": 1,
+                                "reload_sequence": 2,
+                                "source_immutable_ref": None,
+                                "source_digest": None,
+                            },
+                            "reloaded_for_operation": True,
                         }
                         for component in components
                     ),
@@ -536,6 +557,66 @@ def test_run_residency_pins_under_l1_admission_lock() -> None:
     assert ledger.pinned == ((key, "l1_gpu"),)
 
 
+def test_residency_ledger_records_pressure_eviction_and_exact_reload() -> None:
+    l1_capacity = TierCapacity(max_bytes=1024)
+    lower_capacity = TierCapacity(max_bytes=4096)
+    ledger = ResidencyLedger(
+        ResidencyLimits(
+            l1_gpu=l1_capacity,
+            l2_cpu=lower_capacity,
+            l3_nvme=lower_capacity,
+        )
+    )
+    keys = tuple(
+        ResidencyKey(
+            training_session_id="session",
+            run_id=f"run-{index}",
+            generation_id="generation",
+            topology_fingerprint="topology",
+            adapter_layout_fingerprint="adapter",
+        )
+        for index in range(2)
+    )
+    for index, key in enumerate(keys):
+        l2 = ledger.reserve(key, source=None, target="l2_cpu", byte_count=1024)
+        ledger.commit(
+            l2, immutable_ref=f"host-image-{index}", digest=f"{index + 1}" * 64
+        )
+
+    first_l1 = ledger.reserve(
+        keys[0], source="l2_cpu", target="l1_gpu", byte_count=1024
+    )
+    ledger.commit(first_l1)
+    assert ledger.entry(keys[0]).last_l1_reload is None
+
+    assert ledger.admission_evictions("l1_gpu", 1024, 1024, protected={keys[1]}) == (
+        keys[0],
+    )
+    ledger.drop(keys[0], "l1_gpu")
+    second_l1 = ledger.reserve(
+        keys[1], source="l2_cpu", target="l1_gpu", byte_count=1024
+    )
+    ledger.commit(second_l1)
+
+    assert ledger.admission_evictions("l1_gpu", 1024, 1024, protected={keys[0]}) == (
+        keys[1],
+    )
+    ledger.drop(keys[1], "l1_gpu")
+    reloaded_l1 = ledger.reserve(
+        keys[0], source="l2_cpu", target="l1_gpu", byte_count=1024
+    )
+    ledger.commit(reloaded_l1)
+
+    assert ledger.entry(keys[0]).last_l1_reload == ResidencyL1ReloadReceipt(
+        source="l2_cpu",
+        byte_count=1024,
+        eviction_sequence=1,
+        reload_sequence=3,
+        source_immutable_ref="host-image-0",
+        source_digest="1" * 64,
+    )
+
+
 def _operation(
     operation_id: str,
     kind: str,
@@ -560,6 +641,77 @@ def _batch() -> RlTrajectoryBatch:
         min_source_version=0,
         max_source_version=0,
     )
+
+
+@pytest.mark.asyncio
+async def test_local_megatron_client_uses_slot_worker_and_exact_contributions() -> None:
+    packing = PackingOutcome(
+        packed_sequence_length=8,
+        packed_sequences=1,
+        target_packed_sequences=1,
+        physical_tokens=8,
+        non_padding_tokens=8,
+        loss_bearing_tokens=8,
+        trainable_assistant_tokens=8,
+    )
+
+    class _Worker:
+        def __init__(self) -> None:
+            self.calls = []
+
+        async def execute(self, request, operation, contributions=()):
+            self.calls.append((request, operation, contributions))
+            if isinstance(request, ForwardBackwardRequest):
+                result = ForwardBackwardResult(
+                    operation_id=operation.operation_id,
+                    packing=packing,
+                    produced_gradient=True,
+                )
+            else:
+                assert isinstance(request, OptimStepRequest)
+                result = OptimStepResult(
+                    operation_id=operation.operation_id,
+                    contributing_forward_backward_operation_ids=contributions,
+                    checkpoint=CheckpointRef(
+                        run_id="run", learner_version=1, checkpoint_id="generation-1"
+                    ),
+                )
+            return OperationSucceeded(operation=operation, result=result)
+
+    worker = _Worker()
+    client = LocalMegatronTrainingClient(
+        MegatronSlotRun("run", worker),  # type: ignore[arg-type]
+        learner_version=0,
+    )
+    forward = await client.forward_backward(
+        ForwardBackwardRequest(
+            run_id="run",
+            request_id="forward",
+            sequence_id=0,
+            batch=_batch(),
+            loss=LossConfig(name="cispo"),
+        )
+    )
+    assert (await forward.result()).produced_gradient
+    optimizer = await client.optim_step(
+        OptimStepRequest(
+            run_id="run",
+            request_id="optimizer",
+            sequence_id=1,
+            optimizer=AdamConfig(learning_rate=1e-5),
+        )
+    )
+    result = await optimizer.result()
+
+    assert worker.calls[1][2] == (forward.ref.operation_id,)
+    assert result.contributing_forward_backward_operation_ids == (
+        forward.ref.operation_id,
+    )
+    assert client.projected_learner_version == 1
+    assert (await client.operation_evidence(optimizer.ref.operation_id)).status == (
+        "succeeded"
+    )
+    await client.close()
 
 
 def _input_object(operation_id: str) -> TrainingInputObjectRef:
@@ -1174,6 +1326,10 @@ async def test_slot_coordinator_summarizes_private_residency_evidence() -> None:
     assert summary.l1_ready_bytes == 1024
     assert summary.components[0].component == "weights"
     assert summary.components[0].l1_ready_rank_count == 1
+    assert summary.components[0].l1_reload_rank_count == 1
+    assert summary.components[0].l1_reload_bytes == 1024
+    assert summary.components[0].l1_reload_sources == ("l2_cpu",)
+    assert summary.components[0].all_ranks_reloaded_after_eviction
     assert summary.components[1].component == "optimizer"
     assert summary.components[1].observed_rank_count == 0
     assert summary.tiers[0].tier == "l1_gpu"

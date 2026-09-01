@@ -25,7 +25,7 @@ from art.megatron.runtime.portable_snapshot import (
     PortableSnapshotReadReceipt,
     build_portable_snapshot_archive,
 )
-from art.megatron.runtime.residency import ResidencyKey
+from art.megatron.runtime.residency import ResidencyKey, ResidencyL1ReloadReceipt
 from art.megatron.runtime.specs import TrainerGeneration
 from art.runtime_attestation import RuntimeArchitectureAttestation
 from art.training import AdapterSpec, TrainingRunSpec
@@ -102,7 +102,13 @@ def test_rank_residency_evidence_retains_bounded_copy_facts(
         copies=(
             SimpleNamespace(tier="l1_gpu", byte_count=1024, ready_at=0.0),
             SimpleNamespace(tier="l2_cpu", byte_count=1024, ready_at=0.0),
-        )
+        ),
+        last_l1_reload=ResidencyL1ReloadReceipt(
+            source="l2_cpu",
+            byte_count=1024,
+            eviction_sequence=1,
+            reload_sequence=2,
+        ),
     )
     executor = object.__new__(executor_module.MCoreRunSlotExecutor)
     executor._runs = {"run": state}
@@ -112,6 +118,7 @@ def test_rank_residency_evidence_retains_bounded_copy_facts(
         )
     )
     executor.runtime = SimpleNamespace(rank=0)
+    executor._reported_l1_reload_sequences = {}
 
     evidence = executor._residency_evidence("run", "operation", ("weights",), (key,))
 
@@ -123,6 +130,8 @@ def test_rank_residency_evidence_retains_bounded_copy_facts(
         {"tier": "l1_gpu", "byte_count": 1024, "ready": True},
         {"tier": "l2_cpu", "byte_count": 1024, "ready": True},
     )
+    assert component["reloaded_for_operation"] is True
+    assert component["last_l1_reload"]["reload_sequence"] == 2
 
 
 def test_fresh_optimizer_is_prepared_entirely_on_cpu(
