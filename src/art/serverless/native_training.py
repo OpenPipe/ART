@@ -18,6 +18,7 @@ from art.training import (
     OptimStepRequest,
     OptimStepResult,
     RunCommand,
+    RunInitialState,
     SamplerWeightsResult,
     SaveStateRequest,
     SaveStateResult,
@@ -159,9 +160,15 @@ class RemoteTrainingClient:
         request_id: str,
         run_name: str,
         spec: TrainingRunSpec,
+        initial_state: RunInitialState | None = None,
         poll_interval_s: float = 0.1,
     ) -> RemoteTrainingClient:
-        run = await service.resolve(request_id=request_id, run_name=run_name, spec=spec)
+        run = await service.resolve(
+            request_id=request_id,
+            run_name=run_name,
+            spec=spec,
+            initial_state=initial_state,
+        )
         return cls(service, run, poll_interval_s=poll_interval_s)
 
     @property

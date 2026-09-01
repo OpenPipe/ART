@@ -21,7 +21,7 @@ from openai.pagination import AsyncCursorPage
 from pydantic import Field, model_validator
 from typing_extensions import override
 
-from art.training import LoadStateRequest, RunCommand, TrainingRunSpec
+from art.training import LoadStateRequest, RunCommand, RunInitialState, TrainingRunSpec
 
 from ..trajectories import TrajectoryGroup
 from ..types import SFTMetricLoggingConfig
@@ -331,12 +331,14 @@ class TrainingRuns(AsyncAPIResource):
         request_id: str,
         run_name: str,
         spec: TrainingRunSpec,
+        initial_state: RunInitialState | None = None,
     ) -> NativeTrainingRun:
         wire_spec = {
             "base_model": spec.base_model,
             "dtype": spec.dtype,
             "lora_rank": spec.adapter.rank,
             "lora_target_modules": list(spec.adapter.target_modules),
+            "seed": spec.seed,
         }
         run = await self._post(
             "/training/runs:resolve",
@@ -345,6 +347,11 @@ class TrainingRuns(AsyncAPIResource):
                 "request_id": request_id,
                 "run_name": run_name,
                 "spec": wire_spec,
+                "initial_state": (
+                    None
+                    if initial_state is None
+                    else initial_state.model_dump(mode="json")
+                ),
             },
         )
         if run.run_name != run_name or run.spec != wire_spec:

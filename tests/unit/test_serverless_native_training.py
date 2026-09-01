@@ -18,7 +18,10 @@ from art.training import (
     LossConfig,
     PackedInputCaptureRef,
     PackingOutcome,
+    RunInitialState,
+    ServiceCheckpointSource,
     TrainingRunSpec,
+    WandbArtifactCheckpointSource,
 )
 
 
@@ -30,8 +33,10 @@ class _TrainingRuns:
         self.result_calls = 0
         self.released: tuple[str, str] | None = None
         self.run: NativeTrainingRun | None = None
+        self.resolve_kwargs: dict[str, Any] | None = None
 
     async def resolve(self, **kwargs: Any) -> NativeTrainingRun:
+        self.resolve_kwargs = kwargs
         spec = kwargs["spec"]
         self.run = NativeTrainingRun(
             run_id="run-native",
@@ -41,6 +46,7 @@ class _TrainingRuns:
                 "dtype": spec.dtype,
                 "lora_rank": spec.adapter.rank,
                 "lora_target_modules": list(spec.adapter.target_modules),
+                "seed": spec.seed,
             },
             status="open",
             next_sequence_id=0,
@@ -123,6 +129,30 @@ class _TrainingRuns:
         return self.run.model_copy(update={"status": "closing"})
 
 
+class _ResolveTransport(TrainingRuns):
+    def __init__(self, *, change_seed: bool = False) -> None:
+        self.change_seed = change_seed
+        self.path: str | None = None
+        self.body: dict[str, Any] | None = None
+
+    async def _post(self, path, *, cast_to, body):
+        assert cast_to is NativeTrainingRun
+        self.path = path
+        self.body = body
+        spec = dict(body["spec"])
+        if self.change_seed:
+            spec["seed"] = 999
+        return NativeTrainingRun(
+            run_id="run-native",
+            run_name=body["run_name"],
+            spec=spec,
+            status="open",
+            next_sequence_id=4,
+            projected_learner_version=2,
+            committed_learner_version=2,
+        )
+
+
 def _request(
     *, request_id: str = "request-native", sequence_id: int = 0
 ) -> ForwardRequest:
@@ -202,6 +232,96 @@ async def test_native_client_retains_run_and_terminal_operation_identity() -> No
     assert service.released == ("operation-native", "release-native")
     assert service.result_calls == 2
     assert service.submissions == 1
+    assert service.resolve_kwargs is not None
+    assert service.resolve_kwargs["initial_state"] is None
+
+
+@pytest.mark.asyncio
+async def test_native_client_resolve_preserves_typed_initial_state() -> None:
+    service = _TrainingRuns()
+    spec = TrainingRunSpec(
+        base_model="Qwen/Qwen3-30B-A3B",
+        adapter=AdapterSpec(rank=8, target_modules=("linear_qkv",)),
+        seed=17,
+    )
+    initial_state = RunInitialState(
+        source=ServiceCheckpointSource(checkpoint_id="checkpoint-1"),
+        restore_optimizer=True,
+    )
+
+    client = await RemoteTrainingClient.resolve(
+        cast(TrainingRuns, service),
+        request_id="resume-native",
+        run_name="resumed-run",
+        spec=spec,
+        initial_state=initial_state,
+    )
+
+    assert client.run_id == "run-native"
+    assert service.resolve_kwargs == {
+        "request_id": "resume-native",
+        "run_name": "resumed-run",
+        "spec": spec,
+        "initial_state": initial_state,
+    }
+    await client.close()
+
+
+@pytest.mark.asyncio
+async def test_training_runs_resolve_serializes_exact_initial_state() -> None:
+    service = _ResolveTransport()
+    spec = TrainingRunSpec(
+        base_model="Qwen/Qwen3-30B-A3B",
+        adapter=AdapterSpec(rank=8, target_modules=("linear_qkv",)),
+        seed=17,
+    )
+    initial_state = RunInitialState(
+        source=WandbArtifactCheckpointSource(artifact="entity/project/checkpoint:v3"),
+    )
+
+    run = await service.resolve(
+        request_id="resume-native",
+        run_name="resumed-run",
+        spec=spec,
+        initial_state=initial_state,
+    )
+
+    assert run.run_id == "run-native"
+    assert service.path == "/training/runs:resolve"
+    assert service.body == {
+        "request_id": "resume-native",
+        "run_name": "resumed-run",
+        "spec": {
+            "base_model": "Qwen/Qwen3-30B-A3B",
+            "dtype": "bfloat16",
+            "lora_rank": 8,
+            "lora_target_modules": ["linear_qkv"],
+            "seed": 17,
+        },
+        "initial_state": {
+            "source": {
+                "kind": "wandb_artifact",
+                "artifact": "entity/project/checkpoint:v3",
+            },
+            "restore_optimizer": False,
+        },
+    }
+
+
+@pytest.mark.asyncio
+async def test_training_runs_resolve_rejects_changed_seed() -> None:
+    service = _ResolveTransport(change_seed=True)
+
+    with pytest.raises(RuntimeError, match="run identity changed"):
+        await service.resolve(
+            request_id="resume-native",
+            run_name="resumed-run",
+            spec=TrainingRunSpec(
+                base_model="Qwen/Qwen3-30B-A3B",
+                adapter=AdapterSpec(rank=8, target_modules=("linear_qkv",)),
+                seed=17,
+            ),
+        )
 
 
 @pytest.mark.asyncio

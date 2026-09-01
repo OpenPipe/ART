@@ -48,6 +48,31 @@ class TrainingRunSpec(Contract):
     dtype: Literal["bfloat16"] = "bfloat16"
 
 
+class ServiceCheckpointSource(Contract):
+    kind: Literal["service_checkpoint"] = "service_checkpoint"
+    checkpoint_id: str = Field(min_length=1, max_length=128)
+
+
+class WandbArtifactCheckpointSource(Contract):
+    kind: Literal["wandb_artifact"] = "wandb_artifact"
+    artifact: str = Field(
+        min_length=5,
+        max_length=768,
+        pattern=r"^[^/:\\\x00-\x1f]+/[^/:\\\x00-\x1f]+/[^/:\\\x00-\x1f]+:v(?:0|[1-9][0-9]*)$",
+    )
+
+
+CheckpointSource = Annotated[
+    ServiceCheckpointSource | WandbArtifactCheckpointSource,
+    Field(discriminator="kind"),
+]
+
+
+class RunInitialState(Contract):
+    source: CheckpointSource
+    restore_optimizer: bool = False
+
+
 class RunCommand(Contract):
     run_id: str = Field(min_length=1, max_length=MAX_CONTROL_IDENTIFIER_LENGTH)
     request_id: str = Field(min_length=1, max_length=MAX_CONTROL_IDENTIFIER_LENGTH)

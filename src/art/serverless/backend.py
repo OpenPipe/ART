@@ -34,7 +34,7 @@ if TYPE_CHECKING:
     from wandb.sdk.artifacts.artifact import Artifact
 
     from ..model import Model, TrainableModel
-    from ..training import PackedInputCaptureRef, TrainingRunSpec
+    from ..training import PackedInputCaptureRef, RunInitialState, TrainingRunSpec
     from .native_training import RemoteTrainingClient
 
 
@@ -236,6 +236,7 @@ class ServerlessBackend:
         request_id: str,
         run_name: str,
         spec: "TrainingRunSpec",
+        initial_state: "RunInitialState | None" = None,
         poll_interval_s: float = 0.1,
     ) -> "RemoteTrainingClient":
         """Resolve one durable native run and retain its operation identities."""
@@ -247,6 +248,7 @@ class ServerlessBackend:
             request_id=request_id,
             run_name=run_name,
             spec=spec,
+            initial_state=initial_state,
             poll_interval_s=poll_interval_s,
         )
 
