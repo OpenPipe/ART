@@ -505,12 +505,209 @@ def phase_validate(cell: str, evidence: str) -> None:
     )
 
 
+SPLIT_MEMORY_LIMIT_ENV = "ART_TRAINER_RANK_TEST_MEMORY_LIMIT_BYTES"
+
+
+def phase_split_conversion(evidence: str | None) -> None:
+    """GPU gate for best-effort internal splitting (sealed cell shape).
+
+    Mirrors the research thread's sealed split-conversion cell: Qwen3.5-4B,
+    four transformer layers, CP1, four inputs. Memory pressure is induced
+    deterministically with the test-only usable-memory cap instead of ballast.
+
+    Gates:
+    - unlimited: the call runs unsplit (subforward_count == 1);
+    - conversion: under a cap sized between the unsplit and split requirements,
+      the call splits (subforward_count >= 2), outputs match the unsplit run
+      (parity), and both a single combined backward and a reverse-order
+      per-subforward backward succeed with every graph live;
+    - bounded-decline: under a cap below the smallest single request, the
+      call refuses before any model execution with the honest wording.
+    """
+
+    phase_contract()
+    import torch
+    import torch.distributed as dist
+
+    from art.megatron import train as megatron_train
+    from art.trainer_rank import ForwardInput, TrainerRank, TrainerRankMemoryError
+
+    if not torch.cuda.is_available():
+        _fail("split-conversion phase requires CUDA")
+    torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
+    dist.init_process_group(backend="nccl")
+    rows: list[dict[str, object]] = []
+    try:
+        torch.manual_seed(1234)
+        runtime = megatron_train.build_training_runtime(
+            model_identifier="Qwen/Qwen3.5-4B",
+            provider_configure=lambda provider: setattr(provider, "num_layers", 4),
+            print_env=dist.get_rank() == 0,
+        )
+        for chunk in runtime.model:
+            chunk.train()
+        rank = TrainerRank(runtime)
+
+        def requests() -> list[ForwardInput]:
+            generator = torch.Generator().manual_seed(6_101)
+            items = []
+            for _ in range(4):
+                tokens = torch.randint(10, 64_000, (12_288,), generator=generator)
+                labels = torch.roll(tokens, shifts=-1).clone()
+                labels[-1] = -100
+                items.append(ForwardInput(input_tokens=tokens, target_tokens=labels))
+            return items
+
+        def run(
+            limit_bytes: int | None,
+        ) -> tuple[list[torch.Tensor], dict[str, object]]:
+            os.environ[TEST_HOOKS_ENV] = "1"
+            if limit_bytes is None:
+                os.environ.pop(SPLIT_MEMORY_LIMIT_ENV, None)
+            else:
+                os.environ[SPLIT_MEMORY_LIMIT_ENV] = str(limit_bytes)
+            torch.cuda.synchronize()
+            torch.cuda.reset_peak_memory_stats()
+            outputs = rank.dp_rank_forward(requests())
+            telemetry = rank.last_forward_telemetry()
+            logprobs = [
+                output.target_logprobs.detach().float().clone() for output in outputs
+            ]
+            return logprobs, {**telemetry, "outputs": outputs}
+
+        # 1. Unlimited: unsplit reference (also profiles the retained fraction).
+        reference, info = run(None)
+        loss = torch.stack(
+            [o.target_logprobs.float().sum() for o in info["outputs"]]
+        ).sum()
+        loss.backward()
+        rank.zero_grad()
+        unsplit_peak = int(torch.cuda.max_memory_allocated())
+        allocated = int(torch.cuda.memory_allocated())
+        rows.append(
+            {
+                "arm": "unlimited",
+                "subforward_count": info["subforward_count"],
+                "peak": unsplit_peak,
+            }
+        )
+        if info["subforward_count"] != 1:
+            _fail("unlimited arm must run unsplit")
+
+        # Second unlimited pass so the retained-fraction profile is warm.
+        run(None)
+        rank.zero_grad()
+
+        # 2. Conversion: cap the usable budget just below the planner's own
+        # unsplit requirement. The unsplit plan then fails admission by
+        # construction, while any split whose profiled retained fraction is
+        # below 1.0 has a cumulative requirement strictly under the unsplit
+        # one (k-way: R/k + (k-1)·f·R/k < R), so the ladder converts.
+        def pressured_cap() -> tuple[int, int]:
+            # Recompute at call time: the allocator state and the learned
+            # memory profile both move between runs.
+            unsplit_plan = rank._plan_flat_forward(requests())
+            required_unsplit = rank._estimate_required_memory_bytes_from_values(
+                packed_tokens=unsplit_plan.packed_tokens,
+                output_bytes=unsplit_plan.output_bytes,
+                signature=unsplit_plan.signature,
+                logical_tokens=unsplit_plan.logical_tokens,
+            )
+            torch.cuda.synchronize()
+            return int(
+                torch.cuda.memory_allocated()
+            ) + required_unsplit - 1, required_unsplit
+
+        cap, required_unsplit = pressured_cap()
+        logprobs, info = run(cap)
+        rows.append(
+            {
+                "arm": "conversion",
+                "subforward_count": info["subforward_count"],
+                "cap": cap,
+            }
+        )
+        if info["subforward_count"] < 2:
+            _fail(
+                f"conversion arm did not split (subforward_count={info['subforward_count']})"
+            )
+        # Parity metric matches dev/trainer_rank_check.py: mean absolute
+        # difference relative to the reference's mean magnitude (bf16 kernels
+        # reorder reductions across packings), with a loose max-abs backstop.
+        split_all = torch.cat([a.reshape(-1) for a in logprobs])
+        reference_all = torch.cat([b.reshape(-1) for b in reference])
+        mean_abs_pct = float(
+            (split_all - reference_all).abs().mean()
+            / max(float(reference_all.abs().mean()), 1e-6)
+            * 100.0
+        )
+        max_abs = float((split_all - reference_all).abs().max())
+        rows.append(
+            {
+                "arm": "conversion-parity",
+                "mean_abs_pct": mean_abs_pct,
+                "max_abs": max_abs,
+            }
+        )
+        if mean_abs_pct > 0.5 or max_abs > 1.0:
+            _fail(
+                "split outputs diverge from unsplit reference:"
+                f" mean_abs_pct={mean_abs_pct:.4f}% max_abs={max_abs:.4f}"
+            )
+        # Combined backward with every graph live.
+        loss = torch.stack(
+            [o.target_logprobs.float().sum() for o in info["outputs"]]
+        ).sum()
+        loss.backward()
+        rank.zero_grad()
+        # Reverse-order per-subforward backward with every graph live (the
+        # sealed research protocol). Outputs within one subforward share a
+        # graph, so each subforward's outputs are reduced to one loss.
+        cap, _required = pressured_cap()
+        _, info = run(cap)
+        outputs = list(info["outputs"])
+        partition = info["subforward_request_indices"]
+        if len(partition) < 2:
+            _fail("reverse-order arm expected a split plan")
+        for indices in reversed(list(partition)):
+            torch.stack(
+                [outputs[index].target_logprobs.float().sum() for index in indices]
+            ).sum().backward()
+        rank.zero_grad()
+
+        # 3. Bounded decline: below the smallest single request.
+        os.environ[SPLIT_MEMORY_LIMIT_ENV] = str(allocated + 1)
+        torch.cuda.synchronize()
+        before = int(torch.cuda.memory_allocated())
+        try:
+            rank.dp_rank_forward(requests())
+        except TrainerRankMemoryError as error:
+            message = str(error).lower()
+            if "unable to find a feasible split" not in message:
+                _fail(f"decline is not worded as a bounded-search refusal: {error}")
+            if int(torch.cuda.memory_allocated()) > before + (1 << 20):
+                _fail("decline allocated model state before refusing")
+            rows.append({"arm": "bounded-decline", "refused": True})
+        else:
+            _fail("bounded-decline arm did not refuse")
+        os.environ.pop(SPLIT_MEMORY_LIMIT_ENV, None)
+        os.environ.pop(TEST_HOOKS_ENV, None)
+        if evidence and dist.get_rank() == 0:
+            with open(evidence, "a", encoding="utf-8") as handle:
+                for row in rows:
+                    handle.write(json.dumps(row, sort_keys=True) + "\n")
+        print(f"split-conversion phase: PASS {rows}")
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--phase",
         required=True,
-        choices=("contract", "census", "measure", "validate"),
+        choices=("contract", "census", "measure", "validate", "split-conversion"),
     )
     parser.add_argument("--cell", default="grpo-gdn-cp4")
     parser.add_argument(
@@ -529,6 +726,8 @@ def main() -> None:
         phase_measure(
             arguments.cell, arguments.arm, arguments.evidence, arguments.repeat
         )
+    elif arguments.phase == "split-conversion":
+        phase_split_conversion(arguments.evidence or None)
     else:
         if not arguments.evidence:
             _fail("--evidence input path is required for validate")

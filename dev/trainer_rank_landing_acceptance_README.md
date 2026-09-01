@@ -15,6 +15,8 @@ every gate below now passes on the landed implementation.
 | `--phase contract` / `--phase census` | CPU | knob-free surface; all 44 real Ellavox groups plan, zero refusals | pass |
 | `dev/trainer_rank_landing_acceptance_gdn_cp4.sky.yaml` | 4x H200 k8s | 2-layer sealed throughput screen: paired median gain >= 20% (sealed 47.2%); peak reduction >= 30% (sealed 55.8%); median selected depth >= 2 (sealed 3); planning p50 <= 150 ms absolute (sealed steady 82 ms) | gain 49.7%, peak 4.17 vs 9.0 GiB, depth 3, planning 36 ms |
 | `dev/trainer_rank_landing_acceptance_cp1.sky.yaml` | 1x H200 | full-height model, real Ellavox stream: paired median regression <= 2% (sealed: ties); planning fraction <= 10% (sealed 1.5%/4.2%) | see evidence log |
+| `tests/unit/test_trainer_rank_split.py` | CPU | best-effort splitting contract: bounded ladder, cumulative live-graph admission, caller-order reconstruction, honest refusal wording, minimum-wave splitting, deterministic partitions, `subforward_count` telemetry | pass |
+| `--phase split-conversion` | 1x H200 | sealed cell shape (Qwen3.5-4B, 4 layers, 4 inputs): unlimited runs unsplit; induced cap converts (>=2 subforwards) with output parity, combined and reverse-order backward; sub-request cap refuses before execution | see evidence log |
 
 Protocol note (2026-09-01): planning cost is gated as a *fraction* only on the
 full-height cp1 cell, matching the sealed protocol — the sealed 1.5%/4.2%

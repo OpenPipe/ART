@@ -134,19 +134,24 @@ def test_dp_rank_forward_splits_instead_of_raising(
     executed = _recording_executor(monkeypatch, rank)
     inputs = [_request(marker) for marker in range(4)]
     # Unsplit: 40 packed tokens. Budget admits 20, so two subforwards of two
-    # requests fit (each 20 transient; the second must also carry the first's
-    # retained graphs — see the cumulative test for that constraint).
+    # requests fit once a retained profile says earlier graphs cost nothing
+    # extra here (the cumulative test covers the conservative default).
+    monkeypatch.setattr(rank, "_retained_fraction", lambda plan: 0.0)
     _packed_budget(monkeypatch, rank, 20)
 
     outputs = rank.dp_rank_forward(inputs)
 
     assert [int(output.target_logprobs.item()) for output in outputs] == [0, 1, 2, 3]
     assert len(executed) == 2
+    # Each subforward is a self-contained flat plan (its own local request
+    # indices); identify what it executed by the requests' trailing markers.
     assert [
-        tuple(index for group in plan.groups for index in group.request_indices)
+        tuple(int(item.input_ids[-1]) for group in plan.groups for item in group.items)
         for plan in executed
     ] == [(0, 1), (2, 3)]
-    assert rank.last_forward_telemetry()["subforward_count"] == 2
+    telemetry = rank.last_forward_telemetry()
+    assert telemetry["subforward_count"] == 2
+    assert telemetry["subforward_request_indices"] == ((0, 1), (2, 3))
 
 
 def test_unsplit_call_reports_a_single_subforward(
@@ -158,7 +163,9 @@ def test_unsplit_call_reports_a_single_subforward(
 
     rank.dp_rank_forward([_request(marker) for marker in range(4)])
 
-    assert rank.last_forward_telemetry()["subforward_count"] == 1
+    telemetry = rank.last_forward_telemetry()
+    assert telemetry["subforward_count"] == 1
+    assert telemetry["subforward_request_indices"] == ((0, 1, 2, 3),)
 
 
 def test_split_outputs_preserve_nested_caller_order(
@@ -171,6 +178,7 @@ def test_split_outputs_preserve_nested_caller_order(
         [_request(2)],
         [_request(3), _request(4), _request(5)],
     ]
+    monkeypatch.setattr(rank, "_retained_fraction", lambda plan: 0.0)
     _packed_budget(monkeypatch, rank, 20)
 
     outputs = rank.dp_rank_forward(nested)
@@ -287,17 +295,19 @@ def test_split_decisions_are_deterministic(monkeypatch: pytest.MonkeyPatch) -> N
     _packed_budget(monkeypatch, rank, 30)
     inputs = [_request(marker) for marker in range(8)]
 
+    def partition() -> list[tuple[int, ...]]:
+        return [
+            tuple(
+                int(item.input_ids[-1]) for group in plan.groups for item in group.items
+            )
+            for plan in executed
+        ]
+
     rank.dp_rank_forward(inputs)
-    first = [
-        tuple(index for group in plan.groups for index in group.request_indices)
-        for plan in executed
-    ]
+    first = partition()
     executed.clear()
     rank.dp_rank_forward(inputs)
-    second = [
-        tuple(index for group in plan.groups for index in group.request_indices)
-        for plan in executed
-    ]
+    second = partition()
 
     assert first == second
     assert len(first) == 4

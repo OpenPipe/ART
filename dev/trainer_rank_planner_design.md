@@ -143,9 +143,53 @@ so the worker never touches the device. The synchronous submission cost is
 charged to `planning_ms`; hidden worker time is reported separately as
 `speculative_planning_ms`. See the acceptance README for measured numbers.
 
+## Best-effort internal splitting (follow-up PR)
+
+Contract (relaxed, 2026-09-01): try not to raise when splitting would make
+execution feasible; account for every returned graph staying live together;
+if finding out is too expensive or fragile, refuse — worded as "unable to find
+a feasible split", never as a claim that none exists.
+
+Mechanism:
+- `dp_rank_forward` (and the minimum wave of `forward_micro_batches`) plans
+  unsplit first (cost-optimal, then memory-minimal). If neither is admitted, a
+  bounded, deterministic ladder tries 2, 4, ... subforwards, partitioned along
+  the canonical prefix tree so shared-prefix siblings stay together, stopping
+  at the fewest subforwards that fit; one request per subforward is the last
+  rung.
+- Chunk pricing mirrors width probing (cheap no-sharing bound accepts, cheap
+  full-sharing bound rejects, planner pricing only in between). Chunks execute
+  larger-ephemeral-first (deterministic), and subforward `j` is admitted
+  against the retained memory of every earlier subforward plus its own
+  transient estimate; the backward upper bound (all retained graphs plus the
+  largest reusable workspace) must also fit. This is the research thread's
+  cumulative memory invariant: retained adds, ephemeral does not, backward
+  workspaces take a max.
+- Retained fraction (memory still allocated after a forward returns, as a
+  fraction of its estimate) is learned online per signature; the default
+  before any observation is 1.0 (everything retained), so a cold call that
+  cannot fit unsplit refuses until a profile exists.
+- The complete ordered split is admitted before any model execution; there is
+  no retry after the first forward. A failure in a later subforward raises
+  `TrainerRankPartialExecutionError` (a `TrainerRankMemoryError`) so partial
+  execution is reported distinctly.
+- Splitting is disabled under expert parallelism in this release (HybridEP
+  capacity must not be resized between subforwards while earlier graphs are
+  live); the refusal says so.
+- Telemetry: `subforward_count` in `last_forward_telemetry()` and
+  `MicroBatchStats`. Test-only `ART_TRAINER_RANK_TEST_MEMORY_LIMIT_BYTES`
+  (gated by `ART_TRAINER_RANK_TEST_HOOKS`) caps usable memory so GPU gates
+  induce conversion/decline deterministically without ballast tensors.
+
+GPU gate (`--phase split-conversion`), mirroring the sealed research cell
+(Qwen3.5-4B, 4 layers, CP1, 4 inputs): unlimited runs unsplit; a cap between
+the split and unsplit requirements converts (>= 2 subforwards) with outputs
+matching the unsplit reference, a single combined backward, and a
+reverse-order per-output backward all with every graph live; a cap below the
+smallest request refuses before any model execution.
+
 ## Explicitly out of scope (follow-ups)
 
-Best-effort internal splitting in `dp_rank_forward`; head chunking and memory
-margins as data-dependent planner decisions; TP>1 admission seam; cost-model
+Head chunking and memory margins as data-dependent planner decisions; TP>1 admission seam; cost-model
 recalibration. Not planned: infeasibility proofs, all-rank planning/digest
 agreement, HybridEP/CUDA instrumentation from the research diff.
