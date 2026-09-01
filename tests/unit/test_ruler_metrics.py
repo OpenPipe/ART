@@ -62,19 +62,23 @@ class _FakeResponse:
         )
 
 
-def _score_content(count: int) -> str:
+def _score_content_for_ids(trajectory_ids: list[str]) -> str:
     return json.dumps(
         {
             "scores": [
                 {
-                    "trajectory_id": str(index),
-                    "explanation": f"Trajectory {index}.",
-                    "score": index / 10,
+                    "trajectory_id": trajectory_id,
+                    "explanation": f"Trajectory {trajectory_id}.",
+                    "score": int(trajectory_id) / 10,
                 }
-                for index in range(1, count + 1)
+                for trajectory_id in trajectory_ids
             ]
         }
     )
+
+
+def _score_content(count: int) -> str:
+    return _score_content_for_ids([str(index) for index in range(1, count + 1)])
 
 
 def _response(count: int, *, cost: float | None = None) -> _FakeResponse:
@@ -256,14 +260,17 @@ async def test_ruler_structural_retry_propagates_cancellation(monkeypatch):
     async def _fake_acompletion(**_kwargs):
         nonlocal calls
         calls += 1
+        if calls == 1:
+            return _response(1)
         raise asyncio.CancelledError
 
     monkeypatch.setattr(ruler_module, "acompletion", _fake_acompletion)
+    monkeypatch.setattr(ruler_module, "ModelResponse", _FakeResponse)
 
     with pytest.raises(asyncio.CancelledError):
         await ruler_module.ruler(_TWO_TRAJECTORIES)
 
-    assert calls == 1
+    assert calls == 2
 
 
 @pytest.mark.asyncio
@@ -290,3 +297,49 @@ async def test_ruler_records_cost_for_every_structural_attempt(monkeypatch):
 
     assert len(scores) == 2
     assert metrics["costs/train/judge/ruler"] == pytest.approx(0.03)
+
+
+@pytest.mark.asyncio
+async def test_ruler_retries_duplicate_trajectory_ids(monkeypatch):
+    responses = iter(
+        [
+            _FakeResponse(
+                content=_score_content_for_ids(["1", "1"]),
+                prompt_tokens=100,
+                completion_tokens=50,
+            ),
+            _response(2),
+        ]
+    )
+    calls = 0
+
+    async def _fake_acompletion(**_kwargs):
+        nonlocal calls
+        calls += 1
+        return next(responses)
+
+    monkeypatch.setattr(ruler_module, "acompletion", _fake_acompletion)
+    monkeypatch.setattr(ruler_module, "ModelResponse", _FakeResponse)
+
+    scores = await ruler_module.ruler(_TWO_TRAJECTORIES)
+
+    assert calls == 2
+    assert [score.trajectory_id for score in scores] == ["1", "2"]
+
+
+@pytest.mark.asyncio
+async def test_ruler_orders_scores_by_trajectory_id(monkeypatch):
+    async def _fake_acompletion(**_kwargs):
+        return _FakeResponse(
+            content=_score_content_for_ids(["2", "1"]),
+            prompt_tokens=100,
+            completion_tokens=50,
+        )
+
+    monkeypatch.setattr(ruler_module, "acompletion", _fake_acompletion)
+    monkeypatch.setattr(ruler_module, "ModelResponse", _FakeResponse)
+
+    scores = await ruler_module.ruler(_TWO_TRAJECTORIES)
+
+    assert [score.trajectory_id for score in scores] == ["1", "2"]
+    assert [score.score for score in scores] == pytest.approx([0.1, 0.2])

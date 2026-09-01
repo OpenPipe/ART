@@ -49,7 +49,7 @@ DEFAULT_RUBRIC = dedent(
 as RULER extracts task understanding from the system prompts in the trajectories."""
 
 # A malformed relative ranking is usually transient; permit one bounded re-judge.
-_SCORE_COUNT_ATTEMPTS = 2
+_STRUCTURAL_ATTEMPTS = 2
 
 
 def _judge_provider(judge_model: str) -> str | None:
@@ -220,7 +220,7 @@ async def ruler(
         {"role": "user", "content": user_text},
     ]
 
-    for attempt in range(_SCORE_COUNT_ATTEMPTS):
+    for attempt in range(_STRUCTURAL_ATTEMPTS):
         response = await acompletion(
             model=judge_model,
             messages=messages,
@@ -247,26 +247,41 @@ async def ruler(
         content = first_choice.message.content or "{}"
         parsed = Response.model_validate_json(content)
         expected_scores = 1 if all_identical else len(message_lists)
+        structure_error: ValueError | None = None
         if len(parsed.scores) != expected_scores:
-            if attempt + 1 < _SCORE_COUNT_ATTEMPTS:
-                continue
             qualifier = " for identical trajectories" if all_identical else ""
-            raise ValueError(
+            structure_error = ValueError(
                 f"Expected {expected_scores} score{'' if expected_scores == 1 else 's'}"
                 f"{qualifier}, but got {len(parsed.scores)}"
             )
+        expected_ids = [str(index) for index in range(1, expected_scores + 1)]
+        scores_by_id = {score.trajectory_id: score for score in parsed.scores}
+        if structure_error is None and (
+            len(scores_by_id) != expected_scores
+            or set(scores_by_id) != set(expected_ids)
+        ):
+            structure_error = ValueError(
+                f"Expected trajectory ids {expected_ids}, but got "
+                f"{[score.trajectory_id for score in parsed.scores]}"
+            )
+        if structure_error is not None:
+            if attempt + 1 < _STRUCTURAL_ATTEMPTS:
+                continue
+            raise structure_error
+
+        ordered_scores = [scores_by_id[trajectory_id] for trajectory_id in expected_ids]
 
         # If all trajectories were identical, we only sent one to the judge.
         # Duplicate the score for all trajectories.
         if all_identical:
-            single_score = parsed.scores[0]
+            single_score = ordered_scores[0]
             return [
                 single_score.model_copy(update={"trajectory_id": str(i)})
                 for i in range(1, len(message_lists) + 1)
             ]
-        return parsed.scores
+        return ordered_scores
 
-    raise AssertionError("RULER score-count retry loop did not return")
+    raise AssertionError("RULER structural retry loop did not return")
 
 
 async def ruler_score_group(
