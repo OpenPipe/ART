@@ -276,7 +276,7 @@ def test_forward_micro_batches_prewarms_next_wave_during_yield(
     rank = TrainerRank(_runtime())
     monkeypatch.setattr(rank, "_dp_rank_and_size", lambda: (0, 1))
     monkeypatch.setattr(rank, "_all_ranks_have_memory_profile", lambda **_kwargs: True)
-    inputs = [_target_request(_tokens(1, 2, 3, index)) for index in range(8)]
+    inputs = _unshared_requests(8)
     limit = rank._estimate_flat_forward(inputs[:4])
     assert limit is not None
     _set_packed_token_budget(monkeypatch, rank, lambda: limit[0])
@@ -307,6 +307,16 @@ def test_forward_micro_batches_prewarms_next_wave_during_yield(
 
     remaining = list(generator)
     assert [batch.stats.global_count for batch in remaining] == [4]
+
+
+def _unshared_requests(count: int) -> list[ForwardInput]:
+    """Rows with no shareable prefix, so packed tokens equal logical tokens
+    under every layout and packed-token budgets translate directly to waves."""
+
+    return [
+        _target_request(_tokens(1_000 + index, 2_000 + index, 3_000 + index, index))
+        for index in range(count)
+    ]
 
 
 def _prewarmed_rank(
@@ -347,7 +357,7 @@ def test_speculative_planning_uses_immutable_snapshots(
 ) -> None:
     """Mutating caller tensors after the yield must not poison the cache."""
 
-    inputs = [_target_request(_tokens(1, 2, 3, index)) for index in range(8)]
+    inputs = _unshared_requests(8)
     rank = _prewarmed_rank(monkeypatch, inputs, inputs[:4])
     original_rows = tuple(row.clone() for row in _rows(inputs[4:8]))
     original_key = rank._layout_cache_key(original_rows)
@@ -373,7 +383,7 @@ def test_speculative_planning_uses_immutable_snapshots(
 def test_speculative_planning_warms_this_dp_ranks_local_slice(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    inputs = [_target_request(_tokens(1, 2, 3, index)) for index in range(16)]
+    inputs = _unshared_requests(16)
     # Local budget of 4 items per rank -> global waves of 8 at DP2.
     rank = _prewarmed_rank(monkeypatch, inputs, inputs[0:8:2], dp=(0, 2))
 
@@ -424,10 +434,87 @@ def test_width_search_lets_prefix_sharing_widen_the_wave(
     assert [batch.stats.global_count for batch in batches] == [2]
 
 
+def _attention_runtime() -> "TrainingRuntime":
+    # Same structural fake as _runtime(), but an attention-only model support
+    # handler so the cost model applies no GDN sharing penalty.
+    return SimpleNamespace(
+        model=[_FakeGPT()],
+        optimizer=None,
+        provider=SimpleNamespace(hidden_size=8, num_layers=4),
+        model_support_handler=SimpleNamespace(build_gdn_execution_spec=False),
+    )  # type: ignore
+
+
+def test_width_search_survives_non_monotone_cost_optimal_layouts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Sharing can be declined at width 2 yet accepted at width 3.
+
+    Cost-optimal packed tokens are therefore not monotone in width (fits at
+    1, fails at 2, fits at 3 in this case). Feasibility must instead be judged
+    by the memory-minimal layout, which is monotone, so the search reaches
+    width 3 instead of stopping at the spurious failure.
+    """
+
+    shared = tuple(range(10_000, 10_040))
+    inputs = [_target_request(_tokens(*shared, tail)) for tail in (1, 2, 3)]
+    rank = TrainerRank(_attention_runtime())
+    monkeypatch.setattr(rank, "_dp_rank_and_size", lambda: (0, 1))
+    monkeypatch.setattr(rank, "_all_ranks_have_memory_profile", lambda **_kwargs: True)
+    monkeypatch.setattr(
+        rank,
+        "_run_flat_plan_with_memory_tracking",
+        lambda plan, **_kwargs: (
+            [ForwardOutput(None, None, None, None) for _ in range(plan.request_count)],
+            None,
+        ),
+    )
+    # Confirm the non-monotone premise under the production cost model.
+    two = rank._plan_flat_forward(inputs[:2])
+    three = rank._plan_flat_forward(inputs)
+    assert two.packed_tokens == 82, two.packed_tokens
+    assert three.packed_tokens == 43, three.packed_tokens
+    _set_packed_token_budget(monkeypatch, rank, 60)
+
+    batches = list(rank.forward_micro_batches(inputs))
+
+    assert [batch.stats.global_count for batch in batches] == [3]
+    assert batches[0].stats.packed_tokens <= 60
+
+
+def test_dp_rank_forward_falls_back_to_memory_minimal_layout_before_refusing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    shared = tuple(range(10_000, 10_040))
+    inputs = [_target_request(_tokens(*shared, tail)) for tail in (1, 2)]
+    rank = TrainerRank(_attention_runtime())
+    monkeypatch.setattr(rank, "_dp_rank_and_size", lambda: (0, 1))
+    executed: list[int] = []
+    monkeypatch.setattr(
+        rank,
+        "_run_flat_plan_with_memory_tracking",
+        lambda plan, **_kwargs: (
+            executed.append(plan.packed_tokens)
+            or [
+                ForwardOutput(None, None, None, None) for _ in range(plan.request_count)
+            ],
+            None,
+        ),
+    )
+    # Cost-optimal layout declines sharing (82 tokens); full sharing (42) fits.
+    _set_packed_token_budget(monkeypatch, rank, 60)
+
+    outputs = rank.dp_rank_forward(inputs)
+
+    assert len(outputs) == 2
+    assert executed == [42]
+    assert rank.last_forward_telemetry()["selected_max_depth"] == 2
+
+
 def test_forward_micro_batches_telemetry_reports_hidden_speculation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    inputs = [_target_request(_tokens(1, 2, 3, index)) for index in range(8)]
+    inputs = _unshared_requests(8)
     rank = _prewarmed_rank(monkeypatch, inputs, inputs[:4])
     list(rank.forward_micro_batches(inputs))
     telemetry = rank.last_forward_telemetry()
@@ -490,9 +577,11 @@ def test_adaptive_planner_materializes_only_final_large_candidate(
     estimate_calls = 0
     original_plan = rank._plan_flat_forward
     original_estimate = rank._estimate_flat_forward
+    # Unique leading tokens: no shareable prefix, so packed tokens equal
+    # logical tokens under every layout and the budget maps directly to width.
     inputs = [
         _target_request(
-            _tokens(1, 2, 3, index % 7, index),
+            _tokens(1_000 + index, 2, 3, index % 7, index),
             target_count=2 if index % 5 == 0 else 1,
             top_k=3 if index % 4 == 0 else None,
             hidden_states=index % 9 == 0,
@@ -608,7 +697,7 @@ def test_forward_micro_batches_shrinks_when_memory_budget_drops(
     rank = TrainerRank(_runtime())
     monkeypatch.setattr(rank, "_dp_rank_and_size", lambda: (0, 1))
     monkeypatch.setattr(rank, "_all_ranks_have_memory_profile", lambda **_kwargs: True)
-    inputs = [_target_request(_tokens(1, 2, 3, index)) for index in range(14)]
+    inputs = _unshared_requests(14)
     first_limit = rank._estimate_flat_forward(inputs[:8])
     tail_limit = rank._estimate_flat_forward(inputs[8:11])
     assert first_limit is not None

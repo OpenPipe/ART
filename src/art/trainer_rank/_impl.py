@@ -119,6 +119,11 @@ _TEST_HOOKS_ENV = "ART_TRAINER_RANK_TEST_HOOKS"
 _TEST_ANCHOR_ENV = "ART_TRAINER_RANK_TEST_ANCHOR"
 
 _U64_STRUCT = struct.Struct("<Q")
+
+# Layout selected when the cost-optimal layout cannot be admitted: full sharing
+# minimizes packed tokens, and its packed count is monotone in wave width, so
+# it is the feasibility predicate the width search relies on.
+_MEMORY_MINIMAL_ANCHOR = "full_sharing"
 _CHECKPOINT_PREFETCH_EXECUTOR: tuple[int, ThreadPoolExecutor] | None = None
 _CHECKPOINT_PREFETCH_EXECUTOR_LOCK = threading.Lock()
 
@@ -970,6 +975,7 @@ class TrainerRank:
             tuple[str, int, int, bool, int, str | None],
             tuple[CanonicalPrefixTree, PrefixTreeLayout],
         ] = OrderedDict()
+        self._tree_cache: OrderedDict[str, CanonicalPrefixTree] = OrderedDict()
         self._layout_cache_lock = threading.Lock()
         self._speculative_planner: ThreadPoolExecutor | None = None
         self._speculative_planning_future: Future[None] | None = None
@@ -1863,11 +1869,17 @@ class TrainerRank:
         with torch.set_grad_enabled(enabled):
             self._reset_planning_telemetry()
             materialized = _materialize(inputs)
-            plan = self._plan_flat_forward(
-                list(_flatten(materialized)), checkpoint=checkpoint
-            )
-            self._snapshot_planning_telemetry(plan)
+            requests = list(_flatten(materialized))
+            plan = self._plan_flat_forward(requests, checkpoint=checkpoint)
             check = self._memory_check(plan)
+            if not check.fits:
+                # Best effort before refusing: the memory-minimal (full
+                # sharing) layouts may fit where the cost-optimal ones do not.
+                plan = self._plan_flat_forward(
+                    requests, checkpoint=checkpoint, memory_minimal=True
+                )
+                check = self._memory_check(plan)
+            self._snapshot_planning_telemetry(plan)
             if not check.fits:
                 self._raise_memory_error(
                     plan,
@@ -2569,6 +2581,10 @@ class TrainerRank:
 
         estimates: dict[int, tuple[_MemoryCheck, bool, bool] | None] = {}
         plans: dict[int, _FlatForwardPlan] = {}
+        # Per-width layout mode chosen by admission: False = cost-optimal,
+        # True = memory-minimal (full sharing). Materialization must build the
+        # same layouts the admitted estimate priced.
+        layout_modes: dict[int, bool] = {}
         exact_failed_width: int | None = None
 
         def estimate(width: int) -> tuple[_MemoryCheck, bool, bool] | None:
@@ -2597,29 +2613,52 @@ class TrainerRank:
                 exact_failed_width is None or width < exact_failed_width
             ):
                 # The cheap no-sharing count is an upper bound: valid for
-                # accepting a width, not for rejecting one. Only when it
-                # rejects, price the width with the planner's actual layouts
-                # so prefix sharing's memory savings can buy a wider wave.
-                # Feasibility is treated as monotone in width (the search
-                # already relies on this), so widths at or above a width whose
-                # exact pricing failed skip the exact evaluation.
-                exact = self._estimate_flat_forward(
-                    local_requests, checkpoint=checkpoint, exact=True
-                )
-                assert exact is not None
-                packed_tokens, output_bytes, signature = exact
+                # accepting a width, not for rejecting one. When it rejects,
+                # price the width with the planner's cost-optimal layouts;
+                # if those still do not fit, price the memory-minimal (full
+                # sharing) layouts. The cost-optimal layout can decline
+                # sharing at one width and accept it at a wider one, so its
+                # packed count is not monotone in width — but full sharing's
+                # is, which makes "memory-minimal fits" the monotone
+                # feasibility predicate the outer search relies on. The
+                # admitted mode is recorded so materialization executes the
+                # same layouts that were priced.
                 logical_tokens = sum(
                     int(request.input_tokens.numel()) for request in local_requests
                 )
-                check = self._memory_check_required(
-                    self._estimate_required_memory_bytes_from_values(
-                        packed_tokens=packed_tokens,
-                        output_bytes=output_bytes,
-                        signature=signature,
-                        logical_tokens=logical_tokens,
-                    ),
-                    sync_across_dp=True,
-                )
+
+                def priced(exact: bool, memory_minimal: bool) -> _MemoryCheck | None:
+                    values = self._estimate_flat_forward(
+                        local_requests,
+                        checkpoint=checkpoint,
+                        exact=exact,
+                        memory_minimal=memory_minimal,
+                    )
+                    if values is None:
+                        return None
+                    return self._memory_check_required(
+                        self._estimate_required_memory_bytes_from_values(
+                            packed_tokens=values[0],
+                            output_bytes=values[1],
+                            signature=values[2],
+                            logical_tokens=logical_tokens,
+                        ),
+                        sync_across_dp=True,
+                    )
+
+                # Cheap full-sharing bound first: if even the memory-minimal
+                # layouts cannot fit, no planner pricing is needed.
+                minimal_bound = priced(exact=False, memory_minimal=True)
+                if minimal_bound is not None and minimal_bound.fits:
+                    for memory_minimal in (False, True):
+                        priced_check = priced(exact=True, memory_minimal=memory_minimal)
+                        assert priced_check is not None
+                        check = priced_check
+                        if check.fits:
+                            layout_modes[width] = memory_minimal
+                            break
+                elif minimal_bound is not None:
+                    check = minimal_bound
                 if not check.fits:
                     exact_failed_width = (
                         width
@@ -2643,8 +2682,16 @@ class TrainerRank:
             width = normalize(width)
             result = estimate(width)
             if result is None:
+                # Estimator unavailable (device inputs): admit on the
+                # materialized plan, trying the cost-optimal layouts first and
+                # the memory-minimal layouts if those do not fit.
                 plan = materialize(width)
                 check = self._memory_check(plan, sync_across_dp=True)
+                if not check.fits and not layout_modes.get(width, False):
+                    layout_modes[width] = True
+                    plans.pop(width, None)
+                    plan = materialize(width)
+                    check = self._memory_check(plan, sync_across_dp=True)
                 trusted = self._all_ranks_have_memory_profile(
                     packed_tokens=plan.packed_tokens,
                     signature=plan.signature,
@@ -2662,7 +2709,9 @@ class TrainerRank:
             if plan is None:
                 _, local_inputs = local_slice(width)
                 plan = self._plan_flat_forward(
-                    list(_flatten(local_inputs)), checkpoint=checkpoint
+                    list(_flatten(local_inputs)),
+                    checkpoint=checkpoint,
+                    memory_minimal=layout_modes.get(width, False),
                 )
                 plans[width] = plan
             return plan
@@ -2777,12 +2826,21 @@ class TrainerRank:
         )
         return cp_size, self._num_layers, uses_gdn
 
+    def _layout_anchor(self, *, memory_minimal: bool) -> str | None:
+        """Resolve the layout anchor: test forcing wins, else memory policy."""
+
+        forced = self._forced_test_anchor()
+        if forced is not None:
+            return forced
+        return _MEMORY_MINIMAL_ANCHOR if memory_minimal else None
+
     def _layout_cache_key(
         self,
         input_ids: Sequence[torch.Tensor],
+        *,
+        memory_minimal: bool = False,
     ) -> tuple[str, int, int, bool, int, str | None]:
         cp_size, layers, uses_gdn = self._planner_topology_facts()
-        anchor = self._forced_test_anchor()
         hasher = hashlib.sha256()
         for tensor in input_ids:
             row = tensor.detach().reshape(-1).cpu().contiguous()
@@ -2795,7 +2853,7 @@ class TrainerRank:
             layers,
             uses_gdn,
             COEFFICIENT_VERSION,
-            anchor,
+            self._layout_anchor(memory_minimal=memory_minimal),
         )
 
     def _cached_group_layout(
@@ -2815,22 +2873,31 @@ class TrainerRank:
     ) -> tuple[CanonicalPrefixTree, PrefixTreeLayout]:
         """Plan one group and memoize the result.
 
-        Pure with respect to TrainerRank state apart from the cache itself, so
-        it is safe to run on the speculative planning thread; a concurrent
-        duplicate computation of the same key is deterministic and harmless.
+        Pure with respect to TrainerRank state apart from the caches, so it is
+        safe to run on the speculative planning thread; a concurrent duplicate
+        computation of the same key is deterministic and harmless. The
+        canonical tree is cached by content alone so the cost-optimal and
+        memory-minimal layouts of one group share a single construction.
         """
 
-        _, cp_size, layers, uses_gdn, _, anchor = key
-        tree = build_canonical_prefix_tree(
-            tuple(tuple(tensor.reshape(-1).tolist()) for tensor in input_ids)
-        )
+        content_key, cp_size, layers, uses_gdn, _, anchor = key
+        with self._layout_cache_lock:
+            tree = self._tree_cache.get(content_key)
+            if tree is not None:
+                self._tree_cache.move_to_end(content_key)
+        if tree is None:
+            tree = build_canonical_prefix_tree(input_ids)
+            with self._layout_cache_lock:
+                self._tree_cache[content_key] = tree
+                while len(self._tree_cache) > _LAYOUT_SELECTION_CACHE_LIMIT:
+                    self._tree_cache.popitem(last=False)
         if anchor is not None:
             candidates = prefix_tree_layout_candidates(tree)
             matching = [
                 candidate for candidate in candidates if anchor in candidate.labels
             ]
             if len(matching) != 1:
-                raise ValueError(f"unknown forced test anchor {anchor!r}")
+                raise ValueError(f"unknown forced layout anchor {anchor!r}")
             layout = matching[0].layout
         else:
             layout = select_prefix_tree_layout(
@@ -2851,17 +2918,21 @@ class TrainerRank:
     def _select_group_layout(
         self,
         input_ids: Sequence[torch.Tensor],
+        *,
+        memory_minimal: bool = False,
     ) -> tuple[CanonicalPrefixTree, PrefixTreeLayout]:
         """Select one group's prefix-sharing layout, cached by content identity.
 
         The cache key is a raw-bytes content hash plus the topology, cost
-        coefficients, and (test-only) forced anchor, so identical steady-state
-        groups (or groups pre-planned speculatively during the caller's GPU
-        work) skip canonicalization and search entirely.
+        coefficients, and layout anchor, so identical steady-state groups (or
+        groups pre-planned speculatively during the caller's GPU work) skip
+        canonicalization and search entirely. ``memory_minimal`` selects the
+        full-sharing layout instead of the cost-optimal one; the width search
+        uses it when the cost-optimal layout cannot be admitted.
         """
 
         started = time.perf_counter()
-        key = self._layout_cache_key(input_ids)
+        key = self._layout_cache_key(input_ids, memory_minimal=memory_minimal)
         cached = self._cached_group_layout(key)
         if cached is None:
             cached = self._compute_group_layout(input_ids, key)
@@ -2972,6 +3043,7 @@ class TrainerRank:
         requests: Sequence[AnyForwardInput],
         *,
         checkpoint: AdapterSelection = Unset,
+        memory_minimal: bool = False,
     ) -> _FlatForwardPlan:
         plans: list[_ForwardGroupPlan] = []
         output_bytes = self._estimate_group_request_output_bytes(requests)
@@ -2983,7 +3055,9 @@ class TrainerRank:
                 self._forward_item(requests[index]) for index in group_indices
             )
             group_input_ids = tuple(item.input_ids for item in items)
-            tree, layout = self._select_group_layout(group_input_ids)
+            tree, layout = self._select_group_layout(
+                group_input_ids, memory_minimal=memory_minimal
+            )
             selected_max_depth = max(selected_max_depth, layout.maximum_depth)
             started = time.perf_counter()
             packed = materialize_prefix_tree_layout(
@@ -3024,15 +3098,18 @@ class TrainerRank:
         *,
         checkpoint: AdapterSelection = Unset,
         exact: bool = False,
+        memory_minimal: bool = False,
     ) -> tuple[int, int, _MemorySignature] | None:
         """Estimate packed tokens for width probing.
 
-        The default is the cheap no-sharing token count: an exact upper bound
-        on any planner-selected layout (safe for accepting a width), one
-        O(tokens) CPU walk, and it preserves the estimator's CUDA
-        None-contract. ``exact=True`` prices the planner's actual layouts
-        (memoized by content) and is used only when the upper bound would
-        reject a width.
+        Cheap mode (``exact=False``) is one O(tokens) CPU walk of the packing
+        primitive and preserves its CUDA None-contract: with
+        ``memory_minimal=False`` it is the no-sharing count, an upper bound on
+        any planner-selected layout (safe for accepting a width); with
+        ``memory_minimal=True`` it is the full-sharing count, the lower bound
+        whose feasibility is monotone in width (valid for rejecting one).
+        ``exact=True`` prices the planner's actual layouts (memoized by
+        content) and is used only inside the band where those bounds disagree.
         """
 
         groups = self._group_active_request_indices(requests, checkpoint=checkpoint)
@@ -3043,13 +3120,17 @@ class TrainerRank:
                     tuple(
                         requests[index].input_tokens.reshape(-1).to(dtype=torch.long)
                         for index in group_indices
-                    )
+                    ),
+                    memory_minimal=memory_minimal,
                 )
                 packed_tokens += layout.packed_tokens
                 continue
+            # Radix depth is bounded by the number of rows, so ``len(group)``
+            # is an unlimited-sharing depth for this group; it is a bound for
+            # estimation, not a sharing policy.
             group_packed_tokens = estimate_prefix_tree_packed_tokens(
                 (requests[index].input_tokens.reshape(-1) for index in group_indices),
-                max_depth=0,
+                max_depth=len(group_indices) if memory_minimal else 0,
             )
             if group_packed_tokens is None:
                 return None

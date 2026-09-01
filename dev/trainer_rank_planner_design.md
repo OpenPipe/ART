@@ -91,6 +91,22 @@ GRPO cells (sealed: full-sharing arm 875.7 ms vs automatic 1,132.8 ms on the
 win cell). Constants are versioned (`coefficient_version`) for future
 recalibration; not addressed in this PR.
 
+## Width feasibility is decided by the memory-minimal layout
+
+The cost-optimal layout can decline sharing at one width and accept it at a
+wider one, so its packed-token count — and therefore "does the cost-optimal
+plan fit" — is not monotone in wave width (research review reproduced: fits
+at width 1, fails at 2, fits at 3). The width search's exponential/binary
+structure requires a monotone predicate, so feasibility is defined as "the
+memory-minimal (full-sharing) layout fits": full sharing minimizes packed
+tokens and its count is monotone in width by construction. Admission then
+executes the cost-optimal layout when it fits and the memory-minimal layout
+otherwise; the chosen mode is recorded per width so materialization builds
+exactly the layouts that were priced. `dp_rank_forward` applies the same
+fallback before refusing. Both bounds are cheap O(tokens) walks of the packing
+primitive (no-sharing and unlimited-depth sharing); planner pricing runs only
+inside the band where they disagree.
+
 ## Planning cost engineering
 
 Two behavior-preserving optimizations keep exact width pricing cheap:
@@ -103,9 +119,8 @@ Two behavior-preserving optimizations keep exact width pricing cheap:
   construction instead of recomputing them per Pareto comparison — 28 ms ->
   5 ms per search on an 8-decision tree, identical results (210 baseline
   fingerprints).
-- Width probing skips exact pricing at or above a width whose exact pricing
-  already failed (feasibility is treated as monotone in width, as the search
-  already assumes).
+- Width probing skips exact pricing at or above a width whose memory-minimal
+  layout already failed (the monotone predicate above).
 Benchmark (2-layer, fresh tokens, forced multi-wave): per-step planning
 67.7 ms -> 42.3 ms, step wall 185.8 ms -> 160.7 ms with sharing-aware widths
 (2 waves) — within ~5% of the no-sharing-bound 4-wave step (153.5 ms) while
