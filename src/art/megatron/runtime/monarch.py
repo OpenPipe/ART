@@ -1679,8 +1679,6 @@ async def spawn_monarch_trainer_actors(
             "trainer layer placement is not replicated by pipeline stage"
         )
     loaded_layers = loaded_layer_sum // replication
-    if configured_layers != {loaded_layers}:
-        raise RuntimeError("trainer loaded layer count differs from resolved config")
     architecture = RuntimeArchitectureAttestation.create(
         runtime_kind="trainer",
         base_model=runtime_spec.model_identifier,

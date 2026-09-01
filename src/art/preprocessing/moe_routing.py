@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import os
-import time
 from typing import Any, cast
 
 import numpy as np
@@ -50,8 +48,6 @@ class MoeRoutingAlignmentStats(BaseModel):
     routed_tokens: int = 0
     prompt_route_bytes: int = 0
     completion_route_bytes: int = 0
-    token_id_validation_s: float = 0.0
-    append_overlay_s: float = 0.0
 
 
 class MoeRoutingPackStats(BaseModel):
@@ -245,7 +241,6 @@ def align_choice_routes_to_tokenized_result(
             num_experts = prompt_routes.num_experts
         elif num_experts != prompt_routes.num_experts:
             raise RuntimeError("MoE route captures disagree on exact expert count")
-        timing_start = _route_alignment_time_ns()
         if prompt_token_ids != token_ids[:offset]:
             raise RuntimeError(
                 "vLLM routed prompt token ids do not match ART-tokenized prefix: "
@@ -258,7 +253,6 @@ def align_choice_routes_to_tokenized_result(
                 f"offset={offset}, vllm_len={len(completion_token_ids)}, "
                 f"art_len={token_length}"
             )
-        _add_route_alignment_elapsed(stats, "token_id_validation_s", timing_start)
         if prompt_routes.shape[0] != len(prompt_token_ids):
             raise RuntimeError(
                 "Binary prompt route length does not match prompt_token_ids: "
@@ -281,8 +275,7 @@ def align_choice_routes_to_tokenized_result(
             aligned,
             route_mask,
             covered_until,
-        ) = _timed_append_or_overlay_routes(
-            stats=stats,
+        ) = _append_or_overlay_routes(
             aligned=aligned,
             route_mask=route_mask,
             route_segments=route_segments,
@@ -296,8 +289,7 @@ def align_choice_routes_to_tokenized_result(
             aligned,
             route_mask,
             covered_until,
-        ) = _timed_append_or_overlay_routes(
-            stats=stats,
+        ) = _append_or_overlay_routes(
             aligned=aligned,
             route_mask=route_mask,
             route_segments=route_segments,
@@ -334,34 +326,6 @@ def align_choice_routes_to_tokenized_result(
     route_segments.append(missing)
     stats.routed_tokens = covered_until
     return MoeRouteSegments(segments=tuple(route_segments)), stats
-
-
-def _timed_append_or_overlay_routes(
-    *,
-    stats: MoeRoutingAlignmentStats,
-    aligned: np.ndarray | None,
-    route_mask: np.ndarray | None,
-    route_segments: list[MoeRouteArray],
-    covered_until: int,
-    token_count: int,
-    route_shape: tuple[int, int],
-    start: int,
-    routes: MoeRouteArray,
-) -> tuple[np.ndarray | None, np.ndarray | None, int]:
-    timing_start = _route_alignment_time_ns()
-    try:
-        return _append_or_overlay_routes(
-            aligned=aligned,
-            route_mask=route_mask,
-            route_segments=route_segments,
-            covered_until=covered_until,
-            token_count=token_count,
-            route_shape=route_shape,
-            start=start,
-            routes=routes,
-        )
-    finally:
-        _add_route_alignment_elapsed(stats, "append_overlay_s", timing_start)
 
 
 def _append_or_overlay_routes(
@@ -557,23 +521,3 @@ def deterministic_moe_routes(
     for slot in range(topk):
         routes[:, :, slot] = (base + slot) % num_experts
     return MoeRouteArray(routes, num_experts=num_experts, validate=False)
-
-
-def _route_alignment_time_ns() -> int:
-    return (
-        time.perf_counter_ns()
-        if os.environ.get("ART_PROFILE_MOE_ROUTE_ALIGNMENT") == "1"
-        else 0
-    )
-
-
-def _add_route_alignment_elapsed(
-    stats: MoeRoutingAlignmentStats, field_name: str, start_ns: int
-) -> None:
-    if start_ns == 0:
-        return
-    setattr(
-        stats,
-        field_name,
-        float(getattr(stats, field_name)) + (time.perf_counter_ns() - start_ns) / 1e9,
-    )

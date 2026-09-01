@@ -14,7 +14,11 @@ from pydantic import BaseModel, ConfigDict, Field
 from ..serving_capabilities import ServingProfileIdentity
 from ..utils.lifecycle import ChildProcessSupervisor
 from ..vllm_runtime import ManagedVllmRuntime, VllmRuntimeLaunchConfig
-from .adapter_transport import AdapterReceiveResult, AdapterTransferTarget
+from .adapter_transport import (
+    AdapterReceivePoolState,
+    AdapterReceiveResult,
+    AdapterTransferTarget,
+)
 from .specs import ModelServiceMemberSpec, ModelServiceSpec
 
 
@@ -122,6 +126,8 @@ class ReplicaHostLauncher(Protocol):
     ) -> AdapterReceiveResult: ...
 
     async def release_adapter_receive(self, generation_id: str) -> None: ...
+
+    async def adapter_receive_state(self) -> AdapterReceivePoolState: ...
 
 
 class _ManagedMember:
@@ -451,6 +457,18 @@ class ReplicaManager:
                     self._rpc_timeout_s,
                 )
                 for launcher in self._host_launchers
+            )
+        )
+
+    async def adapter_transfer_state(self) -> tuple[AdapterReceivePoolState, ...]:
+        return tuple(
+            await asyncio.gather(
+                *(
+                    asyncio.wait_for(
+                        launcher.adapter_receive_state(), self._rpc_timeout_s
+                    )
+                    for launcher in self._host_launchers
+                )
             )
         )
 

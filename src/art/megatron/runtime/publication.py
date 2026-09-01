@@ -5,6 +5,7 @@ from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, model_validator
 
+from art.distributed.adapter_transport import AdapterSenderState
 from art.megatron.optimizer_state import (
     OptimizerAdapter,
     OptimizerShard,
@@ -29,6 +30,7 @@ class TrainerRankPublication(_PublicationModel):
     runtime_sha256: str | None = None
     topology: OptimizerTopology | None = None
     saves_optimizer: bool
+    adapter_transport_state: AdapterSenderState | None = None
 
     @model_validator(mode="after")
     def _validate_payload(self) -> "TrainerRankPublication":
@@ -58,6 +60,8 @@ class TrainerRankPublication(_PublicationModel):
                 raise ValueError("adapter and trainer generation identities differ")
         elif self.adapter is not None:
             raise ValueError("only rank zero may publish the adapter manifest")
+        if self.rank != 0 and self.adapter_transport_state is not None:
+            raise ValueError("only rank zero may report adapter transport state")
         if self.shard is not None and self.shard.rank != self.rank:
             raise ValueError("optimizer shard identifies another trainer rank")
         return self

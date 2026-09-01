@@ -11,7 +11,7 @@ from threading import Condition, Lock
 import time
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 import torch
 
 from art.utils.safetensors import PreparedSafetensors, save_prepared_safetensors
@@ -53,6 +53,46 @@ class AdapterReceiveResult(_TransportRecord):
     registration_s: float = Field(default=0, ge=0)
     sender_staging_s: float = Field(default=0, ge=0)
     sender_registration_s: float = Field(default=0, ge=0)
+
+
+class AdapterReceivePoolState(_TransportRecord):
+    """Bounded physical receiver state after one publication boundary."""
+
+    schema_version: Literal[1] = 1
+    host_id: str = Field(min_length=1)
+    pool_capacity: int = Field(ge=1)
+    registered_slots: int = Field(ge=0)
+    registered_capacity_bytes: int = Field(ge=0)
+    active_registered_slots: int = Field(ge=0)
+    pending_nixl_receives: int = Field(ge=0)
+    pending_local_receives: int = Field(ge=0)
+    materialized_generations: int = Field(ge=0)
+    pending_notifications: int = Field(ge=0)
+    closed: bool
+
+    @model_validator(mode="after")
+    def _validate_bounds(self) -> "AdapterReceivePoolState":
+        if (
+            self.registered_slots > self.pool_capacity
+            or self.active_registered_slots > self.registered_slots
+            or self.pending_nixl_receives > self.pool_capacity
+            or self.pending_local_receives > self.pool_capacity
+        ):
+            raise ValueError("adapter receiver state exceeds its configured pool")
+        return self
+
+
+class AdapterSenderState(_TransportRecord):
+    """Bounded sender registrations and completed physical transfer lanes."""
+
+    schema_version: Literal[1] = 1
+    transport: Literal["idle", "local", "nixl", "mixed"]
+    active_transfers: int = Field(ge=0)
+    completed_transfers: int = Field(ge=0)
+    registered_buffers: int = Field(ge=0, le=1)
+    registered_capacity_bytes: int = Field(ge=0)
+    remote_agents: int = Field(ge=0)
+    closed: bool
 
 
 class AdapterTransferNotification(_TransportRecord):
@@ -412,6 +452,30 @@ class AdapterSnapshotReceiver:
             if path.exists():
                 rmtree(path)
 
+    def state(self) -> AdapterReceivePoolState:
+        with self._condition:
+            slots = tuple(self._slots)
+            pending_nixl = len(self._pending)
+            pending_local = len(self._local_pending)
+            materialized = len(self._materialized)
+            closed = self._closed
+        with self._agent_lock:
+            notifications = len(self._notifications)
+        return AdapterReceivePoolState(
+            host_id=self.host_id,
+            pool_capacity=self.pool_capacity,
+            registered_slots=len(slots),
+            registered_capacity_bytes=sum(slot.block.numel() for slot in slots),
+            active_registered_slots=sum(
+                slot.generation_id is not None for slot in slots
+            ),
+            pending_nixl_receives=pending_nixl,
+            pending_local_receives=pending_local,
+            materialized_generations=materialized,
+            pending_notifications=notifications,
+            closed=closed,
+        )
+
     def _finish_local(self, generation_id: str) -> None:
         pending = self._local_pending.pop(generation_id)
         pending.listener.close()
@@ -506,6 +570,9 @@ class NixlAdapterSender:
         self._block: torch.Tensor | None = None
         self._registration: Any | None = None
         self._remote_agents: dict[tuple[str, str], str] = {}
+        self._active_transfers = 0
+        self._completed_transfers = 0
+        self._closed = False
 
     def send(
         self,
@@ -552,24 +619,26 @@ class NixlAdapterSender:
                 self._remote_agents[key] = remote_agent
             if remote_agent != target.remote_agent:
                 raise RuntimeError("NIXL target returned the wrong agent identity")
-            handle = agent.initialize_xfer(
-                "WRITE",
-                local_descriptors,
-                agent.get_xfer_descs(
-                    [
-                        (
-                            target.remote_address,
-                            used_bytes,
-                            target.remote_device_id,
-                        )
-                    ],
-                    mem_type="DRAM",
-                ),
-                remote_agent,
-                notification,
-                backends=["UCX"],
-            )
+            self._active_transfers += 1
+            handle = None
             try:
+                handle = agent.initialize_xfer(
+                    "WRITE",
+                    local_descriptors,
+                    agent.get_xfer_descs(
+                        [
+                            (
+                                target.remote_address,
+                                used_bytes,
+                                target.remote_device_id,
+                            )
+                        ],
+                        mem_type="DRAM",
+                    ),
+                    remote_agent,
+                    notification,
+                    backends=["UCX"],
+                )
                 state = agent.transfer(handle)
                 deadline = time.monotonic() + target.transfer_timeout_s
                 while state == "PROC":
@@ -584,8 +653,11 @@ class NixlAdapterSender:
                     raise RuntimeError(
                         f"NIXL adapter transfer failed for {target.host_id}"
                     )
+                self._completed_transfers += 1
             finally:
-                handle.release()
+                if handle is not None:
+                    handle.release()
+                self._active_transfers -= 1
 
     def _ensure_capacity(self, used_bytes: int) -> float:
         if self._block is not None and self._block.numel() >= used_bytes:
@@ -613,6 +685,20 @@ class NixlAdapterSender:
             self._agent.deregister_memory(self._registration, backends=["UCX"])
         self._block = None
         self._registration = None
+        self._closed = True
+
+    def state(self) -> AdapterSenderState:
+        return AdapterSenderState(
+            transport="nixl",
+            active_transfers=self._active_transfers,
+            completed_transfers=self._completed_transfers,
+            registered_buffers=int(self._registration is not None),
+            registered_capacity_bytes=(
+                0 if self._block is None else self._block.numel()
+            ),
+            remote_agents=len(self._remote_agents),
+            closed=self._closed,
+        )
 
     def _require_agent(self) -> Any:
         if self._agent is None:
@@ -625,6 +711,8 @@ class AdapterSnapshotSender:
 
     def __init__(self) -> None:
         self._nixl: NixlAdapterSender | None = None
+        self._local_completed_transfers = 0
+        self._closed = False
 
     def send(
         self,
@@ -648,6 +736,31 @@ class AdapterSnapshotSender:
             )
             return
         self._send_local(snapshot, targets, prepared_tensors=prepared_tensors)
+        self._local_completed_transfers += len(targets)
+
+    def state(self) -> AdapterSenderState:
+        if self._nixl is not None:
+            nixl = self._nixl.state()
+            return nixl.model_copy(
+                update={
+                    "transport": (
+                        "mixed" if self._local_completed_transfers else "nixl"
+                    ),
+                    "completed_transfers": (
+                        nixl.completed_transfers + self._local_completed_transfers
+                    ),
+                    "closed": self._closed,
+                }
+            )
+        return AdapterSenderState(
+            transport="local" if self._local_completed_transfers else "idle",
+            active_transfers=0,
+            completed_transfers=self._local_completed_transfers,
+            registered_buffers=0,
+            registered_capacity_bytes=0,
+            remote_agents=0,
+            closed=self._closed,
+        )
 
     @staticmethod
     def _send_local(
@@ -685,3 +798,4 @@ class AdapterSnapshotSender:
         if self._nixl is not None:
             self._nixl.close()
             self._nixl = None
+        self._closed = True

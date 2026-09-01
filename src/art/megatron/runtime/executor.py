@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING, Any, Literal
 
 import torch
 
-from art.distributed.adapter_transport import AdapterTransferTarget
+from art.distributed.adapter_transport import AdapterSenderState, AdapterTransferTarget
 from art.training.contracts import TokenLogprobs
 from art.utils.safetensors import PreparedSafetensors, SafetensorsLayout
 
@@ -2207,11 +2207,12 @@ class _GenerationPublisher:
                 self._lora_layout = SafetensorsLayout(lora.tensors)
             prepared_tensors = self._lora_layout.bind(lora.tensors)
         failures: list[BaseException] = []
+        adapter_transport_state: AdapterSenderState | None = None
         if int(self.runtime.rank) == 0 and publication_targets:
             if lora is None or prepared_tensors is None:
                 raise RuntimeError("rank zero has no LoRA snapshot to transfer")
             try:
-                self._transfer_lora_snapshot(
+                adapter_transport_state = self._transfer_lora_snapshot(
                     lora,
                     publication_targets,
                     prepared_tensors=prepared_tensors,
@@ -2227,6 +2228,7 @@ class _GenerationPublisher:
             adapter=adapter,
             optimizer=optimizer,
             prepared_tensors=prepared_tensors,
+            adapter_transport_state=adapter_transport_state,
             failures=failures,
         )
 
@@ -2240,6 +2242,7 @@ class _GenerationPublisher:
         adapter: "OptimizerAdapter | None",
         optimizer: Future[Any],
         prepared_tensors: PreparedSafetensors | None,
+        adapter_transport_state: AdapterSenderState | None,
         failures: list[BaseException],
     ) -> TrainerRankPublication:
         record: TrainerRankPublication | None = None
@@ -2256,6 +2259,7 @@ class _GenerationPublisher:
                 adapter=adapter,
                 optimizer=resolved_optimizer,
                 prepared_tensors=prepared_tensors,
+                adapter_transport_state=adapter_transport_state,
             )
         except BaseException as error:
             failures.append(error)
@@ -2275,7 +2279,7 @@ class _GenerationPublisher:
         targets: tuple[Any, ...],
         *,
         prepared_tensors: PreparedSafetensors,
-    ) -> None:
+    ) -> AdapterSenderState:
         from art.distributed.adapter_transport import AdapterSnapshotSender
 
         if self._transport_sender is None:
@@ -2285,6 +2289,7 @@ class _GenerationPublisher:
             targets,
             prepared_tensors=prepared_tensors,
         )
+        return self._transport_sender.state()
 
     def _persist_generation(
         self,
@@ -2296,6 +2301,7 @@ class _GenerationPublisher:
         adapter: "OptimizerAdapter | None",
         optimizer: Any,
         prepared_tensors: PreparedSafetensors | None,
+        adapter_transport_state: AdapterSenderState | None,
     ) -> TrainerRankPublication:
         from art.megatron.optimizer_state import (
             publish_adapter_checkpoint,
@@ -2340,6 +2346,7 @@ class _GenerationPublisher:
             runtime_sha256=None if optimizer is None else optimizer.runtime_sha256,
             topology=None if optimizer is None else optimizer.topology,
             saves_optimizer=optimizer is not None,
+            adapter_transport_state=adapter_transport_state,
         )
 
     def _completed(

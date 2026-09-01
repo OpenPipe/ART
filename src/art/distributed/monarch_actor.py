@@ -150,6 +150,10 @@ class AdapterTransferHostService(Actor):
         await asyncio.to_thread(self._receiver.release, generation_id)
 
     @resilient_endpoint
+    async def state(self):
+        return await asyncio.to_thread(self._receiver.state)
+
+    @resilient_endpoint
     async def close(self) -> None:
         await asyncio.to_thread(self._receiver.close)
 

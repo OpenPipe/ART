@@ -6,6 +6,7 @@ from contextlib import asynccontextmanager
 import hashlib
 from http import HTTPStatus
 import json
+import logging
 import math
 from pathlib import Path
 import time
@@ -40,6 +41,7 @@ from art.vllm_runtime import map_checkpoint_path_for_vllm
 from .model_support import get_model_support_handler
 from .operation_handler import (
     POLICY_ACTIVATION_LAG_METRIC,
+    MegatronAdapterTransportEvidence,
     MegatronArtifactResourcePlan,
     MegatronInferenceUpdateUsage,
     MegatronPolicyActivationTiming,
@@ -52,6 +54,8 @@ from .runtime.specs import (
     TrainerGeneration,
     TrainerRuntimeSpec,
 )
+
+_LOGGER = logging.getLogger(__name__)
 
 
 class MegatronPairedInferencePublisher:
@@ -338,6 +342,25 @@ class MegatronPairedInferencePublisher:
                     )
                 raise
             activated = time.monotonic()
+            transport_evidence = None
+            try:
+                sender_state = next(
+                    record.adapter_transport_state
+                    for record in records
+                    if record.rank == 0
+                )
+                if sender_state is None:
+                    raise RuntimeError(
+                        "paired publication has no sender transport state"
+                    )
+                transport_evidence = MegatronAdapterTransportEvidence(
+                    sender=sender_state,
+                    receivers=await manager.adapter_transfer_state(),
+                )
+            except Exception:
+                # The holder commit is already authoritative. Missing operator evidence
+                # is unknown coverage and must not turn a successful update into failure.
+                _LOGGER.exception("failed to collect paired adapter transport evidence")
             lag = MegatronPolicyActivationTiming(
                 trainer_completed_monotonic_s=trainer_completed,
                 serving_activated_monotonic_s=activated,
@@ -369,6 +392,7 @@ class MegatronPairedInferencePublisher:
                     staging_s=max(float(item.materialization_s) for item in received),
                     apply_s=update_apply_s,
                 ),
+                adapter_transport_evidence=transport_evidence,
                 holder_update_sequence=update_sequence,
                 holder_update_id=update_identity,
                 retained=(

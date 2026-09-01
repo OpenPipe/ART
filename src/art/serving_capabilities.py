@@ -14,7 +14,7 @@ from pydantic import (
 
 from art.runtime_attestation import RuntimeArchitectureAttestation
 
-ART_SERVING_PROTOCOL_VERSION = 11
+ART_SERVING_PROTOCOL_VERSION = 12
 
 ART_PRIVATE_CACHE_IDENTITY_HEADER = "x-art-cache-identity"
 ART_PRIVATE_REQUEST_IDENTITY_HEADER = "x-art-request-identity"
@@ -32,6 +32,7 @@ ServingFeature = Literal[
     "inplace_lora_load",
     "in_flight_lora_updates",
     "policy_token_spans",
+    "request_runtime_reports",
 ]
 
 
@@ -241,6 +242,14 @@ class PairedInferenceEndpoint(BaseModel):
             ART_RUNTIME_TARGET_HEADER: self.target_id,
         }
 
+    def request_runtime_report_url(self, request_identity: str) -> str:
+        if not re.fullmatch(_SHA256_PATTERN, request_identity):
+            raise ValueError("request_identity must be a lowercase SHA-256")
+        return (
+            f"{str(self.url).rstrip('/')}"
+            f"/art/internal/v1/requests/{request_identity}/report"
+        )
+
 
 class ServingCapabilities(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
@@ -252,6 +261,7 @@ class ServingCapabilities(BaseModel):
     inplace_lora_load: bool = False
     in_flight_lora_updates: bool = False
     policy_token_spans: bool = False
+    request_runtime_reports: bool = False
     profile: ServingProfile | None = None
 
     @model_validator(mode="after")

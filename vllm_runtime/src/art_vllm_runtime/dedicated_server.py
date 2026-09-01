@@ -47,7 +47,7 @@ from art_vllm_runtime.runtime_usage import (
     runtime_usage_journal,
 )
 
-ART_SERVING_PROTOCOL_VERSION = 11
+ART_SERVING_PROTOCOL_VERSION = 12
 _PRIVATE_CACHE_IDENTITY_HEADER = "x-art-cache-identity"
 _PRIVATE_COMPLETION_PATH = "/art/internal/v1/completions"
 _PRIVATE_DISPATCH_PATH = "/art/internal/v1/chat/completions"
@@ -136,6 +136,17 @@ class _PrivateExecutionReceipts:
         async with self._lock:
             return self._receipts.get(request_identity)
 
+    async def state(self) -> dict[str, int]:
+        async with self._lock:
+            active = sum(
+                receipt.execution == "started" for receipt in self._receipts.values()
+            )
+            return {
+                "execution_receipt_capacity": self.capacity,
+                "active_execution_receipts": active,
+                "terminal_execution_receipts": len(self._receipts) - active,
+            }
+
 
 @dataclass(frozen=True)
 class _LoraUpdateReceipt:
@@ -216,6 +227,17 @@ class _LoraUpdateReceipts:
     async def get(self, operation_id: str) -> _LoraUpdateReceipt | None:
         async with self._lock:
             return self._receipts.get(operation_id)
+
+    async def state(self) -> dict[str, int]:
+        async with self._lock:
+            active = sum(
+                receipt.state == "started" for receipt in self._receipts.values()
+            )
+            return {
+                "lora_update_receipt_capacity": self.capacity,
+                "active_lora_update_receipts": active,
+                "terminal_lora_update_receipts": len(self._receipts) - active,
+            }
 
 
 @dataclass(frozen=True)
@@ -1050,6 +1072,7 @@ def _patch_art_runtime_routes() -> None:
                     "inplace_lora_load": True,
                     "in_flight_lora_updates": True,
                     "policy_token_spans": True,
+                    "request_runtime_reports": True,
                     "profile": profile,
                 }
             )
@@ -1338,6 +1361,73 @@ def _patch_art_runtime_routes() -> None:
                 content={
                     "type": "execution_receipt",
                     "execution": receipt.execution,
+                }
+            )
+
+        @router.get(f"{_PRIVATE_EXECUTION_RECEIPT_PREFIX}/{{request_identity}}/report")
+        async def private_request_runtime_report(
+            request_identity: str, raw_request: Request
+        ) -> JSONResponse:
+            target_error = _private_runtime_target_error(
+                raw_request, execution="unknown"
+            )
+            if target_error is not None:
+                return target_error
+            if _SHA256_RE.fullmatch(request_identity) is None:
+                return JSONResponse(
+                    content={
+                        "error": "Invalid private request identity",
+                        "type": "invalid_private_context",
+                        "execution": "not_started",
+                    },
+                    status_code=HTTPStatus.BAD_REQUEST.value,
+                )
+            from art_vllm_runtime.engine_core import query_engine_cores
+
+            reports = await query_engine_cores(
+                engine(raw_request), "art_request_runtime_report", request_identity
+            )
+            present = tuple(
+                report for report in reports if report["report"] is not None
+            )
+            receipt = await _private_execution_receipts.get(request_identity)
+            if not present and receipt is None:
+                return JSONResponse(
+                    content={
+                        "type": "request_runtime_report_missing",
+                        "execution": "unknown",
+                    },
+                    status_code=HTTPStatus.NOT_FOUND.value,
+                )
+            return JSONResponse(
+                content={
+                    "schema_version": 1,
+                    "type": "request_runtime_report",
+                    "request_identity": request_identity,
+                    "execution": ("unknown" if receipt is None else receipt.execution),
+                    "runtime": {
+                        "target_id": _runtime_target_id,
+                        "process_uuid": _runtime_state.get("process_uuid"),
+                        "generation": _runtime_state.get("generation"),
+                        "runtime_source_id": _runtime_state.get("runtime_source_id"),
+                        "runtime_source_epoch": _runtime_state.get(
+                            "runtime_source_epoch"
+                        ),
+                        "model": _runtime_state.get("runtime_model"),
+                        "serving_profile_identity": _runtime_state.get(
+                            "serving_profile_identity"
+                        ),
+                    },
+                    "engine_reports": [
+                        {"engine_index": index, **report}
+                        for index, report in enumerate(reports)
+                    ],
+                    "bounded_state": {
+                        **await _private_execution_receipts.state(),
+                        **await _lora_update_receipts.state(),
+                        **await _private_route_responses.state(),
+                        **runtime_usage_journal().state(),
+                    },
                 }
             )
 

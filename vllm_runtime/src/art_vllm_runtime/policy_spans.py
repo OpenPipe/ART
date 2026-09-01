@@ -836,9 +836,11 @@ def _patch_scheduler_policy_span_transport() -> None:
                     _flush_complete_prompt_spans(
                         request, outputs_by_request.get(req_id)
                     )
+            from art_vllm_runtime.request_reports import observe_scheduler_step
             from art_vllm_runtime.resource_usage import attach_scheduler_usage
 
             attach_scheduler_usage(self, scheduler_output, outputs_by_client)
+            observe_scheduler_step(self, scheduler_output, requests)
             return outputs_by_client
 
         update_from_output.__art_policy_spans_patched__ = True  # type: ignore[attr-defined]
@@ -849,10 +851,17 @@ def _patch_scheduler_policy_span_transport() -> None:
         return
 
     def _preempt_request(self: Any, request: Any, timestamp: float) -> None:
+        from art_vllm_runtime.request_reports import (
+            observe_preemption,
+            request_snapshot,
+        )
+
+        before = request_snapshot(self, request)
         original_preempt(self, request, timestamp)
         if hasattr(request, ART_PROMPT_POLICY_TOKEN_SPANS_FIELD):
             delattr(request, ART_PROMPT_POLICY_TOKEN_SPANS_FIELD)
         _rebase_preempted_request_policy_history(request)
+        observe_preemption(self, request, before=before)
 
     _preempt_request.__art_policy_spans_patched__ = True  # type: ignore[attr-defined]
     Scheduler._preempt_request = _preempt_request  # type: ignore[method-assign]
@@ -1315,6 +1324,17 @@ def _patch_policy_lora_update_rpc() -> None:
 
         EngineCore.art_declare_loaded_lora_policy = art_declare_loaded_lora_policy  # type: ignore[attr-defined]
 
+    if not hasattr(EngineCore, "art_request_runtime_report"):
+
+        def art_request_runtime_report(
+            self: Any, request_identity: str
+        ) -> dict[str, Any]:
+            from art_vllm_runtime.request_reports import request_runtime_report
+
+            return request_runtime_report(self.scheduler, request_identity)
+
+        EngineCore.art_request_runtime_report = art_request_runtime_report  # type: ignore[attr-defined]
+
 
 def _apply_policy_lora_update(
     engine_core: Any, payload: dict[str, Any]
@@ -1353,12 +1373,18 @@ def _transition_scheduler_policy_history(
     previous_policy: Mapping[str, Any] | None,
     started_request_ids: set[str],
 ) -> dict[str, int]:
+    from art_vllm_runtime.request_reports import (
+        observe_policy_transition,
+        request_snapshot,
+    )
+
     _validate_continued_policy_update(scheduler, started_request_ids)
     updated = 0
     continued = 0
     for request in scheduler.requests.values():
         if not _request_uses_lora_slot(request, lora_request.lora_name):
             continue
+        before = request_snapshot(scheduler, request)
         previous_digest = getattr(request, _POLICY_HISTORY_BASE_FIELD, None)
         if request.request_id in started_request_ids:
             continued += 1
@@ -1428,6 +1454,18 @@ def _transition_scheduler_policy_history(
                 int(getattr(request, "num_preemptions", 0) or 0),
                 len(getattr(request, "output_token_ids", ())),
             ),
+        )
+        observe_policy_transition(
+            scheduler,
+            request,
+            before=before,
+            previous_policy=previous_policy,
+            next_policy={
+                "lora_slot": lora_request.lora_name,
+                "generation_id": lora_request.generation_id,
+                "policy_version": lora_request.policy_version,
+                "update_seq": lora_request.update_seq,
+            },
         )
         updated += 1
     return {
