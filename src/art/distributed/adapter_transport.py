@@ -10,7 +10,9 @@ import socket
 from threading import Condition, Lock
 import time
 from typing import Any, Literal
+from urllib.parse import urlsplit
 
+import httpx
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 import torch
 
@@ -53,6 +55,50 @@ class AdapterReceiveResult(_TransportRecord):
     registration_s: float = Field(default=0, ge=0)
     sender_staging_s: float = Field(default=0, ge=0)
     sender_registration_s: float = Field(default=0, ge=0)
+    source_identity: str | None = Field(default=None, min_length=1, max_length=512)
+
+
+class ExternalAdapterObjectSource(_TransportRecord):
+    """One completed immutable LoRA object plus bounded PEFT metadata."""
+
+    generation_id: str = Field(
+        min_length=1,
+        max_length=255,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]*$",
+    )
+    source_identity: str = Field(min_length=1, max_length=512)
+    object_url: str = Field(min_length=1, max_length=8192, repr=False)
+    object_bytes: int = Field(gt=8, le=8 << 30)
+    object_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    adapter_config_json: str = Field(min_length=2, max_length=64 << 10)
+    adapter_config_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    lora_rank: int = Field(gt=0, le=4096)
+    target_modules: tuple[str, ...] = Field(min_length=1, max_length=4096)
+
+    @model_validator(mode="after")
+    def _validate_source(self) -> "ExternalAdapterObjectSource":
+        parsed = urlsplit(self.object_url)
+        if (
+            parsed.scheme != "https"
+            or not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.fragment
+        ):
+            raise ValueError("external adapter object requires an exact HTTPS URL")
+        config_bytes = self.adapter_config_json.encode()
+        if hashlib.sha256(config_bytes).hexdigest() != self.adapter_config_sha256:
+            raise ValueError("external adapter config digest changed")
+        config = _adapter_config(config_bytes)
+        if config["r"] != self.lora_rank:
+            raise ValueError("external adapter rank changed")
+        if tuple(config["target_modules"]) != self.target_modules:
+            raise ValueError("external adapter target modules changed")
+        if len(set(self.target_modules)) != len(self.target_modules) or any(
+            not module or len(module) > 512 for module in self.target_modules
+        ):
+            raise ValueError("external adapter target modules are invalid")
+        return self
 
 
 class AdapterReceivePoolState(_TransportRecord):
@@ -66,6 +112,7 @@ class AdapterReceivePoolState(_TransportRecord):
     active_registered_slots: int = Field(ge=0)
     pending_nixl_receives: int = Field(ge=0)
     pending_local_receives: int = Field(ge=0)
+    pending_object_receives: int = Field(default=0, ge=0)
     materialized_generations: int = Field(ge=0)
     pending_notifications: int = Field(ge=0)
     closed: bool
@@ -77,6 +124,7 @@ class AdapterReceivePoolState(_TransportRecord):
             or self.active_registered_slots > self.registered_slots
             or self.pending_nixl_receives > self.pool_capacity
             or self.pending_local_receives > self.pool_capacity
+            or self.pending_object_receives > self.pool_capacity
         ):
             raise ValueError("adapter receiver state exceeds its configured pool")
         return self
@@ -197,6 +245,156 @@ def _copy_payload(payload: PreparedSafetensors, block: torch.Tensor) -> None:
         raise RuntimeError("Adapter payload copy was incomplete")
 
 
+def _adapter_config(payload: bytes) -> dict[str, Any]:
+    try:
+        config = json.loads(payload)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError("external adapter config is not valid JSON") from error
+    if not isinstance(config, dict):
+        raise ValueError("external adapter config must be an object")
+    rank = config.get("r")
+    targets = config.get("target_modules")
+    if type(rank) is not int or not 0 < rank <= 4096:
+        raise ValueError("external adapter config has an invalid rank")
+    if (
+        not isinstance(targets, list)
+        or not targets
+        or len(targets) > 4096
+        or any(not isinstance(item, str) for item in targets)
+    ):
+        raise ValueError("external adapter config has invalid target modules")
+    if (
+        config.get("art_lora_format") != "vllm"
+        and str(config.get("peft_type", "")).upper() != "LORA"
+    ):
+        raise ValueError("external adapter config is not a vLLM-compatible LoRA")
+    return config
+
+
+_SAFETENSORS_FLOAT_BYTES = {
+    "F64": 8,
+    "F32": 4,
+    "F16": 2,
+    "BF16": 2,
+    "F8_E4M3": 1,
+    "F8_E5M2": 1,
+}
+
+
+def _validate_safetensors_file(path: Path, expected_bytes: int) -> None:
+    with path.open("rb") as source:
+        raw_header_bytes = source.read(8)
+        if len(raw_header_bytes) != 8:
+            raise RuntimeError("external adapter safetensors header is incomplete")
+        header_bytes = int.from_bytes(raw_header_bytes, "little")
+        if not 2 <= header_bytes <= min(64 << 20, expected_bytes - 8):
+            raise RuntimeError("external adapter safetensors header is unbounded")
+        try:
+            header = json.loads(source.read(header_bytes))
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise RuntimeError(
+                "external adapter safetensors header is invalid"
+            ) from error
+    if not isinstance(header, dict) or len(header) > 65_537:
+        raise RuntimeError("external adapter safetensors tensor table is invalid")
+    data_bytes = expected_bytes - 8 - header_bytes
+    extents: list[tuple[int, int]] = []
+    for name, tensor in header.items():
+        if name == "__metadata__":
+            if not isinstance(tensor, dict):
+                raise RuntimeError("external adapter safetensors metadata is invalid")
+            continue
+        if not isinstance(name, str) or not name or len(name) > 1024:
+            raise RuntimeError("external adapter safetensors tensor name is invalid")
+        if not isinstance(tensor, dict):
+            raise RuntimeError("external adapter safetensors tensor entry is invalid")
+        dtype_bytes = _SAFETENSORS_FLOAT_BYTES.get(tensor.get("dtype"))
+        shape = tensor.get("shape")
+        offsets = tensor.get("data_offsets")
+        if (
+            dtype_bytes is None
+            or not isinstance(shape, list)
+            or not 1 <= len(shape) <= 8
+            or any(type(value) is not int or value <= 0 for value in shape)
+            or not isinstance(offsets, list)
+            or len(offsets) != 2
+            or any(type(value) is not int or value < 0 for value in offsets)
+        ):
+            raise RuntimeError("external adapter safetensors tensor layout is invalid")
+        start, end = offsets
+        elements = 1
+        for value in shape:
+            elements *= value
+        if end <= start or end - start != elements * dtype_bytes or end > data_bytes:
+            raise RuntimeError("external adapter safetensors tensor extent is invalid")
+        extents.append((start, end))
+    if not extents:
+        raise RuntimeError("external adapter safetensors contains no tensors")
+    cursor = 0
+    for start, end in sorted(extents):
+        if start != cursor:
+            raise RuntimeError("external adapter safetensors extents are not complete")
+        cursor = end
+    if cursor != data_bytes:
+        raise RuntimeError("external adapter safetensors payload is incomplete")
+
+
+def _download_exact_object(
+    source: ExternalAdapterObjectSource,
+    path: Path,
+    *,
+    timeout_s: float,
+) -> None:
+    started = time.monotonic()
+    digest = hashlib.sha256()
+    received = 0
+    with path.open("xb") as output:
+        if hasattr(os, "posix_fallocate"):
+            os.posix_fallocate(output.fileno(), 0, source.object_bytes)
+        with httpx.Client(
+            follow_redirects=False,
+            timeout=httpx.Timeout(timeout_s, connect=min(30.0, timeout_s)),
+        ) as client:
+            with client.stream(
+                "GET",
+                source.object_url,
+                headers={"Accept-Encoding": "identity"},
+            ) as response:
+                if response.status_code != 200:
+                    raise RuntimeError(
+                        f"external adapter object returned HTTP {response.status_code}"
+                    )
+                if response.headers.get("content-encoding", "identity") != "identity":
+                    raise RuntimeError("external adapter object used content encoding")
+                length = response.headers.get("content-length")
+                if length is not None:
+                    try:
+                        declared = int(length)
+                    except ValueError as error:
+                        raise RuntimeError(
+                            "external adapter object has invalid content length"
+                        ) from error
+                    if declared != source.object_bytes:
+                        raise RuntimeError("external adapter object size changed")
+                for chunk in response.iter_bytes(1 << 20):
+                    if time.monotonic() - started > timeout_s:
+                        raise TimeoutError("external adapter object download timed out")
+                    received += len(chunk)
+                    if received > source.object_bytes:
+                        raise RuntimeError(
+                            "external adapter object exceeded its byte bound"
+                        )
+                    output.write(chunk)
+                    digest.update(chunk)
+        output.truncate(received)
+        output.flush()
+        os.fsync(output.fileno())
+    if received != source.object_bytes:
+        raise RuntimeError("external adapter object was incomplete")
+    if digest.hexdigest() != source.object_sha256:
+        raise RuntimeError("external adapter object digest changed")
+
+
 class AdapterSnapshotReceiver:
     """Owns receive buffers for immutable LoRA generations."""
 
@@ -215,8 +413,78 @@ class AdapterSnapshotReceiver:
         self._condition = Condition()
         self._notifications: dict[str, AdapterTransferNotification] = {}
         self._materialized: set[str] = set()
+        self._object_pending: set[str] = set()
         self._agent_lock = Lock()
         self._closed = False
+
+    def materialize_object(
+        self,
+        source: ExternalAdapterObjectSource,
+        timeout_s: float = 300.0,
+    ) -> AdapterReceiveResult:
+        """Download and validate a completed object into immutable local staging."""
+
+        started = time.monotonic()
+        with self._condition:
+            deadline = started + timeout_s
+            while len(self._object_pending) >= self.pool_capacity:
+                if self._closed:
+                    raise RuntimeError("adapter receive pool is closed")
+                remaining_s = deadline - time.monotonic()
+                if remaining_s <= 0:
+                    raise TimeoutError("external adapter receive pool remained full")
+                self._condition.wait(remaining_s)
+            if self._closed:
+                raise RuntimeError("adapter receive pool is closed")
+            if (
+                source.generation_id in self._pending
+                or source.generation_id in self._local_pending
+                or source.generation_id in self._object_pending
+                or source.generation_id in self._materialized
+            ):
+                raise RuntimeError(
+                    f"Adapter receive already exists: {source.generation_id}"
+                )
+            self._object_pending.add(source.generation_id)
+
+        path = self.output_root / source.generation_id
+        temporary = self.output_root / f".{source.generation_id}.{os.getpid()}.tmp"
+        try:
+            if path.exists() or temporary.exists():
+                raise RuntimeError("external adapter staging path already exists")
+            temporary.mkdir(parents=True)
+            model_path = temporary / "adapter_model.safetensors"
+            _download_exact_object(source, model_path, timeout_s=timeout_s)
+            config_path = temporary / "adapter_config.json"
+            config_path.write_text(source.adapter_config_json, encoding="utf-8")
+            _validate_safetensors_file(model_path, source.object_bytes)
+            with self._condition:
+                if self._closed:
+                    raise RuntimeError("adapter receive pool closed during download")
+            os.rename(temporary, path)
+            with self._condition:
+                self._materialized.add(source.generation_id)
+            return AdapterReceiveResult(
+                host_id=self.host_id,
+                generation_id=source.generation_id,
+                path=str(path),
+                tensor_bytes=source.object_bytes,
+                config_bytes=len(source.adapter_config_json.encode()),
+                materialization_s=time.monotonic() - started,
+                used_bytes=source.object_bytes,
+                capacity_bytes=source.object_bytes,
+                source_identity=source.source_identity,
+            )
+        except BaseException:
+            if temporary.exists():
+                from shutil import rmtree
+
+                rmtree(temporary)
+            raise
+        finally:
+            with self._condition:
+                self._object_pending.discard(source.generation_id)
+                self._condition.notify_all()
 
     def prepare(
         self,
@@ -439,7 +707,8 @@ class AdapterSnapshotReceiver:
             self._finish_local(generation_id)
         with self._agent_lock:
             self._notifications.pop(generation_id, None)
-        self._materialized.discard(generation_id)
+        with self._condition:
+            self._materialized.discard(generation_id)
         for root in (
             self.output_root,
             Path(
@@ -459,6 +728,7 @@ class AdapterSnapshotReceiver:
             slots = tuple(self._slots)
             pending_nixl = len(self._pending)
             pending_local = len(self._local_pending)
+            pending_object = len(self._object_pending)
             materialized = len(self._materialized)
             closed = self._closed
         with self._agent_lock:
@@ -473,6 +743,7 @@ class AdapterSnapshotReceiver:
             ),
             pending_nixl_receives=pending_nixl,
             pending_local_receives=pending_local,
+            pending_object_receives=pending_object,
             materialized_generations=materialized,
             pending_notifications=notifications,
             closed=closed,
@@ -551,6 +822,8 @@ class AdapterSnapshotReceiver:
         with self._condition:
             self._closed = True
             self._condition.notify_all()
+            while self._object_pending:
+                self._condition.wait()
         for generation_id in (
             *self._pending,
             *self._local_pending,

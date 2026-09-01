@@ -10,10 +10,6 @@ from typing import Any, Literal, Protocol, cast
 
 from pydantic import BaseModel, ConfigDict, Field, FiniteFloat, model_validator
 
-from art.distributed.adapter_transport import (
-    AdapterReceivePoolState,
-    AdapterSenderState,
-)
 from art.distributed.art_runtime import ArtRuntime, DistributedPackedBatch
 from art.distributed.packing import PackingRequest
 from art.distributed.rollout import RolloutModelSpec
@@ -188,15 +184,6 @@ class MegatronInferenceUpdateUsage(BaseModel):
     apply_s: FiniteFloat = Field(ge=0)
 
 
-class MegatronAdapterTransportEvidence(BaseModel):
-    """Neutral post-transfer state bound to one paired publication receipt."""
-
-    model_config = ConfigDict(extra="forbid", frozen=True)
-
-    sender: AdapterSenderState
-    receivers: tuple[AdapterReceivePoolState, ...] = Field(min_length=1, max_length=64)
-
-
 class MegatronSamplerPublicationReceipt(BaseModel):
     """Private durable proof for one operation-keyed serving publication."""
 
@@ -214,7 +201,6 @@ class MegatronSamplerPublicationReceipt(BaseModel):
     learner_version: int = Field(ge=0)
     policy_activation_timing: MegatronPolicyActivationTiming | None = None
     inference_update_usage: MegatronInferenceUpdateUsage | None = None
-    adapter_transport_evidence: MegatronAdapterTransportEvidence | None = None
     holder_update_sequence: int | None = Field(default=None, ge=0)
     holder_update_id: str | None = Field(default=None, min_length=1, max_length=255)
     retained: tuple[MegatronRetainedState, ...] = Field(min_length=1, max_length=8)

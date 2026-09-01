@@ -2375,6 +2375,9 @@ class DistributedMegatronService:
         endpoint = (
             "/art/in_flight_lora_update" if in_flight else "/v1/load_lora_adapter"
         )
+        source_root = Path(checkpoint)
+        model_bytes = (source_root / "adapter_model.safetensors").stat().st_size
+        config_bytes = (source_root / "adapter_config.json").stat().st_size
         payload = (
             {
                 "operation_id": hashlib.sha256(
@@ -2382,7 +2385,13 @@ class DistributedMegatronService:
                 ).hexdigest(),
                 "model_name": name,
                 "lora_slot": name,
-                "lora_path": path,
+                "source": {
+                    "path": path,
+                    "source_identity": self._generation_id_for_step(step),
+                    "layout": "peft_safetensors_v1",
+                    "model_bytes": model_bytes,
+                    "config_bytes": config_bytes,
+                },
                 "generation_id": self._generation_id_for_step(step),
                 "expected_generation_id": self._generation_id_for_step(active_step),
                 "policy_version": step,

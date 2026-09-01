@@ -23,7 +23,7 @@ from art.megatron.runtime.managed import MegatronRuntimeInfo
 from art.utils.lifecycle import complete_task, complete_to_thread
 from art.vllm_route_transport import hydrate_retained_route_bundles
 
-from .adapter_transport import AdapterSnapshotReceiver
+from .adapter_transport import AdapterSnapshotReceiver, ExternalAdapterObjectSource
 from .artifact_preflight import (
     ArtifactProbeCommand,
     ArtifactProbeResult,
@@ -144,6 +144,14 @@ class AdapterTransferHostService(Actor):
     @resilient_endpoint
     async def poll(self, generation_id: str):
         return await asyncio.to_thread(self._receiver.poll, generation_id)
+
+    @resilient_endpoint(concurrent=True)
+    async def materialize_object(
+        self, source: ExternalAdapterObjectSource, timeout_s: float
+    ):
+        return await asyncio.to_thread(
+            self._receiver.materialize_object, source, timeout_s
+        )
 
     @resilient_endpoint
     async def release(self, generation_id: str) -> None:

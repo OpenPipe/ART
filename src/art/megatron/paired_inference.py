@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from collections import Counter
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 import hashlib
 from http import HTTPStatus
 import json
@@ -20,6 +21,7 @@ from art.adapter_leases import in_flight_lora_name
 from art.distributed.adapter_transport import (
     AdapterReceiveResult,
     AdapterTransferTarget,
+    ExternalAdapterObjectSource,
 )
 from art.distributed.art_runtime import ArtRuntime
 from art.distributed.specs import ModelServiceSpec
@@ -41,7 +43,6 @@ from art.vllm_runtime import map_checkpoint_path_for_vllm
 from .model_support import get_model_support_handler
 from .operation_handler import (
     POLICY_ACTIVATION_LAG_METRIC,
-    MegatronAdapterTransportEvidence,
     MegatronArtifactResourcePlan,
     MegatronInferenceUpdateUsage,
     MegatronPolicyActivationTiming,
@@ -56,6 +57,20 @@ from .runtime.specs import (
 )
 
 _LOGGER = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True, slots=True)
+class MegatronExternalLoraApplyResult:
+    runtime_lora_name: str
+    generation_id: str
+    policy_version: int
+    holder_update_sequence: int
+    holder_update_id: str
+    source_identity: str
+    tensor_bytes: int
+    config_bytes: int
+    staging_s: float
+    apply_s: float
 
 
 class MegatronPairedInferencePublisher:
@@ -81,9 +96,14 @@ class MegatronPairedInferencePublisher:
         self.architecture_attestation = endpoint.profile.architecture
         self.api_key = api_key
         self._lock = asyncio.Lock()
+        self._publication_locks: dict[str, asyncio.Lock] = {}
+        self._active_publications = 0
+        self._publications_idle = asyncio.Event()
+        self._publications_idle.set()
         self._active_generations: dict[str, str] = {}
+        self._active_update_sequences: dict[str, int] = {}
         self._retained_transfers: dict[str, tuple[Any, str]] = {}
-        self._retained_adapter_paths: dict[str, str] = {}
+        self._retained_adapter_sources: dict[str, dict[str, object]] = {}
         self._activated_publications: dict[
             tuple[str, int], MegatronSamplerPublicationReceipt
         ] = {}
@@ -184,6 +204,22 @@ class MegatronPairedInferencePublisher:
         return self._activated_publications.get((public_alias, learner_version))
 
     @asynccontextmanager
+    async def _publication_scope(self, public_alias: str) -> AsyncIterator[None]:
+        alias_lock = self._publication_locks.setdefault(public_alias, asyncio.Lock())
+        async with alias_lock:
+            async with self._lock:
+                self._require_open()
+                self._active_publications += 1
+                self._publications_idle.clear()
+            try:
+                yield
+            finally:
+                async with self._lock:
+                    self._active_publications -= 1
+                    if self._active_publications == 0:
+                        self._publications_idle.set()
+
+    @asynccontextmanager
     async def exact_publication_lease(
         self,
         public_alias: str,
@@ -231,7 +267,7 @@ class MegatronPairedInferencePublisher:
             else f"{alias}@{generation.policy_step}"
         )
         publication_key = (alias, generation.policy_step)
-        async with self._lock:
+        async with self._publication_scope(alias):
             self._require_open()
             prior = self._activated_publications.get(publication_key)
             if prior is not None:
@@ -252,7 +288,8 @@ class MegatronPairedInferencePublisher:
                     "paired publication learner lineage is not monotonic"
                 )
             manager = self.runtime.model_service(self.service.name)
-            await self._release_pending_transfers()
+            async with self._lock:
+                await self._release_pending_transfers()
             targets = await manager.prepare_adapter_transfer(
                 generation.generation_id,
                 template_adapter_path,
@@ -311,7 +348,13 @@ class MegatronPairedInferencePublisher:
                 "operation_id": operation.operation_id,
                 "model_name": runtime_lora_name,
                 "lora_slot": runtime_lora_name,
-                "lora_path": map_checkpoint_path_for_vllm(self.config, checkpoint),
+                "source": {
+                    "path": map_checkpoint_path_for_vllm(self.config, checkpoint),
+                    "source_identity": generation.generation_id,
+                    "layout": "peft_safetensors_v1",
+                    "model_bytes": tensor_bytes,
+                    "config_bytes": config_bytes,
+                },
                 "generation_id": generation.generation_id,
                 "expected_generation_id": expected_generation,
                 "policy_version": generation.policy_step,
@@ -342,25 +385,6 @@ class MegatronPairedInferencePublisher:
                     )
                 raise
             activated = time.monotonic()
-            transport_evidence = None
-            try:
-                sender_state = next(
-                    record.adapter_transport_state
-                    for record in records
-                    if record.rank == 0
-                )
-                if sender_state is None:
-                    raise RuntimeError(
-                        "paired publication has no sender transport state"
-                    )
-                transport_evidence = MegatronAdapterTransportEvidence(
-                    sender=sender_state,
-                    receivers=await manager.adapter_transfer_state(),
-                )
-            except Exception:
-                # The holder commit is already authoritative. Missing operator evidence
-                # is unknown coverage and must not turn a successful update into failure.
-                _LOGGER.exception("failed to collect paired adapter transport evidence")
             lag = MegatronPolicyActivationTiming(
                 trainer_completed_monotonic_s=trainer_completed,
                 serving_activated_monotonic_s=activated,
@@ -392,7 +416,6 @@ class MegatronPairedInferencePublisher:
                     staging_s=max(float(item.materialization_s) for item in received),
                     apply_s=update_apply_s,
                 ),
-                adapter_transport_evidence=transport_evidence,
                 holder_update_sequence=update_sequence,
                 holder_update_id=update_identity,
                 retained=(
@@ -423,15 +446,18 @@ class MegatronPairedInferencePublisher:
                     },
                 ),
             )
-            retained_path = map_checkpoint_path_for_vllm(self.config, checkpoint)
-            prior_transfer = self._retained_transfers.get(runtime_lora_name)
-            self._active_generations[runtime_lora_name] = generation.generation_id
-            self._retained_transfers[runtime_lora_name] = (
-                manager,
-                generation.generation_id,
-            )
-            self._retained_adapter_paths[runtime_lora_name] = retained_path
-            self._record_activated_publication(receipt)
+            async with self._lock:
+                prior_transfer = self._retained_transfers.get(runtime_lora_name)
+                self._active_generations[runtime_lora_name] = generation.generation_id
+                self._active_update_sequences[runtime_lora_name] = update_sequence
+                self._retained_transfers[runtime_lora_name] = (
+                    manager,
+                    generation.generation_id,
+                )
+                self._retained_adapter_sources[runtime_lora_name] = cast(
+                    dict[str, object], payload["source"]
+                )
+                self._record_activated_publication(receipt)
 
             transfer_to_release = (
                 prior_transfer
@@ -446,6 +472,131 @@ class MegatronPairedInferencePublisher:
                 except BaseException:
                     self._retain_pending_transfer(release_manager, release_generation)
             return receipt
+
+    async def apply_external_adapter(
+        self,
+        *,
+        operation_id: str,
+        public_alias: str,
+        generation_id: str,
+        expected_generation_id: str | None,
+        policy_version: int,
+        source: ExternalAdapterObjectSource,
+        timeout_s: float = 300.0,
+    ) -> MegatronExternalLoraApplyResult:
+        """Materialize one exact object and apply it through the normal holder."""
+
+        async with self._publication_scope(public_alias):
+            return await self._apply_external_adapter(
+                operation_id=operation_id,
+                public_alias=public_alias,
+                generation_id=generation_id,
+                expected_generation_id=expected_generation_id,
+                policy_version=policy_version,
+                source=source,
+                timeout_s=timeout_s,
+            )
+
+    async def _apply_external_adapter(
+        self,
+        *,
+        operation_id: str,
+        public_alias: str,
+        generation_id: str,
+        expected_generation_id: str | None,
+        policy_version: int,
+        source: ExternalAdapterObjectSource,
+        timeout_s: float,
+    ) -> MegatronExternalLoraApplyResult:
+
+        if source.generation_id != generation_id:
+            raise ValueError("external adapter generation identity changed")
+        if not operation_id or not public_alias or policy_version < 0:
+            raise ValueError("external adapter apply identity is invalid")
+        self._require_open()
+        manager = self.runtime.model_service(self.service.name)
+        received = await manager.materialize_external_adapter(
+            source, timeout_s=timeout_s
+        )
+        runtime_lora_name = in_flight_lora_name(public_alias)
+        try:
+            checkpoint, tensor_bytes, config_bytes = _validate_external_received(
+                received, source, self.service
+            )
+            staged = {
+                "path": map_checkpoint_path_for_vllm(self.config, checkpoint),
+                "source_identity": source.source_identity,
+                "layout": "peft_safetensors_v1",
+                "model_bytes": tensor_bytes,
+                "config_bytes": config_bytes,
+            }
+            response = await self._post_update(
+                {
+                    "operation_id": operation_id,
+                    "model_name": runtime_lora_name,
+                    "lora_slot": runtime_lora_name,
+                    "source": staged,
+                    "generation_id": generation_id,
+                    "expected_generation_id": expected_generation_id,
+                    "policy_version": policy_version,
+                }
+            )
+            update_sequence = _response_int(response, "update_seq")
+            apply_s = _response_float(response, "apply_s")
+            update_identity = str(response["update_identity"])
+            if (
+                response.get("generation_id") != generation_id
+                or response.get("lora_slot") != runtime_lora_name
+                or response.get("source_identity") != source.source_identity
+                or _response_int(response, "policy_version") != policy_version
+            ):
+                manager.quarantine("paired holder returned another external policy")
+                raise RuntimeError("paired holder changed external policy identity")
+        except BaseException as error:
+            try:
+                await asyncio.shield(
+                    manager.release_adapter_transfer(source.generation_id)
+                )
+            except BaseException as cleanup_error:
+                self._retain_pending_transfer(manager, source.generation_id)
+                error.add_note(
+                    "external adapter cleanup also failed: "
+                    f"{type(cleanup_error).__name__}: {cleanup_error}"
+                )
+            raise
+
+        async with self._lock:
+            previous_sequence = self._active_update_sequences.get(runtime_lora_name, -1)
+            if update_sequence <= previous_sequence:
+                manager.quarantine("paired external update sequence regressed")
+                raise RuntimeError("paired external update sequence is not monotonic")
+            prior_transfer = self._retained_transfers.get(runtime_lora_name)
+            self._active_generations[runtime_lora_name] = generation_id
+            self._active_update_sequences[runtime_lora_name] = update_sequence
+            self._retained_transfers[runtime_lora_name] = (
+                manager,
+                source.generation_id,
+            )
+            self._retained_adapter_sources[runtime_lora_name] = staged
+
+        if prior_transfer is not None and prior_transfer[1] != source.generation_id:
+            release_manager, release_generation = prior_transfer
+            try:
+                await release_manager.release_adapter_transfer(release_generation)
+            except BaseException:
+                self._retain_pending_transfer(release_manager, release_generation)
+        return MegatronExternalLoraApplyResult(
+            runtime_lora_name=runtime_lora_name,
+            generation_id=generation_id,
+            policy_version=policy_version,
+            holder_update_sequence=update_sequence,
+            holder_update_id=update_identity,
+            source_identity=source.source_identity,
+            tensor_bytes=tensor_bytes,
+            config_bytes=config_bytes,
+            staging_s=max(item.materialization_s for item in received),
+            apply_s=apply_s,
+        )
 
     async def prune_versioned_adapters(
         self,
@@ -487,8 +638,9 @@ class MegatronPairedInferencePublisher:
                     == receipt.serving_generation_id
                 ):
                     self._active_generations.pop(runtime_lora_name)
+                    self._active_update_sequences.pop(runtime_lora_name, None)
                 self._retained_transfers.pop(runtime_lora_name)
-                self._retained_adapter_paths.pop(runtime_lora_name, None)
+                self._retained_adapter_sources.pop(runtime_lora_name, None)
                 try:
                     await manager.release_adapter_transfer(generation_id)
                 except BaseException:
@@ -530,11 +682,15 @@ class MegatronPairedInferencePublisher:
                     "cannot close paired inference with materialized exact adapters"
                 )
             self._closed = True
+        await self._publications_idle.wait()
+        async with self._lock:
             await self._release_transfers(tuple(self._retained_transfers.items()))
             self._active_generations.clear()
-            self._retained_adapter_paths.clear()
+            self._active_update_sequences.clear()
+            self._retained_adapter_sources.clear()
             self._activated_publications.clear()
             self._latest_activated_publications.clear()
+            self._publication_locks.clear()
 
     async def _post_unload(self, runtime_lora_name: str) -> None:
         url = f"{self.service.leader_endpoint.url.rstrip('/')}/v1/unload_lora_adapter"
@@ -549,70 +705,14 @@ class MegatronPairedInferencePublisher:
 
     async def _post_update(self, payload: dict[str, object]) -> dict[str, object]:
         url = f"{self.service.leader_endpoint.url}/art/in_flight_lora_update"
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            try:
-                response = await client.post(
-                    url,
-                    json=payload,
-                    headers=_headers(self.api_key),
-                )
-            except httpx.TransportError as error:
-                return await self._recover_update_receipt(client, payload, error)
+        async with httpx.AsyncClient(timeout=330.0) as client:
+            response = await client.post(
+                url,
+                json=payload,
+                headers=_headers(self.api_key),
+            )
         response.raise_for_status()
         return _response_object(response)
-
-    async def _recover_update_receipt(
-        self,
-        client: Any,
-        payload: dict[str, object],
-        original_error: httpx.TransportError,
-    ) -> dict[str, object]:
-        url = f"{self.service.leader_endpoint.url}/art/in_flight_lora_update/receipt"
-        deadline = asyncio.get_running_loop().time() + 5.0
-        last_error: BaseException = original_error
-        while True:
-            try:
-                response = await client.post(
-                    url,
-                    json=payload,
-                    headers=_headers(self.api_key),
-                    timeout=1.0,
-                )
-                if response.status_code == HTTPStatus.NOT_FOUND.value:
-                    state = "missing"
-                else:
-                    response.raise_for_status()
-                    receipt = _response_object(response)
-                    state = str(receipt.get("state"))
-                    if state == "settled":
-                        status = receipt.get("response_status")
-                        value = receipt.get("response")
-                        if (
-                            isinstance(status, bool)
-                            or not isinstance(status, int)
-                            or not isinstance(value, dict)
-                        ):
-                            raise RuntimeError(
-                                "paired holder returned an invalid update receipt"
-                            )
-                        if not 200 <= status < 300:
-                            raise RuntimeError(
-                                "paired holder update failed before its response "
-                                f"was received: {value!r}"
-                            ) from original_error
-                        return cast(dict[str, object], value)
-                    if state == "ambiguous":
-                        raise RuntimeError(
-                            "paired holder update outcome is ambiguous"
-                        ) from original_error
-            except httpx.TransportError as error:
-                last_error = error
-                state = "unreachable"
-            if asyncio.get_running_loop().time() >= deadline:
-                raise RuntimeError(
-                    f"paired holder update outcome could not be reconciled ({state})"
-                ) from last_error
-            await asyncio.sleep(0.05)
 
     async def _release_pending_transfers(self) -> None:
         pending = tuple(
@@ -709,11 +809,11 @@ class MegatronPairedInferencePublisher:
             raise RuntimeError("in-flight publication is no longer active")
 
         transfer = self._retained_transfers.get(runtime_lora_name)
-        path = self._retained_adapter_paths.get(runtime_lora_name)
+        source = self._retained_adapter_sources.get(runtime_lora_name)
         if (
             transfer is None
             or transfer[1] != receipt.serving_generation_id
-            or path is None
+            or source is None
         ):
             raise RuntimeError("in-flight publication generation is not retained")
 
@@ -724,7 +824,7 @@ class MegatronPairedInferencePublisher:
             "operation_id": uuid.uuid4().hex,
             "model_name": exact_name,
             "lora_slot": exact_name,
-            "lora_path": path,
+            "source": source,
             "generation_id": receipt.serving_generation_id,
             "expected_generation_id": None,
             "policy_version": receipt.learner_version,
@@ -885,6 +985,26 @@ def _validate_received(
         raise RuntimeError("inference hosts materialized different adapters")
     tensor_bytes, config_bytes = sizes.pop()
     return paths.pop(), tensor_bytes, config_bytes
+
+
+def _validate_external_received(
+    received: tuple[AdapterReceiveResult, ...],
+    source: ExternalAdapterObjectSource,
+    service: ModelServiceSpec,
+) -> tuple[str, int, int]:
+    expected_hosts = len({member.host_id for member in service.members})
+    if len(received) != expected_hosts or not received:
+        raise RuntimeError("not every inference host materialized the external adapter")
+    if {item.generation_id for item in received} != {source.generation_id}:
+        raise RuntimeError("inference hosts materialized another external generation")
+    if {item.source_identity for item in received} != {source.source_identity}:
+        raise RuntimeError("inference hosts changed the external source identity")
+    paths = {str(item.path) for item in received}
+    config_bytes = len(source.adapter_config_json.encode())
+    sizes = {(int(item.tensor_bytes), int(item.config_bytes)) for item in received}
+    if len(paths) != 1 or sizes != {(source.object_bytes, config_bytes)}:
+        raise RuntimeError("inference hosts materialized different external adapters")
+    return paths.pop(), source.object_bytes, config_bytes
 
 
 def _serving_profile_identity(

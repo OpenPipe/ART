@@ -1,10 +1,15 @@
 import asyncio
 from collections import Counter
+import hashlib
+import json
 from types import SimpleNamespace
 
-import httpx
 import pytest
 
+from art.distributed.adapter_transport import (
+    AdapterReceiveResult,
+    ExternalAdapterObjectSource,
+)
 from art.megatron.operation_handler import (
     MegatronInferenceUpdateUsage,
     MegatronPolicyActivationTiming,
@@ -19,24 +24,6 @@ from art.megatron.paired_inference import (
 from art.training import CheckpointRef, SamplerWeightsResult
 
 
-class _ReceiptClient:
-    def __init__(self, response: httpx.Response) -> None:
-        self.response = response
-        self.requests: list[tuple[str, dict[str, object]]] = []
-
-    async def post(
-        self,
-        url: str,
-        *,
-        json: dict[str, object],
-        headers: dict[str, str] | None,
-        timeout: float,
-    ) -> httpx.Response:
-        del headers, timeout
-        self.requests.append((url, json))
-        return self.response
-
-
 def _publisher() -> MegatronPairedInferencePublisher:
     publisher = object.__new__(MegatronPairedInferencePublisher)
     publisher.service = SimpleNamespace(
@@ -49,15 +36,85 @@ def _publisher() -> MegatronPairedInferencePublisher:
 def _activated_publisher() -> MegatronPairedInferencePublisher:
     publisher = _publisher()
     publisher._lock = asyncio.Lock()
+    publisher._publication_locks = {}
+    publisher._active_publications = 0
+    publisher._publications_idle = asyncio.Event()
+    publisher._publications_idle.set()
     publisher._active_generations = {}
+    publisher._active_update_sequences = {}
     publisher._retained_transfers = {}
-    publisher._retained_adapter_paths = {}
+    publisher._retained_adapter_sources = {}
     publisher._activated_publications = {}
     publisher._latest_activated_publications = {}
     publisher._exact_evaluation_publications = {}
     publisher._activated_publication_leases = Counter()
     publisher._closed = False
     return publisher
+
+
+@pytest.mark.asyncio
+async def test_publication_scope_serializes_one_alias() -> None:
+    publisher = _activated_publisher()
+    first_entered = asyncio.Event()
+    release_first = asyncio.Event()
+    second_entered = asyncio.Event()
+
+    async def first() -> None:
+        async with publisher._publication_scope("model"):
+            first_entered.set()
+            await release_first.wait()
+
+    async def second() -> None:
+        async with publisher._publication_scope("model"):
+            second_entered.set()
+
+    first_task = asyncio.create_task(first())
+    await first_entered.wait()
+    second_task = asyncio.create_task(second())
+    await asyncio.sleep(0)
+    assert not second_entered.is_set()
+    release_first.set()
+    await asyncio.gather(first_task, second_task)
+    assert second_entered.is_set()
+
+
+@pytest.mark.asyncio
+async def test_publication_scope_overlaps_distinct_aliases() -> None:
+    publisher = _activated_publisher()
+    entered = {"first": asyncio.Event(), "second": asyncio.Event()}
+    release = asyncio.Event()
+
+    async def publish(alias: str) -> None:
+        async with publisher._publication_scope(alias):
+            entered[alias].set()
+            await release.wait()
+
+    tasks = tuple(asyncio.create_task(publish(alias)) for alias in ("first", "second"))
+    await asyncio.gather(*(event.wait() for event in entered.values()))
+    assert publisher._active_publications == 2
+    release.set()
+    await asyncio.gather(*tasks)
+
+
+@pytest.mark.asyncio
+async def test_close_waits_for_active_publication() -> None:
+    publisher = _activated_publisher()
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def publish() -> None:
+        async with publisher._publication_scope("model"):
+            entered.set()
+            await release.wait()
+
+    publication = asyncio.create_task(publish())
+    await entered.wait()
+    close = asyncio.create_task(publisher.aclose())
+    await asyncio.sleep(0)
+    assert not close.done()
+    release.set()
+    await asyncio.gather(publication, close)
+    assert publisher._closed
 
 
 def _publication(
@@ -207,9 +264,13 @@ def _activate_in_flight(
         manager,
         receipt.serving_generation_id,
     )
-    publisher._retained_adapter_paths[receipt.runtime_lora_name] = (
-        f"/adapter/{receipt.learner_version}"
-    )
+    publisher._retained_adapter_sources[receipt.runtime_lora_name] = {
+        "path": f"/adapter/{receipt.learner_version}",
+        "source_identity": receipt.serving_generation_id,
+        "layout": "peft_safetensors_v1",
+        "model_bytes": 4096,
+        "config_bytes": 512,
+    }
     publisher._record_activated_publication(receipt)
 
 
@@ -256,74 +317,98 @@ async def test_in_flight_exact_lease_does_not_block_next_activation() -> None:
         assert publisher.activated_publication("model") == second
         assert publisher.activated_publication("model", 1) == first
 
-    assert updates[0]["lora_path"] == "/adapter/1"
+    assert updates[0]["source"]["path"] == "/adapter/1"
     assert updates[0]["expected_generation_id"] is None
     assert unloaded == ["model:eval@1"]
     assert publisher.activated_publication("model", 1) is None
 
 
 @pytest.mark.asyncio
-async def test_lost_update_response_recovers_exact_holder_receipt() -> None:
-    holder_result = {
-        "status": "updated",
-        "generation_id": "generation-2",
-        "update_seq": 2,
-        "update_identity": "update-2",
-        "apply_s": 0.125,
+async def test_external_object_uses_the_ordinary_holder_update_path() -> None:
+    config = json.dumps(
+        {"art_lora_format": "vllm", "r": 1, "target_modules": ["q_proj"]},
+        separators=(",", ":"),
+    )
+    source = ExternalAdapterObjectSource(
+        generation_id="generation-3",
+        source_identity="sha256:" + "a" * 64,
+        object_url="https://objects.example/adapter.safetensors?signature=secret",
+        object_bytes=4096,
+        object_sha256="a" * 64,
+        adapter_config_json=config,
+        adapter_config_sha256=hashlib.sha256(config.encode()).hexdigest(),
+        lora_rank=1,
+        target_modules=("q_proj",),
+    )
+
+    class Manager:
+        def __init__(self) -> None:
+            self.released: list[str] = []
+
+        async def materialize_external_adapter(self, value, *, timeout_s):
+            assert value is source
+            assert timeout_s == 300
+            return (
+                AdapterReceiveResult(
+                    host_id="inference-0",
+                    generation_id=source.generation_id,
+                    path="/adapter/generation-3",
+                    tensor_bytes=source.object_bytes,
+                    config_bytes=len(config.encode()),
+                    materialization_s=0.25,
+                    used_bytes=source.object_bytes,
+                    capacity_bytes=source.object_bytes,
+                    source_identity=source.source_identity,
+                ),
+            )
+
+        async def release_adapter_transfer(self, generation_id):
+            self.released.append(generation_id)
+
+        def quarantine(self, reason):
+            raise AssertionError(reason)
+
+    manager = Manager()
+    publisher = _activated_publisher()
+    publisher.runtime = SimpleNamespace(model_service=lambda _name: manager)
+    publisher.service = SimpleNamespace(
+        name="inference",
+        members=(SimpleNamespace(host_id="inference-0"),),
+        leader_endpoint=SimpleNamespace(url="http://holder.test:8000"),
+    )
+    publisher.config = {}
+    updates = []
+
+    async def update(payload):
+        updates.append(payload)
+        return {
+            "generation_id": payload["generation_id"],
+            "lora_slot": payload["lora_slot"],
+            "policy_version": payload["policy_version"],
+            "update_seq": 3,
+            "update_identity": "update-3",
+            "source_identity": payload["source"]["source_identity"],
+            "apply_s": 0.05,
+        }
+
+    publisher._post_update = update  # type: ignore[method-assign]
+    result = await publisher.apply_external_adapter(
+        operation_id="operation-3",
+        public_alias="model",
+        generation_id=source.generation_id,
+        expected_generation_id=None,
+        policy_version=3,
+        source=source,
+    )
+
+    assert updates[0]["source"] == {
+        "path": "/adapter/generation-3",
+        "source_identity": source.source_identity,
+        "layout": "peft_safetensors_v1",
+        "model_bytes": 4096,
+        "config_bytes": len(config.encode()),
     }
-    request = httpx.Request(
-        "POST", "http://holder.test:8000/art/in_flight_lora_update/receipt"
-    )
-    client = _ReceiptClient(
-        httpx.Response(
-            200,
-            request=request,
-            json={
-                "operation_id": "operation-2",
-                "state": "settled",
-                "response_status": 200,
-                "response": holder_result,
-            },
-        )
-    )
-    payload: dict[str, object] = {
-        "operation_id": "operation-2",
-        "generation_id": "generation-2",
-    }
-
-    recovered = await _publisher()._recover_update_receipt(
-        client,
-        payload,
-        httpx.ReadError("response lost", request=request),
-    )
-
-    assert recovered == holder_result
-    assert client.requests == [
-        (
-            "http://holder.test:8000/art/in_flight_lora_update/receipt",
-            payload,
-        )
-    ]
-
-
-@pytest.mark.asyncio
-async def test_ambiguous_holder_receipt_does_not_reexecute_update() -> None:
-    request = httpx.Request(
-        "POST", "http://holder.test:8000/art/in_flight_lora_update/receipt"
-    )
-    client = _ReceiptClient(
-        httpx.Response(
-            200,
-            request=request,
-            json={"operation_id": "operation-2", "state": "ambiguous"},
-        )
-    )
-
-    with pytest.raises(RuntimeError, match="outcome is ambiguous"):
-        await _publisher()._recover_update_receipt(
-            client,
-            {"operation_id": "operation-2"},
-            httpx.ReadError("response lost", request=request),
-        )
-
-    assert len(client.requests) == 1
+    assert result.staging_s == 0.25
+    assert result.apply_s == 0.05
+    assert publisher._active_generations["model:active"] == "generation-3"
+    assert manager.released == []

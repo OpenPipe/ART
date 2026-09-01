@@ -1,4 +1,6 @@
 import asyncio
+from concurrent.futures import Future
+import time
 from types import SimpleNamespace
 
 from art_vllm_runtime import policy_spans
@@ -184,3 +186,248 @@ def test_publication_initializes_an_empty_mutable_slot_once() -> None:
             await coordinator.begin_publication(slot, expected_generation_id=None)
 
     asyncio.run(exercise())
+
+
+def test_preflight_keeps_target_admissions_open_until_publication() -> None:
+    async def exercise() -> None:
+        coordinator = policy_spans.LoraUpdateCoordinator()
+        slot = "run:active"
+        initial = policy_spans.PolicyLoRARequest(
+            lora_name=slot,
+            lora_int_id=1,
+            lora_path="/generation-a",
+            generation_id="generation-a",
+            policy_version=1,
+            update_seq=1,
+        )
+        await coordinator.declare_initial(slot, initial)
+        ticket = await coordinator.acquire(slot)
+
+        await coordinator.preflight_publication(
+            slot, expected_generation_id="generation-a"
+        )
+        publication = asyncio.create_task(
+            coordinator.begin_publication(slot, expected_generation_id="generation-a")
+        )
+        await asyncio.sleep(0)
+        assert not publication.done()
+
+        await ticket.release()
+        sequence = await publication
+        assert sequence == 2
+        await coordinator.cancel_update(slot, sequence)
+
+    asyncio.run(exercise())
+
+
+def test_prepared_lora_uses_native_cpu_loader_before_install(tmp_path) -> None:
+    class AdapterManager:
+        capacity = 2
+
+        def __init__(self) -> None:
+            self.adapters = {7: SimpleNamespace(id=7, generation="old")}
+            self.active: list[int] = []
+
+        def __len__(self) -> int:
+            return len(self.adapters)
+
+        def remove_adapter(self, adapter_id: int) -> bool:
+            return self.adapters.pop(adapter_id, None) is not None
+
+        def add_adapter(self, adapter: object) -> bool:
+            adapter_id = int(adapter.id)  # type: ignore[attr-defined]
+            self.adapters[adapter_id] = adapter
+            return True
+
+        def activate_adapter(self, adapter_id: int) -> bool:
+            self.active.append(adapter_id)
+            return True
+
+    class Manager:
+        def __init__(self) -> None:
+            self._adapter_manager = AdapterManager()
+            self.loader_thread = ""
+
+        def _load_adapter(self, request: object) -> object:
+            from threading import current_thread
+
+            self.loader_thread = current_thread().name
+            return SimpleNamespace(
+                id=request.lora_int_id,  # type: ignore[attr-defined]
+                generation="new",
+            )
+
+        def pin_adapter(self, adapter_id: int) -> bool:
+            return adapter_id in self._adapter_manager.adapters
+
+    manager = Manager()
+    worker = SimpleNamespace(model_runner=SimpleNamespace(lora_manager=manager))
+    operation_id = "prepared-worker-test"
+    adapter_path = tmp_path / "generation-b"
+    adapter_path.mkdir()
+    (adapter_path / "adapter_model.safetensors").write_bytes(b"m" * 4096)
+    (adapter_path / "adapter_config.json").write_bytes(b"c" * 512)
+    staged = {
+        "path": str(adapter_path),
+        "source_identity": "generation-b",
+        "layout": "peft_safetensors_v1",
+        "model_bytes": 4096,
+        "config_bytes": 512,
+    }
+    prepare_request = policy_spans.PolicyLoRARequest(
+        lora_name="run:active",
+        lora_int_id=7,
+        lora_path=staged["path"],
+        generation_id="generation-b",
+        policy_version=2,
+        update_seq=0,
+    )
+    final_request = policy_spans.PolicyLoRARequest(
+        **{
+            **policy_spans.policy_lora_request_payload(prepare_request),
+            "update_seq": 2,
+        }
+    )
+    policy_spans._WORKER_LORA_POLICY_BY_ID[7] = {
+        "generation_id": "generation-a",
+        "policy_version": 1,
+        "lora_slot": "run:active",
+        "lora_path": "/adapter/generation-a",
+        "update_seq": 1,
+    }
+
+    try:
+        state = policy_spans._prepare_worker_lora(
+            worker,
+            operation_id,
+            policy_spans.policy_lora_request_payload(prepare_request),
+            staged,
+        )
+        assert state["state"] in {"preparing", "ready"}
+        deadline = time.monotonic() + 1
+        while True:
+            state = policy_spans._worker_lora_status(
+                operation_id,
+                policy_spans.policy_lora_request_payload(prepare_request),
+                staged,
+            )
+            if state == {"state": "ready"}:
+                break
+            assert time.monotonic() < deadline
+            time.sleep(0.001)
+
+        changed_payload = policy_spans.policy_lora_request_payload(prepare_request)
+        changed_payload["is_3d_lora_weight"] = True
+        with pytest.raises(RuntimeError, match="changed identity"):
+            policy_spans._worker_lora_status(
+                operation_id,
+                changed_payload,
+                staged,
+            )
+
+        acknowledgement = policy_spans._commit_worker_lora(
+            worker,
+            operation_id,
+            policy_spans.policy_lora_request_payload(final_request),
+            staged,
+        )
+        assert manager.loader_thread.startswith("art-lora-prepare")
+        assert manager._adapter_manager.adapters[7].generation == "new"
+        assert manager._adapter_manager.active == [7]
+        assert acknowledgement["current"]["generation_id"] == "generation-b"
+        assert acknowledgement["current"]["update_seq"] == 2
+
+        changed_staged = {**staged, "model_bytes": 4095}
+        with pytest.raises(RuntimeError, match="changed its byte layout"):
+            policy_spans._prepare_worker_lora(
+                worker,
+                "prepared-worker-size-conflict",
+                policy_spans.policy_lora_request_payload(prepare_request),
+                changed_staged,
+            )
+    finally:
+        policy_spans._abort_worker_lora(operation_id)
+        policy_spans._WORKER_LORA_POLICY_BY_ID.pop(7, None)
+
+
+def test_engine_commit_is_one_paused_descriptor_only_transaction() -> None:
+    request = policy_spans.PolicyLoRARequest(
+        lora_name="run:active",
+        lora_int_id=7,
+        lora_path="/adapter/generation-b",
+        generation_id="generation-b",
+        policy_version=2,
+        update_seq=2,
+    )
+    payload = policy_spans.policy_lora_request_payload(request)
+    staged = {
+        "path": request.lora_path,
+        "source_identity": request.generation_id,
+        "layout": "peft_safetensors_v1",
+        "model_bytes": 4096,
+        "config_bytes": 512,
+    }
+    previous = {
+        "generation_id": "generation-a",
+        "policy_version": 1,
+        "lora_slot": request.lora_name,
+        "lora_path": "/adapter/generation-a",
+        "update_seq": 1,
+    }
+    current = {
+        "generation_id": request.generation_id,
+        "policy_version": request.policy_version,
+        "lora_slot": request.lora_name,
+        "lora_path": request.lora_path,
+        "update_seq": request.update_seq,
+    }
+
+    class Core:
+        def __init__(self) -> None:
+            self.scheduler = SimpleNamespace(requests={})
+            self.pauses: list[tuple[str, bool]] = []
+            self.resumes = 0
+            self.rpc: tuple[str, tuple[object, ...]] | None = None
+            self.pause_result: Future[None] | None = None
+
+        def pause_scheduler(self, mode: str, abort: bool) -> Future[None] | None:
+            self.pauses.append((mode, abort))
+            return self.pause_result
+
+        def resume_scheduler(self) -> None:
+            self.resumes += 1
+
+        def collective_rpc(
+            self, method: str, *, args: tuple[object, ...]
+        ) -> list[dict[str, object]]:
+            self.rpc = (method, args)
+            return [{"loaded": True, "previous": previous, "current": current}]
+
+    core = Core()
+    result = policy_spans._commit_staged_policy_lora_update(
+        core, "operation-2", payload, staged
+    )
+
+    assert core.pauses == [("keep", False)]
+    assert core.resumes == 1
+    assert core.rpc == (
+        "art_commit_staged_lora_policy",
+        ("operation-2", payload, staged),
+    )
+    assert result == {
+        "workers": 1,
+        "cache_transition": {"updated_requests": 0, "continued_requests": 0},
+    }
+
+    pending_core = Core()
+    pending_core.pause_result = Future()
+    transaction = policy_spans._commit_staged_policy_lora_update(
+        pending_core, "operation-3", payload, staged
+    )
+    assert isinstance(transaction, Future)
+    assert pending_core.rpc is None
+    assert pending_core.resumes == 0
+    pending_core.pause_result.set_result(None)
+    assert transaction.result() == result
+    assert pending_core.rpc is not None
+    assert pending_core.resumes == 1

@@ -18,6 +18,7 @@ from .adapter_transport import (
     AdapterReceivePoolState,
     AdapterReceiveResult,
     AdapterTransferTarget,
+    ExternalAdapterObjectSource,
 )
 from .specs import ModelServiceMemberSpec, ModelServiceSpec
 
@@ -123,6 +124,10 @@ class ReplicaHostLauncher(Protocol):
 
     async def wait_adapter_receive(
         self, generation_id: str, timeout_s: float
+    ) -> AdapterReceiveResult: ...
+
+    async def materialize_adapter_object(
+        self, source: ExternalAdapterObjectSource, timeout_s: float
     ) -> AdapterReceiveResult: ...
 
     async def release_adapter_receive(self, generation_id: str) -> None: ...
@@ -443,6 +448,28 @@ class ReplicaManager:
                             generation_id, self._rpc_timeout_s
                         ),
                         self._rpc_timeout_s,
+                    )
+                    for launcher in self._host_launchers
+                )
+            )
+        )
+
+    async def materialize_external_adapter(
+        self,
+        source: ExternalAdapterObjectSource,
+        *,
+        timeout_s: float = 300.0,
+    ) -> tuple[AdapterReceiveResult, ...]:
+        if timeout_s <= 0:
+            raise ValueError(
+                "external adapter materialization timeout must be positive"
+            )
+        return tuple(
+            await asyncio.gather(
+                *(
+                    asyncio.wait_for(
+                        launcher.materialize_adapter_object(source, timeout_s),
+                        timeout_s + 1.0,
                     )
                     for launcher in self._host_launchers
                 )

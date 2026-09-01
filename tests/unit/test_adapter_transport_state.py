@@ -1,6 +1,9 @@
 import base64
+import hashlib
+import json
 from types import SimpleNamespace
 
+import httpx
 import pytest
 
 from art.distributed import adapter_transport
@@ -8,6 +11,7 @@ from art.distributed.adapter_transport import (
     AdapterSnapshotReceiver,
     AdapterSnapshotSender,
     AdapterTransferTarget,
+    ExternalAdapterObjectSource,
     NixlAdapterSender,
 )
 
@@ -25,6 +29,7 @@ def test_adapter_transport_state_is_bounded_and_survives_close(
         "active_registered_slots": 0,
         "pending_nixl_receives": 0,
         "pending_local_receives": 0,
+        "pending_object_receives": 0,
         "materialized_generations": 0,
         "pending_notifications": 0,
         "closed": False,
@@ -68,6 +73,104 @@ def test_adapter_transport_state_is_bounded_and_survives_close(
     }
     sender.close()
     assert sender.state().closed is True
+
+
+def _external_object_source(payload: bytes) -> ExternalAdapterObjectSource:
+    config = json.dumps(
+        {
+            "art_lora_format": "vllm",
+            "r": 1,
+            "target_modules": ["q_proj"],
+        },
+        separators=(",", ":"),
+    )
+    return ExternalAdapterObjectSource(
+        generation_id="generation-object",
+        source_identity="sha256:" + hashlib.sha256(payload).hexdigest(),
+        object_url="https://objects.example/adapter_model.safetensors?signature=secret",
+        object_bytes=len(payload),
+        object_sha256=hashlib.sha256(payload).hexdigest(),
+        adapter_config_json=config,
+        adapter_config_sha256=hashlib.sha256(config.encode()).hexdigest(),
+        lora_rank=1,
+        target_modules=("q_proj",),
+    )
+
+
+def _safetensors_payload() -> bytes:
+    header = json.dumps(
+        {
+            "base_model.model.q_proj.lora_A.weight": {
+                "dtype": "F32",
+                "shape": [1],
+                "data_offsets": [0, 4],
+            }
+        },
+        separators=(",", ":"),
+    ).encode()
+    header += b" " * (-len(header) % 8)
+    return len(header).to_bytes(8, "little") + header + b"\x00\x00\x00\x00"
+
+
+def test_completed_external_object_materializes_into_existing_receiver(
+    tmp_path, monkeypatch
+) -> None:
+    payload = _safetensors_payload()
+    source = _external_object_source(payload)
+    real_client = httpx.Client
+
+    def client(**kwargs):
+        return real_client(
+            transport=httpx.MockTransport(
+                lambda request: httpx.Response(200, content=payload, request=request)
+            ),
+            **kwargs,
+        )
+
+    monkeypatch.setattr(adapter_transport.httpx, "Client", client)
+    receiver = AdapterSnapshotReceiver("inference-0", str(tmp_path), pool_capacity=2)
+
+    result = receiver.materialize_object(source)
+
+    assert result.source_identity == source.source_identity
+    assert result.tensor_bytes == len(payload)
+    assert (
+        tmp_path
+        / "adapter_transfers"
+        / source.generation_id
+        / "adapter_model.safetensors"
+    ).read_bytes() == payload
+    assert receiver.state().materialized_generations == 1
+    receiver.release(source.generation_id)
+    assert receiver.state().materialized_generations == 0
+
+
+def test_external_object_digest_failure_leaves_no_materialized_state(
+    tmp_path, monkeypatch
+) -> None:
+    payload = _safetensors_payload()
+    source = _external_object_source(payload).model_copy(
+        update={"object_sha256": "0" * 64}
+    )
+    real_client = httpx.Client
+
+    def client(**kwargs):
+        return real_client(
+            transport=httpx.MockTransport(
+                lambda request: httpx.Response(200, content=payload, request=request)
+            ),
+            **kwargs,
+        )
+
+    monkeypatch.setattr(adapter_transport.httpx, "Client", client)
+    receiver = AdapterSnapshotReceiver("inference-0", str(tmp_path), pool_capacity=2)
+
+    with pytest.raises(RuntimeError, match="digest changed"):
+        receiver.materialize_object(source)
+
+    assert receiver.state().pending_object_receives == 0
+    assert receiver.state().materialized_generations == 0
+    assert tuple((tmp_path / "adapter_transfers").iterdir()) == ()
 
 
 class _Handle:

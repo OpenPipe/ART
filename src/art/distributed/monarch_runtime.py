@@ -11,6 +11,7 @@ from .adapter_transport import (
     AdapterReceivePoolState,
     AdapterReceiveResult,
     AdapterTransferTarget,
+    ExternalAdapterObjectSource,
 )
 from .data_plane import PackedBatchRef, PackedBatchTransfer
 from .packing import PackingRequest, PackingResult
@@ -208,6 +209,13 @@ class MonarchVllmHostLauncher:
             if remaining_s <= 0:
                 raise TimeoutError(f"Adapter transfer timed out: {generation_id}")
             await asyncio.sleep(min(0.01, remaining_s))
+
+    async def materialize_adapter_object(
+        self, source: ExternalAdapterObjectSource, timeout_s: float
+    ) -> AdapterReceiveResult:
+        return await call_remote(
+            self.adapter_actor.materialize_object, source, timeout_s
+        )
 
     async def release_adapter_receive(self, generation_id: str) -> None:
         await call_remote(self.adapter_actor.release, generation_id)

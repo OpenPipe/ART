@@ -8,14 +8,18 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Mapping
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 from functools import wraps
 import hashlib
 import importlib
+from pathlib import Path
 import re
 import sys
+from threading import RLock
+import time
 from typing import Any, AsyncIterator
 
 import msgspec
@@ -44,6 +48,21 @@ _POLICY_CACHE_TRANSITIONS_FIELD = "_art_policy_cache_transitions"
 _POLICY_CACHE_TRANSITION_KEY = "art_policy_transition_v1"
 _PROMPT_POLICY_SPANS_COMPLETE_FIELD = "_art_prompt_policy_spans_complete"
 _CACHED_PROMPT_POLICY_SPAN_FIELD = "_art_cached_prompt_policy_span"
+_PREPARED_LORA_CAPACITY = 2
+_PREPARED_LORA_TTL_S = 300.0
+
+
+@dataclass
+class _PreparedWorkerLora:
+    identity: tuple[object, ...]
+    future: Future[Any]
+    created_at: float
+
+
+_PREPARED_LORA_LOCK = RLock()
+_PREPARED_LORA_EXECUTOR: ThreadPoolExecutor | None = None
+_PREPARED_LORAS: dict[str, _PreparedWorkerLora] = {}
+_PREPARED_LORA_FUTURES: set[Future[Any]] = set()
 
 
 class _RequestAdmissionLease:
@@ -264,6 +283,21 @@ class LoraUpdateCoordinator:
             lora_slot, expected_generation_id=expected_generation_id
         )
 
+    async def preflight_publication(
+        self,
+        lora_slot: str,
+        *,
+        expected_generation_id: str | None,
+    ) -> None:
+        state = self._state(lora_slot)
+        async with state.condition:
+            await state.condition.wait_for(lambda: not state.update_active)
+            self._validate_expected_generation(
+                state.lora_request,
+                lora_slot=lora_slot,
+                expected_generation_id=expected_generation_id,
+            )
+
     async def begin_publication(
         self,
         lora_slot: str,
@@ -274,18 +308,11 @@ class LoraUpdateCoordinator:
         async with state.condition:
             await state.condition.wait_for(lambda: not state.update_active)
             current = state.lora_request
-            if current is None:
-                if expected_generation_id is not None:
-                    raise RuntimeError(
-                        f"LoRA slot {lora_slot!r} has no active generation"
-                    )
-            elif expected_generation_id is None:
-                raise RuntimeError(f"LoRA slot {lora_slot!r} is already active")
-            elif current.generation_id != expected_generation_id:
-                raise RuntimeError(
-                    f"LoRA slot {lora_slot!r} is generation "
-                    f"{current.generation_id!r}, expected {expected_generation_id!r}"
-                )
+            self._validate_expected_generation(
+                current,
+                lora_slot=lora_slot,
+                expected_generation_id=expected_generation_id,
+            )
             state.update_active = True
             state.blocked = True
             update_seq = state.next_update_seq
@@ -300,6 +327,24 @@ class LoraUpdateCoordinator:
                 state.condition.notify_all()
                 raise
             return update_seq
+
+    @staticmethod
+    def _validate_expected_generation(
+        current: PolicyLoRARequest | None,
+        *,
+        lora_slot: str,
+        expected_generation_id: str | None,
+    ) -> None:
+        if current is None:
+            if expected_generation_id is not None:
+                raise RuntimeError(f"LoRA slot {lora_slot!r} has no active generation")
+        elif expected_generation_id is None:
+            raise RuntimeError(f"LoRA slot {lora_slot!r} is already active")
+        elif current.generation_id != expected_generation_id:
+            raise RuntimeError(
+                f"LoRA slot {lora_slot!r} is generation "
+                f"{current.generation_id!r}, expected {expected_generation_id!r}"
+            )
 
     async def commit_update(
         self,
@@ -836,11 +881,9 @@ def _patch_scheduler_policy_span_transport() -> None:
                     _flush_complete_prompt_spans(
                         request, outputs_by_request.get(req_id)
                     )
-            from art_vllm_runtime.request_reports import observe_scheduler_step
             from art_vllm_runtime.resource_usage import attach_scheduler_usage
 
             attach_scheduler_usage(self, scheduler_output, outputs_by_client)
-            observe_scheduler_step(self, scheduler_output, requests)
             return outputs_by_client
 
         update_from_output.__art_policy_spans_patched__ = True  # type: ignore[attr-defined]
@@ -851,17 +894,10 @@ def _patch_scheduler_policy_span_transport() -> None:
         return
 
     def _preempt_request(self: Any, request: Any, timestamp: float) -> None:
-        from art_vllm_runtime.request_reports import (
-            observe_preemption,
-            request_snapshot,
-        )
-
-        before = request_snapshot(self, request)
         original_preempt(self, request, timestamp)
         if hasattr(request, ART_PROMPT_POLICY_TOKEN_SPANS_FIELD):
             delattr(request, ART_PROMPT_POLICY_TOKEN_SPANS_FIELD)
         _rebase_preempted_request_policy_history(request)
-        observe_preemption(self, request, before=before)
 
     _preempt_request.__art_policy_spans_patched__ = True  # type: ignore[attr-defined]
     Scheduler._preempt_request = _preempt_request  # type: ignore[method-assign]
@@ -1268,6 +1304,52 @@ def _patch_policy_lora_update_rpc() -> None:
 
         WorkerBase.art_load_lora_policy = art_load_lora_policy  # type: ignore[attr-defined]
 
+    if not hasattr(WorkerBase, "art_prepare_staged_lora_policy"):
+
+        def art_prepare_staged_lora_policy(
+            self: Any,
+            operation_id: str,
+            payload: dict[str, Any],
+            staged: dict[str, Any],
+        ) -> dict[str, str]:
+            return _prepare_worker_lora(self, operation_id, payload, staged)
+
+        WorkerBase.art_prepare_staged_lora_policy = art_prepare_staged_lora_policy  # type: ignore[attr-defined]
+
+    if not hasattr(WorkerBase, "art_staged_lora_policy_status"):
+
+        def art_staged_lora_policy_status(
+            self: Any,
+            operation_id: str,
+            payload: dict[str, Any],
+            staged: dict[str, Any],
+        ) -> dict[str, str]:
+            return _worker_lora_status(operation_id, payload, staged)
+
+        WorkerBase.art_staged_lora_policy_status = art_staged_lora_policy_status  # type: ignore[attr-defined]
+
+    if not hasattr(WorkerBase, "art_abort_staged_lora_policy"):
+
+        def art_abort_staged_lora_policy(
+            self: Any,
+            operation_id: str,
+        ) -> dict[str, bool]:
+            return {"released": _abort_worker_lora(operation_id)}
+
+        WorkerBase.art_abort_staged_lora_policy = art_abort_staged_lora_policy  # type: ignore[attr-defined]
+
+    if not hasattr(WorkerBase, "art_commit_staged_lora_policy"):
+
+        def art_commit_staged_lora_policy(
+            self: Any,
+            operation_id: str,
+            payload: dict[str, Any],
+            staged: dict[str, Any],
+        ) -> dict[str, Any]:
+            return _commit_worker_lora(self, operation_id, payload, staged)
+
+        WorkerBase.art_commit_staged_lora_policy = art_commit_staged_lora_policy  # type: ignore[attr-defined]
+
     if not hasattr(WorkerBase, "art_declare_loaded_lora_policy"):
 
         def art_declare_loaded_lora_policy(
@@ -1310,6 +1392,75 @@ def _patch_policy_lora_update_rpc() -> None:
 
         EngineCore.art_apply_lora_policy_update = art_apply_lora_policy_update  # type: ignore[attr-defined]
 
+    if not hasattr(EngineCore, "art_prepare_staged_lora_policy"):
+
+        def art_prepare_staged_lora_policy(
+            self: Any,
+            operation_id: str,
+            payload: dict[str, Any],
+            staged: dict[str, Any],
+        ) -> dict[str, Any]:
+            acknowledgements = self.collective_rpc(
+                "art_prepare_staged_lora_policy",
+                args=(operation_id, payload, staged),
+            )
+            return _validate_worker_preparation(acknowledgements)
+
+        EngineCore.art_prepare_staged_lora_policy = art_prepare_staged_lora_policy  # type: ignore[attr-defined]
+
+    if not hasattr(EngineCore, "art_staged_lora_policy_status"):
+
+        def art_staged_lora_policy_status(
+            self: Any,
+            operation_id: str,
+            payload: dict[str, Any],
+            staged: dict[str, Any],
+        ) -> dict[str, Any]:
+            acknowledgements = self.collective_rpc(
+                "art_staged_lora_policy_status",
+                args=(operation_id, payload, staged),
+            )
+            return _validate_worker_preparation(acknowledgements)
+
+        EngineCore.art_staged_lora_policy_status = art_staged_lora_policy_status  # type: ignore[attr-defined]
+
+    if not hasattr(EngineCore, "art_abort_staged_lora_policy"):
+
+        def art_abort_staged_lora_policy(
+            self: Any,
+            operation_id: str,
+        ) -> dict[str, int]:
+            acknowledgements = self.collective_rpc(
+                "art_abort_staged_lora_policy", args=(operation_id,)
+            )
+            return {
+                "workers": len(acknowledgements),
+                "released": sum(
+                    bool(item.get("released")) for item in acknowledgements
+                ),
+            }
+
+        EngineCore.art_abort_staged_lora_policy = art_abort_staged_lora_policy  # type: ignore[attr-defined]
+
+    if not hasattr(EngineCore, "art_commit_staged_lora_policy_update"):
+
+        def art_commit_staged_lora_policy_update(
+            self: Any,
+            operation_id: str,
+            payload: dict[str, Any],
+            staged: dict[str, Any],
+        ) -> dict[str, Any]:
+            return _commit_staged_policy_lora_update(
+                self,
+                operation_id,
+                payload,
+                staged,
+            )
+
+        EngineCore.art_commit_staged_lora_policy_update = (
+            art_commit_staged_lora_policy_update  # type: ignore[attr-defined]
+        )
+
     if not hasattr(EngineCore, "art_declare_loaded_lora_policy"):
 
         def art_declare_loaded_lora_policy(
@@ -1324,16 +1475,179 @@ def _patch_policy_lora_update_rpc() -> None:
 
         EngineCore.art_declare_loaded_lora_policy = art_declare_loaded_lora_policy  # type: ignore[attr-defined]
 
-    if not hasattr(EngineCore, "art_request_runtime_report"):
 
-        def art_request_runtime_report(
-            self: Any, request_identity: str
-        ) -> dict[str, Any]:
-            from art_vllm_runtime.request_reports import request_runtime_report
+def _prepare_worker_lora(
+    worker: Any,
+    operation_id: str,
+    payload: dict[str, Any],
+    staged: dict[str, Any],
+) -> dict[str, str]:
+    lora_request = _policy_lora_request_from_payload(payload)
+    _validate_staged_lora_descriptor(lora_request, staged)
+    _validate_staged_lora_files(lora_request, staged)
+    identity = _prepared_lora_identity(lora_request, staged)
+    manager = _worker_lora_manager(worker)
+    loader = getattr(manager, "_load_adapter", None)
+    if not callable(loader):
+        raise RuntimeError("vLLM worker has no prepared LoRA loader")
 
-            return request_runtime_report(self.scheduler, request_identity)
+    global _PREPARED_LORA_EXECUTOR
+    with _PREPARED_LORA_LOCK:
+        _reap_prepared_loras()
+        existing = _PREPARED_LORAS.get(operation_id)
+        if existing is not None:
+            if existing.identity != identity:
+                raise RuntimeError("prepared LoRA operation changed identity")
+            if existing.future.done():
+                existing.future.result()
+                return {"state": "ready"}
+            return {"state": "preparing"}
+        if (
+            len(_PREPARED_LORAS) >= _PREPARED_LORA_CAPACITY
+            or len(_PREPARED_LORA_FUTURES) >= _PREPARED_LORA_CAPACITY
+        ):
+            raise RuntimeError("prepared LoRA capacity is exhausted")
+        if _PREPARED_LORA_EXECUTOR is None:
+            _PREPARED_LORA_EXECUTOR = ThreadPoolExecutor(
+                max_workers=_PREPARED_LORA_CAPACITY,
+                thread_name_prefix="art-lora-prepare",
+            )
+        future = _PREPARED_LORA_EXECUTOR.submit(loader, lora_request)
+        _PREPARED_LORA_FUTURES.add(future)
+        _PREPARED_LORAS[operation_id] = _PreparedWorkerLora(
+            identity=identity,
+            future=future,
+            created_at=time.monotonic(),
+        )
+    future.add_done_callback(_prepared_lora_finished)
+    return {"state": "preparing"}
 
-        EngineCore.art_request_runtime_report = art_request_runtime_report  # type: ignore[attr-defined]
+
+def _worker_lora_status(
+    operation_id: str,
+    payload: dict[str, Any],
+    staged: dict[str, Any],
+) -> dict[str, str]:
+    lora_request = _policy_lora_request_from_payload(payload)
+    _validate_staged_lora_descriptor(lora_request, staged)
+    identity = _prepared_lora_identity(lora_request, staged)
+    with _PREPARED_LORA_LOCK:
+        _reap_prepared_loras()
+        entry = _PREPARED_LORAS.get(operation_id)
+        if entry is None:
+            raise RuntimeError("prepared LoRA operation is unavailable")
+        if entry.identity != identity:
+            raise RuntimeError("prepared LoRA operation changed identity")
+        future = entry.future
+    if not future.done():
+        return {"state": "preparing"}
+    future.result()
+    return {"state": "ready"}
+
+
+def _abort_worker_lora(operation_id: str) -> bool:
+    with _PREPARED_LORA_LOCK:
+        entry = _PREPARED_LORAS.pop(operation_id, None)
+    if entry is None:
+        return False
+    entry.future.cancel()
+    return True
+
+
+def _commit_worker_lora(
+    worker: Any,
+    operation_id: str,
+    payload: dict[str, Any],
+    staged: dict[str, Any],
+) -> dict[str, Any]:
+    lora_request = _policy_lora_request_from_payload(payload)
+    _validate_staged_lora_descriptor(lora_request, staged)
+    identity = _prepared_lora_identity(lora_request, staged)
+    with _PREPARED_LORA_LOCK:
+        entry = _PREPARED_LORAS.get(operation_id)
+        if entry is None or entry.identity != identity or not entry.future.done():
+            raise RuntimeError("prepared LoRA operation is not ready")
+        _PREPARED_LORAS.pop(operation_id)
+    prepared = entry.future.result()
+    manager = _worker_lora_manager(worker)
+    adapter_manager = getattr(manager, "_adapter_manager", None)
+    if adapter_manager is None:
+        raise RuntimeError("vLLM worker has no native LoRA model manager")
+
+    previous = _WORKER_LORA_POLICY_BY_ID.get(lora_request.lora_int_id)
+    adapter_manager.remove_adapter(lora_request.lora_int_id)
+    if len(adapter_manager) + 1 > adapter_manager.capacity:
+        remove_oldest = getattr(adapter_manager, "remove_oldest_adapter", None)
+        if not callable(remove_oldest) or not remove_oldest():
+            raise RuntimeError("vLLM LoRA cache has no evictable prepared slot")
+    loaded = adapter_manager.add_adapter(prepared)
+    adapter_manager.activate_adapter(lora_request.lora_int_id)
+    if not manager.pin_adapter(lora_request.lora_int_id):
+        raise RuntimeError("Loaded policy LoRA could not be pinned")
+    current = _record_worker_lora_policy(lora_request)
+    return {
+        "loaded": bool(loaded),
+        "previous": None if previous is None else dict(previous),
+        "current": dict(current),
+    }
+
+
+def _worker_lora_manager(worker: Any) -> Any:
+    model_runner = getattr(worker, "model_runner", None)
+    manager = getattr(model_runner, "lora_manager", None)
+    if manager is None:
+        raise RuntimeError("vLLM worker has no LoRA manager")
+    return manager
+
+
+def _prepared_lora_identity(
+    lora_request: PolicyLoRARequest,
+    staged: Mapping[str, Any],
+) -> tuple[object, ...]:
+    return (
+        lora_request.lora_name,
+        lora_request.lora_int_id,
+        lora_request.lora_path,
+        lora_request.generation_id,
+        lora_request.policy_version,
+        lora_request.tensorizer_config_dict,
+        lora_request.is_3d_lora_weight,
+        staged["source_identity"],
+        staged["layout"],
+        staged["model_bytes"],
+        staged["config_bytes"],
+    )
+
+
+def _prepared_lora_finished(future: Future[Any]) -> None:
+    with _PREPARED_LORA_LOCK:
+        _PREPARED_LORA_FUTURES.discard(future)
+
+
+def _reap_prepared_loras() -> None:
+    deadline = time.monotonic() - _PREPARED_LORA_TTL_S
+    expired = tuple(
+        operation_id
+        for operation_id, entry in _PREPARED_LORAS.items()
+        if entry.created_at <= deadline
+    )
+    for operation_id in expired:
+        entry = _PREPARED_LORAS.pop(operation_id)
+        entry.future.cancel()
+
+
+def _validate_worker_preparation(
+    acknowledgements: list[Mapping[str, Any]],
+) -> dict[str, Any]:
+    if not acknowledgements:
+        raise RuntimeError("LoRA preparation returned no worker acknowledgements")
+    states = tuple(item.get("state") for item in acknowledgements)
+    if any(state not in {"preparing", "ready"} for state in states):
+        raise RuntimeError("LoRA preparation returned an invalid worker state")
+    return {
+        "workers": len(acknowledgements),
+        "ready": all(state == "ready" for state in states),
+    }
 
 
 def _apply_policy_lora_update(
@@ -1366,6 +1680,110 @@ def _apply_policy_lora_update(
         raise
 
 
+def _commit_staged_policy_lora_update(
+    engine_core: Any,
+    operation_id: str,
+    payload: dict[str, Any],
+    staged: dict[str, Any],
+) -> dict[str, Any] | Future[dict[str, Any]]:
+    """Perform one queue-serialized pause, collective install, and resume."""
+
+    paused = engine_core.pause_scheduler("keep", False)
+    if isinstance(paused, Future):
+        transaction: Future[dict[str, Any]] = Future()
+
+        def commit_after_pause(pause: Future[Any]) -> None:
+            try:
+                pause.result()
+                transaction.set_result(
+                    _commit_staged_policy_lora_update_after_pause(
+                        engine_core, operation_id, payload, staged
+                    )
+                )
+            except BaseException as error:
+                transaction.set_exception(error)
+
+        paused.add_done_callback(commit_after_pause)
+        return transaction
+    return _commit_staged_policy_lora_update_after_pause(
+        engine_core, operation_id, payload, staged
+    )
+
+
+def _commit_staged_policy_lora_update_after_pause(
+    engine_core: Any,
+    operation_id: str,
+    payload: dict[str, Any],
+    staged: dict[str, Any],
+) -> dict[str, Any]:
+    mutation_started = False
+    try:
+        lora_request = _policy_lora_request_from_payload(payload)
+        started = {
+            request.request_id
+            for request in engine_core.scheduler.requests.values()
+            if _request_uses_lora_slot(request, lora_request.lora_name)
+            and _request_has_executed(request)
+        }
+        _validate_continued_policy_update(engine_core.scheduler, started)
+        mutation_started = True
+        acknowledgements = engine_core.collective_rpc(
+            "art_commit_staged_lora_policy",
+            args=(operation_id, payload, staged),
+        )
+        previous = _validate_worker_lora_update(lora_request, acknowledgements)
+        cache_transition = _transition_scheduler_policy_history(
+            engine_core.scheduler,
+            lora_request=_policy_lora_request_from_payload(payload, load_inplace=False),
+            previous_policy=previous,
+            started_request_ids=started,
+        )
+        engine_core.resume_scheduler()
+        return {
+            "workers": len(acknowledgements),
+            "cache_transition": cache_transition,
+        }
+    except BaseException:
+        if mutation_started:
+            # A failed collective may have changed only a subset of workers.
+            engine_core.pause_scheduler("abort", True)
+        else:
+            engine_core.resume_scheduler()
+        raise
+
+
+def _validate_staged_lora_descriptor(
+    lora_request: PolicyLoRARequest, staged: Mapping[str, Any]
+) -> None:
+    if staged.get("path") != lora_request.lora_path:
+        raise RuntimeError("staged LoRA descriptor changed its path")
+    if staged.get("layout") != "peft_safetensors_v1":
+        raise RuntimeError("staged LoRA descriptor changed its layout")
+    for field in ("source_identity", "model_bytes", "config_bytes"):
+        value = staged.get(field)
+        if field == "source_identity":
+            valid = isinstance(value, str) and bool(value)
+        else:
+            valid = isinstance(value, int) and not isinstance(value, bool) and value > 0
+        if not valid:
+            raise RuntimeError(f"staged LoRA descriptor has invalid {field}")
+
+
+def _validate_staged_lora_files(
+    lora_request: PolicyLoRARequest, staged: Mapping[str, Any]
+) -> None:
+    root = Path(lora_request.lora_path)
+    model_path = root / "adapter_model.safetensors"
+    config_path = root / "adapter_config.json"
+    if not model_path.is_file() or not config_path.is_file():
+        raise RuntimeError("staged LoRA descriptor is incomplete")
+    if (
+        model_path.stat().st_size != staged["model_bytes"]
+        or config_path.stat().st_size != staged["config_bytes"]
+    ):
+        raise RuntimeError("staged LoRA descriptor changed its byte layout")
+
+
 def _transition_scheduler_policy_history(
     scheduler: Any,
     *,
@@ -1373,18 +1791,12 @@ def _transition_scheduler_policy_history(
     previous_policy: Mapping[str, Any] | None,
     started_request_ids: set[str],
 ) -> dict[str, int]:
-    from art_vllm_runtime.request_reports import (
-        observe_policy_transition,
-        request_snapshot,
-    )
-
     _validate_continued_policy_update(scheduler, started_request_ids)
     updated = 0
     continued = 0
     for request in scheduler.requests.values():
         if not _request_uses_lora_slot(request, lora_request.lora_name):
             continue
-        before = request_snapshot(scheduler, request)
         previous_digest = getattr(request, _POLICY_HISTORY_BASE_FIELD, None)
         if request.request_id in started_request_ids:
             continued += 1
@@ -1454,18 +1866,6 @@ def _transition_scheduler_policy_history(
                 int(getattr(request, "num_preemptions", 0) or 0),
                 len(getattr(request, "output_token_ids", ())),
             ),
-        )
-        observe_policy_transition(
-            scheduler,
-            request,
-            before=before,
-            previous_policy=previous_policy,
-            next_policy={
-                "lora_slot": lora_request.lora_name,
-                "generation_id": lora_request.generation_id,
-                "policy_version": lora_request.policy_version,
-                "update_seq": lora_request.update_seq,
-            },
         )
         updated += 1
     return {
