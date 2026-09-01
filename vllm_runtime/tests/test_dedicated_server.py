@@ -597,3 +597,85 @@ def test_runtime_sleep_route_returns_engine_validation_error(monkeypatch) -> Non
     response = TestClient(app).post("/sleep?level=1&mode=wait")
     assert response.status_code == 400
     assert response.json() == {"error": "invalid level=1 mode='wait'"}
+
+
+def test_private_completion_preserves_exact_token_request_and_logprobs(
+    monkeypatch,
+) -> None:
+    from art_vllm_runtime.runtime_usage import RuntimeUsageJournal
+    from fastapi.responses import JSONResponse
+    from vllm.entrypoints.openai import api_server
+    from vllm.entrypoints.openai.completion import api_router as completion_router
+
+    async def exact_completion(request, _raw_request):
+        assert request.prompt == [11, 12]
+        assert request.max_tokens == 2
+        assert request.logprobs == 2
+        assert request.return_token_ids is True
+        return JSONResponse(
+            {
+                "id": "cmpl-exact",
+                "object": "text_completion",
+                "created": 0,
+                "model": request.model,
+                "choices": [
+                    {
+                        "index": 0,
+                        "text": "",
+                        "finish_reason": "length",
+                        "prompt_token_ids": [11, 12],
+                        "token_ids": [13, 14],
+                        "logprobs": {"token_logprobs": [-0.1, -0.2]},
+                    }
+                ],
+            }
+        )
+
+    monkeypatch.setattr(api_server, "build_app", lambda *args, **kwargs: FastAPI())
+    monkeypatch.setattr(api_server, "_art_runtime_routes_patched", False, raising=False)
+    monkeypatch.setattr(completion_router, "create_completion", exact_completion)
+    monkeypatch.setattr(dedicated_server, "_runtime_target_id", "a" * 64)
+    receipts = dedicated_server._PrivateExecutionReceipts(capacity=2)
+    monkeypatch.setattr(dedicated_server, "_private_execution_receipts", receipts)
+    journal = RuntimeUsageJournal("runtime-source", 1, capacity=2)
+    monkeypatch.setattr(dedicated_server, "runtime_usage_journal", lambda: journal)
+    dedicated_server._patch_art_runtime_routes()
+    app = api_server.build_app()
+
+    client = TestClient(app)
+    response = client.post(
+        "/art/internal/v1/completions",
+        headers={
+            "x-art-runtime-target": "a" * 64,
+            "x-art-request-identity": "b" * 64,
+            "x-art-cache-identity": "c" * 64,
+            "x-art-tenant-id": "tenant-1",
+            "x-art-run-id": "run-1",
+            "x-art-service-tier": "standard",
+        },
+        json={
+            "model": "runtime-model",
+            "prompt": [11, 12],
+            "max_tokens": 2,
+            "logprobs": 2,
+            "return_token_ids": True,
+            "return_tokens_as_token_ids": True,
+            "add_special_tokens": False,
+        },
+    )
+    assert response.status_code == 200
+    assert response.json()["choices"][0] == {
+        "index": 0,
+        "text": "",
+        "finish_reason": "length",
+        "prompt_token_ids": [11, 12],
+        "token_ids": [13, 14],
+        "logprobs": {"token_logprobs": [-0.1, -0.2]},
+    }
+    receipt = client.get(
+        f"/art/internal/v1/requests/{'b' * 64}",
+        headers={"x-art-runtime-target": "a" * 64},
+    )
+    assert receipt.status_code == 200
+    assert receipt.json()["execution"] == "completed"
+    client.close()
