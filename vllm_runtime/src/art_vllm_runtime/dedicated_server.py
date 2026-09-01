@@ -47,7 +47,7 @@ from art_vllm_runtime.runtime_usage import (
     runtime_usage_journal,
 )
 
-ART_SERVING_PROTOCOL_VERSION = 10
+ART_SERVING_PROTOCOL_VERSION = 11
 _PRIVATE_CACHE_IDENTITY_HEADER = "x-art-cache-identity"
 _PRIVATE_DISPATCH_PATH = "/art/internal/v1/chat/completions"
 _PRIVATE_EXECUTION_RECEIPT_CAPACITY = 4096
@@ -428,6 +428,12 @@ def _config_string(value: Any) -> str:
     return str(raw).removeprefix("torch.")
 
 
+def _canonical_json_sha256(value: Any) -> str:
+    return hashlib.sha256(
+        json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+
+
 async def _serving_profile(engine_client: Any) -> dict[str, Any] | None:
     identity = _runtime_state.get("serving_profile_identity")
     if identity is None:
@@ -458,13 +464,65 @@ async def _serving_profile(engine_client: Any) -> dict[str, Any] | None:
     geometry = geometry_reports[0]
     if not isinstance(geometry, dict):
         raise RuntimeError("vLLM returned malformed KV geometry")
+    resolved_config = getattr(model, "hf_config", None)
+    if resolved_config is None:
+        resolved_config = getattr(model, "hf_text_config", None)
+    to_dict = getattr(resolved_config, "to_dict", None)
+    if not callable(to_dict):
+        raise RuntimeError("vLLM resolved model config does not expose to_dict()")
+    canonical_config = to_dict()
+    if not isinstance(canonical_config, dict):
+        raise RuntimeError("vLLM resolved model config did not produce an object")
+    text_config = getattr(model, "hf_text_config", resolved_config)
+    loaded_layer_count = int(getattr(text_config, "num_hidden_layers", 0))
+    if loaded_layer_count < 1:
+        raise RuntimeError("vLLM resolved model config has no loaded layers")
+    runtime_model = _runtime_state.get("runtime_model", model.model)
+    runtime_revision = _runtime_state.get("runtime_revision", model.revision)
+    model_revision = str(runtime_revision or "default")
+    world_size = (
+        int(parallel.tensor_parallel_size)
+        * int(parallel.pipeline_parallel_size)
+        * int(parallel.data_parallel_size)
+    )
+    runtime_identity = _canonical_json_sha256(
+        {
+            "process_uuid": _runtime_state.get("process_uuid"),
+            "generation": _runtime_state.get("generation"),
+            "runtime_source_id": _runtime_state.get("runtime_source_id"),
+            "runtime_source_epoch": _runtime_state.get("runtime_source_epoch"),
+        }
+    )
+    architecture = {
+        "runtime_kind": "inference",
+        "base_model": identity["base_model"],
+        "model_source": runtime_model,
+        "model_revision": model_revision,
+        "model_support_key": identity["model_support_key"],
+        "handler_name": identity["handler_name"],
+        "canonical_config_sha256": _canonical_json_sha256(canonical_config),
+        "loaded_layer_count": loaded_layer_count,
+        "tensor_parallel_size": int(parallel.tensor_parallel_size),
+        "context_parallel_size": int(parallel.prefill_context_parallel_size),
+        "pipeline_parallel_size": int(parallel.pipeline_parallel_size),
+        "expert_parallel_size": (
+            int(parallel.data_parallel_size) if parallel.enable_expert_parallel else 1
+        ),
+        "data_parallel_size": int(parallel.data_parallel_size),
+        "world_size": world_size,
+        "runtime_identity": runtime_identity,
+    }
+    architecture["architecture_sha256"] = _canonical_json_sha256(
+        {key: value for key, value in architecture.items() if key != "runtime_identity"}
+    )
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "identity": identity,
+        "architecture": architecture,
         # vLLM rewrites offline model identifiers to local snapshot paths. Keep
         # the ART launch identity stable across online and offline resolution.
-        "runtime_model": _runtime_state.get("runtime_model", model.model),
-        "runtime_revision": _runtime_state.get("runtime_revision", model.revision),
+        "runtime_model": runtime_model,
+        "runtime_revision": runtime_revision,
         "tokenizer": model.tokenizer,
         "tokenizer_revision": model.tokenizer_revision,
         "model_dtype": _config_string(model.dtype),

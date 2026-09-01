@@ -27,6 +27,7 @@ from art.megatron.runtime.portable_snapshot import (
 )
 from art.megatron.runtime.residency import ResidencyKey
 from art.megatron.runtime.specs import TrainerGeneration
+from art.runtime_attestation import RuntimeArchitectureAttestation
 from art.training import AdapterSpec, TrainingRunSpec
 
 
@@ -146,6 +147,23 @@ async def test_cold_bind_uses_portable_archive_generation(tmp_path: Any) -> None
             runtime_source_id="slot",
             runtime_source_epoch=1,
             runtime_fingerprint="f" * 64,
+            trainer_architecture=RuntimeArchitectureAttestation.create(
+                runtime_kind="trainer",
+                base_model="model",
+                model_source="model",
+                model_revision="default",
+                model_support_key="test",
+                handler_name="test",
+                canonical_config_sha256="a" * 64,
+                loaded_layer_count=1,
+                tensor_parallel_size=1,
+                context_parallel_size=1,
+                pipeline_parallel_size=1,
+                expert_parallel_size=1,
+                data_parallel_size=1,
+                world_size=1,
+                runtime_identity="f" * 64,
+            ),
         ),
     )
     binding = await slot.bind_run(

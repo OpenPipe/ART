@@ -21,6 +21,7 @@ MAX_CONTROL_IDENTIFIER_LENGTH = 255
 MAX_CHECKPOINT_REFERENCE_LENGTH = 2048
 MAX_TOKEN_LOGPROB_VALUES = 16_777_216
 MAX_TARGET_MODULES = 256
+MAX_INPUT_OBJECT_REFERENCE_LENGTH = 2048
 
 
 class Contract(BaseModel):
@@ -83,8 +84,29 @@ class TokenizedTrainingBatch(Contract):
         return self
 
 
+class TrainingInputObject(Contract):
+    """Authenticated immutable object identity; access remains resolver-owned."""
+
+    store: Literal["caios"] = "caios"
+    locator: str = Field(min_length=1, max_length=MAX_INPUT_OBJECT_REFERENCE_LENGTH)
+    size_bytes: int = Field(ge=1)
+    sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+class TrainingInputObjectRef(Contract):
+    """Digest-bound identity for an immutable, externally stored input batch."""
+
+    kind: Literal["input_object"] = "input_object"
+    run_id: str = Field(min_length=1, max_length=MAX_CONTROL_IDENTIFIER_LENGTH)
+    operation_id: str = Field(min_length=1, max_length=64)
+    input_kind: Literal["rl", "sft", "tokenized"]
+    encoding: Literal["art_training_batch_json_v1"] = "art_training_batch_json_v1"
+    object: TrainingInputObject
+    lease_id: str = Field(min_length=1, max_length=512)
+
+
 class PackedInputCaptureRef(Contract):
-    """Opaque identity for one immutable slot-local packed input."""
+    """Disposable slot-local materialization of one immutable packed input."""
 
     kind: Literal["captured"] = "captured"
     run_id: str = Field(min_length=1, max_length=MAX_CONTROL_IDENTIFIER_LENGTH)
@@ -94,6 +116,7 @@ class PackedInputCaptureRef(Contract):
     input_kind: Literal["rl", "sft", "tokenized"]
     min_source_version: int = Field(default=0, ge=0)
     max_source_version: int = Field(default=0, ge=0)
+    input_object: TrainingInputObjectRef | None = None
 
     @model_validator(mode="after")
     def _validate_source_versions(self) -> "PackedInputCaptureRef":
@@ -102,10 +125,17 @@ class PackedInputCaptureRef(Contract):
         return self
 
 
+RawTrainingBatch = Annotated[
+    RlTrajectoryBatch | SupervisedTrajectoryBatch | TokenizedTrainingBatch,
+    Field(discriminator="kind"),
+]
+
+
 TrainingBatch = Annotated[
     RlTrajectoryBatch
     | SupervisedTrajectoryBatch
     | TokenizedTrainingBatch
+    | TrainingInputObjectRef
     | PackedInputCaptureRef,
     Field(discriminator="kind"),
 ]
@@ -130,7 +160,7 @@ class ForwardRequest(RunCommand):
     def _validate_loss(self) -> "ForwardRequest":
         batch_kind = (
             self.batch.input_kind
-            if isinstance(self.batch, PackedInputCaptureRef)
+            if isinstance(self.batch, (PackedInputCaptureRef, TrainingInputObjectRef))
             else self.batch.kind
         )
         expected = {

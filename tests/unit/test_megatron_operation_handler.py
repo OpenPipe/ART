@@ -64,6 +64,8 @@ from art.training import (
     SamplerPublication,
     SamplerWeightsResult,
     SaveWeightsForSamplerRequest,
+    TrainingInputObject,
+    TrainingInputObjectRef,
 )
 from art.trajectories import TrajectoryGroup
 from art.vllm_route_transport import (
@@ -75,7 +77,9 @@ from art.vllm_route_transport import (
 )
 
 
-def _packed_batch(*, content_sha256: str | None = None) -> DistributedPackedBatch:
+def _packed_batch(
+    *, content_sha256: str | None = None, batch_id: str = "batch"
+) -> DistributedPackedBatch:
     item_sizes = {
         "tokens": ("int64", 8),
         "group_ids": ("int64", 8),
@@ -101,7 +105,7 @@ def _packed_batch(*, content_sha256: str | None = None) -> DistributedPackedBatc
         )
         offset += byte_count
     ref = PackedBatchRef(
-        batch_id="batch",
+        batch_id=batch_id,
         owner_actor_id="owner",
         lease_id="lease",
         shared_memory_name="shm",
@@ -133,11 +137,31 @@ class _Runtime:
         self.packed = _packed_batch()
         self.released: list[DistributedPackedBatch] = []
 
-    async def pack(self, _request):
+    async def pack(self, request):
+        if (
+            request.compute_content_sha256
+            and self.packed.leases.ref.content_sha256 is None
+        ):
+            self.packed = _packed_batch(content_sha256="b" * 64)
         return self.packed
 
     async def release_batch(self, batch):
         self.released.append(batch)
+
+
+class _InputResolver:
+    def __init__(self, batch: RlTrajectoryBatch) -> None:
+        self.batch = batch
+        self.calls: list[tuple[TrainingInputObjectRef, OperationRef]] = []
+
+    async def resolve(
+        self,
+        input_object: TrainingInputObjectRef,
+        *,
+        operation: OperationRef,
+    ) -> RlTrajectoryBatch:
+        self.calls.append((input_object, operation))
+        return self.batch
 
 
 class _RouteOwnership:
@@ -503,6 +527,20 @@ def _batch() -> RlTrajectoryBatch:
     )
 
 
+def _input_object(operation_id: str) -> TrainingInputObjectRef:
+    return TrainingInputObjectRef(
+        run_id="run",
+        operation_id=operation_id,
+        input_kind="rl",
+        object=TrainingInputObject(
+            locator=f"caios://training-input/{operation_id}",
+            size_bytes=128,
+            sha256="c" * 64,
+        ),
+        lease_id=f"training-input:{operation_id}",
+    )
+
+
 def _batch_with_retained_route() -> tuple[RlTrajectoryBatch, RetainedRouteBundleRef]:
     choice = RouteBundleChoiceLayout(
         choice_index=0,
@@ -819,6 +857,8 @@ async def test_handler_retains_route_ownership_through_optimizer() -> None:
     trainer.fail_optimizer = False
     trainer.runtime_spec.enable_moe_routing_replay = True
     ownership = _RouteOwnership()
+    batch, route = _batch_with_retained_route()
+    input_object = _input_object("fb")
     handler = MegatronOperationHandler(
         runtime,  # type: ignore[arg-type]
         trainer,
@@ -837,14 +877,14 @@ async def test_handler_retains_route_ownership_through_optimizer() -> None:
             output_adapter_root="/adapter",
         ),
         route_ownership=ownership,
+        input_resolver=_InputResolver(batch),
     )
-    batch, route = _batch_with_retained_route()
     result = await handler(
         ForwardBackwardRequest(
             run_id="run",
             request_id="fb",
             sequence_id=0,
-            batch=batch,
+            batch=input_object,
             loss=LossConfig(name="cispo"),
         ),
         _operation("fb", "forward_backward", 0),
@@ -854,7 +894,7 @@ async def test_handler_retains_route_ownership_through_optimizer() -> None:
     assert capture is not None
     assert ownership.acquired[0][1] == (route,)
     target = await handler.transfer_route_ownership(
-        capture,
+        input_object,
         transfer_id="migration:routes",
         target_owner_id="target-runtime",
     )
@@ -875,11 +915,13 @@ async def test_handler_retains_route_ownership_through_optimizer() -> None:
 
 
 @pytest.mark.asyncio
-async def test_replay_capture_survives_optimizer_until_explicit_release() -> None:
+async def test_input_object_releases_image_and_rematerializes_for_replay() -> None:
     runtime = _Runtime()
     runtime.packed = _packed_batch(content_sha256="b" * 64)
     trainer = _Trainer()
     trainer.fail_optimizer = False
+    resolver = _InputResolver(_batch())
+    input_object = _input_object("fb")
     handler = MegatronOperationHandler(
         runtime,  # type: ignore[arg-type]
         trainer,
@@ -897,21 +939,27 @@ async def test_replay_capture_survives_optimizer_until_explicit_release() -> Non
             rollout_model=RolloutModelSpec(payload={}),
             output_adapter_root="/adapter",
         ),
+        input_resolver=resolver,
     )
+    operation = _operation("fb", "forward_backward", 0)
     first = await handler(
         ForwardBackwardRequest(
             run_id="run",
             request_id="fb",
             sequence_id=0,
-            batch=_batch(),
+            batch=input_object,
             loss=LossConfig(name="cispo"),
             retain_packed_input=True,
         ),
-        _operation("fb", "forward_backward", 0),
+        operation,
         (),
     )
     capture = first.packed_input_capture
     assert capture is not None and capture.content_sha256 == "b" * 64
+    assert capture.input_object == input_object
+    assert handler.durable_contribution_inputs() == (("fb", input_object),)
+    first_image = runtime.packed
+    assert runtime.released == [first_image]
     await handler(
         OptimStepRequest(
             run_id="run",
@@ -922,8 +970,11 @@ async def test_replay_capture_survives_optimizer_until_explicit_release() -> Non
         _operation("optim", "optim_step", 1, output=1),
         ("fb",),
     )
-    assert runtime.released == []
+    assert runtime.released == [first_image]
 
+    replay_image = _packed_batch(content_sha256="b" * 64, batch_id="replacement-image")
+    runtime.packed = replay_image
+    replay_operation = _operation("replay", "forward_backward", 2, parent=1)
     await handler(
         ForwardBackwardRequest(
             run_id="run",
@@ -932,7 +983,7 @@ async def test_replay_capture_survives_optimizer_until_explicit_release() -> Non
             batch=capture,
             loss=LossConfig(name="cispo"),
         ),
-        _operation("replay", "forward_backward", 2, parent=1),
+        replay_operation,
         (),
     )
     await handler(
@@ -945,10 +996,14 @@ async def test_replay_capture_survives_optimizer_until_explicit_release() -> Non
         _operation("replay-optim", "optim_step", 3, parent=1, output=2),
         ("replay",),
     )
-    assert runtime.released == []
-    await handler.discard_prepared_input(capture)
-    await handler.discard_prepared_input(capture)
-    assert runtime.released == [runtime.packed]
+    assert runtime.released == [first_image, replay_image]
+    await handler.discard_input_object(input_object)
+    await handler.discard_input_object(input_object)
+    assert runtime.released == [first_image, replay_image]
+    assert resolver.calls == [
+        (input_object, operation),
+        (input_object, replay_operation),
+    ]
 
 
 @pytest.mark.asyncio
@@ -1244,7 +1299,10 @@ async def test_slot_migration_fences_replays_and_releases_one_run() -> None:
     runtime = _Runtime()
     trainer = _Trainer()
     trainer.fail_optimizer = False
-    slot = MegatronSlotCoordinator(runtime, trainer)  # type: ignore[arg-type]
+    input_object = _input_object("fb-replay")
+    slot = MegatronSlotCoordinator(  # type: ignore[arg-type]
+        runtime, trainer, input_resolver=_InputResolver(_batch())
+    )
     run = await slot.install_migration_run(
         MegatronOperationConfig(
             run_id="run",
@@ -1269,7 +1327,7 @@ async def test_slot_migration_fences_replays_and_releases_one_run() -> None:
         run_id="run",
         request_id="fb-replay",
         sequence_id=4,
-        batch=_batch(),
+        batch=input_object,
         loss=LossConfig(name="cispo"),
     )
     operation = _operation("fb-replay", "forward_backward", 4, parent=2)
@@ -1307,7 +1365,7 @@ async def test_slot_migration_fences_replays_and_releases_one_run() -> None:
         open_contributions=(
             MegatronMigrationContribution(
                 operation_id="fb-replay",
-                packed_input=result.result.packed_input_capture,
+                input_object=input_object,
             ),
         ),
     )

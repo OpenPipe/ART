@@ -69,6 +69,7 @@ class MegatronPairedInferencePublisher:
         self.service = service
         self.config = config
         self.endpoint = endpoint
+        self.architecture_attestation = endpoint.profile.architecture
         self.api_key = api_key
         self._lock = asyncio.Lock()
         self._active_generations: dict[str, str] = {}

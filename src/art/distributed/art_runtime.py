@@ -358,6 +358,18 @@ class ArtRuntime:
                 raise RuntimeError(f"host service {host_id!r} identity changed")
         return health
 
+    def host_admission_reports(
+        self, host_ids: tuple[str, ...]
+    ) -> tuple[HostAdmissionReport, ...]:
+        """Return immutable admission evidence for an exact bounded host set."""
+
+        if len(set(host_ids)) != len(host_ids):
+            raise ValueError("host admission request contains duplicate hosts")
+        try:
+            return tuple(self._admitted_hosts[host_id] for host_id in host_ids)
+        except KeyError as error:
+            raise KeyError(f"host {error.args[0]!r} was not admitted") from None
+
     @property
     def nixl_transport(self) -> NixlTransportSpec | None:
         return self._nixl_transport
@@ -1121,6 +1133,7 @@ class ArtRuntime:
                     rank_processes,
                     cp_lookahead_ports,
                     residency_prefetch_ports,
+                    architecture_attestation,
                 ) = await spawn_monarch_trainer_actors(
                     proc,
                     runtime_spec,
@@ -1149,6 +1162,7 @@ class ArtRuntime:
             rank_processes,
             cp_lookahead_ports,
             residency_prefetch_ports,
+            architecture_attestation,
             register_initial_run=register_initial_run,
         )
         self._trainer_runs.add(run)

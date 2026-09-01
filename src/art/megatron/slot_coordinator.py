@@ -26,6 +26,8 @@ from art.training import (
     SaveStateRequest,
     SaveWeightsForSamplerRequest,
     SupervisedTrajectoryBatch,
+    TrainingInputObjectRef,
+    TrainingInputResolver,
 )
 
 from .operation_handler import (
@@ -85,7 +87,7 @@ class MegatronMigrationContribution(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     operation_id: str = Field(min_length=1)
-    packed_input: PackedInputCaptureRef
+    input_object: TrainingInputObjectRef
 
 
 class MegatronMigrationFence(BaseModel):
@@ -479,6 +481,7 @@ class MegatronSlotCoordinator:
         schedule: MegatronSlotScheduleConfig | None = None,
         publisher: MegatronPairedPublisher | None = None,
         route_ownership: RouteBundleOwnershipProvider | None = None,
+        input_resolver: TrainingInputResolver | None = None,
         operation_evidence_sink: MegatronOperationEvidenceSink | None = None,
         command_timeout_s: float = 300.0,
     ) -> None:
@@ -490,6 +493,7 @@ class MegatronSlotCoordinator:
         self.schedule = schedule or MegatronSlotScheduleConfig()
         self.publisher = publisher
         self.route_ownership = route_ownership
+        self.input_resolver = input_resolver
         self.operation_evidence_sink = operation_evidence_sink
         self.command_timeout_s = command_timeout_s
         self._runs: dict[str, _RunState] = {}
@@ -634,6 +638,7 @@ class MegatronSlotCoordinator:
                 checkpoints=checkpoints,
                 publisher=self.publisher,
                 route_ownership=self.route_ownership,
+                input_resolver=self.input_resolver,
             )
             scheduled = _ScheduledRunHandler(self, config.run_id)
             worker = _SlotOperationWorker(
@@ -955,7 +960,7 @@ class MegatronSlotCoordinator:
                 await self._condition.wait()
 
         trainer_state = await self.trainer.command_run_state(run_id)
-        retained = state.handler.retained_contribution_inputs()
+        retained = state.handler.durable_contribution_inputs()
         retained_ids = tuple(operation_id for operation_id, _ in retained)
         if (
             trainer_state.run_id != run_id
@@ -974,9 +979,9 @@ class MegatronSlotCoordinator:
             open_contributions=tuple(
                 MegatronMigrationContribution(
                     operation_id=operation_id,
-                    packed_input=packed_input,
+                    input_object=input_object,
                 )
-                for operation_id, packed_input in retained
+                for operation_id, input_object in retained
             ),
         )
         async with self._condition:
@@ -990,8 +995,8 @@ class MegatronSlotCoordinator:
             self._condition.notify_all()
             return fence
 
-    async def release_retained_input(self, ref: PackedInputCaptureRef) -> None:
-        """Release one replay capture after its durable recovery coverage."""
+    async def release_retained_input(self, ref: TrainingInputObjectRef) -> None:
+        """Release one local materialization after durable recovery coverage."""
 
         async with self._condition:
             state = self._runs.get(ref.run_id)
@@ -1017,7 +1022,7 @@ class MegatronSlotCoordinator:
                 self._condition.notify_all()
                 raise
         try:
-            await state.handler.discard_prepared_input(ref)
+            await state.handler.discard_input_object(ref)
         finally:
             async with self._condition:
                 if self._runs.get(ref.run_id) is state:
@@ -1108,7 +1113,7 @@ class MegatronSlotCoordinator:
         try:
             for contribution in fence.open_contributions:
                 handle = await state.handler.transfer_route_ownership(
-                    contribution.packed_input,
+                    contribution.input_object,
                     transfer_id=transfer_id,
                     target_owner_id=target_owner_id,
                 )
@@ -1116,7 +1121,7 @@ class MegatronSlotCoordinator:
                     transfers.append(
                         RouteBundleOwnershipTransfer(
                             operation_id=contribution.operation_id,
-                            packed_input=contribution.packed_input,
+                            input_object=contribution.input_object,
                             handle=handle,
                         )
                     )
@@ -1267,9 +1272,9 @@ class MegatronSlotCoordinator:
         retained = tuple(
             MegatronMigrationContribution(
                 operation_id=operation_id,
-                packed_input=packed_input,
+                input_object=input_object,
             )
-            for operation_id, packed_input in state.handler.retained_contribution_inputs()
+            for operation_id, input_object in state.handler.durable_contribution_inputs()
         )
         if (
             not _same_generation_identity(

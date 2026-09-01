@@ -14,7 +14,12 @@ from art.distributed import ArtLaunchContext, ArtRuntime, ArtRuntimeConfig
 from art.distributed.rollout import RolloutModelSpec
 from art.distributed.specs import RuntimeTopology
 from art.model import TrainableModel
-from art.training import TrainingRunSpec
+from art.runtime_attestation import (
+    PairedSlotRuntimeAttestation,
+    RuntimeArchitectureAttestation,
+    RuntimeHostAttestation,
+)
+from art.training import TrainingInputResolver, TrainingRunSpec
 from art.types import MegatronRuntimeConfig
 from art.utils.output_dirs import get_step_checkpoint_dir
 from art.vllm_route_transport import RouteBundleReader
@@ -80,6 +85,8 @@ class MegatronSlotRuntimeDescriptor(BaseModel):
     runtime_source_id: str = Field(min_length=1)
     runtime_source_epoch: int = Field(ge=0)
     runtime_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
+    trainer_architecture: RuntimeArchitectureAttestation
+    paired_attestation: PairedSlotRuntimeAttestation | None = None
 
 
 class MegatronRunBootstrapConfig(BaseModel):
@@ -148,6 +155,7 @@ async def launch_megatron_slot(
     launch: ArtLaunchContext | None = None,
     route_bundle_reader: RouteBundleReader | None = None,
     route_bundle_ownership: RouteBundleOwnershipProvider | None = None,
+    input_resolver: TrainingInputResolver | None = None,
     resources: MegatronSlotResourceManager | None = None,
     operation_evidence_sink: MegatronOperationEvidenceSink | None = None,
 ) -> MegatronSlotRuntime:
@@ -201,6 +209,7 @@ async def launch_megatron_slot(
             schedule=config.schedule,
             publisher=paired_inference,
             route_ownership=route_bundle_ownership,
+            input_resolver=input_resolver,
             operation_evidence_sink=operation_evidence_sink,
             command_timeout_s=config.command_timeout_s,
         )
@@ -208,6 +217,27 @@ async def launch_megatron_slot(
     except BaseException:
         await runtime.close()
         raise
+    trainer_architecture = trainer.architecture_attestation
+    paired_attestation = None
+    if paired_inference is not None:
+        trainer_host_ids = tuple(
+            dict.fromkeys(rank.host_id for rank in runtime_spec.trainer_mesh.ranks)
+        )
+        inference_host_ids = tuple(
+            dict.fromkeys(member.host_id for member in paired_inference.service.members)
+        )
+        paired_attestation = PairedSlotRuntimeAttestation(
+            trainer=trainer_architecture,
+            inference=paired_inference.architecture_attestation,
+            trainer_hosts=tuple(
+                RuntimeHostAttestation.from_admission(report)
+                for report in runtime.host_admission_reports(trainer_host_ids)
+            ),
+            inference_hosts=tuple(
+                RuntimeHostAttestation.from_admission(report)
+                for report in runtime.host_admission_reports(inference_host_ids)
+            ),
+        )
     return MegatronSlotRuntime(
         runtime=runtime,
         coordinator=coordinator,
@@ -215,6 +245,8 @@ async def launch_megatron_slot(
             runtime_source_id=config.slot_id,
             runtime_source_epoch=config.runtime_source_epoch,
             runtime_fingerprint=runtime_spec.fingerprint,
+            trainer_architecture=trainer_architecture,
+            paired_attestation=paired_attestation,
         ),
         paired_inference=paired_inference,
     )

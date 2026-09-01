@@ -42,6 +42,8 @@ from art.training import (
     SupervisedTrajectoryBatch,
     TokenizedTrainingBatch,
     TokenLogprobs,
+    TrainingInputObjectRef,
+    TrainingInputResolver,
     UsageMeasurement,
     bootstrap_operation_worker,
 )
@@ -298,6 +300,8 @@ class _CapturedInput:
     owners: set[str] = field(default_factory=set)
     retained_for_replay: bool = False
     input_metrics: dict[str, float] = field(default_factory=dict)
+    source_request: ForwardRequest | ForwardBackwardRequest | None = None
+    source_operation: OperationRef | None = None
 
 
 class _ResidentTrainer(Protocol):
@@ -390,6 +394,7 @@ class MegatronOperationHandler:
         checkpoints: MegatronCheckpointOperations | None = None,
         publisher: MegatronPairedPublisher | None = None,
         route_ownership: RouteBundleOwnershipProvider | None = None,
+        input_resolver: TrainingInputResolver | None = None,
     ) -> None:
         if config.source.training_session_id != config.training_session_id:
             raise ValueError("source generation belongs to another training session")
@@ -399,6 +404,7 @@ class MegatronOperationHandler:
         self.checkpoints = checkpoints
         self.publisher = publisher
         self.route_ownership = route_ownership
+        self.input_resolver = input_resolver
         self._generation = config.source
         self._optimizer_state_path = config.optimizer_state_path
         self._captures: dict[str, _CapturedInput] = {}
@@ -475,7 +481,27 @@ class MegatronOperationHandler:
                 request, operation
             ):
                 raise ValueError("packed-input command controls changed")
+            await self._ensure_capture_materialized(
+                captured, resolver_operation=operation
+            )
             return captured.ref
+        identity_request = request
+        input_object = (
+            request.batch if isinstance(request.batch, TrainingInputObjectRef) else None
+        )
+        if input_object is not None:
+            if (
+                input_object.run_id != operation.run_id
+                or input_object.operation_id != operation.operation_id
+            ):
+                raise ValueError("input object belongs to another operation")
+            request = request.model_copy(
+                update={
+                    "batch": await self._resolve_input_object(
+                        input_object, operation=operation
+                    )
+                }
+            )
         if not isinstance(
             request.batch,
             (RlTrajectoryBatch, SupervisedTrajectoryBatch, TokenizedTrainingBatch),
@@ -485,7 +511,7 @@ class MegatronOperationHandler:
                 "the persistent Megatron runtime requires an RL, SFT, or tokenized batch",
                 usage=CommandExecutionUsage.no_work(),
             )
-        fingerprint = _input_fingerprint(request, operation)
+        fingerprint = _input_fingerprint(identity_request, operation)
         capture_id = operation.operation_id
         async with self._capture_lock:
             prior = self._captures.get(capture_id)
@@ -501,121 +527,241 @@ class MegatronOperationHandler:
                     "retained packed-input capacity is exhausted",
                     usage=CommandExecutionUsage.no_work(),
                 )
-            if isinstance(request.batch, SupervisedTrajectoryBatch):
-                tokenized = self._sft_tokenizer.tokenize(
-                    self.config.rollout_model.build(), request.batch
-                )
-                packing = _sft_packing_outcome(
-                    tokenized,
-                    configured_sequence_length=self.trainer.runtime_spec.packed_sequence_length,
-                    target_sequences=(
-                        _train_config(
-                            self.config.train_config, request
-                        ).grad_accumulation_sequences
-                        or _data_parallel_size(self.trainer)
-                    ),
-                )
-                sft = (
-                    SFTBatchData(
-                        trajectory_tensors=tuple(tokenized.trajectory_tensors),
-                        learning_rate=tokenized.learning_rate,
-                        num_trajectories=tokenized.num_trajectories,
-                        num_tokens=tokenized.num_tokens,
-                        num_trainable_tokens=tokenized.num_trainable_tokens,
-                        num_dropped_trajectories=(tokenized.num_dropped_trajectories),
-                    )
-                    if tokenized.num_trainable_tokens > 0
-                    else None
-                )
-                content_sha256 = None if sft is None else sft.fingerprint
-                ref = PackedInputCaptureRef(
-                    run_id=operation.run_id,
-                    capture_id=capture_id,
-                    manifest_sha256=_sft_capture_manifest_sha256(
-                        operation,
-                        packing,
-                        fingerprint,
-                        content_sha256,
-                    ),
-                    content_sha256=content_sha256,
-                    input_kind="sft",
-                )
-                self._captures[capture_id] = _CapturedInput(
-                    ref=ref,
-                    request_fingerprint=fingerprint,
-                    control_fingerprint=_input_control_fingerprint(request, operation),
-                    packed=None,
-                    sft=sft,
-                    packing=packing,
-                    retained_for_replay=request.retain_packed_input and sft is not None,
-                    input_metrics={
-                        "data/dropped_sft_trajectories": float(
-                            tokenized.num_dropped_trajectories
-                        )
-                    },
-                )
-                return ref
-            bundles = (
-                retained_route_bundles_from_bundles(request.batch.groups)
-                if isinstance(request.batch, RlTrajectoryBatch)
-                else ()
+            captured = await self._materialize_input(
+                request,
+                identity_request,
+                operation,
+                input_object=input_object,
+                acquire_route_ownership=True,
             )
-            ownership = await self._acquire_route_ownership(operation, bundles)
-            packed = None
-            try:
-                packed = await self.runtime.pack(
-                    self._packing_request(
-                        request,
-                        operation,
-                        retained_route_bundles=bundles,
-                    )
+            self._captures[capture_id] = captured
+            return captured.ref
+
+    async def _resolve_input_object(
+        self,
+        input_object: TrainingInputObjectRef,
+        *,
+        operation: OperationRef,
+    ) -> RlTrajectoryBatch | SupervisedTrajectoryBatch | TokenizedTrainingBatch:
+        resolver = self.input_resolver
+        if resolver is None:
+            raise OperationExecutionError(
+                "execution_failed",
+                "immutable training-input resolution is not configured",
+                usage=CommandExecutionUsage.no_work(),
+            )
+        batch = await resolver.resolve(input_object, operation=operation)
+        if batch.kind != input_object.input_kind:
+            raise RuntimeError("training-input resolver changed input kind")
+        return batch
+
+    async def _materialize_input(
+        self,
+        request: ForwardRequest | ForwardBackwardRequest,
+        identity_request: ForwardRequest | ForwardBackwardRequest,
+        operation: OperationRef,
+        *,
+        input_object: TrainingInputObjectRef | None,
+        route_ownership: RouteBundleOwnershipHandle | None = None,
+        acquire_route_ownership: bool,
+    ) -> _CapturedInput:
+        fingerprint = _input_fingerprint(identity_request, operation)
+        if isinstance(request.batch, SupervisedTrajectoryBatch):
+            tokenized = self._sft_tokenizer.tokenize(
+                self.config.rollout_model.build(), request.batch
+            )
+            packing = _sft_packing_outcome(
+                tokenized,
+                configured_sequence_length=self.trainer.runtime_spec.packed_sequence_length,
+                target_sequences=(
+                    _train_config(
+                        self.config.train_config, request
+                    ).grad_accumulation_sequences
+                    or _data_parallel_size(self.trainer)
+                ),
+            )
+            sft = (
+                SFTBatchData(
+                    trajectory_tensors=tuple(tokenized.trajectory_tensors),
+                    learning_rate=tokenized.learning_rate,
+                    num_trajectories=tokenized.num_trajectories,
+                    num_tokens=tokenized.num_tokens,
+                    num_trainable_tokens=tokenized.num_trainable_tokens,
+                    num_dropped_trajectories=tokenized.num_dropped_trajectories,
                 )
-                if packed is None:
-                    raise ValueError("training input produced no packed sequence")
-                packing = self._packing_outcome(packed, request)
-                ref = PackedInputCaptureRef(
-                    run_id=operation.run_id,
-                    capture_id=capture_id,
-                    manifest_sha256=_capture_manifest_sha256(
-                        operation, packed, packing, fingerprint
-                    ),
-                    content_sha256=packed.leases.ref.content_sha256,
-                    input_kind=request.batch.kind,
-                    min_source_version=(
-                        request.batch.min_source_version
-                        if isinstance(request.batch, RlTrajectoryBatch)
-                        else 0
-                    ),
-                    max_source_version=(
-                        request.batch.max_source_version
-                        if isinstance(request.batch, RlTrajectoryBatch)
-                        else 0
-                    ),
-                )
-                if request.retain_packed_input and ref.content_sha256 is None:
-                    raise RuntimeError("replayable packed input has no content digest")
-            except BaseException as error:
-                if packed is not None:
-                    try:
-                        await self.runtime.release_batch(packed)
-                    except BaseException as cleanup_error:
-                        error.add_note(
-                            "packed-input cleanup also failed: "
-                            f"{type(cleanup_error).__name__}: {cleanup_error}"
-                        )
-                await self._release_route_ownership(ownership, error)
-                raise
-            self._captures[capture_id] = _CapturedInput(
+                if tokenized.num_trainable_tokens > 0
+                else None
+            )
+            content_sha256 = None if sft is None else sft.fingerprint
+            ref = PackedInputCaptureRef(
+                run_id=operation.run_id,
+                capture_id=operation.operation_id,
+                manifest_sha256=_sft_capture_manifest_sha256(
+                    operation,
+                    packing,
+                    fingerprint,
+                    content_sha256,
+                ),
+                content_sha256=content_sha256,
+                input_kind="sft",
+                input_object=input_object,
+            )
+            return _CapturedInput(
                 ref=ref,
                 request_fingerprint=fingerprint,
-                control_fingerprint=_input_control_fingerprint(request, operation),
-                packed=packed,
-                sft=None,
+                control_fingerprint=_input_control_fingerprint(
+                    identity_request, operation
+                ),
+                packed=None,
+                sft=sft,
                 packing=packing,
-                route_ownership=ownership,
-                retained_for_replay=request.retain_packed_input,
+                retained_for_replay=(
+                    identity_request.retain_packed_input and sft is not None
+                ),
+                input_metrics={
+                    "data/dropped_sft_trajectories": float(
+                        tokenized.num_dropped_trajectories
+                    )
+                },
+                source_request=identity_request if input_object is not None else None,
+                source_operation=operation if input_object is not None else None,
             )
-            return ref
+        if not isinstance(request.batch, (RlTrajectoryBatch, TokenizedTrainingBatch)):
+            raise RuntimeError("resolved training input has an unsupported kind")
+        bundles = (
+            retained_route_bundles_from_bundles(request.batch.groups)
+            if isinstance(request.batch, RlTrajectoryBatch)
+            else ()
+        )
+        ownership = route_ownership
+        acquired_here = False
+        if acquire_route_ownership:
+            ownership = await self._acquire_route_ownership(operation, bundles)
+            acquired_here = ownership is not None
+        elif bundles and ownership is None:
+            raise RuntimeError(
+                "retained route ownership changed during rematerialization"
+            )
+        packed = None
+        try:
+            packed = await self.runtime.pack(
+                self._packing_request(
+                    request,
+                    operation,
+                    retained_route_bundles=bundles,
+                    force_content_sha256=input_object is not None,
+                )
+            )
+            if packed is None:
+                raise ValueError("training input produced no packed sequence")
+            packing = self._packing_outcome(packed, request)
+            ref = PackedInputCaptureRef(
+                run_id=operation.run_id,
+                capture_id=operation.operation_id,
+                manifest_sha256=_capture_manifest_sha256(
+                    operation, packed, packing, fingerprint
+                ),
+                content_sha256=packed.leases.ref.content_sha256,
+                input_kind=request.batch.kind,
+                min_source_version=(
+                    request.batch.min_source_version
+                    if isinstance(request.batch, RlTrajectoryBatch)
+                    else 0
+                ),
+                max_source_version=(
+                    request.batch.max_source_version
+                    if isinstance(request.batch, RlTrajectoryBatch)
+                    else 0
+                ),
+                input_object=input_object,
+            )
+            if (
+                identity_request.retain_packed_input or input_object is not None
+            ) and ref.content_sha256 is None:
+                raise RuntimeError("replayable packed input has no content digest")
+        except BaseException as error:
+            if packed is not None:
+                try:
+                    await self.runtime.release_batch(packed)
+                except BaseException as cleanup_error:
+                    error.add_note(
+                        "packed-input cleanup also failed: "
+                        f"{type(cleanup_error).__name__}: {cleanup_error}"
+                    )
+            if acquired_here:
+                await self._release_route_ownership(ownership, error)
+            raise
+        return _CapturedInput(
+            ref=ref,
+            request_fingerprint=fingerprint,
+            control_fingerprint=_input_control_fingerprint(identity_request, operation),
+            packed=packed,
+            sft=None,
+            packing=packing,
+            route_ownership=ownership,
+            retained_for_replay=identity_request.retain_packed_input,
+            source_request=identity_request if input_object is not None else None,
+            source_operation=operation if input_object is not None else None,
+        )
+
+    async def _ensure_capture_materialized(
+        self,
+        captured: _CapturedInput,
+        *,
+        resolver_operation: OperationRef | None = None,
+    ) -> None:
+        if not captured.packed_released:
+            return
+        source_request = captured.source_request
+        source_operation = captured.source_operation
+        input_object = captured.ref.input_object
+        if source_request is None or source_operation is None or input_object is None:
+            raise RuntimeError("released packed input has no immutable source")
+        async with self._capture_lock:
+            if not captured.packed_released:
+                return
+            request = source_request.model_copy(
+                update={
+                    "batch": await self._resolve_input_object(
+                        input_object,
+                        operation=resolver_operation or source_operation,
+                    )
+                }
+            )
+            await self._replace_capture_materialization(
+                captured,
+                request=request,
+                identity_request=source_request,
+                source_operation=source_operation,
+                input_object=input_object,
+            )
+
+    async def _replace_capture_materialization(
+        self,
+        captured: _CapturedInput,
+        *,
+        request: ForwardRequest | ForwardBackwardRequest,
+        identity_request: ForwardRequest | ForwardBackwardRequest,
+        source_operation: OperationRef,
+        input_object: TrainingInputObjectRef,
+    ) -> None:
+        fresh = await self._materialize_input(
+            request,
+            identity_request,
+            source_operation,
+            input_object=input_object,
+            route_ownership=captured.route_ownership,
+            acquire_route_ownership=False,
+        )
+        if fresh.ref != captured.ref:
+            if fresh.packed is not None:
+                await self.runtime.release_batch(fresh.packed)
+            raise RuntimeError("rematerialized packed input changed identity")
+        captured.packed = fresh.packed
+        captured.sft = fresh.sft
+        captured.packing = fresh.packing
+        captured.input_metrics = fresh.input_metrics
+        captured.packed_released = False
 
     async def __call__(
         self,
@@ -765,6 +911,25 @@ class MegatronOperationHandler:
         captured.retained_for_replay = False
         await self._release_if_unowned(ref.capture_id)
 
+    async def discard_input_object(self, ref: TrainingInputObjectRef) -> None:
+        matches = tuple(
+            captured
+            for captured in self._captures.values()
+            if captured.ref.input_object == ref
+        )
+        if not matches and any(
+            released.input_object == ref
+            for released in self._released_captures.values()
+        ):
+            return
+        if len(matches) != 1 or ref.run_id != self.config.run_id:
+            raise ValueError("training-input object is absent or ambiguous")
+        captured = matches[0]
+        if captured.owners:
+            raise RuntimeError("cannot discard training input owned by an operation")
+        captured.retained_for_replay = False
+        await self._release_if_unowned(captured.ref.capture_id)
+
     async def packing_for(self, ref: PackedInputCaptureRef) -> PackingOutcome:
         return (await self._require_capture(ref, None)).packing
 
@@ -777,22 +942,30 @@ class MegatronOperationHandler:
         captured = self._captures.get(capture_id)
         if captured is None:
             raise RuntimeError("numerical capture packed input is absent")
+        await self._ensure_capture_materialized(captured)
         if captured.packed is None:
             raise RuntimeError("SFT numerical capture is not yet supported")
-        return await self.trainer.capture_forward_backward_numerics(
-            self.config.run_id,
-            operation_id,
-            captured.packed.leases,
-            root,
-        )
+        try:
+            return await self.trainer.capture_forward_backward_numerics(
+                self.config.run_id,
+                operation_id,
+                captured.packed.leases,
+                root,
+            )
+        finally:
+            if captured.ref.input_object is not None:
+                await self._release_execution_image(capture_id, captured)
 
     async def retry_releases(self) -> None:
         for capture_id in tuple(self._release_failures):
+            captured = self._captures.get(capture_id)
+            if captured is not None and captured.ref.input_object is not None:
+                await self._release_execution_image(capture_id, captured)
             await self._release_if_unowned(capture_id)
 
     async def transfer_route_ownership(
         self,
-        ref: PackedInputCaptureRef,
+        ref: TrainingInputObjectRef,
         *,
         transfer_id: str,
         target_owner_id: str,
@@ -801,7 +974,7 @@ class MegatronOperationHandler:
 
         if not transfer_id or not target_owner_id:
             raise ValueError("route ownership transfer identities must not be empty")
-        captured = await self._require_capture(ref, None)
+        captured = self._capture_for_input_object(ref)
         handle = captured.route_ownership
         if handle is None:
             return None
@@ -824,6 +997,19 @@ class MegatronOperationHandler:
             (operation_id, self._captures[capture_id].ref)
             for operation_id, capture_id in self._contributions.items()
         )
+
+    def durable_contribution_inputs(
+        self,
+    ) -> tuple[tuple[str, TrainingInputObjectRef], ...]:
+        retained: list[tuple[str, TrainingInputObjectRef]] = []
+        for operation_id, capture_id in self._contributions.items():
+            input_object = self._captures[capture_id].ref.input_object
+            if input_object is None:
+                raise RuntimeError(
+                    "open F/B contribution has no immutable training-input object"
+                )
+            retained.append((operation_id, input_object))
+        return tuple(retained)
 
     def sampler_publication_receipt(
         self, operation_id: str
@@ -1029,7 +1215,7 @@ class MegatronOperationHandler:
             gpu_service_ns=UsageMeasurement.complete(int(raw["gpu_service_ns"])),
         )
         result_type = ForwardBackwardResult if backward else ForwardResult
-        return result_type(
+        result = result_type(
             operation_id=operation.operation_id,
             packing=captured.packing,
             packed_input_capture=capture_ref,
@@ -1048,6 +1234,9 @@ class MegatronOperationHandler:
             usage=usage,
             **({"produced_gradient": True} if backward else {}),
         )
+        if capture_ref.input_object is not None:
+            await self._release_execution_image(capture_ref.capture_id, captured)
+        return result
 
     async def _optim_step(
         self,
@@ -1115,6 +1304,16 @@ class MegatronOperationHandler:
             raise ValueError("packed-input capture is absent or changed")
         return captured
 
+    def _capture_for_input_object(self, ref: TrainingInputObjectRef) -> _CapturedInput:
+        matches = tuple(
+            captured
+            for captured in self._captures.values()
+            if captured.ref.input_object == ref
+        )
+        if len(matches) != 1 or ref.run_id != self.config.run_id:
+            raise ValueError("training-input object is absent or ambiguous")
+        return matches[0]
+
     async def _release_after_failed_execution(
         self, capture_id: str, primary: BaseException
     ) -> None:
@@ -1132,10 +1331,9 @@ class MegatronOperationHandler:
         captured = self._captures.get(capture_id)
         if captured is None or captured.owners or captured.retained_for_replay:
             return
+        if not await self._release_execution_image(capture_id, captured):
+            return
         try:
-            if captured.packed is not None and not captured.packed_released:
-                await self.runtime.release_batch(captured.packed)
-                captured.packed_released = True
             await self._release_route_ownership(captured.route_ownership)
             captured.route_ownership = None
         except BaseException as error:
@@ -1146,6 +1344,23 @@ class MegatronOperationHandler:
         self._released_captures[capture_id] = captured.ref
         while len(self._released_captures) > self.config.max_retained_inputs:
             self._released_captures.pop(next(iter(self._released_captures)))
+
+    async def _release_execution_image(
+        self, capture_id: str, captured: _CapturedInput
+    ) -> bool:
+        if captured.packed_released:
+            return True
+        try:
+            if captured.packed is not None:
+                await self.runtime.release_batch(captured.packed)
+            captured.packed = None
+            captured.sft = None
+            captured.packed_released = True
+        except BaseException as error:
+            self._release_failures[capture_id] = error
+            return False
+        self._release_failures.pop(capture_id, None)
+        return True
 
     async def _acquire_route_ownership(
         self,
@@ -1193,6 +1408,7 @@ class MegatronOperationHandler:
         operation: OperationRef,
         *,
         retained_route_bundles: tuple[RetainedRouteBundleRef, ...],
+        force_content_sha256: bool = False,
     ) -> PackingRequest:
         if isinstance(request.batch, TokenizedTrainingBatch):
             return PackingRequest(
@@ -1201,7 +1417,9 @@ class MegatronOperationHandler:
                 tokenized_batch=request.batch,
                 tokenized_loss=cast(Any, request.loss.name),
                 packed_sequence_length=self.trainer.runtime_spec.packed_sequence_length,
-                compute_content_sha256=request.retain_packed_input,
+                compute_content_sha256=(
+                    request.retain_packed_input or force_content_sha256
+                ),
             )
         assert isinstance(request.batch, RlTrajectoryBatch)
         experimental = _experimental_config(request)
@@ -1222,7 +1440,9 @@ class MegatronOperationHandler:
             ),
             include_moe_routing=self.trainer.runtime_spec.enable_moe_routing_replay,
             collect_packing_shapes=request.collect_packing_shapes,
-            compute_content_sha256=request.retain_packed_input,
+            compute_content_sha256=(
+                request.retain_packed_input or force_content_sha256
+            ),
             group_ids=tuple(
                 f"{operation.operation_id}:{index}"
                 for index in range(len(request.batch.groups))
@@ -1271,6 +1491,7 @@ def bootstrap_megatron_operation_worker(
     *,
     checkpoints: MegatronCheckpointOperations | None = None,
     route_ownership: RouteBundleOwnershipProvider | None = None,
+    input_resolver: TrainingInputResolver | None = None,
     max_retained_operations: int = 128,
 ) -> MegatronOperationRuntime:
     handler = MegatronOperationHandler(
@@ -1279,6 +1500,7 @@ def bootstrap_megatron_operation_worker(
         config,
         checkpoints=checkpoints,
         route_ownership=route_ownership,
+        input_resolver=input_resolver,
     )
     return MegatronOperationRuntime(
         handler=handler,
@@ -1408,6 +1630,7 @@ def _capture_manifest_sha256(
                 "packed": packed.leases.ref.model_dump(
                     mode="json",
                     exclude={
+                        "batch_id",
                         "owner_actor_id",
                         "lease_id",
                         "shared_memory_name",

@@ -28,6 +28,10 @@ from art.megatron.weights.external_lora_publish import (
     ExternalLoraSinkSpec,
     ExternalLoraTarget,
 )
+from art.runtime_attestation import (
+    RuntimeArchitectureAttestation,
+    canonical_config_sha256,
+)
 from art.training import (
     CommandExecutionUsage,
     OperationExecutionError,
@@ -273,6 +277,10 @@ class _TrainerRankReady(BaseModel):
     gpu_id: GpuId
     hostname: str
     process_id: int
+    handler_name: str
+    canonical_config_sha256: str
+    configured_layer_count: int
+    loaded_local_layer_count: int
 
 
 class _CpLookaheadResult(BaseModel):
@@ -535,6 +543,19 @@ class MonarchTrainerActor(Actor):
                 f"{self._runtime.model_support_handler.key!r} != "
                 f"{runtime_spec.handler_name!r}"
             )
+        from art.megatron.training.streaming_weight_offload import (
+            loaded_transformer_layer_count,
+        )
+
+        pretrained = self._runtime.bridge.hf_pretrained
+        resolved_config = getattr(pretrained, "config", pretrained)
+        self._canonical_config_sha256 = canonical_config_sha256(resolved_config)
+        self._configured_layer_count = int(self._runtime.provider.num_layers)
+        self._loaded_local_layer_count = loaded_transformer_layer_count(
+            self._runtime.model
+        )
+        if min(self._configured_layer_count, self._loaded_local_layer_count) < 1:
+            raise RuntimeError("trainer loaded no transformer layers")
         from art.megatron.training.streaming_weight_offload import (
             streaming_weight_offload_config_from_env,
         )
@@ -872,6 +893,10 @@ class MonarchTrainerActor(Actor):
             gpu_id=self._gpu_id,
             hostname=socket.gethostname(),
             process_id=os.getpid(),
+            handler_name=self._runtime.model_support_handler.key,
+            canonical_config_sha256=self._canonical_config_sha256,
+            configured_layer_count=self._configured_layer_count,
+            loaded_local_layer_count=self._loaded_local_layer_count,
         ).model_dump(mode="json")
 
     @endpoint
@@ -1627,6 +1652,7 @@ async def spawn_monarch_trainer_actors(
     tuple[_TrainerRankReady, ...],
     tuple[Port[Any], ...],
     tuple[Port[Any], ...],
+    RuntimeArchitectureAttestation,
 ]:
     """Configure torch-elastic first, then initialize exactly one actor per rank."""
     spmd: Any = proc_mesh.spawn(
@@ -1661,6 +1687,44 @@ async def spawn_monarch_trainer_actors(
         raise RuntimeError(
             "trainer startup did not return the configured rank placement"
         )
+    handlers = {value.handler_name for value in ready}
+    config_digests = {value.canonical_config_sha256 for value in ready}
+    configured_layers = {value.configured_layer_count for value in ready}
+    if (
+        handlers != {runtime_spec.handler_name}
+        or len(config_digests) != 1
+        or len(configured_layers) != 1
+    ):
+        raise RuntimeError("trainer ranks loaded inconsistent model architecture")
+    topology = runtime_spec.trainer_mesh.topology
+    replication = len(placements) // topology.pp
+    loaded_layer_sum = sum(value.loaded_local_layer_count for value in ready)
+    if loaded_layer_sum % replication:
+        raise RuntimeError(
+            "trainer layer placement is not replicated by pipeline stage"
+        )
+    loaded_layers = loaded_layer_sum // replication
+    if configured_layers != {loaded_layers}:
+        raise RuntimeError("trainer loaded layer count differs from resolved config")
+    architecture = RuntimeArchitectureAttestation.create(
+        runtime_kind="trainer",
+        base_model=runtime_spec.model_identifier,
+        model_source=runtime_spec.model_source,
+        model_revision=runtime_spec.model_revision,
+        model_support_key=runtime_spec.model_support_key,
+        handler_name=runtime_spec.handler_name,
+        canonical_config_sha256=next(iter(config_digests)),
+        loaded_layer_count=loaded_layers,
+        tensor_parallel_size=topology.tp,
+        context_parallel_size=topology.cp,
+        pipeline_parallel_size=topology.pp,
+        expert_parallel_size=topology.ep,
+        data_parallel_size=(
+            len(placements) // (topology.tp * topology.cp * topology.pp)
+        ),
+        world_size=len(placements),
+        runtime_identity=runtime_spec.fingerprint,
+    )
     port_values = await actors.cp_lookahead_port.call()
     lookahead_ports = tuple(
         value["port"]
@@ -1681,7 +1745,7 @@ async def spawn_monarch_trainer_actors(
     )
     if len(residency_ports) != len(placements):
         raise RuntimeError("trainer ranks returned incomplete residency services")
-    return actors, ready, lookahead_ports, residency_ports
+    return actors, ready, lookahead_ports, residency_ports, architecture
 
 
 class _PublicationState:
@@ -1900,6 +1964,7 @@ class MonarchTrainerRun:
         rank_processes: tuple[_TrainerRankReady, ...],
         cp_lookahead_ports: tuple[Port[Any], ...],
         residency_prefetch_ports: tuple[Port[Any], ...],
+        architecture_attestation: RuntimeArchitectureAttestation,
         *,
         register_initial_run: bool = True,
     ) -> None:
@@ -1908,6 +1973,7 @@ class MonarchTrainerRun:
                 "training run does not match the trainer runtime fingerprint"
             )
         self.runtime_spec = runtime_spec
+        self.architecture_attestation = architecture_attestation
         self.run_spec = run_spec
         self._actors = actors
         self._proc_mesh = proc_mesh

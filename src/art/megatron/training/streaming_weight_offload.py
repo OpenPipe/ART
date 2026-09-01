@@ -457,6 +457,12 @@ def _transformer_layers(model: Sequence[torch.nn.Module]) -> list[torch.nn.Modul
     return layers
 
 
+def loaded_transformer_layer_count(model: Sequence[torch.nn.Module]) -> int:
+    """Count concrete transformer layers in this rank's loaded model chunks."""
+
+    return len(_transformer_layers(model))
+
+
 def _unwrap_module(module: torch.nn.Module) -> torch.nn.Module:
     current = module
     seen: set[int] = set()

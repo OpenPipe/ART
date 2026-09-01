@@ -12,7 +12,9 @@ from pydantic import (
     model_validator,
 )
 
-ART_SERVING_PROTOCOL_VERSION = 10
+from art.runtime_attestation import RuntimeArchitectureAttestation
+
+ART_SERVING_PROTOCOL_VERSION = 11
 
 ART_PRIVATE_CACHE_IDENTITY_HEADER = "x-art-cache-identity"
 ART_PRIVATE_REQUEST_IDENTITY_HEADER = "x-art-request-identity"
@@ -102,8 +104,9 @@ class ServingProfileIdentity(BaseModel):
 class ServingProfile(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    schema_version: Literal[2] = 2
+    schema_version: Literal[3] = 3
     identity: ServingProfileIdentity
+    architecture: RuntimeArchitectureAttestation
     runtime_model: str = Field(min_length=1)
     runtime_revision: str | None = None
     tokenizer: str = Field(min_length=1)
@@ -144,6 +147,14 @@ class ServingProfile(BaseModel):
 
     @model_validator(mode="after")
     def _validate_profile(self) -> "ServingProfile":
+        if self.architecture.runtime_kind != "inference":
+            raise ValueError("serving architecture has another runtime kind")
+        if (
+            self.architecture.base_model != self.identity.base_model
+            or self.architecture.model_support_key != self.identity.model_support_key
+            or self.architecture.handler_name != self.identity.handler_name
+        ):
+            raise ValueError("serving architecture differs from profile identity")
         if (
             self.runtime_model != self.identity.model_identifier
             or (self.runtime_revision or "default") != self.identity.model_revision

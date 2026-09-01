@@ -19,6 +19,7 @@ from .contracts import (
     OptimStepResult,
     PackedInputCaptureRef,
     PackingOutcome,
+    RawTrainingBatch,
     RlTrajectoryBatch,
     RunCommand,
     SamplerPublication,
@@ -30,6 +31,8 @@ from .contracts import (
     TokenizedTrainingBatch,
     TokenLogprobs,
     TrainingBatch,
+    TrainingInputObject,
+    TrainingInputObjectRef,
     TrainingRunSpec,
     UsageCoverage,
     UsageMeasurement,
@@ -45,6 +48,7 @@ from .execution import (
     TerminalOperationFailure,
     bootstrap_operation_worker,
 )
+from .input_objects import TrainingInputResolver
 from .sequencing import CommandAdmission, CommandAdmissionPolicy, RunCommandLedger
 from .tokenized import TokenizedDatum, TokenizedLossName
 
@@ -78,6 +82,7 @@ __all__ = [
     "OptimStepResult",
     "PackedInputCaptureRef",
     "PackingOutcome",
+    "RawTrainingBatch",
     "RlTrajectoryBatch",
     "RunCommand",
     "RunCommandLedger",
@@ -94,6 +99,9 @@ __all__ = [
     "TokenizedTrainingBatch",
     "TrainingRunSpec",
     "TrainingBatch",
+    "TrainingInputObject",
+    "TrainingInputObjectRef",
+    "TrainingInputResolver",
     "UsageCoverage",
     "UsageMeasurement",
     "bootstrap_operation_worker",

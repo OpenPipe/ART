@@ -248,6 +248,13 @@ async def test_serving_profile_reports_resolved_runtime_geometry(monkeypatch) ->
             model_config=SimpleNamespace(
                 model="/offline/cache/models--test--model/snapshots/revision",
                 revision=None,
+                hf_config=SimpleNamespace(
+                    to_dict=lambda: {
+                        "architectures": ["TestModel"],
+                        "num_hidden_layers": 24,
+                    }
+                ),
+                hf_text_config=SimpleNamespace(num_hidden_layers=24),
                 tokenizer="test/model",
                 tokenizer_revision=None,
                 dtype="bfloat16",
@@ -286,6 +293,8 @@ async def test_serving_profile_reports_resolved_runtime_geometry(monkeypatch) ->
     )
 
     assert profile.identity.model_identifier == "test/model"
+    assert profile.architecture.loaded_layer_count == 24
+    assert profile.architecture.handler_name == "test-handler"
     assert profile.runtime_model == "test/model"
     assert profile.tensor_parallel_size == 2
     assert profile.quantization == "fp8"

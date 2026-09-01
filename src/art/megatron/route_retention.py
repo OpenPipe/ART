@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal, Protocol
 
-from art.training import OperationRef, PackedInputCaptureRef
+from art.training import OperationRef, TrainingInputObjectRef
 from art.vllm_route_transport import RetainedRouteBundleRef
 
 type RouteBundleOwnershipHandle = object
@@ -12,7 +12,7 @@ type RouteBundleOwnershipHandle = object
 @dataclass(frozen=True, slots=True)
 class RouteBundleOwnershipTransfer:
     operation_id: str
-    packed_input: PackedInputCaptureRef
+    input_object: TrainingInputObjectRef
     handle: RouteBundleOwnershipHandle
 
 

@@ -18,6 +18,7 @@ from art.megatron.model_support.lora_disk import (
     load_adapter_config,
     normalize_lora_checkpoint_to_vllm,
 )
+from art.runtime_attestation import RuntimeArchitectureAttestation
 
 
 def test_serving_normalization_retains_exact_training_targets(tmp_path) -> None:
@@ -73,6 +74,23 @@ async def test_launch_megatron_slot_owns_one_shared_runtime(
         ),
     )
     runtime_spec = SimpleNamespace(fingerprint="a" * 64)
+    architecture = RuntimeArchitectureAttestation.create(
+        runtime_kind="trainer",
+        base_model="model",
+        model_source="model",
+        model_revision="default",
+        model_support_key="test",
+        handler_name="test",
+        canonical_config_sha256="b" * 64,
+        loaded_layer_count=1,
+        tensor_parallel_size=1,
+        context_parallel_size=1,
+        pipeline_parallel_size=1,
+        expert_parallel_size=1,
+        data_parallel_size=1,
+        world_size=1,
+        runtime_identity="a" * 64,
+    )
 
     class Runtime:
         def __init__(self) -> None:
@@ -90,7 +108,9 @@ async def test_launch_megatron_slot_owns_one_shared_runtime(
                 "shutdown_timeout_s": 20.0,
             }
             self.shared_starts += 1
-            return SimpleNamespace(runtime_spec=spec)
+            return SimpleNamespace(
+                runtime_spec=spec, architecture_attestation=architecture
+            )
 
         def register_closeable(self, closeable: Any) -> None:
             self.closeables.append(closeable)
@@ -136,11 +156,11 @@ async def test_launch_megatron_slot_owns_one_shared_runtime(
 
     assert runtime.shared_starts == 1
     assert runtime.closeables == [launched.coordinator]
-    assert launched.descriptor.model_dump() == {
-        "runtime_source_id": "slot",
-        "runtime_source_epoch": 7,
-        "runtime_fingerprint": "a" * 64,
-    }
+    assert launched.descriptor.runtime_source_id == "slot"
+    assert launched.descriptor.runtime_source_epoch == 7
+    assert launched.descriptor.runtime_fingerprint == "a" * 64
+    assert launched.descriptor.trainer_architecture == architecture
+    assert launched.descriptor.paired_attestation is None
 
     await launched.aclose()
     assert runtime.closed

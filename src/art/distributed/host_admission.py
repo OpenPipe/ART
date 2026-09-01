@@ -75,6 +75,8 @@ class _Contract(BaseModel):
 
 class GpuIdentity(_Contract):
     index: int = Field(ge=0)
+    product_name: str = Field(min_length=1, max_length=255)
+    compute_capability: str = Field(pattern=r"^[0-9]+\.[0-9]+$")
     uuid: str = Field(pattern=CUDA_DEVICE_UUID_PATTERN)
     parent_uuid: str = Field(
         pattern=r"^GPU-[0-9A-Fa-f]{8}(?:-[0-9A-Fa-f]{4}){3}-[0-9A-Fa-f]{12}$"
@@ -288,26 +290,28 @@ def _query_gpu_inventory(
         raise RuntimeError("nvidia-smi is required for GPU host admission")
     result = _run_nvidia_smi(
         executable,
-        "--query-gpu=index,uuid,pci.bus_id,driver_version",
+        "--query-gpu=index,name,compute_cap,uuid,pci.bus_id,driver_version",
         "--format=csv,noheader,nounits",
     )
     rows: list[tuple[GpuIdentity, str]] = []
     for line_number, row in enumerate(csv.reader(result.stdout.splitlines()), start=1):
         values = tuple(value.strip() for value in row)
         try:
-            if len(values) != 4:
-                raise ValueError(f"expected 4 fields, received {len(values)}")
+            if len(values) != 6:
+                raise ValueError(f"expected 6 fields, received {len(values)}")
             gpu = GpuIdentity(
                 index=int(values[0]),
-                uuid=values[1],
-                parent_uuid=values[1],
-                pci_bus_id=values[2].upper(),
+                product_name=values[1],
+                compute_capability=values[2],
+                uuid=values[3],
+                parent_uuid=values[3],
+                pci_bus_id=values[4].upper(),
             )
         except ValueError as error:
             raise RuntimeError(
                 f"invalid nvidia-smi row {line_number}: {error}"
             ) from None
-        rows.append((gpu, values[3]))
+        rows.append((gpu, values[5]))
     _require_unique(
         "nvidia-smi GPU indices", [(gpu.index, gpu.uuid) for gpu, _ in rows]
     )
@@ -348,6 +352,8 @@ def _query_gpu_inventory(
         try:
             mig = GpuIdentity(
                 index=parent.index,
+                product_name=parent.product_name,
+                compute_capability=parent.compute_capability,
                 uuid=match[1],
                 parent_uuid=parent.uuid,
                 pci_bus_id=parent.pci_bus_id,
