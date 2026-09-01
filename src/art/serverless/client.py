@@ -133,7 +133,7 @@ NativeOperationStatus = Literal[
 
 class NativeTrainingRun(BaseModel):
     run_id: str
-    run_name: str
+    run_name: str | None = None
     spec: dict[str, Any]
     status: NativeRunStatus
     next_sequence_id: int
@@ -329,7 +329,7 @@ class TrainingRuns(AsyncAPIResource):
         self,
         *,
         request_id: str,
-        run_name: str,
+        run_name: str | None = None,
         spec: TrainingRunSpec,
         initial_state: RunInitialState | None = None,
     ) -> NativeTrainingRun:
@@ -340,19 +340,19 @@ class TrainingRuns(AsyncAPIResource):
             "lora_target_modules": list(spec.adapter.target_modules),
             "seed": spec.seed,
         }
+        body: dict[str, Any] = {
+            "request_id": request_id,
+            "spec": wire_spec,
+            "initial_state": (
+                None if initial_state is None else initial_state.model_dump(mode="json")
+            ),
+        }
+        if run_name is not None:
+            body["run_name"] = run_name
         run = await self._post(
             "/training/runs:resolve",
             cast_to=NativeTrainingRun,
-            body={
-                "request_id": request_id,
-                "run_name": run_name,
-                "spec": wire_spec,
-                "initial_state": (
-                    None
-                    if initial_state is None
-                    else initial_state.model_dump(mode="json")
-                ),
-            },
+            body=body,
         )
         if run.run_name != run_name or run.spec != wire_spec:
             raise RuntimeError("native training run identity changed during resolve")
@@ -397,9 +397,11 @@ class TrainingRuns(AsyncAPIResource):
             body={"request_id": request_id},
         )
 
-    async def close(self, run_id: str) -> NativeTrainingRun:
+    async def close(self, run_id: str, *, request_id: str) -> NativeTrainingRun:
         return await self._post(
-            f"/training/runs/{run_id}:close", cast_to=NativeTrainingRun
+            f"/training/runs/{run_id}:close",
+            cast_to=NativeTrainingRun,
+            body={"request_id": request_id},
         )
 
 

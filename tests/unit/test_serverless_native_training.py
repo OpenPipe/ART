@@ -32,6 +32,7 @@ class _TrainingRuns:
         self.requests: dict[str, ForwardRequest] = {}
         self.result_calls = 0
         self.released: tuple[str, str] | None = None
+        self.close_request_id: str | None = None
         self.run: NativeTrainingRun | None = None
         self.resolve_kwargs: dict[str, Any] | None = None
 
@@ -124,8 +125,9 @@ class _TrainingRuns:
     async def cancel(self, run_id: str, operation_id: str) -> NativeTrainingOperation:
         raise AssertionError((run_id, operation_id))
 
-    async def close(self, run_id: str) -> NativeTrainingRun:
+    async def close(self, run_id: str, *, request_id: str) -> NativeTrainingRun:
         assert self.run is not None and run_id == self.run.run_id
+        self.close_request_id = request_id
         return self.run.model_copy(update={"status": "closing"})
 
 
@@ -144,7 +146,7 @@ class _ResolveTransport(TrainingRuns):
             spec["seed"] = 999
         return NativeTrainingRun(
             run_id="run-native",
-            run_name=body["run_name"],
+            run_name=body.get("run_name"),
             spec=spec,
             status="open",
             next_sequence_id=4,
@@ -265,6 +267,8 @@ async def test_native_client_resolve_preserves_typed_initial_state() -> None:
         "initial_state": initial_state,
     }
     await client.close()
+    assert service.close_request_id is not None
+    assert service.close_request_id.startswith("close-")
 
 
 @pytest.mark.asyncio
@@ -306,6 +310,22 @@ async def test_training_runs_resolve_serializes_exact_initial_state() -> None:
             "restore_optimizer": False,
         },
     }
+
+
+@pytest.mark.asyncio
+async def test_training_runs_resolve_omits_implicit_default_name() -> None:
+    service = _ResolveTransport()
+    run = await service.resolve(
+        request_id="resolve-default",
+        spec=TrainingRunSpec(
+            base_model="Qwen/Qwen3-30B-A3B",
+            adapter=AdapterSpec(rank=8, target_modules=("linear_qkv",)),
+        ),
+    )
+
+    assert run.run_name is None
+    assert service.body is not None
+    assert "run_name" not in service.body
 
 
 @pytest.mark.asyncio

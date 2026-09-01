@@ -151,6 +151,9 @@ class RemoteTrainingClient:
         self._operation_index_bytes = 0
         self._lock = asyncio.Lock()
         self._closed = False
+        self._close_request_id = (
+            "close-" + hashlib.sha256(f"close\0{run.run_id}".encode()).hexdigest()
+        )
 
     @classmethod
     async def resolve(
@@ -158,7 +161,7 @@ class RemoteTrainingClient:
         service: TrainingRuns,
         *,
         request_id: str,
-        run_name: str,
+        run_name: str | None = None,
         spec: TrainingRunSpec,
         initial_state: RunInitialState | None = None,
         poll_interval_s: float = 0.1,
@@ -186,6 +189,10 @@ class RemoteTrainingClient:
     @property
     def operation_ids(self) -> tuple[str, ...]:
         return tuple(self._operations_by_id)
+
+    @property
+    def closed(self) -> bool:
+        return self._closed
 
     async def operation_evidence(self, operation_id: str) -> NativeTrainingOperation:
         operation = await self._service.operation(self.run_id, operation_id)
@@ -237,11 +244,14 @@ class RemoteTrainingClient:
         async with self._lock:
             if self._closed:
                 return
+            closed = await self._service.close(
+                self.run_id, request_id=self._close_request_id
+            )
             self._closed = True
             self._operations.clear()
             self._operations_by_id.clear()
             self._operation_index_bytes = 0
-        self._run = await self._service.close(self.run_id)
+            self._run = closed
 
     async def _submit(
         self, request: RunCommand, result_type: type[ResultT]

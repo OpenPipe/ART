@@ -1,7 +1,5 @@
 import asyncio
 from contextlib import asynccontextmanager
-import hashlib
-import json
 import secrets
 import time
 from typing import TYPE_CHECKING, Any, AsyncIterator, Iterable, Literal, cast
@@ -234,7 +232,7 @@ class ServerlessBackend:
         self,
         *,
         request_id: str,
-        run_name: str,
+        run_name: str | None = None,
         spec: "TrainingRunSpec",
         initial_state: "RunInitialState | None" = None,
         poll_interval_s: float = 0.1,
@@ -257,27 +255,13 @@ class ServerlessBackend:
 
         key = model._storage_name()
         client = self._training_clients.get(key)
-        if client is not None:
+        if client is not None and not client.closed:
             return client
+        self._training_clients.pop(key, None)
         spec = _training_run_spec(model)
-        request_id = (
-            "resolve-"
-            + hashlib.sha256(
-                json.dumps(
-                    {
-                        "project": model.project,
-                        "entity": model.entity,
-                        "run_name": model.run_name,
-                        "spec": spec.model_dump(mode="json"),
-                    },
-                    sort_keys=True,
-                    separators=(",", ":"),
-                ).encode()
-            ).hexdigest()
-        )
+        request_id = f"resolve-{secrets.token_hex(16)}"
         client = await self.create_training_client(
             request_id=request_id,
-            run_name=model.run_name,
             spec=spec,
         )
         self._training_clients[key] = client
