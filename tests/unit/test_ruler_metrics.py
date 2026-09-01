@@ -222,11 +222,10 @@ async def test_ruler_records_direct_cost_for_openrouter_judges(monkeypatch):
 @pytest.mark.parametrize("invalid_count", [1, 3])
 async def test_ruler_retries_missing_or_extra_scores(monkeypatch, invalid_count):
     responses = iter([_response(invalid_count), _response(2)])
-    calls = 0
+    calls = []
 
-    async def _fake_acompletion(**_kwargs):
-        nonlocal calls
-        calls += 1
+    async def _fake_acompletion(**kwargs):
+        calls.append(kwargs)
         return next(responses)
 
     monkeypatch.setattr(ruler_module, "acompletion", _fake_acompletion)
@@ -234,17 +233,42 @@ async def test_ruler_retries_missing_or_extra_scores(monkeypatch, invalid_count)
 
     scores = await ruler_module.ruler(_TWO_TRAJECTORIES)
 
-    assert calls == 2
+    assert len(calls) == 2
     assert [score.trajectory_id for score in scores] == ["1", "2"]
+    initial_messages = calls[0]["messages"]
+    assert len(initial_messages) == 2
+    assert "exactly 2 score objects" in initial_messages[0]["content"]
+    assert "1, 2" in initial_messages[0]["content"]
+    retry_messages = calls[1]["messages"]
+    assert retry_messages[:2] == initial_messages
+    assert retry_messages[2] == {
+        "role": "assistant",
+        "content": _score_content(invalid_count),
+    }
+    correction = retry_messages[3]["content"]
+    assert f"had {invalid_count} score object" in correction
+    assert (
+        "Missing trajectory IDs: 2"
+        if invalid_count == 1
+        else "Missing trajectory IDs: none"
+    ) in correction
+    assert "Duplicate trajectory IDs: none" in correction
+    assert (
+        "Unexpected trajectory IDs: 3"
+        if invalid_count == 3
+        else "Unexpected trajectory IDs: none"
+    ) in correction
+    assert "using each trajectory ID exactly once: 1, 2" in correction
 
 
 @pytest.mark.asyncio
 async def test_ruler_raises_after_structural_attempts_are_exhausted(monkeypatch):
-    calls = 0
+    # Reproduce the 046 capture: two trajectories requested, but both otherwise-valid
+    # judge responses return only trajectory 1.
+    calls = []
 
-    async def _fake_acompletion(**_kwargs):
-        nonlocal calls
-        calls += 1
+    async def _fake_acompletion(**kwargs):
+        calls.append(kwargs)
         return _response(1)
 
     monkeypatch.setattr(ruler_module, "acompletion", _fake_acompletion)
@@ -253,7 +277,13 @@ async def test_ruler_raises_after_structural_attempts_are_exhausted(monkeypatch)
     with pytest.raises(ValueError, match="Expected 2 scores, but got 1"):
         await ruler_module.ruler(_TWO_TRAJECTORIES)
 
-    assert calls == 2
+    assert len(calls) == 2
+    retry_messages = calls[1]["messages"]
+    assert retry_messages[2] == {
+        "role": "assistant",
+        "content": _score_content(1),
+    }
+    assert "Missing trajectory IDs: 2" in retry_messages[3]["content"]
 
 
 @pytest.mark.asyncio
@@ -314,11 +344,10 @@ async def test_ruler_retries_duplicate_trajectory_ids(monkeypatch):
             _response(2),
         ]
     )
-    calls = 0
+    calls = []
 
-    async def _fake_acompletion(**_kwargs):
-        nonlocal calls
-        calls += 1
+    async def _fake_acompletion(**kwargs):
+        calls.append(kwargs)
         return next(responses)
 
     monkeypatch.setattr(ruler_module, "acompletion", _fake_acompletion)
@@ -326,8 +355,11 @@ async def test_ruler_retries_duplicate_trajectory_ids(monkeypatch):
 
     scores = await ruler_module.ruler(_TWO_TRAJECTORIES)
 
-    assert calls == 2
+    assert len(calls) == 2
     assert [score.trajectory_id for score in scores] == ["1", "2"]
+    correction = calls[1]["messages"][3]["content"]
+    assert "Missing trajectory IDs: 2" in correction
+    assert "Duplicate trajectory IDs: 1" in correction
 
 
 @pytest.mark.asyncio

@@ -215,7 +215,19 @@ async def ruler(
         """
     )
 
-    messages = [
+    expected_scores = 1 if all_identical else len(message_lists)
+    expected_ids = [str(index) for index in range(1, expected_scores + 1)]
+    required_ids = ", ".join(expected_ids)
+    judge_prompt += dedent(
+        f"""
+
+        Return exactly {expected_scores} score object{"" if expected_scores == 1 else "s"},
+        one for each of these trajectory IDs, with no duplicates or omissions:
+        {required_ids}
+        """
+    )
+
+    messages: list[ChatCompletionMessageParam] = [
         {"role": "system", "content": judge_prompt},
         {"role": "user", "content": user_text},
     ]
@@ -246,7 +258,6 @@ async def ruler(
 
         content = first_choice.message.content or "{}"
         parsed = Response.model_validate_json(content)
-        expected_scores = 1 if all_identical else len(message_lists)
         structure_error: ValueError | None = None
         if len(parsed.scores) != expected_scores:
             qualifier = " for identical trajectories" if all_identical else ""
@@ -254,8 +265,21 @@ async def ruler(
                 f"Expected {expected_scores} score{'' if expected_scores == 1 else 's'}"
                 f"{qualifier}, but got {len(parsed.scores)}"
             )
-        expected_ids = [str(index) for index in range(1, expected_scores + 1)]
         scores_by_id = {score.trajectory_id: score for score in parsed.scores}
+        received_ids = [score.trajectory_id for score in parsed.scores]
+        missing_ids = [
+            trajectory_id
+            for trajectory_id in expected_ids
+            if trajectory_id not in scores_by_id
+        ]
+        duplicate_ids = sorted(
+            {
+                trajectory_id
+                for trajectory_id in received_ids
+                if received_ids.count(trajectory_id) > 1
+            }
+        )
+        unexpected_ids = sorted(set(received_ids) - set(expected_ids))
         if structure_error is None and (
             len(scores_by_id) != expected_scores
             or set(scores_by_id) != set(expected_ids)
@@ -266,6 +290,23 @@ async def ruler(
             )
         if structure_error is not None:
             if attempt + 1 < _STRUCTURAL_ATTEMPTS:
+                messages = [
+                    *messages,
+                    {"role": "assistant", "content": content},
+                    {
+                        "role": "user",
+                        "content": (
+                            f"Your response had {len(parsed.scores)} score object"
+                            f"{'' if len(parsed.scores) == 1 else 's'}; expected "
+                            f"{expected_scores}. Missing trajectory IDs: "
+                            f"{', '.join(missing_ids) or 'none'}. Duplicate trajectory "
+                            f"IDs: {', '.join(duplicate_ids) or 'none'}. Unexpected "
+                            f"trajectory IDs: {', '.join(unexpected_ids) or 'none'}. "
+                            f"Return one complete replacement using each trajectory ID "
+                            f"exactly once: {required_ids}."
+                        ),
+                    },
+                ]
                 continue
             raise structure_error
 
