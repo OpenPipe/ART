@@ -134,9 +134,7 @@ def test_vectorized_build_matches_scalar_reference(seed: int) -> None:
     rng = random.Random(20260901 + seed)
     rows = _random_rows(rng)
     _assert_equivalent(rows, rows)
-    _assert_equivalent(
-        rows, tuple(torch.tensor(row, dtype=torch.long) for row in rows)
-    )
+    _assert_equivalent(rows, tuple(torch.tensor(row, dtype=torch.long) for row in rows))
 
 
 def test_int32_and_cuda_layout_inputs_normalize_to_the_same_tree() -> None:
