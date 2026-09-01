@@ -17,6 +17,7 @@ from art.distributed.data_plane import (
     PackedBatchRef,
     PrefixTreePackingStatsSpec,
     TensorSpec,
+    TokenizedOutputMapSpec,
 )
 from art.distributed.packing import TrajectoryGroupPayload
 from art.distributed.rollout import DistributedTrajectorySelection, RolloutModelSpec
@@ -109,6 +110,7 @@ def _packed_batch(
     non_padding_tokens: int = 7,
     loss_bearing_tokens: int = 4,
     trainable_assistant_tokens: int = 4,
+    tokenized: bool = False,
 ) -> DistributedPackedBatch:
     item_sizes = {
         "tokens": ("int64", 8),
@@ -120,6 +122,15 @@ def _packed_batch(
         "advantages": ("float32", 4),
         "weights": ("float32", 4),
     }
+    if tokenized:
+        item_sizes.update(
+            {
+                "target_tokens": ("int64", 8),
+                "loss_weights": ("float32", 4),
+                "behavior_logprobs": ("float32", 4),
+                "token_advantages": ("float32", 4),
+            }
+        )
     offset = 0
     tensors = []
     for name, (dtype, item_size) in item_sizes.items():
@@ -128,7 +139,15 @@ def _packed_batch(
             TensorSpec(
                 name=name,
                 dtype=dtype,
-                shape=(1, 8),
+                shape=(1, 8, 1)
+                if name
+                in {
+                    "target_tokens",
+                    "loss_weights",
+                    "behavior_logprobs",
+                    "token_advantages",
+                }
+                else (1, 8),
                 offset=offset,
                 byte_count=byte_count,
             )
@@ -151,6 +170,12 @@ def _packed_batch(
         prefix_tree_packing_stats=PrefixTreePackingStatsSpec(
             logical_tokens=7, physical_tokens=8
         ),
+        training_kind="tokenized" if tokenized else "rl",
+        tokenized_output_map=(
+            TokenizedOutputMapSpec(packed_positions=((0, 1),), candidate_counts=(1,))
+            if tokenized
+            else None
+        ),
     )
     return DistributedPackedBatch(
         leases=PackedBatchLeaseSet(ref=ref, host_refs={"host": ref}),
@@ -170,6 +195,27 @@ class _Runtime:
 
     async def pack(self, request):
         self.pack_requests.append(request)
+        if request.tokenized_batch is not None:
+            self.packed = _packed_batch(
+                batch_id="tokenized",
+                content_sha256=("b" * 64 if request.compute_content_sha256 else None),
+                non_padding_tokens=sum(
+                    len(datum.input_tokens) for datum in request.tokenized_batch.datums
+                ),
+                loss_bearing_tokens=sum(
+                    weight != 0.0
+                    for datum in request.tokenized_batch.datums
+                    for row in datum.weights or ()
+                    for weight in row
+                ),
+                trainable_assistant_tokens=sum(
+                    weight != 0.0
+                    for datum in request.tokenized_batch.datums
+                    for row in datum.weights or ()
+                    for weight in row
+                ),
+                tokenized=True,
+            )
         if (
             request.compute_content_sha256
             and self.packed.leases.ref.content_sha256 is None
@@ -239,6 +285,7 @@ class _Trainer:
         self.run_states: dict[str, TrainerCommandRunState] = {}
         self.migration_releases: list[str] = []
         self.optimizer_jobs = []
+        self.forward_backward_jobs = []
         self.cp_lookaheads = []
 
     async def prepare_cp_lookahead(self, batch, *, global_grad_accumulation_sequences):
@@ -443,6 +490,7 @@ class _Trainer:
         return await (await self.start_forward(job, batch)).completion
 
     async def start_forward_backward(self, job, _batch):
+        self.forward_backward_jobs.append(job)
         await self._enter(job.run_id)
         self._advance(job, backward=True)
         result = {
@@ -474,12 +522,6 @@ class _Trainer:
 
     async def forward_backward(self, job, batch):
         return await (await self.start_forward_backward(job, batch)).completion
-
-    async def start_sft_forward_backward(self, job, _batch):
-        return await self.start_forward_backward(job, _batch)
-
-    async def start_sft_forward(self, job, _batch):
-        return await self.start_forward(job, _batch)
 
     async def optim_step(self, job):
         if self.fail_optimizer:
@@ -1503,6 +1545,55 @@ async def test_slot_coordinator_serializes_gpu_work_before_result_settlement() -
 
 
 @pytest.mark.asyncio
+async def test_megatron_backend_uses_distributed_service_without_training_binding(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class _Service:
+        def __init__(self) -> None:
+            self.prefetches = 0
+            self.start_configs = []
+
+        def prefetch_trainer(self) -> None:
+            self.prefetches += 1
+
+        async def start_openai_server(self, *, config):
+            self.start_configs.append(config)
+            return "127.0.0.1", 4321
+
+    backend = MegatronBackend(path=str(tmp_path), enable_expert_replay=False)
+    model = TrainableModel(
+        run_name="local-run",
+        name="local-run",
+        project="pipeline-tests",
+        base_model="test-model",
+        base_path=str(tmp_path),
+    )
+    service = _Service()
+    service_requests = []
+    binding_requests = []
+
+    async def get_service(requested_model):
+        service_requests.append(requested_model)
+        return service
+
+    async def bind_owned_training_run(bound_model, openai_config):
+        binding_requests.append((bound_model, openai_config))
+
+    monkeypatch.setattr(backend, "_get_service", get_service)
+    monkeypatch.setattr(backend, "_bind_owned_training_run", bind_owned_training_run)
+
+    base_url, api_key = await backend._prepare_backend_for_training(model)
+
+    assert binding_requests == []
+    assert backend._training_binding is None
+    assert service_requests == [model, model]
+    assert service.prefetches == 1
+    assert len(service.start_configs) == 1
+    assert service.start_configs[0]["server_args"]["api_key"] == api_key
+    assert base_url == "http://127.0.0.1:4321/v1"
+
+
+@pytest.mark.asyncio
 async def test_megatron_backend_lowers_rl_and_sft_through_one_bound_slot(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1691,15 +1782,7 @@ async def test_megatron_backend_lowers_rl_and_sft_through_one_bound_slot(
         publisher=publisher,  # type: ignore[arg-type]
         outcome_sink=sink,
     )
-    backend = MegatronBackend(path=str(tmp_path))
-
-    async def bind_owned_training_run(bound_model, openai_config):
-        assert bound_model is model
-        assert openai_config is None
-        backend._training_binding = binding
-        model.run_id = binding.config.run_id
-
-    monkeypatch.setattr(backend, "_bind_owned_training_run", bind_owned_training_run)
+    backend = MegatronBackend(path=str(tmp_path), training_binding=binding)
     monkeypatch.setattr(TrainableModel, "_get_wandb_run", lambda _self: None)
     monkeypatch.setattr(
         "art.megatron.backend.get_megatron_runtime_config",
@@ -1732,6 +1815,7 @@ async def test_megatron_backend_lowers_rl_and_sft_through_one_bound_slot(
     assert model.get_inference_name() == "registered-slot-run@1"
     assert queue.materializations == 1
     assert len(runtime.pack_requests) == 1
+    assert runtime.pack_requests[0].tokenized_batch is None
     assert len(queue.marked) == 1
     assert queue.released[0][1] == "consumed"
     assert trainer.optimizer_jobs[-1].contributing_forward_backward_operation_ids
@@ -1754,6 +1838,16 @@ async def test_megatron_backend_lowers_rl_and_sft_through_one_bound_slot(
         )
     ]
     assert sft_metrics[0][TRAIN_GRADIENT_STEPS_KEY] == 1.0
+    assert len(runtime.pack_requests) == 2
+    sft_pack = runtime.pack_requests[-1]
+    assert sft_pack.trajectory_groups == ()
+    assert sft_pack.tokenized_loss == "cross_entropy"
+    assert sft_pack.tokenized_batch is not None
+    assert len(sft_pack.tokenized_batch.datums) == 1
+    assert sft_pack.tokenized_batch.datums[0].input_tokens == (1, 2)
+    assert sft_pack.tokenized_batch.datums[0].target_tokens == ((2,), (0,))
+    assert sft_pack.tokenized_batch.datums[0].weights == ((1.0,), (0.0,))
+    assert trainer.forward_backward_jobs[-1].loss.name == "cross_entropy"
     assert trainer.optimizer_jobs[-1].operation.kind == "optim_step"
     assert client.projected_learner_version == 2
     assert client.operation_ids == ()
@@ -1794,6 +1888,7 @@ async def test_megatron_backend_lowers_rl_and_sft_through_one_bound_slot(
             )
 
     slot._runs["run"].handler._sft_tokenizer = _ZeroSftTokenizer()  # type: ignore[assignment]
+    pack_count = len(runtime.pack_requests)
     zero_sft = [
         metrics
         async for metrics in backend._train_sft(
@@ -1809,6 +1904,7 @@ async def test_megatron_backend_lowers_rl_and_sft_through_one_bound_slot(
     assert zero_sft[0]["data/step_trainable_assistant_tokens"] == 0.0
     assert zero_sft[0][TRAIN_GRADIENT_STEPS_KEY] == 0.0
     assert len(trainer.optimizer_jobs) == optimizer_count
+    assert len(runtime.pack_requests) == pack_count
 
     runtime.packed = _packed_batch(batch_id="pipeline")
     pipeline_materialized = TrajectoryGroup(

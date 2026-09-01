@@ -6,13 +6,15 @@ from pathlib import Path
 from threading import Lock
 from typing import cast
 
+import torch
 from transformers import AutoTokenizer
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
 from art import dev
 from art.dev.sequence_lengths import max_seq_length_from_model_config
 from art.model import TrainableModel
-from art.training.contracts import SupervisedTrajectoryBatch
+from art.training.contracts import SupervisedTrajectoryBatch, TokenizedTrainingBatch
+from art.training.tokenized import TokenizedDatum
 from art.utils.model_config import get_instruction_response_parts
 
 from .tokenize import SFTBatch, tokenize_sft_batch
@@ -145,6 +147,70 @@ class SftBatchTokenizer:
             if len(self._max_sequence_lengths) > self.cache_capacity:
                 self._max_sequence_lengths.popitem(last=False)
             return value
+
+
+def tokenized_training_batch_from_sft(
+    batch: SFTBatch,
+) -> TokenizedTrainingBatch | None:
+    """Lower causal SFT tensors into the canonical exact-token contract."""
+
+    if batch.num_trajectories != len(batch.trajectory_tensors):
+        raise ValueError("SFT trajectory count does not match its tensor payload")
+    if batch.num_dropped_trajectories < 0:
+        raise ValueError("SFT dropped trajectory count must be nonnegative")
+    if not math.isfinite(batch.learning_rate):
+        raise ValueError("SFT learning rate must be finite")
+
+    datums: list[TokenizedDatum] = []
+    num_tokens = 0
+    source_trainable_tokens = 0
+    required = {"input_ids", "attention_mask", "labels"}
+    for tensors in batch.trajectory_tensors:
+        if set(tensors) != required:
+            raise ValueError("SFT trajectory tensors must have the exact schema")
+        if any(
+            not isinstance(tensors[name], torch.Tensor)
+            or tensors[name].dtype != torch.long
+            or tensors[name].device.type != "cpu"
+            or not tensors[name].is_contiguous()
+            for name in required
+        ):
+            raise ValueError("SFT trajectory tensors must be contiguous CPU int64")
+        if any(
+            tensors[name].ndim != 2 or tensors[name].shape[0] != 1 for name in required
+        ):
+            raise ValueError("SFT trajectory tensors must have shape [1, sequence]")
+        if len({tuple(tensors[name].shape) for name in required}) != 1:
+            raise ValueError("SFT trajectory tensor shapes differ")
+        if not bool(torch.all(tensors["attention_mask"] == 1).item()):
+            raise ValueError("SFT command tensors must be unpadded")
+
+        input_tokens = tuple(int(value) for value in tensors["input_ids"][0].tolist())
+        labels = tuple(int(value) for value in tensors["labels"][0].tolist())
+        num_tokens += len(input_tokens)
+        source_trainable_tokens += sum(label != -100 for label in labels)
+        shifted_labels = (*labels[1:], -100)
+        weights = tuple(1.0 if label != -100 else 0.0 for label in shifted_labels)
+        if not any(weights):
+            continue
+        datums.append(
+            TokenizedDatum(
+                input_tokens=input_tokens,
+                target_tokens=tuple(
+                    (label if label != -100 else 0,) for label in shifted_labels
+                ),
+                weights=tuple((weight,) for weight in weights),
+            )
+        )
+
+    if (batch.num_tokens, batch.num_trainable_tokens) != (
+        num_tokens,
+        source_trainable_tokens,
+    ):
+        raise ValueError("SFT token counts do not match the tensor payload")
+    if not datums:
+        return None
+    return TokenizedTrainingBatch(datums=tuple(datums))
 
 
 def _chat_template(internal: dev.InternalModelConfig) -> str | None:

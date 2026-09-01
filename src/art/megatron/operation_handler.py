@@ -18,7 +18,10 @@ from art.distributed.art_runtime import ArtRuntime, DistributedPackedBatch
 from art.distributed.packing import PackingRequest
 from art.distributed.rollout import RolloutModelSpec
 from art.distributed.trajectory_store import retained_route_bundles_from_bundles
-from art.preprocessing.sft import SftBatchTokenizer
+from art.preprocessing.sft import (
+    SftBatchTokenizer,
+    tokenized_training_batch_from_sft,
+)
 from art.training import (
     AdapterSpec,
     CheckpointRef,
@@ -57,7 +60,6 @@ from .route_retention import (
     RouteBundleOwnershipHandle,
     RouteBundleOwnershipProvider,
 )
-from .runtime.data_plane import SFTBatchData
 from .runtime.l4_hydration import L4HydrationSidecar
 from .runtime.publication import TrainerRankPublication
 from .runtime.specs import (
@@ -67,8 +69,6 @@ from .runtime.specs import (
     ForwardBackwardJobSpec,
     ForwardJobSpec,
     OptimizerJobSpec,
-    SftForwardBackwardJobSpec,
-    SftForwardJobSpec,
     TrainerGeneration,
 )
 
@@ -306,7 +306,6 @@ class _CapturedInput:
     request_fingerprint: str
     control_fingerprint: str
     packed: DistributedPackedBatch | None
-    sft: SFTBatchData | None
     packing: PackingOutcome
     route_ownership: RouteBundleOwnershipHandle | None = None
     packed_released: bool = False
@@ -339,22 +338,6 @@ class _ResidentTrainer(Protocol):
 
     async def start_forward_backward(
         self, job: ForwardBackwardJobSpec, batch: Any
-    ) -> "_TrainerCommandLaunch": ...
-
-    async def sft_forward(
-        self, job: SftForwardJobSpec, batch: SFTBatchData
-    ) -> dict[str, Any]: ...
-
-    async def start_sft_forward(
-        self, job: SftForwardJobSpec, batch: SFTBatchData
-    ) -> "_TrainerCommandLaunch": ...
-
-    async def sft_forward_backward(
-        self, job: SftForwardBackwardJobSpec, batch: SFTBatchData
-    ) -> dict[str, Any]: ...
-
-    async def start_sft_forward_backward(
-        self, job: SftForwardBackwardJobSpec, batch: SFTBatchData
     ) -> "_TrainerCommandLaunch": ...
 
     async def optim_step(self, job: OptimizerJobSpec) -> dict[str, Any]: ...
@@ -579,67 +562,59 @@ class MegatronOperationHandler:
         acquire_route_ownership: bool,
     ) -> _CapturedInput:
         fingerprint = _input_fingerprint(identity_request, operation)
+        packing_request = request
+        input_metrics: dict[str, float] = {}
         if isinstance(request.batch, SupervisedTrajectoryBatch):
-            tokenized = self._sft_tokenizer.tokenize(
+            sft_batch = self._sft_tokenizer.tokenize(
                 self.config.rollout_model.build(), request.batch
             )
-            packing = _sft_packing_outcome(
-                tokenized,
-                configured_sequence_length=self.trainer.runtime_spec.packed_sequence_length,
-                target_sequences=(
-                    _train_config(
-                        self.config.train_config, request
-                    ).grad_accumulation_sequences
-                    or _data_parallel_size(self.trainer)
-                ),
+            input_metrics["data/dropped_sft_trajectories"] = float(
+                sft_batch.num_dropped_trajectories
             )
-            sft = (
-                SFTBatchData(
-                    trajectory_tensors=tuple(tokenized.trajectory_tensors),
-                    learning_rate=tokenized.learning_rate,
-                    num_trajectories=tokenized.num_trajectories,
-                    num_tokens=tokenized.num_tokens,
-                    num_trainable_tokens=tokenized.num_trainable_tokens,
-                    num_dropped_trajectories=tokenized.num_dropped_trajectories,
+            tokenized_batch = tokenized_training_batch_from_sft(sft_batch)
+            if tokenized_batch is None:
+                config = _train_config(self.config.train_config, request)
+                packing = PackingOutcome(
+                    packed_sequence_length=(
+                        self.trainer.runtime_spec.packed_sequence_length
+                    ),
+                    packed_sequences=0,
+                    target_packed_sequences=(
+                        config.grad_accumulation_sequences
+                        or _data_parallel_size(self.trainer)
+                    ),
+                    physical_tokens=0,
+                    non_padding_tokens=0,
+                    loss_bearing_tokens=0,
+                    trainable_assistant_tokens=0,
                 )
-                if tokenized.num_trainable_tokens > 0
-                else None
-            )
-            content_sha256 = None if sft is None else sft.fingerprint
-            ref = PackedInputCaptureRef(
-                run_id=operation.run_id,
-                capture_id=operation.operation_id,
-                manifest_sha256=_sft_capture_manifest_sha256(
-                    operation,
-                    packing,
-                    fingerprint,
-                    content_sha256,
-                ),
-                content_sha256=content_sha256,
-                input_kind="sft",
-                input_object=input_object,
-            )
-            return _CapturedInput(
-                ref=ref,
-                request_fingerprint=fingerprint,
-                control_fingerprint=_input_control_fingerprint(
-                    identity_request, operation
-                ),
-                packed=None,
-                sft=sft,
-                packing=packing,
-                retained_for_replay=(
-                    identity_request.retain_packed_input and sft is not None
-                ),
-                input_metrics={
-                    "data/dropped_sft_trajectories": float(
-                        tokenized.num_dropped_trajectories
-                    )
-                },
-                source_request=identity_request if input_object is not None else None,
-                source_operation=operation if input_object is not None else None,
-            )
-        if not isinstance(request.batch, (RlTrajectoryBatch, TokenizedTrainingBatch)):
+                ref = PackedInputCaptureRef(
+                    run_id=operation.run_id,
+                    capture_id=operation.operation_id,
+                    manifest_sha256=_capture_manifest_sha256(
+                        operation, None, packing, fingerprint
+                    ),
+                    content_sha256=None,
+                    input_kind="sft",
+                    input_object=input_object,
+                )
+                return _CapturedInput(
+                    ref=ref,
+                    request_fingerprint=fingerprint,
+                    control_fingerprint=_input_control_fingerprint(
+                        identity_request, operation
+                    ),
+                    packed=None,
+                    packing=packing,
+                    retained_for_replay=False,
+                    input_metrics=input_metrics,
+                    source_request=(
+                        identity_request if input_object is not None else None
+                    ),
+                    source_operation=operation if input_object is not None else None,
+                )
+            packing_request = request.model_copy(update={"batch": tokenized_batch})
+        elif not isinstance(request.batch, (RlTrajectoryBatch, TokenizedTrainingBatch)):
             raise RuntimeError("resolved training input has an unsupported kind")
         bundles = (
             retained_route_bundles_from_bundles(request.batch.groups)
@@ -659,7 +634,7 @@ class MegatronOperationHandler:
         try:
             packed = await self.runtime.pack(
                 self._packing_request(
-                    request,
+                    packing_request,
                     operation,
                     retained_route_bundles=bundles,
                     force_content_sha256=input_object is not None,
@@ -709,10 +684,10 @@ class MegatronOperationHandler:
             request_fingerprint=fingerprint,
             control_fingerprint=_input_control_fingerprint(identity_request, operation),
             packed=packed,
-            sft=None,
             packing=packing,
             route_ownership=ownership,
             retained_for_replay=identity_request.retain_packed_input,
+            input_metrics=input_metrics,
             source_request=identity_request if input_object is not None else None,
             source_operation=operation if input_object is not None else None,
         )
@@ -771,7 +746,6 @@ class MegatronOperationHandler:
                 await self.runtime.release_batch(fresh.packed)
             raise RuntimeError("rematerialized packed input changed identity")
         captured.packed = fresh.packed
-        captured.sft = fresh.sft
         captured.packing = fresh.packing
         captured.input_metrics = fresh.input_metrics
         captured.packed_released = False
@@ -1142,61 +1116,36 @@ class MegatronOperationHandler:
             completion.set_result(result)
             return MegatronOperationLaunch(completion=completion)
         try:
-            if captured.sft is not None:
-                sft_common = {
-                    "operation": operation,
-                    "training_session_id": self.config.training_session_id,
-                    "source": self._generation,
-                    "optimizer_state_path": self._optimizer_state_path,
-                    "batch_fingerprint": captured.sft.fingerprint,
-                    "expected_global_nonpadding_tokens": (
-                        captured.packing.non_padding_tokens
-                    ),
-                    "expected_global_loss_bearing_tokens": (
-                        captured.packing.loss_bearing_tokens
-                    ),
-                    "config": _train_config(self.config.train_config, request),
-                    "return_token_logprobs": request.return_token_logprobs,
-                }
-                if backward:
-                    trainer_launch = await self.trainer.start_sft_forward_backward(
-                        SftForwardBackwardJobSpec(**sft_common),
-                        captured.sft,
-                    )
-                else:
-                    trainer_launch = await self.trainer.start_sft_forward(
-                        SftForwardJobSpec(**sft_common),
-                        captured.sft,
-                    )
+            if captured.packed is None:
+                raise RuntimeError("prepared input has no executable payload")
+            packed_common = {
+                "operation": operation,
+                "training_session_id": self.config.training_session_id,
+                "source": self._generation,
+                "optimizer_state_path": self._optimizer_state_path,
+                "batch": captured.packed.leases.ref,
+                "expected_global_loss_bearing_tokens": (
+                    captured.packing.loss_bearing_tokens
+                ),
+                "config": _train_config(self.config.train_config, request),
+                "experimental_config": _experimental_config(request),
+                "loss": (
+                    request.loss
+                    if captured.packed.leases.ref.training_kind == "tokenized"
+                    else None
+                ),
+                "return_token_logprobs": request.return_token_logprobs,
+            }
+            if backward:
+                trainer_launch = await self.trainer.start_forward_backward(
+                    ForwardBackwardJobSpec(**packed_common),
+                    captured.packed.leases,
+                )
             else:
-                if captured.packed is None:
-                    raise RuntimeError("prepared input has no executable payload")
-                packed_common = {
-                    "operation": operation,
-                    "training_session_id": self.config.training_session_id,
-                    "source": self._generation,
-                    "optimizer_state_path": self._optimizer_state_path,
-                    "batch": captured.packed.leases.ref,
-                    "expected_global_loss_bearing_tokens": (
-                        captured.packing.loss_bearing_tokens
-                    ),
-                    "config": _train_config(self.config.train_config, request),
-                    "experimental_config": _experimental_config(request),
-                    "loss": (
-                        request.loss if captured.ref.input_kind == "tokenized" else None
-                    ),
-                    "return_token_logprobs": request.return_token_logprobs,
-                }
-                if backward:
-                    trainer_launch = await self.trainer.start_forward_backward(
-                        ForwardBackwardJobSpec(**packed_common),
-                        captured.packed.leases,
-                    )
-                else:
-                    trainer_launch = await self.trainer.start_forward(
-                        ForwardJobSpec(**packed_common),
-                        captured.packed.leases,
-                    )
+                trainer_launch = await self.trainer.start_forward(
+                    ForwardJobSpec(**packed_common),
+                    captured.packed.leases,
+                )
         except BaseException as error:
             await self._release_after_failed_execution(capture_ref.capture_id, error)
             if isinstance(error, OperationExecutionError):
@@ -1253,10 +1202,11 @@ class MegatronOperationHandler:
                 for value in raw.get("token_logprobs", ())
             ),
             metrics={
+                **captured.input_metrics,
                 **(
                     _packing_metrics(captured.packed)
                     if captured.packed is not None
-                    else captured.input_metrics
+                    else {}
                 ),
                 **raw.get("metrics", {}),
             },
@@ -1379,7 +1329,6 @@ class MegatronOperationHandler:
             if captured.packed is not None:
                 await self.runtime.release_batch(captured.packed)
             captured.packed = None
-            captured.sft = None
             captured.packed_released = True
         except BaseException as error:
             self._release_failures[capture_id] = error
@@ -1643,7 +1592,7 @@ def _input_control_fingerprint(
 
 def _capture_manifest_sha256(
     operation: OperationRef,
-    packed: DistributedPackedBatch,
+    packed: DistributedPackedBatch | None,
     packing: PackingOutcome,
     request_fingerprint: str,
 ) -> str:
@@ -1652,15 +1601,19 @@ def _capture_manifest_sha256(
             {
                 "operation_id": operation.operation_id,
                 "request_fingerprint": request_fingerprint,
-                "packed": packed.leases.ref.model_dump(
-                    mode="json",
-                    exclude={
-                        "batch_id",
-                        "owner_actor_id",
-                        "lease_id",
-                        "shared_memory_name",
-                        "owner_process_id",
-                    },
+                "packed": (
+                    None
+                    if packed is None
+                    else packed.leases.ref.model_dump(
+                        mode="json",
+                        exclude={
+                            "batch_id",
+                            "owner_actor_id",
+                            "lease_id",
+                            "shared_memory_name",
+                            "owner_process_id",
+                        },
+                    )
                 ),
                 "packing": packing.model_dump(mode="json"),
             },
@@ -1668,47 +1621,6 @@ def _capture_manifest_sha256(
             separators=(",", ":"),
         ).encode()
     ).hexdigest()
-
-
-def _sft_capture_manifest_sha256(
-    operation: OperationRef,
-    packing: PackingOutcome,
-    request_fingerprint: str,
-    content_sha256: str | None,
-) -> str:
-    return hashlib.sha256(
-        json.dumps(
-            {
-                "operation_id": operation.operation_id,
-                "request_fingerprint": request_fingerprint,
-                "content_sha256": content_sha256,
-                "packing": packing.model_dump(mode="json"),
-            },
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode()
-    ).hexdigest()
-
-
-def _sft_packing_outcome(
-    batch: Any,
-    *,
-    configured_sequence_length: int,
-    target_sequences: int,
-) -> PackingOutcome:
-    sequence_length = max(
-        (int(tensors["input_ids"].numel()) for tensors in batch.trajectory_tensors),
-        default=configured_sequence_length,
-    )
-    return PackingOutcome(
-        packed_sequence_length=sequence_length,
-        packed_sequences=batch.num_trajectories,
-        target_packed_sequences=target_sequences,
-        physical_tokens=batch.num_tokens,
-        non_padding_tokens=batch.num_tokens,
-        loss_bearing_tokens=batch.num_trainable_tokens,
-        trainable_assistant_tokens=batch.num_trainable_tokens,
-    )
 
 
 def _complete_zero_usage() -> CommandExecutionUsage:

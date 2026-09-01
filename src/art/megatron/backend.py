@@ -1518,12 +1518,6 @@ class MegatronBackend(LocalBackend):
         model: AnyTrainableModel,
         config: dev.OpenAIServerConfig | None = None,
     ) -> tuple[str, str]:
-        if (
-            self._training_binding is None
-            and self._runtime is None
-            and get_external_vllm_runtime_config(model._internal_config or {}) is None
-        ):
-            await self._bind_owned_training_run(cast(TrainableModel, model), config)
         binding = self._training_binding
         if binding is not None:
             del config
