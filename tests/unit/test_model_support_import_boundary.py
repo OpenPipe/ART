@@ -39,3 +39,40 @@ def test_get_model_config_qwen3_metadata_does_not_import_megatron() -> None:
         cwd=Path(__file__).resolve().parents[2],
         check=True,
     )
+
+
+def test_monarch_controller_import_does_not_require_megatron() -> None:
+    subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            textwrap.dedent(
+                """
+                import builtins
+                import sys
+
+                real_import = builtins.__import__
+
+                def blocked_import(
+                    name, globals=None, locals=None, fromlist=(), level=0
+                ):
+                    if level == 0 and name.partition(".")[0] == "megatron":
+                        raise ModuleNotFoundError("No module named 'megatron'")
+                    return real_import(name, globals, locals, fromlist, level)
+
+                builtins.__import__ = blocked_import
+
+                import art.megatron.runtime.monarch as monarch
+
+                assert monarch.__name__ == "art.megatron.runtime.monarch"
+                assert not {
+                    name
+                    for name in sys.modules
+                    if name.partition(".")[0] == "megatron"
+                }
+                """
+            ),
+        ],
+        cwd=Path(__file__).resolve().parents[2],
+        check=True,
+    )

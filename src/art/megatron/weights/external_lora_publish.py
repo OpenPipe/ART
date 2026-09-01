@@ -8,26 +8,21 @@ import json
 import math
 import struct
 import sys
-from typing import Any, Literal, Protocol, TypeVar, cast
+from typing import TYPE_CHECKING, Any, Literal, Protocol, TypeVar, cast
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 import torch
 
-from art.megatron.lora import LoraShardMeta, LoRASlotRef, _block_for_key
 from art.megatron.model_support.lora_disk import (
     ART_LORA_FORMAT_CONFIG_KEY,
     ART_LORA_FORMAT_VLLM,
 )
 from art.megatron.tensor_snapshot import PendingCpuSnapshot, PinnedCpuSnapshotStager
-from art.megatron.training.model_chunks import ModelChunks
-from art.megatron.weights.lora_publish import (
-    PackedExpertShardMeta,
-    _stage_published_tensors,
-    collect_local_lora_entries,
-    collect_local_packed_expert_entries,
-    merge_packed_expert_adapter_entries,
-    merge_sharded_adapter_entries,
-)
+
+if TYPE_CHECKING:
+    from art.megatron.lora import LoraShardMeta, LoRASlotRef
+    from art.megatron.training.model_chunks import ModelChunks
+    from art.megatron.weights.lora_publish import PackedExpertShardMeta
 
 _SAFETENSORS_DTYPES = {
     torch.bool: "BOOL",
@@ -374,6 +369,11 @@ def stage_external_lora_from_model(
     coordinator_rank: int = 0,
     slot_ref: LoRASlotRef | None = None,
 ) -> PendingCpuSnapshot[PreparedExternalLora]:
+    from art.megatron.weights.lora_publish import (
+        collect_local_lora_entries,
+        collect_local_packed_expert_entries,
+    )
+
     rank, _world_size = _rank_world(group)
     packed_groups = tuple(handler.expert_packed_lora_groups())
     regular, regular_metadata = collect_local_lora_entries(
@@ -435,6 +435,8 @@ def prepare_external_lora(
     coordinator_rank: int = 0,
 ) -> PendingCpuSnapshot[PreparedExternalLora]:
     """Prepare rank-owned ranges of one standard, externally loadable LoRA."""
+
+    from art.megatron.weights.lora_publish import _stage_published_tensors
 
     rank, world_size = _rank_world(group)
     device = torch.device(exchange_device)
@@ -677,12 +679,16 @@ def _dtype_from_name(name: str) -> torch.dtype:
 
 
 def _metadata_block(meta: LoraShardMeta | PackedExpertShardMeta) -> str:
+    from art.megatron.lora import LoraShardMeta, _block_for_key
+
     return meta.block if isinstance(meta, LoraShardMeta) else _block_for_key(meta.key)
 
 
 def _metadata_identity(
     meta: LoraShardMeta | PackedExpertShardMeta,
 ) -> tuple[str, str, int, int]:
+    from art.megatron.weights.lora_publish import PackedExpertShardMeta
+
     return (
         "packed" if isinstance(meta, PackedExpertShardMeta) else "regular",
         meta.key,
@@ -808,6 +814,8 @@ def _canonical_sources(
     ],
     block_owners: Mapping[str, int],
 ) -> tuple[list[LoraShardMeta], list[PackedExpertShardMeta]]:
+    from art.megatron.weights.lora_publish import PackedExpertShardMeta
+
     regular: list[LoraShardMeta] = []
     packed: list[PackedExpertShardMeta] = []
     for identity in sorted(candidates):
@@ -925,6 +933,11 @@ def _convert_owned_blocks(
     handler: Any,
     adapter_config: dict[str, Any],
 ) -> tuple[dict[str, torch.Tensor], list[dict[str, Any]]]:
+    from art.megatron.weights.lora_publish import (
+        merge_packed_expert_adapter_entries,
+        merge_sharded_adapter_entries,
+    )
+
     output: dict[str, torch.Tensor] = {}
     configs = []
     for block in sorted(key for key, owner in block_owners.items() if owner == rank):
