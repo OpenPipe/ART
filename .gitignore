@@ -25,3 +25,4 @@ replays/
 /src/art/wandb/__pycache__/
 scratch/
 /progress_log.md
+dev/_trainer_rank_ellavox_qwen35_4b_tokens.json
