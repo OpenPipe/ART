@@ -66,12 +66,6 @@ class MegatronRunSlots:
         self._prepared_checkpoint_saves: dict[str, Any] = {}
         self._finalized_checkpoint_saves: OrderedDict[str, Any] = OrderedDict()
 
-    def load_checkpoint(self, name: str, directory: str) -> None:
-        """Synchronously load one rank-local materialized checkpoint directory."""
-
-        source = self._prepare_checkpoint(directory)
-        _checkpoint.load_checkpoint(self, source, name)
-
     def load_checkpoint_for_residency(
         self, name: str, directory: str
     ) -> tuple[tuple[torch.nn.Parameter, ...], tuple[torch.Tensor, ...]]:
@@ -231,24 +225,12 @@ class MegatronRunSlots:
             raise MegatronRunSlotStateError(
                 "Fresh optimizer preparation requires non-empty CPU weights"
             )
-        dynamic = self._new_dynamic_optimizer(name, params)
+        dynamic = _checkpoint.build_adam_optimizer(
+            weights,
+            self._optimizer_config(params),
+            padding_masks=self._optimizer_padding_masks(name),
+        )
         slot.optimizer = dynamic
-        group = dynamic.optimizer.param_groups[0]
-        for master in dynamic.master_params:
-            dynamic.optimizer.state[master] = {
-                "step": torch.zeros((), dtype=torch.float32),
-                "exp_avg": torch.zeros_like(
-                    master, memory_format=torch.preserve_format
-                ),
-                "exp_avg_sq": torch.zeros_like(
-                    master, memory_format=torch.preserve_format
-                ),
-            }
-            if bool(group.get("amsgrad", False)):
-                dynamic.optimizer.state[master]["max_exp_avg_sq"] = torch.zeros_like(
-                    master, memory_format=torch.preserve_format
-                )
-        self._zero_dynamic_optimizer_padding(name, dynamic)
         tensors = self.checkpoint_slot_optimizer_tensors(name)
         if not tensors or any(tensor.device.type != "cpu" for tensor in tensors):
             slot.optimizer = None
@@ -279,7 +261,12 @@ class MegatronRunSlots:
             _checkpoint._ensure_group(self),
         )
         dynamic = _checkpoint._phase(
-            lambda: self._restore_canonical_optimizer(name, optimizer_state),
+            lambda: _checkpoint.build_adam_optimizer(
+                slot.params,
+                optimizer_state.config,
+                restored=optimizer_state,
+                padding_masks=self._optimizer_padding_masks(name),
+            ),
             "restore checkpoint optimizer for CPU residency",
             _checkpoint._ensure_group(self),
         )
@@ -291,33 +278,6 @@ class MegatronRunSlots:
                 "Restored optimizer residency is not entirely CPU resident"
             )
         return tensors
-
-    def prepare_checkpoint_slot_optimizer(
-        self, name: str, params: OptimizerConfig
-    ) -> tuple[torch.Tensor, ...]:
-        """Create the complete CUDA optimizer image before command admission."""
-
-        dynamic = self._dynamic_optimizer(name, params)
-        group = dynamic.optimizer.param_groups[0]
-        capturable = bool(group.get("capturable", False))
-        fused = bool(group.get("fused", False))
-        for master in dynamic.master_params:
-            state = dynamic.optimizer.state[master]
-            if state:
-                continue
-            step_device = master.device if capturable or fused else torch.device("cpu")
-            state["step"] = torch.zeros((), dtype=torch.float32, device=step_device)
-            state["exp_avg"] = torch.zeros_like(
-                master, memory_format=torch.preserve_format
-            )
-            state["exp_avg_sq"] = torch.zeros_like(
-                master, memory_format=torch.preserve_format
-            )
-            if bool(group.get("amsgrad", False)):
-                state["max_exp_avg_sq"] = torch.zeros_like(
-                    master, memory_format=torch.preserve_format
-                )
-        return self.checkpoint_slot_optimizer_tensors(name)
 
     def clear_checkpoint_slot_grads(self, name: str) -> None:
         for parameter in self.checkpoint_slot_parameters(name):
@@ -392,7 +352,7 @@ class MegatronRunSlots:
             raise ValueError("gradient step flags do not match checkpoint slot")
 
         for gradient, mask in zip(
-            gradients, self._dynamic_optimizer_padding_masks(name), strict=True
+            gradients, self._optimizer_padding_masks(name), strict=True
         ):
             gradient.masked_fill_(mask, 0)
         grad_norm = _distributed_grad_norm(model_params, gradients)
@@ -713,7 +673,11 @@ class MegatronRunSlots:
             raise ValueError(f"Unknown checkpoint slot: {name!r}") from error
         dynamic = slot.optimizer
         if dynamic is None:
-            dynamic = self._new_dynamic_optimizer(name, params)
+            dynamic = _checkpoint.build_adam_optimizer(
+                slot.params,
+                self._optimizer_config(params),
+                padding_masks=self._optimizer_padding_masks(name),
+            )
             slot.optimizer = dynamic
             return dynamic
         for group in dynamic.optimizer.param_groups:
@@ -721,163 +685,34 @@ class MegatronRunSlots:
             group["betas"] = (params.beta1, params.beta2)
             group["eps"] = params.eps
             group["weight_decay"] = params.weight_decay
-        self._zero_dynamic_optimizer_padding(name, dynamic)
+        _checkpoint.zero_optimizer_padding(dynamic, self._optimizer_padding_masks(name))
         return dynamic
 
-    def _new_dynamic_optimizer(
-        self,
-        name: str,
-        params: OptimizerConfig,
-        *,
-        master_params: Sequence[torch.Tensor] | None = None,
-    ) -> _checkpoint.DynamicOptimizer:
+    @staticmethod
+    def _optimizer_config(params: OptimizerConfig) -> _checkpoint.OptimizerConfig:
+        return {
+            "learning_rate": params.learning_rate,
+            "beta1": params.beta1,
+            "beta2": params.beta2,
+            "eps": params.eps,
+            "weight_decay": params.weight_decay,
+        }
+
+    def _optimizer_padding_masks(self, name: str) -> tuple[torch.Tensor, ...]:
         slot = self._checkpoint_slots[name]
         if slot.custom or slot.custom_payload is not None:
             raise MegatronRunSlotStateError(
                 "Megatron run slots do not support custom checkpoint tensors"
             )
-        model_params = slot.params
-        sources = model_params if master_params is None else tuple(master_params)
-        if len(sources) != len(model_params) or any(
-            not isinstance(source, torch.Tensor) for source in sources
-        ):
-            raise MegatronRunSlotStateError(
-                f"Optimizer state for checkpoint slot {name!r} has "
-                f"{len(sources)} master parameters; expected {len(model_params)}."
-            )
-        if any(
-            tuple(source.shape) != tuple(model.shape)
-            for source, model in zip(sources, model_params, strict=True)
-        ):
-            raise MegatronRunSlotStateError(
-                f"Optimizer master parameter shape does not match checkpoint {name!r}"
-            )
-        masters = tuple(
-            torch.nn.Parameter(
-                source.detach().to(device=model.device, dtype=torch.float32).clone()
-            )
-            for model, source in zip(model_params, sources, strict=True)
-        )
-        optimizer = torch.optim.AdamW(
-            masters,
-            lr=params.learning_rate,
-            betas=(params.beta1, params.beta2),
-            eps=params.eps,
-            weight_decay=params.weight_decay,
-        )
-        return _checkpoint.DynamicOptimizer(optimizer, masters)
-
-    def _restore_canonical_optimizer(
-        self, name: str, state: _checkpoint.LocalOptimizerState
-    ) -> _checkpoint.DynamicOptimizer:
-        dynamic = self._new_dynamic_optimizer(
-            name,
-            OptimizerConfig(
-                learning_rate=state.config["learning_rate"],
-                beta1=state.config["beta1"],
-                beta2=state.config["beta2"],
-                eps=state.config["eps"],
-                weight_decay=state.config["weight_decay"],
-            ),
-            master_params=state.masters,
-        )
-        for master, exp_avg, exp_avg_sq, step in zip(
-            dynamic.master_params,
-            state.exp_avgs,
-            state.exp_avg_sqs,
-            state.steps,
-            strict=True,
-        ):
-            if tuple(exp_avg.shape) != tuple(master.shape) or tuple(
-                exp_avg_sq.shape
-            ) != tuple(master.shape):
-                raise MegatronRunSlotStateError(
-                    f"Canonical optimizer moment shape does not match {name!r}"
-                )
-            dynamic.optimizer.state[master] = {
-                "step": torch.tensor(step, dtype=torch.float32),
-                "exp_avg": exp_avg.to(master.device, torch.float32).clone(),
-                "exp_avg_sq": exp_avg_sq.to(master.device, torch.float32).clone(),
-            }
-        self._zero_dynamic_optimizer_padding(name, dynamic)
-        return dynamic
-
-    def _zero_dynamic_optimizer_padding(
-        self, name: str, dynamic: _checkpoint.DynamicOptimizer
-    ) -> None:
-        masks = self._dynamic_optimizer_padding_masks(name)
-        with torch.no_grad():
-            for param, mask in zip(dynamic.master_params, masks, strict=True):
-                param.masked_fill_(mask, 0)
-                for value in dynamic.optimizer.state.get(param, {}).values():
-                    if isinstance(value, torch.Tensor) and value.shape == param.shape:
-                        value.masked_fill_(mask, 0)
-
-    def _dynamic_optimizer_padding_masks(self, name: str) -> tuple[torch.Tensor, ...]:
         params = self._checkpoint_slots[name].params
-        masks = tuple(torch.zeros_like(param, dtype=torch.bool) for param in params)
-        param_indices = {id(param): index for index, param in enumerate(params)}
-        exported: dict[str, torch.Tensor] = {}
-        owners: dict[str, tuple[int, int | None]] = {}
-        mapped_indices: set[int] = set()
-        ref = self._slot_ref(name)
-
-        for chunk in self.runtime.model:
-            for module in chunk.modules():
-                lora_params = getattr(module, "_lora_params", None)
-                expected_keys = getattr(module, "_expected_weight_keys", None)
-                if not callable(lora_params) or not callable(expected_keys):
-                    continue
-                for suffix, param in lora_params(ref):
-                    index = param_indices.get(id(param))
-                    if index is None:
-                        continue
-                    mapped_indices.add(index)
-                    keys = expected_keys(str(suffix).removesuffix(".weight"))
-                    if int(param.ndim) == 3:
-                        if len(keys) != int(param.shape[0]):
-                            raise MegatronRunSlotStateError(
-                                f"Cannot map optimizer padding for checkpoint "
-                                f"{name!r}: {len(keys)} adapter keys describe "
-                                f"{int(param.shape[0])} local experts."
-                            )
-                        for expert, key in enumerate(keys):
-                            exported[str(key)] = torch.ones_like(param[expert].T)
-                            owners[str(key)] = (index, expert)
-                    elif len(keys) == 1:
-                        key = str(keys[0])
-                        exported[key] = torch.ones_like(param.T)
-                        owners[key] = (index, None)
-                    else:
-                        raise MegatronRunSlotStateError(
-                            f"Cannot map optimizer padding for checkpoint {name!r}: "
-                            f"expected one adapter key, got {len(keys)}."
-                        )
-
-        if mapped_indices and (
-            missing := sorted(
-                index for index in range(len(params)) if index not in mapped_indices
-            )
-        ):
-            raise MegatronRunSlotStateError(
-                f"Cannot map optimizer padding for checkpoint {name!r}: parameter "
-                f"indices {missing} do not belong to installed LoRA sites."
-            )
-
-        canonical = self.runtime.model_support_handler.canonicalize_loaded_lora_state(
-            exported, self.runtime.model
+        return _checkpoint.lora_optimizer_padding_masks(
+            params,
+            model_chunks=self.runtime.model,
+            slot_ref=self._slot_ref(name),
+            canonicalize_loaded_state=(
+                self.runtime.model_support_handler.canonicalize_loaded_lora_state
+            ),
         )
-        for key, value in canonical.items():
-            owner = owners.get(key)
-            if owner is None or not isinstance(value, torch.Tensor):
-                continue
-            index, expert = owner
-            mask = value.T == 0
-            if expert is None:
-                masks[index].copy_(mask)
-            else:
-                masks[index][expert].copy_(mask)
-        return masks
 
     def _reduce_gradient_tensors(
         self,

@@ -139,8 +139,8 @@ def test_fresh_optimizer_is_prepared_entirely_on_cpu(
     }
     monkeypatch.setattr(
         MegatronRunSlots,
-        "_zero_dynamic_optimizer_padding",
-        lambda *_args, **_kwargs: None,
+        "_optimizer_padding_masks",
+        lambda *_args, **_kwargs: (torch.zeros_like(parameter, dtype=torch.bool),),
     )
     cuda_initialized = torch.cuda.is_initialized()
 

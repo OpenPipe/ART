@@ -102,6 +102,152 @@ class DynamicOptimizer:
     master_params: tuple[torch.nn.Parameter, ...]
 
 
+def build_adam_optimizer(
+    model_params: Sequence[torch.nn.Parameter],
+    config: OptimizerConfig,
+    *,
+    restored: LocalOptimizerState | None = None,
+    padding_masks: Sequence[torch.Tensor] = (),
+) -> DynamicOptimizer:
+    """Construct complete local Adam state without attaching it to a runtime owner."""
+
+    sources = model_params if restored is None else restored.masters
+    if len(sources) != len(model_params):
+        raise RuntimeError(
+            "optimizer master parameter count differs from model parameter count"
+        )
+    if any(
+        tuple(source.shape) != tuple(model.shape)
+        for source, model in zip(sources, model_params, strict=True)
+    ):
+        raise RuntimeError("optimizer master parameter shape differs from model")
+    masters = tuple(
+        torch.nn.Parameter(
+            source.detach().to(device=model.device, dtype=torch.float32).clone()
+        )
+        for model, source in zip(model_params, sources, strict=True)
+    )
+    optimizer = torch.optim.AdamW(
+        masters,
+        lr=config["learning_rate"],
+        betas=(config["beta1"], config["beta2"]),
+        eps=config["eps"],
+        weight_decay=config["weight_decay"],
+    )
+    dynamic = DynamicOptimizer(optimizer, masters)
+    if restored is not None and not (
+        len(restored.exp_avgs)
+        == len(restored.exp_avg_sqs)
+        == len(restored.steps)
+        == len(masters)
+    ):
+        raise RuntimeError("optimizer moment coverage differs from model parameters")
+    for index, master in enumerate(masters):
+        exp_avg = (
+            torch.zeros_like(master, memory_format=torch.preserve_format)
+            if restored is None
+            else restored.exp_avgs[index].to(master.device, torch.float32).clone()
+        )
+        exp_avg_sq = (
+            torch.zeros_like(master, memory_format=torch.preserve_format)
+            if restored is None
+            else restored.exp_avg_sqs[index].to(master.device, torch.float32).clone()
+        )
+        if exp_avg.shape != master.shape or exp_avg_sq.shape != master.shape:
+            raise RuntimeError("optimizer moment shape differs from model parameter")
+        optimizer.state[master] = {
+            "step": torch.tensor(
+                0.0 if restored is None else restored.steps[index],
+                dtype=torch.float32,
+            ),
+            "exp_avg": exp_avg,
+            "exp_avg_sq": exp_avg_sq,
+        }
+    zero_optimizer_padding(dynamic, padding_masks)
+    return dynamic
+
+
+def zero_optimizer_padding(
+    dynamic: DynamicOptimizer, padding_masks: Sequence[torch.Tensor]
+) -> None:
+    """Keep topology padding absent from logical Adam state."""
+
+    if not padding_masks:
+        return
+    if len(padding_masks) != len(dynamic.master_params):
+        raise RuntimeError("optimizer padding-mask coverage differs from parameters")
+    with torch.no_grad():
+        for param, mask in zip(dynamic.master_params, padding_masks, strict=True):
+            if mask.shape != param.shape:
+                raise RuntimeError(
+                    "optimizer padding-mask shape differs from parameter"
+                )
+            param.masked_fill_(mask, 0)
+            for value in dynamic.optimizer.state.get(param, {}).values():
+                if isinstance(value, torch.Tensor) and value.shape == param.shape:
+                    value.masked_fill_(mask, 0)
+
+
+def lora_optimizer_padding_masks(
+    model_params: Sequence[torch.nn.Parameter],
+    *,
+    model_chunks: Sequence[torch.nn.Module],
+    slot_ref: "LoRASlotRef",
+    canonicalize_loaded_state: Callable[..., Mapping[str, object]],
+) -> tuple[torch.Tensor, ...]:
+    """Derive topology-padding masks from canonical LoRA tensor coverage."""
+
+    from art.megatron.lora import LoRA
+
+    masks = tuple(torch.zeros_like(param, dtype=torch.bool) for param in model_params)
+    param_indices = {id(param): index for index, param in enumerate(model_params)}
+    exported: dict[str, torch.Tensor] = {}
+    owners: dict[str, tuple[int, int | None]] = {}
+    mapped_indices: set[int] = set()
+    for chunk in model_chunks:
+        for module in chunk.modules():
+            if not isinstance(module, LoRA):
+                continue
+            for suffix, param in module._lora_params(slot_ref):
+                index = param_indices.get(id(param))
+                if index is None:
+                    continue
+                mapped_indices.add(index)
+                keys = module._expected_weight_keys(str(suffix).removesuffix(".weight"))
+                if int(param.ndim) == 3:
+                    if len(keys) != int(param.shape[0]):
+                        raise RuntimeError(
+                            "LoRA optimizer padding expert coverage differs from "
+                            "the local parameter"
+                        )
+                    for expert, key in enumerate(keys):
+                        exported[str(key)] = torch.ones_like(param[expert].T)
+                        owners[str(key)] = (index, expert)
+                elif len(keys) == 1:
+                    key = str(keys[0])
+                    exported[key] = torch.ones_like(param.T)
+                    owners[key] = (index, None)
+                else:
+                    raise RuntimeError(
+                        "LoRA optimizer padding key coverage differs from the local "
+                        "parameter"
+                    )
+    if mapped_indices and len(mapped_indices) != len(model_params):
+        raise RuntimeError("optimizer parameters include state outside LoRA sites")
+    canonical = canonicalize_loaded_state(exported, model_chunks)
+    for key, value in canonical.items():
+        owner = owners.get(key)
+        if owner is None or not isinstance(value, torch.Tensor):
+            continue
+        index, expert = owner
+        mask = value.T == 0
+        if expert is None:
+            masks[index].copy_(mask)
+        else:
+            masks[index][expert].copy_(mask)
+    return masks
+
+
 @dataclass
 class CheckpointSlot:
     params: tuple[torch.nn.Parameter, ...] = ()
