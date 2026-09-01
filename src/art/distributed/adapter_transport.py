@@ -92,6 +92,8 @@ class AdapterSenderState(_TransportRecord):
     registered_buffers: int = Field(ge=0, le=1)
     registered_capacity_bytes: int = Field(ge=0)
     remote_agents: int = Field(ge=0)
+    poisoned: bool = False
+    unreleased_handles: int = Field(default=0, ge=0, le=1)
     closed: bool
 
 
@@ -569,9 +571,11 @@ class NixlAdapterSender:
         self._agent: Any | None = None
         self._block: torch.Tensor | None = None
         self._registration: Any | None = None
-        self._remote_agents: dict[tuple[str, str], str] = {}
+        self._remote_agents: dict[str, tuple[str, str]] = {}
+        self._unreleased_handles: list[Any] = []
         self._active_transfers = 0
         self._completed_transfers = 0
+        self._poisoned = False
         self._closed = False
 
     def send(
@@ -580,6 +584,10 @@ class NixlAdapterSender:
         adapter_config: dict[str, Any],
         targets: tuple[AdapterTransferTarget, ...],
     ) -> None:
+        if self._closed:
+            raise RuntimeError("NIXL adapter sender is closed")
+        if self._poisoned:
+            raise RuntimeError("NIXL adapter sender requires a runtime restart")
         if not targets:
             return
         first = targets[0]
@@ -608,17 +616,7 @@ class NixlAdapterSender:
             local_descriptors = agent.get_xfer_descs(
                 (self._block.narrow(0, 0, used_bytes),)
             )
-            key = (target.host_id, target.remote_metadata_b64)
-            remote_agent = self._remote_agents.get(key)
-            if remote_agent is None:
-                remote_agent = agent.add_remote_agent(
-                    base64.b64decode(target.remote_metadata_b64)
-                )
-                if isinstance(remote_agent, bytes):
-                    remote_agent = remote_agent.decode()
-                self._remote_agents[key] = remote_agent
-            if remote_agent != target.remote_agent:
-                raise RuntimeError("NIXL target returned the wrong agent identity")
+            remote_agent = self._remote_agent_for_target(agent, target)
             self._active_transfers += 1
             handle = None
             try:
@@ -654,9 +652,27 @@ class NixlAdapterSender:
                         f"NIXL adapter transfer failed for {target.host_id}"
                     )
                 self._completed_transfers += 1
-            finally:
+            except BaseException as error:
                 if handle is not None:
-                    handle.release()
+                    try:
+                        handle.release()
+                    except BaseException as release_error:
+                        self._poisoned = True
+                        self._unreleased_handles.append(handle)
+                        error.add_note(
+                            "NIXL transfer cancellation failed; sender is poisoned: "
+                            f"{type(release_error).__name__}: {release_error}"
+                        )
+                raise
+            else:
+                if handle is not None:
+                    try:
+                        handle.release()
+                    except BaseException:
+                        self._poisoned = True
+                        self._unreleased_handles.append(handle)
+                        raise
+            finally:
                 self._active_transfers -= 1
 
     def _ensure_capacity(self, used_bytes: int) -> float:
@@ -677,8 +693,21 @@ class NixlAdapterSender:
         return time.monotonic() - started
 
     def close(self) -> None:
+        failures: list[BaseException] = []
+        retained_handles = []
+        for handle in self._unreleased_handles:
+            try:
+                handle.release()
+            except BaseException as error:
+                failures.append(error)
+                retained_handles.append(handle)
+        self._unreleased_handles = retained_handles
+        if failures:
+            raise RuntimeError(
+                "NIXL adapter sender could not release an active transfer"
+            ) from failures[0]
         if self._agent is not None:
-            for remote_agent in self._remote_agents.values():
+            for _, remote_agent in self._remote_agents.values():
                 self._agent.remove_remote_agent(remote_agent)
         self._remote_agents.clear()
         if self._agent is not None and self._registration is not None:
@@ -697,8 +726,44 @@ class NixlAdapterSender:
                 0 if self._block is None else self._block.numel()
             ),
             remote_agents=len(self._remote_agents),
+            poisoned=self._poisoned,
+            unreleased_handles=len(self._unreleased_handles),
             closed=self._closed,
         )
+
+    def _remote_agent_for_target(
+        self, agent: Any, target: AdapterTransferTarget
+    ) -> str:
+        cached = self._remote_agents.get(target.host_id)
+        if cached is not None and cached[0] != target.remote_metadata_b64:
+            try:
+                agent.remove_remote_agent(cached[1])
+            except BaseException:
+                self._poisoned = True
+                raise
+            self._remote_agents.pop(target.host_id)
+            cached = None
+        if cached is None:
+            remote_agent = agent.add_remote_agent(
+                base64.b64decode(target.remote_metadata_b64)
+            )
+            if isinstance(remote_agent, bytes):
+                remote_agent = remote_agent.decode()
+            if remote_agent != target.remote_agent:
+                try:
+                    agent.remove_remote_agent(remote_agent)
+                except BaseException:
+                    self._poisoned = True
+                    raise
+                raise RuntimeError("NIXL target returned the wrong agent identity")
+            self._remote_agents[target.host_id] = (
+                target.remote_metadata_b64,
+                remote_agent,
+            )
+            return remote_agent
+        if cached[1] != target.remote_agent:
+            raise RuntimeError("NIXL target returned the wrong agent identity")
+        return cached[1]
 
     def _require_agent(self) -> Any:
         if self._agent is None:
@@ -759,6 +824,8 @@ class AdapterSnapshotSender:
             registered_buffers=0,
             registered_capacity_bytes=0,
             remote_agents=0,
+            poisoned=False,
+            unreleased_handles=0,
             closed=self._closed,
         )
 
