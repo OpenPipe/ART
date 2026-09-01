@@ -273,6 +273,19 @@ class CheckpointRef(Contract):
     checkpoint_id: str = Field(min_length=1, max_length=MAX_CHECKPOINT_REFERENCE_LENGTH)
 
 
+class CheckpointArchiveRef(Contract):
+    checkpoint_id: str = Field(min_length=1, max_length=MAX_CHECKPOINT_REFERENCE_LENGTH)
+    learner_version: int = Field(ge=0)
+    components: tuple[Literal["weights", "optimizer"], ...] = Field(
+        min_length=1, max_length=2
+    )
+    wandb_artifact: str = Field(
+        min_length=5,
+        max_length=768,
+        pattern=r"^[^/:\\\x00-\x1f]+/[^/:\\\x00-\x1f]+/[^/:\\\x00-\x1f]+:v(?:0|[1-9][0-9]*)$",
+    )
+
+
 class ImmutablePublicationRef(Contract):
     locator: str = Field(min_length=1, max_length=MAX_CHECKPOINT_REFERENCE_LENGTH)
     size_bytes: int = Field(gt=0)
@@ -473,6 +486,16 @@ class SamplerWeightsResult(OperationResult):
 class SaveStateResult(OperationResult):
     kind: Literal["save_state"] = "save_state"
     checkpoint: CheckpointRef
+    archive: CheckpointArchiveRef | None = None
+
+    @model_validator(mode="after")
+    def _validate_archive(self) -> "SaveStateResult":
+        if self.archive is not None and (
+            self.archive.checkpoint_id,
+            self.archive.learner_version,
+        ) != (self.checkpoint.checkpoint_id, self.checkpoint.learner_version):
+            raise ValueError("durable archive differs from its checkpoint")
+        return self
 
 
 class LoadStateResult(OperationResult):

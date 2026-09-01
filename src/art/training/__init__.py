@@ -1,6 +1,7 @@
 from .contracts import (
     AdamConfig,
     AdapterSpec,
+    CheckpointArchiveRef,
     CheckpointRef,
     CommandExecutionUsage,
     ExternalLoraReceipt,
@@ -56,6 +57,7 @@ __all__ = [
     "AdamConfig",
     "AdapterSpec",
     "CheckpointRef",
+    "CheckpointArchiveRef",
     "CommandExecutionUsage",
     "CommandAdmission",
     "CommandAdmissionPolicy",
