@@ -6,10 +6,12 @@ import pytest
 from art.serverless.client import (
     NativeOperationStatus,
     NativeTrainingOperation,
+    NativeTrainingResult,
+    NativeTrainingResultRelease,
     NativeTrainingRun,
     TrainingRuns,
 )
-from art.serverless.native_training import RemoteTrainingClient
+from art.serverless.native_training import RemoteTrainingClient, RemoteTrainingError
 from art.training import (
     AdapterSpec,
     ForwardRequest,
@@ -24,6 +26,9 @@ class _TrainingRuns:
     def __init__(self) -> None:
         self.submissions = 0
         self.operations: dict[str, NativeTrainingOperation] = {}
+        self.requests: dict[str, ForwardRequest] = {}
+        self.result_calls = 0
+        self.released: tuple[str, str] | None = None
         self.run: NativeTrainingRun | None = None
 
     async def resolve(self, **kwargs: Any) -> NativeTrainingRun:
@@ -36,7 +41,6 @@ class _TrainingRuns:
                 "dtype": spec.dtype,
                 "lora_rank": spec.adapter.rank,
                 "lora_target_modules": list(spec.adapter.target_modules),
-                "optimizer": "adamw",
             },
             status="open",
             next_sequence_id=0,
@@ -49,6 +53,8 @@ class _TrainingRuns:
         self.submissions += 1
         prior = self.operations.get(request.request_id)
         if prior is not None:
+            if self.requests[prior.operation_id] != request:
+                raise RemoteTrainingError("server rejected divergent command")
             return prior
         operation_id = (
             "operation-native"
@@ -57,6 +63,7 @@ class _TrainingRuns:
         )
         admitted = _operation(request, operation_id=operation_id, status="admitted")
         self.operations[request.request_id] = admitted
+        self.requests[operation_id] = request
         return admitted
 
     async def operation(
@@ -68,11 +75,20 @@ class _TrainingRuns:
             for operation in self.operations.values()
             if operation.operation_id == operation_id
         )
-        request = ForwardRequest.model_validate(admitted.command)
+        request = self.requests[operation_id]
         return _operation(
             request,
             operation_id=operation_id,
             status="succeeded",
+            result_available=True,
+        )
+
+    async def result(self, run_id: str, operation_id: str) -> NativeTrainingResult:
+        assert run_id == "run-native"
+        self.result_calls += 1
+        return NativeTrainingResult(
+            operation_id=operation_id,
+            kind="forward",
             result={
                 "kind": "forward",
                 "operation_id": operation_id,
@@ -86,6 +102,17 @@ class _TrainingRuns:
                     trainable_assistant_tokens=4,
                 ).model_dump(mode="json"),
             },
+        )
+
+    async def release_result(
+        self, run_id: str, operation_id: str, *, request_id: str
+    ) -> NativeTrainingResultRelease:
+        assert run_id == "run-native"
+        self.released = (operation_id, request_id)
+        return NativeTrainingResultRelease(
+            operation_id=operation_id,
+            request_id=request_id,
+            released=True,
         )
 
     async def cancel(self, run_id: str, operation_id: str) -> NativeTrainingOperation:
@@ -118,7 +145,7 @@ def _operation(
     *,
     operation_id: str = "operation-native",
     status: NativeOperationStatus,
-    result: dict[str, Any] | None = None,
+    result_available: bool = False,
 ) -> NativeTrainingOperation:
     return NativeTrainingOperation(
         operation_id=operation_id,
@@ -129,9 +156,6 @@ def _operation(
         status=status,
         learner_parent_version=0,
         reserved_output_learner_version=None,
-        contributing_operation_ids=(),
-        command=request.model_dump(mode="json"),
-        command_digest=f"sha256:{'a' * 64}",
         admitted_at=datetime(2026, 8, 29, tzinfo=UTC),
         execution_started_at=datetime(2026, 8, 29, tzinfo=UTC),
         execution_ended_at=(
@@ -140,8 +164,8 @@ def _operation(
             else None
         ),
         cancel_requested=False,
-        event_cursor=1,
-        result=result,
+        latest_event_cursor=1,
+        result_available=result_available,
         error=None,
     )
 
@@ -169,8 +193,14 @@ async def test_native_client_retains_run_and_terminal_operation_identity() -> No
     assert replay is operation
     assert operation.ref.operation_id == result.operation_id == "operation-native"
     evidence = await client.operation_evidence(operation.ref.operation_id)
-    assert evidence.command_digest == f"sha256:{'a' * 64}"
+    assert evidence.result is not None
+    assert evidence.result["operation_id"] == result.operation_id
+    assert evidence.result["packing"] == result.packing.model_dump(mode="json")
     assert evidence.execution_ended_at is not None
+    released = await operation.release_result(request_id="release-native")
+    assert released.released is True
+    assert service.released == ("operation-native", "release-native")
+    assert service.result_calls == 2
     assert service.submissions == 1
 
 

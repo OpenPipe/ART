@@ -27,6 +27,7 @@ from art.training import (
 
 from .client import (
     NativeTrainingOperation,
+    NativeTrainingResultRelease,
     NativeTrainingRun,
     TrainingRuns,
     request_kind,
@@ -104,6 +105,13 @@ class RemoteTrainingOperation(Generic[ResultT]):
     async def cancel(self) -> NativeTrainingOperation:
         return await self._service.cancel(self._ref.run_id, self._ref.operation_id)
 
+    async def release_result(self, *, request_id: str) -> NativeTrainingResultRelease:
+        return await self._service.release_result(
+            self._ref.run_id,
+            self._ref.operation_id,
+            request_id=request_id,
+        )
+
     async def _wait_terminal(self) -> NativeTrainingOperation:
         while True:
             operation = await self._service.operation(
@@ -112,7 +120,7 @@ class RemoteTrainingOperation(Generic[ResultT]):
             if _operation_ref(operation) != self._ref:
                 raise RemoteTrainingError("remote operation identity changed")
             if operation.status in {"succeeded", "failed", "cancelled"}:
-                return operation
+                return await _with_result(self._service, operation)
             await asyncio.sleep(self._poll_interval_s)
 
 
@@ -177,7 +185,7 @@ class RemoteTrainingClient:
         retained = self._operations_by_id.get(operation_id)
         if retained is not None and _operation_ref(operation) != retained.ref:
             raise RemoteTrainingError("remote operation identity changed")
-        return operation
+        return await _with_result(self._service, operation)
 
     async def forward(
         self, request: ForwardRequest
@@ -232,7 +240,6 @@ class RemoteTrainingClient:
         self, request: RunCommand, result_type: type[ResultT]
     ) -> RemoteTrainingOperation[ResultT]:
         fingerprint = _request_fingerprint(request)
-        command = request.model_dump(mode="json")
         async with self._lock:
             if self._closed:
                 raise RuntimeError("remote training client is closed")
@@ -256,7 +263,6 @@ class RemoteTrainingClient:
                 or ref.sequence_id != request.sequence_id
                 or ref.kind != request_kind(request)
                 or admitted.request_id != request.request_id
-                or admitted.command != command
                 or (
                     not replay
                     and ref.learner_parent_version != self._projected_learner_version
@@ -301,7 +307,11 @@ class RemoteTrainingClient:
 
 
 def _operation_ref(operation: NativeTrainingOperation) -> OperationRef:
-    kind = "save_sampler" if operation.kind == "save_weights" else operation.kind
+    kind = (
+        "save_sampler"
+        if operation.kind == "save_weights_for_sampler"
+        else operation.kind
+    )
     return OperationRef(
         run_id=operation.run_id,
         operation_id=operation.operation_id,
@@ -310,6 +320,20 @@ def _operation_ref(operation: NativeTrainingOperation) -> OperationRef:
         reserved_output_learner_version=(operation.reserved_output_learner_version),
         kind=kind,
     )
+
+
+async def _with_result(
+    service: TrainingRuns, operation: NativeTrainingOperation
+) -> NativeTrainingOperation:
+    if operation.status != "succeeded" or not operation.result_available:
+        return operation
+    envelope = await service.result(operation.run_id, operation.operation_id)
+    if (
+        envelope.operation_id != operation.operation_id
+        or envelope.kind != operation.kind
+    ):
+        raise RemoteTrainingError("operation result identity changed")
+    return operation.model_copy(update={"result": envelope.result})
 
 
 def _request_fingerprint(request: RunCommand) -> str:

@@ -120,12 +120,10 @@ NativeOperationKind = Literal[
     "optim_step",
     "save_state",
     "load_state",
-    "save_weights",
+    "save_weights_for_sampler",
 ]
 NativeOperationStatus = Literal[
     "admitted",
-    "packing",
-    "ready",
     "running",
     "succeeded",
     "failed",
@@ -152,15 +150,13 @@ class NativeTrainingOperation(BaseModel):
     status: NativeOperationStatus
     learner_parent_version: int
     reserved_output_learner_version: int | None
-    contributing_operation_ids: tuple[str, ...]
-    command: dict[str, Any]
-    command_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
     admitted_at: datetime
     execution_started_at: datetime | None
     execution_ended_at: datetime | None
     cancel_requested: bool
-    event_cursor: int
-    result: dict[str, Any] | None
+    latest_event_cursor: int
+    result_available: bool
+    result: dict[str, Any] | None = None
     error: dict[str, Any] | None
 
     @model_validator(mode="after")
@@ -174,6 +170,18 @@ class NativeTrainingOperation(BaseModel):
         if self.execution_ended_at is not None and self.execution_ended_at < lower:
             raise ValueError("operation execution ends before it starts")
         return self
+
+
+class NativeTrainingResult(BaseModel):
+    operation_id: str
+    kind: NativeOperationKind
+    result: dict[str, Any]
+
+
+class NativeTrainingResultRelease(BaseModel):
+    operation_id: str
+    request_id: str
+    released: Literal[True]
 
 
 class Models(AsyncAPIResource):
@@ -329,7 +337,6 @@ class TrainingRuns(AsyncAPIResource):
             "dtype": spec.dtype,
             "lora_rank": spec.adapter.rank,
             "lora_target_modules": list(spec.adapter.target_modules),
-            "optimizer": "adamw",
         }
         run = await self._post(
             "/training/runs:resolve",
@@ -351,11 +358,7 @@ class TrainingRuns(AsyncAPIResource):
         return await self._post(
             f"/training/runs/{request.run_id}/{request_kind_endpoint(request)}",
             cast_to=NativeTrainingOperation,
-            body={
-                "request_id": request.request_id,
-                "sequence_id": request.sequence_id,
-                "command": request.model_dump(mode="json"),
-            },
+            body=request.model_dump(mode="json", exclude={"run_id"}),
         )
 
     async def operation(
@@ -372,6 +375,21 @@ class TrainingRuns(AsyncAPIResource):
             cast_to=NativeTrainingOperation,
         )
 
+    async def result(self, run_id: str, operation_id: str) -> NativeTrainingResult:
+        return await self._get(
+            f"/training/runs/{run_id}/operations/{operation_id}/result",
+            cast_to=NativeTrainingResult,
+        )
+
+    async def release_result(
+        self, run_id: str, operation_id: str, *, request_id: str
+    ) -> NativeTrainingResultRelease:
+        return await self._post(
+            f"/training/runs/{run_id}/operations/{operation_id}/result:release",
+            cast_to=NativeTrainingResultRelease,
+            body={"request_id": request_id},
+        )
+
     async def close(self, run_id: str) -> NativeTrainingRun:
         return await self._post(
             f"/training/runs/{run_id}:close", cast_to=NativeTrainingRun
@@ -382,11 +400,6 @@ def request_kind_endpoint(request: RunCommand) -> str:
     kind = request_kind(request)
     if kind == "save_sampler":
         return "save_weights_for_sampler"
-    if kind == "load_state":
-        assert isinstance(request, LoadStateRequest)
-        return (
-            "load_state_with_optimizer" if request.restore_optimizer else "load_state"
-        )
     return kind
 
 
