@@ -26,6 +26,7 @@ TopKT = TypeVar("TopKT", bound=TopK | None, covariant=True)
 LogitsT = TypeVar("LogitsT", bound=torch.Tensor | None, covariant=True)
 HiddenStatesT = TypeVar("HiddenStatesT", bound=torch.Tensor | None, covariant=True)
 TrainerRankMemoryError = _impl.TrainerRankMemoryError
+TrainerRankRuntimeSupportError = _impl.TrainerRankRuntimeSupportError
 TrainerRankSlotStateError = _impl.TrainerRankSlotStateError
 Unset = _impl.Unset
 MaterializedCheckpoint = _impl.MaterializedCheckpoint
@@ -45,6 +46,7 @@ for _public_type in (
     MicroBatchStats,
     TopK,
     TrainerRankMemoryError,
+    TrainerRankRuntimeSupportError,
     TrainerRankSlotStateError,
     MaterializedCheckpoint,
     PushedCheckpoint,
@@ -54,22 +56,16 @@ del _public_type
 
 
 class TrainerRank(_impl.TrainerRank):
-    def __init__(
-        self,
-        runtime: TrainingRuntime,
-        *,
-        head_chunk_tokens: int = 512,
-        shared_prefix_max_depth: int = 1,
-        memory_safety_factor: float = 1.10,
-        memory_reserve_fraction: float = 0.03,
-    ) -> None:
-        super().__init__(
-            runtime,
-            head_chunk_tokens=head_chunk_tokens,
-            shared_prefix_max_depth=shared_prefix_max_depth,
-            memory_safety_factor=memory_safety_factor,
-            memory_reserve_fraction=memory_reserve_fraction,
-        )
+    """Execute TrainerRank forwards using automatic, data-dependent planning.
+
+    The constructor intentionally accepts only the training runtime. Prefix
+    sharing, internal forward partitioning, output-head chunking, microbatch
+    width, and memory headroom are planner decisions rather than user tuning
+    parameters.
+    """
+
+    def __init__(self, runtime: TrainingRuntime) -> None:
+        super().__init__(runtime)
 
     def zero_grad(self) -> None:
         super().zero_grad()
@@ -369,6 +365,7 @@ __all__ = [
     "TopK",
     "TrainerRank",
     "TrainerRankMemoryError",
+    "TrainerRankRuntimeSupportError",
     "PushedCheckpoint",
     "TrainerRankSlotStateError",
     "Unset",

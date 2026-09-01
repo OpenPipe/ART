@@ -14,10 +14,13 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from copy import deepcopy
 from dataclasses import dataclass, replace
 from dataclasses import field as dataclass_field
+import hashlib
 import math
 import os
 from pathlib import Path
+import struct
 import threading
+import time
 from types import TracebackType
 from typing import (
     TYPE_CHECKING,
@@ -42,8 +45,15 @@ from typing_extensions import TypeIs
 from art.megatron.prefix_tree_packing import (
     PrefixTreePack,
     _local_position_pairs,
-    estimate_prefix_tree_packed_tokens,
-    prefix_tree_pack,
+)
+from art.trainer_rank._planner_cost import COEFFICIENT_VERSION
+from art.trainer_rank._prefix_tree_materializer import materialize_prefix_tree_layout
+from art.trainer_rank._prefix_tree_planner import (
+    CanonicalPrefixTree,
+    PrefixTreeLayout,
+    build_canonical_prefix_tree,
+    prefix_tree_layout_candidates,
+    select_prefix_tree_layout,
 )
 from art.trainer_rank._telemetry import phase as _telemetry_phase
 
@@ -92,6 +102,20 @@ T = TypeVar("T")
 ModuleT = TypeVar("ModuleT", bound=torch.nn.Module)
 
 _MEMORY_PROFILE_TRUST_GROWTH = 8
+
+# Internal calibrated planner policy. These are deliberately not user knobs:
+# prefix sharing, head chunking, and memory margins are planner decisions.
+_MEMORY_SAFETY_FACTOR = 1.10
+_MEMORY_RESERVE_FRACTION = 0.03
+_HEAD_CHUNK_TOKENS = 512
+_PLANNER_REFINEMENT_BUDGET = 2_000
+
+# Test-only layout anchor forcing for paired acceptance measurement. Both
+# variables must be set; the hook is inert in production.
+_TEST_HOOKS_ENV = "ART_TRAINER_RANK_TEST_HOOKS"
+_TEST_ANCHOR_ENV = "ART_TRAINER_RANK_TEST_ANCHOR"
+
+_U64_STRUCT = struct.Struct("<Q")
 _CHECKPOINT_PREFETCH_EXECUTOR: tuple[int, ThreadPoolExecutor] | None = None
 _CHECKPOINT_PREFETCH_EXECUTOR_LOCK = threading.Lock()
 
@@ -461,7 +485,33 @@ class MicroBatchStats:
 
 
 class TrainerRankMemoryError(RuntimeError):
-    pass
+    """Bounded conservative planning could not safely admit this call.
+
+    This is not an infeasibility proof: it means the planner's bounded search
+    and conservative admission margin found no plan predicted to fit. The
+    error reports only what the caller can act on.
+    """
+
+    predicted_peak_bytes: int
+    usable_limit_bytes: int
+    suggestion: str
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        predicted_peak_bytes: int,
+        usable_limit_bytes: int,
+        suggestion: str,
+    ) -> None:
+        super().__init__(message)
+        self.predicted_peak_bytes = predicted_peak_bytes
+        self.usable_limit_bytes = usable_limit_bytes
+        self.suggestion = suggestion
+
+
+class TrainerRankRuntimeSupportError(RuntimeError):
+    """The current topology or runtime capability is not yet supported."""
 
 
 class TrainerRankSlotStateError(RuntimeError):
@@ -769,7 +819,7 @@ type _RowMatch = tuple[torch.Tensor, torch.Tensor, tuple[int, ...]]
 @dataclass(frozen=True)
 class _MemorySignature:
     topology: tuple[int, int, int, int]
-    shared_prefix_max_depth: int
+    planner_coefficients: int
     slot_group_count: int
     request_mix: tuple[str, ...]
     grad_enabled: bool
@@ -797,35 +847,22 @@ class _FlatForwardPlan:
 
 
 class TrainerRank:
-    def __init__(
-        self,
-        runtime: TrainingRuntime,
-        *,
-        head_chunk_tokens: int = 512,
-        shared_prefix_max_depth: int = 1,
-        memory_safety_factor: float = 1.10,
-        memory_reserve_fraction: float = 0.03,
-    ) -> None:
+    def __init__(self, runtime: TrainingRuntime) -> None:
         pp_size = int(getattr(runtime.provider, "pipeline_model_parallel_size", 1) or 1)
         if pp_size > 1 or len(runtime.model) > 1:
-            raise NotImplementedError(
+            raise TrainerRankRuntimeSupportError(
                 "TrainerRank does not use the MCore forward/backward schedule and "
                 "therefore requires PP=1 with exactly one local model chunk; "
                 f"got pp={pp_size}, chunks={len(runtime.model)}"
             )
-        if head_chunk_tokens < 1:
-            raise ValueError("head_chunk_tokens must be >= 1")
-        if shared_prefix_max_depth < 0:
-            raise ValueError("shared_prefix_max_depth must be >= 0")
-        if memory_safety_factor < 1.0:
-            raise ValueError("memory_safety_factor must be >= 1.0")
-        if not (0.0 <= memory_reserve_fraction < 1.0):
-            raise ValueError("memory_reserve_fraction must be in [0, 1)")
+        tp_size = int(getattr(runtime.provider, "tensor_model_parallel_size", 1) or 1)
+        if tp_size > 1:
+            raise TrainerRankRuntimeSupportError(
+                "TrainerRank automatic planning currently requires TP=1: the "
+                "planner's admission model is not yet calibrated for "
+                f"tensor-parallel execution (got tp={tp_size})"
+            )
         self.runtime: TrainingRuntime = runtime
-        self.head_chunk_tokens = head_chunk_tokens
-        self.shared_prefix_max_depth = shared_prefix_max_depth
-        self.memory_safety_factor = memory_safety_factor
-        self.memory_reserve_fraction = memory_reserve_fraction
         self.device = next(runtime.model[0].parameters()).device
         self._param_dtype_size = _dtype_size(next(runtime.model[0].parameters()).dtype)
         try:
@@ -872,6 +909,13 @@ class TrainerRank:
         self._hybridep_rows_high_water = 0
         self._memory_profiles: dict[_MemorySignature, _MemoryProfile] = {}
         self._last_global_micro_batch_size: int | None = None
+        self._layout_selection_cache: dict[
+            tuple[str, int, int, bool, int, str | None],
+            tuple[CanonicalPrefixTree, PrefixTreeLayout],
+        ] = {}
+        self._planning_seconds_accum = 0.0
+        self._planning_depth_max = 0
+        self._last_forward_telemetry_snapshot: dict[str, float | int] | None = None
         self.zero_grad()
 
     def zero_grad(self) -> None:
@@ -1636,6 +1680,7 @@ class TrainerRank:
                 self._forward_item(requests[index])
         start = 0
         while start < len(items):
+            self._reset_planning_telemetry()
             with _telemetry_phase(
                 "plan",
                 {"global_start": start, "global_remaining": len(items) - start},
@@ -1643,6 +1688,7 @@ class TrainerRank:
                 candidate = self._select_next_micro_batch(
                     items, start, checkpoint=checkpoint
                 )
+            self._snapshot_planning_telemetry()
             tracked_outputs, memory_baseline = self._run_flat_plan_with_memory_tracking(
                 candidate.plan,
                 context="forward_micro_batches",
@@ -1749,6 +1795,7 @@ class TrainerRank:
     ) -> ForwardOutputs:
         enabled = torch.is_grad_enabled() if no_grad is None else not no_grad
         with torch.set_grad_enabled(enabled):
+            self._reset_planning_telemetry()
             materialized = _materialize(inputs)
             plan = self._plan_flat_forward(
                 list(_flatten(materialized)), checkpoint=checkpoint
@@ -1761,6 +1808,7 @@ class TrainerRank:
                     context="dp_rank_forward",
                     message="forward is predicted to exceed available memory",
                 )
+            self._snapshot_planning_telemetry()
             tracked_outputs, _memory_baseline = (
                 self._run_flat_plan_with_memory_tracking(
                     plan,
@@ -1769,6 +1817,23 @@ class TrainerRank:
             )
             outputs = iter(tracked_outputs)
             return _unflatten(materialized, outputs)
+
+    def _reset_planning_telemetry(self) -> None:
+        self._planning_seconds_accum = 0.0
+        self._planning_depth_max = 0
+
+    def _snapshot_planning_telemetry(self) -> None:
+        self._last_forward_telemetry_snapshot = {
+            "planning_ms": self._planning_seconds_accum * 1_000.0,
+            "selected_max_depth": self._planning_depth_max,
+        }
+
+    def last_forward_telemetry(self) -> dict[str, float | int]:
+        """Concise planner telemetry for the most recent public forward."""
+
+        if self._last_forward_telemetry_snapshot is None:
+            raise RuntimeError("no forward has completed planning yet")
+        return dict(self._last_forward_telemetry_snapshot)
 
     def dp_reduce(
         self,
@@ -2595,6 +2660,76 @@ class TrainerRank:
         except (AssertionError, ImportError, RuntimeError, ValueError):
             return 0, 1
 
+    def _forced_test_anchor(self) -> str | None:
+        if os.environ.get(_TEST_HOOKS_ENV) != "1":
+            return None
+        return os.environ.get(_TEST_ANCHOR_ENV) or None
+
+    def _planner_topology_facts(self) -> tuple[int, int, bool]:
+        cp_size = self._topology_key()[2]
+        uses_gdn = bool(
+            getattr(
+                self.runtime.model_support_handler, "build_gdn_execution_spec", False
+            )
+        )
+        return cp_size, self._num_layers, uses_gdn
+
+    def _select_group_layout(
+        self,
+        input_ids: Sequence[torch.Tensor],
+    ) -> tuple[CanonicalPrefixTree, PrefixTreeLayout]:
+        """Select one group's prefix-sharing layout, cached by content identity.
+
+        The cache key is a raw-bytes content hash plus the topology, cost
+        coefficients, and (test-only) forced anchor, so identical steady-state
+        groups skip canonicalization and search entirely.
+        """
+
+        started = time.perf_counter()
+        cp_size, layers, uses_gdn = self._planner_topology_facts()
+        anchor = self._forced_test_anchor()
+        hasher = hashlib.sha256()
+        for tensor in input_ids:
+            row = tensor.detach().reshape(-1).cpu().contiguous()
+            hasher.update(_U64_STRUCT.pack(int(row.numel())))
+            hasher.update(row.numpy().tobytes())
+        key = (
+            hasher.hexdigest(),
+            cp_size,
+            layers,
+            uses_gdn,
+            COEFFICIENT_VERSION,
+            anchor,
+        )
+        cached = self._layout_selection_cache.get(key)
+        if cached is None:
+            tree = build_canonical_prefix_tree(
+                tuple(tuple(tensor.reshape(-1).tolist()) for tensor in input_ids)
+            )
+            if anchor is not None:
+                candidates = prefix_tree_layout_candidates(tree)
+                matching = [
+                    candidate for candidate in candidates if anchor in candidate.labels
+                ]
+                if len(matching) != 1:
+                    raise ValueError(f"unknown forced test anchor {anchor!r}")
+                layout = matching[0].layout
+            else:
+                layout = select_prefix_tree_layout(
+                    tree,
+                    cp_size=cp_size,
+                    layers=layers,
+                    uses_gdn=uses_gdn,
+                    refinement_work_budget=_PLANNER_REFINEMENT_BUDGET,
+                ).layout
+            cached = (tree, layout)
+            self._layout_selection_cache[key] = cached
+        self._planning_seconds_accum += time.perf_counter() - started
+        self._planning_depth_max = max(
+            self._planning_depth_max, cached[1].maximum_depth
+        )
+        return cached
+
     def _plan_flat_forward(
         self,
         requests: Sequence[AnyForwardInput],
@@ -2609,10 +2744,14 @@ class TrainerRank:
             items = tuple(
                 self._forward_item(requests[index]) for index in group_indices
             )
-            packed = prefix_tree_pack(
-                (item.input_ids for item in items),
-                max_depth=self.shared_prefix_max_depth,
+            tree, layout = self._select_group_layout(
+                tuple(item.input_ids for item in items)
             )
+            started = time.perf_counter()
+            packed = materialize_prefix_tree_layout(
+                tuple(item.input_ids for item in items), tree, layout
+            )
+            self._planning_seconds_accum += time.perf_counter() - started
             plans.append(
                 _ForwardGroupPlan(
                     slot_ref=slot_ref,
@@ -2649,13 +2788,13 @@ class TrainerRank:
         groups = self._group_active_request_indices(requests, checkpoint=checkpoint)
         packed_tokens = 0
         for _, group_indices in groups:
-            group_packed_tokens = estimate_prefix_tree_packed_tokens(
-                (requests[index].input_tokens.reshape(-1) for index in group_indices),
-                max_depth=self.shared_prefix_max_depth,
+            _, layout = self._select_group_layout(
+                tuple(
+                    requests[index].input_tokens.reshape(-1).to(dtype=torch.long)
+                    for index in group_indices
+                )
             )
-            if group_packed_tokens is None:
-                return None
-            packed_tokens += group_packed_tokens
+            packed_tokens += layout.packed_tokens
 
         return (
             packed_tokens,
@@ -2759,7 +2898,7 @@ class TrainerRank:
     def _telemetry_plan_signature(plan: _FlatForwardPlan) -> dict[str, object]:
         return {
             "topology": plan.signature.topology,
-            "shared_prefix_max_depth": plan.signature.shared_prefix_max_depth,
+            "planner_coefficients": plan.signature.planner_coefficients,
             "slot_group_count": plan.signature.slot_group_count,
             "request_mix": plan.signature.request_mix,
             "grad_enabled": plan.signature.grad_enabled,
@@ -3022,7 +3161,7 @@ class TrainerRank:
         modes = tuple(sorted(grad_modes))
         return _MemorySignature(
             topology=self._topology_key(),
-            shared_prefix_max_depth=self.shared_prefix_max_depth,
+            planner_coefficients=COEFFICIENT_VERSION,
             slot_group_count=slot_group_count,
             request_mix=tuple(
                 sorted({_request_mix_key(request) for request in requests})
@@ -3099,15 +3238,20 @@ class TrainerRank:
         context: str,
         message: str,
     ) -> None:
+        suggestion = (
+            "Use smaller top-level items, reduce output requests, or call "
+            "dp_rank_forward with already-DP-local smaller inputs."
+        )
         raise TrainerRankMemoryError(
             f"{context}: {message}. "
             f"packed_tokens={plan.packed_tokens} "
             f"logical_tokens={plan.logical_tokens} "
-            f"output_gb={plan.output_bytes / 1024**3:.3f} "
-            f"estimated_required_gb={check.estimated_required_bytes / 1024**3:.3f} "
-            f"available_gb={check.available_bytes / 1024**3:.3f}. "
-            "Use smaller top-level items, reduce output requests, or call "
-            "dp_rank_forward with already-DP-local smaller inputs."
+            f"predicted_peak_gb={check.estimated_required_bytes / 1024**3:.3f} "
+            f"usable_limit_gb={check.available_bytes / 1024**3:.3f}. "
+            f"{suggestion}",
+            predicted_peak_bytes=check.estimated_required_bytes,
+            usable_limit_bytes=check.available_bytes,
+            suggestion=suggestion,
         )
 
     def _estimate_required_memory_bytes_from_values(
@@ -3134,7 +3278,7 @@ class TrainerRank:
             compute = static_compute
         else:
             compute = max(static_compute, int(profiled.bytes_per_token * packed_tokens))
-        return int((output_bytes + compute) * self.memory_safety_factor)
+        return int((output_bytes + compute) * _MEMORY_SAFETY_FACTOR)
 
     def _available_memory_bytes(self) -> int:
         if not (torch.cuda.is_available() and self.device.type == "cuda"):
@@ -3143,7 +3287,7 @@ class TrainerRank:
         allocated = int(torch.cuda.memory_allocated(self.device))
         reserved = int(torch.cuda.memory_reserved(self.device))
         reusable_reserved = max(0, reserved - allocated)
-        reserve = int(total * self.memory_reserve_fraction)
+        reserve = int(total * _MEMORY_RESERVE_FRACTION)
         return max(0, int(free) + reusable_reserved - reserve)
 
     def _all_ranks_have_memory_profile(
@@ -3343,7 +3487,7 @@ class TrainerRank:
                 _row_match(
                     positions.cpu(),
                     rows_cpu,
-                    chunk_tokens=self.head_chunk_tokens,
+                    chunk_tokens=_HEAD_CHUNK_TOKENS,
                 )
                 for positions in prepared.positions_by_item
             )
@@ -3368,7 +3512,7 @@ class TrainerRank:
                 logit_bounds=_chunk_boundaries(
                     logit_rows_cpu,
                     end=int(row_tensor.numel()),
-                    chunk_tokens=self.head_chunk_tokens,
+                    chunk_tokens=_HEAD_CHUNK_TOKENS,
                 ),
                 output_weight=output_weight,
                 target_logprobs=target_logprobs,
@@ -3419,9 +3563,9 @@ class TrainerRank:
             item.labels is not None or item.request.top_k is not None for item in items
         )
         for chunk_index, start in enumerate(
-            range(0, int(rows.numel()), self.head_chunk_tokens)
+            range(0, int(rows.numel()), _HEAD_CHUNK_TOKENS)
         ):
-            chunk_rows = rows[start : start + self.head_chunk_tokens]
+            chunk_rows = rows[start : start + _HEAD_CHUNK_TOKENS]
             local_logits = self._local_logits_from_hidden_rows(
                 model,
                 _select_positions(hidden_by_row, chunk_rows),

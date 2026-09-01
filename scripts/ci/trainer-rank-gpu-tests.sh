@@ -25,6 +25,5 @@ ART_MEGATRON_CONTEXT_PARALLEL_SIZE=2 \
     dev/trainer_rank_check.py \
     --model Qwen/Qwen3-0.6B \
     --layers 1 \
-    --depths 0,4 \
-    --chunks 17,8192 \
+    --anchors no_sharing,full_sharing \
     --slots 2

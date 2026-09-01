@@ -495,11 +495,18 @@ def test_forward_input_preserves_public_runtime_shape() -> None:
     assert ForwardInput.__match_args__ == fields
 
 
-@pytest.mark.parametrize("depth", (0, 2))
-def test_trainer_rank_accepts_shared_prefix_depth(depth: int) -> None:
-    trainer = TrainerRank(_runtime(), shared_prefix_max_depth=depth)
-
-    assert trainer.shared_prefix_max_depth == depth
+@pytest.mark.parametrize(
+    "knob",
+    (
+        "shared_prefix_max_depth",
+        "head_chunk_tokens",
+        "memory_safety_factor",
+        "memory_reserve_fraction",
+    ),
+)
+def test_trainer_rank_rejects_removed_planner_knobs(knob: str) -> None:
+    with pytest.raises(TypeError):
+        TrainerRank(_runtime(), **{knob: 1})
 
 
 @pytest.mark.skipif(find_spec("megatron") is None, reason="requires Megatron")
