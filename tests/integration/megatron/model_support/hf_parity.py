@@ -119,9 +119,9 @@ def _hf_parity_phase_pass_fns_for_case(
         case_config.base_model,
         allow_unvalidated_arch=case_config.allow_unvalidated_arch,
     )
-    return handler.correctness_phase_pass_fns(sys.modules[__name__]) or (
-        _hf_parity_phase_pass_fns()
-    )
+    from .correctness_policy import phase_pass_fns
+
+    return phase_pass_fns(handler, sys.modules[__name__]) or _hf_parity_phase_pass_fns()
 
 
 def hf_parity_case_config(case_config: OracleCaseConfig) -> OracleCaseConfig:

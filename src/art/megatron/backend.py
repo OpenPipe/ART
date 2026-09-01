@@ -33,7 +33,7 @@ from ..utils.output_dirs import get_model_dir, get_step_checkpoint_dir
 from ..vllm_route_transport import RouteBundleReader, unique_retained_route_bundles
 from ..vllm_runtime import get_external_vllm_runtime_config
 from .migrations import apply_megatron_migrations
-from .runtime.specs import ResidentLoraInspectionResult, ResidentScoreResult
+from .runtime.specs import ResidentLoraInspectionResult
 from .runtime_config import get_megatron_runtime_config
 
 if TYPE_CHECKING:
@@ -1336,119 +1336,6 @@ class MegatronBackend(LocalBackend):
         return await service.inspect_resident_lora(
             expected_learner_version=expected_learner_version
         )
-
-    async def score_resident(
-        self,
-        model: AnyTrainableModel,
-        trajectory_groups: Iterable[TrajectoryGroup],
-        *,
-        expected_learner_version: int,
-        top_k: int = 20,
-        grad_accumulation_sequences: int | None = None,
-    ) -> ResidentScoreResult:
-        if self._training_binding is not None:
-            raise RuntimeError(
-                "resident scoring has no slot-owned diagnostic command boundary"
-            )
-        groups = list(trajectory_groups)
-        if not groups or not any(group.trajectories for group in groups):
-            raise ValueError("resident scoring requires at least one trajectory")
-        stale = [
-            (group_index, trajectory_index, initial, final)
-            for group_index, group in enumerate(groups)
-            for trajectory_index, trajectory in enumerate(group.trajectories)
-            for initial, final in (
-                (
-                    trajectory.initial_policy_version,
-                    trajectory.final_policy_version,
-                ),
-            )
-            if initial != expected_learner_version or final != expected_learner_version
-        ]
-        if stale:
-            raise ValueError(
-                "resident score trajectories must have exact initial/final learner "
-                f"provenance {expected_learner_version}; mismatches={stale[:8]}"
-            )
-
-        include_moe_routing = self._model_uses_expert_replay(model)
-        dev_config = {
-            "advantage_balance": 0.0,
-            "allow_training_without_logprobs": False,
-            "scale_rewards": True,
-            "plot_tensors": False,
-            "packed_sequence_length": (
-                get_megatron_runtime_config().packed_sequence_length
-            ),
-            "logprob_calculation_chunk_size": 1024,
-        }
-        batch = await self._prepare_training_batch(
-            model,
-            groups,
-            dev_config,
-            include_moe_routing=include_moe_routing,
-        )
-        if batch is None:
-            raise RuntimeError("resident scoring produced no packed batch")
-
-        try:
-            from ..distributed.art_runtime import DistributedPackedBatch
-            from .distributed_service import DistributedMegatronService
-
-            payload = batch.payload
-            if not isinstance(payload, _DistributedBatchPayload):
-                raise RuntimeError("resident scoring did not use the typed data plane")
-            distributed_batch = cast(DistributedPackedBatch, payload.packed)
-            service = cast(
-                DistributedMegatronService,
-                await self._get_service(model),
-            )
-            accumulation = await service.resolve_global_grad_accumulation_sequences(
-                types.TrainConfig(
-                    grad_accumulation_sequences=grad_accumulation_sequences
-                )
-            )
-            return await service.score_resident_packed(
-                distributed_batch,
-                expected_learner_version=expected_learner_version,
-                global_grad_accumulation_sequences=accumulation,
-                top_k=top_k,
-            )
-        finally:
-            primary = sys.exception()
-            paths = {
-                group._prepared_log_path
-                for group in groups
-                if group._prepared_log_path is not None
-            }
-            try:
-                results = await asyncio.gather(
-                    self._release_distributed_batch(
-                        batch,
-                        disposition="discarded",
-                    ),
-                    *(
-                        asyncio.to_thread(Path(path).unlink, missing_ok=True)
-                        for path in paths
-                    ),
-                    return_exceptions=True,
-                )
-                for group in groups:
-                    group._prepared_log_path = None
-                failures = [
-                    result for result in results if isinstance(result, BaseException)
-                ]
-                if failures:
-                    raise BaseExceptionGroup(
-                        "resident score batch release failed", failures
-                    )
-            except BaseException as cleanup_error:
-                if primary is None:
-                    raise
-                raise BaseExceptionGroup(
-                    "resident score and batch release failed",
-                    [primary, cleanup_error],
-                ) from None
 
     def _supports_concurrent_training_and_inference(
         self, model: AnyTrainableModel

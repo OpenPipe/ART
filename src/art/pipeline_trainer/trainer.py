@@ -16,7 +16,6 @@ import time
 from typing import (
     Any,
     AsyncIterator,
-    Callable,
     Generic,
     Iterable,
     Sequence,
@@ -361,9 +360,6 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
         self._checkpoint_log_tasks: set[asyncio.Task[None]] = set()
         self._checkpoint_log_failure: BaseException | None = None
         self._post_train_tasks: set[asyncio.Task[None]] = set()
-        self._pre_next_dispatch_hooks: dict[
-            int, list[Callable[[int], Awaitable[None] | None]]
-        ] = {}
 
         self.state = PipelineState()
         self._stop_event = asyncio.Event()
@@ -694,20 +690,6 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                     _ResizableAsyncQueue[TrajectoryGroup | None], self._output_queue
                 ).resize(self.queue_maxsize)
         self._status._num_workers = self.num_rollout_workers
-
-    def add_pre_next_dispatch_hook(
-        self,
-        after_step: int,
-        hook: Callable[[int], Awaitable[None] | None],
-    ) -> None:
-        """Run a one-shot hook after a step settles and before the next is prepared."""
-        if after_step < 1:
-            raise ValueError("after_step must be positive")
-        if after_step <= self.state.next_training_step:
-            raise ValueError(
-                "pre-next-dispatch hooks must be registered before the step"
-            )
-        self._pre_next_dispatch_hooks.setdefault(after_step, []).append(hook)
 
     async def _start_attachments(self) -> None:
         for attachment in self._attachments:
@@ -1200,9 +1182,6 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                 return
             await self._packed_queue.put(item)
             next_packing_policy_step = packing_policy_step + 1
-            fence_step = min(self._pre_next_dispatch_hooks, default=None)
-            if fence_step is not None and fence_step <= packing_policy_step + 1:
-                await item.handoff.wait()
             if not self._accept_prepared_batches:
                 return
             if saw_sentinel:
@@ -1285,11 +1264,6 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
             await self._schedule_eval_step(item.current_step)
         self._persist_state(item.current_step)
         phases["persistence"] = time.monotonic() - started
-
-        for hook in self._pre_next_dispatch_hooks.pop(item.current_step, ()):
-            result = hook(item.current_step)
-            if inspect.isawaitable(result):
-                await result
 
         if os.getenv("ART_TRAIN_STEP_LOG"):
             summary = " ".join(
@@ -1408,16 +1382,11 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                 training_policy_step, batch
             )
             expected_step = current_step + 1
-            fence_next_dispatch = expected_step in self._pre_next_dispatch_hooks
             should_eval_step = self._should_eval_step(expected_step)
             should_checkpoint = self.save_checkpoint and should_eval_step
 
             self.state.next_training_step = expected_step
-            if (
-                self._packed_queue is not None
-                and not fence_next_dispatch
-                and command_context is None
-            ):
+            if self._packed_queue is not None and command_context is None:
                 prepared.handoff.set()
 
             self._status.note_training_start(len(batch))
@@ -1434,7 +1403,7 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                 if command_context is not None:
                     result = await command_context.complete(
                         post_train_dispatch,
-                        None if fence_next_dispatch else prepared.handoff,
+                        prepared.handoff,
                     )
                 else:
                     if post_train_dispatch is not None:
@@ -1466,8 +1435,6 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                         await self._discard_collected_group(group)
                 self._status.note_training_end()
                 await self._await_post_train(post_train_task)
-                if fence_next_dispatch and self._packed_queue is not None:
-                    prepared.handoff.set()
                 raise
             finally:
                 train_call_elapsed = time.monotonic() - train_call_start
@@ -1565,16 +1532,6 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                 name=f"post_train_step_{current_step}",
             )
             self._post_train_tasks.add(post_train_task)
-
-            if fence_next_dispatch:
-                post_train_dispatch.set()
-                try:
-                    await self._await_post_train(post_train_task)
-                finally:
-                    if self._packed_queue is not None:
-                        prepared.handoff.set()
-                post_train_task = None
-                post_train_dispatch = None
 
             if saw_sentinel:
                 stop_after_batch = True

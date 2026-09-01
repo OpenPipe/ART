@@ -43,8 +43,6 @@ from .specs import (
     OptimizerJobSpec,
     ResidentLoraInspectionShard,
     ResidentLoraInspectionSpec,
-    ResidentScoreJobSpec,
-    ResidentScoreShard,
     SftForwardBackwardJobSpec,
     SftForwardJobSpec,
     SFTJobSpec,
@@ -58,9 +56,6 @@ from .trainer_run import EventSink
 if TYPE_CHECKING:
     from art.megatron.lora import LoRASlotRef
     from art.megatron.optimizer_state import OptimizerAdapter
-    from art.megatron.runtime.numerical_capture import (
-        ForwardBackwardNumericalRankReceipt,
-    )
     from art.megatron.runtime.portable_snapshot import (
         PortableSnapshotArchive,
         PortableSnapshotRankReceipt,
@@ -457,17 +452,6 @@ class MegatronTrainJobExecutor:
             "python_gc_frozen_objects": float(gc.get_freeze_count()),
         }
 
-    def score(
-        self,
-        job: ResidentScoreJobSpec,
-        batch: InMemoryPackedBatch,
-    ) -> ResidentScoreShard:
-        self._validate_resident_score(job.run_id, job.learner)
-        validate_packed_batch(batch)
-        from art.megatron.train import execute_megatron_score_job
-
-        return execute_megatron_score_job(self.runtime, job, batch.tensors)
-
     def inspect_resident_lora(
         self,
         request: ResidentLoraInspectionSpec,
@@ -516,19 +500,6 @@ class MegatronTrainJobExecutor:
             raise RuntimeError("Megatron executor is closed")
         self._require_no_open_gradients()
         self._publisher.raise_if_failed()
-
-    def _validate_resident_score(self, run_id: str, learner: TrainerGeneration) -> None:
-        self._validate_diagnostic_runtime()
-        runtime = self.runtime
-        if (
-            runtime.resident_run_id != run_id
-            or runtime.resident_training_session_id != learner.training_session_id
-            or runtime.resident_policy_step != learner.policy_step
-            or runtime.resident_generation_id != learner.generation_id
-            or not runtime.optimizer_state_loaded
-            or runtime.optimizer is None
-        ):
-            raise RuntimeError("resident trainer state does not match score learner")
 
     def _validate_resident_inspection(
         self, run_id: str, learner: TrainerGeneration
@@ -1623,39 +1594,6 @@ class MCoreRunSlotExecutor:
             result.new_logprobs if job.return_token_logprobs else (),
             _sft_token_logprobs,
         )
-
-    def capture_forward_backward_numerics(
-        self,
-        *,
-        run_id: str,
-        operation_id: str,
-        batch: InMemoryPackedBatch,
-        token_logprobs: tuple[TokenLogprobs, ...],
-        root: str,
-    ) -> "ForwardBackwardNumericalRankReceipt":
-        """Persist exact rank-local evidence for an open F/B contribution."""
-
-        state = self._runs.get(run_id)
-        if state is None:
-            raise KeyError(f"trainer command run {run_id!r} is absent")
-        contribution_ids = state.gradients.contribution_ids
-        if not contribution_ids or contribution_ids[-1] != operation_id:
-            raise RuntimeError("numerical capture is not the open F/B suffix")
-        validate_packed_batch(batch)
-        from .numerical_capture import capture_forward_backward_rank
-
-        with self._maintenance_resident(state, ("accumulator",)):
-            gradients = state.gradients.snapshot_local_sums().gradients
-            return capture_forward_backward_rank(
-                root=root,
-                run_id=run_id,
-                operation_id=operation_id,
-                contribution_ids=contribution_ids,
-                rank=int(self.runtime.rank),
-                packed_tensors=batch.tensors,
-                token_logprobs=token_logprobs,
-                gradients=gradients,
-            )
 
     def execute_optimizer(self, job: OptimizerJobSpec) -> dict[str, Any]:
         state = self._require_parent(job)

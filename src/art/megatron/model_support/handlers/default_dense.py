@@ -169,16 +169,6 @@ class DefaultDenseHandler:
         del model_chunks
         return state
 
-    def correctness_precision(self) -> Literal["bf16", "fp32"]:
-        return "fp32"
-
-    def correctness_use_fp32_lora_reference(self) -> bool:
-        return True
-
-    def correctness_phase_pass_fns(self, oracle_harness: Any) -> dict[str, Any] | None:
-        del oracle_harness
-        return None
-
     def to_vllm_lora_tensors(
         self,
         tensors: dict[str, torch.Tensor],

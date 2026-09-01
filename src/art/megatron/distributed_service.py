@@ -80,8 +80,6 @@ from .runtime.specs import (
     OptimizerJobSpec,
     ResidentLoraInspectionResult,
     ResidentLoraInspectionSpec,
-    ResidentScoreJobSpec,
-    ResidentScoreResult,
     SftForwardBackwardJobSpec,
     TrainAccepted,
     TrainCancelled,
@@ -1447,29 +1445,6 @@ class DistributedMegatronService:
         step = await asyncio.shield(admitted)
         return _PipelineOptimizerLaunch(step=step, completion=completion)
 
-    def _require_resident_score_locked(
-        self,
-        expected_learner_version: int,
-    ) -> tuple[Any, TrainerGeneration]:
-        self._require_open()
-        self._raise_publication_failure()
-        source = self._learner_generation
-        trainer = self._resident_trainer_for_generation(source) if source else None
-        if expected_learner_version != self._latest_step:
-            raise ValueError(
-                "resident diagnostic learner version mismatch: "
-                f"request={expected_learner_version}, current={self._latest_step}"
-            )
-        if (
-            source is None
-            or source.policy_step != expected_learner_version
-            or trainer is None
-        ):
-            raise RuntimeError(
-                "resident scoring requires the exact hydrated warm trainer generation"
-            )
-        return trainer, source
-
     def _require_resident_inspection_locked(
         self,
         expected_learner_version: int,
@@ -1495,64 +1470,6 @@ class DistributedMegatronService:
                 "resident inspection requires the exact current warm trainer run"
             )
         return trainer, source
-
-    async def score_resident_packed(
-        self,
-        batch: DistributedPackedBatch,
-        *,
-        expected_learner_version: int,
-        global_grad_accumulation_sequences: int,
-        top_k: int = 20,
-    ) -> ResidentScoreResult:
-        await self._await_trainer_preparation()
-        async with self._train_lock:
-            async with self._mutation_lock:
-                trainer, source = self._require_resident_score_locked(
-                    expected_learner_version
-                )
-                job = ResidentScoreJobSpec(
-                    job_id=uuid.uuid4().hex,
-                    run_id=trainer.run_spec.run_id,
-                    learner=source,
-                    batch=batch.leases.ref,
-                    global_grad_accumulation_sequences=(
-                        global_grad_accumulation_sequences
-                    ),
-                    top_k=top_k,
-                )
-
-            try:
-                if self._temporal_gpu_sharing and self._base_url is not None:
-                    serving = self._serving_futures.get(expected_learner_version)
-                    if serving is not None:
-                        await asyncio.shield(serving)
-                    async with self._serving_lock:
-                        await self._sleep_for_training_locked()
-                async with self._trainer_failure_boundary():
-                    result = await trainer.score(job, batch.leases)
-                    async with self._mutation_lock:
-                        current_trainer, current_source = (
-                            self._require_resident_score_locked(
-                                expected_learner_version
-                            )
-                        )
-                        if current_trainer is not trainer or current_source != source:
-                            raise RuntimeError(
-                                "resident learner generation changed during scoring"
-                            )
-                    if result.learner != source:
-                        raise RuntimeError(
-                            "resident score returned a different learner generation"
-                        )
-                    if result.expected_score_count != batch.loss_bearing_tokens:
-                        raise RuntimeError(
-                            "resident score target coverage differs from packed data"
-                        )
-                    return result
-            finally:
-                if self._temporal_gpu_sharing and self._vllm_sleeping:
-                    async with self._serving_lock:
-                        await self._wake_for_serving_locked()
 
     async def inspect_resident_lora(
         self,

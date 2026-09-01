@@ -683,7 +683,9 @@ def _run_packing_invariance_worker(
         allow_unvalidated_arch=allow_unvalidated_arch,
     )
     handler = get_model_support_handler_for_spec(spec)
-    precision = handler.correctness_precision()
+    from .correctness_policy import precision as correctness_precision
+
+    precision = correctness_precision(handler)
     mean_abs_pct_limit = _LOGITS_MEAN_ABS_PCT_LIMITS[precision]
     report = PackingInvarianceReport(
         git=git,
@@ -907,7 +909,9 @@ def run_packing_invariance(
         allow_unvalidated_arch=allow_unvalidated_arch,
     )
     handler = get_model_support_handler_for_spec(spec)
-    dtype = _dtype_for_precision(handler.correctness_precision())
+    from .correctness_policy import precision
+
+    dtype = _dtype_for_precision(precision(handler))
     resolved_num_layers = (
         max(
             1,

@@ -48,11 +48,6 @@ from art.utils.lifecycle import (
 
 from .data_plane import InMemoryPackedBatch, SFTBatchData
 from .l4_hydration import RankL4HydrationService, raise_l4_hydration_failures
-from .numerical_capture import (
-    ForwardBackwardNumericalCaptureReceipt,
-    ForwardBackwardNumericalRankReceipt,
-    build_forward_backward_capture,
-)
 from .portable_snapshot import (
     PortableSnapshotArchive,
     PortableSnapshotExportReceipt,
@@ -87,9 +82,6 @@ from .specs import (
     ResidentLoraInspectionShard,
     ResidentLoraInspectionSpec,
     ResidentLoraRankSummary,
-    ResidentScoreJobSpec,
-    ResidentScoreResult,
-    ResidentScoreShard,
     SftForwardBackwardJobSpec,
     SftForwardJobSpec,
     SFTJobSpec,
@@ -1254,34 +1246,6 @@ class MonarchTrainerActor(Actor):
             if opened_job:
                 self._weight_offload.after_job()
 
-    @endpoint
-    def capture_forward_backward_numerics(
-        self,
-        run_id: str,
-        operation_id: str,
-        batch_json: str,
-        token_logprobs_json: tuple[str, ...],
-        root: str,
-    ) -> dict[str, Any]:
-        if not self._valid:
-            raise RuntimeError("trainer actor runtime is invalid")
-        leases = PackedBatchLeaseSet.model_validate_json(batch_json)
-        batch = InMemoryPackedBatch.open(leases.ref, leases.host_refs[self._host_id])
-        try:
-            receipt = self._run_slot_executor.capture_forward_backward_numerics(
-                run_id=run_id,
-                operation_id=operation_id,
-                batch=batch,
-                token_logprobs=tuple(
-                    TokenLogprobs.model_validate_json(value)
-                    for value in token_logprobs_json
-                ),
-                root=root,
-            )
-            return receipt.model_dump(mode="json")
-        finally:
-            batch.close()
-
     @endpoint(explicit_response_port=True)
     def execute_forward(
         self,
@@ -1482,25 +1446,6 @@ class MonarchTrainerActor(Actor):
                 }
             )
             raise
-
-    @endpoint
-    def score(self, job_json: str, batch_json: str) -> dict[str, Any]:
-        batch = None
-        try:
-            if not self._valid:
-                raise RuntimeError("trainer actor runtime is invalid")
-            job = ResidentScoreJobSpec.model_validate_json(job_json)
-            leases = PackedBatchLeaseSet.model_validate_json(batch_json)
-            batch = InMemoryPackedBatch.open(job.batch, leases.host_refs[self._host_id])
-            with self._weight_offload.job():
-                result = self._executor.score(job, batch)
-            return result.model_dump(mode="json")
-        except BaseException:
-            self._valid = False
-            raise
-        finally:
-            if batch is not None:
-                batch.close()
 
     @endpoint
     def inspect_resident_lora(self, request_json: str) -> dict[str, Any]:
@@ -1748,68 +1693,6 @@ class _PublicationState:
         self.outcome_observed = False
 
 
-def _merge_resident_score_shards(
-    shards: tuple[ResidentScoreShard, ...],
-    *,
-    job: ResidentScoreJobSpec,
-    world_size: int,
-) -> ResidentScoreResult:
-    by_rank = {shard.rank: shard for shard in shards}
-    expected_ranks = set(range(world_size))
-    if len(by_rank) != len(shards) or set(by_rank) != expected_ranks:
-        raise RuntimeError("resident score did not return exactly one shard per rank")
-    ordered = tuple(by_rank[rank] for rank in range(world_size))
-    first = ordered[0]
-    for shard in ordered:
-        if (
-            shard.job_id != job.job_id
-            or shard.run_id != job.run_id
-            or shard.learner != job.learner
-            or shard.batch_id != job.batch.batch_id
-            or shard.batch_fingerprint != first.batch_fingerprint
-            or shard.top_k != job.top_k
-            or shard.expected_score_count != first.expected_score_count
-            or shard.routing_replay_packed_tokens != first.routing_replay_packed_tokens
-        ):
-            raise RuntimeError("resident score rank shards disagree on provenance")
-    expected_replay_tokens = (
-        0
-        if job.batch.moe_routing_replay is None
-        else job.batch.moe_routing_replay.packed_tokens
-    )
-    if first.routing_replay_packed_tokens != expected_replay_tokens:
-        raise RuntimeError("resident score routing replay does not match packed data")
-
-    scores: dict[tuple[int, int], Any] = {}
-    for shard in ordered:
-        for score in shard.scores:
-            key = score.sample_index, score.logit_index
-            previous = scores.get(key)
-            if previous is not None and previous != score:
-                raise RuntimeError(
-                    f"resident score replicas disagree at coordinate {key}"
-                )
-            scores[key] = score
-    merged = tuple(scores[key] for key in sorted(scores))
-    if len(merged) != first.expected_score_count:
-        raise RuntimeError(
-            "resident score did not cover every packed target: "
-            f"expected={first.expected_score_count}, got={len(merged)}"
-        )
-    return ResidentScoreResult(
-        job_id=job.job_id,
-        run_id=job.run_id,
-        learner=job.learner,
-        batch_id=job.batch.batch_id,
-        batch_fingerprint=first.batch_fingerprint,
-        ranks=tuple(range(world_size)),
-        top_k=job.top_k,
-        expected_score_count=first.expected_score_count,
-        routing_replay_packed_tokens=first.routing_replay_packed_tokens,
-        scores=merged,
-    )
-
-
 def _merge_resident_lora_shards(
     shards: tuple[ResidentLoraInspectionShard, ...],
     *,
@@ -1976,9 +1859,6 @@ class MonarchTrainerRun:
         self._checkpoint_load_preparations: dict[
             str, tuple[str, OperationRef, PortableSnapshotLoadReceipt]
         ] = {}
-        self._numerical_captures: dict[
-            str, tuple[tuple[str, str], ForwardBackwardNumericalCaptureReceipt]
-        ] = {}
         self._command_mode = False
         self._lock = asyncio.Lock()
         self._cp_lookahead_lock = asyncio.Lock()
@@ -2106,60 +1986,6 @@ class MonarchTrainerRun:
                     state.open_forward_backward_ids
                 ),
             )
-
-    async def capture_forward_backward_numerics(
-        self,
-        run_id: str,
-        operation_id: str,
-        batch: PackedBatchLeaseSet,
-        root: str,
-    ) -> ForwardBackwardNumericalCaptureReceipt:
-        identity = (run_id, os.path.abspath(root))
-        prior = self._numerical_captures.get(operation_id)
-        if prior is not None:
-            if prior[0] != identity:
-                raise RuntimeError("numerical capture operation was reused")
-            return prior[1]
-        async with self._lock:
-            prior = self._numerical_captures.get(operation_id)
-            if prior is not None:
-                if prior[0] != identity:
-                    raise RuntimeError("numerical capture operation was reused")
-                return prior[1]
-            state = self._command_runs.get(run_id)
-            cached = self._operations.get(operation_id)
-            if (
-                state is None
-                or not state.open_forward_backward_ids
-                or state.open_forward_backward_ids[-1] != operation_id
-                or cached is None
-            ):
-                raise RuntimeError("numerical capture is not the open F/B suffix")
-            result = cached[1]
-            token_logprobs = tuple(
-                TokenLogprobs.model_validate(value).model_dump_json()
-                for value in result.get("token_logprobs", ())
-            )
-            values = await asyncio.wait_for(
-                self._actors.capture_forward_backward_numerics.call(
-                    run_id,
-                    operation_id,
-                    batch.model_dump_json(),
-                    token_logprobs,
-                    identity[1],
-                ),
-                timeout=state.spec.event_timeout_s,
-            )
-            receipt = build_forward_backward_capture(
-                tuple(
-                    ForwardBackwardNumericalRankReceipt.model_validate(value)
-                    for value in values.values()
-                )
-            )
-            self._numerical_captures[operation_id] = (identity, receipt)
-            while len(self._numerical_captures) > _MAX_CACHED_COMMAND_OPERATIONS:
-                self._numerical_captures.pop(next(iter(self._numerical_captures)))
-            return receipt
 
     async def export_command_run_checkpoint(
         self,
@@ -3267,28 +3093,6 @@ class MonarchTrainerRun:
         ) or {result["operation_id"] for result in results} != {operation_id}:
             raise RuntimeError("trainer ranks released another residency admission")
 
-    async def score(
-        self,
-        job: ResidentScoreJobSpec,
-        batch: PackedBatchLeaseSet,
-    ) -> ResidentScoreResult:
-        async with self._lock:
-            if error := self._validate_resident_score(job, batch):
-                raise error
-            values = await self._run_resident_collective(
-                job.job_id,
-                self._actors.score.call(job.model_dump_json(), batch.model_dump_json()),
-                invalidate_on_error=True,
-            )
-            shards = tuple(
-                ResidentScoreShard.model_validate(value) for value in values.values()
-            )
-            return _merge_resident_score_shards(
-                shards,
-                job=job,
-                world_size=len(self.runtime_spec.trainer_mesh.ranks),
-            )
-
     async def inspect_resident_lora(
         self,
         request: ResidentLoraInspectionSpec,
@@ -3937,31 +3741,6 @@ class MonarchTrainerRun:
         self._learner_version = job.learner_version
         if state is not None:
             state.learner_version = job.learner_version
-
-    def _validate_resident_score(
-        self,
-        job: ResidentScoreJobSpec,
-        batch: PackedBatchLeaseSet,
-    ) -> BaseException | None:
-        if error := self._validate_resident_learner(
-            run_id=job.run_id,
-            learner=job.learner,
-        ):
-            return error
-        if batch.ref != job.batch:
-            return ValueError("resident score batch ref does not match its leases")
-        if job.batch.sequence_length != self.runtime_spec.packed_sequence_length:
-            return ValueError(
-                "resident score batch length does not match the trainer runtime"
-            )
-        if (
-            job.batch.moe_routing_replay is not None
-            and not self.runtime_spec.enable_moe_routing_replay
-        ):
-            return ValueError(
-                "resident score routing replay is disabled on this trainer runtime"
-            )
-        return None
 
     def _validate_resident_inspection(
         self,

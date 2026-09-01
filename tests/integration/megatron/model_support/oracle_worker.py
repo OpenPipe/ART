@@ -34,7 +34,6 @@ from .fp32_grouped_gemm import (
     allow_fp32_grouped_gemm_fallback_for_model_support_tests,
 )
 from .gdn_fp32_reference import install_megatron_qwen35_gdn_fp32_reference
-from .gdn_trace_uids import install_gdn_trace_token_uid_hooks
 from .oracle_harness import (
     SUPPORTED_SENSITIVITY_MUTATIONS,
     OracleCaseConfig,
@@ -63,7 +62,6 @@ _TOPOLOGY_ENV_VARS = {
     "vpp": "ART_MEGATRON_VIRTUAL_PIPELINE_MODEL_PARALLEL_SIZE",
 }
 _ORACLE_DEBUG_ENV = "ART_ORACLE_DEBUG"
-_ATTACH_TOKEN_UIDS_ENV = "ART_MEGATRON_ATTACH_TOKEN_UIDS"
 _ORACLE_DEBUG_START_TIME = time.perf_counter()
 
 
@@ -158,7 +156,6 @@ def run_worker_subprocesses(
                 live_log.flush()
             env = {
                 **os.environ,
-                "ART_MEGATRON_ATTACH_TOKEN_UIDS": "1",
                 "PYTHONUNBUFFERED": "1",
             }
             if requests[0].case_config.precision == "fp32":
@@ -1493,7 +1490,6 @@ def _reset_optimizer_state(optimizer: Any) -> None:
 def _start_worker_session(request: WorkerRunRequest) -> _WorkerSession:
     """Builds distributed model state once for compatible oracle requests."""
     _debug("starting worker session setup")
-    os.environ.setdefault(_ATTACH_TOKEN_UIDS_ENV, "1")
     from art.megatron import train as megatron_train
     from art.megatron.training.weight_offload import WeightOffloadManager
 
@@ -1734,7 +1730,6 @@ def _worker_run(
         captured_grads = _collect_lora_grads(model_chunks)
 
     with ExitStack() as training_stack:
-        training_stack.enter_context(install_gdn_trace_token_uid_hooks())
         training_stack.enter_context(
             _mutation_hook(
                 megatron_train,

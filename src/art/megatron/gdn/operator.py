@@ -34,7 +34,6 @@ from .segment_layout import (
 
 _GDN_ATTENTION_ORIGINAL_SHAPE_ATTR = "_art_gdn_attention_original_shape"
 _GDN_RUNTIME_STATE_ATTR = "_art_gdn_runtime_state"
-_GDN_TRACE_TOKEN_UID_HOOKS: Any | None = None
 
 
 class _GdnIslandBoundary(NamedTuple):
@@ -51,13 +50,6 @@ class _GdnRuntimeState:
         self.active_shape_key: int | None = None
         self.hidden_layout: Literal["attention", "gdn"] = "attention"
         self.original_shapes: dict[int, tuple[int, int, int]] = {}
-
-
-def set_gdn_trace_token_uid_hooks(hooks: Any | None) -> Any | None:
-    global _GDN_TRACE_TOKEN_UID_HOOKS
-    previous = _GDN_TRACE_TOKEN_UID_HOOKS
-    _GDN_TRACE_TOKEN_UID_HOOKS = hooks
-    return previous
 
 
 def install_prefix_tree_gdn_hooks(model_chunks: Sequence[Any]) -> None:
@@ -1060,14 +1052,9 @@ def _enter_gdn_island_layout(
         attention_bias, original_shape, gdn=gdn, island_id=island_id
     )
     runtime.active_shape_key = _gdn_attention_original_shape_cache_key(gdn, island_id)
-    token_uids = (
-        _local_layout_token_uids(plan, "gdn", hidden_states=gdn_hidden, gdn=gdn)
-        if _layout_token_uids_enabled()
-        else None
-    )
     _set_active_routing_replay_layout("gdn")
     return _attach_gdn_attention_original_shape(
-        _attach_trace_token_uids(gdn_hidden, token_uids),
+        gdn_hidden,
         original_shape,
     )
 
@@ -1099,16 +1086,7 @@ def _mark_attention_layout_active(
     runtime.active_shape_key = None
     if hidden_states is None:
         return
-    plan = _require_gdn_cp_plan(attention_bias)
-    token_uids = (
-        _local_layout_token_uids(
-            plan, "attention", hidden_states=hidden_states, gdn=gdn
-        )
-        if _layout_token_uids_enabled()
-        else None
-    )
     _set_active_routing_replay_layout("attention")
-    _attach_trace_token_uids(hidden_states, token_uids)
 
 
 def _mark_gdn_layout_active(
@@ -1129,13 +1107,7 @@ def _mark_gdn_layout_active(
         _store_gdn_attention_original_shape(
             attention_bias, original_shape, gdn=gdn, island_id=island_id
         )
-    gdn_token_uids = (
-        _local_layout_token_uids(plan, "gdn", hidden_states=hidden_states, gdn=gdn)
-        if _layout_token_uids_enabled()
-        else None
-    )
     _set_active_routing_replay_layout("gdn")
-    _attach_trace_token_uids(hidden_states, gdn_token_uids)
 
 
 def _leave_gdn_island_layout(
@@ -1164,15 +1136,8 @@ def _leave_gdn_island_layout(
         gdn=gdn,
     )
     _mark_attention_layout_active(attention_bias)
-    token_uids = (
-        _local_layout_token_uids(
-            plan, "attention", hidden_states=attention_hidden, gdn=gdn
-        )
-        if _layout_token_uids_enabled()
-        else None
-    )
     _set_active_routing_replay_layout("attention")
-    return _attach_trace_token_uids(attention_hidden, token_uids)
+    return attention_hidden
 
 
 def _require_gdn_cp_plan(attention_bias: Any) -> GdnRankExecutionPlan:
@@ -1282,129 +1247,6 @@ def _exchange_plan_device(plan: Any) -> torch.device | str | None:
     return None
 
 
-def _hidden_token_count(hidden_states: Tensor) -> int:
-    if hidden_states.ndim < 2:
-        return 0
-    return int(hidden_states.shape[0]) * int(hidden_states.shape[1])
-
-
-def _layout_token_uids(
-    plan: GdnRankExecutionPlan, layout: Literal["attention", "gdn"]
-) -> Tensor:
-    indices = (
-        plan.gdn_token_indices if layout == "gdn" else plan.attention_token_indices
-    )
-    return torch.tensor(indices, dtype=torch.int64)
-
-
-def _trace_token_uids_enabled() -> bool:
-    return _GDN_TRACE_TOKEN_UID_HOOKS is not None
-
-
-def _local_layout_token_uids(
-    plan: GdnRankExecutionPlan,
-    layout: Literal["attention", "gdn"],
-    *,
-    hidden_states: Tensor,
-    gdn: Any | None,
-) -> Tensor:
-    token_uids = _layout_token_uids(plan, layout)
-    token_count = _hidden_token_count(hidden_states)
-    if token_count == int(token_uids.numel()):
-        return token_uids
-    if token_count <= 0:
-        return token_uids.new_empty((0,))
-    projection = _gdn_output_projection(gdn)
-    tp_rank = _tp_rank(projection) if projection is not None else 0
-    start = tp_rank * token_count
-    end = min(start + token_count, int(token_uids.numel()))
-    local_uids = token_uids.new_full((token_count,), -1)
-    if start >= int(token_uids.numel()):
-        return local_uids
-    real_uids = token_uids[start:end]
-    local_uids[: int(real_uids.numel())] = real_uids
-    return local_uids
-
-
-def _replicated_layout_token_uids(
-    plan: GdnRankExecutionPlan,
-    layout: Literal["attention", "gdn"],
-    *,
-    hidden_states: Tensor,
-) -> Tensor:
-    token_uids = _layout_token_uids(plan, layout)
-    token_count = _hidden_token_count(hidden_states)
-    if token_count == int(token_uids.numel()):
-        return token_uids
-    if token_count <= 0:
-        return token_uids.new_empty((0,))
-    local_uids = token_uids.new_full((token_count,), -1)
-    real_uids = token_uids[: min(token_count, int(token_uids.numel()))]
-    local_uids[: int(real_uids.numel())] = real_uids
-    return local_uids
-
-
-def _attach_trace_token_uids(tensor: Tensor, token_uids: Tensor | None) -> Tensor:
-    hooks = _GDN_TRACE_TOKEN_UID_HOOKS
-    if hooks is None or token_uids is None:
-        return tensor
-    attach = getattr(hooks, "attach_token_uids", None)
-    return tensor if attach is None else cast(Tensor, attach(tensor, token_uids))
-
-
-def _prepare_in_proj_trace_token_uids(gdn: Any, hidden_states: Tensor) -> None:
-    hooks = _GDN_TRACE_TOKEN_UID_HOOKS
-    if hooks is None:
-        return
-    prepare = getattr(hooks, "prepare_in_proj_token_uids", None)
-    if prepare is not None:
-        prepare(gdn, hidden_states)
-
-
-def _set_out_proj_lora_trace_token_uids(gdn: Any, hidden_states: Tensor) -> None:
-    hooks = _GDN_TRACE_TOKEN_UID_HOOKS
-    if hooks is None:
-        return
-    setter = getattr(hooks, "set_out_proj_lora_token_uids", None)
-    if setter is not None:
-        setter(gdn, hidden_states)
-
-
-def _set_out_norm_trace_token_uids(gdn: Any, token_uids: Tensor | None) -> None:
-    hooks = _GDN_TRACE_TOKEN_UID_HOOKS
-    if hooks is None or token_uids is None:
-        return
-    setter = getattr(hooks, "set_out_norm_token_uids", None)
-    if setter is not None:
-        setter(gdn, token_uids)
-
-
-def _set_out_proj_trace_token_uids(
-    gdn: Any,
-    hidden_states: Tensor,
-    *,
-    sequence_parallel_output: bool,
-) -> None:
-    hooks = _GDN_TRACE_TOKEN_UID_HOOKS
-    if hooks is None:
-        return
-    setter = getattr(hooks, "set_out_proj_token_uids", None)
-    if setter is not None:
-        setter(
-            gdn,
-            hidden_states,
-            sequence_parallel_output=sequence_parallel_output,
-        )
-
-
-def _pad_trace_token_uids_for_stream(token_uids: Tensor, stream: Tensor) -> Tensor:
-    hooks = _GDN_TRACE_TOKEN_UID_HOOKS
-    pad = None if hooks is None else getattr(hooks, "pad_token_uids_for_stream", None)
-    if pad is not None:
-        return cast(Tensor, pad(token_uids, stream))
-    return token_uids
-
-
 def _attach_gdn_attention_original_shape(
     tensor: Tensor, original_shape: tuple[int, int, int] | None
 ) -> Tensor:
@@ -1501,12 +1343,6 @@ def _active_routing_replay_controller() -> Any | None:
     except ImportError:
         return None
     return _active_routing_replay_controller()
-
-
-def _layout_token_uids_enabled() -> bool:
-    return (
-        _trace_token_uids_enabled() or _active_routing_replay_controller() is not None
-    )
 
 
 def _set_active_routing_replay_layout(
@@ -1722,7 +1558,6 @@ def _in_proj(
     sequence_parallel_input: bool = True,
 ) -> tuple[Tensor, Tensor | None]:
     del sequence_parallel_input
-    _prepare_in_proj_trace_token_uids(gdn, hidden_states)
     return gdn.in_proj(hidden_states)
 
 
@@ -1753,18 +1588,9 @@ def _project_gdn_output(
     reduce_tensor_parallel_output: bool = True,
 ) -> tuple[Tensor, Tensor | None]:
     batch_size, seq_len, _, _ = recurrent_output.shape
-    token_uids = (
-        _replicated_layout_token_uids(plan, "gdn", hidden_states=recurrent_output)
-        if _trace_token_uids_enabled()
-        else None
-    )
-    _set_out_norm_trace_token_uids(gdn, token_uids)
     norm_out = _apply_gated_rms_norm(gdn, recurrent_output, gate)
     norm_out = norm_out.reshape(batch_size, seq_len, _local_value_dim(gdn))
     norm_out = norm_out.transpose(0, 1).contiguous()
-    if token_uids is not None:
-        token_uids = _replicated_layout_token_uids(plan, "gdn", hidden_states=norm_out)
-    _attach_trace_token_uids(norm_out, token_uids)
     out, out_bias = _out_proj(
         gdn,
         norm_out,
@@ -1814,20 +1640,11 @@ def _project_cp_gdn_output(
     dependency: Tensor | None = None,
 ) -> tuple[Tensor, Tensor | None]:
     batch_size, seq_len, _, _ = recurrent_output.shape
-    token_uids = (
-        _replicated_layout_token_uids(plan, "gdn", hidden_states=recurrent_output)
-        if _trace_token_uids_enabled()
-        else None
-    )
-    _set_out_norm_trace_token_uids(gdn, token_uids)
     norm_out = _apply_gated_rms_norm(gdn, recurrent_output, gate)
     norm_out = norm_out.reshape(batch_size, seq_len, _local_value_dim(gdn))
     norm_out = norm_out.transpose(0, 1).contiguous()
     if dependency is not None:
         norm_out = _add_autograd_dependency(norm_out, dependency)
-    if token_uids is not None:
-        token_uids = _replicated_layout_token_uids(plan, "gdn", hidden_states=norm_out)
-    _attach_trace_token_uids(norm_out, token_uids)
     if output_layout == "attention":
         norm_out = _exchange_cp_sequence_stream(
             norm_out,
@@ -1836,15 +1653,7 @@ def _project_cp_gdn_output(
             source_layout="gdn",
             dest_layout="attention",
         )
-        if token_uids is not None:
-            token_uids = _replicated_layout_token_uids(
-                plan, "attention", hidden_states=norm_out
-            )
-        _attach_trace_token_uids(norm_out, token_uids)
     norm_out = _pad_sequence_parallel_output_stream(gdn, norm_out)
-    if token_uids is not None:
-        token_uids = _pad_trace_token_uids_for_stream(token_uids, norm_out)
-    _attach_trace_token_uids(norm_out, token_uids)
     return _out_proj(gdn, norm_out)
 
 
@@ -1952,11 +1761,6 @@ def _out_proj(
     reduce_tensor_parallel_output: bool = True,
 ) -> tuple[Tensor, Tensor | None]:
     projection = gdn.out_proj
-    _set_out_proj_trace_token_uids(
-        gdn,
-        hidden_states,
-        sequence_parallel_output=sequence_parallel_output,
-    )
     if (
         int(hidden_states.numel()) != 0
         and not force_explicit
@@ -1990,7 +1794,6 @@ def _explicit_out_proj(
     if bias is not None and not _returns_bias(base_projection):
         out = out + bias
     if hasattr(projection, "lora"):
-        _set_out_proj_lora_trace_token_uids(gdn, hidden_states)
         lora_output = projection.lora(hidden_states)
         if reduce_tensor_parallel_output and bool(
             getattr(projection, "reduce_output", True)

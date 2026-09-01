@@ -817,6 +817,9 @@ def _functional_session(
     *,
     visible_gpu_count: int,
 ) -> _SharedFunctionalSession | None:
+    # Resident scoring was a test-only trainer API. Run these stages independently.
+    return None
+
     if not _ordered_stages(prepared.stages, RESIDENT_FUNCTIONAL_STAGES):
         return None
     support = get_model_support_spec(

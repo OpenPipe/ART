@@ -72,7 +72,6 @@ def run_worker_subprocess(
     env = dict(os.environ)
     env.update(
         {
-            "ART_MEGATRON_ATTACH_TOKEN_UIDS": "1",
             "PYTHONUNBUFFERED": "1",
             "PYTHONPATH": os.pathsep.join(pythonpath_entries),
         }

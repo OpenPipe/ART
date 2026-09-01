@@ -240,38 +240,6 @@ class Glm52Handler(DefaultMoeHandler):
             )
         }
 
-    def correctness_precision(self) -> Literal["bf16", "fp32"]:
-        return "bf16"
-
-    def correctness_use_fp32_lora_reference(self) -> bool:
-        return False
-
-    def prepare_hf_reference_model(self, model: Any) -> Any:
-        for module in model.modules():
-            if type(module).__name__ == "GlmMoeDsaIndexer":
-                module.requires_grad_(False)
-        return model
-
-    def correctness_phase_pass_fns(self, oracle_harness: Any) -> dict[str, Any]:
-        nonzero = {"typical_abs_scale": 0.0, "candidate_abs_scale": 0.0}
-        forward = oracle_harness.MetricThresholdRule(
-            limits={"mean_abs_pct": 3.0}, minimums=nonzero
-        )
-        grad = oracle_harness.MetricThresholdRule(
-            limits={"mean_abs_pct": 5.0}, minimums=nonzero
-        )
-        return {
-            "forward": forward,
-            "outputs": forward,
-            "losses": oracle_harness.MetricThresholdRule(limits={"mean_abs_pct": 3.0}),
-            "grads": grad,
-            "deltas": grad,
-            "router_scores": forward,
-            "router_topk_ids": oracle_harness.MetricThresholdRule(
-                limits={"topk_mismatch_fraction": 0.0, "top1_mismatch_fraction": 0.0}
-            ),
-        }
-
     def collect_layer_families(self, provider: Any) -> list[LayerFamilyInstance]:
         pattern = tuple(provider.glm52_indexer_types)
         full = [index for index, value in enumerate(pattern) if value == "full"]

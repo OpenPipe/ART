@@ -59,7 +59,6 @@ from .route_retention import (
 )
 from .runtime.data_plane import SFTBatchData
 from .runtime.l4_hydration import L4HydrationSidecar
-from .runtime.numerical_capture import ForwardBackwardNumericalCaptureReceipt
 from .runtime.publication import TrainerRankPublication
 from .runtime.specs import (
     CommandPublicationSpec,
@@ -363,14 +362,6 @@ class _ResidentTrainer(Protocol):
     async def publish_command_generation(
         self, spec: CommandPublicationSpec
     ) -> tuple[tuple[TrainerRankPublication, ...], dict[str, float]]: ...
-
-    async def capture_forward_backward_numerics(
-        self,
-        run_id: str,
-        operation_id: str,
-        batch: Any,
-        root: str,
-    ) -> ForwardBackwardNumericalCaptureReceipt: ...
 
     async def commit_prepared_command_run_checkpoint(
         self, operation: OperationRef
@@ -973,29 +964,6 @@ class MegatronOperationHandler:
                 global_grad_accumulation_sequences=(config.grad_accumulation_sequences),
             )
         )
-
-    async def capture_forward_backward_numerics(
-        self, operation_id: str, root: str
-    ) -> ForwardBackwardNumericalCaptureReceipt:
-        capture_id = self._contributions.get(operation_id)
-        if capture_id is None:
-            raise RuntimeError("numerical capture operation is not an open F/B")
-        captured = self._captures.get(capture_id)
-        if captured is None:
-            raise RuntimeError("numerical capture packed input is absent")
-        await self._ensure_capture_materialized(captured)
-        if captured.packed is None:
-            raise RuntimeError("SFT numerical capture is not yet supported")
-        try:
-            return await self.trainer.capture_forward_backward_numerics(
-                self.config.run_id,
-                operation_id,
-                captured.packed.leases,
-                root,
-            )
-        finally:
-            if captured.ref.input_object is not None:
-                await self._release_execution_image(capture_id, captured)
 
     async def retry_releases(self) -> None:
         for capture_id in tuple(self._release_failures):

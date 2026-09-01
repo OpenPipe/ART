@@ -185,14 +185,6 @@ class ModelSupportHandler(Protocol):
         model_chunks: Sequence[Any],
     ) -> dict[str, Any]: ...
 
-    def correctness_precision(self) -> Literal["bf16", "fp32"]: ...
-
-    def correctness_use_fp32_lora_reference(self) -> bool: ...
-
-    def correctness_phase_pass_fns(
-        self, oracle_harness: Any
-    ) -> dict[str, Any] | None: ...
-
     def collect_layer_families(
         self,
         provider: "GPTModelProvider",

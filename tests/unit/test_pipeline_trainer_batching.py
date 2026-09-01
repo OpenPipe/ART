@@ -226,56 +226,6 @@ async def test_command_preparation_keeps_one_ready_while_preparing_next(
 
 
 @pytest.mark.asyncio
-async def test_pre_next_dispatch_hook_blocks_packed_lookahead(tmp_path: Path) -> None:
-    backend = MagicMock()
-
-    async def train(*_args: object, **_kwargs: object) -> SimpleNamespace:
-        return SimpleNamespace(step=backend.train.await_count, metrics={})
-
-    backend.train = AsyncMock(side_effect=train)
-    trainer = _packed_trainer(tmp_path, backend, run_name="pipeline-dispatch-hook-test")
-    hook_started = asyncio.Event()
-    release_hook = asyncio.Event()
-    second_prepared = asyncio.Event()
-
-    async def freeze_after_step(step: int) -> None:
-        assert step == 1
-        hook_started.set()
-        await release_hook.wait()
-
-    trainer.add_pre_next_dispatch_hook(1, freeze_after_step)
-    first = _PreparedPipelineItem(
-        batch=[_group()],
-        discarded=0,
-        zero_variance_discarded=0,
-        saw_sentinel=False,
-        packing_policy_step=0,
-        selection_s=0.0,
-        preparation_s=0.0,
-        preparation_metrics={},
-    )
-    second = first.model_copy(
-        update={"batch": [_group()], "saw_sentinel": True, "handoff": asyncio.Event()}
-    )
-
-    async def prepare() -> None:
-        await trainer._packed_queue.put(first)
-        await first.handoff.wait()
-        second_prepared.set()
-        await trainer._packed_queue.put(second)
-
-    producer = asyncio.create_task(prepare())
-    training = asyncio.create_task(trainer._training_stage())
-    await asyncio.wait_for(hook_started.wait(), timeout=2.0)
-    assert backend.train.await_count == 1
-    assert not second_prepared.is_set()
-
-    release_hook.set()
-    await asyncio.wait_for(asyncio.gather(producer, training), timeout=2.0)
-    assert backend.train.await_count == 2
-
-
-@pytest.mark.asyncio
 async def test_command_lookahead_overlaps_current_command_execution(
     tmp_path: Path,
 ) -> None:

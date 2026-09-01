@@ -44,7 +44,6 @@ from .route_retention import (
     RouteBundleOwnershipProvider,
     RouteBundleOwnershipTransfer,
 )
-from .runtime.numerical_capture import ForwardBackwardNumericalCaptureReceipt
 from .runtime.portable_snapshot import (
     PortableSnapshotArchive,
     PortableSnapshotExportReceipt,
@@ -488,14 +487,6 @@ class _SharedTrainer(Protocol):
     ) -> PortableSnapshotInstallReceipt | None: ...
 
     async def command_run_state(self, run_id: str) -> TrainerCommandRunState: ...
-
-    async def capture_forward_backward_numerics(
-        self,
-        run_id: str,
-        operation_id: str,
-        batch: Any,
-        root: str,
-    ) -> ForwardBackwardNumericalCaptureReceipt: ...
 
     async def export_command_run_checkpoint(
         self,
@@ -947,96 +938,6 @@ class MegatronSlotCoordinator:
             raise RuntimeError("portable export changed operation-keyed evidence")
         return receipt
 
-    async def capture_run_checkpoints(
-        self,
-        exports: tuple[tuple[str, str], ...],
-    ) -> tuple[PortableSnapshotExportReceipt, ...]:
-        """Export all resident runs at one quiescent gate boundary."""
-
-        run_ids = tuple(run_id for run_id, _export_id in exports)
-        export_ids = tuple(export_id for _run_id, export_id in exports)
-        if (
-            not exports
-            or len(exports) > 4
-            or len(set(run_ids)) != len(run_ids)
-            or len(set(export_ids)) != len(export_ids)
-            or any(not value for value in (*run_ids, *export_ids))
-        ):
-            raise ValueError(
-                "checkpoint capture identities must be nonempty and unique"
-            )
-        async with self._condition:
-            states = tuple(self._runs.get(run_id) for run_id in run_ids)
-            if set(run_ids) != set(self._runs) or any(
-                state is None
-                or state.draining
-                or state.maintenance
-                or state.migration_fence_id is not None
-                or state.migration_restore_id is not None
-                for state in states
-            ):
-                raise RuntimeError("Megatron slot run is unavailable for capture")
-            resident = tuple(state for state in states if state is not None)
-            for state in resident:
-                state.maintenance = True
-            try:
-                while (
-                    self._active_run_id is not None
-                    or self._ready
-                    or any(
-                        state.preparing or state.worker_calls or state.settling
-                        for state in resident
-                    )
-                ):
-                    await self._condition.wait()
-                if any(
-                    self._runs.get(run_id) is not state or state.draining
-                    for run_id, state in zip(run_ids, resident, strict=True)
-                ):
-                    raise RuntimeError("Megatron slot run changed during capture")
-                generations = tuple(state.handler.generation for state in resident)
-            except BaseException:
-                for state in resident:
-                    state.maintenance = False
-                self._condition.notify_all()
-                raise
-        try:
-            captured: list[PortableSnapshotExportReceipt] = []
-            for (run_id, export_id), generation in zip(
-                exports, generations, strict=True
-            ):
-                captured.append(
-                    await self.trainer.export_command_run_checkpoint(
-                        run_id,
-                        generation,
-                        export_id,
-                    )
-                )
-            receipts = tuple(captured)
-            for receipt, export_id, generation in zip(
-                receipts, export_ids, generations, strict=True
-            ):
-                exported = receipt.generation
-                if receipt.export_id != export_id or (
-                    exported.training_session_id,
-                    exported.policy_step,
-                    exported.generation_id,
-                ) != (
-                    generation.training_session_id,
-                    generation.policy_step,
-                    generation.generation_id,
-                ):
-                    raise RuntimeError(
-                        "checkpoint capture changed its generation identity"
-                    )
-            return receipts
-        finally:
-            async with self._condition:
-                for run_id, state in zip(run_ids, resident, strict=True):
-                    if self._runs.get(run_id) is state:
-                        state.maintenance = False
-                self._condition.notify_all()
-
     async def install_run_checkpoint(
         self,
         operation: OperationRef,
@@ -1269,48 +1170,6 @@ class MegatronSlotCoordinator:
         finally:
             async with self._condition:
                 if self._runs.get(ref.run_id) is state:
-                    state.maintenance = False
-                self._condition.notify_all()
-
-    async def capture_forward_backward_numerics(
-        self,
-        *,
-        run_id: str,
-        operation_id: str,
-        root: str,
-    ) -> ForwardBackwardNumericalCaptureReceipt:
-        """Capture exact gate evidence while the selected F/B suffix is open."""
-
-        async with self._condition:
-            state = self._runs.get(run_id)
-            if (
-                state is None
-                or state.draining
-                or state.maintenance
-                or state.migration_fence_id is not None
-                or state.migration_restore_id is not None
-            ):
-                raise RuntimeError("Megatron slot run is unavailable for capture")
-            state.maintenance = True
-            try:
-                while (
-                    state.preparing
-                    or state.worker_calls
-                    or self._active_run_id == run_id
-                    or any(item.run_id == run_id for item in self._ready)
-                ):
-                    await self._condition.wait()
-            except BaseException:
-                state.maintenance = False
-                self._condition.notify_all()
-                raise
-        try:
-            return await state.handler.capture_forward_backward_numerics(
-                operation_id, root
-            )
-        finally:
-            async with self._condition:
-                if self._runs.get(run_id) is state:
                     state.maintenance = False
                 self._condition.notify_all()
 

@@ -521,12 +521,14 @@ def run_hf_parity_stage(
         allow_unvalidated_arch=allow_unvalidated_arch,
     )
     handler = get_model_support_handler_for_spec(spec)
+    from .correctness_policy import precision
+
     case_config = _oracle_case_config(
         oracle_harness,
         base_model=base_model,
         model_support_key=spec.key,
         is_moe=handler.is_moe,
-        precision=handler.correctness_precision(),
+        precision=precision(handler),
         num_layers=max(1, architecture.recommended_min_layers),
         target_modules=list(spec.default_target_modules),
         allow_unvalidated_arch=allow_unvalidated_arch,
@@ -570,12 +572,14 @@ def run_lora_coverage_stage(
         allow_unvalidated_arch=allow_unvalidated_arch,
     )
     handler = get_model_support_handler_for_spec(spec)
+    from .correctness_policy import precision
+
     case_config = _oracle_case_config(
         oracle_harness,
         base_model=base_model,
         model_support_key=spec.key,
         is_moe=handler.is_moe,
-        precision=handler.correctness_precision(),
+        precision=precision(handler),
         num_layers=max(1, architecture.recommended_min_layers),
         target_modules=list(spec.default_target_modules),
         allow_unvalidated_arch=allow_unvalidated_arch,
@@ -639,10 +643,12 @@ def run_correctness_sensitivity_stage(
         allow_unvalidated_arch=allow_unvalidated_arch,
     )
     handler = get_model_support_handler_for_spec(spec)
+    from .correctness_policy import phase_pass_fns, precision, use_fp32_lora_reference
+
     cp_supported = bool(handler.cp_supported)
-    correctness_precision = handler.correctness_precision()
-    correctness_use_fp32_lora_reference = handler.correctness_use_fp32_lora_reference()
-    correctness_phase_pass_fns = handler.correctness_phase_pass_fns(oracle_harness)
+    correctness_precision = precision(handler)
+    correctness_use_fp32_lora_reference = use_fp32_lora_reference(handler)
+    correctness_phase_pass_fns = phase_pass_fns(handler, oracle_harness)
     suite_topologies = list(
         oracle_harness.selected_suite_topologies(
             is_moe=handler.is_moe,
