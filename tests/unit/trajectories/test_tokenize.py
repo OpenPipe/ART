@@ -27,6 +27,7 @@ import art
 import art.trajectories as tr
 from art.trajectories import (
     ChatCompletionsExchange,
+    ChatCompletionsHistory,
     ChatCompletionsMessageSource,
     ChatCompletionsRequest,
     CompletionsExchange,
@@ -292,6 +293,82 @@ class _BoundaryTokenizer(_StopTokenizer):
         )
 
 
+class _CharacterTemplateTokenizer:
+    eos_token_id = 9
+    unk_token_id = 0
+    all_special_tokens = ["§"]
+    special_tokens_map = {"eos_token": "§"}
+
+    @staticmethod
+    def _encode(text: str) -> list[int]:
+        return [9 if character == "§" else ord(character) + 100 for character in text]
+
+    def __call__(self, text: str, **kwargs: object) -> dict[str, object]:
+        result: dict[str, object] = {"input_ids": self._encode(text)}
+        if kwargs.get("return_offsets_mapping"):
+            result["offset_mapping"] = [
+                (index, index + 1) for index in range(len(text))
+            ]
+        return result
+
+    def convert_tokens_to_ids(self, token: str) -> int:
+        return 9 if token == "§" else 0
+
+    def decode(self, token_ids: list[int], **kwargs: object) -> str:
+        del kwargs
+        return "".join(
+            "§" if token == 9 else "a" if token >= 7000 else chr(token - 100)
+            for token in token_ids
+        )
+
+    def apply_chat_template(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        tokenize: bool = True,
+        add_generation_prompt: bool,
+        **kwargs: object,
+    ) -> str | list[int]:
+        del add_generation_prompt, kwargs
+        text = "".join(
+            str(message.get("content") or "")
+            + ("§" if message.get("role") == "assistant" else "")
+            for message in messages
+        )
+        return self._encode(text) if tokenize else text
+
+
+def _character_template_history(
+    *,
+    following_user: str = "turn 2",
+    omit_length_tail: bool = False,
+) -> tuple[ChatCompletionsHistory, _CharacterTemplateTokenizer, list[int]]:
+    tokenizer = _CharacterTemplateTokenizer()
+    answer = tokenizer._encode("answer")
+    first_prompt = tokenizer._encode("turn 0")
+    first_output = [7001, *answer[1:], 9]
+    second_prompt = [*first_prompt, *first_output, *tokenizer._encode("turn 1")]
+    second_output = [7002, *answer[1:]]
+    third_prompt = [
+        *second_prompt,
+        *second_output,
+        *([] if omit_length_tail else [9]),
+        *tokenizer._encode(following_user),
+    ]
+    third_output = [*answer, 9]
+
+    first = _chat_exchange(first_prompt, first_output)
+    second = _chat_exchange(second_prompt, second_output, offset=1)
+    second.response.choices[0].finish_reason = "length"
+    third = _chat_exchange(third_prompt, third_output, offset=2)
+    if following_user != "turn 2":
+        third.request["messages"][-1] = {"role": "user", "content": following_user}
+    history = art.Trajectory(
+        exchanges=TrajectoryExchanges(chat_completions=[first, second, third])
+    ).chat_completions_history()
+    return history, tokenizer, [*third_prompt, *third_output]
+
+
 def test_exact_sampled_eos_is_stop_when_tokenizer_identifies_it() -> None:
     exchange = _chat_exchange([1], [2, 9])
 
@@ -510,6 +587,164 @@ def test_exact_output_boundaries_survive_prefix_order_drift_and_length_stop() ->
         match="Could not prove a sampled history message boundary",
     ):
         history.tokenize(tokenizer=tokenizer, chat_template="explicit override")
+
+
+def test_public_exact_chain_preserves_raw_drift_across_proven_length_boundary() -> None:
+    history, tokenizer, expected = _character_template_history()
+
+    tokenized = history.tokenize(tokenizer=tokenizer)
+
+    assert tokenized.tokens == expected
+    assert 7001 in tokenized.tokens
+    length_start = tokenized.tokens.index(7002)
+    tail = length_start + len("answer")
+    assert tokenized.flags[tail] == tr.TokenFlag.EXACT | tr.TokenFlag.STOP
+    assert not tokenized.flags[tail] & tr.TokenFlag.SAMPLED
+
+
+def test_public_exact_chain_rejects_user_token_colliding_with_missing_tail(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "art.trajectories._tokenize._WARNED_PREFIX_RETOKENIZATION", False
+    )
+    history, tokenizer, authoritative = _character_template_history(
+        following_user="§turn 2",
+        omit_length_tail=True,
+    )
+
+    with pytest.warns(UserWarning, match="retokenized an earlier sampled response"):
+        tokenized = history.tokenize(tokenizer=tokenizer)
+
+    assert tokenized.tokens != authoritative
+    length_start = tokenized.tokens.index(7002)
+    boundary = length_start + len("answer")
+    assert tokenized.tokens[boundary : boundary + 2] == [9, 9]
+    assert not tokenized.flags[boundary] & tr.TokenFlag.ASSISTANT
+    assert tokenized.flags[boundary] & tr.TokenFlag.STOP
+    assert not tokenized.flags[boundary + 1] & tr.TokenFlag.ASSISTANT
+    assert not tokenized.flags[boundary + 1] & tr.TokenFlag.STOP
+
+
+def test_exact_chain_preserves_raw_output_across_proven_length_tail() -> None:
+    first = _chat_exchange([1], [2, 7, 9])
+    second = _chat_exchange([1, 2, 7, 9, 3], [4], offset=1)
+    second.response.choices[0].finish_reason = "length"
+    third = _chat_exchange([1, 2, 7, 9, 3, 4, 8, 9, 5], [6, 9], offset=2)
+    history = art.Trajectory(
+        exchanges=TrajectoryExchanges(chat_completions=[first, second, third])
+    ).chat_completions_history()
+    from art.trajectories._tokenize import (
+        _RenderedLengthStopBoundary,
+        _sampled_source_key,
+        _tokenize_exact_projected_chat_history,
+    )
+
+    length_source = history.message_sources[3]
+    assert length_source is not None
+    tokenized = _tokenize_exact_projected_chat_history(
+        history,
+        tokenizer=_StopTokenizer(),
+        length_stop_boundaries={
+            _sampled_source_key(length_source): _RenderedLengthStopBoundary(
+                tail=(8, 9), following=(5,)
+            )
+        },
+        projection_validated=True,
+    )
+
+    assert tokenized is not None
+    assert tokenized.tokens == [1, 2, 7, 9, 3, 4, 8, 9, 5, 6, 9]
+    assert [
+        index for index, flag in enumerate(tokenized.flags) if flag & tr.TokenFlag.STOP
+    ] == [3, 7, 10]
+    assert tokenized.flags[6:8] == [
+        tr.TokenFlag.EXACT | tr.TokenFlag.ASSISTANT,
+        tr.TokenFlag.EXACT | tr.TokenFlag.STOP,
+    ]
+    assert not any(flag & tr.TokenFlag.SAMPLED for flag in tokenized.flags[6:8])
+
+
+def test_exact_chain_declines_unrecognized_or_mismatched_length_boundary() -> None:
+    first = _chat_exchange([1], [2])
+    first.response.choices[0].finish_reason = "length"
+    second = _chat_exchange([1, 2, 8, 9, 3], [4, 9], offset=1)
+    history = art.Trajectory(
+        exchanges=TrajectoryExchanges(chat_completions=[first, second])
+    ).chat_completions_history()
+    from art.trajectories._tokenize import (
+        _RenderedLengthStopBoundary,
+        _sampled_source_key,
+        _tokenize_exact_projected_chat_history,
+    )
+
+    length_source = history.message_sources[1]
+    assert length_source is not None
+    tokenizer = _StopTokenizer()
+    assert (
+        _tokenize_exact_projected_chat_history(
+            history,
+            tokenizer=tokenizer,
+            projection_validated=True,
+        )
+        is None
+    )
+    assert (
+        _tokenize_exact_projected_chat_history(
+            history,
+            tokenizer=tokenizer,
+            length_stop_boundaries={
+                _sampled_source_key(length_source): _RenderedLengthStopBoundary(
+                    tail=(7, 9), following=(3,)
+                )
+            },
+            projection_validated=True,
+        )
+        is None
+    )
+
+
+def test_rendered_length_stop_boundary_requires_unique_assistant_terminal_stop() -> (
+    None
+):
+    from art.trajectories._tokenize import (
+        _rendered_length_stop_boundary,
+        _RenderedLengthStopBoundary,
+    )
+
+    tokens = [1, 2, 8, 9, 3]
+    assistant_mask = [False, True, True, True, False]
+    stop_mask = [False, False, False, True, False]
+    assert _rendered_length_stop_boundary(
+        tokens,
+        assistant_mask,
+        stop_mask,
+        content_end=2,
+        next_prompt_end=5,
+    ) == _RenderedLengthStopBoundary(tail=(8, 9), following=(3,))
+
+    # A special token belonging to the following user turn cannot certify an
+    # assistant stop, even when it is a tokenizer terminator.
+    assert (
+        _rendered_length_stop_boundary(
+            tokens,
+            [False, True, True, False, False],
+            stop_mask,
+            content_end=2,
+            next_prompt_end=5,
+        )
+        is None
+    )
+    assert (
+        _rendered_length_stop_boundary(
+            tokens,
+            assistant_mask,
+            [False, False, True, True, False],
+            content_end=2,
+            next_prompt_end=5,
+        )
+        is None
+    )
 
 
 def test_exact_output_boundary_after_sampled_tool_call() -> None:
