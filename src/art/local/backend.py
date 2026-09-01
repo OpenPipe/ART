@@ -1044,9 +1044,7 @@ class LocalBackend:
                 image_processor=self._image_processors[model.base_model],
                 chat_template_kwargs=chat_template_kwargs,
                 chat_template_tool_schema_format=chat_template_tool_schema_format,
-                model=automatic_training_model_selector(
-                    self._model_inference_name(model)
-                ),
+                model=automatic_training_model_selector(model.get_inference_name()),
                 _max_sequence_length=training_max_sequence_length,
             )
         )

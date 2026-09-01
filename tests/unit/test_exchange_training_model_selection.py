@@ -446,6 +446,42 @@ def test_local_backend_trains_retained_source_after_overlength_history(
     assert packed["assistant_mask"].tolist() == [[False, True, False, True, True]] * 2
 
 
+def test_standalone_packer_preserves_rollout_inference_identity(tmp_path: Path) -> None:
+    backend = LocalBackend(path=str(tmp_path))
+    model = TrainableModel(
+        run_name="slot-run",
+        name="local-slot-run",
+        project="pipeline-tests",
+        base_model="test-model",
+        base_path=str(tmp_path),
+        inference_model_name="policy",
+    )
+    tokenizer = cast(
+        PreTrainedTokenizerBase,
+        SimpleNamespace(
+            name_or_path="test-model",
+            eos_token_id=0,
+            decode=lambda token_id: str(token_id),
+        ),
+    )
+    backend._tokenizers[("test-model", None)] = tokenizer
+    backend._image_processors["test-model"] = None
+
+    packed = backend._get_packed_tensors(
+        model,
+        [_group()],
+        advantage_balance=0.0,
+        allow_training_without_logprobs=False,
+        scale_rewards=False,
+        plot_tensors=False,
+        packed_sequence_length=8,
+        logprob_calculation_chunk_size=1,
+    )
+
+    assert packed is not None
+    assert packed["tokens"].shape[0] == 2
+
+
 def test_training_rejects_multiple_concrete_policy_versions() -> None:
     group = _versioned_group()
     with pytest.raises(ValueError, match="exactly one concrete model"):
