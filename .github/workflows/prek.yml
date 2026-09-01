@@ -225,6 +225,7 @@ jobs:
             tests/unit/test_prefix_tree_packing.py \
             tests/unit/test_trainer_rank_validation.py \
             tests/unit/test_trainer_rank_weird_shapes.py \
+            tests/acceptance/trainer_rank_planner \
             tests/integration/megatron/gdn_shared_prefix/test_gdn_planner_runtime_model.py \
             tests/integration/megatron/gdn_shared_prefix/test_gdn_cp_layout_distributed.py::test_distributed_gdn_cp_layout_all_to_all_roundtrips \
             tests/integration/megatron/gdn_shared_prefix/test_gdn_cp_layout_distributed.py::test_distributed_gdn_cp_layout_handles_empty_ranks

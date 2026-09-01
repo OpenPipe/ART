@@ -80,12 +80,17 @@ GATES: dict[str, dict[str, float]] = {
         "min_peak_reduction_pct": 30.0,
         # Sealed: median selected max depth 3.
         "min_median_selected_max_depth": 2.0,
-        # Sealed: 4.2% worst planning fraction across acceptance cells.
-        "max_planning_fraction": 0.10,
+        # This cell is the sealed 2-layer throughput screen: execution is
+        # deliberately tiny, so planning is bounded absolutely here (sealed
+        # steady planning was 82 ms p50). The 10% planning *fraction* gate is
+        # measured on the full-height cp1-regression cell, matching the
+        # sealed protocol (its CP1 acceptance cells ran the full model).
+        "max_planning_ms": 150.0,
     },
     "cp1-regression": {
         # Sealed: -0.58% / +0.07% (ties). Gate: no worse than a 2% loss.
         "max_paired_median_regression_pct": 2.0,
+        # Sealed: 1.5% / 4.2% on full-height CP1 cells.
         "max_planning_fraction": 0.10,
     },
 }
@@ -298,9 +303,16 @@ def phase_measure(cell: str, arm: str, output_jsonl: str, repeat: int) -> None:
     dist.init_process_group(backend="nccl")
     try:
         torch.manual_seed(1234)
+        # The gdn-cp4 throughput screen uses exactly two transformer layers
+        # (sealed preregistration); the cp1 regression/planning cell runs the
+        # full-height model, matching the sealed CP1 acceptance protocol.
         runtime = megatron_train.build_training_runtime(
             model_identifier="Qwen/Qwen3.5-4B",
-            provider_configure=lambda provider: setattr(provider, "num_layers", 2),
+            provider_configure=(
+                (lambda provider: setattr(provider, "num_layers", 2))
+                if cell == "grpo-gdn-cp4"
+                else None
+            ),
             print_env=dist.get_rank() == 0,
         )
         for chunk in runtime.model:
@@ -411,7 +423,18 @@ def phase_validate(cell: str, evidence: str) -> None:
         / statistics.median(_measured(rows, arm, "complete_call_ms"))
         for arm in ("automatic", "depth_one")
     )
+    if "max_planning_fraction" not in gates:
+        planning_fraction = 0.0
     failures: list[str] = []
+    if "max_planning_ms" in gates:
+        planning_ms = max(
+            statistics.median(_measured(rows, arm, "planning_ms"))
+            for arm in ("automatic", "depth_one")
+        )
+        if planning_ms > gates["max_planning_ms"]:
+            failures.append(
+                f"planning p50 {planning_ms:.1f}ms > {gates['max_planning_ms']}ms gate"
+            )
     if "min_paired_median_gain_pct" in gates:
         if median_gain < gates["min_paired_median_gain_pct"]:
             failures.append(
@@ -444,7 +467,7 @@ def phase_validate(cell: str, evidence: str) -> None:
                 f"paired median regression {median_gain:.2f}% exceeds"
                 f" -{gates['max_paired_median_regression_pct']}% gate"
             )
-    if planning_fraction > gates["max_planning_fraction"]:
+    if planning_fraction > gates.get("max_planning_fraction", 1.0):
         failures.append(
             f"planning fraction {planning_fraction:.3f} >"
             f" {gates['max_planning_fraction']} gate"
