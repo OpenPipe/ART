@@ -126,6 +126,8 @@ class MegatronPairedInferencePublisher:
         base_model: str,
         config: dev.BackendModelConfig,
         runtime_spec: TrainerRuntimeSpec,
+        runtime_source_id: str,
+        runtime_source_epoch: int,
     ) -> "MegatronPairedInferencePublisher":
         services = tuple(
             service
@@ -146,6 +148,8 @@ class MegatronPairedInferencePublisher:
             ),
             server_args=_server_args(config, base_model),
             serving_profile_identity=profile,
+            runtime_source_id=runtime_source_id,
+            runtime_source_epoch=runtime_source_epoch,
         )
         started = False
         try:
@@ -159,6 +163,11 @@ class MegatronPairedInferencePublisher:
             _validate_serving_profile(capabilities, profile, service)
             manager = runtime.model_service(service.name)
             credentials = manager.dispatch_credentials
+            if (
+                credentials.runtime_source_id,
+                credentials.runtime_source_epoch,
+            ) != (runtime_source_id, runtime_source_epoch):
+                raise RuntimeError("vLLM returned another runtime source identity")
             endpoint = PairedInferenceEndpoint(
                 url=(
                     f"{service.leader_endpoint.url.rstrip('/')}"

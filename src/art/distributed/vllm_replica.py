@@ -9,7 +9,7 @@ import secrets
 from typing import Literal, Protocol
 import uuid
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from ..serving_capabilities import ServingProfileIdentity
 from ..utils.lifecycle import ChildProcessSupervisor
@@ -41,7 +41,15 @@ class ReplicaLaunchTemplate(_Message):
     engine_args: dict[str, object] = Field(default_factory=dict)
     server_args: dict[str, object] = Field(default_factory=dict)
     serving_profile_identity: ServingProfileIdentity | None = None
+    runtime_source_id: str | None = Field(default=None, min_length=1, max_length=512)
+    runtime_source_epoch: int | None = Field(default=None, ge=0)
     runtime_source_epoch_base: int = Field(default=0, ge=0)
+
+    @model_validator(mode="after")
+    def _validate_runtime_source(self) -> "ReplicaLaunchTemplate":
+        if (self.runtime_source_id is None) != (self.runtime_source_epoch is None):
+            raise ValueError("runtime source ID and epoch must be supplied together")
+        return self
 
 
 class HostMemberLaunchRequest(_Message):
@@ -301,14 +309,23 @@ class ReplicaManager:
             )
         if self._private_dispatch_token is None:
             raise RuntimeError("private dispatch credentials are unavailable")
+        runtime_source_id, runtime_source_epoch = self._runtime_source_identity()
         return ReplicaDispatchCredentials(
             target_id=self._state.generation_digest,
             runtime_generation=self._state.generation,
-            runtime_source_id=self._spec.name,
-            runtime_source_epoch=(
-                self._template.runtime_source_epoch_base + self._state.generation
-            ),
+            runtime_source_id=runtime_source_id,
+            runtime_source_epoch=runtime_source_epoch,
             authorization_token=self._private_dispatch_token,
+        )
+
+    def _runtime_source_identity(self) -> tuple[str, int]:
+        source_id = self._template.runtime_source_id
+        source_epoch = self._template.runtime_source_epoch
+        if source_id is not None and source_epoch is not None:
+            return source_id, source_epoch
+        return (
+            self._spec.name,
+            self._template.runtime_source_epoch_base + self._state.generation,
         )
 
     async def start(self) -> ReplicaState:
@@ -703,6 +720,7 @@ class ReplicaManager:
             )
         process_uuid = uuid.uuid4().hex
         physical_ids = all(isinstance(gpu_id, int) for gpu_id in member.gpu_ids)
+        runtime_source_id, runtime_source_epoch = self._runtime_source_identity()
         launch = VllmRuntimeLaunchConfig(
             base_model=self._spec.runtime_model,
             port=self._spec.leader_endpoint.port,
@@ -735,10 +753,8 @@ class ReplicaManager:
             replica_generation=self._state.generation,
             process_uuid=process_uuid,
             runtime_target_id=self._state.generation_digest,
-            runtime_source_id=self._spec.name,
-            runtime_source_epoch=(
-                self._template.runtime_source_epoch_base + self._state.generation
-            ),
+            runtime_source_id=runtime_source_id,
+            runtime_source_epoch=runtime_source_epoch,
             private_dispatch_token=self._private_dispatch_token,
             update_identity=self._state.update_identity,
             initial_generation_id=self._template.initial_generation_id,

@@ -88,13 +88,16 @@ async def test_failure_stops_whole_gang_before_callback_and_restarts_generation(
         ReplicaLaunchTemplate(
             served_model_name="model@0",
             lora_path="/step/0000",
-            runtime_source_epoch_base=11,
+            runtime_source_id="slot",
+            runtime_source_epoch=11,
         ),
         on_failure=failed,
         monitor_interval_s=60,
     )
     await manager.start()
     initial_credentials = manager.dispatch_credentials
+    assert initial_credentials.runtime_generation == 0
+    assert initial_credentials.runtime_source_id == "slot"
     assert initial_credentials.runtime_source_epoch == 11
     launchers["host1"].failed = True
 
@@ -119,7 +122,9 @@ async def test_failure_stops_whole_gang_before_callback_and_restarts_generation(
     assert restarted.generation == 1
     assert restarted.generation_digest != failures[0].generation_digest
     assert manager.dispatch_credentials.target_id == restarted.generation_digest
-    assert manager.dispatch_credentials.runtime_source_epoch == 12
+    assert manager.dispatch_credentials.runtime_generation == 1
+    assert manager.dispatch_credentials.runtime_source_id == "slot"
+    assert manager.dispatch_credentials.runtime_source_epoch == 11
     assert (
         manager.dispatch_credentials.authorization_token
         != initial_credentials.authorization_token
@@ -133,4 +138,11 @@ async def test_failure_stops_whole_gang_before_callback_and_restarts_generation(
             29500,
             29500,
         ]
+        assert [
+            (
+                request.launch_config.runtime_source_id,
+                request.launch_config.runtime_source_epoch,
+            )
+            for request in launcher.requests
+        ] == [("slot", 11), ("slot", 11)]
     await manager.stop()

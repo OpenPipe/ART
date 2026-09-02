@@ -232,6 +232,8 @@ async def launch_megatron_slot(
                 base_model=config.base_model,
                 config=cast(dev.BackendModelConfig, dict(config.model)),
                 runtime_spec=runtime_spec,
+                runtime_source_id=config.slot_id,
+                runtime_source_epoch=config.runtime_source_epoch,
             )
             if config.topology.model_services
             else None
