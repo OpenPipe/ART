@@ -4,6 +4,7 @@ import hashlib
 import json
 from types import SimpleNamespace
 
+import httpx
 import pytest
 
 from art.distributed.adapter_transport import (
@@ -52,6 +53,52 @@ def _activated_publisher() -> MegatronPairedInferencePublisher:
     publisher._activated_publication_leases = Counter()
     publisher._closed = False
     return publisher
+
+
+@pytest.mark.asyncio
+async def test_holder_update_retries_ambiguous_transport_response(monkeypatch) -> None:
+    calls: list[tuple[str, dict[str, object], dict[str, str]]] = []
+    receipt = {"update_identity": "update-1"}
+
+    class _Client:
+        def __init__(self, *, timeout: float) -> None:
+            assert timeout == 330.0
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args) -> None:
+            return None
+
+        async def post(self, url, *, json, headers):
+            calls.append((url, json, headers))
+            if len(calls) == 1:
+                raise httpx.ReadError("holder response was lost")
+            return httpx.Response(
+                200,
+                json=receipt,
+                request=httpx.Request("POST", url),
+            )
+
+    monkeypatch.setattr(
+        "art.megatron.paired_inference.httpx.AsyncClient",
+        _Client,
+    )
+    payload: dict[str, object] = {"operation_id": "operation-1"}
+
+    assert await _publisher()._post_update(payload) == receipt
+    assert calls == [
+        (
+            "http://holder.test:8000/art/in_flight_lora_update",
+            payload,
+            {"Authorization": "Bearer secret"},
+        ),
+        (
+            "http://holder.test:8000/art/in_flight_lora_update",
+            payload,
+            {"Authorization": "Bearer secret"},
+        ),
+    ]
 
 
 @pytest.mark.asyncio

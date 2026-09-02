@@ -519,7 +519,6 @@ class MegatronPairedInferencePublisher:
         source: ExternalAdapterSource,
         timeout_s: float,
     ) -> MegatronExternalLoraApplyResult:
-
         if source.generation_id != generation_id:
             raise ValueError("external adapter generation identity changed")
         if not operation_id or not public_alias or policy_version < 0:
@@ -727,12 +726,21 @@ class MegatronPairedInferencePublisher:
 
     async def _post_update(self, payload: dict[str, object]) -> dict[str, object]:
         url = f"{self.service.leader_endpoint.url}/art/in_flight_lora_update"
-        async with httpx.AsyncClient(timeout=330.0) as client:
-            response = await client.post(
-                url,
-                json=payload,
-                headers=_headers(self.api_key),
-            )
+        async with asyncio.timeout(330.0):
+            async with httpx.AsyncClient(timeout=330.0) as client:
+                for attempt in range(3):
+                    try:
+                        response = await client.post(
+                            url,
+                            json=payload,
+                            headers=_headers(self.api_key),
+                        )
+                    except httpx.TransportError:
+                        if attempt == 2:
+                            raise
+                        await asyncio.sleep(0.1 * (2**attempt))
+                    else:
+                        break
         response.raise_for_status()
         return _response_object(response)
 
