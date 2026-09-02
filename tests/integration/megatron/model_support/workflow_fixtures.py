@@ -70,6 +70,9 @@ _REVISIONS = {
     "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16": (
         "2d59de1cbd51c0adf384eb906b766d1aee0e0517"
     ),
+    "nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16": (
+        "b3caaabed0263651a17dc1f2d4ce97e794f76c44"
+    ),
 }
 _MULTIMODAL = {"qwen3_5_dense", "qwen3_5_moe", "gemma4_dense", "gemma4_moe"}
 
@@ -264,6 +267,7 @@ _PLAIN_TEXT: dict[str, tuple[int, int, dict[str, Any]]] = {
             "moe_shared_expert_intermediate_size": 512,
             "n_routed_experts": 4,
             "num_experts_per_tok": 2,
+            "num_nextn_predict_layers": 0,
             "tie_word_embeddings": False,
         },
     ),
@@ -408,7 +412,20 @@ def _configure(
     }
     if model_key in _PLAIN_TEXT:
         layers, hidden, values = _PLAIN_TEXT[model_key]
-        text = _set(_common(config, layers=layers, hidden=hidden, **common), **values)
+        text = _common(config, layers=layers, hidden=hidden, **common)
+        values = dict(values)
+        hybrid_pattern = values.pop("hybrid_override_pattern", None)
+        if hybrid_pattern is not None:
+            layer_types = getattr(text, "layer_types", None)
+            if isinstance(layer_types, (list, tuple)):
+                actual_pattern = "".join(
+                    _HYBRID_LAYER_SYMBOLS[layer_type] for layer_type in layer_types
+                )
+                if actual_pattern != hybrid_pattern:
+                    raise RuntimeError(f"{model_key} reduced hybrid pattern changed")
+            else:
+                text.hybrid_override_pattern = hybrid_pattern
+        text = _set(text, **values)
         if model_key == "glm52":
             text.vocab_size = source_vocab_size
         return config
@@ -919,7 +936,12 @@ def _build(
         config.save_pretrained(staging)
         if functional:
             (staging / "config.json").write_text(json.dumps(reduced, indent=2) + "\n")
-            for name in _FUNCTIONAL_REMOTE_CODE_FILES.get(model_key, ()):
+            remote_code_files = (
+                _FUNCTIONAL_REMOTE_CODE_FILES.get(model_key, ())
+                if source_config.get("auto_map")
+                else ()
+            )
+            for name in remote_code_files:
                 if source_fixture is None:
                     raise RuntimeError(
                         f"{model_key} remote code requires a parent fixture"
@@ -973,24 +995,32 @@ def _build(
                 if model_key == "nemotron_h_moe":
                     config.dtype = configured_dtype
                 fp32 = {}
+                backbone_prefix = None
                 if model_key == "nemotron_h_moe":
+                    backbone = getattr(model, "backbone", None)
+                    backbone_prefix = "backbone"
+                    if backbone is None:
+                        backbone = getattr(model, "model", None)
+                        backbone_prefix = "model"
+                    if backbone is None:
+                        raise RuntimeError("Nemotron-H HF fixture backbone changed")
                     pattern = str(config.hybrid_override_pattern)
                     for index, symbol in enumerate(pattern):
-                        mixer = model.backbone.layers[index].mixer
+                        mixer = backbone.layers[index].mixer
                         if symbol == "E":
                             torch.nn.init.normal_(
                                 mixer.gate.weight, std=float(config.initializer_range)
                             )
                         if symbol == "M":
-                            fp32[f"backbone.layers.{index}.mixer.A_log"] = (
+                            fp32[f"{backbone_prefix}.layers.{index}.mixer.A_log"] = (
                                 mixer.A_log.detach().clone()
                             )
-                            fp32[f"backbone.layers.{index}.mixer.D"] = (
+                            fp32[f"{backbone_prefix}.layers.{index}.mixer.D"] = (
                                 mixer.D.detach().clone()
                             )
                         elif symbol == "E":
                             fp32[
-                                f"backbone.layers.{index}.mixer.gate.e_score_correction_bias"
+                                f"{backbone_prefix}.layers.{index}.mixer.gate.e_score_correction_bias"
                             ] = mixer.gate.e_score_correction_bias.detach().clone()
                 model = model.to(torch.bfloat16)
                 tensors = dict(model.named_parameters()) | dict(model.named_buffers())
@@ -1004,10 +1034,13 @@ def _build(
                         layer.post_attention_layernorm.weight.fill_(residual_scale)
                         layer.post_feedforward_layernorm.weight.fill_(residual_scale)
             if model_key == "nemotron_h_moe":
-                if model._tied_weights_keys != ["lm_head.weight"]:
+                if backbone_prefix == "backbone":
+                    if model._tied_weights_keys != ["lm_head.weight"]:
+                        raise RuntimeError("Nemotron-H HF tied-weight metadata changed")
+                    model._tied_weights_keys = {}
+                    model.register_for_auto_class("AutoModelForCausalLM")
+                elif model._tied_weights_keys != {}:
                     raise RuntimeError("Nemotron-H HF tied-weight metadata changed")
-                model._tied_weights_keys = {}
-                model.register_for_auto_class("AutoModelForCausalLM")
             parameters = sum(parameter.numel() for parameter in model.parameters())
             model.save_pretrained(
                 staging,
@@ -1015,7 +1048,7 @@ def _build(
                 max_shard_size="2GB",
                 **(
                     {"save_original_format": False}
-                    if model_key == "nemotron_h_moe"
+                    if model_key == "nemotron_h_moe" and backbone_prefix == "backbone"
                     else {}
                 ),
             )
