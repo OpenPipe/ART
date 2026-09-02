@@ -453,6 +453,7 @@ async def test_external_source_uses_the_ordinary_holder_update_path(
     }
     assert result.staging_s == 0.25
     assert result.apply_s == 0.05
+    assert result.transfer_bytes == model_bytes + config_bytes
     assert replayed == result
     assert len(updates) == 2
     assert publisher._active_generations["model:active"] == "generation-3"

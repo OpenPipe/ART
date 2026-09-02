@@ -70,6 +70,7 @@ class MegatronExternalLoraApplyResult:
     source_identity: str
     tensor_bytes: int
     config_bytes: int
+    transfer_bytes: int
     staging_s: float
     apply_s: float
 
@@ -614,6 +615,7 @@ class MegatronPairedInferencePublisher:
             source_identity=source.source_identity,
             tensor_bytes=tensor_bytes,
             config_bytes=config_bytes,
+            transfer_bytes=sum(item.used_bytes for item in received),
             staging_s=max(item.materialization_s for item in received),
             apply_s=apply_s,
         )
