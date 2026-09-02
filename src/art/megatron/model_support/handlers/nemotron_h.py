@@ -38,6 +38,8 @@ from art.megatron.recurrent import parse_recurrent_prefix_tree
 
 _MOE_FFN_ALIGNMENT = 128
 _LOGICAL_MOE_FFN_ATTR = "art_nemotron_h_logical_moe_ffn_hidden_size"
+_ART_LORA_LAYER_PREFIX = "base_model.model.backbone.layers."
+_TRANSFORMERS_LORA_LAYER_PREFIX = "base_model.model.model.layers."
 _EXPERT_MAPPING_AXES = {
     "decoder.layers.*.mlp.experts.linear_fc1.weight*": 0,
     "decoder.layers.*.mlp.experts.linear_fc2.weight*": 1,
@@ -114,19 +116,45 @@ def _padding_sizes_from_hf_config(config: Any) -> tuple[int, int]:
 
 
 @lru_cache(maxsize=8)
-def _expert_sizes_from_adapter_base(base_model: str) -> tuple[int, int, int]:
+def _adapter_base_metadata(base_model: str) -> tuple[int, int, int, str]:
     config_path = Path(base_model) / "config.json"
     if not config_path.exists():
         from huggingface_hub import hf_hub_download
 
         config_path = Path(hf_hub_download(base_model, "config.json"))
-    config = json.loads(config_path.read_text(encoding="utf-8"))
-    config = config.get("text_config") or config
+    source = json.loads(config_path.read_text(encoding="utf-8"))
+    config = source.get("text_config") or source
     logical, internal = _padding_sizes_from_hf_config(config)
     experts = int(config.get("n_routed_experts", 0) or 0)
     if experts <= 0:
         raise RuntimeError("Nemotron-H config is missing n_routed_experts")
-    return logical, internal, experts
+    prefix = (
+        _ART_LORA_LAYER_PREFIX
+        if source.get("auto_map")
+        else _TRANSFORMERS_LORA_LAYER_PREFIX
+    )
+    return logical, internal, experts, prefix
+
+
+def _external_lora_layer_prefix(adapter_config: dict[str, Any]) -> str:
+    base_model = adapter_config.get("base_model_name_or_path")
+    if not isinstance(base_model, str) or not base_model:
+        raise RuntimeError(
+            "Nemotron-H LoRA conversion requires base_model_name_or_path"
+        )
+    return _adapter_base_metadata(base_model)[3]
+
+
+def _replace_lora_layer_prefix(
+    tensors: dict[str, torch.Tensor],
+    *,
+    source: str,
+    target: str,
+) -> dict[str, torch.Tensor]:
+    return {
+        target + key.removeprefix(source) if key.startswith(source) else key: tensor
+        for key, tensor in tensors.items()
+    }
 
 
 _PACKED_EXPERT_LORA_SLOTS = tuple(
@@ -194,7 +222,7 @@ def _convert_lora_padding(
         raise RuntimeError(
             "Nemotron-H LoRA conversion requires base_model_name_or_path"
         )
-    logical, internal, experts = _expert_sizes_from_adapter_base(base_model)
+    logical, internal, experts, _ = _adapter_base_metadata(base_model)
     if (
         not pad
         and (
@@ -663,11 +691,16 @@ class NemotronHHandler(DefaultMoeHandler):
         *,
         adapter_config: dict[str, Any],
     ) -> tuple[dict[str, torch.Tensor], dict[str, Any]]:
+        tensors = _convert_lora_padding(
+            tensors,
+            adapter_config=adapter_config,
+            pad=False,
+        )
         return (
-            _convert_lora_padding(
+            _replace_lora_layer_prefix(
                 tensors,
-                adapter_config=adapter_config,
-                pad=False,
+                source=_ART_LORA_LAYER_PREFIX,
+                target=_external_lora_layer_prefix(adapter_config),
             ),
             adapter_config,
         )
@@ -678,6 +711,11 @@ class NemotronHHandler(DefaultMoeHandler):
         *,
         adapter_config: dict[str, Any],
     ) -> dict[str, torch.Tensor]:
+        tensors = _replace_lora_layer_prefix(
+            tensors,
+            source=_external_lora_layer_prefix(adapter_config),
+            target=_ART_LORA_LAYER_PREFIX,
+        )
         return _convert_lora_padding(
             tensors,
             adapter_config=adapter_config,
