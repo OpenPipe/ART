@@ -1,4 +1,5 @@
 from datetime import datetime
+import math
 import os
 from typing import Any, Iterable, Literal, Type, TypedDict, TypeVar, cast
 
@@ -18,10 +19,31 @@ from openai._types import NOT_GIVEN, NotGiven, Omit
 from openai._utils import is_mapping, maybe_transform
 from openai._version import __version__
 from openai.pagination import AsyncCursorPage
-from pydantic import Field, model_validator
+from pydantic import ConfigDict, Field, FiniteFloat, model_validator
 from typing_extensions import override
 
-from art.training import LoadStateRequest, RunCommand, RunInitialState, TrainingRunSpec
+from art.training import (
+    CheckpointArchiveRef,
+    CheckpointRef,
+    ForwardBackwardRequest,
+    ForwardBackwardResult,
+    ForwardRequest,
+    ForwardResult,
+    LoadStateRequest,
+    LoadStateResult,
+    OperationResult,
+    OptimStepResult,
+    PackedInputCaptureRef,
+    RunCommand,
+    RunInitialState,
+    SaveStateResult,
+    SaveWeightsForSamplerRequest,
+    ServiceCheckpointSource,
+    TokenLogprobs,
+    TrainingInputObjectRef,
+    TrainingRunSpec,
+    WandbArtifactCheckpointSource,
+)
 
 from ..trajectories import TrajectoryGroup
 from ..types import SFTMetricLoggingConfig
@@ -182,6 +204,281 @@ class NativeTrainingResultRelease(BaseModel):
     operation_id: str
     request_id: str
     released: Literal[True]
+
+
+class RemoteSamplerPublicationResult(OperationResult):
+    """Logical sampler identity returned by the public serverless boundary."""
+
+    kind: Literal["save_sampler"] = "save_sampler"
+    checkpoint: CheckpointRef
+    target: Literal["active", "saved_generation"]
+    model_alias: str = Field(min_length=1, max_length=255)
+    generation_id: str = Field(min_length=1, max_length=255)
+
+
+class _PublicWireModel(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+
+class _PublicCheckpointRef(_PublicWireModel):
+    checkpoint_id: str
+    learner_version: int = Field(ge=0)
+
+
+class _PublicPackingOutcome(_PublicWireModel):
+    packed_sequence_length: int = Field(ge=1)
+    packed_sequences: int = Field(ge=0)
+    target_packed_sequences: int = Field(ge=1)
+    physical_tokens: int = Field(ge=0)
+    non_padding_tokens: int = Field(ge=0)
+    loss_bearing_tokens: int = Field(ge=0)
+    trainable_assistant_tokens: int = Field(ge=0)
+
+
+class _PublicPackingLeafShape(_PublicWireModel):
+    token_ids: tuple[int, ...] = Field(min_length=1)
+    shareable_length: int = Field(ge=0)
+
+    @model_validator(mode="after")
+    def _validate_shareable_length(self) -> "_PublicPackingLeafShape":
+        if self.shareable_length > len(self.token_ids):
+            raise ValueError("shareable_length exceeds packing token count")
+        return self
+
+
+class _PublicPackedGroupShape(_PublicWireModel):
+    leaves: tuple[_PublicPackingLeafShape, ...] = Field(min_length=1)
+
+
+class _PublicPackedInputRef(_PublicWireModel):
+    capture_id: str
+    manifest_sha256: str
+    content_sha256: str | None
+    input_kind: Literal["rl", "sft", "tokenized"]
+    min_source_version: int = Field(ge=0)
+    max_source_version: int = Field(ge=0)
+
+
+class _PublicTrainingResult(_PublicWireModel):
+    operation_id: str
+    kind: NativeOperationKind
+    metrics: dict[str, FiniteFloat] = Field(default_factory=dict)
+    packing: _PublicPackingOutcome | None = None
+    produced_gradient: bool | None = None
+    token_logprobs: tuple[TokenLogprobs, ...] = ()
+    group_shapes: tuple[_PublicPackedGroupShape, ...] = ()
+    packed_input: _PublicPackedInputRef | None = None
+    contributing_operation_ids: tuple[str, ...] | None = None
+    checkpoint: _PublicCheckpointRef | None = None
+    learner_version: int | None = Field(default=None, ge=0)
+    target: Literal["active", "saved_generation"] | None = None
+    model_alias: str | None = None
+    generation_id: str | None = None
+    archive: CheckpointArchiveRef | None = None
+    optimizer_restored: bool | None = None
+
+
+class _PublicResultRef(_PublicWireModel):
+    result_id: str
+    media_type: Literal[
+        "application/json",
+        "application/vnd.coreweave.training-result+msgpack; version=1",
+    ]
+    size_bytes: int = Field(ge=1)
+    expires_at: datetime
+
+
+class _PublicOperationError(_PublicWireModel):
+    code: str
+
+
+class _PublicTrainingOperation(_PublicWireModel):
+    operation_id: str
+    run_id: str
+    request_id: str
+    sequence_id: int
+    kind: NativeOperationKind
+    status: NativeOperationStatus
+    learner_parent_version: int
+    reserved_output_learner_version: int | None
+    admitted_at: datetime
+    started_at: datetime | None
+    ended_at: datetime | None
+    cancel_requested: bool
+    latest_event_cursor: int
+    result_summary: _PublicTrainingResult | None
+    result_ref: _PublicResultRef | None
+    error: _PublicOperationError | None
+
+
+class _NativePublicWireAdapter:
+    """Translate between ART contracts and the frozen public training wire."""
+
+    @staticmethod
+    def command(request: RunCommand) -> dict[str, Any]:
+        body = request.model_dump(mode="json", exclude={"run_id"})
+        if isinstance(request, (ForwardRequest, ForwardBackwardRequest)):
+            if isinstance(
+                request.batch, (PackedInputCaptureRef, TrainingInputObjectRef)
+            ):
+                raise ValueError(
+                    "native serverless commands require a public raw training batch"
+                )
+            if request.loss.name == "ppo":
+                raise ValueError("native serverless commands do not support PPO")
+            values = dict(request.loss.values)
+            allowed = {"clip_low_threshold", "clip_high_threshold"}
+            unsupported = sorted(set(values) - allowed)
+            if unsupported:
+                raise ValueError(
+                    "native serverless loss has unsupported values: "
+                    + ", ".join(unsupported)
+                )
+            if request.loss.name != "cispo" and values:
+                raise ValueError(
+                    "native serverless clip thresholds are supported only for CISPO"
+                )
+            loss: dict[str, Any] = {
+                "name": request.loss.name,
+                "normalize_advantages": request.loss.normalize_advantages,
+            }
+            for key, value in values.items():
+                if (
+                    isinstance(value, bool)
+                    or not isinstance(value, (int, float))
+                    or not math.isfinite(float(value))
+                ):
+                    raise ValueError(
+                        f"native serverless loss value {key!r} must be finite"
+                    )
+                loss[key] = float(value)
+            body["loss"] = loss
+        elif isinstance(request, SaveWeightsForSamplerRequest):
+            target = {
+                "in_flight_lora": "active",
+                "versioned_lora": "saved_generation",
+            }.get(request.publication.mode)
+            if target is None or request.publication.model_alias is None:
+                raise ValueError(
+                    "native serverless publication requires active or saved-generation LoRA"
+                )
+            body["publication"] = {
+                "target": target,
+                "model_alias": request.publication.model_alias,
+            }
+        elif isinstance(request, LoadStateRequest):
+            checkpoint = request.checkpoint
+            if checkpoint.startswith("service-checkpoint:"):
+                source = ServiceCheckpointSource(
+                    checkpoint_id=checkpoint.removeprefix("service-checkpoint:")
+                )
+            elif checkpoint.startswith("wandb-artifact:"):
+                source = WandbArtifactCheckpointSource(
+                    artifact=checkpoint.removeprefix("wandb-artifact:")
+                )
+            else:
+                source = ServiceCheckpointSource(checkpoint_id=checkpoint)
+            body["source"] = source.model_dump(mode="json")
+            del body["checkpoint"]
+        return body
+
+    @classmethod
+    def operation(cls, public: _PublicTrainingOperation) -> NativeTrainingOperation:
+        result = None
+        if public.result_summary is not None:
+            if public.result_summary.kind != public.kind:
+                raise ValueError("public operation result kind changed")
+            result = cls._result_payload(public.run_id, public.result_summary)
+        return NativeTrainingOperation(
+            operation_id=public.operation_id,
+            run_id=public.run_id,
+            request_id=public.request_id,
+            sequence_id=public.sequence_id,
+            kind=public.kind,
+            status=public.status,
+            learner_parent_version=public.learner_parent_version,
+            reserved_output_learner_version=public.reserved_output_learner_version,
+            admitted_at=public.admitted_at,
+            execution_started_at=public.started_at,
+            execution_ended_at=public.ended_at,
+            cancel_requested=public.cancel_requested,
+            latest_event_cursor=public.latest_event_cursor,
+            result_available=(
+                public.result_summary is not None or public.result_ref is not None
+            ),
+            result=result,
+            error=(
+                None if public.error is None else public.error.model_dump(mode="python")
+            ),
+        )
+
+    @classmethod
+    def result(cls, run_id: str, public: _PublicTrainingResult) -> NativeTrainingResult:
+        return NativeTrainingResult(
+            operation_id=public.operation_id,
+            kind=public.kind,
+            result=cls._result_payload(run_id, public),
+        )
+
+    @staticmethod
+    def _checkpoint(run_id: str, value: Any) -> dict[str, Any]:
+        if not isinstance(value, dict):
+            raise ValueError("public checkpoint result must be an object")
+        return {"run_id": run_id, **value}
+
+    @classmethod
+    def _result_payload(
+        cls, run_id: str, public: _PublicTrainingResult
+    ) -> dict[str, Any]:
+        payload = public.model_dump(mode="json", exclude_unset=True)
+        kind = public.kind
+        if kind in {"forward", "forward_backward"}:
+            packing = payload.get("packing")
+            if not isinstance(packing, dict):
+                raise ValueError("public forward result has no packing object")
+            packing["group_shapes"] = payload.pop("group_shapes", [])
+            packed_input = payload.pop("packed_input", None)
+            if packed_input is not None:
+                if not isinstance(packed_input, dict):
+                    raise ValueError("public packed-input result must be an object")
+                payload["packed_input_capture"] = {
+                    "kind": "captured",
+                    "run_id": run_id,
+                    **packed_input,
+                }
+            result_type = (
+                ForwardBackwardResult if kind == "forward_backward" else ForwardResult
+            )
+        elif kind == "optim_step":
+            payload["contributing_forward_backward_operation_ids"] = payload.pop(
+                "contributing_operation_ids"
+            )
+            learner_version = payload.pop("learner_version")
+            payload["checkpoint"] = cls._checkpoint(run_id, payload["checkpoint"])
+            if learner_version != payload["checkpoint"]["learner_version"]:
+                raise ValueError("public optimizer learner version changed")
+            result_type = OptimStepResult
+        elif kind == "save_weights_for_sampler":
+            learner_version = payload.pop("learner_version")
+            payload["kind"] = "save_sampler"
+            payload["checkpoint"] = cls._checkpoint(run_id, payload["checkpoint"])
+            if learner_version != payload["checkpoint"]["learner_version"]:
+                raise ValueError("public sampler learner version changed")
+            result_type = RemoteSamplerPublicationResult
+        elif kind == "save_state":
+            if "archive" not in payload:
+                raise ValueError("public save-state result has no archive")
+            payload["checkpoint"] = cls._checkpoint(run_id, payload["checkpoint"])
+            result_type = SaveStateResult
+        elif kind == "load_state":
+            payload["checkpoint"] = cls._checkpoint(run_id, payload["checkpoint"])
+            result_type = LoadStateResult
+        else:
+            raise ValueError(f"unsupported public training result {kind!r}")
+        return result_type.model_validate(payload).model_dump(mode="python")
+
+
+_NATIVE_PUBLIC_WIRE = _NativePublicWireAdapter()
 
 
 class Models(AsyncAPIResource):
@@ -362,31 +659,35 @@ class TrainingRuns(AsyncAPIResource):
         return await self._get(f"/training/runs/{run_id}", cast_to=NativeTrainingRun)
 
     async def submit(self, request: RunCommand) -> NativeTrainingOperation:
-        return await self._post(
+        public = await self._post(
             f"/training/runs/{request.run_id}/{request_kind_endpoint(request)}",
-            cast_to=NativeTrainingOperation,
-            body=request.model_dump(mode="json", exclude={"run_id"}),
+            cast_to=_PublicTrainingOperation,
+            body=_NATIVE_PUBLIC_WIRE.command(request),
         )
+        return _NATIVE_PUBLIC_WIRE.operation(public)
 
     async def operation(
         self, run_id: str, operation_id: str
     ) -> NativeTrainingOperation:
-        return await self._get(
+        public = await self._get(
             f"/training/runs/{run_id}/operations/{operation_id}",
-            cast_to=NativeTrainingOperation,
+            cast_to=_PublicTrainingOperation,
         )
+        return _NATIVE_PUBLIC_WIRE.operation(public)
 
     async def cancel(self, run_id: str, operation_id: str) -> NativeTrainingOperation:
-        return await self._post(
+        public = await self._post(
             f"/training/runs/{run_id}/operations/{operation_id}:cancel",
-            cast_to=NativeTrainingOperation,
+            cast_to=_PublicTrainingOperation,
         )
+        return _NATIVE_PUBLIC_WIRE.operation(public)
 
     async def result(self, run_id: str, operation_id: str) -> NativeTrainingResult:
-        return await self._get(
+        public = await self._get(
             f"/training/runs/{run_id}/operations/{operation_id}/result",
-            cast_to=NativeTrainingResult,
+            cast_to=_PublicTrainingResult,
         )
+        return _NATIVE_PUBLIC_WIRE.result(run_id, public)
 
     async def release_result(
         self, run_id: str, operation_id: str, *, request_id: str

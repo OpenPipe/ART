@@ -19,7 +19,6 @@ from art.training import (
     OptimStepResult,
     RunCommand,
     RunInitialState,
-    SamplerWeightsResult,
     SaveStateRequest,
     SaveStateResult,
     SaveWeightsForSamplerRequest,
@@ -30,6 +29,7 @@ from .client import (
     NativeTrainingOperation,
     NativeTrainingResultRelease,
     NativeTrainingRun,
+    RemoteSamplerPublicationResult,
     TrainingRuns,
     request_kind,
 )
@@ -218,8 +218,8 @@ class RemoteTrainingClient:
 
     async def save_weights_for_sampler(
         self, request: SaveWeightsForSamplerRequest
-    ) -> RemoteTrainingOperation[SamplerWeightsResult]:
-        return await self._submit(request, SamplerWeightsResult)
+    ) -> RemoteTrainingOperation[RemoteSamplerPublicationResult]:
+        return await self._submit(request, RemoteSamplerPublicationResult)
 
     async def save_state(
         self, request: SaveStateRequest

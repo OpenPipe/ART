@@ -621,7 +621,7 @@ class ServerlessBackend:
         )
         publication_result = await publication.result()
         self._native_steps[key] = optimizer_result.checkpoint.learner_version
-        self._native_artifacts[key] = publication_result.lora
+        self._native_artifacts[key] = publication_result.generation_id
         if verbose:
             print(
                 "Native training operations: "
@@ -747,7 +747,7 @@ class ServerlessBackend:
         publication_result = await publication.result()
         key = model._storage_name()
         self._native_steps[key] = optimizer_result.checkpoint.learner_version
-        self._native_artifacts[key] = publication_result.lora
+        self._native_artifacts[key] = publication_result.generation_id
         wandb_run = model._get_wandb_run()
         if wandb_run is not None:
             record_provenance(wandb_run, "serverless-sft")

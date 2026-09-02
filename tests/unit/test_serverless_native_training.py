@@ -3,26 +3,42 @@ from typing import Any, cast
 
 import pytest
 
+from art.distributed.trajectory_store import TrajectoryGroupBundle
 from art.serverless.client import (
     NativeOperationStatus,
     NativeTrainingOperation,
     NativeTrainingResult,
     NativeTrainingResultRelease,
     NativeTrainingRun,
+    RemoteSamplerPublicationResult,
     TrainingRuns,
 )
 from art.serverless.native_training import RemoteTrainingClient, RemoteTrainingError
 from art.training import (
+    AdamConfig,
     AdapterSpec,
+    ForwardBackwardRequest,
+    ForwardBackwardResult,
     ForwardRequest,
+    ForwardResult,
+    LoadStateRequest,
+    LoadStateResult,
     LossConfig,
+    OptimStepRequest,
+    OptimStepResult,
     PackedInputCaptureRef,
     PackingOutcome,
+    RlTrajectoryBatch,
     RunInitialState,
+    SamplerPublication,
+    SaveStateRequest,
+    SaveStateResult,
+    SaveWeightsForSamplerRequest,
     ServiceCheckpointSource,
     TrainingRunSpec,
     WandbArtifactCheckpointSource,
 )
+from art.trajectories import Trajectory, TrajectoryGroup
 
 
 class _TrainingRuns:
@@ -153,6 +169,59 @@ class _ResolveTransport(TrainingRuns):
             projected_learner_version=2,
             committed_learner_version=2,
         )
+
+
+class _PublicWireTransport(TrainingRuns):
+    def __init__(self, result_payloads: tuple[dict[str, Any], ...]) -> None:
+        self.posts: list[tuple[str, dict[str, Any]]] = []
+        self.result_payloads = result_payloads
+        self.operations: dict[str, tuple[dict[str, Any], str]] = {}
+
+    async def _post(self, path, *, cast_to, body):
+        self.posts.append((path, body))
+        endpoint = path.rsplit("/", 1)[-1]
+        operation_id = f"operation-{body['sequence_id']}"
+        self.operations[operation_id] = (body, endpoint)
+        return cast_to.model_validate(self._operation(operation_id, status="admitted"))
+
+    async def _get(self, path, *, cast_to):
+        operation_id = path.split("/operations/", 1)[1].split("/", 1)[0]
+        if path.endswith("/result"):
+            sequence_id = int(operation_id.removeprefix("operation-"))
+            return cast_to.model_validate(self.result_payloads[sequence_id])
+        return cast_to.model_validate(self._operation(operation_id, status="succeeded"))
+
+    def _operation(self, operation_id: str, *, status: str) -> dict[str, Any]:
+        body, endpoint = self.operations[operation_id]
+        now = datetime(2026, 9, 2, tzinfo=UTC)
+        transition = endpoint in {"optim_step", "load_state"}
+        return {
+            "operation_id": operation_id,
+            "run_id": "run-native",
+            "request_id": body["request_id"],
+            "sequence_id": body["sequence_id"],
+            "kind": endpoint,
+            "status": status,
+            "learner_parent_version": 0,
+            "reserved_output_learner_version": 1 if transition else None,
+            "admitted_at": now,
+            "started_at": now if status == "succeeded" else None,
+            "ended_at": now if status == "succeeded" else None,
+            "cancel_requested": False,
+            "latest_event_cursor": body["sequence_id"] + 1,
+            "result_summary": None,
+            "result_ref": (
+                {
+                    "result_id": operation_id,
+                    "media_type": "application/json",
+                    "size_bytes": 1,
+                    "expires_at": datetime(2026, 9, 3, tzinfo=UTC),
+                }
+                if status == "succeeded"
+                else None
+            ),
+            "error": None,
+        }
 
 
 def _request(
@@ -313,6 +382,229 @@ async def test_training_runs_resolve_serializes_exact_initial_state() -> None:
             "restore_optimizer": False,
         },
     }
+
+
+@pytest.mark.asyncio
+async def test_training_runs_translate_the_complete_public_wire() -> None:
+    packed = {
+        "packed_sequence_length": 8,
+        "packed_sequences": 1,
+        "target_packed_sequences": 1,
+        "physical_tokens": 8,
+        "non_padding_tokens": 7,
+        "loss_bearing_tokens": 4,
+        "trainable_assistant_tokens": 4,
+    }
+    public_capture = {
+        "capture_id": "capture-public",
+        "manifest_sha256": "a" * 64,
+        "content_sha256": "b" * 64,
+        "input_kind": "rl",
+        "min_source_version": 0,
+        "max_source_version": 0,
+    }
+    public_checkpoint = {"checkpoint_id": "checkpoint-1", "learner_version": 1}
+    result_payloads = (
+        {
+            "kind": "forward",
+            "operation_id": "operation-0",
+            "metrics": {"loss": 1.0},
+            "packing": packed,
+            "token_logprobs": [],
+            "group_shapes": [
+                {"leaves": [{"token_ids": [1, 2], "shareable_length": 1}]}
+            ],
+            "packed_input": public_capture,
+        },
+        {
+            "kind": "forward_backward",
+            "operation_id": "operation-1",
+            "metrics": {},
+            "packing": packed,
+            "produced_gradient": True,
+            "token_logprobs": [],
+            "group_shapes": [],
+            "packed_input": public_capture,
+        },
+        {
+            "kind": "optim_step",
+            "operation_id": "operation-2",
+            "metrics": {},
+            "contributing_operation_ids": ["operation-1"],
+            "checkpoint": public_checkpoint,
+            "learner_version": 1,
+        },
+        {
+            "kind": "save_weights_for_sampler",
+            "operation_id": "operation-3",
+            "metrics": {},
+            "target": "saved_generation",
+            "model_alias": "sampler",
+            "generation_id": "generation-1",
+            "learner_version": 1,
+            "checkpoint": public_checkpoint,
+        },
+        {
+            "kind": "save_state",
+            "operation_id": "operation-4",
+            "metrics": {},
+            "checkpoint": public_checkpoint,
+            "archive": {
+                **public_checkpoint,
+                "components": ["weights", "optimizer"],
+                "wandb_artifact": "entity/project/checkpoint:v1",
+            },
+        },
+        {
+            "kind": "load_state",
+            "operation_id": "operation-5",
+            "metrics": {},
+            "checkpoint": {"checkpoint_id": "checkpoint-2", "learner_version": 2},
+            "optimizer_restored": True,
+        },
+    )
+    service = _PublicWireTransport(result_payloads)
+    raw_batch = RlTrajectoryBatch(
+        groups=(
+            TrajectoryGroupBundle.from_group(
+                TrajectoryGroup(
+                    [
+                        Trajectory(
+                            messages_and_choices=[
+                                {"role": "assistant", "content": "answer"}
+                            ],
+                            reward=1.0,
+                        )
+                    ]
+                )
+            ),
+        ),
+        min_source_version=0,
+        max_source_version=0,
+    )
+    requests = (
+        ForwardRequest(
+            run_id="run-native",
+            request_id="forward",
+            sequence_id=0,
+            batch=raw_batch,
+            loss=LossConfig(
+                name="cispo",
+                values={"clip_low_threshold": 0.2, "clip_high_threshold": 0.3},
+            ),
+            collect_packing_shapes=True,
+            retain_packed_input=True,
+        ),
+        ForwardBackwardRequest(
+            run_id="run-native",
+            request_id="forward-backward",
+            sequence_id=1,
+            batch=raw_batch,
+            loss=LossConfig(name="cispo"),
+            retain_packed_input=True,
+        ),
+        OptimStepRequest(
+            run_id="run-native",
+            request_id="optimizer",
+            sequence_id=2,
+            optimizer=AdamConfig(learning_rate=1e-5),
+        ),
+        SaveWeightsForSamplerRequest(
+            run_id="run-native",
+            request_id="publication",
+            sequence_id=3,
+            checkpoint_name="checkpoint-1",
+            publication=SamplerPublication(
+                mode="versioned_lora", model_alias="sampler"
+            ),
+        ),
+        SaveStateRequest(
+            run_id="run-native",
+            request_id="save",
+            sequence_id=4,
+            checkpoint_name="checkpoint-1",
+        ),
+        LoadStateRequest(
+            run_id="run-native",
+            request_id="load",
+            sequence_id=5,
+            checkpoint="service-checkpoint:checkpoint-2",
+            restore_optimizer=True,
+        ),
+    )
+    result_types = (
+        ForwardResult,
+        ForwardBackwardResult,
+        OptimStepResult,
+        RemoteSamplerPublicationResult,
+        SaveStateResult,
+        LoadStateResult,
+    )
+
+    translated = []
+    for request, result_type in zip(requests, result_types, strict=True):
+        admitted = await service.submit(request)
+        assert admitted.execution_started_at is None
+        assert admitted.execution_ended_at is None
+        assert not admitted.result_available
+        terminal = await service.operation("run-native", admitted.operation_id)
+        assert terminal.execution_started_at == terminal.execution_ended_at
+        assert terminal.result_available and terminal.result is None
+        envelope = await service.result("run-native", admitted.operation_id)
+        translated.append(result_type.model_validate(envelope.result))
+
+    assert [path.rsplit("/", 1)[-1] for path, _ in service.posts] == [
+        "forward",
+        "forward_backward",
+        "optim_step",
+        "save_weights_for_sampler",
+        "save_state",
+        "load_state",
+    ]
+    assert service.posts[0][1]["loss"] == {
+        "name": "cispo",
+        "normalize_advantages": True,
+        "clip_low_threshold": 0.2,
+        "clip_high_threshold": 0.3,
+    }
+    assert service.posts[3][1]["publication"] == {
+        "target": "saved_generation",
+        "model_alias": "sampler",
+    }
+    assert service.posts[5][1]["source"] == {
+        "kind": "service_checkpoint",
+        "checkpoint_id": "checkpoint-2",
+    }
+    forward, forward_backward, optimizer, sampler, saved, loaded = translated
+    assert forward.packing.group_shapes[0].leaves[0].token_ids.tolist() == [1, 2]
+    assert forward.packed_input_capture is not None
+    assert forward.packed_input_capture.run_id == "run-native"
+    assert forward_backward.produced_gradient
+    assert optimizer.contributing_forward_backward_operation_ids == ("operation-1",)
+    assert sampler.kind == "save_sampler"
+    assert (
+        sampler.target,
+        sampler.model_alias,
+        sampler.generation_id,
+    ) == ("saved_generation", "sampler", "generation-1")
+    assert all(
+        result.checkpoint.run_id == "run-native"
+        for result in (optimizer, sampler, saved, loaded)
+    )
+    assert saved.archive is not None and loaded.optimizer_restored
+
+    with pytest.raises(ValueError, match="do not support PPO"):
+        await service.submit(
+            requests[0].model_copy(update={"loss": LossConfig(name="ppo")})
+        )
+    with pytest.raises(ValueError, match="public raw training batch"):
+        await service.submit(_request())
+    service.result_payloads = (
+        result_payloads[0] | {"physical_lora_locator": "private"},
+        *result_payloads[1:],
+    )
+    with pytest.raises(ValueError, match="Extra inputs are not permitted"):
+        await service.result("run-native", "operation-0")
 
 
 @pytest.mark.asyncio

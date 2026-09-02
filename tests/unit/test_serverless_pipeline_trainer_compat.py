@@ -185,7 +185,9 @@ async def test_serverless_train_model_forwards_experimental_config() -> None:
         captured["save_weights_for_sampler"] = request
         return SimpleNamespace(
             ref=SimpleNamespace(operation_id="save-sampler"),
-            result=AsyncMock(return_value=SimpleNamespace(lora="lora-ref")),
+            result=AsyncMock(
+                return_value=SimpleNamespace(generation_id="generation-1")
+            ),
         )
 
     client.forward_backward = forward_backward
@@ -291,7 +293,9 @@ async def test_serverless_train_sft_uses_native_commands() -> None:
         client.next_sequence_id = 3
         return SimpleNamespace(
             ref=SimpleNamespace(operation_id="sft-save-sampler"),
-            result=AsyncMock(return_value=SimpleNamespace(lora="lora-ref")),
+            result=AsyncMock(
+                return_value=SimpleNamespace(generation_id="generation-5")
+            ),
         )
 
     client.forward_backward = forward_backward
@@ -346,7 +350,7 @@ async def test_serverless_train_sft_uses_native_commands() -> None:
     ]
     assert backend.logs_sft_metrics_remotely() is False
     assert backend._native_steps[model._storage_name()] == 5
-    assert backend._native_artifacts[model._storage_name()] == "lora-ref"
+    assert backend._native_artifacts[model._storage_name()] == "generation-5"
     forward_operation.cancel.assert_not_awaited()
 
 
