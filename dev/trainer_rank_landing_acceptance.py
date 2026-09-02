@@ -2049,6 +2049,7 @@ def phase_cost_calibrate(
             "model": model,
             "layers": int(rank._num_layers),
             "gdn_layers": _gdn_layer_count(runtime.model[0]),
+            "planner_gdn_layers": rank._planner_topology_facts().gdn_layers,
             "uses_gdn": bool(
                 getattr(
                     runtime.model_support_handler, "build_gdn_execution_spec", False
@@ -2062,15 +2063,17 @@ def phase_cost_calibrate(
             tuple(r.input_tokens.reshape(-1).to(torch.long) for r in requests)
         )
         candidates = prefix_tree_layout_candidates(tree)
-        cp_size, planner_layers, uses_gdn = rank._planner_topology_facts()
+        facts = rank._planner_topology_facts()
         candidate_rows = []
         for candidate in candidates:
             features = layout_features(candidate.layout)
             score = prefix_tree_layout_score(
                 candidate.layout,
-                cp_size=cp_size,
-                layers=planner_layers,
-                uses_gdn=uses_gdn,
+                cp_size=facts.cp_size,
+                layers=facts.layers,
+                uses_gdn=facts.uses_gdn,
+                tp_size=facts.tp_size,
+                gdn_layers=facts.gdn_layers,
             )
             candidate_rows.append(
                 {

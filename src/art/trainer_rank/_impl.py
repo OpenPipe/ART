@@ -28,6 +28,7 @@ from typing import (
     Any,
     Generic,
     Literal,
+    NamedTuple,
     NotRequired,
     Self,
     SupportsIndex,
@@ -1032,6 +1033,30 @@ def _local_wave_indices(
     return tuple(range(start + dp_rank, start + width, dp_size))
 
 
+class _PlannerFacts(NamedTuple):
+    """Topology and model facts the layout scorer prices against."""
+
+    cp_size: int
+    tp_size: int
+    layers: int
+    gdn_layers: int
+    uses_gdn: bool
+
+
+# Content hash, planner facts, coefficient version, forced/memory anchor.
+_LayoutKey = tuple[str, _PlannerFacts, int, str | None]
+
+
+def _gdn_layer_count(model: torch.nn.Module) -> int:
+    """Number of gated-delta-net layers in the model (0 when unavailable)."""
+
+    try:
+        from megatron.core.ssm.gated_delta_net import GatedDeltaNet
+    except ImportError:
+        return 0
+    return sum(isinstance(module, GatedDeltaNet) for module in model.modules())
+
+
 def _split_chunks(
     order: Sequence[int],
     requests: Sequence[AnyForwardInput],
@@ -1091,6 +1116,13 @@ class TrainerRank:
             or getattr(runtime.provider, "num_layers", 1)
             or 1
         )
+        # Layers that run the gated-delta-net path (Qwen3.5-4B: 24 of 32); the
+        # cost model prices GDN state hand-offs per GDN layer, not per layer.
+        self._gdn_layers = _gdn_layer_count(runtime.model[0])
+        if self._gdn_layers == 0 and bool(
+            getattr(runtime.model_support_handler, "build_gdn_execution_spec", False)
+        ):
+            self._gdn_layers = self._num_layers
         self._default_slot_ref: LoRASlotRef | None = None
         self._slot_stack: list[LoRASlotRef] = []
         self._checkpoint_slots: dict[str, _CheckpointSlot] = {}
@@ -1126,7 +1158,7 @@ class TrainerRank:
         # content on consecutive calls); fresh-token training steps must not
         # accumulate entries for the lifetime of the rank.
         self._layout_selection_cache: OrderedDict[
-            tuple[str, int, int, bool, int, str | None],
+            _LayoutKey,
             tuple[CanonicalPrefixTree, PrefixTreeLayout],
         ] = OrderedDict()
         self._tree_cache: OrderedDict[str, CanonicalPrefixTree] = OrderedDict()
@@ -3366,14 +3398,20 @@ class TrainerRank:
             return None
         return os.environ.get(_TEST_ANCHOR_ENV) or None
 
-    def _planner_topology_facts(self) -> tuple[int, int, bool]:
-        cp_size = self._topology_key()[2]
+    def _planner_topology_facts(self) -> "_PlannerFacts":
+        _dp, tp_size, cp_size, _pp = self._topology_key()
         uses_gdn = bool(
             getattr(
                 self.runtime.model_support_handler, "build_gdn_execution_spec", False
             )
         )
-        return cp_size, self._num_layers, uses_gdn
+        return _PlannerFacts(
+            cp_size=cp_size,
+            tp_size=tp_size,
+            layers=self._num_layers,
+            gdn_layers=self._gdn_layers if uses_gdn else 0,
+            uses_gdn=uses_gdn,
+        )
 
     def _layout_anchor(self, *, memory_minimal: bool) -> str | None:
         """Resolve the layout anchor: test forcing wins, else memory policy."""
@@ -3388,8 +3426,8 @@ class TrainerRank:
         input_ids: Sequence[torch.Tensor],
         *,
         memory_minimal: bool = False,
-    ) -> tuple[str, int, int, bool, int, str | None]:
-        cp_size, layers, uses_gdn = self._planner_topology_facts()
+    ) -> "_LayoutKey":
+        facts = self._planner_topology_facts()
         hasher = hashlib.sha256()
         for tensor in input_ids:
             row = tensor.detach().reshape(-1).cpu().contiguous()
@@ -3398,16 +3436,14 @@ class TrainerRank:
             hasher.update(row.numpy())
         return (
             hasher.hexdigest(),
-            cp_size,
-            layers,
-            uses_gdn,
+            facts,
             COEFFICIENT_VERSION,
             self._layout_anchor(memory_minimal=memory_minimal),
         )
 
     def _cached_group_layout(
         self,
-        key: tuple[str, int, int, bool, int, str | None],
+        key: "_LayoutKey",
     ) -> tuple[CanonicalPrefixTree, PrefixTreeLayout] | None:
         with self._layout_cache_lock:
             cached = self._layout_selection_cache.get(key)
@@ -3418,7 +3454,7 @@ class TrainerRank:
     def _compute_group_layout(
         self,
         input_ids: Sequence[torch.Tensor],
-        key: tuple[str, int, int, bool, int, str | None],
+        key: "_LayoutKey",
     ) -> tuple[CanonicalPrefixTree, PrefixTreeLayout]:
         """Plan one group and memoize the result.
 
@@ -3429,7 +3465,7 @@ class TrainerRank:
         memory-minimal layouts of one group share a single construction.
         """
 
-        content_key, cp_size, layers, uses_gdn, _, anchor = key
+        content_key, facts, _, anchor = key
         with self._layout_cache_lock:
             tree = self._tree_cache.get(content_key)
             if tree is not None:
@@ -3451,9 +3487,11 @@ class TrainerRank:
         else:
             layout = select_prefix_tree_layout(
                 tree,
-                cp_size=cp_size,
-                layers=layers,
-                uses_gdn=uses_gdn,
+                cp_size=facts.cp_size,
+                layers=facts.layers,
+                uses_gdn=facts.uses_gdn,
+                tp_size=facts.tp_size,
+                gdn_layers=facts.gdn_layers,
                 refinement_work_budget=_PLANNER_REFINEMENT_BUDGET,
             ).layout
         cached = (tree, layout)
@@ -3549,7 +3587,7 @@ class TrainerRank:
             pending: list[
                 tuple[
                     tuple[torch.Tensor, ...],
-                    tuple[str, int, int, bool, int, str | None],
+                    _LayoutKey,
                 ]
             ] = []
             for _, group_indices in groups:

@@ -751,12 +751,15 @@ def select_prefix_tree_layout(
     layers: int,
     uses_gdn: bool,
     refinement_work_budget: int,
+    tp_size: int = 1,
+    gdn_layers: int | None = None,
 ):
     """Production layout selection for one canonical tree.
 
-    Composes the mandatory candidate family, the calibrated production score,
-    and the bounded nonuniform refinement search.  Deterministic: identical
-    trees, topology facts, and budgets yield identical layouts on every rank.
+    Composes the mandatory candidate family, the production score, and the
+    bounded nonuniform refinement search.  Deterministic: identical trees,
+    topology facts, and budgets yield identical layouts on every rank.
+    ``gdn_layers`` defaults to ``layers`` when the model uses GDN.
     """
 
     from ._planner_cost import prefix_tree_layout_score
@@ -767,6 +770,8 @@ def select_prefix_tree_layout(
             cp_size=cp_size,
             layers=layers,
             uses_gdn=uses_gdn,
+            tp_size=tp_size,
+            gdn_layers=gdn_layers,
         )
 
     return search_prefix_tree_layout(

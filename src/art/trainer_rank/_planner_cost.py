@@ -115,9 +115,17 @@ def prefix_tree_layout_score(
     cp_size: int,
     layers: int,
     uses_gdn: bool,
+    tp_size: int = 1,
+    gdn_layers: int | None = None,
 ) -> tuple[int, int, int, int]:
-    """Price one layout for the given topology and model facts."""
+    """Price one layout for the given topology and model facts.
 
+    ``tp_size`` and ``gdn_layers`` are accepted so callers already pass the
+    full topology; the coefficient-version-1 formula below does not yet use
+    them (the recalibrated model does).
+    """
+
+    del tp_size, gdn_layers
     cp = max(1, cp_size)
     layer_count = max(1, layers)
     segment_count = len(layout.segments)
