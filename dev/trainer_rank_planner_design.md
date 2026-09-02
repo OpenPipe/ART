@@ -279,12 +279,25 @@ Gates (test-first; all failed on the refusing tree):
 - `tests/unit/test_trainer_rank_topology.py`: TP>1 constructs, PP>1 and
   multi-chunk runtimes still refuse.
 - `--phase tp2-public` (2× H200, Qwen3.5-4B full model, DP1×TP2×CP1, public
-  `dp_rank_forward`): both TP peers plan the same physical layout on every
-  call; the automatic planner selects depth>1 on the hierarchical GRPO shape;
-  odd packed lengths exercise sequence-parallel padding with outputs at the
-  final real token; automatic vs depth-one outputs, loss and active-LoRA
-  gradients agree; measured rows are compile-free and plan-cache-stable;
-  paired timing is reported, not gated.
+  `dp_rank_forward`, active LoRA slot), plus the identical cell at `--tp 1`
+  as the control: both TP peers plan the same physical layout on every call;
+  the automatic planner shares more deeply than depth-one on the hierarchical
+  GRPO shape; odd packed lengths exercise sequence-parallel padding with
+  outputs at the final real token; losses finite; measured rows compile-free
+  and plan-cache-stable; paired timing reported, not gated. Numerics are
+  gated by `--phase tp-compare` (CPU) on the two dumps. bf16 rounding differs
+  whenever the reduction order changes — a different packing and a different
+  TP degree both change it — and over 36 layers that noise is ~1.3% of the
+  mean logprob magnitude (0.19–0.20 nats per target token) on this cell, so
+  absolute tolerances borrowed from same-packing comparisons cannot separate
+  a TP defect from noise. The reference is therefore the control's own
+  cross-layout divergence measured in the same run: same-layout TP-vs-TP1
+  divergence (mean and max) and cross-layout divergence at TP (outputs and
+  LoRA gradients) must stay within 1.5× of it, losses must agree, and the
+  differences must be unstructured (no request outlier, final tokens like
+  the body, no bias). Measured: same-layout TP2-vs-TP1 1.39% vs the 1.31%
+  reference (ratio 1.06), cross-layout ratios 1.05 (outputs) and 1.06
+  (gradients), losses within 0.06%, flat per-request profile, tail = body.
 - `--phase dp2-tp2-waves` (4× H200, DP2×TP2, public `forward_micro_batches`):
   at least two waves under the test-only cap, DP replicas with different
   payloads, identical wave shapes within each TP pair, every input returned

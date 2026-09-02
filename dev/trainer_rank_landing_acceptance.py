@@ -1418,17 +1418,60 @@ def phase_tp2_public(
             dist.destroy_process_group()
 
 
+def _difference_profile(actual: list[Any], expected: list[Any]) -> dict[str, float]:
+    """Per-target-token difference statistics (masked positions are exact zeros)."""
+
+    import torch
+
+    per_request: list[float] = []
+    tails: list[float] = []
+    bodies: list[float] = []
+    signed: list[float] = []
+    for a, b in zip(actual, expected, strict=True):
+        a = a.reshape(-1).double()
+        b = b.reshape(-1).double()
+        mask = (a != 0) & (b != 0)
+        d = (a - b)[mask]
+        if int(d.numel()) < 8:
+            continue
+        per_request.append(float(d.abs().mean()))
+        tails.append(float(d[-4:].abs().mean()))
+        bodies.append(float(d[:-4].abs().mean()))
+        signed.append(float(d.mean()))
+    if not per_request:
+        _fail("difference profile: no unmasked target tokens")
+    ordered = sorted(per_request)
+    return {
+        "mean_abs_per_token": sum(per_request) / len(per_request),
+        "max_request_mean_abs": ordered[-1],
+        "median_request_mean_abs": ordered[len(ordered) // 2],
+        "tail_mean_abs": sum(tails) / len(tails),
+        "body_mean_abs": sum(bodies) / len(bodies),
+        "signed_mean": sum(signed) / len(signed),
+    }
+
+
 def phase_tp_compare(control_dump: str, dump: str, evidence: str | None) -> None:
     """CPU numerics gates for the TP public cell against its TP1 control.
 
-    - Same-layout TP correctness: for each arm, the TP run's outputs must match
-      the TP1 control's outputs for the identical packing within the gate
-      tolerance (bf16 reduction order differs across shards; the packing does
-      not), and the losses must agree.
-    - Cross-layout divergence (automatic vs depth-one) at TP must not exceed
-      1.5x the control's divergence for outputs and LoRA gradients: sharing
-      changes bf16 accumulation order identically at TP1, so a TP-specific
-      defect shows up as excess divergence, not as divergence per se.
+    bf16 rounding differs whenever the reduction order changes, and both a
+    different packing (cross-layout) and a different tensor-parallel degree
+    (sharded GEMMs, bf16 all-reduces) change it. Over 36 layers that noise is
+    about 1.3% of the mean logprob magnitude on this cell, so absolute
+    tolerances borrowed from same-packing comparisons cannot separate a TP
+    defect from noise. The reference is therefore the control's own
+    cross-layout divergence (automatic vs depth-one at TP1), measured on the
+    identical cell in the same run:
+
+    - same-layout TP correctness: for each arm, TP-vs-TP1 output divergence
+      (mean and max) must stay within ``max_cross_layout_ratio`` of the
+      control's cross-layout divergence, and the losses must agree;
+    - cross-layout divergence at TP (outputs and LoRA gradients) must stay
+      within the same ratio of the control's;
+    - no structured error: no request's mean difference exceeds twice the
+      median request's, the last four target tokens (where sequence-parallel
+      padding sits) differ no more than twice the body, and the signed mean
+      difference is small relative to the absolute one.
     """
 
     import torch
@@ -1437,54 +1480,97 @@ def phase_tp_compare(control_dump: str, dump: str, evidence: str | None) -> None
     trial = torch.load(dump, weights_only=False)
     if int(control["tp"]) != 1:
         _fail(f"control dump must be TP1 (got tp={control['tp']})")
+    ratio = TP_GATES["max_cross_layout_ratio"]
     rows: list[dict[str, object]] = []
     problems: list[str] = []
-    for arm in ("automatic", "depth_one"):
-        c, t = control["arms"][arm], trial["arms"][arm]
-        if c["packed_tokens"] != t["packed_tokens"]:
+    reference_mean = float(control["cross_layout"]["mean_abs_pct"])
+    reference_max = float(control["cross_layout"]["max_abs"])
+    reference_profile = _difference_profile(
+        control["arms"]["automatic"]["logprobs"],
+        control["arms"]["depth_one"]["logprobs"],
+    )
+    rows.append(
+        {
+            "arm": "tp1-cross-layout-reference",
+            **control["cross_layout"],
+            **reference_profile,
+        }
+    )
+
+    def structured(label: str, profile: dict[str, float]) -> None:
+        if profile["max_request_mean_abs"] > 2.0 * profile["median_request_mean_abs"]:
             problems.append(
-                f"{arm}: TP{trial['tp']} packed {t['packed_tokens']} tokens vs TP1 {c['packed_tokens']} (layouts differ)"
+                f"{label}: one request diverges ({profile['max_request_mean_abs']:.3f} vs "
+                f"median {profile['median_request_mean_abs']:.3f})"
+            )
+        if profile["tail_mean_abs"] > 2.0 * max(profile["body_mean_abs"], 1e-9):
+            problems.append(
+                f"{label}: final tokens diverge ({profile['tail_mean_abs']:.3f} vs body "
+                f"{profile['body_mean_abs']:.3f})"
+            )
+        if abs(profile["signed_mean"]) > 0.25 * profile["mean_abs_per_token"]:
+            problems.append(
+                f"{label}: biased differences (signed {profile['signed_mean']:+.4f} vs "
+                f"abs {profile['mean_abs_per_token']:.4f})"
+            )
+
+    for arm in ("automatic", "depth_one"):
+        c, tr = control["arms"][arm], trial["arms"][arm]
+        if c["packed_tokens"] != tr["packed_tokens"]:
+            problems.append(
+                f"{arm}: TP{trial['tp']} packed {tr['packed_tokens']} tokens vs TP1 "
+                f"{c['packed_tokens']} (layouts differ)"
             )
             continue
-        mean_abs_pct, max_abs = _compare_logprobs(t["logprobs"], c["logprobs"])
-        loss_rel_pct = abs(t["loss"] - c["loss"]) / max(abs(c["loss"]), 1e-6) * 100.0
+        mean_abs_pct, max_abs = _compare_logprobs(tr["logprobs"], c["logprobs"])
+        loss_rel_pct = abs(tr["loss"] - c["loss"]) / max(abs(c["loss"]), 1e-6) * 100.0
+        profile = _difference_profile(tr["logprobs"], c["logprobs"])
         rows.append(
             {
                 "arm": f"tp{trial['tp']}-vs-tp1-{arm}",
-                "packed_tokens": t["packed_tokens"],
+                "packed_tokens": tr["packed_tokens"],
                 "mean_abs_pct": mean_abs_pct,
                 "max_abs": max_abs,
                 "loss_rel_pct": loss_rel_pct,
+                "mean_abs_pct_ratio_to_reference": mean_abs_pct
+                / max(reference_mean, 1e-12),
+                **profile,
             }
         )
-        if mean_abs_pct > TP_GATES["max_output_mean_abs_pct"]:
+        if mean_abs_pct > ratio * reference_mean:
             problems.append(
-                f"{arm}: same-layout output mean_abs_pct={mean_abs_pct:.4f}"
+                f"{arm}: same-layout output divergence {mean_abs_pct:.4f}% exceeds "
+                f"{ratio}x the TP1 cross-layout reference {reference_mean:.4f}%"
             )
-        if max_abs > TP_GATES["max_output_abs"]:
-            problems.append(f"{arm}: same-layout output max_abs={max_abs:.4f}")
+        if max_abs > ratio * reference_max:
+            problems.append(
+                f"{arm}: same-layout max_abs {max_abs:.3f} exceeds {ratio}x the reference {reference_max:.3f}"
+            )
         if loss_rel_pct > TP_GATES["max_loss_rel_pct"]:
             problems.append(f"{arm}: same-layout loss_rel_pct={loss_rel_pct:.4f}")
-    ratio_rows = {}
-    for key in ("mean_abs_pct", "grad_rel_l2"):
-        c, t = float(control["cross_layout"][key]), float(trial["cross_layout"][key])
-        ratio_rows[key] = {"control": c, "trial": t, "ratio": t / max(c, 1e-12)}
-        if (
-            t > TP_GATES["max_cross_layout_ratio"] * c
-            and t > TP_CROSS_LAYOUT_FLOOR[key]
-        ):
-            problems.append(
-                f"cross-layout {key} at TP{trial['tp']} is {t:.5f} vs {c:.5f} at TP1 "
-                f"(ratio {t / max(c, 1e-12):.2f} > {TP_GATES['max_cross_layout_ratio']})"
-            )
-    rows.append(
-        {
-            "arm": f"tp{trial['tp']}-cross-layout-vs-control",
-            **{f"{k}_{kk}": v for k, vv in ratio_rows.items() for kk, v in vv.items()},
-            "control_noise": control["noise"],
-            "trial_noise": trial["noise"],
-        }
+        structured(f"tp{trial['tp']}-vs-tp1-{arm}", profile)
+
+    trial_profile = _difference_profile(
+        trial["arms"]["automatic"]["logprobs"], trial["arms"]["depth_one"]["logprobs"]
     )
+    cross: dict[str, object] = {
+        "arm": f"tp{trial['tp']}-cross-layout-vs-control",
+        **trial_profile,
+    }
+    for key in ("mean_abs_pct", "grad_rel_l2"):
+        c, tr = float(control["cross_layout"][key]), float(trial["cross_layout"][key])
+        cross[f"{key}_control"] = c
+        cross[f"{key}_trial"] = tr
+        cross[f"{key}_ratio"] = tr / max(c, 1e-12)
+        if tr > ratio * c and tr > TP_CROSS_LAYOUT_FLOOR[key]:
+            problems.append(
+                f"cross-layout {key} at TP{trial['tp']} is {tr:.5f} vs {c:.5f} at TP1 "
+                f"(ratio {tr / max(c, 1e-12):.2f} > {ratio})"
+            )
+    cross["control_noise"] = control["noise"]
+    cross["trial_noise"] = trial["noise"]
+    rows.append(cross)
+    structured(f"tp{trial['tp']}-cross-layout", trial_profile)
     if evidence:
         with open(evidence, "a", encoding="utf-8") as handle:
             for row in rows:
