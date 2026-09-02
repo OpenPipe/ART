@@ -20,6 +20,8 @@ every gate below now passes on the landed implementation.
 | `tests/unit/test_trainer_rank_topology.py` | CPU | TP>1 runtimes construct; PP>1 and multi-chunk runtimes still refuse | pass |
 | `--phase tp2-public --tp 2` (`dev/trainer_rank_landing_acceptance_tp2.sky.yaml`) + `--tp 1` control (1x H200) + `--phase tp-compare` (CPU) | 2x H200 k8s | Qwen3.5-4B full model, DP1×TP2×CP1, public `dp_rank_forward`, active LoRA: TP peers plan identical physical layouts; automatic shares deeper than depth-one (group lengths 9,199 vs 37,871 for 53,216 logical tokens; physical 9,200 / 37,872 after per-group TP padding); odd group lengths exercise SP padding; measured rows compile-free and plan-cache-stable; numerics gated relative to the TP1 control's cross-layout divergence with source/workload fingerprints (same-layout TP2-vs-TP1 ratios 1.06/1.05, cross-layout ratios 1.05/1.06, losses within 0.06%, unstructured differences). Also runs the CI check script at TP=2 (0.0 divergence) | pass: automatic 720 ms vs depth-one 1,921 ms (62.5% paired gain at TP2; 71.9% at TP1) |
 | `--phase dp2-tp2-waves` (`dev/trainer_rank_landing_acceptance_dp2_tp2.sky.yaml`) | 4x H200 k8s | DP2×TP2 public `forward_micro_batches`: ≥2 waves, distinct DP payloads, identical wave shapes within each TP pair, every input returned once in order, forward+backward per wave, automatic vs depth-one parity, empty-DP-slot arm, no hang | see evidence log |
+| `--phase cost-calibrate` (`dev/trainer_rank_cost_calibration_{cp4,2gpu}.sky.yaml`, `dev/trainer_rank_cost_calibration_local.sh`) | 1x/2x/4x H200 | every mandatory candidate layout of a cell timed through the public API (forward+backward, active LoRA, compile-free, max-rank) plus the production selection; layout features and topology/model facts to JSONL. Cells: GRPO g8/g16/g4x4 (Qwen3.5-4B GDN and Qwen3-4B attention, 2-layer and full height), three heterogeneous controls, Ellavox groups, at TP1/TP2 × CP1/CP2/CP4 | 38+ cells, ~2,600 within-cell pairs |
+| `dev/trainer_rank_cost_fit.py` | CPU | paired within-cell deltas, non-negative least squares over the production term functions, regret-minimizing refinement; gates on whole held-out cells: pairwise ordering ≥90% on pairs separated >3%, median regret ≤2%, p95 ≤5%, none >10%, clear winners selected within 5%; `--selector-check` runs the shipped table through the real selector | fitted table: 99.0% pairwise, p95 regret 2.0%, max 4.0%; held-out Ellavox groups, all heterogeneous cells, all TP2 cells and the attention model each pass when withheld; shipped selector on every measured cell: median 0%, max 4.0%; current (hand-set) score: 81.6% pairwise, max regret 62% |
 | `--phase split-conversion --pressure ballast` | 1x H200 | same cell under real pressure (live ballast tensors, no test hooks). Training forward: ballast sized from the measured retained fraction f (budget midway inside the (1−f)·R/2 conversion window, width reported), unsplit refused before execution, split runs under the reduced headroom with parity, combined backward with ballast live, observed forward+backward peak within both the admitted budget and the predicted peak; deeper ballast refuses before execution. `no_grad` forward (retained ≈ outputs only; the demonstrated high-value case): budget 60% of the unsplit requirement converts with parity and the observed peak within budget and prediction | see evidence log |
 
 Protocol note (2026-09-01): planning cost is gated as a *fraction* only on the
@@ -64,9 +66,13 @@ pytest acceptance suite only.
 ## Sealed evidence provenance
 
 Research worktree `~/.codex/worktrees/7236/art`,
-`scratch/trainer_rank_final_acceptance/`. Known limitations carried forward:
-the cost model carries no TP terms and undervalues full sharing on some GRPO
-cells (sealed: full-sharing arm 875.7 ms vs automatic 1,132.8 ms). Cost
-constants are versioned via `COEFFICIENT_VERSION` for future recalibration.
-The TP>1 refusal from the landing was lifted by the TP-support follow-up (see
-the `tp2-public` and `dp2-tp2-waves` rows above).
+`scratch/trainer_rank_final_acceptance/`. The landing's cost constants were
+hand-set (the research thread confirmed it) and carried no TP terms; the
+cost-model recalibration replaced them with a fitted table
+(`COEFFICIENT_VERSION` 2, see the calibration rows above and the design
+brief). The sealed "full-sharing arm 875.7 ms vs automatic 1,132.8 ms" gap was
+the research run's online calibration wandering between layouts, not a
+ranking error of the frozen score; the real misranking on that cell was
+prompt-level sharing (791 ms) vs full sharing (872 ms), which the fitted
+table gets right. The TP>1 refusal from the landing was lifted by the
+TP-support follow-up (see the `tp2-public` and `dp2-tp2-waves` rows above).
