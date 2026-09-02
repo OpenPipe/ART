@@ -149,9 +149,6 @@ from art.training.tokenized_loss import tokenized_loss
 
 DEFAULT_MODEL_IDENTIFIER = "Qwen/Qwen3-30B-A3B-Instruct-2507"
 _optimizer_stats_printed = False
-_INTER_FORWARD_BACKWARD_GAP_PREFIX = "time/inter_forward_backward_gap_rank_"
-_INTER_FORWARD_BACKWARD_GPU_GAP_PREFIX = "time/inter_forward_backward_gpu_gap_rank_"
-_INTER_FORWARD_BACKWARD_PHASE_PREFIX = "time/inter_forward_backward_"
 
 
 class _RunSlotParameters(Protocol):
@@ -170,16 +167,6 @@ __all__ = [
     "execute_megatron_sft_job",
     "inspect_resident_lora",
 ]
-
-
-class _InterForwardBackwardTiming(BaseModel):
-    model_config = ConfigDict(arbitrary_types_allowed=True)
-
-    metrics_group: Any | None = None
-    previous_schedule_end_s: float | None = None
-    previous_schedule_cuda_end: torch.cuda.Event | None = None
-    previous_job_complete_s: float | None = None
-    current_job_start_s: float | None = None
 
 
 class TrainingRuntime(BaseModel):
@@ -207,9 +194,6 @@ class TrainingRuntime(BaseModel):
     rank: int
     world_size: int
     moe_routing_replay_controller: MoeRoutingReplayController | None = None
-    inter_forward_backward_timing: _InterForwardBackwardTiming = Field(
-        default_factory=_InterForwardBackwardTiming
-    )
 
     @field_validator("model")
     @classmethod
@@ -275,7 +259,9 @@ class RLForwardBackwardState(BaseModel):
     micro_count: int = Field(ge=1)
     schedule: MCoreScheduleAdapter[PreparedRLMicroInputs]
     loss_diagnostics: LossOffPolicyDiagnosticsAccumulator
-    inter_schedule_metrics: dict[str, float] = Field(default_factory=dict)
+    schedule_prepare_s: float = Field(ge=0)
+    replay_finalize_s: float = Field(ge=0)
+    result_collect_s: float = Field(ge=0)
 
 
 class SFTForwardBackwardState(BaseModel):
@@ -603,12 +589,6 @@ def build_training_runtime(
 
     optimizer_config = optimizer_config or _default_optimizer_config()
     optimizer = _build_optimizer(model, optimizer_config) if build_optimizer else None
-    metrics_group = (
-        torch.distributed.new_group(backend="gloo")  # ty: ignore[possibly-missing-attribute]
-        if world_size > 1
-        else None
-    )
-
     runtime = TrainingRuntime(
         provider_bundle=provider_bundle,
         provider=provider,
@@ -619,9 +599,6 @@ def build_training_runtime(
         rank=rank,
         world_size=world_size,
         snapshot_pool_capacity=snapshot_pool_capacity,
-        inter_forward_backward_timing=_InterForwardBackwardTiming(
-            metrics_group=metrics_group
-        ),
     )
     _model_runtime_sha256(runtime)
     configure_moe_routing_replay(
@@ -796,7 +773,6 @@ def _execute_megatron_rl_forward_backward_steps(
                 next_step_first_micro=next_step_first_micro,
                 next_step_first_ref_logprobs=next_step_first_ref_logprobs,
                 hybridep_token_counts=hybridep_token_counts,
-                inter_forward_backward_timing=runtime.inter_forward_backward_timing,
                 defer_grad_sync=defer_grad_sync,
                 forward_only=forward_only,
                 loss=(
@@ -848,7 +824,6 @@ def execute_megatron_rl_job(
 ) -> dict[str, float]:
     """Execute one current fused RL update from an in-memory packed batch."""
     adapter_dtypes = None
-    inter_schedule_metrics: dict[str, float] = {}
     final_metrics: dict[str, float] = {}
     job_succeeded = False
 
@@ -860,7 +835,7 @@ def execute_megatron_rl_job(
         replay_finalize_s: float,
         step_input_prepare_s: float,
     ) -> None:
-        nonlocal final_metrics, inter_schedule_metrics
+        nonlocal final_metrics
         assert runtime.optimizer is not None
         optimizer_started = time.perf_counter()
         optimizer_result = run_megatron_optimizer_step(
@@ -898,18 +873,6 @@ def execute_megatron_rl_job(
             num_gradient_steps=num_steps,
             train_step_s=forward_backward_s + optimizer_s,
         )
-        if step_index == 0:
-            inter_schedule_metrics = {
-                name: value
-                for name, value in step_result.pipeline_metrics.items()
-                if name.startswith(
-                    (
-                        _INTER_FORWARD_BACKWARD_GAP_PREFIX,
-                        _INTER_FORWARD_BACKWARD_GPU_GAP_PREFIX,
-                    )
-                )
-            }
-        final_metrics.update(inter_schedule_metrics)
         final_metrics["time/replay_finalize_s"] = replay_finalize_s
         final_metrics["time/step_input_prepare_s"] = step_input_prepare_s
         final_metrics["time/step_result_finalize_s"] = (
@@ -993,19 +956,6 @@ def _forward_backward_command_metrics(
             sample["loss/kl_policy_ref"] = result.kl_policy_ref
         samples.append(sample)
     metrics = average_metric_samples(samples)
-    first_pipeline_metrics = results[0].pipeline_metrics
-    metrics.update(
-        {
-            name: value
-            for name, value in first_pipeline_metrics.items()
-            if name.startswith(
-                (
-                    _INTER_FORWARD_BACKWARD_GAP_PREFIX,
-                    _INTER_FORWARD_BACKWARD_GPU_GAP_PREFIX,
-                )
-            )
-        }
-    )
     workloads = tuple(result.workload for result in results)
     metrics.update(
         {
@@ -3230,110 +3180,14 @@ def run_megatron_sft_step(
 def _run_training_schedule(
     schedule: MCoreScheduleAdapter[Any],
     forward_step_func: Callable[..., Any],
-    timing: _InterForwardBackwardTiming | None,
     *,
     forward_only: bool = False,
-) -> tuple[list[Any], Callable[[], dict[str, float]]]:
-    started_s = time.monotonic()
-    gap_s = (
-        None
-        if timing is None or timing.previous_schedule_end_s is None
-        else started_s - timing.previous_schedule_end_s
-    )
-    phase_s = (
-        None
-        if timing is None
-        or timing.previous_schedule_end_s is None
-        or timing.previous_job_complete_s is None
-        or timing.current_job_start_s is None
-        or not (
-            timing.previous_schedule_end_s
-            <= timing.previous_job_complete_s
-            <= timing.current_job_start_s
-            <= started_s
-        )
-        else (
-            timing.previous_job_complete_s - timing.previous_schedule_end_s,
-            timing.current_job_start_s - timing.previous_job_complete_s,
-            started_s - timing.current_job_start_s,
-        )
-    )
-    previous_cuda_end = (
-        timing.previous_schedule_cuda_end if timing is not None else None
-    )
-    outputs = schedule.run(
+) -> list[Any]:
+    return schedule.run(
         forward_step_func,
         forward_only=forward_only,
         collect_non_loss_data=forward_only,
     )
-    ended_s = time.monotonic()
-    if timing is None:
-        return outputs, lambda: {}
-    cuda_span = schedule.telemetry.cuda_span()
-    timing.previous_schedule_end_s = ended_s
-    timing.previous_schedule_cuda_end = cuda_span[1] if cuda_span is not None else None
-    if gap_s is None:
-        return outputs, lambda: {}
-    world_size = torch.distributed.get_world_size()  # ty: ignore[possibly-missing-attribute]
-    local_timing = torch.tensor(
-        (gap_s, *(phase_s or (math.nan, math.nan, math.nan))), dtype=torch.float64
-    )
-    rank_timings = [torch.empty_like(local_timing) for _ in range(world_size)]
-    work = None
-    if world_size == 1:
-        rank_timings[0].copy_(local_timing)
-    else:
-        if timing.metrics_group is None:
-            raise RuntimeError("Multi-rank schedule timing requires a Gloo group")
-        work = torch.distributed.all_gather(  # ty: ignore[possibly-missing-attribute]
-            rank_timings,
-            local_timing,
-            group=timing.metrics_group,
-            async_op=True,
-        )
-
-    def metrics() -> dict[str, float]:
-        if work is not None:
-            work.wait()
-        values = {
-            f"{_INTER_FORWARD_BACKWARD_GAP_PREFIX}{rank}_s": float(parts[0].item())
-            for rank, parts in enumerate(rank_timings)
-        }
-        phase_names = ("previous_job_tail", "worker_idle", "current_job_prepare")
-        values.update(
-            {
-                f"{_INTER_FORWARD_BACKWARD_PHASE_PREFIX}{name}_rank_{rank}_s": float(
-                    parts[index].item()
-                )
-                for rank, parts in enumerate(rank_timings)
-                for index, name in enumerate(phase_names, start=1)
-                if not torch.isnan(parts[index])
-            }
-        )
-        if previous_cuda_end is None or cuda_span is None:
-            return values
-        local_gpu_gap = torch.tensor(
-            previous_cuda_end.elapsed_time(cuda_span[0]) / 1e3,
-            dtype=torch.float64,
-        )
-        gpu_gaps = [torch.empty_like(local_gpu_gap) for _ in range(world_size)]
-        if world_size == 1:
-            gpu_gaps[0].copy_(local_gpu_gap)
-        else:
-            torch.distributed.all_gather(  # ty: ignore[possibly-missing-attribute]
-                gpu_gaps,
-                local_gpu_gap,
-                group=timing.metrics_group,
-            )
-        values.update(
-            {
-                f"{_INTER_FORWARD_BACKWARD_GPU_GAP_PREFIX}{rank}_s": float(gap.item())
-                for rank, gap in enumerate(gpu_gaps)
-            }
-        )
-        return values
-
-    return outputs, metrics
 
 
 def run_megatron_rl_forward_backward_step(
@@ -3352,7 +3206,6 @@ def run_megatron_rl_forward_backward_step(
     next_step_first_micro: PackedTensors | None = None,
     next_step_first_ref_logprobs: torch.Tensor | None = None,
     hybridep_token_counts: list[int] | None = None,
-    inter_forward_backward_timing: _InterForwardBackwardTiming | None = None,
     defer_grad_sync: bool = False,
     forward_only: bool = False,
     loss: LossConfig | None = None,
@@ -3607,10 +3460,9 @@ def run_megatron_rl_forward_backward_step(
         )
 
     schedule_prepare_s = time.perf_counter() - schedule_prepare_started
-    forward_data_store, collect_inter_schedule_metrics = _run_training_schedule(
+    forward_data_store = _run_training_schedule(
         schedule,
         forward_step_func,
-        inter_forward_backward_timing,
         forward_only=forward_only,
     )
     replay_finalize_started = time.perf_counter()
@@ -3656,17 +3508,6 @@ def run_megatron_rl_forward_backward_step(
         device=device,
     )
     result_collect_s = time.perf_counter() - result_collect_started
-    inter_metrics_started = time.perf_counter()
-    inter_metrics = collect_inter_schedule_metrics()
-    inter_metrics_s = time.perf_counter() - inter_metrics_started
-    inter_metrics.update(
-        {
-            "time/schedule_prepare_s": schedule_prepare_s,
-            "time/post_schedule_replay_finalize_s": replay_finalize_s,
-            "time/post_schedule_result_collect_s": result_collect_s,
-            "time/post_schedule_inter_metrics_s": inter_metrics_s,
-        }
-    )
     new_logprobs = [
         cast(torch.Tensor, data["new_logprobs"]) for data in pipeline_results
     ]
@@ -3700,7 +3541,9 @@ def run_megatron_rl_forward_backward_step(
         micro_count=micro_count,
         schedule=schedule,
         loss_diagnostics=loss_diagnostics,
-        inter_schedule_metrics=inter_metrics,
+        schedule_prepare_s=schedule_prepare_s,
+        replay_finalize_s=replay_finalize_s,
+        result_collect_s=result_collect_s,
     )
 
 
@@ -3730,7 +3573,9 @@ def _finish_megatron_rl_forward_backward_step(
         loss_metrics=loss_metrics,
         pipeline_metrics={
             **state.schedule.telemetry.metrics(),
-            **state.inter_schedule_metrics,
+            "time/schedule_prepare_s": state.schedule_prepare_s,
+            "time/post_schedule_replay_finalize_s": state.replay_finalize_s,
+            "time/post_schedule_result_collect_s": state.result_collect_s,
             "time/post_schedule_loss_reduce_s": loss_reduce_s,
             "time/post_schedule_loss_metrics_s": loss_metrics_s,
         },
@@ -3756,7 +3601,6 @@ def run_training_step(
     next_step_first_ref_logprobs: torch.Tensor | None = None,
     hybridep_token_counts: list[int] | None = None,
     before_optimizer_step: Callable[[], None] | None = None,
-    inter_forward_backward_timing: _InterForwardBackwardTiming | None = None,
 ) -> TrainStepResult:
     state = run_megatron_rl_forward_backward_step(
         model_chunks=model_chunks,
@@ -3773,7 +3617,6 @@ def run_training_step(
         next_step_first_micro=next_step_first_micro,
         next_step_first_ref_logprobs=next_step_first_ref_logprobs,
         hybridep_token_counts=hybridep_token_counts,
-        inter_forward_backward_timing=inter_forward_backward_timing,
     )
     optimizer_started = time.perf_counter()
     optimizer_result = run_megatron_optimizer_step(

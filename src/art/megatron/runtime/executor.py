@@ -218,8 +218,6 @@ class MegatronTrainJobExecutor:
         if self._closed:
             raise RuntimeError("Megatron executor is closed")
         self._require_no_open_gradients()
-        timing = self.runtime.inter_forward_backward_timing
-        timing.current_job_start_s = time.monotonic()
         validate_packed_batch(batch)
         self._publisher.raise_if_failed()
         from art.megatron.train import execute_megatron_rl_job
@@ -241,7 +239,6 @@ class MegatronTrainJobExecutor:
             cancelled=cancelled,
         )
         metrics.update(self._stabilize_python_gc())
-        timing.previous_job_complete_s = time.monotonic()
         return metrics
 
     def execute_forward_backward(
@@ -262,9 +259,6 @@ class MegatronTrainJobExecutor:
             raise RuntimeError(
                 "F/B parent does not match the open gradient accumulator"
             )
-        self.runtime.inter_forward_backward_timing.current_job_start_s = (
-            time.monotonic()
-        )
         from art.megatron.train import execute_megatron_rl_forward_backward_job
 
         gradients = self._gradients.setdefault(
@@ -395,7 +389,6 @@ class MegatronTrainJobExecutor:
             "time/optimizer_step_s": time.perf_counter() - started,
         }
         metrics.update(self._stabilize_python_gc())
-        runtime.inter_forward_backward_timing.previous_job_complete_s = time.monotonic()
         return {
             "operation_id": job.operation_id,
             "learner_version": job.learner_version,
@@ -414,8 +407,6 @@ class MegatronTrainJobExecutor:
         if self._closed:
             raise RuntimeError("Megatron executor is closed")
         self._require_no_open_gradients()
-        timing = self.runtime.inter_forward_backward_timing
-        timing.current_job_start_s = time.monotonic()
         self._publisher.raise_if_failed()
         from art.megatron.train import execute_megatron_sft_job
 
@@ -436,7 +427,6 @@ class MegatronTrainJobExecutor:
             cancelled=cancelled,
         )
         metrics.update(self._stabilize_python_gc())
-        timing.previous_job_complete_s = time.monotonic()
         return metrics
 
     def _stabilize_python_gc(self) -> dict[str, float]:
