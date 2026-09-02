@@ -696,9 +696,12 @@ def test_root_and_trajectory_exports_are_identical() -> None:
 
 
 if TYPE_CHECKING:
+    from transformers import PreTrainedTokenizerBase
 
     async def _overloads_typecheck(
-        trajectories: list[art.Trajectory], groups: list[art.TrajectoryGroup]
+        trajectories: list[art.Trajectory],
+        groups: list[art.TrajectoryGroup],
+        tokenizer: PreTrainedTokenizerBase,
     ) -> None:
         tokenized: list[tr.TokenizedTrajectory] = await art.tokenize(trajectories)
         tokenized_multi: list[tr.TokenizedMultiHistoryTrajectory] = await art.tokenize(
@@ -720,6 +723,9 @@ if TYPE_CHECKING:
         tensorized_multi_groups: list[
             tr.TensorizedTrajectoryGroup[tr.TensorizedMultiHistoryTrajectory]
         ] = await art.tensorize(groups, multi_history=True)
+        with_transformers_tokenizer: list[
+            tr.TensorizedTrajectory
+        ] = await art.tensorize(trajectories, tokenizer=tokenizer)
         _ = (
             tokenized,
             tokenized_multi,
@@ -729,4 +735,5 @@ if TYPE_CHECKING:
             tensorized_multi,
             tensorized_groups,
             tensorized_multi_groups,
+            with_transformers_tokenizer,
         )

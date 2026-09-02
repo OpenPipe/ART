@@ -139,17 +139,12 @@ class CompactTrajectoryPayload(TypedDict):
 class Tokenizer(Protocol):
     """Minimal tokenizer surface used by trajectory tokenization."""
 
-    def __call__(self, text: str, *, add_special_tokens: bool = False) -> object: ...
+    def __call__(self, *args: Any, **kwargs: Any) -> object: ...
 
     def apply_chat_template(
         self,
-        messages: list[dict[str, Any]],
-        *,
-        tools: object,
-        tokenize: bool,
-        add_generation_prompt: bool,
-        chat_template: str | None = None,
-        **kwargs: object,
+        *args: Any,
+        **kwargs: Any,
     ) -> object: ...
 
 
