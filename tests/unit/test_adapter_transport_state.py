@@ -2,6 +2,7 @@ import asyncio
 import base64
 import hashlib
 import json
+from threading import Lock
 from types import SimpleNamespace
 
 import httpx
@@ -13,6 +14,7 @@ from art.distributed.adapter_transport import (
     AdapterSnapshotReceiver,
     AdapterSnapshotSender,
     AdapterTransferTarget,
+    ExternalAdapterCommit,
     ExternalAdapterObjectSource,
     ExternalAdapterShard,
     ExternalAdapterShardedSource,
@@ -150,6 +152,33 @@ def test_completed_external_object_materializes_into_existing_receiver(
     assert receiver.state().materialized_generations == 0
 
 
+def test_completed_external_object_retries_transient_get(tmp_path, monkeypatch) -> None:
+    payload = _safetensors_payload()
+    source = _external_object_source(payload)
+    real_client = httpx.Client
+    attempts = 0
+
+    def client(**kwargs):
+        def response(request):
+            nonlocal attempts
+            attempts += 1
+            return httpx.Response(
+                503 if attempts == 1 else 200,
+                content=b"" if attempts == 1 else payload,
+                request=request,
+            )
+
+        return real_client(transport=httpx.MockTransport(response), **kwargs)
+
+    monkeypatch.setattr(adapter_transport.httpx, "Client", client)
+    receiver = AdapterSnapshotReceiver("inference-0", str(tmp_path), pool_capacity=2)
+
+    result = receiver.materialize_object(source, timeout_s=1)
+
+    assert result.tensor_bytes == len(payload)
+    assert attempts == 2
+
+
 def test_external_object_digest_failure_leaves_no_materialized_state(
     tmp_path, monkeypatch
 ) -> None:
@@ -235,6 +264,94 @@ def test_committed_external_shards_reconstruct_standard_adapter(
         receiver.materialize_object(
             source.model_copy(update={"source_identity": "manifest:" + "f" * 64})
         )
+
+
+def test_streaming_shards_overlap_upload_and_require_final_commit(
+    tmp_path, monkeypatch
+) -> None:
+    model = _safetensors_payload()
+    config = json.dumps(
+        {"art_lora_format": "vllm", "r": 1, "target_modules": ["q_proj"]},
+        separators=(",", ":"),
+    ).encode()
+    payloads = (config, model[:17], model[17:])
+    paths = ("adapter_config.json",) + ("adapter_model.safetensors",) * 2
+    offsets = (0, 0, 17)
+    fields = {
+        "generation_id": "generation-streaming",
+        "source_identity": "stream:" + hashlib.sha256(model).hexdigest(),
+        "model_bytes": len(model),
+        "config_bytes": len(config),
+        "shards": tuple(
+            ExternalAdapterShard(
+                index=index,
+                relative_path=paths[index],
+                file_offset=offsets[index],
+                object_url=f"https://objects.example/shard-{index}?signature=secret",
+                object_bytes=len(payload),
+                object_sha256=hashlib.sha256(payload).hexdigest(),
+            )
+            for index, payload in enumerate(payloads)
+        ),
+        "max_parallel_downloads": 4,
+    }
+    draft = ExternalAdapterShardedSource(**fields)
+    plan_sha256 = hashlib.sha256(
+        adapter_transport._external_shard_plan(draft)
+    ).hexdigest()
+    commit_payload = json.dumps(
+        {
+            "format": "art_external_adapter_commit_v1",
+            "generation_id": fields["generation_id"],
+            "plan_sha256": plan_sha256,
+            "source_identity": fields["source_identity"],
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    source = ExternalAdapterShardedSource(
+        **fields,
+        plan_sha256=plan_sha256,
+        commit=ExternalAdapterCommit(
+            object_url="https://objects.example/commit?signature=secret",
+            object_bytes=len(commit_payload),
+            object_sha256=hashlib.sha256(commit_payload).hexdigest(),
+        ),
+    )
+    real_client = httpx.Client
+    lock = Lock()
+    shard_attempts = 0
+    commit_attempts_before_last_shard = 0
+
+    def client(**kwargs):
+        def response(request):
+            nonlocal shard_attempts, commit_attempts_before_last_shard
+            path = request.url.path
+            with lock:
+                if path.endswith("commit"):
+                    if shard_attempts < 2:
+                        commit_attempts_before_last_shard += 1
+                        return httpx.Response(404, request=request)
+                    return httpx.Response(200, content=commit_payload, request=request)
+                index = int(path.rsplit("-", 1)[1])
+                if index == 2:
+                    shard_attempts += 1
+                    if shard_attempts < 2:
+                        return httpx.Response(404, request=request)
+                return httpx.Response(200, content=payloads[index], request=request)
+
+        return real_client(transport=httpx.MockTransport(response), **kwargs)
+
+    monkeypatch.setattr(adapter_transport.httpx, "Client", client)
+    receiver = AdapterSnapshotReceiver("inference-0", str(tmp_path), pool_capacity=2)
+
+    result = receiver.materialize_object(source, timeout_s=2)
+
+    root = tmp_path / "adapter_transfers" / source.generation_id
+    assert result.tensor_bytes == len(model)
+    assert (root / "adapter_model.safetensors").read_bytes() == model
+    assert shard_attempts == 2
+    assert commit_attempts_before_last_shard >= 1
 
 
 def test_external_materialization_failure_settles_and_releases_every_host() -> None:

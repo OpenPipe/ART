@@ -10,7 +10,7 @@ from pathlib import Path
 import socket
 from threading import Condition, Lock
 import time
-from typing import Any, Literal, TypeAlias
+from typing import Any, Callable, Literal, TypeAlias
 from urllib.parse import urlsplit
 
 import httpx
@@ -108,6 +108,19 @@ class ExternalAdapterShard(_TransportRecord):
         return self
 
 
+class ExternalAdapterCommit(_TransportRecord):
+    """Final small object proving a streaming shard plan is complete."""
+
+    object_url: str = Field(min_length=1, max_length=8192, repr=False)
+    object_bytes: int = Field(gt=0, le=1 << 20)
+    object_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+    @model_validator(mode="after")
+    def _validate_url(self) -> "ExternalAdapterCommit":
+        _validate_exact_object_url(self.object_url)
+        return self
+
+
 class ExternalAdapterShardedSource(_TransportRecord):
     """Committed immutable shards covering one standard PEFT adapter."""
 
@@ -121,6 +134,8 @@ class ExternalAdapterShardedSource(_TransportRecord):
     config_bytes: int = Field(gt=1, le=64 << 10)
     shards: tuple[ExternalAdapterShard, ...] = Field(min_length=2, max_length=1024)
     max_parallel_downloads: int = Field(default=16, ge=1, le=32)
+    plan_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    commit: ExternalAdapterCommit | None = None
 
     @model_validator(mode="after")
     def _validate_coverage(self) -> "ExternalAdapterShardedSource":
@@ -144,6 +159,20 @@ class ExternalAdapterShardedSource(_TransportRecord):
                 cursor += shard.object_bytes
             if cursor != size_bytes:
                 raise ValueError("external adapter shards do not cover their file")
+        streaming = self.commit is not None
+        if streaming != (self.plan_sha256 is not None):
+            raise ValueError("streaming external adapter requires plan and commit")
+        if streaming:
+            assert self.plan_sha256 is not None and self.commit is not None
+            plan_sha256 = hashlib.sha256(_external_shard_plan(self)).hexdigest()
+            if self.plan_sha256 != plan_sha256:
+                raise ValueError("external adapter streaming plan changed")
+            commit = _external_shard_commit(self)
+            if (
+                self.commit.object_bytes != len(commit)
+                or self.commit.object_sha256 != hashlib.sha256(commit).hexdigest()
+            ):
+                raise ValueError("external adapter commit identity changed")
         return self
 
 
@@ -162,6 +191,41 @@ def _validate_exact_object_url(value: str) -> None:
         or parsed.fragment
     ):
         raise ValueError("external adapter object requires an exact HTTPS URL")
+
+
+def _external_shard_plan(source: ExternalAdapterShardedSource) -> bytes:
+    payload = {
+        "format": "art_external_adapter_plan_v1",
+        "generation_id": source.generation_id,
+        "source_identity": source.source_identity,
+        "model_bytes": source.model_bytes,
+        "config_bytes": source.config_bytes,
+        "shards": [
+            {
+                "index": shard.index,
+                "relative_path": shard.relative_path,
+                "file_offset": shard.file_offset,
+                "object_bytes": shard.object_bytes,
+                "object_sha256": shard.object_sha256,
+            }
+            for shard in source.shards
+        ],
+    }
+    return json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+
+
+def _external_shard_commit(source: ExternalAdapterShardedSource) -> bytes:
+    assert source.plan_sha256 is not None
+    return json.dumps(
+        {
+            "format": "art_external_adapter_commit_v1",
+            "generation_id": source.generation_id,
+            "plan_sha256": source.plan_sha256,
+            "source_identity": source.source_identity,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
 
 
 class AdapterReceivePoolState(_TransportRecord):
@@ -411,12 +475,17 @@ def _download_exact_object(
     with path.open("xb") as output:
         if hasattr(os, "posix_fallocate"):
             os.posix_fallocate(output.fileno(), 0, source.object_bytes)
+
+        def reset() -> None:
+            output.seek(0)
+
         received = _stream_exact_object(
             source.object_url,
             size_bytes=source.object_bytes,
             sha256=source.object_sha256,
             timeout_s=timeout_s,
             write=output.write,
+            reset=reset,
         )
         output.truncate(received)
         output.flush()
@@ -430,45 +499,105 @@ def _stream_exact_object(
     sha256: str,
     timeout_s: float,
     write: Any,
+    reset: Callable[[], None] | None = None,
+    wait_until_available: bool = False,
+) -> int:
+    deadline = time.monotonic() + timeout_s
+    attempts = 0
+    while True:
+        attempts += 1
+        if reset is not None:
+            reset()
+        remaining_s = deadline - time.monotonic()
+        if remaining_s <= 0:
+            raise TimeoutError("external adapter object download timed out")
+        try:
+            return _stream_exact_object_once(
+                url,
+                size_bytes=size_bytes,
+                sha256=sha256,
+                timeout_s=remaining_s,
+                write=write,
+                wait_until_available=wait_until_available,
+            )
+        except _RetryableObjectError as error:
+            if not wait_until_available and attempts >= 4:
+                raise RuntimeError(
+                    "external adapter object retries exhausted"
+                ) from error
+            delay_s = min(
+                0.1 * (2 ** min(attempts - 1, 3)), deadline - time.monotonic()
+            )
+            if delay_s <= 0:
+                raise TimeoutError(
+                    "external adapter object download timed out"
+                ) from error
+            time.sleep(delay_s)
+
+
+class _RetryableObjectError(RuntimeError):
+    pass
+
+
+def _stream_exact_object_once(
+    url: str,
+    *,
+    size_bytes: int,
+    sha256: str,
+    timeout_s: float,
+    write: Any,
+    wait_until_available: bool,
 ) -> int:
     started = time.monotonic()
     digest = hashlib.sha256()
     received = 0
-    with httpx.Client(
-        follow_redirects=False,
-        timeout=httpx.Timeout(timeout_s, connect=min(30.0, timeout_s)),
-    ) as client:
-        with client.stream(
-            "GET", url, headers={"Accept-Encoding": "identity"}
-        ) as response:
-            if response.status_code != 200:
-                raise RuntimeError(
-                    f"external adapter object returned HTTP {response.status_code}"
-                )
-            if response.headers.get("content-encoding", "identity") != "identity":
-                raise RuntimeError("external adapter object used content encoding")
-            length = response.headers.get("content-length")
-            if length is not None:
-                try:
-                    declared = int(length)
-                except ValueError as error:
-                    raise RuntimeError(
-                        "external adapter object has invalid content length"
-                    ) from error
-                if declared != size_bytes:
-                    raise RuntimeError("external adapter object size changed")
-            for chunk in response.iter_bytes(1 << 20):
-                if time.monotonic() - started > timeout_s:
-                    raise TimeoutError("external adapter object download timed out")
-                received += len(chunk)
-                if received > size_bytes:
-                    raise RuntimeError(
-                        "external adapter object exceeded its byte bound"
+    try:
+        with httpx.Client(
+            follow_redirects=False,
+            timeout=httpx.Timeout(timeout_s, connect=min(30.0, timeout_s)),
+        ) as client:
+            with client.stream(
+                "GET", url, headers={"Accept-Encoding": "identity"}
+            ) as response:
+                if response.status_code != 200:
+                    message = (
+                        f"external adapter object returned HTTP {response.status_code}"
                     )
-                write(chunk)
-                digest.update(chunk)
+                    if response.status_code in {408, 425, 429, 500, 502, 503, 504} or (
+                        wait_until_available and response.status_code == 404
+                    ):
+                        raise _RetryableObjectError(message)
+                    raise RuntimeError(message)
+                if response.headers.get("content-encoding", "identity") != "identity":
+                    raise RuntimeError("external adapter object used content encoding")
+                length = response.headers.get("content-length")
+                if length is not None:
+                    try:
+                        declared = int(length)
+                    except ValueError as error:
+                        raise RuntimeError(
+                            "external adapter object has invalid content length"
+                        ) from error
+                    if declared != size_bytes:
+                        raise RuntimeError("external adapter object size changed")
+                for chunk in response.iter_bytes(1 << 20):
+                    if time.monotonic() - started > timeout_s:
+                        raise _RetryableObjectError(
+                            "external adapter object download timed out"
+                        )
+                    received += len(chunk)
+                    if received > size_bytes:
+                        raise RuntimeError(
+                            "external adapter object exceeded its byte bound"
+                        )
+                    write(chunk)
+                    digest.update(chunk)
+    except httpx.TransportError as error:
+        raise _RetryableObjectError(
+            "external adapter object transport failed"
+        ) from error
     if received != size_bytes:
-        raise RuntimeError("external adapter object was incomplete")
+        raise _RetryableObjectError("external adapter object was incomplete")
     if digest.hexdigest() != sha256:
         raise RuntimeError("external adapter object digest changed")
     return received
@@ -509,6 +638,10 @@ def _materialize_external_shards(
         def receive(shard: ExternalAdapterShard) -> None:
             cursor = shard.file_offset
 
+            def reset() -> None:
+                nonlocal cursor
+                cursor = shard.file_offset
+
             def write(chunk: bytes) -> int:
                 nonlocal cursor
                 count = _pwrite_all(descriptors[shard.relative_path], chunk, cursor)
@@ -521,12 +654,38 @@ def _materialize_external_shards(
                 sha256=shard.object_sha256,
                 timeout_s=timeout_s,
                 write=write,
+                reset=reset,
+                wait_until_available=source.commit is not None,
             )
 
         with ThreadPoolExecutor(
-            max_workers=min(source.max_parallel_downloads, len(source.shards))
+            max_workers=min(
+                source.max_parallel_downloads,
+                len(source.shards) + (source.commit is not None),
+            )
         ) as pool:
-            tuple(pool.map(receive, source.shards))
+            futures = [pool.submit(receive, shard) for shard in source.shards]
+            if source.commit is not None:
+                commit_payload = bytearray()
+                commit = source.commit
+                futures.append(
+                    pool.submit(
+                        _stream_exact_object,
+                        commit.object_url,
+                        size_bytes=commit.object_bytes,
+                        sha256=commit.object_sha256,
+                        timeout_s=timeout_s,
+                        write=commit_payload.extend,
+                        reset=commit_payload.clear,
+                        wait_until_available=True,
+                    )
+                )
+            for future in futures:
+                future.result()
+            if source.commit is not None and bytes(commit_payload) != (
+                _external_shard_commit(source)
+            ):
+                raise RuntimeError("external adapter final commit changed")
         for fd in descriptors.values():
             os.fsync(fd)
     finally:
