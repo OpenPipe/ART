@@ -283,7 +283,10 @@ def refresh_features(paths: list[Path]) -> None:
                     for label in candidate.labels
                 }
                 for candidate in row["candidates"]:
-                    candidate["features"] = by_label[candidate["label"]]
+                    # The timed production selection keeps its recorded
+                    # features; only mandatory-family labels are recomputed.
+                    if candidate["label"] in by_label:
+                        candidate["features"] = by_label[candidate["label"]]
             out.append(json.dumps(row, sort_keys=True, default=str))
         path.write_text("\n".join(out) + "\n")
 
