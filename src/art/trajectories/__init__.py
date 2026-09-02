@@ -23,6 +23,7 @@ from typing import (
     TypeAlias,
     TypeVar,
     Union,
+    cast,
     overload,
 )
 
@@ -1388,6 +1389,206 @@ async def trajectory_group(
     )
 
 
+@overload
+async def tokenize(
+    items: Iterable[Trajectory],
+    *,
+    multi_history: Literal[False] = False,
+    reconcile_text_equivalent_tokenizations: bool = False,
+    model: str | None = None,
+    base_model: str | None = None,
+    tokenizer: Tokenizer | None = None,
+    chat_template: str | None = None,
+    chat_template_kwargs: Mapping[str, object] | None = None,
+) -> list[TokenizedTrajectory]: ...
+
+
+@overload
+async def tokenize(
+    items: Iterable[Trajectory],
+    *,
+    multi_history: Literal[True],
+    reconcile_text_equivalent_tokenizations: bool = False,
+    model: str | None = None,
+    base_model: str | None = None,
+    tokenizer: Tokenizer | None = None,
+    chat_template: str | None = None,
+    chat_template_kwargs: Mapping[str, object] | None = None,
+) -> list[TokenizedMultiHistoryTrajectory]: ...
+
+
+@overload
+async def tokenize(
+    items: Iterable[TrajectoryGroup],
+    *,
+    multi_history: Literal[False] = False,
+    reconcile_text_equivalent_tokenizations: bool = False,
+    model: str | None = None,
+    base_model: str | None = None,
+    tokenizer: Tokenizer | None = None,
+    chat_template: str | None = None,
+    chat_template_kwargs: Mapping[str, object] | None = None,
+) -> list[TokenizedTrajectoryGroup[TokenizedTrajectory]]: ...
+
+
+@overload
+async def tokenize(
+    items: Iterable[TrajectoryGroup],
+    *,
+    multi_history: Literal[True],
+    reconcile_text_equivalent_tokenizations: bool = False,
+    model: str | None = None,
+    base_model: str | None = None,
+    tokenizer: Tokenizer | None = None,
+    chat_template: str | None = None,
+    chat_template_kwargs: Mapping[str, object] | None = None,
+) -> list[TokenizedTrajectoryGroup[TokenizedMultiHistoryTrajectory]]: ...
+
+
+async def tokenize(
+    items: Iterable[Trajectory] | Iterable[TrajectoryGroup],
+    *,
+    multi_history: bool = False,
+    reconcile_text_equivalent_tokenizations: bool = False,
+    model: str | None = None,
+    base_model: str | None = None,
+    tokenizer: Tokenizer | None = None,
+    chat_template: str | None = None,
+    chat_template_kwargs: Mapping[str, object] | None = None,
+) -> (
+    list[TokenizedTrajectory]
+    | list[TokenizedMultiHistoryTrajectory]
+    | list[TokenizedTrajectoryGroup[TokenizedTrajectory]]
+    | list[TokenizedTrajectoryGroup[TokenizedMultiHistoryTrajectory]]
+):
+    """Tokenize trajectories concurrently using an automatically sized CPU pool.
+
+    ``items`` must be a homogeneous iterable of trajectories or trajectory groups.
+    Results preserve input order and group metadata. All remaining arguments are
+    forwarded to :meth:`Trajectory.tokenize`.
+    """
+
+    from ._parallel import transform
+
+    return cast(
+        Any,
+        await transform(
+            items,
+            operation="tokenize",
+            multi_history=multi_history,
+            reconcile_text_equivalent_tokenizations=reconcile_text_equivalent_tokenizations,
+            model=model,
+            base_model=base_model,
+            tokenizer=tokenizer,
+            chat_template=chat_template,
+            chat_template_kwargs=chat_template_kwargs,
+        ),
+    )
+
+
+@overload
+async def tensorize(
+    items: Iterable[Trajectory],
+    *,
+    multi_history: Literal[False] = False,
+    reconcile_text_equivalent_tokenizations: bool = False,
+    model: str | None = None,
+    base_model: str | None = None,
+    tokenizer: Tokenizer | None = None,
+    chat_template: str | None = None,
+    chat_template_kwargs: Mapping[str, object] | None = None,
+    device: torch.device | str | None = None,
+) -> list[TensorizedTrajectory]: ...
+
+
+@overload
+async def tensorize(
+    items: Iterable[Trajectory],
+    *,
+    multi_history: Literal[True],
+    reconcile_text_equivalent_tokenizations: bool = False,
+    model: str | None = None,
+    base_model: str | None = None,
+    tokenizer: Tokenizer | None = None,
+    chat_template: str | None = None,
+    chat_template_kwargs: Mapping[str, object] | None = None,
+    device: torch.device | str | None = None,
+) -> list[TensorizedMultiHistoryTrajectory]: ...
+
+
+@overload
+async def tensorize(
+    items: Iterable[TrajectoryGroup],
+    *,
+    multi_history: Literal[False] = False,
+    reconcile_text_equivalent_tokenizations: bool = False,
+    model: str | None = None,
+    base_model: str | None = None,
+    tokenizer: Tokenizer | None = None,
+    chat_template: str | None = None,
+    chat_template_kwargs: Mapping[str, object] | None = None,
+    device: torch.device | str | None = None,
+) -> list[TensorizedTrajectoryGroup[TensorizedTrajectory]]: ...
+
+
+@overload
+async def tensorize(
+    items: Iterable[TrajectoryGroup],
+    *,
+    multi_history: Literal[True],
+    reconcile_text_equivalent_tokenizations: bool = False,
+    model: str | None = None,
+    base_model: str | None = None,
+    tokenizer: Tokenizer | None = None,
+    chat_template: str | None = None,
+    chat_template_kwargs: Mapping[str, object] | None = None,
+    device: torch.device | str | None = None,
+) -> list[TensorizedTrajectoryGroup[TensorizedMultiHistoryTrajectory]]: ...
+
+
+async def tensorize(
+    items: Iterable[Trajectory] | Iterable[TrajectoryGroup],
+    *,
+    multi_history: bool = False,
+    reconcile_text_equivalent_tokenizations: bool = False,
+    model: str | None = None,
+    base_model: str | None = None,
+    tokenizer: Tokenizer | None = None,
+    chat_template: str | None = None,
+    chat_template_kwargs: Mapping[str, object] | None = None,
+    device: torch.device | str | None = None,
+) -> (
+    list[TensorizedTrajectory]
+    | list[TensorizedMultiHistoryTrajectory]
+    | list[TensorizedTrajectoryGroup[TensorizedTrajectory]]
+    | list[TensorizedTrajectoryGroup[TensorizedMultiHistoryTrajectory]]
+):
+    """Tokenize and tensorize trajectories using an automatically sized CPU pool.
+
+    ``items`` must be a homogeneous iterable of trajectories or trajectory groups.
+    CPU tensorization runs in the pool; completed tensors are then moved to
+    ``device`` while preserving input order and group metadata.
+    """
+
+    from ._parallel import transform
+
+    return cast(
+        Any,
+        await transform(
+            items,
+            operation="tensorize",
+            multi_history=multi_history,
+            reconcile_text_equivalent_tokenizations=reconcile_text_equivalent_tokenizations,
+            model=model,
+            base_model=base_model,
+            tokenizer=tokenizer,
+            chat_template=chat_template,
+            chat_template_kwargs=chat_template_kwargs,
+            device=device,
+        ),
+    )
+
+
 def get_messages(messages_and_choices: MessagesAndChoices) -> Messages:
     from ._compat import messages_from_legacy_history
 
@@ -1475,5 +1676,7 @@ __all__ = [
     "no_capture",
     "trajectory",
     "trajectory_group",
+    "tokenize",
+    "tensorize",
     "get_messages",
 ]

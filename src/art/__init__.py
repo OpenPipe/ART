@@ -76,6 +76,8 @@ from .trajectories import (
     TrajectoryGroup,
     current_trajectory,
     no_capture,
+    tensorize,
+    tokenize,
     trajectory,
     trajectory_group,
 )
@@ -128,6 +130,8 @@ __all__ = [
     "TrainResult",
     "Trajectory",
     "TrajectoryGroup",
+    "tokenize",
+    "tensorize",
     "trajectory",
     "trajectory_group",
     "capture_yielded_trajectory",

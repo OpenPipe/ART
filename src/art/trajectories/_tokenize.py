@@ -11,6 +11,7 @@ from hashlib import sha256
 import json
 import math
 import re
+import threading
 from typing import TYPE_CHECKING, Any, Literal, Protocol, TypeVar, cast
 import warnings
 
@@ -61,6 +62,7 @@ if TYPE_CHECKING:
 
 _TOKEN_ID = re.compile(r"token_id:(\d+)$")
 _WARNED_PREFIX_RETOKENIZATION = False
+_TOKENIZER_LOAD_LOCK = threading.Lock()
 
 
 @dataclass
@@ -1495,7 +1497,11 @@ def _cached_tokenizer(base_model: str, revision: str | None) -> Tokenizer:
 
 
 def _load_tokenizer(config: _TokenizerConfig) -> Tokenizer:
-    return _cached_tokenizer(config.base_model, config.revision)
+    # functools.lru_cache permits duplicate concurrent calls for the same miss.
+    # Collection tokenization runs in parallel, so serialize this rare load path
+    # while leaving all tokenizer use concurrent.
+    with _TOKENIZER_LOAD_LOCK:
+        return _cached_tokenizer(config.base_model, config.revision)
 
 
 def _ids(value: object) -> list[int]:
