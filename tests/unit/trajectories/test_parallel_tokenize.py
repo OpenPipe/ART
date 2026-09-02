@@ -2,12 +2,20 @@ from __future__ import annotations
 
 from collections.abc import Callable
 import concurrent.futures
+from datetime import UTC, datetime, timedelta
 from functools import lru_cache
 import math
+import os
+from pathlib import Path
+import pickle
+import subprocess
+import sys
+import textwrap
 import threading
 import time
 from typing import TYPE_CHECKING, Any, cast
 
+from openai.types.chat import ChatCompletion
 import pytest
 
 import art
@@ -15,6 +23,7 @@ import art.trajectories as tr
 from art.trajectories import _parallel, _tokenize
 
 _CPU_CAPACITY = _parallel._cpu_capacity
+_SUPPORTS_PROCESSES = _parallel._supports_processes
 
 
 def _tokenized(trajectory: art.Trajectory) -> tr.TokenizedTrajectory:
@@ -33,11 +42,72 @@ def _tokenized_multi(trajectory: art.Trajectory) -> tr.TokenizedMultiHistoryTraj
     return tr.TokenizedMultiHistoryTrajectory(trajectory=trajectory, histories=[])
 
 
+def _chat_completion(index: int) -> ChatCompletion:
+    token = index + 2
+    return ChatCompletion.model_validate(
+        {
+            "id": f"chat-{index}",
+            "object": "chat.completion",
+            "created": 0,
+            "model": "test/model",
+            "choices": [
+                {
+                    "index": 0,
+                    "finish_reason": "stop",
+                    "message": {"role": "assistant", "content": "answer"},
+                    "prompt_token_ids": [1],
+                    "token_ids": [token],
+                    "logprobs": {
+                        "content": [
+                            {
+                                "token": f"token_id:{token}",
+                                "logprob": -0.2,
+                                "bytes": [],
+                                "top_logprobs": [],
+                            }
+                        ]
+                    },
+                }
+            ],
+        }
+    )
+
+
+def _legacy_trajectory(index: int) -> art.Trajectory:
+    response = _chat_completion(index)
+    return art.Trajectory(
+        messages_and_choices=[response.choices[0]], metadata={"index": index}
+    )
+
+
+def _exchange_trajectory(index: int) -> art.Trajectory:
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+    return art.Trajectory(
+        exchanges=tr.TrajectoryExchanges(
+            chat_completions=[
+                tr.ChatCompletionsExchange(
+                    request=tr.ChatCompletionsRequest(
+                        model="test/model",
+                        messages=[{"role": "user", "content": "question"}],
+                    ),
+                    response=_chat_completion(index),
+                    start_time=start,
+                    end_time=start + timedelta(milliseconds=1),
+                )
+            ]
+        ),
+        metadata={"index": index},
+    )
+
+
 @pytest.fixture(autouse=True)
 def _reset_tuning(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(_parallel, "_cpu_capacity", lambda: 4)
+    monkeypatch.setattr(_parallel, "_supports_processes", lambda **_: False)
+    monkeypatch.setattr(_parallel, "_PROCESS_BACKEND_DISABLED", False)
     with _parallel._TUNING_LOCK:
         _parallel._tuning_state.cache_clear()
+        _parallel._process_tuning_state.cache_clear()
 
 
 def _patch_tokenize(
@@ -242,6 +312,323 @@ def test_tuner_probes_intermediate_worker_count_for_odd_input_size() -> None:
     assert _parallel._workers(key, capacity=16, size=3) == 2
 
 
+def test_process_tuner_ignores_cold_start_and_compares_two_with_four() -> None:
+    key = ("process",)
+    assert _parallel._process_workers(key, capacity=16, size=16) == 4
+
+    _parallel._observe_process(
+        key, workers=4, capacity=16, size=16, units=100, elapsed=10
+    )
+    assert _parallel._process_workers(key, capacity=16, size=16) == 4
+
+    _parallel._observe_process(
+        key, workers=4, capacity=16, size=16, units=400, elapsed=1
+    )
+    assert _parallel._process_workers(key, capacity=16, size=16) == 4
+    _parallel._observe_process(
+        key, workers=4, capacity=16, size=16, units=400, elapsed=1
+    )
+    assert _parallel._process_workers(key, capacity=16, size=16) == 2
+
+    _parallel._observe_process(
+        key, workers=2, capacity=16, size=16, units=390, elapsed=1
+    )
+    assert _parallel._process_workers(key, capacity=16, size=16) == 2
+    _parallel._observe_process(
+        key, workers=2, capacity=16, size=16, units=390, elapsed=1
+    )
+    assert _parallel._process_workers(key, capacity=16, size=16) == 2
+
+
+def test_process_tuner_returns_to_four_when_two_is_slower() -> None:
+    key = ("process-slower",)
+    _parallel._observe_process(
+        key, workers=4, capacity=16, size=16, units=100, elapsed=10
+    )
+    _parallel._observe_process(
+        key, workers=4, capacity=16, size=16, units=400, elapsed=1
+    )
+    _parallel._observe_process(
+        key, workers=4, capacity=16, size=16, units=400, elapsed=1
+    )
+    _parallel._observe_process(
+        key, workers=2, capacity=16, size=16, units=300, elapsed=1
+    )
+    _parallel._observe_process(
+        key, workers=2, capacity=16, size=16, units=300, elapsed=1
+    )
+
+    assert _parallel._process_workers(key, capacity=16, size=16) == 4
+
+
+def test_process_backend_is_considered_only_after_slow_thread_work() -> None:
+    fast_key = ("fast-thread",)
+    slow_key = ("slow-thread",)
+    for key in (fast_key, slow_key):
+        _parallel._observe(key, workers=4, capacity=16, size=16, units=100, elapsed=2)
+        _parallel._observe(key, workers=4, capacity=16, size=16, units=100, elapsed=2)
+
+    _parallel._consider_processes(fast_key, elapsed=0.1)
+    _parallel._consider_processes(slow_key, elapsed=2.0)
+
+    assert not _parallel._processes_enabled(fast_key)
+    assert _parallel._processes_enabled(slow_key)
+
+
+def test_process_backend_returns_to_threads_when_warm_rate_is_not_better() -> None:
+    key = ("threads-win",)
+    _parallel._observe(key, workers=4, capacity=16, size=16, units=400, elapsed=1)
+    _parallel._observe(key, workers=4, capacity=16, size=16, units=400, elapsed=1)
+    _parallel._consider_processes(key, elapsed=1)
+    _parallel._observe_process(
+        key, workers=4, capacity=16, size=16, units=100, elapsed=10
+    )
+    _parallel._observe_process(
+        key, workers=4, capacity=16, size=16, units=300, elapsed=1
+    )
+    _parallel._observe_process(
+        key, workers=4, capacity=16, size=16, units=300, elapsed=1
+    )
+
+    assert not _parallel._processes_enabled(key)
+
+
+def test_process_context_does_not_spawn_through_user_main() -> None:
+    assert _parallel._process_context().get_start_method() == "spawn"
+
+
+def test_process_context_does_not_reexecute_unguarded_script(
+    tmp_path: Path,
+) -> None:
+    script = tmp_path / "unguarded.py"
+    marker = tmp_path / "executions"
+    script.write_text(
+        textwrap.dedent(
+            f"""
+            from pathlib import Path
+            from art.trajectories._parallel import _discard_process_executor, _process_executor
+
+            marker = Path({str(marker)!r})
+            with marker.open("a") as output:
+                output.write("run\\n")
+            pool = _process_executor(2)
+            assert list(pool.map(abs, [-1, -2])) == [1, 2]
+            _discard_process_executor()
+            """
+        )
+    )
+
+    subprocess.run([sys.executable, str(script)], check=True, cwd=Path.cwd())
+
+    assert marker.read_text() == "run\n"
+
+
+def test_child_deserialization_failure_is_a_transfer_error() -> None:
+    with pytest.raises(_parallel._ProcessTransferError, match="process input"):
+        _parallel._tokenize_process_payload(b"not a pickle")
+
+
+def test_process_input_pickle_does_not_mutate_or_mark_caller_trajectory() -> None:
+    trajectory = _exchange_trajectory(0)
+    request_keys = list(trajectory.exchanges.chat_completions[0].request)
+    options = _parallel._ProcessOptions(
+        multi_history=False,
+        reconcile_text_equivalent_tokenizations=False,
+        model=None,
+        base_model=None,
+        chat_template=None,
+        chat_template_kwargs=None,
+    )
+
+    payloads = _parallel._process_payloads([trajectory], options)
+
+    assert payloads
+    assert list(trajectory.exchanges.chat_completions[0].request) == request_keys
+    assert not getattr(trajectory, "_art_pickle_strings_interned", False)
+
+
+def test_broken_pool_disables_processes_for_the_interpreter() -> None:
+    with pytest.warns(RuntimeWarning, match="using threads"):
+        _parallel._disable_process_backend(_parallel.BrokenProcessPool("worker exited"))
+
+    assert not _SUPPORTS_PROCESSES(capacity=4, size=4, tokenizer=None)
+
+
+async def test_process_results_rebind_to_original_trajectories(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(_parallel, "_supports_processes", lambda **_: True)
+    monkeypatch.setattr(_parallel, "_processes_enabled", lambda *_, **__: True)
+
+    async def process_map(
+        payloads: list[bytes],
+        trajectories: list[art.Trajectory],
+        *,
+        workers: int,
+        capacity: int,
+    ) -> list[tr.TokenizedTrajectory]:
+        del workers, capacity
+        copies = [
+            cast(tuple[art.Trajectory, object], pickle.loads(payload))[0]
+            for payload in payloads
+        ]
+        return [
+            cast(
+                tr.TokenizedTrajectory,
+                _parallel._deserialize_process_result(
+                    pickle.dumps(_tokenized(copied)), trajectory
+                ),
+            )
+            for copied, trajectory in zip(copies, trajectories, strict=True)
+        ]
+
+    monkeypatch.setattr(_parallel, "_ordered_process_map", process_map)
+    trajectories = [art.Trajectory(metadata={"index": index}) for index in range(4)]
+
+    result = await art.tokenize(trajectories)
+
+    assert [value.trajectory for value in result] == trajectories
+    assert all(
+        value.trajectory is trajectory
+        for value, trajectory in zip(result, trajectories, strict=True)
+    )
+
+
+def test_process_rebind_uses_exchange_position_not_deep_equality() -> None:
+    trajectory = _exchange_trajectory(0)
+    copied = cast(art.Trajectory, pickle.loads(pickle.dumps(trajectory)))
+    tokenized = copied.tokenize()
+    trajectory.exchanges.chat_completions[0].request["temperature"] = math.nan
+
+    _parallel._rebind_process_result(tokenized, trajectory)
+
+    source = cast(tr.ChatCompletionsHistory, tokenized.history).message_sources[-1]
+    assert source is not None
+    assert source.exchange is trajectory.exchanges.chat_completions[0]
+    assert tokenized.trajectory is trajectory
+
+
+async def test_process_tensorization_runs_in_parent_thread_pool(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pytest.importorskip("torch")
+    monkeypatch.setattr(_parallel, "_supports_processes", lambda **_: True)
+    monkeypatch.setattr(_parallel, "_processes_enabled", lambda *_, **__: True)
+    parent_pid = os.getpid()
+    tensorize_processes: list[int] = []
+    tensorize_threads: list[str] = []
+    original_tensorize = tr.TokenizedTrajectory.tensorize
+
+    async def process_map(
+        payloads: list[bytes],
+        trajectories: list[art.Trajectory],
+        *,
+        workers: int,
+        capacity: int,
+    ) -> list[tr.TokenizedTrajectory]:
+        del workers, capacity
+        copies = [
+            cast(tuple[art.Trajectory, object], pickle.loads(payload))[0]
+            for payload in payloads
+        ]
+        return [
+            cast(
+                tr.TokenizedTrajectory,
+                _parallel._deserialize_process_result(
+                    pickle.dumps(_tokenized(copied)), trajectory
+                ),
+            )
+            for copied, trajectory in zip(copies, trajectories, strict=True)
+        ]
+
+    def tensorize(
+        self: tr.TokenizedTrajectory, *, device: object = None
+    ) -> tr.TensorizedTrajectory:
+        tensorize_processes.append(os.getpid())
+        tensorize_threads.append(threading.current_thread().name)
+        return original_tensorize(self, device=cast(Any, device))
+
+    monkeypatch.setattr(_parallel, "_ordered_process_map", process_map)
+    monkeypatch.setattr(tr.TokenizedTrajectory, "tensorize", tensorize)
+    trajectories = [art.Trajectory(metadata={"index": index}) for index in range(4)]
+
+    result = await art.tensorize(trajectories, device="cpu")
+
+    assert tensorize_processes == [parent_pid] * 4
+    assert all(name.startswith("art-tokenize") for name in tensorize_threads)
+    assert all(value.tokens.device.type == "cpu" for value in result)
+
+
+async def test_unpickleable_process_input_warns_once_and_falls_back(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(_parallel, "_supports_processes", lambda **_: True)
+
+    def processes_enabled(key: tuple[object, ...]) -> bool:
+        return not _parallel._process_tuning_state(key).disabled
+
+    monkeypatch.setattr(_parallel, "_processes_enabled", processes_enabled)
+    _patch_tokenize(monkeypatch, lambda trajectory, _: _tokenized(trajectory))
+    attempts = 0
+
+    def fail_payloads(*_: object) -> list[bytes]:
+        nonlocal attempts
+        attempts += 1
+        raise _parallel._ProcessTransferError("not pickleable")
+
+    monkeypatch.setattr(_parallel, "_process_payloads", fail_payloads)
+    trajectories = [art.Trajectory(metadata={"index": index}) for index in range(4)]
+
+    with pytest.warns(RuntimeWarning, match="using threads"):
+        first = await art.tokenize(trajectories)
+    second = await art.tokenize(trajectories)
+
+    assert attempts == 1
+    assert [value.trajectory for value in first] == trajectories
+    assert [value.trajectory for value in second] == trajectories
+
+
+async def test_process_tokenization_errors_are_not_retried_in_threads(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(_parallel, "_supports_processes", lambda **_: True)
+    monkeypatch.setattr(_parallel, "_processes_enabled", lambda *_, **__: True)
+
+    async def process_map(*_: object, **__: object) -> list[tr.TokenizedTrajectory]:
+        raise ValueError("invalid trajectory")
+
+    monkeypatch.setattr(_parallel, "_ordered_process_map", process_map)
+    trajectories = [art.Trajectory(metadata={"index": index}) for index in range(4)]
+
+    with pytest.raises(ValueError, match="invalid trajectory"):
+        await art.tokenize(trajectories)
+
+
+async def test_spawn_process_pool_tokenizes_serialized_trajectories() -> None:
+    trajectories = [_legacy_trajectory(index) for index in range(4)]
+    options = _parallel._ProcessOptions(
+        multi_history=False,
+        reconcile_text_equivalent_tokenizations=False,
+        model="test/model",
+        base_model=None,
+        chat_template=None,
+        chat_template_kwargs=None,
+    )
+
+    try:
+        result = await _parallel._ordered_process_map(
+            _parallel._process_payloads(trajectories, options),
+            trajectories,
+            workers=2,
+            capacity=2,
+        )
+    finally:
+        _parallel._discard_process_executor()
+
+    tokenized = cast(list[tr.TokenizedTrajectory], result)
+    assert [value.tokens for value in tokenized] == [[1, 2], [1, 3], [1, 4], [1, 5]]
+
+
 def test_workload_bucket_uses_average_history_branches() -> None:
     trajectories = [
         art.Trajectory(
@@ -263,6 +650,13 @@ def test_cpu_capacity_honors_affinity_and_cgroup(
     monkeypatch.setattr(_parallel, "_cgroup_cpu_limit", lambda: 6)
 
     assert _CPU_CAPACITY() == 6
+
+
+def test_process_backend_requires_capacity_batch_and_automatic_tokenizer() -> None:
+    assert _SUPPORTS_PROCESSES(capacity=4, size=4, tokenizer=None)
+    assert not _SUPPORTS_PROCESSES(capacity=1, size=4, tokenizer=None)
+    assert not _SUPPORTS_PROCESSES(capacity=4, size=3, tokenizer=None)
+    assert not _SUPPORTS_PROCESSES(capacity=4, size=4, tokenizer=cast(Any, object()))
 
 
 def test_automatic_tokenizer_loading_is_single_flight(

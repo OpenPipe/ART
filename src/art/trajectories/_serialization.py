@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from contextlib import contextmanager
 from dataclasses import fields, is_dataclass
+import threading
 from typing import Any, Literal, SupportsIndex, cast
 
 from openai.types.chat import ChatCompletion
@@ -13,6 +15,17 @@ from pydantic.main import IncEx
 from ..openai import ART_MOE_ROUTING_METADATA_KEY
 
 type _StringPool = dict[str, str]
+_PICKLE_STATE = threading.local()
+
+
+@contextmanager
+def _without_pickle_string_interning():
+    previous = getattr(_PICKLE_STATE, "skip_string_interning", False)
+    _PICKLE_STATE.skip_string_interning = True
+    try:
+        yield
+    finally:
+        _PICKLE_STATE.skip_string_interning = previous
 
 
 class _StringInterningModel(BaseModel):
@@ -24,7 +37,9 @@ class _StringInterningModel(BaseModel):
     __slots__ = ("_art_pickle_strings_interned",)
 
     def __reduce_ex__(self, protocol: SupportsIndex, /) -> str | tuple[Any, ...]:
-        if not getattr(self, "_art_pickle_strings_interned", False):
+        if not getattr(_PICKLE_STATE, "skip_string_interning", False) and not getattr(
+            self, "_art_pickle_strings_interned", False
+        ):
             _intern_strings(self)
         return super().__reduce_ex__(protocol)
 
@@ -217,7 +232,12 @@ def validate_history(value: object) -> object:
     return model.model_validate(data)
 
 
-def _rebind_history_sources(history: object, trajectory: object | None = None) -> None:
+def _rebind_history_sources(
+    history: object,
+    trajectory: object | None = None,
+    *,
+    source_trajectory: object | None = None,
+) -> None:
     """Restore history sidecars to canonical exchange objects after validation."""
 
     from . import (
@@ -234,18 +254,32 @@ def _rebind_history_sources(history: object, trajectory: object | None = None) -
         ResponsesExchange,
         MessagesExchange,
     )
-    canonical = (
-        [
-            *trajectory.exchanges.chat_completions,
-            *trajectory.exchanges.completions,
-            *trajectory.exchanges.responses,
-            *trajectory.exchanges.messages,
+
+    def exchanges(value: object) -> list[object]:
+        if not isinstance(value, Trajectory):
+            return []
+        return [
+            *value.exchanges.chat_completions,
+            *value.exchanges.completions,
+            *value.exchanges.responses,
+            *value.exchanges.messages,
         ]
-        if isinstance(trajectory, Trajectory)
-        else []
-    )
+
+    canonical = exchanges(trajectory)
     fixed = trajectory is not None
-    identities = {id(exchange): exchange for exchange in canonical}
+    if source_trajectory is None:
+        identities = {id(exchange): exchange for exchange in canonical}
+    else:
+        sources = exchanges(source_trajectory)
+        if len(sources) != len(canonical) or any(
+            type(source) is not type(target)
+            for source, target in zip(sources, canonical, strict=True)
+        ):
+            raise ValueError("Source trajectory exchange structure has changed")
+        identities = {
+            id(source): target
+            for source, target in zip(sources, canonical, strict=True)
+        }
 
     def visit(value: object) -> None:
         if isinstance(value, BaseModel) or is_dataclass(value):
@@ -258,7 +292,9 @@ def _rebind_history_sources(history: object, trajectory: object | None = None) -
             )
             for name, item in items:
                 if isinstance(item, exchange_types):
-                    if id(item) in identities:
+                    if (replacement := identities.get(id(item))) is not None:
+                        if replacement is not item:
+                            object.__setattr__(value, name, replacement)
                         continue
                     matches = [
                         exchange
