@@ -13,6 +13,7 @@ from pydantic import BaseModel, ConfigDict, Field, FiniteFloat, model_validator
 from art.distributed.art_runtime import ArtRuntime, DistributedPackedBatch
 from art.distributed.packing import PackingRequest
 from art.distributed.rollout import RolloutModelSpec
+from art.distributed.specs import PairedTransferIdentity
 from art.distributed.trajectory_store import retained_route_bundles_from_bundles
 from art.preprocessing.sft import (
     SftBatchTokenizer,
@@ -202,10 +203,18 @@ class MegatronSamplerPublicationReceipt(BaseModel):
     learner_version: int = Field(ge=0)
     policy_activation_timing: MegatronPolicyActivationTiming | None = None
     inference_update_usage: MegatronInferenceUpdateUsage | None = None
+    paired_transfer: PairedTransferIdentity | None = None
     holder_update_sequence: int | None = Field(default=None, ge=0)
     holder_update_id: str | None = Field(default=None, min_length=1, max_length=255)
     retained: tuple[MegatronRetainedState, ...] = Field(min_length=1, max_length=8)
     result: SamplerWeightsResult
+
+    @model_validator(mode="after")
+    def _validate_transport(self) -> "MegatronSamplerPublicationReceipt":
+        paired = self.publication_mode in {"versioned_lora", "in_flight_lora"}
+        if self.paired_transfer is not None and not paired:
+            raise ValueError("non-paired publication cannot carry paired endpoints")
+        return self
 
     def validate_command(
         self,

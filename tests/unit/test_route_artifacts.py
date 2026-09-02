@@ -3,7 +3,12 @@ import struct
 from types import SimpleNamespace
 
 import pytest
+import torch
 
+from art.distributed import ClusterSpec, HostSpec
+import art.distributed.art_runtime as art_runtime_module
+from art.distributed.art_runtime import ArtRuntime
+from art.distributed.specs import LocalTransferEndpoint
 from art.route_artifacts import (
     MaterializedRouteArtifactProvider,
     RouteArtifactExportReceipt,
@@ -11,11 +16,13 @@ from art.route_artifacts import (
 )
 from art.training import OperationRef
 from art.vllm_route_transport import (
+    LocalRouteObjectView,
     RetainedRouteBundleRef,
     RouteBundleChoiceLayout,
     RouteBundleLayout,
     RouteBundleObjectRef,
     local_retained_route_bundle_transfer,
+    publish_retained_route_bundle_nixl_transfer,
     route_bundle_id,
 )
 
@@ -30,11 +37,7 @@ def test_opaque_holder_route_never_selects_path_loader() -> None:
     assert _route_refs_are_local_files((ref,))  # type: ignore[arg-type]
 
 
-@pytest.mark.asyncio
-async def test_route_artifact_stream_materializes_for_exact_operation(
-    tmp_path, monkeypatch
-) -> None:
-    payload = b"exact-routes"
+def _route_ref(payload: bytes, locator: str) -> RetainedRouteBundleRef:
     choice = RouteBundleChoiceLayout(
         choice_index=0,
         dtype="uint8",
@@ -56,15 +59,191 @@ async def test_route_artifact_stream_materializes_for_exact_operation(
         "sha256": hashlib.sha256(payload).hexdigest(),
     }
     layout = RouteBundleLayout(bundle_id=route_bundle_id(identity), **identity)
-    source = RetainedRouteBundleRef(
+    return RetainedRouteBundleRef(
         object=RouteBundleObjectRef(
             store="holder_local",
-            locator=f"holder-local:opaque:{layout.bundle_id}",
+            locator=locator,
             size_bytes=len(payload),
             sha256=layout.sha256,
         ),
         layout=layout,
         lease_id="route-capture-" + "b" * 64,
+    )
+
+
+def _runtime(root: str, *, inference_domain: str) -> ArtRuntime:
+    cluster = ClusterSpec(
+        hosts=(
+            HostSpec(
+                host_id="trainer",
+                node_rank=0,
+                worker_address="tcp://trainer:1",
+                cpu_slots=1,
+                local_transfer_domain="trainer-domain",
+                local_transfer_root=root,
+            ),
+            HostSpec(
+                host_id="inference",
+                node_rank=1,
+                worker_address="tcp://inference:1",
+                cpu_slots=1,
+                local_transfer_domain=inference_domain,
+                local_transfer_root=root,
+            ),
+        ),
+        controller_host_id="trainer",
+    )
+    runtime = object.__new__(ArtRuntime)
+    runtime.topology = SimpleNamespace(
+        cluster=cluster,
+        trainer=SimpleNamespace(
+            ranks=(SimpleNamespace(host_id="trainer"),), coordinator_rank=0
+        ),
+        model_services=(
+            SimpleNamespace(members=(SimpleNamespace(host_id="inference"),)),
+        ),
+    )
+    runtime._nixl_transport = object()
+    return runtime
+
+
+@pytest.mark.asyncio
+async def test_opaque_holder_route_uses_shared_domain_view(tmp_path) -> None:
+    payload = b"shared-route"
+    path = tmp_path / "bundle.routes"
+    path.write_bytes(payload)
+    ref = _route_ref(payload, "holder-local:opaque:bundle")
+
+    class Reader:
+        retained_route_transport = "holder_local"
+        local_transfer_endpoint = LocalTransferEndpoint(
+            host_id="inference", domain="trainer-domain", root=str(tmp_path)
+        )
+
+        async def resolve_local_view(self, source, *, lease_id):
+            assert (source, lease_id) == (ref.object, ref.lease_id)
+            return LocalRouteObjectView(source=source, path=str(path))
+
+    runtime = _runtime(str(tmp_path), inference_domain="trainer-domain")
+    runtime._route_bundle_reader = Reader()
+    transfer, publisher = await runtime._holder_route_transfer(
+        (ref,), batch_id="batch", target_host_id="trainer"
+    )
+
+    assert publisher is None
+    assert await transfer.receive_payload(timeout_s=1) == payload
+
+
+@pytest.mark.asyncio
+async def test_split_domains_with_same_root_select_nixl(tmp_path, monkeypatch) -> None:
+    ref = _route_ref(b"remote-route", "holder-local:opaque:bundle")
+    reader = SimpleNamespace(
+        retained_route_transport="holder_local",
+        local_transfer_endpoint=LocalTransferEndpoint(
+            host_id="inference", domain="inference-domain", root=str(tmp_path)
+        ),
+    )
+    called = False
+
+    async def publish(refs, **kwargs):
+        nonlocal called
+        called = True
+        assert refs == (ref,)
+        assert kwargs["reader"] is reader
+        assert kwargs["target_host_id"] == "trainer"
+        return "nixl-transfer", "source-registration"
+
+    monkeypatch.setattr(
+        art_runtime_module, "publish_retained_route_bundle_nixl_transfer", publish
+    )
+    runtime = _runtime(str(tmp_path), inference_domain="inference-domain")
+    runtime._route_bundle_reader = reader
+
+    assert await runtime._holder_route_transfer(
+        (ref,), batch_id="batch", target_host_id="trainer"
+    ) == ("nixl-transfer", "source-registration")
+    assert called
+
+
+class _NixlHandle:
+    def __init__(self, local, remote) -> None:
+        self.local = local
+        self.remote = remote
+
+    def release(self) -> None:
+        return None
+
+
+class _NixlAgent:
+    memory: dict[int, torch.Tensor] = {}
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+
+    def register_memory(self, blocks, **_kwargs):
+        addresses = tuple(block.data_ptr() for block in blocks)
+        self.memory.update(zip(addresses, blocks, strict=True))
+        return addresses
+
+    def deregister_memory(self, addresses, **_kwargs) -> None:
+        for address in addresses:
+            self.memory.pop(address)
+
+    def get_agent_metadata(self) -> bytes:
+        return self.name.encode()
+
+    def add_remote_agent(self, metadata: bytes) -> str:
+        return metadata.decode()
+
+    def remove_remote_agent(self, _name: str) -> None:
+        return None
+
+    def get_xfer_descs(self, blocks, **_kwargs):
+        return blocks
+
+    def initialize_xfer(self, operation, local, remote, _agent, **_kwargs):
+        assert operation == "READ"
+        return _NixlHandle(local, remote)
+
+    def transfer(self, handle: _NixlHandle) -> str:
+        address, count, _device = handle.remote[0]
+        handle.local[0].copy_(self.memory[address].narrow(0, 0, count))
+        return "DONE"
+
+
+@pytest.mark.asyncio
+async def test_nixl_route_transfer_moves_exact_reader_bytes(monkeypatch) -> None:
+    payload = b"nixl-route"
+    ref = _route_ref(payload, "holder-local:opaque:nixl")
+
+    class Reader:
+        async def read_stream(self, source, *, lease_id):
+            assert (source, lease_id) == (ref.object, ref.lease_id)
+            yield payload[:3]
+            yield payload[3:]
+
+    monkeypatch.setattr("art.distributed.adapter_transport._new_agent", _NixlAgent)
+    transfer, publisher = await publish_retained_route_bundle_nixl_transfer(
+        (ref,), reader=Reader(), stream_id="routes", target_host_id="packer"
+    )
+    try:
+        assert (
+            await transfer.receive_payload(timeout_s=1, target_host_id="packer")
+            == payload
+        )
+    finally:
+        await publisher.close()
+    assert not _NixlAgent.memory
+
+
+@pytest.mark.asyncio
+async def test_route_artifact_stream_materializes_for_exact_operation(
+    tmp_path,
+) -> None:
+    payload = b"exact-routes"
+    source = _route_ref(
+        payload,
+        "holder-local:opaque:" + hashlib.sha256(payload).hexdigest(),
     )
     export = RouteArtifactExportReceipt.create(
         attempt_id="c" * 64,
@@ -95,8 +274,16 @@ async def test_route_artifact_stream_materializes_for_exact_operation(
         kind="forward_backward",
     )
     handle = await provider.acquire(operation=operation, bundles=(artifact.local,))
-    monkeypatch.setenv("ART_VLLM_ROUTE_SHM_ROOT", str(tmp_path))
-    transfer = local_retained_route_bundle_transfer((artifact.local,))
+    transfer = local_retained_route_bundle_transfer(
+        (source,),
+        (
+            LocalRouteObjectView(
+                source=source.object,
+                path=artifact.local.object.locator,
+            ),
+        ),
+        local_transfer_root=str(tmp_path),
+    )
     assert await transfer.receive_payload(timeout_s=1) == payload
     assert (
         b"".join(
@@ -121,37 +308,7 @@ async def test_route_artifact_stream_materializes_for_exact_operation(
 @pytest.mark.asyncio
 async def test_route_artifact_rejects_truncated_payload(tmp_path) -> None:
     payload = b"x"
-    choice = RouteBundleChoiceLayout(
-        choice_index=0,
-        dtype="uint8",
-        shape=(2, 1, 1),
-        offset=0,
-        byte_count=2,
-        token_ids_sha256="a" * 64,
-    )
-    identity = {
-        "protocol_version": 1,
-        "format": "art_inference_route_bundle_v1",
-        "request_id": "b" * 64,
-        "owner_id": "paired-slot",
-        "model_identity": "model@generation",
-        "response_id": "response",
-        "num_experts": 1,
-        "choices": [choice.model_dump(mode="json")],
-        "byte_count": 2,
-        "sha256": hashlib.sha256(b"xx").hexdigest(),
-    }
-    layout = RouteBundleLayout(bundle_id=route_bundle_id(identity), **identity)
-    source = RetainedRouteBundleRef(
-        object=RouteBundleObjectRef(
-            store="holder_local",
-            locator="holder-local:opaque:" + layout.bundle_id,
-            size_bytes=2,
-            sha256=layout.sha256,
-        ),
-        layout=layout,
-        lease_id="route-capture-" + "b" * 64,
-    )
+    source = _route_ref(b"xx", "holder-local:opaque:truncated")
     export = RouteArtifactExportReceipt.create(
         attempt_id="c" * 64,
         tenant_id="tenant",

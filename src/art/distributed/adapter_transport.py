@@ -41,6 +41,23 @@ class AdapterTransferTarget(_TransportRecord):
     transfer_timeout_s: float = Field(default=300.0, gt=0)
 
 
+class NixlMemorySource(_TransportRecord):
+    """One bounded CPU buffer registered for a remote NIXL read."""
+
+    agent: str = Field(min_length=1, max_length=255)
+    metadata_b64: str = Field(min_length=1, max_length=1 << 20)
+    address: int = Field(gt=0)
+    byte_count: int = Field(gt=0)
+
+    @model_validator(mode="after")
+    def _validate_metadata(self) -> "NixlMemorySource":
+        try:
+            base64.b64decode(self.metadata_b64, validate=True)
+        except ValueError as error:
+            raise ValueError("NIXL source metadata is not valid base64") from error
+        return self
+
+
 class AdapterReceiveResult(_TransportRecord):
     host_id: str = Field(min_length=1)
     generation_id: str = Field(min_length=1)
@@ -346,6 +363,61 @@ def _new_agent(name: str) -> Any:
             sync_mode=sync_type.NIXL_THREAD_SYNC_STRICT,
         ),
     )
+
+
+def _run_nixl_transfer(
+    agent: Any, handle: Any, *, timeout_s: float, description: str
+) -> None:
+    state = agent.transfer(handle)
+    deadline = time.monotonic() + timeout_s
+    while state == "PROC":
+        if time.monotonic() >= deadline:
+            raise TimeoutError(f"NIXL {description} timed out")
+        time.sleep(0.001)
+        state = agent.check_xfer_state(handle)
+    if state != "DONE":
+        raise RuntimeError(f"NIXL {description} failed")
+
+
+def nixl_read_bytes(
+    source: NixlMemorySource, *, transfer_id: str, timeout_s: float
+) -> bytearray:
+    """Read one registered CPU buffer with the standard NIXL lifecycle."""
+
+    payload = bytearray(source.byte_count)
+    block = torch.frombuffer(payload, dtype=torch.uint8)
+    agent = _new_agent(
+        "art-nixl-reader-"
+        + hashlib.sha256(f"{os.getpid()}:{transfer_id}".encode()).hexdigest()[:24]
+    )
+    registration = agent.register_memory((block,), backends=["UCX"])
+    remote_agent = None
+    handle = None
+    try:
+        remote_agent = agent.add_remote_agent(
+            base64.b64decode(source.metadata_b64, validate=True)
+        )
+        if isinstance(remote_agent, bytes):
+            remote_agent = remote_agent.decode()
+        if remote_agent != source.agent:
+            raise RuntimeError("NIXL source returned the wrong agent identity")
+        handle = agent.initialize_xfer(
+            "READ",
+            agent.get_xfer_descs((block,)),
+            agent.get_xfer_descs(
+                [(source.address, source.byte_count, 0)], mem_type="DRAM"
+            ),
+            remote_agent,
+            backends=["UCX"],
+        )
+        _run_nixl_transfer(agent, handle, timeout_s=timeout_s, description=transfer_id)
+        return payload
+    finally:
+        if handle is not None:
+            handle.release()
+        if remote_agent is not None:
+            agent.remove_remote_agent(remote_agent)
+        agent.deregister_memory(registration, backends=["UCX"])
 
 
 def _adapter_template_bytes(path: str) -> int:
@@ -697,12 +769,22 @@ class AdapterSnapshotReceiver:
     """Owns receive buffers for immutable LoRA generations."""
 
     def __init__(
-        self, host_id: str, output_root: str, *, pool_capacity: int = 2
+        self,
+        host_id: str,
+        output_root: str,
+        *,
+        pool_capacity: int = 2,
+        local_transfer_root: str | None = None,
     ) -> None:
         if pool_capacity < 1:
             raise ValueError("adapter receive pool capacity must be positive")
         self.host_id = host_id
         self.output_root = Path(output_root) / "adapter_transfers"
+        self.local_transfer_root = (
+            None
+            if local_transfer_root is None
+            else Path(local_transfer_root) / "adapter_transfers"
+        )
         self.pool_capacity = pool_capacity
         self._agent: Any | None = None
         self._pending: dict[str, _PendingReceive] = {}
@@ -883,6 +965,9 @@ class AdapterSnapshotReceiver:
                 raise RuntimeError("adapter receive pool is closed")
             if generation_id in self._local_pending or generation_id in self._pending:
                 raise RuntimeError(f"Adapter receive already exists: {generation_id}")
+            if self.local_transfer_root is None:
+                raise RuntimeError("local adapter transfer root is not configured")
+            self.local_transfer_root.mkdir(parents=True, exist_ok=True)
             socket_path = (
                 "/tmp/art-lora-"
                 + hashlib.sha256(
@@ -895,17 +980,15 @@ class AdapterSnapshotReceiver:
                 listener.bind(socket_path)
                 listener.listen(1)
                 listener.setblocking(False)
-                local_root = Path(
-                    os.environ.get(
-                        "ART_LOCAL_ADAPTER_TRANSFER_ROOT",
-                        "/dev/shm/art_adapter_transfers",
-                    )
-                )
                 target = AdapterTransferTarget(
                     transport="local",
                     host_id=self.host_id,
                     generation_id=generation_id,
-                    path=str((local_root / self.host_id / generation_id).absolute()),
+                    path=str(
+                        (
+                            self.local_transfer_root / self.host_id / generation_id
+                        ).absolute()
+                    ),
                     remote_agent=socket_path,
                     remote_metadata_b64="-",
                     remote_address=0,
@@ -1036,16 +1119,10 @@ class AdapterSnapshotReceiver:
         with self._condition:
             self._materialized.discard(generation_id)
             self._materialized_objects.pop(generation_id, None)
-        for root in (
-            self.output_root,
-            Path(
-                os.environ.get(
-                    "ART_LOCAL_ADAPTER_TRANSFER_ROOT",
-                    "/dev/shm/art_adapter_transfers",
-                )
-            )
-            / self.host_id,
-        ):
+        roots = [self.output_root]
+        if self.local_transfer_root is not None:
+            roots.append(self.local_transfer_root / self.host_id)
+        for root in roots:
             path = root / generation_id
             if path.exists():
                 rmtree(path)
@@ -1171,6 +1248,7 @@ class NixlAdapterSender:
         self._agent: Any | None = None
         self._block: torch.Tensor | None = None
         self._registration: Any | None = None
+        self._payload: bytearray | None = None
         self._remote_agents: dict[str, tuple[str, str]] = {}
         self._unreleased_handles: list[Any] = []
         self._active_transfers = 0
@@ -1237,20 +1315,14 @@ class NixlAdapterSender:
                     notification,
                     backends=["UCX"],
                 )
-                state = agent.transfer(handle)
-                deadline = time.monotonic() + target.transfer_timeout_s
-                while state == "PROC":
-                    if time.monotonic() >= deadline:
-                        raise TimeoutError(
-                            "NIXL adapter transfer timed out for "
-                            f"{target.host_id}: {target.generation_id}"
-                        )
-                    time.sleep(0.001)
-                    state = agent.check_xfer_state(handle)
-                if state != "DONE":
-                    raise RuntimeError(
-                        f"NIXL adapter transfer failed for {target.host_id}"
-                    )
+                _run_nixl_transfer(
+                    agent,
+                    handle,
+                    timeout_s=target.transfer_timeout_s,
+                    description=(
+                        f"adapter transfer for {target.host_id}: {target.generation_id}"
+                    ),
+                )
                 self._completed_transfers += 1
             except BaseException as error:
                 if handle is not None:
@@ -1292,6 +1364,22 @@ class NixlAdapterSender:
         self._registration = registration
         return time.monotonic() - started
 
+    def register_bytes(self, payload: bytearray) -> NixlMemorySource:
+        """Register one immutable payload until this sender is closed."""
+
+        if self._closed or self._block is not None or not payload:
+            raise RuntimeError("NIXL byte source is not available")
+        self._payload = payload
+        self._block = torch.frombuffer(payload, dtype=torch.uint8)
+        agent = self._require_agent()
+        self._registration = agent.register_memory((self._block,), backends=["UCX"])
+        return NixlMemorySource(
+            agent=agent.name,
+            metadata_b64=base64.b64encode(agent.get_agent_metadata()).decode(),
+            address=self._block.data_ptr(),
+            byte_count=len(payload),
+        )
+
     def close(self) -> None:
         failures: list[BaseException] = []
         retained_handles = []
@@ -1313,6 +1401,7 @@ class NixlAdapterSender:
         if self._agent is not None and self._registration is not None:
             self._agent.deregister_memory(self._registration, backends=["UCX"])
         self._block = None
+        self._payload = None
         self._registration = None
         self._closed = True
 
@@ -1367,7 +1456,7 @@ class NixlAdapterSender:
 
     def _require_agent(self) -> Any:
         if self._agent is None:
-            self._agent = _new_agent(f"art-lora-sender-{os.getpid()}")
+            self._agent = _new_agent(f"art-nixl-sender-{os.getpid()}-{id(self):x}")
         return self._agent
 
 

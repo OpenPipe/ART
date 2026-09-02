@@ -25,7 +25,7 @@ from art.distributed.adapter_transport import (
     ExternalAdapterSource,
 )
 from art.distributed.art_runtime import ArtRuntime
-from art.distributed.specs import ModelServiceSpec
+from art.distributed.specs import ModelServiceSpec, PairedTransferIdentity
 from art.distributed.vllm_replica import ReplicaLaunchTemplate
 from art.serving_capabilities import (
     PairedInferenceEndpoint,
@@ -304,9 +304,7 @@ class MegatronPairedInferencePublisher:
             targets = await manager.prepare_adapter_transfer(
                 generation.generation_id,
                 template_adapter_path,
-                transport=_paired_lora_transport(
-                    self.trainer.runtime_spec, self.service
-                ),
+                transport=self.endpoint.profile.identity.paired_transfer.backend,
             )
             if not targets:
                 raise RuntimeError("paired inference returned no transfer targets")
@@ -435,6 +433,7 @@ class MegatronPairedInferencePublisher:
                     staging_s=max(float(item.materialization_s) for item in received),
                     apply_s=update_apply_s,
                 ),
+                paired_transfer=self.endpoint.profile.identity.paired_transfer,
                 holder_update_sequence=update_sequence,
                 holder_update_id=update_identity,
                 retained=(
@@ -1100,6 +1099,8 @@ def _serving_profile_identity(
     service: ModelServiceSpec,
 ) -> ServingProfileIdentity:
     retained_routes = runtime.retained_route_prefetch_enabled
+    paired_transfer = _paired_transfer_identity(runtime, spec, service)
+    route_transport = runtime.retained_route_transport
     return ServingProfileIdentity(
         base_model=base_model,
         model_identifier=service.runtime_model,
@@ -1111,8 +1112,14 @@ def _serving_profile_identity(
         lora_target_modules=spec.lora_target_modules,
         trainer_dtype=spec.dtype,
         route_replay=spec.enable_moe_routing_replay,
-        lora_transport=_paired_lora_transport(spec, service),
-        retained_route_transport=runtime.retained_route_transport,
+        paired_transfer=paired_transfer,
+        lora_transport=paired_transfer.backend,
+        retained_route_transport=route_transport,
+        retained_route_delivery=(
+            paired_transfer.backend
+            if route_transport == "holder_local"
+            else route_transport
+        ),
         retained_route_max_bytes=(
             runtime.config.route_bundle_prefetch_capacity_bytes
             if retained_routes
@@ -1125,11 +1132,21 @@ def _serving_profile_identity(
 
 
 def _paired_lora_transport(
-    spec: TrainerRuntimeSpec, service: ModelServiceSpec
+    runtime: ArtRuntime, spec: TrainerRuntimeSpec, service: ModelServiceSpec
 ) -> Literal["local", "nixl"]:
-    trainer_host = spec.trainer_mesh.ranks[0].host_id
-    inference_hosts = {member.host_id for member in service.members}
-    return "local" if inference_hosts == {trainer_host} else "nixl"
+    return _paired_transfer_identity(runtime, spec, service).backend
+
+
+def _paired_transfer_identity(
+    runtime: ArtRuntime, spec: TrainerRuntimeSpec, service: ModelServiceSpec
+) -> PairedTransferIdentity:
+    coordinator = spec.trainer_mesh.ranks[spec.trainer_mesh.coordinator_rank]
+    return runtime.topology.cluster.paired_transfer_identity(
+        tuple(rank.host_id for rank in spec.trainer_mesh.ranks),
+        tuple(member.host_id for member in service.members),
+        lora_source_host_id=coordinator.host_id,
+        route_source_host_id=service.members[0].host_id,
+    )
 
 
 def _validate_serving_profile(

@@ -12,9 +12,10 @@ from pydantic import (
     model_validator,
 )
 
+from art.distributed.specs import PairedTransferIdentity
 from art.runtime_attestation import RuntimeArchitectureAttestation
 
-ART_SERVING_PROTOCOL_VERSION = 12
+ART_SERVING_PROTOCOL_VERSION = 13
 
 ART_PRIVATE_CACHE_IDENTITY_HEADER = "x-art-cache-identity"
 ART_PRIVATE_REQUEST_IDENTITY_HEADER = "x-art-request-identity"
@@ -80,8 +81,10 @@ class ServingProfileIdentity(BaseModel):
     lora_target_modules: tuple[str, ...] = Field(min_length=1)
     trainer_dtype: Literal["bfloat16", "float16", "float32"]
     route_replay: bool
+    paired_transfer: PairedTransferIdentity
     lora_transport: Literal["local", "nixl"]
     retained_route_transport: Literal["none", "holder_local", "caios_lota"]
+    retained_route_delivery: Literal["none", "local", "nixl", "caios_lota"]
     retained_route_max_bytes: int = Field(ge=0)
     retained_route_max_bundles: int = Field(ge=0)
 
@@ -95,6 +98,17 @@ class ServingProfileIdentity(BaseModel):
         if not valid_bounds:
             raise ValueError(
                 "retained route transport and bounds must be present together"
+            )
+        if self.lora_transport != self.paired_transfer.backend:
+            raise ValueError("LoRA transport differs from paired endpoint topology")
+        expected_delivery = {
+            "none": "none",
+            "holder_local": self.paired_transfer.backend,
+            "caios_lota": "caios_lota",
+        }[self.retained_route_transport]
+        if self.retained_route_delivery != expected_delivery:
+            raise ValueError(
+                "retained route delivery differs from its ownership and topology"
             )
         if len(set(self.lora_target_modules)) != len(self.lora_target_modules):
             raise ValueError("LoRA target modules must be unique")

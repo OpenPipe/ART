@@ -122,8 +122,12 @@ def resilient_endpoint(function: Any = None, *, concurrent: bool = False) -> Any
 class AdapterTransferHostService(Actor):
     """Adapter receiver isolated from packing in its own host process."""
 
-    def __init__(self, host_id: str, output_root: str) -> None:
-        self._receiver = AdapterSnapshotReceiver(host_id, output_root)
+    def __init__(
+        self, host_id: str, output_root: str, local_transfer_root: str | None
+    ) -> None:
+        self._receiver = AdapterSnapshotReceiver(
+            host_id, output_root, local_transfer_root=local_transfer_root
+        )
 
     @resilient_endpoint
     async def prepare(
@@ -580,6 +584,9 @@ class ArtHostService(Actor):
             return groups, tokenized_batch, time.monotonic() - fetch_started
 
         route_transfer = request.route_bundle_transfer
+        route_transfer_backend = (
+            None if route_transfer is None else route_transfer.backend
+        )
         if route_transfer is not None:
             if (
                 route_transfer.stream is not None
@@ -590,7 +597,8 @@ class ArtHostService(Actor):
             async def receive_routes() -> tuple[bytearray, float]:
                 started = time.monotonic()
                 payload = await route_transfer.receive_payload(
-                    timeout_s=transfer_timeout_s
+                    timeout_s=transfer_timeout_s,
+                    target_host_id=self.host_id,
                 )
                 return payload, time.monotonic() - started
 
@@ -711,6 +719,7 @@ class ArtHostService(Actor):
                 generation_id=request.generation_id,
                 trajectory_fetch_s=trajectory_fetch_s,
                 route_fetch_s=route_fetch_s,
+                route_transfer_backend=route_transfer_backend,
                 packing_core_s=packing_core_s,
                 trajectory_log_wait_s=trajectory_log_wait_s,
             )
@@ -741,6 +750,7 @@ class ArtHostService(Actor):
             trajectory_log_path=request.trajectory_log_path,
             trajectory_fetch_s=trajectory_fetch_s,
             route_fetch_s=route_fetch_s,
+            route_transfer_backend=route_transfer_backend,
             packing_core_s=packing_core_s,
             trajectory_log_wait_s=trajectory_log_wait_s,
             packed_batch_finalize_s=packed_batch_finalize_s,

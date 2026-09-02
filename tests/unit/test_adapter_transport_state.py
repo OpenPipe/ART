@@ -82,6 +82,24 @@ def test_adapter_transport_state_is_bounded_and_survives_close(
     assert sender.state().closed is True
 
 
+def test_local_adapter_target_uses_the_explicit_shared_root(
+    tmp_path, monkeypatch
+) -> None:
+    root = tmp_path / "shared"
+    receiver = AdapterSnapshotReceiver(
+        "inference-0", str(tmp_path), local_transfer_root=str(root)
+    )
+    monkeypatch.setattr(adapter_transport, "_adapter_template_bytes", lambda _path: 8)
+
+    target = receiver.prepare("generation-1", "template", transport="local")
+
+    assert target.path == str(
+        root / "adapter_transfers" / "inference-0" / "generation-1"
+    )
+    receiver.release("generation-1")
+    receiver.close()
+
+
 def _external_object_source(payload: bytes) -> ExternalAdapterObjectSource:
     config = json.dumps(
         {

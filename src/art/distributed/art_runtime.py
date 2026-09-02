@@ -16,9 +16,11 @@ from art.megatron.runtime.managed import MegatronRuntimeInfo
 from art.megatron.runtime.specs import TrainerRuntimeSpec, TrainingRunSpec
 from art.utils.lifecycle import complete_task
 from art.vllm_route_transport import (
+    LocalRouteObjectView,
     RetainedRouteBundleRef,
     RouteBundleReader,
     local_retained_route_bundle_transfer,
+    publish_retained_route_bundle_nixl_transfer,
     publish_retained_route_bundle_transfer,
 )
 
@@ -78,6 +80,7 @@ from .specs import (
     HostServiceHealth,
     ModelServiceSpec,
     NixlTransportSpec,
+    PairedTransferIdentity,
     RuntimeTopology,
 )
 from .vllm_replica import (
@@ -102,6 +105,7 @@ class DistributedPackedBatch(BaseModel):
     packing_rpc_s: float = 0.0
     trajectory_fetch_s: float = 0.0
     route_fetch_s: float = 0.0
+    route_transfer_backend: Literal["stream", "local", "nixl"] | None = None
     packing_core_s: float = 0.0
     trajectory_log_wait_s: float = 0.0
     packed_batch_finalize_s: float = 0.0
@@ -312,6 +316,7 @@ class ArtRuntime:
                     AdapterTransferHostService,
                     host.host_id,
                     self.config.vllm_output_root,
+                    host.local_transfer_root,
                 )
                 self._adapter_services[host.host_id] = adapter_actor
             await asyncio.gather(
@@ -842,6 +847,83 @@ class ArtRuntime:
             host for host in self.topology.cluster.hosts if host.host_id == host_id
         )
 
+    async def _holder_route_transfer(
+        self,
+        refs: tuple[RetainedRouteBundleRef, ...],
+        *,
+        batch_id: str,
+        target_host_id: str,
+    ) -> tuple[Any, Any | None]:
+        assert self._route_bundle_reader is not None
+        local_files = _route_refs_are_local_files(refs)
+        if local_files:
+            trainer = self.topology.trainer
+            if trainer is None or {rank.host_id for rank in trainer.ranks} != {
+                target_host_id
+            }:
+                raise RuntimeError("materialized routes require one trainer host")
+            roots = {Path(ref.object.locator).resolve().parent for ref in refs}
+            if len(roots) != 1:
+                raise RuntimeError("materialized routes must share one local root")
+            views = tuple(
+                LocalRouteObjectView(source=ref.object, path=ref.object.locator)
+                for ref in refs
+            )
+            return (
+                local_retained_route_bundle_transfer(
+                    refs, views, local_transfer_root=str(roots.pop())
+                ),
+                None,
+            )
+
+        paired = self._paired_transfer_identity()
+        targets = {endpoint.host_id: endpoint for endpoint in paired.trainer_endpoints}
+        if target_host_id not in targets:
+            raise RuntimeError("route packing target is not a paired trainer endpoint")
+        if self._route_bundle_reader.local_transfer_endpoint != paired.route_source:
+            raise RuntimeError("holder route reader differs from its inference source")
+        if paired.backend == "nixl":
+            if self._nixl_transport is None:
+                raise RuntimeError("cross-domain holder routes require NIXL transport")
+            return await publish_retained_route_bundle_nixl_transfer(
+                refs,
+                reader=self._route_bundle_reader,
+                stream_id=f"{batch_id}:routes",
+                target_host_id=target_host_id,
+            )
+        views = tuple(
+            await asyncio.gather(
+                *(
+                    self._route_bundle_reader.resolve_local_view(
+                        ref.object, lease_id=ref.lease_id
+                    )
+                    for ref in refs
+                )
+            )
+        )
+        return (
+            local_retained_route_bundle_transfer(
+                refs,
+                views,
+                local_transfer_root=paired.route_source.root,
+            ),
+            None,
+        )
+
+    def _paired_transfer_identity(self) -> PairedTransferIdentity:
+        trainer = self.topology.trainer
+        services = self.topology.model_services
+        if trainer is None or len(services) != 1:
+            raise RuntimeError("holder routes require one paired inference service")
+        service = services[0]
+        coordinator = trainer.ranks[trainer.coordinator_rank]
+        return self.topology.cluster.paired_transfer_identity(
+            tuple(rank.host_id for rank in trainer.ranks),
+            tuple(member.host_id for member in service.members),
+            lora_source_host_id=coordinator.host_id,
+            route_source_host_id=service.members[0].host_id,
+        )
+
     async def pack(self, request: PackingRequest) -> DistributedPackedBatch | None:
         self._require_open()
         trainer = self.topology.trainer
@@ -855,6 +937,7 @@ class ArtRuntime:
         self._live_batches[batch_id] = trainer_hosts
         try:
             publishers = []
+            route_transfer = None
             wire_request = request
             if (
                 request.trajectory_groups
@@ -912,16 +995,18 @@ class ArtRuntime:
                         raise RuntimeError(
                             "retained route bytes exceed prefetch capacity"
                         )
-                    if (
-                        self._route_bundle_reader.retained_route_transport
-                        == "holder_local"
-                        and _route_refs_are_local_files(refs)
-                    ):
-                        if len(trainer_hosts) != 1:
-                            raise RuntimeError(
-                                "local retained routes require one physical host"
-                            )
-                        route_transfer = local_retained_route_bundle_transfer(refs)
+                    route_transport = self._route_bundle_reader.retained_route_transport
+                    if route_transport == "holder_local":
+                        (
+                            route_transfer,
+                            route_publisher,
+                        ) = await self._holder_route_transfer(
+                            refs,
+                            batch_id=batch_id,
+                            target_host_id=source_host,
+                        )
+                        if route_publisher is not None:
+                            publishers.append(route_publisher)
                     else:
                         (
                             route_transfer,
@@ -957,6 +1042,11 @@ class ArtRuntime:
                 raise RuntimeError("packing host returned the wrong generation ID")
             if result.ref.batch_id != batch_id:
                 raise RuntimeError("packing host returned the wrong batch ID")
+            expected_route_backend = (
+                None if route_transfer is None else route_transfer.backend
+            )
+            if result.route_transfer_backend != expected_route_backend:
+                raise RuntimeError("packing host changed the route transfer backend")
             host_refs = {source_host: result.ref}
             destinations = {
                 host_id: MonarchPackedBatchInbox(self._host_services[host_id])
@@ -988,6 +1078,7 @@ class ArtRuntime:
             packing_rpc_s=packing_rpc_s,
             trajectory_fetch_s=result.trajectory_fetch_s,
             route_fetch_s=result.route_fetch_s,
+            route_transfer_backend=result.route_transfer_backend,
             packing_core_s=result.packing_core_s,
             trajectory_log_wait_s=result.trajectory_log_wait_s,
             packed_batch_finalize_s=result.packed_batch_finalize_s,

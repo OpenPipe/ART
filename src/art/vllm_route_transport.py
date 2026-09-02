@@ -16,11 +16,17 @@ from typing import TYPE_CHECKING, Any, Literal, Protocol
 from openai.types.chat import ChatCompletion
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from art.distributed.adapter_transport import (
+    NixlAdapterSender,
+    NixlMemorySource,
+    nixl_read_bytes,
+)
 from art.distributed.data_plane import (
     AsyncByteStreamPublisher,
     ByteStreamTransfer,
     receive_byte_stream,
 )
+from art.distributed.specs import LocalTransferEndpoint
 from art.preprocessing.moe_routing import (
     ART_MOE_ROUTING_METADATA_KEY,
     MoeRouteArray,
@@ -131,9 +137,27 @@ class RetainedRouteBundleRef(_Contract):
         return self
 
 
+class NixlRouteTransfer(_Contract):
+    """Bounded registered-memory source for one cross-domain route batch."""
+
+    protocol_version: Literal[1] = 1
+    stream_id: str = Field(min_length=1, max_length=512)
+    target_host_id: str = Field(min_length=1, max_length=255)
+    source: NixlMemorySource
+
+
+class LocalRouteObjectView(_Contract):
+    """Lease-bound local path for an otherwise opaque retained object."""
+
+    source: RouteBundleObjectRef
+    path: str = Field(min_length=1, max_length=4096)
+
+
 class RouteBundleBatchTransfer(_Contract):
     stream: ByteStreamTransfer | None = None
-    local_objects: tuple[RouteBundleObjectRef, ...] = ()
+    nixl: NixlRouteTransfer | None = None
+    local_objects: tuple[LocalRouteObjectView, ...] = ()
+    local_transfer_root: str | None = Field(default=None, max_length=4096)
     layouts: tuple[RouteBundleLayout, ...] = Field(min_length=1)
 
     @model_validator(mode="after")
@@ -142,38 +166,89 @@ class RouteBundleBatchTransfer(_Contract):
             raise ValueError("retained route transfer repeats a bundle")
         if len({layout.response_id for layout in self.layouts}) != len(self.layouts):
             raise ValueError("retained route transfer repeats a response")
-        if (self.stream is None) == (not self.local_objects):
+        transports = sum(
+            (self.stream is not None, self.nixl is not None, bool(self.local_objects))
+        )
+        if transports != 1:
             raise ValueError("retained route transfer must use one transport")
-        if (
-            self.stream is not None
-            and sum(layout.byte_count for layout in self.layouts)
-            != self.stream.byte_count
-        ):
+        if bool(self.local_objects) != (self.local_transfer_root is not None):
+            raise ValueError("local route transfer requires its explicit root")
+        expected_bytes = sum(layout.byte_count for layout in self.layouts)
+        transferred_bytes = (
+            self.stream.byte_count
+            if self.stream is not None
+            else self.nixl.source.byte_count
+            if self.nixl is not None
+            else expected_bytes
+        )
+        if transferred_bytes != expected_bytes:
             raise ValueError("retained route transfer size differs from its layouts")
+        root = (
+            None
+            if self.local_transfer_root is None
+            else Path(self.local_transfer_root).resolve()
+        )
         if self.local_objects and (
-            len(self.local_objects) != len(self.layouts)
+            str(root) != self.local_transfer_root
+            or len(self.local_objects) != len(self.layouts)
             or any(
-                ref.store != "holder_local"
-                or ref.size_bytes != layout.byte_count
-                or ref.sha256 != layout.sha256
-                for ref, layout in zip(self.local_objects, self.layouts, strict=True)
+                view.source.size_bytes != layout.byte_count
+                or view.source.sha256 != layout.sha256
+                or view.source.store != "holder_local"
+                or str(Path(view.path).resolve()) != view.path
+                or Path(view.path).resolve().suffix != ".routes"
+                or root not in Path(view.path).resolve().parents
+                for view, layout in zip(self.local_objects, self.layouts, strict=True)
             )
         ):
             raise ValueError("local route objects differ from their layouts")
         return self
 
-    async def receive_payload(self, *, timeout_s: float) -> bytearray:
+    @property
+    def backend(self) -> Literal["stream", "local", "nixl"]:
+        if self.stream is not None:
+            return "stream"
+        return "nixl" if self.nixl is not None else "local"
+
+    async def receive_payload(
+        self, *, timeout_s: float, target_host_id: str | None = None
+    ) -> bytearray:
         if self.stream is not None:
             return await receive_byte_stream(self.stream, timeout_s=timeout_s)
-        return await asyncio.to_thread(_read_local_route_objects, self.local_objects)
+        nixl = self.nixl
+        if nixl is not None:
+            if target_host_id != nixl.target_host_id:
+                raise RuntimeError(
+                    "NIXL route transfer reached the wrong runtime domain"
+                )
+            from art.utils.lifecycle import complete_to_thread
+
+            payload, cancelled = await complete_to_thread(
+                lambda: nixl_read_bytes(
+                    nixl.source,
+                    transfer_id=nixl.stream_id,
+                    timeout_s=timeout_s,
+                )
+            )
+            if cancelled is not None:
+                raise cancelled
+            return payload
+        return await asyncio.to_thread(
+            _read_local_route_objects,
+            self.local_objects,
+            self.local_transfer_root,
+        )
 
     async def receive_into(
         self,
         groups: Iterable["TrajectoryGroup"],
         *,
         timeout_s: float,
+        target_host_id: str | None = None,
     ) -> int:
-        payload = await self.receive_payload(timeout_s=timeout_s)
+        payload = await self.receive_payload(
+            timeout_s=timeout_s, target_host_id=target_host_id
+        )
         return hydrate_retained_route_bundles(groups, self.layouts, payload)
 
 
@@ -182,6 +257,13 @@ class RouteBundleReader(Protocol):
 
     @property
     def retained_route_transport(self) -> Literal["holder_local", "caios_lota"]: ...
+
+    @property
+    def local_transfer_endpoint(self) -> LocalTransferEndpoint | None: ...
+
+    async def resolve_local_view(
+        self, ref: RouteBundleObjectRef, *, lease_id: str
+    ) -> LocalRouteObjectView: ...
 
     def read_stream(
         self, ref: RouteBundleObjectRef, *, lease_id: str
@@ -192,6 +274,70 @@ class RouteBundleReader(Protocol):
 class RouteBundlePayload:
     layout: RouteBundleLayout
     chunks: tuple[memoryview, ...]
+
+
+@dataclass
+class NixlRoutePublisher:
+    """Own the registered source bytes until the remote packing RPC settles."""
+
+    transfer: NixlRouteTransfer
+    _sender: NixlAdapterSender
+
+    async def close(self) -> None:
+        from art.utils.lifecycle import complete_to_thread
+
+        _, cancelled = await complete_to_thread(self._sender.close)
+        if cancelled is not None:
+            raise cancelled
+
+
+async def publish_retained_route_bundle_nixl_transfer(
+    refs: tuple[RetainedRouteBundleRef, ...],
+    *,
+    reader: RouteBundleReader,
+    stream_id: str,
+    target_host_id: str,
+) -> tuple[RouteBundleBatchTransfer, NixlRoutePublisher]:
+    if not refs:
+        raise ValueError("retained route transfer requires at least one bundle")
+    if len({ref.layout.bundle_id for ref in refs}) != len(refs):
+        raise ValueError("retained route transfer repeats a bundle")
+    payload = await _read_retained_route_payload(refs, reader)
+    from art.utils.lifecycle import complete_to_thread
+
+    publisher, cancelled = await complete_to_thread(
+        lambda: _register_nixl_route_source(
+            payload, stream_id=stream_id, target_host_id=target_host_id
+        )
+    )
+    if cancelled is not None:
+        await publisher.close()
+        raise cancelled
+    try:
+        transfer = RouteBundleBatchTransfer(
+            nixl=publisher.transfer,
+            layouts=tuple(ref.layout for ref in refs),
+        )
+    except BaseException:
+        await publisher.close()
+        raise
+    return transfer, publisher
+
+
+def _register_nixl_route_source(
+    payload: bytearray, *, stream_id: str, target_host_id: str
+) -> NixlRoutePublisher:
+    sender = NixlAdapterSender()
+    try:
+        transfer = NixlRouteTransfer(
+            stream_id=stream_id,
+            target_host_id=target_host_id,
+            source=sender.register_bytes(payload),
+        )
+    except BaseException:
+        sender.close()
+        raise
+    return NixlRoutePublisher(transfer, sender)
 
 
 async def publish_retained_route_bundle_transfer(
@@ -232,11 +378,17 @@ async def publish_retained_route_bundle_transfer(
 
 def local_retained_route_bundle_transfer(
     refs: tuple[RetainedRouteBundleRef, ...],
+    views: tuple[LocalRouteObjectView, ...],
+    *,
+    local_transfer_root: str,
 ) -> RouteBundleBatchTransfer:
     if not refs:
         raise ValueError("local retained route transfer requires at least one bundle")
+    if tuple(view.source for view in views) != tuple(ref.object for ref in refs):
+        raise ValueError("local route views differ from their retained objects")
     return RouteBundleBatchTransfer(
-        local_objects=tuple(ref.object for ref in refs),
+        local_objects=views,
+        local_transfer_root=local_transfer_root,
         layouts=tuple(ref.layout for ref in refs),
     )
 
@@ -471,15 +623,31 @@ def retained_local_route_bundle_from_response(
     )
 
 
-def _read_local_route_objects(
-    refs: tuple[RouteBundleObjectRef, ...],
+async def _read_retained_route_payload(
+    refs: tuple[RetainedRouteBundleRef, ...], reader: RouteBundleReader
 ) -> bytearray:
-    root = Path(
-        os.environ.get("ART_VLLM_ROUTE_SHM_ROOT", "/dev/shm/art_vllm_routes")
-    ).resolve()
     payload = bytearray()
     for ref in refs:
-        target = Path(ref.locator).resolve()
+        start = len(payload)
+        async for chunk in reader.read_stream(ref.object, lease_id=ref.lease_id):
+            if len(payload) + len(chunk) - start > ref.object.size_bytes:
+                raise RuntimeError("retained route reader exceeded its declared size")
+            payload.extend(chunk)
+        if len(payload) - start != ref.object.size_bytes:
+            raise RuntimeError("retained route reader ended before its declared size")
+    return payload
+
+
+def _read_local_route_objects(
+    views: tuple[LocalRouteObjectView, ...],
+    local_transfer_root: str | None,
+) -> bytearray:
+    assert local_transfer_root is not None
+    root = Path(local_transfer_root)
+    payload = bytearray()
+    for view in views:
+        ref = view.source
+        target = Path(view.path).resolve()
         if (
             ref.store != "holder_local"
             or target.suffix != ".routes"

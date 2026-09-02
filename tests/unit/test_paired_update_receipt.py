@@ -13,6 +13,12 @@ from art.distributed.adapter_transport import (
     ExternalAdapterShard,
     ExternalAdapterShardedSource,
 )
+from art.distributed.specs import (
+    ClusterSpec,
+    HostSpec,
+    LocalTransferEndpoint,
+    PairedTransferIdentity,
+)
 from art.megatron.operation_handler import (
     MegatronInferenceUpdateUsage,
     MegatronPolicyActivationTiming,
@@ -24,6 +30,7 @@ from art.megatron.paired_inference import (
     _adapter_transport_metrics,
     _engine_args,
     _paired_lora_transport,
+    _paired_transfer_identity,
 )
 from art.training import CheckpointRef, SamplerWeightsResult
 
@@ -189,6 +196,25 @@ def _publication(
         inference_update_usage=MegatronInferenceUpdateUsage(
             staging_s=0.1, apply_s=0.15
         ),
+        paired_transfer=(
+            PairedTransferIdentity(
+                backend="local",
+                trainer_endpoints=(
+                    LocalTransferEndpoint(
+                        host_id="slot", domain="slot", root="/dev/shm"
+                    ),
+                ),
+                inference_endpoints=(
+                    LocalTransferEndpoint(
+                        host_id="slot", domain="slot", root="/dev/shm"
+                    ),
+                ),
+                lora_source_host_id="slot",
+                route_source_host_id="slot",
+            )
+            if mode in {"versioned_lora", "in_flight_lora"}
+            else None
+        ),
         holder_update_sequence=step,
         holder_update_id=f"update-{step}",
         retained=(
@@ -213,24 +239,54 @@ def _publication(
 
 
 def test_paired_lora_transport_follows_resolved_placement() -> None:
+    cluster = ClusterSpec(
+        hosts=(
+            HostSpec(
+                host_id="trainer",
+                node_rank=0,
+                worker_address="tcp://trainer:1",
+                cpu_slots=1,
+                local_transfer_domain="slot",
+                local_transfer_root="/dev/shm/routes",
+            ),
+            HostSpec(
+                host_id="inference",
+                node_rank=1,
+                worker_address="tcp://inference:1",
+                cpu_slots=1,
+                local_transfer_domain="slot",
+                local_transfer_root="/dev/shm/routes",
+            ),
+        ),
+        controller_host_id="trainer",
+    )
+    runtime = SimpleNamespace(topology=SimpleNamespace(cluster=cluster))
     spec = SimpleNamespace(
-        trainer_mesh=SimpleNamespace(ranks=(SimpleNamespace(host_id="trainer"),))
+        trainer_mesh=SimpleNamespace(
+            ranks=(SimpleNamespace(host_id="trainer"),), coordinator_rank=0
+        )
     )
+    service = SimpleNamespace(members=(SimpleNamespace(host_id="inference"),))
 
-    assert (
-        _paired_lora_transport(
-            spec,
-            SimpleNamespace(members=(SimpleNamespace(host_id="trainer"),)),
-        )
-        == "local"
+    identity = _paired_transfer_identity(runtime, spec, service)
+    assert _paired_lora_transport(runtime, spec, service) == identity.backend == "local"
+    assert identity.lora_source_host_id == "trainer"
+    assert identity.route_source_host_id == "inference"
+    split_cluster = ClusterSpec(
+        hosts=(
+            cluster.hosts[0],
+            HostSpec(
+                **cluster.hosts[1].model_dump(exclude={"local_transfer_domain"}),
+                local_transfer_domain="inference-pod",
+            ),
+        ),
+        controller_host_id="trainer",
     )
-    assert (
-        _paired_lora_transport(
-            spec,
-            SimpleNamespace(members=(SimpleNamespace(host_id="inference"),)),
-        )
-        == "nixl"
+    identity = _paired_transfer_identity(
+        SimpleNamespace(topology=SimpleNamespace(cluster=split_cluster)), spec, service
     )
+    assert identity.backend == "nixl"
+    assert identity.route_source.domain == "inference-pod"
 
 
 def test_paired_transport_metrics_preserve_authoritative_receive_evidence() -> None:

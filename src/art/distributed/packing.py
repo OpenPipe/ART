@@ -423,6 +423,7 @@ class PackingResult(BaseModel):
     trajectory_log_path: str | None = None
     trajectory_fetch_s: float = Field(default=0.0, ge=0)
     route_fetch_s: float = Field(default=0.0, ge=0)
+    route_transfer_backend: Literal["stream", "local", "nixl"] | None = None
     packing_core_s: float = Field(default=0.0, ge=0)
     trajectory_log_wait_s: float = Field(default=0.0, ge=0)
     packed_batch_finalize_s: float = Field(default=0.0, ge=0)

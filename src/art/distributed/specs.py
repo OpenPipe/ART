@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections import Counter
 from collections.abc import Sequence
 from ipaddress import ip_address
+from pathlib import Path
 from typing import Annotated, Literal, TypeAlias
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -30,18 +31,105 @@ def _gpu_identities(gpu_ids: tuple[GpuId, ...]) -> tuple[int | str, ...]:
     )
 
 
+class LocalTransferEndpoint(_Spec):
+    host_id: str = Field(min_length=1, max_length=255)
+    domain: str = Field(
+        min_length=1,
+        max_length=255,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]*$",
+    )
+    root: str = Field(min_length=1, max_length=4096)
+
+    @model_validator(mode="after")
+    def _validate_root(self) -> "LocalTransferEndpoint":
+        root = Path(self.root)
+        if not root.is_absolute() or str(root.resolve()) != self.root:
+            raise ValueError("local transfer root must be a canonical absolute path")
+        return self
+
+
+class PairedTransferIdentity(_Spec):
+    """Exact trainer/inference topology selecting both paired transfer legs."""
+
+    backend: Literal["local", "nixl"]
+    trainer_endpoints: tuple[LocalTransferEndpoint, ...] = Field(
+        min_length=1, max_length=256
+    )
+    inference_endpoints: tuple[LocalTransferEndpoint, ...] = Field(
+        min_length=1, max_length=256
+    )
+    lora_source_host_id: str = Field(min_length=1, max_length=255)
+    route_source_host_id: str = Field(min_length=1, max_length=255)
+
+    @model_validator(mode="after")
+    def _validate_topology(self) -> "PairedTransferIdentity":
+        for endpoints in (self.trainer_endpoints, self.inference_endpoints):
+            if len({endpoint.host_id for endpoint in endpoints}) != len(endpoints):
+                raise ValueError("paired transfer repeats a host endpoint")
+        if self.lora_source_host_id not in {
+            endpoint.host_id for endpoint in self.trainer_endpoints
+        }:
+            raise ValueError("LoRA source must be a trainer endpoint")
+        if self.route_source_host_id not in {
+            endpoint.host_id for endpoint in self.inference_endpoints
+        }:
+            raise ValueError("route source must be an inference endpoint")
+        identities = {
+            (endpoint.domain, endpoint.root)
+            for endpoint in self.trainer_endpoints + self.inference_endpoints
+        }
+        expected = "local" if len(identities) == 1 else "nixl"
+        if self.backend != expected:
+            raise ValueError("paired transfer backend differs from its endpoints")
+        return self
+
+    @property
+    def lora_source(self) -> LocalTransferEndpoint:
+        return next(
+            endpoint
+            for endpoint in self.trainer_endpoints
+            if endpoint.host_id == self.lora_source_host_id
+        )
+
+    @property
+    def route_source(self) -> LocalTransferEndpoint:
+        return next(
+            endpoint
+            for endpoint in self.inference_endpoints
+            if endpoint.host_id == self.route_source_host_id
+        )
+
+
 class HostSpec(_Spec):
     host_id: str = Field(min_length=1)
     node_rank: int = Field(ge=0)
     worker_address: str = Field(min_length=1)
     cpu_slots: int = Field(ge=1)
     gpu_ids: tuple[GpuId, ...] = ()
+    local_transfer_domain: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=255,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]*$",
+    )
+    local_transfer_root: str | None = Field(default=None, min_length=1, max_length=4096)
 
     @model_validator(mode="after")
     def _validate_gpu_ids(self) -> "HostSpec":
         identities = _gpu_identities(self.gpu_ids)
         if len(set(identities)) != len(identities):
             raise ValueError("gpu_ids must be unique within a host")
+        if (self.local_transfer_domain is None) != (self.local_transfer_root is None):
+            raise ValueError(
+                "local transfer domain and root must be configured together"
+            )
+        if self.local_transfer_root is not None:
+            root = Path(self.local_transfer_root)
+            resolved = root.resolve()
+            if not root.is_absolute() or str(root) != str(resolved):
+                raise ValueError(
+                    "local transfer root must be a canonical absolute path"
+                )
         return self
 
 
@@ -141,11 +229,63 @@ class ClusterSpec(_Spec):
             raise ValueError("worker_address values must be unique")
         if self.controller_host_id not in host_ids:
             raise ValueError("controller_host_id must identify a configured host")
+        domains: dict[str, str] = {}
+        for host in self.hosts:
+            if host.local_transfer_domain is None:
+                continue
+            assert host.local_transfer_root is not None
+            prior_root = domains.setdefault(
+                host.local_transfer_domain, host.local_transfer_root
+            )
+            if prior_root != host.local_transfer_root:
+                raise ValueError("one local transfer domain must use one root")
         return self
 
     @property
     def host_ids(self) -> tuple[str, ...]:
         return tuple(host.host_id for host in self.hosts)
+
+    def local_transfer_endpoints(
+        self, host_ids: Sequence[str]
+    ) -> tuple[LocalTransferEndpoint, ...]:
+        if not host_ids:
+            raise ValueError("local transfer membership must not be empty")
+        hosts = {host.host_id: host for host in self.hosts}
+        unknown = set(host_ids).difference(hosts)
+        if unknown:
+            raise ValueError(f"unknown local transfer hosts: {sorted(unknown)}")
+        selected = tuple(hosts[host_id] for host_id in dict.fromkeys(host_ids))
+        if any(host.local_transfer_domain is None for host in selected):
+            raise ValueError("selected host has no explicit local transfer identity")
+        return tuple(
+            LocalTransferEndpoint(
+                host_id=host.host_id,
+                domain=str(host.local_transfer_domain),
+                root=str(host.local_transfer_root),
+            )
+            for host in selected
+        )
+
+    def paired_transfer_identity(
+        self,
+        trainer_host_ids: Sequence[str],
+        inference_host_ids: Sequence[str],
+        *,
+        lora_source_host_id: str,
+        route_source_host_id: str,
+    ) -> PairedTransferIdentity:
+        trainer = self.local_transfer_endpoints(trainer_host_ids)
+        inference = self.local_transfer_endpoints(inference_host_ids)
+        identities = {
+            (endpoint.domain, endpoint.root) for endpoint in trainer + inference
+        }
+        return PairedTransferIdentity(
+            backend="local" if len(identities) == 1 else "nixl",
+            trainer_endpoints=trainer,
+            inference_endpoints=inference,
+            lora_source_host_id=lora_source_host_id,
+            route_source_host_id=route_source_host_id,
+        )
 
     def gpu_placements(
         self, host_ids: Sequence[str] | None = None

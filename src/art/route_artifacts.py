@@ -15,6 +15,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from art.training import OperationRef
 from art.vllm_route_transport import (
+    LocalRouteObjectView,
     RetainedRouteBundleRef,
     RouteBundleObjectRef,
 )
@@ -212,6 +213,7 @@ class MaterializedRouteArtifactProvider:
     """Reader and bounded ownership adapter for deterministic offline replay."""
 
     retained_route_transport: Literal["holder_local"] = "holder_local"
+    local_transfer_endpoint: None = None
 
     def __init__(self, artifacts: tuple[MaterializedRouteArtifact, ...]) -> None:
         if not artifacts or len(artifacts) > 4096:
@@ -309,6 +311,21 @@ class MaterializedRouteArtifactProvider:
             os.close(descriptor)
         if total != ref.size_bytes or digest.hexdigest() != ref.sha256:
             raise RuntimeError("route artifact changed digest")
+
+    async def resolve_local_view(
+        self, ref: RouteBundleObjectRef, *, lease_id: str
+    ) -> LocalRouteObjectView:
+        artifact = next(
+            (
+                item
+                for item in self._artifacts.values()
+                if item.local.object == ref and item.local.lease_id == lease_id
+            ),
+            None,
+        )
+        if artifact is None:
+            raise RuntimeError("route artifact reader does not own this object")
+        return LocalRouteObjectView(source=ref, path=ref.locator)
 
 
 async def _read_descriptor(descriptor: int) -> bytes:

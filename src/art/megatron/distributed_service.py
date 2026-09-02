@@ -62,6 +62,7 @@ from .optimizer_state import (
     read_committed_optimizer_pointer,
     resolve_committed_optimizer_policy,
 )
+from .paired_inference import _paired_transfer_identity
 from .runtime.build import build_trainer_runtime_spec
 from .runtime.data_plane import SFTBatchData
 from .runtime.publication import (
@@ -914,13 +915,13 @@ class DistributedMegatronService:
         if self._managed_service_name is None:
             return ()
         manager = self.runtime.model_service(self._managed_service_name)
-        trainer_host = trainer.runtime_spec.trainer_mesh.ranks[0].host_id
-        inference_hosts = {member.host_id for member in manager.spec.members}
         try:
             targets = await manager.prepare_adapter_transfer(
                 generation_id,
                 get_step_checkpoint_dir(self.output_dir, 0),
-                transport="local" if inference_hosts == {trainer_host} else "nixl",
+                transport=_paired_transfer_identity(
+                    self.runtime, trainer.runtime_spec, manager.spec
+                ).backend,
             )
             if not targets:
                 raise RuntimeError("model service returned no adapter transfer targets")
@@ -2164,6 +2165,10 @@ class DistributedMegatronService:
     def _serving_profile_identity(self) -> ServingProfileIdentity:
         spec = self._runtime_spec()
         retained_routes = self.runtime.retained_route_prefetch_enabled
+        paired_transfer = _paired_transfer_identity(
+            self.runtime, spec, self._model_service_spec()
+        )
+        route_transport = self.runtime.retained_route_transport
         return ServingProfileIdentity(
             base_model=self.base_model,
             model_identifier=spec.model_source,
@@ -2175,8 +2180,14 @@ class DistributedMegatronService:
             lora_target_modules=spec.lora_target_modules,
             trainer_dtype=spec.dtype,
             route_replay=spec.enable_moe_routing_replay,
-            lora_transport="nixl" if self.runtime.nixl_transport else "local",
-            retained_route_transport=self.runtime.retained_route_transport,
+            paired_transfer=paired_transfer,
+            lora_transport=paired_transfer.backend,
+            retained_route_transport=route_transport,
+            retained_route_delivery=(
+                paired_transfer.backend
+                if route_transport == "holder_local"
+                else route_transport
+            ),
             retained_route_max_bytes=(
                 self.runtime.config.route_bundle_prefetch_capacity_bytes
                 if retained_routes

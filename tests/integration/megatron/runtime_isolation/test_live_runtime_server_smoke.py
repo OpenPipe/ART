@@ -9,6 +9,7 @@ import uuid
 import httpx
 import pytest
 
+from art.distributed.specs import LocalTransferEndpoint, PairedTransferIdentity
 from art.serving_capabilities import PairedInferenceEndpoint, ServingProfileIdentity
 import art.vllm_runtime as runtime
 
@@ -85,8 +86,24 @@ async def test_external_runtime_server_live_smoke(
             lora_target_modules=("q_proj",),
             trainer_dtype="bfloat16",
             route_replay=False,
+            paired_transfer=PairedTransferIdentity(
+                backend="local",
+                trainer_endpoints=(
+                    LocalTransferEndpoint(
+                        host_id="local", domain="local", root="/dev/shm"
+                    ),
+                ),
+                inference_endpoints=(
+                    LocalTransferEndpoint(
+                        host_id="local", domain="local", root="/dev/shm"
+                    ),
+                ),
+                lora_source_host_id="local",
+                route_source_host_id="local",
+            ),
             lora_transport="local",
             retained_route_transport="none",
+            retained_route_delivery="none",
             retained_route_max_bytes=0,
             retained_route_max_bundles=0,
         ),
