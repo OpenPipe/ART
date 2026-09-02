@@ -2,9 +2,8 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 import os
-from typing import Any, Iterator, cast
+from typing import Any, Iterator
 
-from megatron.core import parallel_state as ps
 from megatron.core.tensor_parallel.mappings import (
     gather_from_sequence_parallel_region,
 )
@@ -230,93 +229,37 @@ def forward_token_logits(
     )
 
 
-class _VocabParallelSelectedLogprobs(torch.autograd.Function):
-    @staticmethod
-    def forward(
-        ctx: Any,
-        local_logits: torch.Tensor,
-        target_tokens: torch.Tensor,
-        group: Any,
-        vocab_start: int,
-        tp_size: int,
-    ) -> torch.Tensor:
-        if local_logits.ndim != 2 or target_tokens.ndim != 2:
-            raise ValueError("selected logprobs require [N,V] logits and [N,K] targets")
-        if local_logits.shape[0] != target_tokens.shape[0]:
-            raise ValueError("selected logprob logits and targets do not align")
-        logits = local_logits.float()
-        local_max = logits.max(dim=1).values
-        global_max = local_max.clone()
-        if tp_size > 1:
-            torch.distributed.all_reduce(
-                global_max,
-                op=torch.distributed.ReduceOp.MAX,  # ty: ignore[possibly-missing-attribute]
-                group=group,
-            )
-        exp_logits = torch.exp(logits - global_max.unsqueeze(1))
-        exp_sum = exp_logits.sum(dim=1)
-        if tp_size > 1:
-            torch.distributed.all_reduce(exp_sum, group=group)
-        softmax = exp_logits / exp_sum.unsqueeze(1)
-
-        local_targets = target_tokens - vocab_start
-        valid = target_tokens >= 0
-        owns_target = (
-            valid & (local_targets >= 0) & (local_targets < local_logits.shape[1])
-        )
-        target_logits = logits.gather(
-            1, local_targets.clamp(0, local_logits.shape[1] - 1)
-        ).masked_fill(~owns_target, 0.0)
-        owners = owns_target.to(dtype=torch.int32)
-        if tp_size > 1:
-            torch.distributed.all_reduce(target_logits, group=group)
-            torch.distributed.all_reduce(owners, group=group)
-        torch._assert_async(
-            torch.all((~valid) | (owners == 1)),
-            "target token is outside the vocabulary-parallel output",
-        )
-        ctx.save_for_backward(softmax, local_targets, owns_target, valid)
-        ctx.input_dtype = local_logits.dtype
-        return (target_logits - (global_max + exp_sum.log()).unsqueeze(1)).masked_fill(
-            ~valid, 0.0
-        )
-
-    @staticmethod
-    def backward(
-        ctx: Any, *grad_outputs: Any
-    ) -> tuple[torch.Tensor, None, None, None, None]:
-        grad_output = cast(torch.Tensor, grad_outputs[0])
-        softmax, local_targets, owns_target, valid = ctx.saved_tensors
-        coefficients = grad_output.float().masked_fill(~valid, 0.0)
-        grad_logits = -softmax * coefficients.sum(dim=1, keepdim=True)
-        grad_logits.scatter_add_(
-            1,
-            local_targets.clamp(0, grad_logits.shape[1] - 1),
-            coefficients.masked_fill(~owns_target, 0.0),
-        )
-        return grad_logits.to(dtype=ctx.input_dtype), None, None, None, None
-
-
-def vocab_parallel_selected_logprobs(
+def selected_target_logprobs(
+    model: torch.nn.Module,
     local_logits: torch.Tensor,
     target_tokens: torch.Tensor,
 ) -> torch.Tensor:
-    """Return exact selected logprobs with a vocabulary-shard-local backward."""
-    initialized = ps.model_parallel_is_initialized()
-    tp_size = int(ps.get_tensor_model_parallel_world_size()) if initialized else 1
-    tp_rank = int(ps.get_tensor_model_parallel_rank()) if initialized else 0
-    group = (
-        ps.get_tensor_model_parallel_group(check_initialized=False)
-        if initialized and tp_size > 1
-        else None
+    """Return exact selected target logprobs without dense FP32 normalization."""
+    if local_logits.ndim != 2 or target_tokens.ndim != 2:
+        raise ValueError("selected logprobs require [N,V] logits and [N,K] targets")
+    if int(local_logits.shape[0]) != int(target_tokens.shape[0]):
+        raise ValueError("selected logprob logits and targets do not align")
+    if int(target_tokens.shape[1]) != 1:
+        from art.megatron.multi_target_logprobs import (
+            vocab_parallel_multi_target_logprobs,
+        )
+
+        return vocab_parallel_multi_target_logprobs(local_logits, target_tokens)
+
+    language_model = _language_model(model)
+    _validate_language_model(language_model)
+    if (
+        not bool(getattr(language_model.config, "cross_entropy_loss_fusion", False))
+        or getattr(language_model.config, "cross_entropy_fusion_impl", None) != "te"
+    ):
+        raise RuntimeError("single-target selected logprobs require TE cross entropy")
+    valid = target_tokens[:, 0] >= 0
+    labels = target_tokens[:, 0].masked_fill(~valid, 0).reshape(1, -1)
+    losses = language_model.compute_language_model_loss(
+        labels=labels,
+        logits=local_logits.unsqueeze(1),
     )
-    return _VocabParallelSelectedLogprobs.apply(
-        local_logits,
-        target_tokens,
-        group,
-        tp_rank * int(local_logits.shape[1]),
-        tp_size,
-    )
+    return (-losses.reshape(-1, 1)).masked_fill(~valid.unsqueeze(1), 0.0)
 
 
 def _language_model(model: torch.nn.Module) -> Any:

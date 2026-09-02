@@ -92,7 +92,7 @@ from art.megatron.selective_lm_head import (
     TokenLossOutput,
     forward_token_logits,
     forward_token_losses,
-    vocab_parallel_selected_logprobs,
+    selected_target_logprobs,
 )
 from art.megatron.tensor_snapshot import SnapshotReadBarrier
 from art.megatron.training.compile import configure_training_compile
@@ -3501,8 +3501,10 @@ def run_megatron_rl_forward_backward_step(
                 selected_advantages = prepared.lm_head_selection.select_rows(
                     token_advantages
                 )
-                selected_logprobs = vocab_parallel_selected_logprobs(
-                    output_tensor, selected_targets
+                selected_logprobs = selected_target_logprobs(
+                    model,
+                    output_tensor,
+                    selected_targets,
                 )
                 loss_output = tokenized_loss(
                     loss,
