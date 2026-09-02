@@ -264,7 +264,7 @@ def test_paired_lora_transport_follows_resolved_placement() -> None:
         controller_host_id="trainer",
     )
     route_source = LocalTransferEndpoint(
-        host_id="trainer", domain="slot", root="/dev/shm/routes"
+        host_id="inference", domain="slot", root="/dev/shm/routes"
     )
     runtime = SimpleNamespace(
         topology=SimpleNamespace(cluster=cluster),
@@ -299,14 +299,18 @@ def test_paired_lora_transport_follows_resolved_placement() -> None:
     identity = _paired_transfer_identity(
         SimpleNamespace(
             topology=SimpleNamespace(cluster=split_cluster),
-            retained_route_source=route_source,
+            retained_route_source=LocalTransferEndpoint(
+                host_id="inference",
+                domain="inference-pod",
+                root="/dev/shm/routes",
+            ),
         ),
         spec,
         service,
     )
     assert identity.lora_backend == "nixl"
-    assert identity.route_delivery == "local"
-    assert identity.route_backend("trainer") == "local"
+    assert identity.route_delivery == "nixl"
+    assert identity.route_backend("trainer") == "nixl"
 
 
 def test_paired_transport_metrics_preserve_authoritative_receive_evidence() -> None:

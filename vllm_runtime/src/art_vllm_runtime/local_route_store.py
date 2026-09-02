@@ -82,6 +82,36 @@ class LocalRouteStore:
 
         self._target(ref).unlink(missing_ok=True)
 
+    def accepts_transfer_root(self, root: str) -> bool:
+        transfer_root = Path(root).resolve()
+        return self.root == transfer_root or self.root.is_relative_to(transfer_root)
+
+    def local_view(self, ref: dict[str, object]) -> str:
+        target = self._target(ref)
+        self._verify_ref(target, ref)
+        return str(target)
+
+    def read_many(self, refs: tuple[dict[str, object], ...]) -> bytearray:
+        payload = bytearray()
+        for ref in refs:
+            target = self._target(ref)
+            size_bytes, sha256 = self._identity(ref)
+            descriptor = os.open(target, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+            digest = hashlib.sha256()
+            start = len(payload)
+            try:
+                metadata = os.fstat(descriptor)
+                if not stat.S_ISREG(metadata.st_mode) or metadata.st_size != size_bytes:
+                    raise RuntimeError("local route object changed size or type")
+                while chunk := os.read(descriptor, 1 << 20):
+                    payload.extend(chunk)
+                    digest.update(chunk)
+            finally:
+                os.close(descriptor)
+            if len(payload) - start != size_bytes or digest.hexdigest() != sha256:
+                raise RuntimeError("local route object changed digest")
+        return payload
+
     def close(self) -> None:
         shutil.rmtree(self.root, ignore_errors=True)
 
@@ -107,6 +137,25 @@ class LocalRouteStore:
                 raise RuntimeError("local route object changed digest")
         finally:
             os.close(descriptor)
+
+    @classmethod
+    def _verify_ref(cls, target: Path, ref: dict[str, object]) -> None:
+        size_bytes, sha256 = cls._identity(ref)
+        cls._verify(target, size_bytes=size_bytes, sha256=sha256)
+
+    @staticmethod
+    def _identity(ref: dict[str, object]) -> tuple[int, str]:
+        size_bytes = ref.get("size_bytes")
+        sha256 = ref.get("sha256")
+        if (
+            isinstance(size_bytes, bool)
+            or not isinstance(size_bytes, int)
+            or size_bytes < 1
+            or not isinstance(sha256, str)
+            or len(sha256) != 64
+        ):
+            raise ValueError("local route object identity is invalid")
+        return size_bytes, sha256
 
 
 def encode_route_object_header(ref: dict[str, object]) -> str:

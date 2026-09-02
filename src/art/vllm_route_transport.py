@@ -43,6 +43,8 @@ DTYPES = {1: "u1", 2: "<u2"}
 ROUTE_BUNDLE_FORMAT = "art_inference_route_bundle_v1"
 RETAINED_ROUTE_BUNDLE_KEY = "retained_route_bundle"
 ART_PRIVATE_ROUTE_OBJECT_HEADER = "x-art-route-object"
+ART_PRIVATE_ROUTE_SOURCE_PREPARE_PATH = "/art/internal/v1/route-sources:prepare"
+ART_PRIVATE_ROUTE_SOURCE_RELEASE_PREFIX = "/art/internal/v1/route-sources"
 
 
 class _Contract(BaseModel):
@@ -151,6 +153,144 @@ class LocalRouteObjectView(_Contract):
 
     source: RouteBundleObjectRef
     path: str = Field(min_length=1, max_length=4096)
+
+
+class HolderRouteSourceObject(_Contract):
+    """One service-leased holder object selected for a packing operation."""
+
+    request_id: str = Field(min_length=1, max_length=256)
+    object: RouteBundleObjectRef
+    lease_id: str = Field(min_length=1, max_length=512)
+
+    @model_validator(mode="after")
+    def _validate_holder_object(self) -> "HolderRouteSourceObject":
+        if self.object.store != "holder_local":
+            raise ValueError("holder route source referenced another object store")
+        return self
+
+
+def holder_route_source_operation_id(
+    *,
+    stream_id: str,
+    source_endpoint: LocalTransferEndpoint,
+    target_endpoint: LocalTransferEndpoint,
+    objects: tuple[HolderRouteSourceObject, ...],
+) -> str:
+    payload = {
+        "stream_id": stream_id,
+        "source_endpoint": source_endpoint.model_dump(mode="json"),
+        "target_endpoint": target_endpoint.model_dump(mode="json"),
+        "objects": [item.model_dump(mode="json") for item in objects],
+    }
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+
+
+class HolderRouteSourceRequest(_Contract):
+    """Exact private request to expose retained holder bytes to one packer."""
+
+    protocol_version: Literal[1] = 1
+    operation_id: str = Field(pattern=r"^[0-9a-f]{64}$")
+    stream_id: str = Field(min_length=1, max_length=512)
+    source_endpoint: LocalTransferEndpoint
+    target_endpoint: LocalTransferEndpoint
+    objects: tuple[HolderRouteSourceObject, ...] = Field(min_length=1, max_length=256)
+
+    @classmethod
+    def create(
+        cls,
+        refs: tuple[RetainedRouteBundleRef, ...],
+        *,
+        stream_id: str,
+        source_endpoint: LocalTransferEndpoint,
+        target_endpoint: LocalTransferEndpoint,
+    ) -> "HolderRouteSourceRequest":
+        objects = tuple(
+            HolderRouteSourceObject(
+                request_id=ref.layout.request_id,
+                object=ref.object,
+                lease_id=ref.lease_id,
+            )
+            for ref in refs
+        )
+        return cls(
+            operation_id=holder_route_source_operation_id(
+                stream_id=stream_id,
+                source_endpoint=source_endpoint,
+                target_endpoint=target_endpoint,
+                objects=objects,
+            ),
+            stream_id=stream_id,
+            source_endpoint=source_endpoint,
+            target_endpoint=target_endpoint,
+            objects=objects,
+        )
+
+    @model_validator(mode="after")
+    def _validate_operation(self) -> "HolderRouteSourceRequest":
+        if len({item.request_id for item in self.objects}) != len(self.objects):
+            raise ValueError("holder route source repeats a request")
+        if len({item.object.locator for item in self.objects}) != len(self.objects):
+            raise ValueError("holder route source repeats an object")
+        expected = holder_route_source_operation_id(
+            stream_id=self.stream_id,
+            source_endpoint=self.source_endpoint,
+            target_endpoint=self.target_endpoint,
+            objects=self.objects,
+        )
+        if self.operation_id != expected:
+            raise ValueError("holder route source operation identity changed")
+        return self
+
+    @property
+    def backend(self) -> Literal["local", "nixl"]:
+        source = self.source_endpoint
+        target = self.target_endpoint
+        return (
+            "local"
+            if (source.domain, source.root) == (target.domain, target.root)
+            else "nixl"
+        )
+
+
+class HolderRouteSourceReceipt(_Contract):
+    """Holder proof for one active local view or NIXL registration."""
+
+    protocol_version: Literal[1] = 1
+    request: HolderRouteSourceRequest
+    backend: Literal["local", "nixl"]
+    local_objects: tuple[LocalRouteObjectView, ...] = ()
+    nixl: NixlRouteTransfer | None = None
+
+    @model_validator(mode="after")
+    def _validate_source(self) -> "HolderRouteSourceReceipt":
+        if self.backend != self.request.backend:
+            raise ValueError("holder route source backend changed")
+        objects = tuple(item.object for item in self.request.objects)
+        if self.backend == "local":
+            if (
+                self.nixl is not None
+                or tuple(view.source for view in self.local_objects) != objects
+            ):
+                raise ValueError("local holder route source changed its objects")
+            root = Path(self.request.source_endpoint.root)
+            if any(
+                str(Path(view.path).resolve()) != view.path
+                or root not in Path(view.path).resolve().parents
+                for view in self.local_objects
+            ):
+                raise ValueError("local holder route source escaped its transfer root")
+        elif (
+            self.local_objects
+            or self.nixl is None
+            or self.nixl.stream_id != self.request.stream_id
+            or self.nixl.target_host_id != self.request.target_endpoint.host_id
+            or self.nixl.source.byte_count
+            != sum(item.object.size_bytes for item in self.request.objects)
+        ):
+            raise ValueError("NIXL holder route source changed its operation")
+        return self
 
 
 class RouteBundleBatchTransfer(_Contract):
@@ -269,6 +409,14 @@ class RouteBundleReader(Protocol):
         self, ref: RouteBundleObjectRef, *, lease_id: str
     ) -> AsyncIterator[bytes | bytearray | memoryview]: ...
 
+    async def prepare_transfer_source(
+        self, request: HolderRouteSourceRequest
+    ) -> HolderRouteSourceReceipt: ...
+
+    async def release_transfer_source(
+        self, receipt: HolderRouteSourceReceipt
+    ) -> None: ...
+
 
 @dataclass(frozen=True)
 class RouteBundlePayload:
@@ -291,6 +439,56 @@ class NixlRoutePublisher:
             raise cancelled
 
 
+@dataclass
+class HolderRouteSourceHandle:
+    """Release an ephemeral holder source without releasing its service lease."""
+
+    receipt: HolderRouteSourceReceipt
+    _reader: RouteBundleReader
+    _closed: bool = False
+
+    async def close(self) -> None:
+        if self._closed:
+            return
+        await self._reader.release_transfer_source(self.receipt)
+        self._closed = True
+
+
+async def prepare_holder_route_bundle_transfer(
+    refs: tuple[RetainedRouteBundleRef, ...],
+    *,
+    reader: RouteBundleReader,
+    stream_id: str,
+    source_endpoint: LocalTransferEndpoint,
+    target_endpoint: LocalTransferEndpoint,
+) -> tuple[RouteBundleBatchTransfer, HolderRouteSourceHandle]:
+    """Prepare the exact holder object where it physically resides."""
+
+    request = HolderRouteSourceRequest.create(
+        refs,
+        stream_id=stream_id,
+        source_endpoint=source_endpoint,
+        target_endpoint=target_endpoint,
+    )
+    receipt = await reader.prepare_transfer_source(request)
+    handle = HolderRouteSourceHandle(receipt=receipt, _reader=reader)
+    try:
+        if receipt.request != request:
+            raise RuntimeError("holder route source receipt changed its request")
+        transfer = RouteBundleBatchTransfer(
+            nixl=receipt.nixl,
+            local_objects=receipt.local_objects,
+            local_transfer_root=(
+                source_endpoint.root if receipt.backend == "local" else None
+            ),
+            layouts=tuple(ref.layout for ref in refs),
+        )
+    except BaseException:
+        await handle.close()
+        raise
+    return transfer, handle
+
+
 async def publish_retained_route_bundle_nixl_transfer(
     refs: tuple[RetainedRouteBundleRef, ...],
     *,
@@ -306,7 +504,7 @@ async def publish_retained_route_bundle_nixl_transfer(
     from art.utils.lifecycle import complete_to_thread
 
     publisher, cancelled = await complete_to_thread(
-        lambda: _register_nixl_route_source(
+        lambda: register_retained_route_nixl_source(
             payload, stream_id=stream_id, target_host_id=target_host_id
         )
     )
@@ -324,7 +522,7 @@ async def publish_retained_route_bundle_nixl_transfer(
     return transfer, publisher
 
 
-def _register_nixl_route_source(
+def register_retained_route_nixl_source(
     payload: bytearray, *, stream_id: str, target_host_id: str
 ) -> NixlRoutePublisher:
     sender = NixlAdapterSender()

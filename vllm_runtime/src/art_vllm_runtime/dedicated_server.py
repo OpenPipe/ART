@@ -24,6 +24,17 @@ from starlette.datastructures import Headers
 from starlette.types import Receive, Scope, Send
 from vllm.entrypoints.serve.utils.server_utils import AuthenticationMiddleware
 
+from art.distributed.specs import PairedTransferIdentity
+from art.vllm_route_transport import (
+    ART_PRIVATE_ROUTE_SOURCE_PREPARE_PATH,
+    ART_PRIVATE_ROUTE_SOURCE_RELEASE_PREFIX,
+    HolderRouteSourceReceipt,
+    HolderRouteSourceRequest,
+    LocalRouteObjectView,
+    NixlRoutePublisher,
+    RouteBundleObjectRef,
+    register_retained_route_nixl_source,
+)
 from art_vllm_runtime.binary_routes import (
     PIPELINE_ROUTES_ENV,
     PIPELINE_ROUTES_PROTOCOL,
@@ -48,7 +59,7 @@ from art_vllm_runtime.runtime_usage import (
     runtime_usage_journal,
 )
 
-ART_SERVING_PROTOCOL_VERSION = 14
+ART_SERVING_PROTOCOL_VERSION = 15
 _PRIVATE_CACHE_IDENTITY_HEADER = "x-art-cache-identity"
 _PRIVATE_COMPLETION_PATH = "/art/internal/v1/completions"
 _PRIVATE_DISPATCH_PATH = "/art/internal/v1/chat/completions"
@@ -204,14 +215,22 @@ class _PrivateRouteResponse:
     body: bytes | None = None
     retained_bytes: int = 0
     object_ref: dict[str, object] | None = None
+    acknowledged: bool = False
+
+
+@dataclass(frozen=True)
+class _PrivateRouteSource:
+    receipt: HolderRouteSourceReceipt
+    publisher: NixlRoutePublisher | None = None
 
 
 class _PrivateRouteResponses:
-    """Bound exact route responses until the service commits their CAIOS ref."""
+    """Bound exact route responses and their ephemeral transfer sources."""
 
     def __init__(self) -> None:
         self._lock = asyncio.Lock()
         self._responses: dict[str, _PrivateRouteResponse] = {}
+        self._sources: dict[str, _PrivateRouteSource] = {}
         self._reserved_bytes = 0
 
     async def reserve(
@@ -230,7 +249,10 @@ class _PrivateRouteResponses:
                 reserved_bytes < 1
                 or capacity_bytes < reserved_bytes
                 or capacity_bundles < 1
-                or len(self._responses) >= capacity_bundles
+                or sum(
+                    not response.acknowledged for response in self._responses.values()
+                )
+                >= capacity_bundles
                 or self._reserved_bytes + reserved_bytes > capacity_bytes
             ):
                 raise RuntimeUsageCapacityError(
@@ -289,6 +311,8 @@ class _PrivateRouteResponses:
                 return False
             if response.fingerprint != fingerprint:
                 raise RuntimeError("private route response identity changed")
+            if self._source_uses(request_identity):
+                raise RuntimeError("private route response has an active source")
             self._responses.pop(request_identity)
             self._reserved_bytes -= response.reserved_bytes
             if response.object_ref is not None and _local_route_store is not None:
@@ -296,15 +320,31 @@ class _PrivateRouteResponses:
             return True
 
     async def acknowledge(self, request_identity: str) -> int | None:
-        return await self.discard(request_identity)
+        async with self._lock:
+            response = self._responses.get(request_identity)
+            if response is None or response.acknowledged:
+                return None
+            if response.body is None or response.object_ref is None:
+                raise RuntimeError("private route response is not complete")
+            self._responses[request_identity] = _PrivateRouteResponse(
+                fingerprint=response.fingerprint,
+                reserved_bytes=0,
+                retained_bytes=response.retained_bytes,
+                object_ref=response.object_ref,
+                acknowledged=True,
+            )
+            self._reserved_bytes -= response.reserved_bytes
+            return response.retained_bytes
 
     async def discard(self, request_identity: str) -> int | None:
         async with self._lock:
             response = self._responses.get(request_identity)
             if response is None:
                 return None
-            if response.body is None:
+            if response.body is None and not response.acknowledged:
                 raise RuntimeError("private route response is not complete")
+            if self._source_uses(request_identity):
+                raise RuntimeError("private route response has an active source")
             if response.object_ref is not None:
                 if _local_route_store is None:
                     raise RuntimeError("local route store is unavailable")
@@ -313,15 +353,131 @@ class _PrivateRouteResponses:
             self._reserved_bytes -= response.reserved_bytes
             return response.retained_bytes
 
+    async def prepare_source(
+        self,
+        request: HolderRouteSourceRequest,
+        store: LocalRouteStore,
+    ) -> HolderRouteSourceReceipt:
+        async with self._lock:
+            existing = self._sources.get(request.operation_id)
+            if existing is not None:
+                if existing.receipt.request != request:
+                    raise RuntimeError("holder route source operation identity changed")
+                return existing.receipt
+            selected_ids = {item.request_id for item in request.objects}
+            if any(
+                selected_ids.intersection(
+                    item.request_id for item in source.receipt.request.objects
+                )
+                for source in self._sources.values()
+            ):
+                raise RuntimeError("holder route object already has an active source")
+            refs = []
+            for item in request.objects:
+                response = self._responses.get(item.request_id)
+                holder_ref = (
+                    None
+                    if response is None or response.object_ref is None
+                    else RouteBundleObjectRef.model_validate(response.object_ref)
+                )
+                if (
+                    response is None
+                    or not response.acknowledged
+                    or holder_ref is None
+                    or holder_ref.store != item.object.store
+                    or holder_ref.size_bytes != item.object.size_bytes
+                    or holder_ref.sha256 != item.object.sha256
+                ):
+                    raise RuntimeError("holder route source object is unavailable")
+                refs.append(holder_ref.model_dump(mode="json"))
+            if not store.accepts_transfer_root(request.source_endpoint.root):
+                raise RuntimeError("holder route store escaped its transfer endpoint")
+
+            publisher = None
+            if request.backend == "local":
+                receipt = HolderRouteSourceReceipt(
+                    request=request,
+                    backend="local",
+                    local_objects=tuple(
+                        LocalRouteObjectView(
+                            source=item.object,
+                            path=store.local_view(ref),
+                        )
+                        for item, ref in zip(request.objects, refs, strict=True)
+                    ),
+                )
+            else:
+                from art.utils.lifecycle import complete_to_thread
+
+                payload, cancelled = await complete_to_thread(
+                    lambda: store.read_many(tuple(refs))
+                )
+                if cancelled is not None:
+                    raise cancelled
+                publisher, cancelled = await complete_to_thread(
+                    lambda: register_retained_route_nixl_source(
+                        payload,
+                        stream_id=request.stream_id,
+                        target_host_id=request.target_endpoint.host_id,
+                    )
+                )
+                if cancelled is not None:
+                    await publisher.close()
+                    raise cancelled
+                receipt = HolderRouteSourceReceipt(
+                    request=request,
+                    backend="nixl",
+                    nixl=publisher.transfer,
+                )
+            self._sources[request.operation_id] = _PrivateRouteSource(
+                receipt=receipt,
+                publisher=publisher,
+            )
+            return receipt
+
+    async def release_source(self, receipt: HolderRouteSourceReceipt) -> bool:
+        async with self._lock:
+            source = self._sources.get(receipt.request.operation_id)
+            if source is None:
+                return False
+            if source.receipt != receipt:
+                raise RuntimeError("holder route source receipt changed")
+            if source.publisher is not None:
+                await source.publisher.close()
+            self._sources.pop(receipt.request.operation_id)
+            return True
+
+    async def close_sources(self) -> None:
+        async with self._lock:
+            sources = tuple(self._sources.values())
+            for source in sources:
+                if source.publisher is not None:
+                    await source.publisher.close()
+            self._sources.clear()
+
+    def _source_uses(self, request_identity: str) -> bool:
+        return any(
+            any(
+                item.request_id == request_identity
+                for item in source.receipt.request.objects
+            )
+            for source in self._sources.values()
+        )
+
     async def state(self) -> dict[str, int]:
         async with self._lock:
             completed = tuple(
                 response
                 for response in self._responses.values()
-                if response.body is not None
+                if response.object_ref is not None
+            )
+            active = tuple(
+                response
+                for response in self._responses.values()
+                if response.body is None and not response.acknowledged
             )
             return {
-                "active_route_reservations": len(self._responses) - len(completed),
+                "active_route_reservations": len(active),
                 "retained_route_responses": len(completed),
                 "reserved_route_bytes": self._reserved_bytes,
                 "retained_route_bytes": sum(
@@ -563,6 +719,8 @@ class _ArtAuthenticationMiddleware(AuthenticationMiddleware):
             path == _PRIVATE_DISPATCH_PATH
             or path.startswith(f"{_PRIVATE_EXECUTION_RECEIPT_PREFIX}/")
             or path.startswith(_PRIVATE_USAGE_PATH)
+            or path == ART_PRIVATE_ROUTE_SOURCE_PREPARE_PATH
+            or path.startswith(f"{ART_PRIVATE_ROUTE_SOURCE_RELEASE_PREFIX}/")
         ):
             if _verify_bearer(headers, _private_dispatch_token):
                 return self.app(scope, receive, send)
@@ -711,6 +869,13 @@ def _retained_route_transport() -> str:
     if transport not in {"holder_local", "caios_lota"}:
         raise RuntimeError("retained-route transport is unavailable")
     return str(transport)
+
+
+def _paired_transfer_identity() -> PairedTransferIdentity:
+    identity = _runtime_state.get("serving_profile_identity")
+    if not isinstance(identity, dict):
+        raise RuntimeError("paired transfer profile identity is unavailable")
+    return PairedTransferIdentity.model_validate(identity.get("paired_transfer"))
 
 
 def _private_route_capacity() -> tuple[int, int]:
@@ -1326,6 +1491,82 @@ def _patch_art_runtime_routes() -> None:
                     "type": "execution_receipt",
                     "execution": receipt.execution,
                 }
+            )
+
+        @router.post(
+            ART_PRIVATE_ROUTE_SOURCE_PREPARE_PATH,
+            dependencies=[Depends(validate_json_request)],
+        )
+        async def prepare_private_route_source(
+            source_request: HolderRouteSourceRequest,
+            raw_request: Request,
+        ) -> JSONResponse:
+            target_error = _private_runtime_target_error(
+                raw_request, execution="unknown"
+            )
+            if target_error is not None:
+                return target_error
+            try:
+                paired = _paired_transfer_identity()
+                target = paired.route_target(source_request.target_endpoint.host_id)
+                if (
+                    _local_route_store is None
+                    or paired.route_source is None
+                    or source_request.source_endpoint != paired.route_source
+                    or source_request.target_endpoint != target
+                    or source_request.backend != paired.route_backend(target.host_id)
+                ):
+                    raise RuntimeError("holder route source topology changed")
+                receipt = await _private_route_responses.prepare_source(
+                    source_request, _local_route_store
+                )
+            except (RuntimeError, ValueError) as error:
+                return JSONResponse(
+                    content={
+                        "error": str(error),
+                        "type": "route_source_rejected",
+                    },
+                    status_code=HTTPStatus.CONFLICT.value,
+                )
+            return JSONResponse(content=receipt.model_dump(mode="json"))
+
+        @router.post(
+            f"{ART_PRIVATE_ROUTE_SOURCE_RELEASE_PREFIX}/{{operation_id}}:release",
+            dependencies=[Depends(validate_json_request)],
+        )
+        async def release_private_route_source(
+            operation_id: str,
+            source_receipt: HolderRouteSourceReceipt,
+            raw_request: Request,
+        ) -> JSONResponse:
+            target_error = _private_runtime_target_error(
+                raw_request, execution="unknown"
+            )
+            if target_error is not None:
+                return target_error
+            if (
+                _SHA256_RE.fullmatch(operation_id) is None
+                or source_receipt.request.operation_id != operation_id
+            ):
+                return JSONResponse(
+                    content={
+                        "error": "Invalid holder route source operation",
+                        "type": "invalid_private_context",
+                    },
+                    status_code=HTTPStatus.BAD_REQUEST.value,
+                )
+            try:
+                released = await _private_route_responses.release_source(source_receipt)
+            except RuntimeError as error:
+                return JSONResponse(
+                    content={
+                        "error": str(error),
+                        "type": "route_source_rejected",
+                    },
+                    status_code=HTTPStatus.CONFLICT.value,
+                )
+            return JSONResponse(
+                content={"operation_id": operation_id, "released": released}
             )
 
         async def remove_private_route_response(
@@ -2096,6 +2337,7 @@ def main(argv: list[str] | None = None) -> None:
             set_fast_metrics_writer(None)
             metrics_sidecar.close()
             if _local_route_store is not None:
+                asyncio.run(_private_route_responses.close_sources())
                 _local_route_store.close()
                 _local_route_store = None
 

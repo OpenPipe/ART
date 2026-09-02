@@ -11,6 +11,7 @@ from art_vllm_runtime.local_route_store import (
 import numpy as np
 
 from art.vllm_route_transport import (
+    LocalRouteObjectView,
     local_retained_route_bundle_transfer,
     retained_local_route_bundle_from_response,
 )
@@ -45,7 +46,13 @@ def test_local_route_object_binds_exact_binary_response(tmp_path, monkeypatch) -
     assert bundle.object.model_dump(mode="json") == ref
     assert Path(bundle.object.locator).read_bytes() == route_payload
     assert bundle.layout.byte_count == len(route_payload)
-    transfer = local_retained_route_bundle_transfer((bundle,))
+    assert store.accepts_transfer_root(str(tmp_path))
+    assert store.read_many((ref,)) == route_payload
+    transfer = local_retained_route_bundle_transfer(
+        (bundle,),
+        (LocalRouteObjectView(source=bundle.object, path=store.local_view(ref)),),
+        local_transfer_root=str(tmp_path),
+    )
     assert asyncio.run(transfer.receive_payload(timeout_s=1)) == route_payload
     store.release(ref)
     assert not Path(bundle.object.locator).exists()

@@ -7,12 +7,24 @@ from unittest.mock import AsyncMock
 
 from art_vllm_runtime import dedicated_server
 from art_vllm_runtime.fast_metrics import FAST_METRIC_NAMES, FastMetricsSidecar
+from art_vllm_runtime.local_route_store import LocalRouteStore
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 import pytest
 from starlette.datastructures import URL
 
+from art.distributed.adapter_transport import NixlMemorySource
+from art.distributed.specs import LocalTransferEndpoint
 from art.serving_capabilities import PairedInferenceEndpoint, ServingProfile
+from art.vllm_route_transport import (
+    ART_PRIVATE_ROUTE_SOURCE_PREPARE_PATH,
+    ART_PRIVATE_ROUTE_SOURCE_RELEASE_PREFIX,
+    HolderRouteSourceObject,
+    HolderRouteSourceRequest,
+    NixlRouteTransfer,
+    RouteBundleObjectRef,
+    holder_route_source_operation_id,
+)
 
 _PAYLOAD: dict[str, object] = {
     "schema_version": 1,
@@ -199,15 +211,15 @@ async def test_serving_profile_reports_resolved_runtime_geometry(monkeypatch) ->
             ],
             "lora_source_host_id": "trainer",
             "route_source": {
-                "host_id": "trainer",
-                "domain": "trainer",
+                "host_id": "inference",
+                "domain": "inference",
                 "root": "/dev/shm",
             },
-            "route_delivery": "local",
+            "route_delivery": "nixl",
         },
         "lora_transport": "nixl",
         "retained_route_transport": "holder_local",
-        "retained_route_delivery": "local",
+        "retained_route_delivery": "nixl",
         "retained_route_max_bytes": 4096,
         "retained_route_max_bundles": 4,
     }
@@ -332,6 +344,11 @@ def test_private_dispatch_uses_distinct_auth_and_fences_runtime_target(
     app.get("/v1/models")(lambda: {"ok": True})
     app.get("/art/state")(lambda: {"ok": True})
     app.post(dedicated_server._PRIVATE_DISPATCH_PATH)(lambda: {"ok": True})
+    app.post(ART_PRIVATE_ROUTE_SOURCE_PREPARE_PATH)(lambda: {"ok": True})
+    source_release_path = (
+        f"{ART_PRIVATE_ROUTE_SOURCE_RELEASE_PREFIX}/{'d' * 64}:release"
+    )
+    app.post(source_release_path)(lambda: {"ok": True})
     middleware = dedicated_server._ArtAuthenticationMiddleware(app)
 
     async def authenticated_app(scope, receive, send):
@@ -366,6 +383,21 @@ def test_private_dispatch_uses_distinct_auth_and_fences_runtime_target(
         ).status_code
         == 200
     )
+    for path in (ART_PRIVATE_ROUTE_SOURCE_PREPARE_PATH, source_release_path):
+        assert (
+            client.post(
+                path,
+                headers={"Authorization": "Bearer public-token"},
+            ).status_code
+            == 401
+        )
+        assert (
+            client.post(
+                path,
+                headers={"Authorization": "Bearer " + "p" * 32},
+            ).status_code
+            == 200
+        )
 
     scope = {
         "type": "http",
@@ -618,17 +650,20 @@ async def test_private_route_responses_reserve_replay_ack_and_discard_exact_byte
         "reserved_route_bytes": 8,
         "retained_route_bytes": 5,
     }
-    monkeypatch.setattr(dedicated_server, "_local_route_store", None)
-    with pytest.raises(RuntimeError, match="local route store is unavailable"):
-        await responses.acknowledge(identity)
     monkeypatch.setattr(
         dedicated_server,
         "_local_route_store",
         SimpleNamespace(discard=released.append),
     )
     assert await responses.acknowledge(identity) == 5
-    assert released == [object_ref]
+    assert released == []
     assert await responses.acknowledge(identity) is None
+    assert await responses.state() == {
+        "active_route_reservations": 0,
+        "retained_route_responses": 1,
+        "reserved_route_bytes": 0,
+        "retained_route_bytes": 5,
+    }
     await responses.reserve(
         "b" * 64,
         "payload",
@@ -636,6 +671,8 @@ async def test_private_route_responses_reserve_replay_ack_and_discard_exact_byte
         capacity_bytes=8,
         capacity_bundles=1,
     )
+    assert await responses.discard(identity) == 5
+    assert released == [object_ref]
     await responses.complete(
         "b" * 64,
         "payload",
@@ -652,6 +689,106 @@ async def test_private_route_responses_reserve_replay_ack_and_discard_exact_byte
         "reserved_route_bytes": 0,
         "retained_route_bytes": 0,
     }
+
+
+@pytest.mark.asyncio
+async def test_private_route_source_registers_acknowledged_holder_bytes(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setenv("ART_VLLM_ROUTE_SHM_ROOT", str(tmp_path))
+    store = LocalRouteStore("runtime")
+    monkeypatch.setattr(dedicated_server, "_local_route_store", store)
+    responses = dedicated_server._PrivateRouteResponses()
+    request_identity = "a" * 64
+    payload = b"holder-routes"
+    raw_ref = store.retain(request_identity, payload)
+    ref = RouteBundleObjectRef.model_validate(raw_ref)
+    await responses.reserve(
+        request_identity,
+        "fingerprint",
+        len(payload),
+        capacity_bytes=len(payload),
+        capacity_bundles=1,
+    )
+    await responses.complete(
+        request_identity,
+        "fingerprint",
+        b"response",
+        retained_bytes=len(payload),
+        object_ref=raw_ref,
+    )
+    source = LocalTransferEndpoint(
+        host_id="inference", domain="inference", root=str(tmp_path)
+    )
+    target = LocalTransferEndpoint(
+        host_id="trainer", domain="trainer", root=str(tmp_path)
+    )
+    service_ref = ref.model_copy(update={"locator": "holder-local:service:bundle"})
+    objects = (
+        HolderRouteSourceObject(
+            request_id=request_identity,
+            object=service_ref,
+            lease_id="service-route-lease",
+        ),
+    )
+    request = HolderRouteSourceRequest(
+        operation_id=holder_route_source_operation_id(
+            stream_id="batch:routes",
+            source_endpoint=source,
+            target_endpoint=target,
+            objects=objects,
+        ),
+        stream_id="batch:routes",
+        source_endpoint=source,
+        target_endpoint=target,
+        objects=objects,
+    )
+    published = []
+
+    class Publisher:
+        def __init__(self) -> None:
+            self.transfer = NixlRouteTransfer(
+                stream_id=request.stream_id,
+                target_host_id=target.host_id,
+                source=NixlMemorySource(
+                    agent="holder-agent",
+                    metadata_b64="YWdlbnQ=",
+                    address=1,
+                    byte_count=len(payload),
+                ),
+            )
+            self.closed = False
+
+        async def close(self) -> None:
+            self.closed = True
+
+    publisher = Publisher()
+
+    def register(value, *, stream_id, target_host_id):
+        published.append(bytes(value))
+        assert (stream_id, target_host_id) == (request.stream_id, target.host_id)
+        return publisher
+
+    monkeypatch.setattr(
+        dedicated_server, "register_retained_route_nixl_source", register
+    )
+    with pytest.raises(RuntimeError, match="source object is unavailable"):
+        await responses.prepare_source(request, store)
+    assert await responses.acknowledge(request_identity) == len(payload)
+    assert os.path.exists(ref.locator)
+    receipt = await responses.prepare_source(request, store)
+
+    assert receipt.backend == "nixl"
+    assert receipt.nixl == publisher.transfer
+    assert await responses.prepare_source(request, store) == receipt
+    assert published == [payload]
+    with pytest.raises(RuntimeError, match="active source"):
+        await responses.discard(request_identity)
+    assert await responses.release_source(receipt)
+    assert publisher.closed
+    assert not await responses.release_source(receipt)
+    assert await responses.discard(request_identity) == len(payload)
+    assert not os.path.exists(ref.locator)
 
 
 @pytest.mark.asyncio

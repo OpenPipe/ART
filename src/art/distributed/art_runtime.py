@@ -20,7 +20,7 @@ from art.vllm_route_transport import (
     RetainedRouteBundleRef,
     RouteBundleReader,
     local_retained_route_bundle_transfer,
-    publish_retained_route_bundle_nixl_transfer,
+    prepare_holder_route_bundle_transfer,
     publish_retained_route_bundle_transfer,
 )
 
@@ -895,32 +895,14 @@ class ArtRuntime:
         ):
             raise RuntimeError("holder route reader changed its physical source")
         route_backend = paired.route_backend(target_host_id)
-        if route_backend == "nixl":
-            if self._nixl_transport is None:
-                raise RuntimeError("cross-domain holder routes require NIXL transport")
-            return await publish_retained_route_bundle_nixl_transfer(
-                refs,
-                reader=self._route_bundle_reader,
-                stream_id=f"{batch_id}:routes",
-                target_host_id=target_host_id,
-            )
-        views = tuple(
-            await asyncio.gather(
-                *(
-                    self._route_bundle_reader.resolve_local_view(
-                        ref.object, lease_id=ref.lease_id
-                    )
-                    for ref in refs
-                )
-            )
-        )
-        return (
-            local_retained_route_bundle_transfer(
-                refs,
-                views,
-                local_transfer_root=route_source.root,
-            ),
-            None,
+        if route_backend == "nixl" and self._nixl_transport is None:
+            raise RuntimeError("cross-domain holder routes require NIXL transport")
+        return await prepare_holder_route_bundle_transfer(
+            refs,
+            reader=self._route_bundle_reader,
+            stream_id=f"{batch_id}:routes",
+            source_endpoint=route_source,
+            target_endpoint=paired.route_target(target_host_id),
         )
 
     def _paired_transfer_identity(self) -> PairedTransferIdentity:

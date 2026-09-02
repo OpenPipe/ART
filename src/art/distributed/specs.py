@@ -71,6 +71,10 @@ class PairedTransferIdentity(_Spec):
             endpoint.host_id for endpoint in self.trainer_endpoints
         }:
             raise ValueError("LoRA source must be a trainer endpoint")
+        if self.route_source is not None and self.route_source not in (
+            self.inference_endpoints
+        ):
+            raise ValueError("route source must be an inference endpoint")
         identities = {
             (endpoint.domain, endpoint.root)
             for endpoint in self.trainer_endpoints + self.inference_endpoints
@@ -94,15 +98,18 @@ class PairedTransferIdentity(_Spec):
     def route_backend(self, target_host_id: str) -> Literal["local", "nixl"]:
         if self.route_source is None:
             raise RuntimeError("paired transfer has no holder route source")
+        target = self.route_target(target_host_id)
+        return _local_transfer_backend(self.route_source, target)
+
+    def route_target(self, target_host_id: str) -> LocalTransferEndpoint:
         try:
-            target = next(
+            return next(
                 endpoint
                 for endpoint in self.trainer_endpoints
                 if endpoint.host_id == target_host_id
             )
         except StopIteration:
             raise RuntimeError("route target is not a trainer endpoint") from None
-        return _local_transfer_backend(self.route_source, target)
 
 
 def _local_transfer_backend(
