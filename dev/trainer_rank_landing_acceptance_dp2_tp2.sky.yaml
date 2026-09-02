@@ -1,0 +1,67 @@
+# TP support gate: DP2 x TP2 public forward_micro_batches cell (4x H200, Kubernetes).
+#
+# The global wave planner's world-scope collectives composed with TP execution
+# collectives (pair scope): at least two waves under the test-only memory cap,
+# DP replicas with different payloads, identical wave shapes within each TP
+# pair, every input returned exactly once in order, forward and backward per
+# wave through an active LoRA slot, automatic vs depth-one parity, and an
+# empty-DP-slot arm (see phase_dp2_tp2_waves in
+# dev/trainer_rank_landing_acceptance.py).
+#
+# Usage:
+#   sky launch -c tr-dp2-tp2 dev/trainer_rank_landing_acceptance_dp2_tp2.sky.yaml \
+#     --env RUN_ID=<run id>
+
+name: trainer-rank-dp2-tp2-gate
+
+workdir: .
+
+envs:
+  RUN_ID: unset
+
+resources:
+  cloud: kubernetes
+  accelerators: H200:4
+  cpus: 32+
+  memory: 256+
+  image_id: docker:docker.io/bradhiltonnw/art-gpu@sha256:f93fda4032bf37f16d9c639c51daf73e1a884df97d14baabf349868831321bdc
+
+setup: |
+  set -euo pipefail
+  export CC=gcc CXX=g++
+  uv sync --frozen --extra megatron --group dev
+  uv sync --project megatron_runtime --extra cuda12 --group test --frozen
+  uv pip install --python megatron_runtime/.venv/bin/python --no-deps --editable .
+
+run: |
+  set -euo pipefail
+  : "${RUN_ID:?RUN_ID is required}"
+  root="scratch/trainer_rank_landing_acceptance/${RUN_ID}"
+  mkdir -p "${root}"
+
+  export ART_MEGATRON_TENSOR_MODEL_PARALLEL_SIZE=2
+  export ART_MEGATRON_CONTEXT_PARALLEL_SIZE=1
+  export ART_MEGATRON_DATA_PARALLEL_SIZE=2
+  export ART_MEGATRON_PIPELINE_MODEL_PARALLEL_SIZE=1
+  export TOKENIZERS_PARALLELISM=false
+  export PYTHONUNBUFFERED=1
+
+  uv run --no-sync python dev/trainer_rank_landing_acceptance.py --phase contract
+
+  timeout 14400s megatron_runtime/.venv/bin/python -m torch.distributed.run --standalone --nproc-per-node=4 \
+    dev/trainer_rank_landing_acceptance.py --phase dp2-tp2-waves \
+    --evidence "${root}/evidence.jsonl" \
+    2>&1 | tee "${root}/dp2_tp2_waves.log"
+
+config:
+  kubernetes:
+    pod_config:
+      spec:
+        schedulerName: binpack-scheduler
+        activeDeadlineSeconds: 42000
+        containers:
+          - name: ray-node
+            imagePullPolicy: Always
+            env:
+              - name: UV_LINK_MODE
+                value: copy

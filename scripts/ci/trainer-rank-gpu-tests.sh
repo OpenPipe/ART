@@ -27,3 +27,14 @@ ART_MEGATRON_CONTEXT_PARALLEL_SIZE=2 \
     --layers 1 \
     --anchors no_sharing,full_sharing \
     --slots 2
+
+# Tensor parallelism through the public API: vocab-parallel head, sequence
+# parallelism (forced on at TP>1) and TP padding of packed batches, at layouts
+# no_sharing vs full_sharing with two LoRA slots.
+ART_MEGATRON_TENSOR_MODEL_PARALLEL_SIZE=2 \
+  "${runtime_python}" -m torch.distributed.run --standalone --nproc-per-node=2 \
+    dev/trainer_rank_check.py \
+    --model Qwen/Qwen3-0.6B \
+    --layers 1 \
+    --anchors no_sharing,full_sharing \
+    --slots 2

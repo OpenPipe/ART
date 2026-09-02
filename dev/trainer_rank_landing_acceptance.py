@@ -54,6 +54,7 @@ import argparse
 import functools
 import inspect
 import json
+import logging
 import os
 from pathlib import Path
 import statistics
@@ -911,12 +912,650 @@ def phase_split_conversion(evidence: str | None, pressure: str) -> None:
             dist.destroy_process_group()
 
 
+# --- Tensor-parallel gates ---------------------------------------------------
+#
+# Written before lifting the TP>1 constructor refusal (test-first): both GPU
+# phases below fail on the pre-lift tree at ``TrainerRank(runtime)``.
+#
+# ``tp2-public`` (2 ranks, DP1 x TP2 x CP1) is the first public-API execution
+# of the automatic planner under tensor parallelism: planner-selected prefix
+# sharing -> GDN prefix state -> sequence parallelism -> TP output head ->
+# backward through an active LoRA slot, compared against the depth-one arm.
+# ``dp2-tp2-waves`` (4 ranks, DP2 x TP2) exercises the global wave planner's
+# collectives (world scope) composed with TP execution collectives (pair scope)
+# through public ``forward_micro_batches``, including an empty DP slot.
+
+TP_GATES: dict[str, float] = {
+    # bf16 kernels reorder reductions across packings (same metric/tolerance as
+    # the split-conversion gate and dev/trainer_rank_check.py).
+    "max_output_mean_abs_pct": 0.5,
+    "max_output_abs": 1.0,
+    "max_loss_rel_pct": 0.5,
+    # LoRA gradients across two different packings of the same tokens.
+    "max_grad_rel_l2": 2e-2,
+    "min_grad_cosine": 0.999,
+    # Plan-cache-stable measured rows: identical content plans as a cache hit.
+    "max_measured_planning_ms": 10.0,
+}
+
+# Hierarchical GRPO shape for the TP2 public cell: (groups, group size, system,
+# prompt, completion). The odd system and completion lengths make every
+# planner layout's packed length odd, so sequence-parallel padding
+# (local_length % TP != 0) is exercised with outputs at the final real token.
+GRPO_TP2 = (2, 8, 1023, 2048, 255)
+
+
+class _ForwardCompileWatch(logging.Handler):
+    """Collect per-forward compile status from the trainer telemetry log."""
+
+    def __init__(self) -> None:
+        super().__init__(level=logging.INFO)
+        self.statuses: list[str] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        message = record.getMessage()
+        marker = "ART_TRAINER_EVENT "
+        if marker not in message:
+            return
+        try:
+            event = json.loads(message.split(marker, 1)[1])
+        except json.JSONDecodeError:
+            return
+        if event.get("event") == "phase" and event.get("phase") == "forward":
+            self.statuses.append(str(event.get("compile_status", "unknown")))
+
+    def take(self) -> list[str]:
+        statuses, self.statuses = self.statuses, []
+        return statuses
+
+
+def _install_compile_watch() -> _ForwardCompileWatch:
+    logger = logging.getLogger("art.trainer_rank._telemetry")
+    logger.setLevel(logging.INFO)
+    watch = _ForwardCompileWatch()
+    logger.addHandler(watch)
+    return watch
+
+
+def _grpo_groups(seed: int, shape: tuple[int, int, int, int, int]) -> list[list[Any]]:
+    """Hierarchical GRPO groups: one nested item per prompt group."""
+
+    import torch
+
+    from art.trainer_rank import ForwardInput
+
+    prompt_groups, group_size, system_tokens, prompt_tokens, completion_tokens = shape
+
+    def _tokens(token_seed: int, count: int) -> torch.Tensor:
+        generator = torch.Generator().manual_seed(token_seed)
+        return torch.randint(low=10, high=64_000, size=(count,), generator=generator)
+
+    system = _tokens(seed * 100_003, system_tokens)
+    groups: list[list[Any]] = []
+    for prompt_group in range(prompt_groups):
+        prompt = _tokens(seed * 1_000_003 + prompt_group * 100_019, prompt_tokens)
+        prefix = torch.cat((system, prompt))
+        requests: list[Any] = []
+        for branch in range(group_size):
+            completion = _tokens(
+                seed * 10_000_019 + prompt_group * 1_000_033 + branch * 10_007,
+                completion_tokens,
+            )
+            tokens = torch.cat((prefix, completion))
+            labels = torch.roll(tokens, shifts=-1).clone()
+            labels[-1] = -100
+            labels[: max(int(prefix.numel()) - 1, 0)] = -100
+            requests.append(ForwardInput(input_tokens=tokens, target_tokens=labels))
+        groups.append(requests)
+    return groups
+
+
+def _anchor_env(arm: str) -> None:
+    if arm == "automatic":
+        os.environ.pop(TEST_ANCHOR_ENV, None)
+        os.environ.pop(TEST_HOOKS_ENV, None)
+    else:
+        os.environ[TEST_HOOKS_ENV] = "1"
+        os.environ[TEST_ANCHOR_ENV] = arm
+
+
+def _tp_group() -> Any:
+    from megatron.core import parallel_state as ps
+
+    return ps.get_tensor_model_parallel_group(check_initialized=False)
+
+
+def _gather_objects(value: Any, group: Any = None) -> list[Any]:
+    import torch.distributed as dist
+
+    size = dist.get_world_size(group)
+    values: list[Any] = [None] * size
+    dist.all_gather_object(values, value, group=group)
+    return values
+
+
+def _plan_fingerprint(
+    rank: Any, requests: list[Any], checkpoint: Any
+) -> dict[str, Any]:
+    """Content fingerprint of the plan this rank would execute (a cache hit)."""
+
+    import hashlib
+
+    plan = rank._plan_flat_forward(requests, checkpoint=checkpoint)
+    telemetry = rank.last_forward_telemetry()
+    return {
+        "packed_tokens": int(plan.packed_tokens),
+        "logical_tokens": int(plan.logical_tokens),
+        "selected_max_depth": int(plan.selected_max_depth),
+        "subforward_request_indices": telemetry["subforward_request_indices"],
+        "groups": [
+            {
+                "tokens": hashlib.sha256(
+                    group.packed.tokens.cpu().contiguous().numpy().tobytes()
+                ).hexdigest(),
+                "group_ids": hashlib.sha256(
+                    group.packed.group_ids.cpu().contiguous().numpy().tobytes()
+                ).hexdigest(),
+                "segments": len(group.packed.segments),
+            }
+            for group in plan.groups
+        ],
+    }
+
+
+def _assert_tp_peers_agree(fingerprint: dict[str, object], label: str) -> None:
+    peers = _gather_objects(fingerprint, _tp_group())
+    if any(peer != peers[0] for peer in peers):
+        _fail(f"{label}: TP peers planned different physical layouts: {peers}")
+
+
+def _lora_gradients(rank: Any, slot: str) -> list[Any]:
+    import torch
+
+    return [
+        torch.zeros_like(parameter, dtype=torch.float32, device="cpu")
+        if parameter.grad is None
+        else parameter.grad.detach().float().cpu().clone()
+        for parameter in rank._checkpoint_slots[slot].params
+    ]
+
+
+def _compare_gradients(actual: list[Any], expected: list[Any]) -> tuple[float, float]:
+    """Return (relative L2 error, cosine similarity) over all LoRA gradients."""
+
+    import torch
+
+    flat_actual = torch.cat([g.reshape(-1) for g in actual])
+    flat_expected = torch.cat([g.reshape(-1) for g in expected])
+    denominator = max(float(flat_expected.norm()), 1e-12)
+    rel_l2 = float((flat_actual - flat_expected).norm()) / denominator
+    cosine = float(
+        torch.nn.functional.cosine_similarity(
+            flat_actual.unsqueeze(0), flat_expected.unsqueeze(0)
+        ).item()
+    )
+    return rel_l2, cosine
+
+
+def _compare_logprobs(actual: list[Any], expected: list[Any]) -> tuple[float, float]:
+    import torch
+
+    flat_actual = torch.cat([a.reshape(-1) for a in actual])
+    flat_expected = torch.cat([b.reshape(-1) for b in expected])
+    mean_abs_pct = float(
+        (flat_actual - flat_expected).abs().mean()
+        / max(float(flat_expected.abs().mean()), 1e-6)
+        * 100.0
+    )
+    return mean_abs_pct, float((flat_actual - flat_expected).abs().max())
+
+
+def _check_pair(
+    rows: list[dict[str, object]],
+    label: str,
+    automatic: dict[str, Any],
+    depth_one: dict[str, Any],
+) -> None:
+    """Gate automatic-vs-depth-one outputs, loss and LoRA gradients."""
+
+    mean_abs_pct, max_abs = _compare_logprobs(
+        automatic["logprobs"], depth_one["logprobs"]
+    )
+    loss_rel_pct = (
+        abs(automatic["loss"] - depth_one["loss"])
+        / max(abs(depth_one["loss"]), 1e-6)
+        * 100.0
+    )
+    grad_rel_l2, grad_cosine = _compare_gradients(
+        automatic["gradients"], depth_one["gradients"]
+    )
+    rows.append(
+        {
+            "arm": f"{label}-parity",
+            "mean_abs_pct": mean_abs_pct,
+            "max_abs": max_abs,
+            "loss_rel_pct": loss_rel_pct,
+            "grad_rel_l2": grad_rel_l2,
+            "grad_cosine": grad_cosine,
+        }
+    )
+    problems = []
+    if mean_abs_pct > TP_GATES["max_output_mean_abs_pct"]:
+        problems.append(f"output mean_abs_pct={mean_abs_pct:.4f}")
+    if max_abs > TP_GATES["max_output_abs"]:
+        problems.append(f"output max_abs={max_abs:.4f}")
+    if loss_rel_pct > TP_GATES["max_loss_rel_pct"]:
+        problems.append(f"loss_rel_pct={loss_rel_pct:.4f}")
+    if grad_rel_l2 > TP_GATES["max_grad_rel_l2"]:
+        problems.append(f"grad_rel_l2={grad_rel_l2:.5f}")
+    if grad_cosine < TP_GATES["min_grad_cosine"]:
+        problems.append(f"grad_cosine={grad_cosine:.6f}")
+    if problems:
+        _fail(f"{label}: automatic vs depth-one diverge: " + ", ".join(problems))
+
+
+def _init_gpu_phase(name: str) -> None:
+    import torch
+    import torch.distributed as dist
+
+    if not torch.cuda.is_available():
+        _fail(f"{name} phase requires CUDA")
+    torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
+    dist.init_process_group(backend="nccl")
+
+
+def _require_topology(rank: Any, *, tp: int, dp: int) -> None:
+    from megatron.core import parallel_state as ps
+
+    actual_tp = int(ps.get_tensor_model_parallel_world_size())
+    actual_dp = int(ps.get_data_parallel_world_size())
+    if (actual_tp, actual_dp) != (tp, dp):
+        _fail(
+            f"expected TP{tp} x DP{dp}, runtime initialized TP{actual_tp} x DP{actual_dp}"
+        )
+
+
+def _write_rows(evidence: str | None, rows: list[dict[str, object]], name: str) -> None:
+    import torch.distributed as dist
+
+    if evidence and dist.get_rank() == 0:
+        with open(evidence, "a", encoding="utf-8") as handle:
+            for row in rows:
+                handle.write(json.dumps(row, sort_keys=True) + "\n")
+    if dist.get_rank() == 0:
+        print(f"{name} phase: PASS {rows}")
+
+
+def phase_tp2_public(evidence: str | None, repeat: int) -> None:
+    """DP1 x TP2 x CP1 public ``dp_rank_forward`` cell (2 ranks, Qwen3.5-4B).
+
+    Gates:
+    - both TP peers plan the same physical layout on every call;
+    - the automatic planner selects depth > 1 on the hierarchical GRPO shape;
+    - packed lengths are odd, so sequence-parallel padding is exercised;
+    - automatic vs depth-one: outputs, loss and active-LoRA gradients agree;
+    - measured rows are compile-free and plan-cache-stable (3 warmups per arm,
+      then ``repeat`` alternating measured pairs);
+    - paired median complete-call gain is reported (not gated: the cost model
+      carries no TP terms yet).
+    """
+
+    phase_contract()
+    _init_gpu_phase("tp2-public")
+    import statistics
+
+    import torch
+    import torch.distributed as dist
+
+    from art.megatron import train as megatron_train
+    from art.trainer_rank import TrainerRank
+
+    sys.path.insert(0, str(REPO_ROOT / "dev"))
+    from trainer_rank_support import load_random_checkpoints
+
+    rows: list[dict[str, object]] = []
+    try:
+        torch.manual_seed(1234)
+        runtime = megatron_train.build_training_runtime(
+            model_identifier="Qwen/Qwen3.5-4B",
+            print_env=dist.get_rank() == 0,
+        )
+        for chunk in runtime.model:
+            chunk.train()
+        rank = TrainerRank(runtime)
+        _require_topology(rank, tp=2, dp=1)
+        [slot] = load_random_checkpoints(runtime, rank, 1, base_model="Qwen/Qwen3.5-4B")
+        watch = _install_compile_watch()
+        requests = [
+            request for group in _grpo_groups(6_301, GRPO_TP2) for request in group
+        ]
+
+        def run(arm: str) -> dict[str, Any]:
+            _anchor_env(arm)
+            watch.take()
+            rank.zero_grad()
+            torch.cuda.synchronize()
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            start.record()
+            outputs = rank.dp_rank_forward(requests, checkpoint=slot)
+            loss = _output_loss(outputs)
+            loss.backward()
+            end.record()
+            torch.cuda.synchronize()
+            telemetry = rank.last_forward_telemetry()
+            fingerprint = _plan_fingerprint(rank, requests, slot)
+            _assert_tp_peers_agree(fingerprint, f"tp2-public {arm}")
+            result = {
+                "arm": arm,
+                "ms": float(start.elapsed_time(end)),
+                "loss": float(loss.detach().float().item()),
+                "logprobs": [o.target_logprobs.detach().float().cpu() for o in outputs],
+                "gradients": _lora_gradients(rank, slot),
+                "selected_max_depth": int(telemetry["selected_max_depth"]),
+                "planning_ms": float(telemetry["planning_ms"]),
+                "packed_tokens": int(fingerprint["packed_tokens"]),
+                "compile_statuses": watch.take(),
+            }
+            del outputs, loss
+            rank.zero_grad()
+            _anchor_env("automatic")
+            return result
+
+        # Warmups (compile, autotune, memory profile) for both arms.
+        for _ in range(3):
+            for arm in ("automatic", "depth_one"):
+                run(arm)
+        # Correctness pair.
+        automatic = run("automatic")
+        depth_one = run("depth_one")
+        rows.append(
+            {
+                "arm": "tp2-public-layouts",
+                "automatic_selected_max_depth": automatic["selected_max_depth"],
+                "automatic_packed_tokens": automatic["packed_tokens"],
+                "depth_one_selected_max_depth": depth_one["selected_max_depth"],
+                "depth_one_packed_tokens": depth_one["packed_tokens"],
+                "logical_tokens": sum(int(r.input_tokens.numel()) for r in requests),
+            }
+        )
+        if automatic["selected_max_depth"] < 2:
+            _fail(
+                "automatic planner did not select depth > 1 on the GRPO shape "
+                f"(selected_max_depth={automatic['selected_max_depth']})"
+            )
+        if automatic["packed_tokens"] % 2 == 0 or depth_one["packed_tokens"] % 2 == 0:
+            _fail("cell shape did not exercise sequence-parallel padding (even length)")
+        _check_pair(rows, "tp2-public", automatic, depth_one)
+
+        # Alternating measured pairs: compile-free and plan-cache-stable.
+        samples: dict[str, list[float]] = {"automatic": [], "depth_one": []}
+        for _ in range(repeat):
+            for arm in ("automatic", "depth_one"):
+                result = run(arm)
+                samples[arm].append(result["ms"])
+                if any(status != "none" for status in result["compile_statuses"]):
+                    _fail(f"measured {arm} row compiled: {result['compile_statuses']}")
+                if result["planning_ms"] > TP_GATES["max_measured_planning_ms"]:
+                    _fail(
+                        f"measured {arm} row was not a plan-cache hit: {result['planning_ms']:.2f} ms"
+                    )
+                reference = automatic if arm == "automatic" else depth_one
+                if result["selected_max_depth"] != reference["selected_max_depth"]:
+                    _fail(f"measured {arm} row changed layout depth")
+        paired_gain = [
+            (d - a) / d * 100.0
+            for a, d in zip(samples["automatic"], samples["depth_one"], strict=True)
+        ]
+        rows.append(
+            {
+                "arm": "tp2-public-timing",
+                "automatic_median_ms": statistics.median(samples["automatic"]),
+                "depth_one_median_ms": statistics.median(samples["depth_one"]),
+                "paired_median_gain_pct": statistics.median(paired_gain),
+                "measured_pairs": repeat,
+            }
+        )
+        _write_rows(evidence, rows, "tp2-public")
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
+
+
+def phase_dp2_tp2_waves(evidence: str | None) -> None:
+    """DP2 x TP2 public ``forward_micro_batches`` gate (4 ranks, Qwen3.5-4B).
+
+    Arm A (branchy): six hierarchical GRPO groups as top-level items, the
+    test-only memory cap sized so the stream needs at least two waves, forward
+    and backward per wave through an active LoRA slot. Gates: every global input
+    is returned exactly once in original order; both ranks of each TP pair
+    execute identical wave shapes while DP replicas carry different payloads;
+    the automatic planner selects depth > 1; automatic vs depth-one outputs,
+    loss and LoRA gradients agree; no collective hangs (the run completes).
+
+    Arm B (empty slot): a single heterogeneous item, so one DP replica has
+    nothing to do in the only wave and must still complete the protocol.
+    """
+
+    phase_contract()
+    _init_gpu_phase("dp2-tp2-waves")
+    import torch
+    import torch.distributed as dist
+
+    from art.megatron import train as megatron_train
+    from art.trainer_rank import ForwardInput, TrainerRank
+
+    sys.path.insert(0, str(REPO_ROOT / "dev"))
+    from trainer_rank_support import load_random_checkpoints
+
+    rows: list[dict[str, object]] = []
+    try:
+        torch.manual_seed(1234)
+        runtime = megatron_train.build_training_runtime(
+            model_identifier="Qwen/Qwen3.5-4B",
+            print_env=dist.get_rank() == 0,
+        )
+        for chunk in runtime.model:
+            chunk.train()
+        rank = TrainerRank(runtime)
+        _require_topology(rank, tp=2, dp=2)
+        dp_rank, dp_size = rank._dp_rank_and_size()
+        [slot] = load_random_checkpoints(runtime, rank, 1, base_model="Qwen/Qwen3.5-4B")
+        items = [
+            group
+            for seed in range(6)
+            for group in _grpo_groups(7_001 + seed, (1, 8, 1023, 2048, 255))
+        ]
+
+        def stream(arm: str, cap_bytes: int | None) -> dict[str, Any]:
+            _anchor_env(arm)
+            if cap_bytes is None:
+                os.environ.pop(SPLIT_MEMORY_LIMIT_ENV, None)
+            else:
+                os.environ[TEST_HOOKS_ENV] = "1"
+                os.environ[SPLIT_MEMORY_LIMIT_ENV] = str(cap_bytes)
+            rank.zero_grad()
+            seen: list[int] = []
+            wave_shapes: list[dict[str, object]] = []
+            logprobs: dict[int, list[torch.Tensor]] = {}
+            loss_total = 0.0
+            depths: list[int] = []
+            for batch in rank.forward_micro_batches(items, checkpoint=slot):
+                seen.extend(int(index) for index in batch.indices)
+                telemetry = rank.last_forward_telemetry()
+                depths.append(int(telemetry["selected_max_depth"]))
+                wave_shapes.append(
+                    {
+                        "global_start": batch.stats.global_start,
+                        "global_stop": batch.stats.global_stop,
+                        "global_count": batch.stats.global_count,
+                        "local_count": batch.stats.local_count,
+                        "packed_tokens": batch.stats.packed_tokens,
+                        "logical_tokens": batch.stats.logical_tokens,
+                        "selected_max_depth": int(telemetry["selected_max_depth"]),
+                        "subforward_count": batch.stats.subforward_count,
+                    }
+                )
+                flat = [output for group in batch.outputs for output in group]
+                for index, group in zip(batch.indices, batch.outputs, strict=True):
+                    logprobs[int(index)] = [
+                        o.target_logprobs.detach().float().cpu() for o in group
+                    ]
+                if flat:
+                    loss = _output_loss(flat)
+                    loss_total += float(loss.detach().float().item())
+                    loss.backward()
+            torch.cuda.synchronize()
+            result = {
+                "arm": arm,
+                "seen": seen,
+                "waves": wave_shapes,
+                "loss": loss_total,
+                "logprobs": logprobs,
+                "gradients": _lora_gradients(rank, slot),
+                "depths": depths,
+            }
+            rank.zero_grad()
+            _anchor_env("automatic")
+            os.environ.pop(SPLIT_MEMORY_LIMIT_ENV, None)
+            return result
+
+        # Warm-up: one uncapped automatic stream (compile, profile).
+        stream("automatic", None)
+        # Cap so at most two items fit per DP rank per wave (three waves).
+        plan = rank._plan_flat_forward(items[0], checkpoint=slot)
+        per_item = rank._estimate_required_memory_bytes_from_values(
+            packed_tokens=plan.packed_tokens,
+            output_bytes=plan.output_bytes,
+            signature=plan.signature,
+            logical_tokens=plan.logical_tokens,
+        )
+        torch.cuda.synchronize()
+        cap = int(torch.cuda.memory_allocated()) + int(per_item * 2.5)
+        cap_all = _gather_objects(cap)
+        cap = min(cap_all)  # one cap on every rank; MIN-reduced budgets anyway
+
+        automatic = stream("automatic", cap)
+        depth_one = stream("depth_one", cap)
+
+        # Every global input exactly once, in original order, across DP ranks
+        # (ranks in one TP pair hold the same slice, so dedupe by DP rank).
+        for result in (automatic, depth_one):
+            by_dp: dict[int, list[int]] = {}
+            for peer_dp, seen in _gather_objects((dp_rank, result["seen"])):
+                by_dp.setdefault(int(peer_dp), list(seen))
+            merged = sorted(index for seen in by_dp.values() for index in seen)
+            if merged != list(range(len(items))):
+                _fail(f"{result['arm']}: inputs not returned exactly once: {merged}")
+            if any(seen != sorted(seen) for seen in by_dp.values()):
+                _fail(
+                    f"{result['arm']}: a DP rank returned inputs out of order: {by_dp}"
+                )
+            if len(result["waves"]) < 2:
+                _fail(
+                    f"{result['arm']}: expected at least two waves, got {len(result['waves'])}"
+                )
+            peers = _gather_objects(result["waves"], _tp_group())
+            if any(peer != peers[0] for peer in peers):
+                _fail(
+                    f"{result['arm']}: TP peers executed different wave shapes: {peers}"
+                )
+            if len({tuple(seen) for seen in by_dp.values()}) < len(by_dp):
+                _fail(
+                    "DP replicas received identical payloads; the gate needs distinct slices"
+                )
+        if max(automatic["depths"]) < 2:
+            _fail(
+                f"automatic planner did not select depth > 1 in any wave: {automatic['depths']}"
+            )
+        rows.append(
+            {
+                "arm": "dp2-tp2-branchy",
+                "waves": len(automatic["waves"]),
+                "wave_shapes": automatic["waves"],
+                "depth_one_waves": len(depth_one["waves"]),
+                "local_indices": sorted(automatic["seen"]),
+                "cap_bytes": cap,
+            }
+        )
+        # Parity per item held locally (both arms hold the same local slice).
+        local = sorted(automatic["logprobs"])
+        if local != sorted(depth_one["logprobs"]):
+            _fail("arms held different local item sets")
+        _check_pair(
+            rows,
+            "dp2-tp2-branchy",
+            {
+                **automatic,
+                "logprobs": [
+                    t for index in local for t in automatic["logprobs"][index]
+                ],
+            },
+            {
+                **depth_one,
+                "logprobs": [
+                    t for index in local for t in depth_one["logprobs"][index]
+                ],
+            },
+        )
+
+        # Arm B: empty DP slot.
+        single = [
+            ForwardInput(
+                input_tokens=(
+                    tokens := torch.randint(
+                        10,
+                        64_000,
+                        (1_537,),
+                        generator=torch.Generator().manual_seed(9_301),
+                    )
+                ),
+                target_tokens=torch.cat((tokens[1:], tokens.new_tensor([-100]))),
+            )
+        ]
+        rank.zero_grad()
+        waves = 0
+        local_outputs = 0
+        for batch in rank.forward_micro_batches([single], checkpoint=slot):
+            waves += 1
+            flat = [output for group in batch.outputs for output in group]
+            local_outputs += len(flat)
+            if flat:
+                _output_loss(flat).backward()
+        torch.cuda.synchronize()
+        counts = _gather_objects((dp_rank, waves, local_outputs))
+        rows.append({"arm": "dp2-tp2-empty-slot", "per_rank": counts})
+        per_dp = {}
+        for dp, wave_count, outputs in counts:
+            per_dp.setdefault(dp, set()).add((wave_count, outputs))
+        if any(len(v) != 1 for v in per_dp.values()):
+            _fail(f"TP peers disagree on the empty-slot wave: {counts}")
+        totals = sorted(next(iter(v)) for v in per_dp.values())
+        if totals != [(1, 0), (1, 1)]:
+            _fail(
+                f"empty-slot arm expected one wave with (0, 1) outputs across DP ranks: {counts}"
+            )
+        rank.zero_grad()
+        _write_rows(evidence, rows, "dp2-tp2-waves")
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--phase",
         required=True,
-        choices=("contract", "census", "measure", "validate", "split-conversion"),
+        choices=(
+            "contract",
+            "census",
+            "measure",
+            "validate",
+            "split-conversion",
+            "tp2-public",
+            "dp2-tp2-waves",
+        ),
     )
     parser.add_argument("--cell", default="grpo-gdn-cp4")
     parser.add_argument(
@@ -943,6 +1582,10 @@ def main() -> None:
         )
     elif arguments.phase == "split-conversion":
         phase_split_conversion(arguments.evidence or None, arguments.pressure)
+    elif arguments.phase == "tp2-public":
+        phase_tp2_public(arguments.evidence or None, arguments.repeat)
+    elif arguments.phase == "dp2-tp2-waves":
+        phase_dp2_tp2_waves(arguments.evidence or None)
     else:
         if not arguments.evidence:
             _fail("--evidence input path is required for validate")

@@ -67,11 +67,16 @@ def test_real_qwen35_gdn_lora_gradients_match_flattened() -> None:
     not torch.cuda.is_available() or torch.cuda.device_count() < 2,
     reason="At least two CUDA devices are required for TP2 GDN coverage.",
 )
-def test_real_qwen35_gdn_tp2_gradients_match_flattened(tmp_path: Path) -> None:
-    init_method = file_init_method(tmp_path, "real_gdn_tp2_lora")
+@pytest.mark.parametrize("lora", (False, True), ids=("base", "lora"))
+def test_real_qwen35_gdn_tp2_gradients_match_flattened(
+    tmp_path: Path, lora: bool
+) -> None:
+    init_method = file_init_method(
+        tmp_path, f"real_gdn_tp2_{'lora' if lora else 'base'}"
+    )
     mp.spawn(
         _tp2_worker,
-        args=(init_method, str(tmp_path)),
+        args=(init_method, str(tmp_path), lora),
         nprocs=2,
         join=True,
     )
@@ -79,7 +84,7 @@ def test_real_qwen35_gdn_tp2_gradients_match_flattened(tmp_path: Path) -> None:
         assert (tmp_path / f"rank_{rank}.ok").read_text() == "ok\n"
 
 
-def _tp2_worker(rank: int, init_method: str, output_dir: str) -> None:
+def _tp2_worker(rank: int, init_method: str, output_dir: str, lora: bool) -> None:
     torch.cuda.set_device(rank)
     init_process_group(
         backend="nccl",
@@ -99,7 +104,7 @@ def _tp2_worker(rank: int, init_method: str, output_dir: str) -> None:
             for case in default_phase0_cases(conv_width=2)
             if case.name == "multi_family_repeated"
         )
-        packed_gdn, flat_gdn = _make_matching_gdn_pair(tp_size=2, lora=False)
+        packed_gdn, flat_gdn = _make_matching_gdn_pair(tp_size=2, lora=lora)
         tensors = build_phase0_packed_tensors(case)
         metrics = compare_real_gdn_cp1_to_flattened(
             packed_gdn=packed_gdn,
@@ -109,7 +114,9 @@ def _tp2_worker(rank: int, init_method: str, output_dir: str) -> None:
             parent_ids=tensors["parent_ids"].cuda(),
             assistant_mask=tensors["assistant_mask"].cuda(),
         )
-        assert_real_gdn_metrics(metrics, "tp2")
+        assert_real_gdn_metrics(metrics, "tp2_lora" if lora else "tp2")
+        if lora:
+            assert _gdn_lora_grad_names(packed_gdn)
         Path(output_dir, f"rank_{rank}.ok").write_text("ok\n")
     finally:
         if getattr(ps, "model_parallel_is_initialized", lambda: False)():
