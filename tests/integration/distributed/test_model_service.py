@@ -54,6 +54,21 @@ def _service(tmp_path, runtime) -> DistributedMegatronService:
     )
 
 
+def test_managed_engine_args_match_serving_profile_lora_rank(tmp_path) -> None:
+    service = _service(
+        tmp_path,
+        SimpleNamespace(topology=SimpleNamespace(model_services=(_spec(),))),
+    )
+    service.base_model = "Qwen/Qwen3.5-35B-A3B"
+    service.config = {"engine_args": {"max_lora_rank": 8}}
+    profile = cast(Any, SimpleNamespace(lora_rank=32, route_replay=True))
+
+    args = service._engine_args(None, profile=profile)
+
+    assert args["max_lora_rank"] == profile.lora_rank == 32
+    assert args["enable_return_routed_experts"] is profile.route_replay
+
+
 def test_exact_resident_generation_controls_trainer_freshness(tmp_path) -> None:
     service = _service(tmp_path, SimpleNamespace())
     current = TrainerGeneration(

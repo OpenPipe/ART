@@ -244,7 +244,7 @@ async def test_serving_profile_reports_resolved_runtime_geometry(monkeypatch) ->
             ),
             lora_config=SimpleNamespace(
                 max_loras=2,
-                max_lora_rank=64,
+                max_lora_rank=32,
                 lora_dtype="bfloat16",
             ),
             speculative_config=SimpleNamespace(method="mtp"),
@@ -262,6 +262,7 @@ async def test_serving_profile_reports_resolved_runtime_geometry(monkeypatch) ->
     assert profile.runtime_model == "test/model"
     assert profile.tensor_parallel_size == 8
     assert profile.quantization == "fp8"
+    assert profile.max_lora_rank == profile.identity.lora_rank == 32
     assert profile.multi_token_prediction
     assert profile.kv_block_bytes_per_rank == 65_536
     assert profile.kv_capacity_bytes_per_rank == 268_435_456

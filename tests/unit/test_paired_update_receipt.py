@@ -185,14 +185,16 @@ def test_paired_lora_transport_follows_resolved_placement() -> None:
     )
 
 
-def test_paired_engine_args_require_raw_vllm_sampling_defaults() -> None:
+def test_paired_engine_args_match_serving_profile_lora_rank() -> None:
+    profile = SimpleNamespace(lora_rank=32, route_replay=True)
     args = _engine_args(
-        {},
+        {"engine_args": {"max_lora_rank": 8}},
         False,
         "Qwen/Qwen3.5-35B-A3B",
-        enable_moe_routing_replay=True,
+        profile=profile,
     )
 
+    assert args["max_lora_rank"] == profile.lora_rank == 32
     assert args["generation_config"] == "vllm"
     assert args["logprobs_mode"] == "raw_logprobs"
     with pytest.raises(ValueError, match="raw model logprobs"):
@@ -200,14 +202,14 @@ def test_paired_engine_args_require_raw_vllm_sampling_defaults() -> None:
             {"engine_args": {"logprobs_mode": "processed_logprobs"}},
             False,
             "Qwen/Qwen3.5-35B-A3B",
-            enable_moe_routing_replay=True,
+            profile=profile,
         )
     with pytest.raises(ValueError, match="vLLM generation defaults"):
         _engine_args(
             {"engine_args": {"generation_config": "auto"}},
             False,
             "Qwen/Qwen3.5-35B-A3B",
-            enable_moe_routing_replay=True,
+            profile=profile,
         )
 
 

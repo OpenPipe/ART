@@ -1900,14 +1900,15 @@ class DistributedMegatronService:
                 port=cast(int, server_args["port"]),
             )
             service = self._model_service_spec()
+        profile = self._serving_profile_identity()
         template = ReplicaLaunchTemplate(
             served_model_name=self._serving_lora_name(step),
             lora_path=lora_path,
             initial_generation_id=self._generation_id_for_step(step),
             initial_policy_version=step,
-            engine_args=self._engine_args(config),
+            engine_args=self._engine_args(config, profile=profile),
             server_args=self._server_args(config),
-            serving_profile_identity=self._serving_profile_identity(),
+            serving_profile_identity=profile,
         )
         await self.runtime.start_model_service(
             service, template, on_failure=self._replica_failed
@@ -2252,7 +2253,12 @@ class DistributedMegatronService:
             failures.append(cancelled)
         return failures
 
-    def _engine_args(self, server: dev.OpenAIServerConfig | None) -> dict[str, object]:
+    def _engine_args(
+        self,
+        server: dev.OpenAIServerConfig | None,
+        *,
+        profile: ServingProfileIdentity,
+    ) -> dict[str, object]:
         handler = get_model_support_handler(
             self.base_model,
             allow_unvalidated_arch=self._allow_unvalidated_arch,
@@ -2267,10 +2273,9 @@ class DistributedMegatronService:
             raise ValueError("paired inference requires raw model logprobs")
         values["enable_sleep_mode"] = self._temporal_gpu_sharing
         values["enable_lora"] = True
-        values["enable_return_routed_experts"] = (
-            self._runtime_spec().enable_moe_routing_replay
-        )
+        values["enable_return_routed_experts"] = profile.route_replay
         values.setdefault("max_loras", 2)
+        values["max_lora_rank"] = profile.lora_rank
         values["generation_config"] = "vllm"
         values["logprobs_mode"] = "raw_logprobs"
         for key in ("model", "served_model_name"):

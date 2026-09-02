@@ -142,7 +142,7 @@ class MegatronPairedInferencePublisher:
                 config,
                 service.temporal_gpu_sharing,
                 base_model,
-                enable_moe_routing_replay=runtime_spec.enable_moe_routing_replay,
+                profile=profile,
             ),
             server_args=_server_args(config, base_model),
             serving_profile_identity=profile,
@@ -1098,7 +1098,7 @@ def _engine_args(
     temporal_gpu_sharing: bool,
     base_model: str,
     *,
-    enable_moe_routing_replay: bool,
+    profile: ServingProfileIdentity,
 ) -> dict[str, object]:
     allow_unvalidated = bool(config.get("allow_unvalidated_arch", False))
     handler = get_model_support_handler(
@@ -1113,8 +1113,9 @@ def _engine_args(
         raise ValueError("paired inference requires raw model logprobs")
     values["enable_sleep_mode"] = temporal_gpu_sharing
     values["enable_lora"] = True
-    values["enable_return_routed_experts"] = enable_moe_routing_replay
+    values["enable_return_routed_experts"] = profile.route_replay
     values.setdefault("max_loras", 2)
+    values["max_lora_rank"] = profile.lora_rank
     values["generation_config"] = "vllm"
     values["logprobs_mode"] = "raw_logprobs"
     for key in ("model", "served_model_name"):
