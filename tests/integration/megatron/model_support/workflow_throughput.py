@@ -620,8 +620,13 @@ def _sized_config(
     sized = json.loads(json.dumps(source))
     text = _text(sized)
     source_text = _text(source)
-    source_layers = int(source_text["num_hidden_layers"])
     layer_fields = tuple(field for field in _LAYER_LIST_FIELDS if field in source_text)
+    source_depth = source_text.get("num_hidden_layers")
+    if source_depth is None:
+        if not layer_fields:
+            raise ValueError(f"{model_key} config is missing its layer count")
+        source_depth = len(source_text[layer_fields[0]])
+    source_layers = int(source_depth)
     if num_layers > source_layers and layer_fields:
         raise ValueError(
             f"cannot expand {model_key} with per-layer fields {layer_fields}"
