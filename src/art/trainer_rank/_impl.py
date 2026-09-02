@@ -1066,19 +1066,13 @@ class TrainerRank:
                 "therefore requires PP=1 with exactly one local model chunk; "
                 f"got pp={pp_size}, chunks={len(runtime.model)}"
             )
-        tp_size = int(getattr(runtime.provider, "tensor_model_parallel_size", 1) or 1)
-        try:
-            from megatron.core import parallel_state as ps
-
-            tp_size = max(tp_size, int(ps.get_tensor_model_parallel_world_size()))
-        except (AssertionError, ImportError, RuntimeError, ValueError):
-            pass
-        if tp_size > 1:
-            raise TrainerRankRuntimeSupportError(
-                "TrainerRank automatic planning currently requires TP=1: the "
-                "planner's admission model is not yet calibrated for "
-                f"tensor-parallel execution (got tp={tp_size})"
-            )
+        # Tensor parallelism is admitted: the vocab-parallel head, sequence-
+        # parallel gather, TP padding of packed batches and sharded LoRA
+        # gradient reduction pre-date the planner, memory checks all-reduce
+        # within the TP x CP group, and the memory profile is keyed by topology
+        # so TP calibrates itself online. Known limitations: the cost model
+        # carries no TP terms and the cold static estimate ignores sharding
+        # (conservative); both are recalibration follow-ups.
         self.runtime: TrainingRuntime = runtime
         self.device = next(runtime.model[0].parameters()).device
         self._param_dtype_size = _dtype_size(next(runtime.model[0].parameters()).dtype)

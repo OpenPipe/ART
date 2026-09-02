@@ -34,8 +34,9 @@ document records the verified facts the acceptance suite pins).
    decisions; `dp_rank_forward` plans once and raises
    `TrainerRankMemoryError(predicted_peak_bytes, usable_limit_bytes,
    suggestion)` when the unsplit plan cannot be admitted (best-effort internal
-   splitting is a follow-up PR); `TrainerRankRuntimeSupportError` at
-   TP>1/PP>1 (follow-up widens the seam).
+   splitting is a follow-up PR); `TrainerRankRuntimeSupportError` at PP>1
+   (TP>1 was refused at landing as a calibration caution and is admitted
+   again by the TP-support follow-up; see "Tensor parallelism" below).
 4. **Distributed identity WITHOUT a leader protocol** (deliberate deviation
    from the research design, in the spirit of "or whatever's simplest"):
    layout selection is a pure deterministic function of (content identity,
@@ -251,8 +252,51 @@ within the bounded-search contract); and a cold oversized `no_grad` call
 still refuses until a compatible profile exists (a later simplification could
 model `no_grad` retained memory directly from the known output bytes).
 
+## Tensor parallelism (follow-up PR)
+
+TrainerRank accepted TP>1 before the planner landed; #826 refused it as a
+calibration caution, not because anything was missing. The machinery is
+unchanged and pre-dates the planner: the vocab-parallel output head (log-Z,
+target logprobs, top-k and full logits reduced/gathered across the sharded
+vocabulary in the same head chunks), the sequence-parallel hidden gather and
+output-layer SP toggle, TP padding of packed batches (appended singleton tree
+nodes, after planning, so padding can never become a shared subtree), sharded
+vs replicated LoRA gradient reduction, memory checks all-reduced within the
+TP×CP group, and memory-profile signatures keyed by (dp, tp, cp, pp) so a TP
+topology calibrates itself online.
+
+Known, accepted limitations: the cost model carries CP terms but no TP terms
+(layout ranking is expected to survive since sharing shrinks tokens uniformly,
+but constants are uncalibrated — folded into the cost-model recalibration
+follow-up, to be fitted from fresh TP2 telemetry rather than by dividing the
+estimate by TP, which would turn conservative refusals into unsafe
+admissions); the cold static estimate ignores sharding (conservative); TP
+padding happens after planning, so estimates and telemetry count fewer than
+TP tokens too few; the all-shards-`-inf` output-head case is a documented
+non-goal (unreachable for supported models without a vocabulary-wide mask).
+
+Gates (test-first; all failed on the refusing tree):
+- `tests/unit/test_trainer_rank_topology.py`: TP>1 constructs, PP>1 and
+  multi-chunk runtimes still refuse.
+- `--phase tp2-public` (2× H200, Qwen3.5-4B full model, DP1×TP2×CP1, public
+  `dp_rank_forward`): both TP peers plan the same physical layout on every
+  call; the automatic planner selects depth>1 on the hierarchical GRPO shape;
+  odd packed lengths exercise sequence-parallel padding with outputs at the
+  final real token; automatic vs depth-one outputs, loss and active-LoRA
+  gradients agree; measured rows are compile-free and plan-cache-stable;
+  paired timing is reported, not gated.
+- `--phase dp2-tp2-waves` (4× H200, DP2×TP2, public `forward_micro_batches`):
+  at least two waves under the test-only cap, DP replicas with different
+  payloads, identical wave shapes within each TP pair, every input returned
+  exactly once in order, forward and backward per wave, automatic vs
+  depth-one parity, and an empty-DP-slot arm; completing is the no-hang gate.
+- CI: `dev/trainer_rank_check.py` at TP=2 (16 request combinations, two
+  slots) next to the CP=2 run; the GDN TP2 kernel parity test now also runs
+  with LoRA.
+
 ## Explicitly out of scope (follow-ups)
 
-Head chunking and memory margins as data-dependent planner decisions; TP>1 admission seam; cost-model
-recalibration. Not planned: infeasibility proofs, all-rank planning/digest
-agreement, HybridEP/CUDA instrumentation from the research diff.
+Head chunking and memory margins as data-dependent planner decisions;
+cost-model recalibration (including TP terms). Not planned: infeasibility
+proofs, all-rank planning/digest agreement, HybridEP/CUDA instrumentation from
+the research diff.

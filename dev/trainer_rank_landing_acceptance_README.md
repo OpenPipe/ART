@@ -17,6 +17,9 @@ every gate below now passes on the landed implementation.
 | `dev/trainer_rank_landing_acceptance_cp1.sky.yaml` | 1x H200 | full-height model, real Ellavox stream: paired median regression <= 2% (sealed: ties); planning fraction <= 10% (sealed 1.5%/4.2%) | see evidence log |
 | `tests/unit/test_trainer_rank_split.py` | CPU | best-effort splitting contract: bounded ladder (failed rungs rejected by cheap bounds; planner runs only for the executing rung), cumulative live-graph admission, retained profile trusted only near its observed scale and max-merged once observed, caller-order reconstruction, honest refusal wording, minimum-wave splitting, deterministic partitions, one slot-ensure collective per call, independent slot-graph sentinels per subforward, `TrainerRankPartialExecutionError` on execution-time failure, `subforward_count` telemetry | pass |
 | `--phase split-conversion --pressure cap` | 1x H200 | sealed cell shape (Qwen3.5-4B, 4 layers, 4 inputs) under the test-only cap: unlimited runs unsplit; cap converts (>=2 subforwards) with output parity, combined and reverse-order backward; sub-request cap refuses before execution | see evidence log |
+| `tests/unit/test_trainer_rank_topology.py` | CPU | TP>1 runtimes construct; PP>1 and multi-chunk runtimes still refuse | pass |
+| `--phase tp2-public` (`dev/trainer_rank_landing_acceptance_tp2.sky.yaml`) | 2x H200 k8s | Qwen3.5-4B full model, DP1×TP2×CP1, public `dp_rank_forward`: TP peers plan identical physical layouts; automatic selects depth>1; odd packed lengths exercise SP padding; automatic vs depth-one outputs/loss/LoRA-gradient parity; measured rows compile-free and plan-cache-stable; paired timing reported (not gated). Also runs the CI check script at TP=2 | see evidence log |
+| `--phase dp2-tp2-waves` (`dev/trainer_rank_landing_acceptance_dp2_tp2.sky.yaml`) | 4x H200 k8s | DP2×TP2 public `forward_micro_batches`: ≥2 waves, distinct DP payloads, identical wave shapes within each TP pair, every input returned once in order, forward+backward per wave, automatic vs depth-one parity, empty-DP-slot arm, no hang | see evidence log |
 | `--phase split-conversion --pressure ballast` | 1x H200 | same cell under real pressure (live ballast tensors, no test hooks). Training forward: ballast sized from the measured retained fraction f (budget midway inside the (1−f)·R/2 conversion window, width reported), unsplit refused before execution, split runs under the reduced headroom with parity, combined backward with ballast live, observed forward+backward peak within both the admitted budget and the predicted peak; deeper ballast refuses before execution. `no_grad` forward (retained ≈ outputs only; the demonstrated high-value case): budget 60% of the unsplit requirement converts with parity and the observed peak within budget and prediction | see evidence log |
 
 Protocol note (2026-09-01): planning cost is gated as a *fraction* only on the
@@ -62,7 +65,8 @@ pytest acceptance suite only.
 
 Research worktree `~/.codex/worktrees/7236/art`,
 `scratch/trainer_rank_final_acceptance/`. Known limitations carried forward:
-TP>1 refusal (planner admission not TP-calibrated), and the cost model
-undervaluing full sharing on some GRPO cells (sealed: full-sharing arm
-875.7 ms vs automatic 1,132.8 ms). Cost constants are versioned via
-`COEFFICIENT_VERSION` for future recalibration.
+the cost model carries no TP terms and undervalues full sharing on some GRPO
+cells (sealed: full-sharing arm 875.7 ms vs automatic 1,132.8 ms). Cost
+constants are versioned via `COEFFICIENT_VERSION` for future recalibration.
+The TP>1 refusal from the landing was lifted by the TP-support follow-up (see
+the `tp2-public` and `dp2-tp2-waves` rows above).

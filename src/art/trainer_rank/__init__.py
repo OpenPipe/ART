@@ -63,8 +63,10 @@ class TrainerRank(_impl.TrainerRank):
     The constructor intentionally accepts only the training runtime. Prefix
     sharing and microbatch width are data-dependent planner decisions;
     output-head chunking and memory margins are internal calibrated policy.
-    None are user tuning parameters. Requires TP=1 and PP=1: unsupported
-    topologies raise ``TrainerRankRuntimeSupportError`` at construction.
+    None are user tuning parameters. Requires PP=1 (TrainerRank does not use
+    the MCore pipeline schedule); PP>1 raises ``TrainerRankRuntimeSupportError``
+    at construction. Tensor parallelism is supported; the planner's memory
+    profile is keyed by topology and calibrates itself online.
     """
 
     def __init__(self, runtime: TrainingRuntime) -> None:
