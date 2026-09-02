@@ -50,6 +50,7 @@ from art.training import (
     UsageMeasurement,
     bootstrap_operation_worker,
 )
+from art.training.tokenized import tokenized_clip_bounds
 from art.vllm_route_transport import RetainedRouteBundleRef
 
 from .route_retention import (
@@ -1493,7 +1494,14 @@ def _experimental_config(
         if name in ExperimentalTrainConfig.model_fields
     }
     values["ppo"] = request.loss.name == "ppo"
-    values["scale_rewards"] = bool(values.get("scale_rewards", True))
+    values["scale_rewards"] = request.loss.normalize_advantages
+    if request.loss.name == "cispo" and {
+        "clip_low_threshold",
+        "clip_high_threshold",
+    }.intersection(request.loss.values):
+        low, high = tokenized_clip_bounds("cispo", request.loss.values)
+        values["epsilon"] = 1.0 - low
+        values["epsilon_high"] = high - 1.0
     return ExperimentalTrainConfig.model_validate(values)
 
 
