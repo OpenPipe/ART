@@ -296,6 +296,9 @@ class _PrivateRouteResponses:
             return True
 
     async def acknowledge(self, request_identity: str) -> int | None:
+        return await self.discard(request_identity)
+
+    async def discard(self, request_identity: str) -> int | None:
         async with self._lock:
             response = self._responses.get(request_identity)
             if response is None:
@@ -1325,11 +1328,8 @@ def _patch_art_runtime_routes() -> None:
                 }
             )
 
-        @router.post(
-            f"{_PRIVATE_EXECUTION_RECEIPT_PREFIX}/{{request_identity}}/routes:ack"
-        )
-        async def acknowledge_private_route_response(
-            request_identity: str, raw_request: Request
+        async def remove_private_route_response(
+            request_identity: str, raw_request: Request, *, discard: bool
         ) -> JSONResponse:
             target_error = _private_runtime_target_error(
                 raw_request, execution="unknown"
@@ -1346,9 +1346,12 @@ def _patch_art_runtime_routes() -> None:
                     status_code=HTTPStatus.BAD_REQUEST.value,
                 )
             try:
-                released_bytes = await _private_route_responses.acknowledge(
-                    request_identity
+                remove = (
+                    _private_route_responses.discard
+                    if discard
+                    else _private_route_responses.acknowledge
                 )
+                released_bytes = await remove(request_identity)
             except RuntimeError as error:
                 return JSONResponse(
                     content={
@@ -1358,11 +1361,32 @@ def _patch_art_runtime_routes() -> None:
                     },
                     status_code=HTTPStatus.CONFLICT.value,
                 )
+            result = "discarded" if discard else "acknowledged"
             return JSONResponse(
                 content={
-                    "acknowledged": released_bytes is not None,
+                    result: released_bytes is not None,
                     "released_bytes": released_bytes or 0,
                 }
+            )
+
+        @router.post(
+            f"{_PRIVATE_EXECUTION_RECEIPT_PREFIX}/{{request_identity}}/routes:ack"
+        )
+        async def acknowledge_private_route_response(
+            request_identity: str, raw_request: Request
+        ) -> JSONResponse:
+            return await remove_private_route_response(
+                request_identity, raw_request, discard=False
+            )
+
+        @router.post(
+            f"{_PRIVATE_EXECUTION_RECEIPT_PREFIX}/{{request_identity}}/routes:discard"
+        )
+        async def discard_private_route_response(
+            request_identity: str, raw_request: Request
+        ) -> JSONResponse:
+            return await remove_private_route_response(
+                request_identity, raw_request, discard=True
             )
 
         @router.get(_PRIVATE_USAGE_PATH)

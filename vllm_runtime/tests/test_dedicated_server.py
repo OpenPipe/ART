@@ -558,7 +558,7 @@ def test_lora_staging_precedes_target_admission_gate(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
-async def test_private_route_responses_reserve_replay_and_ack_exact_bytes(
+async def test_private_route_responses_reserve_replay_ack_and_discard_exact_bytes(
     monkeypatch,
 ) -> None:
     responses = dedicated_server._PrivateRouteResponses()
@@ -608,6 +608,29 @@ async def test_private_route_responses_reserve_replay_and_ack_exact_bytes(
     assert await responses.acknowledge(identity) == 5
     assert released == [object_ref]
     assert await responses.acknowledge(identity) is None
+    await responses.reserve(
+        "b" * 64,
+        "payload",
+        8,
+        capacity_bytes=8,
+        capacity_bundles=1,
+    )
+    await responses.complete(
+        "b" * 64,
+        "payload",
+        b"response",
+        retained_bytes=5,
+        object_ref=object_ref,
+    )
+    assert await responses.discard("b" * 64) == 5
+    assert released == [object_ref, object_ref]
+    assert await responses.discard("b" * 64) is None
+    assert await responses.state() == {
+        "active_route_reservations": 0,
+        "retained_route_responses": 0,
+        "reserved_route_bytes": 0,
+        "retained_route_bytes": 0,
+    }
 
 
 @pytest.mark.asyncio
@@ -704,6 +727,7 @@ def test_runtime_sleep_route_returns_engine_validation_error(monkeypatch) -> Non
     assert {
         "/art/internal/v1/chat/completions",
         "/art/internal/v1/completions",
+        "/art/internal/v1/requests/{request_identity}/routes:discard",
     } <= {route.path for route in app.routes}
 
     class Engine:
