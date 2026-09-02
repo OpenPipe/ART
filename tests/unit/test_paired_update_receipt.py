@@ -21,6 +21,7 @@ from art.megatron.operation_handler import (
 )
 from art.megatron.paired_inference import (
     MegatronPairedInferencePublisher,
+    _adapter_transport_metrics,
     _engine_args,
     _paired_lora_transport,
 )
@@ -229,6 +230,44 @@ def test_paired_lora_transport_follows_resolved_placement() -> None:
             SimpleNamespace(members=(SimpleNamespace(host_id="inference"),)),
         )
         == "nixl"
+    )
+
+
+def test_paired_transport_metrics_preserve_authoritative_receive_evidence() -> None:
+    received = tuple(
+        AdapterReceiveResult(
+            host_id=f"inference-{index}",
+            generation_id="generation-1",
+            path="/adapter/generation-1",
+            tensor_bytes=100,
+            config_bytes=10,
+            materialization_s=0.2 + index / 10,
+            used_bytes=100,
+            capacity_bytes=128 * (index + 1),
+            prepare_s=0.01 + index / 100,
+            pool_wait_s=0.02 + index / 100,
+            registration_s=0.03 + index / 100,
+            sender_staging_s=0.04 + index / 100,
+            sender_registration_s=0.05 + index / 100,
+        )
+        for index in range(2)
+    )
+
+    metrics = _adapter_transport_metrics(received, wait_s=0.06)
+
+    assert metrics == pytest.approx(
+        {
+            "publication/adapter_transport_bytes": 200.0,
+            "publication/adapter_transport_capacity_bytes": 384.0,
+            "publication/adapter_transport_capacity_utilization": 200 / 384,
+            "publication/adapter_transport_wait_s": 0.06,
+            "publication/adapter_transport_pool_wait_s": 0.03,
+            "publication/adapter_transport_prepare_s": 0.02,
+            "publication/adapter_transport_registration_s": 0.04,
+            "publication/adapter_transport_sender_staging_s": 0.05,
+            "publication/adapter_transport_sender_registration_s": 0.06,
+            "publication/adapter_materialization_s": 0.3,
+        }
     )
 
 

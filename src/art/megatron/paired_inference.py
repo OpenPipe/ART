@@ -322,15 +322,23 @@ class MegatronPairedInferencePublisher:
                 )
             )
             receive_task = asyncio.create_task(
-                manager.wait_adapter_transfer(generation.generation_id)
+                _wait_adapter_transfer(manager, generation.generation_id)
             )
             try:
-                (records, publication_metrics), received = await asyncio.gather(
-                    rank_task, receive_task
-                )
+                (
+                    (records, publication_metrics),
+                    (
+                        received,
+                        transport_wait_s,
+                    ),
+                ) = await asyncio.gather(rank_task, receive_task)
                 _validate_rank_publications(records, generation, self.trainer)
                 checkpoint, tensor_bytes, config_bytes = _validate_received(
                     received, generation, targets
+                )
+                transport_metrics = _adapter_transport_metrics(
+                    received,
+                    wait_s=transport_wait_s,
                 )
             except BaseException as error:
                 for task in (rank_task, receive_task):
@@ -446,14 +454,9 @@ class MegatronPairedInferencePublisher:
                     ),
                     lora=runtime_lora_name,
                     metrics={
-                        POLICY_ACTIVATION_LAG_METRIC: lag.activation_lag_s,
-                        "publication/adapter_transport_bytes": float(
-                            tensor_bytes * len(received)
-                        ),
-                        "publication/adapter_materialization_s": max(
-                            float(item.materialization_s) for item in received
-                        ),
                         **publication_metrics,
+                        **transport_metrics,
+                        POLICY_ACTIVATION_LAG_METRIC: lag.activation_lag_s,
                     },
                 ),
             )
@@ -1015,6 +1018,54 @@ def _validate_received(
         raise RuntimeError("inference hosts materialized different adapters")
     tensor_bytes, config_bytes = sizes.pop()
     return paths.pop(), tensor_bytes, config_bytes
+
+
+async def _wait_adapter_transfer(
+    manager: Any,
+    generation_id: str,
+) -> tuple[tuple[AdapterReceiveResult, ...], float]:
+    started = time.monotonic()
+    received = await manager.wait_adapter_transfer(generation_id)
+    return received, time.monotonic() - started
+
+
+def _adapter_transport_metrics(
+    received: tuple[AdapterReceiveResult, ...],
+    *,
+    wait_s: float,
+) -> dict[str, float]:
+    capacity_bytes = sum(item.capacity_bytes for item in received)
+    used_bytes = sum(item.used_bytes for item in received)
+    if capacity_bytes <= 0 or used_bytes <= 0 or used_bytes > capacity_bytes:
+        raise RuntimeError("paired adapter transfer returned invalid capacity evidence")
+    return {
+        "publication/adapter_transport_bytes": float(
+            sum(item.tensor_bytes for item in received)
+        ),
+        "publication/adapter_transport_capacity_bytes": float(capacity_bytes),
+        "publication/adapter_transport_capacity_utilization": (
+            used_bytes / capacity_bytes
+        ),
+        "publication/adapter_transport_wait_s": wait_s,
+        "publication/adapter_transport_pool_wait_s": max(
+            item.pool_wait_s for item in received
+        ),
+        "publication/adapter_transport_prepare_s": max(
+            item.prepare_s for item in received
+        ),
+        "publication/adapter_transport_registration_s": max(
+            item.registration_s for item in received
+        ),
+        "publication/adapter_transport_sender_staging_s": max(
+            item.sender_staging_s for item in received
+        ),
+        "publication/adapter_transport_sender_registration_s": max(
+            item.sender_registration_s for item in received
+        ),
+        "publication/adapter_materialization_s": max(
+            item.materialization_s for item in received
+        ),
+    }
 
 
 def _validate_external_received(
