@@ -179,6 +179,30 @@ def _token_tp_collective(f: LayoutFeatures, m: ScoringFacts) -> int:
     return f.packed_tokens * m.layers * (tp - 1) * WORK_PER_US // tp
 
 
+def _attention_layers(m: ScoringFacts) -> int:
+    return max(0, m.layers - m.gdn_layers)
+
+
+def _attention_token_per_rank(f: LayoutFeatures, m: ScoringFacts) -> int:
+    return f.packed_tokens * _attention_layers(m) * WORK_PER_US // _ranks(m)
+
+
+def _gdn_token_per_rank(f: LayoutFeatures, m: ScoringFacts) -> int:
+    return f.packed_tokens * m.gdn_layers * WORK_PER_US // _ranks(m)
+
+
+def _attention_token_cp_exchange(f: LayoutFeatures, m: ScoringFacts) -> int:
+    """Attention KV exchanged across CP ranks scales with rows and (cp - 1)."""
+
+    cp = max(1, m.cp_size)
+    return f.packed_tokens * _attention_layers(m) * (cp - 1) * WORK_PER_US // cp
+
+
+def _attention_token_tp_collective(f: LayoutFeatures, m: ScoringFacts) -> int:
+    tp = max(1, m.tp_size)
+    return f.packed_tokens * _attention_layers(m) * (tp - 1) * WORK_PER_US // tp
+
+
 def _segment_per_layer(f: LayoutFeatures, m: ScoringFacts) -> int:
     return f.segment_count * m.layers * WORK_PER_US
 
@@ -189,6 +213,18 @@ def _segment_cross_rank_per_layer(f: LayoutFeatures, m: ScoringFacts) -> int:
 
 def _segment_per_rank(f: LayoutFeatures, m: ScoringFacts) -> int:
     return f.segment_count * m.layers * WORK_PER_US // _ranks(m)
+
+
+def _gdn_segment_per_layer(f: LayoutFeatures, m: ScoringFacts) -> int:
+    """Per-segment work specific to GDN layers (state buckets per segment)."""
+
+    return f.segment_count * m.gdn_layers * WORK_PER_US
+
+
+def _gdn_small_segment_per_layer(f: LayoutFeatures, m: ScoringFacts) -> int:
+    return (
+        f.below(SMALL_SEGMENT_TOKENS * max(1, m.cp_size)) * m.gdn_layers * WORK_PER_US
+    )
 
 
 def _small_segment_per_layer(f: LayoutFeatures, m: ScoringFacts) -> int:
@@ -263,9 +299,15 @@ TERM_FUNCTIONS = {
     "token_per_rank": _token_per_rank,
     "token_cp_exchange": _token_cp_exchange,
     "token_tp_collective": _token_tp_collective,
+    "attention_token_per_rank": _attention_token_per_rank,
+    "gdn_token_per_rank": _gdn_token_per_rank,
+    "attention_token_cp_exchange": _attention_token_cp_exchange,
+    "attention_token_tp_collective": _attention_token_tp_collective,
     "segment_per_layer": _segment_per_layer,
     "segment_cross_rank_per_layer": _segment_cross_rank_per_layer,
     "segment_per_rank": _segment_per_rank,
+    "gdn_segment_per_layer": _gdn_segment_per_layer,
+    "gdn_small_segment_per_layer": _gdn_small_segment_per_layer,
     "small_segment_per_layer": _small_segment_per_layer,
     "tiny_segment_per_layer": _tiny_segment_per_layer,
     "short_tokens_per_rank": _short_tokens_per_rank,
@@ -311,25 +353,31 @@ def score_terms(
 # ``TERM_FUNCTIONS`` one to one.
 COEFFICIENT_SCALE_PER_US = 1_000
 COEFFICIENTS_MILLI_US: dict[str, int] = {
-    "token_per_rank": 2969,
-    "token_cp_exchange": 94,
-    "token_tp_collective": 333,
-    "segment_per_layer": 161336,
-    "segment_per_rank": 1656312,
+    "token_per_rank": 727,
+    "token_cp_exchange": 0,
+    "token_tp_collective": 109,
+    "attention_token_per_rank": 0,
+    "gdn_token_per_rank": 460,
+    "attention_token_cp_exchange": 0,
+    "attention_token_tp_collective": 123,
+    "segment_per_layer": 0,
+    "segment_per_rank": 0,
     "segment_cross_rank_per_layer": 0,
-    "small_segment_per_layer": 217125,
-    "tiny_segment_per_layer": 209913,
-    "short_tokens_per_rank": 0,
-    "tiny_tokens_per_rank": 12,
+    "gdn_segment_per_layer": 0,
+    "gdn_small_segment_per_layer": 0,
+    "small_segment_per_layer": 0,
+    "tiny_segment_per_layer": 208734,
+    "short_tokens_per_rank": 66,
+    "tiny_tokens_per_rank": 0,
     "level_per_layer": 0,
-    "level_cp_per_layer": 0,
-    "level_tp_per_layer": 0,
-    "gdn_level": 1397395,
-    "gdn_level_cp": 1240186,
-    "gdn_level_tp": 637635,
+    "level_cp_per_layer": 50090,
+    "level_tp_per_layer": 137926,
+    "gdn_level": 1356526,
+    "gdn_level_cp": 0,
+    "gdn_level_tp": 564315,
     "gdn_fanout": 0,
     "gdn_fanout_cross_rank": 0,
-    "shared_tokens_per_rank": 117,
+    "shared_tokens_per_rank": 0,
     "attention_area_per_rank": 0,
 }
 assert set(COEFFICIENTS_MILLI_US) == set(TERM_FUNCTIONS)
