@@ -1,8 +1,7 @@
 import inspect
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
-
-from art.megatron import train
 
 
 class _Schedule:
@@ -24,6 +23,8 @@ class _Schedule:
 def test_training_schedule_does_not_create_or_gather_profiler_state(
     monkeypatch,
 ) -> None:
+    from art.megatron import train
+
     def unexpected(*_args: Any, **_kwargs: Any) -> None:
         raise AssertionError("production schedule attempted a profiler collective")
 
@@ -37,3 +38,19 @@ def test_training_schedule_does_not_create_or_gather_profiler_state(
     assert "inter_forward_backward_timing" not in train.TrainingRuntime.model_fields
     assert "new_group" not in inspect.getsource(train.build_training_runtime)
     assert "all_gather" not in inspect.getsource(train._run_training_schedule)
+
+
+def test_pipeline_schedule_keeps_detailed_profiler_out_of_production() -> None:
+    source = (
+        Path(__file__).parents[4] / "src/art/megatron/training/pipeline_schedule.py"
+    ).read_text()
+
+    assert '"pipeline/schedule_wall_s"' in source
+    for forbidden in (
+        "all_gather_into_tensor",
+        "_TimedP2PCommunicator",
+        "torch.cuda.Event",
+        "reset_peak_memory_stats",
+        "max_memory_allocated",
+    ):
+        assert forbidden not in source
