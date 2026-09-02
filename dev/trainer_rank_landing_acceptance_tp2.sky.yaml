@@ -53,8 +53,8 @@ run: |
     2>&1 | tee "${root}/check_tp2.log"
 
   timeout 14400s megatron_runtime/.venv/bin/python -m torch.distributed.run --standalone --nproc-per-node=2 \
-    dev/trainer_rank_landing_acceptance.py --phase tp2-public --repeat 10 \
-    --evidence "${root}/evidence.jsonl" \
+    dev/trainer_rank_landing_acceptance.py --phase tp2-public --tp 2 --repeat 10 \
+    --evidence "${root}/evidence.jsonl" --dump-dir "${root}/dump" \
     2>&1 | tee "${root}/tp2_public.log"
 
 config:

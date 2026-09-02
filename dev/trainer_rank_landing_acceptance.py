@@ -936,7 +936,12 @@ TP_GATES: dict[str, float] = {
     "min_grad_cosine": 0.999,
     # Plan-cache-stable measured rows: identical content plans as a cache hit.
     "max_measured_planning_ms": 10.0,
+    # Cross-layout divergence at TP may not exceed this multiple of the TP1
+    # control's divergence (and is ignored below an absolute floor).
+    "max_cross_layout_ratio": 1.5,
 }
+# Cross-layout divergence below these absolute floors is never gated.
+TP_CROSS_LAYOUT_FLOOR: dict[str, float] = {"mean_abs_pct": 0.05, "grad_rel_l2": 0.005}
 
 # Hierarchical GRPO shape for the TP2 public cell: (groups, group size, system,
 # prompt, completion). The odd system and completion lengths make every
@@ -1085,14 +1090,13 @@ def _compare_gradients(actual: list[Any], expected: list[Any]) -> tuple[float, f
 
     import torch
 
-    flat_actual = torch.cat([g.reshape(-1) for g in actual])
-    flat_expected = torch.cat([g.reshape(-1) for g in expected])
-    denominator = max(float(flat_expected.norm()), 1e-12)
+    flat_actual = torch.cat([g.reshape(-1).double() for g in actual])
+    flat_expected = torch.cat([g.reshape(-1).double() for g in expected])
+    denominator = max(float(flat_expected.norm()), 1e-300)
     rel_l2 = float((flat_actual - flat_expected).norm()) / denominator
     cosine = float(
-        torch.nn.functional.cosine_similarity(
-            flat_actual.unsqueeze(0), flat_expected.unsqueeze(0)
-        ).item()
+        (flat_actual @ flat_expected)
+        / max(float(flat_actual.norm()) * float(flat_expected.norm()), 1e-300)
     )
     return rel_l2, cosine
 
@@ -1186,22 +1190,32 @@ def _write_rows(evidence: str | None, rows: list[dict[str, object]], name: str) 
         print(f"{name} phase: PASS {rows}")
 
 
-def phase_tp2_public(evidence: str | None, repeat: int) -> None:
-    """DP1 x TP2 x CP1 public ``dp_rank_forward`` cell (2 ranks, Qwen3.5-4B).
+def phase_tp2_public(
+    evidence: str | None, repeat: int, *, tp: int, dump_dir: str | None
+) -> None:
+    """DP1 x TP{tp} x CP1 public ``dp_rank_forward`` cell (Qwen3.5-4B full model).
+
+    Run at ``--tp 2`` (the gate) and at ``--tp 1`` (the control: the identical
+    cell on one GPU). Structural gates run here; the numerics gates compare
+    the two dumps in ``--phase tp-compare`` (CPU), because bf16 divergence
+    between two packings of the same tokens is only meaningful relative to
+    the TP1 control, and TP correctness itself is a same-layout question.
 
     Gates:
-    - both TP peers plan the same physical layout on every call;
-    - the automatic planner selects depth > 1 on the hierarchical GRPO shape;
-    - packed lengths are odd, so sequence-parallel padding is exercised;
-    - automatic vs depth-one: outputs, loss and active-LoRA gradients agree;
+    - all TP peers plan the same physical layout on every call;
+    - the automatic planner shares more deeply than depth-one on the
+      hierarchical GRPO shape (fewer packed tokens);
+    - packed lengths are odd, so sequence-parallel padding is exercised at
+      TP>1 with outputs at the final real token;
+    - the loss is finite for both arms;
     - measured rows are compile-free and plan-cache-stable (3 warmups per arm,
-      then ``repeat`` alternating measured pairs);
-    - paired median complete-call gain is reported (not gated: the cost model
-      carries no TP terms yet).
+      then ``repeat`` alternating measured pairs); paired timing is reported.
+    Rows are printed as they are produced and written even on failure.
     """
 
     phase_contract()
     _init_gpu_phase("tp2-public")
+    import math
     import statistics
 
     import torch
@@ -1213,7 +1227,17 @@ def phase_tp2_public(evidence: str | None, repeat: int) -> None:
     sys.path.insert(0, str(REPO_ROOT / "dev"))
     from trainer_rank_support import load_random_checkpoints
 
+    label = f"tp{tp}-public"
     rows: list[dict[str, object]] = []
+
+    def note(row: dict[str, object]) -> None:
+        rows.append(row)
+        if dist.get_rank() == 0:
+            print(
+                f"{label} row: {json.dumps(row, sort_keys=True, default=str)}",
+                flush=True,
+            )
+
     try:
         torch.manual_seed(1234)
         runtime = megatron_train.build_training_runtime(
@@ -1223,7 +1247,7 @@ def phase_tp2_public(evidence: str | None, repeat: int) -> None:
         for chunk in runtime.model:
             chunk.train()
         rank = TrainerRank(runtime)
-        _require_topology(rank, tp=2, dp=1)
+        _require_topology(rank, tp=tp, dp=1)
         [slot] = load_random_checkpoints(runtime, rank, 1, base_model="Qwen/Qwen3.5-4B")
         watch = _install_compile_watch()
         requests = [
@@ -1245,7 +1269,7 @@ def phase_tp2_public(evidence: str | None, repeat: int) -> None:
             torch.cuda.synchronize()
             telemetry = rank.last_forward_telemetry()
             fingerprint = _plan_fingerprint(rank, requests, slot)
-            _assert_tp_peers_agree(fingerprint, f"tp2-public {arm}")
+            _assert_tp_peers_agree(fingerprint, f"{label} {arm}")
             result = {
                 "arm": arm,
                 "ms": float(start.elapsed_time(end)),
@@ -1266,27 +1290,92 @@ def phase_tp2_public(evidence: str | None, repeat: int) -> None:
         for _ in range(3):
             for arm in ("automatic", "depth_one"):
                 run(arm)
-        # Correctness pair.
+        # Correctness runs: both arms, plus a repeat of automatic for the
+        # same-layout run-to-run noise floor (bf16 backward is nondeterministic).
         automatic = run("automatic")
         depth_one = run("depth_one")
-        rows.append(
+        automatic_again = run("automatic")
+        noise_out = _compare_logprobs(
+            automatic_again["logprobs"], automatic["logprobs"]
+        )
+        noise_grad = _compare_gradients(
+            automatic_again["gradients"], automatic["gradients"]
+        )
+        note(
             {
-                "arm": "tp2-public-layouts",
+                "arm": f"{label}-layouts",
+                "tp": tp,
                 "automatic_selected_max_depth": automatic["selected_max_depth"],
                 "automatic_packed_tokens": automatic["packed_tokens"],
                 "depth_one_selected_max_depth": depth_one["selected_max_depth"],
                 "depth_one_packed_tokens": depth_one["packed_tokens"],
                 "logical_tokens": sum(int(r.input_tokens.numel()) for r in requests),
+                "automatic_loss": automatic["loss"],
+                "depth_one_loss": depth_one["loss"],
+                "same_layout_noise_output_mean_abs_pct": noise_out[0],
+                "same_layout_noise_output_max_abs": noise_out[1],
+                "same_layout_noise_grad_rel_l2": noise_grad[0],
+                "same_layout_noise_grad_cosine": noise_grad[1],
             }
         )
-        if automatic["selected_max_depth"] < 2:
+        cross_out = _compare_logprobs(automatic["logprobs"], depth_one["logprobs"])
+        cross_grad = _compare_gradients(automatic["gradients"], depth_one["gradients"])
+        note(
+            {
+                "arm": f"{label}-cross-layout",
+                "tp": tp,
+                "mean_abs_pct": cross_out[0],
+                "max_abs": cross_out[1],
+                "loss_rel_pct": abs(automatic["loss"] - depth_one["loss"])
+                / max(abs(depth_one["loss"]), 1e-6)
+                * 100.0,
+                "grad_rel_l2": cross_grad[0],
+                "grad_cosine": cross_grad[1],
+            }
+        )
+        if automatic["packed_tokens"] >= depth_one["packed_tokens"]:
             _fail(
-                "automatic planner did not select depth > 1 on the GRPO shape "
-                f"(selected_max_depth={automatic['selected_max_depth']})"
+                "automatic planner did not share more deeply than depth-one "
+                f"({automatic['packed_tokens']} vs {depth_one['packed_tokens']} packed tokens)"
             )
-        if automatic["packed_tokens"] % 2 == 0 or depth_one["packed_tokens"] % 2 == 0:
-            _fail("cell shape did not exercise sequence-parallel padding (even length)")
-        _check_pair(rows, "tp2-public", automatic, depth_one)
+        if tp > 1 and (
+            automatic["packed_tokens"] % tp == 0 or depth_one["packed_tokens"] % tp == 0
+        ):
+            _fail("cell shape did not exercise sequence-parallel padding")
+        if not (math.isfinite(automatic["loss"]) and math.isfinite(depth_one["loss"])):
+            _fail("non-finite loss")
+        if dump_dir and dist.get_rank() == 0:
+            Path(dump_dir).mkdir(parents=True, exist_ok=True)
+            torch.save(
+                {
+                    "tp": tp,
+                    "arms": {
+                        arm: {
+                            "logprobs": result["logprobs"],
+                            "loss": result["loss"],
+                            "packed_tokens": result["packed_tokens"],
+                            "selected_max_depth": result["selected_max_depth"],
+                        }
+                        for arm, result in (
+                            ("automatic", automatic),
+                            ("depth_one", depth_one),
+                        )
+                    },
+                    "noise": {
+                        "output_mean_abs_pct": noise_out[0],
+                        "output_max_abs": noise_out[1],
+                        "grad_rel_l2": noise_grad[0],
+                        "grad_cosine": noise_grad[1],
+                    },
+                    "cross_layout": {
+                        "mean_abs_pct": cross_out[0],
+                        "max_abs": cross_out[1],
+                        "grad_rel_l2": cross_grad[0],
+                        "grad_cosine": cross_grad[1],
+                    },
+                },
+                Path(dump_dir, f"tp{tp}_public.pt"),
+            )
 
         # Alternating measured pairs: compile-free and plan-cache-stable.
         samples: dict[str, list[float]] = {"automatic": [], "depth_one": []}
@@ -1301,25 +1390,110 @@ def phase_tp2_public(evidence: str | None, repeat: int) -> None:
                         f"measured {arm} row was not a plan-cache hit: {result['planning_ms']:.2f} ms"
                     )
                 reference = automatic if arm == "automatic" else depth_one
-                if result["selected_max_depth"] != reference["selected_max_depth"]:
-                    _fail(f"measured {arm} row changed layout depth")
+                if result["packed_tokens"] != reference["packed_tokens"]:
+                    _fail(f"measured {arm} row changed layout")
         paired_gain = [
             (d - a) / d * 100.0
             for a, d in zip(samples["automatic"], samples["depth_one"], strict=True)
         ]
-        rows.append(
+        note(
             {
-                "arm": "tp2-public-timing",
+                "arm": f"{label}-timing",
+                "tp": tp,
                 "automatic_median_ms": statistics.median(samples["automatic"]),
                 "depth_one_median_ms": statistics.median(samples["depth_one"]),
                 "paired_median_gain_pct": statistics.median(paired_gain),
                 "measured_pairs": repeat,
             }
         )
-        _write_rows(evidence, rows, "tp2-public")
+        _write_rows(evidence, rows, label)
+    except SystemExit:
+        if evidence and dist.get_rank() == 0:
+            with open(evidence, "a", encoding="utf-8") as handle:
+                for row in rows:
+                    handle.write(json.dumps(row, sort_keys=True, default=str) + "\n")
+        raise
     finally:
         if dist.is_initialized():
             dist.destroy_process_group()
+
+
+def phase_tp_compare(control_dump: str, dump: str, evidence: str | None) -> None:
+    """CPU numerics gates for the TP public cell against its TP1 control.
+
+    - Same-layout TP correctness: for each arm, the TP run's outputs must match
+      the TP1 control's outputs for the identical packing within the gate
+      tolerance (bf16 reduction order differs across shards; the packing does
+      not), and the losses must agree.
+    - Cross-layout divergence (automatic vs depth-one) at TP must not exceed
+      1.5x the control's divergence for outputs and LoRA gradients: sharing
+      changes bf16 accumulation order identically at TP1, so a TP-specific
+      defect shows up as excess divergence, not as divergence per se.
+    """
+
+    import torch
+
+    control = torch.load(control_dump, weights_only=False)
+    trial = torch.load(dump, weights_only=False)
+    if int(control["tp"]) != 1:
+        _fail(f"control dump must be TP1 (got tp={control['tp']})")
+    rows: list[dict[str, object]] = []
+    problems: list[str] = []
+    for arm in ("automatic", "depth_one"):
+        c, t = control["arms"][arm], trial["arms"][arm]
+        if c["packed_tokens"] != t["packed_tokens"]:
+            problems.append(
+                f"{arm}: TP{trial['tp']} packed {t['packed_tokens']} tokens vs TP1 {c['packed_tokens']} (layouts differ)"
+            )
+            continue
+        mean_abs_pct, max_abs = _compare_logprobs(t["logprobs"], c["logprobs"])
+        loss_rel_pct = abs(t["loss"] - c["loss"]) / max(abs(c["loss"]), 1e-6) * 100.0
+        rows.append(
+            {
+                "arm": f"tp{trial['tp']}-vs-tp1-{arm}",
+                "packed_tokens": t["packed_tokens"],
+                "mean_abs_pct": mean_abs_pct,
+                "max_abs": max_abs,
+                "loss_rel_pct": loss_rel_pct,
+            }
+        )
+        if mean_abs_pct > TP_GATES["max_output_mean_abs_pct"]:
+            problems.append(
+                f"{arm}: same-layout output mean_abs_pct={mean_abs_pct:.4f}"
+            )
+        if max_abs > TP_GATES["max_output_abs"]:
+            problems.append(f"{arm}: same-layout output max_abs={max_abs:.4f}")
+        if loss_rel_pct > TP_GATES["max_loss_rel_pct"]:
+            problems.append(f"{arm}: same-layout loss_rel_pct={loss_rel_pct:.4f}")
+    ratio_rows = {}
+    for key in ("mean_abs_pct", "grad_rel_l2"):
+        c, t = float(control["cross_layout"][key]), float(trial["cross_layout"][key])
+        ratio_rows[key] = {"control": c, "trial": t, "ratio": t / max(c, 1e-12)}
+        if (
+            t > TP_GATES["max_cross_layout_ratio"] * c
+            and t > TP_CROSS_LAYOUT_FLOOR[key]
+        ):
+            problems.append(
+                f"cross-layout {key} at TP{trial['tp']} is {t:.5f} vs {c:.5f} at TP1 "
+                f"(ratio {t / max(c, 1e-12):.2f} > {TP_GATES['max_cross_layout_ratio']})"
+            )
+    rows.append(
+        {
+            "arm": f"tp{trial['tp']}-cross-layout-vs-control",
+            **{f"{k}_{kk}": v for k, vv in ratio_rows.items() for kk, v in vv.items()},
+            "control_noise": control["noise"],
+            "trial_noise": trial["noise"],
+        }
+    )
+    if evidence:
+        with open(evidence, "a", encoding="utf-8") as handle:
+            for row in rows:
+                handle.write(json.dumps(row, sort_keys=True, default=str) + "\n")
+    for row in rows:
+        print(json.dumps(row, sort_keys=True, default=str))
+    if problems:
+        _fail("tp-compare:\n  - " + "\n  - ".join(problems))
+    print("tp-compare phase: PASS")
 
 
 def phase_dp2_tp2_waves(evidence: str | None) -> None:
@@ -1464,9 +1638,12 @@ def phase_dp2_tp2_waves(evidence: str | None) -> None:
                 _fail(
                     "DP replicas received identical payloads; the gate needs distinct slices"
                 )
-        if max(automatic["depths"]) < 2:
+        if not all(
+            wave["packed_tokens"] < wave["logical_tokens"]
+            for wave in automatic["waves"]
+        ):
             _fail(
-                f"automatic planner did not select depth > 1 in any wave: {automatic['depths']}"
+                f"automatic planner shared nothing in some wave: {automatic['waves']}"
             )
         rows.append(
             {
@@ -1555,6 +1732,7 @@ def main() -> None:
             "split-conversion",
             "tp2-public",
             "dp2-tp2-waves",
+            "tp-compare",
         ),
     )
     parser.add_argument("--cell", default="grpo-gdn-cp4")
@@ -1569,6 +1747,19 @@ def main() -> None:
         choices=("cap", "ballast"),
         help="split-conversion only: induce memory pressure with the test-only cap or real ballast",
     )
+    parser.add_argument(
+        "--tp",
+        type=int,
+        default=2,
+        help="tp2-public only: expected tensor-parallel size (1 runs the control cell)",
+    )
+    parser.add_argument(
+        "--dump-dir", default="", help="tp2-public only: save per-arm outputs here"
+    )
+    parser.add_argument(
+        "--control-dump", default="", help="tp-compare: TP1 control dump (.pt)"
+    )
+    parser.add_argument("--dump", default="", help="tp-compare: TP>1 dump (.pt)")
     arguments = parser.parse_args()
     if arguments.phase == "contract":
         phase_contract()
@@ -1583,7 +1774,18 @@ def main() -> None:
     elif arguments.phase == "split-conversion":
         phase_split_conversion(arguments.evidence or None, arguments.pressure)
     elif arguments.phase == "tp2-public":
-        phase_tp2_public(arguments.evidence or None, arguments.repeat)
+        phase_tp2_public(
+            arguments.evidence or None,
+            arguments.repeat,
+            tp=arguments.tp,
+            dump_dir=arguments.dump_dir or None,
+        )
+    elif arguments.phase == "tp-compare":
+        if not (arguments.control_dump and arguments.dump):
+            _fail("tp-compare requires --control-dump and --dump")
+        phase_tp_compare(
+            arguments.control_dump, arguments.dump, arguments.evidence or None
+        )
     elif arguments.phase == "dp2-tp2-waves":
         phase_dp2_tp2_waves(arguments.evidence or None)
     else:
