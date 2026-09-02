@@ -78,6 +78,7 @@ from .specs import (
     GpuId,
     GpuPlacement,
     HostServiceHealth,
+    LocalTransferEndpoint,
     ModelServiceSpec,
     NixlTransportSpec,
     PairedTransferIdentity,
@@ -403,6 +404,16 @@ class ArtRuntime:
         if transport not in {"holder_local", "caios_lota"}:
             raise RuntimeError("route reader returned an unsupported transport")
         return transport
+
+    @property
+    def retained_route_source(self) -> LocalTransferEndpoint | None:
+        if self.retained_route_transport != "holder_local":
+            return None
+        assert self._route_bundle_reader is not None
+        source = self._route_bundle_reader.local_transfer_endpoint
+        if source is None:
+            raise RuntimeError("holder route reader omitted its physical endpoint")
+        return source
 
     async def _resolve_nixl_transport(self) -> None:
         transport = self._nixl_transport
@@ -877,12 +888,14 @@ class ArtRuntime:
             )
 
         paired = self._paired_transfer_identity()
-        targets = {endpoint.host_id: endpoint for endpoint in paired.trainer_endpoints}
-        if target_host_id not in targets:
-            raise RuntimeError("route packing target is not a paired trainer endpoint")
-        if self._route_bundle_reader.local_transfer_endpoint != paired.route_source:
-            raise RuntimeError("holder route reader differs from its inference source")
-        if paired.backend == "nixl":
+        route_source = paired.route_source
+        if (
+            route_source is None
+            or self._route_bundle_reader.local_transfer_endpoint != route_source
+        ):
+            raise RuntimeError("holder route reader changed its physical source")
+        route_backend = paired.route_backend(target_host_id)
+        if route_backend == "nixl":
             if self._nixl_transport is None:
                 raise RuntimeError("cross-domain holder routes require NIXL transport")
             return await publish_retained_route_bundle_nixl_transfer(
@@ -905,7 +918,7 @@ class ArtRuntime:
             local_retained_route_bundle_transfer(
                 refs,
                 views,
-                local_transfer_root=paired.route_source.root,
+                local_transfer_root=route_source.root,
             ),
             None,
         )
@@ -921,7 +934,7 @@ class ArtRuntime:
             tuple(rank.host_id for rank in trainer.ranks),
             tuple(member.host_id for member in service.members),
             lora_source_host_id=coordinator.host_id,
-            route_source_host_id=service.members[0].host_id,
+            route_source=self.retained_route_source,
         )
 
     async def pack(self, request: PackingRequest) -> DistributedPackedBatch | None:

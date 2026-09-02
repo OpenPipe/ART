@@ -49,9 +49,9 @@ class LocalTransferEndpoint(_Spec):
 
 
 class PairedTransferIdentity(_Spec):
-    """Exact trainer/inference topology selecting both paired transfer legs."""
+    """Exact endpoints and independently selected paired transfer legs."""
 
-    backend: Literal["local", "nixl"]
+    lora_backend: Literal["local", "nixl"]
     trainer_endpoints: tuple[LocalTransferEndpoint, ...] = Field(
         min_length=1, max_length=256
     )
@@ -59,7 +59,8 @@ class PairedTransferIdentity(_Spec):
         min_length=1, max_length=256
     )
     lora_source_host_id: str = Field(min_length=1, max_length=255)
-    route_source_host_id: str = Field(min_length=1, max_length=255)
+    route_source: LocalTransferEndpoint | None = None
+    route_delivery: Literal["none", "local", "nixl", "mixed"] = "none"
 
     @model_validator(mode="after")
     def _validate_topology(self) -> "PairedTransferIdentity":
@@ -70,17 +71,16 @@ class PairedTransferIdentity(_Spec):
             endpoint.host_id for endpoint in self.trainer_endpoints
         }:
             raise ValueError("LoRA source must be a trainer endpoint")
-        if self.route_source_host_id not in {
-            endpoint.host_id for endpoint in self.inference_endpoints
-        }:
-            raise ValueError("route source must be an inference endpoint")
         identities = {
             (endpoint.domain, endpoint.root)
             for endpoint in self.trainer_endpoints + self.inference_endpoints
         }
         expected = "local" if len(identities) == 1 else "nixl"
-        if self.backend != expected:
-            raise ValueError("paired transfer backend differs from its endpoints")
+        if self.lora_backend != expected:
+            raise ValueError("LoRA transfer backend differs from its endpoints")
+        expected_delivery = _route_delivery(self.route_source, self.trainer_endpoints)
+        if self.route_delivery != expected_delivery:
+            raise ValueError("route delivery differs from its physical endpoints")
         return self
 
     @property
@@ -91,13 +91,40 @@ class PairedTransferIdentity(_Spec):
             if endpoint.host_id == self.lora_source_host_id
         )
 
-    @property
-    def route_source(self) -> LocalTransferEndpoint:
-        return next(
-            endpoint
-            for endpoint in self.inference_endpoints
-            if endpoint.host_id == self.route_source_host_id
-        )
+    def route_backend(self, target_host_id: str) -> Literal["local", "nixl"]:
+        if self.route_source is None:
+            raise RuntimeError("paired transfer has no holder route source")
+        try:
+            target = next(
+                endpoint
+                for endpoint in self.trainer_endpoints
+                if endpoint.host_id == target_host_id
+            )
+        except StopIteration:
+            raise RuntimeError("route target is not a trainer endpoint") from None
+        return _local_transfer_backend(self.route_source, target)
+
+
+def _local_transfer_backend(
+    source: LocalTransferEndpoint, target: LocalTransferEndpoint
+) -> Literal["local", "nixl"]:
+    return (
+        "local"
+        if (source.domain, source.root) == (target.domain, target.root)
+        else "nixl"
+    )
+
+
+def _route_delivery(
+    source: LocalTransferEndpoint | None,
+    targets: tuple[LocalTransferEndpoint, ...],
+) -> Literal["none", "local", "nixl", "mixed"]:
+    if source is None:
+        return "none"
+    backends = {_local_transfer_backend(source, target) for target in targets}
+    if len(backends) == 1:
+        return backends.pop()
+    return "mixed"
 
 
 class HostSpec(_Spec):
@@ -272,19 +299,24 @@ class ClusterSpec(_Spec):
         inference_host_ids: Sequence[str],
         *,
         lora_source_host_id: str,
-        route_source_host_id: str,
+        route_source: LocalTransferEndpoint | None,
     ) -> PairedTransferIdentity:
         trainer = self.local_transfer_endpoints(trainer_host_ids)
         inference = self.local_transfer_endpoints(inference_host_ids)
+        if route_source is not None:
+            canonical_source = self.local_transfer_endpoints((route_source.host_id,))[0]
+            if route_source != canonical_source:
+                raise ValueError("route source differs from its cluster endpoint")
         identities = {
             (endpoint.domain, endpoint.root) for endpoint in trainer + inference
         }
         return PairedTransferIdentity(
-            backend="local" if len(identities) == 1 else "nixl",
+            lora_backend="local" if len(identities) == 1 else "nixl",
             trainer_endpoints=trainer,
             inference_endpoints=inference,
             lora_source_host_id=lora_source_host_id,
-            route_source_host_id=route_source_host_id,
+            route_source=route_source,
+            route_delivery=_route_delivery(route_source, trainer),
         )
 
     def gpu_placements(

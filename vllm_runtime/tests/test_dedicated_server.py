@@ -186,7 +186,7 @@ async def test_serving_profile_reports_resolved_runtime_geometry(monkeypatch) ->
         "trainer_dtype": "bfloat16",
         "route_replay": True,
         "paired_transfer": {
-            "backend": "nixl",
+            "lora_backend": "nixl",
             "trainer_endpoints": [
                 {"host_id": "trainer", "domain": "trainer", "root": "/dev/shm"}
             ],
@@ -198,11 +198,16 @@ async def test_serving_profile_reports_resolved_runtime_geometry(monkeypatch) ->
                 }
             ],
             "lora_source_host_id": "trainer",
-            "route_source_host_id": "inference",
+            "route_source": {
+                "host_id": "trainer",
+                "domain": "trainer",
+                "root": "/dev/shm",
+            },
+            "route_delivery": "local",
         },
         "lora_transport": "nixl",
         "retained_route_transport": "holder_local",
-        "retained_route_delivery": "nixl",
+        "retained_route_delivery": "local",
         "retained_route_max_bytes": 4096,
         "retained_route_max_bundles": 4,
     }

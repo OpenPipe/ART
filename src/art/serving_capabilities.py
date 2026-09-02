@@ -15,7 +15,7 @@ from pydantic import (
 from art.distributed.specs import PairedTransferIdentity
 from art.runtime_attestation import RuntimeArchitectureAttestation
 
-ART_SERVING_PROTOCOL_VERSION = 13
+ART_SERVING_PROTOCOL_VERSION = 14
 
 ART_PRIVATE_CACHE_IDENTITY_HEADER = "x-art-cache-identity"
 ART_PRIVATE_REQUEST_IDENTITY_HEADER = "x-art-request-identity"
@@ -84,7 +84,7 @@ class ServingProfileIdentity(BaseModel):
     paired_transfer: PairedTransferIdentity
     lora_transport: Literal["local", "nixl"]
     retained_route_transport: Literal["none", "holder_local", "caios_lota"]
-    retained_route_delivery: Literal["none", "local", "nixl", "caios_lota"]
+    retained_route_delivery: Literal["none", "local", "nixl", "mixed", "caios_lota"]
     retained_route_max_bytes: int = Field(ge=0)
     retained_route_max_bundles: int = Field(ge=0)
 
@@ -99,11 +99,17 @@ class ServingProfileIdentity(BaseModel):
             raise ValueError(
                 "retained route transport and bounds must be present together"
             )
-        if self.lora_transport != self.paired_transfer.backend:
+        if self.lora_transport != self.paired_transfer.lora_backend:
             raise ValueError("LoRA transport differs from paired endpoint topology")
+        if (self.paired_transfer.route_source is not None) != (
+            self.retained_route_transport == "holder_local"
+        ):
+            raise ValueError(
+                "holder route transport and physical source must be present together"
+            )
         expected_delivery = {
             "none": "none",
-            "holder_local": self.paired_transfer.backend,
+            "holder_local": self.paired_transfer.route_delivery,
             "caios_lota": "caios_lota",
         }[self.retained_route_transport]
         if self.retained_route_delivery != expected_delivery:

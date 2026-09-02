@@ -87,7 +87,7 @@ async def test_external_runtime_server_live_smoke(
             trainer_dtype="bfloat16",
             route_replay=False,
             paired_transfer=PairedTransferIdentity(
-                backend="local",
+                lora_backend="local",
                 trainer_endpoints=(
                     LocalTransferEndpoint(
                         host_id="local", domain="local", root="/dev/shm"
@@ -99,7 +99,6 @@ async def test_external_runtime_server_live_smoke(
                     ),
                 ),
                 lora_source_host_id="local",
-                route_source_host_id="local",
             ),
             lora_transport="local",
             retained_route_transport="none",

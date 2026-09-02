@@ -71,33 +71,53 @@ def _route_ref(payload: bytes, locator: str) -> RetainedRouteBundleRef:
     )
 
 
-def _runtime(root: str, *, inference_domain: str) -> ArtRuntime:
-    cluster = ClusterSpec(
-        hosts=(
-            HostSpec(
-                host_id="trainer",
-                node_rank=0,
-                worker_address="tcp://trainer:1",
-                cpu_slots=1,
-                local_transfer_domain="trainer-domain",
-                local_transfer_root=root,
-            ),
-            HostSpec(
-                host_id="inference",
-                node_rank=1,
-                worker_address="tcp://inference:1",
-                cpu_slots=1,
-                local_transfer_domain=inference_domain,
-                local_transfer_root=root,
-            ),
+def _runtime(
+    root: str, *, inference_domain: str, remote_trainer: bool = False
+) -> ArtRuntime:
+    hosts = [
+        HostSpec(
+            host_id="trainer",
+            node_rank=0,
+            worker_address="tcp://trainer:1",
+            cpu_slots=1,
+            local_transfer_domain="trainer-domain",
+            local_transfer_root=root,
         ),
+        HostSpec(
+            host_id="inference",
+            node_rank=1,
+            worker_address="tcp://inference:1",
+            cpu_slots=1,
+            local_transfer_domain=inference_domain,
+            local_transfer_root=root,
+        ),
+    ]
+    if remote_trainer:
+        hosts.append(
+            HostSpec(
+                host_id="trainer-remote",
+                node_rank=2,
+                worker_address="tcp://trainer-remote:1",
+                cpu_slots=1,
+                local_transfer_domain="trainer-remote-domain",
+                local_transfer_root=root,
+            )
+        )
+    cluster = ClusterSpec(
+        hosts=tuple(hosts),
         controller_host_id="trainer",
     )
     runtime = object.__new__(ArtRuntime)
     runtime.topology = SimpleNamespace(
         cluster=cluster,
         trainer=SimpleNamespace(
-            ranks=(SimpleNamespace(host_id="trainer"),), coordinator_rank=0
+            ranks=tuple(
+                SimpleNamespace(host_id=host_id)
+                for host_id in (
+                    ("trainer", "trainer-remote") if remote_trainer else ("trainer",)
+                )
+            ),
+            coordinator_rank=0,
         ),
         model_services=(
             SimpleNamespace(members=(SimpleNamespace(host_id="inference"),)),
@@ -108,7 +128,7 @@ def _runtime(root: str, *, inference_domain: str) -> ArtRuntime:
 
 
 @pytest.mark.asyncio
-async def test_opaque_holder_route_uses_shared_domain_view(tmp_path) -> None:
+async def test_split_inference_uses_controller_local_route_view(tmp_path) -> None:
     payload = b"shared-route"
     path = tmp_path / "bundle.routes"
     path.write_bytes(payload)
@@ -117,15 +137,18 @@ async def test_opaque_holder_route_uses_shared_domain_view(tmp_path) -> None:
     class Reader:
         retained_route_transport = "holder_local"
         local_transfer_endpoint = LocalTransferEndpoint(
-            host_id="inference", domain="trainer-domain", root=str(tmp_path)
+            host_id="trainer", domain="trainer-domain", root=str(tmp_path)
         )
 
         async def resolve_local_view(self, source, *, lease_id):
             assert (source, lease_id) == (ref.object, ref.lease_id)
             return LocalRouteObjectView(source=source, path=str(path))
 
-    runtime = _runtime(str(tmp_path), inference_domain="trainer-domain")
+    runtime = _runtime(str(tmp_path), inference_domain="inference-domain")
     runtime._route_bundle_reader = Reader()
+    paired = runtime._paired_transfer_identity()
+    assert paired.lora_backend == "nixl"
+    assert paired.route_delivery == "local"
     transfer, publisher = await runtime._holder_route_transfer(
         (ref,), batch_id="batch", target_host_id="trainer"
     )
@@ -135,12 +158,12 @@ async def test_opaque_holder_route_uses_shared_domain_view(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_split_domains_with_same_root_select_nixl(tmp_path, monkeypatch) -> None:
+async def test_remote_trainer_route_target_selects_nixl(tmp_path, monkeypatch) -> None:
     ref = _route_ref(b"remote-route", "holder-local:opaque:bundle")
     reader = SimpleNamespace(
         retained_route_transport="holder_local",
         local_transfer_endpoint=LocalTransferEndpoint(
-            host_id="inference", domain="inference-domain", root=str(tmp_path)
+            host_id="trainer", domain="trainer-domain", root=str(tmp_path)
         ),
     )
     called = False
@@ -150,17 +173,22 @@ async def test_split_domains_with_same_root_select_nixl(tmp_path, monkeypatch) -
         called = True
         assert refs == (ref,)
         assert kwargs["reader"] is reader
-        assert kwargs["target_host_id"] == "trainer"
+        assert kwargs["target_host_id"] == "trainer-remote"
         return "nixl-transfer", "source-registration"
 
     monkeypatch.setattr(
         art_runtime_module, "publish_retained_route_bundle_nixl_transfer", publish
     )
-    runtime = _runtime(str(tmp_path), inference_domain="inference-domain")
+    runtime = _runtime(
+        str(tmp_path), inference_domain="inference-domain", remote_trainer=True
+    )
     runtime._route_bundle_reader = reader
+    paired = runtime._paired_transfer_identity()
+    assert paired.route_delivery == "mixed"
+    assert paired.route_backend("trainer-remote") == "nixl"
 
     assert await runtime._holder_route_transfer(
-        (ref,), batch_id="batch", target_host_id="trainer"
+        (ref,), batch_id="batch", target_host_id="trainer-remote"
     ) == ("nixl-transfer", "source-registration")
     assert called
 

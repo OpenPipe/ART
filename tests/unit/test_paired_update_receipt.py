@@ -198,7 +198,7 @@ def _publication(
         ),
         paired_transfer=(
             PairedTransferIdentity(
-                backend="local",
+                lora_backend="local",
                 trainer_endpoints=(
                     LocalTransferEndpoint(
                         host_id="slot", domain="slot", root="/dev/shm"
@@ -210,7 +210,10 @@ def _publication(
                     ),
                 ),
                 lora_source_host_id="slot",
-                route_source_host_id="slot",
+                route_source=LocalTransferEndpoint(
+                    host_id="slot", domain="slot", root="/dev/shm"
+                ),
+                route_delivery="local",
             )
             if mode in {"versioned_lora", "in_flight_lora"}
             else None
@@ -260,7 +263,13 @@ def test_paired_lora_transport_follows_resolved_placement() -> None:
         ),
         controller_host_id="trainer",
     )
-    runtime = SimpleNamespace(topology=SimpleNamespace(cluster=cluster))
+    route_source = LocalTransferEndpoint(
+        host_id="trainer", domain="slot", root="/dev/shm/routes"
+    )
+    runtime = SimpleNamespace(
+        topology=SimpleNamespace(cluster=cluster),
+        retained_route_source=route_source,
+    )
     spec = SimpleNamespace(
         trainer_mesh=SimpleNamespace(
             ranks=(SimpleNamespace(host_id="trainer"),), coordinator_rank=0
@@ -269,9 +278,14 @@ def test_paired_lora_transport_follows_resolved_placement() -> None:
     service = SimpleNamespace(members=(SimpleNamespace(host_id="inference"),))
 
     identity = _paired_transfer_identity(runtime, spec, service)
-    assert _paired_lora_transport(runtime, spec, service) == identity.backend == "local"
+    assert (
+        _paired_lora_transport(runtime, spec, service)
+        == identity.lora_backend
+        == "local"
+    )
     assert identity.lora_source_host_id == "trainer"
-    assert identity.route_source_host_id == "inference"
+    assert identity.route_source == route_source
+    assert identity.route_delivery == "local"
     split_cluster = ClusterSpec(
         hosts=(
             cluster.hosts[0],
@@ -283,10 +297,16 @@ def test_paired_lora_transport_follows_resolved_placement() -> None:
         controller_host_id="trainer",
     )
     identity = _paired_transfer_identity(
-        SimpleNamespace(topology=SimpleNamespace(cluster=split_cluster)), spec, service
+        SimpleNamespace(
+            topology=SimpleNamespace(cluster=split_cluster),
+            retained_route_source=route_source,
+        ),
+        spec,
+        service,
     )
-    assert identity.backend == "nixl"
-    assert identity.route_source.domain == "inference-pod"
+    assert identity.lora_backend == "nixl"
+    assert identity.route_delivery == "local"
+    assert identity.route_backend("trainer") == "local"
 
 
 def test_paired_transport_metrics_preserve_authoritative_receive_evidence() -> None:

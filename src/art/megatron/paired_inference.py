@@ -304,7 +304,7 @@ class MegatronPairedInferencePublisher:
             targets = await manager.prepare_adapter_transfer(
                 generation.generation_id,
                 template_adapter_path,
-                transport=self.endpoint.profile.identity.paired_transfer.backend,
+                transport=self.endpoint.profile.identity.paired_transfer.lora_backend,
             )
             if not targets:
                 raise RuntimeError("paired inference returned no transfer targets")
@@ -1113,10 +1113,10 @@ def _serving_profile_identity(
         trainer_dtype=spec.dtype,
         route_replay=spec.enable_moe_routing_replay,
         paired_transfer=paired_transfer,
-        lora_transport=paired_transfer.backend,
+        lora_transport=paired_transfer.lora_backend,
         retained_route_transport=route_transport,
         retained_route_delivery=(
-            paired_transfer.backend
+            paired_transfer.route_delivery
             if route_transport == "holder_local"
             else route_transport
         ),
@@ -1134,7 +1134,7 @@ def _serving_profile_identity(
 def _paired_lora_transport(
     runtime: ArtRuntime, spec: TrainerRuntimeSpec, service: ModelServiceSpec
 ) -> Literal["local", "nixl"]:
-    return _paired_transfer_identity(runtime, spec, service).backend
+    return _paired_transfer_identity(runtime, spec, service).lora_backend
 
 
 def _paired_transfer_identity(
@@ -1145,7 +1145,7 @@ def _paired_transfer_identity(
         tuple(rank.host_id for rank in spec.trainer_mesh.ranks),
         tuple(member.host_id for member in service.members),
         lora_source_host_id=coordinator.host_id,
-        route_source_host_id=service.members[0].host_id,
+        route_source=runtime.retained_route_source,
     )
 
 

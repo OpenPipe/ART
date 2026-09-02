@@ -48,7 +48,7 @@ from art_vllm_runtime.runtime_usage import (
     runtime_usage_journal,
 )
 
-ART_SERVING_PROTOCOL_VERSION = 13
+ART_SERVING_PROTOCOL_VERSION = 14
 _PRIVATE_CACHE_IDENTITY_HEADER = "x-art-cache-identity"
 _PRIVATE_COMPLETION_PATH = "/art/internal/v1/completions"
 _PRIVATE_DISPATCH_PATH = "/art/internal/v1/chat/completions"

@@ -921,7 +921,7 @@ class DistributedMegatronService:
                 get_step_checkpoint_dir(self.output_dir, 0),
                 transport=_paired_transfer_identity(
                     self.runtime, trainer.runtime_spec, manager.spec
-                ).backend,
+                ).lora_backend,
             )
             if not targets:
                 raise RuntimeError("model service returned no adapter transfer targets")
@@ -2181,10 +2181,10 @@ class DistributedMegatronService:
             trainer_dtype=spec.dtype,
             route_replay=spec.enable_moe_routing_replay,
             paired_transfer=paired_transfer,
-            lora_transport=paired_transfer.backend,
+            lora_transport=paired_transfer.lora_backend,
             retained_route_transport=route_transport,
             retained_route_delivery=(
-                paired_transfer.backend
+                paired_transfer.route_delivery
                 if route_transport == "holder_local"
                 else route_transport
             ),

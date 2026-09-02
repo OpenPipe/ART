@@ -60,10 +60,12 @@ import sys
 import art.distributed as distributed
 assert "art.distributed.art_runtime" not in sys.modules
 from art.distributed import (
-    ArtRuntime, ClusterSpec, NcclTransportSpec, PackingRequest, compile_topology,
+    ArtRuntime, ClusterSpec, LocalTransferEndpoint, NcclTransportSpec,
+    PackingRequest, PairedTransferIdentity, compile_topology,
 )
 assert all(value is not None for value in (
-    ArtRuntime, ClusterSpec, NcclTransportSpec, PackingRequest, compile_topology
+    ArtRuntime, ClusterSpec, LocalTransferEndpoint, NcclTransportSpec,
+    PackingRequest, PairedTransferIdentity, compile_topology
 ))
 assert "monarch" not in sys.modules
 assert "PackingRequest" in distributed.__all__
