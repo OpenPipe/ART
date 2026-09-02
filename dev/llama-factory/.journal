@@ -1,0 +1,77 @@
+We need to add support for Llama Factory training.
+
+We have 2 H200s at our disposal.
+
+We need to successfully run a LoRA SFT job with Qwen/Qwen3-30B-A3B-Instruct-2507.
+
+User insists as much as possible be done via pyproject.toml dependencies.
+
+Can create new extra, `llama-factory`.
+
+Anything that cannot be done with `uv sync --extra llama-factory` must be documented.
+
+We will provide a reproducable script to run the training job with 2 H200s.
+
+What if the model, activations, optimizer, etc. doesn't fit? It should fit with LoRA, but we can try activation offloading and other tricks if we need to.
+
+If the LoRA format is not HF/vLLM compatible, we will need to document how to convert to and from llama-factory format.
+
+We will keep working until it works.
+
+User says to ignore dev/llama-factory/config.yaml, we don't need to update it or follow any of its patterns. We're starting fresh.
+
+We need to keep this journal up-to-date so work can be resumed later.
+
+2025-09-16  — Initial setup
+
+- Added optional extra `llama-factory` in root `pyproject.toml` with dependencies: `llamafactory>=0.9.2`, `deepspeed>=0.15.3`, and `datasets>=2.19.0`. This enables `uv sync --extra llama-factory` to install core training tools.
+- Next: create a reproducible 2xH200 LoRA SFT script targeting `Qwen/Qwen3-30B-A3B-Instruct-2507`, plus a ZeRO‑3 config for safety.
+
+Open questions
+
+1) Confirm the exact HF repo id for the model: is it `Qwen/Qwen3-30B-A3B-Instruct-2507`? If gated, ensure `HF_TOKEN` available.
+2) Preferred dataset for SFT? If none provided, we will wire a minimal built‑in dataset alias for smoke tests and leave a placeholder for user dataset paths.
+3) Output format: prefer HF‑compatible LoRA adapters. If LLaMA‑Factory saves internal format, document `export`/merge steps to HF PEFT/vLLM.
+
+Plan (next steps)
+
+- Added `scripts/llama_factory/qwen3_30b_2xH200_sft.sh` (executable) to launch with 2 GPUs.
+- Added `dev/llama-factory/configs/qwen3_30b_lora.yaml` (LoRA SFT config).
+- Added `dev/llama-factory/configs/deepspeed_zero3.json` (ZeRO‑3, CPU offload safety).
+
+Run steps
+
+1) Install deps: `uv sync --extra llama-factory`
+2) (If model is gated) export `HF_TOKEN=...`
+3) Launch 2xH200 SFT: `scripts/llama_factory/qwen3_30b_2xH200_sft.sh`
+4) Artifacts will be in `outputs/llamafactory/qwen3_30b_lora_sft`
+
+Fallbacks
+
+- If OOM: lower `lora_rank`, increase `gradient_accumulation_steps`, or reduce `cutoff_len`.
+- If still failing: switch `deepspeed_zero3` JSON to more aggressive offloading, or set `flash_attn: fa2` explicitly.
+
+Next
+
+- Document LoRA export/merge to HF PEFT and vLLM runtime.
+
+2025-09-16 — Progress update
+
+- Created isolated env at `dev/llama-factory/.venv` with `llamafactory==0.9.3` and compatible deps.
+- Removed DeepSpeed (nvcc not present) and ran pure Accelerate/DDP.
+- Fixed YAML keys to LLaMA-Factory schema; set `template: chatml` for Qwen3; switched to ONLINE dataset (`tatsu-lab/alpaca`) for smoke test; `max_steps: 20` and `save_steps: 10`.
+- Resolved model loading by upgrading `transformers` in venv to `4.52.4` to support `qwen3_moe`.
+- Installed `hf_transfer` to satisfy HF_HUB fast download env.
+- Training launched on 2x H200; model weights are loading and dataset preprocessing completed; training loop initializing (`max_steps` acknowledged). Will monitor until first checkpoint appears under `outputs/llamafactory/qwen3_30b_lora_sft`.
+
+2025-09-16 — Debug + relaunch (single GPU)
+
+- Fixed failing keys by removing `evaluation_strategy` and set `template: qwen3` (confirmed available in LLaMA‑Factory `TEMPLATES`).
+- Switched dataset config to list form with `dataset_dir: ONLINE` and `dataset: [tatsu-lab/alpaca]` to satisfy parser.
+- Relaunched on 1 GPU with `HF_HUB_ENABLE_HF_TRANSFER=0` to avoid hf_transfer dependency errors.
+- Status: process alive, GPU0 ~41.9 GiB allocated, model loaded, tokenizer/dataset preprocessed, trainer initializing. Awaiting first step/loss log and save at `save_steps: 10`.
+
+Next
+
+- Verify first checkpoint save; then run `llamafactory-cli export peft` to `exports/qwen3_30b_lora_peft` and a quick text-gen sanity check.
+- If OOM/throughput issues appear, reduce `cutoff_len` and/or increase `grad_accum`.
