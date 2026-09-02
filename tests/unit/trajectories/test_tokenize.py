@@ -665,6 +665,51 @@ def test_exact_chain_preserves_raw_output_across_proven_length_tail() -> None:
     assert not any(flag & tr.TokenFlag.SAMPLED for flag in tokenized.flags[6:8])
 
 
+def test_exact_chain_appends_renderer_owned_terminal_length_tail() -> None:
+    first = _chat_exchange([1], [2])
+    first.response.choices[0].finish_reason = "length"
+    second = _chat_exchange([1, 2, 7, 9, 3], [4], offset=1)
+    second.response.choices[0].finish_reason = "length"
+    history = art.Trajectory(
+        exchanges=TrajectoryExchanges(chat_completions=[first, second])
+    ).chat_completions_history()
+    from art.trajectories._tokenize import (
+        _RenderedLengthStopBoundary,
+        _sampled_source_key,
+        _tokenize_exact_projected_chat_history,
+    )
+
+    first_source = history.message_sources[1]
+    final_source = history.message_sources[3]
+    assert first_source is not None
+    assert final_source is not None
+    tokenized = _tokenize_exact_projected_chat_history(
+        history,
+        tokenizer=_StopTokenizer(),
+        length_stop_boundaries={
+            _sampled_source_key(first_source): _RenderedLengthStopBoundary(
+                tail=(7, 9), following=(3,)
+            ),
+            _sampled_source_key(final_source): _RenderedLengthStopBoundary(
+                tail=(8, 9), following=()
+            ),
+        },
+        projection_validated=True,
+    )
+
+    assert tokenized is not None
+    assert tokenized.tokens == [1, 2, 7, 9, 3, 4, 8, 9]
+    assert tokenized.flags[2:4] == [
+        tr.TokenFlag.EXACT | tr.TokenFlag.ASSISTANT,
+        tr.TokenFlag.EXACT | tr.TokenFlag.STOP,
+    ]
+    assert tokenized.flags[-2:] == [
+        tr.TokenFlag.ASSISTANT,
+        tr.TokenFlag.STOP,
+    ]
+    assert not any(flag & tr.TokenFlag.SAMPLED for flag in tokenized.flags[-2:])
+
+
 def test_exact_chain_declines_unrecognized_or_mismatched_length_boundary() -> None:
     first = _chat_exchange([1], [2])
     first.response.choices[0].finish_reason = "length"
@@ -708,6 +753,7 @@ def test_rendered_length_stop_boundary_requires_unique_assistant_terminal_stop()
     None
 ):
     from art.trajectories._tokenize import (
+        _next_assistant_span_start,
         _rendered_length_stop_boundary,
         _RenderedLengthStopBoundary,
     )
@@ -722,6 +768,16 @@ def test_rendered_length_stop_boundary_requires_unique_assistant_terminal_stop()
         content_end=2,
         next_prompt_end=5,
     ) == _RenderedLengthStopBoundary(tail=(8, 9), following=(3,))
+    assert (
+        _next_assistant_span_start(
+            [False, True, True, True, False, False, True, True], after=2
+        )
+        == 6
+    )
+    assert (
+        _next_assistant_span_start([False, True, True, True, False, False], after=2)
+        is None
+    )
 
     # A special token belonging to the following user turn cannot certify an
     # assistant stop, even when it is a tokenizer terminator.
