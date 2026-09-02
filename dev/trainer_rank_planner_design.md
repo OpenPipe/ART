@@ -270,10 +270,14 @@ Known, accepted limitations: the cost model carries CP terms but no TP terms
 but constants are uncalibrated — folded into the cost-model recalibration
 follow-up, to be fitted from fresh TP2 telemetry rather than by dividing the
 estimate by TP, which would turn conservative refusals into unsafe
-admissions); the cold static estimate ignores sharding (conservative); TP
-padding happens after planning, so estimates and telemetry count fewer than
-TP tokens too few; the all-shards-`-inf` output-head case is a documented
-non-goal (unreachable for supported models without a vocabulary-wide mask).
+admissions); the cold static estimate ignores sharding (conservative); the
+all-shards-`-inf` output-head case is a documented non-goal (unreachable for
+supported models without a vocabulary-wide mask). Padding is accounted for:
+execution pads every checkpoint/no-grad group independently to a TP multiple,
+so a plan's `packed_tokens` (and the cheap bounds, the split lower bound and
+the memory profile with it) is the *physical* count, each group rounded up
+(`_physical_tokens`); the unpadded aggregate would have been short by up to
+`groups × (TP−1)` tokens, not merely `< TP`.
 
 Gates (test-first; all failed on the refusing tree):
 - `tests/unit/test_trainer_rank_topology.py`: TP>1 constructs, PP>1 and

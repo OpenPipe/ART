@@ -974,6 +974,36 @@ class _ForwardCompileWatch(logging.Handler):
         return statuses
 
 
+def _source_fingerprint() -> str:
+    import subprocess
+
+    try:
+        return subprocess.check_output(
+            ["git", "rev-parse", "HEAD"],
+            cwd=REPO_ROOT,
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+    except (OSError, subprocess.CalledProcessError):
+        return "unknown"
+
+
+def _workload_fingerprint(requests: list[Any]) -> dict[str, object]:
+    import hashlib
+
+    digest = hashlib.sha256()
+    for request in requests:
+        digest.update(request.input_tokens.reshape(-1).to("cpu").numpy().tobytes())
+        if request.target_tokens is not None:
+            digest.update(request.target_tokens.reshape(-1).to("cpu").numpy().tobytes())
+    return {
+        "shape": list(GRPO_TP2),
+        "seed": 6_301,
+        "requests_sha256": digest.hexdigest(),
+        "request_count": len(requests),
+    }
+
+
 def _install_compile_watch() -> _ForwardCompileWatch:
     logger = logging.getLogger("art.trainer_rank._telemetry")
     logger.setLevel(logging.INFO)
@@ -1349,6 +1379,8 @@ def phase_tp2_public(
             torch.save(
                 {
                     "tp": tp,
+                    "source": _source_fingerprint(),
+                    "workload": _workload_fingerprint(requests),
                     "arms": {
                         arm: {
                             "logprobs": result["logprobs"],
@@ -1451,7 +1483,9 @@ def _difference_profile(actual: list[Any], expected: list[Any]) -> dict[str, flo
     }
 
 
-def phase_tp_compare(control_dump: str, dump: str, evidence: str | None) -> None:
+def phase_tp_compare(
+    control_dump: str, dump: str, evidence: str | None, *, expect_tp: int
+) -> None:
     """CPU numerics gates for the TP public cell against its TP1 control.
 
     bf16 rounding differs whenever the reduction order changes, and both a
@@ -1480,6 +1514,17 @@ def phase_tp_compare(control_dump: str, dump: str, evidence: str | None) -> None
     trial = torch.load(dump, weights_only=False)
     if int(control["tp"]) != 1:
         _fail(f"control dump must be TP1 (got tp={control['tp']})")
+    if expect_tp <= 1 or int(trial["tp"]) != expect_tp:
+        _fail(
+            f"trial dump must come from the TP{expect_tp} cell (got tp={trial['tp']}); "
+            "a TP1 dump supplied as the trial would pass every comparison trivially"
+        )
+    for key in ("source", "workload"):
+        if not control.get(key) or control.get(key) != trial.get(key):
+            _fail(
+                f"control and trial dumps must carry the same {key} fingerprint: "
+                f"{control.get(key)!r} vs {trial.get(key)!r}"
+            )
     ratio = TP_GATES["max_cross_layout_ratio"]
     rows: list[dict[str, object]] = []
     problems: list[str] = []
@@ -1492,6 +1537,9 @@ def phase_tp_compare(control_dump: str, dump: str, evidence: str | None) -> None
     rows.append(
         {
             "arm": "tp1-cross-layout-reference",
+            "source": control.get("source"),
+            "workload": control.get("workload"),
+            "trial_tp": trial["tp"],
             **control["cross_layout"],
             **reference_profile,
         }
@@ -1837,7 +1885,10 @@ def main() -> None:
         "--tp",
         type=int,
         default=2,
-        help="tp2-public only: expected tensor-parallel size (1 runs the control cell)",
+        help=(
+            "tp2-public: expected tensor-parallel size (1 runs the control cell); "
+            "tp-compare: required TP of the trial dump"
+        ),
     )
     parser.add_argument(
         "--dump-dir", default="", help="tp2-public only: save per-arm outputs here"
@@ -1870,7 +1921,10 @@ def main() -> None:
         if not (arguments.control_dump and arguments.dump):
             _fail("tp-compare requires --control-dump and --dump")
         phase_tp_compare(
-            arguments.control_dump, arguments.dump, arguments.evidence or None
+            arguments.control_dump,
+            arguments.dump,
+            arguments.evidence or None,
+            expect_tp=arguments.tp,
         )
     elif arguments.phase == "dp2-tp2-waves":
         phase_dp2_tp2_waves(arguments.evidence or None)

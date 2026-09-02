@@ -16,7 +16,11 @@ from typing import TYPE_CHECKING
 import pytest
 import torch
 
-from art.trainer_rank import TrainerRank, TrainerRankRuntimeSupportError
+from art.trainer_rank import (
+    ForwardInput,
+    TrainerRank,
+    TrainerRankRuntimeSupportError,
+)
 
 if TYPE_CHECKING:
     from art.megatron.train import TrainingRuntime
@@ -59,3 +63,45 @@ def test_trainer_rank_still_refuses_pipeline_parallel_runtimes() -> None:
         TrainerRank(_runtime(pp=2))
     with pytest.raises(TrainerRankRuntimeSupportError, match="one local model chunk"):
         TrainerRank(_runtime(chunks=2))
+
+
+def test_packed_tokens_count_per_group_tensor_parallel_padding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Execution pads every group to a TP multiple; admission must count that.
+
+    Two groups (grad and no_grad) of 5 and 7 tokens are physically 6 + 8 at
+    TP=2. The plan, the cheap bounds, the exact estimate and the split lower
+    bound must all agree on the physical count; at TP=1 they equal the sum.
+    """
+
+    rank = TrainerRank(_runtime(tp=2))  # type: ignore[arg-type]
+    monkeypatch.setattr(rank, "_dp_rank_and_size", lambda: (0, 1))
+    monkeypatch.setattr(
+        rank,
+        "_estimate_required_memory_bytes_from_values",
+        lambda *, packed_tokens, **_kwargs: packed_tokens,
+    )
+    first = torch.tensor([11, 12, 13, 14, 15], dtype=torch.long)
+    second = torch.tensor([21, 22, 23, 24, 25, 26, 27], dtype=torch.long)
+    requests = [
+        ForwardInput(input_tokens=first, target_tokens=first),
+        ForwardInput(input_tokens=second, target_tokens=second, no_grad=True),
+    ]
+
+    plan = rank._plan_flat_forward(requests)
+    assert sorted(int(g.packed.tokens.numel()) for g in plan.groups) == [5, 7]
+    assert plan.packed_tokens == 12  # TP=1 without Megatron: unpadded sum
+
+    monkeypatch.setattr(rank, "_topology_key", lambda: (1, 2, 1, 1))
+    plan = rank._plan_flat_forward(requests)
+    assert plan.packed_tokens == 6 + 8
+    cheap = rank._estimate_flat_forward(requests)
+    exact = rank._estimate_flat_forward(requests, exact=True)
+    assert cheap is not None and exact is not None
+    assert cheap[0] == exact[0] == plan.packed_tokens
+    rows = tuple(request.input_tokens for request in requests)
+    from art.trainer_rank._impl import Unset
+
+    lower = rank._split_chunk_lower_cost(requests, rows, checkpoint=Unset)
+    assert lower.required == 6 + 8
