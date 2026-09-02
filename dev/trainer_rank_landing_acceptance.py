@@ -2018,8 +2018,9 @@ def phase_cost_calibrate(
     from art.trainer_rank import TrainerRank, TrainerRankMemoryError
     from art.trainer_rank._planner_cost import (
         COEFFICIENT_VERSION,
+        ScoringFacts,
         layout_features,
-        prefix_tree_layout_score,
+        predicted_us,
     )
     from art.trainer_rank._prefix_tree_planner import (
         build_canonical_prefix_tree,
@@ -2083,20 +2084,21 @@ def phase_cost_calibrate(
         candidate_rows = []
         for candidate in candidates:
             features = layout_features(candidate.layout)
-            score = prefix_tree_layout_score(
-                candidate.layout,
-                cp_size=facts.cp_size,
-                layers=facts.layers,
-                uses_gdn=facts.uses_gdn,
-                tp_size=facts.tp_size,
-                gdn_layers=facts.gdn_layers,
+            current_us = predicted_us(
+                features,
+                ScoringFacts(
+                    cp_size=facts.cp_size,
+                    tp_size=facts.tp_size,
+                    layers=facts.layers,
+                    gdn_layers=facts.gdn_layers,
+                ),
             )
             candidate_rows.append(
                 {
                     "label": candidate.labels[0],
                     "labels": list(candidate.labels),
                     "features": features.as_dict(),
-                    "current_score_us": score[0] / 1_024,
+                    "current_score_us": current_us,
                 }
             )
         logical_tokens = sum(int(r.input_tokens.numel()) for r in requests)

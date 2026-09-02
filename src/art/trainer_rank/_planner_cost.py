@@ -1,22 +1,27 @@
-"""Calibrated integer cost model for prefix-tree layout selection.
+"""Fitted integer cost model for prefix-tree layout selection.
 
 The score is a lexicographic fixed-point tuple: predicted work first, then
 packed tokens, segment count, and maximum depth as deterministic tie-breaks.
 All terms are integers so every rank computes bit-identical scores.
 
-Provenance: the formula and constants are the research implementation's
-production layout score (frozen 2026-08-31), mirrored and test-locked by its
-sealed nonuniform-search gate and validated end-to-end by the sealed GPU
-acceptance cells (GRPO GDN CP4 win: automatic selected depth 3, packing
-26,624 physical tokens for 172,032 logical, +47.2% paired median gain vs the
-depth-one arm; heterogeneous/Ellavox CP1: correctly converged to the
-depth-one-equivalent plan).
+Provenance (coefficient version 2): fitted 2026-09-02 from a forced-candidate
+calibration campaign on H200 bf16 (``dev/trainer_rank_landing_acceptance.py
+--phase cost-calibrate`` and ``dev/trainer_rank_cost_fit.py``): every
+mandatory candidate layout of each cell timed through the public API (forward
++ backward through an active LoRA slot, compile-free, max-rank), on Qwen3.5-4B
+(GDN, 24 of 32 layers) and Qwen3-4B (attention) at TP1/TP2 and CP1/CP2/CP4,
+over hierarchical GRPO shapes, heterogeneous controls and real Ellavox groups.
+Coefficients are a non-negative least-squares fit on within-cell paired timing
+deltas, refined by direct regret minimization, validated on whole held-out
+cells (odd Ellavox groups; whole topologies, shapes and models in ablation).
+The version-1 constants they replace were hand-set, not fitted.
 
-Known limitation carried from research (documented, not addressed here): the
-GDN depth terms overprice deep sharing on some GRPO cells — the sealed
-full-sharing arm measured faster than the automatic selection on the win
-cell.  Constants are versioned via ``COEFFICIENT_VERSION`` so a future
-recalibration invalidates cached recipes.
+What the data showed: the cost of a shared prefix level is a GDN effect that
+grows when the level's state hand-offs cross CP or TP ranks (the attention
+model pays almost nothing for it), per-rank token work shrinks with tp x cp,
+and rows in segments that are short *per rank* run inefficient kernels.
+``COEFFICIENT_VERSION`` is part of every layout cache key, so a new table
+invalidates cached recipes.
 """
 
 from __future__ import annotations
@@ -27,7 +32,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from ._prefix_tree_planner import PrefixTreeLayout
 
-COEFFICIENT_VERSION = 1
+COEFFICIENT_VERSION = 2
 
 # Segment-length buckets for kernel-utilization effects: a segment shorter than
 # these runs small-M kernels on every rank it is sharded over. Context
@@ -287,22 +292,63 @@ def term_values(features: LayoutFeatures, facts: ScoringFacts) -> dict[str, int]
 def score_terms(
     features: LayoutFeatures,
     facts: ScoringFacts,
-    coefficients_us: dict[str, int],
+    coefficients_milli_us: dict[str, int],
 ) -> int:
-    """Total predicted work under a coefficient table (microseconds per unit)."""
+    """Total predicted work under a coefficient table (milli-microseconds per
+    feature unit), in 1/(WORK_PER_US x 1000) microsecond units."""
 
     return sum(
         TERM_FUNCTIONS[name](features, facts) * coefficient
-        for name, coefficient in coefficients_us.items()
+        for name, coefficient in coefficients_milli_us.items()
         if coefficient
     )
 
 
-# Calibrated GDN pipeline penalties (microseconds per transformer layer): the
-# first shared depth introduces segment-boundary state exchange; each depth
-# beyond two adds bounded incremental barrier/bucket work.
-GDN_FIRST_SHARED_PIPELINE_US_PER_LAYER = 768
-GDN_EXCESS_DEPTH_PIPELINE_US_PER_LAYER = 256
+# Fitted coefficients in integer milli-microseconds per feature unit (see the
+# module docstring for provenance; regenerate with
+# ``dev/trainer_rank_cost_fit.py --integerize``). Zero means the term carried no
+# weight on the calibration cells and is kept only so the table matches
+# ``TERM_FUNCTIONS`` one to one.
+COEFFICIENT_SCALE_PER_US = 1_000
+COEFFICIENTS_MILLI_US: dict[str, int] = {
+    "token_per_rank": 2969,
+    "token_cp_exchange": 94,
+    "token_tp_collective": 333,
+    "segment_per_layer": 161336,
+    "segment_per_rank": 1656312,
+    "segment_cross_rank_per_layer": 0,
+    "small_segment_per_layer": 217125,
+    "tiny_segment_per_layer": 209913,
+    "short_tokens_per_rank": 0,
+    "tiny_tokens_per_rank": 12,
+    "level_per_layer": 0,
+    "level_cp_per_layer": 0,
+    "level_tp_per_layer": 0,
+    "gdn_level": 1397395,
+    "gdn_level_cp": 1240186,
+    "gdn_level_tp": 637635,
+    "gdn_fanout": 0,
+    "gdn_fanout_cross_rank": 0,
+    "shared_tokens_per_rank": 117,
+    "attention_area_per_rank": 0,
+}
+assert set(COEFFICIENTS_MILLI_US) == set(TERM_FUNCTIONS)
+
+
+def predicted_work(
+    features: LayoutFeatures,
+    facts: ScoringFacts,
+    coefficients_milli_us: dict[str, int] = COEFFICIENTS_MILLI_US,
+) -> int:
+    """Total predicted work in 1/(WORK_PER_US x COEFFICIENT_SCALE_PER_US) us."""
+
+    return score_terms(features, facts, coefficients_milli_us)
+
+
+def predicted_us(features: LayoutFeatures, facts: ScoringFacts) -> float:
+    """Predicted layout-dependent work in microseconds (for logging only)."""
+
+    return predicted_work(features, facts) / (WORK_PER_US * COEFFICIENT_SCALE_PER_US)
 
 
 def prefix_tree_layout_score(
@@ -316,42 +362,33 @@ def prefix_tree_layout_score(
 ) -> tuple[int, int, int, int]:
     """Price one layout for the given topology and model facts.
 
-    ``tp_size`` and ``gdn_layers`` are accepted so callers already pass the
-    full topology; the coefficient-version-1 formula below does not yet use
-    them (the recalibrated model does).
+    ``gdn_layers`` defaults to ``layers`` when the model uses GDN and to zero
+    otherwise; ``uses_gdn`` only matters for that default.
     """
 
-    del tp_size, gdn_layers
-    cp = max(1, cp_size)
-    layer_count = max(1, layers)
-    segment_count = len(layout.segments)
-    parent_edges = len(layout.selected_decisions)
-    transformer = layout.packed_tokens * WORK_PER_US
-    imbalance = ((layout.packed_tokens + cp - 1) // cp) * (96 + 32 * cp)
-    launch = segment_count * (96 + 32 * cp) * WORK_PER_US
-    exchanges = parent_edges * (64 + 32 * cp) * WORK_PER_US
-    gdn_work = (
-        (
-            min(1, max(0, layout.maximum_depth - 1))
-            * layer_count
-            * GDN_FIRST_SHARED_PIPELINE_US_PER_LAYER
-            * WORK_PER_US
-            + max(0, layout.maximum_depth - 2)
-            * layer_count
-            * GDN_EXCESS_DEPTH_PIPELINE_US_PER_LAYER
-            * WORK_PER_US
-        )
-        if uses_gdn
-        else 0
+    features = layout_features(layout)
+    facts = ScoringFacts(
+        cp_size=max(1, cp_size),
+        tp_size=max(1, tp_size),
+        layers=max(1, layers),
+        gdn_layers=(
+            max(0, gdn_layers)
+            if gdn_layers is not None
+            else (max(1, layers) if uses_gdn else 0)
+        ),
     )
-    total = layer_count * transformer + (imbalance + launch + exchanges + gdn_work)
-    return total, layout.packed_tokens, segment_count, layout.maximum_depth
+    return (
+        predicted_work(features, facts),
+        layout.packed_tokens,
+        features.segment_count,
+        layout.maximum_depth,
+    )
 
 
 __all__ = [
+    "COEFFICIENTS_MILLI_US",
+    "COEFFICIENT_SCALE_PER_US",
     "COEFFICIENT_VERSION",
-    "GDN_EXCESS_DEPTH_PIPELINE_US_PER_LAYER",
-    "GDN_FIRST_SHARED_PIPELINE_US_PER_LAYER",
     "LayoutFeatures",
     "SEGMENT_LENGTH_THRESHOLDS",
     "SMALL_SEGMENT_TOKENS",
@@ -360,6 +397,8 @@ __all__ = [
     "TINY_SEGMENT_TOKENS",
     "WORK_PER_US",
     "layout_features",
+    "predicted_us",
+    "predicted_work",
     "prefix_tree_layout_score",
     "score_terms",
     "term_values",

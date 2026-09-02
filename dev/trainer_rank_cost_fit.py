@@ -540,12 +540,18 @@ def main() -> None:
         "fit_all": evaluate(candidates, predict(candidates, terms, beta)),
     }
     if arguments.integerize:
-        integer = {name: int(round(value)) for name, value in report["terms"].items()}
-        report["integer_terms_us"] = integer
-        beta_int = np.asarray([integer[name] for name in terms], dtype=np.float64)
+        # Production stores integer milli-microseconds per feature unit.
+        integer = {
+            name: int(round(value * 1_000)) for name, value in report["terms"].items()
+        }
+        report["integer_terms_milli_us"] = integer
+        beta_int = np.asarray(
+            [integer[name] / 1_000.0 for name in terms], dtype=np.float64
+        )
         report["integer_all"] = evaluate(
             candidates, predict(candidates, terms, beta_int)
         )
+        print("COEFFICIENTS_MILLI_US =", json.dumps(integer, indent=4))
     for split in ("train", "test", "current_all", "fit_all", "integer_all"):
         block = report.get(split)
         if not block:

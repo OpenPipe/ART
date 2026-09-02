@@ -407,7 +407,9 @@ def test_width_search_lets_prefix_sharing_widen_the_wave(
 ) -> None:
     """A no-sharing upper bound may accept a width, never reject one."""
 
-    shared = tuple(range(10_000, 11_000))
+    # 2,000 shared tokens: under the fitted cost model a shared level on the
+    # GDN model pays for itself from roughly 1,500 saved tokens per layer.
+    shared = tuple(range(10_000, 12_000))
     inputs = [
         _target_request(_tokens(*shared, 1)),
         _target_request(_tokens(*shared, 2)),
@@ -424,10 +426,10 @@ def test_width_search_lets_prefix_sharing_widen_the_wave(
         ),
     )
     plan = rank._plan_flat_forward(inputs)
-    assert plan.packed_tokens < 2_002, "planner must share the common prefix"
-    # Budget fits the shared plan (1,002 packed) but not the no-sharing bound
-    # (2,002); the wave must still take both requests.
-    _set_packed_token_budget(monkeypatch, rank, 1_200)
+    assert plan.packed_tokens < 4_002, "planner must share the common prefix"
+    # Budget fits the shared plan (2,002 packed) but not the no-sharing bound
+    # (4,002); the wave must still take both requests.
+    _set_packed_token_budget(monkeypatch, rank, 2_400)
 
     batches = list(rank.forward_micro_batches(inputs))
 
@@ -456,7 +458,10 @@ def test_width_search_survives_non_monotone_cost_optimal_layouts(
     width 3 instead of stopping at the spurious failure.
     """
 
-    shared = tuple(range(10_000, 10_040))
+    # 500 shared tokens on the attention model: one saved copy (width 2) does
+    # not pay for the extra segment under the fitted cost model, two saved
+    # copies (width 3) do.
+    shared = tuple(range(10_000, 10_500))
     inputs = [_target_request(_tokens(*shared, tail)) for tail in (1, 2, 3)]
     rank = TrainerRank(_attention_runtime())
     monkeypatch.setattr(rank, "_dp_rank_and_size", lambda: (0, 1))
@@ -472,14 +477,14 @@ def test_width_search_survives_non_monotone_cost_optimal_layouts(
     # Confirm the non-monotone premise under the production cost model.
     two = rank._plan_flat_forward(inputs[:2])
     three = rank._plan_flat_forward(inputs)
-    assert two.packed_tokens == 82, two.packed_tokens
-    assert three.packed_tokens == 43, three.packed_tokens
-    _set_packed_token_budget(monkeypatch, rank, 60)
+    assert two.packed_tokens == 1_002, two.packed_tokens
+    assert three.packed_tokens == 503, three.packed_tokens
+    _set_packed_token_budget(monkeypatch, rank, 700)
 
     batches = list(rank.forward_micro_batches(inputs))
 
     assert [batch.stats.global_count for batch in batches] == [3]
-    assert batches[0].stats.packed_tokens <= 60
+    assert batches[0].stats.packed_tokens <= 700
 
 
 def test_dp_rank_forward_falls_back_to_memory_minimal_layout_before_refusing(
