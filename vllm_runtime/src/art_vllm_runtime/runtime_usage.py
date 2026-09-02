@@ -5,11 +5,14 @@ from __future__ import annotations
 from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from decimal import Decimal
+from decimal import ROUND_HALF_EVEN, Decimal
 import math
 from threading import RLock
 import time
 from typing import Any, Callable
+
+_NANOSECONDS_PER_SECOND = 1_000_000_000
+_NANOSECONDS_PER_MILLISECOND = 1_000_000
 
 
 class RuntimeUsageCapacityError(RuntimeError):
@@ -298,10 +301,13 @@ class RuntimeUsageJournal:
             reason = str(getattr(finished, "finish_reason"))
             corrupted = bool(getattr(finished, "is_corrupted", False))
             status, attribution = _terminal_status(reason, corrupted)
+            live_request_ns = (
+                Decimal(str(latency)) * _NANOSECONDS_PER_SECOND
+            ).to_integral_value(rounding=ROUND_HALF_EVEN)
             measurements: tuple[dict[str, object], ...] = (
                 {
                     "metric": "live_request_ms",
-                    "quantity": str(Decimal(str(latency)) * 1000),
+                    "quantity": str(live_request_ns / _NANOSECONDS_PER_MILLISECOND),
                 },
                 {
                     "metric": "inference_gpu_ms",

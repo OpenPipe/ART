@@ -59,7 +59,7 @@ def test_runtime_usage_pages_are_gapless_bounded_and_acknowledged() -> None:
     assert first["status"] == "succeeded"
     assert first["failure_attribution"] is None
     assert first["measurements"] == (
-        {"metric": "live_request_ms", "quantity": "125.000"},
+        {"metric": "live_request_ms", "quantity": "125"},
         {"metric": "inference_gpu_ms", "quantity": "0"},
         {"metric": "cached_prefill_tokens", "quantity": 5},
         {"metric": "uncached_prefill_tokens", "quantity": 7},
@@ -76,6 +76,24 @@ def test_runtime_usage_pages_are_gapless_bounded_and_acknowledged() -> None:
     assert second["failure_attribution"] == "unknown"
     with pytest.raises(RuntimeUsageCursorError, match="expired"):
         journal.read(after_sequence=0)
+
+
+def test_runtime_usage_rounds_live_latency_to_service_precision() -> None:
+    journal = RuntimeUsageJournal("paired-runtime", 0)
+    journal.reserve("request", _context("tenant"))
+    journal.record_gpu_complete("request")
+    finished = _finished("request")
+    finished.e2e_latency = 4.219876543678901
+
+    assert journal.record_finished(finished, observed_unix_s=10.0)
+    receipt = journal.read(after_sequence=0)["receipts"][0]
+    quantity = next(
+        item["quantity"]
+        for item in receipt["measurements"]
+        if item["metric"] == "live_request_ms"
+    )
+
+    assert quantity == "4219.876544"
 
 
 def test_runtime_usage_preserves_unknown_terminal_measurements() -> None:
