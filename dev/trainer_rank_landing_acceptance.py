@@ -975,18 +975,28 @@ class _ForwardCompileWatch(logging.Handler):
 
 
 def _source_fingerprint() -> str:
-    """Content hash of the TrainerRank sources and this driver.
+    """Content hash of the TrainerRank sources (what decides numerics).
 
     Content-based rather than a git commit so that a SkyPilot workdir (synced
     without ``.git``) and a local checkout of the same files agree, and so that
-    uncommitted edits change the fingerprint.
+    uncommitted edits change the fingerprint. The driver itself is hashed
+    separately and recorded for information only: its gate logic does not
+    change what the cell computes.
     """
 
+    return _content_hash(
+        sorted((REPO_ROOT / "src" / "art" / "trainer_rank").glob("*.py"))
+    )
+
+
+def _driver_fingerprint() -> str:
+    return _content_hash([Path(__file__).resolve()])
+
+
+def _content_hash(files: list[Path]) -> str:
     import hashlib
 
     digest = hashlib.sha256()
-    files = sorted((REPO_ROOT / "src" / "art" / "trainer_rank").glob("*.py"))
-    files.append(Path(__file__).resolve())
     for path in files:
         digest.update(path.name.encode())
         digest.update(path.read_bytes())
@@ -1395,12 +1405,14 @@ def phase_tp2_public(
                 {
                     "tp": tp,
                     "source": _source_fingerprint(),
+                    "driver": _driver_fingerprint(),
                     "workload": _workload_fingerprint(requests),
                     "arms": {
                         arm: {
                             "logprobs": result["logprobs"],
                             "loss": result["loss"],
                             "packed_tokens": result["packed_tokens"],
+                            "group_lengths": result["group_lengths"],
                             "selected_max_depth": result["selected_max_depth"],
                         }
                         for arm, result in (
@@ -1553,6 +1565,7 @@ def phase_tp_compare(
         {
             "arm": "tp1-cross-layout-reference",
             "source": control.get("source"),
+            "driver": {"control": control.get("driver"), "trial": trial.get("driver")},
             "workload": control.get("workload"),
             "trial_tp": trial["tp"],
             **control["cross_layout"],
@@ -1579,10 +1592,12 @@ def phase_tp_compare(
 
     for arm in ("automatic", "depth_one"):
         c, tr = control["arms"][arm], trial["arms"][arm]
-        if c["packed_tokens"] != tr["packed_tokens"]:
+        # Same layout means the same materialized (unpadded) group lengths;
+        # ``packed_tokens`` is physical and differs by the TP padding.
+        if c["group_lengths"] != tr["group_lengths"]:
             problems.append(
-                f"{arm}: TP{trial['tp']} packed {tr['packed_tokens']} tokens vs TP1 "
-                f"{c['packed_tokens']} (layouts differ)"
+                f"{arm}: TP{trial['tp']} group lengths {tr['group_lengths']} vs TP1 "
+                f"{c['group_lengths']} (layouts differ)"
             )
             continue
         mean_abs_pct, max_abs = _compare_logprobs(tr["logprobs"], c["logprobs"])
@@ -1591,7 +1606,9 @@ def phase_tp_compare(
         rows.append(
             {
                 "arm": f"tp{trial['tp']}-vs-tp1-{arm}",
-                "packed_tokens": tr["packed_tokens"],
+                "group_lengths": tr["group_lengths"],
+                "packed_tokens_tp": tr["packed_tokens"],
+                "packed_tokens_tp1": c["packed_tokens"],
                 "mean_abs_pct": mean_abs_pct,
                 "max_abs": max_abs,
                 "loss_rel_pct": loss_rel_pct,
