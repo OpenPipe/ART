@@ -83,6 +83,53 @@ def _cell_key(row: dict[str, Any]) -> str:
     )
 
 
+def production_regret(
+    candidates: list[Candidate], paths: list[Path]
+) -> dict[str, dict[str, Any]]:
+    """Measured regret of the timed ``automatic`` selection per cell, if present."""
+
+    automatic: dict[str, tuple[list[float], list[str]]] = {}
+    for path in paths:
+        for line in path.read_text().splitlines():
+            if not line.strip():
+                continue
+            row = json.loads(line)
+            if row.get("record_type") == "calibration_cell":
+                for candidate in row["candidates"]:
+                    if candidate["label"] == "automatic":
+                        automatic.setdefault(
+                            _cell_key(row), ([], candidate.get("matches", []))
+                        )
+            elif (
+                row.get("record_type") == "calibration_sample"
+                and row.get("role") == "measured"
+                and row.get("candidate_label") == "automatic"
+                and not row.get("admission_failed")
+                and row.get("subforward_count", 1) == 1
+                and all(status == "none" for status in row.get("compile_statuses", []))
+            ):
+                automatic.setdefault(_cell_key(row), ([], []))[0].append(
+                    float(row["ms_max_rank"])
+                )
+    by_cell: dict[str, list[Candidate]] = defaultdict(list)
+    for candidate in candidates:
+        by_cell[candidate.cell].append(candidate)
+    report: dict[str, dict[str, Any]] = {}
+    for cell, (values, matches) in automatic.items():
+        if len(values) < 2 or cell not in by_cell:
+            continue
+        best = min(by_cell[cell], key=lambda c: c.ms)
+        ms = statistics.median(values)
+        report[cell] = {
+            "automatic_ms": ms,
+            "best": best.label,
+            "best_ms": best.ms,
+            "regret_pct": (ms - best.ms) / best.ms * 100.0,
+            "matches": matches,
+        }
+    return report
+
+
 def load_candidates(paths: list[Path]) -> list[Candidate]:
     cells: dict[str, dict[str, Any]] = {}
     samples: dict[tuple[str, str], list[float]] = defaultdict(list)
@@ -114,6 +161,8 @@ def load_candidates(paths: list[Path]) -> list[Candidate]:
             "uses_gdn": float(bool(cell["uses_gdn"])),
         }
         for candidate in cell["candidates"]:
+            if candidate["label"] == "automatic":
+                continue  # the production selection is reported, not fitted
             values = samples.get((key, candidate["label"]))
             if not values or len(values) < 2:
                 continue
@@ -131,6 +180,68 @@ def load_candidates(paths: list[Path]) -> list[Candidate]:
                 )
             )
     return candidates
+
+
+def _normalized(features: dict[str, Any]) -> dict[str, Any]:
+    """JSON round-trips turn tuples into lists; compare on a canonical form."""
+
+    return {
+        key: tuple(value) if isinstance(value, (list, tuple)) else value
+        for key, value in features.items()
+    }
+
+
+def selector_check(candidates: list[Candidate]) -> dict[str, dict[str, Any]]:
+    """Run the production selector on each cell's tree under the shipped table.
+
+    Reports the chosen layout's features, whether it is one of the measured
+    candidates (and that candidate's measured regret), or a nonuniform layout
+    outside the mandatory family (which then needs measuring before the table
+    can be trusted on that cell).
+    """
+
+    import torch
+
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from trainer_rank_landing_acceptance import _calibration_requests
+
+    from art.trainer_rank._planner_cost import layout_features
+    from art.trainer_rank._prefix_tree_planner import (
+        build_canonical_prefix_tree,
+        select_prefix_tree_layout,
+    )
+
+    by_cell: dict[str, list[Candidate]] = defaultdict(list)
+    for candidate in candidates:
+        by_cell[candidate.cell].append(candidate)
+    report: dict[str, dict[str, Any]] = {}
+    for cell, members in by_cell.items():
+        name, rest = cell.split("|", 1)
+        group = int(cell.rsplit("|g", 1)[1]) if "|g" in cell else 0
+        requests, _ = _calibration_requests(name, group=group)
+        tree = build_canonical_prefix_tree(
+            tuple(r.input_tokens.reshape(-1).to(torch.long) for r in requests)
+        )
+        facts = members[0].facts
+        selected = select_prefix_tree_layout(
+            tree,
+            cp_size=int(facts["cp"]),
+            layers=int(facts["layers"]),
+            uses_gdn=bool(facts["uses_gdn"]),
+            tp_size=int(facts["tp"]),
+            gdn_layers=int(facts["gdn_layers"]),
+            refinement_work_budget=2_000,
+        ).layout
+        features = _normalized(layout_features(selected).as_dict())
+        best = min(members, key=lambda c: c.ms)
+        match = next((c for c in members if _normalized(c.features) == features), None)
+        report[cell] = {
+            "selected": match.label if match else "nonuniform (unmeasured)",
+            "selected_packed_tokens": features["packed_tokens"],
+            "best": best.label,
+            "regret_pct": ((match.ms - best.ms) / best.ms * 100.0) if match else None,
+        }
+    return report
 
 
 def refresh_features(paths: list[Path]) -> None:
@@ -348,34 +459,48 @@ def fit_regret(
     Starts from the least-squares solution (which fixes the scale) and tries
     multiplicative steps per coefficient, including switching a coefficient
     on at a small value or off; accepts a step only when the training loss
-    falls. Deterministic and cheap: each evaluation is one ranking pass.
+    falls. Greedy, so it runs from a few deterministic starts (the solution
+    scaled up and down, and reversed coordinate order) and keeps the best.
     """
 
     matrix = term_matrix(candidates, terms)
-    beta = start.copy()
-    positive = beta[beta > 0]
+    positive = start[start > 0]
     floor = float(positive.min()) * 1e-3 if positive.size else 1e-3
-    best = selection_loss(candidates, matrix @ beta)
     factors = (0.25, 0.5, 0.8, 1.25, 2.0, 4.0)
-    for _ in range(sweeps):
-        improved = False
-        for j in range(len(beta)):
-            current = beta[j]
-            trials = [current * factor for factor in factors if current > 0]
-            trials.append(0.0)
-            if current == 0:
-                trials.extend(floor * factor for factor in (1.0, 10.0, 100.0, 1000.0))
-            for trial in trials:
-                if trial == current:
-                    continue
-                candidate_beta = beta.copy()
-                candidate_beta[j] = trial
-                loss = selection_loss(candidates, matrix @ candidate_beta)
-                if loss < best - 1e-9:
-                    best, beta, improved = loss, candidate_beta, True
-        if not improved:
-            break
-    return beta
+
+    def search(beta: np.ndarray, order: list[int]) -> tuple[float, np.ndarray]:
+        beta = beta.copy()
+        best = selection_loss(candidates, matrix @ beta)
+        for _ in range(sweeps):
+            improved = False
+            for j in order:
+                current = beta[j]
+                trials = [current * factor for factor in factors if current > 0]
+                trials.append(0.0)
+                if current == 0:
+                    trials.extend(
+                        floor * factor for factor in (1.0, 10.0, 100.0, 1000.0)
+                    )
+                for trial in trials:
+                    if trial == current:
+                        continue
+                    candidate_beta = beta.copy()
+                    candidate_beta[j] = trial
+                    loss = selection_loss(candidates, matrix @ candidate_beta)
+                    if loss < best - 1e-9:
+                        best, beta, improved = loss, candidate_beta, True
+            if not improved:
+                break
+        return best, beta
+
+    forward = list(range(len(start)))
+    results = [
+        search(start * scale, order)
+        for scale in (1.0, 0.5, 2.0)
+        for order in (forward, forward[::-1])
+    ]
+    # Lowest loss wins; ties prefer the least-changed start (first in order).
+    return min(results, key=lambda item: item[0])[1]
 
 
 def predict(
@@ -508,6 +633,11 @@ def main() -> None:
         action="store_true",
         help="recompute candidate features from the reproducible workloads first",
     )
+    parser.add_argument(
+        "--selector-check",
+        action="store_true",
+        help="run the shipped production selector on every measured cell and report its choice",
+    )
     arguments = parser.parse_args()
     if arguments.refresh_features:
         refresh_features(arguments.evidence)
@@ -552,6 +682,30 @@ def main() -> None:
             candidates, predict(candidates, terms, beta_int)
         )
         print("COEFFICIENTS_MILLI_US =", json.dumps(integer, indent=4))
+    report["production"] = production_regret(candidates, arguments.evidence)
+    if report["production"]:
+        regrets = sorted(v["regret_pct"] for v in report["production"].values())
+        print(
+            f"production   cells={len(regrets):3d} (timed automatic selection) regret "
+            f"median={statistics.median(regrets):.2f}% max={regrets[-1]:.2f}%"
+        )
+    if arguments.selector_check:
+        report["selector_check"] = selector_check(candidates)
+        unmeasured = [
+            c for c, v in report["selector_check"].items() if v["regret_pct"] is None
+        ]
+        regrets = [
+            v["regret_pct"]
+            for v in report["selector_check"].values()
+            if v["regret_pct"] is not None
+        ]
+        print(
+            f"selector     cells={len(report['selector_check']):3d} shipped-table selection regret "
+            f"median={statistics.median(regrets) if regrets else float('nan'):.2f}% "
+            f"max={max(regrets) if regrets else float('nan'):.2f}% unmeasured_nonuniform={len(unmeasured)}"
+        )
+        for cell in unmeasured:
+            print("   nonuniform selection not in measured family:", cell)
     for split in ("train", "test", "current_all", "fit_all", "integer_all"):
         block = report.get(split)
         if not block:

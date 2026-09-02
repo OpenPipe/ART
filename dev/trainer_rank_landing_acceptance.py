@@ -2101,6 +2101,36 @@ def phase_cost_calibrate(
                     "current_score_us": current_us,
                 }
             )
+        # The production selector's own choice, timed like every other
+        # candidate: the prospective regret of the shipped score. Its label is
+        # "automatic"; the layout it matches in the family (if any) is recorded.
+        _anchor_env("automatic")
+        _tree, automatic_layout = rank._select_group_layout(
+            tuple(r.input_tokens.reshape(-1).to(torch.long) for r in requests)
+        )
+        automatic_features = layout_features(automatic_layout)
+        matching = [
+            row["label"]
+            for row in candidate_rows
+            if row["features"] == automatic_features.as_dict()
+        ]
+        candidate_rows.append(
+            {
+                "label": "automatic",
+                "labels": ["automatic"],
+                "features": automatic_features.as_dict(),
+                "current_score_us": predicted_us(
+                    automatic_features,
+                    ScoringFacts(
+                        cp_size=facts.cp_size,
+                        tp_size=facts.tp_size,
+                        layers=facts.layers,
+                        gdn_layers=facts.gdn_layers,
+                    ),
+                ),
+                "matches": matching,
+            }
+        )
         logical_tokens = sum(int(r.input_tokens.numel()) for r in requests)
         base = {
             "schema": CALIBRATION_SCHEMA,
