@@ -47,21 +47,16 @@ from typing import Any
 
 import numpy as np
 
-TERMS: dict[str, str] = {
-    # name: expression over feature dict f and facts dict m (evaluated with eval on
-    # a restricted namespace); every coefficient is >= 0 microseconds per unit.
-    "token_work_per_layer": "f['packed_tokens'] * m['layers'] / m['tp']",
-    "token_work_tp_fixed": "f['packed_tokens'] * m['layers'] * (m['tp'] > 1)",
-    "segment_launch": "f['segment_count'] * (1 + m['cp'])",
-    "shared_segment": "f['shared_segments'] * (1 + m['cp'])",
-    "level_per_layer": "(f['max_depth'] - 1) * m['layers'] * m['cp']",
-    "gdn_level_per_gdn_layer": "(f['max_depth'] - 1) * m['gdn_layers']",
-    "gdn_fanout_per_gdn_layer": "f['fanout_sum'] * m['gdn_layers']",
-    "shared_tokens_per_layer": "f['shared_tokens'] * m['layers'] / m['tp']",
-    "small_segments_per_layer": "f['small_segments'] * m['layers']",
-    "attention_area_per_layer": "f['attention_area'] * (m['layers'] - m['gdn_layers']) / (1e6 * m['tp'])",
-    "tp_collective_per_layer_segment": "f['segment_count'] * m['layers'] * (m['tp'] > 1)",
-}
+# Terms are the production module's integer term functions, so a fitted table
+# is consumed verbatim by the scorer (single source of truth).
+from art.trainer_rank._planner_cost import (  # noqa: E402
+    TERM_FUNCTIONS,
+    WORK_PER_US,
+    LayoutFeatures,
+    ScoringFacts,
+)
+
+TERMS = TERM_FUNCTIONS
 DEFAULT_TERMS = tuple(TERMS)
 NOISE_BAND_PCT = 3.0
 
@@ -139,15 +134,18 @@ def load_candidates(paths: list[Path]) -> list[Candidate]:
 
 
 def term_matrix(candidates: list[Candidate], terms: tuple[str, ...]) -> np.ndarray:
+    """Term values in feature units (the integer functions divided by WORK_PER_US)."""
+
     rows = []
     for candidate in candidates:
-        namespace = {"f": candidate.features, "m": candidate.facts}
-        rows.append(
-            [
-                float(eval(TERMS[name], {"__builtins__": {}}, namespace))
-                for name in terms
-            ]
-        )  # noqa: S307
+        features = LayoutFeatures(**candidate.features)
+        facts = ScoringFacts(
+            cp_size=int(candidate.facts["cp"]),
+            tp_size=int(candidate.facts["tp"]),
+            layers=int(candidate.facts["layers"]),
+            gdn_layers=int(candidate.facts["gdn_layers"]),
+        )
+        rows.append([TERMS[name](features, facts) / WORK_PER_US for name in terms])
     return np.asarray(rows, dtype=np.float64)
 
 

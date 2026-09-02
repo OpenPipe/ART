@@ -102,6 +102,105 @@ def layout_features(layout: PrefixTreeLayout) -> LayoutFeatures:
 # One integer work unit represents 1/1024 microsecond of predicted wall time.
 WORK_PER_US = 1_024
 
+
+@dataclass(frozen=True, slots=True)
+class ScoringFacts:
+    """Topology and model facts a term may scale by."""
+
+    cp_size: int
+    tp_size: int
+    layers: int
+    gdn_layers: int
+
+
+# Interpretable cost terms: integer functions of (features, facts) in
+# "feature units x WORK_PER_US" so a coefficient in microseconds per unit
+# multiplies to integer work. The calibration fitter regresses measured
+# within-cell timing deltas on exactly these functions, so a fitted table is
+# consumed verbatim by ``score_terms``. Divisions are integer divisions of an
+# already WORK_PER_US-scaled value, keeping every rank bit-identical.
+def _token_work_per_layer(f: LayoutFeatures, m: ScoringFacts) -> int:
+    return f.packed_tokens * m.layers * WORK_PER_US // max(1, m.tp_size)
+
+
+def _token_work_tp_fixed(f: LayoutFeatures, m: ScoringFacts) -> int:
+    return f.packed_tokens * m.layers * WORK_PER_US if m.tp_size > 1 else 0
+
+
+def _segment_launch(f: LayoutFeatures, m: ScoringFacts) -> int:
+    return f.segment_count * (1 + m.cp_size) * WORK_PER_US
+
+
+def _shared_segment(f: LayoutFeatures, m: ScoringFacts) -> int:
+    return f.shared_segments * (1 + m.cp_size) * WORK_PER_US
+
+
+def _level_per_layer(f: LayoutFeatures, m: ScoringFacts) -> int:
+    return max(0, f.max_depth - 1) * m.layers * m.cp_size * WORK_PER_US
+
+
+def _gdn_level_per_gdn_layer(f: LayoutFeatures, m: ScoringFacts) -> int:
+    return max(0, f.max_depth - 1) * m.gdn_layers * WORK_PER_US
+
+
+def _gdn_fanout_per_gdn_layer(f: LayoutFeatures, m: ScoringFacts) -> int:
+    return f.fanout_sum * m.gdn_layers * WORK_PER_US
+
+
+def _shared_tokens_per_layer(f: LayoutFeatures, m: ScoringFacts) -> int:
+    return f.shared_tokens * m.layers * WORK_PER_US // max(1, m.tp_size)
+
+
+def _small_segments_per_layer(f: LayoutFeatures, m: ScoringFacts) -> int:
+    return f.small_segments * m.layers * WORK_PER_US
+
+
+def _attention_area_per_layer(f: LayoutFeatures, m: ScoringFacts) -> int:
+    attention_layers = max(0, m.layers - m.gdn_layers)
+    return (f.attention_area * attention_layers * WORK_PER_US) // (
+        1_000_000 * max(1, m.tp_size)
+    )
+
+
+def _tp_collective_per_layer_segment(f: LayoutFeatures, m: ScoringFacts) -> int:
+    return f.segment_count * m.layers * WORK_PER_US if m.tp_size > 1 else 0
+
+
+TERM_FUNCTIONS = {
+    "token_work_per_layer": _token_work_per_layer,
+    "token_work_tp_fixed": _token_work_tp_fixed,
+    "segment_launch": _segment_launch,
+    "shared_segment": _shared_segment,
+    "level_per_layer": _level_per_layer,
+    "gdn_level_per_gdn_layer": _gdn_level_per_gdn_layer,
+    "gdn_fanout_per_gdn_layer": _gdn_fanout_per_gdn_layer,
+    "shared_tokens_per_layer": _shared_tokens_per_layer,
+    "small_segments_per_layer": _small_segments_per_layer,
+    "attention_area_per_layer": _attention_area_per_layer,
+    "tp_collective_per_layer_segment": _tp_collective_per_layer_segment,
+}
+
+
+def term_values(features: LayoutFeatures, facts: ScoringFacts) -> dict[str, int]:
+    """Every term's integer value (feature units x WORK_PER_US) for one layout."""
+
+    return {name: fn(features, facts) for name, fn in TERM_FUNCTIONS.items()}
+
+
+def score_terms(
+    features: LayoutFeatures,
+    facts: ScoringFacts,
+    coefficients_us: dict[str, int],
+) -> int:
+    """Total predicted work under a coefficient table (microseconds per unit)."""
+
+    return sum(
+        TERM_FUNCTIONS[name](features, facts) * coefficient
+        for name, coefficient in coefficients_us.items()
+        if coefficient
+    )
+
+
 # Calibrated GDN pipeline penalties (microseconds per transformer layer): the
 # first shared depth introduces segment-boundary state exchange; each depth
 # beyond two adds bounded incremental barrier/bucket work.
@@ -158,8 +257,12 @@ __all__ = [
     "GDN_FIRST_SHARED_PIPELINE_US_PER_LAYER",
     "LayoutFeatures",
     "SMALL_SEGMENT_TOKENS",
+    "ScoringFacts",
+    "TERM_FUNCTIONS",
     "TINY_SEGMENT_TOKENS",
     "WORK_PER_US",
     "layout_features",
     "prefix_tree_layout_score",
+    "score_terms",
+    "term_values",
 ]
