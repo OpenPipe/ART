@@ -133,12 +133,62 @@ def load_candidates(paths: list[Path]) -> list[Candidate]:
     return candidates
 
 
+def refresh_features(paths: list[Path]) -> None:
+    """Recompute every cell's candidate features with the current extractor.
+
+    Cells are reproducible from their workload description (GRPO shape and
+    seed, heterogeneous seed, or Ellavox corpus group), so evidence recorded
+    with an older feature set can be brought forward without re-timing.
+    Rewrites the ``calibration_cell`` rows in place.
+    """
+
+    import torch
+
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from trainer_rank_landing_acceptance import _calibration_requests
+
+    from art.trainer_rank._planner_cost import layout_features
+    from art.trainer_rank._prefix_tree_planner import (
+        build_canonical_prefix_tree,
+        prefix_tree_layout_candidates,
+    )
+
+    for path in paths:
+        lines = path.read_text().splitlines()
+        out = []
+        for line in lines:
+            if not line.strip():
+                continue
+            row = json.loads(line)
+            if row.get("record_type") == "calibration_cell":
+                group = int(row["workload"].get("group", 0) or 0)
+                requests, _ = _calibration_requests(row["cell"], group=group)
+                tree = build_canonical_prefix_tree(
+                    tuple(r.input_tokens.reshape(-1).to(torch.long) for r in requests)
+                )
+                by_label = {
+                    label: layout_features(candidate.layout).as_dict()
+                    for candidate in prefix_tree_layout_candidates(tree)
+                    for label in candidate.labels
+                }
+                for candidate in row["candidates"]:
+                    candidate["features"] = by_label[candidate["label"]]
+            out.append(json.dumps(row, sort_keys=True, default=str))
+        path.write_text("\n".join(out) + "\n")
+
+
 def term_matrix(candidates: list[Candidate], terms: tuple[str, ...]) -> np.ndarray:
     """Term values in feature units (the integer functions divided by WORK_PER_US)."""
 
     rows = []
     for candidate in candidates:
-        features = LayoutFeatures(**candidate.features)
+        features = LayoutFeatures(
+            **{
+                **candidate.features,
+                "segments_below": tuple(candidate.features.get("segments_below", ())),
+                "tokens_below": tuple(candidate.features.get("tokens_below", ())),
+            }
+        )
         facts = ScoringFacts(
             cp_size=int(candidate.facts["cp"]),
             tp_size=int(candidate.facts["tp"]),
@@ -149,39 +199,183 @@ def term_matrix(candidates: list[Candidate], terms: tuple[str, ...]) -> np.ndarr
     return np.asarray(rows, dtype=np.float64)
 
 
-def paired_deltas(
-    candidates: list[Candidate], terms: tuple[str, ...]
-) -> tuple[np.ndarray, np.ndarray]:
+@dataclass(frozen=True)
+class Pair:
+    a: Candidate
+    b: Candidate
+    weight: float
+
+    @property
+    def separation_pct(self) -> float:
+        return abs(self.a.ms - self.b.ms) / min(self.a.ms, self.b.ms) * 100.0
+
+
+def candidate_pairs(candidates: list[Candidate]) -> list[Pair]:
+    """Within-cell candidate pairs with base weights.
+
+    Every cell contributes equally regardless of how many candidates it has,
+    and a pair's error counts relative to the pair's magnitude (the ranking
+    decision is between close candidates, not between no-sharing and full
+    sharing).
+    """
+
     by_cell: dict[str, list[Candidate]] = defaultdict(list)
     for candidate in candidates:
         by_cell[candidate.cell].append(candidate)
+    pairs: list[Pair] = []
+    for members in by_cell.values():
+        combos = list(itertools.combinations(members, 2))
+        if not combos:
+            continue
+        cell_weight = 1.0 / math.sqrt(len(combos))
+        for a, b in combos:
+            pairs.append(Pair(a, b, cell_weight / (0.5 * (a.ms + b.ms))))
+    return pairs
+
+
+def paired_deltas(
+    candidates: list[Candidate],
+    terms: tuple[str, ...],
+    pairs: list[Pair] | None = None,
+    extra_weights: dict[int, float] | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Weighted (feature delta, timing delta in us) rows for the pairs."""
+
+    pairs = candidate_pairs(candidates) if pairs is None else pairs
     features = term_matrix(candidates, terms)
     index = {id(candidate): i for i, candidate in enumerate(candidates)}
     xs, ys = [], []
-    for members in by_cell.values():
-        for a, b in itertools.combinations(members, 2):
-            xs.append(features[index[id(a)]] - features[index[id(b)]])
-            ys.append((a.ms - b.ms) * 1_000.0)  # microseconds
+    for position, pair in enumerate(pairs):
+        weight = pair.weight * (extra_weights or {}).get(position, 1.0)
+        xs.append((features[index[id(pair.a)]] - features[index[id(pair.b)]]) * weight)
+        ys.append((pair.a.ms - pair.b.ms) * 1_000.0 * weight)
     return np.asarray(xs), np.asarray(ys)
 
 
-def nnls(x: np.ndarray, y: np.ndarray, *, iterations: int = 20_000) -> np.ndarray:
-    """Projected-gradient non-negative least squares (small problems)."""
+def fit_ranking(
+    candidates: list[Candidate],
+    terms: tuple[str, ...],
+    *,
+    rounds: int = 4,
+    boost: float = 4.0,
+) -> np.ndarray:
+    """Non-negative fit with rank-focused reweighting.
+
+    After each least-squares solve, separated pairs (> NOISE_BAND_PCT apart)
+    whose predicted order is wrong have their weight multiplied by ``boost``
+    and the fit repeats, so the coefficients concentrate on the ranking
+    decisions rather than on the large easy deltas.
+    """
+
+    pairs = candidate_pairs(candidates)
+    extra: dict[int, float] = {}
+    beta = nnls(*paired_deltas(candidates, terms, pairs))
+    for _ in range(rounds):
+        predicted = predict(candidates, terms, beta)
+        index = {id(candidate): i for i, candidate in enumerate(candidates)}
+        wrong = [
+            position
+            for position, pair in enumerate(pairs)
+            if pair.separation_pct > NOISE_BAND_PCT
+            and (pair.a.ms < pair.b.ms)
+            != (predicted[index[id(pair.a)]] < predicted[index[id(pair.b)]])
+        ]
+        if not wrong:
+            break
+        for position in wrong:
+            extra[position] = extra.get(position, 1.0) * boost
+        beta = nnls(*paired_deltas(candidates, terms, pairs, extra))
+    return beta
+
+
+def nnls(x: np.ndarray, y: np.ndarray, *, iterations: int = 500) -> np.ndarray:
+    """Non-negative least squares (Lawson-Hanson active set, column-scaled)."""
 
     if x.size == 0:
         return np.zeros(x.shape[1] if x.ndim == 2 else 0)
     scale = np.maximum(np.abs(x).max(axis=0), 1e-12)
     xs = x / scale
-    beta = np.zeros(xs.shape[1])
-    step = 1.0 / (np.linalg.norm(xs, 2) ** 2 + 1e-12)
+    n = xs.shape[1]
+    passive = np.zeros(n, dtype=bool)
+    beta = np.zeros(n)
+    tolerance = 1e-10 * max(1.0, float(np.abs(xs.T @ y).max()))
     for _ in range(iterations):
-        gradient = xs.T @ (xs @ beta - y)
-        updated = np.maximum(beta - step * gradient, 0.0)
-        if np.max(np.abs(updated - beta)) < 1e-10 * (1 + np.max(np.abs(beta))):
-            beta = updated
+        gradient = xs.T @ (y - xs @ beta)
+        gradient[passive] = -np.inf
+        if gradient.max() <= tolerance:
             break
-        beta = updated
+        passive[int(np.argmax(gradient))] = True
+        while True:
+            trial = np.zeros(n)
+            trial[passive], *_ = np.linalg.lstsq(xs[:, passive], y, rcond=None)
+            negative = passive & (trial <= 0)
+            if not negative.any():
+                beta = trial
+                break
+            # Step back toward the feasible boundary and drop what hits zero.
+            ratios = beta[negative] / np.maximum(
+                beta[negative] - trial[negative], 1e-300
+            )
+            alpha = float(min(1.0, ratios.min()))
+            beta = beta + alpha * (trial - beta)
+            passive &= beta > 1e-12
+            beta[~passive] = 0.0
     return beta / scale
+
+
+def selection_loss(
+    candidates: list[Candidate], predicted_us: np.ndarray, *, pair_weight: float = 0.05
+) -> float:
+    """Sum of selected regret (percent) plus a small pairwise-ordering penalty."""
+
+    report = evaluate(candidates, predicted_us)
+    regret = sum(cell["regret_pct"] for cell in report["per_cell"].values())
+    ordering = (
+        (1.0 - report["pairwise_accuracy"]) * 100.0 if report["ordered_pairs"] else 0.0
+    )
+    return regret + pair_weight * ordering
+
+
+def fit_regret(
+    candidates: list[Candidate],
+    terms: tuple[str, ...],
+    start: np.ndarray,
+    *,
+    sweeps: int = 12,
+) -> np.ndarray:
+    """Minimize selected regret directly by coordinate search in log space.
+
+    Starts from the least-squares solution (which fixes the scale) and tries
+    multiplicative steps per coefficient, including switching a coefficient
+    on at a small value or off; accepts a step only when the training loss
+    falls. Deterministic and cheap: each evaluation is one ranking pass.
+    """
+
+    matrix = term_matrix(candidates, terms)
+    beta = start.copy()
+    positive = beta[beta > 0]
+    floor = float(positive.min()) * 1e-3 if positive.size else 1e-3
+    best = selection_loss(candidates, matrix @ beta)
+    factors = (0.25, 0.5, 0.8, 1.25, 2.0, 4.0)
+    for _ in range(sweeps):
+        improved = False
+        for j in range(len(beta)):
+            current = beta[j]
+            trials = [current * factor for factor in factors if current > 0]
+            trials.append(0.0)
+            if current == 0:
+                trials.extend(floor * factor for factor in (1.0, 10.0, 100.0, 1000.0))
+            for trial in trials:
+                if trial == current:
+                    continue
+                candidate_beta = beta.copy()
+                candidate_beta[j] = trial
+                loss = selection_loss(candidates, matrix @ candidate_beta)
+                if loss < best - 1e-9:
+                    best, beta, improved = loss, candidate_beta, True
+        if not improved:
+            break
+    return beta
 
 
 def predict(
@@ -297,7 +491,26 @@ def main() -> None:
     )
     parser.add_argument("--report", default="", help="write the JSON report here")
     parser.add_argument("--integerize", action="store_true")
+    parser.add_argument(
+        "--rank-rounds",
+        type=int,
+        default=0,
+        help="rank-focused reweighting rounds after the initial least squares",
+    )
+    parser.add_argument(
+        "--objective",
+        choices=("lsq", "regret"),
+        default="regret",
+        help="lsq: weighted non-negative least squares; regret: refine it by direct regret minimization",
+    )
+    parser.add_argument(
+        "--refresh-features",
+        action="store_true",
+        help="recompute candidate features from the reproducible workloads first",
+    )
     arguments = parser.parse_args()
+    if arguments.refresh_features:
+        refresh_features(arguments.evidence)
     terms = tuple(t for t in arguments.terms.split(",") if t)
     candidates = load_candidates(arguments.evidence)
     if not candidates:
@@ -314,8 +527,9 @@ def main() -> None:
 
     train = [c for c in candidates if not held_out(c.cell)]
     test = [c for c in candidates if held_out(c.cell)]
-    x, y = paired_deltas(train, terms)
-    beta = nnls(x, y)
+    beta = fit_ranking(train, terms, rounds=arguments.rank_rounds)
+    if arguments.objective == "regret":
+        beta = fit_regret(train, terms, beta)
     report: dict[str, Any] = {
         "terms": dict(zip(terms, [float(b) for b in beta], strict=True)),
         "train_cells": len({c.cell for c in train}),

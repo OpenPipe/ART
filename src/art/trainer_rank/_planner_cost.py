@@ -30,9 +30,12 @@ if TYPE_CHECKING:
 COEFFICIENT_VERSION = 1
 
 # Segment-length buckets for kernel-utilization effects: a segment shorter than
-# these runs small-M kernels on every rank it is sharded over.
+# these runs small-M kernels on every rank it is sharded over. Context
+# parallelism shards a segment across ranks, so the scorer reads the bucket
+# for ``threshold x cp`` (per-rank length); the histogram covers 64..8192.
 SMALL_SEGMENT_TOKENS = 512
 TINY_SEGMENT_TOKENS = 128
+SEGMENT_LENGTH_THRESHOLDS = (64, 128, 256, 512, 1024, 2048, 4096, 8192)
 
 
 @dataclass(frozen=True, slots=True)
@@ -60,9 +63,30 @@ class LayoutFeatures:
     tiny_segments: int
     # Causal attention pairs over physical rows: sum of len * (start + len/2).
     attention_area: int
+    # Segments shorter than each SEGMENT_LENGTH_THRESHOLDS entry (cumulative),
+    # and the tokens they hold: rows that run small-M kernels per rank.
+    segments_below: tuple[int, ...] = ()
+    tokens_below: tuple[int, ...] = ()
 
-    def as_dict(self) -> dict[str, int]:
+    def as_dict(self) -> dict[str, object]:
         return asdict(self)
+
+    def below(self, tokens: int) -> int:
+        """Segments shorter than ``tokens`` (nearest histogram bucket at or above)."""
+
+        return _bucket(self.segments_below, tokens)
+
+    def tokens_in_segments_below(self, tokens: int) -> int:
+        """Tokens held in segments shorter than ``tokens``."""
+
+        return _bucket(self.tokens_below, tokens)
+
+
+def _bucket(cumulative: tuple[int, ...], tokens: int) -> int:
+    for threshold, count in zip(SEGMENT_LENGTH_THRESHOLDS, cumulative, strict=False):
+        if threshold >= tokens:
+            return count
+    return cumulative[-1] if cumulative else 0
 
 
 def layout_features(layout: PrefixTreeLayout) -> LayoutFeatures:
@@ -73,6 +97,8 @@ def layout_features(layout: PrefixTreeLayout) -> LayoutFeatures:
     small = 0
     tiny = 0
     area = 0
+    below = [0] * len(SEGMENT_LENGTH_THRESHOLDS)
+    tokens_below = [0] * len(SEGMENT_LENGTH_THRESHOLDS)
     for segment in layout.segments:
         length = segment.end - segment.start
         fanout = len(segment.sequence_indices)
@@ -85,6 +111,10 @@ def layout_features(layout: PrefixTreeLayout) -> LayoutFeatures:
             small += 1
         if length < TINY_SEGMENT_TOKENS:
             tiny += 1
+        for index, threshold in enumerate(SEGMENT_LENGTH_THRESHOLDS):
+            if length < threshold:
+                below[index] += 1
+                tokens_below[index] += length
         area += length * segment.start + (length * length) // 2
     return LayoutFeatures(
         packed_tokens=layout.packed_tokens,
@@ -96,6 +126,8 @@ def layout_features(layout: PrefixTreeLayout) -> LayoutFeatures:
         small_segments=small,
         tiny_segments=tiny,
         attention_area=area,
+        segments_below=tuple(below),
+        tokens_below=tuple(tokens_below),
     )
 
 
@@ -119,65 +151,130 @@ class ScoringFacts:
 # within-cell timing deltas on exactly these functions, so a fitted table is
 # consumed verbatim by ``score_terms``. Divisions are integer divisions of an
 # already WORK_PER_US-scaled value, keeping every rank bit-identical.
-def _token_work_per_layer(f: LayoutFeatures, m: ScoringFacts) -> int:
-    return f.packed_tokens * m.layers * WORK_PER_US // max(1, m.tp_size)
+#
+# Topology enters through explicit interactions rather than per-topology
+# tables: per-rank token work shrinks with tp x cp, while dependency levels,
+# GDN state hand-offs and segment launches carry extra cost when they cross
+# CP or TP ranks ((cp - 1) and (tp - 1) factors).
+def _ranks(m: ScoringFacts) -> int:
+    return max(1, m.tp_size) * max(1, m.cp_size)
 
 
-def _token_work_tp_fixed(f: LayoutFeatures, m: ScoringFacts) -> int:
-    return f.packed_tokens * m.layers * WORK_PER_US if m.tp_size > 1 else 0
+def _token_per_rank(f: LayoutFeatures, m: ScoringFacts) -> int:
+    return f.packed_tokens * m.layers * WORK_PER_US // _ranks(m)
 
 
-def _segment_launch(f: LayoutFeatures, m: ScoringFacts) -> int:
-    return f.segment_count * (1 + m.cp_size) * WORK_PER_US
+def _token_cp_exchange(f: LayoutFeatures, m: ScoringFacts) -> int:
+    cp = max(1, m.cp_size)
+    return f.packed_tokens * m.layers * (cp - 1) * WORK_PER_US // cp
 
 
-def _shared_segment(f: LayoutFeatures, m: ScoringFacts) -> int:
-    return f.shared_segments * (1 + m.cp_size) * WORK_PER_US
+def _token_tp_collective(f: LayoutFeatures, m: ScoringFacts) -> int:
+    tp = max(1, m.tp_size)
+    return f.packed_tokens * m.layers * (tp - 1) * WORK_PER_US // tp
+
+
+def _segment_per_layer(f: LayoutFeatures, m: ScoringFacts) -> int:
+    return f.segment_count * m.layers * WORK_PER_US
+
+
+def _segment_cross_rank_per_layer(f: LayoutFeatures, m: ScoringFacts) -> int:
+    return f.segment_count * m.layers * (_ranks(m) - 1) * WORK_PER_US
+
+
+def _segment_per_rank(f: LayoutFeatures, m: ScoringFacts) -> int:
+    return f.segment_count * m.layers * WORK_PER_US // _ranks(m)
+
+
+def _small_segment_per_layer(f: LayoutFeatures, m: ScoringFacts) -> int:
+    # Small per rank: a segment is sharded across the CP ranks.
+    return f.below(SMALL_SEGMENT_TOKENS * max(1, m.cp_size)) * m.layers * WORK_PER_US
+
+
+def _tiny_segment_per_layer(f: LayoutFeatures, m: ScoringFacts) -> int:
+    return f.below(TINY_SEGMENT_TOKENS * max(1, m.cp_size)) * m.layers * WORK_PER_US
+
+
+def _short_tokens_per_rank(f: LayoutFeatures, m: ScoringFacts) -> int:
+    """Extra per-token cost for rows in segments that are short per rank."""
+
+    tokens = f.tokens_in_segments_below(SMALL_SEGMENT_TOKENS * max(1, m.cp_size))
+    return tokens * m.layers * WORK_PER_US // _ranks(m)
+
+
+def _tiny_tokens_per_rank(f: LayoutFeatures, m: ScoringFacts) -> int:
+    tokens = f.tokens_in_segments_below(TINY_SEGMENT_TOKENS * max(1, m.cp_size))
+    return tokens * m.layers * WORK_PER_US // _ranks(m)
 
 
 def _level_per_layer(f: LayoutFeatures, m: ScoringFacts) -> int:
-    return max(0, f.max_depth - 1) * m.layers * m.cp_size * WORK_PER_US
+    return max(0, f.max_depth - 1) * m.layers * WORK_PER_US
 
 
-def _gdn_level_per_gdn_layer(f: LayoutFeatures, m: ScoringFacts) -> int:
+def _level_cp_per_layer(f: LayoutFeatures, m: ScoringFacts) -> int:
+    return max(0, f.max_depth - 1) * m.layers * (max(1, m.cp_size) - 1) * WORK_PER_US
+
+
+def _level_tp_per_layer(f: LayoutFeatures, m: ScoringFacts) -> int:
+    return max(0, f.max_depth - 1) * m.layers * (max(1, m.tp_size) - 1) * WORK_PER_US
+
+
+def _gdn_level(f: LayoutFeatures, m: ScoringFacts) -> int:
     return max(0, f.max_depth - 1) * m.gdn_layers * WORK_PER_US
 
 
-def _gdn_fanout_per_gdn_layer(f: LayoutFeatures, m: ScoringFacts) -> int:
-    return f.fanout_sum * m.gdn_layers * WORK_PER_US
-
-
-def _shared_tokens_per_layer(f: LayoutFeatures, m: ScoringFacts) -> int:
-    return f.shared_tokens * m.layers * WORK_PER_US // max(1, m.tp_size)
-
-
-def _small_segments_per_layer(f: LayoutFeatures, m: ScoringFacts) -> int:
-    return f.small_segments * m.layers * WORK_PER_US
-
-
-def _attention_area_per_layer(f: LayoutFeatures, m: ScoringFacts) -> int:
-    attention_layers = max(0, m.layers - m.gdn_layers)
-    return (f.attention_area * attention_layers * WORK_PER_US) // (
-        1_000_000 * max(1, m.tp_size)
+def _gdn_level_cp(f: LayoutFeatures, m: ScoringFacts) -> int:
+    return (
+        max(0, f.max_depth - 1) * m.gdn_layers * (max(1, m.cp_size) - 1) * WORK_PER_US
     )
 
 
-def _tp_collective_per_layer_segment(f: LayoutFeatures, m: ScoringFacts) -> int:
-    return f.segment_count * m.layers * WORK_PER_US if m.tp_size > 1 else 0
+def _gdn_level_tp(f: LayoutFeatures, m: ScoringFacts) -> int:
+    return (
+        max(0, f.max_depth - 1) * m.gdn_layers * (max(1, m.tp_size) - 1) * WORK_PER_US
+    )
+
+
+def _gdn_fanout(f: LayoutFeatures, m: ScoringFacts) -> int:
+    return f.fanout_sum * m.gdn_layers * WORK_PER_US
+
+
+def _gdn_fanout_cross_rank(f: LayoutFeatures, m: ScoringFacts) -> int:
+    return f.fanout_sum * m.gdn_layers * (_ranks(m) - 1) * WORK_PER_US
+
+
+def _shared_tokens_per_rank(f: LayoutFeatures, m: ScoringFacts) -> int:
+    return f.shared_tokens * m.layers * WORK_PER_US // _ranks(m)
+
+
+def _attention_area_per_rank(f: LayoutFeatures, m: ScoringFacts) -> int:
+    attention_layers = max(0, m.layers - m.gdn_layers)
+    return (f.attention_area * attention_layers * WORK_PER_US) // (
+        1_000_000 * _ranks(m)
+    )
 
 
 TERM_FUNCTIONS = {
-    "token_work_per_layer": _token_work_per_layer,
-    "token_work_tp_fixed": _token_work_tp_fixed,
-    "segment_launch": _segment_launch,
-    "shared_segment": _shared_segment,
+    "token_per_rank": _token_per_rank,
+    "token_cp_exchange": _token_cp_exchange,
+    "token_tp_collective": _token_tp_collective,
+    "segment_per_layer": _segment_per_layer,
+    "segment_cross_rank_per_layer": _segment_cross_rank_per_layer,
+    "segment_per_rank": _segment_per_rank,
+    "small_segment_per_layer": _small_segment_per_layer,
+    "tiny_segment_per_layer": _tiny_segment_per_layer,
+    "short_tokens_per_rank": _short_tokens_per_rank,
+    "tiny_tokens_per_rank": _tiny_tokens_per_rank,
     "level_per_layer": _level_per_layer,
-    "gdn_level_per_gdn_layer": _gdn_level_per_gdn_layer,
-    "gdn_fanout_per_gdn_layer": _gdn_fanout_per_gdn_layer,
-    "shared_tokens_per_layer": _shared_tokens_per_layer,
-    "small_segments_per_layer": _small_segments_per_layer,
-    "attention_area_per_layer": _attention_area_per_layer,
-    "tp_collective_per_layer_segment": _tp_collective_per_layer_segment,
+    "level_cp_per_layer": _level_cp_per_layer,
+    "level_tp_per_layer": _level_tp_per_layer,
+    "gdn_level": _gdn_level,
+    "gdn_level_cp": _gdn_level_cp,
+    "gdn_level_tp": _gdn_level_tp,
+    "gdn_fanout": _gdn_fanout,
+    "gdn_fanout_cross_rank": _gdn_fanout_cross_rank,
+    "shared_tokens_per_rank": _shared_tokens_per_rank,
+    "attention_area_per_rank": _attention_area_per_rank,
 }
 
 
@@ -256,6 +353,7 @@ __all__ = [
     "GDN_EXCESS_DEPTH_PIPELINE_US_PER_LAYER",
     "GDN_FIRST_SHARED_PIPELINE_US_PER_LAYER",
     "LayoutFeatures",
+    "SEGMENT_LENGTH_THRESHOLDS",
     "SMALL_SEGMENT_TOKENS",
     "ScoringFacts",
     "TERM_FUNCTIONS",

@@ -1912,8 +1912,25 @@ def _gdn_layer_count(model: Any) -> int:
     return sum(isinstance(module, GatedDeltaNet) for module in model.modules())
 
 
-def _hetero_requests(seed: int) -> list[Any]:
-    """Heterogeneous control: three families with modest shared prefixes plus
+HETERO_FAMILIES: dict[str, tuple[tuple[int, tuple[int, ...]], ...]] = {
+    # (shared prefix length, completion lengths) per family; singletons added.
+    "cal-hetero": (
+        (512, (256, 1_024, 640, 384)),
+        (2_048, (128, 2_048, 512)),
+        (4_096, (768, 256)),
+    ),
+    "cal-hetero2": (
+        (256, (512, 512, 1_536)),
+        (1_024, (2_048, 256, 768, 1_280, 384)),
+        (3_072, (128, 640)),
+        (6_144, (1_024, 2_048, 512)),
+    ),
+    "cal-hetero3": ((1_536, (896, 384, 1_152, 640, 256, 2_304)), (768, (320, 1_792))),
+}
+
+
+def _hetero_requests(seed: int, cell: str = "cal-hetero") -> list[Any]:
+    """Heterogeneous controls: a few families with modest shared prefixes plus
     singletons, so sharing is available but never dramatic."""
 
     import torch
@@ -1925,9 +1942,7 @@ def _hetero_requests(seed: int) -> list[Any]:
         return torch.randint(low=10, high=64_000, size=(count,), generator=generator)
 
     requests: list[Any] = []
-    for family, (prefix_len, completions) in enumerate(
-        ((512, (256, 1_024, 640, 384)), (2_048, (128, 2_048, 512)), (4_096, (768, 256)))
-    ):
+    for family, (prefix_len, completions) in enumerate(HETERO_FAMILIES[cell]):
         prefix = _tokens(seed * 7_001 + family * 101, prefix_len)
         for branch, completion_len in enumerate(completions):
             tokens = torch.cat(
@@ -1966,8 +1981,9 @@ def _calibration_requests(
         shape = (4, 4, 1_023, 3_072, 511)
         requests = [r for g in _grpo_groups(6_501, shape) for r in g]
         return requests, {"kind": "grpo", "shape": list(shape), "seed": 6_501}
-    if cell == "cal-hetero":
-        return _hetero_requests(7_777), {"kind": "hetero", "seed": 7_777}
+    if cell in HETERO_FAMILIES:
+        seed = {"cal-hetero": 7_777, "cal-hetero2": 7_778, "cal-hetero3": 7_779}[cell]
+        return _hetero_requests(seed, cell), {"kind": cell, "seed": seed}
     if cell == "cal-ellavox":
         return _ellavox_requests(group), {"kind": "ellavox", "group": group}
     raise ValueError(f"unknown calibration cell {cell!r}")

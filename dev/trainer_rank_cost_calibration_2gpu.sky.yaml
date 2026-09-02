@@ -19,6 +19,9 @@ envs:
   RUN_ID: unset
   REPEAT: "8"
   ELLAVOX_GROUPS: "0 1 2 3 4 5 6 7"
+  # "main" = TP2 GRPO/hetero + Ellavox CP2; "cp2-hetero" = GRPO/hetero at CP2
+  # and heterogeneous variants at TP2 (second campaign).
+  CELL_SET: main
 
 resources:
   cloud: kubernetes
@@ -53,15 +56,27 @@ run: |
       --cell "$3" --model "$4" --layers "$5" --group "${6:-0}" --repeat "${REPEAT}" \
       --evidence "${root}/evidence.jsonl" 2>&1 | tee "${root}/tp$1-cp$2-$3-$5-g${6:-0}.log" | grep -E "cost-calibrate|LANDING|Traceback" || true
   }
-  cell 2 1 cal-grpo-g8   Qwen/Qwen3.5-4B 0
-  cell 2 1 cal-grpo-g16  Qwen/Qwen3.5-4B 0
-  cell 2 1 cal-grpo-g4x4 Qwen/Qwen3.5-4B 0
-  cell 2 1 cal-hetero    Qwen/Qwen3.5-4B 0
-  cell 2 1 cal-grpo-g8   Qwen/Qwen3-4B   0
-  for g in ${ELLAVOX_GROUPS}; do
-    cell 1 2 cal-ellavox Qwen/Qwen3.5-4B 0 "$g"
-  done
-  echo "cost-calibration 2gpu: done"
+  if [ "${CELL_SET}" = "main" ]; then
+    cell 2 1 cal-grpo-g8   Qwen/Qwen3.5-4B 0
+    cell 2 1 cal-grpo-g16  Qwen/Qwen3.5-4B 0
+    cell 2 1 cal-grpo-g4x4 Qwen/Qwen3.5-4B 0
+    cell 2 1 cal-hetero    Qwen/Qwen3.5-4B 0
+    cell 2 1 cal-grpo-g8   Qwen/Qwen3-4B   0
+    for g in ${ELLAVOX_GROUPS}; do
+      cell 1 2 cal-ellavox Qwen/Qwen3.5-4B 0 "$g"
+    done
+  else
+    cell 1 2 cal-grpo-g8   Qwen/Qwen3.5-4B 0
+    cell 1 2 cal-grpo-g16  Qwen/Qwen3.5-4B 0
+    cell 1 2 cal-grpo-g4x4 Qwen/Qwen3.5-4B 0
+    cell 1 2 cal-hetero    Qwen/Qwen3.5-4B 0
+    cell 1 2 cal-hetero2   Qwen/Qwen3.5-4B 0
+    cell 1 2 cal-hetero3   Qwen/Qwen3.5-4B 0
+    cell 1 2 cal-grpo-g8   Qwen/Qwen3-4B   0
+    cell 2 1 cal-hetero2   Qwen/Qwen3.5-4B 0
+    cell 2 1 cal-hetero3   Qwen/Qwen3.5-4B 0
+  fi
+  echo "cost-calibration 2gpu (${CELL_SET}): done"
 
 config:
   kubernetes:

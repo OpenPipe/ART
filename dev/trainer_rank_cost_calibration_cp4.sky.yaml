@@ -16,9 +16,18 @@ name: trainer-rank-cost-calibration-cp4
 
 workdir: .
 
+# The corpus is git-ignored (customer-derived tokens); mounted for the Ellavox
+# CP4 cells and never committed.
+file_mounts:
+  /tmp/trainer_rank_ellavox_corpus.json: dev/_trainer_rank_ellavox_qwen35_4b_tokens.json
+
 envs:
   RUN_ID: unset
   REPEAT: "8"
+  # "main" = GRPO/hetero/attention cells; "hetero-ellavox" = heterogeneous
+  # variants and Ellavox groups (second campaign).
+  CELL_SET: main
+  ELLAVOX_GROUPS: "0 1 2 3 4 5 6 7"
 
 resources:
   cloud: kubernetes
@@ -47,20 +56,30 @@ run: |
   export PYTHONUNBUFFERED=1
   uv run --no-sync python dev/trainer_rank_landing_acceptance.py --phase contract
 
-  cell() {  # cell model layers
+  cp /tmp/trainer_rank_ellavox_corpus.json dev/_trainer_rank_ellavox_qwen35_4b_tokens.json
+  cell() {  # cell model layers [group]
     timeout 7200s megatron_runtime/.venv/bin/python -m torch.distributed.run --standalone --nproc-per-node=4 \
       dev/trainer_rank_landing_acceptance.py --phase cost-calibrate \
-      --cell "$1" --model "$2" --layers "$3" --repeat "${REPEAT}" \
-      --evidence "${root}/evidence.jsonl" 2>&1 | tee "${root}/$1-$3.log" | grep -E "cost-calibrate|LANDING|Traceback" || true
+      --cell "$1" --model "$2" --layers "$3" --group "${4:-0}" --repeat "${REPEAT}" \
+      --evidence "${root}/evidence.jsonl" 2>&1 | tee "${root}/$1-$3-g${4:-0}.log" | grep -E "cost-calibrate|LANDING|Traceback" || true
   }
-  cell cal-grpo-g8-long Qwen/Qwen3.5-4B 2
-  cell cal-grpo-g8      Qwen/Qwen3.5-4B 0
-  cell cal-grpo-g16     Qwen/Qwen3.5-4B 0
-  cell cal-grpo-g4x4    Qwen/Qwen3.5-4B 0
-  cell cal-hetero       Qwen/Qwen3.5-4B 0
-  cell cal-grpo-g8-long Qwen/Qwen3-4B   2
-  cell cal-grpo-g8      Qwen/Qwen3-4B   0
-  echo "cost-calibration cp4: done"
+  if [ "${CELL_SET}" = "main" ]; then
+    cell cal-grpo-g8-long Qwen/Qwen3.5-4B 2
+    cell cal-grpo-g8      Qwen/Qwen3.5-4B 0
+    cell cal-grpo-g16     Qwen/Qwen3.5-4B 0
+    cell cal-grpo-g4x4    Qwen/Qwen3.5-4B 0
+    cell cal-hetero       Qwen/Qwen3.5-4B 0
+    cell cal-grpo-g8-long Qwen/Qwen3-4B   2
+    cell cal-grpo-g8      Qwen/Qwen3-4B   0
+  else
+    cell cal-hetero2 Qwen/Qwen3.5-4B 0
+    cell cal-hetero3 Qwen/Qwen3.5-4B 0
+    cell cal-hetero2 Qwen/Qwen3-4B   0
+    for g in ${ELLAVOX_GROUPS}; do
+      cell cal-ellavox Qwen/Qwen3.5-4B 0 "$g"
+    done
+  fi
+  echo "cost-calibration cp4 (${CELL_SET}): done"
 
 config:
   kubernetes:

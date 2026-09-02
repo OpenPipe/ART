@@ -35,9 +35,9 @@ def _candidate(
 
 
 def test_paired_delta_nnls_recovers_known_coefficients() -> None:
-    terms = ("token_work_per_layer", "level_per_layer")
-    # True model: 5 us per token-layer, 20 ms per (level x layer x cp); a cell
-    # constant of 300 ms cancels in paired deltas.
+    terms = ("token_per_rank", "level_cp_per_layer")
+    # True model: 5 us per per-rank token-layer, 20 ms per (level x layer x
+    # (cp - 1)); a cell constant of 300 ms cancels in paired deltas.
     true = np.array([5.0, 20_000.0])
     cells = []
     for cell in range(3):
@@ -47,13 +47,15 @@ def test_paired_delta_nnls_recovers_known_coefficients() -> None:
             ("b", 12_000, 2),
             ("c", 8_000, 3),
         ):
-            features = np.array([packed * 2 / 1, (depth - 1) * 2 * 4])
+            features = np.array([packed * 2 // 4, (depth - 1) * 2 * 3])
             ms = base + float(features @ true) / 1_000.0
             cells.append(
                 _candidate(f"cell{cell}", label, packed, 16 + depth, depth, ms)
             )
     x, y = fit.paired_deltas(cells, terms)
     beta = fit.nnls(x, y)
+    assert np.allclose(beta, true, rtol=1e-3)
+    beta = fit.fit_ranking(cells, terms)
     assert np.allclose(beta, true, rtol=1e-3)
     report = fit.evaluate(cells, fit.predict(cells, terms, beta))
     assert report["pairwise_accuracy"] == 1.0

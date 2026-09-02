@@ -50,6 +50,8 @@ def test_layout_features_on_the_sealed_grpo_shape() -> None:
         small_segments=0,
         tiny_segments=0,
         attention_area=16 * (10_752 * 10_752 // 2),
+        segments_below=(0, 0, 0, 0, 0, 0, 0, 0),
+        tokens_below=(0, 0, 0, 0, 0, 0, 0, 0),
     )
     depth_one = by_label["depth_one"]
     assert (depth_one.packed_tokens, depth_one.segment_count) == (141_312, 17)
@@ -73,3 +75,12 @@ def test_layout_features_on_the_sealed_grpo_shape() -> None:
     # fifth of the pairs the unshared layout does.
     assert full.attention_area < no_sharing.attention_area // 4
     assert full.as_dict()["attention_area"] == full.attention_area
+    # Full sharing: one 2,048-token system, two 8,192-token prompts, sixteen
+    # 512-token completions. Cumulative counts below 64..8192.
+    # (strictly shorter, so the 2,048-token system counts only below 4,096).
+    assert full.segments_below == (0, 0, 0, 0, 16, 16, 17, 17)
+    assert full.below(512) == 0 and full.below(1024) == 16
+    # CP4 reads the bucket for 512 * 4 = 2,048 tokens per rank.
+    assert full.below(512 * 4) == 16 and full.below(128 * 4) == 0
+    assert full.tokens_in_segments_below(1024) == 16 * 512
+    assert full.tokens_in_segments_below(4096) == 16 * 512 + 2048
