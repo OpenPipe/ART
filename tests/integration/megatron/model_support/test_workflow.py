@@ -886,7 +886,7 @@ def test_validated_architecture_representative_models_are_fixed() -> None:
     ]
 
 
-def test_qwen38_uses_its_measured_throughput_fingerprint() -> None:
+def test_aliases_use_their_measured_throughput_fingerprints() -> None:
     qwen35 = handler_workflow_resources_for_base_model("Qwen/Qwen3.5-27B")
     qwen38 = handler_workflow_resources_for_base_model("Qwen/Qwen3.8-27B")
     assert qwen35 is not None and qwen35.e2e_throughput is not None
@@ -899,6 +899,16 @@ def test_qwen38_uses_its_measured_throughput_fingerprint() -> None:
     )
     assert qwen38_config.thresholds["b300"].calibration_fingerprint == (
         "b07ee7ec6338ec021463a43a90fc96c5c5a036b4a04d90b80e1d22c1eef86774"
+    )
+    lightning = handler_workflow_resources_for_base_model(
+        "nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16"
+    )
+    assert lightning is not None and lightning.e2e_throughput is not None
+    assert lightning.e2e_throughput.throughput is not None
+    assert lightning.e2e_throughput.throughput.thresholds[
+        "b300"
+    ].calibration_fingerprint == (
+        "61c9e114ce17335ccf2a644d49b0fba7f3341d0f8af0b9f7df19f940c33209c7"
     )
 
 
