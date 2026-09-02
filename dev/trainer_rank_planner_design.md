@@ -127,16 +127,18 @@ What the data showed:
 
 Gates (held-out cells, noise-qualified): pairwise ordering ≥ 90% on pairs
 separated by more than 3%, median regret ≤ 2%, p95 ≤ 5%, none above 10%,
-clear winners selected within 5%. Measured on the 38 calibration cells: the
-fitted table ranks 99.0% of separated pairs correctly, p95 regret 2.0%, max
-4.0% (a 2-layer attention CP4 cell whose two deep-sharing layouts differ by
-4%); the held-out Ellavox groups pass, and so do ablations withholding every
-heterogeneous cell, every TP2 cell, or the whole attention model. Withholding
-every CP4 cell does not extrapolate (a CP4 heterogeneous cell is then
-misranked by 25%), so CP4 cells stay in the fit. The production selector, beam
-search included, on the same cells: median regret 0%, max 4.0%, never a layout
-outside the measured family. The hand-set version-1 score on the same cells:
-81.6% pairwise, max regret 62% (an Ellavox group at CP2).
+clear winners selected within 5%. Measured on the 56 calibration cells (3,844
+within-cell pairs): the fitted table ranks 98.1% of separated pairs
+correctly, p95 regret 2.9%, max 4.2%, no clear misses; the pre-registered
+holdout (the odd Ellavox groups, 11 cells) passes. Ablations withholding
+every TP2 cell, every CP2 cell, or the whole attention model pass; withholding
+every heterogeneous cell misranks one CP4 heterogeneous cell by 9.5%, and
+withholding every CP4 cell does not extrapolate (25%), so those cells stay in
+the fit. Robustness: the table fitted on the first 38 cells, run through the
+real selector on the 18 later cells, was already within 4.2% everywhere, and
+the production selection timed in the later CP2/TP2 cells had median regret
+−0.2%, max 0.4%. The hand-set version-1 score on the same 56 cells: 78.6%
+pairwise, max regret 67% (an Ellavox group at CP2).
 
 Landing gates re-derived: the sealed win-cell shape still selects deep sharing
 (prompt-level sharing at CP4, where it measures fastest; full sharing at CP1),

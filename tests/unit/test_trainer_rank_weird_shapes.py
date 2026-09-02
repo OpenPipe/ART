@@ -458,10 +458,10 @@ def test_width_search_survives_non_monotone_cost_optimal_layouts(
     width 3 instead of stopping at the spurious failure.
     """
 
-    # 500 shared tokens on the attention model: one saved copy (width 2) does
-    # not pay for the extra segment under the fitted cost model, two saved
+    # 200 shared tokens on the attention model: one saved copy (width 2) does
+    # not pay for the extra level under the fitted cost model, two saved
     # copies (width 3) do.
-    shared = tuple(range(10_000, 10_500))
+    shared = tuple(range(10_000, 10_200))
     inputs = [_target_request(_tokens(*shared, tail)) for tail in (1, 2, 3)]
     rank = TrainerRank(_attention_runtime())
     monkeypatch.setattr(rank, "_dp_rank_and_size", lambda: (0, 1))
@@ -477,14 +477,14 @@ def test_width_search_survives_non_monotone_cost_optimal_layouts(
     # Confirm the non-monotone premise under the production cost model.
     two = rank._plan_flat_forward(inputs[:2])
     three = rank._plan_flat_forward(inputs)
-    assert two.packed_tokens == 1_002, two.packed_tokens
-    assert three.packed_tokens == 503, three.packed_tokens
-    _set_packed_token_budget(monkeypatch, rank, 700)
+    assert two.packed_tokens == 402, two.packed_tokens
+    assert three.packed_tokens == 203, three.packed_tokens
+    _set_packed_token_budget(monkeypatch, rank, 300)
 
     batches = list(rank.forward_micro_batches(inputs))
 
     assert [batch.stats.global_count for batch in batches] == [3]
-    assert batches[0].stats.packed_tokens <= 700
+    assert batches[0].stats.packed_tokens <= 300
 
 
 def test_dp_rank_forward_falls_back_to_memory_minimal_layout_before_refusing(
