@@ -4,6 +4,7 @@ import asyncio
 from collections import Counter
 from collections.abc import Awaitable, Callable
 import logging
+from pathlib import Path
 import time
 from typing import Any, Literal
 from urllib.parse import urlparse
@@ -15,6 +16,7 @@ from art.megatron.runtime.managed import MegatronRuntimeInfo
 from art.megatron.runtime.specs import TrainerRuntimeSpec, TrainingRunSpec
 from art.utils.lifecycle import complete_task
 from art.vllm_route_transport import (
+    RetainedRouteBundleRef,
     RouteBundleReader,
     local_retained_route_bundle_transfer,
     publish_retained_route_bundle_transfer,
@@ -105,6 +107,14 @@ class DistributedPackedBatch(BaseModel):
     packed_batch_finalize_s: float = 0.0
     packed_batch_fanout_s: float = 0.0
     packing_generation_id: str
+
+
+def _route_refs_are_local_files(refs: tuple[RetainedRouteBundleRef, ...]) -> bool:
+    return all(
+        Path(ref.object.locator).is_absolute()
+        and Path(ref.object.locator).suffix == ".routes"
+        for ref in refs
+    )
 
 
 class ArtRuntime:
@@ -905,6 +915,7 @@ class ArtRuntime:
                     if (
                         self._route_bundle_reader.retained_route_transport
                         == "holder_local"
+                        and _route_refs_are_local_files(refs)
                     ):
                         if len(trainer_hosts) != 1:
                             raise RuntimeError(

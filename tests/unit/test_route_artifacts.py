@@ -1,5 +1,6 @@
 import hashlib
 import struct
+from types import SimpleNamespace
 
 import pytest
 
@@ -17,6 +18,16 @@ from art.vllm_route_transport import (
     local_retained_route_bundle_transfer,
     route_bundle_id,
 )
+
+
+def test_opaque_holder_route_never_selects_path_loader() -> None:
+    from art.distributed.art_runtime import _route_refs_are_local_files
+
+    ref = SimpleNamespace(object=SimpleNamespace(locator="holder-local:owner:bundle"))
+    assert not _route_refs_are_local_files((ref,))  # type: ignore[arg-type]
+
+    ref.object.locator = "/dev/shm/art_vllm_routes/bundle.routes"
+    assert _route_refs_are_local_files((ref,))  # type: ignore[arg-type]
 
 
 @pytest.mark.asyncio
