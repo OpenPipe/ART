@@ -276,7 +276,10 @@ async def test_training_runs_resolve_serializes_exact_initial_state() -> None:
     service = _ResolveTransport()
     spec = TrainingRunSpec(
         base_model="Qwen/Qwen3-30B-A3B",
-        adapter=AdapterSpec(rank=8, target_modules=("linear_qkv",)),
+        adapter=AdapterSpec(
+            rank=8,
+            target_modules=("q_proj", "k_proj", "v_proj", "o_proj"),
+        ),
         seed=17,
     )
     initial_state = RunInitialState(
@@ -299,7 +302,7 @@ async def test_training_runs_resolve_serializes_exact_initial_state() -> None:
             "base_model": "Qwen/Qwen3-30B-A3B",
             "dtype": "bfloat16",
             "lora_rank": 8,
-            "lora_target_modules": ["linear_qkv"],
+            "lora_target_modules": ["k_proj", "o_proj", "q_proj", "v_proj"],
             "seed": 17,
         },
         "initial_state": {

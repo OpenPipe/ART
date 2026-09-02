@@ -337,7 +337,7 @@ class TrainingRuns(AsyncAPIResource):
             "base_model": spec.base_model,
             "dtype": spec.dtype,
             "lora_rank": spec.adapter.rank,
-            "lora_target_modules": list(spec.adapter.target_modules),
+            "lora_target_modules": sorted(spec.adapter.target_modules),
             "seed": spec.seed,
         }
         body: dict[str, Any] = {
