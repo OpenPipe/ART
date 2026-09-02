@@ -1,0 +1,15 @@
+{"task": "Review this code:\n```python\ndef calculate_discount(price, discount):\n    return price - (price * discount / 100)\n```", "has_critical": false}
+{"task": "Review this code:\n```javascript\napp.get('/user/:id', (req, res) => {\n    const user = db.query(`SELECT * FROM users WHERE id = ${req.params.id}`);\n    res.json(user);\n});\n```", "has_critical": true}
+{"task": "Review this code:\n```python\ndef process_payment(card_number, amount):\n    print(f'Processing payment: {card_number} for ${amount}')\n    return stripe.charge(card_number, amount)\n```", "has_critical": true}
+{"task": "Review this code:\n```python\ndef get_items(items):\n    result = []\n    for i in range(len(items)):\n        result.append(items[i].upper())\n    return result\n```", "has_critical": false}
+{"task": "Review this code:\n```javascript\nfunction validateEmail(email) {\n    return email.includes('@');\n}\n```", "has_critical": false}
+{"task": "Review this code:\n```python\nimport pickle\n\ndef load_user_data(data):\n    return pickle.loads(data)\n```", "has_critical": true}
+{"task": "Review this code:\n```python\ndef divide(a, b):\n    return a / b\n```", "has_critical": false}
+{"task": "Review this code:\n```javascript\nconst password = 'admin123';\nfunction authenticate(user, pass) {\n    return pass === password;\n}\n```", "has_critical": true}
+{"task": "Review this code:\n```python\ndef fetch_url(url):\n    import subprocess\n    return subprocess.run(['curl', url], capture_output=True)\n```", "has_critical": true}
+{"task": "Review this code:\n```python\nclass UserService:\n    def __init__(self):\n        self.db = Database()\n        self.cache = Redis()\n        self.logger = Logger()\n        self.mailer = Mailer()\n        self.validator = Validator()\n    \n    def create_user(self, data):\n        if self.validator.validate(data):\n            user = self.db.insert(data)\n            self.cache.set(user.id, user)\n            self.logger.info(f'Created {user.id}')\n            self.mailer.send_welcome(user.email)\n            return user\n```", "has_critical": false}
+{"task": "Review this code:\n```python\ndef is_admin(user_id):\n    # TODO: implement properly\n    return True\n```", "has_critical": true}
+{"task": "Review this code:\n```javascript\nfunction sanitize(input) {\n    return input.replace('<', '&lt;').replace('>', '&gt;');\n}\n```", "has_critical": true}
+{"task": "Review this code:\n```python\ndef retry(func, max_attempts=3):\n    for i in range(max_attempts):\n        try:\n            return func()\n        except Exception:\n            if i == max_attempts - 1:\n                raise\n            time.sleep(2 ** i)\n```", "has_critical": false}
+{"task": "Review this code:\n```python\nfrom flask import request\n\n@app.route('/search')\ndef search():\n    query = request.args.get('q')\n    return render_template_string(f'<h1>Results for {query}</h1>')\n```", "has_critical": true}
+{"task": "Review this code:\n```python\ndef parse_config(config_str):\n    return eval(config_str)\n```", "has_critical": true}
