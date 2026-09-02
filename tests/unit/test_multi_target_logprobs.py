@@ -3,8 +3,17 @@ from types import SimpleNamespace
 import pytest
 import torch
 import torch.nn.functional as F
+import triton
+import triton.language as tl
 
+from art.megatron.multi_target_logprobs import _row_offset
 from art.megatron.selective_lm_head import selected_target_logprobs
+
+
+@triton.jit
+def _row_offset_probe(output, STRIDE: tl.constexpr):
+    row = tl.program_id(0)
+    tl.store(output + row, _row_offset(row, STRIDE))
 
 
 class _SingleTargetModel(torch.nn.Module):
@@ -42,6 +51,19 @@ def test_single_target_uses_model_cross_entropy() -> None:
 
     assert model.loss_calls == 1
     torch.testing.assert_close(actual, expected)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_multi_target_kernel_uses_64_bit_row_offsets() -> None:
+    rows = 9000
+    local_vocab_size = 248320
+    offsets = torch.empty(rows, device="cuda", dtype=torch.int64)
+
+    _row_offset_probe[(rows,)](offsets, STRIDE=local_vocab_size)
+
+    expected = (rows - 1) * local_vocab_size
+    assert expected > torch.iinfo(torch.int32).max
+    assert offsets[-1].item() == expected
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")

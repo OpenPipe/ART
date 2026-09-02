@@ -9,6 +9,11 @@ import triton.language as tl
 
 
 @triton.jit
+def _row_offset(row, stride: tl.constexpr):
+    return row.to(tl.int64) * stride
+
+
+@triton.jit
 def _row_stats_kernel(
     logits,
     row_max,
@@ -17,12 +22,13 @@ def _row_stats_kernel(
     BLOCK_V: tl.constexpr,
 ):
     row = tl.program_id(0)
+    row_offset = _row_offset(row, LOCAL_VOCAB_SIZE)
     running_max = -float("inf")
     running_sum = 0.0
     for start in tl.range(0, LOCAL_VOCAB_SIZE, BLOCK_V, num_stages=1):
         offsets = start + tl.arange(0, BLOCK_V)
         values = tl.load(
-            logits + row * LOCAL_VOCAB_SIZE + offsets,
+            logits + row_offset + offsets,
             mask=offsets < LOCAL_VOCAB_SIZE,
             other=-float("inf"),
         ).to(tl.float32)
@@ -53,8 +59,9 @@ def _target_logits_kernel(
     local_targets = targets_at_offsets - VOCAB_START
     owned = mask & (local_targets >= 0) & (local_targets < LOCAL_VOCAB_SIZE)
     rows = offsets // target_count
+    row_offsets = _row_offset(rows, LOCAL_VOCAB_SIZE)
     values = tl.load(
-        logits + rows * LOCAL_VOCAB_SIZE + local_targets,
+        logits + row_offsets + local_targets,
         mask=owned,
         other=0.0,
     ).to(tl.float32)
@@ -92,16 +99,15 @@ def _softmax_workspace_kernel(
     BLOCK_V: tl.constexpr,
 ):
     row = tl.program_id(0)
+    row_offset = _row_offset(row, LOCAL_VOCAB_SIZE)
     block = tl.program_id(1)
     offsets = block * BLOCK_V + tl.arange(0, BLOCK_V)
     mask = offsets < LOCAL_VOCAB_SIZE
-    values = tl.load(
-        logits + row * LOCAL_VOCAB_SIZE + offsets, mask=mask, other=0.0
-    ).to(tl.float32)
+    values = tl.load(logits + row_offset + offsets, mask=mask, other=0.0).to(tl.float32)
     maximum = tl.load(row_max + row)
     denominator = tl.load(row_sum + row)
     probabilities = tl.exp(values - maximum) / denominator
-    tl.store(logits + row * LOCAL_VOCAB_SIZE + offsets, probabilities, mask=mask)
+    tl.store(logits + row_offset + offsets, probabilities, mask=mask)
 
 
 @triton.jit
@@ -112,15 +118,16 @@ def _scale_softmax_backward_kernel(
     BLOCK_V: tl.constexpr,
 ):
     row = tl.program_id(0)
+    row_offset = _row_offset(row, LOCAL_VOCAB_SIZE)
     block = tl.program_id(1)
     offsets = block * BLOCK_V + tl.arange(0, BLOCK_V)
     mask = offsets < LOCAL_VOCAB_SIZE
-    values = tl.load(
-        probabilities + row * LOCAL_VOCAB_SIZE + offsets, mask=mask, other=0.0
-    ).to(tl.float32)
+    values = tl.load(probabilities + row_offset + offsets, mask=mask, other=0.0).to(
+        tl.float32
+    )
     coefficient_sum = tl.load(coefficient_sums + row)
     tl.store(
-        probabilities + row * LOCAL_VOCAB_SIZE + offsets,
+        probabilities + row_offset + offsets,
         -values * coefficient_sum,
         mask=mask,
     )
@@ -144,8 +151,9 @@ def _target_gradient_kernel(
     owned = mask & (local_targets >= 0) & (local_targets < LOCAL_VOCAB_SIZE)
     rows = offsets // target_count
     coefficients_at_offsets = tl.load(coefficients + offsets, mask=owned, other=0.0)
+    row_offsets = _row_offset(rows, LOCAL_VOCAB_SIZE)
     tl.atomic_add(
-        grad_logits + rows * LOCAL_VOCAB_SIZE + local_targets,
+        grad_logits + row_offsets + local_targets,
         coefficients_at_offsets,
         mask=owned,
     )
