@@ -1084,7 +1084,10 @@ def _plan_fingerprint(
     plan = rank._plan_flat_forward(requests, checkpoint=checkpoint)
     telemetry = rank.last_forward_telemetry()
     return {
+        # Physical count (each group padded to the TP multiple) and the
+        # unpadded per-group lengths that execution pads.
         "packed_tokens": int(plan.packed_tokens),
+        "group_lengths": [int(group.packed.tokens.numel()) for group in plan.groups],
         "logical_tokens": int(plan.logical_tokens),
         "selected_max_depth": int(plan.selected_max_depth),
         "subforward_request_indices": telemetry["subforward_request_indices"],
@@ -1240,8 +1243,9 @@ def phase_tp2_public(
     - all TP peers plan the same physical layout on every call;
     - the automatic planner shares more deeply than depth-one on the
       hierarchical GRPO shape (fewer packed tokens);
-    - packed lengths are odd, so sequence-parallel padding is exercised at
-      TP>1 with outputs at the final real token;
+    - materialized group lengths are not TP multiples, so sequence-parallel
+      padding is exercised at TP>1 with outputs at the final real token (the
+      reported ``packed_tokens`` is the physical, padded count);
     - the loss is finite for both arms;
     - measured rows are compile-free and plan-cache-stable (3 warmups per arm,
       then ``repeat`` alternating measured pairs); paired timing is reported.
@@ -1314,6 +1318,7 @@ def phase_tp2_public(
                 "selected_max_depth": int(telemetry["selected_max_depth"]),
                 "planning_ms": float(telemetry["planning_ms"]),
                 "packed_tokens": int(fingerprint["packed_tokens"]),
+                "group_lengths": list(fingerprint["group_lengths"]),
                 "compile_statuses": watch.take(),
             }
             del outputs, loss
@@ -1342,8 +1347,10 @@ def phase_tp2_public(
                 "tp": tp,
                 "automatic_selected_max_depth": automatic["selected_max_depth"],
                 "automatic_packed_tokens": automatic["packed_tokens"],
+                "automatic_group_lengths": automatic["group_lengths"],
                 "depth_one_selected_max_depth": depth_one["selected_max_depth"],
                 "depth_one_packed_tokens": depth_one["packed_tokens"],
+                "depth_one_group_lengths": depth_one["group_lengths"],
                 "logical_tokens": sum(int(r.input_tokens.numel()) for r in requests),
                 "automatic_loss": automatic["loss"],
                 "depth_one_loss": depth_one["loss"],
@@ -1373,8 +1380,11 @@ def phase_tp2_public(
                 "automatic planner did not share more deeply than depth-one "
                 f"({automatic['packed_tokens']} vs {depth_one['packed_tokens']} packed tokens)"
             )
-        if tp > 1 and (
-            automatic["packed_tokens"] % tp == 0 or depth_one["packed_tokens"] % tp == 0
+        # ``packed_tokens`` is the physical (padded) count; padding is
+        # exercised when a materialized group length is not a TP multiple.
+        if tp > 1 and not all(
+            any(length % tp for length in result["group_lengths"])
+            for result in (automatic, depth_one)
         ):
             _fail("cell shape did not exercise sequence-parallel padding")
         if not (math.isfinite(automatic["loss"]) and math.isfinite(depth_one["loss"])):
