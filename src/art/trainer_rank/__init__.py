@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable, Iterable, Iterator, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from typing import TYPE_CHECKING, Literal, TypeVar, cast, overload
 
 import torch
@@ -336,12 +336,19 @@ class TrainerRank(_impl.TrainerRank):
     def optim_step(
         self,
         *,
-        params: AdamParams,
-        scale_grads: float = 1.0,
+        params: AdamParams | Mapping[str, AdamParams],
+        scale_grads: float | Mapping[str, float] = 1.0,
         checkpoints: Sequence[str] | None = None,
         on_live_graphs: Literal["allow", "error"] = "allow",
     ) -> dict[str, float]:
         """Step checkpoint slots that have accumulated gradients.
+
+        A mapping assigns independent optimizer parameters to each checkpoint;
+        ``scale_grads`` may likewise map checkpoints to gradient scales. Mapping
+        keys select the checkpoints when ``checkpoints`` is omitted, and all
+        explicitly supplied checkpoint sets must match. Each checkpoint's gradient
+        norm is clipped independently. If any selected norm is nonfinite, no
+        selected checkpoint is updated.
 
         By default, caller-retained forward graphs do not block the step. ART does
         not detach or free those graphs, and backward through one after the step is

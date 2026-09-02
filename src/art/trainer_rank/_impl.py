@@ -2431,8 +2431,8 @@ class TrainerRank:
     def optim_step(
         self,
         *,
-        params: AdamParams,
-        scale_grads: float = 1.0,
+        params: AdamParams | Mapping[str, AdamParams],
+        scale_grads: float | Mapping[str, float] = 1.0,
         checkpoints: Sequence[str] | None = None,
         on_live_graphs: Literal["allow", "error"] = "allow",
     ) -> dict[str, float]:
@@ -2441,7 +2441,73 @@ class TrainerRank:
                 "on_live_graphs must be either 'allow' or 'error', got "
                 f"{on_live_graphs!r}"
             )
-        selected_checkpoints = self._selected_dynamic_checkpoints(checkpoints)
+        params_by_checkpoint = dict(params) if isinstance(params, Mapping) else None
+        if params_by_checkpoint is not None:
+            if not params_by_checkpoint:
+                raise ValueError("params mapping must select at least one checkpoint")
+            if any(not isinstance(name, str) for name in params_by_checkpoint):
+                raise TypeError("params keys must be checkpoint names")
+            if any(
+                not isinstance(value, AdamParams)
+                for value in params_by_checkpoint.values()
+            ):
+                raise TypeError("params values must be AdamParams")
+        elif not isinstance(params, AdamParams):
+            raise TypeError(
+                "params must be AdamParams or a mapping of checkpoint names"
+            )
+        if isinstance(scale_grads, Mapping):
+            raw_scales = cast(Mapping[object, object], scale_grads)
+            if not raw_scales:
+                raise ValueError(
+                    "scale_grads mapping must select at least one checkpoint"
+                )
+            if any(not isinstance(name, str) for name in raw_scales):
+                raise TypeError("scale_grads keys must be checkpoint names")
+            try:
+                scales_by_checkpoint = {
+                    cast(str, name): float(cast(Any, value))
+                    for name, value in raw_scales.items()
+                }
+            except (TypeError, ValueError) as error:
+                raise TypeError("scale_grads values must be floats") from error
+            scale_grads_value = None
+        else:
+            scales_by_checkpoint = None
+            scale_grads_value = float(scale_grads)
+        configured = [
+            tuple(value)
+            for value in (params_by_checkpoint, scales_by_checkpoint)
+            if value is not None
+        ]
+        if checkpoints is not None:
+            configured.append(tuple(dict.fromkeys(checkpoints)))
+        if configured and any(set(names) != set(configured[0]) for names in configured):
+            raise ValueError(
+                "params, scale_grads, and checkpoints must select the same "
+                "checkpoint names"
+            )
+        checkpoint_selection = (
+            checkpoints
+            if checkpoints is not None
+            else sorted(configured[0])
+            if configured
+            else None
+        )
+        self._guard_optim_step_configuration(
+            checkpoint_selection, params, on_live_graphs
+        )
+        selected_checkpoints = self._selected_dynamic_checkpoints(checkpoint_selection)
+        params_by_checkpoint = (
+            params_by_checkpoint
+            if params_by_checkpoint is not None
+            else dict.fromkeys(selected_checkpoints, cast(AdamParams, params))
+        )
+        scales_by_checkpoint = (
+            scales_by_checkpoint
+            if scales_by_checkpoint is not None
+            else dict.fromkeys(selected_checkpoints, cast(float, scale_grads_value))
+        )
         if on_live_graphs == "error":
             self._guard_checkpoints_can_step(selected_checkpoints)
         with _telemetry_phase(
@@ -2450,8 +2516,55 @@ class TrainerRank:
         ):
             return self._dynamic_optim_step(
                 selected_checkpoints,
-                params=params,
-                scale_grads=scale_grads,
+                params=params_by_checkpoint,
+                scale_grads=scales_by_checkpoint,
+            )
+
+    def _guard_optim_step_configuration(
+        self,
+        checkpoints: Sequence[str] | None,
+        params: AdamParams | Mapping[str, AdamParams],
+        on_live_graphs: Literal["allow", "error"],
+    ) -> None:
+        if not (dist.is_available() and dist.is_initialized()):
+            return
+
+        def adam_values(
+            value: AdamParams,
+        ) -> tuple[float, float, float, float, float]:
+            return (
+                value.learning_rate,
+                value.beta1,
+                value.beta2,
+                value.weight_decay,
+                value.grad_clip_norm,
+            )
+
+        config_values = (
+            tuple(
+                (name, *adam_values(value))
+                for name, value in sorted(
+                    cast(Mapping[str, AdamParams], params).items()
+                )
+            )
+            if isinstance(params, Mapping)
+            else adam_values(params)
+        )
+        digest = hashlib.sha256(
+            repr(
+                (
+                    None if checkpoints is None else tuple(checkpoints),
+                    config_values,
+                    on_live_graphs,
+                )
+            ).encode()
+        ).digest()
+        local = torch.tensor(tuple(digest), device=self.device, dtype=torch.uint8)
+        gathered = [torch.empty_like(local) for _ in range(dist.get_world_size())]
+        dist.all_gather(gathered, local)
+        if any(not torch.equal(value, local) for value in gathered):
+            raise TrainerRankSlotStateError(
+                "Optimizer checkpoint selection or AdamParams differ across ranks"
             )
 
     def _load_checkpoint_slot(
@@ -2724,8 +2837,8 @@ class TrainerRank:
         self,
         checkpoint_names: Sequence[str],
         *,
-        params: AdamParams,
-        scale_grads: float,
+        params: Mapping[str, AdamParams],
+        scale_grads: Mapping[str, float],
     ) -> dict[str, float]:
         self.runtime.model_support_handler.zero_internal_padding_grads(
             self.runtime.model
@@ -2735,32 +2848,76 @@ class TrainerRank:
             slot_params = self._checkpoint_slots[name].params
             step_flags = self._dynamic_param_step_flags(slot_params)
             slot_grads = self._reduce_dynamic_grads(
-                slot_params, scale_grads=scale_grads
+                slot_params, scale_grads=scale_grads[name]
             )
             selected.append((name, slot_params, slot_grads, step_flags))
 
-        all_params = tuple(
-            param for _, slot_params, _, _ in selected for param in slot_params
+        grad_norms = dict(
+            zip(
+                checkpoint_names,
+                _distributed_grad_norms(
+                    [(model_params, grads) for _, model_params, grads, _ in selected]
+                ),
+                strict=True,
+            )
         )
-        all_grads = tuple(
-            grad for _, _, slot_grads, _ in selected for grad in slot_grads
-        )
-        grad_norm = _distributed_grad_norm(all_params, all_grads)
-        if not torch.isfinite(torch.tensor(grad_norm)):
-            self.zero_grad()
-            return {
-                "learning_rate": float(params.learning_rate),
-                "grad_norm": float(grad_norm),
-                "update_successful": 0.0,
-                "num_zeros_in_grad": 0.0,
+        grad_norm = math.sqrt(sum(value**2 for value in grad_norms.values()))
+        metrics = {
+            "grad_norm": float(grad_norm),
+            "update_successful": float(math.isfinite(grad_norm)),
+            "num_zeros_in_grad": 0.0,
+        }
+        for name in checkpoint_names:
+            metrics[f"learning_rate/{name}"] = float(params[name].learning_rate)
+            metrics[f"grad_norm/{name}"] = float(grad_norms[name])
+        learning_rates = {params[name].learning_rate for name in checkpoint_names}
+        if len(learning_rates) == 1:
+            metrics["learning_rate"] = float(params[checkpoint_names[0]].learning_rate)
+        if not math.isfinite(grad_norm):
+            for name in checkpoint_names:
+                for param in self._checkpoint_slots[name].params:
+                    param.grad = None
+                self._prune_slot_graphs(self._slot_ref(name))
+            return metrics
+        previous = {
+            name: (
+                slot.optimizer,
+                None
+                if slot.optimizer is None
+                else [
+                    {key: group[key] for key in ("lr", "betas", "weight_decay")}
+                    for group in slot.optimizer.optimizer.param_groups
+                ],
+            )
+            for name in checkpoint_names
+            for slot in (self._checkpoint_slots[name],)
+        }
+        try:
+            dynamics = {
+                name: self._dynamic_optimizer(name, params[name])
+                for name in checkpoint_names
             }
-        clip = (
-            min(1.0, params.grad_clip_norm / (grad_norm + 1.0e-6))
-            if params.grad_clip_norm > 0.0
-            else 1.0
-        )
+        except BaseException:
+            for name, (optimizer, groups) in previous.items():
+                self._checkpoint_slots[name].optimizer = optimizer
+                if optimizer is not None and groups is not None:
+                    for group, values in zip(
+                        optimizer.optimizer.param_groups, groups, strict=True
+                    ):
+                        group.update(values)
+            raise
         for name, model_params, grads, step_flags in selected:
-            dynamic = self._dynamic_optimizer(name, params)
+            checkpoint_params = params[name]
+            checkpoint_grad_norm = grad_norms[name]
+            clip = (
+                min(
+                    1.0,
+                    checkpoint_params.grad_clip_norm / (checkpoint_grad_norm + 1.0e-6),
+                )
+                if checkpoint_params.grad_clip_norm > 0.0
+                else 1.0
+            )
+            dynamic = dynamics[name]
             for master, grad, should_step in zip(
                 dynamic.master_params, grads, step_flags, strict=True
             ):
@@ -2775,12 +2932,7 @@ class TrainerRank:
                     model.grad = None
             self._prune_slot_graphs(self._slot_ref(name))
             self._checkpoint_slots[name].revision += 1
-        return {
-            "learning_rate": float(params.learning_rate),
-            "grad_norm": float(grad_norm),
-            "update_successful": 1.0,
-            "num_zeros_in_grad": 0.0,
-        }
+        return metrics
 
     def _dynamic_param_step_flags(
         self, params: Sequence[torch.nn.Parameter]
@@ -5006,20 +5158,26 @@ def _distributed_grad_norm(
     params: Sequence[torch.nn.Parameter],
     grads: Sequence[torch.Tensor],
 ) -> float:
-    if len(params) != len(grads):
+    return _distributed_grad_norms([(params, grads)])[0]
+
+
+def _distributed_grad_norms(
+    groups: Sequence[tuple[Sequence[torch.nn.Parameter], Sequence[torch.Tensor]]],
+) -> tuple[float, ...]:
+    if any(len(params) != len(grads) for params, grads in groups):
         raise ValueError("params and grads must have matching lengths")
-    included = [
-        grad
-        for param, grad in zip(params, grads, strict=True)
-        if _include_in_distributed_grad_norm(param)
-    ]
-    device = grads[0].device if grads else torch.device("cpu")
-    squared = torch.zeros((), device=device, dtype=torch.float32)
-    for grad in included:
-        squared.add_(grad.float().square().sum())
+    device = next(
+        (grad.device for _params, grads in groups for grad in grads),
+        torch.device("cpu"),
+    )
+    squared = torch.zeros(len(groups), device=device, dtype=torch.float32)
+    for index, (params, grads) in enumerate(groups):
+        for param, grad in zip(params, grads, strict=True):
+            if _include_in_distributed_grad_norm(param):
+                squared[index].add_(grad.float().square().sum())
     if dist.is_available() and dist.is_initialized():
         dist.all_reduce(squared, op=dist.ReduceOp.SUM)
-    return float(torch.sqrt(squared).item())
+    return tuple(torch.sqrt(squared).tolist())
 
 
 def _include_in_distributed_grad_norm(param: torch.nn.Parameter) -> bool:

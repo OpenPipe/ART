@@ -2470,6 +2470,269 @@ def test_optim_step_implicitly_steps_only_slots_with_grads(
     torch.testing.assert_close(untouched, before_untouched)
 
 
+def test_optim_step_accepts_per_checkpoint_params_and_scales(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trainer = TrainerRank(_runtime())
+    scales: dict[str, float] = {}
+    names: dict[int, str] = {}
+    for name in ("policy", "adversary", "unselected"):
+        param = torch.nn.Parameter(torch.ones(1))
+        param.grad = torch.ones_like(param)
+        trainer._checkpoint_slots[name] = _CheckpointSlot(params=(param,))
+        names[id(param)] = name
+
+    def reduce_grads(
+        params: tuple[torch.nn.Parameter, ...], *, scale_grads: float
+    ) -> tuple[torch.Tensor, ...]:
+        name = names[id(params[0])]
+        scales[name] = scale_grads
+        assert all(param.grad is not None for param in params)
+        return tuple(
+            cast(torch.Tensor, param.grad).float().mul(scale_grads) for param in params
+        )
+
+    monkeypatch.setattr(trainer, "_reduce_dynamic_grads", reduce_grads)
+    metrics = trainer.optim_step(
+        params={
+            "policy": AdamParams(
+                learning_rate=1e-2, weight_decay=0.0, grad_clip_norm=0.0
+            ),
+            "adversary": AdamParams(
+                learning_rate=2e-2, weight_decay=0.0, grad_clip_norm=0.0
+            ),
+        },
+        scale_grads={"policy": 0.5, "adversary": 0.25},
+    )
+
+    assert scales == {"adversary": 0.25, "policy": 0.5}
+    assert trainer._checkpoint_slots["unselected"].optimizer is None
+    for name, learning_rate in (("policy", 1e-2), ("adversary", 2e-2)):
+        optimizer = trainer._checkpoint_slots[name].optimizer
+        assert optimizer is not None
+        assert optimizer.optimizer.param_groups[0]["lr"] == learning_rate
+        assert metrics[f"learning_rate/{name}"] == learning_rate
+    assert "learning_rate" not in metrics
+
+
+@pytest.mark.parametrize("mapped", (False, True))
+def test_optim_step_clips_per_checkpoint(
+    monkeypatch: pytest.MonkeyPatch, mapped: bool
+) -> None:
+    trainer = TrainerRank(_runtime())
+    stepped: dict[str, torch.Tensor] = {}
+    dynamics: dict[str, object] = {}
+
+    class RecordingOptimizer:
+        def __init__(self, name: str, master: torch.nn.Parameter) -> None:
+            self.name = name
+            self.master = master
+
+        def step(self) -> None:
+            assert self.master.grad is not None
+            stepped[self.name] = self.master.grad.detach().clone()
+
+        def zero_grad(self, *, set_to_none: bool = False) -> None:
+            del set_to_none
+            self.master.grad = None
+
+    for name, grad in (("policy", 3.0), ("adversary", 4.0)):
+        param = torch.nn.Parameter(torch.ones(1))
+        param.grad = torch.full_like(param, grad)
+        trainer._checkpoint_slots[name] = _CheckpointSlot(params=(param,))
+        master = torch.nn.Parameter(param.detach().float().clone())
+        dynamics[name] = SimpleNamespace(
+            master_params=(master,), optimizer=RecordingOptimizer(name, master)
+        )
+
+    monkeypatch.setattr(
+        trainer,
+        "_reduce_dynamic_grads",
+        lambda params, **_kwargs: tuple(param.grad.float() for param in params),
+    )
+    monkeypatch.setattr(
+        trainer, "_dynamic_optimizer", lambda name, _params: dynamics[name]
+    )
+    monkeypatch.setattr(trainer, "_prune_slot_graphs", lambda *_args: None)
+
+    adam = AdamParams(learning_rate=1e-2, grad_clip_norm=1.0)
+    params = (
+        {
+            "policy": adam,
+            "adversary": AdamParams(learning_rate=1e-2, grad_clip_norm=2.0),
+        }
+        if mapped
+        else adam
+    )
+    metrics = trainer.optim_step(
+        params=params,
+        checkpoints=None if mapped else ["policy", "adversary"],
+    )
+
+    torch.testing.assert_close(stepped["policy"], torch.ones(1))
+    torch.testing.assert_close(
+        stepped["adversary"], torch.full((1,), 2.0 if mapped else 1.0)
+    )
+    assert metrics["grad_norm"] == pytest.approx(5.0)
+    assert metrics["learning_rate"] == 1e-2
+    assert metrics["grad_norm/policy"] == pytest.approx(3.0)
+    assert metrics["grad_norm/adversary"] == pytest.approx(4.0)
+
+
+def test_optim_step_checks_all_checkpoint_grads_before_stepping(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trainer = TrainerRank(_runtime())
+    for name, grad in (
+        ("policy", 1.0),
+        ("adversary", float("nan")),
+        ("unselected", 1.0),
+    ):
+        param = torch.nn.Parameter(torch.ones(1))
+        param.grad = torch.full_like(param, grad)
+        trainer._checkpoint_slots[name] = _CheckpointSlot(params=(param,))
+    monkeypatch.setattr(
+        trainer,
+        "_reduce_dynamic_grads",
+        lambda params, **_kwargs: tuple(param.grad.float() for param in params),
+    )
+    monkeypatch.setattr(
+        trainer,
+        "_dynamic_optimizer",
+        lambda *_args: pytest.fail("optimizer initialized before finite preflight"),
+    )
+
+    metrics = trainer.optim_step(
+        params={
+            name: AdamParams(learning_rate=1e-2) for name in ("policy", "adversary")
+        }
+    )
+
+    assert metrics["update_successful"] == 0.0
+    assert all(slot.revision == 0 for slot in trainer._checkpoint_slots.values())
+    assert all(
+        param.grad is None
+        for name, slot in trainer._checkpoint_slots.items()
+        if name != "unselected"
+        for param in slot.params
+    )
+    assert trainer._checkpoint_slots["unselected"].params[0].grad is not None
+
+
+def test_optim_step_requires_matching_checkpoint_configuration() -> None:
+    trainer = TrainerRank(_runtime())
+
+    with pytest.raises(ValueError, match="same checkpoint names"):
+        trainer.optim_step(
+            params={"policy": AdamParams(learning_rate=1e-3)},
+            scale_grads={"adversary": 1.0},
+        )
+    with pytest.raises(ValueError, match="same checkpoint names"):
+        trainer.optim_step(
+            params={"policy": AdamParams(learning_rate=1e-3)},
+            checkpoints=["adversary"],
+        )
+
+
+def test_optim_step_mapping_rejects_unready_checkpoints() -> None:
+    trainer = TrainerRank(_runtime())
+    trainer._checkpoint_slots["student"] = _CheckpointSlot(
+        params=(torch.nn.Parameter(torch.ones(1)),)
+    )
+
+    with pytest.raises(TrainerRankSlotStateError, match="no gradients"):
+        trainer.optim_step(params={"student": AdamParams(learning_rate=1e-3)})
+    with pytest.raises(TrainerRankSlotStateError, match="unloaded checkpoint"):
+        trainer.optim_step(params={"missing": AdamParams(learning_rate=1e-3)})
+
+
+@pytest.mark.parametrize("mapped", ("params", "scale_grads"))
+def test_optim_step_allows_either_configuration_to_be_mapped(
+    monkeypatch: pytest.MonkeyPatch, mapped: str
+) -> None:
+    trainer = TrainerRank(_runtime())
+    param = torch.nn.Parameter(torch.ones(1))
+    param.grad = torch.ones_like(param)
+    trainer._checkpoint_slots["student"] = _CheckpointSlot(params=(param,))
+    monkeypatch.setattr(
+        trainer,
+        "_reduce_dynamic_grads",
+        lambda params, **_kwargs: tuple(param.grad.float() for param in params),
+    )
+    adam = AdamParams(learning_rate=1e-3, weight_decay=0.0)
+
+    trainer.optim_step(
+        params={"student": adam} if mapped == "params" else adam,
+        scale_grads={"student": 0.5} if mapped == "scale_grads" else 0.5,
+    )
+
+    assert trainer._checkpoint_slots["student"].revision == 1
+
+
+def test_optim_step_prepares_all_optimizers_before_first_update(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trainer = TrainerRank(_runtime())
+    stepped = False
+    for name in ("a", "b"):
+        param = torch.nn.Parameter(torch.ones(1))
+        param.grad = torch.ones_like(param)
+        trainer._checkpoint_slots[name] = _CheckpointSlot(params=(param,))
+    monkeypatch.setattr(
+        trainer,
+        "_reduce_dynamic_grads",
+        lambda params, **_kwargs: tuple(param.grad.float() for param in params),
+    )
+
+    class RecordingOptimizer:
+        def step(self) -> None:
+            nonlocal stepped
+            stepped = True
+
+        def zero_grad(self, *, set_to_none: bool = False) -> None:
+            del set_to_none
+
+    dynamic = SimpleNamespace(
+        master_params=(torch.nn.Parameter(torch.ones(1)),),
+        optimizer=RecordingOptimizer(),
+    )
+
+    def optimizer(name: str, _params: AdamParams) -> object:
+        if name == "b":
+            raise RuntimeError("invalid optimizer state")
+        return dynamic
+
+    monkeypatch.setattr(trainer, "_dynamic_optimizer", optimizer)
+    with pytest.raises(RuntimeError, match="invalid optimizer state"):
+        trainer.optim_step(
+            params={name: AdamParams(learning_rate=1e-3) for name in ("a", "b")}
+        )
+
+    assert not stepped
+    assert all(slot.revision == 0 for slot in trainer._checkpoint_slots.values())
+    assert all(slot.optimizer is None for slot in trainer._checkpoint_slots.values())
+
+
+def test_optim_step_configuration_must_match_across_ranks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trainer = TrainerRank(_runtime())
+    monkeypatch.setattr(dist, "is_available", lambda: True)
+    monkeypatch.setattr(dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(dist, "get_world_size", lambda _group=None: 2)
+
+    def gather(outputs: list[torch.Tensor], value: torch.Tensor) -> None:
+        outputs[0].copy_(value)
+        outputs[1].zero_()
+
+    monkeypatch.setattr(dist, "all_gather", gather)
+
+    with pytest.raises(TrainerRankSlotStateError, match="differ across ranks"):
+        trainer._guard_optim_step_configuration(
+            ["student"], AdamParams(learning_rate=1e-3), "allow"
+        )
+
+
 def test_optim_step_implicitly_ignores_resident_forward_snapshot(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
