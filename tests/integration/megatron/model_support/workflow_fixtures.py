@@ -17,7 +17,7 @@ FIXTURE_PATH_ENV = "ART_MODEL_SUPPORT_FIXTURE_PATH"
 FIXTURE_CACHE_ENV = "ART_MODEL_SUPPORT_FIXTURE_CACHE"
 FIXTURE_ROOT_ENV = "ART_MODEL_SUPPORT_FIXTURE_ROOT"
 FIXTURE_VERSION = 18
-_MODEL_FIXTURE_VERSION_OFFSETS = {"nemotron_h_moe": 7}
+_MODEL_FIXTURE_VERSION_OFFSETS = {"nemotron_h_moe": 8}
 _CANONICAL_CACHE_VERSION = 16
 _ROOT = Path("/tmp/art-models/main-merge-oracle")
 _CACHE_ROOT = Path("/tmp/art-model-support-workflow/hf-cache")
@@ -48,7 +48,7 @@ _REDUCED_TRAINABILITY_ENV: dict[str, dict[str, dict[str, str]]] = {
 }
 _TOKENIZER_FIXTURE_VERSION = 3
 _FUNCTIONAL_FIXTURE_VERSION = 1
-_FUNCTIONAL_FIXTURE_VERSION_OFFSETS = {"nemotron_h_moe": 5}
+_FUNCTIONAL_FIXTURE_VERSION_OFFSETS = {"nemotron_h_moe": 6}
 _FUNCTIONAL_REMOTE_CODE_FILES = {
     "nemotron_h_moe": (
         "configuration_nemotron_h.py",
@@ -491,6 +491,19 @@ def _pack_qwen35_experts(path: Path, config: Any) -> None:
     save_file(tensors, checkpoint, metadata={"format": "pt"})
 
 
+def _restore_nemotron_h_embedding_name(path: Path) -> None:
+    from safetensors.torch import load_file, save_file
+
+    checkpoint = path / "model.safetensors"
+    tensors = load_file(checkpoint)
+    source = "backbone.embedding.weight"
+    target = "backbone.embeddings.weight"
+    if source not in tensors or target in tensors:
+        raise RuntimeError("Nemotron-H HF embedding serialization changed")
+    tensors[target] = tensors.pop(source)
+    save_file(tensors, checkpoint, metadata={"format": "pt"})
+
+
 def _json_sha256(value: object) -> str:
     return hashlib.sha256(
         json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
@@ -531,14 +544,21 @@ def _config_shape(config: dict[str, Any], *exclude: str) -> dict[str, object]:
     }
 
 
+def _functional_depth(text: dict[str, Any], *, model_key: str) -> int:
+    depth = text.get("num_hidden_layers")
+    if depth is None and isinstance(text.get("layers_block_type"), list):
+        depth = len(text["layers_block_type"])
+    if type(depth) is not int or depth < _functional_plan(model_key).depth:
+        raise RuntimeError(f"{model_key} has invalid production depth")
+    return depth
+
+
 def _functional_config(
     source: dict[str, Any], *, model_key: str
 ) -> tuple[dict[str, Any], dict[str, object]]:
     plan = _functional_plan(model_key)
     text = _config_text(source, plan)
-    source_depth = text.get("num_hidden_layers")
-    if type(source_depth) is not int or source_depth < plan.depth:
-        raise RuntimeError(f"{model_key} has invalid production depth")
+    source_depth = _functional_depth(text, model_key=model_key)
     reduced = json.loads(json.dumps(source))
     reduced_text = _config_text(reduced, plan)
     reduced_text["num_hidden_layers"] = plan.depth
@@ -676,7 +696,7 @@ def _select_functional_weights(
 ) -> dict[str, str]:
     plan = _functional_plan(model_key)
     text_config = _config_text(config, plan)
-    source_depth = int(text_config["num_hidden_layers"])
+    source_depth = _functional_depth(text_config, model_key=model_key)
     text_layers: set[int] = set()
     vision_layers: set[int] = set()
     auxiliary_layers: set[int] = set()
@@ -1052,6 +1072,8 @@ def _build(
                     else {}
                 ),
             )
+            if model_key == "nemotron_h_moe" and backbone_prefix == "model":
+                _restore_nemotron_h_embedding_name(staging)
             del model
             gc.collect()
             if model_key == "qwen3_5_moe":
