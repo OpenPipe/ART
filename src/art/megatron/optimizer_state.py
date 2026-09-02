@@ -383,6 +383,83 @@ def canonical_adapter_path(staging_path: str | Path, step: int) -> Path:
     ).absolute()
 
 
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as payload:
+        while chunk := payload.read(8 << 20):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _adapter_payload_identity(path: Path) -> tuple[tuple[str, int, str], ...]:
+    _, files = _adapter_checkpoint_files(path)
+    return tuple((file.name, file.stat().st_size, _file_sha256(file)) for file in files)
+
+
+def acknowledge_materialized_adapter(
+    adapter_path: str | Path,
+    *,
+    step: int,
+    training_session_id: str,
+    generation_id: str,
+) -> OptimizerAdapter:
+    """Attach exact learner identity to an already verified adapter tree."""
+    path = Path(adapter_path).absolute()
+    adapter = optimizer_adapter(
+        path,
+        step,
+        training_session_id=training_session_id,
+        generation_id=generation_id,
+    )
+    acknowledgment = path / ADAPTER_PUBLICATION_ACK
+    if acknowledgment.exists():
+        if read_adapter_publication(path, step=step) != adapter:
+            raise RuntimeError("materialized adapter acknowledgment changed identity")
+    else:
+        _write_model_atomic(acknowledgment, adapter)
+    return adapter
+
+
+def _reuse_initial_adapter_checkpoint(
+    staging: Path,
+    canonical: Path,
+    adapter: OptimizerAdapter,
+) -> OptimizerAdapter:
+    publication = read_adapter_publication(canonical, step=0, verify_files=True)
+    if publication is None:
+        expected_generation = _initial_generation_id(canonical, 0)
+        if adapter.generation_id != expected_generation:
+            raise RuntimeError(
+                "Refusing to adopt an unacknowledged step-zero adapter with a "
+                f"different generation: expected={expected_generation!r}, "
+                f"received={adapter.generation_id!r}"
+            )
+    elif publication != adapter:
+        raise RuntimeError(
+            "Refusing to reuse a step-zero adapter with different publication "
+            f"identity: acknowledged={publication.model_dump()}, "
+            f"received={adapter.model_dump()}"
+        )
+    if _adapter_payload_identity(staging) != _adapter_payload_identity(canonical):
+        raise RuntimeError(
+            f"Refusing to reuse step-zero adapter with different payload: {canonical}"
+        )
+
+    shutil.rmtree(staging)
+    _fsync_directory(staging.parent)
+    acknowledged = acknowledge_materialized_adapter(
+        canonical,
+        step=adapter.step,
+        training_session_id=adapter.training_session_id,
+        generation_id=adapter.generation_id,
+    )
+    _write_model_atomic(
+        canonical.parent.parent / "megatron_runtime" / ADAPTER_LATEST_POINTER,
+        acknowledged,
+    )
+    return acknowledged
+
+
 def _canonical_adapter_path(path: str | Path, step: int) -> Path:
     candidate = Path(path).absolute()
     if (
@@ -402,8 +479,6 @@ def publish_adapter_checkpoint(
 ) -> OptimizerAdapter:
     staging = Path(staging_path).absolute()
     canonical = canonical_adapter_path(staging, step)
-    if canonical.exists():
-        raise RuntimeError(f"Refusing to replace canonical adapter {canonical}")
     _, files = _adapter_checkpoint_files(staging)
     for path in files:
         with path.open("rb") as adapter_file:
@@ -416,6 +491,10 @@ def publish_adapter_checkpoint(
         generation_id=generation_id or _initial_generation_id(canonical, step),
         files=_adapter_file_records(staging),
     )
+    if canonical.exists():
+        if step == 0:
+            return _reuse_initial_adapter_checkpoint(staging, canonical, adapter)
+        raise RuntimeError(f"Refusing to replace canonical adapter {canonical}")
     _write_model_atomic(staging / ADAPTER_PUBLICATION_ACK, adapter)
     canonical.parent.mkdir(parents=True, exist_ok=True)
     os.replace(staging, canonical)
