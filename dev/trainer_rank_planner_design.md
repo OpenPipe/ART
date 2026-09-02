@@ -233,12 +233,23 @@ What the ballast arm taught us: on this cell a training forward retains
 saved logits), so a 2-way split lowers the requirement by only
 (1−f)·R/2 ≈ 0.5% — splitting cannot shrink retained activations, only the
 transient share. The arm therefore sizes its ballast from the measured
-fraction and reports the window width honestly. Splitting pays where little
-is retained: `no_grad` forwards (reference/old-policy logprobs; retained ≈
-outputs only) convert at a fraction of the unsplit requirement, which the arm
-also demonstrates under real pressure. Callers that could backward per
-subforward would gain similarly, but the public contract keeps every graph
-live, so that is not modeled.
+fraction and reports the window width honestly. `no_grad` forwards
+(reference/old-policy logprobs; retained ≈ outputs only) are the
+demonstrated high-value case: they convert at a fraction of the unsplit
+requirement, which the arm also shows under real pressure. The training
+benefit is workload-dependent and small in this sealed landing cell; the
+research thread's full-height cell retained closer to 92%, so CP/GDN,
+output-heavy or workspace-heavy training shapes may have several gigabytes
+of splittable transient memory, and grad-enabled support is kept for them.
+Callers that could backward per subforward would gain more, but the public
+contract keeps every graph live, so that is not modeled.
+
+Accepted limitations: the full-sharing lower bound can conservatively reject
+a rung whose cost-optimal layouts would have fit if retained-profile trust
+changes with the sharing ratio (a false refusal, never an unsafe admission —
+within the bounded-search contract); and a cold oversized `no_grad` call
+still refuses until a compatible profile exists (a later simplification could
+model `no_grad` retained memory directly from the known output bytes).
 
 ## Explicitly out of scope (follow-ups)
 
