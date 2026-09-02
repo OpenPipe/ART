@@ -48,7 +48,7 @@ _REDUCED_TRAINABILITY_ENV: dict[str, dict[str, dict[str, str]]] = {
 }
 _TOKENIZER_FIXTURE_VERSION = 3
 _FUNCTIONAL_FIXTURE_VERSION = 1
-_FUNCTIONAL_FIXTURE_VERSION_OFFSETS = {"nemotron_h_moe": 6}
+_FUNCTIONAL_FIXTURE_VERSION_OFFSETS = {"nemotron_h_moe": 7}
 _FUNCTIONAL_REMOTE_CODE_FILES = {
     "nemotron_h_moe": (
         "configuration_nemotron_h.py",
@@ -378,7 +378,7 @@ _FUNCTIONAL_PLANS = {
     "nemotron_h_moe": _plan(
         6,
         "backbone.layers",
-        auxiliary=(None, "num_nextn_predict_layers"),
+        auxiliary=("mtp.layers", "num_nextn_predict_layers"),
     ),
 }
 _FUNCTIONAL_PATTERNS = {
@@ -732,13 +732,19 @@ def _select_functional_weights(
     count = text_config.get(auxiliary_count) if auxiliary_count else 0
     if type(count) is not int or count < 0:
         raise RuntimeError(f"{model_key} has invalid {auxiliary_count}")
+    auxiliary_depth = count
+    if auxiliary_prefix == "mtp.layers" and count:
+        mtp_layer_types = text_config.get("mtp_layers_block_type")
+        if not isinstance(mtp_layer_types, list) or not mtp_layer_types:
+            raise RuntimeError(f"{model_key} MTP layer pattern is invalid")
+        auxiliary_depth *= len(mtp_layer_types)
     expected = set(
         range(source_depth + (count if plan.auxiliary and not auxiliary_prefix else 0))
     )
     if text_layers != expected:
         raise RuntimeError(f"{model_key} canonical text-layer coverage changed")
     if auxiliary_prefix:
-        if auxiliary_layers != set(range(count)):
+        if auxiliary_layers != set(range(auxiliary_depth)):
             raise RuntimeError(
                 f"{model_key} canonical auxiliary-layer coverage changed"
             )
