@@ -307,7 +307,9 @@ def set_hf_config_num_layers(config: Any, num_layers: int) -> str:
             if isinstance(layer_types, (list, tuple)):
                 setattr(config_view, "layer_types", list(layer_types[:num_layers]))
             hybrid_pattern = getattr(config_view, "hybrid_override_pattern", None)
-            if isinstance(hybrid_pattern, str):
+            if isinstance(hybrid_pattern, str) and not isinstance(
+                layer_types, (list, tuple)
+            ):
                 config_view.hybrid_override_pattern = hybrid_pattern[:num_layers]
             mlp_only_layers = getattr(config_view, "mlp_only_layers", None)
             if isinstance(mlp_only_layers, (list, tuple)):

@@ -277,7 +277,10 @@ NEMOTRON_H_SPEC = ModelSupportSpec(
     key="nemotron_h_moe",
     handler_key=_NEMOTRON_H_HANDLER_KEY,
     is_moe=True,
-    model_names=("nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",),
+    model_names=(
+        "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
+        "nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16",
+    ),
     default_target_modules=_NEMOTRON_H_TARGET_MODULES,
     native_vllm_lora_status=_VALIDATED_NATIVE_VLLM_LORA_STATUS,
     dependency_floor=DependencyFloor(

@@ -36,6 +36,7 @@ from .workflow_resources import (
 _STAGE_DIR_ENV = "ART_MODEL_SUPPORT_WORKFLOW_STAGE_DIR"
 _LAYER_LIST_FIELDS = (
     "layer_types",
+    "layers_block_type",
     "mlp_layer_types",
     "indexer_types",
     "compress_ratios",
@@ -631,6 +632,12 @@ def _sized_config(
         if len(values) < num_layers:
             raise ValueError(f"{model_key} {field} has only {len(values)} entries")
         text[field] = values[:num_layers]
+    mtp_count_field = "num_nextn_predict_layers"
+    if mtp_count_field in source_text:
+        mtp_count = source_text[mtp_count_field]
+        if type(mtp_count) is not int or mtp_count < 0:
+            raise ValueError(f"{model_key} has an invalid {mtp_count_field}")
+        text[mtp_count_field] = 0
     hybrid_pattern = source_text.get("hybrid_override_pattern")
     if hybrid_pattern is not None:
         if not isinstance(hybrid_pattern, str) or len(hybrid_pattern) != source_layers:
@@ -650,6 +657,7 @@ def _sized_config(
                 "num_hidden_layers",
                 *_LAYER_LIST_FIELDS,
                 "hybrid_override_pattern",
+                mtp_count_field,
             )
             if field == "num_hidden_layers" or field in source_text
         ],

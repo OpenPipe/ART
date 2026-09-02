@@ -327,7 +327,18 @@ _MULTIMODAL_SHAPES = {
 }
 # fmt: on
 
-_FUNCTIONAL_LAYER_FIELDS = ("layer_types", "mlp_layer_types", "indexer_types")
+_FUNCTIONAL_LAYER_FIELDS = (
+    "layer_types",
+    "layers_block_type",
+    "mlp_layer_types",
+    "indexer_types",
+)
+_HYBRID_LAYER_SYMBOLS = {
+    "mamba": "M",
+    "moe": "E",
+    "attention": "*",
+    "mlp": "-",
+}
 _WIDTH_TERMS = ("hidden", "intermediate", "head", "expert", "lora_rank", "topk")
 
 
@@ -360,7 +371,11 @@ _FUNCTIONAL_PLANS = {
     "dsv4": _plan(6, "layers", auxiliary=("mtp", "num_nextn_predict_layers")),
     "glm52": _plan(10, "model.layers", auxiliary=(None, "num_nextn_predict_layers")),
     "gpt_oss_moe": _plan(4, "model.layers"),
-    "nemotron_h_moe": _plan(6, "backbone.layers"),
+    "nemotron_h_moe": _plan(
+        6,
+        "backbone.layers",
+        auxiliary=(None, "num_nextn_predict_layers"),
+    ),
 }
 _FUNCTIONAL_PATTERNS = {
     "qwen3_dense": {"layer_types": ("full_attention",) * 2},
@@ -523,12 +538,26 @@ def _functional_config(
                 raise RuntimeError(f"{model_key} production {field} is incomplete")
             patterns[field] = values[: plan.depth]
             reduced_text[field] = patterns[field]
-    hybrid_pattern = text.get("hybrid_override_pattern")
+    serialized_hybrid_pattern = text.get("hybrid_override_pattern")
+    hybrid_pattern = serialized_hybrid_pattern
+    if (layer_types := text.get("layers_block_type")) is not None:
+        try:
+            layer_types_pattern = "".join(
+                _HYBRID_LAYER_SYMBOLS[layer_type] for layer_type in layer_types
+            )
+        except (KeyError, TypeError) as exc:
+            raise RuntimeError(
+                f"{model_key} production layers_block_type is invalid"
+            ) from exc
+        if hybrid_pattern is not None and hybrid_pattern != layer_types_pattern:
+            raise RuntimeError(f"{model_key} production hybrid patterns disagree")
+        hybrid_pattern = layer_types_pattern
     if hybrid_pattern is not None:
         if not isinstance(hybrid_pattern, str) or len(hybrid_pattern) != source_depth:
             raise RuntimeError(f"{model_key} production hybrid pattern is invalid")
         patterns["hybrid_override_pattern"] = hybrid_pattern[: plan.depth]
-        reduced_text["hybrid_override_pattern"] = hybrid_pattern[: plan.depth]
+        if serialized_hybrid_pattern is not None:
+            reduced_text["hybrid_override_pattern"] = hybrid_pattern[: plan.depth]
     for field, expected in _FUNCTIONAL_PATTERNS.get(model_key, {}).items():
         actual = patterns.get(field)
         if (tuple(actual) if isinstance(actual, list) else actual) != expected:

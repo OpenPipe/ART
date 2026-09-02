@@ -542,6 +542,9 @@ class NemotronHHandler(DefaultMoeHandler):
             )
         if getattr(provider, "virtual_pipeline_model_parallel_size", None) is not None:
             raise ValueError("Nemotron-H does not support virtual pipeline parallelism")
+        provider.mtp_num_layers = None
+        provider.mtp_hybrid_override_pattern = None
+        provider.mtp_loss_scaling_factor = None
         _configure_moe_padding(provider)
         provider.use_mamba_mem_eff_path = True
 
@@ -720,6 +723,12 @@ class NemotronHHandler(DefaultMoeHandler):
             "packed_seq_params": None,
         }
 
+    def prepare_hf_reference_config(self, config: Any) -> None:
+        if int(getattr(config, "num_nextn_predict_layers", 0) or 0):
+            config.num_nextn_predict_layers = 0
+            if hasattr(config, "mtp_layers_block_type"):
+                config.mtp_layers_block_type = []
+
     def prepare_hf_reference_model_class(self, model_class: type[Any]) -> type[Any]:
         if model_class.__name__ != "NemotronHForCausalLM":
             raise TypeError("Nemotron-H HF reference model class changed")
@@ -745,23 +754,30 @@ class NemotronHHandler(DefaultMoeHandler):
         )
 
     def prepare_hf_reference_model(self, model: Any) -> Any:
+        backbone = getattr(model, "backbone", None)
+        prefix = "backbone"
+        if backbone is None:
+            backbone = getattr(model, "model", None)
+            prefix = "model"
+        if backbone is None:
+            raise RuntimeError("Nemotron-H HF backbone changed")
         pattern = str(model.config.hybrid_override_pattern)
         fp32_names = {
             name
             for index, symbol in enumerate(pattern)
             for name in (
                 (
-                    f"backbone.layers.{index}.mixer.A_log",
-                    f"backbone.layers.{index}.mixer.D",
+                    f"{prefix}.layers.{index}.mixer.A_log",
+                    f"{prefix}.layers.{index}.mixer.D",
                 )
                 if symbol == "M"
-                else (f"backbone.layers.{index}.mixer.gate.e_score_correction_bias",)
+                else (f"{prefix}.layers.{index}.mixer.gate.e_score_correction_bias",)
                 if symbol == "E"
                 else ()
             )
         }
         state = model.state_dict()
-        params_dtype = model.backbone.embeddings.weight.dtype
+        params_dtype = backbone.embeddings.weight.dtype
         invalid = {
             name: tensor.dtype
             for name, tensor in state.items()
@@ -773,7 +789,7 @@ class NemotronHHandler(DefaultMoeHandler):
         if invalid:
             raise RuntimeError(f"Nemotron-H HF reference precision changed: {invalid}")
         expected_names = [
-            f"backbone.layers.{index}.mixer"
+            f"{prefix}.layers.{index}.mixer"
             for index, symbol in enumerate(pattern)
             if symbol == "M"
         ]

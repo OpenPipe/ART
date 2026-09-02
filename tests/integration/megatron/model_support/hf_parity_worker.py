@@ -514,15 +514,17 @@ def _load_hf_model(
             if isinstance(auto_map, dict)
             else None
         )
-        if not isinstance(class_reference, str) or not class_reference:
-            raise RuntimeError("HF reference model class is unavailable")
-        model_class = prepare_model_class(
-            get_class_from_dynamic_module(
+        if isinstance(class_reference, str) and class_reference:
+            reference_model_class = get_class_from_dynamic_module(
                 class_reference,
                 base_model,
                 revision=getattr(config, "_commit_hash", None),
             )
-        )
+        else:
+            reference_model_class = cast(Any, AutoModelForCausalLM)._model_mapping[
+                type(config)
+            ]
+        model_class = prepare_model_class(reference_model_class)
     model = model_class.from_pretrained(
         base_model,
         config=config,
