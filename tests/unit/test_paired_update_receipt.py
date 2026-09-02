@@ -9,6 +9,8 @@ import pytest
 from art.distributed.adapter_transport import (
     AdapterReceiveResult,
     ExternalAdapterObjectSource,
+    ExternalAdapterShard,
+    ExternalAdapterShardedSource,
 )
 from art.megatron.operation_handler import (
     MegatronInferenceUpdateUsage,
@@ -323,23 +325,54 @@ async def test_in_flight_exact_lease_does_not_block_next_activation() -> None:
     assert publisher.activated_publication("model", 1) is None
 
 
+@pytest.mark.parametrize("sharded", [False, True], ids=["object", "shards"])
 @pytest.mark.asyncio
-async def test_external_object_uses_the_ordinary_holder_update_path() -> None:
+async def test_external_source_uses_the_ordinary_holder_update_path(
+    sharded: bool,
+) -> None:
     config = json.dumps(
         {"art_lora_format": "vllm", "r": 1, "target_modules": ["q_proj"]},
         separators=(",", ":"),
     )
-    source = ExternalAdapterObjectSource(
-        generation_id="generation-3",
-        source_identity="sha256:" + "a" * 64,
-        object_url="https://objects.example/adapter.safetensors?signature=secret",
-        object_bytes=4096,
-        object_sha256="a" * 64,
-        adapter_config_json=config,
-        adapter_config_sha256=hashlib.sha256(config.encode()).hexdigest(),
-        lora_rank=1,
-        target_modules=("q_proj",),
-    )
+    model_bytes = 4096
+    config_bytes = len(config.encode())
+    if sharded:
+        source = ExternalAdapterShardedSource(
+            generation_id="generation-3",
+            source_identity="manifest:" + "a" * 64,
+            model_bytes=model_bytes,
+            config_bytes=config_bytes,
+            shards=(
+                ExternalAdapterShard(
+                    index=0,
+                    relative_path="adapter_config.json",
+                    file_offset=0,
+                    object_url="https://objects.example/config?signature=secret",
+                    object_bytes=config_bytes,
+                    object_sha256="b" * 64,
+                ),
+                ExternalAdapterShard(
+                    index=1,
+                    relative_path="adapter_model.safetensors",
+                    file_offset=0,
+                    object_url="https://objects.example/model?signature=secret",
+                    object_bytes=model_bytes,
+                    object_sha256="c" * 64,
+                ),
+            ),
+        )
+    else:
+        source = ExternalAdapterObjectSource(
+            generation_id="generation-3",
+            source_identity="sha256:" + "a" * 64,
+            object_url="https://objects.example/adapter.safetensors?signature=secret",
+            object_bytes=model_bytes,
+            object_sha256="a" * 64,
+            adapter_config_json=config,
+            adapter_config_sha256=hashlib.sha256(config.encode()).hexdigest(),
+            lora_rank=1,
+            target_modules=("q_proj",),
+        )
 
     class Manager:
         def __init__(self) -> None:
@@ -353,11 +386,11 @@ async def test_external_object_uses_the_ordinary_holder_update_path() -> None:
                     host_id="inference-0",
                     generation_id=source.generation_id,
                     path="/adapter/generation-3",
-                    tensor_bytes=source.object_bytes,
-                    config_bytes=len(config.encode()),
+                    tensor_bytes=model_bytes,
+                    config_bytes=config_bytes,
                     materialization_s=0.25,
-                    used_bytes=source.object_bytes,
-                    capacity_bytes=source.object_bytes,
+                    used_bytes=model_bytes + config_bytes,
+                    capacity_bytes=model_bytes + config_bytes,
                     source_identity=source.source_identity,
                 ),
             )
@@ -400,15 +433,25 @@ async def test_external_object_uses_the_ordinary_holder_update_path() -> None:
         policy_version=3,
         source=source,
     )
+    replayed = await publisher.apply_external_adapter(
+        operation_id="operation-3",
+        public_alias="model",
+        generation_id=source.generation_id,
+        expected_generation_id=None,
+        policy_version=3,
+        source=source,
+    )
 
     assert updates[0]["source"] == {
         "path": "/adapter/generation-3",
         "source_identity": source.source_identity,
         "layout": "peft_safetensors_v1",
-        "model_bytes": 4096,
-        "config_bytes": len(config.encode()),
+        "model_bytes": model_bytes,
+        "config_bytes": config_bytes,
     }
     assert result.staging_s == 0.25
     assert result.apply_s == 0.05
+    assert replayed == result
+    assert len(updates) == 2
     assert publisher._active_generations["model:active"] == "generation-3"
     assert manager.released == []

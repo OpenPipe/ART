@@ -404,6 +404,159 @@ async def test_private_execution_receipts_are_bounded_and_fail_closed() -> None:
 
 
 @pytest.mark.asyncio
+async def test_completed_lora_update_replays_before_generation_validation(
+    monkeypatch,
+) -> None:
+    receipts = dedicated_server._CompletedLoraUpdates(capacity=2)
+    monkeypatch.setattr(dedicated_server, "_completed_lora_updates", receipts)
+    body = dedicated_server._InFlightLoraUpdateRequest(
+        operation_id="operation-1",
+        model_name="run:active",
+        lora_slot="run:active",
+        source={
+            "path": "/adapter/generation-1",
+            "source_identity": "manifest:" + "a" * 64,
+            "layout": "peft_safetensors_v1",
+            "model_bytes": 4096,
+            "config_bytes": 128,
+        },
+        generation_id="generation-1",
+        expected_generation_id="generation-1",
+        policy_version=1,
+    )
+    fingerprint = dedicated_server._lora_update_fingerprint(body)
+    result = {
+        "status": "updated",
+        "generation_id": body.generation_id,
+        "update_seq": 1,
+    }
+    await receipts.settle(body.operation_id, fingerprint, result)
+
+    replay = await dedicated_server._replay_lora_update(body, fingerprint)
+    assert replay is not None
+    assert replay.status_code == 200
+    assert json.loads(replay.body) == result
+
+    changed = body.model_copy(update={"policy_version": 2})
+    conflict = await dedicated_server._replay_lora_update(
+        changed, dedicated_server._lora_update_fingerprint(changed)
+    )
+    assert conflict is not None
+    assert conflict.status_code == 409
+
+    await receipts.settle("operation-2", "fingerprint-2", {"status": "updated"})
+    await receipts.settle("operation-3", "fingerprint-3", {"status": "updated"})
+    assert await receipts.replay(body.operation_id, fingerprint) is None
+
+
+def test_lora_staging_precedes_target_admission_gate(monkeypatch) -> None:
+    from art_vllm_runtime import policy_spans
+    from vllm.entrypoints.openai import api_server
+
+    events: list[str] = []
+
+    class Gate:
+        entered = False
+
+        async def __aenter__(self):
+            self.entered = True
+            events.append("gate_enter")
+
+        async def __aexit__(self, *_args):
+            events.append("gate_exit")
+            self.entered = False
+
+    gate = Gate()
+    current = policy_spans.PolicyLoRARequest(
+        lora_name="run:active",
+        lora_int_id=7,
+        lora_path="/adapter/generation-1",
+        load_inplace=False,
+        generation_id="generation-1",
+        policy_version=1,
+        update_seq=1,
+    )
+
+    class Models:
+        lora_requests = {"run:active": current}
+        lora_resolver_lock = {"run:active": gate}
+
+        async def _check_load_lora_adapter_request(self, _request):
+            assert gate.entered
+            return None
+
+        def is_base_model(self, _model_name):
+            return False
+
+    class EngineCore:
+        async def call_utility_async(self, method, *_args):
+            if method == "art_prepare_staged_lora_policy":
+                assert not gate.entered
+                events.append("prepare")
+                return {"workers": 1, "ready": True}
+            if method == "art_commit_staged_lora_policy_update":
+                assert gate.entered
+                events.append("commit")
+                return {"workers": 1, "cache_transition": {}}
+            raise AssertionError(method)
+
+    class Coordinator:
+        async def preflight_publication(self, *_args, **_kwargs):
+            assert gate.entered
+
+        async def begin_publication(self, *_args, **_kwargs):
+            assert gate.entered
+            return 2
+
+        async def commit_update(self, *_args, **_kwargs):
+            assert gate.entered
+            events.append("settle")
+
+    monkeypatch.setattr(api_server, "build_app", lambda *args, **kwargs: FastAPI())
+    monkeypatch.setattr(api_server, "_art_runtime_routes_patched", False, raising=False)
+    monkeypatch.setattr(
+        policy_spans, "lora_update_coordinator", lambda *_args: Coordinator()
+    )
+    monkeypatch.setattr(
+        policy_spans, "register_lora_alias", lambda *_args, **_kwargs: None
+    )
+    monkeypatch.setattr(
+        policy_spans, "publish_lora_slot_policy", lambda *_args, **_kwargs: None
+    )
+    monkeypatch.setattr(
+        dedicated_server,
+        "_completed_lora_updates",
+        dedicated_server._CompletedLoraUpdates(capacity=2),
+    )
+    dedicated_server._patch_art_runtime_routes()
+    app = api_server.build_app()
+    app.state.openai_serving_models = Models()
+    app.state.engine_client = SimpleNamespace(engine_core=EngineCore())
+
+    response = TestClient(app).post(
+        "/art/in_flight_lora_update",
+        json={
+            "operation_id": "operation-2",
+            "model_name": "run:active",
+            "lora_slot": "run:active",
+            "generation_id": "generation-2",
+            "expected_generation_id": "generation-1",
+            "policy_version": 2,
+            "source": {
+                "path": "/adapter/generation-2",
+                "source_identity": "manifest:" + "a" * 64,
+                "layout": "peft_safetensors_v1",
+                "model_bytes": 4096,
+                "config_bytes": 128,
+            },
+        },
+    )
+
+    assert response.status_code == 200
+    assert events == ["prepare", "gate_enter", "commit", "settle", "gate_exit"]
+
+
+@pytest.mark.asyncio
 async def test_private_route_responses_reserve_replay_and_ack_exact_bytes(
     monkeypatch,
 ) -> None:

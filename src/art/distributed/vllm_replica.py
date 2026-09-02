@@ -464,17 +464,33 @@ class ReplicaManager:
             raise ValueError(
                 "external adapter materialization timeout must be positive"
             )
-        return tuple(
-            await asyncio.gather(
+        settled = await asyncio.gather(
+            *(
+                asyncio.wait_for(
+                    launcher.materialize_adapter_object(source, timeout_s),
+                    timeout_s + 1.0,
+                )
+                for launcher in self._host_launchers
+            ),
+            return_exceptions=True,
+        )
+        failures = [item for item in settled if isinstance(item, BaseException)]
+        if failures:
+            cleanup = await asyncio.gather(
                 *(
                     asyncio.wait_for(
-                        launcher.materialize_adapter_object(source, timeout_s),
-                        timeout_s + 1.0,
+                        launcher.release_adapter_receive(source.generation_id),
+                        self._rpc_timeout_s,
                     )
                     for launcher in self._host_launchers
-                )
+                ),
+                return_exceptions=True,
             )
-        )
+            failures.extend(item for item in cleanup if isinstance(item, BaseException))
+            raise BaseExceptionGroup(
+                "external adapter materialization failed", failures
+            )
+        return tuple(item for item in settled if isinstance(item, AdapterReceiveResult))
 
     async def release_adapter_transfer(self, generation_id: str) -> None:
         await asyncio.gather(

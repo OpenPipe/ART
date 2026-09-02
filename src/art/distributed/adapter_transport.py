@@ -552,6 +552,7 @@ class AdapterSnapshotReceiver:
         self._condition = Condition()
         self._notifications: dict[str, AdapterTransferNotification] = {}
         self._materialized: set[str] = set()
+        self._materialized_objects: dict[str, AdapterReceiveResult] = {}
         self._object_pending: set[str] = set()
         self._agent_lock = Lock()
         self._closed = False
@@ -565,6 +566,23 @@ class AdapterSnapshotReceiver:
 
         started = time.monotonic()
         with self._condition:
+            if self._closed:
+                raise RuntimeError("adapter receive pool is closed")
+            existing = self._materialized_objects.get(source.generation_id)
+            if existing is not None:
+                if isinstance(source, ExternalAdapterObjectSource):
+                    tensor_bytes = source.object_bytes
+                    config_bytes = len(source.adapter_config_json.encode())
+                else:
+                    tensor_bytes = source.model_bytes
+                    config_bytes = source.config_bytes
+                if (
+                    existing.source_identity != source.source_identity
+                    or existing.tensor_bytes != tensor_bytes
+                    or existing.config_bytes != config_bytes
+                ):
+                    raise RuntimeError("materialized external adapter identity changed")
+                return existing
             deadline = started + timeout_s
             while len(self._object_pending) >= self.pool_capacity:
                 if self._closed:
@@ -609,9 +627,7 @@ class AdapterSnapshotReceiver:
                 if self._closed:
                     raise RuntimeError("adapter receive pool closed during download")
             os.rename(temporary, path)
-            with self._condition:
-                self._materialized.add(source.generation_id)
-            return AdapterReceiveResult(
+            result = AdapterReceiveResult(
                 host_id=self.host_id,
                 generation_id=source.generation_id,
                 path=str(path),
@@ -622,6 +638,10 @@ class AdapterSnapshotReceiver:
                 capacity_bytes=tensor_bytes + config_bytes,
                 source_identity=source.source_identity,
             )
+            with self._condition:
+                self._materialized.add(source.generation_id)
+                self._materialized_objects[source.generation_id] = result
+            return result
         except BaseException:
             if temporary.exists():
                 from shutil import rmtree
@@ -856,6 +876,7 @@ class AdapterSnapshotReceiver:
             self._notifications.pop(generation_id, None)
         with self._condition:
             self._materialized.discard(generation_id)
+            self._materialized_objects.pop(generation_id, None)
         for root in (
             self.output_root,
             Path(

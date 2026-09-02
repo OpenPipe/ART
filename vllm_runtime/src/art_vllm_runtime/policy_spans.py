@@ -1685,37 +1685,9 @@ def _commit_staged_policy_lora_update(
     operation_id: str,
     payload: dict[str, Any],
     staged: dict[str, Any],
-) -> dict[str, Any] | Future[dict[str, Any]]:
-    """Perform one queue-serialized pause, collective install, and resume."""
-
-    paused = engine_core.pause_scheduler("keep", False)
-    if isinstance(paused, Future):
-        transaction: Future[dict[str, Any]] = Future()
-
-        def commit_after_pause(pause: Future[Any]) -> None:
-            try:
-                pause.result()
-                transaction.set_result(
-                    _commit_staged_policy_lora_update_after_pause(
-                        engine_core, operation_id, payload, staged
-                    )
-                )
-            except BaseException as error:
-                transaction.set_exception(error)
-
-        paused.add_done_callback(commit_after_pause)
-        return transaction
-    return _commit_staged_policy_lora_update_after_pause(
-        engine_core, operation_id, payload, staged
-    )
-
-
-def _commit_staged_policy_lora_update_after_pause(
-    engine_core: Any,
-    operation_id: str,
-    payload: dict[str, Any],
-    staged: dict[str, Any],
 ) -> dict[str, Any]:
+    """Commit at the EngineCore command boundary without stalling other slots."""
+
     mutation_started = False
     try:
         lora_request = _policy_lora_request_from_payload(payload)
@@ -1738,7 +1710,6 @@ def _commit_staged_policy_lora_update_after_pause(
             previous_policy=previous,
             started_request_ids=started,
         )
-        engine_core.resume_scheduler()
         return {
             "workers": len(acknowledgements),
             "cache_transition": cache_transition,
@@ -1747,8 +1718,6 @@ def _commit_staged_policy_lora_update_after_pause(
         if mutation_started:
             # A failed collective may have changed only a subset of workers.
             engine_core.pause_scheduler("abort", True)
-        else:
-            engine_core.resume_scheduler()
         raise
 
 

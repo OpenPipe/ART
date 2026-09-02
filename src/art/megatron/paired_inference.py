@@ -21,6 +21,7 @@ from art.adapter_leases import in_flight_lora_name
 from art.distributed.adapter_transport import (
     AdapterReceiveResult,
     AdapterTransferTarget,
+    ExternalAdapterObjectSource,
     ExternalAdapterSource,
 )
 from art.distributed.art_runtime import ArtRuntime
@@ -523,7 +524,7 @@ class MegatronPairedInferencePublisher:
             checkpoint, tensor_bytes, config_bytes = _validate_external_received(
                 received, source, self.service
             )
-            staged = {
+            staged: dict[str, object] = {
                 "path": map_checkpoint_path_for_vllm(self.config, checkpoint),
                 "source_identity": source.source_identity,
                 "layout": "peft_safetensors_v1",
@@ -567,17 +568,27 @@ class MegatronPairedInferencePublisher:
 
         async with self._lock:
             previous_sequence = self._active_update_sequences.get(runtime_lora_name, -1)
-            if update_sequence <= previous_sequence:
+            prior_transfer = self._retained_transfers.get(runtime_lora_name)
+            if update_sequence < previous_sequence:
                 manager.quarantine("paired external update sequence regressed")
                 raise RuntimeError("paired external update sequence is not monotonic")
-            prior_transfer = self._retained_transfers.get(runtime_lora_name)
-            self._active_generations[runtime_lora_name] = generation_id
-            self._active_update_sequences[runtime_lora_name] = update_sequence
-            self._retained_transfers[runtime_lora_name] = (
-                manager,
-                source.generation_id,
-            )
-            self._retained_adapter_sources[runtime_lora_name] = staged
+            if update_sequence == previous_sequence:
+                if (
+                    self._active_generations.get(runtime_lora_name) != generation_id
+                    or self._retained_adapter_sources.get(runtime_lora_name) != staged
+                    or prior_transfer is None
+                    or prior_transfer[1] != source.generation_id
+                ):
+                    manager.quarantine("paired external replay identity changed")
+                    raise RuntimeError("paired external update replay changed identity")
+            else:
+                self._active_generations[runtime_lora_name] = generation_id
+                self._active_update_sequences[runtime_lora_name] = update_sequence
+                self._retained_transfers[runtime_lora_name] = (
+                    manager,
+                    source.generation_id,
+                )
+                self._retained_adapter_sources[runtime_lora_name] = staged
 
         if prior_transfer is not None and prior_transfer[1] != source.generation_id:
             release_manager, release_generation = prior_transfer
@@ -1000,11 +1011,16 @@ def _validate_external_received(
     if {item.source_identity for item in received} != {source.source_identity}:
         raise RuntimeError("inference hosts changed the external source identity")
     paths = {str(item.path) for item in received}
-    config_bytes = len(source.adapter_config_json.encode())
+    if isinstance(source, ExternalAdapterObjectSource):
+        tensor_bytes = source.object_bytes
+        config_bytes = len(source.adapter_config_json.encode())
+    else:
+        tensor_bytes = source.model_bytes
+        config_bytes = source.config_bytes
     sizes = {(int(item.tensor_bytes), int(item.config_bytes)) for item in received}
-    if len(paths) != 1 or sizes != {(source.object_bytes, config_bytes)}:
+    if len(paths) != 1 or sizes != {(tensor_bytes, config_bytes)}:
         raise RuntimeError("inference hosts materialized different external adapters")
-    return paths.pop(), source.object_bytes, config_bytes
+    return paths.pop(), tensor_bytes, config_bytes
 
 
 def _serving_profile_identity(

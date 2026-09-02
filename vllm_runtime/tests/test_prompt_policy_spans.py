@@ -1,5 +1,4 @@
 import asyncio
-from concurrent.futures import Future
 import time
 from types import SimpleNamespace
 
@@ -350,7 +349,7 @@ def test_prepared_lora_uses_native_cpu_loader_before_install(tmp_path) -> None:
         policy_spans._WORKER_LORA_POLICY_BY_ID.pop(7, None)
 
 
-def test_engine_commit_is_one_paused_descriptor_only_transaction() -> None:
+def test_engine_commit_is_one_queue_serialized_descriptor_only_transaction() -> None:
     request = policy_spans.PolicyLoRARequest(
         lora_name="run:active",
         lora_int_id=7,
@@ -383,24 +382,21 @@ def test_engine_commit_is_one_paused_descriptor_only_transaction() -> None:
     }
 
     class Core:
-        def __init__(self) -> None:
+        def __init__(self, *, fail: bool = False) -> None:
             self.scheduler = SimpleNamespace(requests={})
             self.pauses: list[tuple[str, bool]] = []
-            self.resumes = 0
             self.rpc: tuple[str, tuple[object, ...]] | None = None
-            self.pause_result: Future[None] | None = None
+            self.fail = fail
 
-        def pause_scheduler(self, mode: str, abort: bool) -> Future[None] | None:
+        def pause_scheduler(self, mode: str, abort: bool) -> None:
             self.pauses.append((mode, abort))
-            return self.pause_result
-
-        def resume_scheduler(self) -> None:
-            self.resumes += 1
 
         def collective_rpc(
             self, method: str, *, args: tuple[object, ...]
         ) -> list[dict[str, object]]:
             self.rpc = (method, args)
+            if self.fail:
+                raise RuntimeError("collective failed")
             return [{"loaded": True, "previous": previous, "current": current}]
 
     core = Core()
@@ -408,8 +404,7 @@ def test_engine_commit_is_one_paused_descriptor_only_transaction() -> None:
         core, "operation-2", payload, staged
     )
 
-    assert core.pauses == [("keep", False)]
-    assert core.resumes == 1
+    assert core.pauses == []
     assert core.rpc == (
         "art_commit_staged_lora_policy",
         ("operation-2", payload, staged),
@@ -419,15 +414,9 @@ def test_engine_commit_is_one_paused_descriptor_only_transaction() -> None:
         "cache_transition": {"updated_requests": 0, "continued_requests": 0},
     }
 
-    pending_core = Core()
-    pending_core.pause_result = Future()
-    transaction = policy_spans._commit_staged_policy_lora_update(
-        pending_core, "operation-3", payload, staged
-    )
-    assert isinstance(transaction, Future)
-    assert pending_core.rpc is None
-    assert pending_core.resumes == 0
-    pending_core.pause_result.set_result(None)
-    assert transaction.result() == result
-    assert pending_core.rpc is not None
-    assert pending_core.resumes == 1
+    failed = Core(fail=True)
+    with pytest.raises(RuntimeError, match="collective failed"):
+        policy_spans._commit_staged_policy_lora_update(
+            failed, "operation-3", payload, staged
+        )
+    assert failed.pauses == [("abort", True)]

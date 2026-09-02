@@ -65,6 +65,7 @@ _PRIVATE_USAGE_PATH = "/art/internal/v1/usage"
 _RUNTIME_TARGET_HEADER = "x-art-runtime-target"
 _LORA_PREPARATION_POLL_S = 0.05
 _LORA_PREPARATION_TIMEOUT_S = 300.0
+_LORA_UPDATE_RECEIPT_CAPACITY = 4096
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _runtime_state: dict[str, object] = {}
 _auth_tokens: list[str] = []
@@ -148,6 +149,52 @@ class _PrivateExecutionReceipts:
                 "active_execution_receipts": active,
                 "terminal_execution_receipts": len(self._receipts) - active,
             }
+
+
+@dataclass(frozen=True)
+class _CompletedLoraUpdateReceipt:
+    fingerprint: str
+    result: dict[str, object]
+
+
+class _CompletedLoraUpdates:
+    """Bound response-loss replay for holder-local update operations."""
+
+    def __init__(self, capacity: int) -> None:
+        if capacity < 1:
+            raise ValueError("LoRA update receipt capacity must be positive")
+        self.capacity = capacity
+        self._lock = asyncio.Lock()
+        self._receipts: OrderedDict[str, _CompletedLoraUpdateReceipt] = OrderedDict()
+
+    async def replay(
+        self, operation_id: str, fingerprint: str
+    ) -> dict[str, object] | None:
+        async with self._lock:
+            receipt = self._receipts.get(operation_id)
+            if receipt is None:
+                return None
+            if receipt.fingerprint != fingerprint:
+                raise ValueError("LoRA update operation identity changed")
+            self._receipts.move_to_end(operation_id)
+            return dict(receipt.result)
+
+    async def settle(
+        self, operation_id: str, fingerprint: str, result: dict[str, object]
+    ) -> None:
+        async with self._lock:
+            existing = self._receipts.get(operation_id)
+            if existing is not None:
+                if existing.fingerprint != fingerprint or existing.result != result:
+                    raise RuntimeError("completed LoRA update receipt changed")
+                self._receipts.move_to_end(operation_id)
+                return
+            if len(self._receipts) >= self.capacity:
+                self._receipts.popitem(last=False)
+            self._receipts[operation_id] = _CompletedLoraUpdateReceipt(
+                fingerprint=fingerprint,
+                result=dict(result),
+            )
 
 
 @dataclass(frozen=True)
@@ -283,6 +330,7 @@ class _PrivateRouteResponses:
 _private_execution_receipts = _PrivateExecutionReceipts(
     _PRIVATE_EXECUTION_RECEIPT_CAPACITY
 )
+_completed_lora_updates = _CompletedLoraUpdates(_LORA_UPDATE_RECEIPT_CAPACITY)
 _private_route_responses = _PrivateRouteResponses()
 
 
@@ -776,6 +824,27 @@ def _valid_preparation_result(value: object, *, ready: bool) -> bool:
         and value["workers"] > 0
         and value.get("ready") is ready
     )
+
+
+def _lora_update_fingerprint(body: _InFlightLoraUpdateRequest) -> str:
+    payload = json.dumps(
+        body.model_dump(mode="json"), sort_keys=True, separators=(",", ":")
+    ).encode()
+    return hashlib.sha256(payload).hexdigest()
+
+
+async def _replay_lora_update(
+    body: _InFlightLoraUpdateRequest,
+    fingerprint: str,
+) -> JSONResponse | None:
+    try:
+        result = await _completed_lora_updates.replay(body.operation_id, fingerprint)
+    except ValueError as error:
+        return JSONResponse(
+            content={"error": str(error), "type": "idempotency_conflict"},
+            status_code=HTTPStatus.CONFLICT.value,
+        )
+    return None if result is None else JSONResponse(content=result)
 
 
 def _index_shared_pp_partition(config: Any, pp_size: int) -> tuple[int, ...] | None:
@@ -1443,6 +1512,10 @@ def _patch_art_runtime_routes() -> None:
             models = raw_request.app.state.openai_serving_models
             engine_client = engine(raw_request)
             coordinator = lora_update_coordinator(models, engine_client)
+            request_fingerprint = _lora_update_fingerprint(body)
+            replay = await _replay_lora_update(body, request_fingerprint)
+            if replay is not None:
+                return replay
             if (
                 body.expected_generation_id is not None
                 and generation_id == body.expected_generation_id
@@ -1452,13 +1525,66 @@ def _patch_art_runtime_routes() -> None:
                     status_code=HTTPStatus.CONFLICT.value,
                 )
 
-            apply_started = time.monotonic()
             update_seq: int | None = None
             mutation_started = False
             preparation_attempted = False
             lora_request: PolicyLoRARequest | None = None
             try:
+                lora_int_id = (
+                    models.lora_requests[lora_slot].lora_int_id
+                    if lora_slot in models.lora_requests
+                    else models.lora_id_counter.inc(1)
+                )
+                prepare_request = PolicyLoRARequest(
+                    lora_name=lora_slot,
+                    lora_int_id=lora_int_id,
+                    lora_path=lora_path,
+                    base_model_name=(
+                        body.base_model_name
+                        if body.base_model_name is not None
+                        and models.is_base_model(body.base_model_name)
+                        else None
+                    ),
+                    load_inplace=True,
+                    is_3d_lora_weight=body.is_3d_lora_weight,
+                    generation_id=generation_id,
+                    policy_version=policy_version,
+                    update_seq=0,
+                )
+                prepare_payload = policy_lora_request_payload(prepare_request)
+                staged_payload = staged.model_dump(mode="python")
+                preparation_attempted = True
+                preparation = await engine_client.engine_core.call_utility_async(
+                    "art_prepare_staged_lora_policy",
+                    body.operation_id,
+                    prepare_payload,
+                    staged_payload,
+                )
+                deadline = time.monotonic() + _LORA_PREPARATION_TIMEOUT_S
+                while not _valid_preparation_result(preparation, ready=True):
+                    if not _valid_preparation_result(preparation, ready=False):
+                        raise RuntimeError(
+                            "EngineCore returned an invalid LoRA preparation state"
+                        )
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError("Timed out preparing policy LoRA")
+                    await asyncio.sleep(_LORA_PREPARATION_POLL_S)
+                    preparation = await engine_client.engine_core.call_utility_async(
+                        "art_staged_lora_policy_status",
+                        body.operation_id,
+                        prepare_payload,
+                        staged_payload,
+                    )
+
+                apply_started = time.monotonic()
                 async with models.lora_resolver_lock[lora_slot]:
+                    replay = await _replay_lora_update(body, request_fingerprint)
+                    if replay is not None:
+                        await engine_client.engine_core.call_utility_async(
+                            "art_abort_staged_lora_policy", body.operation_id
+                        )
+                        preparation_attempted = False
+                        return replay
                     load_request = LoadLoRAAdapterRequest(
                         lora_name=lora_slot,
                         lora_path=lora_path,
@@ -1469,6 +1595,10 @@ def _patch_art_runtime_routes() -> None:
                         load_request
                     )
                     if isinstance(load_error, ErrorResponse):
+                        await engine_client.engine_core.call_utility_async(
+                            "art_abort_staged_lora_policy", body.operation_id
+                        )
+                        preparation_attempted = False
                         return JSONResponse(
                             content=load_error.model_dump(mode="python"),
                             status_code=load_error.error.code,
@@ -1479,59 +1609,16 @@ def _patch_art_runtime_routes() -> None:
                             expected_generation_id=body.expected_generation_id,
                         )
                     except RuntimeError as error:
+                        await engine_client.engine_core.call_utility_async(
+                            "art_abort_staged_lora_policy", body.operation_id
+                        )
+                        preparation_attempted = False
                         return JSONResponse(
                             content={
                                 "error": str(error),
                                 "type": "generation_conflict",
                             },
                             status_code=HTTPStatus.CONFLICT.value,
-                        )
-                    lora_int_id = (
-                        models.lora_requests[lora_slot].lora_int_id
-                        if lora_slot in models.lora_requests
-                        else models.lora_id_counter.inc(1)
-                    )
-                    prepare_request = PolicyLoRARequest(
-                        lora_name=lora_slot,
-                        lora_int_id=lora_int_id,
-                        lora_path=lora_path,
-                        base_model_name=(
-                            body.base_model_name
-                            if body.base_model_name is not None
-                            and models.is_base_model(body.base_model_name)
-                            else None
-                        ),
-                        load_inplace=True,
-                        is_3d_lora_weight=body.is_3d_lora_weight,
-                        generation_id=generation_id,
-                        policy_version=policy_version,
-                        update_seq=0,
-                    )
-                    prepare_payload = policy_lora_request_payload(prepare_request)
-                    staged_payload = staged.model_dump(mode="python")
-                    preparation_attempted = True
-                    preparation = await engine_client.engine_core.call_utility_async(
-                        "art_prepare_staged_lora_policy",
-                        body.operation_id,
-                        prepare_payload,
-                        staged_payload,
-                    )
-                    deadline = time.monotonic() + _LORA_PREPARATION_TIMEOUT_S
-                    while not _valid_preparation_result(preparation, ready=True):
-                        if not _valid_preparation_result(preparation, ready=False):
-                            raise RuntimeError(
-                                "EngineCore returned an invalid LoRA preparation state"
-                            )
-                        if time.monotonic() >= deadline:
-                            raise TimeoutError("Timed out preparing policy LoRA")
-                        await asyncio.sleep(_LORA_PREPARATION_POLL_S)
-                        preparation = (
-                            await engine_client.engine_core.call_utility_async(
-                                "art_staged_lora_policy_status",
-                                body.operation_id,
-                                prepare_payload,
-                                staged_payload,
-                            )
                         )
                     try:
                         update_seq = await coordinator.begin_publication(
@@ -1649,6 +1736,9 @@ def _patch_art_runtime_routes() -> None:
                 "staged_bytes": staged.total_bytes,
                 "source_identity": staged.source_identity,
             }
+            await _completed_lora_updates.settle(
+                body.operation_id, request_fingerprint, result
+            )
             return JSONResponse(content=result)
 
         app.include_router(router)

@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import hashlib
 import json
@@ -8,6 +9,7 @@ import pytest
 
 from art.distributed import adapter_transport
 from art.distributed.adapter_transport import (
+    AdapterReceiveResult,
     AdapterSnapshotReceiver,
     AdapterSnapshotSender,
     AdapterTransferTarget,
@@ -16,6 +18,7 @@ from art.distributed.adapter_transport import (
     ExternalAdapterShardedSource,
     NixlAdapterSender,
 )
+from art.distributed.vllm_replica import ReplicaManager
 
 
 def test_adapter_transport_state_is_bounded_and_survives_close(
@@ -227,6 +230,84 @@ def test_committed_external_shards_reconstruct_standard_adapter(
     assert result.config_bytes == len(config)
     assert (root / "adapter_config.json").read_bytes() == config
     assert (root / "adapter_model.safetensors").read_bytes() == model
+    assert receiver.materialize_object(source) == result
+    with pytest.raises(RuntimeError, match="identity changed"):
+        receiver.materialize_object(
+            source.model_copy(update={"source_identity": "manifest:" + "f" * 64})
+        )
+
+
+def test_external_materialization_failure_settles_and_releases_every_host() -> None:
+    config = json.dumps(
+        {"art_lora_format": "vllm", "r": 1, "target_modules": ["q_proj"]},
+        separators=(",", ":"),
+    ).encode()
+    source = ExternalAdapterObjectSource(
+        generation_id="generation-failed-gang",
+        source_identity="sha256:" + "a" * 64,
+        object_url="https://objects.example/adapter?signature=secret",
+        object_bytes=4096,
+        object_sha256="b" * 64,
+        adapter_config_json=config.decode(),
+        adapter_config_sha256=hashlib.sha256(config).hexdigest(),
+        lora_rank=1,
+        target_modules=("q_proj",),
+    )
+
+    class Launcher:
+        def __init__(self, host_id: str, *, fail_once: bool) -> None:
+            self.host_id = host_id
+            self.fail_once = fail_once
+            self.attempts = 0
+            self.completed = False
+            self.retained = False
+            self.released: list[str] = []
+
+        async def materialize_adapter_object(self, value, timeout_s):
+            self.attempts += 1
+            self.completed = False
+            try:
+                await asyncio.sleep(0 if self.fail_once else 0.01)
+                assert value is source
+                if self.retained:
+                    raise RuntimeError("retry conflicted with retained receive")
+                if self.fail_once and self.attempts == 1:
+                    raise RuntimeError("host materialization failed")
+                self.retained = True
+                return AdapterReceiveResult(
+                    host_id=self.host_id,
+                    generation_id=source.generation_id,
+                    path=f"/adapter/{source.generation_id}",
+                    tensor_bytes=source.object_bytes,
+                    config_bytes=len(config),
+                    materialization_s=0.1,
+                    used_bytes=source.object_bytes + len(config),
+                    capacity_bytes=source.object_bytes + len(config),
+                    source_identity=source.source_identity,
+                )
+            finally:
+                self.completed = True
+
+        async def release_adapter_receive(self, generation_id):
+            assert self.completed
+            self.retained = False
+            self.released.append(generation_id)
+
+    async def exercise() -> tuple[Launcher, Launcher, tuple[AdapterReceiveResult, ...]]:
+        first = Launcher("inference-0", fail_once=False)
+        second = Launcher("inference-1", fail_once=True)
+        manager = object.__new__(ReplicaManager)
+        manager._host_launchers = (first, second)
+        manager._rpc_timeout_s = 1.0
+        with pytest.raises(BaseExceptionGroup, match="materialization failed"):
+            await manager.materialize_external_adapter(source, timeout_s=1.0)
+        retried = await manager.materialize_external_adapter(source, timeout_s=1.0)
+        return first, second, retried
+
+    first, second, retried = asyncio.run(exercise())
+    assert first.released == [source.generation_id]
+    assert second.released == [source.generation_id]
+    assert tuple(item.host_id for item in retried) == ("inference-0", "inference-1")
 
 
 class _Handle:
