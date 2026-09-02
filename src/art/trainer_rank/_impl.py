@@ -540,10 +540,10 @@ class TrainerRankRuntimeSupportError(RuntimeError):
 
 
 class TrainerRankPartialExecutionError(TrainerRankMemoryError):
-    """A later subforward of an admitted split failed after earlier ones ran.
+    """A subforward of an admitted split failed while executing.
 
     Distinct from an up-front refusal: model execution already began, so the
-    call cannot transparently choose another split. Earlier subforwards'
+    call cannot transparently choose another split. Any earlier subforwards'
     graphs were released; runtime state (e.g. RNG) may have advanced.
     """
 
@@ -564,10 +564,14 @@ class _MemoryProfile:
     bytes_per_token: float
     packed_tokens: int
     logical_per_packed: float = 1.0
-    # Fraction of the estimated forward requirement still allocated after the
-    # forward returns (activations retained for backward). Conservative
-    # default: everything. Learned online, max-merged.
-    retained_fraction: float = 1.0
+    # Fraction of a forward's observed peak still allocated after it returns
+    # (activations retained for backward): a physical ratio, so it needs no
+    # trusted denominator (the cold call's static estimate is far below the
+    # real peak). ``None`` until observed, max-merged afterwards. Observed at
+    # forward return only — it says nothing about the backward's own
+    # workspace. Trusted only near the ``packed_tokens`` /
+    # ``logical_per_packed`` scale it was observed at.
+    retained_fraction: float | None = None
 
 
 @dataclass(frozen=True)
@@ -936,10 +940,65 @@ _AnyForwardPlan = _FlatForwardPlan | _SplitForwardPlan
 
 
 @dataclass(frozen=True)
-class _SignatureOnlyPlan:
-    """Minimal stand-in so profile lookups can price a chunk before planning."""
+class _SubforwardCost:
+    """Memory terms of one candidate subforward while all graphs stay live.
 
-    signature: _MemorySignature
+    ``required`` is its transient peak while running (the planner estimate);
+    ``retained`` is what stays allocated after it returns because its graph
+    is kept for backward; ``ephemeral`` is the difference.
+    """
+
+    required: int
+    retained: int
+
+    @property
+    def ephemeral(self) -> int:
+        return self.required - self.retained
+
+
+_MEMORY_ERROR_SUGGESTION = (
+    "Use smaller top-level items, reduce output requests, or call "
+    "dp_rank_forward with already-DP-local smaller inputs."
+)
+
+
+def _memory_error(
+    *,
+    context: str,
+    message: str,
+    packed_tokens: int,
+    logical_tokens: int,
+    check: _MemoryCheck,
+) -> TrainerRankMemoryError:
+    return TrainerRankMemoryError(
+        f"{context}: {message}. "
+        f"packed_tokens={packed_tokens} "
+        f"logical_tokens={logical_tokens} "
+        f"predicted_peak_gb={check.estimated_required_bytes / 1024**3:.3f} "
+        f"usable_limit_gb={check.available_bytes / 1024**3:.3f}. "
+        f"{_MEMORY_ERROR_SUGGESTION}",
+        predicted_peak_bytes=check.estimated_required_bytes,
+        usable_limit_bytes=check.available_bytes,
+        suggestion=_MEMORY_ERROR_SUGGESTION,
+    )
+
+
+@dataclass(frozen=True)
+class _ForwardRefusal:
+    """Why no admissible plan was found. ``plan`` is the unsplit call."""
+
+    plan: _FlatForwardPlan
+    check: _MemoryCheck
+    message: str
+
+    def error(self, context: str) -> TrainerRankMemoryError:
+        return _memory_error(
+            context=context,
+            message=self.message,
+            packed_tokens=self.plan.packed_tokens,
+            logical_tokens=self.plan.logical_tokens,
+            check=self.check,
+        )
 
 
 def _wave_geometry(item_count: int, start: int, dp_size: int) -> tuple[int, int, int]:
@@ -1879,7 +1938,7 @@ class TrainerRank:
                 self._submit_speculative_wave_planning(
                     items, stop, checkpoint=checkpoint
                 )
-            self._snapshot_planning_telemetry(candidate.plan)
+            self._snapshot_planning_telemetry(candidate.plan, candidate.check)
             with _telemetry_phase(
                 # This interval is controlled by the caller and normally contains
                 # loss construction and backward for the yielded microbatch.
@@ -1908,7 +1967,8 @@ class TrainerRank:
             # The caller normally runs backward while the micro-batch is yielded.
             # Include that peak in future planning; forward-only profiling can
             # otherwise admit a later micro-batch that leaves no collective or
-            # optimizer headroom.
+            # optimizer headroom. Peak only: the retained observation belongs
+            # to the forward's return, already recorded for this same plan.
             if isinstance(candidate.plan, _FlatForwardPlan):
                 self._update_peak_memory_profile(candidate.plan, memory_baseline)
             start = stop
@@ -1979,10 +2039,9 @@ class TrainerRank:
             self._reset_planning_telemetry()
             materialized = _materialize(inputs)
             requests = list(_flatten(materialized))
-            plan, _check = self._plan_admissible_forward(
+            plan = self._plan_admissible_forward(
                 requests, checkpoint=checkpoint, context="dp_rank_forward"
             )
-            self._snapshot_planning_telemetry(plan)
             tracked_outputs = self._execute_admitted_plan(
                 plan, context="dp_rank_forward"
             )
@@ -2005,13 +2064,12 @@ class TrainerRank:
                     subforward, context=context
                 )
             except TrainerRankMemoryError as error:
-                if ordinal == 0:
-                    raise
-                # Model execution already began: no replanning is possible.
+                # Model execution already began, so no replanning is possible
+                # and the caller must not mistake this for an up-front refusal.
                 raise TrainerRankPartialExecutionError(
                     f"{context}: subforward {ordinal + 1} of "
-                    f"{plan.subforward_count} failed after earlier subforwards "
-                    f"executed; the call is partially executed. {error}",
+                    f"{plan.subforward_count} failed during execution "
+                    f"({ordinal} of {plan.subforward_count} completed). {error}",
                     predicted_peak_bytes=error.predicted_peak_bytes,
                     usable_limit_bytes=error.usable_limit_bytes,
                     suggestion=error.suggestion,
@@ -2022,78 +2080,100 @@ class TrainerRank:
             raise AssertionError("split execution did not cover every request")
         return cast(list[AnyForwardOutput], merged)
 
-    def _retained_fraction(self, plan: _FlatForwardPlan | _SignatureOnlyPlan) -> float:
-        """Fraction of a subforward's estimate that stays live after it returns."""
-
-        return self._retained_fraction_for(plan.signature)
-
     def _plan_admissible_forward(
         self,
         requests: Sequence[AnyForwardInput],
         *,
         checkpoint: AdapterSelection,
         context: str,
-        refusal_prefix: str = "forward is predicted to exceed available memory",
-    ) -> tuple[_AnyForwardPlan, _MemoryCheck]:
-        """Plan one forward, splitting into sequential subforwards if needed.
+    ) -> _AnyForwardPlan:
+        """Plan one forward (splitting if needed), recording telemetry, or raise."""
 
-        Bounded, deterministic ladder: the unsplit plan (cost-optimal, then
-        memory-minimal), then 2, 4, ... subforwards partitioned along the
-        prefix tree so shared-prefix siblings stay together, stopping at the
-        fewest subforwards that fit. Subforward ``j`` is admitted against the
-        retained memory of subforwards ``< j`` plus its own transient estimate,
-        because every returned graph stays live together. If even one request
-        per subforward cannot be admitted, refuse: the ladder was unable to
-        find a feasible split (which is not a claim that none exists).
+        found = self._find_admissible_forward(
+            requests,
+            checkpoint=checkpoint,
+            refusal_prefix="forward is predicted to exceed available memory",
+        )
+        if isinstance(found, _ForwardRefusal):
+            self._snapshot_planning_telemetry(found.plan, found.check)
+            raise found.error(context)
+        plan, check = found
+        self._snapshot_planning_telemetry(plan, check)
+        return plan
+
+    def _find_admissible_forward(
+        self,
+        requests: Sequence[AnyForwardInput],
+        *,
+        checkpoint: AdapterSelection,
+        refusal_prefix: str,
+    ) -> tuple[_AnyForwardPlan, _MemoryCheck] | _ForwardRefusal:
+        """Find an admissible plan: unsplit first, then the bounded split ladder.
+
+        The unsplit plan is tried cost-optimal, then memory-minimal. If neither
+        is admitted, the ladder tries 2, 4, ... subforwards (at most one
+        request each), cutting the requests in prefix-local depth-first order
+        into token-balanced chunks, and stops at the fewest subforwards whose
+        rung check passes (``_admit_split_rung``). Exhausting the ladder is a
+        refusal worded as "unable to find a feasible split": the search is
+        bounded, so this is not a claim that none exists.
+
+        Checkpoint slots are ensured exactly once, up front; everything after
+        plans with ``ensure_slots=False`` so the number of collectives this
+        rank performs does not depend on its (DP-local) inputs.
         """
 
-        plan = self._plan_flat_forward(requests, checkpoint=checkpoint)
+        self._ensure_checkpoint_slots_for(requests, checkpoint=checkpoint)
+        plan = self._plan_flat_forward(
+            requests, checkpoint=checkpoint, ensure_slots=False
+        )
         check = self._memory_check(plan)
         if check.fits:
             return plan, check
         # Best effort before splitting: the memory-minimal (full sharing)
         # layouts may fit where the cost-optimal ones do not.
         plan = self._plan_flat_forward(
-            requests, checkpoint=checkpoint, memory_minimal=True
+            requests, checkpoint=checkpoint, memory_minimal=True, ensure_slots=False
         )
         check = self._memory_check(plan)
         if check.fits:
             return plan, check
-        failing_plan, failing_check = plan, check
         request_count = len(requests)
-        if request_count > 1 and self._expert_parallel_active():
-            self._raise_memory_error(
-                failing_plan,
-                failing_check,
-                context=context,
-                message=(
-                    f"{refusal_prefix}; unable to find a feasible split: internal "
-                    "splitting is disabled under expert parallelism in this release"
-                ),
+        if request_count == 1:
+            return _ForwardRefusal(
+                plan, check, f"{refusal_prefix}; a single request cannot be split"
             )
-        if request_count > 1:
-            order = self._split_request_order(requests, checkpoint=checkpoint)
-            subforward_count = 2
-            while True:
-                chunks = _split_chunks(order, requests, subforward_count)
-                admitted = self._admit_split(chunks, requests, checkpoint=checkpoint)
-                if isinstance(admitted, _SplitForwardPlan):
-                    return admitted, self._memory_check(admitted.subforwards[-1])
-                failing_plan, failing_check = admitted
-                if subforward_count >= request_count:
-                    break
-                subforward_count = min(request_count, subforward_count * 2)
-        self._raise_memory_error(
-            failing_plan,
-            failing_check,
-            context=context,
-            message=(
-                f"{refusal_prefix}; unable to find a feasible split: the bounded "
-                "split ladder reached one request per subforward and the smallest "
-                "subforward is still predicted to exceed available memory"
-            ),
+        if self._expert_parallel_active():
+            return _ForwardRefusal(
+                plan,
+                check,
+                f"{refusal_prefix}; unable to find a feasible split: internal "
+                "splitting is disabled under expert parallelism in this release",
+            )
+        rows = tuple(
+            request.input_tokens.detach().reshape(-1).to("cpu", torch.long)
+            for request in requests
         )
-        raise AssertionError("unreachable")
+        order = self._split_request_order(requests, rows, checkpoint=checkpoint)
+        subforward_count = 2
+        while True:
+            chunks = _split_chunks(order, requests, subforward_count)
+            split, check = self._admit_split_rung(
+                chunks, requests, rows, checkpoint=checkpoint
+            )
+            if split is not None:
+                return split, check
+            if subforward_count >= request_count:
+                break
+            subforward_count = min(request_count, subforward_count * 2)
+        return _ForwardRefusal(
+            plan,
+            check,
+            f"{refusal_prefix}; unable to find a feasible split: every rung of "
+            "the bounded ladder (2, 4, ..., one request per subforward) is "
+            "predicted to exceed available memory once all returned graphs are "
+            "live together",
+        )
 
     def _expert_parallel_active(self) -> bool:
         try:
@@ -2103,136 +2183,188 @@ class TrainerRank:
         except (AssertionError, ImportError, RuntimeError, ValueError):
             return False
 
-    def _admit_split(
+    def _admit_split_rung(
         self,
         chunks: Sequence[tuple[int, ...]],
         requests: Sequence[AnyForwardInput],
+        rows: Sequence[torch.Tensor],
         *,
         checkpoint: AdapterSelection,
-    ) -> _SplitForwardPlan | tuple[_FlatForwardPlan, _MemoryCheck]:
-        """Admit one candidate partition or return the first failing piece.
+    ) -> tuple[_SplitForwardPlan | None, _MemoryCheck]:
+        """Admit one rung of the ladder, or return its binding memory check.
 
-        Pricing per chunk mirrors width probing: the cheap no-sharing bound
-        accepts, the cheap full-sharing bound rejects, and planner pricing runs
-        only in between (cost-optimal, then memory-minimal). Chunks execute
-        larger-ephemeral-first (deterministic, stable), which minimizes the
-        cumulative forward peak; admission of chunk ``j`` charges the retained
-        memory of every earlier chunk. Finally the backward upper bound —
-        every chunk's retained graphs plus the largest ephemeral workspace —
-        must fit, because all returned graphs are backwarded while live.
+        Every returned graph stays live, so subforward ``j`` needs its own
+        transient peak plus the memory retained by the subforwards before it.
+        Each of those sums is bounded by the rung check — all retained memory
+        plus the largest ephemeral share — which therefore decides the rung by
+        itself, in any execution order. The same quantity is the headroom the
+        caller's backward can count on: every graph live and one subforward's
+        forward-ephemeral memory free again. That is a heuristic for backward
+        workspace, not a bound (a backward may need more than its forward's
+        ephemeral memory); the ballast arm of the split-conversion gate
+        measures it on a real cell.
+
+        Cost: the cheap full-sharing lower bound (one O(tokens) CPU scan per
+        chunk) rejects a rung without planning anything. A rung that survives
+        is priced exactly with cost-optimal layouts and, failing that, with
+        memory-minimal layouts, whose packed tokens equal the lower bound — so
+        the planner runs for at most one rung, the one that executes.
         """
 
-        priced: list[tuple[int, int, int, bool, tuple[int, ...]]] = []
-        for chunk in chunks:
-            chunk_requests = [requests[index] for index in chunk]
-            logical = sum(
-                int(request.input_tokens.numel()) for request in chunk_requests
+        lower = [
+            self._split_chunk_lower_cost(
+                [requests[index] for index in chunk],
+                [rows[index] for index in chunk],
+                checkpoint=checkpoint,
             )
-            cheap = self._estimate_flat_forward(chunk_requests, checkpoint=checkpoint)
-            if cheap is None:
-                # Device inputs: price with the actual plan (memoized).
-                plan = self._plan_flat_forward(chunk_requests, checkpoint=checkpoint)
-                cheap = (plan.packed_tokens, plan.output_bytes, plan.signature)
-            packed, output_bytes, signature = cheap
-            required = self._estimate_required_memory_bytes_from_values(
-                packed_tokens=packed,
-                output_bytes=output_bytes,
-                signature=signature,
-                logical_tokens=logical,
-            )
-            retained = int(
-                required * self._retained_fraction(_SignatureOnlyPlan(signature))
-            )
-            priced.append((required, retained, logical, False, chunk))
-
-        # Larger ephemeral (transient - retained) first minimizes the running
-        # forward peak; ties break on chunk order for determinism.
-        order = sorted(
-            range(len(priced)),
-            key=lambda i: (-(priced[i][0] - priced[i][1]), i),
-        )
-
-        subforwards: list[_FlatForwardPlan] = []
-        admitted_chunks: list[tuple[int, ...]] = []
-        retained_total = 0
-        largest_ephemeral = 0
-        for position in order:
-            required, retained, logical, _mode, chunk = priced[position]
-            chunk_requests = [requests[index] for index in chunk]
-            admitted: _FlatForwardPlan | None = None
-            failing: tuple[_FlatForwardPlan, _MemoryCheck] | None = None
-            check = self._memory_check_required(required + retained_total)
-            if check.fits:
-                # The cheap bound admitted it; the cost-optimal plan is no
-                # larger than the bound.
-                admitted = self._plan_flat_forward(
-                    chunk_requests, checkpoint=checkpoint
+            for chunk in chunks
+        ]
+        check = self._split_rung_check(lower)
+        if not check.fits:
+            return None, check
+        for memory_minimal in (False, True):
+            plans = [
+                self._plan_flat_forward(
+                    [requests[index] for index in chunk],
+                    checkpoint=checkpoint,
+                    memory_minimal=memory_minimal,
+                    ensure_slots=False,
                 )
-            else:
-                for memory_minimal in (False, True):
-                    plan = self._plan_flat_forward(
-                        chunk_requests,
-                        checkpoint=checkpoint,
-                        memory_minimal=memory_minimal,
-                    )
-                    required = self._estimate_required_memory_bytes_from_values(
-                        packed_tokens=plan.packed_tokens,
-                        output_bytes=plan.output_bytes,
-                        signature=plan.signature,
-                        logical_tokens=plan.logical_tokens,
-                    )
-                    retained = int(required * self._retained_fraction(plan))
-                    check = self._memory_check_required(required + retained_total)
-                    if check.fits:
-                        admitted = plan
-                        break
-                    failing = (plan, check)
-            if admitted is None:
-                assert failing is not None
-                return failing
-            subforwards.append(admitted)
-            admitted_chunks.append(chunk)
-            retained_total += retained
-            largest_ephemeral = max(largest_ephemeral, required - retained)
+                for chunk in chunks
+            ]
+            costs = [self._plan_cost(plan) for plan in plans]
+            check = self._split_rung_check(costs)
+            if check.fits:
+                # Larger ephemeral first minimizes the running forward peak;
+                # ties keep chunk order, so the partition is deterministic.
+                order = sorted(
+                    range(len(plans)), key=lambda i: (-costs[i].ephemeral, i)
+                )
+                return (
+                    _SplitForwardPlan(
+                        subforwards=tuple(plans[i] for i in order),
+                        request_indices=tuple(tuple(chunks[i]) for i in order),
+                        request_count=len(requests),
+                    ),
+                    check,
+                )
+        return None, check
 
-        # Backward upper bound: all retained graphs live plus the largest
-        # subforward's reusable workspace.
-        backward_check = self._memory_check_required(retained_total + largest_ephemeral)
-        if not backward_check.fits:
-            return subforwards[-1], backward_check
-        return _SplitForwardPlan(
-            subforwards=tuple(subforwards),
-            request_indices=tuple(admitted_chunks),
-            request_count=len(requests),
+    def _split_rung_check(self, costs: Sequence[_SubforwardCost]) -> _MemoryCheck:
+        return self._memory_check_required(
+            sum(cost.retained for cost in costs) + max(cost.ephemeral for cost in costs)
         )
 
-    def _retained_fraction_for(self, signature: _MemorySignature) -> float:
+    def _split_chunk_lower_cost(
+        self,
+        requests: Sequence[AnyForwardInput],
+        rows: Sequence[torch.Tensor],
+        *,
+        checkpoint: AdapterSelection,
+    ) -> _SubforwardCost:
+        """Cheapest possible cost of a chunk: its full-sharing packed tokens."""
+
+        groups = self._group_active_request_indices(
+            requests, checkpoint=checkpoint, ensure_slots=False
+        )
+        packed_tokens = 0
+        for _, group_indices in groups:
+            estimated = estimate_prefix_tree_packed_tokens(
+                (rows[index] for index in group_indices),
+                max_depth=len(group_indices),
+            )
+            assert estimated is not None  # rows are CPU copies
+            packed_tokens += estimated
+        return self._subforward_cost(
+            packed_tokens=packed_tokens,
+            output_bytes=self._estimate_group_request_output_bytes(requests),
+            signature=self._memory_signature_from_requests(
+                requests,
+                slot_group_count=len(groups),
+                grad_modes=tuple(mode for (_, mode), _ in groups),
+            ),
+            logical_tokens=sum(int(row.numel()) for row in rows),
+        )
+
+    def _plan_cost(self, plan: _FlatForwardPlan) -> _SubforwardCost:
+        return self._subforward_cost(
+            packed_tokens=plan.packed_tokens,
+            output_bytes=plan.output_bytes,
+            signature=plan.signature,
+            logical_tokens=plan.logical_tokens,
+        )
+
+    def _subforward_cost(
+        self,
+        *,
+        packed_tokens: int,
+        output_bytes: int,
+        signature: _MemorySignature,
+        logical_tokens: int,
+    ) -> _SubforwardCost:
+        required = self._estimate_required_memory_bytes_from_values(
+            packed_tokens=packed_tokens,
+            output_bytes=output_bytes,
+            signature=signature,
+            logical_tokens=logical_tokens,
+        )
+        retained = int(
+            required
+            * self._retained_fraction(
+                signature, packed_tokens=packed_tokens, logical_tokens=logical_tokens
+            )
+        )
+        return _SubforwardCost(required=required, retained=retained)
+
+    def _retained_fraction(
+        self,
+        signature: _MemorySignature,
+        *,
+        packed_tokens: int,
+        logical_tokens: int,
+    ) -> float:
+        """Share of a subforward's peak still allocated after it returns.
+
+        Applied to the estimated peak, which is at least the real one whenever
+        the estimate is trusted. 1.0 (everything retained) until observed. An
+        observation is trusted only near the scale and sharing ratio it was
+        made at — the growth range that already gates ``bytes_per_token`` —
+        so a small profiled forward cannot authorize a much larger split.
+        """
+
         profile = self._memory_profiles.get(signature)
-        return 1.0 if profile is None else profile.retained_fraction
+        if profile is None or profile.retained_fraction is None:
+            return 1.0
+        if packed_tokens > profile.packed_tokens * _MEMORY_PROFILE_TRUST_GROWTH:
+            return 1.0
+        ratio = logical_tokens / max(1, packed_tokens)
+        if ratio > profile.logical_per_packed * _MEMORY_PROFILE_TRUST_GROWTH:
+            return 1.0
+        return profile.retained_fraction
 
     def _split_request_order(
         self,
         requests: Sequence[AnyForwardInput],
+        rows: Sequence[torch.Tensor],
         *,
         checkpoint: AdapterSelection,
     ) -> tuple[int, ...]:
-        """Order requests so prefix-sharing siblings are adjacent.
+        """Order requests in prefix-local depth-first order.
 
         Within each checkpoint group, requests follow the canonical tree's
-        depth-first leaf order; requests that produce no outputs (and so join
-        no group) follow in input order.
+        depth-first leaf order, so prefix-sharing requests are adjacent and
+        contiguous cuts keep most sharing inside one chunk; requests that
+        produce no outputs (and so join no group) follow in input order.
         """
 
         ordered: list[int] = []
         seen: set[int] = set()
         for _, group_indices in self._group_active_request_indices(
-            requests, checkpoint=checkpoint
+            requests, checkpoint=checkpoint, ensure_slots=False
         ):
-            rows = tuple(
-                requests[index].input_tokens.reshape(-1).to(dtype=torch.long)
-                for index in group_indices
+            tree, _layout = self._select_group_layout(
+                tuple(rows[index] for index in group_indices)
             )
-            tree, _layout = self._select_group_layout(rows)
             for sequence_indices in tree.sequence_indices_by_terminal:
                 for position in sequence_indices:
                     ordered.append(group_indices[position])
@@ -2245,7 +2377,9 @@ class TrainerRank:
         with self._layout_cache_lock:
             self._speculative_planning_seconds = 0.0
 
-    def _snapshot_planning_telemetry(self, plan: _AnyForwardPlan) -> None:
+    def _snapshot_planning_telemetry(
+        self, plan: _AnyForwardPlan, check: _MemoryCheck
+    ) -> None:
         with self._layout_cache_lock:
             speculative_seconds = self._speculative_planning_seconds
         partition = (
@@ -2261,6 +2395,8 @@ class TrainerRank:
             # Flat request indices executed by each subforward, in execution
             # order; lets callers backward per subforward if they wish.
             "subforward_request_indices": partition,
+            "predicted_peak_bytes": check.estimated_required_bytes,
+            "usable_limit_bytes": check.available_bytes,
         }
 
     def last_forward_telemetry(self) -> dict[str, Any]:
@@ -2271,8 +2407,11 @@ class TrainerRank:
         synchronous cost of submitting speculative work);
         ``speculative_planning_ms`` is worker CPU time hidden under the
         caller's GPU work; ``selected_max_depth`` describes the most recently
-        materialized plan. The snapshot is taken before admission, so a call
-        refused with ``TrainerRankMemoryError`` is still reflected.
+        materialized plan; ``predicted_peak_bytes`` / ``usable_limit_bytes``
+        are the admitted plan's memory check (for a split: every retained
+        graph plus the largest subforward's ephemeral share). A call refused
+        with ``TrainerRankMemoryError`` is still reflected, with the binding
+        check that refused it.
         """
 
         if self._last_forward_telemetry_snapshot is None:
@@ -3128,16 +3267,33 @@ class TrainerRank:
             first = candidate(min_width)
             if not first.check.fits:
                 # The smallest wave cannot run unsplit: best effort is the
-                # bounded split ladder (which refuses honestly if exhausted).
+                # bounded split ladder. Each DP rank runs it on its own share,
+                # then all ranks agree on the outcome (one collective, always)
+                # so a refusal is raised everywhere or nowhere.
                 indices, local_inputs = local_slice(min_width)
-                split_plan, split_check = self._plan_admissible_forward(
+                refusal_prefix = (
+                    "smallest DP microbatch is predicted to exceed available memory"
+                )
+                found = self._find_admissible_forward(
                     list(_flatten(local_inputs)),
                     checkpoint=checkpoint,
-                    context="forward_micro_batches",
-                    refusal_prefix=(
-                        "smallest DP microbatch is predicted to exceed available memory"
-                    ),
+                    refusal_prefix=refusal_prefix,
                 )
+                agreed = self._all_ranks_true(not isinstance(found, _ForwardRefusal))
+                if isinstance(found, _ForwardRefusal):
+                    raise found.error("forward_micro_batches")
+                if not agreed:
+                    raise _memory_error(
+                        context="forward_micro_batches",
+                        message=(
+                            f"{refusal_prefix} on another DP rank, which was "
+                            "unable to find a feasible split for its share"
+                        ),
+                        packed_tokens=first.plan.packed_tokens,
+                        logical_tokens=first.plan.logical_tokens,
+                        check=first.check,
+                    )
+                split_plan, split_check = found
                 return _CandidateMicroBatch(
                     inputs=local_inputs,
                     indices=indices,
@@ -3441,11 +3597,14 @@ class TrainerRank:
         *,
         checkpoint: AdapterSelection = Unset,
         memory_minimal: bool = False,
+        ensure_slots: bool = True,
     ) -> _FlatForwardPlan:
         plans: list[_ForwardGroupPlan] = []
         output_bytes = self._estimate_group_request_output_bytes(requests)
         logical_tokens = sum(int(request.input_tokens.numel()) for request in requests)
-        groups = self._group_active_request_indices(requests, checkpoint=checkpoint)
+        groups = self._group_active_request_indices(
+            requests, checkpoint=checkpoint, ensure_slots=ensure_slots
+        )
         selected_max_depth = 0
         for (slot_ref, grad_enabled), group_indices in groups:
             items = tuple(
@@ -3622,33 +3781,34 @@ class TrainerRank:
                 if torch.cuda.is_available() and self.device.type == "cuda":
                     torch.cuda.synchronize(self.device)
         except torch.cuda.OutOfMemoryError as exc:
-            check = self._memory_check(plan)
-            self._raise_memory_error(
-                plan,
-                check,
+            raise _memory_error(
                 context=context,
                 message="CUDA OOM occurred despite the planner estimate",
+                packed_tokens=plan.packed_tokens,
+                logical_tokens=plan.logical_tokens,
+                check=self._memory_check(plan),
+            ) from exc
+        if baseline is not None:
+            self._update_peak_memory_profile(
+                plan, baseline, int(torch.cuda.memory_allocated(self.device))
             )
-            raise AssertionError("unreachable") from exc
-        retained_after = (
-            None if baseline is None else int(torch.cuda.memory_allocated(self.device))
-        )
-        self._update_peak_memory_profile(plan, baseline, retained_after=retained_after)
         return outputs, baseline
 
     def _update_peak_memory_profile(
         self,
         plan: _FlatForwardPlan,
         baseline: int | None,
-        *,
         retained_after: int | None = None,
     ) -> None:
         if baseline is None:
             return
         peak = int(torch.cuda.max_memory_allocated(self.device))
-        retained = None if retained_after is None else max(0, retained_after - baseline)
         self._update_memory_profile(
-            plan, max(0, peak - baseline), retained_bytes=retained
+            plan,
+            max(0, peak - baseline),
+            retained_bytes=(
+                None if retained_after is None else max(0, retained_after - baseline)
+            ),
         )
 
     @staticmethod
@@ -3988,30 +4148,6 @@ class TrainerRank:
         except (AssertionError, ImportError, RuntimeError, ValueError):
             return None
 
-    def _raise_memory_error(
-        self,
-        plan: _FlatForwardPlan,
-        check: _MemoryCheck,
-        *,
-        context: str,
-        message: str,
-    ) -> None:
-        suggestion = (
-            "Use smaller top-level items, reduce output requests, or call "
-            "dp_rank_forward with already-DP-local smaller inputs."
-        )
-        raise TrainerRankMemoryError(
-            f"{context}: {message}. "
-            f"packed_tokens={plan.packed_tokens} "
-            f"logical_tokens={plan.logical_tokens} "
-            f"predicted_peak_gb={check.estimated_required_bytes / 1024**3:.3f} "
-            f"usable_limit_gb={check.available_bytes / 1024**3:.3f}. "
-            f"{suggestion}",
-            predicted_peak_bytes=check.estimated_required_bytes,
-            usable_limit_bytes=check.available_bytes,
-            suggestion=suggestion,
-        )
-
     def _estimate_required_memory_bytes_from_values(
         self,
         *,
@@ -4096,36 +4232,23 @@ class TrainerRank:
         plan: _FlatForwardPlan,
         peak_delta_bytes: int,
         *,
-        retained_bytes: int | None = None,
+        retained_bytes: int | None,
     ) -> None:
         if plan.packed_tokens <= 0:
             return
         compute_delta = max(0, peak_delta_bytes - plan.output_bytes)
         bytes_per_token = compute_delta / max(1, plan.packed_tokens)
         previous = self._memory_profiles.get(plan.signature)
-        retained_fraction = 1.0 if previous is None else previous.retained_fraction
+        retained_fraction = None if previous is None else previous.retained_fraction
         if retained_bytes is not None:
-            estimate = max(
-                1,
-                self._estimate_required_memory_bytes_from_values(
-                    packed_tokens=plan.packed_tokens,
-                    output_bytes=plan.output_bytes,
-                    signature=plan.signature,
-                    logical_tokens=plan.logical_tokens,
-                ),
-            )
-            observed = min(1.0, retained_bytes / estimate)
-            # Max-merge (conservative) once observed; the first observation
-            # replaces the all-retained default.
+            observed = min(1.0, retained_bytes / max(1, peak_delta_bytes))
+            # Max-merge once observed. ``None`` (never observed) is distinct
+            # from an observed 1.0, so a later, lower observation cannot
+            # replace it.
             retained_fraction = (
                 observed
-                if previous is None
-                else max(
-                    observed,
-                    previous.retained_fraction
-                    if previous.retained_fraction < 1.0
-                    else observed,
-                )
+                if retained_fraction is None
+                else max(retained_fraction, observed)
             )
         self._memory_profiles[plan.signature] = _MemoryProfile(
             bytes_per_token=max(

@@ -153,40 +153,92 @@ a feasible split", never as a claim that none exists.
 Mechanism:
 - `dp_rank_forward` (and the minimum wave of `forward_micro_batches`) plans
   unsplit first (cost-optimal, then memory-minimal). If neither is admitted, a
-  bounded, deterministic ladder tries 2, 4, ... subforwards, partitioned along
-  the canonical prefix tree so shared-prefix siblings stay together, stopping
-  at the fewest subforwards that fit; one request per subforward is the last
-  rung.
-- Chunk pricing mirrors width probing (cheap no-sharing bound accepts, cheap
-  full-sharing bound rejects, planner pricing only in between). Chunks execute
-  larger-ephemeral-first (deterministic), and subforward `j` is admitted
-  against the retained memory of every earlier subforward plus its own
-  transient estimate; the backward upper bound (all retained graphs plus the
-  largest reusable workspace) must also fit. This is the research thread's
-  cumulative memory invariant: retained adds, ephemeral does not, backward
-  workspaces take a max.
+  bounded, deterministic ladder tries 2, 4, ... subforwards (at most one
+  request each), cutting the requests in prefix-local depth-first order into
+  token-balanced chunks — so most sharing stays inside one chunk, though a
+  cut can still divide a sibling subtree — and stops at the fewest
+  subforwards whose rung check passes.
+- Rung check. Every returned graph stays live, so subforward `j` needs its
+  own transient peak plus the memory retained by the subforwards before it.
+  Each of those sums is bounded by *all retained memory plus the largest
+  ephemeral share*, which therefore decides a rung by itself in any order
+  (this is the research thread's cumulative invariant: retained adds,
+  ephemeral does not). Chunks execute larger-ephemeral-first, which minimizes
+  the running forward peak. The same quantity is the headroom the caller's
+  backward can count on — every graph live plus one subforward's
+  forward-ephemeral memory free again. That is a *heuristic* for backward
+  workspace, not a bound: a backward may need more than its forward's
+  ephemeral memory (e.g. kernel autotune workspaces). The ballast arm of the
+  GPU gate measures it on a real cell instead of claiming it.
+- Cost. The cheap full-sharing lower bound (one O(tokens) CPU scan per chunk)
+  rejects a rung without planning anything; a surviving rung is priced
+  exactly with cost-optimal layouts and, failing that, memory-minimal ones
+  (whose packed tokens equal the lower bound). The planner therefore runs
+  for at most one rung — the one that executes — and the whole ladder is
+  O(tokens log n) cheap scans plus one exact pass.
 - Retained fraction (memory still allocated after a forward returns, as a
-  fraction of its estimate) is learned online per signature; the default
-  before any observation is 1.0 (everything retained), so a cold call that
-  cannot fit unsplit refuses until a profile exists.
+  fraction of that forward's observed peak — a physical ratio, so it needs no
+  trusted denominator; the first, cold call's static estimate is far below
+  the real peak) is learned online per signature: `None` until observed, then
+  max-merged (an observed 1.0 is distinct from "unobserved"). Admission
+  applies it to a subforward's estimated peak, which is at least the real
+  peak whenever the estimate is trusted.
+  It is trusted only within the profile's packed-token trust range and near
+  its observed logical/packed ratio, so a small profiled forward cannot
+  authorize a much larger split. Unobserved means 1.0 (everything retained),
+  so a cold call that cannot fit unsplit refuses until a profile exists.
+  Limitation: the observation is taken at forward return and says nothing
+  about backward; TrainerRank cannot see the caller's backward peak for
+  `dp_rank_forward` (the micro-batch path folds the post-yield peak into
+  `bytes_per_token`, not into the retained fraction).
+- Collectives. Ensuring checkpoint slots is a world collective; the ladder's
+  length depends on this rank's DP-local inputs, so slots are ensured exactly
+  once per call and all further planning skips the ensure. Memory checks
+  all-reduce only within the TP×CP group (identical inputs). In the
+  minimum-wave path every DP rank runs its own ladder and then all ranks
+  agree on the outcome with one collective, so a refusal is raised everywhere
+  or nowhere.
 - The complete ordered split is admitted before any model execution; there is
-  no retry after the first forward. A failure in a later subforward raises
-  `TrainerRankPartialExecutionError` (a `TrainerRankMemoryError`) so partial
-  execution is reported distinctly.
+  no retry after the first forward. Any execution-time memory failure of an
+  admitted split raises `TrainerRankPartialExecutionError` (a
+  `TrainerRankMemoryError`) naming how many subforwards completed, so it is
+  never mistaken for an up-front refusal. Each subforward's outputs carry
+  their own slot-graph sentinel, so slot load/step stays blocked until every
+  subforward's graph is released.
 - Splitting is disabled under expert parallelism in this release (HybridEP
   capacity must not be resized between subforwards while earlier graphs are
   live); the refusal says so.
-- Telemetry: `subforward_count` in `last_forward_telemetry()` and
-  `MicroBatchStats`. Test-only `ART_TRAINER_RANK_TEST_MEMORY_LIMIT_BYTES`
-  (gated by `ART_TRAINER_RANK_TEST_HOOKS`) caps usable memory so GPU gates
-  induce conversion/decline deterministically without ballast tensors.
+- Telemetry: `subforward_count`, `subforward_request_indices`,
+  `predicted_peak_bytes` and `usable_limit_bytes` in
+  `last_forward_telemetry()`; `subforward_count` in `MicroBatchStats`.
+  Test-only `ART_TRAINER_RANK_TEST_MEMORY_LIMIT_BYTES` (gated by
+  `ART_TRAINER_RANK_TEST_HOOKS`) caps usable memory so the deterministic GPU
+  arm can induce conversion/decline without ballast.
 
 GPU gate (`--phase split-conversion`), mirroring the sealed research cell
-(Qwen3.5-4B, 4 layers, CP1, 4 inputs): unlimited runs unsplit; a cap between
-the split and unsplit requirements converts (>= 2 subforwards) with outputs
-matching the unsplit reference, a single combined backward, and a
-reverse-order per-output backward all with every graph live; a cap below the
-smallest request refuses before any model execution.
+(Qwen3.5-4B, 4 layers, CP1, 4 inputs), in two arms. `--pressure cap`
+(deterministic control flow): unlimited runs unsplit; a cap between the split
+and unsplit requirements converts (>= 2 subforwards) with outputs matching the
+unsplit reference, a single combined backward and a reverse-order
+per-subforward backward with every graph live; a cap below the smallest
+request refuses before any model execution. `--pressure ballast` (physical
+memory safety, no test hooks): live ballast tensors bring the real usable
+budget under the unsplit requirement; the call converts with parity, the
+combined backward runs with the ballast still live, and the observed
+forward+backward peak must stay within both the budget the planner admitted
+against and its predicted peak; deeper ballast refuses before execution.
+
+What the ballast arm taught us: on this cell a training forward retains
+~99% of its peak for backward (layer activations plus the chunked head's
+saved logits), so a 2-way split lowers the requirement by only
+(1−f)·R/2 ≈ 0.5% — splitting cannot shrink retained activations, only the
+transient share. The arm therefore sizes its ballast from the measured
+fraction and reports the window width honestly. Splitting pays where little
+is retained: `no_grad` forwards (reference/old-policy logprobs; retained ≈
+outputs only) convert at a fraction of the unsplit requirement, which the arm
+also demonstrates under real pressure. Callers that could backward per
+subforward would gain similarly, but the public contract keeps every graph
+live, so that is not modeled.
 
 ## Explicitly out of scope (follow-ups)
 

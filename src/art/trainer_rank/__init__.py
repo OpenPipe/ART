@@ -47,6 +47,7 @@ for _public_type in (
     MicroBatchStats,
     TopK,
     TrainerRankMemoryError,
+    TrainerRankPartialExecutionError,
     TrainerRankRuntimeSupportError,
     TrainerRankSlotStateError,
     MaterializedCheckpoint,
