@@ -1020,8 +1020,14 @@ def _workload_fingerprint(requests: list[Any]) -> dict[str, object]:
 
 
 def _install_compile_watch() -> _ForwardCompileWatch:
-    logger = logging.getLogger("art.trainer_rank._telemetry")
-    logger.setLevel(logging.INFO)
+    # Take the logger object from the telemetry module itself: attaching by a
+    # guessed name silently observes nothing (the earlier TP2 gate's
+    # compile-free check was vacuous for exactly that reason).
+    from art.trainer_rank import _telemetry
+
+    logger = _telemetry.logger
+    if logger.level == logging.NOTSET or logger.level > logging.INFO:
+        logger.setLevel(logging.INFO)
     watch = _ForwardCompileWatch()
     logger.addHandler(watch)
     return watch
@@ -1885,6 +1891,346 @@ def phase_dp2_tp2_waves(evidence: str | None) -> None:
             dist.destroy_process_group()
 
 
+# --- Cost-model calibration harness ------------------------------------------
+#
+# ``--phase cost-calibrate`` times every mandatory candidate layout of one cell
+# through the public API (forward + backward through an active LoRA slot),
+# forcing each candidate with the test-only anchor hook, and records the
+# candidate's O(segments) layout features together with max-rank compile-free
+# timings. The fit (dev/trainer_rank_cost_fit.py) consumes the JSONL.
+
+CALIBRATION_SCHEMA = "art.dev.trainer_rank_cost_calibration.v1"
+CALIBRATION_MAX_WARMUPS = 8
+CALIBRATION_MIN_WARMUPS = 2
+
+
+def _gdn_layer_count(model: Any) -> int:
+    try:
+        from megatron.core.ssm.gated_delta_net import GatedDeltaNet
+    except ImportError:
+        return 0
+    return sum(isinstance(module, GatedDeltaNet) for module in model.modules())
+
+
+def _hetero_requests(seed: int) -> list[Any]:
+    """Heterogeneous control: three families with modest shared prefixes plus
+    singletons, so sharing is available but never dramatic."""
+
+    import torch
+
+    from art.trainer_rank import ForwardInput
+
+    def _tokens(token_seed: int, count: int) -> torch.Tensor:
+        generator = torch.Generator().manual_seed(token_seed)
+        return torch.randint(low=10, high=64_000, size=(count,), generator=generator)
+
+    requests: list[Any] = []
+    for family, (prefix_len, completions) in enumerate(
+        ((512, (256, 1_024, 640, 384)), (2_048, (128, 2_048, 512)), (4_096, (768, 256)))
+    ):
+        prefix = _tokens(seed * 7_001 + family * 101, prefix_len)
+        for branch, completion_len in enumerate(completions):
+            tokens = torch.cat(
+                (prefix, _tokens(seed * 9_001 + family * 211 + branch, completion_len))
+            )
+            labels = torch.roll(tokens, shifts=-1).clone()
+            labels[-1] = -100
+            labels[: max(prefix_len - 1, 0)] = -100
+            requests.append(ForwardInput(input_tokens=tokens, target_tokens=labels))
+    for single in range(3):
+        tokens = _tokens(seed * 11_003 + single, 1_536 + 700 * single)
+        labels = torch.roll(tokens, shifts=-1).clone()
+        labels[-1] = -100
+        requests.append(ForwardInput(input_tokens=tokens, target_tokens=labels))
+    return requests
+
+
+def _calibration_requests(
+    cell: str, *, group: int
+) -> tuple[list[Any], dict[str, object]]:
+    """Requests for one calibration cell and a JSON-safe description."""
+
+    if cell == "cal-grpo-g8-long":
+        shape = GRPO_PRIMARY_LONG_G8
+        requests = [r for g in _grpo_groups(6_001, shape) for r in g]
+        return requests, {"kind": "grpo", "shape": list(shape), "seed": 6_001}
+    if cell == "cal-grpo-g8":
+        shape = GRPO_TP2
+        requests = [r for g in _grpo_groups(6_301, shape) for r in g]
+        return requests, {"kind": "grpo", "shape": list(shape), "seed": 6_301}
+    if cell == "cal-grpo-g16":
+        shape = (2, 16, 1_023, 2_048, 255)
+        requests = [r for g in _grpo_groups(6_401, shape) for r in g]
+        return requests, {"kind": "grpo", "shape": list(shape), "seed": 6_401}
+    if cell == "cal-grpo-g4x4":
+        shape = (4, 4, 1_023, 3_072, 511)
+        requests = [r for g in _grpo_groups(6_501, shape) for r in g]
+        return requests, {"kind": "grpo", "shape": list(shape), "seed": 6_501}
+    if cell == "cal-hetero":
+        return _hetero_requests(7_777), {"kind": "hetero", "seed": 7_777}
+    if cell == "cal-ellavox":
+        return _ellavox_requests(group), {"kind": "ellavox", "group": group}
+    raise ValueError(f"unknown calibration cell {cell!r}")
+
+
+def phase_cost_calibrate(
+    *,
+    cell: str,
+    model: str,
+    layers: int,
+    group: int,
+    repeat: int,
+    evidence: str,
+) -> None:
+    """Time every mandatory candidate layout of one cell (GPU).
+
+    Per candidate: warm up until a forward is compile-free (bounded), then
+    ``repeat`` measured rounds in a rotating candidate order so drift is
+    balanced across candidates. Each measured row records max-rank forward +
+    backward wall time, compile status, plan-cache planning time, peak memory,
+    subforward count (split rows are excluded from fitting), the candidate's
+    layout features and labels, and the topology and model facts.
+    """
+
+    phase_contract()
+    _init_gpu_phase("cost-calibrate")
+    from megatron.core import parallel_state as ps
+    import torch
+    import torch.distributed as dist
+
+    from art.megatron import train as megatron_train
+    from art.trainer_rank import TrainerRank, TrainerRankMemoryError
+    from art.trainer_rank._planner_cost import (
+        COEFFICIENT_VERSION,
+        layout_features,
+        prefix_tree_layout_score,
+    )
+    from art.trainer_rank._prefix_tree_planner import (
+        build_canonical_prefix_tree,
+        prefix_tree_layout_candidates,
+    )
+
+    sys.path.insert(0, str(REPO_ROOT / "dev"))
+    from trainer_rank_support import load_random_checkpoints
+
+    rows: list[dict[str, object]] = []
+    world_rank = dist.get_rank()
+
+    def emit(row: dict[str, object]) -> None:
+        rows.append(row)
+        if world_rank == 0:
+            with open(evidence, "a", encoding="utf-8") as handle:
+                handle.write(json.dumps(row, sort_keys=True, default=str) + "\n")
+
+    try:
+        torch.manual_seed(1234)
+        runtime = megatron_train.build_training_runtime(
+            model_identifier=model,
+            provider_configure=(
+                (lambda provider: setattr(provider, "num_layers", layers))
+                if layers > 0
+                else None
+            ),
+            print_env=world_rank == 0,
+        )
+        for chunk in runtime.model:
+            chunk.train()
+        rank = TrainerRank(runtime)
+        [slot] = load_random_checkpoints(runtime, rank, 1, base_model=model)
+        watch = _install_compile_watch()
+        requests, workload = _calibration_requests(cell, group=group)
+        topology = {
+            "tp": int(ps.get_tensor_model_parallel_world_size()),
+            "cp": int(ps.get_context_parallel_world_size()),
+            "dp": int(ps.get_data_parallel_world_size()),
+            "world_size": dist.get_world_size(),
+        }
+        model_facts = {
+            "model": model,
+            "layers": int(rank._num_layers),
+            "gdn_layers": _gdn_layer_count(runtime.model[0]),
+            "uses_gdn": bool(
+                getattr(
+                    runtime.model_support_handler, "build_gdn_execution_spec", False
+                )
+            ),
+            "hidden_size": int(rank._hidden_size),
+            "param_dtype": str(next(runtime.model[0].parameters()).dtype),
+            "device": torch.cuda.get_device_name(),
+        }
+        tree = build_canonical_prefix_tree(
+            tuple(r.input_tokens.reshape(-1).to(torch.long) for r in requests)
+        )
+        candidates = prefix_tree_layout_candidates(tree)
+        cp_size, planner_layers, uses_gdn = rank._planner_topology_facts()
+        candidate_rows = []
+        for candidate in candidates:
+            features = layout_features(candidate.layout)
+            score = prefix_tree_layout_score(
+                candidate.layout,
+                cp_size=cp_size,
+                layers=planner_layers,
+                uses_gdn=uses_gdn,
+            )
+            candidate_rows.append(
+                {
+                    "label": candidate.labels[0],
+                    "labels": list(candidate.labels),
+                    "features": features.as_dict(),
+                    "current_score_us": score[0] / 1_024,
+                }
+            )
+        logical_tokens = sum(int(r.input_tokens.numel()) for r in requests)
+        base = {
+            "schema": CALIBRATION_SCHEMA,
+            "cell": cell,
+            "workload": workload,
+            "logical_tokens": logical_tokens,
+            "request_count": len(requests),
+            "requests_sha256": _workload_fingerprint(requests)["requests_sha256"],
+            **topology,
+            **model_facts,
+            "coefficient_version": COEFFICIENT_VERSION,
+            "source": _source_fingerprint(),
+            "driver": _driver_fingerprint(),
+        }
+        emit(
+            {
+                **base,
+                "record_type": "calibration_cell",
+                "candidates": candidate_rows,
+                "tree_decisions": len(tree.decision_indices),
+                "tree_segments": len(tree.segments),
+            }
+        )
+
+        def run(label: str) -> dict[str, object]:
+            _anchor_env(label)
+            watch.take()
+            rank.zero_grad()
+            torch.cuda.synchronize()
+            torch.cuda.reset_peak_memory_stats()
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            start.record()
+            failed = 0
+            try:
+                outputs = rank.dp_rank_forward(requests, checkpoint=slot)
+                loss = _output_loss(outputs)
+                loss.backward()
+            except TrainerRankMemoryError as error:
+                failed = 1
+                message = str(error)
+            end.record()
+            torch.cuda.synchronize()
+            flags = torch.tensor([float(failed)], device="cuda")
+            dist.all_reduce(flags, op=dist.ReduceOp.MAX)
+            if flags.item() > 0:
+                _anchor_env("automatic")
+                rank.zero_grad()
+                return {"admission_failed": True, "message": message if failed else ""}
+            local_ms = float(start.elapsed_time(end))
+            ms = torch.tensor([local_ms], device="cuda")
+            dist.all_reduce(ms, op=dist.ReduceOp.MAX)
+            telemetry = rank.last_forward_telemetry()
+            result = {
+                "admission_failed": False,
+                "ms_max_rank": float(ms.item()),
+                "ms_local": local_ms,
+                "compile_statuses": watch.take(),
+                "planning_ms": float(telemetry["planning_ms"]),
+                "selected_max_depth": int(telemetry["selected_max_depth"]),
+                "subforward_count": int(telemetry["subforward_count"]),
+                "peak_allocated_bytes": int(torch.cuda.max_memory_allocated()),
+                "loss": float(loss.detach().float().item()),
+            }
+            del outputs, loss
+            rank.zero_grad()
+            _anchor_env("automatic")
+            return result
+
+        # Warm-ups per candidate until compile-free (bounded).
+        live: list[str] = []
+        for candidate in candidate_rows:
+            label = str(candidate["label"])
+            for attempt in range(CALIBRATION_MAX_WARMUPS):
+                result = run(label)
+                emit(
+                    {
+                        **base,
+                        "record_type": "calibration_sample",
+                        "role": "warmup",
+                        "candidate_label": label,
+                        "attempt": attempt,
+                        **result,
+                    }
+                )
+                if result.get("admission_failed"):
+                    break
+                statuses = cast(list, result["compile_statuses"])
+                if (
+                    attempt + 1 >= CALIBRATION_MIN_WARMUPS
+                    and statuses
+                    and all(status == "none" for status in statuses)
+                ):
+                    live.append(label)
+                    break
+            else:
+                emit(
+                    {
+                        **base,
+                        "record_type": "calibration_note",
+                        "candidate_label": label,
+                        "note": "never compile-free within warm-up budget; excluded",
+                    }
+                )
+        # Measured rounds in rotating order.
+        for round_index in range(repeat):
+            order = (
+                live[round_index % max(1, len(live)) :]
+                + live[: round_index % max(1, len(live))]
+            )
+            for label in order:
+                result = run(label)
+                emit(
+                    {
+                        **base,
+                        "record_type": "calibration_sample",
+                        "role": "measured",
+                        "candidate_label": label,
+                        "round": round_index,
+                        **result,
+                    }
+                )
+        if world_rank == 0:
+            measured = [
+                r
+                for r in rows
+                if r.get("record_type") == "calibration_sample"
+                and r.get("role") == "measured"
+            ]
+            summary: dict[str, list[float]] = {}
+            for r in measured:
+                if not r.get("admission_failed") and all(
+                    s == "none" for s in cast(list, r["compile_statuses"])
+                ):
+                    summary.setdefault(str(r["candidate_label"]), []).append(
+                        float(cast(float, r["ms_max_rank"]))
+                    )
+            import statistics
+
+            print(
+                f"cost-calibrate {cell} tp{topology['tp']} cp{topology['cp']} layers={model_facts['layers']}: "
+                + ", ".join(
+                    f"{label}={statistics.median(values):.1f}ms(n={len(values)})"
+                    for label, values in summary.items()
+                )
+            )
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -1899,6 +2245,7 @@ def main() -> None:
             "tp2-public",
             "dp2-tp2-waves",
             "tp-compare",
+            "cost-calibrate",
         ),
     )
     parser.add_argument("--cell", default="grpo-gdn-cp4")
@@ -1924,6 +2271,21 @@ def main() -> None:
     )
     parser.add_argument(
         "--dump-dir", default="", help="tp2-public only: save per-arm outputs here"
+    )
+    parser.add_argument(
+        "--model", default="Qwen/Qwen3.5-4B", help="cost-calibrate: model id"
+    )
+    parser.add_argument(
+        "--layers",
+        type=int,
+        default=0,
+        help="cost-calibrate: transformer layers (0 = full model)",
+    )
+    parser.add_argument(
+        "--group",
+        type=int,
+        default=0,
+        help="cost-calibrate cal-ellavox: corpus group index",
     )
     parser.add_argument(
         "--control-dump", default="", help="tp-compare: TP1 control dump (.pt)"
@@ -1960,6 +2322,17 @@ def main() -> None:
         )
     elif arguments.phase == "dp2-tp2-waves":
         phase_dp2_tp2_waves(arguments.evidence or None)
+    elif arguments.phase == "cost-calibrate":
+        if not arguments.evidence:
+            _fail("--evidence output path is required for cost-calibrate")
+        phase_cost_calibrate(
+            cell=arguments.cell,
+            model=arguments.model,
+            layers=arguments.layers,
+            group=arguments.group,
+            repeat=arguments.repeat,
+            evidence=arguments.evidence,
+        )
     else:
         if not arguments.evidence:
             _fail("--evidence input path is required for validate")

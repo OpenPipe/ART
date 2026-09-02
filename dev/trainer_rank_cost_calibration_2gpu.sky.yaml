@@ -1,0 +1,77 @@
+# Cost-model calibration: 2-GPU cells (2x H200, Kubernetes).
+#
+# TP2 x CP1 GRPO/heterogeneous cells (the first TP calibration evidence) and
+# TP1 x CP2 Ellavox groups (real data; the corpus is git-ignored and mounted).
+# Even Ellavox groups are calibration rows, odd groups are held out for
+# validation by the fit (see dev/trainer_rank_cost_fit.py).
+#
+# Usage:
+#   sky launch -c tr-cost-2gpu dev/trainer_rank_cost_calibration_2gpu.sky.yaml --env RUN_ID=<id>
+
+name: trainer-rank-cost-calibration-2gpu
+
+workdir: .
+
+file_mounts:
+  /tmp/trainer_rank_ellavox_corpus.json: dev/_trainer_rank_ellavox_qwen35_4b_tokens.json
+
+envs:
+  RUN_ID: unset
+  REPEAT: "8"
+  ELLAVOX_GROUPS: "0 1 2 3 4 5 6 7"
+
+resources:
+  cloud: kubernetes
+  accelerators: H200:2
+  cpus: 24+
+  memory: 192+
+  image_id: docker:docker.io/bradhiltonnw/art-gpu@sha256:f93fda4032bf37f16d9c639c51daf73e1a884df97d14baabf349868831321bdc
+
+setup: |
+  set -euo pipefail
+  export CC=gcc CXX=g++
+  uv sync --frozen --extra megatron --group dev
+  uv sync --project megatron_runtime --extra cuda12 --group test --frozen
+  uv pip install --python megatron_runtime/.venv/bin/python --no-deps --editable .
+
+run: |
+  set -euo pipefail
+  : "${RUN_ID:?RUN_ID is required}"
+  root="scratch/trainer_rank_cost_calibration/${RUN_ID}"
+  mkdir -p "${root}"
+  cp /tmp/trainer_rank_ellavox_corpus.json dev/_trainer_rank_ellavox_qwen35_4b_tokens.json
+  export ART_MEGATRON_DATA_PARALLEL_SIZE=1
+  export ART_MEGATRON_PIPELINE_MODEL_PARALLEL_SIZE=1
+  export TOKENIZERS_PARALLELISM=false
+  export PYTHONUNBUFFERED=1
+  uv run --no-sync python dev/trainer_rank_landing_acceptance.py --phase contract
+
+  cell() {  # tp cp cell model layers [group]
+    ART_MEGATRON_TENSOR_MODEL_PARALLEL_SIZE="$1" ART_MEGATRON_CONTEXT_PARALLEL_SIZE="$2" \
+    timeout 7200s megatron_runtime/.venv/bin/python -m torch.distributed.run --standalone --nproc-per-node=2 \
+      dev/trainer_rank_landing_acceptance.py --phase cost-calibrate \
+      --cell "$3" --model "$4" --layers "$5" --group "${6:-0}" --repeat "${REPEAT}" \
+      --evidence "${root}/evidence.jsonl" 2>&1 | tee "${root}/tp$1-cp$2-$3-$5-g${6:-0}.log" | grep -E "cost-calibrate|LANDING|Traceback" || true
+  }
+  cell 2 1 cal-grpo-g8   Qwen/Qwen3.5-4B 0
+  cell 2 1 cal-grpo-g16  Qwen/Qwen3.5-4B 0
+  cell 2 1 cal-grpo-g4x4 Qwen/Qwen3.5-4B 0
+  cell 2 1 cal-hetero    Qwen/Qwen3.5-4B 0
+  cell 2 1 cal-grpo-g8   Qwen/Qwen3-4B   0
+  for g in ${ELLAVOX_GROUPS}; do
+    cell 1 2 cal-ellavox Qwen/Qwen3.5-4B 0 "$g"
+  done
+  echo "cost-calibration 2gpu: done"
+
+config:
+  kubernetes:
+    pod_config:
+      spec:
+        schedulerName: binpack-scheduler
+        activeDeadlineSeconds: 42000
+        containers:
+          - name: ray-node
+            imagePullPolicy: Always
+            env:
+              - name: UV_LINK_MODE
+                value: copy

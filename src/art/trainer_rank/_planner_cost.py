@@ -21,12 +21,83 @@ recalibration invalidates cached recipes.
 
 from __future__ import annotations
 
+from dataclasses import asdict, dataclass
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from ._prefix_tree_planner import PrefixTreeLayout
 
 COEFFICIENT_VERSION = 1
+
+# Segment-length buckets for kernel-utilization effects: a segment shorter than
+# these runs small-M kernels on every rank it is sharded over.
+SMALL_SEGMENT_TOKENS = 512
+TINY_SEGMENT_TOKENS = 128
+
+
+@dataclass(frozen=True, slots=True)
+class LayoutFeatures:
+    """Integer, O(segments) features of one layout that differ between layouts.
+
+    Everything a call shares across its candidate layouts (logical tokens, the
+    output head, model size) cancels in ranking, so only layout-dependent
+    quantities are here. Each is derivable from the planned segments alone, so
+    the calibration harness logs exactly what a scorer can price.
+    """
+
+    packed_tokens: int
+    segment_count: int
+    # Shared (fan-out > 1) segments; equals the number of selected decisions.
+    shared_segments: int
+    # Dependency levels including the root and tail levels: no sharing = 1.
+    max_depth: int
+    # Tokens held in shared segments: the physical rows whose state/KV is
+    # handed on to more than one continuation.
+    shared_tokens: int
+    # Sum of fan-out over shared segments: state hand-offs per layer.
+    fanout_sum: int
+    small_segments: int
+    tiny_segments: int
+    # Causal attention pairs over physical rows: sum of len * (start + len/2).
+    attention_area: int
+
+    def as_dict(self) -> dict[str, int]:
+        return asdict(self)
+
+
+def layout_features(layout: PrefixTreeLayout) -> LayoutFeatures:
+    segment_count = 0
+    shared_segments = 0
+    shared_tokens = 0
+    fanout_sum = 0
+    small = 0
+    tiny = 0
+    area = 0
+    for segment in layout.segments:
+        length = segment.end - segment.start
+        fanout = len(segment.sequence_indices)
+        segment_count += 1
+        if fanout > 1:
+            shared_segments += 1
+            shared_tokens += length
+            fanout_sum += fanout
+        if length < SMALL_SEGMENT_TOKENS:
+            small += 1
+        if length < TINY_SEGMENT_TOKENS:
+            tiny += 1
+        area += length * segment.start + (length * length) // 2
+    return LayoutFeatures(
+        packed_tokens=layout.packed_tokens,
+        segment_count=segment_count,
+        shared_segments=shared_segments,
+        max_depth=layout.maximum_depth,
+        shared_tokens=shared_tokens,
+        fanout_sum=fanout_sum,
+        small_segments=small,
+        tiny_segments=tiny,
+        attention_area=area,
+    )
+
 
 # One integer work unit represents 1/1024 microsecond of predicted wall time.
 WORK_PER_US = 1_024
@@ -77,6 +148,10 @@ __all__ = [
     "COEFFICIENT_VERSION",
     "GDN_EXCESS_DEPTH_PIPELINE_US_PER_LAYER",
     "GDN_FIRST_SHARED_PIPELINE_US_PER_LAYER",
+    "LayoutFeatures",
+    "SMALL_SEGMENT_TOKENS",
+    "TINY_SEGMENT_TOKENS",
     "WORK_PER_US",
+    "layout_features",
     "prefix_tree_layout_score",
 ]
