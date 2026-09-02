@@ -12,6 +12,8 @@ from art.distributed.adapter_transport import (
     AdapterSnapshotSender,
     AdapterTransferTarget,
     ExternalAdapterObjectSource,
+    ExternalAdapterShard,
+    ExternalAdapterShardedSource,
     NixlAdapterSender,
 )
 
@@ -171,6 +173,60 @@ def test_external_object_digest_failure_leaves_no_materialized_state(
     assert receiver.state().pending_object_receives == 0
     assert receiver.state().materialized_generations == 0
     assert tuple((tmp_path / "adapter_transfers").iterdir()) == ()
+
+
+def test_committed_external_shards_reconstruct_standard_adapter(
+    tmp_path, monkeypatch
+) -> None:
+    model = _safetensors_payload()
+    config = json.dumps(
+        {
+            "art_lora_format": "vllm",
+            "r": 1,
+            "target_modules": ["q_proj"],
+        },
+        separators=(",", ":"),
+    ).encode()
+    payloads = (config, model[:17], model[17:])
+    paths = ("adapter_config.json",) + ("adapter_model.safetensors",) * 2
+    offsets = (0, 0, 17)
+    source = ExternalAdapterShardedSource(
+        generation_id="generation-sharded",
+        source_identity="manifest:" + hashlib.sha256(b"commit").hexdigest(),
+        model_bytes=len(model),
+        config_bytes=len(config),
+        shards=tuple(
+            ExternalAdapterShard(
+                index=index,
+                relative_path=paths[index],
+                file_offset=offsets[index],
+                object_url=f"https://objects.example/shard-{index}?signature=secret",
+                object_bytes=len(payload),
+                object_sha256=hashlib.sha256(payload).hexdigest(),
+            )
+            for index, payload in enumerate(payloads)
+        ),
+    )
+    real_client = httpx.Client
+
+    def client(**kwargs):
+        def response(request):
+            index = int(request.url.path.rsplit("-", 1)[1])
+            return httpx.Response(200, content=payloads[index], request=request)
+
+        return real_client(transport=httpx.MockTransport(response), **kwargs)
+
+    monkeypatch.setattr(adapter_transport.httpx, "Client", client)
+    receiver = AdapterSnapshotReceiver("inference-0", str(tmp_path), pool_capacity=2)
+
+    result = receiver.materialize_object(source)
+    root = tmp_path / "adapter_transfers" / source.generation_id
+
+    assert result.source_identity == source.source_identity
+    assert result.tensor_bytes == len(model)
+    assert result.config_bytes == len(config)
+    assert (root / "adapter_config.json").read_bytes() == config
+    assert (root / "adapter_model.safetensors").read_bytes() == model
 
 
 class _Handle:

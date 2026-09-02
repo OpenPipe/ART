@@ -21,7 +21,7 @@ from art.adapter_leases import in_flight_lora_name
 from art.distributed.adapter_transport import (
     AdapterReceiveResult,
     AdapterTransferTarget,
-    ExternalAdapterObjectSource,
+    ExternalAdapterSource,
 )
 from art.distributed.art_runtime import ArtRuntime
 from art.distributed.specs import ModelServiceSpec
@@ -481,7 +481,7 @@ class MegatronPairedInferencePublisher:
         generation_id: str,
         expected_generation_id: str | None,
         policy_version: int,
-        source: ExternalAdapterObjectSource,
+        source: ExternalAdapterSource,
         timeout_s: float = 300.0,
     ) -> MegatronExternalLoraApplyResult:
         """Materialize one exact object and apply it through the normal holder."""
@@ -505,7 +505,7 @@ class MegatronPairedInferencePublisher:
         generation_id: str,
         expected_generation_id: str | None,
         policy_version: int,
-        source: ExternalAdapterObjectSource,
+        source: ExternalAdapterSource,
         timeout_s: float,
     ) -> MegatronExternalLoraApplyResult:
 
@@ -989,7 +989,7 @@ def _validate_received(
 
 def _validate_external_received(
     received: tuple[AdapterReceiveResult, ...],
-    source: ExternalAdapterObjectSource,
+    source: ExternalAdapterSource,
     service: ModelServiceSpec,
 ) -> tuple[str, int, int]:
     expected_hosts = len({member.host_id for member in service.members})

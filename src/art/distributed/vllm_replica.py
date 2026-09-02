@@ -18,7 +18,7 @@ from .adapter_transport import (
     AdapterReceivePoolState,
     AdapterReceiveResult,
     AdapterTransferTarget,
-    ExternalAdapterObjectSource,
+    ExternalAdapterSource,
 )
 from .specs import ModelServiceMemberSpec, ModelServiceSpec
 
@@ -127,7 +127,7 @@ class ReplicaHostLauncher(Protocol):
     ) -> AdapterReceiveResult: ...
 
     async def materialize_adapter_object(
-        self, source: ExternalAdapterObjectSource, timeout_s: float
+        self, source: ExternalAdapterSource, timeout_s: float
     ) -> AdapterReceiveResult: ...
 
     async def release_adapter_receive(self, generation_id: str) -> None: ...
@@ -456,7 +456,7 @@ class ReplicaManager:
 
     async def materialize_external_adapter(
         self,
-        source: ExternalAdapterObjectSource,
+        source: ExternalAdapterSource,
         *,
         timeout_s: float = 300.0,
     ) -> tuple[AdapterReceiveResult, ...]:

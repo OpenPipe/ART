@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import importlib
 import json
@@ -9,7 +10,7 @@ from pathlib import Path
 import socket
 from threading import Condition, Lock
 import time
-from typing import Any, Literal
+from typing import Any, Literal, TypeAlias
 from urllib.parse import urlsplit
 
 import httpx
@@ -77,15 +78,7 @@ class ExternalAdapterObjectSource(_TransportRecord):
 
     @model_validator(mode="after")
     def _validate_source(self) -> "ExternalAdapterObjectSource":
-        parsed = urlsplit(self.object_url)
-        if (
-            parsed.scheme != "https"
-            or not parsed.hostname
-            or parsed.username is not None
-            or parsed.password is not None
-            or parsed.fragment
-        ):
-            raise ValueError("external adapter object requires an exact HTTPS URL")
+        _validate_exact_object_url(self.object_url)
         config_bytes = self.adapter_config_json.encode()
         if hashlib.sha256(config_bytes).hexdigest() != self.adapter_config_sha256:
             raise ValueError("external adapter config digest changed")
@@ -99,6 +92,76 @@ class ExternalAdapterObjectSource(_TransportRecord):
         ):
             raise ValueError("external adapter target modules are invalid")
         return self
+
+
+class ExternalAdapterShard(_TransportRecord):
+    index: int = Field(ge=0)
+    relative_path: Literal["adapter_config.json", "adapter_model.safetensors"]
+    file_offset: int = Field(ge=0)
+    object_url: str = Field(min_length=1, max_length=8192, repr=False)
+    object_bytes: int = Field(gt=0, le=5 << 30)
+    object_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+    @model_validator(mode="after")
+    def _validate_url(self) -> "ExternalAdapterShard":
+        _validate_exact_object_url(self.object_url)
+        return self
+
+
+class ExternalAdapterShardedSource(_TransportRecord):
+    """Committed immutable shards covering one standard PEFT adapter."""
+
+    generation_id: str = Field(
+        min_length=1,
+        max_length=255,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]*$",
+    )
+    source_identity: str = Field(min_length=1, max_length=512)
+    model_bytes: int = Field(gt=8, le=8 << 30)
+    config_bytes: int = Field(gt=1, le=64 << 10)
+    shards: tuple[ExternalAdapterShard, ...] = Field(min_length=2, max_length=1024)
+    max_parallel_downloads: int = Field(default=16, ge=1, le=32)
+
+    @model_validator(mode="after")
+    def _validate_coverage(self) -> "ExternalAdapterShardedSource":
+        if tuple(shard.index for shard in self.shards) != tuple(
+            range(len(self.shards))
+        ):
+            raise ValueError("external adapter shard indexes must be contiguous")
+        if len({shard.object_url for shard in self.shards}) != len(self.shards):
+            raise ValueError("external adapter shard URLs must be unique")
+        expected = {
+            "adapter_config.json": self.config_bytes,
+            "adapter_model.safetensors": self.model_bytes,
+        }
+        for relative_path, size_bytes in expected.items():
+            cursor = 0
+            for shard in (
+                item for item in self.shards if item.relative_path == relative_path
+            ):
+                if shard.file_offset != cursor:
+                    raise ValueError("external adapter shards leave a file gap")
+                cursor += shard.object_bytes
+            if cursor != size_bytes:
+                raise ValueError("external adapter shards do not cover their file")
+        return self
+
+
+ExternalAdapterSource: TypeAlias = (
+    ExternalAdapterObjectSource | ExternalAdapterShardedSource
+)
+
+
+def _validate_exact_object_url(value: str) -> None:
+    parsed = urlsplit(value)
+    if (
+        parsed.scheme != "https"
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.fragment
+    ):
+        raise ValueError("external adapter object requires an exact HTTPS URL")
 
 
 class AdapterReceivePoolState(_TransportRecord):
@@ -345,54 +408,130 @@ def _download_exact_object(
     *,
     timeout_s: float,
 ) -> None:
-    started = time.monotonic()
-    digest = hashlib.sha256()
-    received = 0
     with path.open("xb") as output:
         if hasattr(os, "posix_fallocate"):
             os.posix_fallocate(output.fileno(), 0, source.object_bytes)
-        with httpx.Client(
-            follow_redirects=False,
-            timeout=httpx.Timeout(timeout_s, connect=min(30.0, timeout_s)),
-        ) as client:
-            with client.stream(
-                "GET",
-                source.object_url,
-                headers={"Accept-Encoding": "identity"},
-            ) as response:
-                if response.status_code != 200:
-                    raise RuntimeError(
-                        f"external adapter object returned HTTP {response.status_code}"
-                    )
-                if response.headers.get("content-encoding", "identity") != "identity":
-                    raise RuntimeError("external adapter object used content encoding")
-                length = response.headers.get("content-length")
-                if length is not None:
-                    try:
-                        declared = int(length)
-                    except ValueError as error:
-                        raise RuntimeError(
-                            "external adapter object has invalid content length"
-                        ) from error
-                    if declared != source.object_bytes:
-                        raise RuntimeError("external adapter object size changed")
-                for chunk in response.iter_bytes(1 << 20):
-                    if time.monotonic() - started > timeout_s:
-                        raise TimeoutError("external adapter object download timed out")
-                    received += len(chunk)
-                    if received > source.object_bytes:
-                        raise RuntimeError(
-                            "external adapter object exceeded its byte bound"
-                        )
-                    output.write(chunk)
-                    digest.update(chunk)
+        received = _stream_exact_object(
+            source.object_url,
+            size_bytes=source.object_bytes,
+            sha256=source.object_sha256,
+            timeout_s=timeout_s,
+            write=output.write,
+        )
         output.truncate(received)
         output.flush()
         os.fsync(output.fileno())
-    if received != source.object_bytes:
+
+
+def _stream_exact_object(
+    url: str,
+    *,
+    size_bytes: int,
+    sha256: str,
+    timeout_s: float,
+    write: Any,
+) -> int:
+    started = time.monotonic()
+    digest = hashlib.sha256()
+    received = 0
+    with httpx.Client(
+        follow_redirects=False,
+        timeout=httpx.Timeout(timeout_s, connect=min(30.0, timeout_s)),
+    ) as client:
+        with client.stream(
+            "GET", url, headers={"Accept-Encoding": "identity"}
+        ) as response:
+            if response.status_code != 200:
+                raise RuntimeError(
+                    f"external adapter object returned HTTP {response.status_code}"
+                )
+            if response.headers.get("content-encoding", "identity") != "identity":
+                raise RuntimeError("external adapter object used content encoding")
+            length = response.headers.get("content-length")
+            if length is not None:
+                try:
+                    declared = int(length)
+                except ValueError as error:
+                    raise RuntimeError(
+                        "external adapter object has invalid content length"
+                    ) from error
+                if declared != size_bytes:
+                    raise RuntimeError("external adapter object size changed")
+            for chunk in response.iter_bytes(1 << 20):
+                if time.monotonic() - started > timeout_s:
+                    raise TimeoutError("external adapter object download timed out")
+                received += len(chunk)
+                if received > size_bytes:
+                    raise RuntimeError(
+                        "external adapter object exceeded its byte bound"
+                    )
+                write(chunk)
+                digest.update(chunk)
+    if received != size_bytes:
         raise RuntimeError("external adapter object was incomplete")
-    if digest.hexdigest() != source.object_sha256:
+    if digest.hexdigest() != sha256:
         raise RuntimeError("external adapter object digest changed")
+    return received
+
+
+def _pwrite_all(fd: int, value: bytes, offset: int) -> int:
+    written = 0
+    while written < len(value):
+        count = os.pwrite(fd, value[written:], offset + written)
+        if count <= 0:
+            raise RuntimeError("external adapter shard write made no progress")
+        written += count
+    return written
+
+
+def _materialize_external_shards(
+    source: ExternalAdapterShardedSource,
+    root: Path,
+    *,
+    timeout_s: float,
+) -> None:
+    files = {
+        "adapter_config.json": source.config_bytes,
+        "adapter_model.safetensors": source.model_bytes,
+    }
+    descriptors: dict[str, int] = {}
+    try:
+        for relative_path, size_bytes in files.items():
+            fd = os.open(
+                root / relative_path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600
+            )
+            descriptors[relative_path] = fd
+            if hasattr(os, "posix_fallocate"):
+                os.posix_fallocate(fd, 0, size_bytes)
+            else:
+                os.ftruncate(fd, size_bytes)
+
+        def receive(shard: ExternalAdapterShard) -> None:
+            cursor = shard.file_offset
+
+            def write(chunk: bytes) -> int:
+                nonlocal cursor
+                count = _pwrite_all(descriptors[shard.relative_path], chunk, cursor)
+                cursor += count
+                return count
+
+            _stream_exact_object(
+                shard.object_url,
+                size_bytes=shard.object_bytes,
+                sha256=shard.object_sha256,
+                timeout_s=timeout_s,
+                write=write,
+            )
+
+        with ThreadPoolExecutor(
+            max_workers=min(source.max_parallel_downloads, len(source.shards))
+        ) as pool:
+            tuple(pool.map(receive, source.shards))
+        for fd in descriptors.values():
+            os.fsync(fd)
+    finally:
+        for fd in descriptors.values():
+            os.close(fd)
 
 
 class AdapterSnapshotReceiver:
@@ -419,10 +558,10 @@ class AdapterSnapshotReceiver:
 
     def materialize_object(
         self,
-        source: ExternalAdapterObjectSource,
+        source: ExternalAdapterSource,
         timeout_s: float = 300.0,
     ) -> AdapterReceiveResult:
-        """Download and validate a completed object into immutable local staging."""
+        """Download and validate committed object bytes into immutable staging."""
 
         started = time.monotonic()
         with self._condition:
@@ -454,10 +593,18 @@ class AdapterSnapshotReceiver:
                 raise RuntimeError("external adapter staging path already exists")
             temporary.mkdir(parents=True)
             model_path = temporary / "adapter_model.safetensors"
-            _download_exact_object(source, model_path, timeout_s=timeout_s)
             config_path = temporary / "adapter_config.json"
-            config_path.write_text(source.adapter_config_json, encoding="utf-8")
-            _validate_safetensors_file(model_path, source.object_bytes)
+            if isinstance(source, ExternalAdapterObjectSource):
+                _download_exact_object(source, model_path, timeout_s=timeout_s)
+                config_path.write_text(source.adapter_config_json, encoding="utf-8")
+                tensor_bytes = source.object_bytes
+                config_bytes = len(source.adapter_config_json.encode())
+            else:
+                _materialize_external_shards(source, temporary, timeout_s=timeout_s)
+                tensor_bytes = source.model_bytes
+                config_bytes = source.config_bytes
+                _adapter_config(config_path.read_bytes())
+            _validate_safetensors_file(model_path, tensor_bytes)
             with self._condition:
                 if self._closed:
                     raise RuntimeError("adapter receive pool closed during download")
@@ -468,11 +615,11 @@ class AdapterSnapshotReceiver:
                 host_id=self.host_id,
                 generation_id=source.generation_id,
                 path=str(path),
-                tensor_bytes=source.object_bytes,
-                config_bytes=len(source.adapter_config_json.encode()),
+                tensor_bytes=tensor_bytes,
+                config_bytes=config_bytes,
                 materialization_s=time.monotonic() - started,
-                used_bytes=source.object_bytes,
-                capacity_bytes=source.object_bytes,
+                used_bytes=tensor_bytes + config_bytes,
+                capacity_bytes=tensor_bytes + config_bytes,
                 source_identity=source.source_identity,
             )
         except BaseException:
