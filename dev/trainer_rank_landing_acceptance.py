@@ -975,17 +975,22 @@ class _ForwardCompileWatch(logging.Handler):
 
 
 def _source_fingerprint() -> str:
-    import subprocess
+    """Content hash of the TrainerRank sources and this driver.
 
-    try:
-        return subprocess.check_output(
-            ["git", "rev-parse", "HEAD"],
-            cwd=REPO_ROOT,
-            text=True,
-            stderr=subprocess.DEVNULL,
-        ).strip()
-    except (OSError, subprocess.CalledProcessError):
-        return "unknown"
+    Content-based rather than a git commit so that a SkyPilot workdir (synced
+    without ``.git``) and a local checkout of the same files agree, and so that
+    uncommitted edits change the fingerprint.
+    """
+
+    import hashlib
+
+    digest = hashlib.sha256()
+    files = sorted((REPO_ROOT / "src" / "art" / "trainer_rank").glob("*.py"))
+    files.append(Path(__file__).resolve())
+    for path in files:
+        digest.update(path.name.encode())
+        digest.update(path.read_bytes())
+    return digest.hexdigest()
 
 
 def _workload_fingerprint(requests: list[Any]) -> dict[str, object]:
