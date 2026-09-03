@@ -268,6 +268,7 @@ def _write_runtime_launcher(runtime_dir: Path) -> Path:
         '    library_path="${library_path}${library_path:+:}${directory}"\n'
         "done\n"
         'export LD_LIBRARY_PATH="${library_path}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"\n'
+        'export PATH="$runtime_root/bin${PATH:+:${PATH}}"\n'
         'if [ -n "${ART_MONARCH_PROGRAM_PYTHONPATH:-}" ]; then\n'
         '    export PYTHONPATH="$ART_MONARCH_PROGRAM_PYTHONPATH"\n'
         "else\n"
