@@ -164,7 +164,12 @@ asserts the shipped table is the certified table and that the certified
 metrics hold on the recorded aggregates; `--from-certificate` re-fits from it.
 The runners propagate every cell failure (no masked exit codes) and the
 fitter refuses to fit incomplete evidence unless the gaps are excluded
-explicitly (`--require-complete`, `--exclude-cells`).
+explicitly (`--require-complete`, `--exclude-cells`). Two Ellavox CP4 cells
+(groups 1 and 4) are excluded this way: their CP4 executions hang
+deterministically in NCCL all-to-alls in the context-parallel group
+(reproduced on a fresh cluster at identical collective sequence numbers) — a
+pre-existing CP4 execution bug, tracked as issue #840; the version-1 score
+selects the hanging layout for group 4, the fitted table happens not to.
 
 ## Width feasibility is decided by the memory-minimal layout
 
