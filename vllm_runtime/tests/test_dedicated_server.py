@@ -496,10 +496,18 @@ async def test_completed_lora_update_replays_before_generation_validation(
     }
     await receipts.settle(body.operation_id, fingerprint, result)
 
+    latest_result = {
+        "status": "updated",
+        "generation_id": "generation-2",
+        "update_seq": 2,
+    }
+    await receipts.settle("operation-2", "fingerprint-2", latest_result)
+
     replay = await dedicated_server._replay_lora_update(body, fingerprint)
     assert replay is not None
     assert replay.status_code == 200
     assert json.loads(replay.body) == result
+    assert await receipts.replay("operation-2", "fingerprint-2") == latest_result
 
     changed = body.model_copy(update={"policy_version": 2})
     conflict = await dedicated_server._replay_lora_update(
@@ -508,7 +516,6 @@ async def test_completed_lora_update_replays_before_generation_validation(
     assert conflict is not None
     assert conflict.status_code == 409
 
-    await receipts.settle("operation-2", "fingerprint-2", {"status": "updated"})
     await receipts.settle("operation-3", "fingerprint-3", {"status": "updated"})
     assert await receipts.replay(body.operation_id, fingerprint) is None
 

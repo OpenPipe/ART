@@ -420,6 +420,9 @@ async def test_exact_publication_lease_pins_version_until_prune() -> None:
     assert unloaded == ["model@1"]
     assert manager.released == ["generation-1"]
 
+    await publisher.aclose()
+    assert manager.released == ["generation-1", "generation-2"]
+
 
 def _activate_in_flight(
     publisher: MegatronPairedInferencePublisher,
@@ -547,13 +550,13 @@ async def test_external_source_uses_the_ordinary_holder_update_path(
             self.released: list[str] = []
 
         async def materialize_external_adapter(self, value, *, timeout_s):
-            assert value is source
+            assert value.source_identity == source.source_identity
             assert timeout_s == 300
             return (
                 AdapterReceiveResult(
                     host_id="inference-0",
-                    generation_id=source.generation_id,
-                    path="/adapter/generation-3",
+                    generation_id=value.generation_id,
+                    path=f"/adapter/{value.generation_id}",
                     tensor_bytes=model_bytes,
                     config_bytes=config_bytes,
                     materialization_s=0.25,
@@ -582,12 +585,13 @@ async def test_external_source_uses_the_ordinary_holder_update_path(
 
     async def update(payload):
         updates.append(payload)
+        policy_version = int(payload["policy_version"])
         return {
             "generation_id": payload["generation_id"],
             "lora_slot": payload["lora_slot"],
-            "policy_version": payload["policy_version"],
-            "update_seq": 3,
-            "update_identity": "update-3",
+            "policy_version": policy_version,
+            "update_seq": policy_version,
+            "update_identity": f"update-{policy_version}",
             "source_identity": payload["source"]["source_identity"],
             "apply_s": 0.05,
         }
@@ -624,3 +628,43 @@ async def test_external_source_uses_the_ordinary_holder_update_path(
     assert len(updates) == 2
     assert publisher._active_generations["model:active"] == "generation-3"
     assert manager.released == []
+
+    for suffix, failure in (
+        ("failed", RuntimeError("holder rejected staged adapter")),
+        ("cancelled", asyncio.CancelledError()),
+    ):
+        failed_source = source.model_copy(
+            update={"generation_id": f"generation-{suffix}"}
+        )
+
+        async def fail_update(_payload, *, error=failure):
+            raise error
+
+        publisher._post_update = fail_update  # type: ignore[method-assign]
+        with pytest.raises(type(failure)):
+            await publisher.apply_external_adapter(
+                operation_id=f"operation-{suffix}",
+                public_alias="model",
+                generation_id=failed_source.generation_id,
+                expected_generation_id="generation-3",
+                policy_version=4,
+                source=failed_source,
+            )
+
+    replacement = source.model_copy(update={"generation_id": "generation-4"})
+    publisher._post_update = update  # type: ignore[method-assign]
+    await publisher.apply_external_adapter(
+        operation_id="operation-4",
+        public_alias="model",
+        generation_id=replacement.generation_id,
+        expected_generation_id="generation-3",
+        policy_version=4,
+        source=replacement,
+    )
+    assert manager.released == [
+        "generation-failed",
+        "generation-cancelled",
+        "generation-3",
+    ]
+    await publisher.aclose()
+    assert manager.released[-1] == "generation-4"

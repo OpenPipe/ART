@@ -1358,6 +1358,8 @@ async def test_handler_retains_route_ownership_through_optimizer() -> None:
         _operation("optim", "optim_step", 1, output=1),
         ("fb",),
     )
+    assert ownership.released == []
+    await handler.acknowledge_operation("optim")
     assert ownership.released == [("source", "fb")]
     await ownership.release(target)
 
