@@ -188,14 +188,31 @@ def _manifest_hash(
     return hashlib.sha256(payload).hexdigest()
 
 
-def _run(command: list[str], *, cwd: Path | None = None) -> str:
-    result = subprocess.run(command, cwd=cwd, capture_output=True, text=True)
+def _run(
+    command: list[str],
+    *,
+    cwd: Path | None = None,
+    env: dict[str, str] | None = None,
+) -> str:
+    result = subprocess.run(command, cwd=cwd, env=env, capture_output=True, text=True)
     if result.returncode:
         detail = (result.stdout + result.stderr)[-8000:]
         raise RuntimeError(
             f"Megatron runtime command failed: {shlex.join(command)}\n{detail}"
         )
     return result.stdout
+
+
+def _runtime_build_environment() -> dict[str, str]:
+    environment = os.environ.copy()
+    for entry in sys.path:
+        include = Path(entry) / "nvidia" / "cudnn" / "include"
+        if (include / "cudnn.h").is_file():
+            environment["CPATH"] = os.pathsep.join(
+                filter(None, (str(include), environment.get("CPATH")))
+            )
+            break
+    return environment
 
 
 def _uv() -> str:
@@ -357,7 +374,8 @@ def _install_runtime(
                 "--no-install-project",
                 "--python",
                 sys.executable,
-            ]
+            ],
+            env=_runtime_build_environment(),
         )
         _report_progress(
             progress,
