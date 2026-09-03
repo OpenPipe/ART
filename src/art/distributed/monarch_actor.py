@@ -512,7 +512,7 @@ class ArtHostService(Actor):
             raise RuntimeError("host has not passed ART runtime admission")
         return await self._launcher().start_member(request)
 
-    @resilient_endpoint
+    @resilient_endpoint(concurrent=True)
     async def vllm_member_state(self, replica_id: str, member_id: str, generation: int):
         return await self._launcher().member_state(replica_id, member_id, generation)
 
