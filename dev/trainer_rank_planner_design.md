@@ -134,16 +134,18 @@ What the data showed:
 Gates (held-out cells, noise-qualified): pairwise ordering ≥ 90% on pairs
 separated by more than 3%, median regret ≤ 2%, p95 ≤ 5%, none above 10%,
 clear winners selected within 5%. The table is fitted on 45 cells and
-evaluated on all 56 (3,844 within-cell pairs; the 11 odd Ellavox groups are
-the pre-registered holdout): it ranks 98.1% of separated pairs correctly, p95
-regret 2.9%, max 4.2%, no clear misses; the holdout passes. Ablations withholding
+evaluated on all 58 (3,849 within-cell pairs; the 11 odd Ellavox groups are
+the pre-registered holdout, and the two Ellavox CP4 cells re-measured after
+issue #840 are held out as well, 13 held-out cells): it ranks 98.1% of
+separated pairs correctly, p95 regret 2.9%, max 4.2%, no clear misses; the
+holdout passes. Ablations withholding
 every TP2 cell, every CP2 cell, or the whole attention model pass; withholding
 every heterogeneous cell misranks one CP4 heterogeneous cell by 9.5%, and
 withholding every CP4 cell does not extrapolate (25%), so those cells stay in
 the fit. Robustness: the table fitted on the first 38 cells, run through the
 real selector on the 18 later cells, was already within 4.2% everywhere, and
 the production selection timed in the later CP2/TP2 cells had median regret
-−0.2%, max 0.4%. The hand-set version-1 score on the same 56 cells: 78.6%
+−0.2%, max 0.4%. The hand-set version-1 score on the original 56 cells: 78.6%
 pairwise, max regret 67% (an Ellavox group at CP2).
 
 Calibrated domain: the table applies only inside `CalibrationProfile`, which
@@ -155,7 +157,7 @@ one-time warning. `dev/trainer_rank_cost_calibration_manifest.json` lists the
 exact cells each recipe launches; the fitter's `--manifest` validation requires
 every non-excluded cell to be present and complete, rejects unexpected cells
 and duplicate cells with differing execution fingerprints, and the certificate
-test asserts the 56 retained identities plus the two explicit exclusions.
+test asserts all 58 identities (no exclusions).
 
 Landing gates re-derived: the sealed win-cell shape still selects deep sharing
 (prompt-level sharing at CP4, where it measures fastest; full sharing at CP1),
@@ -182,11 +184,17 @@ metrics hold on the recorded aggregates; `--from-certificate` re-fits from it.
 The runners propagate every cell failure (no masked exit codes) and the
 fitter refuses to fit incomplete evidence unless the gaps are excluded
 explicitly (`--require-complete`, `--exclude-cells`). Two Ellavox CP4 cells
-(groups 1 and 4) are excluded this way: their CP4 executions hang
-deterministically in NCCL all-to-alls in the context-parallel group
-(reproduced on a fresh cluster at identical collective sequence numbers) — a
-pre-existing CP4 execution bug, tracked as issue #840; the version-1 score
-selects the hanging layout for group 4, the fitted table happens not to.
+(groups 1 and 4) were excluded this way at first because their calibration
+runs deadlocked in NCCL all-to-alls in the context-parallel group (issue
+#840). Tracing every collective per rank (`dev/trainer_rank_collective_trace.py`,
+`dev/trainer_rank_collective_diff.py`) showed the harness, not the runtime,
+at fault: the warm-up loop stopped when the *local* rank's forward was
+compile-free, and one CP rank whose local shapes still recompiled ran an
+extra warm-up of the previous layout while its peers moved on, so the ranks
+exchanged different layouts. Warm-up completion is now decided from the
+gathered world-wide compile statuses; both cells were re-measured cleanly
+and folded into the certificate as held-out cells (shipped-table regret 0%
+and 2.8%; the training cells and therefore the table are unchanged).
 
 ## Width feasibility is decided by the memory-minimal layout
 

@@ -83,7 +83,7 @@ def test_recipes_launch_exactly_the_manifest_cells() -> None:
     }
     excluded = {cell["key"] for cell in manifest["excluded"]}
     assert excluded <= expected
-    assert len(expected - excluded) == 56
+    assert len(expected - excluded) == 58
 
 
 def test_manifest_campaign_labels_name_checked_in_recipes() -> None:
@@ -94,4 +94,5 @@ def test_manifest_campaign_labels_name_checked_in_recipes() -> None:
         "tr-cost-cp4-2",
         "tr-cost-2gpu",
         "tr-cost-2gpu-2",
+        "tr-cost-cp4-840",
     }

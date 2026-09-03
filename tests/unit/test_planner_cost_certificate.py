@@ -87,7 +87,8 @@ def test_full_refit_reproduces_the_table_when_requested() -> None:
 
 
 def test_certificate_holds_exactly_the_manifest_cells() -> None:
-    """Exact cell identities: every expected cell minus the explicit exclusions."""
+    """Exact cell identities: every expected cell minus the explicit exclusions
+    (none since the two Ellavox CP4 cells were re-measured after issue #840)."""
 
     payload = json.loads(_CERTIFICATE.read_text())
     manifest = json.loads(_MANIFEST.read_text())
@@ -96,7 +97,7 @@ def test_certificate_holds_exactly_the_manifest_cells() -> None:
     assert excluded <= expected
     certified = {cell["cell"] for cell in payload["cells"]}
     assert certified == expected - excluded
-    assert len(certified) == 56 and len(excluded) == 2
+    assert len(certified) == 58 and not excluded
     assert set(payload["manifest"]["excluded"]) == excluded
     assert payload["manifest"]["path"] == _MANIFEST.name
     # Every retained cell carries its execution fingerprints.
