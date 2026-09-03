@@ -90,7 +90,10 @@ jobs:
           project_dir="$(mktemp -d)"
           cd "$project_dir"
           uv init --name art-runtime-smoke --python 3.12 --bare
-          uv add "openpipe-art[backend] @ file://${wheel_path}"
+          uv add \
+            --index-strategy unsafe-best-match \
+            --extra-index-url https://download.pytorch.org/whl/cu128 \
+            "openpipe-art[backend] @ file://${wheel_path}"
           uv sync
           uv run python - <<'PY'
           from pathlib import Path
