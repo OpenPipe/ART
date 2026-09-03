@@ -31,6 +31,12 @@ if TYPE_CHECKING:
         VllmParallelSpec,
     )
     from .topology import compile_topology
+    from .training_input_manifest import (
+        PackingRequestArtifact,
+        PackingRequestManifest,
+        PackingRequestSource,
+        packing_request_from_text_datums,
+    )
     from .vllm_replica import (
         HostMemberLaunchRequest,
         HostMemberState,
@@ -67,6 +73,9 @@ _EXPORTS = {
     "NixlTransportSpec": ".specs",
     "PairedTransferIdentity": ".specs",
     "PackingRequest": ".packing",
+    "PackingRequestArtifact": ".training_input_manifest",
+    "PackingRequestManifest": ".training_input_manifest",
+    "PackingRequestSource": ".training_input_manifest",
     "PackedBatchRef": ".data_plane",
     "ReplicaHostLauncher": ".vllm_replica",
     "ReplicaFailure": ".vllm_replica",
@@ -80,6 +89,7 @@ _EXPORTS = {
     "TrainerMeshSpec": ".specs",
     "VllmParallelSpec": ".specs",
     "compile_topology": ".topology",
+    "packing_request_from_text_datums": ".training_input_manifest",
 }
 
 __all__ = list(_EXPORTS)

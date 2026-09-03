@@ -6,6 +6,11 @@ from msgspec import msgpack
 import numpy as np
 import pytest
 
+from art.distributed import (
+    PackingRequestArtifact,
+    PackingRequestManifest,
+    PackingRequestSource,
+)
 from art.distributed.data_plane import ByteStreamTransfer, PackedBatchInbox
 from art.distributed.packing import (
     PackingRequest,
@@ -18,6 +23,7 @@ from art.distributed.packing import (
 from art.training.token_matrix import (
     NamedLossRequest,
     RetainedTokenRoutes,
+    TextDatum,
     TokenMatrix,
     TokenMatrixBatch,
     dense_row,
@@ -44,6 +50,41 @@ def _batch() -> TokenMatrixBatch:
             ),
         )
     )
+
+
+def test_packing_request_manifest_retains_exact_sft_bootstrap() -> None:
+    request = PackingRequest(
+        batch=_batch(),
+        loss=NamedLossRequest(name="cross_entropy", normalize_advantages=False),
+        generation_id="length-objective-generation",
+        packed_sequence_length=128,
+    )
+    source = PackingRequestSource(
+        stage="length_trainability",
+        command_index=1,
+        learner_parent_version=0,
+        text_datums=(
+            TextDatum(
+                datum_id="matrix-0",
+                messages=(
+                    {"role": "user", "content": "Return the learned marker."},
+                    {"role": "assistant", "content": "MARK MARK"},
+                ),
+                assistant_turns="last",
+            ),
+        ),
+    )
+    manifest = PackingRequestManifest.create(
+        context={"model_identity": {"base_model": "model", "handler": "dense"}},
+        inputs=(PackingRequestArtifact.capture(request, source=source),),
+    )
+
+    restored = PackingRequestManifest.model_validate_json(manifest.canonical_bytes())
+
+    assert restored == manifest
+    assert restored.inputs[0].source.learner_parent_version == 0
+    assert restored.inputs[0].source.text_datums[0].datum_id == "matrix-0"
+    assert restored.inputs[0].request == request
 
 
 def test_retained_route_sidecar_resolves_by_matrix_id() -> None:

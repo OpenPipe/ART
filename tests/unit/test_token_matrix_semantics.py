@@ -1,19 +1,23 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
 import math
 from types import SimpleNamespace
+from typing import Any, cast
 
 import pytest
 import torch
 
+from art.distributed import packing_request_from_text_datums
 import art.preprocessing.pack as pack_module
 from art.preprocessing.pack import packed_tensors_from_token_matrices
 from art.preprocessing.token_matrix import token_matrix_batch_from_art_rollouts
-from art.preprocessing.tokenize import TokenizedResult
+from art.preprocessing.tokenize import SFTBatch, TokenizedResult
 from art.training.token_matrix import (
     CapturedTokenRoutes,
     MatrixPair,
     NamedLossRequest,
+    TextDatum,
     TokenMatrix,
     TokenMatrixBatch,
     dense_row,
@@ -90,6 +94,60 @@ def test_rollout_lowering_emits_first_class_captured_route_selector() -> None:
             choice_index=2,
         ),
     )
+
+
+def test_text_datum_uses_canonical_sft_lowering() -> None:
+    calls: list[tuple[object, tuple[Trajectory, ...], dict[str, object]]] = []
+
+    class _Tokenizer:
+        def tokenize(
+            self, model: object, trajectories: Sequence[Trajectory], **kwargs: object
+        ) -> SFTBatch:
+            calls.append((model, tuple(trajectories), kwargs))
+            return SFTBatch(
+                trajectory_tensors=[
+                    {
+                        "input_ids": torch.tensor([[10, 11, 12]]),
+                        "attention_mask": torch.tensor([[1, 1, 1]]),
+                        "labels": torch.tensor([[-100, 11, 12]]),
+                    }
+                ],
+                learning_rate=0.0,
+                num_trajectories=1,
+                num_tokens=3,
+                num_trainable_tokens=2,
+            )
+
+    model = SimpleNamespace(base_model="model")
+    datum = TextDatum(
+        datum_id="length-marker",
+        messages=(
+            {"role": "user", "content": "Return the learned marker."},
+            {"role": "assistant", "content": "MARK MARK"},
+        ),
+        assistant_turns="last",
+        packing_affinity_id="marker-objective",
+    )
+
+    request = packing_request_from_text_datums(
+        (datum,),
+        model=cast(Any, model),
+        generation_id="length-objective-generation",
+        packed_sequence_length=128,
+        tokenizer=cast(Any, _Tokenizer()),
+    )
+    batch = request.batch
+
+    assert batch.matrices[0].matrix_id == "length-marker"
+    assert batch.matrices[0].packing_affinity_id == "marker-objective"
+    assert batch.matrices[0].row("token_ids").dense_values() == (10, 11, 12)
+    assert batch.matrices[0].row("loss_weights").dense_values() == (1.0, 1.0, 0.0)
+    assert request.loss == NamedLossRequest(
+        name="cross_entropy", normalize_advantages=False
+    )
+    assert request.packed_sequence_length == 128
+    assert calls[0][1][0].messages_and_choices == list(datum.messages)
+    assert calls[0][2] == {"assistant_turns": "last", "learning_rate": 0.0}
 
 
 @pytest.mark.parametrize("loss_name", ["importance_sampling", "cispo"])

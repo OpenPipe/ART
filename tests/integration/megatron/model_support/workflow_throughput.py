@@ -96,7 +96,6 @@ _VLLM_RUNTIME_PACKAGES = (
 _LOCAL_SOURCE_PACKAGES = ("openpipe-art", "art-vllm-runtime")
 _H200_THROUGHPUT_NUM_LAYERS = {"dsv4": 4, "glm52": 6}
 _THROUGHPUT_MAX_ATTEMPTS = 2
-_WORKFLOW_TRAINING_INPUT_SCHEMA = "art.model_support.workflow_training_inputs.v1"
 _LOAD_ACCEPTANCE_FAILURES = frozenset(
     {
         "stable_min_vllm_pressure",
@@ -643,33 +642,23 @@ async def _capture_training_input(
     )
 
 
-def _artifact_json_bytes(value: Any) -> bytes:
-    return (
-        json.dumps(
-            value,
-            sort_keys=True,
-            separators=(",", ":"),
-            ensure_ascii=True,
-        ).encode()
-        + b"\n"
-    )
-
-
-def _artifact_value_sha256(value: Any) -> str:
-    return hashlib.sha256(_artifact_json_bytes(value)).hexdigest()
-
-
 def _write_workflow_training_input_manifest(
     stage_dir: Path,
     *,
     captured_inputs: tuple[CapturedTrainingInput, ...],
     runtime_contract: Mapping[str, Any],
+    source_stage: str,
 ) -> tuple[Path, str]:
-    from art.distributed import PackingRequest
+    from art.distributed import (
+        PackingRequest,
+        PackingRequestArtifact,
+        PackingRequestManifest,
+        PackingRequestSource,
+    )
 
     if not captured_inputs:
         raise RuntimeError("workflow training input manifest requires captured inputs")
-    identity = {
+    context = {
         key: runtime_contract.get(key)
         for key in (
             "model_identity",
@@ -678,16 +667,10 @@ def _write_workflow_training_input_manifest(
             "source_provenance",
         )
     }
-    if not all(isinstance(value, Mapping) for value in identity.values()):
+    if not all(isinstance(value, Mapping) for value in context.values()):
         raise RuntimeError("workflow runtime contract lacks input provenance")
-    identity["fixture_manifest_sha256"] = _artifact_value_sha256(
-        identity["fixture_manifest"]
-    )
-    identity["source_provenance_sha256"] = _artifact_value_sha256(
-        identity["source_provenance"]
-    )
 
-    inputs: list[dict[str, Any]] = []
+    inputs: list[PackingRequestArtifact] = []
     previous_command = 0
     for captured in captured_inputs:
         request = captured.packing_request
@@ -696,29 +679,21 @@ def _write_workflow_training_input_manifest(
         if captured.source_command_index <= previous_command:
             raise RuntimeError("captured workflow commands are not strictly ordered")
         previous_command = captured.source_command_index
-        exact_input = {
-            "stage": "e2e_throughput",
-            "command_index": captured.source_command_index,
-            "learner_parent_version": captured.learner_parent_version,
-            "result_learner_version": captured.policy_step,
-            "packed_sequence_length": request.packed_sequence_length,
-            "token_matrix_batch": request.batch.model_dump(mode="json"),
-            "named_loss_request": request.loss.model_dump(mode="json"),
-        }
         inputs.append(
-            {
-                "input_id": "sha256:" + _artifact_value_sha256(exact_input),
-                **exact_input,
-            }
+            PackingRequestArtifact.capture(
+                request,
+                source=PackingRequestSource(
+                    stage=source_stage,
+                    command_index=captured.source_command_index,
+                    learner_parent_version=captured.learner_parent_version,
+                    result_learner_version=captured.policy_step,
+                ),
+            )
         )
 
-    manifest = {
-        "schema": _WORKFLOW_TRAINING_INPUT_SCHEMA,
-        **identity,
-        "inputs": inputs,
-    }
+    manifest = PackingRequestManifest.create(context=dict(context), inputs=inputs)
     manifest_path = stage_dir / "workflow_training_input_manifest.json"
-    encoded_manifest = _artifact_json_bytes(manifest)
+    encoded_manifest = manifest.canonical_bytes()
     manifest_path.write_bytes(encoded_manifest)
     return manifest_path, hashlib.sha256(encoded_manifest).hexdigest()
 
@@ -1999,7 +1974,8 @@ async def _run_e2e_throughput_async(
             f"window and two measured windows: max_steps={config.max_steps}, "
             f"warmup={autotune.warmup_ignore_steps}, window={autotune.window_steps}"
         )
-    capture_train_calls = _matched_capture_steps(config.max_steps)
+    matched_capture_calls = _matched_capture_steps(config.max_steps)
+    capture_train_calls = (1, *matched_capture_calls)
     runtime_contract = _calibration_contract(
         base_model=base_model,
         fixture=fixture,
@@ -2250,7 +2226,7 @@ async def _run_e2e_throughput_async(
                         "PipelineTrainer did not pass trajectory groups positionally"
                     )
                 groups = args[1]
-                if command in capture_train_calls:
+                if command in matched_capture_calls:
                     _collect_matched_packing_shapes(groups)
                 learner_parent_version = kwargs.get("learner_parent_version")
                 if not isinstance(learner_parent_version, int):
@@ -2346,17 +2322,34 @@ async def _run_e2e_throughput_async(
                 )
                 setattr(runtime, "pack", original_runtime_pack)
                 await _cancel_activation_tasks(activation_tasks)
-            if len(captured_training_inputs) != _MATCHED_MEASURED_STEPS:
+            if len(captured_training_inputs) != _MATCHED_MEASURED_STEPS + 1:
                 raise RuntimeError(
-                    "online pipeline did not capture every matched train batch"
+                    "online pipeline did not capture bootstrap and matched train batches"
                 )
             if captured_packing_requests:
                 raise RuntimeError("workflow left captured packing requests unconsumed")
-            capture_settings = captured_training_inputs[0].pipeline_settings
+            captured_training_inputs.sort(key=lambda value: value.source_command_index)
+            bootstrap_input, *matched_training_inputs = captured_training_inputs
+            if (
+                bootstrap_input.source_command_index != 1
+                or bootstrap_input.learner_parent_version != 0
+            ):
+                raise RuntimeError(
+                    "workflow bootstrap input is not rooted at learner 0"
+                )
+            if (
+                tuple(
+                    captured.source_command_index
+                    for captured in matched_training_inputs
+                )
+                != matched_capture_calls
+            ):
+                raise RuntimeError("workflow matched input command identities differ")
+            capture_settings = matched_training_inputs[0].pipeline_settings
             _require(
                 all(
                     captured.pipeline_settings == capture_settings
-                    for captured in captured_training_inputs[1:]
+                    for captured in matched_training_inputs[1:]
                 ),
                 "matched E2E samples used different pipeline settings",
             )
@@ -2364,11 +2357,11 @@ async def _run_e2e_throughput_async(
                 _matched_input_fingerprints(
                     [
                         captured.trajectory_fingerprint
-                        for captured in captured_training_inputs
+                        for captured in matched_training_inputs
                     ],
                     [
                         captured.packed_fingerprint
-                        for captured in captured_training_inputs
+                        for captured in matched_training_inputs
                     ],
                 )
             )
@@ -2379,14 +2372,14 @@ async def _run_e2e_throughput_async(
                 packed_input_fingerprint=packed_input_fingerprint,
                 samples=[
                     (captured.metrics, captured.policy_step)
-                    for captured in captured_training_inputs
+                    for captured in matched_training_inputs
                 ],
             )
             isolated_phase = await _run_isolated_backend_phase(
                 backend=backend,
                 model=model,
                 service=service,
-                captured_inputs=tuple(captured_training_inputs),
+                captured_inputs=tuple(matched_training_inputs),
             )
         finally:
             await client.close()
@@ -2416,6 +2409,7 @@ async def _run_e2e_throughput_async(
             stage_dir,
             captured_inputs=tuple(captured_training_inputs),
             runtime_contract=runtime_contract,
+            source_stage="e2e_throughput",
         )
     )
     thresholds = config.thresholds.get(hardware)
@@ -2436,7 +2430,7 @@ async def _run_e2e_throughput_async(
                 "trajectory_fingerprint": captured.trajectory_fingerprint,
                 "packed_fingerprint": captured.packed_fingerprint,
             }
-            for captured in captured_training_inputs
+            for captured in matched_training_inputs
         ],
         "autotuner_profile": str(profile_path),
         "policy_activation_timeline": str(activation_path),

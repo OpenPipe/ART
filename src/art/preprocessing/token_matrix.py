@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Literal, Protocol
 
 import numpy as np
 
@@ -13,6 +13,7 @@ from art.training.token_matrix import (
     NamedLossRequest,
     SpanRowValues,
     SpanValue,
+    TextDatum,
     TokenMatrix,
     TokenMatrixBatch,
     TokenRow,
@@ -26,6 +27,22 @@ from .tokenize import SFTBatch, TokenizedResult
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
+
+    from art.model import TrainableModel
+    from art.trajectories import Trajectory
+
+    from .sft import SftBatchTokenizer
+
+
+class _SftTokenizer(Protocol):
+    def tokenize(
+        self,
+        model: TrainableModel,
+        trajectories: Sequence[Trajectory],
+        *,
+        assistant_turns: Literal["all", "last"],
+        learning_rate: float,
+    ) -> SFTBatch: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -184,6 +201,49 @@ def token_matrix_batch_from_sft(
         return None
     result = TokenMatrixBatch(matrices=tuple(matrices))
     validate_token_matrix_batch(result, NamedLossRequest(name="cross_entropy"))
+    return result
+
+
+def token_matrix_batch_from_text_datums(
+    datums: Sequence[TextDatum],
+    *,
+    model: TrainableModel,
+    tokenizer: SftBatchTokenizer | _SftTokenizer,
+) -> TokenMatrixBatch:
+    """Lower native text through the existing production SFT semantic oracle."""
+
+    from art.trajectories import Trajectory
+
+    matrices: list[TokenMatrix] = []
+    for datum in datums:
+        trajectory = Trajectory(
+            messages_and_choices=list(datum.messages),
+            tools=list(datum.tools) if datum.tools is not None else None,
+        )
+        tokenized = tokenizer.tokenize(
+            model,
+            (trajectory,),
+            assistant_turns=datum.assistant_turns,
+            learning_rate=0.0,
+        )
+        lowered = token_matrix_batch_from_sft(tokenized)
+        if lowered is None or len(lowered.matrices) != 1:
+            raise ValueError(f"text datum {datum.datum_id!r} has no trainable target")
+        matrices.append(
+            lowered.matrices[0].model_copy(
+                update={
+                    "matrix_id": datum.datum_id,
+                    "packing_affinity_id": datum.packing_affinity_id,
+                }
+            )
+        )
+    if not matrices:
+        raise ValueError("text lowering requires at least one datum")
+    result = TokenMatrixBatch(matrices=tuple(matrices))
+    validate_token_matrix_batch(
+        result,
+        NamedLossRequest(name="cross_entropy", normalize_advantages=False),
+    )
     return result
 
 

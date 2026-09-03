@@ -149,7 +149,7 @@ def test_canonical_production_config_digest_uses_resolved_config(
 def test_workflow_training_input_manifest_retains_exact_token_matrix(
     tmp_path: Path,
 ) -> None:
-    from art.distributed import PackingRequest
+    from art.distributed import PackingRequest, PackingRequestManifest
     from art.training import NamedLossRequest, TokenMatrix, TokenMatrixBatch
     from art.training.token_matrix import dense_row
 
@@ -178,7 +178,7 @@ def test_workflow_training_input_manifest_retains_exact_token_matrix(
         packed_fingerprint="packed",
         pipeline_settings={},
         metrics={},
-        policy_step=8,
+        policy_step=7,
         packing_request=request,
         source_command_index=7,
         learner_parent_version=6,
@@ -194,29 +194,23 @@ def test_workflow_training_input_manifest_retains_exact_token_matrix(
         tmp_path,
         captured_inputs=(captured,),
         runtime_contract=runtime_contract,
+        source_stage="e2e_throughput",
     )
 
     assert manifest_sha256 == hashlib.sha256(manifest_path.read_bytes()).hexdigest()
-    manifest = json.loads(manifest_path.read_text())
-    assert manifest["schema"] == "art.model_support.workflow_training_inputs.v1"
-    assert manifest["fixture_manifest"] == runtime_contract["fixture_manifest"]
-    assert manifest["source_provenance"] == runtime_contract["source_provenance"]
-    entry = manifest["inputs"][0]
-    assert entry["stage"] == "e2e_throughput"
-    assert entry["command_index"] == 7
-    assert entry["learner_parent_version"] == 6
-    assert entry["result_learner_version"] == 8
-    assert entry["packed_sequence_length"] == 128
-    assert TokenMatrixBatch.model_validate(entry["token_matrix_batch"]) == batch
-    assert NamedLossRequest.model_validate(entry["named_loss_request"]) == loss
-    exact_input = {key: value for key, value in entry.items() if key != "input_id"}
-    encoded = (
-        json.dumps(
-            exact_input, sort_keys=True, separators=(",", ":"), ensure_ascii=True
-        ).encode()
-        + b"\n"
+    manifest = PackingRequestManifest.model_validate_json(manifest_path.read_bytes())
+    assert manifest.format == "art.packing_requests.v1"
+    assert manifest.context["fixture_manifest"] == runtime_contract["fixture_manifest"]
+    assert (
+        manifest.context["source_provenance"] == runtime_contract["source_provenance"]
     )
-    assert entry["input_id"] == "sha256:" + hashlib.sha256(encoded).hexdigest()
+    entry = manifest.inputs[0]
+    assert entry.source.stage == "e2e_throughput"
+    assert entry.source.command_index == 7
+    assert entry.source.learner_parent_version == 6
+    assert entry.source.result_learner_version == 7
+    assert entry.request == request
+    assert entry.input_id.startswith("sha256:")
 
 
 def test_shared_fixture_root_rehomes_node_local_paths(tmp_path: Path) -> None:
