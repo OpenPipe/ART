@@ -912,6 +912,22 @@ def test_aliases_use_their_measured_throughput_fingerprints() -> None:
     )
 
 
+def test_glm53_uses_its_measured_throughput_fingerprint() -> None:
+    glm52 = handler_workflow_resources_for_base_model("zai-org/GLM-5.2")
+    glm53 = handler_workflow_resources_for_base_model("zai-org/GLM-5.3-BF16")
+    assert glm52 is not None and glm52.e2e_throughput is not None
+    assert glm53 is not None and glm53.e2e_throughput is not None
+    glm52_config = glm52.e2e_throughput.throughput
+    glm53_config = glm53.e2e_throughput.throughput
+    assert glm52_config is not None and glm53_config is not None
+    assert glm52_config.thresholds["b300"].calibration_fingerprint == (
+        "bf81b6800b9ea080514da72e5e3a989e72fe523a6cdde9cbe9271eaf162c0f07"
+    )
+    assert glm53_config.thresholds["b300"].calibration_fingerprint == (
+        "dd36d8cf47db685e1d49e0da739d5b9e2ef41cb5e6f9bc3bb5132f57f25c915d"
+    )
+
+
 def test_dsv4_runtime_stages_use_full_model_resources() -> None:
     resources = handler_workflow_resources_for_base_model(
         "deepseek-ai/DeepSeek-V4-Flash"
