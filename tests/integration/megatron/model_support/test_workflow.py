@@ -1,3 +1,4 @@
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -39,6 +40,7 @@ from .workflow_resources import (
     resolve_stage_resources_for_visible_gpus,
 )
 from .workflow_throughput import (
+    CapturedTrainingInput,
     PolicyActivationEvent,
     ThroughputFixture,
     _canonical_production_config_sha256,
@@ -53,6 +55,7 @@ from .workflow_throughput import (
     _settled_execution_decision_suffix,
     _sized_prompt,
     _synthetic_sampling_constraints,
+    _write_workflow_training_input_manifest,
     acceptance_failures,
 )
 
@@ -141,6 +144,79 @@ def test_canonical_production_config_digest_uses_resolved_config(
     digest = _canonical_production_config_sha256(production_config / "config.json")
     assert digest == canonical_config_sha256(resolved)
     assert digest != _digest(source)
+
+
+def test_workflow_training_input_manifest_retains_exact_token_matrix(
+    tmp_path: Path,
+) -> None:
+    from art.distributed import PackingRequest
+    from art.training import NamedLossRequest, TokenMatrix, TokenMatrixBatch
+    from art.training.token_matrix import dense_row
+
+    batch = TokenMatrixBatch(
+        matrices=(
+            TokenMatrix(
+                matrix_id="matrix-0",
+                rows=(
+                    dense_row("token_ids", "int64", (3,), (10, 11, 12)),
+                    dense_row("target_token_ids", "int64", (3, 1), (11, 12, 0)),
+                    dense_row("loss_weights", "float32", (3, 1), (0.0, 1.0, 1.0)),
+                ),
+            ),
+        )
+    )
+    loss = NamedLossRequest(name="cross_entropy")
+    request = PackingRequest(
+        batch=batch,
+        loss=loss,
+        generation_id="packing-generation",
+        packed_sequence_length=128,
+    )
+    captured = CapturedTrainingInput(
+        bundles=(),
+        trajectory_fingerprint="trajectory",
+        packed_fingerprint="packed",
+        pipeline_settings={},
+        metrics={},
+        policy_step=8,
+        packing_request=request,
+        source_command_index=7,
+        learner_parent_version=6,
+    )
+    runtime_contract = {
+        "fixture_manifest": {"sized_config_sha256": "fixture"},
+        "source_provenance": {"art": {"commit": "source"}},
+        "topology": {"tensor_parallel_size": 1, "context_parallel_size": 2},
+        "model_identity": {"base_model": "model", "model_key": "handler"},
+    }
+
+    manifest_path, manifest_sha256 = _write_workflow_training_input_manifest(
+        tmp_path,
+        captured_inputs=(captured,),
+        runtime_contract=runtime_contract,
+    )
+
+    assert manifest_sha256 == hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+    manifest = json.loads(manifest_path.read_text())
+    assert manifest["schema"] == "art.model_support.workflow_training_inputs.v1"
+    assert manifest["fixture_manifest"] == runtime_contract["fixture_manifest"]
+    assert manifest["source_provenance"] == runtime_contract["source_provenance"]
+    entry = manifest["inputs"][0]
+    assert entry["stage"] == "e2e_throughput"
+    assert entry["command_index"] == 7
+    assert entry["learner_parent_version"] == 6
+    assert entry["result_learner_version"] == 8
+    assert entry["packed_sequence_length"] == 128
+    assert TokenMatrixBatch.model_validate(entry["token_matrix_batch"]) == batch
+    assert NamedLossRequest.model_validate(entry["named_loss_request"]) == loss
+    exact_input = {key: value for key, value in entry.items() if key != "input_id"}
+    encoded = (
+        json.dumps(
+            exact_input, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+        ).encode()
+        + b"\n"
+    )
+    assert entry["input_id"] == "sha256:" + hashlib.sha256(encoded).hexdigest()
 
 
 def test_shared_fixture_root_rehomes_node_local_paths(tmp_path: Path) -> None:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Mapping
 from contextlib import contextmanager
+from contextvars import ContextVar
 import hashlib
 import json
 import math
@@ -95,6 +96,7 @@ _VLLM_RUNTIME_PACKAGES = (
 _LOCAL_SOURCE_PACKAGES = ("openpipe-art", "art-vllm-runtime")
 _H200_THROUGHPUT_NUM_LAYERS = {"dsv4": 4, "glm52": 6}
 _THROUGHPUT_MAX_ATTEMPTS = 2
+_WORKFLOW_TRAINING_INPUT_SCHEMA = "art.model_support.workflow_training_inputs.v1"
 _LOAD_ACCEPTANCE_FAILURES = frozenset(
     {
         "stable_min_vllm_pressure",
@@ -165,6 +167,19 @@ class CapturedTrainingInput(NamedTuple):
     pipeline_settings: dict[str, int]
     metrics: Mapping[str, Any]
     policy_step: int
+    packing_request: Any
+    source_command_index: int
+    learner_parent_version: int
+
+
+class _CapturedPreparedTrainingInput(NamedTuple):
+    bundles: tuple[Any, ...]
+    trajectory_fingerprint: str
+    packed_fingerprint: str
+    pipeline_settings: dict[str, int]
+    packing_request: Any
+    source_command_index: int
+    learner_parent_version: int
 
 
 @contextmanager
@@ -605,7 +620,11 @@ async def _capture_training_input(
     prepared: Any,
     selections: tuple[Any, ...],
     pipeline_settings: dict[str, int],
-) -> tuple[tuple[Any, ...], str, str, dict[str, int]]:
+    *,
+    packing_request: Any,
+    source_command_index: int,
+    learner_parent_version: int,
+) -> _CapturedPreparedTrainingInput:
     bundles, packed_fingerprint = await asyncio.gather(
         _capture_training_bundles(selections),
         asyncio.to_thread(_packed_batch_fingerprint, prepared),
@@ -613,7 +632,95 @@ async def _capture_training_input(
     trajectory_fingerprint = hashlib.sha256(
         await asyncio.to_thread(_bundle_bytes, bundles)
     ).hexdigest()
-    return bundles, trajectory_fingerprint, packed_fingerprint, pipeline_settings
+    return _CapturedPreparedTrainingInput(
+        bundles=bundles,
+        trajectory_fingerprint=trajectory_fingerprint,
+        packed_fingerprint=packed_fingerprint,
+        pipeline_settings=pipeline_settings,
+        packing_request=packing_request,
+        source_command_index=source_command_index,
+        learner_parent_version=learner_parent_version,
+    )
+
+
+def _artifact_json_bytes(value: Any) -> bytes:
+    return (
+        json.dumps(
+            value,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+        ).encode()
+        + b"\n"
+    )
+
+
+def _artifact_value_sha256(value: Any) -> str:
+    return hashlib.sha256(_artifact_json_bytes(value)).hexdigest()
+
+
+def _write_workflow_training_input_manifest(
+    stage_dir: Path,
+    *,
+    captured_inputs: tuple[CapturedTrainingInput, ...],
+    runtime_contract: Mapping[str, Any],
+) -> tuple[Path, str]:
+    from art.distributed import PackingRequest
+
+    if not captured_inputs:
+        raise RuntimeError("workflow training input manifest requires captured inputs")
+    identity = {
+        key: runtime_contract.get(key)
+        for key in (
+            "model_identity",
+            "topology",
+            "fixture_manifest",
+            "source_provenance",
+        )
+    }
+    if not all(isinstance(value, Mapping) for value in identity.values()):
+        raise RuntimeError("workflow runtime contract lacks input provenance")
+    identity["fixture_manifest_sha256"] = _artifact_value_sha256(
+        identity["fixture_manifest"]
+    )
+    identity["source_provenance_sha256"] = _artifact_value_sha256(
+        identity["source_provenance"]
+    )
+
+    inputs: list[dict[str, Any]] = []
+    previous_command = 0
+    for captured in captured_inputs:
+        request = captured.packing_request
+        if not isinstance(request, PackingRequest):
+            raise TypeError("captured workflow input is not a PackingRequest")
+        if captured.source_command_index <= previous_command:
+            raise RuntimeError("captured workflow commands are not strictly ordered")
+        previous_command = captured.source_command_index
+        exact_input = {
+            "stage": "e2e_throughput",
+            "command_index": captured.source_command_index,
+            "learner_parent_version": captured.learner_parent_version,
+            "result_learner_version": captured.policy_step,
+            "packed_sequence_length": request.packed_sequence_length,
+            "token_matrix_batch": request.batch.model_dump(mode="json"),
+            "named_loss_request": request.loss.model_dump(mode="json"),
+        }
+        inputs.append(
+            {
+                "input_id": "sha256:" + _artifact_value_sha256(exact_input),
+                **exact_input,
+            }
+        )
+
+    manifest = {
+        "schema": _WORKFLOW_TRAINING_INPUT_SCHEMA,
+        **identity,
+        "inputs": inputs,
+    }
+    manifest_path = stage_dir / "workflow_training_input_manifest.json"
+    encoded_manifest = _artifact_json_bytes(manifest)
+    manifest_path.write_bytes(encoded_manifest)
+    return manifest_path, hashlib.sha256(encoded_manifest).hexdigest()
 
 
 def _collect_matched_packing_shapes(groups: Any) -> None:
@@ -2019,15 +2126,32 @@ async def _run_e2e_throughput_async(
             service = cast(
                 DistributedMegatronService, await backend._get_service(model)
             )
+            runtime = service.runtime
             activation_tasks: dict[int, asyncio.Task[PolicyActivationEvent]] = {}
             capture_tasks: dict[
                 int,
-                asyncio.Task[tuple[tuple[Any, ...], str, str, dict[str, int]]],
+                asyncio.Task[_CapturedPreparedTrainingInput],
             ] = {}
+            capture_command: ContextVar[int | None] = ContextVar(
+                "workflow_throughput_capture_command", default=None
+            )
+            captured_packing_requests: dict[int, Any] = {}
             original_prepare_pipeline_commands = backend.prepare_pipeline_commands
             original_finish_training_batch = backend._finish_training_batch
+            original_runtime_pack = runtime.pack
             command_count = 0
             train_call_count = 0
+
+            async def tracked_runtime_pack(request: Any) -> Any:
+                packed = await original_runtime_pack(request)
+                command = capture_command.get()
+                if command is not None:
+                    if command in captured_packing_requests:
+                        raise RuntimeError(
+                            f"workflow command {command} issued multiple packing requests"
+                        )
+                    captured_packing_requests[command] = request
+                return packed
 
             async def finish_training_batch(batch: Any, *, failed: bool) -> None:
                 failures = []
@@ -2064,24 +2188,43 @@ async def _run_e2e_throughput_async(
                 capture_task = capture_tasks.get(captured_batch_id)
                 if capture_task is None:
                     raise RuntimeError("trainer did not release captured sources")
-                bundles, trajectory, packed, settings = await capture_task
+                captured = await capture_task
                 capture_tasks.pop(captured_batch_id)
                 captured_training_inputs.append(
                     CapturedTrainingInput(
-                        bundles,
-                        trajectory,
-                        packed,
-                        settings,
-                        result.metrics,
-                        step,
+                        bundles=captured.bundles,
+                        trajectory_fingerprint=captured.trajectory_fingerprint,
+                        packed_fingerprint=captured.packed_fingerprint,
+                        pipeline_settings=captured.pipeline_settings,
+                        metrics=result.metrics,
+                        policy_step=step,
+                        packing_request=captured.packing_request,
+                        source_command_index=captured.source_command_index,
+                        learner_parent_version=captured.learner_parent_version,
                     )
                 )
 
-            async def start_capture(groups: Any, prepared: Any) -> int:
+            async def start_capture(
+                groups: Any,
+                prepared: Any,
+                *,
+                command: int,
+                learner_parent_version: int,
+            ) -> int:
                 selections = tuple(getattr(prepared.batch.payload, "selections", ()))
                 if len(selections) != len(groups):
                     raise RuntimeError(
                         "prepared throughput batch lacks exact queue selections"
+                    )
+                request = captured_packing_requests.pop(command, None)
+                if request is None:
+                    raise RuntimeError(
+                        f"workflow command {command} lacks its pre-pack request"
+                    )
+                generation_id = getattr(prepared.batch.payload, "generation_id", None)
+                if request.generation_id != generation_id:
+                    raise RuntimeError(
+                        "captured PackingRequest does not match prepared generation"
                     )
                 captured_batch_id = id(prepared.batch)
                 capture_tasks[captured_batch_id] = asyncio.create_task(
@@ -2089,6 +2232,9 @@ async def _run_e2e_throughput_async(
                         prepared,
                         selections,
                         _current_pipeline_settings(trainer),
+                        packing_request=request,
+                        source_command_index=command,
+                        learner_parent_version=learner_parent_version,
                     )
                 )
                 return captured_batch_id
@@ -2106,8 +2252,20 @@ async def _run_e2e_throughput_async(
                 groups = args[1]
                 if command in capture_train_calls:
                     _collect_matched_packing_shapes(groups)
-                context = await original_prepare_pipeline_commands(*args, **kwargs)
+                learner_parent_version = kwargs.get("learner_parent_version")
+                if not isinstance(learner_parent_version, int):
+                    raise RuntimeError(
+                        "PipelineTrainer omitted the learner parent version"
+                    )
+                token = capture_command.set(
+                    command if command in capture_train_calls else None
+                )
+                try:
+                    context = await original_prepare_pipeline_commands(*args, **kwargs)
+                finally:
+                    capture_command.reset(token)
                 if context is None:
+                    captured_packing_requests.pop(command, None)
                     command_count -= 1
                     return None
                 captured_batch_id = None
@@ -2118,7 +2276,12 @@ async def _run_e2e_throughput_async(
                             raise RuntimeError(
                                 "split command lost its exact prepared capture"
                             )
-                        captured_batch_id = await start_capture(groups, prepared)
+                        captured_batch_id = await start_capture(
+                            groups,
+                            prepared,
+                            command=command,
+                            learner_parent_version=learner_parent_version,
+                        )
                     except BaseException as capture_error:
                         try:
                             await context.abort()
@@ -2154,6 +2317,7 @@ async def _run_e2e_throughput_async(
                 tracked_prepare_pipeline_commands,
             )
             setattr(backend, "_finish_training_batch", finish_training_batch)
+            setattr(runtime, "pack", tracked_runtime_pack)
             try:
                 measurement_start = (
                     config.max_steps - tail_windows * autotune.window_steps + 1
@@ -2180,11 +2344,14 @@ async def _run_e2e_throughput_async(
                     "_finish_training_batch",
                     original_finish_training_batch,
                 )
+                setattr(runtime, "pack", original_runtime_pack)
                 await _cancel_activation_tasks(activation_tasks)
             if len(captured_training_inputs) != _MATCHED_MEASURED_STEPS:
                 raise RuntimeError(
                     "online pipeline did not capture every matched train batch"
                 )
+            if captured_packing_requests:
+                raise RuntimeError("workflow left captured packing requests unconsumed")
             capture_settings = captured_training_inputs[0].pipeline_settings
             _require(
                 all(
@@ -2244,6 +2411,13 @@ async def _run_e2e_throughput_async(
     activation_path.write_text(
         json.dumps([event._asdict() for event in events], indent=2) + "\n"
     )
+    training_input_manifest_path, training_input_manifest_sha256 = (
+        _write_workflow_training_input_manifest(
+            stage_dir,
+            captured_inputs=tuple(captured_training_inputs),
+            runtime_contract=runtime_contract,
+        )
+    )
     thresholds = config.thresholds.get(hardware)
     failures = acceptance_failures(measurements, config, thresholds)
     classification = _classify_acceptance_failures(failures)
@@ -2266,6 +2440,8 @@ async def _run_e2e_throughput_async(
         ],
         "autotuner_profile": str(profile_path),
         "policy_activation_timeline": str(activation_path),
+        "workflow_training_input_manifest": str(training_input_manifest_path),
+        "workflow_training_input_manifest_sha256": (training_input_manifest_sha256),
         "thresholds": thresholds.model_dump(mode="json") if thresholds else None,
         **classification,
     }
