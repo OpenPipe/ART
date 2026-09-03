@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from contextlib import contextmanager
 import fcntl
 import hashlib
@@ -13,6 +14,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -21,13 +23,22 @@ from art.distributed.host_admission import (
     RuntimeFingerprint,
     runtime_package_names,
 )
-from art.utils.cache_dirs import configure_model_cache_env
+from art.utils.cache_dirs import configure_model_cache_env, network_cache_warning
 
 RUNTIME_INSTALL_MARKER = "openpipe-art-megatron-runtime"
 RUNTIME_LAUNCHER = "art-megatron-python"
 RUNTIME_PROTOCOL_VERSION = 1
 RuntimeProfile = Literal["cuda12", "cuda13"]
 RuntimeVariant = Literal["base", "hybrid_ep", "hybrid_ep_multinode"]
+
+
+def console_runtime_progress(message: str) -> None:
+    print(f"ART runtime: {message}", flush=True)
+
+
+def _report_progress(progress: Callable[[str], None] | None, message: str) -> None:
+    if progress is not None:
+        progress(message)
 
 
 class MegatronRuntimeAsset(BaseModel):
@@ -320,6 +331,7 @@ def _install_runtime(
     variant: RuntimeVariant,
     cache_root: Path,
     manifest_hash: str,
+    progress: Callable[[str], None] | None = None,
 ) -> Path:
     stage = Path(tempfile.mkdtemp(prefix=f".{manifest_hash}.tmp-", dir=cache_root))
     runtime_dir = cache_root / manifest_hash
@@ -327,6 +339,11 @@ def _install_runtime(
     try:
         shutil.copy2(bundle / manifest.pyproject.filename, stage / "pyproject.toml")
         shutil.copy2(bundle / manifest.lockfile.filename, stage / "uv.lock")
+        started = time.perf_counter()
+        _report_progress(
+            progress,
+            f"installing Megatron {profile}/{variant} dependencies in {cache_root}",
+        )
         _run(
             [
                 _uv(),
@@ -342,11 +359,27 @@ def _install_runtime(
                 sys.executable,
             ]
         )
+        _report_progress(
+            progress,
+            f"installed Megatron dependencies in {time.perf_counter() - started:.1f}s",
+        )
         python = _runtime_python(stage)
+        started = time.perf_counter()
+        _report_progress(progress, "copying the installed ART build into Megatron")
         _copy_art(python)
         launcher = _write_runtime_launcher(stage)
+        _report_progress(
+            progress,
+            f"copied ART into Megatron in {time.perf_counter() - started:.1f}s",
+        )
         if variant != "base":
+            started = time.perf_counter()
+            _report_progress(progress, f"building {variant} runtime extensions")
             _prepare_hybrid_ep(launcher, multinode=variant == "hybrid_ep_multinode")
+            _report_progress(
+                progress,
+                f"built {variant} extensions in {time.perf_counter() - started:.1f}s",
+            )
         if runtime_dir.exists():
             if existing := _valid_runtime(
                 runtime_dir,
@@ -418,6 +451,7 @@ def ensure_megatron_runtime(
     art_build_sha256: str,
     require_hybrid_ep: bool = False,
     multinode: bool = False,
+    progress: Callable[[str], None] | None = None,
 ) -> MegatronRuntimeInfo:
     if multinode and not require_hybrid_ep:
         raise ValueError("multi-node HybridEP requires require_hybrid_ep=True")
@@ -454,28 +488,45 @@ def ensure_megatron_runtime(
             cache_root = _runtime_cache_root()
             runtime_dir = cache_root / identity
             with _install_lock(cache_root):
-                python = _valid_runtime(
+                existing = _valid_runtime(
                     runtime_dir,
                     cache_root=cache_root,
                     manifest_hash=identity,
                     profile=profile,
                     variant=variant,
-                ) or _install_runtime(
-                    bundle,
-                    manifest,
-                    profile,
-                    variant,
-                    cache_root,
-                    identity,
                 )
+                if existing is not None:
+                    python = existing
+                    _report_progress(
+                        progress, f"using cached Megatron runtime at {runtime_dir}"
+                    )
+                else:
+                    if warning := network_cache_warning(cache_root):
+                        _report_progress(progress, f"Warning: {warning}")
+                    python = _install_runtime(
+                        bundle,
+                        manifest,
+                        profile,
+                        variant,
+                        cache_root,
+                        identity,
+                        progress,
+                    )
     if not os.access(python, os.X_OK):
         raise RuntimeError(f"Megatron runtime Python is not executable: {python}")
     if require_hybrid_ep and not managed:
         _prepare_hybrid_ep(python, multinode=multinode)
+    started = time.perf_counter()
+    _report_progress(progress, "validating Megatron runtime imports and package pins")
+    fingerprint = _fingerprint(python, profile, hybrid_ep=require_hybrid_ep)
+    _report_progress(
+        progress,
+        f"validated Megatron runtime in {time.perf_counter() - started:.1f}s",
+    )
     return MegatronRuntimeInfo(
         python=str(python),
         profile=profile,
         variant=variant,
         manifest_hash=identity,
-        runtime=_fingerprint(python, profile, hybrid_ep=require_hybrid_ep),
+        runtime=fingerprint,
     )

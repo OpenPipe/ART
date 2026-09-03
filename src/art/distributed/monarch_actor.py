@@ -232,13 +232,17 @@ class ArtHostService(Actor):
             raise RuntimeError("host has not passed ART runtime admission")
         key = (require_hybrid_ep, multinode)
         if key not in self._megatron_runtimes:
-            from art.megatron.runtime.managed import ensure_megatron_runtime
+            from art.megatron.runtime.managed import (
+                console_runtime_progress,
+                ensure_megatron_runtime,
+            )
 
             self._megatron_runtimes[key] = await asyncio.to_thread(
                 ensure_megatron_runtime,
                 art_build_sha256=self._admission_report.runtime.art_build_sha256,
                 require_hybrid_ep=require_hybrid_ep,
                 multinode=multinode,
+                progress=console_runtime_progress,
             )
         return self._megatron_runtimes[key]
 

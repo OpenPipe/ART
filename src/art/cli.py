@@ -1,5 +1,6 @@
 from pathlib import Path
 import socket
+import time
 from typing import Any
 
 from dotenv import load_dotenv
@@ -8,9 +9,117 @@ import typer
 load_dotenv()
 
 app = typer.Typer()
+runtime_app = typer.Typer(help="Prepare and inspect ART's managed GPU runtimes.")
+app.add_typer(runtime_app, name="runtime")
 
 
 SKILL_NAMES = ["train-sft", "train-rl"]
+
+
+def _format_bytes(value: int | None) -> str:
+    if value is None:
+        return "unknown"
+    amount = float(value)
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if amount < 1024 or unit == "TiB":
+            return f"{amount:.1f} {unit}"
+        amount /= 1024
+    raise AssertionError("unreachable")
+
+
+def _runtime_error_message(error: Exception) -> str:
+    if isinstance(error, ModuleNotFoundError) and error.name == "torch":
+        return (
+            "Megatron runtime commands require openpipe-art[megatron] on CUDA 12 "
+            "or openpipe-art[megatron-cu130] on CUDA 13"
+        )
+    return str(error)
+
+
+@runtime_app.command("status")
+def runtime_status(
+    hybrid_ep: bool = typer.Option(
+        False, "--hybrid-ep", help="Inspect the HybridEP Megatron variant."
+    ),
+    multinode: bool = typer.Option(
+        False, "--multinode", help="Inspect the multi-node HybridEP variant."
+    ),
+    size: bool = typer.Option(
+        True, "--size/--no-size", help="Measure active runtime cache disk use."
+    ),
+) -> None:
+    """Show selected CUDA profiles, runtime readiness, and cache storage."""
+    from art.runtime_diagnostics import (
+        inspect_megatron_runtime,
+        inspect_vllm_runtime,
+    )
+
+    try:
+        statuses = (
+            inspect_vllm_runtime(include_size=size),
+            inspect_megatron_runtime(
+                require_hybrid_ep=hybrid_ep or multinode,
+                multinode=multinode,
+                include_size=size,
+            ),
+        )
+    except Exception as error:
+        typer.echo(
+            f"Runtime inspection failed: {_runtime_error_message(error)}", err=True
+        )
+        raise typer.Exit(1) from None
+    for status in statuses:
+        state = "ready" if status.ready else "not prepared"
+        variant = f"/{status.variant}" if status.variant else ""
+        typer.echo(f"{status.name}: {state} ({status.profile}{variant}, {status.mode})")
+        if status.path:
+            typer.echo(f"  runtime: {status.path}")
+        if status.cache_root:
+            typer.echo(f"  cache: {status.cache_root}")
+            typer.echo(
+                f"  storage: {_format_bytes(status.disk_bytes)} used, "
+                f"{_format_bytes(status.free_bytes)} free, "
+                f"filesystem={status.filesystem or 'unknown'}"
+            )
+        if status.warning:
+            typer.echo(f"  warning: {status.warning}", err=True)
+
+
+@runtime_app.command("prepare")
+def runtime_prepare(
+    hybrid_ep: bool = typer.Option(
+        False, "--hybrid-ep", help="Prepare Megatron with HybridEP extensions."
+    ),
+    multinode: bool = typer.Option(
+        False,
+        "--multinode",
+        help="Prepare multi-node HybridEP; implies --hybrid-ep.",
+    ),
+) -> None:
+    """Install and validate the pinned vLLM and Megatron environments."""
+    from art.runtime_diagnostics import prepare_runtime_environments
+
+    started = time.perf_counter()
+    try:
+        prepared = prepare_runtime_environments(
+            require_hybrid_ep=hybrid_ep or multinode,
+            multinode=multinode,
+            progress=lambda message: typer.echo(f"ART runtime: {message}"),
+        )
+    except Exception as error:
+        typer.echo(
+            f"Runtime preparation failed: {_runtime_error_message(error)}", err=True
+        )
+        raise typer.Exit(1) from None
+    for runtime in prepared:
+        variant = f"/{runtime.variant}" if runtime.variant else ""
+        typer.echo(
+            f"{runtime.name}: ready ({runtime.profile}{variant}) in "
+            f"{runtime.elapsed_seconds:.1f}s at {runtime.path}"
+        )
+    typer.echo(
+        f"All requested runtimes are ready in {time.perf_counter() - started:.1f}s."
+    )
 
 
 def _get_skill_path(skill_name: str) -> Path:

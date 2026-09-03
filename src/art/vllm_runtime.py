@@ -10,13 +10,14 @@ import shlex
 import shutil
 import subprocess
 import tempfile
+import time
 from typing import Any, Callable, Literal, Mapping, TypedDict
 from urllib.parse import urlparse
 
 import httpx
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from .utils.cache_dirs import configure_model_cache_env
+from .utils.cache_dirs import configure_model_cache_env, network_cache_warning
 from .utils.lifecycle import (
     ChildProcessSupervisor,
     managed_process_cmd,
@@ -40,6 +41,15 @@ _TILELANG_PATH_MARKERS = ("/site-packages/tilelang/", "\\site-packages\\tilelang
 _FLASHINFER_WORKSPACE_ENV = "FLASHINFER_WORKSPACE_BASE"
 _ART_FLASHINFER_WORKSPACE_ENV = "ART_VLLM_RUNTIME_FLASHINFER_WORKSPACE_BASE"
 VLLM_RUNTIME_CLOSE_TIMEOUT = process_shutdown_timeout(1)
+
+
+def _console_progress(message: str) -> None:
+    print(f"ART runtime: {message}", flush=True)
+
+
+def _report_progress(progress: Callable[[str], None] | None, message: str) -> None:
+    if progress is not None:
+        progress(message)
 
 
 def _managed_runtime_extra() -> Literal["cuda12", "cuda13"]:
@@ -731,6 +741,7 @@ def _install_managed_runtime(
     cache_root: Path,
     manifest: VllmRuntimeManifest,
     manifest_hash: str,
+    progress: Callable[[str], None] | None = None,
 ) -> Path:
     runtime_wheel = bundle_dir / manifest.runtime_wheel
     if _sha256_file(runtime_wheel) != manifest.runtime_wheel_sha256:
@@ -745,6 +756,11 @@ def _install_managed_runtime(
     try:
         shutil.copy2(bundle_dir / manifest.pyproject, stage / "pyproject.toml")
         shutil.copy2(bundle_dir / manifest.lockfile, stage / "uv.lock")
+        started = time.perf_counter()
+        _report_progress(
+            progress,
+            f"installing vLLM {MANAGED_RUNTIME_EXTRA} dependencies in {cache_root}",
+        )
         _run_install_command(
             [
                 "uv",
@@ -757,6 +773,10 @@ def _install_managed_runtime(
                 "--no-install-project",
                 "--no-dev",
             ]
+        )
+        _report_progress(
+            progress,
+            f"installed vLLM dependencies in {time.perf_counter() - started:.1f}s",
         )
         if runtime_dir.exists():
             existing = _validate_managed_runtime(
@@ -774,6 +794,8 @@ def _install_managed_runtime(
         stage.rename(runtime_dir)
         promoted = True
         runtime_python = _runtime_python(runtime_dir)
+        started = time.perf_counter()
+        _report_progress(progress, "installing ART's pinned vLLM runtime server")
         _run_install_command(
             [
                 "uv",
@@ -784,6 +806,10 @@ def _install_managed_runtime(
                 str(runtime_python),
                 str(runtime_wheel),
             ]
+        )
+        _report_progress(
+            progress,
+            f"installed vLLM runtime server in {time.perf_counter() - started:.1f}s",
         )
         runtime_bin = _runtime_bin(runtime_dir)
         if not _is_executable_file(runtime_bin):
@@ -807,7 +833,7 @@ def _install_managed_runtime(
         raise
 
 
-def ensure_vllm_runtime() -> Path:
+def ensure_vllm_runtime(*, progress: Callable[[str], None] | None = None) -> Path:
     configure_model_cache_env()
     bundle_dir = _bundled_runtime_dir()
     manifest = _load_bundled_manifest(bundle_dir)
@@ -826,12 +852,16 @@ def ensure_vllm_runtime() -> Path:
         )
         if existing is not None:
             _cleanup_old_managed_runtimes(cache_root, keep_hash=manifest_hash)
+            _report_progress(progress, f"using cached vLLM runtime at {runtime_dir}")
             return existing
+        if warning := network_cache_warning(cache_root):
+            _report_progress(progress, f"Warning: {warning}")
         return _install_managed_runtime(
             bundle_dir=bundle_dir,
             cache_root=cache_root,
             manifest=manifest,
             manifest_hash=manifest_hash,
+            progress=progress,
         )
 
 
@@ -846,7 +876,9 @@ def _resolve_vllm_runtime_python() -> Path:
     return _runtime_python(runtime_dir)
 
 
-def _runtime_command_prefix() -> list[str]:
+def _runtime_command_prefix(
+    *, progress: Callable[[str], None] | None = None
+) -> list[str]:
     override = os.environ.get("ART_VLLM_RUNTIME_BIN")
     if override:
         command = shlex.split(override)
@@ -866,7 +898,7 @@ def _runtime_command_prefix() -> list[str]:
             "vLLM runtime env is not built. Run `uv sync` in "
             f"{runtime_root} or set ART_VLLM_RUNTIME_BIN."
         )
-    return [str(ensure_vllm_runtime())]
+    return [str(ensure_vllm_runtime(progress=progress))]
 
 
 def build_vllm_runtime_server_cmd(config: VllmRuntimeLaunchConfig) -> list[str]:
@@ -874,7 +906,7 @@ def build_vllm_runtime_server_cmd(config: VllmRuntimeLaunchConfig) -> list[str]:
         key: value for key, value in config.server_args.items() if key != "api_key"
     }
     command = [
-        *_runtime_command_prefix(),
+        *_runtime_command_prefix(progress=_console_progress),
         f"--model={config.base_model}",
         f"--port={config.port}",
         f"--host={config.host}",
