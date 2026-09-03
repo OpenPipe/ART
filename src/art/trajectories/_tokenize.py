@@ -522,6 +522,22 @@ def _prove_exact_sampled_assistant_span(
     return start, end
 
 
+def _prove_exact_length_stopped_assistant_prefix(
+    matches: Sequence[tuple[int, int]],
+    assistant_mask: Sequence[bool],
+    *,
+    expected_start: int,
+) -> tuple[int, int] | None:
+    """Prove sampled content before a separately validated renderer stop tail."""
+
+    if len(matches) != 1 or matches[0][0] != expected_start:
+        return None
+    start, end = matches[0]
+    if not all(assistant_mask[start:end]) or (start > 0 and assistant_mask[start - 1]):
+        return None
+    return start, end
+
+
 def _rendered_flag(assistant: bool, output: bool, stop: bool) -> TokenFlag:
     flag = TokenFlag.ASSISTANT if assistant else TokenFlag(0)
     if output:
@@ -5215,6 +5231,19 @@ def _tokenize_chat_view(
                 else marked_bounds.get(message_index)
                 or probed_bounds.get(message_index)
             )
+            if (
+                bounds is None
+                and position + 1 < len(sampled_message_indices)
+                and source_matches_context(source)
+            ):
+                prompt = source_prompt_tokens(source)
+                output, _ = source_output_tokens(source)
+                if prompt is not None and output:
+                    bounds = _prove_exact_length_stopped_assistant_prefix(
+                        locations(output, 0),
+                        assistant_mask,
+                        expected_start=len(prompt),
+                    )
             next_prompt_end: int | None
             if position + 1 < len(sampled_message_indices):
                 next_message_index = sampled_message_indices[position + 1]

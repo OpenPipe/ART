@@ -566,7 +566,7 @@ def test_exact_coverage_stops_at_a_duplicated_length_terminator() -> None:
     assert not tokenized.flags[4] & tr.TokenFlag.EXACT
 
 
-def test_terminal_length_stays_synthetic_after_an_earlier_length_stop() -> None:
+def test_terminal_length_stays_exact_after_an_earlier_length_stop() -> None:
     first = _chat_exchange([1], [2])
     first.response.choices[0].finish_reason = "length"
     second = _chat_exchange([1, 2, 9, 3], [4, 9], offset=1)
@@ -576,10 +576,10 @@ def test_terminal_length_stays_synthetic_after_an_earlier_length_stop() -> None:
         exchanges=TrajectoryExchanges(chat_completions=[first, second])
     ).tokenize(tokenizer=_StopTokenizer())
 
-    assert tokenized.tokens == [1, 2, 9, 3, 4, 9, 9]
+    assert tokenized.tokens == [1, 2, 9, 3, 4, 9]
     assert tokenized.flags[-2:] == [
         _SAMPLED_ASSISTANT_OUTPUT,
-        tr.TokenFlag.STOP,
+        _SAMPLED_ASSISTANT_OUTPUT,
     ]
 
 
@@ -634,6 +634,47 @@ def test_exact_output_boundaries_survive_prefix_order_drift_and_length_stop() ->
         match="Could not prove a sampled history message boundary",
     ):
         history.tokenize(tokenizer=tokenizer, chat_template="explicit override")
+
+
+def test_exact_length_boundary_with_multiple_assistant_parts() -> None:
+    first = _chat_exchange([1], [2, 9])
+    second = _chat_exchange([1, 2, 9, 3], [4, 5], offset=1)
+    second_data = second.response.model_dump(mode="python")
+    second_data["choices"][0]["finish_reason"] = "length"
+    second_data["choices"][0]["message"] = {
+        "role": "assistant",
+        "reasoning_content": "reason",
+        "content": "answer",
+    }
+    second.response = ChatCompletion.model_validate(second_data)
+    third = _chat_exchange([1, 2, 9, 3, 4, 5, 9, 6], [7, 9], offset=2)
+    third.request["messages"] = [
+        first.request["messages"][0],
+        first.response.choices[0].message.model_dump(mode="python", exclude_none=True),
+        second.request["messages"][-1],
+        second.response.choices[0].message.model_dump(mode="python", exclude_none=True),
+        third.request["messages"][-1],
+    ]
+    history = art.Trajectory(
+        exchanges=TrajectoryExchanges(chat_completions=[first, second, third])
+    ).chat_completions_history()
+    tokenizer = _BoundaryTokenizer(
+        ("user", [8]),
+        ("assistant", [2, 9]),
+        ("user", [3]),
+        ("assistant", [4, 5, 9]),
+        ("user", [6]),
+        ("assistant", [7, 9]),
+    )
+
+    tokenized = history.tokenize(tokenizer=tokenizer)
+
+    assert tokenized.tokens == [1, 2, 9, 3, 4, 5, 9, 6, 7, 9]
+    assert tokenized.flags[4:7] == [
+        _SAMPLED_ASSISTANT_OUTPUT,
+        _SAMPLED_ASSISTANT_OUTPUT,
+        tr.TokenFlag.EXACT | tr.TokenFlag.STOP,
+    ]
 
 
 def test_public_exact_chain_preserves_raw_drift_across_proven_length_boundary() -> None:
