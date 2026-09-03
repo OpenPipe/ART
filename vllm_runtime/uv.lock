@@ -155,6 +155,7 @@ dependencies = [
 
 [package.optional-dependencies]
 cuda12 = [
+    { name = "nixl-cu12", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
     { name = "nvidia-nccl-cu12", marker = "sys_platform == 'linux'" },
     { name = "torch", version = "2.11.0+cu128", source = { registry = "https://download.pytorch.org/whl/cu128" }, marker = "sys_platform == 'linux'" },
     { name = "torchaudio", version = "2.11.0+cu128", source = { registry = "https://download.pytorch.org/whl/cu128" }, marker = "sys_platform == 'linux'" },
@@ -162,6 +163,7 @@ cuda12 = [
     { name = "vllm", version = "0.25.1+cu129", source = { url = "https://github.com/vllm-project/vllm/releases/download/v0.25.1/vllm-0.25.1%2Bcu129-cp38-abi3-manylinux_2_28_x86_64.whl" }, marker = "sys_platform == 'linux'" },
 ]
 cuda13 = [
+    { name = "nixl-cu13", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
     { name = "nvidia-nccl-cu13", marker = "sys_platform == 'linux'" },
     { name = "torch", version = "2.11.0+cu130", source = { registry = "https://download.pytorch.org/whl/cu130" }, marker = "sys_platform == 'linux'" },
     { name = "torchaudio", version = "2.11.0+cu130", source = { registry = "https://download.pytorch.org/whl/cu130" }, marker = "sys_platform == 'linux'" },
@@ -172,6 +174,8 @@ cuda13 = [
 
 [package.metadata]
 requires-dist = [
+    { name = "nixl-cu12", marker = "platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'cuda12'", specifier = "==1.3.2" },
+    { name = "nixl-cu13", marker = "platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'cuda13'", specifier = "==1.3.2" },
     { name = "nvidia-nccl-cu12", marker = "sys_platform == 'linux' and extra == 'cuda12'", specifier = "==2.28.9" },
     { name = "nvidia-nccl-cu13", marker = "sys_platform == 'linux' and extra == 'cuda13'", specifier = "==2.28.9" },
     { name = "openai", specifier = "==2.53.0" },
@@ -1423,6 +1427,32 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/95/97/51359c77527d45943fe7a94d00a3843b81162e6c4244b3579fe8fc54cb9c/ninja-1.13.0-py3-none-win32.whl", hash = "sha256:8cfbb80b4a53456ae8a39f90ae3d7a2129f45ea164f43fadfa15dc38c4aef1c9", size = 267201, upload-time = "2025-08-11T15:10:15.158Z" },
     { url = "https://files.pythonhosted.org/packages/29/45/c0adfbfb0b5895aa18cec400c535b4f7ff3e52536e0403602fc1a23f7de9/ninja-1.13.0-py3-none-win_amd64.whl", hash = "sha256:fb8ee8719f8af47fed145cced4a85f0755dd55d45b2bddaf7431fa89803c5f3e", size = 309975, upload-time = "2025-08-11T15:10:16.697Z" },
     { url = "https://files.pythonhosted.org/packages/df/93/a7b983643d1253bb223234b5b226e69de6cda02b76cdca7770f684b795f5/ninja-1.13.0-py3-none-win_arm64.whl", hash = "sha256:3c0b40b1f0bba764644385319028650087b4c1b18cdfa6f45cb39a3669b81aa9", size = 290806, upload-time = "2025-08-11T15:10:18.018Z" },
+]
+
+[[package]]
+name = "nixl-cu12"
+version = "1.3.2"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "numpy", marker = "sys_platform != 'darwin'" },
+    { name = "torch", version = "2.11.0+cu128", source = { registry = "https://download.pytorch.org/whl/cu128" }, marker = "sys_platform != 'darwin'" },
+]
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/b0/28/8ba9eab9faa5f9455d8ebd322630398573f4e109b84ef8615d85d4bca3b4/nixl_cu12-1.3.2-cp312-cp312-manylinux_2_28_aarch64.whl", hash = "sha256:ea79ec205168cf819614127265ce1fff1e61d9d126d6d56cbd1ecaa29c980723", size = 80286069, upload-time = "2026-07-24T20:14:48.56Z" },
+    { url = "https://files.pythonhosted.org/packages/f8/d3/2964339654b3fe85e7aa62fdce4da3b97ee40337f3b72466aa79251f1196/nixl_cu12-1.3.2-cp312-cp312-manylinux_2_28_x86_64.whl", hash = "sha256:ef8ccdffcd54978e8a799de59287efcb3af0b7ba3bf02e04bc4df4c842f1f569", size = 82188539, upload-time = "2026-07-24T20:12:52.953Z" },
+]
+
+[[package]]
+name = "nixl-cu13"
+version = "1.3.2"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "numpy", marker = "sys_platform != 'darwin'" },
+    { name = "torch", version = "2.11.0+cu130", source = { registry = "https://download.pytorch.org/whl/cu130" }, marker = "sys_platform != 'darwin'" },
+]
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/a0/2f/154a40352b7b6cb5afc41e1b794821c9631974712a6536ade78ef681a0b6/nixl_cu13-1.3.2-cp312-cp312-manylinux_2_28_aarch64.whl", hash = "sha256:5c3f5c1265fcec50f608a56fe828fad892322a1170755cdade9cc37c6545bb73", size = 64425110, upload-time = "2026-07-24T20:18:51.96Z" },
+    { url = "https://files.pythonhosted.org/packages/99/d8/5768b907b85d8856c07674ddd0ffeb736ed987ff530a12e8f17a273cab3b/nixl_cu13-1.3.2-cp312-cp312-manylinux_2_28_x86_64.whl", hash = "sha256:22fcd7183b2cd831b3da781c9e9991c5f6ef77a238ee6b7ac05d42558ea469a9", size = 66330361, upload-time = "2026-07-24T20:16:38.296Z" },
 ]
 
 [[package]]

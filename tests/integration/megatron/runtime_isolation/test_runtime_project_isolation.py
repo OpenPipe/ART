@@ -85,6 +85,25 @@ def test_runtime_project_imports_in_its_own_project_env(artifact_dir: Path) -> N
     assert payload == {"runtime_ok": True, "has_vllm": True}
 
 
+def test_dedicated_runtime_does_not_import_art_product(
+    artifact_dir: Path,
+) -> None:
+    payload = json.loads(
+        _runtime_python(
+            "import builtins, json; "
+            "real_import = builtins.__import__; "
+            "builtins.__import__ = lambda name, *args, **kwargs: "
+            "(_ for _ in ()).throw(AssertionError(name)) "
+            "if name.split('.')[0] == 'art' else real_import(name, *args, **kwargs); "
+            "import art_vllm_runtime.dedicated_server; "
+            "print(json.dumps({'imported': True}))",
+            artifact_dir,
+            "dedicated_runtime_import",
+        )
+    )
+    assert payload == {"imported": True}
+
+
 def test_runtime_server_source_contains_only_required_custom_routes() -> None:
     source = (
         ROOT / "vllm_runtime" / "src" / "art_vllm_runtime" / "dedicated_server.py"

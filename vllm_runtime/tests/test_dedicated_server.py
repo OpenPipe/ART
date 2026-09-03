@@ -5,26 +5,34 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock
 
-from art_vllm_runtime import dedicated_server
+from art_vllm_runtime import dedicated_server, route_contracts
 from art_vllm_runtime.fast_metrics import FAST_METRIC_NAMES, FastMetricsSidecar
 from art_vllm_runtime.local_route_store import LocalRouteStore
+from art_vllm_runtime.route_contracts import (
+    ART_PRIVATE_ROUTE_SOURCE_PREPARE_PATH,
+    ART_PRIVATE_ROUTE_SOURCE_RELEASE_PREFIX,
+    HOLDER_ROUTE_RESPONSE_MEDIA_TYPE,
+    HolderRouteSourceObject,
+    HolderRouteSourceRequest,
+    LocalTransferEndpoint,
+    NixlMemorySource,
+    NixlRouteTransfer,
+    holder_route_source_operation_id,
+)
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 import numpy as np
 import pytest
 from starlette.datastructures import URL
 
-from art.distributed.adapter_transport import NixlMemorySource
-from art.distributed.specs import LocalTransferEndpoint
 from art.serving_capabilities import PairedInferenceEndpoint, ServingProfile
 from art.vllm_route_transport import (
-    ART_PRIVATE_ROUTE_SOURCE_PREPARE_PATH,
-    ART_PRIVATE_ROUTE_SOURCE_RELEASE_PREFIX,
-    HOLDER_ROUTE_RESPONSE_MEDIA_TYPE,
-    HolderRouteSourceObject,
-    HolderRouteSourceRequest,
-    NixlRouteTransfer,
-    holder_route_source_operation_id,
+    HolderRouteResponseEnvelope as ArtHolderRouteResponseEnvelope,
+)
+from art.vllm_route_transport import (
+    HolderRouteSourceReceipt as ArtHolderRouteSourceReceipt,
+)
+from art.vllm_route_transport import (
     retained_holder_route_bundle_from_response,
 )
 
@@ -733,6 +741,7 @@ async def test_private_route_source_registers_acknowledged_holder_bytes(
     assert len(encoded.body) < len(payload)
     assert sentinel not in encoded.body
     assert encoded.object_ref is not None
+    ArtHolderRouteResponseEnvelope.model_validate_json(encoded.body)
     completion, bundle = retained_holder_route_bundle_from_response(
         encoded.body,
         request_id=request_identity,
@@ -769,7 +778,7 @@ async def test_private_route_source_registers_acknowledged_holder_bytes(
     objects = (
         HolderRouteSourceObject(
             request_id=request_identity,
-            object=service_ref,
+            object=service_ref.model_dump(mode="json"),
             lease_id="service-route-lease",
         ),
     )
@@ -822,6 +831,7 @@ async def test_private_route_source_registers_acknowledged_holder_bytes(
 
     assert receipt.backend == "nixl"
     assert receipt.nixl == publisher.transfer
+    ArtHolderRouteSourceReceipt.model_validate(receipt.model_dump(mode="json"))
     assert await responses.prepare_source(request, store) == receipt
     assert published == [payload]
     with pytest.raises(RuntimeError, match="active source"):
@@ -831,6 +841,46 @@ async def test_private_route_source_registers_acknowledged_holder_bytes(
     assert not await responses.release_source(receipt)
     assert await responses.discard(request_identity) == len(payload)
     assert not os.path.exists(ref.locator)
+
+
+@pytest.mark.asyncio
+async def test_runtime_nixl_route_source_owns_registration(monkeypatch) -> None:
+    deregistered = []
+
+    class Sync:
+        NIXL_THREAD_SYNC_STRICT = "strict"
+
+    class Config:
+        def __init__(self, **values) -> None:
+            self.values = values
+
+    class Agent:
+        def __init__(self, name, config) -> None:
+            self.name = name
+            assert config.values["backends"] == ["UCX"]
+
+        def register_memory(self, blocks, *, backends):
+            assert len(blocks) == 1 and backends == ["UCX"]
+            return "registration"
+
+        def get_agent_metadata(self):
+            return b"agent-metadata"
+
+        def deregister_memory(self, registration, *, backends) -> None:
+            deregistered.append((registration, backends))
+
+    monkeypatch.setattr(route_contracts, "_load_nixl", lambda: (Agent, Config, Sync))
+    publisher = route_contracts.register_retained_route_nixl_source(
+        bytearray(b"route-bytes"),
+        stream_id="batch:routes",
+        target_host_id="trainer",
+    )
+
+    assert publisher.transfer.source.byte_count == len(b"route-bytes")
+    assert publisher.transfer.target_host_id == "trainer"
+    await publisher.close()
+    await publisher.close()
+    assert deregistered == [("registration", ["UCX"])]
 
 
 @pytest.mark.asyncio

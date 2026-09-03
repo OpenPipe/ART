@@ -24,20 +24,6 @@ from starlette.datastructures import Headers
 from starlette.types import Receive, Scope, Send
 from vllm.entrypoints.serve.utils.server_utils import AuthenticationMiddleware
 
-from art.distributed.specs import PairedTransferIdentity
-from art.vllm_route_transport import (
-    ART_PRIVATE_ROUTE_SOURCE_PREPARE_PATH,
-    ART_PRIVATE_ROUTE_SOURCE_RELEASE_PREFIX,
-    HOLDER_ROUTE_RESPONSE_MEDIA_TYPE,
-    HolderRouteResponseEnvelope,
-    HolderRouteSourceReceipt,
-    HolderRouteSourceRequest,
-    LocalRouteObjectView,
-    NixlRoutePublisher,
-    RouteBundleObjectRef,
-    register_retained_route_nixl_source,
-    retained_route_bundle_from_parts,
-)
 from art_vllm_runtime.binary_routes import (
     PIPELINE_ROUTES_ENV,
     PIPELINE_ROUTES_PROTOCOL,
@@ -50,6 +36,21 @@ from art_vllm_runtime.patches import apply_vllm_runtime_patches
 from art_vllm_runtime.resource_usage import (
     bind_runtime_usage_context,
     drain_runtime_usage,
+)
+from art_vllm_runtime.route_contracts import (
+    ART_PRIVATE_ROUTE_SOURCE_PREPARE_PATH,
+    ART_PRIVATE_ROUTE_SOURCE_RELEASE_PREFIX,
+    HOLDER_ROUTE_RESPONSE_MEDIA_TYPE,
+    HolderRouteResponseEnvelope,
+    HolderRouteSourceReceipt,
+    HolderRouteSourceRequest,
+    LocalRouteObjectView,
+    NixlRoutePublisher,
+    PairedTransferIdentity,
+    RouteBundleObjectRef,
+    complete_to_thread,
+    holder_route_layout_from_parts,
+    register_retained_route_nixl_source,
 )
 from art_vllm_runtime.runtime_usage import (
     RuntimeRequestContext,
@@ -415,8 +416,6 @@ class _PrivateRouteResponses:
                     ),
                 )
             else:
-                from art.utils.lifecycle import complete_to_thread
-
                 payload, cancelled = await complete_to_thread(
                     lambda: store.read_many(tuple(refs))
                 )
@@ -908,7 +907,7 @@ def _encode_private_route_response(
     if not isinstance(owner_id, str) or not owner_id:
         raise RuntimeError("runtime source identity is unavailable")
     route_payload, num_experts, choices = encode_routed_experts_payload(routes)
-    completion, payload = retained_route_bundle_from_parts(
+    completion, layout = holder_route_layout_from_parts(
         response_body,
         route_payload,
         choices,
@@ -922,7 +921,7 @@ def _encode_private_route_response(
         envelope = HolderRouteResponseEnvelope(
             response=completion,
             object=RouteBundleObjectRef.model_validate(object_ref),
-            layout=payload.layout,
+            layout=layout,
         )
         body = envelope.model_dump_json(exclude_none=True).encode()
     except BaseException:
