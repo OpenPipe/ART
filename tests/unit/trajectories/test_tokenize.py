@@ -465,6 +465,59 @@ def test_length_stop_without_a_template_terminator_does_not_raise() -> None:
     assert not any(flag & tr.TokenFlag.STOP for flag in tokenized.flags)
 
 
+def test_adjacent_seeded_and_response_assistant_output_are_distinguished() -> None:
+    response = ChatCompletion.model_validate(
+        {
+            "id": "chat-adjacent-assistant",
+            "object": "chat.completion",
+            "created": 0,
+            "model": "test/model",
+            "choices": [
+                {
+                    "index": 0,
+                    "finish_reason": "stop",
+                    "message": {"role": "assistant", "content": "answer"},
+                }
+            ],
+        }
+    )
+    exchange = ChatCompletionsExchange(
+        request=ChatCompletionsRequest(
+            model="test/model",
+            messages=[{"role": "assistant", "content": "seed"}],
+        ),
+        response=response,
+        start_time=datetime(2026, 1, 1),
+        end_time=datetime(2026, 1, 1) + timedelta(milliseconds=1),
+    )
+
+    class Tokenizer:
+        def __call__(self, text: str, **kwargs: object) -> list[int]:
+            del kwargs
+            return [ord(character) for character in text]
+
+        def apply_chat_template(
+            self, messages: list[dict[str, Any]], **kwargs: object
+        ) -> list[int]:
+            del kwargs
+            return [
+                ord(character)
+                for message in messages
+                for character in cast(str, message.get("content") or "")
+            ]
+
+    tokenized = art.Trajectory(
+        exchanges=TrajectoryExchanges(chat_completions=[exchange])
+    ).tokenize(tokenizer=Tokenizer())
+
+    seed_length = len("seed")
+    assert all(flag == tr.TokenFlag.ASSISTANT for flag in tokenized.flags[:seed_length])
+    assert all(
+        flag == tr.TokenFlag.ASSISTANT | tr.TokenFlag.OUTPUT
+        for flag in tokenized.flags[seed_length:]
+    )
+
+
 def test_length_stop_mapping_allows_another_assistant_without_a_stop() -> None:
     first = _chat_exchange([1], [2])
     second = _chat_exchange([1, 2, 3], [4], offset=1)

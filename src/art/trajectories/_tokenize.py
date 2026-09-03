@@ -583,8 +583,36 @@ def _response_output_mask(
     messages: Sequence[Mapping[str, object]],
     sources: Sequence[object | None],
     assistant_mask: Sequence[bool],
+    message_bounds: Sequence[tuple[int, int]] | None = None,
 ) -> list[bool]:
     """Mark assistant spans backed by concrete exchange responses."""
+
+    result = [False] * len(assistant_mask)
+    if message_bounds is not None:
+        if len(message_bounds) != len(messages):
+            raise ValueError("Message bounds differ in length from messages")
+        for message, source, (start, end) in zip(
+            messages, sources, message_bounds, strict=True
+        ):
+            if (
+                message.get("role") == "assistant"
+                and source is not None
+                and _source_is_sampled(source)
+            ):
+                result[start:end] = [True] * (end - start)
+        # A direct content render can gain one template-owned role stop above.
+        # Attribute that tail to the final assistant response without merging
+        # adjacent assistant messages with different provenance.
+        if messages and messages[-1].get("role") == "assistant":
+            start = message_bounds[-1][1]
+            source = sources[-1]
+            if (
+                source is not None
+                and _source_is_sampled(source)
+                and all(assistant_mask[start:])
+            ):
+                result[start:] = [True] * (len(result) - start)
+        return result
 
     assistant_sources = [
         source
@@ -602,7 +630,6 @@ def _response_output_mask(
             end += 1
         spans.append((start, end))
         start = end
-    result = [False] * len(assistant_mask)
     if len(spans) != len(assistant_sources):
         # Some minimal/custom templates concatenate adjacent assistant items.
         # That loses the boundary between those items, but attribution remains
@@ -4690,6 +4717,7 @@ def _tokenize_chat_view(
         messages,
         history.message_sources,
         canonical_assistant_mask,
+        direct_bounds or None,
     )
     assistant_mask = _translate_token_mask(
         canonical_rendered, rendered, canonical_assistant_mask

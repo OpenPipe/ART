@@ -126,6 +126,17 @@ def test_first_occurrence_masks_partition_models_and_accept_generators() -> None
     assert not hasattr(art, "first_occurrence_masks")
 
 
+def test_first_occurrence_preview_does_not_mutate_trie() -> None:
+    trie = tr._FirstOccurrenceTrie()
+
+    assert trie.mask("model", [1, 2], [0, 0], claim=False) == [True, True]
+    assert trie._roots == {}
+    assert trie.mask("model", [1], [0]) == [True]
+    root = trie._roots["model"]
+    assert trie.mask("model", [1, 2, 3], [0, 0, 0], claim=False) == [False, True, True]
+    assert 2 not in root.children[1].children
+
+
 def test_tensorized_first_occurrence_masks_match_tokenized() -> None:
     histories = [
         _tokenized([1, 2], [tr.TokenFlag(0), tr.TokenFlag.OUTPUT]),

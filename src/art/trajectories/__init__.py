@@ -1629,15 +1629,33 @@ class _FirstOccurrenceTrie:
         where: TokenFlag | None = None,
         claim: bool = True,
     ) -> list[bool]:
-        node = self._roots.setdefault(model, _TokenPrefixNode())
         result: list[bool] = []
         sentinel = int(where) if where is not None else None
+        if not claim:
+            node = self._roots.get(model)
+            missing = node is None
+            for token, flag in zip(tokens, flags, strict=True):
+                if not missing:
+                    assert node is not None
+                    child = node.children.get(int(token))
+                    missing = child is None
+                    if child is not None:
+                        node = child
+                eligible = sentinel is None or bool(int(flag) & sentinel)
+                if missing:
+                    result.append(eligible)
+                else:
+                    assert node is not None
+                    result.append(eligible and not node.claimed)
+            return result
+
+        node = self._roots.setdefault(model, _TokenPrefixNode())
         for token, flag in zip(tokens, flags, strict=True):
             node = node.children.setdefault(int(token), _TokenPrefixNode())
             eligible = sentinel is None or bool(int(flag) & sentinel)
             first = eligible and not node.claimed
             result.append(first)
-            if first and claim:
+            if first:
                 node.claimed = True
         return result
 

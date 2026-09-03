@@ -4,7 +4,7 @@ from collections.abc import Mapping
 from datetime import datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
-from typing import SupportsIndex, cast, overload
+from typing import Any, SupportsIndex, cast, overload
 from unittest.mock import patch
 
 import numpy as np
@@ -339,14 +339,24 @@ def test_training_tokenizes_each_exchange_trajectory_once(
     )
     assert calls == len(group.trajectories)
 
-    calls = 0
+    public_calls = 0
+    original_public = art.Trajectory.tokenize
+
+    def counted_public(
+        self: art.Trajectory, *args: Any, **kwargs: Any
+    ) -> TokenizedMultiHistoryTrajectory:
+        nonlocal public_calls
+        public_calls += 1
+        return cast(TokenizedMultiHistoryTrajectory, original_public(self, *args, **kwargs))
+
+    monkeypatch.setattr(art.Trajectory, "tokenize", counted_public)
     trajectory_groups_to_datums(
         [group],
         renderer=None,
         tokenizer=None,
         model="policy",
     )
-    assert calls == len(group.trajectories)
+    assert public_calls == len(group.trajectories)
 
 
 def test_overlength_history_does_not_claim_sources_from_fitting_history() -> None:
