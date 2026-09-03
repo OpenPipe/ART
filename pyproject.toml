@@ -103,6 +103,7 @@ megatron = [
     "torchmonarch==0.6.0",
     "transformers==5.12.1",
     "uv>=0.11.7",
+    "wandb==0.28.0",
 ]
 megatron-cu130 = [
     "aiohttp>=3.13.0",
@@ -114,6 +115,7 @@ megatron-cu130 = [
     "torchmonarch==0.6.0",
     "transformers==5.12.1",
     "uv>=0.11.7",
+    "wandb==0.28.0",
 ]
 
 langgraph = [
