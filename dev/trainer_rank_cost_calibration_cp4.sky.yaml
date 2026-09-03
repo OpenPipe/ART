@@ -25,7 +25,8 @@ envs:
   RUN_ID: unset
   REPEAT: "8"
   # "main" = GRPO/hetero/attention cells; "hetero-ellavox" = heterogeneous
-  # variants and Ellavox groups (second campaign).
+  # variants and Ellavox groups (second campaign); "ellavox" = the Ellavox
+  # groups in ELLAVOX_GROUPS only (e.g. re-measuring single groups).
   CELL_SET: main
   ELLAVOX_GROUPS: "0 1 2 3 4 5 6 7"
 
@@ -76,9 +77,11 @@ run: |
     run_cell cal-grpo-g8-long Qwen/Qwen3-4B   2
     run_cell cal-grpo-g8      Qwen/Qwen3-4B   0
   else
-    run_cell cal-hetero2 Qwen/Qwen3.5-4B 0
-    run_cell cal-hetero3 Qwen/Qwen3.5-4B 0
-    run_cell cal-hetero2 Qwen/Qwen3-4B   0
+    if [ "${CELL_SET}" = "hetero-ellavox" ]; then
+      run_cell cal-hetero2 Qwen/Qwen3.5-4B 0
+      run_cell cal-hetero3 Qwen/Qwen3.5-4B 0
+      run_cell cal-hetero2 Qwen/Qwen3-4B   0
+    fi
     for g in ${ELLAVOX_GROUPS}; do
       run_cell cal-ellavox Qwen/Qwen3.5-4B 0 "$g"
     done

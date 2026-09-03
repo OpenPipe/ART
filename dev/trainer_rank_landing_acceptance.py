@@ -1090,6 +1090,22 @@ def _gather_objects(value: Any, group: Any = None) -> list[Any]:
     return values
 
 
+def _merge_rank_statuses(gathered: list[list[str]]) -> list[str]:
+    return sorted({str(status) for statuses in gathered for status in statuses})
+
+
+def _world_compile_statuses(watch: Any) -> list[str]:
+    """Compile statuses of the last forward on every rank (sorted, unique).
+
+    Compile telemetry is per process: a rank whose local shapes differ can
+    recompile while its peers do not. Any decision that steers the next
+    forward (warm-up completion, compile-free gates) must be taken from the
+    world-wide view, or the ranks run different layouts and their collectives
+    deadlock (issue #840).
+    """
+    return _merge_rank_statuses(_gather_objects(watch.take()))
+
+
 def _plan_fingerprint(
     rank: Any, requests: list[Any], checkpoint: Any
 ) -> dict[str, Any]:
@@ -1335,7 +1351,7 @@ def phase_tp2_public(
                 "planning_ms": float(telemetry["planning_ms"]),
                 "packed_tokens": int(fingerprint["packed_tokens"]),
                 "group_lengths": list(fingerprint["group_lengths"]),
-                "compile_statuses": watch.take(),
+                "compile_statuses": _world_compile_statuses(watch),
             }
             del outputs, loss
             rank.zero_grad()
@@ -1904,6 +1920,20 @@ CALIBRATION_MAX_WARMUPS = 8
 CALIBRATION_MIN_WARMUPS = 2
 
 
+def _warmup_complete(attempt: int, statuses: list[str]) -> bool:
+    """Whether a candidate's warm-up may stop after 0-based ``attempt``.
+
+    ``statuses`` must be the world-wide compile statuses of that attempt
+    (``_world_compile_statuses``); the decision selects every rank's next
+    forward, so it has to be identical on all ranks.
+    """
+    return (
+        attempt + 1 >= CALIBRATION_MIN_WARMUPS
+        and bool(statuses)
+        and all(status == "none" for status in statuses)
+    )
+
+
 def _gdn_layer_count(model: Any) -> int:
     try:
         from megatron.core.ssm.gated_delta_net import GatedDeltaNet
@@ -2000,9 +2030,10 @@ def phase_cost_calibrate(
 ) -> None:
     """Time every mandatory candidate layout of one cell (GPU).
 
-    Per candidate: warm up until a forward is compile-free (bounded), then
-    ``repeat`` measured rounds in a rotating candidate order so drift is
-    balanced across candidates. Each measured row records max-rank forward +
+    Per candidate: warm up until a forward is compile-free on every rank
+    (bounded; the decision is taken from world-wide compile telemetry so all
+    ranks run the same layout sequence), then ``repeat`` measured rounds in a
+    rotating candidate order so drift is balanced across candidates. Each measured row records max-rank forward +
     backward wall time, compile status, plan-cache planning time, peak memory,
     subforward count (split rows are excluded from fitting), the candidate's
     layout features and labels, and the topology and model facts.
@@ -2194,7 +2225,7 @@ def phase_cost_calibrate(
                 "admission_failed": False,
                 "ms_max_rank": float(ms.item()),
                 "ms_local": local_ms,
-                "compile_statuses": watch.take(),
+                "compile_statuses": _world_compile_statuses(watch),
                 "planning_ms": float(telemetry["planning_ms"]),
                 "selected_max_depth": int(telemetry["selected_max_depth"]),
                 "subforward_count": int(telemetry["subforward_count"]),
@@ -2224,12 +2255,7 @@ def phase_cost_calibrate(
                 )
                 if result.get("admission_failed"):
                     break
-                statuses = cast(list, result["compile_statuses"])
-                if (
-                    attempt + 1 >= CALIBRATION_MIN_WARMUPS
-                    and statuses
-                    and all(status == "none" for status in statuses)
-                ):
+                if _warmup_complete(attempt, cast(list, result["compile_statuses"])):
                     live.append(label)
                     break
             else:
