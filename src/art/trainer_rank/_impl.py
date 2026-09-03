@@ -50,7 +50,11 @@ from art.megatron.prefix_tree_packing import (
     _local_position_pairs,
     estimate_prefix_tree_packed_tokens,
 )
-from art.trainer_rank._planner_cost import coefficient_version_for
+from art.trainer_rank._planner_cost import (
+    ModelGeometry,
+    ParallelShape,
+    select_scoring,
+)
 from art.trainer_rank._prefix_tree_materializer import materialize_prefix_tree_layout
 from art.trainer_rank._prefix_tree_planner import (
     CanonicalPrefixTree,
@@ -866,7 +870,8 @@ type _RowMatch = tuple[torch.Tensor, torch.Tensor, tuple[int, ...]]
 @dataclass(frozen=True)
 class _MemorySignature:
     topology: tuple[int, int, int, int]
-    planner_coefficients: int
+    # (coefficient version, calibrated table id): the score that planned it.
+    planner_coefficients: tuple[int, str | None]
     slot_group_count: int
     request_mix: tuple[str, ...]
     grad_enabled: bool
@@ -1044,12 +1049,18 @@ class _PlannerFacts(NamedTuple):
     layers: int
     gdn_layers: int
     uses_gdn: bool
-    # Score version for this runtime: the fitted table inside its calibrated
-    # capability profile, the fallback outside it (see coefficient_version_for).
+    # Expert parallelism (MoE models): EP and expert-TP sizes. Not priced by
+    # the current terms, but part of the execution class and the cache key.
+    ep_size: int
+    etp_size: int
+    # Score for this runtime: a fitted table inside its calibrated execution
+    # class (version 2, identified by table id), the fallback outside it
+    # (version 1); see select_scoring.
     coefficient_version: int
+    coefficient_table: str | None
 
 
-# Content hash, planner facts (including the coefficient version), anchor.
+# Content hash, planner facts (including the score identity), anchor.
 _LayoutKey = tuple[str, _PlannerFacts, str | None]
 
 
@@ -1061,6 +1072,35 @@ def _gdn_layer_count(model: torch.nn.Module) -> int:
     except ImportError:
         return 0
     return sum(isinstance(module, GatedDeltaNet) for module in model.modules())
+
+
+def _moe_layer_count(model: torch.nn.Module) -> int:
+    """Number of mixture-of-experts layers in the model (0 when unavailable)."""
+
+    try:
+        from megatron.core.transformer.moe.moe_layer import BaseMoELayer
+    except ImportError:
+        return 0
+    return sum(isinstance(module, BaseMoELayer) for module in model.modules())
+
+
+def _expert_parallel_shape(provider: object) -> tuple[int, int]:
+    """(EP, ETP) of the initialized runtime, else the provider's configuration."""
+
+    try:
+        from megatron.core import parallel_state as ps
+
+        if ps.model_parallel_is_initialized():
+            return (
+                int(ps.get_expert_model_parallel_world_size()),
+                int(ps.get_expert_tensor_parallel_world_size()),
+            )
+    except (AssertionError, AttributeError, ImportError, RuntimeError):
+        pass
+    return (
+        int(getattr(provider, "expert_model_parallel_size", 1) or 1),
+        int(getattr(provider, "expert_tensor_parallel_size", 1) or 1),
+    )
 
 
 def _split_chunks(
@@ -1129,8 +1169,9 @@ class TrainerRank:
             getattr(runtime.model_support_handler, "build_gdn_execution_spec", False)
         ):
             self._gdn_layers = self._num_layers
-        # The fitted layout cost model applies only inside the capability
-        # profile it was calibrated on; other runtimes keep the previous score.
+        # A fitted layout cost table applies only to the execution classes it
+        # was calibrated on (device class, dtype, model geometry, parallel
+        # shape); other runtimes keep the previous score.
         parameter = next(runtime.model[0].parameters())
         capability: tuple[int, int] | None = None
         device_memory: int | None = None
@@ -1140,27 +1181,42 @@ class TrainerRank:
                 torch.cuda.get_device_properties(parameter.device).total_memory
             )
         spec = getattr(runtime, "model_support_spec", None)
+        self._moe_layers = _moe_layer_count(runtime.model[0])
         is_moe = bool(
-            getattr(spec, "is_moe", False)
+            self._moe_layers
+            or getattr(spec, "is_moe", False)
             or getattr(runtime.model_support_handler, "is_moe", False)
         )
-        self._coefficient_version = coefficient_version_for(
+        self._geometry = ModelGeometry.from_config(
+            getattr(metadata_model, "config", None) or runtime.provider,
+            has_gdn=self._gdn_layers > 0,
+            has_moe=is_moe,
+        )
+        _dp, tp_size, cp_size, _pp = self._topology_key()
+        ep_size, etp_size = _expert_parallel_shape(runtime.provider)
+        self._parallel_shape = ParallelShape(
+            tp=tp_size, cp=cp_size, ep=ep_size, etp=etp_size
+        )
+        selection = select_scoring(
             device_capability=capability,
             device_memory_bytes=device_memory,
             param_dtype=str(parameter.dtype),
-            hidden_size=int(self._hidden_size),
-            is_moe=is_moe,
+            geometry=self._geometry,
+            shape=self._parallel_shape,
         )
-        if self._coefficient_version != 2:
+        self._coefficient_version = selection.version
+        self._coefficient_table = selection.table_id
+        self._planner_coefficients = selection.coefficients
+        if selection.table_id is None:
             logger.warning(
                 "TrainerRank layout cost model: runtime (capability=%s, device "
-                "memory=%s, dtype=%s, hidden=%s, moe=%s) is outside the calibrated "
-                "profile; using the version-%d score",
+                "memory=%s, dtype=%s, geometry=%s, shape=%s) matches no calibrated "
+                "execution class; using the version-%d score",
                 capability,
                 device_memory,
                 parameter.dtype,
-                self._hidden_size,
-                is_moe,
+                self._geometry,
+                self._parallel_shape,
                 self._coefficient_version,
             )
         self._default_slot_ref: LoRASlotRef | None = None
@@ -3603,7 +3659,10 @@ class TrainerRank:
             layers=self._num_layers,
             gdn_layers=self._gdn_layers if uses_gdn else 0,
             uses_gdn=uses_gdn,
+            ep_size=self._parallel_shape.ep,
+            etp_size=self._parallel_shape.etp,
             coefficient_version=self._coefficient_version,
+            coefficient_table=self._coefficient_table,
         )
 
     def _layout_anchor(self, *, memory_minimal: bool) -> str | None:
@@ -3685,6 +3744,7 @@ class TrainerRank:
                 tp_size=facts.tp_size,
                 gdn_layers=facts.gdn_layers,
                 coefficient_version=facts.coefficient_version,
+                coefficients=self._planner_coefficients,
                 refinement_work_budget=_PLANNER_REFINEMENT_BUDGET,
             ).layout
         cached = (tree, layout)
@@ -4307,7 +4367,7 @@ class TrainerRank:
         modes = tuple(sorted(grad_modes))
         return _MemorySignature(
             topology=self._topology_key(),
-            planner_coefficients=self._coefficient_version,
+            planner_coefficients=(self._coefficient_version, self._coefficient_table),
             slot_group_count=slot_group_count,
             request_mix=tuple(
                 sorted({_request_mix_key(request) for request in requests})

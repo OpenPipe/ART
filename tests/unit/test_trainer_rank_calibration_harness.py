@@ -13,6 +13,8 @@ import importlib.util
 from pathlib import Path
 import sys
 
+import pytest
+
 _DRIVER = (
     Path(__file__).resolve().parents[2] / "dev" / "trainer_rank_landing_acceptance.py"
 )
@@ -66,3 +68,50 @@ def test_every_recorded_compile_status_is_world_wide() -> None:
     source = _DRIVER.read_text()
     assert '"compile_statuses": watch.take()' not in source
     assert source.count('"compile_statuses": _world_compile_statuses(watch)') == 2
+
+
+class _Tokenizer:
+    def __init__(self, size: int, salt: str = "") -> None:
+        self._size = size
+        self._salt = salt
+
+    def __len__(self) -> int:
+        return self._size
+
+    def decode(self, ids: list[int]) -> str:
+        return self._salt + " ".join(str(i) for i in ids)
+
+
+def test_corpus_tokenizer_check_requires_the_same_tokenizer(monkeypatch) -> None:
+    import transformers
+
+    corpus = {
+        "tokenizer_model": "Qwen/Qwen3-0.6B",
+        "groups": [{"histories": [{"tokens": list(range(1, 300))}]}],
+    }
+    tokenizers = {
+        "Qwen/Qwen3-0.6B": _Tokenizer(151_669),
+        "Qwen/Qwen3-8B": _Tokenizer(151_669),
+        "Qwen/Qwen3.5-4B": _Tokenizer(248_320, salt="other:"),
+    }
+    monkeypatch.setattr(
+        transformers.AutoTokenizer,
+        "from_pretrained",
+        classmethod(lambda cls, name, **kwargs: tokenizers[name]),
+    )
+    assert driver._check_corpus_tokenizer(corpus, "Qwen/Qwen3-8B") == {
+        "corpus_tokenizer": "Qwen/Qwen3-0.6B",
+        "vocabulary": 151_669,
+    }
+    with pytest.raises(SystemExit):
+        driver._check_corpus_tokenizer(corpus, "Qwen/Qwen3.5-4B")
+
+
+def test_qwen3_ellavox_cells_use_the_qwen3_corpus() -> None:
+    assert driver.CALIBRATION_CORPUS_BY_CELL == {
+        "cal-ellavox": "qwen35",
+        "cal-ellavox-qwen3": "qwen3",
+    }
+    assert set(driver.ELLAVOX_CORPORA) == {"qwen35", "qwen3"}
+    for path, digest in driver.ELLAVOX_CORPORA.values():
+        assert path.name.startswith("_trainer_rank_ellavox_") and len(digest) == 64
