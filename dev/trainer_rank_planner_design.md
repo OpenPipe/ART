@@ -85,11 +85,17 @@ quantum preserving four measured winners; 256 µs as a launch-floor proxy),
 applied to the total layer count rather than the GDN layer count, and blind
 to TP. The recalibration replaced them with a fitted table
 (`_planner_cost.COEFFICIENTS_MILLI_US`, integer milli-microseconds per
-feature unit) over interpretable integer term functions
-(`_planner_cost.TERM_FUNCTIONS`) of O(segments) layout features
-(`layout_features`: packed tokens, segments, shared segments and tokens,
-fan-out, dependency levels, segment-length and token-length histograms,
-causal attention area) and the planner facts (cp, tp, layers, GDN layers).
+feature unit) over ten interpretable integer term functions
+(`_planner_cost.TERM_FUNCTIONS`) of four O(segments) layout features
+(`layout_features`: packed tokens, segment count, dependency levels, a
+segment-length histogram) and the planner facts (cp, tp, layers, GDN
+layers). The ten terms are the ones that carried weight in the calibration:
+per-rank token work with CP-exchange and TP-collective terms, a GDN per-token
+surcharge, attention KV exchange across CP ranks, tiny-per-rank segments per
+layer, dependency levels crossing CP or TP ranks, and GDN level hand-offs with
+their TP interaction. Candidate terms that fitted to zero (segment launches,
+fan-out, shared tokens, attention area, small-M token surcharges) were dropped
+from the module; a future campaign can reintroduce them.
 Only quantities that differ between a call's layouts are priced; everything
 a call shares (logical tokens, the output head, model size) cancels in
 ranking.

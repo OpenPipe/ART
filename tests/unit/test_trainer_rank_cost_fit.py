@@ -22,13 +22,8 @@ def _candidate(
     features = {
         "packed_tokens": packed,
         "segment_count": segments,
-        "shared_segments": max(0, depth - 1),
         "max_depth": depth,
-        "shared_tokens": 0,
-        "fanout_sum": 0,
-        "small_segments": 0,
-        "tiny_segments": 0,
-        "attention_area": 0,
+        "segments_below": [0] * 8,
     }
     facts = {"layers": 2.0, "gdn_layers": 2.0, "tp": 1.0, "cp": 4.0, "uses_gdn": 1.0}
     return fit.Candidate(cell, label, features, facts, ms, 4, 1.0)
@@ -54,8 +49,6 @@ def test_paired_delta_nnls_recovers_known_coefficients() -> None:
             )
     x, y = fit.paired_deltas(cells, terms)
     beta = fit.nnls(x, y)
-    assert np.allclose(beta, true, rtol=1e-3)
-    beta = fit.fit_ranking(cells, terms)
     assert np.allclose(beta, true, rtol=1e-3)
     report = fit.evaluate(cells, fit.predict(cells, terms, beta))
     assert report["pairwise_accuracy"] == 1.0

@@ -1,601 +1,68 @@
 {
  "cells": [
-  {
-   "campaign": "local",
-   "cell": "cal-ellavox",
-   "cp": 1,
-   "group": 0,
-   "key": "cal-ellavox|Qwen/Qwen3.5-4B|L32|tp1|cp1|g0",
-   "layers": 32,
-   "model": "Qwen/Qwen3.5-4B",
-   "tp": 1
-  },
-  {
-   "campaign": "local",
-   "cell": "cal-ellavox",
-   "cp": 1,
-   "group": 1,
-   "key": "cal-ellavox|Qwen/Qwen3.5-4B|L32|tp1|cp1|g1",
-   "layers": 32,
-   "model": "Qwen/Qwen3.5-4B",
-   "tp": 1
-  },
-  {
-   "campaign": "local",
-   "cell": "cal-ellavox",
-   "cp": 1,
-   "group": 2,
-   "key": "cal-ellavox|Qwen/Qwen3.5-4B|L32|tp1|cp1|g2",
-   "layers": 32,
-   "model": "Qwen/Qwen3.5-4B",
-   "tp": 1
-  },
-  {
-   "campaign": "local",
-   "cell": "cal-ellavox",
-   "cp": 1,
-   "group": 3,
-   "key": "cal-ellavox|Qwen/Qwen3.5-4B|L32|tp1|cp1|g3",
-   "layers": 32,
-   "model": "Qwen/Qwen3.5-4B",
-   "tp": 1
-  },
-  {
-   "campaign": "local",
-   "cell": "cal-ellavox",
-   "cp": 1,
-   "group": 4,
-   "key": "cal-ellavox|Qwen/Qwen3.5-4B|L32|tp1|cp1|g4",
-   "layers": 32,
-   "model": "Qwen/Qwen3.5-4B",
-   "tp": 1
-  },
-  {
-   "campaign": "local",
-   "cell": "cal-ellavox",
-   "cp": 1,
-   "group": 5,
-   "key": "cal-ellavox|Qwen/Qwen3.5-4B|L32|tp1|cp1|g5",
-   "layers": 32,
-   "model": "Qwen/Qwen3.5-4B",
-   "tp": 1
-  },
-  {
-   "campaign": "local",
-   "cell": "cal-ellavox",
-   "cp": 1,
-   "group": 6,
-   "key": "cal-ellavox|Qwen/Qwen3.5-4B|L32|tp1|cp1|g6",
-   "layers": 32,
-   "model": "Qwen/Qwen3.5-4B",
-   "tp": 1
-  },
-  {
-   "campaign": "local",
-   "cell": "cal-ellavox",
-   "cp": 1,
-   "group": 7,
-   "key": "cal-ellavox|Qwen/Qwen3.5-4B|L32|tp1|cp1|g7",
-   "layers": 32,
-   "model": "Qwen/Qwen3.5-4B",
-   "tp": 1
-  },
-  {
-   "campaign": "tr-cost-2gpu",
-   "cell": "cal-ellavox",
-   "cp": 2,
-   "group": 0,
-   "key": "cal-ellavox|Qwen/Qwen3.5-4B|L32|tp1|cp2|g0",
-   "layers": 32,
-   "model": "Qwen/Qwen3.5-4B",
-   "tp": 1
-  },
-  {
-   "campaign": "tr-cost-2gpu",
-   "cell": "cal-ellavox",
-   "cp": 2,
-   "group": 1,
-   "key": "cal-ellavox|Qwen/Qwen3.5-4B|L32|tp1|cp2|g1",
-   "layers": 32,
-   "model": "Qwen/Qwen3.5-4B",
-   "tp": 1
-  },
-  {
-   "campaign": "tr-cost-2gpu",
-   "cell": "cal-ellavox",
-   "cp": 2,
-   "group": 2,
-   "key": "cal-ellavox|Qwen/Qwen3.5-4B|L32|tp1|cp2|g2",
-   "layers": 32,
-   "model": "Qwen/Qwen3.5-4B",
-   "tp": 1
-  },
-  {
-   "campaign": "tr-cost-2gpu",
-   "cell": "cal-ellavox",
-   "cp": 2,
-   "group": 3,
-   "key": "cal-ellavox|Qwen/Qwen3.5-4B|L32|tp1|cp2|g3",
-   "layers": 32,
-   "model": "Qwen/Qwen3.5-4B",
-   "tp": 1
-  },
-  {
-   "campaign": "tr-cost-2gpu",
-   "cell": "cal-ellavox",
-   "cp": 2,
-   "group": 4,
-   "key": "cal-ellavox|Qwen/Qwen3.5-4B|L32|tp1|cp2|g4",
-   "layers": 32,
-   "model": "Qwen/Qwen3.5-4B",
-   "tp": 1
-  },
-  {
-   "campaign": "tr-cost-2gpu",
-   "cell": "cal-ellavox",
-   "cp": 2,
-   "group": 5,
-   "key": "cal-ellavox|Qwen/Qwen3.5-4B|L32|tp1|cp2|g5",
-   "layers": 32,
-   "model": "Qwen/Qwen3.5-4B",
-   "tp": 1
-  },
-  {
-   "campaign": "tr-cost-2gpu",
-   "cell": "cal-ellavox",
-   "cp": 2,
-   "group": 6,
-   "key": "cal-ellavox|Qwen/Qwen3.5-4B|L32|tp1|cp2|g6",
-   "layers": 32,
-   "model": "Qwen/Qwen3.5-4B",
-   "tp": 1
-  },
-  {
-   "campaign": "tr-cost-2gpu",
-   "cell": "cal-ellavox",
-   "cp": 2,
-   "group": 7,
-   "key": "cal-ellavox|Qwen/Qwen3.5-4B|L32|tp1|cp2|g7",
-   "layers": 32,
-   "model": "Qwen/Qwen3.5-4B",
-   "tp": 1
-  },
-  {
-   "campaign": "tr-cost-cp4-2",
-   "cell": "cal-ellavox",
-   "cp": 4,
-   "group": 0,
-   "key": "cal-ellavox|Qwen/Qwen3.5-4B|L32|tp1|cp4|g0",
-   "layers": 32,
-   "model": "Qwen/Qwen3.5-4B",
-   "tp": 1
-  },
-  {
-   "campaign": "tr-cost-cp4-2",
-   "cell": "cal-ellavox",
-   "cp": 4,
-   "group": 1,
-   "key": "cal-ellavox|Qwen/Qwen3.5-4B|L32|tp1|cp4|g1",
-   "layers": 32,
-   "model": "Qwen/Qwen3.5-4B",
-   "tp": 1
-  },
-  {
-   "campaign": "tr-cost-cp4-2",
-   "cell": "cal-ellavox",
-   "cp": 4,
-   "group": 2,
-   "key": "cal-ellavox|Qwen/Qwen3.5-4B|L32|tp1|cp4|g2",
-   "layers": 32,
-   "model": "Qwen/Qwen3.5-4B",
-   "tp": 1
-  },
-  {
-   "campaign": "tr-cost-cp4-2",
-   "cell": "cal-ellavox",
-   "cp": 4,
-   "group": 3,
-   "key": "cal-ellavox|Qwen/Qwen3.5-4B|L32|tp1|cp4|g3",
-   "layers": 32,
-   "model": "Qwen/Qwen3.5-4B",
-   "tp": 1
-  },
-  {
-   "campaign": "tr-cost-cp4-2",
-   "cell": "cal-ellavox",
-   "cp": 4,
-   "group": 4,
-   "key": "cal-ellavox|Qwen/Qwen3.5-4B|L32|tp1|cp4|g4",
-   "layers": 32,
-   "model": "Qwen/Qwen3.5-4B",
-   "tp": 1
-  },
-  {
-   "campaign": "tr-cost-cp4-2",
-   "cell": "cal-ellavox",
-   "cp": 4,
-   "group": 5,
-   "key": "cal-ellavox|Qwen/Qwen3.5-4B|L32|tp1|cp4|g5",
-   "layers": 32,
-   "model": "Qwen/Qwen3.5-4B",
-   "tp": 1
-  },
-  {
-   "campaign": "tr-cost-cp4-2",
-   "cell": "cal-ellavox",
-   "cp": 4,
-   "group": 6,
-   "key": "cal-ellavox|Qwen/Qwen3.5-4B|L32|tp1|cp4|g6",
-   "layers": 32,
-   "model": "Qwen/Qwen3.5-4B",
-   "tp": 1
-  },
-  {
-   "campaign": "tr-cost-cp4-2",
-   "cell": "cal-ellavox",
-   "cp": 4,
-   "group": 7,
-   "key": "cal-ellavox|Qwen/Qwen3.5-4B|L32|tp1|cp4|g7",
-   "layers": 32,
-   "model": "Qwen/Qwen3.5-4B",
-   "tp": 1
-  },
-  {
-   "campaign": "local",
-   "cell": "cal-grpo-g16",
-   "cp": 1,
-   "group": null,
-   "key": "cal-grpo-g16|Qwen/Qwen3.5-4B|L32|tp1|cp1",
-   "layers": 32,
-   "model": "Qwen/Qwen3.5-4B",
-   "tp": 1
-  },
-  {
-   "campaign": "tr-cost-2gpu-2",
-   "cell": "cal-grpo-g16",
-   "cp": 2,
-   "group": null,
-   "key": "cal-grpo-g16|Qwen/Qwen3.5-4B|L32|tp1|cp2",
-   "layers": 32,
-   "model": "Qwen/Qwen3.5-4B",
-   "tp": 1
-  },
-  {
-   "campaign": "tr-cost-cp4",
-   "cell": "cal-grpo-g16",
-   "cp": 4,
-   "group": null,
-   "key": "cal-grpo-g16|Qwen/Qwen3.5-4B|L32|tp1|cp4",
-   "layers": 32,
-   "model": "Qwen/Qwen3.5-4B",
-   "tp": 1
-  },
-  {
-   "campaign": "tr-cost-2gpu",
-   "cell": "cal-grpo-g16",
-   "cp": 1,
-   "group": null,
-   "key": "cal-grpo-g16|Qwen/Qwen3.5-4B|L32|tp2|cp1",
-   "layers": 32,
-   "model": "Qwen/Qwen3.5-4B",
-   "tp": 2
-  },
-  {
-   "campaign": "local",
-   "cell": "cal-grpo-g4x4",
-   "cp": 1,
-   "group": null,
-   "key": "cal-grpo-g4x4|Qwen/Qwen3.5-4B|L32|tp1|cp1",
-   "layers": 32,
-   "model": "Qwen/Qwen3.5-4B",
-   "tp": 1
-  },
-  {
-   "campaign": "tr-cost-2gpu-2",
-   "cell": "cal-grpo-g4x4",
-   "cp": 2,
-   "group": null,
-   "key": "cal-grpo-g4x4|Qwen/Qwen3.5-4B|L32|tp1|cp2",
-   "layers": 32,
-   "model": "Qwen/Qwen3.5-4B",
-   "tp": 1
-  },
-  {
-   "campaign": "tr-cost-cp4",
-   "cell": "cal-grpo-g4x4",
-   "cp": 4,
-   "group": null,
-   "key": "cal-grpo-g4x4|Qwen/Qwen3.5-4B|L32|tp1|cp4",
-   "layers": 32,
-   "model": "Qwen/Qwen3.5-4B",
-   "tp": 1
-  },
-  {
-   "campaign": "tr-cost-2gpu",
-   "cell": "cal-grpo-g4x4",
-   "cp": 1,
-   "group": null,
-   "key": "cal-grpo-g4x4|Qwen/Qwen3.5-4B|L32|tp2|cp1",
-   "layers": 32,
-   "model": "Qwen/Qwen3.5-4B",
-   "tp": 2
-  },
-  {
-   "campaign": "local",
-   "cell": "cal-grpo-g8-long",
-   "cp": 1,
-   "group": null,
-   "key": "cal-grpo-g8-long|Qwen/Qwen3-4B|L2|tp1|cp1",
-   "layers": 2,
-   "model": "Qwen/Qwen3-4B",
-   "tp": 1
-  },
-  {
-   "campaign": "tr-cost-cp4",
-   "cell": "cal-grpo-g8-long",
-   "cp": 4,
-   "group": null,
-   "key": "cal-grpo-g8-long|Qwen/Qwen3-4B|L2|tp1|cp4",
-   "layers": 2,
-   "model": "Qwen/Qwen3-4B",
-   "tp": 1
-  },
-  {
-   "campaign": "local",
-   "cell": "cal-grpo-g8-long",
-   "cp": 1,
-   "group": null,
-   "key": "cal-grpo-g8-long|Qwen/Qwen3.5-4B|L2|tp1|cp1",
-   "layers": 2,
-   "model": "Qwen/Qwen3.5-4B",
-   "tp": 1
-  },
-  {
-   "campaign": "tr-cost-cp4",
-   "cell": "cal-grpo-g8-long",
-   "cp": 4,
-   "group": null,
-   "key": "cal-grpo-g8-long|Qwen/Qwen3.5-4B|L2|tp1|cp4",
-   "layers": 2,
-   "model": "Qwen/Qwen3.5-4B",
-   "tp": 1
-  },
-  {
-   "campaign": "local",
-   "cell": "cal-grpo-g8",
-   "cp": 1,
-   "group": null,
-   "key": "cal-grpo-g8|Qwen/Qwen3-4B|L36|tp1|cp1",
-   "layers": 36,
-   "model": "Qwen/Qwen3-4B",
-   "tp": 1
-  },
-  {
-   "campaign": "tr-cost-2gpu-2",
-   "cell": "cal-grpo-g8",
-   "cp": 2,
-   "group": null,
-   "key": "cal-grpo-g8|Qwen/Qwen3-4B|L36|tp1|cp2",
-   "layers": 36,
-   "model": "Qwen/Qwen3-4B",
-   "tp": 1
-  },
-  {
-   "campaign": "tr-cost-cp4",
-   "cell": "cal-grpo-g8",
-   "cp": 4,
-   "group": null,
-   "key": "cal-grpo-g8|Qwen/Qwen3-4B|L36|tp1|cp4",
-   "layers": 36,
-   "model": "Qwen/Qwen3-4B",
-   "tp": 1
-  },
-  {
-   "campaign": "tr-cost-2gpu",
-   "cell": "cal-grpo-g8",
-   "cp": 1,
-   "group": null,
-   "key": "cal-grpo-g8|Qwen/Qwen3-4B|L36|tp2|cp1",
-   "layers": 36,
-   "model": "Qwen/Qwen3-4B",
-   "tp": 2
-  },
-  {
-   "campaign": "local",
-   "cell": "cal-grpo-g8",
-   "cp": 1,
-   "group": null,
-   "key": "cal-grpo-g8|Qwen/Qwen3.5-4B|L32|tp1|cp1",
-   "layers": 32,
-   "model": "Qwen/Qwen3.5-4B",
-   "tp": 1
-  },
-  {
-   "campaign": "tr-cost-2gpu-2",
-   "cell": "cal-grpo-g8",
-   "cp": 2,
-   "group": null,
-   "key": "cal-grpo-g8|Qwen/Qwen3.5-4B|L32|tp1|cp2",
-   "layers": 32,
-   "model": "Qwen/Qwen3.5-4B",
-   "tp": 1
-  },
-  {
-   "campaign": "tr-cost-cp4",
-   "cell": "cal-grpo-g8",
-   "cp": 4,
-   "group": null,
-   "key": "cal-grpo-g8|Qwen/Qwen3.5-4B|L32|tp1|cp4",
-   "layers": 32,
-   "model": "Qwen/Qwen3.5-4B",
-   "tp": 1
-  },
-  {
-   "campaign": "tr-cost-2gpu",
-   "cell": "cal-grpo-g8",
-   "cp": 1,
-   "group": null,
-   "key": "cal-grpo-g8|Qwen/Qwen3.5-4B|L32|tp2|cp1",
-   "layers": 32,
-   "model": "Qwen/Qwen3.5-4B",
-   "tp": 2
-  },
-  {
-   "campaign": "local",
-   "cell": "cal-hetero2",
-   "cp": 1,
-   "group": null,
-   "key": "cal-hetero2|Qwen/Qwen3-4B|L36|tp1|cp1",
-   "layers": 36,
-   "model": "Qwen/Qwen3-4B",
-   "tp": 1
-  },
-  {
-   "campaign": "tr-cost-cp4-2",
-   "cell": "cal-hetero2",
-   "cp": 4,
-   "group": null,
-   "key": "cal-hetero2|Qwen/Qwen3-4B|L36|tp1|cp4",
-   "layers": 36,
-   "model": "Qwen/Qwen3-4B",
-   "tp": 1
-  },
-  {
-   "campaign": "local",
-   "cell": "cal-hetero2",
-   "cp": 1,
-   "group": null,
-   "key": "cal-hetero2|Qwen/Qwen3.5-4B|L32|tp1|cp1",
-   "layers": 32,
-   "model": "Qwen/Qwen3.5-4B",
-   "tp": 1
-  },
-  {
-   "campaign": "tr-cost-2gpu-2",
-   "cell": "cal-hetero2",
-   "cp": 2,
-   "group": null,
-   "key": "cal-hetero2|Qwen/Qwen3.5-4B|L32|tp1|cp2",
-   "layers": 32,
-   "model": "Qwen/Qwen3.5-4B",
-   "tp": 1
-  },
-  {
-   "campaign": "tr-cost-cp4-2",
-   "cell": "cal-hetero2",
-   "cp": 4,
-   "group": null,
-   "key": "cal-hetero2|Qwen/Qwen3.5-4B|L32|tp1|cp4",
-   "layers": 32,
-   "model": "Qwen/Qwen3.5-4B",
-   "tp": 1
-  },
-  {
-   "campaign": "tr-cost-2gpu-2",
-   "cell": "cal-hetero2",
-   "cp": 1,
-   "group": null,
-   "key": "cal-hetero2|Qwen/Qwen3.5-4B|L32|tp2|cp1",
-   "layers": 32,
-   "model": "Qwen/Qwen3.5-4B",
-   "tp": 2
-  },
-  {
-   "campaign": "local",
-   "cell": "cal-hetero3",
-   "cp": 1,
-   "group": null,
-   "key": "cal-hetero3|Qwen/Qwen3.5-4B|L32|tp1|cp1",
-   "layers": 32,
-   "model": "Qwen/Qwen3.5-4B",
-   "tp": 1
-  },
-  {
-   "campaign": "tr-cost-2gpu-2",
-   "cell": "cal-hetero3",
-   "cp": 2,
-   "group": null,
-   "key": "cal-hetero3|Qwen/Qwen3.5-4B|L32|tp1|cp2",
-   "layers": 32,
-   "model": "Qwen/Qwen3.5-4B",
-   "tp": 1
-  },
-  {
-   "campaign": "tr-cost-cp4-2",
-   "cell": "cal-hetero3",
-   "cp": 4,
-   "group": null,
-   "key": "cal-hetero3|Qwen/Qwen3.5-4B|L32|tp1|cp4",
-   "layers": 32,
-   "model": "Qwen/Qwen3.5-4B",
-   "tp": 1
-  },
-  {
-   "campaign": "tr-cost-2gpu-2",
-   "cell": "cal-hetero3",
-   "cp": 1,
-   "group": null,
-   "key": "cal-hetero3|Qwen/Qwen3.5-4B|L32|tp2|cp1",
-   "layers": 32,
-   "model": "Qwen/Qwen3.5-4B",
-   "tp": 2
-  },
-  {
-   "campaign": "local",
-   "cell": "cal-hetero",
-   "cp": 1,
-   "group": null,
-   "key": "cal-hetero|Qwen/Qwen3.5-4B|L32|tp1|cp1",
-   "layers": 32,
-   "model": "Qwen/Qwen3.5-4B",
-   "tp": 1
-  },
-  {
-   "campaign": "tr-cost-2gpu-2",
-   "cell": "cal-hetero",
-   "cp": 2,
-   "group": null,
-   "key": "cal-hetero|Qwen/Qwen3.5-4B|L32|tp1|cp2",
-   "layers": 32,
-   "model": "Qwen/Qwen3.5-4B",
-   "tp": 1
-  },
-  {
-   "campaign": "tr-cost-cp4",
-   "cell": "cal-hetero",
-   "cp": 4,
-   "group": null,
-   "key": "cal-hetero|Qwen/Qwen3.5-4B|L32|tp1|cp4",
-   "layers": 32,
-   "model": "Qwen/Qwen3.5-4B",
-   "tp": 1
-  },
-  {
-   "campaign": "tr-cost-2gpu",
-   "cell": "cal-hetero",
-   "cp": 1,
-   "group": null,
-   "key": "cal-hetero|Qwen/Qwen3.5-4B|L32|tp2|cp1",
-   "layers": 32,
-   "model": "Qwen/Qwen3.5-4B",
-   "tp": 2
-  }
+  {"campaign":"local","cell":"cal-ellavox","cp":1,"group":0,"key":"cal-ellavox|Qwen/Qwen3.5-4B|L32|tp1|cp1|g0","layers":32,"model":"Qwen/Qwen3.5-4B","tp":1},
+  {"campaign":"local","cell":"cal-ellavox","cp":1,"group":1,"key":"cal-ellavox|Qwen/Qwen3.5-4B|L32|tp1|cp1|g1","layers":32,"model":"Qwen/Qwen3.5-4B","tp":1},
+  {"campaign":"local","cell":"cal-ellavox","cp":1,"group":2,"key":"cal-ellavox|Qwen/Qwen3.5-4B|L32|tp1|cp1|g2","layers":32,"model":"Qwen/Qwen3.5-4B","tp":1},
+  {"campaign":"local","cell":"cal-ellavox","cp":1,"group":3,"key":"cal-ellavox|Qwen/Qwen3.5-4B|L32|tp1|cp1|g3","layers":32,"model":"Qwen/Qwen3.5-4B","tp":1},
+  {"campaign":"local","cell":"cal-ellavox","cp":1,"group":4,"key":"cal-ellavox|Qwen/Qwen3.5-4B|L32|tp1|cp1|g4","layers":32,"model":"Qwen/Qwen3.5-4B","tp":1},
+  {"campaign":"local","cell":"cal-ellavox","cp":1,"group":5,"key":"cal-ellavox|Qwen/Qwen3.5-4B|L32|tp1|cp1|g5","layers":32,"model":"Qwen/Qwen3.5-4B","tp":1},
+  {"campaign":"local","cell":"cal-ellavox","cp":1,"group":6,"key":"cal-ellavox|Qwen/Qwen3.5-4B|L32|tp1|cp1|g6","layers":32,"model":"Qwen/Qwen3.5-4B","tp":1},
+  {"campaign":"local","cell":"cal-ellavox","cp":1,"group":7,"key":"cal-ellavox|Qwen/Qwen3.5-4B|L32|tp1|cp1|g7","layers":32,"model":"Qwen/Qwen3.5-4B","tp":1},
+  {"campaign":"tr-cost-2gpu","cell":"cal-ellavox","cp":2,"group":0,"key":"cal-ellavox|Qwen/Qwen3.5-4B|L32|tp1|cp2|g0","layers":32,"model":"Qwen/Qwen3.5-4B","tp":1},
+  {"campaign":"tr-cost-2gpu","cell":"cal-ellavox","cp":2,"group":1,"key":"cal-ellavox|Qwen/Qwen3.5-4B|L32|tp1|cp2|g1","layers":32,"model":"Qwen/Qwen3.5-4B","tp":1},
+  {"campaign":"tr-cost-2gpu","cell":"cal-ellavox","cp":2,"group":2,"key":"cal-ellavox|Qwen/Qwen3.5-4B|L32|tp1|cp2|g2","layers":32,"model":"Qwen/Qwen3.5-4B","tp":1},
+  {"campaign":"tr-cost-2gpu","cell":"cal-ellavox","cp":2,"group":3,"key":"cal-ellavox|Qwen/Qwen3.5-4B|L32|tp1|cp2|g3","layers":32,"model":"Qwen/Qwen3.5-4B","tp":1},
+  {"campaign":"tr-cost-2gpu","cell":"cal-ellavox","cp":2,"group":4,"key":"cal-ellavox|Qwen/Qwen3.5-4B|L32|tp1|cp2|g4","layers":32,"model":"Qwen/Qwen3.5-4B","tp":1},
+  {"campaign":"tr-cost-2gpu","cell":"cal-ellavox","cp":2,"group":5,"key":"cal-ellavox|Qwen/Qwen3.5-4B|L32|tp1|cp2|g5","layers":32,"model":"Qwen/Qwen3.5-4B","tp":1},
+  {"campaign":"tr-cost-2gpu","cell":"cal-ellavox","cp":2,"group":6,"key":"cal-ellavox|Qwen/Qwen3.5-4B|L32|tp1|cp2|g6","layers":32,"model":"Qwen/Qwen3.5-4B","tp":1},
+  {"campaign":"tr-cost-2gpu","cell":"cal-ellavox","cp":2,"group":7,"key":"cal-ellavox|Qwen/Qwen3.5-4B|L32|tp1|cp2|g7","layers":32,"model":"Qwen/Qwen3.5-4B","tp":1},
+  {"campaign":"tr-cost-cp4-2","cell":"cal-ellavox","cp":4,"group":0,"key":"cal-ellavox|Qwen/Qwen3.5-4B|L32|tp1|cp4|g0","layers":32,"model":"Qwen/Qwen3.5-4B","tp":1},
+  {"campaign":"tr-cost-cp4-2","cell":"cal-ellavox","cp":4,"group":1,"key":"cal-ellavox|Qwen/Qwen3.5-4B|L32|tp1|cp4|g1","layers":32,"model":"Qwen/Qwen3.5-4B","tp":1},
+  {"campaign":"tr-cost-cp4-2","cell":"cal-ellavox","cp":4,"group":2,"key":"cal-ellavox|Qwen/Qwen3.5-4B|L32|tp1|cp4|g2","layers":32,"model":"Qwen/Qwen3.5-4B","tp":1},
+  {"campaign":"tr-cost-cp4-2","cell":"cal-ellavox","cp":4,"group":3,"key":"cal-ellavox|Qwen/Qwen3.5-4B|L32|tp1|cp4|g3","layers":32,"model":"Qwen/Qwen3.5-4B","tp":1},
+  {"campaign":"tr-cost-cp4-2","cell":"cal-ellavox","cp":4,"group":4,"key":"cal-ellavox|Qwen/Qwen3.5-4B|L32|tp1|cp4|g4","layers":32,"model":"Qwen/Qwen3.5-4B","tp":1},
+  {"campaign":"tr-cost-cp4-2","cell":"cal-ellavox","cp":4,"group":5,"key":"cal-ellavox|Qwen/Qwen3.5-4B|L32|tp1|cp4|g5","layers":32,"model":"Qwen/Qwen3.5-4B","tp":1},
+  {"campaign":"tr-cost-cp4-2","cell":"cal-ellavox","cp":4,"group":6,"key":"cal-ellavox|Qwen/Qwen3.5-4B|L32|tp1|cp4|g6","layers":32,"model":"Qwen/Qwen3.5-4B","tp":1},
+  {"campaign":"tr-cost-cp4-2","cell":"cal-ellavox","cp":4,"group":7,"key":"cal-ellavox|Qwen/Qwen3.5-4B|L32|tp1|cp4|g7","layers":32,"model":"Qwen/Qwen3.5-4B","tp":1},
+  {"campaign":"local","cell":"cal-grpo-g16","cp":1,"group":null,"key":"cal-grpo-g16|Qwen/Qwen3.5-4B|L32|tp1|cp1","layers":32,"model":"Qwen/Qwen3.5-4B","tp":1},
+  {"campaign":"tr-cost-2gpu-2","cell":"cal-grpo-g16","cp":2,"group":null,"key":"cal-grpo-g16|Qwen/Qwen3.5-4B|L32|tp1|cp2","layers":32,"model":"Qwen/Qwen3.5-4B","tp":1},
+  {"campaign":"tr-cost-cp4","cell":"cal-grpo-g16","cp":4,"group":null,"key":"cal-grpo-g16|Qwen/Qwen3.5-4B|L32|tp1|cp4","layers":32,"model":"Qwen/Qwen3.5-4B","tp":1},
+  {"campaign":"tr-cost-2gpu","cell":"cal-grpo-g16","cp":1,"group":null,"key":"cal-grpo-g16|Qwen/Qwen3.5-4B|L32|tp2|cp1","layers":32,"model":"Qwen/Qwen3.5-4B","tp":2},
+  {"campaign":"local","cell":"cal-grpo-g4x4","cp":1,"group":null,"key":"cal-grpo-g4x4|Qwen/Qwen3.5-4B|L32|tp1|cp1","layers":32,"model":"Qwen/Qwen3.5-4B","tp":1},
+  {"campaign":"tr-cost-2gpu-2","cell":"cal-grpo-g4x4","cp":2,"group":null,"key":"cal-grpo-g4x4|Qwen/Qwen3.5-4B|L32|tp1|cp2","layers":32,"model":"Qwen/Qwen3.5-4B","tp":1},
+  {"campaign":"tr-cost-cp4","cell":"cal-grpo-g4x4","cp":4,"group":null,"key":"cal-grpo-g4x4|Qwen/Qwen3.5-4B|L32|tp1|cp4","layers":32,"model":"Qwen/Qwen3.5-4B","tp":1},
+  {"campaign":"tr-cost-2gpu","cell":"cal-grpo-g4x4","cp":1,"group":null,"key":"cal-grpo-g4x4|Qwen/Qwen3.5-4B|L32|tp2|cp1","layers":32,"model":"Qwen/Qwen3.5-4B","tp":2},
+  {"campaign":"local","cell":"cal-grpo-g8-long","cp":1,"group":null,"key":"cal-grpo-g8-long|Qwen/Qwen3-4B|L2|tp1|cp1","layers":2,"model":"Qwen/Qwen3-4B","tp":1},
+  {"campaign":"tr-cost-cp4","cell":"cal-grpo-g8-long","cp":4,"group":null,"key":"cal-grpo-g8-long|Qwen/Qwen3-4B|L2|tp1|cp4","layers":2,"model":"Qwen/Qwen3-4B","tp":1},
+  {"campaign":"local","cell":"cal-grpo-g8-long","cp":1,"group":null,"key":"cal-grpo-g8-long|Qwen/Qwen3.5-4B|L2|tp1|cp1","layers":2,"model":"Qwen/Qwen3.5-4B","tp":1},
+  {"campaign":"tr-cost-cp4","cell":"cal-grpo-g8-long","cp":4,"group":null,"key":"cal-grpo-g8-long|Qwen/Qwen3.5-4B|L2|tp1|cp4","layers":2,"model":"Qwen/Qwen3.5-4B","tp":1},
+  {"campaign":"local","cell":"cal-grpo-g8","cp":1,"group":null,"key":"cal-grpo-g8|Qwen/Qwen3-4B|L36|tp1|cp1","layers":36,"model":"Qwen/Qwen3-4B","tp":1},
+  {"campaign":"tr-cost-2gpu-2","cell":"cal-grpo-g8","cp":2,"group":null,"key":"cal-grpo-g8|Qwen/Qwen3-4B|L36|tp1|cp2","layers":36,"model":"Qwen/Qwen3-4B","tp":1},
+  {"campaign":"tr-cost-cp4","cell":"cal-grpo-g8","cp":4,"group":null,"key":"cal-grpo-g8|Qwen/Qwen3-4B|L36|tp1|cp4","layers":36,"model":"Qwen/Qwen3-4B","tp":1},
+  {"campaign":"tr-cost-2gpu","cell":"cal-grpo-g8","cp":1,"group":null,"key":"cal-grpo-g8|Qwen/Qwen3-4B|L36|tp2|cp1","layers":36,"model":"Qwen/Qwen3-4B","tp":2},
+  {"campaign":"local","cell":"cal-grpo-g8","cp":1,"group":null,"key":"cal-grpo-g8|Qwen/Qwen3.5-4B|L32|tp1|cp1","layers":32,"model":"Qwen/Qwen3.5-4B","tp":1},
+  {"campaign":"tr-cost-2gpu-2","cell":"cal-grpo-g8","cp":2,"group":null,"key":"cal-grpo-g8|Qwen/Qwen3.5-4B|L32|tp1|cp2","layers":32,"model":"Qwen/Qwen3.5-4B","tp":1},
+  {"campaign":"tr-cost-cp4","cell":"cal-grpo-g8","cp":4,"group":null,"key":"cal-grpo-g8|Qwen/Qwen3.5-4B|L32|tp1|cp4","layers":32,"model":"Qwen/Qwen3.5-4B","tp":1},
+  {"campaign":"tr-cost-2gpu","cell":"cal-grpo-g8","cp":1,"group":null,"key":"cal-grpo-g8|Qwen/Qwen3.5-4B|L32|tp2|cp1","layers":32,"model":"Qwen/Qwen3.5-4B","tp":2},
+  {"campaign":"local","cell":"cal-hetero2","cp":1,"group":null,"key":"cal-hetero2|Qwen/Qwen3-4B|L36|tp1|cp1","layers":36,"model":"Qwen/Qwen3-4B","tp":1},
+  {"campaign":"tr-cost-cp4-2","cell":"cal-hetero2","cp":4,"group":null,"key":"cal-hetero2|Qwen/Qwen3-4B|L36|tp1|cp4","layers":36,"model":"Qwen/Qwen3-4B","tp":1},
+  {"campaign":"local","cell":"cal-hetero2","cp":1,"group":null,"key":"cal-hetero2|Qwen/Qwen3.5-4B|L32|tp1|cp1","layers":32,"model":"Qwen/Qwen3.5-4B","tp":1},
+  {"campaign":"tr-cost-2gpu-2","cell":"cal-hetero2","cp":2,"group":null,"key":"cal-hetero2|Qwen/Qwen3.5-4B|L32|tp1|cp2","layers":32,"model":"Qwen/Qwen3.5-4B","tp":1},
+  {"campaign":"tr-cost-cp4-2","cell":"cal-hetero2","cp":4,"group":null,"key":"cal-hetero2|Qwen/Qwen3.5-4B|L32|tp1|cp4","layers":32,"model":"Qwen/Qwen3.5-4B","tp":1},
+  {"campaign":"tr-cost-2gpu-2","cell":"cal-hetero2","cp":1,"group":null,"key":"cal-hetero2|Qwen/Qwen3.5-4B|L32|tp2|cp1","layers":32,"model":"Qwen/Qwen3.5-4B","tp":2},
+  {"campaign":"local","cell":"cal-hetero3","cp":1,"group":null,"key":"cal-hetero3|Qwen/Qwen3.5-4B|L32|tp1|cp1","layers":32,"model":"Qwen/Qwen3.5-4B","tp":1},
+  {"campaign":"tr-cost-2gpu-2","cell":"cal-hetero3","cp":2,"group":null,"key":"cal-hetero3|Qwen/Qwen3.5-4B|L32|tp1|cp2","layers":32,"model":"Qwen/Qwen3.5-4B","tp":1},
+  {"campaign":"tr-cost-cp4-2","cell":"cal-hetero3","cp":4,"group":null,"key":"cal-hetero3|Qwen/Qwen3.5-4B|L32|tp1|cp4","layers":32,"model":"Qwen/Qwen3.5-4B","tp":1},
+  {"campaign":"tr-cost-2gpu-2","cell":"cal-hetero3","cp":1,"group":null,"key":"cal-hetero3|Qwen/Qwen3.5-4B|L32|tp2|cp1","layers":32,"model":"Qwen/Qwen3.5-4B","tp":2},
+  {"campaign":"local","cell":"cal-hetero","cp":1,"group":null,"key":"cal-hetero|Qwen/Qwen3.5-4B|L32|tp1|cp1","layers":32,"model":"Qwen/Qwen3.5-4B","tp":1},
+  {"campaign":"tr-cost-2gpu-2","cell":"cal-hetero","cp":2,"group":null,"key":"cal-hetero|Qwen/Qwen3.5-4B|L32|tp1|cp2","layers":32,"model":"Qwen/Qwen3.5-4B","tp":1},
+  {"campaign":"tr-cost-cp4","cell":"cal-hetero","cp":4,"group":null,"key":"cal-hetero|Qwen/Qwen3.5-4B|L32|tp1|cp4","layers":32,"model":"Qwen/Qwen3.5-4B","tp":1},
+  {"campaign":"tr-cost-2gpu","cell":"cal-hetero","cp":1,"group":null,"key":"cal-hetero|Qwen/Qwen3.5-4B|L32|tp2|cp1","layers":32,"model":"Qwen/Qwen3.5-4B","tp":2}
  ],
  "description": "Expected calibration cells for the coefficient-version-2 campaign (2026-09-02): the exact union of the cells the checked-in recipes launch (dev/trainer_rank_cost_calibration_local.sh; the cp4 and 2gpu sky recipes in both CELL_SET modes), keyed exactly as the fitter keys cells. tests/unit/test_planner_cost_manifest_recipes.py asserts recipes and manifest agree. The fitter's --manifest validation requires every non-excluded cell to be present with a complete mandatory candidate set and rejects unexpected cells; exclusions must be listed here with a reason.",
  "excluded": [
-  {
-   "key": "cal-ellavox|Qwen/Qwen3.5-4B|L32|tp1|cp4|g1",
-   "reason": "deterministic CP4 NCCL all-to-all hang in the context-parallel group; reproduced on a fresh cluster (issue #840)"
-  },
-  {
-   "key": "cal-ellavox|Qwen/Qwen3.5-4B|L32|tp1|cp4|g4",
-   "reason": "deterministic CP4 NCCL all-to-all hang in the context-parallel group; reproduced on a fresh cluster (issue #840)"
-  }
+  {"key":"cal-ellavox|Qwen/Qwen3.5-4B|L32|tp1|cp4|g1","reason":"deterministic CP4 NCCL all-to-all hang in the context-parallel group; reproduced on a fresh cluster (issue #840)"},
+  {"key":"cal-ellavox|Qwen/Qwen3.5-4B|L32|tp1|cp4|g4","reason":"deterministic CP4 NCCL all-to-all hang in the context-parallel group; reproduced on a fresh cluster (issue #840)"}
  ],
- "recipes": {
-  "dev/trainer_rank_cost_calibration_2gpu.sky.yaml CELL_SET=main|cp2-hetero": "tp2 cp1 and tp1 cp2 cells",
-  "dev/trainer_rank_cost_calibration_cp4.sky.yaml CELL_SET=main|hetero-ellavox": "cp4 cells",
-  "dev/trainer_rank_cost_calibration_local.sh": "tp1 cp1 cells (local H200)"
- },
  "schema": "art.dev.trainer_rank_cost_calibration_manifest.v1"
 }

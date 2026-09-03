@@ -39,48 +39,31 @@ def test_layout_features_on_the_sealed_grpo_shape() -> None:
         for label in candidate.labels
     }
 
-    no_sharing = by_label["no_sharing"]
-    assert no_sharing == LayoutFeatures(
+    assert by_label["no_sharing"] == LayoutFeatures(
         packed_tokens=172_032,
         segment_count=16,
-        shared_segments=0,
         max_depth=1,
-        shared_tokens=0,
-        fanout_sum=0,
-        small_segments=0,
-        tiny_segments=0,
-        attention_area=16 * (10_752 * 10_752 // 2),
         segments_below=(0, 0, 0, 0, 0, 0, 0, 0),
-        tokens_below=(0, 0, 0, 0, 0, 0, 0, 0),
     )
     depth_one = by_label["depth_one"]
-    assert (depth_one.packed_tokens, depth_one.segment_count) == (141_312, 17)
-    assert (depth_one.shared_segments, depth_one.max_depth) == (1, 2)
-    assert (depth_one.shared_tokens, depth_one.fanout_sum) == (2_048, 16)
+    assert (depth_one.packed_tokens, depth_one.segment_count, depth_one.max_depth) == (
+        141_312,
+        17,
+        2,
+    )
     full = by_label["full_sharing"]
-    assert (full.packed_tokens, full.segment_count, full.shared_segments) == (
-        26_624,
-        19,
-        3,
-    )
-    assert (full.max_depth, full.shared_tokens, full.fanout_sum) == (3, 18_432, 32)
-    partial = by_label["minimum_effective_span_2049"]
-    assert (partial.packed_tokens, partial.shared_segments, partial.max_depth) == (
-        28_672,
-        2,
-        2,
-    )
-    assert partial.shared_tokens == 20_480 and partial.fanout_sum == 16
-    # Sharing shrinks causal attention work: the shared layouts attend to a
-    # fifth of the pairs the unshared layout does.
-    assert full.attention_area < no_sharing.attention_area // 4
-    assert full.as_dict()["attention_area"] == full.attention_area
-    # Full sharing: one 2,048-token system, two 8,192-token prompts, sixteen
-    # 512-token completions. Cumulative counts below 64..8192.
-    # (strictly shorter, so the 2,048-token system counts only below 4,096).
+    assert (full.packed_tokens, full.segment_count, full.max_depth) == (26_624, 19, 3)
+    # One 2,048-token system, two 8,192-token prompts, sixteen 512-token
+    # completions: cumulative counts strictly below 64..8192 (the system counts
+    # only below 4,096).
     assert full.segments_below == (0, 0, 0, 0, 16, 16, 17, 17)
     assert full.below(512) == 0 and full.below(1024) == 16
-    # CP4 reads the bucket for 512 * 4 = 2,048 tokens per rank.
-    assert full.below(512 * 4) == 16 and full.below(128 * 4) == 0
-    assert full.tokens_in_segments_below(1024) == 16 * 512
-    assert full.tokens_in_segments_below(4096) == 16 * 512 + 2048
+    # CP4 reads the bucket for 128 * 4 = 512 tokens per rank.
+    assert full.below(128 * 4) == 0 and full.below(128 * 8) == 16
+    partial = by_label["minimum_effective_span_2049"]
+    assert (partial.packed_tokens, partial.segment_count, partial.max_depth) == (
+        28_672,
+        18,
+        2,
+    )
+    assert full.as_dict()["segments_below"] == full.segments_below

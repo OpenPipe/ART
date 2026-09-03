@@ -77,7 +77,7 @@ def test_full_refit_reproduces_the_table_when_requested() -> None:
         )
 
     train = [c for c in candidates if not held_out(c.cell)]
-    beta = fit.fit_ranking(train, terms, rounds=arguments["rank_rounds"])
+    beta = fit.nnls(*fit.paired_deltas(train, terms))
     if arguments["objective"] == "regret":
         beta = fit.fit_regret(train, terms, beta)
     table = {

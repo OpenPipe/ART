@@ -19,9 +19,9 @@ Method
    (default: every Ellavox group with an odd index, plus any cell name matching
    ``--holdout`` patterns).
 
-Terms are interpretable products of a layout feature and a topology/model
-factor (see ``TERMS``); the fit is a non-negative least squares over their
-coefficients in microseconds per unit.  ``--integerize`` prints the frozen
+Terms are the production module's integer term functions (``TERMS``); the fit
+is a non-negative least squares over their coefficients in microseconds per
+unit, refined by direct regret minimization.  ``--integerize`` prints the frozen
 integer table for ``_planner_cost.py`` and re-checks every ranking under the
 integer model.
 
@@ -58,6 +58,19 @@ from art.trainer_rank._planner_cost import (  # noqa: E402
 
 TERMS = TERM_FUNCTIONS
 DEFAULT_TERMS = tuple(TERMS)
+# Evidence may carry features from an older, wider extractor; only the fields the
+# current LayoutFeatures defines are kept (and compared).
+FEATURE_FIELDS = tuple(LayoutFeatures.__dataclass_fields__)
+
+
+def _project(features: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: tuple(value) if isinstance(value, (list, tuple)) else value
+        for key, value in features.items()
+        if key in FEATURE_FIELDS
+    }
+
+
 NOISE_BAND_PCT = 3.0
 
 
@@ -319,7 +332,34 @@ def export_certificate(
             if report.get(split)
         },
     }
-    path.write_text(json.dumps(payload, indent=1, sort_keys=True, default=str) + "\n")
+    path.write_text(_compact_json(payload) + "\n")
+
+
+def _compact_json(payload: dict[str, Any]) -> str:
+    """Pretty top level, one line per cell and per list entry: diff-friendly
+    without pretty-printing every feature of every candidate."""
+
+    def line(value: Any) -> str:
+        return json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
+
+    parts = []
+    for key in sorted(payload):
+        value = payload[key]
+        if isinstance(value, list):
+            body = ",\n".join("  " + line(item) for item in value)
+            parts.append(f'"{key}": [\n{body}\n ]')
+        elif isinstance(value, dict) and key in (
+            "metrics",
+            "fit_arguments",
+            "manifest",
+        ):
+            body = ",\n".join(
+                f"  {json.dumps(k)}: {line(v)}" for k, v in sorted(value.items())
+            )
+            parts.append(f'"{key}": {{\n{body}\n }}')
+        else:
+            parts.append(f'"{key}": {line(value)}')
+    return "{\n " + ",\n ".join(parts) + "\n}"
 
 
 def load_certificate(path: Path) -> tuple[list[Candidate], dict[str, Any]]:
@@ -330,7 +370,7 @@ def load_certificate(path: Path) -> tuple[list[Candidate], dict[str, Any]]:
         Candidate(
             cell["cell"],
             c["label"],
-            c["features"],
+            _project(c["features"]),
             cell["facts"],
             float(c["median_ms"]),
             int(c["n"]),
@@ -384,7 +424,7 @@ def load_candidates(paths: list[Path]) -> list[Candidate]:
                 Candidate(
                     key,
                     candidate["label"],
-                    candidate["features"],
+                    _project(candidate["features"]),
                     facts,
                     median,
                     len(values),
@@ -392,15 +432,6 @@ def load_candidates(paths: list[Path]) -> list[Candidate]:
                 )
             )
     return candidates
-
-
-def _normalized(features: dict[str, Any]) -> dict[str, Any]:
-    """JSON round-trips turn tuples into lists; compare on a canonical form."""
-
-    return {
-        key: tuple(value) if isinstance(value, (list, tuple)) else value
-        for key, value in features.items()
-    }
 
 
 def selector_check(candidates: list[Candidate]) -> dict[str, dict[str, Any]]:
@@ -444,9 +475,9 @@ def selector_check(candidates: list[Candidate]) -> dict[str, dict[str, Any]]:
             gdn_layers=int(facts["gdn_layers"]),
             refinement_work_budget=2_000,
         ).layout
-        features = _normalized(layout_features(selected).as_dict())
+        features = _project(layout_features(selected).as_dict())
         best = min(members, key=lambda c: c.ms)
-        match = next((c for c in members if _normalized(c.features) == features), None)
+        match = next((c for c in members if _project(c.features) == features), None)
         report[cell] = {
             "selected": match.label if match else "nonuniform (unmeasured)",
             "selected_packed_tokens": features["packed_tokens"],
@@ -456,64 +487,16 @@ def selector_check(candidates: list[Candidate]) -> dict[str, dict[str, Any]]:
     return report
 
 
-def refresh_features(paths: list[Path]) -> None:
-    """Recompute every cell's candidate features with the current extractor.
-
-    Cells are reproducible from their workload description (GRPO shape and
-    seed, heterogeneous seed, or Ellavox corpus group), so evidence recorded
-    with an older feature set can be brought forward without re-timing.
-    Rewrites the ``calibration_cell`` rows in place.
-    """
-
-    import torch
-
-    sys.path.insert(0, str(Path(__file__).resolve().parent))
-    from trainer_rank_landing_acceptance import _calibration_requests
-
-    from art.trainer_rank._planner_cost import layout_features
-    from art.trainer_rank._prefix_tree_planner import (
-        build_canonical_prefix_tree,
-        prefix_tree_layout_candidates,
-    )
-
-    for path in paths:
-        lines = path.read_text().splitlines()
-        out = []
-        for line in lines:
-            if not line.strip():
-                continue
-            row = json.loads(line)
-            if row.get("record_type") == "calibration_cell":
-                group = int(row["workload"].get("group", 0) or 0)
-                requests, _ = _calibration_requests(row["cell"], group=group)
-                tree = build_canonical_prefix_tree(
-                    tuple(r.input_tokens.reshape(-1).to(torch.long) for r in requests)
-                )
-                by_label = {
-                    label: layout_features(candidate.layout).as_dict()
-                    for candidate in prefix_tree_layout_candidates(tree)
-                    for label in candidate.labels
-                }
-                for candidate in row["candidates"]:
-                    # The timed production selection keeps its recorded
-                    # features; only mandatory-family labels are recomputed.
-                    if candidate["label"] in by_label:
-                        candidate["features"] = by_label[candidate["label"]]
-            out.append(json.dumps(row, sort_keys=True, default=str))
-        path.write_text("\n".join(out) + "\n")
-
-
 def term_matrix(candidates: list[Candidate], terms: tuple[str, ...]) -> np.ndarray:
     """Term values in feature units (the integer functions divided by WORK_PER_US)."""
 
     rows = []
     for candidate in candidates:
         features = LayoutFeatures(
-            **{
-                **candidate.features,
-                "segments_below": tuple(candidate.features.get("segments_below", ())),
-                "tokens_below": tuple(candidate.features.get("tokens_below", ())),
-            }
+            packed_tokens=int(candidate.features["packed_tokens"]),
+            segment_count=int(candidate.features["segment_count"]),
+            max_depth=int(candidate.features["max_depth"]),
+            segments_below=tuple(candidate.features.get("segments_below", ())),
         )
         facts = ScoringFacts(
             cp_size=int(candidate.facts["cp"]),
@@ -576,42 +559,6 @@ def paired_deltas(
         xs.append((features[index[id(pair.a)]] - features[index[id(pair.b)]]) * weight)
         ys.append((pair.a.ms - pair.b.ms) * 1_000.0 * weight)
     return np.asarray(xs), np.asarray(ys)
-
-
-def fit_ranking(
-    candidates: list[Candidate],
-    terms: tuple[str, ...],
-    *,
-    rounds: int = 4,
-    boost: float = 4.0,
-) -> np.ndarray:
-    """Non-negative fit with rank-focused reweighting.
-
-    After each least-squares solve, separated pairs (> NOISE_BAND_PCT apart)
-    whose predicted order is wrong have their weight multiplied by ``boost``
-    and the fit repeats, so the coefficients concentrate on the ranking
-    decisions rather than on the large easy deltas.
-    """
-
-    pairs = candidate_pairs(candidates)
-    extra: dict[int, float] = {}
-    beta = nnls(*paired_deltas(candidates, terms, pairs))
-    for _ in range(rounds):
-        predicted = predict(candidates, terms, beta)
-        index = {id(candidate): i for i, candidate in enumerate(candidates)}
-        wrong = [
-            position
-            for position, pair in enumerate(pairs)
-            if pair.separation_pct > NOISE_BAND_PCT
-            and (pair.a.ms < pair.b.ms)
-            != (predicted[index[id(pair.a)]] < predicted[index[id(pair.b)]])
-        ]
-        if not wrong:
-            break
-        for position in wrong:
-            extra[position] = extra.get(position, 1.0) * boost
-        beta = nnls(*paired_deltas(candidates, terms, pairs, extra))
-    return beta
 
 
 def nnls(x: np.ndarray, y: np.ndarray, *, iterations: int = 500) -> np.ndarray:
@@ -800,26 +747,6 @@ def gates_pass(report: dict[str, Any]) -> list[str]:
     return problems
 
 
-def current_score_report(
-    candidates: list[Candidate], paths: list[Path]
-) -> dict[str, Any]:
-    """Regret of the shipped scorer, from the ``current_score_us`` the harness logged."""
-
-    scores: dict[tuple[str, str], float] = {}
-    for path in paths:
-        for line in path.read_text().splitlines():
-            if not line.strip():
-                continue
-            row = json.loads(line)
-            if row.get("record_type") == "calibration_cell":
-                for candidate in row["candidates"]:
-                    scores[(_cell_key(row), candidate["label"])] = float(
-                        candidate["current_score_us"]
-                    )
-    predicted = np.asarray([scores[(c.cell, c.label)] for c in candidates])
-    return evaluate(candidates, predicted)
-
-
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("evidence", nargs="*", type=Path)
@@ -864,21 +791,10 @@ def main() -> None:
     parser.add_argument("--report", default="", help="write the JSON report here")
     parser.add_argument("--integerize", action="store_true")
     parser.add_argument(
-        "--rank-rounds",
-        type=int,
-        default=0,
-        help="rank-focused reweighting rounds after the initial least squares",
-    )
-    parser.add_argument(
         "--objective",
         choices=("lsq", "regret"),
         default="regret",
         help="lsq: weighted non-negative least squares; regret: refine it by direct regret minimization",
-    )
-    parser.add_argument(
-        "--refresh-features",
-        action="store_true",
-        help="recompute candidate features from the reproducible workloads first",
     )
     parser.add_argument(
         "--selector-check",
@@ -886,8 +802,6 @@ def main() -> None:
         help="run the shipped production selector on every measured cell and report its choice",
     )
     arguments = parser.parse_args()
-    if arguments.refresh_features:
-        refresh_features(arguments.evidence)
     terms = tuple(t for t in arguments.terms.split(",") if t)
     excluded = [p for p in arguments.exclude_cells.split(",") if p]
 
@@ -952,7 +866,7 @@ def main() -> None:
 
     train = [c for c in candidates if not held_out(c.cell)]
     test = [c for c in candidates if held_out(c.cell)]
-    beta = fit_ranking(train, terms, rounds=arguments.rank_rounds)
+    beta = nnls(*paired_deltas(train, terms))
     if arguments.objective == "regret":
         beta = fit_regret(train, terms, beta)
     report: dict[str, Any] = {
@@ -961,11 +875,6 @@ def main() -> None:
         "test_cells": len({c.cell for c in test}),
         "train": evaluate(train, predict(train, terms, beta)),
         "test": evaluate(test, predict(test, terms, beta)) if test else None,
-        "current_all": (
-            current_score_report(candidates, arguments.evidence)
-            if arguments.evidence
-            else None
-        ),
         "fit_all": evaluate(candidates, predict(candidates, terms, beta)),
     }
     if arguments.integerize:
@@ -1007,7 +916,7 @@ def main() -> None:
         )
         for cell in unmeasured:
             print("   nonuniform selection not in measured family:", cell)
-    for split in ("train", "test", "current_all", "fit_all", "integer_all"):
+    for split in ("train", "test", "fit_all", "integer_all"):
         block = report.get(split)
         if not block:
             continue
@@ -1036,7 +945,6 @@ def main() -> None:
             arguments={
                 "terms": list(terms),
                 "objective": arguments.objective,
-                "rank_rounds": arguments.rank_rounds,
                 "holdout": arguments.holdout,
                 "exclude_cells": excluded,
                 "require_complete": arguments.require_complete,
