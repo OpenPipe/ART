@@ -28,8 +28,11 @@ run_cell cal-grpo-g8      Qwen/Qwen3.5-4B 0
 run_cell cal-grpo-g16     Qwen/Qwen3.5-4B 0
 run_cell cal-grpo-g4x4    Qwen/Qwen3.5-4B 0
 run_cell cal-hetero       Qwen/Qwen3.5-4B 0
+run_cell cal-hetero2      Qwen/Qwen3.5-4B 0
+run_cell cal-hetero3      Qwen/Qwen3.5-4B 0
 run_cell cal-grpo-g8-long Qwen/Qwen3-4B   2
 run_cell cal-grpo-g8      Qwen/Qwen3-4B   0
+run_cell cal-hetero2      Qwen/Qwen3-4B   0
 if [ -f dev/_trainer_rank_ellavox_qwen35_4b_tokens.json ]; then
   for g in 0 1 2 3 4 5 6 7; do
     run_cell cal-ellavox Qwen/Qwen3.5-4B 0 "$g"

@@ -441,7 +441,7 @@
    "tp": 2
   },
   {
-   "campaign": "local2",
+   "campaign": "local",
    "cell": "cal-hetero2",
    "cp": 1,
    "group": null,
@@ -461,7 +461,7 @@
    "tp": 1
   },
   {
-   "campaign": "local2",
+   "campaign": "local",
    "cell": "cal-hetero2",
    "cp": 1,
    "group": null,
@@ -501,7 +501,7 @@
    "tp": 2
   },
   {
-   "campaign": "local2",
+   "campaign": "local",
    "cell": "cal-hetero3",
    "cp": 1,
    "group": null,
@@ -581,7 +581,7 @@
    "tp": 2
   }
  ],
- "description": "Expected calibration cells for the coefficient-version-2 campaign (2026-09-02): every cell each recipe launches, keyed exactly as the fitter keys cells. The fitter's --manifest validation requires every non-excluded cell to be present with a complete mandatory candidate set and rejects unexpected cells; exclusions must be listed here with a reason.",
+ "description": "Expected calibration cells for the coefficient-version-2 campaign (2026-09-02): the exact union of the cells the checked-in recipes launch (dev/trainer_rank_cost_calibration_local.sh; the cp4 and 2gpu sky recipes in both CELL_SET modes), keyed exactly as the fitter keys cells. tests/unit/test_planner_cost_manifest_recipes.py asserts recipes and manifest agree. The fitter's --manifest validation requires every non-excluded cell to be present with a complete mandatory candidate set and rejects unexpected cells; exclusions must be listed here with a reason.",
  "excluded": [
   {
    "key": "cal-ellavox|Qwen/Qwen3.5-4B|L32|tp1|cp4|g1",
