@@ -1,3 +1,4 @@
+from array import array
 from collections.abc import Iterable, Sequence
 import os
 import random
@@ -15,10 +16,16 @@ from ..megatron.prefix_tree_packing import (
 from ..megatron.prefix_tree_packing import (
     prefix_tree_pack_segments as _prefix_tree_pack_segments,
 )
-from ..training.tokenized import (
-    MAX_TOKENIZED_PHYSICAL_VALUES,
-    TokenizedDatum,
-    TokenizedLossName,
+from ..pipeline_tuner.config import PackedGroupShape, PackingLeafShape
+from ..training.contracts import PolicyTokenCount, TrainingOutcome
+from ..training.token_matrix import (
+    MAX_MATRIX_VALUES,
+    MAX_TARGET_CANDIDATES,
+    NamedLossRequest,
+    TokenMatrix,
+    TokenMatrixBatch,
+    active_loss_positions,
+    validate_token_matrix_batch,
 )
 from ..types import Verbosity
 from .moe_routing import (
@@ -54,17 +61,23 @@ class PackedTensors(TypedDict):
     prefix_tree_packing_stats: NotRequired[PrefixTreePackingStats]
     original_logprobs: NotRequired[torch.Tensor]
     target_tokens: NotRequired[torch.Tensor]
-    loss_weights: NotRequired[torch.Tensor]
-    behavior_logprobs: NotRequired[torch.Tensor]
-    token_advantages: NotRequired[torch.Tensor]
-    tokenized_output_map: NotRequired["TokenizedOutputMap"]
+    projection_ids: NotRequired[torch.Tensor]
+    logical_projection_ids: NotRequired[torch.Tensor]
+    logical_matrix_indices: NotRequired[torch.Tensor]
+    logical_target_indices: NotRequired[torch.Tensor]
+    logical_value_mask: NotRequired[torch.Tensor]
+    logical_loss_weights: NotRequired[torch.Tensor]
+    logical_behavior_logprobs: NotRequired[torch.Tensor]
+    logical_advantages: NotRequired[torch.Tensor]
+    token_matrix_output_map: NotRequired["TokenMatrixOutputMap"]
+    token_matrix_training_outcome: NotRequired[TrainingOutcome]
 
 
-class TokenizedOutputMap(BaseModel):
+class TokenMatrixOutputMap(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    packed_positions: tuple[tuple[int, ...], ...] = Field(min_length=1)
-    candidate_counts: tuple[int, ...] = Field(min_length=1)
+    matrix_ids: tuple[str, ...] = Field(min_length=1)
+    target_shapes: tuple[tuple[int, int], ...] = Field(min_length=1)
 
 
 # Exact tokenized inputs have no model-specific pad token. Padding positions are
@@ -94,11 +107,12 @@ class _PrefixTreePackItem(NamedTuple):
     pixel_values: torch.Tensor | None
     image_grid_thw: torch.Tensor | None
     moe_routes: MoeRouteArray | MoeRouteSegments | None
-    datum_index: int | None = None
+    matrix_index: int | None = None
     target_tokens: np.ndarray | None = None
     loss_weights: np.ndarray | None = None
     behavior_logprobs: np.ndarray | None = None
     token_advantages: np.ndarray | None = None
+    placement_group_id: int | None = None
 
 
 class _PrefixTreeRowPlan(NamedTuple):
@@ -132,6 +146,22 @@ class _PrefixTreeBin:
         self.token_count += self.insertion_delta(leaf)
         self.occupied_segments.update(segment_id for segment_id, _ in leaf.segment_path)
         self.leaves.append(leaf)
+
+    def insertion_delta_group(self, leaves: Sequence[_PrefixTreeLeaf]) -> int:
+        segments = {
+            segment_id: length
+            for leaf in leaves
+            for segment_id, length in leaf.segment_path
+            if segment_id not in self.occupied_segments
+        }
+        return sum(segments.values())
+
+    def add_group(self, leaves: Sequence[_PrefixTreeLeaf]) -> None:
+        self.token_count += self.insertion_delta_group(leaves)
+        self.occupied_segments.update(
+            segment_id for leaf in leaves for segment_id, _ in leaf.segment_path
+        )
+        self.leaves.extend(leaves)
 
 
 class PrefixTreePackingEstimate(NamedTuple):
@@ -253,30 +283,38 @@ def packed_tensors_from_tokenized_results(
     )
 
 
-def packed_tensors_from_tokenized_datums(
-    datums: Sequence[TokenizedDatum],
+def packed_tensors_from_token_matrices(
+    batch: TokenMatrixBatch,
     *,
-    loss: TokenizedLossName,
+    loss: NamedLossRequest | None,
     seq_len: int,
     pad_token_id: int = TOKENIZED_INPUT_PADDING_ID,
     pack_results: bool = True,
+    return_token_logprobs: bool = True,
+    resolved_routes: dict[str, MoeRouteArray | MoeRouteSegments] | None = None,
     min_prefix_tree_shared_segment_length: int = (
         DEFAULT_MIN_PREFIX_TREE_SHARED_SEGMENT_LENGTH
     ),
 ) -> PackedTensors:
-    """Pack exact named-loss inputs without changing their logical tensors."""
-    if not datums:
-        raise ValueError("tokenized packing requires at least one datum")
-    sharing_ids: dict[tuple[int, tuple[int, ...]], int] = {}
+    """Build one physical prefix tree while retaining every logical occurrence."""
+
+    validate_token_matrix_batch(
+        batch,
+        loss,
+        output_rows=("learner_logprobs",) if return_token_logprobs else (),
+    )
+    component_ids = _matrix_component_ids(batch, loss)
+    routes = _resolved_matrix_routes(batch, resolved_routes)
     items = [
-        _tokenized_datum_pack_item(
-            datum,
-            datum_index=index,
+        _token_matrix_pack_item(
+            matrix,
+            matrix_index=index,
             loss=loss,
             seq_len=seq_len,
-            sharing_ids=sharing_ids,
+            route=routes.get(matrix.matrix_id),
+            placement_group_id=component_ids.get(matrix.matrix_id),
         )
-        for index, datum in enumerate(datums)
+        for index, matrix in enumerate(batch.matrices)
     ]
     return prefix_tree_pack(
         tokenized_results=[],
@@ -286,9 +324,46 @@ def packed_tensors_from_tokenized_datums(
         advantage_balance=0.0,
         verbosity=0,
         pack_results=pack_results,
-        include_moe_routing=False,
+        include_moe_routing=bool(routes),
         min_prefix_tree_shared_segment_length=(min_prefix_tree_shared_segment_length),
         _items=items,
+        _token_matrix_batch=batch,
+        _return_token_logprobs=return_token_logprobs,
+    )
+
+
+def token_matrix_packing_shapes(
+    batch: TokenMatrixBatch,
+    loss: NamedLossRequest,
+) -> tuple[PackedGroupShape, ...]:
+    """Expose bounded logical placement units with stable matrix identities."""
+
+    by_id = {matrix.matrix_id: matrix for matrix in batch.matrices}
+    assigned = {
+        matrix_id
+        for component in loss.placement_components()
+        for matrix_id in component
+    }
+    units = [*loss.placement_components()]
+    units.extend(
+        (matrix.matrix_id,)
+        for matrix in batch.matrices
+        if matrix.matrix_id not in assigned
+    )
+    return tuple(
+        PackedGroupShape(
+            leaves=tuple(
+                PackingLeafShape(
+                    matrix_id=matrix_id,
+                    token_ids=array(
+                        "I", by_id[matrix_id].row("token_ids").dense_values()
+                    ),
+                    shareable_length=by_id[matrix_id].token_count,
+                )
+                for matrix_id in unit
+            )
+        )
+        for unit in units
     )
 
 
@@ -306,11 +381,15 @@ def prefix_tree_pack(
         DEFAULT_MIN_PREFIX_TREE_SHARED_SEGMENT_LENGTH
     ),
     _items: list[_PrefixTreePackItem] | None = None,
+    _token_matrix_batch: TokenMatrixBatch | None = None,
+    _return_token_logprobs: bool = True,
 ) -> PackedTensors:
     if min_prefix_tree_shared_segment_length < 0:
         raise ValueError("min_prefix_tree_shared_segment_length must be >= 0")
     if _items is not None and tokenized_results:
         raise ValueError("prefix_tree_pack accepts results or prebuilt items")
+    if _token_matrix_batch is not None and _items is None:
+        raise ValueError("TokenMatrix packing requires prebuilt items")
     items: list[_PrefixTreePackItem] = [] if _items is None else _items
     moe_routing_pack_stats = MoeRoutingPackStats()
 
@@ -347,6 +426,8 @@ def prefix_tree_pack(
     row_plans = [plan for _, plan in planned_rows]
 
     num_sequences = len(rows)
+    if _token_matrix_batch is not None and num_sequences * seq_len > MAX_MATRIX_VALUES:
+        raise ValueError("TokenMatrix physical plan exceeds the configured value limit")
     tokens_np = np.full((num_sequences, seq_len), pad_token_id, dtype=np.int64)
     group_ids_np = np.full((num_sequences, seq_len), -1, dtype=np.int64)
     parent_ids_np = np.full((num_sequences, seq_len), -1, dtype=np.int64)
@@ -355,41 +436,9 @@ def prefix_tree_pack(
     logprobs_np = np.full((num_sequences, seq_len), np.nan, dtype=np.float32)
     advantages_np = np.zeros((num_sequences, seq_len), dtype=np.float32)
     weights_np = np.zeros((num_sequences, seq_len), dtype=np.float32)
-    tokenized_items = [item for item in items if item.datum_index is not None]
-    if tokenized_items and len(tokenized_items) != len(items):
-        raise RuntimeError("one packed batch cannot mix ART and tokenized-loss items")
-    candidate_capacity = max(
-        (
-            int(item.target_tokens.shape[1])
-            for item in tokenized_items
-            if item.target_tokens is not None
-        ),
-        default=0,
-    )
-    physical_values = num_sequences * seq_len * candidate_capacity
-    if physical_values > MAX_TOKENIZED_PHYSICAL_VALUES:
-        raise ValueError(
-            "packed tokenized work exceeds the configured value limit: "
-            f"{physical_values} > {MAX_TOKENIZED_PHYSICAL_VALUES}"
-        )
-    tokenized_shape = (num_sequences, seq_len, candidate_capacity)
-    target_tokens_np = (
-        np.full(tokenized_shape, TOKENIZED_TARGET_PADDING_ID, dtype=np.int64)
-        if tokenized_items
-        else None
-    )
-    loss_weights_np = (
-        np.zeros(tokenized_shape, dtype=np.float32) if tokenized_items else None
-    )
-    behavior_logprobs_np = (
-        np.zeros(tokenized_shape, dtype=np.float32) if tokenized_items else None
-    )
-    token_advantages_np = (
-        np.zeros(tokenized_shape, dtype=np.float32) if tokenized_items else None
-    )
     packed_positions = (
         [np.full(len(item.token_ids), -1, dtype=np.int64) for item in items]
-        if tokenized_items
+        if _token_matrix_batch is not None
         else None
     )
     pixel_values: list[torch.Tensor | None] = []
@@ -428,22 +477,25 @@ def prefix_tree_pack(
             route_tensor=row_route_tensor,
             route_shape=(None if route_contract is None else route_contract[1:]),
             include_moe_routing=include_moe_routing,
-            target_tokens=(
-                None if target_tokens_np is None else target_tokens_np[index]
-            ),
-            loss_weights=(None if loss_weights_np is None else loss_weights_np[index]),
-            behavior_logprobs=(
-                None if behavior_logprobs_np is None else behavior_logprobs_np[index]
-            ),
-            token_advantages=(
-                None if token_advantages_np is None else token_advantages_np[index]
-            ),
             packed_positions=packed_positions,
             packed_row=index,
             packed_sequence_length=seq_len,
         )
         pixel_values.append(_packed_row_tensor_list(row, "pixel_values"))
         image_grid_thw.append(_packed_row_tensor_list(row, "image_grid_thw"))
+    token_matrix_tensors = None
+    if _token_matrix_batch is not None:
+        if packed_positions is None:
+            raise RuntimeError("TokenMatrix packing did not retain logical positions")
+        token_matrix_tensors = _materialize_token_matrix_logical_tensors(
+            batch=_token_matrix_batch,
+            items=items,
+            packed_positions=packed_positions,
+            num_sequences=num_sequences,
+            sequence_length=seq_len,
+            assistant_mask=assistant_mask_np,
+            return_token_logprobs=_return_token_logprobs,
+        )
     assistant_mask_tensor = torch.from_numpy(assistant_mask_np)
     weights_tensor = torch.from_numpy(weights_np)
     weights_tensor = torch.where(
@@ -501,31 +553,8 @@ def prefix_tree_pack(
             num_experts=num_experts,
             pack_stats=moe_routing_pack_stats,
         )
-    if tokenized_items:
-        assert target_tokens_np is not None
-        assert loss_weights_np is not None
-        assert behavior_logprobs_np is not None
-        assert token_advantages_np is not None
-        assert packed_positions is not None
-        if any(np.any(positions < 0) for positions in packed_positions):
-            raise RuntimeError("tokenized output map does not cover every input token")
-        packed_tensors.update(
-            target_tokens=torch.from_numpy(target_tokens_np),
-            loss_weights=torch.from_numpy(loss_weights_np),
-            behavior_logprobs=torch.from_numpy(behavior_logprobs_np),
-            token_advantages=torch.from_numpy(token_advantages_np),
-            tokenized_output_map=TokenizedOutputMap(
-                packed_positions=tuple(
-                    tuple(int(value) for value in positions)
-                    for positions in packed_positions
-                ),
-                candidate_counts=tuple(
-                    int(item.target_tokens.shape[1])
-                    for item in items
-                    if item.target_tokens is not None
-                ),
-            ),
-        )
+    if token_matrix_tensors is not None:
+        packed_tensors.update(token_matrix_tensors)
     return packed_tensors
 
 
@@ -539,18 +568,35 @@ def _prefix_tree_pack_rows(
     if not items:
         return []
     if not pack_results:
-        return [
-            (
-                [item],
-                _prefix_tree_row_plan(
-                    [item],
-                    seq_len=seq_len,
-                    pack_results=False,
-                    min_shared_segment_length=min_shared_segment_length,
-                ),
+        grouped: dict[tuple[str, int], list[_PrefixTreePackItem]] = {}
+        for index, item in enumerate(items):
+            key = (
+                ("item", index)
+                if item.placement_group_id is None
+                else ("component", item.placement_group_id)
             )
-            for item in items
-        ]
+            grouped.setdefault(key, []).append(item)
+        planned_rows = []
+        for row in grouped.values():
+            required_tokens = sum(len(item.token_ids) for item in row)
+            if required_tokens > seq_len:
+                raise RuntimeError(
+                    "TokenMatrix placement component exceeds sequence length "
+                    "without prefix sharing: "
+                    f"cost={required_tokens}, seq_len={seq_len}"
+                )
+            plan = _prefix_tree_row_plan(
+                row,
+                seq_len=seq_len,
+                pack_results=False,
+                min_shared_segment_length=min_shared_segment_length,
+            )
+            if plan.length != required_tokens:
+                raise RuntimeError(
+                    "unpacked TokenMatrix component did not retain every token"
+                )
+            planned_rows.append((row, plan))
+        return planned_rows
 
     segments = _prefix_tree_pack_segments(
         (item.sharing_ids for item in items),
@@ -566,7 +612,11 @@ def _prefix_tree_pack_rows(
     leaves = [
         _PrefixTreeLeaf(
             item_index=index,
-            packing_group_id=item.prompt_id,
+            packing_group_id=(
+                item.placement_group_id
+                if item.placement_group_id is not None
+                else len(items) + index
+            ),
             segment_path=tuple(paths[index]),
             empty_bin_cost=sum(length for _, length in paths[index]),
         )
@@ -581,7 +631,7 @@ def _prefix_tree_pack_rows(
     grouped: dict[int, list[_PrefixTreeLeaf]] = {}
     for leaf in leaves:
         grouped.setdefault(leaf.packing_group_id, []).append(leaf)
-    bins = _place_prefix_tree_leaves(grouped.values(), seq_len=seq_len)
+    bins = _place_prefix_tree_groups(grouped.values(), seq_len=seq_len)
 
     planned_rows = []
     for packed_bin in bins:
@@ -610,6 +660,46 @@ def _prefix_tree_pack_rows(
             )
         planned_rows.append((row, plan))
     return planned_rows
+
+
+def _place_prefix_tree_groups(
+    groups: Iterable[Sequence[_PrefixTreeLeaf]],
+    *,
+    seq_len: int,
+) -> list[_PrefixTreeBin]:
+    """Best-fit placement where every loss-connected group is one hard unit."""
+
+    units = []
+    for group in groups:
+        leaves = tuple(group)
+        segment_lengths = {
+            segment_id: length
+            for leaf in leaves
+            for segment_id, length in leaf.segment_path
+        }
+        empty_cost = sum(segment_lengths.values())
+        if empty_cost > seq_len:
+            raise RuntimeError(
+                "TokenMatrix placement component exceeds sequence length: "
+                f"cost={empty_cost}, seq_len={seq_len}"
+            )
+        units.append((empty_cost, leaves))
+    units.sort(key=lambda item: item[0], reverse=True)
+
+    bins: list[_PrefixTreeBin] = []
+    for _empty_cost, leaves in units:
+        best_bin = None
+        best_remaining = seq_len + 1
+        for candidate in bins:
+            count = candidate.token_count + candidate.insertion_delta_group(leaves)
+            if count <= seq_len and seq_len - count < best_remaining:
+                best_bin = candidate
+                best_remaining = seq_len - count
+        if best_bin is None:
+            best_bin = _PrefixTreeBin()
+            bins.append(best_bin)
+        best_bin.add_group(leaves)
+    return bins
 
 
 def _place_prefix_tree_leaves(
@@ -741,61 +831,125 @@ def _prefix_tree_pack_item(
     return _truncate_prefix_tree_pack_item(item, seq_len)
 
 
-def _tokenized_datum_pack_item(
-    datum: TokenizedDatum,
+def _token_matrix_pack_item(
+    matrix: TokenMatrix,
     *,
-    datum_index: int,
-    loss: TokenizedLossName,
+    matrix_index: int,
+    loss: NamedLossRequest | None,
     seq_len: int,
-    sharing_ids: dict[tuple[int, tuple[int, ...]], int],
+    route: MoeRouteArray | MoeRouteSegments | None,
+    placement_group_id: int | None,
 ) -> _PrefixTreePackItem:
-    datum.validate_for_loss(loss)
-    if len(datum.input_tokens) > seq_len:
+    if matrix.token_count > seq_len:
         raise ValueError(
-            "tokenized datum exceeds packed sequence length: "
-            f"{len(datum.input_tokens)} > {seq_len}"
+            "TokenMatrix exceeds packed sequence length: "
+            f"{matrix.token_count} > {seq_len}"
         )
-    targets = np.asarray(datum.target_tokens, dtype=np.int64)
-    coefficients = datum.weights if loss == "cross_entropy" else datum.advantages
-    assert coefficients is not None
-    coefficient_array = np.asarray(coefficients, dtype=np.float32)
-    loss_positions = np.flatnonzero(np.any(coefficient_array != 0.0, axis=1))
-    if loss_positions.size == 0:
-        raise ValueError(f"{loss} datum has no loss-bearing target")
+    tokens = tuple(int(value) for value in matrix.row("token_ids").dense_values())
+    target_row = matrix.row("target_token_ids")
+    targets = np.asarray(target_row.dense_values(), dtype=np.int64).reshape(
+        target_row.shape
+    )
+    behavior = _matrix_float_row(matrix, "behavior_logprobs", target_row.shape)
+    advantages = _matrix_float_row(matrix, "advantages", target_row.shape)
+    active = np.asarray(active_loss_positions(matrix, loss), dtype=np.bool_)
+    default_weight = (
+        1.0
+        if loss is not None
+        and loss.name in {"importance_sampling", "cispo"}
+        and matrix.optional_row("loss_weights") is None
+        else 0.0
+    )
+    weights = _matrix_float_row(
+        matrix,
+        "loss_weights",
+        target_row.shape,
+        default=default_weight,
+    )
+    weights = np.where(active[:, None], weights, 0.0).astype(np.float32, copy=False)
+    if loss is None or loss.name not in {"importance_sampling", "cispo"}:
+        # Losses without an advantage row use this otherwise-unused tensor as a
+        # one-per-position activity marker for topology-invariant normalization.
+        advantages = np.zeros_like(weights)
+        for position in np.flatnonzero(active):
+            candidates = np.flatnonzero(weights[position] != 0.0)
+            if candidates.size:
+                advantages[position, int(candidates[0])] = 1.0
     item = _PrefixTreePackItem(
-        token_ids=datum.input_tokens,
-        sharing_ids=tuple(
-            sharing_ids.setdefault((token, tuple(target)), len(sharing_ids))
-            for token, target in zip(
-                datum.input_tokens, datum.target_tokens, strict=True
-            )
-        ),
-        input_pos=np.arange(len(datum.input_tokens), dtype=np.int64),
-        assistant_mask=np.any(coefficient_array != 0.0, axis=1),
-        logprobs=np.full(len(datum.input_tokens), np.nan, dtype=np.float32),
+        token_ids=tokens,
+        sharing_ids=tokens,
+        input_pos=np.arange(matrix.token_count, dtype=np.int64),
+        assistant_mask=active,
+        logprobs=np.full(matrix.token_count, np.nan, dtype=np.float32),
         advantage=1.0,
         weight=1.0,
-        prompt_id=datum_index,
-        shareable_length=int(loss_positions[0]),
+        prompt_id=matrix_index,
+        shareable_length=matrix.token_count,
         pixel_values=None,
         image_grid_thw=None,
-        moe_routes=None,
-        datum_index=datum_index,
+        moe_routes=route,
+        matrix_index=matrix_index,
         target_tokens=targets,
-        loss_weights=(coefficient_array if loss == "cross_entropy" else None),
-        behavior_logprobs=(
-            None
-            if datum.logprobs is None
-            else np.asarray(datum.logprobs, dtype=np.float32)
-        ),
-        token_advantages=(
-            None
-            if datum.advantages is None
-            else np.asarray(datum.advantages, dtype=np.float32)
-        ),
+        loss_weights=weights,
+        behavior_logprobs=behavior,
+        token_advantages=advantages,
+        placement_group_id=placement_group_id,
     )
     _validate_prefix_tree_pack_item(item)
     return item
+
+
+def _matrix_float_row(
+    matrix: TokenMatrix,
+    name: str,
+    shape: tuple[int, ...],
+    *,
+    default: float = 0.0,
+) -> np.ndarray:
+    row = matrix.optional_row(name)
+    if row is None:
+        return np.full(shape, default, dtype=np.float32)
+    return np.asarray(row.dense_values(), dtype=np.float32).reshape(shape)
+
+
+def _matrix_component_ids(
+    batch: TokenMatrixBatch,
+    loss: NamedLossRequest | None,
+) -> dict[str, int]:
+    if loss is None:
+        return {}
+    return {
+        matrix_id: component_id
+        for component_id, component in enumerate(loss.placement_components())
+        for matrix_id in component
+    }
+
+
+def _resolved_matrix_routes(
+    batch: TokenMatrixBatch,
+    resolved: dict[str, MoeRouteArray | MoeRouteSegments] | None,
+) -> dict[str, MoeRouteArray | MoeRouteSegments]:
+    from .token_matrix import inline_routes_array
+
+    routes = dict(resolved or {})
+    for route in batch.routes:
+        if route.kind == "captured":
+            raise ValueError(
+                "captured TokenMatrix routes must be resolved before packing"
+            )
+        if route.kind == "retained":
+            if route.matrix_id not in routes:
+                raise ValueError(
+                    "retained TokenMatrix routes must be resolved before packing"
+                )
+            continue
+        inline = inline_routes_array(route)
+        previous = routes.setdefault(route.matrix_id, inline)
+        if previous is not inline:
+            raise ValueError("TokenMatrix routes were supplied twice")
+    if routes and set(routes) != {matrix.matrix_id for matrix in batch.matrices}:
+        raise ValueError("routing replay requires routes for every TokenMatrix")
+    return routes
 
 
 def _validate_prefix_tree_pack_item(item: _PrefixTreePackItem) -> None:
@@ -816,23 +970,23 @@ def _validate_prefix_tree_pack_item(item: _PrefixTreePackItem) -> None:
             "Prefix-tree MoE route token count does not match token IDs: "
             f"{item.moe_routes.shape[0]} != {token_count}"
         )
-    tokenized = (
+    logical = (
         item.target_tokens,
         item.loss_weights,
         item.behavior_logprobs,
         item.token_advantages,
     )
-    if item.datum_index is None:
-        if any(value is not None for value in tokenized):
-            raise RuntimeError("ART pack items cannot carry tokenized-loss tensors")
+    if item.matrix_index is None:
+        if any(value is not None for value in logical):
+            raise RuntimeError("ART pack items cannot carry TokenMatrix tensors")
         return
     if item.target_tokens is None or any(
         value is not None and value.shape != item.target_tokens.shape
-        for value in tokenized[1:]
+        for value in logical[1:]
     ):
-        raise RuntimeError("Tokenized-loss tensors must share one exact shape")
+        raise RuntimeError("TokenMatrix logical tensors must share one exact shape")
     if item.target_tokens.shape[0] != token_count:
-        raise RuntimeError("Tokenized-loss tensors must align with input tokens")
+        raise RuntimeError("TokenMatrix logical tensors must align with input tokens")
 
 
 def prefix_tree_shareable_length(
@@ -881,16 +1035,7 @@ def _truncate_prefix_tree_pack_item(
         pixel_values=item.pixel_values,
         image_grid_thw=item.image_grid_thw,
         moe_routes=item.moe_routes,
-        datum_index=item.datum_index,
-        target_tokens=_slice_optional(item.target_tokens, seq_len),
-        loss_weights=_slice_optional(item.loss_weights, seq_len),
-        behavior_logprobs=_slice_optional(item.behavior_logprobs, seq_len),
-        token_advantages=_slice_optional(item.token_advantages, seq_len),
     )
-
-
-def _slice_optional(value: np.ndarray | None, end: int) -> np.ndarray | None:
-    return None if value is None else value[:end]
 
 
 def _first_trainable_token_index(
@@ -939,10 +1084,6 @@ def _materialize_prefix_tree_row(
     route_tensor: np.ndarray | None,
     route_shape: tuple[int, int] | None,
     include_moe_routing: bool,
-    target_tokens: np.ndarray | None = None,
-    loss_weights: np.ndarray | None = None,
-    behavior_logprobs: np.ndarray | None = None,
-    token_advantages: np.ndarray | None = None,
     packed_positions: list[np.ndarray] | None = None,
     packed_row: int = 0,
     packed_sequence_length: int = 0,
@@ -964,48 +1105,12 @@ def _materialize_prefix_tree_row(
         logprobs[dst_start:dst_end] = item.logprobs[src_start:src_end]
         advantages[dst_start:dst_end] = item.advantage
         weights[dst_start:dst_end] = item.weight
-        if item.target_tokens is not None:
-            if (
-                target_tokens is None
-                or loss_weights is None
-                or behavior_logprobs is None
-                or token_advantages is None
-                or packed_positions is None
-                or item.datum_index is None
-            ):
-                raise RuntimeError("tokenized-loss materialization is incomplete")
-            candidates = int(item.target_tokens.shape[1])
-            target_tokens[dst_start:dst_end, :candidates] = item.target_tokens[
-                src_start:src_end
-            ]
-            _copy_optional_loss_tensor(
-                loss_weights,
-                item.loss_weights,
-                dst_start=dst_start,
-                src_start=src_start,
-                src_end=src_end,
-                candidates=candidates,
-            )
-            _copy_optional_loss_tensor(
-                behavior_logprobs,
-                item.behavior_logprobs,
-                dst_start=dst_start,
-                src_start=src_start,
-                src_end=src_end,
-                candidates=candidates,
-            )
-            _copy_optional_loss_tensor(
-                token_advantages,
-                item.token_advantages,
-                dst_start=dst_start,
-                src_start=src_start,
-                src_end=src_end,
-                candidates=candidates,
-            )
+        if packed_positions is not None:
             for sequence_index in segment.sequence_indices:
                 source = row[sequence_index]
-                assert source.datum_index is not None
-                packed_positions[source.datum_index][src_start:src_end] = (
+                if source.matrix_index is None:
+                    raise RuntimeError("TokenMatrix occurrence mapping is incomplete")
+                packed_positions[source.matrix_index][src_start:src_end] = (
                     packed_row * packed_sequence_length
                     + np.arange(dst_start, dst_end, dtype=np.int64)
                 )
@@ -1030,19 +1135,205 @@ def _materialize_prefix_tree_row(
             )
 
 
-def _copy_optional_loss_tensor(
-    destination: np.ndarray,
-    source: np.ndarray | None,
+def _materialize_token_matrix_logical_tensors(
     *,
-    dst_start: int,
-    src_start: int,
-    src_end: int,
-    candidates: int,
-) -> None:
-    if source is not None:
-        destination[dst_start : dst_start + src_end - src_start, :candidates] = source[
-            src_start:src_end
-        ]
+    batch: TokenMatrixBatch,
+    items: list[_PrefixTreePackItem],
+    packed_positions: list[np.ndarray],
+    num_sequences: int,
+    sequence_length: int,
+    assistant_mask: np.ndarray,
+    return_token_logprobs: bool,
+) -> dict[str, Any]:
+    if len(items) != len(batch.matrices) or len(packed_positions) != len(items):
+        raise RuntimeError("TokenMatrix logical inputs are not aligned")
+
+    packed_rows: list[int] = []
+    logical_entry_counts = [0] * num_sequences
+    for item, positions in zip(items, packed_positions, strict=True):
+        if np.any(positions < 0):
+            raise RuntimeError("TokenMatrix occurrence map is incomplete")
+        rows = {int(position) // sequence_length for position in positions}
+        if len(rows) != 1:
+            raise RuntimeError("one TokenMatrix must remain within one packed row")
+        packed_row = next(iter(rows))
+        packed_rows.append(packed_row)
+        targets = item.target_tokens
+        weights = item.loss_weights
+        advantages = item.token_advantages
+        if targets is None or weights is None or advantages is None:
+            raise RuntimeError("TokenMatrix item is missing logical loss rows")
+        logical_entry_counts[packed_row] += (
+            int(targets.size)
+            if return_token_logprobs
+            else int(np.count_nonzero((weights != 0.0) | (advantages != 0.0)))
+        )
+    logical_width = max(max(logical_entry_counts, default=0), 1)
+    padded_logical_value_count = num_sequences * logical_width
+    if padded_logical_value_count > MAX_MATRIX_VALUES:
+        raise ValueError(
+            "TokenMatrix padded physical or logical plan exceeds the configured "
+            "value limit"
+        )
+
+    # The physical target union is deduplicated by (physical token, target
+    # token), while the logical entries below retain every caller occurrence.
+    # Projection IDs are microbatch-global because the gather flattens rows.
+    position_targets: list[dict[int, tuple[int, int]]] = [
+        {} for _ in range(num_sequences * sequence_length)
+    ]
+    next_projection_id = 0
+    entries: list[list[tuple[int, int, int, float, float, float]]] = [
+        [] for _ in range(num_sequences)
+    ]
+
+    accepted_positions = 0
+    policy_counts: dict[int, int] = {}
+    policy_applicable = any(
+        matrix.optional_row("policy_version") is not None for matrix in batch.matrices
+    )
+    candidate_capacity = 1
+    for matrix_index, (item, packed_row) in enumerate(
+        zip(items, packed_rows, strict=True)
+    ):
+        targets = item.target_tokens
+        weights = item.loss_weights
+        behavior = item.behavior_logprobs
+        advantages = item.token_advantages
+        if any(value is None for value in (targets, weights, behavior, advantages)):
+            raise RuntimeError("TokenMatrix item is missing logical loss rows")
+        assert targets is not None
+        assert weights is not None
+        assert behavior is not None
+        assert advantages is not None
+        positions = packed_positions[matrix_index]
+        candidate_count = int(targets.shape[1])
+        policy_row = batch.matrices[matrix_index].optional_row("policy_version")
+        policy_values = None if policy_row is None else policy_row.dense_values()
+        for logical_position, physical_position in enumerate(positions):
+            active_position = bool(item.assistant_mask[logical_position])
+            if active_position:
+                assistant_mask.reshape(-1)[int(physical_position)] = True
+                accepted_positions += 1
+                if policy_values is not None:
+                    policy_version = int(
+                        policy_values[logical_position * policy_row.trailing_width]
+                    )
+                    policy_counts[policy_version] = (
+                        policy_counts.get(policy_version, 0) + 1
+                    )
+            for candidate in range(candidate_count):
+                weight = float(weights[logical_position, candidate])
+                advantage = float(advantages[logical_position, candidate])
+                if not return_token_logprobs and weight == 0.0 and advantage == 0.0:
+                    continue
+                target = int(targets[logical_position, candidate])
+                target_slots = position_targets[int(physical_position)]
+                slot_projection = target_slots.get(target)
+                if slot_projection is None:
+                    slot = len(target_slots)
+                    if slot >= MAX_TARGET_CANDIDATES:
+                        raise ValueError(
+                            "shared TokenMatrix target union exceeds the candidate limit"
+                        )
+                    candidate_capacity = max(candidate_capacity, slot + 1)
+                    if (
+                        num_sequences * sequence_length * candidate_capacity
+                        > MAX_MATRIX_VALUES
+                    ):
+                        raise ValueError(
+                            "TokenMatrix padded physical or logical plan exceeds the "
+                            "configured value limit"
+                        )
+                    projection_id = next_projection_id
+                    next_projection_id += 1
+                    slot_projection = (slot, projection_id)
+                    target_slots[target] = slot_projection
+                _slot, projection_id = slot_projection
+                entries[packed_row].append(
+                    (
+                        matrix_index,
+                        logical_position * candidate_count + candidate,
+                        projection_id,
+                        weight,
+                        float(behavior[logical_position, candidate]),
+                        advantage,
+                    )
+                )
+
+    physical_value_count = num_sequences * sequence_length * candidate_capacity
+    if physical_value_count > MAX_MATRIX_VALUES:
+        raise ValueError(
+            "TokenMatrix padded physical or logical plan exceeds the configured "
+            "value limit"
+        )
+
+    physical_shape = (num_sequences, sequence_length, candidate_capacity)
+    target_tokens = np.full(physical_shape, TOKENIZED_TARGET_PADDING_ID, dtype=np.int64)
+    projection_ids = np.full(physical_shape, -1, dtype=np.int64)
+    for flat_position, targets in enumerate(position_targets):
+        row, position = divmod(flat_position, sequence_length)
+        for target, (slot, projection_id) in targets.items():
+            target_tokens[row, position, slot] = target
+            projection_ids[row, position, slot] = projection_id
+
+    logical_shape = (num_sequences, logical_width)
+    logical_projection_ids = np.full(logical_shape, -1, dtype=np.int64)
+    logical_matrix_indices = np.full(logical_shape, -1, dtype=np.int32)
+    logical_target_indices = np.full(logical_shape, -1, dtype=np.int64)
+    logical_value_mask = np.zeros(logical_shape, dtype=np.bool_)
+    logical_loss_weights = np.zeros(logical_shape, dtype=np.float32)
+    logical_behavior_logprobs = np.zeros(logical_shape, dtype=np.float32)
+    logical_advantages = np.zeros(logical_shape, dtype=np.float32)
+    for row_index, row_entries in enumerate(entries):
+        for index, (
+            matrix_index,
+            target_index,
+            projection_id,
+            weight,
+            behavior,
+            advantage,
+        ) in enumerate(row_entries):
+            logical_projection_ids[row_index, index] = projection_id
+            logical_matrix_indices[row_index, index] = matrix_index
+            logical_target_indices[row_index, index] = target_index
+            logical_value_mask[row_index, index] = True
+            logical_loss_weights[row_index, index] = weight
+            logical_behavior_logprobs[row_index, index] = behavior
+            logical_advantages[row_index, index] = advantage
+
+    return {
+        "target_tokens": torch.from_numpy(target_tokens),
+        "projection_ids": torch.from_numpy(projection_ids),
+        "logical_projection_ids": torch.from_numpy(logical_projection_ids),
+        "logical_matrix_indices": torch.from_numpy(logical_matrix_indices),
+        "logical_target_indices": torch.from_numpy(logical_target_indices),
+        "logical_value_mask": torch.from_numpy(logical_value_mask),
+        "logical_loss_weights": torch.from_numpy(logical_loss_weights),
+        "logical_behavior_logprobs": torch.from_numpy(logical_behavior_logprobs),
+        "logical_advantages": torch.from_numpy(logical_advantages),
+        "token_matrix_output_map": TokenMatrixOutputMap(
+            matrix_ids=tuple(matrix.matrix_id for matrix in batch.matrices),
+            target_shapes=tuple(
+                cast(tuple[int, int], matrix.row("target_token_ids").shape)
+                for matrix in batch.matrices
+            ),
+        ),
+        "token_matrix_training_outcome": TrainingOutcome(
+            accepted_trainable_tokens=accepted_positions,
+            policy_token_counts=(
+                tuple(
+                    PolicyTokenCount(
+                        policy_version=version,
+                        accepted_trainable_tokens=count,
+                    )
+                    for version, count in sorted(policy_counts.items())
+                )
+                if policy_applicable
+                else None
+            ),
+        ),
+    }
 
 
 def _validate_shared_prefix_tree_segment(
@@ -1056,22 +1347,10 @@ def _validate_shared_prefix_tree_segment(
     reference_input_pos = reference.input_pos[src_start:src_end]
     for sequence_index in sequence_indices:
         item = row[sequence_index]
-        if src_end > item.shareable_length:
-            raise RuntimeError("Prefix-tree pack attempted to share a trainable token")
         if not np.array_equal(item.input_pos[src_start:src_end], reference_input_pos):
             raise RuntimeError(
                 "Prefix-tree pack cannot share mismatched input positions"
             )
-        if (item.moe_routes is None) != (reference.moe_routes is None):
-            raise RuntimeError("Prefix-tree shared routes are incomplete")
-        if (item.target_tokens is None) != (reference.target_tokens is None):
-            raise RuntimeError("Prefix-tree shared tokenized targets are incomplete")
-        if item.target_tokens is not None:
-            if reference.target_tokens is None or not np.array_equal(
-                item.target_tokens[src_start:src_end],
-                reference.target_tokens[src_start:src_end],
-            ):
-                raise RuntimeError("Prefix-tree shared tokenized targets differ")
 
 
 def _packed_row_tensor_list(

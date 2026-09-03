@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-from collections.abc import Iterable
-import secrets
-from typing import TYPE_CHECKING, Any, Literal
+import hashlib
+import json
+from typing import Any, Literal
 
 from msgspec import msgpack
 import numpy as np
@@ -15,11 +15,16 @@ from art.preprocessing.moe_routing import (
     NUM_EXPERTS_KEY,
     ROUTED_EXPERTS_KEY,
     MoeRouteArray,
+    MoeRouteSegments,
     moe_route_dtype,
 )
 from art.preprocessing.pack import DEFAULT_MIN_PREFIX_TREE_SHARED_SEGMENT_LENGTH
-from art.training.contracts import TokenizedTrainingBatch
-from art.training.tokenized import TokenizedLossName
+from art.training.token_matrix import (
+    NamedLossRequest,
+    RetainedTokenRoutes,
+    TokenMatrixBatch,
+    validate_token_matrix_batch,
+)
 from art.trajectories import (
     MetadataValue,
     PydanticException,
@@ -30,21 +35,14 @@ from art.vllm_route_transport import (
     RETAINED_ROUTE_BUNDLE_KEY,
     RetainedRouteBundleRef,
     RouteBundleBatchTransfer,
+    RouteBundleLayout,
     retained_route_bundles_from_groups,
+    unique_retained_route_bundles,
 )
 
 from .data_plane import ByteStreamTransfer, PackedBatchRef, receive_byte_stream
-from .rollout import RolloutModelSpec
-from .trajectory_store import (
-    TrajectoryBatchTransfer,
-    TrajectoryGroupBundle,
-    TrajectoryPackingSource,
-)
 
-if TYPE_CHECKING:
-    from art.model import TrainableModel
-
-_TOKENIZED_BATCH_ADAPTER = TypeAdapter(TokenizedTrainingBatch)
+_TOKEN_MATRIX_BATCH_ADAPTER = TypeAdapter(TokenMatrixBatch)
 
 
 class _ChoiceRoutingPayload(BaseModel):
@@ -277,154 +275,183 @@ class TrajectoryGroupPayload(BaseModel):
         return group
 
 
-class TokenizedBatchTransfer(BaseModel):
+class TokenMatrixBatchTransfer(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     stream: ByteStreamTransfer
 
-    async def receive(self, *, timeout_s: float) -> TokenizedTrainingBatch:
+    async def receive(self, *, timeout_s: float) -> TokenMatrixBatch:
         payload = await receive_byte_stream(self.stream, timeout_s=timeout_s)
-        return _TOKENIZED_BATCH_ADAPTER.validate_python(msgpack.decode(payload))
+        return _TOKEN_MATRIX_BATCH_ADAPTER.validate_python(msgpack.decode(payload))
 
 
-def encode_tokenized_batch(batch: TokenizedTrainingBatch) -> bytes:
+def encode_token_matrix_batch(batch: TokenMatrixBatch) -> bytes:
     return msgpack.encode(batch.model_dump(mode="python"))
 
 
 class PackingRequest(BaseModel):
-    """Canonical trajectory or exact-token packing input."""
+    """One canonical TokenMatrix request before its controller-to-host transfer."""
 
     model_config = ConfigDict(extra="forbid", frozen=True, arbitrary_types_allowed=True)
 
-    model: RolloutModelSpec
+    batch: TokenMatrixBatch
+    loss: NamedLossRequest
+    return_token_logprobs: bool = True
     generation_id: str = Field(min_length=1)
-    trajectory_groups: tuple[TrajectoryGroupBundle, ...] = ()
-    trajectory_transfer: TrajectoryBatchTransfer | None = None
-    trajectory_sources: tuple[TrajectoryPackingSource, ...] = ()
-    tokenized_batch: TokenizedTrainingBatch | None = None
-    tokenized_transfer: TokenizedBatchTransfer | None = None
-    tokenized_loss: TokenizedLossName | None = None
     retained_route_bundles: tuple[RetainedRouteBundleRef, ...] = ()
-    route_bundle_transfer: RouteBundleBatchTransfer | None = None
-    trajectory_log_path: str | None = None
-    advantage_balance: float = 0.0
-    allow_training_without_logprobs: bool = False
-    scale_rewards: bool = True
-    plot_tensors: bool = False
     packed_sequence_length: int = Field(ge=1)
-    logprob_calculation_chunk_size: int = Field(default=1024, ge=1)
-    include_moe_routing: bool = False
     collect_packing_shapes: bool = False
     min_prefix_tree_shared_segment_length: int = Field(
         default=DEFAULT_MIN_PREFIX_TREE_SHARED_SEGMENT_LENGTH,
         ge=0,
     )
     compute_content_sha256: bool = False
-    group_ids: tuple[str, ...] = ()
-    record_ids: tuple[str, ...] = ()
-    min_source_version: int = Field(default=0, ge=0)
-    max_source_version: int = Field(default=0, ge=0)
 
     @model_validator(mode="after")
-    def _validate_trajectory_input(self) -> "PackingRequest":
-        inputs = (
-            bool(self.trajectory_groups),
-            self.trajectory_transfer is not None,
-            bool(self.trajectory_sources),
-            self.tokenized_batch is not None,
-            self.tokenized_transfer is not None,
+    def _validate_request(self) -> "PackingRequest":
+        validate_token_matrix_batch(
+            self.batch,
+            self.loss,
+            output_rows=("learner_logprobs",) if self.return_token_logprobs else (),
         )
-        if sum(inputs) != 1:
-            raise ValueError("packing requires exactly one batch input")
-        tokenized = (
-            self.tokenized_batch is not None or self.tokenized_transfer is not None
-        )
-        if tokenized != (self.tokenized_loss is not None):
-            raise ValueError("tokenized packing requires its named loss")
-        if self.retained_route_bundles and self.route_bundle_transfer is not None:
-            raise ValueError("packing cannot mix retained refs and route transfer")
-        if (self.retained_route_bundles or self.route_bundle_transfer) and not (
-            self.include_moe_routing
-        ):
-            raise ValueError("retained routes require MoE routing replay")
-        refs = self.retained_route_bundles
-        if len({ref.layout.bundle_id for ref in refs}) != len(refs):
+        refs = unique_retained_route_bundles(self.retained_route_bundles)
+        if len(refs) != len(self.retained_route_bundles):
             raise ValueError("packing repeats a retained route bundle")
-        if len({ref.layout.response_id for ref in refs}) != len(refs):
-            raise ValueError("packing repeats a retained route response")
-        if tokenized and (
-            self.retained_route_bundles
-            or self.route_bundle_transfer is not None
-            or self.trajectory_log_path is not None
-            or self.advantage_balance != 0.0
-            or self.allow_training_without_logprobs
-            or not self.scale_rewards
-            or self.plot_tensors
-            or self.logprob_calculation_chunk_size != 1024
-            or self.include_moe_routing
-            or self.collect_packing_shapes
-        ):
-            raise ValueError("tokenized packing cannot carry trajectory-only controls")
+        referenced = retained_route_bundles_from_token_matrix_batch(self.batch)
+        if {ref.layout.bundle_id: ref for ref in refs} != {
+            ref.layout.bundle_id: ref for ref in referenced
+        }:
+            raise ValueError(
+                "retained route sidecar must exactly match TokenMatrix references"
+            )
         return self
 
-    @classmethod
-    def from_groups(
-        cls,
-        model: TrainableModel,
-        trajectory_groups: Iterable[TrajectoryGroup],
-        *,
-        packed_sequence_length: int,
-        advantage_balance: float = 0.0,
-        allow_training_without_logprobs: bool = False,
-        scale_rewards: bool = True,
-        plot_tensors: bool = False,
-        logprob_calculation_chunk_size: int = 1024,
-        include_moe_routing: bool = False,
-        group_ids: tuple[str, ...] = (),
-        record_ids: tuple[str, ...] = (),
-        min_source_version: int = 0,
-        max_source_version: int = 0,
-    ) -> "PackingRequest":
-        """Build a serializable packing request from public ART objects."""
 
-        groups = tuple(trajectory_groups)
+class PackingTransferRequest(BaseModel):
+    """Transport-only request received by the packing host."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, arbitrary_types_allowed=True)
+
+    batch_transfer: TokenMatrixBatchTransfer
+    loss: NamedLossRequest
+    return_token_logprobs: bool
+    generation_id: str = Field(min_length=1)
+    route_bundle_transfer: RouteBundleBatchTransfer | None = None
+    packed_sequence_length: int = Field(ge=1)
+    collect_packing_shapes: bool = False
+    min_prefix_tree_shared_segment_length: int = Field(
+        default=DEFAULT_MIN_PREFIX_TREE_SHARED_SEGMENT_LENGTH,
+        ge=0,
+    )
+    compute_content_sha256: bool = False
+
+    @classmethod
+    def from_request(
+        cls,
+        request: PackingRequest,
+        *,
+        batch_transfer: TokenMatrixBatchTransfer,
+        route_bundle_transfer: RouteBundleBatchTransfer | None,
+    ) -> "PackingTransferRequest":
         return cls(
-            model=RolloutModelSpec.from_model(model),
-            generation_id=secrets.token_hex(16),
-            trajectory_groups=tuple(
-                TrajectoryGroupBundle.from_group(group) for group in groups
+            batch_transfer=batch_transfer,
+            loss=request.loss,
+            return_token_logprobs=request.return_token_logprobs,
+            generation_id=request.generation_id,
+            route_bundle_transfer=route_bundle_transfer,
+            packed_sequence_length=request.packed_sequence_length,
+            collect_packing_shapes=request.collect_packing_shapes,
+            min_prefix_tree_shared_segment_length=(
+                request.min_prefix_tree_shared_segment_length
             ),
-            retained_route_bundles=retained_route_bundles_from_groups(groups),
-            advantage_balance=advantage_balance,
-            allow_training_without_logprobs=allow_training_without_logprobs,
-            scale_rewards=scale_rewards,
-            plot_tensors=plot_tensors,
-            packed_sequence_length=packed_sequence_length,
-            logprob_calculation_chunk_size=logprob_calculation_chunk_size,
-            include_moe_routing=include_moe_routing,
-            collect_packing_shapes=any(
-                group._collect_packing_shape for group in groups
-            ),
-            group_ids=group_ids,
-            record_ids=record_ids,
-            min_source_version=min_source_version,
-            max_source_version=max_source_version,
+            compute_content_sha256=request.compute_content_sha256,
         )
+
+
+def retained_route_bundles_from_token_matrix_batch(
+    batch: TokenMatrixBatch,
+) -> tuple[RetainedRouteBundleRef, ...]:
+    return unique_retained_route_bundles(
+        RetainedRouteBundleRef.model_validate(route.bundle)
+        for route in batch.routes
+        if isinstance(route, RetainedTokenRoutes)
+    )
+
+
+def resolve_retained_token_matrix_routes(
+    batch: TokenMatrixBatch,
+    layouts: tuple[RouteBundleLayout, ...],
+    payload: bytes | bytearray | memoryview,
+) -> dict[str, MoeRouteArray | MoeRouteSegments]:
+    """Validate transferred retained bundles and select matrix-aligned routes."""
+
+    retained = tuple(
+        route for route in batch.routes if isinstance(route, RetainedTokenRoutes)
+    )
+    refs = retained_route_bundles_from_token_matrix_batch(batch)
+    refs_by_id = {ref.layout.bundle_id: ref for ref in refs}
+    layouts_by_id = {layout.bundle_id: layout for layout in layouts}
+    if len(layouts_by_id) != len(layouts):
+        raise ValueError("retained route transfer repeats a bundle")
+    if set(layouts_by_id) != set(refs_by_id):
+        raise ValueError("retained route transfer differs from TokenMatrix references")
+    for bundle_id, layout in layouts_by_id.items():
+        if refs_by_id[bundle_id].layout != layout:
+            raise ValueError("retained route transfer changed a referenced layout")
+
+    selected: dict[str, list[RetainedTokenRoutes]] = {}
+    for route in retained:
+        ref = RetainedRouteBundleRef.model_validate(route.bundle)
+        selected.setdefault(ref.layout.bundle_id, []).append(route)
+
+    view = memoryview(payload).cast("B").toreadonly()
+    offset = 0
+    resolved: dict[str, MoeRouteArray | MoeRouteSegments] = {}
+    for layout in layouts:
+        end = offset + layout.byte_count
+        if end > len(view):
+            raise RuntimeError("retained route transfer ended before its layout")
+        chunk = view[offset:end]
+        if hashlib.sha256(chunk).hexdigest() != layout.sha256:
+            raise RuntimeError("retained route bundle changed its exact digest")
+        choices = {choice.choice_index: choice for choice in layout.choices}
+        for route in selected[layout.bundle_id]:
+            choice = choices.get(route.choice_index)
+            if choice is None:
+                raise ValueError("retained TokenMatrix route selects an unknown choice")
+            matrix = batch.matrix(route.matrix_id)
+            token_ids = tuple(
+                int(value) for value in matrix.row("token_ids").dense_values()
+            )
+            token_sha256 = hashlib.sha256(
+                json.dumps(token_ids, separators=(",", ":")).encode()
+            ).hexdigest()
+            if choice.shape[0] != matrix.token_count or token_sha256 != (
+                choice.token_ids_sha256
+            ):
+                raise RuntimeError("retained routes do not match TokenMatrix tokens")
+            dtype = np.dtype("u1" if choice.dtype == "uint8" else "<u2")
+            resolved[route.matrix_id] = MoeRouteArray(
+                np.frombuffer(
+                    chunk[choice.offset : choice.offset + choice.byte_count],
+                    dtype=dtype,
+                ).reshape(choice.shape),
+                num_experts=layout.num_experts,
+            )
+        offset = end
+    if offset != len(view):
+        raise RuntimeError("retained route transfer exceeded its layouts")
+    return resolved
 
 
 class PackingResult(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, arbitrary_types_allowed=True)
 
-    ref: PackedBatchRef | None
-    packed_group_shapes: tuple[PackedGroupShape | None, ...]
-    trainable_assistant_tokens: int = Field(default=0, ge=0)
-    loss_bearing_tokens: int = Field(default=0, ge=0)
-    non_padding_tokens: int = Field(default=0, ge=0)
-    trajectory_log_path: str | None = None
-    trajectory_fetch_s: float = Field(default=0.0, ge=0)
+    ref: PackedBatchRef
+    packed_group_shapes: tuple[PackedGroupShape, ...]
+    batch_fetch_s: float = Field(default=0.0, ge=0)
     route_fetch_s: float = Field(default=0.0, ge=0)
     route_transfer_backend: Literal["stream", "local", "nixl"] | None = None
     packing_core_s: float = Field(default=0.0, ge=0)
-    trajectory_log_wait_s: float = Field(default=0.0, ge=0)
     packed_batch_finalize_s: float = Field(default=0.0, ge=0)
     generation_id: str = Field(min_length=1)

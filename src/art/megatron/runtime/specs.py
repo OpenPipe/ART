@@ -11,7 +11,7 @@ from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, model_validator
 from art.distributed.adapter_transport import AdapterTransferTarget
 from art.distributed.data_plane import PackedBatchRef
 from art.distributed.specs import NixlTransportSpec, TrainerMeshSpec
-from art.training.contracts import AdamConfig, LossConfig, OperationRef
+from art.training import AdamConfig, NamedLossRequest, OperationRef
 from art.types import TrainConfig, TrainSFTConfig
 
 from .portable_snapshot import PortableSnapshotArchive
@@ -271,7 +271,7 @@ class _ForwardCommandJobSpec(_Spec):
     expected_global_loss_bearing_tokens: int = Field(ge=1)
     config: CurrentTrainConfig
     experimental_config: ExperimentalTrainConfig = ExperimentalTrainConfig()
-    loss: LossConfig | None = None
+    loss: NamedLossRequest
     return_token_logprobs: bool = True
 
     @model_validator(mode="after")
@@ -281,12 +281,9 @@ class _ForwardCommandJobSpec(_Spec):
             or self.source.policy_step != self.operation.learner_parent_version
         ):
             raise ValueError("source generation does not identify the command parent")
-        tokenized = self.batch.training_kind == "tokenized"
-        if tokenized != (self.loss is not None):
-            raise ValueError("tokenized packed batches require their named loss")
-        if (
-            not tokenized
-            and self.batch.max_source_version > self.operation.learner_parent_version
+        policy_counts = self.batch.training_outcome.policy_token_counts
+        if policy_counts and (
+            policy_counts[-1].policy_version > self.operation.learner_parent_version
         ):
             raise ValueError(
                 "batch source policy version cannot be newer than the learner"

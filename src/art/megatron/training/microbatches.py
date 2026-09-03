@@ -30,6 +30,7 @@ from art.megatron.training.trace import (
     sft_sequence_token_uids,
 )
 from art.preprocessing.pack import PackedTensors
+from art.training.token_matrix_loss import logical_active_position_count
 
 
 class CpBatchLookaheadState(BaseModel):
@@ -118,9 +119,15 @@ class PreparedRLMicroInputs(BaseModel):
     lm_head_selection: LmHeadTokenSelection
     ref_logprobs: torch.Tensor | None = None
     target_tokens: torch.Tensor | None = None
-    loss_weights: torch.Tensor | None = None
-    behavior_logprobs: torch.Tensor | None = None
-    token_advantages: torch.Tensor | None = None
+    projection_ids: torch.Tensor | None = None
+    logical_projection_ids: torch.Tensor | None = None
+    logical_matrix_indices: torch.Tensor | None = None
+    logical_target_indices: torch.Tensor | None = None
+    logical_value_mask: torch.Tensor | None = None
+    logical_loss_weights: torch.Tensor | None = None
+    logical_behavior_logprobs: torch.Tensor | None = None
+    logical_advantages: torch.Tensor | None = None
+    projection_count: int = 0
     local_token_uids: torch.Tensor | None = None
     workload: TrainingMicrobatchWorkload
 
@@ -183,9 +190,11 @@ def _zero_contribution_inputs(template: PackedTensors) -> PackedTensors:
     dummy["assistant_mask"].zero_()
     if "target_tokens" in dummy:
         dummy["target_tokens"].fill_(-100)
-        dummy["loss_weights"].zero_()
-        dummy["behavior_logprobs"].zero_()
-        dummy["token_advantages"].zero_()
+    if "projection_ids" in dummy:
+        dummy["projection_ids"].fill_(-1)
+    if "logical_value_mask" in dummy:
+        dummy["logical_value_mask"].zero_()
+        dummy["logical_loss_weights"].zero_()
     return dummy
 
 
@@ -438,6 +447,27 @@ def _move_inputs_to_device(inputs: PackedTensors, device: torch.device) -> None:
 
 
 def _count_trainable_tokens(inputs: LossInputs | DispatchedPackedTensors) -> float:
+    logical_mask = (
+        inputs.inputs.get("logical_value_mask")
+        if isinstance(inputs, LossInputs)
+        else inputs.logical_value_mask
+    )
+    logical_advantages = (
+        inputs.inputs.get("logical_advantages")
+        if isinstance(inputs, LossInputs)
+        else inputs.logical_advantages
+    )
+    if logical_mask is not None and logical_advantages is not None:
+        count = float(logical_active_position_count(logical_mask, logical_advantages))
+        if isinstance(inputs, DispatchedPackedTensors):
+            group = inputs.loss_all_reduce_group
+            if (
+                group is not None
+                and torch.distributed.get_world_size(group) > 1
+                and torch.distributed.get_rank(group) != 0
+            ):
+                return 0.0
+        return count
     assistant_mask = inputs.align_inputs().assistant_mask
     return float(assistant_mask.sum().item())
 
@@ -619,6 +649,7 @@ def _prepare_dense_rl_micro(
         shifted_labels,
         target_device=device,
     )
+    projection_count = _projection_count(micro)
     workload = TrainingMicrobatchWorkload(
         logical_nonpadding_tokens=sum(
             row.valid_tokens
@@ -626,7 +657,13 @@ def _prepare_dense_rl_micro(
                 group_ids=micro["group_ids"], parent_ids=micro["parent_ids"]
             )
         ),
-        loss_bearing_tokens=int(shifted_assistant_mask.sum().item()),
+        loss_bearing_tokens=(
+            logical_active_position_count(
+                micro["logical_value_mask"], micro["logical_advantages"]
+            )
+            if "token_matrix_output_map" in micro
+            else int(shifted_assistant_mask.sum().item())
+        ),
         executed_token_equivalents=int(micro["tokens"].numel()),
         nominal_schedule_capacity_tokens=int(micro["tokens"].numel()),
     )
@@ -641,12 +678,26 @@ def _prepare_dense_rl_micro(
         lm_head_selection=lm_head_selection,
         ref_logprobs=ref_logprobs,
         target_tokens=micro.get("target_tokens"),
-        loss_weights=micro.get("loss_weights"),
-        behavior_logprobs=micro.get("behavior_logprobs"),
-        token_advantages=micro.get("token_advantages"),
+        projection_ids=micro.get("projection_ids"),
+        logical_projection_ids=micro.get("logical_projection_ids"),
+        logical_matrix_indices=micro.get("logical_matrix_indices"),
+        logical_target_indices=micro.get("logical_target_indices"),
+        logical_value_mask=micro.get("logical_value_mask"),
+        logical_loss_weights=micro.get("logical_loss_weights"),
+        logical_behavior_logprobs=micro.get("logical_behavior_logprobs"),
+        logical_advantages=micro.get("logical_advantages"),
+        projection_count=projection_count,
         local_token_uids=packed_sequence_token_uids(micro, device=device),
         workload=workload,
     )
+
+
+def _projection_count(micro: PackedTensors) -> int:
+    logical_ids = micro.get("logical_projection_ids")
+    logical_mask = micro.get("logical_value_mask")
+    if logical_ids is None or logical_mask is None or not bool(logical_mask.any()):
+        return 0
+    return int(logical_ids[logical_mask].max().item()) + 1
 
 
 def _prepare_rl_cp_micro_full(
@@ -707,9 +758,15 @@ def _prepared_rl_micro_from_cp_batch(
             prepared.tensors.ref_logprobs if ref_logprobs is not None else None
         ),
         target_tokens=prepared.tensors.target_tokens,
-        loss_weights=prepared.tensors.loss_weights,
-        behavior_logprobs=prepared.tensors.behavior_logprobs,
-        token_advantages=prepared.tensors.token_advantages,
+        projection_ids=prepared.tensors.projection_ids,
+        logical_projection_ids=prepared.tensors.logical_projection_ids,
+        logical_matrix_indices=prepared.tensors.logical_matrix_indices,
+        logical_target_indices=prepared.tensors.logical_target_indices,
+        logical_value_mask=prepared.tensors.logical_value_mask,
+        logical_loss_weights=prepared.tensors.logical_loss_weights,
+        logical_behavior_logprobs=prepared.tensors.logical_behavior_logprobs,
+        logical_advantages=prepared.tensors.logical_advantages,
+        projection_count=prepared.tensors.projection_count,
         local_token_uids=prepared.tensors.token_uids,
         workload=prepared.workload,
     )

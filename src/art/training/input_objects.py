@@ -1,6 +1,7 @@
 from typing import Protocol
 
-from .contracts import OperationRef, RawTrainingBatch, TrainingInputObjectRef
+from .contracts import OperationRef, TrainingInputObjectRef
+from .token_matrix import TokenMatrixBatch
 
 
 class TrainingInputResolver(Protocol):
@@ -11,4 +12,4 @@ class TrainingInputResolver(Protocol):
         input_object: TrainingInputObjectRef,
         *,
         operation: OperationRef,
-    ) -> RawTrainingBatch: ...
+    ) -> TokenMatrixBatch: ...

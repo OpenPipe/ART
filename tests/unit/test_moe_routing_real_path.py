@@ -24,8 +24,13 @@ from art.preprocessing.moe_routing import (
     MoeRouteSegments,
     align_choice_routes_to_tokenized_result,
 )
-from art.preprocessing.pack import packed_tensors_from_tokenized_results
+from art.preprocessing.pack import (
+    packed_tensors_from_token_matrices,
+    packed_tensors_from_tokenized_results,
+)
+from art.preprocessing.token_matrix import token_matrix_batch_from_art_rollouts
 from art.preprocessing.tokenize import TokenizedResult
+from art.training import NamedLossRequest
 from art.trajectories import ChatCompletionsExchange, Trajectory
 
 
@@ -514,20 +519,23 @@ def test_exchange_route_roundtrip_preserves_exact_contract() -> None:
 
 
 def test_shm_replay_is_one_layer_major_uint16_tensor() -> None:
-    packed = packed_tensors_from_tokenized_results(
-        [
+    lowered = token_matrix_batch_from_art_rollouts(
+        (
             _tokenized(
                 [10, 20],
                 [[[0, 256]], [[255, 1]]],
                 prompt_id=456,
                 prompt_length=1,
                 num_experts=257,
-            )
-        ],
+            ),
+        )
+    )
+    packed = packed_tensors_from_token_matrices(
+        batch=lowered.batch,
+        loss=NamedLossRequest(name="cispo", normalize_advantages=False),
         seq_len=4,
         pad_token_id=0,
-        truncate_long_results=False,
-        include_moe_routing=True,
+        resolved_routes=lowered.resolved_routes,
     )
     store = SharedMemoryPackedBatchStore(
         owner_actor_id="test-owner", capacity_bytes=1 << 20

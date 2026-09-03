@@ -120,6 +120,7 @@ class PipelineMetric(pydantic.BaseModel):
 class PackingLeafShape(pydantic.BaseModel):
     model_config = pydantic.ConfigDict(arbitrary_types_allowed=True)
 
+    matrix_id: str = pydantic.Field(min_length=1, max_length=255)
     token_ids: array
     shareable_length: int = pydantic.Field(ge=0)
 

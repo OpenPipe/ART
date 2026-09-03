@@ -3,7 +3,6 @@ from typing import Any, cast
 
 import pytest
 
-from art.distributed.trajectory_store import TrajectoryGroupBundle
 from art.serverless.client import (
     NativeOperationStatus,
     NativeTrainingOperation,
@@ -23,22 +22,21 @@ from art.training import (
     ForwardResult,
     LoadStateRequest,
     LoadStateResult,
-    LossConfig,
+    NamedLossRequest,
     OptimStepRequest,
     OptimStepResult,
     PackedInputCaptureRef,
     PackingOutcome,
-    RlTrajectoryBatch,
     RunInitialState,
     SamplerPublication,
     SaveStateRequest,
     SaveStateResult,
     SaveWeightsForSamplerRequest,
     ServiceCheckpointSource,
+    TokenMatrixBatch,
     TrainingRunSpec,
     WandbArtifactCheckpointSource,
 )
-from art.trajectories import Trajectory, TrajectoryGroup
 
 
 class _TrainingRuns:
@@ -119,10 +117,10 @@ class _TrainingRuns:
                     packed_sequence_length=8,
                     packed_sequences=1,
                     target_packed_sequences=1,
-                    physical_tokens=8,
-                    non_padding_tokens=7,
-                    loss_bearing_tokens=4,
-                    trainable_assistant_tokens=4,
+                    logical_tokens=7,
+                    physical_tokens=7,
+                    packed_capacity_tokens=8,
+                    padding_tokens=1,
                 ).model_dump(mode="json"),
             },
         )
@@ -235,9 +233,8 @@ def _request(
             run_id="run-native",
             capture_id="capture-native",
             manifest_sha256="a" * 64,
-            input_kind="rl",
         ),
-        loss=LossConfig(name="cispo"),
+        loss=NamedLossRequest(name="cispo"),
     )
 
 
@@ -390,18 +387,15 @@ async def test_training_runs_translate_the_complete_public_wire() -> None:
         "packed_sequence_length": 8,
         "packed_sequences": 1,
         "target_packed_sequences": 1,
-        "physical_tokens": 8,
-        "non_padding_tokens": 7,
-        "loss_bearing_tokens": 4,
-        "trainable_assistant_tokens": 4,
+        "logical_tokens": 7,
+        "physical_tokens": 7,
+        "packed_capacity_tokens": 8,
+        "padding_tokens": 1,
     }
     public_capture = {
         "capture_id": "capture-public",
         "manifest_sha256": "a" * 64,
         "content_sha256": "b" * 64,
-        "input_kind": "rl",
-        "min_source_version": 0,
-        "max_source_version": 0,
     }
     public_checkpoint = {"checkpoint_id": "checkpoint-1", "learner_version": 1}
     result_payloads = (
@@ -412,7 +406,15 @@ async def test_training_runs_translate_the_complete_public_wire() -> None:
             "packing": packed,
             "token_logprobs": [],
             "group_shapes": [
-                {"leaves": [{"token_ids": [1, 2], "shareable_length": 1}]}
+                {
+                    "leaves": [
+                        {
+                            "matrix_id": "rollout-0",
+                            "token_ids": [1, 2],
+                            "shareable_length": 1,
+                        }
+                    ]
+                }
             ],
             "packed_input": public_capture,
         },
@@ -421,6 +423,17 @@ async def test_training_runs_translate_the_complete_public_wire() -> None:
             "operation_id": "operation-1",
             "metrics": {},
             "packing": packed,
+            "training": {
+                "accepted_trainable_tokens": 4,
+                "policy_token_counts": [
+                    {"policy_version": 0, "accepted_trainable_tokens": 4}
+                ],
+            },
+            "loss": {
+                "contract_id": "cispo_v1",
+                "value": 0.25,
+                "reduction": "mean_active_token",
+            },
             "produced_gradient": True,
             "token_logprobs": [],
             "group_shapes": [],
@@ -464,23 +477,40 @@ async def test_training_runs_translate_the_complete_public_wire() -> None:
         },
     )
     service = _PublicWireTransport(result_payloads)
-    raw_batch = RlTrajectoryBatch(
-        groups=(
-            TrajectoryGroupBundle.from_group(
-                TrajectoryGroup(
-                    [
-                        Trajectory(
-                            messages_and_choices=[
-                                {"role": "assistant", "content": "answer"}
-                            ],
-                            reward=1.0,
-                        )
-                    ]
-                )
-            ),
-        ),
-        min_source_version=0,
-        max_source_version=0,
+    raw_batch = TokenMatrixBatch.model_validate(
+        {
+            "matrices": [
+                {
+                    "matrix_id": "rollout-0",
+                    "rows": [
+                        {
+                            "name": "token_ids",
+                            "dtype": "int64",
+                            "shape": [2],
+                            "values": {"encoding": "dense", "data": [1, 2]},
+                        },
+                        {
+                            "name": "target_token_ids",
+                            "dtype": "int64",
+                            "shape": [2, 1],
+                            "values": {"encoding": "dense", "data": [2, 3]},
+                        },
+                        {
+                            "name": "behavior_logprobs",
+                            "dtype": "float32",
+                            "shape": [2, 1],
+                            "values": {"encoding": "dense", "data": [-1.0, -1.0]},
+                        },
+                        {
+                            "name": "advantages",
+                            "dtype": "float32",
+                            "shape": [2, 1],
+                            "values": {"encoding": "dense", "data": [1.0, 1.0]},
+                        },
+                    ],
+                }
+            ]
+        }
     )
     requests = (
         ForwardRequest(
@@ -488,7 +518,7 @@ async def test_training_runs_translate_the_complete_public_wire() -> None:
             request_id="forward",
             sequence_id=0,
             batch=raw_batch,
-            loss=LossConfig(
+            loss=NamedLossRequest(
                 name="cispo",
                 values={"clip_low_threshold": 0.2, "clip_high_threshold": 0.3},
             ),
@@ -500,7 +530,7 @@ async def test_training_runs_translate_the_complete_public_wire() -> None:
             request_id="forward-backward",
             sequence_id=1,
             batch=raw_batch,
-            loss=LossConfig(name="cispo"),
+            loss=NamedLossRequest(name="cispo"),
             retain_packed_input=True,
         ),
         OptimStepRequest(
@@ -576,10 +606,14 @@ async def test_training_runs_translate_the_complete_public_wire() -> None:
         "checkpoint_id": "checkpoint-2",
     }
     forward, forward_backward, optimizer, sampler, saved, loaded = translated
-    assert forward.packing.group_shapes[0].leaves[0].token_ids.tolist() == [1, 2]
+    leaf = forward.packing.group_shapes[0].leaves[0]
+    assert leaf.matrix_id == "rollout-0"
+    assert leaf.token_ids.tolist() == [1, 2]
     assert forward.packed_input_capture is not None
     assert forward.packed_input_capture.run_id == "run-native"
     assert forward_backward.produced_gradient
+    assert forward_backward.training.accepted_trainable_tokens == 4
+    assert forward_backward.loss.contract_id == "cispo_v1"
     assert optimizer.contributing_forward_backward_operation_ids == ("operation-1",)
     assert sampler.kind == "save_sampler"
     assert (
@@ -593,10 +627,6 @@ async def test_training_runs_translate_the_complete_public_wire() -> None:
     )
     assert saved.archive is not None and loaded.optimizer_restored
 
-    with pytest.raises(ValueError, match="do not support PPO"):
-        await service.submit(
-            requests[0].model_copy(update={"loss": LossConfig(name="ppo")})
-        )
     with pytest.raises(ValueError, match="public raw training batch"):
         await service.submit(_request())
     service.result_payloads = (

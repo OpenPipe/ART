@@ -13,6 +13,7 @@ import torch
 from art.loss import shift_tensor
 from art.megatron.selective_lm_head import LmHeadTokenSelection
 from art.preprocessing.pack import PackedTensors
+from art.training.token_matrix_loss import logical_active_position_count
 
 from .builder import build_prefix_tree_attention_spec
 from .layout_index import TokenLayoutIndex
@@ -2410,6 +2411,7 @@ def dispatch_megatron_context_parallel_training_tensors(
         tuple[torch.Tensor, torch.Tensor],
     ] = {}
     tokenized = "target_tokens" in micro
+    token_matrix = "token_matrix_output_map" in micro
     assistant_mask = (
         micro["assistant_mask"]
         if tokenized
@@ -2474,6 +2476,17 @@ def dispatch_megatron_context_parallel_training_tensors(
     local_token_uids = (
         None if token_uids is None else dispatch(token_uids, -1, move_to_target=False)
     )
+
+    def replicate(tensor: torch.Tensor | None) -> torch.Tensor | None:
+        return None if tensor is None else _to_target_device(tensor, target_device)
+
+    logical_mask = micro.get("logical_value_mask")
+    projection_count = 0
+    if logical_mask is not None and bool(logical_mask.any()):
+        logical_ids = micro.get("logical_projection_ids")
+        if logical_ids is None:
+            raise RuntimeError("TokenMatrix logical values have no projection IDs")
+        projection_count = int(logical_ids[logical_mask].max().item()) + 1
     tensors = DispatchedPackedTensors(
         tokens=dispatch(micro["tokens"], 0),
         labels=_to_target_device(local_labels, target_device),
@@ -2490,13 +2503,29 @@ def dispatch_megatron_context_parallel_training_tensors(
         loss_all_reduce_group=cp_group,
         token_uids=None if local_token_uids is None else local_token_uids.contiguous(),
         target_tokens=maybe_dispatch(micro.get("target_tokens"), -100),
-        loss_weights=maybe_dispatch(micro.get("loss_weights"), 0.0),
-        behavior_logprobs=maybe_dispatch(micro.get("behavior_logprobs"), 0.0),
-        token_advantages=maybe_dispatch(micro.get("token_advantages"), 0.0),
+        projection_ids=maybe_dispatch(micro.get("projection_ids"), -1),
+        logical_projection_ids=replicate(micro.get("logical_projection_ids")),
+        logical_matrix_indices=replicate(micro.get("logical_matrix_indices")),
+        logical_target_indices=replicate(micro.get("logical_target_indices")),
+        logical_value_mask=replicate(logical_mask),
+        logical_loss_weights=replicate(micro.get("logical_loss_weights")),
+        logical_behavior_logprobs=replicate(micro.get("logical_behavior_logprobs")),
+        logical_advantages=replicate(micro.get("logical_advantages")),
+        projection_count=projection_count,
     )
     workload = TrainingMicrobatchWorkload(
         logical_nonpadding_tokens=sum(rank_plan.local_valid_lengths),
-        loss_bearing_tokens=int(local_assistant_mask.sum().item()),
+        loss_bearing_tokens=(
+            (
+                logical_active_position_count(
+                    micro["logical_value_mask"], micro["logical_advantages"]
+                )
+                if rank_plan.rank == 0
+                else 0
+            )
+            if token_matrix
+            else int(local_assistant_mask.sum().item())
+        ),
         executed_token_equivalents=int(local_labels.numel()),
         nominal_schedule_capacity_tokens=rank_plan.original_seq_len,
     )

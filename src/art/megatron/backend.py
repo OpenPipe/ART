@@ -37,6 +37,12 @@ from .runtime.specs import ResidentLoraInspectionResult
 from .runtime_config import get_megatron_runtime_config
 
 if TYPE_CHECKING:
+    from ..pipeline_tuner import PackedGroupShape
+    from ..preprocessing.sft import SftBatchTokenizer
+    from ..preprocessing.token_matrix import LoweredTokenMatrixBatch
+    from ..preprocessing.tokenize import TokenizedResult
+    from ..training import NamedLossRequest, TokenMatrixBatch
+    from ..vllm_route_transport import RetainedRouteBundleRef
     from .slot_runtime import (
         MegatronRunBinding,
         MegatronSlotRuntime,
@@ -382,6 +388,9 @@ class MegatronBackend(LocalBackend):
         self._training_client: LocalMegatronTrainingClient | None = None
         self._training_client_model_key: tuple[str, str] | None = None
         self._training_client_lock = asyncio.Lock()
+        from ..preprocessing.sft import SftBatchTokenizer
+
+        self._sft_tokenizer: SftBatchTokenizer = SftBatchTokenizer()
         self._owned_slot_runtime: MegatronSlotRuntime | None = None
         self._owned_slot_ports: tuple[int, int] | None = None
         self._route_bundle_reader = route_bundle_reader
@@ -716,6 +725,8 @@ class MegatronBackend(LocalBackend):
                     f"MegatronBackend.train gets {removed_kwarg} from "
                     "art.init_megatron_runtime_config(...)."
                 )
+        if kwargs.get("loss_fn", "cispo") == "ppo":
+            raise ValueError("Megatron TokenMatrix training does not support PPO")
         dispatch_event = kwargs.pop("_pipeline_train_dispatch_event", None)
         if dispatch_event is not None and not isinstance(dispatch_event, asyncio.Event):
             raise TypeError("pipeline train dispatch fence must be an asyncio.Event")
@@ -802,15 +813,13 @@ class MegatronBackend(LocalBackend):
         dev_config: dev.TrainConfig,
         verbose: bool,
     ) -> AsyncIterator[dict[str, float]]:
-        from ..distributed.trajectory_store import TrajectoryGroupBundle
+        from ..preprocessing.token_matrix import token_matrix_batch_from_art_rollouts
         from ..training import (
             AdamConfig,
             ForwardBackwardRequest,
             ForwardBackwardResult,
-            LossConfig,
             OptimStepRequest,
             OptimStepResult,
-            RlTrajectoryBatch,
             SamplerPublication,
             SamplerWeightsResult,
             SaveStateRequest,
@@ -819,6 +828,7 @@ class MegatronBackend(LocalBackend):
 
         if not trajectory_groups:
             raise ValueError("Megatron training requires at least one group")
+        loss = self._rl_token_matrix_loss(dev_config)
         client = await self.training_client(model)
         prepared = await self._claim_or_prepare_bound_batch(trajectory_groups)
         operations: list[tuple[Any, Any]] = []
@@ -831,28 +841,31 @@ class MegatronBackend(LocalBackend):
             materialized = prepared.materialized
             if not any(group.trajectories for group in materialized):
                 raise ValueError("Megatron training requires at least one trajectory")
-            versions = [
-                version
-                for group in materialized
-                for trajectory in group.trajectories
-                for version in (
-                    trajectory.initial_policy_version,
-                    trajectory.final_policy_version,
-                )
-                if version is not None
-            ]
-            batch = RlTrajectoryBatch(
-                groups=tuple(
-                    TrajectoryGroupBundle.from_group(group) for group in materialized
-                ),
-                min_source_version=min(
-                    versions, default=client.projected_learner_version
-                ),
-                max_source_version=max(
-                    versions, default=client.projected_learner_version
-                ),
+            tokenized = self._tokenize_bound_rollouts(
+                model,
+                list(materialized),
+                dev_config,
             )
             dispatch = _PIPELINE_TRAIN_DISPATCH.get()
+            if not tokenized:
+                if dispatch is not None:
+                    dispatch.set()
+                yield {TRAIN_GRADIENT_STEPS_KEY: 0.0}
+                return
+            lowered = token_matrix_batch_from_art_rollouts(
+                tokenized,
+                loss="cispo",
+                normalize_advantages=bool(dev_config.get("scale_rewards", True)),
+                advantage_balance=float(dev_config.get("advantage_balance", 0.0)),
+            )
+            batch = self._token_matrix_batch_with_routes(
+                lowered,
+                self._retained_route_bundles(
+                    prepared.materialized,
+                    prepared.selections,
+                ),
+                require_routes=self._model_uses_expert_replay(model),
+            )
             if dispatch is not None:
                 dispatch.set()
             request_id = secrets.token_hex(16)
@@ -861,17 +874,7 @@ class MegatronBackend(LocalBackend):
                 request_id=f"fb-{request_id}",
                 sequence_id=client.next_sequence_id,
                 batch=batch,
-                loss=LossConfig(
-                    name="ppo" if dev_config.get("ppo", False) else "cispo",
-                    normalize_advantages=bool(dev_config.get("scale_rewards", True)),
-                    values=cast(
-                        dict[str, Any],
-                        {
-                            **config.model_dump(mode="python"),
-                            **dict(dev_config),
-                        },
-                    ),
-                ),
+                loss=loss,
                 collect_packing_shapes=any(
                     group._collect_packing_shape for group in trajectory_groups
                 ),
@@ -887,17 +890,17 @@ class MegatronBackend(LocalBackend):
                 forward_request, forward, acknowledged
             )
             if forward_result.packing.group_shapes:
-                if len(forward_result.packing.group_shapes) != len(trajectory_groups):
-                    raise RuntimeError("packed-group shape cardinality changed")
-                for group, shape in zip(
+                self._attach_rl_packing_shapes(
                     trajectory_groups,
+                    batch,
                     forward_result.packing.group_shapes,
-                    strict=True,
-                ):
-                    group._packed_group_shape = shape
+                )
             if not forward_result.produced_gradient:
                 yield {
                     **forward_result.metrics,
+                    "data/step_trainable_assistant_tokens": float(
+                        forward_result.training.accepted_trainable_tokens
+                    ),
                     TRAIN_GRADIENT_STEPS_KEY: 0.0,
                 }
                 return
@@ -970,6 +973,9 @@ class MegatronBackend(LocalBackend):
                     forward_result.metrics, optimizer_result.metrics
                 ),
                 **sampler_result.metrics,
+                "data/step_trainable_assistant_tokens": float(
+                    forward_result.training.accepted_trainable_tokens
+                ),
             }
         finally:
             failures: list[BaseException] = []
@@ -1016,6 +1022,175 @@ class MegatronBackend(LocalBackend):
                     failures.append(error)
             if failures:
                 raise BaseExceptionGroup("Megatron training cleanup failed", failures)
+
+    @staticmethod
+    def _rl_token_matrix_loss(
+        dev_config: dev.TrainConfig,
+    ) -> NamedLossRequest:
+        from ..training import NamedLossRequest
+
+        if dev_config.get("ppo", False):
+            raise ValueError("Megatron TokenMatrix training does not support PPO")
+        epsilon = dev_config.get("epsilon")
+        epsilon_high = dev_config.get("epsilon_high")
+        return NamedLossRequest(
+            name="cispo",
+            normalize_advantages=False,
+            values={
+                "clip_low_threshold": 1.0
+                - (1.0 if epsilon is None else float(epsilon)),
+                "clip_high_threshold": 1.0
+                + (4.0 if epsilon_high is None else float(epsilon_high)),
+            },
+        )
+
+    @staticmethod
+    def _retained_route_bundles(
+        groups: tuple[TrajectoryGroup, ...],
+        selections: tuple[Any, ...],
+    ) -> tuple[RetainedRouteBundleRef, ...]:
+        from ..vllm_route_transport import retained_route_bundles_from_groups
+
+        if not selections:
+            return retained_route_bundles_from_groups(groups)
+        return unique_retained_route_bundles(
+            ref
+            for selection in selections
+            for ref in selection.lease.item.ref.descriptor.retained_route_bundles
+        )
+
+    @staticmethod
+    def _token_matrix_batch_with_routes(
+        lowered: LoweredTokenMatrixBatch,
+        retained_bundles: tuple[RetainedRouteBundleRef, ...] = (),
+        *,
+        require_routes: bool = False,
+    ) -> TokenMatrixBatch:
+        import hashlib
+        import json
+
+        from ..preprocessing.moe_routing import MoeRouteSegments
+        from ..training import InlineTokenRoutes, RetainedTokenRoutes
+
+        matrix_ids = {matrix.matrix_id for matrix in lowered.batch.matrices}
+        routes_by_matrix: dict[str, Any] = {
+            route.matrix_id: route for route in lowered.batch.routes
+        }
+        for matrix_id, route in lowered.resolved_routes.items():
+            if matrix_id not in matrix_ids:
+                raise ValueError("routing replay references an unknown TokenMatrix")
+            if matrix_id in routes_by_matrix:
+                raise ValueError("TokenMatrix routes were supplied twice")
+            segments = (
+                route.segments if isinstance(route, MoeRouteSegments) else (route,)
+            )
+            routes_by_matrix[matrix_id] = InlineTokenRoutes(
+                matrix_id=matrix_id,
+                num_experts=route.num_experts,
+                shape=route.shape,
+                expert_ids=b"".join(segment.tobytes(order="C") for segment in segments),
+            )
+
+        for matrix in lowered.batch.matrices:
+            if matrix.matrix_id in routes_by_matrix:
+                continue
+            token_ids = tuple(
+                int(value) for value in matrix.row("token_ids").dense_values()
+            )
+            digest = hashlib.sha256(
+                json.dumps(token_ids, separators=(",", ":")).encode()
+            ).hexdigest()
+            matches = tuple(
+                (ref, choice)
+                for ref in retained_bundles
+                for choice in ref.layout.choices
+                if choice.shape[0] == matrix.token_count
+                and choice.token_ids_sha256 == digest
+            )
+            if len(matches) > 1:
+                raise RuntimeError(
+                    "retained routing replay is ambiguous for one TokenMatrix"
+                )
+            if matches:
+                ref, choice = matches[0]
+                routes_by_matrix[matrix.matrix_id] = RetainedTokenRoutes(
+                    matrix_id=matrix.matrix_id,
+                    bundle=ref.model_dump(mode="json"),
+                    choice_index=choice.choice_index,
+                )
+
+        if (require_routes or routes_by_matrix) and set(routes_by_matrix) != matrix_ids:
+            raise ValueError("routing replay requires routes for every TokenMatrix")
+        return lowered.batch.model_copy(
+            update={
+                "routes": tuple(
+                    routes_by_matrix[matrix.matrix_id]
+                    for matrix in lowered.batch.matrices
+                    if matrix.matrix_id in routes_by_matrix
+                )
+            }
+        )
+
+    @staticmethod
+    def _attach_rl_packing_shapes(
+        trajectory_groups: list[TrajectoryGroup],
+        batch: TokenMatrixBatch,
+        shapes: tuple[PackedGroupShape, ...],
+    ) -> None:
+        leaves_by_matrix = {
+            leaf.matrix_id: leaf for shape in shapes for leaf in shape.leaves
+        }
+        if len(leaves_by_matrix) != sum(len(shape.leaves) for shape in shapes):
+            raise RuntimeError("packed-group shapes repeat a TokenMatrix")
+        if set(leaves_by_matrix) != {matrix.matrix_id for matrix in batch.matrices}:
+            raise RuntimeError("packed-group shapes changed matrix identity")
+
+        from ..pipeline_tuner import PackedGroupShape
+
+        for index, group in enumerate(trajectory_groups):
+            leaves = tuple(
+                leaves_by_matrix[matrix.matrix_id]
+                for matrix in batch.matrices
+                if matrix.packing_affinity_id == f"prompt-{index}"
+            )
+            if leaves:
+                group._packed_group_shape = PackedGroupShape(leaves=leaves)
+
+    def _tokenize_bound_rollouts(
+        self,
+        model: TrainableModel,
+        trajectory_groups: list[TrajectoryGroup],
+        dev_config: dev.TrainConfig,
+    ) -> list[TokenizedResult]:
+        from ..local.backend import _load_training_tokenizer, _tokenizer_cache_key
+        from ..preprocessing.tokenize import tokenize_trajectory_groups
+        from ..trajectories._selection import automatic_training_model_selector
+
+        internal_config = cast(dev.InternalModelConfig, model._internal_config or {})
+        tokenizer_key = _tokenizer_cache_key(model.base_model, internal_config)
+        if tokenizer_key not in self._tokenizers:
+            self._tokenizers[tokenizer_key] = self._configure_training_tokenizer(
+                _load_training_tokenizer(model.base_model),
+                model=model,
+                internal_config=internal_config,
+            )
+        return list(
+            tokenize_trajectory_groups(
+                self._tokenizers[tokenizer_key],
+                trajectory_groups,
+                bool(dev_config.get("allow_training_without_logprobs", False)),
+                bool(dev_config.get("scale_rewards", True)),
+                chat_template_kwargs=internal_config.get("chat_template_kwargs"),
+                chat_template_tool_schema_format=(
+                    self._chat_template_tool_schema_format(internal_config)
+                ),
+                model=automatic_training_model_selector(model.get_inference_name()),
+                _max_sequence_length=min(
+                    self._model_max_sequence_length(model),
+                    get_megatron_runtime_config().packed_sequence_length,
+                ),
+            )
+        )
 
     async def _claim_or_prepare_bound_batch(
         self, trajectory_groups: list[TrajectoryGroup]
@@ -1148,16 +1323,16 @@ class MegatronBackend(LocalBackend):
                 yield metrics
             return
         del dev_config
+        from ..preprocessing.token_matrix import token_matrix_batch_from_sft
         from ..training import (
             AdamConfig,
             ForwardBackwardRequest,
             ForwardBackwardResult,
-            LossConfig,
+            NamedLossRequest,
             OptimStepRequest,
             OptimStepResult,
             SamplerPublication,
             SaveWeightsForSamplerRequest,
-            SupervisedTrajectoryBatch,
         )
         from ..utils.sft import resolve_sft_batch_size
 
@@ -1195,15 +1370,33 @@ class MegatronBackend(LocalBackend):
             operations: list[tuple[Any, Any]] = []
             acknowledged: set[str] = set()
             try:
+                tokenized = self._sft_tokenizer.tokenize(
+                    cast(TrainableModel, model),
+                    batch,
+                    assistant_turns=config.assistant_turns,
+                    learning_rate=learning_rate,
+                )
+                token_matrix_batch = token_matrix_batch_from_sft(tokenized)
+                if token_matrix_batch is None:
+                    rows.append(
+                        {
+                            "data/step_num_trajectories": float(len(batch)),
+                            "data/step_trainable_assistant_tokens": 0.0,
+                            "data/step_num_dropped_trajectories": float(
+                                tokenized.num_dropped_trajectories
+                            ),
+                            "data/sft_zero_work": 1.0,
+                        }
+                    )
+                    continue
                 forward_request = ForwardBackwardRequest(
                     run_id=client.run_id,
                     request_id=f"sft-fb-{request_id}",
                     sequence_id=client.next_sequence_id,
-                    batch=SupervisedTrajectoryBatch(
-                        trajectories=tuple(batch),
-                        assistant_turns=config.assistant_turns,
+                    batch=token_matrix_batch,
+                    loss=NamedLossRequest(
+                        name="cross_entropy", normalize_advantages=False
                     ),
-                    loss=LossConfig(name="cross_entropy"),
                     return_token_logprobs=False,
                 )
                 forward = await client.forward_backward(forward_request)
@@ -1219,7 +1412,12 @@ class MegatronBackend(LocalBackend):
                         {
                             **forward_result.metrics,
                             "data/step_num_trajectories": float(len(batch)),
-                            "data/step_trainable_assistant_tokens": 0.0,
+                            "data/step_trainable_assistant_tokens": float(
+                                forward_result.training.accepted_trainable_tokens
+                            ),
+                            "data/step_num_dropped_trajectories": float(
+                                tokenized.num_dropped_trajectories
+                            ),
                         }
                     )
                     continue
@@ -1250,7 +1448,10 @@ class MegatronBackend(LocalBackend):
                         ),
                         "data/step_num_trajectories": float(len(batch)),
                         "data/step_trainable_assistant_tokens": float(
-                            forward_result.packing.trainable_assistant_tokens
+                            forward_result.training.accepted_trainable_tokens
+                        ),
+                        "data/step_num_dropped_trajectories": float(
+                            tokenized.num_dropped_trajectories
                         ),
                     }
                 )
@@ -1571,6 +1772,7 @@ class MegatronBackend(LocalBackend):
         *,
         include_moe_routing: bool,
     ) -> _PackedTrainingBatch | None:
+        loss = self._rl_token_matrix_loss(cast(dev.TrainConfig, dev_config))
         prepared = tuple(group._prepared_training_batch for group in trajectory_groups)
         collect_packing_shapes = any(
             group._collect_packing_shape for group in trajectory_groups
@@ -1604,16 +1806,12 @@ class MegatronBackend(LocalBackend):
             for group in trajectory_groups:
                 group._prepared_training_batch = None
             return cast(_PackedTrainingBatch, first.batch)
-        from ..distributed.packing import PackingRequest
-        from ..distributed.rollout import (
-            DistributedTrajectorySelection,
-            RolloutModelSpec,
+        from ..distributed.packing import (
+            PackingRequest,
+            retained_route_bundles_from_token_matrix_batch,
         )
-        from ..distributed.trajectory_store import (
-            TrajectoryGroupBundle,
-            TrajectoryPackingSource,
-            retained_route_bundles_from_bundles,
-        )
+        from ..distributed.rollout import DistributedTrajectorySelection
+        from ..preprocessing.token_matrix import token_matrix_batch_from_art_rollouts
 
         selections = tuple(group._distributed_lease for group in trajectory_groups)
         selected = tuple(
@@ -1626,7 +1824,6 @@ class MegatronBackend(LocalBackend):
                 group._distributed_lease = None
 
         generation_id = uuid.uuid4().hex
-        trajectory_log_path: str | None = None
         runtime: ArtRuntime | None = None
         packed: Any = None
         marked_packed = False
@@ -1648,56 +1845,9 @@ class MegatronBackend(LocalBackend):
             ):
                 raise RuntimeError("distributed batch spans trajectory queues")
 
-            from .distributed_service import DistributedMegatronService
-
-            service = cast(DistributedMegatronService, await self._get_service(model))
-            runtime = service.runtime
-            versions = [
-                version
-                for group in trajectory_groups
-                for trajectory in group.trajectories
-                for version in (
-                    trajectory.initial_policy_version,
-                    trajectory.final_policy_version,
-                )
-                if version is not None
-            ]
-            current_step = min(versions) if versions else await self._get_step(model)
-            if selected:
-                group_ids = tuple(
-                    selection.lease.item.ref.result_id for selection in selected
-                )
-                record_ids = tuple(
-                    record.record_id
-                    for selection in selected
-                    for record in selection.lease.item.ref.records
-                )
-                trajectory_log_path = str(
-                    Path(get_model_dir(model=model, art_path=self._path))
-                    / "trajectories"
-                    / ".staging"
-                    / f"{generation_id}.parquet"
-                )
-            else:
-                group_ids = tuple(
-                    f"{group.metadata.get('scenario_id', 'group')}:{index}"
-                    for index, group in enumerate(trajectory_groups)
-                )
-                record_ids = tuple(
-                    f"{group_id}:{trajectory_index}"
-                    for group_id, group in zip(
-                        group_ids, trajectory_groups, strict=True
-                    )
-                    for trajectory_index, _ in enumerate(group.trajectories)
-                )
-            local_selections = tuple(
-                selection
-                for selection in selected
-                if selection.lease.item.ref.transfer is None
-            )
-            if local_selections and len(local_selections) != len(selected):
-                raise RuntimeError("distributed batch mixes local and remote owners")
-            local_groups = (
+            service = await self._get_service(model)
+            runtime = cast(Any, service).runtime
+            materialized = (
                 tuple(
                     await asyncio.gather(
                         *(
@@ -1706,43 +1856,40 @@ class MegatronBackend(LocalBackend):
                         )
                     )
                 )
-                if queue is not None and local_selections
-                else ()
+                if queue is not None
+                else tuple(trajectory_groups)
             )
-            bundles = tuple(
-                TrajectoryGroupBundle.from_group(group)
-                for group in (local_groups if selected else tuple(trajectory_groups))
+            tokenized = self._tokenize_bound_rollouts(
+                model,
+                list(materialized),
+                cast(dev.TrainConfig, dev_config),
             )
-            sources = (
-                ()
-                if local_selections
-                else tuple(selection.lease.item for selection in selected)
+            if not tokenized:
+                return None
+            lowered = token_matrix_batch_from_art_rollouts(
+                tokenized,
+                loss="cispo",
+                normalize_advantages=packing_config.scale_rewards,
+                advantage_balance=packing_config.advantage_balance,
             )
-            retained_routes = (
-                unique_retained_route_bundles(
-                    (
-                        ref
-                        for source in sources
-                        for ref in source.ref.descriptor.retained_route_bundles
-                    ),
-                )
-                if sources
-                else retained_route_bundles_from_bundles(bundles)
+            token_matrix_batch = self._token_matrix_batch_with_routes(
+                lowered,
+                self._retained_route_bundles(materialized, selected),
+                require_routes=include_moe_routing,
             )
             request = PackingRequest(
-                model=RolloutModelSpec.from_model(model),
+                batch=token_matrix_batch,
+                loss=loss,
+                return_token_logprobs=False,
                 generation_id=generation_id,
-                trajectory_groups=bundles,
-                trajectory_sources=tuple(
-                    TrajectoryPackingSource.from_item(source) for source in sources
+                retained_route_bundles=(
+                    retained_route_bundles_from_token_matrix_batch(token_matrix_batch)
                 ),
-                retained_route_bundles=retained_routes,
-                trajectory_log_path=trajectory_log_path,
-                group_ids=group_ids,
-                record_ids=record_ids,
-                min_source_version=min(versions, default=current_step),
-                max_source_version=max(versions, default=current_step),
-                **packing_config.model_dump(),
+                packed_sequence_length=packing_config.packed_sequence_length,
+                collect_packing_shapes=packing_config.collect_packing_shapes,
+                min_prefix_tree_shared_segment_length=(
+                    packing_config.min_prefix_tree_shared_segment_length
+                ),
             )
             if queue is not None:
                 mark_packed_task = asyncio.create_task(
@@ -1773,8 +1920,6 @@ class MegatronBackend(LocalBackend):
             if packed is None:
                 return None
             shapes = tuple(packed.packed_group_shapes)
-            if len(shapes) != len(trajectory_groups):
-                raise RuntimeError("packed-group shapes do not match trajectory groups")
             ref = packed.leases.ref
             stats = ref.prefix_tree_packing_stats
             if stats is None:
@@ -1790,18 +1935,21 @@ class MegatronBackend(LocalBackend):
                 ),
                 num_sequences=ref.num_sequences,
                 sequence_length=ref.sequence_length,
-                trainable_assistant_tokens=packed.trainable_assistant_tokens,
-                loss_bearing_tokens=packed.loss_bearing_tokens,
-                non_padding_tokens=packed.non_padding_tokens,
+                trainable_assistant_tokens=(
+                    ref.training_outcome.accepted_trainable_tokens
+                ),
+                loss_bearing_tokens=ref.logical_loss_terms,
+                non_padding_tokens=stats.physical_tokens,
                 logical_tokens=stats.logical_tokens,
                 physical_tokens=stats.physical_tokens,
-                include_moe_routing=include_moe_routing,
+                include_moe_routing=bool(token_matrix_batch.routes),
             )
-            for group, shape in zip(trajectory_groups, shapes, strict=True):
-                if shape is not None:
-                    group._packed_group_shape = shape
-                if selected:
-                    group._prepared_log_path = packed.trajectory_log_path
+            if shapes:
+                self._attach_rl_packing_shapes(
+                    trajectory_groups,
+                    token_matrix_batch,
+                    shapes,
+                )
             transferred = True
             return batch
         finally:
@@ -1817,7 +1965,6 @@ class MegatronBackend(LocalBackend):
                                 generation_id=(
                                     generation_id if marked_packed else None
                                 ),
-                                trajectory_log_path=trajectory_log_path,
                             )
                         )
                     )
@@ -1838,16 +1985,7 @@ class MegatronBackend(LocalBackend):
         packed: Any,
         selections: tuple[Any, ...],
         generation_id: str | None,
-        trajectory_log_path: str | None,
     ) -> None:
-        paths = {
-            path
-            for path in (
-                trajectory_log_path,
-                getattr(packed, "trajectory_log_path", None),
-            )
-            if path is not None
-        }
         releases = [
             *(
                 (runtime.release_batch(packed),)
@@ -1862,7 +2000,6 @@ class MegatronBackend(LocalBackend):
                 )
                 for selection in selections
             ),
-            *(asyncio.to_thread(Path(path).unlink, missing_ok=True) for path in paths),
         ]
         results = await asyncio.gather(*releases, return_exceptions=True)
         failures = [result for result in results if isinstance(result, BaseException)]
@@ -1906,10 +2043,9 @@ class MegatronBackend(LocalBackend):
             )
         distributed = payload.packed
         metrics = {
-            "time/step_trajectory_fetch_s": distributed.trajectory_fetch_s,
+            "time/step_batch_fetch_s": distributed.batch_fetch_s,
             "time/step_route_fetch_s": distributed.route_fetch_s,
             "time/step_packing_core_s": distributed.packing_core_s,
-            "time/step_trajectory_log_wait_s": distributed.trajectory_log_wait_s,
             "time/step_packed_batch_finalize_s": distributed.packed_batch_finalize_s,
             "time/step_packing_rpc_s": distributed.packing_rpc_s,
             "time/step_packed_batch_fanout_s": distributed.packed_batch_fanout_s,
@@ -1995,8 +2131,8 @@ class MegatronBackend(LocalBackend):
         }
         if unexpected := train_kwargs.keys() - supported:
             raise TypeError(f"unsupported Megatron pipeline options: {unexpected}")
-        if train_kwargs.get("loss_fn", "cispo") not in {"cispo", "ppo"}:
-            raise ValueError("Megatron pipeline supports only cispo and ppo")
+        if train_kwargs.get("loss_fn", "cispo") != "cispo":
+            raise ValueError("Megatron TokenMatrix pipeline supports only cispo")
         if train_kwargs.get("loss_fn_config") is not None:
             raise ValueError("Megatron pipeline requires loss_fn_config=None")
         if train_kwargs.get("adam_params") is not None:
@@ -2161,44 +2297,8 @@ class MegatronBackend(LocalBackend):
             DistributedPackedBatch,
             payload.packed,
         )
-        if payload.selections:
-            ref = distributed_batch.leases.ref
-            expected_groups = tuple(
-                selection.lease.item.ref.result_id for selection in payload.selections
-            )
-            expected_records = tuple(
-                record.record_id
-                for selection in payload.selections
-                for record in selection.lease.item.ref.records
-            )
-            versions = []
-            for selection in payload.selections:
-                item = selection.lease.item
-                descriptor = item.ref.descriptor
-                versions.extend(
-                    version
-                    for initial, final in zip(
-                        descriptor.trajectory_initial_policy_versions,
-                        descriptor.trajectory_final_policy_versions,
-                        strict=True,
-                    )
-                    for version in (
-                        initial
-                        if initial is not None
-                        else item.annotations.initial_policy_version,
-                        final
-                        if final is not None
-                        else item.annotations.final_policy_version,
-                    )
-                )
-            if (
-                distributed_batch.packing_generation_id != payload.generation_id
-                or ref.group_ids != expected_groups
-                or ref.record_ids != expected_records
-                or ref.min_source_version != min(versions)
-                or ref.max_source_version != max(versions)
-            ):
-                raise RuntimeError("packed batch policy provenance does not match")
+        if distributed_batch.packing_generation_id != payload.generation_id:
+            raise RuntimeError("packed batch generation identity does not match")
         distributed_service = cast(DistributedMegatronService, service)
         async for result in distributed_service.train_packed(
             distributed_batch,

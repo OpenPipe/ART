@@ -143,9 +143,11 @@ from art.megatron.training.pipeline_schedule import (
 from art.megatron.training.trace import context_parallel_trace_token_uids_enabled
 from art.metrics_taxonomy import TRAIN_GRADIENT_STEPS_KEY, average_metric_samples
 from art.preprocessing.pack import PackedTensors
-from art.training.contracts import LossConfig
-from art.training.tokenized import tokenized_clip_bounds
-from art.training.tokenized_loss import tokenized_loss
+from art.training.token_matrix import NamedLossRequest
+from art.training.token_matrix_loss import (
+    execute_token_matrix_loss,
+    gather_logical_projection_values,
+)
 
 DEFAULT_MODEL_IDENTIFIER = "Qwen/Qwen3-30B-A3B-Instruct-2507"
 _optimizer_stats_printed = False
@@ -284,6 +286,7 @@ class MegatronForwardBackwardJobResult(BaseModel):
     logical_nonpadding_tokens: int = Field(ge=0)
     executed_token_equivalents: int = Field(ge=0)
     gpu_service_ns: int = Field(ge=0)
+    named_loss_value: float
     metrics: dict[str, float] = Field(default_factory=dict)
 
 
@@ -991,6 +994,21 @@ def _forward_backward_command_metrics(
     return metrics
 
 
+def _command_named_loss_value(
+    results: tuple[MegatronForwardBackwardStepResult, ...],
+) -> float:
+    loss_terms = sum(result.workload.loss_bearing_tokens for result in results)
+    if loss_terms < 1:
+        raise RuntimeError("F/B command produced no logical loss terms")
+    return (
+        sum(
+            float(result.reduced_loss.item()) * result.workload.loss_bearing_tokens
+            for result in results
+        )
+        / loss_terms
+    )
+
+
 def execute_megatron_rl_forward_backward_job(
     runtime: TrainingRuntime,
     job: ForwardBackwardJobSpec,
@@ -1096,6 +1114,7 @@ def execute_megatron_rl_forward_backward_job(
             result.workload.executed_token_equivalents for result in results
         ),
         gpu_service_ns=gpu_service_ns,
+        named_loss_value=_command_named_loss_value(results),
         metrics=_forward_backward_command_metrics(
             results,
             durations=durations,
@@ -1229,6 +1248,7 @@ def execute_megatron_dynamic_lora_forward_backward_job(
             result.workload.executed_token_equivalents for result in results
         ),
         gpu_service_ns=gpu_service_ns,
+        named_loss_value=_command_named_loss_value(results),
         metrics=_forward_backward_command_metrics(
             results,
             durations=durations,
@@ -1510,6 +1530,7 @@ def execute_megatron_dynamic_lora_sft_forward_backward_job(
         logical_nonpadding_tokens=batch.num_tokens,
         executed_token_equivalents=executed,
         gpu_service_ns=gpu_service_ns,
+        named_loss_value=float(reduced_loss.item()),
         metrics=_sft_command_metrics(
             states,
             reduced_loss=reduced_loss,
@@ -3190,6 +3211,107 @@ def _run_training_schedule(
     )
 
 
+def _token_matrix_micro_loss(
+    *,
+    model: MegatronModule,
+    output_tensor: torch.Tensor,
+    prepared: PreparedRLMicroInputs,
+    loss: NamedLossRequest,
+    matrix_ids: tuple[str, ...],
+    forward_only: bool,
+) -> dict[str, Any] | tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
+    required = (
+        prepared.target_tokens,
+        prepared.projection_ids,
+        prepared.logical_projection_ids,
+        prepared.logical_matrix_indices,
+        prepared.logical_value_mask,
+        prepared.logical_loss_weights,
+        prepared.logical_behavior_logprobs,
+        prepared.logical_advantages,
+    )
+    if any(value is None for value in required):
+        raise RuntimeError("TokenMatrix micro is missing its logical projection plan")
+    (
+        target_tokens,
+        projection_ids,
+        logical_projection_ids,
+        logical_matrix_indices,
+        logical_value_mask,
+        logical_loss_weights,
+        logical_behavior_logprobs,
+        logical_advantages,
+    ) = cast(tuple[torch.Tensor, ...], required)
+    selected_targets = prepared.lm_head_selection.select_rows(target_tokens)
+    selected_projection_ids = prepared.lm_head_selection.select_rows(projection_ids)
+    selected_logprobs = selected_target_logprobs(
+        model,
+        output_tensor,
+        selected_targets,
+    )
+    cp_group = getattr(prepared.loss_inputs, "loss_all_reduce_group", None)
+    logical_logprobs = gather_logical_projection_values(
+        local_values=selected_logprobs,
+        local_projection_ids=selected_projection_ids,
+        logical_projection_ids=logical_projection_ids,
+        logical_value_mask=logical_value_mask,
+        projection_count=prepared.projection_count,
+        cp_group=cp_group,
+    )
+    request = loss
+    matrix_index = {matrix_id: index for index, matrix_id in enumerate(matrix_ids)}
+    matrix_pairs = tuple(
+        (matrix_index[pair.chosen_matrix_id], matrix_index[pair.rejected_matrix_id])
+        for pair in request.matrix_pairs
+    )
+    loss_output = execute_token_matrix_loss(
+        request,
+        learner_logprobs=logical_logprobs,
+        loss_weights=logical_loss_weights,
+        behavior_logprobs=logical_behavior_logprobs,
+        advantages=logical_advantages,
+        logical_value_mask=logical_value_mask,
+        logical_matrix_indices=logical_matrix_indices,
+        matrix_pairs=matrix_pairs,
+        cp_group=cp_group,
+    )
+    active = logical_value_mask & (logical_loss_weights != 0)
+    ratio = loss_output.probability_ratio
+    diagnostics = None
+    if ratio is not None and request.name == "cispo":
+        low = float(request.values.get("clip_low_threshold", 0.0))
+        high = float(request.values.get("clip_high_threshold", 4.0))
+        diagnostics = LossOffPolicyDiagnostics.from_tensors(
+            prob_ratio=ratio,
+            advantages=logical_advantages,
+            assistant_mask=active,
+            weights=logical_loss_weights,
+            ppo=False,
+            epsilon=1.0 - low,
+            epsilon_high=high - 1.0,
+        )
+    values = {
+        "raw_loss_sum": loss_output.reported_loss.detach(),
+        "probs_corr": (
+            compute_probs_corr(
+                logical_behavior_logprobs.masked_fill(~active, float("nan")),
+                logical_logprobs.masked_fill(~active, float("nan")),
+            ).detach()
+            if ratio is not None
+            else loss_output.reported_loss.detach().new_zeros(())
+        ),
+        "kl_policy_ref": None,
+        "offpolicy_diagnostics": diagnostics,
+        "new_logprobs": logical_logprobs.detach(),
+    }
+    if forward_only:
+        return values
+    if not loss_output.backward_loss.requires_grad:
+        raise RuntimeError("TokenMatrix micro loss is detached")
+    token_count = active.sum().to(dtype=torch.float32)
+    return loss_output.backward_loss, token_count, values
+
+
 def run_megatron_rl_forward_backward_step(
     *,
     model_chunks: ModelChunks,
@@ -3208,7 +3330,7 @@ def run_megatron_rl_forward_backward_step(
     hybridep_token_counts: list[int] | None = None,
     defer_grad_sync: bool = False,
     forward_only: bool = False,
-    loss: LossConfig | None = None,
+    loss: NamedLossRequest | None = None,
 ) -> RLForwardBackwardState:
     schedule_prepare_started = time.perf_counter()
     micro_inputs = inputs if isinstance(inputs, list) else [inputs]
@@ -3326,94 +3448,25 @@ def run_megatron_rl_forward_backward_step(
 
         def reduce_loss(output_tensor: torch.Tensor, **_kwargs: Any):
             if loss is not None:
-                target_tokens = prepared.target_tokens
-                loss_weights = prepared.loss_weights
-                behavior_logprobs = prepared.behavior_logprobs
-                token_advantages = prepared.token_advantages
-                if any(
-                    value is None
-                    for value in (
-                        target_tokens,
-                        loss_weights,
-                        behavior_logprobs,
-                        token_advantages,
-                    )
-                ):
-                    raise RuntimeError(
-                        "tokenized F/B micro is missing named-loss tensors"
-                    )
-                assert target_tokens is not None
-                assert loss_weights is not None
-                assert behavior_logprobs is not None
-                assert token_advantages is not None
-                selected_targets = prepared.lm_head_selection.select_rows(target_tokens)
-                selected_weights = prepared.lm_head_selection.select_rows(loss_weights)
-                selected_behavior = prepared.lm_head_selection.select_rows(
-                    behavior_logprobs
+                if prepared.logical_projection_ids is None:
+                    raise RuntimeError("TokenMatrix micro has no logical projection")
+                output_map = micro_inputs[item.order].get("token_matrix_output_map")
+                if output_map is None:
+                    raise RuntimeError("TokenMatrix micro has no output identity map")
+                reduced = _token_matrix_micro_loss(
+                    model=model,
+                    output_tensor=output_tensor,
+                    prepared=prepared,
+                    loss=loss,
+                    matrix_ids=output_map.matrix_ids,
+                    forward_only=forward_only,
                 )
-                selected_advantages = prepared.lm_head_selection.select_rows(
-                    token_advantages
-                )
-                selected_logprobs = selected_target_logprobs(
-                    model,
-                    output_tensor,
-                    selected_targets,
-                )
-                loss_output = tokenized_loss(
-                    loss,
-                    target_logprobs=selected_logprobs,
-                    weights=selected_weights,
-                    sampling_logprobs=selected_behavior,
-                    advantages=selected_advantages,
-                )
-                micro_loss = loss_output.loss_sum
-                if not forward_only and not micro_loss.requires_grad:
-                    raise RuntimeError("tokenized micro loss is detached")
-                ratio = loss_output.probability_ratio
-                active = (
-                    selected_weights != 0
-                    if loss.name == "cross_entropy"
-                    else selected_advantages != 0
-                )
-                diagnostics = None
-                if ratio is not None and loss.name in {"ppo", "cispo"}:
-                    loss_name = cast(Literal["ppo", "cispo"], loss.name)
-                    low, high = tokenized_clip_bounds(loss_name, loss.values)
-                    diagnostics = LossOffPolicyDiagnostics.from_tensors(
-                        prob_ratio=ratio,
-                        advantages=selected_advantages,
-                        assistant_mask=active,
-                        weights=torch.ones_like(selected_advantages),
-                        ppo=loss.name == "ppo",
-                        epsilon=1.0 - low,
-                        epsilon_high=high - 1.0,
-                    )
-                values = {
-                    "order": item.order,
-                    "raw_loss_sum": micro_loss.detach(),
-                    "probs_corr": (
-                        compute_probs_corr(
-                            selected_behavior.masked_fill(~active, float("nan")),
-                            selected_logprobs.masked_fill(~active, float("nan")),
-                        ).detach()
-                        if ratio is not None
-                        else micro_loss.detach().new_zeros(())
-                    ),
-                    "kl_policy_ref": None,
-                    "offpolicy_diagnostics": diagnostics,
-                    "new_logprobs": prepared.lm_head_selection.restore_rows(
-                        selected_logprobs.detach()
-                    ),
-                }
-                if forward_only:
-                    return values
-                return (
-                    micro_loss,
-                    _local_trainable_token_count_tensor(
-                        [prepared.loss_inputs], device=device
-                    ),
-                    values,
-                )
+                if isinstance(reduced, dict):
+                    reduced["order"] = item.order
+                    return reduced
+                backward_loss, token_count, values = reduced
+                values["order"] = item.order
+                return backward_loss, token_count, values
             assert isinstance(token_output, TokenLossOutput)
             new_logprobs = -output_tensor
             compact_loss_inputs = token_output.compact_loss_inputs(prepared.loss_inputs)
@@ -3512,7 +3565,8 @@ def run_megatron_rl_forward_backward_step(
         cast(torch.Tensor, data["new_logprobs"]) for data in pipeline_results
     ]
     returned_sample_indices = tuple(micro_sample_indices)
-    if loss is not None and int(topology.cp) > 1:
+    token_matrix = any("token_matrix_output_map" in micro for micro in micro_inputs)
+    if loss is not None and int(topology.cp) > 1 and not token_matrix:
         new_logprobs = _globalize_context_parallel_logprob_batch(
             local_logprobs=new_logprobs,
             attention_states=[prepared.attention_state for prepared in prepared_micros],

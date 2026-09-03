@@ -27,7 +27,6 @@ from art.training import (
     RunCommand,
     SaveStateRequest,
     SaveWeightsForSamplerRequest,
-    SupervisedTrajectoryBatch,
     TrainingInputObjectRef,
     TrainingInputResolver,
 )
@@ -1579,18 +1578,14 @@ class MegatronSlotCoordinator:
             if isinstance(request, LoadStateRequest):
                 await state.handler.prefetch_load_state(request, operation)
             components = _components(request)
-            raw_sft = isinstance(
-                request, (ForwardRequest, ForwardBackwardRequest)
-            ) and (isinstance(request.batch, SupervisedTrajectoryBatch))
-            if not raw_sft:
-                resource_request = MegatronSlotResourceRequest(
-                    run_id=operation.run_id,
-                    operation_id=operation.operation_id,
-                    source=state.handler.generation,
-                    optimizer_state_path=state.handler.optimizer_state_path,
-                    components=components,
-                )
-                self.resources.prefetch(resource_request)
+            resource_request = MegatronSlotResourceRequest(
+                run_id=operation.run_id,
+                operation_id=operation.operation_id,
+                source=state.handler.generation,
+                optimizer_state_path=state.handler.optimizer_state_path,
+                components=components,
+            )
+            self.resources.prefetch(resource_request)
             cost = 1
             if isinstance(request, (ForwardRequest, ForwardBackwardRequest)):
                 capture = await state.handler.prepare_input(request, operation)
@@ -1598,15 +1593,6 @@ class MegatronSlotCoordinator:
                 await state.handler.prepare_cp_lookahead(request, operation, capture)
                 request = request.model_copy(update={"batch": capture})
                 cost = max(1, packing.physical_tokens)
-                if raw_sft:
-                    resource_request = MegatronSlotResourceRequest(
-                        run_id=operation.run_id,
-                        operation_id=operation.operation_id,
-                        source=state.handler.generation,
-                        optimizer_state_path=state.handler.optimizer_state_path,
-                        components=(components if packing.loss_bearing_tokens else ()),
-                    )
-                    self.resources.prefetch(resource_request)
             assert resource_request is not None
             evidence = await self.resources.ensure(resource_request)
             evidence_key = (operation.run_id, operation.operation_id)

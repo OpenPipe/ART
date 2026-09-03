@@ -14,6 +14,7 @@ from pydantic import BaseModel, ConfigDict
 
 from art.megatron.runtime.managed import MegatronRuntimeInfo
 from art.megatron.runtime.specs import TrainerRuntimeSpec, TrainingRunSpec
+from art.pipeline_tuner.config import PackedGroupShape
 from art.utils.lifecycle import complete_task
 from art.vllm_route_transport import (
     LocalRouteObjectView,
@@ -52,7 +53,6 @@ from .monarch_bootstrap import (
 from .monarch_runtime import (
     MonarchPackedBatchInbox,
     MonarchPackedBatchSource,
-    MonarchPackingEndpoint,
     MonarchRolloutWorkerEndpoint,
     MonarchTrajectoryQueueEndpoint,
     MonarchVllmHostLauncher,
@@ -68,8 +68,9 @@ from .nccl_preflight import (
 from .packing import (
     PackingRequest,
     PackingResult,
-    TokenizedBatchTransfer,
-    encode_tokenized_batch,
+    PackingTransferRequest,
+    TokenMatrixBatchTransfer,
+    encode_token_matrix_batch,
 )
 from .rollout import DistributedRolloutExecutor, InstalledAsyncCallable
 from .specs import (
@@ -98,17 +99,12 @@ class DistributedPackedBatch(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     leases: PackedBatchLeaseSet
-    packed_group_shapes: tuple[Any, ...]
-    trainable_assistant_tokens: int
-    loss_bearing_tokens: int
-    non_padding_tokens: int
-    trajectory_log_path: str | None = None
+    packed_group_shapes: tuple[PackedGroupShape, ...]
     packing_rpc_s: float = 0.0
-    trajectory_fetch_s: float = 0.0
+    batch_fetch_s: float = 0.0
     route_fetch_s: float = 0.0
     route_transfer_backend: Literal["stream", "local", "nixl"] | None = None
     packing_core_s: float = 0.0
-    trajectory_log_wait_s: float = 0.0
     packed_batch_finalize_s: float = 0.0
     packed_batch_fanout_s: float = 0.0
     packing_generation_id: str
@@ -919,7 +915,7 @@ class ArtRuntime:
             route_source=self.retained_route_source,
         )
 
-    async def pack(self, request: PackingRequest) -> DistributedPackedBatch | None:
+    async def pack(self, request: PackingRequest) -> DistributedPackedBatch:
         self._require_open()
         trainer = self.topology.trainer
         if trainer is None:
@@ -933,47 +929,17 @@ class ArtRuntime:
         try:
             publishers = []
             route_transfer = None
-            wire_request = request
-            if (
-                request.trajectory_groups
-                or request.tokenized_batch is not None
-                or request.retained_route_bundles
-            ):
-                controller = self._host(self.topology.cluster.controller_host_id)
-                data_plane_host = urlparse(controller.worker_address).hostname
-                if data_plane_host is None:
-                    raise ValueError("controller has no routable address")
+            controller = self._host(self.topology.cluster.controller_host_id)
+            data_plane_host = urlparse(controller.worker_address).hostname
+            if data_plane_host is None:
+                raise ValueError("controller has no routable address")
             try:
-                if request.tokenized_batch is not None:
-                    publisher = await ByteStreamPublisher.create(
-                        batch_id,
-                        (encode_tokenized_batch(request.tokenized_batch),),
-                        advertise_host=data_plane_host,
-                    )
-                    publishers.append(publisher)
-                    wire_request = wire_request.model_copy(
-                        update={
-                            "tokenized_batch": None,
-                            "tokenized_transfer": TokenizedBatchTransfer(
-                                stream=publisher.transfer
-                            ),
-                        }
-                    )
-                elif request.trajectory_groups:
-                    from .trajectory_store import publish_trajectory_bundles
-
-                    transfer, publisher = await publish_trajectory_bundles(
-                        request.trajectory_groups,
-                        stream_id=batch_id,
-                        advertise_host=data_plane_host,
-                    )
-                    publishers.append(publisher)
-                    wire_request = wire_request.model_copy(
-                        update={
-                            "trajectory_groups": (),
-                            "trajectory_transfer": transfer,
-                        }
-                    )
+                batch_publisher = await ByteStreamPublisher.create(
+                    batch_id,
+                    (encode_token_matrix_batch(request.batch),),
+                    advertise_host=data_plane_host,
+                )
+                publishers.append(batch_publisher)
                 if request.retained_route_bundles:
                     if self._route_bundle_reader is None:
                         raise RuntimeError(
@@ -1013,26 +979,23 @@ class ArtRuntime:
                             advertise_host=data_plane_host,
                         )
                         publishers.append(route_publisher)
-                    wire_request = wire_request.model_copy(
-                        update={
-                            "retained_route_bundles": (),
-                            "route_bundle_transfer": route_transfer,
-                        }
-                    )
+                wire_request = PackingTransferRequest.from_request(
+                    request,
+                    batch_transfer=TokenMatrixBatchTransfer(
+                        stream=batch_publisher.transfer
+                    ),
+                    route_bundle_transfer=route_transfer,
+                )
                 packing_rpc_started = time.monotonic()
-                result: PackingResult = await MonarchPackingEndpoint(
-                    source_service
-                ).pack(
+                result: PackingResult = await call_remote(
+                    source_service.pack_batch,
                     wire_request,
                     batch_id,
-                    transfer_timeout_s=self.topology.cluster.rpc_timeout_s,
+                    self.topology.cluster.rpc_timeout_s,
                 )
                 packing_rpc_s = time.monotonic() - packing_rpc_started
             finally:
                 await asyncio.gather(*(publisher.close() for publisher in publishers))
-            if result.ref is None:
-                self._live_batches.pop(batch_id)
-                return None
             if result.generation_id != request.generation_id:
                 raise RuntimeError("packing host returned the wrong generation ID")
             if result.ref.batch_id != batch_id:
@@ -1066,16 +1029,11 @@ class ArtRuntime:
         return DistributedPackedBatch(
             leases=leases,
             packed_group_shapes=result.packed_group_shapes,
-            trainable_assistant_tokens=result.trainable_assistant_tokens,
-            loss_bearing_tokens=result.loss_bearing_tokens,
-            non_padding_tokens=result.non_padding_tokens,
-            trajectory_log_path=result.trajectory_log_path,
             packing_rpc_s=packing_rpc_s,
-            trajectory_fetch_s=result.trajectory_fetch_s,
+            batch_fetch_s=result.batch_fetch_s,
             route_fetch_s=result.route_fetch_s,
             route_transfer_backend=result.route_transfer_backend,
             packing_core_s=result.packing_core_s,
-            trajectory_log_wait_s=result.trajectory_log_wait_s,
             packed_batch_finalize_s=result.packed_batch_finalize_s,
             packed_batch_fanout_s=packed_batch_fanout_s,
             packing_generation_id=result.generation_id,

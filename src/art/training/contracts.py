@@ -6,15 +6,13 @@ from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, FiniteFloat, model_validator
 
-from art.distributed.trajectory_store import TrajectoryGroupBundle
 from art.pipeline_tuner.config import PackedGroupShape
-from art.trajectories import Trajectory
 
-from .tokenized import (
-    MAX_TOKENIZED_PHYSICAL_VALUES,
-    TokenizedDatum,
-    tokenized_physical_value_count,
-    validate_tokenized_loss_values,
+from .token_matrix import (
+    LossContractId,
+    NamedLossRequest,
+    TokenMatrixBatch,
+    validate_token_matrix_batch,
 )
 
 MAX_CONTROL_IDENTIFIER_LENGTH = 255
@@ -79,36 +77,6 @@ class RunCommand(Contract):
     sequence_id: int = Field(ge=0)
 
 
-class RlTrajectoryBatch(Contract):
-    kind: Literal["rl"] = "rl"
-    groups: tuple[TrajectoryGroupBundle, ...] = Field(min_length=1)
-    min_source_version: int = Field(ge=0)
-    max_source_version: int = Field(ge=0)
-
-    @model_validator(mode="after")
-    def _validate_source_versions(self) -> "RlTrajectoryBatch":
-        if self.max_source_version < self.min_source_version:
-            raise ValueError("max_source_version must be >= min_source_version")
-        return self
-
-
-class SupervisedTrajectoryBatch(Contract):
-    kind: Literal["sft"] = "sft"
-    trajectories: tuple[Trajectory, ...] = Field(min_length=1)
-    assistant_turns: Literal["all", "last"] = "all"
-
-
-class TokenizedTrainingBatch(Contract):
-    kind: Literal["tokenized"] = "tokenized"
-    datums: tuple[TokenizedDatum, ...] = Field(min_length=1)
-
-    @model_validator(mode="after")
-    def _validate_size(self) -> TokenizedTrainingBatch:
-        if tokenized_physical_value_count(self.datums) > MAX_TOKENIZED_PHYSICAL_VALUES:
-            raise ValueError("tokenized batch exceeds the configured value limit")
-        return self
-
-
 class TrainingInputObject(Contract):
     """Authenticated immutable object identity; access remains resolver-owned."""
 
@@ -124,8 +92,9 @@ class TrainingInputObjectRef(Contract):
     kind: Literal["input_object"] = "input_object"
     run_id: str = Field(min_length=1, max_length=MAX_CONTROL_IDENTIFIER_LENGTH)
     operation_id: str = Field(min_length=1, max_length=64)
-    input_kind: Literal["rl", "sft", "tokenized"]
-    encoding: Literal["art_training_batch_json_v1"] = "art_training_batch_json_v1"
+    encoding: Literal["art_token_matrix_batch_json_v1"] = (
+        "art_token_matrix_batch_json_v1"
+    )
     object: TrainingInputObject
     lease_id: str = Field(min_length=1, max_length=512)
 
@@ -138,72 +107,30 @@ class PackedInputCaptureRef(Contract):
     capture_id: str = Field(min_length=1, max_length=64)
     manifest_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     content_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
-    input_kind: Literal["rl", "sft", "tokenized"]
-    min_source_version: int = Field(default=0, ge=0)
-    max_source_version: int = Field(default=0, ge=0)
     input_object: TrainingInputObjectRef | None = None
-
-    @model_validator(mode="after")
-    def _validate_source_versions(self) -> "PackedInputCaptureRef":
-        if self.max_source_version < self.min_source_version:
-            raise ValueError("max_source_version must be >= min_source_version")
-        return self
-
-
-RawTrainingBatch = Annotated[
-    RlTrajectoryBatch | SupervisedTrajectoryBatch | TokenizedTrainingBatch,
-    Field(discriminator="kind"),
-]
 
 
 TrainingBatch = Annotated[
-    RlTrajectoryBatch
-    | SupervisedTrajectoryBatch
-    | TokenizedTrainingBatch
-    | TrainingInputObjectRef
-    | PackedInputCaptureRef,
+    TokenMatrixBatch | TrainingInputObjectRef | PackedInputCaptureRef,
     Field(discriminator="kind"),
 ]
-
-
-class LossConfig(Contract):
-    name: Literal["cross_entropy", "importance_sampling", "cispo", "ppo"]
-    normalize_advantages: bool = True
-    values: dict[str, FiniteFloat | int | bool | str | None] = Field(
-        default_factory=dict
-    )
 
 
 class ForwardRequest(RunCommand):
     batch: TrainingBatch
-    loss: LossConfig
+    loss: NamedLossRequest
     collect_packing_shapes: bool = False
     retain_packed_input: bool = False
     return_token_logprobs: bool = True
 
     @model_validator(mode="after")
     def _validate_loss(self) -> "ForwardRequest":
-        batch_kind = (
-            self.batch.input_kind
-            if isinstance(self.batch, (PackedInputCaptureRef, TrainingInputObjectRef))
-            else self.batch.kind
-        )
-        expected = {
-            "sft": {"cross_entropy"},
-            "rl": {"cispo", "ppo"},
-            "tokenized": {"cross_entropy", "importance_sampling", "cispo"},
-        }[batch_kind]
-        if self.loss.name not in expected:
-            raise ValueError(
-                f"{batch_kind} batches require one of {sorted(expected)}, "
-                f"got {self.loss.name!r}"
+        if isinstance(self.batch, TokenMatrixBatch):
+            validate_token_matrix_batch(
+                self.batch,
+                self.loss,
+                output_rows=("learner_logprobs",) if self.return_token_logprobs else (),
             )
-        if isinstance(self.batch, TokenizedTrainingBatch):
-            loss = self.loss.name
-            assert loss != "ppo"
-            validate_tokenized_loss_values(loss, self.loss.values)
-            for datum in self.batch.datums:
-                datum.validate_for_loss(loss)
         return self
 
 
@@ -328,21 +255,56 @@ class PackingOutcome(Contract):
     packed_sequence_length: int = Field(ge=1)
     packed_sequences: int = Field(ge=0)
     target_packed_sequences: int = Field(ge=1)
+    logical_tokens: int = Field(ge=0)
     physical_tokens: int = Field(ge=0)
-    non_padding_tokens: int = Field(ge=0)
-    loss_bearing_tokens: int = Field(ge=0)
-    trainable_assistant_tokens: int = Field(ge=0)
+    packed_capacity_tokens: int = Field(ge=0)
+    padding_tokens: int = Field(ge=0)
     group_shapes: tuple[PackedGroupShape, ...] = ()
 
     @model_validator(mode="after")
     def _validate_counts(self) -> "PackingOutcome":
-        if self.non_padding_tokens > self.physical_tokens:
-            raise ValueError("non_padding_tokens cannot exceed physical_tokens")
-        if (self.packed_sequences == 0) != (self.physical_tokens == 0):
-            raise ValueError("zero packed sequences and physical tokens must agree")
-        if self.loss_bearing_tokens > self.non_padding_tokens:
-            raise ValueError("loss_bearing_tokens cannot exceed non_padding_tokens")
+        expected_capacity = self.packed_sequences * self.packed_sequence_length
+        if self.packed_capacity_tokens != expected_capacity:
+            raise ValueError("packed capacity does not match shape")
+        if self.physical_tokens > self.logical_tokens:
+            raise ValueError("physical tokens cannot exceed logical tokens")
+        if self.physical_tokens > self.packed_capacity_tokens:
+            raise ValueError("physical tokens cannot exceed packed capacity")
+        if self.padding_tokens != self.packed_capacity_tokens - self.physical_tokens:
+            raise ValueError("padding tokens must equal capacity minus physical tokens")
+        if (self.packed_sequences == 0) != (self.logical_tokens == 0):
+            raise ValueError("zero packed sequences and logical tokens must agree")
         return self
+
+
+class PolicyTokenCount(Contract):
+    policy_version: int = Field(ge=0)
+    accepted_trainable_tokens: int = Field(ge=1)
+
+
+class TrainingOutcome(Contract):
+    accepted_trainable_tokens: int = Field(ge=0)
+    policy_token_counts: tuple[PolicyTokenCount, ...] | None
+
+    @model_validator(mode="after")
+    def _validate_policy_counts(self) -> "TrainingOutcome":
+        if self.policy_token_counts is None:
+            return self
+        versions = tuple(item.policy_version for item in self.policy_token_counts)
+        if versions != tuple(sorted(set(versions))):
+            raise ValueError("policy token counts must be sorted and unique")
+        if (
+            sum(item.accepted_trainable_tokens for item in self.policy_token_counts)
+            != self.accepted_trainable_tokens
+        ):
+            raise ValueError("policy token counts must cover accepted trainable tokens")
+        return self
+
+
+class NamedLossOutcome(Contract):
+    contract_id: LossContractId
+    value: FiniteFloat
+    reduction: Literal["mean_active_token"] = "mean_active_token"
 
 
 class TokenLogprobs(Contract):
@@ -350,6 +312,7 @@ class TokenLogprobs(Contract):
         extra="forbid", frozen=True, ser_json_bytes="base64", val_json_bytes="base64"
     )
 
+    matrix_id: str = Field(min_length=1, max_length=255)
     shape: tuple[int, ...] = Field(min_length=1, max_length=2)
     data: bytes
 
@@ -374,12 +337,20 @@ class TokenLogprobs(Contract):
 
     @classmethod
     def from_values(
-        cls, values: list[float], *, shape: tuple[int, ...] | None = None
+        cls,
+        values: list[float],
+        *,
+        matrix_id: str,
+        shape: tuple[int, ...] | None = None,
     ) -> "TokenLogprobs":
         buffer = array("f", values)
         if sys.byteorder != "little":
             buffer.byteswap()
-        return cls(shape=shape or (len(values),), data=buffer.tobytes())
+        return cls(
+            matrix_id=matrix_id,
+            shape=shape or (len(values),),
+            data=buffer.tobytes(),
+        )
 
     def to_values(self) -> list[float]:
         buffer = array("f")
@@ -472,11 +443,13 @@ class ForwardResult(OperationResult):
 
 class ForwardBackwardResult(ForwardResult):
     kind: Literal["forward_backward"] = "forward_backward"
+    training: TrainingOutcome
+    loss: NamedLossOutcome
     produced_gradient: bool = True
 
     @model_validator(mode="after")
     def _validate_gradient(self) -> "ForwardBackwardResult":
-        expected = self.packing.loss_bearing_tokens > 0
+        expected = self.training.accepted_trainable_tokens > 0
         if self.produced_gradient != expected:
             raise ValueError("gradient production must match loss-bearing tokens")
         if not self.produced_gradient and (

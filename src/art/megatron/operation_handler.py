@@ -14,11 +14,6 @@ from art.distributed.art_runtime import ArtRuntime, DistributedPackedBatch
 from art.distributed.packing import PackingRequest
 from art.distributed.rollout import RolloutModelSpec
 from art.distributed.specs import PairedTransferIdentity
-from art.distributed.trajectory_store import retained_route_bundles_from_bundles
-from art.preprocessing.sft import (
-    SftBatchTokenizer,
-    tokenized_training_batch_from_sft,
-)
 from art.training import (
     AdapterSpec,
     CheckpointRef,
@@ -29,6 +24,8 @@ from art.training import (
     ForwardResult,
     LoadStateRequest,
     LoadStateResult,
+    NamedLossOutcome,
+    NamedLossRequest,
     OperationExecutionError,
     OperationRef,
     OperationResultType,
@@ -37,21 +34,19 @@ from art.training import (
     OptimStepResult,
     PackedInputCaptureRef,
     PackingOutcome,
-    RlTrajectoryBatch,
     RunCommand,
     SamplerWeightsResult,
     SaveStateRequest,
     SaveStateResult,
     SaveWeightsForSamplerRequest,
-    SupervisedTrajectoryBatch,
-    TokenizedTrainingBatch,
     TokenLogprobs,
+    TokenMatrixBatch,
     TrainingInputObjectRef,
     TrainingInputResolver,
+    TrainingOutcome,
     UsageMeasurement,
     bootstrap_operation_worker,
 )
-from art.training.tokenized import tokenized_clip_bounds
 from art.vllm_route_transport import RetainedRouteBundleRef
 
 from .route_retention import (
@@ -303,6 +298,8 @@ class _CapturedInput:
     control_fingerprint: str
     packed: DistributedPackedBatch | None
     packing: PackingOutcome
+    training: TrainingOutcome
+    loss: NamedLossRequest
     route_ownership: RouteBundleOwnershipHandle | None = None
     packed_released: bool = False
     owners: set[str] = field(default_factory=set)
@@ -405,7 +402,6 @@ class MegatronOperationHandler:
         self._capture_lock = asyncio.Lock()
         self._release_failures: dict[str, BaseException] = {}
         self._sampler_publications: dict[str, MegatronSamplerPublicationReceipt] = {}
-        self._sft_tokenizer = SftBatchTokenizer()
         self._l4_hydration = L4HydrationSidecar[MegatronLoadedState]()
 
     @property
@@ -494,13 +490,10 @@ class MegatronOperationHandler:
                     )
                 }
             )
-        if not isinstance(
-            request.batch,
-            (RlTrajectoryBatch, SupervisedTrajectoryBatch, TokenizedTrainingBatch),
-        ):
+        if not isinstance(request.batch, TokenMatrixBatch):
             raise OperationExecutionError(
                 "invalid_request",
-                "the persistent Megatron runtime requires an RL, SFT, or tokenized batch",
+                "the persistent Megatron runtime requires a canonical TokenMatrix batch",
                 usage=CommandExecutionUsage.no_work(),
             )
         fingerprint = _input_fingerprint(identity_request, operation)
@@ -534,7 +527,7 @@ class MegatronOperationHandler:
         input_object: TrainingInputObjectRef,
         *,
         operation: OperationRef,
-    ) -> RlTrajectoryBatch | SupervisedTrajectoryBatch | TokenizedTrainingBatch:
+    ) -> TokenMatrixBatch:
         resolver = self.input_resolver
         if resolver is None:
             raise OperationExecutionError(
@@ -543,8 +536,6 @@ class MegatronOperationHandler:
                 usage=CommandExecutionUsage.no_work(),
             )
         batch = await resolver.resolve(input_object, operation=operation)
-        if batch.kind != input_object.input_kind:
-            raise RuntimeError("training-input resolver changed input kind")
         return batch
 
     async def _materialize_input(
@@ -558,65 +549,10 @@ class MegatronOperationHandler:
         acquire_route_ownership: bool,
     ) -> _CapturedInput:
         fingerprint = _input_fingerprint(identity_request, operation)
-        packing_request = request
         input_metrics: dict[str, float] = {}
-        if isinstance(request.batch, SupervisedTrajectoryBatch):
-            sft_batch = self._sft_tokenizer.tokenize(
-                self.config.rollout_model.build(), request.batch
-            )
-            input_metrics["data/dropped_sft_trajectories"] = float(
-                sft_batch.num_dropped_trajectories
-            )
-            tokenized_batch = tokenized_training_batch_from_sft(sft_batch)
-            if tokenized_batch is None:
-                config = _train_config(self.config.train_config, request)
-                packing = PackingOutcome(
-                    packed_sequence_length=(
-                        self.trainer.runtime_spec.packed_sequence_length
-                    ),
-                    packed_sequences=0,
-                    target_packed_sequences=(
-                        config.grad_accumulation_sequences
-                        or _data_parallel_size(self.trainer)
-                    ),
-                    physical_tokens=0,
-                    non_padding_tokens=0,
-                    loss_bearing_tokens=0,
-                    trainable_assistant_tokens=0,
-                )
-                ref = PackedInputCaptureRef(
-                    run_id=operation.run_id,
-                    capture_id=operation.operation_id,
-                    manifest_sha256=_capture_manifest_sha256(
-                        operation, None, packing, fingerprint
-                    ),
-                    content_sha256=None,
-                    input_kind="sft",
-                    input_object=input_object,
-                )
-                return _CapturedInput(
-                    ref=ref,
-                    request_fingerprint=fingerprint,
-                    control_fingerprint=_input_control_fingerprint(
-                        identity_request, operation
-                    ),
-                    packed=None,
-                    packing=packing,
-                    retained_for_replay=False,
-                    input_metrics=input_metrics,
-                    source_request=(
-                        identity_request if input_object is not None else None
-                    ),
-                    source_operation=operation if input_object is not None else None,
-                )
-            packing_request = request.model_copy(update={"batch": tokenized_batch})
-        elif not isinstance(request.batch, (RlTrajectoryBatch, TokenizedTrainingBatch)):
+        if not isinstance(request.batch, TokenMatrixBatch):
             raise RuntimeError("resolved training input has an unsupported kind")
-        bundles = (
-            retained_route_bundles_from_bundles(request.batch.groups)
-            if isinstance(request.batch, RlTrajectoryBatch)
-            else ()
-        )
+        bundles = _retained_route_bundles(request.batch)
         ownership = route_ownership
         acquired_here = False
         if acquire_route_ownership:
@@ -630,14 +566,12 @@ class MegatronOperationHandler:
         try:
             packed = await self.runtime.pack(
                 self._packing_request(
-                    packing_request,
+                    request,
                     operation,
                     retained_route_bundles=bundles,
                     force_content_sha256=input_object is not None,
                 )
             )
-            if packed is None:
-                raise ValueError("training input produced no packed sequence")
             packing = self._packing_outcome(packed, request)
             ref = PackedInputCaptureRef(
                 run_id=operation.run_id,
@@ -646,17 +580,6 @@ class MegatronOperationHandler:
                     operation, packed, packing, fingerprint
                 ),
                 content_sha256=packed.leases.ref.content_sha256,
-                input_kind=request.batch.kind,
-                min_source_version=(
-                    request.batch.min_source_version
-                    if isinstance(request.batch, RlTrajectoryBatch)
-                    else 0
-                ),
-                max_source_version=(
-                    request.batch.max_source_version
-                    if isinstance(request.batch, RlTrajectoryBatch)
-                    else 0
-                ),
                 input_object=input_object,
             )
             if (
@@ -681,6 +604,8 @@ class MegatronOperationHandler:
             control_fingerprint=_input_control_fingerprint(identity_request, operation),
             packed=packed,
             packing=packing,
+            training=packed.leases.ref.training_outcome,
+            loss=request.loss,
             route_ownership=ownership,
             retained_for_replay=identity_request.retain_packed_input,
             input_metrics=input_metrics,
@@ -1079,38 +1004,6 @@ class MegatronOperationHandler:
     ) -> MegatronOperationLaunch:
         capture_ref = await self.prepare_input(request, operation)
         captured = await self._require_capture(capture_ref, operation)
-        if captured.packing.loss_bearing_tokens == 0:
-            await self.trainer.record_no_work_command(
-                operation, self._generation.policy_step
-            )
-            captured.retained_for_replay = False
-            await self._release_if_unowned(capture_ref.capture_id)
-            metrics = {
-                **captured.input_metrics,
-                "data/sft_zero_work": 1.0,
-            }
-            if backward:
-                result: OperationResultType = ForwardBackwardResult(
-                    operation_id=operation.operation_id,
-                    packing=captured.packing,
-                    packed_input_capture=None,
-                    token_logprobs=(),
-                    metrics=metrics,
-                    usage=_complete_zero_usage(),
-                    produced_gradient=False,
-                )
-            else:
-                result = ForwardResult(
-                    operation_id=operation.operation_id,
-                    packing=captured.packing,
-                    packed_input_capture=None,
-                    token_logprobs=(),
-                    metrics=metrics,
-                    usage=_complete_zero_usage(),
-                )
-            completion = asyncio.get_running_loop().create_future()
-            completion.set_result(result)
-            return MegatronOperationLaunch(completion=completion)
         try:
             if captured.packed is None:
                 raise RuntimeError("prepared input has no executable payload")
@@ -1121,15 +1014,11 @@ class MegatronOperationHandler:
                 "optimizer_state_path": self._optimizer_state_path,
                 "batch": captured.packed.leases.ref,
                 "expected_global_loss_bearing_tokens": (
-                    captured.packing.loss_bearing_tokens
+                    captured.packed.leases.ref.logical_loss_terms
                 ),
                 "config": _train_config(self.config.train_config, request),
                 "experimental_config": _experimental_config(request),
-                "loss": (
-                    request.loss
-                    if captured.packed.leases.ref.training_kind == "tokenized"
-                    else None
-                ),
+                "loss": request.loss,
                 "return_token_logprobs": request.return_token_logprobs,
             }
             if backward:
@@ -1188,8 +1077,7 @@ class MegatronOperationHandler:
             gpu_count=UsageMeasurement.complete(int(raw["gpu_count"])),
             gpu_service_ns=UsageMeasurement.complete(int(raw["gpu_service_ns"])),
         )
-        result_type = ForwardBackwardResult if backward else ForwardResult
-        result = result_type(
+        common = dict(
             operation_id=operation.operation_id,
             packing=captured.packing,
             packed_input_capture=capture_ref,
@@ -1207,8 +1095,20 @@ class MegatronOperationHandler:
                 **raw.get("metrics", {}),
             },
             usage=usage,
-            **({"produced_gradient": True} if backward else {}),
         )
+        result: OperationResultType
+        if backward:
+            result = ForwardBackwardResult(
+                **common,
+                training=captured.training,
+                loss=NamedLossOutcome(
+                    contract_id=captured.loss.contract_id,
+                    value=float(raw["named_loss_value"]),
+                ),
+                produced_gradient=True,
+            )
+        else:
+            result = ForwardResult(**common)
         if capture_ref.input_object is not None:
             await self._release_execution_image(capture_ref.capture_id, captured)
         return result
@@ -1380,45 +1280,17 @@ class MegatronOperationHandler:
         retained_route_bundles: tuple[RetainedRouteBundleRef, ...],
         force_content_sha256: bool = False,
     ) -> PackingRequest:
-        if isinstance(request.batch, TokenizedTrainingBatch):
-            return PackingRequest(
-                model=self.config.rollout_model,
-                generation_id=operation.operation_id,
-                tokenized_batch=request.batch,
-                tokenized_loss=cast(Any, request.loss.name),
-                packed_sequence_length=self.trainer.runtime_spec.packed_sequence_length,
-                compute_content_sha256=(
-                    request.retain_packed_input or force_content_sha256
-                ),
-            )
-        assert isinstance(request.batch, RlTrajectoryBatch)
-        experimental = _experimental_config(request)
         return PackingRequest(
-            model=self.config.rollout_model,
             generation_id=operation.operation_id,
-            trajectory_groups=request.batch.groups,
+            batch=request.batch,
+            loss=request.loss,
             retained_route_bundles=retained_route_bundles,
-            advantage_balance=experimental.advantage_balance,
-            allow_training_without_logprobs=bool(
-                experimental.allow_training_without_logprobs
-            ),
-            scale_rewards=experimental.scale_rewards,
-            plot_tensors=bool(experimental.plot_tensors),
             packed_sequence_length=self.trainer.runtime_spec.packed_sequence_length,
-            logprob_calculation_chunk_size=(
-                experimental.logprob_calculation_chunk_size or 1024
-            ),
-            include_moe_routing=self.trainer.runtime_spec.enable_moe_routing_replay,
             collect_packing_shapes=request.collect_packing_shapes,
+            return_token_logprobs=request.return_token_logprobs,
             compute_content_sha256=(
                 request.retain_packed_input or force_content_sha256
             ),
-            group_ids=tuple(
-                f"{operation.operation_id}:{index}"
-                for index in range(len(request.batch.groups))
-            ),
-            min_source_version=request.batch.min_source_version,
-            max_source_version=request.batch.max_source_version,
         )
 
     def _packing_outcome(
@@ -1436,10 +1308,12 @@ class MegatronOperationHandler:
             packed_sequence_length=ref.sequence_length,
             packed_sequences=ref.num_sequences,
             target_packed_sequences=target,
+            logical_tokens=stats.logical_tokens,
             physical_tokens=stats.physical_tokens,
-            non_padding_tokens=packed.non_padding_tokens,
-            loss_bearing_tokens=packed.loss_bearing_tokens,
-            trainable_assistant_tokens=packed.trainable_assistant_tokens,
+            packed_capacity_tokens=ref.num_sequences * ref.sequence_length,
+            padding_tokens=(
+                ref.num_sequences * ref.sequence_length - stats.physical_tokens
+            ),
             group_shapes=tuple(
                 cast(Any, shape)
                 for shape in packed.packed_group_shapes
@@ -1502,16 +1376,32 @@ def _experimental_config(
         for name, value in request.loss.values.items()
         if name in ExperimentalTrainConfig.model_fields
     }
-    values["ppo"] = request.loss.name == "ppo"
+    values["ppo"] = False
     values["scale_rewards"] = request.loss.normalize_advantages
     if request.loss.name == "cispo" and {
         "clip_low_threshold",
         "clip_high_threshold",
     }.intersection(request.loss.values):
-        low, high = tokenized_clip_bounds("cispo", request.loss.values)
+        low = float(request.loss.values.get("clip_low_threshold", 0.0))
+        high = float(request.loss.values.get("clip_high_threshold", 4.0))
         values["epsilon"] = 1.0 - low
         values["epsilon_high"] = high - 1.0
     return ExperimentalTrainConfig.model_validate(values)
+
+
+def _retained_route_bundles(
+    batch: TokenMatrixBatch,
+) -> tuple[RetainedRouteBundleRef, ...]:
+    by_id: dict[str, RetainedRouteBundleRef] = {}
+    for route in batch.routes:
+        if route.kind != "retained":
+            continue
+        ref = RetainedRouteBundleRef.model_validate(route.bundle)
+        bundle_id = ref.layout.bundle_id
+        previous = by_id.setdefault(bundle_id, ref)
+        if previous != ref:
+            raise ValueError("TokenMatrix route bundle identity was reused")
+    return tuple(by_id.values())
 
 
 def _data_parallel_size(trainer: _ResidentTrainer) -> int:
@@ -1655,10 +1545,9 @@ def _dispatched_execution_error(
 
 def _packing_metrics(packed: DistributedPackedBatch) -> dict[str, float]:
     return {
-        "time/step_trajectory_fetch_s": packed.trajectory_fetch_s,
+        "time/step_batch_fetch_s": packed.batch_fetch_s,
         "time/step_route_fetch_s": packed.route_fetch_s,
         "time/step_packing_core_s": packed.packing_core_s,
-        "time/step_trajectory_log_wait_s": packed.trajectory_log_wait_s,
         "time/step_packed_batch_finalize_s": packed.packed_batch_finalize_s,
         "time/step_packing_rpc_s": packed.packing_rpc_s,
         "time/step_packed_batch_fanout_s": packed.packed_batch_fanout_s,

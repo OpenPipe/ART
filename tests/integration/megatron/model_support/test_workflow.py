@@ -120,7 +120,9 @@ def _fixture(tmp_path: Path, model_key: str) -> WorkflowFixture:
     )
 
 
-def test_canonical_production_config_digest_uses_resolved_config(tmp_path: Path) -> None:
+def test_canonical_production_config_digest_uses_resolved_config(
+    tmp_path: Path,
+) -> None:
     import torch
     from transformers import AutoConfig, LlamaConfig
 
@@ -851,7 +853,9 @@ def test_throughput_packed_input_fingerprint_hashes_data_plane_bytes() -> None:
                 PackedGroupShape(
                     leaves=(
                         PackingLeafShape(
-                            token_ids=array("I", [1, 2, 3]), shareable_length=2
+                            matrix_id="fixture-matrix-0",
+                            token_ids=array("I", [1, 2, 3]),
+                            shareable_length=2,
                         ),
                     )
                 ),
@@ -875,7 +879,9 @@ def test_throughput_packed_input_fingerprint_hashes_data_plane_bytes() -> None:
             PackedGroupShape(
                 leaves=(
                     PackingLeafShape(
-                        token_ids=array("I", [1, 2, 4]), shareable_length=2
+                        matrix_id="fixture-matrix-0",
+                        token_ids=array("I", [1, 2, 4]),
+                        shareable_length=2,
                     ),
                 )
             ),

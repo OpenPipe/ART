@@ -82,65 +82,71 @@ def _command_token_logprobs(
 def _command_token_logprob_decoder(
     batch: InMemoryPackedBatch,
 ) -> Callable[[tuple[torch.Tensor, ...]], tuple[dict[str, Any], ...]]:
-    if batch.ref.training_kind != "tokenized":
-        return _sft_token_logprobs
-    output_map = batch.ref.tokenized_output_map
-    if output_map is None:
-        raise RuntimeError("tokenized batch has no output map")
-    target_tokens = batch.tensors.get("target_tokens")
-    if target_tokens is None:
-        raise RuntimeError("tokenized batch has no target tensor")
-    candidate_capacity = int(target_tokens.shape[2])
-    expected_rows = batch.ref.num_sequences * batch.ref.sequence_length
+    output_map = batch.ref.token_matrix_output_map
+    matrix_indices = batch.tensors.get("logical_matrix_indices")
+    target_indices = batch.tensors.get("logical_target_indices")
+    value_mask = batch.tensors.get("logical_value_mask")
+    if matrix_indices is None or target_indices is None or value_mask is None:
+        raise RuntimeError("TokenMatrix batch has no logical output map")
 
     def decode(outputs: tuple[torch.Tensor, ...]) -> tuple[dict[str, Any], ...]:
-        return _decode_tokenized_logprobs(
+        return _decode_token_matrix_logprobs(
             outputs,
-            candidate_capacity=candidate_capacity,
-            expected_rows=expected_rows,
-            packed_positions=output_map.packed_positions,
-            candidate_counts=output_map.candidate_counts,
+            matrix_ids=output_map.matrix_ids,
+            target_shapes=output_map.target_shapes,
+            matrix_indices=matrix_indices,
+            target_indices=target_indices,
+            value_mask=value_mask,
         )
 
     return decode
 
 
-def _decode_tokenized_logprobs(
+def _decode_token_matrix_logprobs(
     outputs: tuple[torch.Tensor, ...],
     *,
-    candidate_capacity: int,
-    expected_rows: int,
-    packed_positions: tuple[tuple[int, ...], ...],
-    candidate_counts: tuple[int, ...],
+    matrix_ids: tuple[str, ...],
+    target_shapes: tuple[tuple[int, int], ...],
+    matrix_indices: torch.Tensor,
+    target_indices: torch.Tensor,
+    value_mask: torch.Tensor,
 ) -> tuple[dict[str, Any], ...]:
-    physical = torch.cat(
-        [values.reshape(-1, candidate_capacity) for values in outputs], dim=0
-    )
-    if int(physical.shape[0]) != expected_rows:
+    logical = torch.cat([values.reshape(1, -1) for values in outputs], dim=0)
+    expected_shape = tuple(matrix_indices.shape)
+    if tuple(logical.shape) != expected_shape:
         raise RuntimeError(
-            "tokenized command did not return every physical packed row: "
-            f"returned={physical.shape[0]}, expected={expected_rows}"
+            "TokenMatrix command did not return every logical packed row: "
+            f"returned={tuple(logical.shape)}, expected={expected_shape}"
         )
-    logical = []
-    for positions, candidates in zip(packed_positions, candidate_counts, strict=True):
-        values = physical[list(positions), :candidates]
-        logical.append(
+    if (
+        target_indices.shape != matrix_indices.shape
+        or value_mask.shape != matrix_indices.shape
+    ):
+        raise RuntimeError("TokenMatrix logical output tensors are not aligned")
+    decoded = []
+    for matrix_index, (matrix_id, shape) in enumerate(
+        zip(matrix_ids, target_shapes, strict=True)
+    ):
+        element_count = math.prod(shape)
+        values = torch.empty(element_count, dtype=logical.dtype)
+        seen = torch.zeros(element_count, dtype=torch.bool)
+        selected = value_mask & (matrix_indices == matrix_index)
+        indices = target_indices[selected].to(dtype=torch.long)
+        if indices.numel():
+            if bool((indices < 0).any()) or bool((indices >= element_count).any()):
+                raise RuntimeError("TokenMatrix logical target index is out of range")
+            if int(indices.unique().numel()) != int(indices.numel()):
+                raise RuntimeError("TokenMatrix logical target output was duplicated")
+            values[indices] = logical[selected]
+            seen[indices] = True
+        if not bool(seen.all()):
+            raise RuntimeError(f"TokenMatrix output for {matrix_id!r} is incomplete")
+        decoded.append(
             TokenLogprobs.from_values(
-                values.flatten().tolist(), shape=tuple(values.shape)
+                values.tolist(), matrix_id=matrix_id, shape=shape
             ).model_dump(mode="python")
         )
-    return tuple(logical)
-
-
-def _sft_token_logprobs(
-    outputs: tuple[torch.Tensor, ...],
-) -> tuple[dict[str, Any], ...]:
-    return tuple(
-        TokenLogprobs.from_values(
-            values.flatten().tolist(), shape=tuple(values.shape)
-        ).model_dump(mode="python")
-        for values in outputs
-    )
+    return tuple(decoded)
 
 
 @dataclass(slots=True)
@@ -286,6 +292,7 @@ class MegatronTrainJobExecutor:
             "logical_nonpadding_tokens": result.logical_nonpadding_tokens,
             "executed_token_equivalents": result.executed_token_equivalents,
             "gpu_service_ns": result.gpu_service_ns,
+            "named_loss_value": result.named_loss_value,
             "token_logprobs": _command_token_logprobs(batch, result.new_logprobs)
             if job.return_token_logprobs
             else (),
@@ -1468,6 +1475,7 @@ class MCoreRunSlotExecutor:
                 "logical_nonpadding_tokens": result.logical_nonpadding_tokens,
                 "executed_token_equivalents": result.executed_token_equivalents,
                 "gpu_service_ns": result.gpu_service_ns,
+                "named_loss_value": result.named_loss_value,
                 "metrics": result.metrics,
             },
             result.new_logprobs if job.return_token_logprobs else (),
@@ -1503,6 +1511,7 @@ class MCoreRunSlotExecutor:
                 "logical_nonpadding_tokens": result.logical_nonpadding_tokens,
                 "executed_token_equivalents": result.executed_token_equivalents,
                 "gpu_service_ns": result.gpu_service_ns,
+                "named_loss_value": result.named_loss_value,
                 "metrics": result.metrics,
             },
             result.new_logprobs if job.return_token_logprobs else (),

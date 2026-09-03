@@ -182,6 +182,15 @@ class DispatchedPackedTensors(ContextParallelLossInputs):
     loss_weights: torch.Tensor | None = None
     behavior_logprobs: torch.Tensor | None = None
     token_advantages: torch.Tensor | None = None
+    projection_ids: torch.Tensor | None = None
+    logical_projection_ids: torch.Tensor | None = None
+    logical_matrix_indices: torch.Tensor | None = None
+    logical_target_indices: torch.Tensor | None = None
+    logical_value_mask: torch.Tensor | None = None
+    logical_loss_weights: torch.Tensor | None = None
+    logical_behavior_logprobs: torch.Tensor | None = None
+    logical_advantages: torch.Tensor | None = None
+    projection_count: int = 0
 
 
 class TrainingMicrobatchWorkload(BaseModel):

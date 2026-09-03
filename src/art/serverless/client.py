@@ -31,6 +31,7 @@ from art.training import (
     ForwardResult,
     LoadStateRequest,
     LoadStateResult,
+    NamedLossOutcome,
     OperationResult,
     OptimStepResult,
     PackedInputCaptureRef,
@@ -41,6 +42,7 @@ from art.training import (
     ServiceCheckpointSource,
     TokenLogprobs,
     TrainingInputObjectRef,
+    TrainingOutcome,
     TrainingRunSpec,
     WandbArtifactCheckpointSource,
 )
@@ -229,13 +231,14 @@ class _PublicPackingOutcome(_PublicWireModel):
     packed_sequence_length: int = Field(ge=1)
     packed_sequences: int = Field(ge=0)
     target_packed_sequences: int = Field(ge=1)
+    logical_tokens: int = Field(ge=0)
     physical_tokens: int = Field(ge=0)
-    non_padding_tokens: int = Field(ge=0)
-    loss_bearing_tokens: int = Field(ge=0)
-    trainable_assistant_tokens: int = Field(ge=0)
+    packed_capacity_tokens: int = Field(ge=0)
+    padding_tokens: int = Field(ge=0)
 
 
 class _PublicPackingLeafShape(_PublicWireModel):
+    matrix_id: str = Field(min_length=1, max_length=255)
     token_ids: tuple[int, ...] = Field(min_length=1)
     shareable_length: int = Field(ge=0)
 
@@ -254,9 +257,7 @@ class _PublicPackedInputRef(_PublicWireModel):
     capture_id: str
     manifest_sha256: str
     content_sha256: str | None
-    input_kind: Literal["rl", "sft", "tokenized"]
-    min_source_version: int = Field(ge=0)
-    max_source_version: int = Field(ge=0)
+    input_object: TrainingInputObjectRef | None = None
 
 
 class _PublicTrainingResult(_PublicWireModel):
@@ -264,6 +265,8 @@ class _PublicTrainingResult(_PublicWireModel):
     kind: NativeOperationKind
     metrics: dict[str, FiniteFloat] = Field(default_factory=dict)
     packing: _PublicPackingOutcome | None = None
+    training: TrainingOutcome | None = None
+    loss: NamedLossOutcome | None = None
     produced_gradient: bool | None = None
     token_logprobs: tuple[TokenLogprobs, ...] = ()
     group_shapes: tuple[_PublicPackedGroupShape, ...] = ()

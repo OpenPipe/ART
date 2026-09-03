@@ -42,6 +42,7 @@ from .moe_routing import (
     align_choice_routes_to_tokenized_result,
     choice_moe_routing_metadata,
 )
+from .policy_spans import choice_policy_token_spans
 from .response_masking import (
     _TemplatePartTokenizer,
     response_only_labels,
@@ -376,9 +377,11 @@ class TokenizedResult:
     _tokenizer: _TokenDecoder = field(repr=False, compare=False)
     moe_routed_experts: MoeRouteArray | MoeRouteSegments | None = None
     moe_routing_alignment_stats: MoeRoutingAlignmentStats | None = None
+    policy_versions: list[int] | None = None
     weight: float = 0.0
     prompt_id: int = 0
     prompt_length: int = 0
+    captured_route: tuple[str, int] | None = None
 
     @cached_property
     def tokens(self) -> list[str]:
@@ -410,10 +413,16 @@ class TokenizedResult:
                 self.moe_routed_experts, self.prompt_length
             ),
             moe_routing_alignment_stats=self.moe_routing_alignment_stats,
+            policy_versions=(
+                None
+                if self.policy_versions is None
+                else self.policy_versions[self.prompt_length :]
+            ),
             _tokenizer=self._tokenizer,
             weight=self.weight,
             prompt_id=self.prompt_id,
             prompt_length=0,
+            captured_route=None,
         )
 
 
@@ -627,8 +636,84 @@ def _tokenized_result_from_vllm_choices(
         ),
         moe_routed_experts=moe_routed_experts,
         moe_routing_alignment_stats=moe_routing_alignment_stats,
+        policy_versions=_choice_policy_versions(
+            token_count=len(token_ids),
+            choices=choices,
+            choice_offsets=choice_offsets,
+        ),
+        captured_route=_captured_route_selection(
+            trajectory=trajectory,
+            choices=choices,
+            token_ids=token_ids,
+        ),
         _tokenizer=tokenizer,
     )
+
+
+def _captured_route_selection(
+    *,
+    trajectory: Trajectory,
+    choices: list[Choice],
+    token_ids: list[int],
+) -> tuple[str, int] | None:
+    """Bind one route-capture response only when it covers the exact sequence."""
+
+    selected = {
+        (
+            int(choice.index),
+            tuple(prompt_ids),
+            tuple(completion_ids),
+        )
+        for choice in choices
+        if (metadata := choice_vllm_token_metadata(choice)) is not None
+        for prompt_ids, completion_ids in (metadata,)
+    }
+    matches: list[tuple[str, int]] = []
+    for exchange in trajectory.exchanges.chat_completions:
+        if exchange.request.get("capture_routes") is not True:
+            continue
+        for choice in exchange.response.choices:
+            metadata = choice_vllm_token_metadata(choice)
+            if metadata is None:
+                continue
+            prompt_ids, completion_ids = metadata
+            identity = (
+                int(choice.index),
+                tuple(prompt_ids),
+                tuple(completion_ids),
+            )
+            if identity not in selected:
+                continue
+            if [*prompt_ids, *completion_ids] != token_ids:
+                continue
+            matches.append((exchange.response.id, int(choice.index)))
+    unique = tuple(dict.fromkeys(matches))
+    if len(unique) > 1:
+        raise RuntimeError("route capture identity is ambiguous for tokenized sequence")
+    return unique[0] if unique else None
+
+
+def _choice_policy_versions(
+    *,
+    token_count: int,
+    choices: list[Choice],
+    choice_offsets: list[int],
+) -> list[int] | None:
+    versions = [-1] * token_count
+    saw_span = False
+    for choice, offset in zip(choices, choice_offsets, strict=True):
+        for span in choice_policy_token_spans(choice):
+            start = offset + span.start_token
+            end = offset + span.end_token
+            if start < 0 or end > token_count:
+                raise RuntimeError("policy token span exceeds the tokenized sequence")
+            for position in range(start, end):
+                previous = versions[position]
+                if previous not in {-1, span.policy_version}:
+                    raise RuntimeError("overlapping policy token spans disagree")
+                versions[position] = span.policy_version
+            saw_span = True
+    return versions if saw_span else None
 
 
 def assemble_vllm_training_sequences(
@@ -892,6 +977,15 @@ def tokenize_trajectory_groups(
                             extra_logprobs={},
                             moe_routed_experts=moe_routes,
                             moe_routing_alignment_stats=moe_stats,
+                            captured_route=(
+                                _captured_route_selection(
+                                    trajectory=trajectory,
+                                    choices=chat_trace.choices,
+                                    token_ids=exchange_result.tokens,
+                                )
+                                if chat_trace is not None
+                                else None
+                            ),
                             _tokenizer=tokenizer,
                         )
                     )

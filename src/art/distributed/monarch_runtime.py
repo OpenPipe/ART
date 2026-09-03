@@ -14,7 +14,6 @@ from .adapter_transport import (
     ExternalAdapterSource,
 )
 from .data_plane import PackedBatchRef, PackedBatchTransfer
-from .packing import PackingRequest, PackingResult
 from .rollout import (
     RolloutInvocation,
     RolloutResult,
@@ -252,19 +251,3 @@ class MonarchPackedBatchSource:
 
     async def note_transmitted(self, byte_count: int) -> None:
         await call_remote(self.actor.note_batch_transmitted, byte_count)
-
-
-class MonarchPackingEndpoint:
-    def __init__(self, actor: Any) -> None:
-        self.actor = actor
-
-    async def pack(
-        self,
-        request: PackingRequest,
-        batch_id: str,
-        *,
-        transfer_timeout_s: float,
-    ) -> PackingResult:
-        return await call_remote(
-            self.actor.pack_batch, request, batch_id, transfer_timeout_s
-        )

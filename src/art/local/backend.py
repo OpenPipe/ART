@@ -86,17 +86,19 @@ from ..pipeline_tuner import (
 from ..preprocessing.pack import (
     DEFAULT_MIN_PREFIX_TREE_SHARED_SEGMENT_LENGTH,
     PackedTensors,
-    packed_tensors_from_tokenized_results,
+    packed_tensors_from_token_matrices,
     packed_tensors_to_dir,
     plot_packed_tensors,
     prefix_tree_shareable_length,
 )
+from ..preprocessing.token_matrix import token_matrix_batch_from_art_rollouts
 from ..preprocessing.tokenize import (
     ChatTemplateToolSchemaFormat,
     tokenize_sft_batch,
     tokenize_trajectory_groups,
 )
 from ..serving_capabilities import FastMetricsSnapshot, ServingCapabilities
+from ..training import NamedLossRequest
 from ..trajectories import Trajectory, TrajectoryGroup
 from ..trajectories._selection import automatic_training_model_selector
 from ..types import (
@@ -1116,27 +1118,46 @@ class LocalBackend:
             if not tokenized_results:
                 return None
 
-        self._record_packed_group_observations(trajectory_groups, tokenized_results)
-        packed_tensors = packed_tensors_from_tokenized_results(
-            tokenized_results,
-            sequence_length,
-            pad_token_id=tokenizer.eos_token_id,
-            truncate_long_results=False,
-            advantage_balance=advantage_balance,
-            pack_results=self._supports_result_packing,
-            include_moe_routing=include_moe_routing,
-            min_prefix_tree_shared_segment_length=(
-                min_prefix_tree_shared_segment_length
-            ),
-        )
-        if (
-            not allow_training_without_logprobs
-            and np.isnan(packed_tensors["logprobs"]).all()
+        if not allow_training_without_logprobs and all(
+            np.isnan(np.asarray(result.logprobs)).all() for result in tokenized_results
         ):
             logger.warning(
                 "There are no assistant logprobs to train on. Did you forget to include at least one Choice in Trajectory.messages_and_choices?"
             )
             return None
+
+        loss = NamedLossRequest(name="cispo", normalize_advantages=False)
+        lowered = token_matrix_batch_from_art_rollouts(
+            tokenized_results,
+            loss="cispo",
+            normalize_advantages=scale_rewards,
+            advantage_balance=advantage_balance,
+        )
+        self._record_packed_group_observations(
+            trajectory_groups,
+            tokenized_results,
+            tuple(matrix.matrix_id for matrix in lowered.batch.matrices),
+        )
+        resolved_routes = lowered.resolved_routes if include_moe_routing else None
+        if include_moe_routing and set(lowered.resolved_routes) != {
+            matrix.matrix_id for matrix in lowered.batch.matrices
+        }:
+            raise RuntimeError(
+                "MoE routing replay from trajectories was requested, but a "
+                "tokenized result has no aligned routed experts"
+            )
+        packed_tensors = packed_tensors_from_token_matrices(
+            batch=lowered.batch,
+            loss=loss,
+            seq_len=sequence_length,
+            pad_token_id=tokenizer.eos_token_id,
+            pack_results=self._supports_result_packing,
+            return_token_logprobs=True,
+            resolved_routes=resolved_routes,
+            min_prefix_tree_shared_segment_length=(
+                min_prefix_tree_shared_segment_length
+            ),
+        )
         if plot_tensors:
             plot_packed_tensors(
                 packed_tensors, get_model_dir(model=model, art_path=self._path)
@@ -1149,25 +1170,30 @@ class LocalBackend:
 
     @staticmethod
     def _record_packed_group_observations(
-        trajectory_groups: list[TrajectoryGroup], tokenized_results: list[Any]
+        trajectory_groups: list[TrajectoryGroup],
+        tokenized_results: list[Any],
+        matrix_ids: tuple[str, ...],
     ) -> None:
         if not any(group._collect_packing_shape for group in trajectory_groups):
             return
-        by_trajectory_id: dict[int, list[Any]] = {}
-        for result in tokenized_results:
-            by_trajectory_id.setdefault(id(result.trajectory), []).append(result)
+        by_trajectory_id: dict[int, list[tuple[Any, str]]] = {}
+        for result, matrix_id in zip(tokenized_results, matrix_ids, strict=True):
+            by_trajectory_id.setdefault(id(result.trajectory), []).append(
+                (result, matrix_id)
+            )
         for group in trajectory_groups:
             if not group._collect_packing_shape:
                 continue
-            results: list[Any] = []
+            results: list[tuple[Any, str]] = []
             for trajectory in group.trajectories:
                 results.extend(by_trajectory_id.get(id(trajectory), []))
             if not results:
                 continue
             leaves = []
-            for result in results:
+            for result, matrix_id in results:
                 leaves.append(
                     PackingLeafShape(
+                        matrix_id=matrix_id,
                         token_ids=array("I", result.token_ids),
                         shareable_length=prefix_tree_shareable_length(result),
                     )

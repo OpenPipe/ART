@@ -13,7 +13,9 @@ from typing import Any, Coroutine, Literal, Protocol, TypeVar, cast
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-PACKED_BATCH_FORMAT = "art_packed_rl_v2"
+from art.training.contracts import TrainingOutcome
+
+PACKED_BATCH_FORMAT = "art_token_matrix_packed_v1"
 _DTYPE_BYTES = {
     "bool": 1,
     "uint8": 1,
@@ -66,9 +68,19 @@ class PrefixTreePackingStatsSpec(_Contract):
     physical_tokens: int = Field(ge=0)
 
 
-class TokenizedOutputMapSpec(_Contract):
-    packed_positions: tuple[tuple[int, ...], ...] = Field(min_length=1)
-    candidate_counts: tuple[int, ...] = Field(min_length=1)
+class TokenMatrixOutputMapSpec(_Contract):
+    matrix_ids: tuple[str, ...] = Field(min_length=1)
+    target_shapes: tuple[tuple[int, int], ...] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def _validate_matrices(self) -> "TokenMatrixOutputMapSpec":
+        if len(self.matrix_ids) != len(self.target_shapes):
+            raise ValueError("TokenMatrix output identities and shapes are not aligned")
+        if len(set(self.matrix_ids)) != len(self.matrix_ids):
+            raise ValueError("TokenMatrix output identities must be unique")
+        if any(min(shape) < 1 for shape in self.target_shapes):
+            raise ValueError("TokenMatrix output shapes must be positive")
+        return self
 
 
 class PackedBatchRef(_Contract):
@@ -88,8 +100,9 @@ class PackedBatchRef(_Contract):
     image_grid_thw_present: tuple[bool, ...]
     moe_routing_replay: MoeRoutingReplaySpec | None = None
     prefix_tree_packing_stats: PrefixTreePackingStatsSpec | None = None
-    training_kind: Literal["rl", "tokenized"] = "rl"
-    tokenized_output_map: TokenizedOutputMapSpec | None = None
+    token_matrix_output_map: TokenMatrixOutputMapSpec
+    training_outcome: TrainingOutcome
+    logical_loss_terms: int = Field(ge=1)
     group_ids: tuple[str, ...] = ()
     record_ids: tuple[str, ...] = ()
     min_source_version: int = Field(default=0, ge=0)
@@ -150,46 +163,50 @@ class PackedBatchRef(_Contract):
                 or specs["original_logprobs"].shape != core_shape
             ):
                 raise ValueError("original_logprobs dtype or shape is invalid")
-        tokenized_names = {
+        matrix_names = {
             "target_tokens",
-            "loss_weights",
-            "behavior_logprobs",
-            "token_advantages",
+            "projection_ids",
+            "logical_projection_ids",
+            "logical_matrix_indices",
+            "logical_target_indices",
+            "logical_value_mask",
+            "logical_loss_weights",
+            "logical_behavior_logprobs",
+            "logical_advantages",
         }
-        if self.training_kind == "tokenized":
-            if self.tokenized_output_map is None or not tokenized_names <= specs.keys():
-                raise ValueError("tokenized packed-batch manifest is incomplete")
-            target_shape = specs["target_tokens"].shape
-            if (
-                len(target_shape) != 3
-                or target_shape[:2] != core_shape
-                or target_shape[2] < 1
-                or specs["target_tokens"].dtype != "int64"
-                or any(
-                    specs[name].dtype != "float32" or specs[name].shape != target_shape
-                    for name in tokenized_names - {"target_tokens"}
-                )
-            ):
-                raise ValueError("tokenized packed tensor dtype or shape is invalid")
-            expected_optional |= tokenized_names
-            output_map = self.tokenized_output_map
-            if (
-                len(output_map.packed_positions) != len(output_map.candidate_counts)
-                or any(
-                    count < 1 or count > target_shape[2]
-                    for count in output_map.candidate_counts
-                )
-                or any(not positions for positions in output_map.packed_positions)
-                or any(
-                    position < 0
-                    or position >= self.num_sequences * self.sequence_length
-                    for positions in output_map.packed_positions
-                    for position in positions
-                )
-            ):
-                raise ValueError("tokenized output map is invalid")
-        elif self.tokenized_output_map is not None:
-            raise ValueError("RL packed batches cannot carry a tokenized output map")
+        if not matrix_names <= specs.keys():
+            raise ValueError("TokenMatrix packed-batch manifest is incomplete")
+        physical_shape = specs["target_tokens"].shape
+        if (
+            len(physical_shape) != 3
+            or physical_shape[:2] != core_shape
+            or specs["target_tokens"].dtype != "int64"
+            or specs["projection_ids"].dtype != "int64"
+            or specs["projection_ids"].shape != physical_shape
+        ):
+            raise ValueError("TokenMatrix physical projection tensors are invalid")
+        logical_shape = specs["logical_projection_ids"].shape
+        if len(logical_shape) != 2 or logical_shape[0] != self.num_sequences:
+            raise ValueError("TokenMatrix logical tensors must have shape [B,L]")
+        logical_dtypes = {
+            "logical_projection_ids": "int64",
+            "logical_matrix_indices": "int32",
+            "logical_target_indices": "int64",
+            "logical_value_mask": "bool",
+            "logical_loss_weights": "float32",
+            "logical_behavior_logprobs": "float32",
+            "logical_advantages": "float32",
+        }
+        if any(
+            specs[name].dtype != dtype or specs[name].shape != logical_shape
+            for name, dtype in logical_dtypes.items()
+        ):
+            raise ValueError("TokenMatrix logical tensor dtype or shape is invalid")
+        if self.training_outcome.accepted_trainable_tokens > self.logical_loss_terms:
+            raise ValueError(
+                "accepted token positions cannot exceed logical loss terms"
+            )
+        expected_optional |= matrix_names
         replay_names = {"moe_routing_replay/expert_indices"}
         if self.moe_routing_replay is not None:
             if not replay_names <= specs.keys():
@@ -350,8 +367,9 @@ class SharedMemoryPackedBatchStore:
                 image_grid_thw_present=metadata["image_grid_thw_present"],
                 moe_routing_replay=metadata["moe_routing_replay"],
                 prefix_tree_packing_stats=metadata["prefix_tree_packing_stats"],
-                training_kind=metadata["training_kind"],
-                tokenized_output_map=metadata["tokenized_output_map"],
+                token_matrix_output_map=metadata["token_matrix_output_map"],
+                training_outcome=metadata["training_outcome"],
+                logical_loss_terms=metadata["logical_loss_terms"],
                 group_ids=group_ids,
                 record_ids=record_ids,
                 min_source_version=min_source_version,
@@ -1046,20 +1064,39 @@ def _flatten_packed_tensors(
         if tuple(original.shape) != shape:
             raise ValueError("original_logprobs must match the core packed shape")
         flat.append(("original_logprobs", original))
-    tokenized_names = (
-        "target_tokens",
-        "loss_weights",
-        "behavior_logprobs",
-        "token_advantages",
+    matrix_map = tensors.get("token_matrix_output_map")
+    training_outcome = tensors.get("token_matrix_training_outcome")
+    if matrix_map is None or training_outcome is None:
+        raise ValueError("packed tensors must carry TokenMatrix result metadata")
+    logical_weights = tensors.get("logical_loss_weights")
+    logical_mask = tensors.get("logical_value_mask")
+    if logical_weights is None or logical_mask is None:
+        raise ValueError("packed tensors must carry TokenMatrix logical loss values")
+    logical_loss_terms = int(((logical_weights != 0) & logical_mask).sum().item())
+    if logical_loss_terms < 1:
+        raise ValueError("TokenMatrix packed tensors have no active loss terms")
+    token_matrix_names = (
+        "projection_ids",
+        "logical_projection_ids",
+        "logical_matrix_indices",
+        "logical_target_indices",
+        "logical_value_mask",
+        "logical_loss_weights",
+        "logical_behavior_logprobs",
+        "logical_advantages",
     )
-    tokenized = [name for name in tokenized_names if name in tensors]
-    if tokenized and len(tokenized) != len(tokenized_names):
-        raise ValueError("tokenized packed tensors are incomplete")
-    for name in tokenized:
+    if "target_tokens" not in tensors or any(
+        name not in tensors for name in token_matrix_names
+    ):
+        raise ValueError("TokenMatrix packed tensors are incomplete")
+    physical = tensors["target_tokens"]
+    _validate_tensor("target_tokens", physical, torch)
+    if physical.ndim != 3 or tuple(physical.shape[:2]) != shape:
+        raise ValueError("TokenMatrix targets must have shape [B,S,K]")
+    flat.append(("target_tokens", physical))
+    for name in token_matrix_names:
         tensor = tensors[name]
         _validate_tensor(name, tensor, torch)
-        if tensor.ndim != 3 or tuple(tensor.shape[:2]) != shape:
-            raise ValueError("tokenized packed tensors must have shape [B, S, K]")
         flat.append((name, tensor))
     replay = tensors.get("moe_routing_replay")
     replay_spec = None
@@ -1082,12 +1119,9 @@ def _flatten_packed_tensors(
         ),
         "moe_routing_replay": replay_spec,
         "prefix_tree_packing_stats": tensors.get("prefix_tree_packing_stats"),
-        "training_kind": "tokenized" if tokenized else "rl",
-        "tokenized_output_map": (
-            None
-            if (output_map := tensors.get("tokenized_output_map")) is None
-            else output_map.model_dump()
-        ),
+        "token_matrix_output_map": matrix_map.model_dump(),
+        "training_outcome": training_outcome,
+        "logical_loss_terms": logical_loss_terms,
     }
 
 
@@ -1222,9 +1256,24 @@ def _unflatten_packed_tensors(flat: dict[str, Any], ref: PackedBatchRef) -> Any:
         "loss_weights",
         "behavior_logprobs",
         "token_advantages",
+        "projection_ids",
+        "logical_projection_ids",
+        "logical_matrix_indices",
+        "logical_target_indices",
+        "logical_value_mask",
+        "logical_loss_weights",
+        "logical_behavior_logprobs",
+        "logical_advantages",
     ):
         if name in flat:
             tensors[name] = flat[name]
+    if ref.token_matrix_output_map is not None:
+        from art.preprocessing.pack import TokenMatrixOutputMap
+
+        tensors["token_matrix_output_map"] = TokenMatrixOutputMap.model_validate(
+            ref.token_matrix_output_map.model_dump(mode="python")
+        )
+        tensors["token_matrix_training_outcome"] = ref.training_outcome
     if ref.prefix_tree_packing_stats is not None:
         tensors["prefix_tree_packing_stats"] = (
             ref.prefix_tree_packing_stats.model_dump()

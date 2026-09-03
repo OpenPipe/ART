@@ -32,7 +32,15 @@ if TYPE_CHECKING:
     from wandb.sdk.artifacts.artifact import Artifact
 
     from ..model import Model, TrainableModel
-    from ..training import PackedInputCaptureRef, RunInitialState, TrainingRunSpec
+    from ..pipeline_tuner.config import PackedGroupShape
+    from ..preprocessing.sft import SftBatchTokenizer
+    from ..preprocessing.token_matrix import LoweredTokenMatrixBatch
+    from ..training import (
+        PackedInputCaptureRef,
+        RunInitialState,
+        TokenMatrixBatch,
+        TrainingRunSpec,
+    )
     from .native_training import RemoteTrainingClient
 
 
@@ -91,6 +99,135 @@ class ServerlessBackend:
         self._native_artifacts: dict[str, str] = {}
         self._retain_next_inputs: set[str] = set()
         self._retained_inputs: dict[str, list["PackedInputCaptureRef"]] = {}
+        self._sft_batch_tokenizer: SftBatchTokenizer | None = None
+
+    def _batch_tokenizer(self) -> "SftBatchTokenizer":
+        if self._sft_batch_tokenizer is None:
+            from art.preprocessing.sft import SftBatchTokenizer
+
+            self._sft_batch_tokenizer = SftBatchTokenizer()
+        return self._sft_batch_tokenizer
+
+    def _lower_rl_batch(
+        self,
+        model: AnyTrainableModel,
+        trajectory_groups: list[TrajectoryGroup],
+        dev_config: dev.TrainConfig,
+    ) -> "TokenMatrixBatch | None":
+        from art.preprocessing.token_matrix import (
+            token_matrix_batch_from_art_rollouts,
+        )
+        from art.preprocessing.tokenize import tokenize_trajectory_groups
+        from art.trajectories._selection import automatic_training_model_selector
+
+        tokenizer_cache = self._batch_tokenizer()
+        internal = cast(dev.InternalModelConfig, model._internal_config or {})
+        tokenizer = tokenizer_cache._tokenizer(model.base_model, internal)
+        model_max_sequence_length = tokenizer_cache.max_sequence_length(model)
+        configured_sequence_length = dev_config.get("packed_sequence_length")
+        max_sequence_length = (
+            min(model_max_sequence_length, configured_sequence_length)
+            if configured_sequence_length is not None
+            else model_max_sequence_length
+        )
+        tokenized = list(
+            tokenize_trajectory_groups(
+                tokenizer,
+                trajectory_groups,
+                bool(dev_config.get("allow_training_without_logprobs", False)),
+                bool(dev_config.get("scale_rewards", True)),
+                chat_template_kwargs=internal.get("chat_template_kwargs"),
+                chat_template_tool_schema_format=internal.get(
+                    "chat_template_tool_schema_format", "default"
+                ),
+                model=automatic_training_model_selector(model.get_inference_name()),
+                _max_sequence_length=max_sequence_length,
+            )
+        )
+        tokenized = [
+            result
+            for result in tokenized
+            if len(result.token_ids) <= max_sequence_length
+        ]
+        if not tokenized:
+            return None
+        if any(
+            result.pixel_values is not None or result.image_grid_thw is not None
+            for result in tokenized
+        ):
+            raise ValueError("native TokenMatrix training supports text inputs only")
+        lowered = token_matrix_batch_from_art_rollouts(
+            tokenized,
+            normalize_advantages=bool(dev_config.get("scale_rewards", True)),
+            advantage_balance=float(dev_config.get("advantage_balance", 0.0)),
+        )
+        return self._transport_token_matrix_batch(lowered)
+
+    @staticmethod
+    def _transport_token_matrix_batch(
+        lowered: "LoweredTokenMatrixBatch",
+    ) -> "TokenMatrixBatch":
+        if not lowered.batch.routes and not lowered.resolved_routes:
+            return lowered.batch
+
+        from art.preprocessing.moe_routing import MoeRouteSegments
+        from art.training import InlineTokenRoutes
+
+        matrix_ids = {matrix.matrix_id for matrix in lowered.batch.matrices}
+        routes_by_matrix = {}
+        for route in lowered.batch.routes:
+            if route.matrix_id in routes_by_matrix:
+                raise ValueError("TokenMatrix routes were supplied twice")
+            routes_by_matrix[route.matrix_id] = route
+        for matrix_id, route in lowered.resolved_routes.items():
+            if matrix_id not in matrix_ids:
+                raise ValueError("routing replay references an unknown TokenMatrix")
+            if matrix_id in routes_by_matrix:
+                raise ValueError("TokenMatrix routes were supplied twice")
+            segments = (
+                route.segments if isinstance(route, MoeRouteSegments) else (route,)
+            )
+            routes_by_matrix[matrix_id] = InlineTokenRoutes(
+                matrix_id=matrix_id,
+                num_experts=route.num_experts,
+                shape=route.shape,
+                expert_ids=b"".join(segment.tobytes(order="C") for segment in segments),
+            )
+        if set(routes_by_matrix) != matrix_ids:
+            raise ValueError("routing replay requires routes for every TokenMatrix")
+        return lowered.batch.model_copy(
+            update={
+                "routes": tuple(
+                    routes_by_matrix[matrix.matrix_id]
+                    for matrix in lowered.batch.matrices
+                )
+            }
+        )
+
+    @staticmethod
+    def _attach_rl_packing_shapes(
+        trajectory_groups: list[TrajectoryGroup],
+        batch: "TokenMatrixBatch",
+        shapes: tuple["PackedGroupShape", ...],
+    ) -> None:
+        leaves_by_matrix = {
+            leaf.matrix_id: leaf for shape in shapes for leaf in shape.leaves
+        }
+        if len(leaves_by_matrix) != sum(len(shape.leaves) for shape in shapes):
+            raise RuntimeError("packed-group shapes repeat a TokenMatrix")
+        if set(leaves_by_matrix) != {matrix.matrix_id for matrix in batch.matrices}:
+            raise RuntimeError("packed-group shapes changed matrix identity")
+
+        from art.pipeline_tuner.config import PackedGroupShape
+
+        for index, group in enumerate(trajectory_groups):
+            leaves = tuple(
+                leaves_by_matrix[matrix.matrix_id]
+                for matrix in batch.matrices
+                if matrix.packing_affinity_id == f"prompt-{index}"
+            )
+            if leaves:
+                group._packed_group_shape = PackedGroupShape(leaves=leaves)
 
     def logs_sft_metrics_remotely(self) -> bool:
         return False
@@ -508,13 +645,11 @@ class ServerlessBackend:
         dev_config: dev.TrainConfig,
         verbose: bool = False,
     ) -> AsyncIterator[dict[str, float]]:
-        from art.distributed.trajectory_store import TrajectoryGroupBundle
         from art.training import (
             AdamConfig,
             ForwardBackwardRequest,
-            LossConfig,
+            NamedLossRequest,
             OptimStepRequest,
-            RlTrajectoryBatch,
             SamplerPublication,
             SaveWeightsForSamplerRequest,
         )
@@ -528,46 +663,40 @@ class ServerlessBackend:
             group.trajectories for group in trajectory_groups
         ):
             raise ValueError("native training requires at least one trajectory")
-        client = await self.training_client(model)
-        versions = [
-            version
-            for group in trajectory_groups
-            for trajectory in group.trajectories
-            for version in (
-                trajectory.initial_policy_version,
-                trajectory.final_policy_version,
-            )
-            if version is not None
-        ]
-        current_version = client.projected_learner_version
-        batch = RlTrajectoryBatch(
-            groups=tuple(
-                TrajectoryGroupBundle.from_group(group) for group in trajectory_groups
-            ),
-            min_source_version=min(versions, default=current_version),
-            max_source_version=max(versions, default=current_version),
+        if dev_config.get("ppo"):
+            raise ValueError("native ServerlessBackend training does not support PPO")
+        batch = await asyncio.to_thread(
+            self._lower_rl_batch,
+            model,
+            trajectory_groups,
+            dev_config,
         )
+        if batch is None:
+            return
+        client = await self.training_client(model)
         sequence_id = client.next_sequence_id
         request_id = secrets.token_hex(16)
         key = model._storage_name()
         retain_input = key in self._retain_next_inputs
+        epsilon = dev_config.get("epsilon")
+        epsilon_high = dev_config.get("epsilon_high")
+        loss = NamedLossRequest(
+            name="cispo",
+            normalize_advantages=False,
+            values={
+                "clip_low_threshold": 1.0
+                - (1.0 if epsilon is None else float(epsilon)),
+                "clip_high_threshold": 1.0
+                + (4.0 if epsilon_high is None else float(epsilon_high)),
+            },
+        )
         forward = await client.forward_backward(
             ForwardBackwardRequest(
                 run_id=client.run_id,
                 request_id=f"fb-{request_id}",
                 sequence_id=sequence_id,
                 batch=batch,
-                loss=LossConfig(
-                    name="ppo" if dev_config.get("ppo") else "cispo",
-                    normalize_advantages=bool(dev_config.get("scale_rewards", True)),
-                    values=cast(
-                        dict[str, Any],
-                        {
-                            **config.model_dump(mode="python"),
-                            **dict(dev_config),
-                        },
-                    ),
-                ),
+                loss=loss,
                 collect_packing_shapes=any(
                     group._collect_packing_shape for group in trajectory_groups
                 ),
@@ -583,14 +712,11 @@ class ServerlessBackend:
                 raise RuntimeError("retained packed input has no exact content digest")
             self._retained_inputs.setdefault(key, []).append(capture)
         if forward_result.packing.group_shapes:
-            if len(forward_result.packing.group_shapes) != len(trajectory_groups):
-                raise RuntimeError("packed-group shapes changed cardinality")
-            for group, shape in zip(
+            self._attach_rl_packing_shapes(
                 trajectory_groups,
+                batch,
                 forward_result.packing.group_shapes,
-                strict=True,
-            ):
-                group._packed_group_shape = shape
+            )
 
         optimizer = await client.optim_step(
             OptimStepRequest(
@@ -632,6 +758,10 @@ class ServerlessBackend:
             **base_metrics,
             **forward_result.metrics,
             **optimizer_result.metrics,
+            "loss/train": float(forward_result.loss.value),
+            "data/step_trainable_assistant_tokens": float(
+                forward_result.training.accepted_trainable_tokens
+            ),
             TRAIN_GRADIENT_STEPS_KEY: float(forward_result.packing.packed_sequences),
         }
 
@@ -646,14 +776,14 @@ class ServerlessBackend:
         """Lower raw supervised trajectories through native split commands."""
         del dev_config
 
+        from art.preprocessing.token_matrix import token_matrix_batch_from_sft
         from art.training import (
             AdamConfig,
             ForwardBackwardRequest,
-            LossConfig,
+            NamedLossRequest,
             OptimStepRequest,
             SamplerPublication,
             SaveWeightsForSamplerRequest,
-            SupervisedTrajectoryBatch,
         )
 
         from ..utils.sft import resolve_sft_batch_size
@@ -682,17 +812,26 @@ class ServerlessBackend:
         operation_ids: list[str] = []
         optimizer_result: Any | None = None
         for batch, learning_rate in zip(batches, learning_rates, strict=True):
+            tokenized = await asyncio.to_thread(
+                self._batch_tokenizer().tokenize,
+                model,
+                batch,
+                assistant_turns=config.assistant_turns,
+                learning_rate=learning_rate,
+            )
+            token_matrix_batch = token_matrix_batch_from_sft(tokenized)
+            if token_matrix_batch is None:
+                continue
             request_id = secrets.token_hex(16)
             forward = await client.forward_backward(
                 ForwardBackwardRequest(
                     run_id=client.run_id,
                     request_id=f"fb-{request_id}",
                     sequence_id=client.next_sequence_id,
-                    batch=SupervisedTrajectoryBatch(
-                        trajectories=tuple(batch),
-                        assistant_turns=config.assistant_turns,
+                    batch=token_matrix_batch,
+                    loss=NamedLossRequest(
+                        name="cross_entropy", normalize_advantages=False
                     ),
-                    loss=LossConfig(name="cross_entropy"),
                     return_token_logprobs=False,
                 )
             )
@@ -716,9 +855,10 @@ class ServerlessBackend:
                 {
                     **forward_result.metrics,
                     **optimizer_result.metrics,
+                    "loss/train": float(forward_result.loss.value),
                     "data/step_num_trajectories": float(len(batch)),
                     "data/step_trainable_assistant_tokens": float(
-                        forward_result.packing.trainable_assistant_tokens
+                        forward_result.training.accepted_trainable_tokens
                     ),
                 }
             )

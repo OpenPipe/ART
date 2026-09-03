@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import dataclass
 from math import prod
-from typing import cast
+from typing import Literal, cast
 
 import tinker
 
@@ -12,14 +12,19 @@ from art.training import (
     ForwardBackwardResult,
     ForwardRequest,
     ForwardResult,
-    LossConfig,
-    TokenizedDatum,
-    TokenizedTrainingBatch,
 )
-from art.training.tokenized import TokenizedLossName
+from art.training.token_matrix import (
+    NamedLossRequest,
+    TokenMatrix,
+    TokenMatrixBatch,
+    TokenRow,
+    dense_row,
+    validate_token_matrix_batch,
+)
 
 from .errors import UnsupportedCapabilityError
 
+TinkerLossName = Literal["cross_entropy", "importance_sampling", "cispo"]
 SUPPORTED_LOSSES = frozenset({"cross_entropy", "importance_sampling", "cispo"})
 _LOSS_CONFIG_KEYS = {
     "cross_entropy": frozenset(),
@@ -30,8 +35,8 @@ _LOSS_CONFIG_KEYS = {
 
 @dataclass(frozen=True, slots=True)
 class TinkerForwardTranslation:
-    batch: TokenizedTrainingBatch
-    loss: LossConfig
+    batch: TokenMatrixBatch
+    loss: NamedLossRequest
     target_shapes: tuple[tuple[int, ...], ...]
 
     def request(
@@ -57,14 +62,24 @@ def translate_tinker_forward_input(
 ) -> TinkerForwardTranslation:
     """Lower pinned Tinker wire data without retokenizing or changing shapes."""
 
-    loss = _validate_loss(forward_input.loss_fn)
-    values = _validate_loss_config(loss, forward_input.loss_fn_config)
+    loss_name = _validate_loss(forward_input.loss_fn)
+    values = _validate_loss_config(loss_name, forward_input.loss_fn_config)
     if not forward_input.data:
         raise ValueError("No data provided")
-    converted = tuple(_convert_datum(datum, loss) for datum in forward_input.data)
+    converted = tuple(
+        _convert_datum(datum, loss_name, matrix_id=f"tinker-datum-{index}")
+        for index, datum in enumerate(forward_input.data)
+    )
+    batch = TokenMatrixBatch(matrices=tuple(item[0] for item in converted))
+    loss = NamedLossRequest(
+        name=loss_name,
+        normalize_advantages=False,
+        values=values,
+    )
+    validate_token_matrix_batch(batch, loss)
     return TinkerForwardTranslation(
-        batch=TokenizedTrainingBatch(datums=tuple(item[0] for item in converted)),
-        loss=LossConfig(name=loss, normalize_advantages=False, values=values),
+        batch=batch,
+        loss=loss,
         target_shapes=tuple(item[1] for item in converted),
     )
 
@@ -98,7 +113,7 @@ def to_tinker_forward_output(
     )
 
 
-def _validate_loss(loss: object) -> TokenizedLossName:
+def _validate_loss(loss: object) -> TinkerLossName:
     if callable(loss):
         raise UnsupportedCapabilityError(
             "custom loss functions are not supported; use a named server loss"
@@ -111,11 +126,11 @@ def _validate_loss(loss: object) -> TokenizedLossName:
         raise ValueError(
             f"unsupported loss {loss!r}; expected one of {sorted(SUPPORTED_LOSSES)}"
         )
-    return cast(TokenizedLossName, loss)
+    return cast(TinkerLossName, loss)
 
 
 def _validate_loss_config(
-    loss: TokenizedLossName,
+    loss: TinkerLossName,
     config: dict[str, float] | None,
 ) -> dict[str, float]:
     values = dict(config or {})
@@ -129,8 +144,10 @@ def _validate_loss_config(
 
 def _convert_datum(
     datum: tinker.Datum,
-    loss: TokenizedLossName,
-) -> tuple[TokenizedDatum, tuple[int, ...]]:
+    loss: TinkerLossName,
+    *,
+    matrix_id: str,
+) -> tuple[TokenMatrix, tuple[int, ...]]:
     unsupported = [
         type(chunk).__name__
         for chunk in datum.model_input.chunks
@@ -151,27 +168,46 @@ def _convert_datum(
             f"{loss} requires exactly {sorted(expected)}, got {sorted(found)}"
         )
 
-    target_tokens, shape = _matrix(datum.loss_fn_inputs["target_tokens"], integer=True)
-    values: dict[str, object] = {
-        "input_tokens": tuple(datum.model_input.to_ints()),
-        "target_tokens": target_tokens,
-    }
-    for name in ("weights", "logprobs", "advantages"):
-        if name in datum.loss_fn_inputs:
-            values[name] = _matrix(datum.loss_fn_inputs[name], integer=False)[0]
-    converted = TokenizedDatum.model_validate(values)
-    converted.validate_for_loss(loss)
-    return converted, shape
+    target_tokens, shape = _tensor_row(
+        "target_token_ids",
+        datum.loss_fn_inputs["target_tokens"],
+        integer=True,
+    )
+    input_tokens = tuple(datum.model_input.to_ints())
+    rows = [
+        dense_row("token_ids", "int64", (len(input_tokens),), input_tokens),
+        target_tokens,
+    ]
+    if loss == "cross_entropy":
+        weights, _ = _tensor_row(
+            "loss_weights",
+            datum.loss_fn_inputs["weights"],
+            integer=False,
+        )
+        rows.append(weights)
+    else:
+        behavior_logprobs, _ = _tensor_row(
+            "behavior_logprobs",
+            datum.loss_fn_inputs["logprobs"],
+            integer=False,
+        )
+        advantages, _ = _tensor_row(
+            "advantages",
+            datum.loss_fn_inputs["advantages"],
+            integer=False,
+        )
+        if not any(float(value) != 0.0 for value in advantages.dense_values()):
+            raise ValueError(f"{loss} datum has no loss-bearing target")
+        rows.extend((behavior_logprobs, advantages))
+    return TokenMatrix(matrix_id=matrix_id, rows=tuple(rows)), shape
 
 
-def _matrix(
+def _tensor_row(
+    name: str,
     tensor: tinker.TensorData,
     *,
     integer: bool,
-) -> tuple[
-    tuple[tuple[int, ...], ...] | tuple[tuple[float, ...], ...],
-    tuple[int, ...],
-]:
+) -> tuple[TokenRow, tuple[int, ...]]:
     expected_dtype = "int64" if integer else "float32"
     if tensor.dtype != expected_dtype:
         raise TypeError(f"expected {expected_dtype} TensorData, got {tensor.dtype!r}")
@@ -183,14 +219,14 @@ def _matrix(
     if len(shape) not in {1, 2}:
         raise ValueError(f"named-loss tensors must be 1-D or 2-D, got shape {shape}")
     values = _dense_values(tensor, shape)
-    width = 1 if len(shape) == 1 else shape[1]
-    rows = tuple(
-        tuple(_number(value) for value in values[offset : offset + width])
-        for offset in range(0, len(values), width)
-    )
+    canonical_shape = (shape[0], 1) if len(shape) == 1 else shape
     if integer:
-        return tuple(tuple(int(value) for value in row) for row in rows), shape
-    return tuple(tuple(float(value) for value in row) for row in rows), shape
+        converted: tuple[int, ...] | tuple[float, ...] = tuple(
+            int(_number(value)) for value in values
+        )
+        return dense_row(name, "int64", canonical_shape, converted), shape
+    converted = tuple(float(_number(value)) for value in values)
+    return dense_row(name, "float32", canonical_shape, converted), shape
 
 
 def _dense_values(tensor: tinker.TensorData, shape: tuple[int, ...]) -> list[object]:

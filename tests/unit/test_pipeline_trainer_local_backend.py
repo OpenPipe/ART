@@ -8,6 +8,7 @@ from types import ModuleType, SimpleNamespace
 from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import numpy as np
 import pytest
 import torch
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
@@ -15,6 +16,7 @@ from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 from art import PipelineRuntimeConfig, TrainableModel, Trajectory, TrajectoryGroup
 from art.dev.model import InternalModelConfig
 from art.local import LocalBackend
+import art.local.backend as local_backend_module
 from art.megatron import MegatronBackend
 from art.megatron.train import load_adapter_into_model
 from art.pipeline_trainer import (
@@ -23,6 +25,7 @@ from art.pipeline_trainer import (
     CheckpointRetentionContext,
 )
 from art.pipeline_trainer.trainer import PipelineTrainer
+from art.preprocessing.moe_routing import MoeRouteArray
 from art.preprocessing.tokenize import TokenizedResult
 from art.utils.output_dirs import get_model_dir, get_step_checkpoint_dir
 
@@ -742,7 +745,14 @@ def test_local_backend_get_packed_tensors_warns_and_drops_overlong_results(
         ],
     )
     short_result = _make_tokenized_result(short_trajectory, [1, 2, 3, 4])
+    short_result.moe_routed_experts = MoeRouteArray(
+        np.asarray([[[0]], [[1]], [[2]], [[3]]], dtype=np.uint8),
+        num_experts=4,
+    )
     long_result = _make_tokenized_result(long_trajectory, list(range(10)))
+    group = TrajectoryGroup([short_trajectory, long_trajectory])
+    group._collect_packing_shape = True
+    canonical_packer = local_backend_module.packed_tensors_from_token_matrices
 
     with (
         patch(
@@ -754,21 +764,40 @@ def test_local_backend_get_packed_tensors_warns_and_drops_overlong_results(
             "art.local.backend.tokenize_trajectory_groups",
             return_value=iter([short_result, long_result]),
         ) as tokenize,
+        patch.object(model, "get_inference_name", return_value=f"{model.name}@0"),
+        patch(
+            "art.local.backend.packed_tensors_from_token_matrices",
+            wraps=canonical_packer,
+        ) as pack_token_matrices,
         pytest.warns(UserWarning, match="Dropping 1 tokenized results"),
     ):
         packed_tensors = backend._get_packed_tensors(
             model,
-            [_make_group([0.0, 1.0])],
+            [group],
             advantage_balance=0.0,
             allow_training_without_logprobs=False,
             scale_rewards=True,
             plot_tensors=False,
             packed_sequence_length=4,
             logprob_calculation_chunk_size=2,
+            include_moe_routing=True,
         )
 
     assert packed_tensors is not None
     assert packed_tensors["tokens"].shape == (1, 4)
+    assert packed_tensors["token_matrix_output_map"].matrix_ids == ("rollout-0",)
+    assert (
+        packed_tensors["token_matrix_training_outcome"].accepted_trainable_tokens == 1
+    )
+    pack_token_matrices.assert_called_once()
+    pack_kwargs = pack_token_matrices.call_args.kwargs
+    assert pack_kwargs["loss"].name == "cispo"
+    assert pack_kwargs["loss"].normalize_advantages is False
+    resolved_routes = pack_kwargs["resolved_routes"]
+    assert tuple(resolved_routes) == ("rollout-0",)
+    assert resolved_routes["rollout-0"] is short_result.moe_routed_experts
+    assert group._packed_group_shape is not None
+    assert group._packed_group_shape.leaves[0].matrix_id == "rollout-0"
     selector = tokenize.call_args.kwargs["model"]
     assert selector.value == f"{model.name}@0"
     assert selector.automatic_family == (model.name, "@")
