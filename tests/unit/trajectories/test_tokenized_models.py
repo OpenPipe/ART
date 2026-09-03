@@ -1,7 +1,9 @@
 import math
 import pickle
+from typing import Any, cast
 
 import pytest
+import torch
 
 import art
 import art.trajectories as tr
@@ -18,7 +20,8 @@ def _history() -> tr.TokenizedHistory:
             tr.TokenFlag.EXACT
             | tr.TokenFlag.SAMPLED
             | tr.TokenFlag.ASSISTANT
-            | tr.TokenFlag.STOP,
+            | tr.TokenFlag.STOP
+            | tr.TokenFlag.OUTPUT,
         ],
     )
 
@@ -28,10 +31,12 @@ def test_token_provenance_flag_values_and_invariant() -> None:
     assert tr.TokenFlag.SAMPLED == 2
     assert tr.TokenFlag.ASSISTANT == 4
     assert tr.TokenFlag.STOP == 8
+    assert tr.TokenFlag.OUTPUT == 16
     assert not hasattr(tr.TokenizedHistory, "exact_mask")
     assert not hasattr(tr.TokenizedHistory, "sampled_mask")
     assert not hasattr(tr.TokenizedHistory, "assistant_mask")
     assert not hasattr(tr.TokenizedHistory, "stop_mask")
+    assert not hasattr(tr.TokenizedHistory, "output_mask")
 
     with pytest.raises(ValueError, match="SAMPLED tokens must also be EXACT"):
         tr.TokenizedHistory(
@@ -50,6 +55,104 @@ def test_token_provenance_flag_values_and_invariant() -> None:
         flags=[tr.TokenFlag.ASSISTANT],
     )
     assert value.flags == [tr.TokenFlag.ASSISTANT]
+
+    legacy = tr.TokenizedHistory(
+        history=tr.LegacyHistory(messages_and_choices=[]),
+        model="policy",
+        tokens=[1],
+        logprobs=[-0.1],
+        flags=[tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED],
+    )
+    assert legacy.flags == [
+        tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED | tr.TokenFlag.OUTPUT
+    ]
+
+
+def _tokenized(
+    tokens: list[int], flags: list[tr.TokenFlag], *, model: str = "policy"
+) -> tr.TokenizedHistory:
+    return tr.TokenizedHistory(
+        history=tr.LegacyHistory(messages_and_choices=[]),
+        model=model,
+        tokens=tokens,
+        logprobs=[math.nan] * len(tokens),
+        flags=flags,
+    )
+
+
+def test_first_occurrence_masks_use_complete_prefixes_and_eligibility() -> None:
+    output = tr.TokenFlag.OUTPUT
+    histories = [
+        _tokenized([1, 2, 9], [tr.TokenFlag(0), output, output]),
+        _tokenized([1, 2, 9], [tr.TokenFlag(0), output, output]),
+        _tokenized([1, 3, 9], [tr.TokenFlag(0), output, output]),
+    ]
+
+    assert tr.first_occurrence_masks(histories) == [
+        [True, True, True],
+        [False, False, False],
+        [False, True, True],
+    ]
+    assert tr.first_occurrence_masks(histories, where=output) == [
+        [False, True, True],
+        [False, False, False],
+        [False, True, True],
+    ]
+
+    unsampled = _tokenized([1, 2], [tr.TokenFlag(0), output])
+    sampled = _tokenized(
+        [1, 2],
+        [tr.TokenFlag(0), tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED],
+    )
+    assert tr.first_occurrence_masks(
+        [unsampled, sampled], where=tr.TokenFlag.SAMPLED
+    ) == [[False, False], [False, True]]
+
+
+def test_first_occurrence_masks_partition_models_and_accept_generators() -> None:
+    histories = (
+        _tokenized([1, 2], [tr.TokenFlag(0)] * 2, model=model)
+        for model in ("one", "two")
+    )
+    assert tr.first_occurrence_masks(histories) == [[True, True], [True, True]]
+    assert tr.first_occurrence_masks([], where=tr.TokenFlag.OUTPUT) == []
+    assert tr.first_occurrence_masks(
+        [_tokenized([1], [tr.TokenFlag.OUTPUT])], where=tr.TokenFlag(0)
+    ) == [[False]]
+    assert tr.first_occurrence_masks(
+        [_tokenized([1, 2], [tr.TokenFlag.OUTPUT, tr.TokenFlag.STOP])],
+        where=tr.TokenFlag.OUTPUT | tr.TokenFlag.STOP,
+    ) == [[True, True]]
+    assert not hasattr(art, "first_occurrence_masks")
+
+
+def test_tensorized_first_occurrence_masks_match_tokenized() -> None:
+    histories = [
+        _tokenized([1, 2], [tr.TokenFlag(0), tr.TokenFlag.OUTPUT]),
+        _tokenized([1, 2], [tr.TokenFlag(0), tr.TokenFlag.OUTPUT]),
+    ]
+    tensors = [history.tensorize() for history in histories]
+    expected = tr.first_occurrence_masks(histories, where=tr.TokenFlag.OUTPUT)
+    actual = tr.first_occurrence_masks(tensors, where=tr.TokenFlag.OUTPUT)
+    source = art.Trajectory()
+    tokenized_multi = tr.TokenizedMultiHistoryTrajectory(
+        trajectory=source, histories=histories
+    )
+    tensorized_multi = tokenized_multi.tensorize()
+
+    assert [mask.tolist() for mask in actual] == expected
+    assert tokenized_multi.first_occurrence_masks(where=tr.TokenFlag.OUTPUT) == expected
+    assert [
+        mask.tolist()
+        for mask in tensorized_multi.first_occurrence_masks(where=tr.TokenFlag.OUTPUT)
+    ] == expected
+    assert all(mask.dtype is torch.bool for mask in actual)
+    assert all(
+        mask.device == history.tokens.device
+        for mask, history in zip(actual, tensors, strict=True)
+    )
+    with pytest.raises(TypeError, match="uniformly tokenized or tensorized"):
+        tr.first_occurrence_masks(cast(Any, [histories[0], tensors[0]]))
 
 
 def _assert_history_round_trip(

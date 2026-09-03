@@ -956,9 +956,15 @@ async def test_rollout_captures_two_turn_tool_exchange_with_exact_tokens() -> No
     assert tokenized.flags == [
         tr.TokenFlag.EXACT,
         tr.TokenFlag.EXACT,
-        tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED | tr.TokenFlag.ASSISTANT,
+        tr.TokenFlag.EXACT
+        | tr.TokenFlag.SAMPLED
+        | tr.TokenFlag.ASSISTANT
+        | tr.TokenFlag.OUTPUT,
         tr.TokenFlag.EXACT,
-        tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED | tr.TokenFlag.ASSISTANT,
+        tr.TokenFlag.EXACT
+        | tr.TokenFlag.SAMPLED
+        | tr.TokenFlag.ASSISTANT
+        | tr.TokenFlag.OUTPUT,
     ]
 
 

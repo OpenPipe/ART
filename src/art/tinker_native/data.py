@@ -15,6 +15,7 @@ from ..trajectories import (
     TokenizedHistory,
     Trajectory,
     TrajectoryGroup,
+    _FirstOccurrenceTrie,
     get_messages,
 )
 from ..trajectories._selection import ModelSelector, resolve_training_model
@@ -164,26 +165,24 @@ def trajectory_groups_to_datums(
             continue
         for trajectory, advantage in zip(group.trajectories, advantages):
             if trajectory.exchanges:
-                from ..trajectories._tokenize import (
-                    _as_tokenizer,
-                    _first_introduction_mask,
-                    _SampledSourceKey,
-                    _tokenize_trajectory_with_trace,
-                )
+                from ..trajectories._tokenize import _as_tokenizer
 
                 selected_model = resolve_training_model(trajectory, model)
-                tokenized, traces = _tokenize_trajectory_with_trace(
-                    trajectory,
+                tokenized = trajectory.tokenize(
+                    multi_history=True,
                     model=selected_model,
                     base_model=base_model,
                     tokenizer=_as_tokenizer(tokenizer)
                     if tokenizer is not None
                     else None,
                 )
-                seen_source_keys: set[_SampledSourceKey] = set()
-                for history, trace in zip(tokenized.histories, traces, strict=True):
-                    trainable = _first_introduction_mask(
-                        trace.source_keys, seen_source_keys
+                occurrences = _FirstOccurrenceTrie()
+                for history in tokenized.histories:
+                    trainable = occurrences.mask(
+                        history.model,
+                        history.tokens,
+                        history.flags,
+                        where=TokenFlag.SAMPLED,
                     )
                     datum = _tokenized_trajectory_to_datum(
                         history, advantage, trainable=trainable

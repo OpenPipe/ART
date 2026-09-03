@@ -149,16 +149,22 @@ class Tokenizer(Protocol):
 
 
 class TokenFlag(IntFlag):
-    """Independent facts about a token; members may be combined."""
+    """Independent facts about a token; members may be combined.
+
+    ``ASSISTANT`` is structural and may include request context. ``OUTPUT`` is
+    reconstructed response provenance; ``SAMPLED`` is authoritative server output.
+    """
 
     # The ID came from inference metadata rather than client-side tokenization.
     EXACT = 1 << 0
-    # The exact token ID belongs to a model-sampled response rather than its prompt.
+    # The server returned this exact output token ID (implies EXACT | OUTPUT).
     SAMPLED = 1 << 1
-    # The token is in a rendered assistant continuation and may be inexact.
+    # The token occupies a rendered assistant-role region and may be inexact.
     ASSISTANT = 1 << 2
     # The token belongs to a generation-terminating token or sequence.
     STOP = 1 << 3
+    # Best-effort provenance that the token came from a concrete response.
+    OUTPUT = 1 << 4
 
 
 class ChatCompletionsRequest(TypedDict, total=False, extra_items=Any):
@@ -1091,13 +1097,22 @@ class TokenizedHistory(_StringInterningModel):
     def validate_tokenwise_lengths(self) -> TokenizedHistory:
         if not (len(self.tokens) == len(self.logprobs) == len(self.flags)):
             raise ValueError("Tokenized history fields differ in length")
-        if any(
-            flag & TokenFlag.SAMPLED and not flag & TokenFlag.EXACT
-            for flag in self.flags
-        ):
-            raise ValueError(
-                "SAMPLED tokens must also be EXACT; regenerate this tokenization"
-            )
+        needs_output = False
+        for flag in self.flags:
+            if not flag & TokenFlag.SAMPLED:
+                continue
+            if not flag & TokenFlag.EXACT:
+                raise ValueError(
+                    "SAMPLED tokens must also be EXACT; regenerate this tokenization"
+                )
+            needs_output |= not bool(flag & TokenFlag.OUTPUT)
+        # Serialized tokenizations predating OUTPUT remain valid: SAMPLED is
+        # authoritative output provenance and therefore implies OUTPUT.
+        if needs_output:
+            self.flags = [
+                flag | TokenFlag.OUTPUT if flag & TokenFlag.SAMPLED else flag
+                for flag in self.flags
+            ]
         return self
 
     def tensorize(
@@ -1205,6 +1220,13 @@ class TokenizedMultiHistoryTrajectory(_StringInterningModel):
         self, *, device: torch.device | str | None = None
     ) -> TensorizedMultiHistoryTrajectory:
         return _load_tensors().tensorize_multi_history_trajectory(self, device=device)
+
+    def first_occurrence_masks(
+        self, *, where: TokenFlag | None = None
+    ) -> list[list[bool]]:
+        """Select the first eligible occurrence of each model-visible prefix."""
+
+        return first_occurrence_masks(self.histories, where=where)
 
 
 TokenizedTrajectoryT = TypeVar(
@@ -1584,6 +1606,92 @@ async def tensorize(
     )
 
 
+class _TokenPrefixNode:
+    __slots__ = ("children", "claimed")
+
+    def __init__(self) -> None:
+        self.children: dict[int, _TokenPrefixNode] = {}
+        self.claimed = False
+
+
+class _FirstOccurrenceTrie:
+    """Track claimed token-prefix edges independently for each model."""
+
+    def __init__(self) -> None:
+        self._roots: dict[str, _TokenPrefixNode] = {}
+
+    def mask(
+        self,
+        model: str,
+        tokens: Iterable[int],
+        flags: Iterable[int | TokenFlag],
+        *,
+        where: TokenFlag | None = None,
+        claim: bool = True,
+    ) -> list[bool]:
+        node = self._roots.setdefault(model, _TokenPrefixNode())
+        result: list[bool] = []
+        sentinel = int(where) if where is not None else None
+        for token, flag in zip(tokens, flags, strict=True):
+            node = node.children.setdefault(int(token), _TokenPrefixNode())
+            eligible = sentinel is None or bool(int(flag) & sentinel)
+            first = eligible and not node.claimed
+            result.append(first)
+            if first and claim:
+                node.claimed = True
+        return result
+
+
+@overload
+def first_occurrence_masks(
+    histories: Iterable[TokenizedHistory],
+    *,
+    where: TokenFlag | None = None,
+) -> list[list[bool]]: ...
+
+
+@overload
+def first_occurrence_masks(
+    histories: Iterable[TensorizedHistory],
+    *,
+    where: TokenFlag | None = None,
+) -> list[torch.Tensor]: ...
+
+
+def first_occurrence_masks(
+    histories: Iterable[TokenizedHistory] | Iterable[TensorizedHistory],
+    *,
+    where: TokenFlag | None = None,
+) -> list[list[bool]] | list[torch.Tensor]:
+    """Return first-occurrence masks for complete model-visible token prefixes.
+
+    ``where=None`` selects every unique position. A flag selects and deduplicates
+    only positions carrying any requested bit; ineligible positions do not claim
+    their prefix for a later history. ``ASSISTANT`` is structural and can include
+    request context; use ``OUTPUT`` for reconstructed response tokens or
+    ``SAMPLED`` when authoritative server output IDs are required.
+    """
+
+    values = list(histories)
+    if not values:
+        return []
+    if all(isinstance(history, TokenizedHistory) for history in values):
+        trie = _FirstOccurrenceTrie()
+        return [
+            trie.mask(
+                history.model,
+                history.tokens,
+                history.flags,
+                where=where,
+            )
+            for history in cast(list[TokenizedHistory], values)
+        ]
+    tensors = _load_tensors()
+    if all(isinstance(history, tensors.TensorizedHistory) for history in values):
+        return tensors.first_occurrence_masks(cast(Any, values), where=where)
+    raise TypeError("histories must be uniformly tokenized or tensorized")
+
+
 def get_messages(messages_and_choices: MessagesAndChoices) -> Messages:
     from ._compat import messages_from_legacy_history
 
@@ -1673,5 +1781,6 @@ __all__ = [
     "trajectory_group",
     "tokenize",
     "tensorize",
+    "first_occurrence_masks",
     "get_messages",
 ]

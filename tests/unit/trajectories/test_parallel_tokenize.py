@@ -33,7 +33,10 @@ def _tokenized(trajectory: art.Trajectory) -> tr.TokenizedTrajectory:
         model="policy",
         tokens=[index, index + 1],
         logprobs=[math.nan, -0.25],
-        flags=[tr.TokenFlag.EXACT, tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED],
+        flags=[
+            tr.TokenFlag.EXACT,
+            tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED | tr.TokenFlag.OUTPUT,
+        ],
         trajectory=trajectory,
     )
 

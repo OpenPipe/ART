@@ -25,6 +25,7 @@ from ..trajectories import (
     TokenFlag,
     Trajectory,
     TrajectoryGroup,
+    _FirstOccurrenceTrie,
     get_messages,
 )
 from ..trajectories._selection import ModelSelector, resolve_training_model
@@ -757,9 +758,7 @@ def tokenize_trajectory_groups(
             if trajectory.exchanges:
                 from ..trajectories._tokenize import (
                     _as_tokenizer,
-                    _first_introduction_mask,
                     _require_causal_predecessor,
-                    _SampledSourceKey,
                     _tokenize_trajectory_with_trace,
                 )
 
@@ -782,7 +781,7 @@ def tokenize_trajectory_groups(
                         "local tokenization or chat-template rendering was required."
                     )
                 trajectory_results = []
-                seen_source_keys: set[_SampledSourceKey] = set()
+                occurrences = _FirstOccurrenceTrie()
                 for exchange_result, trace in zip(
                     exchange_results.histories, traces, strict=True
                 ):
@@ -790,9 +789,12 @@ def tokenize_trajectory_groups(
                         _max_sequence_length is not None
                         and len(exchange_result.tokens) > _max_sequence_length
                     ):
-                        preview_seen = set(seen_source_keys)
-                        would_train = _first_introduction_mask(
-                            trace.source_keys, preview_seen
+                        would_train = occurrences.mask(
+                            exchange_result.model,
+                            exchange_result.tokens,
+                            exchange_result.flags,
+                            where=TokenFlag.SAMPLED,
+                            claim=False,
                         )
                         if any(would_train):
                             trajectory_results.append(
@@ -814,8 +816,11 @@ def tokenize_trajectory_groups(
                                 )
                             )
                         continue
-                    trainable = _first_introduction_mask(
-                        trace.source_keys, seen_source_keys
+                    trainable = occurrences.mask(
+                        exchange_result.model,
+                        exchange_result.tokens,
+                        exchange_result.flags,
+                        where=TokenFlag.SAMPLED,
                     )
                     _require_causal_predecessor(trainable)
                     if not any(trainable):

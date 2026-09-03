@@ -24,6 +24,7 @@ from . import (
     Trajectory,
     TrajectoryGroup,
     TrajectoryHistory,
+    _FirstOccurrenceTrie,
     _StringInterningModel,
 )
 from ._serialization import (
@@ -106,6 +107,9 @@ class TensorizedHistory(_StringInterningModel):
         if not (len(self.tokens) == len(self.logprobs) == len(self.flags)):
             raise ValueError("Tensorized history fields differ in length")
         sampled = self.flags.bitwise_and(int(TokenFlag.SAMPLED)).bool()
+        self.flags = self.flags.bitwise_or(
+            sampled.to(self.flags.dtype) * int(TokenFlag.OUTPUT)
+        )
         exact = self.flags.bitwise_and(int(TokenFlag.EXACT)).bool()
         if bool((sampled & ~exact).any().item()):
             raise ValueError(
@@ -201,10 +205,37 @@ class TensorizedMultiHistoryTrajectory(_StringInterningModel):
             history.to(device)
         return self
 
+    def first_occurrence_masks(
+        self, *, where: TokenFlag | None = None
+    ) -> list[torch.Tensor]:
+        """Select the first eligible occurrence of each model-visible prefix."""
+
+        return first_occurrence_masks(self.histories, where=where)
+
     def compact_dump(self) -> CompactTrajectoryPayload:
         from ._compact import dump
 
         return dump(self)
+
+
+def first_occurrence_masks(
+    histories: list[TensorizedHistory],
+    *,
+    where: TokenFlag | None = None,
+) -> list[torch.Tensor]:
+    """Tensor implementation using one bulk device transfer per source tensor."""
+
+    trie = _FirstOccurrenceTrie()
+    result: list[torch.Tensor] = []
+    for history in histories:
+        tokens, flags = (
+            torch.stack((history.tokens, history.flags)).detach().cpu().tolist()
+        )
+        mask = trie.mask(history.model, tokens, flags, where=where)
+        result.append(
+            torch.tensor(mask, dtype=torch.bool, device=history.tokens.device)
+        )
+    return result
 
 
 TensorizedTrajectoryT = TypeVar(

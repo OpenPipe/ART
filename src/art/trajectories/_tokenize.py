@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from bisect import bisect_left
 import codecs
-from collections.abc import Hashable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime
@@ -12,7 +12,7 @@ import json
 import math
 import re
 import threading
-from typing import TYPE_CHECKING, Any, Literal, Protocol, TypeVar, cast
+from typing import TYPE_CHECKING, Any, Literal, Protocol, cast
 import warnings
 
 from anthropic.types import Message, MessageParam, TextBlock
@@ -522,8 +522,10 @@ def _prove_exact_sampled_assistant_span(
     return start, end
 
 
-def _rendered_flag(assistant: bool, stop: bool) -> TokenFlag:
+def _rendered_flag(assistant: bool, output: bool, stop: bool) -> TokenFlag:
     flag = TokenFlag.ASSISTANT if assistant else TokenFlag(0)
+    if output:
+        flag |= TokenFlag.OUTPUT
     return flag | TokenFlag.STOP if stop else flag
 
 
@@ -577,6 +579,51 @@ def _synthetic_length_stop_mask(
     return mask
 
 
+def _response_output_mask(
+    messages: Sequence[Mapping[str, object]],
+    sources: Sequence[object | None],
+    assistant_mask: Sequence[bool],
+) -> list[bool]:
+    """Mark assistant spans backed by concrete exchange responses."""
+
+    assistant_sources = [
+        source
+        for message, source in zip(messages, sources, strict=True)
+        if message.get("role") == "assistant"
+    ]
+    spans: list[tuple[int, int]] = []
+    start = 0
+    while start < len(assistant_mask):
+        if not assistant_mask[start]:
+            start += 1
+            continue
+        end = start + 1
+        while end < len(assistant_mask) and assistant_mask[end]:
+            end += 1
+        spans.append((start, end))
+        start = end
+    result = [False] * len(assistant_mask)
+    if len(spans) != len(assistant_sources):
+        # Some minimal/custom templates concatenate adjacent assistant items.
+        # That loses the boundary between those items, but attribution remains
+        # unambiguous when every merged item has the same provenance class.
+        output_sources = [
+            source is not None and _source_is_sampled(source)
+            for source in assistant_sources
+        ]
+        if output_sources and all(output_sources):
+            return list(assistant_mask)
+        if not any(output_sources):
+            return result
+        raise ValueError(
+            "Could not uniquely attribute rendered assistant spans to source turns"
+        )
+    for source, (start, end) in zip(assistant_sources, spans, strict=True):
+        if source is not None and _source_is_sampled(source):
+            result[start:end] = [True] * (end - start)
+    return result
+
+
 @dataclass(frozen=True)
 class _SampledOutput:
     text: str | None
@@ -612,19 +659,6 @@ class _HistoryTokenizationTrace:
                 )
             if source_key is not None and source_key not in self.sources:
                 raise AssertionError("Tokenization trace source key is unresolved")
-
-
-_SourceKeyT = TypeVar("_SourceKeyT", bound=Hashable)
-
-
-def _first_introduction_mask(
-    source_keys: Sequence[_SourceKeyT | None],
-    seen: set[_SourceKeyT],
-) -> list[bool]:
-    keys = {key for key in source_keys if key is not None}
-    new_keys = keys - seen
-    seen.update(keys)
-    return [key in new_keys if key is not None else False for key in source_keys]
 
 
 def _require_causal_predecessor(trainable: Sequence[bool]) -> None:
@@ -2241,7 +2275,12 @@ def _legacy_tokenize(
             completion_logprobs = [math.nan] * len(completion)
         logprobs.extend(completion_logprobs)
         flags.extend(
-            [TokenFlag.EXACT | TokenFlag.SAMPLED | TokenFlag.ASSISTANT]
+            [
+                TokenFlag.EXACT
+                | TokenFlag.SAMPLED
+                | TokenFlag.ASSISTANT
+                | TokenFlag.OUTPUT
+            ]
             * len(completion)
         )
         if item.finish_reason in {"stop", "tool_calls", "function_call"}:
@@ -2511,8 +2550,9 @@ def _tokenize_exchange_trajectory(
             if isinstance(exchange, CompletionsExchange)
             else TokenFlag.ASSISTANT
         )
+        completion_flag |= TokenFlag.OUTPUT
         if completion_is_exact:
-            completion_flag |= TokenFlag.EXACT | TokenFlag.SAMPLED
+            completion_flag |= TokenFlag.EXACT | TokenFlag.SAMPLED | TokenFlag.OUTPUT
         flags.extend([completion_flag] * len(completion))
         if completion_is_exact:
             source_key = _exchange_sampled_source_key(exchange)
@@ -3475,7 +3515,13 @@ def _tokenize_exact_responses_history(
         token_ids.extend(output)
         logprobs.extend(output_logprobs)
         flags.extend(
-            [TokenFlag.EXACT | TokenFlag.SAMPLED | TokenFlag.ASSISTANT] * len(output)
+            [
+                TokenFlag.EXACT
+                | TokenFlag.SAMPLED
+                | TokenFlag.ASSISTANT
+                | TokenFlag.OUTPUT
+            ]
+            * len(output)
         )
         source = next(
             (
@@ -3979,7 +4025,12 @@ def _tokenize_exact_projected_chat_history(
     flags = [
         *([TokenFlag.EXACT] * len(final_prompt)),
         *(
-            [TokenFlag.EXACT | TokenFlag.SAMPLED | TokenFlag.ASSISTANT]
+            [
+                TokenFlag.EXACT
+                | TokenFlag.SAMPLED
+                | TokenFlag.ASSISTANT
+                | TokenFlag.OUTPUT
+            ]
             * len(final_output)
         ),
         *terminal_flags,
@@ -4029,7 +4080,7 @@ def _tokenize_exact_projected_chat_history(
         if final_prompt[start:end] != retained_ids:
             return None
         flags[start:end] = [
-            TokenFlag.EXACT | TokenFlag.SAMPLED | TokenFlag.ASSISTANT
+            TokenFlag.EXACT | TokenFlag.SAMPLED | TokenFlag.ASSISTANT | TokenFlag.OUTPUT
         ] * len(retained_ids)
         logprobs[start:end] = retained_logprobs
         source_key = _sampled_source_key(source)
@@ -4635,8 +4686,16 @@ def _tokenize_chat_view(
         canonical_assistant_mask,
         canonical_stop_mask,
     )
+    canonical_output_mask = _response_output_mask(
+        messages,
+        history.message_sources,
+        canonical_assistant_mask,
+    )
     assistant_mask = _translate_token_mask(
         canonical_rendered, rendered, canonical_assistant_mask
+    )
+    output_mask = _translate_token_mask(
+        canonical_rendered, rendered, canonical_output_mask
     )
     stop_mask = _translate_token_mask(canonical_rendered, rendered, canonical_stop_mask)
     length_stop_mask = _translate_token_mask(
@@ -5645,9 +5704,14 @@ def _tokenize_chat_view(
         token_ids.extend(rendered[cursor:start])
         logprobs.extend([math.nan] * (start - cursor))
         flags.extend(
-            _rendered_flag(assistant and not length_stop, stop)
-            for assistant, stop, length_stop in zip(
+            _rendered_flag(
+                assistant and not length_stop,
+                output and not length_stop,
+                stop,
+            )
+            for assistant, output, stop, length_stop in zip(
                 assistant_mask[cursor:start],
+                output_mask[cursor:start],
                 stop_mask[cursor:start],
                 length_stop_mask[cursor:start],
                 strict=True,
@@ -5670,6 +5734,7 @@ def _tokenize_chat_view(
                 TokenFlag.EXACT
                 | TokenFlag.SAMPLED
                 | TokenFlag.ASSISTANT
+                | TokenFlag.OUTPUT
                 | (TokenFlag.STOP if stop else TokenFlag(0))
                 for stop in replacement_stop_mask
             )
@@ -5683,7 +5748,11 @@ def _tokenize_chat_view(
                 else [math.nan] * len(replacement)
             )
             flags.extend(
-                _rendered_flag(not length_stop, stop)
+                _rendered_flag(
+                    not length_stop,
+                    not length_stop,
+                    stop,
+                )
                 for stop, length_stop in zip(
                     replacement_stop_mask,
                     replacement_length_stop_mask,
@@ -5695,9 +5764,14 @@ def _tokenize_chat_view(
     token_ids.extend(rendered[cursor:])
     logprobs.extend([math.nan] * (len(rendered) - cursor))
     flags.extend(
-        _rendered_flag(assistant and not length_stop, stop)
-        for assistant, stop, length_stop in zip(
+        _rendered_flag(
+            assistant and not length_stop,
+            output and not length_stop,
+            stop,
+        )
+        for assistant, output, stop, length_stop in zip(
             assistant_mask[cursor:],
+            output_mask[cursor:],
             stop_mask[cursor:],
             length_stop_mask[cursor:],
             strict=True,
@@ -5769,7 +5843,9 @@ def _tokenize_completions_token_history(
     for start, end in history.sampled_spans:
         if start < 0 or end <= start or end > len(history.prompt):
             raise ValueError("Completions sampled spans are out of bounds")
-        flags[start:end] = [TokenFlag.EXACT | TokenFlag.SAMPLED] * (end - start)
+        flags[start:end] = [TokenFlag.EXACT | TokenFlag.SAMPLED | TokenFlag.OUTPUT] * (
+            end - start
+        )
     for span in history.prompt_sources:
         if span.source is None:
             continue
@@ -5975,6 +6051,8 @@ def _tokenize_completions_string_history(
             )
             logprobs.extend(visible or [math.nan] * len(ids))
         flag = TokenFlag.EXACT if exact is not None else TokenFlag(0)
+        if is_sampled:
+            flag |= TokenFlag.OUTPUT
         if is_sampled and exact is not None:
             flag |= TokenFlag.SAMPLED
         flags.extend([flag] * len(ids))

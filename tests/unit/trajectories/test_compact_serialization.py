@@ -638,7 +638,7 @@ def test_tokenized_compact_round_trip_all_protocol_source_shapes() -> None:
             logprobs=[float("nan"), -0.1],
             flags=[
                 tr.TokenFlag.EXACT,
-                tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED,
+                tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED | tr.TokenFlag.OUTPUT,
             ],
         )
 

@@ -706,7 +706,7 @@ def test_history_accepts_user_authored_messages_with_none_source() -> None:
     tokenized = history.tokenize(tokenizer=Tokenizer())
 
     assert tokenized.tokens == [10, 20, 30]
-    assert tokenized.flags[1] == tr.TokenFlag.ASSISTANT
+    assert tokenized.flags[1] == tr.TokenFlag.ASSISTANT | tr.TokenFlag.OUTPUT
 
 
 def test_protocol_histories_convert_to_chat_and_history_rejects_ambiguity() -> None:
@@ -1901,7 +1901,10 @@ def test_anthropic_exact_regeneration_preserves_sampled_source() -> None:
     assert tokenized.tokens == [1, 101, 3, 5]
     assert tokenized.logprobs[1] == -101.0
     assert tokenized.flags[1] == (
-        tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED | tr.TokenFlag.ASSISTANT
+        tr.TokenFlag.EXACT
+        | tr.TokenFlag.SAMPLED
+        | tr.TokenFlag.ASSISTANT
+        | tr.TokenFlag.OUTPUT
     )
 
 
