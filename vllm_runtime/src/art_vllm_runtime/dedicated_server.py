@@ -28,12 +28,15 @@ from art.distributed.specs import PairedTransferIdentity
 from art.vllm_route_transport import (
     ART_PRIVATE_ROUTE_SOURCE_PREPARE_PATH,
     ART_PRIVATE_ROUTE_SOURCE_RELEASE_PREFIX,
+    HOLDER_ROUTE_RESPONSE_MEDIA_TYPE,
+    HolderRouteResponseEnvelope,
     HolderRouteSourceReceipt,
     HolderRouteSourceRequest,
     LocalRouteObjectView,
     NixlRoutePublisher,
     RouteBundleObjectRef,
     register_retained_route_nixl_source,
+    retained_route_bundle_from_parts,
 )
 from art_vllm_runtime.binary_routes import (
     PIPELINE_ROUTES_ENV,
@@ -41,10 +44,7 @@ from art_vllm_runtime.binary_routes import (
     _register_model_route_layout,
 )
 from art_vllm_runtime.fast_metrics import FastMetricsSidecar
-from art_vllm_runtime.local_route_store import (
-    LocalRouteStore,
-    encode_route_object_header,
-)
+from art_vllm_runtime.local_route_store import LocalRouteStore
 from art_vllm_runtime.lora_staging import StagedLoraDescriptor
 from art_vllm_runtime.patches import apply_vllm_runtime_patches
 from art_vllm_runtime.resource_usage import (
@@ -59,7 +59,7 @@ from art_vllm_runtime.runtime_usage import (
     runtime_usage_journal,
 )
 
-ART_SERVING_PROTOCOL_VERSION = 15
+ART_SERVING_PROTOCOL_VERSION = 16
 _PRIVATE_CACHE_IDENTITY_HEADER = "x-art-cache-identity"
 _PRIVATE_COMPLETION_PATH = "/art/internal/v1/completions"
 _PRIVATE_DISPATCH_PATH = "/art/internal/v1/chat/completions"
@@ -68,7 +68,6 @@ _PRIVATE_EXECUTION_RECEIPT_PREFIX = "/art/internal/v1/requests"
 _PRIVATE_REQUEST_IDENTITY_HEADER = "x-art-request-identity"
 _PRIVATE_ROUTE_CAPTURE_HEADER = "x-art-route-capture"
 _PRIVATE_ROUTE_MAX_BYTES_HEADER = "x-art-route-max-bytes"
-_PRIVATE_ROUTE_OBJECT_HEADER = "x-art-route-object"
 _PRIVATE_RUN_ID_HEADER = "x-art-run-id"
 _PRIVATE_SERVICE_TIER_HEADER = "x-art-service-tier"
 _PRIVATE_TENANT_ID_HEADER = "x-art-tenant-id"
@@ -78,6 +77,7 @@ _LORA_PREPARATION_POLL_S = 0.05
 _LORA_PREPARATION_TIMEOUT_S = 300.0
 _LORA_UPDATE_RECEIPT_CAPACITY = 4096
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+_ROUTED_EXPERTS_MEDIA_TYPE = "application/vnd.art.routed-experts-v2"
 _runtime_state: dict[str, object] = {}
 _auth_tokens: list[str] = []
 _fast_metrics_port: int | None = None
@@ -222,6 +222,14 @@ class _PrivateRouteResponse:
 class _PrivateRouteSource:
     receipt: HolderRouteSourceReceipt
     publisher: NixlRoutePublisher | None = None
+
+
+@dataclass(frozen=True)
+class _EncodedPrivateRouteResponse:
+    body: bytes
+    retained_bytes: int
+    object_ref: dict[str, object] | None
+    media_type: str
 
 
 class _PrivateRouteResponses:
@@ -871,6 +879,63 @@ def _retained_route_transport() -> str:
     return str(transport)
 
 
+def _encode_private_route_response(
+    response_body: bytes,
+    routes: dict[int, Any],
+    *,
+    request_identity: str,
+    model_identity: str,
+) -> _EncodedPrivateRouteResponse:
+    from art_vllm_runtime.binary_routes import (
+        encode_routed_experts_payload,
+        encode_routed_experts_response_parts,
+    )
+
+    transport = _retained_route_transport()
+    if transport != "holder_local":
+        body, route_payload = encode_routed_experts_response_parts(
+            response_body, routes
+        )
+        return _EncodedPrivateRouteResponse(
+            body=body,
+            retained_bytes=len(route_payload),
+            object_ref=None,
+            media_type=_ROUTED_EXPERTS_MEDIA_TYPE,
+        )
+    if _local_route_store is None:
+        raise RuntimeError("local route store is unavailable")
+    owner_id = _runtime_state.get("runtime_source_id")
+    if not isinstance(owner_id, str) or not owner_id:
+        raise RuntimeError("runtime source identity is unavailable")
+    route_payload, num_experts, choices = encode_routed_experts_payload(routes)
+    completion, payload = retained_route_bundle_from_parts(
+        response_body,
+        route_payload,
+        choices,
+        num_experts=num_experts,
+        request_id=request_identity,
+        owner_id=owner_id,
+        model_identity=model_identity,
+    )
+    object_ref = _local_route_store.retain(request_identity, route_payload)
+    try:
+        envelope = HolderRouteResponseEnvelope(
+            response=completion,
+            object=RouteBundleObjectRef.model_validate(object_ref),
+            layout=payload.layout,
+        )
+        body = envelope.model_dump_json(exclude_none=True).encode()
+    except BaseException:
+        _local_route_store.release(object_ref)
+        raise
+    return _EncodedPrivateRouteResponse(
+        body=body,
+        retained_bytes=len(route_payload),
+        object_ref=object_ref,
+        media_type=HOLDER_ROUTE_RESPONSE_MEDIA_TYPE,
+    )
+
+
 def _paired_transfer_identity() -> PairedTransferIdentity:
     identity = _runtime_state.get("serving_profile_identity")
     if not isinstance(identity, dict):
@@ -1136,7 +1201,6 @@ def _patch_art_runtime_routes() -> None:
     from art_vllm_runtime.binary_routes import (
         capture_routed_experts,
         encode_routed_experts_response,
-        encode_routed_experts_response_parts,
         mark_route_request,
     )
 
@@ -1247,15 +1311,13 @@ def _patch_art_runtime_routes() -> None:
                         status_code=HTTPStatus.CONFLICT.value,
                     )
                 if retained is not None:
-                    headers = {}
-                    if retained.object_ref is not None:
-                        headers[_PRIVATE_ROUTE_OBJECT_HEADER] = (
-                            encode_route_object_header(retained.object_ref)
-                        )
                     return Response(
                         content=retained.body,
-                        media_type="application/vnd.art.routed-experts-v2",
-                        headers=headers,
+                        media_type=(
+                            HOLDER_ROUTE_RESPONSE_MEDIA_TYPE
+                            if retained.object_ref is not None
+                            else _ROUTED_EXPERTS_MEDIA_TYPE
+                        ),
                     )
             try:
                 existing = await _private_execution_receipts.claim(
@@ -1383,21 +1445,18 @@ def _patch_art_runtime_routes() -> None:
                     )
                 object_ref = None
                 try:
-                    retained, route_payload = encode_routed_experts_response_parts(
-                        response.body, routes
+                    encoded = _encode_private_route_response(
+                        response.body,
+                        routes,
+                        request_identity=request_identity,
+                        model_identity=cache_identity,
                     )
-                    object_ref = None
-                    if _retained_route_transport() == "holder_local":
-                        if _local_route_store is None:
-                            raise RuntimeError("local route store is unavailable")
-                        object_ref = _local_route_store.retain(
-                            request_identity, route_payload
-                        )
+                    object_ref = encoded.object_ref
                     await _private_route_responses.complete(
                         request_identity,
                         fingerprint,
-                        retained,
-                        retained_bytes=len(route_payload),
+                        encoded.body,
+                        retained_bytes=encoded.retained_bytes,
                         object_ref=object_ref,
                     )
                 except (OSError, RuntimeError, ValueError) as error:
@@ -1414,13 +1473,9 @@ def _patch_art_runtime_routes() -> None:
                     for key, value in response.headers.items()
                     if key.lower() not in {"content-length", "content-type"}
                 }
-                if object_ref is not None:
-                    headers[_PRIVATE_ROUTE_OBJECT_HEADER] = encode_route_object_header(
-                        object_ref
-                    )
                 return Response(
-                    content=retained,
-                    media_type="application/vnd.art.routed-experts-v2",
+                    content=encoded.body,
+                    media_type=encoded.media_type,
                     headers=headers,
                 )
             body_iterator = getattr(response, "body_iterator", None)

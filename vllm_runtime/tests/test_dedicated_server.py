@@ -10,6 +10,7 @@ from art_vllm_runtime.fast_metrics import FAST_METRIC_NAMES, FastMetricsSidecar
 from art_vllm_runtime.local_route_store import LocalRouteStore
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+import numpy as np
 import pytest
 from starlette.datastructures import URL
 
@@ -19,11 +20,12 @@ from art.serving_capabilities import PairedInferenceEndpoint, ServingProfile
 from art.vllm_route_transport import (
     ART_PRIVATE_ROUTE_SOURCE_PREPARE_PATH,
     ART_PRIVATE_ROUTE_SOURCE_RELEASE_PREFIX,
+    HOLDER_ROUTE_RESPONSE_MEDIA_TYPE,
     HolderRouteSourceObject,
     HolderRouteSourceRequest,
     NixlRouteTransfer,
-    RouteBundleObjectRef,
     holder_route_source_operation_id,
+    retained_holder_route_bundle_from_response,
 )
 
 _PAYLOAD: dict[str, object] = {
@@ -698,11 +700,49 @@ async def test_private_route_source_registers_acknowledged_holder_bytes(
     monkeypatch.setenv("ART_VLLM_ROUTE_SHM_ROOT", str(tmp_path))
     store = LocalRouteStore("runtime")
     monkeypatch.setattr(dedicated_server, "_local_route_store", store)
+    monkeypatch.setitem(
+        dedicated_server._runtime_state,
+        "serving_profile_identity",
+        {"retained_route_transport": "holder_local"},
+    )
+    monkeypatch.setitem(dedicated_server._runtime_state, "runtime_source_id", "runtime")
     responses = dedicated_server._PrivateRouteResponses()
     request_identity = "a" * 64
-    payload = b"holder-routes"
-    raw_ref = store.retain(request_identity, payload)
-    ref = RouteBundleObjectRef.model_validate(raw_ref)
+
+    class Routes(dict):
+        num_experts = 256
+        padding_layers = ()
+
+    array = np.tile(np.asarray([251, 252, 253, 254], dtype=np.uint8), (4096, 1, 1))
+    payload = array.tobytes()
+    sentinel = bytes([251, 252, 253, 254]) * 16
+    response_body = (
+        b'{"id":"response","choices":[{"finish_reason":"stop","index":0,'
+        b'"logprobs":null,"message":{"content":"ok","role":"assistant"},'
+        b'"output_token_ids":[13]}],"created":0,"model":"model",'
+        b'"object":"chat.completion","prompt_token_ids":[11,12]}'
+    )
+    encoded = dedicated_server._encode_private_route_response(
+        response_body,
+        Routes({0: array}),
+        request_identity=request_identity,
+        model_identity="b" * 64,
+    )
+    assert encoded.media_type == HOLDER_ROUTE_RESPONSE_MEDIA_TYPE
+    assert encoded.retained_bytes == len(payload)
+    assert len(encoded.body) < len(payload)
+    assert sentinel not in encoded.body
+    assert encoded.object_ref is not None
+    completion, bundle = retained_holder_route_bundle_from_response(
+        encoded.body,
+        request_id=request_identity,
+        owner_id="runtime",
+        model_identity="b" * 64,
+        lease_id="service-route-lease",
+    )
+    assert completion.id == "response"
+    assert bundle.layout.byte_count == len(payload)
+    ref = bundle.object
     await responses.reserve(
         request_identity,
         "fingerprint",
@@ -713,10 +753,12 @@ async def test_private_route_source_registers_acknowledged_holder_bytes(
     await responses.complete(
         request_identity,
         "fingerprint",
-        b"response",
-        retained_bytes=len(payload),
-        object_ref=raw_ref,
+        encoded.body,
+        retained_bytes=encoded.retained_bytes,
+        object_ref=encoded.object_ref,
     )
+    replay = await responses.replay(request_identity, "fingerprint")
+    assert replay is not None and sentinel not in replay.body
     source = LocalTransferEndpoint(
         host_id="inference", domain="inference", root=str(tmp_path)
     )

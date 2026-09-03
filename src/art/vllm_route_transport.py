@@ -45,6 +45,7 @@ RETAINED_ROUTE_BUNDLE_KEY = "retained_route_bundle"
 ART_PRIVATE_ROUTE_OBJECT_HEADER = "x-art-route-object"
 ART_PRIVATE_ROUTE_SOURCE_PREPARE_PATH = "/art/internal/v1/route-sources:prepare"
 ART_PRIVATE_ROUTE_SOURCE_RELEASE_PREFIX = "/art/internal/v1/route-sources"
+HOLDER_ROUTE_RESPONSE_MEDIA_TYPE = "application/vnd.art.holder-route-response-v1+json"
 
 
 class _Contract(BaseModel):
@@ -136,6 +137,26 @@ class RetainedRouteBundleRef(_Contract):
             or self.object.sha256 != self.layout.sha256
         ):
             raise ValueError("retained route object differs from its exact layout")
+        return self
+
+
+class HolderRouteResponseEnvelope(_Contract):
+    """Completion and authenticated holder object metadata, without route bytes."""
+
+    protocol_version: Literal[1] = 1
+    response: ChatCompletion
+    object: RouteBundleObjectRef
+    layout: RouteBundleLayout
+
+    @model_validator(mode="after")
+    def _validate_bundle(self) -> "HolderRouteResponseEnvelope":
+        if (
+            self.object.store != "holder_local"
+            or self.object.size_bytes != self.layout.byte_count
+            or self.object.sha256 != self.layout.sha256
+        ):
+            raise ValueError("holder route object differs from its exact layout")
+        _validate_response_binding(self.response, self.layout)
         return self
 
 
@@ -742,6 +763,81 @@ def retained_route_bundle_from_response(
     response, response_payload, num_experts, encoded = _parse_routed_experts_response(
         body
     )
+    return _retained_route_bundle(
+        response,
+        response_payload,
+        num_experts,
+        encoded,
+        request_id=request_id,
+        owner_id=owner_id,
+        model_identity=model_identity,
+    )
+
+
+def retained_route_bundle_from_parts(
+    response_body: bytes,
+    route_payload: bytes,
+    choices: tuple[
+        tuple[
+            int,
+            Literal["uint8", "uint16"],
+            tuple[int, int, int],
+            int,
+            int,
+        ],
+        ...,
+    ],
+    *,
+    num_experts: int,
+    request_id: str,
+    owner_id: str,
+    model_identity: str,
+) -> tuple[ChatCompletion, RouteBundlePayload]:
+    """Bind route-only bytes to an ordinary completion without a binary envelope."""
+
+    response_payload = json.loads(response_body)
+    if not isinstance(response_payload, dict):
+        raise RuntimeError("ART JSON response must be an object")
+    response = ChatCompletion.model_validate(response_payload)
+    view = memoryview(route_payload).toreadonly()
+    encoded = []
+    cursor = 0
+    for choice_index, dtype, shape, offset, byte_count in choices:
+        end = offset + byte_count
+        if offset != cursor or byte_count < 1 or end > len(view):
+            raise RuntimeError("route-only storage layout is not an exact partition")
+        encoded.append(
+            (
+                choice_index,
+                "u1" if dtype == "uint8" else "<u2",
+                shape,
+                view[offset:end],
+            )
+        )
+        cursor = end
+    if cursor != len(view):
+        raise RuntimeError("route-only storage layout has trailing bytes")
+    return _retained_route_bundle(
+        response,
+        response_payload,
+        num_experts,
+        tuple(encoded),
+        request_id=request_id,
+        owner_id=owner_id,
+        model_identity=model_identity,
+    )
+
+
+def _retained_route_bundle(
+    response: ChatCompletion,
+    response_payload: Mapping[str, Any],
+    num_experts: int,
+    encoded: tuple[tuple[int, str, tuple[int, int, int], memoryview], ...],
+    *,
+    request_id: str,
+    owner_id: str,
+    model_identity: str,
+) -> tuple[ChatCompletion, RouteBundlePayload]:
     layouts = []
     chunks = []
     digest = hashlib.sha256()
@@ -776,6 +872,31 @@ def retained_route_bundle_from_response(
     }
     layout = RouteBundleLayout(bundle_id=route_bundle_id(identity), **identity)
     return response, RouteBundlePayload(layout=layout, chunks=tuple(chunks))
+
+
+def retained_holder_route_bundle_from_response(
+    body: bytes,
+    *,
+    request_id: str,
+    owner_id: str,
+    model_identity: str,
+    lease_id: str,
+) -> tuple[ChatCompletion, RetainedRouteBundleRef]:
+    """Bind a metadata-only holder response to the service-owned route lease."""
+
+    envelope = HolderRouteResponseEnvelope.model_validate_json(body)
+    layout = envelope.layout
+    if (
+        layout.request_id != request_id
+        or layout.owner_id != owner_id
+        or layout.model_identity != model_identity
+    ):
+        raise RuntimeError("holder route response changed its request identity")
+    return envelope.response, RetainedRouteBundleRef(
+        object=envelope.object,
+        layout=layout,
+        lease_id=lease_id,
+    )
 
 
 def retained_local_route_bundle_from_response(

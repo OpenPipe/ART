@@ -15,7 +15,7 @@ from pydantic import (
 from art.distributed.specs import PairedTransferIdentity
 from art.runtime_attestation import RuntimeArchitectureAttestation
 
-ART_SERVING_PROTOCOL_VERSION = 15
+ART_SERVING_PROTOCOL_VERSION = 16
 
 ART_PRIVATE_CACHE_IDENTITY_HEADER = "x-art-cache-identity"
 ART_PRIVATE_REQUEST_IDENTITY_HEADER = "x-art-request-identity"

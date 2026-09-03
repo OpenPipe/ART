@@ -6,7 +6,7 @@ from contextvars import ContextVar
 from functools import wraps
 import os
 import struct
-from typing import Any
+from typing import Any, Literal, TypeAlias
 
 import numpy as np
 
@@ -19,6 +19,14 @@ ROUTE_REQUEST_XARG = "art_return_routed_experts"
 ROUTE_CACHE_SALT = "art-routes=ARTRTE2"
 _REGISTERED_NUM_EXPERTS: int | None = None
 _REGISTERED_PADDING_LAYERS: tuple[int, ...] | None = None
+
+EncodedRouteChoice: TypeAlias = tuple[
+    int,
+    Literal["uint8", "uint16"],
+    tuple[int, int, int],
+    int,
+    int,
+]
 
 
 class _CapturedRoutes(dict[int, np.ndarray]):
@@ -102,26 +110,58 @@ def encode_routed_experts_response_parts(
 ) -> tuple[bytes, bytes]:
     """Encode the response and return the exact concatenated route payload."""
 
-    num_experts = int(num_experts or getattr(routes, "num_experts", 0))
+    route_payload, num_experts, choices = encode_routed_experts_payload(
+        routes, num_experts=num_experts
+    )
     chunks: list[bytes | memoryview] = [
-        HEADER.pack(MAGIC, len(json_body), len(routes), num_experts),
+        HEADER.pack(MAGIC, len(json_body), len(choices), num_experts),
         json_body,
     ]
-    route_chunks: list[memoryview] = []
-    for choice_index, dtype_code, array in _encoded_route_arrays(
-        routes, num_experts=num_experts
-    ):
-        route_bytes = memoryview(array).cast("B")
-        if array.ndim != 3:
-            raise RuntimeError(f"Routed experts must have rank 3, got {array.shape}")
+    payload_view = memoryview(route_payload)
+    for choice_index, dtype, shape, offset, byte_count in choices:
         chunks.extend(
             (
-                ROUTE_HEADER.pack(choice_index, dtype_code, *array.shape),
-                route_bytes,
+                ROUTE_HEADER.pack(
+                    choice_index,
+                    1 if dtype == "uint8" else 2,
+                    *shape,
+                ),
+                payload_view[offset : offset + byte_count],
             )
         )
-        route_chunks.append(route_bytes)
-    return b"".join(chunks), b"".join(route_chunks)
+    return b"".join(chunks), route_payload
+
+
+def encode_routed_experts_payload(
+    routes: dict[int, np.ndarray],
+    *,
+    num_experts: int | None = None,
+) -> tuple[bytes, int, tuple[EncodedRouteChoice, ...]]:
+    """Encode one route-only object plus its exact choice storage layout."""
+
+    resolved_num_experts = int(num_experts or getattr(routes, "num_experts", 0))
+    chunks: list[memoryview] = []
+    choices: list[EncodedRouteChoice] = []
+    offset = 0
+    for choice_index, dtype_code, array in _encoded_route_arrays(
+        routes, num_experts=resolved_num_experts
+    ):
+        route_bytes = memoryview(array).cast("B")
+        byte_count = len(route_bytes)
+        shape = tuple(int(value) for value in array.shape)
+        assert len(shape) == 3
+        choices.append(
+            (
+                choice_index,
+                "uint8" if dtype_code == 1 else "uint16",
+                shape,
+                offset,
+                byte_count,
+            )
+        )
+        chunks.append(route_bytes)
+        offset += byte_count
+    return b"".join(chunks), resolved_num_experts, tuple(choices)
 
 
 def _encoded_route_arrays(
