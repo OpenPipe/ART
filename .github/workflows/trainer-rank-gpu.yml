@@ -112,6 +112,21 @@ jobs:
           chmod 600 "${HOME}/.kube/config"
           kubectl --context cks-wb3 get nodes >/dev/null
 
+      - name: Configure SkyPilot workload identity
+        run: |
+          mkdir -p "${HOME}/.sky"
+          cat > "${HOME}/.sky/config.yaml" <<'YAML'
+          # Use the pre-provisioned least-privilege service account instead of
+          # allowing SkyPilot to create its broadly privileged legacy RBAC.
+          allowed_clouds:
+            - kubernetes
+          kubernetes:
+            allowed_contexts:
+              - cks-wb3
+            remote_identity:
+              cks-wb3: skypilot-workload
+          YAML
+
       - name: Run TrainerRank GPU validation
         run: |
           set -euo pipefail
