@@ -1107,7 +1107,7 @@ class TrainerRank:
         # TP explicitly. Known limitation: the cold static memory estimate
         # ignores sharding (conservative).
         self.runtime: TrainingRuntime = runtime
-        self.device = next(runtime.model[0].parameters()).device
+        self.device: torch.device = next(runtime.model[0].parameters()).device
         self._param_dtype_size = _dtype_size(next(runtime.model[0].parameters()).dtype)
         try:
             metadata_model = _language_model(runtime.model[0])
