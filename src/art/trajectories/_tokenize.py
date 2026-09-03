@@ -4019,9 +4019,9 @@ def _tokenize_exact_projected_chat_history(
         if final_stop_reason == "length"
         else None
     )
-    if final_stop_reason == "length" and (
-        terminal_boundary is None or not terminal_boundary.tail
-    ):
+    # Unlike a nonterminal truncation, the final sampled output needs no
+    # synthetic boundary to connect it to a later prompt.
+    if terminal_boundary is not None and not terminal_boundary.tail:
         return None
 
     # The final prompt proves every earlier boundary. Only this terminal tail
@@ -5201,6 +5201,7 @@ def _tokenize_chat_view(
             _SampledSourceKey, _RenderedLengthStopBoundary
         ] = {}
         length_stop_count = 0
+        length_stop_boundaries_complete = True
         for position, message_index in enumerate(sampled_message_indices):
             source = history.message_sources[message_index]
             assert source is not None
@@ -5248,11 +5249,18 @@ def _tokenize_chat_view(
                 else None
             )
             if boundary is None:
-                break
+                if position + 1 < len(sampled_message_indices):
+                    length_stop_boundaries_complete = False
+                    break
+                # A terminal length stop needs no renderer-owned tail: the
+                # authoritative prompt and sampled output already describe the
+                # complete trainable sequence. A later turn is required only
+                # to prove a nonterminal synthetic boundary.
+                continue
             length_stop_boundaries[source_key] = boundary
         if (
             length_stop_count
-            and len(length_stop_boundaries) == length_stop_count
+            and length_stop_boundaries_complete
             and (
                 exact := _tokenize_exact_projected_chat_history(
                     history,

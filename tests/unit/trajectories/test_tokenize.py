@@ -757,6 +757,42 @@ def test_exact_chain_appends_renderer_owned_terminal_length_tail() -> None:
     assert not any(flag & tr.TokenFlag.SAMPLED for flag in tokenized.flags[-2:])
 
 
+def test_exact_chain_accepts_unproven_terminal_length_tail() -> None:
+    first = _chat_exchange([1], [2])
+    first.response.choices[0].finish_reason = "length"
+    second = _chat_exchange([1, 2, 7, 9, 3], [4], offset=1)
+    second.response.choices[0].finish_reason = "length"
+    history = art.Trajectory(
+        exchanges=TrajectoryExchanges(chat_completions=[first, second])
+    ).chat_completions_history()
+    from art.trajectories._tokenize import (
+        _RenderedLengthStopBoundary,
+        _sampled_source_key,
+        _tokenize_exact_projected_chat_history,
+    )
+
+    first_source = history.message_sources[1]
+    assert first_source is not None
+    tokenized = _tokenize_exact_projected_chat_history(
+        history,
+        tokenizer=_StopTokenizer(),
+        length_stop_boundaries={
+            _sampled_source_key(first_source): _RenderedLengthStopBoundary(
+                tail=(7, 9), following=(3,)
+            ),
+        },
+        projection_validated=True,
+    )
+
+    assert tokenized is not None
+    assert tokenized.tokens == [1, 2, 7, 9, 3, 4]
+    assert tokenized.flags[2:4] == [
+        tr.TokenFlag.EXACT | tr.TokenFlag.ASSISTANT,
+        tr.TokenFlag.EXACT | tr.TokenFlag.STOP,
+    ]
+    assert tokenized.flags[-1] == _SAMPLED_ASSISTANT_OUTPUT
+
+
 def test_exact_chain_declines_unrecognized_or_mismatched_length_boundary() -> None:
     first = _chat_exchange([1], [2])
     first.response.choices[0].finish_reason = "length"
@@ -894,7 +930,7 @@ def test_exact_output_boundary_after_sampled_tool_call() -> None:
 
     tokenized = history.tokenize(tokenizer=tokenizer)
 
-    assert tokenized.tokens == [1, 2, 7, 9, 3, 4, 9, 5, 6, 9]
+    assert tokenized.tokens == [1, 2, 7, 9, 3, 4, 9, 5, 6]
     sampled = [
         index
         for index, flag in enumerate(tokenized.flags)
@@ -903,8 +939,8 @@ def test_exact_output_boundary_after_sampled_tool_call() -> None:
     assert sampled == [1, 2, 3, 5, 6, 8]
     assert [
         index for index, flag in enumerate(tokenized.flags) if flag & tr.TokenFlag.STOP
-    ] == [3, 6, 9]
-    assert tokenized.flags[9] == tr.TokenFlag.STOP
+    ] == [3, 6]
+    assert tokenized.flags[-1] == _SAMPLED_ASSISTANT_OUTPUT
 
 
 def test_proven_exact_output_boundary_does_not_require_prompt_token_ids() -> None:
