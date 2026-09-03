@@ -1677,20 +1677,24 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
         trajectories: Iterable[art.Trajectory],
     ) -> None:
         for trajectory in trajectories:
+            found_completion = False
             for item in cls._trajectory_messages_and_choices(trajectory):
-                is_completion = isinstance(item, Choice) or (
-                    isinstance(item, Mapping) and item.get("role") == "assistant"
+                spans = cls._validated_policy_spans(
+                    item, required=isinstance(item, Choice)
                 )
-                if not is_completion:
+                if spans is None:
                     continue
-                spans = cls._validated_policy_spans(item, required=True)
-                assert spans is not None
+                found_completion = True
                 for span in spans:
                     if span.policy_version != step:
                         raise RuntimeError(
                             f"Eval at step {step} returned "
                             f"policy-{span.policy_version} tokens"
                         )
+            if not found_completion:
+                raise RuntimeError(
+                    "Exact policy provenance is missing policy_token_spans"
+                )
 
     @staticmethod
     def _validated_policy_spans(
