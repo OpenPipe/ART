@@ -248,7 +248,10 @@ GLM52_SPEC = ModelSupportSpec(
     key="glm52",
     handler_key=_GLM52_HANDLER_KEY,
     is_moe=True,
-    model_names=("zai-org/GLM-5.2",),
+    model_names=(
+        "zai-org/GLM-5.2",
+        "zai-org/GLM-5.3-BF16",
+    ),
     default_target_modules=_GLM52_TARGET_MODULES,
     native_vllm_lora_status=_VALIDATED_NATIVE_VLLM_LORA_STATUS,
     dependency_floor=DependencyFloor(

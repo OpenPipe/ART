@@ -66,6 +66,7 @@ _REVISIONS = {
     "google/gemma-4-26B-A4B-it": "4d7ae4984b7db7de8f8457170b3f1a419ee76d52",
     "deepseek-ai/DeepSeek-V4-Flash": "60d8d70770c6776ff598c94bb586a859a38244f1",
     "zai-org/GLM-5.2": "b4734de4facf877f85769a911abafc5283eab3d9",
+    "zai-org/GLM-5.3-BF16": "304b8051cfb2b260b61ce0cbe330e02a98e73639",
     "openai/gpt-oss-20b": "6cee5e81ee83917806bbde320786a8fb61efebee",
     "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16": (
         "2d59de1cbd51c0adf384eb906b766d1aee0e0517"

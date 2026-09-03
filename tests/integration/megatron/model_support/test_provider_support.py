@@ -147,6 +147,16 @@ def test_qwen38_27b_uses_qwen35_dense_support() -> None:
     assert handler.key == "qwen3_5_dense"
 
 
+def test_glm53_bf16_uses_glm52_support() -> None:
+    spec = get_model_support_spec("zai-org/GLM-5.3-BF16")
+    handler = get_model_support_handler("zai-org/GLM-5.3-BF16")
+
+    assert spec.key == "glm52"
+    assert spec.is_moe is True
+    assert spec.native_vllm_lora_status == "validated"
+    assert handler.key == "glm52"
+
+
 def test_meta_llama_32_1b_instruct_uses_llama3_dense_support() -> None:
     model = "meta-llama/Llama-3.2-1B-Instruct"
     spec = get_model_support_spec(model)
