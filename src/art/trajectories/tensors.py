@@ -118,12 +118,20 @@ class TensorizedHistory(_StringInterningModel):
         return self
 
     def to(self, device: torch.device | str) -> Self:
-        """Move owned tensors to ``device`` in place and return this view."""
+        """Return a copy with independently owned tensors on ``device``."""
+
+        result = self.model_copy()
+        result.tokens = self.tokens.to(device=device, copy=True)
+        result.logprobs = self.logprobs.to(device=device, copy=True)
+        result.flags = self.flags.to(device=device, copy=True)
+        return result
+
+    def to_(self, device: torch.device | str) -> None:
+        """Move owned tensors to ``device`` in place."""
 
         self.tokens = self.tokens.to(device=device)
         self.logprobs = self.logprobs.to(device=device)
         self.flags = self.flags.to(device=device)
-        return self
 
     def compact_dump(self) -> CompactTrajectoryPayload:
         from ._compact import dump
@@ -201,9 +209,13 @@ class TensorizedMultiHistoryTrajectory(_StringInterningModel):
         return self
 
     def to(self, device: torch.device | str) -> Self:
+        return self.model_copy(
+            update={"histories": [history.to(device) for history in self.histories]}
+        )
+
+    def to_(self, device: torch.device | str) -> None:
         for history in self.histories:
-            history.to(device)
-        return self
+            history.to_(device)
 
     def first_occurrence_masks(
         self, *, where: TokenFlag | None = None
@@ -290,12 +302,21 @@ class TensorizedTrajectoryGroup(_StringInterningModel, Generic[TensorizedTraject
         return self
 
     def to(self, device: torch.device | str) -> Self:
+        trajectories: list[TensorizedTrajectoryT] = []
         for trajectory in self.trajectories:
             if isinstance(trajectory, TensorizedTrajectory):
-                trajectory.to(device)
+                moved = trajectory.to(device)
             else:
-                trajectory.to(device)
-        return self
+                moved = trajectory.to(device)
+            trajectories.append(cast(TensorizedTrajectoryT, moved))
+        return self.model_copy(update={"trajectories": trajectories})
+
+    def to_(self, device: torch.device | str) -> None:
+        for trajectory in self.trajectories:
+            if isinstance(trajectory, TensorizedTrajectory):
+                trajectory.to_(device)
+            else:
+                trajectory.to_(device)
 
     def compact_dump(self) -> CompactTrajectoryPayload:
         from ._compact import dump

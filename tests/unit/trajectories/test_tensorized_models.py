@@ -133,7 +133,7 @@ def test_missing_torch_reports_tensor_extra() -> None:
     assert "openpipe-art[tensors]" in result.stderr
 
 
-def test_history_tensorize_uses_canonical_tensors_and_moves_in_place() -> None:
+def test_history_tensorize_uses_canonical_tensors_and_device_copy_semantics() -> None:
     value = _tokenized_history().tensorize()
 
     assert isinstance(value, tr.TensorizedHistory)
@@ -142,7 +142,16 @@ def test_history_tensorize_uses_canonical_tensors_and_moves_in_place() -> None:
     assert value.flags.dtype is torch.int32
     assert value.tokens.device.type == "cpu"
     assert value.tokens.is_contiguous()
-    assert value.to("cpu") is value
+    copied = value.to("cpu")
+    assert copied is not value
+    assert copied.history is value.history
+    assert copied.tokens.data_ptr() != value.tokens.data_ptr()
+    assert copied.logprobs.data_ptr() != value.logprobs.data_ptr()
+    assert copied.flags.data_ptr() != value.flags.data_ptr()
+    assert torch.equal(copied.tokens, value.tokens)
+    assert torch.allclose(copied.logprobs, value.logprobs, equal_nan=True)
+    assert torch.equal(copied.flags, value.flags)
+    assert value.to_("cpu") is None
     assert "tokenized" not in type(value).model_fields
 
 
@@ -316,7 +325,25 @@ def test_tensorized_trajectory_multi_history_and_group_compact_round_trips() -> 
         restored_group.trajectories[0].trajectory
         is (restored_group.trajectory_group.trajectories[0])
     )
-    assert restored_group.to("cpu") is restored_group
+    copied_multi = restored_multi.to("cpu")
+    assert copied_multi is not restored_multi
+    assert copied_multi.trajectory is restored_multi.trajectory
+    assert copied_multi.histories[0] is not restored_multi.histories[0]
+    assert (
+        copied_multi.histories[0].tokens.data_ptr()
+        != restored_multi.histories[0].tokens.data_ptr()
+    )
+    assert restored_multi.to_("cpu") is None
+
+    copied_group = restored_group.to("cpu")
+    assert copied_group is not restored_group
+    assert copied_group.trajectory_group is restored_group.trajectory_group
+    assert copied_group.trajectories[0] is not restored_group.trajectories[0]
+    assert (
+        copied_group.trajectories[0].tokens.data_ptr()
+        != restored_group.trajectories[0].tokens.data_ptr()
+    )
+    assert restored_group.to_("cpu") is None
 
 
 def test_tensorized_pickle_retains_sources_without_tokenized_intermediate() -> None:

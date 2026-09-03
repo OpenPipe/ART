@@ -795,5 +795,5 @@ async def transform(
 
     if device is not None:
         for value in transformed:
-            cast(Any, value).to(device)
+            cast(Any, value).to_(device)
     return transformed

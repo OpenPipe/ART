@@ -175,7 +175,7 @@ def _validate_value(
         else:
             result = _validate_group(value, model)
         if device is not None:
-            move = getattr(result, "to", None)
+            move = getattr(result, "to_", None)
             if not callable(move):
                 raise AssertionError("Tensorized compact value has no device mover")
             move(device)
