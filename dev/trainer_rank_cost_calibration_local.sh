@@ -17,18 +17,23 @@ cell() {  # cell model layers [group]
     dev/trainer_rank_landing_acceptance.py --phase cost-calibrate \
     --cell "$1" --model "$2" --layers "$3" --group "${4:-0}" --repeat "${repeat}" \
     --evidence "${evidence}" 2>&1 | tee "${logdir}/tp1-cp1-$1-$3-g${4:-0}.log" \
-    | grep -E "cost-calibrate|LANDING|Traceback" || true
+    | { grep -E "cost-calibrate|LANDING|Traceback" || true; }
 }
-cell cal-grpo-g8-long Qwen/Qwen3.5-4B 2
-cell cal-grpo-g8      Qwen/Qwen3.5-4B 0
-cell cal-grpo-g16     Qwen/Qwen3.5-4B 0
-cell cal-grpo-g4x4    Qwen/Qwen3.5-4B 0
-cell cal-hetero       Qwen/Qwen3.5-4B 0
-cell cal-grpo-g8-long Qwen/Qwen3-4B   2
-cell cal-grpo-g8      Qwen/Qwen3-4B   0
+# pipefail carries torchrun's status through tee and the grep filter; a failed
+# cell is recorded and the script exits nonzero at the end.
+failures=0
+run_cell() { cell "$@" || { failures=$((failures + 1)); echo "CELL FAILED: $*"; }; }
+run_cell cal-grpo-g8-long Qwen/Qwen3.5-4B 2
+run_cell cal-grpo-g8      Qwen/Qwen3.5-4B 0
+run_cell cal-grpo-g16     Qwen/Qwen3.5-4B 0
+run_cell cal-grpo-g4x4    Qwen/Qwen3.5-4B 0
+run_cell cal-hetero       Qwen/Qwen3.5-4B 0
+run_cell cal-grpo-g8-long Qwen/Qwen3-4B   2
+run_cell cal-grpo-g8      Qwen/Qwen3-4B   0
 if [ -f dev/_trainer_rank_ellavox_qwen35_4b_tokens.json ]; then
   for g in 0 1 2 3 4 5 6 7; do
-    cell cal-ellavox Qwen/Qwen3.5-4B 0 "$g"
+    run_cell cal-ellavox Qwen/Qwen3.5-4B 0 "$g"
   done
 fi
-echo "cost-calibration local: done"
+echo "cost-calibration local: done (${failures} failed cells)"
+[ "${failures}" -eq 0 ]

@@ -130,6 +130,156 @@ def production_regret(
     return report
 
 
+def validate_completeness(paths: list[Path], *, repeat: int) -> list[str]:
+    """Every mandatory candidate of every cell must have ``repeat`` usable rows.
+
+    The runners record failures, and the fitter silently skips thin candidates,
+    so a failed cell or candidate could otherwise vanish while the reduced
+    dataset still passes its gates. Returns the list of gaps (empty = complete).
+    """
+
+    expected: dict[str, list[str]] = {}
+    usable: dict[tuple[str, str], int] = defaultdict(int)
+    failed: set[tuple[str, str]] = set()
+    for path in paths:
+        for line in path.read_text().splitlines():
+            if not line.strip():
+                continue
+            row = json.loads(line)
+            key = _cell_key(row) if "cell" in row else None
+            if row.get("record_type") == "calibration_cell":
+                expected[_cell_key(row)] = [
+                    c["label"] for c in row["candidates"] if c["label"] != "automatic"
+                ]
+            elif row.get("record_type") == "calibration_sample" and key:
+                label = str(row["candidate_label"])
+                if row.get("admission_failed"):
+                    failed.add((key, label))
+                elif (
+                    row.get("role") == "measured"
+                    and row.get("subforward_count", 1) == 1
+                    and all(s == "none" for s in row.get("compile_statuses", []))
+                ):
+                    usable[(key, label)] += 1
+    gaps: list[str] = []
+    for cell, labels in expected.items():
+        for label in labels:
+            if (cell, label) in failed:
+                gaps.append(f"{cell}: {label} refused admission")
+            elif usable[(cell, label)] < repeat:
+                gaps.append(
+                    f"{cell}: {label} has {usable[(cell, label)]} usable rows (< {repeat})"
+                )
+    return gaps
+
+
+CERTIFICATE_SCHEMA = "art.dev.trainer_rank_cost_calibration_certificate.v1"
+
+
+def export_certificate(
+    path: Path,
+    candidates: list[Candidate],
+    *,
+    evidence: list[Path],
+    arguments: dict[str, Any],
+    integer_table: dict[str, int],
+    report: dict[str, Any],
+) -> None:
+    """Write the compact, reproducible record binding the table to its data.
+
+    Per-cell candidate features, medians, counts, spreads and fingerprints
+    (no tokens, no per-sample rows), the exact fit arguments, the integer table
+    and its hash, and the headline metrics. ``--from-certificate`` re-fits from
+    exactly this record.
+    """
+
+    import hashlib
+
+    fingerprints: dict[str, dict[str, Any]] = {}
+    for evidence_path in evidence:
+        for line in evidence_path.read_text().splitlines():
+            if not line.strip():
+                continue
+            row = json.loads(line)
+            if row.get("record_type") == "calibration_cell":
+                fingerprints[_cell_key(row)] = {
+                    "requests_sha256": row.get("requests_sha256"),
+                    "source": row.get("source"),
+                    "workload": row.get("workload"),
+                    "device": row.get("device"),
+                    "param_dtype": row.get("param_dtype"),
+                    "hidden_size": row.get("hidden_size"),
+                }
+    by_cell: dict[str, list[Candidate]] = defaultdict(list)
+    for candidate in candidates:
+        by_cell[candidate.cell].append(candidate)
+    cells = [
+        {
+            "cell": cell,
+            "facts": members[0].facts,
+            **fingerprints.get(cell, {}),
+            "candidates": [
+                {
+                    "label": c.label,
+                    "features": c.features,
+                    "median_ms": c.ms,
+                    "n": c.n,
+                    "spread_pct": c.spread_pct,
+                }
+                for c in sorted(members, key=lambda c: c.label)
+            ],
+        }
+        for cell, members in sorted(by_cell.items())
+    ]
+    table_hash = hashlib.sha256(
+        json.dumps(integer_table, sort_keys=True).encode()
+    ).hexdigest()
+    payload = {
+        "schema": CERTIFICATE_SCHEMA,
+        "fit_arguments": arguments,
+        "cells": cells,
+        "integer_table_milli_us": integer_table,
+        "integer_table_sha256": table_hash,
+        "metrics": {
+            split: {
+                k: report[split][k]
+                for k in (
+                    "cells",
+                    "ordered_pairs",
+                    "pairwise_accuracy",
+                    "median_regret_pct",
+                    "p95_regret_pct",
+                    "max_regret_pct",
+                    "clear_misses",
+                )
+            }
+            for split in ("integer_all", "test", "train")
+            if report.get(split)
+        },
+    }
+    path.write_text(json.dumps(payload, indent=1, sort_keys=True, default=str) + "\n")
+
+
+def load_certificate(path: Path) -> tuple[list[Candidate], dict[str, Any]]:
+    payload = json.loads(path.read_text())
+    if payload.get("schema") != CERTIFICATE_SCHEMA:
+        raise ValueError("unknown certificate schema")
+    candidates = [
+        Candidate(
+            cell["cell"],
+            c["label"],
+            c["features"],
+            cell["facts"],
+            float(c["median_ms"]),
+            int(c["n"]),
+            float(c["spread_pct"]),
+        )
+        for cell in payload["cells"]
+        for c in cell["candidates"]
+    ]
+    return candidates, payload
+
+
 def load_candidates(paths: list[Path]) -> list[Candidate]:
     cells: dict[str, dict[str, Any]] = {}
     samples: dict[tuple[str, str], list[float]] = defaultdict(list)
@@ -610,7 +760,31 @@ def current_score_report(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("evidence", nargs="+", type=Path)
+    parser.add_argument("evidence", nargs="*", type=Path)
+    parser.add_argument(
+        "--from-certificate",
+        default="",
+        help="fit from a checked-in certificate's aggregates instead of raw evidence",
+    )
+    parser.add_argument(
+        "--export-certificate",
+        default="",
+        help="write the compact reproducible certificate (aggregates, arguments, table, hash)",
+    )
+    parser.add_argument(
+        "--exclude-cells",
+        default="",
+        help=(
+            "comma-separated substrings of cells to leave out explicitly (recorded in the "
+            "certificate); the fitter never drops incomplete cells silently"
+        ),
+    )
+    parser.add_argument(
+        "--require-complete",
+        type=int,
+        default=0,
+        help="fail unless every mandatory candidate of every cell has at least this many usable rows",
+    )
     parser.add_argument("--terms", default=",".join(DEFAULT_TERMS))
     parser.add_argument(
         "--holdout",
@@ -645,7 +819,35 @@ def main() -> None:
     if arguments.refresh_features:
         refresh_features(arguments.evidence)
     terms = tuple(t for t in arguments.terms.split(",") if t)
-    candidates = load_candidates(arguments.evidence)
+    excluded = [p for p in arguments.exclude_cells.split(",") if p]
+
+    def excluded_cell(cell: str) -> bool:
+        return any(p in cell for p in excluded)
+
+    if arguments.require_complete:
+        gaps = [
+            gap
+            for gap in validate_completeness(
+                arguments.evidence, repeat=arguments.require_complete
+            )
+            if not excluded_cell(gap.split(":", 1)[0])
+        ]
+        if gaps:
+            print("incomplete evidence:", file=sys.stderr)
+            for gap in gaps:
+                print("  -", gap, file=sys.stderr)
+            raise SystemExit(1)
+        print(
+            f"evidence complete: every mandatory candidate has >= {arguments.require_complete} rows"
+        )
+    if arguments.from_certificate:
+        candidates, _certificate = load_certificate(Path(arguments.from_certificate))
+    else:
+        candidates = load_candidates(arguments.evidence)
+    if excluded:
+        dropped = sorted({c.cell for c in candidates if excluded_cell(c.cell)})
+        candidates = [c for c in candidates if not excluded_cell(c.cell)]
+        print("excluded cells:", *dropped, sep="\n  ")
     if not candidates:
         print("no usable candidates", file=sys.stderr)
         raise SystemExit(1)
@@ -669,7 +871,11 @@ def main() -> None:
         "test_cells": len({c.cell for c in test}),
         "train": evaluate(train, predict(train, terms, beta)),
         "test": evaluate(test, predict(test, terms, beta)) if test else None,
-        "current_all": current_score_report(candidates, arguments.evidence),
+        "current_all": (
+            current_score_report(candidates, arguments.evidence)
+            if arguments.evidence
+            else None
+        ),
         "fit_all": evaluate(candidates, predict(candidates, terms, beta)),
     }
     if arguments.integerize:
@@ -685,7 +891,9 @@ def main() -> None:
             candidates, predict(candidates, terms, beta_int)
         )
         print("COEFFICIENTS_MILLI_US =", json.dumps(integer, indent=4))
-    report["production"] = production_regret(candidates, arguments.evidence)
+    report["production"] = (
+        production_regret(candidates, arguments.evidence) if arguments.evidence else {}
+    )
     if report["production"]:
         regrets = sorted(v["regret_pct"] for v in report["production"].values())
         print(
@@ -728,6 +936,25 @@ def main() -> None:
         )
     if arguments.report:
         Path(arguments.report).write_text(json.dumps(report, indent=1, default=str))
+    if arguments.export_certificate:
+        if "integer_terms_milli_us" not in report:
+            raise SystemExit("--export-certificate requires --integerize")
+        export_certificate(
+            Path(arguments.export_certificate),
+            candidates,
+            evidence=arguments.evidence,
+            arguments={
+                "terms": list(terms),
+                "objective": arguments.objective,
+                "rank_rounds": arguments.rank_rounds,
+                "holdout": arguments.holdout,
+                "exclude_cells": excluded,
+                "require_complete": arguments.require_complete,
+            },
+            integer_table=report["integer_terms_milli_us"],
+            report=report,
+        )
+        print("certificate written:", arguments.export_certificate)
 
 
 if __name__ == "__main__":

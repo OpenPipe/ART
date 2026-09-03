@@ -33,6 +33,8 @@ if TYPE_CHECKING:
     from ._prefix_tree_planner import PrefixTreeLayout
 
 COEFFICIENT_VERSION = 2
+# The pre-calibration score, kept as the fallback outside the calibrated domain.
+COEFFICIENT_VERSION_FALLBACK = 1
 
 # Segment-length buckets for kernel-utilization effects: a segment shorter than
 # these runs small-M kernels on every rank it is sharded over. Context
@@ -346,6 +348,112 @@ def score_terms(
     )
 
 
+@dataclass(frozen=True, slots=True)
+class CalibrationProfile:
+    """The capability domain the fitted table was measured on.
+
+    Capability-based, never model-name-based: the campaign ran on Hopper
+    (compute capability 9.0) in bf16 on ~4B dense-attention and GDN models
+    (hidden size 2,560), at TP1/TP2 and CP1/CP2/CP4. Outside this domain the
+    token-versus-boundary economics are unmeasured, so the selector keeps the
+    previous scorer rather than extrapolating.
+    """
+
+    device_capabilities: tuple[tuple[int, int], ...] = ((9, 0),)
+    param_dtypes: tuple[str, ...] = ("torch.bfloat16",)
+    hidden_size_range: tuple[int, int] = (2_048, 3_072)
+    allow_moe: bool = False
+
+    def matches(
+        self,
+        *,
+        device_capability: tuple[int, int] | None,
+        param_dtype: str,
+        hidden_size: int,
+        is_moe: bool,
+    ) -> bool:
+        if device_capability is not None and (
+            tuple(device_capability) not in self.device_capabilities
+        ):
+            return False
+        if param_dtype not in self.param_dtypes:
+            return False
+        low, high = self.hidden_size_range
+        if not low <= hidden_size <= high:
+            return False
+        return self.allow_moe or not is_moe
+
+
+CALIBRATION_PROFILE = CalibrationProfile()
+
+
+def coefficient_version_for(
+    *,
+    device_capability: tuple[int, int] | None,
+    param_dtype: str,
+    hidden_size: int,
+    is_moe: bool,
+) -> int:
+    """Pick the score version for a runtime: the fitted table inside its
+    calibrated capability profile, the fallback outside it.
+
+    ``device_capability`` is ``None`` when the model is not on a CUDA device
+    (CPU-only planning, as in the unit tests); such runtimes use the fitted
+    table, since the profile describes GPU execution.
+    """
+
+    if device_capability is None:
+        return COEFFICIENT_VERSION
+    inside = CALIBRATION_PROFILE.matches(
+        device_capability=device_capability,
+        param_dtype=param_dtype,
+        hidden_size=hidden_size,
+        is_moe=is_moe,
+    )
+    return COEFFICIENT_VERSION if inside else COEFFICIENT_VERSION_FALLBACK
+
+
+# --- Version 1 (fallback): the landing's hand-shaped score ---------------------
+# Provenance: the research implementation's production layout score (frozen
+# 2026-08-31); constants were hand-set. Kept verbatim so runtimes outside the
+# calibrated profile behave exactly as before the recalibration.
+_V1_GDN_FIRST_SHARED_PIPELINE_US_PER_LAYER = 768
+_V1_GDN_EXCESS_DEPTH_PIPELINE_US_PER_LAYER = 256
+
+
+def _prefix_tree_layout_score_v1(
+    layout: PrefixTreeLayout,
+    *,
+    cp_size: int,
+    layers: int,
+    uses_gdn: bool,
+) -> tuple[int, int, int, int]:
+    cp = max(1, cp_size)
+    layer_count = max(1, layers)
+    segment_count = len(layout.segments)
+    parent_edges = len(layout.selected_decisions)
+    transformer = layout.packed_tokens * WORK_PER_US
+    imbalance = ((layout.packed_tokens + cp - 1) // cp) * (96 + 32 * cp)
+    launch = segment_count * (96 + 32 * cp) * WORK_PER_US
+    exchanges = parent_edges * (64 + 32 * cp) * WORK_PER_US
+    gdn_work = (
+        (
+            min(1, max(0, layout.maximum_depth - 1))
+            * layer_count
+            * _V1_GDN_FIRST_SHARED_PIPELINE_US_PER_LAYER
+            * WORK_PER_US
+            + max(0, layout.maximum_depth - 2)
+            * layer_count
+            * _V1_GDN_EXCESS_DEPTH_PIPELINE_US_PER_LAYER
+            * WORK_PER_US
+        )
+        if uses_gdn
+        else 0
+    )
+    total = layer_count * transformer + (imbalance + launch + exchanges + gdn_work)
+    return total, layout.packed_tokens, segment_count, layout.maximum_depth
+
+
 # Fitted coefficients in integer milli-microseconds per feature unit (see the
 # module docstring for provenance; regenerate with
 # ``dev/trainer_rank_cost_fit.py --integerize``). Zero means the term carried no
@@ -407,13 +515,22 @@ def prefix_tree_layout_score(
     uses_gdn: bool,
     tp_size: int = 1,
     gdn_layers: int | None = None,
+    coefficient_version: int = COEFFICIENT_VERSION,
 ) -> tuple[int, int, int, int]:
     """Price one layout for the given topology and model facts.
 
     ``gdn_layers`` defaults to ``layers`` when the model uses GDN and to zero
     otherwise; ``uses_gdn`` only matters for that default.
+    ``coefficient_version`` selects the fitted table (2) or the fallback (1);
+    see ``coefficient_version_for``.
     """
 
+    if coefficient_version == COEFFICIENT_VERSION_FALLBACK:
+        return _prefix_tree_layout_score_v1(
+            layout, cp_size=cp_size, layers=layers, uses_gdn=uses_gdn
+        )
+    if coefficient_version != COEFFICIENT_VERSION:
+        raise ValueError(f"unknown coefficient version {coefficient_version}")
     features = layout_features(layout)
     facts = ScoringFacts(
         cp_size=max(1, cp_size),
@@ -434,9 +551,12 @@ def prefix_tree_layout_score(
 
 
 __all__ = [
+    "CALIBRATION_PROFILE",
     "COEFFICIENTS_MILLI_US",
     "COEFFICIENT_SCALE_PER_US",
     "COEFFICIENT_VERSION",
+    "COEFFICIENT_VERSION_FALLBACK",
+    "CalibrationProfile",
     "LayoutFeatures",
     "SEGMENT_LENGTH_THRESHOLDS",
     "SMALL_SEGMENT_TOKENS",
@@ -444,6 +564,7 @@ __all__ = [
     "TERM_FUNCTIONS",
     "TINY_SEGMENT_TOKENS",
     "WORK_PER_US",
+    "coefficient_version_for",
     "layout_features",
     "predicted_us",
     "predicted_work",

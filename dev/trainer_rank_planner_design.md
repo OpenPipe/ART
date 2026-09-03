@@ -143,8 +143,28 @@ pairwise, max regret 67% (an Ellavox group at CP2).
 Landing gates re-derived: the sealed win-cell shape still selects deep sharing
 (prompt-level sharing at CP4, where it measures fastest; full sharing at CP1),
 the heterogeneous control and the tiny sealed families still decline, and
-selection stays deterministic. `COEFFICIENT_VERSION` is part of every layout
-cache key, so the new table invalidates cached recipes.
+selection stays deterministic. The coefficient version is part of the planner
+facts and therefore of every layout cache key, so the new table invalidates
+cached recipes.
+
+Calibrated domain (review finding): the table was measured on one capability
+class, so it applies only inside `CalibrationProfile` — compute capability
+9.0, bf16, hidden size 2,048–3,072, non-MoE — and TrainerRank keeps the
+version-1 score (kept verbatim as the fallback) outside it, logging once. The
+gate is capability-based, never model-name-based; extending the domain means
+running the calibration cells on the new hardware or width and widening the
+profile with evidence. CPU-only planning (unit tests) uses the fitted table.
+
+Reproducibility (review finding): `dev/trainer_rank_cost_calibration_certificate.json`
+binds the shipped table to its data — per-cell candidate features, median
+timings, counts, spreads and fingerprints (no tokens, no per-sample rows), the
+exact fit arguments including any explicit cell exclusions, the integer table
+and its hash, and the headline metrics. `tests/unit/test_planner_cost_certificate.py`
+asserts the shipped table is the certified table and that the certified
+metrics hold on the recorded aggregates; `--from-certificate` re-fits from it.
+The runners propagate every cell failure (no masked exit codes) and the
+fitter refuses to fit incomplete evidence unless the gaps are excluded
+explicitly (`--require-complete`, `--exclude-cells`).
 
 ## Width feasibility is decided by the memory-minimal layout
 

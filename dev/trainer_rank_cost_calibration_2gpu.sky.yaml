@@ -54,29 +54,34 @@ run: |
     timeout 7200s megatron_runtime/.venv/bin/python -m torch.distributed.run --standalone --nproc-per-node=2 \
       dev/trainer_rank_landing_acceptance.py --phase cost-calibrate \
       --cell "$3" --model "$4" --layers "$5" --group "${6:-0}" --repeat "${REPEAT}" \
-      --evidence "${root}/evidence.jsonl" 2>&1 | tee "${root}/tp$1-cp$2-$3-$5-g${6:-0}.log" | grep -E "cost-calibrate|LANDING|Traceback" || true
+      --evidence "${root}/evidence.jsonl" 2>&1 | tee "${root}/tp$1-cp$2-$3-$5-g${6:-0}.log" | { grep -E "cost-calibrate|LANDING|Traceback" || true; }
   }
+  # pipefail carries torchrun's status through tee and the grep filter; a
+  # failed cell is recorded and the campaign exits nonzero at the end.
+  failures=0
+  run_cell() { cell "$@" || { failures=$((failures + 1)); echo "CELL FAILED: $*"; }; }
   if [ "${CELL_SET}" = "main" ]; then
-    cell 2 1 cal-grpo-g8   Qwen/Qwen3.5-4B 0
-    cell 2 1 cal-grpo-g16  Qwen/Qwen3.5-4B 0
-    cell 2 1 cal-grpo-g4x4 Qwen/Qwen3.5-4B 0
-    cell 2 1 cal-hetero    Qwen/Qwen3.5-4B 0
-    cell 2 1 cal-grpo-g8   Qwen/Qwen3-4B   0
+    run_cell 2 1 cal-grpo-g8   Qwen/Qwen3.5-4B 0
+    run_cell 2 1 cal-grpo-g16  Qwen/Qwen3.5-4B 0
+    run_cell 2 1 cal-grpo-g4x4 Qwen/Qwen3.5-4B 0
+    run_cell 2 1 cal-hetero    Qwen/Qwen3.5-4B 0
+    run_cell 2 1 cal-grpo-g8   Qwen/Qwen3-4B   0
     for g in ${ELLAVOX_GROUPS}; do
-      cell 1 2 cal-ellavox Qwen/Qwen3.5-4B 0 "$g"
+      run_cell 1 2 cal-ellavox Qwen/Qwen3.5-4B 0 "$g"
     done
   else
-    cell 1 2 cal-grpo-g8   Qwen/Qwen3.5-4B 0
-    cell 1 2 cal-grpo-g16  Qwen/Qwen3.5-4B 0
-    cell 1 2 cal-grpo-g4x4 Qwen/Qwen3.5-4B 0
-    cell 1 2 cal-hetero    Qwen/Qwen3.5-4B 0
-    cell 1 2 cal-hetero2   Qwen/Qwen3.5-4B 0
-    cell 1 2 cal-hetero3   Qwen/Qwen3.5-4B 0
-    cell 1 2 cal-grpo-g8   Qwen/Qwen3-4B   0
-    cell 2 1 cal-hetero2   Qwen/Qwen3.5-4B 0
-    cell 2 1 cal-hetero3   Qwen/Qwen3.5-4B 0
+    run_cell 1 2 cal-grpo-g8   Qwen/Qwen3.5-4B 0
+    run_cell 1 2 cal-grpo-g16  Qwen/Qwen3.5-4B 0
+    run_cell 1 2 cal-grpo-g4x4 Qwen/Qwen3.5-4B 0
+    run_cell 1 2 cal-hetero    Qwen/Qwen3.5-4B 0
+    run_cell 1 2 cal-hetero2   Qwen/Qwen3.5-4B 0
+    run_cell 1 2 cal-hetero3   Qwen/Qwen3.5-4B 0
+    run_cell 1 2 cal-grpo-g8   Qwen/Qwen3-4B   0
+    run_cell 2 1 cal-hetero2   Qwen/Qwen3.5-4B 0
+    run_cell 2 1 cal-hetero3   Qwen/Qwen3.5-4B 0
   fi
-  echo "cost-calibration 2gpu (${CELL_SET}): done"
+  echo "cost-calibration 2gpu (${CELL_SET}): done (${failures} failed cells)"
+  [ "${failures}" -eq 0 ]
 
 config:
   kubernetes:

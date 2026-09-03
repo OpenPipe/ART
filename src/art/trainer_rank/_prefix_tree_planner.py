@@ -753,6 +753,7 @@ def select_prefix_tree_layout(
     refinement_work_budget: int,
     tp_size: int = 1,
     gdn_layers: int | None = None,
+    coefficient_version: int | None = None,
 ):
     """Production layout selection for one canonical tree.
 
@@ -762,7 +763,11 @@ def select_prefix_tree_layout(
     ``gdn_layers`` defaults to ``layers`` when the model uses GDN.
     """
 
-    from ._planner_cost import prefix_tree_layout_score
+    from ._planner_cost import COEFFICIENT_VERSION, prefix_tree_layout_score
+
+    version = (
+        COEFFICIENT_VERSION if coefficient_version is None else coefficient_version
+    )
 
     def scorer(layout: PrefixTreeLayout) -> tuple[int, ...]:
         return prefix_tree_layout_score(
@@ -772,6 +777,7 @@ def select_prefix_tree_layout(
             uses_gdn=uses_gdn,
             tp_size=tp_size,
             gdn_layers=gdn_layers,
+            coefficient_version=version,
         )
 
     return search_prefix_tree_layout(
