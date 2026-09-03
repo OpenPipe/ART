@@ -107,10 +107,9 @@ jobs:
                   "-c",
                   "import torch, vllm; "
                   "from art_vllm_runtime.fast_metrics import FastMetricsSharedWriter; "
-                  "from art_vllm_runtime.policy_spans import "
-                  "_patch_lora_update_coordinator; "
+                  "from art_vllm_runtime.patches import apply_vllm_runtime_patches; "
                   "writer = FastMetricsSharedWriter(); writer.close(); "
-                  "_patch_lora_update_coordinator(); "
+                  "apply_vllm_runtime_patches(); "
                   "print('runtime compatibility ok')",
               ],
               check=True,
