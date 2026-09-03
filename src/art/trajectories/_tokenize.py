@@ -599,7 +599,7 @@ def _response_output_mask(
                 and source is not None
                 and _source_is_sampled(source)
             ):
-                result[start:end] = [True] * (end - start)
+                result[start:end] = assistant_mask[start:end]
         # A direct content render can gain one template-owned role stop above.
         # Attribute that tail to the final assistant response without merging
         # adjacent assistant messages with different provenance.
@@ -2579,7 +2579,7 @@ def _tokenize_exchange_trajectory(
         )
         completion_flag |= TokenFlag.OUTPUT
         if completion_is_exact:
-            completion_flag |= TokenFlag.EXACT | TokenFlag.SAMPLED | TokenFlag.OUTPUT
+            completion_flag |= TokenFlag.EXACT | TokenFlag.SAMPLED
         flags.extend([completion_flag] * len(completion))
         if completion_is_exact:
             source_key = _exchange_sampled_source_key(exchange)

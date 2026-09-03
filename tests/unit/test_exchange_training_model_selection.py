@@ -347,7 +347,9 @@ def test_training_tokenizes_each_exchange_trajectory_once(
     ) -> TokenizedMultiHistoryTrajectory:
         nonlocal public_calls
         public_calls += 1
-        return cast(TokenizedMultiHistoryTrajectory, original_public(self, *args, **kwargs))
+        return cast(
+            TokenizedMultiHistoryTrajectory, original_public(self, *args, **kwargs)
+        )
 
     monkeypatch.setattr(art.Trajectory, "tokenize", counted_public)
     trajectory_groups_to_datums(
@@ -798,6 +800,8 @@ def test_preprocessing_preserves_moe_routes_for_reasoning_stripped_suffix() -> N
     assert len(initial) == 2
     assert len(stripped) == 2
     assert all(result.choice_offsets == [1] for result in initial)
+    # The retained response has a different complete visible prefix after its
+    # reasoning is stripped, so it is independently eligible in this history.
     assert all(result.choice_offsets == [1, 5] for result in stripped)
     assert all(result.assistant_mask == [0, 1, 1, 1, 1] for result in initial)
     assert all(result.assistant_mask == [0, 1, 1, 1, 0, 1, 1] for result in stripped)
