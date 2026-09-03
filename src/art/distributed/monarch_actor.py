@@ -224,7 +224,7 @@ class ArtHostService(Actor):
             ) from error
         return self.host_id
 
-    @resilient_endpoint
+    @resilient_endpoint(concurrent=True)
     async def ensure_megatron_runtime(
         self, require_hybrid_ep: bool, multinode: bool
     ) -> MegatronRuntimeInfo:
