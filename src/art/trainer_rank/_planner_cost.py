@@ -12,8 +12,10 @@ mandatory candidate layout of each cell timed through the public API (forward
 (GDN, 24 of 32 layers) and Qwen3-4B (attention) at TP1/TP2 and CP1/CP2/CP4,
 over hierarchical GRPO shapes, heterogeneous controls and real Ellavox groups.
 Coefficients are a non-negative least-squares fit on within-cell paired timing
-deltas, refined by direct regret minimization, validated on whole held-out
-cells (odd Ellavox groups; whole topologies, shapes and models in ablation).
+deltas, refined by direct regret minimization, fitted on 45 cells and
+evaluated on all 56 (the 11 odd Ellavox groups are the pre-registered holdout;
+whole topologies, shapes and models were withheld in ablations). The table is
+bound to its evidence by ``dev/trainer_rank_cost_calibration_certificate.json``.
 The version-1 constants they replace were hand-set, not fitted.
 
 What the data showed: the cost of a shared prefix level is a GDN effect that
@@ -350,24 +352,35 @@ def score_terms(
 
 @dataclass(frozen=True, slots=True)
 class CalibrationProfile:
-    """The capability domain the fitted table was measured on.
+    """The capability domain the fitted table was measured on — exactly.
 
-    Capability-based, never model-name-based: the campaign ran on Hopper
-    (compute capability 9.0) in bf16 on ~4B dense-attention and GDN models
-    (hidden size 2,560), at TP1/TP2 and CP1/CP2/CP4. Outside this domain the
-    token-versus-boundary economics are unmeasured, so the selector keeps the
-    previous scorer rather than extrapolating.
+    Capability-based, never model-name-based, and narrowed to what the
+    certificate actually contains: H200-class Hopper devices (compute
+    capability 9.0 *and* an HBM3e-sized memory system, which separates H200
+    from the 80 GB H100 that shares the capability), bf16 parameters, hidden
+    size 2,560 (Qwen3.5-4B GDN and Qwen3-4B attention), dense (non-MoE)
+    models, at TP1/TP2 and CP1/CP2/CP4. Hidden size is not a score feature,
+    so every admitted width would get identical token-versus-boundary
+    economics; only measured widths are admitted. Outside this domain the
+    selector keeps the version-1 score. Extending the domain means running
+    the calibration cells on the new device or width and regenerating the
+    certificate, which the certificate test binds to these fields.
     """
 
     device_capabilities: tuple[tuple[int, int], ...] = ((9, 0),)
+    # H200 reports ~143 GB; H100 (80 GB) is excluded by this bound.
+    min_device_memory_bytes: int = 120 * 1024**3
     param_dtypes: tuple[str, ...] = ("torch.bfloat16",)
-    hidden_size_range: tuple[int, int] = (2_048, 3_072)
+    hidden_sizes: tuple[int, ...] = (2_560,)
     allow_moe: bool = False
+    # Documentation of the measured devices; matching never reads names.
+    measured_device_names: tuple[str, ...] = ("NVIDIA H200",)
 
     def matches(
         self,
         *,
         device_capability: tuple[int, int] | None,
+        device_memory_bytes: int | None,
         param_dtype: str,
         hidden_size: int,
         is_moe: bool,
@@ -376,10 +389,13 @@ class CalibrationProfile:
             tuple(device_capability) not in self.device_capabilities
         ):
             return False
+        if device_memory_bytes is not None and (
+            device_memory_bytes < self.min_device_memory_bytes
+        ):
+            return False
         if param_dtype not in self.param_dtypes:
             return False
-        low, high = self.hidden_size_range
-        if not low <= hidden_size <= high:
+        if hidden_size not in self.hidden_sizes:
             return False
         return self.allow_moe or not is_moe
 
@@ -393,19 +409,22 @@ def coefficient_version_for(
     param_dtype: str,
     hidden_size: int,
     is_moe: bool,
+    device_memory_bytes: int | None = None,
 ) -> int:
     """Pick the score version for a runtime: the fitted table inside its
     calibrated capability profile, the fallback outside it.
 
     ``device_capability`` is ``None`` when the model is not on a CUDA device
     (CPU-only planning, as in the unit tests); such runtimes use the fitted
-    table, since the profile describes GPU execution.
+    table, since the profile describes GPU execution. On CUDA both the
+    capability and the device memory size are checked.
     """
 
     if device_capability is None:
         return COEFFICIENT_VERSION
     inside = CALIBRATION_PROFILE.matches(
         device_capability=device_capability,
+        device_memory_bytes=device_memory_bytes,
         param_dtype=param_dtype,
         hidden_size=hidden_size,
         is_moe=is_moe,

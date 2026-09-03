@@ -127,10 +127,10 @@ What the data showed:
 
 Gates (held-out cells, noise-qualified): pairwise ordering ≥ 90% on pairs
 separated by more than 3%, median regret ≤ 2%, p95 ≤ 5%, none above 10%,
-clear winners selected within 5%. Measured on the 56 calibration cells (3,844
-within-cell pairs): the fitted table ranks 98.1% of separated pairs
-correctly, p95 regret 2.9%, max 4.2%, no clear misses; the pre-registered
-holdout (the odd Ellavox groups, 11 cells) passes. Ablations withholding
+clear winners selected within 5%. The table is fitted on 45 cells and
+evaluated on all 56 (3,844 within-cell pairs; the 11 odd Ellavox groups are
+the pre-registered holdout): it ranks 98.1% of separated pairs correctly, p95
+regret 2.9%, max 4.2%, no clear misses; the holdout passes. Ablations withholding
 every TP2 cell, every CP2 cell, or the whole attention model pass; withholding
 every heterogeneous cell misranks one CP4 heterogeneous cell by 9.5%, and
 withholding every CP4 cell does not extrapolate (25%), so those cells stay in
@@ -139,6 +139,17 @@ real selector on the 18 later cells, was already within 4.2% everywhere, and
 the production selection timed in the later CP2/TP2 cells had median regret
 −0.2%, max 0.4%. The hand-set version-1 score on the same 56 cells: 78.6%
 pairwise, max regret 67% (an Ellavox group at CP2).
+
+Calibrated domain: the table applies only inside `CalibrationProfile`, which
+is narrowed to exactly what the certificate measured and bound to it by test —
+compute capability 9.0 with an H200-class memory system (the 80 GB H100 shares
+the capability and is excluded by device memory), bf16, hidden size 2,560,
+dense models; everything else keeps the version-1 score (kept verbatim) with a
+one-time warning. `dev/trainer_rank_cost_calibration_manifest.json` lists the
+exact cells each recipe launches; the fitter's `--manifest` validation requires
+every non-excluded cell to be present and complete, rejects unexpected cells
+and duplicate cells with differing execution fingerprints, and the certificate
+test asserts the 56 retained identities plus the two explicit exclusions.
 
 Landing gates re-derived: the sealed win-cell shape still selects deep sharing
 (prompt-level sharing at CP4, where it measures fastest; full sharing at CP1),

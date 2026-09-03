@@ -74,3 +74,73 @@ def test_evaluate_reports_regret_of_a_wrong_selection() -> None:
     assert abs(report["max_regret_pct"] - 20.0) < 1e-9
     assert report["clear_misses"] == ["c"]
     assert fit.gates_pass(report)
+
+
+def test_manifest_validation_flags_missing_unexpected_and_mixed_cells(
+    tmp_path: Path,
+) -> None:
+    """A whole missing cell, an unexpected cell, and duplicate cells with
+    different execution fingerprints must all fail manifest validation."""
+
+    import json
+
+    def cell_row(cell: str, group: int, *, source: str = "s1") -> dict[str, object]:
+        return {
+            "record_type": "calibration_cell",
+            "cell": cell,
+            "model": "Qwen/Qwen3.5-4B",
+            "layers": 32,
+            "tp": 1,
+            "cp": 1,
+            "workload": {"group": group},
+            "source": source,
+            "requests_sha256": f"w{group}",
+            "device": "NVIDIA H200",
+            "param_dtype": "torch.bfloat16",
+            "hidden_size": 2560,
+            "candidates": [],
+        }
+
+    evidence = tmp_path / "evidence.jsonl"
+    evidence.write_text(
+        "\n".join(
+            json.dumps(row)
+            for row in (
+                cell_row("cal-ellavox", 0),
+                cell_row("cal-ellavox", 0, source="s2"),  # same key, other source
+                cell_row("cal-ellavox", 9),  # not in the manifest
+            )
+        )
+        + "\n"
+    )
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "schema": fit.MANIFEST_SCHEMA,
+                "cells": [
+                    {"key": "cal-ellavox|Qwen/Qwen3.5-4B|L32|tp1|cp1|g0"},
+                    {"key": "cal-ellavox|Qwen/Qwen3.5-4B|L32|tp1|cp1|g1"},
+                    {"key": "cal-ellavox|Qwen/Qwen3.5-4B|L32|tp1|cp1|g2"},
+                ],
+                "excluded": [{"key": "cal-ellavox|Qwen/Qwen3.5-4B|L32|tp1|cp1|g2"}],
+            }
+        )
+    )
+    problems, excluded = fit.validate_manifest(
+        [evidence], manifest, excluded=["cp1|g2"]
+    )
+    assert excluded == ["cal-ellavox|Qwen/Qwen3.5-4B|L32|tp1|cp1|g2"]
+    joined = "\n".join(problems)
+    assert (
+        "expected cell missing from the evidence: cal-ellavox|Qwen/Qwen3.5-4B|L32|tp1|cp1|g1"
+        in joined
+    )
+    assert (
+        "unexpected cell in the evidence: cal-ellavox|Qwen/Qwen3.5-4B|L32|tp1|cp1|g9"
+        in joined
+    )
+    assert "different execution fingerprints" in joined
+    # An exclusion that the manifest does not list is itself a problem.
+    problems, _ = fit.validate_manifest([evidence], manifest, excluded=["cp1|g0"])
+    assert any("not listed in the manifest" in p for p in problems)

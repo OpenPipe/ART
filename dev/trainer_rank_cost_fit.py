@@ -173,6 +173,60 @@ def validate_completeness(paths: list[Path], *, repeat: int) -> list[str]:
     return gaps
 
 
+MANIFEST_SCHEMA = "art.dev.trainer_rank_cost_calibration_manifest.v1"
+FINGERPRINT_FIELDS = (
+    "source",
+    "requests_sha256",
+    "device",
+    "param_dtype",
+    "hidden_size",
+)
+
+
+def cell_fingerprints(paths: list[Path]) -> dict[str, set[tuple[Any, ...]]]:
+    """Distinct execution fingerprints recorded per cell key across the evidence."""
+
+    seen: dict[str, set[tuple[Any, ...]]] = defaultdict(set)
+    for path in paths:
+        for line in path.read_text().splitlines():
+            if not line.strip():
+                continue
+            row = json.loads(line)
+            if row.get("record_type") == "calibration_cell":
+                seen[_cell_key(row)].add(tuple(row.get(k) for k in FINGERPRINT_FIELDS))
+    return seen
+
+
+def validate_manifest(
+    paths: list[Path], manifest_path: Path, *, excluded: list[str]
+) -> tuple[list[str], list[str]]:
+    """Exact cell identities: every expected cell present unless excluded, no
+    unexpected cells, exclusions listed in the manifest, and one execution
+    fingerprint per cell. Returns (problems, resolved excluded keys)."""
+
+    manifest = json.loads(manifest_path.read_text())
+    if manifest.get("schema") != MANIFEST_SCHEMA:
+        raise ValueError("unknown manifest schema")
+    expected = {cell["key"] for cell in manifest["cells"]}
+    listed_exclusions = {cell["key"] for cell in manifest["excluded"]}
+    present = cell_fingerprints(paths)
+    problems: list[str] = []
+    excluded_keys = {key for key in expected if any(p in key for p in excluded)}
+    for key in sorted(excluded_keys - listed_exclusions):
+        problems.append(f"excluded cell is not listed in the manifest: {key}")
+    for key in sorted(expected - excluded_keys - set(present)):
+        problems.append(f"expected cell missing from the evidence: {key}")
+    for key in sorted(set(present) - expected):
+        problems.append(f"unexpected cell in the evidence: {key}")
+    for key, prints in sorted(present.items()):
+        if len(prints) > 1 and key not in excluded_keys:
+            problems.append(
+                f"cell recorded with {len(prints)} different execution fingerprints "
+                f"(source/workload/device/dtype/hidden): {key}"
+            )
+    return problems, sorted(excluded_keys)
+
+
 CERTIFICATE_SCHEMA = "art.dev.trainer_rank_cost_calibration_certificate.v1"
 
 
@@ -184,6 +238,7 @@ def export_certificate(
     arguments: dict[str, Any],
     integer_table: dict[str, int],
     report: dict[str, Any],
+    manifest: dict[str, Any] | None = None,
 ) -> None:
     """Write the compact, reproducible record binding the table to its data.
 
@@ -234,9 +289,16 @@ def export_certificate(
     table_hash = hashlib.sha256(
         json.dumps(integer_table, sort_keys=True).encode()
     ).hexdigest()
+    envelope = {
+        "device_names": sorted({str(c.get("device")) for c in cells}),
+        "param_dtypes": sorted({str(c.get("param_dtype")) for c in cells}),
+        "hidden_sizes": sorted({int(c.get("hidden_size") or 0) for c in cells}),
+    }
     payload = {
         "schema": CERTIFICATE_SCHEMA,
         "fit_arguments": arguments,
+        "manifest": manifest,
+        "measured_envelope": envelope,
         "cells": cells,
         "integer_table_milli_us": integer_table,
         "integer_table_sha256": table_hash,
@@ -780,6 +842,14 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--manifest",
+        default="",
+        help=(
+            "expected-cell manifest (JSON): every listed cell must be present unless "
+            "excluded, no unexpected cells, one execution fingerprint per cell"
+        ),
+    )
+    parser.add_argument(
         "--require-complete",
         type=int,
         default=0,
@@ -824,6 +894,26 @@ def main() -> None:
     def excluded_cell(cell: str) -> bool:
         return any(p in cell for p in excluded)
 
+    manifest_record: dict[str, Any] | None = None
+    if arguments.manifest:
+        problems, excluded_keys = validate_manifest(
+            arguments.evidence, Path(arguments.manifest), excluded=excluded
+        )
+        if problems:
+            print("manifest validation failed:", file=sys.stderr)
+            for problem in problems:
+                print("  -", problem, file=sys.stderr)
+            raise SystemExit(1)
+        manifest_payload = json.loads(Path(arguments.manifest).read_text())
+        manifest_record = {
+            "path": Path(arguments.manifest).name,
+            "expected": [cell["key"] for cell in manifest_payload["cells"]],
+            "excluded": excluded_keys,
+        }
+        print(
+            f"manifest ok: {len(manifest_record['expected'])} expected cells, "
+            f"{len(excluded_keys)} excluded, identities and fingerprints consistent"
+        )
     if arguments.require_complete:
         gaps = [
             gap
@@ -953,6 +1043,7 @@ def main() -> None:
             },
             integer_table=report["integer_terms_milli_us"],
             report=report,
+            manifest=manifest_record,
         )
         print("certificate written:", arguments.export_certificate)
 

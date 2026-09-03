@@ -16,10 +16,14 @@ from art.trainer_rank._prefix_tree_planner import (
     prefix_tree_layout_candidates,
 )
 
+H200_MEMORY_BYTES = 143 * 1024**3
+H100_MEMORY_BYTES = 80 * 1024**3
+
 
 def _version(
     *,
     device_capability: tuple[int, int] | None = (9, 0),
+    device_memory_bytes: int | None = H200_MEMORY_BYTES,
     param_dtype: str = "torch.bfloat16",
     hidden_size: int = 2_560,
     is_moe: bool = False,
@@ -28,6 +32,7 @@ def _version(
 
     return coefficient_version_for(
         device_capability=device_capability,
+        device_memory_bytes=device_memory_bytes,
         param_dtype=param_dtype,
         hidden_size=hidden_size,
         is_moe=is_moe,
@@ -38,6 +43,7 @@ def test_profile_admits_the_measured_configuration() -> None:
     assert _version() == COEFFICIENT_VERSION
     assert CALIBRATION_PROFILE.matches(
         device_capability=(9, 0),
+        device_memory_bytes=H200_MEMORY_BYTES,
         param_dtype="torch.bfloat16",
         hidden_size=2_560,
         is_moe=False,
@@ -45,13 +51,20 @@ def test_profile_admits_the_measured_configuration() -> None:
 
 
 def test_profile_falls_back_outside_its_domain() -> None:
-    # Ampere (unmeasured GPU class), fp16, a 0.6B-class width, an 8B-class
-    # width, and mixture-of-experts each leave the calibrated domain.
+    # Ampere (unmeasured GPU class); H100 (shares the 9.0 capability but not
+    # the H200 memory system); fp16; unmeasured widths, including the
+    # neighbouring 2,048 and 3,072 (hidden size is not a score feature, so only
+    # the measured 2,560 is admitted); and mixture-of-experts.
     assert _version(device_capability=(8, 0)) == COEFFICIENT_VERSION_FALLBACK
+    assert (
+        _version(device_memory_bytes=H100_MEMORY_BYTES) == COEFFICIENT_VERSION_FALLBACK
+    )
     assert _version(param_dtype="torch.float16") == COEFFICIENT_VERSION_FALLBACK
-    assert _version(hidden_size=1_024) == COEFFICIENT_VERSION_FALLBACK
-    assert _version(hidden_size=4_096) == COEFFICIENT_VERSION_FALLBACK
+    for hidden in (1_024, 2_048, 3_072, 4_096):
+        assert _version(hidden_size=hidden) == COEFFICIENT_VERSION_FALLBACK, hidden
     assert _version(is_moe=True) == COEFFICIENT_VERSION_FALLBACK
+    # Memory unknown (older driver): the capability check alone applies.
+    assert _version(device_memory_bytes=None) == COEFFICIENT_VERSION
 
 
 def test_cpu_only_planning_uses_the_fitted_table() -> None:

@@ -1132,11 +1132,13 @@ class TrainerRank:
         # The fitted layout cost model applies only inside the capability
         # profile it was calibrated on; other runtimes keep the previous score.
         parameter = next(runtime.model[0].parameters())
-        capability: tuple[int, int] | None = (
-            torch.cuda.get_device_capability(parameter.device)
-            if parameter.device.type == "cuda"
-            else None
-        )
+        capability: tuple[int, int] | None = None
+        device_memory: int | None = None
+        if parameter.device.type == "cuda":
+            capability = torch.cuda.get_device_capability(parameter.device)
+            device_memory = int(
+                torch.cuda.get_device_properties(parameter.device).total_memory
+            )
         spec = getattr(runtime, "model_support_spec", None)
         is_moe = bool(
             getattr(spec, "is_moe", False)
@@ -1144,16 +1146,18 @@ class TrainerRank:
         )
         self._coefficient_version = coefficient_version_for(
             device_capability=capability,
+            device_memory_bytes=device_memory,
             param_dtype=str(parameter.dtype),
             hidden_size=int(self._hidden_size),
             is_moe=is_moe,
         )
         if self._coefficient_version != 2:
             logger.warning(
-                "TrainerRank layout cost model: runtime (capability=%s, dtype=%s, "
-                "hidden=%s, moe=%s) is outside the calibrated profile; using the "
-                "version-%d score",
+                "TrainerRank layout cost model: runtime (capability=%s, device "
+                "memory=%s, dtype=%s, hidden=%s, moe=%s) is outside the calibrated "
+                "profile; using the version-%d score",
                 capability,
+                device_memory,
                 parameter.dtype,
                 self._hidden_size,
                 is_moe,

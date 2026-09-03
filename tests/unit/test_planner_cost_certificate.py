@@ -20,10 +20,11 @@ import sys
 
 import numpy as np
 
-from art.trainer_rank._planner_cost import COEFFICIENTS_MILLI_US
+from art.trainer_rank._planner_cost import CALIBRATION_PROFILE, COEFFICIENTS_MILLI_US
 
 _ROOT = Path(__file__).resolve().parents[2]
 _CERTIFICATE = _ROOT / "dev" / "trainer_rank_cost_calibration_certificate.json"
+_MANIFEST = _ROOT / "dev" / "trainer_rank_cost_calibration_manifest.json"
 _spec = importlib.util.spec_from_file_location(
     "trainer_rank_cost_fit", _ROOT / "dev" / "trainer_rank_cost_fit.py"
 )
@@ -49,7 +50,7 @@ def test_certified_metrics_hold_on_the_recorded_aggregates() -> None:
     beta = np.asarray([COEFFICIENTS_MILLI_US[name] / 1_000.0 for name in terms])
     report = fit.evaluate(candidates, fit.predict(candidates, terms, beta))
     recorded = payload["metrics"]["integer_all"]
-    assert report["cells"] == recorded["cells"] >= 50
+    assert report["cells"] == recorded["cells"] == len(payload["cells"])
     assert report["ordered_pairs"] == recorded["ordered_pairs"]
     assert abs(report["pairwise_accuracy"] - recorded["pairwise_accuracy"]) < 1e-9
     assert abs(report["max_regret_pct"] - recorded["max_regret_pct"]) < 1e-9
@@ -83,3 +84,50 @@ def test_full_refit_reproduces_the_table_when_requested() -> None:
         name: int(round(value * 1_000)) for name, value in zip(terms, beta, strict=True)
     }
     assert table == payload["integer_table_milli_us"]
+
+
+def test_certificate_holds_exactly_the_manifest_cells() -> None:
+    """Exact cell identities: every expected cell minus the explicit exclusions."""
+
+    payload = json.loads(_CERTIFICATE.read_text())
+    manifest = json.loads(_MANIFEST.read_text())
+    expected = {cell["key"] for cell in manifest["cells"]}
+    excluded = {cell["key"] for cell in manifest["excluded"]}
+    assert excluded <= expected
+    certified = {cell["cell"] for cell in payload["cells"]}
+    assert certified == expected - excluded
+    assert len(certified) == 56 and len(excluded) == 2
+    assert set(payload["manifest"]["excluded"]) == excluded
+    assert payload["manifest"]["path"] == _MANIFEST.name
+    # Every retained cell carries its execution fingerprints.
+    for cell in payload["cells"]:
+        for key in (
+            "source",
+            "requests_sha256",
+            "device",
+            "param_dtype",
+            "hidden_size",
+        ):
+            assert cell.get(key) not in (None, ""), (cell["cell"], key)
+
+
+def test_profile_envelope_is_bound_to_the_certified_evidence() -> None:
+    """The admitted domain is exactly what the certificate measured."""
+
+    payload = json.loads(_CERTIFICATE.read_text())
+    devices = {cell["device"] for cell in payload["cells"]}
+    dtypes = {cell["param_dtype"] for cell in payload["cells"]}
+    hidden = {int(cell["hidden_size"]) for cell in payload["cells"]}
+    assert set(CALIBRATION_PROFILE.measured_device_names) == devices
+    assert set(CALIBRATION_PROFILE.param_dtypes) == dtypes
+    assert set(CALIBRATION_PROFILE.hidden_sizes) == hidden
+    assert payload["measured_envelope"] == {
+        "device_names": sorted(devices),
+        "param_dtypes": sorted(dtypes),
+        "hidden_sizes": sorted(hidden),
+    }
+    assert not CALIBRATION_PROFILE.allow_moe
+    assert all(float(cell["facts"]["tp"]) in (1.0, 2.0) for cell in payload["cells"])
+    assert all(
+        float(cell["facts"]["cp"]) in (1.0, 2.0, 4.0) for cell in payload["cells"]
+    )

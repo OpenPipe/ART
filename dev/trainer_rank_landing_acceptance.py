@@ -2075,6 +2075,12 @@ def phase_cost_calibrate(
             "hidden_size": int(rank._hidden_size),
             "param_dtype": str(next(runtime.model[0].parameters()).dtype),
             "device": torch.cuda.get_device_name(),
+            "device_capability": list(torch.cuda.get_device_capability()),
+            "device_total_memory_bytes": int(
+                torch.cuda.get_device_properties(
+                    torch.cuda.current_device()
+                ).total_memory
+            ),
         }
         tree = build_canonical_prefix_tree(
             tuple(r.input_tokens.reshape(-1).to(torch.long) for r in requests)
