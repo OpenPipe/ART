@@ -1131,6 +1131,31 @@ def _gather_objects(value: Any, group: Any = None) -> list[Any]:
     return values
 
 
+def _hybridep_telemetry(rank: Any) -> dict[str, Any]:
+    """HybridEP facts of the last forward on MoE runtimes under expert
+    parallelism: the largest per-rank row count TrainerRank configured (its
+    high-water mark) and the live buffer's token capacity per rank. Both are
+    ``None`` without expert parallelism."""
+
+    try:
+        from megatron.core import parallel_state as ps
+        from megatron.core.transformer.moe import fused_a2a
+    except ImportError:
+        return {"hybridep_rows_high_water": None, "hybridep_capacity_rows": None}
+    if int(ps.get_expert_model_parallel_world_size()) <= 1:
+        return {"hybridep_rows_high_water": None, "hybridep_capacity_rows": None}
+    buffer = getattr(fused_a2a, "_hybrid_ep_buffer", None)
+    capacity = (
+        int(buffer.configurer.buffer_config.max_num_of_tokens_per_rank)
+        if buffer is not None
+        else None
+    )
+    return {
+        "hybridep_rows_high_water": int(getattr(rank, "_hybridep_rows_high_water", 0)),
+        "hybridep_capacity_rows": capacity,
+    }
+
+
 def _merge_rank_statuses(gathered: list[list[str]]) -> list[str]:
     return sorted({str(status) for statuses in gathered for status in statuses})
 
@@ -2296,6 +2321,7 @@ def phase_cost_calibrate(
                 "subforward_count": int(telemetry["subforward_count"]),
                 "peak_allocated_bytes": int(torch.cuda.max_memory_allocated()),
                 "loss": float(loss.detach().float().item()),
+                **_hybridep_telemetry(rank),
             }
             del outputs, loss
             rank.zero_grad()
