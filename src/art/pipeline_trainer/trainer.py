@@ -1468,7 +1468,6 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
         if post_train_dispatch is not None:
             post_train_dispatch.set()
         await self._await_post_train(post_train_task)
-        self.state.done = True
         self._accept_prepared_batches = False
         if isinstance(self._output_queue, DistributedTrajectoryQueue):
             await self._output_queue.finish()
