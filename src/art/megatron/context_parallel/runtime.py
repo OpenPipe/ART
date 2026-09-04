@@ -7,6 +7,7 @@ import json
 from threading import Lock
 from typing import Any, cast
 
+import numpy as np
 from pydantic import BaseModel
 import torch
 
@@ -37,7 +38,6 @@ from .types import (
     TrainingMicrobatchWorkload,
 )
 
-_CHUNK_MASK_STATS_TORCH_THRESHOLD = 1024
 _CP4_SEARCH_PROBE_CANDIDATE_LIMIT = 2
 _CP4_SEARCH_PROBE_IMPROVEMENT_MS = 1.0
 _PLAN_CACHE_MAX_ENTRIES = 128
@@ -472,7 +472,7 @@ def _best_improving_move(
     cp_size: int,
     q_weights: list[float],
     candidate_limit: int,
-    evaluate_candidate: Any,
+    evaluate_candidates: Any,
 ) -> tuple[tuple[int, ...], dict[str, Any]] | None:
     slow_rank = int(
         max(
@@ -489,7 +489,7 @@ def _best_improving_move(
     if not candidate_chunks:
         return None
 
-    best_move: tuple[tuple[int, ...], dict[str, Any]] | None = None
+    moves: list[tuple[int, ...]] = []
     for chunk_index in candidate_chunks:
         for dst_rank in range(cp_size):
             if dst_rank == slow_rank:
@@ -502,16 +502,19 @@ def _best_improving_move(
                 and len(set(candidate_owners)) != cp_size
             ):
                 continue
-            candidate_eval = evaluate_candidate(
-                owners=candidate_owners,
-                wave_assignment=wave_assignment,
-            )
-            if float(candidate_eval["score"]) + 1e-9 >= float(current_eval["score"]):
-                continue
-            if best_move is None or float(candidate_eval["score"]) + 1e-9 < float(
-                best_move[1]["score"]
-            ):
-                best_move = (candidate_owners, candidate_eval)
+            moves.append(candidate_owners)
+    evaluations = evaluate_candidates(
+        owners_list=moves,
+        wave_assignment=wave_assignment,
+    )
+    best_move: tuple[tuple[int, ...], dict[str, Any]] | None = None
+    for candidate_owners, candidate_eval in zip(moves, evaluations, strict=True):
+        if float(candidate_eval["score"]) + 1e-9 >= float(current_eval["score"]):
+            continue
+        if best_move is None or float(candidate_eval["score"]) + 1e-9 < float(
+            best_move[1]["score"]
+        ):
+            best_move = (candidate_owners, candidate_eval)
     return best_move
 
 
@@ -910,37 +913,55 @@ def _ranges_size(ranges: tuple[TokenRange, ...]) -> int:
     return int(sum(range_.size() for range_ in ranges))
 
 
-def _chunk_mask_stats(
+@dataclass(frozen=True)
+class _PairProgram:
+    """The chunk pair program as the plan evaluator consumes it.
+
+    Pair counts and their positivity are float64 matrices: every value is an
+    integer far below 2**53, so the BLAS-backed products below are exact, and
+    the evaluator only ever compares them with zero or converts them back to
+    ``int``.
+    """
+
+    pair_counts: np.ndarray
+    pair_positive: np.ndarray
+    chunk_lengths: np.ndarray
+
+
+def _pair_program(
+    pair_matrix: list[list[int]] | torch.Tensor,
     *,
-    chunk_lengths: tuple[int, ...],
-    chunk_mask: torch.Tensor,
-    chunk_lengths_tensor: torch.Tensor | None = None,
-) -> tuple[int, int]:
-    if (
-        chunk_lengths_tensor is not None
-        and len(chunk_lengths) >= _CHUNK_MASK_STATS_TORCH_THRESHOLD
-    ):
-        if int(chunk_mask.numel()) == 0 or not bool(chunk_mask.any().item()):
-            return 0, 0
-        token_count = int(chunk_lengths_tensor[chunk_mask].sum().item())
-        run_starts = chunk_mask.clone()
-        run_starts[1:] = torch.logical_and(
-            run_starts[1:], torch.logical_not(chunk_mask[:-1])
-        )
-        range_count = int(run_starts.sum().item())
-        return token_count, range_count
-    token_count = 0
-    range_count = 0
-    in_run = False
-    for is_set, length in zip(chunk_mask.tolist(), chunk_lengths, strict=True):
-        if bool(is_set):
-            token_count += int(length)
-            if not in_run:
-                range_count += 1
-                in_run = True
-            continue
-        in_run = False
-    return token_count, range_count
+    chunk_ranges: tuple[TokenRange, ...],
+) -> _PairProgram:
+    chunk_count = len(chunk_ranges)
+    counts = (
+        pair_matrix.to(torch.float64).numpy()
+        if isinstance(pair_matrix, torch.Tensor)
+        else np.asarray(pair_matrix, dtype=np.float64)
+    ).reshape(chunk_count, chunk_count)
+    return _PairProgram(
+        pair_counts=counts,
+        pair_positive=(counts > 0).astype(np.float64),
+        chunk_lengths=np.asarray(
+            [int(range_.size()) for range_ in chunk_ranges], dtype=np.int64
+        ),
+    )
+
+
+def _mask_token_and_range_counts(
+    masks: np.ndarray,
+    chunk_lengths: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """For every chunk mask along the last axis: the tokens it covers and the
+    number of contiguous chunk runs it consists of."""
+
+    tokens = masks.astype(np.int64) @ chunk_lengths
+    if masks.shape[-1] == 0:
+        return tokens, np.zeros(masks.shape[:-1], dtype=np.int64)
+    runs = masks[..., 0].astype(np.int64) + (masks[..., 1:] & ~masks[..., :-1]).sum(
+        axis=-1, dtype=np.int64
+    )
+    return tokens, runs
 
 
 def _stage_cost_ms(
@@ -1057,267 +1078,292 @@ def _simulate_backward_time_ms(
     return max(current_time, max(reduce_ready_times, default=0.0))
 
 
+def _stage_cost_ms_array(
+    *,
+    pair_count: np.ndarray,
+    q_tokens: np.ndarray,
+    k_tokens: np.ndarray,
+    q_range_count: np.ndarray,
+    k_range_count: np.ndarray,
+    config: ContextParallelConfig,
+    backward: bool,
+    local: bool,
+) -> np.ndarray:
+    """``_stage_cost_ms`` over arrays of integer-valued float64 counts, term by
+    term in the same order, so every element equals the scalar formula."""
+
+    pair_ms = (
+        config.planner_local_backward_pair_ms
+        if backward and local
+        else (
+            config.planner_remote_backward_pair_ms
+            if backward
+            else (
+                config.planner_local_pair_ms if local else config.planner_remote_pair_ms
+            )
+        )
+    )
+    remote_underfill_ms = np.zeros_like(pair_count)
+    if not local:
+        token_floor = int(config.planner_remote_stage_token_floor)
+        pair_floor = int(config.planner_remote_stage_pair_floor)
+        token_shortfall = np.maximum(token_floor - np.minimum(q_tokens, k_tokens), 0.0)
+        pair_shortfall = np.maximum(pair_floor - pair_count, 0.0)
+        token_scale = (
+            token_shortfall / float(token_floor)
+            if token_floor > 0
+            else np.zeros_like(pair_count)
+        )
+        pair_scale = (
+            pair_shortfall / float(pair_floor)
+            if pair_floor > 0
+            else np.zeros_like(pair_count)
+        )
+        remote_underfill_ms = np.where(
+            (pair_count > 0) | (q_tokens > 0) | (k_tokens > 0),
+            float(config.planner_remote_stage_underfill_ms)
+            * np.maximum(token_scale, pair_scale),
+            0.0,
+        )
+    return (
+        float(config.planner_stage_overhead_ms)
+        + pair_count * float(pair_ms)
+        + q_tokens * float(config.planner_merge_q_token_ms)
+        + (q_range_count + k_range_count) * float(config.planner_interval_overhead_ms)
+        + remote_underfill_ms
+    )
+
+
+def _comm_cost_ms_array(
+    *,
+    tokens: np.ndarray,
+    range_count: np.ndarray,
+    config: ContextParallelConfig,
+    backward: bool,
+) -> np.ndarray:
+    per_token = (
+        float(config.planner_reduce_token_ms)
+        if backward
+        else float(config.planner_fetch_token_ms)
+    )
+    return np.where(
+        (tokens <= 0) & (range_count <= 0),
+        0.0,
+        float(config.planner_comm_stage_overhead_ms)
+        + tokens * per_token
+        + range_count * float(config.planner_interval_overhead_ms),
+    )
+
+
+def _simulate_forward_time_ms_array(
+    *,
+    local_stage_ms: np.ndarray,
+    remote_stage_ms: np.ndarray,
+    remote_fetch_ms: np.ndarray,
+    active: np.ndarray,
+) -> np.ndarray:
+    """``_simulate_forward_time_ms`` over (..., wave) arrays whose inactive
+    waves are skipped exactly as the scalar version skips absent stages."""
+
+    wave_count = active.shape[-1]
+    # The fetch of the next active wave after each wave (a reverse scan).
+    next_fetch = np.zeros_like(remote_fetch_ms)
+    has_next = np.zeros(active.shape, dtype=bool)
+    carry_fetch = np.zeros_like(local_stage_ms)
+    carry_has = np.zeros(local_stage_ms.shape, dtype=bool)
+    for wave in reversed(range(wave_count)):
+        next_fetch[..., wave] = carry_fetch
+        has_next[..., wave] = carry_has
+        carry_fetch = np.where(
+            active[..., wave], remote_fetch_ms[..., wave], carry_fetch
+        )
+        carry_has = carry_has | active[..., wave]
+    current = local_stage_ms.copy()
+    fetch_ready = np.zeros_like(local_stage_ms)
+    started = np.zeros(local_stage_ms.shape, dtype=bool)
+    for wave in range(wave_count):
+        is_active = active[..., wave]
+        ready = np.where(started, fetch_ready, remote_fetch_ms[..., wave])
+        compute_start = np.maximum(current, ready)
+        current = np.where(
+            is_active, compute_start + remote_stage_ms[..., wave], current
+        )
+        fetch_ready = np.where(
+            is_active & has_next[..., wave],
+            compute_start + next_fetch[..., wave],
+            fetch_ready,
+        )
+        started = started | is_active
+    return current
+
+
+def _simulate_backward_time_ms_array(
+    *,
+    local_stage_ms: np.ndarray,
+    remote_stage_ms: np.ndarray,
+    remote_reduce_ms: np.ndarray,
+    active: np.ndarray,
+) -> np.ndarray:
+    current = np.zeros_like(local_stage_ms)
+    reduce_ready = np.zeros_like(local_stage_ms)
+    for wave in range(active.shape[-1]):
+        is_active = active[..., wave]
+        current = np.where(is_active, current + remote_stage_ms[..., wave], current)
+        reduce_ready = np.where(
+            is_active,
+            np.maximum(reduce_ready, current + remote_reduce_ms[..., wave]),
+            reduce_ready,
+        )
+    total = current + local_stage_ms
+    return np.where(
+        active.any(axis=-1), np.maximum(total, reduce_ready), local_stage_ms
+    )
+
+
+def _evaluate_plans(
+    *,
+    program: _PairProgram,
+    owners_batch: np.ndarray,
+    wave_assignment: tuple[int, ...],
+    cp_size: int,
+    config: ContextParallelConfig,
+) -> list[dict[str, Any]]:
+    """Predicted per-rank forward and backward time of a batch of chunk
+    assignments (``owners_batch``: candidate x chunk) under one wave assignment.
+
+    The mask algebra (which chunks each rank owns, attends, fetches and sends
+    per wave), the cost formulas and the stage simulations are all vectorized
+    over candidates, ranks, sources and waves; each candidate prices exactly as
+    it would on its own.
+    """
+
+    batch = int(owners_batch.shape[0])
+    chunk_count = int(program.chunk_lengths.shape[0])
+    wave_count = max(wave_assignment, default=0) + 1 if wave_assignment else 0
+    lengths = program.chunk_lengths
+    waves_array = np.asarray(wave_assignment, dtype=np.int64).reshape(chunk_count)
+    # (candidate, rank, chunk): ownership; (wave, chunk): wave membership.
+    owned = owners_batch[:, None, :] == np.arange(cp_size)[None, :, None]
+    in_wave = waves_array[None, :] == np.arange(wave_count)[:, None]
+    owned_f = owned.astype(np.float64)
+    # (candidate, rank, k chunk): pairs between the rank's q chunks and each k chunk.
+    owned_pair_counts = owned_f @ program.pair_counts
+    positive_cols = owned_pair_counts > 0
+    local_pairs = (owned_pair_counts * owned_f).sum(axis=2)
+    local_q = owned & ((owned_f @ program.pair_positive.T) > 0)
+    local_k = owned & positive_cols
+    local_q_tokens, local_q_ranges = _mask_token_and_range_counts(local_q, lengths)
+    local_k_tokens, local_k_ranges = _mask_token_and_range_counts(local_k, lengths)
+
+    not_self = ~np.eye(cp_size, dtype=bool)
+    # (candidate, rank, source, wave, chunk): the source's chunks in this wave
+    # that the rank's queries attend, i.e. what the rank fetches from it.
+    touched_source = (
+        owned[:, None, :, None, :]
+        & in_wave[None, None, None, :, :]
+        & positive_cols[:, :, None, None, :]
+        & not_self[None, :, :, None, None]
+    )
+    request_tokens, request_ranges = _mask_token_and_range_counts(
+        touched_source, lengths
+    )
+    recv_tokens = request_tokens.sum(axis=2)
+    recv_ranges = request_ranges.sum(axis=2)
+    touched = touched_source.any(axis=2)  # (candidate, rank, wave, chunk)
+    touched_f = touched.astype(np.float64)
+    request_pairs = np.einsum("crj,crwj->crw", owned_pair_counts, touched_f)
+    touched_q = owned[:, :, None, :] & ((touched_f @ program.pair_positive.T) > 0)
+    q_tokens, q_ranges = _mask_token_and_range_counts(touched_q, lengths)
+    # (candidate, rank, wave, peer, chunk): the rank's owned chunks in this
+    # wave that the peer's queries attend, i.e. what the rank sends to it.
+    send_mask = (
+        (owned[:, :, None, :] & in_wave[None, None, :, :])[:, :, :, None, :]
+        & positive_cols[:, None, None, :, :]
+        & not_self[None, :, None, :, None]
+    )
+    send_tokens_by_peer, send_ranges_by_peer = _mask_token_and_range_counts(
+        send_mask, lengths
+    )
+    aggregate_tokens, aggregate_ranges = _mask_token_and_range_counts(
+        send_mask.any(axis=3), lengths
+    )
+    send_tokens = send_tokens_by_peer.sum(axis=3) + aggregate_tokens
+    send_ranges = send_ranges_by_peer.sum(axis=3) + aggregate_ranges
+    active = (request_pairs > 0) | (recv_tokens > 0) | (recv_ranges > 0)
+
+    local_costs: dict[str, Any] = dict(
+        pair_count=local_pairs,
+        q_tokens=local_q_tokens.astype(np.float64),
+        k_tokens=local_k_tokens.astype(np.float64),
+        q_range_count=local_q_ranges.astype(np.float64),
+        k_range_count=local_k_ranges.astype(np.float64),
+        config=config,
+        local=True,
+    )
+    local_forward = np.where(
+        local_pairs > 0, _stage_cost_ms_array(backward=False, **local_costs), 0.0
+    )
+    local_backward = np.where(
+        local_pairs > 0, _stage_cost_ms_array(backward=True, **local_costs), 0.0
+    )
+    stage_costs: dict[str, Any] = dict(
+        pair_count=request_pairs,
+        q_tokens=q_tokens.astype(np.float64),
+        k_tokens=recv_tokens.astype(np.float64),
+        q_range_count=q_ranges.astype(np.float64),
+        k_range_count=recv_ranges.astype(np.float64),
+        config=config,
+        local=False,
+    )
+    comm_costs: dict[str, Any] = dict(
+        tokens=np.maximum(send_tokens, recv_tokens).astype(np.float64),
+        range_count=np.maximum(send_ranges, recv_ranges).astype(np.float64),
+        config=config,
+    )
+    forward_ms = _simulate_forward_time_ms_array(
+        local_stage_ms=local_forward,
+        remote_stage_ms=_stage_cost_ms_array(backward=False, **stage_costs),
+        remote_fetch_ms=_comm_cost_ms_array(backward=False, **comm_costs),
+        active=active,
+    )
+    backward_ms = _simulate_backward_time_ms_array(
+        local_stage_ms=local_backward,
+        remote_stage_ms=_stage_cost_ms_array(backward=True, **stage_costs),
+        remote_reduce_ms=_comm_cost_ms_array(backward=True, **comm_costs),
+        active=active,
+    )
+    rank_scores = forward_ms + backward_ms
+    return [
+        {
+            "score": float(rank_scores[index].max()) if cp_size else 0.0,
+            "rank_scores": tuple(float(value) for value in rank_scores[index]),
+            "rank_forward_ms": tuple(float(value) for value in forward_ms[index]),
+            "rank_backward_ms": tuple(float(value) for value in backward_ms[index]),
+        }
+        for index in range(batch)
+    ]
+
+
 def _evaluate_plan(
     *,
-    chunk_ranges: tuple[TokenRange, ...],
-    pair_matrix: list[list[int]] | torch.Tensor,
+    program: _PairProgram,
     owners: tuple[int, ...],
     wave_assignment: tuple[int, ...],
     cp_size: int,
     config: ContextParallelConfig,
-    pair_positive: torch.Tensor | None = None,
-    chunk_lengths: tuple[int, ...] | None = None,
-    chunk_lengths_tensor: torch.Tensor | None = None,
 ) -> dict[str, Any]:
-    rank_scores: list[float] = []
-    rank_forward_ms: list[float] = []
-    rank_backward_ms: list[float] = []
-    chunk_count = len(chunk_ranges)
-    wave_count = max(wave_assignment, default=0) + 1 if wave_assignment else 0
-    pair_counts = (
-        pair_matrix
-        if isinstance(pair_matrix, torch.Tensor) and pair_matrix.dtype == torch.int64
-        else torch.as_tensor(pair_matrix, dtype=torch.int64)
+    """Predicted per-rank forward and backward time of one chunk assignment."""
+
+    owners_batch = np.asarray(owners, dtype=np.int64).reshape(
+        1, int(program.chunk_lengths.shape[0])
     )
-    if pair_positive is None:
-        pair_positive = pair_counts > 0
-    if chunk_lengths is None:
-        chunk_lengths = tuple(int(range_.size()) for range_ in chunk_ranges)
-    if (
-        chunk_lengths_tensor is None
-        and len(chunk_lengths) >= _CHUNK_MASK_STATS_TORCH_THRESHOLD
-    ):
-        chunk_lengths_tensor = torch.tensor(chunk_lengths, dtype=torch.int64)
-    owners_tensor = torch.tensor(owners, dtype=torch.int64)
-    wave_tensor = torch.tensor(
-        wave_assignment,
-        dtype=torch.int64,
-    )
-    owner_masks = [owners_tensor == rank for rank in range(cp_size)]
-    owner_indices = [
-        torch.nonzero(owner_mask, as_tuple=False).flatten()
-        for owner_mask in owner_masks
-    ]
-    empty_pair_counts = pair_counts.new_zeros((0, chunk_count))
-    empty_pair_positive = pair_positive.new_zeros((0, chunk_count))
-    pair_counts_by_rank_rows = [
-        (
-            empty_pair_counts
-            if int(owner_index.numel()) == 0
-            else pair_counts.index_select(0, owner_index)
-        )
-        for owner_index in owner_indices
-    ]
-    pair_positive_by_rank_rows = [
-        (
-            empty_pair_positive
-            if int(owner_index.numel()) == 0
-            else pair_positive.index_select(0, owner_index)
-        )
-        for owner_index in owner_indices
-    ]
-    pair_positive_by_rank_cols = [
-        (
-            torch.zeros(chunk_count, dtype=torch.bool)
-            if int(rank_rows.numel()) == 0
-            else rank_rows.any(dim=0)
-        )
-        for rank_rows in pair_positive_by_rank_rows
-    ]
-    wave_masks = [wave_tensor == wave_index for wave_index in range(wave_count)]
-
-    for rank in range(cp_size):
-        owned_q_mask = owner_masks[rank]
-        owned_q_indices = owner_indices[rank]
-        owned_pair_counts = pair_counts_by_rank_rows[rank]
-        owned_pair_positive = pair_positive_by_rank_rows[rank]
-        owned_positive_cols = pair_positive_by_rank_cols[rank]
-
-        local_pairs = (
-            0
-            if int(owned_q_indices.numel()) == 0
-            else int(owned_pair_counts.index_select(1, owned_q_indices).sum().item())
-        )
-        local_q_mask = torch.zeros(chunk_count, dtype=torch.bool)
-        if int(owned_q_indices.numel()) > 0:
-            touched_local_q = owned_pair_positive.index_select(1, owned_q_indices).any(
-                dim=1
-            )
-            if bool(touched_local_q.any().item()):
-                local_q_mask[owned_q_indices[touched_local_q]] = True
-        local_k_mask = owned_q_mask & owned_positive_cols
-        local_q_tokens, local_q_range_count = _chunk_mask_stats(
-            chunk_lengths=chunk_lengths,
-            chunk_mask=local_q_mask,
-            chunk_lengths_tensor=chunk_lengths_tensor,
-        )
-        local_k_tokens, local_k_range_count = _chunk_mask_stats(
-            chunk_lengths=chunk_lengths,
-            chunk_mask=local_k_mask,
-            chunk_lengths_tensor=chunk_lengths_tensor,
-        )
-        local_stage_ms = _stage_cost_ms(
-            pair_count=local_pairs,
-            q_tokens=local_q_tokens,
-            k_tokens=local_k_tokens,
-            q_range_count=local_q_range_count,
-            k_range_count=local_k_range_count,
-            config=config,
-            backward=False,
-            local=True,
-        )
-        local_backward_ms = _stage_cost_ms(
-            pair_count=local_pairs,
-            q_tokens=local_q_tokens,
-            k_tokens=local_k_tokens,
-            q_range_count=local_q_range_count,
-            k_range_count=local_k_range_count,
-            config=config,
-            backward=True,
-            local=True,
-        )
-
-        remote_stage_ms: list[float] = []
-        remote_fetch_ms: list[float] = []
-        remote_backward_ms: list[float] = []
-        remote_reduce_ms: list[float] = []
-        for wave_index in range(wave_count):
-            request_tokens_by_source = [0 for _ in range(cp_size)]
-            request_range_counts_by_source = [0 for _ in range(cp_size)]
-            request_pairs = 0
-            touched_q_mask = torch.zeros(chunk_count, dtype=torch.bool)
-            for source_rank in range(cp_size):
-                if source_rank == rank:
-                    continue
-                touched_source_mask = (
-                    owner_masks[source_rank]
-                    & wave_masks[wave_index]
-                    & owned_positive_cols
-                )
-                (
-                    request_tokens_by_source[source_rank],
-                    request_range_counts_by_source[source_rank],
-                ) = _chunk_mask_stats(
-                    chunk_lengths=chunk_lengths,
-                    chunk_mask=touched_source_mask,
-                    chunk_lengths_tensor=chunk_lengths_tensor,
-                )
-                if request_tokens_by_source[source_rank] <= 0:
-                    continue
-                touched_source_indices = torch.nonzero(
-                    touched_source_mask,
-                    as_tuple=False,
-                ).flatten()
-                request_pairs += int(
-                    owned_pair_counts.index_select(1, touched_source_indices)
-                    .sum()
-                    .item()
-                )
-                touched_remote_q = owned_pair_positive.index_select(
-                    1,
-                    touched_source_indices,
-                ).any(dim=1)
-                if bool(touched_remote_q.any().item()):
-                    touched_q_mask[owned_q_indices[touched_remote_q]] = True
-            recv_tokens = sum(request_tokens_by_source)
-            recv_range_count = sum(request_range_counts_by_source)
-            if request_pairs <= 0 and recv_tokens <= 0 and recv_range_count <= 0:
-                continue
-
-            send_tokens_by_peer = [0 for _ in range(cp_size)]
-            send_range_counts_by_peer = [0 for _ in range(cp_size)]
-            aggregate_send_mask = torch.zeros(chunk_count, dtype=torch.bool)
-            owned_wave_mask = owned_q_mask & wave_masks[wave_index]
-            if bool(owned_wave_mask.any().item()):
-                for peer_rank in range(cp_size):
-                    if peer_rank == rank:
-                        continue
-                    send_mask = owned_wave_mask & pair_positive_by_rank_cols[peer_rank]
-                    (
-                        send_tokens_by_peer[peer_rank],
-                        send_range_counts_by_peer[peer_rank],
-                    ) = _chunk_mask_stats(
-                        chunk_lengths=chunk_lengths,
-                        chunk_mask=send_mask,
-                        chunk_lengths_tensor=chunk_lengths_tensor,
-                    )
-                    if send_tokens_by_peer[peer_rank] > 0:
-                        aggregate_send_mask |= send_mask
-            (
-                send_tokens_by_peer[rank],
-                send_range_counts_by_peer[rank],
-            ) = _chunk_mask_stats(
-                chunk_lengths=chunk_lengths,
-                chunk_mask=aggregate_send_mask,
-                chunk_lengths_tensor=chunk_lengths_tensor,
-            )
-
-            send_tokens = sum(send_tokens_by_peer)
-            q_tokens, q_range_count = _chunk_mask_stats(
-                chunk_lengths=chunk_lengths,
-                chunk_mask=touched_q_mask,
-                chunk_lengths_tensor=chunk_lengths_tensor,
-            )
-            remote_stage_ms.append(
-                _stage_cost_ms(
-                    pair_count=request_pairs,
-                    q_tokens=q_tokens,
-                    k_tokens=recv_tokens,
-                    q_range_count=q_range_count,
-                    k_range_count=recv_range_count,
-                    config=config,
-                    backward=False,
-                    local=False,
-                )
-            )
-            remote_backward_ms.append(
-                _stage_cost_ms(
-                    pair_count=request_pairs,
-                    q_tokens=q_tokens,
-                    k_tokens=recv_tokens,
-                    q_range_count=q_range_count,
-                    k_range_count=recv_range_count,
-                    config=config,
-                    backward=True,
-                    local=False,
-                )
-            )
-            remote_fetch_ms.append(
-                _comm_cost_ms(
-                    tokens=max(send_tokens, recv_tokens),
-                    range_count=max(sum(send_range_counts_by_peer), recv_range_count),
-                    config=config,
-                    backward=False,
-                )
-            )
-            remote_reduce_ms.append(
-                _comm_cost_ms(
-                    tokens=max(send_tokens, recv_tokens),
-                    range_count=max(sum(send_range_counts_by_peer), recv_range_count),
-                    config=config,
-                    backward=True,
-                )
-            )
-
-        forward_ms = _simulate_forward_time_ms(
-            local_stage_ms=local_stage_ms if local_pairs > 0 else 0.0,
-            remote_stage_ms=tuple(remote_stage_ms),
-            remote_fetch_ms=tuple(remote_fetch_ms),
-        )
-        backward_ms = _simulate_backward_time_ms(
-            local_stage_ms=local_backward_ms if local_pairs > 0 else 0.0,
-            remote_stage_ms=tuple(remote_backward_ms),
-            remote_reduce_ms=tuple(remote_reduce_ms),
-        )
-        rank_forward_ms.append(float(forward_ms))
-        rank_backward_ms.append(float(backward_ms))
-        rank_scores.append(float(forward_ms + backward_ms))
-    return {
-        "score": max(rank_scores, default=0.0),
-        "rank_scores": tuple(rank_scores),
-        "rank_forward_ms": tuple(rank_forward_ms),
-        "rank_backward_ms": tuple(rank_backward_ms),
-    }
+    return _evaluate_plans(
+        program=program,
+        owners_batch=owners_batch,
+        wave_assignment=wave_assignment,
+        cp_size=cp_size,
+        config=config,
+    )[0]
 
 
 def _search_generic_chunk_assignment(
@@ -1338,37 +1384,41 @@ def _search_generic_chunk_assignment(
     )
     best: tuple[tuple[int, ...], tuple[int, ...], dict[str, Any]] | None = None
     eval_cache: dict[tuple[tuple[int, ...], tuple[int, ...]], dict[str, Any]] = {}
-    pair_counts = torch.as_tensor(pair_matrix, dtype=torch.int64)
-    pair_positive = pair_counts > 0
-    chunk_lengths = tuple(int(range_.size()) for range_ in chunk_ranges)
-    chunk_lengths_tensor = (
-        torch.tensor(chunk_lengths, dtype=torch.int64)
-        if len(chunk_lengths) >= _CHUNK_MASK_STATS_TORCH_THRESHOLD
-        else None
-    )
+    program = _pair_program(pair_matrix, chunk_ranges=chunk_ranges)
+
+    def _evaluate_candidates(
+        *,
+        owners_list: list[tuple[int, ...]],
+        wave_assignment: tuple[int, ...],
+    ) -> list[dict[str, Any]]:
+        misses = [
+            owners
+            for owners in dict.fromkeys(owners_list)
+            if (owners, wave_assignment) not in eval_cache
+        ]
+        if misses:
+            evaluations = _evaluate_plans(
+                program=program,
+                owners_batch=np.asarray(misses, dtype=np.int64).reshape(
+                    len(misses), len(chunk_ranges)
+                ),
+                wave_assignment=wave_assignment,
+                cp_size=cp_size,
+                config=config,
+            )
+            for owners, evaluation in zip(misses, evaluations, strict=True):
+                eval_cache[(owners, wave_assignment)] = evaluation
+        return [eval_cache[(owners, wave_assignment)] for owners in owners_list]
 
     def _evaluate_candidate(
         *,
         owners: tuple[int, ...],
         wave_assignment: tuple[int, ...],
     ) -> dict[str, Any]:
-        cache_key = (owners, wave_assignment)
-        cached = eval_cache.get(cache_key)
-        if cached is not None:
-            return cached
-        cached = _evaluate_plan(
-            chunk_ranges=chunk_ranges,
-            pair_matrix=pair_counts,
-            owners=owners,
+        return _evaluate_candidates(
+            owners_list=[owners],
             wave_assignment=wave_assignment,
-            cp_size=cp_size,
-            config=config,
-            pair_positive=pair_positive,
-            chunk_lengths=chunk_lengths,
-            chunk_lengths_tensor=chunk_lengths_tensor,
-        )
-        eval_cache[cache_key] = cached
-        return cached
+        )[0]
 
     contiguous_owners = _contiguous_chunk_assignment(
         q_weights=q_weights,
@@ -1410,7 +1460,7 @@ def _search_generic_chunk_assignment(
                     int(config.planner_candidate_chunk_limit),
                     _CP4_SEARCH_PROBE_CANDIDATE_LIMIT,
                 ),
-                evaluate_candidate=_evaluate_candidate,
+                evaluate_candidates=_evaluate_candidates,
             )
             if (
                 probe_move is not None
@@ -1430,7 +1480,7 @@ def _search_generic_chunk_assignment(
                 cp_size=cp_size,
                 q_weights=q_weights,
                 candidate_limit=int(config.planner_candidate_chunk_limit),
-                evaluate_candidate=_evaluate_candidate,
+                evaluate_candidates=_evaluate_candidates,
             )
             if best_move is None:
                 break
