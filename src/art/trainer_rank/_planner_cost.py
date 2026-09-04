@@ -843,6 +843,49 @@ ATTN_MOE_H2048_TABLE = CalibratedTable(
     ),
 )
 
+# Qwen3.5-27B class (dense GDN + attention, hidden 5,120): 24 attention heads
+# in 4 query groups of 256 channels, GDN 48 value / 16 key heads of 128 dims
+# and a 4-tap conv, 64 layers (48 GDN), on H200 bf16 (2026-09-04). Admitted at
+# TP1 x CP1/2/4 and TP2 x CP1 (the ten terms rank this GDN class at CP4, as
+# they do the 35B GDN MoE class); TP2 x CP2 fails its gates and keeps the
+# version-1 score, which on this class lost up to 112% at CP4.
+QWEN35_27B_GEOMETRY = ModelGeometry(
+    hidden_size=5_120,
+    ffn_hidden_size=17_408,
+    num_attention_heads=24,
+    num_query_groups=4,
+    kv_channels=256,
+    gdn_value_heads=48,
+    gdn_key_heads=16,
+    gdn_key_head_dim=128,
+    gdn_value_head_dim=128,
+    gdn_conv_kernel=4,
+)
+DENSE_GDN_H5120_TABLE = CalibratedTable(
+    table_id="dense-gdn-h5120-h200-bf16",
+    coefficients_milli_us={
+        "attention_token_cp_exchange": 0,
+        "gdn_level": 3_043_381,
+        "gdn_level_tp": 0,
+        "gdn_token_per_rank": 0,
+        "level_cp_per_layer": 0,
+        "level_tp_per_layer": 442_039,
+        "tiny_segment_per_layer": 230_182,
+        "token_cp_exchange": 0,
+        "token_per_rank": 11_441,
+        "token_tp_collective": 0,
+    },
+    device_classes=(H200_CLASS,),
+    param_dtypes=("torch.bfloat16",),
+    geometries=(QWEN35_27B_GEOMETRY,),
+    shapes=(
+        ParallelShape(tp=1, cp=1),
+        ParallelShape(tp=1, cp=2),
+        ParallelShape(tp=1, cp=4),
+        ParallelShape(tp=2, cp=1),
+    ),
+)
+
 CALIBRATED_TABLES: tuple[CalibratedTable, ...] = (
     DENSE_H2560_TABLE,
     GDN_MOE_H2048_TABLE,
@@ -850,6 +893,7 @@ CALIBRATED_TABLES: tuple[CalibratedTable, ...] = (
     DENSE_ATTN_H4096_TABLE,
     DENSE_ATTN_H5120_TABLE,
     ATTN_MOE_H2048_TABLE,
+    DENSE_GDN_H5120_TABLE,
 )
 # CPU-only planning (unit tests) prices with this table.
 DEFAULT_TABLE = DENSE_H2560_TABLE
@@ -940,6 +984,7 @@ __all__ = [
     "DENSE_ATTN_H2048_TABLE",
     "DENSE_ATTN_H4096_TABLE",
     "DENSE_ATTN_H5120_TABLE",
+    "DENSE_GDN_H5120_TABLE",
     "DENSE_H2560_TABLE",
     "GDN_MOE_H2048_TABLE",
     "CalibratedTable",

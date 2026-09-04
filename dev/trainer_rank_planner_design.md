@@ -248,6 +248,19 @@ are measured but not admitted: neither selection passed its gates on the noisy
 evidence (version 1 loses up to 13% there); a sixteen-round re-measurement of
 those shapes is queued to admit them if the noise was transient.
 
+Fifth calibrated class (2026-09-04): Qwen3.5-27B (dense GDN + attention,
+hidden 5,120; `dense-gdn-h5120-h200-bf16`) on H200 bf16 over TP1 × CP1/2/4,
+TP2 × CP1 and TP2 × CP2 (70 cells; four CP1/CP2 cells incomplete or lost to the
+single-GPU memory admission of issue #848, one TP2 × CP2 cell lost to an NCCL
+collective timeout during warm-up). Clean timings (median per-candidate spread
+0.4–0.7% except TP2 × CP2), and the ten terms rank this GDN class at CP4 as they
+do the 35B GDN MoE class, so no re-ranker: admitted directly at TP1 × CP1/2/4
+and TP2 × CP1 (52 cells; pairwise 97.0%, max regret 3.4%, held-out 1.8%).
+TP2 × CP2 fails its gates marginally (p95 5.1%, one clear miss) and keeps
+version 1. This is the class where the version-1 fallback hurt most: on the
+largest Ellavox group at CP4 it chose a layout 112% slower than the best
+(4,084 ms against 1,927 ms), and 26% slower at TP2 × CP2.
+
 The re-ranker is affordable because the context-parallel assignment search
 was vectorized (`_evaluate_plans` in `art.megatron.context_parallel.runtime`):
 it prices a whole batch of candidate moves in one numpy pass with the cost
