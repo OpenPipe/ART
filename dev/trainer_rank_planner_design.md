@@ -182,6 +182,26 @@ of the lattice are excluded with reasons: CP1 cells the single-GPU memory
 admission cannot run or refuses (issue #848) and the CP4/EP1 Ellavox cells
 that segfault in the expert grouped GEMM on real routing (issue #851).
 
+Known limitation (2026-09-04, dense controls): the O(segments) layout
+features cannot see the context-parallel plan a layout produces, and on
+attention-only models with real data at CP4 that plan dominates. Two layouts
+of an Ellavox group with near-identical features (about 13k packed tokens,
+six versus seven segments, the same 12k-token longest segment) differ by 25%
+in measured time because one needs four exchange waves with rank loads
+7168/3584/1536/790 and the other two waves with 6656/2560/2048/1751. The
+Qwen3-1.7B and Qwen3-8B controls therefore fail the gates at CP4 with the ten
+terms (held-out max regret 26% and 14%) and are not certified, and the same
+group measured on the certified Qwen3-4B geometry at TP1 × CP4 shows a 35%
+regret for the shipped table (the version-1 score reaches 15% on another
+group there; neither is adequate). The dense certificate had no
+attention-plus-real-data cells at CP4, so its metrics did not cover this.
+Adding two CP-plan-derived features offline (exchange waves × layers, maximum
+rank load × layers) lets the 1.7B class pass every gate (98.1% pairwise, max
+2.9%); deriving them costs about 25–40 ms per candidate on CPU, so the
+candidate fix is a CP-plan-aware re-rank of the top few layouts after the
+cheap score. Until then, attention models on real data at CP4 should be
+treated as unpriced by both scores.
+
 Landing gates re-derived: the sealed win-cell shape still selects deep sharing
 (prompt-level sharing at CP4, where it measures fastest; full sharing at CP1),
 the heterogeneous control and the tiny sealed families still decline, and
