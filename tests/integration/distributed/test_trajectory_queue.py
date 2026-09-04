@@ -221,3 +221,36 @@ async def test_pending_minimum_defers_shrink_until_cancelled() -> None:
         await pending_take
     assert (await queue.snapshot()).max_ready_groups == 1
     await queue.close()
+
+
+@pytest.mark.asyncio
+async def test_pending_minimum_reserves_groups_retained_by_batch() -> None:
+    queue = DistributedTrajectoryQueue(
+        endpoint=_InProcessTrajectoryQueueEndpoint(),
+        owner_endpoints={"owner": AsyncMock()},
+        maxsize=9,
+        capacity_records=100,
+        capacity_bytes=100,
+    )
+    await queue.start()
+    for index in range(9):
+        assert await _put(queue, _item(f"initial-{index}"))
+
+    groups, _ = await queue.get_many(9, wait=True)
+    for group in groups[:8]:
+        await queue.discard_group(group)
+
+    pending_take = asyncio.create_task(queue.get_many(8, wait=True, held_groups=1))
+    await _wait_until(lambda: queue._minimum_take_size == 9)
+    queue.set_maxsize(8)
+    assert (await queue.snapshot()).max_ready_groups == 9
+    for index in range(8):
+        assert await _put(queue, _item(f"replacement-{index}"))
+
+    acquired, closed = await pending_take
+    assert len(acquired) == 8
+    assert not closed
+    assert (await queue.snapshot()).max_ready_groups == 8
+    for group in [groups[-1], *acquired]:
+        await queue.discard_group(group)
+    await queue.close()
