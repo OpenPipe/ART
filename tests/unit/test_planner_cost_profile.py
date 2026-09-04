@@ -142,11 +142,16 @@ def test_attention_classes_are_admitted_only_where_their_gates_pass() -> None:
             selection = _selection(geometry=geometry, shape=shape)
             assert selection.table_id == table.table_id, (table.table_id, shape)
             assert selection.coefficients is table.coefficients_milli_us
-        # TP1 x CP4 was measured for every attention class and is not admitted.
-        assert cp4 not in table.shapes
-        assert _selection(geometry=geometry, shape=cp4).version == (
-            COEFFICIENT_VERSION_FALLBACK
-        ), table.table_id
+        # TP1 x CP4 is admitted through the two-stage re-ranker: the table's
+        # shortlist score plus its certified re-ranker, never the direct table.
+        assert cp4 not in table.shapes and cp4 in table.reranked_shapes
+        reranked = _selection(geometry=geometry, shape=cp4)
+        assert reranked.version == COEFFICIENT_VERSION
+        assert reranked.table_id == table.table_id
+        assert reranked.reranker is table.reranker
+        assert reranked.coefficients is (table.reranker.shortlist_coefficients_milli_us)
+        # Directly scored shapes never carry a re-ranker.
+        assert _selection(geometry=geometry, shape=ParallelShape()).reranker is None
         # A different dtype never borrows the table.
         assert _selection(
             geometry=geometry, shape=ParallelShape(), param_dtype="torch.float16"

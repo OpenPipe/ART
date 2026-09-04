@@ -1207,6 +1207,8 @@ class TrainerRank:
         self._coefficient_version = selection.version
         self._coefficient_table = selection.table_id
         self._planner_coefficients = selection.coefficients
+        # Two-stage selection on re-ranked shapes (part of the table identity).
+        self._planner_reranker = selection.reranker
         if selection.table_id is None:
             logger.warning(
                 "TrainerRank layout cost model: runtime (capability=%s, device "
@@ -3746,6 +3748,14 @@ class TrainerRank:
                 coefficient_version=facts.coefficient_version,
                 coefficients=self._planner_coefficients,
                 refinement_work_budget=_PLANNER_REFINEMENT_BUDGET,
+                reranker=self._planner_reranker,
+                plan_structure=(
+                    None
+                    if self._planner_reranker is None
+                    else lambda candidate: self._plan_structure(
+                        input_ids, tree, candidate
+                    )
+                ),
             ).layout
         cached = (tree, layout)
         with self._layout_cache_lock:
@@ -3754,6 +3764,39 @@ class TrainerRank:
             while len(self._layout_selection_cache) > _LAYOUT_SELECTION_CACHE_LIMIT:
                 self._layout_selection_cache.popitem(last=False)
         return cached
+
+    def _plan_structure(
+        self,
+        input_ids: Sequence[torch.Tensor],
+        tree: CanonicalPrefixTree,
+        layout: PrefixTreeLayout,
+    ) -> tuple[int, int]:
+        """(remote wave count, largest per-rank token load) of the context-
+        parallel plan this layout produces, through the runtime's planning
+        bundle cache: the layout finally selected reuses its bundle."""
+
+        from art.megatron.context_parallel.runtime import summarize_prefix_tree_plan
+        from art.megatron.training.microbatches import (
+            _context_parallel_config_for_provider,
+        )
+
+        packed = materialize_prefix_tree_layout(
+            input_ids, tree, layout, verify_shared_tokens=False
+        )
+        handler = self.runtime.model_support_handler
+        summary = summarize_prefix_tree_plan(
+            group_ids=packed.group_ids,
+            parent_ids=packed.parent_ids,
+            topology=self._topology(),
+            config=_context_parallel_config_for_provider(
+                self.runtime.provider, self.device, handler
+            ),
+            original_seq_len=int(packed.tokens.shape[1]),
+            build_gdn_execution_spec=bool(
+                getattr(handler, "build_gdn_execution_spec", False)
+            ),
+        )
+        return summary.wave_count, summary.max_rank_tokens
 
     def _select_group_layout(
         self,

@@ -80,9 +80,16 @@ def test_certified_metrics_hold_on_the_recorded_aggregates(table) -> None:
     beta = np.asarray(
         [table.coefficients_milli_us.get(name, 0) / 1_000.0 for name in terms]
     )
+    reranked_labels = {f"tp{shape.tp}cp{shape.cp}" for shape in table.reranked_shapes}
+    candidates = [c for c in candidates if fit._shape_label(c) not in reranked_labels]
     report = fit.evaluate(candidates, fit.predict(candidates, terms, beta))
     recorded = payload["metrics"]["integer_all"]
-    assert report["cells"] == recorded["cells"] == len(payload["cells"])
+    direct_cells = [
+        cell
+        for cell in payload["cells"]
+        if ParallelShape(*cell["shape"]) not in table.reranked_shapes
+    ]
+    assert report["cells"] == recorded["cells"] == len(direct_cells)
     assert report["ordered_pairs"] == recorded["ordered_pairs"]
     assert abs(report["pairwise_accuracy"] - recorded["pairwise_accuracy"]) < 1e-9
     assert abs(report["max_regret_pct"] - recorded["max_regret_pct"]) < 1e-9
@@ -109,11 +116,87 @@ def test_full_refit_reproduces_the_table_when_requested(table) -> None:
             and int(cell.rsplit("|g", 1)[1]) % 2 == 1
         )
 
-    train = [c for c in candidates if not held_out(c.cell)]
+    reranked_labels = {f"tp{shape.tp}cp{shape.cp}" for shape in table.reranked_shapes}
+    train = [
+        c
+        for c in candidates
+        if not held_out(c.cell) and fit._shape_label(c) not in reranked_labels
+    ]
     beta = fit.nnls(*fit.paired_deltas(train, terms))
     if arguments["objective"] == "regret":
         beta = fit.fit_regret(train, terms, beta)
     assert fit.integerize(train, terms, beta) == payload["integer_table_milli_us"]
+
+
+@_TABLES
+def test_reranked_shapes_are_certified_by_the_two_stage_selection(table) -> None:
+    """Tables with a re-ranker: the shipped re-ranker is the certificate's, and
+    the two-stage selection recomputed from the recorded aggregates (shortlist
+    by the shortlist table, select by the plan structure) reproduces the
+    certified metrics and passes the gates on every re-ranked shape; the
+    direct metrics cover the directly scored shapes only."""
+
+    candidates, payload = fit.load_certificate(certificate_path(table.table_id))
+    block = payload.get("reranker")
+    if table.reranker is None:
+        assert block is None and not table.reranked_shapes
+        assert all(
+            ParallelShape(*cell["shape"]) in table.shapes for cell in payload["cells"]
+        )
+        return
+    reranked_labels = {f"tp{shape.tp}cp{shape.cp}" for shape in table.reranked_shapes}
+    assert set(block["shapes"]) == reranked_labels
+    assert block["shortlist_size"] == table.reranker.shortlist_size
+    assert block["incumbent"] == table.reranker.incumbent
+    assert block["shortlist_table_milli_us"] == dict(
+        table.reranker.shortlist_coefficients_milli_us
+    )
+    assert block["wave_per_layer_milli_us"] == table.reranker.wave_per_layer_milli_us
+    assert (
+        block["max_rank_token_per_layer_milli_us"]
+        == table.reranker.max_rank_token_per_layer_milli_us
+    )
+    terms = tuple(payload["fit_arguments"]["terms"])
+    reranked = [c for c in candidates if fit._shape_label(c) in reranked_labels]
+    direct = [c for c in candidates if fit._shape_label(c) not in reranked_labels]
+    assert reranked and direct
+    assert {fit._shape_label(c) for c in direct} == {
+        f"tp{shape.tp}cp{shape.cp}" for shape in table.shapes
+    }
+    recomputed = fit.evaluate_two_stage(
+        reranked,
+        terms=terms,
+        shortlist_beta=np.asarray(
+            [block["shortlist_table_milli_us"][name] / 1_000.0 for name in terms]
+        ),
+        rerank_beta=np.asarray(
+            [
+                block["wave_per_layer_milli_us"] / 1_000.0,
+                block["max_rank_token_per_layer_milli_us"] / 1_000.0,
+            ]
+        ),
+        shortlist_size=block["shortlist_size"],
+        incumbent=block["incumbent"],
+    )
+    recorded = block["metrics"]["all"]
+    for key in ("cells", "ordered_pairs", "clear_misses", "recall"):
+        assert recomputed[key] == recorded[key], key
+    for key in (
+        "pairwise_accuracy",
+        "median_regret_pct",
+        "p95_regret_pct",
+        "max_regret_pct",
+    ):
+        assert abs(recomputed[key] - recorded[key]) < 1e-9, key
+    assert not fit.two_stage_gates(recomputed)
+    for shape, metrics in block["metrics"]["by_shape"].items():
+        assert not fit.two_stage_gates(metrics), shape
+    # The direct metrics are the certificate's headline metrics: direct cells only.
+    beta = np.asarray(
+        [table.coefficients_milli_us.get(name, 0) / 1_000.0 for name in terms]
+    )
+    report = fit.evaluate(direct, fit.predict(direct, terms, beta))
+    assert report["cells"] == payload["metrics"]["integer_all"]["cells"]
 
 
 @_TABLES
@@ -160,7 +243,7 @@ def test_admitted_execution_classes_are_exactly_the_certified_ones(table) -> Non
     assert geometries == set(table.geometries)
     assert geometries == {ModelGeometry(**cell["geometry"]) for cell in cells}
     shapes = {ParallelShape(*shape) for shape in admitted["shapes"]}
-    assert shapes == set(table.shapes)
+    assert shapes == set(table.shapes) | set(table.reranked_shapes)
     assert shapes == {ParallelShape(*cell["shape"]) for cell in cells}
     devices = {
         DeviceClass(tuple(entry["capability"]), entry["memory_class"])
@@ -176,7 +259,7 @@ def test_admitted_execution_classes_are_exactly_the_certified_ones(table) -> Non
         for cell in cells
     }
     for geometry in table.geometries:
-        for shape in table.shapes:
+        for shape in (*table.shapes, *table.reranked_shapes):
             assert (geometry, shape) in measured, (geometry.hidden_size, shape)
     manifest = json.loads(manifest_path(table.table_id).read_text())
     geometry_of_model = {

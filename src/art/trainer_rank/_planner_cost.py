@@ -328,6 +328,34 @@ class ParallelShape:
 
 
 @dataclass(frozen=True)
+class ReRanker:
+    """Second-stage score for a table's re-ranked parallel shapes.
+
+    On these shapes the ten-term score cannot see the structure of the
+    context-parallel plan a layout produces, which dominates real-data cells
+    at CP4. It still shortlists well: the ``shortlist_size`` cheapest layouts
+    of the search under ``shortlist_coefficients_milli_us`` (plus the
+    ``incumbent`` anchor) are then priced per layer by the plan they produce,
+    remote wave count and largest per-rank token load, and the lowest
+    second-stage score is selected. Fitted and certified per class and shape
+    like the tables (shortlist recall, ranking gates, non-regression against
+    the cheap score and version 1, planning cost).
+    """
+
+    shortlist_size: int
+    incumbent: str
+    shortlist_coefficients_milli_us: Mapping[str, int]
+    wave_per_layer_milli_us: int
+    max_rank_token_per_layer_milli_us: int
+
+    def score(self, *, layers: int, wave_count: int, max_rank_tokens: int) -> int:
+        return max(1, layers) * (
+            wave_count * self.wave_per_layer_milli_us
+            + max_rank_tokens * self.max_rank_token_per_layer_milli_us
+        )
+
+
+@dataclass(frozen=True)
 class CalibratedTable:
     """One fitted coefficient table and the execution classes it admits.
 
@@ -335,6 +363,8 @@ class CalibratedTable:
     geometry and parallel shape must each appear in the table's measured
     sets (the certificate test binds these sets to the recorded cells). No
     configuration is admitted because a width falls between measured widths.
+    ``reranked_shapes`` are admitted through the two-stage selection of the
+    table's ``reranker`` instead of the ten-term score alone.
     """
 
     table_id: str
@@ -347,6 +377,27 @@ class CalibratedTable:
     # are in the certificate and the fit, but the score is known to misrank
     # that pair (a documented blind spot), so the fallback applies there.
     withheld: tuple[tuple[ModelGeometry, ParallelShape], ...] = ()
+    reranked_shapes: tuple[ParallelShape, ...] = ()
+    reranker: ReRanker | None = None
+
+    def __post_init__(self) -> None:
+        if set(self.reranked_shapes) & set(self.shapes):
+            raise ValueError("a shape is either scored directly or re-ranked")
+        if bool(self.reranked_shapes) != (self.reranker is not None):
+            raise ValueError("re-ranked shapes and a re-ranker come together")
+
+    def admits_class(
+        self,
+        *,
+        device: DeviceClass,
+        param_dtype: str,
+        geometry: ModelGeometry,
+    ) -> bool:
+        return (
+            any(known.admits(device) for known in self.device_classes)
+            and param_dtype in self.param_dtypes
+            and geometry in self.geometries
+        )
 
     def admits(
         self,
@@ -357,21 +408,37 @@ class CalibratedTable:
         shape: ParallelShape,
     ) -> bool:
         return (
-            any(known.admits(device) for known in self.device_classes)
-            and param_dtype in self.param_dtypes
-            and geometry in self.geometries
+            self.admits_class(device=device, param_dtype=param_dtype, geometry=geometry)
             and shape in self.shapes
             and (geometry, shape) not in self.withheld
+        )
+
+    def reranks(
+        self,
+        *,
+        device: DeviceClass,
+        param_dtype: str,
+        geometry: ModelGeometry,
+        shape: ParallelShape,
+    ) -> bool:
+        return (
+            self.reranker is not None
+            and self.admits_class(
+                device=device, param_dtype=param_dtype, geometry=geometry
+            )
+            and shape in self.reranked_shapes
         )
 
 
 @dataclass(frozen=True, slots=True)
 class ScoringSelection:
-    """The score a runtime uses: version 2 with one table, or the fallback."""
+    """The score a runtime uses: version 2 with one table (directly, or as
+    the shortlist score of a two-stage re-ranker), or the fallback."""
 
     version: int
     table_id: str | None
     coefficients: Mapping[str, int] | None
+    reranker: ReRanker | None = None
 
 
 def select_scoring(
@@ -403,6 +470,16 @@ def select_scoring(
         ):
             return ScoringSelection(
                 COEFFICIENT_VERSION, table.table_id, table.coefficients_milli_us
+            )
+        if table.reranks(
+            device=device, param_dtype=param_dtype, geometry=geometry, shape=shape
+        ):
+            assert table.reranker is not None
+            return ScoringSelection(
+                COEFFICIENT_VERSION,
+                table.table_id,
+                table.reranker.shortlist_coefficients_milli_us,
+                table.reranker,
             )
     return ScoringSelection(COEFFICIENT_VERSION_FALLBACK, None, None)
 
@@ -556,11 +633,12 @@ GDN_MOE_H2048_TABLE = CalibratedTable(
 
 # Dense attention classes measured on the shape lattice (2026-09-04):
 # Qwen3-1.7B (hidden 2,048), Qwen3-8B (4,096) and Qwen3-14B (5,120), each
-# with 8 query groups of 128 channels, on H200 bf16. TP1 x CP4 (and TP2 x CP2
-# for the two smaller classes) was measured but is not admitted: the ten-term
-# score cannot see the context-parallel exchange schedule and misranks the
-# recurring real-data groups there (design brief, known limitation), so those
-# shapes keep the version-1 score until the CP-aware re-ranker is certified.
+# with 8 query groups of 128 channels, on H200 bf16. TP1 x CP4 is admitted
+# through the two-stage re-ranker: the ten-term score cannot see the
+# context-parallel plan a layout produces, which decides the recurring
+# real-data groups there (design brief), so it only shortlists and the plan's
+# remote wave count and largest per-rank token load select. TP2 x CP2 fails
+# its gates for the two smaller classes and keeps the version-1 score.
 _ATTENTION_DTYPES = ("torch.bfloat16",)
 _ATTENTION_SHAPES = (
     ParallelShape(tp=1, cp=1),
@@ -592,6 +670,25 @@ DENSE_ATTN_H2048_TABLE = CalibratedTable(
     param_dtypes=_ATTENTION_DTYPES,
     geometries=(QWEN3_1_7B_GEOMETRY,),
     shapes=_ATTENTION_SHAPES,
+    reranked_shapes=(ParallelShape(tp=1, cp=4),),
+    reranker=ReRanker(
+        shortlist_size=3,
+        incumbent="depth_one",
+        shortlist_coefficients_milli_us={
+            "attention_token_cp_exchange": 3,
+            "gdn_level": 0,
+            "gdn_level_tp": 0,
+            "gdn_token_per_rank": 0,
+            "level_cp_per_layer": 69_746,
+            "level_tp_per_layer": 0,
+            "tiny_segment_per_layer": 0,
+            "token_cp_exchange": 57,
+            "token_per_rank": 1_656,
+            "token_tp_collective": 143,
+        },
+        wave_per_layer_milli_us=1_144_207,
+        max_rank_token_per_layer_milli_us=678,
+    ),
 )
 QWEN3_8B_GEOMETRY = ModelGeometry(
     hidden_size=4_096,
@@ -618,6 +715,25 @@ DENSE_ATTN_H4096_TABLE = CalibratedTable(
     param_dtypes=_ATTENTION_DTYPES,
     geometries=(QWEN3_8B_GEOMETRY,),
     shapes=_ATTENTION_SHAPES,
+    reranked_shapes=(ParallelShape(tp=1, cp=4),),
+    reranker=ReRanker(
+        shortlist_size=3,
+        incumbent="depth_one",
+        shortlist_coefficients_milli_us={
+            "attention_token_cp_exchange": 57,
+            "gdn_level": 0,
+            "gdn_level_tp": 0,
+            "gdn_token_per_rank": 0,
+            "level_cp_per_layer": 17_614,
+            "level_tp_per_layer": 0,
+            "tiny_segment_per_layer": 1_508,
+            "token_cp_exchange": 0,
+            "token_per_rank": 2_925,
+            "token_tp_collective": 573,
+        },
+        wave_per_layer_milli_us=249_653,
+        max_rank_token_per_layer_milli_us=2_820,
+    ),
 )
 QWEN3_14B_GEOMETRY = ModelGeometry(
     hidden_size=5_120,
@@ -644,6 +760,25 @@ DENSE_ATTN_H5120_TABLE = CalibratedTable(
     param_dtypes=_ATTENTION_DTYPES,
     geometries=(QWEN3_14B_GEOMETRY,),
     shapes=_ATTENTION_SHAPES + (ParallelShape(tp=2, cp=2),),
+    reranked_shapes=(ParallelShape(tp=1, cp=4),),
+    reranker=ReRanker(
+        shortlist_size=3,
+        incumbent="depth_one",
+        shortlist_coefficients_milli_us={
+            "attention_token_cp_exchange": 0,
+            "gdn_level": 0,
+            "gdn_level_tp": 0,
+            "gdn_token_per_rank": 0,
+            "level_cp_per_layer": 0,
+            "level_tp_per_layer": 0,
+            "tiny_segment_per_layer": 0,
+            "token_cp_exchange": 0,
+            "token_per_rank": 4_592,
+            "token_tp_collective": 496,
+        },
+        wave_per_layer_milli_us=654_967,
+        max_rank_token_per_layer_milli_us=4_642,
+    ),
 )
 
 CALIBRATED_TABLES: tuple[CalibratedTable, ...] = (
@@ -748,6 +883,7 @@ __all__ = [
     "LayoutFeatures",
     "ModelGeometry",
     "ParallelShape",
+    "ReRanker",
     "ScoringSelection",
     "SEGMENT_LENGTH_THRESHOLDS",
     "ScoringFacts",

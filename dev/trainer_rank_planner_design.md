@@ -202,29 +202,44 @@ for the shipped table (the version-1 score reaches 15% on another group
 there; neither is adequate). The dense certificate had no
 attention-plus-real-data cells at CP4, so its metrics did not cover this.
 
-Resolution shipped (2026-09-04, per review): the attention classes get
-shape-restricted tables where the gates pass — Qwen3-1.7B
-(`dense-attn-h2048-h200-bf16`) and Qwen3-8B (`dense-attn-h4096-h200-bf16`) at
-TP1 × CP1/CP2 and TP2 × CP1, Qwen3-14B (`dense-attn-h5120-h200-bf16`) also at
-TP2 × CP2 (42/42/56 cells; pairwise 96.5%/99.9%/99.9%, max regret ≤1.1%,
-gates passing on every admitted shape) — while TP1 × CP4 (and TP2 × CP2 for
-the two smaller classes) stays on version 1, listed in each manifest as
-excluded with the reason. The dense table withholds Qwen3-4B × TP1 × CP4:
-version 1's 15% worst observed cell is the less harmful established fallback
-than the table's 35%, and this is ordinary execution-class admission, not a
-model or corpus rule. Adding CP-plan-derived features offline (exchange
-waves × layers, maximum rank load × layers) lets the 1.7B class pass every
-gate (98.1% pairwise, max 2.9%) and the 14B class with the load term alone
-(max 3.1%); deriving them costs about 25–40 ms per candidate on CPU. The
-planned fix is a two-stage selector: the cheap ten-term score shortlists the
-top k layouts (k swept offline for measured-best recall, the incumbent always
-included) and a separate small re-ranker scores the shortlist with the CP
-plan's exchange-wave count and critical-path work (sum over waves of the
-maximum rank work per wave) per layer, enabled only for the execution classes
-and shapes whose own certificate passes. Its certificate must cover shortlist
-recall, the re-ranking gates, non-regression against both the cheap score and
-version 1, and planning economics (re-ranking about ≤1% of execution time on
-the hot path, bounded by k, never a wall-clock search).
+Resolution (2026-09-04, per review). The attention classes get their own
+tables where the ten-term gates pass — Qwen3-1.7B (`dense-attn-h2048-h200-bf16`)
+and Qwen3-8B (`dense-attn-h4096-h200-bf16`) at TP1 × CP1/CP2 and TP2 × CP1,
+Qwen3-14B (`dense-attn-h5120-h200-bf16`) also at TP2 × CP2 (42/42/56 cells;
+pairwise 96.5%/99.9%/99.9%, max regret ≤1.1%) — and TP1 × CP4 is admitted
+through a **two-stage selection** (`ReRanker`, `CalibratedTable.reranked_shapes`,
+`select_prefix_tree_layout(..., reranker, plan_structure)`): the ten-term score
+(a shortlist table fitted on every measured shape; its job is recall) keeps the
+three cheapest layouts of the search plus the depth-one anchor, each shortlisted
+layout is priced by the structure of the context-parallel plan it produces —
+remote wave count and largest per-rank token load, per layer, from the CP
+planner's own assignment (`summarize_prefix_tree_plan`, through the planning
+bundle cache so the selected layout's plan is reused) — and the lowest
+second-stage score wins (ties keep the cheaper layout). The two physical
+drivers came out of the measured schedules: on equal-load layouts an extra
+remote wave costs 2.4 / 1.8 / 0.6 ms per layer on 1.7B / 8B / 14B (the CP
+planner's own model prefers the extra wave; issue #854), and the max-rank load
+carries the rest. Certified per class on TP1 × CP4 (`reranker` block of the
+certificate, bound by `tests/unit/test_planner_cost_certificate.py`):
+every clear measured winner is in the shortlist; two-stage regret max
+2.6% / 0.8% / 4.1% (held-out 0.7% / 0.8% / 0.4%); never more than 2% worse
+than the cheap-only or the version-1 selection; and the synchronous planning
+cost of pricing the shortlist (mean 2.6% / 1.6% / 1.0% of the cell's time
+after the assignment-search speedup below) is below the mean execution saved
+on those cells (2.9% / 1.8% / 1.2%). TP2 × CP2 still fails its gates for the
+two smaller classes and keeps version 1; the dense table withholds
+Qwen3-4B × TP1 × CP4 (version 1's 15% worst observed cell is the less harmful
+fallback than the table's 35%; its 7 real-data CP4 cells are too few to
+certify a re-ranker).
+
+The re-ranker is affordable because the context-parallel assignment search
+was vectorized (`_evaluate_plans` in `art.megatron.context_parallel.runtime`):
+it prices a whole batch of candidate moves in one numpy pass with the cost
+formulas and stage simulations kept in the same arithmetic order, identical
+results on all 446 real calibration candidates (the pre-rewrite evaluator is
+the reference in `tests/unit/test_context_parallel_plan_evaluation.py`), and
+the median search fell from 18.3 ms to 4.1 ms per packed row — also on the
+production plan-build path of every CP>1 micro-batch.
 
 Landing gates re-derived: the sealed win-cell shape still selects deep sharing
 (prompt-level sharing at CP4, where it measures fastest; full sharing at CP1),

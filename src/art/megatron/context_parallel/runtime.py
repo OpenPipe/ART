@@ -181,6 +181,50 @@ def _get_or_build_planning_bundle(
     return planning_key, bundle, group_ids_cpu, parent_ids_cpu
 
 
+@dataclass(frozen=True)
+class ContextParallelPlanSummary:
+    """Structure of one packed row's context-parallel plan: the number of
+    remote attention waves and the largest per-rank token load. Derived from
+    the cached planning bundle, so a caller that summarizes a row and then
+    executes it pays for the assignment search once."""
+
+    wave_count: int
+    max_rank_tokens: int
+
+
+def summarize_prefix_tree_plan(
+    *,
+    group_ids: torch.Tensor,
+    parent_ids: torch.Tensor,
+    topology: ParallelTopology,
+    config: ContextParallelConfig,
+    original_seq_len: int,
+    build_gdn_execution_spec: bool = False,
+) -> ContextParallelPlanSummary:
+    """Plan one packed row (CPU metadata) and report its CP plan structure.
+
+    The layout planner's second stage prices shortlisted layouts with this;
+    the bundle it builds is the one ``prepare_cp_micro`` reuses for the layout
+    that is finally executed.
+    """
+
+    _planning_key, bundle, _group_ids, _parent_ids = _get_or_build_planning_bundle(
+        group_ids=group_ids,
+        parent_ids=parent_ids,
+        topology=topology,
+        config=config,
+        original_seq_len=original_seq_len,
+        build_gdn_execution_spec=build_gdn_execution_spec,
+    )
+    wave_count = max(bundle.wave_assignment) + 1 if bundle.wave_assignment else 0
+    return ContextParallelPlanSummary(
+        wave_count=int(wave_count),
+        max_rank_tokens=int(
+            max(bundle.token_layout_index.token_counts_by_rank, default=0)
+        ),
+    )
+
+
 def _get_or_build_bundle_rank_plan(
     *,
     planning_key: str,
