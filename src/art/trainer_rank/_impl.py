@@ -5017,7 +5017,14 @@ class TrainerRank:
         rows = tuple(self._hybridep_rows(batch, topology=topology) for batch in padded)
         current = fused_a2a._hybrid_ep_buffer
         live = self._has_live_hybridep_graphs()
-        required_capacity = _hybridep_token_capacity(sequence_length, int(topology.cp))
+        # The buffer must hold the busiest rank's planned rows: cost-aware CP
+        # plans (few long histories, shared prefixes) can put more than the
+        # near-balanced extent on one rank, and every rank sizes the buffer
+        # identically because the planned counts are the same on all ranks.
+        required_capacity = max(
+            _hybridep_token_capacity(sequence_length, int(topology.cp)),
+            max(rows),
+        )
         if live and (
             current is None
             or id(current) != getattr(self, "_hybridep_buffer_id", None)
@@ -5033,6 +5040,7 @@ class TrainerRank:
             self.runtime,
             packed_sequence_length=sequence_length,
             context_parallel_size=int(topology.cp),
+            required_capacity=required_capacity,
         )
         current = fused_a2a._hybrid_ep_buffer
         if current is None:
