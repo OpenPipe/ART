@@ -46,6 +46,9 @@ setup: |
   uv sync --frozen --extra megatron --group dev
   uv sync --project megatron_runtime --extra cuda12 --group test --frozen
   uv pip install --python megatron_runtime/.venv/bin/python --no-deps --editable .
+  # Expert-parallel shapes need the HybridEP dispatcher, which ART builds from
+  # its vendored source for this node's GPU architecture (single node).
+  HYBRID_EP_MULTINODE=0 USE_NIXL=0 megatron_runtime/.venv/bin/python -m art.megatron.hybrid_ep_setup
 
 run: |
   set -euo pipefail
