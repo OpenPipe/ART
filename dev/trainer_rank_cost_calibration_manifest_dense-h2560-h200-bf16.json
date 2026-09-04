@@ -65,18 +65,52 @@
   {"campaign":"local","cell":"cal-hetero","cp":1,"group":null,"key":"cal-hetero|Qwen/Qwen3.5-4B|L32|tp1|cp1","layers":32,"model":"Qwen/Qwen3.5-4B","tp":1},
   {"campaign":"tr-cost-2gpu-2","cell":"cal-hetero","cp":2,"group":null,"key":"cal-hetero|Qwen/Qwen3.5-4B|L32|tp1|cp2","layers":32,"model":"Qwen/Qwen3.5-4B","tp":1},
   {"campaign":"tr-cost-cp4","cell":"cal-hetero","cp":4,"group":null,"key":"cal-hetero|Qwen/Qwen3.5-4B|L32|tp1|cp4","layers":32,"model":"Qwen/Qwen3.5-4B","tp":1},
-  {"campaign":"tr-cost-2gpu","cell":"cal-hetero","cp":1,"group":null,"key":"cal-hetero|Qwen/Qwen3.5-4B|L32|tp2|cp1","layers":32,"model":"Qwen/Qwen3.5-4B","tp":2}
+  {"campaign":"tr-cost-2gpu","cell":"cal-hetero","cp":1,"group":null,"key":"cal-hetero|Qwen/Qwen3.5-4B|L32|tp2|cp1","layers":32,"model":"Qwen/Qwen3.5-4B","tp":2},
+  {"campaign":"tr-cost-q3-4b-cp4","cell":"cal-ellavox-qwen3","cp":4,"ep":1,"etp":1,"group":0,"key":"cal-ellavox-qwen3|Qwen/Qwen3-4B|L36|tp1|cp4|g0","layers":36,"model":"Qwen/Qwen3-4B","tp":1},
+  {"campaign":"tr-cost-q3-4b-cp4","cell":"cal-ellavox-qwen3","cp":4,"ep":1,"etp":1,"group":1,"key":"cal-ellavox-qwen3|Qwen/Qwen3-4B|L36|tp1|cp4|g1","layers":36,"model":"Qwen/Qwen3-4B","tp":1},
+  {"campaign":"tr-cost-q3-4b-cp4","cell":"cal-ellavox-qwen3","cp":4,"ep":1,"etp":1,"group":2,"key":"cal-ellavox-qwen3|Qwen/Qwen3-4B|L36|tp1|cp4|g2","layers":36,"model":"Qwen/Qwen3-4B","tp":1},
+  {"campaign":"tr-cost-q3-4b-cp4","cell":"cal-ellavox-qwen3","cp":4,"ep":1,"etp":1,"group":3,"key":"cal-ellavox-qwen3|Qwen/Qwen3-4B|L36|tp1|cp4|g3","layers":36,"model":"Qwen/Qwen3-4B","tp":1},
+  {"campaign":"tr-cost-q3-4b-cp4","cell":"cal-ellavox-qwen3","cp":4,"ep":1,"etp":1,"group":4,"key":"cal-ellavox-qwen3|Qwen/Qwen3-4B|L36|tp1|cp4|g4","layers":36,"model":"Qwen/Qwen3-4B","tp":1},
+  {"campaign":"tr-cost-q3-4b-cp4","cell":"cal-ellavox-qwen3","cp":4,"ep":1,"etp":1,"group":5,"key":"cal-ellavox-qwen3|Qwen/Qwen3-4B|L36|tp1|cp4|g5","layers":36,"model":"Qwen/Qwen3-4B","tp":1},
+  {"campaign":"tr-cost-q3-4b-cp4","cell":"cal-ellavox-qwen3","cp":4,"ep":1,"etp":1,"group":6,"key":"cal-ellavox-qwen3|Qwen/Qwen3-4B|L36|tp1|cp4|g6","layers":36,"model":"Qwen/Qwen3-4B","tp":1},
+  {"campaign":"tr-cost-q3-4b-cp4","cell":"cal-ellavox-qwen3","cp":4,"ep":1,"etp":1,"group":7,"key":"cal-ellavox-qwen3|Qwen/Qwen3-4B|L36|tp1|cp4|g7","layers":36,"model":"Qwen/Qwen3-4B","tp":1},
+  {"campaign":"tr-cost-q3-4b-cp4","cell":"cal-ellavox-qwen3","cp":2,"ep":1,"etp":1,"group":0,"key":"cal-ellavox-qwen3|Qwen/Qwen3-4B|L36|tp2|cp2|g0","layers":36,"model":"Qwen/Qwen3-4B","tp":2},
+  {"campaign":"tr-cost-q3-4b-cp4","cell":"cal-ellavox-qwen3","cp":2,"ep":1,"etp":1,"group":1,"key":"cal-ellavox-qwen3|Qwen/Qwen3-4B|L36|tp2|cp2|g1","layers":36,"model":"Qwen/Qwen3-4B","tp":2},
+  {"campaign":"tr-cost-q3-4b-cp4","cell":"cal-ellavox-qwen3","cp":2,"ep":1,"etp":1,"group":2,"key":"cal-ellavox-qwen3|Qwen/Qwen3-4B|L36|tp2|cp2|g2","layers":36,"model":"Qwen/Qwen3-4B","tp":2},
+  {"campaign":"tr-cost-q3-4b-cp4","cell":"cal-ellavox-qwen3","cp":2,"ep":1,"etp":1,"group":3,"key":"cal-ellavox-qwen3|Qwen/Qwen3-4B|L36|tp2|cp2|g3","layers":36,"model":"Qwen/Qwen3-4B","tp":2},
+  {"campaign":"tr-cost-q3-4b-cp4","cell":"cal-ellavox-qwen3","cp":2,"ep":1,"etp":1,"group":4,"key":"cal-ellavox-qwen3|Qwen/Qwen3-4B|L36|tp2|cp2|g4","layers":36,"model":"Qwen/Qwen3-4B","tp":2},
+  {"campaign":"tr-cost-q3-4b-cp4","cell":"cal-ellavox-qwen3","cp":2,"ep":1,"etp":1,"group":5,"key":"cal-ellavox-qwen3|Qwen/Qwen3-4B|L36|tp2|cp2|g5","layers":36,"model":"Qwen/Qwen3-4B","tp":2},
+  {"campaign":"tr-cost-q3-4b-cp4","cell":"cal-ellavox-qwen3","cp":2,"ep":1,"etp":1,"group":6,"key":"cal-ellavox-qwen3|Qwen/Qwen3-4B|L36|tp2|cp2|g6","layers":36,"model":"Qwen/Qwen3-4B","tp":2},
+  {"campaign":"tr-cost-q3-4b-cp4","cell":"cal-ellavox-qwen3","cp":2,"ep":1,"etp":1,"group":7,"key":"cal-ellavox-qwen3|Qwen/Qwen3-4B|L36|tp2|cp2|g7","layers":36,"model":"Qwen/Qwen3-4B","tp":2}
  ],
  "description": "Expected calibration cells for the coefficient-version-2 campaign (2026-09-02; Ellavox CP4 groups 1 and 4 re-measured 2026-09-03 after the harness desynchronization fix of issue #840): the exact union of the cells the checked-in recipes launch (dev/trainer_rank_cost_calibration_local.sh; the cp4 and 2gpu sky recipes in both CELL_SET modes), keyed exactly as the fitter keys cells. tests/unit/test_planner_cost_manifest_recipes.py asserts recipes and manifest agree. The fitter's --manifest validation requires every non-excluded cell to be present with a complete mandatory candidate set and rejects unexpected cells; exclusions must be listed here with a reason.",
  "excluded": [
-
+  {"key":"cal-ellavox-qwen3|Qwen/Qwen3-4B|L36|tp1|cp4|g0","reason":"blind-spot evidence, not fitted: Qwen3-4B at TP1 x CP4 on the Qwen3-tokenized Ellavox groups shows the shipped score misranking layouts (regret up to 35% on g5) because the ten terms cannot see the context-parallel exchange schedule; the pair is withheld from admission (see withheld)"},
+  {"key":"cal-ellavox-qwen3|Qwen/Qwen3-4B|L36|tp1|cp4|g1","reason":"blind-spot evidence, not fitted: Qwen3-4B at TP1 x CP4 on the Qwen3-tokenized Ellavox groups shows the shipped score misranking layouts (regret up to 35% on g5) because the ten terms cannot see the context-parallel exchange schedule; the pair is withheld from admission (see withheld)"},
+  {"key":"cal-ellavox-qwen3|Qwen/Qwen3-4B|L36|tp1|cp4|g2","reason":"blind-spot evidence, not fitted: Qwen3-4B at TP1 x CP4 on the Qwen3-tokenized Ellavox groups shows the shipped score misranking layouts (regret up to 35% on g5) because the ten terms cannot see the context-parallel exchange schedule; the pair is withheld from admission (see withheld)"},
+  {"key":"cal-ellavox-qwen3|Qwen/Qwen3-4B|L36|tp1|cp4|g3","reason":"blind-spot evidence, not fitted: Qwen3-4B at TP1 x CP4 on the Qwen3-tokenized Ellavox groups shows the shipped score misranking layouts (regret up to 35% on g5) because the ten terms cannot see the context-parallel exchange schedule; the pair is withheld from admission (see withheld)"},
+  {"key":"cal-ellavox-qwen3|Qwen/Qwen3-4B|L36|tp1|cp4|g4","reason":"blind-spot evidence, not fitted: Qwen3-4B at TP1 x CP4 on the Qwen3-tokenized Ellavox groups shows the shipped score misranking layouts (regret up to 35% on g5) because the ten terms cannot see the context-parallel exchange schedule; the pair is withheld from admission (see withheld)"},
+  {"key":"cal-ellavox-qwen3|Qwen/Qwen3-4B|L36|tp1|cp4|g5","reason":"blind-spot evidence, not fitted: Qwen3-4B at TP1 x CP4 on the Qwen3-tokenized Ellavox groups shows the shipped score misranking layouts (regret up to 35% on g5) because the ten terms cannot see the context-parallel exchange schedule; the pair is withheld from admission (see withheld)"},
+  {"key":"cal-ellavox-qwen3|Qwen/Qwen3-4B|L36|tp1|cp4|g6","reason":"blind-spot evidence, not fitted: Qwen3-4B at TP1 x CP4 on the Qwen3-tokenized Ellavox groups shows the shipped score misranking layouts (regret up to 35% on g5) because the ten terms cannot see the context-parallel exchange schedule; the pair is withheld from admission (see withheld)"},
+  {"key":"cal-ellavox-qwen3|Qwen/Qwen3-4B|L36|tp1|cp4|g7","reason":"blind-spot evidence, not fitted: Qwen3-4B at TP1 x CP4 on the Qwen3-tokenized Ellavox groups shows the shipped score misranking layouts (regret up to 35% on g5) because the ten terms cannot see the context-parallel exchange schedule; the pair is withheld from admission (see withheld)"},
+  {"key":"cal-ellavox-qwen3|Qwen/Qwen3-4B|L36|tp2|cp2|g0","reason":"blind-spot evidence, not fitted: TP2 x CP2 is not an admitted shape of this table; measured to show the same context-parallel exchange-schedule effect for the attention geometry"},
+  {"key":"cal-ellavox-qwen3|Qwen/Qwen3-4B|L36|tp2|cp2|g1","reason":"blind-spot evidence, not fitted: TP2 x CP2 is not an admitted shape of this table; measured to show the same context-parallel exchange-schedule effect for the attention geometry"},
+  {"key":"cal-ellavox-qwen3|Qwen/Qwen3-4B|L36|tp2|cp2|g2","reason":"blind-spot evidence, not fitted: TP2 x CP2 is not an admitted shape of this table; measured to show the same context-parallel exchange-schedule effect for the attention geometry"},
+  {"key":"cal-ellavox-qwen3|Qwen/Qwen3-4B|L36|tp2|cp2|g3","reason":"blind-spot evidence, not fitted: TP2 x CP2 is not an admitted shape of this table; measured to show the same context-parallel exchange-schedule effect for the attention geometry"},
+  {"key":"cal-ellavox-qwen3|Qwen/Qwen3-4B|L36|tp2|cp2|g4","reason":"blind-spot evidence, not fitted: TP2 x CP2 is not an admitted shape of this table; measured to show the same context-parallel exchange-schedule effect for the attention geometry"},
+  {"key":"cal-ellavox-qwen3|Qwen/Qwen3-4B|L36|tp2|cp2|g5","reason":"blind-spot evidence, not fitted: TP2 x CP2 is not an admitted shape of this table; measured to show the same context-parallel exchange-schedule effect for the attention geometry"},
+  {"key":"cal-ellavox-qwen3|Qwen/Qwen3-4B|L36|tp2|cp2|g6","reason":"blind-spot evidence, not fitted: TP2 x CP2 is not an admitted shape of this table; measured to show the same context-parallel exchange-schedule effect for the attention geometry"},
+  {"key":"cal-ellavox-qwen3|Qwen/Qwen3-4B|L36|tp2|cp2|g7","reason":"blind-spot evidence, not fitted: TP2 x CP2 is not an admitted shape of this table; measured to show the same context-parallel exchange-schedule effect for the attention geometry"}
  ],
- "launches": {},
+ "launches": {"tr-cost-q3-4b-cp4":{"cells":["cal-ellavox-qwen3:0:0","cal-ellavox-qwen3:0:1","cal-ellavox-qwen3:0:2","cal-ellavox-qwen3:0:3","cal-ellavox-qwen3:0:4","cal-ellavox-qwen3:0:5","cal-ellavox-qwen3:0:6","cal-ellavox-qwen3:0:7"],"model":"Qwen/Qwen3-4B","recipe":"dev/trainer_rank_cost_calibration_lattice.sky.yaml","repeat":8,"shapes":[[1,4,1,1],[2,2,1,1]]}},
  "recipes": [
   "dev/trainer_rank_cost_calibration_local.sh",
   "dev/trainer_rank_cost_calibration_cp4.sky.yaml",
   "dev/trainer_rank_cost_calibration_2gpu.sky.yaml"
  ],
  "schema": "art.dev.trainer_rank_cost_calibration_manifest.v1",
- "table_id": "dense-h2560-h200-bf16"
+ "table_id": "dense-h2560-h200-bf16",
+ "withheld": [
+  {"model":"Qwen/Qwen3-4B","reason":"measured and fitted (three synthetic cells) but not admitted: on real-data groups the ten-term score cannot see the context-parallel exchange schedule and its regret reached 35% (dev/trainer_rank_planner_design.md, known limitation); version 1 is the less harmful fallback there until the CP-aware re-ranker is certified","shape":[1,4,1,1]}
+ ]
 }

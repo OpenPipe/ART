@@ -168,7 +168,9 @@ def test_admitted_execution_classes_are_exactly_the_certified_ones(table) -> Non
     }
     assert devices == set(table.device_classes)
     assert set(admitted["param_dtypes"]) == set(table.param_dtypes)
-    # Every geometry was measured at every admitted shape (product admission).
+    # Every geometry was measured at every admitted shape (product admission);
+    # a withheld pair is a measured pair the manifest documents with a reason,
+    # and the table does not admit it.
     measured = {
         (ModelGeometry(**cell["geometry"]), ParallelShape(*cell["shape"]))
         for cell in cells
@@ -176,6 +178,24 @@ def test_admitted_execution_classes_are_exactly_the_certified_ones(table) -> Non
     for geometry in table.geometries:
         for shape in table.shapes:
             assert (geometry, shape) in measured, (geometry.hidden_size, shape)
+    manifest = json.loads(manifest_path(table.table_id).read_text())
+    geometry_of_model = {
+        cell["model"]: ModelGeometry(**cell["geometry"]) for cell in cells
+    }
+    withheld = {
+        (geometry_of_model[entry["model"]], ParallelShape(*entry["shape"]))
+        for entry in manifest.get("withheld", [])
+    }
+    assert withheld == set(table.withheld)
+    assert withheld <= measured
+    assert all(entry.get("reason") for entry in manifest.get("withheld", []))
+    for geometry, shape in withheld:
+        assert not table.admits(
+            device=table.device_classes[0],
+            param_dtype=table.param_dtypes[0],
+            geometry=geometry,
+            shape=shape,
+        )
     # One geometry per model across all of its cells.
     by_model: dict[str, set[str]] = {}
     for cell in cells:

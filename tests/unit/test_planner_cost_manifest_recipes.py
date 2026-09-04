@@ -153,10 +153,20 @@ def test_launches_produce_exactly_the_manifest_cells(table) -> None:
     )
 
 
-def test_dense_table_manifest_is_the_original_58_cells() -> None:
+def test_dense_table_manifest_is_the_original_58_cells_plus_blind_spot_evidence() -> (
+    None
+):
+    """The 58 fitted cells of the original recipes, plus the Qwen3-4B real-data
+    launch at TP1 x CP4 and TP2 x CP2 (16 cells) that documents the
+    context-parallel blind spot; none of those 16 is fitted."""
+
     manifest = json.loads(manifest_path("dense-h2560-h200-bf16").read_text())
     expected = {cell["key"] for cell in manifest["cells"]}
-    assert len(expected) == 58 and not manifest["excluded"]
+    excluded = {cell["key"] for cell in manifest["excluded"]}
+    assert len(expected - excluded) == 58
+    assert excluded == launch_cells(manifest["launches"]["tr-cost-q3-4b-cp4"])
+    assert len(excluded) == 16
+    assert [entry["shape"] for entry in manifest["withheld"]] == [[1, 4, 1, 1]]
     for recipe in manifest["recipes"]:
         assert (_ROOT / recipe).is_file(), recipe
 

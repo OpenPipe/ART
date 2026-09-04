@@ -2,8 +2,8 @@
 
 A calibrated table admits a runtime when its device class, parameter dtype,
 model geometry (read from the Megatron config, never a model name) and
-parallel shape (TP x CP x EP x ETP) all appear in the table's measured sets;
-everything else keeps the version-1 score.
+parallel shape (TP x CP x EP x ETP) all appear in the table's measured sets and
+the pair is not withheld; everything else keeps the version-1 score.
 """
 
 from __future__ import annotations
@@ -57,6 +57,8 @@ def _selection(
 def test_measured_execution_classes_are_admitted() -> None:
     for geometry in (QWEN35_4B_GEOMETRY, QWEN3_4B_GEOMETRY):
         for shape in DENSE_H2560_TABLE.shapes:
+            if (geometry, shape) in DENSE_H2560_TABLE.withheld:
+                continue
             selection = _selection(geometry=geometry, shape=shape)
             assert selection.version == COEFFICIENT_VERSION
             assert selection.table_id == DENSE_H2560_TABLE.table_id
@@ -71,11 +73,11 @@ def test_unmeasured_classes_fall_back_to_version_one() -> None:
     assert _selection(device_capability=(8, 0)).version == fallback
     assert _selection(device_memory_bytes=H100_MEMORY_BYTES).version == fallback
     assert _selection(param_dtype="torch.float16").version == fallback
-    # Any geometry change: a wider model (Qwen3-8B-like), a neighbouring
-    # width, a different FFN ratio or head geometry, GDN state shape, or MoE.
+    # Any geometry change: an unmeasured wider model, a neighbouring width, a
+    # different FFN ratio or head geometry, GDN state shape, or MoE.
     dense = QWEN3_4B_GEOMETRY
     for geometry in (
-        ModelGeometry(4_096, 12_288, 32, 8, 128),
+        ModelGeometry(6_144, 16_384, 48, 8, 128),
         ModelGeometry(3_072, 8_192, 24, 8, 128),
         ModelGeometry(**{**dense.as_dict(), "ffn_hidden_size": 8_192}),
         ModelGeometry(**{**dense.as_dict(), "num_query_groups": 4}),
@@ -101,6 +103,58 @@ def test_unmeasured_classes_fall_back_to_version_one() -> None:
         selection = _selection(shape=shape)
         assert selection.version == fallback, shape
         assert selection.table_id is None and selection.coefficients is None
+
+
+def test_withheld_pair_falls_back_while_the_rest_of_its_table_is_admitted() -> None:
+    # Qwen3-4B at TP1 x CP4 is measured but withheld (the ten-term score cannot
+    # see the CP exchange schedule there); the GDN geometry keeps CP4 and the
+    # attention geometry keeps its other shapes.
+    cp4 = ParallelShape(tp=1, cp=4)
+    assert (QWEN3_4B_GEOMETRY, cp4) in DENSE_H2560_TABLE.withheld
+    withheld = _selection(geometry=QWEN3_4B_GEOMETRY, shape=cp4)
+    assert withheld.version == COEFFICIENT_VERSION_FALLBACK
+    assert withheld.table_id is None and withheld.coefficients is None
+    assert _selection(geometry=QWEN35_4B_GEOMETRY, shape=cp4).table_id == (
+        DENSE_H2560_TABLE.table_id
+    )
+    for shape in (ParallelShape(), ParallelShape(tp=1, cp=2), ParallelShape(tp=2)):
+        assert _selection(geometry=QWEN3_4B_GEOMETRY, shape=shape).table_id == (
+            DENSE_H2560_TABLE.table_id
+        ), shape
+
+
+def test_attention_classes_are_admitted_only_where_their_gates_pass() -> None:
+    from art.trainer_rank._planner_cost import (
+        DENSE_ATTN_H2048_TABLE,
+        DENSE_ATTN_H4096_TABLE,
+        DENSE_ATTN_H5120_TABLE,
+    )
+
+    cp4 = ParallelShape(tp=1, cp=4)
+    tp2cp2 = ParallelShape(tp=2, cp=2)
+    for table in (
+        DENSE_ATTN_H2048_TABLE,
+        DENSE_ATTN_H4096_TABLE,
+        DENSE_ATTN_H5120_TABLE,
+    ):
+        (geometry,) = table.geometries
+        for shape in table.shapes:
+            selection = _selection(geometry=geometry, shape=shape)
+            assert selection.table_id == table.table_id, (table.table_id, shape)
+            assert selection.coefficients is table.coefficients_milli_us
+        # TP1 x CP4 was measured for every attention class and is not admitted.
+        assert cp4 not in table.shapes
+        assert _selection(geometry=geometry, shape=cp4).version == (
+            COEFFICIENT_VERSION_FALLBACK
+        ), table.table_id
+        # A different dtype never borrows the table.
+        assert _selection(
+            geometry=geometry, shape=ParallelShape(), param_dtype="torch.float16"
+        ).version == (COEFFICIENT_VERSION_FALLBACK)
+    # TP2 x CP2 passed its gates only for the hidden-5,120 class.
+    assert tp2cp2 in DENSE_ATTN_H5120_TABLE.shapes
+    assert tp2cp2 not in DENSE_ATTN_H4096_TABLE.shapes
+    assert tp2cp2 not in DENSE_ATTN_H2048_TABLE.shapes
 
 
 def test_cpu_only_planning_uses_the_default_table() -> None:
