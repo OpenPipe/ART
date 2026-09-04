@@ -1400,6 +1400,12 @@ def main() -> None:
                 f"no cells on the re-ranked shapes {sorted(rerank_shapes)}"
             )
         candidates = [c for c in candidates if _shape_label(c) not in rerank_shapes]
+        if not candidates:
+            raise SystemExit(
+                "every cell is on a re-ranked shape: the direct table needs directly "
+                "scored cells (for a validation run of the two-stage selection alone, "
+                "read the timed `automatic` rows without --rerank-shapes)"
+            )
         print(
             f"re-ranked shapes {sorted(rerank_shapes)}: {len({c.cell for c in reranked})} cells "
             f"leave the direct fit ({len({c.cell for c in candidates})} direct cells)"
