@@ -5173,15 +5173,17 @@ def _tokenize_chat_view(
                     continue
             probe_messages = deepcopy(messages)
             slot_groups = _chat_message_text_slot_groups(probe_messages[message_index])
-            if len(slot_groups) != 1 or len(slot_groups[0]) != 1:
+            if not slot_groups:
                 continue
-            container, key = slot_groups[0][0]
-            original = str(container[key])
-            leading = original[: len(original) - len(original.lstrip())]
-            trailing = original[len(original.rstrip()) :]
-            container[key] = (
-                leading + f"ART_TRAJECTORY_{id(probe_messages):x}_PROBE" + trailing
-            )
+            for part_index, slots in enumerate(slot_groups):
+                for slot_index, (container, key) in enumerate(slots):
+                    original = str(container[key])
+                    leading = original[: len(original) - len(original.lstrip())]
+                    trailing = original[len(original.rstrip()) :]
+                    container[key] = (
+                        leading + f"ART_TRAJECTORY_{id(probe_messages):x}_"
+                        f"PROBE_{part_index}_{slot_index}" + trailing
+                    )
             try:
                 probe = render(
                     probe_messages,

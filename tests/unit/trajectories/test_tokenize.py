@@ -345,6 +345,7 @@ def _character_template_history(
     *,
     following_user: str = "turn 2",
     omit_length_tail: bool = False,
+    length_reasoning: str | None = None,
 ) -> tuple[ChatCompletionsHistory, _CharacterTemplateTokenizer, list[int]]:
     tokenizer = _CharacterTemplateTokenizer()
     answer = tokenizer._encode("answer")
@@ -363,7 +364,15 @@ def _character_template_history(
     first = _chat_exchange(first_prompt, first_output)
     second = _chat_exchange(second_prompt, second_output, offset=1)
     second.response.choices[0].finish_reason = "length"
+    if length_reasoning is not None:
+        data = second.response.model_dump(mode="python")
+        data["choices"][0]["message"]["reasoning_content"] = length_reasoning
+        second.response = ChatCompletion.model_validate(data)
     third = _chat_exchange(third_prompt, third_output, offset=2)
+    if length_reasoning is not None:
+        third.request["messages"][-2] = second.response.choices[0].message.model_dump(
+            mode="python", exclude_none=True
+        )
     if following_user != "turn 2":
         third.request["messages"][-1] = {"role": "user", "content": following_user}
     history = art.Trajectory(
@@ -688,6 +697,16 @@ def test_public_exact_chain_preserves_raw_drift_across_proven_length_boundary() 
     tail = length_start + len("answer")
     assert tokenized.flags[tail] == tr.TokenFlag.EXACT | tr.TokenFlag.STOP
     assert not tokenized.flags[tail] & tr.TokenFlag.SAMPLED
+
+
+def test_public_exact_chain_probes_multi_part_length_response() -> None:
+    history, tokenizer, expected = _character_template_history(
+        length_reasoning="thinking"
+    )
+
+    tokenized = history.tokenize(tokenizer=tokenizer)
+
+    assert tokenized.tokens == expected
 
 
 def test_public_exact_chain_rejects_user_token_colliding_with_missing_tail(
