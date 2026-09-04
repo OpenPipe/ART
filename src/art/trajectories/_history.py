@@ -490,6 +490,53 @@ def _chat_retains_sampled_suffix(
     return _retains_output_suffix(prior_prompt, prior_output, prompt_ids)
 
 
+def _chat_structured_generation_hit_limit(
+    branch: _Branch[Message, ChatCompletionsMessageSource, _ChatContext],
+    prompt_length: int,
+    cache: dict[tuple[int, int], _GenerationTokens],
+) -> bool:
+    """Reject append-only reconciliation of a token-limited structured output."""
+
+    prior_source = next(
+        (
+            source
+            for source in reversed(branch.sources[:prompt_length])
+            if source is not None
+            and isinstance(source.exchange, ChatCompletionsExchange)
+            and source.choice_index is not None
+        ),
+        None,
+    )
+    if prior_source is None or prior_source.choice_index is None:
+        return False
+    if not isinstance(prior_source.exchange, ChatCompletionsExchange):
+        raise AssertionError("Native Chat history has a non-Chat source")
+    exchange = prior_source.exchange
+    choice = next(
+        (
+            choice
+            for choice in exchange.response.choices
+            if choice.index == prior_source.choice_index
+        ),
+        None,
+    )
+    if (
+        choice is None
+        or choice.finish_reason != "tool_calls"
+        or not choice.message.tool_calls
+    ):
+        return False
+    limit = exchange.request.get("max_completion_tokens")
+    if limit is None:
+        limit = exchange.request.get("max_tokens")
+    if not isinstance(limit, int) or isinstance(limit, bool) or limit <= 0:
+        return False
+    _, prior_output = _chat_generation_tokens(
+        exchange, prior_source.choice_index, cache
+    )
+    return prior_output is not None and len(prior_output) >= limit
+
+
 def _anthropic_exact_generation_extends(
     branch: _Branch[AnthropicMessageParam, AnthropicMessageSource, _AnthropicContext],
     prompt_ids: Sequence[int] | None,
@@ -656,12 +703,17 @@ def chat_completions_histories(
                 branch, prompt_ids, len(prompt), token_cache
             )
             continuation = lambda branch: (
-                reconcile
-                or (
-                    _chat_retains_sampled_reasoning(
-                        branch, prompt_ids, len(prompt), token_cache
+                not _chat_structured_generation_hit_limit(
+                    branch, len(prompt), token_cache
+                )
+                and (
+                    reconcile
+                    or (
+                        _chat_retains_sampled_reasoning(
+                            branch, prompt_ids, len(prompt), token_cache
+                        )
+                        and exact_continuation(branch)
                     )
-                    and exact_continuation(branch)
                 )
             )
             source_continuation = lambda branch: (

@@ -1636,6 +1636,53 @@ def test_chat_template_stripped_reasoning_splits_exact_histories() -> None:
         trajectory.tokenize()
 
 
+@pytest.mark.parametrize("output_limit, expected_histories", [(2, 2), (3, 1)])
+def test_token_limited_structured_output_splits_append_only_continuation(
+    output_limit: int, expected_histories: int
+) -> None:
+    tool_call = {
+        "id": "call-1",
+        "type": "function",
+        "function": {"name": "lookup", "arguments": '{"id":"1"}'},
+    }
+    first = _chat([{"role": "user", "content": "one"}], "")
+    first.request["max_completion_tokens"] = output_limit
+    first_data = first.response.model_dump(mode="python")
+    first_data["prompt_token_ids"] = [1]
+    first_data["choices"][0]["finish_reason"] = "tool_calls"
+    first_data["choices"][0]["message"] = {
+        "role": "assistant",
+        "content": None,
+        "tool_calls": [tool_call],
+    }
+    first_data["choices"][0]["token_ids"] = [2, 3]
+    first.response = ChatCompletion.model_validate(first_data)
+
+    second = _chat(
+        [
+            {"role": "user", "content": "one"},
+            {"role": "assistant", "content": None, "tool_calls": [tool_call]},
+            {"role": "tool", "tool_call_id": "call-1", "content": "result"},
+        ],
+        "done",
+        offset=1,
+    )
+    second_data = second.response.model_dump(mode="python")
+    second_data["prompt_token_ids"] = [1, 2, 3, 4]
+    second_data["choices"][0]["token_ids"] = [5]
+    second.response = ChatCompletion.model_validate(second_data)
+    trajectory = art.Trajectory(
+        exchanges=TrajectoryExchanges(chat_completions=[first, second])
+    )
+
+    histories = trajectory.chat_completions_histories()
+
+    assert len(histories) == expected_histories
+    assert [len(history.messages) for history in histories] == (
+        [2, 4] if expected_histories == 2 else [4]
+    )
+
+
 def test_chat_reasoning_retokenization_reconciles_when_text_is_preserved() -> None:
     first = _chat([{"role": "user", "content": "one"}], "first")
     first_data = first.response.model_dump(mode="python")
