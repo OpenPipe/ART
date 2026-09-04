@@ -833,6 +833,8 @@ class MegatronBackend(LocalBackend):
         model: TrainableModel,
         trajectory_groups: list[TrajectoryGroup],
         *,
+        loss_type: dev.LossType | None = None,
+        max_completion_length: int | None = None,
         normalize_advantages: bool = True,
         advantage_balance: float = 0.0,
         scale_rewards: bool = True,
@@ -843,6 +845,12 @@ class MegatronBackend(LocalBackend):
     ) -> dict[str, float] | None:
         include_moe_routing = self._model_uses_expert_replay(model)
         dev_config = {
+            **({"loss_type": loss_type} if loss_type is not None else {}),
+            **(
+                {"max_completion_length": max_completion_length}
+                if max_completion_length is not None
+                else {}
+            ),
             "advantage_balance": advantage_balance,
             "allow_training_without_logprobs": allow_training_without_logprobs,
             "scale_rewards": scale_rewards and normalize_advantages,

@@ -573,6 +573,7 @@ def _prepare_dense_rl_micro(
     provider: Any,
     model_support_handler: Any,
     ref_logprobs: torch.Tensor | None,
+    is_dummy: bool = False,
 ) -> PreparedRLMicroInputs:
     attention_state = create_prefix_tree_state(
         group_ids=micro["group_ids"],
@@ -620,7 +621,7 @@ def _prepare_dense_rl_micro(
         model_input_pos=micro["input_pos"],
         model_labels=shifted_labels,
         attention_state=attention_state,
-        loss_inputs=LossInputs(inputs=micro),
+        loss_inputs=LossInputs(inputs=micro, is_dummy=is_dummy),
         lm_head_selection=lm_head_selection,
         ref_logprobs=ref_logprobs,
         local_token_uids=packed_sequence_token_uids(micro, device=device),
@@ -637,6 +638,7 @@ def _prepare_rl_cp_micro_full(
     model_support_handler: Any,
     trace_token_uids: bool,
     ref_logprobs: torch.Tensor | None,
+    is_dummy: bool = False,
 ) -> PreparedMegatronBatch:
     """Prepare RL CP inputs without moving planning metadata to CUDA first.
 
@@ -663,6 +665,7 @@ def _prepare_rl_cp_micro_full(
         block_mask_variants=_art_flex_cp_block_mask_variants(provider, device),
         target_device=device,
         ref_logprobs=ref_logprobs,
+        is_dummy=is_dummy,
         model_support_handler=model_support_handler,
         attention_head_dim=getattr(provider, "kv_channels", None),
         attention_value_head_dim=getattr(provider, "kv_channels", None),
@@ -700,6 +703,7 @@ def _prepare_current_rl_micro(
     ref_logprobs: torch.Tensor | None,
     trace_token_uids: bool,
     pending_prepared_micro: PreparedMegatronBatch | None,
+    is_dummy: bool = False,
 ) -> tuple[PreparedRLMicroInputs, PreparedMegatronBatch | None]:
     if int(topology.cp) <= 1:
         return (
@@ -709,6 +713,7 @@ def _prepare_current_rl_micro(
                 provider=provider,
                 model_support_handler=model_support_handler,
                 ref_logprobs=ref_logprobs,
+                is_dummy=is_dummy,
             ),
             pending_prepared_micro,
         )
@@ -722,6 +727,7 @@ def _prepare_current_rl_micro(
             model_support_handler=model_support_handler,
             trace_token_uids=trace_token_uids,
             ref_logprobs=ref_logprobs,
+            is_dummy=is_dummy,
         )
     return _prepared_rl_micro_from_cp_batch(prepared, ref_logprobs=ref_logprobs), None
 
@@ -735,6 +741,7 @@ def _prepare_next_rl_cp_micro(
     model_support_handler: Any,
     trace_token_uids: bool,
     ref_logprobs: torch.Tensor | None = None,
+    is_dummy: bool = False,
 ) -> PreparedMegatronBatch | None:
     if next_micro is None or int(topology.cp) <= 1:
         return None
@@ -746,6 +753,7 @@ def _prepare_next_rl_cp_micro(
         model_support_handler=model_support_handler,
         trace_token_uids=trace_token_uids,
         ref_logprobs=ref_logprobs,
+        is_dummy=is_dummy,
     )
 
 

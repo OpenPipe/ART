@@ -10,7 +10,7 @@ from typing import Any, cast
 from pydantic import BaseModel
 import torch
 
-from art.loss import shift_tensor
+from art.loss import LossInputs, shift_tensor
 from art.megatron.selective_lm_head import LmHeadTokenSelection
 from art.preprocessing.pack import PackedTensors
 
@@ -2192,6 +2192,7 @@ def prepare_cp_micro(
     block_mask_variants: tuple[CpBlockMaskVariant, ...] = (),
     target_device: torch.device | None = None,
     ref_logprobs: torch.Tensor | None = None,
+    is_dummy: bool = False,
     model_support_handler: Any | None = None,
     attention_head_dim: int | None = None,
     attention_value_head_dim: int | None = None,
@@ -2228,6 +2229,7 @@ def prepare_cp_micro(
         target_device=target_device,
         cp_group=cp_group,
         ref_logprobs=ref_logprobs,
+        is_dummy=is_dummy,
     )
     if model_support_handler is not None:
         from art.megatron.model_support.spec import PrefixTreeModelStateContext
@@ -2398,6 +2400,7 @@ def dispatch_megatron_context_parallel_training_tensors(
     target_device: torch.device | None = None,
     cp_group: Any | None = None,
     ref_logprobs: torch.Tensor | None = None,
+    is_dummy: bool = False,
 ) -> tuple[DispatchedPackedTensors, TrainingMicrobatchWorkload]:
     """Gather this rank's training tensors and optionally move them to device.
 
@@ -2419,6 +2422,24 @@ def dispatch_megatron_context_parallel_training_tensors(
     advantages = shift_tensor(micro["advantages"], 0.0)
     weights = shift_tensor(micro["weights"], 0.0)
     shifted_group_ids = shift_tensor(micro["group_ids"], 0)
+    # The dispatcher sees the complete packed row before slicing it across
+    # context-parallel ranks.  Preserve that logical completion count so the
+    # Dr. GRPO fixed denominator remains invariant to the CP token layout.
+    logical_sequence_count = (
+        LossInputs(inputs=micro).align_inputs().logical_sequence_count(assistant_mask)
+    )
+    # M-Core sums ``num_tokens`` across the CP group.  Assign the fixed
+    # denominator to rank zero of that group and zero to its peers, avoiding
+    # fractional integer counts when the denominator is not divisible by the
+    # CP degree.
+    normalization_denominator = (
+        torch.tensor(
+            0 if is_dummy else logical_sequence_count,
+            dtype=torch.int,
+        )
+        if rank_plan.rank == 0
+        else torch.zeros((), dtype=torch.int)
+    )
     original_logprobs_source = cast(Any, micro).get("original_logprobs")
     original_logprobs = (
         None
@@ -2474,6 +2495,9 @@ def dispatch_megatron_context_parallel_training_tensors(
         original_logprobs=maybe_dispatch(original_logprobs, 0.0),
         ref_logprobs=maybe_dispatch(ref_logprobs, float("nan")),
         loss_all_reduce_group=cp_group,
+        is_dummy=is_dummy,
+        logical_sequence_count_override=logical_sequence_count,
+        normalization_denominator_override=normalization_denominator,
         token_uids=None if local_token_uids is None else local_token_uids.contiguous(),
     )
     workload = TrainingMicrobatchWorkload(

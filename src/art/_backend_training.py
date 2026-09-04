@@ -34,9 +34,27 @@ _GRADIENT_WORKLOAD_METRICS = {
 _GRADIENT_TRAIN_TIME = "time/gradient_step_train_s"
 
 
+def _validate_loss_reduction(
+    loss_type: dev.LossType | None,
+    max_completion_length: int | None,
+) -> None:
+    if loss_type is not None and (
+        not isinstance(loss_type, str) or loss_type not in {"grpo", "bnpo", "dr_grpo"}
+    ):
+        raise ValueError("loss_type must be one of 'grpo', 'bnpo', or 'dr_grpo'.")
+    if max_completion_length is not None and (
+        isinstance(max_completion_length, bool)
+        or not isinstance(max_completion_length, int)
+        or max_completion_length < 1
+    ):
+        raise ValueError("max_completion_length must be a positive integer")
+
+
 def build_rl_train_configs(
     *,
     learning_rate: float,
+    loss_type: dev.LossType | None = None,
+    max_completion_length: int | None = None,
     advantage_balance: float = 0.0,
     scale_rewards: bool = True,
     importance_sampling_level: Literal[
@@ -63,6 +81,9 @@ def build_rl_train_configs(
     final_training_step: int | None = None,
     grad_accumulation_sequences: int | None = None,
 ) -> tuple[TrainConfig, dev.TrainConfig]:
+    if loss_type == "dr_grpo" and max_completion_length is None:
+        max_completion_length = dev.DEFAULT_MAX_COMPLETION_LENGTH
+    _validate_loss_reduction(loss_type, max_completion_length)
     config = TrainConfig(
         learning_rate=learning_rate,
         kl_penalty_coef=kl_penalty_coef,
@@ -81,6 +102,14 @@ def build_rl_train_configs(
         "precalculate_logprobs": precalculate_logprobs,
         "scale_rewards": scale_rewards,
     }
+
+    # Keep these optional so existing callers retain ART's historical BNPO
+    # behavior, while allowing a backend-level setting to override the
+    # trainer's native GRPOConfig when explicitly requested.
+    if loss_type is not None:
+        dev_config["loss_type"] = loss_type
+    if max_completion_length is not None:
+        dev_config["max_completion_length"] = max_completion_length
 
     if allow_training_without_logprobs is not None:
         dev_config["allow_training_without_logprobs"] = allow_training_without_logprobs
