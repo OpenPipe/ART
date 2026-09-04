@@ -232,6 +232,22 @@ Qwen3-4B × TP1 × CP4 (version 1's 15% worst observed cell is the less harmful
 fallback than the table's 35%; its 7 real-data CP4 cells are too few to
 certify a re-ranker).
 
+Fourth calibrated class (2026-09-04): Qwen3-30B-A3B (attention + MoE, hidden
+2,048, 128 experts top-8; `attn-moe-h2048-h200-bf16`) on H200 bf16 over the same
+EP-deconfounding lattice (112 cells; 3 CP1 cells excluded for the single-GPU
+memory admission of issue #848; no CP>1/EP1 segfaults on this model). Its
+timings carried sporadic 10–20 s stalls on about 4% of measured rounds and a
+few percent of drift across rounds (median per-candidate spread 17–25% at
+CP2/EP2 and CP4/EP2 against 1–8% for every other class), and the class shows the
+attention CP4 blind spot. Admission follows the gates: directly at TP1 × CP1,
+TP2 × CP1 and TP2 × CP1 with EP2 (39 cells; pairwise 99.9%, max regret 2.2%),
+and at TP1 × CP4 with EP2 through the two-stage re-ranker (14 cells; max 2.1%,
+every clear winner shortlisted, planning 1.0% of cell time against 1.3% saved),
+where version 1 lost up to 10.7%. TP1 × CP2 (EP1/EP2) and TP1 × CP4 (EP1/EP4)
+are measured but not admitted: neither selection passed its gates on the noisy
+evidence (version 1 loses up to 13% there); a sixteen-round re-measurement of
+those shapes is queued to admit them if the noise was transient.
+
 The re-ranker is affordable because the context-parallel assignment search
 was vectorized (`_evaluate_plans` in `art.megatron.context_parallel.runtime`):
 it prices a whole batch of candidate moves in one numpy pass with the cost

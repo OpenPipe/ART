@@ -54,6 +54,16 @@ def manifest_path(table_id: str) -> Path:
 _TABLES = pytest.mark.parametrize("table", CALIBRATED_TABLES, ids=lambda t: t.table_id)
 
 
+def _label(shape: ParallelShape) -> str:
+    """The fitter's shape label (``_shape_label``): tp, cp, then ep/etp when > 1."""
+
+    return (
+        f"tp{shape.tp}cp{shape.cp}"
+        + (f"ep{shape.ep}" if shape.ep > 1 else "")
+        + (f"etp{shape.etp}" if shape.etp > 1 else "")
+    )
+
+
 def test_default_table_is_the_dense_one() -> None:
     assert DENSE_H2560_TABLE.coefficients_milli_us == COEFFICIENTS_MILLI_US
     assert len({table.table_id for table in CALIBRATED_TABLES}) == len(
@@ -80,7 +90,7 @@ def test_certified_metrics_hold_on_the_recorded_aggregates(table) -> None:
     beta = np.asarray(
         [table.coefficients_milli_us.get(name, 0) / 1_000.0 for name in terms]
     )
-    reranked_labels = {f"tp{shape.tp}cp{shape.cp}" for shape in table.reranked_shapes}
+    reranked_labels = {_label(shape) for shape in table.reranked_shapes}
     candidates = [c for c in candidates if fit._shape_label(c) not in reranked_labels]
     report = fit.evaluate(candidates, fit.predict(candidates, terms, beta))
     recorded = payload["metrics"]["integer_all"]
@@ -116,7 +126,7 @@ def test_full_refit_reproduces_the_table_when_requested(table) -> None:
             and int(cell.rsplit("|g", 1)[1]) % 2 == 1
         )
 
-    reranked_labels = {f"tp{shape.tp}cp{shape.cp}" for shape in table.reranked_shapes}
+    reranked_labels = {_label(shape) for shape in table.reranked_shapes}
     train = [
         c
         for c in candidates
@@ -144,7 +154,7 @@ def test_reranked_shapes_are_certified_by_the_two_stage_selection(table) -> None
             ParallelShape(*cell["shape"]) in table.shapes for cell in payload["cells"]
         )
         return
-    reranked_labels = {f"tp{shape.tp}cp{shape.cp}" for shape in table.reranked_shapes}
+    reranked_labels = {_label(shape) for shape in table.reranked_shapes}
     assert set(block["shapes"]) == reranked_labels
     assert block["shortlist_size"] == table.reranker.shortlist_size
     assert block["incumbent"] == table.reranker.incumbent
@@ -161,7 +171,7 @@ def test_reranked_shapes_are_certified_by_the_two_stage_selection(table) -> None
     direct = [c for c in candidates if fit._shape_label(c) not in reranked_labels]
     assert reranked and direct
     assert {fit._shape_label(c) for c in direct} == {
-        f"tp{shape.tp}cp{shape.cp}" for shape in table.shapes
+        _label(shape) for shape in table.shapes
     }
     recomputed = fit.evaluate_two_stage(
         reranked,
