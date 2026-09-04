@@ -2299,6 +2299,16 @@ def phase_cost_calibrate(
             except TrainerRankMemoryError as error:
                 failed = 1
                 message = str(error)
+            except ValueError as error:
+                # The unsplit forward did not fit and admission tried a split
+                # rung; the forced candidate label names a layout of the whole
+                # tree, so it has no match in a sub-forward's family. A split
+                # run is not a comparable measurement anyway (the fitter drops
+                # subforward_count > 1), so record it as an admission failure.
+                if "unknown forced layout anchor" not in str(error):
+                    raise
+                failed = 1
+                message = f"forced layout has no match under a split rung: {error}"
             end.record()
             torch.cuda.synchronize()
             flags = torch.tensor([float(failed)], device="cuda")
