@@ -426,6 +426,122 @@ def test_process_context_does_not_reexecute_unguarded_script(
     assert marker.read_text() == "run\n"
 
 
+def test_process_exit_hook_runs_before_stdlib_joins_workers() -> None:
+    from concurrent.futures import process as stdlib_process
+
+    registered: list[Any] = getattr(threading, "_threading_atexits")
+    hooks = [getattr(hook, "func", hook) for hook in registered]
+
+    assert _parallel._shutdown_process_executor in hooks
+    # threading runs its exit hooks in reverse registration order.
+    assert hooks.index(_parallel._shutdown_process_executor) > hooks.index(
+        stdlib_process._python_exit
+    )
+    _parallel._shutdown_process_executor()  # no pool: nothing to do
+
+
+def test_interpreter_exit_is_bounded_after_process_tokenization(
+    tmp_path: Path,
+) -> None:
+    script = tmp_path / "exit_after_process_tokenization.py"
+    script.write_text(
+        textwrap.dedent(
+            """
+            import asyncio
+            import multiprocessing
+            import time
+
+            from openai.types.chat import ChatCompletion
+
+            import art
+            from art.trajectories import _parallel
+
+            _parallel._supports_processes = lambda **_: True
+            _parallel._processes_enabled = lambda *_: True
+            _parallel._PROCESS_EXIT_GRACE_SECONDS = 1.0
+
+
+            def trajectory(index):
+                token = index + 2
+                completion = ChatCompletion.model_validate(
+                    {
+                        "id": f"chat-{index}",
+                        "object": "chat.completion",
+                        "created": 0,
+                        "model": "test/model",
+                        "choices": [
+                            {
+                                "index": 0,
+                                "finish_reason": "stop",
+                                "message": {"role": "assistant", "content": "answer"},
+                                "prompt_token_ids": [1],
+                                "token_ids": [token],
+                                "logprobs": {
+                                    "content": [
+                                        {
+                                            "token": f"token_id:{token}",
+                                            "logprob": -0.2,
+                                            "bytes": [],
+                                            "top_logprobs": [],
+                                        }
+                                    ]
+                                },
+                            }
+                        ],
+                    }
+                )
+                return art.Trajectory(
+                    messages_and_choices=[completion.choices[0]],
+                    metadata={"index": index},
+                )
+
+
+            async def main():
+                trajectories = [trajectory(index) for index in range(4)]
+                first = await art.tokenize(trajectories, model="test/model")
+                workers = sorted(p.pid for p in multiprocessing.active_children())
+                second = await art.tokenize(trajectories, model="test/model")
+                assert [value.tokens for value in first] == [[1, 2], [1, 3], [1, 4], [1, 5]]
+                assert [value.trajectory for value in second] == trajectories
+                assert workers == sorted(p.pid for p in multiprocessing.active_children())
+                print("WORKERS", *workers, flush=True)
+                # Leave one worker busy with work nobody will ever consume, and one
+                # tokenization cancelled mid-flight, as an interrupted driver would.
+                _parallel._PROCESS_EXECUTOR.submit(time.sleep, 600)
+                task = asyncio.ensure_future(art.tokenize(trajectories, model="test/model"))
+                await asyncio.sleep(0)
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+
+
+            asyncio.run(main())
+            print("MAIN_DONE", time.time(), flush=True)
+            """
+        )
+    )
+
+    completed = subprocess.run(
+        [sys.executable, str(script)],
+        capture_output=True,
+        text=True,
+        timeout=600,
+        cwd=Path.cwd(),
+    )
+    finished_at = time.time()
+
+    assert completed.returncode == 0, completed.stderr
+    lines = dict(line.split(" ", 1) for line in completed.stdout.splitlines())
+    workers = [int(pid) for pid in lines["WORKERS"].split()]
+    assert len(workers) >= 2
+    assert finished_at - float(lines["MAIN_DONE"]) < 30
+    for pid in workers:
+        with pytest.raises(ProcessLookupError):
+            os.kill(pid, 0)
+
+
 def test_child_deserialization_failure_is_a_transfer_error() -> None:
     with pytest.raises(_parallel._ProcessTransferError, match="process input"):
         _parallel._tokenize_process_payload(b"not a pickle")

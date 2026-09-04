@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import atexit
 from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from concurrent.futures import Future, ProcessPoolExecutor, ThreadPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
@@ -8,6 +9,7 @@ from dataclasses import dataclass, field
 from functools import lru_cache
 import math
 import multiprocessing
+from multiprocessing.process import BaseProcess
 import os
 from pathlib import Path
 import pickle
@@ -35,6 +37,7 @@ _Operation = Literal["tokenize", "tensorize"]
 _PROCESS_MAX_WORKERS = 4
 _PROCESS_MIN_ITEMS = 4
 _PROCESS_MIN_THREAD_SECONDS = 1.0
+_PROCESS_EXIT_GRACE_SECONDS = 5.0
 
 
 def _cgroup_cpu_limit() -> int | None:
@@ -179,17 +182,74 @@ def _process_executor(capacity: int) -> ProcessPoolExecutor:
     return executor
 
 
-def _discard_process_executor() -> None:
+def _release_process_executor() -> ProcessPoolExecutor | None:
     global _PROCESS_EXECUTOR, _PROCESS_EXECUTOR_CAPACITY, _PROCESS_EXECUTOR_PID
     global _PROCESS_STARTUP
     with _PROCESS_EXECUTOR_LOCK:
         previous = _PROCESS_EXECUTOR
+        owned = _PROCESS_EXECUTOR_PID == os.getpid()
         _PROCESS_EXECUTOR = None
         _PROCESS_EXECUTOR_PID = None
         _PROCESS_EXECUTOR_CAPACITY = 0
         _PROCESS_STARTUP = ()
-        if previous is not None:
-            previous.shutdown(wait=False, cancel_futures=True)
+    return previous if owned else None
+
+
+def _discard_process_executor() -> None:
+    previous = _release_process_executor()
+    if previous is not None:
+        previous.shutdown(wait=False, cancel_futures=True)
+
+
+def _process_executor_workers(executor: ProcessPoolExecutor) -> list[BaseProcess]:
+    processes = getattr(executor, "_processes", None)
+    return list(processes.values()) if processes else []
+
+
+def _shutdown_process_executor(grace: float | None = None) -> None:
+    """Stop the shared process pool within a bounded time.
+
+    Runs before concurrent.futures joins its workers at interpreter exit. Idle
+    workers leave as soon as they read the shutdown sentinel; workers still busy
+    with tensorization nobody can consume anymore are terminated after ``grace``
+    seconds so the interpreter never waits on them indefinitely.
+    """
+    executor = _release_process_executor()
+    if executor is None:
+        return
+    if grace is None:
+        grace = _PROCESS_EXIT_GRACE_SECONDS
+    workers = _process_executor_workers(executor)
+    executor.shutdown(wait=False, cancel_futures=True)
+    deadline = time.monotonic() + max(0.0, grace)
+    for worker in workers:
+        worker.join(max(0.0, deadline - time.monotonic()))
+    for worker in workers:
+        if worker.is_alive():
+            worker.terminate()
+    for worker in workers:
+        worker.join(1.0)
+    for worker in workers:
+        if worker.is_alive():
+            worker.kill()
+            worker.join(1.0)
+
+
+def _register_process_exit_hook() -> None:
+    # threading's private atexit list runs before concurrent.futures joins its
+    # worker threads and processes, which is the only point early enough to
+    # bound that join. Fall back to atexit where the hook is unavailable.
+    register = getattr(threading, "_register_atexit", None)
+    if register is not None:
+        try:
+            register(_shutdown_process_executor)
+            return
+        except RuntimeError:
+            return
+    atexit.register(_shutdown_process_executor)
+
+
+_register_process_exit_hook()
 
 
 @dataclass
