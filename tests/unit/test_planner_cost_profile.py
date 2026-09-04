@@ -196,6 +196,31 @@ def test_attention_moe_class_admits_only_its_certified_shapes() -> None:
     )
 
 
+def test_dense_gdn_h5120_class_admits_its_four_measured_shapes() -> None:
+    from art.trainer_rank._planner_cost import (
+        DENSE_ATTN_H5120_TABLE,
+        DENSE_GDN_H5120_TABLE,
+        QWEN3_14B_GEOMETRY,
+        QWEN35_27B_GEOMETRY,
+    )
+
+    assert DENSE_GDN_H5120_TABLE.reranker is None
+    for shape in DENSE_GDN_H5120_TABLE.shapes:
+        selection = _selection(geometry=QWEN35_27B_GEOMETRY, shape=shape)
+        assert selection.table_id == DENSE_GDN_H5120_TABLE.table_id, shape
+    # CP4 is scored directly for this GDN class; TP2 x CP2 keeps version 1.
+    assert ParallelShape(tp=1, cp=4) in DENSE_GDN_H5120_TABLE.shapes
+    assert _selection(
+        geometry=QWEN35_27B_GEOMETRY, shape=ParallelShape(tp=2, cp=2)
+    ).version == (COEFFICIENT_VERSION_FALLBACK)
+    # Same hidden size as the Qwen3-14B attention class, different geometry:
+    # the two tables never borrow each other.
+    assert QWEN35_27B_GEOMETRY.hidden_size == QWEN3_14B_GEOMETRY.hidden_size
+    assert _selection(
+        geometry=QWEN3_14B_GEOMETRY, shape=ParallelShape(tp=1, cp=1)
+    ).table_id == (DENSE_ATTN_H5120_TABLE.table_id)
+
+
 def test_cpu_only_planning_uses_the_default_table() -> None:
     # No CUDA device (unit tests): the calibrated domain describes GPU
     # execution, so the device is not a reason to fall back.
