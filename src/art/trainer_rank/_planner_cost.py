@@ -343,6 +343,10 @@ class CalibratedTable:
     param_dtypes: tuple[str, ...]
     geometries: tuple[ModelGeometry, ...]
     shapes: tuple[ParallelShape, ...]
+    # Measured (geometry, shape) pairs the table does not admit: their cells
+    # are in the certificate and the fit, but the score is known to misrank
+    # that pair (a documented blind spot), so the fallback applies there.
+    withheld: tuple[tuple[ModelGeometry, ParallelShape], ...] = ()
 
     def admits(
         self,
@@ -357,6 +361,7 @@ class CalibratedTable:
             and param_dtype in self.param_dtypes
             and geometry in self.geometries
             and shape in self.shapes
+            and (geometry, shape) not in self.withheld
         )
 
 
@@ -497,6 +502,11 @@ DENSE_H2560_TABLE = CalibratedTable(
         ParallelShape(tp=1, cp=4),
         ParallelShape(tp=2, cp=1),
     ),
+    # Qwen3-4B at TP1 x CP4 is measured but withheld: on real-data groups the
+    # ten-term score cannot see the context-parallel exchange schedule and its
+    # regret reached 35% (design brief, known limitation); version 1 is the
+    # less harmful fallback there until the CP-aware re-ranker is certified.
+    withheld=((QWEN3_4B_GEOMETRY, ParallelShape(tp=1, cp=4)),),
 )
 # Qwen3.5-35B-A3B class (GDN + MoE, hidden 2,048): 16 attention heads in 2 query groups of 256 channels, GDN 32 value / 16 key heads of 128 dims, 256 experts (top-8, expert FFN 512, shared expert 512), on H200 bf16; measured at TP1 x CP1/2/4 and TP2 with EP1, EP2 at CP2/CP4/TP2 and EP4 at CP4 (2026-09-04).
 GDN_MOE_H2048_GEOMETRY = ModelGeometry(
@@ -544,13 +554,112 @@ GDN_MOE_H2048_TABLE = CalibratedTable(
     ),
 )
 
+# Dense attention classes measured on the shape lattice (2026-09-04):
+# Qwen3-1.7B (hidden 2,048), Qwen3-8B (4,096) and Qwen3-14B (5,120), each
+# with 8 query groups of 128 channels, on H200 bf16. TP1 x CP4 (and TP2 x CP2
+# for the two smaller classes) was measured but is not admitted: the ten-term
+# score cannot see the context-parallel exchange schedule and misranks the
+# recurring real-data groups there (design brief, known limitation), so those
+# shapes keep the version-1 score until the CP-aware re-ranker is certified.
+_ATTENTION_DTYPES = ("torch.bfloat16",)
+_ATTENTION_SHAPES = (
+    ParallelShape(tp=1, cp=1),
+    ParallelShape(tp=1, cp=2),
+    ParallelShape(tp=2, cp=1),
+)
+QWEN3_1_7B_GEOMETRY = ModelGeometry(
+    hidden_size=2_048,
+    ffn_hidden_size=6_144,
+    num_attention_heads=16,
+    num_query_groups=8,
+    kv_channels=128,
+)
+DENSE_ATTN_H2048_TABLE = CalibratedTable(
+    table_id="dense-attn-h2048-h200-bf16",
+    coefficients_milli_us={
+        "attention_token_cp_exchange": 0,
+        "gdn_level": 0,
+        "gdn_level_tp": 0,
+        "gdn_token_per_rank": 0,
+        "level_cp_per_layer": 0,
+        "level_tp_per_layer": 0,
+        "tiny_segment_per_layer": 0,
+        "token_cp_exchange": 46,
+        "token_per_rank": 259,
+        "token_tp_collective": 573,
+    },
+    device_classes=(H200_CLASS,),
+    param_dtypes=_ATTENTION_DTYPES,
+    geometries=(QWEN3_1_7B_GEOMETRY,),
+    shapes=_ATTENTION_SHAPES,
+)
+QWEN3_8B_GEOMETRY = ModelGeometry(
+    hidden_size=4_096,
+    ffn_hidden_size=12_288,
+    num_attention_heads=32,
+    num_query_groups=8,
+    kv_channels=128,
+)
+DENSE_ATTN_H4096_TABLE = CalibratedTable(
+    table_id="dense-attn-h4096-h200-bf16",
+    coefficients_milli_us={
+        "attention_token_cp_exchange": 0,
+        "gdn_level": 0,
+        "gdn_level_tp": 0,
+        "gdn_token_per_rank": 0,
+        "level_cp_per_layer": 0,
+        "level_tp_per_layer": 0,
+        "tiny_segment_per_layer": 0,
+        "token_cp_exchange": 262,
+        "token_per_rank": 2_858,
+        "token_tp_collective": 640,
+    },
+    device_classes=(H200_CLASS,),
+    param_dtypes=_ATTENTION_DTYPES,
+    geometries=(QWEN3_8B_GEOMETRY,),
+    shapes=_ATTENTION_SHAPES,
+)
+QWEN3_14B_GEOMETRY = ModelGeometry(
+    hidden_size=5_120,
+    ffn_hidden_size=17_408,
+    num_attention_heads=40,
+    num_query_groups=8,
+    kv_channels=128,
+)
+DENSE_ATTN_H5120_TABLE = CalibratedTable(
+    table_id="dense-attn-h5120-h200-bf16",
+    coefficients_milli_us={
+        "attention_token_cp_exchange": 0,
+        "gdn_level": 0,
+        "gdn_level_tp": 0,
+        "gdn_token_per_rank": 0,
+        "level_cp_per_layer": 0,
+        "level_tp_per_layer": 0,
+        "tiny_segment_per_layer": 0,
+        "token_cp_exchange": 0,
+        "token_per_rank": 4_607,
+        "token_tp_collective": 487,
+    },
+    device_classes=(H200_CLASS,),
+    param_dtypes=_ATTENTION_DTYPES,
+    geometries=(QWEN3_14B_GEOMETRY,),
+    shapes=_ATTENTION_SHAPES + (ParallelShape(tp=2, cp=2),),
+)
+
 CALIBRATED_TABLES: tuple[CalibratedTable, ...] = (
     DENSE_H2560_TABLE,
     GDN_MOE_H2048_TABLE,
+    DENSE_ATTN_H2048_TABLE,
+    DENSE_ATTN_H4096_TABLE,
+    DENSE_ATTN_H5120_TABLE,
 )
 # CPU-only planning (unit tests) prices with this table.
 DEFAULT_TABLE = DENSE_H2560_TABLE
 assert set(COEFFICIENTS_MILLI_US) == set(TERM_FUNCTIONS)
+assert all(
+    set(table.coefficients_milli_us) == set(TERM_FUNCTIONS)
+    for table in CALIBRATED_TABLES
+)
 
 
 def predicted_work(
@@ -629,7 +738,11 @@ __all__ = [
     "COEFFICIENT_VERSION",
     "COEFFICIENT_VERSION_FALLBACK",
     "DEFAULT_TABLE",
+    "DENSE_ATTN_H2048_TABLE",
+    "DENSE_ATTN_H4096_TABLE",
+    "DENSE_ATTN_H5120_TABLE",
     "DENSE_H2560_TABLE",
+    "GDN_MOE_H2048_TABLE",
     "CalibratedTable",
     "DeviceClass",
     "LayoutFeatures",

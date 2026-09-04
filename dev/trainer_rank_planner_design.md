@@ -156,17 +156,23 @@ geometry read from the Megatron config (hidden and FFN widths, attention head
 geometry, GDN state shape, expert geometry — never a model name; layer counts
 are scoring facts, not identity) and parallel shape (TP × CP × EP × ETP).
 Admission is exact: the dense hidden-2,560 table admits the Qwen3.5-4B and
-Qwen3-4B geometries at the four measured shapes (TP1 × CP1/2/4 and TP2 × CP1);
-TP2 × CP2, CP8, TP4, expert parallelism, other widths and MoE models keep the
-version-1 score (kept verbatim) with a one-time warning. Each certificate names
-its table and records the admitted device classes, dtypes, geometries and
-shapes; the certificate test asserts they equal the production table's sets
-and that every geometry was measured at every admitted shape.
+Qwen3-4B geometries at the four measured shapes (TP1 × CP1/2/4 and TP2 × CP1)
+except the withheld pair Qwen3-4B × TP1 × CP4 (measured and fitted, but the
+score is known to misrank real-data groups there; see the known limitation
+below). A table's `withheld` pairs fall back to version 1, and the manifest
+records each with its reason. TP2 × CP2, CP8, TP4, expert parallelism, other
+widths and MoE models keep the version-1 score (kept verbatim) with a one-time
+warning unless another table admits them. Each certificate names its table and
+records the admitted device classes, dtypes, geometries and shapes; the
+certificate test asserts they equal the production table's sets, that every
+geometry was measured at every admitted shape, and that the withheld pairs are
+exactly the manifest's.
 `dev/trainer_rank_cost_calibration_manifest_<table>.json` lists the exact cells
 each recipe or lattice launch of that table produces; the fitter's `--manifest` validation requires every
 non-excluded cell to be present and complete, rejects unexpected cells and
 duplicate cells with differing execution fingerprints (geometry included), and
-the certificate test asserts all 58 identities (no exclusions).
+the certificate test asserts the 58 fitted identities plus the 16 excluded
+blind-spot cells of the Qwen3-4B real-data launch (below).
 
 Second calibrated class (2026-09-04): Qwen3.5-35B-A3B (GDN + MoE, hidden
 2,048, 256 experts top-8) on H200 bf16, measured over a shape lattice that
@@ -189,18 +195,36 @@ of an Ellavox group with near-identical features (about 13k packed tokens,
 six versus seven segments, the same 12k-token longest segment) differ by 25%
 in measured time because one needs four exchange waves with rank loads
 7168/3584/1536/790 and the other two waves with 6656/2560/2048/1751. The
-Qwen3-1.7B and Qwen3-8B controls therefore fail the gates at CP4 with the ten
-terms (held-out max regret 26% and 14%) and are not certified, and the same
-group measured on the certified Qwen3-4B geometry at TP1 × CP4 shows a 35%
-regret for the shipped table (the version-1 score reaches 15% on another
-group there; neither is adequate). The dense certificate had no
+Qwen3-1.7B, Qwen3-8B and Qwen3-14B controls therefore fail the gates at CP4
+with the ten terms (held-out max regret 26%, 14% and 17%), and the same group
+measured on the certified Qwen3-4B geometry at TP1 × CP4 shows a 35% regret
+for the shipped table (the version-1 score reaches 15% on another group
+there; neither is adequate). The dense certificate had no
 attention-plus-real-data cells at CP4, so its metrics did not cover this.
-Adding two CP-plan-derived features offline (exchange waves × layers, maximum
-rank load × layers) lets the 1.7B class pass every gate (98.1% pairwise, max
-2.9%); deriving them costs about 25–40 ms per candidate on CPU, so the
-candidate fix is a CP-plan-aware re-rank of the top few layouts after the
-cheap score. Until then, attention models on real data at CP4 should be
-treated as unpriced by both scores.
+
+Resolution shipped (2026-09-04, per review): the attention classes get
+shape-restricted tables where the gates pass — Qwen3-1.7B
+(`dense-attn-h2048-h200-bf16`) and Qwen3-8B (`dense-attn-h4096-h200-bf16`) at
+TP1 × CP1/CP2 and TP2 × CP1, Qwen3-14B (`dense-attn-h5120-h200-bf16`) also at
+TP2 × CP2 (42/42/56 cells; pairwise 96.5%/99.9%/99.9%, max regret ≤1.1%,
+gates passing on every admitted shape) — while TP1 × CP4 (and TP2 × CP2 for
+the two smaller classes) stays on version 1, listed in each manifest as
+excluded with the reason. The dense table withholds Qwen3-4B × TP1 × CP4:
+version 1's 15% worst observed cell is the less harmful established fallback
+than the table's 35%, and this is ordinary execution-class admission, not a
+model or corpus rule. Adding CP-plan-derived features offline (exchange
+waves × layers, maximum rank load × layers) lets the 1.7B class pass every
+gate (98.1% pairwise, max 2.9%) and the 14B class with the load term alone
+(max 3.1%); deriving them costs about 25–40 ms per candidate on CPU. The
+planned fix is a two-stage selector: the cheap ten-term score shortlists the
+top k layouts (k swept offline for measured-best recall, the incumbent always
+included) and a separate small re-ranker scores the shortlist with the CP
+plan's exchange-wave count and critical-path work (sum over waves of the
+maximum rank work per wave) per layer, enabled only for the execution classes
+and shapes whose own certificate passes. Its certificate must cover shortlist
+recall, the re-ranking gates, non-regression against both the cheap score and
+version 1, and planning economics (re-ranking about ≤1% of execution time on
+the hot path, bounded by k, never a wall-clock search).
 
 Landing gates re-derived: the sealed win-cell shape still selects deep sharing
 (prompt-level sharing at CP4, where it measures fastest; full sharing at CP1),
