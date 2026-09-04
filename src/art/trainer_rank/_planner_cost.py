@@ -24,14 +24,21 @@ model pays almost nothing for it), per-rank token work shrinks with tp x cp,
 GDN layers cost more per token than attention layers, and segments that are
 tiny *per rank* run inefficient kernels. Ten terms carried weight; candidates
 that fitted to zero were dropped.
-``COEFFICIENT_VERSION`` is part of every layout cache key, so a new table
-invalidates cached recipes.
+``COEFFICIENT_VERSION`` and the selected table's identity are part of every
+layout cache key, so a new table invalidates cached recipes.
+
+Calibrated domain: a table applies only to the execution classes it was
+measured on — device class, parameter dtype, model geometry (widths, head
+geometry, GDN state shape, expert geometry) and parallel shape (TP, CP, EP,
+ETP) — see ``CalibratedTable`` and ``select_scoring``. Outside every table the
+version-1 score applies.
 """
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from ._prefix_tree_planner import PrefixTreeLayout
@@ -202,7 +209,7 @@ TERM_FUNCTIONS = {
 def score_terms(
     features: LayoutFeatures,
     facts: ScoringFacts,
-    coefficients_milli_us: dict[str, int],
+    coefficients_milli_us: Mapping[str, int],
 ) -> int:
     """Total predicted work under a coefficient table (milli-microseconds per
     feature unit), in 1/(WORK_PER_US x 1000) microsecond units."""
@@ -215,85 +222,184 @@ def score_terms(
 
 
 @dataclass(frozen=True, slots=True)
-class CalibrationProfile:
-    """The capability domain the fitted table was measured on — exactly.
+class ModelGeometry:
+    """Per-layer model geometry that sets kernel economics.
 
-    Capability-based, never model-name-based, and narrowed to what the
-    certificate actually contains: H200-class Hopper devices (compute
-    capability 9.0 *and* an HBM3e-sized memory system, which separates H200
-    from the 80 GB H100 that shares the capability), bf16 parameters, hidden
-    size 2,560 (Qwen3.5-4B GDN and Qwen3-4B attention), dense (non-MoE)
-    models, at TP1/TP2 and CP1/CP2/CP4. Hidden size is not a score feature,
-    so every admitted width would get identical token-versus-boundary
-    economics; only measured widths are admitted. Outside this domain the
-    selector keeps the version-1 score. Extending the domain means running
-    the calibration cells on the new device or width and regenerating the
-    certificate, which the certificate test binds to these fields.
+    Read from the Megatron ``TransformerConfig`` (never from a model name);
+    layer *counts* are scoring facts, not identity. GDN and MoE fields are
+    zero when the model has no such layers, so an attention-only model and a
+    hybrid one never share a geometry.
     """
 
-    device_capabilities: tuple[tuple[int, int], ...] = ((9, 0),)
-    # H200 reports ~143 GB; H100 (80 GB) is excluded by this bound.
-    min_device_memory_bytes: int = 120 * 1024**3
-    param_dtypes: tuple[str, ...] = ("torch.bfloat16",)
-    hidden_sizes: tuple[int, ...] = (2_560,)
-    allow_moe: bool = False
-    # Documentation of the measured devices; matching never reads names.
-    measured_device_names: tuple[str, ...] = ("NVIDIA H200",)
+    hidden_size: int
+    ffn_hidden_size: int
+    num_attention_heads: int
+    num_query_groups: int
+    kv_channels: int
+    gdn_value_heads: int = 0
+    gdn_key_heads: int = 0
+    gdn_key_head_dim: int = 0
+    gdn_value_head_dim: int = 0
+    gdn_conv_kernel: int = 0
+    moe_experts: int = 0
+    moe_topk: int = 0
+    moe_ffn_hidden_size: int = 0
+    moe_shared_expert_ffn: int = 0
 
-    def matches(
+    @classmethod
+    def from_config(
+        cls, config: Any, *, has_gdn: bool, has_moe: bool
+    ) -> "ModelGeometry":
+        def field(name: str, default: int = 0) -> int:
+            value = getattr(config, name, None)
+            return int(value) if value is not None else default
+
+        hidden = field("hidden_size")
+        heads = field("num_attention_heads")
+        return cls(
+            hidden_size=hidden,
+            ffn_hidden_size=field("ffn_hidden_size"),
+            num_attention_heads=heads,
+            num_query_groups=field("num_query_groups", heads),
+            kv_channels=field("kv_channels", hidden // heads if heads else 0),
+            gdn_value_heads=field("linear_num_value_heads") if has_gdn else 0,
+            gdn_key_heads=field("linear_num_key_heads") if has_gdn else 0,
+            gdn_key_head_dim=field("linear_key_head_dim") if has_gdn else 0,
+            gdn_value_head_dim=field("linear_value_head_dim") if has_gdn else 0,
+            gdn_conv_kernel=field("linear_conv_kernel_dim") if has_gdn else 0,
+            moe_experts=field("num_moe_experts") if has_moe else 0,
+            moe_topk=field("moe_router_topk") if has_moe else 0,
+            moe_ffn_hidden_size=field("moe_ffn_hidden_size") if has_moe else 0,
+            moe_shared_expert_ffn=(
+                field("moe_shared_expert_intermediate_size") if has_moe else 0
+            ),
+        )
+
+    def as_dict(self) -> dict[str, int]:
+        return asdict(self)
+
+
+@dataclass(frozen=True, slots=True)
+class DeviceClass:
+    """Accelerator class: compute capability plus a memory-system bucket.
+
+    The 80 GB H100 shares capability 9.0 with the 141 GB H200 but not its
+    memory system, so the bucket separates them. ``memory_class`` is ``None``
+    when the runtime cannot read device memory (older drivers); such a device
+    is admitted on capability alone.
+    """
+
+    capability: tuple[int, int]
+    memory_class: str | None
+
+    @staticmethod
+    def memory_class_for(memory_bytes: int | None) -> str | None:
+        if memory_bytes is None:
+            return None
+        if memory_bytes >= 120 * 1024**3:
+            return "hbm-141g"
+        if memory_bytes >= 70 * 1024**3:
+            return "hbm-80g"
+        return "hbm-small"
+
+    @classmethod
+    def for_device(
+        cls, capability: tuple[int, int], memory_bytes: int | None
+    ) -> "DeviceClass":
+        return cls(
+            (int(capability[0]), int(capability[1])),
+            cls.memory_class_for(memory_bytes),
+        )
+
+    def admits(self, device: "DeviceClass") -> bool:
+        return device.capability == self.capability and (
+            device.memory_class is None or device.memory_class == self.memory_class
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class ParallelShape:
+    """The parallel shape a table was measured at: TP x CP x EP x ETP."""
+
+    tp: int = 1
+    cp: int = 1
+    ep: int = 1
+    etp: int = 1
+
+
+@dataclass(frozen=True)
+class CalibratedTable:
+    """One fitted coefficient table and the execution classes it admits.
+
+    Admission is exact: the runtime's device class, parameter dtype, model
+    geometry and parallel shape must each appear in the table's measured
+    sets (the certificate test binds these sets to the recorded cells). No
+    configuration is admitted because a width falls between measured widths.
+    """
+
+    table_id: str
+    coefficients_milli_us: Mapping[str, int]
+    device_classes: tuple[DeviceClass, ...]
+    param_dtypes: tuple[str, ...]
+    geometries: tuple[ModelGeometry, ...]
+    shapes: tuple[ParallelShape, ...]
+
+    def admits(
         self,
         *,
-        device_capability: tuple[int, int] | None,
-        device_memory_bytes: int | None,
+        device: DeviceClass,
         param_dtype: str,
-        hidden_size: int,
-        is_moe: bool,
+        geometry: ModelGeometry,
+        shape: ParallelShape,
     ) -> bool:
-        if device_capability is not None and (
-            tuple(device_capability) not in self.device_capabilities
-        ):
-            return False
-        if device_memory_bytes is not None and (
-            device_memory_bytes < self.min_device_memory_bytes
-        ):
-            return False
-        if param_dtype not in self.param_dtypes:
-            return False
-        if hidden_size not in self.hidden_sizes:
-            return False
-        return self.allow_moe or not is_moe
+        return (
+            any(known.admits(device) for known in self.device_classes)
+            and param_dtype in self.param_dtypes
+            and geometry in self.geometries
+            and shape in self.shapes
+        )
 
 
-CALIBRATION_PROFILE = CalibrationProfile()
+@dataclass(frozen=True, slots=True)
+class ScoringSelection:
+    """The score a runtime uses: version 2 with one table, or the fallback."""
+
+    version: int
+    table_id: str | None
+    coefficients: Mapping[str, int] | None
 
 
-def coefficient_version_for(
+def select_scoring(
     *,
     device_capability: tuple[int, int] | None,
+    device_memory_bytes: int | None,
     param_dtype: str,
-    hidden_size: int,
-    is_moe: bool,
-    device_memory_bytes: int | None = None,
-) -> int:
-    """Pick the score version for a runtime: the fitted table inside its
-    calibrated capability profile, the fallback outside it.
+    geometry: ModelGeometry,
+    shape: ParallelShape,
+) -> ScoringSelection:
+    """Pick the score for a runtime: the table whose measured execution
+    classes admit it, else the version-1 fallback.
 
     ``device_capability`` is ``None`` when the model is not on a CUDA device
-    (CPU-only planning, as in the unit tests); such runtimes use the fitted
-    table, since the profile describes GPU execution. On CUDA both the
-    capability and the device memory size are checked.
+    (CPU-only planning, as in the unit tests); such runtimes use the default
+    table, since the calibrated domain describes GPU execution.
     """
 
     if device_capability is None:
-        return COEFFICIENT_VERSION
-    inside = CALIBRATION_PROFILE.matches(
-        device_capability=device_capability,
-        device_memory_bytes=device_memory_bytes,
-        param_dtype=param_dtype,
-        hidden_size=hidden_size,
-        is_moe=is_moe,
-    )
-    return COEFFICIENT_VERSION if inside else COEFFICIENT_VERSION_FALLBACK
+        return ScoringSelection(
+            COEFFICIENT_VERSION,
+            DEFAULT_TABLE.table_id,
+            DEFAULT_TABLE.coefficients_milli_us,
+        )
+    device = DeviceClass.for_device(device_capability, device_memory_bytes)
+    for table in CALIBRATED_TABLES:
+        if table.admits(
+            device=device, param_dtype=param_dtype, geometry=geometry, shape=shape
+        ):
+            return ScoringSelection(
+                COEFFICIENT_VERSION, table.table_id, table.coefficients_milli_us
+            )
+    return ScoringSelection(COEFFICIENT_VERSION_FALLBACK, None, None)
 
 
 # --- Version 1 (fallback): the landing's hand-shaped score ---------------------
@@ -341,6 +447,7 @@ def _prefix_tree_layout_score_v1(
 # module docstring for provenance; regenerate with
 # ``dev/trainer_rank_cost_fit.py --integerize`` and the checked-in certificate).
 COEFFICIENT_SCALE_PER_US = 1_000
+# Dense hidden-2,560 class (Qwen3.5-4B GDN and Qwen3-4B attention on H200 bf16).
 COEFFICIENTS_MILLI_US: dict[str, int] = {
     "token_per_rank": 2002,
     "token_cp_exchange": 39,
@@ -353,23 +460,72 @@ COEFFICIENTS_MILLI_US: dict[str, int] = {
     "gdn_level": 3336555,
     "gdn_level_tp": 1194872,
 }
+
+H200_CLASS = DeviceClass(capability=(9, 0), memory_class="hbm-141g")
+# Megatron TransformerConfig geometry of the two measured models. Qwen3.5-4B:
+# 16 attention heads in 4 query groups of 256 channels, GDN with 32 value /
+# 16 key heads of 128 dims and a 4-tap conv; Qwen3-4B: 32 heads in 8 groups
+# of 128 channels. Layer counts are scoring facts, not identity.
+QWEN35_4B_GEOMETRY = ModelGeometry(
+    hidden_size=2_560,
+    ffn_hidden_size=9_216,
+    num_attention_heads=16,
+    num_query_groups=4,
+    kv_channels=256,
+    gdn_value_heads=32,
+    gdn_key_heads=16,
+    gdn_key_head_dim=128,
+    gdn_value_head_dim=128,
+    gdn_conv_kernel=4,
+)
+QWEN3_4B_GEOMETRY = ModelGeometry(
+    hidden_size=2_560,
+    ffn_hidden_size=9_728,
+    num_attention_heads=32,
+    num_query_groups=8,
+    kv_channels=128,
+)
+DENSE_H2560_TABLE = CalibratedTable(
+    table_id="dense-h2560-h200-bf16",
+    coefficients_milli_us=COEFFICIENTS_MILLI_US,
+    device_classes=(H200_CLASS,),
+    param_dtypes=("torch.bfloat16",),
+    geometries=(QWEN35_4B_GEOMETRY, QWEN3_4B_GEOMETRY),
+    shapes=(
+        ParallelShape(tp=1, cp=1),
+        ParallelShape(tp=1, cp=2),
+        ParallelShape(tp=1, cp=4),
+        ParallelShape(tp=2, cp=1),
+    ),
+)
+CALIBRATED_TABLES: tuple[CalibratedTable, ...] = (DENSE_H2560_TABLE,)
+# CPU-only planning (unit tests) prices with this table.
+DEFAULT_TABLE = DENSE_H2560_TABLE
 assert set(COEFFICIENTS_MILLI_US) == set(TERM_FUNCTIONS)
 
 
 def predicted_work(
     features: LayoutFeatures,
     facts: ScoringFacts,
-    coefficients_milli_us: dict[str, int] = COEFFICIENTS_MILLI_US,
+    coefficients: Mapping[str, int] | None = None,
 ) -> int:
-    """Total predicted work in 1/(WORK_PER_US x COEFFICIENT_SCALE_PER_US) us."""
+    """Integer predicted work under a table (default: the shipped dense table)."""
 
-    return score_terms(features, facts, coefficients_milli_us)
+    return score_terms(
+        features,
+        facts,
+        COEFFICIENTS_MILLI_US if coefficients is None else coefficients,
+    )
 
 
-def predicted_us(features: LayoutFeatures, facts: ScoringFacts) -> float:
-    """Predicted layout-dependent work in microseconds (for logging only)."""
-
-    return predicted_work(features, facts) / (WORK_PER_US * COEFFICIENT_SCALE_PER_US)
+def predicted_us(
+    features: LayoutFeatures,
+    facts: ScoringFacts,
+    coefficients: Mapping[str, int] | None = None,
+) -> float:
+    return predicted_work(features, facts, coefficients) / (
+        WORK_PER_US * COEFFICIENT_SCALE_PER_US
+    )
 
 
 def prefix_tree_layout_score(
@@ -381,13 +537,15 @@ def prefix_tree_layout_score(
     tp_size: int = 1,
     gdn_layers: int | None = None,
     coefficient_version: int = COEFFICIENT_VERSION,
+    coefficients: Mapping[str, int] | None = None,
 ) -> tuple[int, int, int, int]:
     """Price one layout for the given topology and model facts.
 
     ``gdn_layers`` defaults to ``layers`` when the model uses GDN and to zero
     otherwise; ``uses_gdn`` only matters for that default.
-    ``coefficient_version`` selects the fitted table (2) or the fallback (1);
-    see ``coefficient_version_for``.
+    ``coefficient_version`` selects a fitted table (2) or the fallback (1) and
+    ``coefficients`` names the table (default: the shipped dense table); see
+    ``select_scoring``.
     """
 
     if coefficient_version == COEFFICIENT_VERSION_FALLBACK:
@@ -408,7 +566,7 @@ def prefix_tree_layout_score(
         ),
     )
     return (
-        predicted_work(features, facts),
+        predicted_work(features, facts, coefficients),
         layout.packed_tokens,
         features.segment_count,
         layout.maximum_depth,
@@ -416,22 +574,28 @@ def prefix_tree_layout_score(
 
 
 __all__ = [
-    "CALIBRATION_PROFILE",
+    "CALIBRATED_TABLES",
     "COEFFICIENTS_MILLI_US",
     "COEFFICIENT_SCALE_PER_US",
     "COEFFICIENT_VERSION",
     "COEFFICIENT_VERSION_FALLBACK",
-    "CalibrationProfile",
+    "DEFAULT_TABLE",
+    "DENSE_H2560_TABLE",
+    "CalibratedTable",
+    "DeviceClass",
     "LayoutFeatures",
+    "ModelGeometry",
+    "ParallelShape",
+    "ScoringSelection",
     "SEGMENT_LENGTH_THRESHOLDS",
     "ScoringFacts",
     "TERM_FUNCTIONS",
     "TINY_SEGMENT_TOKENS",
     "WORK_PER_US",
-    "coefficient_version_for",
     "layout_features",
     "predicted_us",
     "predicted_work",
     "prefix_tree_layout_score",
     "score_terms",
+    "select_scoring",
 ]

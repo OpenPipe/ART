@@ -137,3 +137,41 @@ def test_manifest_validation_flags_missing_unexpected_and_mixed_cells(
     # An exclusion that the manifest does not list is itself a problem.
     problems, _ = fit.validate_manifest([evidence], manifest, excluded=["cp1|g0"])
     assert any("not listed in the manifest" in p for p in problems)
+
+
+def test_cell_key_carries_expert_parallelism_only_when_present() -> None:
+    row = {
+        "cell": "cal-grpo-g8",
+        "model": "Qwen/Qwen3.5-35B-A3B",
+        "layers": 40,
+        "tp": 1,
+        "cp": 4,
+        "workload": {"kind": "grpo"},
+    }
+    assert fit._cell_key(row) == "cal-grpo-g8|Qwen/Qwen3.5-35B-A3B|L40|tp1|cp4"
+    assert fit._cell_key({**row, "ep": 2}) == (
+        "cal-grpo-g8|Qwen/Qwen3.5-35B-A3B|L40|tp1|cp4|ep2"
+    )
+    assert fit._cell_key({**row, "ep": 4, "etp": 2, "workload": {"group": 3}}) == (
+        "cal-grpo-g8|Qwen/Qwen3.5-35B-A3B|L40|tp1|cp4|ep4|etp2|g3"
+    )
+    # Older rows without expert fields keep their historical keys.
+    assert fit._shape({"tp": 2, "cp": 1}) == (2, 1, 1, 1)
+
+
+def test_group_reports_judge_gates_per_group() -> None:
+    def candidates(cell: str, model: str, times: dict[str, float]) -> list:
+        return [
+            fit.Candidate(cell, label, {}, {}, ms, 8, 0.5, model, (1, 1, 1, 1))
+            for label, ms in times.items()
+        ]
+
+    good = candidates("a|M1|L2|tp1|cp1", "M1", {"x": 100.0, "y": 120.0})
+    bad = candidates("b|M2|L2|tp1|cp1", "M2", {"x": 100.0, "y": 130.0})
+    # Predictions rank the good cell right and the bad cell wrong (30% regret).
+    predicted = [1.0, 2.0, 2.0, 1.0]
+    report = fit.evaluate_groups(
+        good + bad, __import__("numpy").asarray(predicted), lambda c: c.model
+    )
+    assert report["M1"]["max_regret_pct"] == 0.0 and not report["M1"]["gate_problems"]
+    assert report["M2"]["max_regret_pct"] > 10.0 and report["M2"]["gate_problems"]

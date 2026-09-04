@@ -19,7 +19,7 @@ Provenance: adopted from the holistic-planner research implementation frozen
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable, Iterator, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 import hashlib
 from itertools import combinations
@@ -754,13 +754,16 @@ def select_prefix_tree_layout(
     tp_size: int = 1,
     gdn_layers: int | None = None,
     coefficient_version: int | None = None,
+    coefficients: Mapping[str, int] | None = None,
 ):
     """Production layout selection for one canonical tree.
 
     Composes the mandatory candidate family, the production score, and the
     bounded nonuniform refinement search.  Deterministic: identical trees,
     topology facts, and budgets yield identical layouts on every rank.
-    ``gdn_layers`` defaults to ``layers`` when the model uses GDN.
+    ``gdn_layers`` defaults to ``layers`` when the model uses GDN;
+    ``coefficients`` is the calibrated table for this runtime's execution
+    class (default: the shipped dense table).
     """
 
     from ._planner_cost import COEFFICIENT_VERSION, prefix_tree_layout_score
@@ -778,6 +781,7 @@ def select_prefix_tree_layout(
             tp_size=tp_size,
             gdn_layers=gdn_layers,
             coefficient_version=version,
+            coefficients=coefficients,
         )
 
     return search_prefix_tree_layout(

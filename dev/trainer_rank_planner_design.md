@@ -148,16 +148,25 @@ the production selection timed in the later CP2/TP2 cells had median regret
 −0.2%, max 0.4%. The hand-set version-1 score on the original 56 cells: 78.6%
 pairwise, max regret 67% (an Ellavox group at CP2).
 
-Calibrated domain: the table applies only inside `CalibrationProfile`, which
-is narrowed to exactly what the certificate measured and bound to it by test —
-compute capability 9.0 with an H200-class memory system (the 80 GB H100 shares
-the capability and is excluded by device memory), bf16, hidden size 2,560,
-dense models; everything else keeps the version-1 score (kept verbatim) with a
-one-time warning. `dev/trainer_rank_cost_calibration_manifest.json` lists the
-exact cells each recipe launches; the fitter's `--manifest` validation requires
-every non-excluded cell to be present and complete, rejects unexpected cells
-and duplicate cells with differing execution fingerprints, and the certificate
-test asserts all 58 identities (no exclusions).
+Calibrated domain: a table applies only to the execution classes it was
+measured on (`CalibratedTable`, `select_scoring`): device class (compute
+capability plus a memory-system bucket, so the 80 GB H100 that shares
+capability 9.0 with the 141 GB H200 is not admitted), parameter dtype, model
+geometry read from the Megatron config (hidden and FFN widths, attention head
+geometry, GDN state shape, expert geometry — never a model name; layer counts
+are scoring facts, not identity) and parallel shape (TP × CP × EP × ETP).
+Admission is exact: the dense hidden-2,560 table admits the Qwen3.5-4B and
+Qwen3-4B geometries at the four measured shapes (TP1 × CP1/2/4 and TP2 × CP1);
+TP2 × CP2, CP8, TP4, expert parallelism, other widths and MoE models keep the
+version-1 score (kept verbatim) with a one-time warning. Each certificate names
+its table and records the admitted device classes, dtypes, geometries and
+shapes; the certificate test asserts they equal the production table's sets
+and that every geometry was measured at every admitted shape.
+`dev/trainer_rank_cost_calibration_manifest.json` lists the exact cells each
+recipe launches; the fitter's `--manifest` validation requires every
+non-excluded cell to be present and complete, rejects unexpected cells and
+duplicate cells with differing execution fingerprints (geometry included), and
+the certificate test asserts all 58 identities (no exclusions).
 
 Landing gates re-derived: the sealed win-cell shape still selects deep sharing
 (prompt-level sharing at CP4, where it measures fastest; full sharing at CP1),
@@ -166,13 +175,14 @@ selection stays deterministic. The coefficient version is part of the planner
 facts and therefore of every layout cache key, so the new table invalidates
 cached recipes.
 
-Calibrated domain (review finding): the table was measured on one capability
-class, so it applies only inside `CalibrationProfile` — compute capability
-9.0, bf16, hidden size 2,048–3,072, non-MoE — and TrainerRank keeps the
-version-1 score (kept verbatim as the fallback) outside it, logging once. The
-gate is capability-based, never model-name-based; extending the domain means
-running the calibration cells on the new hardware or width and widening the
-profile with evidence. CPU-only planning (unit tests) uses the fitted table.
+Calibrated domain (review finding, generalized for the multi-class campaign):
+the gate is capability- and geometry-based, never model-name-based. Extending
+the domain means running the calibration cells on the new execution class and
+either fitting it its own table or admitting it into an existing one, with a
+certificate either way; no class is admitted because a width falls between
+measured widths. The selected table's identity joins the coefficient version
+in the planner facts and therefore in every layout cache key. CPU-only
+planning (unit tests) uses the default dense table.
 
 Reproducibility (review finding): `dev/trainer_rank_cost_calibration_certificate.json`
 binds the shipped table to its data — per-cell candidate features, median
