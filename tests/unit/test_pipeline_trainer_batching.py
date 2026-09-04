@@ -31,7 +31,9 @@ def _group() -> TrajectoryGroup:
     )
 
 
-def _eval_choice(step: int, *, with_spans: bool = True) -> Choice:
+def _eval_choice(
+    step: int, *, completion_tokens: int = 1, with_spans: bool = True
+) -> Choice:
     choice = Choice(
         index=0,
         finish_reason="stop",
@@ -41,7 +43,7 @@ def _eval_choice(step: int, *, with_spans: bool = True) -> Choice:
         cast(dict[str, Any], choice.model_extra)["policy_token_spans"] = [
             {
                 "start_token": 0,
-                "end_token": 1,
+                "end_token": completion_tokens,
                 "generation_id": f"generation-{step}",
                 "policy_version": step,
                 "lora_slot": "slot",
@@ -49,6 +51,55 @@ def _eval_choice(step: int, *, with_spans: bool = True) -> Choice:
             }
         ]
     return choice
+
+
+@pytest.mark.asyncio
+async def test_local_pipeline_records_exact_choice_completion_tokens(
+    tmp_path: Path,
+) -> None:
+    choice = _eval_choice(0, completion_tokens=3)
+    cast(dict[str, Any], choice.model_extra)["art_completion_tokens"] = 3
+
+    async def rollout(*_args: object, **_kwargs: object) -> TrajectoryGroup:
+        return TrajectoryGroup(
+            [
+                Trajectory(
+                    reward=1.0,
+                    messages_and_choices=[
+                        {"role": "user", "content": "prompt"},
+                        choice,
+                    ],
+                )
+            ]
+        )
+
+    trainer = PipelineTrainer(
+        model=TrainableModel(
+            run_name="pipeline-completion-tokens-test",
+            name="pipeline-completion-tokens-test",
+            project="pipeline-tests",
+            base_model="test-model",
+            base_path=str(tmp_path),
+        ),
+        backend=MagicMock(),  # type: ignore[arg-type]
+        rollout_fn=rollout,
+        scenarios=[{"metadata": {"scenario_id": "scenario-0"}}],
+        config={},
+        pipeline=PipelineRuntimeConfig(
+            num_rollout_workers=1,
+            min_batch_size=1,
+            max_batch_size=1,
+        ),
+        max_steps=1,
+        eval_fn=None,
+    )
+    trainer._output_queue = asyncio.Queue()
+
+    await trainer._rollout_worker(worker_id=0)
+
+    group = await trainer._output_queue.get()
+    assert group is not None
+    assert group.trajectories[0].metrics["completion_tokens"] == 3
 
 
 def test_eval_rejects_tokens_from_another_policy() -> None:

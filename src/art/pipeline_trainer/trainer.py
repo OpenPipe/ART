@@ -39,6 +39,7 @@ from art.distributed.rollout import (
 )
 from art.distributed.trajectory_store import TrajectoryGroupRef
 from art.errors import LocalServingUnavailableError
+from art.gather import record_trajectory_completion_tokens
 from art.pipeline_tuner import (
     PackedGroupObservation,
     PackedGroupShape,
@@ -996,6 +997,8 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                 scenario_metadata = self._scenario_metadata(scenario)
                 if isinstance(group, TrajectoryGroup):
                     group.metadata.update(scenario_metadata)
+                    for trajectory in group.trajectories:
+                        record_trajectory_completion_tokens(trajectory)
                     self._apply_policy_versions(
                         group,
                         initial_version=initial_version,
