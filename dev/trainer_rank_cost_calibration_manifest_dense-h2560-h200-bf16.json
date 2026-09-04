@@ -1,4 +1,12 @@
 {
+ "campaign_labels": [
+  "local",
+  "tr-cost-2gpu",
+  "tr-cost-2gpu-2",
+  "tr-cost-cp4",
+  "tr-cost-cp4-2",
+  "tr-cost-cp4-840"
+ ],
  "cells": [
   {"campaign":"local","cell":"cal-ellavox","cp":1,"group":0,"key":"cal-ellavox|Qwen/Qwen3.5-4B|L32|tp1|cp1|g0","layers":32,"model":"Qwen/Qwen3.5-4B","tp":1},
   {"campaign":"local","cell":"cal-ellavox","cp":1,"group":1,"key":"cal-ellavox|Qwen/Qwen3.5-4B|L32|tp1|cp1|g1","layers":32,"model":"Qwen/Qwen3.5-4B","tp":1},
@@ -63,5 +71,12 @@
  "excluded": [
 
  ],
- "schema": "art.dev.trainer_rank_cost_calibration_manifest.v1"
+ "launches": {},
+ "recipes": [
+  "dev/trainer_rank_cost_calibration_local.sh",
+  "dev/trainer_rank_cost_calibration_cp4.sky.yaml",
+  "dev/trainer_rank_cost_calibration_2gpu.sky.yaml"
+ ],
+ "schema": "art.dev.trainer_rank_cost_calibration_manifest.v1",
+ "table_id": "dense-h2560-h200-bf16"
 }

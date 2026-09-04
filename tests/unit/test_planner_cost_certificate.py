@@ -1,12 +1,15 @@
-"""The checked-in calibration certificate binds the production table to its data.
+"""Each checked-in calibration certificate binds one production table to its data.
 
-The certificate carries every cell's candidate features, median timings,
-counts and fingerprints (no tokens), the exact fit arguments, the integer table
-and its hash. This test verifies (cheaply) that the shipped table is the
-certificate's table and that the certificate's headline metrics are what the
-table produces on the recorded aggregates. Set ``ART_COST_CERTIFICATE_REFIT=1``
-to also re-run the full fit from the aggregates and require the identical
-integer table (slower: about a minute).
+One certificate per calibrated table
+(``dev/trainer_rank_cost_calibration_certificate_<table>.json``). A certificate
+carries every cell's candidate features, median timings, counts and execution
+fingerprints (no tokens), the exact fit arguments, the integer table and its
+hash. These tests verify (cheaply) that each shipped table is its certificate's
+table, that the certified headline metrics are what the table produces on the
+recorded aggregates, and that the table admits exactly the execution classes
+the certificate measured. Set ``ART_COST_CERTIFICATE_REFIT=1`` to also re-run
+the full fit from the aggregates and require the identical integer table
+(slower: about a minute per table).
 """
 
 from __future__ import annotations
@@ -19,6 +22,7 @@ from pathlib import Path
 import sys
 
 import numpy as np
+import pytest
 
 from art.trainer_rank._planner_cost import (
     CALIBRATED_TABLES,
@@ -30,8 +34,6 @@ from art.trainer_rank._planner_cost import (
 )
 
 _ROOT = Path(__file__).resolve().parents[2]
-_CERTIFICATE = _ROOT / "dev" / "trainer_rank_cost_calibration_certificate.json"
-_MANIFEST = _ROOT / "dev" / "trainer_rank_cost_calibration_manifest.json"
 _spec = importlib.util.spec_from_file_location(
     "trainer_rank_cost_fit", _ROOT / "dev" / "trainer_rank_cost_fit.py"
 )
@@ -41,23 +43,43 @@ sys.modules["trainer_rank_cost_fit"] = fit
 _spec.loader.exec_module(fit)
 
 
-def test_shipped_table_is_the_certified_table() -> None:
-    payload = json.loads(_CERTIFICATE.read_text())
-    assert payload["schema"] == fit.CERTIFICATE_SCHEMA
-    assert payload["table_id"] == DENSE_H2560_TABLE.table_id
-    assert payload["integer_table_milli_us"] == COEFFICIENTS_MILLI_US
+def certificate_path(table_id: str) -> Path:
+    return _ROOT / "dev" / f"trainer_rank_cost_calibration_certificate_{table_id}.json"
+
+
+def manifest_path(table_id: str) -> Path:
+    return _ROOT / "dev" / f"trainer_rank_cost_calibration_manifest_{table_id}.json"
+
+
+_TABLES = pytest.mark.parametrize("table", CALIBRATED_TABLES, ids=lambda t: t.table_id)
+
+
+def test_default_table_is_the_dense_one() -> None:
     assert DENSE_H2560_TABLE.coefficients_milli_us == COEFFICIENTS_MILLI_US
-    assert [table.table_id for table in CALIBRATED_TABLES] == [payload["table_id"]]
+    assert len({table.table_id for table in CALIBRATED_TABLES}) == len(
+        CALIBRATED_TABLES
+    )
+
+
+@_TABLES
+def test_shipped_table_is_the_certified_table(table) -> None:
+    payload = json.loads(certificate_path(table.table_id).read_text())
+    assert payload["schema"] == fit.CERTIFICATE_SCHEMA
+    assert payload["table_id"] == table.table_id
+    assert payload["integer_table_milli_us"] == dict(table.coefficients_milli_us)
     digest = hashlib.sha256(
         json.dumps(payload["integer_table_milli_us"], sort_keys=True).encode()
     ).hexdigest()
     assert digest == payload["integer_table_sha256"]
 
 
-def test_certified_metrics_hold_on_the_recorded_aggregates() -> None:
-    candidates, payload = fit.load_certificate(_CERTIFICATE)
+@_TABLES
+def test_certified_metrics_hold_on_the_recorded_aggregates(table) -> None:
+    candidates, payload = fit.load_certificate(certificate_path(table.table_id))
     terms = tuple(payload["fit_arguments"]["terms"])
-    beta = np.asarray([COEFFICIENTS_MILLI_US[name] / 1_000.0 for name in terms])
+    beta = np.asarray(
+        [table.coefficients_milli_us.get(name, 0) / 1_000.0 for name in terms]
+    )
     report = fit.evaluate(candidates, fit.predict(candidates, terms, beta))
     recorded = payload["metrics"]["integer_all"]
     assert report["cells"] == recorded["cells"] == len(payload["cells"])
@@ -69,10 +91,11 @@ def test_certified_metrics_hold_on_the_recorded_aggregates() -> None:
     assert not report["clear_misses"]
 
 
-def test_full_refit_reproduces_the_table_when_requested() -> None:
+@_TABLES
+def test_full_refit_reproduces_the_table_when_requested(table) -> None:
     if os.environ.get("ART_COST_CERTIFICATE_REFIT") != "1":
         return
-    candidates, payload = fit.load_certificate(_CERTIFICATE)
+    candidates, payload = fit.load_certificate(certificate_path(table.table_id))
     arguments = payload["fit_arguments"]
     terms = tuple(arguments["terms"])
 
@@ -90,26 +113,26 @@ def test_full_refit_reproduces_the_table_when_requested() -> None:
     beta = fit.nnls(*fit.paired_deltas(train, terms))
     if arguments["objective"] == "regret":
         beta = fit.fit_regret(train, terms, beta)
-    table = {
+    fitted = {
         name: int(round(value * 1_000)) for name, value in zip(terms, beta, strict=True)
     }
-    assert table == payload["integer_table_milli_us"]
+    assert fitted == payload["integer_table_milli_us"]
 
 
-def test_certificate_holds_exactly_the_manifest_cells() -> None:
-    """Exact cell identities: every expected cell minus the explicit exclusions
-    (none since the two Ellavox CP4 cells were re-measured after issue #840)."""
+@_TABLES
+def test_certificate_holds_exactly_the_manifest_cells(table) -> None:
+    """Exact cell identities: every expected cell minus the explicit exclusions."""
 
-    payload = json.loads(_CERTIFICATE.read_text())
-    manifest = json.loads(_MANIFEST.read_text())
+    payload = json.loads(certificate_path(table.table_id).read_text())
+    manifest = json.loads(manifest_path(table.table_id).read_text())
+    assert manifest["table_id"] == table.table_id
     expected = {cell["key"] for cell in manifest["cells"]}
     excluded = {cell["key"] for cell in manifest["excluded"]}
     assert excluded <= expected
     certified = {cell["cell"] for cell in payload["cells"]}
     assert certified == expected - excluded
-    assert len(certified) == 58 and not excluded
     assert set(payload["manifest"]["excluded"]) == excluded
-    assert payload["manifest"]["path"] == _MANIFEST.name
+    assert payload["manifest"]["path"] == manifest_path(table.table_id).name
     # Every retained cell carries its execution fingerprints.
     for cell in payload["cells"]:
         for key in (
@@ -118,45 +141,43 @@ def test_certificate_holds_exactly_the_manifest_cells() -> None:
             "device",
             "param_dtype",
             "hidden_size",
+            "geometry",
+            "shape",
+            "model",
         ):
-            assert cell.get(key) not in (None, ""), (cell["cell"], key)
+            assert cell.get(key) not in (None, "", [], {}), (cell["cell"], key)
 
 
-def test_admitted_execution_classes_are_exactly_the_certified_ones() -> None:
+@_TABLES
+def test_admitted_execution_classes_are_exactly_the_certified_ones(table) -> None:
     """The production table admits precisely the device classes, dtypes, model
     geometries and parallel shapes recorded in the certificate's cells."""
 
-    payload = json.loads(_CERTIFICATE.read_text())
+    payload = json.loads(certificate_path(table.table_id).read_text())
     cells = payload["cells"]
+    memory_classes = {device.memory_class for device in table.device_classes}
     for cell in cells:
-        assert cell["geometry"] and cell["shape"] and cell["model"], cell["cell"]
-        assert (
-            cell["device_memory_class"]
-            == DeviceClass.memory_class_for(
-                None if cell.get("device_total_memory_bytes") is None else None
-            )
-            or cell["device_memory_class"] == "hbm-141g"
-        )
+        assert cell["device_memory_class"] in memory_classes, cell["cell"]
     admitted = payload["admitted"]
     geometries = {ModelGeometry(**geometry) for geometry in admitted["geometries"]}
-    assert geometries == set(DENSE_H2560_TABLE.geometries)
+    assert geometries == set(table.geometries)
     assert geometries == {ModelGeometry(**cell["geometry"]) for cell in cells}
     shapes = {ParallelShape(*shape) for shape in admitted["shapes"]}
-    assert shapes == set(DENSE_H2560_TABLE.shapes)
+    assert shapes == set(table.shapes)
     assert shapes == {ParallelShape(*cell["shape"]) for cell in cells}
     devices = {
         DeviceClass(tuple(entry["capability"]), entry["memory_class"])
         for entry in admitted["device_classes"]
     }
-    assert devices == set(DENSE_H2560_TABLE.device_classes)
-    assert set(admitted["param_dtypes"]) == set(DENSE_H2560_TABLE.param_dtypes)
+    assert devices == set(table.device_classes)
+    assert set(admitted["param_dtypes"]) == set(table.param_dtypes)
     # Every geometry was measured at every admitted shape (product admission).
     measured = {
         (ModelGeometry(**cell["geometry"]), ParallelShape(*cell["shape"]))
         for cell in cells
     }
-    for geometry in DENSE_H2560_TABLE.geometries:
-        for shape in DENSE_H2560_TABLE.shapes:
+    for geometry in table.geometries:
+        for shape in table.shapes:
             assert (geometry, shape) in measured, (geometry.hidden_size, shape)
     # One geometry per model across all of its cells.
     by_model: dict[str, set[str]] = {}
