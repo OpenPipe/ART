@@ -498,7 +498,56 @@ DENSE_H2560_TABLE = CalibratedTable(
         ParallelShape(tp=2, cp=1),
     ),
 )
-CALIBRATED_TABLES: tuple[CalibratedTable, ...] = (DENSE_H2560_TABLE,)
+# Qwen3.5-35B-A3B class (GDN + MoE, hidden 2,048): 16 attention heads in 2 query groups of 256 channels, GDN 32 value / 16 key heads of 128 dims, 256 experts (top-8, expert FFN 512, shared expert 512), on H200 bf16; measured at TP1 x CP1/2/4 and TP2 with EP1, EP2 at CP2/CP4/TP2 and EP4 at CP4 (2026-09-04).
+GDN_MOE_H2048_GEOMETRY = ModelGeometry(
+    ffn_hidden_size=8_192,
+    gdn_conv_kernel=4,
+    gdn_key_head_dim=128,
+    gdn_key_heads=16,
+    gdn_value_head_dim=128,
+    gdn_value_heads=32,
+    hidden_size=2_048,
+    kv_channels=256,
+    moe_experts=256,
+    moe_ffn_hidden_size=512,
+    moe_shared_expert_ffn=512,
+    moe_topk=8,
+    num_attention_heads=16,
+    num_query_groups=2,
+)
+GDN_MOE_H2048_TABLE = CalibratedTable(
+    table_id="gdn-moe-h2048-h200-bf16",
+    coefficients_milli_us={
+        "attention_token_cp_exchange": 37,
+        "gdn_level": 8_982_505,
+        "gdn_level_tp": 0,
+        "gdn_token_per_rank": 368,
+        "level_cp_per_layer": 50_356,
+        "level_tp_per_layer": 5_701_857,
+        "tiny_segment_per_layer": 442_444,
+        "token_cp_exchange": 37,
+        "token_per_rank": 3_145,
+        "token_tp_collective": 734,
+    },
+    device_classes=(H200_CLASS,),
+    param_dtypes=("torch.bfloat16",),
+    geometries=(GDN_MOE_H2048_GEOMETRY,),
+    shapes=(
+        ParallelShape(tp=1, cp=1),
+        ParallelShape(tp=1, cp=2),
+        ParallelShape(tp=1, cp=2, ep=2),
+        ParallelShape(tp=1, cp=4),
+        ParallelShape(tp=1, cp=4, ep=2),
+        ParallelShape(tp=1, cp=4, ep=4),
+        ParallelShape(tp=2, cp=1),
+        ParallelShape(tp=2, cp=1, ep=2),
+    ),
+)
+
+CALIBRATED_TABLES: tuple[CalibratedTable, ...] = (
+    DENSE_H2560_TABLE,
+    GDN_MOE_H2048_TABLE,
+)
 # CPU-only planning (unit tests) prices with this table.
 DEFAULT_TABLE = DENSE_H2560_TABLE
 assert set(COEFFICIENTS_MILLI_US) == set(TERM_FUNCTIONS)

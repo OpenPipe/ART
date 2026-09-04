@@ -227,3 +227,37 @@ def test_scores_follow_the_selected_table() -> None:
     # Four 2,100-token sequences sharing a 2,000-token prefix: the selected
     # layout packs fewer tokens than the unshared 8,400 and more than the prefix.
     assert 2_000 < selected.layout.packed_tokens < 8_400
+
+
+def test_moe_class_is_admitted_only_at_its_measured_shapes() -> None:
+    from art.trainer_rank._planner_cost import (
+        GDN_MOE_H2048_GEOMETRY,
+        GDN_MOE_H2048_TABLE,
+    )
+
+    for shape in GDN_MOE_H2048_TABLE.shapes:
+        selection = _selection(geometry=GDN_MOE_H2048_GEOMETRY, shape=shape)
+        assert selection.table_id == GDN_MOE_H2048_TABLE.table_id, shape
+    assert ParallelShape(tp=1, cp=4, ep=4) in GDN_MOE_H2048_TABLE.shapes
+    # Unmeasured shapes (TP2 x CP2, EP1 at CP8, expert TP) and the dense table's
+    # shapes with this geometry under a different dtype fall back.
+    for shape in (
+        ParallelShape(tp=2, cp=2),
+        ParallelShape(tp=1, cp=8),
+        ParallelShape(tp=2, cp=1, ep=2, etp=2),
+    ):
+        assert _selection(geometry=GDN_MOE_H2048_GEOMETRY, shape=shape).version == (
+            COEFFICIENT_VERSION_FALLBACK
+        ), shape
+    assert (
+        _selection(
+            geometry=GDN_MOE_H2048_GEOMETRY,
+            shape=ParallelShape(),
+            param_dtype="torch.float16",
+        ).version
+        == COEFFICIENT_VERSION_FALLBACK
+    )
+    # The dense geometries never borrow the MoE table and vice versa.
+    assert _selection(
+        geometry=QWEN35_4B_GEOMETRY, shape=ParallelShape(tp=1, cp=4, ep=4)
+    ).version == (COEFFICIENT_VERSION_FALLBACK)
