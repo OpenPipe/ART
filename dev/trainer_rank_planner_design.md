@@ -168,6 +168,20 @@ non-excluded cell to be present and complete, rejects unexpected cells and
 duplicate cells with differing execution fingerprints (geometry included), and
 the certificate test asserts all 58 identities (no exclusions).
 
+Second calibrated class (2026-09-04): Qwen3.5-35B-A3B (GDN + MoE, hidden
+2,048, 256 experts top-8) on H200 bf16, measured over a shape lattice that
+separates context from expert parallelism (EP1 at CP1/2/4 and TP2, EP2 at
+CP2/CP4/TP2, EP4 at CP4; `dev/trainer_rank_cost_calibration_lattice.sky.yaml`)
+on the synthetic families and the Ellavox groups: 73 cells, 3,658 within-cell
+pairs, 13 held-out odd-Ellavox cells. The same ten terms fitted to their own
+table (`gdn-moe-h2048-h200-bf16`) rank 97.1% of separated pairs correctly,
+median regret 0%, p95 2.4%, max 4.9%, gates passing on every shape (EP shapes
+included), so no expert-parallel term was needed; the version-1 fallback this
+class used before loses up to 35% on the large Ellavox groups. Fifteen cells
+of the lattice are excluded with reasons: CP1 cells the single-GPU memory
+admission cannot run or refuses (issue #848) and the CP4/EP1 Ellavox cells
+that segfault in the expert grouped GEMM on real routing (issue #851).
+
 Landing gates re-derived: the sealed win-cell shape still selects deep sharing
 (prompt-level sharing at CP4, where it measures fastest; full sharing at CP1),
 the heterogeneous control and the tiny sealed families still decline, and

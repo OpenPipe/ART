@@ -113,10 +113,7 @@ def test_full_refit_reproduces_the_table_when_requested(table) -> None:
     beta = fit.nnls(*fit.paired_deltas(train, terms))
     if arguments["objective"] == "regret":
         beta = fit.fit_regret(train, terms, beta)
-    fitted = {
-        name: int(round(value * 1_000)) for name, value in zip(terms, beta, strict=True)
-    }
-    assert fitted == payload["integer_table_milli_us"]
+    assert fit.integerize(train, terms, beta) == payload["integer_table_milli_us"]
 
 
 @_TABLES

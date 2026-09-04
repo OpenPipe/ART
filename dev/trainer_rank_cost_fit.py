@@ -441,7 +441,7 @@ def load_certificate(path: Path) -> tuple[list[Candidate], dict[str, Any]]:
         for cell in payload["cells"]
         for c in cell["candidates"]
     ]
-    return candidates, payload
+    return sorted(candidates, key=lambda c: (c.cell, c.label)), payload
 
 
 def load_candidates(paths: list[Path]) -> list[Candidate]:
@@ -498,7 +498,10 @@ def load_candidates(paths: list[Path]) -> list[Candidate]:
                     shape,
                 )
             )
-    return candidates
+    # Canonical order: the regret refinement is a deterministic coordinate
+    # search whose path depends on candidate order, and equivalent optima
+    # exist, so evidence-file order and certificate order must agree.
+    return sorted(candidates, key=lambda c: (c.cell, c.label))
 
 
 def evaluate_groups(
@@ -776,6 +779,63 @@ def fit_regret(
     return min(results, key=lambda item: item[0])[1]
 
 
+def integerize(
+    candidates: list[Candidate],
+    terms: tuple[str, ...],
+    beta: np.ndarray,
+    *,
+    sweeps: int = 12,
+) -> dict[str, int]:
+    """The production table: integer milli-microseconds per unit, repaired on
+    the integer grid when rounding costs a ranking.
+
+    Rounding the float optimum can flip close pairs (equivalent optima with
+    tiny per-token coefficients are especially fragile). When the rounded
+    table's selection loss on the training cells is no worse than the float
+    optimum's, it is returned as is; otherwise a deterministic coordinate
+    search over integer values continues minimizing the same loss from the
+    rounded table, accepting only strict improvements.
+    """
+
+    matrix = term_matrix(candidates, terms)
+    table = np.asarray([int(round(value * 1_000)) for value in beta], dtype=np.int64)
+
+    def loss(values: np.ndarray) -> float:
+        return selection_loss(candidates, matrix @ (values / 1_000.0))
+
+    best = loss(table)
+    if best <= selection_loss(candidates, matrix @ beta) + 1e-9:
+        return {name: int(value) for name, value in zip(terms, table, strict=True)}
+    for _ in range(sweeps):
+        improved = False
+        for j in range(len(table)):
+            current = int(table[j])
+            trials = {
+                current + 1,
+                max(0, current - 1),
+                current + 2,
+                max(0, current - 2),
+                0,
+            }
+            if current > 0:
+                trials |= {
+                    int(round(current * factor)) for factor in (0.5, 0.9, 1.1, 2.0)
+                }
+            else:
+                trials |= {1, 10, 100, 1_000}
+            for trial in sorted(trials):
+                if trial == current or trial < 0:
+                    continue
+                candidate_table = table.copy()
+                candidate_table[j] = trial
+                candidate_loss = loss(candidate_table)
+                if candidate_loss < best - 1e-9:
+                    best, table, improved = candidate_loss, candidate_table, True
+        if not improved:
+            break
+    return {name: int(value) for name, value in zip(terms, table, strict=True)}
+
+
 def predict(
     candidates: list[Candidate], terms: tuple[str, ...], beta: np.ndarray
 ) -> np.ndarray:
@@ -1007,10 +1067,10 @@ def main() -> None:
         "fit_all": evaluate(candidates, predict(candidates, terms, beta)),
     }
     if arguments.integerize:
-        # Production stores integer milli-microseconds per feature unit.
-        integer = {
-            name: int(round(value * 1_000)) for name, value in report["terms"].items()
-        }
+        # Production stores integer milli-microseconds per feature unit;
+        # repaired on the integer grid (training cells) when rounding costs
+        # a ranking.
+        integer = integerize(train, terms, beta)
         report["integer_terms_milli_us"] = integer
         beta_int = np.asarray(
             [integer[name] / 1_000.0 for name in terms], dtype=np.float64
