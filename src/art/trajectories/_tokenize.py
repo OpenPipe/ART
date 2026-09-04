@@ -5216,6 +5216,9 @@ def _tokenize_chat_view(
         length_stop_boundaries: dict[
             _SampledSourceKey, _RenderedLengthStopBoundary
         ] = {}
+        rendered_length_stops = [
+            index for index, selected in enumerate(length_stop_mask) if selected
+        ]
         length_stop_count = 0
         length_stop_boundaries_complete = True
         for position, message_index in enumerate(sampled_message_indices):
@@ -5238,11 +5241,23 @@ def _tokenize_chat_view(
             ):
                 prompt = source_prompt_tokens(source)
                 output, _ = source_output_tokens(source)
-                if prompt is not None and output:
+                if (
+                    prompt is not None
+                    and output
+                    and length_stop_count <= len(rendered_length_stops)
+                ):
+                    rendered_end = rendered_length_stops[length_stop_count - 1] + 1
+                    rendered_start = rendered_end - 1
+                    while rendered_start and assistant_mask[rendered_start - 1]:
+                        rendered_start -= 1
                     bounds = _prove_exact_length_stopped_assistant_prefix(
-                        locations(output, 0),
+                        [
+                            match
+                            for match in locations(output, rendered_start)
+                            if match[1] <= rendered_end
+                        ],
                         assistant_mask,
-                        expected_start=len(prompt),
+                        expected_start=rendered_start,
                     )
             next_prompt_end: int | None
             if position + 1 < len(sampled_message_indices):

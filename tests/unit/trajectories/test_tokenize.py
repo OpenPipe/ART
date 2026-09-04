@@ -636,7 +636,7 @@ def test_exact_output_boundaries_survive_prefix_order_drift_and_length_stop() ->
         history.tokenize(tokenizer=tokenizer, chat_template="explicit override")
 
 
-def test_exact_length_boundary_with_multiple_assistant_parts() -> None:
+def test_exact_length_boundary_with_multiple_parts_and_prefix_drift() -> None:
     first = _chat_exchange([1], [2, 9])
     second = _chat_exchange([1, 2, 9, 3], [4, 5], offset=1)
     second_data = second.response.model_dump(mode="python")
@@ -661,7 +661,7 @@ def test_exact_length_boundary_with_multiple_assistant_parts() -> None:
     tokenizer = _BoundaryTokenizer(
         ("user", [8]),
         ("assistant", [2, 9]),
-        ("user", [3]),
+        ("user", [3, 99]),
         ("assistant", [4, 5, 9]),
         ("user", [6]),
         ("assistant", [7, 9]),
