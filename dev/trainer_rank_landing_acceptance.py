@@ -59,6 +59,7 @@ import os
 from pathlib import Path
 import statistics
 import sys
+import time
 from typing import Any, cast
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -2122,10 +2123,12 @@ def phase_cost_calibrate(
     from art.megatron import train as megatron_train
     from art.trainer_rank import TrainerRank, TrainerRankMemoryError
     from art.trainer_rank._planner_cost import (
+        COEFFICIENT_VERSION_FALLBACK,
         DeviceClass,
         ScoringFacts,
         layout_features,
         predicted_us,
+        prefix_tree_layout_score,
     )
     from art.trainer_rank._prefix_tree_planner import (
         build_canonical_prefix_tree,
@@ -2222,15 +2225,45 @@ def phase_cost_calibrate(
                 return None
             return predicted_us(features, scoring_facts, rank._planner_coefficients)
 
+        rows_for_plan = tuple(
+            r.input_tokens.reshape(-1).to(torch.long) for r in requests
+        )
         for candidate in candidates:
             features = layout_features(candidate.layout)
             current_us = current_score(features)
+            # The CP plan structure the layout produces (what the two-stage
+            # re-ranker prices) and what deriving it costs on this host.
+            started = time.perf_counter()
+            if facts.cp_size > 1:
+                wave_count, max_rank_tokens = rank._plan_structure(
+                    rows_for_plan, tree, candidate.layout
+                )
+            else:
+                wave_count, max_rank_tokens = 0, int(candidate.layout.packed_tokens)
             candidate_rows.append(
                 {
                     "label": candidate.labels[0],
                     "labels": list(candidate.labels),
                     "features": features.as_dict(),
                     "current_score_us": current_us,
+                    "cp_plan": {
+                        "wave_count": int(wave_count),
+                        "max_rank_tokens": int(max_rank_tokens),
+                        "summary_ms": (time.perf_counter() - started) * 1_000.0,
+                    },
+                    # The version-1 score: the fallback the two-stage
+                    # certification must not regress against.
+                    "fallback_work": int(
+                        prefix_tree_layout_score(
+                            candidate.layout,
+                            cp_size=facts.cp_size,
+                            layers=facts.layers,
+                            uses_gdn=facts.uses_gdn,
+                            tp_size=facts.tp_size,
+                            gdn_layers=facts.gdn_layers,
+                            coefficient_version=COEFFICIENT_VERSION_FALLBACK,
+                        )[0]
+                    ),
                 }
             )
         # The production selector's own choice, timed like every other
