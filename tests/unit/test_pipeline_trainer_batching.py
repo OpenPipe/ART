@@ -8,6 +8,7 @@ from openai.types.chat.chat_completion_message import ChatCompletionMessage
 import pytest
 
 from art import PipelineRuntimeConfig, TrainableModel, Trajectory, TrajectoryGroup
+from art.distributed.trajectory_store import TrajectoryRecordStore
 from art.pipeline_trainer.trainer import PipelineTrainer
 
 
@@ -100,6 +101,33 @@ async def test_local_pipeline_records_exact_choice_completion_tokens(
     group = await trainer._output_queue.get()
     assert group is not None
     assert group.trajectories[0].metrics["completion_tokens"] == 3
+
+
+def test_distributed_rollout_store_records_exact_choice_completion_tokens() -> None:
+    choice = _eval_choice(0, completion_tokens=3)
+    cast(dict[str, Any], choice.model_extra)["art_completion_tokens"] = 3
+    group = TrajectoryGroup(
+        [
+            Trajectory(
+                reward=1.0,
+                messages_and_choices=[
+                    {"role": "user", "content": "prompt"},
+                    choice,
+                ],
+            )
+        ]
+    )
+    store = TrajectoryRecordStore(
+        owner_actor_id="worker",
+        capacity_records=1,
+        capacity_bytes=1 << 20,
+    )
+
+    ref = store.put(group)
+
+    assert ref.descriptor.completion_tokens == (3.0,)
+    assert ref.descriptor.trajectory_metrics == ({"completion_tokens": 3},)
+    assert store.materialize(ref).trajectories[0].metrics["completion_tokens"] == 3
 
 
 def test_eval_rejects_tokens_from_another_policy() -> None:

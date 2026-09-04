@@ -335,7 +335,12 @@ class TrajectoryRecordStore:
         self._used_bytes = 0
 
     def put(self, group: TrajectoryGroup) -> TrajectoryGroupRef:
+        from art.gather import record_trajectory_completion_tokens
+
         from .packing import TrajectoryGroupPayload
+
+        for trajectory in group.trajectories:
+            record_trajectory_completion_tokens(trajectory)
 
         payload = TrajectoryGroupPayload.from_group(group)
         bundle = TrajectoryGroupBundle.from_payload(payload)
