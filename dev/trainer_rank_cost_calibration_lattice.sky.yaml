@@ -93,7 +93,10 @@ config:
     pod_config:
       spec:
         schedulerName: binpack-scheduler
-        activeDeadlineSeconds: 42000
+        # A full five-shape dense lattice on a 27B-class model runs ~13 h of
+        # cells after setup; the 42000 s used by the smaller recipes cut it
+        # short and lost the run. The GPU pod policy caps this at 604800.
+        activeDeadlineSeconds: 86400
         containers:
           - name: ray-node
             imagePullPolicy: Always
