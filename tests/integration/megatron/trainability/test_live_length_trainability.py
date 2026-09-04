@@ -839,6 +839,7 @@ async def run_length_trainability_async(
         allow_unvalidated_arch=allow_unvalidated_arch,
         resource_stage_name="length_trainability",
     )
+    internal_config["rollout_weight_update_mode"] = "in_flight_lora"
     max_model_len = _get_env_int(
         "ART_MODEL_SUPPORT_LENGTH_MAX_MODEL_LEN",
         1024,
