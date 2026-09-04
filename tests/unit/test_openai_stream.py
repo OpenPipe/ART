@@ -80,6 +80,7 @@ def _chunks() -> list[ChatCompletionChunk]:
     first_span = {
         "start_token": 0,
         "end_token": 1,
+        "generation_id": "generation-1",
         "policy_version": 1,
         "lora_slot": "slot",
         "update_seq": 2,
@@ -112,6 +113,9 @@ def _chunks() -> list[ChatCompletionChunk]:
                     },
                     "finish_reason": None,
                     "token_ids": [21],
+                    "prompt_policy_token_spans": [
+                        {**first_span, "start_token": 1, "end_token": 2}
+                    ],
                     "policy_token_spans": [first_span],
                     "logprobs": {
                         "content": [
@@ -163,6 +167,9 @@ def _chunks() -> list[ChatCompletionChunk]:
                     },
                     "finish_reason": None,
                     "token_ids": [11],
+                    "prompt_policy_token_spans": [
+                        {**first_span, "start_token": 1, "end_token": 2}
+                    ],
                     "policy_token_spans": [first_span],
                     "logprobs": {
                         "content": [
@@ -260,17 +267,21 @@ def test_stream_consumer_matches_auto_capture_reconstruction() -> None:
     assert first.model_extra == {
         "prompt_token_ids": [1, 2],
         "token_ids": [11, 12],
-        "policy_token_spans": [
-            {
-                "start_token": 0,
-                "end_token": 1,
-                "policy_version": 1,
-                "lora_slot": "slot",
-                "update_seq": 2,
-            },
+        "prompt_policy_token_spans": [
             {
                 "start_token": 1,
                 "end_token": 2,
+                "generation_id": "generation-1",
+                "policy_version": 1,
+                "lora_slot": "slot",
+                "update_seq": 2,
+            }
+        ],
+        "policy_token_spans": [
+            {
+                "start_token": 0,
+                "end_token": 2,
+                "generation_id": "generation-1",
                 "policy_version": 1,
                 "lora_slot": "slot",
                 "update_seq": 2,
@@ -279,6 +290,10 @@ def test_stream_consumer_matches_auto_capture_reconstruction() -> None:
     }
     assert second.model_extra is not None
     assert second.model_extra["token_ids"] == [21, 22]
+    assert (
+        second.model_extra["prompt_policy_token_spans"]
+        == (first.model_extra["prompt_policy_token_spans"])
+    )
     assert first.logprobs is not None
     assert second.logprobs is not None
     assert len(first.logprobs.content or []) == 2
@@ -359,11 +374,76 @@ def test_stream_consumer_rejects_premature_choice_termination() -> None:
 
 
 def test_stream_consumer_can_require_usage_trailer() -> None:
-    chunks = _chunks()[:-1]
+    chunks = _chunks()
+    chunks[-1] = chunks[-1].model_copy(update={"usage": None})
 
     assert _consume(chunks).usage is None
     with pytest.raises(ValueError, match="usage trailer"):
         _consume(chunks, require_usage=True)
+
+
+def test_policy_tracked_stream_fails_closed_without_spans() -> None:
+    stream = _Stream(
+        [
+            _chunk(
+                choices=[
+                    {
+                        "index": 0,
+                        "delta": {"content": "answer"},
+                        "finish_reason": "stop",
+                        "token_ids": [1],
+                    }
+                ],
+                prompt_token_ids=[1, 2],
+            )
+        ]
+    )
+    setattr(stream, "_art_require_policy_spans", True)
+
+    with pytest.raises(ValueError, match="omitted prompt or completion"):
+        asyncio.run(
+            consume_chat_completion_stream(
+                cast(AsyncStream[ChatCompletionChunk], stream)
+            )
+        )
+
+
+def test_policy_tracked_stream_accepts_empty_causal_prompt_partition() -> None:
+    stream = _Stream(
+        [
+            _chunk(
+                choices=[
+                    {
+                        "index": 0,
+                        "delta": {"content": "answer"},
+                        "finish_reason": "stop",
+                        "token_ids": [2],
+                        "prompt_policy_token_spans": [],
+                        "policy_token_spans": [
+                            {
+                                "start_token": 0,
+                                "end_token": 1,
+                                "generation_id": "generation-1",
+                                "policy_version": 1,
+                                "lora_slot": "slot",
+                                "update_seq": 1,
+                            }
+                        ],
+                    }
+                ],
+                prompt_token_ids=[1],
+            )
+        ]
+    )
+    setattr(stream, "_art_require_policy_spans", True)
+
+    completion = asyncio.run(
+        consume_chat_completion_stream(cast(AsyncStream[ChatCompletionChunk], stream))
+    )
+
+    metadata = completion.choices[0].model_extra
+    assert metadata is not None
+    assert metadata["prompt_policy_token_spans"] == []
 
 
 def test_auto_capture_rejects_done_with_nonterminal_choice() -> None:
