@@ -76,7 +76,7 @@ def test_unmeasured_classes_fall_back_to_version_one() -> None:
     dense = QWEN3_4B_GEOMETRY
     for geometry in (
         ModelGeometry(4_096, 12_288, 32, 8, 128),
-        ModelGeometry(2_048, 6_144, 16, 8, 128),
+        ModelGeometry(3_072, 8_192, 24, 8, 128),
         ModelGeometry(**{**dense.as_dict(), "ffn_hidden_size": 8_192}),
         ModelGeometry(**{**dense.as_dict(), "num_query_groups": 4}),
         ModelGeometry(**{**QWEN35_4B_GEOMETRY.as_dict(), "gdn_value_heads": 16}),
