@@ -781,12 +781,75 @@ DENSE_ATTN_H5120_TABLE = CalibratedTable(
     ),
 )
 
+# Qwen3-30B-A3B class (attention + MoE, hidden 2,048): 32 attention heads in
+# 4 query groups of 128 channels, 128 experts (top-8, expert FFN 768), on H200
+# bf16 (2026-09-04). Admitted directly where the ten-term gates pass (TP1 x
+# CP1, TP2 x CP1, TP2 x CP1 with EP2) and at TP1 x CP4 with EP2 through the
+# two-stage re-ranker; its other measured shapes (TP1 x CP2 with EP1/EP2, TP1 x
+# CP4 with EP1/EP4) keep the version-1 score: this class's timings carried
+# sporadic multi-second stalls and drift, and neither selection passed its
+# gates there (design brief).
+ATTN_MOE_H2048_GEOMETRY = ModelGeometry(
+    hidden_size=2_048,
+    ffn_hidden_size=6_144,
+    num_attention_heads=32,
+    num_query_groups=4,
+    kv_channels=128,
+    moe_experts=128,
+    moe_topk=8,
+    moe_ffn_hidden_size=768,
+    moe_shared_expert_ffn=0,
+)
+ATTN_MOE_H2048_TABLE = CalibratedTable(
+    table_id="attn-moe-h2048-h200-bf16",
+    coefficients_milli_us={
+        "attention_token_cp_exchange": 0,
+        "gdn_level": 0,
+        "gdn_level_tp": 0,
+        "gdn_token_per_rank": 0,
+        "level_cp_per_layer": 0,
+        "level_tp_per_layer": 0,
+        "tiny_segment_per_layer": 0,
+        "token_cp_exchange": 0,
+        "token_per_rank": 3_324,
+        "token_tp_collective": 105,
+    },
+    device_classes=(H200_CLASS,),
+    param_dtypes=("torch.bfloat16",),
+    geometries=(ATTN_MOE_H2048_GEOMETRY,),
+    shapes=(
+        ParallelShape(tp=1, cp=1),
+        ParallelShape(tp=2, cp=1),
+        ParallelShape(tp=2, cp=1, ep=2),
+    ),
+    reranked_shapes=(ParallelShape(tp=1, cp=4, ep=2),),
+    reranker=ReRanker(
+        shortlist_size=3,
+        incumbent="depth_one",
+        shortlist_coefficients_milli_us={
+            "attention_token_cp_exchange": 135,
+            "gdn_level": 0,
+            "gdn_level_tp": 0,
+            "gdn_token_per_rank": 0,
+            "level_cp_per_layer": 0,
+            "level_tp_per_layer": 0,
+            "tiny_segment_per_layer": 400_502,
+            "token_cp_exchange": 13,
+            "token_per_rank": 1_618,
+            "token_tp_collective": 21_583,
+        },
+        wave_per_layer_milli_us=1_228_071,
+        max_rank_token_per_layer_milli_us=1_294,
+    ),
+)
+
 CALIBRATED_TABLES: tuple[CalibratedTable, ...] = (
     DENSE_H2560_TABLE,
     GDN_MOE_H2048_TABLE,
     DENSE_ATTN_H2048_TABLE,
     DENSE_ATTN_H4096_TABLE,
     DENSE_ATTN_H5120_TABLE,
+    ATTN_MOE_H2048_TABLE,
 )
 # CPU-only planning (unit tests) prices with this table.
 DEFAULT_TABLE = DENSE_H2560_TABLE
@@ -873,6 +936,7 @@ __all__ = [
     "COEFFICIENT_VERSION",
     "COEFFICIENT_VERSION_FALLBACK",
     "DEFAULT_TABLE",
+    "ATTN_MOE_H2048_TABLE",
     "DENSE_ATTN_H2048_TABLE",
     "DENSE_ATTN_H4096_TABLE",
     "DENSE_ATTN_H5120_TABLE",
