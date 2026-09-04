@@ -234,7 +234,11 @@ def cell_fingerprints(paths: list[Path]) -> dict[str, set[tuple[Any, ...]]]:
 
 
 def validate_manifest(
-    paths: list[Path], manifest_path: Path, *, excluded: list[str]
+    paths: list[Path],
+    manifest_path: Path,
+    *,
+    excluded: list[str],
+    exact: bool = False,
 ) -> tuple[list[str], list[str]]:
     """Exact cell identities: every expected cell present unless excluded, no
     unexpected cells, exclusions listed in the manifest, and one execution
@@ -247,7 +251,11 @@ def validate_manifest(
     listed_exclusions = {cell["key"] for cell in manifest["excluded"]}
     present = cell_fingerprints(paths)
     problems: list[str] = []
-    excluded_keys = {key for key in expected if any(p in key for p in excluded)}
+    excluded_keys = {
+        key
+        for key in expected
+        if (key in excluded if exact else any(p in key for p in excluded))
+    }
     for key in sorted(excluded_keys - listed_exclusions):
         problems.append(f"excluded cell is not listed in the manifest: {key}")
     for key in sorted(expected - excluded_keys - set(present)):
@@ -868,7 +876,8 @@ def main() -> None:
         default="",
         help=(
             "comma-separated substrings of cells to leave out explicitly (recorded in the "
-            "certificate); the fitter never drops incomplete cells silently"
+            "certificate), or @manifest for exactly the manifest's listed exclusions; "
+            "the fitter never drops incomplete cells silently"
         ),
     )
     parser.add_argument(
@@ -911,15 +920,27 @@ def main() -> None:
     )
     arguments = parser.parse_args()
     terms = tuple(t for t in arguments.terms.split(",") if t)
-    excluded = [p for p in arguments.exclude_cells.split(",") if p]
+    if arguments.exclude_cells == "@manifest":
+        # Exactly the manifest's listed exclusions (each carries its reason).
+        if not arguments.manifest:
+            raise SystemExit("--exclude-cells @manifest requires --manifest")
+        manifest_excluded = json.loads(Path(arguments.manifest).read_text())["excluded"]
+        excluded = [cell["key"] for cell in manifest_excluded]
+        exact = True
+    else:
+        excluded = [p for p in arguments.exclude_cells.split(",") if p]
+        exact = False
 
     def excluded_cell(cell: str) -> bool:
-        return any(p in cell for p in excluded)
+        return cell in excluded if exact else any(p in cell for p in excluded)
 
     manifest_record: dict[str, Any] | None = None
     if arguments.manifest:
         problems, excluded_keys = validate_manifest(
-            arguments.evidence, Path(arguments.manifest), excluded=excluded
+            arguments.evidence,
+            Path(arguments.manifest),
+            excluded=excluded,
+            exact=exact,
         )
         if problems:
             print("manifest validation failed:", file=sys.stderr)
