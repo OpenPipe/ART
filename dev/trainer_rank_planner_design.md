@@ -162,8 +162,8 @@ version-1 score (kept verbatim) with a one-time warning. Each certificate names
 its table and records the admitted device classes, dtypes, geometries and
 shapes; the certificate test asserts they equal the production table's sets
 and that every geometry was measured at every admitted shape.
-`dev/trainer_rank_cost_calibration_manifest.json` lists the exact cells each
-recipe launches; the fitter's `--manifest` validation requires every
+`dev/trainer_rank_cost_calibration_manifest_<table>.json` lists the exact cells
+each recipe or lattice launch of that table produces; the fitter's `--manifest` validation requires every
 non-excluded cell to be present and complete, rejects unexpected cells and
 duplicate cells with differing execution fingerprints (geometry included), and
 the certificate test asserts all 58 identities (no exclusions).
@@ -184,7 +184,8 @@ measured widths. The selected table's identity joins the coefficient version
 in the planner facts and therefore in every layout cache key. CPU-only
 planning (unit tests) uses the default dense table.
 
-Reproducibility (review finding): `dev/trainer_rank_cost_calibration_certificate.json`
+Reproducibility (review finding): `dev/trainer_rank_cost_calibration_certificate_<table>.json`
+(one per calibrated table)
 binds the shipped table to its data — per-cell candidate features, median
 timings, counts, spreads and fingerprints (no tokens, no per-sample rows), the
 exact fit arguments including any explicit cell exclusions, the integer table

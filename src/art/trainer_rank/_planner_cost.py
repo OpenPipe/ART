@@ -15,7 +15,7 @@ Coefficients are a non-negative least-squares fit on within-cell paired timing
 deltas, refined by direct regret minimization, fitted on 45 cells and
 evaluated on all 56 (the 11 odd Ellavox groups are the pre-registered holdout;
 whole topologies, shapes and models were withheld in ablations). The table is
-bound to its evidence by ``dev/trainer_rank_cost_calibration_certificate.json``.
+bound to its evidence by ``dev/trainer_rank_cost_calibration_certificate_<table>.json``.
 The version-1 constants they replace were hand-set, not fitted.
 
 What the data showed: the cost of a shared prefix level is a GDN effect that
