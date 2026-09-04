@@ -3114,6 +3114,9 @@ def test_checkpoint_fallback_preserves_artifact_version_and_renderer(
     monkeypatch.setitem(sys.modules, "wandb", wandb)
     monkeypatch.setitem(sys.modules, "wandb.apis", apis)
     monkeypatch.setitem(sys.modules, "wandb.apis.public", public)
+    from art.trajectories._tokenize import _cached_artifact_config
+
+    _cached_artifact_config.cache_clear()
     exchange = _chat_exchange([], [], model=model)
     extra = exchange.response.choices[0].model_extra
     assert extra is not None
@@ -3139,6 +3142,59 @@ def test_checkpoint_fallback_preserves_artifact_version_and_renderer(
     assert config.chat_template_kwargs == {"thinking": True}
     assert tokenizer.calls[0]["chat_template"] == "template"
     assert tokenizer.calls[0]["thinking"] is True
+
+
+def test_checkpoint_tokenizer_configs_are_resolved_once_per_process(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from concurrent.futures import ThreadPoolExecutor
+
+    from art.trajectories._tokenize import (
+        _ARTIFACT_BASE_MODELS,
+        _cached_artifact_config,
+        _tokenizer_config,
+    )
+
+    artifact_names: list[str] = []
+
+    class Api:
+        def artifact(self, name: str) -> SimpleNamespace:
+            artifact_names.append(name)
+            return SimpleNamespace(
+                metadata={
+                    "base_model": "base/model",
+                    "renderer": {"chat_template_kwargs": {"thinking": True}},
+                }
+            )
+
+    wandb = ModuleType("wandb")
+    apis = ModuleType("wandb.apis")
+    public = ModuleType("wandb.apis.public")
+    setattr(public, "Api", Api)
+    setattr(apis, "public", public)
+    setattr(wandb, "apis", apis)
+    monkeypatch.setitem(sys.modules, "wandb", wandb)
+    monkeypatch.setitem(sys.modules, "wandb.apis", apis)
+    monkeypatch.setitem(sys.modules, "wandb.apis.public", public)
+    model = "wandb-artifact:///entity/project/cached-run"
+    _cached_artifact_config.cache_clear()
+    _ARTIFACT_BASE_MODELS.pop("entity/project/cached-run", None)
+    try:
+        first = _tokenizer_config(model, None)
+        overridden = _tokenizer_config(model, "other/model")
+        second = _tokenizer_config(model, None)
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            parallel = list(executor.map(_tokenizer_config, [model] * 4, [None] * 4))
+    finally:
+        _cached_artifact_config.cache_clear()
+        _ARTIFACT_BASE_MODELS.pop("entity/project/cached-run", None)
+
+    assert artifact_names == ["entity/project/cached-run:latest"]
+    assert first == second and first is not second
+    assert first.base_model == "base/model"
+    assert overridden.base_model == "other/model"
+    assert second.base_model == "base/model"
+    assert all(config == first for config in parallel)
 
 
 def test_loaded_tokenizers_are_cached_by_model_and_revision(

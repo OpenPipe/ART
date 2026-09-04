@@ -4,7 +4,7 @@ from bisect import bisect_left
 import codecs
 from collections.abc import Mapping, Sequence
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from functools import lru_cache
 from hashlib import sha256
@@ -1503,7 +1503,23 @@ def _artifact_base_model(identity: str) -> str:
     return base_model
 
 
+_ARTIFACT_CONFIG_LOCK = threading.Lock()
+
+
 def _artifact_config(model: str) -> _TokenizerConfig:
+    """Resolve a checkpoint's tokenizer configuration, once per process.
+
+    The metadata describes the checkpoint collection, so it is stable across
+    versions and aliases; re-fetching it would cost a W&B API round trip on every
+    tokenization. Callers get their own copy because _tokenizer_config adjusts it.
+    """
+    with _ARTIFACT_CONFIG_LOCK:
+        config = _cached_artifact_config(model)
+    return replace(config)
+
+
+@lru_cache(maxsize=1024)
+def _cached_artifact_config(model: str) -> _TokenizerConfig:
     from wandb.apis.public import Api
 
     artifact_path = _artifact_name(model)
