@@ -61,6 +61,8 @@ run: |
   export ART_MEGATRON_PIPELINE_MODEL_PARALLEL_SIZE=1
   export TOKENIZERS_PARALLELISM=false
   export PYTHONUNBUFFERED=1
+  # Native crashes (SIGSEGV in a kernel) print every rank's Python stack.
+  export PYTHONFAULTHANDLER=1
   uv run --no-sync python dev/trainer_rank_landing_acceptance.py --phase contract
 
   cell() {  # tp cp ep etp cell layers group
