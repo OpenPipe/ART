@@ -2,8 +2,8 @@
 
 A calibrated table admits a runtime when its device class, parameter dtype,
 model geometry (read from the Megatron config, never a model name) and
-parallel shape (TP x CP x EP x ETP) all appear in the table's measured sets;
-everything else keeps the version-1 score.
+parallel shape (TP x CP x EP x ETP) all appear in the table's measured sets and
+the pair is not withheld; everything else keeps the version-1 score.
 """
 
 from __future__ import annotations
@@ -57,6 +57,8 @@ def _selection(
 def test_measured_execution_classes_are_admitted() -> None:
     for geometry in (QWEN35_4B_GEOMETRY, QWEN3_4B_GEOMETRY):
         for shape in DENSE_H2560_TABLE.shapes:
+            if (geometry, shape) in DENSE_H2560_TABLE.withheld:
+                continue
             selection = _selection(geometry=geometry, shape=shape)
             assert selection.version == COEFFICIENT_VERSION
             assert selection.table_id == DENSE_H2560_TABLE.table_id
@@ -71,12 +73,12 @@ def test_unmeasured_classes_fall_back_to_version_one() -> None:
     assert _selection(device_capability=(8, 0)).version == fallback
     assert _selection(device_memory_bytes=H100_MEMORY_BYTES).version == fallback
     assert _selection(param_dtype="torch.float16").version == fallback
-    # Any geometry change: a wider model (Qwen3-8B-like), a neighbouring
-    # width, a different FFN ratio or head geometry, GDN state shape, or MoE.
+    # Any geometry change: an unmeasured wider model, a neighbouring width, a
+    # different FFN ratio or head geometry, GDN state shape, or MoE.
     dense = QWEN3_4B_GEOMETRY
     for geometry in (
-        ModelGeometry(4_096, 12_288, 32, 8, 128),
-        ModelGeometry(2_048, 6_144, 16, 8, 128),
+        ModelGeometry(6_144, 16_384, 48, 8, 128),
+        ModelGeometry(3_072, 8_192, 24, 8, 128),
         ModelGeometry(**{**dense.as_dict(), "ffn_hidden_size": 8_192}),
         ModelGeometry(**{**dense.as_dict(), "num_query_groups": 4}),
         ModelGeometry(**{**QWEN35_4B_GEOMETRY.as_dict(), "gdn_value_heads": 16}),
@@ -101,6 +103,123 @@ def test_unmeasured_classes_fall_back_to_version_one() -> None:
         selection = _selection(shape=shape)
         assert selection.version == fallback, shape
         assert selection.table_id is None and selection.coefficients is None
+
+
+def test_withheld_pair_falls_back_while_the_rest_of_its_table_is_admitted() -> None:
+    # Qwen3-4B at TP1 x CP4 is measured but withheld (the ten-term score cannot
+    # see the CP exchange schedule there); the GDN geometry keeps CP4 and the
+    # attention geometry keeps its other shapes.
+    cp4 = ParallelShape(tp=1, cp=4)
+    assert (QWEN3_4B_GEOMETRY, cp4) in DENSE_H2560_TABLE.withheld
+    withheld = _selection(geometry=QWEN3_4B_GEOMETRY, shape=cp4)
+    assert withheld.version == COEFFICIENT_VERSION_FALLBACK
+    assert withheld.table_id is None and withheld.coefficients is None
+    assert _selection(geometry=QWEN35_4B_GEOMETRY, shape=cp4).table_id == (
+        DENSE_H2560_TABLE.table_id
+    )
+    for shape in (ParallelShape(), ParallelShape(tp=1, cp=2), ParallelShape(tp=2)):
+        assert _selection(geometry=QWEN3_4B_GEOMETRY, shape=shape).table_id == (
+            DENSE_H2560_TABLE.table_id
+        ), shape
+
+
+def test_attention_classes_are_admitted_only_where_their_gates_pass() -> None:
+    from art.trainer_rank._planner_cost import (
+        DENSE_ATTN_H2048_TABLE,
+        DENSE_ATTN_H4096_TABLE,
+        DENSE_ATTN_H5120_TABLE,
+    )
+
+    cp4 = ParallelShape(tp=1, cp=4)
+    tp2cp2 = ParallelShape(tp=2, cp=2)
+    for table in (
+        DENSE_ATTN_H2048_TABLE,
+        DENSE_ATTN_H4096_TABLE,
+        DENSE_ATTN_H5120_TABLE,
+    ):
+        (geometry,) = table.geometries
+        for shape in table.shapes:
+            selection = _selection(geometry=geometry, shape=shape)
+            assert selection.table_id == table.table_id, (table.table_id, shape)
+            assert selection.coefficients is table.coefficients_milli_us
+        # TP1 x CP4 is admitted through the two-stage re-ranker: the table's
+        # shortlist score plus its certified re-ranker, never the direct table.
+        assert cp4 not in table.shapes and cp4 in table.reranked_shapes
+        reranked = _selection(geometry=geometry, shape=cp4)
+        assert reranked.version == COEFFICIENT_VERSION
+        assert reranked.table_id == table.table_id
+        assert reranked.reranker is table.reranker
+        assert reranked.coefficients is (table.reranker.shortlist_coefficients_milli_us)
+        # Directly scored shapes never carry a re-ranker.
+        assert _selection(geometry=geometry, shape=ParallelShape()).reranker is None
+        # A different dtype never borrows the table.
+        assert _selection(
+            geometry=geometry, shape=ParallelShape(), param_dtype="torch.float16"
+        ).version == (COEFFICIENT_VERSION_FALLBACK)
+    # TP2 x CP2 passed its gates only for the hidden-5,120 class.
+    assert tp2cp2 in DENSE_ATTN_H5120_TABLE.shapes
+    assert tp2cp2 not in DENSE_ATTN_H4096_TABLE.shapes
+    assert tp2cp2 not in DENSE_ATTN_H2048_TABLE.shapes
+
+
+def test_attention_moe_class_admits_only_its_certified_shapes() -> None:
+    from art.trainer_rank._planner_cost import (
+        ATTN_MOE_H2048_GEOMETRY,
+        ATTN_MOE_H2048_TABLE,
+        GDN_MOE_H2048_GEOMETRY,
+    )
+
+    geometry = ATTN_MOE_H2048_GEOMETRY
+    for shape in ATTN_MOE_H2048_TABLE.shapes:
+        selection = _selection(geometry=geometry, shape=shape)
+        assert selection.table_id == ATTN_MOE_H2048_TABLE.table_id, shape
+        assert selection.reranker is None
+    # TP1 x CP4 is re-ranked at every measured expert parallelism.
+    for ep in (1, 2, 4):
+        reranked = _selection(geometry=geometry, shape=ParallelShape(tp=1, cp=4, ep=ep))
+        assert reranked.reranker is ATTN_MOE_H2048_TABLE.reranker, ep
+    # Unmeasured shapes keep the version-1 score.
+    for shape in (
+        ParallelShape(tp=2, cp=2),
+        ParallelShape(tp=1, cp=8),
+        ParallelShape(tp=1, cp=4, ep=8),
+        ParallelShape(tp=2, cp=1, ep=2, etp=2),
+    ):
+        assert _selection(geometry=geometry, shape=shape).version == (
+            COEFFICIENT_VERSION_FALLBACK
+        ), shape
+    # The GDN MoE class and this attention MoE class never borrow each other.
+    assert (
+        _selection(
+            geometry=GDN_MOE_H2048_GEOMETRY, shape=ParallelShape(tp=2, cp=1, ep=2)
+        ).table_id
+        != ATTN_MOE_H2048_TABLE.table_id
+    )
+
+
+def test_dense_gdn_h5120_class_admits_its_four_measured_shapes() -> None:
+    from art.trainer_rank._planner_cost import (
+        DENSE_ATTN_H5120_TABLE,
+        DENSE_GDN_H5120_TABLE,
+        QWEN3_14B_GEOMETRY,
+        QWEN35_27B_GEOMETRY,
+    )
+
+    assert DENSE_GDN_H5120_TABLE.reranker is None
+    for shape in DENSE_GDN_H5120_TABLE.shapes:
+        selection = _selection(geometry=QWEN35_27B_GEOMETRY, shape=shape)
+        assert selection.table_id == DENSE_GDN_H5120_TABLE.table_id, shape
+    # CP4 is scored directly for this GDN class; TP2 x CP2 keeps version 1.
+    assert ParallelShape(tp=1, cp=4) in DENSE_GDN_H5120_TABLE.shapes
+    assert _selection(
+        geometry=QWEN35_27B_GEOMETRY, shape=ParallelShape(tp=2, cp=2)
+    ).version == (COEFFICIENT_VERSION_FALLBACK)
+    # Same hidden size as the Qwen3-14B attention class, different geometry:
+    # the two tables never borrow each other.
+    assert QWEN35_27B_GEOMETRY.hidden_size == QWEN3_14B_GEOMETRY.hidden_size
+    assert _selection(
+        geometry=QWEN3_14B_GEOMETRY, shape=ParallelShape(tp=1, cp=1)
+    ).table_id == (DENSE_ATTN_H5120_TABLE.table_id)
 
 
 def test_cpu_only_planning_uses_the_default_table() -> None:
@@ -227,3 +346,37 @@ def test_scores_follow_the_selected_table() -> None:
     # Four 2,100-token sequences sharing a 2,000-token prefix: the selected
     # layout packs fewer tokens than the unshared 8,400 and more than the prefix.
     assert 2_000 < selected.layout.packed_tokens < 8_400
+
+
+def test_moe_class_is_admitted_only_at_its_measured_shapes() -> None:
+    from art.trainer_rank._planner_cost import (
+        GDN_MOE_H2048_GEOMETRY,
+        GDN_MOE_H2048_TABLE,
+    )
+
+    for shape in GDN_MOE_H2048_TABLE.shapes:
+        selection = _selection(geometry=GDN_MOE_H2048_GEOMETRY, shape=shape)
+        assert selection.table_id == GDN_MOE_H2048_TABLE.table_id, shape
+    assert ParallelShape(tp=1, cp=4, ep=4) in GDN_MOE_H2048_TABLE.shapes
+    # Unmeasured shapes (TP2 x CP2, EP1 at CP8, expert TP) and the dense table's
+    # shapes with this geometry under a different dtype fall back.
+    for shape in (
+        ParallelShape(tp=2, cp=2),
+        ParallelShape(tp=1, cp=8),
+        ParallelShape(tp=2, cp=1, ep=2, etp=2),
+    ):
+        assert _selection(geometry=GDN_MOE_H2048_GEOMETRY, shape=shape).version == (
+            COEFFICIENT_VERSION_FALLBACK
+        ), shape
+    assert (
+        _selection(
+            geometry=GDN_MOE_H2048_GEOMETRY,
+            shape=ParallelShape(),
+            param_dtype="torch.float16",
+        ).version
+        == COEFFICIENT_VERSION_FALLBACK
+    )
+    # The dense geometries never borrow the MoE table and vice versa.
+    assert _selection(
+        geometry=QWEN35_4B_GEOMETRY, shape=ParallelShape(tp=1, cp=4, ep=4)
+    ).version == (COEFFICIENT_VERSION_FALLBACK)

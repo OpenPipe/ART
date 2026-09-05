@@ -25,9 +25,12 @@ import hashlib
 from itertools import combinations
 import json
 import struct
-from typing import Literal, TypeAlias, overload
+from typing import TYPE_CHECKING, Literal, TypeAlias, overload
 
 import torch
+
+if TYPE_CHECKING:
+    from ._planner_cost import ReRanker
 
 Fingerprint: TypeAlias = str
 DecisionSet: TypeAlias = frozenset[int]
@@ -755,6 +758,8 @@ def select_prefix_tree_layout(
     gdn_layers: int | None = None,
     coefficient_version: int | None = None,
     coefficients: Mapping[str, int] | None = None,
+    reranker: "ReRanker | None" = None,
+    plan_structure: Callable[[PrefixTreeLayout], tuple[int, int]] | None = None,
 ):
     """Production layout selection for one canonical tree.
 
@@ -764,9 +769,20 @@ def select_prefix_tree_layout(
     ``gdn_layers`` defaults to ``layers`` when the model uses GDN;
     ``coefficients`` is the calibrated table for this runtime's execution
     class (default: the shipped dense table).
+
+    With a ``reranker`` (execution classes whose shape is re-ranked, see
+    ``select_scoring``) the cheap score only shortlists: its
+    ``shortlist_size`` best layouts plus the ``incumbent`` anchor are priced
+    by the context-parallel plan each produces, ``plan_structure(layout)`` =
+    (remote wave count, largest per-rank token load), and the lowest
+    second-stage score wins; ties keep the cheaper layout.
     """
 
     from ._planner_cost import COEFFICIENT_VERSION, prefix_tree_layout_score
+    from ._prefix_tree_performance_search import (
+        _candidate_rank_key,
+        search_nonuniform_prefix_tree_layouts,
+    )
 
     version = (
         COEFFICIENT_VERSION if coefficient_version is None else coefficient_version
@@ -784,12 +800,38 @@ def select_prefix_tree_layout(
             coefficients=coefficients,
         )
 
-    return search_prefix_tree_layout(
+    result = search_nonuniform_prefix_tree_layouts(
         tree,
         scorer,
         refinement_work_budget=refinement_work_budget,
         mandatory_candidates=prefix_tree_layout_candidates(tree),
     )
+    if reranker is None:
+        return result.incumbent
+    if plan_structure is None:
+        raise ValueError("re-ranking needs the plan structure of a layout")
+    ranked = sorted(result.candidates, key=_candidate_rank_key)
+    shortlist = list(ranked[: max(1, reranker.shortlist_size)])
+    shortlist += [
+        anchor
+        for anchor in ranked
+        if anchor.mandatory
+        and reranker.incumbent in anchor.candidate.labels
+        and anchor not in shortlist
+    ]
+    best: tuple[tuple[int, int], object] | None = None
+    for position, candidate in enumerate(shortlist):
+        wave_count, max_rank_tokens = plan_structure(candidate.layout)
+        key = (
+            reranker.score(
+                layers=layers, wave_count=wave_count, max_rank_tokens=max_rank_tokens
+            ),
+            position,
+        )
+        if best is None or key < best[0]:
+            best = (key, candidate)
+    assert best is not None
+    return best[1]
 
 
 __all__ = [

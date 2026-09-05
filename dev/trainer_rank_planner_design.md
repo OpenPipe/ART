@@ -156,17 +156,117 @@ geometry read from the Megatron config (hidden and FFN widths, attention head
 geometry, GDN state shape, expert geometry — never a model name; layer counts
 are scoring facts, not identity) and parallel shape (TP × CP × EP × ETP).
 Admission is exact: the dense hidden-2,560 table admits the Qwen3.5-4B and
-Qwen3-4B geometries at the four measured shapes (TP1 × CP1/2/4 and TP2 × CP1);
-TP2 × CP2, CP8, TP4, expert parallelism, other widths and MoE models keep the
-version-1 score (kept verbatim) with a one-time warning. Each certificate names
-its table and records the admitted device classes, dtypes, geometries and
-shapes; the certificate test asserts they equal the production table's sets
-and that every geometry was measured at every admitted shape.
-`dev/trainer_rank_cost_calibration_manifest.json` lists the exact cells each
-recipe launches; the fitter's `--manifest` validation requires every
+Qwen3-4B geometries at the four measured shapes (TP1 × CP1/2/4 and TP2 × CP1)
+except the withheld pair Qwen3-4B × TP1 × CP4 (measured and fitted, but the
+score is known to misrank real-data groups there; see the known limitation
+below). A table's `withheld` pairs fall back to version 1, and the manifest
+records each with its reason. TP2 × CP2, CP8, TP4, expert parallelism, other
+widths and MoE models keep the version-1 score (kept verbatim) with a one-time
+warning unless another table admits them. Each certificate names its table and
+records the admitted device classes, dtypes, geometries and shapes; the
+certificate test asserts they equal the production table's sets, that every
+geometry was measured at every admitted shape, and that the withheld pairs are
+exactly the manifest's.
+`dev/trainer_rank_cost_calibration_manifest_<table>.json` lists the exact cells
+each recipe or lattice launch of that table produces; the fitter's `--manifest` validation requires every
 non-excluded cell to be present and complete, rejects unexpected cells and
 duplicate cells with differing execution fingerprints (geometry included), and
-the certificate test asserts all 58 identities (no exclusions).
+the certificate test asserts the 58 fitted identities plus the 16 excluded
+blind-spot cells of the Qwen3-4B real-data launch (below).
+
+Second calibrated class (2026-09-04): Qwen3.5-35B-A3B (GDN + MoE, hidden
+2,048, 256 experts top-8) on H200 bf16, measured over a shape lattice that
+separates context from expert parallelism (EP1 at CP1/2/4 and TP2, EP2 at
+CP2/CP4/TP2, EP4 at CP4; `dev/trainer_rank_cost_calibration_lattice.sky.yaml`)
+on the synthetic families and the Ellavox groups: 73 cells, 3,658 within-cell
+pairs, 13 held-out odd-Ellavox cells. The same ten terms fitted to their own
+table (`gdn-moe-h2048-h200-bf16`) rank 97.1% of separated pairs correctly,
+median regret 0%, p95 2.4%, max 4.9%, gates passing on every shape (EP shapes
+included), so no expert-parallel term was needed; the version-1 fallback this
+class used before loses up to 35% on the large Ellavox groups. Fifteen cells
+of the lattice are excluded with reasons: CP1 cells the single-GPU memory
+admission cannot run or refuses (issue #848) and the CP4/EP1 Ellavox cells
+that segfault in the expert grouped GEMM on real routing (issue #851).
+
+Known limitation (2026-09-04, dense controls): the O(segments) layout
+features cannot see the context-parallel plan a layout produces, and on
+attention-only models with real data at CP4 that plan dominates. Two layouts
+of an Ellavox group with near-identical features (about 13k packed tokens,
+six versus seven segments, the same 12k-token longest segment) differ by 25%
+in measured time because one needs four exchange waves with rank loads
+7168/3584/1536/790 and the other two waves with 6656/2560/2048/1751. The
+Qwen3-1.7B, Qwen3-8B and Qwen3-14B controls therefore fail the gates at CP4
+with the ten terms (held-out max regret 26%, 14% and 17%), and the same group
+measured on the certified Qwen3-4B geometry at TP1 × CP4 shows a 35% regret
+for the shipped table (the version-1 score reaches 15% on another group
+there; neither is adequate). The dense certificate had no
+attention-plus-real-data cells at CP4, so its metrics did not cover this.
+
+Resolution (2026-09-04, per review). The attention classes get their own
+tables where the ten-term gates pass — Qwen3-1.7B (`dense-attn-h2048-h200-bf16`)
+and Qwen3-8B (`dense-attn-h4096-h200-bf16`) at TP1 × CP1/CP2 and TP2 × CP1,
+Qwen3-14B (`dense-attn-h5120-h200-bf16`) also at TP2 × CP2 (42/42/56 cells;
+pairwise 96.5%/99.9%/99.9%, max regret ≤1.1%) — and TP1 × CP4 is admitted
+through a **two-stage selection** (`ReRanker`, `CalibratedTable.reranked_shapes`,
+`select_prefix_tree_layout(..., reranker, plan_structure)`): the ten-term score
+(a shortlist table fitted on every measured shape; its job is recall) keeps the
+three cheapest layouts of the search plus the depth-one anchor, each shortlisted
+layout is priced by the structure of the context-parallel plan it produces —
+remote wave count and largest per-rank token load, per layer, from the CP
+planner's own assignment (`summarize_prefix_tree_plan`, through the planning
+bundle cache so the selected layout's plan is reused) — and the lowest
+second-stage score wins (ties keep the cheaper layout). The two physical
+drivers came out of the measured schedules: on equal-load layouts an extra
+remote wave costs 2.4 / 1.8 / 0.6 ms per layer on 1.7B / 8B / 14B (the CP
+planner's own model prefers the extra wave; issue #854), and the max-rank load
+carries the rest. Certified per class on TP1 × CP4 (`reranker` block of the
+certificate, bound by `tests/unit/test_planner_cost_certificate.py`):
+every clear measured winner is in the shortlist; two-stage regret max
+2.6% / 0.8% / 4.1% (held-out 0.7% / 0.8% / 0.4%); never more than 2% worse
+than the cheap-only or the version-1 selection; and the synchronous planning
+cost of pricing the shortlist (mean 2.6% / 1.6% / 1.0% of the cell's time
+after the assignment-search speedup below) is below the mean execution saved
+on those cells (2.9% / 1.8% / 1.2%). TP2 × CP2 still fails its gates for the
+two smaller classes and keeps version 1; the dense table withholds
+Qwen3-4B × TP1 × CP4 (version 1's 15% worst observed cell is the less harmful
+fallback than the table's 35%; its 7 real-data CP4 cells are too few to
+certify a re-ranker).
+
+Fourth calibrated class (2026-09-04/05): Qwen3-30B-A3B (attention + MoE, hidden
+2,048, 128 experts top-8; `attn-moe-h2048-h200-bf16`) on H200 bf16 over the same
+EP-deconfounding lattice (112 cells; 3 CP1 cells excluded for the single-GPU
+memory admission of issue #848; no CP>1/EP1 segfaults on this model). The
+eight-round timings of TP1 × CP2 (EP1/EP2) and TP1 × CP4 (EP1/EP4) carried
+sporadic 10–20 s stalls on about 4% of rounds, so those shapes were re-measured
+with sixteen rounds (the stalls persist at about 4% of rounds but shrink to
+about 2×, and medians hold). The class shows the attention CP4 blind spot.
+Admitted directly at TP1 × CP1, TP1 × CP2 (EP1, EP2) and TP2 × CP1 (EP1, EP2)
+(67 cells; pairwise 96.3%, max regret 2.2%), and at TP1 × CP4 with EP1, EP2 and
+EP4 through the two-stage re-ranker (42 cells; max 2.1%, every clear winner
+shortlisted, planning 1.1% of cell time against 1.4% saved), where version 1
+lost up to 13%.
+
+Fifth calibrated class (2026-09-04): Qwen3.5-27B (dense GDN + attention,
+hidden 5,120; `dense-gdn-h5120-h200-bf16`) on H200 bf16 over TP1 × CP1/2/4,
+TP2 × CP1 and TP2 × CP2 (70 cells; four CP1/CP2 cells incomplete or lost to the
+single-GPU memory admission of issue #848, one TP2 × CP2 cell lost to an NCCL
+collective timeout during warm-up). Clean timings (median per-candidate spread
+0.4–0.7% except TP2 × CP2), and the ten terms rank this GDN class at CP4 as they
+do the 35B GDN MoE class, so no re-ranker: admitted directly at TP1 × CP1/2/4
+and TP2 × CP1 (52 cells; pairwise 97.0%, max regret 3.4%, held-out 1.8%).
+TP2 × CP2 fails its gates marginally (p95 5.1%, one clear miss) and keeps
+version 1. This is the class where the version-1 fallback hurt most: on the
+largest Ellavox group at CP4 it chose a layout 112% slower than the best
+(4,084 ms against 1,927 ms), and 26% slower at TP2 × CP2.
+
+The re-ranker is affordable because the context-parallel assignment search
+was vectorized (`_evaluate_plans` in `art.megatron.context_parallel.runtime`):
+it prices a whole batch of candidate moves in one numpy pass with the cost
+formulas and stage simulations kept in the same arithmetic order, identical
+results on all 446 real calibration candidates (the pre-rewrite evaluator is
+the reference in `tests/unit/test_context_parallel_plan_evaluation.py`), and
+the median search fell from 18.3 ms to 4.1 ms per packed row — also on the
+production plan-build path of every CP>1 micro-batch.
 
 Landing gates re-derived: the sealed win-cell shape still selects deep sharing
 (prompt-level sharing at CP4, where it measures fastest; full sharing at CP1),
@@ -184,7 +284,8 @@ measured widths. The selected table's identity joins the coefficient version
 in the planner facts and therefore in every layout cache key. CPU-only
 planning (unit tests) uses the default dense table.
 
-Reproducibility (review finding): `dev/trainer_rank_cost_calibration_certificate.json`
+Reproducibility (review finding): `dev/trainer_rank_cost_calibration_certificate_<table>.json`
+(one per calibrated table)
 binds the shipped table to its data — per-cell candidate features, median
 timings, counts, spreads and fingerprints (no tokens, no per-sample rows), the
 exact fit arguments including any explicit cell exclusions, the integer table

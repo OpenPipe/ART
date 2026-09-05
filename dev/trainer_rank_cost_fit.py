@@ -87,6 +87,11 @@ class Candidate:
     # Grouping keys for per-model / per-shape reports (not fitted).
     model: str = ""
     shape: tuple[int, int, int, int] = (1, 1, 1, 1)
+    # Structure of the CP plan the layout produces (wave_count,
+    # max_rank_tokens, summary_ms) and the version-1 score: what the two-stage
+    # re-ranker prices and what it is compared against. Absent in older rows.
+    cp_plan: dict[str, float] | None = None
+    fallback_work: int | None = None
 
 
 def _shape(row: dict[str, Any]) -> tuple[int, int, int, int]:
@@ -234,7 +239,11 @@ def cell_fingerprints(paths: list[Path]) -> dict[str, set[tuple[Any, ...]]]:
 
 
 def validate_manifest(
-    paths: list[Path], manifest_path: Path, *, excluded: list[str]
+    paths: list[Path],
+    manifest_path: Path,
+    *,
+    excluded: list[str],
+    exact: bool = False,
 ) -> tuple[list[str], list[str]]:
     """Exact cell identities: every expected cell present unless excluded, no
     unexpected cells, exclusions listed in the manifest, and one execution
@@ -247,7 +256,11 @@ def validate_manifest(
     listed_exclusions = {cell["key"] for cell in manifest["excluded"]}
     present = cell_fingerprints(paths)
     problems: list[str] = []
-    excluded_keys = {key for key in expected if any(p in key for p in excluded)}
+    excluded_keys = {
+        key
+        for key in expected
+        if (key in excluded if exact else any(p in key for p in excluded))
+    }
     for key in sorted(excluded_keys - listed_exclusions):
         problems.append(f"excluded cell is not listed in the manifest: {key}")
     for key in sorted(expected - excluded_keys - set(present)):
@@ -276,6 +289,8 @@ def export_certificate(
     report: dict[str, Any],
     manifest: dict[str, Any] | None = None,
     table_id: str = "",
+    reranked: list[Candidate] | None = None,
+    reranker: dict[str, Any] | None = None,
 ) -> None:
     """Write the compact, reproducible record binding the table to its data.
 
@@ -308,7 +323,7 @@ def export_certificate(
                     "shape": list(_shape(row)),
                 }
     by_cell: dict[str, list[Candidate]] = defaultdict(list)
-    for candidate in candidates:
+    for candidate in [*candidates, *(reranked or [])]:
         by_cell[candidate.cell].append(candidate)
     cells = [
         {
@@ -322,6 +337,12 @@ def export_certificate(
                     "median_ms": c.ms,
                     "n": c.n,
                     "spread_pct": c.spread_pct,
+                    **({"cp_plan": c.cp_plan} if c.cp_plan is not None else {}),
+                    **(
+                        {"fallback_work": c.fallback_work}
+                        if c.fallback_work is not None
+                        else {}
+                    ),
                 }
                 for c in sorted(members, key=lambda c: c.label)
             ],
@@ -367,6 +388,9 @@ def export_certificate(
         "cells": cells,
         "integer_table_milli_us": integer_table,
         "integer_table_sha256": table_hash,
+        # Two-stage selection on the re-ranked shapes (None when the table
+        # scores every admitted shape directly).
+        "reranker": reranker,
         "metrics": {
             split: {
                 k: report[split][k]
@@ -429,11 +453,13 @@ def load_certificate(path: Path) -> tuple[list[Candidate], dict[str, Any]]:
             float(c["spread_pct"]),
             str(cell.get("model") or cell["cell"].split("|")[1]),
             tuple(cell.get("shape") or _shape(cell["facts"])),
+            c.get("cp_plan"),
+            c.get("fallback_work"),
         )
         for cell in payload["cells"]
         for c in cell["candidates"]
     ]
-    return candidates, payload
+    return sorted(candidates, key=lambda c: (c.cell, c.label)), payload
 
 
 def load_candidates(paths: list[Path]) -> list[Candidate]:
@@ -488,9 +514,14 @@ def load_candidates(paths: list[Path]) -> list[Candidate]:
                     spread,
                     str(cell["model"]),
                     shape,
+                    candidate.get("cp_plan"),
+                    candidate.get("fallback_work"),
                 )
             )
-    return candidates
+    # Canonical order: the regret refinement is a deterministic coordinate
+    # search whose path depends on candidate order, and equivalent optima
+    # exist, so evidence-file order and certificate order must agree.
+    return sorted(candidates, key=lambda c: (c.cell, c.label))
 
 
 def evaluate_groups(
@@ -590,8 +621,30 @@ def selector_check(candidates: list[Candidate]) -> dict[str, dict[str, Any]]:
     return report
 
 
+def _cp_plan_value(candidate: Candidate, key: str) -> float:
+    if candidate.cp_plan is None:
+        raise ValueError(
+            f"{candidate.cell} {candidate.label}: no cp_plan recorded (re-run the "
+            "harness or backfill the evidence before fitting a re-ranker)"
+        )
+    return float(candidate.cp_plan[key])
+
+
+# The re-ranker's terms, in the units ReRanker.score multiplies by layers:
+# remote wave count and largest per-rank token load of the CP plan.
+RERANK_TERMS: dict[str, Callable[[Candidate], float]] = {
+    "wave_per_layer": lambda c: (
+        float(c.facts["layers"]) * _cp_plan_value(c, "wave_count")
+    ),
+    "max_rank_token_per_layer": lambda c: (
+        float(c.facts["layers"]) * _cp_plan_value(c, "max_rank_tokens")
+    ),
+}
+
+
 def term_matrix(candidates: list[Candidate], terms: tuple[str, ...]) -> np.ndarray:
-    """Term values in feature units (the integer functions divided by WORK_PER_US)."""
+    """Term values in feature units (the integer functions divided by
+    WORK_PER_US; the re-ranker's terms in their own units)."""
 
     rows = []
     for candidate in candidates:
@@ -607,7 +660,14 @@ def term_matrix(candidates: list[Candidate], terms: tuple[str, ...]) -> np.ndarr
             layers=int(candidate.facts["layers"]),
             gdn_layers=int(candidate.facts["gdn_layers"]),
         )
-        rows.append([TERMS[name](features, facts) / WORK_PER_US for name in terms])
+        rows.append(
+            [
+                RERANK_TERMS[name](candidate)
+                if name in RERANK_TERMS
+                else TERMS[name](features, facts) / WORK_PER_US
+                for name in terms
+            ]
+        )
     return np.asarray(rows, dtype=np.float64)
 
 
@@ -768,6 +828,63 @@ def fit_regret(
     return min(results, key=lambda item: item[0])[1]
 
 
+def integerize(
+    candidates: list[Candidate],
+    terms: tuple[str, ...],
+    beta: np.ndarray,
+    *,
+    sweeps: int = 12,
+) -> dict[str, int]:
+    """The production table: integer milli-microseconds per unit, repaired on
+    the integer grid when rounding costs a ranking.
+
+    Rounding the float optimum can flip close pairs (equivalent optima with
+    tiny per-token coefficients are especially fragile). When the rounded
+    table's selection loss on the training cells is no worse than the float
+    optimum's, it is returned as is; otherwise a deterministic coordinate
+    search over integer values continues minimizing the same loss from the
+    rounded table, accepting only strict improvements.
+    """
+
+    matrix = term_matrix(candidates, terms)
+    table = np.asarray([int(round(value * 1_000)) for value in beta], dtype=np.int64)
+
+    def loss(values: np.ndarray) -> float:
+        return selection_loss(candidates, matrix @ (values / 1_000.0))
+
+    best = loss(table)
+    if best <= selection_loss(candidates, matrix @ beta) + 1e-9:
+        return {name: int(value) for name, value in zip(terms, table, strict=True)}
+    for _ in range(sweeps):
+        improved = False
+        for j in range(len(table)):
+            current = int(table[j])
+            trials = {
+                current + 1,
+                max(0, current - 1),
+                current + 2,
+                max(0, current - 2),
+                0,
+            }
+            if current > 0:
+                trials |= {
+                    int(round(current * factor)) for factor in (0.5, 0.9, 1.1, 2.0)
+                }
+            else:
+                trials |= {1, 10, 100, 1_000}
+            for trial in sorted(trials):
+                if trial == current or trial < 0:
+                    continue
+                candidate_table = table.copy()
+                candidate_table[j] = trial
+                candidate_loss = loss(candidate_table)
+                if candidate_loss < best - 1e-9:
+                    best, table, improved = candidate_loss, candidate_table, True
+        if not improved:
+            break
+    return {name: int(value) for name, value in zip(terms, table, strict=True)}
+
+
 def predict(
     candidates: list[Candidate], terms: tuple[str, ...], beta: np.ndarray
 ) -> np.ndarray:
@@ -850,6 +967,282 @@ def gates_pass(report: dict[str, Any]) -> list[str]:
     return problems
 
 
+RERANK_TERM_NAMES = ("wave_per_layer", "max_rank_token_per_layer")
+
+
+def two_stage_shortlist(
+    members: list[Candidate],
+    shortlist_us: np.ndarray,
+    *,
+    shortlist_size: int,
+    incumbent: str,
+) -> list[Candidate]:
+    """The cheapest ``shortlist_size`` layouts of a cell under the shortlist
+    score plus the incumbent anchor, in cheap order (production's rule)."""
+
+    ranked = [
+        member
+        for _score, _label, member in sorted(
+            zip(shortlist_us, [m.label for m in members], members, strict=True),
+            key=lambda item: (item[0], item[1]),
+        )
+    ]
+    shortlist = ranked[: max(1, shortlist_size)]
+    shortlist += [m for m in ranked if m.label == incumbent and m not in shortlist]
+    return shortlist
+
+
+def evaluate_two_stage(
+    candidates: list[Candidate],
+    *,
+    terms: tuple[str, ...],
+    shortlist_beta: np.ndarray,
+    rerank_beta: np.ndarray,
+    shortlist_size: int,
+    incumbent: str,
+) -> dict[str, Any]:
+    """Two-stage selection per cell: shortlist by the ten-term score, select
+    the lowest re-ranker score (ties keep the cheaper layout). Reports the
+    ranking gates over the shortlist, shortlist recall and its irrecoverable
+    regret, non-regression against the cheap-only and version-1 selections,
+    and the synchronous planning cost of pricing the shortlist."""
+
+    by_cell: dict[str, list[Candidate]] = defaultdict(list)
+    for candidate in candidates:
+        by_cell[candidate.cell].append(candidate)
+    regrets: list[float] = []
+    clear_misses: list[str] = []
+    ordered_pairs = 0
+    ordered_correct = 0
+    recall = {
+        "cells": 0,
+        "best_in_shortlist": 0,
+        "clear_winner_cells": 0,
+        "clear_winners_in_shortlist": 0,
+        "max_irrecoverable_pct": 0.0,
+    }
+    regression: dict[str, Any] = {
+        "worse_than_cheap_cells": [],
+        "worse_than_fallback_cells": [],
+        "fallback_available": True,
+        "savings_vs_cheap_pct": [],
+        "savings_vs_fallback_pct": [],
+    }
+    economics: list[tuple[float, float, str]] = []
+    per_cell: dict[str, dict[str, Any]] = {}
+    for cell, members in sorted(by_cell.items()):
+        shortlist_us = predict(members, terms, shortlist_beta)
+        shortlist = two_stage_shortlist(
+            members, shortlist_us, shortlist_size=shortlist_size, incumbent=incumbent
+        )
+        rerank_us = dict(
+            zip(
+                [m.label for m in shortlist],
+                predict(shortlist, RERANK_TERM_NAMES, rerank_beta),
+                strict=True,
+            )
+        )
+        selected = min(
+            enumerate(shortlist), key=lambda item: (rerank_us[item[1].label], item[0])
+        )[1]
+        best = min(members, key=lambda m: m.ms)
+        regret = (selected.ms - best.ms) / best.ms * 100.0
+        regrets.append(regret)
+        by_ms = sorted(members, key=lambda m: m.ms)
+        lead_pct = (by_ms[1].ms - best.ms) / best.ms * 100.0 if len(by_ms) > 1 else 0.0
+        clear = lead_pct > max(best.spread_pct, NOISE_BAND_PCT)
+        if clear and regret > 5.0:
+            clear_misses.append(cell)
+        recall["cells"] += 1
+        recall["best_in_shortlist"] += best in shortlist
+        recall["clear_winner_cells"] += clear
+        recall["clear_winners_in_shortlist"] += clear and best in shortlist
+        irrecoverable = (min(m.ms for m in shortlist) - best.ms) / best.ms * 100.0
+        recall["max_irrecoverable_pct"] = max(
+            recall["max_irrecoverable_pct"], irrecoverable
+        )
+        for a, b in itertools.combinations(shortlist, 2):
+            separation = abs(a.ms - b.ms) / min(a.ms, b.ms) * 100.0
+            if separation <= 3.0:
+                continue
+            ordered_pairs += 1
+            ordered_correct += (a.ms < b.ms) == (
+                rerank_us[a.label] < rerank_us[b.label]
+            )
+        cheap = shortlist[0]
+        cheap_regret = (cheap.ms - best.ms) / best.ms * 100.0
+        regression["savings_vs_cheap_pct"].append(cheap_regret - regret)
+        if regret - cheap_regret > 2.0:
+            regression["worse_than_cheap_cells"].append(cell)
+        if all(m.fallback_work is not None for m in members):
+            fallback = min(members, key=lambda m: (m.fallback_work or 0, m.label))
+            fallback_regret = (fallback.ms - best.ms) / best.ms * 100.0
+            regression["savings_vs_fallback_pct"].append(fallback_regret - regret)
+            if regret - fallback_regret > 2.0:
+                regression["worse_than_fallback_cells"].append(cell)
+        else:
+            regression["fallback_available"] = False
+            fallback_regret = None
+        summary_ms = [
+            float((m.cp_plan or {}).get("summary_ms", 0.0)) for m in shortlist
+        ]
+        planning_ms = sum(summary_ms) - min(
+            summary_ms
+        )  # the selected plan is built anyway
+        economics.append((planning_ms / best.ms * 100.0, planning_ms, cell))
+        per_cell[cell] = {
+            "selected": selected.label,
+            "best": best.label,
+            "regret_pct": regret,
+            "best_lead_pct": lead_pct,
+            "shortlist": [m.label for m in shortlist],
+            "cheap_regret_pct": cheap_regret,
+            "fallback_regret_pct": fallback_regret,
+            "irrecoverable_pct": irrecoverable,
+            "planning_ms": planning_ms,
+        }
+    regrets_sorted = sorted(regrets)
+    ratios = sorted(economics)
+    for key in ("savings_vs_cheap_pct", "savings_vs_fallback_pct"):
+        values = regression.pop(key)
+        regression[key.replace("_pct", "_mean_pct")] = (
+            statistics.mean(values) if values else 0.0
+        )
+    return {
+        "cells": len(by_cell),
+        "pairwise_accuracy": (ordered_correct / ordered_pairs)
+        if ordered_pairs
+        else float("nan"),
+        "ordered_pairs": ordered_pairs,
+        "median_regret_pct": statistics.median(regrets) if regrets else float("nan"),
+        "p95_regret_pct": regrets_sorted[
+            min(len(regrets_sorted) - 1, int(0.95 * len(regrets_sorted)))
+        ]
+        if regrets
+        else float("nan"),
+        "max_regret_pct": max(regrets) if regrets else float("nan"),
+        "clear_misses": clear_misses,
+        "recall": recall,
+        "non_regression": regression,
+        "planning_cost": {
+            "mean_pct_of_cell": statistics.mean(r[0] for r in ratios)
+            if ratios
+            else 0.0,
+            "median_pct_of_cell": ratios[len(ratios) // 2][0] if ratios else 0.0,
+            "max_pct_of_cell": ratios[-1][0] if ratios else 0.0,
+            "max_ms": ratios[-1][1] if ratios else 0.0,
+            "max_cell": ratios[-1][2] if ratios else "",
+        },
+        "per_cell": per_cell,
+    }
+
+
+def two_stage_gates(report: dict[str, Any]) -> list[str]:
+    problems = gates_pass(report)
+    recall = report["recall"]
+    if recall["clear_winners_in_shortlist"] != recall["clear_winner_cells"]:
+        problems.append(
+            f"shortlist misses clear winners: {recall['clear_winners_in_shortlist']}/{recall['clear_winner_cells']}"
+        )
+    regression = report["non_regression"]
+    if regression["worse_than_cheap_cells"]:
+        problems.append(
+            f"worse than the cheap selection by >2%: {regression['worse_than_cheap_cells']}"
+        )
+    if regression["worse_than_fallback_cells"]:
+        problems.append(
+            f"worse than the version-1 selection by >2%: {regression['worse_than_fallback_cells']}"
+        )
+    # A synchronous miss pays for the shortlist's plans; on the re-ranked
+    # cells the execution saved over both single-stage selections must cover it.
+    cost = report["planning_cost"]["mean_pct_of_cell"]
+    savings = max(
+        regression["savings_vs_cheap_mean_pct"],
+        regression["savings_vs_fallback_mean_pct"],
+    )
+    if cost > savings:
+        problems.append(
+            f"planning cost {cost:.1f}% of cell time exceeds the mean saving {savings:.1f}%"
+        )
+    return problems
+
+
+def fit_reranker(
+    candidates: list[Candidate],
+    reranked: list[Candidate],
+    *,
+    terms: tuple[str, ...],
+    held_out: Callable[[str], bool],
+    shortlist_size: int,
+    incumbent: str,
+    objective: str,
+) -> dict[str, Any]:
+    """Fit and evaluate the two-stage selector for the re-ranked shapes.
+
+    The shortlist score is the ten-term table fitted on every measured shape
+    (its job is recall, not selection); the re-ranker is fitted on paired
+    deltas within the training cells' shortlists and refined on their regret,
+    then integerized like a table.
+    """
+
+    shortlist_train = [c for c in candidates if not held_out(c.cell)]
+    shortlist_beta = nnls(*paired_deltas(shortlist_train, terms))
+    if objective == "regret":
+        shortlist_beta = fit_regret(shortlist_train, terms, shortlist_beta)
+    shortlist_table = integerize(shortlist_train, terms, shortlist_beta)
+    shortlist_beta_int = np.asarray([shortlist_table[name] / 1_000.0 for name in terms])
+
+    by_cell: dict[str, list[Candidate]] = defaultdict(list)
+    for candidate in reranked:
+        by_cell[candidate.cell].append(candidate)
+    train_shortlists: list[Candidate] = []
+    for cell, members in sorted(by_cell.items()):
+        if held_out(cell):
+            continue
+        train_shortlists += two_stage_shortlist(
+            members,
+            predict(members, terms, shortlist_beta_int),
+            shortlist_size=shortlist_size,
+            incumbent=incumbent,
+        )
+    rerank_beta = nnls(*paired_deltas(train_shortlists, RERANK_TERM_NAMES))
+    if objective == "regret":
+        rerank_beta = fit_regret(train_shortlists, RERANK_TERM_NAMES, rerank_beta)
+    rerank_table = integerize(train_shortlists, RERANK_TERM_NAMES, rerank_beta)
+    rerank_beta_int = np.asarray(
+        [rerank_table[name] / 1_000.0 for name in RERANK_TERM_NAMES]
+    )
+
+    def two_stage(subset: list[Candidate]) -> dict[str, Any]:
+        return evaluate_two_stage(
+            subset,
+            terms=terms,
+            shortlist_beta=shortlist_beta_int,
+            rerank_beta=rerank_beta_int,
+            shortlist_size=shortlist_size,
+            incumbent=incumbent,
+        )
+
+    held = [c for c in reranked if held_out(c.cell)]
+    shapes = sorted({_shape_label(c) for c in reranked})
+    return {
+        "shortlist_size": shortlist_size,
+        "incumbent": incumbent,
+        "shapes": shapes,
+        "shortlist_table_milli_us": shortlist_table,
+        "wave_per_layer_milli_us": rerank_table["wave_per_layer"],
+        "max_rank_token_per_layer_milli_us": rerank_table["max_rank_token_per_layer"],
+        "metrics": {
+            "all": two_stage(reranked),
+            "held_out": two_stage(held) if held else None,
+            "by_shape": {
+                shape: two_stage([c for c in reranked if _shape_label(c) == shape])
+                for shape in shapes
+            },
+        },
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("evidence", nargs="*", type=Path)
@@ -868,7 +1261,8 @@ def main() -> None:
         default="",
         help=(
             "comma-separated substrings of cells to leave out explicitly (recorded in the "
-            "certificate); the fitter never drops incomplete cells silently"
+            "certificate), or @manifest for exactly the manifest's listed exclusions; "
+            "the fitter never drops incomplete cells silently"
         ),
     )
     parser.add_argument(
@@ -899,6 +1293,17 @@ def main() -> None:
     )
     parser.add_argument("--integerize", action="store_true")
     parser.add_argument(
+        "--rerank-shapes",
+        default="",
+        help=(
+            "comma-separated shape labels (e.g. tp1cp4) selected by the two-stage "
+            "re-ranker: the ten-term score shortlists, the CP plan structure decides; "
+            "their cells leave the direct fit and need cp_plan in the evidence"
+        ),
+    )
+    parser.add_argument("--shortlist-size", type=int, default=3)
+    parser.add_argument("--incumbent", default="depth_one")
+    parser.add_argument(
         "--objective",
         choices=("lsq", "regret"),
         default="regret",
@@ -911,15 +1316,27 @@ def main() -> None:
     )
     arguments = parser.parse_args()
     terms = tuple(t for t in arguments.terms.split(",") if t)
-    excluded = [p for p in arguments.exclude_cells.split(",") if p]
+    if arguments.exclude_cells == "@manifest":
+        # Exactly the manifest's listed exclusions (each carries its reason).
+        if not arguments.manifest:
+            raise SystemExit("--exclude-cells @manifest requires --manifest")
+        manifest_excluded = json.loads(Path(arguments.manifest).read_text())["excluded"]
+        excluded = [cell["key"] for cell in manifest_excluded]
+        exact = True
+    else:
+        excluded = [p for p in arguments.exclude_cells.split(",") if p]
+        exact = False
 
     def excluded_cell(cell: str) -> bool:
-        return any(p in cell for p in excluded)
+        return cell in excluded if exact else any(p in cell for p in excluded)
 
     manifest_record: dict[str, Any] | None = None
     if arguments.manifest:
         problems, excluded_keys = validate_manifest(
-            arguments.evidence, Path(arguments.manifest), excluded=excluded
+            arguments.evidence,
+            Path(arguments.manifest),
+            excluded=excluded,
+            exact=exact,
         )
         if problems:
             print("manifest validation failed:", file=sys.stderr)
@@ -972,6 +1389,27 @@ def main() -> None:
             return int(cell.rsplit("|g", 1)[1]) % 2 == 1
         return False
 
+    # Cells on re-ranked shapes are selected by the two-stage selector; the
+    # direct table is fitted and gated on the other shapes only.
+    rerank_shapes = {label for label in arguments.rerank_shapes.split(",") if label}
+    reranked = [c for c in candidates if _shape_label(c) in rerank_shapes]
+    all_candidates = candidates
+    if rerank_shapes:
+        if not reranked:
+            raise SystemExit(
+                f"no cells on the re-ranked shapes {sorted(rerank_shapes)}"
+            )
+        candidates = [c for c in candidates if _shape_label(c) not in rerank_shapes]
+        if not candidates:
+            raise SystemExit(
+                "every cell is on a re-ranked shape: the direct table needs directly "
+                "scored cells (for a validation run of the two-stage selection alone, "
+                "read the timed `automatic` rows without --rerank-shapes)"
+            )
+        print(
+            f"re-ranked shapes {sorted(rerank_shapes)}: {len({c.cell for c in reranked})} cells "
+            f"leave the direct fit ({len({c.cell for c in candidates})} direct cells)"
+        )
     train = [c for c in candidates if not held_out(c.cell)]
     test = [c for c in candidates if held_out(c.cell)]
     beta = nnls(*paired_deltas(train, terms))
@@ -986,10 +1424,10 @@ def main() -> None:
         "fit_all": evaluate(candidates, predict(candidates, terms, beta)),
     }
     if arguments.integerize:
-        # Production stores integer milli-microseconds per feature unit.
-        integer = {
-            name: int(round(value * 1_000)) for name, value in report["terms"].items()
-        }
+        # Production stores integer milli-microseconds per feature unit;
+        # repaired on the integer grid (training cells) when rounding costs
+        # a ranking.
+        integer = integerize(train, terms, beta)
         report["integer_terms_milli_us"] = integer
         beta_int = np.asarray(
             [integer[name] / 1_000.0 for name in terms], dtype=np.float64
@@ -998,8 +1436,66 @@ def main() -> None:
             candidates, predict(candidates, terms, beta_int)
         )
         print("COEFFICIENTS_MILLI_US =", json.dumps(integer, indent=4))
+    if reranked:
+        if not arguments.integerize:
+            raise SystemExit("--rerank-shapes requires --integerize")
+        report["reranker"] = fit_reranker(
+            all_candidates,
+            reranked,
+            terms=terms,
+            held_out=held_out,
+            shortlist_size=arguments.shortlist_size,
+            incumbent=arguments.incumbent,
+            objective=arguments.objective,
+        )
+        block = report["reranker"]
+        print(
+            "RERANKER =",
+            json.dumps(
+                {
+                    k: block[k]
+                    for k in (
+                        "shortlist_size",
+                        "incumbent",
+                        "shapes",
+                        "wave_per_layer_milli_us",
+                        "max_rank_token_per_layer_milli_us",
+                    )
+                },
+                indent=4,
+            ),
+        )
+        print(
+            "shortlist table (milli-us):", json.dumps(block["shortlist_table_milli_us"])
+        )
+        for name, metrics in (
+            ("two-stage all", block["metrics"]["all"]),
+            ("two-stage held-out", block["metrics"]["held_out"]),
+            *(
+                (f"two-stage {shape}", m)
+                for shape, m in block["metrics"]["by_shape"].items()
+            ),
+        ):
+            if not metrics:
+                continue
+            recall = metrics["recall"]
+            problems = two_stage_gates(metrics)
+            print(
+                f"{name:22s} cells={metrics['cells']:3d} acc={metrics['pairwise_accuracy']:.3f} regret median={metrics['median_regret_pct']:.2f}% "
+                f"p95={metrics['p95_regret_pct']:.2f}% max={metrics['max_regret_pct']:.2f}% | recall {recall['best_in_shortlist']}/{recall['cells']} "
+                f"clear {recall['clear_winners_in_shortlist']}/{recall['clear_winner_cells']} irrecoverable max {recall['max_irrecoverable_pct']:.1f}% | "
+                f"planning mean {metrics['planning_cost']['mean_pct_of_cell']:.1f}% max {metrics['planning_cost']['max_pct_of_cell']:.1f}% of cell vs saving "
+                f"{max(metrics['non_regression']['savings_vs_cheap_mean_pct'], metrics['non_regression']['savings_vs_fallback_mean_pct']):.1f}% | "
+                + (
+                    "GATES PASS"
+                    if not problems
+                    else "GATES FAIL: " + "; ".join(problems)
+                )
+            )
     report["production"] = (
-        production_regret(candidates, arguments.evidence) if arguments.evidence else {}
+        production_regret(all_candidates, arguments.evidence)
+        if arguments.evidence
+        else {}
     )
     if report["production"]:
         regrets = sorted(v["regret_pct"] for v in report["production"].values())
@@ -1083,11 +1579,16 @@ def main() -> None:
                 "holdout": arguments.holdout,
                 "exclude_cells": excluded,
                 "require_complete": arguments.require_complete,
+                "rerank_shapes": sorted(rerank_shapes),
+                "shortlist_size": arguments.shortlist_size,
+                "incumbent": arguments.incumbent,
             },
             integer_table=report["integer_terms_milli_us"],
             report=report,
             manifest=manifest_record,
             table_id=arguments.table_id,
+            reranked=reranked,
+            reranker=report.get("reranker"),
         )
         print("certificate written:", arguments.export_certificate)
 

@@ -59,6 +59,7 @@ import os
 from pathlib import Path
 import statistics
 import sys
+import time
 from typing import Any, cast
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -1131,6 +1132,31 @@ def _gather_objects(value: Any, group: Any = None) -> list[Any]:
     return values
 
 
+def _hybridep_telemetry(rank: Any) -> dict[str, Any]:
+    """HybridEP facts of the last forward on MoE runtimes under expert
+    parallelism: the largest per-rank row count TrainerRank configured (its
+    high-water mark) and the live buffer's token capacity per rank. Both are
+    ``None`` without expert parallelism."""
+
+    try:
+        from megatron.core import parallel_state as ps
+        from megatron.core.transformer.moe import fused_a2a
+    except ImportError:
+        return {"hybridep_rows_high_water": None, "hybridep_capacity_rows": None}
+    if int(ps.get_expert_model_parallel_world_size()) <= 1:
+        return {"hybridep_rows_high_water": None, "hybridep_capacity_rows": None}
+    buffer = getattr(fused_a2a, "_hybrid_ep_buffer", None)
+    capacity = (
+        int(buffer.configurer.buffer_config.max_num_of_tokens_per_rank)
+        if buffer is not None
+        else None
+    )
+    return {
+        "hybridep_rows_high_water": int(getattr(rank, "_hybridep_rows_high_water", 0)),
+        "hybridep_capacity_rows": capacity,
+    }
+
+
 def _merge_rank_statuses(gathered: list[list[str]]) -> list[str]:
     return sorted({str(status) for statuses in gathered for status in statuses})
 
@@ -2097,10 +2123,12 @@ def phase_cost_calibrate(
     from art.megatron import train as megatron_train
     from art.trainer_rank import TrainerRank, TrainerRankMemoryError
     from art.trainer_rank._planner_cost import (
+        COEFFICIENT_VERSION_FALLBACK,
         DeviceClass,
         ScoringFacts,
         layout_features,
         predicted_us,
+        prefix_tree_layout_score,
     )
     from art.trainer_rank._prefix_tree_planner import (
         build_canonical_prefix_tree,
@@ -2197,15 +2225,45 @@ def phase_cost_calibrate(
                 return None
             return predicted_us(features, scoring_facts, rank._planner_coefficients)
 
+        rows_for_plan = tuple(
+            r.input_tokens.reshape(-1).to(torch.long) for r in requests
+        )
         for candidate in candidates:
             features = layout_features(candidate.layout)
             current_us = current_score(features)
+            # The CP plan structure the layout produces (what the two-stage
+            # re-ranker prices) and what deriving it costs on this host.
+            started = time.perf_counter()
+            if facts.cp_size > 1:
+                wave_count, max_rank_tokens = rank._plan_structure(
+                    rows_for_plan, tree, candidate.layout
+                )
+            else:
+                wave_count, max_rank_tokens = 0, int(candidate.layout.packed_tokens)
             candidate_rows.append(
                 {
                     "label": candidate.labels[0],
                     "labels": list(candidate.labels),
                     "features": features.as_dict(),
                     "current_score_us": current_us,
+                    "cp_plan": {
+                        "wave_count": int(wave_count),
+                        "max_rank_tokens": int(max_rank_tokens),
+                        "summary_ms": (time.perf_counter() - started) * 1_000.0,
+                    },
+                    # The version-1 score: the fallback the two-stage
+                    # certification must not regress against.
+                    "fallback_work": int(
+                        prefix_tree_layout_score(
+                            candidate.layout,
+                            cp_size=facts.cp_size,
+                            layers=facts.layers,
+                            uses_gdn=facts.uses_gdn,
+                            tp_size=facts.tp_size,
+                            gdn_layers=facts.gdn_layers,
+                            coefficient_version=COEFFICIENT_VERSION_FALLBACK,
+                        )[0]
+                    ),
                 }
             )
         # The production selector's own choice, timed like every other
@@ -2274,6 +2332,16 @@ def phase_cost_calibrate(
             except TrainerRankMemoryError as error:
                 failed = 1
                 message = str(error)
+            except ValueError as error:
+                # The unsplit forward did not fit and admission tried a split
+                # rung; the forced candidate label names a layout of the whole
+                # tree, so it has no match in a sub-forward's family. A split
+                # run is not a comparable measurement anyway (the fitter drops
+                # subforward_count > 1), so record it as an admission failure.
+                if "unknown forced layout anchor" not in str(error):
+                    raise
+                failed = 1
+                message = f"forced layout has no match under a split rung: {error}"
             end.record()
             torch.cuda.synchronize()
             flags = torch.tensor([float(failed)], device="cuda")
@@ -2296,6 +2364,7 @@ def phase_cost_calibrate(
                 "subforward_count": int(telemetry["subforward_count"]),
                 "peak_allocated_bytes": int(torch.cuda.max_memory_allocated()),
                 "loss": float(loss.detach().float().item()),
+                **_hybridep_telemetry(rank),
             }
             del outputs, loss
             rank.zero_grad()
