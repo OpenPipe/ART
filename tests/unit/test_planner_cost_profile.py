@@ -166,6 +166,7 @@ def test_attention_moe_class_admits_only_its_certified_shapes() -> None:
     from art.trainer_rank._planner_cost import (
         ATTN_MOE_H2048_GEOMETRY,
         ATTN_MOE_H2048_TABLE,
+        GDN_MOE_H2048_GEOMETRY,
     )
 
     geometry = ATTN_MOE_H2048_GEOMETRY
@@ -173,21 +174,21 @@ def test_attention_moe_class_admits_only_its_certified_shapes() -> None:
         selection = _selection(geometry=geometry, shape=shape)
         assert selection.table_id == ATTN_MOE_H2048_TABLE.table_id, shape
         assert selection.reranker is None
-    reranked = _selection(geometry=geometry, shape=ParallelShape(tp=1, cp=4, ep=2))
-    assert reranked.reranker is ATTN_MOE_H2048_TABLE.reranker
-    # Measured shapes whose gates did not pass keep the version-1 score.
+    # TP1 x CP4 is re-ranked at every measured expert parallelism.
+    for ep in (1, 2, 4):
+        reranked = _selection(geometry=geometry, shape=ParallelShape(tp=1, cp=4, ep=ep))
+        assert reranked.reranker is ATTN_MOE_H2048_TABLE.reranker, ep
+    # Unmeasured shapes keep the version-1 score.
     for shape in (
-        ParallelShape(tp=1, cp=2),
-        ParallelShape(tp=1, cp=2, ep=2),
-        ParallelShape(tp=1, cp=4),
-        ParallelShape(tp=1, cp=4, ep=4),
+        ParallelShape(tp=2, cp=2),
+        ParallelShape(tp=1, cp=8),
+        ParallelShape(tp=1, cp=4, ep=8),
+        ParallelShape(tp=2, cp=1, ep=2, etp=2),
     ):
         assert _selection(geometry=geometry, shape=shape).version == (
             COEFFICIENT_VERSION_FALLBACK
         ), shape
     # The GDN MoE class and this attention MoE class never borrow each other.
-    from art.trainer_rank._planner_cost import GDN_MOE_H2048_GEOMETRY
-
     assert (
         _selection(
             geometry=GDN_MOE_H2048_GEOMETRY, shape=ParallelShape(tp=2, cp=1, ep=2)
