@@ -783,12 +783,11 @@ DENSE_ATTN_H5120_TABLE = CalibratedTable(
 
 # Qwen3-30B-A3B class (attention + MoE, hidden 2,048): 32 attention heads in
 # 4 query groups of 128 channels, 128 experts (top-8, expert FFN 768), on H200
-# bf16 (2026-09-04). Admitted directly where the ten-term gates pass (TP1 x
-# CP1, TP2 x CP1, TP2 x CP1 with EP2) and at TP1 x CP4 with EP2 through the
-# two-stage re-ranker; its other measured shapes (TP1 x CP2 with EP1/EP2, TP1 x
-# CP4 with EP1/EP4) keep the version-1 score: this class's timings carried
-# sporadic multi-second stalls and drift, and neither selection passed its
-# gates there (design brief).
+# bf16 (2026-09-04/05). Admitted directly at TP1 x CP1, TP1 x CP2 (EP1, EP2)
+# and TP2 x CP1 (EP1, EP2); TP1 x CP4 at every expert parallelism through the
+# two-stage re-ranker (this attention class has the CP4 blind spot). The CP2
+# and CP4 EP1/EP4 shapes were re-measured with sixteen rounds after their
+# eight-round timings carried sporadic multi-second stalls (design brief).
 ATTN_MOE_H2048_GEOMETRY = ModelGeometry(
     hidden_size=2_048,
     ffn_hidden_size=6_144,
@@ -807,11 +806,11 @@ ATTN_MOE_H2048_TABLE = CalibratedTable(
         "gdn_level": 0,
         "gdn_level_tp": 0,
         "gdn_token_per_rank": 0,
-        "level_cp_per_layer": 0,
+        "level_cp_per_layer": 127_543,
         "level_tp_per_layer": 0,
         "tiny_segment_per_layer": 0,
-        "token_cp_exchange": 0,
-        "token_per_rank": 3_324,
+        "token_cp_exchange": 237,
+        "token_per_rank": 6_648,
         "token_tp_collective": 105,
     },
     device_classes=(H200_CLASS,),
@@ -819,27 +818,33 @@ ATTN_MOE_H2048_TABLE = CalibratedTable(
     geometries=(ATTN_MOE_H2048_GEOMETRY,),
     shapes=(
         ParallelShape(tp=1, cp=1),
+        ParallelShape(tp=1, cp=2),
+        ParallelShape(tp=1, cp=2, ep=2),
         ParallelShape(tp=2, cp=1),
         ParallelShape(tp=2, cp=1, ep=2),
     ),
-    reranked_shapes=(ParallelShape(tp=1, cp=4, ep=2),),
+    reranked_shapes=(
+        ParallelShape(tp=1, cp=4),
+        ParallelShape(tp=1, cp=4, ep=2),
+        ParallelShape(tp=1, cp=4, ep=4),
+    ),
     reranker=ReRanker(
         shortlist_size=3,
         incumbent="depth_one",
         shortlist_coefficients_milli_us={
-            "attention_token_cp_exchange": 135,
+            "attention_token_cp_exchange": 8,
             "gdn_level": 0,
             "gdn_level_tp": 0,
             "gdn_token_per_rank": 0,
-            "level_cp_per_layer": 0,
-            "level_tp_per_layer": 0,
-            "tiny_segment_per_layer": 400_502,
-            "token_cp_exchange": 13,
-            "token_per_rank": 1_618,
-            "token_tp_collective": 21_583,
+            "level_cp_per_layer": 163_376,
+            "level_tp_per_layer": 140_748,
+            "tiny_segment_per_layer": 169_817,
+            "token_cp_exchange": 98,
+            "token_per_rank": 6_705,
+            "token_tp_collective": 78,
         },
-        wave_per_layer_milli_us=1_228_071,
-        max_rank_token_per_layer_milli_us=1_294,
+        wave_per_layer_milli_us=1_388_921,
+        max_rank_token_per_layer_milli_us=1_347,
     ),
 )
 
