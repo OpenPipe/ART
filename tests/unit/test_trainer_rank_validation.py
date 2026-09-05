@@ -620,10 +620,13 @@ def test_hybridep_uses_maximum_cp_model_rows(
 
     configured = trainer._configure_hybridep((batch, short_batch), topology=topology)
 
+    # The reserved capacity covers the largest planned rows per rank (13, from
+    # the longer batch) as well as the near-balanced extent of the sequence.
     assert calls == {
         "capacity": {
             "packed_sequence_length": 9,
             "context_parallel_size": 4,
+            "required_capacity": 13,
         },
     }
     assert configured == ((13, 11), 13)
