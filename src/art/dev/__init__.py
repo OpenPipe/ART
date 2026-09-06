@@ -13,7 +13,12 @@ from .model import (
     VllmRuntimeArgs,
 )
 from .openai_server import OpenAIServerConfig, ServerArgs, get_openai_server_config
-from .train import TrainConfig, TrainSFTConfig
+from .train import (
+    DEFAULT_MAX_COMPLETION_LENGTH,
+    LossType,
+    TrainConfig,
+    TrainSFTConfig,
+)
 from .validate import (
     is_dedicated_mode,
     is_external_vllm_mode,
@@ -40,5 +45,7 @@ __all__ = [
     "ServerArgs",
     "TrainSFTConfig",
     "TrainConfig",
+    "LossType",
+    "DEFAULT_MAX_COMPLETION_LENGTH",
     "validate_dedicated_config",
 ]

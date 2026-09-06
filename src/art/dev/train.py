@@ -8,7 +8,21 @@ if TYPE_CHECKING:
     from art.megatron.routing_replay import MoeRoutingReplayBundle
 
 
+# Reduction schemes implemented by the RL policy-loss reducer.  Keep this
+# alias in the developer configuration module so the public ``TrainerArgs``
+# and the backend's experimental configuration cannot drift apart.
+LossType = Literal["grpo", "bnpo", "dr_grpo"]
+
+# TRL 0.20 (the backend version pinned by ART) uses this value when callers
+# select ``loss_type="dr_grpo"`` without spelling out a completion length.
+# Keeping the default here lets the public TrainerArgs API behave exactly like
+# the native GRPOConfig while still allowing an explicit override.
+DEFAULT_MAX_COMPLETION_LENGTH = 256
+
+
 class TrainConfig(TypedDict, total=False):
+    loss_type: LossType
+    max_completion_length: int
     advantage_balance: float
     """Balance between negative and positive advantages in the range [-1.0, 1.0]. \
 -1.0 means only training on negative advantages, 1.0 means only training on \

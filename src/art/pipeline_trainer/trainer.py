@@ -206,6 +206,8 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
         # Training
         learning_rate: float = 1e-5,
         loss_fn: str = "cispo",
+        loss_type: art.dev.LossType | None = None,
+        max_completion_length: int | None = None,
         loss_fn_config: dict | None = None,
         normalize_advantages: bool = True,
         grad_accumulation_sequences: int | None = None,
@@ -323,6 +325,12 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
         self.queue_maxsize = pipeline.queue_maxsize
         self.learning_rate = learning_rate
         self.loss_fn = loss_fn
+        self.loss_type = loss_type
+        self.max_completion_length = (
+            art.dev.DEFAULT_MAX_COMPLETION_LENGTH
+            if loss_type == "dr_grpo" and max_completion_length is None
+            else max_completion_length
+        )
         self.loss_fn_config = loss_fn_config
         self.normalize_advantages = normalize_advantages
         self.grad_accumulation_sequences = grad_accumulation_sequences
@@ -786,6 +794,20 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                 "PipelineTrainer eval requires a backend with exact checkpoint "
                 "inference leases."
             )
+        if self.loss_type is not None and self.loss_type not in {
+            "grpo",
+            "bnpo",
+            "dr_grpo",
+        }:
+            raise ValueError(
+                "PipelineTrainer loss_type must be 'grpo', 'bnpo', or 'dr_grpo'."
+            )
+        if self.max_completion_length is not None and (
+            isinstance(self.max_completion_length, bool)
+            or not isinstance(self.max_completion_length, int)
+            or self.max_completion_length < 1
+        ):
+            raise ValueError("max_completion_length must be a positive integer")
         if not isinstance(self.backend, LocalBackend):
             return
 
@@ -1079,6 +1101,15 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                 batch,
                 normalize_advantages=self.normalize_advantages,
                 grad_accumulation_sequences=self.grad_accumulation_sequences,
+                **(
+                    {
+                        "loss_type": self.loss_type,
+                        "max_completion_length": self.max_completion_length,
+                    }
+                    if self.loss_type is not None
+                    or self.max_completion_length is not None
+                    else {}
+                ),
             )
             preparation_s = time.monotonic() - started
             if preparation_metrics is None:
@@ -1322,6 +1353,10 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                     "adam_params": self.adam_params,
                     "optimizer_save_interval": self.optimizer_save_interval,
                 }
+                if self.loss_type is not None:
+                    train_kwargs["loss_type"] = self.loss_type
+                if self.max_completion_length is not None:
+                    train_kwargs["max_completion_length"] = self.max_completion_length
                 if self.grad_accumulation_sequences is not None:
                     train_kwargs["grad_accumulation_sequences"] = (
                         self.grad_accumulation_sequences

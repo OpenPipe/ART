@@ -52,6 +52,8 @@ class DeleteCheckpointsResponse(BaseModel):
 
 
 class ExperimentalTrainingConfig(TypedDict, total=False):
+    loss_type: Literal["grpo", "bnpo", "dr_grpo"] | None
+    max_completion_length: int | None
     advantage_balance: float | None
     allow_training_without_logprobs: bool | None
     epsilon: float | None

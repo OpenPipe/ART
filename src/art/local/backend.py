@@ -1291,6 +1291,8 @@ class LocalBackend:
         # Core training parameters
         learning_rate: float = 5e-6,
         loss_fn: Literal["cispo", "ppo"] = "cispo",
+        loss_type: dev.LossType | None = None,
+        max_completion_length: int | None = None,
         loss_fn_config: dict | None = None,
         normalize_advantages: bool = True,
         adam_params: object | None = None,
@@ -1341,6 +1343,14 @@ class LocalBackend:
             learning_rate: Learning rate for training. Defaults to 5e-6.
             loss_fn: RL loss function. LocalBackend currently supports
                 "cispo" and "ppo".
+            loss_type: Token-loss reduction. Use ``"grpo"`` for per-completion
+                means, ``"bnpo"`` for ART's historical active-token mean, or
+                ``"dr_grpo"`` for the fixed response-length denominator from
+                the Dr. GRPO paper. If omitted, the Unsloth trainer's
+                ``TrainerArgs.loss_type`` is used when available.
+            max_completion_length: Fixed completion length used by
+                ``loss_type="dr_grpo"``. Defaults to TRL's 256-token value
+                when that reduction is selected without an explicit length.
             loss_fn_config: Additional loss-function config. Not supported by
                 LocalBackend.
             normalize_advantages: Backward-compatible alias for reward std scaling.
@@ -1404,6 +1414,15 @@ class LocalBackend:
             # await model.log(metrics=result.metrics, step=result.step)
         """
         groups_list = list(trajectory_groups)
+        configured_trainer_args = (
+            (model._internal_config or {}).get("trainer_args", {})
+            if isinstance(model, TrainableModel)
+            else {}
+        )
+        if loss_type is None:
+            loss_type = configured_trainer_args.get("loss_type")
+        if max_completion_length is None:
+            max_completion_length = configured_trainer_args.get("max_completion_length")
         if loss_fn not in {"cispo", "ppo"}:
             raise ValueError("LocalBackend only supports loss_fn='cispo' or 'ppo'.")
         if loss_fn_config is not None:
@@ -1441,6 +1460,8 @@ class LocalBackend:
             )
         config, dev_config = build_rl_train_configs(
             learning_rate=learning_rate,
+            loss_type=loss_type,
+            max_completion_length=max_completion_length,
             advantage_balance=advantage_balance,
             scale_rewards=scale_rewards,
             importance_sampling_level=importance_sampling_level,
