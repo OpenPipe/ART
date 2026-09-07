@@ -1,0 +1,105 @@
+# Cost-model calibration on a 4x H200 node over an explicit lattice of
+# parallel shapes (TP, CP, EP[, ETP]) for one model: the shapes are run one
+# after another with the matching torchrun world size (TP x CP; DP is 1, so
+# EP must divide TP x CP). Used for the multi-class campaign: MoE models
+# need EP isolated from CP (CP1/EP1, CP2/EP1, CP2/EP2, CP4/EP1, CP4/EP2,
+# CP4/EP4) and dense controls reuse the same loop at EP1.
+#
+# The Ellavox corpora are git-ignored (customer-derived tokens); both are
+# mounted so `cal-ellavox` (Qwen3.5 tokenizer) and `cal-ellavox-qwen3`
+# (Qwen3 tokenizer) cells can run, and never committed.
+#
+# Usage:
+#   sky launch -c tr-cost-lattice dev/trainer_rank_cost_calibration_lattice.sky.yaml \
+#     --env RUN_ID=<id> --env MODEL=Qwen/Qwen3.5-35B-A3B \
+#     --env SHAPES="1,1,1 1,2,1 1,2,2 1,4,1 1,4,2 1,4,4 2,1,1 2,1,2" \
+#     --env CELLS="cal-grpo-g8:0 cal-ellavox:0:1" --env REPEAT=8
+# CELLS entries are cell:layers[:group]; layers 0 = full model.
+
+name: trainer-rank-cost-calibration-lattice
+
+workdir: .
+
+file_mounts:
+  /tmp/trainer_rank_ellavox_corpus.json: dev/_trainer_rank_ellavox_qwen35_4b_tokens.json
+  /tmp/trainer_rank_ellavox_qwen3_corpus.json: dev/_trainer_rank_ellavox_qwen3_06b_tokens.json
+
+envs:
+  RUN_ID: unset
+  MODEL: Qwen/Qwen3.5-35B-A3B
+  REPEAT: "8"
+  # tp,cp,ep[,etp] per shape; world size = tp x cp.
+  SHAPES: "1,1,1 1,2,1 1,2,2 1,4,1 1,4,2 1,4,4 2,1,1 2,1,2"
+  # cell:layers[:group]
+  CELLS: "cal-grpo-g8:0"
+
+resources:
+  cloud: kubernetes
+  accelerators: H200:4
+  cpus: 32+
+  memory: 256+
+  image_id: docker:docker.io/bradhiltonnw/art-gpu@sha256:f93fda4032bf37f16d9c639c51daf73e1a884df97d14baabf349868831321bdc
+
+setup: |
+  set -euo pipefail
+  export CC=gcc CXX=g++
+  uv sync --frozen --extra megatron --group dev
+  uv sync --project megatron_runtime --extra cuda12 --group test --frozen
+  uv pip install --python megatron_runtime/.venv/bin/python --no-deps --editable .
+  # Expert-parallel shapes need the HybridEP dispatcher, which ART builds from
+  # its vendored source for this node's GPU architecture (single node).
+  HYBRID_EP_MULTINODE=0 USE_NIXL=0 megatron_runtime/.venv/bin/python -m art.megatron.hybrid_ep_setup
+
+run: |
+  set -euo pipefail
+  : "${RUN_ID:?RUN_ID is required}"
+  root="scratch/trainer_rank_cost_calibration/${RUN_ID}"
+  mkdir -p "${root}"
+  cp /tmp/trainer_rank_ellavox_corpus.json dev/_trainer_rank_ellavox_qwen35_4b_tokens.json
+  cp /tmp/trainer_rank_ellavox_qwen3_corpus.json dev/_trainer_rank_ellavox_qwen3_06b_tokens.json
+  export ART_MEGATRON_DATA_PARALLEL_SIZE=1
+  export ART_MEGATRON_PIPELINE_MODEL_PARALLEL_SIZE=1
+  export TOKENIZERS_PARALLELISM=false
+  export PYTHONUNBUFFERED=1
+  # Native crashes (SIGSEGV in a kernel) print every rank's Python stack.
+  export PYTHONFAULTHANDLER=1
+  uv run --no-sync python dev/trainer_rank_landing_acceptance.py --phase contract
+
+  cell() {  # tp cp ep etp cell layers group
+    ART_MEGATRON_TENSOR_MODEL_PARALLEL_SIZE="$1" ART_MEGATRON_CONTEXT_PARALLEL_SIZE="$2" \
+    ART_MEGATRON_EXPERT_MODEL_PARALLEL_SIZE="$3" ART_MEGATRON_EXPERT_TENSOR_PARALLEL_SIZE="$4" \
+    timeout 7200s megatron_runtime/.venv/bin/python -m torch.distributed.run --standalone --nproc-per-node=$(( $1 * $2 )) \
+      dev/trainer_rank_landing_acceptance.py --phase cost-calibrate \
+      --cell "$5" --model "${MODEL}" --layers "$6" --group "$7" --repeat "${REPEAT}" \
+      --evidence "${root}/evidence.jsonl" 2>&1 | tee "${root}/tp$1-cp$2-ep$3-etp$4-$5-$6-g$7.log" | { grep -E "cost-calibrate|LANDING|Traceback|outside|matches no calibrated" || true; }
+  }
+  # pipefail carries torchrun's status through tee and the grep filter; a
+  # failed cell is recorded and the campaign exits nonzero at the end.
+  failures=0
+  run_cell() { cell "$@" || { failures=$((failures + 1)); echo "CELL FAILED: $*"; }; }
+  for shape in ${SHAPES}; do
+    IFS=, read -r tp cp ep etp <<< "${shape}"
+    etp="${etp:-1}"
+    for spec in ${CELLS}; do
+      IFS=: read -r name layers group <<< "${spec}"
+      run_cell "${tp}" "${cp}" "${ep}" "${etp}" "${name}" "${layers:-0}" "${group:-0}"
+    done
+  done
+  echo "cost-calibration lattice (${MODEL}): done (${failures} failed cells)"
+  [ "${failures}" -eq 0 ]
+
+config:
+  kubernetes:
+    pod_config:
+      spec:
+        schedulerName: binpack-scheduler
+        # A full five-shape dense lattice on a 27B-class model runs ~13 h of
+        # cells after setup; the 42000 s used by the smaller recipes cut it
+        # short and lost the run. The GPU pod policy caps this at 604800.
+        activeDeadlineSeconds: 86400
+        containers:
+          - name: ray-node
+            imagePullPolicy: Always
+            env:
+              - name: UV_LINK_MODE
+                value: copy
