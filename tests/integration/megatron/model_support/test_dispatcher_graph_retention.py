@@ -232,7 +232,7 @@ def test_dispatcher_adaptation_survives_serialization(
         pickle.loads(pickle.dumps(model)) if round_trip == "pickle" else deepcopy(model)
     )
     for layer in clone:
-        dispatcher = cast(Any, layer.token_dispatcher)
+        dispatcher = layer.token_dispatcher
         wrapper = dispatcher.dispatch_preprocess
         assert isinstance(wrapper, partial)
         assert wrapper.args[0] is dispatcher
