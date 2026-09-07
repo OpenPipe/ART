@@ -512,6 +512,9 @@ def _owned_token_ms_for_provider(provider: Any) -> float:
         tensor_parallel_size=int(
             getattr(provider, "tensor_model_parallel_size", 1) or 1
         ),
+        expert_parallel_size=int(
+            getattr(provider, "expert_model_parallel_size", 1) or 1
+        ),
     )
 
 

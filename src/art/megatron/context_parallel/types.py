@@ -308,28 +308,38 @@ def estimate_owned_token_ms(
     moe_ffn_hidden_size: int = 0,
     moe_shared_expert_ffn: int = 0,
     tensor_parallel_size: int = 1,
+    expert_parallel_size: int = 1,
     achieved_tflops: float = 400.0,
 ) -> float:
-    """Per-token, per-layer compute of the non-attention work a rank owns.
+    """Per-token, per-layer compute of the non-attention work that follows a
+    rank's owned tokens, in ms on this rank.
 
-    Dense FLOPs per token: the four attention projections (8 h^2) and a gated
-    MLP (6 h f), or for MoE the routed experts (6 h f_e k) plus a shared expert
-    (6 h f_s); backward is about twice the forward. Divided by the tensor
-    parallel size (each TP rank does its share) and an achieved throughput
-    (400 TFLOP/s is a bf16 H200 at large matmuls). Agrees within about 30%
-    with the per-token coefficients fitted from measured layer times on
+    Local work follows ownership: the four attention projections (8 h^2 FLOPs
+    per token) and the dense gated MLP (6 h f) or, for MoE, the shared expert
+    (6 h f_s). Routed-expert work (6 h f_e k) follows ownership only while the
+    experts are replicated (expert parallelism 1); with expert parallelism the
+    routed rows are redistributed across the expert-parallel group, so a
+    destination rank's expert work depends on the tokens of every source rank
+    in that group, not on its own ownership, and it must not enter the
+    ownership balance (with balanced routing it is the same on every rank).
+
+    Backward is about twice the forward; each tensor-parallel rank does its
+    share; 400 TFLOP/s is a bf16 H200 at large matmuls. Agrees within about
+    30% with the per-token coefficients fitted from measured layer times on
     Qwen3-1.7B/8B/14B and Qwen3-30B-A3B (0.7 / 2.8 / 4.6 / 1.3 us).
     """
 
     h = float(hidden_size)
-    if moe_topk > 0 and moe_ffn_hidden_size > 0:
-        mlp = (
-            6.0
-            * h
-            * (float(moe_ffn_hidden_size) * moe_topk + float(moe_shared_expert_ffn))
-        )
-    else:
-        mlp = 6.0 * h * float(ffn_hidden_size)
-    forward_flops = 8.0 * h * h + mlp
-    total_flops = 3.0 * forward_flops
+    is_moe = moe_topk > 0 and moe_ffn_hidden_size > 0
+    local = 8.0 * h * h + (
+        6.0 * h * float(moe_shared_expert_ffn)
+        if is_moe
+        else 6.0 * h * float(ffn_hidden_size)
+    )
+    routed = (
+        6.0 * h * float(moe_ffn_hidden_size) * moe_topk
+        if is_moe and max(1, expert_parallel_size) == 1
+        else 0.0
+    )
+    total_flops = 3.0 * (local + routed)
     return total_flops / max(1, tensor_parallel_size) / (achieved_tflops * 1e12) * 1e3

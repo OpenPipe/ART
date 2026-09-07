@@ -609,3 +609,35 @@ def test_owned_token_cost_keeps_token_balance_on_a_causal_row() -> None:
     # The bounded local search cannot reach an even split on this skewed row
     # (24 -> 18 of 48 chunks on the busiest rank), but the term pulls that way.
     assert with_tokens < attention_only
+
+
+def test_routed_expert_work_follows_ownership_only_without_expert_parallelism() -> None:
+    """With expert parallelism the routed rows are redistributed across the
+    expert-parallel group (ART runs EP over the CP ranks, e.g. TP1/CP2/EP2), so
+    a destination rank's expert work does not follow its own ownership and must
+    not enter the ownership balance; only projections and the shared expert do."""
+
+    from art.megatron.context_parallel.types import estimate_owned_token_ms
+
+    moe = dict(
+        hidden_size=2_048,
+        ffn_hidden_size=6_144,
+        moe_topk=8,
+        moe_ffn_hidden_size=768,
+        moe_shared_expert_ffn=0,
+    )
+    replicated = estimate_owned_token_ms(**moe, expert_parallel_size=1)
+    ep_equals_cp = estimate_owned_token_ms(**moe, expert_parallel_size=2)
+    projections_only = estimate_owned_token_ms(
+        hidden_size=2_048, ffn_hidden_size=0, moe_topk=0, moe_ffn_hidden_size=0
+    )
+    assert ep_equals_cp == pytest.approx(projections_only)
+    assert replicated > ep_equals_cp
+    # Routed work at EP1: 6 h f_e k FLOPs forward, tripled for backward.
+    routed_ms = 3.0 * 6.0 * 2_048 * 768 * 8 / 400e12 * 1e3
+    assert replicated - ep_equals_cp == pytest.approx(routed_ms)
+    # A shared expert stays local under expert parallelism.
+    with_shared = estimate_owned_token_ms(
+        **{**moe, "moe_shared_expert_ffn": 512}, expert_parallel_size=4
+    )
+    assert with_shared > ep_equals_cp
