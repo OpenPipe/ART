@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import gc
-import inspect
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
+from typing import Any, cast
 import weakref
 
 import pytest
@@ -12,84 +12,94 @@ from torch._dynamo.testing import CompileCounterWithBackend
 pytest.importorskip("megatron.bridge")
 
 from megatron.core.tensor_parallel import random as mcore_random
-from megatron.core.transformer.moe.token_dispatcher import MoEAlltoAllTokenDispatcher
+from megatron.core.transformer.moe.token_dispatcher import (
+    MoEAllGatherTokenDispatcher,
+    MoEAlltoAllTokenDispatcher,
+    MoEFlexTokenDispatcher,
+)
 
-from art.megatron.runtime.bridge_runtime import _patch_moe_dispatcher_graph_retention
-
-_UPSTREAM_DISPATCH = inspect.unwrap(MoEAlltoAllTokenDispatcher.dispatch_preprocess)
+from art.trainer_rank._impl import _configure_moe_dispatcher_caches
 
 
-class _CpuDispatcher(MoEAlltoAllTokenDispatcher):
+def _preprocess(self, routing_map):
+    return routing_map.sum(0)
+
+
+def _synchronize(self, point, tokens_per_expert=None):
+    assert tokens_per_expert is not None
+    return tokens_per_expert
+
+
+def _dispatcher() -> Any:
+    # Keep the exact upstream type and dispatch/permute implementation, replacing
+    # only CUDA/distributed initialization and metadata transfers for this CPU test.
+    dispatcher: Any = object.__new__(MoEAlltoAllTokenDispatcher)
+    dispatcher.config = SimpleNamespace(
+        moe_router_padding_for_quantization=False, moe_permute_fusion=False
+    )
+    dispatcher.shared_experts = None
+    dispatcher.drop_and_pad = False
+    dispatcher.num_out_tokens = 22
+    dispatcher.preprocess = MethodType(_preprocess, dispatcher)
+    dispatcher._maybe_dtoh_and_synchronize = MethodType(_synchronize, dispatcher)
+    return dispatcher
+
+
+class _RouterLayer(torch.nn.Module):
     def __init__(self):
-        # Exercise the real dispatcher/permute without CUDA streams or collectives.
-        self.config = SimpleNamespace(
-            moe_router_padding_for_quantization=False, moe_permute_fusion=False
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.randn(8, 4, dtype=torch.float64))
+        self.token_dispatcher = _dispatcher()
+
+    def forward(self, value):
+        probs = (value.reshape(-1, 8) @ self.weight).softmax(-1)
+        routing = torch.zeros_like(probs, dtype=torch.bool)
+        routing.scatter_(1, probs.topk(2, dim=-1).indices, True)
+        dispatcher = self.token_dispatcher
+        routed, routed_probs = dispatcher.dispatch_preprocess(value, routing, probs)
+        transformed = routed.tanh() * routed_probs[:, None]
+        merged = torch.zeros_like(value.reshape(-1, 8)).index_add(
+            0, dispatcher.reversed_local_input_permutation_mapping, transformed
         )
-        self.shared_experts = None
-        self.drop_and_pad = False
-        self.num_out_tokens = 22  # Eleven tokens, two selected experts each.
-
-    def preprocess(self, routing_map):
-        return routing_map.sum(0)
-
-    def _maybe_dtoh_and_synchronize(self, point, tokens_per_expert=None):
-        assert tokens_per_expert is not None
-        return tokens_per_expert
+        return value + 0.2 * merged.reshape_as(value)
 
 
-def _run_checkpointed_router(backend):
-    torch.manual_seed(47)
-    initial = torch.randn(1, 11, 8, dtype=torch.float64, requires_grad=True)
-    weights = [
-        torch.randn(8, 4, dtype=torch.float64, requires_grad=True) for _ in range(4)
-    ]
-    dispatchers = [_CpuDispatcher() for _ in weights]
+def _run_checkpointed_router(model, *, install_before_backward=False):
+    model.zero_grad(set_to_none=True)
+    initial = torch.linspace(-1, 1, 88, dtype=torch.float64).reshape(1, 11, 8)
+    initial.requires_grad_()
     inputs = []
 
-    def layer(index):
+    def checkpointed(layer):
         def compute(value):
-            probs = (value.reshape(-1, 8) @ weights[index]).softmax(-1)
-            routing = torch.zeros_like(probs, dtype=torch.bool)
-            routing.scatter_(1, probs.topk(2, dim=-1).indices, True)
-            dispatcher = dispatchers[index]
-            routed, routed_probs = dispatcher.dispatch_preprocess(value, routing, probs)
-            transformed = routed.tanh() * routed_probs[:, None]
-            merged = torch.zeros_like(value.reshape(-1, 8)).index_add(
-                0, dispatcher.reversed_local_input_permutation_mapping, transformed
-            )
-            return value + 0.2 * merged.reshape_as(value)
-
-        execute = (
-            compute if backend is None else torch.compile(compute, backend=backend)
-        )
-
-        def forward(value):
             if torch.is_grad_enabled():
                 assert value.is_leaf
                 inputs.append(weakref.ref(value))
-            return execute(value)
+            return layer(value)
 
-        return forward
+        return compute
 
     hidden = initial
-    for index in range(len(weights)):
-        hidden = mcore_random.CheckpointFunction.apply(layer(index), False, hidden)
+    for layer in model:
+        hidden = mcore_random.CheckpointFunction.apply(
+            checkpointed(layer), False, hidden
+        )
     loss = hidden.square().sum()
+    if install_before_backward:
+        _configure_moe_dispatcher_caches([model])
     loss.backward()
     gc.collect()
-    assert len(inputs) == len(weights)
+    assert len(inputs) == len(model)
     alive = [reference() is not None for reference in inputs]
-    for reference in inputs:
-        if (value := reference()) is not None:
-            assert value.grad is not None
-    del value
     gradients = []
-    for value in [initial, *weights]:
+    for value in [initial, *model.parameters()]:
         assert value.grad is not None
         gradients.append(value.grad.clone())
     # Keep the loss/output alive: clearing only the cache must release the leaves.
-    cache_sizes = [dispatcher.probs.numel() for dispatcher in dispatchers]
-    for dispatcher in dispatchers:
+    cache_sizes = []
+    for layer in model:
+        dispatcher = layer.token_dispatcher
+        cache_sizes.append(dispatcher.probs.numel())
         assert dispatcher.probs.dtype == initial.dtype
         assert dispatcher.probs.device == initial.device
         dispatcher.probs = None
@@ -98,38 +108,97 @@ def _run_checkpointed_router(backend):
     return loss.detach(), gradients, alive, cache_sizes
 
 
-@pytest.mark.parametrize("compiled", [False, True])
-def test_dispatcher_cache_does_not_retain_checkpoint_inputs(monkeypatch, compiled):
-    # The imported MCore checkpoint implementation runs unchanged except CPU RNG.
+@pytest.fixture
+def cpu_checkpoint_rng(monkeypatch):
+    # The imported MCore checkpoint implementation otherwise runs unchanged.
     monkeypatch.setattr(
         mcore_random, "_get_all_rng_states", lambda: (torch.get_rng_state(),)
     )
     monkeypatch.setattr(
         mcore_random, "_set_all_rng_states", lambda state: torch.set_rng_state(state)
     )
-    monkeypatch.setattr(
-        MoEAlltoAllTokenDispatcher, "dispatch_preprocess", _UPSTREAM_DISPATCH
-    )
+
+
+@pytest.mark.parametrize("compiled", [False, True])
+@pytest.mark.parametrize("pending_graph", [False, True])
+def test_dispatcher_cache_releases_checkpoint_inputs(
+    cpu_checkpoint_rng, compiled, pending_graph
+):
+    torch.manual_seed(47)
+    original = MoEAlltoAllTokenDispatcher.dispatch_preprocess
     backend = CompileCounterWithBackend("aot_eager") if compiled else None
+    model = torch.nn.ModuleList([_RouterLayer() for _ in range(4)])
+    if backend is not None:
+        model = torch.nn.ModuleList(
+            [
+                cast(torch.nn.Module, torch.compile(layer, backend=backend))
+                for layer in model
+            ]
+        )
     try:
         reference_loss, reference_grads, retained, sizes = _run_checkpointed_router(
-            backend
+            model
         )
         assert all(retained)
         assert sizes == [44] * 4
-        # Production installs runtime patches before compiling any model graph.
-        torch.compiler.reset()
-        _patch_moe_dispatcher_graph_retention()
-        patched = MoEAlltoAllTokenDispatcher.dispatch_preprocess
-        _patch_moe_dispatcher_graph_retention()
-        assert MoEAlltoAllTokenDispatcher.dispatch_preprocess is patched
-        loss, gradients, retained, sizes = _run_checkpointed_router(backend)
+        # This same model has already compiled/executed both forward and backward.
+        # Do not reset the compiler between warming and installing the adaptation.
+        if not pending_graph:
+            _configure_moe_dispatcher_caches([model])
+        loss, gradients, retained, sizes = _run_checkpointed_router(
+            model, install_before_backward=pending_graph
+        )
         assert not any(retained)
         assert sizes == [0] * 4
         assert torch.equal(loss, reference_loss)
         for actual, expected in zip(gradients, reference_grads, strict=True):
             assert torch.equal(actual, expected)
+        assert MoEAlltoAllTokenDispatcher.dispatch_preprocess is original
         if backend is not None:
             assert backend.frame_count > 0
     finally:
         torch.compiler.reset()
+
+
+def test_dispatcher_adaptation_is_instance_scoped_and_collectable(cpu_checkpoint_rng):
+    class CustomDispatcher(MoEAlltoAllTokenDispatcher):
+        pass
+
+    target = _RouterLayer()
+    untouched = _RouterLayer()
+    subclass = object.__new__(CustomDispatcher)
+    overridden = _dispatcher()
+    override = overridden.dispatch_preprocess
+    overridden.dispatch_preprocess = override
+    excluded = [
+        subclass,
+        overridden,
+        object.__new__(MoEAllGatherTokenDispatcher),
+        object.__new__(MoEFlexTokenDispatcher),
+    ]
+    owners = [target, target]  # Shared module and dispatcher discovery is harmless.
+    for dispatcher in [target.token_dispatcher, *excluded]:
+        owner = torch.nn.Module()
+        setattr(owner, "token_dispatcher", dispatcher)
+        owners.append(owner)
+    model = torch.nn.ModuleList(owners)
+    original = MoEAlltoAllTokenDispatcher.dispatch_preprocess
+    _configure_moe_dispatcher_caches([model, model])
+    adapted = target.token_dispatcher.dispatch_preprocess
+    _configure_moe_dispatcher_caches([model])
+    assert target.token_dispatcher.dispatch_preprocess is adapted
+    assert MoEAlltoAllTokenDispatcher.dispatch_preprocess is original
+    assert untouched.token_dispatcher.dispatch_preprocess.__func__ is original
+    assert subclass.dispatch_preprocess.__func__ is original
+    assert overridden.dispatch_preprocess is override
+    for dispatcher in excluded:
+        assert "probs" not in vars(dispatcher)
+    _, _, retained, sizes = _run_checkpointed_router(torch.nn.ModuleList([untouched]))
+    assert retained == [True]
+    assert sizes == [44]
+    # Persistent bound methods must not keep the dispatcher alive once its owner
+    # and any pending graphs have gone away.
+    reference = weakref.ref(target.token_dispatcher)
+    del adapted, target, owners, model, owner
+    gc.collect()
+    assert reference() is None
