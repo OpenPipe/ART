@@ -1144,14 +1144,14 @@ def _patch_moe_dispatcher_graph_retention() -> None:
         probs: torch.Tensor,
     ):
         result = original(self, hidden_states, routing_map, probs)
-        # MCore reads this cache only for dtype. A detached alias can still retain
-        # its base graph under compilation; an empty tensor owns no input storage.
+        # MCore reads this cache only for dtype; an empty tensor owns no graph or
+        # input storage. Keeping probabilities retains checkpoint inputs and grads.
         # Returned routing probabilities keep their original gradient path.
         self.probs = probs.new_empty(0)
         return result
 
     setattr(_dispatch_preprocess, "__art_probs_dtype_cache__", True)
-    MoEAlltoAllTokenDispatcher.dispatch_preprocess = _dispatch_preprocess
+    setattr(MoEAlltoAllTokenDispatcher, "dispatch_preprocess", _dispatch_preprocess)
 
 
 def _patch_moe_unpermute_empty_input() -> None:

@@ -32,8 +32,9 @@ class _CpuDispatcher(MoEAlltoAllTokenDispatcher):
     def preprocess(self, routing_map):
         return routing_map.sum(0)
 
-    def _maybe_dtoh_and_synchronize(self, point, value):
-        return value
+    def _maybe_dtoh_and_synchronize(self, point, tokens_per_expert=None):
+        assert tokens_per_expert is not None
+        return tokens_per_expert
 
 
 def _run_checkpointed_router(backend):
@@ -87,11 +88,14 @@ def _run_checkpointed_router(backend):
         assert value.grad is not None
         gradients.append(value.grad.clone())
     # Keep the loss/output alive: clearing only the cache must release the leaves.
+    cache_sizes = [dispatcher.probs.numel() for dispatcher in dispatchers]
     for dispatcher in dispatchers:
+        assert dispatcher.probs.dtype == initial.dtype
+        assert dispatcher.probs.device == initial.device
         dispatcher.probs = None
     gc.collect()
     assert all(reference() is None for reference in inputs)
-    return loss.detach(), gradients, alive
+    return loss.detach(), gradients, alive, cache_sizes
 
 
 @pytest.mark.parametrize("compiled", [False, True])
@@ -108,14 +112,20 @@ def test_dispatcher_cache_does_not_retain_checkpoint_inputs(monkeypatch, compile
     )
     backend = CompileCounterWithBackend("aot_eager") if compiled else None
     try:
-        reference_loss, reference_grads, retained = _run_checkpointed_router(backend)
+        reference_loss, reference_grads, retained, sizes = _run_checkpointed_router(
+            backend
+        )
         assert all(retained)
+        assert sizes == [44] * 4
+        # Production installs runtime patches before compiling any model graph.
+        torch.compiler.reset()
         _patch_moe_dispatcher_graph_retention()
         patched = MoEAlltoAllTokenDispatcher.dispatch_preprocess
         _patch_moe_dispatcher_graph_retention()
         assert MoEAlltoAllTokenDispatcher.dispatch_preprocess is patched
-        loss, gradients, retained = _run_checkpointed_router(backend)
+        loss, gradients, retained, sizes = _run_checkpointed_router(backend)
         assert not any(retained)
+        assert sizes == [0] * 4
         assert torch.equal(loss, reference_loss)
         for actual, expected in zip(gradients, reference_grads, strict=True):
             assert torch.equal(actual, expected)
