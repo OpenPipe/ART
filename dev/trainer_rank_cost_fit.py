@@ -480,6 +480,11 @@ def load_candidates(paths: list[Path]) -> list[Candidate]:
                     continue
                 if any(status != "none" for status in row.get("compile_statuses", [])):
                     continue
+                # Paired planner A/B runs time every layout under the current
+                # and a legacy CP planner configuration; only the current one
+                # is calibration evidence.
+                if row.get("planner_variant", "current") != "current":
+                    continue
                 samples[(_cell_key(row), str(row["candidate_label"]))].append(
                     float(row["ms_max_rank"])
                 )

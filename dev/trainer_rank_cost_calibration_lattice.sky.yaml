@@ -32,6 +32,8 @@ envs:
   SHAPES: "1,1,1 1,2,1 1,2,2 1,4,1 1,4,2 1,4,4 2,1,1 2,1,2"
   # cell:layers[:group]
   CELLS: "cal-grpo-g8:0"
+  # Extra harness arguments, e.g. "--planner-ab" for the paired CP planner A/B.
+  EXTRA_ARGS: ""
 
 resources:
   cloud: kubernetes
@@ -71,7 +73,7 @@ run: |
     timeout 7200s megatron_runtime/.venv/bin/python -m torch.distributed.run --standalone --nproc-per-node=$(( $1 * $2 )) \
       dev/trainer_rank_landing_acceptance.py --phase cost-calibrate \
       --cell "$5" --model "${MODEL}" --layers "$6" --group "$7" --repeat "${REPEAT}" \
-      --evidence "${root}/evidence.jsonl" 2>&1 | tee "${root}/tp$1-cp$2-ep$3-etp$4-$5-$6-g$7.log" | { grep -E "cost-calibrate|LANDING|Traceback|outside|matches no calibrated" || true; }
+      --evidence "${root}/evidence.jsonl" ${EXTRA_ARGS} 2>&1 | tee "${root}/tp$1-cp$2-ep$3-etp$4-$5-$6-g$7.log" | { grep -E "cost-calibrate|LANDING|Traceback|outside|matches no calibrated" || true; }
   }
   # pipefail carries torchrun's status through tee and the grep filter; a
   # failed cell is recorded and the campaign exits nonzero at the end.

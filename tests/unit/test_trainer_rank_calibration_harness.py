@@ -115,3 +115,39 @@ def test_qwen3_ellavox_cells_use_the_qwen3_corpus() -> None:
     assert set(driver.ELLAVOX_CORPORA) == {"qwen35", "qwen3"}
     for path, digest in driver.ELLAVOX_CORPORA.values():
         assert path.name.startswith("_trainer_rank_ellavox_") and len(digest) == 64
+
+
+def test_legacy_planner_variant_restores_the_pre_854_constants() -> None:
+    """The paired A/B times every layout under the current CP planner and the
+    legacy constants (no host cost per remote stage, a fetch priced at about
+    14 GB/s, attention-only balance); the legacy config differs in exactly
+    those fields."""
+
+    pytest.importorskip("megatron.core")
+    from art.megatron.context_parallel.types import ContextParallelConfig
+
+    current = ContextParallelConfig(planner_owned_token_ms=0.0033)
+    legacy = driver._legacy_planner_config(current)
+    assert legacy.planner_remote_stage_host_ms == 0.0
+    assert (
+        legacy.planner_fetch_token_ms == legacy.planner_reduce_token_ms == 0.000287151
+    )
+    assert legacy.planner_owned_token_ms == 0.0
+    assert current.planner_remote_stage_host_ms > 0.0
+    assert current.planner_fetch_token_ms < legacy.planner_fetch_token_ms
+    changed = {
+        name
+        for name in current.__dataclass_fields__
+        if getattr(current, name) != getattr(legacy, name)
+    }
+    assert changed == {
+        "planner_remote_stage_host_ms",
+        "planner_fetch_token_ms",
+        "planner_reduce_token_ms",
+        "planner_owned_token_ms",
+    }
+    driver._set_planner_variant("legacy")
+    assert driver._planner_variant == "legacy"
+    driver._set_planner_variant("current")
+    with pytest.raises(ValueError):
+        driver._set_planner_variant("other")
