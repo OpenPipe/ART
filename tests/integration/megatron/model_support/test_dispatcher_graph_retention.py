@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+from copy import deepcopy
+from functools import partial
 import gc
-from types import MethodType, SimpleNamespace
+import pickle
+from types import SimpleNamespace
 from typing import Any, cast
 import weakref
 
@@ -41,8 +44,8 @@ def _dispatcher() -> Any:
     dispatcher.shared_experts = None
     dispatcher.drop_and_pad = False
     dispatcher.num_out_tokens = 22
-    dispatcher.preprocess = MethodType(_preprocess, dispatcher)
-    dispatcher._maybe_dtoh_and_synchronize = MethodType(_synchronize, dispatcher)
+    dispatcher.preprocess = partial(_preprocess, dispatcher)
+    dispatcher._maybe_dtoh_and_synchronize = partial(_synchronize, dispatcher)
     return dispatcher
 
 
@@ -207,9 +210,51 @@ def test_dispatcher_adaptation_is_instance_scoped_and_collectable(cpu_checkpoint
     _, _, retained, sizes = _run_checkpointed_router(torch.nn.ModuleList([untouched]))
     assert retained == [True]
     assert sizes == [44]
-    # Persistent bound methods must not keep the dispatcher alive once its owner
+    # Persistent callables must not keep the dispatcher alive once its owner
     # and any pending graphs have gone away.
     reference = weakref.ref(target.token_dispatcher)
     del adapted, target, owners, model, owner, trainer, runtime
     gc.collect()
     assert reference() is None
+
+
+@pytest.mark.parametrize("round_trip", ["pickle", "deepcopy"])
+@pytest.mark.parametrize("compiled", [False, True])
+def test_dispatcher_adaptation_survives_serialization(
+    cpu_checkpoint_rng, round_trip, compiled
+):
+    torch.manual_seed(47)
+    model = torch.nn.ModuleList([_RouterLayer() for _ in range(4)])
+    expected_loss, expected_grads, retained, _ = _run_checkpointed_router(model)
+    assert all(retained)
+    _configure_moe_dispatcher_caches([model])
+    clone = (
+        pickle.loads(pickle.dumps(model)) if round_trip == "pickle" else deepcopy(model)
+    )
+    for layer in clone:
+        dispatcher: Any = layer.token_dispatcher
+        wrapper = dispatcher.dispatch_preprocess
+        assert isinstance(wrapper, partial)
+        assert wrapper.args[0] is dispatcher
+        assert all(dispatcher is not original.token_dispatcher for original in model)
+        _configure_moe_dispatcher_caches([clone])
+        assert dispatcher.dispatch_preprocess is wrapper
+    backend = CompileCounterWithBackend("aot_eager") if compiled else None
+    if backend is not None:
+        clone = torch.nn.ModuleList(
+            [
+                cast(torch.nn.Module, torch.compile(layer, backend=backend))
+                for layer in clone
+            ]
+        )
+    try:
+        loss, gradients, retained, sizes = _run_checkpointed_router(clone)
+        assert not any(retained)
+        assert sizes == [0] * 4
+        assert torch.equal(loss, expected_loss)
+        for actual, expected in zip(gradients, expected_grads, strict=True):
+            assert torch.equal(actual, expected)
+        if backend is not None:
+            assert backend.frame_count > 0
+    finally:
+        torch.compiler.reset()
