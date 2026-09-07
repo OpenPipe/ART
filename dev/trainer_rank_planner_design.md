@@ -202,35 +202,48 @@ for the shipped table (the version-1 score reaches 15% on another group
 there; neither is adequate). The dense certificate had no
 attention-plus-real-data cells at CP4, so its metrics did not cover this.
 
-Resolution (2026-09-04, per review). The attention classes get their own
+Resolution (2026-09-04/05, per review). The attention classes get their own
 tables where the ten-term gates pass — Qwen3-1.7B (`dense-attn-h2048-h200-bf16`)
 and Qwen3-8B (`dense-attn-h4096-h200-bf16`) at TP1 × CP1/CP2 and TP2 × CP1,
 Qwen3-14B (`dense-attn-h5120-h200-bf16`) also at TP2 × CP2 (42/42/56 cells;
 pairwise 96.5%/99.9%/99.9%, max regret ≤1.1%) — and TP1 × CP4 is admitted
 through a **two-stage selection** (`ReRanker`, `CalibratedTable.reranked_shapes`,
-`select_prefix_tree_layout(..., reranker, plan_structure)`): the ten-term score
-(a shortlist table fitted on every measured shape; its job is recall) keeps the
-three cheapest layouts of the search plus the depth-one anchor, each shortlisted
-layout is priced by the structure of the context-parallel plan it produces —
-remote wave count and largest per-rank token load, per layer, from the CP
-planner's own assignment (`summarize_prefix_tree_plan`, through the planning
-bundle cache so the selected layout's plan is reused) — and the lowest
-second-stage score wins (ties keep the cheaper layout). The two physical
-drivers came out of the measured schedules: on equal-load layouts an extra
-remote wave costs 2.4 / 1.8 / 0.6 ms per layer on 1.7B / 8B / 14B (the CP
-planner's own model prefers the extra wave; issue #854), and the max-rank load
-carries the rest. Certified per class on TP1 × CP4 (`reranker` block of the
-certificate, bound by `tests/unit/test_planner_cost_certificate.py`):
-every clear measured winner is in the shortlist; two-stage regret max
-2.6% / 0.8% / 4.1% (held-out 0.7% / 0.8% / 0.4%); never more than 2% worse
-than the cheap-only or the version-1 selection; and the synchronous planning
-cost of pricing the shortlist (mean 2.6% / 1.6% / 1.0% of the cell's time
-after the assignment-search speedup below) is below the mean execution saved
-on those cells (2.9% / 1.8% / 1.2%). TP2 × CP2 still fails its gates for the
-two smaller classes and keeps version 1; the dense table withholds
-Qwen3-4B × TP1 × CP4 (version 1's 15% worst observed cell is the less harmful
-fallback than the table's 35%; its 7 real-data CP4 cells are too few to
-certify a re-ranker).
+`select_prefix_tree_layout(..., reranker, plan_structure)`) where that selection
+pays for itself: the ten-term score (a shortlist table fitted on every measured
+shape; its job is recall) keeps the three cheapest layouts of the search plus
+the depth-one anchor, each shortlisted layout is priced by the structure of the
+context-parallel plan it produces — remote wave count and largest per-rank token
+load, per layer, from the CP planner's own assignment
+(`summarize_prefix_tree_plan`, through the planning bundle cache so the
+selected layout's plan is reused) — and the lowest second-stage score wins
+(ties keep the cheaper layout). The two physical drivers came out of the
+measured schedules: on equal-load layouts an extra remote wave costs 2.4 / 1.8 /
+0.6 ms per layer on 1.7B / 8B / 14B (the CP planner's own model prefers the
+extra wave; issue #854), and the max-rank load carries the rest.
+
+The re-ranker's certificate (the `reranker` block, recomputed by
+`tests/unit/test_planner_cost_certificate.py` on all cells and on the held-out
+cells) requires: every clear measured winner in the shortlist; the ranking
+gates on the two-stage selection; never more than 2% worse than the cheap-only
+or the version-1 selection; and the synchronous planning cost of pricing the
+shortlist covered by the mean execution saved against **both** single-stage
+alternatives (cache reuse and overlap are not measured and do not count). That
+last gate decides which classes ship it: Qwen3-8B (max regret 0.8%; planning
+1.6% of cell time against 1.8% saved over version 1) and Qwen3-14B (4.1%; 1.0%
+against 1.2%) pass on all and held-out cells; Qwen3-1.7B does not — the
+re-ranker ranks its cells (max 2.6%) but on that small model pricing three
+plans costs 2.6% of a cell's time against 2.0% saved over version 1 — nor does
+the Qwen3-30B-A3B attention-MoE class (0.9% saved against 1.1% planning on all
+cells, and version 1 is 0.3% better on its held-out cells). Both keep version 1
+at TP1 × CP4, with the reason recorded per cell in their manifests. The dense
+table withholds Qwen3-4B × TP1 × CP4 (version 1's 15% worst observed cell is the
+less harmful fallback than the table's 35%; its 7 real-data CP4 cells are too
+few to certify a re-ranker).
+
+The tables and re-rankers were calibrated on training forwards (forward +
+backward). Groups that run without gradients keep the version-1 score and are
+cached under their own identity (`_PlannerFacts.grad_enabled`) until
+forward-only execution is validated separately.
 
 Fourth calibrated class (2026-09-04/05): Qwen3-30B-A3B (attention + MoE, hidden
 2,048, 128 experts top-8; `attn-moe-h2048-h200-bf16`) on H200 bf16 over the same
@@ -241,10 +254,9 @@ sporadic 10–20 s stalls on about 4% of rounds, so those shapes were re-measure
 with sixteen rounds (the stalls persist at about 4% of rounds but shrink to
 about 2×, and medians hold). The class shows the attention CP4 blind spot.
 Admitted directly at TP1 × CP1, TP1 × CP2 (EP1, EP2) and TP2 × CP1 (EP1, EP2)
-(67 cells; pairwise 96.3%, max regret 2.2%), and at TP1 × CP4 with EP1, EP2 and
-EP4 through the two-stage re-ranker (42 cells; max 2.1%, every clear winner
-shortlisted, planning 1.1% of cell time against 1.4% saved), where version 1
-lost up to 13%.
+(67 cells; pairwise 96.3%, max regret 2.2%). TP1 × CP4 keeps version 1: the
+two-stage re-ranker ranks it (max 2.1% at EP1, EP2 and EP4) but does not pay
+back its planning cost against version 1 (above).
 
 Fifth calibrated class (2026-09-04): Qwen3.5-27B (dense GDN + attention,
 hidden 5,120; `dense-gdn-h5120-h200-bf16`) on H200 bf16 over TP1 × CP1/2/4,

@@ -201,6 +201,44 @@ def test_reranked_shapes_are_certified_by_the_two_stage_selection(table) -> None
     assert not fit.two_stage_gates(recomputed)
     for shape, metrics in block["metrics"]["by_shape"].items():
         assert not fit.two_stage_gates(metrics), shape
+    # The held-out cells (the fit's own holdout rule) must pass the same gates,
+    # recomputed here rather than trusted from the certificate.
+    arguments = payload["fit_arguments"]
+    patterns = [p for p in arguments["holdout"].split(",") if p]
+
+    def held_out(cell: str) -> bool:
+        if any(p in cell for p in patterns):
+            return True
+        return (
+            "cal-ellavox" in cell
+            and "|g" in cell
+            and int(cell.rsplit("|g", 1)[1]) % 2 == 1
+        )
+
+    held = [c for c in reranked if held_out(c.cell)]
+    assert held, "no held-out re-ranked cells"
+    recomputed_held = fit.evaluate_two_stage(
+        held,
+        terms=terms,
+        shortlist_beta=np.asarray(
+            [block["shortlist_table_milli_us"][name] / 1_000.0 for name in terms]
+        ),
+        rerank_beta=np.asarray(
+            [
+                block["wave_per_layer_milli_us"] / 1_000.0,
+                block["max_rank_token_per_layer_milli_us"] / 1_000.0,
+            ]
+        ),
+        shortlist_size=block["shortlist_size"],
+        incumbent=block["incumbent"],
+    )
+    recorded_held = block["metrics"]["held_out"]
+    for key in ("cells", "ordered_pairs", "clear_misses", "recall"):
+        assert recomputed_held[key] == recorded_held[key], key
+    assert (
+        abs(recomputed_held["max_regret_pct"] - recorded_held["max_regret_pct"]) < 1e-9
+    )
+    assert not fit.two_stage_gates(recomputed_held)
     # The direct metrics are the certificate's headline metrics: direct cells only.
     beta = np.asarray(
         [table.coefficients_milli_us.get(name, 0) / 1_000.0 for name in terms]
