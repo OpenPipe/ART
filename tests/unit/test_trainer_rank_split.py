@@ -33,7 +33,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from contextlib import nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import sys
 from types import ModuleType, SimpleNamespace
 from typing import TYPE_CHECKING, Any, cast
@@ -150,7 +150,7 @@ def test_dp_rank_forward_splits_instead_of_raising(
     # Unsplit: 40 packed tokens. Budget admits 20, so two subforwards of two
     # requests fit once a retained profile says earlier graphs cost nothing
     # extra here (the cumulative test covers the conservative default).
-    monkeypatch.setattr(rank, "_retained_fraction", lambda *_args, **_kwargs: 0.0)
+    monkeypatch.setattr(rank, "_retained_memory_bytes", lambda *_args, **_kwargs: 0)
     _packed_budget(monkeypatch, rank, 20)
 
     outputs = rank.dp_rank_forward(inputs)
@@ -192,7 +192,7 @@ def test_split_outputs_preserve_nested_caller_order(
         [_request(2)],
         [_request(3), _request(4), _request(5)],
     ]
-    monkeypatch.setattr(rank, "_retained_fraction", lambda *_args, **_kwargs: 0.0)
+    monkeypatch.setattr(rank, "_retained_memory_bytes", lambda *_args, **_kwargs: 0)
     _packed_budget(monkeypatch, rank, 20)
 
     outputs = rank.dp_rank_forward(nested)
@@ -273,7 +273,11 @@ def test_split_admission_uses_a_retained_profile_when_available(
     rank = _rank(monkeypatch)
     executed = _recording_executor(monkeypatch, rank)
     _packed_budget(monkeypatch, rank, 25)
-    monkeypatch.setattr(rank, "_retained_fraction", lambda *_args, **_kwargs: 0.1)
+    monkeypatch.setattr(
+        rank,
+        "_retained_memory_bytes",
+        lambda *_args, **kwargs: int(kwargs["required"] * 0.1),
+    )
 
     outputs = rank.dp_rank_forward([_request(marker) for marker in range(4)])
 
@@ -286,7 +290,7 @@ def test_forward_micro_batches_splits_the_minimum_wave(
 ) -> None:
     rank = _rank(monkeypatch)
     _recording_executor(monkeypatch, rank)
-    monkeypatch.setattr(rank, "_retained_fraction", lambda *_args, **_kwargs: 0.0)
+    monkeypatch.setattr(rank, "_retained_memory_bytes", lambda *_args, **_kwargs: 0)
     # One top-level item holding four requests (40 tokens) under a 20-token
     # budget: the minimum wave cannot fit unsplit and must split, not raise.
     items = [[_request(marker) for marker in range(4)]]
@@ -306,7 +310,7 @@ def test_forward_micro_batches_splits_the_minimum_wave(
 def test_split_decisions_are_deterministic(monkeypatch: pytest.MonkeyPatch) -> None:
     rank = _rank(monkeypatch)
     executed = _recording_executor(monkeypatch, rank)
-    monkeypatch.setattr(rank, "_retained_fraction", lambda *_args, **_kwargs: 0.0)
+    monkeypatch.setattr(rank, "_retained_memory_bytes", lambda *_args, **_kwargs: 0)
     _packed_budget(monkeypatch, rank, 30)
     inputs = [_request(marker) for marker in range(8)]
 
@@ -337,7 +341,7 @@ def test_split_ladder_ensures_checkpoint_slots_once(
 
     rank = _rank(monkeypatch)
     _recording_executor(monkeypatch, rank)
-    monkeypatch.setattr(rank, "_retained_fraction", lambda *_args, **_kwargs: 0.0)
+    monkeypatch.setattr(rank, "_retained_memory_bytes", lambda *_args, **_kwargs: 0)
     ensured = 0
     original = rank._ensure_checkpoint_slots
 
@@ -372,10 +376,14 @@ def test_retained_profile_is_trusted_only_near_its_observed_scale(
     _packed_budget(monkeypatch, rank, 25)
     inputs = [_request(marker) for marker in range(4)]
     signature = rank._plan_flat_forward(inputs).signature
+    monkeypatch.setattr(
+        rank, "_estimate_group_request_output_bytes", lambda requests: 0
+    )
     rank._memory_profiles[signature] = _MemoryProfile(
         bytes_per_token=1.0,
         packed_tokens=observed_packed_tokens,
         retained_fraction=0.1,
+        retained_compute_bytes_per_token=0.1 / 1.1,
     )
 
     if expect_split:
@@ -394,15 +402,12 @@ def test_retained_observations_are_max_merged_once_observed(
     _packed_budget(monkeypatch, rank, 1_000)
     plan = rank._plan_flat_forward([_request(marker) for marker in range(4)])
 
-    def fraction() -> float:
-        return rank._retained_fraction(
-            plan.signature,
-            packed_tokens=plan.packed_tokens,
-            logical_tokens=plan.logical_tokens,
-        )
+    def fraction() -> float | None:
+        profile = rank._memory_profiles.get(plan.signature)
+        return None if profile is None else profile.retained_fraction
 
     # Observations are retained bytes over the same forward's peak delta (40).
-    assert fraction() == 1.0  # never observed
+    assert fraction() is None  # never observed
     rank._update_memory_profile(plan, 40, retained_bytes=40)
     assert fraction() == 1.0  # observed: everything retained
     rank._update_memory_profile(plan, 40, retained_bytes=4)
@@ -419,12 +424,134 @@ def test_retained_observations_are_max_merged_once_observed(
     assert fraction() == pytest.approx(0.7)  # peak-only update keeps it
 
 
+@pytest.mark.parametrize("output_gib", [0, 4])
+@pytest.mark.parametrize("peak_first", [False, True])
+def test_backward_peak_does_not_inflate_retained_split_memory(
+    monkeypatch: pytest.MonkeyPatch, output_gib: int, peak_first: bool
+) -> None:
+    rank = TrainerRank(_runtime())
+    gib = 1 << 30
+    plan = replace(
+        rank._plan_flat_forward([_request(0)]),
+        packed_tokens=100,
+        logical_tokens=100,
+        output_bytes=output_gib * gib,
+    )
+    half = replace(
+        plan, packed_tokens=50, logical_tokens=50, output_bytes=plan.output_bytes // 2
+    )
+    if peak_first:
+        rank._update_memory_profile(plan, 100 * gib, retained_bytes=None)
+    rank._update_memory_profile(plan, 60 * gib, retained_bytes=30 * gib)
+    forward = rank._plan_cost(half)
+    rank._update_memory_profile(plan, 100 * gib, retained_bytes=None)
+    backward = rank._plan_cost(half)
+
+    assert forward.required == (55 if peak_first else 33) * gib
+    assert backward.required == 55 * gib
+    assert forward.retained == backward.retained == int(16.5 * gib)
+    monkeypatch.setattr(rank, "_available_memory_bytes", lambda: 75 * gib)
+    check = rank._split_rung_check([backward, backward])
+    assert check.fits
+    assert check.estimated_required_bytes == int(71.5 * gib)
+
+
+@pytest.mark.parametrize("retained_bytes", [20_000, 40_000, 60_000])
+@pytest.mark.parametrize("output_bytes", [10_000, 30_000])
+def test_retained_outputs_are_charged_separately(
+    retained_bytes: int, output_bytes: int
+) -> None:
+    rank = TrainerRank(_runtime())
+    plan = replace(
+        rank._plan_flat_forward([_request(0)]),
+        packed_tokens=100,
+        logical_tokens=100,
+        output_bytes=40_000,
+    )
+    rank._update_memory_profile(plan, 100_000, retained_bytes=retained_bytes)
+    rank._update_memory_profile(plan, 200_000, retained_bytes=None)
+    half = replace(plan, packed_tokens=50, logical_tokens=50, output_bytes=output_bytes)
+    retained_compute = max(0, retained_bytes - plan.output_bytes) // 2
+    assert rank._plan_cost(half).retained == int(
+        (output_bytes + retained_compute) * 1.1
+    )
+
+
+def test_retained_compute_observations_are_max_merged_independently() -> None:
+    rank = TrainerRank(_runtime())
+    plan = replace(
+        rank._plan_flat_forward([_request(0)]),
+        packed_tokens=100,
+        logical_tokens=100,
+        output_bytes=40_000,
+    )
+    rank._update_memory_profile(plan, 100_000, retained_bytes=60_000)
+    larger = replace(plan, packed_tokens=200, logical_tokens=200, output_bytes=80_000)
+    rank._update_memory_profile(larger, 200_000, retained_bytes=180_000)
+    retained = rank._plan_cost(plan).retained
+    rank._update_memory_profile(larger, 300_000, retained_bytes=None)
+    rank._update_memory_profile(plan, 100_000, retained_bytes=41_000)
+
+    assert rank._memory_profiles[plan.signature].retained_compute_bytes_per_token == 500
+    assert rank._plan_cost(plan).retained == retained == 99_000
+
+
+def test_changed_output_allocation_does_not_inflate_retained_compute() -> None:
+    rank = TrainerRank(_runtime())
+    plan = replace(
+        rank._plan_flat_forward([_request(0)]),
+        packed_tokens=100,
+        logical_tokens=100,
+        output_bytes=40_000,
+    )
+    rank._update_memory_profile(plan, 100_000, retained_bytes=60_000)
+    retained = rank._plan_cost(plan).retained
+    larger_output = replace(plan, output_bytes=140_000)
+    rank._update_memory_profile(larger_output, 200_000, retained_bytes=160_000)
+
+    assert rank._memory_profiles[plan.signature].retained_compute_bytes_per_token == 200
+    assert rank._plan_cost(plan).retained == retained == 66_000
+    assert rank._plan_cost(larger_output).retained == 176_000
+
+
+@pytest.mark.parametrize(
+    ("packed_tokens", "logical_tokens", "trusted"),
+    [(800, 800, True), (801, 801, False), (100, 800, True), (100, 801, False)],
+)
+def test_retained_compute_keeps_growth_and_sharing_trust_limits(
+    packed_tokens: int, logical_tokens: int, trusted: bool
+) -> None:
+    rank = TrainerRank(_runtime())
+    plan = replace(
+        rank._plan_flat_forward([_request(0)]),
+        packed_tokens=100,
+        logical_tokens=100,
+        output_bytes=40_000,
+    )
+    candidate = replace(
+        plan, packed_tokens=packed_tokens, logical_tokens=logical_tokens
+    )
+    cold = rank._plan_cost(candidate)
+    assert cold.retained == cold.required
+    # A peak-only observation cannot authorize releasing any retained memory.
+    rank._update_memory_profile(plan, 100_000, retained_bytes=None)
+    unknown = rank._plan_cost(candidate)
+    assert unknown.retained == unknown.required
+    rank._update_memory_profile(plan, 100_000, retained_bytes=60_000)
+    observed = rank._plan_cost(candidate)
+    if trusted:
+        assert observed.retained == 220_000
+        assert observed.retained < observed.required
+    else:
+        assert observed.retained == observed.required
+
+
 @pytest.mark.parametrize("failing_ordinal", (0, 1))
 def test_split_execution_failure_is_reported_as_partial_execution(
     monkeypatch: pytest.MonkeyPatch, failing_ordinal: int
 ) -> None:
     rank = _rank(monkeypatch)
-    monkeypatch.setattr(rank, "_retained_fraction", lambda *_args, **_kwargs: 0.0)
+    monkeypatch.setattr(rank, "_retained_memory_bytes", lambda *_args, **_kwargs: 0)
     _packed_budget(monkeypatch, rank, 20)
     runs = 0
 
@@ -461,7 +588,7 @@ def test_split_subforwards_track_independent_slot_graphs(
     the second is released too."""
 
     rank = _rank(monkeypatch)
-    monkeypatch.setattr(rank, "_retained_fraction", lambda *_args, **_kwargs: 0.0)
+    monkeypatch.setattr(rank, "_retained_memory_bytes", lambda *_args, **_kwargs: 0)
     _packed_budget(monkeypatch, rank, 20)
     ref = cast("LoRASlotRef", _SlotRef("teacher"))
     monkeypatch.setattr(rank, "_slot_ref", lambda name: _SlotRef(name))
