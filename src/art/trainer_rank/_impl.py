@@ -574,14 +574,13 @@ class _MemoryProfile:
     bytes_per_token: float
     packed_tokens: int
     logical_per_packed: float = 1.0
-    # Fraction of a forward's observed peak still allocated after it returns
-    # (activations retained for backward): a physical ratio, so it needs no
-    # trusted denominator (the cold call's static estimate is far below the
-    # real peak). ``None`` until observed, max-merged afterwards. Observed at
-    # forward return only — it says nothing about the backward's own
-    # workspace. Trusted only near the ``packed_tokens`` /
-    # ``logical_per_packed`` scale it was observed at.
+    # Historical forward-retained/forward-peak ratio for calibration telemetry,
+    # max-merged only from forward-return observations. Admission uses the
+    # independent retained compute rate below, not this ratio of past peaks.
     retained_fraction: float | None = None
+    # Separate the retained compute rate from the peak, which also learns
+    # caller-owned backward workspace. Requested outputs are charged explicitly.
+    retained_compute_bytes_per_token: float | None = None
 
 
 @dataclass(frozen=True)
@@ -2482,39 +2481,45 @@ class TrainerRank:
             signature=signature,
             logical_tokens=logical_tokens,
         )
-        retained = int(
-            required
-            * self._retained_fraction(
-                signature, packed_tokens=packed_tokens, logical_tokens=logical_tokens
-            )
+        retained = self._retained_memory_bytes(
+            signature,
+            packed_tokens=packed_tokens,
+            logical_tokens=logical_tokens,
+            output_bytes=output_bytes,
+            required=required,
         )
         return _SubforwardCost(required=required, retained=retained)
 
-    def _retained_fraction(
+    def _retained_memory_bytes(
         self,
         signature: _MemorySignature,
         *,
         packed_tokens: int,
         logical_tokens: int,
-    ) -> float:
-        """Share of a subforward's peak still allocated after it returns.
+        output_bytes: int,
+        required: int,
+    ) -> int:
+        """Forward-retained bytes, independent of a later backward peak.
 
-        Applied to the estimated peak, which is at least the real one whenever
-        the estimate is trusted. 1.0 (everything retained) until observed. An
-        observation is trusted only near the scale and sharing ratio it was
-        made at — the growth range that already gates ``bytes_per_token`` —
-        so a small profiled forward cannot authorize a much larger split.
+        Retain the full estimate until observed near the current scale and
+        sharing ratio, so a small forward cannot authorize a much larger split.
         """
 
         profile = self._memory_profiles.get(signature)
-        if profile is None or profile.retained_fraction is None:
-            return 1.0
+        if profile is None or profile.retained_compute_bytes_per_token is None:
+            return required
         if packed_tokens > profile.packed_tokens * _MEMORY_PROFILE_TRUST_GROWTH:
-            return 1.0
+            return required
         ratio = logical_tokens / max(1, packed_tokens)
         if ratio > profile.logical_per_packed * _MEMORY_PROFILE_TRUST_GROWTH:
-            return 1.0
-        return profile.retained_fraction
+            return required
+        retained = (
+            output_bytes
+            + profile.retained_compute_bytes_per_token
+            * packed_tokens
+            * max(1.0, ratio / profile.logical_per_packed)
+        )
+        return min(required, int(retained * _MEMORY_SAFETY_FACTOR))
 
     def _split_request_order(
         self,
@@ -4655,6 +4660,9 @@ class TrainerRank:
         bytes_per_token = compute_delta / max(1, plan.packed_tokens)
         previous = self._memory_profiles.get(plan.signature)
         retained_fraction = None if previous is None else previous.retained_fraction
+        retained_compute = (
+            None if previous is None else previous.retained_compute_bytes_per_token
+        )
         if retained_bytes is not None:
             observed = min(1.0, retained_bytes / max(1, peak_delta_bytes))
             # Max-merge once observed. ``None`` (never observed) is distinct
@@ -4665,6 +4673,10 @@ class TrainerRank:
                 if retained_fraction is None
                 else max(retained_fraction, observed)
             )
+            observed_compute = max(
+                0, min(retained_bytes, peak_delta_bytes) - plan.output_bytes
+            ) / max(1, plan.packed_tokens)
+            retained_compute = max(retained_compute or 0.0, observed_compute)
         self._memory_profiles[plan.signature] = _MemoryProfile(
             bytes_per_token=max(
                 bytes_per_token,
@@ -4679,6 +4691,7 @@ class TrainerRank:
                 1.0 if previous is None else previous.logical_per_packed,
             ),
             retained_fraction=retained_fraction,
+            retained_compute_bytes_per_token=retained_compute,
         )
 
     def _forward_item(self, request: AnyForwardInput) -> _ForwardItem:
