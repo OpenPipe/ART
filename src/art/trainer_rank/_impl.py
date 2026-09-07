@@ -1150,6 +1150,14 @@ def _moe_dispatch_preprocess(
     return result
 
 
+def _moe_combine_postprocess(dispatcher: Any, hidden_states: torch.Tensor):
+    result = type(dispatcher).combine_postprocess(dispatcher, hidden_states)
+    # Backward saves its own maps; the next dispatch recreates these caches.
+    dispatcher.routing_map = None
+    dispatcher.reversed_local_input_permutation_mapping = None
+    return result
+
+
 def _configure_moe_dispatcher_caches(model: Sequence[torch.nn.Module]) -> None:
     for chunk in model:
         for module in chunk.modules():
@@ -1174,6 +1182,16 @@ def _configure_moe_dispatcher_caches(model: Sequence[torch.nn.Module]) -> None:
             )
             if (probs := getattr(dispatcher, "probs", None)) is not None:
                 dispatcher.probs = probs.new_empty(0)
+            if (
+                "combine_postprocess" not in vars(dispatcher)
+                and getattr(dispatcher.config, "cuda_graph_impl", "none") == "none"
+            ):
+                # CUDA graph capture exposes these maps as explicit outputs.
+                setattr(
+                    dispatcher,
+                    "combine_postprocess",
+                    partial(_moe_combine_postprocess, dispatcher),
+                )
 
 
 class TrainerRank:
