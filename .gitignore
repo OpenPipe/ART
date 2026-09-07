@@ -26,3 +26,4 @@ replays/
 scratch/
 /progress_log.md
 dev/_trainer_rank_ellavox_qwen35_4b_tokens.json
+dev/_trainer_rank_ellavox_qwen3_06b_tokens.json

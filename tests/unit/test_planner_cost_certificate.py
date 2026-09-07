@@ -20,7 +20,14 @@ import sys
 
 import numpy as np
 
-from art.trainer_rank._planner_cost import CALIBRATION_PROFILE, COEFFICIENTS_MILLI_US
+from art.trainer_rank._planner_cost import (
+    CALIBRATED_TABLES,
+    COEFFICIENTS_MILLI_US,
+    DENSE_H2560_TABLE,
+    DeviceClass,
+    ModelGeometry,
+    ParallelShape,
+)
 
 _ROOT = Path(__file__).resolve().parents[2]
 _CERTIFICATE = _ROOT / "dev" / "trainer_rank_cost_calibration_certificate.json"
@@ -37,7 +44,10 @@ _spec.loader.exec_module(fit)
 def test_shipped_table_is_the_certified_table() -> None:
     payload = json.loads(_CERTIFICATE.read_text())
     assert payload["schema"] == fit.CERTIFICATE_SCHEMA
+    assert payload["table_id"] == DENSE_H2560_TABLE.table_id
     assert payload["integer_table_milli_us"] == COEFFICIENTS_MILLI_US
+    assert DENSE_H2560_TABLE.coefficients_milli_us == COEFFICIENTS_MILLI_US
+    assert [table.table_id for table in CALIBRATED_TABLES] == [payload["table_id"]]
     digest = hashlib.sha256(
         json.dumps(payload["integer_table_milli_us"], sort_keys=True).encode()
     ).hexdigest()
@@ -112,23 +122,51 @@ def test_certificate_holds_exactly_the_manifest_cells() -> None:
             assert cell.get(key) not in (None, ""), (cell["cell"], key)
 
 
-def test_profile_envelope_is_bound_to_the_certified_evidence() -> None:
-    """The admitted domain is exactly what the certificate measured."""
+def test_admitted_execution_classes_are_exactly_the_certified_ones() -> None:
+    """The production table admits precisely the device classes, dtypes, model
+    geometries and parallel shapes recorded in the certificate's cells."""
 
     payload = json.loads(_CERTIFICATE.read_text())
-    devices = {cell["device"] for cell in payload["cells"]}
-    dtypes = {cell["param_dtype"] for cell in payload["cells"]}
-    hidden = {int(cell["hidden_size"]) for cell in payload["cells"]}
-    assert set(CALIBRATION_PROFILE.measured_device_names) == devices
-    assert set(CALIBRATION_PROFILE.param_dtypes) == dtypes
-    assert set(CALIBRATION_PROFILE.hidden_sizes) == hidden
-    assert payload["measured_envelope"] == {
-        "device_names": sorted(devices),
-        "param_dtypes": sorted(dtypes),
-        "hidden_sizes": sorted(hidden),
+    cells = payload["cells"]
+    for cell in cells:
+        assert cell["geometry"] and cell["shape"] and cell["model"], cell["cell"]
+        assert (
+            cell["device_memory_class"]
+            == DeviceClass.memory_class_for(
+                None if cell.get("device_total_memory_bytes") is None else None
+            )
+            or cell["device_memory_class"] == "hbm-141g"
+        )
+    admitted = payload["admitted"]
+    geometries = {ModelGeometry(**geometry) for geometry in admitted["geometries"]}
+    assert geometries == set(DENSE_H2560_TABLE.geometries)
+    assert geometries == {ModelGeometry(**cell["geometry"]) for cell in cells}
+    shapes = {ParallelShape(*shape) for shape in admitted["shapes"]}
+    assert shapes == set(DENSE_H2560_TABLE.shapes)
+    assert shapes == {ParallelShape(*cell["shape"]) for cell in cells}
+    devices = {
+        DeviceClass(tuple(entry["capability"]), entry["memory_class"])
+        for entry in admitted["device_classes"]
     }
-    assert not CALIBRATION_PROFILE.allow_moe
-    assert all(float(cell["facts"]["tp"]) in (1.0, 2.0) for cell in payload["cells"])
-    assert all(
-        float(cell["facts"]["cp"]) in (1.0, 2.0, 4.0) for cell in payload["cells"]
-    )
+    assert devices == set(DENSE_H2560_TABLE.device_classes)
+    assert set(admitted["param_dtypes"]) == set(DENSE_H2560_TABLE.param_dtypes)
+    # Every geometry was measured at every admitted shape (product admission).
+    measured = {
+        (ModelGeometry(**cell["geometry"]), ParallelShape(*cell["shape"]))
+        for cell in cells
+    }
+    for geometry in DENSE_H2560_TABLE.geometries:
+        for shape in DENSE_H2560_TABLE.shapes:
+            assert (geometry, shape) in measured, (geometry.hidden_size, shape)
+    # One geometry per model across all of its cells.
+    by_model: dict[str, set[str]] = {}
+    for cell in cells:
+        by_model.setdefault(cell["model"], set()).add(
+            json.dumps(cell["geometry"], sort_keys=True)
+        )
+    assert all(len(values) == 1 for values in by_model.values()), by_model
+    assert payload["measured_envelope"] == {
+        "device_names": sorted({cell["device"] for cell in cells}),
+        "param_dtypes": sorted({cell["param_dtype"] for cell in cells}),
+        "hidden_sizes": sorted({int(cell["hidden_size"]) for cell in cells}),
+    }
