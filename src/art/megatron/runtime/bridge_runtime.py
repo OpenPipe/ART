@@ -5,6 +5,7 @@ import contextlib
 import copy
 from dataclasses import replace
 import fnmatch
+import functools
 import re
 from typing import Any, cast
 
@@ -1132,9 +1133,10 @@ def _patch_moe_dispatcher_graph_retention() -> None:
     )
 
     original = MoEAlltoAllTokenDispatcher.dispatch_preprocess
-    if getattr(original, "__art_detached_probs_cache__", False):
+    if getattr(original, "__art_probs_dtype_cache__", False):
         return
 
+    @functools.wraps(original)
     def _dispatch_preprocess(
         self: Any,
         hidden_states: torch.Tensor,
@@ -1142,13 +1144,13 @@ def _patch_moe_dispatcher_graph_retention() -> None:
         probs: torch.Tensor,
     ):
         result = original(self, hidden_states, routing_map, probs)
-        # MCore reads this persistent cache only for dtype. Keeping its graph
-        # retains each recomputed checkpoint input and its gradient after backward.
-        # The returned routing probabilities keep their original gradient path.
-        self.probs = probs.detach()
+        # MCore reads this cache only for dtype. A detached alias can still retain
+        # its base graph under compilation; an empty tensor owns no input storage.
+        # Returned routing probabilities keep their original gradient path.
+        self.probs = probs.new_empty(0)
         return result
 
-    setattr(_dispatch_preprocess, "__art_detached_probs_cache__", True)
+    setattr(_dispatch_preprocess, "__art_probs_dtype_cache__", True)
     MoEAlltoAllTokenDispatcher.dispatch_preprocess = _dispatch_preprocess
 
 
