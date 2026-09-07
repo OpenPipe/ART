@@ -5,7 +5,6 @@ import contextlib
 import copy
 from dataclasses import replace
 import fnmatch
-import functools
 import re
 from typing import Any, cast
 
@@ -937,7 +936,6 @@ def install_art_bridge_runtime_patches() -> None:
     _patch_router_gating_linear_empty_input()
     _patch_bias_swiglu_empty_input()
     _patch_moe_unpermute_empty_input()
-    _patch_moe_dispatcher_graph_retention()
     _patch_nonuniform_expert_export()
     if not getattr(
         model_provider_module.get_model, "__art_meta_materialization__", False
@@ -1125,33 +1123,6 @@ def _patch_bias_swiglu_empty_input() -> None:
     setattr(mlp, "weighted_bias_swiglu_impl", _weighted_bias_swiglu_empty_safe)
     setattr(experts, "weighted_bias_swiglu_impl", _weighted_bias_swiglu_empty_safe)
     setattr(shared_experts, "bias_swiglu_impl", _bias_swiglu_empty_safe)
-
-
-def _patch_moe_dispatcher_graph_retention() -> None:
-    from megatron.core.transformer.moe.token_dispatcher import (
-        MoEAlltoAllTokenDispatcher,
-    )
-
-    original = MoEAlltoAllTokenDispatcher.dispatch_preprocess
-    if getattr(original, "__art_probs_dtype_cache__", False):
-        return
-
-    @functools.wraps(original)
-    def _dispatch_preprocess(
-        self: Any,
-        hidden_states: torch.Tensor,
-        routing_map: torch.Tensor,
-        probs: torch.Tensor,
-    ):
-        result = original(self, hidden_states, routing_map, probs)
-        # MCore reads this cache only for dtype; an empty tensor owns no graph or
-        # input storage. Keeping probabilities retains checkpoint inputs and grads.
-        # Returned routing probabilities keep their original gradient path.
-        self.probs = probs.new_empty(0)
-        return result
-
-    setattr(_dispatch_preprocess, "__art_probs_dtype_cache__", True)
-    setattr(MoEAlltoAllTokenDispatcher, "dispatch_preprocess", _dispatch_preprocess)
 
 
 def _patch_moe_unpermute_empty_input() -> None:
