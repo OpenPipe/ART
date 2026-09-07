@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import gc
+import inspect
 from types import SimpleNamespace
 import weakref
 
@@ -15,7 +16,7 @@ from megatron.core.transformer.moe.token_dispatcher import MoEAlltoAllTokenDispa
 
 from art.megatron.runtime.bridge_runtime import _patch_moe_dispatcher_graph_retention
 
-_UPSTREAM_DISPATCH = MoEAlltoAllTokenDispatcher.dispatch_preprocess
+_UPSTREAM_DISPATCH = inspect.unwrap(MoEAlltoAllTokenDispatcher.dispatch_preprocess)
 
 
 class _CpuDispatcher(MoEAlltoAllTokenDispatcher):
