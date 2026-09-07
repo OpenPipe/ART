@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import argparse
 from collections import defaultdict
+from collections.abc import Callable
 from dataclasses import dataclass
 import itertools
 import json
@@ -83,11 +84,28 @@ class Candidate:
     ms: float
     n: int
     spread_pct: float
+    # Grouping keys for per-model / per-shape reports (not fitted).
+    model: str = ""
+    shape: tuple[int, int, int, int] = (1, 1, 1, 1)
+
+
+def _shape(row: dict[str, Any]) -> tuple[int, int, int, int]:
+    """(tp, cp, ep, etp); expert parallelism defaults to 1 for older rows."""
+
+    return (
+        int(row.get("tp", 1)),
+        int(row.get("cp", 1)),
+        int(row.get("ep", 1) or 1),
+        int(row.get("etp", 1) or 1),
+    )
 
 
 def _cell_key(row: dict[str, Any]) -> str:
+    tp, cp, ep, etp = _shape(row)
     return (
-        f"{row['cell']}|{row['model']}|L{row['layers']}|tp{row['tp']}|cp{row['cp']}"
+        f"{row['cell']}|{row['model']}|L{row['layers']}|tp{tp}|cp{cp}"
+        + (f"|ep{ep}" if ep > 1 else "")
+        + (f"|etp{etp}" if etp > 1 else "")
         + (
             f"|g{row['workload'].get('group')}"
             if row.get("workload", {}).get("group") is not None
@@ -193,7 +211,12 @@ FINGERPRINT_FIELDS = (
     "device",
     "param_dtype",
     "hidden_size",
+    "geometry",
 )
+
+
+def _fingerprint(row: dict[str, Any]) -> tuple[Any, ...]:
+    return tuple(json.dumps(row.get(k), sort_keys=True) for k in FINGERPRINT_FIELDS)
 
 
 def cell_fingerprints(paths: list[Path]) -> dict[str, set[tuple[Any, ...]]]:
@@ -206,7 +229,7 @@ def cell_fingerprints(paths: list[Path]) -> dict[str, set[tuple[Any, ...]]]:
                 continue
             row = json.loads(line)
             if row.get("record_type") == "calibration_cell":
-                seen[_cell_key(row)].add(tuple(row.get(k) for k in FINGERPRINT_FIELDS))
+                seen[_cell_key(row)].add(_fingerprint(row))
     return seen
 
 
@@ -252,6 +275,7 @@ def export_certificate(
     integer_table: dict[str, int],
     report: dict[str, Any],
     manifest: dict[str, Any] | None = None,
+    table_id: str = "",
 ) -> None:
     """Write the compact, reproducible record binding the table to its data.
 
@@ -274,9 +298,14 @@ def export_certificate(
                     "requests_sha256": row.get("requests_sha256"),
                     "source": row.get("source"),
                     "workload": row.get("workload"),
+                    "model": row.get("model"),
                     "device": row.get("device"),
+                    "device_capability": row.get("device_capability"),
+                    "device_memory_class": row.get("device_memory_class"),
                     "param_dtype": row.get("param_dtype"),
                     "hidden_size": row.get("hidden_size"),
+                    "geometry": row.get("geometry"),
+                    "shape": list(_shape(row)),
                 }
     by_cell: dict[str, list[Candidate]] = defaultdict(list)
     for candidate in candidates:
@@ -307,11 +336,34 @@ def export_certificate(
         "param_dtypes": sorted({str(c.get("param_dtype")) for c in cells}),
         "hidden_sizes": sorted({int(c.get("hidden_size") or 0) for c in cells}),
     }
+
+    # The execution classes this table was measured on: exactly what the
+    # production table admits (bound by tests/unit/test_planner_cost_certificate.py).
+    def unique(values: Any) -> list[Any]:
+        return [
+            json.loads(v)
+            for v in sorted({json.dumps(x, sort_keys=True) for x in values})
+        ]
+
+    admitted = {
+        "device_classes": unique(
+            {
+                "capability": c.get("device_capability"),
+                "memory_class": c.get("device_memory_class"),
+            }
+            for c in cells
+        ),
+        "param_dtypes": envelope["param_dtypes"],
+        "geometries": unique(c.get("geometry") for c in cells),
+        "shapes": unique(c.get("shape") for c in cells),
+    }
     payload = {
         "schema": CERTIFICATE_SCHEMA,
+        "table_id": table_id,
         "fit_arguments": arguments,
         "manifest": manifest,
         "measured_envelope": envelope,
+        "admitted": admitted,
         "cells": cells,
         "integer_table_milli_us": integer_table,
         "integer_table_sha256": table_hash,
@@ -375,6 +427,8 @@ def load_certificate(path: Path) -> tuple[list[Candidate], dict[str, Any]]:
             float(c["median_ms"]),
             int(c["n"]),
             float(c["spread_pct"]),
+            str(cell.get("model") or cell["cell"].split("|")[1]),
+            tuple(cell.get("shape") or _shape(cell["facts"])),
         )
         for cell in payload["cells"]
         for c in cell["candidates"]
@@ -405,11 +459,14 @@ def load_candidates(paths: list[Path]) -> list[Candidate]:
                 )
     candidates: list[Candidate] = []
     for key, cell in cells.items():
+        shape = _shape(cell)
         facts = {
             "layers": float(cell["layers"]),
             "gdn_layers": float(cell["gdn_layers"]),
-            "tp": float(cell["tp"]),
-            "cp": float(cell["cp"]),
+            "tp": float(shape[0]),
+            "cp": float(shape[1]),
+            "ep": float(shape[2]),
+            "etp": float(shape[3]),
             "uses_gdn": float(bool(cell["uses_gdn"])),
         }
         for candidate in cell["candidates"]:
@@ -429,9 +486,55 @@ def load_candidates(paths: list[Path]) -> list[Candidate]:
                     median,
                     len(values),
                     spread,
+                    str(cell["model"]),
+                    shape,
                 )
             )
     return candidates
+
+
+def evaluate_groups(
+    candidates: list[Candidate],
+    predicted_us: np.ndarray,
+    key: Callable[[Candidate], str],
+) -> dict[str, dict[str, Any]]:
+    """Headline metrics per group (model, parallel shape, workload family):
+    gates are judged per group, never pooled, so many easy cells of one model
+    cannot hide one poorly modeled architecture."""
+
+    groups: dict[str, list[tuple[Candidate, float]]] = defaultdict(list)
+    for candidate, value in zip(candidates, predicted_us, strict=True):
+        groups[key(candidate)].append((candidate, float(value)))
+    report: dict[str, dict[str, Any]] = {}
+    for name, members in sorted(groups.items()):
+        block = evaluate([m[0] for m in members], np.asarray([m[1] for m in members]))
+        report[name] = {
+            k: block[k]
+            for k in (
+                "cells",
+                "ordered_pairs",
+                "pairwise_accuracy",
+                "median_regret_pct",
+                "p95_regret_pct",
+                "max_regret_pct",
+                "clear_misses",
+            )
+        }
+        report[name]["gate_problems"] = gates_pass(block)
+    return report
+
+
+def _shape_label(candidate: Candidate) -> str:
+    tp, cp, ep, etp = candidate.shape
+    return (
+        f"tp{tp}cp{cp}"
+        + (f"ep{ep}" if ep > 1 else "")
+        + (f"etp{etp}" if etp > 1 else "")
+    )
+
+
+def _family_label(candidate: Candidate) -> str:
+    return candidate.cell.split("|")[0]
 
 
 def selector_check(candidates: list[Candidate]) -> dict[str, dict[str, Any]]:
@@ -789,6 +892,11 @@ def main() -> None:
         help="comma-separated substrings selecting held-out cells (odd Ellavox groups are always held out)",
     )
     parser.add_argument("--report", default="", help="write the JSON report here")
+    parser.add_argument(
+        "--table-id",
+        default="",
+        help="identity of the production table this certificate binds (required with --export-certificate)",
+    )
     parser.add_argument("--integerize", action="store_true")
     parser.add_argument(
         "--objective",
@@ -926,6 +1034,31 @@ def main() -> None:
             f"p95={block['p95_regret_pct']:.2f}% max={block['max_regret_pct']:.2f}% "
             f"clear_misses={len(block['clear_misses'])}"
         )
+    final_beta = np.asarray(
+        [
+            report.get("integer_terms_milli_us", {}).get(name, 0) / 1_000.0
+            for name in terms
+        ]
+        if "integer_terms_milli_us" in report
+        else beta,
+        dtype=np.float64,
+    )
+    predicted_all = predict(candidates, terms, final_beta)
+    report["by_model"] = evaluate_groups(candidates, predicted_all, lambda c: c.model)
+    report["by_shape"] = evaluate_groups(candidates, predicted_all, _shape_label)
+    report["by_family"] = evaluate_groups(candidates, predicted_all, _family_label)
+    for title, blocks in (("model", report["by_model"]), ("shape", report["by_shape"])):
+        for name, block in blocks.items():
+            print(
+                f"by {title:6s} {name:28s} cells={block['cells']:3d} acc="
+                f"{block['pairwise_accuracy']:.3f} regret median={block['median_regret_pct']:.2f}% "
+                f"max={block['max_regret_pct']:.2f}%"
+                + (
+                    f" GATES: {'; '.join(block['gate_problems'])}"
+                    if block["gate_problems"]
+                    else ""
+                )
+            )
     print("coefficients (us/unit):", json.dumps(report["terms"], indent=1))
     if report["test"]:
         problems = gates_pass(report["test"])
@@ -938,6 +1071,8 @@ def main() -> None:
     if arguments.export_certificate:
         if "integer_terms_milli_us" not in report:
             raise SystemExit("--export-certificate requires --integerize")
+        if not arguments.table_id:
+            raise SystemExit("--export-certificate requires --table-id")
         export_certificate(
             Path(arguments.export_certificate),
             candidates,
@@ -952,6 +1087,7 @@ def main() -> None:
             integer_table=report["integer_terms_milli_us"],
             report=report,
             manifest=manifest_record,
+            table_id=arguments.table_id,
         )
         print("certificate written:", arguments.export_certificate)
 

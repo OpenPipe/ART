@@ -66,6 +66,16 @@ ELLAVOX_CORPUS = REPO_ROOT / "dev" / "_trainer_rank_ellavox_qwen35_4b_tokens.jso
 ELLAVOX_CORPUS_SHA256 = (
     "b2528f067065c20cea81a2868f39a8cdd008c30ee54d5e90b68ddf598cfcd41b"
 )
+# The same customer-derived histories tokenized with the Qwen3 tokenizer
+# (ids below 151,936), for Qwen3-family calibration cells; git-ignored too.
+ELLAVOX_QWEN3_CORPUS = REPO_ROOT / "dev" / "_trainer_rank_ellavox_qwen3_06b_tokens.json"
+ELLAVOX_QWEN3_CORPUS_SHA256 = (
+    "958e1fd0343ef228c38873e6e436c01e3dac0320505205c4ac7c127f370feaa5"
+)
+ELLAVOX_CORPORA: dict[str, tuple[Path, str]] = {
+    "qwen35": (ELLAVOX_CORPUS, ELLAVOX_CORPUS_SHA256),
+    "qwen3": (ELLAVOX_QWEN3_CORPUS, ELLAVOX_QWEN3_CORPUS_SHA256),
+}
 
 # Gate thresholds (sealed measurement -> conservative landing gate).
 GATES: dict[str, dict[str, float]] = {
@@ -156,15 +166,46 @@ def phase_contract() -> None:
     print("contract phase: PASS")
 
 
-@functools.lru_cache(maxsize=1)
-def _load_corpus() -> dict[str, Any]:
+@functools.lru_cache(maxsize=2)
+def _load_corpus(name: str = "qwen35") -> dict[str, Any]:
     import hashlib
 
-    data = ELLAVOX_CORPUS.read_bytes()
+    path, expected = ELLAVOX_CORPORA[name]
+    data = path.read_bytes()
     digest = hashlib.sha256(data).hexdigest()
-    if digest != ELLAVOX_CORPUS_SHA256:
-        _fail(f"census corpus digest mismatch: {digest}")
+    if digest != expected:
+        _fail(f"corpus {name} digest mismatch: {digest}")
     return json.loads(data)
+
+
+def _check_corpus_tokenizer(corpus: dict[str, Any], model: str) -> dict[str, Any]:
+    """Require the model's tokenizer to agree with the corpus tokenizer.
+
+    Token ids are only meaningful under the tokenizer that produced them; a
+    Qwen3.5 model would accept Qwen3 ids (its vocabulary is larger) yet see
+    different text. The check decodes a fixed sample with both tokenizers and
+    compares vocabulary sizes; it fails the cell loudly on any difference.
+    """
+
+    from transformers import AutoTokenizer
+
+    corpus_model = str(corpus.get("tokenizer_model") or "")
+    model_tokenizer = AutoTokenizer.from_pretrained(model, trust_remote_code=True)
+    corpus_tokenizer = AutoTokenizer.from_pretrained(
+        corpus_model, trust_remote_code=True
+    )
+    sample = corpus["groups"][0]["histories"][0]["tokens"][:256]
+    problems = []
+    if len(model_tokenizer) != len(corpus_tokenizer):
+        problems.append(
+            f"vocabulary sizes differ: model {len(model_tokenizer)} vs corpus "
+            f"{len(corpus_tokenizer)} ({corpus_model})"
+        )
+    if model_tokenizer.decode(sample) != corpus_tokenizer.decode(sample):
+        problems.append(f"sample decodes differently under {model} and {corpus_model}")
+    if problems:
+        _fail("corpus/model tokenizer mismatch:\n  - " + "\n  - ".join(problems))
+    return {"corpus_tokenizer": corpus_model, "vocabulary": len(model_tokenizer)}
 
 
 def _load_census_sequences() -> dict[str, tuple[tuple[int, ...], ...]]:
@@ -243,14 +284,14 @@ def _grpo_requests(seed: int) -> list[Any]:
     return requests
 
 
-def _ellavox_requests(sample: int) -> list[Any]:
+def _ellavox_requests(sample: int, corpus: str = "qwen35") -> list[Any]:
     """Real Ellavox rows for the depth-one-is-best regression cell."""
 
     import torch
 
     from art.trainer_rank import ForwardInput
 
-    groups = _load_corpus()["groups"]
+    groups = _load_corpus(corpus)["groups"]
     group = groups[sample % len(groups)]
     requests: list[Any] = []
     for history in group["histories"]:
@@ -2016,7 +2057,15 @@ def _calibration_requests(
         return _hetero_requests(seed, cell), {"kind": cell, "seed": seed}
     if cell == "cal-ellavox":
         return _ellavox_requests(group), {"kind": "ellavox", "group": group}
+    if cell == "cal-ellavox-qwen3":
+        return (
+            _ellavox_requests(group, corpus="qwen3"),
+            {"kind": "ellavox-qwen3", "group": group},
+        )
     raise ValueError(f"unknown calibration cell {cell!r}")
+
+
+CALIBRATION_CORPUS_BY_CELL = {"cal-ellavox": "qwen35", "cal-ellavox-qwen3": "qwen3"}
 
 
 def phase_cost_calibrate(
@@ -2048,7 +2097,7 @@ def phase_cost_calibrate(
     from art.megatron import train as megatron_train
     from art.trainer_rank import TrainerRank, TrainerRankMemoryError
     from art.trainer_rank._planner_cost import (
-        COEFFICIENT_VERSION,
+        DeviceClass,
         ScoringFacts,
         layout_features,
         predicted_us,
@@ -2087,31 +2136,47 @@ def phase_cost_calibrate(
         [slot] = load_random_checkpoints(runtime, rank, 1, base_model=model)
         watch = _install_compile_watch()
         requests, workload = _calibration_requests(cell, group=group)
+        tokenizer_check = (
+            _check_corpus_tokenizer(
+                _load_corpus(CALIBRATION_CORPUS_BY_CELL[cell]), model
+            )
+            if cell in CALIBRATION_CORPUS_BY_CELL
+            else None
+        )
+        shape = rank._parallel_shape
         topology = {
             "tp": int(ps.get_tensor_model_parallel_world_size()),
             "cp": int(ps.get_context_parallel_world_size()),
             "dp": int(ps.get_data_parallel_world_size()),
+            "ep": int(shape.ep),
+            "etp": int(shape.etp),
             "world_size": dist.get_world_size(),
         }
+        device_memory = int(
+            torch.cuda.get_device_properties(torch.cuda.current_device()).total_memory
+        )
         model_facts = {
             "model": model,
             "layers": int(rank._num_layers),
             "gdn_layers": _gdn_layer_count(runtime.model[0]),
+            "moe_layers": int(rank._moe_layers),
             "planner_gdn_layers": rank._planner_topology_facts().gdn_layers,
             "uses_gdn": bool(
                 getattr(
                     runtime.model_support_handler, "build_gdn_execution_spec", False
                 )
             ),
+            "is_moe": bool(rank._geometry.moe_experts),
             "hidden_size": int(rank._hidden_size),
+            # The execution class the planner admits on (Megatron config
+            # geometry; layer counts are facts, not identity).
+            "geometry": rank._geometry.as_dict(),
             "param_dtype": str(next(runtime.model[0].parameters()).dtype),
             "device": torch.cuda.get_device_name(),
             "device_capability": list(torch.cuda.get_device_capability()),
-            "device_total_memory_bytes": int(
-                torch.cuda.get_device_properties(
-                    torch.cuda.current_device()
-                ).total_memory
-            ),
+            "device_total_memory_bytes": device_memory,
+            "device_memory_class": DeviceClass.memory_class_for(device_memory),
+            "tokenizer_check": tokenizer_check,
         }
         tree = build_canonical_prefix_tree(
             tuple(r.input_tokens.reshape(-1).to(torch.long) for r in requests)
@@ -2119,17 +2184,22 @@ def phase_cost_calibrate(
         candidates = prefix_tree_layout_candidates(tree)
         facts = rank._planner_topology_facts()
         candidate_rows = []
+        scoring_facts = ScoringFacts(
+            cp_size=facts.cp_size,
+            tp_size=facts.tp_size,
+            layers=facts.layers,
+            gdn_layers=facts.gdn_layers,
+        )
+
+        def current_score(features: Any) -> float | None:
+            # The runtime's own table; None when it runs the version-1 fallback.
+            if rank._planner_coefficients is None:
+                return None
+            return predicted_us(features, scoring_facts, rank._planner_coefficients)
+
         for candidate in candidates:
             features = layout_features(candidate.layout)
-            current_us = predicted_us(
-                features,
-                ScoringFacts(
-                    cp_size=facts.cp_size,
-                    tp_size=facts.tp_size,
-                    layers=facts.layers,
-                    gdn_layers=facts.gdn_layers,
-                ),
-            )
+            current_us = current_score(features)
             candidate_rows.append(
                 {
                     "label": candidate.labels[0],
@@ -2156,15 +2226,7 @@ def phase_cost_calibrate(
                 "label": "automatic",
                 "labels": ["automatic"],
                 "features": automatic_features.as_dict(),
-                "current_score_us": predicted_us(
-                    automatic_features,
-                    ScoringFacts(
-                        cp_size=facts.cp_size,
-                        tp_size=facts.tp_size,
-                        layers=facts.layers,
-                        gdn_layers=facts.gdn_layers,
-                    ),
-                ),
+                "current_score_us": current_score(automatic_features),
                 "matches": matching,
             }
         )
@@ -2178,7 +2240,10 @@ def phase_cost_calibrate(
             "requests_sha256": _workload_fingerprint(requests)["requests_sha256"],
             **topology,
             **model_facts,
-            "coefficient_version": COEFFICIENT_VERSION,
+            # The score this runtime actually used (a table id when inside a
+            # calibrated execution class, else the version-1 fallback).
+            "coefficient_version": int(rank._coefficient_version),
+            "coefficient_table": rank._coefficient_table,
             "source": _source_fingerprint(),
             "driver": _driver_fingerprint(),
         }
