@@ -4862,6 +4862,8 @@ class TrainerRank:
         logits: list[torch.Tensor | None],
         label_rows: list[torch.Tensor | None],
     ) -> None:
+        from torch.utils.checkpoint import checkpoint
+
         model = _language_model(self.runtime.model[0])
         max_top_k = max((int(item.request.top_k or 0) for item in items), default=0)
         need_log_z = any(
@@ -4871,45 +4873,17 @@ class TrainerRank:
             range(0, int(rows.numel()), _HEAD_CHUNK_TOKENS)
         ):
             chunk_rows = rows[start : start + _HEAD_CHUNK_TOKENS]
-            local_logits = self._local_logits_from_hidden_rows(
+            # Recompute vocabulary-sized intermediates one chunk at a time in
+            # backward; chunking alone otherwise retains every chunk's logits.
+            local_logits, log_z, local_topk = checkpoint(
+                self._local_head_stats,
                 model,
                 _select_positions(hidden_by_row, chunk_rows),
                 output_weight=output_weight,
+                need_log_z=need_log_z,
+                max_top_k=max_top_k,
+                use_reentrant=False,
             )
-            log_z: torch.Tensor | None = None
-            local_topk: tuple[torch.Tensor, torch.Tensor] | None = None
-            if need_log_z:
-                topk_stats = _try_triton_local_topk_stats(local_logits, k=max_top_k)
-                logsumexp_stats = (
-                    cast(
-                        tuple[torch.Tensor, torch.Tensor] | None,
-                        _try_triton_stats("local_logsumexp_stats", local_logits),
-                    )
-                    if topk_stats is None
-                    else None
-                )
-                stats = topk_stats if topk_stats is not None else logsumexp_stats
-                if stats is not None:
-                    local_max, local_sum = stats[:2]
-                    local_max = local_max.detach()
-                    global_max = _all_reduce_tensor_parallel_max(local_max)
-                    global_sum = _all_reduce_tensor_parallel_sum(
-                        local_sum * torch.exp(local_max - global_max)
-                    )
-                    log_z = global_max + torch.log(global_sum)
-                else:
-                    log_z = _vocab_parallel_log_z(local_logits)
-
-                if topk_stats is not None:
-                    _, _, local_values, local_tokens = topk_stats
-                    local_topk = (local_values, local_tokens)
-                elif logsumexp_stats is not None and max_top_k > 0:
-                    local_k = min(max_top_k, int(local_logits.shape[1]))
-                    local_values, local_tokens = torch.topk(
-                        local_logits, k=local_k, dim=-1
-                    )
-                    local_topk = (local_values.float(), local_tokens)
-
             logit_start, logit_end = logit_bounds[chunk_index : chunk_index + 2]
             logit_chunk_offsets = logit_rows[logit_start:logit_end] - start
             chunk_logits: torch.Tensor | None = None
@@ -4976,6 +4950,57 @@ class TrainerRank:
                         raise RuntimeError("top_k output was not allocated")
                     current.logprobs[offsets] = values.logprobs
                     current.tokens[offsets] = values.tokens
+
+    def _local_head_stats(
+        self,
+        model: "GPTModel",
+        hidden: torch.Tensor,
+        *,
+        output_weight: torch.Tensor | None,
+        need_log_z: bool,
+        max_top_k: int,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor | None,
+        tuple[torch.Tensor, torch.Tensor] | None,
+    ]:
+        local_logits = self._local_logits_from_hidden_rows(
+            model,
+            hidden,
+            output_weight=output_weight,
+        )
+        log_z: torch.Tensor | None = None
+        local_topk: tuple[torch.Tensor, torch.Tensor] | None = None
+        if need_log_z:
+            topk_stats = _try_triton_local_topk_stats(local_logits, k=max_top_k)
+            logsumexp_stats = (
+                cast(
+                    tuple[torch.Tensor, torch.Tensor] | None,
+                    _try_triton_stats("local_logsumexp_stats", local_logits),
+                )
+                if topk_stats is None
+                else None
+            )
+            stats = topk_stats if topk_stats is not None else logsumexp_stats
+            if stats is not None:
+                local_max, local_sum = stats[:2]
+                local_max = local_max.detach()
+                global_max = _all_reduce_tensor_parallel_max(local_max)
+                global_sum = _all_reduce_tensor_parallel_sum(
+                    local_sum * torch.exp(local_max - global_max)
+                )
+                log_z = global_max + torch.log(global_sum)
+            else:
+                log_z = _vocab_parallel_log_z(local_logits)
+
+            if topk_stats is not None:
+                _, _, local_values, local_tokens = topk_stats
+                local_topk = (local_values, local_tokens)
+            elif logsumexp_stats is not None and max_top_k > 0:
+                local_k = min(max_top_k, int(local_logits.shape[1]))
+                local_values, local_tokens = torch.topk(local_logits, k=local_k, dim=-1)
+                local_topk = (local_values.float(), local_tokens)
+        return local_logits, log_z, local_topk
 
     def _local_logits_from_hidden_rows(
         self,
