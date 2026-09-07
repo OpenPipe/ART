@@ -633,12 +633,13 @@ GDN_MOE_H2048_TABLE = CalibratedTable(
 
 # Dense attention classes measured on the shape lattice (2026-09-04):
 # Qwen3-1.7B (hidden 2,048), Qwen3-8B (4,096) and Qwen3-14B (5,120), each
-# with 8 query groups of 128 channels, on H200 bf16. TP1 x CP4 is admitted
-# through the two-stage re-ranker: the ten-term score cannot see the
-# context-parallel plan a layout produces, which decides the recurring
-# real-data groups there (design brief), so it only shortlists and the plan's
-# remote wave count and largest per-rank token load select. TP2 x CP2 fails
-# its gates for the two smaller classes and keeps the version-1 score.
+# with 8 query groups of 128 channels, on H200 bf16. The ten-term score cannot
+# see the context-parallel plan a layout produces, which decides the recurring
+# real-data groups at TP1 x CP4 (design brief), so that shape is admitted
+# through the two-stage re-ranker where the re-ranker pays back its planning
+# cost against version 1 (Qwen3-8B, Qwen3-14B); on Qwen3-1.7B it does not
+# (2.6% of a small cell's time against 2.0% saved) and CP4 keeps version 1.
+# TP2 x CP2 fails its gates for the two smaller classes and keeps version 1.
 _ATTENTION_DTYPES = ("torch.bfloat16",)
 _ATTENTION_SHAPES = (
     ParallelShape(tp=1, cp=1),
@@ -670,25 +671,6 @@ DENSE_ATTN_H2048_TABLE = CalibratedTable(
     param_dtypes=_ATTENTION_DTYPES,
     geometries=(QWEN3_1_7B_GEOMETRY,),
     shapes=_ATTENTION_SHAPES,
-    reranked_shapes=(ParallelShape(tp=1, cp=4),),
-    reranker=ReRanker(
-        shortlist_size=3,
-        incumbent="depth_one",
-        shortlist_coefficients_milli_us={
-            "attention_token_cp_exchange": 3,
-            "gdn_level": 0,
-            "gdn_level_tp": 0,
-            "gdn_token_per_rank": 0,
-            "level_cp_per_layer": 69_746,
-            "level_tp_per_layer": 0,
-            "tiny_segment_per_layer": 0,
-            "token_cp_exchange": 57,
-            "token_per_rank": 1_656,
-            "token_tp_collective": 143,
-        },
-        wave_per_layer_milli_us=1_144_207,
-        max_rank_token_per_layer_milli_us=678,
-    ),
 )
 QWEN3_8B_GEOMETRY = ModelGeometry(
     hidden_size=4_096,
@@ -784,10 +766,11 @@ DENSE_ATTN_H5120_TABLE = CalibratedTable(
 # Qwen3-30B-A3B class (attention + MoE, hidden 2,048): 32 attention heads in
 # 4 query groups of 128 channels, 128 experts (top-8, expert FFN 768), on H200
 # bf16 (2026-09-04/05). Admitted directly at TP1 x CP1, TP1 x CP2 (EP1, EP2)
-# and TP2 x CP1 (EP1, EP2); TP1 x CP4 at every expert parallelism through the
-# two-stage re-ranker (this attention class has the CP4 blind spot). The CP2
-# and CP4 EP1/EP4 shapes were re-measured with sixteen rounds after their
-# eight-round timings carried sporadic multi-second stalls (design brief).
+# and TP2 x CP1 (EP1, EP2). TP1 x CP4 (this attention class has the CP4 blind
+# spot) keeps version 1: the two-stage re-ranker ranks it but saves less than
+# its planning cost against version 1 (design brief). The CP2 and CP4 EP1/EP4
+# shapes were re-measured with sixteen rounds after their eight-round timings
+# carried sporadic multi-second stalls.
 ATTN_MOE_H2048_GEOMETRY = ModelGeometry(
     hidden_size=2_048,
     ffn_hidden_size=6_144,
@@ -822,29 +805,6 @@ ATTN_MOE_H2048_TABLE = CalibratedTable(
         ParallelShape(tp=1, cp=2, ep=2),
         ParallelShape(tp=2, cp=1),
         ParallelShape(tp=2, cp=1, ep=2),
-    ),
-    reranked_shapes=(
-        ParallelShape(tp=1, cp=4),
-        ParallelShape(tp=1, cp=4, ep=2),
-        ParallelShape(tp=1, cp=4, ep=4),
-    ),
-    reranker=ReRanker(
-        shortlist_size=3,
-        incumbent="depth_one",
-        shortlist_coefficients_milli_us={
-            "attention_token_cp_exchange": 8,
-            "gdn_level": 0,
-            "gdn_level_tp": 0,
-            "gdn_token_per_rank": 0,
-            "level_cp_per_layer": 163_376,
-            "level_tp_per_layer": 140_748,
-            "tiny_segment_per_layer": 169_817,
-            "token_cp_exchange": 98,
-            "token_per_rank": 6_705,
-            "token_tp_collective": 78,
-        },
-        wave_per_layer_milli_us=1_388_921,
-        max_rank_token_per_layer_milli_us=1_347,
     ),
 )
 

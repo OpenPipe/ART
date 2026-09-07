@@ -571,6 +571,38 @@ def test_hybridep_validates_topology_for_empty_forward(
         assert trainer.dp_rank_forward([]) == []
 
 
+def test_no_grad_groups_keep_the_fallback_score_and_their_own_cache_key() -> None:
+    """The calibrated tables and re-rankers measured training forwards (forward
+    + backward); a group that runs without gradients is scored by version 1 and
+    cached under a distinct identity, so it can never reuse a training layout."""
+
+    from art.trainer_rank._planner_cost import (
+        COEFFICIENT_VERSION_FALLBACK,
+    )
+
+    trainer = TrainerRank(_runtime())
+    training = trainer._planner_topology_facts()
+    inference = trainer._planner_topology_facts(grad_enabled=False)
+    assert training.grad_enabled and not inference.grad_enabled
+    assert inference.coefficient_version == COEFFICIENT_VERSION_FALLBACK
+    assert inference.coefficient_table is None
+    assert (
+        training._replace(
+            coefficient_version=inference.coefficient_version,
+            coefficient_table=None,
+            grad_enabled=False,
+        )
+        == inference
+    )
+    rows = (torch.arange(9), torch.arange(5))
+    assert trainer._layout_cache_key(rows) != trainer._layout_cache_key(
+        rows, grad_enabled=False
+    )
+    assert trainer._layout_cache_key(rows, grad_enabled=False) == (
+        trainer._layout_cache_key(rows, grad_enabled=False)
+    )
+
+
 @pytest.mark.skipif(find_spec("megatron") is None, reason="requires Megatron")
 def test_hybridep_uses_maximum_cp_model_rows(
     monkeypatch: pytest.MonkeyPatch,

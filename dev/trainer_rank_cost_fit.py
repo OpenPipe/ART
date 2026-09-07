@@ -1154,15 +1154,17 @@ def two_stage_gates(report: dict[str, Any]) -> list[str]:
             f"worse than the version-1 selection by >2%: {regression['worse_than_fallback_cells']}"
         )
     # A synchronous miss pays for the shortlist's plans; on the re-ranked
-    # cells the execution saved over both single-stage selections must cover it.
+    # cells the execution saved must cover it against BOTH single-stage
+    # alternatives: the cheap-only selection and the version-1 fallback that
+    # production would otherwise run on these shapes. Cache reuse or overlap
+    # is not measured here and does not count.
     cost = report["planning_cost"]["mean_pct_of_cell"]
-    savings = max(
-        regression["savings_vs_cheap_mean_pct"],
-        regression["savings_vs_fallback_mean_pct"],
-    )
-    if cost > savings:
+    saved_vs_cheap = regression["savings_vs_cheap_mean_pct"]
+    saved_vs_fallback = regression["savings_vs_fallback_mean_pct"]
+    if cost > saved_vs_cheap or cost > saved_vs_fallback:
         problems.append(
-            f"planning cost {cost:.1f}% of cell time exceeds the mean saving {savings:.1f}%"
+            f"planning cost {cost:.2f}% of cell time is not covered by the mean saving "
+            f"({saved_vs_cheap:.2f}% vs the cheap selection, {saved_vs_fallback:.2f}% vs version 1)"
         )
     return problems
 
@@ -1484,8 +1486,8 @@ def main() -> None:
                 f"{name:22s} cells={metrics['cells']:3d} acc={metrics['pairwise_accuracy']:.3f} regret median={metrics['median_regret_pct']:.2f}% "
                 f"p95={metrics['p95_regret_pct']:.2f}% max={metrics['max_regret_pct']:.2f}% | recall {recall['best_in_shortlist']}/{recall['cells']} "
                 f"clear {recall['clear_winners_in_shortlist']}/{recall['clear_winner_cells']} irrecoverable max {recall['max_irrecoverable_pct']:.1f}% | "
-                f"planning mean {metrics['planning_cost']['mean_pct_of_cell']:.1f}% max {metrics['planning_cost']['max_pct_of_cell']:.1f}% of cell vs saving "
-                f"{max(metrics['non_regression']['savings_vs_cheap_mean_pct'], metrics['non_regression']['savings_vs_fallback_mean_pct']):.1f}% | "
+                f"planning mean {metrics['planning_cost']['mean_pct_of_cell']:.2f}% max {metrics['planning_cost']['max_pct_of_cell']:.1f}% of cell vs saving "
+                f"{metrics['non_regression']['savings_vs_cheap_mean_pct']:.2f}% (cheap) / {metrics['non_regression']['savings_vs_fallback_mean_pct']:.2f}% (v1) | "
                 + (
                     "GATES PASS"
                     if not problems

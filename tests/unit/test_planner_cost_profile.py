@@ -142,20 +142,29 @@ def test_attention_classes_are_admitted_only_where_their_gates_pass() -> None:
             selection = _selection(geometry=geometry, shape=shape)
             assert selection.table_id == table.table_id, (table.table_id, shape)
             assert selection.coefficients is table.coefficients_milli_us
-        # TP1 x CP4 is admitted through the two-stage re-ranker: the table's
-        # shortlist score plus its certified re-ranker, never the direct table.
-        assert cp4 not in table.shapes and cp4 in table.reranked_shapes
+            assert selection.reranker is None
+        # TP1 x CP4 is never scored by the direct table on an attention class.
+        assert cp4 not in table.shapes
+        # A different dtype never borrows the table.
+        assert _selection(
+            geometry=geometry, shape=ParallelShape(), param_dtype="torch.float16"
+        ).version == (COEFFICIENT_VERSION_FALLBACK)
+    # TP1 x CP4 goes through the two-stage re-ranker where it pays back its
+    # planning cost against both single-stage selections (8B, 14B); on the
+    # 1.7B class it does not, and CP4 keeps the version-1 score.
+    for table in (DENSE_ATTN_H4096_TABLE, DENSE_ATTN_H5120_TABLE):
+        (geometry,) = table.geometries
+        assert cp4 in table.reranked_shapes and table.reranker is not None
         reranked = _selection(geometry=geometry, shape=cp4)
         assert reranked.version == COEFFICIENT_VERSION
         assert reranked.table_id == table.table_id
         assert reranked.reranker is table.reranker
         assert reranked.coefficients is (table.reranker.shortlist_coefficients_milli_us)
-        # Directly scored shapes never carry a re-ranker.
-        assert _selection(geometry=geometry, shape=ParallelShape()).reranker is None
-        # A different dtype never borrows the table.
-        assert _selection(
-            geometry=geometry, shape=ParallelShape(), param_dtype="torch.float16"
-        ).version == (COEFFICIENT_VERSION_FALLBACK)
+    (small,) = DENSE_ATTN_H2048_TABLE.geometries
+    assert DENSE_ATTN_H2048_TABLE.reranker is None
+    fallback = _selection(geometry=small, shape=cp4)
+    assert fallback.version == COEFFICIENT_VERSION_FALLBACK
+    assert fallback.table_id is None and fallback.reranker is None
     # TP2 x CP2 passed its gates only for the hidden-5,120 class.
     assert tp2cp2 in DENSE_ATTN_H5120_TABLE.shapes
     assert tp2cp2 not in DENSE_ATTN_H4096_TABLE.shapes
@@ -174,10 +183,14 @@ def test_attention_moe_class_admits_only_its_certified_shapes() -> None:
         selection = _selection(geometry=geometry, shape=shape)
         assert selection.table_id == ATTN_MOE_H2048_TABLE.table_id, shape
         assert selection.reranker is None
-    # TP1 x CP4 is re-ranked at every measured expert parallelism.
+    # TP1 x CP4 was measured at every expert parallelism, but the two-stage
+    # re-ranker does not pay back its planning cost against version 1 on this
+    # class, so those shapes keep the fallback score.
+    assert ATTN_MOE_H2048_TABLE.reranker is None
     for ep in (1, 2, 4):
-        reranked = _selection(geometry=geometry, shape=ParallelShape(tp=1, cp=4, ep=ep))
-        assert reranked.reranker is ATTN_MOE_H2048_TABLE.reranker, ep
+        fallback = _selection(geometry=geometry, shape=ParallelShape(tp=1, cp=4, ep=ep))
+        assert fallback.version == COEFFICIENT_VERSION_FALLBACK, ep
+        assert fallback.table_id is None and fallback.reranker is None
     # Unmeasured shapes keep the version-1 score.
     for shape in (
         ParallelShape(tp=2, cp=2),
