@@ -91,11 +91,31 @@ class ContextParallelConfig:
     planner_candidate_chunk_limit: int = 8
     planner_max_remote_waves: int = 4
     planner_stage_overhead_ms: float = 0.287151
+    # Host-side work every remote stage adds per layer (its own attention
+    # call, merge and collectives in forward and backward). Measured on H200
+    # bf16 as the extra time of one more remote wave at equal max rank load:
+    # 2.3-2.6 ms per layer (forward + backward) on Qwen3-1.7B/4B/8B/30B-A3B at
+    # CP4 and 0.2-0.6 ms on 8B/14B when layers are long enough to hide it, so
+    # this is the exposed value per direction (issue #854).
+    planner_remote_stage_host_ms: float = 1.2
+    # Compute the rest of the layer does per token a rank owns (projections,
+    # MLP or routed experts, forward + backward), in ms per token per layer on
+    # this rank. The attention stages alone do not see it, so without it the
+    # search balances attention pairs at the expense of token balance; see
+    # estimate_owned_token_ms. Zero disables the term.
+    planner_owned_token_ms: float = 0.0
     planner_comm_stage_overhead_ms: float = 0.143576
     planner_interval_overhead_ms: float = 0.11486
     planner_merge_q_token_ms: float = 0.00011486
-    planner_fetch_token_ms: float = 0.000287151
-    planner_reduce_token_ms: float = 0.000287151
+    # Per-token cost of the KV fetch and dKV reduce collectives. The previous
+    # value (0.000287, about 14 GB/s at 4 KB per token) priced a 12k-token
+    # fetch at 3.8 ms, ten times what NVLink delivers, so the planner hid a
+    # phantom latency behind extra waves and traded token balance for less
+    # remote fetch; measured pairs show no such gain at any volume (issue
+    # #854). 30 ns per token is a conservative all-to-all figure for 4 KB
+    # tokens on H200 NVLink.
+    planner_fetch_token_ms: float = 0.00003
+    planner_reduce_token_ms: float = 0.00003
     planner_local_pair_ms: float = 0.000000045944
     planner_remote_pair_ms: float = 0.000000048816
     planner_local_backward_pair_ms: float = 0.000000137832
@@ -278,3 +298,38 @@ class ExactMaskMetadata:
     q_token_indices: torch.Tensor
     k_token_indices: torch.Tensor
     cache_key: str
+
+
+def estimate_owned_token_ms(
+    *,
+    hidden_size: int,
+    ffn_hidden_size: int,
+    moe_topk: int = 0,
+    moe_ffn_hidden_size: int = 0,
+    moe_shared_expert_ffn: int = 0,
+    tensor_parallel_size: int = 1,
+    achieved_tflops: float = 400.0,
+) -> float:
+    """Per-token, per-layer compute of the non-attention work a rank owns.
+
+    Dense FLOPs per token: the four attention projections (8 h^2) and a gated
+    MLP (6 h f), or for MoE the routed experts (6 h f_e k) plus a shared expert
+    (6 h f_s); backward is about twice the forward. Divided by the tensor
+    parallel size (each TP rank does its share) and an achieved throughput
+    (400 TFLOP/s is a bf16 H200 at large matmuls). Agrees within about 30%
+    with the per-token coefficients fitted from measured layer times on
+    Qwen3-1.7B/8B/14B and Qwen3-30B-A3B (0.7 / 2.8 / 4.6 / 1.3 us).
+    """
+
+    h = float(hidden_size)
+    if moe_topk > 0 and moe_ffn_hidden_size > 0:
+        mlp = (
+            6.0
+            * h
+            * (float(moe_ffn_hidden_size) * moe_topk + float(moe_shared_expert_ffn))
+        )
+    else:
+        mlp = 6.0 * h * float(ffn_hidden_size)
+    forward_flops = 8.0 * h * h + mlp
+    total_flops = 3.0 * forward_flops
+    return total_flops / max(1, tensor_parallel_size) / (achieved_tflops * 1e12) * 1e3

@@ -1031,6 +1031,7 @@ def _stage_cost_ms(
         )
     )
     remote_underfill_ms = 0.0
+    remote_host_ms = 0.0 if local else float(config.planner_remote_stage_host_ms)
     if not local and (pair_count > 0 or q_tokens > 0 or k_tokens > 0):
         token_shortfall = max(
             int(config.planner_remote_stage_token_floor) - min(q_tokens, k_tokens),
@@ -1061,6 +1062,7 @@ def _stage_cost_ms(
         + float(q_range_count + k_range_count)
         * float(config.planner_interval_overhead_ms)
         + remote_underfill_ms
+        + remote_host_ms
     )
 
 
@@ -1148,6 +1150,7 @@ def _stage_cost_ms_array(
         )
     )
     remote_underfill_ms = np.zeros_like(pair_count)
+    remote_host_ms = 0.0 if local else float(config.planner_remote_stage_host_ms)
     if not local:
         token_floor = int(config.planner_remote_stage_token_floor)
         pair_floor = int(config.planner_remote_stage_pair_floor)
@@ -1175,6 +1178,7 @@ def _stage_cost_ms_array(
         + q_tokens * float(config.planner_merge_q_token_ms)
         + (q_range_count + k_range_count) * float(config.planner_interval_overhead_ms)
         + remote_underfill_ms
+        + remote_host_ms
     )
 
 
@@ -1376,6 +1380,12 @@ def _evaluate_plans(
         remote_reduce_ms=_comm_cost_ms_array(backward=True, **comm_costs),
         active=active,
     )
+    # The rest of the layer's work scales with the tokens a rank owns
+    # (backward about twice the forward).
+    owned_tokens = owned_f @ lengths.astype(np.float64)
+    owned_ms = owned_tokens * float(config.planner_owned_token_ms)
+    forward_ms = forward_ms + owned_ms / 3.0
+    backward_ms = backward_ms + owned_ms * (2.0 / 3.0)
     rank_scores = forward_ms + backward_ms
     return [
         {

@@ -11,6 +11,7 @@ identically, floats included.
 
 from __future__ import annotations
 
+import dataclasses
 import random
 from typing import Any
 
@@ -321,6 +322,16 @@ def _reference_evaluate_plan(
         rank_forward_ms.append(float(forward_ms))
         rank_backward_ms.append(float(backward_ms))
         rank_scores.append(float(forward_ms + backward_ms))
+    # The rest of the layer's per-token work (added after the rewrite; the
+    # reference applies the same arithmetic per rank).
+    owned = [0.0 for _ in range(cp_size)]
+    for length, owner in zip(chunk_lengths, owners, strict=True):
+        owned[int(owner)] += float(length)
+    for rank in range(cp_size):
+        owned_ms = owned[rank] * float(config.planner_owned_token_ms)
+        rank_forward_ms[rank] = rank_forward_ms[rank] + owned_ms / 3.0
+        rank_backward_ms[rank] = rank_backward_ms[rank] + owned_ms * (2.0 / 3.0)
+        rank_scores[rank] = rank_forward_ms[rank] + rank_backward_ms[rank]
     return {
         "score": max(rank_scores, default=0.0),
         "rank_scores": tuple(rank_scores),
@@ -356,9 +367,9 @@ def _random_instance(seed: int, *, chunk_count: int | None = None):
 
 
 def _both(
-    ranges, pairs, owners, waves, cp_size
+    ranges, pairs, owners, waves, cp_size, config: ContextParallelConfig | None = None
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    config = ContextParallelConfig()
+    config = config or ContextParallelConfig()
     program = rt._pair_program(pairs, chunk_ranges=ranges)
     new = rt._evaluate_plan(
         program=program,
@@ -444,3 +455,157 @@ def test_search_is_unchanged_by_the_rewrite() -> None:
     )
     _new, reference = _both(ranges, pairs, owners, waves, max(cp_size, 2))
     assert evaluation == reference
+
+
+def test_remote_stages_carry_the_host_cost_and_local_stages_do_not() -> None:
+    """Every remote stage adds a fixed slab of host work per layer (its own
+    attention call, merge and collectives); the planner prices it so it stops
+    preferring an extra wave whose only merit is finer pipelining."""
+
+    config = ContextParallelConfig()
+    counts = dict(
+        pair_count=1_000_000,
+        q_tokens=4_096,
+        k_tokens=4_096,
+        q_range_count=1,
+        k_range_count=1,
+    )
+    remote = _stage_cost_ms(config=config, backward=False, local=False, **counts)
+    local = _stage_cost_ms(config=config, backward=False, local=True, **counts)
+    free = _stage_cost_ms(
+        config=dataclasses.replace(config, planner_remote_stage_host_ms=0.0),
+        backward=False,
+        local=False,
+        **counts,
+    )
+    assert remote - free == pytest.approx(config.planner_remote_stage_host_ms)
+    assert local < remote
+    assert _stage_cost_ms(
+        config=config, backward=True, local=False, **counts
+    ) - _stage_cost_ms(
+        config=dataclasses.replace(config, planner_remote_stage_host_ms=0.0),
+        backward=True,
+        local=False,
+        **counts,
+    ) == pytest.approx(config.planner_remote_stage_host_ms)
+
+
+def _causal_program(chunk_count: int, chunk_size: int = 512):
+    """A plain causal row split into equal chunks: every k chunk at or before a q
+    chunk pairs with it (a full square for earlier chunks, a triangle on the
+    diagonal)."""
+
+    ranges = tuple(
+        TokenRange(start=i * chunk_size, end=(i + 1) * chunk_size)
+        for i in range(chunk_count)
+    )
+    pairs = [
+        [
+            (chunk_size * chunk_size if j < i else chunk_size * (chunk_size + 1) // 2)
+            if j <= i
+            else 0
+            for j in range(chunk_count)
+        ]
+        for i in range(chunk_count)
+    ]
+    return ranges, pairs
+
+
+def test_search_prefers_one_wave_with_the_recalibrated_constants() -> None:
+    """On a balanced causal row the previous constants (no host cost per remote
+    stage and a fetch priced ten times NVLink) split the remote work into
+    waves to hide a phantom latency; the recalibrated defaults keep one wave,
+    which is what the measured equal-load pairs favour on every class."""
+
+    ranges, pairs = _causal_program(48)
+    q_weights = [float(sum(row)) for row in pairs]
+    pair_matrix = torch.as_tensor(pairs, dtype=torch.int64)
+
+    def waves(config: ContextParallelConfig) -> int:
+        _owners, assignment, _ev = rt._search_generic_chunk_assignment(
+            chunk_ranges=ranges,
+            pair_matrix=pair_matrix,
+            q_weights=q_weights,
+            cp_size=4,
+            config=config,
+        )
+        return max(assignment) + 1
+
+    previous = dataclasses.replace(
+        ContextParallelConfig(),
+        planner_remote_stage_host_ms=0.0,
+        planner_fetch_token_ms=0.000287151,
+        planner_reduce_token_ms=0.000287151,
+    )
+    assert waves(previous) > 1
+    assert waves(ContextParallelConfig()) == 1
+
+
+@pytest.mark.parametrize("seed", range(300, 320))
+def test_owned_token_term_matches_the_reference(seed: int) -> None:
+    ranges, pairs, owners, waves, cp_size = _random_instance(seed)
+    config = dataclasses.replace(ContextParallelConfig(), planner_owned_token_ms=0.0033)
+    new, reference = _both(ranges, pairs, owners, waves, cp_size, config)
+    assert new == reference
+
+
+def test_owned_token_estimate_matches_measured_per_token_costs() -> None:
+    """Per-token, per-layer compute from geometry against the coefficients the
+    calibration fitted from measured layer times (us per token per layer)."""
+
+    from art.megatron.context_parallel.types import estimate_owned_token_ms
+
+    measured_us = {
+        (2_048, 6_144, 0, 0): 0.68,  # Qwen3-1.7B
+        (4_096, 12_288, 0, 0): 2.8,  # Qwen3-8B
+        (5_120, 17_408, 0, 0): 4.6,  # Qwen3-14B
+        (2_048, 6_144, 8, 768): 1.3,  # Qwen3-30B-A3B (routed experts)
+    }
+    for (hidden, ffn, topk, moe_ffn), expected in measured_us.items():
+        estimate = (
+            estimate_owned_token_ms(
+                hidden_size=hidden,
+                ffn_hidden_size=ffn,
+                moe_topk=topk,
+                moe_ffn_hidden_size=moe_ffn,
+            )
+            * 1_000.0
+        )
+        assert 0.6 * expected <= estimate <= 1.6 * expected, (
+            hidden,
+            estimate,
+            expected,
+        )
+    # Tensor parallelism divides the per-rank work.
+    assert estimate_owned_token_ms(
+        hidden_size=4_096, ffn_hidden_size=12_288, tensor_parallel_size=2
+    ) == pytest.approx(
+        estimate_owned_token_ms(hidden_size=4_096, ffn_hidden_size=12_288) / 2
+    )
+
+
+def test_owned_token_cost_keeps_token_balance_on_a_causal_row() -> None:
+    """Attention pairs alone favour giving the early (cheap) chunks to one rank;
+    the owned-token term pulls the split back toward equal tokens."""
+
+    ranges, pairs = _causal_program(48)
+    q_weights = [float(sum(row)) for row in pairs]
+    pair_matrix = torch.as_tensor(pairs, dtype=torch.int64)
+
+    def max_owned(config: ContextParallelConfig) -> int:
+        owners, _waves, _ev = rt._search_generic_chunk_assignment(
+            chunk_ranges=ranges,
+            pair_matrix=pair_matrix,
+            q_weights=q_weights,
+            cp_size=4,
+            config=config,
+        )
+        return max(owners.count(rank) for rank in range(4)) * 512
+
+    attention_only = max_owned(ContextParallelConfig())
+    with_tokens = max_owned(
+        dataclasses.replace(ContextParallelConfig(), planner_owned_token_ms=0.0033)
+    )
+    # The bounded local search cannot reach an even split on this skewed row
+    # (24 -> 18 of 48 chunks on the busiest rank), but the term pulls that way.
+    assert with_tokens < attention_only

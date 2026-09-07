@@ -20,6 +20,7 @@ from art.megatron.context_parallel.types import (
     ParallelTopology,
     PreparedMegatronBatch,
     TrainingMicrobatchWorkload,
+    estimate_owned_token_ms,
 )
 from art.megatron.flex_attn.compiled import flash_sparse_block_size_for_head_dim
 from art.megatron.prefix_tree import parse_prefix_tree
@@ -491,6 +492,29 @@ def _art_flex_cp_block_mask_variants(
     return tuple(variants)
 
 
+def _owned_token_ms_for_provider(provider: Any) -> float:
+    """The CP planner's per-owned-token compute cost from the model geometry."""
+
+    hidden = getattr(provider, "hidden_size", None)
+    ffn = getattr(provider, "ffn_hidden_size", None)
+    if not hidden or not ffn:
+        return 0.0
+    return estimate_owned_token_ms(
+        hidden_size=int(hidden),
+        ffn_hidden_size=int(ffn),
+        moe_topk=int(getattr(provider, "moe_router_topk", 0) or 0)
+        if getattr(provider, "num_moe_experts", None)
+        else 0,
+        moe_ffn_hidden_size=int(getattr(provider, "moe_ffn_hidden_size", 0) or 0),
+        moe_shared_expert_ffn=int(
+            getattr(provider, "moe_shared_expert_intermediate_size", 0) or 0
+        ),
+        tensor_parallel_size=int(
+            getattr(provider, "tensor_model_parallel_size", 1) or 1
+        ),
+    )
+
+
 def _context_parallel_config_for_provider(
     provider: Any,
     device: torch.device,
@@ -501,7 +525,8 @@ def _context_parallel_config_for_provider(
         return ContextParallelConfig(
             workload_profile=model_support_handler.context_parallel_workload_profile(
                 provider
-            )
+            ),
+            planner_owned_token_ms=_owned_token_ms_for_provider(provider),
         )
     return ContextParallelConfig(
         attention_sparse_block_size=flash_sparse_block_size_for_head_dim(
@@ -512,6 +537,7 @@ def _context_parallel_config_for_provider(
         workload_profile=model_support_handler.context_parallel_workload_profile(
             provider
         ),
+        planner_owned_token_ms=_owned_token_ms_for_provider(provider),
     )
 
 
