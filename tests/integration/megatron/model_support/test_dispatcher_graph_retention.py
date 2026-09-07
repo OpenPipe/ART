@@ -18,6 +18,7 @@ from megatron.core.transformer.moe.token_dispatcher import (
     MoEFlexTokenDispatcher,
 )
 
+from art.trainer_rank import TrainerRank
 from art.trainer_rank._impl import _configure_moe_dispatcher_caches
 
 
@@ -183,9 +184,19 @@ def test_dispatcher_adaptation_is_instance_scoped_and_collectable(cpu_checkpoint
         owners.append(owner)
     model = torch.nn.ModuleList(owners)
     original = MoEAlltoAllTokenDispatcher.dispatch_preprocess
-    _configure_moe_dispatcher_caches([model, model])
+    target.token_dispatcher.probs = target.weight.softmax(-1)
+    cached = weakref.ref(target.token_dispatcher.probs)
+    runtime = SimpleNamespace(
+        model=[model],
+        provider=SimpleNamespace(hidden_size=8, num_layers=1),
+        model_support_handler=SimpleNamespace(),
+        optimizer=None,
+    )
+    trainer = TrainerRank(cast(Any, runtime))
+    assert cached() is None
+    assert target.token_dispatcher.probs.numel() == 0
     adapted = target.token_dispatcher.dispatch_preprocess
-    _configure_moe_dispatcher_caches([model])
+    _configure_moe_dispatcher_caches([model, model])
     assert target.token_dispatcher.dispatch_preprocess is adapted
     assert MoEAlltoAllTokenDispatcher.dispatch_preprocess is original
     assert untouched.token_dispatcher.dispatch_preprocess.__func__ is original
@@ -199,6 +210,6 @@ def test_dispatcher_adaptation_is_instance_scoped_and_collectable(cpu_checkpoint
     # Persistent bound methods must not keep the dispatcher alive once its owner
     # and any pending graphs have gone away.
     reference = weakref.ref(target.token_dispatcher)
-    del adapted, target, owners, model, owner
+    del adapted, target, owners, model, owner, trainer, runtime
     gc.collect()
     assert reference() is None
