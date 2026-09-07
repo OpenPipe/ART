@@ -51,6 +51,7 @@ from art.megatron.prefix_tree_packing import (
     estimate_prefix_tree_packed_tokens,
 )
 from art.trainer_rank._planner_cost import (
+    COEFFICIENT_VERSION_FALLBACK,
     ModelGeometry,
     ParallelShape,
     select_scoring,
@@ -1055,9 +1056,13 @@ class _PlannerFacts(NamedTuple):
     etp_size: int
     # Score for this runtime: a fitted table inside its calibrated execution
     # class (version 2, identified by table id), the fallback outside it
-    # (version 1); see select_scoring.
+    # (version 1); see select_scoring. The tables were calibrated on training
+    # forwards (forward + backward); groups that run without gradients keep
+    # the fallback until forward-only execution is validated separately, so
+    # the grad mode is part of the identity.
     coefficient_version: int
     coefficient_table: str | None
+    grad_enabled: bool = True
 
 
 # Content hash, planner facts (including the score identity), anchor.
@@ -1207,6 +1212,8 @@ class TrainerRank:
         self._coefficient_version = selection.version
         self._coefficient_table = selection.table_id
         self._planner_coefficients = selection.coefficients
+        # Two-stage selection on re-ranked shapes (part of the table identity).
+        self._planner_reranker = selection.reranker
         if selection.table_id is None:
             logger.warning(
                 "TrainerRank layout cost model: runtime (capability=%s, device "
@@ -2483,11 +2490,12 @@ class TrainerRank:
 
         ordered: list[int] = []
         seen: set[int] = set()
-        for _, group_indices in self._group_active_request_indices(
+        for (_slot, grad_enabled), group_indices in self._group_active_request_indices(
             requests, checkpoint=checkpoint, ensure_slots=False
         ):
             tree, _layout = self._select_group_layout(
-                tuple(rows[index] for index in group_indices)
+                tuple(rows[index] for index in group_indices),
+                grad_enabled=grad_enabled,
             )
             for sequence_indices in tree.sequence_indices_by_terminal:
                 for position in sequence_indices:
@@ -3646,7 +3654,7 @@ class TrainerRank:
             return None
         return os.environ.get(_TEST_ANCHOR_ENV) or None
 
-    def _planner_topology_facts(self) -> "_PlannerFacts":
+    def _planner_topology_facts(self, *, grad_enabled: bool = True) -> "_PlannerFacts":
         _dp, tp_size, cp_size, _pp = self._topology_key()
         uses_gdn = bool(
             getattr(
@@ -3661,8 +3669,13 @@ class TrainerRank:
             uses_gdn=uses_gdn,
             ep_size=self._parallel_shape.ep,
             etp_size=self._parallel_shape.etp,
-            coefficient_version=self._coefficient_version,
-            coefficient_table=self._coefficient_table,
+            coefficient_version=(
+                self._coefficient_version
+                if grad_enabled
+                else COEFFICIENT_VERSION_FALLBACK
+            ),
+            coefficient_table=self._coefficient_table if grad_enabled else None,
+            grad_enabled=grad_enabled,
         )
 
     def _layout_anchor(self, *, memory_minimal: bool) -> str | None:
@@ -3678,8 +3691,9 @@ class TrainerRank:
         input_ids: Sequence[torch.Tensor],
         *,
         memory_minimal: bool = False,
+        grad_enabled: bool = True,
     ) -> "_LayoutKey":
-        facts = self._planner_topology_facts()
+        facts = self._planner_topology_facts(grad_enabled=grad_enabled)
         hasher = hashlib.sha256()
         for tensor in input_ids:
             row = tensor.detach().reshape(-1).cpu().contiguous()
@@ -3744,8 +3758,24 @@ class TrainerRank:
                 tp_size=facts.tp_size,
                 gdn_layers=facts.gdn_layers,
                 coefficient_version=facts.coefficient_version,
-                coefficients=self._planner_coefficients,
+                coefficients=(
+                    self._planner_coefficients
+                    if facts.coefficient_table is not None
+                    else None
+                ),
                 refinement_work_budget=_PLANNER_REFINEMENT_BUDGET,
+                reranker=(
+                    self._planner_reranker
+                    if facts.coefficient_table is not None
+                    else None
+                ),
+                plan_structure=(
+                    None
+                    if self._planner_reranker is None or facts.coefficient_table is None
+                    else lambda candidate: self._plan_structure(
+                        input_ids, tree, candidate
+                    )
+                ),
             ).layout
         cached = (tree, layout)
         with self._layout_cache_lock:
@@ -3755,24 +3785,62 @@ class TrainerRank:
                 self._layout_selection_cache.popitem(last=False)
         return cached
 
+    def _plan_structure(
+        self,
+        input_ids: Sequence[torch.Tensor],
+        tree: CanonicalPrefixTree,
+        layout: PrefixTreeLayout,
+    ) -> tuple[int, int]:
+        """(remote wave count, largest per-rank token load) of the context-
+        parallel plan this layout produces, through the runtime's planning
+        bundle cache: the layout finally selected reuses its bundle."""
+
+        from art.megatron.context_parallel.runtime import summarize_prefix_tree_plan
+        from art.megatron.training.microbatches import (
+            _context_parallel_config_for_provider,
+        )
+
+        packed = materialize_prefix_tree_layout(
+            input_ids, tree, layout, verify_shared_tokens=False
+        )
+        handler = self.runtime.model_support_handler
+        summary = summarize_prefix_tree_plan(
+            group_ids=packed.group_ids,
+            parent_ids=packed.parent_ids,
+            topology=self._topology(),
+            config=_context_parallel_config_for_provider(
+                self.runtime.provider, self.device, handler
+            ),
+            original_seq_len=int(packed.tokens.shape[1]),
+            build_gdn_execution_spec=bool(
+                getattr(handler, "build_gdn_execution_spec", False)
+            ),
+        )
+        return summary.wave_count, summary.max_rank_tokens
+
     def _select_group_layout(
         self,
         input_ids: Sequence[torch.Tensor],
         *,
         memory_minimal: bool = False,
+        grad_enabled: bool = True,
     ) -> tuple[CanonicalPrefixTree, PrefixTreeLayout]:
         """Select one group's prefix-sharing layout, cached by content identity.
 
         The cache key is a raw-bytes content hash plus the topology, cost
-        coefficients, and layout anchor, so identical steady-state groups (or
-        groups pre-planned speculatively during the caller's GPU work) skip
-        canonicalization and search entirely. ``memory_minimal`` selects the
-        full-sharing layout instead of the cost-optimal one; the width search
-        uses it when the cost-optimal layout cannot be admitted.
+        coefficients, grad mode and layout anchor, so identical steady-state
+        groups (or groups pre-planned speculatively during the caller's GPU
+        work) skip canonicalization and search entirely. ``memory_minimal``
+        selects the full-sharing layout instead of the cost-optimal one; the
+        width search uses it when the cost-optimal layout cannot be admitted.
+        Groups without gradients are scored by the version-1 fallback: the
+        calibrated tables measured forward + backward.
         """
 
         started = time.perf_counter()
-        key = self._layout_cache_key(input_ids, memory_minimal=memory_minimal)
+        key = self._layout_cache_key(
+            input_ids, memory_minimal=memory_minimal, grad_enabled=grad_enabled
+        )
         cached = self._cached_group_layout(key)
         if cached is None:
             cached = self._compute_group_layout(input_ids, key)
@@ -3843,7 +3911,7 @@ class TrainerRank:
                     _LayoutKey,
                 ]
             ] = []
-            for _, group_indices in groups:
+            for (_slot, grad_enabled), group_indices in groups:
                 snapshots = tuple(
                     requests[index]
                     .input_tokens.detach()
@@ -3852,7 +3920,7 @@ class TrainerRank:
                     .clone()
                     for index in group_indices
                 )
-                key = self._layout_cache_key(snapshots)
+                key = self._layout_cache_key(snapshots, grad_enabled=grad_enabled)
                 if self._cached_group_layout(key) is None:
                     pending.append((snapshots, key))
         except Exception:
@@ -3899,7 +3967,9 @@ class TrainerRank:
             )
             group_input_ids = tuple(item.input_ids for item in items)
             tree, layout = self._select_group_layout(
-                group_input_ids, memory_minimal=memory_minimal
+                group_input_ids,
+                memory_minimal=memory_minimal,
+                grad_enabled=grad_enabled,
             )
             selected_max_depth = max(selected_max_depth, layout.maximum_depth)
             started = time.perf_counter()
@@ -3959,7 +4029,7 @@ class TrainerRank:
 
         groups = self._group_active_request_indices(requests, checkpoint=checkpoint)
         packed_tokens = 0
-        for _, group_indices in groups:
+        for (_slot, grad_enabled), group_indices in groups:
             if exact:
                 _, layout = self._select_group_layout(
                     tuple(
@@ -3967,6 +4037,7 @@ class TrainerRank:
                         for index in group_indices
                     ),
                     memory_minimal=memory_minimal,
+                    grad_enabled=grad_enabled,
                 )
                 packed_tokens += self._physical_tokens(layout.packed_tokens)
                 continue
@@ -5017,7 +5088,14 @@ class TrainerRank:
         rows = tuple(self._hybridep_rows(batch, topology=topology) for batch in padded)
         current = fused_a2a._hybrid_ep_buffer
         live = self._has_live_hybridep_graphs()
-        required_capacity = _hybridep_token_capacity(sequence_length, int(topology.cp))
+        # The buffer must hold the busiest rank's planned rows: cost-aware CP
+        # plans (few long histories, shared prefixes) can put more than the
+        # near-balanced extent on one rank, and every rank sizes the buffer
+        # identically because the planned counts are the same on all ranks.
+        required_capacity = max(
+            _hybridep_token_capacity(sequence_length, int(topology.cp)),
+            max(rows),
+        )
         if live and (
             current is None
             or id(current) != getattr(self, "_hybridep_buffer_id", None)
@@ -5033,6 +5111,7 @@ class TrainerRank:
             self.runtime,
             packed_sequence_length=sequence_length,
             context_parallel_size=int(topology.cp),
+            required_capacity=required_capacity,
         )
         current = fused_a2a._hybrid_ep_buffer
         if current is None:

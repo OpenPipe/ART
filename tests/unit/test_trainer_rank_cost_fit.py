@@ -175,3 +175,81 @@ def test_group_reports_judge_gates_per_group() -> None:
     )
     assert report["M1"]["max_regret_pct"] == 0.0 and not report["M1"]["gate_problems"]
     assert report["M2"]["max_regret_pct"] > 10.0 and report["M2"]["gate_problems"]
+
+
+def test_integerize_keeps_plain_rounding_when_it_preserves_rankings() -> None:
+    import numpy as np
+
+    cells = [
+        fit.Candidate(
+            "a|M|L2|tp1|cp1",
+            label,
+            {
+                "packed_tokens": tokens,
+                "segment_count": 1,
+                "max_depth": 1,
+                "segments_below": (),
+            },
+            {
+                "layers": 2.0,
+                "gdn_layers": 0.0,
+                "tp": 1.0,
+                "cp": 1.0,
+                "ep": 1.0,
+                "etp": 1.0,
+                "uses_gdn": 0.0,
+            },
+            ms,
+            8,
+            0.5,
+        )
+        for label, (ms, tokens) in {"x": (100.0, 1000), "y": (120.0, 1500)}.items()
+    ]
+    assert fit.integerize(cells, ("token_per_rank",), np.asarray([2.0004])) == {
+        "token_per_rank": 2000
+    }
+
+
+def test_integerize_never_loses_to_plain_rounding() -> None:
+    import numpy as np
+
+    def candidates(cell: str, times: dict[str, tuple[float, int]]) -> list:
+        return [
+            fit.Candidate(
+                cell,
+                label,
+                {
+                    "packed_tokens": tokens,
+                    "segment_count": 1,
+                    "max_depth": 1,
+                    "segments_below": (),
+                },
+                {
+                    "layers": 2.0,
+                    "gdn_layers": 0.0,
+                    "tp": 1.0,
+                    "cp": 1.0,
+                    "ep": 1.0,
+                    "etp": 1.0,
+                    "uses_gdn": 0.0,
+                },
+                ms,
+                8,
+                0.5,
+            )
+            for label, (ms, tokens) in times.items()
+        ]
+
+    cells = candidates(
+        "a|M|L2|tp1|cp1", {"x": (100.0, 1000), "y": (110.0, 1100)}
+    ) + candidates("b|M|L2|tp1|cp1", {"x": (100.0, 1000), "y": (99.0, 1001)})
+    terms = ("token_per_rank",)
+    beta = np.asarray([0.0004])  # rounds to 0 milli-us: every cell would tie
+    table = fit.integerize(cells, terms, beta)
+    assert all(isinstance(v, int) for v in table.values())
+    matrix = fit.term_matrix(cells, terms)
+    rounded = np.asarray([0.0])
+    refined = np.asarray([table["token_per_rank"] / 1_000.0])
+    assert fit.selection_loss(cells, matrix @ refined) <= fit.selection_loss(
+        cells, matrix @ rounded
+    )
