@@ -15,6 +15,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from copy import deepcopy
 from dataclasses import dataclass, replace
 from dataclasses import field as dataclass_field
+from functools import partial
 import hashlib
 import logging
 import math
@@ -23,7 +24,7 @@ from pathlib import Path
 import struct
 import threading
 import time
-from types import MethodType, TracebackType
+from types import TracebackType
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -1135,6 +1136,21 @@ def _split_chunks(
     return tuple(tuple(chunk) for chunk in chunks)
 
 
+def _moe_dispatch_preprocess(
+    dispatcher: Any,
+    hidden_states: torch.Tensor,
+    routing_map: torch.Tensor,
+    probs: torch.Tensor,
+):
+    result = type(dispatcher).dispatch_preprocess(
+        dispatcher, hidden_states, routing_map, probs
+    )
+    # MCore uses this cache only for dtype. Keep the real routing outputs
+    # differentiable without retaining their checkpoint graph.
+    dispatcher.probs = probs.new_empty(0)
+    return result
+
+
 def _configure_moe_dispatcher_caches(model: Sequence[torch.nn.Module]) -> None:
     for chunk in model:
         for module in chunk.modules():
@@ -1150,26 +1166,12 @@ def _configure_moe_dispatcher_caches(model: Sequence[torch.nn.Module]) -> None:
             ):
                 continue
 
-            def _dispatch_preprocess(
-                self: Any,
-                hidden_states: torch.Tensor,
-                routing_map: torch.Tensor,
-                probs: torch.Tensor,
-            ):
-                result = MoEAlltoAllTokenDispatcher.dispatch_preprocess(
-                    self, hidden_states, routing_map, probs
-                )
-                # MCore uses this cache only for dtype. Keep the real routing
-                # outputs differentiable without retaining their checkpoint graph.
-                self.probs = probs.new_empty(0)
-                return result
-
             # Persist through caller-owned backward/checkpoint recomputation;
             # other dispatcher instances and custom implementations stay intact.
             setattr(
                 dispatcher,
                 "dispatch_preprocess",
-                MethodType(_dispatch_preprocess, dispatcher),
+                partial(_moe_dispatch_preprocess, dispatcher),
             )
             if (probs := getattr(dispatcher, "probs", None)) is not None:
                 dispatcher.probs = probs.new_empty(0)
