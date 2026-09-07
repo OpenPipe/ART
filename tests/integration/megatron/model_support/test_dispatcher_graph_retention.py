@@ -236,7 +236,7 @@ def test_dispatcher_adaptation_survives_serialization(
         pickle.loads(pickle.dumps(model)) if round_trip == "pickle" else deepcopy(model)
     )
     for layer in clone:
-        dispatcher = layer.token_dispatcher
+        dispatcher: Any = layer.token_dispatcher
         wrapper = dispatcher.dispatch_preprocess
         assert isinstance(wrapper, partial)
         assert wrapper.args[0] is dispatcher
@@ -306,8 +306,8 @@ def test_dispatcher_maps_allow_outstanding_forwards_and_repeated_backward(
     adapted = deepcopy(reference)
     _configure_moe_dispatcher_caches([adapted])
     if compiled:
-        reference = torch.compile(reference, backend="aot_eager")
-        adapted = torch.compile(adapted, backend="aot_eager")
+        reference = cast(torch.nn.Module, torch.compile(reference, backend="aot_eager"))
+        adapted = cast(torch.nn.Module, torch.compile(adapted, backend="aot_eager"))
 
     def run(model):
         inputs = [
