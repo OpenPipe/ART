@@ -135,7 +135,11 @@ def test_full_refit_reproduces_the_table_when_requested(table) -> None:
     beta = fit.nnls(*fit.paired_deltas(train, terms))
     if arguments["objective"] == "regret":
         beta = fit.fit_regret(train, terms, beta)
-    assert fit.integerize(train, terms, beta) == payload["integer_table_milli_us"]
+    # The certificate lists every production term (zero when unfitted).
+    refit = fit.integerize(train, terms, beta)
+    assert {name: int(refit.get(name, 0)) for name in fit.TERMS} == {
+        name: int(payload["integer_table_milli_us"].get(name, 0)) for name in fit.TERMS
+    }
 
 
 @_TABLES

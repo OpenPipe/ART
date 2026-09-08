@@ -641,6 +641,29 @@ def test_routed_expert_work_follows_ownership_only_without_expert_parallelism() 
         **{**moe, "moe_shared_expert_ffn": 512}, expert_parallel_size=4
     )
     assert with_shared > ep_equals_cp
+    # Expert tensor parallelism wider than the attention one (TP1 x CP2 with
+    # ETP2) gathers every CP owner's routed rows into one expert group, so
+    # both expert ranks do the same routed work whatever the ownership: the
+    # routed cost leaves the ownership balance exactly as under EP.
+    etp_across_owners = estimate_owned_token_ms(
+        **moe,
+        tensor_parallel_size=1,
+        expert_parallel_size=1,
+        expert_tensor_parallel_size=2,
+    )
+    assert etp_across_owners == pytest.approx(projections_only)
+    # An expert tensor-parallel group equal to the attention one stays within
+    # the owner (Megatron's default), and each rank does its share.
+    same_group = estimate_owned_token_ms(
+        **moe,
+        tensor_parallel_size=2,
+        expert_parallel_size=1,
+        expert_tensor_parallel_size=2,
+    )
+    assert same_group == pytest.approx(replicated / 2.0)
+    assert estimate_owned_token_ms(**moe, tensor_parallel_size=2) == pytest.approx(
+        same_group
+    )
 
 
 @pytest.mark.parametrize("seed", range(400, 430))

@@ -294,3 +294,74 @@ def test_production_regret_ignores_legacy_planner_rows(tmp_path: Path) -> None:
     report = fit.production_regret(candidates, [path])
     assert report[key]["automatic_ms"] == 100.0
     assert report[key]["regret_pct"] == 0.0
+
+
+def _ab_rows(
+    cell: dict, label: str, *, current: int, legacy: int, legacy_failed: bool = False
+) -> list[dict]:
+    rows = []
+    for variant, count in (("current", current), ("legacy", legacy)):
+        for i in range(count):
+            rows.append(
+                {
+                    **cell,
+                    "record_type": "calibration_sample",
+                    "role": "measured",
+                    "candidate_label": label,
+                    "planner_variant": variant,
+                    "compile_statuses": ["none"],
+                    "round": i,
+                    "ms_max_rank": 100.0,
+                }
+            )
+    if legacy_failed:
+        rows.append(
+            {
+                **cell,
+                "record_type": "calibration_sample",
+                "role": "measured",
+                "candidate_label": label,
+                "planner_variant": "legacy",
+                "admission_failed": True,
+            }
+        )
+    return rows
+
+
+def test_completeness_counts_only_current_planner_rows(tmp_path: Path) -> None:
+    """Legacy-planner rows of a paired A/B are not calibration evidence: they
+    neither fill a candidate's row count nor fail a cell through their own
+    admission failures."""
+
+    import json
+
+    cell = {"cell": "cal-grpo-g8", "model": "m", "layers": 2, "tp": 1, "cp": 2}
+    header = {
+        **cell,
+        "record_type": "calibration_cell",
+        "candidates": [{"label": "depth_one"}],
+    }
+    # Four current plus four legacy rows are four usable rows, not eight.
+    thin = tmp_path / "thin.jsonl"
+    thin.write_text(
+        "\n".join(
+            json.dumps(r)
+            for r in [header, *_ab_rows(cell, "depth_one", current=4, legacy=4)]
+        )
+        + "\n"
+    )
+    gaps = fit.validate_completeness([thin], repeat=8)
+    assert gaps == [f"{fit._cell_key(cell)}: depth_one has 4 usable rows (< 8)"]
+    # Eight current rows are complete even when the legacy arm refused admission.
+    full = tmp_path / "full.jsonl"
+    full.write_text(
+        "\n".join(
+            json.dumps(r)
+            for r in [
+                header,
+                *_ab_rows(cell, "depth_one", current=8, legacy=0, legacy_failed=True),
+            ]
+        )
+        + "\n"
+    )
+    assert fit.validate_completeness([full], repeat=8) == []

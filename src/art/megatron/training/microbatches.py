@@ -515,6 +515,12 @@ def _owned_token_ms_for_provider(provider: Any) -> float:
         expert_parallel_size=int(
             getattr(provider, "expert_model_parallel_size", 1) or 1
         ),
+        # Megatron defaults the expert tensor-parallel size to the attention one.
+        expert_tensor_parallel_size=int(
+            getattr(provider, "expert_tensor_parallel_size", None)
+            or getattr(provider, "tensor_model_parallel_size", 1)
+            or 1
+        ),
     )
 
 

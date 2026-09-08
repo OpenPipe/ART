@@ -151,3 +151,30 @@ def test_legacy_planner_variant_restores_the_pre_854_constants() -> None:
     driver._set_planner_variant("current")
     with pytest.raises(ValueError):
         driver._set_planner_variant("other")
+
+
+def test_legacy_planner_variant_restores_the_pre_854_search(monkeypatch) -> None:
+    """The legacy arm is main's planner, not a constants-only ablation: with the
+    constants it restores the any-rank improving move (ownership may fragment),
+    and the current arm keeps the contiguous-only search."""
+
+    pytest.importorskip("megatron.core")  # the CP runtime needs Megatron-Core
+    from art.megatron.context_parallel import runtime
+    from art.megatron.training import microbatches
+
+    current_move = runtime._best_improving_move
+    monkeypatch.setattr(
+        microbatches,
+        "_context_parallel_config_for_provider",
+        microbatches._context_parallel_config_for_provider,
+    )
+    monkeypatch.setattr(runtime, "_best_improving_move", current_move)
+    monkeypatch.setattr(driver, "_CURRENT_BEST_IMPROVING_MOVE", None)
+    driver._install_planner_ab()
+    try:
+        driver._set_planner_variant("legacy")
+        assert runtime._best_improving_move is driver._legacy_best_improving_move
+        driver._set_planner_variant("current")
+        assert runtime._best_improving_move is current_move
+    finally:
+        driver._set_planner_variant("current")

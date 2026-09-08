@@ -2117,10 +2117,76 @@ def _legacy_planner_config(config: Any) -> Any:
     )
 
 
+# The pre-#854 assignment search (main before the recalibration), verbatim: a
+# slow rank's chunk may move to any other rank, so ownership can fragment. The
+# legacy arm restores it together with the constants, so the arm is main's
+# planner and not a constants-only ablation.
+def _legacy_best_improving_move(
+    *,
+    current_owners: tuple[int, ...],
+    current_eval: dict[str, Any],
+    wave_assignment: tuple[int, ...],
+    cp_size: int,
+    q_weights: list[float],
+    candidate_limit: int,
+    evaluate_candidates: Any,
+) -> tuple[tuple[int, ...], dict[str, Any]] | None:
+    from art.megatron.context_parallel.runtime import _candidate_chunk_indices
+
+    slow_rank = int(
+        max(
+            range(cp_size),
+            key=lambda rank: cast(tuple[float, ...], current_eval["rank_scores"])[rank],
+        )
+    )
+    candidate_chunks = _candidate_chunk_indices(
+        owners=current_owners,
+        target_rank=slow_rank,
+        q_weights=q_weights,
+        limit=int(candidate_limit),
+    )
+    if not candidate_chunks:
+        return None
+
+    moves: list[tuple[int, ...]] = []
+    for chunk_index in candidate_chunks:
+        for dst_rank in range(cp_size):
+            if dst_rank == slow_rank:
+                continue
+            candidate = list(current_owners)
+            candidate[chunk_index] = dst_rank
+            candidate_owners = tuple(candidate)
+            if (
+                len(candidate_owners) >= cp_size
+                and len(set(candidate_owners)) != cp_size
+            ):
+                continue
+            moves.append(candidate_owners)
+    evaluations = evaluate_candidates(
+        owners_list=moves,
+        wave_assignment=wave_assignment,
+    )
+    best_move: tuple[tuple[int, ...], dict[str, Any]] | None = None
+    for candidate_owners, candidate_eval in zip(moves, evaluations, strict=True):
+        if float(candidate_eval["score"]) + 1e-9 >= float(current_eval["score"]):
+            continue
+        if best_move is None or float(candidate_eval["score"]) + 1e-9 < float(
+            best_move[1]["score"]
+        ):
+            best_move = (candidate_owners, candidate_eval)
+    return best_move
+
+
+_CURRENT_BEST_IMPROVING_MOVE: Any = None
+
+
 def _install_planner_ab() -> None:
+    global _CURRENT_BEST_IMPROVING_MOVE
+    from art.megatron.context_parallel import runtime
     from art.megatron.training import microbatches
 
     original = microbatches._context_parallel_config_for_provider
+    _CURRENT_BEST_IMPROVING_MOVE = runtime._best_improving_move
 
     def variant_config(provider: Any, device: Any, handler: Any) -> Any:
         config = original(provider, device, handler)
@@ -2136,6 +2202,16 @@ def _set_planner_variant(variant: str) -> None:
     if variant not in _PLANNER_VARIANTS:
         raise ValueError(f"unknown planner variant {variant!r}")
     _planner_variant = variant
+    # The search algorithm follows the variant (the config builder is patched
+    # by _install_planner_ab; plans are cached per config, never across arms).
+    from art.megatron.context_parallel import runtime
+
+    if _CURRENT_BEST_IMPROVING_MOVE is not None:
+        runtime._best_improving_move = (
+            _legacy_best_improving_move
+            if variant == "legacy"
+            else _CURRENT_BEST_IMPROVING_MOVE
+        )
 
 
 def phase_cost_calibrate(
@@ -2289,17 +2365,22 @@ def phase_cost_calibrate(
                 )
             else:
                 wave_count, max_rank_tokens = 0, int(candidate.layout.packed_tokens)
-            legacy_plan: dict[str, int] | None = None
+            # The current planner's cost only; the legacy arm below is timed
+            # separately so the paired run does not inflate it.
+            summary_ms = (time.perf_counter() - started) * 1_000.0
+            legacy_plan: dict[str, float] | None = None
             if planner_ab and facts.cp_size > 1:
                 _set_planner_variant("legacy")
+                legacy_started = time.perf_counter()
                 legacy_waves, legacy_max = rank._plan_structure(
                     rows_for_plan, tree, candidate.layout
                 )
-                _set_planner_variant("current")
                 legacy_plan = {
                     "wave_count": int(legacy_waves),
                     "max_rank_tokens": int(legacy_max),
+                    "summary_ms": (time.perf_counter() - legacy_started) * 1_000.0,
                 }
+                _set_planner_variant("current")
             candidate_rows.append(
                 {
                     "label": candidate.labels[0],
@@ -2309,7 +2390,7 @@ def phase_cost_calibrate(
                     "cp_plan": {
                         "wave_count": int(wave_count),
                         "max_rank_tokens": int(max_rank_tokens),
-                        "summary_ms": (time.perf_counter() - started) * 1_000.0,
+                        "summary_ms": summary_ms,
                     },
                     **({"cp_plan_legacy": legacy_plan} if legacy_plan else {}),
                     # The version-1 score: the fallback the two-stage

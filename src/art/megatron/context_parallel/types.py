@@ -309,6 +309,7 @@ def estimate_owned_token_ms(
     moe_shared_expert_ffn: int = 0,
     tensor_parallel_size: int = 1,
     expert_parallel_size: int = 1,
+    expert_tensor_parallel_size: int | None = None,
     achieved_tflops: float = 400.0,
 ) -> float:
     """Per-token, per-layer compute of the non-attention work that follows a
@@ -317,11 +318,16 @@ def estimate_owned_token_ms(
     Local work follows ownership: the four attention projections (8 h^2 FLOPs
     per token) and the dense gated MLP (6 h f) or, for MoE, the shared expert
     (6 h f_s). Routed-expert work (6 h f_e k) follows ownership only while the
-    experts are replicated (expert parallelism 1); with expert parallelism the
-    routed rows are redistributed across the expert-parallel group, so a
-    destination rank's expert work depends on the tokens of every source rank
-    in that group, not on its own ownership, and it must not enter the
-    ownership balance (with balanced routing it is the same on every rank).
+    expert communication stays within the owning rank's tensor-parallel group:
+    expert parallelism 1 and an expert tensor-parallel size no larger than the
+    attention tensor-parallel size (Megatron defaults it to the same size).
+    With expert parallelism the routed rows are redistributed across the
+    expert-parallel group; with an expert tensor-parallel group wider than the
+    attention one (e.g. TP1 x CP2 with ETP2) the group gathers every CP
+    owner's routed rows. Either way a rank's expert work depends on the tokens
+    of every source rank in that group, not on its own ownership, and it must
+    not enter the ownership balance (with balanced routing it is the same on
+    every rank).
 
     Backward is about twice the forward; each tensor-parallel rank does its
     share; 400 TFLOP/s is a bf16 H200 at large matmuls. Agrees within about
@@ -336,10 +342,17 @@ def estimate_owned_token_ms(
         if is_moe
         else 6.0 * h * float(ffn_hidden_size)
     )
+    tp = max(1, tensor_parallel_size)
+    etp = (
+        tp
+        if expert_tensor_parallel_size is None
+        else max(1, expert_tensor_parallel_size)
+    )
+    routed_follows_ownership = max(1, expert_parallel_size) == 1 and etp <= tp
     routed = (
         6.0 * h * float(moe_ffn_hidden_size) * moe_topk
-        if is_moe and max(1, expert_parallel_size) == 1
+        if is_moe and routed_follows_ownership
         else 0.0
     )
     total_flops = 3.0 * (local + routed)
-    return total_flops / max(1, tensor_parallel_size) / (achieved_tflops * 1e12) * 1e3
+    return total_flops / tp / (achieved_tflops * 1e12) * 1e3

@@ -189,6 +189,11 @@ def validate_completeness(paths: list[Path], *, repeat: int) -> list[str]:
                     c["label"] for c in row["candidates"] if c["label"] != "automatic"
                 ]
             elif row.get("record_type") == "calibration_sample" and key:
+                # Paired planner A/B rows of the legacy variant are not
+                # calibration evidence (see load_candidates) and count for
+                # neither completeness nor admission failures.
+                if row.get("planner_variant", "current") != "current":
+                    continue
                 label = str(row["candidate_label"])
                 if row.get("admission_failed"):
                     failed.add((key, label))
