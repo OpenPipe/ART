@@ -1022,8 +1022,11 @@ def test_gemma4_peft_target_parameter_moe_layout_is_transposed(tmp_path: Path):
         down_a = internal[f"{art_prefix}.{expert}.down_proj.lora_A.weight"]
         down_b = internal[f"{art_prefix}.{expert}.down_proj.lora_B.weight"]
         assert torch.equal(gate_up_a, peft_gate_up_b[:, expert].unsqueeze(0))
-        assert torch.equal(gate_up_b[:4], peft_gate_up_a[expert].unsqueeze(1))
-        assert torch.count_nonzero(gate_up_b[4:]) == 0
+        gate_b, up_b = gate_up_b.chunk(2, dim=0)
+        assert torch.equal(gate_b[:2], peft_gate_up_a[expert, :2].unsqueeze(1))
+        assert torch.equal(up_b[:2], peft_gate_up_a[expert, 2:].unsqueeze(1))
+        assert torch.count_nonzero(gate_b[2:]) == 0
+        assert torch.count_nonzero(up_b[2:]) == 0
         assert torch.equal(down_a[:, :2], peft_down_b[:, expert].unsqueeze(0))
         assert torch.count_nonzero(down_a[:, 2:]) == 0
         assert torch.equal(down_b, peft_down_a[expert].unsqueeze(1))
