@@ -187,8 +187,8 @@ def test_planner_variant_switch_clears_the_registered_layout_cache(monkeypatch) 
     own choice rather than the current planner's."""
 
     pytest.importorskip("megatron.core")
-    import threading
     from collections import OrderedDict
+    import threading
     from types import SimpleNamespace
 
     from art.megatron.context_parallel import runtime
