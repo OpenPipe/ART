@@ -371,6 +371,59 @@ sensitivity as the 4B class, and `cal-hetero3` at TP2 × CP2 (not admitted)
 the same +8% as on the 30B class. One TP2 × CP2 cell was again lost to an
 NCCL collective timeout in the tensor-parallel group during warm-up.
 
+**What the paired arms compare.** The legacy arm of the campaign restored the
+four planner constants but ran the contiguous-only improving move that this
+change introduced, so it was a constants-only ablation rather than main's
+planner. Re-planning every measured layout with main's search (a slow rank's
+chunk may move to any rank) shows the arms differ on 79 of the roughly 2,900 measured CP > 1 layouts (about 5 of 124 per CP2 shape and 2 of 124 per CP4 shape, the same
+synthetic depth-one rows and two Ellavox groups on every class); main's plan has more remote waves in 14 of them, the
+same in 60 and fewer in 5, and a fragmented ownership range in most. One of the 79 is a production pick: the Ellavox
+g4 `minimum_effective_span_495` layout at CP4 on the three GDN classes (main balances its ranks to 8,192 tokens with
+two fragmented ranges; the legacy arm keeps one range per rank at 9,728), re-measured under the faithful arm: the current planner beats main on it as well — −2.5% (Qwen3.5-4B), −0.4% (Qwen3.5-27B), −1.6% and −2.7% (Qwen3.5-35B-A3B at CP4 EP2 and EP4), eight paired rounds each, and the cell's best layout improves by 2.5% / 3.2% / 3.5% / 1.4%; the earlier constants-only arm had been 2–3% slower than main on that layout on the two dense GDN classes.
+Where the arms differ main's plan is the same or worse under both cost models,
+so the measured gains against the legacy arm understate the gains against main. The harness now restores main's search together with the
+constants (`_legacy_best_improving_move`), so future paired runs compare
+against main itself; the completed campaign is described as measured.
+
+**The final selector against main.** The paired automatic rows time the
+tables shipped at the time (main's) under each planner; the re-certified
+tables are evaluated offline on the same evidence: the layout each new table
+selects, timed under the current planner, against main's production
+selection timed under the legacy arm, per cell of every admitted shape:
+
+| class | shape | final vs main: median | p90 | worst cell | final regret vs cell-best: max |
+| --- | --- | --- | --- | --- | --- |
+| Qwen3-1.7B | TP1×CP2 | −8.5% | +0.6% | +5.4% | 0.6% |
+| Qwen3.5-4B, Qwen3-4B | TP1×CP2 | −2.9% | −0.6% | +0.0% | 0.7% |
+| | TP1×CP4 | −4.1% | −0.4% | −0.2% | 2.8% |
+| Qwen3-8B | TP1×CP2 | −20.6% | −8.5% | −4.8% | 0.6% |
+| | TP1×CP4 | −20.5% | +0.6% | +5.1% | 1.7% |
+| Qwen3-14B | TP1×CP2 | −25.5% | −8.8% | −4.3% | 0.3% |
+| | TP1×CP4 | −29.6% | +0.4% | +1.7% | 2.9% |
+| | TP2×CP2 | −16.1% | −5.1% | −5.0% | 0.1% |
+| Qwen3-30B-A3B | TP1×CP2 | −6.0% | +0.8% | +3.5% | 1.7% |
+| | TP1×CP2 EP2 | −4.2% | +0.3% | +7.8% | 0.2% |
+| Qwen3.5-27B | TP1×CP2 | −5.3% | +1.3% | +1.9% | 3.9% |
+| | TP1×CP4 | −4.6% | −0.5% | +4.3% | 4.6% |
+| Qwen3.5-35B-A3B | TP1×CP2 | −0.8% | +1.6% | +2.6% | 1.5% |
+| | TP1×CP2 EP2 | −0.4% | +2.2% | +4.1% | 3.2% |
+| | TP1×CP4 | −1.0% | +2.1% | +2.1% | 0.0% |
+| | TP1×CP4 EP2 | −1.3% | −0.0% | +0.1% | 2.7% |
+| | TP1×CP4 EP4 | −1.9% | −0.1% | +0.2% | 1.1% |
+
+The worst cells are the ones named above (the 30B heterogeneous cell at
+CP2 EP2, the synthetic 8B GRPO cell at CP4, one 1.7B synthetic cell at CP2);
+the final selector's own regret against the best measured layout of its cell
+is at most 4.6% (27B CP4) and 0% at the median everywhere.
+
+**Expert tensor parallelism.** With an expert tensor-parallel group wider
+than the attention one (TP1 × CP2 with ETP2) the group gathers every CP
+owner's routed rows, so the routed work is the same on both expert ranks
+whatever the ownership; `estimate_owned_token_ms` now charges routed work
+per owned token only when expert parallelism is 1 and the expert
+tensor-parallel size does not exceed the attention one (Megatron's default),
+and the config builder passes the provider's expert tensor-parallel size.
+
 **Re-certification.** Every table was refit from the current-planner rows of
 the paired campaign plus its unchanged CP1 and TP2 × CP1 cells, with the
 checked-in recipe of its certificate:
