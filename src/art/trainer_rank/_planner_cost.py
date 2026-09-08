@@ -585,7 +585,7 @@ DENSE_H2560_TABLE = CalibratedTable(
     # less harmful fallback there until the CP-aware re-ranker is certified.
     withheld=((QWEN3_4B_GEOMETRY, ParallelShape(tp=1, cp=4)),),
 )
-# Qwen3.5-35B-A3B class (GDN + MoE, hidden 2,048): 16 attention heads in 2 query groups of 256 channels, GDN 32 value / 16 key heads of 128 dims, 256 experts (top-8, expert FFN 512, shared expert 512), on H200 bf16; measured at TP1 x CP1/2/4 and TP2 with EP1, EP2 at CP2/CP4/TP2 and EP4 at CP4 (2026-09-04).
+# Qwen3.5-35B-A3B class (GDN + MoE, hidden 2,048): 16 attention heads in 2 query groups of 256 channels, GDN 32 value / 16 key heads of 128 dims, 256 experts (top-8, expert FFN 512, shared expert 512), on H200 bf16; measured at TP1 x CP1/2/4 and TP2 with EP1, EP2 at CP2/CP4/TP2 and EP4 at CP4 (2026-09-04; every CP > 1 shape re-measured under the recalibrated CP planner on 2026-09-08, issue #854).
 GDN_MOE_H2048_GEOMETRY = ModelGeometry(
     ffn_hidden_size=8_192,
     gdn_conv_kernel=4,
@@ -730,12 +730,13 @@ DENSE_ATTN_H5120_TABLE = CalibratedTable(
 
 # Qwen3-30B-A3B class (attention + MoE, hidden 2,048): 32 attention heads in
 # 4 query groups of 128 channels, 128 experts (top-8, expert FFN 768), on H200
-# bf16 (2026-09-04/05). Admitted directly at TP1 x CP1, TP1 x CP2 (EP1, EP2)
-# and TP2 x CP1 (EP1, EP2). TP1 x CP4 (this attention class has the CP4 blind
-# spot) keeps version 1: the two-stage re-ranker ranks it but saves less than
-# its planning cost against version 1 (design brief). The CP2 and CP4 EP1/EP4
-# shapes were re-measured with sixteen rounds after their eight-round timings
-# carried sporadic multi-second stalls.
+# bf16 (2026-09-04/05; CP2 and CP4 re-measured under the recalibrated CP
+# planner on 2026-09-08, issue #854). Admitted directly at TP1 x CP1,
+# TP1 x CP2 (EP1, EP2) and TP2 x CP1 (EP1, EP2). TP1 x CP4 is measured but not
+# admitted: the two-stage re-ranker that ranked it is retired, and the direct
+# score ranks CP4 at EP1 and EP2 but not at EP4 (design brief); admitting it
+# is a follow-up. The eight-round CP2/CP4 timings carried sporadic
+# multi-second stalls; medians are robust to them.
 ATTN_MOE_H2048_GEOMETRY = ModelGeometry(
     hidden_size=2_048,
     ffn_hidden_size=6_144,
@@ -775,10 +776,13 @@ ATTN_MOE_H2048_TABLE = CalibratedTable(
 
 # Qwen3.5-27B class (dense GDN + attention, hidden 5,120): 24 attention heads
 # in 4 query groups of 256 channels, GDN 48 value / 16 key heads of 128 dims
-# and a 4-tap conv, 64 layers (48 GDN), on H200 bf16 (2026-09-04). Admitted at
-# TP1 x CP1/2/4 and TP2 x CP1 (the ten terms rank this GDN class at CP4, as
-# they do the 35B GDN MoE class); TP2 x CP2 fails its gates and keeps the
-# version-1 score, which on this class lost up to 112% at CP4.
+# and a 4-tap conv, 64 layers (48 GDN), on H200 bf16 (2026-09-04; CP2, CP4 and
+# TP2 x CP2 re-measured under the recalibrated CP planner on 2026-09-08, issue
+# #854). Admitted at TP1 x CP1/2/4 and TP2 x CP1 (the ten terms rank this GDN
+# class at CP4, as they do the 35B GDN MoE class; after the recalibration the
+# CP4 group carries one 5.5% clear miss on the synthetic grpo-g8 cell, whose
+# best layout changed with the planner); TP2 x CP2 fails its gates and keeps
+# the version-1 score, which on this class lost up to 112% at CP4.
 QWEN35_27B_GEOMETRY = ModelGeometry(
     hidden_size=5_120,
     ffn_hidden_size=17_408,
@@ -795,15 +799,15 @@ DENSE_GDN_H5120_TABLE = CalibratedTable(
     table_id="dense-gdn-h5120-h200-bf16",
     coefficients_milli_us={
         "attention_token_cp_exchange": 0,
-        "gdn_level": 3_043_381,
+        "gdn_level": 2_987_709,
         "gdn_level_tp": 0,
         "gdn_token_per_rank": 0,
         "level_cp_per_layer": 0,
-        "level_tp_per_layer": 442_039,
-        "tiny_segment_per_layer": 230_182,
-        "token_cp_exchange": 0,
-        "token_per_rank": 11_441,
-        "token_tp_collective": 0,
+        "level_tp_per_layer": 212_167,
+        "tiny_segment_per_layer": 197_090,
+        "token_cp_exchange": 191,
+        "token_per_rank": 5755,
+        "token_tp_collective": 817,
     },
     device_classes=(H200_CLASS,),
     param_dtypes=("torch.bfloat16",),
