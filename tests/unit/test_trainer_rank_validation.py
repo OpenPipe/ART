@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import timedelta
 import gc
 from importlib.util import find_spec
@@ -40,6 +40,7 @@ from art.trainer_rank._checkpoint import (
     PreparedCheckpoint,
     _file_digest,
     _FinalizedSave,
+    _LocalShard,
     _manifest_digest,
     _merge_component,
     _PreparedSave,
@@ -1863,6 +1864,62 @@ def test_optimizer_shards_are_received_as_float32(
 
     assert received == [torch.float32]
     assert merged["weight"].dtype == torch.float32
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("owner_rank", 1),
+        ("shape", (3, 2)),
+        ("dtype_name", "float32"),
+        ("manifest", {"kind": "different"}),
+        ("block", "other"),
+    ],
+)
+def test_checkpoint_merge_rejects_same_key_with_different_metadata(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, field: str, value: object
+) -> None:
+    metadata = SimpleNamespace(
+        key="weight",
+        owner_rank=0,
+        shape=(2, 3),
+        dtype_name="bfloat16",
+        manifest={"kind": "replicated"},
+        block="block",
+    )
+    decoy = SimpleNamespace(**{**vars(metadata), field: value})
+    prepared = replace(
+        _prepared_save(tmp_path, 0),
+        shards=(
+            _LocalShard(cast(Any, decoy), "decoy"),
+            _LocalShard(cast(Any, metadata), "selected"),
+        ),
+    )
+    tensor = torch.ones(2, 3)
+
+    def read(_prepared, relative, component, keys):
+        assert (relative, component, list(keys)) == ("selected", "master", ["weight"])
+        return {"weight": tensor}
+
+    monkeypatch.setattr("art.trainer_rank._checkpoint._read_snapshot", read)
+    monkeypatch.setattr("art.trainer_rank._checkpoint._rank", lambda: 0)
+    monkeypatch.setattr(
+        "art.trainer_rank._checkpoint.raise_distributed", lambda *_: None
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "art.megatron.weights.lora_publish",
+        SimpleNamespace(
+            merge_sharded_adapter_entries=lambda entries: {
+                key: values[0][1] for key, values in entries.items()
+            },
+        ),
+    )
+    selected = SimpleNamespace(
+        **{**vars(metadata), "manifest": dict(metadata.manifest)}
+    )
+    merged = _merge_component(prepared, cast(Any, [selected]), "master", None)
+    torch.testing.assert_close(merged["weight"], tensor)
 
 
 def test_checkpoint_fifo_abort_and_failure_do_not_block_later_save(
