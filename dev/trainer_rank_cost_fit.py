@@ -140,6 +140,7 @@ def production_regret(
                 row.get("record_type") == "calibration_sample"
                 and row.get("role") == "measured"
                 and row.get("candidate_label") == "automatic"
+                and row.get("planner_variant", "current") == "current"
                 and not row.get("admission_failed")
                 and row.get("subforward_count", 1) == 1
                 and all(status == "none" for status in row.get("compile_statuses", []))
@@ -1590,7 +1591,12 @@ def main() -> None:
                 "shortlist_size": arguments.shortlist_size,
                 "incumbent": arguments.incumbent,
             },
-            integer_table=report["integer_terms_milli_us"],
+            # Every production term, zero when it was not fitted, so the
+            # certificate equals the shipped table (bound by the certificate test).
+            integer_table={
+                name: int(report["integer_terms_milli_us"].get(name, 0))
+                for name in TERMS
+            },
             report=report,
             manifest=manifest_record,
             table_id=arguments.table_id,

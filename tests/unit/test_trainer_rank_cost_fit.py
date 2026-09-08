@@ -253,3 +253,44 @@ def test_integerize_never_loses_to_plain_rounding() -> None:
     assert fit.selection_loss(cells, matrix @ refined) <= fit.selection_loss(
         cells, matrix @ rounded
     )
+
+
+def test_production_regret_ignores_legacy_planner_rows(tmp_path: Path) -> None:
+    """Paired planner A/B evidence times the ``automatic`` selection under both
+    planner variants; only the current planner's rows describe production."""
+
+    cell = {"cell": "cal-grpo-g8", "model": "m", "layers": 2, "tp": 1, "cp": 2}
+    key = fit._cell_key(cell)
+    rows = [
+        {
+            **cell,
+            "record_type": "calibration_cell",
+            "candidates": [
+                {"label": "automatic", "matches": ["depth_one"]},
+                {"label": "depth_one"},
+            ],
+        }
+    ]
+    for variant, ms in (
+        ("current", 100.0),
+        ("current", 100.0),
+        ("legacy", 200.0),
+        ("legacy", 200.0),
+    ):
+        rows.append(
+            {
+                **cell,
+                "record_type": "calibration_sample",
+                "role": "measured",
+                "candidate_label": "automatic",
+                "planner_variant": variant,
+                "compile_statuses": ["none"],
+                "ms_max_rank": ms,
+            }
+        )
+    path = tmp_path / "evidence.jsonl"
+    path.write_text("\n".join(__import__("json").dumps(r) for r in rows) + "\n")
+    candidates = [_candidate(key, "depth_one", 4096, 8, 1, 100.0)]
+    report = fit.production_regret(candidates, [path])
+    assert report[key]["automatic_ms"] == 100.0
+    assert report[key]["regret_pct"] == 0.0
