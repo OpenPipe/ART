@@ -1801,11 +1801,75 @@ def _add_gemma4_k_eq_v_v_lora_tensors(
 
 def _vllm_moe_config(adapter_config: dict[str, Any]) -> dict[str, Any]:
     config = dict(adapter_config)
-    target_modules = list(config.get("target_modules") or [])
-    if "experts" not in target_modules:
-        target_modules.append("experts")
+    target_modules = [
+        name for name in config.get("target_modules") or [] if name != "experts"
+    ]
+    for name in ("gate_proj", "up_proj", "down_proj"):
+        if name not in target_modules:
+            target_modules.append(name)
     config["target_modules"] = target_modules
+    config["target_parameters"] = None
     return config
+
+
+def _export_per_expert_lora_tensors(
+    tensors: dict[str, torch.Tensor],
+    *,
+    adapter_config: dict[str, Any],
+) -> tuple[dict[str, torch.Tensor], dict[str, Any]]:
+    """Separate the expert and rank axes for vLLM's default MoE LoRA loader.
+
+    The packed publisher keeps gate/up fused during training and transport. On
+    disk, each expert uses ordinary gate/up/down projection keys and 2D factors.
+    B's packed columns are rank-major, so splitting consecutive columns would
+    silently mix experts for ranks greater than one.
+    """
+    grouped: dict[str, dict[str, torch.Tensor]] = {}
+    transformed: dict[str, torch.Tensor] = {}
+    for key, tensor in tensors.items():
+        match = _VLLM_MOE_KEY_RE.match(key)
+        if match is None:
+            transformed[key] = tensor
+            continue
+        slot = (
+            f"{'base_layer.' if match.group('base_layer') else ''}{match.group('lora')}"
+        )
+        grouped.setdefault(match.group("prefix"), {})[slot] = tensor
+    rank = int(adapter_config["r"])
+    for prefix, slots in grouped.items():
+        try:
+            gate_up_a = slots["base_layer.lora_A"]
+            gate_up_b = slots["base_layer.lora_B"]
+            down_a = slots["lora_A"]
+            down_b = slots["lora_B"]
+        except KeyError as exc:
+            raise RuntimeError(
+                f"Incomplete Gemma 4 MoE LoRA block for {prefix}"
+            ) from exc
+        if rank <= 0 or gate_up_a.shape[0] % rank:
+            raise RuntimeError(f"{prefix}: invalid packed LoRA rank {rank}")
+        num_experts = gate_up_a.shape[0] // rank
+        gate_up_b = _unpack_vllm_3d_lora_b(
+            gate_up_b, num_experts=num_experts, rank=rank
+        )
+        down_b = _unpack_vllm_3d_lora_b(down_b, num_experts=num_experts, rank=rank)
+        for expert in range(num_experts):
+            rows = slice(expert * rank, (expert + 1) * rank)
+            gate_b, up_b = gate_up_b[expert].chunk(2, dim=0)
+            factors = {
+                "gate_proj": (gate_up_a[rows], gate_b),
+                "up_proj": (gate_up_a[rows], up_b),
+                "down_proj": (down_a[rows], down_b[expert]),
+            }
+            for module, (a, b) in factors.items():
+                for name, tensor in (("A", a), ("B", b)):
+                    key = f"{prefix}.{expert}.{module}.lora_{name}.weight"
+                    if key in transformed:
+                        raise RuntimeError(f"Duplicate Gemma 4 LoRA tensor: {key}")
+                    transformed[key] = _clone(tensor)
+    if grouped or any(_VLLM_MOE_EXPERT_KEY_RE.match(k) for k in tensors):
+        adapter_config = _vllm_moe_config(adapter_config)
+    return transformed, adapter_config
 
 
 def _canonicalize_gemma4_peft_moe_target_parameter_layout(
@@ -1917,10 +1981,8 @@ def _to_vllm_lora_tensors(
             transformed,
             adapter_config=adapter_config,
         )
-        has_fused_experts = any(_VLLM_MOE_KEY_RE.match(key) for key in transformed)
-        return (
-            transformed,
-            _vllm_moe_config(adapter_config) if has_fused_experts else adapter_config,
+        return _export_per_expert_lora_tensors(
+            transformed, adapter_config=adapter_config
         )
 
     transformed: dict[str, torch.Tensor] = {}
@@ -1998,7 +2060,7 @@ def _to_vllm_lora_tensors(
         transformed,
         adapter_config=adapter_config,
     )
-    return transformed, _vllm_moe_config(adapter_config)
+    return _export_per_expert_lora_tensors(transformed, adapter_config=adapter_config)
 
 
 def _from_vllm_lora_tensors(
