@@ -6,6 +6,7 @@ import asyncio
 from collections import OrderedDict
 from collections.abc import (
     Callable,
+    Generator,
     Iterable,
     Iterator,
     Mapping,
@@ -1316,6 +1317,7 @@ class TrainerRank:
         self._hybridep_rows_high_water = 0
         self._memory_profiles: dict[_MemorySignature, _MemoryProfile] = {}
         self._last_global_micro_batch_size: int | None = None
+        self._skipped_forward_waves: dict[object, tuple[int, int, int]] = {}
         # Bounded LRU: steady-state hits are temporally local (identical
         # content on consecutive calls); fresh-token training steps must not
         # accumulate entries for the lifetime of the rank.
@@ -1391,6 +1393,7 @@ class TrainerRank:
         *,
         checkpoint: AdapterSelection,
     ) -> object:
+        self._guard_forward_collective(kind)
         from . import _checkpoint
 
         group = self._checkpoint_group()
@@ -1742,6 +1745,7 @@ class TrainerRank:
                 self._load_registered_checkpoint(name)
 
     def load_checkpoint(self, checkpoint: str | MaterializedCheckpoint | None) -> None:
+        self._guard_forward_collective("load_checkpoint")
         logical, source = self._checkpoint_source(checkpoint)
         with self._checkpoint_mutation_lock:
             if self._slot_stack:
@@ -1760,6 +1764,7 @@ class TrainerRank:
 
     def snapshot_checkpoint(self, source: str, destination: str) -> bool:
         """Clone a loaded checkpoint into a forward-only resident snapshot."""
+        self._guard_forward_collective("snapshot_checkpoint")
         from . import _checkpoint
 
         self._ensure_checkpoint_slots((source,))
@@ -1784,6 +1789,7 @@ class TrainerRank:
     def _push_checkpoint_sync(
         self, logical_path: str | None, source_path: str | None
     ) -> None:
+        self._guard_forward_collective("push_checkpoint")
         with self._checkpoint_mutation_lock:
             if source_path is not None:
                 assert logical_path is not None
@@ -1814,6 +1820,7 @@ class TrainerRank:
         output_dir: str,
         checkpoint_path: str | Literal["active"] = "active",
     ) -> None:
+        self._guard_forward_collective("prepare_checkpoint_save")
         from . import _checkpoint
 
         _checkpoint.prepare_checkpoint_save(
@@ -1821,11 +1828,13 @@ class TrainerRank:
         )
 
     def finish_checkpoint_save(self, output_dir: str) -> None:
+        self._guard_forward_collective("finish_checkpoint_save")
         from . import _checkpoint
 
         _checkpoint.finish_checkpoint_save(self, output_dir)
 
     def abort_checkpoint_save(self, output_dir: str) -> None:
+        self._guard_forward_collective("abort_checkpoint_save")
         from . import _checkpoint
 
         _checkpoint.abort_checkpoint_save(self, output_dir)
@@ -1835,6 +1844,7 @@ class TrainerRank:
         output_dir: str,
         checkpoint_path: str | Literal["active"] = "active",
     ) -> int:
+        self._guard_forward_collective("export_lora")
         from . import _lora_export
 
         return _lora_export.export_lora(
@@ -1995,6 +2005,7 @@ class TrainerRank:
         *,
         checkpoint: AdapterSelection = Unset,
         no_grad: bool | None = None,
+        yield_empty: bool = False,
     ) -> Iterator[
         MicroBatch[
             ForwardInput[LogprobsT, TopKT, LogitsT, HiddenStatesT],
@@ -2011,6 +2022,7 @@ class TrainerRank:
         *,
         checkpoint: AdapterSelection = Unset,
         no_grad: bool | None = None,
+        yield_empty: bool = False,
     ) -> Iterator[
         MicroBatch[
             Sequence[ForwardInput[LogprobsT, TopKT, LogitsT, HiddenStatesT]],
@@ -2027,6 +2039,7 @@ class TrainerRank:
         *,
         checkpoint: AdapterSelection = Unset,
         no_grad: bool | None = None,
+        yield_empty: bool = False,
     ) -> Iterator[
         MicroBatch[
             Sequence[Sequence[ForwardInput[LogprobsT, TopKT, LogitsT, HiddenStatesT]]],
@@ -2047,6 +2060,7 @@ class TrainerRank:
         *,
         checkpoint: AdapterSelection = Unset,
         no_grad: bool | None = None,
+        yield_empty: bool = False,
     ) -> Iterator[
         MicroBatch[
             Sequence[
@@ -2068,26 +2082,61 @@ class TrainerRank:
         *,
         checkpoint: AdapterSelection = Unset,
         no_grad: bool | None = None,
+        yield_empty: bool = False,
     ) -> Iterator[MicroBatch[ForwardInputs, ForwardOutputs]]:
+        if not isinstance(yield_empty, bool):
+            raise TypeError("yield_empty must be a bool")
         enabled = torch.is_grad_enabled() if no_grad is None else not no_grad
-        batches = self._forward_micro_batches(inputs, checkpoint=checkpoint)
-        while True:
-            with torch.set_grad_enabled(enabled):
+        batches = self._forward_micro_batches(
+            inputs, checkpoint=checkpoint, yield_empty=yield_empty
+        )
+        token = object()
+        try:
+            while True:
+                self._guard_forward_collective("forward_micro_batches")
+                with torch.set_grad_enabled(enabled):
+                    try:
+                        batch = next(batches)
+                    except StopIteration:
+                        return
+                if not yield_empty and not batch.outputs:
+                    continue
+                if (
+                    not yield_empty
+                    and batch.stats.global_count < self._dp_rank_and_size()[1]
+                ):
+                    self._skipped_forward_waves[token] = (
+                        threading.get_ident(),
+                        batch.stats.global_start,
+                        batch.stats.global_stop,
+                    )
                 try:
-                    batch = next(batches)
-                except StopIteration:
-                    return
-            yield batch
+                    yield batch
+                finally:
+                    self._skipped_forward_waves.pop(token, None)
+        finally:
+            batches.close()
+
+    def _guard_forward_collective(self, operation: str) -> None:
+        for thread, start, stop in tuple(self._skipped_forward_waves.values()):
+            if thread == threading.get_ident():
+                raise RuntimeError(
+                    f"{operation} cannot run during forward_micro_batches wave "
+                    f"[{start}, {stop}): yield_empty=False skips some data-parallel "
+                    "ranks. Move collective calls after the iterator or use "
+                    "yield_empty=True on every rank."
+                )
 
     def _forward_micro_batches(
         self,
         inputs: Iterable[ForwardInputs],
         *,
         checkpoint: AdapterSelection,
-    ) -> Iterator[MicroBatch[ForwardInputs, ForwardOutputs]]:
+        yield_empty: bool,
+    ) -> Generator[MicroBatch[ForwardInputs, ForwardOutputs], None, None]:
         items = [_materialize(item) for item in inputs]
         requests = list(_flatten(items))
-        self._validate_replicated_top_level_count(len(items))
+        self._validate_replicated_top_level_count(len(items), yield_empty=yield_empty)
         for _, indices in self._group_active_request_indices(
             requests, checkpoint=checkpoint
         ):
@@ -2225,6 +2274,7 @@ class TrainerRank:
         checkpoint: AdapterSelection = Unset,
         no_grad: bool | None = None,
     ) -> ForwardOutputs:
+        self._guard_forward_collective("dp_rank_forward")
         enabled = torch.is_grad_enabled() if no_grad is None else not no_grad
         with torch.set_grad_enabled(enabled):
             self._reset_planning_telemetry()
@@ -2622,6 +2672,7 @@ class TrainerRank:
         *,
         op: dist.ReduceOp.RedOpType = dist.ReduceOp.SUM,
     ) -> None:
+        self._guard_forward_collective("dp_reduce")
         from megatron.core import parallel_state as ps
 
         dist.all_reduce(
@@ -2638,6 +2689,7 @@ class TrainerRank:
         checkpoints: Sequence[str] | None = None,
         on_live_graphs: Literal["allow", "error"] = "allow",
     ) -> dict[str, float]:
+        self._guard_forward_collective("optim_step")
         if on_live_graphs not in ("allow", "error"):
             raise ValueError(
                 "on_live_graphs must be either 'allow' or 'error', got "
@@ -3692,17 +3744,22 @@ class TrainerRank:
 
         return candidate(best)
 
-    def _validate_replicated_top_level_count(self, count: int) -> None:
+    def _validate_replicated_top_level_count(
+        self, count: int, *, yield_empty: bool
+    ) -> None:
         if not (dist.is_available() and dist.is_initialized()):
             return
-        counts = [0 for _ in range(dist.get_world_size())]
-        dist.all_gather_object(counts, int(count))
-        if len(set(counts)) == 1:
+        configurations: list[tuple[int, bool] | None] = [
+            None for _ in range(dist.get_world_size())
+        ]
+        dist.all_gather_object(configurations, (int(count), yield_empty))
+        if len(set(configurations)) == 1:
             return
         raise ValueError(
-            "forward_micro_batches requires the same top-level input count on every "
+            "forward_micro_batches requires the same top-level input count and "
+            "yield_empty setting on every "
             "distributed rank. Pass already-DP-local inputs to dp_rank_forward instead. "
-            f"Observed counts by rank: {counts}."
+            f"Observed (count, yield_empty) by rank: {configurations}."
         )
 
     def _dp_rank_and_size(self) -> tuple[int, int]:

@@ -165,6 +165,7 @@ class TrainerRank(_impl.TrainerRank):
         *,
         checkpoint: AdapterSelection = Unset,
         no_grad: bool | None = None,
+        yield_empty: bool = False,
     ) -> Iterator[
         MicroBatch[
             ForwardInput[LogprobsT, TopKT, LogitsT, HiddenStatesT],
@@ -181,6 +182,7 @@ class TrainerRank(_impl.TrainerRank):
         *,
         checkpoint: AdapterSelection = Unset,
         no_grad: bool | None = None,
+        yield_empty: bool = False,
     ) -> Iterator[
         MicroBatch[
             Sequence[ForwardInput[LogprobsT, TopKT, LogitsT, HiddenStatesT]],
@@ -197,6 +199,7 @@ class TrainerRank(_impl.TrainerRank):
         *,
         checkpoint: AdapterSelection = Unset,
         no_grad: bool | None = None,
+        yield_empty: bool = False,
     ) -> Iterator[
         MicroBatch[
             Sequence[Sequence[ForwardInput[LogprobsT, TopKT, LogitsT, HiddenStatesT]]],
@@ -217,6 +220,7 @@ class TrainerRank(_impl.TrainerRank):
         *,
         checkpoint: AdapterSelection = Unset,
         no_grad: bool | None = None,
+        yield_empty: bool = False,
     ) -> Iterator[
         MicroBatch[
             Sequence[
@@ -238,6 +242,7 @@ class TrainerRank(_impl.TrainerRank):
         *,
         checkpoint: AdapterSelection = Unset,
         no_grad: bool | None = None,
+        yield_empty: bool = False,
     ) -> Iterator[MicroBatch[ForwardInputs, ForwardOutputs]]:
         """Forward replicated inputs in adaptive data-parallel microbatches.
 
@@ -247,12 +252,23 @@ class TrainerRank(_impl.TrainerRank):
         Input and target tensors may be on a different device from the trainer;
         ART moves its packed model inputs and labels internally without mutating
         the caller-owned `ForwardInput` objects.
+
+        Empty local microbatches are skipped unless `yield_empty=True`. Every
+        rank must use the same setting. When a wave skips ranks, TrainerRank
+        collective methods raise if called from its loop body; fully populated
+        waves permit them. Use `yield_empty=True` for per-wave collectives,
+        including reductions on ranks with no outputs. Exhaust or close a retained
+        iterator before making collective calls after an early exit. Guards apply
+        on the iterator's thread; raw torch.distributed calls are not guarded.
+        Collective calls must still match across ranks.
         """
         forward = cast(
             Callable[..., Iterator[MicroBatch[ForwardInputs, ForwardOutputs]]],
             super().forward_micro_batches,
         )
-        return forward(inputs, checkpoint=checkpoint, no_grad=no_grad)
+        return forward(
+            inputs, checkpoint=checkpoint, no_grad=no_grad, yield_empty=yield_empty
+        )
 
     @overload
     def dp_rank_forward(
