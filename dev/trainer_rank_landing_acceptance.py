@@ -2178,15 +2178,22 @@ def _legacy_best_improving_move(
 
 
 _CURRENT_BEST_IMPROVING_MOVE: Any = None
+# Ranks whose layout-selection cache must not survive a variant switch: the
+# cache is keyed by content, topology and coefficients, not by the CP planner,
+# and the production selection (the "automatic" candidate) depends on the
+# planner wherever a re-ranker prices plan structure.
+_PLANNER_AB_RANKS: list[Any] = []
 
 
-def _install_planner_ab() -> None:
+def _install_planner_ab(rank: Any = None) -> None:
     global _CURRENT_BEST_IMPROVING_MOVE
     from art.megatron.context_parallel import runtime
     from art.megatron.training import microbatches
 
     original = microbatches._context_parallel_config_for_provider
     _CURRENT_BEST_IMPROVING_MOVE = runtime._best_improving_move
+    if rank is not None and rank not in _PLANNER_AB_RANKS:
+        _PLANNER_AB_RANKS.append(rank)
 
     def variant_config(provider: Any, device: Any, handler: Any) -> Any:
         config = original(provider, device, handler)
@@ -2212,6 +2219,9 @@ def _set_planner_variant(variant: str) -> None:
             if variant == "legacy"
             else _CURRENT_BEST_IMPROVING_MOVE
         )
+    for rank in _PLANNER_AB_RANKS:
+        with rank._layout_cache_lock:
+            rank._layout_selection_cache.clear()
 
 
 def phase_cost_calibrate(
@@ -2352,7 +2362,7 @@ def phase_cost_calibrate(
         if planner_ab:
             # Installed before the candidate rows so the legacy plan structure
             # recorded next to the current one is the legacy planner's.
-            _install_planner_ab()
+            _install_planner_ab(rank)
         for candidate in candidates:
             features = layout_features(candidate.layout)
             current_us = current_score(features)
@@ -2416,20 +2426,34 @@ def phase_cost_calibrate(
             tuple(r.input_tokens.reshape(-1).to(torch.long) for r in requests)
         )
         automatic_features = layout_features(automatic_layout)
-        matching = [
-            row["label"]
-            for row in candidate_rows
-            if row["features"] == automatic_features.as_dict()
-        ]
-        candidate_rows.append(
-            {
-                "label": "automatic",
-                "labels": ["automatic"],
-                "features": automatic_features.as_dict(),
-                "current_score_us": current_score(automatic_features),
-                "matches": matching,
-            }
-        )
+
+        def _matching(features: Any) -> list[str]:
+            return [
+                row["label"]
+                for row in candidate_rows
+                if row["features"] == features.as_dict()
+            ]
+
+        automatic_row: dict[str, Any] = {
+            "label": "automatic",
+            "labels": ["automatic"],
+            "features": automatic_features.as_dict(),
+            "current_score_us": current_score(automatic_features),
+            "matches": _matching(automatic_features),
+        }
+        if planner_ab:
+            # The legacy arm's production selection is made under the legacy
+            # planner (the variant switch clears the layout cache), so its
+            # timed rows are main's actual choice, not the current one's.
+            _set_planner_variant("legacy")
+            _tree, legacy_layout = rank._select_group_layout(
+                tuple(r.input_tokens.reshape(-1).to(torch.long) for r in requests)
+            )
+            _set_planner_variant("current")
+            legacy_features = layout_features(legacy_layout)
+            automatic_row["features_legacy"] = legacy_features.as_dict()
+            automatic_row["matches_legacy"] = _matching(legacy_features)
+        candidate_rows.append(automatic_row)
         logical_tokens = sum(int(r.input_tokens.numel()) for r in requests)
         base = {
             "schema": CALIBRATION_SCHEMA,

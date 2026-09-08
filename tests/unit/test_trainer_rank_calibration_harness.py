@@ -178,3 +178,40 @@ def test_legacy_planner_variant_restores_the_pre_854_search(monkeypatch) -> None
         assert runtime._best_improving_move is current_move
     finally:
         driver._set_planner_variant("current")
+
+
+def test_planner_variant_switch_clears_the_registered_layout_cache(monkeypatch) -> None:
+    """The production selection ("automatic") depends on the planner wherever a
+    re-ranker prices plan structure, but the rank's layout cache is not keyed by
+    the planner: a variant switch must drop it so the legacy arm times main's
+    own choice rather than the current planner's."""
+
+    pytest.importorskip("megatron.core")
+    import threading
+    from collections import OrderedDict
+    from types import SimpleNamespace
+
+    from art.megatron.context_parallel import runtime
+    from art.megatron.training import microbatches
+
+    monkeypatch.setattr(
+        microbatches,
+        "_context_parallel_config_for_provider",
+        microbatches._context_parallel_config_for_provider,
+    )
+    monkeypatch.setattr(runtime, "_best_improving_move", runtime._best_improving_move)
+    monkeypatch.setattr(driver, "_CURRENT_BEST_IMPROVING_MOVE", None)
+    monkeypatch.setattr(driver, "_PLANNER_AB_RANKS", [])
+    rank = SimpleNamespace(
+        _layout_cache_lock=threading.Lock(),
+        _layout_selection_cache=OrderedDict({"key": "layout"}),
+    )
+    driver._install_planner_ab(rank)
+    try:
+        driver._set_planner_variant("legacy")
+        assert not rank._layout_selection_cache
+        rank._layout_selection_cache["key"] = "legacy layout"
+        driver._set_planner_variant("current")
+        assert not rank._layout_selection_cache
+    finally:
+        driver._set_planner_variant("current")

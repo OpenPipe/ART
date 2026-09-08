@@ -319,12 +319,12 @@ def estimate_owned_token_ms(
     per token) and the dense gated MLP (6 h f) or, for MoE, the shared expert
     (6 h f_s). Routed-expert work (6 h f_e k) follows ownership only while the
     expert communication stays within the owning rank's tensor-parallel group:
-    expert parallelism 1 and an expert tensor-parallel size no larger than the
+    expert parallelism 1 and an expert tensor-parallel size that divides the
     attention tensor-parallel size (Megatron defaults it to the same size).
     With expert parallelism the routed rows are redistributed across the
-    expert-parallel group; with an expert tensor-parallel group wider than the
-    attention one (e.g. TP1 x CP2 with ETP2) the group gathers every CP
-    owner's routed rows. Either way a rank's expert work depends on the tokens
+    expert-parallel group; with an expert tensor-parallel group that does not
+    tile the attention one (TP1 x CP2 with ETP2, or TP4 with ETP3) the group
+    gathers routed rows of more than one CP owner. Either way a rank's expert work depends on the tokens
     of every source rank in that group, not on its own ownership, and it must
     not enter the ownership balance (with balanced routing it is the same on
     every rank).
@@ -348,7 +348,11 @@ def estimate_owned_token_ms(
         if expert_tensor_parallel_size is None
         else max(1, expert_tensor_parallel_size)
     )
-    routed_follows_ownership = max(1, expert_parallel_size) == 1 and etp <= tp
+    # Under Megatron's rank ordering the expert tensor-parallel groups tile the
+    # attention tensor-parallel groups only when their size divides the
+    # attention one; otherwise (e.g. TP4 with ETP3) a group straddles two
+    # context-parallel owners and gathers both owners' routed rows.
+    routed_follows_ownership = max(1, expert_parallel_size) == 1 and tp % etp == 0
     routed = (
         6.0 * h * float(moe_ffn_hidden_size) * moe_topk
         if is_moe and routed_follows_ownership

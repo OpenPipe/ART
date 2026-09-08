@@ -664,6 +664,23 @@ def test_routed_expert_work_follows_ownership_only_without_expert_parallelism() 
     assert estimate_owned_token_ms(**moe, tensor_parallel_size=2) == pytest.approx(
         same_group
     )
+    # A size that does not divide the attention one straddles owners (TP4 with
+    # ETP3: expert groups [3, 4, 5] and [6, 7, 8] span two CP owners) and the
+    # routed work leaves the balance; a divisor (ETP2) stays within the owner.
+    straddling = estimate_owned_token_ms(
+        **moe,
+        tensor_parallel_size=4,
+        expert_parallel_size=1,
+        expert_tensor_parallel_size=3,
+    )
+    assert straddling == pytest.approx(projections_only / 4.0)
+    tiling = estimate_owned_token_ms(
+        **moe,
+        tensor_parallel_size=4,
+        expert_parallel_size=1,
+        expert_tensor_parallel_size=2,
+    )
+    assert tiling == pytest.approx(replicated / 4.0)
 
 
 @pytest.mark.parametrize("seed", range(400, 430))
