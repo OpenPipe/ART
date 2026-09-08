@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Iterable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from datetime import timedelta
 import gc
@@ -13,7 +14,7 @@ import sys
 import threading
 import time
 from types import ModuleType, SimpleNamespace
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, Never, cast
 
 import pytest
 import torch
@@ -951,19 +952,22 @@ async def test_shared_checkpoint_prefetch_survives_waiter_cancellation() -> None
 
     def prepare() -> PreparedCheckpoint:
         started.set()
-        release.wait()
+        assert release.wait(5)
         return source
 
-    future = trainer._register_checkpoint_prefetch("student", "student", prepare)
-    first = asyncio.create_task(trainer._await_checkpoint_prefetch(future))
-    second = asyncio.create_task(trainer._await_checkpoint_prefetch(future))
+    trainer._checkpoint_slots["student"] = _CheckpointSlot(snapshot=True)
+    trainer._register_checkpoint_prefetch("student", "student", prepare)
+    first = trainer._checkpoint_prefetch_waiter("student")
+    second = trainer._checkpoint_prefetch_waiter("student")
     await asyncio.to_thread(started.wait)
     first.cancel()
     with pytest.raises(asyncio.CancelledError):
         await first
     release.set()
 
-    assert await second is source
+    assert await second is None
+    trainer._checkpoint_slots.pop("student")
+    assert trainer._prefetched_checkpoint("student") is source
     [cached] = trainer._checkpoint_prefetches.values()
     assert cached.result() is source
 
@@ -3289,18 +3293,237 @@ def test_dp_rank_forward_supports_arbitrary_nested_depth(
     assert _output_values(outputs) == [0, 1, 2]
 
 
+@pytest.mark.parametrize("yield_empty", [False, True])
 def test_forward_micro_batches_uses_deterministic_dp_windows(
     monkeypatch: pytest.MonkeyPatch,
+    yield_empty: bool,
 ) -> None:
     trainer = TrainerRank(_runtime())
     _stub_forward(monkeypatch, trainer, dp=(1, 2))
 
     batches = list(
-        trainer.forward_micro_batches([_target_request(i) for i in range(5)])
+        trainer.forward_micro_batches(
+            [_target_request(i) for i in range(5)], yield_empty=yield_empty
+        )
     )
 
-    assert [batch.indices for batch in batches] == [(1,), (3,), ()]
-    assert [len(batch.outputs) for batch in batches] == [1, 1, 0]
+    assert [batch.indices for batch in batches] == [(1,), (3,)] + (
+        [()] if yield_empty else []
+    )
+    assert [len(batch.outputs) for batch in batches] == [1, 1] + (
+        [0] if yield_empty else []
+    )
+
+
+@pytest.mark.parametrize(
+    "operation",
+    [
+        "dp_reduce",
+        "optim_step",
+        "parameter",
+        "module",
+        "buffer",
+        "load_checkpoint",
+        "snapshot_checkpoint",
+        "push_checkpoint",
+        "save_checkpoint",
+        "prepare_checkpoint_save",
+        "finish_checkpoint_save",
+        "abort_checkpoint_save",
+        "export_lora",
+        "dp_rank_forward",
+        "forward_micro_batches",
+    ],
+)
+def test_skipped_forward_wave_rejects_collectives_before_backend(
+    monkeypatch: pytest.MonkeyPatch, operation: str
+) -> None:
+    trainer = TrainerRank(_runtime())
+    _stub_forward(monkeypatch, trainer, dp=(0, 2))
+    batches = trainer.forward_micro_batches([_target_request(1)])
+    next(batches)
+    assert trainer._skipped_forward_waves
+
+    def unexpected(*_args: object, **_kwargs: object) -> Never:
+        pytest.fail("partial-wave guard must run before backend work")
+
+    monkeypatch.setattr(dist, "all_reduce", unexpected)
+    monkeypatch.setattr(trainer, "_checkpoint_group", unexpected)
+    calls = {
+        "dp_reduce": lambda: trainer.dp_reduce(torch.tensor(1)),
+        "optim_step": lambda: trainer.optim_step(params=AdamParams(learning_rate=1e-3)),
+        "parameter": lambda: trainer.parameter("p", unexpected),
+        "module": lambda: trainer.module("m", unexpected),
+        "buffer": lambda: trainer.buffer("b", unexpected),
+        "load_checkpoint": lambda: trainer.load_checkpoint("missing"),
+        "snapshot_checkpoint": lambda: trainer.snapshot_checkpoint("a", "b"),
+        "push_checkpoint": lambda: trainer.push_checkpoint("missing").__enter__(),
+        "save_checkpoint": lambda: trainer.save_checkpoint("/unused"),
+        "prepare_checkpoint_save": lambda: trainer.prepare_checkpoint_save("/unused"),
+        "finish_checkpoint_save": lambda: trainer.finish_checkpoint_save("/unused"),
+        "abort_checkpoint_save": lambda: trainer.abort_checkpoint_save("/unused"),
+        "export_lora": lambda: trainer.export_lora("/unused"),
+        "dp_rank_forward": lambda: trainer.dp_rank_forward([_target_request(1)]),
+        "forward_micro_batches": lambda: next(
+            trainer.forward_micro_batches([_target_request(1)], yield_empty=True)
+        ),
+    }
+    with pytest.raises(RuntimeError, match="yield_empty=False skips"):
+        calls[operation]()
+    cast(Any, batches).close()
+    assert not trainer._skipped_forward_waves
+
+
+@pytest.mark.parametrize("finish", ["exhaust", "close", "throw"])
+def test_skipped_forward_wave_cleans_up_retained_iterator(
+    monkeypatch: pytest.MonkeyPatch, finish: str
+) -> None:
+    trainer = TrainerRank(_runtime())
+    _stub_forward(monkeypatch, trainer, dp=(0, 2))
+    batches = trainer.forward_micro_batches([_target_request(1)], no_grad=True)
+    for _batch in batches:
+        break
+    assert torch.is_grad_enabled()
+    with pytest.raises(RuntimeError, match="yield_empty=False"):
+        trainer._guard_forward_collective("test")
+    # An independent actor thread may finish an all-rank checkpoint save while
+    # this callback is paused in its loop body.
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        executor.submit(trainer._guard_forward_collective, "test").result()
+    if finish == "exhaust":
+        assert list(batches) == []
+    elif finish == "close":
+        cast(Any, batches).close()
+    else:
+        with pytest.raises(LookupError, match="injected"):
+            cast(Any, batches).throw(LookupError("injected"))
+    assert not trainer._skipped_forward_waves
+    assert torch.is_grad_enabled()
+    trainer._guard_forward_collective("test")
+
+
+def test_skipped_forward_wave_cannot_resume_another_iterator(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trainer = TrainerRank(_runtime())
+    _stub_forward(monkeypatch, trainer, dp=(0, 2))
+    outer = trainer.forward_micro_batches([_target_request(i) for i in range(4)])
+    next(outer)  # Every rank participates in this wave, so nesting is allowed.
+    inner = trainer.forward_micro_batches([_target_request(1)])
+    next(inner)
+    with pytest.raises(RuntimeError, match="yield_empty=False skips"):
+        next(outer)
+    with pytest.raises(RuntimeError, match="yield_empty=False skips"):
+        trainer._guard_forward_collective("test")
+    cast(Any, inner).close()
+    trainer._guard_forward_collective("test")
+
+
+def _forward_yield_modes_worker(rank: int, world_size: int, init_method: str) -> None:
+    dist.init_process_group(
+        "gloo",
+        rank=rank,
+        world_size=world_size,
+        init_method=init_method,
+        timeout=timedelta(seconds=30),
+    )
+    try:
+        with pytest.MonkeyPatch.context() as monkeypatch:
+            try:
+                from megatron.core import parallel_state
+            except ImportError:
+                core = ModuleType("megatron.core")
+                parallel_state = cast(Any, SimpleNamespace())
+                cast(Any, core).parallel_state = parallel_state
+                monkeypatch.setitem(sys.modules, "megatron.core", core)
+            monkeypatch.setattr(
+                parallel_state,
+                "get_data_parallel_group",
+                lambda **_: dist.group.WORLD,
+                raising=False,
+            )
+            for count in (0, 1, world_size - 1, world_size, 2 * world_size + 1):
+                for mode in (None, False, True):
+                    trainer = TrainerRank(_runtime())
+                    parameter = torch.nn.Parameter(torch.tensor(2.0))
+
+                    def execute(plan, **_kwargs):
+                        return [
+                            ForwardOutput(
+                                parameter * item.input_ids.float(), None, None, None
+                            )
+                            for group in plan.groups
+                            for item in group.items
+                        ]
+
+                    # Only the model execution and Megatron topology are mocked;
+                    # ART's iterator, wave planning, and Gloo collectives are real.
+                    _stub_forward(monkeypatch, trainer, execute, dp=(rank, world_size))
+                    monkeypatch.setattr(trainer, "_topology_key", lambda: (1, 1, 1, 1))
+                    monkeypatch.setattr(trainer, "_forward_memory_group", lambda: None)
+                    requests = [_target_request(i) for i in range(count)]
+                    batches = (
+                        trainer.forward_micro_batches(requests)
+                        if mode is None
+                        else trainer.forward_micro_batches(requests, yield_empty=mode)
+                    )
+                    local_indices: list[int] = []
+                    total_loss = torch.tensor(0.0)
+                    for batch in batches:
+                        local_indices.extend(batch.indices)
+                        participation = torch.tensor(len(batch.outputs))
+                        if mode is True or batch.stats.global_count >= world_size:
+                            trainer.dp_reduce(participation)
+                            assert participation.item() == batch.stats.global_count
+                        else:
+                            with pytest.raises(RuntimeError, match="skips"):
+                                trainer.dp_reduce(participation)
+                        loss = torch.tensor(0.0)
+                        for output in batch.outputs:
+                            loss = loss + output.target_logprobs.sum()
+                        # The old mode needs a guard; the default supports the
+                        # original experiment's unconditional backward directly.
+                        if mode is not True or batch.outputs:
+                            loss.backward()
+                        total_loss += loss.detach()
+                    assert local_indices == list(range(rank, count, world_size))
+                    assert not trainer._skipped_forward_waves
+                    gradient = (
+                        torch.zeros_like(parameter)
+                        if parameter.grad is None
+                        else parameter.grad
+                    )
+                    trainer.dp_reduce(gradient)
+                    trainer.dp_reduce(total_loss)
+                    assert gradient.item() == count**2
+                    assert total_loss.item() == 2 * count**2
+
+            with pytest.raises(ValueError, match="yield_empty setting"):
+                list(trainer.forward_micro_batches(requests, yield_empty=rank == 0))
+            completed = torch.tensor(1)
+            trainer.dp_reduce(completed)
+            assert completed.item() == world_size
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.parametrize("world_size", [2, 4])
+def test_forward_micro_batches_yield_modes_collectively(
+    tmp_path: Path, world_size: int
+) -> None:
+    context = mp.spawn(
+        _forward_yield_modes_worker,
+        args=(world_size, f"file://{tmp_path / 'forward-yields'}"),
+        nprocs=world_size,
+        join=False,
+    )
+    deadline = time.monotonic() + 60
+    while time.monotonic() < deadline:
+        if context.join(timeout=1):
+            return
+    for process in context.processes:
+        process.terminate()
+    pytest.fail("forward yield modes test hung")
 
 
 def test_forward_micro_batches_syncs_fit_decision_across_dp(
@@ -3495,7 +3718,7 @@ def test_forward_micro_batches_rejects_mismatched_replicated_counts(
     monkeypatch.setattr(trainer_rank.dist, "all_reduce", lambda *_args, **_kwargs: None)
 
     def gather(output, value):
-        output[:] = [value, value + 1]
+        output[:] = [value, (value[0] + 1, value[1])]
 
     monkeypatch.setattr(trainer_rank.dist, "all_gather_object", gather)
 

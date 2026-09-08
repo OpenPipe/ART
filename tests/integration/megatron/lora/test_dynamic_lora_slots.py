@@ -603,6 +603,8 @@ def _trainer_for(lora: LoRA, device: torch.device) -> TrainerRank:
     trainer.device = device
     trainer._slot_stack = []
     trainer._default_slot_ref = None
+    trainer._skipped_forward_waves = {}
+    trainer._snapshot_checkpoint_names = set()
     trainer._checkpoint_slots = {
         name: _CheckpointSlot(
             tuple(lora.lora_slot_params(LoRASlotRef("checkpoint", name)))

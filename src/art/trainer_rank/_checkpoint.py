@@ -1641,6 +1641,7 @@ def snapshot_checkpoint(trainer: TrainerRank, source: str, destination: str) -> 
         _restore_slots(model_snapshot)
         trainer._checkpoint_slots.pop(destination, None)
         raise
+    trainer._snapshot_checkpoint_names.add(destination)
     return True
 
 
@@ -1976,6 +1977,7 @@ def snapshot_prepared_checkpoint(
             )
         return False
     load_checkpoint(trainer, source, destination, forward_only=True)
+    trainer._snapshot_checkpoint_names.add(destination)
     return True
 
 

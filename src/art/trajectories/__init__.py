@@ -20,11 +20,13 @@ from typing import (
     Generic,
     Literal,
     Protocol,
+    Self,
     TypeAlias,
     TypeVar,
     Union,
     cast,
     overload,
+    override,
 )
 
 from anthropic.types import (
@@ -298,6 +300,45 @@ class TrajectoryExchanges(pydantic.BaseModel):
     responses: list[ResponsesExchange] = pydantic.Field(default_factory=list)
     messages: list[MessagesExchange] = pydantic.Field(default_factory=list)
 
+    @override
+    def model_copy(
+        self,
+        *,
+        include_models: str | Iterable[str] | None = None,
+        exclude_models: str | Iterable[str] | None = None,
+        update: Mapping[str, Any] | None = None,
+        deep: bool = False,
+    ) -> Self:
+        """Copy with fresh protocol lists, including then excluding models.
+
+        Each selector matches an exact captured model first, otherwise a
+        case-sensitive shell pattern. ``None`` includes all/excludes none;
+        an empty iterable matches none. Shallow copies share exchange objects;
+        deep copies copy the retained graph. Explicit updates win, unvalidated
+        and used as supplied, without filtering or copying replacement values.
+        """
+        from ._selection import _matching_models
+
+        protocols = {
+            "chat_completions": self.chat_completions,
+            "completions": self.completions,
+            "responses": self.responses,
+            "messages": self.messages,
+        }
+        models = {item.model for items in protocols.values() for item in items}
+        selected = _matching_models(models, include_models)
+        if exclude_models is not None:
+            selected = selected - _matching_models(models, exclude_models)
+        filtered = super().model_copy(
+            update={
+                name: [item for item in items if item.model in selected]
+                if update is None or name not in update
+                else []
+                for name, items in protocols.items()
+            }
+        )
+        return super(TrajectoryExchanges, filtered).model_copy(update=update, deep=deep)
+
     def __bool__(self) -> bool:
         return any(
             (self.chat_completions, self.completions, self.responses, self.messages)
@@ -555,6 +596,32 @@ class Trajectory(_CompactModel):
         default_factory=lambda: datetime.now(UTC), exclude=True
     )
     _policy_token_counts: dict[int, int] | None = pydantic.PrivateAttr(default=None)
+
+    @override
+    def model_copy(
+        self,
+        *,
+        include_models: str | Iterable[str] | None = None,
+        exclude_models: str | Iterable[str] | None = None,
+        update: Mapping[str, Any] | None = None,
+        deep: bool = False,
+    ) -> Self:
+        """Copy, filtering exchanges with ``TrajectoryExchanges.model_copy``.
+
+        Exchanges follow ``deep`` by default; all other fields retain ordinary
+        Pydantic copy semantics. Explicit ``update`` values win unchanged: pass
+        an exchanges copy there to choose its copy depth independently.
+        """
+        filtered = super().model_copy(
+            update={
+                "exchanges": self.exchanges.model_copy(
+                    include_models=include_models, exclude_models=exclude_models
+                )
+                if update is None or "exchanges" not in update
+                else TrajectoryExchanges()
+            }
+        )
+        return super(Trajectory, filtered).model_copy(update=update, deep=deep)
 
     @pydantic.field_serializer("messages_and_choices", when_used="json")
     def serialize_messages_and_choices(self, value: MessagesAndChoices) -> list[Any]:
