@@ -202,7 +202,8 @@ for the shipped table (the version-1 score reaches 15% on another group
 there; neither is adequate). The dense certificate had no
 attention-plus-real-data cells at CP4, so its metrics did not cover this.
 
-Resolution (2026-09-04/05, per review). The attention classes get their own
+Resolution (2026-09-04/05, per review; superseded for TP1 × CP4 by the planner
+recalibration of 2026-09-08 below, which retired the re-ranker). The attention classes get their own
 tables where the ten-term gates pass — Qwen3-1.7B (`dense-attn-h2048-h200-bf16`)
 and Qwen3-8B (`dense-attn-h4096-h200-bf16`) at TP1 × CP1/CP2 and TP2 × CP1,
 Qwen3-14B (`dense-attn-h5120-h200-bf16`) also at TP2 × CP2 (42/42/56 cells;
@@ -270,6 +271,137 @@ TP2 × CP2 fails its gates marginally (p95 5.1%, one clear miss) and keeps
 version 1. This is the class where the version-1 fallback hurt most: on the
 largest Ellavox group at CP4 it chose a layout 112% slower than the best
 (4,084 ms against 1,927 ms), and 26% slower at TP2 × CP2.
+
+### Recalibrated context-parallel planner and re-certification (2026-09-08, issue #854)
+
+The context-parallel assignment planner (`_search_generic_chunk_assignment`)
+chooses the remote wave count and the chunk owners from its own per-layer cost
+model, and three of its assumptions made it choose slower plans. It priced no
+host work per remote stage, although one more wave costs a measured
+2.3–2.6 ms per layer (forward + backward) on the small and medium classes and
+0.2–0.6 ms where layers are long enough to hide it; it priced the KV fetch at
+about 14 GB/s, ten times slower than NVLink, and hid that phantom latency
+behind extra waves; and it balanced attention pairs only, so on causal rows
+the early rank owned several times the tokens of the last while the rest of
+the layer's compute went unpriced. The recalibration adds a host cost per
+remote stage (`planner_remote_stage_host_ms`, 1.2 ms per direction), prices
+fetch and reduce at 30 ns per token, and adds a per-owned-token compute cost
+from the provider geometry (`planner_owned_token_ms`, `estimate_owned_token_ms`;
+routed-expert work is charged per owned token only without expert parallelism,
+because with EP the routed rows are redistributed across the group). The
+search also keeps every rank's ownership contiguous — moves shift boundary
+chunks to the rank owning the neighbouring chunk — because the GDN layers chain
+recurrent state along the attention layout and a rank owning two separate
+ranges pays extra hops (one +15% cell in the first hardware validation, the
+only fragmented plan of its cell).
+
+Every CP > 1 cell of every calibrated class was re-measured with a paired
+A/B (`--planner-ab`): each layout is timed under the current and the legacy
+planner in alternating rounds on the same node; legacy rows carry
+`planner_variant` and are never fitted. Per-layout median change of the
+current planner against the legacy one, the change of each cell's best
+layout, and the change of the timed production (automatic) selection:
+
+| class | shape | layouts faster | per-layout median | cell-best | production |
+| --- | --- | --- | --- | --- | --- |
+| Qwen3-1.7B | TP1 × CP2 | 127/138 | −5.4% | −8.8% | −7.9% |
+| | TP1 × CP4 | 122/138 | −12.7% | −8.5% | −13.0% |
+| | TP2 × CP2 | 113/138 | −2.1% | −3.5% | −6.4% |
+| Qwen3.5-4B (GDN) | TP1 × CP2 | 120/137 | −3.4% | −3.8% | −3.9% |
+| | TP1 × CP4 | 110/137 | −3.3% | −3.9% | −4.7% |
+| Qwen3-8B | TP1 × CP2 | 137/138 | −23.5% | −20.7% | −20.4% |
+| | TP1 × CP4 | 128/138 | −14.6% | −21.0% | −20.6% |
+| | TP2 × CP2 | 135/138 | −10.2% | −10.8% | −10.4% |
+| Qwen3-14B | TP1 × CP2 | 137/138 | −27.6% | −25.3% | −25.6% |
+| | TP1 × CP4 | 129/138 | −16.8% | −28.7% | −29.5% |
+| | TP2 × CP2 | 135/138 | −17.8% | −16.1% | −14.6% |
+| Qwen3-30B-A3B | TP1 × CP2 | 128/138 | −5.0% | −5.6% | −5.6% |
+| | TP1 × CP2 EP2 | 106/138 | −1.2% | −3.8% | −3.8% |
+| | TP1 × CP4 | 110/138 | −6.6% | −5.8% | −6.5% |
+| | TP1 × CP4 EP2 | 120/138 | −6.7% | −5.5% | −7.7% |
+| Qwen3.5-35B-A3B (GDN) | TP1 × CP2 | 100/135 | −0.9% | −0.7% | −0.8% |
+| | TP1 × CP2 EP2 | 100/137 | −0.5% | −0.3% | +0.2% |
+| | TP1 × CP4 | 18/30 | −0.8% | −1.2% | −1.0% |
+| | TP1 × CP4 EP2 | 109/135 | −1.1% | −1.2% | −1.2% |
+| | TP1 × CP4 EP4 | 113/137 | −1.2% | −1.6% | −1.8% |
+| Qwen3.5-27B (GDN) | TP1 × CP2 | 116/137 | −5.9% | −5.4% | −5.3% |
+| | TP1 × CP4 | 111/137 | −3.3% | −5.6% | −4.7% |
+| | TP2 × CP2 | 113/131 | −5.2% | −5.6% | −5.5% |
+
+Same-plan layouts (where both planners produce the identical assignment)
+change by 0.0%, which validates the pairing. On the attention classes 85 of
+124 measured CP4 layouts lose remote waves and 119–120 lower their maximum
+rank load; none fragments. The few layouts that got slower are the uniform
+synthetic GRPO cells at CP4 (Qwen3-8B cal-grpo-g4x4 +4–5%), where the
+token-balanced plan trades a lower maximum load for more attention pairs on
+one rank.
+
+**GDN classes.** On Qwen3.5-4B (24 GDN layers of 32) twelve CP4 layouts are
+slower by more than 2% although every one of them has a single-wave plan at
+least as balanced as before. They are GDN-planner decisions reacting to the
+ownership it is handed, not attention-plan regressions. On the largest
+Ellavox group (`g5 no_sharing`, +22.9%) the GDN planner chains one
+12.6k-token sequence across the four ranks under the legacy layout but keeps
+every sequence local under the new one, stacking two on rank 3 (25.3k GDN
+tokens against about 15.8k per rank); its own model predicts the chain saves
+4.18 ms per layer in the first case and 3.97 ms in the second, straddling the
+hand-set 4.0 ms chain gate (`GdnPlannerConfig.cp_chain_min_runtime_delta_ms`),
+while the measured penalty is about 15 ms per GDN layer — the GDN model
+under-prices chaining roughly fourfold. On the 7k-token groups (+6–9%) the
+greedy owner search leaves one rank empty and stacks depth-1 segments on two
+ranks. Neither changes what the layout planner picks (production −3.9% /
+−4.7%) and the refit absorbs the tail; a GDN-planner recalibration (chain gate,
+owner search) is a separate follow-up.
+
+**Expert-parallel classes.** On Qwen3-30B-A3B the gains are 5–7% at CP2 and
+CP4 with one clear regression: the heterogeneous synthetic cell
+`cal-hetero3` at TP1 × CP2 EP2 (+8.0% on its best layout, 8/8 rounds). With
+routed-expert work no longer charged per owned token under expert
+parallelism the search balances attention pairs and hands rank 0 10,752 of
+16,756 tokens (legacy 7,168), and the measurement says the per-owned-token
+work at EP2 (dispatch, permutation, router) is larger than the projections
+alone; a dispatch term for EP is a follow-up. The 35B GDN-MoE class is near
+neutral, as expected where 35 ms layers hide the host work an extra wave
+costs. Two of its cells segfault in the expert grouped GEMM on real routing
+(issue #851) under the re-measurement — `cal-ellavox g2` at CP2 (already
+excluded) and now at CP4 EP2 — and are excluded with that reason.
+On Qwen3.5-27B (48 GDN layers of 64) the class gains 3–6% on every shape;
+its Ellavox g6 CP4 layouts show the same +3–5% GDN owner-assignment
+sensitivity as the 4B class, and `cal-hetero3` at TP2 × CP2 (not admitted)
+the same +8% as on the 30B class. One TP2 × CP2 cell was again lost to an
+NCCL collective timeout in the tensor-parallel group during warm-up.
+
+**Re-certification.** Every table was refit from the current-planner rows of
+the paired campaign plus its unchanged CP1 and TP2 × CP1 cells, with the
+checked-in recipe of its certificate:
+
+| table | cells | pairwise | p95 regret | max regret | change |
+| --- | --- | --- | --- | --- | --- |
+| dense-h2560 (Qwen3.5-4B, Qwen3-4B) | 58 | 98.7% | 1.9% | 2.8% | was 98.1% / 2.9% / 4.2% |
+| dense-attn-h2048 (Qwen3-1.7B) | 42 | 100% | 0.6% | 1.0% | CP exchange term → 0; three-term structure kept |
+| dense-attn-h4096 (Qwen3-8B) | 56 | 99.8% | 1.1% | 1.7% | TP1 × CP4 now fitted directly (99.3%, max 1.7%) |
+| dense-attn-h5120 (Qwen3-14B) | 70 | 98.8% | 0.9% | 2.9% | TP1 × CP4 now fitted directly (94.2%, max 2.9%) |
+| attn-moe-h2048 (Qwen3-30B-A3B) | 67 | 99.9% | 1.0% | 2.2% | was 96.3% / max 2.2%; TP1 × CP4 stays excluded |
+| gdn-moe-h2048 (Qwen3.5-35B-A3B) | 80 | 96.6% | 2.7% | 4.2% | CP4/EP1 synthetic cells re-measured; one more #851 exclusion |
+| dense-gdn-h5120 (Qwen3.5-27B) | 52 | 98.6% | 3.9% | 4.6% | was 97.0% / max 3.4%; least-squares objective (the regret refinement lands on a 5.5% clear miss on the synthetic grpo-g8 CP4 cell, whose best layout changed with the planner) |
+
+The two-stage re-ranker is retired on the shipped tables. Its two drivers
+were the remote wave count and the maximum rank load of the CP plan a layout
+produces; the recalibrated planner builds single-wave, balanced plans for
+nearly every layout, so the re-ranker's gates now fail on both classes that
+shipped it (Qwen3-8B: pairwise 0.82, saving 0.12% of cell time against 1.6%
+planning; Qwen3-14B: no saving against the cheap selection and worse than
+version 1 on one group) while the direct ten-term score ranks their CP4 cells.
+Both classes admit TP1 × CP4 directly. No shipped table carries a `ReRanker`
+any more; the machinery (`ReRanker`, `reranked_shapes`, `plan_structure`, the
+fitter's two-stage gates) is kept for now and its removal is a follow-up. The
+CP4 blind spot itself has largely closed: on Qwen3-1.7B the direct score ranks
+CP4 at 100% (max 1.4%) and TP2 × CP2 at 99.6% (max 4.6%), on Qwen3-8B
+TP2 × CP2 at 99.4% (max 1.5%) — informational; admitting shapes that were not
+admitted before is deferred to a follow-up. The fitter's timed-production
+block now ignores legacy-planner rows, and exported certificates list every
+production term (zero when unfitted) so a certificate equals the shipped
+dictionary.
 
 The re-ranker is affordable because the context-parallel assignment search
 was vectorized (`_evaluate_plans` in `art.megatron.context_parallel.runtime`):
