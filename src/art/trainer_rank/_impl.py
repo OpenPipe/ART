@@ -1289,6 +1289,7 @@ class TrainerRank:
         self._default_slot_ref: LoRASlotRef | None = None
         self._slot_stack: list[LoRASlotRef] = []
         self._checkpoint_slots: dict[str, _CheckpointSlot] = {}
+        self._snapshot_checkpoint_names: set[str] = set()
         self._prepared_lora_exports: dict[str, tuple[str, _PreparedLoraExport]] = {}
         self._checkpoint_prefetches: dict[str, Future[PreparedCheckpoint]] = {}
         self._checkpoint_prefetch_sources: dict[str, str] = {}
@@ -1708,7 +1709,10 @@ class TrainerRank:
         group = _checkpoint._ensure_group(self)
         _checkpoint.raise_distributed(error, "prepare checkpoint", group)
         assert source is not None
-        _checkpoint.load_checkpoint(self, source, checkpoint)
+        if checkpoint in self._snapshot_checkpoint_names:
+            _checkpoint.load_checkpoint(self, source, checkpoint, forward_only=True)
+        else:
+            _checkpoint.load_checkpoint(self, source, checkpoint)
 
     def _ensure_checkpoint_slots(self, checkpoints: Iterable[str]) -> None:
         from . import _checkpoint

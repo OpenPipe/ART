@@ -1008,6 +1008,61 @@ def test_loaded_custom_payload_is_owned_after_source_removal(
 
 
 @pytest.mark.skipif(find_spec("megatron") is None, reason="requires Megatron")
+@pytest.mark.parametrize("prepared", [False, True])
+@pytest.mark.parametrize("register_before_eviction", [False, True])
+def test_evicted_snapshot_reloads_frozen_without_changing_training_loads(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    prepared: bool,
+    register_before_eviction: bool,
+) -> None:
+    from art.trainer_rank import _checkpoint
+
+    trainer, api = _real_lora_trainer()
+    head, temperature, _buffer = _register_custom_tensors(api)
+    _step_custom_tensors(trainer, head, temperature, monkeypatch)
+    saved = tmp_path / "saved"
+    trainer.save_checkpoint(str(saved), "student")
+    snapshot = "student:step0"
+    if prepared:
+        _checkpoint.snapshot_prepared_checkpoint(
+            trainer, prepare_checkpoint(str(saved)), snapshot
+        )
+    else:
+        trainer.snapshot_checkpoint("student", snapshot)
+    if register_before_eviction:
+        trainer._register_checkpoint_prefetch(snapshot, str(saved)).result()
+    trainer._discard_snapshot_checkpoint(snapshot)
+    if not register_before_eviction:
+        trainer._register_checkpoint_prefetch(snapshot, str(saved)).result()
+    trainer._ensure_checkpoint_slots((snapshot,))
+
+    slot = trainer._checkpoint_slots[snapshot]
+    assert slot.snapshot
+    assert slot.params and all(not parameter.requires_grad for parameter in slot.params)
+    assert slot.optimizer is None
+    frozen = api.parameter(
+        "temperature", lambda: torch.tensor(0.5), checkpoint=snapshot
+    )
+    torch.testing.assert_close(frozen, temperature)
+    assert not frozen.requires_grad
+    with pytest.raises(TrainerRankSlotStateError, match="forward-only"):
+        trainer.optim_step(
+            params=AdamParams(learning_rate=1e-3), checkpoints=[snapshot]
+        )
+
+    for name in ("ordinary", "another:step0"):
+        trainer.load_checkpoint(MaterializedCheckpoint(name, str(saved)))
+        loaded = trainer._checkpoint_slots[name]
+        assert not loaded.snapshot
+        assert all(parameter.requires_grad for parameter in loaded.params)
+        assert loaded.optimizer is not None
+        assert api.parameter(
+            "temperature", lambda: torch.tensor(0.5), checkpoint=name
+        ).requires_grad
+
+
+@pytest.mark.skipif(find_spec("megatron") is None, reason="requires Megatron")
 def test_prepared_forward_snapshot_restores_frozen_custom_tensors(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
