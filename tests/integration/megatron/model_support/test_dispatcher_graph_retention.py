@@ -39,7 +39,9 @@ def _dispatcher() -> Any:
     # only CUDA/distributed initialization and metadata transfers for this CPU test.
     dispatcher: Any = object.__new__(MoEAlltoAllTokenDispatcher)
     dispatcher.config = SimpleNamespace(
-        moe_router_padding_for_quantization=False, moe_permute_fusion=False
+        moe_router_padding_for_quantization=False,
+        moe_permute_fusion=False,
+        cuda_graph_impl="none",
     )
     dispatcher.shared_experts = None
     dispatcher.drop_and_pad = False
@@ -62,10 +64,7 @@ class _RouterLayer(torch.nn.Module):
         dispatcher = self.token_dispatcher
         routed, routed_probs = dispatcher.dispatch_preprocess(value, routing, probs)
         transformed = routed.tanh() * routed_probs[:, None]
-        merged = torch.zeros_like(value.reshape(-1, 8)).index_add(
-            0, dispatcher.reversed_local_input_permutation_mapping, transformed
-        )
-        return value + 0.2 * merged.reshape_as(value)
+        return value + 0.2 * dispatcher.combine_postprocess(transformed)
 
 
 def _run_checkpointed_router(model, *, install_before_backward=False):
@@ -106,6 +105,9 @@ def _run_checkpointed_router(model, *, install_before_backward=False):
         cache_sizes.append(dispatcher.probs.numel())
         assert dispatcher.probs.dtype == initial.dtype
         assert dispatcher.probs.device == initial.device
+        if "combine_postprocess" in vars(dispatcher):
+            assert dispatcher.routing_map is None
+            assert dispatcher.reversed_local_input_permutation_mapping is None
         dispatcher.probs = None
     gc.collect()
     assert all(reference() is None for reference in inputs)
@@ -199,8 +201,10 @@ def test_dispatcher_adaptation_is_instance_scoped_and_collectable(cpu_checkpoint
     assert cached() is None
     assert target.token_dispatcher.probs.numel() == 0
     adapted = target.token_dispatcher.dispatch_preprocess
+    adapted_combine = target.token_dispatcher.combine_postprocess
     _configure_moe_dispatcher_caches([model, model])
     assert target.token_dispatcher.dispatch_preprocess is adapted
+    assert target.token_dispatcher.combine_postprocess is adapted_combine
     assert MoEAlltoAllTokenDispatcher.dispatch_preprocess is original
     assert untouched.token_dispatcher.dispatch_preprocess.__func__ is original
     assert subclass.dispatch_preprocess.__func__ is original
@@ -213,7 +217,7 @@ def test_dispatcher_adaptation_is_instance_scoped_and_collectable(cpu_checkpoint
     # Persistent callables must not keep the dispatcher alive once its owner
     # and any pending graphs have gone away.
     reference = weakref.ref(target.token_dispatcher)
-    del adapted, target, owners, model, owner, trainer, runtime
+    del adapted, adapted_combine, target, owners, model, owner, trainer, runtime
     gc.collect()
     assert reference() is None
 
@@ -232,13 +236,17 @@ def test_dispatcher_adaptation_survives_serialization(
         pickle.loads(pickle.dumps(model)) if round_trip == "pickle" else deepcopy(model)
     )
     for layer in clone:
-        dispatcher = layer.token_dispatcher
+        dispatcher: Any = layer.token_dispatcher
         wrapper = dispatcher.dispatch_preprocess
         assert isinstance(wrapper, partial)
         assert wrapper.args[0] is dispatcher
+        combine = dispatcher.combine_postprocess
+        assert isinstance(combine, partial)
+        assert combine.args[0] is dispatcher
         assert all(dispatcher is not original.token_dispatcher for original in model)
         _configure_moe_dispatcher_caches([clone])
         assert dispatcher.dispatch_preprocess is wrapper
+        assert dispatcher.combine_postprocess is combine
     backend = CompileCounterWithBackend("aot_eager") if compiled else None
     if backend is not None:
         clone = torch.nn.ModuleList(
@@ -258,3 +266,113 @@ def test_dispatcher_adaptation_survives_serialization(
             assert backend.frame_count > 0
     finally:
         torch.compiler.reset()
+
+
+@pytest.mark.parametrize("grad_enabled", [False, True])
+def test_dispatcher_maps_outlive_cache_only_when_backward_needs_them(grad_enabled):
+    layer = _RouterLayer()
+    _configure_moe_dispatcher_caches([layer])
+    dispatcher = layer.token_dispatcher
+    value = torch.randn(11, 8, dtype=torch.float64, requires_grad=True)
+    probs = torch.randn(11, 4, dtype=torch.float64, requires_grad=True)
+    routing = torch.zeros_like(probs, dtype=torch.bool)
+    routing.scatter_(1, probs.topk(2, dim=-1).indices, True)
+    routing_ref = weakref.ref(routing)
+    with torch.set_grad_enabled(grad_enabled):
+        routed, weights = dispatcher.dispatch_preprocess(value, routing, probs)
+        index_ref = weakref.ref(dispatcher.reversed_local_input_permutation_mapping)
+        output = dispatcher.combine_postprocess(routed * weights[:, None])
+    del routing, routed, weights
+    assert dispatcher.routing_map is None
+    assert dispatcher.reversed_local_input_permutation_mapping is None
+    assert routing_ref() is None
+    # Eager autograd owns the index independently; no-grad checkpoint forwards
+    # release it immediately instead of caching every layer's final map.
+    assert (index_ref() is not None) is grad_enabled
+    if grad_enabled:
+        output.square().sum().backward()
+        assert value.grad is not None and torch.isfinite(value.grad).all()
+        assert probs.grad is not None and torch.isfinite(probs.grad).all()
+        assert index_ref() is None
+
+
+@pytest.mark.parametrize("compiled", [False, True])
+@pytest.mark.parametrize("checkpointed", [False, True])
+def test_dispatcher_maps_allow_outstanding_forwards_and_repeated_backward(
+    cpu_checkpoint_rng, compiled, checkpointed
+):
+    torch.manual_seed(848)
+    reference = torch.nn.Sequential(_RouterLayer(), _RouterLayer())
+    adapted = deepcopy(reference)
+    _configure_moe_dispatcher_caches([adapted])
+    if compiled:
+        reference = cast(torch.nn.Module, torch.compile(reference, backend="aot_eager"))
+        adapted = cast(torch.nn.Module, torch.compile(adapted, backend="aot_eager"))
+
+    def run(model):
+        inputs = [
+            torch.linspace(-1 + offset, 1 + offset, 88, dtype=torch.float64)
+            .reshape(1, 11, 8)
+            .requires_grad_()
+            for offset in (0, 0.3)
+        ]
+        outputs = [
+            mcore_random.CheckpointFunction.apply(model, False, value)
+            if checkpointed
+            else model(value)
+            for value in inputs
+        ]
+        losses = [output.square().sum() for output in outputs]
+        losses[1].backward(retain_graph=True)
+        losses[0].backward()
+        losses[1].backward()
+        gradients = []
+        for tensor in [*inputs, *model.parameters()]:
+            assert tensor.grad is not None
+            gradients.append(tensor.grad.clone())
+        return [output.detach() for output in outputs], gradients
+
+    try:
+        expected_outputs, expected_grads = run(reference)
+        outputs, grads = run(adapted)
+        for actual, expected in zip(
+            [*outputs, *grads], [*expected_outputs, *expected_grads], strict=True
+        ):
+            assert torch.equal(actual, expected)
+        for module in adapted.modules():
+            if isinstance(module, _RouterLayer):
+                assert module.token_dispatcher.routing_map is None
+                assert (
+                    module.token_dispatcher.reversed_local_input_permutation_mapping
+                    is None
+                )
+    finally:
+        torch.compiler.reset()
+
+
+@pytest.mark.parametrize("cuda_graph_impl", ["local", "transformer_engine"])
+def test_dispatcher_cuda_graph_maps_are_preserved(cuda_graph_impl):
+    layer = _RouterLayer()
+    dispatcher = layer.token_dispatcher
+    dispatcher.config.cuda_graph_impl = cuda_graph_impl
+    original_combine = dispatcher.combine_postprocess.__func__
+    _configure_moe_dispatcher_caches([layer])
+    assert dispatcher.combine_postprocess.__func__ is original_combine
+    output = layer(torch.randn(1, 11, 8, dtype=torch.float64))
+    output.sum().backward()
+    assert dispatcher.probs.numel() == 0  # Existing #858 behavior is unchanged.
+    assert dispatcher.routing_map.shape == (11, 4)
+    assert dispatcher.reversed_local_input_permutation_mapping.shape == (22,)
+
+
+def test_dispatcher_custom_combine_is_preserved():
+    layer = _RouterLayer()
+    dispatcher = layer.token_dispatcher
+    combine = dispatcher.combine_postprocess
+    dispatcher.combine_postprocess = combine
+    _configure_moe_dispatcher_caches([layer])
+    assert dispatcher.combine_postprocess is combine
+    layer(torch.randn(1, 11, 8, dtype=torch.float64)).sum().backward()
+    assert dispatcher.probs.numel() == 0
+    assert dispatcher.routing_map is not None
+    assert dispatcher.reversed_local_input_permutation_mapping is not None
