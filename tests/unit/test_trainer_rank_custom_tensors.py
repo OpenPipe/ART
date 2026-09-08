@@ -166,6 +166,14 @@ def _trainer(*names: str) -> tuple[TrainerRank, _CustomTensorAPI]:
     return trainer, cast(_CustomTensorAPI, trainer)
 
 
+def test_custom_head_uses_model_hidden_size_before_forward() -> None:
+    trainer, api = _trainer("student")
+    weight = api.parameter(
+        "head", lambda: torch.zeros(trainer.hidden_size), checkpoint="student"
+    )
+    assert weight.shape == (4,)
+
+
 def _distributed_custom_registration_worker(
     rank: int,
     world_size: int,

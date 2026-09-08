@@ -72,6 +72,11 @@ class TrainerRank(_impl.TrainerRank):
     def __init__(self, runtime: TrainingRuntime) -> None:
         super().__init__(runtime)
 
+    @property
+    def hidden_size(self) -> int:
+        """Width of the returned hidden states."""
+        return self._hidden_size
+
     def zero_grad(self) -> None:
         super().zero_grad()
 
