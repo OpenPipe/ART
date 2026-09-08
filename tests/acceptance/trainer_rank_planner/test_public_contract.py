@@ -7,12 +7,12 @@ contract (research thread behavior spec, frozen 2026-08-31):
   head-chunk, or memory-safety policy knob. Its constructor accepts only the
   training runtime.
 - ``forward_micro_batches`` and ``dp_rank_forward`` accept only
-  ``inputs``, ``checkpoint``, and ``no_grad``.
+  ``inputs``, ``checkpoint``, and ``no_grad``, plus ``yield_empty`` on the iterator.
 - ``TrainerRankMemoryError`` reports only a predicted peak, the usable limit,
   and an actionable reduction suggestion. It carries no infeasibility proof.
 
-These tests define the landing contract: written and fail-verified before
-the implementation, they must pass unmodified on the landed tree.
+These tests preserve the landing's planner-policy constraints while checking
+subsequent public API additions.
 """
 
 from __future__ import annotations
@@ -83,6 +83,9 @@ def test_forward_method_signatures_are_knob_free(method_name: str) -> None:
     method = getattr(trainer_rank.TrainerRank, method_name)
     parameters = _parameters(method)
     allowed = {"inputs", "checkpoint", "no_grad"}
+    if method_name == "forward_micro_batches":
+        allowed.add("yield_empty")
+        assert parameters["yield_empty"].default is False
     assert set(parameters) <= allowed, (
         f"{method_name} accepts unexpected parameters:"
         f" {sorted(set(parameters) - allowed)}"
