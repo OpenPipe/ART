@@ -625,6 +625,10 @@ class Gemma4MoeHandler(_Gemma4TokenizerMixin, DefaultMoeHandler):
         )
 
         target_set = set(target_modules)
+        # Per-expert checkpoints name the three projections independently;
+        # Megatron trains the routed experts through its fused LoRA wrapper.
+        if {"gate_proj", "up_proj", "down_proj"} <= target_set:
+            target_set.add("experts")
         for chunk in model_chunks:
             for module_name, module in chunk.named_modules():
                 if not isinstance(module, TransformerLayer):
