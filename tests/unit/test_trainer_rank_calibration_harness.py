@@ -115,3 +115,103 @@ def test_qwen3_ellavox_cells_use_the_qwen3_corpus() -> None:
     assert set(driver.ELLAVOX_CORPORA) == {"qwen35", "qwen3"}
     for path, digest in driver.ELLAVOX_CORPORA.values():
         assert path.name.startswith("_trainer_rank_ellavox_") and len(digest) == 64
+
+
+def test_legacy_planner_variant_restores_the_pre_854_constants() -> None:
+    """The paired A/B times every layout under the current CP planner and the
+    legacy constants (no host cost per remote stage, a fetch priced at about
+    14 GB/s, attention-only balance); the legacy config differs in exactly
+    those fields."""
+
+    pytest.importorskip("megatron.core")
+    from art.megatron.context_parallel.types import ContextParallelConfig
+
+    current = ContextParallelConfig(planner_owned_token_ms=0.0033)
+    legacy = driver._legacy_planner_config(current)
+    assert legacy.planner_remote_stage_host_ms == 0.0
+    assert (
+        legacy.planner_fetch_token_ms == legacy.planner_reduce_token_ms == 0.000287151
+    )
+    assert legacy.planner_owned_token_ms == 0.0
+    assert current.planner_remote_stage_host_ms > 0.0
+    assert current.planner_fetch_token_ms < legacy.planner_fetch_token_ms
+    changed = {
+        name
+        for name in current.__dataclass_fields__
+        if getattr(current, name) != getattr(legacy, name)
+    }
+    assert changed == {
+        "planner_remote_stage_host_ms",
+        "planner_fetch_token_ms",
+        "planner_reduce_token_ms",
+        "planner_owned_token_ms",
+    }
+    driver._set_planner_variant("legacy")
+    assert driver._planner_variant == "legacy"
+    driver._set_planner_variant("current")
+    with pytest.raises(ValueError):
+        driver._set_planner_variant("other")
+
+
+def test_legacy_planner_variant_restores_the_pre_854_search(monkeypatch) -> None:
+    """The legacy arm is main's planner, not a constants-only ablation: with the
+    constants it restores the any-rank improving move (ownership may fragment),
+    and the current arm keeps the contiguous-only search."""
+
+    pytest.importorskip("megatron.core")  # the CP runtime needs Megatron-Core
+    from art.megatron.context_parallel import runtime
+    from art.megatron.training import microbatches
+
+    current_move = runtime._best_improving_move
+    monkeypatch.setattr(
+        microbatches,
+        "_context_parallel_config_for_provider",
+        microbatches._context_parallel_config_for_provider,
+    )
+    monkeypatch.setattr(runtime, "_best_improving_move", current_move)
+    monkeypatch.setattr(driver, "_CURRENT_BEST_IMPROVING_MOVE", None)
+    driver._install_planner_ab()
+    try:
+        driver._set_planner_variant("legacy")
+        assert runtime._best_improving_move is driver._legacy_best_improving_move
+        driver._set_planner_variant("current")
+        assert runtime._best_improving_move is current_move
+    finally:
+        driver._set_planner_variant("current")
+
+
+def test_planner_variant_switch_clears_the_registered_layout_cache(monkeypatch) -> None:
+    """The production selection ("automatic") depends on the planner wherever a
+    re-ranker prices plan structure, but the rank's layout cache is not keyed by
+    the planner: a variant switch must drop it so the legacy arm times main's
+    own choice rather than the current planner's."""
+
+    pytest.importorskip("megatron.core")
+    from collections import OrderedDict
+    import threading
+    from types import SimpleNamespace
+
+    from art.megatron.context_parallel import runtime
+    from art.megatron.training import microbatches
+
+    monkeypatch.setattr(
+        microbatches,
+        "_context_parallel_config_for_provider",
+        microbatches._context_parallel_config_for_provider,
+    )
+    monkeypatch.setattr(runtime, "_best_improving_move", runtime._best_improving_move)
+    monkeypatch.setattr(driver, "_CURRENT_BEST_IMPROVING_MOVE", None)
+    monkeypatch.setattr(driver, "_PLANNER_AB_RANKS", [])
+    rank = SimpleNamespace(
+        _layout_cache_lock=threading.Lock(),
+        _layout_selection_cache=OrderedDict({"key": "layout"}),
+    )
+    driver._install_planner_ab(rank)
+    try:
+        driver._set_planner_variant("legacy")
+        assert not rank._layout_selection_cache
+        rank._layout_selection_cache["key"] = "legacy layout"
+        driver._set_planner_variant("current")
+        assert not rank._layout_selection_cache
+    finally:
+        driver._set_planner_variant("current")

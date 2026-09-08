@@ -533,19 +533,33 @@ def _best_improving_move(
     if not candidate_chunks:
         return None
 
+    # Only boundary chunks move, and only to the rank owning the neighbouring
+    # chunk on that side, so every rank keeps a contiguous token range: the
+    # executor's per-range overheads stay minimal and models that chain state
+    # along the sequence (GDN) keep one hop per boundary.
     moves: list[tuple[int, ...]] = []
+    seen: set[tuple[int, ...]] = set()
     for chunk_index in candidate_chunks:
-        for dst_rank in range(cp_size):
-            if dst_rank == slow_rank:
-                continue
+        neighbours = []
+        if chunk_index > 0 and int(current_owners[chunk_index - 1]) != slow_rank:
+            neighbours.append(int(current_owners[chunk_index - 1]))
+        if (
+            chunk_index + 1 < len(current_owners)
+            and int(current_owners[chunk_index + 1]) != slow_rank
+        ):
+            neighbours.append(int(current_owners[chunk_index + 1]))
+        for dst_rank in neighbours:
             candidate = list(current_owners)
             candidate[chunk_index] = dst_rank
             candidate_owners = tuple(candidate)
+            if candidate_owners in seen:
+                continue
             if (
                 len(candidate_owners) >= cp_size
                 and len(set(candidate_owners)) != cp_size
             ):
                 continue
+            seen.add(candidate_owners)
             moves.append(candidate_owners)
     evaluations = evaluate_candidates(
         owners_list=moves,
@@ -1031,6 +1045,7 @@ def _stage_cost_ms(
         )
     )
     remote_underfill_ms = 0.0
+    remote_host_ms = 0.0 if local else float(config.planner_remote_stage_host_ms)
     if not local and (pair_count > 0 or q_tokens > 0 or k_tokens > 0):
         token_shortfall = max(
             int(config.planner_remote_stage_token_floor) - min(q_tokens, k_tokens),
@@ -1061,6 +1076,7 @@ def _stage_cost_ms(
         + float(q_range_count + k_range_count)
         * float(config.planner_interval_overhead_ms)
         + remote_underfill_ms
+        + remote_host_ms
     )
 
 
@@ -1148,6 +1164,7 @@ def _stage_cost_ms_array(
         )
     )
     remote_underfill_ms = np.zeros_like(pair_count)
+    remote_host_ms = 0.0 if local else float(config.planner_remote_stage_host_ms)
     if not local:
         token_floor = int(config.planner_remote_stage_token_floor)
         pair_floor = int(config.planner_remote_stage_pair_floor)
@@ -1175,6 +1192,7 @@ def _stage_cost_ms_array(
         + q_tokens * float(config.planner_merge_q_token_ms)
         + (q_range_count + k_range_count) * float(config.planner_interval_overhead_ms)
         + remote_underfill_ms
+        + remote_host_ms
     )
 
 
@@ -1376,6 +1394,12 @@ def _evaluate_plans(
         remote_reduce_ms=_comm_cost_ms_array(backward=True, **comm_costs),
         active=active,
     )
+    # The rest of the layer's work scales with the tokens a rank owns
+    # (backward about twice the forward).
+    owned_tokens = owned_f @ lengths.astype(np.float64)
+    owned_ms = owned_tokens * float(config.planner_owned_token_ms)
+    forward_ms = forward_ms + owned_ms / 3.0
+    backward_ms = backward_ms + owned_ms * (2.0 / 3.0)
     rank_scores = forward_ms + backward_ms
     return [
         {
@@ -1464,8 +1488,20 @@ def _search_generic_chunk_assignment(
             wave_assignment=wave_assignment,
         )[0]
 
+    # The contiguous start balances the whole layer per chunk: attention pairs
+    # at the local pair cost (forward + backward) plus the per-token compute
+    # the chunk's tokens bring with them.
+    pair_ms = float(config.planner_local_pair_ms) + float(
+        config.planner_local_backward_pair_ms
+    )
+    chunk_weights = [
+        float(weight) * pair_ms + float(length) * float(config.planner_owned_token_ms)
+        for weight, length in zip(
+            q_weights, program.chunk_lengths.tolist(), strict=True
+        )
+    ]
     contiguous_owners = _contiguous_chunk_assignment(
-        q_weights=q_weights,
+        q_weights=chunk_weights,
         cp_size=cp_size,
     )
     if not contiguous_owners:
@@ -1499,7 +1535,7 @@ def _search_generic_chunk_assignment(
                 current_eval=current_eval,
                 wave_assignment=wave_assignment,
                 cp_size=cp_size,
-                q_weights=q_weights,
+                q_weights=chunk_weights,
                 candidate_limit=min(
                     int(config.planner_candidate_chunk_limit),
                     _CP4_SEARCH_PROBE_CANDIDATE_LIMIT,
@@ -1522,7 +1558,7 @@ def _search_generic_chunk_assignment(
                 current_eval=current_eval,
                 wave_assignment=wave_assignment,
                 cp_size=cp_size,
-                q_weights=q_weights,
+                q_weights=chunk_weights,
                 candidate_limit=int(config.planner_candidate_chunk_limit),
                 evaluate_candidates=_evaluate_candidates,
             )

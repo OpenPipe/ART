@@ -2094,6 +2094,136 @@ def _calibration_requests(
 CALIBRATION_CORPUS_BY_CELL = {"cal-ellavox": "qwen35", "cal-ellavox-qwen3": "qwen3"}
 
 
+# Paired planner A/B (--planner-ab): every layout is timed under the current
+# CP planner configuration and under the legacy constants (issue #854: no host
+# cost per remote stage, a fetch priced at ~14 GB/s, attention-only balance)
+# in alternating rounds on the same node, so the comparison carries no
+# node-to-node drift. The variant is switched by patching the config builder
+# the runtime calls for every micro-batch; the planning-bundle cache keys on
+# the config, so the two variants never share plans.
+_PLANNER_VARIANTS = ("current", "legacy")
+_planner_variant = "current"
+
+
+def _legacy_planner_config(config: Any) -> Any:
+    from dataclasses import replace
+
+    return replace(
+        config,
+        planner_remote_stage_host_ms=0.0,
+        planner_fetch_token_ms=0.000287151,
+        planner_reduce_token_ms=0.000287151,
+        planner_owned_token_ms=0.0,
+    )
+
+
+# The pre-#854 assignment search (main before the recalibration), verbatim: a
+# slow rank's chunk may move to any other rank, so ownership can fragment. The
+# legacy arm restores it together with the constants, so the arm is main's
+# planner and not a constants-only ablation.
+def _legacy_best_improving_move(
+    *,
+    current_owners: tuple[int, ...],
+    current_eval: dict[str, Any],
+    wave_assignment: tuple[int, ...],
+    cp_size: int,
+    q_weights: list[float],
+    candidate_limit: int,
+    evaluate_candidates: Any,
+) -> tuple[tuple[int, ...], dict[str, Any]] | None:
+    from art.megatron.context_parallel.runtime import _candidate_chunk_indices
+
+    slow_rank = int(
+        max(
+            range(cp_size),
+            key=lambda rank: cast(tuple[float, ...], current_eval["rank_scores"])[rank],
+        )
+    )
+    candidate_chunks = _candidate_chunk_indices(
+        owners=current_owners,
+        target_rank=slow_rank,
+        q_weights=q_weights,
+        limit=int(candidate_limit),
+    )
+    if not candidate_chunks:
+        return None
+
+    moves: list[tuple[int, ...]] = []
+    for chunk_index in candidate_chunks:
+        for dst_rank in range(cp_size):
+            if dst_rank == slow_rank:
+                continue
+            candidate = list(current_owners)
+            candidate[chunk_index] = dst_rank
+            candidate_owners = tuple(candidate)
+            if (
+                len(candidate_owners) >= cp_size
+                and len(set(candidate_owners)) != cp_size
+            ):
+                continue
+            moves.append(candidate_owners)
+    evaluations = evaluate_candidates(
+        owners_list=moves,
+        wave_assignment=wave_assignment,
+    )
+    best_move: tuple[tuple[int, ...], dict[str, Any]] | None = None
+    for candidate_owners, candidate_eval in zip(moves, evaluations, strict=True):
+        if float(candidate_eval["score"]) + 1e-9 >= float(current_eval["score"]):
+            continue
+        if best_move is None or float(candidate_eval["score"]) + 1e-9 < float(
+            best_move[1]["score"]
+        ):
+            best_move = (candidate_owners, candidate_eval)
+    return best_move
+
+
+_CURRENT_BEST_IMPROVING_MOVE: Any = None
+# Ranks whose layout-selection cache must not survive a variant switch: the
+# cache is keyed by content, topology and coefficients, not by the CP planner,
+# and the production selection (the "automatic" candidate) depends on the
+# planner wherever a re-ranker prices plan structure.
+_PLANNER_AB_RANKS: list[Any] = []
+
+
+def _install_planner_ab(rank: Any = None) -> None:
+    global _CURRENT_BEST_IMPROVING_MOVE
+    from art.megatron.context_parallel import runtime
+    from art.megatron.training import microbatches
+
+    original = microbatches._context_parallel_config_for_provider
+    _CURRENT_BEST_IMPROVING_MOVE = runtime._best_improving_move
+    if rank is not None and rank not in _PLANNER_AB_RANKS:
+        _PLANNER_AB_RANKS.append(rank)
+
+    def variant_config(provider: Any, device: Any, handler: Any) -> Any:
+        config = original(provider, device, handler)
+        return (
+            _legacy_planner_config(config) if _planner_variant == "legacy" else config
+        )
+
+    microbatches._context_parallel_config_for_provider = variant_config
+
+
+def _set_planner_variant(variant: str) -> None:
+    global _planner_variant
+    if variant not in _PLANNER_VARIANTS:
+        raise ValueError(f"unknown planner variant {variant!r}")
+    _planner_variant = variant
+    # The search algorithm follows the variant (the config builder is patched
+    # by _install_planner_ab; plans are cached per config, never across arms).
+    from art.megatron.context_parallel import runtime
+
+    if _CURRENT_BEST_IMPROVING_MOVE is not None:
+        runtime._best_improving_move = (
+            _legacy_best_improving_move
+            if variant == "legacy"
+            else _CURRENT_BEST_IMPROVING_MOVE
+        )
+    for rank in _PLANNER_AB_RANKS:
+        with rank._layout_cache_lock:
+            rank._layout_selection_cache.clear()
+
+
 def phase_cost_calibrate(
     *,
     cell: str,
@@ -2101,6 +2231,7 @@ def phase_cost_calibrate(
     layers: int,
     group: int,
     repeat: int,
+    planner_ab: bool = False,
     evidence: str,
 ) -> None:
     """Time every mandatory candidate layout of one cell (GPU).
@@ -2228,6 +2359,10 @@ def phase_cost_calibrate(
         rows_for_plan = tuple(
             r.input_tokens.reshape(-1).to(torch.long) for r in requests
         )
+        if planner_ab:
+            # Installed before the candidate rows so the legacy plan structure
+            # recorded next to the current one is the legacy planner's.
+            _install_planner_ab(rank)
         for candidate in candidates:
             features = layout_features(candidate.layout)
             current_us = current_score(features)
@@ -2240,6 +2375,22 @@ def phase_cost_calibrate(
                 )
             else:
                 wave_count, max_rank_tokens = 0, int(candidate.layout.packed_tokens)
+            # The current planner's cost only; the legacy arm below is timed
+            # separately so the paired run does not inflate it.
+            summary_ms = (time.perf_counter() - started) * 1_000.0
+            legacy_plan: dict[str, float] | None = None
+            if planner_ab and facts.cp_size > 1:
+                _set_planner_variant("legacy")
+                legacy_started = time.perf_counter()
+                legacy_waves, legacy_max = rank._plan_structure(
+                    rows_for_plan, tree, candidate.layout
+                )
+                legacy_plan = {
+                    "wave_count": int(legacy_waves),
+                    "max_rank_tokens": int(legacy_max),
+                    "summary_ms": (time.perf_counter() - legacy_started) * 1_000.0,
+                }
+                _set_planner_variant("current")
             candidate_rows.append(
                 {
                     "label": candidate.labels[0],
@@ -2249,8 +2400,9 @@ def phase_cost_calibrate(
                     "cp_plan": {
                         "wave_count": int(wave_count),
                         "max_rank_tokens": int(max_rank_tokens),
-                        "summary_ms": (time.perf_counter() - started) * 1_000.0,
+                        "summary_ms": summary_ms,
                     },
+                    **({"cp_plan_legacy": legacy_plan} if legacy_plan else {}),
                     # The version-1 score: the fallback the two-stage
                     # certification must not regress against.
                     "fallback_work": int(
@@ -2274,20 +2426,34 @@ def phase_cost_calibrate(
             tuple(r.input_tokens.reshape(-1).to(torch.long) for r in requests)
         )
         automatic_features = layout_features(automatic_layout)
-        matching = [
-            row["label"]
-            for row in candidate_rows
-            if row["features"] == automatic_features.as_dict()
-        ]
-        candidate_rows.append(
-            {
-                "label": "automatic",
-                "labels": ["automatic"],
-                "features": automatic_features.as_dict(),
-                "current_score_us": current_score(automatic_features),
-                "matches": matching,
-            }
-        )
+
+        def _matching(features: Any) -> list[str]:
+            return [
+                row["label"]
+                for row in candidate_rows
+                if row["features"] == features.as_dict()
+            ]
+
+        automatic_row: dict[str, Any] = {
+            "label": "automatic",
+            "labels": ["automatic"],
+            "features": automatic_features.as_dict(),
+            "current_score_us": current_score(automatic_features),
+            "matches": _matching(automatic_features),
+        }
+        if planner_ab:
+            # The legacy arm's production selection is made under the legacy
+            # planner (the variant switch clears the layout cache), so its
+            # timed rows are main's actual choice, not the current one's.
+            _set_planner_variant("legacy")
+            _tree, legacy_layout = rank._select_group_layout(
+                tuple(r.input_tokens.reshape(-1).to(torch.long) for r in requests)
+            )
+            _set_planner_variant("current")
+            legacy_features = layout_features(legacy_layout)
+            automatic_row["features_legacy"] = legacy_features.as_dict()
+            automatic_row["matches_legacy"] = _matching(legacy_features)
+        candidate_rows.append(automatic_row)
         logical_tokens = sum(int(r.input_tokens.numel()) for r in requests)
         base = {
             "schema": CALIBRATION_SCHEMA,
@@ -2371,43 +2537,54 @@ def phase_cost_calibrate(
             _anchor_env("automatic")
             return result
 
-        # Warm-ups per candidate until compile-free (bounded).
-        live: list[str] = []
+        # Warm-ups per candidate (and planner variant) until compile-free
+        # (bounded): a different CP plan can mean new kernel shapes.
+        variants = _PLANNER_VARIANTS if planner_ab else ("current",)
+        live: list[tuple[str, str]] = []
         for candidate in candidate_rows:
             label = str(candidate["label"])
-            for attempt in range(CALIBRATION_MAX_WARMUPS):
-                result = run(label)
-                emit(
-                    {
-                        **base,
-                        "record_type": "calibration_sample",
-                        "role": "warmup",
-                        "candidate_label": label,
-                        "attempt": attempt,
-                        **result,
-                    }
-                )
-                if result.get("admission_failed"):
-                    break
-                if _warmup_complete(attempt, cast(list, result["compile_statuses"])):
-                    live.append(label)
-                    break
-            else:
-                emit(
-                    {
-                        **base,
-                        "record_type": "calibration_note",
-                        "candidate_label": label,
-                        "note": "never compile-free within warm-up budget; excluded",
-                    }
-                )
-        # Measured rounds in rotating order.
+            for variant in variants:
+                _set_planner_variant(variant)
+                for attempt in range(CALIBRATION_MAX_WARMUPS):
+                    result = run(label)
+                    emit(
+                        {
+                            **base,
+                            "record_type": "calibration_sample",
+                            "role": "warmup",
+                            "candidate_label": label,
+                            "planner_variant": variant,
+                            "attempt": attempt,
+                            **result,
+                        }
+                    )
+                    if result.get("admission_failed"):
+                        break
+                    if _warmup_complete(
+                        attempt, cast(list, result["compile_statuses"])
+                    ):
+                        live.append((label, variant))
+                        break
+                else:
+                    emit(
+                        {
+                            **base,
+                            "record_type": "calibration_note",
+                            "candidate_label": label,
+                            "planner_variant": variant,
+                            "note": "never compile-free within warm-up budget; excluded",
+                        }
+                    )
+        _set_planner_variant("current")
+        # Measured rounds in rotating order; with --planner-ab the two variants
+        # of every layout alternate within each round.
         for round_index in range(repeat):
             order = (
                 live[round_index % max(1, len(live)) :]
                 + live[: round_index % max(1, len(live))]
             )
-            for label in order:
+            for label, variant in order:
+                _set_planner_variant(variant)
                 result = run(label)
                 emit(
                     {
@@ -2415,10 +2592,12 @@ def phase_cost_calibrate(
                         "record_type": "calibration_sample",
                         "role": "measured",
                         "candidate_label": label,
+                        "planner_variant": variant,
                         "round": round_index,
                         **result,
                     }
                 )
+        _set_planner_variant("current")
         if world_rank == 0:
             measured = [
                 r
@@ -2431,7 +2610,11 @@ def phase_cost_calibrate(
                 if not r.get("admission_failed") and all(
                     s == "none" for s in cast(list, r["compile_statuses"])
                 ):
-                    summary.setdefault(str(r["candidate_label"]), []).append(
+                    variant = str(r.get("planner_variant", "current"))
+                    key = str(r["candidate_label"]) + (
+                        f"@{variant}" if variant != "current" else ""
+                    )
+                    summary.setdefault(key, []).append(
                         float(cast(float, r["ms_max_rank"]))
                     )
             import statistics
@@ -2471,6 +2654,14 @@ def main() -> None:
     )
     parser.add_argument("--evidence", default="")
     parser.add_argument("--repeat", type=int, default=30)
+    parser.add_argument(
+        "--planner-ab",
+        action="store_true",
+        help=(
+            "cost-calibrate: time every layout under the current and the legacy CP "
+            "planner configuration in alternating rounds (paired, same node)"
+        ),
+    )
     parser.add_argument(
         "--pressure",
         default="cap",
@@ -2549,6 +2740,7 @@ def main() -> None:
             group=arguments.group,
             repeat=arguments.repeat,
             evidence=arguments.evidence,
+            planner_ab=arguments.planner_ab,
         )
     else:
         if not arguments.evidence:

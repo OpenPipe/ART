@@ -140,6 +140,7 @@ def production_regret(
                 row.get("record_type") == "calibration_sample"
                 and row.get("role") == "measured"
                 and row.get("candidate_label") == "automatic"
+                and row.get("planner_variant", "current") == "current"
                 and not row.get("admission_failed")
                 and row.get("subforward_count", 1) == 1
                 and all(status == "none" for status in row.get("compile_statuses", []))
@@ -188,6 +189,11 @@ def validate_completeness(paths: list[Path], *, repeat: int) -> list[str]:
                     c["label"] for c in row["candidates"] if c["label"] != "automatic"
                 ]
             elif row.get("record_type") == "calibration_sample" and key:
+                # Paired planner A/B rows of the legacy variant are not
+                # calibration evidence (see load_candidates) and count for
+                # neither completeness nor admission failures.
+                if row.get("planner_variant", "current") != "current":
+                    continue
                 label = str(row["candidate_label"])
                 if row.get("admission_failed"):
                     failed.add((key, label))
@@ -479,6 +485,11 @@ def load_candidates(paths: list[Path]) -> list[Candidate]:
                 if row.get("admission_failed") or row.get("subforward_count", 1) != 1:
                     continue
                 if any(status != "none" for status in row.get("compile_statuses", [])):
+                    continue
+                # Paired planner A/B runs time every layout under the current
+                # and a legacy CP planner configuration; only the current one
+                # is calibration evidence.
+                if row.get("planner_variant", "current") != "current":
                     continue
                 samples[(_cell_key(row), str(row["candidate_label"]))].append(
                     float(row["ms_max_rank"])
@@ -1585,7 +1596,12 @@ def main() -> None:
                 "shortlist_size": arguments.shortlist_size,
                 "incumbent": arguments.incumbent,
             },
-            integer_table=report["integer_terms_milli_us"],
+            # Every production term, zero when it was not fitted, so the
+            # certificate equals the shipped table (bound by the certificate test).
+            integer_table={
+                name: int(report["integer_terms_milli_us"].get(name, 0))
+                for name in TERMS
+            },
             report=report,
             manifest=manifest_record,
             table_id=arguments.table_id,
