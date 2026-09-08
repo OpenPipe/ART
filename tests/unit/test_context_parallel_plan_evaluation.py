@@ -641,3 +641,61 @@ def test_routed_expert_work_follows_ownership_only_without_expert_parallelism() 
         **{**moe, "moe_shared_expert_ffn": 512}, expert_parallel_size=4
     )
     assert with_shared > ep_equals_cp
+
+
+@pytest.mark.parametrize("seed", range(400, 430))
+def test_search_keeps_every_rank_contiguous(seed: int) -> None:
+    """The improving-move search only shifts boundary chunks to the adjacent
+    rank, so from the contiguous start every rank owns one token range (GDN
+    state chains keep one hop per boundary; per-range overheads stay minimal)."""
+
+    rng = random.Random(seed)
+    cp_size = rng.choice((2, 4))
+    n = rng.randint(cp_size * 2, 60)
+    ranges, pairs = _causal_program(n)
+    for i in range(n):
+        for j in range(i + 1):
+            if pairs[i][j]:
+                pairs[i][j] = int(pairs[i][j] * rng.uniform(0.2, 1.0))
+    q_weights = [float(sum(row)) for row in pairs]
+    config = dataclasses.replace(
+        ContextParallelConfig(),
+        planner_owned_token_ms=rng.choice((0.0, 0.0008, 0.0046)),
+    )
+    owners, _waves, _ev = rt._search_generic_chunk_assignment(
+        chunk_ranges=ranges,
+        pair_matrix=torch.as_tensor(pairs, dtype=torch.int64),
+        q_weights=q_weights,
+        cp_size=cp_size,
+        config=config,
+    )
+    assert rt._ownership_range_counts(owners, cp_size=cp_size) == tuple(
+        1 for _ in range(cp_size)
+    )
+    assert len(set(owners)) == cp_size
+
+
+def test_contiguous_start_balances_tokens_when_they_dominate() -> None:
+    """With a large per-token cost the contiguous start splits tokens evenly;
+    with none it follows attention pairs (the causal row's later chunks)."""
+
+    ranges, pairs = _causal_program(48)
+    q_weights = [float(sum(row)) for row in pairs]
+    pair_matrix = torch.as_tensor(pairs, dtype=torch.int64)
+
+    def loads(config: ContextParallelConfig) -> list[int]:
+        owners, _w, _e = rt._search_generic_chunk_assignment(
+            chunk_ranges=ranges,
+            pair_matrix=pair_matrix,
+            q_weights=q_weights,
+            cp_size=4,
+            config=config,
+        )
+        return [owners.count(rank) for rank in range(4)]
+
+    pairs_only = loads(ContextParallelConfig())
+    token_heavy = loads(
+        dataclasses.replace(ContextParallelConfig(), planner_owned_token_ms=1.0)
+    )
+    assert max(pairs_only) > 12 + 2
+    assert max(token_heavy) <= 12 + 1
