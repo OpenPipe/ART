@@ -639,9 +639,9 @@ GDN_MOE_H2048_TABLE = CalibratedTable(
 # produces, which decided the recurring real-data groups at TP1 x CP4 (design
 # brief), so that shape went through the two-stage re-ranker where it paid
 # back its planning cost. The recalibrated planner builds single-wave,
-# balanced plans for nearly every layout, so on Qwen3-8B the re-ranker no
-# longer pays back and CP4 is scored directly; Qwen3-14B keeps the re-ranker
-# until its re-certification lands; on Qwen3-1.7B CP4 keeps version 1.
+# balanced plans for nearly every layout, so on Qwen3-8B and Qwen3-14B the
+# re-ranker no longer pays back and CP4 is scored directly; on Qwen3-1.7B
+# CP4 keeps version 1.
 # TP2 x CP2 is not admitted for the two smaller classes.
 _ATTENTION_DTYPES = ("torch.bfloat16",)
 _ATTENTION_SHAPES = (
@@ -711,40 +711,21 @@ QWEN3_14B_GEOMETRY = ModelGeometry(
 DENSE_ATTN_H5120_TABLE = CalibratedTable(
     table_id="dense-attn-h5120-h200-bf16",
     coefficients_milli_us={
-        "attention_token_cp_exchange": 0,
+        "attention_token_cp_exchange": 27,
         "gdn_level": 0,
         "gdn_level_tp": 0,
         "gdn_token_per_rank": 0,
-        "level_cp_per_layer": 0,
+        "level_cp_per_layer": 100_249,
         "level_tp_per_layer": 0,
-        "tiny_segment_per_layer": 0,
-        "token_cp_exchange": 0,
-        "token_per_rank": 4_607,
-        "token_tp_collective": 487,
+        "tiny_segment_per_layer": 10_843,
+        "token_cp_exchange": 106,
+        "token_per_rank": 9263,
+        "token_tp_collective": 918,
     },
     device_classes=(H200_CLASS,),
     param_dtypes=_ATTENTION_DTYPES,
     geometries=(QWEN3_14B_GEOMETRY,),
-    shapes=_ATTENTION_SHAPES + (ParallelShape(tp=2, cp=2),),
-    reranked_shapes=(ParallelShape(tp=1, cp=4),),
-    reranker=ReRanker(
-        shortlist_size=3,
-        incumbent="depth_one",
-        shortlist_coefficients_milli_us={
-            "attention_token_cp_exchange": 0,
-            "gdn_level": 0,
-            "gdn_level_tp": 0,
-            "gdn_token_per_rank": 0,
-            "level_cp_per_layer": 0,
-            "level_tp_per_layer": 0,
-            "tiny_segment_per_layer": 0,
-            "token_cp_exchange": 0,
-            "token_per_rank": 4_592,
-            "token_tp_collective": 496,
-        },
-        wave_per_layer_milli_us=654_967,
-        max_rank_token_per_layer_milli_us=4_642,
-    ),
+    shapes=_ATTENTION_SHAPES + (ParallelShape(tp=1, cp=4), ParallelShape(tp=2, cp=2)),
 )
 
 # Qwen3-30B-A3B class (attention + MoE, hidden 2,048): 32 attention heads in
