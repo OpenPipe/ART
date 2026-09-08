@@ -143,17 +143,21 @@ def test_attention_classes_are_admitted_only_where_their_gates_pass() -> None:
             assert selection.table_id == table.table_id, (table.table_id, shape)
             assert selection.coefficients is table.coefficients_milli_us
             assert selection.reranker is None
-        # TP1 x CP4 is never scored by the direct table on an attention class.
-        assert cp4 not in table.shapes
         # A different dtype never borrows the table.
         assert _selection(
             geometry=geometry, shape=ParallelShape(), param_dtype="torch.float16"
         ).version == (COEFFICIENT_VERSION_FALLBACK)
-    # TP1 x CP4 goes through the two-stage re-ranker where it pays back its
-    # planning cost against both single-stage selections (8B, 14B); on the
-    # 1.7B class it does not, and CP4 keeps the version-1 score.
-    for table in (DENSE_ATTN_H4096_TABLE, DENSE_ATTN_H5120_TABLE):
+    # TP1 x CP4: the 8B class scores it directly since the CP planner
+    # recalibration (issue #854) removed the exchange-schedule variance the
+    # two-stage re-ranker priced; the 14B class still goes through the
+    # re-ranker where it pays back its planning cost against both
+    # single-stage selections; on the 1.7B class CP4 keeps the version-1 score.
+    assert cp4 in DENSE_ATTN_H4096_TABLE.shapes
+    assert DENSE_ATTN_H4096_TABLE.reranker is None
+    assert not DENSE_ATTN_H4096_TABLE.reranked_shapes
+    for table in (DENSE_ATTN_H5120_TABLE,):
         (geometry,) = table.geometries
+        assert cp4 not in table.shapes
         assert cp4 in table.reranked_shapes and table.reranker is not None
         reranked = _selection(geometry=geometry, shape=cp4)
         assert reranked.version == COEFFICIENT_VERSION
