@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
 from fnmatch import fnmatchcase
 import re
@@ -7,6 +8,24 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from . import Trajectory
+
+
+def _matching_models(
+    candidates: set[str | None], selectors: str | Iterable[str] | None
+) -> set[str | None]:
+    if selectors is None:
+        return candidates
+    return {
+        candidate
+        for selector in ((selectors,) if isinstance(selectors, str) else selectors)
+        for candidate in candidates
+        if candidate == selector
+        or (
+            selector not in candidates
+            and candidate is not None
+            and fnmatchcase(candidate, selector)
+        )
+    }
 
 
 @dataclass(frozen=True, slots=True)
