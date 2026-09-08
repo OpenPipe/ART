@@ -1677,7 +1677,6 @@ class TrainerRank:
             futures = [
                 self._checkpoint_prefetches[self._checkpoint_prefetch_sources[name]]
                 for name in checkpoints
-                if name not in self._checkpoint_slots
             ]
 
         async def wait() -> None:

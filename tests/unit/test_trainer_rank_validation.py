@@ -952,19 +952,22 @@ async def test_shared_checkpoint_prefetch_survives_waiter_cancellation() -> None
 
     def prepare() -> PreparedCheckpoint:
         started.set()
-        release.wait()
+        assert release.wait(5)
         return source
 
-    future = trainer._register_checkpoint_prefetch("student", "student", prepare)
-    first = asyncio.create_task(trainer._await_checkpoint_prefetch(future))
-    second = asyncio.create_task(trainer._await_checkpoint_prefetch(future))
+    trainer._checkpoint_slots["student"] = _CheckpointSlot(snapshot=True)
+    trainer._register_checkpoint_prefetch("student", "student", prepare)
+    first = trainer._checkpoint_prefetch_waiter("student")
+    second = trainer._checkpoint_prefetch_waiter("student")
     await asyncio.to_thread(started.wait)
     first.cancel()
     with pytest.raises(asyncio.CancelledError):
         await first
     release.set()
 
-    assert await second is source
+    assert await second is None
+    trainer._checkpoint_slots.pop("student")
+    assert trainer._prefetched_checkpoint("student") is source
     [cached] = trainer._checkpoint_prefetches.values()
     assert cached.result() is source
 
