@@ -992,6 +992,19 @@ def _read_snapshot(
     return {key: payload[f"{prefix}/{key}"] for key in keys}
 
 
+def _matching_shards(
+    prepared: _PreparedSave, metadata: Sequence[LoraShardMeta]
+) -> dict[str, list[_LocalShard]]:
+    by_key: dict[str, list[LoraShardMeta]] = {}
+    for item in metadata:
+        by_key.setdefault(item.key, []).append(item)
+    matched: dict[str, list[_LocalShard]] = {}
+    for record in prepared.shards:
+        if record.metadata in by_key.get(record.metadata.key, ()):
+            matched.setdefault(record.metadata.key, []).append(record)
+    return matched
+
+
 def _merge_component(
     prepared: _PreparedSave,
     metadata: Sequence[LoraShardMeta],
@@ -1005,16 +1018,15 @@ def _merge_component(
     error: BaseException | None = None
     try:
         if owned:
-            files = {
-                record.file for record in prepared.shards if record.metadata in owned
-            }
+            shards = _matching_shards(prepared, owned)
+            files = {record.file for records in shards.values() for record in records}
             for relative in files:
                 keys = [
                     item.key
                     for item in owned
                     if next(
                         record.file
-                        for record in prepared.shards
+                        for record in shards.get(item.key, ())
                         if record.metadata == item
                     )
                     == relative
@@ -1174,8 +1186,8 @@ def _finish(trainer: TrainerRank, prepared: _PreparedSave) -> None:
             try:
                 for relative in {
                     record.file
-                    for record in prepared.shards
-                    if record.metadata in owned
+                    for records in _matching_shards(prepared, owned).values()
+                    for record in records
                 }:
                     load = importlib.import_module("safetensors.torch").load_file
                     payload = load(prepared.snapshot / relative)
