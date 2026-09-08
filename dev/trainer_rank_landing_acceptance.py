@@ -2273,6 +2273,10 @@ def phase_cost_calibrate(
         rows_for_plan = tuple(
             r.input_tokens.reshape(-1).to(torch.long) for r in requests
         )
+        if planner_ab:
+            # Installed before the candidate rows so the legacy plan structure
+            # recorded next to the current one is the legacy planner's.
+            _install_planner_ab()
         for candidate in candidates:
             features = layout_features(candidate.layout)
             current_us = current_score(features)
@@ -2431,8 +2435,6 @@ def phase_cost_calibrate(
         # Warm-ups per candidate (and planner variant) until compile-free
         # (bounded): a different CP plan can mean new kernel shapes.
         variants = _PLANNER_VARIANTS if planner_ab else ("current",)
-        if planner_ab:
-            _install_planner_ab()
         live: list[tuple[str, str]] = []
         for candidate in candidate_rows:
             label = str(candidate["label"])
