@@ -92,6 +92,8 @@ class CurrentSFTConfig(TrainSFTConfig):
 
 
 class ExperimentalTrainConfig(_Spec):
+    loss_type: Literal["grpo", "bnpo", "dr_grpo"] = "bnpo"
+    max_completion_length: int | None = Field(default=None, ge=1)
     advantage_balance: float = 0.0
     allow_training_without_logprobs: bool | None = None
     epsilon: float | None = None

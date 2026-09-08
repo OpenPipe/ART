@@ -4,6 +4,7 @@ from typing import Literal, NoReturn
 from typing_extensions import Required, TypedDict
 
 from .engine import EngineArgs
+from .train import LossType
 
 RolloutWeightUpdateMode = Literal["step_lora", "in_flight_lora"]
 VllmRuntimeMode = Literal["managed", "external"]
@@ -378,6 +379,7 @@ class TrainerArgs(TypedDict, total=False):
     num_generations: int | None
     temperature: float
     max_completion_length: int | None
+    loss_type: LossType
     ds3_gather_for_generation: bool
     beta: float
     reward_weights: list[float] | None

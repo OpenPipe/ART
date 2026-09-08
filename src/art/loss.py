@@ -6,6 +6,7 @@ import torch
 from art.utils.group_aggregate import group_aggregate
 
 from . import dev
+from .dev.train import LossType
 
 if TYPE_CHECKING:
     from art.preprocessing.inputs import TrainInputs
@@ -174,6 +175,11 @@ class Loss(BaseModel):
     entropy: torch.Tensor | None
     policy_loss_sum: torch.Tensor
     probs_corr: torch.Tensor
+    # The scalar used to normalize a raw (``reduction="sum"``) loss.  Megatron
+    # uses this value to keep gradient and metric normalization identical to
+    # the local reducer.  It is optional for backwards compatibility with
+    # callers that construct ``Loss`` objects directly.
+    normalization_denominator: torch.Tensor | None = None
     kl_policy_ref: torch.Tensor | None = None
     offpolicy_diagnostics: LossOffPolicyDiagnostics | None = None
 
@@ -188,6 +194,22 @@ class AlignedLossInputs(BaseModel):
     group_ids: torch.Tensor
     original_logprobs: torch.Tensor | None = None
     entropies_are_aligned: bool = False
+    # Distributed schedules pad incomplete global batches with zero-gradient
+    # microbatches.  Keep that scheduling fact separate from an ordinary
+    # completion whose assistant mask happens to be empty: the latter still
+    # participates in GRPO's batch denominator, while the former must not.
+    is_dummy: bool = False
+    # Context-parallel dispatch can retain the complete logical batch shape
+    # while each rank only owns a token slice.  In that case the local
+    # ``group_ids`` do not contain enough information to recover the number of
+    # completion tails, so the dispatcher may provide the globally computed
+    # count here.  Ordinary dense callers leave it unset.
+    logical_sequence_count_override: int | None = None
+    # Optional per-rank contribution to the denominator used by a raw
+    # ``reduction="sum"`` loss.  Context-parallel dispatch uses an integer
+    # owner rank for fixed sequence denominators so M-Core can all-reduce the
+    # value without rounding fractional counts.
+    normalization_denominator_override: torch.Tensor | None = None
 
     def align_inputs(self) -> "AlignedLossInputs":
         return self
@@ -199,9 +221,195 @@ class AlignedLossInputs(BaseModel):
         return values.sum() / (mask.sum() + 1e-18)
 
     def denominator(self, mask: torch.Tensor, reduction: Literal["mean", "sum"]):
+        """Historical active-token denominator helper.
+
+        Keep this method for callers that used the aligned-input utility
+        directly.  ``loss_fn`` now uses :meth:`normalization_denominator` so
+        alternate GRPO reductions can share one source of truth.
+        """
+
         if reduction == "sum":
             return 1.0
         return mask.sum() + 1e-18
+
+    def _logical_sequence_groups(self, mask: torch.Tensor) -> tuple[torch.Tensor, int]:
+        """Return a group index map and logical completion count.
+
+        Unpacked backends have one row per completion.  Megatron can pack
+        several completions into one row, with ``group_ids`` identifying each
+        prefix-tree segment.  Grouping by both row and segment keeps the
+        reduction invariant under either representation while avoiding any
+        gradient-bearing operations on the metadata tensors.
+        """
+
+        if mask.ndim != 2:
+            # Loss tensors are normally [batch, sequence].  Flattening a
+            # lightweight one-dimensional fixture as one sequence keeps the
+            # helper well-defined without introducing a host-side branch in
+            # the training path.
+            mask = mask.reshape(1, -1)
+
+        batch_size = int(mask.shape[0])
+        if self.group_ids.shape != mask.shape:
+            # A missing/mismatched group map means one logical completion per
+            # physical row.  Return an empty index map; callers that need
+            # per-group values use the row-wise fallback below.
+            empty = mask.new_empty((0,), dtype=torch.long)
+            return empty, batch_size
+
+        active = mask > 0
+        row_grid = torch.arange(batch_size, device=mask.device).unsqueeze(1)
+        row_ids = row_grid.expand_as(mask)[active]
+        group_ids = self.group_ids.to(device=mask.device, dtype=torch.long)[active]
+        if row_ids.numel() == 0:
+            empty = mask.new_empty((0,), dtype=torch.long)
+            return empty, batch_size
+
+        keys = torch.stack((row_ids, group_ids), dim=1)
+        unique_keys, inverse = torch.unique(keys, dim=0, return_inverse=True)
+        group_count = int(unique_keys.shape[0])
+        active_rows = torch.unique(row_ids)
+        empty_rows = batch_size - int(active_rows.numel())
+        return inverse, group_count + empty_rows
+
+    def logical_sequence_count(self, mask: torch.Tensor) -> int:
+        """Number of completion denominators represented by ``mask``.
+
+        A packed row may contain multiple independent completion tails.  The
+        prefix-tree ``group_ids`` metadata lets Dr. GRPO retain the paper's
+        ``B * max_completion_length`` denominator instead of accidentally
+        using the number of physical rows.
+        """
+
+        if self.logical_sequence_count_override is not None:
+            return max(int(self.logical_sequence_count_override), 1)
+        _, count = self._logical_sequence_groups(mask)
+        return max(count, 1)
+
+    def _grouped_mean_sum(
+        self, values: torch.Tensor, mask: torch.Tensor
+    ) -> tuple[torch.Tensor, int]:
+        """Return the sum of per-completion means and its denominator count."""
+
+        if mask.ndim != 2:
+            values = values.reshape(1, -1)
+            mask = mask.reshape(1, -1)
+        masked_values = values * mask
+        if self.group_ids.shape != mask.shape:
+            row_values = masked_values.reshape(mask.shape[0], -1).sum(dim=1)
+            row_counts = mask.reshape(mask.shape[0], -1).sum(dim=1)
+            return (row_values / (row_counts + 1e-18)).sum(), int(mask.shape[0])
+
+        active = mask > 0
+        row_grid = torch.arange(mask.shape[0], device=mask.device).unsqueeze(1)
+        row_ids = row_grid.expand_as(mask)[active]
+        if row_ids.numel() == 0:
+            return masked_values.sum(), int(mask.shape[0])
+        group_ids = self.group_ids.to(device=mask.device, dtype=torch.long)[active]
+        keys = torch.stack((row_ids, group_ids), dim=1)
+        unique_keys, inverse = torch.unique(keys, dim=0, return_inverse=True)
+        group_count = int(unique_keys.shape[0])
+        sums = values.new_zeros((group_count,))
+        counts = values.new_zeros((group_count,))
+        sums.scatter_add_(0, inverse, values[active])
+        counts.scatter_add_(0, inverse, mask[active])
+        means_sum = (sums / (counts + 1e-18)).sum()
+        empty_rows = int(mask.shape[0]) - int(torch.unique(row_ids).numel())
+        return means_sum, group_count + empty_rows
+
+    def reduce_masked(
+        self,
+        values: torch.Tensor,
+        mask: torch.Tensor,
+        *,
+        loss_type: LossType,
+        max_completion_length: int | None,
+        reduction: Literal["mean", "sum"],
+    ) -> torch.Tensor:
+        """Reduce token values using the selected GRPO normalization.
+
+        ``bnpo`` is ART's historical active-token mean.  ``grpo`` first takes
+        a mean within each completion and then averages completions.  Dr.
+        GRPO (``dr_grpo``) uses a fixed ``B * max_completion_length``
+        denominator, removing the response-length term from the objective.
+        ``reduction="sum"`` intentionally remains a raw sum for distributed
+        training; its matching denominator is exposed separately through
+        :meth:`normalization_denominator`.
+        """
+
+        if reduction == "sum":
+            if loss_type == "grpo":
+                grouped_sum, _ = self._grouped_mean_sum(values, mask)
+                return grouped_sum
+            return (values * mask).sum()
+
+        if loss_type == "bnpo":
+            if reduction == "mean":
+                return self.masked_mean(values * mask, mask)
+            return (values * mask).sum() / (mask.sum() + 1e-18)
+
+        if loss_type == "dr_grpo":
+            assert max_completion_length is not None
+            denominator = torch.tensor(
+                float(self.logical_sequence_count(mask) * max_completion_length),
+                device=mask.device,
+                dtype=torch.float32,
+            )
+            return (values * mask).sum() / denominator.clamp_min(1.0)
+
+        # GRPO: average each logical completion independently.  The grouped
+        # path also handles Megatron prefix-tree rows; ordinary unpacked rows
+        # simply contribute one group each.
+        if loss_type != "grpo":
+            raise ValueError(f"Unknown loss_type: {loss_type!r}")
+        grouped_sum, denominator = self._grouped_mean_sum(values, mask)
+        return grouped_sum / max(denominator, 1)
+
+    def normalization_denominator(
+        self,
+        mask: torch.Tensor,
+        *,
+        loss_type: LossType,
+        max_completion_length: int | None,
+        reduction: Literal["mean", "sum"] = "mean",
+    ) -> torch.Tensor:
+        """Return the denominator paired with a raw loss sum."""
+
+        if reduction == "sum" and self.is_dummy:
+            return mask.new_zeros(())
+
+        if (
+            self.normalization_denominator_override is not None
+            and loss_type
+            in {
+                "grpo",
+                "dr_grpo",
+            }
+            and reduction == "sum"
+        ):
+            denominator = self.normalization_denominator_override.to(device=mask.device)
+            if loss_type == "dr_grpo":
+                assert max_completion_length is not None
+                denominator = denominator * max_completion_length
+            return denominator
+
+        if loss_type == "bnpo":
+            denominator = mask.sum()
+            return denominator if reduction == "sum" else denominator.clamp_min(1.0)
+        if loss_type == "dr_grpo":
+            assert max_completion_length is not None
+            return torch.tensor(
+                float(self.logical_sequence_count(mask) * max_completion_length),
+                device=mask.device,
+                dtype=torch.float32,
+            ).clamp_min(1.0)
+        if loss_type == "grpo":
+            return torch.tensor(
+                float(self.logical_sequence_count(mask)),
+                device=mask.device,
+                dtype=torch.float32,
+            )
+        raise ValueError(f"Unknown loss_type: {loss_type!r}")
 
     def aligned_entropies(self, entropies: torch.Tensor | None) -> torch.Tensor | None:
         if entropies is None:
@@ -215,6 +423,7 @@ class LossInputs(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
     inputs: PackedLossInput
+    is_dummy: bool = False
 
     def align_inputs(self) -> AlignedLossInputs:
         inputs = self.inputs
@@ -229,6 +438,7 @@ class LossInputs(BaseModel):
                 if "original_logprobs" in inputs
                 else None
             ),
+            is_dummy=self.is_dummy,
         )
 
 
@@ -267,8 +477,42 @@ def loss_fn(
     entropies: torch.Tensor | None,
     experimental_config: dev.TrainConfig,
     reduction: Literal["mean", "sum"] = "mean",
+    *,
+    loss_type: LossType | None = None,
+    max_completion_length: int | None = None,
 ) -> Loss:
     aligned_inputs = inputs.align_inputs()
+    configured_loss_type = (
+        loss_type
+        if loss_type is not None
+        else experimental_config.get("loss_type", "bnpo")
+    )
+    if configured_loss_type is None:
+        configured_loss_type = "bnpo"
+    if not isinstance(configured_loss_type, str) or configured_loss_type not in {
+        "grpo",
+        "bnpo",
+        "dr_grpo",
+    }:
+        raise ValueError(
+            f"Unknown loss_type: {configured_loss_type!r}. "
+            "Expected one of 'grpo', 'bnpo', or 'dr_grpo'."
+        )
+    resolved_loss_type = configured_loss_type
+    resolved_max_completion_length = (
+        max_completion_length
+        if max_completion_length is not None
+        else experimental_config.get("max_completion_length")
+    )
+    if resolved_loss_type == "dr_grpo":
+        if resolved_max_completion_length is None:
+            resolved_max_completion_length = dev.DEFAULT_MAX_COMPLETION_LENGTH
+        if (
+            isinstance(resolved_max_completion_length, bool)
+            or not isinstance(resolved_max_completion_length, int)
+            or resolved_max_completion_length <= 0
+        ):
+            raise ValueError("max_completion_length must be a positive integer")
     old_logprobs = aligned_inputs.old_logprobs
     advantages = aligned_inputs.advantages
     assistant_mask_bool = aligned_inputs.assistant_mask.to(dtype=torch.bool)
@@ -384,13 +628,33 @@ def loss_fn(
             prob_ratio = torch.exp(logprob_diff)
         policy_loss *= torch.clamp(prob_ratio, max=upper_bound).detach()
     policy_loss = policy_loss * weights * assistant_mask
-    denominator = aligned_inputs.denominator(assistant_mask, reduction)
-    reduced_policy_loss = policy_loss.sum() / denominator
+    reduced_policy_loss = aligned_inputs.reduce_masked(
+        policy_loss,
+        assistant_mask,
+        loss_type=resolved_loss_type,
+        max_completion_length=resolved_max_completion_length,
+        reduction=reduction,
+    )
+    normalization_denominator = aligned_inputs.normalization_denominator(
+        assistant_mask,
+        loss_type=resolved_loss_type,
+        max_completion_length=resolved_max_completion_length,
+        reduction=reduction,
+    )
     # Compute reduced entropy for the current step.
     aligned_entropies = aligned_inputs.aligned_entropies(entropies)
     if aligned_entropies is not None:
         aligned_entropies = _mask_ignored_tokens(aligned_entropies, assistant_mask_bool)
-        entropy = (aligned_entropies * weights * assistant_mask).sum() / denominator
+        entropy_values = aligned_entropies * weights * assistant_mask
+        # Entropy is a diagnostic in ART (it is not added to ``policy_loss``),
+        # so retain the historical active-token mean regardless of the policy
+        # normalization selected above.  The sum path remains a raw sum for
+        # callers that explicitly requested ``reduction="sum"``.
+        entropy = (
+            entropy_values.sum()
+            if reduction == "sum"
+            else aligned_inputs.masked_mean(entropy_values, assistant_mask)
+        )
     else:
         entropy = None
     return Loss(
@@ -399,6 +663,7 @@ def loss_fn(
         entropy=entropy,
         policy_loss_sum=policy_loss.sum(),
         probs_corr=probs_corr,
+        normalization_denominator=normalization_denominator,
         kl_policy_ref=kl_policy_ref,
         offpolicy_diagnostics=offpolicy_diagnostics,
     )

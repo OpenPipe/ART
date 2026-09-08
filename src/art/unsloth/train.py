@@ -478,12 +478,30 @@ def get_compute_loss_fn(trainer: "GRPOTrainer") -> Callable[..., torch.Tensor]:
             ref_logprobs = None
         del attn_bias
 
+        # ART replaces TRL's ``compute_loss`` below, so TRL's loss controls
+        # would otherwise be silently ignored.  Prefer an explicit ART
+        # developer config when present, and fall back to the corresponding
+        # GRPOConfig values so ``TrainerArgs(loss_type=...)`` has the same
+        # semantics as native TRL training.
+        configured_loss_type = cast(
+            dev.LossType | None,
+            _config.get("loss_type", getattr(trainer.args, "loss_type", None)),
+        )
+        configured_max_completion_length = cast(
+            int | None,
+            _config.get(
+                "max_completion_length",
+                getattr(trainer.args, "max_completion_length", None),
+            ),
+        )
         loss = loss_fn(
             LossInputs(inputs=inputs),
             new_logprobs,
             ref_logprobs,
             entropies,
             _config,
+            loss_type=configured_loss_type,
+            max_completion_length=configured_max_completion_length,
         )
 
         trainer._metrics["train"]["loss/learning_rate"].append(config.learning_rate)

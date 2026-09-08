@@ -687,6 +687,15 @@ def execute_megatron_rl_job(
                 if cp_lookahead_state is not None
                 else None
             )
+            next_step_first_sample_index = (
+                build_micro_sample_indices(
+                    step_index=step_index + 1,
+                    num_sequences=num_sequences,
+                    global_grad_accumulation_sequences=global_grad_accumulation_sequences,
+                )[0]
+                if step_index + 1 < num_steps
+                else None
+            )
             next_step_first_ref_logprobs = (
                 _select_next_step_first_ref_logprobs(
                     ref_logprobs_by_index=ref_logprobs_by_index,
@@ -720,6 +729,7 @@ def execute_megatron_rl_job(
                 moe_routing_replay_controller=runtime.moe_routing_replay_controller,
                 cp_lookahead_state=cp_lookahead_state,
                 next_step_first_micro=next_step_first_micro,
+                next_step_first_sample_index=next_step_first_sample_index,
                 next_step_first_ref_logprobs=next_step_first_ref_logprobs,
                 hybridep_token_counts=hybridep_token_counts,
                 before_optimizer_step=(
@@ -1524,6 +1534,7 @@ def _calculate_megatron_logprob_batch(
                 ref_logprobs=None,
                 trace_token_uids=trace_token_uids,
                 pending_prepared_micro=pending_prepared_micro,
+                is_dummy=sample_indices[order] is None,
             )
             prepared_micros.append(prepared)
             pending_prepared_micro = _prepare_next_rl_cp_micro(
@@ -1534,6 +1545,10 @@ def _calculate_megatron_logprob_batch(
                 model_support_handler=model_support_handler,
                 trace_token_uids=trace_token_uids,
                 ref_logprobs=None,
+                is_dummy=(
+                    order + 1 < len(sample_indices)
+                    and sample_indices[order + 1] is None
+                ),
             )
         microbatch_state = PipelineMicrobatchState(
             controller=moe_routing_replay_controller,
@@ -1916,6 +1931,7 @@ def _calculate_megatron_score_batch(
                 ref_logprobs=None,
                 trace_token_uids=True,
                 pending_prepared_micro=pending_prepared_micro,
+                is_dummy=sample_indices[order] is None,
             )
             prepared_micros.append(prepared)
             pending_prepared_micro = _prepare_next_rl_cp_micro(
@@ -1925,6 +1941,10 @@ def _calculate_megatron_score_batch(
                 provider=runtime.provider,
                 model_support_handler=runtime.model_support_handler,
                 trace_token_uids=True,
+                is_dummy=(
+                    order + 1 < len(sample_indices)
+                    and sample_indices[order + 1] is None
+                ),
             )
         schedule = MCoreScheduleAdapter(
             model_chunks=model_chunks,
@@ -2629,6 +2649,7 @@ def run_training_step(
     moe_routing_replay_controller: MoeRoutingReplayController | None = None,
     cp_lookahead_state: CpBatchLookaheadState | None = None,
     next_step_first_micro: PackedTensors | None = None,
+    next_step_first_sample_index: int | None = None,
     next_step_first_ref_logprobs: torch.Tensor | None = None,
     hybridep_token_counts: list[int] | None = None,
     before_optimizer_step: Callable[[], None] | None = None,
@@ -2691,14 +2712,16 @@ def run_training_step(
             ref_logprobs=micro_ref_logprobs,
             trace_token_uids=trace_token_uids,
             pending_prepared_micro=pending_prepared_micro,
+            is_dummy=micro_sample_indices[micro_order] is None,
         )
         prepared_micros.append(prepared_micro)
+        next_micro = _next_micro_lookahead(
+            micro_inputs,
+            micro_order,
+            next_step_first_micro,
+        )
         pending_prepared_micro = _prepare_next_rl_cp_micro(
-            _next_micro_lookahead(
-                micro_inputs,
-                micro_order,
-                next_step_first_micro,
-            ),
+            next_micro,
             device=device,
             topology=topology,
             provider=provider,
@@ -2709,6 +2732,19 @@ def run_training_step(
                 micro_order=micro_order,
                 micro_count=micro_count,
                 next_step_first_ref_logprobs=next_step_first_ref_logprobs,
+            ),
+            is_dummy=(
+                next_micro is not None
+                and (
+                    (
+                        micro_order + 1 < micro_count
+                        and micro_sample_indices[micro_order + 1] is None
+                    )
+                    or (
+                        micro_order + 1 >= micro_count
+                        and next_step_first_sample_index is None
+                    )
+                )
             ),
         )
     if cp_lookahead_state is not None:
@@ -2756,15 +2792,25 @@ def run_training_step(
                     "RL micro_loss is detached before pipeline backward: "
                     f"micro={item.order}, sample={item.sample_index}"
                 )
-            num_tokens = _local_trainable_token_count_tensor(
-                [prepared.loss_inputs], device=device
-            )
+            # MCore uses the second return value to normalize the backward
+            # graph.  For Dr. GRPO this must be the fixed completion-length
+            # denominator rather than the number of active tokens; otherwise
+            # the distributed path would silently reintroduce length bias.
+            if loss_info.normalization_denominator is not None:
+                num_tokens = loss_info.normalization_denominator.detach().to(
+                    device=device, dtype=torch.int
+                )
+            else:
+                num_tokens = _local_trainable_token_count_tensor(
+                    [prepared.loss_inputs], device=device
+                )
             return (
                 micro_loss,
                 num_tokens,
                 {
                     "order": item.order,
                     "raw_loss_sum": micro_loss.detach(),
+                    "normalization_denominator": num_tokens.detach(),
                     "probs_corr": loss_info.probs_corr.detach(),
                     "kl_policy_ref": (
                         None
@@ -2826,6 +2872,23 @@ def run_training_step(
         [prepared.loss_inputs for prepared in prepared_micros],
         device=device,
     )
+    normalization_values = [
+        data.get("normalization_denominator") for data in pipeline_results
+    ]
+    if any(value is not None for value in normalization_values):
+        normalization_count = sum(
+            (
+                cast(torch.Tensor, value).to(device)
+                for value in normalization_values
+                if value is not None
+            ),
+            torch.zeros([], device=device, dtype=token_count.dtype),
+        )
+    else:
+        # Keep compatibility with older schedule payloads that did not carry
+        # an explicit reduction denominator.  Apply the historical aggregate
+        # token count once, rather than once per microbatch result.
+        normalization_count = token_count
     result_collect_s = time.perf_counter() - result_collect_started
     optimizer_started = time.perf_counter()
     update_successful, grad_norm, num_zeros_in_grad = _optimizer_step(
@@ -2839,7 +2902,7 @@ def run_training_step(
     loss_reduce_started = time.perf_counter()
     reduced_loss = _reduce_loss_sum(
         raw_loss_sum,
-        token_count,
+        normalization_count,
         group=ps.get_data_parallel_group(with_context_parallel=True),
     )
     loss_reduce_s = time.perf_counter() - loss_reduce_started
