@@ -5,7 +5,17 @@ from typing_extensions import Required, TypedDict
 
 from .engine import EngineArgs
 
-RolloutWeightsMode = Literal["lora", "merged"]
+RolloutWeightUpdateMode = Literal["step_lora", "in_flight_lora"]
+VllmRuntimeMode = Literal["managed", "external"]
+
+
+class VllmRuntimeArgs(TypedDict, total=False):
+    mode: Required[VllmRuntimeMode]
+    server_url: str
+    api_key: str | None
+    local_checkpoint_root: str | None
+    server_checkpoint_root: str | None
+    health_timeout_s: float
 
 
 # Vendored from transformers.training_args.OptimizerNames
@@ -122,10 +132,10 @@ class InternalModelConfig(TypedDict, total=False):
             inference run on separate GPUs.
         inference_gpu_ids: GPU IDs for vLLM inference (e.g., [1]). When set
             with trainer_gpu_ids, enables dedicated mode.
-        rollout_weights_mode: How inference weights are applied in vLLM.
-            - "lora": load LoRA adapters into vLLM directly
-            - "merged": keep training LoRA adapters, but push merged weights
-              into vLLM for inference
+        rollout_weight_update_mode: How LoRA rollout weights are registered
+            - "step_lora": load one adapter per policy step
+            - "in_flight_lora": update one derived LoRA slot in place while
+              recording token-level policy spans
         chat_template_kwargs: Extra keyword arguments passed to chat-template
             rendering for both rollout inference and local training tokenization.
         chat_template: Raw chat template text used by rollout inference and
@@ -135,6 +145,8 @@ class InternalModelConfig(TypedDict, total=False):
         chat_template_content_format: vLLM chat template content format.
         chat_template_tool_schema_format: Tool schema rendering format used for
             local training tokenization.
+        vllm_runtime: vLLM runtime location. Omit for ART-managed local runtime;
+            set mode="external" to attach to a pre-launched vLLM server.
         allow_unvalidated_arch: Permit model-support validation workflows to run
             architectures that are not yet in the supported-model registry.
     """
@@ -146,13 +158,15 @@ class InternalModelConfig(TypedDict, total=False):
     trainer_args: "TrainerArgs"
     trainer_gpu_ids: list[int]
     inference_gpu_ids: list[int]
-    rollout_weights_mode: "RolloutWeightsMode"
+    rollout_weight_update_mode: "RolloutWeightUpdateMode"
     chat_template_kwargs: dict[str, object]
     chat_template: str
     chat_template_path: str
     chat_template_content_format: str
     chat_template_tool_schema_format: Literal["default", "vllm_openai"]
+    vllm_runtime: VllmRuntimeArgs
     allow_unvalidated_arch: bool
+    megatron_model_initialization: Literal["pretrained", "random"]
 
 
 class BackendModelConfig(InternalModelConfig, total=False):

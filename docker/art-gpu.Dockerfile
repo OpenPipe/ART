@@ -3,8 +3,6 @@ ARG ART_SHA=unknown
 ARG UV_VERSION=0.11.7
 ARG BUILD_JOBS=2
 ARG UV_CONCURRENT_BUILDS=1
-ARG APEX_PARALLEL_BUILD=2
-ARG APEX_NVCC_THREADS=1
 ARG TORCH_CUDA_ARCH_LIST=9.0
 ARG CUDNN_PACKAGE_VERSION=9.10.2.21
 ARG SKYPILOT_VERSION=0.12.0
@@ -15,8 +13,6 @@ FROM ${BASE_IMAGE} AS builder
 ARG UV_VERSION
 ARG BUILD_JOBS
 ARG UV_CONCURRENT_BUILDS
-ARG APEX_PARALLEL_BUILD
-ARG APEX_NVCC_THREADS
 ARG TORCH_CUDA_ARCH_LIST
 ARG CUDNN_PACKAGE_VERSION
 
@@ -26,8 +22,6 @@ ENV CUDA_HOME=/usr/local/cuda-12.8 \
     UV_PYTHON_INSTALL_DIR=/opt/uv-python \
     UV_LINK_MODE=copy \
     UV_CONCURRENT_BUILDS=${UV_CONCURRENT_BUILDS} \
-    APEX_PARALLEL_BUILD=${APEX_PARALLEL_BUILD} \
-    NVCC_APPEND_FLAGS=--threads\ ${APEX_NVCC_THREADS} \
     TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST} \
     CMAKE_BUILD_PARALLEL_LEVEL=${BUILD_JOBS} \
     MAX_JOBS=${BUILD_JOBS} \
@@ -49,6 +43,7 @@ RUN if ! getent group messagebus >/dev/null; then groupadd -r messagebus; fi \
 WORKDIR /opt/src/art
 COPY pyproject.toml uv.lock ./
 COPY vllm_runtime/pyproject.toml vllm_runtime/uv.lock ./vllm_runtime/
+COPY megatron_runtime/pyproject.toml megatron_runtime/uv.lock ./megatron_runtime/
 
 RUN /opt/conda/bin/python -m pip install --no-cache-dir "nvidia-cudnn-cu12==${CUDNN_PACKAGE_VERSION}" \
  && mkdir -p /usr/local/cuda-12.8/include /usr/local/cuda-12.8/lib64 \
@@ -61,8 +56,8 @@ RUN /opt/conda/bin/python -m pip install --no-cache-dir "nvidia-cudnn-cu12==${CU
       dst="/usr/local/cuda-12.8/lib64/$(basename "$src")"; \
       if [ ! -e "$dst" ]; then ln -s "$src" "$dst" && printf '%s\n' "$dst" >> /tmp/art-cudnn-symlinks.txt; fi; \
     done \
- && UV_LINK_MODE=hardlink uv sync --frozen --extra megatron --no-install-project --python 3.12 \
- && rm -rf .venv \
+ && UV_LINK_MODE=hardlink uv sync --project megatron_runtime --frozen --extra cuda12 --no-install-project --no-dev --python 3.12 \
+ && rm -rf megatron_runtime/.venv \
  && UV_LINK_MODE=hardlink uv sync --frozen --extra backend --extra tinker --no-install-project --python 3.12 \
  && rm -rf .venv \
  && cd vllm_runtime \
@@ -77,8 +72,6 @@ ARG ART_SHA
 ARG UV_VERSION
 ARG BUILD_JOBS
 ARG UV_CONCURRENT_BUILDS
-ARG APEX_PARALLEL_BUILD
-ARG APEX_NVCC_THREADS
 ARG TORCH_CUDA_ARCH_LIST
 ARG SKYPILOT_VERSION
 ARG SKY_REMOTE_RAY_VERSION
@@ -89,8 +82,6 @@ ENV CUDA_HOME=/usr/local/cuda-12.8 \
     UV_PYTHON_INSTALL_DIR=/opt/uv-python \
     UV_LINK_MODE=copy \
     UV_CONCURRENT_BUILDS=${UV_CONCURRENT_BUILDS} \
-    APEX_PARALLEL_BUILD=${APEX_PARALLEL_BUILD} \
-    NVCC_APPEND_FLAGS=--threads\ ${APEX_NVCC_THREADS} \
     TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST} \
     CMAKE_BUILD_PARALLEL_LEVEL=${BUILD_JOBS} \
     MAX_JOBS=${BUILD_JOBS} \

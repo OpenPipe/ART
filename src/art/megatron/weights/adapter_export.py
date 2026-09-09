@@ -1,3 +1,4 @@
+from collections.abc import Callable, Sequence
 import math
 from typing import Any
 
@@ -7,31 +8,18 @@ from megatron.core.transformer.transformer_layer import TransformerLayer
 import torch
 
 from art.megatron.lora import (
+    ComponentwiseColumnParallelLinearLoRA,
     GatedDeltaNetInProjLoRA,
     LoRA,
-    MLPExpertsLinearFC1FusedLoRA,
     MLPExpertsLinearFC1LoRA,
     MLPExpertsLinearFC2LoRA,
+    RowParallelLinearLoRA,
     SelfAttentionLinearProjLoRA,
     SelfAttentionLinearQKVLoRA,
     SharedExpertsLinearFC1LoRA,
     SharedExpertsLinearFC2LoRA,
 )
 from art.megatron.weights.param_name_canonicalization import canonical_art_param_name
-
-
-def layer_base_prefix(
-    module: TransformerLayer,
-    *,
-    module_name: str | None = None,
-) -> str:
-    if module_name is not None:
-        canonical_name = canonical_art_param_name(module_name)
-        if canonical_name.startswith(
-            ("decoder.layers.", "language_model.decoder.layers.")
-        ):
-            return canonical_name
-    return f"language_model.decoder.layers.{module.layer_number - 1}"
 
 
 def _adapter_alpha_dim(lora: LoRA) -> tuple[int, int]:
@@ -51,12 +39,6 @@ def _adapter_tensors(
     return a_t.transpose(-1, -2).contiguous(), b_t.transpose(-1, -2).contiguous()
 
 
-def _adapter_param_prefix(base_prefix: str, adapter_key: str | None) -> str:
-    if adapter_key is None:
-        return f"{base_prefix}.adapter"
-    return f"{base_prefix}.adapter.{adapter_key}"
-
-
 def _adapter_weight(
     *,
     base_prefix: str,
@@ -66,7 +48,8 @@ def _adapter_weight(
     linear_in: torch.Tensor,
     linear_out: torch.Tensor,
 ) -> AdapterWeight:
-    param_prefix = _adapter_param_prefix(base_prefix, adapter_key)
+    adapter_suffix = "" if adapter_key is None else f".{adapter_key}"
+    param_prefix = f"{base_prefix}.adapter{adapter_suffix}"
     return AdapterWeight(
         global_base_prefix=base_prefix,
         adapter_key=adapter_key,
@@ -162,96 +145,263 @@ def _fused_pair_adapter_weight(
     )
 
 
+def _set_adapter_weights(
+    out: dict[str, list[Any]],
+    base_prefix: str,
+    *weights: AdapterWeight,
+    weight_suffix: str = ".weight",
+) -> None:
+    out[f"{base_prefix}{weight_suffix}"] = list(weights)
+
+
+def _set_expert_adapter_weights(
+    out: dict[str, list[Any]],
+    base_prefix: str,
+    lora: LoRA,
+    build_weight: Callable[[int], AdapterWeight],
+) -> None:
+    for local_expert_idx, logical_expert_idx in enumerate(lora.expert_ids):
+        if logical_expert_idx is None:
+            continue
+        _set_adapter_weights(
+            out,
+            base_prefix,
+            build_weight(local_expert_idx),
+            weight_suffix=f".weight{local_expert_idx + lora._expert_offset}",
+        )
+
+
+def _set_lora_weights(
+    out: dict[str, list[Any]],
+    base_prefix: str,
+    *items: tuple[LoRA | None, str | None],
+) -> None:
+    weights = [
+        _simple_adapter_weight(base_prefix, lora, adapter_key=adapter_key)
+        for lora, adapter_key in items
+        if lora is not None
+    ]
+    if not weights:
+        return
+    _set_adapter_weights(
+        out,
+        base_prefix,
+        *weights,
+    )
+
+
+def layer_base_prefix(
+    module: Any,
+    *,
+    module_name: str | None = None,
+) -> str:
+    if module_name is not None:
+        canonical_name = canonical_art_param_name(module_name)
+        if canonical_name.startswith(
+            ("decoder.layers.", "language_model.decoder.layers.")
+        ):
+            return canonical_name
+    return f"language_model.decoder.layers.{module.layer_number - 1}"
+
+
+def build_mamba_stack_adapter_weights(
+    model_chunks: Sequence[Any],
+) -> dict[str, list[Any]]:
+    from megatron.core.ssm.mamba_layer import MambaLayer
+    from megatron.core.transformer.transformer_layer import MoETransformerLayer
+
+    adapter_weights_by_base: dict[str, list[Any]] = {}
+    for chunk in model_chunks:
+        for module_name, module in chunk.named_modules():
+            if not isinstance(module, (MambaLayer, TransformerLayer)):
+                continue
+            layer_prefix = layer_base_prefix(module, module_name=module_name)
+            if isinstance(module, MambaLayer):
+                add_mamba_mixer_adapter_weights(
+                    adapter_weights_by_base,
+                    layer_prefix=layer_prefix,
+                    mixer=module.mixer,
+                )
+            elif isinstance(module, MoETransformerLayer):
+                add_grouped_moe_adapter_weights(
+                    adapter_weights_by_base,
+                    layer_prefix=layer_prefix,
+                    experts=module.mlp.experts,
+                )
+                shared_experts = getattr(module.mlp, "shared_experts", None)
+                if shared_experts is not None:
+                    add_shared_experts_adapter_weights(
+                        adapter_weights_by_base,
+                        layer_prefix=layer_prefix,
+                        shared_experts=shared_experts,
+                    )
+            else:
+                add_standard_self_attention_adapter_weights(
+                    adapter_weights_by_base,
+                    layer_prefix=layer_prefix,
+                    self_attention=module.self_attention,
+                )
+    return adapter_weights_by_base
+
+
+def build_transformer_layer_adapter_weights(
+    model_chunks: Sequence[Any],
+    grouped_moe: bool = False,
+    language_layers_only: bool = False,
+) -> dict[str, list[Any]]:
+    layer_filter = None
+    if language_layers_only:
+        from art.megatron.lora import (
+            _is_language_transformer_layer_name as layer_filter,
+        )
+
+    add_mlp_adapter_weights = (
+        _add_moe_mlp_adapter_weights_for_layer
+        if grouped_moe
+        else _add_dense_mlp_adapter_weights_for_layer
+    )
+    adapter_weights_by_base: dict[str, list[Any]] = {}
+    for chunk in model_chunks:
+        for module_name, module in chunk.named_modules():
+            if not isinstance(module, TransformerLayer):
+                continue
+            if layer_filter is not None and not layer_filter(module_name):
+                continue
+            layer_prefix = layer_base_prefix(module, module_name=module_name)
+            add_self_attention_adapter_weights(
+                adapter_weights_by_base,
+                layer_prefix=layer_prefix,
+                self_attention=module.self_attention,
+            )
+            add_mlp_adapter_weights(adapter_weights_by_base, layer_prefix, module)
+    return adapter_weights_by_base
+
+
+def add_self_attention_adapter_weights(
+    adapter_weights_by_base: dict[str, list[Any]],
+    *,
+    layer_prefix: str,
+    self_attention: Any,
+) -> None:
+    for attr in ("linear_proj", "out_proj"):
+        linear_proj = getattr(self_attention, attr, None)
+        if isinstance(linear_proj, SelfAttentionLinearProjLoRA):
+            base_prefix = f"{layer_prefix}.self_attention.{attr}"
+            _set_lora_weights(
+                adapter_weights_by_base,
+                base_prefix,
+                (linear_proj.lora, None),
+            )
+
+    linear_qkv = getattr(self_attention, "linear_qkv", None)
+    if isinstance(linear_qkv, SelfAttentionLinearQKVLoRA):
+        base_prefix = f"{layer_prefix}.self_attention.linear_qkv"
+        _set_lora_weights(
+            adapter_weights_by_base,
+            base_prefix,
+            (linear_qkv.q_proj_lora, "adapter_q"),
+            (linear_qkv.k_proj_lora, "adapter_k"),
+            (linear_qkv.v_proj_lora, "adapter_v"),
+        )
+
+    in_proj = getattr(self_attention, "in_proj", None)
+    if isinstance(in_proj, GatedDeltaNetInProjLoRA):
+        base_prefix = f"{layer_prefix}.self_attention.in_proj"
+        input_dim = int(in_proj.qkv_lora.A_T.shape[-2])
+        output_dim = int(in_proj.num_value_heads_per_partition)
+        _set_adapter_weights(
+            adapter_weights_by_base,
+            base_prefix,
+            _simple_adapter_weight(
+                base_prefix, in_proj.qkv_lora, adapter_key="adapter_qkv"
+            ),
+            _simple_adapter_weight(
+                base_prefix, in_proj.z_lora, adapter_key="adapter_z"
+            ),
+            *(
+                _zero_adapter_weight(
+                    base_prefix=base_prefix,
+                    adapter_key=adapter_key,
+                    input_dim=input_dim,
+                    output_dim=output_dim,
+                    like=in_proj.qkv_lora.B_T,
+                )
+                for adapter_key in ("adapter_b", "adapter_a")
+            ),
+        )
+
+
 def add_standard_self_attention_adapter_weights(
     adapter_weights_by_base: dict[str, list[Any]],
     *,
     layer_prefix: str,
     self_attention: Any,
 ) -> None:
-    linear_proj = getattr(self_attention, "linear_proj", None)
-    if isinstance(linear_proj, SelfAttentionLinearProjLoRA):
-        base_prefix = f"{layer_prefix}.self_attention.linear_proj"
-        adapter_weights_by_base[f"{base_prefix}.weight"] = [
-            _simple_adapter_weight(base_prefix, linear_proj.lora)
-        ]
-
-    linear_qkv = getattr(self_attention, "linear_qkv", None)
-    if isinstance(linear_qkv, SelfAttentionLinearQKVLoRA):
-        base_prefix = f"{layer_prefix}.self_attention.linear_qkv"
-        adapter_weights = []
-        q_proj_lora = getattr(linear_qkv, "q_proj_lora", None)
-        k_proj_lora = getattr(linear_qkv, "k_proj_lora", None)
-        v_proj_lora = getattr(linear_qkv, "v_proj_lora", None)
-        if q_proj_lora is not None:
-            adapter_weights.append(
-                _simple_adapter_weight(
-                    base_prefix,
-                    q_proj_lora,
-                    adapter_key="adapter_q",
-                )
-            )
-        if k_proj_lora is not None:
-            adapter_weights.append(
-                _simple_adapter_weight(
-                    base_prefix,
-                    k_proj_lora,
-                    adapter_key="adapter_k",
-                )
-            )
-        if v_proj_lora is not None:
-            adapter_weights.append(
-                _simple_adapter_weight(
-                    base_prefix,
-                    v_proj_lora,
-                    adapter_key="adapter_v",
-                )
-            )
-        if adapter_weights:
-            adapter_weights_by_base[f"{base_prefix}.weight"] = adapter_weights
+    add_self_attention_adapter_weights(
+        adapter_weights_by_base,
+        layer_prefix=layer_prefix,
+        self_attention=self_attention,
+    )
 
 
-def add_gated_delta_net_adapter_weights(
+def add_mamba_mixer_adapter_weights(
     adapter_weights_by_base: dict[str, list[Any]],
     *,
     layer_prefix: str,
-    self_attention: Any,
+    mixer: Any,
 ) -> None:
-    out_proj = getattr(self_attention, "out_proj", None)
-    if isinstance(out_proj, SelfAttentionLinearProjLoRA):
-        base_prefix = f"{layer_prefix}.self_attention.out_proj"
-        adapter_weights_by_base[f"{base_prefix}.weight"] = [
-            _simple_adapter_weight(base_prefix, out_proj.lora)
-        ]
+    in_proj = getattr(mixer, "in_proj", None)
+    if isinstance(in_proj, ComponentwiseColumnParallelLinearLoRA):
+        base_prefix = f"{layer_prefix}.mixer.in_proj"
+        _set_adapter_weights(
+            adapter_weights_by_base,
+            base_prefix,
+            _simple_adapter_weight(base_prefix, in_proj.lora),
+        )
+    out_proj = getattr(mixer, "out_proj", None)
+    if isinstance(out_proj, RowParallelLinearLoRA):
+        base_prefix = f"{layer_prefix}.mixer.out_proj"
+        _set_adapter_weights(
+            adapter_weights_by_base,
+            base_prefix,
+            _simple_adapter_weight(base_prefix, out_proj.lora),
+        )
 
-    in_proj = getattr(self_attention, "in_proj", None)
-    if isinstance(in_proj, GatedDeltaNetInProjLoRA):
-        base_prefix = f"{layer_prefix}.self_attention.in_proj"
-        adapter_weights_by_base[f"{base_prefix}.weight"] = [
-            _simple_adapter_weight(
-                base_prefix,
-                in_proj.qkv_lora,
-                adapter_key="adapter_qkv",
-            ),
-            _simple_adapter_weight(
-                base_prefix,
-                in_proj.z_lora,
-                adapter_key="adapter_z",
-            ),
-            _zero_adapter_weight(
-                base_prefix=base_prefix,
-                adapter_key="adapter_b",
-                input_dim=int(in_proj.qkv_lora.A_T.shape[-2]),
-                output_dim=int(in_proj.num_value_heads_per_partition),
-                like=in_proj.qkv_lora.B_T,
-            ),
-            _zero_adapter_weight(
-                base_prefix=base_prefix,
-                adapter_key="adapter_a",
-                input_dim=int(in_proj.qkv_lora.A_T.shape[-2]),
-                output_dim=int(in_proj.num_value_heads_per_partition),
-                like=in_proj.qkv_lora.B_T,
-            ),
-        ]
+
+def _add_dense_mlp_adapter_weights_for_layer(
+    adapter_weights_by_base: dict[str, list[Any]],
+    layer_prefix: str,
+    module: Any,
+) -> None:
+    from art.megatron.model_support.handlers.default_dense import _require_dense_mlp
+
+    _require_dense_mlp(module)
+    add_split_mlp_adapter_weights(
+        adapter_weights_by_base,
+        f"{layer_prefix}.mlp",
+        module.mlp,
+    )
+
+
+def _add_moe_mlp_adapter_weights_for_layer(
+    adapter_weights_by_base: dict[str, list[Any]],
+    layer_prefix: str,
+    module: Any,
+) -> None:
+    from art.megatron.model_support.handlers.default_dense import _require_moe_experts
+
+    add_grouped_moe_adapter_weights(
+        adapter_weights_by_base,
+        layer_prefix=layer_prefix,
+        experts=_require_moe_experts(module),
+    )
+    shared_experts = getattr(module.mlp, "shared_experts", None)
+    if shared_experts is not None:
+        add_split_mlp_adapter_weights(
+            adapter_weights_by_base,
+            f"{layer_prefix}.mlp.shared_experts",
+            shared_experts,
+        )
 
 
 def add_grouped_moe_adapter_weights(
@@ -261,43 +411,51 @@ def add_grouped_moe_adapter_weights(
     experts: Any,
 ) -> None:
     linear_fc1 = getattr(experts, "linear_fc1", None)
-    if isinstance(linear_fc1, MLPExpertsLinearFC1FusedLoRA):
-        base_prefix = f"{layer_prefix}.mlp.experts.linear_fc1"
-        for local_expert_idx in range(linear_fc1.lora.num_local_experts):
-            global_expert_idx = local_expert_idx + linear_fc1.lora._expert_offset
-            adapter_weights_by_base[f"{base_prefix}.weight{global_expert_idx}"] = [
-                _simple_adapter_weight(
-                    base_prefix,
-                    linear_fc1.lora,
-                    expert_idx=local_expert_idx,
-                )
-            ]
-    elif isinstance(linear_fc1, MLPExpertsLinearFC1LoRA):
-        base_prefix = f"{layer_prefix}.mlp.experts.linear_fc1"
-        for local_expert_idx in range(linear_fc1.gate_lora.num_local_experts):
-            global_expert_idx = local_expert_idx + linear_fc1.gate_lora._expert_offset
-            adapter_weights_by_base[f"{base_prefix}.weight{global_expert_idx}"] = [
-                _fused_pair_adapter_weight(
-                    base_prefix,
-                    linear_fc1.gate_lora,
-                    linear_fc1.up_lora,
-                    first_expert_idx=local_expert_idx,
-                    second_expert_idx=local_expert_idx,
-                )
-            ]
+    base_prefix = f"{layer_prefix}.mlp.experts.linear_fc1"
+    if isinstance(linear_fc1, MLPExpertsLinearFC1LoRA):
+        if linear_fc1.non_gated:
+            lora = linear_fc1.up_lora
+            build_weight = lambda local_expert_idx: _simple_adapter_weight(
+                base_prefix,
+                linear_fc1.up_lora,
+                expert_idx=local_expert_idx,
+            )
+        elif linear_fc1.fused_gate_up:
+            lora = linear_fc1.lora
+            build_weight = lambda local_expert_idx: _simple_adapter_weight(
+                base_prefix,
+                linear_fc1.lora,
+                expert_idx=local_expert_idx,
+            )
+        else:
+            lora = linear_fc1.gate_lora
+            build_weight = lambda local_expert_idx: _fused_pair_adapter_weight(
+                base_prefix,
+                linear_fc1.gate_lora,
+                linear_fc1.up_lora,
+                first_expert_idx=local_expert_idx,
+                second_expert_idx=local_expert_idx,
+            )
+        _set_expert_adapter_weights(
+            adapter_weights_by_base,
+            base_prefix,
+            lora,
+            build_weight,
+        )
 
     linear_fc2 = getattr(experts, "linear_fc2", None)
     if isinstance(linear_fc2, MLPExpertsLinearFC2LoRA):
         base_prefix = f"{layer_prefix}.mlp.experts.linear_fc2"
-        for local_expert_idx in range(linear_fc2.lora.num_local_experts):
-            global_expert_idx = local_expert_idx + linear_fc2.lora._expert_offset
-            adapter_weights_by_base[f"{base_prefix}.weight{global_expert_idx}"] = [
-                _simple_adapter_weight(
-                    base_prefix,
-                    linear_fc2.lora,
-                    expert_idx=local_expert_idx,
-                )
-            ]
+        _set_expert_adapter_weights(
+            adapter_weights_by_base,
+            base_prefix,
+            linear_fc2.lora,
+            lambda local_expert_idx: _simple_adapter_weight(
+                base_prefix,
+                linear_fc2.lora,
+                expert_idx=local_expert_idx,
+            ),
+        )
 
 
 def add_dense_mlp_adapter_weights(
@@ -306,28 +464,11 @@ def add_dense_mlp_adapter_weights(
     layer_prefix: str,
     mlp: Any,
 ) -> None:
-    linear_fc1 = getattr(mlp, "linear_fc1", None)
-    if isinstance(linear_fc1, SharedExpertsLinearFC1LoRA):
-        base_prefix = f"{layer_prefix}.mlp.linear_fc1"
-        adapter_weights_by_base[f"{base_prefix}.weight"] = [
-            _simple_adapter_weight(
-                base_prefix,
-                linear_fc1.gate_lora,
-                adapter_key="adapter_gate",
-            ),
-            _simple_adapter_weight(
-                base_prefix,
-                linear_fc1.up_lora,
-                adapter_key="adapter_up",
-            ),
-        ]
-
-    linear_fc2 = getattr(mlp, "linear_fc2", None)
-    if isinstance(linear_fc2, SharedExpertsLinearFC2LoRA):
-        base_prefix = f"{layer_prefix}.mlp.linear_fc2"
-        adapter_weights_by_base[f"{base_prefix}.weight"] = [
-            _simple_adapter_weight(base_prefix, linear_fc2.row_parallel_lora.lora)
-        ]
+    add_split_mlp_adapter_weights(
+        adapter_weights_by_base,
+        f"{layer_prefix}.mlp",
+        mlp,
+    )
 
 
 def add_shared_experts_adapter_weights(
@@ -336,25 +477,40 @@ def add_shared_experts_adapter_weights(
     layer_prefix: str,
     shared_experts: Any,
 ) -> None:
-    linear_fc1 = getattr(shared_experts, "linear_fc1", None)
-    if isinstance(linear_fc1, SharedExpertsLinearFC1LoRA):
-        base_prefix = f"{layer_prefix}.mlp.shared_experts.linear_fc1"
-        adapter_weights_by_base[f"{base_prefix}.weight"] = [
-            _simple_adapter_weight(
-                base_prefix,
-                linear_fc1.gate_lora,
-                adapter_key="adapter_gate",
-            ),
-            _simple_adapter_weight(
-                base_prefix,
-                linear_fc1.up_lora,
-                adapter_key="adapter_up",
-            ),
-        ]
+    add_split_mlp_adapter_weights(
+        adapter_weights_by_base,
+        f"{layer_prefix}.mlp.shared_experts",
+        shared_experts,
+    )
 
-    linear_fc2 = getattr(shared_experts, "linear_fc2", None)
+
+def add_split_mlp_adapter_weights(
+    adapter_weights_by_base: dict[str, list[Any]],
+    base_prefix: str,
+    mlp: Any,
+) -> None:
+    linear_fc1 = getattr(mlp, "linear_fc1", None)
+    if isinstance(linear_fc1, SharedExpertsLinearFC1LoRA):
+        fc1_prefix = f"{base_prefix}.linear_fc1"
+        if linear_fc1.non_gated:
+            _set_adapter_weights(
+                adapter_weights_by_base,
+                fc1_prefix,
+                _simple_adapter_weight(fc1_prefix, linear_fc1.up_lora),
+            )
+        else:
+            _set_lora_weights(
+                adapter_weights_by_base,
+                fc1_prefix,
+                (linear_fc1.gate_lora, "adapter_gate"),
+                (linear_fc1.up_lora, "adapter_up"),
+            )
+
+    linear_fc2 = getattr(mlp, "linear_fc2", None)
     if isinstance(linear_fc2, SharedExpertsLinearFC2LoRA):
-        base_prefix = f"{layer_prefix}.mlp.shared_experts.linear_fc2"
-        adapter_weights_by_base[f"{base_prefix}.weight"] = [
-            _simple_adapter_weight(base_prefix, linear_fc2.row_parallel_lora.lora)
-        ]
+        fc2_prefix = f"{base_prefix}.linear_fc2"
+        _set_adapter_weights(
+            adapter_weights_by_base,
+            fc2_prefix,
+            _simple_adapter_weight(fc2_prefix, linear_fc2.row_parallel_lora.lora),
+        )

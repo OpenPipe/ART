@@ -41,9 +41,21 @@ source .venv/bin/activate
 # Abhängigkeiten installieren
 pip install -r requirements.txt
 
-# Für GPU-Training (CUDA 11.8)
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
-pip install bitsandbytes accelerate peft trl
+# After: Serverless RL with instant feedback
+from art.serverless.backend import ServerlessBackend
+
+model = art.TrainableModel(
+  project="voice-agent",
+  name="agent-001",
+  run_name="agent-001",
+  base_model="Qwen/Qwen3.6-27B"
+)
+
+backend = ServerlessBackend(
+    api_key="your_wandb_api_key"
+)
+model.register(backend)
+# Edit and iterate in minutes, not hours!
 ```
 
 ## 🎮 Nutzung

@@ -30,6 +30,11 @@ on:
         required: true
         default: true
         type: boolean
+      prewarm_modal:
+        description: "Prebuild the pushed image in Modal when auth is configured"
+        required: true
+        default: true
+        type: boolean
       prewarm_infras:
         description: "Space/comma-separated Kubernetes-backed infra targets to prewarm"
         required: true
@@ -177,11 +182,16 @@ jobs:
           PULL_IMAGE_REPO: ${{ inputs.pull_image_repo || 'docker.io/bradhiltonnw/art-gpu' }}
           IMAGE_TAG: ${{ inputs.tag }}
           NO_CACHE: ${{ inputs.no_cache }}
+          MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
+          MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
+          PREWARM_MODAL_INPUT: ${{ inputs.prewarm_modal }}
           PREWARM_NODES: ${{ inputs.prewarm_nodes }}
           PREWARM_TIMEOUT: ${{ inputs.prewarm_timeout }}
         run: |
           IMAGE_TAG="${IMAGE_TAG:-latest}"
           NO_CACHE="${NO_CACHE:-false}"
+          export PREWARM_MODAL="${PREWARM_MODAL:-auto}"
+          PREWARM_MODAL_INPUT="${PREWARM_MODAL_INPUT:-true}"
           PREWARM_NODES="${PREWARM_NODES:-true}"
           PREWARM_TIMEOUT="${PREWARM_TIMEOUT:-30m}"
 
@@ -195,6 +205,10 @@ jobs:
 
           if [ "${NO_CACHE}" = "true" ]; then
             args+=(--no-cache)
+          fi
+
+          if [ "${PREWARM_MODAL_INPUT}" = "false" ]; then
+            args+=(--no-prewarm-modal)
           fi
 
           if [ "${PREWARM_NODES}" != "true" ]; then

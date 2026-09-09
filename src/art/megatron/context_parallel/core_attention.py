@@ -14,7 +14,7 @@ from torch.nn.attention.flex_attention import BlockMask
 
 from art.megatron.flex_attn.attention import (
     FlexAttentionWrapper,
-    SharedPrefixAttentionState,
+    PrefixTreeAttentionState,
     _configure_softmax_offset,
     _triton_num_stages_2_head_dims,
 )
@@ -109,13 +109,13 @@ class ArtContextParallelCoreAttention(torch.nn.Module):
                 softmax_offset=cast(Tensor | None, getattr(self, "softmax_offset")),
             )
         else:
-            if isinstance(attention_bias, SharedPrefixAttentionState):
+            if isinstance(attention_bias, PrefixTreeAttentionState):
                 block_mask = attention_bias.block_mask_for_window(
                     getattr(self, "art_sliding_window", None)
                 )
             else:
                 assert isinstance(attention_bias, BlockMask), (
-                    "Expected ArtContextParallelState, SharedPrefixAttentionState, or BlockMask in attention_bias."
+                    "Expected ArtContextParallelState, PrefixTreeAttentionState, or BlockMask in attention_bias."
                 )
                 block_mask = attention_bias
             q = query.permute(1, 2, 0, 3)

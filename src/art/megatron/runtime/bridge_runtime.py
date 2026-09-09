@@ -1,8 +1,11 @@
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 import contextlib
+import copy
+from dataclasses import replace
 import fnmatch
+import re
 from typing import Any, cast
 
 from megatron.bridge.models.common.unimodal import to_empty_if_meta_device
@@ -11,8 +14,10 @@ from megatron.bridge.models.conversion.param_mapping import (
     ColumnParallelMapping,
     MegatronParamMapping,
     ReplicatedMapping,
+    extract_expert_number_from_param,
     get_module_and_param_from_name,
 )
+from megatron.bridge.models.conversion.utils import unwrap_model
 from megatron.bridge.models.model_provider import ModelProviderMixin
 from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.enums import ModelType
@@ -21,11 +26,22 @@ from megatron.core.transformer.module import Float16Module, MegatronModule
 from megatron.core.utils import get_model_config
 import torch
 
-from art.megatron.model_support.spec import HfWeightSource
+from art.megatron.expert_parallel import (
+    ExpertParallelLayout,
+    get_expert_parallel_layout,
+)
+from art.megatron.model_support.spec import HfWeightSource, ModelSupportHandler
+
+_Fp32PreservedTensor = tuple[torch.nn.Module, str, torch.Tensor, bool]
 
 
 class ExpertTensorSlice:
-    __slots__ = ("global_start", "global_stop", "tensor")
+    __slots__ = (
+        "global_start",
+        "global_stop",
+        "physical_to_logical",
+        "tensor",
+    )
 
     def __init__(
         self,
@@ -33,13 +49,22 @@ class ExpertTensorSlice:
         *,
         global_start: int,
         global_stop: int,
+        physical_to_logical: tuple[int | None, ...] | None = None,
     ) -> None:
         self.tensor = tensor
         self.global_start = int(global_start)
         self.global_stop = int(global_stop)
+        self.physical_to_logical = physical_to_logical
 
     def get(self, global_expert: int) -> torch.Tensor:
         global_expert = int(global_expert)
+        if self.physical_to_logical is not None:
+            logical_expert = self.physical_to_logical[global_expert]
+            if logical_expert is None:
+                raise RuntimeError(
+                    f"masked physical expert {global_expert} has no checkpoint tensor"
+                )
+            global_expert = logical_expert
         if not self.global_start <= global_expert < self.global_stop:
             raise RuntimeError(
                 "expert slice cache miss for global expert "
@@ -112,13 +137,23 @@ def _needs_expert_slice_prefetch(task: Any) -> bool:
         int(getattr(mapping, "ep_size", 1)) > 1
         and bool(getattr(mapping, "is_expert", False))
         and bool(getattr(mapping, "is_grouped_export", False))
-        and isinstance(getattr(mapping, "hf_param", None), str)
+        and isinstance(getattr(mapping, "hf_param", None), (str, Mapping))
     )
 
 
 def _expert_slice_range(task: Any) -> tuple[int, int]:
     mapping = task.mapping
     config = getattr(task.megatron_module, "config", None)
+    layout = get_expert_parallel_layout(config)
+    if layout is not None:
+        local_experts = tuple(
+            expert
+            for expert in layout.local_logical_experts(int(mapping.ep_rank))
+            if expert is not None
+        )
+        if not local_experts:
+            raise RuntimeError(f"EP rank {mapping.ep_rank} owns no logical experts")
+        return local_experts[0], local_experts[-1] + 1
     num_experts = int(getattr(config, "num_moe_experts", 0) or 0)
     ep_size = int(getattr(mapping, "ep_size", 1))
     ep_rank = int(getattr(mapping, "ep_rank", 0))
@@ -164,6 +199,71 @@ def _load_hf_tensor_slice(
 
 def _direct_hf_weight_source(key: str) -> HfWeightSource:
     return HfWeightSource(logical_key=key, physical_key_options=((key,),))
+
+
+_HF_EXPERT_RE = re.compile(r"(?P<prefix>(?:^|\.)experts\.)(?P<expert>\d+)(?=\.|$)")
+
+
+def _logical_hf_param(
+    hf_param: Any,
+    *,
+    physical_expert: int,
+    logical_expert: int,
+) -> Any:
+    if isinstance(hf_param, str):
+        return _HF_EXPERT_RE.sub(
+            lambda match: (
+                f"{match.group('prefix')}{logical_expert}"
+                if int(match.group("expert")) == physical_expert
+                else match.group(0)
+            ),
+            hf_param,
+        )
+    if isinstance(hf_param, Mapping):
+        return {
+            key: _logical_hf_param(
+                value,
+                physical_expert=physical_expert,
+                logical_expert=logical_expert,
+            )
+            for key, value in hf_param.items()
+        }
+    return hf_param
+
+
+def _prepare_nonuniform_expert_tasks(tasks: Iterable[Any]) -> list[Any]:
+    prepared: list[Any] = []
+    for task in tasks:
+        if (
+            task is None
+            or task.megatron_module is None
+            or not bool(getattr(task.mapping, "is_expert", False))
+        ):
+            prepared.append(task)
+            continue
+        layout = get_expert_parallel_layout(
+            getattr(task.megatron_module, "config", None)
+        )
+        if layout is None:
+            prepared.append(task)
+            continue
+        physical_expert = extract_expert_number_from_param(task.mapping.megatron_param)
+        logical_expert = layout.logical_expert(physical_expert)
+        if logical_expert is None:
+            if task.param_weight is None:
+                raise RuntimeError(
+                    f"masked physical expert {physical_expert} has no target parameter"
+                )
+            task.param_weight.data.zero_()
+            continue
+        mapping = copy.copy(task.mapping)
+        mapping.hf_param = _logical_hf_param(
+            mapping.hf_param,
+            physical_expert=physical_expert,
+            logical_expert=logical_expert,
+        )
+        prepared.append(replace(task, mapping=mapping))
+    return prepared
 
 
 def _planned_hf_weight_source(
@@ -240,6 +340,8 @@ def load_unique_hf_keys_once(
     hf_state_dict: Mapping[str, torch.Tensor],
     *,
     bridge: MegatronModelBridge | None = None,
+    extra_keys: Callable[[Iterable[str], Mapping[str, torch.Tensor]], Iterable[str]]
+    | None = None,
 ) -> dict[str, torch.Tensor | ExpertTensorSlice]:
     task_list = list(tasks)
     prefetch_task_by_key: dict[str, Any] = {}
@@ -248,6 +350,9 @@ def load_unique_hf_keys_once(
             continue
         for key in _iter_hf_param_names(task.mapping.hf_param):
             prefetch_task_by_key.setdefault(key, task)
+    if extra_keys is not None:
+        for key in extra_keys(tuple(sorted(prefetch_task_by_key)), hf_state_dict):
+            prefetch_task_by_key.setdefault(key, None)
     keys = sorted(prefetch_task_by_key)
     expert_slice_ranges: dict[str, tuple[int, int]] = {}
     expert_slice_task_by_key: dict[str, Any] = {}
@@ -257,14 +362,14 @@ def load_unique_hf_keys_once(
         if not _needs_expert_slice_prefetch(task):
             continue
         start, stop = _expert_slice_range(task)
-        key = cast(str, task.mapping.hf_param)
-        previous = expert_slice_ranges.get(key)
-        expert_slice_ranges[key] = (
-            (start, stop)
-            if previous is None
-            else (min(previous[0], start), max(previous[1], stop))
-        )
-        expert_slice_task_by_key.setdefault(key, task)
+        for key in _iter_hf_param_names(task.mapping.hf_param):
+            previous = expert_slice_ranges.get(key)
+            expert_slice_ranges[key] = (
+                (start, stop)
+                if previous is None
+                else (min(previous[0], start), max(previous[1], stop))
+            )
+            expert_slice_task_by_key.setdefault(key, task)
     cache: dict[str, torch.Tensor | ExpertTensorSlice] = {}
     direct_physical_by_logical: dict[str, str] = {}
     materialized_source_by_key: dict[str, tuple[HfWeightSource, tuple[str, ...]]] = {}
@@ -312,10 +417,14 @@ def load_unique_hf_keys_once(
             )
         )
     for key, (start, stop) in expert_slice_ranges.items():
+        task = expert_slice_task_by_key.get(key)
+        layout = get_expert_parallel_layout(
+            getattr(getattr(task, "megatron_module", None), "config", None)
+        )
         source = _planned_hf_weight_source(
             bridge,
             key,
-            task=expert_slice_task_by_key.get(key),
+            task=task,
         )
         selected_option = _select_physical_key_option(source, hf_state_dict)
         if source.kind != "direct":
@@ -334,6 +443,9 @@ def load_unique_hf_keys_once(
                 _pin_cpu_tensor(tensor[start:stop]),
                 global_start=start,
                 global_stop=stop,
+                physical_to_logical=(
+                    None if layout is None else layout.physical_to_logical
+                ),
             )
             continue
         if len(selected_option) != 1:
@@ -352,6 +464,9 @@ def load_unique_hf_keys_once(
             ),
             global_start=start,
             global_stop=stop,
+            physical_to_logical=(
+                None if layout is None else layout.physical_to_logical
+            ),
         )
     return cache
 
@@ -415,19 +530,60 @@ def _wrap_with_mp_wrapper(
 ) -> list[MegatronModule]:
     if not (model_config.fp16 or model_config.bf16) or mixed_precision_wrapper is None:
         return model
-    keep_in_fp32: list[tuple[Any, torch.Tensor]] = []
-    for model_module in model:
-        for submodule in model_module.modules():
-            if hasattr(submodule, "_maintain_float32_expert_bias"):
-                expert_bias = getattr(submodule, "expert_bias", None)
-                if expert_bias is not None:
-                    keep_in_fp32.append((submodule, expert_bias.data.clone()))
+    keep_in_fp32 = _collect_fp32_preserved_tensors(model)
     wrapped = [
         mixed_precision_wrapper(model_config, model_module) for model_module in model
     ]
-    for submodule, fp32_data in keep_in_fp32:
-        submodule.expert_bias.data = fp32_data
+    _restore_fp32_preserved_tensors(keep_in_fp32)
     return wrapped
+
+
+def _collect_fp32_preserved_tensors(
+    model: list[MegatronModule],
+) -> list[_Fp32PreservedTensor]:
+    """Snapshot tensors explicitly marked to survive Megatron fp16/bf16 casts."""
+
+    keep_in_fp32: list[_Fp32PreservedTensor] = []
+    for model_module in model:
+        for submodule in model_module.modules():
+            fp32_parameter_names = set(getattr(submodule, "_keep_fp32_parameters", ()))
+            fp32_buffer_names = set(getattr(submodule, "_keep_fp32_buffers", ()))
+            explicit_names = fp32_parameter_names | fp32_buffer_names
+            seen: set[str] = set()
+            if hasattr(submodule, "_maintain_float32_expert_bias"):
+                expert_bias = getattr(submodule, "expert_bias", None)
+                if isinstance(expert_bias, torch.nn.Parameter):
+                    keep_in_fp32.append(
+                        (submodule, "expert_bias", expert_bias.data.clone(), True)
+                    )
+                    seen.add("expert_bias")
+            for name in explicit_names - seen:
+                tensor = getattr(submodule, name, None)
+                if isinstance(tensor, torch.nn.Parameter):
+                    keep_in_fp32.append((submodule, name, tensor.data.clone(), True))
+                    seen.add(name)
+                elif isinstance(tensor, torch.Tensor):
+                    keep_in_fp32.append((submodule, name, tensor.data.clone(), False))
+                    seen.add(name)
+            for name, param in submodule.named_parameters(recurse=False):
+                if name not in seen and getattr(param, "_keep_fp32", False):
+                    keep_in_fp32.append((submodule, name, param.data.clone(), True))
+                    seen.add(name)
+            for name, buffer in submodule.named_buffers(recurse=False):
+                if name not in seen and getattr(buffer, "_keep_fp32", False):
+                    keep_in_fp32.append((submodule, name, buffer.data.clone(), False))
+                    seen.add(name)
+    return keep_in_fp32
+
+
+def _restore_fp32_preserved_tensors(
+    keep_in_fp32: list[_Fp32PreservedTensor],
+) -> None:
+    for submodule, name, fp32_data, is_parameter in keep_in_fp32:
+        if is_parameter:
+            getattr(submodule, name).data = fp32_data
+        else:
+            submodule._buffers[name] = fp32_data
 
 
 def _art_get_model(
@@ -479,6 +635,12 @@ def _art_get_model(
         ]
 
     model = _apply_pre_wrap_hook(model, pre_wrap_hook)
+    handler = cast(
+        ModelSupportHandler | None,
+        getattr(model_provider, "_art_model_support_handler", None),
+    )
+    if handler is not None:
+        handler.prepare_model_for_mixed_precision(model)
     _set_tp_attrs(model)
     model_provider_module._print_num_params(model, pg_collection=pg_collection)
     model_config = get_model_config(model[0])
@@ -492,6 +654,8 @@ def _art_get_model(
             model_module.cuda(torch.cuda.current_device())
 
     model = _wrap_with_mp_wrapper(model, model_config, mixed_precision_wrapper)
+    if handler is not None:
+        handler.validate_model_mixed_precision(model)
     if model_provider_module.correct_amax_history_if_needed is not None:
         model_provider_module.correct_amax_history_if_needed(cast(Any, model))
     if wrap_with_ddp:
@@ -514,9 +678,26 @@ def _column_parallel_hf_to_megatron(
 ) -> torch.Tensor:
     if self.tp_size == 1:
         return hf_weights
-    normalized_param = self._normalize_expert_param_name(self.megatron_param)
+    param_name = self.megatron_param
+    if self.is_expert:
+        # Bridge names experts globally; TE registers rank-local numeric suffixes.
+        expert_digits = param_name[len(param_name.rstrip("0123456789")) :]
+        config = getattr(megatron_module, "config", None)
+        num_experts = int(getattr(config, "num_moe_experts", 0) or 0)
+        if not expert_digits or num_experts <= 0 or num_experts % self.ep_size:
+            raise RuntimeError(
+                "Cannot resolve local expert parameter for "
+                f"{param_name!r}: num_experts={num_experts}, ep_size={self.ep_size}"
+            )
+        experts_per_rank = num_experts // self.ep_size
+        local_expert = int(expert_digits) - self.ep_rank * experts_per_rank
+        if not 0 <= local_expert < experts_per_rank:
+            raise RuntimeError(
+                f"Expert {expert_digits} is not local to EP rank {self.ep_rank}"
+            )
+        param_name = f"{param_name[: -len(expert_digits)]}{local_expert}"
     target_param = get_module_and_param_from_name(
-        cast(Any, megatron_module), normalized_param
+        cast(Any, megatron_module), param_name
     )[1]
     if self.tp_rank == 0:
         full_size = hf_weights.shape[0]
@@ -527,11 +708,13 @@ def _column_parallel_hf_to_megatron(
         splits = list(torch.chunk(hf_weights, self.tp_size, dim=0))
     else:
         splits = None
-    return self.scatter_to_tp_ranks(
+    return _scatter_to_tp_ranks(
+        self,
         splits,
         target_param.shape,
         target_param.dtype,
         target_param.device,
+        output_tensor=target_param.data,
     )
 
 
@@ -542,20 +725,50 @@ def _scatter_to_tp_ranks(
     dtype: torch.dtype,
     device: torch.device,
     src_rank: int = 0,
+    output_tensor: torch.Tensor | None = None,
 ) -> torch.Tensor:
     if self.tp_size == 1:
-        return cast(list[torch.Tensor], splits)[0].to(
-            device=device, dtype=dtype, non_blocking=True
-        )
-    output = torch.empty(output_shape, dtype=dtype, device=device)
+        shard = cast(list[torch.Tensor], splits)[0]
+        if output_tensor is None:
+            return shard.to(device=device, dtype=dtype, non_blocking=True)
+        output_tensor.copy_(shard, non_blocking=True)
+        if output_tensor.device.type == "cuda":
+            torch.cuda.synchronize(output_tensor.device)
+        return output_tensor
+    output = (
+        torch.empty(output_shape, dtype=dtype, device=device)
+        if output_tensor is None
+        else output_tensor
+    )
     dist = cast(Any, torch.distributed)
     global_src = dist.get_global_rank(group=self.tp_group, group_rank=src_rank)
-    scatter_list = None
-    if self.tp_rank == src_rank and splits:
-        scatter_list = [
-            shard.to(device=device, dtype=dtype, non_blocking=True) for shard in splits
-        ]
-    dist.scatter(output, scatter_list, src=global_src, group=self.tp_group)
+    if self.tp_rank == src_rank:
+        if not splits:
+            raise RuntimeError("source TP rank must provide tensor splits")
+        if len(splits) != self.tp_size:
+            raise RuntimeError(
+                f"source TP rank got {len(splits)} tensor splits for TP size "
+                f"{self.tp_size}"
+            )
+        for peer_rank, shard in enumerate(splits):
+            if peer_rank == src_rank:
+                output.copy_(shard, non_blocking=True)
+                continue
+            send_buffer = torch.empty(output_shape, dtype=dtype, device=device)
+            send_buffer.copy_(shard, non_blocking=True)
+            if send_buffer.device.type == "cuda":
+                torch.cuda.current_stream(send_buffer.device).synchronize()
+            dist.send(
+                send_buffer,
+                dst=dist.get_global_rank(group=self.tp_group, group_rank=peer_rank),
+                group=self.tp_group,
+            )
+            if send_buffer.device.type == "cuda":
+                torch.cuda.synchronize(send_buffer.device)
+    else:
+        dist.recv(output, src=global_src, group=self.tp_group)
+    if output.device.type == "cuda":
+        torch.cuda.synchronize(output.device)
     return output
 
 
@@ -577,10 +790,68 @@ def _replicated_hf_to_megatron(
     ):
         broadcast_device = _materialization_device()
     if self.tp_rank == 0:
-        tensor = hf_weights.to(device=cast(Any, broadcast_device), non_blocking=True)
+        tensor = hf_weights.to(
+            device=broadcast_device,
+            non_blocking=True,
+        )
     else:
-        tensor = torch.empty_like(hf_weights, device=cast(Any, broadcast_device))
+        tensor = torch.empty_like(
+            hf_weights,
+            device=broadcast_device,
+        )
     return self.broadcast_tensor_to_tp_ranks(tensor, src_rank=0)
+
+
+def _shared_embedding_broadcast_model(
+    megatron_model: list[MegatronModule],
+) -> list[MegatronModule]:
+    if len(megatron_model) == 1:
+        return megatron_model
+    for chunk in megatron_model:
+        model = unwrap_model(chunk)
+        language_model = getattr(model, "language_model", None)
+        if language_model is not None:
+            model = language_model
+        embedding = getattr(model, "embedding", None)
+        if (
+            getattr(embedding, "word_embeddings", None) is not None
+            or getattr(model, "output_layer", None) is not None
+        ):
+            return [chunk]
+    return megatron_model
+
+
+def _validate_local_pretrained_tasks(
+    bridge: MegatronModelBridge,
+    megatron_model: list[Any],
+    tasks: Iterable[Any],
+) -> None:
+    covered = {
+        id(task.param_weight)
+        for task in tasks
+        if task is not None
+        and task.megatron_module is not None
+        and task.param_weight is not None
+    }
+    config = getattr(unwrap_model(megatron_model)[0], "config", None)
+    tied_output = bool(
+        config is not None and bridge._share_embeddings_and_output_weights(config)
+    )
+    missing = [
+        name
+        for model in megatron_model
+        for name, param in model.named_parameters()
+        if not bridge._is_adapter_param_name(name)
+        and not (tied_output and "output_layer" in name)
+        and id(param) not in covered
+    ]
+    if missing:
+        preview = ", ".join(missing[:8])
+        remainder = f" (+{len(missing) - 8} more)" if len(missing) > 8 else ""
+        raise RuntimeError(
+            "Megatron Bridge did not create pretrained load tasks for "
+            f"{len(missing)} required local parameter(s): {preview}{remainder}"
+        )
 
 
 def _optimized_load_weights_hf_to_megatron(
@@ -597,8 +868,15 @@ def _optimized_load_weights_hf_to_megatron(
         if hasattr(megatron_model[0], "hide_loss_modules"):
             stack.enter_context(megatron_model[0].hide_loss_modules())
         tasks = self.build_conversion_tasks(hf_pretrained, megatron_model)
+        _validate_local_pretrained_tasks(self, megatron_model, tasks)
+        tasks = _prepare_nonuniform_expert_tasks(tasks)
     hf_state_dict = hf_pretrained.state
-    raw_cache = load_unique_hf_keys_once(tasks, hf_state_dict, bridge=self)
+    raw_cache = load_unique_hf_keys_once(
+        tasks,
+        hf_state_dict,
+        bridge=self,
+        extra_keys=getattr(self, "art_extra_hf_prefetch_keys", None),
+    )
     cached_state = _CachedStateLookup(cache=raw_cache, source=hf_state_dict)
     description = f"Loading from {hf_pretrained.model_name_or_path}"
     pending_device_copy = False
@@ -642,12 +920,13 @@ def _optimized_load_weights_hf_to_megatron(
                 f"  Bridge type: {type(task.mapping).__name__}\n"
                 f"  HF mapping: {task.mapping.hf_param}"
             )
-        task.param_weight.data.copy_(converted_weights, non_blocking=True)
+        if converted_weights.data_ptr() != task.param_weight.data.data_ptr():
+            task.param_weight.data.copy_(converted_weights, non_blocking=True)
         if task.param_weight.device.type == "cuda":
             pending_device_copy = True
     if pending_device_copy and torch.cuda.is_available():
         torch.cuda.synchronize()
-    self._broadcast_shared_embeddings(megatron_model)
+    self._broadcast_shared_embeddings(_shared_embedding_broadcast_model(megatron_model))
     return megatron_model
 
 
@@ -657,6 +936,7 @@ def install_art_bridge_runtime_patches() -> None:
     _patch_router_gating_linear_empty_input()
     _patch_bias_swiglu_empty_input()
     _patch_moe_unpermute_empty_input()
+    _patch_nonuniform_expert_export()
     if not getattr(
         model_provider_module.get_model, "__art_meta_materialization__", False
     ):
@@ -684,6 +964,77 @@ def install_art_bridge_runtime_patches() -> None:
             "load_weights_hf_to_megatron",
             _optimized_load_weights_hf_to_megatron,
         )
+
+
+def _patch_nonuniform_expert_export() -> None:
+    original = MegatronParamMapping.gather_from_ep_ranks
+    if getattr(original, "__art_nonuniform_experts__", False):
+        return
+
+    def _gather_from_ep_ranks(
+        self: MegatronParamMapping,
+        megatron_weights: torch.Tensor | None,
+        megatron_module: MegatronModule | None,
+        hf_param_name: Any,
+    ) -> dict[str, torch.Tensor]:
+        if megatron_module is None:
+            payload = self.broadcast_obj_from_pp_rank(
+                None, "art_expert_parallel_layout"
+            )
+            layout = (
+                None
+                if payload is None
+                else ExpertParallelLayout.model_validate(payload)
+            )
+        else:
+            layout = get_expert_parallel_layout(
+                getattr(megatron_module, "config", None)
+            )
+            self.broadcast_obj_from_pp_rank(
+                None if layout is None else layout.model_dump(mode="python"),
+                "art_expert_parallel_layout",
+            )
+        if layout is None or hf_param_name is None:
+            return original(self, megatron_weights, megatron_module, hf_param_name)
+        if isinstance(hf_param_name, Mapping):
+            if megatron_weights is None:
+                return {}
+            gathered = [
+                torch.empty_like(megatron_weights) for _ in range(layout.ep_size)
+            ]
+            torch.distributed.all_gather(
+                gathered, megatron_weights, group=self.ep_group
+            )
+            return {str(hf_param_name): torch.stack(gathered)}
+        if not _HF_EXPERT_RE.search(hf_param_name):
+            return original(self, megatron_weights, megatron_module, hf_param_name)
+        if megatron_weights is None:
+            return {}
+
+        physical_expert = extract_expert_number_from_param(self.megatron_param)
+        local_expert = physical_expert % layout.slots_per_rank
+        gathered = [torch.empty_like(megatron_weights) for _ in range(layout.ep_size)]
+        torch.distributed.all_gather(gathered, megatron_weights, group=self.ep_group)
+        result: dict[str, torch.Tensor] = {}
+        for ep_rank, weight in enumerate(gathered):
+            logical_expert = layout.logical_expert(
+                ep_rank * layout.slots_per_rank + local_expert
+            )
+            if logical_expert is None:
+                continue
+            key = _HF_EXPERT_RE.sub(
+                lambda match: f"{match.group('prefix')}{logical_expert}",
+                hf_param_name,
+            )
+            result[key] = weight
+        return result
+
+    setattr(_gather_from_ep_ranks, "__art_nonuniform_experts__", True)
+    setattr(
+        MegatronParamMapping,
+        "gather_from_ep_ranks",
+        _gather_from_ep_ranks,
+    )
 
 
 def _patch_router_gating_linear_empty_input() -> None:

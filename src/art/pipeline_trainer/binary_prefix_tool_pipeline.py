@@ -19,7 +19,7 @@ import polars as pl
 import art
 from art.tinker_native import TinkerNativeBackend
 
-from . import PipelineTrainer, make_group_rollout_fn
+from . import PipelineRuntimeConfig, PipelineTrainer, make_group_rollout_fn
 
 Scenario = dict[str, Any]
 
@@ -148,7 +148,7 @@ def extract_guess(choice: Any) -> tuple[str | None, str]:
 
 
 def get_model_output_dir(model: art.TrainableModel) -> Path:
-    return Path(model.base_path) / model.project / "models" / model.name
+    return Path(model.base_path) / model.project / "models" / model.run_name
 
 
 def print_history_summary(model: art.TrainableModel, tail: int = 5) -> None:
@@ -219,6 +219,7 @@ async def main() -> None:
 
     backend = TinkerNativeBackend(path=art_path)
     model = art.TrainableModel(
+        run_name=model_name,
         name=model_name,
         project=project,
         base_model=base_model,
@@ -331,10 +332,12 @@ async def main() -> None:
         scenarios=scenario_iter(),
         config=config,
         eval_fn=eval_fn,
-        num_rollout_workers=num_rollout_workers,
-        min_batch_size=min_batch_size,
+        pipeline=PipelineRuntimeConfig(
+            num_rollout_workers=num_rollout_workers,
+            min_batch_size=min_batch_size,
+            max_batch_size=max_batch_size,
+        ),
         max_steps_off_policy=max_steps_off_policy,
-        max_batch_size=max_batch_size,
         learning_rate=float(os.environ.get("LEARNING_RATE", "1e-4")),
         log_interval_seconds=log_interval_seconds,
         eval_every_n_steps=eval_every_n_steps,

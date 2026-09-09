@@ -28,6 +28,7 @@ async def main():
     backend = LocalBackend()
 
     model = art.TrainableModel(
+        run_name="llama-8b-007",
         name="llama-8b-007",
         project="tic-tac-toe",
         base_model="meta-llama/Meta-Llama-3.1-8B-Instruct",

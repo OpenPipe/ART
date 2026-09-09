@@ -224,8 +224,10 @@ def install_megatron_qwen35_gdn_fp32_reference(
     *,
     base_model: str,
 ) -> None:
-    model_key = base_model.lower()
-    if "qwen3.5" not in model_key and "qwen3_5" not in model_key:
+    from art.megatron.model_support.registry import get_model_support_handler
+
+    handler = get_model_support_handler(base_model)
+    if handler.key not in {"qwen3_5_dense", "qwen3_5_moe"}:
         return
     from art.megatron.gdn import operator as gdn_operator
 

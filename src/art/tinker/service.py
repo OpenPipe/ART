@@ -59,6 +59,28 @@ class TinkerService:
     async def vllm_engine_is_sleeping(self) -> bool:
         return False
 
+    async def acquire_exact_adapter(self, step: int, checkpoint_path: str) -> str:
+        del checkpoint_path
+        model_name = f"{self.model_name}@{step}"
+        state = await self._state_task
+        if model_name not in state.models:
+            raise RuntimeError(f"Tinker checkpoint {model_name!r} is not registered")
+        return model_name
+
+    async def release_exact_adapter(self, step: int) -> None:
+        del step
+
+    async def resolve_global_grad_accumulation_sequences(
+        self, config: types.TrainConfig
+    ) -> int:
+        requested = config.grad_accumulation_sequences
+        if requested not in (None, 1):
+            raise ValueError(
+                "TinkerService is configured for grad_accumulation_sequences=1, "
+                f"got {requested}"
+            )
+        return 1
+
     async def aclose(self) -> None:
         if self._server is not None:
             await self._server.stop()

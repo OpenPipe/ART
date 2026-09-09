@@ -8,6 +8,8 @@ import triton.language as tl
 
 from .types import TokenRange
 
+_WARMED_HEAD_MAJOR_KERNELS: set[tuple[str, int | None, torch.dtype, int]] = set()
+
 
 def _single_range(ranges: Sequence[TokenRange]) -> TokenRange | None:
     compact = [range_ for range_ in ranges if range_.size() > 0]
@@ -90,8 +92,7 @@ def _range_gather_head_major_kernel(
     output_head_stride,
     output_token_stride,
     inner_size: tl.constexpr,
-    n_cols: tl.constexpr,
-    n_col_blocks: tl.constexpr,
+    n_cols,
     elem_per_block: tl.constexpr,
 ):
     out_row = tl.program_id(0)
@@ -129,8 +130,7 @@ def _range_reduce_sum_head_major_kernel(
     output_head_stride,
     output_token_stride,
     inner_size: tl.constexpr,
-    n_cols: tl.constexpr,
-    n_col_blocks: tl.constexpr,
+    n_cols,
     elem_per_block: tl.constexpr,
 ):
     in_row = tl.program_id(0)
@@ -196,7 +196,7 @@ def _range_meta(
         dtype=torch.int64,
     )
     cu_range_sizes = torch.cumsum(range_sizes, dim=0)
-    total_size = int(cu_range_sizes[-1].item())
+    total_size = sum(range_.size() for range_ in compact)
     row_map = torch.repeat_interleave(
         torch.arange(len(compact), device=device, dtype=torch.int64),
         range_sizes[1:],
@@ -382,12 +382,44 @@ def _range_gather_head_major_impl(
         output.stride(0),
         output.stride(1),
         inner_size=inner_size,  # ty: ignore[invalid-argument-type]
-        n_cols=n_cols,  # ty: ignore[invalid-argument-type]
-        n_col_blocks=n_col_blocks,
+        n_cols=n_cols,
         elem_per_block=elem_per_block,  # ty: ignore[invalid-argument-type]
         num_warps=4,  # ty: ignore[unknown-argument]
     )
     return output
+
+
+def prepare_range_head_major_kernels(input_tensor: torch.Tensor) -> None:
+    """Compile one shape-polymorphic gather/reduce pair before variable CP plans.
+
+    Prefix trees may not require multi-range Q/KV movement until a late batch.
+    Warm once per device, dtype, and inner dimension so that workload variation
+    cannot expose compilation in a later optimizer step. This enqueues two tiny
+    kernels on the current stream and must remain free of CUDA synchronization.
+    """
+    if not input_tensor.is_cuda:
+        return
+    if input_tensor.ndim < 3:
+        raise RuntimeError(
+            "Head-major range kernel preparation expects [H, T, ...], "
+            f"got {tuple(input_tensor.shape)}"
+        )
+    inner_size = input_tensor.numel() // max(
+        int(input_tensor.shape[0] * input_tensor.shape[1]), 1
+    )
+    key = (
+        input_tensor.device.type,
+        input_tensor.device.index,
+        input_tensor.dtype,
+        inner_size,
+    )
+    if key in _WARMED_HEAD_MAJOR_KERNELS:
+        return
+    probe = input_tensor.new_empty((input_tensor.shape[0], 2, *input_tensor.shape[2:]))
+    ranges = (TokenRange(start=0, end=1), TokenRange(start=1, end=2))
+    gathered = _range_gather_head_major_impl(probe, ranges)
+    range_reduce_sum_head_major_(gathered, output_tensor=probe, ranges=ranges)
+    _WARMED_HEAD_MAJOR_KERNELS.add(key)
 
 
 class _RangeGatherFn(torch.autograd.Function):
@@ -675,8 +707,7 @@ def range_reduce_sum_head_major_(
         output_tensor.stride(0),
         output_tensor.stride(1),
         inner_size=inner_size,  # ty: ignore[invalid-argument-type]
-        n_cols=n_cols,  # ty: ignore[invalid-argument-type]
-        n_col_blocks=n_col_blocks,
+        n_cols=n_cols,
         elem_per_block=elem_per_block,  # ty: ignore[invalid-argument-type]
         num_warps=4,  # ty: ignore[unknown-argument]
     )

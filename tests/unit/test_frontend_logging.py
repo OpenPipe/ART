@@ -119,7 +119,11 @@ class TestFrontendLoggingCompatibility:
 
         # Check expected columns exist
         expected_columns = [
+            "format_version",
             "group_index",
+            "trajectory_index",
+            "group_json",
+            "trajectory_json",
             "group_metadata",
             "group_metrics",
             "group_logs",
@@ -187,7 +191,7 @@ class TestHistoryJsonlCompatibility:
         # Verify required fields
         assert "step" in entry
         assert "recorded_at" in entry
-        assert "val/reward" in entry  # Prefixed metric
+        assert "val/reward" in entry
 
     @pytest.mark.asyncio
     async def test_history_readable_by_polars(
@@ -275,6 +279,7 @@ class TestPathStructure:
         """Verify step numbers are zero-padded to 4 digits."""
         # Create a mock trainable model with step > 0
         model = TrainableModel(
+            run_name="mymodel",
             name="mymodel",
             project="myproj",
             base_model="gpt-4",
@@ -348,14 +353,12 @@ class TestMetricCalculation:
                 "step",
                 "recorded_at",
                 "training_step",
-                "time/wall_clock_sec",
             ]
         ]
         assert all(k.startswith(("val/", "data/")) for k in metric_keys), (
             f"Not all metrics routed into taxonomy namespaces: {metric_keys}"
         )
         assert entry["training_step"] == 0
-        assert entry["time/wall_clock_sec"] >= 0
 
     @pytest.mark.asyncio
     async def test_standard_metrics_present(self, tmp_path: Path):
@@ -435,7 +438,7 @@ class TestMetricCalculation:
         with open(history_path) as f:
             entry = json.loads(f.readline())
 
-        assert entry["val/group_judge_score"] == 0.4
+        assert entry["val/group/judge_score"] == 0.4
 
     @pytest.mark.asyncio
     async def test_exception_rate_calculation(self, tmp_path: Path):
@@ -565,7 +568,7 @@ class TestMetricCalculation:
         assert entry["train/reward"] == 0.7
         assert entry["train/exception_rate"] == 0.0
         assert entry["train/custom_score"] == 1.0
-        assert entry["reward/prefixed"] == 2.0
+        assert entry["train/reward/prefixed"] == 2.0
 
     @pytest.mark.asyncio
     async def test_train_logs_add_default_data_metrics_from_trajectory_groups(
@@ -751,8 +754,8 @@ class TestMetricCalculation:
             split="train",
             step=1,
             metrics={
-                "time/step_actor_s": 1.5,
-                "data/step_actor_tokens": 10,
+                "time/step_rollout_s": 1.5,
+                "data/step_rollout_tokens": 10,
             },
         )
 
@@ -760,10 +763,10 @@ class TestMetricCalculation:
         with open(history_path) as f:
             entry = json.loads(f.readline())
 
-        assert entry["time/step_actor_s"] == pytest.approx(1.5)
-        assert entry["time/cum/actor_s"] == pytest.approx(1.5)
-        assert entry["data/step_actor_tokens"] == pytest.approx(10)
-        assert entry["data/cum/actor_tokens"] == pytest.approx(10)
+        assert entry["time/step_rollout_s"] == pytest.approx(1.5)
+        assert entry["time/cum/rollout_s"] == pytest.approx(1.5)
+        assert entry["data/step_rollout_tokens"] == pytest.approx(10)
+        assert entry["data/cum/rollout_tokens"] == pytest.approx(10)
 
     @pytest.mark.asyncio
     async def test_log_without_new_builder_metrics_skips_extra_taxonomy_row(
@@ -782,8 +785,8 @@ class TestMetricCalculation:
             split="train",
             step=1,
             metrics={
-                "time/step_trainer_s": 2.0,
-                "data/step_trainer_tokens": 20.0,
+                "time/step_backend_train_s": 2.0,
+                "data/step_trainable_assistant_tokens": 20.0,
             },
         )
         await model.log(
@@ -908,6 +911,7 @@ class TestLocalBackendAutomaticMetrics:
 
         with patch("art.model.time.monotonic", side_effect=[100.0, 106.0, 111.0]):
             model = TrainableModel(
+                run_name="test-model",
                 name="test-model",
                 project="test-project",
                 base_model="Qwen/Qwen3-4B-Instruct-2507",
@@ -964,6 +968,7 @@ class TestLocalBackendAutomaticMetrics:
                         return_value="NVIDIA A100-SXM4-80GB",
                     ):
                         model = TrainableModel(
+                            run_name="test-model",
                             name="test-model",
                             project="test-project",
                             base_model="Qwen/Qwen3-4B-Instruct-2507",
@@ -1019,6 +1024,7 @@ class TestTrainSFTMetricsAggregation:
     async def test_train_sft_aggregates_metrics(self, tmp_path: Path):
         """Verify train_sft logs batch metrics plus an aggregate checkpoint row."""
         model = TrainableModel(
+            run_name="test-sft",
             name="test-sft",
             project="test-project",
             base_model="Qwen/Qwen2.5-0.5B-Instruct",
@@ -1086,13 +1092,14 @@ class TestTrainSFTMetricsAggregation:
         summary = summary_entries[0]
         assert summary["loss/train"] == pytest.approx(0.8)  # (1.0 + 0.8 + 0.6) / 3
         assert summary["loss/grad_norm"] == pytest.approx(0.4)  # (0.5 + 0.4 + 0.3) / 3
-        assert summary["time/step_trainer_s"] >= 0
-        assert summary["time/cum/trainer_s"] >= 0
+        assert summary["time/step_backend_train_s"] >= 0
+        assert summary["time/cum/backend_train_s"] >= 0
 
     @pytest.mark.asyncio
     async def test_train_sft_single_step_increment(self, tmp_path: Path):
         """Verify train_sft results in single step increment regardless of batch count."""
         model = TrainableModel(
+            run_name="test-sft-step",
             name="test-sft-step",
             project="test-project",
             base_model="gpt-4",
@@ -1138,6 +1145,7 @@ class TestTrainSFTMetricsAggregation:
     async def test_train_sft_no_metrics_when_empty(self, tmp_path: Path):
         """Verify train_sft handles empty training gracefully."""
         model = TrainableModel(
+            run_name="test-sft-empty",
             name="test-sft-empty",
             project="test-project",
             base_model="gpt-4",
@@ -1168,6 +1176,7 @@ class TestTrainSFTMetricsAggregation:
     async def test_train_sft_logs_every_gradient_step(self, tmp_path: Path):
         """Verify train_sft logs every SFT optimizer metric row."""
         model = TrainableModel(
+            run_name="test-sft-every-step",
             name="test-sft-every-step",
             project="test-project",
             base_model="gpt-4",
@@ -1226,6 +1235,7 @@ class TestTrainSFTMetricsAggregation:
 
         backend = RemoteLoggingBackend()
         model = TrainableModel(
+            run_name="test-sft-remote",
             name="test-sft-remote",
             project="test-project",
             base_model="gpt-4",
@@ -1249,6 +1259,7 @@ class TestGradientStepMetrics:
         self, tmp_path: Path
     ):
         model = TrainableModel(
+            run_name="test-backend-train",
             name="test-backend-train",
             project="test-project",
             base_model="gpt-4",
@@ -1264,7 +1275,7 @@ class TestGradientStepMetrics:
                     TRAIN_GRADIENT_STEPS_KEY: 2.0,
                 }
 
-        backend._train_model = mock_train_model  # type: ignore[method-assign]
+        setattr(backend, "_train_model", mock_train_model)
         backend._get_step = AsyncMock(return_value=1)  # type: ignore[method-assign]
 
         groups = [

@@ -43,8 +43,10 @@ async def main():
     backend = TinkerBackend()
     global model
     base_model = os.environ.get("BASE_MODEL", "Qwen/Qwen3-30B-A3B-Instruct-2507")
+    run_name = os.environ.get("MODEL_NAME", "012")
     model = art.TrainableModel(
-        name=os.environ.get("MODEL_NAME", "012"),
+        name=run_name,
+        run_name=run_name,
         project="yes-no-maybe",
         base_model=base_model,
         # _internal_config=art.dev.InternalModelConfig(

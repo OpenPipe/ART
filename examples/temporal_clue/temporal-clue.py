@@ -55,6 +55,7 @@ async def rollout(model: art.Model, puzzle: TemporalCluePuzzle) -> art.Trajector
 
 async def main():
     model = art.TrainableModel(
+        run_name="001",
         name="001",
         project="temporal-clue",
         base_model="Qwen/Qwen2.5-7B-Instruct",

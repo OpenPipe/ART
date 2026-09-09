@@ -3,7 +3,13 @@ from collections import Counter
 from contextlib import asynccontextmanager
 from typing import AsyncIterator
 
-from art.adapter_leases import pin_inference_step, pinned_inference_step
+from art.adapter_leases import (
+    in_flight_lora_name,
+    pin_inference_step,
+    pin_inference_target,
+    pinned_inference_name,
+    pinned_inference_step,
+)
 
 
 class AdapterLeaseManager:
@@ -26,3 +32,8 @@ class AdapterLeaseManager:
 
     def active_steps(self) -> set[int]:
         return set(self._counts)
+
+    @asynccontextmanager
+    async def prune_guard(self) -> AsyncIterator[set[int]]:
+        async with self._condition:
+            yield self.active_steps()

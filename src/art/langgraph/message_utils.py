@@ -1,5 +1,5 @@
 import json
-from typing import List, Union
+from typing import List, Union, cast
 
 from langchain_core.messages import (
     AIMessage,
@@ -88,7 +88,7 @@ def langchain_msg_to_openai(msg: BaseMessage):
 
 
 def convert_langgraph_messages(messages: List[object]) -> MessagesAndChoices:
-    converted = []
+    converted: MessagesAndChoices = []
 
     for msg in messages:
         response_metadata = getattr(msg, "response_metadata")
@@ -116,7 +116,7 @@ def convert_langgraph_messages(messages: List[object]) -> MessagesAndChoices:
         elif isinstance(msg, BaseMessage):
             converted.append(langchain_msg_to_openai(msg))
         elif isinstance(msg, dict):
-            converted.append(msg)
+            converted.append(cast(Message, msg))
         else:
             raise TypeError(f"Unsupported message type: {type(msg)}")
 

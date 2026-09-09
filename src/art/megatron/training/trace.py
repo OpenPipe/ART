@@ -156,12 +156,14 @@ def attach_trace_token_uids(
     token_uids: torch.Tensor | None,
 ) -> Iterator[None]:
     attach_module_token_uids = trace_token_uids_enabled()
-    _set_root_output_trace_token_uids(model_chunks[0], token_uids)
+    for chunk in model_chunks:
+        _set_root_output_trace_token_uids(chunk, token_uids)
     if attach_module_token_uids:
         _set_module_trace_token_uids(model_chunks, token_uids)
     try:
         yield
     finally:
-        _set_root_output_trace_token_uids(model_chunks[0], None)
+        for chunk in model_chunks:
+            _set_root_output_trace_token_uids(chunk, None)
         if attach_module_token_uids:
             _set_module_trace_token_uids(model_chunks, None)

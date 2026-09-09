@@ -1,0 +1,29 @@
+name: trainer-rank-gpu-validation
+
+workdir: .
+
+resources:
+  accelerators: H200:2
+  image_id: docker:docker.io/bradhiltonnw/art-gpu:latest
+
+setup: |
+  INSTALL_VLLM_RUNTIME=false bash src/art/megatron/setup.sh
+  uv sync --project megatron_runtime --extra cuda12 --group test \
+    --frozen --no-install-project --inexact
+
+run: |
+  timeout --signal=TERM --kill-after=30s 20m \
+    bash scripts/ci/trainer-rank-gpu-tests.sh
+
+config:
+  kubernetes:
+    pod_config:
+      spec:
+        schedulerName: binpack-scheduler
+        activeDeadlineSeconds: 3600
+        containers:
+          - name: ray-node
+            imagePullPolicy: Always
+            env:
+              - name: UV_LINK_MODE
+                value: copy

@@ -209,13 +209,7 @@ async def pull_model_from_s3(
         prefix=prefix,
     )
     await ensure_bucket_exists(s3_bucket)
-    if verbose:
-        print(f"DEBUG: S3 sync from {s3_path} to {local_dir}")
     await s3_sync(s3_path, local_dir, verbose=verbose, delete=delete, exclude=exclude)
-    if verbose:
-        print(
-            f"DEBUG: After sync, local_dir contents: {os.listdir(local_dir) if os.path.exists(local_dir) else 'Does not exist'}"
-        )
 
     return local_model_dir
 
@@ -258,8 +252,6 @@ async def push_model_to_s3(
     )
 
     await ensure_bucket_exists(s3_bucket)
-    if verbose:
-        print(f"DEBUG: S3 sync from {local_model_dir} to {s3_path}")
     await s3_sync(local_model_dir, s3_path, verbose=verbose, delete=delete)
 
 

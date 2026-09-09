@@ -20,4 +20,4 @@ def calculate_step_std_dev(trajectory_groups: list[TrajectoryGroup]) -> float:
     if len(std_devs) == 0:
         return 0
 
-    return sum(std_devs) / len(std_devs)
+    return float(sum(std_devs) / len(std_devs))

@@ -9,7 +9,9 @@ Replace the current `model.train(trajectory_groups, config)` API with a backend-
 Training is currently invoked through the model:
 
 ```python
-model = art.TrainableModel(name="my-model", project="my-project", base_model="...")
+model = art.TrainableModel(
+    name="my-model", run_name="my-model", project="my-project", base_model="..."
+)
 await model.register(backend)
 
 # Training call
@@ -69,7 +71,9 @@ The model is a *specification* (name, project, base_model, config). The backend 
 ### New API
 
 ```python
-model = art.TrainableModel(name="my-model", project="my-project", base_model="...")
+model = art.TrainableModel(
+    name="my-model", run_name="my-model", project="my-project", base_model="..."
+)
 await model.register(backend)
 
 # Backend-first training call

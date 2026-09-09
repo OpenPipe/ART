@@ -30,6 +30,7 @@ async def main():
     backend = LocalBackend()
 
     model = art.TrainableModel(
+        run_name=MODEL_NAME,
         name=MODEL_NAME,
         project=PROJECT_NAME,
         base_model=BASE_MODEL,

@@ -5,7 +5,7 @@ from typing import Any, cast
 import torch
 from torch._dynamo import config as dynamo_config
 import torch.distributed as dist
-from torch.nn.attention.flex_attention import AuxOutput, AuxRequest, BlockMask
+from torch.nn.attention.flex_attention import BlockMask
 import triton
 import triton.language as tl
 
@@ -16,20 +16,21 @@ from art.megatron.flex_attn.compiled import (
     get_sparse_compiled_flex_attention,
     normalize_flex_lse,
     normalize_sparse_block_size,
+    prepare_sparse_flex_attention,
     select_sparse_execution_family,
     sparse_compiled_flex_attention,
 )
 
-from .block_mask import build_block_mask
+from .block_mask import build_block_mask_from_context, prepare_block_mask_context
 from .comm import A2AVCommunicator
 from .range_ops import (
+    prepare_range_head_major_kernels,
     range_gather_head_major,
     range_reduce_sum_,
     range_reduce_sum_head_major_,
 )
 from .types import (
     ArtContextParallelState,
-    AttnSlice,
     CpBlockMaskVariant,
     DkvReducePlan,
     ExactMaskMetadata,
@@ -669,6 +670,7 @@ class FlexAttentionKernel:
         backend = flex_backend_for_head_dims(
             head_dim=int(q.shape[-1]),
             head_dim_v=int(v.shape[-1]),
+            device=q.device,
         )
         if compile_key is None:
             _q_len, _k_len, compile_key = select_sparse_execution_family(
@@ -686,23 +688,24 @@ class FlexAttentionKernel:
                 head_dim=int(q.shape[-1]),
                 head_dim_v=int(v.shape[-1]),
                 triton_num_stages_2_head_dims=self.triton_num_stages_2_head_dims,
+                device=q.device,
             )
         )
-        out, aux = cast(
-            tuple[torch.Tensor, AuxOutput],
-            compiled_flex_attention(
-                q,
-                k,
-                v,
-                block_mask=block_mask,
-                scale=scale,
-                enable_gqa=enable_gqa,
-                return_aux=AuxRequest(lse=True),
-            ),
+        prepare_sparse_flex_attention(
+            q,
+            k,
+            v,
+            block_mask=block_mask,
+            enable_gqa=enable_gqa,
         )
-        lse = aux.lse
-        if lse is None:
-            raise RuntimeError("Compiled flex attention did not return lse.")
+        out, lse = compiled_flex_attention(
+            q,
+            k,
+            v,
+            block_mask=block_mask,
+            scale=scale,
+            enable_gqa=enable_gqa,
+        )
         lse = normalize_flex_lse(lse, backend=backend)
         return out, lse
 
@@ -748,19 +751,26 @@ def _build_stage_block_mask(
         raise RuntimeError(
             f"Stage {stage_plan.stage_index} is missing exact mask metadata"
         )
-    mask = build_block_mask(
+    block_mask_context = state.execution_cache.block_mask_context
+    if block_mask_context is None:
+        block_mask_context = prepare_block_mask_context(
+            group_ids=state.group_ids,
+            parent_ids=state.parent_ids,
+            input_pos=state.input_pos,
+        )
+        state.execution_cache.block_mask_context = block_mask_context
+    mask = build_block_mask_from_context(
         FlexMaskSpec(
             q_len=int(execution_spec.q_len),
             k_len=int(execution_spec.k_len),
             block_size=resolved_block_size,
             slices=stage_plan.slices,
-            exact_mask=mask_metadata.model_dump(mode="python"),
+            exact_mask=mask_metadata,
         ),
-        group_ids=state.group_ids,
-        parent_ids=state.parent_ids,
-        input_pos=state.input_pos,
+        context=block_mask_context,
         sliding_window=sliding_window,
         device=device,
+        validate=False,
     )
     cache[cache_key] = mask
     return mask
@@ -849,30 +859,6 @@ def prepare_context_parallel_execution_state(
                 block_size=variant.block_size,
                 sliding_window=variant.sliding_window,
             )
-
-
-def _causal_slice_pair_count(slice_: AttnSlice) -> int:
-    q_start = int(slice_.q_range.start)
-    q_end = int(slice_.q_range.end)
-    k_start = int(slice_.k_range.start)
-    k_end = int(slice_.k_range.end)
-    if q_end <= q_start or k_end <= k_start:
-        return 0
-
-    k_len = k_end - k_start
-    partial_q_start = max(q_start, k_start)
-    partial_q_end = min(q_end - 1, k_end - 2)
-    partial = 0
-    if partial_q_start <= partial_q_end:
-        count = partial_q_end - partial_q_start + 1
-        partial = count * (partial_q_start + partial_q_end + 2 - 2 * k_start) // 2
-
-    full_q_start = max(q_start, k_end - 1)
-    full_q_end = q_end - 1
-    full = 0
-    if full_q_start <= full_q_end:
-        full = (full_q_end - full_q_start + 1) * k_len
-    return int(partial + full)
 
 
 def _validate_stage_block_alignment(
@@ -1038,9 +1024,9 @@ def _run_stage_attention(
         head_major=input_head_major,
     )
     if input_head_major:
-        q_flex = q_stage.unsqueeze(0)
-        k_flex = k_stage.unsqueeze(0)
-        v_flex = v_stage.unsqueeze(0)
+        q_flex = q_stage.unsqueeze(0).contiguous()
+        k_flex = k_stage.unsqueeze(0).contiguous()
+        v_flex = v_stage.unsqueeze(0).contiguous()
     else:
         q_flex = q_stage.permute(1, 0, 2).unsqueeze(0).contiguous()
         k_flex = k_stage.permute(1, 0, 2).unsqueeze(0).contiguous()
@@ -1904,11 +1890,14 @@ def _flatten_qkv(
     value: torch.Tensor,
     state: ArtContextParallelState,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    return (
+    flattened = (
         flatten_valid_sequence_head_major(query, state.rank_plan.local_valid_lengths),
         flatten_valid_sequence_head_major(key, state.rank_plan.local_valid_lengths),
         flatten_valid_sequence_head_major(value, state.rank_plan.local_valid_lengths),
     )
+    for tensor in flattened:
+        prepare_range_head_major_kernels(tensor)
+    return flattened
 
 
 def _run_context_parallel_forward(
@@ -2252,16 +2241,16 @@ def _run_context_parallel_backward(
             grad_outputs=tuple(stage_output_grads),
             allow_unused=True,
         )
-        grad_map = {
+        grad_map: dict[str, torch.Tensor | None] = {
             name: grad for name, grad in zip(input_names, input_grads, strict=True)
         }
         for grad_name in ("q_input", "k_input", "v_input"):
             grad_map[grad_name] = _sanitize_nested_stage_input_grad(
-                cast(torch.Tensor | None, grad_map.get(grad_name)),
+                grad_map.get(grad_name),
             )
         _scatter_stage_grad(
             target=dq_flat,
-            grad=cast(torch.Tensor | None, grad_map.get("q_input")),
+            grad=grad_map.get("q_input"),
             ranges=stage_plan.owner_local_q_ranges,
             state=state,
             head_major=True,
@@ -2269,14 +2258,14 @@ def _run_context_parallel_backward(
         if stage_plan.is_local_stage:
             _scatter_stage_grad(
                 target=dk_flat,
-                grad=cast(torch.Tensor | None, grad_map.get("k_input")),
+                grad=grad_map.get("k_input"),
                 ranges=stage_plan.owner_local_k_ranges,
                 state=state,
                 head_major=True,
             )
             _scatter_stage_grad(
                 target=dv_flat,
-                grad=cast(torch.Tensor | None, grad_map.get("v_input")),
+                grad=grad_map.get("v_input"),
                 ranges=stage_plan.owner_local_k_ranges,
                 state=state,
                 head_major=True,
@@ -2286,8 +2275,8 @@ def _run_context_parallel_backward(
             stage_record.clear()
             continue
         if not stage_plan.is_local_stage:
-            dk_remote = cast(torch.Tensor | None, grad_map.get("k_input"))
-            dv_remote = cast(torch.Tensor | None, grad_map.get("v_input"))
+            dk_remote = grad_map.get("k_input")
+            dv_remote = grad_map.get("v_input")
             if dk_remote is None:
                 dk_remote = k_flat.new_empty((k_flat.shape[0], 0, k_flat.shape[2]))
             if dv_remote is None:

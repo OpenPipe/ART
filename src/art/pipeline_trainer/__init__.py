@@ -1,3 +1,5 @@
+from art.pipeline_tuner import PipelineAutotuneConfig, PipelineRuntimeConfig
+
 from .checkpoint_retention import (
     CHECKPOINT_CREATED_AT_METRIC,
     CHECKPOINT_EVAL_COMPLETED_METRIC,
@@ -19,6 +21,8 @@ __all__ = [
     "CheckpointRetentionContext",
     "CheckpointRetentionStrategy",
     "PipelineTrainer",
+    "PipelineAutotuneConfig",
+    "PipelineRuntimeConfig",
     "make_group_rollout_fn",
     "keep_recent_and_top",
     "StatusReporter",

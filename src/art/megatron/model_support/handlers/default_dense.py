@@ -1,4 +1,5 @@
-from typing import Any, Sequence
+from contextlib import AbstractContextManager, nullcontext
+from typing import Any, Callable, Literal, Sequence
 
 import torch
 
@@ -8,7 +9,7 @@ from art.megatron.model_support.spec import (
     FlexAttentionCompileCrashConfig,
     HfWeightSource,
     LayerFamilyInstance,
-    RolloutWeightsMode,
+    PrefixTreeModelStateContext,
     SharedExpertCompileState,
 )
 
@@ -23,6 +24,14 @@ def _compile_workaround_flags_for_provider(
     base_flags: tuple[str, ...] = (),
 ) -> tuple[str, ...]:
     flags = base_flags
+    if int(getattr(provider, "num_moe_experts", 0) or 0) > 0:
+        # Megatron's all-to-all dispatcher performs side-stream D2H copies and
+        # record_stream lifetime management inside this method. Those effects
+        # cannot be functionalized by Dynamo and do not benefit from compile.
+        flags = (*flags, "alltoall_dispatch_dtoh")
+        # HybridEP owns native communication, dynamic routing metadata, and
+        # side-stream lifetimes. Keep only Megatron's thin flex wrapper eager.
+        flags = (*flags, "flex_token_dispatch_combine")
     if (
         bool(getattr(provider, "sequence_parallel", False))
         and int(getattr(provider, "tensor_model_parallel_size", 1) or 1) > 1
@@ -36,11 +45,16 @@ def _compile_workaround_flags_for_provider(
 class DefaultDenseHandler:
     key = "default_dense"
     build_gdn_execution_spec = False
+    has_recurrent_layers = False
     is_moe = False
+    cp_supported = True
     native_vllm_lora_status = "disabled"
 
     def identity_lora_model_config(self, base_config: Any) -> Any:
         return base_config
+
+    def identity_lora_model_context(self) -> AbstractContextManager[None]:
+        return nullcontext()
 
     def identity_lora_target_parameters(
         self,
@@ -96,12 +110,23 @@ class DefaultDenseHandler:
         del provider
         return None
 
-    def vllm_engine_args(
+    def context_parallel_workload_profile(self, provider: Any) -> Any | None:
+        del provider
+        return None
+
+    def default_chat_template(self) -> str | None:
+        return None
+
+    def configure_tokenizer(
         self,
+        tokenizer: Any,
         *,
-        rollout_weights_mode: RolloutWeightsMode,
-    ) -> dict[str, object]:
-        del rollout_weights_mode
+        internal_config: Any,
+    ) -> Any:
+        del internal_config
+        return tokenizer
+
+    def vllm_engine_args(self) -> dict[str, object]:
         return {}
 
     def vllm_server_args(self) -> dict[str, object]:
@@ -111,6 +136,65 @@ class DefaultDenseHandler:
         del model_chunks
         return None
 
+    def prepare_model_for_mixed_precision(self, model_chunks: Sequence[Any]) -> None:
+        del model_chunks
+
+    def validate_model_mixed_precision(self, model_chunks: Sequence[Any]) -> None:
+        del model_chunks
+
+    def build_pipeline_microbatch_activator(
+        self,
+        model_chunks: Sequence[Any],
+    ) -> Callable[[Any, int], None] | None:
+        del model_chunks
+        return None
+
+    def preserve_pipeline_microbatch_activation(
+        self,
+        model_chunks: Sequence[Any],
+    ):
+        del model_chunks
+        return nullcontext()
+
+    def build_prefix_tree_model_state(
+        self,
+        context: PrefixTreeModelStateContext,
+    ) -> dict[str, Any]:
+        del context
+        return {}
+
+    def zero_internal_padding_grads(self, model_chunks: Sequence[Any]) -> None:
+        del model_chunks
+        return None
+
+    def zero_internal_padding_params(self, model_chunks: Sequence[Any]) -> None:
+        del model_chunks
+        return None
+
+    def canonicalize_loaded_lora_state(
+        self,
+        state: dict[str, Any],
+        model_chunks: Sequence[Any],
+    ) -> dict[str, Any]:
+        del model_chunks
+        return state
+
+    def correctness_precision(self) -> Literal["bf16", "fp32"]:
+        return "fp32"
+
+    def correctness_use_fp32_lora_reference(self) -> bool:
+        return True
+
+    def correctness_phase_pass_fns(self, oracle_harness: Any) -> dict[str, Any] | None:
+        del oracle_harness
+        return None
+
+    def correctness_suite_topologies(self, oracle_harness: Any) -> list[Any]:
+        return oracle_harness.selected_suite_topologies(
+            is_moe=self.is_moe,
+            cp_supported=self.cp_supported,
+        )
+
     def to_vllm_lora_tensors(
         self,
         tensors: dict[str, torch.Tensor],
@@ -118,6 +202,12 @@ class DefaultDenseHandler:
         adapter_config: dict[str, Any],
     ) -> tuple[dict[str, torch.Tensor], dict[str, Any]]:
         return tensors, adapter_config
+
+    def to_vllm_lora_config(self, adapter_config: dict[str, Any]) -> dict[str, Any]:
+        return adapter_config
+
+    def vllm_lora_conversion_is_view_only(self) -> bool:
+        return False
 
     def from_vllm_lora_tensors(
         self,
@@ -161,7 +251,7 @@ class DefaultDenseHandler:
 
         from art.megatron.lora import (
             _adapter_model_prefix,
-            wrap_dense_mlp,
+            wrap_split_mlp_lora,
             wrap_standard_self_attention,
         )
 
@@ -170,18 +260,19 @@ class DefaultDenseHandler:
             for module in chunk.modules():
                 if not isinstance(module, TransformerLayer):
                     continue
+                adapter_model_prefix = _adapter_model_prefix(module)
                 wrap_standard_self_attention(
                     module.self_attention,
-                    adapter_model_prefix=_adapter_model_prefix(module),
+                    adapter_model_prefix=adapter_model_prefix,
                     provider=provider,
                     target_modules=target_set,
                     rank=rank,
                     alpha=alpha,
                 )
                 _require_dense_mlp(module)
-                wrap_dense_mlp(
+                wrap_split_mlp_lora(
                     module.mlp,
-                    adapter_model_prefix=_adapter_model_prefix(module),
+                    adapter_model_prefix=f"{adapter_model_prefix}.mlp",
                     provider=provider,
                     target_modules=target_set,
                     rank=rank,
@@ -192,32 +283,9 @@ class DefaultDenseHandler:
         self,
         model_chunks: Sequence[Any],
     ) -> dict[str, list[Any]]:
-        from megatron.core.transformer.transformer_layer import TransformerLayer
+        from art.megatron.weights import adapter_export
 
-        from art.megatron.weights.adapter_export import (
-            add_dense_mlp_adapter_weights,
-            add_standard_self_attention_adapter_weights,
-            layer_base_prefix,
-        )
-
-        adapter_weights_by_base: dict[str, list[Any]] = {}
-        for chunk in model_chunks:
-            for module_name, module in chunk.named_modules():
-                if not isinstance(module, TransformerLayer):
-                    continue
-                layer_prefix = layer_base_prefix(module, module_name=module_name)
-                _require_dense_mlp(module)
-                add_standard_self_attention_adapter_weights(
-                    adapter_weights_by_base,
-                    layer_prefix=layer_prefix,
-                    self_attention=module.self_attention,
-                )
-                add_dense_mlp_adapter_weights(
-                    adapter_weights_by_base,
-                    layer_prefix=layer_prefix,
-                    mlp=module.mlp,
-                )
-        return adapter_weights_by_base
+        return adapter_export.build_transformer_layer_adapter_weights(model_chunks)
 
     def compile_workaround_config(
         self,
@@ -267,7 +335,7 @@ class DefaultMoeHandler(DefaultDenseHandler):
         from art.megatron.lora import (
             _adapter_model_prefix,
             wrap_grouped_moe_experts,
-            wrap_shared_experts_mlp,
+            wrap_split_mlp_lora,
             wrap_standard_self_attention,
         )
 
@@ -294,9 +362,9 @@ class DefaultMoeHandler(DefaultDenseHandler):
                 )
                 shared_experts = getattr(module.mlp, "shared_experts", None)
                 if shared_experts is not None:
-                    wrap_shared_experts_mlp(
+                    wrap_split_mlp_lora(
                         shared_experts,
-                        adapter_model_prefix=adapter_model_prefix,
+                        adapter_model_prefix=f"{adapter_model_prefix}.mlp.shared_expert",
                         provider=provider,
                         target_modules=target_set,
                         rank=rank,
@@ -307,39 +375,12 @@ class DefaultMoeHandler(DefaultDenseHandler):
         self,
         model_chunks: Sequence[Any],
     ) -> dict[str, list[Any]]:
-        from megatron.core.transformer.transformer_layer import TransformerLayer
+        from art.megatron.weights import adapter_export
 
-        from art.megatron.weights.adapter_export import (
-            add_grouped_moe_adapter_weights,
-            add_shared_experts_adapter_weights,
-            add_standard_self_attention_adapter_weights,
-            layer_base_prefix,
+        return adapter_export.build_transformer_layer_adapter_weights(
+            model_chunks,
+            grouped_moe=True,
         )
-
-        adapter_weights_by_base: dict[str, list[Any]] = {}
-        for chunk in model_chunks:
-            for module_name, module in chunk.named_modules():
-                if not isinstance(module, TransformerLayer):
-                    continue
-                layer_prefix = layer_base_prefix(module, module_name=module_name)
-                add_standard_self_attention_adapter_weights(
-                    adapter_weights_by_base,
-                    layer_prefix=layer_prefix,
-                    self_attention=module.self_attention,
-                )
-                add_grouped_moe_adapter_weights(
-                    adapter_weights_by_base,
-                    layer_prefix=layer_prefix,
-                    experts=_require_moe_experts(module),
-                )
-                shared_experts = getattr(module.mlp, "shared_experts", None)
-                if shared_experts is not None:
-                    add_shared_experts_adapter_weights(
-                        adapter_weights_by_base,
-                        layer_prefix=layer_prefix,
-                        shared_experts=shared_experts,
-                    )
-        return adapter_weights_by_base
 
 
 def _require_dense_mlp(module: Any) -> None:

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import os
-from typing import Any, cast
+from typing import Any
 
 import torch
 
@@ -73,104 +73,36 @@ def _install_self_attn_linear_proj_reduce_scatter_workaround() -> None:
     art_lora.reduce_scatter_to_sequence_parallel_region = wrapped  # type: ignore[assignment]
 
 
-class _WeightedSwiGLUNoInnerForwardCast(torch.autograd.Function):
-    @staticmethod
-    def forward(
-        ctx: Any,
-        input: torch.Tensor,
-        weights: torch.Tensor,
-        fp8_input_store: bool,
-    ) -> torch.Tensor:
-        input_for_backward = input.to(torch.float8_e4m3fn) if fp8_input_store else input
-        ctx.save_for_backward(input_for_backward, weights)
-        ctx.ori_input_dtype = input.dtype
-        ctx.fp8_input_store = fp8_input_store
-        x_glu, x_linear = torch.chunk(input, 2, dim=-1)
-        return torch.nn.functional.silu(x_glu) * x_linear * weights
-
-    @staticmethod
-    def backward(
-        ctx: Any,
-        *grad_outputs: Any,
-    ) -> tuple[torch.Tensor, torch.Tensor, None]:
-        from megatron.core.fusions import fused_bias_swiglu
-
-        grad_output = cast(torch.Tensor, grad_outputs[0])
-        input, weights = ctx.saved_tensors
-        input = input.to(ctx.ori_input_dtype) if ctx.fp8_input_store else input
-        input_grad, weights_grad = fused_bias_swiglu.weighted_swiglu_back(
-            grad_output,
-            input,
-            weights,
-        )
-        return input_grad, weights_grad, None
+def _install_moe_postprocess_workaround(moe_layer: Any) -> None:
+    # Routed token counts change across packed RL steps. Megatron's MoE
+    # postprocess reshapes through dispatcher-owned shape state, which makes
+    # this small boundary recompile repeatedly while the surrounding layer still
+    # benefits from compilation.
+    moe_layer.MoELayer.postprocess = _disable(moe_layer.MoELayer.postprocess)
 
 
-def _install_weighted_bias_swiglu_no_inner_forward_cast_workaround() -> None:
-    from megatron.core.fusions import fused_bias_swiglu
-    from megatron.core.transformer import mlp
-    from megatron.core.transformer.moe import experts
+def _install_gemma4_moe_postprocess_workaround() -> None:
+    from megatron.bridge.models.gemma import gemma4_provider
 
-    if getattr(
-        fused_bias_swiglu.weighted_bias_swiglu_impl,
-        "__art_no_inner_forward_cast__",
-        False,
+    # Gemma4 overrides MoELayer.postprocess to normalize routed and shared
+    # expert outputs. That override sees dynamic routed-token counts, so it
+    # needs the same small eager boundary as the base MoE postprocess.
+    gemma4_provider.Gemma4MoELayer.postprocess = _disable(
+        gemma4_provider.Gemma4MoELayer.postprocess
+    )
+
+
+def _install_te_triton_mask_map_workaround() -> None:
+    from transformer_engine.pytorch.triton import permutation
+
+    # TE's mask-map path launches custom Triton kernels. Keep their thin Python
+    # wrappers eager while the surrounding MoE layer and grouped GEMMs compile.
+    for name in (
+        "make_row_id_map",
+        "permute_with_mask_map",
+        "unpermute_with_mask_map",
     ):
-        return
-
-    def _empty_weighted_swiglu_output(
-        input: torch.Tensor,
-        bias: torch.Tensor | None,
-        weights: torch.Tensor,
-    ) -> torch.Tensor:
-        output_shape = (*input.shape[:-1], int(input.shape[-1]) // 2)
-        zero = input.sum() * 0.0 + weights.to(dtype=input.dtype).sum() * 0.0
-        if bias is not None:
-            zero = zero + bias.to(dtype=input.dtype).sum() * 0.0
-        return zero.expand(output_shape).clone()
-
-    def _weighted_bias_swiglu_no_inner_forward_cast(
-        input: torch.Tensor,
-        bias: torch.Tensor | None,
-        weights: torch.Tensor,
-        fp8_input_store: bool = False,
-    ) -> torch.Tensor:
-        if int(input.numel()) == 0:
-            return _empty_weighted_swiglu_output(input, bias=bias, weights=weights)
-        if bias is not None:
-            raise NotImplementedError(
-                "Bias is not supported for weighted swiglu fusion"
-            )
-        original_shape = input.shape
-        output = _WeightedSwiGLUNoInnerForwardCast.apply(
-            input.view(-1, original_shape[-1]),
-            weights,
-            fp8_input_store,
-        ).to(input.dtype)
-        return (
-            output
-            if len(original_shape) == 2
-            else output.view(*original_shape[:-1], -1)
-        )
-
-    setattr(
-        _weighted_bias_swiglu_no_inner_forward_cast,
-        "__art_no_inner_forward_cast__",
-        True,
-    )
-    setattr(
-        fused_bias_swiglu,
-        "weighted_bias_swiglu_impl",
-        _weighted_bias_swiglu_no_inner_forward_cast,
-    )
-    setattr(
-        mlp, "weighted_bias_swiglu_impl", _weighted_bias_swiglu_no_inner_forward_cast
-    )
-    setattr(
-        experts,
-        "weighted_bias_swiglu_impl",
-        _weighted_bias_swiglu_no_inner_forward_cast,
-    )
+        _disable_attr(permutation, name)
 
 
 def install_torch_compile_workarounds(
@@ -209,32 +141,11 @@ def install_torch_compile_workarounds(
         _install_context_parallel_attention_workaround()
     if _SELF_ATTN_LINEAR_PROJ_REDUCE_SCATTER_WORKAROUND_FLAG in flags:
         _install_self_attn_linear_proj_reduce_scatter_workaround()
-    if "weighted_bias_swiglu_no_inner_forward_cast" in flags:
-        _install_weighted_bias_swiglu_no_inner_forward_cast_workaround()
+    if "moe_postprocess" in flags:
+        _install_moe_postprocess_workaround(moe_layer)
+    if "gemma4_moe_postprocess" in flags:
+        _install_gemma4_moe_postprocess_workaround()
 
-    deepep_flags = {"deepep_permute_restore", "deepep_dispatch_combine"} & flags
-    if deepep_flags:
-        deepep_manager = _require_attr(token_dispatcher, "_DeepepManager")
-        if "deepep_permute_restore" in flags:
-            _disable_attr(deepep_manager, "get_permuted_hidden_states_by_experts")
-            _disable_attr(deepep_manager, "get_restored_hidden_states_by_experts")
-        if "deepep_dispatch_combine" in flags:
-            _disable_attr(deepep_manager, "dispatch")
-            _disable_attr(deepep_manager, "combine")
-    if "alltoall_dtoh" in flags:
-        token_dispatcher.MoEAlltoAllTokenDispatcher._maybe_dtoh_and_synchronize = (
-            _disable(
-                token_dispatcher.MoEAlltoAllTokenDispatcher._maybe_dtoh_and_synchronize
-            )
-        )
-    if "alltoall_dispatch_preprocess" in flags:
-        token_dispatcher.MoEAlltoAllTokenDispatcher.dispatch_preprocess = _disable(
-            token_dispatcher.MoEAlltoAllTokenDispatcher.dispatch_preprocess
-        )
-    if "alltoall_combine_postprocess" in flags:
-        token_dispatcher.MoEAlltoAllTokenDispatcher.combine_postprocess = _disable(
-            token_dispatcher.MoEAlltoAllTokenDispatcher.combine_postprocess
-        )
     if "te_moe_permute_with_probs" in flags:
         from transformer_engine.pytorch import permutation as te_permutation
 
@@ -248,13 +159,7 @@ def install_torch_compile_workarounds(
                 moe_utils.fused_permute_with_probs
             )
     if "te_triton_permute_with_mask_map" in flags:
-        from transformer_engine.pytorch.triton import (
-            permutation as te_triton_permutation,
-        )
-
-        te_triton_permutation.permute_with_mask_map = _disable(
-            te_triton_permutation.permute_with_mask_map
-        )
+        _install_te_triton_mask_map_workaround()
     if "te_moe_unpermute" in flags:
         from transformer_engine.pytorch import permutation as te_permutation
 
@@ -283,6 +188,12 @@ def install_torch_compile_workarounds(
         te_triton_permutation.unpermute_with_mask_map_bwd_with_merging_probs = _disable(
             te_triton_permutation.unpermute_with_mask_map_bwd_with_merging_probs
         )
+    if "alltoall_dispatch_dtoh" in flags:
+        token_dispatcher.MoEAlltoAllTokenDispatcher._maybe_dtoh_and_synchronize = (
+            _disable(
+                token_dispatcher.MoEAlltoAllTokenDispatcher._maybe_dtoh_and_synchronize
+            )
+        )
     if "flex_token_dispatch_combine" in flags:
         token_dispatcher.MoEFlexTokenDispatcher.token_dispatch = _disable(
             token_dispatcher.MoEFlexTokenDispatcher.token_dispatch
@@ -294,6 +205,10 @@ def install_torch_compile_workarounds(
         moe_layer.MoELayer.preprocess = _disable(moe_layer.MoELayer.preprocess)
     if "moe_forward" in flags:
         moe_layer.MoELayer.forward = _disable(moe_layer.MoELayer.forward)
+    if "mlp_forward" in flags:
+        from megatron.core.transformer import mlp
+
+        mlp.MLP.forward = _disable(mlp.MLP.forward)
     if "te_grouped_mlp_forward" in flags:
         moe_experts.TEGroupedMLP.forward = _disable(moe_experts.TEGroupedMLP.forward)
     _INSTALLED_CONFIG = installed_config

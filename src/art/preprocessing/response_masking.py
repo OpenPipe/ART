@@ -1,11 +1,20 @@
-from transformers.tokenization_utils_base import PreTrainedTokenizerBase
+from collections.abc import Iterable
+from typing import Protocol
+
+
+class _TemplatePartTokenizer(Protocol):
+    def __call__(self, text: str, *, add_special_tokens: bool) -> object: ...
 
 
 def token_ids_for_template_part(
-    tokenizer: PreTrainedTokenizerBase,
+    tokenizer: _TemplatePartTokenizer,
     template_part: str,
 ) -> list[int]:
-    return list(tokenizer(template_part, add_special_tokens=False).input_ids)
+    encoded = tokenizer(template_part, add_special_tokens=False)
+    input_ids = getattr(encoded, "input_ids", None)
+    if not isinstance(input_ids, Iterable):
+        raise TypeError("tokenizer must return iterable input_ids")
+    return [int(token_id) for token_id in input_ids]
 
 
 def _find_subsequence(

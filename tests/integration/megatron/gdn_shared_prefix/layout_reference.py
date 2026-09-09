@@ -7,9 +7,9 @@ import torch
 from torch import Tensor
 
 from art.megatron.context_parallel.layout_index import TokenLayoutIndex
-from art.megatron.gdn.gdn_shared_prefix import (
+from art.megatron.gdn.gdn_prefix_tree import (
     GdnPackedExecutionSpec,
-    parse_gdn_shared_prefix_segments,
+    parse_gdn_prefix_tree_segments,
 )
 from art.megatron.gdn.layout import (
     GdnCpExchangePlan,
@@ -19,7 +19,7 @@ from art.megatron.gdn.layout import (
 
 
 class TestGdnCpLayoutPlan(BaseModel):
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(arbitrary_types_allowed=True, frozen=True)
 
     batch_size: int = Field(ge=1)
     sequence_length: int = Field(ge=1)
@@ -39,9 +39,7 @@ def build_test_gdn_cp_layout_plan(
     gdn_token_ranges_by_rank: Sequence[Sequence[tuple[int, int, int]]] | None = None,
     device: torch.device | str | None = None,
 ) -> TestGdnCpLayoutPlan:
-    spec = parse_gdn_shared_prefix_segments(
-        group_ids, parent_ids, min_completions_per_family=0
-    )
+    spec = parse_gdn_prefix_tree_segments(group_ids, parent_ids)
     gdn_ranges = (
         _normalize_rank_ranges(gdn_token_ranges_by_rank, cp_size=cp_size)
         if gdn_token_ranges_by_rank is not None
@@ -89,7 +87,7 @@ def _build_full_exchange_plan(
         )
         for transfer in local_plan.transfers:
             transfers.setdefault((transfer.source_rank, transfer.dest_rank), transfer)
-    return GdnCpExchangePlan.model_construct(
+    return GdnCpExchangePlan(
         cp_size=len(source_layout.token_counts_by_rank),
         source_token_counts_by_rank=source_layout.token_counts_by_rank,
         dest_token_counts_by_rank=tuple(
@@ -133,7 +131,7 @@ def _split_gdn_token_ranges_by_rank(
                 _segment_token_start(segment, spec.sequence_length),
                 _segment_token_start(segment, spec.sequence_length) + segment.length,
             )
-            for segment in spec.segments()
+            for segment in spec.tree_segments
         ),
         cp_size=cp_size,
     )

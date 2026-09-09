@@ -15,6 +15,7 @@ class JustTheFactsConfig(BaseModel):
 
 models: dict[str, art.TrainableModel[JustTheFactsConfig]] = {
     "facts-14b-001": art.TrainableModel(
+        run_name="facts-14b-001",
         name="facts-14b-001",
         project="just-the-facts",
         base_model="Qwen/Qwen2.5-14B-Instruct",

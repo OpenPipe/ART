@@ -4,10 +4,10 @@ import asyncio
 from datetime import datetime
 
 from dotenv import load_dotenv
-import wandb
 
 import art
 from art.serverless.backend import ServerlessBackend
+from art.utils import wandb_sdk
 
 load_dotenv()
 
@@ -41,7 +41,7 @@ def get_latest_artifact_provenance(
     entity: str, project: str, name: str
 ) -> list[str] | None:
     """Fetch provenance from the latest W&B artifact's metadata."""
-    api = wandb.Api()
+    api = wandb_sdk.api()
     artifact = api.artifact(f"{entity}/{project}/{name}:latest", type="lora")
     return artifact.metadata.get("wandb.provenance")
 
@@ -49,8 +49,10 @@ def get_latest_artifact_provenance(
 async def main() -> None:
     backend = ServerlessBackend()
 
+    run_name = f"provenance-test-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
     model = art.TrainableModel(
-        name=f"provenance-test-{datetime.now().strftime('%Y%m%d-%H%M%S')}",
+        name=run_name,
+        run_name=run_name,
         project="provenance-test",
         base_model="OpenPipe/Qwen3-14B-Instruct",
     )
@@ -74,7 +76,9 @@ async def main() -> None:
                 raise
 
     # Check provenance on the latest artifact after first train call
-    provenance = get_latest_artifact_provenance(model.entity, model.project, model.name)
+    provenance = get_latest_artifact_provenance(
+        model.entity, model.project, model.run_name
+    )
     print(f"After step 1: provenance = {provenance}")
     assert provenance == ["serverless-rl"], (
         f"Expected ['serverless-rl'], got {provenance}"
@@ -92,7 +96,9 @@ async def main() -> None:
     except RuntimeError as e:
         print(f"Step 2 training failed (transient server error, OK for this test): {e}")
 
-    provenance = get_latest_artifact_provenance(model.entity, model.project, model.name)
+    provenance = get_latest_artifact_provenance(
+        model.entity, model.project, model.run_name
+    )
     print(f"After step 2: provenance = {provenance}")
     assert provenance == ["serverless-rl"], (
         f"Expected ['serverless-rl'] (no duplicate), got {provenance}"

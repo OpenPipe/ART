@@ -7,8 +7,11 @@ from openai.types.chat.chat_completion import Choice
 from pydantic import BaseModel
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
-from art.preprocessing.tokenize import _apply_chat_template_token_ids
-from art.trajectories import History, Trajectory, TrajectoryGroup, get_messages
+from art.preprocessing.tokenize import (
+    _apply_chat_template_token_ids,
+    _messages_for_chat_template,
+)
+from art.trajectories import LegacyHistory, Trajectory, TrajectoryGroup
 from art.types import MessagesAndChoices, Tools
 
 
@@ -121,7 +124,7 @@ def _rendered_ids(
 ) -> list[int]:
     return _apply_chat_template_token_ids(
         tokenizer,
-        cast(list[dict[str, Any]], get_messages(messages_and_choices)),
+        _messages_for_chat_template(tokenizer, messages_and_choices),
         tools=tools,
         tokenize=True,
         add_generation_prompt=False,
@@ -130,7 +133,7 @@ def _rendered_ids(
 
 def _attach_token_metadata_to_history(
     tokenizer: PreTrainedTokenizerBase,
-    history: Trajectory | History,
+    history: Trajectory | LegacyHistory,
 ) -> None:
     items = history.messages_and_choices
     for index, item in enumerate(items):
@@ -288,7 +291,7 @@ def build_chat_template_conformance_inputs(
                         _choice_for_text("maybe", maybe_ids),
                     ),
                     additional_histories=[
-                        History(
+                        LegacyHistory(
                             messages_and_choices=_messages_and_choices(
                                 {"role": "user", "content": "Previous turn."},
                                 _choice_for_text("prior yes", prior_yes_ids),
@@ -303,7 +306,7 @@ def build_chat_template_conformance_inputs(
                         _choice_for_text("yes", yes_ids),
                     ),
                     additional_histories=[
-                        History(
+                        LegacyHistory(
                             messages_and_choices=_messages_and_choices(
                                 {"role": "user", "content": "Previous turn."},
                                 _choice_for_text("prior yes", prior_yes_ids),

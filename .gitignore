@@ -9,10 +9,12 @@ data/cache.db
 streaming-chat-completions/
 unsloth_compiled_cache/
 wandb/
+!/typings/wandb/
+!/typings/wandb/**
 docs/node_modules/
 dist/
 replays/
-trajectories/
+/trajectories/
 .DS_Store
 .local/
 .claude/settings.local.json
@@ -22,8 +24,6 @@ trajectories/
 !/src/art/wandb/**
 /src/art/wandb/__pycache__/
 scratch/
-wandb_runs/
-checkpoints/
-*.jsonl
-.venv
-*.pyc
+/progress_log.md
+dev/_trainer_rank_ellavox_qwen35_4b_tokens.json
+dev/_trainer_rank_ellavox_qwen3_06b_tokens.json

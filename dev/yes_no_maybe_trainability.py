@@ -247,7 +247,7 @@ def make_backend(
     if backend_name == "local":
         return LocalBackend(path=art_path, in_process=in_process)
     if backend_name == "megatron":
-        return MegatronBackend(path=art_path, in_process=in_process)
+        return MegatronBackend(path=art_path)
     raise ValueError(f"Unsupported BACKEND={backend_name!r}")
 
 
@@ -282,6 +282,7 @@ async def main() -> None:
     os.makedirs(art_path, exist_ok=True)
     backend = make_backend(backend_name, art_path, in_process=in_process)
     model = art.TrainableModel(
+        run_name=model_name,
         name=model_name,
         project=project,
         base_model=base_model,

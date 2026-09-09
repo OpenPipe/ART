@@ -1,12 +1,70 @@
 from __future__ import annotations
 
+from getpass import getuser
+import hashlib
+import importlib
 import os
+from pathlib import Path
+import pickle
+import tempfile
 from typing import Any, cast
 
 from quack.gemm import gemm as quack_gemm
 import torch
+import triton
+import triton.language as tl
 
 _PADDED_LOW_RANK_TARGET = 8
+
+
+@triton.jit
+def _grouped_lora_wgrad_kernel(
+    big,
+    small,
+    expert_offsets,
+    out,
+    alpha,
+    BIG_D_STRIDE: tl.constexpr,
+    BIG_K_STRIDE: tl.constexpr,
+    SMALL_R_STRIDE: tl.constexpr,
+    SMALL_K_STRIDE: tl.constexpr,
+    D: tl.constexpr,
+    R: tl.constexpr,
+    TRANSPOSE_OUT: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    BLOCK_R: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+) -> None:
+    expert = tl.program_id(2)
+    d = (tl.program_id(0) * BLOCK_D + tl.arange(0, BLOCK_D)).to(tl.int64)
+    r = (tl.program_id(1) * BLOCK_R + tl.arange(0, BLOCK_R)).to(tl.int64)
+    start = tl.load(expert_offsets + expert)
+    end = tl.load(expert_offsets + expert + 1)
+    acc = tl.zeros((BLOCK_D, BLOCK_R), tl.float32)
+    for k0 in tl.range(start, end, BLOCK_K, num_stages=3):
+        k = (k0 + tl.arange(0, BLOCK_K)).to(tl.int64)
+        big_tile = tl.load(
+            big + d[:, None] * BIG_D_STRIDE + k[None, :] * BIG_K_STRIDE,
+            mask=(d[:, None] < D) & (k[None, :] < end),
+            other=0.0,
+        )
+        small_tile = tl.load(
+            small + r[:, None] * SMALL_R_STRIDE + k[None, :] * SMALL_K_STRIDE,
+            mask=(r[:, None] < R) & (k[None, :] < end),
+            other=0.0,
+        )
+        acc += tl.dot(big_tile, tl.trans(small_tile))
+    base = expert * D * R
+    out_offsets = (
+        base + r[None, :] * D + d[:, None]
+        if TRANSPOSE_OUT
+        else base + d[:, None] * R + r[None, :]
+    )
+    tl.store(
+        out + out_offsets,
+        acc * alpha,
+        mask=(d[:, None] < D) & (r[None, :] < R),
+    )
 
 
 def _validate_rank(rank: int) -> None:
@@ -27,6 +85,65 @@ def _env_positive_int(name: str) -> int | None:
     if value <= 0:
         raise ValueError(f"{name} must be > 0, got {value}")
     return value
+
+
+def _quack_compile_lock_dir() -> Path:
+    path = (
+        Path(os.environ["ART_QUACK_COMPILE_LOCK_DIR"])
+        if "ART_QUACK_COMPILE_LOCK_DIR" in os.environ
+        else Path(tempfile.gettempdir()) / getuser() / "art_quack_compile_locks"
+    )
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _cache_key(args: tuple[Any, ...], kwargs: dict[str, Any]) -> tuple[Any, ...]:
+    return args + tuple(sorted(kwargs.items())) if kwargs else args
+
+
+def _key_hash(key: tuple[Any, ...]) -> str:
+    try:
+        data = pickle.dumps(key)
+    except Exception:
+        data = repr(key).encode()
+    return hashlib.sha256(data).hexdigest()
+
+
+def _install_quack_compile_lock() -> None:
+    """Serialize QuACK CuTe compilation misses across distributed ranks.
+
+    QuACK protects disk-cache load/store with file locks, but it compiles cache
+    misses outside that lock. ETP runs can make every rank compile the same
+    grouped-LoRA backward GEMM at once, which has crashed inside CuTe DSL codegen.
+    Hot in-process cache hits bypass this guard, so kernel launches stay unlocked.
+    """
+    import quack.cache_utils as quack_cache_utils
+
+    gemm_module = importlib.import_module("quack.gemm")
+    compile_gemm = getattr(gemm_module, "_compile_gemm")
+    if bool(getattr(compile_gemm, "_art_compile_lock_wrapped", False)):
+        return
+    cache = getattr(compile_gemm, "cache", None)
+
+    def locked_compile_gemm(*args: Any, **kwargs: Any) -> Any:
+        key = _cache_key(args, kwargs)
+        if isinstance(cache, dict) and key in cache:
+            return compile_gemm(*args, **kwargs)
+        lock_path = _quack_compile_lock_dir() / f"{_key_hash(key)}.lock"
+        with quack_cache_utils.FileLock(lock_path, exclusive=True, timeout=600):
+            return compile_gemm(*args, **kwargs)
+
+    locked_compile_gemm_any = cast(Any, locked_compile_gemm)
+    locked_compile_gemm_any.cache = getattr(compile_gemm, "cache", None)
+    locked_compile_gemm_any.cache_clear = getattr(compile_gemm, "cache_clear", None)
+    locked_compile_gemm_any.cache_info = getattr(compile_gemm, "cache_info", None)
+    locked_compile_gemm_any._art_compile_lock_wrapped = True
+    setattr(gemm_module, "_compile_gemm", locked_compile_gemm)
+
+
+def _quack_gemm(*args: Any, **kwargs: Any) -> Any:
+    _install_quack_compile_lock()
+    return quack_gemm(*args, **kwargs)
 
 
 def _tokens_per_expert_to_tensor(
@@ -199,7 +316,12 @@ def _varlen_quack_gemm(
     tile_n: int,
     alpha: float = 1.0,
     out: torch.Tensor | None = None,
+    residual: torch.Tensor | None = None,
 ) -> torch.Tensor:
+    if residual is not None:
+        if out is not None and out is not residual:
+            raise ValueError("Residual grouped GEMM requires aliased output")
+        out = residual
     if out is None:
         out = torch.empty(
             a.shape[0],
@@ -216,11 +338,11 @@ def _varlen_quack_gemm(
             raise ValueError(
                 f"Output tensor must match input device/dtype, got {out.device}/{out.dtype}"
             )
-    quack_gemm(
+    _quack_gemm(
         a,
         b,
         out,
-        None,
+        residual,
         None,
         tile_M=tile_m,
         tile_N=tile_n,
@@ -245,6 +367,42 @@ def _varlen_quack_gemm_k(
     tile_n: int,
     alpha: float = 1.0,
 ) -> torch.Tensor:
+    # QuACK's SM100 varlen-K scheduler can fault under the integrated async launch
+    # sequence; keep its faster grouped GEMM path on Hopper and use exact ragged
+    # spans for the small-rank LoRA parameter gradients on Blackwell.
+    if torch.cuda.get_device_capability(a.device)[0] >= 10:
+        transpose_out = out_shape_m <= out_shape_n
+        big, small = (b, a) if transpose_out else (a, b)
+        d, rank = big.shape[0], small.shape[0]
+        out = torch.empty(
+            batch_count,
+            out_shape_m,
+            out_shape_n,
+            device=a.device,
+            dtype=a.dtype,
+        )
+        block_r = min(triton.next_power_of_2(rank), 32)
+        cast(Any, _grouped_lora_wgrad_kernel)[
+            (triton.cdiv(d, 64), triton.cdiv(rank, block_r), batch_count)
+        ](
+            big,
+            small,
+            expert_offsets,
+            out,
+            alpha,
+            BIG_D_STRIDE=big.stride(0),
+            BIG_K_STRIDE=big.stride(1),
+            SMALL_R_STRIDE=small.stride(0),
+            SMALL_K_STRIDE=small.stride(1),
+            D=d,
+            R=rank,
+            TRANSPOSE_OUT=transpose_out,
+            BLOCK_D=64,
+            BLOCK_R=block_r,
+            BLOCK_K=32,
+            num_warps=4,
+        )
+        return out
     out = torch.empty(
         batch_count,
         out_shape_m,
@@ -252,7 +410,7 @@ def _varlen_quack_gemm_k(
         device=a.device,
         dtype=a.dtype,
     )
-    quack_gemm(
+    _quack_gemm(
         a,
         b,
         out,
@@ -278,7 +436,20 @@ class _QuackGroupedLoraFn(torch.autograd.Function):
         b_t: torch.Tensor,
         counts: torch.Tensor,
         scale: float,
+        residual: torch.Tensor | None,
     ) -> torch.Tensor:
+        has_residual = residual is not None
+        if residual is not None:
+            if not residual.is_contiguous():
+                raise ValueError("Residual grouped LoRA requires contiguous output")
+            residual = torch.empty(
+                0, device=residual.device, dtype=residual.dtype
+            ).set_(
+                residual.untyped_storage(),
+                residual.storage_offset(),
+                residual.size(),
+                residual.stride(),
+            )
         expert_offsets = _build_expert_offsets(counts, device=x.device)
         actual_rank = a_t.shape[-1]
         effective_rank = _effective_rank(actual_rank)
@@ -303,12 +474,13 @@ class _QuackGroupedLoraFn(torch.autograd.Function):
             tile_m=64,
             tile_n=_matmul_tile_n(b_t.shape[-1]),
             alpha=scale,
+            residual=residual,
         )
-
         ctx.save_for_backward(x, a_t_eff, b_t_eff, tmp, expert_offsets)
         ctx.actual_rank = actual_rank
         ctx.effective_rank = effective_rank
         ctx.scale = scale
+        ctx.has_residual = has_residual
         return out
 
     @staticmethod
@@ -370,6 +542,7 @@ class _QuackGroupedLoraFn(torch.autograd.Function):
             grad_b_eff[:, :actual_rank, :].contiguous(),
             None,
             None,
+            grad_out if ctx.has_residual else None,
         )
 
 
@@ -586,7 +759,30 @@ def quack_grouped_lora(
     synchronization in the hot path.
     """
     counts_tensor = _validate_inputs(x, a_t, b_t, counts)
-    return _QuackGroupedLoraFn.apply(x, a_t, b_t, counts_tensor, scale)
+    return _QuackGroupedLoraFn.apply(x, a_t, b_t, counts_tensor, scale, None)
+
+
+@torch.compiler.disable
+def quack_grouped_lora_residual(
+    residual: torch.Tensor,
+    x: torch.Tensor,
+    a_t: torch.Tensor,
+    b_t: torch.Tensor,
+    counts: list[int] | torch.Tensor,
+    scale: float = 1.0,
+) -> torch.Tensor:
+    """Consume a base output and accumulate grouped LoRA into its storage."""
+    counts_tensor = _validate_inputs(x, a_t, b_t, counts)
+    expected = (x.shape[0], b_t.shape[-1])
+    if residual.shape != expected:
+        raise ValueError(
+            f"Expected residual shape {expected}, got {tuple(residual.shape)}"
+        )
+    if residual.device != x.device or residual.dtype != x.dtype:
+        raise ValueError("Residual must match grouped LoRA input device and dtype")
+    if x.shape[0] == 0:
+        return residual
+    return _QuackGroupedLoraFn.apply(x, a_t, b_t, counts_tensor, scale, residual)
 
 
 @torch.compiler.disable

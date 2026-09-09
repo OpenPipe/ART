@@ -29,54 +29,54 @@ class TestMetricsBuilder:
     async def test_cum_accumulates_for_hierarchical_sections(self) -> None:
         builder = MetricsBuilder(cost_context="train")
 
-        builder.add_user_timing(step_wall_s=1.5, step_actor_s=0.3)
+        builder.add_user_timing(step_wall_s=1.5, step_rollout_s=0.3)
         builder.add_data(
             step_num_scenarios=2,
-            step_actor_tokens=10,
+            step_rollout_tokens=10,
             scenario_ids=["a", "b"],
         )
         first = await builder.flush()
 
         assert first["time/cum/wall_s"] == pytest.approx(1.5)
-        assert first["time/cum/actor_s"] == pytest.approx(0.3)
+        assert first["time/cum/rollout_s"] == pytest.approx(0.3)
         assert first["data/cum/num_scenarios"] == pytest.approx(2)
-        assert first["data/cum/actor_tokens"] == pytest.approx(10)
+        assert first["data/cum/rollout_tokens"] == pytest.approx(10)
         assert first["data/cum/num_unique_scenarios"] == 2
 
-        builder.add_user_timing(step_wall_s=0.5, step_actor_s=0.2)
+        builder.add_user_timing(step_wall_s=0.5, step_rollout_s=0.2)
         builder.add_data(
             step_num_scenarios=3,
-            step_actor_tokens=5,
+            step_rollout_tokens=5,
             scenario_ids=["b", "c"],
         )
         second = await builder.flush()
 
         assert second["time/cum/wall_s"] == pytest.approx(2.0)
-        assert second["time/cum/actor_s"] == pytest.approx(0.5)
+        assert second["time/cum/rollout_s"] == pytest.approx(0.5)
         assert second["data/cum/num_scenarios"] == pytest.approx(5)
-        assert second["data/cum/actor_tokens"] == pytest.approx(15)
+        assert second["data/cum/rollout_tokens"] == pytest.approx(15)
         assert second["data/cum/num_unique_scenarios"] == 3
 
     @pytest.mark.asyncio
     async def test_helper_metrics_accumulate_within_a_single_step(self) -> None:
         builder = MetricsBuilder(cost_context="train")
 
-        builder.add_data(step_num_scenarios=2, step_actor_tokens=10)
-        builder.add_data(step_num_scenarios=3, step_actor_tokens=5)
-        builder.add_user_timing(step_wall_s=1.5, step_actor_s=0.3, step_eval_s=0.2)
-        builder.add_user_timing(step_wall_s=0.5, step_actor_s=0.2, step_eval_s=0.1)
-        builder.add_idle_times(step_trainer_idle_s=1.0, step_actor_idle_s=2.0)
-        builder.add_idle_times(step_trainer_idle_s=0.5, step_actor_idle_s=1.0)
+        builder.add_data(step_num_scenarios=2, step_rollout_tokens=10)
+        builder.add_data(step_num_scenarios=3, step_rollout_tokens=5)
+        builder.add_user_timing(step_wall_s=1.5, step_rollout_s=0.3, step_eval_s=0.2)
+        builder.add_user_timing(step_wall_s=0.5, step_rollout_s=0.2, step_eval_s=0.1)
+        builder.add_idle_times(step_trainer_idle_s=1.0, step_rollout_idle_s=2.0)
+        builder.add_idle_times(step_trainer_idle_s=0.5, step_rollout_idle_s=1.0)
 
         metrics = await builder.flush()
 
         assert metrics["data/step_num_scenarios"] == pytest.approx(5)
-        assert metrics["data/step_actor_tokens"] == pytest.approx(15)
+        assert metrics["data/step_rollout_tokens"] == pytest.approx(15)
         assert metrics["time/step_wall_s"] == pytest.approx(2.0)
-        assert metrics["time/step_actor_s"] == pytest.approx(0.5)
+        assert metrics["time/step_rollout_s"] == pytest.approx(0.5)
         assert metrics["time/step_eval_s"] == pytest.approx(0.3)
-        assert metrics["throughput/step_trainer_idle_s"] == pytest.approx(1.5)
-        assert metrics["throughput/step_actor_idle_s"] == pytest.approx(3.0)
+        assert metrics["time/step_trainer_idle_s"] == pytest.approx(1.5)
+        assert metrics["time/step_rollout_idle_s"] == pytest.approx(3.0)
 
     @pytest.mark.asyncio
     async def test_throughput_metrics_derive_from_time_and_token_cumulatives(
@@ -84,18 +84,18 @@ class TestMetricsBuilder:
     ) -> None:
         builder = MetricsBuilder(cost_context="train")
 
-        builder.add_metric("time/step_trainer_s", 4.0)
-        builder.add_metric("data/step_trainer_tokens", 40.0)
-        builder.add_metric("time/step_actor_s", 2.0)
-        builder.add_metric("data/step_actor_tokens", 10.0)
-        builder.add_idle_times(step_trainer_idle_s=1.5, step_actor_idle_s=0.5)
+        builder.add_metric("time/step_backend_train_s", 4.0)
+        builder.add_metric("data/step_trainable_assistant_tokens", 40.0)
+        builder.add_metric("time/step_rollout_s", 2.0)
+        builder.add_metric("data/step_rollout_tokens", 10.0)
+        builder.add_idle_times(step_trainer_idle_s=1.5, step_rollout_idle_s=0.5)
 
         metrics = await builder.flush()
 
-        assert metrics["throughput/cum/trainer_idle_s"] == pytest.approx(1.5)
-        assert metrics["throughput/cum/actor_idle_s"] == pytest.approx(0.5)
+        assert metrics["time/cum/trainer_idle_s"] == pytest.approx(1.5)
+        assert metrics["time/cum/rollout_idle_s"] == pytest.approx(0.5)
         assert metrics["throughput/avg_trainer_tok_per_s"] == pytest.approx(10.0)
-        assert metrics["throughput/avg_actor_tok_per_s"] == pytest.approx(5.0)
+        assert metrics["throughput/avg_rollout_tok_per_s"] == pytest.approx(5.0)
 
     @pytest.mark.asyncio
     async def test_costs_all_generated_for_single_and_multiple_children(self) -> None:
@@ -221,8 +221,8 @@ class TestMetricsBuilder:
     @pytest.mark.asyncio
     async def test_empty_flush_does_not_repeat_stale_derived_metrics(self) -> None:
         builder = MetricsBuilder(cost_context="train")
-        builder.add_metric("time/step_trainer_s", 2.0)
-        builder.add_metric("data/step_trainer_tokens", 20.0)
+        builder.add_metric("time/step_backend_train_s", 2.0)
+        builder.add_metric("data/step_trainable_assistant_tokens", 20.0)
         builder.add_data(scenario_ids=["s1"])
 
         first = await builder.flush()

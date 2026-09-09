@@ -9,7 +9,70 @@ import signal
 import subprocess
 import sys
 import time
-from typing import Any
+from types import FrameType
+from typing import Any, TypeVar
+
+PROCESS_SHUTDOWN_TIMEOUT_SECONDS = 20.0
+_PROCESS_SHUTDOWN_LEVEL_STEP = 0.1
+_PROCESS_SHUTDOWN_SWEEP_GRACE_FRACTION = 0.05
+_T = TypeVar("_T")
+
+
+async def complete_task(
+    task: asyncio.Task[_T],
+) -> tuple[_T, asyncio.CancelledError | None]:
+    cancelled: asyncio.CancelledError | None = None
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError as error:
+            if task.cancelled():
+                break
+            cancelled = cancelled or error
+        except BaseException:
+            break
+    try:
+        result = task.result()
+    except BaseException as error:
+        if cancelled is not None:
+            cancelled.add_note(f"operation also failed: {error}")
+            raise cancelled
+        raise
+    return result, cancelled
+
+
+async def complete_to_thread(
+    operation: Callable[[], _T],
+) -> tuple[_T, asyncio.CancelledError | None]:
+    return await complete_task(asyncio.create_task(asyncio.to_thread(operation)))
+
+
+def consume_future_exception(future: asyncio.Future[Any]) -> None:
+    try:
+        future.exception()
+    except asyncio.CancelledError:
+        pass
+
+
+def process_shutdown_timeout(level: int) -> float:
+    multiplier = max(0.1, 1.0 - _PROCESS_SHUTDOWN_LEVEL_STEP * level)
+    return PROCESS_SHUTDOWN_TIMEOUT_SECONDS * multiplier
+
+
+def process_shutdown_sweep_grace() -> float:
+    return PROCESS_SHUTDOWN_TIMEOUT_SECONDS * _PROCESS_SHUTDOWN_SWEEP_GRACE_FRACTION
+
+
+async def cleanup_after_failure(
+    primary: BaseException,
+    cleanup: Callable[[], Awaitable[None]],
+    *,
+    message: str,
+) -> None:
+    try:
+        await cleanup()
+    except BaseException as cleanup_failure:
+        raise BaseExceptionGroup(message, [primary, cleanup_failure]) from None
 
 
 def managed_process_cmd(
@@ -20,6 +83,10 @@ def managed_process_cmd(
         str(Path(__file__).resolve().with_name("managed_process.py")),
         "--parent-pid",
         str(parent_pid or os.getpid()),
+        "--child-timeout",
+        str(process_shutdown_timeout(2)),
+        "--sweep-grace",
+        str(process_shutdown_sweep_grace()),
         "--",
         *command,
     ]
@@ -35,7 +102,7 @@ def kill_process_group(pid: int, sig: signal.Signals) -> None:
 def terminate_popen_process_group(
     process: subprocess.Popen[Any],
     *,
-    timeout: float = 5.0,
+    timeout: float = process_shutdown_timeout(1),
 ) -> None:
     if process.poll() is None:
         kill_process_group(process.pid, signal.SIGTERM)
@@ -46,7 +113,9 @@ def terminate_popen_process_group(
         process.wait()
 
 
-def terminate_asyncio_process_group(process: Any, *, timeout: float = 5.0) -> None:
+def terminate_asyncio_process_group(
+    process: Any, *, timeout: float = process_shutdown_timeout(1)
+) -> None:
     if process.returncode is None:
         kill_process_group(process.pid, signal.SIGTERM)
     deadline = time.monotonic() + timeout
@@ -149,7 +218,9 @@ class ServiceLifecycle:
     def __init__(self) -> None:
         self.closing = False
         self._close_callback: Callable[[], None] | None = None
-        self._previous_signal_handlers: dict[int, Any] = {}
+        self._previous_signal_handlers: dict[
+            int, Callable[[int, FrameType | None], object] | int | None
+        ] = {}
 
     def begin_close(self) -> bool:
         if self.closing:
@@ -172,9 +243,16 @@ class ServiceLifecycle:
             previous = signal.getsignal(signum)
             self._previous_signal_handlers[signum] = previous
 
-            def _handler(received_signum, frame, *, _previous=previous):
+            def _handler(
+                received_signum: int,
+                frame: FrameType | None,
+                *,
+                _previous: Callable[[int, FrameType | None], object]
+                | int
+                | None = previous,
+            ) -> None:
                 close()
-                if callable(_previous):
+                if not isinstance(_previous, int) and _previous is not None:
                     _previous(received_signum, frame)
                     return
                 if _previous == signal.SIG_IGN:

@@ -11,8 +11,6 @@ UV_CACHE_ASSET_PREFIX="${UV_CACHE_ASSET_PREFIX:-prek-uv-cache}"
 BUILD_JOBS="${BUILD_JOBS:-auto}"
 AUTO_BUILD_JOBS_MAX="${AUTO_BUILD_JOBS_MAX:-8}"
 UV_BUILD_SLOTS="${UV_BUILD_SLOTS:-2}"
-CI_APEX_PARALLEL_BUILD="${CI_APEX_PARALLEL_BUILD:-8}"
-CI_APEX_NVCC_THREADS="${CI_APEX_NVCC_THREADS:-1}"
 TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-9.0}"
 KEEP_COUNT="${KEEP_COUNT:-4}"
 PART_SIZE_MB="${PART_SIZE_MB:-1900}"
@@ -158,6 +156,8 @@ compute_fingerprint() {
   python3 "${REPO_ROOT}/scripts/ci/compute_uv_fingerprint.py" \
     --pyproject "${REPO_ROOT}/pyproject.toml" \
     --uv-lock "${REPO_ROOT}/uv.lock" \
+    --megatron-pyproject "${REPO_ROOT}/megatron_runtime/pyproject.toml" \
+    --megatron-uv-lock "${REPO_ROOT}/megatron_runtime/uv.lock" \
     --base-image "${BASE_IMAGE}" \
     --python-mm "${PYTHON_MM}" \
     --torch-cuda-arch-list "${TORCH_CUDA_ARCH_LIST}"
@@ -221,40 +221,9 @@ ensure_release_exists() {
     --notes "Managed cache assets for prek CI dependency bootstrap."
 }
 
-resolve_apex_parallel_build() {
-  local compile_jobs="$1"
-
-  [[ "${compile_jobs}" =~ ^[1-9][0-9]*$ ]] || fail "compile_jobs must be a positive integer."
-  [[ "${CI_APEX_PARALLEL_BUILD}" =~ ^[1-9][0-9]*$ ]] || fail "CI_APEX_PARALLEL_BUILD must be a positive integer."
-
-  local apex_parallel_build="${CI_APEX_PARALLEL_BUILD}"
-  if ((apex_parallel_build > compile_jobs)); then
-    apex_parallel_build="${compile_jobs}"
-  fi
-  printf '%s\n' "${apex_parallel_build}"
-}
-
-constrain_temp_pyproject_for_ci_build() {
-  local pyproject_path="$1"
-  local apex_parallel_build="$2"
-  local nvcc_threads="$3"
-
-  [[ -f "${pyproject_path}" ]] || fail "pyproject not found: ${pyproject_path}"
-  [[ "${apex_parallel_build}" =~ ^[1-9][0-9]*$ ]] || fail "apex_parallel_build must be a positive integer."
-  [[ "${nvcc_threads}" =~ ^[1-9][0-9]*$ ]] || fail "CI_APEX_NVCC_THREADS must be a positive integer."
-
-  log "Applying cache-build overrides: APEX_PARALLEL_BUILD=${apex_parallel_build}, NVCC_APPEND_FLAGS=--threads ${nvcc_threads}."
-  python3 "${SCRIPT_DIR}/apply_ci_uv_build_overrides.py" \
-    --pyproject "${pyproject_path}" \
-    --apex-parallel-build "${apex_parallel_build}" \
-    --apex-nvcc-threads "${nvcc_threads}"
-}
-
 build_cache_archive() {
   local archive_path="$1"
   local compile_jobs="$2"
-  local apex_parallel_build
-  apex_parallel_build="$(resolve_apex_parallel_build "${compile_jobs}")"
 
   TMP_DIR="$(mktemp -d)"
   UV_CACHE_DIR="${TMP_DIR}/uv-cache"
@@ -262,7 +231,9 @@ build_cache_archive() {
 
   cp "${REPO_ROOT}/pyproject.toml" "${TMP_DIR}/pyproject.toml"
   cp "${REPO_ROOT}/uv.lock" "${TMP_DIR}/uv.lock"
-  constrain_temp_pyproject_for_ci_build "${TMP_DIR}/pyproject.toml" "${apex_parallel_build}" "${CI_APEX_NVCC_THREADS}"
+  mkdir -p "${TMP_DIR}/megatron_runtime"
+  cp "${REPO_ROOT}/megatron_runtime/pyproject.toml" "${TMP_DIR}/megatron_runtime/pyproject.toml"
+  cp "${REPO_ROOT}/megatron_runtime/uv.lock" "${TMP_DIR}/megatron_runtime/uv.lock"
 
   pushd "${TMP_DIR}" >/dev/null
   export UV_CACHE_DIR
@@ -274,7 +245,7 @@ build_cache_archive() {
   export NINJAFLAGS="-j${compile_jobs}"
   export TORCH_CUDA_ARCH_LIST
 
-  local cudnn_path="${TMP_DIR}/.venv/lib/python${PYTHON_MM}/site-packages/nvidia/cudnn"
+  local cudnn_path="${TMP_DIR}/megatron_runtime/.venv/lib/python${PYTHON_MM}/site-packages/nvidia/cudnn"
   export CUDNN_PATH="${cudnn_path}"
   export CUDNN_HOME="${cudnn_path}"
   export CUDNN_INCLUDE_PATH="${cudnn_path}/include"
@@ -283,10 +254,12 @@ build_cache_archive() {
   export LIBRARY_PATH="${CUDNN_LIBRARY_PATH}${LIBRARY_PATH:+:${LIBRARY_PATH}}"
   export LD_LIBRARY_PATH="${CUDNN_LIBRARY_PATH}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
 
-  log "Building split uv cache with compile_jobs=${compile_jobs}, apex_parallel_build=${apex_parallel_build}, nvcc_threads=${CI_APEX_NVCC_THREADS}, cuda_arch_list=${TORCH_CUDA_ARCH_LIST}, and uv_concurrent_builds=${UV_BUILD_SLOTS}."
-  uv sync --frozen --extra megatron --extra langgraph --extra plotting --group dev --no-install-project --python "${PYTHON_MM}"
+  log "Building split uv cache with compile_jobs=${compile_jobs}, cuda_arch_list=${TORCH_CUDA_ARCH_LIST}, and uv_concurrent_builds=${UV_BUILD_SLOTS}."
+  uv sync --frozen --extra langgraph --extra plotting --group dev --no-install-project --python "${PYTHON_MM}"
+  uv sync --project megatron_runtime --frozen --extra cuda12 --group test --no-install-project --python "${PYTHON_MM}"
   uv sync --frozen --extra backend --extra tinker --extra langgraph --extra plotting --group dev --no-install-project --python "${PYTHON_MM}"
   rm -rf .venv
+  rm -rf megatron_runtime/.venv
 
   log "Packing uv cache archive to ${archive_path}."
   rm -f "${archive_path}"

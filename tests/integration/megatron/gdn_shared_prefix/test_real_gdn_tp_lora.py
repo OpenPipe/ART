@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from pathlib import Path
-import socket
 
 import pytest
 
@@ -26,6 +25,7 @@ from art.megatron.model_support import QWEN3_5_MOE_SPEC  # noqa: E402
 from art.megatron.model_support.handlers import QWEN3_5_MOE_HANDLER  # noqa: E402
 
 from .cases import GdnPhase0Case, default_phase0_cases  # noqa: E402
+from .distributed_init import file_init_method  # noqa: E402
 from .metrics import GDN_CORRECTNESS_DTYPE, assert_real_gdn_metrics  # noqa: E402
 from .packed_layout import build_phase0_packed_tensors  # noqa: E402
 from .real_gdn_oracle import (  # noqa: E402
@@ -67,11 +67,16 @@ def test_real_qwen35_gdn_lora_gradients_match_flattened() -> None:
     not torch.cuda.is_available() or torch.cuda.device_count() < 2,
     reason="At least two CUDA devices are required for TP2 GDN coverage.",
 )
-def test_real_qwen35_gdn_tp2_gradients_match_flattened(tmp_path: Path) -> None:
-    port = _find_free_port()
+@pytest.mark.parametrize("lora", (False, True), ids=("base", "lora"))
+def test_real_qwen35_gdn_tp2_gradients_match_flattened(
+    tmp_path: Path, lora: bool
+) -> None:
+    init_method = file_init_method(
+        tmp_path, f"real_gdn_tp2_{'lora' if lora else 'base'}"
+    )
     mp.spawn(
         _tp2_worker,
-        args=(port, str(tmp_path)),
+        args=(init_method, str(tmp_path), lora),
         nprocs=2,
         join=True,
     )
@@ -79,11 +84,11 @@ def test_real_qwen35_gdn_tp2_gradients_match_flattened(tmp_path: Path) -> None:
         assert (tmp_path / f"rank_{rank}.ok").read_text() == "ok\n"
 
 
-def _tp2_worker(rank: int, port: int, output_dir: str) -> None:
+def _tp2_worker(rank: int, init_method: str, output_dir: str, lora: bool) -> None:
     torch.cuda.set_device(rank)
     init_process_group(
         backend="nccl",
-        init_method=f"tcp://127.0.0.1:{port}",
+        init_method=init_method,
         rank=rank,
         world_size=2,
     )
@@ -99,7 +104,7 @@ def _tp2_worker(rank: int, port: int, output_dir: str) -> None:
             for case in default_phase0_cases(conv_width=2)
             if case.name == "multi_family_repeated"
         )
-        packed_gdn, flat_gdn = _make_matching_gdn_pair(tp_size=2, lora=False)
+        packed_gdn, flat_gdn = _make_matching_gdn_pair(tp_size=2, lora=lora)
         tensors = build_phase0_packed_tensors(case)
         metrics = compare_real_gdn_cp1_to_flattened(
             packed_gdn=packed_gdn,
@@ -109,7 +114,9 @@ def _tp2_worker(rank: int, port: int, output_dir: str) -> None:
             parent_ids=tensors["parent_ids"].cuda(),
             assistant_mask=tensors["assistant_mask"].cuda(),
         )
-        assert_real_gdn_metrics(metrics, "tp2")
+        assert_real_gdn_metrics(metrics, "tp2_lora" if lora else "tp2")
+        if lora:
+            assert _gdn_lora_grad_names(packed_gdn)
         Path(output_dir, f"rank_{rank}.ok").write_text("ok\n")
     finally:
         if getattr(ps, "model_parallel_is_initialized", lambda: False)():
@@ -229,9 +236,3 @@ def _gdn_lora_grad_names(gdn: torch.nn.Module) -> tuple[str, ...]:
         and parameter.grad is not None
         and bool(parameter.grad.abs().max().item() > 0)
     )
-
-
-def _find_free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", 0))
-        return int(sock.getsockname()[1])

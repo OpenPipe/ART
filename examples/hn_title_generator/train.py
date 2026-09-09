@@ -236,6 +236,7 @@ async def main():
     # Initialize ART Backend and Model
     backend = LocalBackend()
     model = art.TrainableModel(
+        run_name=MODEL_NAME,
         name=MODEL_NAME,
         project=PROJECT,
         base_model=BASE_MODEL,

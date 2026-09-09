@@ -1,0 +1,26 @@
+{
+  "model_output": "  reasoning  </think>\n\nAnswer first.\n\n<tool_call>\n<function=lookup_weather>\n<parameter=city>\nSan Francisco\n</parameter>\n<parameter=days>\n3\n</parameter>\n</function>\n</tool_call>",
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "lookup_weather",
+        "description": "Look up a weather forecast.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "city": {"type": "string"},
+            "days": {"type": "integer"}
+          },
+          "required": ["city", "days"]
+        }
+      }
+    }
+  ],
+  "expected_tool_calls": [
+    {
+      "name": "lookup_weather",
+      "arguments": {"city": "San Francisco", "days": 3}
+    }
+  ]
+}

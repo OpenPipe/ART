@@ -26,7 +26,7 @@ _CP_SIZES = (2, 4, 8)
 
 
 @pytest.mark.parametrize("cp_size", _CP_SIZES)
-def test_qwen35_gdn_shared_prefix_cp_topology_oracle(
+def test_qwen35_gdn_prefix_tree_cp_topology_oracle(
     cp_size: int,
     capsys: pytest.CaptureFixture[str],
     monkeypatch: pytest.MonkeyPatch,
@@ -63,7 +63,7 @@ def test_qwen35_gdn_shared_prefix_cp_topology_oracle(
         }
     )
     variant = VariantSpec(
-        name=f"qwen35_gdn_shared_prefix_cp{cp_size}",
+        name=f"qwen35_gdn_prefix_tree_cp{cp_size}",
         objective="rl",
         topology=topology,
     )

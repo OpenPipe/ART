@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
 from megatron.core.packed_seq_params import PackedSeqParams
 from pydantic import BaseModel, ConfigDict, Field
 import torch
+
+from art.megatron.selective_lm_head import LmHeadTokenSelection
 
 from .layout_index import TokenLayoutIndex
 from .loss_inputs import ContextParallelLossInputs
@@ -16,9 +19,8 @@ class AttnMaskKind(str, Enum):
     CAUSAL = "causal"
 
 
-class TokenRange(BaseModel):
-    model_config = ConfigDict(frozen=True)
-
+@dataclass(frozen=True)
+class TokenRange:
     start: int
     end: int
 
@@ -29,9 +31,8 @@ class TokenRange(BaseModel):
         return self.end <= self.start
 
 
-class AttnSlice(BaseModel):
-    model_config = ConfigDict(frozen=True)
-
+@dataclass(frozen=True)
+class AttnSlice:
     q_range: TokenRange
     k_range: TokenRange
     mask_kind: AttnMaskKind
@@ -39,77 +40,82 @@ class AttnSlice(BaseModel):
     family_index: int | None = None
 
 
-class PackedRowAttentionSpec(BaseModel):
-    model_config = ConfigDict(frozen=True)
-
+@dataclass(frozen=True)
+class PackedRowAttentionSpec:
     row_index: int
     valid_tokens: int
     slices: tuple[AttnSlice, ...]
 
 
-class PackedBatchAttentionSpec(BaseModel):
-    model_config = ConfigDict(frozen=True)
-
+@dataclass(frozen=True)
+class PackedBatchAttentionSpec:
     rows: tuple[PackedRowAttentionSpec, ...]
 
 
-class SharedPrefixBuilderConfig(BaseModel):
+class ContextParallelStageWorkProfile(BaseModel):
+    """Architecture work assigned to one physical pipeline rank."""
+
     model_config = ConfigDict(frozen=True)
 
-    ignore_padding_group_id: int = -1
-    require_contiguous_group_runs: bool = True
+    physical_pipeline_rank: int = Field(ge=0)
+    query_flops_per_token: int = Field(ge=0)
+    tile_pair_flops: int = Field(ge=0)
+    k_hbm_bytes_per_token: int = Field(ge=0)
+    k_fetch_bytes_per_token: int = Field(ge=0)
+    dkv_reduce_bytes_per_token: int = Field(ge=0)
+    query_memory_bytes_per_token: int = Field(ge=0)
+    k_memory_bytes_per_token: int = Field(ge=0)
 
 
-class PlannerCpOverride(BaseModel):
+class ContextParallelWorkloadProfile(BaseModel):
+    """Model-specific facts used to compare low-fragmentation CP layouts."""
+
     model_config = ConfigDict(frozen=True)
 
-    cp_size: int
-    block_size: int | None = None
-    planner_chunk_size: int | None = None
-    planner_chunk_budget_base: int | None = None
-    planner_chunk_budget_per_cp_rank: int | None = None
-    planner_assignment_strategy: str | None = None
-    planner_stripe_group_size: int | None = None
-    planner_max_search_steps: int | None = None
-    planner_candidate_chunk_limit: int | None = None
-    planner_max_remote_waves: int | None = None
-    planner_stage_overhead_ms: float | None = None
-    planner_comm_stage_overhead_ms: float | None = None
-    planner_interval_overhead_ms: float | None = None
-    planner_merge_q_token_ms: float | None = None
-    planner_fetch_token_ms: float | None = None
-    planner_reduce_token_ms: float | None = None
-    planner_local_pair_ms: float | None = None
-    planner_remote_pair_ms: float | None = None
-    planner_local_backward_pair_ms: float | None = None
-    planner_remote_backward_pair_ms: float | None = None
-    planner_remote_stage_token_floor: int | None = None
-    planner_remote_stage_pair_floor: int | None = None
-    planner_remote_stage_underfill_ms: float | None = None
-    planner_tuned_backend: str | None = None
-    planner_tuned_hardware: str | None = None
-    planner_tuned_cp_sizes: tuple[int, ...] | None = None
+    stages: tuple[ContextParallelStageWorkProfile, ...] = Field(min_length=1)
+    query_tile_size: int = Field(gt=0)
+    key_tile_size: int = Field(gt=0)
+    indexer_score_workspace_elements: int = Field(gt=0)
+    indexer_max_k_tokens: int = Field(gt=0)
+    max_ownership_ranges_per_rank: int = Field(default=2, gt=0)
 
 
-class ContextParallelConfig(BaseModel):
-    model_config = ConfigDict(frozen=True, extra="forbid")
-
+@dataclass(frozen=True)
+class ContextParallelConfig:
     block_size: int = 128
     attention_sparse_block_size: tuple[int, int] | None = None
     planner_chunk_size: int = 512
     planner_chunk_budget_base: int = 128
     planner_chunk_budget_per_cp_rank: int = 16
-    planner_assignment_strategy: str = "search"
-    planner_stripe_group_size: int = 16
     planner_max_search_steps: int = 8
     planner_candidate_chunk_limit: int = 8
     planner_max_remote_waves: int = 4
     planner_stage_overhead_ms: float = 0.287151
+    # Host-side work every remote stage adds per layer (its own attention
+    # call, merge and collectives in forward and backward). Measured on H200
+    # bf16 as the extra time of one more remote wave at equal max rank load:
+    # 2.3-2.6 ms per layer (forward + backward) on Qwen3-1.7B/4B/8B/30B-A3B at
+    # CP4 and 0.2-0.6 ms on 8B/14B when layers are long enough to hide it, so
+    # this is the exposed value per direction (issue #854).
+    planner_remote_stage_host_ms: float = 1.2
+    # Compute the rest of the layer does per token a rank owns (projections,
+    # MLP or routed experts, forward + backward), in ms per token per layer on
+    # this rank. The attention stages alone do not see it, so without it the
+    # search balances attention pairs at the expense of token balance; see
+    # estimate_owned_token_ms. Zero disables the term.
+    planner_owned_token_ms: float = 0.0
     planner_comm_stage_overhead_ms: float = 0.143576
     planner_interval_overhead_ms: float = 0.11486
     planner_merge_q_token_ms: float = 0.00011486
-    planner_fetch_token_ms: float = 0.000287151
-    planner_reduce_token_ms: float = 0.000287151
+    # Per-token cost of the KV fetch and dKV reduce collectives. The previous
+    # value (0.000287, about 14 GB/s at 4 KB per token) priced a 12k-token
+    # fetch at 3.8 ms, ten times what NVLink delivers, so the planner hid a
+    # phantom latency behind extra waves and traded token balance for less
+    # remote fetch; measured pairs show no such gain at any volume (issue
+    # #854). 30 ns per token is a conservative all-to-all figure for 4 KB
+    # tokens on H200 NVLink.
+    planner_fetch_token_ms: float = 0.00003
+    planner_reduce_token_ms: float = 0.00003
     planner_local_pair_ms: float = 0.000000045944
     planner_remote_pair_ms: float = 0.000000048816
     planner_local_backward_pair_ms: float = 0.000000137832
@@ -117,15 +123,11 @@ class ContextParallelConfig(BaseModel):
     planner_remote_stage_token_floor: int = 4096
     planner_remote_stage_pair_floor: int = 4_000_000
     planner_remote_stage_underfill_ms: float = 0.287151
-    planner_tuned_backend: str | None = "art_context_parallel"
-    planner_tuned_hardware: str | None = "NVIDIA H200"
-    planner_tuned_cp_sizes: tuple[int, ...] = (2,)
-    planner_cp_overrides: tuple[PlannerCpOverride, ...] = ()
+    workload_profile: ContextParallelWorkloadProfile | None = None
 
 
-class ParallelTopology(BaseModel):
-    model_config = ConfigDict(frozen=True)
-
+@dataclass(frozen=True)
+class ParallelTopology:
     tp: int = 1
     cp: int = 1
     dp: int = 1
@@ -133,73 +135,50 @@ class ParallelTopology(BaseModel):
     sp: bool = False
 
 
-class ContextParallelRuntimeKey(BaseModel):
-    model_config = ConfigDict(frozen=True)
-
-    topology: ParallelTopology
-    config: ContextParallelConfig
-    row_signatures: tuple[str, ...]
-
-
-class KvFetchPlan(BaseModel):
-    model_config = ConfigDict(frozen=True)
-
+@dataclass(frozen=True)
+class KvFetchPlan:
     send_splits: tuple[int, ...]
     recv_splits: tuple[int, ...]
     send_ranges_by_peer: tuple[tuple[TokenRange, ...], ...]
 
 
-class DkvReducePlan(BaseModel):
-    model_config = ConfigDict(frozen=True)
-
+@dataclass(frozen=True)
+class DkvReducePlan:
     send_splits: tuple[int, ...]
     recv_splits: tuple[int, ...]
     recv_ranges_by_peer: tuple[tuple[TokenRange, ...], ...]
 
 
-class StagePlan(BaseModel):
-    model_config = ConfigDict(frozen=True)
-
+@dataclass(frozen=True)
+class StagePlan:
     stage_index: int
     source_rank: int
-    source_ranks: tuple[int, ...] = ()
     is_local_stage: bool
-    wave_index: int | None = None
     slices: tuple[AttnSlice, ...]
-    global_q_ranges: tuple[TokenRange, ...] = ()
-    global_k_ranges: tuple[TokenRange, ...] = ()
     owner_local_q_ranges: tuple[TokenRange, ...]
     owner_local_k_ranges: tuple[TokenRange, ...]
-    mask_metadata: "ExactMaskMetadata | None" = None
-    remote_buffer_range: TokenRange | None = None
     q_len: int
     k_len: int
+    source_ranks: tuple[int, ...] = ()
+    wave_index: int | None = None
+    global_q_ranges: tuple[TokenRange, ...] = ()
+    global_k_ranges: tuple[TokenRange, ...] = ()
+    mask_metadata: "ExactMaskMetadata | None" = None
+    remote_buffer_range: TokenRange | None = None
     kv_fetch_plan: KvFetchPlan | None = None
     dkv_reduce_plan: DkvReducePlan | None = None
 
 
-class RankRuntimePlan(BaseModel):
-    model_config = ConfigDict(frozen=True)
-
+@dataclass(frozen=True)
+class RankRuntimePlan:
     rank: int
     original_seq_len: int
     token_layout_index: TokenLayoutIndex
     local_valid_lengths: tuple[int, ...]
     local_row_ranges: tuple[TokenRange | None, ...]
-    local_token_count: int
     stage_plans: tuple[StagePlan, ...]
-    backward_stage_indices: tuple[int, ...] = ()
-    remote_kv_fetch_plan: KvFetchPlan
     remote_dkv_reduce_plan: DkvReducePlan
-
-
-class ContextParallelRuntimePlan(BaseModel):
-    model_config = ConfigDict(frozen=True)
-
-    topology: ParallelTopology
-    config: ContextParallelConfig
-    token_layout_index: TokenLayoutIndex
-    rank_plans: tuple[RankRuntimePlan, ...]
+    backward_stage_indices: tuple[int, ...] = ()
 
 
 class DispatchedPackedTensors(ContextParallelLossInputs):
@@ -214,66 +193,69 @@ class DispatchedPackedTensors(ContextParallelLossInputs):
     advantages: torch.Tensor
     weights: torch.Tensor
     valid_lengths: tuple[int, ...]
+    lm_head_selection: LmHeadTokenSelection
     original_logprobs: torch.Tensor | None = None
     ref_logprobs: torch.Tensor | None = None
     loss_all_reduce_group: Any | None = None
     token_uids: torch.Tensor | None = None
 
 
-class ContextParallelExecutionCache(BaseModel):
-    model_config = ConfigDict(arbitrary_types_allowed=True)
+class TrainingMicrobatchWorkload(BaseModel):
+    model_config = ConfigDict(frozen=True)
 
-    block_masks: dict[Any, Any] = Field(default_factory=dict)
-    range_indices: dict[Any, torch.Tensor] = Field(default_factory=dict)
-    range_meta: dict[Any, tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]] = Field(
+    logical_nonpadding_tokens: int = Field(ge=0)
+    loss_bearing_tokens: int = Field(ge=0)
+    executed_token_equivalents: int = Field(ge=0)
+    nominal_schedule_capacity_tokens: int = Field(ge=0)
+
+
+class TrainingStepWorkload(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    logical_nonpadding_tokens: int = Field(ge=0)
+    loss_bearing_tokens: int = Field(ge=0)
+    executed_token_equivalents: int = Field(ge=0)
+    nominal_schedule_capacity_tokens: int = Field(ge=0)
+    dummy_executed_token_equivalents: int = Field(ge=0)
+    dummy_schedule_capacity_tokens: int = Field(ge=0)
+    real_microbatches: int = Field(ge=0)
+    dummy_microbatches: int = Field(ge=0)
+
+
+@dataclass
+class ContextParallelExecutionCache:
+    block_mask_context: Any | None = None
+    block_masks: dict[Any, Any] = field(default_factory=dict)
+    range_indices: dict[Any, torch.Tensor] = field(default_factory=dict)
+    range_meta: dict[Any, tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]] = field(
         default_factory=dict
     )
-    stage_execution_specs: dict[Any, "StageExecutionSpec"] = Field(default_factory=dict)
+    stage_execution_specs: dict[Any, "StageExecutionSpec"] = field(default_factory=dict)
 
 
-class CpBlockMaskVariant(BaseModel):
-    model_config = ConfigDict(frozen=True)
-
-    sliding_window: int | None = None
+@dataclass(frozen=True)
+class CpBlockMaskVariant:
     block_size: tuple[int, int]
+    sliding_window: int | None = None
 
 
-class StageExecutionSpec(BaseModel):
-    model_config = ConfigDict(frozen=True)
-
+@dataclass(frozen=True)
+class StageExecutionSpec:
     q_len: int
     k_len: int
     compile_key: str
     mask_metadata: "ExactMaskMetadata | None" = None
 
 
-class PlannerProvenance(BaseModel):
-    model_config = ConfigDict(frozen=True)
-
-    runtime_backend: str
-    runtime_hardware: str | None = None
-    runtime_cp_size: int
-    tuned_backend: str | None = None
-    tuned_hardware: str | None = None
-    tuned_cp_sizes: tuple[int, ...] = ()
-    backend_match: bool
-    hardware_match: bool
-    cp_size_match: bool
-    using_best_effort: bool
-    warning_message: str | None = None
-    warning_emitted: bool = False
-
-
-class ArtContextParallelState(BaseModel):
-    model_config = ConfigDict(arbitrary_types_allowed=True)
-
-    runtime_key: ContextParallelRuntimeKey
+@dataclass
+class ArtContextParallelState:
     rank_plan: RankRuntimePlan
     cp_group: Any
     config: ContextParallelConfig
     group_ids: torch.Tensor
     parent_ids: torch.Tensor
     input_pos: torch.Tensor
+    model_state: dict[str, Any] = field(default_factory=dict)
     block_mask_variants: tuple[CpBlockMaskVariant, ...] = ()
     gdn_execution_spec: Any | None = None
     gdn_execution_plan: Any | None = None
@@ -281,31 +263,29 @@ class ArtContextParallelState(BaseModel):
     gdn_input_layout: str | None = None
     gdn_output_layout: str | None = None
     gdn_attention_original_shape: tuple[int, int, int] | None = None
-    gdn_attention_original_shapes: dict[int, tuple[int, int, int]] = Field(
+    gdn_attention_original_shapes: dict[int, tuple[int, int, int]] = field(
         default_factory=dict
     )
     gdn_attention_token_uids: torch.Tensor | None = None
     gdn_active_module: Any | None = None
-    planner_provenance: PlannerProvenance
     trace_token_uids: torch.Tensor | None = None
-    execution_cache: ContextParallelExecutionCache = Field(
+    execution_cache: ContextParallelExecutionCache = field(
         default_factory=ContextParallelExecutionCache
     )
 
 
-class PreparedMegatronBatch(BaseModel):
-    model_config = ConfigDict(arbitrary_types_allowed=True)
-
+@dataclass
+class PreparedMegatronBatch:
     tensors: DispatchedPackedTensors
-    packed_seq_params: PackedSeqParams | None = None
     attention_state: Any
+    workload: TrainingMicrobatchWorkload
+    packed_seq_params: PackedSeqParams | None = None
     rank_plan: RankRuntimePlan | None = None
     pad_multiple: int = 1
 
 
-class FlexMaskSpec(BaseModel):
-    model_config = ConfigDict(frozen=True)
-
+@dataclass(frozen=True)
+class FlexMaskSpec:
     q_len: int
     k_len: int
     block_size: int | tuple[int, int]
@@ -313,9 +293,70 @@ class FlexMaskSpec(BaseModel):
     exact_mask: "ExactMaskMetadata"
 
 
-class ExactMaskMetadata(BaseModel):
-    model_config = ConfigDict(frozen=True, arbitrary_types_allowed=True)
-
+@dataclass(frozen=True)
+class ExactMaskMetadata:
     q_token_indices: torch.Tensor
     k_token_indices: torch.Tensor
     cache_key: str
+
+
+def estimate_owned_token_ms(
+    *,
+    hidden_size: int,
+    ffn_hidden_size: int,
+    moe_topk: int = 0,
+    moe_ffn_hidden_size: int = 0,
+    moe_shared_expert_ffn: int = 0,
+    tensor_parallel_size: int = 1,
+    expert_parallel_size: int = 1,
+    expert_tensor_parallel_size: int | None = None,
+    achieved_tflops: float = 400.0,
+) -> float:
+    """Per-token, per-layer compute of the non-attention work that follows a
+    rank's owned tokens, in ms on this rank.
+
+    Local work follows ownership: the four attention projections (8 h^2 FLOPs
+    per token) and the dense gated MLP (6 h f) or, for MoE, the shared expert
+    (6 h f_s). Routed-expert work (6 h f_e k) follows ownership only while the
+    expert communication stays within the owning rank's tensor-parallel group:
+    expert parallelism 1 and an expert tensor-parallel size that divides the
+    attention tensor-parallel size (Megatron defaults it to the same size).
+    With expert parallelism the routed rows are redistributed across the
+    expert-parallel group; with an expert tensor-parallel group that does not
+    tile the attention one (TP1 x CP2 with ETP2, or TP4 with ETP3) the group
+    gathers routed rows of more than one CP owner. Either way a rank's expert work depends on the tokens
+    of every source rank in that group, not on its own ownership, and it must
+    not enter the ownership balance (with balanced routing it is the same on
+    every rank).
+
+    Backward is about twice the forward; each tensor-parallel rank does its
+    share; 400 TFLOP/s is a bf16 H200 at large matmuls. Agrees within about
+    30% with the per-token coefficients fitted from measured layer times on
+    Qwen3-1.7B/8B/14B and Qwen3-30B-A3B (0.7 / 2.8 / 4.6 / 1.3 us).
+    """
+
+    h = float(hidden_size)
+    is_moe = moe_topk > 0 and moe_ffn_hidden_size > 0
+    local = 8.0 * h * h + (
+        6.0 * h * float(moe_shared_expert_ffn)
+        if is_moe
+        else 6.0 * h * float(ffn_hidden_size)
+    )
+    tp = max(1, tensor_parallel_size)
+    etp = (
+        tp
+        if expert_tensor_parallel_size is None
+        else max(1, expert_tensor_parallel_size)
+    )
+    # Under Megatron's rank ordering the expert tensor-parallel groups tile the
+    # attention tensor-parallel groups only when their size divides the
+    # attention one; otherwise (e.g. TP4 with ETP3) a group straddles two
+    # context-parallel owners and gathers both owners' routed rows.
+    routed_follows_ownership = max(1, expert_parallel_size) == 1 and tp % etp == 0
+    routed = (
+        6.0 * h * float(moe_ffn_hidden_size) * moe_topk
+        if is_moe and routed_follows_ownership
+        else 0.0
+    )
+    total_flops = 3.0 * (local + routed)
+    return total_flops / tp / (achieved_tflops * 1e12) * 1e3

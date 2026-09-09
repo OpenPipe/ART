@@ -51,9 +51,9 @@ __all__ = [
 _TRAIN_TASK_SHUTDOWN_TIMEOUT_S = 5.0
 
 _UPSTREAM_TRAIN_METRIC_KEYS = {
-    "reward": "reward",
-    "reward_std_dev": "reward_std_dev",
-    "exception_rate": "exception_rate",
+    "reward": "train/reward",
+    "reward_std_dev": "train/reward_std_dev",
+    "exception_rate": "train/exception_rate",
     "policy_loss": "loss/train",
     "loss": "loss/train",
     "entropy": "loss/entropy",
@@ -64,8 +64,8 @@ _UPSTREAM_TRAIN_METRIC_KEYS = {
     "num_groups_submitted": "data/step_num_groups_submitted",
     "num_groups_trainable": "data/step_num_groups_trainable",
     "num_trajectories": "data/step_num_trajectories",
-    "num_trainable_tokens": "data/step_trainer_tokens",
-    "train_tokens": "data/step_trainer_tokens",
+    "num_trainable_tokens": "data/step_trainable_assistant_tokens",
+    "train_tokens": "data/step_trainable_assistant_tokens",
     "num_datums": "data/step_num_datums",
 }
 
@@ -301,7 +301,7 @@ def _canonicalize_upstream_metric_key(metric: str) -> str:
     if metric == "tokens_per_second":
         return ""
     if metric.startswith("group_metric_"):
-        return f"group_{metric[len('group_metric_') :]}"
+        return f"train/group/{metric[len('group_metric_') :]}"
     return _UPSTREAM_TRAIN_METRIC_KEYS.get(metric, metric)
 
 
@@ -435,7 +435,7 @@ def get_compute_loss_fn(trainer: "GRPOTrainer") -> Callable[..., torch.Tensor]:
             f"Sequence length ({seq_len}) must be evenly divisible by chunk size ({chunk_size})"
         )
         os.environ["UNSLOTH_RETURN_HIDDEN_STATES"] = "1"
-        forward_kwargs = {}
+        forward_kwargs: dict[str, object] = {}
         if "pixel_values" in inputs:
             forward_kwargs["pixel_values"] = inputs["pixel_values"]
         if "image_grid_thw" in inputs:
@@ -602,7 +602,7 @@ def calculate_logprobs(
     trainer: "GRPOTrainer",
     input_ids: torch.Tensor,
     causal_mask: torch.Tensor,
-    forward_kwargs: dict[str, torch.Tensor],
+    forward_kwargs: dict[str, object],
     next_input_ids: torch.Tensor,
     lm_head_t: torch.Tensor,
     chunk_size: int,
@@ -830,7 +830,7 @@ async def run_unsloth_rl_training(
     for offset in range(0, packed_tensors["tokens"].shape[0]):
         for _ in range(2 if warmup else 1):
             if precalculate_logprobs and not warmup:
-                packed_tensors["original_logprobs"] = packed_tensors["logprobs"]  # type: ignore[index]
+                packed_tensors["original_logprobs"] = packed_tensors["logprobs"]
                 packed_tensors["logprobs"] = _precalculate_new_logprobs(
                     ctx,
                     packed_tensors,

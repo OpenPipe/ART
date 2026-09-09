@@ -84,6 +84,7 @@ class ExperimentalTrainingConfig(TypedDict, total=False):
 class SFTTrainingConfig(TypedDict, total=False):
     batch_size: int | None
     learning_rate: float | list[float] | None
+    assistant_turns: Literal["all", "last"]
     metric_logging: SFTMetricLoggingConfig | None
 
 

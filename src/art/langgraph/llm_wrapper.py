@@ -14,7 +14,7 @@ from langchain_core.runnables import Runnable
 from langchain_core.utils.function_calling import convert_to_openai_tool
 from langchain_openai import ChatOpenAI
 
-from art.trajectories import History, Trajectory
+from art.trajectories import LegacyHistory, Trajectory
 
 from .logging import FileLogger
 from .message_utils import convert_langgraph_messages
@@ -89,7 +89,7 @@ def create_messages_from_logs(logger: FileLogger, trajectory: Trajectory):
                 trajectory.tools = tools[idx]
             else:
                 trajectory.additional_histories.append(
-                    History(messages_and_choices=converted, tools=tools[idx])
+                    LegacyHistory(messages_and_choices=converted, tools=tools[idx])
                 )
         except Exception:
             pass

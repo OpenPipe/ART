@@ -44,6 +44,7 @@ async def main():
 
     backend = LocalBackend()
     model = art.TrainableModel(
+        run_name="001-gemma3",
         name="001-gemma3",
         project="yes-no-maybe-s",
         base_model="google/gemma-3-4b-it",

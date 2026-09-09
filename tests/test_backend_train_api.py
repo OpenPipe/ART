@@ -116,6 +116,7 @@ async def main() -> None:
         # Create backend and model
         backend = LocalBackend(path=tmpdir)
         model = art.TrainableModel(
+            run_name="test-backend-train-api",
             name="test-backend-train-api",
             project="api-test",
             base_model=os.environ.get("BASE_MODEL", DEFAULT_BASE_MODEL),

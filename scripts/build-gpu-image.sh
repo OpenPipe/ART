@@ -10,11 +10,13 @@ Options:
   --image-repo REPO      Image repository to publish
   --infra INFRA          Kubernetes-backed SkyPilot infra (default: k8s/cks-wb3)
   --no-cache             Disable registry-backed BuildKit cache
+  --no-prewarm-modal     Skip prebuilding the pushed image in Modal
   --no-prewarm-nodes     Skip pre-pulling the pushed image on GPU nodes
   --prewarm-infra INFRA  Kubernetes-backed infra to prewarm; repeatable
   --pull-image-repo REPO Image repository for cluster pulls/prewarm
+  --prewarm-modal        Require prebuilding the pushed image in Modal
   --prewarm-timeout DUR  Timeout for the prewarm DaemonSet rollout (default: 30m)
-  --tag TAG              Image tag to publish
+  --tag TAG              Image tag to publish (default: latest)
   --help                 Show this help
 EOF
 }
@@ -25,12 +27,13 @@ cluster_name=""
 infra="${SKY_INFRA:-k8s/cks-wb3}"
 image_repo="${ART_IMAGE_REPO:-}"
 pull_image_repo="${ART_PULL_IMAGE_REPO:-}"
-image_tag=""
+image_tag="${IMAGE_TAG:-latest}"
 docker_config_path="${DOCKER_CONFIG_PATH:-${HOME}/.docker/config.json}"
 buildkit_image="${BUILDKIT_IMAGE:-moby/buildkit:v0.29.0-rootless}"
 buildkit_namespace="${KUBECTL_NAMESPACE:-default}"
 buildkit_wait_timeout="${BUILDKIT_WAIT_TIMEOUT:-300s}"
 no_cache="${NO_CACHE:-false}"
+prewarm_modal="${PREWARM_MODAL:-auto}"
 prewarm_nodes="${PREWARM_NODES:-true}"
 prewarm_infras=()
 if [[ -n "${PREWARM_INFRAS:-}" ]]; then
@@ -42,6 +45,8 @@ prewarm_namespace="${PREWARM_NAMESPACE:-default}"
 prewarm_name="${PREWARM_NAME:-art-gpu-image-prewarm}"
 prewarm_image_pull_secret="${PREWARM_IMAGE_PULL_SECRET:-art-gpu-registry-auth}"
 prewarm_node_selector="${PREWARM_NODE_SELECTOR:-node.coreweave.cloud/class=gpu}"
+prewarm_hypervisor_label="node.coreweave.cloud/hypervisor"
+prewarm_hypervisor_value="true"
 prewarm_timeout="${PREWARM_TIMEOUT:-30m}"
 prewarm_node_timeout="${PREWARM_NODE_TIMEOUT:-10m}"
 prewarm_delete_timeout="${PREWARM_DELETE_TIMEOUT:-60s}"
@@ -73,6 +78,10 @@ while [[ $# -gt 0 ]]; do
       no_cache=true
       shift
       ;;
+    --no-prewarm-modal)
+      prewarm_modal=false
+      shift
+      ;;
     --no-prewarm-nodes)
       prewarm_nodes=false
       shift
@@ -84,6 +93,10 @@ while [[ $# -gt 0 ]]; do
     --pull-image-repo)
       pull_image_repo="$2"
       shift 2
+      ;;
+    --prewarm-modal)
+      prewarm_modal=true
+      shift
       ;;
     --prewarm-timeout)
       prewarm_timeout="$2"
@@ -104,6 +117,14 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
+
+case "${prewarm_modal}" in
+  auto|true|false) ;;
+  *)
+    echo "PREWARM_MODAL must be one of: auto, true, false" >&2
+    exit 1
+    ;;
+esac
 
 kube_context_from_infra() {
   local infra_value="$1"
@@ -141,10 +162,6 @@ prewarm_node_selector_value="${prewarm_node_selector#*=}"
 art_sha="$(git -C "${repo_root}" rev-parse HEAD)"
 art_short_sha="$(git -C "${repo_root}" rev-parse --short=12 HEAD)"
 timestamp="$(date +%m%d-%H%M%S)"
-
-if [[ -z "${image_tag}" ]]; then
-  image_tag="skypilot-${art_short_sha}"
-fi
 
 if [[ -z "${cluster_name}" ]]; then
   cluster_name="art-gpu-build-${timestamp}"
@@ -280,9 +297,14 @@ cleanup() {
 trap cleanup EXIT
 printf '0' > "${build_log_offset_path}"
 
-mkdir -p "${context_dir}/docker" "${context_dir}/vllm_runtime"
+mkdir -p "${context_dir}/docker" "${context_dir}/megatron_runtime" \
+  "${context_dir}/vllm_runtime"
 cp "${repo_root}/pyproject.toml" "${context_dir}/pyproject.toml"
 cp "${repo_root}/uv.lock" "${context_dir}/uv.lock"
+cp "${repo_root}/megatron_runtime/pyproject.toml" \
+  "${context_dir}/megatron_runtime/pyproject.toml"
+cp "${repo_root}/megatron_runtime/uv.lock" \
+  "${context_dir}/megatron_runtime/uv.lock"
 cp "${repo_root}/vllm_runtime/pyproject.toml" "${context_dir}/vllm_runtime/pyproject.toml"
 cp "${repo_root}/vllm_runtime/uv.lock" "${context_dir}/vllm_runtime/uv.lock"
 cp "${repo_root}/.dockerignore" "${context_dir}/.dockerignore"
@@ -459,6 +481,38 @@ if [[ -n "${prewarm_refresh_tag_image}" ]]; then
       )
       ;;
   esac
+fi
+
+modal_auth_available=false
+if [[ "${prewarm_modal}" != "false" ]]; then
+  if uv run --with 'modal>=1.5.0' python - <<'PY' >/dev/null 2>&1; then
+import modal
+
+modal.Workspace.from_context().hydrate()
+PY
+    modal_auth_available=true
+  fi
+fi
+
+if [[ "${prewarm_modal}" == "true" || "${modal_auth_available}" == "true" ]]; then
+  echo "Prewarming ${image_repo}:${image_tag} in Modal image cache"
+  MODAL_FORCE_BUILD=1 uv run --with 'modal>=1.5.0' python - "${image_repo}:${image_tag}" <<'PY'
+import sys
+
+import modal
+
+image = (
+    modal.Image.from_registry(sys.argv[1], add_python="3.12")
+    .apt_install("openssh-server", "sudo", "rsync", "curl", "procps", "patch", "lsof")
+)
+app = modal.App.lookup("skypilot-modal", create_if_missing=True)
+with modal.enable_output():
+    image.build(app)
+PY
+elif [[ "${prewarm_modal}" == "auto" ]]; then
+  echo "Skipping Modal image prewarm: Modal auth unavailable"
+else
+  echo "Skipping Modal image prewarm"
 fi
 
 dump_prewarm_diagnostics() {
@@ -871,13 +925,22 @@ if [[ "${prewarm_nodes}" == "true" ]]; then
     echo "PREWARM_NODE_PARALLELISM must be a positive integer, got: ${prewarm_node_parallelism}" >&2
     exit 1
   fi
+  prewarm_eligible_node_selector="${prewarm_node_selector},${prewarm_hypervisor_label}!=${prewarm_hypervisor_value}"
+  mapfile -t hypervisor_gpu_nodes < <(
+    "${kubectl_cmd[@]}" get nodes \
+      -l "${prewarm_node_selector},${prewarm_hypervisor_label}=${prewarm_hypervisor_value}" \
+      -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null
+  )
+  if (( ${#hypervisor_gpu_nodes[@]} > 0 )); then
+    echo "Skipping ${#hypervisor_gpu_nodes[@]} hypervisor GPU node(s): ${hypervisor_gpu_nodes[*]}"
+  fi
   mapfile -t gpu_nodes < <(
-    "${kubectl_cmd[@]}" get nodes -l "${prewarm_node_selector}" \
+    "${kubectl_cmd[@]}" get nodes -l "${prewarm_eligible_node_selector}" \
       -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null
   )
   gpu_node_count="${#gpu_nodes[@]}"
   if [[ "${gpu_node_count}" == "0" ]]; then
-    echo "Skipping GPU node prewarm: no nodes match ${prewarm_node_selector}"
+    echo "Skipping GPU node prewarm: no nodes match ${prewarm_eligible_node_selector}"
   else
     echo "Prewarming ${prewarm_display} on ${gpu_node_count} GPU node(s)"
     "${kubectl_cmd[@]}" create secret generic "${prewarm_image_pull_secret}" \
@@ -944,6 +1007,15 @@ spec:
     spec:
       nodeSelector:
         ${prewarm_node_selector_key}: ${prewarm_node_selector_value}
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: ${prewarm_hypervisor_label}
+                    operator: NotIn
+                    values:
+                      - "${prewarm_hypervisor_value}"
       imagePullSecrets:
         - name: ${prewarm_image_pull_secret}
       tolerations:

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from pathlib import Path
-import socket
 from typing import Any, cast
 
 import pytest
@@ -20,6 +19,7 @@ from art.megatron.gdn.fla_cp import (  # noqa: E402
     chunk_gated_delta_rule_native_cp,
 )
 
+from .distributed_init import file_init_method  # noqa: E402
 from .metrics import GDN_CORRECTNESS_DTYPE, assert_mean_abs_pct  # noqa: E402
 
 _CP_SIZES = (
@@ -43,10 +43,10 @@ _CP_SIZES = (
 def test_native_fla_cp_recurrent_matches_single_rank(
     cp_size: int, tmp_path: Path
 ) -> None:
-    port = _find_free_port()
+    init_method = file_init_method(tmp_path, f"native_fla_recurrent_cp{cp_size}")
     mp.spawn(
         _native_fla_cp_worker,
-        args=(cp_size, port, str(tmp_path)),
+        args=(cp_size, init_method, str(tmp_path)),
         nprocs=cp_size,
         join=True,
     )
@@ -62,10 +62,10 @@ def test_native_fla_cp_recurrent_matches_single_rank(
 def test_native_fla_cp_recurrent_varlen_multichain_matches_single_rank(
     cp_size: int, tmp_path: Path
 ) -> None:
-    port = _find_free_port()
+    init_method = file_init_method(tmp_path, f"native_fla_varlen_cp{cp_size}")
     mp.spawn(
         _native_fla_cp_varlen_multichain_worker,
-        args=(cp_size, port, str(tmp_path)),
+        args=(cp_size, init_method, str(tmp_path)),
         nprocs=cp_size,
         join=True,
     )
@@ -119,13 +119,13 @@ def test_native_fla_summary_affine_debug_matches_final_state() -> None:
 def _native_fla_cp_worker(
     rank: int,
     cp_size: int,
-    port: int,
+    init_method: str,
     output_dir: str,
 ) -> None:
     torch.cuda.set_device(rank)
     init_process_group(
         backend="nccl",
-        init_method=f"tcp://127.0.0.1:{port}",
+        init_method=init_method,
         rank=rank,
         world_size=cp_size,
     )
@@ -201,13 +201,13 @@ def _native_fla_cp_worker(
 def _native_fla_cp_varlen_multichain_worker(
     rank: int,
     cp_size: int,
-    port: int,
+    init_method: str,
     output_dir: str,
 ) -> None:
     torch.cuda.set_device(rank)
     init_process_group(
         backend="nccl",
-        init_method=f"tcp://127.0.0.1:{port}",
+        init_method=init_method,
         rank=rank,
         world_size=cp_size,
     )
@@ -519,9 +519,3 @@ def _cat_varlen_slices(
 def _assert_grad_close(left: torch.Tensor, right_grad: torch.Tensor, name: str) -> None:
     assert left.grad is not None, name
     assert_mean_abs_pct(right_grad, left.grad, name)
-
-
-def _find_free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", 0))
-        return int(sock.getsockname()[1])

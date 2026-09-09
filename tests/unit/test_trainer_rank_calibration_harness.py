@@ -1,0 +1,217 @@
+"""The calibration harness steers every rank's next forward from world-wide
+compile telemetry.
+
+Issue #840: the warm-up loop stopped when the *local* rank's forward was
+compile-free. One CP rank whose local shapes still recompiled ran an extra
+warm-up of the previous layout while its peers moved on to the next one, so the
+context-parallel all-to-alls paired different layouts and deadlocked.
+"""
+
+from __future__ import annotations
+
+import importlib.util
+from pathlib import Path
+import sys
+
+import pytest
+
+_DRIVER = (
+    Path(__file__).resolve().parents[2] / "dev" / "trainer_rank_landing_acceptance.py"
+)
+_spec = importlib.util.spec_from_file_location(
+    "trainer_rank_landing_acceptance", _DRIVER
+)
+assert _spec is not None and _spec.loader is not None
+driver = importlib.util.module_from_spec(_spec)
+sys.modules[_spec.name] = driver
+_spec.loader.exec_module(driver)
+
+
+class _Watch:
+    def __init__(self, statuses: list[str]) -> None:
+        self._statuses = list(statuses)
+
+    def take(self) -> list[str]:
+        statuses, self._statuses = self._statuses, []
+        return statuses
+
+
+def test_world_compile_statuses_merges_every_rank(monkeypatch) -> None:
+    # Rank 3 recompiled while ranks 0-2 were compile-free: the warm-up must
+    # continue on all four ranks.
+    per_rank = [["none"], ["none"], ["none"], ["recompile"]]
+    gathered: list[list[str]] = []
+
+    def fake_gather(value, group=None):
+        gathered.append(value)
+        return per_rank
+
+    monkeypatch.setattr(driver, "_gather_objects", fake_gather)
+    statuses = driver._world_compile_statuses(_Watch(["none"]))
+    assert gathered == [["none"]], "the local statuses must be gathered"
+    assert statuses == ["none", "recompile"]
+    assert not driver._warmup_complete(attempt=1, statuses=statuses)
+
+
+def test_warmup_complete_needs_min_warmups_and_no_compile_anywhere() -> None:
+    assert not driver._warmup_complete(0, ["none"])
+    assert driver._warmup_complete(1, ["none"])
+    assert not driver._warmup_complete(1, [])
+    assert not driver._warmup_complete(7, ["none", "recompile"])
+    assert driver._merge_rank_statuses([["recompile", "none"], ["none"]]) == [
+        "none",
+        "recompile",
+    ]
+
+
+def test_every_recorded_compile_status_is_world_wide() -> None:
+    source = _DRIVER.read_text()
+    assert '"compile_statuses": watch.take()' not in source
+    assert source.count('"compile_statuses": _world_compile_statuses(watch)') == 2
+
+
+class _Tokenizer:
+    def __init__(self, size: int, salt: str = "") -> None:
+        self._size = size
+        self._salt = salt
+
+    def __len__(self) -> int:
+        return self._size
+
+    def decode(self, ids: list[int]) -> str:
+        return self._salt + " ".join(str(i) for i in ids)
+
+
+def test_corpus_tokenizer_check_requires_the_same_tokenizer(monkeypatch) -> None:
+    import transformers
+
+    corpus = {
+        "tokenizer_model": "Qwen/Qwen3-0.6B",
+        "groups": [{"histories": [{"tokens": list(range(1, 300))}]}],
+    }
+    tokenizers = {
+        "Qwen/Qwen3-0.6B": _Tokenizer(151_669),
+        "Qwen/Qwen3-8B": _Tokenizer(151_669),
+        "Qwen/Qwen3.5-4B": _Tokenizer(248_320, salt="other:"),
+    }
+    monkeypatch.setattr(
+        transformers.AutoTokenizer,
+        "from_pretrained",
+        classmethod(lambda cls, name, **kwargs: tokenizers[name]),
+    )
+    assert driver._check_corpus_tokenizer(corpus, "Qwen/Qwen3-8B") == {
+        "corpus_tokenizer": "Qwen/Qwen3-0.6B",
+        "vocabulary": 151_669,
+    }
+    with pytest.raises(SystemExit):
+        driver._check_corpus_tokenizer(corpus, "Qwen/Qwen3.5-4B")
+
+
+def test_qwen3_ellavox_cells_use_the_qwen3_corpus() -> None:
+    assert driver.CALIBRATION_CORPUS_BY_CELL == {
+        "cal-ellavox": "qwen35",
+        "cal-ellavox-qwen3": "qwen3",
+    }
+    assert set(driver.ELLAVOX_CORPORA) == {"qwen35", "qwen3"}
+    for path, digest in driver.ELLAVOX_CORPORA.values():
+        assert path.name.startswith("_trainer_rank_ellavox_") and len(digest) == 64
+
+
+def test_legacy_planner_variant_restores_the_pre_854_constants() -> None:
+    """The paired A/B times every layout under the current CP planner and the
+    legacy constants (no host cost per remote stage, a fetch priced at about
+    14 GB/s, attention-only balance); the legacy config differs in exactly
+    those fields."""
+
+    pytest.importorskip("megatron.core")
+    from art.megatron.context_parallel.types import ContextParallelConfig
+
+    current = ContextParallelConfig(planner_owned_token_ms=0.0033)
+    legacy = driver._legacy_planner_config(current)
+    assert legacy.planner_remote_stage_host_ms == 0.0
+    assert (
+        legacy.planner_fetch_token_ms == legacy.planner_reduce_token_ms == 0.000287151
+    )
+    assert legacy.planner_owned_token_ms == 0.0
+    assert current.planner_remote_stage_host_ms > 0.0
+    assert current.planner_fetch_token_ms < legacy.planner_fetch_token_ms
+    changed = {
+        name
+        for name in current.__dataclass_fields__
+        if getattr(current, name) != getattr(legacy, name)
+    }
+    assert changed == {
+        "planner_remote_stage_host_ms",
+        "planner_fetch_token_ms",
+        "planner_reduce_token_ms",
+        "planner_owned_token_ms",
+    }
+    driver._set_planner_variant("legacy")
+    assert driver._planner_variant == "legacy"
+    driver._set_planner_variant("current")
+    with pytest.raises(ValueError):
+        driver._set_planner_variant("other")
+
+
+def test_legacy_planner_variant_restores_the_pre_854_search(monkeypatch) -> None:
+    """The legacy arm is main's planner, not a constants-only ablation: with the
+    constants it restores the any-rank improving move (ownership may fragment),
+    and the current arm keeps the contiguous-only search."""
+
+    pytest.importorskip("megatron.core")  # the CP runtime needs Megatron-Core
+    from art.megatron.context_parallel import runtime
+    from art.megatron.training import microbatches
+
+    current_move = runtime._best_improving_move
+    monkeypatch.setattr(
+        microbatches,
+        "_context_parallel_config_for_provider",
+        microbatches._context_parallel_config_for_provider,
+    )
+    monkeypatch.setattr(runtime, "_best_improving_move", current_move)
+    monkeypatch.setattr(driver, "_CURRENT_BEST_IMPROVING_MOVE", None)
+    driver._install_planner_ab()
+    try:
+        driver._set_planner_variant("legacy")
+        assert runtime._best_improving_move is driver._legacy_best_improving_move
+        driver._set_planner_variant("current")
+        assert runtime._best_improving_move is current_move
+    finally:
+        driver._set_planner_variant("current")
+
+
+def test_planner_variant_switch_clears_the_registered_layout_cache(monkeypatch) -> None:
+    """The production selection ("automatic") depends on the planner wherever a
+    re-ranker prices plan structure, but the rank's layout cache is not keyed by
+    the planner: a variant switch must drop it so the legacy arm times main's
+    own choice rather than the current planner's."""
+
+    pytest.importorskip("megatron.core")
+    from collections import OrderedDict
+    import threading
+    from types import SimpleNamespace
+
+    from art.megatron.context_parallel import runtime
+    from art.megatron.training import microbatches
+
+    monkeypatch.setattr(
+        microbatches,
+        "_context_parallel_config_for_provider",
+        microbatches._context_parallel_config_for_provider,
+    )
+    monkeypatch.setattr(runtime, "_best_improving_move", runtime._best_improving_move)
+    monkeypatch.setattr(driver, "_CURRENT_BEST_IMPROVING_MOVE", None)
+    monkeypatch.setattr(driver, "_PLANNER_AB_RANKS", [])
+    rank = SimpleNamespace(
+        _layout_cache_lock=threading.Lock(),
+        _layout_selection_cache=OrderedDict({"key": "layout"}),
+    )
+    driver._install_planner_ab(rank)
+    try:
+        driver._set_planner_variant("legacy")
+        assert not rank._layout_selection_cache
+        rank._layout_selection_cache["key"] = "legacy layout"
+        driver._set_planner_variant("current")
+        assert not rank._layout_selection_cache
+    finally:
+        driver._set_planner_variant("current")

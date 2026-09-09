@@ -32,7 +32,7 @@ def keep_recent_and_top(
     *,
     recent: int = 5,
     top: int = 2,
-    metric: str = "val/reward",
+    metric: str = "reward/val",
 ) -> CheckpointRetentionStrategy:
     """Keep the most recent eligible checkpoints and top metric checkpoints."""
     if recent < 0:

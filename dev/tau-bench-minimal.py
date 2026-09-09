@@ -28,6 +28,7 @@ async def train(
 
     backend = TinkerBackend()
     model = art.TrainableModel(
+        run_name=name,
         name=name,
         project="tau-bench",
         base_model=base_model,

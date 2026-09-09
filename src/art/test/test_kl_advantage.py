@@ -186,3 +186,36 @@ def test_kl_advantage_can_use_sample_logprobs() -> None:
     assert torch.isclose(sample_loss.kl_policy_ref, expected_sample_kl)
     assert torch.isclose(learner_loss.kl_policy_ref, expected_current_kl)
     assert not torch.isclose(sample_loss.kl_policy_ref, learner_loss.kl_policy_ref)
+
+
+def test_loss_masks_nonfinite_ignored_logprobs_before_arithmetic() -> None:
+    inputs = _make_inputs(seq_len=4, advantages=[0.0, 1.0, 1.0, 0.0])
+    inputs["assistant_mask"] = torch.tensor([[False, False, True, False]])
+    new_logprobs = torch.tensor(
+        [[float("nan"), -0.5, float("nan"), float("nan")]],
+        requires_grad=True,
+    )
+    ref_logprobs = torch.tensor([[float("nan"), -0.25, float("nan"), float("nan")]])
+    entropies = torch.tensor([[float("nan"), float("nan"), 0.125, float("nan")]])
+
+    loss = loss_fn(
+        LossInputs(inputs=inputs),
+        new_logprobs,
+        ref_logprobs,
+        entropies,
+        {"kl_penalty_coef": 0.1},
+    )
+
+    assert torch.isfinite(loss.policy_loss)
+    assert loss.kl_policy_ref is not None
+    assert torch.isfinite(loss.kl_policy_ref)
+    assert loss.entropy is not None
+    assert torch.isfinite(loss.entropy)
+
+    loss.policy_loss.backward()
+    assert new_logprobs.grad is not None
+    assert torch.isfinite(new_logprobs.grad).all()
+    assert new_logprobs.grad[0, 0] == 0.0
+    assert new_logprobs.grad[0, 1] != 0.0
+    assert new_logprobs.grad[0, 2] == 0.0
+    assert new_logprobs.grad[0, 3] == 0.0

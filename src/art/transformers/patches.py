@@ -1,4 +1,4 @@
-from typing import TYPE_CHECKING, Optional, Union
+from typing import TYPE_CHECKING, Any, Optional, Union
 
 import torch
 from transformers import masking_utils
@@ -19,15 +19,7 @@ def _patched_preprocess_mask_arguments(
     position_ids: Optional[torch.Tensor],
     layer_idx: Optional[int],
     encoder_hidden_states: Optional[torch.Tensor] = None,
-) -> tuple[
-    bool,
-    Optional[Union[torch.Tensor, "BlockMask"]],
-    Optional[torch.Tensor],
-    int,
-    int,
-    int,
-    int,
-]:
+) -> tuple[Any, ...]:
     if position_ids is not None and len(position_ids.shape) == 3:
         position_ids = position_ids[0]
     return _preprocess_mask_arguments(

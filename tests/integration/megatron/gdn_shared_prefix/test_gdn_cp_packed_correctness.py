@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from pathlib import Path
-import socket
 from typing import Any
 
 import pytest
@@ -15,12 +14,14 @@ from megatron.core import parallel_state as ps  # noqa: E402
 from torch.distributed import destroy_process_group, init_process_group  # noqa: E402
 import torch.multiprocessing as mp  # noqa: E402
 
-from art.megatron.gdn.gdn_shared_prefix import (  # noqa: E402
+from art.megatron.context_parallel.layout_index import TokenLayoutIndex  # noqa: E402
+from art.megatron.gdn.gdn_prefix_tree import (  # noqa: E402
     GdnPlannerConfig,
     build_gdn_rank_execution_plan,
-    parse_gdn_shared_prefix_segments,
+    parse_gdn_prefix_tree_segments,
 )
 from art.megatron.gdn.operator import run_gdn_layer  # noqa: E402
+from art.megatron.prefix_tree_packing import prefix_tree_pack  # noqa: E402
 
 from .cases import (  # noqa: E402
     GdnFamilyShape,
@@ -29,6 +30,7 @@ from .cases import (  # noqa: E402
     default_phase0_cases,
 )
 from .distributed_grad import all_reduce_parameter_grads_coalesced  # noqa: E402
+from .distributed_init import file_init_method  # noqa: E402
 from .metrics import (  # noqa: E402
     GDN_CORRECTNESS_DTYPE,
     REAL_GDN_GRAD_MEAN_ABS_PCT_THRESHOLD,
@@ -50,10 +52,10 @@ def test_gdn_cp_packed_matches_cp1_oracle_all_edge_cases(
     cp_size: int, tmp_path: Path
 ) -> None:
     _skip_without_gpus(cp_size)
-    port = _find_free_port()
+    init_method = file_init_method(tmp_path, f"cp1_oracle_cp{cp_size}")
     mp.spawn(
         _cp1_oracle_worker,
-        args=(cp_size, port, str(tmp_path), False),
+        args=(cp_size, init_method, str(tmp_path), False),
         nprocs=cp_size,
         join=True,
     )
@@ -66,10 +68,10 @@ def test_gdn_cp_packed_sibling_order_matches_cp1_oracle(
     cp_size: int, tmp_path: Path
 ) -> None:
     _skip_without_gpus(cp_size)
-    port = _find_free_port()
+    init_method = file_init_method(tmp_path, f"cp1_oracle_sibling_cp{cp_size}")
     mp.spawn(
         _cp1_oracle_worker,
-        args=(cp_size, port, str(tmp_path), True),
+        args=(cp_size, init_method, str(tmp_path), True),
         nprocs=cp_size,
         join=True,
     )
@@ -77,17 +79,61 @@ def test_gdn_cp_packed_sibling_order_matches_cp1_oracle(
         assert (tmp_path / f"cp1_oracle_sibling_rank_{rank}.ok").read_text() == "ok\n"
 
 
+@pytest.mark.parametrize("cp_size", (2, 4))
+def test_gdn_cp_tree_chain_matches_cp1_oracle(cp_size: int, tmp_path: Path) -> None:
+    _skip_without_gpus(cp_size)
+    init_method = file_init_method(tmp_path, f"tree_chain_cp{cp_size}")
+    mp.spawn(
+        _tree_chain_oracle_worker,
+        args=(cp_size, init_method, str(tmp_path)),
+        nprocs=cp_size,
+        join=True,
+    )
+    for rank in range(cp_size):
+        assert (tmp_path / f"tree_chain_rank_{rank}.ok").read_text() == "ok\n"
+
+
+def test_gdn_cp_tree_fuzz_matches_cp1_oracle(tmp_path: Path) -> None:
+    cp_size = 4
+    _skip_without_gpus(cp_size)
+    init_method = file_init_method(tmp_path, "tree_fuzz_cp4")
+    mp.spawn(
+        _tree_fuzz_oracle_worker,
+        args=(cp_size, init_method, str(tmp_path)),
+        nprocs=cp_size,
+        join=True,
+    )
+    for rank in range(cp_size):
+        assert (tmp_path / f"tree_fuzz_rank_{rank}.ok").read_text() == "ok\n"
+
+
+@pytest.mark.parametrize("cp_size", (2, 4))
+def test_gdn_cp_tree_trainability_updates_parameters(
+    cp_size: int, tmp_path: Path
+) -> None:
+    _skip_without_gpus(cp_size)
+    init_method = file_init_method(tmp_path, f"tree_trainability_cp{cp_size}")
+    mp.spawn(
+        _tree_trainability_worker,
+        args=(cp_size, init_method, str(tmp_path)),
+        nprocs=cp_size,
+        join=True,
+    )
+    for rank in range(cp_size):
+        assert (tmp_path / f"tree_trainability_rank_{rank}.ok").read_text() == "ok\n"
+
+
 def _cp1_oracle_worker(
     rank: int,
     cp_size: int,
-    port: int,
+    init_method: str,
     output_dir: str,
     sibling_only: bool,
 ) -> None:
     torch.cuda.set_device(rank)
     init_process_group(
         backend="nccl",
-        init_method=f"tcp://127.0.0.1:{port}",
+        init_method=init_method,
         rank=rank,
         world_size=cp_size,
     )
@@ -126,6 +172,167 @@ def _cp1_oracle_worker(
         destroy_process_group()
 
 
+def _tree_chain_oracle_worker(
+    rank: int,
+    cp_size: int,
+    init_method: str,
+    output_dir: str,
+) -> None:
+    torch.cuda.set_device(rank)
+    init_process_group(
+        backend="nccl",
+        init_method=init_method,
+        rank=rank,
+        world_size=cp_size,
+    )
+    try:
+        ps.initialize_model_parallel(
+            tensor_model_parallel_size=1,
+            pipeline_model_parallel_size=1,
+            context_parallel_size=cp_size,
+            expert_model_parallel_size=1,
+        )
+        ref_gdn, cp_gdn = _make_matching_gdn_pair(cp_size=cp_size)
+        _assert_tree_pack_matches_cp1(
+            "tree_chain",
+            ref_gdn,
+            cp_gdn,
+            _tree_chain_pack(),
+            rank=rank,
+            cp_size=cp_size,
+            seed=9090,
+            planner_config=_tree_chain_planner_config(),
+            require_chain=True,
+        )
+        Path(output_dir, f"tree_chain_rank_{rank}.ok").write_text("ok\n")
+    finally:
+        if getattr(ps, "model_parallel_is_initialized", lambda: False)():
+            ps.destroy_model_parallel()
+        destroy_process_group()
+
+
+def _tree_fuzz_oracle_worker(
+    rank: int,
+    cp_size: int,
+    init_method: str,
+    output_dir: str,
+) -> None:
+    torch.cuda.set_device(rank)
+    init_process_group(
+        backend="nccl",
+        init_method=init_method,
+        rank=rank,
+        world_size=cp_size,
+    )
+    try:
+        ps.initialize_model_parallel(
+            tensor_model_parallel_size=1,
+            pipeline_model_parallel_size=1,
+            context_parallel_size=cp_size,
+            expert_model_parallel_size=1,
+        )
+        ref_gdn, cp_gdn = _make_matching_gdn_pair(cp_size=cp_size)
+        for case_index, (name, pack) in enumerate(_tree_fuzz_packs()):
+            _assert_tree_pack_matches_cp1(
+                name,
+                ref_gdn,
+                cp_gdn,
+                pack,
+                rank=rank,
+                cp_size=cp_size,
+                seed=9190 + case_index,
+                planner_config=_tree_fuzz_planner_config(),
+                require_chain=False,
+            )
+            torch.distributed.barrier()
+        Path(output_dir, f"tree_fuzz_rank_{rank}.ok").write_text("ok\n")
+    finally:
+        if getattr(ps, "model_parallel_is_initialized", lambda: False)():
+            ps.destroy_model_parallel()
+        destroy_process_group()
+
+
+def _tree_trainability_worker(
+    rank: int,
+    cp_size: int,
+    init_method: str,
+    output_dir: str,
+) -> None:
+    torch.cuda.set_device(rank)
+    init_process_group(
+        backend="nccl",
+        init_method=init_method,
+        rank=rank,
+        world_size=cp_size,
+    )
+    try:
+        ps.initialize_model_parallel(
+            tensor_model_parallel_size=1,
+            pipeline_model_parallel_size=1,
+            context_parallel_size=cp_size,
+            expert_model_parallel_size=1,
+        )
+        _, cp_gdn = _make_matching_gdn_pair(
+            cp_size=cp_size,
+            params_dtype=GDN_CORRECTNESS_DTYPE,
+        )
+        pack = _tree_trainability_pack()
+        group_ids = pack.group_ids.cuda()
+        parent_ids = pack.parent_ids.cuda()
+        spec = parse_gdn_prefix_tree_segments(group_ids, parent_ids)
+        plan = build_gdn_rank_execution_plan(
+            spec,
+            device=group_ids.device,
+            cp_rank=rank,
+            cp_size=cp_size,
+            attention_token_layout_index=_uniform_attention_layout(
+                spec.real_token_count, cp_size
+            ),
+            planner_config=_tree_chain_planner_config(),
+        )
+        hidden = _tree_trainability_hidden(spec.real_token_count, cp_size=cp_size)
+        flat_hidden = hidden.transpose(0, 1).reshape(-1, hidden.shape[-1])
+        local_index = torch.tensor(
+            plan.attention_token_indices, device=hidden.device, dtype=torch.long
+        )
+        local_hidden = flat_hidden.index_select(0, local_index).unsqueeze(1)
+        optimizer = torch.optim.SGD(cp_gdn.parameters(), lr=5e-2)
+
+        optimizer.zero_grad(set_to_none=True)
+        loss = _tree_training_local_loss(
+            cp_gdn,
+            local_hidden,
+            group_ids,
+            parent_ids,
+            spec,
+            plan,
+        )
+        loss.backward()
+        all_reduce_parameter_grads_coalesced(cp_gdn)
+        grad_norm = _parameter_l1_norm(
+            parameter.grad
+            for parameter in cp_gdn.parameters()
+            if parameter.grad is not None
+        )
+        assert torch.isfinite(grad_norm)
+        assert float(grad_norm.item()) > 0.0
+        before_step = [
+            parameter.detach().float().clone() for parameter in cp_gdn.parameters()
+        ]
+        optimizer.step()
+        update_norm = _parameter_l1_norm(
+            parameter.detach().float() - before
+            for parameter, before in zip(cp_gdn.parameters(), before_step, strict=True)
+        )
+        assert torch.isfinite(update_norm)
+        assert float(update_norm.item()) > 0.0
+        Path(output_dir, f"tree_trainability_rank_{rank}.ok").write_text("ok\n")
+    finally:
+        if getattr(ps, "model_parallel_is_initialized", lambda: False)():
+            ps.destroy_model_parallel()
+        destroy_process_group()
+
+
 def _assert_case_matches_cp1(
     ref_gdn: torch.nn.Module,
     cp_gdn: torch.nn.Module,
@@ -141,14 +348,15 @@ def _assert_case_matches_cp1(
     tensors = build_phase0_packed_tensors(case)
     group_ids = tensors["group_ids"].cuda()
     parent_ids = tensors["parent_ids"].cuda()
-    spec = parse_gdn_shared_prefix_segments(
-        group_ids, parent_ids, min_completions_per_family=0
-    )
+    spec = parse_gdn_prefix_tree_segments(group_ids, parent_ids)
     plan = build_gdn_rank_execution_plan(
         spec,
         device=group_ids.device,
         cp_rank=rank,
         cp_size=cp_size,
+        attention_token_layout_index=_uniform_attention_layout(
+            spec.real_token_count, cp_size
+        ),
         planner_config=planner_config or GdnPlannerConfig(),
     )
     hidden, output_grad = _hidden_and_grad(case, seed=seed)
@@ -212,6 +420,84 @@ def _assert_case_matches_cp1(
     )
 
 
+def _assert_tree_pack_matches_cp1(
+    name: str,
+    ref_gdn: torch.nn.Module,
+    cp_gdn: torch.nn.Module,
+    pack: Any,
+    *,
+    rank: int,
+    cp_size: int,
+    seed: int,
+    planner_config: GdnPlannerConfig,
+    require_chain: bool,
+) -> None:
+    zero_parameter_grads(ref_gdn)
+    zero_parameter_grads(cp_gdn)
+    group_ids = pack.group_ids.cuda()
+    parent_ids = pack.parent_ids.cuda()
+    spec = parse_gdn_prefix_tree_segments(group_ids, parent_ids)
+    plan = build_gdn_rank_execution_plan(
+        spec,
+        device=group_ids.device,
+        cp_rank=rank,
+        cp_size=cp_size,
+        attention_token_layout_index=_uniform_attention_layout(
+            spec.real_token_count, cp_size
+        ),
+        planner_config=planner_config,
+    )
+    if require_chain:
+        assert any(plan.tree_chain_buckets_by_depth)
+    hidden, output_grad = _tree_hidden_and_grad(spec.real_token_count, seed=seed)
+    ref_hidden = hidden.clone().detach().requires_grad_(True)
+    ref_out, _ = run_gdn_layer(
+        ref_gdn,
+        ref_hidden,
+        group_ids=group_ids,
+        parent_ids=parent_ids,
+    )
+    ref_loss = (ref_out * output_grad).sum()
+    ref_loss.backward()
+
+    flat_hidden = hidden.transpose(0, 1).reshape(-1, hidden.shape[-1])
+    flat_grad = output_grad.transpose(0, 1).reshape(-1, output_grad.shape[-1])
+    local_index = torch.tensor(
+        plan.attention_token_indices, device=hidden.device, dtype=torch.long
+    )
+    local_hidden = (
+        flat_hidden.index_select(0, local_index)
+        .unsqueeze(1)
+        .contiguous()
+        .detach()
+        .requires_grad_(True)
+    )
+    local_output_grad = flat_grad.index_select(0, local_index).unsqueeze(1).contiguous()
+    cp_out, _ = run_gdn_layer(
+        cp_gdn,
+        local_hidden,
+        group_ids=group_ids,
+        parent_ids=parent_ids,
+        execution_spec=spec,
+        execution_plan=plan,
+        cp_group=torch.distributed.group.WORLD,
+    )
+    cp_loss = (cp_out * local_output_grad).sum()
+    cp_loss.backward()
+    _assert_cp_matches_reference(
+        name,
+        ref_gdn,
+        cp_gdn,
+        ref_hidden,
+        ref_out,
+        ref_loss.detach(),
+        local_hidden,
+        cp_out,
+        cp_loss.detach(),
+        local_index,
+    )
+
+
 def _assert_sibling_order_matches_cp1(
     ref_gdn: torch.nn.Module,
     cp_gdn: torch.nn.Module,
@@ -233,14 +519,15 @@ def _assert_sibling_order_matches_cp1(
     swapped_parent_ids[0, 5:9] = 0
     swapped_group_ids[0, 9:12] = 2
     swapped_parent_ids[0, 9:12] = 0
-    spec = parse_gdn_shared_prefix_segments(
-        swapped_group_ids, swapped_parent_ids, min_completions_per_family=0
-    )
+    spec = parse_gdn_prefix_tree_segments(swapped_group_ids, swapped_parent_ids)
     plan = build_gdn_rank_execution_plan(
         spec,
         device=group_ids.device,
         cp_rank=rank,
         cp_size=cp_size,
+        attention_token_layout_index=_uniform_attention_layout(
+            spec.real_token_count, cp_size
+        ),
         planner_config=GdnPlannerConfig(),
     )
     hidden, output_grad = _hidden_and_grad(case, seed=20520426 + cp_size)
@@ -349,6 +636,36 @@ def _assert_cp_matches_reference(
     torch.cuda.synchronize()
 
 
+def _tree_training_local_loss(
+    gdn: torch.nn.Module,
+    local_hidden: torch.Tensor,
+    group_ids: torch.Tensor,
+    parent_ids: torch.Tensor,
+    spec: Any,
+    plan: Any,
+) -> torch.Tensor:
+    out, _ = run_gdn_layer(
+        gdn,
+        local_hidden,
+        group_ids=group_ids,
+        parent_ids=parent_ids,
+        execution_spec=spec,
+        execution_plan=plan,
+        cp_group=torch.distributed.group.WORLD,
+    )
+    return out.float().square().mean()
+
+
+def _parameter_l1_norm(tensors: Any) -> torch.Tensor:
+    total: torch.Tensor | None = None
+    for tensor in tensors:
+        contribution = tensor.detach().float().abs().sum()
+        total = contribution if total is None else total + contribution
+    if total is None:
+        return torch.tensor(0.0, device="cuda")
+    return total
+
+
 class _TensorGradView:
     def __init__(self, grad: torch.Tensor) -> None:
         self.grad = grad
@@ -377,6 +694,164 @@ def _hidden_and_grad(
     return hidden, grad
 
 
+def _tree_hidden_and_grad(
+    sequence_length: int, *, seed: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    generator = torch.Generator(device="cuda").manual_seed(seed)
+    hidden = torch.randn(
+        sequence_length,
+        1,
+        64,
+        device="cuda",
+        dtype=GDN_CORRECTNESS_DTYPE,
+        generator=generator,
+    )
+    grad = torch.randn(
+        hidden.shape,
+        device="cuda",
+        dtype=GDN_CORRECTNESS_DTYPE,
+        generator=generator,
+    )
+    torch.distributed.broadcast(hidden, src=0)
+    torch.distributed.broadcast(grad, src=0)
+    return hidden, grad
+
+
+def _tree_trainability_hidden(sequence_length: int, *, cp_size: int) -> torch.Tensor:
+    generator = torch.Generator(device="cuda").manual_seed(6262026 + cp_size)
+    hidden = torch.randn(
+        sequence_length,
+        1,
+        64,
+        device="cuda",
+        dtype=GDN_CORRECTNESS_DTYPE,
+        generator=generator,
+    )
+    torch.distributed.broadcast(hidden, src=0)
+    return hidden
+
+
+def _tree_trainability_pack():
+    root = torch.arange(11, 107)
+    mid = torch.arange(1001, 1161)
+    sibling = torch.arange(2001, 2081)
+    return prefix_tree_pack(
+        (
+            torch.cat((root, mid, torch.tensor([301, 302]))),
+            torch.cat((root, mid, torch.tensor([303, 304, 305]))),
+            torch.cat((root, sibling, torch.tensor([401]))),
+        ),
+        max_depth=2,
+    )
+
+
+def _tree_chain_pack():
+    long_root = torch.arange(11, 267)
+    short_root = torch.arange(1001, 1097)
+    long_mid = torch.arange(2001, 2641)
+    other_mid = torch.arange(3001, 3065)
+    return prefix_tree_pack(
+        (
+            torch.cat((long_root, torch.tensor([301]))),
+            torch.cat((long_root, torch.tensor([302]))),
+            torch.cat((short_root, long_mid, torch.tensor([401]))),
+            torch.cat((short_root, long_mid, torch.tensor([402]))),
+            torch.cat((short_root, other_mid, torch.tensor([403]))),
+        ),
+        max_depth=2,
+    )
+
+
+def _tree_chain_planner_config() -> GdnPlannerConfig:
+    return GdnPlannerConfig(
+        runtime_local_recurrent_tokens_per_ms=10.0,
+        runtime_chain_recurrent_tokens_per_ms=1_000_000.0,
+        runtime_cp_summary_bandwidth_bytes_per_ms=1e18,
+        runtime_cp_summary_compute_segments_per_ms=1e18,
+        runtime_cp_suffix_scan_latency_ms=0.0,
+        runtime_cp_suffix_scan_segments_per_ms=1e18,
+    )
+
+
+def _tree_fuzz_planner_config() -> GdnPlannerConfig:
+    return GdnPlannerConfig()
+
+
+def _tree_fuzz_packs() -> tuple[tuple[str, Any], ...]:
+    return (
+        (
+            "tree_fuzz_duplicates",
+            prefix_tree_pack(_duplicate_tree_sequences(), max_depth=4),
+        ),
+        (
+            "tree_fuzz_ragged_depth4",
+            prefix_tree_pack(_random_tree_sequences(13, max_depth=4), max_depth=4),
+        ),
+        (
+            "tree_fuzz_mixed_tiny_long",
+            prefix_tree_pack(_random_tree_sequences(29, max_depth=5), max_depth=5),
+        ),
+    )
+
+
+def _uniform_attention_layout(real_token_count: int, cp_size: int) -> TokenLayoutIndex:
+    ranges_by_rank: list[tuple[tuple[int, int, int], ...]] = []
+    for rank in range(cp_size):
+        start = (int(real_token_count) * rank) // cp_size
+        end = (int(real_token_count) * (rank + 1)) // cp_size
+        ranges_by_rank.append(((start, end, 0),) if end > start else ())
+    return TokenLayoutIndex(
+        ownership_ranges_by_rank=tuple(ranges_by_rank),
+        token_counts_by_rank=tuple(
+            sum(end - start for start, end, _position in ranges)
+            for ranges in ranges_by_rank
+        ),
+    )
+
+
+def _duplicate_tree_sequences() -> tuple[torch.Tensor, ...]:
+    root = torch.arange(11, 331)
+    mid_a = torch.arange(1001, 1261)
+    mid_b = torch.arange(2001, 2065)
+    leaf_a = torch.arange(3001, 3013)
+    leaf_b = torch.arange(4001, 4017)
+    first = torch.cat((root, mid_a, leaf_a))
+    second = torch.cat((root, mid_a, leaf_b))
+    third = torch.cat((root, mid_b, torch.tensor([91, 92, 93])))
+    return (first, first, second, third, third)
+
+
+def _random_tree_sequences(seed: int, *, max_depth: int) -> tuple[torch.Tensor, ...]:
+    generator = torch.Generator().manual_seed(seed)
+    next_token = 1
+
+    def randint(low: int, high: int) -> int:
+        return int(torch.randint(low, high + 1, (), generator=generator).item())
+
+    def tokens(length: int) -> torch.Tensor:
+        nonlocal next_token
+        out = torch.arange(next_token, next_token + length)
+        next_token += length + 997
+        return out
+
+    def segment_length(depth: int) -> int:
+        choices = (1, 3, 17, 64, 129, 257, 384 if depth == 0 else 96)
+        return choices[randint(0, len(choices) - 1)]
+
+    def walk(prefix: torch.Tensor, depth: int) -> list[torch.Tensor]:
+        here = torch.cat((prefix, tokens(segment_length(depth))))
+        if depth + 1 >= max_depth:
+            return [
+                torch.cat((here, tokens(randint(1, 17)))) for _ in range(randint(2, 4))
+            ]
+        leaves: list[torch.Tensor] = []
+        for _ in range(randint(2, 3)):
+            leaves.extend(walk(here, depth + 1))
+        return leaves
+
+    return tuple(walk(torch.empty(0, dtype=torch.long), 0))
+
+
 def _packed_correctness_cases() -> tuple[GdnPhase0Case, ...]:
     return (
         *default_phase0_cases(conv_width=2),
@@ -388,11 +863,7 @@ def _packed_correctness_cases() -> tuple[GdnPhase0Case, ...]:
 def _planner_config_for_case(case: GdnPhase0Case) -> GdnPlannerConfig | None:
     if case.name != "mixed_local_chain_edge":
         return None
-    return GdnPlannerConfig(
-        cp_chain_min_tokens_per_rank=16,
-        cp_chain_min_total_tokens=128,
-        cp_chain_min_prefix_only_tokens=128,
-    )
+    return GdnPlannerConfig()
 
 
 def _mixed_local_chain_case() -> GdnPhase0Case:
@@ -450,9 +921,3 @@ def _swap_siblings(tensor: torch.Tensor) -> torch.Tensor:
 def _skip_without_gpus(cp_size: int) -> None:
     if not torch.cuda.is_available() or torch.cuda.device_count() < cp_size:
         pytest.skip(f"Need {cp_size} CUDA devices for CP{cp_size} packed GDN.")
-
-
-def _find_free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", 0))
-        return int(sock.getsockname()[1])

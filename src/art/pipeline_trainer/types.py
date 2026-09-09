@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from typing import TypeVar
 
 import art
@@ -22,7 +22,7 @@ SingleRolloutFn = Callable[
 EvalFn = Callable[
     [art.TrainableModel, int, ConfigT],
     Awaitable[
-        list[Trajectory | TrajectoryGroup]
-        | dict[str, list[Trajectory | TrajectoryGroup]]
+        Sequence[Trajectory | TrajectoryGroup]
+        | Mapping[str, Sequence[Trajectory | TrajectoryGroup]]
     ],
 ]

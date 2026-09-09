@@ -13,8 +13,7 @@ env:
   CI_PYTHON_MM: "3.12"
   CI_UV_CACHE_RELEASE_TAG: "prek-uv-cache"
   CI_UV_CACHE_ASSET_PREFIX: "prek-uv-cache"
-  CI_APEX_PARALLEL_BUILD: "8"
-  CI_APEX_NVCC_THREADS: "1"
+  CI_BUILD_JOBS: "8"
   CI_UV_BUILD_SLOTS: "2"
   UV_CACHE_DIR: "/root/.cache/uv"
   UV_LINK_MODE: "copy"
@@ -36,11 +35,11 @@ jobs:
           fp="$(python3 scripts/ci/compute_uv_fingerprint.py \
             --pyproject pyproject.toml \
             --uv-lock uv.lock \
+            --megatron-pyproject megatron_runtime/pyproject.toml \
+            --megatron-uv-lock megatron_runtime/uv.lock \
             --base-image "${CI_BASE_IMAGE}" \
             --python-mm "${CI_PYTHON_MM}" \
-            --torch-cuda-arch-list "${TORCH_CUDA_ARCH_LIST}" \
-            --ci-apex-parallel-build "${CI_APEX_PARALLEL_BUILD}" \
-            --ci-apex-nvcc-threads "${CI_APEX_NVCC_THREADS}")"
+            --torch-cuda-arch-list "${TORCH_CUDA_ARCH_LIST}")"
           echo "fingerprint=${fp}" >> "${GITHUB_OUTPUT}"
           echo "Expected uv cache fingerprint: ${fp}"
 
@@ -51,18 +50,9 @@ jobs:
         run: |
           fingerprint="${{ steps.fingerprint.outputs.fingerprint }}"
           part_prefix="${CI_UV_CACHE_ASSET_PREFIX}-${fingerprint}.tar.zst.part-"
-          release_api="https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/tags/${CI_UV_CACHE_RELEASE_TAG}"
-
-          release_json="$(curl -fsSL \
-            -H "Authorization: Bearer ${GITHUB_TOKEN}" \
-            -H "Accept: application/vnd.github+json" \
-            "${release_api}" || true)"
-
-          if [ -z "${release_json}" ]; then
-            echo "Cache release '${CI_UV_CACHE_RELEASE_TAG}' not found."
-            echo "cache-hit=false" >> "${GITHUB_OUTPUT}"
-            exit 0
-          fi
+          release_json="$(python3 scripts/ci/github_release_assets.py \
+            --repository "${GITHUB_REPOSITORY}" \
+            --tag "${CI_UV_CACHE_RELEASE_TAG}")"
 
           hit="$(RELEASE_JSON="${release_json}" PART_PREFIX="${part_prefix}" python3 -c "
           import json, os, re
@@ -73,7 +63,7 @@ jobs:
               int(m.group(1))
               for a in payload.get('assets', [])
               for m in [pattern.match(a.get('name', ''))]
-              if m and a.get('id') is not None
+              if m and a.get('url')
           )
           print('true' if parts and parts == list(range(len(parts))) else 'false')
           ")"
@@ -147,22 +137,15 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          release_api="https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/tags/${CI_UV_CACHE_RELEASE_TAG}"
           fingerprint="${{ needs.cache-status.outputs.fingerprint }}"
           part_prefix="${CI_UV_CACHE_ASSET_PREFIX}-${fingerprint}.tar.zst.part-"
 
-          release_json="$(curl -fsSL \
-            -H "Authorization: Bearer ${GITHUB_TOKEN}" \
-            -H "Accept: application/vnd.github+json" \
-            "${release_api}" || true)"
-
-          if [ -z "${release_json}" ]; then
-            echo "::error::Missing cache release '${CI_UV_CACHE_RELEASE_TAG}'."
-            exit 1
-          fi
+          release_json="$(python3 scripts/ci/github_release_assets.py \
+            --repository "${GITHUB_REPOSITORY}" \
+            --tag "${CI_UV_CACHE_RELEASE_TAG}")"
 
           part_selection_file="/tmp/uv-cache-part-selection.txt"
-          if ! RELEASE_JSON="${release_json}" PART_PREFIX="${part_prefix}" python3 -c "import json, os, re, sys; payload=json.loads(os.environ['RELEASE_JSON']); part_prefix=os.environ['PART_PREFIX']; pattern=re.compile(r'^' + re.escape(part_prefix) + r'(\\d{3})$'); parts=[]; [parts.append((int(m.group(1)), int(a.get('id')), a.get('name'))) for a in payload.get('assets', []) for m in [pattern.match(a.get('name', ''))] if m and a.get('id') is not None]; parts.sort(key=lambda x: x[0]); indices=[p[0] for p in parts]; expected=list(range(len(parts))); print('\\n'.join(f'{asset_id} {name}' for _, asset_id, name in parts)) if parts and indices == expected else (_ for _ in ()).throw(SystemExit(2 if not parts else 3))" > "${part_selection_file}"; then
+          if ! RELEASE_JSON="${release_json}" PART_PREFIX="${part_prefix}" python3 -c "import json, os, re, sys; payload=json.loads(os.environ['RELEASE_JSON']); part_prefix=os.environ['PART_PREFIX']; pattern=re.compile(r'^' + re.escape(part_prefix) + r'(\\d{3})$'); parts=[]; [parts.append((int(m.group(1)), a.get('url'), a.get('name'))) for a in payload.get('assets', []) for m in [pattern.match(a.get('name', ''))] if m and a.get('url')]; parts.sort(key=lambda x: x[0]); indices=[p[0] for p in parts]; expected=list(range(len(parts))); print('\\n'.join(f'{url} {name}' for _, url, name in parts)) if parts and indices == expected else (_ for _ in ()).throw(SystemExit(2 if not parts else 3))" > "${part_selection_file}"; then
             echo "::error::No complete uv cache part set found for prefix '${part_prefix}'."
             exit 1
           fi
@@ -176,15 +159,14 @@ jobs:
           mkdir -p "${parts_dir}"
           awk -v d="${parts_dir}" '{print d "/" $2}' "${part_selection_file}" > "${part_paths_file}"
 
-          PARTS_DIR="${parts_dir}" GITHUB_TOKEN="${GITHUB_TOKEN}" GITHUB_REPOSITORY="${GITHUB_REPOSITORY}" \
+          PARTS_DIR="${parts_dir}" GITHUB_TOKEN="${GITHUB_TOKEN}" \
             xargs -n 2 -P 8 sh -c '
-              asset_id="$1"
+              asset_url="$1"
               asset_name="$2"
               part_path="${PARTS_DIR}/${asset_name}"
               curl -fsSL -L \
                 -H "Authorization: Bearer ${GITHUB_TOKEN}" \
-                -H "Accept: application/octet-stream" \
-                "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/assets/${asset_id}" \
+                "${asset_url}" \
                 -o "${part_path}"
             ' sh < "${part_selection_file}"
 
@@ -204,14 +186,7 @@ jobs:
 
       - name: Install Megatron dependencies
         run: |
-          original_pyproject="$(mktemp)"
-          cp pyproject.toml "${original_pyproject}"
-          cleanup() {
-            mv "${original_pyproject}" pyproject.toml
-          }
-          trap cleanup EXIT
-
-          cudnn_path="${GITHUB_WORKSPACE}/.venv/lib/python${CI_PYTHON_MM}/site-packages/nvidia/cudnn"
+          cudnn_path="${GITHUB_WORKSPACE}/megatron_runtime/.venv/lib/python${CI_PYTHON_MM}/site-packages/nvidia/cudnn"
           export CUDNN_PATH="${cudnn_path}"
           export CUDNN_HOME="${cudnn_path}"
           export CUDNN_INCLUDE_PATH="${cudnn_path}/include"
@@ -220,16 +195,13 @@ jobs:
           export LIBRARY_PATH="${CUDNN_LIBRARY_PATH}${LIBRARY_PATH:+:${LIBRARY_PATH}}"
           export LD_LIBRARY_PATH="${CUDNN_LIBRARY_PATH}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
           export UV_CONCURRENT_BUILDS="${CI_UV_BUILD_SLOTS}"
-          export CMAKE_BUILD_PARALLEL_LEVEL="${CI_APEX_PARALLEL_BUILD}"
-          export MAX_JOBS="${CI_APEX_PARALLEL_BUILD}"
-          export NINJAFLAGS="-j${CI_APEX_PARALLEL_BUILD}"
-          python3 scripts/ci/apply_ci_uv_build_overrides.py \
-            --pyproject pyproject.toml \
-            --apex-parallel-build "${CI_APEX_PARALLEL_BUILD}" \
-            --apex-nvcc-threads "${CI_APEX_NVCC_THREADS}"
-          echo "CI uv build overrides: APEX_PARALLEL_BUILD=${CI_APEX_PARALLEL_BUILD}, NVCC_APPEND_FLAGS=--threads ${CI_APEX_NVCC_THREADS}, UV_CONCURRENT_BUILDS=${CI_UV_BUILD_SLOTS}"
+          export CMAKE_BUILD_PARALLEL_LEVEL="${CI_BUILD_JOBS}"
+          export MAX_JOBS="${CI_BUILD_JOBS}"
+          export NINJAFLAGS="-j${CI_BUILD_JOBS}"
           uv --version
-          uv sync --extra megatron --extra langgraph --extra plotting --group dev --frozen --python "${CI_PYTHON_MM}"
+          uv sync --extra langgraph --extra plotting --group dev --frozen --python "${CI_PYTHON_MM}"
+          uv sync --project megatron_runtime --extra cuda12 --group test --frozen --python "${CI_PYTHON_MM}"
+          uv pip install --python megatron_runtime/.venv/bin/python --no-deps --editable .
 
       - name: Run prek hooks (lint, format, typecheck, uv.lock)
         run: |
@@ -238,13 +210,27 @@ jobs:
           uv run --no-sync prek run ty --all-files
           uv run --no-sync prek run uv-lock-check --all-files
 
-      - name: Run Megatron unit tests
+      - name: Run Megatron lightweight tests
         run: |
-          uv run --no-sync pytest --nbval --current-env --tb=short \
+          megatron_runtime/.venv/bin/python -c "import megatron.core.packed_seq_params"
+          megatron_runtime/.venv/bin/python -m pytest --nbval --current-env --tb=short \
             tests/unit/test_megatron_reference_logprobs.py \
+            tests/unit/test_preprocessing_tokenize.py::test_gemma4_normalizes_json_tool_arguments_for_mapping_template \
             tests/unit/test_moe_routing_replay.py \
             tests/unit/test_moe_routing_real_path.py \
-            tests/unit/test_pipeline_trainer_local_backend.py
+            tests/unit/test_pipeline_trainer_local_backend.py \
+            tests/unit/test_prefix_tree.py \
+            tests/unit/test_prefix_tree_attention_builder.py \
+            tests/unit/test_prefix_tree_grad_parity.py \
+            tests/unit/test_prefix_tree_packing.py \
+            tests/unit/test_trainer_rank_validation.py \
+            tests/unit/test_trainer_rank_weird_shapes.py \
+            tests/unit/test_trainer_rank_split.py \
+            tests/acceptance/trainer_rank_planner \
+            tests/integration/megatron/model_support/test_dispatcher_graph_retention.py \
+            tests/integration/megatron/gdn_shared_prefix/test_gdn_planner_runtime_model.py \
+            tests/integration/megatron/gdn_shared_prefix/test_gdn_cp_layout_distributed.py::test_distributed_gdn_cp_layout_all_to_all_roundtrips \
+            tests/integration/megatron/gdn_shared_prefix/test_gdn_cp_layout_distributed.py::test_distributed_gdn_cp_layout_handles_empty_ranks
 
       - name: Install backend dependencies
         run: |
@@ -256,4 +242,10 @@ jobs:
             --ignore=tests/unit/test_megatron_reference_logprobs.py \
             --ignore=tests/unit/test_moe_routing_replay.py \
             --ignore=tests/unit/test_moe_routing_real_path.py \
-            --ignore=tests/unit/test_pipeline_trainer_local_backend.py
+            --ignore=tests/unit/test_pipeline_trainer_local_backend.py \
+            --ignore=tests/unit/test_prefix_tree.py \
+            --ignore=tests/unit/test_prefix_tree_attention_builder.py \
+            --ignore=tests/unit/test_prefix_tree_grad_parity.py \
+            --ignore=tests/unit/test_prefix_tree_packing.py \
+            --ignore=tests/unit/test_trainer_rank_validation.py \
+            --ignore=tests/unit/test_trainer_rank_weird_shapes.py

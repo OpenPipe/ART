@@ -42,7 +42,6 @@ def _safe_gpu_memory_utilization() -> float:
 
 def _live_test_config() -> art.dev.InternalModelConfig:
     return {
-        "rollout_weights_mode": "lora",
         "engine_args": {
             "gpu_memory_utilization": _safe_gpu_memory_utilization(),
             "max_model_len": int(
@@ -72,6 +71,7 @@ async def test_local_backend_external_runtime_live_smoke(
     model_name = f"vllm-separation-live-{uuid.uuid4().hex[:8]}"
     backend = LocalBackend(path=str(tmp_path))
     model = art.TrainableModel(
+        run_name=model_name,
         name=model_name,
         project="integration-tests",
         base_model=os.environ.get("BASE_MODEL", DEFAULT_BASE_MODEL),

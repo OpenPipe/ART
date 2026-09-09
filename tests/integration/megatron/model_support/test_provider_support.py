@@ -11,6 +11,7 @@ pytest.importorskip("megatron.bridge")
 from megatron.core.transformer.enums import AttnBackend
 
 from art.megatron.context_parallel.core_attention import ArtContextParallelCoreAttention
+from art.megatron.dsv4.bridge import _install_dsv4_source_aliases
 from art.megatron.flex_attn.attention import FlexDotProductAttention
 from art.megatron.lora import default_lora_rank_for_handler
 from art.megatron.model_support.registry import (
@@ -30,11 +31,21 @@ class _FakeProvider:
         self.overlap_moe_expert_parallel_comm = False
         self.moe_shared_expert_overlap = False
         self.num_moe_experts = 0
+        self.hidden_size = 2048
+        self.moe_ffn_hidden_size = 768
+        self.add_bias_linear = False
+        self.art_moe_grouped_gemm_bias_encoded = False
+        self.bias_activation_fusion = True
+        self.window_size: int | tuple[int, int] = (128, 0)
+        self.moe_hybridep_num_sms = 16
+        self.moe_flex_dispatcher_backend = "hybridep"
+        self.moe_token_dispatcher_type = ""
         self.recompute_granularity: str | None = None
         self.recompute_method: str | None = None
         self.recompute_num_layers: int | None = None
         self.expert_model_parallel_size = 1
         self.expert_tensor_parallel_size = 1
+        self.dsv4_hc_mult = 4
 
     def _base_layer_spec(
         self, config: object, vp_stage: int | None = None
@@ -126,10 +137,81 @@ def test_openpipe_qwen3_14b_instruct_uses_qwen3_dense_support() -> None:
     assert handler.key == "qwen3_dense"
 
 
+def test_qwen38_27b_uses_qwen35_dense_support() -> None:
+    spec = get_model_support_spec("Qwen/Qwen3.8-27B")
+    handler = get_model_support_handler("Qwen/Qwen3.8-27B")
+
+    assert spec.key == "qwen3_5_dense"
+    assert spec.is_moe is False
+    assert spec.native_vllm_lora_status == "validated"
+    assert handler.key == "qwen3_5_dense"
+
+
+def test_glm53_bf16_uses_glm52_support() -> None:
+    spec = get_model_support_spec("zai-org/GLM-5.3-BF16")
+    handler = get_model_support_handler("zai-org/GLM-5.3-BF16")
+
+    assert spec.key == "glm52"
+    assert spec.is_moe is True
+    assert spec.native_vllm_lora_status == "validated"
+    assert handler.key == "glm52"
+
+
+def test_meta_llama_32_1b_instruct_uses_llama3_dense_support() -> None:
+    model = "meta-llama/Llama-3.2-1B-Instruct"
+    spec = get_model_support_spec(model)
+    handler = get_model_support_handler(model)
+
+    assert spec.key == "llama3_dense"
+    assert spec.is_moe is False
+    assert spec.native_vllm_lora_status == "validated"
+    assert handler.key == "llama3_dense"
+
+
 def test_model_support_specs_own_moe_metadata() -> None:
+    assert model_uses_expert_parallel("meta-llama/Llama-3.2-1B-Instruct") is False
     assert model_uses_expert_parallel("OpenPipe/Qwen3-14B-Instruct") is False
     assert model_uses_expert_parallel("Qwen/Qwen3-30B-A3B-Instruct-2507") is True
     assert model_uses_expert_parallel("Qwen/Qwen3.5-35B-A3B") is True
+    assert model_uses_expert_parallel("deepseek-ai/DeepSeek-V4-Flash") is True
+
+
+def test_dsv4_native_lora_is_validated() -> None:
+    spec = get_model_support_spec("deepseek-ai/DeepSeek-V4-Flash")
+
+    assert spec.native_vllm_lora_status == "validated"
+
+
+def test_dsv4_config_only_bridge_does_not_require_checkpoint_state() -> None:
+    _install_dsv4_source_aliases(SimpleNamespace(config=SimpleNamespace()))
+
+
+def test_dsv4_provider_disables_shared_expert_overlap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = _FakeProvider()
+    provider.num_moe_experts = 256
+    provider.moe_shared_expert_overlap = True
+    fake_bridge = _FakeBridge(
+        model_bridge=object(),
+        provider=provider,
+    )
+    monkeypatch.setattr(
+        provider_module.AutoBridge,
+        "from_hf_pretrained",
+        lambda *args, **kwargs: fake_bridge,
+    )
+    monkeypatch.setattr(provider_module.torch.cuda, "device_count", lambda: 2)
+    monkeypatch.setattr(
+        provider_module.torch.cuda,
+        "get_device_properties",
+        lambda device: SimpleNamespace(major=9, name="NVIDIA H200"),
+    )
+
+    resolved = provider_module.get_provider("deepseek-ai/DeepSeek-V4-Flash")
+
+    assert resolved.moe_shared_expert_overlap is False
+    assert resolved.context_parallel_size == 1
 
 
 def test_megatron_lora_rank_defaults_by_architecture() -> None:
@@ -171,6 +253,8 @@ def test_get_provider_accepts_registry_supported_models(
     assert resolved.expert_tensor_parallel_size == 1
     assert resolved.sequence_parallel is False
     assert resolved.moe_shared_expert_overlap is False
+    assert resolved.add_bias_linear is False
+    assert resolved.bias_activation_fusion is False
     assert resolved.moe_router_dtype == "fp32"
     assert resolved.moe_aux_loss_coeff == 0.0
     assert resolved.calculate_per_token_loss is True
@@ -342,8 +426,6 @@ def test_finalize_provider_bundle_uses_post_prepare_topology(
     provider_module.finalize_provider_bundle(bundle)
 
     assert dispatcher_calls == []
-    assert provider.finalized is True
-    assert getattr(provider, "sequence_parallel") is False
 
 
 def test_get_provider_bundle_honors_single_gpu_env_topology(
@@ -416,6 +498,52 @@ def test_get_provider_bundle_honors_context_parallel_env_topology(
         layer_spec.submodules.self_attention.submodules.core_attention
         is ArtContextParallelCoreAttention
     )
+
+
+def test_cp_unsupported_handler_defaults_to_tensor_parallel(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = _FakeProvider()
+    provider.num_moe_experts = 8
+    fake_bridge = _FakeBridge(
+        model_bridge=object(),
+        provider=provider,
+    )
+    monkeypatch.setattr(
+        provider_module.AutoBridge,
+        "from_hf_pretrained",
+        lambda *args, **kwargs: fake_bridge,
+    )
+    monkeypatch.setattr(provider_module.torch.cuda, "device_count", lambda: 4)
+
+    bundle = provider_module.prepare_provider_bundle("deepseek-ai/DeepSeek-V4-Flash")
+    resolved = bundle.provider
+
+    assert resolved.tensor_model_parallel_size == 4
+    assert resolved.context_parallel_size == 1
+    assert resolved.expert_model_parallel_size == 4
+    assert resolved.sequence_parallel is True
+
+
+def test_cp_unsupported_handler_rejects_context_parallel_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = _FakeProvider()
+    provider.num_moe_experts = 8
+    fake_bridge = _FakeBridge(
+        model_bridge=object(),
+        provider=provider,
+    )
+    monkeypatch.setattr(
+        provider_module.AutoBridge,
+        "from_hf_pretrained",
+        lambda *args, **kwargs: fake_bridge,
+    )
+    monkeypatch.setattr(provider_module.torch.cuda, "device_count", lambda: 4)
+    monkeypatch.setenv("ART_MEGATRON_CONTEXT_PARALLEL_SIZE", "2")
+
+    with pytest.raises(RuntimeError, match="does not implement context parallelism"):
+        provider_module.prepare_provider_bundle("deepseek-ai/DeepSeek-V4-Flash")
 
 
 def test_qwen35_handler_keeps_standard_attention_on_flex_under_cp(
@@ -547,24 +675,3 @@ def test_ep_overlap_recompute_contract_disables_full_recompute() -> None:
     assert provider.recompute_granularity is None
     assert provider.recompute_method is None
     assert provider.recompute_num_layers is None
-
-
-def test_finalize_provider_bundle_can_disable_flex_dispatcher_backend(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    provider = _FakeProvider()
-    provider.expert_model_parallel_size = 2
-    provider.expert_tensor_parallel_size = 1
-    dispatcher_calls: list[str] = []
-    monkeypatch.setenv("ART_MEGATRON_MOE_FLEX_DISPATCHER_BACKEND", "disabled")
-    monkeypatch.setattr(
-        provider_module,
-        "apply_flex_dispatcher_backend",
-        lambda provider, moe_flex_dispatcher_backend: dispatcher_calls.append(
-            cast(str, moe_flex_dispatcher_backend)
-        ),
-    )
-
-    provider_module._apply_art_training_runtime_finalize_defaults(cast(Any, provider))
-
-    assert dispatcher_calls == []

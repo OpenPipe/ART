@@ -572,12 +572,12 @@ class OpenAICompatibleTinkerServerWorker:
         tools: Tools | None,
     ) -> tuple[list[int], list[int]] | None:
         from art.preprocessing.tokenize import tokenize_trajectory
-        from art.trajectories import History, Trajectory
+        from art.trajectories import LegacyHistory, Trajectory
 
         result = tokenize_trajectory(
             tokenizer=self._get_renderer(base_model).tokenizer,
             image_processor=None,
-            history=History(
+            history=LegacyHistory(
                 messages_and_choices=messages_and_choices,
                 tools=tools,
             ),

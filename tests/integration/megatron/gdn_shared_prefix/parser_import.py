@@ -9,9 +9,9 @@ from typing import Any
 
 def _load_parser_module() -> ModuleType:
     repo_root = Path(__file__).resolve().parents[4]
-    module_path = repo_root / "src/art/megatron/gdn/gdn_shared_prefix.py"
+    module_path = repo_root / "src/art/megatron/gdn/gdn_prefix_tree.py"
     spec = importlib.util.spec_from_file_location(
-        "_art_gdn_shared_prefix_for_tests", module_path
+        "_art_gdn_prefix_tree_for_tests", module_path
     )
     if spec is None or spec.loader is None:
         raise RuntimeError(f"Failed to load parser module from {module_path}")
@@ -24,6 +24,5 @@ def _load_parser_module() -> ModuleType:
 _MODULE = _load_parser_module()
 
 GdnPackedExecutionSpec: Any = _MODULE.GdnPackedExecutionSpec
-build_gdn_cp_segment_schedule: Any = _MODULE.build_gdn_cp_segment_schedule
 build_gdn_rank_execution_plan: Any = _MODULE.build_gdn_rank_execution_plan
-parse_gdn_shared_prefix_segments: Any = _MODULE.parse_gdn_shared_prefix_segments
+parse_gdn_prefix_tree_segments: Any = _MODULE.parse_gdn_prefix_tree_segments

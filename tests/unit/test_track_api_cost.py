@@ -1,11 +1,18 @@
 import asyncio
+from contextlib import asynccontextmanager
 import json
 from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
 
-from art import Model, TrainableModel, Trajectory, TrajectoryGroup
+from art import (
+    Model,
+    PipelineRuntimeConfig,
+    TrainableModel,
+    Trajectory,
+    TrajectoryGroup,
+)
 from art.costs import compute_sample_costs, get_model_pricing
 from art.metrics import MetricsBuilder, track_api_cost
 from art.pipeline_trainer.trainer import PipelineTrainer
@@ -627,6 +634,7 @@ class TestTrackApiCostIntegration:
         self, tmp_path: Path
     ) -> None:
         model = TrainableModel(
+            run_name="pipeline-context-test",
             name="pipeline-context-test",
             project="pipeline-context-test",
             base_model="test-model",
@@ -660,9 +668,11 @@ class TestTrackApiCostIntegration:
             rollout_fn=rollout_fn,
             scenarios=[{"metadata": {"scenario_id": "s1"}}],
             config={},
-            num_rollout_workers=1,
-            min_batch_size=1,
-            max_batch_size=1,
+            pipeline=PipelineRuntimeConfig(
+                num_rollout_workers=1,
+                min_batch_size=1,
+                max_batch_size=1,
+            ),
             eval_fn=None,
         )
         trainer._output_queue = asyncio.Queue()
@@ -676,6 +686,7 @@ class TestTrackApiCostIntegration:
         self, tmp_path: Path
     ) -> None:
         model = TrainableModel(
+            run_name="pipeline-eval-context-test",
             name="pipeline-eval-context-test",
             project="pipeline-eval-context-test",
             base_model="test-model",
@@ -684,6 +695,12 @@ class TestTrackApiCostIntegration:
         )
         backend = MagicMock()
         observed_contexts: list[str] = []
+
+        @asynccontextmanager
+        async def exact_adapter_lease(*_args: object):
+            yield
+
+        backend.exact_adapter_lease = exact_adapter_lease
 
         @track_api_cost(
             source="llm_judge/correctness",
@@ -707,20 +724,41 @@ class TestTrackApiCostIntegration:
                     reward=1.0,
                     messages_and_choices=[
                         {"role": "user", "content": "hello"},
-                        {"role": "assistant", "content": "hi"},
+                        {
+                            "role": "assistant",
+                            "content": "hi",
+                            "policy_token_spans": [
+                                {
+                                    "start_token": 0,
+                                    "end_token": 1,
+                                    "policy_version": 1,
+                                    "lora_slot": "active",
+                                    "update_seq": 1,
+                                }
+                            ],
+                        },
                     ],
                 )
             ]
 
+        async def rollout_fn(
+            _model: TrainableModel,
+            _scenario: dict,
+            _config: dict,
+        ) -> TrajectoryGroup:
+            return TrajectoryGroup([])
+
         trainer = PipelineTrainer(
             model=model,
             backend=backend,
-            rollout_fn=lambda *_args, **_kwargs: asyncio.sleep(0),
+            rollout_fn=rollout_fn,
             scenarios=[],
             config={},
-            num_rollout_workers=1,
-            min_batch_size=1,
-            max_batch_size=1,
+            pipeline=PipelineRuntimeConfig(
+                num_rollout_workers=1,
+                min_batch_size=1,
+                max_batch_size=1,
+            ),
             eval_fn=eval_fn,
         )
 

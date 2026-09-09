@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import types
 from typing import Any, Callable
 
 from megatron.core.tensor_parallel import (
@@ -19,6 +18,11 @@ def _active_controller() -> Any | None:
     if _CONTROLLER_GETTER is None:
         return None
     return _CONTROLLER_GETTER()
+
+
+def _trace_hook(fn: Callable[..., Any]) -> Callable[..., Any]:
+    """Keep correctness-only routing trace monkeypatches out of Dynamo graphs."""
+    return torch.compiler.disable(fn)
 
 
 @torch._dynamo.disable
@@ -135,93 +139,6 @@ def _attach_trace_row_uids(
         row_token_uids.detach().to(device="cpu", dtype=torch.int64).reshape(-1),
     )
     setattr(target, TRACE_UID_SPAN_ATTR, uid_span)
-
-
-def _attach_trace_row_uids_recursive(
-    target: Any,
-    *,
-    row_token_uids: torch.Tensor,
-    uid_span: int | None,
-) -> None:
-    if isinstance(target, torch.Tensor):
-        _attach_trace_row_uids(
-            target,
-            row_token_uids=row_token_uids,
-            uid_span=uid_span,
-        )
-        return
-    if isinstance(target, dict):
-        for value in target.values():
-            _attach_trace_row_uids_recursive(
-                value,
-                row_token_uids=row_token_uids,
-                uid_span=uid_span,
-            )
-        return
-    if isinstance(target, (list, tuple)):
-        for value in target:
-            _attach_trace_row_uids_recursive(
-                value,
-                row_token_uids=row_token_uids,
-                uid_span=uid_span,
-            )
-
-
-@torch._dynamo.disable
-def _attach_router_output_trace_row_uids(
-    *,
-    controller: Any,
-    router_key: str,
-    output: Any,
-) -> None:
-    target_key = getattr(controller, "_router_prepared_target_keys", {}).get(router_key)
-    if target_key is None:
-        return
-    token_uid_key, _call_index = target_key
-    token_uids = getattr(controller, "_prepared_uid_sets", {}).get(token_uid_key)
-    binding = getattr(controller, "_router_bindings", {}).get(router_key)
-    if token_uids is None or binding is None:
-        return
-    router_token_uids = controller._token_uids_for_router_binding(
-        token_uids,
-        sequence_parallel=bool(binding["sequence_parallel"]),
-    )
-    _attach_trace_row_uids_recursive(
-        output,
-        row_token_uids=router_token_uids,
-        uid_span=getattr(controller, "_global_uid_count", None),
-    )
-
-
-def _install_router_output_trace_hooks(controller: Any | None) -> None:
-    if controller is None:
-        return
-    for router_key, binding in getattr(controller, "_router_bindings", {}).items():
-        module = binding.get("module")
-        if module is None or getattr(module, "_art_oracle_router_trace_patched", False):
-            continue
-        original_routing = module.routing
-
-        def patched_routing(
-            router_module: Any,
-            *args: Any,
-            _original_routing: Any = original_routing,
-            _router_key: str = router_key,
-            **kwargs: Any,
-        ) -> Any:
-            del router_module
-            output = _original_routing(*args, **kwargs)
-            controller = _active_controller()
-            if controller is not None:
-                _attach_router_output_trace_row_uids(
-                    controller=controller,
-                    router_key=_router_key,
-                    output=output,
-                )
-            return output
-
-        module.routing = types.MethodType(patched_routing, module)
-        setattr(module, "_art_oracle_router_trace_patched", True)
 
 
 @torch._dynamo.disable
@@ -415,7 +332,6 @@ def install_moe_routing_trace_hooks(
 ) -> None:
     global _CONTROLLER_GETTER
     _CONTROLLER_GETTER = controller_getter
-    _install_router_output_trace_hooks(_active_controller())
     try:
         from megatron.core.transformer.moe.experts import TEGroupedMLP
         from megatron.core.transformer.moe.token_dispatcher import (
@@ -609,23 +525,27 @@ def install_moe_routing_trace_hooks(
         )
         return original_fc2_forward(self, x, tokens_per_expert)
 
-    setattr(MoEAlltoAllTokenDispatcher, "preprocess", patched_preprocess)
+    setattr(MoEAlltoAllTokenDispatcher, "preprocess", _trace_hook(patched_preprocess))
     setattr(
         MoEAlltoAllTokenDispatcher,
         "dispatch_preprocess",
-        patched_dispatch_preprocess,
+        _trace_hook(patched_dispatch_preprocess),
     )
-    setattr(MoEAlltoAllTokenDispatcher, "token_dispatch", patched_token_dispatch)
+    setattr(
+        MoEAlltoAllTokenDispatcher,
+        "token_dispatch",
+        _trace_hook(patched_token_dispatch),
+    )
     setattr(
         MoEAlltoAllTokenDispatcher,
         "dispatch_postprocess",
-        patched_dispatch_postprocess,
+        _trace_hook(patched_dispatch_postprocess),
     )
     setattr(
         MoEAlltoAllTokenDispatcher,
         "combine_preprocess",
-        patched_combine_preprocess,
+        _trace_hook(patched_combine_preprocess),
     )
-    setattr(TEGroupedMLP, "forward", patched_te_grouped_mlp_forward)
-    setattr(MLPExpertsLinearFC2LoRA, "forward", patched_fc2_forward)
+    setattr(TEGroupedMLP, "forward", _trace_hook(patched_te_grouped_mlp_forward))
+    setattr(MLPExpertsLinearFC2LoRA, "forward", _trace_hook(patched_fc2_forward))
     setattr(MoEAlltoAllTokenDispatcher, "_art_oracle_trace_patched", True)

@@ -6,11 +6,17 @@ from typing import Any
 import torch
 
 from art.megatron.model_support.spec import ModelSupportHandler
+from art.utils.safetensors import (
+    PreparedSafetensors,
+    prepare_safetensors,
+    save_prepared_safetensors,
+)
+
+ART_LORA_FORMAT_CONFIG_KEY = "art_lora_format"
+ART_LORA_FORMAT_VLLM = "vllm"
 
 safetensors = importlib.import_module("safetensors")
-safetensors_torch = importlib.import_module("safetensors.torch")
 safe_open = safetensors.safe_open
-save_file = safetensors_torch.save_file
 
 
 def _jsonable_config(value: Any) -> Any:
@@ -75,11 +81,19 @@ def save_vllm_lora_tensors(
     lora_path: str | Path,
     tensors: dict[str, torch.Tensor],
     adapter_config: dict[str, Any],
+    *,
+    prepared_tensors: PreparedSafetensors | None = None,
 ) -> None:
     base_dir = Path(lora_path)
     base_dir.mkdir(parents=True, exist_ok=True)
-    save_file(tensors, base_dir / "adapter_model.safetensors")
-    save_adapter_config(base_dir, adapter_config)
+    save_prepared_safetensors(
+        prepared_tensors or prepare_safetensors(tensors),
+        base_dir / "adapter_model.safetensors",
+    )
+    save_adapter_config(
+        base_dir,
+        {**adapter_config, ART_LORA_FORMAT_CONFIG_KEY: ART_LORA_FORMAT_VLLM},
+    )
 
 
 def normalize_lora_checkpoint_to_vllm(
@@ -92,13 +106,15 @@ def normalize_lora_checkpoint_to_vllm(
     adapter_model_path = Path(lora_path) / "adapter_model.safetensors"
     if not adapter_model_path.exists():
         return
+    if adapter_config is None:
+        adapter_config = load_adapter_config(lora_path)
+    if adapter_config.get(ART_LORA_FORMAT_CONFIG_KEY) == ART_LORA_FORMAT_VLLM:
+        return
     resolved_handler = resolve_lora_handler(
         lora_path,
         handler,
         allow_unvalidated_arch=allow_unvalidated_arch,
     )
-    if adapter_config is None:
-        adapter_config = load_adapter_config(lora_path)
     tensors = load_vllm_lora_tensors(lora_path)
     tensors, adapter_config = resolved_handler.to_vllm_lora_tensors(
         tensors,

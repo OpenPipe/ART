@@ -1,12 +1,20 @@
-from typing import TYPE_CHECKING, Any, Literal, Protocol, Sequence, runtime_checkable
+from contextlib import AbstractContextManager
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Literal,
+    Protocol,
+    Sequence,
+    runtime_checkable,
+)
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 if TYPE_CHECKING:
     from megatron.bridge import AutoBridge
     from megatron.bridge.models.gpt_provider import GPTModelProvider
 
-RolloutWeightsMode = Literal["lora", "merged"]
 NativeVllmLoraStatus = Literal["disabled", "wip", "validated"]
 SharedExpertCompileState = Literal[
     "none",
@@ -46,6 +54,19 @@ class ArchitectureReport(BaseModel):
     unresolved_risks: list[str] = Field(default_factory=list)
 
 
+class PrefixTreeModelStateContext(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    group_ids: Any
+    parent_ids: Any
+    input_pos: Any | None = None
+    device: Any
+    attention_token_layout_index: Any | None = None
+    attention_head_dim: int | None = None
+    attention_value_head_dim: int | None = None
+    context_parallel_state: Any | None = None
+
+
 class CompileWorkaroundConfig(BaseModel):
     flags: tuple[str, ...] = ()
     unconditional_flags: tuple[str, ...] = ()
@@ -83,7 +104,6 @@ class ModelSupportSpec(BaseModel):
     is_moe: bool = False
     model_names: tuple[str, ...] = ()
     default_target_modules: tuple[str, ...]
-    default_rollout_weights_mode: RolloutWeightsMode = "lora"
     native_vllm_lora_status: NativeVllmLoraStatus = "disabled"
     dependency_floor: DependencyFloor = Field(default_factory=DependencyFloor)
 
@@ -92,9 +112,14 @@ class ModelSupportSpec(BaseModel):
 class ModelSupportHandler(Protocol):
     key: str
     is_moe: bool
+    build_gdn_execution_spec: bool
+    has_recurrent_layers: bool
+    cp_supported: bool
     native_vllm_lora_status: NativeVllmLoraStatus
 
     def identity_lora_model_config(self, base_config: Any) -> Any: ...
+
+    def identity_lora_model_context(self) -> AbstractContextManager[None]: ...
 
     def identity_lora_target_parameters(
         self,
@@ -121,15 +146,63 @@ class ModelSupportHandler(Protocol):
 
     def configure_provider_for_runtime(self, provider: "GPTModelProvider") -> None: ...
 
-    def vllm_engine_args(
+    def context_parallel_workload_profile(self, provider: Any) -> Any | None: ...
+
+    def default_chat_template(self) -> str | None: ...
+
+    def configure_tokenizer(
         self,
+        tokenizer: Any,
         *,
-        rollout_weights_mode: RolloutWeightsMode,
-    ) -> dict[str, object]: ...
+        internal_config: Any,
+    ) -> Any: ...
+
+    def vllm_engine_args(self) -> dict[str, object]: ...
 
     def vllm_server_args(self) -> dict[str, object]: ...
 
     def install_preprocess_patch(self, model_chunks: Sequence[Any]) -> None: ...
+
+    def prepare_model_for_mixed_precision(
+        self, model_chunks: Sequence[Any]
+    ) -> None: ...
+
+    def validate_model_mixed_precision(self, model_chunks: Sequence[Any]) -> None: ...
+
+    def build_pipeline_microbatch_activator(
+        self,
+        model_chunks: Sequence[Any],
+    ) -> Callable[[Any, int], None] | None: ...
+
+    def preserve_pipeline_microbatch_activation(
+        self,
+        model_chunks: Sequence[Any],
+    ) -> AbstractContextManager[None]: ...
+
+    def build_prefix_tree_model_state(
+        self,
+        context: PrefixTreeModelStateContext,
+    ) -> dict[str, Any]: ...
+
+    def zero_internal_padding_grads(self, model_chunks: Sequence[Any]) -> None: ...
+
+    def zero_internal_padding_params(self, model_chunks: Sequence[Any]) -> None: ...
+
+    def canonicalize_loaded_lora_state(
+        self,
+        state: dict[str, Any],
+        model_chunks: Sequence[Any],
+    ) -> dict[str, Any]: ...
+
+    def correctness_precision(self) -> Literal["bf16", "fp32"]: ...
+
+    def correctness_use_fp32_lora_reference(self) -> bool: ...
+
+    def correctness_phase_pass_fns(
+        self, oracle_harness: Any
+    ) -> dict[str, Any] | None: ...
+
+    def correctness_suite_topologies(self, oracle_harness: Any) -> list[Any]: ...
 
     def collect_layer_families(
         self,
@@ -157,6 +230,13 @@ class ModelSupportHandler(Protocol):
         *,
         adapter_config: dict[str, Any],
     ) -> tuple[dict[str, Any], dict[str, Any]]: ...
+
+    def to_vllm_lora_config(
+        self,
+        adapter_config: dict[str, Any],
+    ) -> dict[str, Any]: ...
+
+    def vllm_lora_conversion_is_view_only(self) -> bool: ...
 
     def expert_packed_lora_groups(self) -> tuple[ExpertPackedLoraGroup, ...]: ...
 

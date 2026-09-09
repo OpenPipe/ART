@@ -24,7 +24,7 @@ import openai
 
 import art
 from art.local import LocalBackend
-from art.pipeline_trainer import PipelineTrainer
+from art.pipeline_trainer import PipelineRuntimeConfig, PipelineTrainer
 from art.utils.deployment.wandb import deploy_wandb
 from art.utils.output_dirs import get_model_dir, get_step_checkpoint_dir
 
@@ -258,6 +258,7 @@ async def main() -> None:
 
     # --- Phase 1: train the base model (static name, resume-safe) ---
     model_a = art.TrainableModel(
+        run_name=BASE_MODEL_NAME,
         name=BASE_MODEL_NAME,
         project=PROJECT,
         base_model=BASE_MODEL,
@@ -298,9 +299,11 @@ async def main() -> None:
                 rollout_fn=make_rollout_fn(),
                 scenarios=scenario_iter(),
                 config=None,
-                num_rollout_workers=len(PROMPTS),
-                min_batch_size=len(PROMPTS),
-                max_batch_size=len(PROMPTS),
+                pipeline=PipelineRuntimeConfig(
+                    num_rollout_workers=len(PROMPTS),
+                    min_batch_size=len(PROMPTS),
+                    max_batch_size=len(PROMPTS),
+                ),
                 max_steps=TRAIN_STEPS - start_step,
                 learning_rate=1e-4,
                 loss_fn="cispo",
@@ -334,6 +337,7 @@ async def main() -> None:
     model_b_name = f"ynm-fork-pipeline-{uuid.uuid4().hex[:8]}"
     print(f"Forking into '{model_b_name}'...")
     model_b = art.TrainableModel(
+        run_name=model_b_name,
         name=model_b_name,
         project=PROJECT,
         base_model=BASE_MODEL,
@@ -368,9 +372,11 @@ async def main() -> None:
         rollout_fn=make_rollout_fn(),
         scenarios=scenario_iter(),
         config=None,
-        num_rollout_workers=len(PROMPTS),
-        min_batch_size=len(PROMPTS),
-        max_batch_size=len(PROMPTS),
+        pipeline=PipelineRuntimeConfig(
+            num_rollout_workers=len(PROMPTS),
+            min_batch_size=len(PROMPTS),
+            max_batch_size=len(PROMPTS),
+        ),
         max_steps=2,
         learning_rate=1e-4,
         loss_fn="cispo",

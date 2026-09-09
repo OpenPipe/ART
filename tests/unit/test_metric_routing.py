@@ -1,7 +1,6 @@
 import json
 import os
 from pathlib import Path
-import types
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -35,24 +34,24 @@ class TestMetricRoutingBaseline:
         with open(history_path) as f:
             entry = json.loads(f.readline())
 
-        assert entry["reward/mean"] == 0.9
+        assert entry["train/reward/mean"] == 0.9
         assert entry["train/custom"] == 1.0
         assert entry["train/checkpoint/foo"] == 1.5
         assert entry["train/rewardish/value"] == 2.0
         assert entry["training_step"] == 7
-        assert entry["time/wall_clock_sec"] >= 0
+        assert "time/wall_clock_sec" not in entry
 
     def test_get_wandb_run_registers_taxonomy_sections(self, tmp_path: Path) -> None:
         fake_run = MagicMock()
         fake_run._is_finished = False
 
-        fake_wandb = types.SimpleNamespace()
-        fake_wandb.init = MagicMock(return_value=fake_run)
-        fake_wandb.define_metric = MagicMock()
-        fake_wandb.Settings = lambda **kwargs: kwargs
+        fake_init = MagicMock(return_value=fake_run)
 
         with patch.dict(os.environ, {"WANDB_API_KEY": "test-key"}, clear=False):
-            with patch.dict("sys.modules", {"wandb": fake_wandb}):
+            with (
+                patch("art.model.wandb_sdk.init", fake_init),
+                patch("art.model.wandb_sdk.settings", lambda **kwargs: kwargs),
+            ):
                 model = Model(
                     name="test-model",
                     project="test-project",
@@ -66,19 +65,22 @@ class TestMetricRoutingBaseline:
         ]
         assert define_calls == [
             (("training_step",), {}),
-            (("time/wall_clock_sec",), {}),
             (("sft/gradient_step",), {}),
-            (("reward/*",), {"step_metric": "training_step"}),
+            (("train/*",), {"step_metric": "training_step"}),
+            (("val/*",), {"step_metric": "training_step"}),
+            (("test/*",), {"step_metric": "training_step"}),
             (("loss/*",), {"step_metric": "training_step"}),
+            (("objective/*",), {"step_metric": "training_step"}),
+            (("sample_efficiency/*",), {"step_metric": "training_step"}),
+            (("offpolicy/*",), {"step_metric": "training_step"}),
             (("throughput/*",), {"step_metric": "training_step"}),
             (("costs/*",), {"step_metric": "training_step"}),
             (("time/*",), {"step_metric": "training_step"}),
             (("data/*",), {"step_metric": "training_step"}),
-            (("sft/*",), {"step_metric": "sft/gradient_step"}),
-            (("train/*",), {"step_metric": "training_step"}),
-            (("val/*",), {"step_metric": "training_step"}),
-            (("test/*",), {"step_metric": "training_step"}),
             (("discarded/*",), {"step_metric": "training_step"}),
+            (("pipeline_settings/*",), {"step_metric": "training_step"}),
+            (("vllm/*",), {"step_metric": "training_step"}),
+            (("sft/*",), {"step_metric": "sft/gradient_step"}),
         ]
 
     def test_log_metrics_defines_nested_cost_keys_with_training_step(
@@ -88,13 +90,13 @@ class TestMetricRoutingBaseline:
         fake_run._is_finished = False
         fake_run.config = MagicMock()
 
-        fake_wandb = types.SimpleNamespace()
-        fake_wandb.init = MagicMock(return_value=fake_run)
-        fake_wandb.define_metric = MagicMock()
-        fake_wandb.Settings = lambda **kwargs: kwargs
+        fake_init = MagicMock(return_value=fake_run)
 
         with patch.dict(os.environ, {"WANDB_API_KEY": "test-key"}, clear=False):
-            with patch.dict("sys.modules", {"wandb": fake_wandb}):
+            with (
+                patch("art.model.wandb_sdk.init", fake_init),
+                patch("art.model.wandb_sdk.settings", lambda **kwargs: kwargs),
+            ):
                 model = Model(
                     name="test-model",
                     project="test-project",
@@ -114,19 +116,15 @@ class TestMetricRoutingBaseline:
             (call.args, call.kwargs) for call in fake_run.define_metric.call_args_list
         ]
         assert (
-            ("costs/train/sample",),
-            {"step_metric": "training_step"},
-        ) in define_calls
-        assert (
             ("costs/cum/train/prefill",),
             {"step_metric": "training_step"},
         ) in define_calls
         fake_run.log.assert_called_once()
         logged_metrics = fake_run.log.call_args.args[0]
-        assert logged_metrics["costs/train/sample"] == 0.1
+        assert "costs/train/sample" not in logged_metrics
         assert logged_metrics["costs/cum/train/prefill"] == 0.2
         assert logged_metrics["training_step"] == 1
-        assert "time/wall_clock_sec" in logged_metrics
+        assert "time/wall_clock_sec" not in logged_metrics
         assert fake_run.log.call_args.kwargs == {}
 
     def test_update_wandb_config_seeds_wandb_init(self, tmp_path: Path) -> None:
@@ -134,10 +132,7 @@ class TestMetricRoutingBaseline:
         fake_run._is_finished = False
         fake_run.config = MagicMock()
 
-        fake_wandb = types.SimpleNamespace()
-        fake_wandb.init = MagicMock(return_value=fake_run)
-        fake_wandb.define_metric = MagicMock()
-        fake_wandb.Settings = lambda **kwargs: kwargs
+        fake_init = MagicMock(return_value=fake_run)
 
         payload = {
             "experiment": {"learning_rate": 1e-5, "batch_size": 4},
@@ -145,7 +140,10 @@ class TestMetricRoutingBaseline:
         }
 
         with patch.dict(os.environ, {"WANDB_API_KEY": "test-key"}, clear=False):
-            with patch.dict("sys.modules", {"wandb": fake_wandb}):
+            with (
+                patch("art.model.wandb_sdk.init", fake_init),
+                patch("art.model.wandb_sdk.settings", lambda **kwargs: kwargs),
+            ):
                 model = Model(
                     name="test-model",
                     project="test-project",
@@ -155,7 +153,7 @@ class TestMetricRoutingBaseline:
                 run = model._get_wandb_run()
 
         assert run is fake_run
-        init_kwargs = fake_wandb.init.call_args.kwargs
+        init_kwargs = fake_init.call_args.kwargs
         assert init_kwargs["config"] == payload
         assert "allow_val_change" not in init_kwargs
         fake_run.config.update.assert_called_once_with(payload)
@@ -165,13 +163,13 @@ class TestMetricRoutingBaseline:
         fake_run._is_finished = False
         fake_run.config = MagicMock()
 
-        fake_wandb = types.SimpleNamespace()
-        fake_wandb.init = MagicMock(return_value=fake_run)
-        fake_wandb.define_metric = MagicMock()
-        fake_wandb.Settings = lambda **kwargs: kwargs
+        fake_init = MagicMock(return_value=fake_run)
 
         with patch.dict(os.environ, {"WANDB_API_KEY": "test-key"}, clear=False):
-            with patch.dict("sys.modules", {"wandb": fake_wandb}):
+            with (
+                patch("art.model.wandb_sdk.init", fake_init),
+                patch("art.model.wandb_sdk.settings", lambda **kwargs: kwargs),
+            ):
                 model = Model(
                     name="test-model",
                     project="test-project",

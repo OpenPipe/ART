@@ -1,0 +1,887 @@
+from __future__ import annotations
+
+from collections.abc import Iterable, Iterator, Sequence
+from contextlib import contextmanager
+from dataclasses import dataclass
+import json
+import os
+import statistics
+import time
+from typing import Any, Literal, cast
+
+import torch
+import torch.distributed as dist
+from trainer_rank_diag import all_ranks_checked, rank0_checked
+from trainer_rank_support import load_random_checkpoints
+import typer
+
+from art.trainer_rank._impl import (
+    _TEST_ANCHOR_ENV as ANCHOR_ENV,
+)
+from art.trainer_rank._impl import (
+    _TEST_HOOKS_ENV as ANCHOR_HOOKS_ENV,
+)
+
+
+@contextmanager
+def _forced_anchor(anchor: str) -> Iterator[None]:
+    """Force one layout anchor via the test-only planner hook."""
+
+    if anchor == "automatic":
+        yield
+        return
+    os.environ[ANCHOR_HOOKS_ENV] = "1"
+    os.environ[ANCHOR_ENV] = anchor
+    try:
+        yield
+    finally:
+        os.environ.pop(ANCHOR_HOOKS_ENV, None)
+        os.environ.pop(ANCHOR_ENV, None)
+
+
+from art.megatron.prefix_tree_packing import prefix_tree_pack
+from art.trainer_rank import (
+    AdamParams,
+    ForwardInput,
+    ForwardOutput,
+    MicroBatchStats,
+    TopK,
+    TrainerRank,
+    Unset,
+)
+
+_TOPK_ORACLE_TOLERANCE = 5e-3
+
+
+@dataclass(frozen=True)
+class Diff:
+    mean_abs_pct: float = 0.0
+    max_abs_diff: float = 0.0
+
+    def merge(self, other: Diff) -> Diff:
+        return Diff(
+            max(self.mean_abs_pct, other.mean_abs_pct),
+            max(self.max_abs_diff, other.max_abs_diff),
+        )
+
+
+def main(
+    mode: Literal["correctness", "performance"] = "correctness",
+    model: str = "Qwen/Qwen3-0.6B",
+    layers: int = 1,
+    anchors: str = "no_sharing,depth_one,full_sharing,automatic",
+    performance_anchor: str = "automatic",
+    workload: Literal["regular", "austin", "varied", "unequal_slots"] = "regular",
+    request: Literal["target", "multi", "topk", "logits", "hidden", "mixed"] = "target",
+    families: int = 8,
+    prefix_tokens: int = 128,
+    branches: int = 4,
+    completion_tokens: int = 32,
+    slots: int = 0,
+    adaptive: bool = False,
+    optimizer_step: bool = False,
+    warmup: int = 3,
+    repeat: int = 10,
+    output_jsonl: str = "",
+) -> None:
+    os.environ.setdefault("ART_MEGATRON_TENSOR_MODEL_PARALLEL_SIZE", "1")
+    os.environ.setdefault("ART_MEGATRON_CONTEXT_PARALLEL_SIZE", "1")
+    os.environ.setdefault("ART_MEGATRON_PIPELINE_MODEL_PARALLEL_SIZE", "1")
+    if not torch.cuda.is_available():
+        raise RuntimeError("dev/trainer_rank_check.py requires CUDA")
+    torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
+    dist.init_process_group(backend="nccl")
+    try:
+        from art.megatron import train as megatron_train
+
+        torch.manual_seed(1234)
+        runtime = megatron_train.build_training_runtime(
+            model_identifier=model,
+            provider_configure=(
+                (lambda provider: setattr(provider, "num_layers", layers))
+                if layers > 0
+                else None
+            ),
+            print_env=dist.get_rank() == 0,
+        )
+        if mode == "performance" and workload == "unequal_slots":
+            _trace_unequal_slots("runtime_ready")
+        for chunk in runtime.model:
+            chunk.eval()
+        if mode == "correctness":
+            payload = _correctness(
+                runtime,
+                base_model=model,
+                anchors=tuple(anchors.split(",")),
+                slots=slots,
+            )
+        else:
+            payload = _performance(
+                runtime,
+                base_model=model,
+                anchor=performance_anchor,
+                workload=workload,
+                request=request,
+                families=families,
+                prefix_tokens=prefix_tokens,
+                branches=branches,
+                completion_tokens=completion_tokens,
+                slots=slots,
+                adaptive=adaptive,
+                optimizer_step=optimizer_step,
+                warmup=warmup,
+                repeat=repeat,
+            )
+        payload.update(_topology(), model=model, layers=layers, mode=mode)
+        if dist.get_rank() == 0:
+            line = json.dumps(payload, sort_keys=True)
+            print(line, flush=True)
+            if output_jsonl:
+                with open(output_jsonl, "a", encoding="utf-8") as output:
+                    output.write(line + "\n")
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
+
+
+def _correctness(
+    runtime: Any,
+    *,
+    base_model: str,
+    anchors: tuple[str, ...],
+    slots: int,
+) -> dict[str, object]:
+    assert anchors, "anchors must not be empty"
+    rank = TrainerRank(runtime)
+    slot_names = load_random_checkpoints(
+        runtime,
+        rank,
+        slots,
+        base_model=base_model,
+    )
+    requests = _correctness_requests(slot_names)
+    with _forced_anchor("no_sharing"):
+        reference = _global_outputs(rank, requests)
+    worst = Diff()
+    grad_worst = Diff()
+    slot_grad_worst = Diff()
+    rows: list[dict[str, object]] = []
+    for anchor in anchors:
+        with _forced_anchor(anchor):
+            outputs = _global_outputs(rank, requests)
+        comparison = rank0_checked(
+            f"TrainerRank correctness anchor={anchor}",
+            lambda: _compare_iteration(outputs, reference),
+        )
+        if dist.get_rank() == 0:
+            assert comparison is not None and outputs is not None
+            worst = worst.merge(comparison)
+            rows.append(
+                {
+                    "anchor": anchor,
+                    "independent_mean_abs_pct": comparison.mean_abs_pct,
+                }
+            )
+            print(rows[-1], flush=True)
+    # Head chunk parity is anchor-independent; exercise both a shallow and a
+    # deep-shared packing once each instead of once per anchor.
+    for parity_depth in (1, 4):
+        grad_diff = _head_backward_chunk_parity(rank, requests, pack_depth=parity_depth)
+        grad_worst = grad_worst.merge(grad_diff)
+    if len(slot_names) >= 2:
+        with _forced_anchor("full_sharing"):
+            slot_grad_worst = _slot_backward_parity(rank, requests, slot_names)
+    return {
+        "request_combinations": 16,
+        "slots": slots,
+        "rows": rows,
+        "mean_abs_pct": worst.mean_abs_pct,
+        "max_abs_diff": worst.max_abs_diff,
+        "head_backward_mean_abs_pct": grad_worst.mean_abs_pct,
+        "head_backward_max_abs_diff": grad_worst.max_abs_diff,
+        "slot_backward_mean_abs_pct": slot_grad_worst.mean_abs_pct,
+        "slot_backward_max_abs_diff": slot_grad_worst.max_abs_diff,
+    }
+
+
+def _compare_iteration(
+    outputs: list[dict[str, object]] | None,
+    reference: list[dict[str, object]] | None,
+) -> Diff:
+    assert outputs is not None and reference is not None
+    _assert_topk_only_oracle(outputs)
+    _assert_topk_only_oracle(reference)
+    _assert_same_logits_topk(outputs)
+    _assert_same_logits_topk(reference)
+    return _compare_outputs(
+        outputs,
+        reference,
+        tolerance=5e-3,
+        topk_tolerance=1e-2,
+        allow_topk_layout_ties=True,
+    )
+
+
+def _local_outputs(
+    rank: TrainerRank,
+    indexed_requests: Sequence[tuple[int, ForwardInput]],
+) -> list[dict[str, object]]:
+    from art.megatron.lora import use_lora_slot
+
+    requests = [request for _, request in indexed_requests]
+    plan = rank._plan_flat_forward(requests)
+    outputs: list[ForwardOutput] = [
+        ForwardOutput(None, None, None, None) for _ in requests
+    ]
+    sources: list[torch.Tensor] = [torch.empty(0, dtype=torch.long) for _ in requests]
+    for group in plan.groups:
+        prepared = rank._prepare_packed_forward(group.packed)
+        with use_lora_slot(group.slot_ref):
+            group_outputs = rank._forward_packed(group.items, prepared)
+        for index, source, output in zip(
+            group.request_indices,
+            prepared.source_positions_by_item,
+            group_outputs,
+            strict=True,
+        ):
+            sources[index] = source
+            outputs[index] = output
+    return [
+        _output_record(global_index, source, output)
+        for (global_index, _), source, output in zip(
+            indexed_requests,
+            sources,
+            outputs,
+            strict=True,
+        )
+    ]
+
+
+def _global_outputs(
+    rank: TrainerRank,
+    requests: Sequence[ForwardInput],
+) -> list[dict[str, object]] | None:
+    from megatron.core import parallel_state as ps
+
+    dp_rank = int(ps.get_data_parallel_rank())
+    dp_size = int(ps.get_data_parallel_world_size())
+    indexed = list(enumerate(requests))[dp_rank::dp_size]
+    local = _local_outputs(rank, indexed)
+    gathered: list[list[dict[str, object]] | None] = [None] * dist.get_world_size()
+    dist.all_gather_object(gathered, local)
+    if dist.get_rank() != 0:
+        return None
+    records = [
+        record for rank_records in gathered if rank_records for record in rank_records
+    ]
+    return [
+        _reconstruct(index, request, records) for index, request in enumerate(requests)
+    ]
+
+
+def _output_record(
+    index: int,
+    source_positions: torch.Tensor,
+    output: ForwardOutput,
+) -> dict[str, object]:
+    return {
+        "index": index,
+        "source": source_positions.detach().cpu(),
+        "target": _cpu(output.target_logprobs),
+        "topk_logprobs": _cpu(None if output.top_k is None else output.top_k.logprobs),
+        "topk_tokens": _cpu(None if output.top_k is None else output.top_k.tokens),
+        "logits": _cpu(output.logits),
+        "hidden": _cpu(output.hidden_states),
+    }
+
+
+def _reconstruct(
+    index: int,
+    request: ForwardInput,
+    records: Sequence[dict[str, object]],
+) -> dict[str, object]:
+    selected = [record for record in records if record["index"] == index]
+    return {
+        key: _reconstruct_tensor(
+            selected,
+            key,
+            length=int(request.input_tokens.numel()),
+        )
+        for key in ("target", "topk_logprobs", "topk_tokens", "logits", "hidden")
+    }
+
+
+def _reconstruct_tensor(
+    records: Sequence[dict[str, object]],
+    key: str,
+    *,
+    length: int,
+) -> torch.Tensor | None:
+    values = [
+        record[key] for record in records if isinstance(record[key], torch.Tensor)
+    ]
+    if not values:
+        return None
+    first = cast(torch.Tensor, values[0])
+    output = torch.empty((length, *first.shape[1:]), dtype=first.dtype)
+    filled = torch.zeros(length, dtype=torch.bool)
+    for record in records:
+        value = record[key]
+        if not isinstance(value, torch.Tensor):
+            continue
+        source = cast(torch.Tensor, record["source"])
+        duplicate = filled.index_select(0, source)
+        if bool(duplicate.any()):
+            torch.testing.assert_close(
+                output.index_select(0, source[duplicate]),
+                value[duplicate],
+                atol=2e-5,
+                rtol=2e-5,
+            )
+        output[source] = value
+        filled[source] = True
+    assert bool(filled.all()), f"{key} reconstruction missed positions"
+    return output
+
+
+def _compare_outputs(
+    actual: Sequence[dict[str, object]],
+    expected: Sequence[dict[str, object]],
+    *,
+    tolerance: float,
+    topk_tolerance: float | None = None,
+    allow_topk_layout_ties: bool = False,
+) -> Diff:
+    worst = Diff()
+    for actual_output, expected_output in zip(actual, expected, strict=True):
+        for key in actual_output:
+            actual_tensor = actual_output[key]
+            expected_tensor = expected_output[key]
+            if actual_tensor is None or expected_tensor is None:
+                if actual_tensor is not expected_tensor:
+                    raise AssertionError(f"{key} None mismatch")
+                continue
+            assert isinstance(actual_tensor, torch.Tensor)
+            assert isinstance(expected_tensor, torch.Tensor)
+            if key == "topk_tokens":
+                _assert_stable_topk_tokens(
+                    actual_output,
+                    expected_output,
+                    allow_topk_only_ties=allow_topk_layout_ties,
+                )
+                continue
+            diff = _diff(actual_tensor, expected_tensor)
+            limit = (
+                topk_tolerance
+                if key == "topk_logprobs" and topk_tolerance is not None
+                else tolerance
+            )
+            if diff.mean_abs_pct > limit:
+                raise AssertionError(
+                    f"{key} mean_abs_pct={diff.mean_abs_pct} exceeds {limit}"
+                )
+            worst = worst.merge(diff)
+    return worst
+
+
+def _assert_same_logits_topk(outputs: Sequence[dict[str, object]]) -> None:
+    for index, output in enumerate(outputs):
+        logits = output["logits"]
+        values = output["topk_logprobs"]
+        tokens = output["topk_tokens"]
+        if not all(
+            isinstance(value, torch.Tensor) for value in (logits, values, tokens)
+        ):
+            continue
+        logits = cast(torch.Tensor, logits)
+        values = cast(torch.Tensor, values)
+        tokens = cast(torch.Tensor, tokens)
+        oracle_values, oracle_tokens = torch.topk(
+            torch.log_softmax(logits.float(), dim=-1),
+            int(tokens.shape[-1]),
+            dim=-1,
+        )
+        diff = _diff(values, oracle_values)
+        if diff.mean_abs_pct > _TOPK_ORACLE_TOLERANCE:
+            raise AssertionError(
+                f"output {index} same-logit top-k mean_abs_pct="
+                f"{diff.mean_abs_pct} exceeds {_TOPK_ORACLE_TOLERANCE}"
+            )
+        changed = (
+            (tokens.sort(dim=-1).values != oracle_tokens.sort(dim=-1).values)
+            .reshape(-1, int(tokens.shape[-1]))
+            .any(-1)
+        )
+        logits_rows = logits.reshape(-1, int(logits.shape[-1]))
+        for row in torch.nonzero(changed, as_tuple=False).flatten():
+            if _topk_boundary_margin(logits_rows[int(row)], int(tokens.shape[-1])) > 0:
+                raise AssertionError(
+                    f"output {index} top-k tokens differ from its own logits at "
+                    f"stable row {int(row)}"
+                )
+
+
+def _assert_topk_only_oracle(outputs: Sequence[dict[str, object]]) -> None:
+    topk_only = outputs[2]
+    oracle = outputs[16]
+    for key in ("topk_logprobs", "topk_tokens"):
+        actual = cast(torch.Tensor, topk_only[key])
+        expected = cast(torch.Tensor, oracle[key])
+        if key == "topk_tokens":
+            if not torch.equal(actual, expected):
+                raise AssertionError("top-k-only tokens differ from same-run oracle")
+        else:
+            diff = _diff(actual, expected)
+            if diff.mean_abs_pct > _TOPK_ORACLE_TOLERANCE:
+                raise AssertionError(
+                    "top-k-only logprobs differ from same-run oracle: "
+                    f"mean_abs_pct={diff.mean_abs_pct}, "
+                    f"max_abs_diff={diff.max_abs_diff}, "
+                    f"limit={_TOPK_ORACLE_TOLERANCE}"
+                )
+
+
+def _assert_stable_topk_tokens(
+    actual: dict[str, object],
+    expected: dict[str, object],
+    *,
+    allow_topk_only_ties: bool = False,
+) -> None:
+    actual_tokens = cast(torch.Tensor, actual["topk_tokens"])
+    expected_tokens = cast(torch.Tensor, expected["topk_tokens"])
+    if torch.equal(
+        actual_tokens,
+        expected_tokens,
+    ):
+        return
+    actual_logits = actual["logits"]
+    expected_logits = expected["logits"]
+    if not isinstance(actual_logits, torch.Tensor) or not isinstance(
+        expected_logits, torch.Tensor
+    ):
+        if allow_topk_only_ties:
+            return
+        raise AssertionError("top-k tokens differ for a top-k-only request")
+    actual_rows = actual_tokens.reshape(-1, int(actual_tokens.shape[-1]))
+    expected_rows = expected_tokens.reshape(-1, int(expected_tokens.shape[-1]))
+    actual_logits_rows = actual_logits.reshape(-1, int(actual_logits.shape[-1])).float()
+    expected_logits_rows = expected_logits.reshape(
+        -1, int(expected_logits.shape[-1])
+    ).float()
+    changed = (actual_rows.sort(-1).values != expected_rows.sort(-1).values).any(-1)
+    for row in torch.nonzero(changed, as_tuple=False).flatten():
+        row_index = int(row)
+        error = float(
+            (actual_logits_rows[row_index] - expected_logits_rows[row_index])
+            .abs()
+            .max()
+        )
+        margin = _topk_boundary_margin(
+            expected_logits_rows[row_index],
+            int(expected_tokens.shape[-1]),
+        )
+        if margin > 2 * error:
+            raise AssertionError(
+                f"top-k token sets differ at stable row {row_index}: "
+                f"boundary margin={margin}, logit error={error}"
+            )
+
+
+def _topk_boundary_margin(logits: torch.Tensor, k: int) -> float:
+    if k < 1 or int(logits.numel()) <= k:
+        return 0.0
+    values = torch.topk(logits.float(), k + 1).values
+    return float(values[k - 1] - values[k])
+
+
+def _head_backward_chunk_parity(
+    rank: TrainerRank,
+    requests: Sequence[ForwardInput],
+    *,
+    pack_depth: int = 1,
+) -> Diff:
+    from art.trainer_rank import _impl as trainer_rank_impl
+
+    active = [
+        request
+        for request in requests
+        if request.target_tokens is not None or request.top_k is not None
+    ]
+    items = [rank._forward_item(request) for request in active]
+    prepared = rank._prepare_packed_forward(
+        prefix_tree_pack(
+            (item.input_ids for item in items),
+            max_depth=pack_depth,
+        )
+    )
+    with torch.no_grad():
+        hidden = rank._gather_sequence_parallel_hidden(rank._decoder_hidden(prepared))
+    gradients: list[torch.Tensor] = []
+    logprob_sums: list[torch.Tensor] = []
+    original_chunk = trainer_rank_impl._HEAD_CHUNK_TOKENS
+    for chunk_tokens in (17, 8_192):
+        trainer_rank_impl._HEAD_CHUNK_TOKENS = chunk_tokens
+        try:
+            candidate = hidden.detach().requires_grad_(True)
+            outputs = rank._project_head(items, prepared, candidate)
+            loss = _output_loss(outputs)
+            logprob_sums.append(loss.detach())
+            loss.backward()
+            assert candidate.grad is not None
+            gradients.append(candidate.grad)
+        finally:
+            trainer_rank_impl._HEAD_CHUNK_TOKENS = original_chunk
+    forward_diff = _diff(logprob_sums[0], logprob_sums[1])
+    if forward_diff.mean_abs_pct > 2e-3:
+        raise AssertionError(
+            f"head forward chunk parity mean_abs_pct={forward_diff.mean_abs_pct}"
+        )
+    diff = _diff(gradients[0], gradients[1])
+    if diff.mean_abs_pct > 2e-3:
+        raise AssertionError(f"head gradient mean_abs_pct={diff.mean_abs_pct}")
+    return diff.merge(forward_diff)
+
+
+def _slot_backward_parity(
+    rank: TrainerRank,
+    requests: Sequence[ForwardInput],
+    slots: Sequence[str],
+) -> Diff:
+    worst = Diff()
+    for label, ordered in (("normal", requests), ("reversed", requests[::-1])):
+        result = Diff()
+
+        def check() -> None:
+            nonlocal result
+            result = _local_slot_backward_parity(rank, ordered, slots)
+
+        all_ranks_checked(f"TrainerRank {label} slot gradient parity", check)
+        worst = worst.merge(result)
+    rank.zero_grad()
+    return worst
+
+
+def _local_slot_backward_parity(
+    rank: TrainerRank,
+    requests: Sequence[ForwardInput],
+    slots: Sequence[str],
+) -> Diff:
+    from megatron.core import parallel_state as ps
+
+    local = list(requests)[
+        int(ps.get_data_parallel_rank()) :: int(ps.get_data_parallel_world_size())
+    ]
+    combined = _slot_gradients(rank, local, slots)
+    split_by_slot = {
+        slot: _slot_gradients(
+            rank,
+            [request for request in local if request.checkpoint == slot],
+            slots,
+        )
+        for slot in slots
+    }
+    worst = Diff()
+    for slot in slots:
+        split = split_by_slot[slot]
+        for other in slots:
+            for gradient in split[other]:
+                if other != slot and bool(gradient.count_nonzero()):
+                    raise AssertionError(f"gradient leaked from {slot!r} to {other!r}")
+        for index, (actual, expected) in enumerate(
+            zip(combined[slot], split[slot], strict=True)
+        ):
+            diff = _diff(actual, expected)
+            worst = worst.merge(diff)
+            if diff.mean_abs_pct > 2e-5:
+                raise AssertionError(
+                    f"slot {slot!r} parameter {index} gradient mean_abs_pct="
+                    f"{diff.mean_abs_pct} exceeds 0.00002"
+                )
+        if not any(bool(gradient.count_nonzero()) for gradient in split[slot]):
+            raise AssertionError(f"slot {slot!r} produced no nonzero gradients")
+    return worst
+
+
+def _slot_gradients(
+    rank: TrainerRank,
+    requests: Sequence[ForwardInput],
+    slots: Sequence[str],
+) -> dict[str, list[torch.Tensor]]:
+    rank.zero_grad()
+    _output_loss(rank.dp_rank_forward(requests)).backward()
+    return {
+        slot: [
+            torch.zeros_like(parameter, dtype=torch.float32, device="cpu")
+            if parameter.grad is None
+            else parameter.grad.detach().float().cpu().clone()
+            for parameter in rank._checkpoint_slots[slot].params
+        ]
+        for slot in slots
+    }
+
+
+def _performance(
+    runtime: Any,
+    *,
+    base_model: str,
+    anchor: str,
+    workload: str,
+    request: str,
+    families: int,
+    prefix_tokens: int,
+    branches: int,
+    completion_tokens: int,
+    slots: int,
+    adaptive: bool,
+    optimizer_step: bool,
+    warmup: int,
+    repeat: int,
+) -> dict[str, object]:
+    if workload == "austin":
+        families, prefix_tokens, branches, completion_tokens = 30, 5000, 16, 100
+    rank = TrainerRank(runtime)
+    if workload == "unequal_slots":
+        _trace_unequal_slots("rank_ready")
+    slot_names = load_random_checkpoints(
+        runtime,
+        rank,
+        slots,
+        base_model=base_model,
+        site_limit=1 if workload == "unequal_slots" else None,
+    )
+    if workload == "unequal_slots":
+        _trace_unequal_slots("slots_ready")
+    if workload == "unequal_slots":
+        if len(slot_names) < 2:
+            raise ValueError("--workload unequal_slots requires --slots >= 2")
+        requests = [
+            ForwardInput(
+                input_tokens=(tokens := _tokens(index * 1009, length)),
+                target_tokens=(tokens * 7 + 3) % 32_000,
+                checkpoint=slot_names[index],
+            )
+            for index, length in enumerate((256, 64))
+        ]
+    else:
+        requests = _performance_requests(
+            request=request,
+            families=families,
+            prefix_tokens=prefix_tokens,
+            branches=branches,
+            completion_tokens=completion_tokens,
+            varied=workload == "varied",
+            slots=slot_names,
+        )
+    if anchor != "automatic":
+        os.environ[ANCHOR_HOOKS_ENV] = "1"
+        os.environ[ANCHOR_ENV] = anchor
+    dp_rank, dp_size = rank._dp_rank_and_size()
+    plan = rank._plan_flat_forward(requests)
+    if workload == "unequal_slots":
+        _trace_unequal_slots("plan_ready")
+    assert (
+        workload != "austin" or anchor != "depth_one" or plan.packed_tokens == 198_000
+    )
+
+    def step() -> list[MicroBatchStats]:
+        if workload == "unequal_slots":
+            _trace_unequal_slots("step_start")
+        rank.zero_grad()
+        stats: list[MicroBatchStats] = []
+        if adaptive:
+            for micro in rank.forward_micro_batches(requests):
+                _output_loss(cast(Sequence[ForwardOutput], micro.outputs)).backward()
+                stats.append(micro.stats)
+        else:
+            outputs = rank.dp_rank_forward(requests[dp_rank::dp_size])
+            if workload == "unequal_slots":
+                _trace_unequal_slots("forward_ready")
+            _output_loss(outputs).backward()
+            if workload == "unequal_slots":
+                _trace_unequal_slots("backward_ready")
+        if optimizer_step:
+            if not slot_names:
+                raise ValueError("--optimizer-step requires --slots >= 1")
+            rank.optim_step(params=AdamParams(learning_rate=1e-5))
+        return stats
+
+    for _ in range(warmup):
+        step()
+    times: list[float] = []
+    all_stats: list[MicroBatchStats] = []
+    torch.cuda.reset_peak_memory_stats()
+    for _ in range(repeat):
+        torch.cuda.synchronize()
+        started = time.perf_counter()
+        all_stats.extend(step())
+        torch.cuda.synchronize()
+        times.append(time.perf_counter() - started)
+    median = statistics.median(times)
+    free, total = torch.cuda.mem_get_info()
+    return {
+        "anchor": anchor,
+        "workload": workload,
+        "request": request,
+        "adaptive": adaptive,
+        "optimizer_step": optimizer_step,
+        "slots": slots,
+        "warmup": warmup,
+        "repeat": repeat,
+        "packed_tokens": plan.packed_tokens,
+        "logical_tokens": plan.logical_tokens,
+        "median_s": median,
+        "packed_tok_s": plan.packed_tokens / median,
+        "logical_tok_s": plan.logical_tokens / median,
+        "peak_allocated_gb": torch.cuda.max_memory_allocated() / 1024**3,
+        "peak_reserved_gb": torch.cuda.max_memory_reserved() / 1024**3,
+        "device_used_gb": (total - free) / 1024**3,
+        "windows": [stat.global_count for stat in all_stats],
+        "rejected_candidates": sum(stat.rejected_candidates for stat in all_stats),
+    }
+
+
+def _trace_unequal_slots(event: str) -> None:
+    print(
+        json.dumps({"event": event, "rank": dist.get_rank(), "time": time.time()}),
+        flush=True,
+    )
+
+
+def _output_loss(outputs: Iterable[ForwardOutput]) -> torch.Tensor:
+    terms: list[torch.Tensor] = []
+    for output in outputs:
+        if output.target_logprobs is not None:
+            terms.append(-output.target_logprobs.float().sum())
+        if output.top_k is not None:
+            terms.append(-output.top_k.logprobs.float().sum())
+        if output.logits is not None:
+            terms.append(output.logits.float().square().mean())
+        if output.hidden_states is not None:
+            terms.append(output.hidden_states.float().square().mean())
+    if not terms:
+        raise RuntimeError("request produced no differentiable outputs")
+    return torch.stack(terms).sum()
+
+
+def _correctness_requests(slots: Sequence[str] = ()) -> list[ForwardInput]:
+    requests: list[ForwardInput] = []
+    for mask in range(16):
+        tokens = torch.tensor(
+            [11, 12, 20 + mask // 8, 30 + mask // 4 % 2, 40 + mask // 2 % 2, 50 + mask]
+        )
+        tokens = tokens.reshape(2, 3) if mask == 15 else tokens
+        labels: torch.Tensor | None = None
+        if mask & 1:
+            labels = (tokens * 7 + mask) % 1000
+            if mask == 1:
+                labels = torch.stack((labels, (labels + 17) % 1000), dim=1)
+                labels[2, 1] = -100
+        requests.append(
+            ForwardInput(
+                input_tokens=tokens,
+                target_tokens=labels,
+                top_k=3 if mask & 2 else None,
+                logits=bool(mask & 4),
+                hidden_states=bool(mask & 8),
+                checkpoint=slots[mask % len(slots)] if slots else Unset,
+            )
+        )
+    topk_only = requests[2]
+    requests.append(
+        ForwardInput(
+            input_tokens=topk_only.input_tokens.clone(),
+            top_k=3,
+            logits=True,
+            checkpoint=topk_only.checkpoint,
+        )
+    )
+    return requests
+
+
+def _performance_requests(
+    *,
+    request: str,
+    families: int,
+    prefix_tokens: int,
+    branches: int,
+    completion_tokens: int,
+    varied: bool,
+    slots: Sequence[str],
+) -> list[ForwardInput]:
+    requests: list[ForwardInput] = []
+    for family in range(families):
+        family_base = family * 10_000_019
+        prefix_len = prefix_tokens + ((family * 97) % 257 - 128 if varied else 0)
+        prefix = _tokens(family_base, max(1, prefix_len))
+        family_branches = max(1, branches + ((family % 5) - 2 if varied else 0))
+        for branch in range(family_branches):
+            completion_len = completion_tokens + (
+                (branch * 17) % 33 - 16 if varied else 0
+            )
+            tokens = torch.cat(
+                (
+                    prefix,
+                    _tokens(family_base + branch * 1009 + 17, max(1, completion_len)),
+                )
+            )
+            labels = (tokens * 7 + 3) % 32_000
+            labels[: int(prefix.numel())] = -100
+            if request == "multi":
+                labels = torch.stack(
+                    tuple((labels + offset) % 32_000 for offset in range(4)), dim=1
+                )
+                labels[: int(prefix.numel())] = -100
+            requests.append(
+                ForwardInput(
+                    input_tokens=tokens,
+                    target_tokens=labels
+                    if request in {"target", "multi", "mixed"}
+                    else None,
+                    top_k=10 if request in {"topk", "mixed"} else None,
+                    logits=request == "logits"
+                    or request == "mixed"
+                    and branch % 16 == 0,
+                    hidden_states=request == "hidden"
+                    or request == "mixed"
+                    and branch % 8 == 0,
+                    checkpoint=slots[family % len(slots)] if slots else Unset,
+                )
+            )
+    return requests
+
+
+def _tokens(offset: int, length: int) -> torch.Tensor:
+    return (torch.arange(length, dtype=torch.long) + offset) % 32_000 + 100
+
+
+def _diff(actual: torch.Tensor, expected: torch.Tensor) -> Diff:
+    assert actual.shape == expected.shape, (
+        f"shape mismatch: {actual.shape} != {expected.shape}"
+    )
+    if not actual.numel():
+        return Diff()
+    delta = (actual.float() - expected.float()).abs()
+    return Diff(
+        float(delta.mean() / expected.float().abs().mean().clamp_min(1e-18)),
+        float(delta.max()),
+    )
+
+
+def _cpu(tensor: object) -> torch.Tensor | None:
+    return tensor.detach().cpu() if isinstance(tensor, torch.Tensor) else None
+
+
+def _topology() -> dict[str, int]:
+    from megatron.core import parallel_state as ps
+
+    return {
+        "world": dist.get_world_size(),
+        "dp": int(ps.get_data_parallel_world_size()),
+        "tp": int(ps.get_tensor_model_parallel_world_size()),
+        "cp": int(ps.get_context_parallel_world_size()),
+        "ep": int(ps.get_expert_model_parallel_world_size()),
+    }
+
+
+if __name__ == "__main__":
+    typer.run(main)

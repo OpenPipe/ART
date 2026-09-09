@@ -122,6 +122,7 @@ class GdnTraceTokenUidHooks:
             projection,
             sequence_parallel_output=sequence_parallel_output,
         )
+        self.set_module_token_uids(gdn, output_uids)
         self.set_module_token_uids(getattr(gdn, "out_proj", None), output_uids)
         self.set_module_token_uids(projection, output_uids)
 

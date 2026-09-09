@@ -5,6 +5,9 @@ import time
 from typing import Any, Dict, List, Optional
 
 import openai
+from openai.types.shared_params.response_format_json_schema import (
+    ResponseFormatJSONSchema,
+)
 
 from art.mcp.types import GeneratedScenarioCollection, MCPResource, MCPTool
 from art.utils.logging import _C, dim, err, info, ok, step
@@ -137,7 +140,7 @@ You must respond with a JSON object containing a "scenarios" array of exactly {n
     if custom_instructions:
         prompt += f"\n\nPay close attention to the following instructions when generating scenarios:\n\n{custom_instructions}"
 
-    response_schema = {
+    response_schema: dict[str, object] = {
         "type": "object",
         "properties": {
             "scenarios": {
@@ -166,14 +169,15 @@ You must respond with a JSON object containing a "scenarios" array of exactly {n
     )
 
     t1 = time.perf_counter()
+    response_format: ResponseFormatJSONSchema = {
+        "type": "json_schema",
+        "json_schema": {"name": "scenario_list", "schema": response_schema},
+    }
     response = client_openai.chat.completions.create(
         model=generator_model,
         messages=[{"role": "user", "content": prompt}],
         max_completion_tokens=8000,
-        response_format={
-            "type": "json_schema",
-            "json_schema": {"name": "scenario_list", "schema": response_schema},
-        },
+        response_format=response_format,
     )
     dt = time.perf_counter() - t1
     ok(f"Model responded in {dt:.2f}s.")

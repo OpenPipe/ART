@@ -4,7 +4,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
-from typing import Any
+from typing import Any, Callable
 
 from pydantic import BaseModel, Field
 
@@ -38,6 +38,16 @@ HF_PARITY_PACKED_TENSORS = PackedTensorConfig(
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
 HF_PARITY_ARTIFACT_SUITE_NAME = "Megatron HF parity artifacts"
+
+
+def _hf_parity_worker_env() -> dict[str, str]:
+    return {
+        "RANK": "0",
+        "WORLD_SIZE": "1",
+        "LOCAL_RANK": "0",
+        "LOCAL_WORLD_SIZE": "1",
+        "PYTHONUNBUFFERED": "1",
+    }
 
 
 class HfParityMetricRow(BaseModel):
@@ -96,6 +106,20 @@ def _hf_parity_phase_pass_fns() -> dict[str, PhasePassFn]:
         "grads": grads_deltas,
         "deltas": grads_deltas,
     }
+
+
+def _hf_parity_phase_pass_fns_for_case(
+    case_config: OracleCaseConfig,
+) -> dict[str, PhasePassFn]:
+    from art.megatron.model_support.registry import get_model_support_handler
+
+    handler = get_model_support_handler(
+        case_config.base_model,
+        allow_unvalidated_arch=case_config.allow_unvalidated_arch,
+    )
+    return handler.correctness_phase_pass_fns(sys.modules[__name__]) or (
+        _hf_parity_phase_pass_fns()
+    )
 
 
 def hf_parity_case_config(case_config: OracleCaseConfig) -> OracleCaseConfig:
@@ -170,6 +194,7 @@ def build_tensor_map_metric_rows(
     reference: dict[str, Any],
     candidate: dict[str, Any],
     phase_pass_fns: dict[str, PhasePassFn] | None = None,
+    group_by: Callable[[str], str] | None = None,
 ) -> list[HfParityMetricRow]:
     reference_keys = set(reference.keys())
     candidate_keys = set(candidate.keys())
@@ -186,6 +211,12 @@ def build_tensor_map_metric_rows(
             )
         ]
     rows: list[HfParityMetricRow] = []
+    accumulators: dict[str, DiffAccumulator] = {}
+    diagnostic_pass_fns = dict(phase_pass_fns or _hf_parity_phase_pass_fns())
+    diagnostic_phase = f"{phase}_diagnostic"
+    diagnostic_pass_fns[diagnostic_phase] = MetricThresholdRule(
+        minimums={"typical_abs_scale": 0.0, "candidate_abs_scale": 0.0}
+    )
     for key in sorted(reference_keys):
         if tuple(reference[key].shape) != tuple(candidate[key].shape):
             rows.append(
@@ -198,6 +229,19 @@ def build_tensor_map_metric_rows(
                 )
             )
             continue
+        if group_by is not None:
+            summary = summarize_tensor_pair(reference[key], candidate[key])
+            rows.append(
+                _build_metric_row(
+                    phase=diagnostic_phase,
+                    param=key,
+                    summary=summary,
+                    phase_pass_fns=diagnostic_pass_fns,
+                )
+            )
+            accumulator = accumulators.setdefault(group_by(key), DiffAccumulator())
+            accumulator.update(reference[key], candidate[key])
+            continue
         rows.append(
             _build_metric_row(
                 phase=phase,
@@ -206,6 +250,15 @@ def build_tensor_map_metric_rows(
                 phase_pass_fns=phase_pass_fns,
             )
         )
+    rows.extend(
+        _build_metric_row(
+            phase=phase,
+            param=group,
+            summary=accumulator.as_summary(),
+            phase_pass_fns=phase_pass_fns,
+        )
+        for group, accumulator in sorted(accumulators.items())
+    )
     return rows
 
 
@@ -253,6 +306,11 @@ def set_hf_config_num_layers(config: Any, num_layers: int) -> str:
             layer_types = getattr(config_view, "layer_types", None)
             if isinstance(layer_types, (list, tuple)):
                 setattr(config_view, "layer_types", list(layer_types[:num_layers]))
+            hybrid_pattern = getattr(config_view, "hybrid_override_pattern", None)
+            if isinstance(hybrid_pattern, str) and not isinstance(
+                layer_types, (list, tuple)
+            ):
+                config_view.hybrid_override_pattern = hybrid_pattern[:num_layers]
             mlp_only_layers = getattr(config_view, "mlp_only_layers", None)
             if isinstance(mlp_only_layers, (list, tuple)):
                 setattr(
@@ -301,11 +359,10 @@ def run_hf_parity_subprocess(request: HfParityRunRequest, output_dir: Path) -> N
         "--run-request",
         str(request_path),
     ]
-    env = {**os.environ, "PYTHONUNBUFFERED": "1"}
     run = subprocess.run(
         command,
         cwd=str(worker_cwd),
-        env=env,
+        env={**os.environ, **_hf_parity_worker_env()},
         capture_output=True,
         text=True,
         check=False,
@@ -319,13 +376,28 @@ def run_hf_parity_subprocess(request: HfParityRunRequest, output_dir: Path) -> N
         )
 
 
+def _run_hf_parity_in_process(
+    request: HfParityRunRequest,
+    output_dir: Path,
+) -> None:
+    from .hf_parity_worker import run_worker_cli
+    from .workflow import _redirect_output, _temporary_env
+
+    request_path = output_dir / "run_request.json"
+    _write_json(request_path, request.model_dump(mode="json"))
+    with _temporary_env(**_hf_parity_worker_env()):
+        with _redirect_output(output_dir / "worker.log"):
+            run_worker_cli(request_path)
+
+
 def run_hf_parity(
     *,
     case_config: OracleCaseConfig,
+    in_process: bool = False,
 ) -> HfParityReport:
     case_config = hf_parity_case_config(case_config)
-    if case_config.precision != "fp32":
-        raise ValueError("HF parity currently requires fp32 precision")
+    if case_config.precision not in {"bf16", "fp32"}:
+        raise ValueError(f"Unsupported HF parity precision {case_config.precision!r}")
     if case_config.num_steps != 1:
         raise ValueError("HF parity currently requires num_steps=1")
 
@@ -357,7 +429,8 @@ def run_hf_parity(
         coverage=coverage,
     )
     with provider_topology_env(ORACLE_TOPOLOGY):
-        run_hf_parity_subprocess(request, output_dir)
+        runner = _run_hf_parity_in_process if in_process else run_hf_parity_subprocess
+        runner(request, output_dir)
     report = HfParityReport.model_validate(_read_json(report_path))
     assert_hf_parity_pass(report, report_path=report_path)
     _prune_case_artifacts(Path(case_artifacts.case_dir))
@@ -371,7 +444,7 @@ def build_hf_parity_report(
     loss_summary: dict[str, float],
     grads_rows: list[HfParityMetricRow],
 ) -> HfParityReport:
-    phase_pass_fns = _hf_parity_phase_pass_fns()
+    phase_pass_fns = _hf_parity_phase_pass_fns_for_case(request.case_config)
     rows = [
         _build_metric_row(
             phase="outputs",

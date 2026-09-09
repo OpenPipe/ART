@@ -1,23 +1,31 @@
 from __future__ import annotations
 
-from collections.abc import Sequence
-from typing import Any
+from collections.abc import Callable, Sequence
+from typing import Any, cast
 
 from megatron.core import parallel_state as ps
 from pydantic import BaseModel, ConfigDict
 import torch
 
 from art.loss import LossInputs, shift_tensor
-from art.megatron.context_parallel.runtime import prepare_cp_micro
+from art.megatron.context_parallel.runtime import (
+    context_parallel_rank_model_token_counts,
+    prepare_cp_micro,
+    preplan_megatron_context_parallel_state,
+)
 from art.megatron.context_parallel.types import (
     ContextParallelConfig,
     CpBlockMaskVariant,
     DispatchedPackedTensors,
     ParallelTopology,
     PreparedMegatronBatch,
+    TrainingMicrobatchWorkload,
+    estimate_owned_token_ms,
 )
 from art.megatron.flex_attn.compiled import flash_sparse_block_size_for_head_dim
-from art.megatron.shared_prefix_state import create_shared_prefix_state
+from art.megatron.prefix_tree import parse_prefix_tree
+from art.megatron.prefix_tree_state import create_prefix_tree_state
+from art.megatron.selective_lm_head import LmHeadTokenSelection
 from art.megatron.training.trace import (
     packed_sequence_token_uids,
     sft_sequence_token_uids,
@@ -31,6 +39,74 @@ class CpBatchLookaheadState(BaseModel):
     pending_prepared_micro: PreparedMegatronBatch | None = None
 
 
+class CpBatchPreplanner(BaseModel):
+    """One trainer rank's immutable CPU planning context."""
+
+    model_config = ConfigDict(arbitrary_types_allowed=True, frozen=True)
+
+    topology: ParallelTopology
+    config: ContextParallelConfig
+    cp_rank: int
+    build_gdn_execution_spec: bool
+    gdn_planner_config: Any | None = None
+
+    @classmethod
+    def from_runtime(
+        cls, runtime: Any, *, device: torch.device
+    ) -> "CpBatchPreplanner | None":
+        from art.megatron.train import _infer_parallel_topology
+
+        topology = _infer_parallel_topology(runtime.model)
+        if int(topology.cp) <= 1:
+            return None
+        handler = runtime.model_support_handler
+        return cls(
+            topology=topology,
+            config=_context_parallel_config_for_provider(
+                runtime.provider, device, handler
+            ),
+            cp_rank=int(ps.get_context_parallel_rank()),
+            build_gdn_execution_spec=bool(
+                getattr(handler, "build_gdn_execution_spec", False)
+            ),
+            gdn_planner_config=_gdn_planner_config_for_provider(
+                runtime.provider, handler
+            ),
+        )
+
+    def preplan(
+        self,
+        packed_tensors: PackedTensors,
+        *,
+        global_grad_accumulation_sequences: int | None,
+    ) -> int:
+        num_sequences, sequence_length = map(int, packed_tensors["tokens"].shape)
+        accumulation = resolve_global_grad_accumulation_sequences(
+            global_grad_accumulation_sequences
+        )
+        sample_indices = {
+            0 if index is None else index
+            for step_index in range((num_sequences + accumulation - 1) // accumulation)
+            for index in build_micro_sample_indices(
+                step_index,
+                num_sequences,
+                accumulation,
+            )
+        }
+        for index in sorted(sample_indices):
+            preplan_megatron_context_parallel_state(
+                group_ids=packed_tensors["group_ids"][index : index + 1],
+                parent_ids=packed_tensors["parent_ids"][index : index + 1],
+                original_seq_len=sequence_length,
+                topology=self.topology,
+                config=self.config,
+                cp_rank=self.cp_rank,
+                build_gdn_execution_spec=self.build_gdn_execution_spec,
+                gdn_planner_config=self.gdn_planner_config,
+            )
+        return len(sample_indices)
+
+
 class PreparedRLMicroInputs(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
@@ -40,8 +116,10 @@ class PreparedRLMicroInputs(BaseModel):
     attention_state: Any
     packed_seq_params: Any | None = None
     loss_inputs: LossInputs | DispatchedPackedTensors
+    lm_head_selection: LmHeadTokenSelection
     ref_logprobs: torch.Tensor | None = None
     local_token_uids: torch.Tensor | None = None
+    workload: TrainingMicrobatchWorkload
 
 
 class PreparedSFTMicroInputs(BaseModel):
@@ -51,9 +129,24 @@ class PreparedSFTMicroInputs(BaseModel):
     position_ids: torch.Tensor
     labels: torch.Tensor
     loss_mask: torch.Tensor
+    lm_head_selection: LmHeadTokenSelection
     attention_state: Any
     packed_seq_params: Any | None = None
     local_token_uids: torch.Tensor | None = None
+    workload: TrainingMicrobatchWorkload
+
+
+def _map_packed_tensors(
+    inputs: PackedTensors,
+    transform: Callable[[torch.Tensor], torch.Tensor],
+) -> PackedTensors:
+    return cast(
+        PackedTensors,
+        {
+            key: transform(value) if isinstance(value, torch.Tensor) else value
+            for key, value in inputs.items()
+        },
+    )
 
 
 @torch.no_grad()
@@ -65,28 +158,20 @@ def select_indexed_inputs(packed_tensors: PackedTensors, index: int) -> PackedTe
             return selected.clone()
         return selected
 
-    return PackedTensors(  # type: ignore[call-arg]
-        **{
-            key: selected_tensor(value)
-            for key, value in packed_tensors.items()
-            if isinstance(value, torch.Tensor)
-        },
-        pixel_values=[None],
-        image_grid_thw=[None],
-    )
+    selected = _map_packed_tensors(packed_tensors, selected_tensor)
+    selected["moe_routing_replay"] = None
+    selected["pixel_values"] = [None]
+    selected["image_grid_thw"] = [None]
+    return selected
 
 
 @torch.no_grad()
 def _clone_packed_tensors(inputs: PackedTensors) -> PackedTensors:
-    return PackedTensors(  # type: ignore[call-arg]
-        **{
-            key: value.clone()
-            for key, value in inputs.items()
-            if isinstance(value, torch.Tensor)
-        },
-        pixel_values=[None],
-        image_grid_thw=[None],
-    )
+    cloned = _map_packed_tensors(inputs, torch.Tensor.clone)
+    cloned["moe_routing_replay"] = None
+    cloned["pixel_values"] = [None]
+    cloned["image_grid_thw"] = [None]
+    return cloned
 
 
 @torch.no_grad()
@@ -148,6 +233,21 @@ def build_micro_sample_indices(
     global_grad_accumulation_sequences: int | None,
 ) -> list[int | None]:
     dp_rank = ps.get_data_parallel_rank()
+    return [
+        indices[dp_rank]
+        for indices in build_micro_sample_indices_by_dp_rank(
+            step_index=step_index,
+            num_sequences=num_sequences,
+            global_grad_accumulation_sequences=global_grad_accumulation_sequences,
+        )
+    ]
+
+
+def build_micro_sample_indices_by_dp_rank(
+    step_index: int,
+    num_sequences: int,
+    global_grad_accumulation_sequences: int | None,
+) -> list[list[int | None]]:
     resolved_global_grad_accumulation_sequences = (
         resolve_global_grad_accumulation_sequences(
             global_grad_accumulation_sequences=global_grad_accumulation_sequences
@@ -165,8 +265,109 @@ def build_micro_sample_indices(
             global_sample_index if global_sample_index < num_sequences else None
         )
     return [
-        global_step_indices[offset * dp_world_size + dp_rank]
+        global_step_indices[offset * dp_world_size : (offset + 1) * dp_world_size]
         for offset in range(local_grad_accumulation_sequences)
+    ]
+
+
+def build_rl_hybridep_token_counts(
+    *,
+    packed_tensors: PackedTensors,
+    step_index: int,
+    num_sequences: int,
+    global_grad_accumulation_sequences: int | None,
+    topology: ParallelTopology,
+    provider: Any,
+    model_support_handler: Any,
+) -> list[int]:
+    sample_rows = build_micro_sample_indices_by_dp_rank(
+        step_index=step_index,
+        num_sequences=num_sequences,
+        global_grad_accumulation_sequences=global_grad_accumulation_sequences,
+    )
+    sequence_length = int(packed_tensors["tokens"].shape[1])
+    if int(topology.cp) <= 1:
+        return [sequence_length for _ in sample_rows]
+
+    config = _context_parallel_config_for_provider(
+        provider,
+        torch.device("cuda", torch.cuda.current_device()),
+        model_support_handler,
+    )
+    build_gdn = bool(getattr(model_support_handler, "build_gdn_execution_spec", False))
+    gdn_planner_config = _gdn_planner_config_for_provider(
+        provider, model_support_handler
+    )
+
+    def rank_counts(sample_index: int | None) -> tuple[int, ...]:
+        index = 0 if sample_index is None else sample_index
+        return context_parallel_rank_model_token_counts(
+            group_ids=packed_tensors["group_ids"][index : index + 1],
+            parent_ids=packed_tensors["parent_ids"][index : index + 1],
+            topology=topology,
+            config=config,
+            original_seq_len=sequence_length,
+            build_gdn_execution_spec=build_gdn,
+            gdn_planner_config=gdn_planner_config,
+        )
+
+    return [
+        max(count for sample_index in indices for count in rank_counts(sample_index))
+        for indices in sample_rows
+    ]
+
+
+def build_sft_hybridep_token_counts(
+    *,
+    trajectory_tensors: list[dict[str, torch.Tensor]],
+    step_index: int,
+    global_grad_accumulation_sequences: int | None,
+    topology: ParallelTopology,
+    provider: Any,
+    model_support_handler: Any,
+) -> list[int]:
+    sample_rows = build_micro_sample_indices_by_dp_rank(
+        step_index=step_index,
+        num_sequences=len(trajectory_tensors),
+        global_grad_accumulation_sequences=global_grad_accumulation_sequences,
+    )
+
+    def sample(sample_index: int | None) -> dict[str, torch.Tensor]:
+        return trajectory_tensors[0 if sample_index is None else sample_index]
+
+    if int(topology.cp) <= 1:
+        return [
+            max(int(sample(index)["input_ids"].numel()) for index in indices)
+            for indices in sample_rows
+        ]
+
+    config = _context_parallel_config_for_provider(
+        provider,
+        torch.device("cuda", torch.cuda.current_device()),
+        model_support_handler,
+    )
+    build_gdn = bool(getattr(model_support_handler, "build_gdn_execution_spec", False))
+    gdn_planner_config = _gdn_planner_config_for_provider(
+        provider, model_support_handler
+    )
+
+    def rank_counts(sample_index: int | None) -> tuple[int, ...]:
+        sparse = _sft_inputs_to_sparse_packed_tensors(
+            sample(sample_index), device=torch.device("cpu")
+        )
+        return context_parallel_rank_model_token_counts(
+            group_ids=sparse["group_ids"],
+            parent_ids=sparse["parent_ids"],
+            topology=topology,
+            config=config,
+            original_seq_len=int(sparse["tokens"].shape[1]),
+            build_gdn_execution_spec=build_gdn,
+            gdn_planner_config=gdn_planner_config,
+        )
+
+    return [
+        max(count for sample_index in indices for count in rank_counts(sample_index))
+        for indices in sample_rows
     ]
 
 
@@ -225,9 +426,7 @@ def _select_next_step_first_micro(
 
 
 def _move_inputs_to_device(inputs: PackedTensors, device: torch.device) -> None:
-    for key, value in inputs.items():
-        if isinstance(value, torch.Tensor):
-            inputs[key] = value.to(device)  # type: ignore[index]
+    inputs.update(_map_packed_tensors(inputs, lambda tensor: tensor.to(device)))
 
 
 def _count_trainable_tokens(inputs: LossInputs | DispatchedPackedTensors) -> float:
@@ -240,7 +439,7 @@ def _local_trainable_token_count_tensor(
     device: torch.device,
 ) -> torch.Tensor:
     local_token_total = sum(_count_trainable_tokens(micro) for micro in micro_inputs)
-    return torch.tensor([local_token_total], device=device, dtype=torch.float32)
+    return torch.tensor(local_token_total, device=device, dtype=torch.int)
 
 
 def _art_flex_sliding_windows(provider: Any) -> tuple[int, ...]:
@@ -293,19 +492,61 @@ def _art_flex_cp_block_mask_variants(
     return tuple(variants)
 
 
+def _owned_token_ms_for_provider(provider: Any) -> float:
+    """The CP planner's per-owned-token compute cost from the model geometry."""
+
+    hidden = getattr(provider, "hidden_size", None)
+    ffn = getattr(provider, "ffn_hidden_size", None)
+    if not hidden or not ffn:
+        return 0.0
+    return estimate_owned_token_ms(
+        hidden_size=int(hidden),
+        ffn_hidden_size=int(ffn),
+        moe_topk=int(getattr(provider, "moe_router_topk", 0) or 0)
+        if getattr(provider, "num_moe_experts", None)
+        else 0,
+        moe_ffn_hidden_size=int(getattr(provider, "moe_ffn_hidden_size", 0) or 0),
+        moe_shared_expert_ffn=int(
+            getattr(provider, "moe_shared_expert_intermediate_size", 0) or 0
+        ),
+        tensor_parallel_size=int(
+            getattr(provider, "tensor_model_parallel_size", 1) or 1
+        ),
+        expert_parallel_size=int(
+            getattr(provider, "expert_model_parallel_size", 1) or 1
+        ),
+        # Megatron defaults the expert tensor-parallel size to the attention one.
+        expert_tensor_parallel_size=int(
+            getattr(provider, "expert_tensor_parallel_size", None)
+            or getattr(provider, "tensor_model_parallel_size", 1)
+            or 1
+        ),
+    )
+
+
 def _context_parallel_config_for_provider(
     provider: Any,
     device: torch.device,
+    model_support_handler: Any,
 ) -> ContextParallelConfig:
     head_dim = getattr(provider, "kv_channels", None)
     if head_dim is None:
-        return ContextParallelConfig()
+        return ContextParallelConfig(
+            workload_profile=model_support_handler.context_parallel_workload_profile(
+                provider
+            ),
+            planner_owned_token_ms=_owned_token_ms_for_provider(provider),
+        )
     return ContextParallelConfig(
         attention_sparse_block_size=flash_sparse_block_size_for_head_dim(
             head_dim=int(head_dim),
             head_dim_v=int(head_dim),
             device=device,
-        )
+        ),
+        workload_profile=model_support_handler.context_parallel_workload_profile(
+            provider
+        ),
+        planner_owned_token_ms=_owned_token_ms_for_provider(provider),
     )
 
 
@@ -313,6 +554,8 @@ def _causal_attention_state(
     seq_len: int,
     device: torch.device,
     *,
+    provider: Any,
+    model_support_handler: Any,
     sliding_windows: tuple[int, ...] = (),
     build_gdn_execution_spec: bool,
     attention_head_dim: int | None = None,
@@ -320,16 +563,31 @@ def _causal_attention_state(
 ) -> Any:
     group_ids = torch.zeros((1, seq_len), dtype=torch.int64, device="cpu")
     parent_ids = torch.zeros_like(group_ids)
-    return create_shared_prefix_state(
+    return create_prefix_tree_state(
         group_ids=group_ids,
         parent_ids=parent_ids,
         target_device=device,
         input_pos=torch.arange(seq_len, dtype=torch.int64).unsqueeze(0),
         sliding_windows=sliding_windows,
         build_gdn_execution_spec=build_gdn_execution_spec,
+        model_support_handler=model_support_handler,
         attention_head_dim=attention_head_dim,
         attention_value_head_dim=attention_value_head_dim,
+        gdn_planner_config=_gdn_planner_config_for_provider(
+            provider,
+            model_support_handler,
+        ),
     )
+
+
+def _gdn_planner_config_for_provider(
+    provider: Any, model_support_handler: Any
+) -> Any | None:
+    if not bool(getattr(model_support_handler, "build_gdn_execution_spec", False)):
+        return None
+    from art.megatron.gdn.gdn_prefix_tree import GdnPlannerConfig
+
+    return GdnPlannerConfig.from_provider(provider)
 
 
 def _next_micro_lookahead(
@@ -351,7 +609,7 @@ def _prepare_dense_rl_micro(
     model_support_handler: Any,
     ref_logprobs: torch.Tensor | None,
 ) -> PreparedRLMicroInputs:
-    attention_state = create_shared_prefix_state(
+    attention_state = create_prefix_tree_state(
         group_ids=micro["group_ids"],
         parent_ids=micro["parent_ids"],
         target_device=device,
@@ -360,10 +618,14 @@ def _prepare_dense_rl_micro(
         build_gdn_execution_spec=bool(
             getattr(model_support_handler, "build_gdn_execution_spec", False)
         ),
+        model_support_handler=model_support_handler,
         attention_head_dim=getattr(provider, "kv_channels", None),
         attention_value_head_dim=getattr(provider, "kv_channels", None),
+        gdn_planner_config=_gdn_planner_config_for_provider(
+            provider,
+            model_support_handler,
+        ),
     )
-    _move_inputs_to_device(micro, device)
     shifted_labels = shift_tensor(micro["tokens"], -100)
     shifted_assistant_mask = shift_tensor(micro["assistant_mask"], False)
     shifted_labels = torch.where(
@@ -371,14 +633,33 @@ def _prepare_dense_rl_micro(
         shifted_labels,
         torch.full_like(shifted_labels, -100),
     )
+    lm_head_selection = LmHeadTokenSelection.from_labels(
+        shifted_labels,
+        target_device=device,
+    )
+    workload = TrainingMicrobatchWorkload(
+        logical_nonpadding_tokens=sum(
+            row.valid_tokens
+            for row in parse_prefix_tree(
+                group_ids=micro["group_ids"], parent_ids=micro["parent_ids"]
+            )
+        ),
+        loss_bearing_tokens=int(shifted_assistant_mask.sum().item()),
+        executed_token_equivalents=int(micro["tokens"].numel()),
+        nominal_schedule_capacity_tokens=int(micro["tokens"].numel()),
+    )
+    shifted_labels = shifted_labels.to(device)
+    _move_inputs_to_device(micro, device)
     return PreparedRLMicroInputs(
         model_tokens=micro["tokens"],
         model_input_pos=micro["input_pos"],
         model_labels=shifted_labels,
         attention_state=attention_state,
         loss_inputs=LossInputs(inputs=micro),
+        lm_head_selection=lm_head_selection,
         ref_logprobs=ref_logprobs,
         local_token_uids=packed_sequence_token_uids(micro, device=device),
+        workload=workload,
     )
 
 
@@ -401,16 +682,25 @@ def _prepare_rl_cp_micro_full(
     return prepare_cp_micro(
         micro=micro,
         topology=topology,
-        config=_context_parallel_config_for_provider(provider, device),
+        config=_context_parallel_config_for_provider(
+            provider, device, model_support_handler
+        ),
         cp_group=ps.get_context_parallel_group(check_initialized=False),
         cp_rank=ps.get_context_parallel_rank(),
         build_gdn_execution_spec=bool(
             getattr(model_support_handler, "build_gdn_execution_spec", False)
         ),
+        gdn_planner_config=_gdn_planner_config_for_provider(
+            provider,
+            model_support_handler,
+        ),
         trace_token_uids=trace_token_uids,
         block_mask_variants=_art_flex_cp_block_mask_variants(provider, device),
         target_device=device,
         ref_logprobs=ref_logprobs,
+        model_support_handler=model_support_handler,
+        attention_head_dim=getattr(provider, "kv_channels", None),
+        attention_value_head_dim=getattr(provider, "kv_channels", None),
     )
 
 
@@ -426,32 +716,13 @@ def _prepared_rl_micro_from_cp_batch(
         attention_state=prepared.attention_state,
         packed_seq_params=prepared.packed_seq_params,
         loss_inputs=prepared.tensors,
+        lm_head_selection=prepared.tensors.lm_head_selection,
         ref_logprobs=(
             prepared.tensors.ref_logprobs if ref_logprobs is not None else None
         ),
         local_token_uids=prepared.tensors.token_uids,
+        workload=prepared.workload,
     )
-
-
-def _empty_new_logprobs_from_logits(
-    logits: torch.Tensor, labels: torch.Tensor
-) -> torch.Tensor:
-    if int(labels.numel()) != 0:
-        raise ValueError("empty-logprob path requires empty local labels")
-    if logits.ndim < 3 or int(logits.shape[-1]) == 0:
-        raise ValueError(
-            f"expected empty local logits [B, S, V], got {tuple(logits.shape)}"
-        )
-    candidate = logits[..., 0]
-    if tuple(candidate.shape) == tuple(labels.shape):
-        return candidate
-    candidate = candidate.transpose(0, 1).contiguous()
-    if tuple(candidate.shape) != tuple(labels.shape):
-        raise ValueError(
-            "empty local logits shape must match labels after removing vocab dim, "
-            f"got logits={tuple(logits.shape)} labels={tuple(labels.shape)}"
-        )
-    return candidate
 
 
 def _prepare_current_rl_micro(
@@ -532,7 +803,7 @@ def _local_trainable_sft_token_count_tensor(
     local_token_total = sum(
         _count_sft_trainable_tokens(micro) for micro in micro_inputs
     )
-    return torch.tensor([local_token_total], device=device, dtype=torch.float32)
+    return torch.tensor(local_token_total, device=device, dtype=torch.int)
 
 
 def _prepare_dense_sft_micro(
@@ -545,15 +816,28 @@ def _prepare_dense_sft_micro(
     attention_mask = micro["attention_mask"].reshape(-1)
     seq_len = max(int(attention_mask.sum().item()), 1)
     input_ids = micro["input_ids"].reshape(-1)[:seq_len].unsqueeze(0).to(device)
-    labels = micro["labels"].reshape(-1)[:seq_len].unsqueeze(0).to(device)
+    labels = micro["labels"].reshape(-1)[:seq_len].unsqueeze(0)
     position_ids = torch.arange(seq_len, device=device).unsqueeze(0)
     shifted_labels = shift_tensor(labels, -100)
     loss_mask = shifted_labels != -100
+    workload = TrainingMicrobatchWorkload(
+        logical_nonpadding_tokens=int(attention_mask.sum().item()),
+        loss_bearing_tokens=int(loss_mask.sum().item()),
+        executed_token_equivalents=seq_len,
+        nominal_schedule_capacity_tokens=int(micro["input_ids"].numel()),
+    )
+    lm_head_selection = LmHeadTokenSelection.from_labels(
+        shifted_labels,
+        target_device=device,
+    )
+    shifted_labels = shifted_labels.to(device)
+    loss_mask = loss_mask.to(device)
     return PreparedSFTMicroInputs(
         input_ids=input_ids,
         position_ids=position_ids,
         labels=shifted_labels,
         loss_mask=loss_mask,
+        lm_head_selection=lm_head_selection,
         attention_state=_causal_attention_state(
             seq_len,
             device,
@@ -561,12 +845,15 @@ def _prepare_dense_sft_micro(
             build_gdn_execution_spec=bool(
                 getattr(model_support_handler, "build_gdn_execution_spec", False)
             ),
+            provider=provider,
+            model_support_handler=model_support_handler,
             attention_head_dim=getattr(provider, "kv_channels", None),
             attention_value_head_dim=getattr(provider, "kv_channels", None),
         ),
         local_token_uids=sft_sequence_token_uids(micro, device=device)[
             :, : int(input_ids.shape[1])
         ],
+        workload=workload,
     )
 
 
@@ -622,7 +909,7 @@ def _prepare_sft_cp_micro_full(
 
     The synthetic sparse-packed metadata is constructed on CPU and only the
     rank-local dispatched tensors are moved to `device`. Constructing it on CUDA
-    would make shared-prefix planning read metadata back from the GPU.
+    would make prefix-tree planning read metadata back from the GPU.
     """
     sparse_micro = _sft_inputs_to_sparse_packed_tensors(
         micro,
@@ -631,15 +918,24 @@ def _prepare_sft_cp_micro_full(
     return prepare_cp_micro(
         micro=sparse_micro,
         topology=topology,
-        config=_context_parallel_config_for_provider(provider, device),
+        config=_context_parallel_config_for_provider(
+            provider, device, model_support_handler
+        ),
         cp_group=ps.get_context_parallel_group(check_initialized=False),
         cp_rank=ps.get_context_parallel_rank(),
         build_gdn_execution_spec=bool(
             getattr(model_support_handler, "build_gdn_execution_spec", False)
         ),
+        gdn_planner_config=_gdn_planner_config_for_provider(
+            provider,
+            model_support_handler,
+        ),
         trace_token_uids=trace_token_uids,
         block_mask_variants=_art_flex_cp_block_mask_variants(provider, device),
         target_device=device,
+        model_support_handler=model_support_handler,
+        attention_head_dim=getattr(provider, "kv_channels", None),
+        attention_value_head_dim=getattr(provider, "kv_channels", None),
     )
 
 
@@ -652,9 +948,11 @@ def _prepared_sft_micro_from_cp_batch(
         position_ids=prepared.tensors.input_pos,
         labels=prepared.tensors.labels.masked_fill(~loss_mask, -100),
         loss_mask=loss_mask,
+        lm_head_selection=prepared.tensors.lm_head_selection,
         attention_state=prepared.attention_state,
         packed_seq_params=prepared.packed_seq_params,
         local_token_uids=prepared.tensors.token_uids,
+        workload=prepared.workload,
     )
 
 

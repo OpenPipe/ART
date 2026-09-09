@@ -1,15 +1,28 @@
 from collections.abc import Iterable, Sequence
-import re
 from typing import Any, NamedTuple
 
+from pydantic import BaseModel, ConfigDict
 import torch
 
-from art.megatron.lora import LoRAPublishPlanner, LoraShardMeta
+from art.megatron.lora import (
+    LoRA,
+    LoraShardMeta,
+    LoRASlotRef,
+    _block_for_key,
+    _dtype_name,
+)
+from art.megatron.lora import (
+    _distributed_initialized as _distributed_ready,
+)
 from art.megatron.model_support.lora_disk import save_vllm_lora_tensors
 from art.megatron.model_support.spec import ExpertPackedLoraGroup, ExpertPackedLoraSlot
+from art.megatron.tensor_snapshot import (
+    PendingCpuSnapshot,
+    PinnedCpuSnapshotBuilder,
+    PinnedCpuSnapshotStager,
+)
 from art.megatron.training.model_chunks import ModelChunks
-
-_LAYER_BLOCK_RE = re.compile(r"^(?P<block>.*\.layers\.\d+)\.")
+from art.utils.safetensors import PreparedSafetensors
 
 
 class PackedExpertShardMeta(NamedTuple):
@@ -30,63 +43,24 @@ class PackedExpertShardMeta(NamedTuple):
         return total
 
 
-class _PinnedCpuStager:
-    def __init__(self) -> None:
-        self._events: list[torch.cuda.Event] = []
-        self._stream = torch.cuda.Stream() if torch.cuda.is_available() else None
+class LoraSnapshot(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True, frozen=True)
 
-    def stage(self, tensor: torch.Tensor) -> torch.Tensor:
-        source = tensor.detach()
-        if self._stream is None or not source.is_cuda:
-            return source.cpu()
-
-        source = source.contiguous()
-        target = torch.empty_like(source, device="cpu", pin_memory=True)
-        source_stream = torch.cuda.current_stream(source.device)
-        self._stream.wait_stream(source_stream)
-        with torch.cuda.stream(self._stream):
-            target.copy_(source, non_blocking=True)
-            source.record_stream(self._stream)
-            event = torch.cuda.Event()
-            event.record(self._stream)
-        self._events.append(event)
-        return target
-
-    def finish(self) -> None:
-        for event in self._events:
-            event.synchronize()
-        self._events.clear()
+    tensors: dict[str, torch.Tensor]
+    adapter_config: dict[str, Any]
 
 
-def iter_lora_modules(model_chunks: ModelChunks) -> Iterable[Any]:
+def iter_lora_modules(model_chunks: ModelChunks) -> Iterable[LoRA]:
     for chunk in model_chunks:
         for module in chunk.modules():
-            yield module
-
-
-def _dtype_name(dtype: torch.dtype) -> str:
-    return str(dtype).removeprefix("torch.")
+            if isinstance(module, LoRA):
+                yield module
 
 
 def _dtype_from_name(name: str) -> torch.dtype:
-    dtype = getattr(torch, name, None)
-    if not isinstance(dtype, torch.dtype):
-        raise RuntimeError(f"Unsupported LoRA tensor dtype={name!r}")
-    return dtype
-
-
-def _block_for_key(key: str) -> str:
-    match = _LAYER_BLOCK_RE.match(key)
-    if match is not None:
-        return match.group("block")
-    return "__global__"
-
-
-def _expert_prefix_projection(adapter_model_prefix: str) -> tuple[str, str] | None:
-    group_prefix, separator, projection = adapter_model_prefix.partition(".{expert}.")
-    if not separator:
-        return None
-    return group_prefix, projection
+    if isinstance(dtype := getattr(torch, name, None), torch.dtype):
+        return dtype
+    raise RuntimeError(f"Unsupported LoRA tensor dtype={name!r}")
 
 
 def _packed_expert_slot(
@@ -94,10 +68,9 @@ def _packed_expert_slot(
     suffix: str,
     groups: Sequence[ExpertPackedLoraGroup],
 ) -> tuple[str, ExpertPackedLoraSlot] | None:
-    parts = _expert_prefix_projection(adapter_model_prefix)
-    if parts is None:
+    group_prefix, separator, projection = adapter_model_prefix.partition(".{expert}.")
+    if not separator:
         return None
-    group_prefix, projection = parts
     lora_name = suffix.removesuffix(".weight")
     for group in groups:
         if not group_prefix.endswith(group.art_group_suffix):
@@ -109,47 +82,36 @@ def _packed_expert_slot(
 
 
 def _uses_packed_expert_publish(
-    module: Any,
+    module: LoRA,
     groups: Sequence[ExpertPackedLoraGroup],
+    slot_ref: LoRASlotRef | None = None,
 ) -> bool:
-    if int(getattr(module, "num_local_experts", 1)) <= 1:
+    if module.num_local_experts <= 1:
         return False
-    if not hasattr(module, "_lora_params"):
-        return False
-    adapter_model_prefix = getattr(module, "adapter_model_prefix", "")
-    if not isinstance(adapter_model_prefix, str):
-        return False
-    lora_suffixes = [
-        suffix
-        for suffix, _param in module._lora_params()  # type: ignore[attr-defined]
-    ]
-    return bool(lora_suffixes) and all(
-        _packed_expert_slot(adapter_model_prefix, suffix, groups) is not None
-        for suffix in lora_suffixes
+    params = tuple(module._lora_params(slot_ref))
+    return bool(params) and all(
+        _packed_expert_slot(module.adapter_model_prefix, suffix, groups) is not None
+        for suffix, _param in params
     )
 
 
 def collect_local_lora_entries(
     model_chunks: ModelChunks,
-    adapter_model: dict[str, torch.Tensor],
+    adapter_dtypes: dict[str, torch.dtype],
     *,
     owner_rank: int,
     packed_expert_groups: Sequence[ExpertPackedLoraGroup] = (),
+    slot_ref: LoRASlotRef | None = None,
 ) -> tuple[dict[str, torch.Tensor], list[LoraShardMeta]]:
     local_tensors: dict[str, torch.Tensor] = {}
     local_manifest: dict[str, dict[str, Any]] = {}
     for module in iter_lora_modules(model_chunks):
-        if _uses_packed_expert_publish(module, packed_expert_groups):
+        if _uses_packed_expert_publish(module, packed_expert_groups, slot_ref):
             continue
-        if hasattr(module, "sharded_lora_state_dict"):
-            module_state: dict[str, torch.Tensor] = module.sharded_lora_state_dict()  # type: ignore[attr-defined]
-            for key, value in module_state.items():
-                target_dtype = (
-                    adapter_model[key].dtype if key in adapter_model else value.dtype
-                )
-                local_tensors[key] = value.to(target_dtype).contiguous()
-        if hasattr(module, "sharded_lora_manifest"):
-            local_manifest.update(module.sharded_lora_manifest())  # type: ignore[attr-defined]
+        for key, value in module.sharded_lora_state_dict(slot_ref).items():
+            target_dtype = adapter_dtypes[key] if key in adapter_dtypes else value.dtype
+            local_tensors[key] = value.to(target_dtype).contiguous()
+        local_manifest.update(module.sharded_lora_manifest(slot_ref))
 
     if set(local_tensors) != set(local_manifest):
         raise RuntimeError(
@@ -171,49 +133,40 @@ def collect_local_lora_entries(
     return local_tensors, metadata
 
 
-def _target_dtype_for_lora_param(
-    module: Any,
-    adapter_model: dict[str, torch.Tensor],
-    suffix: str,
-    fallback: torch.dtype,
-) -> torch.dtype:
-    keys = module._expected_weight_keys(suffix.removesuffix(".weight"))  # type: ignore[attr-defined]
-    return (
-        adapter_model[keys[0]].dtype if keys and keys[0] in adapter_model else fallback
-    )
-
-
 def collect_local_packed_expert_entries(
     model_chunks: ModelChunks,
-    adapter_model: dict[str, torch.Tensor],
+    adapter_dtypes: dict[str, torch.dtype],
     *,
     owner_rank: int,
     packed_expert_groups: Sequence[ExpertPackedLoraGroup],
+    slot_ref: LoRASlotRef | None = None,
 ) -> tuple[dict[str, torch.Tensor], list[PackedExpertShardMeta]]:
     local_tensors: dict[str, torch.Tensor] = {}
     metadata: list[PackedExpertShardMeta] = []
     for module in iter_lora_modules(model_chunks):
-        if not _uses_packed_expert_publish(module, packed_expert_groups):
+        if not _uses_packed_expert_publish(module, packed_expert_groups, slot_ref):
             continue
-        adapter_model_prefix = module.adapter_model_prefix  # type: ignore[attr-defined]
-        expert_start = int(module._expert_offset)  # type: ignore[attr-defined]
-        expert_count = int(module.num_local_experts)  # type: ignore[attr-defined]
-        for suffix, param in module._lora_params():  # type: ignore[attr-defined]
+        expert_ids = tuple(expert for expert in module.expert_ids if expert is not None)
+        if not expert_ids:
+            continue
+        expert_start = expert_ids[0]
+        expert_count = len(expert_ids)
+        for suffix, param in module._lora_params(slot_ref):
             slot_match = _packed_expert_slot(
-                adapter_model_prefix,
+                module.adapter_model_prefix,
                 suffix,
                 packed_expert_groups,
             )
-            if slot_match is None or not module._should_export_parameter(param):  # type: ignore[attr-defined]
+            if slot_match is None or not module._should_export_parameter(param):
                 continue
             group_prefix, slot = slot_match
             key = f"{group_prefix}.{slot.output_suffix}"
-            tensor = param.data.transpose(1, 2).contiguous()
-            target_dtype = _target_dtype_for_lora_param(
-                module,
-                adapter_model,
-                suffix,
-                tensor.dtype,
+            tensor = param.data[:expert_count].transpose(1, 2).contiguous()
+            source_keys = module._expected_weight_keys(suffix.removesuffix(".weight"))
+            target_dtype = (
+                adapter_dtypes[source_keys[0]]
+                if source_keys and source_keys[0] in adapter_dtypes
+                else tensor.dtype
             )
             tensor = tensor.to(target_dtype).contiguous()
             if key in local_tensors:
@@ -225,93 +178,13 @@ def collect_local_packed_expert_entries(
                     owner_rank=owner_rank,
                     shape=tuple(int(dim) for dim in tensor.shape),
                     dtype_name=_dtype_name(tensor.dtype),
-                    manifest=module._manifest_for_param(param),  # type: ignore[attr-defined]
+                    manifest=module._manifest_for_param(param),
                     expert_start=expert_start,
                     expert_count=expert_count,
                     pack_layout=slot.pack_layout,
                 )
             )
     return local_tensors, metadata
-
-
-def _global_packed_expert_metadata(
-    planner: LoRAPublishPlanner,
-    adapter_model: dict[str, torch.Tensor],
-    packed_expert_groups: Sequence[ExpertPackedLoraGroup],
-) -> list[PackedExpertShardMeta]:
-    metadata: list[PackedExpertShardMeta] = []
-    for template in planner.templates:
-        if int(template.num_local_experts) <= 1:
-            continue
-        slot_match = _packed_expert_slot(
-            template.adapter_model_prefix,
-            template.suffix,
-            packed_expert_groups,
-        )
-        if slot_match is None:
-            continue
-        group_prefix, slot = slot_match
-        shard_ranks = range(template.shard_world_size) if template.sharded else (0,)
-        for ep_rank in range(planner._expert_model_world_size()):
-            expert_start = ep_rank * template.num_local_experts
-            expert_key = (
-                f"{template.adapter_model_prefix.format(expert=expert_start)}."
-                f"{template.suffix}"
-            )
-            for shard_rank in shard_ranks:
-                owner_rank = planner._expert_owner_rank(ep_rank, shard_rank)
-                per_expert_meta = planner._make_metadata(
-                    template,
-                    key=expert_key,
-                    owner_rank=owner_rank,
-                    shard_rank=shard_rank,
-                    adapter_model=adapter_model,
-                )
-                metadata.append(
-                    PackedExpertShardMeta(
-                        key=f"{group_prefix}.{slot.output_suffix}",
-                        owner_rank=owner_rank,
-                        shape=(template.num_local_experts, *per_expert_meta.shape),
-                        dtype_name=per_expert_meta.dtype_name,
-                        manifest=per_expert_meta.manifest,
-                        expert_start=expert_start,
-                        expert_count=template.num_local_experts,
-                        pack_layout=slot.pack_layout,
-                    )
-                )
-    return metadata
-
-
-def _global_regular_metadata(
-    planner: LoRAPublishPlanner,
-    adapter_model: dict[str, torch.Tensor],
-    packed_expert_groups: Sequence[ExpertPackedLoraGroup],
-) -> list[LoraShardMeta]:
-    if not packed_expert_groups:
-        return planner.global_metadata(adapter_model)
-    if _distributed_ready():
-        from megatron.core import parallel_state as ps
-
-        pp_world_size = ps.get_pipeline_model_parallel_world_size()
-        if pp_world_size != 1:
-            raise RuntimeError(
-                "LoRA publish planner requires pipeline_model_parallel_size=1; "
-                f"got {pp_world_size}. Rank-local modules cannot describe remote "
-                "pipeline stages without exchanging templates."
-            )
-    metadata: list[LoraShardMeta] = []
-    for template in planner.templates:
-        if (
-            _packed_expert_slot(
-                template.adapter_model_prefix,
-                template.suffix,
-                packed_expert_groups,
-            )
-            is not None
-        ):
-            continue
-        metadata.extend(planner._metadata_for_template(template, adapter_model))
-    return metadata
 
 
 def _merge_sharded_tensor(
@@ -350,70 +223,66 @@ def _merge_sharded_tensor(
     return torch.cat(tuple(ordered_shards), dim=axis).contiguous()
 
 
-def merge_sharded_adapter_entries(
-    entries_by_key: dict[str, list[tuple[dict[str, Any], torch.Tensor]]],
-) -> dict[str, torch.Tensor]:
-    adapter_model: dict[str, torch.Tensor] = {}
-    for key, key_entries in entries_by_key.items():
-        first_manifest = key_entries[0][0]
-        sharded = bool(first_manifest["sharded"])
-        shard_world_size = int(first_manifest["shard_world_size"])
-        for manifest_entry, _tensor in key_entries:
-            if bool(manifest_entry["sharded"]) != sharded:
-                raise RuntimeError(f"Inconsistent sharded flag for key={key}")
-            if int(manifest_entry["shard_world_size"]) != shard_world_size:
-                raise RuntimeError(f"Inconsistent shard world size for key={key}")
+def _merge_manifest_entries(
+    key: str,
+    key_entries: Sequence[tuple[dict[str, Any], torch.Tensor]],
+    *,
+    manifest: dict[str, Any] | None = None,
+) -> torch.Tensor:
+    first_manifest = key_entries[0][0]
+    sharded = bool(first_manifest["sharded"])
+    shard_world_size = int(first_manifest["shard_world_size"])
+    for entry_manifest, _tensor in key_entries:
+        if bool(entry_manifest["sharded"]) != sharded:
+            raise RuntimeError(f"Inconsistent sharded flag for key={key}")
+        if int(entry_manifest["shard_world_size"]) != shard_world_size:
+            raise RuntimeError(f"Inconsistent shard world size for key={key}")
 
-        if not sharded:
-            if len(key_entries) != 1:
-                raise RuntimeError(
-                    f"Replicated key={key} expected 1 shard, got {len(key_entries)}"
-                )
-            adapter_model[key] = key_entries[0][1]
-            continue
-
-        shard_rank_to_tensor: dict[int, torch.Tensor] = {}
-        for manifest_entry, shard_tensor in key_entries:
-            shard_rank = int(manifest_entry["shard_rank"])
-            if shard_rank in shard_rank_to_tensor:
-                raise RuntimeError(f"Duplicate shard_rank={shard_rank} for key={key}")
-            shard_rank_to_tensor[shard_rank] = shard_tensor
-
-        expected_shard_ranks = set(range(shard_world_size))
-        if set(shard_rank_to_tensor) != expected_shard_ranks:
+    if not sharded:
+        if len(key_entries) != 1:
             raise RuntimeError(
-                f"Shard rank coverage mismatch for key={key}: "
-                f"expected {sorted(expected_shard_ranks)}, got {sorted(shard_rank_to_tensor)}"
+                f"Replicated key={key} expected 1 shard, got {len(key_entries)}"
             )
+        return key_entries[0][1]
 
-        ordered_shards = [
-            shard_rank_to_tensor[shard_rank] for shard_rank in range(shard_world_size)
-        ]
-        adapter_model[key] = _merge_sharded_tensor(
-            key,
-            ordered_shards=ordered_shards,
-            manifest=first_manifest,
+    shard_rank_to_tensor: dict[int, torch.Tensor] = {}
+    for entry_manifest, shard_tensor in key_entries:
+        shard_rank = int(entry_manifest["shard_rank"])
+        if shard_rank in shard_rank_to_tensor:
+            raise RuntimeError(f"Duplicate shard_rank={shard_rank} for key={key}")
+        shard_rank_to_tensor[shard_rank] = shard_tensor
+
+    expected_shard_ranks = set(range(shard_world_size))
+    if set(shard_rank_to_tensor) != expected_shard_ranks:
+        raise RuntimeError(
+            f"Shard rank coverage mismatch for key={key}: "
+            f"expected {sorted(expected_shard_ranks)}, got {sorted(shard_rank_to_tensor)}"
         )
-    return adapter_model
-
-
-def _distributed_ready() -> bool:
-    is_initialized = getattr(torch.distributed, "is_initialized", None)
-    return (
-        torch.distributed.is_available()
-        and callable(is_initialized)
-        and bool(is_initialized())
+    return _merge_sharded_tensor(
+        key,
+        ordered_shards=[
+            shard_rank_to_tensor[shard_rank] for shard_rank in range(shard_world_size)
+        ],
+        manifest=first_manifest if manifest is None else manifest,
     )
 
 
+def merge_sharded_adapter_entries(
+    entries_by_key: dict[str, list[tuple[dict[str, Any], torch.Tensor]]],
+) -> dict[str, torch.Tensor]:
+    return {
+        key: _merge_manifest_entries(key, key_entries)
+        for key, key_entries in entries_by_key.items()
+    }
+
+
 def _rank_and_device() -> tuple[int, torch.device]:
-    if _distributed_ready():
-        rank = torch.distributed.get_rank()  # type: ignore[possibly-missing-attribute]
-    else:
-        rank = 0
-    if torch.cuda.is_available():
-        return rank, torch.device("cuda", torch.cuda.current_device())
-    return rank, torch.device("cpu")
+    return (
+        torch.distributed.get_rank() if _distributed_ready() else 0,  # type: ignore[possibly-missing-attribute]
+        torch.device("cuda", torch.cuda.current_device())
+        if torch.cuda.is_available()
+        else torch.device("cpu"),
+    )
 
 
 def _metadata_by_owner_dtype(
@@ -426,6 +295,37 @@ def _metadata_by_owner_dtype(
         key: sorted(group, key=lambda meta: meta.key)
         for key, group in sorted(grouped.items())
     }
+
+
+def _canonical_global_metadata(local_metadata: list[Any]) -> list[Any]:
+    """Gather stage-local manifests; select one canonical DP/CP replica per shard."""
+    if not _distributed_ready():
+        return local_metadata
+    world_size = torch.distributed.get_world_size()  # type: ignore[possibly-missing-attribute]
+    gathered: list[list[Any] | None] = [None] * world_size
+    torch.distributed.all_gather_object(gathered, local_metadata)  # type: ignore[possibly-missing-attribute]
+    canonical: dict[tuple[Any, ...], Any] = {}
+    for rank_entries in gathered:
+        if rank_entries is None:
+            raise RuntimeError("LoRA manifest gather returned a missing rank")
+        for meta in rank_entries:
+            manifest = meta.manifest
+            identity = (
+                meta.key,
+                int(manifest.get("shard_rank", 0)),
+                int(getattr(meta, "expert_start", -1)),
+            )
+            current = canonical.get(identity)
+            if current is None or meta.owner_rank < current.owner_rank:
+                canonical[identity] = meta
+    return sorted(
+        canonical.values(),
+        key=lambda meta: (
+            meta.key,
+            int(getattr(meta, "expert_start", -1)),
+            int(meta.manifest.get("shard_rank", 0)),
+        ),
+    )
 
 
 def _pack_metadata_tensors(
@@ -514,45 +414,10 @@ def _merge_packed_expert_block(
     key: str,
     key_entries: list[tuple[dict[str, Any], torch.Tensor]],
 ) -> torch.Tensor:
-    first_manifest = key_entries[0][0]
-    sharded = bool(first_manifest["sharded"])
-    shard_world_size = int(first_manifest["shard_world_size"])
-    if not sharded:
-        if len(key_entries) != 1:
-            raise RuntimeError(
-                f"Replicated packed key={key} expected 1 shard, got {len(key_entries)}"
-            )
-        return key_entries[0][1]
-
-    shard_rank_to_tensor: dict[int, torch.Tensor] = {}
-    for manifest_entry, shard_tensor in key_entries:
-        if bool(manifest_entry["sharded"]) != sharded:
-            raise RuntimeError(f"Inconsistent sharded flag for packed key={key}")
-        if int(manifest_entry["shard_world_size"]) != shard_world_size:
-            raise RuntimeError(f"Inconsistent shard world size for packed key={key}")
-        shard_rank = int(manifest_entry["shard_rank"])
-        if shard_rank in shard_rank_to_tensor:
-            raise RuntimeError(
-                f"Duplicate shard_rank={shard_rank} for packed key={key}"
-            )
-        shard_rank_to_tensor[shard_rank] = shard_tensor
-
-    expected_shard_ranks = set(range(shard_world_size))
-    if set(shard_rank_to_tensor) != expected_shard_ranks:
-        raise RuntimeError(
-            f"Shard rank coverage mismatch for packed key={key}: "
-            f"expected {sorted(expected_shard_ranks)}, got {sorted(shard_rank_to_tensor)}"
-        )
-
-    manifest = dict(first_manifest)
-    manifest["export_shard_dim"] = int(manifest["export_shard_dim"]) + 1
-    return _merge_sharded_tensor(
-        key,
-        ordered_shards=[
-            shard_rank_to_tensor[shard_rank] for shard_rank in range(shard_world_size)
-        ],
-        manifest=manifest,
-    )
+    manifest = dict(key_entries[0][0])
+    if bool(manifest["sharded"]):
+        manifest["export_shard_dim"] = int(manifest["export_shard_dim"]) + 1
+    return _merge_manifest_entries(key, key_entries, manifest=manifest)
 
 
 def _pack_merged_expert_blocks(
@@ -653,15 +518,56 @@ def merge_packed_expert_adapter_entries(
 
 def _stage_published_tensors(
     tensors: dict[str, torch.Tensor],
-    stager: _PinnedCpuStager,
+    stager: PinnedCpuSnapshotBuilder,
 ) -> dict[str, torch.Tensor]:
-    grouped: dict[tuple[str, int | None, str], list[tuple[str, torch.Tensor]]] = {}
+    aliases: dict[
+        tuple[str, int | None, torch.dtype, int], list[tuple[str, torch.Tensor]]
+    ] = {}
+    regular: list[tuple[str, torch.Tensor]] = []
     for key, tensor in tensors.items():
+        if not tensor.numel() or not tensor.is_contiguous():
+            regular.append((key, tensor))
+            continue
+        storage = tensor.untyped_storage()
+        aliases.setdefault(
+            (
+                tensor.device.type,
+                tensor.device.index,
+                tensor.dtype,
+                storage.data_ptr(),
+            ),
+            [],
+        ).append((key, tensor))
+
+    staged: dict[str, torch.Tensor] = {}
+    for group in aliases.values():
+        storage = group[0][1].untyped_storage()
+        if len(group) == 1 or storage.nbytes() > sum(
+            tensor.nbytes for _key, tensor in group
+        ):
+            regular.extend(group)
+            continue
+        representative = group[0][1]
+        flat = representative.new_empty(0).set_(
+            storage,
+            0,
+            (storage.nbytes() // representative.element_size(),),
+            (1,),
+        )
+        staged_flat = stager.stage(flat)
+        for key, tensor in group:
+            staged[key] = staged_flat.as_strided(
+                tensor.shape,
+                tensor.stride(),
+                tensor.storage_offset(),
+            )
+
+    grouped: dict[tuple[str, int | None, str], list[tuple[str, torch.Tensor]]] = {}
+    for key, tensor in regular:
         dtype_name = _dtype_name(tensor.dtype)
         group_key = (tensor.device.type, tensor.device.index, dtype_name)
         grouped.setdefault(group_key, []).append((key, tensor))
 
-    staged: dict[str, torch.Tensor] = {}
     for _group_key, group in sorted(grouped.items()):
         flat = torch.cat(
             [tensor.detach().contiguous().view(-1) for _key, tensor in sorted(group)]
@@ -679,7 +585,7 @@ def _stage_published_tensors(
     return staged
 
 
-def _save_rank0_vllm_lora(
+def _rank0_merged_lora_tensors(
     *,
     metadata: list[LoraShardMeta],
     tensors_by_owner_key: dict[tuple[int, str], torch.Tensor],
@@ -687,35 +593,7 @@ def _save_rank0_vllm_lora(
     packed_expert_tensors_by_owner_key: (
         dict[tuple[int, str], torch.Tensor] | None
     ) = None,
-    handler: Any,
-    adapter_config: dict[str, Any],
-    output_dir: str,
-) -> None:
-    vllm_tensors, published_config = _rank0_vllm_lora_tensors(
-        metadata=metadata,
-        tensors_by_owner_key=tensors_by_owner_key,
-        packed_expert_metadata=packed_expert_metadata,
-        packed_expert_tensors_by_owner_key=packed_expert_tensors_by_owner_key,
-        handler=handler,
-        adapter_config=adapter_config,
-    )
-    stager = _PinnedCpuStager()
-    published_tensors = _stage_published_tensors(vllm_tensors, stager)
-    stager.finish()
-    save_vllm_lora_tensors(output_dir, published_tensors, published_config)
-
-
-def _rank0_vllm_lora_tensors(
-    *,
-    metadata: list[LoraShardMeta],
-    tensors_by_owner_key: dict[tuple[int, str], torch.Tensor],
-    packed_expert_metadata: list[PackedExpertShardMeta] | None = None,
-    packed_expert_tensors_by_owner_key: (
-        dict[tuple[int, str], torch.Tensor] | None
-    ) = None,
-    handler: Any,
-    adapter_config: dict[str, Any],
-) -> tuple[dict[str, torch.Tensor], dict[str, Any]]:
+) -> dict[str, torch.Tensor]:
     merged_tensors = merge_sharded_adapter_entries(
         _entries_by_key(metadata, tensors_by_owner_key)
     )
@@ -730,21 +608,44 @@ def _rank0_vllm_lora_tensors(
             if key in merged_tensors:
                 raise RuntimeError(f"Duplicate LoRA tensor after packed publish: {key}")
             merged_tensors[key] = tensor
+    return merged_tensors
+
+
+def build_vllm_lora_tensors_from_model(
+    *,
+    model: ModelChunks,
+    adapter_dtypes: dict[str, torch.dtype],
+    handler: Any,
+    adapter_config: dict[str, Any],
+    rank: int,
+    world_size: int,
+    slot_ref: LoRASlotRef | None = None,
+) -> tuple[dict[str, torch.Tensor], dict[str, Any]] | None:
+    merged_tensors = _build_merged_lora_tensors_from_model(
+        model=model,
+        adapter_dtypes=adapter_dtypes,
+        handler=handler,
+        rank=rank,
+        world_size=world_size,
+        slot_ref=slot_ref,
+    )
+    if merged_tensors is None:
+        return None
     return handler.to_vllm_lora_tensors(
         merged_tensors,
         adapter_config=dict(adapter_config),
     )
 
 
-def build_vllm_lora_tensors_from_model(
+def _build_merged_lora_tensors_from_model(
     *,
     model: ModelChunks,
-    adapter_model: dict[str, torch.Tensor],
+    adapter_dtypes: dict[str, torch.dtype],
     handler: Any,
-    adapter_config: dict[str, Any],
     rank: int,
     world_size: int,
-) -> tuple[dict[str, torch.Tensor], dict[str, Any]] | None:
+    slot_ref: LoRASlotRef | None = None,
+) -> dict[str, torch.Tensor] | None:
     actual_rank, device = _rank_and_device()
     if _distributed_ready():
         actual_world_size = torch.distributed.get_world_size()  # type: ignore[possibly-missing-attribute]
@@ -761,32 +662,22 @@ def build_vllm_lora_tensors_from_model(
             )
         rank = 0
     packed_expert_groups = tuple(handler.expert_packed_lora_groups())
-    planner = LoRAPublishPlanner(model)
     local_tensors, local_metadata = collect_local_lora_entries(
         model,
-        adapter_model,
+        adapter_dtypes,
         owner_rank=rank,
         packed_expert_groups=packed_expert_groups,
+        slot_ref=slot_ref,
     )
     local_packed_tensors, local_packed_metadata = collect_local_packed_expert_entries(
         model,
-        adapter_model,
+        adapter_dtypes,
         owner_rank=rank,
         packed_expert_groups=packed_expert_groups,
+        slot_ref=slot_ref,
     )
-    all_packed_metadata = (
-        _global_packed_expert_metadata(planner, adapter_model, packed_expert_groups)
-        if rank == 0
-        else local_packed_metadata
-    )
-    if rank == 0:
-        all_metadata = _global_regular_metadata(
-            planner,
-            adapter_model,
-            packed_expert_groups if all_packed_metadata else (),
-        )
-    else:
-        all_metadata = local_metadata
+    all_packed_metadata = _canonical_global_metadata(local_packed_metadata)
+    all_metadata = _canonical_global_metadata(local_metadata)
     exchanged_tensors = _exchange_batched_tensors(
         all_metadata,
         local_tensors=local_tensors,
@@ -803,38 +694,113 @@ def build_vllm_lora_tensors_from_model(
     if rank != 0:
         return None
 
-    return _rank0_vllm_lora_tensors(
+    return _rank0_merged_lora_tensors(
         metadata=all_metadata,
         tensors_by_owner_key=exchanged_tensors,
         packed_expert_metadata=all_packed_metadata,
         packed_expert_tensors_by_owner_key=exchanged_packed_tensors,
-        handler=handler,
-        adapter_config=adapter_config,
     )
 
 
 def save_vllm_lora_from_model(
     *,
     model: ModelChunks,
-    adapter_model: dict[str, torch.Tensor],
+    adapter_dtypes: dict[str, torch.dtype],
     handler: Any,
     adapter_config: dict[str, Any],
     output_dir: str,
     rank: int,
     world_size: int,
+    slot_ref: LoRASlotRef | None = None,
 ) -> None:
-    result = build_vllm_lora_tensors_from_model(
+    snapshot = snapshot_vllm_lora_from_model(
         model=model,
-        adapter_model=adapter_model,
+        adapter_dtypes=adapter_dtypes,
         handler=handler,
         adapter_config=adapter_config,
         rank=rank,
         world_size=world_size,
+        slot_ref=slot_ref,
     )
-    if result is None:
+    if snapshot is None:
         return
-    vllm_tensors, published_config = result
-    stager = _PinnedCpuStager()
-    published_tensors = _stage_published_tensors(vllm_tensors, stager)
-    stager.finish()
-    save_vllm_lora_tensors(output_dir, published_tensors, published_config)
+    save_vllm_lora_snapshot(snapshot, output_dir)
+
+
+def snapshot_vllm_lora_from_model(
+    *,
+    model: ModelChunks,
+    adapter_dtypes: dict[str, torch.dtype],
+    handler: Any,
+    adapter_config: dict[str, Any],
+    rank: int,
+    world_size: int,
+    slot_ref: LoRASlotRef | None = None,
+) -> LoraSnapshot | None:
+    pending = stage_vllm_lora_snapshot_from_model(
+        model=model,
+        adapter_dtypes=adapter_dtypes,
+        handler=handler,
+        adapter_config=adapter_config,
+        rank=rank,
+        world_size=world_size,
+        slot_ref=slot_ref,
+        stager=PinnedCpuSnapshotStager(),
+    )
+    return None if pending is None else pending.resolve()
+
+
+def stage_vllm_lora_snapshot_from_model(
+    *,
+    model: ModelChunks,
+    adapter_dtypes: dict[str, torch.dtype],
+    handler: Any,
+    adapter_config: dict[str, Any],
+    rank: int,
+    world_size: int,
+    stager: PinnedCpuSnapshotStager,
+    slot_ref: LoRASlotRef | None = None,
+) -> PendingCpuSnapshot[LoraSnapshot] | None:
+    merged_tensors = _build_merged_lora_tensors_from_model(
+        model=model,
+        adapter_dtypes=adapter_dtypes,
+        handler=handler,
+        rank=rank,
+        world_size=world_size,
+        slot_ref=slot_ref,
+    )
+    if merged_tensors is None:
+        return None
+    builder = stager.begin()
+    if handler.vllm_lora_conversion_is_view_only():
+        merged_tensors = _stage_published_tensors(merged_tensors, builder)
+        vllm_tensors, published_config = handler.to_vllm_lora_tensors(
+            merged_tensors,
+            adapter_config=dict(adapter_config),
+        )
+    else:
+        vllm_tensors, published_config = handler.to_vllm_lora_tensors(
+            merged_tensors,
+            adapter_config=dict(adapter_config),
+        )
+        vllm_tensors = _stage_published_tensors(vllm_tensors, builder)
+    return builder.finish(
+        LoraSnapshot(
+            tensors=vllm_tensors,
+            adapter_config=published_config,
+        )
+    )
+
+
+def save_vllm_lora_snapshot(
+    snapshot: LoraSnapshot,
+    output_dir: str,
+    *,
+    prepared_tensors: PreparedSafetensors | None = None,
+) -> None:
+    save_vllm_lora_tensors(
+        output_dir,
+        snapshot.tensors,
+        snapshot.adapter_config,
+        prepared_tensors=prepared_tensors,
+    )

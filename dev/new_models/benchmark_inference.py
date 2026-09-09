@@ -52,6 +52,7 @@ async def main():
     max_tokens = 1000
     temperature = 1.0
     model = art.TrainableModel(
+        run_name="benchmark-qwen2.5-14b-instruct",
         name="benchmark-qwen2.5-14b-instruct",
         project="benchmark-vllm",
         base_model="Qwen/Qwen2.5-14B-Instruct",

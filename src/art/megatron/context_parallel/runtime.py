@@ -1,26 +1,28 @@
 from __future__ import annotations
 
 from bisect import bisect_left, bisect_right
+from dataclasses import dataclass, replace
 import hashlib
 import json
+from threading import Lock
 from typing import Any, cast
-import warnings
 
-from pydantic import BaseModel, ConfigDict
+import numpy as np
+from pydantic import BaseModel
 import torch
 
 from art.loss import shift_tensor
+from art.megatron.selective_lm_head import LmHeadTokenSelection
 from art.preprocessing.pack import PackedTensors
 
-from .builder import build_shared_prefix_attention_spec
+from .builder import build_prefix_tree_attention_spec
 from .layout_index import TokenLayoutIndex
 from .types import (
     ArtContextParallelState,
     AttnMaskKind,
     AttnSlice,
     ContextParallelConfig,
-    ContextParallelRuntimeKey,
-    ContextParallelRuntimePlan,
+    ContextParallelWorkloadProfile,
     CpBlockMaskVariant,
     DispatchedPackedTensors,
     DkvReducePlan,
@@ -29,38 +31,39 @@ from .types import (
     PackedBatchAttentionSpec,
     PackedRowAttentionSpec,
     ParallelTopology,
-    PlannerProvenance,
     PreparedMegatronBatch,
     RankRuntimePlan,
     StagePlan,
     TokenRange,
+    TrainingMicrobatchWorkload,
 )
 
-_PLANNER_RUNTIME_BACKEND = "art_context_parallel"
-_PLANNER_BEST_EFFORT_WARNING_KEYS: set[
-    tuple[str, str, int, str, str, tuple[int, ...]]
-] = set()
-_CHUNK_MASK_STATS_TORCH_THRESHOLD = 1024
 _CP4_SEARCH_PROBE_CANDIDATE_LIMIT = 2
 _CP4_SEARCH_PROBE_IMPROVEMENT_MS = 1.0
 _PLAN_CACHE_MAX_ENTRIES = 128
 
 StagePiece = tuple[TokenRange, TokenRange, AttnMaskKind, int | None]
 StageSliceKey = tuple[int, int, int, int, int, str, int]
+ProfiledChunkPiece = tuple[int, int, int, int, int, int, str, int | None]
 
 
-class _PlanningBundle(BaseModel):
-    model_config = ConfigDict(arbitrary_types_allowed=True)
-
+@dataclass(frozen=True)
+class _PlanningBundle:
     spec: PackedBatchAttentionSpec
-    runtime_key: ContextParallelRuntimeKey
-    runtime_plan: ContextParallelRuntimePlan
+    row_spec: PackedRowAttentionSpec
+    chunk_ranges: tuple[TokenRange, ...]
+    owners: tuple[int, ...]
+    wave_assignment: tuple[int, ...]
+    token_layout_index: TokenLayoutIndex
     gdn_execution_spec: Any | None = None
 
 
 _PLANNING_BUNDLE_CACHE: dict[str, _PlanningBundle] = {}
-_RUNTIME_PLAN_CACHE: dict[tuple[str, int], ContextParallelRuntimePlan] = {}
-_GDN_RANK_PLAN_CACHE: dict[tuple[str, str, int | None, int], Any] = {}
+_RUNTIME_PLAN_CACHE: dict[str, tuple[RankRuntimePlan, ...]] = {}
+_RANK_RUNTIME_PLAN_CACHE: dict[tuple[str, int], RankRuntimePlan] = {}
+_GDN_GLOBAL_DECISION_CACHE: dict[tuple[str, str], Any] = {}
+_GDN_RANK_PLAN_CACHE: dict[tuple[str, str, int | None, int, str], Any] = {}
+_PLAN_CACHE_LOCK = Lock()
 
 
 def _json_cache_key(payload: Any) -> str:
@@ -68,9 +71,10 @@ def _json_cache_key(payload: Any) -> str:
 
 
 def _cache_put(cache: dict[Any, Any], key: Any, value: Any) -> None:
-    if key not in cache and len(cache) >= _PLAN_CACHE_MAX_ENTRIES:
-        cache.pop(next(iter(cache)))
-    cache[key] = value
+    with _PLAN_CACHE_LOCK:
+        if key not in cache and len(cache) >= _PLAN_CACHE_MAX_ENTRIES:
+            cache.pop(next(iter(cache)))
+        cache[key] = value
 
 
 def _metadata_tensor_digest(tensor: torch.Tensor) -> str:
@@ -112,171 +116,320 @@ def _planning_bundle_cache_key(
         {
             "group_ids": _metadata_tensor_digest(group_ids),
             "parent_ids": _metadata_tensor_digest(parent_ids),
-            "topology": topology.model_dump(mode="json"),
-            "config": config.model_dump(mode="json"),
+            "topology": _dataclass_payload(topology),
+            "config": _dataclass_payload(config),
             "original_seq_len": int(original_seq_len),
             "build_gdn_execution_spec": bool(build_gdn_execution_spec),
         }
     )
 
 
-def _rank_plan_cache_key(
+def _get_or_build_planning_bundle(
+    *,
+    group_ids: torch.Tensor,
+    parent_ids: torch.Tensor,
+    topology: ParallelTopology,
+    config: ContextParallelConfig,
+    original_seq_len: int,
+    build_gdn_execution_spec: bool,
+) -> tuple[str, _PlanningBundle, torch.Tensor, torch.Tensor]:
+    group_ids_cpu = _planning_metadata_cpu(group_ids)
+    parent_ids_cpu = _planning_metadata_cpu(parent_ids)
+    planning_key = _planning_bundle_cache_key(
+        group_ids=group_ids_cpu,
+        parent_ids=parent_ids_cpu,
+        topology=topology,
+        config=config,
+        original_seq_len=original_seq_len,
+        build_gdn_execution_spec=build_gdn_execution_spec,
+    )
+    bundle = _PLANNING_BUNDLE_CACHE.get(planning_key)
+    if bundle is not None:
+        return planning_key, bundle, group_ids_cpu, parent_ids_cpu
+
+    spec = build_prefix_tree_attention_spec(
+        group_ids=group_ids_cpu,
+        parent_ids=parent_ids_cpu,
+    )
+    gdn_execution_spec = None
+    if build_gdn_execution_spec:
+        from art.megatron.gdn.gdn_prefix_tree import parse_gdn_prefix_tree_segments
+
+        gdn_execution_spec = parse_gdn_prefix_tree_segments(
+            group_ids_cpu,
+            parent_ids_cpu,
+        )
+    row_spec, chunk_ranges, owners, wave_assignment = _runtime_plan_assignment(
+        spec,
+        topology=topology,
+        config=config,
+    )
+    bundle = _PlanningBundle(
+        spec=spec,
+        row_spec=row_spec,
+        chunk_ranges=chunk_ranges,
+        owners=owners,
+        wave_assignment=wave_assignment,
+        token_layout_index=_build_runtime_token_layout_index(
+            chunk_ranges=chunk_ranges,
+            owners=owners,
+            cp_size=max(int(topology.cp), 1),
+        ),
+        gdn_execution_spec=gdn_execution_spec,
+    )
+    _cache_put(_PLANNING_BUNDLE_CACHE, planning_key, bundle)
+    return planning_key, bundle, group_ids_cpu, parent_ids_cpu
+
+
+@dataclass(frozen=True)
+class ContextParallelPlanSummary:
+    """Structure of one packed row's context-parallel plan: the number of
+    remote attention waves and the largest per-rank token load. Derived from
+    the cached planning bundle, so a caller that summarizes a row and then
+    executes it pays for the assignment search once."""
+
+    wave_count: int
+    max_rank_tokens: int
+
+
+def summarize_prefix_tree_plan(
+    *,
+    group_ids: torch.Tensor,
+    parent_ids: torch.Tensor,
+    topology: ParallelTopology,
+    config: ContextParallelConfig,
+    original_seq_len: int,
+    build_gdn_execution_spec: bool = False,
+) -> ContextParallelPlanSummary:
+    """Plan one packed row (CPU metadata) and report its CP plan structure.
+
+    The layout planner's second stage prices shortlisted layouts with this;
+    the bundle it builds is the one ``prepare_cp_micro`` reuses for the layout
+    that is finally executed.
+    """
+
+    _planning_key, bundle, _group_ids, _parent_ids = _get_or_build_planning_bundle(
+        group_ids=group_ids,
+        parent_ids=parent_ids,
+        topology=topology,
+        config=config,
+        original_seq_len=original_seq_len,
+        build_gdn_execution_spec=build_gdn_execution_spec,
+    )
+    wave_count = max(bundle.wave_assignment) + 1 if bundle.wave_assignment else 0
+    return ContextParallelPlanSummary(
+        wave_count=int(wave_count),
+        max_rank_tokens=int(
+            max(bundle.token_layout_index.token_counts_by_rank, default=0)
+        ),
+    )
+
+
+def _get_or_build_bundle_rank_plan(
     *,
     planning_key: str,
-    device: torch.device,
-    cp_rank: int,
-) -> tuple[str, str, int | None, int]:
-    return (planning_key, device.type, device.index, int(cp_rank))
+    bundle: _PlanningBundle,
+    original_seq_len: int,
+    target_rank: int,
+    block_size: int,
+) -> RankRuntimePlan:
+    """Materialize only the caller's rank plan at the host-ahead boundary.
 
-
-def _config_for_runtime_cp(
-    *,
-    topology: ParallelTopology,
-    config: ContextParallelConfig,
-) -> ContextParallelConfig:
-    cp_size = max(int(topology.cp), 1)
-    updates: dict[str, Any] = {}
-    applied_override = False
-    for override in config.planner_cp_overrides:
-        if int(override.cp_size) != cp_size:
-            continue
-        override_updates = override.model_dump(mode="python", exclude_none=True)
-        override_updates.pop("cp_size", None)
-        updates.update(override_updates)
-        applied_override = True
-    if not applied_override:
-        return config
-    updates.setdefault("planner_tuned_cp_sizes", (cp_size,))
-    return config.model_copy(update=updates)
-
-
-def _normalized_planner_metadata_value(value: str | None) -> str:
-    if value is None:
-        return ""
-    normalized = "".join(
-        character.lower() if character.isalnum() else " "
-        for character in str(value).strip()
+    Building every rank plan here scales CPU work with CP size, can exceed the
+    planning budget, and exposes planning after lookahead GPU work completes.
+    Each rank plan depends only on the shared assignment, so peer plans are not
+    part of this runtime boundary.
+    """
+    cache_key = (planning_key, int(target_rank))
+    cached = _RANK_RUNTIME_PLAN_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+    plan = _build_rank_runtime_plan(
+        row_spec=bundle.row_spec,
+        chunk_ranges=bundle.chunk_ranges,
+        owners=bundle.owners,
+        wave_assignment=bundle.wave_assignment,
+        token_layout_index=bundle.token_layout_index,
+        cp_size=len(bundle.token_layout_index.token_counts_by_rank),
+        original_seq_len=original_seq_len,
+        target_rank=target_rank,
+        block_size=block_size,
     )
-    return " ".join(part for part in normalized.split() if part)
+    _cache_put(_RANK_RUNTIME_PLAN_CACHE, cache_key, plan)
+    return plan
 
 
-def _planner_metadata_matches(
-    expected: str | None,
-    actual: str | None,
-    *,
-    fuzzy: bool,
-) -> bool:
-    normalized_expected = _normalized_planner_metadata_value(expected)
-    normalized_actual = _normalized_planner_metadata_value(actual)
-    if not normalized_expected or not normalized_actual:
-        return False
-    if normalized_expected == normalized_actual:
-        return True
-    return bool(
-        fuzzy
-        and (
-            normalized_expected in normalized_actual
-            or normalized_actual in normalized_expected
-        )
-    )
-
-
-def _planner_runtime_hardware() -> str | None:
-    if not torch.cuda.is_available():
-        return None
-    try:
-        return str(torch.cuda.get_device_name(torch.cuda.current_device()))
-    except Exception:
-        return str(torch.cuda.get_device_name(0))
-
-
-def _planner_best_effort_warning_message(provenance: PlannerProvenance) -> str:
-    mismatch_reasons: list[str] = []
-    if not provenance.backend_match:
-        mismatch_reasons.append(
-            f"backend runtime={provenance.runtime_backend!r} tuned={provenance.tuned_backend!r}"
-        )
-    if not provenance.hardware_match:
-        mismatch_reasons.append(
-            f"hardware runtime={provenance.runtime_hardware!r} tuned={provenance.tuned_hardware!r}"
-        )
-    if not provenance.cp_size_match:
-        mismatch_reasons.append(
-            f"cp_size runtime={int(provenance.runtime_cp_size)} tuned={list(provenance.tuned_cp_sizes)}"
-        )
-    mismatch_text = (
-        "; ".join(mismatch_reasons) if mismatch_reasons else "metadata missing"
-    )
+def _gdn_planner_config_cache_key(gdn_planner_config: Any | None) -> str:
     return (
-        "ART context parallel planner coefficients are running in best-effort mode; "
-        f"{mismatch_text}. The runtime will continue with the configured coefficients."
+        _json_cache_key(_dataclass_payload(gdn_planner_config))
+        if gdn_planner_config is not None
+        else ""
     )
 
 
-def _planner_provenance(
+def _gdn_rank_plan_cache_key(
     *,
+    planning_key: str,
+    cp_rank: int,
+    gdn_planner_config: Any | None,
+    device: torch.device,
+) -> tuple[str, str, int | None, int, str]:
+    return (
+        planning_key,
+        device.type,
+        device.index,
+        int(cp_rank),
+        _gdn_planner_config_cache_key(gdn_planner_config),
+    )
+
+
+def _plan_gdn_global_execution(
+    *,
+    planning_key: str,
+    bundle: _PlanningBundle,
+    topology: ParallelTopology,
+    gdn_planner_config: Any | None,
+) -> Any:
+    """Select one all-rank GDN decision without rank-local tensors."""
+    if bundle.gdn_execution_spec is None:
+        raise RuntimeError("GDN CP planning requires a parsed execution spec")
+    cache_key = (
+        planning_key,
+        _gdn_planner_config_cache_key(gdn_planner_config),
+    )
+    cached = _GDN_GLOBAL_DECISION_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    from art.megatron.gdn.gdn_prefix_tree import (
+        build_gdn_global_execution_decision,
+    )
+
+    decision = build_gdn_global_execution_decision(
+        bundle.gdn_execution_spec,
+        cp_size=int(topology.cp),
+        attention_token_layout_index=bundle.token_layout_index,
+        planner_config=gdn_planner_config,
+    )
+    _cache_put(_GDN_GLOBAL_DECISION_CACHE, cache_key, decision)
+    return decision
+
+
+def _plan_gdn_rank_execution(
+    *,
+    planning_key: str,
+    bundle: _PlanningBundle,
+    topology: ParallelTopology,
+    cp_rank: int,
+    gdn_planner_config: Any | None,
+) -> Any:
+    """Plan one GDN rank on CPU at the explicit CP planning boundary."""
+    if bundle.gdn_execution_spec is None:
+        raise RuntimeError("GDN CP planning requires a parsed execution spec")
+    cache_key = _gdn_rank_plan_cache_key(
+        planning_key=planning_key,
+        cp_rank=cp_rank,
+        gdn_planner_config=gdn_planner_config,
+        device=torch.device("cpu"),
+    )
+    cached = _GDN_RANK_PLAN_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    decision = _plan_gdn_global_execution(
+        planning_key=planning_key,
+        bundle=bundle,
+        topology=topology,
+        gdn_planner_config=gdn_planner_config,
+    )
+    from art.megatron.gdn.gdn_prefix_tree import materialize_gdn_rank_execution_plan
+
+    plan = materialize_gdn_rank_execution_plan(
+        bundle.gdn_execution_spec,
+        decision,
+        device="cpu",
+        cp_rank=int(cp_rank),
+        planner_config=gdn_planner_config,
+    )
+    _cache_put(_GDN_RANK_PLAN_CACHE, cache_key, plan)
+    return plan
+
+
+def _materialize_preplanned_gdn_rank_execution(
+    *,
+    planning_key: str,
+    cp_rank: int,
+    gdn_planner_config: Any | None,
+    device: torch.device,
+) -> Any:
+    """Materialize a CPU-planned GDN rank without permitting late planning."""
+    cpu_key = _gdn_rank_plan_cache_key(
+        planning_key=planning_key,
+        cp_rank=cp_rank,
+        gdn_planner_config=gdn_planner_config,
+        device=torch.device("cpu"),
+    )
+    cpu_plan = _GDN_RANK_PLAN_CACHE.get(cpu_key)
+    if cpu_plan is None:
+        raise RuntimeError(
+            "GDN execution plan was not built at the CPU planning boundary"
+        )
+    if device.type == "cpu":
+        return cpu_plan
+
+    device_key = _gdn_rank_plan_cache_key(
+        planning_key=planning_key,
+        cp_rank=cp_rank,
+        gdn_planner_config=gdn_planner_config,
+        device=device,
+    )
+    device_plan = _GDN_RANK_PLAN_CACHE.get(device_key)
+    if device_plan is not None:
+        return device_plan
+
+    from art.megatron.gdn.gdn_prefix_tree import (
+        move_gdn_rank_execution_plan_to_device,
+    )
+
+    device_plan = move_gdn_rank_execution_plan_to_device(cpu_plan, device)
+    _cache_put(_GDN_RANK_PLAN_CACHE, device_key, device_plan)
+    return device_plan
+
+
+def context_parallel_rank_model_token_counts(
+    *,
+    group_ids: torch.Tensor,
+    parent_ids: torch.Tensor,
     topology: ParallelTopology,
     config: ContextParallelConfig,
-    warn: bool = True,
-) -> PlannerProvenance:
-    runtime_hardware = _planner_runtime_hardware()
-    tuned_cp_sizes = tuple(
-        sorted(
-            {
-                int(cp_size)
-                for cp_size in config.planner_tuned_cp_sizes
-                if int(cp_size) > 0
-            }
+    original_seq_len: int,
+    build_gdn_execution_spec: bool,
+    gdn_planner_config: Any | None = None,
+) -> tuple[int, ...]:
+    """Return each CP rank's maximum model rows across physical layouts."""
+    planning_key, bundle, _group_ids_cpu, _parent_ids_cpu = (
+        _get_or_build_planning_bundle(
+            group_ids=group_ids,
+            parent_ids=parent_ids,
+            topology=topology,
+            config=config,
+            original_seq_len=original_seq_len,
+            build_gdn_execution_spec=build_gdn_execution_spec,
         )
     )
-    provenance = PlannerProvenance(
-        runtime_backend=_PLANNER_RUNTIME_BACKEND,
-        runtime_hardware=runtime_hardware,
-        runtime_cp_size=max(int(topology.cp), 1),
-        tuned_backend=config.planner_tuned_backend,
-        tuned_hardware=config.planner_tuned_hardware,
-        tuned_cp_sizes=tuned_cp_sizes,
-        backend_match=_planner_metadata_matches(
-            config.planner_tuned_backend,
-            _PLANNER_RUNTIME_BACKEND,
-            fuzzy=False,
-        ),
-        hardware_match=_planner_metadata_matches(
-            config.planner_tuned_hardware,
-            runtime_hardware,
-            fuzzy=True,
-        ),
-        cp_size_match=bool(tuned_cp_sizes)
-        and max(int(topology.cp), 1) in tuned_cp_sizes,
-        using_best_effort=False,
+    attention_counts = bundle.token_layout_index.token_counts_by_rank
+    if not build_gdn_execution_spec:
+        return attention_counts
+    decision = _plan_gdn_global_execution(
+        planning_key=planning_key,
+        bundle=bundle,
+        topology=topology,
+        gdn_planner_config=gdn_planner_config,
     )
-    if (
-        provenance.backend_match
-        and provenance.hardware_match
-        and provenance.cp_size_match
-    ):
-        return provenance
-
-    warning_message = _planner_best_effort_warning_message(provenance)
-    warning_key = (
-        _normalized_planner_metadata_value(provenance.runtime_backend),
-        _normalized_planner_metadata_value(provenance.runtime_hardware),
-        int(provenance.runtime_cp_size),
-        _normalized_planner_metadata_value(provenance.tuned_backend),
-        _normalized_planner_metadata_value(provenance.tuned_hardware),
-        provenance.tuned_cp_sizes,
-    )
-    warning_emitted = False
-    if warn and warning_key not in _PLANNER_BEST_EFFORT_WARNING_KEYS:
-        _PLANNER_BEST_EFFORT_WARNING_KEYS.add(warning_key)
-        warnings.warn(warning_message, RuntimeWarning, stacklevel=3)
-        warning_emitted = True
-    return provenance.model_copy(
-        update={
-            "using_best_effort": True,
-            "warning_message": warning_message,
-            "warning_emitted": warning_emitted,
-        }
+    gdn_counts = decision.gdn_token_counts_by_rank
+    return tuple(
+        max(attention_count, gdn_count)
+        for attention_count, gdn_count in zip(attention_counts, gdn_counts, strict=True)
     )
 
 
@@ -352,7 +505,7 @@ def _search_config_for_chunk_count(
         return config
     if all(int(getattr(config, key)) == int(value) for key, value in updates.items()):
         return config
-    return config.model_copy(update=updates)
+    return replace(config, **updates)
 
 
 def _best_improving_move(
@@ -363,7 +516,7 @@ def _best_improving_move(
     cp_size: int,
     q_weights: list[float],
     candidate_limit: int,
-    evaluate_candidate: Any,
+    evaluate_candidates: Any,
 ) -> tuple[tuple[int, ...], dict[str, Any]] | None:
     slow_rank = int(
         max(
@@ -380,29 +533,46 @@ def _best_improving_move(
     if not candidate_chunks:
         return None
 
-    best_move: tuple[tuple[int, ...], dict[str, Any]] | None = None
+    # Only boundary chunks move, and only to the rank owning the neighbouring
+    # chunk on that side, so every rank keeps a contiguous token range: the
+    # executor's per-range overheads stay minimal and models that chain state
+    # along the sequence (GDN) keep one hop per boundary.
+    moves: list[tuple[int, ...]] = []
+    seen: set[tuple[int, ...]] = set()
     for chunk_index in candidate_chunks:
-        for dst_rank in range(cp_size):
-            if dst_rank == slow_rank:
-                continue
+        neighbours = []
+        if chunk_index > 0 and int(current_owners[chunk_index - 1]) != slow_rank:
+            neighbours.append(int(current_owners[chunk_index - 1]))
+        if (
+            chunk_index + 1 < len(current_owners)
+            and int(current_owners[chunk_index + 1]) != slow_rank
+        ):
+            neighbours.append(int(current_owners[chunk_index + 1]))
+        for dst_rank in neighbours:
             candidate = list(current_owners)
             candidate[chunk_index] = dst_rank
             candidate_owners = tuple(candidate)
-            if not _assignment_uses_all_ranks(
-                candidate_owners,
-                cp_size=cp_size,
+            if candidate_owners in seen:
+                continue
+            if (
+                len(candidate_owners) >= cp_size
+                and len(set(candidate_owners)) != cp_size
             ):
                 continue
-            candidate_eval = evaluate_candidate(
-                owners=candidate_owners,
-                wave_assignment=wave_assignment,
-            )
-            if float(candidate_eval["score"]) + 1e-9 >= float(current_eval["score"]):
-                continue
-            if best_move is None or float(candidate_eval["score"]) + 1e-9 < float(
-                best_move[1]["score"]
-            ):
-                best_move = (candidate_owners, candidate_eval)
+            seen.add(candidate_owners)
+            moves.append(candidate_owners)
+    evaluations = evaluate_candidates(
+        owners_list=moves,
+        wave_assignment=wave_assignment,
+    )
+    best_move: tuple[tuple[int, ...], dict[str, Any]] | None = None
+    for candidate_owners, candidate_eval in zip(moves, evaluations, strict=True):
+        if float(candidate_eval["score"]) + 1e-9 >= float(current_eval["score"]):
+            continue
+        if best_move is None or float(candidate_eval["score"]) + 1e-9 < float(
+            best_move[1]["score"]
+        ):
+            best_move = (candidate_owners, candidate_eval)
     return best_move
 
 
@@ -411,12 +581,10 @@ def _build_chunk_ranges(
     valid_tokens: int,
     chunk_size: int,
 ) -> tuple[TokenRange, ...]:
-    ranges: list[TokenRange] = []
-    for start in range(0, valid_tokens, chunk_size):
-        ranges.append(
-            TokenRange(start=start, end=min(start + chunk_size, valid_tokens))
-        )
-    return tuple(ranges)
+    return tuple(
+        TokenRange(start=start, end=min(start + chunk_size, valid_tokens))
+        for start in range(0, valid_tokens, chunk_size)
+    )
 
 
 def _indexed_intersections(
@@ -446,33 +614,6 @@ def _indexed_intersections(
     return intersections
 
 
-def _slice_pair_count(
-    *,
-    mask_kind: AttnMaskKind,
-    q_range: TokenRange,
-    k_range: TokenRange,
-) -> int:
-    if mask_kind is AttnMaskKind.FULL:
-        return int(q_range.size()) * int(k_range.size())
-    return _causal_piece_pair_count(
-        q_range=q_range,
-        k_range=k_range,
-    )
-
-
-def _causal_piece_pair_count(
-    *,
-    q_range: TokenRange,
-    k_range: TokenRange,
-) -> int:
-    return _causal_piece_pair_count_from_bounds(
-        q_start=int(q_range.start),
-        q_end=int(q_range.end),
-        k_start=int(k_range.start),
-        k_end=int(k_range.end),
-    )
-
-
 def _causal_piece_pair_count_from_bounds(
     *,
     q_start: int,
@@ -499,91 +640,15 @@ def _causal_piece_pair_count_from_bounds(
     return int(partial + full)
 
 
-def _chunk_piece_decomposition(
-    *,
-    start: int,
-    end: int,
-    chunk_size: int,
-) -> tuple[
-    int, tuple[int, ...], tuple[int, ...], tuple[int, ...], tuple[int, ...], int
-]:
-    first = start // chunk_size
-    last = (end - 1) // chunk_size
-    piece_starts: list[int] = []
-    piece_ends: list[int] = []
-    piece_lengths: list[int] = []
-    piece_prefix_lengths: list[int] = []
-    running_len = 0
-    for chunk_index in range(first, last + 1):
-        piece_start = start if chunk_index == first else chunk_index * chunk_size
-        piece_end = end if chunk_index == last else (chunk_index + 1) * chunk_size
-        piece_len = piece_end - piece_start
-        if piece_len <= 0:
-            continue
-        running_len += piece_len
-        piece_starts.append(piece_start)
-        piece_ends.append(piece_end)
-        piece_lengths.append(piece_len)
-        piece_prefix_lengths.append(running_len)
-    return (
-        first,
-        tuple(piece_starts),
-        tuple(piece_ends),
-        tuple(piece_lengths),
-        tuple(piece_prefix_lengths),
-        running_len,
-    )
-
-
-def _can_use_shared_prefix_chunk_pair_program(
-    row_spec: PackedRowAttentionSpec,
-) -> bool:
-    slices = row_spec.slices
-    index = 0
-    while index < len(slices):
-        prompt_slice = slices[index]
-        if (
-            prompt_slice.family_index is None
-            or prompt_slice.mask_kind is not AttnMaskKind.CAUSAL
-            or prompt_slice.q_range != prompt_slice.k_range
-        ):
-            return False
-        prompt_family_index = prompt_slice.family_index
-        if prompt_family_index is None:
-            raise RuntimeError("shared-prefix prompt slices must carry family_index")
-        family_index = int(prompt_family_index)
-        prompt_start = int(prompt_slice.q_range.start)
-        prompt_end = int(prompt_slice.q_range.end)
-        index += 1
-        while index < len(slices):
-            family_value = slices[index].family_index
-            if family_value is None or int(family_value) != family_index:
-                break
-            if index + 1 >= len(slices):
-                return False
-            full_slice = slices[index]
-            causal_slice = slices[index + 1]
-            if (
-                full_slice.family_index != prompt_slice.family_index
-                or causal_slice.family_index != prompt_slice.family_index
-                or full_slice.mask_kind is not AttnMaskKind.FULL
-                or causal_slice.mask_kind is not AttnMaskKind.CAUSAL
-                or full_slice.q_range != causal_slice.q_range
-                or causal_slice.q_range != causal_slice.k_range
-                or int(full_slice.k_range.start) != prompt_start
-                or int(full_slice.k_range.end) != prompt_end
-            ):
-                return False
-            index += 2
-    return True
-
-
-def _build_chunk_pair_program_generic(
+def _build_chunk_pair_program(
     row_spec: PackedRowAttentionSpec,
     *,
-    chunk_count: int,
-    chunk_size: int,
+    chunk_ranges: tuple[TokenRange, ...],
 ) -> tuple[torch.Tensor, list[float]]:
+    chunk_count = len(chunk_ranges)
+    if chunk_count == 0:
+        return torch.zeros((0, 0), dtype=torch.int64), []
+    chunk_size = int(chunk_ranges[0].size())
     pair_rows = [[0 for _ in range(chunk_count)] for _ in range(chunk_count)]
     q_weights = [0.0 for _ in range(chunk_count)]
 
@@ -679,138 +744,6 @@ def _build_chunk_pair_program_generic(
 
             if q_total > 0:
                 q_weights[q_chunk_index] += float(q_total)
-    return torch.tensor(pair_rows, dtype=torch.int64), q_weights
-
-
-def _build_chunk_pair_program(
-    row_spec: PackedRowAttentionSpec,
-    *,
-    chunk_ranges: tuple[TokenRange, ...],
-) -> tuple[torch.Tensor, list[float]]:
-    chunk_count = len(chunk_ranges)
-    if chunk_count == 0:
-        return torch.zeros((0, 0), dtype=torch.int64), []
-    chunk_size = int(chunk_ranges[0].size())
-    if not _can_use_shared_prefix_chunk_pair_program(row_spec):
-        return _build_chunk_pair_program_generic(
-            row_spec,
-            chunk_count=chunk_count,
-            chunk_size=chunk_size,
-        )
-
-    pair_rows = [[0 for _ in range(chunk_count)] for _ in range(chunk_count)]
-    q_weights = [0.0 for _ in range(chunk_count)]
-    slices = row_spec.slices
-    index = 0
-    while index < len(slices):
-        prompt_slice = slices[index]
-        (
-            prompt_first,
-            prompt_starts,
-            prompt_ends,
-            prompt_lengths,
-            prompt_prefix,
-            prompt_total,
-        ) = _chunk_piece_decomposition(
-            start=int(prompt_slice.q_range.start),
-            end=int(prompt_slice.q_range.end),
-            chunk_size=chunk_size,
-        )
-        for offset, q_chunk_index in enumerate(
-            range(prompt_first, prompt_first + len(prompt_lengths))
-        ):
-            q_piece_len = prompt_lengths[offset]
-            row = pair_rows[q_chunk_index]
-            q_total = 0
-            if offset > 0:
-                for k_offset in range(offset):
-                    row[prompt_first + k_offset] += (
-                        q_piece_len * prompt_lengths[k_offset]
-                    )
-                q_total += q_piece_len * prompt_prefix[offset - 1]
-            pair_count = _causal_piece_pair_count_from_bounds(
-                q_start=prompt_starts[offset],
-                q_end=prompt_ends[offset],
-                k_start=prompt_starts[offset],
-                k_end=prompt_ends[offset],
-            )
-            if pair_count > 0:
-                row[q_chunk_index] += pair_count
-                q_total += pair_count
-            if q_total > 0:
-                q_weights[q_chunk_index] += float(q_total)
-
-        prompt_family_index = prompt_slice.family_index
-        if prompt_family_index is None:
-            raise RuntimeError("shared-prefix prompt slices must carry family_index")
-        family_index = int(prompt_family_index)
-        index += 1
-        completion_chunk_indices: list[int] = []
-        completion_chunk_totals: list[int] = []
-        while index < len(slices):
-            family_value = slices[index].family_index
-            if family_value is None or int(family_value) != family_index:
-                break
-            full_slice = slices[index]
-            (
-                completion_first,
-                completion_starts,
-                completion_ends,
-                completion_lengths,
-                completion_prefix,
-                _,
-            ) = _chunk_piece_decomposition(
-                start=int(full_slice.q_range.start),
-                end=int(full_slice.q_range.end),
-                chunk_size=chunk_size,
-            )
-            for offset, q_chunk_index in enumerate(
-                range(completion_first, completion_first + len(completion_lengths))
-            ):
-                q_piece_len = completion_lengths[offset]
-                if (
-                    completion_chunk_indices
-                    and completion_chunk_indices[-1] == q_chunk_index
-                ):
-                    completion_chunk_totals[-1] += q_piece_len
-                else:
-                    completion_chunk_indices.append(q_chunk_index)
-                    completion_chunk_totals.append(q_piece_len)
-
-            for offset, q_chunk_index in enumerate(
-                range(completion_first, completion_first + len(completion_lengths))
-            ):
-                q_piece_len = completion_lengths[offset]
-                row = pair_rows[q_chunk_index]
-                q_total = 0
-                if offset > 0:
-                    for k_offset in range(offset):
-                        row[completion_first + k_offset] += (
-                            q_piece_len * completion_lengths[k_offset]
-                        )
-                    q_total += q_piece_len * completion_prefix[offset - 1]
-                pair_count = _causal_piece_pair_count_from_bounds(
-                    q_start=completion_starts[offset],
-                    q_end=completion_ends[offset],
-                    k_start=completion_starts[offset],
-                    k_end=completion_ends[offset],
-                )
-                if pair_count > 0:
-                    row[q_chunk_index] += pair_count
-                    q_total += pair_count
-                if q_total > 0:
-                    q_weights[q_chunk_index] += float(q_total)
-            index += 2
-
-        for q_chunk_index, total_q_len in zip(
-            completion_chunk_indices,
-            completion_chunk_totals,
-            strict=True,
-        ):
-            row = pair_rows[q_chunk_index]
-            for k_offset, k_piece_len in enumerate(prompt_lengths):
-                row[prompt_first + k_offset] += total_q_len * k_piece_len
-            q_weights[q_chunk_index] += float(total_q_len * prompt_total)
     return torch.tensor(pair_rows, dtype=torch.int64), q_weights
 
 
@@ -963,63 +896,6 @@ def _contiguous_chunk_assignment(
     return tuple(owners)
 
 
-def _bucket_chunk_assignment(
-    *,
-    q_weights: list[float],
-    cp_size: int,
-) -> tuple[int, ...]:
-    chunk_count = len(q_weights)
-    if chunk_count == 0:
-        return tuple()
-    if cp_size <= 1:
-        return tuple(0 for _ in range(chunk_count))
-    rank_loads = [0.0 for _ in range(cp_size)]
-    rank_chunk_counts = [0 for _ in range(cp_size)]
-    owners = [-1 for _ in range(chunk_count)]
-    for chunk_index in sorted(
-        range(chunk_count),
-        key=lambda index: (-q_weights[index], index),
-    ):
-        rank = min(
-            range(cp_size),
-            key=lambda candidate: (
-                rank_loads[candidate],
-                rank_chunk_counts[candidate],
-                candidate,
-            ),
-        )
-        owners[chunk_index] = rank
-        rank_loads[rank] += q_weights[chunk_index]
-        rank_chunk_counts[rank] += 1
-    return tuple(int(owner) for owner in owners)
-
-
-def _striped_chunk_assignment(
-    *,
-    chunk_count: int,
-    cp_size: int,
-    group_size: int,
-) -> tuple[int, ...]:
-    if chunk_count == 0:
-        return tuple()
-    if cp_size <= 1:
-        return tuple(0 for _ in range(chunk_count))
-    group_size = max(1, int(group_size))
-    return tuple(
-        ((chunk_index // group_size) % cp_size) for chunk_index in range(chunk_count)
-    )
-
-
-def _assignment_uses_all_ranks(
-    owners: tuple[int, ...],
-    *,
-    cp_size: int,
-) -> bool:
-    if len(owners) < cp_size:
-        return True
-    return len({int(owner) for owner in owners}) == cp_size
-
-
 def _candidate_chunk_indices(
     *,
     owners: tuple[int, ...],
@@ -1095,62 +971,55 @@ def _ranges_size(ranges: tuple[TokenRange, ...]) -> int:
     return int(sum(range_.size() for range_ in ranges))
 
 
-def _chunk_mask_stats(
-    *,
-    chunk_lengths: tuple[int, ...],
-    chunk_mask: torch.Tensor,
-    chunk_lengths_tensor: torch.Tensor | None = None,
-) -> tuple[int, int]:
-    if (
-        chunk_lengths_tensor is not None
-        and len(chunk_lengths) >= _CHUNK_MASK_STATS_TORCH_THRESHOLD
-    ):
-        if int(chunk_mask.numel()) == 0 or not bool(chunk_mask.any().item()):
-            return 0, 0
-        token_count = int(chunk_lengths_tensor[chunk_mask].sum().item())
-        run_starts = chunk_mask.clone()
-        run_starts[1:] = torch.logical_and(
-            run_starts[1:], torch.logical_not(chunk_mask[:-1])
-        )
-        range_count = int(run_starts.sum().item())
-        return token_count, range_count
-    token_count = 0
-    range_count = 0
-    in_run = False
-    for is_set, length in zip(chunk_mask.tolist(), chunk_lengths, strict=True):
-        if bool(is_set):
-            token_count += int(length)
-            if not in_run:
-                range_count += 1
-                in_run = True
-            continue
-        in_run = False
-    return token_count, range_count
+@dataclass(frozen=True)
+class _PairProgram:
+    """The chunk pair program as the plan evaluator consumes it.
+
+    Pair counts and their positivity are float64 matrices: every value is an
+    integer far below 2**53, so the BLAS-backed products below are exact, and
+    the evaluator only ever compares them with zero or converts them back to
+    ``int``.
+    """
+
+    pair_counts: np.ndarray
+    pair_positive: np.ndarray
+    chunk_lengths: np.ndarray
 
 
-def _merge_chunk_ranges_from_mask(
+def _pair_program(
+    pair_matrix: list[list[int]] | torch.Tensor,
     *,
     chunk_ranges: tuple[TokenRange, ...],
-    chunk_mask: torch.Tensor,
-) -> tuple[TokenRange, ...]:
-    chunk_indices = torch.nonzero(chunk_mask, as_tuple=False).flatten()
-    if int(chunk_indices.numel()) == 0:
-        return tuple()
-    ordered_chunk_indices = chunk_indices.tolist()
-    first_range = chunk_ranges[int(ordered_chunk_indices[0])]
-    current_start = int(first_range.start)
-    current_end = int(first_range.end)
-    merged: list[TokenRange] = []
-    for chunk_index in ordered_chunk_indices[1:]:
-        range_ = chunk_ranges[int(chunk_index)]
-        if int(range_.start) <= current_end:
-            current_end = max(current_end, int(range_.end))
-            continue
-        merged.append(TokenRange(start=current_start, end=current_end))
-        current_start = int(range_.start)
-        current_end = int(range_.end)
-    merged.append(TokenRange(start=current_start, end=current_end))
-    return tuple(merged)
+) -> _PairProgram:
+    chunk_count = len(chunk_ranges)
+    counts = (
+        pair_matrix.to(torch.float64).numpy()
+        if isinstance(pair_matrix, torch.Tensor)
+        else np.asarray(pair_matrix, dtype=np.float64)
+    ).reshape(chunk_count, chunk_count)
+    return _PairProgram(
+        pair_counts=counts,
+        pair_positive=(counts > 0).astype(np.float64),
+        chunk_lengths=np.asarray(
+            [int(range_.size()) for range_ in chunk_ranges], dtype=np.int64
+        ),
+    )
+
+
+def _mask_token_and_range_counts(
+    masks: np.ndarray,
+    chunk_lengths: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """For every chunk mask along the last axis: the tokens it covers and the
+    number of contiguous chunk runs it consists of."""
+
+    tokens = masks.astype(np.int64) @ chunk_lengths
+    if masks.shape[-1] == 0:
+        return tokens, np.zeros(masks.shape[:-1], dtype=np.int64)
+    runs = masks[..., 0].astype(np.int64) + (masks[..., 1:] & ~masks[..., :-1]).sum(
+        axis=-1, dtype=np.int64
+    )
+    return tokens, runs
 
 
 def _stage_cost_ms(
@@ -1176,6 +1045,7 @@ def _stage_cost_ms(
         )
     )
     remote_underfill_ms = 0.0
+    remote_host_ms = 0.0 if local else float(config.planner_remote_stage_host_ms)
     if not local and (pair_count > 0 or q_tokens > 0 or k_tokens > 0):
         token_shortfall = max(
             int(config.planner_remote_stage_token_floor) - min(q_tokens, k_tokens),
@@ -1206,6 +1076,7 @@ def _stage_cost_ms(
         + float(q_range_count + k_range_count)
         * float(config.planner_interval_overhead_ms)
         + remote_underfill_ms
+        + remote_host_ms
     )
 
 
@@ -1267,295 +1138,303 @@ def _simulate_backward_time_ms(
     return max(current_time, max(reduce_ready_times, default=0.0))
 
 
+def _stage_cost_ms_array(
+    *,
+    pair_count: np.ndarray,
+    q_tokens: np.ndarray,
+    k_tokens: np.ndarray,
+    q_range_count: np.ndarray,
+    k_range_count: np.ndarray,
+    config: ContextParallelConfig,
+    backward: bool,
+    local: bool,
+) -> np.ndarray:
+    """``_stage_cost_ms`` over arrays of integer-valued float64 counts, term by
+    term in the same order, so every element equals the scalar formula."""
+
+    pair_ms = (
+        config.planner_local_backward_pair_ms
+        if backward and local
+        else (
+            config.planner_remote_backward_pair_ms
+            if backward
+            else (
+                config.planner_local_pair_ms if local else config.planner_remote_pair_ms
+            )
+        )
+    )
+    remote_underfill_ms = np.zeros_like(pair_count)
+    remote_host_ms = 0.0 if local else float(config.planner_remote_stage_host_ms)
+    if not local:
+        token_floor = int(config.planner_remote_stage_token_floor)
+        pair_floor = int(config.planner_remote_stage_pair_floor)
+        token_shortfall = np.maximum(token_floor - np.minimum(q_tokens, k_tokens), 0.0)
+        pair_shortfall = np.maximum(pair_floor - pair_count, 0.0)
+        token_scale = (
+            token_shortfall / float(token_floor)
+            if token_floor > 0
+            else np.zeros_like(pair_count)
+        )
+        pair_scale = (
+            pair_shortfall / float(pair_floor)
+            if pair_floor > 0
+            else np.zeros_like(pair_count)
+        )
+        remote_underfill_ms = np.where(
+            (pair_count > 0) | (q_tokens > 0) | (k_tokens > 0),
+            float(config.planner_remote_stage_underfill_ms)
+            * np.maximum(token_scale, pair_scale),
+            0.0,
+        )
+    return (
+        float(config.planner_stage_overhead_ms)
+        + pair_count * float(pair_ms)
+        + q_tokens * float(config.planner_merge_q_token_ms)
+        + (q_range_count + k_range_count) * float(config.planner_interval_overhead_ms)
+        + remote_underfill_ms
+        + remote_host_ms
+    )
+
+
+def _comm_cost_ms_array(
+    *,
+    tokens: np.ndarray,
+    range_count: np.ndarray,
+    config: ContextParallelConfig,
+    backward: bool,
+) -> np.ndarray:
+    per_token = (
+        float(config.planner_reduce_token_ms)
+        if backward
+        else float(config.planner_fetch_token_ms)
+    )
+    return np.where(
+        (tokens <= 0) & (range_count <= 0),
+        0.0,
+        float(config.planner_comm_stage_overhead_ms)
+        + tokens * per_token
+        + range_count * float(config.planner_interval_overhead_ms),
+    )
+
+
+def _simulate_forward_time_ms_array(
+    *,
+    local_stage_ms: np.ndarray,
+    remote_stage_ms: np.ndarray,
+    remote_fetch_ms: np.ndarray,
+    active: np.ndarray,
+) -> np.ndarray:
+    """``_simulate_forward_time_ms`` over (..., wave) arrays whose inactive
+    waves are skipped exactly as the scalar version skips absent stages."""
+
+    wave_count = active.shape[-1]
+    # The fetch of the next active wave after each wave (a reverse scan).
+    next_fetch = np.zeros_like(remote_fetch_ms)
+    has_next = np.zeros(active.shape, dtype=bool)
+    carry_fetch = np.zeros_like(local_stage_ms)
+    carry_has = np.zeros(local_stage_ms.shape, dtype=bool)
+    for wave in reversed(range(wave_count)):
+        next_fetch[..., wave] = carry_fetch
+        has_next[..., wave] = carry_has
+        carry_fetch = np.where(
+            active[..., wave], remote_fetch_ms[..., wave], carry_fetch
+        )
+        carry_has = carry_has | active[..., wave]
+    current = local_stage_ms.copy()
+    fetch_ready = np.zeros_like(local_stage_ms)
+    started = np.zeros(local_stage_ms.shape, dtype=bool)
+    for wave in range(wave_count):
+        is_active = active[..., wave]
+        ready = np.where(started, fetch_ready, remote_fetch_ms[..., wave])
+        compute_start = np.maximum(current, ready)
+        current = np.where(
+            is_active, compute_start + remote_stage_ms[..., wave], current
+        )
+        fetch_ready = np.where(
+            is_active & has_next[..., wave],
+            compute_start + next_fetch[..., wave],
+            fetch_ready,
+        )
+        started = started | is_active
+    return current
+
+
+def _simulate_backward_time_ms_array(
+    *,
+    local_stage_ms: np.ndarray,
+    remote_stage_ms: np.ndarray,
+    remote_reduce_ms: np.ndarray,
+    active: np.ndarray,
+) -> np.ndarray:
+    current = np.zeros_like(local_stage_ms)
+    reduce_ready = np.zeros_like(local_stage_ms)
+    for wave in range(active.shape[-1]):
+        is_active = active[..., wave]
+        current = np.where(is_active, current + remote_stage_ms[..., wave], current)
+        reduce_ready = np.where(
+            is_active,
+            np.maximum(reduce_ready, current + remote_reduce_ms[..., wave]),
+            reduce_ready,
+        )
+    total = current + local_stage_ms
+    return np.where(
+        active.any(axis=-1), np.maximum(total, reduce_ready), local_stage_ms
+    )
+
+
+def _evaluate_plans(
+    *,
+    program: _PairProgram,
+    owners_batch: np.ndarray,
+    wave_assignment: tuple[int, ...],
+    cp_size: int,
+    config: ContextParallelConfig,
+) -> list[dict[str, Any]]:
+    """Predicted per-rank forward and backward time of a batch of chunk
+    assignments (``owners_batch``: candidate x chunk) under one wave assignment.
+
+    The mask algebra (which chunks each rank owns, attends, fetches and sends
+    per wave), the cost formulas and the stage simulations are all vectorized
+    over candidates, ranks, sources and waves; each candidate prices exactly as
+    it would on its own.
+    """
+
+    batch = int(owners_batch.shape[0])
+    chunk_count = int(program.chunk_lengths.shape[0])
+    wave_count = max(wave_assignment, default=0) + 1 if wave_assignment else 0
+    lengths = program.chunk_lengths
+    waves_array = np.asarray(wave_assignment, dtype=np.int64).reshape(chunk_count)
+    # (candidate, rank, chunk): ownership; (wave, chunk): wave membership.
+    owned = owners_batch[:, None, :] == np.arange(cp_size)[None, :, None]
+    in_wave = waves_array[None, :] == np.arange(wave_count)[:, None]
+    owned_f = owned.astype(np.float64)
+    # (candidate, rank, k chunk): pairs between the rank's q chunks and each k chunk.
+    owned_pair_counts = owned_f @ program.pair_counts
+    positive_cols = owned_pair_counts > 0
+    local_pairs = (owned_pair_counts * owned_f).sum(axis=2)
+    local_q = owned & ((owned_f @ program.pair_positive.T) > 0)
+    local_k = owned & positive_cols
+    local_q_tokens, local_q_ranges = _mask_token_and_range_counts(local_q, lengths)
+    local_k_tokens, local_k_ranges = _mask_token_and_range_counts(local_k, lengths)
+
+    not_self = ~np.eye(cp_size, dtype=bool)
+    # (candidate, rank, source, wave, chunk): the source's chunks in this wave
+    # that the rank's queries attend, i.e. what the rank fetches from it.
+    touched_source = (
+        owned[:, None, :, None, :]
+        & in_wave[None, None, None, :, :]
+        & positive_cols[:, :, None, None, :]
+        & not_self[None, :, :, None, None]
+    )
+    request_tokens, request_ranges = _mask_token_and_range_counts(
+        touched_source, lengths
+    )
+    recv_tokens = request_tokens.sum(axis=2)
+    recv_ranges = request_ranges.sum(axis=2)
+    touched = touched_source.any(axis=2)  # (candidate, rank, wave, chunk)
+    touched_f = touched.astype(np.float64)
+    request_pairs = np.einsum("crj,crwj->crw", owned_pair_counts, touched_f)
+    touched_q = owned[:, :, None, :] & ((touched_f @ program.pair_positive.T) > 0)
+    q_tokens, q_ranges = _mask_token_and_range_counts(touched_q, lengths)
+    # (candidate, rank, wave, peer, chunk): the rank's owned chunks in this
+    # wave that the peer's queries attend, i.e. what the rank sends to it.
+    send_mask = (
+        (owned[:, :, None, :] & in_wave[None, None, :, :])[:, :, :, None, :]
+        & positive_cols[:, None, None, :, :]
+        & not_self[None, :, None, :, None]
+    )
+    send_tokens_by_peer, send_ranges_by_peer = _mask_token_and_range_counts(
+        send_mask, lengths
+    )
+    aggregate_tokens, aggregate_ranges = _mask_token_and_range_counts(
+        send_mask.any(axis=3), lengths
+    )
+    send_tokens = send_tokens_by_peer.sum(axis=3) + aggregate_tokens
+    send_ranges = send_ranges_by_peer.sum(axis=3) + aggregate_ranges
+    active = (request_pairs > 0) | (recv_tokens > 0) | (recv_ranges > 0)
+
+    local_costs: dict[str, Any] = dict(
+        pair_count=local_pairs,
+        q_tokens=local_q_tokens.astype(np.float64),
+        k_tokens=local_k_tokens.astype(np.float64),
+        q_range_count=local_q_ranges.astype(np.float64),
+        k_range_count=local_k_ranges.astype(np.float64),
+        config=config,
+        local=True,
+    )
+    local_forward = np.where(
+        local_pairs > 0, _stage_cost_ms_array(backward=False, **local_costs), 0.0
+    )
+    local_backward = np.where(
+        local_pairs > 0, _stage_cost_ms_array(backward=True, **local_costs), 0.0
+    )
+    stage_costs: dict[str, Any] = dict(
+        pair_count=request_pairs,
+        q_tokens=q_tokens.astype(np.float64),
+        k_tokens=recv_tokens.astype(np.float64),
+        q_range_count=q_ranges.astype(np.float64),
+        k_range_count=recv_ranges.astype(np.float64),
+        config=config,
+        local=False,
+    )
+    comm_costs: dict[str, Any] = dict(
+        tokens=np.maximum(send_tokens, recv_tokens).astype(np.float64),
+        range_count=np.maximum(send_ranges, recv_ranges).astype(np.float64),
+        config=config,
+    )
+    forward_ms = _simulate_forward_time_ms_array(
+        local_stage_ms=local_forward,
+        remote_stage_ms=_stage_cost_ms_array(backward=False, **stage_costs),
+        remote_fetch_ms=_comm_cost_ms_array(backward=False, **comm_costs),
+        active=active,
+    )
+    backward_ms = _simulate_backward_time_ms_array(
+        local_stage_ms=local_backward,
+        remote_stage_ms=_stage_cost_ms_array(backward=True, **stage_costs),
+        remote_reduce_ms=_comm_cost_ms_array(backward=True, **comm_costs),
+        active=active,
+    )
+    # The rest of the layer's work scales with the tokens a rank owns
+    # (backward about twice the forward).
+    owned_tokens = owned_f @ lengths.astype(np.float64)
+    owned_ms = owned_tokens * float(config.planner_owned_token_ms)
+    forward_ms = forward_ms + owned_ms / 3.0
+    backward_ms = backward_ms + owned_ms * (2.0 / 3.0)
+    rank_scores = forward_ms + backward_ms
+    return [
+        {
+            "score": float(rank_scores[index].max()) if cp_size else 0.0,
+            "rank_scores": tuple(float(value) for value in rank_scores[index]),
+            "rank_forward_ms": tuple(float(value) for value in forward_ms[index]),
+            "rank_backward_ms": tuple(float(value) for value in backward_ms[index]),
+        }
+        for index in range(batch)
+    ]
+
+
 def _evaluate_plan(
     *,
-    chunk_ranges: tuple[TokenRange, ...],
-    pair_matrix: list[list[int]] | torch.Tensor,
+    program: _PairProgram,
     owners: tuple[int, ...],
     wave_assignment: tuple[int, ...],
     cp_size: int,
     config: ContextParallelConfig,
-    pair_positive: torch.Tensor | None = None,
-    chunk_lengths: tuple[int, ...] | None = None,
-    chunk_lengths_tensor: torch.Tensor | None = None,
 ) -> dict[str, Any]:
-    rank_scores: list[float] = []
-    rank_forward_ms: list[float] = []
-    rank_backward_ms: list[float] = []
-    chunk_count = len(chunk_ranges)
-    wave_count = max(wave_assignment, default=0) + 1 if wave_assignment else 0
-    pair_counts = (
-        pair_matrix
-        if isinstance(pair_matrix, torch.Tensor) and pair_matrix.dtype == torch.int64
-        else torch.as_tensor(pair_matrix, dtype=torch.int64)
+    """Predicted per-rank forward and backward time of one chunk assignment."""
+
+    owners_batch = np.asarray(owners, dtype=np.int64).reshape(
+        1, int(program.chunk_lengths.shape[0])
     )
-    if pair_positive is None:
-        pair_positive = pair_counts > 0
-    if chunk_lengths is None:
-        chunk_lengths = tuple(int(range_.size()) for range_ in chunk_ranges)
-    if (
-        chunk_lengths_tensor is None
-        and len(chunk_lengths) >= _CHUNK_MASK_STATS_TORCH_THRESHOLD
-    ):
-        chunk_lengths_tensor = torch.tensor(chunk_lengths, dtype=torch.int64)
-    owners_tensor = torch.tensor(owners, dtype=torch.int64)
-    wave_tensor = torch.tensor(
-        wave_assignment,
-        dtype=torch.int64,
-    )
-    owner_masks = [owners_tensor == rank for rank in range(cp_size)]
-    owner_indices = [
-        torch.nonzero(owner_mask, as_tuple=False).flatten()
-        for owner_mask in owner_masks
-    ]
-    empty_pair_counts = pair_counts.new_zeros((0, chunk_count))
-    empty_pair_positive = pair_positive.new_zeros((0, chunk_count))
-    pair_counts_by_rank_rows = [
-        (
-            empty_pair_counts
-            if int(owner_index.numel()) == 0
-            else pair_counts.index_select(0, owner_index)
-        )
-        for owner_index in owner_indices
-    ]
-    pair_positive_by_rank_rows = [
-        (
-            empty_pair_positive
-            if int(owner_index.numel()) == 0
-            else pair_positive.index_select(0, owner_index)
-        )
-        for owner_index in owner_indices
-    ]
-    pair_positive_by_rank_cols = [
-        (
-            torch.zeros(chunk_count, dtype=torch.bool)
-            if int(rank_rows.numel()) == 0
-            else rank_rows.any(dim=0)
-        )
-        for rank_rows in pair_positive_by_rank_rows
-    ]
-    wave_masks = [wave_tensor == wave_index for wave_index in range(wave_count)]
-
-    for rank in range(cp_size):
-        owned_q_mask = owner_masks[rank]
-        owned_q_indices = owner_indices[rank]
-        owned_pair_counts = pair_counts_by_rank_rows[rank]
-        owned_pair_positive = pair_positive_by_rank_rows[rank]
-        owned_positive_cols = pair_positive_by_rank_cols[rank]
-
-        local_pairs = (
-            0
-            if int(owned_q_indices.numel()) == 0
-            else int(owned_pair_counts.index_select(1, owned_q_indices).sum().item())
-        )
-        local_q_mask = torch.zeros(chunk_count, dtype=torch.bool)
-        if int(owned_q_indices.numel()) > 0:
-            touched_local_q = owned_pair_positive.index_select(1, owned_q_indices).any(
-                dim=1
-            )
-            if bool(touched_local_q.any().item()):
-                local_q_mask[owned_q_indices[touched_local_q]] = True
-        local_k_mask = owned_q_mask & owned_positive_cols
-        local_q_tokens, local_q_range_count = _chunk_mask_stats(
-            chunk_lengths=chunk_lengths,
-            chunk_mask=local_q_mask,
-            chunk_lengths_tensor=chunk_lengths_tensor,
-        )
-        local_k_tokens, local_k_range_count = _chunk_mask_stats(
-            chunk_lengths=chunk_lengths,
-            chunk_mask=local_k_mask,
-            chunk_lengths_tensor=chunk_lengths_tensor,
-        )
-        local_stage_ms = _stage_cost_ms(
-            pair_count=local_pairs,
-            q_tokens=local_q_tokens,
-            k_tokens=local_k_tokens,
-            q_range_count=local_q_range_count,
-            k_range_count=local_k_range_count,
-            config=config,
-            backward=False,
-            local=True,
-        )
-        local_backward_ms = _stage_cost_ms(
-            pair_count=local_pairs,
-            q_tokens=local_q_tokens,
-            k_tokens=local_k_tokens,
-            q_range_count=local_q_range_count,
-            k_range_count=local_k_range_count,
-            config=config,
-            backward=True,
-            local=True,
-        )
-
-        remote_stage_ms: list[float] = []
-        remote_fetch_ms: list[float] = []
-        remote_backward_ms: list[float] = []
-        remote_reduce_ms: list[float] = []
-        for wave_index in range(wave_count):
-            request_tokens_by_source = [0 for _ in range(cp_size)]
-            request_range_counts_by_source = [0 for _ in range(cp_size)]
-            request_pairs = 0
-            touched_q_mask = torch.zeros(chunk_count, dtype=torch.bool)
-            for source_rank in range(cp_size):
-                if source_rank == rank:
-                    continue
-                touched_source_mask = (
-                    owner_masks[source_rank]
-                    & wave_masks[wave_index]
-                    & owned_positive_cols
-                )
-                (
-                    request_tokens_by_source[source_rank],
-                    request_range_counts_by_source[source_rank],
-                ) = _chunk_mask_stats(
-                    chunk_lengths=chunk_lengths,
-                    chunk_mask=touched_source_mask,
-                    chunk_lengths_tensor=chunk_lengths_tensor,
-                )
-                if request_tokens_by_source[source_rank] <= 0:
-                    continue
-                touched_source_indices = torch.nonzero(
-                    touched_source_mask,
-                    as_tuple=False,
-                ).flatten()
-                request_pairs += int(
-                    owned_pair_counts.index_select(1, touched_source_indices)
-                    .sum()
-                    .item()
-                )
-                touched_remote_q = owned_pair_positive.index_select(
-                    1,
-                    touched_source_indices,
-                ).any(dim=1)
-                if bool(touched_remote_q.any().item()):
-                    touched_q_mask[owned_q_indices[touched_remote_q]] = True
-            recv_tokens = sum(request_tokens_by_source)
-            recv_range_count = sum(request_range_counts_by_source)
-            if request_pairs <= 0 and recv_tokens <= 0 and recv_range_count <= 0:
-                continue
-
-            send_tokens_by_peer = [0 for _ in range(cp_size)]
-            send_range_counts_by_peer = [0 for _ in range(cp_size)]
-            aggregate_send_mask = torch.zeros(chunk_count, dtype=torch.bool)
-            owned_wave_mask = owned_q_mask & wave_masks[wave_index]
-            if bool(owned_wave_mask.any().item()):
-                for peer_rank in range(cp_size):
-                    if peer_rank == rank:
-                        continue
-                    send_mask = owned_wave_mask & pair_positive_by_rank_cols[peer_rank]
-                    (
-                        send_tokens_by_peer[peer_rank],
-                        send_range_counts_by_peer[peer_rank],
-                    ) = _chunk_mask_stats(
-                        chunk_lengths=chunk_lengths,
-                        chunk_mask=send_mask,
-                        chunk_lengths_tensor=chunk_lengths_tensor,
-                    )
-                    if send_tokens_by_peer[peer_rank] > 0:
-                        aggregate_send_mask |= send_mask
-            (
-                send_tokens_by_peer[rank],
-                send_range_counts_by_peer[rank],
-            ) = _chunk_mask_stats(
-                chunk_lengths=chunk_lengths,
-                chunk_mask=aggregate_send_mask,
-                chunk_lengths_tensor=chunk_lengths_tensor,
-            )
-
-            send_tokens = sum(send_tokens_by_peer)
-            q_tokens, q_range_count = _chunk_mask_stats(
-                chunk_lengths=chunk_lengths,
-                chunk_mask=touched_q_mask,
-                chunk_lengths_tensor=chunk_lengths_tensor,
-            )
-            remote_stage_ms.append(
-                _stage_cost_ms(
-                    pair_count=request_pairs,
-                    q_tokens=q_tokens,
-                    k_tokens=recv_tokens,
-                    q_range_count=q_range_count,
-                    k_range_count=recv_range_count,
-                    config=config,
-                    backward=False,
-                    local=False,
-                )
-            )
-            remote_backward_ms.append(
-                _stage_cost_ms(
-                    pair_count=request_pairs,
-                    q_tokens=q_tokens,
-                    k_tokens=recv_tokens,
-                    q_range_count=q_range_count,
-                    k_range_count=recv_range_count,
-                    config=config,
-                    backward=True,
-                    local=False,
-                )
-            )
-            remote_fetch_ms.append(
-                _comm_cost_ms(
-                    tokens=max(send_tokens, recv_tokens),
-                    range_count=max(sum(send_range_counts_by_peer), recv_range_count),
-                    config=config,
-                    backward=False,
-                )
-            )
-            remote_reduce_ms.append(
-                _comm_cost_ms(
-                    tokens=max(send_tokens, recv_tokens),
-                    range_count=max(sum(send_range_counts_by_peer), recv_range_count),
-                    config=config,
-                    backward=True,
-                )
-            )
-
-        forward_ms = _simulate_forward_time_ms(
-            local_stage_ms=local_stage_ms if local_pairs > 0 else 0.0,
-            remote_stage_ms=tuple(remote_stage_ms),
-            remote_fetch_ms=tuple(remote_fetch_ms),
-        )
-        backward_ms = _simulate_backward_time_ms(
-            local_stage_ms=local_backward_ms if local_pairs > 0 else 0.0,
-            remote_stage_ms=tuple(remote_backward_ms),
-            remote_reduce_ms=tuple(remote_reduce_ms),
-        )
-        rank_forward_ms.append(float(forward_ms))
-        rank_backward_ms.append(float(backward_ms))
-        rank_scores.append(float(forward_ms + backward_ms))
-    return {
-        "score": max(rank_scores, default=0.0),
-        "rank_scores": tuple(rank_scores),
-        "rank_forward_ms": tuple(rank_forward_ms),
-        "rank_backward_ms": tuple(rank_backward_ms),
-    }
-
-
-def _evaluate_plan_for_search(
-    *,
-    chunk_ranges: tuple[TokenRange, ...],
-    pair_matrix: list[list[int]] | torch.Tensor,
-    owners: tuple[int, ...],
-    wave_assignment: tuple[int, ...],
-    cp_size: int,
-    config: ContextParallelConfig,
-    pair_positive: torch.Tensor | None = None,
-    chunk_lengths: tuple[int, ...] | None = None,
-    chunk_lengths_tensor: torch.Tensor | None = None,
-) -> dict[str, Any]:
-    return _evaluate_plan(
-        chunk_ranges=chunk_ranges,
-        pair_matrix=pair_matrix,
-        owners=owners,
+    return _evaluate_plans(
+        program=program,
+        owners_batch=owners_batch,
         wave_assignment=wave_assignment,
         cp_size=cp_size,
         config=config,
-        pair_positive=pair_positive,
-        chunk_lengths=chunk_lengths,
-        chunk_lengths_tensor=chunk_lengths_tensor,
-    )
+    )[0]
 
 
-def _search_chunk_assignment(
+def _search_generic_chunk_assignment(
     *,
     chunk_ranges: tuple[TokenRange, ...],
     pair_matrix: list[list[int]] | torch.Tensor,
@@ -1563,7 +1442,6 @@ def _search_chunk_assignment(
     cp_size: int,
     config: ContextParallelConfig,
 ) -> tuple[tuple[int, ...], tuple[int, ...], dict[str, Any]]:
-    cp_size = int(cp_size)
     config = _search_config_for_chunk_count(
         config=config,
         chunk_count=len(chunk_ranges),
@@ -1572,134 +1450,97 @@ def _search_chunk_assignment(
         1,
         min(int(config.planner_max_remote_waves), len(chunk_ranges)) + 1,
     )
-    best_owners: tuple[int, ...] = tuple()
-    best_waves: tuple[int, ...] = tuple()
-    best_eval: dict[str, Any] | None = None
+    best: tuple[tuple[int, ...], tuple[int, ...], dict[str, Any]] | None = None
     eval_cache: dict[tuple[tuple[int, ...], tuple[int, ...]], dict[str, Any]] = {}
-    pair_counts = torch.as_tensor(pair_matrix, dtype=torch.int64)
-    pair_positive = pair_counts > 0
-    chunk_lengths = tuple(int(range_.size()) for range_ in chunk_ranges)
-    chunk_lengths_tensor = (
-        torch.tensor(chunk_lengths, dtype=torch.int64)
-        if len(chunk_lengths) >= _CHUNK_MASK_STATS_TORCH_THRESHOLD
-        else None
-    )
+    program = _pair_program(pair_matrix, chunk_ranges=chunk_ranges)
+
+    def _evaluate_candidates(
+        *,
+        owners_list: list[tuple[int, ...]],
+        wave_assignment: tuple[int, ...],
+    ) -> list[dict[str, Any]]:
+        misses = [
+            owners
+            for owners in dict.fromkeys(owners_list)
+            if (owners, wave_assignment) not in eval_cache
+        ]
+        if misses:
+            evaluations = _evaluate_plans(
+                program=program,
+                owners_batch=np.asarray(misses, dtype=np.int64).reshape(
+                    len(misses), len(chunk_ranges)
+                ),
+                wave_assignment=wave_assignment,
+                cp_size=cp_size,
+                config=config,
+            )
+            for owners, evaluation in zip(misses, evaluations, strict=True):
+                eval_cache[(owners, wave_assignment)] = evaluation
+        return [eval_cache[(owners, wave_assignment)] for owners in owners_list]
 
     def _evaluate_candidate(
         *,
         owners: tuple[int, ...],
         wave_assignment: tuple[int, ...],
     ) -> dict[str, Any]:
-        cache_key = (owners, wave_assignment)
-        cached = eval_cache.get(cache_key)
-        if cached is not None:
-            return cached
-        cached = _evaluate_plan_for_search(
-            chunk_ranges=chunk_ranges,
-            pair_matrix=pair_counts,
-            owners=owners,
+        return _evaluate_candidates(
+            owners_list=[owners],
             wave_assignment=wave_assignment,
-            cp_size=cp_size,
-            config=config,
-            pair_positive=pair_positive,
-            chunk_lengths=chunk_lengths,
-            chunk_lengths_tensor=chunk_lengths_tensor,
-        )
-        eval_cache[cache_key] = cached
-        return cached
+        )[0]
 
-    def _best_wave_assignment_for_owners(
-        owners: tuple[int, ...],
-    ) -> tuple[tuple[int, ...], dict[str, Any]]:
-        best_wave_assignment = tuple()
-        best_eval_local: dict[str, Any] | None = None
-        for wave_count in wave_count_candidates:
-            wave_assignment = _wave_assignment(
-                chunk_count=len(chunk_ranges),
-                wave_count=wave_count,
-            )
-            candidate_eval = _evaluate_candidate(
-                owners=owners,
-                wave_assignment=wave_assignment,
-            )
-            if best_eval_local is None or float(candidate_eval["score"]) + 1e-9 < float(
-                best_eval_local["score"]
-            ):
-                best_wave_assignment = wave_assignment
-                best_eval_local = candidate_eval
-        if best_eval_local is None:
-            raise RuntimeError("Failed to evaluate any wave assignment candidate.")
-        return best_wave_assignment, best_eval_local
-
-    strategy = str(config.planner_assignment_strategy).strip().lower()
-    striped_owners = _striped_chunk_assignment(
-        chunk_count=len(chunk_ranges),
-        cp_size=cp_size,
-        group_size=int(config.planner_stripe_group_size),
+    # The contiguous start balances the whole layer per chunk: attention pairs
+    # at the local pair cost (forward + backward) plus the per-token compute
+    # the chunk's tokens bring with them.
+    pair_ms = float(config.planner_local_pair_ms) + float(
+        config.planner_local_backward_pair_ms
     )
-    fixed_owners_by_strategy = {
-        "contiguous": _contiguous_chunk_assignment(
-            q_weights=q_weights, cp_size=cp_size
-        ),
-        "bucket": _bucket_chunk_assignment(q_weights=q_weights, cp_size=cp_size),
-        "striped": striped_owners,
-    }
-    if strategy in fixed_owners_by_strategy:
-        owners = fixed_owners_by_strategy[strategy]
-        best_waves, best_eval = _best_wave_assignment_for_owners(owners)
-        return owners, best_waves, best_eval
-    if strategy not in {"search", "search_with_striped_seed"}:
-        raise ValueError(
-            "Unsupported planner_assignment_strategy="
-            f"{config.planner_assignment_strategy!r}."
+    chunk_weights = [
+        float(weight) * pair_ms + float(length) * float(config.planner_owned_token_ms)
+        for weight, length in zip(
+            q_weights, program.chunk_lengths.tolist(), strict=True
         )
-
+    ]
     contiguous_owners = _contiguous_chunk_assignment(
-        q_weights=q_weights,
+        q_weights=chunk_weights,
         cp_size=cp_size,
     )
+    if not contiguous_owners:
+        wave_assignment = _wave_assignment(chunk_count=len(chunk_ranges), wave_count=1)
+        return (
+            contiguous_owners,
+            wave_assignment,
+            _evaluate_candidate(
+                owners=contiguous_owners,
+                wave_assignment=wave_assignment,
+            ),
+        )
+
     for wave_count in wave_count_candidates:
         wave_assignment = _wave_assignment(
             chunk_count=len(chunk_ranges),
             wave_count=wave_count,
         )
-        initial_candidates = [
-            initial_owners
-            for initial_owners in (contiguous_owners,)
-            if initial_owners
-            if _assignment_uses_all_ranks(initial_owners, cp_size=cp_size)
-        ]
-        if not initial_candidates:
-            continue
-        current_owners = min(
-            initial_candidates,
-            key=lambda owners: float(
-                _evaluate_candidate(owners=owners, wave_assignment=wave_assignment)[
-                    "score"
-                ]
-            ),
-        )
+        current_owners = contiguous_owners
         current_eval = _evaluate_candidate(
             owners=current_owners,
             wave_assignment=wave_assignment,
         )
 
-        if cp_size >= 8:
-            search_steps_remaining = 0
-        else:
-            search_steps_remaining = int(config.planner_max_search_steps)
+        search_steps_remaining = (
+            0 if cp_size >= 8 else int(config.planner_max_search_steps)
+        )
         if cp_size == 4 and search_steps_remaining > 0:
             probe_move = _best_improving_move(
                 current_owners=current_owners,
                 current_eval=current_eval,
                 wave_assignment=wave_assignment,
                 cp_size=cp_size,
-                q_weights=q_weights,
+                q_weights=chunk_weights,
                 candidate_limit=min(
                     int(config.planner_candidate_chunk_limit),
                     _CP4_SEARCH_PROBE_CANDIDATE_LIMIT,
                 ),
-                evaluate_candidate=_evaluate_candidate,
+                evaluate_candidates=_evaluate_candidates,
             )
             if (
                 probe_move is not None
@@ -1717,35 +1558,418 @@ def _search_chunk_assignment(
                 current_eval=current_eval,
                 wave_assignment=wave_assignment,
                 cp_size=cp_size,
-                q_weights=q_weights,
+                q_weights=chunk_weights,
                 candidate_limit=int(config.planner_candidate_chunk_limit),
-                evaluate_candidate=_evaluate_candidate,
+                evaluate_candidates=_evaluate_candidates,
             )
             if best_move is None:
                 break
             current_owners, current_eval = best_move
 
-        if best_eval is None or float(current_eval["score"]) + 1e-9 < float(
-            best_eval["score"]
+        if best is None or float(current_eval["score"]) + 1e-9 < float(
+            best[2]["score"]
         ):
-            best_owners = current_owners
-            best_waves = wave_assignment
-            best_eval = current_eval
+            best = (current_owners, wave_assignment, current_eval)
+    if best is None:
+        raise RuntimeError("Failed to evaluate any CP planner wave assignment.")
+    return best
 
-    if best_eval is None:
-        best_owners = _contiguous_chunk_assignment(q_weights=q_weights, cp_size=cp_size)
-        best_waves = _wave_assignment(chunk_count=len(chunk_ranges), wave_count=1)
-        best_eval = _evaluate_candidate(
-            owners=best_owners,
-            wave_assignment=best_waves,
+
+def _folded_chunk_assignment(
+    *,
+    weights: list[float],
+    cp_size: int,
+) -> tuple[int, ...]:
+    if len(weights) < 2 * cp_size:
+        return tuple()
+    slab_owners = _contiguous_chunk_assignment(
+        q_weights=weights,
+        cp_size=2 * cp_size,
+    )
+    return tuple(min(owner, 2 * cp_size - 1 - owner) for owner in slab_owners)
+
+
+def _ownership_range_counts(
+    owners: tuple[int, ...],
+    *,
+    cp_size: int,
+) -> tuple[int, ...]:
+    counts = [0 for _ in range(cp_size)]
+    previous = -1
+    for owner in owners:
+        if owner != previous:
+            counts[int(owner)] += 1
+        previous = int(owner)
+    return tuple(counts)
+
+
+def _rounded(value: int, multiple: int) -> int:
+    return ((int(value) + int(multiple) - 1) // int(multiple)) * int(multiple)
+
+
+def _stage_indexer_tile_pairs(
+    pieces: list[ProfiledChunkPiece],
+    *,
+    profile: ContextParallelWorkloadProfile,
+) -> int:
+    queries: dict[tuple[int, int], int] = {}
+    for (
+        _q_index,
+        _k_index,
+        q_start,
+        q_end,
+        k_start,
+        k_end,
+        _mask_kind,
+        _family,
+    ) in pieces:
+        query = (q_start, q_end)
+        queries[query] = queries.get(query, 0) + k_end - k_start
+
+    tile_pairs = 0
+    for (q_start, q_end), k_tokens in queries.items():
+        if k_tokens <= 0:
+            continue
+        k_chunk = min(k_tokens, int(profile.indexer_max_k_tokens))
+        q_chunk = max(1, int(profile.indexer_score_workspace_elements) // k_chunk)
+        rounded_q = sum(
+            _rounded(
+                min(q_chunk, q_end - start),
+                int(profile.query_tile_size),
+            )
+            for start in range(q_start, q_end, q_chunk)
         )
-    return best_owners, best_waves, best_eval
+        rounded_k = sum(
+            _rounded(
+                min(k_chunk, k_tokens - start),
+                int(profile.key_tile_size),
+            )
+            for start in range(0, k_tokens, k_chunk)
+        )
+        tile_pairs += rounded_q * rounded_k
+    return tile_pairs
 
 
-def _concatenate_peer_ranges(
-    ranges_by_peer: list[tuple[TokenRange, ...]] | tuple[tuple[TokenRange, ...], ...],
-) -> tuple[tuple[TokenRange, ...], ...]:
-    return tuple(tuple(ranges) for ranges in ranges_by_peer)
+def _intervals_size(intervals: list[tuple[int, int]]) -> int:
+    if not intervals:
+        return 0
+    ordered = sorted(set(intervals))
+    total = 0
+    current_start, current_end = ordered[0]
+    for start, end in ordered[1:]:
+        if start <= current_end:
+            current_end = max(current_end, end)
+        else:
+            total += current_end - current_start
+            current_start, current_end = start, end
+    return total + current_end - current_start
+
+
+def _profiled_chunk_pieces(
+    row_spec: PackedRowAttentionSpec,
+    *,
+    chunk_ranges: tuple[TokenRange, ...],
+) -> tuple[ProfiledChunkPiece, ...]:
+    pieces = []
+    chunk_starts = tuple(int(range_.start) for range_ in chunk_ranges)
+    chunk_ends = tuple(int(range_.end) for range_ in chunk_ranges)
+    for slice_ in row_spec.slices:
+        q_parts = _indexed_intersections(
+            slice_.q_range,
+            chunk_ranges,
+            candidate_starts=chunk_starts,
+            candidate_ends=chunk_ends,
+        )
+        k_parts = _indexed_intersections(
+            slice_.k_range,
+            chunk_ranges,
+            candidate_starts=chunk_starts,
+            candidate_ends=chunk_ends,
+        )
+        for q_index, q_piece in q_parts:
+            for k_index, k_piece in k_parts:
+                mask_kind = _resolve_stage_mask_kind(
+                    mask_kind=slice_.mask_kind,
+                    q_piece=q_piece,
+                    k_piece=k_piece,
+                )
+                if mask_kind is not None:
+                    pieces.append(
+                        (
+                            q_index,
+                            k_index,
+                            int(q_piece.start),
+                            int(q_piece.end),
+                            int(k_piece.start),
+                            int(k_piece.end),
+                            mask_kind.value,
+                            slice_.family_index,
+                        )
+                    )
+    return tuple(dict.fromkeys(pieces))
+
+
+def _profiled_rank_statistics(
+    *,
+    chunk_pieces: tuple[ProfiledChunkPiece, ...],
+    chunk_ranges: tuple[TokenRange, ...],
+    owners: tuple[int, ...],
+    wave_assignment: tuple[int, ...],
+    cp_size: int,
+    profile: ContextParallelWorkloadProfile,
+) -> list[dict[str, int]]:
+    wave_count = max(wave_assignment, default=0) + 1 if wave_assignment else 0
+    stages: list[list[list[ProfiledChunkPiece]]] = [
+        [[] for _ in range(wave_count + 1)] for _ in range(cp_size)
+    ]
+    recv_ranges: list[list[list[list[tuple[int, int]]]]] = [
+        [[[] for _ in range(cp_size)] for _ in range(wave_count)]
+        for _ in range(cp_size)
+    ]
+    send_ranges: list[list[list[list[tuple[int, int]]]]] = [
+        [[[] for _ in range(cp_size)] for _ in range(wave_count)]
+        for _ in range(cp_size)
+    ]
+    for piece in chunk_pieces:
+        q_index, k_index, _q_start, _q_end, k_start, k_end, _mask, _family = piece
+        destination = int(owners[q_index])
+        source = int(owners[k_index])
+        if source == destination:
+            stages[destination][0].append(piece)
+            continue
+        wave = int(wave_assignment[k_index])
+        stages[destination][wave + 1].append(piece)
+        interval = (k_start, k_end)
+        recv_ranges[destination][wave][source].append(interval)
+        send_ranges[source][wave][destination].append(interval)
+
+    query_tokens = [0 for _ in range(cp_size)]
+    for range_, owner in zip(chunk_ranges, owners, strict=True):
+        query_tokens[int(owner)] += int(range_.size())
+    statistics = []
+    for rank in range(cp_size):
+        combined_k_tokens = _intervals_size(
+            [(piece[4], piece[5]) for piece in stages[rank][0]]
+        )
+        recv_tokens = 0
+        send_tokens = 0
+        remote_peers: set[int] = set()
+        for wave_recv, wave_send in zip(
+            recv_ranges[rank],
+            send_ranges[rank],
+            strict=True,
+        ):
+            for peer, (peer_recv, peer_send) in enumerate(
+                zip(wave_recv, wave_send, strict=True)
+            ):
+                recv_size = _intervals_size(peer_recv)
+                send_size = _intervals_size(peer_send)
+                recv_tokens += recv_size
+                send_tokens += send_size
+                combined_k_tokens += recv_size
+                if peer != rank and (recv_size or send_size):
+                    remote_peers.add(peer)
+        statistics.append(
+            {
+                "query_tokens": query_tokens[rank],
+                "tile_pairs": sum(
+                    _stage_indexer_tile_pairs(pieces, profile=profile)
+                    for pieces in stages[rank]
+                ),
+                "combined_k_tokens": combined_k_tokens,
+                "fetch_send_tokens": send_tokens,
+                "fetch_recv_tokens": recv_tokens,
+                "remote_peers": len(remote_peers),
+            }
+        )
+    return statistics
+
+
+def _evaluate_profiled_assignment(
+    *,
+    chunk_pieces: tuple[ProfiledChunkPiece, ...],
+    chunk_ranges: tuple[TokenRange, ...],
+    owners: tuple[int, ...],
+    wave_assignment: tuple[int, ...],
+    cp_size: int,
+    profile: ContextParallelWorkloadProfile,
+) -> dict[str, Any]:
+    rank_stats = _profiled_rank_statistics(
+        chunk_pieces=chunk_pieces,
+        chunk_ranges=chunk_ranges,
+        owners=owners,
+        wave_assignment=wave_assignment,
+        cp_size=cp_size,
+        profile=profile,
+    )
+    query_flops = 0
+    indexer_flops = 0
+    hbm_k_bytes = 0
+    peak_memory_bytes = 0
+    fetch_send_bytes = 0
+    fetch_recv_bytes = 0
+    dkv_send_bytes = 0
+    dkv_recv_bytes = 0
+    for rank in rank_stats:
+        for stage in profile.stages:
+            query_flops = max(
+                query_flops,
+                rank["query_tokens"] * int(stage.query_flops_per_token),
+            )
+            indexer_flops = max(
+                indexer_flops,
+                rank["tile_pairs"] * int(stage.tile_pair_flops),
+            )
+            hbm_k_bytes = max(
+                hbm_k_bytes,
+                rank["combined_k_tokens"] * int(stage.k_hbm_bytes_per_token),
+            )
+            peak_memory_bytes = max(
+                peak_memory_bytes,
+                rank["query_tokens"] * int(stage.query_memory_bytes_per_token)
+                + rank["combined_k_tokens"] * int(stage.k_memory_bytes_per_token),
+            )
+            fetch_send_bytes = max(
+                fetch_send_bytes,
+                rank["fetch_send_tokens"] * int(stage.k_fetch_bytes_per_token),
+            )
+            fetch_recv_bytes = max(
+                fetch_recv_bytes,
+                rank["fetch_recv_tokens"] * int(stage.k_fetch_bytes_per_token),
+            )
+            dkv_send_bytes = max(
+                dkv_send_bytes,
+                rank["fetch_recv_tokens"] * int(stage.dkv_reduce_bytes_per_token),
+            )
+            dkv_recv_bytes = max(
+                dkv_recv_bytes,
+                rank["fetch_send_tokens"] * int(stage.dkv_reduce_bytes_per_token),
+            )
+
+    range_counts = _ownership_range_counts(owners, cp_size=cp_size)
+    max_network_bytes = max(
+        fetch_send_bytes,
+        fetch_recv_bytes,
+        dkv_send_bytes,
+        dkv_recv_bytes,
+    )
+    return {
+        "score": query_flops,
+        "query_flops": query_flops,
+        "indexer_flops": indexer_flops,
+        "hbm_k_bytes": hbm_k_bytes,
+        "peak_memory_bytes": peak_memory_bytes,
+        "max_network_bytes": max_network_bytes,
+        "fetch_send_bytes": fetch_send_bytes,
+        "fetch_recv_bytes": fetch_recv_bytes,
+        "dkv_send_bytes": dkv_send_bytes,
+        "dkv_recv_bytes": dkv_recv_bytes,
+        "max_remote_peers": max(
+            (rank["remote_peers"] for rank in rank_stats),
+            default=0,
+        ),
+        "max_ownership_ranges": max(range_counts, default=0),
+        "rank_query_tokens": tuple(rank["query_tokens"] for rank in rank_stats),
+        "rank_tile_pairs": tuple(rank["tile_pairs"] for rank in rank_stats),
+        "rank_combined_k_tokens": tuple(
+            rank["combined_k_tokens"] for rank in rank_stats
+        ),
+        "rank_fetch_send_tokens": tuple(
+            rank["fetch_send_tokens"] for rank in rank_stats
+        ),
+        "rank_fetch_recv_tokens": tuple(
+            rank["fetch_recv_tokens"] for rank in rank_stats
+        ),
+        "rank_remote_peers": tuple(rank["remote_peers"] for rank in rank_stats),
+        "ownership_range_counts": range_counts,
+    }
+
+
+def _profiled_assignment_key(
+    evaluation: dict[str, Any],
+    owners: tuple[int, ...],
+) -> tuple[Any, ...]:
+    # These terms retain their own physical units; they are never added together.
+    return (
+        int(evaluation["query_flops"]),
+        int(evaluation["max_network_bytes"]),
+        int(evaluation["hbm_k_bytes"]),
+        int(evaluation["indexer_flops"]),
+        int(evaluation["max_remote_peers"]),
+        int(evaluation["max_ownership_ranges"]),
+        owners,
+    )
+
+
+def _search_chunk_assignment(
+    *,
+    row_spec: PackedRowAttentionSpec | None = None,
+    chunk_ranges: tuple[TokenRange, ...],
+    pair_matrix: list[list[int]] | torch.Tensor,
+    q_weights: list[float],
+    cp_size: int,
+    config: ContextParallelConfig,
+) -> tuple[tuple[int, ...], tuple[int, ...], dict[str, Any]]:
+    generic = _search_generic_chunk_assignment(
+        chunk_ranges=chunk_ranges,
+        pair_matrix=pair_matrix,
+        q_weights=q_weights,
+        cp_size=cp_size,
+        config=config,
+    )
+    profile = config.workload_profile
+    if profile is None:
+        return generic
+    if row_spec is None:
+        raise RuntimeError("Profile-aware CP planning requires the packed row spec.")
+
+    chunk_pieces = _profiled_chunk_pieces(row_spec, chunk_ranges=chunk_ranges)
+    lengths = [float(range_.size()) for range_ in chunk_ranges]
+    candidates = [
+        generic[0],
+        _contiguous_chunk_assignment(q_weights=lengths, cp_size=cp_size),
+        _folded_chunk_assignment(weights=lengths, cp_size=cp_size),
+    ]
+    baseline = _evaluate_profiled_assignment(
+        chunk_pieces=chunk_pieces,
+        chunk_ranges=chunk_ranges,
+        owners=generic[0],
+        wave_assignment=generic[1],
+        cp_size=cp_size,
+        profile=profile,
+    )
+    best_owners = generic[0]
+    best_eval = baseline
+    seen = {generic[0]}
+    for owners in candidates[1:]:
+        if not owners or owners in seen:
+            continue
+        seen.add(owners)
+        if len(set(owners)) != cp_size:
+            continue
+        range_counts = _ownership_range_counts(owners, cp_size=cp_size)
+        if max(range_counts, default=0) > int(profile.max_ownership_ranges_per_rank):
+            continue
+        evaluation = _evaluate_profiled_assignment(
+            chunk_pieces=chunk_pieces,
+            chunk_ranges=chunk_ranges,
+            owners=owners,
+            wave_assignment=generic[1],
+            cp_size=cp_size,
+            profile=profile,
+        )
+        if int(evaluation["peak_memory_bytes"]) > int(
+            baseline["peak_memory_bytes"]
+        ) or _profiled_assignment_key(evaluation, owners) >= _profiled_assignment_key(
+            baseline, generic[0]
+        ):
+            continue
+        if _profiled_assignment_key(evaluation, owners) < _profiled_assignment_key(
+            best_eval, best_owners
+        ):
+            best_owners = owners
+            best_eval = evaluation
+    return best_owners, generic[1], best_eval
 
 
 def _flatten_ranges_by_peer(
@@ -1965,16 +2189,8 @@ def _build_rank_runtime_plan(
             _remap_subrange(range_, host_local_ranges)
             for range_ in local_global_k_ranges
         ),
-        kv_fetch_plan=KvFetchPlan(
-            send_splits=tuple(0 for _ in range(cp_size)),
-            recv_splits=tuple(0 for _ in range(cp_size)),
-            send_ranges_by_peer=tuple(tuple() for _ in range(cp_size)),
-        ),
-        dkv_reduce_plan=DkvReducePlan(
-            send_splits=tuple(0 for _ in range(cp_size)),
-            recv_splits=tuple(0 for _ in range(cp_size)),
-            recv_ranges_by_peer=tuple(tuple() for _ in range(cp_size)),
-        ),
+        kv_fetch_plan=None,
+        dkv_reduce_plan=None,
         remote_buffer_range=None,
         block_size=block_size,
     )
@@ -2082,71 +2298,13 @@ def _build_rank_runtime_plan(
         token_layout_index=token_layout_index,
         local_valid_lengths=(local_token_count,),
         local_row_ranges=local_row_ranges,
-        local_token_count=local_token_count,
         stage_plans=tuple(stage_plans),
         backward_stage_indices=tuple(backward_stage_indices + [0]),
-        remote_kv_fetch_plan=KvFetchPlan(
-            send_splits=aggregate_send_splits,
-            recv_splits=tuple(aggregate_recv_splits),
-            send_ranges_by_peer=aggregate_send_ranges,
-        ),
         remote_dkv_reduce_plan=DkvReducePlan(
             send_splits=tuple(aggregate_recv_splits),
             recv_splits=aggregate_send_splits,
             recv_ranges_by_peer=aggregate_send_ranges,
         ),
-    )
-
-
-def make_runtime_key(
-    spec: PackedBatchAttentionSpec,
-    *,
-    topology: ParallelTopology,
-    config: ContextParallelConfig,
-) -> ContextParallelRuntimeKey:
-    if len(spec.rows) != 1:
-        raise RuntimeError(
-            "ART context parallel runtime keys expect exactly one packed sequence, "
-            f"got {len(spec.rows)} rows."
-        )
-    row_signatures = tuple(_row_signature(row) for row in spec.rows)
-    return ContextParallelRuntimeKey(
-        topology=topology,
-        config=config,
-        row_signatures=row_signatures,
-    )
-
-
-def build_context_parallel_token_layout_index(
-    *,
-    group_ids: torch.Tensor,
-    parent_ids: torch.Tensor,
-    topology: ParallelTopology,
-    config: ContextParallelConfig,
-    original_seq_len: int,
-) -> TokenLayoutIndex:
-    """Return the token ownership chosen by the real CP attention planner."""
-
-    spec = build_shared_prefix_attention_spec(
-        group_ids=group_ids, parent_ids=parent_ids
-    )
-    if int(topology.cp) <= 1:
-        valid_tokens = int(spec.rows[0].valid_tokens) if spec.rows else 0
-        return TokenLayoutIndex(
-            ownership_ranges_by_rank=(((0, valid_tokens, 0),) if valid_tokens else (),),
-            token_counts_by_rank=(valid_tokens,),
-        )
-    runtime_config = _config_for_runtime_cp(topology=topology, config=config)
-    _row_spec, chunk_ranges, owners, _wave_assignment = _runtime_plan_assignment(
-        spec,
-        topology=topology,
-        config=runtime_config,
-    )
-    del original_seq_len
-    return _build_runtime_token_layout_index(
-        chunk_ranges=chunk_ranges,
-        owners=owners,
-        cp_size=max(int(topology.cp), 1),
     )
 
 
@@ -2158,19 +2316,27 @@ def prepare_cp_micro(
     cp_group: Any,
     cp_rank: int,
     build_gdn_execution_spec: bool = False,
+    gdn_planner_config: Any | None = None,
     trace_token_uids: bool = False,
     prepare_execution_state: bool = True,
     block_mask_variants: tuple[CpBlockMaskVariant, ...] = (),
     target_device: torch.device | None = None,
     ref_logprobs: torch.Tensor | None = None,
+    model_support_handler: Any | None = None,
+    attention_head_dim: int | None = None,
+    attention_value_head_dim: int | None = None,
 ) -> PreparedMegatronBatch:
     """Prepare one CP microbatch with a CPU-only planning phase.
 
-    The intended overlap contract is: build the shared-prefix/runtime plan from
+    The intended overlap contract is: build the prefix-tree/runtime plan from
     CPU metadata, then materialize local tensors and BlockMasks on
     `target_device`. Passing CUDA `group_ids` or `parent_ids` still works for
     older direct callers, but it reintroduces D2H syncs and invalidates the
     host-ahead/device-behind lookahead assumption.
+
+    Model-owned state is built exactly once here, after rank-local dispatch.
+    Its handler must only enqueue device work: scalar CUDA reads would expose
+    planning on the host and invalidate lookahead overlap.
     """
     state, rank_plan, spec, pad_multiple = prepare_megatron_context_parallel_state(
         micro=micro,
@@ -2179,10 +2345,11 @@ def prepare_cp_micro(
         cp_group=cp_group,
         cp_rank=cp_rank,
         build_gdn_execution_spec=build_gdn_execution_spec,
+        gdn_planner_config=gdn_planner_config,
         block_mask_variants=block_mask_variants,
         target_device=target_device,
     )
-    tensors = dispatch_megatron_context_parallel_training_tensors(
+    tensors, workload = dispatch_megatron_context_parallel_training_tensors(
         micro=micro,
         rank_plan=rank_plan,
         spec=spec,
@@ -2192,8 +2359,25 @@ def prepare_cp_micro(
         cp_group=cp_group,
         ref_logprobs=ref_logprobs,
     )
+    if model_support_handler is not None:
+        from art.megatron.model_support.spec import PrefixTreeModelStateContext
+
+        state.model_state = dict(
+            model_support_handler.build_prefix_tree_model_state(
+                PrefixTreeModelStateContext(
+                    input_pos=tensors.input_pos,
+                    group_ids=micro["group_ids"],
+                    parent_ids=micro["parent_ids"],
+                    device=tensors.tokens.device,
+                    attention_token_layout_index=rank_plan.token_layout_index,
+                    attention_head_dim=attention_head_dim,
+                    attention_value_head_dim=attention_value_head_dim,
+                    context_parallel_state=state,
+                )
+            )
+        )
     if tensors.token_uids is not None:
-        state = state.model_copy(update={"trace_token_uids": tensors.token_uids})
+        state = replace(state, trace_token_uids=tensors.token_uids)
     if prepare_execution_state:
         from .executor import prepare_context_parallel_execution_state
 
@@ -2205,9 +2389,50 @@ def prepare_cp_micro(
         tensors=tensors,
         packed_seq_params=None,
         attention_state=state,
+        workload=workload,
         rank_plan=rank_plan,
         pad_multiple=pad_multiple,
     )
+
+
+def preplan_megatron_context_parallel_state(
+    *,
+    group_ids: torch.Tensor,
+    parent_ids: torch.Tensor,
+    original_seq_len: int,
+    topology: ParallelTopology,
+    config: ContextParallelConfig,
+    cp_rank: int,
+    build_gdn_execution_spec: bool = False,
+    gdn_planner_config: Any | None = None,
+) -> str:
+    """Warm one rank's immutable CPU plans without touching CUDA or collectives."""
+    if int(topology.cp) <= 1:
+        raise RuntimeError("context-parallel preplanning requires CP > 1")
+    planning_key, bundle, _group_ids, _parent_ids = _get_or_build_planning_bundle(
+        group_ids=group_ids,
+        parent_ids=parent_ids,
+        topology=topology,
+        config=config,
+        original_seq_len=original_seq_len,
+        build_gdn_execution_spec=build_gdn_execution_spec,
+    )
+    _get_or_build_bundle_rank_plan(
+        planning_key=planning_key,
+        bundle=bundle,
+        original_seq_len=original_seq_len,
+        target_rank=cp_rank,
+        block_size=int(config.block_size),
+    )
+    if build_gdn_execution_spec:
+        _plan_gdn_rank_execution(
+            planning_key=planning_key,
+            bundle=bundle,
+            topology=topology,
+            cp_rank=cp_rank,
+            gdn_planner_config=gdn_planner_config,
+        )
+    return planning_key
 
 
 def prepare_megatron_context_parallel_state(
@@ -2218,6 +2443,7 @@ def prepare_megatron_context_parallel_state(
     cp_group: Any,
     cp_rank: int,
     build_gdn_execution_spec: bool = False,
+    gdn_planner_config: Any | None = None,
     block_mask_variants: tuple[CpBlockMaskVariant, ...] = (),
     target_device: torch.device | None = None,
 ) -> tuple[ArtContextParallelState, RankRuntimePlan, PackedBatchAttentionSpec, int]:
@@ -2226,7 +2452,7 @@ def prepare_megatron_context_parallel_state(
     This is the portion of CP prepare that must stay free of CUDA reads so the
     training loop can run it after enqueueing backward for the previous
     microbatch. If device metadata reaches this function, scalar reads,
-    cache-key hashing, and shared-prefix parsing can block the host on GPU work.
+    cache-key hashing, and prefix-tree parsing can block the host on GPU work.
     """
     if int(topology.cp) <= 1:
         raise RuntimeError(
@@ -2242,95 +2468,51 @@ def prepare_megatron_context_parallel_state(
             "ART context parallel currently supports exactly one packed sequence at a time, "
             f"got batch={int(micro['group_ids'].shape[0])}."
         )
-    group_ids_cpu = _planning_metadata_cpu(micro["group_ids"])
-    parent_ids_cpu = _planning_metadata_cpu(micro["parent_ids"])
     input_pos_cpu = _planning_metadata_cpu(micro["input_pos"])
-    runtime_config = _config_for_runtime_cp(topology=topology, config=config)
-    planning_key = _planning_bundle_cache_key(
-        group_ids=group_ids_cpu,
-        parent_ids=parent_ids_cpu,
+    planning_key, bundle, group_ids_cpu, parent_ids_cpu = _get_or_build_planning_bundle(
+        group_ids=micro["group_ids"],
+        parent_ids=micro["parent_ids"],
         topology=topology,
-        config=runtime_config,
+        config=config,
         original_seq_len=int(micro["tokens"].shape[1]),
         build_gdn_execution_spec=build_gdn_execution_spec,
     )
-    bundle = _PLANNING_BUNDLE_CACHE.get(planning_key)
-    if bundle is None:
-        spec = build_shared_prefix_attention_spec(
-            group_ids=group_ids_cpu,
-            parent_ids=parent_ids_cpu,
-        )
-        runtime_key = make_runtime_key(spec, topology=topology, config=runtime_config)
-        runtime_plan = get_or_build_runtime_plan(
-            spec,
-            topology=topology,
-            config=runtime_config,
-            runtime_key=runtime_key,
-            original_seq_len=int(micro["tokens"].shape[1]),
-        )
-        gdn_execution_spec = None
-        if build_gdn_execution_spec:
-            from art.megatron.gdn.gdn_shared_prefix import (
-                parse_gdn_shared_prefix_segments,
-            )
-
-            gdn_execution_spec = parse_gdn_shared_prefix_segments(
-                group_ids_cpu,
-                parent_ids_cpu,
-                min_completions_per_family=0,
-            )
-        bundle = _PlanningBundle(
-            spec=spec,
-            runtime_key=runtime_key,
-            runtime_plan=runtime_plan,
-            gdn_execution_spec=gdn_execution_spec,
-        )
-        _cache_put(_PLANNING_BUNDLE_CACHE, planning_key, bundle)
-    rank_plan = bundle.runtime_plan.rank_plans[int(cp_rank)]
+    rank_plan = _get_or_build_bundle_rank_plan(
+        planning_key=planning_key,
+        bundle=bundle,
+        original_seq_len=int(micro["tokens"].shape[1]),
+        target_rank=cp_rank,
+        block_size=int(config.block_size),
+    )
     gdn_execution_plan = None
     if build_gdn_execution_spec:
-        if bundle.gdn_execution_spec is None:
-            raise RuntimeError("GDN CP planning requires a parsed execution spec")
+        _plan_gdn_rank_execution(
+            planning_key=planning_key,
+            bundle=bundle,
+            topology=topology,
+            cp_rank=cp_rank,
+            gdn_planner_config=gdn_planner_config,
+        )
         gdn_plan_device = (
             target_device if target_device is not None else micro["tokens"].device
         )
-        rank_gdn_key = _rank_plan_cache_key(
+        gdn_execution_plan = _materialize_preplanned_gdn_rank_execution(
             planning_key=planning_key,
+            cp_rank=cp_rank,
+            gdn_planner_config=gdn_planner_config,
             device=gdn_plan_device,
-            cp_rank=int(cp_rank),
         )
-        gdn_execution_plan = _GDN_RANK_PLAN_CACHE.get(rank_gdn_key)
-        if gdn_execution_plan is None:
-            from art.megatron.gdn.gdn_shared_prefix import (
-                build_gdn_rank_execution_plan,
-            )
-
-            gdn_execution_plan = build_gdn_rank_execution_plan(
-                bundle.gdn_execution_spec,
-                device=gdn_plan_device,
-                cp_rank=int(cp_rank),
-                cp_size=int(topology.cp),
-                attention_token_layout_index=rank_plan.token_layout_index,
-            )
-            _cache_put(_GDN_RANK_PLAN_CACHE, rank_gdn_key, gdn_execution_plan)
-    planner_provenance = _planner_provenance(
-        topology=topology,
-        config=runtime_config,
-        warn=int(cp_rank) == 0,
-    )
     pad_multiple = int(topology.tp) if bool(topology.sp) and int(topology.tp) > 1 else 1
     state = ArtContextParallelState(
-        runtime_key=bundle.runtime_key,
         rank_plan=rank_plan,
         cp_group=cp_group,
-        config=runtime_config,
+        config=config,
         group_ids=group_ids_cpu[0].contiguous(),
         parent_ids=parent_ids_cpu[0].contiguous(),
         input_pos=input_pos_cpu[0].contiguous(),
         block_mask_variants=block_mask_variants,
         gdn_execution_spec=bundle.gdn_execution_spec,
         gdn_execution_plan=gdn_execution_plan,
-        planner_provenance=planner_provenance,
         trace_token_uids=None,
     )
     return state, rank_plan, bundle.spec, pad_multiple
@@ -2346,7 +2528,7 @@ def dispatch_megatron_context_parallel_training_tensors(
     target_device: torch.device | None = None,
     cp_group: Any | None = None,
     ref_logprobs: torch.Tensor | None = None,
-) -> DispatchedPackedTensors:
+) -> tuple[DispatchedPackedTensors, TrainingMicrobatchWorkload]:
     """Gather this rank's training tensors and optionally move them to device.
 
     Dispatch may enqueue H2D copies when `target_device` is CUDA, but it must
@@ -2378,118 +2560,59 @@ def dispatch_megatron_context_parallel_training_tensors(
         if trace_token_uids
         else None
     )
-    local_tokens = _dispatch_tensor(
-        micro["tokens"],
-        rank_plan=rank_plan,
-        pad_value=0,
-        pad_multiple=pad_multiple,
-        dispatch_meta_cache=dispatch_meta_cache,
-    )
-    local_labels = _dispatch_tensor(
-        labels,
-        rank_plan=rank_plan,
-        pad_value=-100,
-        pad_multiple=pad_multiple,
-        dispatch_meta_cache=dispatch_meta_cache,
-    )
-    local_input_pos = _dispatch_tensor(
-        micro["input_pos"],
-        rank_plan=rank_plan,
-        pad_value=0,
-        pad_multiple=pad_multiple,
-        dispatch_meta_cache=dispatch_meta_cache,
-    )
-    local_assistant_mask = _dispatch_tensor(
-        assistant_mask,
-        rank_plan=rank_plan,
-        pad_value=False,
-        pad_multiple=pad_multiple,
-        dispatch_meta_cache=dispatch_meta_cache,
-    ).to(dtype=torch.bool)
-    local_group_ids = _dispatch_tensor(
-        shifted_group_ids,
-        rank_plan=rank_plan,
-        pad_value=0,
-        pad_multiple=pad_multiple,
-        dispatch_meta_cache=dispatch_meta_cache,
-    )
-    local_old_logprobs = _dispatch_tensor(
-        old_logprobs,
-        rank_plan=rank_plan,
-        pad_value=float("nan"),
-        pad_multiple=pad_multiple,
-        dispatch_meta_cache=dispatch_meta_cache,
-    )
-    local_original_logprobs = (
-        None
-        if original_logprobs is None
-        else _dispatch_tensor(
-            original_logprobs,
+
+    def dispatch(
+        tensor: torch.Tensor,
+        pad_value: int | float | bool,
+        *,
+        move_to_target: bool = True,
+    ) -> torch.Tensor:
+        local = _dispatch_tensor(
+            tensor,
             rank_plan=rank_plan,
-            pad_value=0.0,
+            pad_value=pad_value,
             pad_multiple=pad_multiple,
             dispatch_meta_cache=dispatch_meta_cache,
         )
-    )
-    local_ref_logprobs = (
-        None
-        if ref_logprobs is None
-        else _dispatch_tensor(
-            ref_logprobs,
-            rank_plan=rank_plan,
-            pad_value=float("nan"),
-            pad_multiple=pad_multiple,
-            dispatch_meta_cache=dispatch_meta_cache,
-        )
-    )
-    local_advantages = _dispatch_tensor(
-        advantages,
-        rank_plan=rank_plan,
-        pad_value=0.0,
-        pad_multiple=pad_multiple,
-        dispatch_meta_cache=dispatch_meta_cache,
-    )
-    local_weights = _dispatch_tensor(
-        weights,
-        rank_plan=rank_plan,
-        pad_value=0.0,
-        pad_multiple=pad_multiple,
-        dispatch_meta_cache=dispatch_meta_cache,
+        return _to_target_device(local, target_device) if move_to_target else local
+
+    def maybe_dispatch(
+        tensor: torch.Tensor | None,
+        pad_value: int | float | bool,
+    ) -> torch.Tensor | None:
+        return None if tensor is None else dispatch(tensor, pad_value)
+
+    local_labels = dispatch(labels, -100, move_to_target=False)
+    lm_head_selection = LmHeadTokenSelection.from_labels(
+        local_labels,
+        target_device=target_device,
     )
     local_token_uids = (
-        None
-        if token_uids is None
-        else _dispatch_tensor(
-            token_uids,
-            rank_plan=rank_plan,
-            pad_value=-1,
-            pad_multiple=pad_multiple,
-            dispatch_meta_cache=dispatch_meta_cache,
-        )
+        None if token_uids is None else dispatch(token_uids, -1, move_to_target=False)
     )
-    return DispatchedPackedTensors(
-        tokens=_to_target_device(local_tokens, target_device),
+    tensors = DispatchedPackedTensors(
+        tokens=dispatch(micro["tokens"], 0),
         labels=_to_target_device(local_labels, target_device),
-        input_pos=_to_target_device(local_input_pos, target_device),
-        assistant_mask=_to_target_device(local_assistant_mask, target_device),
-        group_ids=_to_target_device(local_group_ids, target_device),
-        old_logprobs=_to_target_device(local_old_logprobs, target_device),
-        advantages=_to_target_device(local_advantages, target_device),
-        weights=_to_target_device(local_weights, target_device),
+        input_pos=dispatch(micro["input_pos"], 0),
+        assistant_mask=dispatch(assistant_mask, False).to(dtype=torch.bool),
+        group_ids=dispatch(shifted_group_ids, 0),
+        old_logprobs=dispatch(old_logprobs, float("nan")),
+        advantages=dispatch(advantages, 0.0),
+        weights=dispatch(weights, 0.0),
         valid_lengths=rank_plan.local_valid_lengths,
-        original_logprobs=(
-            None
-            if local_original_logprobs is None
-            else _to_target_device(local_original_logprobs, target_device)
-        ),
-        ref_logprobs=(
-            None
-            if local_ref_logprobs is None
-            else _to_target_device(local_ref_logprobs, target_device)
-        ),
+        lm_head_selection=lm_head_selection,
+        original_logprobs=maybe_dispatch(original_logprobs, 0.0),
+        ref_logprobs=maybe_dispatch(ref_logprobs, float("nan")),
         loss_all_reduce_group=cp_group,
         token_uids=None if local_token_uids is None else local_token_uids.contiguous(),
     )
+    workload = TrainingMicrobatchWorkload(
+        logical_nonpadding_tokens=sum(rank_plan.local_valid_lengths),
+        loss_bearing_tokens=int((local_labels != -100).sum().item()),
+        executed_token_equivalents=int(local_labels.numel()),
+        nominal_schedule_capacity_tokens=rank_plan.original_seq_len,
+    )
+    return tensors, workload
 
 
 def get_or_build_runtime_plan(
@@ -2497,12 +2620,13 @@ def get_or_build_runtime_plan(
     *,
     topology: ParallelTopology,
     config: ContextParallelConfig,
-    runtime_key: ContextParallelRuntimeKey,
     original_seq_len: int,
-) -> ContextParallelRuntimePlan:
-    key = (
-        _json_cache_key(runtime_key.model_dump(mode="json")),
-        int(original_seq_len),
+) -> tuple[RankRuntimePlan, ...]:
+    key = _runtime_plan_cache_key(
+        spec,
+        topology=topology,
+        config=config,
+        original_seq_len=original_seq_len,
     )
     cached = _RUNTIME_PLAN_CACHE.get(key)
     if cached is not None:
@@ -2515,25 +2639,6 @@ def get_or_build_runtime_plan(
     )
     _cache_put(_RUNTIME_PLAN_CACHE, key, plan)
     return plan
-
-
-def get_or_build_rank_runtime_plan(
-    spec: PackedBatchAttentionSpec,
-    *,
-    topology: ParallelTopology,
-    config: ContextParallelConfig,
-    runtime_key: ContextParallelRuntimeKey,
-    original_seq_len: int,
-    target_rank: int,
-) -> RankRuntimePlan:
-    del runtime_key
-    return _build_rank_runtime_plan_for_spec(
-        spec,
-        topology=topology,
-        config=config,
-        original_seq_len=original_seq_len,
-        target_rank=target_rank,
-    )
 
 
 def _runtime_plan_assignment(
@@ -2572,6 +2677,7 @@ def _runtime_plan_assignment(
         chunk_ranges=chunk_ranges,
     )
     owners, wave_assignment, _planner_eval = _search_chunk_assignment(
+        row_spec=row_spec,
         chunk_ranges=chunk_ranges,
         pair_matrix=pair_matrix,
         q_weights=q_weights,
@@ -2581,45 +2687,13 @@ def _runtime_plan_assignment(
     return row_spec, chunk_ranges, owners, wave_assignment
 
 
-def _build_rank_runtime_plan_for_spec(
-    spec: PackedBatchAttentionSpec,
-    *,
-    topology: ParallelTopology,
-    config: ContextParallelConfig,
-    original_seq_len: int,
-    target_rank: int,
-) -> RankRuntimePlan:
-    row_spec, chunk_ranges, owners, wave_assignment = _runtime_plan_assignment(
-        spec,
-        topology=topology,
-        config=config,
-    )
-    cp_size = max(int(topology.cp), 1)
-    token_layout_index = _build_runtime_token_layout_index(
-        chunk_ranges=chunk_ranges,
-        owners=owners,
-        cp_size=cp_size,
-    )
-    return _build_rank_runtime_plan(
-        row_spec=row_spec,
-        chunk_ranges=chunk_ranges,
-        owners=owners,
-        wave_assignment=wave_assignment,
-        token_layout_index=token_layout_index,
-        cp_size=cp_size,
-        original_seq_len=original_seq_len,
-        target_rank=int(target_rank),
-        block_size=int(config.block_size),
-    )
-
-
 def _build_runtime_plan(
     spec: PackedBatchAttentionSpec,
     *,
     topology: ParallelTopology,
     config: ContextParallelConfig,
     original_seq_len: int,
-) -> ContextParallelRuntimePlan:
+) -> tuple[RankRuntimePlan, ...]:
     row_spec, chunk_ranges, owners, wave_assignment = _runtime_plan_assignment(
         spec,
         topology=topology,
@@ -2631,7 +2705,7 @@ def _build_runtime_plan(
         owners=owners,
         cp_size=cp_size,
     )
-    rank_plans = [
+    return tuple(
         _build_rank_runtime_plan(
             row_spec=row_spec,
             chunk_ranges=chunk_ranges,
@@ -2644,12 +2718,6 @@ def _build_runtime_plan(
             block_size=int(config.block_size),
         )
         for rank in range(cp_size)
-    ]
-    return ContextParallelRuntimePlan(
-        topology=topology,
-        config=config,
-        token_layout_index=token_layout_index,
-        rank_plans=tuple(rank_plans),
     )
 
 
@@ -2677,9 +2745,43 @@ def _build_runtime_token_layout_index(
 def _row_signature(row_spec: PackedRowAttentionSpec) -> str:
     payload = {
         "valid_tokens": row_spec.valid_tokens,
-        "slices": [slice_.model_dump(mode="json") for slice_ in row_spec.slices],
+        "slices": [_attn_slice_payload(slice_) for slice_ in row_spec.slices],
     }
     return json.dumps(payload, sort_keys=True)
+
+
+def _runtime_plan_cache_key(
+    spec: PackedBatchAttentionSpec,
+    *,
+    topology: ParallelTopology,
+    config: ContextParallelConfig,
+    original_seq_len: int,
+) -> str:
+    return _json_cache_key(
+        {
+            "topology": _dataclass_payload(topology),
+            "config": _dataclass_payload(config),
+            "row_signatures": tuple(_row_signature(row) for row in spec.rows),
+            "original_seq_len": int(original_seq_len),
+        }
+    )
+
+
+def _dataclass_payload(value: Any) -> dict[str, Any]:
+    return {
+        key: (item.model_dump(mode="json") if isinstance(item, BaseModel) else item)
+        for key, item in value.__dict__.items()
+    }
+
+
+def _attn_slice_payload(slice_: AttnSlice) -> dict[str, Any]:
+    return {
+        "q_range": _dataclass_payload(slice_.q_range),
+        "k_range": _dataclass_payload(slice_.k_range),
+        "mask_kind": slice_.mask_kind.value,
+        "row_index": slice_.row_index,
+        "family_index": slice_.family_index,
+    }
 
 
 def _range_key(range_: TokenRange) -> tuple[int, int]:
@@ -2721,101 +2823,6 @@ def _set_stage_token_indices(
             f"{int(source_indices[mismatch_offset].item())}"
         )
     current_indices.copy_(source_indices)
-
-
-def _token_costs(row_spec: PackedRowAttentionSpec) -> list[float]:
-    costs = [0.0] * row_spec.valid_tokens
-    for slice_ in row_spec.slices:
-        q_range = slice_.q_range
-        k_range = slice_.k_range
-        if slice_.mask_kind is AttnMaskKind.FULL:
-            cost = float(k_range.size())
-            for q_idx in range(q_range.start, q_range.end):
-                costs[q_idx] += cost
-            continue
-        if q_range.size() != k_range.size():
-            raise RuntimeError(
-                "The current planner only supports causal slices with matched q/k sizes, got "
-                f"{q_range} vs {k_range}"
-            )
-        for q_idx in range(q_range.start, q_range.end):
-            costs[q_idx] += float(q_idx - q_range.start + 1)
-    return costs
-
-
-def _split_row_by_cost(
-    row_spec: PackedRowAttentionSpec,
-    *,
-    cp_size: int,
-    block_size: int,
-) -> tuple[TokenRange | None, ...]:
-    if cp_size == 1:
-        return (TokenRange(start=0, end=row_spec.valid_tokens),)
-    if row_spec.valid_tokens == 0:
-        return tuple(None for _ in range(cp_size))
-
-    costs = _token_costs(row_spec)
-    prefix = [0.0]
-    for cost in costs:
-        prefix.append(prefix[-1] + cost)
-    total_cost = prefix[-1]
-    boundaries = [0]
-    block_aligned_split = int(block_size) > 1 and row_spec.valid_tokens >= (
-        cp_size * int(block_size)
-    )
-    for split_index in range(1, cp_size):
-        remaining_ranks = cp_size - split_index
-        min_boundary = boundaries[-1]
-        max_boundary = row_spec.valid_tokens - remaining_ranks
-        if max_boundary <= min_boundary:
-            boundaries.append(min_boundary)
-            continue
-        target = (
-            total_cost * split_index / cp_size
-            if total_cost > 0.0
-            else row_spec.valid_tokens * split_index / cp_size
-        )
-        best_boundary = min_boundary + 1
-        best_error = float("inf")
-        candidate_boundaries = range(min_boundary + 1, max_boundary + 1)
-        if block_aligned_split:
-            aligned_start = (
-                (min_boundary + 1 + block_size - 1) // block_size
-            ) * block_size
-            aligned_end = (max_boundary // block_size) * block_size
-            if aligned_start <= aligned_end:
-                candidate_boundaries = range(aligned_start, aligned_end + 1, block_size)
-        for boundary in candidate_boundaries:
-            current = prefix[boundary] if total_cost > 0.0 else float(boundary)
-            error = abs(current - target)
-            if error < best_error:
-                best_error = error
-                best_boundary = boundary
-        boundaries.append(best_boundary)
-    boundaries.append(row_spec.valid_tokens)
-
-    ranges: list[TokenRange | None] = []
-    for start, end in zip(boundaries[:-1], boundaries[1:]):
-        if end <= start:
-            ranges.append(None)
-        else:
-            ranges.append(TokenRange(start=start, end=end))
-    return tuple(ranges)
-
-
-def _intersections(
-    base_range: TokenRange,
-    owner_ranges: tuple[TokenRange | None, ...],
-) -> list[tuple[int, TokenRange]]:
-    intersections: list[tuple[int, TokenRange]] = []
-    for rank, owner_range in enumerate(owner_ranges):
-        if owner_range is None:
-            continue
-        start = max(base_range.start, owner_range.start)
-        end = min(base_range.end, owner_range.end)
-        if end > start:
-            intersections.append((rank, TokenRange(start=start, end=end)))
-    return intersections
 
 
 def _resolve_stage_mask_kind(

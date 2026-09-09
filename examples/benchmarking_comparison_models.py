@@ -175,6 +175,7 @@ async def main():
 
     # We also can define the models we want to train.
     qwen = art.TrainableModel(
+        run_name="qwen-2.5-14b-instruct",
         name="qwen-2.5-14b-instruct",
         project=PROJECT_NAME,
         base_model="Qwen/Qwen2.5-14B-Instruct",

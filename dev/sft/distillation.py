@@ -50,6 +50,7 @@ async def main():
     # Train student model
     backend = LocalBackend()
     student = art.TrainableModel(
+        run_name="sft-distillation-001",
         name="sft-distillation-001",
         project="sft-distillation",
         base_model=STUDENT_BASE_MODEL,

@@ -18,6 +18,7 @@ class MinimalLayerCoverageReport(BaseModel):
 class ValidationStageResult(BaseModel):
     name: str
     passed: bool = False
+    skipped: bool = False
     metrics: dict[str, Any] = Field(default_factory=dict)
     artifact_dir: str | None = None
 
@@ -26,5 +27,7 @@ class ValidationReport(BaseModel):
     git: dict[str, Any]
     base_model: str
     model_key: str
+    passed: bool = False
+    complete: bool = False
     dependency_versions: dict[str, str] = Field(default_factory=dict)
     stages: list[ValidationStageResult] = Field(default_factory=list)

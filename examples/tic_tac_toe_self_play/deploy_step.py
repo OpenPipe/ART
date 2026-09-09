@@ -19,6 +19,7 @@ async def deploy_step():
     args = parser.parse_args()
 
     model = art.TrainableModel(
+        run_name=MODEL_NAME,
         name=MODEL_NAME,
         project=PROJECT_NAME,
         base_model=BASE_MODEL,
