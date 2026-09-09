@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib.util
 from pathlib import Path
 import sys
+from typing import Any
 
 import numpy as np
 
@@ -365,3 +366,102 @@ def test_completeness_counts_only_current_planner_rows(tmp_path: Path) -> None:
         + "\n"
     )
     assert fit.validate_completeness([full], repeat=8) == []
+
+
+def test_recertification_carries_certificate_cells_the_evidence_does_not_remeasure(
+    tmp_path: Path,
+) -> None:
+    """--from-certificate with evidence: re-measured cells come from the rows,
+    the certificate's other cells keep their recorded aggregates, and both the
+    manifest fingerprints and the completeness check see the carried cells."""
+
+    import json
+
+    cell_a = {"cell": "cal-grpo-g8", "model": "m", "layers": 2, "tp": 1, "cp": 1}
+    cell_b = {"cell": "cal-grpo-g8", "model": "m", "layers": 2, "tp": 1, "cp": 2}
+    key_a, key_b = fit._cell_key(cell_a), fit._cell_key(cell_b)
+    features = {
+        "packed_tokens": 4096,
+        "segment_count": 8,
+        "max_depth": 1,
+        "segments_below": [0] * 8,
+    }
+    facts = {"layers": 2.0, "gdn_layers": 0.0, "tp": 1.0, "cp": 1.0, "uses_gdn": 0.0}
+    fingerprint = {
+        "source": "s",
+        "requests_sha256": "r",
+        "device": "d",
+        "param_dtype": "bf16",
+        "hidden_size": 8,
+        "geometry": {"hidden_size": 8},
+    }
+    certificate = {
+        "schema": fit.CERTIFICATE_SCHEMA,
+        "cells": [
+            {
+                "cell": key,
+                "facts": {**facts, "cp": float(cell["cp"])},
+                "shape": [1, cell["cp"], 1, 1],
+                **fingerprint,
+                "candidates": [
+                    {
+                        "label": "depth_one",
+                        "features": features,
+                        "median_ms": 100.0,
+                        "n": 8,
+                        "spread_pct": 1.0,
+                    }
+                ],
+            }
+            for key, cell in ((key_a, cell_a), (key_b, cell_b))
+        ],
+    }
+    cert_path = tmp_path / "certificate.json"
+    cert_path.write_text(json.dumps(certificate))
+    # New evidence re-measures cell B only.
+    rows: list[dict[str, Any]] = [
+        {
+            **cell_b,
+            **fingerprint,
+            "record_type": "calibration_cell",
+            "candidates": [{"label": "depth_one", "features": features}],
+        }
+    ]
+    rows += [
+        {
+            **cell_b,
+            "record_type": "calibration_sample",
+            "role": "measured",
+            "candidate_label": "depth_one",
+            "compile_statuses": ["none"],
+            "round": i,
+            "ms_max_rank": 90.0,
+        }
+        for i in range(8)
+    ]
+    evidence = tmp_path / "evidence.jsonl"
+    evidence.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+    carried, records = fit.carried_certificate_cells(cert_path, [evidence])
+    assert [c.cell for c in carried] == [key_a] and [r["cell"] for r in records] == [
+        key_a
+    ]
+    assert carried[0].ms == 100.0
+    # Completeness: the carried cell is judged by its recorded count.
+    assert fit.validate_completeness([evidence], repeat=8, carried=records) == []
+    gaps = fit.validate_completeness([evidence], repeat=9, carried=records)
+    assert f"{key_a}: depth_one carried with 8 rows (< 9)" in gaps
+    assert f"{key_b}: depth_one has 8 usable rows (< 9)" in gaps
+    # Manifest: the carried cell counts as present with its recorded fingerprint.
+    manifest = {
+        "schema": fit.MANIFEST_SCHEMA,
+        "cells": [{"key": key_a}, {"key": key_b}],
+        "excluded": [],
+    }
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text(json.dumps(manifest))
+    problems, _ = fit.validate_manifest(
+        [evidence], manifest_path, excluded=[], carried=records
+    )
+    assert problems == []
+    problems, _ = fit.validate_manifest([evidence], manifest_path, excluded=[])
+    assert problems == [f"expected cell missing from the evidence: {key_a}"]

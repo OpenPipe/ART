@@ -119,6 +119,23 @@ def _cell_key(row: dict[str, Any]) -> str:
     )
 
 
+def carried_certificate_cells(
+    certificate_path: Path, evidence: list[Path]
+) -> tuple[list[Candidate], list[dict[str, Any]]]:
+    """Certificate cells the evidence does not re-measure, as candidates plus
+    their recorded cell records (fingerprints, facts, per-candidate counts).
+
+    Re-certifying after a runtime change re-measures the affected shapes only;
+    the other cells keep their certified aggregates, which the certificate
+    records exactly (medians, counts, spreads, features, fingerprints)."""
+
+    measured = set(cell_fingerprints(evidence))
+    candidates, payload = load_certificate(certificate_path)
+    records = [cell for cell in payload["cells"] if cell["cell"] not in measured]
+    carried = {cell["cell"] for cell in records}
+    return [c for c in candidates if c.cell in carried], records
+
+
 def production_regret(
     candidates: list[Candidate], paths: list[Path]
 ) -> dict[str, dict[str, Any]]:
@@ -167,7 +184,9 @@ def production_regret(
     return report
 
 
-def validate_completeness(paths: list[Path], *, repeat: int) -> list[str]:
+def validate_completeness(
+    paths: list[Path], *, repeat: int, carried: list[dict[str, Any]] = ()
+) -> list[str]:
     """Every mandatory candidate of every cell must have ``repeat`` usable rows.
 
     The runners record failures, and the fitter silently skips thin candidates,
@@ -204,6 +223,12 @@ def validate_completeness(paths: list[Path], *, repeat: int) -> list[str]:
                 ):
                     usable[(key, label)] += 1
     gaps: list[str] = []
+    for record in carried:
+        for c in record["candidates"]:
+            if c["label"] != "automatic" and int(c["n"]) < repeat:
+                gaps.append(
+                    f"{record['cell']}: {c['label']} carried with {c['n']} rows (< {repeat})"
+                )
     for cell, labels in expected.items():
         for label in labels:
             if (cell, label) in failed:
@@ -250,6 +275,7 @@ def validate_manifest(
     *,
     excluded: list[str],
     exact: bool = False,
+    carried: list[dict[str, Any]] = (),
 ) -> tuple[list[str], list[str]]:
     """Exact cell identities: every expected cell present unless excluded, no
     unexpected cells, exclusions listed in the manifest, and one execution
@@ -261,6 +287,8 @@ def validate_manifest(
     expected = {cell["key"] for cell in manifest["cells"]}
     listed_exclusions = {cell["key"] for cell in manifest["excluded"]}
     present = cell_fingerprints(paths)
+    for record in carried:
+        present[record["cell"]].add(_fingerprint(record))
     problems: list[str] = []
     excluded_keys = {
         key
@@ -297,6 +325,7 @@ def export_certificate(
     table_id: str = "",
     reranked: list[Candidate] | None = None,
     reranker: dict[str, Any] | None = None,
+    carried: list[dict[str, Any]] = (),
 ) -> None:
     """Write the compact, reproducible record binding the table to its data.
 
@@ -328,6 +357,23 @@ def export_certificate(
                     "geometry": row.get("geometry"),
                     "shape": list(_shape(row)),
                 }
+    for record in carried:
+        fingerprints[record["cell"]] = {
+            key: record.get(key)
+            for key in (
+                "requests_sha256",
+                "source",
+                "workload",
+                "model",
+                "device",
+                "device_capability",
+                "device_memory_class",
+                "param_dtype",
+                "hidden_size",
+                "geometry",
+                "shape",
+            )
+        }
     by_cell: dict[str, list[Candidate]] = defaultdict(list)
     for candidate in [*candidates, *(reranked or [])]:
         by_cell[candidate.cell].append(candidate)
@@ -1329,6 +1375,14 @@ def main() -> None:
     )
     arguments = parser.parse_args()
     terms = tuple(t for t in arguments.terms.split(",") if t)
+    # Re-certification: cells the evidence does not re-measure are carried
+    # from the previous certificate as their recorded aggregates.
+    carried: list[Candidate] = []
+    carried_records: list[dict[str, Any]] = []
+    if arguments.from_certificate and arguments.evidence:
+        carried, carried_records = carried_certificate_cells(
+            Path(arguments.from_certificate), arguments.evidence
+        )
     if arguments.exclude_cells == "@manifest":
         # Exactly the manifest's listed exclusions (each carries its reason).
         if not arguments.manifest:
@@ -1350,6 +1404,7 @@ def main() -> None:
             Path(arguments.manifest),
             excluded=excluded,
             exact=exact,
+            carried=carried_records,
         )
         if problems:
             print("manifest validation failed:", file=sys.stderr)
@@ -1370,7 +1425,9 @@ def main() -> None:
         gaps = [
             gap
             for gap in validate_completeness(
-                arguments.evidence, repeat=arguments.require_complete
+                arguments.evidence,
+                repeat=arguments.require_complete,
+                carried=carried_records,
             )
             if not excluded_cell(gap.split(":", 1)[0])
         ]
@@ -1382,7 +1439,16 @@ def main() -> None:
         print(
             f"evidence complete: every mandatory candidate has >= {arguments.require_complete} rows"
         )
-    if arguments.from_certificate:
+    if arguments.from_certificate and arguments.evidence:
+        candidates = sorted(
+            load_candidates(arguments.evidence) + carried,
+            key=lambda c: (c.cell, c.label),
+        )
+        print(
+            f"carried {len(carried_records)} cells from {Path(arguments.from_certificate).name}"
+            f" ({len({c.cell for c in candidates}) - len(carried_records)} re-measured)"
+        )
+    elif arguments.from_certificate:
         candidates, _certificate = load_certificate(Path(arguments.from_certificate))
     else:
         candidates = load_candidates(arguments.evidence)
@@ -1607,6 +1673,7 @@ def main() -> None:
             table_id=arguments.table_id,
             reranked=reranked,
             reranker=report.get("reranker"),
+            carried=carried_records,
         )
         print("certificate written:", arguments.export_certificate)
 
