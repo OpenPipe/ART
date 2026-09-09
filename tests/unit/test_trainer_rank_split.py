@@ -34,6 +34,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from contextlib import nullcontext
 from dataclasses import dataclass, replace
+import math
 import sys
 from types import ModuleType, SimpleNamespace
 from typing import TYPE_CHECKING, Any, cast
@@ -966,38 +967,67 @@ def test_split_subforwards_track_independent_slot_graphs(
     rank._guard_checkpoint_can_step("teacher")
 
 
+@pytest.mark.parametrize("direction", (-math.inf, None, math.inf))
 def test_retained_ratio_bound_uses_original_guard_at_trusted_endpoint(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, direction: float | None
 ) -> None:
     rank = _retained_ratio_rank(monkeypatch)
-    tokens = (
-        torch.tensor([0, 1, 2, 3, 4, 5, 6, 7]),
-        torch.tensor([0, 1, 8, 9, 10, 11, 12]),
-    )
-    original = [ForwardInput(input_tokens=t, target_tokens=t) for t in tokens]
+
+    def request(tokens: list[int], *, output: bool = True) -> ForwardInput:
+        values = torch.tensor(tokens)
+        return ForwardInput(
+            input_tokens=values, target_tokens=values if output else None
+        )
+
+    original = [
+        request([0, *range(1, 7)]),
+        request([0, *range(21, 27)]),
+        request([99], output=False),
+    ]
     observed = rank._plan_flat_forward(original, memory_minimal=True)
     assert (observed.packed_tokens, observed.logical_tokens) == (13, 15)
     rank._update_memory_profile(
-        observed, peak_delta_bytes=13 * 524288 + 60, retained_bytes=60
+        observed,
+        peak_delta_bytes=observed.output_bytes + 13,
+        retained_bytes=observed.output_bytes,
     )
-    requests = original * 64
-    plan = rank._plan_flat_forward(requests, memory_minimal=True)
-    profile = rank._memory_profiles[plan.signature]
+    requests = [
+        request([*range(24), *range(30, 58)]),
+        request([*range(24), *range(90, 118)]),
+        request(list(range(856)), output=False),
+    ]
+    minimal = rank._plan_flat_forward(requests, memory_minimal=True)
+    plan = rank._plan_flat_forward(requests)
+    profile = rank._memory_profiles[observed.signature]
     cap, limit = profile.packed_tokens * 8, profile.logical_per_packed * 8
-    assert (plan.packed_tokens, plan.logical_tokens, cap) == (13, 960, 104)
+    assert observed.signature == plan.signature
+    assert (minimal.packed_tokens, plan.packed_tokens, plan.logical_tokens) == (
+        80,
+        104,
+        960,
+    )
+    assert plan.packed_tokens == cap
     assert plan.logical_tokens / cap == limit
     # Rearranging the original comparison changes the answer at this equality.
     assert plan.logical_tokens / limit > cap
-    at_cap = rank._subforward_cost(
-        packed_tokens=cap,
-        logical_tokens=plan.logical_tokens,
-        output_bytes=plan.output_bytes,
-        signature=plan.signature,
+    if direction is not None:
+        rank._memory_profiles[plan.signature] = replace(
+            profile,
+            logical_per_packed=math.nextafter(profile.logical_per_packed, direction),
+        )
+    exact = rank._plan_cost(plan)
+    rows = [r.input_tokens for r in requests]
+    lower = rank._split_chunk_lower_cost(requests, rows, checkpoint=Unset)
+    assert (exact.retained < exact.required) == (direction != -math.inf)
+    assert (lower.retained < lower.required) == (direction != -math.inf)
+    assert lower.required <= exact.required and lower.retained <= exact.retained
+    exact_bytes = rank._split_rung_check([exact, exact]).estimated_required_bytes
+    monkeypatch.setattr(rank, "_available_memory_bytes", lambda: exact_bytes)
+    selected, check = rank._admit_split_rung(
+        [(0, 1, 2), (3, 4, 5)], requests * 2, rows * 2, checkpoint=Unset
     )
-    lower = rank._split_chunk_lower_cost(
-        requests, [r.input_tokens for r in requests], checkpoint=Unset
-    )
-    assert lower.retained == at_cap.retained == int(plan.output_bytes * 1.1)
+    assert selected is not None and check.fits
+    assert check.estimated_required_bytes == exact_bytes
 
 
 @pytest.mark.parametrize("retained", (None, 0, 2_000_000))
