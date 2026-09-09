@@ -966,3 +966,37 @@ def test_split_subforwards_track_independent_slot_graphs(
     loss(second).backward()
     rank._guard_slot_can_load(ref)
     rank._guard_checkpoint_can_step("teacher")
+
+
+def test_retained_ratio_bound_uses_original_guard_at_trusted_endpoint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rank = _retained_ratio_rank(monkeypatch)
+    tokens = (
+        torch.tensor([0, 1, 2, 3, 4, 5, 6, 7]),
+        torch.tensor([0, 1, 8, 9, 10, 11, 12]),
+    )
+    original = [ForwardInput(input_tokens=t, target_tokens=t) for t in tokens]
+    observed = rank._plan_flat_forward(original, memory_minimal=True)
+    assert (observed.packed_tokens, observed.logical_tokens) == (13, 15)
+    rank._update_memory_profile(
+        observed, peak_delta_bytes=13 * 524288 + 60, retained_bytes=60
+    )
+    requests = original * 64
+    plan = rank._plan_flat_forward(requests, memory_minimal=True)
+    profile = rank._memory_profiles[plan.signature]
+    cap, limit = profile.packed_tokens * 8, profile.logical_per_packed * 8
+    assert (plan.packed_tokens, plan.logical_tokens, cap) == (13, 960, 104)
+    assert plan.logical_tokens / cap == limit
+    # Rearranging the original comparison changes the answer at this equality.
+    assert plan.logical_tokens / limit > cap
+    at_cap = rank._subforward_cost(
+        packed_tokens=cap,
+        logical_tokens=plan.logical_tokens,
+        output_bytes=plan.output_bytes,
+        signature=plan.signature,
+    )
+    lower = rank._split_chunk_lower_cost(
+        requests, [r.input_tokens for r in requests], checkpoint=Unset
+    )
+    assert lower.retained == at_cap.retained == int(plan.output_bytes * 1.1)

@@ -2651,8 +2651,14 @@ class TrainerRank:
             and logical_tokens / max(1, packed_tokens)
             > profile.logical_per_packed * _MEMORY_PROFILE_TRUST_GROWTH
             and logical_tokens
-            / (profile.logical_per_packed * _MEMORY_PROFILE_TRUST_GROWTH)
-            <= profile.packed_tokens * _MEMORY_PROFILE_TRUST_GROWTH
+            / max(
+                1,
+                min(
+                    unshared_packed_tokens,
+                    profile.packed_tokens * _MEMORY_PROFILE_TRUST_GROWTH,
+                ),
+            )
+            <= profile.logical_per_packed * _MEMORY_PROFILE_TRUST_GROWTH
         ):
             # A larger layout may trust retained compute where full sharing
             # cannot. Its full-required retention is not a pruning lower bound.
