@@ -215,3 +215,34 @@ def test_planner_variant_switch_clears_the_registered_layout_cache(monkeypatch) 
         assert not rank._layout_selection_cache
     finally:
         driver._set_planner_variant("current")
+
+
+def test_gdn_planner_variants_bracket_the_chain_decision() -> None:
+    """The GDN A/B arms force the chain-versus-local decision both ways without
+    touching anything else: ``gdn-local`` can never meet the chain gate,
+    ``gdn-chain`` always meets it and skips the beam search."""
+
+    from dataclasses import fields
+
+    pytest.importorskip("megatron.core")
+    from art.megatron.gdn.gdn_prefix_tree import GdnPlannerConfig
+
+    base = GdnPlannerConfig()
+    assert driver._gdn_variant_config(base, "current") is base
+    assert driver._gdn_variant_config(None, "gdn-local") is None
+    local = driver._gdn_variant_config(base, "gdn-local")
+    chain = driver._gdn_variant_config(base, "gdn-chain")
+    assert local.cp_chain_min_runtime_delta_ms == float("inf")
+    assert chain.cp_chain_min_runtime_delta_ms == float("-inf")
+    assert chain.cp_chain_beam_max_steps == 0
+    for variant in (local, chain):
+        changed = {
+            f.name
+            for f in fields(base)
+            if getattr(variant, f.name) != getattr(base, f.name)
+        }
+        assert changed <= {"cp_chain_min_runtime_delta_ms", "cp_chain_beam_max_steps"}
+    with pytest.raises(ValueError):
+        driver._gdn_variant_config(base, "other")
+    for variant in driver._GDN_VARIANTS:
+        assert variant in driver._PLANNER_VARIANTS

@@ -2101,8 +2101,36 @@ CALIBRATION_CORPUS_BY_CELL = {"cal-ellavox": "qwen35", "cal-ellavox-qwen3": "qwe
 # node-to-node drift. The variant is switched by patching the config builder
 # the runtime calls for every micro-batch; the planning-bundle cache keys on
 # the config, so the two variants never share plans.
-_PLANNER_VARIANTS = ("current", "legacy")
+# Paired GDN-planner A/B (--gdn-ab): the same layouts under the production GDN
+# planner and under two forced decisions that bracket its chain-versus-local
+# choice, with the attention planner unchanged, so the paired difference is
+# the GDN decision's own cost.
+_PLANNER_VARIANTS = ("current", "legacy", "gdn-local", "gdn-chain")
+_GDN_VARIANTS = ("current", "gdn-local", "gdn-chain")
 _planner_variant = "current"
+
+
+def _gdn_variant_config(config: Any, variant: str) -> Any:
+    """The GDN planner configuration of one A/B variant.
+
+    ``gdn-local`` never chains a segment across ranks (the chain gate can never
+    be met); ``gdn-chain`` chains every legal segment (the gate is always met
+    and the beam search is skipped, so the all-chain decision stands).
+    """
+
+    from dataclasses import replace
+
+    if config is None or variant == "current":
+        return config
+    if variant == "gdn-local":
+        return replace(config, cp_chain_min_runtime_delta_ms=float("inf"))
+    if variant == "gdn-chain":
+        return replace(
+            config,
+            cp_chain_min_runtime_delta_ms=float("-inf"),
+            cp_chain_beam_max_steps=0,
+        )
+    raise ValueError(f"unknown GDN planner variant {variant!r}")
 
 
 def _legacy_planner_config(config: Any) -> Any:
@@ -2203,6 +2231,16 @@ def _install_planner_ab(rank: Any = None) -> None:
 
     microbatches._context_parallel_config_for_provider = variant_config
 
+    original_gdn = microbatches._gdn_planner_config_for_provider
+
+    def gdn_variant_config(provider: Any, handler: Any) -> Any:
+        config = original_gdn(provider, handler)
+        if _planner_variant in ("gdn-local", "gdn-chain"):
+            return _gdn_variant_config(config, _planner_variant)
+        return config
+
+    microbatches._gdn_planner_config_for_provider = gdn_variant_config
+
 
 def _set_planner_variant(variant: str) -> None:
     global _planner_variant
@@ -2224,6 +2262,46 @@ def _set_planner_variant(variant: str) -> None:
             rank._layout_selection_cache.clear()
 
 
+def _gdn_plan_summary(rank: Any, packed: Any) -> dict[str, Any] | None:
+    """The GDN planner's decision for one packed layout under the active
+    variant: chained segments, per-rank GDN token counts, exchanged tokens."""
+
+    from art.megatron.context_parallel import runtime
+    from art.megatron.training.microbatches import (
+        _context_parallel_config_for_provider,
+        _gdn_planner_config_for_provider,
+    )
+
+    handler = rank.runtime.model_support_handler
+    if not bool(getattr(handler, "build_gdn_execution_spec", False)):
+        return None
+    topology = rank._topology()
+    planning_key, bundle, _g, _p = runtime._get_or_build_planning_bundle(
+        group_ids=packed.group_ids,
+        parent_ids=packed.parent_ids,
+        topology=topology,
+        config=_context_parallel_config_for_provider(
+            rank.runtime.provider, rank.device, handler
+        ),
+        original_seq_len=int(packed.tokens.shape[1]),
+        build_gdn_execution_spec=True,
+    )
+    decision = runtime._plan_gdn_global_execution(
+        planning_key=planning_key,
+        bundle=bundle,
+        topology=topology,
+        gdn_planner_config=_gdn_planner_config_for_provider(
+            rank.runtime.provider, handler
+        ),
+    )
+    return {
+        "chained_segments": int(sum(decision.chained_nodes)),
+        "segments": int(len(decision.chained_nodes)),
+        "gdn_tokens_by_rank": [int(n) for n in decision.gdn_token_counts_by_rank],
+        "cross_rank_tokens": int(decision.cross_rank_token_count),
+    }
+
+
 def phase_cost_calibrate(
     *,
     cell: str,
@@ -2232,6 +2310,7 @@ def phase_cost_calibrate(
     group: int,
     repeat: int,
     planner_ab: bool = False,
+    gdn_ab: bool = False,
     evidence: str,
 ) -> None:
     """Time every mandatory candidate layout of one cell (GPU).
@@ -2260,6 +2339,9 @@ def phase_cost_calibrate(
         layout_features,
         predicted_us,
         prefix_tree_layout_score,
+    )
+    from art.trainer_rank._prefix_tree_materializer import (
+        materialize_prefix_tree_layout,
     )
     from art.trainer_rank._prefix_tree_planner import (
         build_canonical_prefix_tree,
@@ -2359,7 +2441,7 @@ def phase_cost_calibrate(
         rows_for_plan = tuple(
             r.input_tokens.reshape(-1).to(torch.long) for r in requests
         )
-        if planner_ab:
+        if planner_ab or gdn_ab:
             # Installed before the candidate rows so the legacy plan structure
             # recorded next to the current one is the legacy planner's.
             _install_planner_ab(rank)
@@ -2391,6 +2473,17 @@ def phase_cost_calibrate(
                     "summary_ms": (time.perf_counter() - legacy_started) * 1_000.0,
                 }
                 _set_planner_variant("current")
+            gdn_plans: dict[str, Any] = {}
+            if gdn_ab and facts.cp_size > 1:
+                packed_for_gdn = materialize_prefix_tree_layout(
+                    rows_for_plan, tree, candidate.layout, verify_shared_tokens=False
+                )
+                for gdn_variant in _GDN_VARIANTS:
+                    _set_planner_variant(gdn_variant)
+                    summary = _gdn_plan_summary(rank, packed_for_gdn)
+                    if summary is not None:
+                        gdn_plans[gdn_variant] = summary
+                _set_planner_variant("current")
             candidate_rows.append(
                 {
                     "label": candidate.labels[0],
@@ -2403,6 +2496,7 @@ def phase_cost_calibrate(
                         "summary_ms": summary_ms,
                     },
                     **({"cp_plan_legacy": legacy_plan} if legacy_plan else {}),
+                    **({"gdn_plans": gdn_plans} if gdn_plans else {}),
                     # The version-1 score: the fallback the two-stage
                     # certification must not regress against.
                     "fallback_work": int(
@@ -2539,7 +2633,11 @@ def phase_cost_calibrate(
 
         # Warm-ups per candidate (and planner variant) until compile-free
         # (bounded): a different CP plan can mean new kernel shapes.
-        variants = _PLANNER_VARIANTS if planner_ab else ("current",)
+        variants: tuple[str, ...] = ("current",)
+        if planner_ab:
+            variants += ("legacy",)
+        if gdn_ab:
+            variants += ("gdn-local", "gdn-chain")
         live: list[tuple[str, str]] = []
         for candidate in candidate_rows:
             label = str(candidate["label"])
@@ -2663,6 +2761,15 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--gdn-ab",
+        action="store_true",
+        help=(
+            "cost-calibrate: time every layout under the production GDN planner "
+            "and under its two forced decisions (never chain, chain every legal "
+            "segment) in alternating rounds; rows carry planner_variant"
+        ),
+    )
+    parser.add_argument(
         "--pressure",
         default="cap",
         choices=("cap", "ballast"),
@@ -2741,6 +2848,7 @@ def main() -> None:
             repeat=arguments.repeat,
             evidence=arguments.evidence,
             planner_ab=arguments.planner_ab,
+            gdn_ab=arguments.gdn_ab,
         )
     else:
         if not arguments.evidence:
