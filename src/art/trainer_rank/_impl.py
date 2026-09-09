@@ -2155,16 +2155,20 @@ class TrainerRank:
                 candidate = self._select_next_micro_batch(
                     items, start, checkpoint=checkpoint
                 )
+            self._snapshot_planning_telemetry(candidate.plan, candidate.check)
             if isinstance(candidate.plan, _FlatForwardPlan):
                 tracked_outputs, memory_baseline = (
                     self._run_flat_plan_with_memory_tracking(
                         candidate.plan,
+                        check=candidate.check,
                         context="forward_micro_batches",
                     )
                 )
             else:
                 tracked_outputs = self._execute_admitted_plan(
-                    candidate.plan, context="forward_micro_batches"
+                    candidate.plan,
+                    check=candidate.check,
+                    context="forward_micro_batches",
                 )
                 memory_baseline = None
             flat_outputs = iter(tracked_outputs)
@@ -2283,20 +2287,20 @@ class TrainerRank:
             self._reset_planning_telemetry()
             materialized = _materialize(inputs)
             requests = list(_flatten(materialized))
-            plan = self._plan_admissible_forward(
+            plan, check = self._plan_admissible_forward(
                 requests, checkpoint=checkpoint, context="dp_rank_forward"
             )
             tracked_outputs = self._execute_admitted_plan(
-                plan, context="dp_rank_forward"
+                plan, check=check, context="dp_rank_forward"
             )
             return _unflatten(materialized, iter(tracked_outputs))
 
     def _execute_admitted_plan(
-        self, plan: _AnyForwardPlan, *, context: str
+        self, plan: _AnyForwardPlan, *, check: _MemoryCheck, context: str
     ) -> list[AnyForwardOutput]:
         if isinstance(plan, _FlatForwardPlan):
             outputs, _baseline = self._run_flat_plan_with_memory_tracking(
-                plan, context=context
+                plan, check=check, context=context
             )
             return outputs
         merged: list[AnyForwardOutput | None] = [None] * plan.request_count
@@ -2305,7 +2309,7 @@ class TrainerRank:
         ):
             try:
                 outputs, _baseline = self._run_flat_plan_with_memory_tracking(
-                    subforward, context=context
+                    subforward, check=check, context=context
                 )
             except TrainerRankMemoryError as error:
                 # Model execution already began, so no replanning is possible
@@ -2330,7 +2334,7 @@ class TrainerRank:
         *,
         checkpoint: AdapterSelection,
         context: str,
-    ) -> _AnyForwardPlan:
+    ) -> tuple[_AnyForwardPlan, _MemoryCheck]:
         """Plan one forward (splitting if needed), recording telemetry, or raise."""
 
         found = self._find_admissible_forward(
@@ -2343,7 +2347,7 @@ class TrainerRank:
             raise found.error(context)
         plan, check = found
         self._snapshot_planning_telemetry(plan, check)
-        return plan
+        return plan, check
 
     def _find_admissible_forward(
         self,
@@ -3686,8 +3690,10 @@ class TrainerRank:
                 )
                 agreed = self._all_ranks_true(not isinstance(found, _ForwardRefusal))
                 if isinstance(found, _ForwardRefusal):
+                    self._snapshot_planning_telemetry(found.plan, found.check)
                     raise found.error("forward_micro_batches")
                 if not agreed:
+                    self._snapshot_planning_telemetry(first.plan, first.check)
                     raise _memory_error(
                         context="forward_micro_batches",
                         message=(
@@ -4248,6 +4254,7 @@ class TrainerRank:
         self,
         plan: _FlatForwardPlan,
         *,
+        check: _MemoryCheck,
         context: str,
     ) -> tuple[list[AnyForwardOutput], int | None]:
         if torch.cuda.is_available() and self.device.type == "cuda":
@@ -4272,7 +4279,10 @@ class TrainerRank:
                 message="CUDA OOM occurred despite the planner estimate",
                 packed_tokens=plan.packed_tokens,
                 logical_tokens=plan.logical_tokens,
-                check=self._memory_check(plan),
+                # Preserve the selected admission, including the whole rung's
+                # budget for a split. Rechecking here observes failed state and
+                # can enter collectives that successful peers never reach.
+                check=check,
             ) from exc
         if baseline is not None:
             self._update_peak_memory_profile(
