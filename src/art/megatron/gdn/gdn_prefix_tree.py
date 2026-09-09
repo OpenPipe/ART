@@ -187,10 +187,11 @@ class GdnPlannerConfig:
     cp_chain_beam_max_steps: int = 4
     # Chain buckets add extra collectives and kernel shapes; require a
     # measurable runtime win before selecting them over local execution. The
-    # paired campaigns put the model's error at about 5 ms per layer (rms) and
-    # the decision regret flat for gates between 0 and 1 ms; 1 ms halves the
-    # chains that measured slower without giving up measured wins.
-    cp_chain_min_runtime_delta_ms: float = 1.0
+    # paired campaigns put the model's error at about 5 ms per layer (rms); on
+    # the paired validation against the previous planner every chain that
+    # measured slower on Qwen3.5-4B was predicted to save under 2 ms, and a
+    # 2 ms gate keeps 97% of the measured gains on 4B and 99% on 27B.
+    cp_chain_min_runtime_delta_ms: float = 2.0
     runtime_hidden_bytes_per_token: int = 4096
     runtime_layout_exchange_count: int = 4
     # Global all-to-all token counts are priced against aggregate CP bandwidth.
@@ -969,9 +970,13 @@ def _best_search_owner(
     for rank, tokens in enumerate(on_rank_tokens):
         projected_loads = list(rank_loads)
         projected_loads[rank] += segment_length
+        # The owner choice balances recurrent work only. Pricing the dense work
+        # here as well moved local segments toward token balance at the cost of
+        # more layout exchange; on the paired validation those owner-only
+        # changes were noise at the median with a +14% outlier, while every
+        # measured gain came from the chain decisions, which do price it.
         rank_runtime_ms = max(
             load / planner_config.runtime_local_recurrent_tokens_per_ms
-            + load / planner_config.runtime_dense_tokens_per_ms
             for load in projected_loads
         )
         cross_rank_tokens = segment_length - int(tokens)
