@@ -57,10 +57,13 @@ jobs:
           project_dir="$(mktemp -d)"
           cd "$project_dir"
           uv init --name art-install-smoke --python 3.12 --bare
-          uv add "openpipe-art[backend] @ file://${wheel_path}"
+          uv add \
+            --index-strategy unsafe-best-match \
+            --extra-index-url https://download.pytorch.org/whl/cu128 \
+            "openpipe-art[backend] @ file://${wheel_path}"
           uv sync
 
-      - name: Resolve published Megatron profiles
+      - name: Resolve published GPU profiles
         run: |
           wheel_path="$(python - <<'PY'
           from pathlib import Path
@@ -69,10 +72,10 @@ jobs:
           PY
           )"
 
-          for profile in megatron megatron-cu130; do
+          for profile in distributed distributed-cu130 backend-cu130 megatron megatron-cu130; do
             case "$profile" in
-              megatron) index=cu128 ;;
-              megatron-cu130) index=cu130 ;;
+              distributed|megatron) index=cu128 ;;
+              distributed-cu130|backend-cu130|megatron-cu130) index=cu130 ;;
             esac
             project_dir="$(mktemp -d)"
             cd "$project_dir"

@@ -55,8 +55,7 @@ def update_version(new_version):
 
     pyproject_path.write_text(new_content)
 
-    # run uv sync
-    subprocess.run(["uv", "sync"])
+    subprocess.run(["uv", "lock"], cwd=pyproject_path.parent, check=True)
 
 
 def main():

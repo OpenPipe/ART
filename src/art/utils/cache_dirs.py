@@ -4,6 +4,17 @@ from pathlib import Path
 import re
 
 _DEFAULT_CACHE_ROOT = Path("/tmp/art-cache")
+_NETWORK_FILESYSTEMS = {
+    "ceph",
+    "cifs",
+    "fuse.sshfs",
+    "gpfs",
+    "lustre",
+    "nfs",
+    "nfs4",
+    "smb3",
+    "weka",
+}
 
 
 def compiler_cache_root(
@@ -14,6 +25,39 @@ def compiler_cache_root(
     arch = environ.get("TORCH_CUDA_ARCH_LIST") or environ.get("CUDA_ARCH_LIST")
     arch_tag = re.sub(r"[^A-Za-z0-9._-]+", "_", arch or "unknown")
     return Path(cache_root) / "compiled" / arch_tag
+
+
+def cache_filesystem_type(path: str | Path) -> str | None:
+    """Return the Linux filesystem type containing path, when discoverable."""
+    target = Path(path).expanduser().resolve()
+    try:
+        mounts = Path("/proc/mounts").read_text().splitlines()
+    except OSError:
+        return None
+    match: tuple[int, str] | None = None
+    for line in mounts:
+        fields = line.split()
+        if len(fields) < 3:
+            continue
+        mount = Path(fields[1].replace(r"\040", " ").replace(r"\134", "\\"))
+        try:
+            target.relative_to(mount)
+        except ValueError:
+            continue
+        candidate = (len(mount.parts), fields[2])
+        if match is None or candidate[0] > match[0]:
+            match = candidate
+    return match[1] if match else None
+
+
+def network_cache_warning(path: str | Path) -> str | None:
+    filesystem = cache_filesystem_type(path)
+    if filesystem not in _NETWORK_FILESYSTEMS:
+        return None
+    return (
+        f"{Path(path).expanduser()} is on {filesystem}; managed runtime installs and "
+        "compilation caches should use fast node-local storage"
+    )
 
 
 def _set_path(

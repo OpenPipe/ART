@@ -213,6 +213,27 @@ class TestModelOpenAIClientCosts:
             }
         }
 
+    @pytest.mark.asyncio
+    async def test_policy_tracked_stream_is_marked_for_fail_closed_consumption(
+        self,
+    ) -> None:
+        stream = type("Stream", (), {})()
+
+        class _Recorder:
+            async def create(self, *args: Any, **kwargs: Any) -> object:
+                return stream
+
+        proxy = _OpenAIChatCompletionsProxy(
+            _Recorder(),
+            lambda _response: None,
+            policy_span_mode="require",
+        )
+
+        assert (
+            await proxy.create(model="run:active", messages=[], stream=True) is stream
+        )
+        assert getattr(stream, "_art_require_policy_spans") is True
+
     def test_trainable_model_uses_configured_chat_template_kwargs(self) -> None:
         model = TrainableModel(
             run_name="test-run",

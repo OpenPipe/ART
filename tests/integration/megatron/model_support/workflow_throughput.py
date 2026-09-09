@@ -1938,7 +1938,6 @@ async def _run_e2e_throughput_async(
                                 choice,
                             ],
                             reward=index / (config.rollouts_per_group - 1),
-                            metrics={"completion_tokens": completion_tokens},
                             metadata={"scenario_id": scenario["scenario_id"]},
                         )
                     )
