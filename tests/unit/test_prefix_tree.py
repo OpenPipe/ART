@@ -542,3 +542,52 @@ def _random_tree_sequences(
         return leaves
 
     return tuple(walk(torch.empty(0, dtype=torch.long), 0))
+
+
+def test_gdn_tree_cp_plan_chains_one_long_sequence_because_dense_work_follows_tokens() -> (
+    None
+):
+    """A rank holding one long sequence pays its projections for every token
+    as well as the recurrence (paired planner A/B on Qwen3.5-4B: about 2 us per
+    token, twice the recurrent rate), so chaining the sequence across four
+    ranks pays back well above the chain gate; the recurrent rate alone
+    predicts a saving below the gate for an 8k-token sequence and keeps it on
+    one rank, which measured 3-4x slower than the model expected."""
+
+    pytest.importorskip("megatron.core.packed_seq_params")
+    from dataclasses import replace
+
+    from art.megatron.gdn.gdn_prefix_tree import (
+        GdnPlannerConfig,
+        build_gdn_global_execution_decision,
+        parse_gdn_prefix_tree_segments,
+    )
+
+    pack = prefix_tree_pack((torch.arange(1, 8_193),), max_depth=1)
+    spec = parse_gdn_prefix_tree_segments(
+        group_ids=pack.group_ids, parent_ids=pack.parent_ids
+    )
+    qwen35_4b = GdnPlannerConfig.from_model_shape(
+        hidden_size=2560,
+        tensor_model_parallel_size=1,
+        linear_num_key_heads=16,
+        linear_num_value_heads=32,
+        linear_key_head_dim=128,
+        linear_value_head_dim=128,
+    )
+    assert qwen35_4b.runtime_dense_tokens_per_ms == pytest.approx(1108, rel=0.01)
+    layout = _uniform_attention_layout(spec.real_token_count, 4)
+    chained = build_gdn_global_execution_decision(
+        spec, cp_size=4, attention_token_layout_index=layout, planner_config=qwen35_4b
+    )
+    assert any(chained.chained_nodes)
+    assert max(chained.gdn_token_counts_by_rank) < spec.real_token_count // 2
+    recurrent_only = replace(qwen35_4b, runtime_dense_tokens_per_ms=1e12)
+    local = build_gdn_global_execution_decision(
+        spec,
+        cp_size=4,
+        attention_token_layout_index=layout,
+        planner_config=recurrent_only,
+    )
+    assert not any(local.chained_nodes)
+    assert max(local.gdn_token_counts_by_rank) == spec.real_token_count
