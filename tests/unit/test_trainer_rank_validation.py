@@ -15,6 +15,7 @@ import threading
 import time
 from types import ModuleType, SimpleNamespace
 from typing import TYPE_CHECKING, Any, Never, cast
+import weakref
 
 import pytest
 import torch
@@ -3622,6 +3623,59 @@ def test_forward_micro_batches_profiles_caller_peak_after_yield(
     with pytest.raises(StopIteration):
         next(batches)
     assert profiles == [(plan.packed_tokens, 123)]
+
+
+@pytest.mark.parametrize("no_grad", [False, True])
+@pytest.mark.parametrize("retain_previous", [False, True])
+def test_forward_micro_batches_releases_completed_wave_before_planning(
+    monkeypatch: pytest.MonkeyPatch, no_grad: bool, retain_previous: bool
+) -> None:
+    trainer = TrainerRank(_runtime())
+    tensors: list[weakref.ReferenceType[torch.Tensor]] = []
+
+    def run(plan, **_kwargs):
+        source = torch.ones(4, requires_grad=not no_grad)
+        output = source.square()
+        tensors.extend((weakref.ref(source), weakref.ref(output)))
+        return [ForwardOutput(output, None, None, None)]
+
+    _stub_forward(monkeypatch, trainer, run)
+    select = trainer._select_next_micro_batch
+
+    def select_after_release(*args, **kwargs):
+        if tensors:
+            assert (tensors[1]() is not None) == retain_previous
+            if not no_grad:
+                assert (tensors[0]() is not None) == retain_previous
+        return select(*args, **kwargs)
+
+    monkeypatch.setattr(trainer, "_select_next_micro_batch", select_after_release)
+    profiled: list[bool] = []
+
+    def profile(*_args):
+        # Keep the completed wave through its caller peak observation.
+        profiled.append(tensors[-1]() is not None)
+
+    monkeypatch.setattr(trainer, "_update_peak_memory_profile", profile)
+    batches = trainer.forward_micro_batches(
+        [_target_request(1), _target_request(3)], no_grad=no_grad
+    )
+    first = next(batches)
+    retained = first if retain_previous else None
+    del first
+    second = next(batches)
+    assert profiled == [True]
+    if retained is not None:
+        target = retained.outputs[0].target_logprobs
+        assert target is not None
+        torch.testing.assert_close(target, torch.ones(4))
+        if not no_grad:
+            target.sum().backward()
+    del second
+    with pytest.raises(StopIteration):
+        next(batches)
+    assert profiled == [True, True]
+    assert tensors[-1]() is None
 
 
 def test_memory_profiles_distinguish_grad_mode() -> None:

@@ -575,6 +575,78 @@ def test_split_execution_failure_is_reported_as_partial_execution(
     assert "simulated CUDA OOM" in message
 
 
+@pytest.mark.parametrize("micro_batches", [False, True])
+@pytest.mark.parametrize("split", [False, True])
+def test_forward_oom_preserves_selected_admission(
+    monkeypatch: pytest.MonkeyPatch, micro_batches: bool, split: bool
+) -> None:
+    rank = _rank(monkeypatch)
+    failed = False
+    available = 20 if split else 100
+
+    def budget() -> int:
+        assert not failed, "OOM handling must not repeat admission collectives"
+        return available
+
+    _packed_budget(monkeypatch, rank, budget)
+    monkeypatch.setattr(rank, "_retained_memory_bytes", lambda *_args, **_kwargs: 0)
+    monkeypatch.setattr(
+        rank,
+        "_execute_flat_plan",
+        lambda plan: [ForwardOutput(None, None, None, None)] * plan.request_count,
+    )
+    rank.dp_rank_forward([_request(9, length=5)])
+    assert rank.last_forward_telemetry()["predicted_peak_bytes"] == 5
+    oom = torch.cuda.OutOfMemoryError("injected forward allocation failure")
+    executed = 0
+
+    def run(plan):
+        nonlocal failed, executed
+        executed += 1
+        if executed == (2 if split else 1):
+            failed = True
+            raise oom
+        return [ForwardOutput(None, None, None, None)] * plan.request_count
+
+    monkeypatch.setattr(rank, "_execute_flat_plan", run)
+    inputs = [tuple(_request(marker) for marker in range(4 if split else 1))]
+    with pytest.raises(TrainerRankMemoryError) as caught:
+        if micro_batches:
+            next(rank.forward_micro_batches(inputs))
+        else:
+            rank.dp_rank_forward(inputs)
+
+    error = caught.value
+    assert isinstance(error, TrainerRankPartialExecutionError) == split
+    assert error.predicted_peak_bytes == (20 if split else 10)
+    assert error.usable_limit_bytes == available
+    cause = error.__cause__
+    if split:
+        assert cause is not None
+        cause = cause.__cause__
+    assert cause is oom
+    telemetry = rank.last_forward_telemetry()
+    assert telemetry["predicted_peak_bytes"] == error.predicted_peak_bytes
+    assert telemetry["usable_limit_bytes"] == available
+    assert telemetry["subforward_count"] == (2 if split else 1)
+
+
+def test_micro_batch_refusal_replaces_previous_admission_telemetry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rank = _rank(monkeypatch)
+    _recording_executor(monkeypatch, rank)
+    available = 100
+    _packed_budget(monkeypatch, rank, lambda: available)
+    rank.dp_rank_forward([_request(0, length=5)])
+    available = 1
+    with pytest.raises(TrainerRankMemoryError) as caught:
+        next(rank.forward_micro_batches([_request(1)]))
+    telemetry = rank.last_forward_telemetry()
+    assert telemetry["predicted_peak_bytes"] == caught.value.predicted_peak_bytes == 10
+    assert telemetry["usable_limit_bytes"] == caught.value.usable_limit_bytes == 1
+
+
 @dataclass(frozen=True)
 class _SlotRef:
     name: str | None
