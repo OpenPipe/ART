@@ -2117,6 +2117,7 @@ class TrainerRank:
                     yield batch
                 finally:
                     self._skipped_forward_waves.pop(token, None)
+                    del batch
         finally:
             batches.close()
 
@@ -2214,6 +2215,8 @@ class TrainerRank:
             # to the forward's return, already recorded for this same plan.
             if isinstance(candidate.plan, _FlatForwardPlan):
                 self._update_peak_memory_profile(candidate.plan, memory_baseline)
+            # Only the caller may retain completed outputs into the next wave.
+            del tracked_outputs, flat_outputs, outputs
             start = stop
 
     @overload
