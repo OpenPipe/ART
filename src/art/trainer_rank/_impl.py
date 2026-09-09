@@ -2597,16 +2597,13 @@ class TrainerRank:
         *,
         checkpoint: AdapterSelection,
     ) -> _SubforwardCost:
-        """Optimistic retention; exact layouts still decide admission.
-
-        The required term keeps the estimator's packed-profile trust cutoff;
-        crossing that separate cutoff can still invalidate its lower bound.
-        """
+        """Optimistic cost across layout and profile-trust boundaries."""
 
         groups = self._group_active_request_indices(
             requests, checkpoint=checkpoint, ensure_slots=False
         )
         packed_tokens = 0
+        unshared_packed_tokens = 0
         for _, group_indices in groups:
             estimated = estimate_prefix_tree_packed_tokens(
                 (rows[index] for index in group_indices),
@@ -2614,6 +2611,9 @@ class TrainerRank:
             )
             assert estimated is not None  # rows are CPU copies
             packed_tokens += self._physical_tokens(estimated)
+            unshared_packed_tokens += self._physical_tokens(
+                sum(int(rows[index].numel()) for index in group_indices)
+            )
         output_bytes = self._estimate_group_request_output_bytes(requests)
         signature = self._memory_signature_from_requests(
             requests,
@@ -2628,6 +2628,23 @@ class TrainerRank:
             logical_tokens=logical_tokens,
         )
         profile = self._memory_profiles.get(signature)
+        if profile is not None:
+            cap = profile.packed_tokens * _MEMORY_PROFILE_TRUST_GROWTH
+            if packed_tokens <= cap < unshared_packed_tokens:
+                # Required cost can drop when a larger layout leaves the
+                # profile window. Cold cost grows with packed tokens, so its
+                # first integer count bounds every possible post-cap layout,
+                # even when TP padding makes that count itself unattainable.
+                cold = self._subforward_cost(
+                    packed_tokens=cap + 1,
+                    output_bytes=output_bytes,
+                    signature=signature,
+                    logical_tokens=logical_tokens,
+                )
+                cost = _SubforwardCost(
+                    required=min(cost.required, cold.required),
+                    retained=min(cost.retained, cold.retained),
+                )
         if (
             profile is not None
             and profile.retained_compute_bytes_per_token is not None

@@ -573,12 +573,17 @@ def _retained_ratio_requests() -> list[ForwardInput]:
 
 
 @pytest.mark.parametrize("admit", (False, True))
+@pytest.mark.parametrize(("profile_packed", "budget_gib"), ((8000, 40), (1000, 20)))
 def test_retained_ratio_lower_bound_reaches_exact_split_admission(
-    monkeypatch: pytest.MonkeyPatch, admit: bool
+    monkeypatch: pytest.MonkeyPatch,
+    admit: bool,
+    profile_packed: int,
+    budget_gib: int,
 ) -> None:
     rank = _retained_ratio_rank(monkeypatch)
     # Actual packing: each child has 64k logical/no-sharing rows versus 4k
-    # full-sharing rows. The latter alone crosses the retained-ratio limit.
+    # full-sharing rows. The latter crosses the retained-ratio limit; the
+    # smaller profile also puts no-sharing beyond the packed-profile window.
     requests = _retained_ratio_requests()
     requests += [replace(request, no_grad=True) for request in requests]
     children = [rank._plan_flat_forward(requests[i : i + 16]) for i in (0, 16)]
@@ -586,11 +591,11 @@ def test_retained_ratio_lower_bound_reaches_exact_split_admission(
     rank._memory_profiles[parent.signature] = _MemoryProfile(16 * 131_072, 16_000)
     for child in children:
         rank._memory_profiles[child.signature] = _MemoryProfile(
-            4 * 131_072, 8000, retained_compute_bytes_per_token=128
+            4 * 131_072, profile_packed, retained_compute_bytes_per_token=128
         )
     costs = [rank._plan_cost(child) for child in children]
     exact_bytes = rank._split_rung_check(costs).estimated_required_bytes
-    budget = 40 * 2**30 if admit else exact_bytes - 1
+    budget = budget_gib * 2**30 if admit else exact_bytes - 1
     monkeypatch.setattr(rank, "_available_memory_bytes", lambda: budget)
     exact = rank._split_rung_check(costs)
     if admit:
@@ -666,12 +671,104 @@ def test_retained_ratio_lower_bound_preserves_exact_cost_and_trust_boundaries(
         requests, [request.input_tokens for request in requests], checkpoint=Unset
     )
     assert rank._plan_cost(plan) == exact
-    assert lower.required == exact.required
+    assert lower.required <= exact.required
     if relax:
         assert exact.retained == exact.required
         assert lower.retained == int(plan.output_bytes * 1.1) < exact.retained
     else:
-        assert lower == exact
+        assert lower.retained == min(exact.retained, lower.required)
+
+
+@pytest.mark.parametrize("profile_packed", (499, 500, 501, 1000, 7999, 8000, 8001))
+@pytest.mark.parametrize("retained_rate", (None, 128))
+def test_packed_profile_window_lower_bound_covers_both_cost_regimes(
+    monkeypatch: pytest.MonkeyPatch, profile_packed: int, retained_rate: float | None
+) -> None:
+    rank = _retained_ratio_rank(monkeypatch)
+    requests = _retained_ratio_requests()
+    minimal = rank._plan_flat_forward(requests, memory_minimal=True)
+    maximum = rank._plan_flat_forward(requests)
+    rank._memory_profiles[minimal.signature] = _MemoryProfile(
+        4 * 131_072, profile_packed, retained_compute_bytes_per_token=retained_rate
+    )
+    lower = rank._split_chunk_lower_cost(
+        requests, [request.input_tokens for request in requests], checkpoint=Unset
+    )
+    cap = profile_packed * 8
+    if cap >= maximum.packed_tokens:
+        # No legal layout crosses the packed cutoff: retain the tighter peak.
+        # Warm-only floating-point rounding is outside this correction.
+        assert lower.required == rank._plan_cost(minimal).required
+        return
+    # The full-sharing/no-sharing endpoints bound every legal layout. Price
+    # both sides of the discontinuity as well as hypothetical interior counts.
+    for packed in {4000, 4001, cap - 1, cap, cap + 1, cap + 2, 63_999, 64_000}:
+        if not minimal.packed_tokens <= packed <= maximum.packed_tokens:
+            continue
+        exact = rank._subforward_cost(
+            packed_tokens=packed,
+            logical_tokens=minimal.logical_tokens,
+            output_bytes=minimal.output_bytes,
+            signature=minimal.signature,
+        )
+        assert lower.required <= exact.required
+        assert lower.retained <= exact.retained
+        assert 0 <= lower.retained <= lower.required
+
+
+@pytest.mark.parametrize("profile_rate", (1.0, 4 * 131_072))
+def test_packed_profile_bound_handles_unattainable_tp_boundary_count(
+    monkeypatch: pytest.MonkeyPatch, profile_rate: float
+) -> None:
+    rank = _retained_ratio_rank(monkeypatch)
+    monkeypatch.setattr(rank, "_topology_key", lambda: (1, 4, 1, 1))
+    tokens = torch.arange(7)
+    requests = [
+        ForwardInput(input_tokens=tokens, target_tokens=tokens) for _ in range(16)
+    ]
+    minimal = rank._plan_flat_forward(requests, memory_minimal=True)
+    assert (minimal.packed_tokens, minimal.logical_tokens) == (8, 112)
+    rank._memory_profiles[minimal.signature] = _MemoryProfile(profile_rate, 4)
+    lower = rank._split_chunk_lower_cost(requests, [tokens] * 16, checkpoint=Unset)
+    # The cutoff is32. A hypothetical cold count33 is cheaper than the first
+    # physically possible post-cutoff count36, so it remains a valid bound.
+    for packed in range(8, 113, 4):
+        exact = rank._subforward_cost(
+            packed_tokens=packed,
+            logical_tokens=112,
+            output_bytes=minimal.output_bytes,
+            signature=minimal.signature,
+        )
+        assert lower.required <= exact.required
+        assert lower.retained <= exact.retained
+    if profile_rate == 1.0:
+        assert lower == rank._plan_cost(minimal)
+
+
+def test_packed_profile_bound_counts_each_groups_tp_padding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rank = _retained_ratio_rank(monkeypatch)
+    monkeypatch.setattr(rank, "_topology_key", lambda: (1, 8, 1, 1))
+    first, second = torch.arange(5), torch.arange(3)
+    requests = [
+        ForwardInput(input_tokens=first, target_tokens=first) for _ in range(13)
+    ] + [
+        ForwardInput(input_tokens=second, target_tokens=second, no_grad=True)
+        for _ in range(19)
+    ]
+    minimal = rank._plan_flat_forward(requests, memory_minimal=True)
+    maximum = rank._plan_flat_forward(requests)
+    assert (minimal.packed_tokens, minimal.logical_tokens) == (16, 122)
+    assert maximum.packed_tokens == 72 + 64
+    rank._memory_profiles[minimal.signature] = _MemoryProfile(4 * 131_072, 16)
+    # Logical122 is below cap128, but independent group padding permits136.
+    lower = rank._split_chunk_lower_cost(
+        requests, [request.input_tokens for request in requests], checkpoint=Unset
+    )
+    exact = rank._plan_cost(maximum)
+    assert lower.required <= exact.required < rank._plan_cost(minimal).required
+    assert lower.retained <= exact.retained
 
 
 @pytest.mark.parametrize("empty", (False, True))
