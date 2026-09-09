@@ -143,9 +143,18 @@ def phase_contract() -> None:
         )
     for method_name in ("forward_micro_batches", "dp_rank_forward"):
         parameters = _public_parameters(getattr(trainer_rank.TrainerRank, method_name))
-        extra = set(parameters) - {"inputs", "checkpoint", "no_grad"}
+        # ``yield_empty`` (PR #864) is a keyword-only flag defaulting to False:
+        # off, the contract the acceptance suite pins is unchanged.
+        extra = set(parameters) - {"inputs", "checkpoint", "no_grad", "yield_empty"}
         if extra:
             problems.append(f"{method_name} has extra parameters {sorted(extra)}")
+        flag = parameters.get("yield_empty")
+        if flag is not None and (
+            flag.kind is not inspect.Parameter.KEYWORD_ONLY or flag.default is not False
+        ):
+            problems.append(
+                f"{method_name}: yield_empty must be keyword-only and default to False"
+            )
     if not hasattr(trainer_rank.TrainerRank, TELEMETRY_METHOD):
         problems.append(
             f"TrainerRank.{TELEMETRY_METHOD}() telemetry surface is missing"

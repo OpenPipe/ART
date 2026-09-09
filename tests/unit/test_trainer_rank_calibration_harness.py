@@ -246,3 +246,22 @@ def test_gdn_planner_variants_bracket_the_chain_decision() -> None:
         driver._gdn_variant_config(base, "other")
     for variant in driver._GDN_VARIANTS:
         assert variant in driver._PLANNER_VARIANTS
+
+
+def test_contract_accepts_the_yield_empty_flag_only_when_it_is_off_by_default() -> None:
+    """PR #864 added ``yield_empty`` to the public forwards as a keyword-only flag
+    that defaults to False; the contract phase tolerates exactly that."""
+
+    import inspect
+
+    import art.trainer_rank as trainer_rank
+
+    for method_name in ("forward_micro_batches", "dp_rank_forward"):
+        parameters = driver._public_parameters(
+            getattr(trainer_rank.TrainerRank, method_name)
+        )
+        assert set(parameters) <= {"inputs", "checkpoint", "no_grad", "yield_empty"}
+        flag = parameters.get("yield_empty")
+        if flag is not None:
+            assert flag.kind is inspect.Parameter.KEYWORD_ONLY
+            assert flag.default is False
