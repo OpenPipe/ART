@@ -2114,9 +2114,23 @@ CALIBRATION_CORPUS_BY_CELL = {"cal-ellavox": "qwen35", "cal-ellavox-qwen3": "qwe
 # planner and under two forced decisions that bracket its chain-versus-local
 # choice, with the attention planner unchanged, so the paired difference is
 # the GDN decision's own cost.
-_PLANNER_VARIANTS = ("current", "legacy", "gdn-local", "gdn-chain")
+# Paired GDN-planner validation (--gdn-legacy-ab): the production GDN planner
+# against main's GDN planner before this recalibration, attention planner
+# unchanged, so the paired difference is the recalibration's own effect.
+_PLANNER_VARIANTS = ("current", "legacy", "gdn-local", "gdn-chain", "gdn-legacy")
 _GDN_VARIANTS = ("current", "gdn-local", "gdn-chain")
 _planner_variant = "current"
+
+
+def _legacy_gdn_planner_config(config: Any) -> Any:
+    """The GDN planner configuration main built before the recalibration: the
+    recurrent rates alone price a rank's tokens (no dense projection term)."""
+
+    from dataclasses import replace
+
+    if config is None:
+        return None
+    return replace(config, runtime_dense_tokens_per_ms=1e12)
 
 
 def _gdn_variant_config(config: Any, variant: str) -> Any:
@@ -2131,6 +2145,8 @@ def _gdn_variant_config(config: Any, variant: str) -> Any:
 
     if config is None or variant == "current":
         return config
+    if variant == "gdn-legacy":
+        return _legacy_gdn_planner_config(config)
     if variant == "gdn-local":
         return replace(config, cp_chain_min_runtime_delta_ms=float("inf"))
     if variant == "gdn-chain":
@@ -2244,7 +2260,7 @@ def _install_planner_ab(rank: Any = None) -> None:
 
     def gdn_variant_config(provider: Any, handler: Any) -> Any:
         config = original_gdn(provider, handler)
-        if _planner_variant in ("gdn-local", "gdn-chain"):
+        if _planner_variant in ("gdn-local", "gdn-chain", "gdn-legacy"):
             return _gdn_variant_config(config, _planner_variant)
         return config
 
@@ -2320,6 +2336,7 @@ def phase_cost_calibrate(
     repeat: int,
     planner_ab: bool = False,
     gdn_ab: bool = False,
+    gdn_legacy_ab: bool = False,
     evidence: str,
 ) -> None:
     """Time every mandatory candidate layout of one cell (GPU).
@@ -2450,7 +2467,7 @@ def phase_cost_calibrate(
         rows_for_plan = tuple(
             r.input_tokens.reshape(-1).to(torch.long) for r in requests
         )
-        if planner_ab or gdn_ab:
+        if planner_ab or gdn_ab or gdn_legacy_ab:
             # Installed before the candidate rows so the legacy plan structure
             # recorded next to the current one is the legacy planner's.
             _install_planner_ab(rank)
@@ -2647,6 +2664,8 @@ def phase_cost_calibrate(
             variants += ("legacy",)
         if gdn_ab:
             variants += ("gdn-local", "gdn-chain")
+        if gdn_legacy_ab:
+            variants += ("gdn-legacy",)
         live: list[tuple[str, str]] = []
         for candidate in candidate_rows:
             label = str(candidate["label"])
@@ -2779,6 +2798,15 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--gdn-legacy-ab",
+        action="store_true",
+        help=(
+            "cost-calibrate: time every layout under the production GDN planner "
+            "and under main's GDN planner before the recalibration (no dense "
+            "projection term) in alternating rounds; rows carry planner_variant"
+        ),
+    )
+    parser.add_argument(
         "--pressure",
         default="cap",
         choices=("cap", "ballast"),
@@ -2858,6 +2886,7 @@ def main() -> None:
             evidence=arguments.evidence,
             planner_ab=arguments.planner_ab,
             gdn_ab=arguments.gdn_ab,
+            gdn_legacy_ab=arguments.gdn_legacy_ab,
         )
     else:
         if not arguments.evidence:

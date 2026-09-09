@@ -265,3 +265,56 @@ def test_contract_accepts_the_yield_empty_flag_only_when_it_is_off_by_default() 
         if flag is not None:
             assert flag.kind is inspect.Parameter.KEYWORD_ONLY
             assert flag.default is False
+
+
+def test_gdn_legacy_variant_is_the_planner_before_the_dense_term() -> None:
+    """The validation arm restores main's GDN planner: the dense projection
+    term disabled and nothing else changed, so an 8k-token sequence that the
+    production planner chains across four ranks stays on one rank."""
+
+    from dataclasses import fields
+
+    pytest.importorskip("megatron.core.packed_seq_params")
+    import torch
+
+    from art.megatron.context_parallel.layout_index import TokenLayoutIndex
+    from art.megatron.gdn.gdn_prefix_tree import (
+        GdnPlannerConfig,
+        build_gdn_global_execution_decision,
+        parse_gdn_prefix_tree_segments,
+    )
+    from art.megatron.prefix_tree_packing import prefix_tree_pack
+
+    current = GdnPlannerConfig.from_model_shape(
+        hidden_size=2560,
+        tensor_model_parallel_size=1,
+        linear_num_key_heads=16,
+        linear_num_value_heads=32,
+        linear_key_head_dim=128,
+        linear_value_head_dim=128,
+    )
+    legacy = driver._gdn_variant_config(current, "gdn-legacy")
+    changed = {
+        f.name
+        for f in fields(current)
+        if getattr(legacy, f.name) != getattr(current, f.name)
+    }
+    assert changed == {"runtime_dense_tokens_per_ms"}
+    assert legacy.runtime_dense_tokens_per_ms >= 1e12
+    pack = prefix_tree_pack((torch.arange(1, 8_193),), max_depth=1)
+    spec = parse_gdn_prefix_tree_segments(
+        group_ids=pack.group_ids, parent_ids=pack.parent_ids
+    )
+    n = spec.real_token_count
+    ranges = tuple((((n * r) // 4, (n * (r + 1)) // 4, 0),) for r in range(4))
+    layout = TokenLayoutIndex(
+        ownership_ranges_by_rank=ranges,
+        token_counts_by_rank=tuple(e - s for ((s, e, _),) in ranges),
+    )
+    chained = build_gdn_global_execution_decision(
+        spec, cp_size=4, attention_token_layout_index=layout, planner_config=current
+    )
+    local = build_gdn_global_execution_decision(
+        spec, cp_size=4, attention_token_layout_index=layout, planner_config=legacy
+    )
+    assert any(chained.chained_nodes) and not any(local.chained_nodes)
