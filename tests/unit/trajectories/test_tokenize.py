@@ -8009,3 +8009,112 @@ def test_exchange_training_requires_logprobs_unless_allowed() -> None:
     with pytest.raises(RuntimeError, match="missing logprobs"):
         tokenize(allow_missing=False)
     assert len(tokenize(allow_missing=True)) == 2
+
+
+@pytest.mark.parametrize(
+    ("suffix", "corruption"),
+    [
+        ("0", None),
+        ("7", None),
+        ("0", "missing_stop"),
+        ("0", "wrong_stop"),
+        ("0", "changed_sampled_token"),
+        ("7", "changed_sampled_token"),
+    ],
+)
+def test_length_boundary_preserves_output_despite_probe_suffix_collision(
+    suffix: str,
+    corruption: str | None,
+) -> None:
+    from art.trajectories._tokenize import (
+        _chat_source_full_tokens,
+        _chat_source_prompt_tokens,
+        _tokenize_trajectory_with_trace,
+    )
+
+    class ReasoningTokenizer(_CharacterTemplateTokenizer):
+        def __call__(self, text: str, **kwargs: object) -> dict[str, object]:
+            # Tokenizers without offsets use the content-replacement probe.
+            return {"input_ids": self._encode(text)}
+
+        def apply_chat_template(
+            self,
+            messages: list[dict[str, Any]],
+            *,
+            tokenize: bool = True,
+            add_generation_prompt: bool,
+            **kwargs: object,
+        ) -> str | list[int]:
+            text = ""
+            for message in messages:
+                if message["role"] == "user":
+                    text += f"<u>{message['content']}</u>"
+                else:
+                    text += "<a><think>\n" + (message.get("reasoning") or "")
+                    text += "\n</think>\n\n" + (message.get("content") or "") + "§"
+            if add_generation_prompt:
+                text += "<a><think>\n"
+            return self._encode(text) if tokenize else text
+
+    tokenizer = ReasoningTokenizer()
+    first_messages = [{"role": "user", "content": "question"}]
+    first_message = {"role": "assistant", "reasoning": "thought" + suffix}
+    final_messages = [
+        *first_messages,
+        first_message,
+        {"role": "user", "content": "continue"},
+    ]
+    final_message = {"role": "assistant", "reasoning": "ready", "content": "done"}
+    exchanges = []
+    for i, (messages, message, output, finish) in enumerate(
+        [
+            (first_messages, first_message, "thought" + suffix, "length"),
+            (final_messages, final_message, "ready\n</think>\n\ndone§", "stop"),
+        ]
+    ):
+        prompt = cast(
+            list[int],
+            tokenizer.apply_chat_template(messages, add_generation_prompt=True),
+        )
+        exchange = _chat_exchange(prompt, tokenizer._encode(output), offset=i)
+        exchange.request["messages"] = messages
+        data = exchange.response.model_dump(mode="python")
+        data["choices"][0].update(message=message, finish_reason=finish)
+        exchange.response = ChatCompletion.model_validate(data)
+        exchanges.append(exchange)
+    prompt = exchanges[1].response.choices[0].model_extra["prompt_token_ids"]
+    if corruption == "missing_stop":
+        prompt.remove(9)
+    elif corruption == "wrong_stop":
+        prompt[prompt.index(9)] = tokenizer._encode("!")[0]
+    elif corruption == "changed_sampled_token":
+        prefix = exchanges[0].response.choices[0].model_extra["prompt_token_ids"]
+        prompt[len(prefix)] = tokenizer._encode("!")[0]
+    trajectory = art.Trajectory(
+        exchanges=TrajectoryExchanges(chat_completions=exchanges)
+    )
+    if corruption in {"missing_stop", "wrong_stop"}:
+        with pytest.raises(ValueError, match="Could not uniquely locate"):
+            _tokenize_trajectory_with_trace(trajectory, tokenizer=tokenizer)
+        return
+
+    tokenized, traces = _tokenize_trajectory_with_trace(trajectory, tokenizer=tokenizer)
+    assert len(tokenized.histories) == (2 if corruption else 1)
+    assert sum(len(trace.sources) for trace in traces) == 2
+    for history, trace in zip(tokenized.histories, traces, strict=True):
+        for key, source in trace.sources.items():
+            positions = [
+                i for i, actual in enumerate(trace.source_keys) if actual == key
+            ]
+            output, logprobs = _chat_source_full_tokens(source)
+            assert output is not None
+            assert positions == list(range(positions[0], positions[0] + len(output)))
+            assert history.tokens[: positions[0]] == _chat_source_prompt_tokens(source)
+            assert [history.tokens[i] for i in positions] == output
+            assert [history.logprobs[i] for i in positions] == logprobs
+            assert all(math.isfinite(history.logprobs[i]) for i in positions)
+            assert all(
+                history.flags[i] & _SAMPLED_ASSISTANT_OUTPUT
+                == _SAMPLED_ASSISTANT_OUTPUT
+                for i in positions
+            )
