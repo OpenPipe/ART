@@ -697,9 +697,7 @@ def test_packed_profile_window_lower_bound_covers_both_cost_regimes(
     cap = profile_packed * 8
     if cap >= maximum.packed_tokens:
         # No legal layout crosses the packed cutoff: retain the tighter peak.
-        # Warm-only floating-point rounding is outside this correction.
         assert lower.required == rank._plan_cost(minimal).required
-        return
     # The full-sharing/no-sharing endpoints bound every legal layout. Price
     # both sides of the discontinuity as well as hypothetical interior counts.
     for packed in {4000, 4001, cap - 1, cap, cap + 1, cap + 2, 63_999, 64_000}:
@@ -1000,3 +998,63 @@ def test_retained_ratio_bound_uses_original_guard_at_trusted_endpoint(
         requests, [r.input_tokens for r in requests], checkpoint=Unset
     )
     assert lower.retained == at_cap.retained == int(plan.output_bytes * 1.1)
+
+
+@pytest.mark.parametrize("retained", (None, 0, 2_000_000))
+@pytest.mark.parametrize("admit", (False, True))
+def test_warm_rounding_preserves_native_split_bound_and_exact_budget(
+    monkeypatch: pytest.MonkeyPatch, retained: int | None, admit: bool
+) -> None:
+    rank = _retained_ratio_rank(monkeypatch)
+    tokens = torch.arange(3)
+    part = [ForwardInput(input_tokens=tokens, target_tokens=tokens) for _ in range(5)]
+    requests = part + [replace(request, no_grad=True) for request in part]
+    chunks = [tuple(range(5)), tuple(range(5, 10))]
+    rows = [request.input_tokens for request in requests]
+    children = [rank._plan_flat_forward(requests[a : a + 5]) for a in (0, 5)]
+    assert [plan.packed_tokens for plan in children] == [15, 15]
+    for plan in children:
+        # The real profile update divides an observed integer peak by packed
+        # rows; the prior warm formula differs by two bytes at native N=3/15.
+        rank._update_memory_profile(
+            plan, peak_delta_bytes=7_864_390, retained_bytes=retained
+        )
+    costs = [rank._plan_cost(plan) for plan in children]
+    lower = [
+        rank._split_chunk_lower_cost(
+            requests[a : a + 5], rows[a : a + 5], checkpoint=Unset
+        )
+        for a in (0, 5)
+    ]
+    assert lower == costs
+    exact_bytes = rank._split_rung_check(costs).estimated_required_bytes
+    monkeypatch.setattr(
+        rank, "_available_memory_bytes", lambda: exact_bytes - (not admit)
+    )
+    split, check = rank._admit_split_rung(chunks, requests, rows, checkpoint=Unset)
+    assert check.estimated_required_bytes == exact_bytes and check.fits == admit
+    assert (split is not None) == admit
+
+
+@pytest.mark.parametrize("retained", (None, 0, 7864321 / 15))
+def test_normalized_warm_profile_is_monotone_through_ratio_floor(
+    monkeypatch: pytest.MonkeyPatch, retained: float | None
+) -> None:
+    rank = _retained_ratio_rank(monkeypatch)
+    signature = rank._plan_flat_forward([_request(0)]).signature
+    rank._memory_profiles[signature] = _MemoryProfile(
+        7864330 / 15, 1000, 15 / 13, retained_compute_bytes_per_token=retained
+    )
+    # All counts satisfy the retained guard. The logical term dominates until
+    # N=104, then packed-token growth dominates. Check every integer count.
+    costs = [
+        rank._subforward_cost(
+            packed_tokens=packed,
+            logical_tokens=120,
+            output_bytes=481,
+            signature=signature,
+        )
+        for packed in range(13, 201)
+    ]
+    assert all(a.required <= b.required for a, b in zip(costs, costs[1:]))
+    assert all(a.retained <= b.retained for a, b in zip(costs, costs[1:]))

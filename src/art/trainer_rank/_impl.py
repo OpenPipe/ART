@@ -2723,11 +2723,8 @@ class TrainerRank:
         ratio = logical_tokens / max(1, packed_tokens)
         if ratio > profile.logical_per_packed * _MEMORY_PROFILE_TRUST_GROWTH:
             return required
-        retained = (
-            output_bytes
-            + profile.retained_compute_bytes_per_token
-            * packed_tokens
-            * max(1.0, ratio / profile.logical_per_packed)
+        retained = output_bytes + profile.retained_compute_bytes_per_token * max(
+            packed_tokens, logical_tokens / profile.logical_per_packed
         )
         return min(required, int(retained * _MEMORY_SAFETY_FACTOR))
 
@@ -4817,10 +4814,13 @@ class TrainerRank:
         # A profile learned under lighter sharing (lower logical/packed ratio)
         # underestimates the per-packed-token footprint of a deeper-shared
         # plan; scale the trusted estimate up by the ratio gap.
-        ratio_scale = 1.0
+        # Normalize before multiplying: cancelling packed tokens through two
+        # float operations can otherwise make a larger warm layout cheaper.
+        profiled_tokens: int | float = packed_tokens
         if profiled is not None and logical_tokens is not None:
-            current_ratio = logical_tokens / max(1, packed_tokens)
-            ratio_scale = max(1.0, current_ratio / profiled.logical_per_packed)
+            profiled_tokens = max(
+                packed_tokens, logical_tokens / profiled.logical_per_packed
+            )
         if (
             profiled is None
             or profiled.packed_tokens * _MEMORY_PROFILE_TRUST_GROWTH < packed_tokens
@@ -4829,7 +4829,7 @@ class TrainerRank:
         else:
             compute = max(
                 static_compute,
-                int(profiled.bytes_per_token * packed_tokens * ratio_scale),
+                int(profiled.bytes_per_token * profiled_tokens),
             )
         return int((output_bytes + compute) * _MEMORY_SAFETY_FACTOR)
 
