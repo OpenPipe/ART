@@ -348,10 +348,14 @@ def setup_hybrid_ep() -> str:
 
 
 def validate_hybrid_ep(*, require_multinode: bool = False) -> None:
-    candidates = [_build_identity(enable_multinode=True, use_nixl=True)[0]]
+    installed = _installed_version()
+    candidates = []
     if not require_multinode:
         candidates.append(_build_identity(enable_multinode=False, use_nixl=False)[0])
-    if (installed := _installed_version()) not in candidates:
+        if installed in candidates:
+            return
+    candidates.append(_build_identity(enable_multinode=True, use_nixl=True)[0])
+    if installed not in candidates:
         raise RuntimeError(
             "HybridEP is not built for this ART source and Megatron environment "
             f"(expected one of {candidates}, found {installed}). Run Megatron setup."

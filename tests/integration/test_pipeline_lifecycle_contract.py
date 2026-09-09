@@ -114,12 +114,12 @@ def test_gather_preserves_caller_completion_count_without_exact_choices() -> Non
 
 
 @pytest.mark.asyncio
-async def test_policy_tracking_rejects_streaming_before_dispatch() -> None:
+async def test_synthesized_policy_tracking_rejects_streaming_before_dispatch() -> None:
     completions = MagicMock()
     proxy = _OpenAIChatCompletionsProxy(
         completions,
         lambda _response: None,
-        policy_span_mode="require",
+        policy_span_mode="synthesize",
     )
     with pytest.raises(ValueError, match="Streaming completions"):
         await proxy.create(model="model@1", stream=True)

@@ -206,6 +206,18 @@ Only wheels built with `scripts/build_package.py` contain those bundles. The
 install profile provides `uv`; first use needs package-index access unless the
 node-local cache was prewarmed.
 
+For a HybridEP deployment, each host can materialize and validate the exact
+cross-host runtime before allocating the model:
+
+```bash
+art runtime prepare --hybrid-ep --multinode
+art runtime status --hybrid-ep --multinode
+```
+
+Keep `/tmp/art-cache`, or an explicitly configured runtime cache, on local SSD.
+Use the shared mount for checkpoints and run artifacts. ART reports the selected
+CUDA profile and warns when a runtime cache resolves to a network filesystem.
+
 `examples/multinode/skypilot_training.yaml` runs a real two-host DP2 SFT step
 from the published wheel. It synchronizes only the user program, not an ART
 checkout. Point `ART_SHARED_ROOT` at an existing path mounted on every host,

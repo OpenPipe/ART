@@ -39,6 +39,7 @@ from art.distributed.rollout import (
 )
 from art.distributed.trajectory_store import TrajectoryGroupRef
 from art.errors import LocalServingUnavailableError
+from art.gather import record_trajectory_completion_tokens
 from art.pipeline_tuner import (
     PackedGroupObservation,
     PackedGroupShape,
@@ -996,6 +997,8 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                 scenario_metadata = self._scenario_metadata(scenario)
                 if isinstance(group, TrajectoryGroup):
                     group.metadata.update(scenario_metadata)
+                    for trajectory in group.trajectories:
+                        record_trajectory_completion_tokens(trajectory)
                     self._apply_policy_versions(
                         group,
                         initial_version=initial_version,
@@ -1468,7 +1471,6 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
         if post_train_dispatch is not None:
             post_train_dispatch.set()
         await self._await_post_train(post_train_task)
-        self.state.done = True
         self._accept_prepared_batches = False
         if isinstance(self._output_queue, DistributedTrajectoryQueue):
             await self._output_queue.finish()
@@ -1499,7 +1501,7 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
             count = (self.min_batch_size if wait else self.max_batch_size) - len(batch)
             if isinstance(self._output_queue, DistributedTrajectoryQueue):
                 items, saw_sentinel = await self._output_queue.get_many(
-                    count, wait=wait
+                    count, wait=wait, held_groups=len(batch)
                 )
                 if not items:
                     break
@@ -1678,20 +1680,24 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
         trajectories: Iterable[art.Trajectory],
     ) -> None:
         for trajectory in trajectories:
+            found_completion = False
             for item in cls._trajectory_messages_and_choices(trajectory):
-                is_completion = isinstance(item, Choice) or (
-                    isinstance(item, Mapping) and item.get("role") == "assistant"
+                spans = cls._validated_policy_spans(
+                    item, required=isinstance(item, Choice)
                 )
-                if not is_completion:
+                if spans is None:
                     continue
-                spans = cls._validated_policy_spans(item, required=True)
-                assert spans is not None
+                found_completion = True
                 for span in spans:
                     if span.policy_version != step:
                         raise RuntimeError(
                             f"Eval at step {step} returned "
                             f"policy-{span.policy_version} tokens"
                         )
+            if not found_completion:
+                raise RuntimeError(
+                    "Exact policy provenance is missing policy_token_spans"
+                )
 
     @staticmethod
     def _validated_policy_spans(
