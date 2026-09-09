@@ -2123,14 +2123,29 @@ _planner_variant = "current"
 
 
 def _legacy_gdn_planner_config(config: Any) -> Any:
-    """The GDN planner configuration main built before the recalibration: the
-    recurrent rates alone price a rank's tokens (no dense projection term)."""
+    """The GDN planner configuration main built before the recalibration: no
+    dense projection term, the previous chain overheads (0.2 ms per bucket,
+    80 MB/ms summary exchange, 2.0 ms + 15 segments/ms suffix scan at the
+    reference shape) and the 4.0 ms chain gate. The suffix-scan rate is
+    shape-scaled by from_model_shape, so main's value is recovered through the
+    ratio of the reference rates (15 / 3.5)."""
 
     from dataclasses import replace
 
     if config is None:
         return None
-    return replace(config, runtime_dense_tokens_per_ms=1e12)
+    return replace(
+        config,
+        runtime_dense_tokens_per_ms=1e12,
+        runtime_local_bucket_launch_ms=0.20,
+        runtime_chain_bucket_launch_ms=0.20,
+        runtime_cp_summary_bandwidth_bytes_per_ms=80_000_000.0,
+        runtime_cp_suffix_scan_latency_ms=2.0,
+        runtime_cp_suffix_scan_segments_per_ms=(
+            config.runtime_cp_suffix_scan_segments_per_ms * (15.0 / 3.5)
+        ),
+        cp_chain_min_runtime_delta_ms=4.0,
+    )
 
 
 def _gdn_variant_config(config: Any, variant: str) -> Any:

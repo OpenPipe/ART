@@ -575,7 +575,7 @@ def test_gdn_tree_cp_plan_chains_one_long_sequence_because_dense_work_follows_to
         linear_key_head_dim=128,
         linear_value_head_dim=128,
     )
-    assert qwen35_4b.runtime_dense_tokens_per_ms == pytest.approx(1108, rel=0.01)
+    assert qwen35_4b.runtime_dense_tokens_per_ms == pytest.approx(617, rel=0.01)
     layout = _uniform_attention_layout(spec.real_token_count, 4)
     chained = build_gdn_global_execution_decision(
         spec, cp_size=4, attention_token_layout_index=layout, planner_config=qwen35_4b

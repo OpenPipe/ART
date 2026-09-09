@@ -20,8 +20,9 @@ FLA_CHUNK_SIZE = 64
 _RUNTIME_STATE_THROUGHPUT_EXPONENT = 0.75
 # The GDN layer's dense work (input projection, output projection) runs on the
 # GDN layout, so it follows a rank's GDN-owned tokens; priced from its FLOPs at
-# the throughput the paired planner A/B measured on Qwen3.5-4B (H200 bf16).
-_RUNTIME_DENSE_ACHIEVED_TFLOPS = 280.0
+# the throughput the paired planner A/B campaigns fitted jointly on Qwen3.5-4B,
+# Qwen3.5-27B and Qwen3.5-35B-A3B (H200 bf16, 982 paired layouts, 2026-09-09).
+_RUNTIME_DENSE_ACHIEVED_TFLOPS = 156.0
 
 
 def _dense_tokens_per_ms(
@@ -185,8 +186,11 @@ class GdnPlannerConfig:
     cp_chain_beam_candidate_limit: int = 16
     cp_chain_beam_max_steps: int = 4
     # Chain buckets add extra collectives and kernel shapes; require a
-    # measurable runtime win before selecting them over local execution.
-    cp_chain_min_runtime_delta_ms: float = 4.0
+    # measurable runtime win before selecting them over local execution. The
+    # paired campaigns put the model's error at about 5 ms per layer (rms) and
+    # the decision regret flat for gates between 0 and 1 ms; 1 ms halves the
+    # chains that measured slower without giving up measured wins.
+    cp_chain_min_runtime_delta_ms: float = 1.0
     runtime_hidden_bytes_per_token: int = 4096
     runtime_layout_exchange_count: int = 4
     # Global all-to-all token counts are priced against aggregate CP bandwidth.
@@ -198,19 +202,22 @@ class GdnPlannerConfig:
     runtime_chain_recurrent_tokens_per_ms: float = 1_400.0
     # Dense (projection) work per GDN-owned token on a rank, chained or not; the
     # default is the reference shape's rate.
-    runtime_dense_tokens_per_ms: float = 1_385.0
-    runtime_local_bucket_launch_ms: float = 0.20
-    runtime_chain_bucket_launch_ms: float = 0.20
+    runtime_dense_tokens_per_ms: float = 772.0
+    runtime_local_bucket_launch_ms: float = 2.2
+    runtime_chain_bucket_launch_ms: float = 2.2
     runtime_local_segment_launch_ms: float = 0.005
     runtime_cp_summary_bytes_per_segment: int = 4_194_304
     runtime_cp_summary_exchange_count_per_bucket: int = 8
     # Summary collectives move small state tensors and do not sustain the large
-    # hidden-state all-to-all bandwidth used by the layout exchange term.
-    runtime_cp_summary_bandwidth_bytes_per_ms: float = 80_000_000.0
+    # hidden-state all-to-all bandwidth used by the layout exchange term. The
+    # paired campaigns do not expose a per-byte summary cost beyond the
+    # per-segment scan below (the two are collinear), so the bandwidth is set
+    # high and the per-segment and per-bucket costs carry the chain overhead.
+    runtime_cp_summary_bandwidth_bytes_per_ms: float = 10_000_000_000.0
     runtime_cp_summary_collective_latency_ms: float = 0.0
     runtime_cp_summary_compute_segments_per_ms: float = 320.0
-    runtime_cp_suffix_scan_latency_ms: float = 2.0
-    runtime_cp_suffix_scan_segments_per_ms: float = 15.0
+    runtime_cp_suffix_scan_latency_ms: float = 2.8
+    runtime_cp_suffix_scan_segments_per_ms: float = 3.5
     runtime_parent_state_bytes_per_exchange: int = 262_144
     runtime_parent_state_bandwidth_bytes_per_ms: float = 56_000_000.0
     runtime_parent_state_latency_ms: float = 0.0
@@ -306,7 +313,7 @@ class GdnPlannerConfig:
             runtime_chain_recurrent_tokens_per_ms=1_400.0 * recurrent_scale,
             runtime_cp_summary_bytes_per_segment=summary_state_elements * 4,
             runtime_cp_summary_compute_segments_per_ms=320.0 * summary_scale,
-            runtime_cp_suffix_scan_segments_per_ms=15.0 * summary_scale,
+            runtime_cp_suffix_scan_segments_per_ms=3.5 * summary_scale,
             runtime_parent_state_bytes_per_exchange=(
                 conv_state_bytes + recurrent_state_bytes
             ),

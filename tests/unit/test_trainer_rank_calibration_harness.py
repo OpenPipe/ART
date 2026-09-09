@@ -268,9 +268,10 @@ def test_contract_accepts_the_yield_empty_flag_only_when_it_is_off_by_default() 
 
 
 def test_gdn_legacy_variant_is_the_planner_before_the_dense_term() -> None:
-    """The validation arm restores main's GDN planner: the dense projection
-    term disabled and nothing else changed, so an 8k-token sequence that the
-    production planner chains across four ranks stays on one rank."""
+    """The validation arm restores main's GDN planner: no dense projection
+    term, the previous chain overheads and gate, nothing else changed, so an
+    8k-token sequence that the production planner chains across four ranks
+    stays on one rank."""
 
     from dataclasses import fields
 
@@ -299,8 +300,18 @@ def test_gdn_legacy_variant_is_the_planner_before_the_dense_term() -> None:
         for f in fields(current)
         if getattr(legacy, f.name) != getattr(current, f.name)
     }
-    assert changed == {"runtime_dense_tokens_per_ms"}
+    assert changed == {
+        "runtime_dense_tokens_per_ms",
+        "runtime_local_bucket_launch_ms",
+        "runtime_chain_bucket_launch_ms",
+        "runtime_cp_summary_bandwidth_bytes_per_ms",
+        "runtime_cp_suffix_scan_latency_ms",
+        "runtime_cp_suffix_scan_segments_per_ms",
+        "cp_chain_min_runtime_delta_ms",
+    }
     assert legacy.runtime_dense_tokens_per_ms >= 1e12
+    assert legacy.cp_chain_min_runtime_delta_ms == 4.0
+    assert legacy.runtime_cp_suffix_scan_segments_per_ms == pytest.approx(15.0)
     pack = prefix_tree_pack((torch.arange(1, 8_193),), max_depth=1)
     spec = parse_gdn_prefix_tree_segments(
         group_ids=pack.group_ids, parent_ids=pack.parent_ids
