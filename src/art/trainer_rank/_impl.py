@@ -1195,6 +1195,85 @@ def _configure_moe_dispatcher_caches(model: Sequence[torch.nn.Module]) -> None:
                 )
 
 
+def _moe_output_bytes_per_token(
+    model: Sequence[torch.nn.Module], shape: ParallelShape
+) -> int:
+    """Known FC2 output pair, not a bound on the complete live working set."""
+    if shape != ParallelShape(tp=1, cp=1):
+        return 0
+    from megatron.core.extensions.transformer_engine import TERowParallelGroupedLinear
+    from megatron.core.transformer.moe.experts import TEGroupedMLP
+    from megatron.core.transformer.moe.moe_layer import BaseMoELayer, MoELayer
+    from megatron.core.transformer.moe.router import TopKRouter
+    from megatron.core.transformer.moe.token_dispatcher import (
+        MoEAlltoAllTokenDispatcher,
+    )
+
+    from art.megatron.lora import LoRA, MLPExpertsLinearFC2LoRA
+
+    coefficient = 0
+    for chunk in model:
+        for layer in chunk.modules():
+            if not isinstance(layer, BaseMoELayer):
+                continue
+            experts = getattr(layer, "experts", None)
+            fc2: Any = getattr(experts, "linear_fc2", None)
+            lora: Any = getattr(fc2, "lora", None)
+            dispatcher = getattr(layer, "token_dispatcher", None)
+            sites = (
+                (layer, MoELayer),
+                (experts, TEGroupedMLP),
+                (fc2, MLPExpertsLinearFC2LoRA),
+                (lora, LoRA),
+                (getattr(fc2, "linear_fc2", None), TERowParallelGroupedLinear),
+                (getattr(layer, "router", None), TopKRouter),
+            )
+            if (
+                any(
+                    type(site) is not expected
+                    or "forward" in vars(site)
+                    or getattr(site, "_forward_hooks", None)
+                    or getattr(site, "_forward_pre_hooks", None)
+                    for site, expected in sites
+                )
+                or type(dispatcher) is not MoEAlltoAllTokenDispatcher
+            ):
+                return 0
+            config = layer.config
+            if (
+                config.moe_expert_capacity_factor is not None
+                or config.moe_pad_expert_input_to_capacity
+                or config.moe_router_padding_for_quantization
+                or config.fp8
+                or config.fp4
+                or config.moe_latent_size is not None
+                or config.cuda_graph_impl != "none"
+                or any(
+                    name in vars(dispatcher)
+                    for name in (
+                        "preprocess",
+                        "dispatch_preprocess",
+                        "dispatch_postprocess",
+                    )
+                )
+                or "routing" in vars(layer.router)
+            ):
+                return 0
+            weights = lora.B_T
+            if (
+                weights.dtype not in (torch.float16, torch.bfloat16)
+                or weights.shape[-1] != fc2.out_features
+                or fc2.out_features != config.hidden_size
+                or getattr(layer.router, "topk", None) != config.moe_router_topk
+            ):
+                return 0
+            coefficient = max(
+                coefficient,
+                2 * config.moe_router_topk * fc2.out_features * weights.element_size(),
+            )
+    return coefficient
+
+
 class TrainerRank:
     def __init__(self, runtime: TrainingRuntime) -> None:
         pp_size = int(getattr(runtime.provider, "pipeline_model_parallel_size", 1) or 1)
@@ -1261,6 +1340,11 @@ class TrainerRank:
         ep_size, etp_size = _expert_parallel_shape(runtime.provider)
         self._parallel_shape = ParallelShape(
             tp=tp_size, cp=cp_size, ep=ep_size, etp=etp_size
+        )
+        self._moe_output_bytes_per_token = (
+            _moe_output_bytes_per_token(runtime.model, self._parallel_shape)
+            if self._moe_layers
+            else 0
         )
         selection = select_scoring(
             device_capability=capability,
@@ -4676,6 +4760,11 @@ class TrainerRank:
             * self._hidden_size
             * self._param_dtype_size
             * activation_factor
+        )
+        # Groups execute sequentially: summed packed rows conservatively bound
+        # this output-pair component, not simultaneous workspace or retained graphs.
+        static_compute = max(
+            static_compute, packed_tokens * self._moe_output_bytes_per_token
         )
         # A profile learned under lighter sharing (lower logical/packed ratio)
         # underestimates the per-packed-token footprint of a deeper-shared
