@@ -5252,10 +5252,8 @@ def _tokenize_chat_view(
                 else marked_bounds.get(message_index)
                 or probed_bounds.get(message_index)
             )
-            if (
-                bounds is None
-                and position + 1 < len(sampled_message_indices)
-                and source_matches_context(source)
+            if position + 1 < len(sampled_message_indices) and source_matches_context(
+                source
             ):
                 prompt = source_prompt_tokens(source)
                 output, _ = source_output_tokens(source)
@@ -5268,7 +5266,7 @@ def _tokenize_chat_view(
                     rendered_start = rendered_end - 1
                     while rendered_start and assistant_mask[rendered_start - 1]:
                         rendered_start -= 1
-                    bounds = _prove_exact_length_stopped_assistant_prefix(
+                    exact_bounds = _prove_exact_length_stopped_assistant_prefix(
                         [
                             match
                             for match in locations(output, rendered_start)
@@ -5277,6 +5275,7 @@ def _tokenize_chat_view(
                         assistant_mask,
                         expected_start=rendered_start,
                     )
+                    bounds = exact_bounds or bounds
             next_prompt_end: int | None
             if position + 1 < len(sampled_message_indices):
                 next_message_index = sampled_message_indices[position + 1]
