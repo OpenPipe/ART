@@ -13,9 +13,9 @@ and expected to FAIL on the pre-split tree. Contract, as agreed:
   subforward plus the current transient peak. Until a retained-bytes profile
   exists, retained memory is conservatively the full estimate; a profile is
   trusted only near the scale it was observed at.
-- Failed rungs are rejected with cheap bounds; the planner runs only for the
-  rung that executes. Ensuring checkpoint slots is a collective, so it happens
-  exactly once per call regardless of how many rungs this rank tries.
+- Failed rungs use cheap bounds where possible; uncertain retained-profile
+  costs still need exact planning. Ensuring checkpoint slots is a collective,
+  so it happens exactly once regardless of how many rungs this rank tries.
 - Split execution creates an independent slot-graph sentinel per subforward,
   and any execution-time failure of an admitted split is reported as
   ``TrainerRankPartialExecutionError``.
@@ -49,7 +49,13 @@ from art.trainer_rank import (
     TrainerRankPartialExecutionError,
     TrainerRankSlotStateError,
 )
-from art.trainer_rank._impl import _FlatForwardPlan, _MemoryCheck, _MemoryProfile
+from art.trainer_rank._impl import (
+    Unset,
+    _FlatForwardPlan,
+    _MemoryCheck,
+    _MemoryProfile,
+    _SplitForwardPlan,
+)
 
 if TYPE_CHECKING:
     from art.megatron.lora import LoRASlotRef
@@ -544,6 +550,167 @@ def test_retained_compute_keeps_growth_and_sharing_trust_limits(
         assert observed.retained < observed.required
     else:
         assert observed.retained == observed.required
+
+
+def _retained_ratio_rank(monkeypatch: pytest.MonkeyPatch) -> TrainerRank:
+    rank = _rank(monkeypatch)
+    rank._hidden_size, rank._param_dtype_size, rank._num_layers = 4096, 2, 48
+    monkeypatch.setattr(
+        rank,
+        "_layout_anchor",
+        lambda *, memory_minimal=False: (
+            "full_sharing" if memory_minimal else "no_sharing"
+        ),
+    )
+    return rank
+
+
+def _retained_ratio_requests() -> list[ForwardInput]:
+    tokens = torch.arange(4000) % 31
+    labels = torch.full_like(tokens, -100)
+    labels[-1] = 1
+    return [ForwardInput(input_tokens=tokens, target_tokens=labels) for _ in range(16)]
+
+
+@pytest.mark.parametrize("admit", (False, True))
+def test_retained_ratio_lower_bound_reaches_exact_split_admission(
+    monkeypatch: pytest.MonkeyPatch, admit: bool
+) -> None:
+    rank = _retained_ratio_rank(monkeypatch)
+    # Actual packing: each child has 64k logical/no-sharing rows versus 4k
+    # full-sharing rows. The latter alone crosses the retained-ratio limit.
+    requests = _retained_ratio_requests()
+    requests += [replace(request, no_grad=True) for request in requests]
+    children = [rank._plan_flat_forward(requests[i : i + 16]) for i in (0, 16)]
+    parent = rank._plan_flat_forward(requests)
+    rank._memory_profiles[parent.signature] = _MemoryProfile(16 * 131_072, 16_000)
+    for child in children:
+        rank._memory_profiles[child.signature] = _MemoryProfile(
+            4 * 131_072, 8000, retained_compute_bytes_per_token=128
+        )
+    costs = [rank._plan_cost(child) for child in children]
+    exact_bytes = rank._split_rung_check(costs).estimated_required_bytes
+    budget = 40 * 2**30 if admit else exact_bytes - 1
+    monkeypatch.setattr(rank, "_available_memory_bytes", lambda: budget)
+    exact = rank._split_rung_check(costs)
+    if admit:
+        plan, check = rank._plan_admissible_forward(
+            requests, checkpoint=Unset, context="test"
+        )
+        assert isinstance(plan, _SplitForwardPlan) and plan.subforward_count == 2
+        assert check == exact
+        assert sorted(
+            index for chunk in plan.request_indices for index in chunk
+        ) == list(range(32))
+    lower = rank._split_rung_check(
+        [
+            rank._split_chunk_lower_cost(
+                requests[i : i + 16],
+                [request.input_tokens for request in requests[i : i + 16]],
+                checkpoint=Unset,
+            )
+            for i in (0, 16)
+        ]
+    )
+    assert [child.packed_tokens for child in children] == [64_000, 64_000]
+    assert lower.estimated_required_bytes <= exact.estimated_required_bytes
+    assert lower.fits and exact.fits == admit
+    if not admit:
+        # The optimistic bound survives, but exact pricing must reject this
+        # rung. A later rung with smaller chunks may still fit this budget.
+        split, rejected = rank._admit_split_rung(
+            [tuple(range(16)), tuple(range(16, 32))],
+            requests,
+            [request.input_tokens for request in requests],
+            checkpoint=Unset,
+        )
+        assert split is None and not rejected.fits
+
+
+@pytest.mark.parametrize(
+    ("profile_packed", "profile_ratio", "retained_rate", "relax"),
+    [
+        (999, 1.0, 0, False),  # The two trust windows do not overlap.
+        (1000, 1.0, 0, True),  # Packed=8000 can satisfy both limits exactly.
+        (1001, 1.0, 128, True),
+        (1000, 1.99, 128, True),
+        (1000, 2.0, 128, False),  # Full sharing itself is trusted at equality.
+        (1000, 2.01, 128, False),
+        (1000, 1.0, None, False),  # No retained observation to trust elsewhere.
+    ],
+)
+@pytest.mark.parametrize("hidden_states", (False, True))
+def test_retained_ratio_lower_bound_preserves_exact_cost_and_trust_boundaries(
+    monkeypatch: pytest.MonkeyPatch,
+    profile_packed: int,
+    profile_ratio: float,
+    retained_rate: float | None,
+    relax: bool,
+    hidden_states: bool,
+) -> None:
+    rank = _retained_ratio_rank(monkeypatch)
+    requests = [
+        replace(request, hidden_states=hidden_states)
+        for request in _retained_ratio_requests()
+    ]
+    plan = rank._plan_flat_forward(requests, memory_minimal=True)
+    assert (plan.packed_tokens, plan.logical_tokens) == (4000, 64_000)
+    rank._memory_profiles[plan.signature] = _MemoryProfile(
+        4 * 131_072,
+        profile_packed,
+        profile_ratio,
+        retained_compute_bytes_per_token=retained_rate,
+    )
+    exact = rank._plan_cost(plan)
+    lower = rank._split_chunk_lower_cost(
+        requests, [request.input_tokens for request in requests], checkpoint=Unset
+    )
+    assert rank._plan_cost(plan) == exact
+    assert lower.required == exact.required
+    if relax:
+        assert exact.retained == exact.required
+        assert lower.retained == int(plan.output_bytes * 1.1) < exact.retained
+    else:
+        assert lower == exact
+
+
+@pytest.mark.parametrize("empty", (False, True))
+def test_retained_ratio_lower_bound_without_profile_or_tokens(
+    monkeypatch: pytest.MonkeyPatch, empty: bool
+) -> None:
+    rank = _retained_ratio_rank(monkeypatch)
+    requests = [] if empty else _retained_ratio_requests()
+    plan = rank._plan_flat_forward(requests, memory_minimal=True)
+    cost = rank._plan_cost(plan)
+    lower = rank._split_chunk_lower_cost(
+        requests, [request.input_tokens for request in requests], checkpoint=Unset
+    )
+    assert lower == cost and lower.retained == lower.required
+    if empty:
+        assert lower.required == 0
+
+
+def test_retained_ratio_original_cost_witness_stays_conservative(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rank = _retained_ratio_rank(monkeypatch)
+    signature = rank._plan_flat_forward([_request(0)]).signature
+    rank._memory_profiles[signature] = _MemoryProfile(
+        4 * 131_072, 1000, retained_compute_bytes_per_token=0
+    )
+    small, large = [
+        rank._subforward_cost(
+            packed_tokens=packed,
+            logical_tokens=64_000,
+            output_bytes=10_000,
+            signature=signature,
+        )
+        for packed in (4000, 8000)
+    ]
+    # Exact retention keeps its conservative fallback. Only treating that
+    # fallback as an optimistic split-search bound was incorrect.
+    assert small.required == large.required == 36_909_886_200
+    assert small.retained == small.required and large.retained == 11_000
 
 
 @pytest.mark.parametrize("failing_ordinal", (0, 1))

@@ -2540,10 +2540,10 @@ class TrainerRank:
         measures it on a real cell.
 
         Cost: the cheap full-sharing lower bound (one O(tokens) CPU scan per
-        chunk) rejects a rung without planning anything. A rung that survives
-        is priced exactly with cost-optimal layouts and, failing that, with
-        memory-minimal layouts, whose packed tokens equal the lower bound — so
-        the planner runs for at most one rung, the one that executes.
+        chunk) can reject a rung without planning it. A surviving rung is
+        priced exactly with cost-optimal and then memory-minimal layouts.
+        Retained-profile trust boundaries can make the bound optimistic, so
+        more than one rung may need exact planning before one executes.
         """
 
         lower = [
@@ -2597,7 +2597,11 @@ class TrainerRank:
         *,
         checkpoint: AdapterSelection,
     ) -> _SubforwardCost:
-        """Cheapest possible cost of a chunk: its full-sharing packed tokens."""
+        """Optimistic retention; exact layouts still decide admission.
+
+        The required term keeps the estimator's packed-profile trust cutoff;
+        crossing that separate cutoff can still invalidate its lower bound.
+        """
 
         groups = self._group_active_request_indices(
             requests, checkpoint=checkpoint, ensure_slots=False
@@ -2610,16 +2614,37 @@ class TrainerRank:
             )
             assert estimated is not None  # rows are CPU copies
             packed_tokens += self._physical_tokens(estimated)
-        return self._subforward_cost(
-            packed_tokens=packed_tokens,
-            output_bytes=self._estimate_group_request_output_bytes(requests),
-            signature=self._memory_signature_from_requests(
-                requests,
-                slot_group_count=len(groups),
-                grad_modes=tuple(mode for (_, mode), _ in groups),
-            ),
-            logical_tokens=sum(int(row.numel()) for row in rows),
+        output_bytes = self._estimate_group_request_output_bytes(requests)
+        signature = self._memory_signature_from_requests(
+            requests,
+            slot_group_count=len(groups),
+            grad_modes=tuple(mode for (_, mode), _ in groups),
         )
+        logical_tokens = sum(int(row.numel()) for row in rows)
+        cost = self._subforward_cost(
+            packed_tokens=packed_tokens,
+            output_bytes=output_bytes,
+            signature=signature,
+            logical_tokens=logical_tokens,
+        )
+        profile = self._memory_profiles.get(signature)
+        if (
+            profile is not None
+            and profile.retained_compute_bytes_per_token is not None
+            and logical_tokens / max(1, packed_tokens)
+            > profile.logical_per_packed * _MEMORY_PROFILE_TRUST_GROWTH
+            and logical_tokens
+            / (profile.logical_per_packed * _MEMORY_PROFILE_TRUST_GROWTH)
+            <= profile.packed_tokens * _MEMORY_PROFILE_TRUST_GROWTH
+        ):
+            # A larger layout may trust retained compute where full sharing
+            # cannot. Its full-required retention is not a pruning lower bound.
+            # Charge only outputs here; exact plan costs keep both trust guards.
+            return _SubforwardCost(
+                required=cost.required,
+                retained=min(cost.retained, int(output_bytes * _MEMORY_SAFETY_FACTOR)),
+            )
+        return cost
 
     def _plan_cost(self, plan: _FlatForwardPlan) -> _SubforwardCost:
         return self._subforward_cost(
