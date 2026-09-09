@@ -134,6 +134,8 @@ jobs:
           YAML
 
       - name: Run TrainerRank GPU validation
+        env:
+          EXPECTED_HEAD_SHA: ${{ needs.classify.outputs.head_sha }}
         run: |
           set -euo pipefail
           sky_venv="${RUNNER_TEMP}/skypilot"
@@ -145,9 +147,16 @@ jobs:
           cleanup() { "${sky}" down -y "${cluster}" || true; }
           trap cleanup EXIT
           "${sky}" check kubernetes
-          "${sky}" launch -y -c "${cluster}" \
-            --infra "${SKY_INFRA}" \
-            scripts/ci/trainer-rank-gpu.sky.yaml
+          "${sky_venv}/bin/python" scripts/ci/trainer-rank-gpu.py \
+            "${RUNNER_TEMP}/trainer-rank-result"
+
+      - name: Preserve remote result and diagnostic logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trainer-rank-result-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/trainer-rank-result
+          if-no-files-found: warn
 
   gate:
     name: trainer-rank-gpu-validation
