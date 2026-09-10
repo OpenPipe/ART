@@ -4046,11 +4046,9 @@ def _tokenize_exact_projected_chat_history(
         return None
     final_key = _sampled_source_key(final_source)
     final_stop_reason = _source_stop_evidence(final_source, final_key)[0]
-    terminal_boundary = (
-        (length_stop_boundaries or {}).get(final_key)
-        if final_stop_reason == "length"
-        else None
-    )
+    # A terminal synthetic stop can accompany an earlier length-stop boundary;
+    # neither tail is sampled, and both must retain their renderer proof.
+    terminal_boundary = (length_stop_boundaries or {}).get(final_key)
     # Unlike a nonterminal truncation, the final sampled output needs no
     # synthetic boundary to connect it to a later prompt.
     if terminal_boundary is not None and not terminal_boundary.tail:
@@ -4065,7 +4063,17 @@ def _tokenize_exact_projected_chat_history(
     )
     terminal_flags = (
         [
-            *([TokenFlag.ASSISTANT] * len(terminal_boundary.tail)),
+            *(
+                [
+                    TokenFlag.ASSISTANT
+                    | (
+                        TokenFlag.OUTPUT
+                        if final_stop_reason == "stop"
+                        else TokenFlag(0)
+                    )
+                ]
+                * len(terminal_boundary.tail)
+            ),
             *([TokenFlag(0)] * len(terminal_boundary.following)),
         ]
         if terminal_boundary is not None
@@ -4097,7 +4105,11 @@ def _tokenize_exact_projected_chat_history(
     if terminal_boundary is not None:
         flags[
             len(final_prompt) + len(final_output) + len(terminal_boundary.tail) - 1
-        ] = TokenFlag.STOP
+        ] = TokenFlag.STOP | (
+            TokenFlag.ASSISTANT | TokenFlag.OUTPUT
+            if final_stop_reason == "stop"
+            else TokenFlag(0)
+        )
     source_keys: list[_SampledSourceKey | None] = [
         *([None] * len(final_prompt)),
         *([final_key] * len(final_output)),
@@ -5214,7 +5226,6 @@ def _tokenize_chat_view(
         _projection_matches is True
         and chat_template is None
         and chat_template_kwargs is None
-        and not _history_needs_synthetic_stop(history, resolved_tokenizer)
     ):
         sampled_message_indices: list[int] = []
         seen_signatures: set[tuple[object, ...]] = set()
@@ -5243,9 +5254,25 @@ def _tokenize_chat_view(
             source = history.message_sources[message_index]
             assert source is not None
             source_key = _sampled_source_key(source)
-            if _source_stop_evidence(source, source_key)[0] != "length":
+            stop_reason = _source_stop_evidence(source, source_key)[0]
+            output = _source_output_tokens(source, source_key)
+            synthetic_stop = (
+                stop_reason == "stop"
+                and bool(_terminator_ids(resolved_tokenizer))
+                and output is not None
+                and not _sampled_stop_suffix(
+                    output,
+                    source=source,
+                    source_key=source_key,
+                    tokenizer=resolved_tokenizer,
+                )
+            )
+            if synthetic_stop and position + 1 < len(sampled_message_indices):
+                length_stop_boundaries_complete = False
+                break
+            if stop_reason != "length" and not synthetic_stop:
                 continue
-            length_stop_count += 1
+            length_stop_count += stop_reason == "length"
             bounds = (
                 direct_bounds[message_index]
                 if direct_bounds
@@ -5310,7 +5337,7 @@ def _tokenize_chat_view(
                 else None
             )
             if boundary is None:
-                if position + 1 < len(sampled_message_indices):
+                if synthetic_stop or position + 1 < len(sampled_message_indices):
                     length_stop_boundaries_complete = False
                     break
                 # A terminal length stop needs no renderer-owned tail: the

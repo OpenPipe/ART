@@ -346,6 +346,7 @@ def _character_template_history(
     following_user: str = "turn 2",
     omit_length_tail: bool = False,
     length_reasoning: str | None = None,
+    terminal_sampled_stop: bool = True,
 ) -> tuple[ChatCompletionsHistory, _CharacterTemplateTokenizer, list[int]]:
     tokenizer = _CharacterTemplateTokenizer()
     answer = tokenizer._encode("answer")
@@ -359,7 +360,7 @@ def _character_template_history(
         *([] if omit_length_tail else [9]),
         *tokenizer._encode(following_user),
     ]
-    third_output = [*answer, 9]
+    third_output = [*answer, *([9] if terminal_sampled_stop else [])]
 
     first = _chat_exchange(first_prompt, first_output)
     second = _chat_exchange(second_prompt, second_output, offset=1)
@@ -697,6 +698,44 @@ def test_public_exact_chain_preserves_raw_drift_across_proven_length_boundary() 
     tail = length_start + len("answer")
     assert tokenized.flags[tail] == tr.TokenFlag.EXACT | tr.TokenFlag.STOP
     assert not tokenized.flags[tail] & tr.TokenFlag.SAMPLED
+
+
+@pytest.mark.parametrize("finish_reason", ["stop", "tool_calls"])
+def test_length_chain_retains_exact_prefix_with_terminal_synthetic_stop(
+    finish_reason: str,
+) -> None:
+    history, tokenizer, captured = _character_template_history(
+        terminal_sampled_stop=False
+    )
+    source = history.message_sources[-1]
+    assert source is not None
+    source.exchange.response.choices[0].finish_reason = finish_reason
+
+    tokenized = history.tokenize(tokenizer=tokenizer)
+
+    assert tokenized.tokens == [*captured, 9]
+    assert all(flag & tr.TokenFlag.EXACT for flag in tokenized.flags[:-1])
+    assert tokenized.flags[-1] == (
+        tr.TokenFlag.STOP | tr.TokenFlag.ASSISTANT | tr.TokenFlag.OUTPUT
+    )
+    assert sum(bool(flag & tr.TokenFlag.SAMPLED) for flag in tokenized.flags) == 19
+
+
+def test_terminal_synthetic_stop_does_not_relax_nonterminal_length_proof(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "art.trajectories._tokenize._WARNED_PREFIX_RETOKENIZATION", False
+    )
+    history, tokenizer, captured = _character_template_history(
+        terminal_sampled_stop=False,
+        following_user="§turn 2",
+        omit_length_tail=True,
+    )
+    with pytest.warns(UserWarning, match="retokenized an earlier sampled response"):
+        tokenized = history.tokenize(tokenizer=tokenizer)
+    assert tokenized.tokens != [*captured, 9]
+    assert not all(flag & tr.TokenFlag.EXACT for flag in tokenized.flags[:-1])
 
 
 def test_public_exact_chain_probes_multi_part_length_response() -> None:
