@@ -531,16 +531,16 @@ def _prefix_tree_layout_score_v1(
 COEFFICIENT_SCALE_PER_US = 1_000
 # Dense hidden-2,560 class (Qwen3.5-4B GDN and Qwen3-4B attention on H200 bf16).
 COEFFICIENTS_MILLI_US: dict[str, int] = {
-    "token_per_rank": 1983,
-    "token_cp_exchange": 16,
-    "token_tp_collective": 237,
-    "gdn_token_per_rank": 599,
+    "token_per_rank": 1986,
+    "token_cp_exchange": 45,
+    "token_tp_collective": 229,
+    "gdn_token_per_rank": 305,
     "attention_token_cp_exchange": 7,
-    "tiny_segment_per_layer": 167333,
-    "level_cp_per_layer": 62793,
-    "level_tp_per_layer": 668184,
-    "gdn_level": 2908492,
-    "gdn_level_tp": 1657638,
+    "tiny_segment_per_layer": 222742,
+    "level_cp_per_layer": 152596,
+    "level_tp_per_layer": 635438,
+    "gdn_level": 2920256,
+    "gdn_level_tp": 428567,
 }
 
 H200_CLASS = DeviceClass(capability=(9, 0), memory_class="hbm-141g")
