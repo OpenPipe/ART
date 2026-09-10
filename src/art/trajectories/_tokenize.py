@@ -5279,6 +5279,18 @@ def _tokenize_chat_view(
                 else marked_bounds.get(message_index)
                 or probed_bounds.get(message_index)
             )
+            if synthetic_stop and bounds is not None:
+                # Tool part bounds can omit sampled closing markup. Prove the
+                # complete sampled prefix before appending only its remainder.
+                assert output is not None
+                rendered_start = bounds[0]
+                while rendered_start and assistant_mask[rendered_start - 1]:
+                    rendered_start -= 1
+                bounds = _prove_exact_length_stopped_assistant_prefix(
+                    locations(output, rendered_start),
+                    assistant_mask,
+                    expected_start=rendered_start,
+                )
             if position + 1 < len(sampled_message_indices) and source_matches_context(
                 source
             ):

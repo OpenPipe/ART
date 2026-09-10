@@ -740,7 +740,16 @@ def test_terminal_synthetic_stop_does_not_relax_nonterminal_length_proof(
 
 
 @pytest.mark.parametrize("mismatch", [False, True])
-def test_length_boundary_ends_before_next_assistant_tool_prefix(mismatch: bool) -> None:
+@pytest.mark.parametrize(
+    "sampled_closer", ["", "<", "</too", "</tool>", "</tool></tool>"]
+)
+def test_length_boundary_ends_before_next_assistant_tool_prefix(
+    mismatch: bool, sampled_closer: str
+) -> None:
+    closing_markup = (
+        "</tool></tool>" if sampled_closer == "</tool></tool>" else "</tool>"
+    )
+
     class ToolTokenizer(_CharacterTemplateTokenizer):
         def apply_chat_template(
             self,
@@ -756,7 +765,10 @@ def test_length_boundary_ends_before_next_assistant_tool_prefix(mismatch: bool) 
                 for call in message.get("tool_calls") or []:
                     function = call["function"]
                     text += (
-                        "<tool>" + function["name"] + function["arguments"] + "</tool>"
+                        "<tool>"
+                        + function["name"]
+                        + function["arguments"]
+                        + closing_markup
                     )
                 if message.get("role") == "assistant":
                     text += "§"
@@ -770,7 +782,7 @@ def test_length_boundary_ends_before_next_assistant_tool_prefix(mismatch: bool) 
     next_prompt = [*prompt, *output, 9, *tokenizer._encode("turn 1")]
     if mismatch:
         next_prompt[len(prompt) + len(output)] = 1000
-    tool_output = tokenizer._encode("<tool>lookup{}")
+    tool_output = tokenizer._encode("<tool>lookup{}" + sampled_closer)
     second = _chat_exchange(next_prompt, tool_output, offset=1)
     data = second.response.model_dump(mode="python")
     data["choices"][0].update(
@@ -792,7 +804,10 @@ def test_length_boundary_ends_before_next_assistant_tool_prefix(mismatch: bool) 
         exchanges=TrajectoryExchanges(chat_completions=[first, second])
     ).chat_completions_history()
     tokenized = history.tokenize(tokenizer=tokenizer)
-    expected = [*next_prompt, *tool_output, *tokenizer._encode("</tool>§")]
+    expected = [
+        *next_prompt,
+        *tokenizer._encode("<tool>lookup{}" + closing_markup + "§"),
+    ]
     if mismatch:
         assert tokenized.tokens != expected
         return
@@ -812,6 +827,20 @@ def test_length_boundary_ends_before_next_assistant_tool_prefix(mismatch: bool) 
     ]
     assert len(sampled) == len(output) + len(tool_output)
     assert all(math.isfinite(tokenized.logprobs[index]) for index in sampled)
+
+
+@pytest.mark.parametrize("matches", [[], [(1, 4), (4, 7)], [(4, 7)]])
+def test_terminal_sampled_prefix_requires_one_match_at_assistant_start(
+    matches: list[tuple[int, int]],
+) -> None:
+    from art.trajectories._tokenize import _prove_exact_length_stopped_assistant_prefix
+
+    assert (
+        _prove_exact_length_stopped_assistant_prefix(
+            matches, [False, *([True] * 6)], expected_start=1
+        )
+        is None
+    )
 
 
 def test_public_exact_chain_probes_multi_part_length_response() -> None:
