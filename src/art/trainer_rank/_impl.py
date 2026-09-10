@@ -2278,6 +2278,7 @@ class TrainerRank:
                     items, stop, checkpoint=checkpoint
                 )
             self._snapshot_planning_telemetry(candidate.plan, candidate.check)
+            self._release_cached_memory_for_backward(candidate.plan)
             with _telemetry_phase(
                 # This interval is controlled by the caller and normally contains
                 # loss construction and backward for the yielded microbatch.
@@ -2313,6 +2314,42 @@ class TrainerRank:
             # Only the caller may retain completed outputs into the next wave.
             del tracked_outputs, flat_outputs, outputs
             start = stop
+
+    def _release_cached_memory_for_backward(self, plan: _AnyForwardPlan) -> None:
+        if not (
+            self.device.type == "cuda"
+            and any(group.grad_enabled for group in plan.groups)
+            and torch.cuda.is_available()
+            and torch.cuda.get_allocator_backend() == "native"
+        ):
+            return
+        free, total = torch.cuda.mem_get_info(self.device)
+        reserve = int(total * _MEMORY_RESERVE_FRACTION)
+        if int(free) >= reserve:
+            return
+        allocated = int(torch.cuda.memory_allocated(self.device))
+        reserved = int(torch.cuda.memory_reserved(self.device))
+        if reserved <= allocated:
+            return
+        # Admission counts unused cache as reusable, but external CUDA libraries
+        # cannot spend it. Use the existing reserve as a soft release trigger,
+        # not a calibrated external-library requirement or a new admission rule.
+        evidence: dict[str, object] = {
+            "device": str(self.device),
+            "reserve_trigger_bytes": reserve,
+            "physical_free_before_bytes": int(free),
+            "allocated_bytes": allocated,
+            "reserved_before_bytes": reserved,
+        }
+        with _telemetry_phase("gradient_handoff_cache_release", evidence):
+            with torch.cuda.device(self.device):
+                torch.cuda.empty_cache()
+            evidence["physical_free_after_bytes"] = int(
+                torch.cuda.mem_get_info(self.device)[0]
+            )
+            evidence["reserved_after_bytes"] = int(
+                torch.cuda.memory_reserved(self.device)
+            )
 
     @overload
     def dp_rank_forward(
