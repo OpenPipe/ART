@@ -90,6 +90,33 @@ def worker(root, operation):
         raise ValueError(operation)
 
 
+def finish_child(process):
+    """Keep the unreaped Linux child as the group identity until cleanup finishes."""
+    deadline = time.monotonic() + 5
+    while True:
+        # If another reaper consumed the child, fail without signaling a number
+        # whose identity is no longer reserved by this parent.
+        os.waitid(os.P_PID, process.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        alive = False
+        for path in Path("/proc").glob("[0-9]*/stat"):
+            try:
+                fields = path.read_text().rsplit(") ", 1)[1].split()
+            except FileNotFoundError:
+                continue
+            if int(fields[2]) == process.pid and fields[0] != "Z":
+                alive = True
+                break
+        if not alive:
+            return process.wait(timeout=max(0.001, deadline - time.monotonic()))
+        if time.monotonic() >= deadline:
+            raise TimeoutError("SDK worker process group did not stop")
+        time.sleep(0.01)
+
+
 def run_child(command, timeout, output):
     if timeout <= 0:
         raise TimeoutError("CI remote-result deadline reached")
@@ -97,22 +124,28 @@ def run_child(command, timeout, output):
         process = subprocess.Popen(
             command, stdout=stream, stderr=subprocess.STDOUT, start_new_session=True
         )
+        original = None
         try:
-            code = process.wait(timeout=timeout)
-        except BaseException:
-            # The unreaped direct child reserves this process-group identity.
-            if process.returncode is None:
-                try:
-                    try:
-                        os.killpg(process.pid, signal.SIGKILL)
-                    except ProcessLookupError:
-                        pass
-                    process.wait(timeout=5)
-                except Exception as cleanup_error:
-                    print(
-                        f"Child cleanup also failed: {cleanup_error}", file=sys.stderr
-                    )
+            deadline = time.monotonic() + timeout
+            # WNOWAIT observes exit without freeing the PID/PGID for reuse.
+            while (
+                os.waitid(os.P_PID, process.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+                is None
+            ):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise subprocess.TimeoutExpired(command, timeout)
+                time.sleep(min(0.05, remaining))
+        except BaseException as error:
+            original = error
+        try:
+            code = finish_child(process)
+        except BaseException as cleanup_error:
+            if original is not None:
+                raise original from cleanup_error
             raise
+        if original is not None:
+            raise original
         if code:
             raise subprocess.CalledProcessError(code, command)
 

@@ -371,3 +371,62 @@ def tail_logs(cluster, *, job_id, follow):
     assert result.returncode == 0, result.stderr
     assert json.loads((root / "result.json").read_text())["job_id"] == 17
     assert "fake complete log" in (root / "logs.log").read_text()
+
+
+@pytest.mark.parametrize("code", [0, 17])
+def test_early_worker_exit_stops_descendant_before_reaping_leader(tmp_path, code):
+    import ctypes
+
+    libc = ctypes.CDLL(None)
+    previous = ctypes.c_int()
+    assert libc.prctl(37, ctypes.byref(previous), 0, 0, 0) == 0
+    assert libc.prctl(36, 1, 0, 0, 0) == 0
+    receipt = tmp_path / "child.json"
+    program = """
+import json,os,pathlib,signal,sys,time
+child=os.fork()
+if child==0:
+    signal.signal(signal.SIGTERM,signal.SIG_IGN)
+    pathlib.Path(sys.argv[1]).write_text(json.dumps({'pid':os.getpid(),'pgid':os.getpgrp()}))
+    time.sleep(60)
+    os._exit(0)
+while not pathlib.Path(sys.argv[1]).exists():time.sleep(.005)
+os._exit(int(sys.argv[2]))
+"""
+    info = None
+    try:
+        command = [sys.executable, "-c", program, str(receipt), str(code)]
+        if code:
+            with pytest.raises(subprocess.CalledProcessError) as raised:
+                ci.run_child(command, 1, tmp_path / "out.log")
+            assert raised.value.returncode == code
+        else:
+            ci.run_child(command, 1, tmp_path / "out.log")
+        info = json.loads(receipt.read_text())
+        stat = Path(f"/proc/{info['pid']}/stat")
+        assert (
+            not stat.exists() or stat.read_text().rsplit(") ", 1)[1].split()[0] == "Z"
+        )
+        assert not Path(f"/proc/{info['pgid']}").exists()
+    finally:
+        if info is None and receipt.exists():
+            info = json.loads(receipt.read_text())
+        if info:
+            try:
+                os.kill(info["pid"], signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            try:
+                os.waitpid(info["pid"], 0)
+            except ChildProcessError:
+                pass
+        assert libc.prctl(36, previous.value, 0, 0, 0) == 0
+
+
+def test_lost_waitable_child_identity_never_signals_group(monkeypatch):
+    monkeypatch.setattr(ci.os, "waitid", Mock(side_effect=ChildProcessError))
+    kill = Mock()
+    monkeypatch.setattr(ci.os, "killpg", kill)
+    with pytest.raises(ChildProcessError):
+        ci.finish_child(NS(pid=42))
+    kill.assert_not_called()
