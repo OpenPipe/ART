@@ -3434,13 +3434,16 @@ def test_reasoning_stripped_messages_history_preserves_exact_tokens(
     tokenized = history.tokenize(tokenizer=Tokenizer())
 
     assert tokenized.tokens == [10, 101, 102, 11, 91, 201]
-    assert tokenized.logprobs[1:3] == pytest.approx([-10.1, -10.2])
+    if top_level_only:
+        assert all(math.isnan(value) for value in tokenized.logprobs[1:3])
+    else:
+        assert tokenized.logprobs[1:3] == pytest.approx([-10.1, -10.2])
     assert tokenized.logprobs[-2] == pytest.approx(-10.0)
     assert tokenized.logprobs[-1] == pytest.approx(-20.1)
-    assert tokenized.flags[1:3] == [
-        _SAMPLED_ASSISTANT_OUTPUT,
-        _SAMPLED_ASSISTANT_OUTPUT,
-    ]
+    assert (
+        tokenized.flags[1:3]
+        == [tr.TokenFlag.EXACT if top_level_only else _SAMPLED_ASSISTANT_OUTPUT] * 2
+    )
     assert tokenized.flags[-2:] == [
         _SAMPLED_ASSISTANT_OUTPUT,
         _SAMPLED_ASSISTANT_OUTPUT,
@@ -4330,12 +4333,12 @@ def test_cross_exchange_responses_reasoning_split_uses_later_prompt_backbone() -
         [1, 3, 4, 5],
     ]
     assert math.isnan(tokenized.histories[1].logprobs[0])
-    assert tokenized.histories[1].logprobs[1] == -0.3
+    assert math.isnan(tokenized.histories[1].logprobs[1])
     assert math.isnan(tokenized.histories[1].logprobs[2])
     assert tokenized.histories[1].logprobs[3] == -0.1
     assert tokenized.histories[1].flags == [
         tr.TokenFlag.EXACT,
-        _SAMPLED_ASSISTANT_OUTPUT,
+        tr.TokenFlag.EXACT,
         tr.TokenFlag.EXACT,
         _SAMPLED_ASSISTANT_OUTPUT,
     ]
@@ -6366,13 +6369,8 @@ def test_reasoning_stripped_chat_histories_tokenize_authoritative_views() -> Non
         [1, 2, 101, 102, 9],
         [1, 101, 102, 9, 4, 5, 6, 9],
     ]
-    assert tokenized.histories[1].flags[1] & tr.TokenFlag.SAMPLED
-    assert tokenized.histories[1].flags[1] & tr.TokenFlag.EXACT
-    assert tokenized.histories[1].logprobs[1:3] == [-10.1, -10.2]
-    assert tokenized.histories[1].flags[3] == (
-        _SAMPLED_ASSISTANT_OUTPUT | tr.TokenFlag.STOP
-    )
-    assert tokenized.histories[1].logprobs[3] == -0.9
+    assert tokenized.histories[1].flags[1:4] == [tr.TokenFlag.EXACT] * 3
+    assert all(math.isnan(value) for value in tokenized.histories[1].logprobs[1:4])
     assert 2 not in tokenized.histories[1].tokens
     assert 500 not in tokenized.histories[1].tokens
 
@@ -6534,11 +6532,8 @@ def test_reasoning_stripped_tool_call_keeps_exact_evidence_for_strict_training(
     )
     second_history = tokenized.histories[1]
     assert second_history.tokens == [1, 7, 8, 4, 5]
-    assert second_history.logprobs[1:3] == [-0.7, -0.8]
-    assert second_history.flags[1:3] == [
-        _SAMPLED_ASSISTANT_OUTPUT,
-        _SAMPLED_ASSISTANT_OUTPUT,
-    ]
+    assert all(math.isnan(value) for value in second_history.logprobs[1:3])
+    assert second_history.flags[1:3] == [tr.TokenFlag.EXACT] * 2
 
     preprocessing = list(
         tokenize_trajectory_groups(
@@ -7496,9 +7491,17 @@ def test_reasoning_split_trajectory_reuses_prevalidated_projections(
     exchanges: list[ChatCompletionsExchange] = []
     request_messages: list[ChatCompletionMessageParam] = []
     prompt: list[int] = []
+    expected: dict[tuple[int, ...], float] = {}
     for index in range(40):
         request_messages.append({"role": "user", "content": f"u{index}"})
         prompt.append(3000 + index)
+        output = [1000 + index, 2000 + index]
+        expected.update(
+            {
+                tuple([*prompt, *output[: position + 1]]): -token / 10
+                for position, token in enumerate(output)
+            }
+        )
         exchange = _chat_exchange(
             list(prompt), [1000 + index, 2000 + index], offset=index
         )
@@ -7526,10 +7529,10 @@ def test_reasoning_split_trajectory_reuses_prevalidated_projections(
         any(
             source is not None
             and source.choice_index == 0
-            and source.exchange is exchanges[0]
+            and source.exchange is exchanges[index]
             for source in history.message_sources
         )
-        for history in projected
+        for index, history in enumerate(projected)
     )
 
     from art.trajectories import _tokenize
@@ -7549,8 +7552,19 @@ def test_reasoning_split_trajectory_reuses_prevalidated_projections(
     first_key = next(key for key in traces[0].source_keys if key is not None)
 
     assert len(tokenized.histories) == 40
-    assert all(first_key in trace.sources for trace in traces)
+    assert all(first_key not in trace.sources for trace in traces[1:])
     assert calls == 0
+    selected = {
+        tuple(history.tokens[: index + 1]): history.logprobs[index]
+        for history, mask in zip(
+            tokenized.histories,
+            tokenized.tensorize().first_occurrence_masks(where=tr.TokenFlag.SAMPLED),
+            strict=True,
+        )
+        for index, chosen in enumerate(mask.tolist())
+        if chosen
+    }
+    assert selected == expected
 
 
 def test_explicit_template_override_rerenders_exact_exchange_scaffold() -> None:
@@ -8128,3 +8142,88 @@ def test_length_boundary_preserves_output_despite_probe_suffix_collision(
                 == _SAMPLED_ASSISTANT_OUTPUT
                 for i in positions
             )
+
+
+@pytest.mark.parametrize("protocol", ["chat", "messages", "responses"])
+@pytest.mark.parametrize("later_prompt", [[1, 3, 4], [1, 2, 3, 4], [9, 3, 4]])
+def test_divergent_captured_context_preserves_all_original_sampled_prefixes(
+    protocol: str, later_prompt: list[int]
+) -> None:
+    captures = [([1], [2, 3]), (later_prompt, [5])]
+    if protocol == "chat":
+        exchanges = TrajectoryExchanges(
+            chat_completions=[
+                _chat_exchange(prompt, output, offset=index)
+                for index, (prompt, output) in enumerate(captures)
+            ]
+        )
+    elif protocol == "messages":
+        exchanges = TrajectoryExchanges(
+            messages=[
+                _message_exchange(
+                    MessagesRequest(
+                        model="test/model",
+                        max_tokens=16,
+                        messages=(
+                            [{"role": "user", "content": "turn 0"}]
+                            if index == 0
+                            else [
+                                {"role": "user", "content": "turn 0"},
+                                {
+                                    "role": "assistant",
+                                    "content": [{"type": "text", "text": "answer"}],
+                                },
+                                {"role": "user", "content": "turn 1"},
+                            ]
+                        ),
+                    ),
+                    identifier=f"message-{index}",
+                    offset=index,
+                    prompt_token_ids=prompt,
+                    token_ids=output,
+                    logprobs=[-token / 10 for token in output],
+                )
+                for index, (prompt, output) in enumerate(captures)
+            ]
+        )
+    else:
+        responses = []
+        for index, (prompt, output) in enumerate(captures):
+            exchange = _response_exchange(
+                f"response-{index}",
+                output[-1],
+                offset=index,
+                previous_response_id="response-0" if index else None,
+                prompt_token_ids=prompt,
+            )
+            data = exchange.response.model_dump(mode="python")
+            data["token_generations"][0]["output_tokens"] = [
+                {"token_id": token, "logprob": -token / 10} for token in output
+            ]
+            exchange.response = Response.model_validate(data)
+            responses.append(exchange)
+        exchanges = TrajectoryExchanges(responses=responses)
+    trajectory = art.Trajectory(exchanges=exchanges)
+    tokenized = trajectory.tokenize(multi_history=True)
+    expected = {
+        tuple([*prompt, *output[: index + 1]]): -token / 10
+        for prompt, output in captures
+        for index, token in enumerate(output)
+    }
+    actual = {}
+    masks = tokenized.tensorize().first_occurrence_masks(where=tr.TokenFlag.SAMPLED)
+    for history, mask in zip(tokenized.histories, masks, strict=True):
+        for index, selected in enumerate(mask.tolist()):
+            if selected:
+                prefix = tuple(history.tokens[: index + 1])
+                assert prefix not in actual
+                actual[prefix] = history.logprobs[index]
+    assert actual == expected  # Complete coverage as well as no changed-context sample.
+    if later_prompt == [1, 2, 3, 4]:
+        assert len(tokenized.histories) == 1
+        assert tokenized.histories[0].tokens == [1, 2, 3, 4, 5]
+    else:
+        assert [history.tokens for history in tokenized.histories] == [
+            [1, 2, 3],
+            [*later_prompt, 5],
+        ]
