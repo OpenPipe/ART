@@ -782,7 +782,14 @@ ATTN_MOE_H2048_TABLE = CalibratedTable(
 # class at CP4, as they do the 35B GDN MoE class; after the recalibration the
 # CP4 group carries one 5.5% clear miss on the synthetic grpo-g8 cell, whose
 # best layout changed with the planner); TP2 x CP2 fails its gates and keeps
-# the version-1 score, which on this class lost up to 112% at CP4.
+# the version-1 score, which on this class lost up to 112% at CP4. The GDN
+# planner recalibration of 2026-09-09 (design brief) was validated on this
+# class but the table is NOT refit from it: under the new planner the refit
+# misses the held-out Ellavox g3 cell at CP4 by 11% (its deep layout's GDN
+# segments now chain, which the ten terms cannot see), while the shipped
+# table's picks are within 2.7% of the new best on the other 13 CP4 cells and
+# 22% faster than before on g3 itself; a GDN-aware second stage is the
+# follow-up.
 QWEN35_27B_GEOMETRY = ModelGeometry(
     hidden_size=5_120,
     ffn_hidden_size=17_408,
