@@ -53,7 +53,11 @@ def worker(root, operation):
         try:
             write_json(root / "request.json", {**owner, "request_id": request_id})
             job_id, handle = sky.get(request_id)
-            if type(job_id) is not int or job_id < 1 or handle.cluster_name != cluster:
+            if (
+                type(job_id) is not int
+                or job_id < 1
+                or getattr(handle, "cluster_name", None) != cluster
+            ):
                 raise ValueError(
                     "Sky launch returned a different cluster or invalid job ID"
                 )
@@ -121,33 +125,61 @@ def run_child(command, timeout, output):
     if timeout <= 0:
         raise TimeoutError("CI remote-result deadline reached")
     with output.open("ab") as stream:
-        process = subprocess.Popen(
-            command, stdout=stream, stderr=subprocess.STDOUT, start_new_session=True
-        )
-        original = None
+        interruption = None
+
+        def defer_interrupt(signum, frame):
+            nonlocal interruption
+            if interruption is None:
+                interruption = InterruptedError(f"CI interrupted by signal {signum}")
+
+        # Recording instead of raising also covers interruption *inside* Popen,
+        # before its process handle is returned. Unlike masking, this does not
+        # leave SIGINT/SIGTERM blocked in the exec'd SDK worker.
+        handlers = {
+            sig: signal.getsignal(sig) for sig in (signal.SIGINT, signal.SIGTERM)
+        }
         try:
-            deadline = time.monotonic() + timeout
-            # WNOWAIT observes exit without freeing the PID/PGID for reuse.
-            while (
-                os.waitid(os.P_PID, process.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
-                is None
-            ):
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    raise subprocess.TimeoutExpired(command, timeout)
-                time.sleep(min(0.05, remaining))
-        except BaseException as error:
-            original = error
-        try:
-            code = finish_child(process)
-        except BaseException as cleanup_error:
+            for sig in handlers:
+                signal.signal(sig, defer_interrupt)
+            if interruption is not None:
+                raise interruption
+            process = subprocess.Popen(
+                command, stdout=stream, stderr=subprocess.STDOUT, start_new_session=True
+            )
+            original = None
+            try:
+                deadline = time.monotonic() + timeout
+                # WNOWAIT observes exit without freeing the PID/PGID for reuse.
+                while (
+                    os.waitid(
+                        os.P_PID, process.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT
+                    )
+                    is None
+                ):
+                    if interruption is not None:
+                        raise interruption
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise subprocess.TimeoutExpired(command, timeout)
+                    time.sleep(min(0.05, remaining))
+            except BaseException as error:
+                original = error
+            try:
+                code = finish_child(process)
+            except BaseException as cleanup_error:
+                if original is not None:
+                    raise original from cleanup_error
+                raise
             if original is not None:
-                raise original from cleanup_error
-            raise
-        if original is not None:
-            raise original
-        if code:
-            raise subprocess.CalledProcessError(code, command)
+                raise original
+            if interruption is not None:
+                raise interruption
+            if code:
+                raise subprocess.CalledProcessError(code, command)
+        finally:
+            # Repeated interrupts cannot abort mandatory group retirement.
+            for sig, handler in handlers.items():
+                signal.signal(sig, handler)
 
 
 def run_worker(root, operation, timeout):

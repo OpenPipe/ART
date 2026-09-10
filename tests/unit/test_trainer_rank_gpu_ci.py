@@ -1,5 +1,6 @@
 """No Sky service or GPU calls: exercise the real CI driver at its SDK boundary."""
 
+import ast
 import importlib.util
 import json
 import os
@@ -65,6 +66,14 @@ def test_launch_rejects_wrong_identity(tmp_path, owner, sky, job_id, cluster):
     sky.get.return_value = job_id, NS(cluster_name=cluster or owner["cluster"])
     with pytest.raises(ValueError):
         ci.worker(tmp_path, "launch")
+    assert not (tmp_path / "job.json").exists()
+
+
+def test_launch_missing_handle_cancels_recorded_request(tmp_path, owner, sky):
+    sky.get.return_value = 17, None
+    with pytest.raises(ValueError):
+        ci.worker(tmp_path, "launch")
+    sky.api_cancel.assert_called_once_with(request_ids=["request-17"])
     assert not (tmp_path / "job.json").exists()
 
 
@@ -431,3 +440,85 @@ def test_lost_waitable_child_identity_never_signals_group(monkeypatch):
     with pytest.raises(ChildProcessError):
         ci.finish_child(NS(pid=42))
     kill.assert_not_called()
+
+
+@pytest.mark.parametrize("signum", [signal.SIGINT, signal.SIGTERM])
+@pytest.mark.parametrize("boundary", ["acquiring", "acquired", "cleanup", "repeated"])
+def test_interrupt_boundaries_retire_worker_before_propagating(
+    tmp_path, monkeypatch, signum, boundary
+):
+    """Real signals at acquisition/retirement boundaries, never a Sky call."""
+    tree = ast.parse(SCRIPT.read_text())
+    functions = {n.name: n for n in tree.body if isinstance(n, ast.FunctionDef)}
+    acquired_line = next(
+        n.lineno
+        for n in ast.walk(functions["run_child"])
+        if isinstance(n, ast.Assign)
+        and any(isinstance(t, ast.Name) and t.id == "original" for t in n.targets)
+        and isinstance(n.value, ast.Constant)
+        and n.value.value is None
+    )
+    cleanup_line = next(
+        n.lineno
+        for n in ast.walk(functions["finish_child"])
+        if isinstance(n, ast.Expr)
+        and isinstance(n.value, ast.Call)
+        and isinstance(n.value.func, ast.Attribute)
+        and n.value.func.attr == "killpg"
+    )
+    children, delivered = [], []
+    popen = subprocess.Popen
+
+    def acquire(*args, **kwargs):
+        process = popen(*args, **kwargs)
+        children.append(process)
+        if boundary == "acquiring":
+            os.kill(os.getpid(), signum)
+            delivered.append("acquiring")
+        return process
+
+    def trace(frame, event, arg):
+        if event == "line" and frame.f_code.co_filename == str(SCRIPT):
+            if frame.f_lineno == acquired_line and boundary in {"acquired", "repeated"}:
+                if "acquired" not in delivered:
+                    os.kill(os.getpid(), signum)
+                    delivered.append("acquired")
+            if frame.f_lineno == cleanup_line and boundary in {"cleanup", "repeated"}:
+                # Both signals must remain non-raising throughout group cleanup.
+                if "cleanup" not in delivered:
+                    os.kill(os.getpid(), signal.SIGTERM)
+                    os.kill(os.getpid(), signal.SIGINT)
+                    delivered.append("cleanup")
+        return trace
+
+    def interrupted(signum, frame):
+        raise InterruptedError(f"CI interrupted by signal {signum}")
+
+    handlers = {sig: signal.getsignal(sig) for sig in (signal.SIGINT, signal.SIGTERM)}
+    monkeypatch.setattr(ci.subprocess, "Popen", acquire)
+    try:
+        for sig in handlers:
+            signal.signal(sig, interrupted)
+        sys.settrace(trace)
+        expected = (
+            subprocess.TimeoutExpired if boundary == "cleanup" else InterruptedError
+        )
+        with pytest.raises(expected) as raised:
+            ci.run_child(
+                [sys.executable, "-c", "import time; time.sleep(20)"],
+                0.1,
+                tmp_path / "worker.log",
+            )
+        sys.settrace(None)
+        assert raised.value.__cause__ is None
+        assert len(children) == 1 and delivered
+        assert not Path(f"/proc/{children[0].pid}").exists()
+        assert all(signal.getsignal(sig) is interrupted for sig in handlers)
+    finally:
+        sys.settrace(None)
+        for sig, handler in handlers.items():
+            signal.signal(sig, handler)
+        for process in children:
+            if process.poll() is None:
+                os.killpg(process.pid, signal.SIGKILL)
+            process.wait(timeout=2)
