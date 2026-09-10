@@ -5312,11 +5312,13 @@ def _tokenize_chat_view(
                     else marked_bounds.get(next_message_index)
                     or probed_bounds.get(next_message_index)
                 )
+                # Part bounds can start after sampled tool-call markup; the
+                # next generation boundary is the assistant span's start.
                 next_prompt_end = (
-                    next_bounds[0]
-                    if next_bounds is not None
-                    else _next_assistant_span_start(assistant_mask, after=bounds[1])
+                    _next_assistant_span_start(assistant_mask, after=bounds[1])
                     if bounds is not None
+                    else next_bounds[0]
+                    if next_bounds is not None
                     else None
                 )
             else:

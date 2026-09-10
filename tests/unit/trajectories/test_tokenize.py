@@ -739,6 +739,81 @@ def test_terminal_synthetic_stop_does_not_relax_nonterminal_length_proof(
     assert not all(flag & tr.TokenFlag.EXACT for flag in tokenized.flags[:-1])
 
 
+@pytest.mark.parametrize("mismatch", [False, True])
+def test_length_boundary_ends_before_next_assistant_tool_prefix(mismatch: bool) -> None:
+    class ToolTokenizer(_CharacterTemplateTokenizer):
+        def apply_chat_template(
+            self,
+            messages: list[dict[str, Any]],
+            *,
+            tokenize: bool = True,
+            add_generation_prompt: bool,
+            **kwargs: object,
+        ) -> str | list[int]:
+            text = ""
+            for message in messages:
+                text += str(message.get("content") or "")
+                for call in message.get("tool_calls") or []:
+                    function = call["function"]
+                    text += (
+                        "<tool>" + function["name"] + function["arguments"] + "</tool>"
+                    )
+                if message.get("role") == "assistant":
+                    text += "§"
+            return self._encode(text) if tokenize else text
+
+    tokenizer = ToolTokenizer()
+    prompt = tokenizer._encode("turn 0")
+    output = tokenizer._encode("answer")
+    first = _chat_exchange(prompt, output)
+    first.response.choices[0].finish_reason = "length"
+    next_prompt = [*prompt, *output, 9, *tokenizer._encode("turn 1")]
+    if mismatch:
+        next_prompt[len(prompt) + len(output)] = 1000
+    tool_output = tokenizer._encode("<tool>lookup{}")
+    second = _chat_exchange(next_prompt, tool_output, offset=1)
+    data = second.response.model_dump(mode="python")
+    data["choices"][0].update(
+        finish_reason="tool_calls",
+        message={
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call-1",
+                    "type": "function",
+                    "function": {"name": "lookup", "arguments": "{}"},
+                }
+            ],
+        },
+    )
+    second.response = ChatCompletion.model_validate(data)
+    history = art.Trajectory(
+        exchanges=TrajectoryExchanges(chat_completions=[first, second])
+    ).chat_completions_history()
+    tokenized = history.tokenize(tokenizer=tokenizer)
+    expected = [*next_prompt, *tool_output, *tokenizer._encode("</tool>§")]
+    if mismatch:
+        assert tokenized.tokens != expected
+        return
+    assert tokenized.tokens == expected
+    assert all(
+        flag & tr.TokenFlag.EXACT
+        for flag in tokenized.flags[: len(next_prompt) + len(tool_output)]
+    )
+    assert (
+        tokenized.flags[-1]
+        == tr.TokenFlag.ASSISTANT | tr.TokenFlag.OUTPUT | tr.TokenFlag.STOP
+    )
+    sampled = [
+        index
+        for index, flag in enumerate(tokenized.flags)
+        if flag & tr.TokenFlag.SAMPLED
+    ]
+    assert len(sampled) == len(output) + len(tool_output)
+    assert all(math.isfinite(tokenized.logprobs[index]) for index in sampled)
+
+
 def test_public_exact_chain_probes_multi_part_length_response() -> None:
     history, tokenizer, expected = _character_template_history(
         length_reasoning="thinking"
