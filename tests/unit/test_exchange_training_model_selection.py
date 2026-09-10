@@ -18,7 +18,7 @@ from art import TrainableModel
 from art.dev.model import InternalModelConfig
 from art.local import LocalBackend
 from art.openai import ART_MOE_ROUTING_METADATA_KEY
-from art.preprocessing.moe_routing import MoeRouteArray
+from art.preprocessing.moe_routing import MoeRouteArray, MoeRouteSegments
 from art.preprocessing.tokenize import (
     TokenizedResult,
     _chat_choice_trace,
@@ -149,7 +149,7 @@ def _routed_exchange(
     return exchange
 
 
-def _reasoning_stripped_group() -> art.TrajectoryGroup:
+def _reasoning_stripped_group(*, complete_prefix: bool = False) -> art.TrajectoryGroup:
     def set_choice(
         exchange: ChatCompletionsExchange,
         token_ids: list[int],
@@ -187,7 +187,7 @@ def _reasoning_stripped_group() -> art.TrajectoryGroup:
     )
     set_choice(
         first,
-        [2, 101, 102, 103, 104, 9],
+        [9] if complete_prefix else [2, 101, 102, 103, 104, 9],
         content="first",
         reasoning="long reasoning",
     )
@@ -207,15 +207,55 @@ def _reasoning_stripped_group() -> art.TrajectoryGroup:
         content="second",
         reasoning="short reasoning",
     )
+    exchanges = [first, second]
+    if complete_prefix:
+        # Token 9 has the same captured conditional prefix in both branches.
+        # The earlier overlength branch must not claim it from the fitting one.
+        long = _routed_exchange(
+            prompt_token_ids=[1],
+            output_token=9,
+            messages=[{"role": "user", "content": "one"}],
+            content="long answer",
+        )
+        set_choice(
+            long, [9, 10, 11, 12, 13, 14], content="long answer", reasoning="long"
+        )
+        # Preserve the full first message so first+second form one history;
+        # no separate short history can claim token 9 before the fitting one.
+        second.request["messages"][1] = first.response.choices[0].message.model_dump(
+            mode="python", exclude_none=True
+        )
+        exchanges.insert(0, long)
     return art.TrajectoryGroup(
         [
             art.Trajectory(
-                exchanges=tr.TrajectoryExchanges(chat_completions=[first, second]),
+                exchanges=tr.TrajectoryExchanges(chat_completions=exchanges),
                 reward=reward,
             )
             for reward in (1.0, 0.0)
         ]
     )
+
+
+def _assert_captured_training_prefixes(
+    results: list[TokenizedResult], group: art.TrajectoryGroup
+) -> None:
+    # Derive eligible conditional logprobs directly from captured exchanges,
+    # independently of history lineage, token flags, and preprocessing masks.
+    captured = {}
+    for exchange in group.trajectories[0].exchanges.chat_completions:
+        for choice in exchange.response.choices:
+            extra = choice.model_extra
+            assert extra is not None and choice.logprobs is not None
+            prompt, output = extra["prompt_token_ids"], extra["token_ids"]
+            for index, logprob in enumerate(choice.logprobs.content or []):
+                captured[tuple(prompt + output[: index + 1])] = logprob.logprob
+    for result in results:
+        for index, selected in enumerate(result.assistant_mask):
+            if selected:
+                prefix = tuple(result.token_ids[: index + 1])
+                assert prefix in captured, f"Uncaptured training prefix: {prefix}"
+                assert result.logprobs[index] == captured[prefix]
 
 
 def _group() -> art.TrajectoryGroup:
@@ -361,11 +401,15 @@ def test_training_tokenizes_each_exchange_trajectory_once(
     assert public_calls == len(group.trajectories)
 
 
-def test_overlength_history_does_not_claim_sources_from_fitting_history() -> None:
+@pytest.mark.parametrize("complete_prefix", [False, True], ids=["shifted", "captured"])
+def test_overlength_history_does_not_claim_sources_from_fitting_history(
+    complete_prefix: bool,
+) -> None:
+    group = _reasoning_stripped_group(complete_prefix=complete_prefix)
     results = list(
         tokenize_trajectory_groups(
             cast(PreTrainedTokenizerBase, _Tokenizer()),
-            [_reasoning_stripped_group()],
+            [group],
             allow_training_without_logprobs=False,
             scale_rewards=False,
             shuffle_group_trajectories=False,
@@ -374,18 +418,28 @@ def test_overlength_history_does_not_claim_sources_from_fitting_history() -> Non
             _max_sequence_length=5,
         )
     )
+    _assert_captured_training_prefixes(results, group)
 
     long = [result for result in results if len(result.token_ids) > 5]
     fitting = [result for result in results if len(result.token_ids) <= 5]
     assert len(long) == len(fitting) == 2
     assert all(result.assistant_mask == [0] * 7 for result in long)
     assert all(result.token_ids == [1, 9, 4, 5, 6] for result in fitting)
-    assert all(result.assistant_mask == [0, 1, 0, 1, 1] for result in fitting)
-    assert all(result.weight == pytest.approx(1 / 3) for result in results)
+    # Token 9 is eligible only when sampled under this exact prefix, [1].
+    assert all(
+        result.assistant_mask == [0, int(complete_prefix), 0, 1, 1]
+        for result in fitting
+    )
+    assert all(
+        result.weight == pytest.approx(1 / (2 + int(complete_prefix)))
+        for result in results
+    )
 
 
+@pytest.mark.parametrize("complete_prefix", [False, True], ids=["shifted", "captured"])
 def test_local_backend_trains_retained_source_after_overlength_history(
     tmp_path: Path,
+    complete_prefix: bool,
 ) -> None:
     backend = LocalBackend(path=str(tmp_path))
     model = TrainableModel(
@@ -413,7 +467,7 @@ def test_local_backend_trains_retained_source_after_overlength_history(
     ):
         packed = backend._get_packed_tensors(
             model,
-            [_reasoning_stripped_group()],
+            [_reasoning_stripped_group(complete_prefix=complete_prefix)],
             advantage_balance=0.0,
             allow_training_without_logprobs=False,
             scale_rewards=False,
@@ -424,7 +478,10 @@ def test_local_backend_trains_retained_source_after_overlength_history(
 
     assert packed is not None
     assert packed["tokens"].tolist() == [[1, 9, 4, 5, 6]] * 2
-    assert packed["assistant_mask"].tolist() == [[False, True, False, True, True]] * 2
+    assert (
+        packed["assistant_mask"].tolist()
+        == [[False, complete_prefix, False, True, True]] * 2
+    )
 
 
 def test_training_rejects_multiple_concrete_policy_versions() -> None:
@@ -744,7 +801,9 @@ def test_preprocessing_preserves_moe_routes_for_reasoning_stripped_suffix() -> N
         "completion_token_ids": [5, 6],
         "num_experts": 2048,
         "routed_experts": np.asarray(
-            [[[10]], [[1010]], [[1020]], [[90]], [[40]], [[50]], [[60]]],
+            # Same token IDs, different prefixes: use distinct prompt routes
+            # to detect an invalid overlay from the earlier generation.
+            [[[10]], [[1110]], [[1120]], [[190]], [[40]], [[50]], [[60]]],
             dtype=np.uint16,
         ),
     }
@@ -797,22 +856,33 @@ def test_preprocessing_preserves_moe_routes_for_reasoning_stripped_suffix() -> N
 
     initial = [result for result in results if result.token_ids[1] == 2]
     stripped = [result for result in results if result.token_ids[1] == 101]
+    _assert_captured_training_prefixes(results, group)
     assert len(initial) == 2
     assert len(stripped) == 2
     assert all(result.choice_offsets == [1] for result in initial)
-    # The retained response has a different complete visible prefix after its
-    # reasoning is stripped, so it is independently eligible in this history.
-    assert all(result.choice_offsets == [1, 5] for result in stripped)
+    # The suffix is conditioning only: its captured logprobs belong to the
+    # complete original prefix. The original generation remains trainable.
+    assert all(result.choice_offsets == [5] for result in stripped)
     assert all(result.assistant_mask == [0, 1, 1, 1, 1] for result in initial)
-    assert all(result.assistant_mask == [0, 1, 1, 1, 0, 1, 1] for result in stripped)
-    assert all(result.weight == pytest.approx(1 / 9) for result in results)
-    expected_routes = np.asarray(
-        [[[10]], [[1010]], [[1020]], [[90]], [[40]], [[50]], [[60]]],
+    assert all(result.assistant_mask == [0, 0, 0, 0, 0, 1, 1] for result in stripped)
+    assert all(result.weight == pytest.approx(1 / 6) for result in results)
+    stripped_routes = np.asarray(
+        [[[10]], [[1110]], [[1120]], [[190]], [[40]], [[50]], [[60]]],
         dtype=np.uint16,
     )
-    for result in stripped:
-        assert isinstance(result.moe_routed_experts, MoeRouteArray)
-        assert np.array_equal(result.moe_routed_experts, expected_routes)
+    for histories, expected_routes in (
+        (initial, first_extra[ART_MOE_ROUTING_METADATA_KEY]["routed_experts"]),
+        (stripped, stripped_routes),
+    ):
+        for result in histories:
+            routes = result.moe_routed_experts
+            assert isinstance(routes, (MoeRouteArray, MoeRouteSegments))
+            assert routes.num_experts == 2048
+            segments = (
+                routes.segments if isinstance(routes, MoeRouteSegments) else (routes,)
+            )
+            assert all(not segment.flags.writeable for segment in segments)
+            assert np.array_equal(np.concatenate(segments), expected_routes)
 
     datums = trajectory_groups_to_datums(
         [group],
@@ -824,7 +894,7 @@ def test_preprocessing_preserves_moe_routes_for_reasoning_stripped_suffix() -> N
     )
     masks = [datum.loss_fn_inputs["mask"].to_torch().tolist() for datum in datums]
     assert masks.count([1, 1, 1, 1]) == 2
-    assert masks.count([1, 1, 1, 0, 1, 1]) == 2
+    assert masks.count([0, 0, 0, 0, 1, 1]) == 2
 
 
 def test_ambiguous_non_moe_suffix_falls_back_to_sampled_spans() -> None:
