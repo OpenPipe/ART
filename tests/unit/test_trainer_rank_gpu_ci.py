@@ -15,6 +15,7 @@ import pytest
 
 SCRIPT = Path(__file__).parents[2] / "scripts/ci/trainer-rank-gpu.py"
 spec = importlib.util.spec_from_file_location("trainer_rank_gpu_ci", SCRIPT)
+assert spec is not None and spec.loader is not None
 ci = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(ci)
 
