@@ -9,7 +9,7 @@ from statistics import median
 import sys
 from time import perf_counter
 from types import ModuleType, SimpleNamespace
-from typing import Any, Never, cast
+from typing import Any, Literal, Never, cast
 
 from anthropic.types import ImageBlockParam, Message, MessageParam
 from openai.types import Completion
@@ -346,6 +346,7 @@ def _character_template_history(
     following_user: str = "turn 2",
     omit_length_tail: bool = False,
     length_reasoning: str | None = None,
+    terminal_sampled_stop: bool = True,
 ) -> tuple[ChatCompletionsHistory, _CharacterTemplateTokenizer, list[int]]:
     tokenizer = _CharacterTemplateTokenizer()
     answer = tokenizer._encode("answer")
@@ -359,7 +360,7 @@ def _character_template_history(
         *([] if omit_length_tail else [9]),
         *tokenizer._encode(following_user),
     ]
-    third_output = [*answer, 9]
+    third_output = [*answer, *([9] if terminal_sampled_stop else [])]
 
     first = _chat_exchange(first_prompt, first_output)
     second = _chat_exchange(second_prompt, second_output, offset=1)
@@ -697,6 +698,149 @@ def test_public_exact_chain_preserves_raw_drift_across_proven_length_boundary() 
     tail = length_start + len("answer")
     assert tokenized.flags[tail] == tr.TokenFlag.EXACT | tr.TokenFlag.STOP
     assert not tokenized.flags[tail] & tr.TokenFlag.SAMPLED
+
+
+@pytest.mark.parametrize("finish_reason", ["stop", "tool_calls"])
+def test_length_chain_retains_exact_prefix_with_terminal_synthetic_stop(
+    finish_reason: Literal["stop", "tool_calls"],
+) -> None:
+    history, tokenizer, captured = _character_template_history(
+        terminal_sampled_stop=False
+    )
+    source = history.message_sources[-1]
+    assert source is not None
+    assert isinstance(source.exchange.response, ChatCompletion)
+    source.exchange.response.choices[0].finish_reason = finish_reason
+
+    tokenized = history.tokenize(tokenizer=tokenizer)
+
+    assert tokenized.tokens == [*captured, 9]
+    assert all(flag & tr.TokenFlag.EXACT for flag in tokenized.flags[:-1])
+    assert tokenized.flags[-1] == (
+        tr.TokenFlag.STOP | tr.TokenFlag.ASSISTANT | tr.TokenFlag.OUTPUT
+    )
+    assert sum(bool(flag & tr.TokenFlag.SAMPLED) for flag in tokenized.flags) == 19
+
+
+def test_terminal_synthetic_stop_does_not_relax_nonterminal_length_proof(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "art.trajectories._tokenize._WARNED_PREFIX_RETOKENIZATION", False
+    )
+    history, tokenizer, captured = _character_template_history(
+        terminal_sampled_stop=False,
+        following_user="§turn 2",
+        omit_length_tail=True,
+    )
+    with pytest.warns(UserWarning, match="retokenized an earlier sampled response"):
+        tokenized = history.tokenize(tokenizer=tokenizer)
+    assert tokenized.tokens != [*captured, 9]
+    assert not all(flag & tr.TokenFlag.EXACT for flag in tokenized.flags[:-1])
+
+
+@pytest.mark.parametrize("mismatch", [False, True])
+@pytest.mark.parametrize(
+    "sampled_closer", ["", "<", "</too", "</tool>", "</tool></tool>"]
+)
+def test_length_boundary_ends_before_next_assistant_tool_prefix(
+    mismatch: bool, sampled_closer: str
+) -> None:
+    closing_markup = (
+        "</tool></tool>" if sampled_closer == "</tool></tool>" else "</tool>"
+    )
+
+    class ToolTokenizer(_CharacterTemplateTokenizer):
+        def apply_chat_template(
+            self,
+            messages: list[dict[str, Any]],
+            *,
+            tokenize: bool = True,
+            add_generation_prompt: bool,
+            **kwargs: object,
+        ) -> str | list[int]:
+            text = ""
+            for message in messages:
+                text += str(message.get("content") or "")
+                for call in message.get("tool_calls") or []:
+                    function = call["function"]
+                    text += (
+                        "<tool>"
+                        + function["name"]
+                        + function["arguments"]
+                        + closing_markup
+                    )
+                if message.get("role") == "assistant":
+                    text += "§"
+            return self._encode(text) if tokenize else text
+
+    tokenizer = ToolTokenizer()
+    prompt = tokenizer._encode("turn 0")
+    output = tokenizer._encode("answer")
+    first = _chat_exchange(prompt, output)
+    first.response.choices[0].finish_reason = "length"
+    next_prompt = [*prompt, *output, 9, *tokenizer._encode("turn 1")]
+    if mismatch:
+        next_prompt[len(prompt) + len(output)] = 1000
+    tool_output = tokenizer._encode("<tool>lookup{}" + sampled_closer)
+    second = _chat_exchange(next_prompt, tool_output, offset=1)
+    data = second.response.model_dump(mode="python")
+    data["choices"][0].update(
+        finish_reason="tool_calls",
+        message={
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call-1",
+                    "type": "function",
+                    "function": {"name": "lookup", "arguments": "{}"},
+                }
+            ],
+        },
+    )
+    second.response = ChatCompletion.model_validate(data)
+    history = art.Trajectory(
+        exchanges=TrajectoryExchanges(chat_completions=[first, second])
+    ).chat_completions_history()
+    tokenized = history.tokenize(tokenizer=tokenizer)
+    expected = [
+        *next_prompt,
+        *tokenizer._encode("<tool>lookup{}" + closing_markup + "§"),
+    ]
+    if mismatch:
+        assert tokenized.tokens != expected
+        return
+    assert tokenized.tokens == expected
+    assert all(
+        flag & tr.TokenFlag.EXACT
+        for flag in tokenized.flags[: len(next_prompt) + len(tool_output)]
+    )
+    assert (
+        tokenized.flags[-1]
+        == tr.TokenFlag.ASSISTANT | tr.TokenFlag.OUTPUT | tr.TokenFlag.STOP
+    )
+    sampled = [
+        index
+        for index, flag in enumerate(tokenized.flags)
+        if flag & tr.TokenFlag.SAMPLED
+    ]
+    assert len(sampled) == len(output) + len(tool_output)
+    assert all(math.isfinite(tokenized.logprobs[index]) for index in sampled)
+
+
+@pytest.mark.parametrize("matches", [[], [(1, 4), (4, 7)], [(4, 7)]])
+def test_terminal_sampled_prefix_requires_one_match_at_assistant_start(
+    matches: list[tuple[int, int]],
+) -> None:
+    from art.trajectories._tokenize import _prove_exact_length_stopped_assistant_prefix
+
+    assert (
+        _prove_exact_length_stopped_assistant_prefix(
+            matches, [False, *([True] * 6)], expected_start=1
+        )
+        is None
+    )
 
 
 def test_public_exact_chain_probes_multi_part_length_response() -> None:
