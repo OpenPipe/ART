@@ -574,6 +574,7 @@ class _MemoryCheck:
 class _MemoryProfile:
     bytes_per_token: float
     packed_tokens: int
+    # Active execution rows only; total-input telemetry can include inactive rows.
     logical_per_packed: float = 1.0
     # Historical forward-retained/forward-peak ratio for calibration telemetry,
     # max-merged only from forward-return observations. Admission uses the
@@ -901,6 +902,12 @@ class _FlatForwardPlan:
     output_bytes: int
     signature: _MemorySignature
     selected_max_depth: int = 0
+    inactive_logical_tokens: int = 0
+
+    @property
+    def active_logical_tokens(self) -> int:
+        # Keep total-input telemetry while pricing only executed requests.
+        return self.logical_tokens - self.inactive_logical_tokens
 
     @property
     def subforward_count(self) -> int:
@@ -2620,7 +2627,7 @@ class TrainerRank:
             slot_group_count=len(groups),
             grad_modes=tuple(mode for (_, mode), _ in groups),
         )
-        logical_tokens = sum(int(row.numel()) for row in rows)
+        logical_tokens = _active_logical_tokens(requests)
         cost = self._subforward_cost(
             packed_tokens=packed_tokens,
             output_bytes=output_bytes,
@@ -2674,7 +2681,7 @@ class TrainerRank:
             packed_tokens=plan.packed_tokens,
             output_bytes=plan.output_bytes,
             signature=plan.signature,
-            logical_tokens=plan.logical_tokens,
+            logical_tokens=plan.active_logical_tokens,
         )
 
     def _subforward_cost(
@@ -3642,9 +3649,7 @@ class TrainerRank:
                 estimates[width] = None
                 return None
             assert values is not None
-            logical_tokens = sum(
-                int(request.input_tokens.numel()) for request in local_requests
-            )
+            logical_tokens = _active_logical_tokens(local_requests)
 
             def priced(
                 packed_tokens: int,
@@ -4269,6 +4274,7 @@ class TrainerRank:
                 grad_modes=tuple(mode for (_, mode), _ in groups),
             ),
             selected_max_depth=selected_max_depth,
+            inactive_logical_tokens=logical_tokens - _active_logical_tokens(requests),
         )
 
     def _estimate_flat_forward(
@@ -4750,7 +4756,7 @@ class TrainerRank:
                 packed_tokens=forward.packed_tokens,
                 output_bytes=forward.output_bytes,
                 signature=forward.signature,
-                logical_tokens=forward.logical_tokens,
+                logical_tokens=forward.active_logical_tokens,
             ),
             sync_across_dp=sync_across_dp,
         )
@@ -4915,7 +4921,7 @@ class TrainerRank:
                 0 if previous is None else previous.packed_tokens,
             ),
             logical_per_packed=max(
-                plan.logical_tokens / max(1, plan.packed_tokens),
+                plan.active_logical_tokens / max(1, plan.packed_tokens),
                 1.0 if previous is None else previous.logical_per_packed,
             ),
             retained_fraction=retained_fraction,
@@ -5595,6 +5601,17 @@ def _validate_top_k(top_k: int, model: object) -> None:
     vocab_size = _padded_vocab_size(model)
     if top_k > vocab_size:
         raise ValueError(f"top_k={top_k} exceeds vocabulary size {vocab_size}")
+
+
+def _active_logical_tokens(requests: Sequence[AnyForwardInput]) -> int:
+    return sum(
+        int(request.input_tokens.numel())
+        for request in requests
+        if request.target_tokens is not None
+        or request.logits
+        or request.top_k is not None
+        or request.hidden_states
+    )
 
 
 def _request_mix_key(request: AnyForwardInput) -> str:
