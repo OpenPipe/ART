@@ -56,6 +56,25 @@ CUDA 13 hosts use `openpipe-art[megatron-cu130]` with
 content-addressed node-local cache. No ART checkout or `setup.sh` invocation is
 required.
 
+You can install and validate both pinned GPU runtimes before starting a model:
+
+```bash
+art runtime prepare
+art runtime status
+```
+
+`prepare` reports each dependency, runtime, and validation phase with elapsed
+time. `status` shows the selected CUDA profile, active runtime paths, cache disk
+use, and free space. Model-specific vLLM graph and kernel compilation still
+happens when that model first starts.
+
+Runtime environments and compiler outputs default to `/tmp/art-cache`. Keep
+this cache on fast node-local storage; ART warns when it detects a network
+filesystem. Set `ART_MEGATRON_CACHE_ROOT` to move the complete model/runtime
+cache, or set `ART_MEGATRON_RUNTIME_CACHE_DIR` and
+`ART_VLLM_RUNTIME_CACHE_DIR` individually. Keep durable checkpoints on shared
+storage rather than moving runtime environments there.
+
 The image remains responsible for the NVIDIA driver and CUDA toolkit. For
 cross-host training it must also provide the NCCL network transport, MOFED/RDMA
 devices, and the kernel capabilities described in the multi-node deployment

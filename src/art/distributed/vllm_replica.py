@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Literal, Protocol
 import uuid
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from ..utils.lifecycle import ChildProcessSupervisor
 from ..vllm_runtime import ManagedVllmRuntime, VllmRuntimeLaunchConfig
@@ -29,9 +29,20 @@ ReplicaPhase = Literal[
 class ReplicaLaunchTemplate(_Message):
     served_model_name: str = Field(min_length=1)
     lora_path: str | None = None
+    initial_generation_id: str | None = Field(default=None, min_length=1)
     initial_policy_version: int | None = Field(default=None, ge=0)
     engine_args: dict[str, object] = Field(default_factory=dict)
     server_args: dict[str, object] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def _validate_initial_policy(self) -> "ReplicaLaunchTemplate":
+        if (self.initial_generation_id is None) != (
+            self.initial_policy_version is None
+        ):
+            raise ValueError(
+                "initial_generation_id and initial_policy_version must be set together"
+            )
+        return self
 
 
 class HostMemberLaunchRequest(_Message):
@@ -337,6 +348,7 @@ class ReplicaManager:
         *,
         served_model_name: str,
         lora_path: str | None,
+        initial_generation_id: str | None,
         initial_policy_version: int | None,
     ) -> ReplicaState:
         async with self._lock:
@@ -345,6 +357,7 @@ class ReplicaManager:
                 update={
                     "served_model_name": served_model_name,
                     "lora_path": lora_path,
+                    "initial_generation_id": initial_generation_id,
                     "initial_policy_version": initial_policy_version,
                 }
             )
@@ -623,6 +636,7 @@ class ReplicaManager:
             replica_generation=self._state.generation,
             process_uuid=process_uuid,
             update_identity=self._state.update_identity,
+            initial_generation_id=self._template.initial_generation_id,
             initial_policy_version=self._template.initial_policy_version,
         )
         return HostMemberLaunchRequest(

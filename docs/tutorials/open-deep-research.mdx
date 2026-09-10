@@ -45,7 +45,8 @@ Then install the project dependencies by running `uv sync`.
 You'll be using `LocalBackend` to manage the GPU that your model will be trained on. Install ART with the backend dependencies:
 
 ```bash
-pip install openpipe-art[backend]
+pip install --extra-index-url https://download.pytorch.org/whl/cu128 \
+  "openpipe-art[backend]"
 ```
 
 Make sure you have access to a machine with one or more modern NVIDIA GPUs. This can be your local workstation or a cloud VM. If you're using a cloud provider, launch the GPU instance and run the rest of this tutorial on that machine.

@@ -12,7 +12,9 @@ ART's LangGraph integration enables you to build sophisticated, multi-step AI ag
 To use ART with LangGraph, install ART with the required extras:
 
 ```bash
-uv pip install -U openpipe-art[backend,langgraph]>=0.4.9
+uv pip install -U \
+  --extra-index-url https://download.pytorch.org/whl/cu128 \
+  "openpipe-art[backend,langgraph]>=0.4.9"
 ```
 
 The `langgraph` extra includes the LangGraph integration dependencies, while `backend` provides the training backend components.
@@ -533,7 +535,7 @@ To use this example, simply replace the mock email functions (`search_emails`, `
 
 **Import errors:**
 
-- Install ART with the correct extras: `uv pip install -U openpipe-art[backend,langgraph]>=0.4.9`
+- Install ART with the correct extras: `uv pip install -U --extra-index-url https://download.pytorch.org/whl/cu128 "openpipe-art[backend,langgraph]>=0.4.9"`
 - Ensure you have the required LangGraph dependencies
 
 **Training not starting:**

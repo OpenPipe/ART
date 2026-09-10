@@ -57,6 +57,13 @@ def patch_local_3d_moe_dummy_lora() -> None:
 
 
 def patch_small_batch_moe_lora_intermediate_dtype() -> None:
+    from vllm.triton_utils import HAS_TRITON
+
+    # Without an active Triton driver (e.g. in the release smoke test), vLLM
+    # uses plain placeholder functions with no JIT source to patch.
+    if not HAS_TRITON:
+        return
+
     from vllm.lora.ops.triton_ops import fused_moe_lora_op
 
     kernel = fused_moe_lora_op._fused_moe_lora_small_batch_kernel.fn

@@ -17,7 +17,12 @@ from openai.types.chat.chat_completion_message_function_tool_call import (
 )
 from openai.types.chat.chat_completion_message_tool_call import Function
 
-from .preprocessing.policy_spans import POLICY_TOKEN_SPANS_KEY
+from .preprocessing.policy_spans import (
+    POLICY_TOKEN_SPANS_KEY,
+    PROMPT_POLICY_TOKEN_SPANS_KEY,
+    validate_complete_policy_token_spans,
+    validate_complete_prompt_policy_token_spans,
+)
 
 ART_MOE_ROUTING_METADATA_KEY = "art_moe_routing"
 
@@ -50,6 +55,7 @@ async def consume_chat_completion_stream(
     Raises:
         ValueError: If the stream has no choices or ends before a choice is terminal.
     """
+    require_policy_spans = bool(getattr(stream, "_art_require_policy_spans", False))
     chat_completion: ChatCompletion | None = None
     terminal_choices: set[int] = set()
     stopped_early = False
@@ -77,6 +83,7 @@ async def consume_chat_completion_stream(
             terminal_choices,
             allow_incomplete=stopped_early,
             require_usage=require_usage,
+            require_policy_spans=require_policy_spans,
         )
     except BaseException:
         await stream.close()
@@ -96,6 +103,7 @@ def _is_empty_stream_prologue(chunk: ChatCompletionChunk) -> bool:
 def consume_sync_chat_completion_stream(
     stream: Stream[ChatCompletionChunk],
 ) -> ChatCompletion:
+    require_policy_spans = bool(getattr(stream, "_art_require_policy_spans", False))
     chat_completion: ChatCompletion | None = None
     terminal_choices: set[int] = set()
     try:
@@ -113,6 +121,7 @@ def consume_sync_chat_completion_stream(
         return _validate_and_finalize_chat_completion(
             chat_completion,
             terminal_choices,
+            require_policy_spans=require_policy_spans,
         )
     except BaseException:
         stream.close()
@@ -125,6 +134,7 @@ def _validate_and_finalize_chat_completion(
     *,
     allow_incomplete: bool = False,
     require_usage: bool = False,
+    require_policy_spans: bool = False,
 ) -> ChatCompletion:
     if chat_completion is None or not chat_completion.choices:
         raise IncompleteChatCompletionStreamError(
@@ -143,7 +153,36 @@ def _validate_and_finalize_chat_completion(
         raise IncompleteChatCompletionStreamError(
             "Chat Completions stream ended before its usage trailer"
         )
-    return finalize_chat_completion(chat_completion)
+    completion = finalize_chat_completion(chat_completion)
+    for choice in completion.choices:
+        extra = choice.model_extra or {}
+        has_prompt_spans = PROMPT_POLICY_TOKEN_SPANS_KEY in extra
+        has_completion_spans = POLICY_TOKEN_SPANS_KEY in extra
+        if (
+            not has_prompt_spans
+            and not has_completion_spans
+            and not require_policy_spans
+        ):
+            continue
+        if not has_prompt_spans or not has_completion_spans:
+            raise IncompleteChatCompletionStreamError(
+                "Policy-tracked stream omitted prompt or completion policy spans"
+            )
+        prompt_token_ids = extra.get("prompt_token_ids")
+        completion_token_ids = extra.get("token_ids")
+        if not isinstance(prompt_token_ids, list) or not isinstance(
+            completion_token_ids, list
+        ):
+            raise IncompleteChatCompletionStreamError(
+                "Policy-tracked stream omitted exact token IDs"
+            )
+        validate_complete_prompt_policy_token_spans(
+            choice, prompt_tokens=len(prompt_token_ids)
+        )
+        validate_complete_policy_token_spans(
+            choice, completion_tokens=len(completion_token_ids)
+        )
+    return completion
 
 
 def init_chat_completion(chunk: ChatCompletionChunk) -> ChatCompletion:
@@ -204,12 +243,10 @@ def update_chat_completion(
                 *choice_extra.get("token_ids", []),
                 *token_ids,
             ]
-        policy_token_spans = getattr(chunk_choice, POLICY_TOKEN_SPANS_KEY, None)
-        if policy_token_spans:
-            choice_extra[POLICY_TOKEN_SPANS_KEY] = [
-                *choice_extra.get(POLICY_TOKEN_SPANS_KEY, []),
-                *policy_token_spans,
-            ]
+        for span_key in (PROMPT_POLICY_TOKEN_SPANS_KEY, POLICY_TOKEN_SPANS_KEY):
+            spans = getattr(chunk_choice, span_key, None)
+            if spans is not None:
+                _append_policy_spans(choice_extra.setdefault(span_key, []), spans)
         if chunk_choice.finish_reason is not None:
             choice.finish_reason = chunk_choice.finish_reason
         if chunk_choice.logprobs:
@@ -288,3 +325,19 @@ def update_chat_completion(
         chat_completion.system_fingerprint = chunk.system_fingerprint
     if chunk.usage is not None:
         chat_completion.usage = chunk.usage
+
+
+def _append_policy_spans(
+    accumulated: list[dict[str, Any]], spans: list[dict[str, Any]]
+) -> None:
+    identity = ("generation_id", "policy_version", "lora_slot", "update_seq")
+    for span in spans:
+        current = dict(span)
+        if (
+            accumulated
+            and accumulated[-1].get("end_token") == current.get("start_token")
+            and all(accumulated[-1].get(key) == current.get(key) for key in identity)
+        ):
+            accumulated[-1]["end_token"] = current["end_token"]
+        else:
+            accumulated.append(current)

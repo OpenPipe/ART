@@ -2,17 +2,20 @@
 
 import argparse
 import asyncio
+from collections import OrderedDict
 from functools import lru_cache
+import hashlib
 from http import HTTPStatus
 from ipaddress import ip_address
 import json
 import os
 import socket
+import time
 from typing import Any
 import uuid
 
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 from starlette.datastructures import Headers
 from starlette.types import Receive, Scope, Send
 from vllm.entrypoints.serve.utils.server_utils import AuthenticationMiddleware
@@ -25,10 +28,85 @@ from art_vllm_runtime.binary_routes import (
 from art_vllm_runtime.fast_metrics import FastMetricsSidecar
 from art_vllm_runtime.patches import apply_vllm_runtime_patches
 
-ART_SERVING_PROTOCOL_VERSION = 4
+ART_SERVING_PROTOCOL_VERSION = 5
+_LORA_PREPARATION_POLL_S = 0.05
+_LORA_PREPARATION_TIMEOUT_S = 300.0
+_LORA_UPDATE_RECEIPT_CAPACITY = 4096
 _runtime_state: dict[str, object] = {}
 _auth_tokens: list[str] = []
 _fast_metrics_port: int | None = None
+
+
+class _CompletedLoraUpdateReceipt(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    fingerprint: str
+    result: dict[str, object]
+
+
+class _CompletedLoraUpdates:
+    """Bound response-loss replay for completed update operations."""
+
+    def __init__(self, capacity: int) -> None:
+        if capacity < 1:
+            raise ValueError("LoRA update receipt capacity must be positive")
+        self.capacity = capacity
+        self._lock = asyncio.Lock()
+        self._receipts: OrderedDict[str, _CompletedLoraUpdateReceipt] = OrderedDict()
+        self._active: dict[str, tuple[str, asyncio.Future[dict[str, object]]]] = {}
+
+    async def reserve(
+        self, operation_id: str, fingerprint: str
+    ) -> tuple[bool, asyncio.Future[dict[str, object]]]:
+        async with self._lock:
+            receipt = self._receipts.get(operation_id)
+            if receipt is not None:
+                if receipt.fingerprint != fingerprint:
+                    raise ValueError("LoRA update operation identity changed")
+                self._receipts.move_to_end(operation_id)
+                completed = asyncio.get_running_loop().create_future()
+                completed.set_result(dict(receipt.result))
+                return False, completed
+            active = self._active.get(operation_id)
+            if active is not None:
+                active_fingerprint, completion = active
+                if active_fingerprint != fingerprint:
+                    raise ValueError("LoRA update operation identity changed")
+                return False, completion
+            completion = asyncio.get_running_loop().create_future()
+            self._active[operation_id] = (fingerprint, completion)
+            return True, completion
+
+    async def settle(
+        self, operation_id: str, fingerprint: str, result: dict[str, object]
+    ) -> None:
+        async with self._lock:
+            existing = self._receipts.get(operation_id)
+            if existing is not None:
+                if existing.fingerprint != fingerprint or existing.result != result:
+                    raise RuntimeError("completed LoRA update receipt changed")
+                self._receipts.move_to_end(operation_id)
+                return
+            active = self._active.pop(operation_id, None)
+            if active is None or active[0] != fingerprint:
+                raise RuntimeError("LoRA update operation was not reserved")
+            if len(self._receipts) >= self.capacity:
+                self._receipts.popitem(last=False)
+            self._receipts[operation_id] = _CompletedLoraUpdateReceipt(
+                fingerprint=fingerprint, result=dict(result)
+            )
+            active[1].set_result(dict(result))
+
+    async def abandon(self, operation_id: str, fingerprint: str) -> None:
+        async with self._lock:
+            active = self._active.get(operation_id)
+            if active is None or active[0] != fingerprint:
+                return
+            self._active.pop(operation_id)
+            active[1].cancel()
+
+
+_completed_lora_updates = _CompletedLoraUpdates(_LORA_UPDATE_RECEIPT_CAPACITY)
 
 
 def _patch_prebound_listener_tcp_nodelay(api_server: Any) -> None:
@@ -108,12 +186,62 @@ class _ResetPrefixCacheRequest(BaseModel):
 
 
 class _InFlightLoraUpdateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    operation_id: str = Field(min_length=1, max_length=64)
     model_name: str = Field(min_length=1)
     lora_path: str = Field(min_length=1)
+    generation_id: str = Field(min_length=1)
+    expected_generation_id: str = Field(min_length=1)
     policy_version: int = Field(ge=0)
     lora_slot: str | None = Field(default=None, min_length=1)
     base_model_name: str | None = None
     is_3d_lora_weight: bool = False
+
+
+def _valid_preparation_result(value: object, *, ready: bool) -> bool:
+    return (
+        isinstance(value, dict)
+        and type(value.get("workers")) is int
+        and value["workers"] > 0
+        and value.get("ready") is ready
+    )
+
+
+def _lora_update_fingerprint(body: _InFlightLoraUpdateRequest) -> str:
+    payload = json.dumps(
+        body.model_dump(mode="json"), sort_keys=True, separators=(",", ":")
+    ).encode()
+    return hashlib.sha256(payload).hexdigest()
+
+
+async def _reserve_lora_update(
+    body: _InFlightLoraUpdateRequest, fingerprint: str
+) -> tuple[bool, JSONResponse | None]:
+    try:
+        owner, completion = await _completed_lora_updates.reserve(
+            body.operation_id, fingerprint
+        )
+    except ValueError as error:
+        return False, JSONResponse(
+            content={"error": str(error), "type": "idempotency_conflict"},
+            status_code=HTTPStatus.CONFLICT.value,
+        )
+    if owner:
+        return True, None
+    try:
+        result = await asyncio.shield(completion)
+    except asyncio.CancelledError:
+        if not completion.cancelled():
+            raise
+        return False, JSONResponse(
+            content={
+                "error": "The original LoRA update did not complete; retry the operation",
+                "type": "operation_retry",
+            },
+            status_code=HTTPStatus.SERVICE_UNAVAILABLE.value,
+        )
+    return False, JSONResponse(content=result)
 
 
 def _index_shared_pp_partition(config: Any, pp_size: int) -> tuple[int, ...] | None:
@@ -201,6 +329,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--replica-generation", type=int, default=0)
     parser.add_argument("--process-uuid")
     parser.add_argument("--update-identity")
+    parser.add_argument("--initial-generation-id")
     parser.add_argument("--initial-policy-version", type=int)
     parser.add_argument("--lora-path", help="Optional initial checkpoint path")
     parser.add_argument("--served-model-name", required=True)
@@ -348,6 +477,7 @@ def _patch_art_runtime_routes() -> None:
 
             from art_vllm_runtime.policy_spans import (
                 PolicyLoRARequest,
+                _complete_task,
                 lora_update_coordinator,
                 policy_lora_request_payload,
                 publish_lora_slot_policy,
@@ -356,35 +486,116 @@ def _patch_art_runtime_routes() -> None:
 
             public_model_name = body.model_name
             lora_path = body.lora_path
+            generation_id = body.generation_id
             policy_version = body.policy_version
             lora_slot = body.lora_slot or public_model_name.rsplit("@", 1)[0]
             models = raw_request.app.state.openai_serving_models
             engine_client = engine(raw_request)
             coordinator = lora_update_coordinator(models, engine_client)
-            update_seq = await coordinator.begin_update(lora_slot)
+            request_fingerprint = _lora_update_fingerprint(body)
+            if generation_id == body.expected_generation_id:
+                return JSONResponse(
+                    content={"error": "generation_id must advance"},
+                    status_code=HTTPStatus.CONFLICT.value,
+                )
+            owns_operation, reserved_response = await _reserve_lora_update(
+                body, request_fingerprint
+            )
+            if not owns_operation:
+                assert reserved_response is not None
+                return reserved_response
+
+            update_seq: int | None = None
             mutation_started = False
+            preparation_attempted = False
+            published = False
             try:
+                loaded = models.lora_requests.get(lora_slot)
+                if loaded is None:
+                    await _completed_lora_updates.abandon(
+                        body.operation_id, request_fingerprint
+                    )
+                    return JSONResponse(
+                        content={"error": f"LoRA slot {lora_slot!r} is not loaded"},
+                        status_code=HTTPStatus.NOT_FOUND.value,
+                    )
+                lora_int_id = loaded.lora_int_id
+                prepare_request = PolicyLoRARequest(
+                    lora_name=lora_slot,
+                    lora_int_id=lora_int_id,
+                    lora_path=lora_path,
+                    base_model_name=(
+                        body.base_model_name
+                        if body.base_model_name is not None
+                        and models.is_base_model(body.base_model_name)
+                        else None
+                    ),
+                    load_inplace=True,
+                    is_3d_lora_weight=body.is_3d_lora_weight,
+                    generation_id=generation_id,
+                    policy_version=policy_version,
+                    update_seq=0,
+                )
+                prepare_payload = policy_lora_request_payload(prepare_request)
+                preparation_attempted = True
+                preparation = await engine_client.engine_core.call_utility_async(
+                    "art_prepare_lora_policy", body.operation_id, prepare_payload
+                )
+                deadline = time.monotonic() + _LORA_PREPARATION_TIMEOUT_S
+                while not _valid_preparation_result(preparation, ready=True):
+                    if not _valid_preparation_result(preparation, ready=False):
+                        raise RuntimeError(
+                            "EngineCore returned an invalid LoRA preparation state"
+                        )
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError("Timed out preparing policy LoRA")
+                    await asyncio.sleep(_LORA_PREPARATION_POLL_S)
+                    preparation = await engine_client.engine_core.call_utility_async(
+                        "art_lora_policy_status", body.operation_id, prepare_payload
+                    )
+
                 async with models.lora_resolver_lock[lora_slot]:
                     load_request = LoadLoRAAdapterRequest(
                         lora_name=lora_slot,
                         lora_path=lora_path,
-                        load_inplace=lora_slot in models.lora_requests,
+                        load_inplace=True,
                         is_3d_lora_weight=body.is_3d_lora_weight,
                     )
                     load_error = await models._check_load_lora_adapter_request(
                         load_request
                     )
                     if isinstance(load_error, ErrorResponse):
-                        await coordinator.cancel_update(lora_slot, update_seq)
+                        await engine_client.engine_core.call_utility_async(
+                            "art_abort_prepared_lora_policy", body.operation_id
+                        )
+                        preparation_attempted = False
+                        await _completed_lora_updates.abandon(
+                            body.operation_id, request_fingerprint
+                        )
                         return JSONResponse(
                             content=load_error.model_dump(mode="python"),
                             status_code=load_error.error.code,
                         )
-                    lora_int_id = (
-                        models.lora_requests[lora_slot].lora_int_id
-                        if lora_slot in models.lora_requests
-                        else models.lora_id_counter.inc(1)
-                    )
+                    try:
+                        update_seq = await coordinator.begin_update(
+                            lora_slot,
+                            expected_generation_id=body.expected_generation_id,
+                        )
+                    except RuntimeError as error:
+                        await engine_client.engine_core.call_utility_async(
+                            "art_abort_prepared_lora_policy", body.operation_id
+                        )
+                        preparation_attempted = False
+                        await _completed_lora_updates.abandon(
+                            body.operation_id, request_fingerprint
+                        )
+                        return JSONResponse(
+                            content={
+                                "error": str(error),
+                                "type": "generation_conflict",
+                            },
+                            status_code=HTTPStatus.CONFLICT.value,
+                        )
                     lora_request = PolicyLoRARequest(
                         lora_name=lora_slot,
                         lora_int_id=lora_int_id,
@@ -397,19 +608,23 @@ def _patch_art_runtime_routes() -> None:
                         ),
                         load_inplace=True,
                         is_3d_lora_weight=body.is_3d_lora_weight,
+                        generation_id=generation_id,
                         policy_version=policy_version,
                         update_seq=update_seq,
                     )
                     mutation_started = True
-                    await engine_client.engine_core.call_utility_async(
-                        "pause_scheduler", "keep", False
+                    transaction = await engine_client.engine_core.call_utility_async(
+                        "art_commit_prepared_lora_policy_update",
+                        body.operation_id,
+                        policy_lora_request_payload(lora_request),
                     )
-                    cache_transition = (
-                        await engine_client.engine_core.call_utility_async(
-                            "art_apply_lora_policy_update",
-                            policy_lora_request_payload(lora_request),
+                    if not isinstance(transaction, dict) or not isinstance(
+                        transaction.get("cache_transition"), dict
+                    ):
+                        raise RuntimeError(
+                            "EngineCore returned an invalid LoRA update acknowledgement"
                         )
-                    )
+                    cache_transition = transaction["cache_transition"]
                     serving_request = PolicyLoRARequest(
                         **{
                             **policy_lora_request_payload(lora_request),
@@ -425,20 +640,49 @@ def _patch_art_runtime_routes() -> None:
                     publish_lora_slot_policy(
                         models,
                         lora_slot=lora_slot,
+                        generation_id=generation_id,
                         policy_version=policy_version,
                         update_seq=update_seq,
                     )
-                    await engine_client.engine_core.call_utility_async(
-                        "resume_scheduler"
-                    )
                     await coordinator.commit_update(lora_slot, serving_request)
+                    published = True
                     mutation_started = False
+                    preparation_attempted = False
                 _runtime_state.update(
                     loaded_adapter=public_model_name,
+                    generation_id=generation_id,
                     policy_version=policy_version,
-                    update_identity=(f"lora:{lora_slot}:{policy_version}:{update_seq}"),
+                    update_identity=f"lora:{lora_slot}:{generation_id}:{update_seq}",
                 )
+                result: dict[str, object] = {
+                    "status": "updated",
+                    "model_name": public_model_name,
+                    "lora_slot": lora_slot,
+                    "generation_id": generation_id,
+                    "policy_version": policy_version,
+                    "update_seq": update_seq,
+                    "cache_transition": cache_transition,
+                }
+                interrupted = await _complete_task(
+                    asyncio.create_task(
+                        _completed_lora_updates.settle(
+                            body.operation_id, request_fingerprint, result
+                        )
+                    )
+                )
+                if interrupted is not None:
+                    raise interrupted
+                return JSONResponse(content=result)
             except BaseException:
+                if preparation_attempted and not mutation_started and not published:
+                    try:
+                        await asyncio.shield(
+                            engine_client.engine_core.call_utility_async(
+                                "art_abort_prepared_lora_policy", body.operation_id
+                            )
+                        )
+                    except BaseException:
+                        pass
                 if mutation_started:
                     try:
                         await asyncio.shield(
@@ -450,21 +694,17 @@ def _patch_art_runtime_routes() -> None:
                         await asyncio.shield(
                             coordinator.fail_update(lora_slot, update_seq)
                         )
-                else:
+                if update_seq is not None and not mutation_started and not published:
                     await asyncio.shield(
                         coordinator.cancel_update(lora_slot, update_seq)
                     )
+                if not published:
+                    await asyncio.shield(
+                        _completed_lora_updates.abandon(
+                            body.operation_id, request_fingerprint
+                        )
+                    )
                 raise
-            return JSONResponse(
-                content={
-                    "status": "updated",
-                    "model_name": public_model_name,
-                    "lora_slot": lora_slot,
-                    "policy_version": policy_version,
-                    "update_seq": update_seq,
-                    "cache_transition": cache_transition,
-                }
-            )
 
         app.include_router(router)
         return app
@@ -482,6 +722,7 @@ def _patch_art_runtime_routes() -> None:
             state.openai_serving_models,
             engine_client,
             lora_slot=str(_runtime_state["loaded_adapter"]),
+            generation_id=str(_runtime_state["initial_generation_id"]),
             policy_version=int(policy_version),
         )
 
@@ -578,6 +819,10 @@ def main(argv: list[str] | None = None) -> None:
     global _fast_metrics_port
 
     args = parse_args(argv)
+    if (args.initial_generation_id is None) != (args.initial_policy_version is None):
+        raise ValueError(
+            "--initial-generation-id and --initial-policy-version must be set together"
+        )
     engine_args = json.loads(args.engine_args_json)
     server_args = json.loads(args.server_args_json)
     route_capture = engine_args.get("enable_return_routed_experts", False)
@@ -625,6 +870,7 @@ def main(argv: list[str] | None = None) -> None:
         nnodes=args.nnodes,
         headless=args.headless,
         loaded_adapter=args.served_model_name if args.lora_path else None,
+        generation_id=args.initial_generation_id,
         policy_version=args.initial_policy_version
         if args.initial_policy_version is not None
         else (
@@ -634,6 +880,7 @@ def main(argv: list[str] | None = None) -> None:
             else None
         ),
         update_identity=args.update_identity,
+        initial_generation_id=args.initial_generation_id,
         initial_policy_version=args.initial_policy_version,
         pp_layer_partition=pp_layer_partition,
     )

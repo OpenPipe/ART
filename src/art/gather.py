@@ -176,7 +176,7 @@ async def wrap_trajectories_awaitable(
             return e
 
 
-def record_metrics(context: "GatherContext", trajectory: Trajectory) -> None:
+def record_trajectory_completion_tokens(trajectory: Trajectory) -> None:
     if trajectory.exchanges:
         completion_tokens = _exchange_completion_tokens(trajectory)
         if completion_tokens is not None:
@@ -201,6 +201,10 @@ def record_metrics(context: "GatherContext", trajectory: Trajectory) -> None:
             trajectory.metrics["completion_tokens"] = sum(
                 count for count in completion_tokens if count is not None
             )
+
+
+def record_metrics(context: "GatherContext", trajectory: Trajectory) -> None:
+    record_trajectory_completion_tokens(trajectory)
     context.metric_sums["reward"] += trajectory.reward
     context.metric_divisors["reward"] += 1
     context.metric_sums.update(trajectory.metrics)

@@ -1195,6 +1195,85 @@ def _configure_moe_dispatcher_caches(model: Sequence[torch.nn.Module]) -> None:
                 )
 
 
+def _moe_output_bytes_per_token(
+    model: Sequence[torch.nn.Module], shape: ParallelShape
+) -> int:
+    """Known FC2 output pair, not a bound on the complete live working set."""
+    if shape != ParallelShape(tp=1, cp=1):
+        return 0
+    from megatron.core.extensions.transformer_engine import TERowParallelGroupedLinear
+    from megatron.core.transformer.moe.experts import TEGroupedMLP
+    from megatron.core.transformer.moe.moe_layer import BaseMoELayer, MoELayer
+    from megatron.core.transformer.moe.router import TopKRouter
+    from megatron.core.transformer.moe.token_dispatcher import (
+        MoEAlltoAllTokenDispatcher,
+    )
+
+    from art.megatron.lora import LoRA, MLPExpertsLinearFC2LoRA
+
+    coefficient = 0
+    for chunk in model:
+        for layer in chunk.modules():
+            if not isinstance(layer, BaseMoELayer):
+                continue
+            experts = getattr(layer, "experts", None)
+            fc2: Any = getattr(experts, "linear_fc2", None)
+            lora: Any = getattr(fc2, "lora", None)
+            dispatcher = getattr(layer, "token_dispatcher", None)
+            sites = (
+                (layer, MoELayer),
+                (experts, TEGroupedMLP),
+                (fc2, MLPExpertsLinearFC2LoRA),
+                (lora, LoRA),
+                (getattr(fc2, "linear_fc2", None), TERowParallelGroupedLinear),
+                (getattr(layer, "router", None), TopKRouter),
+            )
+            if (
+                any(
+                    type(site) is not expected
+                    or "forward" in vars(site)
+                    or getattr(site, "_forward_hooks", None)
+                    or getattr(site, "_forward_pre_hooks", None)
+                    for site, expected in sites
+                )
+                or type(dispatcher) is not MoEAlltoAllTokenDispatcher
+            ):
+                return 0
+            config = layer.config
+            if (
+                config.moe_expert_capacity_factor is not None
+                or config.moe_pad_expert_input_to_capacity
+                or config.moe_router_padding_for_quantization
+                or config.fp8
+                or config.fp4
+                or config.moe_latent_size is not None
+                or config.cuda_graph_impl != "none"
+                or any(
+                    name in vars(dispatcher)
+                    for name in (
+                        "preprocess",
+                        "dispatch_preprocess",
+                        "dispatch_postprocess",
+                    )
+                )
+                or "routing" in vars(layer.router)
+            ):
+                return 0
+            weights = lora.B_T
+            if (
+                weights.dtype not in (torch.float16, torch.bfloat16)
+                or weights.shape[-1] != fc2.out_features
+                or fc2.out_features != config.hidden_size
+                or getattr(layer.router, "topk", None) != config.moe_router_topk
+            ):
+                return 0
+            coefficient = max(
+                coefficient,
+                2 * config.moe_router_topk * fc2.out_features * weights.element_size(),
+            )
+    return coefficient
+
+
 class TrainerRank:
     def __init__(self, runtime: TrainingRuntime) -> None:
         pp_size = int(getattr(runtime.provider, "pipeline_model_parallel_size", 1) or 1)
@@ -1261,6 +1340,11 @@ class TrainerRank:
         ep_size, etp_size = _expert_parallel_shape(runtime.provider)
         self._parallel_shape = ParallelShape(
             tp=tp_size, cp=cp_size, ep=ep_size, etp=etp_size
+        )
+        self._moe_output_bytes_per_token = (
+            _moe_output_bytes_per_token(runtime.model, self._parallel_shape)
+            if self._moe_layers
+            else 0
         )
         selection = select_scoring(
             device_capability=capability,
@@ -2117,6 +2201,7 @@ class TrainerRank:
                     yield batch
                 finally:
                     self._skipped_forward_waves.pop(token, None)
+                    del batch
         finally:
             batches.close()
 
@@ -2155,16 +2240,20 @@ class TrainerRank:
                 candidate = self._select_next_micro_batch(
                     items, start, checkpoint=checkpoint
                 )
+            self._snapshot_planning_telemetry(candidate.plan, candidate.check)
             if isinstance(candidate.plan, _FlatForwardPlan):
                 tracked_outputs, memory_baseline = (
                     self._run_flat_plan_with_memory_tracking(
                         candidate.plan,
+                        check=candidate.check,
                         context="forward_micro_batches",
                     )
                 )
             else:
                 tracked_outputs = self._execute_admitted_plan(
-                    candidate.plan, context="forward_micro_batches"
+                    candidate.plan,
+                    check=candidate.check,
+                    context="forward_micro_batches",
                 )
                 memory_baseline = None
             flat_outputs = iter(tracked_outputs)
@@ -2214,6 +2303,8 @@ class TrainerRank:
             # to the forward's return, already recorded for this same plan.
             if isinstance(candidate.plan, _FlatForwardPlan):
                 self._update_peak_memory_profile(candidate.plan, memory_baseline)
+            # Only the caller may retain completed outputs into the next wave.
+            del tracked_outputs, flat_outputs, outputs
             start = stop
 
     @overload
@@ -2283,20 +2374,20 @@ class TrainerRank:
             self._reset_planning_telemetry()
             materialized = _materialize(inputs)
             requests = list(_flatten(materialized))
-            plan = self._plan_admissible_forward(
+            plan, check = self._plan_admissible_forward(
                 requests, checkpoint=checkpoint, context="dp_rank_forward"
             )
             tracked_outputs = self._execute_admitted_plan(
-                plan, context="dp_rank_forward"
+                plan, check=check, context="dp_rank_forward"
             )
             return _unflatten(materialized, iter(tracked_outputs))
 
     def _execute_admitted_plan(
-        self, plan: _AnyForwardPlan, *, context: str
+        self, plan: _AnyForwardPlan, *, check: _MemoryCheck, context: str
     ) -> list[AnyForwardOutput]:
         if isinstance(plan, _FlatForwardPlan):
             outputs, _baseline = self._run_flat_plan_with_memory_tracking(
-                plan, context=context
+                plan, check=check, context=context
             )
             return outputs
         merged: list[AnyForwardOutput | None] = [None] * plan.request_count
@@ -2305,7 +2396,7 @@ class TrainerRank:
         ):
             try:
                 outputs, _baseline = self._run_flat_plan_with_memory_tracking(
-                    subforward, context=context
+                    subforward, check=check, context=context
                 )
             except TrainerRankMemoryError as error:
                 # Model execution already began, so no replanning is possible
@@ -2330,7 +2421,7 @@ class TrainerRank:
         *,
         checkpoint: AdapterSelection,
         context: str,
-    ) -> _AnyForwardPlan:
+    ) -> tuple[_AnyForwardPlan, _MemoryCheck]:
         """Plan one forward (splitting if needed), recording telemetry, or raise."""
 
         found = self._find_admissible_forward(
@@ -2343,7 +2434,7 @@ class TrainerRank:
             raise found.error(context)
         plan, check = found
         self._snapshot_planning_telemetry(plan, check)
-        return plan
+        return plan, check
 
     def _find_admissible_forward(
         self,
@@ -2449,10 +2540,10 @@ class TrainerRank:
         measures it on a real cell.
 
         Cost: the cheap full-sharing lower bound (one O(tokens) CPU scan per
-        chunk) rejects a rung without planning anything. A rung that survives
-        is priced exactly with cost-optimal layouts and, failing that, with
-        memory-minimal layouts, whose packed tokens equal the lower bound — so
-        the planner runs for at most one rung, the one that executes.
+        chunk) can reject a rung without planning it. A surviving rung is
+        priced exactly with cost-optimal and then memory-minimal layouts.
+        Retained-profile trust boundaries can make the bound optimistic, so
+        more than one rung may need exact planning before one executes.
         """
 
         lower = [
@@ -2506,12 +2597,13 @@ class TrainerRank:
         *,
         checkpoint: AdapterSelection,
     ) -> _SubforwardCost:
-        """Cheapest possible cost of a chunk: its full-sharing packed tokens."""
+        """Optimistic cost across layout and profile-trust boundaries."""
 
         groups = self._group_active_request_indices(
             requests, checkpoint=checkpoint, ensure_slots=False
         )
         packed_tokens = 0
+        unshared_packed_tokens = 0
         for _, group_indices in groups:
             estimated = estimate_prefix_tree_packed_tokens(
                 (rows[index] for index in group_indices),
@@ -2519,16 +2611,63 @@ class TrainerRank:
             )
             assert estimated is not None  # rows are CPU copies
             packed_tokens += self._physical_tokens(estimated)
-        return self._subforward_cost(
-            packed_tokens=packed_tokens,
-            output_bytes=self._estimate_group_request_output_bytes(requests),
-            signature=self._memory_signature_from_requests(
-                requests,
-                slot_group_count=len(groups),
-                grad_modes=tuple(mode for (_, mode), _ in groups),
-            ),
-            logical_tokens=sum(int(row.numel()) for row in rows),
+            unshared_packed_tokens += self._physical_tokens(
+                sum(int(rows[index].numel()) for index in group_indices)
+            )
+        output_bytes = self._estimate_group_request_output_bytes(requests)
+        signature = self._memory_signature_from_requests(
+            requests,
+            slot_group_count=len(groups),
+            grad_modes=tuple(mode for (_, mode), _ in groups),
         )
+        logical_tokens = sum(int(row.numel()) for row in rows)
+        cost = self._subforward_cost(
+            packed_tokens=packed_tokens,
+            output_bytes=output_bytes,
+            signature=signature,
+            logical_tokens=logical_tokens,
+        )
+        profile = self._memory_profiles.get(signature)
+        if profile is not None:
+            cap = profile.packed_tokens * _MEMORY_PROFILE_TRUST_GROWTH
+            if packed_tokens <= cap < unshared_packed_tokens:
+                # Required cost can drop when a larger layout leaves the
+                # profile window. Cold cost grows with packed tokens, so its
+                # first integer count bounds every possible post-cap layout,
+                # even when TP padding makes that count itself unattainable.
+                cold = self._subforward_cost(
+                    packed_tokens=cap + 1,
+                    output_bytes=output_bytes,
+                    signature=signature,
+                    logical_tokens=logical_tokens,
+                )
+                cost = _SubforwardCost(
+                    required=min(cost.required, cold.required),
+                    retained=min(cost.retained, cold.retained),
+                )
+        if (
+            profile is not None
+            and profile.retained_compute_bytes_per_token is not None
+            and logical_tokens / max(1, packed_tokens)
+            > profile.logical_per_packed * _MEMORY_PROFILE_TRUST_GROWTH
+            and logical_tokens
+            / max(
+                1,
+                min(
+                    unshared_packed_tokens,
+                    profile.packed_tokens * _MEMORY_PROFILE_TRUST_GROWTH,
+                ),
+            )
+            <= profile.logical_per_packed * _MEMORY_PROFILE_TRUST_GROWTH
+        ):
+            # A larger layout may trust retained compute where full sharing
+            # cannot. Its full-required retention is not a pruning lower bound.
+            # Charge only outputs here; exact plan costs keep both trust guards.
+            return _SubforwardCost(
+                required=cost.required,
+                retained=min(cost.retained, int(output_bytes * _MEMORY_SAFETY_FACTOR)),
+            )
+        return cost
 
     def _plan_cost(self, plan: _FlatForwardPlan) -> _SubforwardCost:
         return self._subforward_cost(
@@ -2584,11 +2723,8 @@ class TrainerRank:
         ratio = logical_tokens / max(1, packed_tokens)
         if ratio > profile.logical_per_packed * _MEMORY_PROFILE_TRUST_GROWTH:
             return required
-        retained = (
-            output_bytes
-            + profile.retained_compute_bytes_per_token
-            * packed_tokens
-            * max(1.0, ratio / profile.logical_per_packed)
+        retained = output_bytes + profile.retained_compute_bytes_per_token * max(
+            packed_tokens, logical_tokens / profile.logical_per_packed
         )
         return min(required, int(retained * _MEMORY_SAFETY_FACTOR))
 
@@ -3686,8 +3822,10 @@ class TrainerRank:
                 )
                 agreed = self._all_ranks_true(not isinstance(found, _ForwardRefusal))
                 if isinstance(found, _ForwardRefusal):
+                    self._snapshot_planning_telemetry(found.plan, found.check)
                     raise found.error("forward_micro_batches")
                 if not agreed:
+                    self._snapshot_planning_telemetry(first.plan, first.check)
                     raise _memory_error(
                         context="forward_micro_batches",
                         message=(
@@ -4248,6 +4386,7 @@ class TrainerRank:
         self,
         plan: _FlatForwardPlan,
         *,
+        check: _MemoryCheck,
         context: str,
     ) -> tuple[list[AnyForwardOutput], int | None]:
         if torch.cuda.is_available() and self.device.type == "cuda":
@@ -4272,7 +4411,10 @@ class TrainerRank:
                 message="CUDA OOM occurred despite the planner estimate",
                 packed_tokens=plan.packed_tokens,
                 logical_tokens=plan.logical_tokens,
-                check=self._memory_check(plan),
+                # Preserve the selected admission, including the whole rung's
+                # budget for a split. Rechecking here observes failed state and
+                # can enter collectives that successful peers never reach.
+                check=check,
             ) from exc
         if baseline is not None:
             self._update_peak_memory_profile(
@@ -4664,13 +4806,21 @@ class TrainerRank:
             * self._param_dtype_size
             * activation_factor
         )
+        # Groups execute sequentially: summed packed rows conservatively bound
+        # this output-pair component, not simultaneous workspace or retained graphs.
+        static_compute = max(
+            static_compute, packed_tokens * self._moe_output_bytes_per_token
+        )
         # A profile learned under lighter sharing (lower logical/packed ratio)
         # underestimates the per-packed-token footprint of a deeper-shared
         # plan; scale the trusted estimate up by the ratio gap.
-        ratio_scale = 1.0
+        # Normalize before multiplying: cancelling packed tokens through two
+        # float operations can otherwise make a larger warm layout cheaper.
+        profiled_tokens: int | float = packed_tokens
         if profiled is not None and logical_tokens is not None:
-            current_ratio = logical_tokens / max(1, packed_tokens)
-            ratio_scale = max(1.0, current_ratio / profiled.logical_per_packed)
+            profiled_tokens = max(
+                packed_tokens, logical_tokens / profiled.logical_per_packed
+            )
         if (
             profiled is None
             or profiled.packed_tokens * _MEMORY_PROFILE_TRUST_GROWTH < packed_tokens
@@ -4679,7 +4829,7 @@ class TrainerRank:
         else:
             compute = max(
                 static_compute,
-                int(profiled.bytes_per_token * packed_tokens * ratio_scale),
+                int(profiled.bytes_per_token * profiled_tokens),
             )
         return int((output_bytes + compute) * _MEMORY_SAFETY_FACTOR)
 

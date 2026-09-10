@@ -80,8 +80,14 @@ jobs:
         run: |
           curl -LsSf https://astral.sh/uv/install.sh | sh
           echo "${HOME}/.local/bin" >> "${GITHUB_PATH}"
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends socat
+          # socat only needs Ubuntu; unrelated third-party apt feeds can be broken.
+          test -s /etc/apt/sources.list.d/ubuntu.sources
+          apt_sources=(
+            -o Dir::Etc::sourcelist=/etc/apt/sources.list.d/ubuntu.sources
+            -o Dir::Etc::sourceparts=-
+          )
+          sudo apt-get "${apt_sources[@]}" update --error-on=any
+          sudo apt-get "${apt_sources[@]}" install -y --no-install-recommends socat
           kubectl_version="$(curl -LsSf https://dl.k8s.io/release/stable.txt)"
           kubectl_path="${RUNNER_TEMP}/kubectl"
           curl -LsSf -o "${kubectl_path}" \
@@ -128,6 +134,8 @@ jobs:
           YAML
 
       - name: Run TrainerRank GPU validation
+        env:
+          EXPECTED_HEAD_SHA: ${{ needs.classify.outputs.head_sha }}
         run: |
           set -euo pipefail
           sky_venv="${RUNNER_TEMP}/skypilot"
@@ -139,9 +147,16 @@ jobs:
           cleanup() { "${sky}" down -y "${cluster}" || true; }
           trap cleanup EXIT
           "${sky}" check kubernetes
-          "${sky}" launch -y -c "${cluster}" \
-            --infra "${SKY_INFRA}" \
-            scripts/ci/trainer-rank-gpu.sky.yaml
+          "${sky_venv}/bin/python" scripts/ci/trainer-rank-gpu.py \
+            "${RUNNER_TEMP}/trainer-rank-result"
+
+      - name: Preserve remote result and diagnostic logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trainer-rank-result-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/trainer-rank-result
+          if-no-files-found: warn
 
   gate:
     name: trainer-rank-gpu-validation
