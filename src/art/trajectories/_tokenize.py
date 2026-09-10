@@ -170,6 +170,28 @@ def _unique_prompt_suffix_end(prompt: str, rendered: str, *, after: int) -> int 
     return after + start + best
 
 
+def _common_prefix_length(left: str | list[int], right: str | list[int]) -> int:
+    """Compare growing blocks natively, then locate the first unequal element."""
+    if not left or not right or left[0] != right[0]:
+        return 0
+    limit = min(len(left), len(right))
+    matched, end = 1, 2
+    while matched < limit:
+        end = min(end, limit)
+        if left[matched:end] != right[matched:end]:
+            high = end - 1
+            while matched < high:
+                middle = (matched + high + 1) // 2
+                if left[matched:middle] == right[matched:middle]:
+                    matched = middle
+                else:
+                    high = middle - 1
+            return matched
+        matched = end
+        end *= 2
+    return matched
+
+
 def _assistant_char_spans(
     messages: list[dict[str, Any]],
     rendered: str,
@@ -190,13 +212,7 @@ def _assistant_char_spans(
             generated = completed[len(prompt) :]
         else:
             prior = render(messages[:message_index], add_generation_prompt=False)
-            shared = 0
-            while (
-                shared < len(prompt)
-                and shared < len(completed)
-                and prompt[shared] == completed[shared]
-            ):
-                shared += 1
+            shared = _common_prefix_length(prompt, completed)
             anchored = not (
                 shared < len(prior)
                 or prompt[: len(prior)] != prior
@@ -249,13 +265,7 @@ def _assistant_char_spans(
                 continue
         if not generated:
             continue
-        start = 0
-        while (
-            start < len(prompt)
-            and start < len(rendered)
-            and prompt[start] == rendered[start]
-        ):
-            start += 1
+        start = _common_prefix_length(prompt, rendered)
         retained_start = next(
             (
                 offset
