@@ -780,6 +780,9 @@ def _sampled_evidence_fingerprint(
             choice for choice in exchange.response.choices if choice.index == index
         )
         choice_extra = choice.model_extra or {}
+        prompt = choice_extra.get("prompt_token_ids")
+        if prompt is None:
+            prompt = (exchange.response.model_extra or {}).get("prompt_token_ids")
         evidence = {
             "message": choice.message.model_dump(
                 mode="json",
@@ -795,6 +798,7 @@ def _sampled_evidence_fingerprint(
                 },
                 exclude_none=True,
             ),
+            "prompt_token_ids": prompt,
             "token_ids": choice_extra.get("token_ids"),
             "logprobs": _chat_logprob_fingerprint_evidence(choice),
             "finish_reason": choice.finish_reason,
@@ -806,9 +810,13 @@ def _sampled_evidence_fingerprint(
             choice for choice in exchange.response.choices if choice.index == index
         )
         choice_extra = choice.model_extra or {}
+        prompt = choice_extra.get("prompt_token_ids")
+        if prompt is None:
+            prompt = (exchange.response.model_extra or {}).get("prompt_token_ids")
         logprobs = _dump(choice.logprobs)
         evidence = {
             "text": choice.text,
+            "prompt_token_ids": prompt,
             "token_ids": choice_extra.get("token_ids"),
             "logprobs": {
                 key: logprobs[key]
@@ -825,7 +833,7 @@ def _sampled_evidence_fingerprint(
             generation = _string_dict(generations[index]) or {}
             evidence = {
                 key: generation[key]
-                for key in ("output_tokens", "output_indices")
+                for key in ("prompt_token_ids", "output_tokens", "output_indices")
                 if key in generation
             }
         else:
@@ -842,6 +850,7 @@ def _sampled_evidence_fingerprint(
                 block.model_dump(mode="json", exclude_none=True)
                 for block in exchange.response.content
             ],
+            "prompt_token_ids": response_extra.get("prompt_token_ids"),
             "token_ids": response_extra.get("token_ids"),
             "logprobs": response_extra.get("logprobs"),
             "stop_reason": exchange.response.stop_reason,
@@ -865,7 +874,9 @@ def _source_key(
         prompt_index=prompt_index,
         # Internal projection may copy an exchange to isolate one choice. A
         # source-specific identity remains stable across those copies without
-        # hashing a growing request or unrelated choices.
+        # hashing rendered request data or unrelated choices. Captured prompt
+        # IDs remain part of the identity: equal output evidence can have
+        # different causal contexts even when response IDs are reused.
         evidence_fingerprint=_sampled_evidence_fingerprint(
             exchange, protocol=protocol, index=index
         ),
