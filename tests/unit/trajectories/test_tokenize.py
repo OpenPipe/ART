@@ -9,7 +9,7 @@ from statistics import median
 import sys
 from time import perf_counter
 from types import ModuleType, SimpleNamespace
-from typing import Any, Never, cast
+from typing import Any, Literal, Never, cast
 
 from anthropic.types import ImageBlockParam, Message, MessageParam
 from openai.types import Completion
@@ -702,13 +702,14 @@ def test_public_exact_chain_preserves_raw_drift_across_proven_length_boundary() 
 
 @pytest.mark.parametrize("finish_reason", ["stop", "tool_calls"])
 def test_length_chain_retains_exact_prefix_with_terminal_synthetic_stop(
-    finish_reason: str,
+    finish_reason: Literal["stop", "tool_calls"],
 ) -> None:
     history, tokenizer, captured = _character_template_history(
         terminal_sampled_stop=False
     )
     source = history.message_sources[-1]
     assert source is not None
+    assert isinstance(source.exchange.response, ChatCompletion)
     source.exchange.response.choices[0].finish_reason = finish_reason
 
     tokenized = history.tokenize(tokenizer=tokenizer)
