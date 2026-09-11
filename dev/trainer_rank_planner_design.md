@@ -595,8 +595,12 @@ change leaves open.
 
 **Re-certification.** The three GDN tables were re-measured on every admitted CP > 1 cell by the
 same campaign (the current-planner rows) and refit with their checked-in
-recipes, carrying the certificates' aggregates for the CP1 and TP2 cells the
-GDN planner does not touch (`--from-certificate` with evidence):
+recipes, carrying the certificates' aggregates for the cells the GDN planner
+does not touch — named explicitly: the CP1 and TP2 × CP1 shapes
+(`--carry-shapes`) and, on the dense table, the attention-only Qwen3-4B
+geometry (`--carry-cells`); every other certificate cell must be re-measured
+or the re-certification is refused, and the lists are recorded in the
+certificate (`--from-certificate` with evidence):
 
 | table | cells | pairwise | p95 regret | max regret | before |
 | --- | --- | --- | --- | --- | --- |
