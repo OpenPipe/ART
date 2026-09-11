@@ -228,6 +228,7 @@ def test_handoff_failure_preserves_error_and_restores_device_and_grad_context(
         assert caught.value is original
         assert not torch.is_grad_enabled()
     assert state["current"] == torch.device("cuda:7")
+    assert inspect.isgenerator(iterator)
     assert inspect.getgeneratorstate(iterator) == inspect.GEN_CLOSED
 
 
@@ -311,6 +312,6 @@ def test_direct_forward_has_no_new_handoff_policy(monkeypatch):
         "_release_cached_memory_for_backward",
         lambda plan: pytest.fail("direct forward is outside the iterator handoff"),
     )
-    output = rank.dp_rank_forward(_target_request(1))
+    output = rank.dp_rank_forward([_target_request(1)])[0]
     output.target_logprobs.sum().backward()
     assert len(executed) == 1
