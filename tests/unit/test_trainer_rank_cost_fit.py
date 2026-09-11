@@ -368,18 +368,21 @@ def test_completeness_counts_only_current_planner_rows(tmp_path: Path) -> None:
     assert fit.validate_completeness([full], repeat=8) == []
 
 
-def test_recertification_carries_certificate_cells_the_evidence_does_not_remeasure(
+def test_recertification_carries_only_the_named_shapes_and_refuses_missing_cells(
     tmp_path: Path,
 ) -> None:
-    """--from-certificate with evidence: re-measured cells come from the rows,
-    the certificate's other cells keep their recorded aggregates, and both the
-    manifest fingerprints and the completeness check see the carried cells."""
+    """--from-certificate with evidence: re-measured cells come from the rows;
+    the certificate's cells of the explicitly named unchanged shapes keep their
+    recorded aggregates; any other certificate cell the evidence does not
+    re-measure refuses the re-certification (never a silent carry)."""
 
     import json
 
-    cell_a = {"cell": "cal-grpo-g8", "model": "m", "layers": 2, "tp": 1, "cp": 1}
-    cell_b = {"cell": "cal-grpo-g8", "model": "m", "layers": 2, "tp": 1, "cp": 2}
-    key_a, key_b = fit._cell_key(cell_a), fit._cell_key(cell_b)
+    cells = [
+        {"cell": "cal-grpo-g8", "model": "m", "layers": 2, "tp": 1, "cp": cp}
+        for cp in (1, 2, 4)
+    ]
+    keys = [fit._cell_key(c) for c in cells]
     features = {
         "packed_tokens": 4096,
         "segment_count": 8,
@@ -413,55 +416,89 @@ def test_recertification_carries_certificate_cells_the_evidence_does_not_remeasu
                     }
                 ],
             }
-            for key, cell in ((key_a, cell_a), (key_b, cell_b))
+            for key, cell in zip(keys, cells)
         ],
     }
     cert_path = tmp_path / "certificate.json"
     cert_path.write_text(json.dumps(certificate))
-    # New evidence re-measures cell B only.
-    rows: list[dict[str, Any]] = [
-        {
-            **cell_b,
-            **fingerprint,
-            "record_type": "calibration_cell",
-            "candidates": [{"label": "depth_one", "features": features}],
-        }
-    ]
-    rows += [
-        {
-            **cell_b,
-            "record_type": "calibration_sample",
-            "role": "measured",
-            "candidate_label": "depth_one",
-            "compile_statuses": ["none"],
-            "round": i,
-            "ms_max_rank": 90.0,
-        }
-        for i in range(8)
-    ]
-    evidence = tmp_path / "evidence.jsonl"
-    evidence.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
-    carried, records = fit.carried_certificate_cells(cert_path, [evidence])
-    assert [c.cell for c in carried] == [key_a] and [r["cell"] for r in records] == [
-        key_a
-    ]
-    assert carried[0].ms == 100.0
-    # Completeness: the carried cell is judged by its recorded count.
-    assert fit.validate_completeness([evidence], repeat=8, carried=records) == []
-    gaps = fit.validate_completeness([evidence], repeat=9, carried=records)
-    assert f"{key_a}: depth_one carried with 8 rows (< 9)" in gaps
-    assert f"{key_b}: depth_one has 8 usable rows (< 9)" in gaps
-    # Manifest: the carried cell counts as present with its recorded fingerprint.
+
+    def evidence_for(*measured: dict) -> Path:
+        rows: list[dict[str, Any]] = []
+        for cell in measured:
+            rows.append(
+                {
+                    **cell,
+                    **fingerprint,
+                    "record_type": "calibration_cell",
+                    "candidates": [{"label": "depth_one", "features": features}],
+                }
+            )
+            rows += [
+                {
+                    **cell,
+                    "record_type": "calibration_sample",
+                    "role": "measured",
+                    "candidate_label": "depth_one",
+                    "compile_statuses": ["none"],
+                    "round": i,
+                    "ms_max_rank": 90.0,
+                }
+                for i in range(8)
+            ]
+        path = tmp_path / f"evidence_{len(measured)}.jsonl"
+        path.write_text("".join(json.dumps(r) + "\n" for r in rows))
+        return path
+
+    # The change touches CP > 1: CP1 may be carried, CP2 and CP4 must be re-measured.
+    both = evidence_for(cells[1], cells[2])
+    carried, records, problems = fit.carried_certificate_cells(
+        cert_path, [both], carry_shapes={"tp1cp1"}
+    )
+    assert (
+        problems == []
+        and [c.cell for c in carried] == [keys[0]]
+        and carried[0].ms == 100.0
+    )
+    assert fit.validate_completeness([both], repeat=8, carried=records) == []
     manifest = {
         "schema": fit.MANIFEST_SCHEMA,
-        "cells": [{"key": key_a}, {"key": key_b}],
+        "cells": [{"key": k} for k in keys],
         "excluded": [],
     }
     manifest_path = tmp_path / "manifest.json"
     manifest_path.write_text(json.dumps(manifest))
-    problems, _ = fit.validate_manifest(
-        [evidence], manifest_path, excluded=[], carried=records
+    assert fit.validate_manifest(
+        [both], manifest_path, excluded=[], carried=records
+    ) == ([], [])
+    # One affected cell re-measured, the other missing: refused, not carried.
+    one = evidence_for(cells[1])
+    _carried, _records, problems = fit.carried_certificate_cells(
+        cert_path, [one], carry_shapes={"tp1cp1"}
     )
-    assert problems == []
-    problems, _ = fit.validate_manifest([evidence], manifest_path, excluded=[])
-    assert problems == [f"expected cell missing from the evidence: {key_a}"]
+    assert problems == [f"affected cell not re-measured: {keys[2]}"]
+    # Empty evidence: every affected cell is missing.
+    empty = tmp_path / "empty.jsonl"
+    empty.write_text("")
+    _carried, _records, problems = fit.carried_certificate_cells(
+        cert_path, [empty], carry_shapes={"tp1cp1"}
+    )
+    assert problems == [f"affected cell not re-measured: {k}" for k in keys[1:]]
+    # No shapes named: nothing may be carried.
+    _carried, _records, problems = fit.carried_certificate_cells(
+        cert_path, [both], carry_shapes=set()
+    )
+    assert problems and problems[0].startswith(
+        "re-certification needs the configurations"
+    )
+    # A cell-key substring names a configuration the change cannot reach
+    # (here the CP4 cell) regardless of its shape.
+    _carried, records, problems = fit.carried_certificate_cells(
+        cert_path, [one], carry_shapes={"tp1cp1"}, carry_cells=["|tp1|cp4"]
+    )
+    assert problems == [] and [r["cell"] for r in records] == [keys[0], keys[2]]
+    # A carried-shape cell that is re-measured comes from the rows, not the certificate.
+    all_three = evidence_for(*cells)
+    carried, records, problems = fit.carried_certificate_cells(
+        cert_path, [all_three], carry_shapes={"tp1cp1"}
+    )
+    assert problems == [] and carried == [] and records == []

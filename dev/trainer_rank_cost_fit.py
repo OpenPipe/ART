@@ -120,20 +120,45 @@ def _cell_key(row: dict[str, Any]) -> str:
 
 
 def carried_certificate_cells(
-    certificate_path: Path, evidence: list[Path]
-) -> tuple[list[Candidate], list[dict[str, Any]]]:
+    certificate_path: Path,
+    evidence: list[Path],
+    *,
+    carry_shapes: set[str],
+    carry_cells: list[str] = (),
+) -> tuple[list[Candidate], list[dict[str, Any]], list[str]]:
     """Certificate cells the evidence does not re-measure, as candidates plus
-    their recorded cell records (fingerprints, facts, per-candidate counts).
+    their recorded cell records, and the problems that forbid the carry.
 
-    Re-certifying after a runtime change re-measures the affected shapes only;
-    the other cells keep their certified aggregates, which the certificate
-    records exactly (medians, counts, spreads, features, fingerprints)."""
+    Re-certifying after a runtime change re-measures the affected shapes; the
+    cells the change does not touch — named explicitly by shape in
+    ``carry_shapes`` (e.g. ``tp1cp1``, ``tp2cp1ep2``) or by cell-key substring
+    in ``carry_cells`` (e.g. ``|Qwen/Qwen3-4B|`` for an attention-only
+    geometry a GDN change cannot reach) — keep their certified aggregates,
+    which the certificate records exactly (medians, counts, spreads, features,
+    fingerprints). Every other certificate cell must be present in the
+    evidence: an affected cell that was not re-measured is a problem, never a
+    silent carry."""
 
     measured = set(cell_fingerprints(evidence))
     candidates, payload = load_certificate(certificate_path)
-    records = [cell for cell in payload["cells"] if cell["cell"] not in measured]
+    problems: list[str] = []
+    if not carry_shapes and not carry_cells:
+        problems.append(
+            "re-certification needs the configurations whose cells may be "
+            "carried (--carry-shapes and/or --carry-cells)"
+        )
+    records = []
+    for cell in payload["cells"]:
+        if cell["cell"] in measured:
+            continue
+        if _shape_label_of(cell["shape"]) in carry_shapes or any(
+            pattern in cell["cell"] for pattern in carry_cells
+        ):
+            records.append(cell)
+        else:
+            problems.append(f"affected cell not re-measured: {cell['cell']}")
     carried = {cell["cell"] for cell in records}
-    return [c for c in candidates if c.cell in carried], records
+    return [c for c in candidates if c.cell in carried], records, problems
 
 
 def production_regret(
@@ -613,7 +638,11 @@ def evaluate_groups(
 
 
 def _shape_label(candidate: Candidate) -> str:
-    tp, cp, ep, etp = candidate.shape
+    return _shape_label_of(candidate.shape)
+
+
+def _shape_label_of(shape: tuple[int, ...] | list[int]) -> str:
+    tp, cp, ep, etp = (list(shape) + [1, 1])[:4]
     return (
         f"tp{tp}cp{cp}"
         + (f"ep{ep}" if ep > 1 else "")
@@ -1311,6 +1340,25 @@ def main() -> None:
         help="fit from a checked-in certificate's aggregates instead of raw evidence",
     )
     parser.add_argument(
+        "--carry-shapes",
+        default="",
+        help=(
+            "re-certification (--from-certificate with evidence): comma-separated "
+            "parallel shapes (tp1cp1, tp2cp1ep2, ...) the change does not touch; "
+            "their certificate cells are carried as recorded aggregates, every "
+            "other certificate cell must be re-measured by the evidence"
+        ),
+    )
+    parser.add_argument(
+        "--carry-cells",
+        default="",
+        help=(
+            "re-certification: comma-separated cell-key substrings the change "
+            "does not touch (e.g. an attention-only geometry for a GDN planner "
+            "change); their certificate cells are carried like --carry-shapes"
+        ),
+    )
+    parser.add_argument(
         "--export-certificate",
         default="",
         help="write the compact reproducible certificate (aggregates, arguments, table, hash)",
@@ -1379,10 +1427,20 @@ def main() -> None:
     # from the previous certificate as their recorded aggregates.
     carried: list[Candidate] = []
     carried_records: list[dict[str, Any]] = []
+    carry_shapes = sorted({s for s in arguments.carry_shapes.split(",") if s})
+    carry_cells = sorted({s for s in arguments.carry_cells.split(",") if s})
     if arguments.from_certificate and arguments.evidence:
-        carried, carried_records = carried_certificate_cells(
-            Path(arguments.from_certificate), arguments.evidence
+        carried, carried_records, carry_problems = carried_certificate_cells(
+            Path(arguments.from_certificate),
+            arguments.evidence,
+            carry_shapes=set(carry_shapes),
+            carry_cells=carry_cells,
         )
+        if carry_problems:
+            print("re-certification refused:", file=sys.stderr)
+            for problem in carry_problems:
+                print("  -", problem, file=sys.stderr)
+            raise SystemExit(1)
     if arguments.exclude_cells == "@manifest":
         # Exactly the manifest's listed exclusions (each carries its reason).
         if not arguments.manifest:
@@ -1657,6 +1715,8 @@ def main() -> None:
                 "objective": arguments.objective,
                 "holdout": arguments.holdout,
                 "exclude_cells": excluded,
+                "carry_shapes": carry_shapes,
+                "carry_cells": carry_cells,
                 "require_complete": arguments.require_complete,
                 "rerank_shapes": sorted(rerank_shapes),
                 "shortlist_size": arguments.shortlist_size,
