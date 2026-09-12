@@ -1,0 +1,94 @@
+# file: skypilot_llamafactory_gptoss20b.yaml
+name: sft-llf-gptoss20b
+
+resources:
+  accelerators: {H200: 1}
+  # Public CUDA image to avoid NGC auth hurdles
+  image_id: docker:pytorch/pytorch:2.4.1-cuda12.1-cudnn9-devel
+
+envs:
+  HF_HUB_ENABLE_HF_TRANSFER: "1"
+  TOKENIZERS_PARALLELISM: "false"
+  PYTORCH_CUDA_ALLOC_CONF: "max_split_size_mb:128"
+  # Optional: set HF_TOKEN if you use gated models; not needed for gpt-oss-20b
+  # HF_TOKEN: "****"
+
+setup: |
+  set -euxo pipefail
+  apt-get update -y
+  DEBIAN_FRONTEND=noninteractive apt-get install -y git build-essential ninja-build python3-dev
+
+  python -m pip install -U pip wheel setuptools
+
+  # Core training/runtime libs
+  python -m pip install \
+    "transformers>=4.55.0" \
+    "accelerate>=0.33.0" \
+    "datasets>=2.19.0" \
+    "peft>=0.12.0" \
+    "bitsandbytes>=0.43.1" \
+    "trl>=0.9.6" \
+    "xformers>=0.0.27" \
+    "flash-attn>=2.6.1" \
+    "tiktoken" \
+    "vllm>=0.5.5" \
+    "llamafactory>=0.9.2"
+
+  # Minimal workspace
+  mkdir -p /workspace/configs /workspace/outputs /workspace/exports
+
+  # LLaMA‑Factory training config (QLoRA on GPT‑OSS-20B MoE)
+  cat > /workspace/configs/llf_gptoss20b_qlora.yaml <<'YAML'
+  ### model
+  model_name_or_path: openai/gpt-oss-20b
+  trust_remote_code: true
+  template: gpt
+  torch_dtype: bfloat16
+  flash_attn: fa2
+
+  ### method
+  stage: sft
+  finetuning_type: lora
+  # QLoRA knobs
+  use_qlora: true
+  bnb_4bit_quant_type: nf4
+  bnb_4bit_use_double_quant: true
+  bnb_4bit_compute_dtype: bfloat16
+  gradient_checkpointing: true
+
+  # Target common linear modules (attention + MLP). LLaMA‑Factory auto‑maps for GPT‑OSS.
+  lora_rank: 8
+  lora_alpha: 32
+  lora_dropout: 0.05
+  lora_target: all-linear
+
+  ### data (tiny sanity‑check run)
+  dataset: alpaca_gpt4_en     # Built‑in small instruction dataset alias
+  cutoff_len: 1024
+  packing: true
+  max_samples: 512            # keep tiny for quick validation
+
+  ### training
+  num_train_epochs: 1
+  per_device_train_batch_size: 1
+  gradient_accumulation_steps: 8
+  learning_rate: 2e-4
+  lr_scheduler_type: cosine
+  optim: adamw_8bit
+  report_to: none
+  logging_steps: 5
+
+  ### output
+  save_steps: 50
+  save_total_limit: 1
+  output_dir: saves/gpt-oss-20b/lora/sft
+  YAML
+
+run: |
+  set -euxo pipefail
+  nvidia-smi
+  echo "Starting LLaMA‑Factory QLoRA SFT on openai/gpt-oss-20b ..."
+  CUDA_VISIBLE_DEVICES=0 llamafactory-cli train /workspace/configs/llf_gptoss20b_qlora.yaml
+
+  echo "Done. LoRA adapter should be at: saves/gpt-oss-20b/lora/sft"
+  ls -lah saves/gpt-oss-20b/lora/sft || true

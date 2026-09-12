@@ -1,0 +1,62 @@
+### LLaMA-Factory LoRA SFT config for Qwen3-235B A22B Instruct (8× H200, ZeRO-3 sharded)
+
+### model
+model_name_or_path: Qwen/Qwen3-235B-A22B-Instruct-2507
+trust_remote_code: true
+template: qwen3
+torch_dtype: bfloat16
+flash_attn: fa2
+
+### method
+stage: sft
+finetuning_type: lora
+# Enable activation checkpointing to keep memory pressure manageable
+gradient_checkpointing: true
+lora_rank: 8
+lora_alpha: 32
+lora_dropout: 0.05
+# Limit LoRA to shared attention/router weights; avoid per-expert MLP explosion in MoE
+lora_target:
+  - q_proj
+  - k_proj
+  - v_proj
+  - o_proj
+  - gate
+  - shared_expert_gate
+
+### data
+# Swap ONLINE dataset entries with your real SFT data when ready
+dataset_dir: ONLINE
+dataset:
+  - tatsu-lab/alpaca
+cutoff_len: 4096
+packing: true
+max_samples: 64
+
+### training
+do_train: true
+num_train_epochs: 1
+max_steps: 10
+per_device_train_batch_size: 1
+gradient_accumulation_steps: 4
+learning_rate: 0.00015
+lr_scheduler_type: cosine
+warmup_ratio: 0.03
+optim: adamw_torch
+bf16: true
+report_to: none
+logging_strategy: steps
+logging_steps: 1
+seed: 42
+
+### distributed / system
+# Launch with torchrun/accelerate over 8 GPUs; ZeRO-3 shards model across devices
+deepspeed: configs/deepspeed_zero3_235b.json
+ddp_timeout: 36000
+dataloader_num_workers: 4
+
+### output
+save_strategy: steps
+save_steps: 2
+save_total_limit: 1
+output_dir: outputs/llamafactory/qwen3_235b_lora_sft_zero3

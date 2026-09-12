@@ -1,0 +1,65 @@
+### LLaMA-Factory LoRA SFT config for Qwen3-30B A3B Instruct (2x H200)
+
+### model
+model_name_or_path: Qwen/Qwen3-30B-A3B-Instruct-2507
+trust_remote_code: true
+template: qwen3
+
+# Quantization (QLoRA via BitsAndBytes)
+# quantization_method: bnb
+# quantization_bit: 4
+# quantization_type: nf4
+# double_quantization: true
+
+### method
+stage: sft
+finetuning_type: lora
+gradient_checkpointing: true
+
+# Target common linear modules (attention + MLP). LLaMA‑Factory resolves per-arch
+lora_rank: 8
+lora_alpha: 32
+lora_dropout: 0.05
+lora_target:
+  - q_proj
+  - k_proj
+  - v_proj
+  - o_proj
+  - gate_proj
+  - up_proj
+  - down_proj
+
+### data
+# Use HF dataset directly via ONLINE mode
+dataset_dir: ONLINE
+dataset:
+  - tatsu-lab/alpaca
+cutoff_len: 1024
+packing: true
+max_samples: 16
+
+### training
+do_train: true
+num_train_epochs: 1
+max_steps: 10
+per_device_train_batch_size: 1
+gradient_accumulation_steps: 1
+learning_rate: 0.0002
+lr_scheduler_type: cosine
+optim: adamw_torch
+bf16: true
+report_to: none
+logging_strategy: steps
+logging_steps: 1
+seed: 42
+
+### distributed / system
+ddp_timeout: 36000
+dataloader_num_workers: 0
+
+### output
+save_strategy: steps
+save_steps: 2
+save_total_limit: 1
+output_dir: outputs/llamafactory/qwen3_30b_lora_sft_fp2g
+
