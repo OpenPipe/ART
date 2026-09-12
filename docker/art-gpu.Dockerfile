@@ -140,6 +140,7 @@ RUN if ! getent group messagebus >/dev/null; then groupadd -r messagebus; fi \
 
 COPY --from=builder --chown=sky:sky /opt/uv-cache /opt/uv-cache
 COPY --from=builder --chown=sky:sky /opt/uv-python /opt/uv-python
+COPY --from=builder --chown=sky:sky /opt/src/art/megatron_runtime/pyproject.toml /opt/src/art/megatron_runtime/uv.lock /opt/src/art/megatron_runtime/
 
 USER sky
 WORKDIR /home/sky
