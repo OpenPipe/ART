@@ -205,9 +205,14 @@ You must respond with a JSON object containing a "scenarios" array of exactly {n
         scenarios = result if isinstance(result, list) else list(result.values())[0]
 
     # Validate count
-    if len(scenarios) != num_scenarios:
+    if len(scenarios) < num_scenarios:
         err(f"Expected {num_scenarios} scenarios, got {len(scenarios)}.")
         raise ValueError(f"Expected {num_scenarios} scenarios, got {len(scenarios)}")
+    elif len(scenarios) > num_scenarios:
+        ok(
+            f"Expected {num_scenarios} scenarios, got {len(scenarios)}. Truncating to {num_scenarios}."
+        )
+        scenarios = scenarios[:num_scenarios]
 
     ok(f"Parsed {len(scenarios)} scenario(s) successfully.")
 
