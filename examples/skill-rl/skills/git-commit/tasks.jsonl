@@ -1,0 +1,30 @@
+{"task": "fixed null pointer exception when user profile is empty", "expected_type": "fix"}
+{"task": "added export to CSV functionality for reports", "expected_type": "feat"}
+{"task": "updated the README with new installation steps", "expected_type": "docs"}
+{"task": "reformatted all Python files with black", "expected_type": "style"}
+{"task": "extracted payment logic into separate service class", "expected_type": "refactor"}
+{"task": "added unit tests for the email validator", "expected_type": "test"}
+{"task": "bumped axios from 0.21 to 1.6 for security patch", "expected_type": "chore"}
+{"task": "users can now reset password via SMS", "expected_type": "feat"}
+{"task": "fixed race condition in websocket connection handler", "expected_type": "fix"}
+{"task": "added JSDoc comments to all public API methods", "expected_type": "docs"}
+{"task": "consistent spacing in CSS files", "expected_type": "style"}
+{"task": "moved database queries from controllers to repositories", "expected_type": "refactor"}
+{"task": "integration tests for checkout flow", "expected_type": "test"}
+{"task": "updated CI to use Node 20", "expected_type": "chore"}
+{"task": "implemented two-factor authentication", "expected_type": "feat"}
+{"task": "handled edge case where date is in the future", "expected_type": "fix"}
+{"task": "API versioning documentation", "expected_type": "docs"}
+{"task": "renamed variables to follow naming convention", "expected_type": "style"}
+{"task": "simplified the state management logic", "expected_type": "refactor"}
+{"task": "snapshot tests for React components", "expected_type": "test"}
+{"task": "added pre-commit hooks for linting", "expected_type": "chore"}
+{"task": "bulk delete for admin dashboard", "expected_type": "feat"}
+{"task": "memory leak in image processing", "expected_type": "fix"}
+{"task": "added troubleshooting section to docs", "expected_type": "docs"}
+{"task": "fixed indentation in YAML configs", "expected_type": "style"}
+{"task": "split monolithic component into smaller pieces", "expected_type": "refactor"}
+{"task": "e2e tests for user registration", "expected_type": "test"}
+{"task": "switched from npm to pnpm", "expected_type": "chore"}
+{"task": "real-time notifications via Server-Sent Events", "expected_type": "feat"}
+{"task": "timezone handling for scheduled tasks", "expected_type": "fix"}
