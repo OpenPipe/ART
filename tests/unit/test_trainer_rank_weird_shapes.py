@@ -22,6 +22,7 @@ from art.trainer_rank import (
 )
 from art.trainer_rank._impl import (
     _CheckpointSlot,
+    _FlatForwardPlan,
     _flatten,
     _MemoryCheck,
     _MemoryProfile,
@@ -550,6 +551,7 @@ def test_minimum_wave_materializes_the_layout_its_check_priced(
     candidate = rank._select_next_micro_batch([inputs], 0)
 
     assert candidate.check.fits
+    assert isinstance(candidate.plan, _FlatForwardPlan)
     assert candidate.plan.packed_tokens == shared.packed_tokens
     assert rank._memory_check(candidate.plan) == candidate.check
     assert candidate.cold_start == (profile != "trusted")
