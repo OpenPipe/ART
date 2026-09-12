@@ -58,6 +58,9 @@ def layer() -> Any:
     value.experts.linear_fc2.out_features = 2048
     value.experts.linear_fc2.linear_fc2 = module(lora_module.TERowParallelGroupedLinear)
     value.experts.linear_fc2.lora = module(lora_module.LoRA)
+    value.experts.linear_fc2.lora.A_T = torch.nn.Parameter(
+        torch.empty(256, 512, 8, dtype=torch.bfloat16)
+    )
     value.experts.linear_fc2.lora.B_T = torch.nn.Parameter(
         torch.empty(256, 8, 2048, dtype=torch.bfloat16)
     )
@@ -85,22 +88,58 @@ def _signature():
 
 def test_supported_constructor_and_original_shape(layer):
     rank = _rank(layer)
-    assert rank._moe_output_bytes_per_token == 2 * 8 * 2048 * 2
+    assert rank._moe_output_bytes_per_token == (512 + 3 * 2048) * 8 * 2
     estimate = rank._estimate_required_memory_bytes_from_values(
         packed_tokens=106432,
         output_bytes=0,
         signature=_signature(),
     )
-    # This independent storage arithmetic exceeds the former 6,713,560,268.
+    # Eager FC2 arguments and outputs; compiler reuse can reduce this component.
+    inputs = torch.empty(106432 * 8, 512, dtype=torch.bfloat16, device="meta")
     base = torch.empty(106432 * 8, 2048, dtype=torch.bfloat16, device="meta")
     adapter = torch.empty_like(base)
-    assert base.untyped_storage()._cdata != adapter.untyped_storage()._cdata
+    combined = base + adapter
+    tensors = (inputs, base, adapter, combined)
+    assert len({x.untyped_storage()._cdata for x in tensors}) == len(tensors)
     pair = base.untyped_storage().nbytes() + adapter.untyped_storage().nbytes()
     assert pair == 6_975_127_552
-    assert estimate == int(pair * 1.1)
+    assert estimate == int(sum(x.untyped_storage().nbytes() for x in tensors) * 1.1)
     assert rank._memory_check_required(6_800_000_000).fits  # CPU default budget
     rank._available_memory_bytes = lambda: 6_800_000_000
     assert not rank._memory_check_required(estimate).fits
+
+
+def test_cold_fixed_pressure_budget_and_partial_envelope_limit(layer):
+    rank = _rank(layer)
+    signature = replace(_signature(), grad_enabled=False, grad_modes=(False,))
+    required = rank._estimate_required_memory_bytes_from_values(
+        packed_tokens=45981, output_bytes=707325952, signature=signature
+    )
+    assert required == 6_164_530_380
+    rank._available_memory_bytes = lambda: 4_652_784_333
+    assert rank._memory_check_required(4_092_810_444).fits
+    assert not rank._memory_check_required(required).fits
+    # This source component remains below the retained whole-forward increment.
+    # No general physical bound follows from rejecting this recorded budget.
+    assert required < 11_445_665_280
+
+
+@pytest.mark.parametrize("mode", ["missing", "dtype", "rank", "experts"])
+def test_unknown_fc2_input_keeps_previous_pair(layer, mode):
+    lora = layer.experts.linear_fc2.lora
+    if mode == "missing":
+        lora.A_T = None
+    else:
+        shape = (
+            (128, 512, 8)
+            if mode == "experts"
+            else (256, 512, 4)
+            if mode == "rank"
+            else (256, 512, 8)
+        )
+        dtype = torch.float32 if mode == "dtype" else torch.bfloat16
+        lora.A_T = torch.nn.Parameter(torch.empty(shape, dtype=dtype))
+    assert _moe_output_bytes_per_token([layer], ParallelShape(tp=1, cp=1)) == 65536
 
 
 @pytest.mark.parametrize("field", ["tp", "cp", "ep", "etp"])

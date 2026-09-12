@@ -418,10 +418,7 @@ def _overlay_routes(
         return
     end = start + routes.shape[0]
     existing = route_mask[start:end]
-    if bool(existing.any()) and not np.array_equal(
-        aligned[start:end][existing], routes[existing]
-    ):
-        raise RuntimeError("Overlapping routed experts disagree for the same token")
+    # Keep first-captured routes; an extended prompt may reroute its uncached tail.
     fill = ~existing
     if bool(fill.any()):
         aligned[start:end][fill] = routes[fill]

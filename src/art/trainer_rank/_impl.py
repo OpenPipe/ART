@@ -574,6 +574,7 @@ class _MemoryCheck:
 class _MemoryProfile:
     bytes_per_token: float
     packed_tokens: int
+    # Active execution rows only; total-input telemetry can include inactive rows.
     logical_per_packed: float = 1.0
     # Historical forward-retained/forward-peak ratio for calibration telemetry,
     # max-merged only from forward-return observations. Admission uses the
@@ -901,6 +902,12 @@ class _FlatForwardPlan:
     output_bytes: int
     signature: _MemorySignature
     selected_max_depth: int = 0
+    inactive_logical_tokens: int = 0
+
+    @property
+    def active_logical_tokens(self) -> int:
+        # Keep total-input telemetry while pricing only executed requests.
+        return self.logical_tokens - self.inactive_logical_tokens
 
     @property
     def subforward_count(self) -> int:
@@ -1198,7 +1205,7 @@ def _configure_moe_dispatcher_caches(model: Sequence[torch.nn.Module]) -> None:
 def _moe_output_bytes_per_token(
     model: Sequence[torch.nn.Module], shape: ParallelShape
 ) -> int:
-    """Known FC2 output pair, not a bound on the complete live working set."""
+    """Known eager FC2 input/outputs, not the complete or compiled working set."""
     if shape != ParallelShape(tp=1, cp=1):
         return 0
     from megatron.core.extensions.transformer_engine import TERowParallelGroupedLinear
@@ -1267,9 +1274,23 @@ def _moe_output_bytes_per_token(
                 or getattr(layer.router, "topk", None) != config.moe_router_topk
             ):
                 return 0
+            features = 2 * fc2.out_features
+            inputs = getattr(lora, "A_T", None)
+            if (
+                isinstance(inputs, torch.Tensor)
+                and inputs.ndim == weights.ndim == 3
+                and inputs.dtype == weights.dtype
+                and inputs.shape[0] == weights.shape[0]
+                and inputs.shape[-1] == weights.shape[-2]
+                and inputs.shape[-2] > 0
+            ):
+                # Eager FC2 keeps x, base_out and adapter_out while producing
+                # their sum. Compilers may reuse storage; other workspace is
+                # not covered. Unknown input metadata keeps the prior pair.
+                features = inputs.shape[-2] + 3 * fc2.out_features
             coefficient = max(
                 coefficient,
-                2 * config.moe_router_topk * fc2.out_features * weights.element_size(),
+                config.moe_router_topk * features * weights.element_size(),
             )
     return coefficient
 
@@ -2620,7 +2641,7 @@ class TrainerRank:
             slot_group_count=len(groups),
             grad_modes=tuple(mode for (_, mode), _ in groups),
         )
-        logical_tokens = sum(int(row.numel()) for row in rows)
+        logical_tokens = _active_logical_tokens(requests)
         cost = self._subforward_cost(
             packed_tokens=packed_tokens,
             output_bytes=output_bytes,
@@ -2674,7 +2695,7 @@ class TrainerRank:
             packed_tokens=plan.packed_tokens,
             output_bytes=plan.output_bytes,
             signature=plan.signature,
-            logical_tokens=plan.logical_tokens,
+            logical_tokens=plan.active_logical_tokens,
         )
 
     def _subforward_cost(
@@ -3642,9 +3663,7 @@ class TrainerRank:
                 estimates[width] = None
                 return None
             assert values is not None
-            logical_tokens = sum(
-                int(request.input_tokens.numel()) for request in local_requests
-            )
+            logical_tokens = _active_logical_tokens(local_requests)
 
             def priced(
                 packed_tokens: int,
@@ -3712,18 +3731,16 @@ class TrainerRank:
                         )
                         assert exact is not None
                         selected = exact
+                        # The minimum wave may execute cold after trust fails.
+                        # Keep its materialization paired with the retained check.
+                        layout_modes[width] = memory_minimal
                         if selected[0].fits and (
                             not profiled or trusted(selected[1], selected[3])
                         ):
-                            layout_modes[width] = memory_minimal
                             break
-                    else:
-                        # Nothing fit and trusted; keep the memory-minimal
-                        # pricing so the recorded failure is the monotone one.
-                        if not selected[0].fits:
-                            layout_modes.pop(width, None)
                 elif minimal_bound is not None:
                     selected = minimal_bound
+                    layout_modes[width] = True
                 if not selected[0].fits:
                     exact_failed_width = (
                         width
@@ -4269,6 +4286,7 @@ class TrainerRank:
                 grad_modes=tuple(mode for (_, mode), _ in groups),
             ),
             selected_max_depth=selected_max_depth,
+            inactive_logical_tokens=logical_tokens - _active_logical_tokens(requests),
         )
 
     def _estimate_flat_forward(
@@ -4750,7 +4768,7 @@ class TrainerRank:
                 packed_tokens=forward.packed_tokens,
                 output_bytes=forward.output_bytes,
                 signature=forward.signature,
-                logical_tokens=forward.logical_tokens,
+                logical_tokens=forward.active_logical_tokens,
             ),
             sync_across_dp=sync_across_dp,
         )
@@ -4807,7 +4825,7 @@ class TrainerRank:
             * activation_factor
         )
         # Groups execute sequentially: summed packed rows conservatively bound
-        # this output-pair component, not simultaneous workspace or retained graphs.
+        # this FC2 component, not all workspace or retained graphs.
         static_compute = max(
             static_compute, packed_tokens * self._moe_output_bytes_per_token
         )
@@ -4915,7 +4933,7 @@ class TrainerRank:
                 0 if previous is None else previous.packed_tokens,
             ),
             logical_per_packed=max(
-                plan.logical_tokens / max(1, plan.packed_tokens),
+                plan.active_logical_tokens / max(1, plan.packed_tokens),
                 1.0 if previous is None else previous.logical_per_packed,
             ),
             retained_fraction=retained_fraction,
@@ -5595,6 +5613,17 @@ def _validate_top_k(top_k: int, model: object) -> None:
     vocab_size = _padded_vocab_size(model)
     if top_k > vocab_size:
         raise ValueError(f"top_k={top_k} exceeds vocabulary size {vocab_size}")
+
+
+def _active_logical_tokens(requests: Sequence[AnyForwardInput]) -> int:
+    return sum(
+        int(request.input_tokens.numel())
+        for request in requests
+        if request.target_tokens is not None
+        or request.logits
+        or request.top_k is not None
+        or request.hidden_states
+    )
 
 
 def _request_mix_key(request: AnyForwardInput) -> str:

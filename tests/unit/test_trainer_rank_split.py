@@ -57,6 +57,7 @@ from art.trainer_rank._impl import (
     _MemoryProfile,
     _SplitForwardPlan,
 )
+from art.trainer_rank._prefix_tree_planner import plan_prefix_tree_layout
 
 if TYPE_CHECKING:
     from art.megatron.lora import LoRASlotRef
@@ -973,16 +974,14 @@ def test_retained_ratio_bound_uses_original_guard_at_trusted_endpoint(
 ) -> None:
     rank = _retained_ratio_rank(monkeypatch)
 
-    def request(tokens: list[int], *, output: bool = True) -> ForwardInput:
+    def request(tokens: list[int]) -> ForwardInput:
         values = torch.tensor(tokens)
-        return ForwardInput(
-            input_tokens=values, target_tokens=values if output else None
-        )
+        return ForwardInput(input_tokens=values, target_tokens=values)
 
     original = [
-        request([0, *range(1, 7)]),
-        request([0, *range(21, 27)]),
-        request([99], output=False),
+        request([0, 1, *range(2, 7)]),
+        request([0, 1, *range(22, 27)]),
+        request([99]),
     ]
     observed = rank._plan_flat_forward(original, memory_minimal=True)
     assert (observed.packed_tokens, observed.logical_tokens) == (13, 15)
@@ -991,11 +990,19 @@ def test_retained_ratio_bound_uses_original_guard_at_trusted_endpoint(
         peak_delta_bytes=observed.output_bytes + 13,
         retained_bytes=observed.output_bytes,
     )
-    requests = [
-        request([*range(24), *range(30, 58)]),
-        request([*range(24), *range(90, 118)]),
-        request(list(range(856)), output=False),
-    ]
+    requests = [request([*range(24), *range(30, 46)]) for _ in range(8)]
+    requests += [request([*range(24), *range(90, 130)]) for _ in range(10)]
+    select = rank._select_group_layout
+
+    def select_leaf_sharing(input_ids, *, memory_minimal=False, grad_enabled=True):
+        tree, layout = select(input_ids, memory_minimal=True, grad_enabled=grad_enabled)
+        if not memory_minimal:
+            # A legal intermediate layout shares each repeated leaf path but
+            # replays the common prefix: 104 physical / 960 active logical rows.
+            layout = plan_prefix_tree_layout(tree, tree.terminal_segment_indices)
+        return tree, layout
+
+    monkeypatch.setattr(rank, "_select_group_layout", select_leaf_sharing)
     minimal = rank._plan_flat_forward(requests, memory_minimal=True)
     plan = rank._plan_flat_forward(requests)
     profile = rank._memory_profiles[observed.signature]
@@ -1006,6 +1013,7 @@ def test_retained_ratio_bound_uses_original_guard_at_trusted_endpoint(
         104,
         960,
     )
+    assert plan.active_logical_tokens == plan.logical_tokens
     assert plan.packed_tokens == cap
     assert plan.logical_tokens / cap == limit
     # Rearranging the original comparison changes the answer at this equality.
@@ -1024,7 +1032,10 @@ def test_retained_ratio_bound_uses_original_guard_at_trusted_endpoint(
     exact_bytes = rank._split_rung_check([exact, exact]).estimated_required_bytes
     monkeypatch.setattr(rank, "_available_memory_bytes", lambda: exact_bytes)
     selected, check = rank._admit_split_rung(
-        [(0, 1, 2), (3, 4, 5)], requests * 2, rows * 2, checkpoint=Unset
+        [tuple(range(18)), tuple(range(18, 36))],
+        requests * 2,
+        rows * 2,
+        checkpoint=Unset,
     )
     assert selected is not None and check.fits
     assert check.estimated_required_bytes == exact_bytes
