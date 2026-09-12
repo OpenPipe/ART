@@ -531,16 +531,16 @@ def _prefix_tree_layout_score_v1(
 COEFFICIENT_SCALE_PER_US = 1_000
 # Dense hidden-2,560 class (Qwen3.5-4B GDN and Qwen3-4B attention on H200 bf16).
 COEFFICIENTS_MILLI_US: dict[str, int] = {
-    "token_per_rank": 1983,
-    "token_cp_exchange": 16,
-    "token_tp_collective": 237,
-    "gdn_token_per_rank": 599,
+    "token_per_rank": 1986,
+    "token_cp_exchange": 45,
+    "token_tp_collective": 229,
+    "gdn_token_per_rank": 305,
     "attention_token_cp_exchange": 7,
-    "tiny_segment_per_layer": 167333,
-    "level_cp_per_layer": 62793,
-    "level_tp_per_layer": 668184,
-    "gdn_level": 2908492,
-    "gdn_level_tp": 1657638,
+    "tiny_segment_per_layer": 222742,
+    "level_cp_per_layer": 152596,
+    "level_tp_per_layer": 635438,
+    "gdn_level": 2920256,
+    "gdn_level_tp": 428567,
 }
 
 H200_CLASS = DeviceClass(capability=(9, 0), memory_class="hbm-141g")
@@ -606,15 +606,15 @@ GDN_MOE_H2048_TABLE = CalibratedTable(
     table_id="gdn-moe-h2048-h200-bf16",
     coefficients_milli_us={
         "attention_token_cp_exchange": 0,
-        "gdn_level": 5_397_515,
+        "gdn_level": 8_553_228,
         "gdn_level_tp": 0,
-        "gdn_token_per_rank": 38,
-        "level_cp_per_layer": 0,
-        "level_tp_per_layer": 2_980_859,
-        "tiny_segment_per_layer": 204_714,
-        "token_cp_exchange": 4,
-        "token_per_rank": 1956,
-        "token_tp_collective": 378,
+        "gdn_token_per_rank": 364,
+        "level_cp_per_layer": 255_082,
+        "level_tp_per_layer": 6_023_815,
+        "tiny_segment_per_layer": 360_723,
+        "token_cp_exchange": 36,
+        "token_per_rank": 3152,
+        "token_tp_collective": 727,
     },
     device_classes=(H200_CLASS,),
     param_dtypes=("torch.bfloat16",),
@@ -782,7 +782,14 @@ ATTN_MOE_H2048_TABLE = CalibratedTable(
 # class at CP4, as they do the 35B GDN MoE class; after the recalibration the
 # CP4 group carries one 5.5% clear miss on the synthetic grpo-g8 cell, whose
 # best layout changed with the planner); TP2 x CP2 fails its gates and keeps
-# the version-1 score, which on this class lost up to 112% at CP4.
+# the version-1 score, which on this class lost up to 112% at CP4. The GDN
+# planner recalibration of 2026-09-09 (design brief) was validated on this
+# class but the table is NOT refit from it: under the new planner the refit
+# misses the held-out Ellavox g3 cell at CP4 by 11% (its deep layout's GDN
+# segments now chain, which the ten terms cannot see), while the shipped
+# table's picks are within 2.7% of the new best on the other 13 CP4 cells and
+# 22% faster than before on g3 itself; a GDN-aware second stage is the
+# follow-up.
 QWEN35_27B_GEOMETRY = ModelGeometry(
     hidden_size=5_120,
     ffn_hidden_size=17_408,

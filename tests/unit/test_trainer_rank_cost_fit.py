@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib.util
 from pathlib import Path
 import sys
+from typing import Any
 
 import numpy as np
 
@@ -365,3 +366,139 @@ def test_completeness_counts_only_current_planner_rows(tmp_path: Path) -> None:
         + "\n"
     )
     assert fit.validate_completeness([full], repeat=8) == []
+
+
+def test_recertification_carries_only_the_named_shapes_and_refuses_missing_cells(
+    tmp_path: Path,
+) -> None:
+    """--from-certificate with evidence: re-measured cells come from the rows;
+    the certificate's cells of the explicitly named unchanged shapes keep their
+    recorded aggregates; any other certificate cell the evidence does not
+    re-measure refuses the re-certification (never a silent carry)."""
+
+    import json
+
+    cells = [
+        {"cell": "cal-grpo-g8", "model": "m", "layers": 2, "tp": 1, "cp": cp}
+        for cp in (1, 2, 4)
+    ]
+    keys = [fit._cell_key(c) for c in cells]
+    features = {
+        "packed_tokens": 4096,
+        "segment_count": 8,
+        "max_depth": 1,
+        "segments_below": [0] * 8,
+    }
+    facts = {"layers": 2.0, "gdn_layers": 0.0, "tp": 1.0, "cp": 1.0, "uses_gdn": 0.0}
+    fingerprint = {
+        "source": "s",
+        "requests_sha256": "r",
+        "device": "d",
+        "param_dtype": "bf16",
+        "hidden_size": 8,
+        "geometry": {"hidden_size": 8},
+    }
+    certificate = {
+        "schema": fit.CERTIFICATE_SCHEMA,
+        "cells": [
+            {
+                "cell": key,
+                "facts": {**facts, "cp": float(cell["cp"])},
+                "shape": [1, cell["cp"], 1, 1],
+                **fingerprint,
+                "candidates": [
+                    {
+                        "label": "depth_one",
+                        "features": features,
+                        "median_ms": 100.0,
+                        "n": 8,
+                        "spread_pct": 1.0,
+                    }
+                ],
+            }
+            for key, cell in zip(keys, cells)
+        ],
+    }
+    cert_path = tmp_path / "certificate.json"
+    cert_path.write_text(json.dumps(certificate))
+
+    def evidence_for(*measured: dict) -> Path:
+        rows: list[dict[str, Any]] = []
+        for cell in measured:
+            rows.append(
+                {
+                    **cell,
+                    **fingerprint,
+                    "record_type": "calibration_cell",
+                    "candidates": [{"label": "depth_one", "features": features}],
+                }
+            )
+            rows += [
+                {
+                    **cell,
+                    "record_type": "calibration_sample",
+                    "role": "measured",
+                    "candidate_label": "depth_one",
+                    "compile_statuses": ["none"],
+                    "round": i,
+                    "ms_max_rank": 90.0,
+                }
+                for i in range(8)
+            ]
+        path = tmp_path / f"evidence_{len(measured)}.jsonl"
+        path.write_text("".join(json.dumps(r) + "\n" for r in rows))
+        return path
+
+    # The change touches CP > 1: CP1 may be carried, CP2 and CP4 must be re-measured.
+    both = evidence_for(cells[1], cells[2])
+    carried, records, problems = fit.carried_certificate_cells(
+        cert_path, [both], carry_shapes={"tp1cp1"}
+    )
+    assert (
+        problems == []
+        and [c.cell for c in carried] == [keys[0]]
+        and carried[0].ms == 100.0
+    )
+    assert fit.validate_completeness([both], repeat=8, carried=records) == []
+    manifest = {
+        "schema": fit.MANIFEST_SCHEMA,
+        "cells": [{"key": k} for k in keys],
+        "excluded": [],
+    }
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text(json.dumps(manifest))
+    assert fit.validate_manifest(
+        [both], manifest_path, excluded=[], carried=records
+    ) == ([], [])
+    # One affected cell re-measured, the other missing: refused, not carried.
+    one = evidence_for(cells[1])
+    _carried, _records, problems = fit.carried_certificate_cells(
+        cert_path, [one], carry_shapes={"tp1cp1"}
+    )
+    assert problems == [f"affected cell not re-measured: {keys[2]}"]
+    # Empty evidence: every affected cell is missing.
+    empty = tmp_path / "empty.jsonl"
+    empty.write_text("")
+    _carried, _records, problems = fit.carried_certificate_cells(
+        cert_path, [empty], carry_shapes={"tp1cp1"}
+    )
+    assert problems == [f"affected cell not re-measured: {k}" for k in keys[1:]]
+    # No shapes named: nothing may be carried.
+    _carried, _records, problems = fit.carried_certificate_cells(
+        cert_path, [both], carry_shapes=set()
+    )
+    assert problems and problems[0].startswith(
+        "re-certification needs the configurations"
+    )
+    # A cell-key substring names a configuration the change cannot reach
+    # (here the CP4 cell) regardless of its shape.
+    _carried, records, problems = fit.carried_certificate_cells(
+        cert_path, [one], carry_shapes={"tp1cp1"}, carry_cells=["|tp1|cp4"]
+    )
+    assert problems == [] and [r["cell"] for r in records] == [keys[0], keys[2]]
+    # A carried-shape cell that is re-measured comes from the rows, not the certificate.
+    all_three = evidence_for(*cells)
+    carried, records, problems = fit.carried_certificate_cells(
+        cert_path, [all_three], carry_shapes={"tp1cp1"}
+    )
+    assert problems == [] and carried == [] and records == []

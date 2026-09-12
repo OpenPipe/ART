@@ -457,36 +457,53 @@ def test_width_search_survives_non_monotone_cost_optimal_layouts(
     1, fails at 2, fits at 3 in this case). Feasibility must instead be judged
     by the memory-minimal layout, which is monotone, so the search reaches
     width 3 instead of stopping at the spurious failure.
+
+    Where exactly one saved copy stops paying for the extra level depends on
+    the fitted cost model (CPU-only planning scores with the default dense
+    table, which is re-certified as the runtime changes), so the test finds a
+    shared-prefix length in that window instead of pinning one.
     """
 
-    # 150 shared tokens on the attention model: one saved copy (width 2) does
-    # not pay for the extra level under the fitted cost model (the default
-    # dense table, re-certified 2026-09-08; the window is 130-160 shared
-    # tokens), two saved copies (width 3) do.
-    shared = tuple(range(10_000, 10_150))
-    inputs = [_target_request(_tokens(*shared, tail)) for tail in (1, 2, 3)]
-    rank = TrainerRank(_attention_runtime())
-    monkeypatch.setattr(rank, "_dp_rank_and_size", lambda: (0, 1))
-    monkeypatch.setattr(rank, "_all_ranks_have_memory_profile", lambda **_kwargs: True)
-    monkeypatch.setattr(
-        rank,
-        "_run_flat_plan_with_memory_tracking",
-        lambda plan, **_kwargs: (
-            [ForwardOutput(None, None, None, None) for _ in range(plan.request_count)],
-            None,
-        ),
-    )
-    # Confirm the non-monotone premise under the production cost model.
-    two = rank._plan_flat_forward(inputs[:2])
-    three = rank._plan_flat_forward(inputs)
-    assert two.packed_tokens == 302, two.packed_tokens
-    assert three.packed_tokens == 153, three.packed_tokens
-    _set_packed_token_budget(monkeypatch, rank, 300)
+    def plans(shared_len: int) -> tuple[TrainerRank, list, int, int]:
+        shared = tuple(range(10_000, 10_000 + shared_len))
+        inputs = [_target_request(_tokens(*shared, tail)) for tail in (1, 2, 3)]
+        rank = TrainerRank(_attention_runtime())
+        monkeypatch.setattr(rank, "_dp_rank_and_size", lambda: (0, 1))
+        monkeypatch.setattr(
+            rank, "_all_ranks_have_memory_profile", lambda **_kwargs: True
+        )
+        monkeypatch.setattr(
+            rank,
+            "_run_flat_plan_with_memory_tracking",
+            lambda plan, **_kwargs: (
+                [
+                    ForwardOutput(None, None, None, None)
+                    for _ in range(plan.request_count)
+                ],
+                None,
+            ),
+        )
+        two = rank._plan_flat_forward(inputs[:2]).packed_tokens
+        three = rank._plan_flat_forward(inputs).packed_tokens
+        return rank, inputs, two, three
+
+    # One saved copy (width 2) does not pay for the extra level under the
+    # production cost model, two saved copies (width 3) do: width 2 replays the
+    # prefix (2 * shared + 2 tokens), width 3 shares it (shared + 3 tokens).
+    for shared_len in range(40, 400, 10):
+        rank, inputs, two, three = plans(shared_len)
+        if two == 2 * shared_len + 2 and three == shared_len + 3:
+            break
+    else:
+        pytest.fail("no shared-prefix length makes the cost-optimal width non-monotone")
+    # A budget between the two: the cost-optimal width-2 layout does not fit,
+    # the width-3 one does.
+    _set_packed_token_budget(monkeypatch, rank, (two + three) // 2)
 
     batches = list(rank.forward_micro_batches(inputs))
 
     assert [batch.stats.global_count for batch in batches] == [3]
-    assert batches[0].stats.packed_tokens <= 300
+    assert batches[0].stats.packed_tokens <= (two + three) // 2
 
 
 def test_dp_rank_forward_falls_back_to_memory_minimal_layout_before_refusing(
