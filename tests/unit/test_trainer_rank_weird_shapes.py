@@ -517,6 +517,103 @@ def test_dp_rank_forward_falls_back_to_memory_minimal_layout_before_refusing(
     assert rank.last_forward_telemetry()["selected_max_depth"] == 2
 
 
+@pytest.mark.parametrize(
+    "profile", ("absent", "tiny", "tiny_roomy", "trusted", "peer_untrusted")
+)
+def test_minimum_wave_materializes_the_layout_its_check_priced(
+    monkeypatch: pytest.MonkeyPatch, profile: str
+) -> None:
+    inputs = [_target_request(_tokens(*range(10_000, 10_040), tail)) for tail in (1, 2)]
+    rank = TrainerRank(_attention_runtime())
+    monkeypatch.setattr(rank, "_dp_rank_and_size", lambda: (0, 1))
+    unshared = rank._plan_flat_forward(inputs)
+    shared = rank._plan_flat_forward(inputs, memory_minimal=True)
+    assert (unshared.packed_tokens, shared.packed_tokens) == (82, 42)
+    if profile != "absent":
+        rank._memory_profiles[shared.signature] = _MemoryProfile(
+            bytes_per_token=0.0,
+            packed_tokens=1 if profile.startswith("tiny") else shared.packed_tokens,
+        )
+    if profile == "peer_untrusted":
+        # Local geometry is trusted, but another DP rank reports otherwise.
+        monkeypatch.setattr(rank, "_all_ranks_have_memory_profile", lambda **_: False)
+    shared_required = rank._memory_check(shared).estimated_required_bytes
+    unshared_required = rank._memory_check(unshared).estimated_required_bytes
+    assert shared_required < unshared_required
+    available = (
+        unshared_required
+        if profile == "tiny_roomy"
+        else (shared_required + unshared_required) // 2
+    )
+    monkeypatch.setattr(rank, "_available_memory_bytes", lambda: available)
+
+    candidate = rank._select_next_micro_batch([inputs], 0)
+
+    assert candidate.check.fits
+    assert candidate.plan.packed_tokens == shared.packed_tokens
+    assert rank._memory_check(candidate.plan) == candidate.check
+    assert candidate.cold_start == (profile != "trusted")
+
+
+@pytest.mark.parametrize("stage", ("bound", "exact"))
+def test_minimum_wave_rejection_keeps_its_layout_mode(
+    monkeypatch: pytest.MonkeyPatch, stage: str
+) -> None:
+    inputs = [_target_request(_tokens(*range(10_000, 10_040), tail)) for tail in (1, 2)]
+    rank = TrainerRank(_attention_runtime())
+    monkeypatch.setattr(rank, "_dp_rank_and_size", lambda: (0, 1))
+    shared = rank._plan_flat_forward(inputs, memory_minimal=True)
+    required = rank._memory_check(shared).estimated_required_bytes
+    available = iter(
+        (required - 1, required + 1, required - 1, required - 1)
+        if stage == "exact"
+        else (required - 1, required - 1)
+    )
+    monkeypatch.setattr(rank, "_available_memory_bytes", lambda: next(available))
+    modes: list[bool] = []
+    original_plan = rank._plan_flat_forward
+
+    def plan(requests, **kwargs):
+        modes.append(kwargs.get("memory_minimal", False))
+        return original_plan(requests, **kwargs)
+
+    original_error = RuntimeError("The split ladder owns the subsequent refusal")
+
+    def find(*args, **kwargs):
+        raise original_error
+
+    monkeypatch.setattr(rank, "_plan_flat_forward", plan)
+    monkeypatch.setattr(rank, "_find_admissible_forward", find)
+    with pytest.raises(RuntimeError) as caught:
+        rank._select_next_micro_batch([inputs], 0)
+    assert caught.value is original_error
+    assert modes == [True]
+    assert next(available, None) is None
+
+
+def test_minimum_wave_empty_dp_rank_keeps_collective_check_sequence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rank = TrainerRank(_attention_runtime())
+    monkeypatch.setattr(rank, "_dp_rank_and_size", lambda: (1, 2))
+    peer_required = iter((82, 42, 82, 42))
+    local_checks: list[tuple[int, bool]] = []
+
+    def check(required: int, *, sync_across_dp: bool = False) -> _MemoryCheck:
+        local_checks.append((required, sync_across_dp))
+        remote = next(peer_required)
+        return _MemoryCheck(remote, 60, remote <= 60)
+
+    monkeypatch.setattr(rank, "_memory_check_required", check)
+    candidate = rank._select_next_micro_batch([[_target_request(_tokens(1, 2))]], 0)
+
+    assert candidate.indices == ()
+    assert candidate.plan.packed_tokens == 0
+    assert candidate.check == _MemoryCheck(42, 60, True)
+    assert local_checks == [(0, True)] * 4
+    assert next(peer_required, None) is None
+
+
 def test_profiled_steady_state_keeps_the_wide_shared_wave(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
