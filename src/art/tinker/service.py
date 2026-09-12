@@ -249,17 +249,17 @@ class TinkerService:
         assert config is not None, "Tinker args are required"
         service_client = tinker.ServiceClient()
         rest_client = service_client.create_rest_client()
+        training_client_args = dict(config.get("training_client_args", {}))
         checkpoint_dir = self._get_last_checkpoint_dir()
         if checkpoint_dir:
             info = yaml.safe_load(open(checkpoint_dir / "info.yaml", "r"))
             with log_timing("Creating Tinker training client from checkpoint"):
                 training_client = await service_client.create_training_client_from_state_with_optimizer_async(
                     path=info["state_with_optimizer_path"],
-                    user_metadata=config.get("user_metadata", None),
+                    user_metadata=training_client_args.get("user_metadata"),
                 )
         else:
             with log_timing("Creating Tinker training client"):
-                training_client_args = config.get("training_client_args", {})
                 if "rank" not in training_client_args:
                     training_client_args["rank"] = 8
                 if "train_unembed" not in training_client_args:
