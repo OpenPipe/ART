@@ -1205,7 +1205,7 @@ def _configure_moe_dispatcher_caches(model: Sequence[torch.nn.Module]) -> None:
 def _moe_output_bytes_per_token(
     model: Sequence[torch.nn.Module], shape: ParallelShape
 ) -> int:
-    """Known FC2 output pair, not a bound on the complete live working set."""
+    """Known eager FC2 input/outputs, not the complete or compiled working set."""
     if shape != ParallelShape(tp=1, cp=1):
         return 0
     from megatron.core.extensions.transformer_engine import TERowParallelGroupedLinear
@@ -1274,9 +1274,23 @@ def _moe_output_bytes_per_token(
                 or getattr(layer.router, "topk", None) != config.moe_router_topk
             ):
                 return 0
+            features = 2 * fc2.out_features
+            inputs = getattr(lora, "A_T", None)
+            if (
+                isinstance(inputs, torch.Tensor)
+                and inputs.ndim == weights.ndim == 3
+                and inputs.dtype == weights.dtype
+                and inputs.shape[0] == weights.shape[0]
+                and inputs.shape[-1] == weights.shape[-2]
+                and inputs.shape[-2] > 0
+            ):
+                # Eager FC2 keeps x, base_out and adapter_out while producing
+                # their sum. Compilers may reuse storage; other workspace is
+                # not covered. Unknown input metadata keeps the prior pair.
+                features = inputs.shape[-2] + 3 * fc2.out_features
             coefficient = max(
                 coefficient,
-                2 * config.moe_router_topk * fc2.out_features * weights.element_size(),
+                config.moe_router_topk * features * weights.element_size(),
             )
     return coefficient
 
@@ -4811,7 +4825,7 @@ class TrainerRank:
             * activation_factor
         )
         # Groups execute sequentially: summed packed rows conservatively bound
-        # this output-pair component, not simultaneous workspace or retained graphs.
+        # this FC2 component, not all workspace or retained graphs.
         static_compute = max(
             static_compute, packed_tokens * self._moe_output_bytes_per_token
         )
