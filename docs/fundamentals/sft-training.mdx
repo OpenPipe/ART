@@ -142,6 +142,12 @@ async def main():
         api_key="your-api-key",
         base_url="https://openrouter.ai/api/v1",
     )
+    # Or point the teacher at OrcaRouter:
+    #
+    # teacher_client = AsyncOpenAI(
+    #     api_key=os.getenv("ORCAROUTER_API_KEY"),
+    #     base_url="https://api.orcarouter.ai/v1",
+    # )
     # Small models often produce malformed JSON or miss fields.
     # Distilling from a larger model teaches consistent structured extraction.
     system_prompt = "Extract {name, role, company} as JSON from the text. Return only valid JSON."
