@@ -3717,18 +3717,16 @@ class TrainerRank:
                         )
                         assert exact is not None
                         selected = exact
+                        # The minimum wave may execute cold after trust fails.
+                        # Keep its materialization paired with the retained check.
+                        layout_modes[width] = memory_minimal
                         if selected[0].fits and (
                             not profiled or trusted(selected[1], selected[3])
                         ):
-                            layout_modes[width] = memory_minimal
                             break
-                    else:
-                        # Nothing fit and trusted; keep the memory-minimal
-                        # pricing so the recorded failure is the monotone one.
-                        if not selected[0].fits:
-                            layout_modes.pop(width, None)
                 elif minimal_bound is not None:
                     selected = minimal_bound
+                    layout_modes[width] = True
                 if not selected[0].fits:
                     exact_failed_width = (
                         width
