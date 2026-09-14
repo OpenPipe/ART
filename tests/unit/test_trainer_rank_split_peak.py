@@ -51,8 +51,10 @@ def _requests(count=2, length=100):
 def _native_slot_fields(monkeypatch, rank):
     # Isolate other regressions from the separate CPU fallback test. These are
     # the native LoRASlotRef's two scalar fields, without importing Megatron.
-    slot = namedtuple("NativeSlotFields", "kind name")
-    monkeypatch.setattr(rank, "_slot_ref", lambda name: slot("checkpoint", name))
+    NativeSlotFields = namedtuple("NativeSlotFields", "kind name")
+    monkeypatch.setattr(
+        rank, "_slot_ref", lambda name: NativeSlotFields("checkpoint", name)
+    )
 
 
 def _split(rank, requests, chunks, *, memory_minimal=False):
@@ -176,7 +178,7 @@ def _counter_split(monkeypatch):
         retained_compute_bytes_per_token=0,
     )
     monkeypatch.setattr(rank, "_available_memory_bytes", lambda: 10_000)
-    counters = dict(allocated=100, peak=100, resets=[], executed=0)
+    counters: dict[str, Any] = dict(allocated=100, peak=100, resets=[], executed=0)
     monkeypatch.setattr(tr, "_telemetry_phase", lambda *a, **k: nullcontext())
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(torch.cuda, "synchronize", lambda _: None)
