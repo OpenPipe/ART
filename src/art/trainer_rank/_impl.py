@@ -1443,6 +1443,8 @@ class TrainerRank:
         self._hybridep_buffer_id: int | None = None
         self._hybridep_rows_high_water = 0
         self._memory_profiles: dict[_MemorySignature, _MemoryProfile] = {}
+        self._split_memory_floors: dict[bytes, int] = {}
+        self._split_memory_floor_status = "not_observed"
         self._last_global_micro_batch_size: int | None = None
         self._skipped_forward_waves: dict[object, tuple[int, int, int]] = {}
         # Bounded LRU: steady-state hits are temporally local (identical
@@ -2292,12 +2294,13 @@ class TrainerRank:
                     )
                 )
             else:
-                tracked_outputs = self._execute_admitted_plan(
-                    candidate.plan,
-                    check=candidate.check,
-                    context="forward_micro_batches",
+                tracked_outputs, memory_baseline, forward_peak = (
+                    self._execute_split_plan_with_memory_tracking(
+                        candidate.plan,
+                        check=candidate.check,
+                        context="forward_micro_batches",
+                    )
                 )
-                memory_baseline = None
             flat_outputs = iter(tracked_outputs)
             outputs = [_unflatten(item, flat_outputs) for item in candidate.inputs]
             stop = start + candidate.stats_global_count
@@ -2345,6 +2348,10 @@ class TrainerRank:
             # to the forward's return, already recorded for this same plan.
             if isinstance(candidate.plan, _FlatForwardPlan):
                 self._update_peak_memory_profile(candidate.plan, memory_baseline)
+            elif memory_baseline is not None:
+                self._record_split_memory_floor(
+                    candidate.plan, memory_baseline, forward_peak
+                )
             # Only the caller may retain completed outputs into the next wave.
             del tracked_outputs, flat_outputs, outputs
             start = stop
@@ -2432,14 +2439,27 @@ class TrainerRank:
                 plan, check=check, context=context
             )
             return outputs
+        outputs, _baseline, _peak = self._execute_split_plan_with_memory_tracking(
+            plan, check=check, context=context
+        )
+        return outputs
+
+    def _execute_split_plan_with_memory_tracking(
+        self, plan: _SplitForwardPlan, *, check: _MemoryCheck, context: str
+    ) -> tuple[list[AnyForwardOutput], int | None, int]:
+        baseline, peak = None, 0
         merged: list[AnyForwardOutput | None] = [None] * plan.request_count
         for ordinal, (subforward, indices) in enumerate(
             zip(plan.subforwards, plan.request_indices, strict=True)
         ):
             try:
-                outputs, _baseline = self._run_flat_plan_with_memory_tracking(
+                outputs, child_baseline = self._run_flat_plan_with_memory_tracking(
                     subforward, check=check, context=context
                 )
+                if child_baseline is not None:
+                    if baseline is None:
+                        baseline = child_baseline
+                    peak = max(peak, int(torch.cuda.max_memory_allocated(self.device)))
             except TrainerRankMemoryError as error:
                 # Model execution already began, so no replanning is possible
                 # and the caller must not mistake this for an up-front refusal.
@@ -2455,7 +2475,7 @@ class TrainerRank:
                 merged[index] = output
         if any(output is None for output in merged):
             raise AssertionError("split execution did not cover every request")
-        return cast(list[AnyForwardOutput], merged)
+        return cast(list[AnyForwardOutput], merged), baseline, peak
 
     def _plan_admissible_forward(
         self,
@@ -2610,27 +2630,176 @@ class TrainerRank:
                 for chunk in chunks
             ]
             costs = [self._plan_cost(plan) for plan in plans]
-            check = self._split_rung_check(costs)
+            # Bind original request mappings; floor keys normalize execution order.
+            order = sorted(range(len(plans)), key=lambda i: (-costs[i].ephemeral, i))
+            split = _SplitForwardPlan(
+                subforwards=tuple(plans[i] for i in order),
+                request_indices=tuple(tuple(chunks[i]) for i in order),
+                request_count=len(requests),
+            )
+            check = self._split_plan_memory_check(split, costs)
             if check.fits:
-                # Larger ephemeral first minimizes the running forward peak;
-                # ties keep chunk order, so the partition is deterministic.
-                order = sorted(
-                    range(len(plans)), key=lambda i: (-costs[i].ephemeral, i)
-                )
-                return (
-                    _SplitForwardPlan(
-                        subforwards=tuple(plans[i] for i in order),
-                        request_indices=tuple(tuple(chunks[i]) for i in order),
-                        request_count=len(requests),
-                    ),
-                    check,
-                )
+                return split, check
         return None, check
 
     def _split_rung_check(self, costs: Sequence[_SubforwardCost]) -> _MemoryCheck:
         return self._memory_check_required(
             sum(cost.retained for cost in costs) + max(cost.ephemeral for cost in costs)
         )
+
+    @staticmethod
+    def _split_memory_key(plan: _SplitForwardPlan) -> bytes | None:
+        # Bound traversal and hashing; retain only a digest, never tensor values,
+        # token tables or graphs. Oversized structural identities stay unlearned.
+        if len(plan.subforwards) > 1024:
+            return None
+        digest, remaining, nodes = (
+            hashlib.sha256(),
+            262144 - 32 * len(plan.subforwards),
+            65536,
+        )
+
+        def feed(value: Any) -> None:
+            nonlocal remaining, nodes
+            nodes -= 1
+            if nodes < 0:
+                raise ValueError("split key node cap")
+            if isinstance(value, tuple):
+                remaining -= 2
+                if remaining < 0:
+                    raise ValueError("split key byte cap")
+                feed(len(value))
+                digest.update(b"(")
+                for child in value:
+                    feed(child)
+                digest.update(b")")
+                return
+            if value is not None and type(value) not in (str, int, bool):
+                raise ValueError("unsupported split key field")
+            if isinstance(value, str) and len(value) > 4096:
+                raise ValueError("split key string cap")
+            if isinstance(value, int) and value.bit_length() > 64:
+                raise ValueError("split key integer cap")
+            encoded = repr(value).encode()
+            remaining -= len(encoded) + 1
+            if remaining < 0:
+                raise ValueError("split key byte cap")
+            digest.update(encoded + b";")
+
+        try:
+            feed((plan.request_count, len(plan.subforwards)))
+            outer, children = digest, []
+            for p, indices in zip(plan.subforwards, plan.request_indices, strict=True):
+                digest = hashlib.sha256()
+                signature = p.signature
+                feed(
+                    (
+                        indices,
+                        signature.topology,
+                        signature.planner_coefficients,
+                        signature.slot_group_count,
+                        signature.request_mix,
+                        signature.grad_enabled,
+                        signature.grad_modes,
+                        p.packed_tokens,
+                        p.logical_tokens,
+                        p.inactive_logical_tokens,
+                        p.output_bytes,
+                        p.output_metadata,
+                        p.selected_max_depth,
+                        len(p.groups),
+                    )
+                )
+                for g in p.groups:
+                    slot = (
+                        None
+                        if g.slot_ref is None
+                        else ("checkpoint", g.slot_ref.name)
+                        if isinstance(g.slot_ref, _LocalLoRASlotRef)
+                        else (g.slot_ref.kind, g.slot_ref.name)
+                    )
+                    feed(
+                        (
+                            slot,
+                            g.grad_enabled,
+                            g.request_indices,
+                            len(g.packed.segments),
+                        )
+                    )
+                    for segment in g.packed.segments:
+                        feed(
+                            (
+                                segment.sequence_indices,
+                                segment.start,
+                                segment.end,
+                                segment.packed_start,
+                                segment.group_id,
+                                segment.parent_id,
+                            )
+                        )
+                    feed(len(g.items))
+                    for item in g.items:
+                        feed(
+                            (
+                                tuple(item.input_ids.shape),
+                                str(item.input_ids.dtype),
+                                None
+                                if item.labels is None
+                                else (tuple(item.labels.shape), str(item.labels.dtype)),
+                                item.request.top_k,
+                                item.request.logits,
+                                item.request.hidden_states,
+                            )
+                        )
+                children.append(digest.digest())
+        except ValueError:
+            return None
+        # Cost/profile updates may reorder the same children. Each digest still
+        # binds its original request mapping/partition; retain the observed max
+        # across execution orders, not an unmeasured bound for every order.
+        outer.update(b"".join(sorted(children)))
+        return outer.digest()
+
+    def _record_split_memory_floor(
+        self, plan: _SplitForwardPlan, baseline: int, forward_peak: int
+    ) -> None:
+        # Only normal caller completion learns a floor; child retained profiles
+        # stay forward-only. Keep earlier child peaks despite their later resets.
+        key = self._split_memory_key(plan)
+        if key is None:
+            self._split_memory_floor_status = "unsupported_key"
+            return
+        if (
+            key not in self._split_memory_floors
+            and len(self._split_memory_floors) >= 1024
+        ):
+            self._split_memory_floor_status = "cache_full_not_learned"
+            return
+        observed = max(
+            0,
+            max(forward_peak, int(torch.cuda.max_memory_allocated(self.device)))
+            - baseline,
+        )
+        self._split_memory_floors[key] = max(
+            self._split_memory_floors.get(key, 0), observed
+        )
+        self._split_memory_floor_status = "recorded"
+
+    def _split_plan_memory_check(
+        self, plan: _SplitForwardPlan, costs: Sequence[_SubforwardCost]
+    ) -> _MemoryCheck:
+        required = sum(cost.retained for cost in costs) + max(
+            cost.ephemeral for cost in costs
+        )
+        key = self._split_memory_key(plan)
+        empirical = (
+            0
+            if key is None
+            else int(self._split_memory_floors.get(key, 0) * _MEMORY_SAFETY_FACTOR)
+        )
+        # Same existing reduction order and count; never reduce while returning
+        # from caller work, where a failed/empty peer may not participate.
+        return self._memory_check_required(max(required, empirical))
 
     def _split_chunk_lower_cost(
         self,

@@ -939,6 +939,7 @@ def test_micro_batch_refusal_replaces_previous_admission_telemetry(
 @dataclass(frozen=True)
 class _SlotRef:
     name: str | None
+    kind: str = "checkpoint"
 
 
 def test_split_subforwards_track_independent_slot_graphs(
