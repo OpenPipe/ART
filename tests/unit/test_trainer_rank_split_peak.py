@@ -164,7 +164,7 @@ def test_profile_order_change_cannot_drop_completed_split_floor(monkeypatch):
     assert rank._memory_profiles == before
 
 
-def test_completed_iterator_preserves_caller_peak_for_next_admission(monkeypatch):
+def _counter_split(monkeypatch):
     rank = _rank()
     monkeypatch.setattr(rank, "_dp_rank_and_size", lambda: (0, 1))
     _native_slot_fields(monkeypatch, rank)
@@ -189,6 +189,9 @@ def test_completed_iterator_preserves_caller_peak_for_next_admission(monkeypatch
 
     def execute(plan):
         counters["executed"] += 1
+        if counters["executed"] == counters.get("fail_at"):
+            counters["profiles_before_failure"] = dict(rank._memory_profiles)
+            raise counters["error"]
         counters["peak"] = counters["allocated"] + 8_000
         counters["allocated"] += 500
         return [
@@ -199,6 +202,11 @@ def test_completed_iterator_preserves_caller_peak_for_next_admission(monkeypatch
     monkeypatch.setattr(torch.cuda, "reset_peak_memory_stats", reset)
     monkeypatch.setattr(rank, "_execute_flat_plan", execute)
     rank.device = torch.device("cuda")  # Only injected counters; no CUDA tensors.
+    return rank, requests, counters
+
+
+def test_completed_iterator_preserves_caller_peak_for_next_admission(monkeypatch):
+    rank, requests, counters = _counter_split(monkeypatch)
     iterator = rank.forward_micro_batches([requests], yield_empty=True)
     batch = next(iterator)
     assert batch.stats.subforward_count == counters["executed"] == 2
@@ -212,6 +220,43 @@ def test_completed_iterator_preserves_caller_peak_for_next_admission(monkeypatch
     with pytest.raises(tr.TrainerRankMemoryError):
         next(rank.forward_micro_batches([requests], yield_empty=True))
     assert counters["executed"] == 2
+
+
+@pytest.mark.parametrize("termination", ["throw", "close"])
+def test_incomplete_caller_does_not_learn_split_peak(monkeypatch, termination):
+    rank, requests, counters = _counter_split(monkeypatch)
+    iterator = rank.forward_micro_batches([requests], yield_empty=True)
+    batch = next(iterator)
+    assert batch.stats.subforward_count == counters["executed"] == 2
+    children = dict(rank._memory_profiles)
+    counters["peak"] = 21_000
+    if termination == "throw":
+        original = RuntimeError("caller failed after partial work")
+        with pytest.raises(RuntimeError) as caught:
+            iterator.throw(original)
+        assert caught.value is original
+    else:
+        assert iterator.close() is None
+    assert list(iterator) == []
+    assert rank._split_memory_floors == {}
+    assert rank._memory_profiles == children
+    assert counters["executed"] == 2
+
+
+def test_partial_forward_does_not_learn_split_peak(monkeypatch):
+    rank, requests, counters = _counter_split(monkeypatch)
+    original = torch.cuda.OutOfMemoryError("second split child allocation")
+    counters.update(fail_at=2, error=original)
+    iterator = rank.forward_micro_batches([requests], yield_empty=True)
+    with pytest.raises(tr.TrainerRankPartialExecutionError) as caught:
+        next(iterator)
+    assert "1 of 2 completed" in str(caught.value)
+    assert isinstance(caught.value.__cause__, tr.TrainerRankMemoryError)
+    assert caught.value.__cause__.__cause__ is original
+    assert list(iterator) == []
+    assert counters["executed"] == 2
+    assert rank._split_memory_floors == {}
+    assert rank._memory_profiles == counters["profiles_before_failure"]
 
 
 def test_empty_dp_rank_retains_global_selection_collective_sequence(monkeypatch):
