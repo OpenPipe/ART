@@ -2670,23 +2670,6 @@ class TrainerRank:
             logical_tokens=logical_tokens,
         )
         profile = self._memory_profiles.get(signature)
-        if profile is not None:
-            cap = profile.packed_tokens * _MEMORY_PROFILE_TRUST_GROWTH
-            if packed_tokens <= cap < unshared_packed_tokens:
-                # Required cost can drop when a larger layout leaves the
-                # profile window. Cold cost grows with packed tokens, so its
-                # first integer count bounds every possible post-cap layout,
-                # even when TP padding makes that count itself unattainable.
-                cold = self._subforward_cost(
-                    packed_tokens=cap + 1,
-                    output_bytes=output_bytes,
-                    signature=signature,
-                    logical_tokens=logical_tokens,
-                )
-                cost = _SubforwardCost(
-                    required=min(cost.required, cold.required),
-                    retained=min(cost.retained, cold.retained),
-                )
         if (
             profile is not None
             and profile.retained_compute_bytes_per_token is not None
