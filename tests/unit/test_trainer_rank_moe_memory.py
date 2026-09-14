@@ -233,7 +233,7 @@ def test_topk_not_expert_count_controls_envelope(layer):
     assert _moe_output_bytes_per_token([layer], shape) == old // 2
 
 
-def test_profiles_outputs_trust_and_empty_plan_unchanged():
+def test_profiles_outputs_and_empty_plan_preserve_empirical_floor():
     rank = _rank()
     signature = _signature()
     assert rank._moe_output_bytes_per_token == 0
@@ -248,12 +248,12 @@ def test_profiles_outputs_trust_and_empty_plan_unchanged():
         packed_tokens=100,
         logical_per_packed=1,
     )
-    for tokens in (100, 800):
+    for tokens in (100, 800, 801):
         assert estimate(
             packed_tokens=tokens, output_bytes=123, signature=signature
         ) == int((tokens * 100000 + 123) * 1.1)
-    assert estimate(packed_tokens=801, output_bytes=123, signature=signature) == int(
-        (801 * 65536 + 123) * 1.1
+    assert not rank._all_ranks_have_memory_profile(
+        packed_tokens=801, signature=signature
     )
     assert estimate(
         packed_tokens=100, logical_tokens=200, output_bytes=123, signature=signature

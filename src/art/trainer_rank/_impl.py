@@ -4860,10 +4860,10 @@ class TrainerRank:
             profiled_tokens = max(
                 packed_tokens, logical_tokens / profiled.logical_per_packed
             )
-        if (
-            profiled is None
-            or profiled.packed_tokens * _MEMORY_PROFILE_TRUST_GROWTH < packed_tokens
-        ):
+        # The trust window limits calibration growth, not the empirical floor.
+        # Dropping that floor beyond the window can admit a larger request that
+        # was refused just inside it, even below a previously observed peak.
+        if profiled is None:
             compute = static_compute
         else:
             compute = max(
