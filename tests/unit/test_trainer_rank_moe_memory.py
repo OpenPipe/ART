@@ -382,3 +382,77 @@ def test_memory_check_preserves_collective_order(monkeypatch):
         (float(estimate), impl.dist.ReduceOp.MAX, group),
         (6_800_000_000.0, impl.dist.ReduceOp.MIN, group),
     ]
+
+
+def _enclosing_moe(layer):
+    from art.megatron.lora import MLPExpertsLinearFC1LoRA
+
+    fc1 = MLPExpertsLinearFC1LoRA.__new__(MLPExpertsLinearFC1LoRA)
+    torch.nn.Module.__init__(fc1)
+    fc1.fused_gate_up = True
+    fc1.non_gated = False
+    fc1.out_features = 1024
+    layer.experts.linear_fc1 = fc1
+    layer.experts.offload_expert_fc1 = False
+    layer.experts.offload_moe_act = False
+    layer.experts.activation_recompute = False
+    layer.token_dispatcher.ep_size = 1
+    layer.token_dispatcher.tp_size = 1
+    layer.token_dispatcher.num_local_experts = 256
+    layer.config.moe_permute_fusion = True
+    return layer
+
+
+def test_compiled_moe_retained_inputs_cold_floor(layer):
+    # Three complete intervals in a retained native trace have these seven
+    # distinct storages live together. Their sum is not the whole-model peak.
+    rank = _rank(_enclosing_moe(layer))
+    rows, hidden, intermediate = 45_981 * 8, 2048, 512
+    widths = (hidden, hidden, 2 * intermediate, intermediate, hidden, hidden, hidden)
+    storages = [
+        torch.empty(rows, width, dtype=torch.bfloat16, device="meta")
+        for width in widths
+    ]
+    assert len({tensor.untyped_storage()._cdata for tensor in storages}) == 7
+    observed_component_bytes = sum(
+        tensor.untyped_storage().nbytes() for tensor in storages
+    )
+    assert observed_component_bytes == 8_663_556_096
+    assert rank._moe_output_bytes_per_token * 45_981 == observed_component_bytes
+    for no_grad in (False, True):
+        signature = replace(
+            _signature(), grad_enabled=not no_grad, grad_modes=(not no_grad,)
+        )
+        assert rank._estimate_required_memory_bytes_from_values(
+            packed_tokens=45_981, output_bytes=0, signature=signature
+        ) == int(observed_component_bytes * 1.1)
+
+
+@pytest.mark.parametrize(
+    "site,attribute,value",
+    [
+        ("dispatcher", "ep_size", 2),
+        ("dispatcher", "tp_size", 2),
+        ("dispatcher", "num_local_experts", 1),
+        ("config", "moe_permute_fusion", False),
+        ("experts", "offload_expert_fc1", True),
+        ("experts", "offload_moe_act", True),
+        ("experts", "activation_recompute", True),
+        ("fc1", "fused_gate_up", False),
+        ("fc1", "non_gated", True),
+        ("fc1", "out_features", 2048),
+        ("fc1", "forward", lambda *args: None),
+    ],
+)
+def test_unknown_enclosing_lifetimes_keep_previous_fc2_floor(
+    layer, site, attribute, value
+):
+    _enclosing_moe(layer)
+    sites = {
+        "dispatcher": layer.token_dispatcher,
+        "config": layer.config,
+        "experts": layer.experts,
+        "fc1": layer.experts.linear_fc1,
+    }
+    setattr(sites[site], attribute, value)
+    assert _moe_output_bytes_per_token([layer], ParallelShape(tp=1, cp=1)) == 106_496
