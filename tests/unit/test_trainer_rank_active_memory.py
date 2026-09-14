@@ -167,6 +167,16 @@ def test_warm_admission_rechecks_current_residency(monkeypatch):
     )
     monkeypatch.setattr(torch.cuda, "memory_allocated", lambda _: state["allocated"])
     monkeypatch.setattr(torch.cuda, "memory_reserved", lambda _: state["reserved"])
+    monkeypatch.setattr(torch.cuda, "get_allocator_backend", lambda: "native")
+    monkeypatch.setattr(
+        torch.cuda,
+        "memory_stats",
+        lambda _: {
+            "allocated_bytes.all.current": state["allocated"],
+            "active_bytes.all.current": state["allocated"],
+            "reserved_bytes.all.current": state["reserved"],
+        },
+    )
     monkeypatch.delenv("ART_TRAINER_RANK_TEST_HOOKS", raising=False)
     # Fresh memory accounting observes newly resident state without discarding
     # a valid incremental profile; cached free blocks remain reusable.
