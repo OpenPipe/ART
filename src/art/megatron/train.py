@@ -911,6 +911,7 @@ def execute_megatron_sft_job(
                     runtime.optimizer_snapshot_barrier.wait_before_mutation
                 ),
             )
+            _validate_train_step_result_finite(runtime, step_result)
             elapsed = time.perf_counter() - started
             final_metrics = {
                 "loss/train": float(step_result.reduced_loss.item()),

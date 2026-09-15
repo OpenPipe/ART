@@ -401,6 +401,7 @@ def _prefix_tree_pack_rows(
     seq_len: int,
     pack_results: bool,
     min_shared_segment_length: int,
+    rebuild_rows: bool = True,
 ) -> list[tuple[list[_Sequence], _PrefixTreeRowPlan]]:
     if not items:
         return []
@@ -461,6 +462,9 @@ def _prefix_tree_pack_rows(
                 "Global prefix-tree occupancy disagrees with final bin plan: "
                 f"occupancy={packed_bin.token_count}, plan={occupancy_plan.length}"
             )
+        if not rebuild_rows:
+            planned_rows.append((row, occupancy_plan))
+            continue
         # Rebuild only after placement so bin-local paths compress without putting
         # repeated tree construction in the best-fit search.
         plan = _prefix_tree_row_plan(

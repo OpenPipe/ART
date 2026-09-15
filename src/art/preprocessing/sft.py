@@ -51,6 +51,9 @@ def pack_sft_batch(
         seq_len=seq_len,
         pack_results=True,
         min_shared_segment_length=DEFAULT_MIN_PREFIX_TREE_SHARED_SEGMENT_LENGTH,
+        # Rebuilding can change sharing at unequal supervision boundaries and
+        # exceed the admitted capacity. Keep the already compacted bin geometry.
+        rebuild_rows=False,
     ):
         fields = {
             name: np.empty((1, plan.length), dtype=np.int64)

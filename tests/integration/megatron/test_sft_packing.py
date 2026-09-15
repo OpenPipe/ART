@@ -43,15 +43,29 @@ def test_sft_packing_preserves_training_targets():
     from art.megatron.prefix_tree import parse_prefix_tree
     from art.preprocessing.sft import pack_sft_batch
 
-    for last_only in (False, True):
-        examples = _examples(last_only)
+    cases = [_examples(False), _examples(True)]
+    unequal = []
+    for index, (length, first_target) in enumerate(
+        ((87, 87), (116, 72), (124, 88), (275, 244), (250, 148))
+    ):
+        tokens = torch.arange(length)[None]
+        tokens[:, 64 if index == 0 else 128 :] += (index + 1) * 1000
+        labels = tokens.clone()
+        labels[:, :first_target] = -100
+        unequal.append(
+            dict(
+                input_ids=tokens, labels=labels, attention_mask=torch.ones_like(tokens)
+            )
+        )
+    cases.append(unequal)
+    for examples in cases:
         expected = Counter(
             (tuple(example["input_ids"][0, :index].tolist()), int(label))
             for example in examples
             for index, label in enumerate(example["labels"][0])
             if index > 0 and label != -100
         )
-        for capacity in (384, 1024):
+        for capacity in (384, 512, 1024):
             actual = Counter()
             for row in pack_sft_batch(examples, seq_len=capacity):
                 (tree,) = parse_prefix_tree(
@@ -145,6 +159,8 @@ def test_sft_packing_loss_and_gradients():
     torch.set_num_threads(4)
     torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", "0")))
     os.environ.setdefault("ART_MEGATRON_LORA_RANK", "8")
+    for axis in ("TENSOR_MODEL", "CONTEXT", "PIPELINE_MODEL", "EXPERT_MODEL"):
+        os.environ.setdefault(f"ART_MEGATRON_{axis}_PARALLEL_SIZE", "1")
     os.environ.setdefault(
         "ART_MEGATRON_LORA_TARGET_MODULES", '["q_proj","k_proj","v_proj","o_proj"]'
     )
@@ -200,6 +216,12 @@ def test_sft_packing_loss_and_gradients():
                             parameter.normal_(std=0.02)
             assert runtime.optimizer is not None
             runtime.optimizer.reload_model_params()
+            router_biases = [
+                (buffer, buffer.clone())
+                for model in runtime.model
+                for name, buffer in model.named_buffers()
+                if name.endswith("expert_bias")
+            ]
             rows = []
             for last_only in (False, True):
                 examples = _examples(last_only)
@@ -223,6 +245,8 @@ def test_sft_packing_loss_and_gradients():
                             max_gradient_mape=max(errors.values()),
                         )
                     )
+            for buffer, initial in router_biases:
+                torch.testing.assert_close(buffer, initial, rtol=0, atol=0)
             print(json.dumps(rows), flush=True)
             if output := os.environ.get("ART_SFT_TEST_REPORT"):
                 Path(output).with_suffix(
