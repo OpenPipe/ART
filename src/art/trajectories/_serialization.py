@@ -31,6 +31,8 @@ def _without_pickle_string_interning():
 class _StringInterningModel(BaseModel):
     """Intern strings once, immediately before this graph is pickled."""
 
+    model_config = pydantic.ConfigDict(ser_json_inf_nan="strings")
+
     # Process-local optimization state: omitting it from Pydantic private state keeps
     # equality and serialization unchanged, and lets a receiving process prepare the
     # graph again after local mutation.
