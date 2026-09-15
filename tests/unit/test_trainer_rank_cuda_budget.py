@@ -41,36 +41,37 @@ def budget(monkeypatch):
     return rank, stats
 
 
-@pytest.mark.parametrize("active,available", [(10, 140), (30, 120), (80, 70)])
-def test_native_pending_is_not_reusable_credit(budget, active, available):
+@pytest.mark.parametrize("active", [10, 30, 80])
+def test_native_cache_and_pending_are_not_physical_credit(budget, active):
     rank, stats = budget
     stats["active_bytes.all.current"] = active
-    assert rank._available_memory_bytes() == available
-    torch.cuda.memory_stats.assert_called_once_with(rank.device)
-    torch.cuda.memory_allocated.assert_not_called()
-    torch.cuda.memory_reserved.assert_not_called()
+    assert rank._available_memory_bytes() == 70
+    cast(Mock, torch.cuda.memory_stats).assert_not_called()
+    cast(Mock, torch.cuda.memory_allocated).assert_called_once_with(rank.device)
+    cast(Mock, torch.cuda.memory_reserved).assert_not_called()
 
 
-def test_pending_credit_changes_admission_before_execution(budget):
+def test_reclaimable_cache_does_not_make_progress_without_physical_free(budget):
     rank, stats = budget
     check = rank._memory_check_required(130)
-    assert check.available_bytes == 120
+    assert check.available_bytes == 70
     assert not check.fits
     # Normal allocator collection can later make the same bytes inactive.
     # The budget itself neither polls events nor forces collection.
     stats["active_bytes.all.current"] = 10
-    assert rank._memory_check_required(130).fits
+    assert not rank._memory_check_required(130).fits
+    assert rank._memory_check_required(70).fits
 
 
-def test_split_and_private_credit_remain_explicit_residuals(budget):
+def test_split_and_private_cache_do_not_inflate_physical_sample(budget):
     rank, stats = budget
     stats["active_bytes.all.current"] = 10
     stats["inactive_split_bytes.all.current"] = 70
-    assert rank._available_memory_bytes() == 140
+    assert rank._available_memory_bytes() == 70
     stats["inactive_split_bytes.all.current"] = 0
     # A whole inactive retained private pool has this same scalar geometry.
-    # This partial correction does not establish pool compatibility.
-    assert rank._available_memory_bytes() == 140
+    # Neither layout can become physical reserve through accounting.
+    assert rank._available_memory_bytes() == 70
 
 
 @pytest.mark.parametrize(
@@ -96,7 +97,7 @@ def test_incomplete_native_counters_grant_no_cache_credit(budget, field, value):
     else:
         stats[key] = value
     assert rank._available_memory_bytes() == 70
-    torch.cuda.memory_allocated.assert_called_once_with(rank.device)
+    cast(Mock, torch.cuda.memory_allocated).assert_called_once_with(rank.device)
 
 
 @pytest.mark.parametrize("backend", ["cudaMallocAsync", "unrecognized"])
@@ -104,9 +105,9 @@ def test_other_backends_retain_legacy_unqualified_credit(budget, monkeypatch, ba
     rank, _ = budget
     monkeypatch.setattr(torch.cuda, "get_allocator_backend", lambda: backend)
     assert rank._available_memory_bytes() == 140
-    torch.cuda.memory_stats.assert_not_called()
-    torch.cuda.memory_allocated.assert_called_once_with(rank.device)
-    torch.cuda.memory_reserved.assert_called_once_with(rank.device)
+    cast(Mock, torch.cuda.memory_stats).assert_not_called()
+    cast(Mock, torch.cuda.memory_allocated).assert_called_once_with(rank.device)
+    cast(Mock, torch.cuda.memory_reserved).assert_called_once_with(rank.device)
 
 
 @pytest.mark.parametrize("missing", [False, True])
@@ -120,17 +121,25 @@ def test_existing_test_limit_stays_relative_to_allocated(budget, monkeypatch, mi
     monkeypatch.setenv(_impl._TEST_MEMORY_LIMIT_ENV, "5")
     assert rank._available_memory_bytes() == 0
     monkeypatch.setenv("ART_TRAINER_RANK_TEST_HOOKS", "0")
-    assert rank._available_memory_bytes() == (70 if missing else 120)
+    assert rank._available_memory_bytes() == 70
+    monkeypatch.setenv("ART_TRAINER_RANK_TEST_HOOKS", "1")
+    monkeypatch.setenv(_impl._TEST_MEMORY_LIMIT_ENV, "10000")
+    assert rank._available_memory_bytes() == 70
 
 
 @pytest.mark.parametrize(
-    "api", ["mem_get_info", "get_allocator_backend", "memory_stats"]
+    "api", ["mem_get_info", "get_allocator_backend", "memory_allocated"]
 )
-def test_actual_api_error_identity_is_not_swallowed(budget, monkeypatch, api):
+@pytest.mark.parametrize(
+    "error_type", [RuntimeError, KeyboardInterrupt, SystemExit, asyncio.CancelledError]
+)
+def test_actual_api_error_identity_is_not_swallowed(
+    budget, monkeypatch, api, error_type
+):
     rank, _ = budget
-    error = RuntimeError("native API failed")
+    error = error_type("native API failed")
     monkeypatch.setattr(torch.cuda, api, Mock(side_effect=error))
-    with pytest.raises(RuntimeError) as caught:
+    with pytest.raises(error_type) as caught:
         rank._available_memory_bytes()
     assert caught.value is error
 
@@ -152,10 +161,14 @@ def test_cpu_budget_avoids_all_new_cuda_api_calls(budget, monkeypatch):
         torch.cuda, "get_allocator_backend", Mock(side_effect=AssertionError)
     )
     assert rank._available_memory_bytes() == 1 << 60
-    torch.cuda.memory_stats.assert_not_called()
+    cast(Mock, torch.cuda.memory_stats).assert_not_called()
 
 
-def test_required_max_then_available_min_collectives_unchanged(budget, monkeypatch):
+@pytest.mark.parametrize("sync_across_dp", [False, True])
+@pytest.mark.parametrize("required", [0, 130])
+def test_required_max_then_available_min_collectives_unchanged(
+    budget, monkeypatch, sync_across_dp, required
+):
     rank, _ = budget
     monkeypatch.setattr(_impl.dist, "is_available", lambda: True)
     monkeypatch.setattr(_impl.dist, "is_initialized", lambda: True)
@@ -169,19 +182,55 @@ def test_required_max_then_available_min_collectives_unchanged(budget, monkeypat
 
     def reduce(value, op, group):
         calls.append((float(value.item()), op, group))
-        value.fill_(150 if op == _impl.dist.ReduceOp.MAX else 110)
+        value.fill_(150 if op == _impl.dist.ReduceOp.MAX else 60)
 
     monkeypatch.setattr(_impl.dist, "all_reduce", reduce)
-    check = rank._memory_check_required(130)
+    check = rank._memory_check_required(required, sync_across_dp=sync_across_dp)
+    expected_group = None if sync_across_dp else group
     assert calls == [
-        (130, _impl.dist.ReduceOp.MAX, group),
-        (120, _impl.dist.ReduceOp.MIN, group),
+        (required, _impl.dist.ReduceOp.MAX, expected_group),
+        (70, _impl.dist.ReduceOp.MIN, expected_group),
     ]
     assert (check.estimated_required_bytes, check.available_bytes, check.fits) == (
         150,
-        110,
+        60,
         False,
     )
+
+
+def test_oom_preserves_admission_and_original_cause_after_free_changes(
+    budget, monkeypatch
+):
+    rank, _ = budget
+    free = [100]
+    read = Mock(side_effect=lambda _: (free[0], 1000))
+    monkeypatch.setattr(torch.cuda, "mem_get_info", read)
+    admitted = rank._memory_check_required(50)
+    assert admitted.fits and admitted.available_bytes == 70
+    original = torch.cuda.OutOfMemoryError("later allocation")
+
+    def execute(_):
+        free[0] = 10
+        raise original
+
+    monkeypatch.setattr(rank, "_execute_flat_plan", execute)
+    monkeypatch.setattr(rank, "_telemetry_signature", lambda _: {})
+    monkeypatch.setattr(rank, "_telemetry_plan_signature", lambda _: {})
+    monkeypatch.setattr(_impl, "_telemetry_phase", lambda *a, **k: nullcontext())
+    monkeypatch.setattr(torch.cuda, "synchronize", Mock())
+    monkeypatch.setattr(torch.cuda, "reset_peak_memory_stats", Mock())
+    plan = SimpleNamespace(packed_tokens=1, logical_tokens=1)
+    with pytest.raises(_impl.TrainerRankMemoryError) as caught:
+        rank._run_flat_plan_with_memory_tracking(
+            plan, check=admitted, context="physical-free CPU witness"
+        )
+    assert caught.value.__cause__ is original
+    assert caught.value.usable_limit_bytes == admitted.available_bytes == 70
+    read.assert_called_once_with(rank.device)
+    # A separate later sample is zero. It cannot rewrite the admitted check or
+    # imply that the previous physical sample reserved bytes through execution.
+    assert rank._available_memory_bytes() == 0
+    assert admitted.available_bytes == 70
 
 
 @pytest.mark.parametrize("failed_locally", [False, True])
@@ -332,11 +381,14 @@ def test_final_selection_uses_pure_fresh_budget_and_original_demand(
             (_impl.dist.ReduceOp.MAX, 192, None),
             (_impl.dist.ReduceOp.MIN, available, None),
         ]
+        * (2 if available < 192 else 1)
         if distributed
         else []
     )
-    torch.cuda.empty_cache.assert_not_called()
-    torch.cuda.mem_get_info.assert_called_once_with(rank.device)
+    cast(Mock, torch.cuda.empty_cache).assert_not_called()
+    assert cast(Mock, torch.cuda.mem_get_info).call_count == (
+        2 if available < 192 else 1
+    )
 
 
 def test_available_sample_follows_required_collective(budget, monkeypatch):
@@ -371,7 +423,7 @@ def test_available_sample_follows_required_collective(budget, monkeypatch):
         False,
     )
     assert events == [_impl.dist.ReduceOp.MAX, "sample", _impl.dist.ReduceOp.MIN]
-    torch.cuda.empty_cache.assert_not_called()
+    cast(Mock, torch.cuda.empty_cache).assert_not_called()
 
 
 def test_execution_failure_retains_final_admission_without_resampling(
@@ -406,4 +458,4 @@ def test_execution_failure_retains_final_admission_without_resampling(
     assert caught.value.usable_limit_bytes == admitted.available_bytes == 70
     read.assert_called_once_with(rank.device)
     assert rank._available_memory_bytes() == 0
-    torch.cuda.empty_cache.assert_not_called()
+    cast(Mock, torch.cuda.empty_cache).assert_not_called()
