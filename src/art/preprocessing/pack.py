@@ -2,7 +2,7 @@ from collections.abc import Iterable, Sequence
 import os
 import random
 import time
-from typing import Any, Literal, NamedTuple, cast
+from typing import Any, Literal, NamedTuple, Protocol, TypeVar, cast
 
 import numpy as np
 import torch
@@ -26,6 +26,20 @@ from .moe_routing import (
 from .tokenize import TokenizedResult
 
 DEFAULT_MIN_PREFIX_TREE_SHARED_SEGMENT_LENGTH = 64
+
+
+class PrefixTreeSequence(Protocol):
+    @property
+    def token_ids(self) -> tuple[int, ...]: ...
+
+    @property
+    def shareable_length(self) -> int: ...
+
+    @property
+    def prompt_id(self) -> int: ...
+
+
+_Sequence = TypeVar("_Sequence", bound=PrefixTreeSequence)
 
 
 class PrefixTreePackingStats(TypedDict):
@@ -382,12 +396,12 @@ def prefix_tree_pack(
 
 
 def _prefix_tree_pack_rows(
-    items: list[_PrefixTreePackItem],
+    items: list[_Sequence],
     *,
     seq_len: int,
     pack_results: bool,
     min_shared_segment_length: int,
-) -> list[tuple[list[_PrefixTreePackItem], _PrefixTreeRowPlan]]:
+) -> list[tuple[list[_Sequence], _PrefixTreeRowPlan]]:
     if not items:
         return []
     if not pack_results:
@@ -669,7 +683,7 @@ def _first_trainable_token_index(
 
 
 def _prefix_tree_row_plan(
-    row: list[_PrefixTreePackItem],
+    row: Sequence[PrefixTreeSequence],
     *,
     seq_len: int,
     pack_results: bool,

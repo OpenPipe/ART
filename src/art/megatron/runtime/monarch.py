@@ -23,7 +23,12 @@ from art.distributed.specs import GpuId
 from art.utils.cache_dirs import configure_model_cache_env
 from art.utils.lifecycle import cleanup_after_failure, consume_future_exception
 
-from .data_plane import InMemoryPackedBatch, SFTBatchData
+from .data_plane import (
+    InMemoryPackedBatch,
+    PackedSFTBatchData,
+    SFTBatchData,
+    pack_sft_batches,
+)
 from .publication import (
     TRAINER_PUBLICATION_EVENT_ADAPTER,
     TrainerPublicationEvent,
@@ -583,7 +588,7 @@ class MonarchTrainerActor(Actor):
     def execute_sft(
         self,
         job_json: str,
-        batches: tuple[SFTBatchData, ...],
+        batches: tuple[PackedSFTBatchData, ...],
         event_port: Port[dict[str, Any]],
     ) -> dict[str, Any]:
         try:
@@ -1122,11 +1127,19 @@ class MonarchTrainerRun:
     async def train_sft(
         self, job: SFTJobSpec, batches: tuple[SFTBatchData, ...]
     ) -> AsyncIterator[TrainEvent]:
+        async def dispatch(port: Port[dict[str, Any]]) -> Any:
+            packed = await asyncio.to_thread(
+                pack_sft_batches,
+                batches,
+                seq_len=self.runtime_spec.packed_sequence_length,
+            )
+            return await self._actors.execute_sft.call(
+                job.model_dump_json(), packed, port
+            )
+
         async for event in self._train(
             job,
-            lambda port: self._actors.execute_sft.call(
-                job.model_dump_json(), batches, port
-            ),
+            dispatch,
             lambda: self._validate_sft(job, batches),
         ):
             yield event
