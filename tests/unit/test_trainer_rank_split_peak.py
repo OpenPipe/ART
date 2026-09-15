@@ -294,11 +294,21 @@ def test_empty_dp_rank_retains_global_selection_collective_sequence(monkeypatch)
             patch.setattr(rank, "_all_ranks_true", agree)
             patch.setattr(rank, "_all_ranks_have_memory_profile", profiled)
 
+            search = rank._search_next_micro_batch
+            search_finished = []
+
+            def searched(*args, **kwargs):
+                result = search(*args, **kwargs)
+                search_finished.append(True)
+                return result
+
+            patch.setattr(rank, "_search_next_micro_batch", searched)
+
             def reduce(value, op, group):
                 trace.append(("global" if group is None else "local", str(op)))
                 if group is None:
                     value.fill_(
-                        max(value.item(), 200)
+                        max(value.item(), 100 if search_finished else 200)
                         if op == tr.dist.ReduceOp.MAX
                         else min(value.item(), 100)
                     )
@@ -314,6 +324,10 @@ def test_empty_dp_rank_retains_global_selection_collective_sequence(monkeypatch)
                 tr._SplitForwardPlan if dp_rank == 0 else tr._FlatForwardPlan,
             )
             traces.append([event for event in trace if event[0] == "global"])
+            assert traces[-1][-2:] == [
+                ("global", str(tr.dist.ReduceOp.MAX)),
+                ("global", str(tr.dist.ReduceOp.MIN)),
+            ]
     assert traces[0] == traces[1]
 
 

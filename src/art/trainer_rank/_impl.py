@@ -3804,6 +3804,31 @@ class TrainerRank:
         *,
         checkpoint: AdapterSelection = Unset,
     ) -> _CandidateMicroBatch[ForwardInputsT]:
+        candidate = self._search_next_micro_batch(items, start, checkpoint=checkpoint)
+        # A later width check may observe less available memory.
+        # Do not return an earlier width's cached budget as the final admission.
+        check = self._memory_check_required(
+            candidate.check.estimated_required_bytes,
+            sync_across_dp=True,
+        )
+        if not check.fits:
+            self._snapshot_planning_telemetry(candidate.plan, check)
+            raise _memory_error(
+                context="forward_micro_batches",
+                message="selected microbatch exceeds freshly sampled available memory",
+                packed_tokens=candidate.plan.packed_tokens,
+                logical_tokens=candidate.plan.logical_tokens,
+                check=check,
+            )
+        return replace(candidate, check=check)
+
+    def _search_next_micro_batch(
+        self,
+        items: Sequence[ForwardInputsT],
+        start: int,
+        *,
+        checkpoint: AdapterSelection = Unset,
+    ) -> _CandidateMicroBatch[ForwardInputsT]:
         dp_rank, dp_size = self._dp_rank_and_size()
         remaining, min_width, granularity = _wave_geometry(len(items), start, dp_size)
         if min_width <= 0:
@@ -4005,12 +4030,27 @@ class TrainerRank:
                 refusal_prefix = (
                     "smallest DP microbatch is predicted to exceed available memory"
                 )
-                found = self._find_admissible_forward(
-                    list(_flatten(local_inputs)),
-                    checkpoint=checkpoint,
-                    refusal_prefix=refusal_prefix,
-                )
-                agreed = self._all_ranks_true(not isinstance(found, _ForwardRefusal))
+                admission_error: BaseException | None = None
+                try:
+                    found = self._find_admissible_forward(
+                        list(_flatten(local_inputs)),
+                        checkpoint=checkpoint,
+                        refusal_prefix=refusal_prefix,
+                    )
+                except BaseException as exc:
+                    admission_error, found = exc, None
+                try:
+                    agreed = self._all_ranks_true(
+                        admission_error is None
+                        and not isinstance(found, _ForwardRefusal)
+                    )
+                except BaseException:
+                    if admission_error is not None:
+                        raise admission_error
+                    raise
+                if admission_error is not None:
+                    raise admission_error
+                assert found is not None
                 if isinstance(found, _ForwardRefusal):
                     self._snapshot_planning_telemetry(found.plan, found.check)
                     raise found.error("forward_micro_batches")
@@ -4020,7 +4060,8 @@ class TrainerRank:
                         context="forward_micro_batches",
                         message=(
                             f"{refusal_prefix} on another DP rank, which was "
-                            "unable to find a feasible split for its share"
+                            "unable to complete admission or find a feasible split "
+                            "for its share"
                         ),
                         packed_tokens=first.plan.packed_tokens,
                         logical_tokens=first.plan.logical_tokens,
@@ -4952,18 +4993,36 @@ class TrainerRank:
         *,
         sync_across_dp: bool = False,
     ) -> _MemoryCheck:
-        available = self._available_memory_bytes()
         if dist.is_available() and dist.is_initialized():
             group = None if sync_across_dp else self._forward_memory_group()
             values = torch.tensor(
-                [float(required), float(available)],
+                [float(required), 0.0],
                 device=self.device if self.device.type == "cuda" else "cpu",
                 dtype=torch.float64,
             )
             dist.all_reduce(values[0], op=dist.ReduceOp.MAX, group=group)
-            dist.all_reduce(values[1], op=dist.ReduceOp.MIN, group=group)
             required = int(values[0].item())
-            available = int(values[1].item())
+            error: BaseException | None = None
+            try:
+                available = self._available_memory_bytes()
+            except BaseException as exc:
+                error, available = exc, -1
+            try:
+                # A healthy communicator carries local failure to every peer
+                # in the existing MIN. This cannot repair a poisoned backend.
+                values[1] = available
+                dist.all_reduce(values[1], op=dist.ReduceOp.MIN, group=group)
+                available = int(values[1].item())
+            except BaseException:
+                if error is not None:
+                    raise error
+                raise
+            if error is not None:
+                raise error
+            if available < 0:
+                raise RuntimeError("Memory admission failed on another rank")
+        else:
+            available = self._available_memory_bytes()
         return _MemoryCheck(
             estimated_required_bytes=required,
             available_bytes=available,
