@@ -5028,9 +5028,29 @@ class TrainerRank:
         if not (torch.cuda.is_available() and self.device.type == "cuda"):
             return 1 << 60
         free, total = torch.cuda.mem_get_info(self.device)
-        allocated = int(torch.cuda.memory_allocated(self.device))
-        reserved = int(torch.cuda.memory_reserved(self.device))
-        reusable_reserved = max(0, reserved - allocated)
+        if torch.cuda.get_allocator_backend() == "native":
+            stats = torch.cuda.memory_stats(self.device)
+            allocated = stats.get("allocated_bytes.all.current")
+            active = stats.get("active_bytes.all.current")
+            reserved = stats.get("reserved_bytes.all.current")
+            if (
+                type(allocated) is int
+                and type(active) is int
+                and type(reserved) is int
+                and 0 <= allocated <= active <= reserved
+            ):
+                # Pending frees remain active until ordinary event collection.
+                # This excludes them, not split/private-pool incompatibilities.
+                reusable_reserved = reserved - active
+            else:
+                # Incomplete native counters cannot establish reusable cache.
+                allocated = int(torch.cuda.memory_allocated(self.device))
+                reusable_reserved = 0
+        else:
+            # Preserve the previous, unqualified policy for other backends.
+            allocated = int(torch.cuda.memory_allocated(self.device))
+            reserved = int(torch.cuda.memory_reserved(self.device))
+            reusable_reserved = max(0, reserved - allocated)
         reserve = int(total * _MEMORY_RESERVE_FRACTION)
         available = max(0, int(free) + reusable_reserved - reserve)
         if os.environ.get(_TEST_HOOKS_ENV) == "1":
