@@ -68,6 +68,7 @@ async def s3_sync(
     destination: str,
     *,
     profile: Optional[str] = None,
+    endpoint_url: Optional[str] = None,
     verbose: bool = False,
     delete: bool = False,
     exclude: list[ExcludableOption] | None = None,
@@ -84,17 +85,27 @@ async def s3_sync(
         source: The *from* path. Can be a local path or an ``s3://`` URI.
         destination: The *to* path. Can be a local path or an ``s3://`` URI.
         profile: Optional AWS profile name to pass to the CLI.
+        endpoint_url: Optional custom endpoint URL for S3-compatible services
+            (e.g. MinIO). Falls back to the ``AWS_ENDPOINT_URL`` environment
+            variable when not provided.
         verbose: When *True*, the output of the AWS CLI is streamed to the
             calling process; otherwise it is suppressed.
+        delete: When *True*, delete files in *destination* that don't exist in
+            *source*.
         exclude: List of directories to exclude from sync.
 
     Raises:
         S3SyncError: If the *aws s3 sync* command exits with a non‑zero status.
     """
 
+    if endpoint_url is None:
+        endpoint_url = os.environ.get("AWS_ENDPOINT_URL")
+
     cmd: list[str] = ["aws"]
     if profile:
         cmd += ["--profile", profile]
+    if endpoint_url:
+        cmd += ["--endpoint-url", endpoint_url]
 
     cmd += ["s3"]
     # use cp for files, sync for directories
@@ -125,15 +136,22 @@ async def s3_sync(
 
 
 async def ensure_bucket_exists(
-    s3_bucket: str | None = None, profile: str | None = None
+    s3_bucket: str | None = None,
+    profile: str | None = None,
+    endpoint_url: str | None = None,
 ) -> None:
     if s3_bucket is None:
         s3_bucket = os.environ["BACKUP_BUCKET"]
+
+    if endpoint_url is None:
+        endpoint_url = os.environ.get("AWS_ENDPOINT_URL")
 
     # Check if bucket exists
     cmd = ["aws"]
     if profile:
         cmd += ["--profile", profile]
+    if endpoint_url:
+        cmd += ["--endpoint-url", endpoint_url]
     cmd += ["s3api", "head-bucket", "--bucket", s3_bucket]
 
     result = await asyncio.create_subprocess_exec(*cmd, stdout=DEVNULL, stderr=DEVNULL)
@@ -147,6 +165,8 @@ async def ensure_bucket_exists(
     cmd = ["aws"]
     if profile:
         cmd += ["--profile", profile]
+    if endpoint_url:
+        cmd += ["--endpoint-url", endpoint_url]
     cmd += ["s3api", "create-bucket", "--bucket", s3_bucket]
 
     result = await asyncio.create_subprocess_exec(*cmd)
