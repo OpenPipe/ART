@@ -615,7 +615,7 @@ def test_minimum_wave_empty_dp_rank_keeps_collective_check_sequence(
 ) -> None:
     rank = TrainerRank(_attention_runtime())
     monkeypatch.setattr(rank, "_dp_rank_and_size", lambda: (1, 2))
-    peer_required = iter((82, 42, 82, 42))
+    peer_required = iter((82, 42, 82, 42, 42))
     local_checks: list[tuple[int, bool]] = []
 
     def check(required: int, *, sync_across_dp: bool = False) -> _MemoryCheck:
@@ -629,7 +629,7 @@ def test_minimum_wave_empty_dp_rank_keeps_collective_check_sequence(
     assert candidate.indices == ()
     assert candidate.plan.packed_tokens == 0
     assert candidate.check == _MemoryCheck(42, 60, True)
-    assert local_checks == [(0, True)] * 4
+    assert local_checks == [(0, True)] * 4 + [(42, True)]
     assert next(peer_required, None) is None
 
 
