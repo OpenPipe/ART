@@ -7,7 +7,13 @@ from typing import Any, cast
 import pytest
 import torch
 
-from art.trainer_rank import ForwardInput, ForwardOutput, TrainerRank, Unset
+from art.trainer_rank import (
+    ForwardInput,
+    ForwardOutput,
+    TrainerRank,
+    TrainerRankMemoryError,
+    Unset,
+)
 
 
 class _Model(torch.nn.Module):
@@ -199,3 +205,58 @@ def test_distinct_output_and_pure_grad_modes_require_their_own_profile():
         assert not rank._all_ranks_have_memory_profile(
             packed_tokens=plan.packed_tokens, signature=plan.signature
         )
+
+
+@pytest.mark.parametrize("no_grad", [False, True])
+def test_direct_forward_does_not_drop_observed_peak_outside_trust(monkeypatch, no_grad):
+    rank = _rank()
+
+    def request(length):
+        tokens = torch.arange(length)
+        return ForwardInput(input_tokens=tokens, target_tokens=tokens, no_grad=no_grad)
+
+    observed = rank._plan_flat_forward([request(10)])
+    rank._update_memory_profile(observed, 10_000, retained_bytes=1000)
+    monkeypatch.setattr(rank, "_available_memory_bytes", lambda: 8000)
+
+    def unexpected_execution(*args, **kwargs):
+        raise AssertionError("An unsafe single request reached model execution")
+
+    monkeypatch.setattr(
+        rank, "_run_flat_plan_with_memory_tracking", unexpected_execution
+    )
+    for length in (80, 81):
+        candidate = rank._plan_flat_forward([request(length)])
+        assert rank._all_ranks_have_memory_profile(
+            packed_tokens=length, signature=candidate.signature
+        ) == (length == 80)
+        # Calibration trust still ends at 8x. Crossing it must not discard a
+        # peak already observed at a smaller size and admit the larger request.
+        with pytest.raises(
+            TrainerRankMemoryError, match="single request cannot be split"
+        ):
+            rank.dp_rank_forward([request(length)])
+        assert rank.last_forward_telemetry()["predicted_peak_bytes"] >= 10_000
+
+
+@pytest.mark.parametrize("logical_ratio", [1, 2, 10])
+def test_empirical_estimate_survives_packed_trust_boundary(logical_ratio):
+    rank = _rank()
+    observed = rank._plan_flat_forward(_requests("target_tokens"))
+    rank._update_memory_profile(observed, 10_000, retained_bytes=1000)
+    estimate = rank._estimate_required_memory_bytes_from_values
+    values = [
+        estimate(
+            packed_tokens=count,
+            logical_tokens=count * logical_ratio,
+            output_bytes=count * 4,
+            signature=observed.signature,
+        )
+        for count in (8, 63, 64, 65, 800)
+    ]
+    assert values == sorted(values)
+    rate = rank._memory_profiles[observed.signature].bytes_per_token
+    assert values[-1] == int((800 * 4 + rate * 800 * logical_ratio) * 1.1)
+    assert not rank._all_ranks_have_memory_profile(
+        packed_tokens=800, signature=observed.signature
+    )

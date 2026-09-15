@@ -1205,7 +1205,7 @@ def _configure_moe_dispatcher_caches(model: Sequence[torch.nn.Module]) -> None:
 def _moe_output_bytes_per_token(
     model: Sequence[torch.nn.Module], shape: ParallelShape
 ) -> int:
-    """Known eager FC2 input/outputs, not the complete or compiled working set."""
+    """Known routed-expert working set, not a complete model/compiled bound."""
     if shape != ParallelShape(tp=1, cp=1):
         return 0
     from megatron.core.extensions.transformer_engine import TERowParallelGroupedLinear
@@ -1216,7 +1216,7 @@ def _moe_output_bytes_per_token(
         MoEAlltoAllTokenDispatcher,
     )
 
-    from art.megatron.lora import LoRA, MLPExpertsLinearFC2LoRA
+    from art.megatron.lora import LoRA, MLPExpertsLinearFC1LoRA, MLPExpertsLinearFC2LoRA
 
     coefficient = 0
     for chunk in model:
@@ -1288,6 +1288,27 @@ def _moe_output_bytes_per_token(
                 # their sum. Compilers may reuse storage; other workspace is
                 # not covered. Unknown input metadata keeps the prior pair.
                 features = inputs.shape[-2] + 3 * fc2.out_features
+                fc1 = getattr(experts, "linear_fc1", None)
+                if (
+                    type(fc1) is MLPExpertsLinearFC1LoRA
+                    and "forward" not in vars(fc1)
+                    and not getattr(fc1, "_forward_hooks", None)
+                    and not getattr(fc1, "_forward_pre_hooks", None)
+                    and fc1.fused_gate_up
+                    and not fc1.non_gated
+                    and fc1.out_features == 2 * inputs.shape[-2]
+                    and getattr(dispatcher, "ep_size", None) == 1
+                    and getattr(dispatcher, "tp_size", None) == 1
+                    and getattr(dispatcher, "num_local_experts", 0) > 1
+                    and getattr(config, "moe_permute_fusion", False)
+                    and getattr(experts, "offload_expert_fc1", None) is False
+                    and getattr(experts, "offload_moe_act", None) is False
+                    and getattr(experts, "activation_recompute", None) is False
+                ):
+                    # The two dispatched H-wide inputs and FC1 gate/up sum
+                    # remain live at the FC2 sum, including in the observed
+                    # compiled path. This is one stage, not a backward bound.
+                    features += 2 * fc2.out_features + fc1.out_features
             coefficient = max(
                 coefficient,
                 config.moe_router_topk * features * weights.element_size(),
@@ -2649,23 +2670,6 @@ class TrainerRank:
             logical_tokens=logical_tokens,
         )
         profile = self._memory_profiles.get(signature)
-        if profile is not None:
-            cap = profile.packed_tokens * _MEMORY_PROFILE_TRUST_GROWTH
-            if packed_tokens <= cap < unshared_packed_tokens:
-                # Required cost can drop when a larger layout leaves the
-                # profile window. Cold cost grows with packed tokens, so its
-                # first integer count bounds every possible post-cap layout,
-                # even when TP padding makes that count itself unattainable.
-                cold = self._subforward_cost(
-                    packed_tokens=cap + 1,
-                    output_bytes=output_bytes,
-                    signature=signature,
-                    logical_tokens=logical_tokens,
-                )
-                cost = _SubforwardCost(
-                    required=min(cost.required, cold.required),
-                    retained=min(cost.retained, cold.retained),
-                )
         if (
             profile is not None
             and profile.retained_compute_bytes_per_token is not None
@@ -4839,10 +4843,10 @@ class TrainerRank:
             profiled_tokens = max(
                 packed_tokens, logical_tokens / profiled.logical_per_packed
             )
-        if (
-            profiled is None
-            or profiled.packed_tokens * _MEMORY_PROFILE_TRUST_GROWTH < packed_tokens
-        ):
+        # The trust window limits calibration growth, not the empirical floor.
+        # Dropping that floor beyond the window can admit a larger request that
+        # was refused just inside it, even below a previously observed peak.
+        if profiled is None:
             compute = static_compute
         else:
             compute = max(

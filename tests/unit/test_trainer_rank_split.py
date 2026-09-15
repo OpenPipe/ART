@@ -604,11 +604,35 @@ def test_retained_ratio_lower_bound_reaches_exact_split_admission(
         plan, check = rank._plan_admissible_forward(
             requests, checkpoint=Unset, context="test"
         )
-        assert isinstance(plan, _SplitForwardPlan) and plan.subforward_count == 2
-        assert check == exact
+        assert isinstance(plan, _SplitForwardPlan)
+        # The smaller profile cannot discount larger layouts after its trust
+        # window; the original 20 GiB budget now requires four subforwards.
+        assert plan.subforward_count == (2 if profile_packed == 8000 else 4)
+        assert check == rank._split_rung_check(
+            [rank._plan_cost(child) for child in plan.subforwards]
+        )
         assert sorted(
             index for chunk in plan.request_indices for index in chunk
         ) == list(range(32))
+        retained = 0
+        leaf_ids = {}
+        for child, indices in zip(plan.subforwards, plan.request_indices, strict=True):
+            cost = rank._plan_cost(child)
+            assert retained + cost.required <= check.estimated_required_bytes <= budget
+            retained += cost.retained
+            assert child.request_count == len(indices)
+            leaf_ids[id(child)] = indices
+
+        def run(child, **kwargs):
+            assert kwargs["check"] == check
+            return [
+                ForwardOutput(None, None, None, None, checkpoint=str(index))
+                for index in leaf_ids[id(child)]
+            ], None
+
+        monkeypatch.setattr(rank, "_run_flat_plan_with_memory_tracking", run)
+        outputs = rank._execute_admitted_plan(plan, check=check, context="test")
+        assert [output.checkpoint for output in outputs] == list(map(str, range(32)))
     lower = rank._split_rung_check(
         [
             rank._split_chunk_lower_cost(
@@ -621,10 +645,11 @@ def test_retained_ratio_lower_bound_reaches_exact_split_admission(
     )
     assert [child.packed_tokens for child in children] == [64_000, 64_000]
     assert lower.estimated_required_bytes <= exact.estimated_required_bytes
-    assert lower.fits and exact.fits == admit
-    if not admit:
-        # The optimistic bound survives, but exact pricing must reject this
-        # rung. A later rung with smaller chunks may still fit this budget.
+    assert lower.fits == (not admit or profile_packed == 8000)
+    assert exact.fits == (admit and profile_packed == 8000)
+    if not exact.fits:
+        # Reject this rung, at the lower bound or exact pricing; a later rung
+        # with smaller chunks may still fit this same budget.
         split, rejected = rank._admit_split_rung(
             [tuple(range(16)), tuple(range(16, 32))],
             requests,
@@ -730,8 +755,8 @@ def test_packed_profile_bound_handles_unattainable_tp_boundary_count(
     assert (minimal.packed_tokens, minimal.logical_tokens) == (8, 112)
     rank._memory_profiles[minimal.signature] = _MemoryProfile(profile_rate, 4)
     lower = rank._split_chunk_lower_cost(requests, [tokens] * 16, checkpoint=Unset)
-    # The cutoff is32. A hypothetical cold count33 is cheaper than the first
-    # physically possible post-cutoff count36, so it remains a valid bound.
+    # The calibration cutoff is32, with the first physically possible larger
+    # count36. Required cost retains its empirical floor across that boundary.
     for packed in range(8, 113, 4):
         exact = rank._subforward_cost(
             packed_tokens=packed,
@@ -767,7 +792,7 @@ def test_packed_profile_bound_counts_each_groups_tp_padding(
         requests, [request.input_tokens for request in requests], checkpoint=Unset
     )
     exact = rank._plan_cost(maximum)
-    assert lower.required <= exact.required < rank._plan_cost(minimal).required
+    assert lower.required == rank._plan_cost(minimal).required < exact.required
     assert lower.retained <= exact.retained
 
 
