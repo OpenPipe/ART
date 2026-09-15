@@ -3,6 +3,7 @@
 import asyncio
 from contextlib import nullcontext
 from types import SimpleNamespace
+from typing import cast
 from unittest.mock import Mock
 
 import pytest
@@ -286,7 +287,9 @@ def test_final_selection_uses_pure_fresh_budget_and_original_demand(
 ):
     rank, stats = budget
     stats["active_bytes.all.current"] = 80
-    plan = SimpleNamespace(packed_tokens=64, logical_tokens=64)
+    plan = cast(
+        _impl._FlatForwardPlan, SimpleNamespace(packed_tokens=64, logical_tokens=64)
+    )
     stale = _impl._MemoryCheck(
         estimated_required_bytes=192, available_bytes=256, fits=True
     )
