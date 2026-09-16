@@ -480,7 +480,11 @@ def _assistant_stop_masks(
 
 
 def _translate_token_mask(
-    source: Sequence[int], target: Sequence[int], mask: Sequence[bool]
+    source: Sequence[int],
+    target: Sequence[int],
+    mask: Sequence[bool],
+    *,
+    tokenizer: Tokenizer | None = None,
 ) -> list[bool]:
     """Translate a token mask across a prefix replacement without guessing."""
 
@@ -490,13 +494,28 @@ def _translate_token_mask(
 
     translated = [False] * len(target)
     mapped = [False] * len(source)
-    for source_start, target_start, length in SequenceMatcher(
+    decode = getattr(tokenizer, "decode", None)
+    for tag, start, end, target_start, target_end in SequenceMatcher(
         None, source, target, autojunk=False
-    ).get_matching_blocks():
-        for offset in range(length):
-            if mask[source_start + offset]:
-                translated[target_start + offset] = True
-                mapped[source_start + offset] = True
+    ).get_opcodes():
+        if tag == "equal":
+            translated[target_start:target_end] = mask[start:end]
+            mapped[start:end] = [True] * (end - start)
+        elif tag == "replace" and callable(decode) and any(mask[start:end]):
+            # A merged whitespace token inherits the mask when any of its
+            # characters participate. Multiple target tokens require a uniform
+            # source mask. This translates flags without changing served IDs.
+            if target_end - target_start != 1 and not all(mask[start:end]):
+                continue
+            kwargs = dict(skip_special_tokens=False, clean_up_tokenization_spaces=False)
+            text = decode(list(source[start:end]), **kwargs)
+            if text.isspace() and text == decode(
+                list(target[target_start:target_end]), **kwargs
+            ):
+                translated[target_start:target_end] = [True] * (
+                    target_end - target_start
+                )
+                mapped[start:end] = [True] * (end - start)
     if any(selected and not retained for selected, retained in zip(mask, mapped)):
         raise ValueError(
             "Cannot preserve assistant boundaries across exact prompt token replacement"
@@ -4785,10 +4804,16 @@ def _tokenize_chat_view(
         direct_bounds or None,
     )
     assistant_mask = _translate_token_mask(
-        canonical_rendered, rendered, canonical_assistant_mask
+        canonical_rendered,
+        rendered,
+        canonical_assistant_mask,
+        tokenizer=resolved_tokenizer,
     )
     output_mask = _translate_token_mask(
-        canonical_rendered, rendered, canonical_output_mask
+        canonical_rendered,
+        rendered,
+        canonical_output_mask,
+        tokenizer=resolved_tokenizer,
     )
     stop_mask = _translate_token_mask(canonical_rendered, rendered, canonical_stop_mask)
     length_stop_mask = _translate_token_mask(
