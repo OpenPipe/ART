@@ -32,6 +32,8 @@ def _compile_workaround_flags_for_provider(
         # HybridEP owns native communication, dynamic routing metadata, and
         # side-stream lifetimes. Keep only Megatron's thin flex wrapper eager.
         flags = (*flags, "flex_token_dispatch_combine")
+    if bool(getattr(provider, "moe_shared_expert_overlap", False)):
+        flags = (*flags, "shared_expert_stream_handoffs")
     if (
         bool(getattr(provider, "sequence_parallel", False))
         and int(getattr(provider, "tensor_model_parallel_size", 1) or 1) > 1
