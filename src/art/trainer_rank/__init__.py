@@ -259,6 +259,20 @@ class TrainerRank(_impl.TrainerRank):
         without multiplying them by the number of replicas. `dp_reduce` combines
         only distinct data-parallel batches.
 
+        ART isolates model PyTorch RNG consumption and synchronizes the default
+        CPU and trainer-device CUDA generators within TP/CP before each yield
+        (or `dp_rank_forward` return), using that DP worker's first TP/CP rank.
+        Matching caller-side random masks and custom-head dropout therefore need
+        no parallelism-specific seeding. Streams advance normally, and different
+        DP workers keep their own state; identical caller seeds are not changed.
+        Custom object registration also synchronizes these generators before
+        invoking its factory. Python/NumPy RNGs, explicit generators, other CUDA
+        devices, concurrent RNG use, and rank-dependent control flow are outside
+        this contract. Caller code must still perform matching operations across
+        TP/CP. Checkpoint saves contain weights/optimizer state, not RNG state;
+        exact replay requires caller RNG restoration and the same model execution
+        history. Model activation checkpointing must preserve RNG state.
+
         Empty local microbatches are skipped unless `yield_empty=True`. Every
         rank must use the same setting. When a wave skips ranks, TrainerRank
         collective methods raise if called from its loop body; fully populated

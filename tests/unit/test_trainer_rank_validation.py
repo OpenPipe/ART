@@ -3434,7 +3434,12 @@ def _forward_yield_modes_worker(rank: int, world_size: int, init_method: str) ->
                 from megatron.core import parallel_state
             except ImportError:
                 core = ModuleType("megatron.core")
-                parallel_state = cast(Any, SimpleNamespace())
+                parallel_state = cast(
+                    Any,
+                    SimpleNamespace(
+                        get_tensor_and_context_parallel_group=lambda **_: None
+                    ),
+                )
                 cast(Any, core).parallel_state = parallel_state
                 monkeypatch.setitem(sys.modules, "megatron.core", core)
             monkeypatch.setattr(
