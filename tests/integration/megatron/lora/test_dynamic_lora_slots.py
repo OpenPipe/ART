@@ -36,6 +36,7 @@ from art.trainer_rank._impl import (  # noqa: E402
     _vocab_parallel_target_logprobs,
     _vocab_parallel_topk_from_local,
 )
+from art.trainer_rank._rng import TrainerRNG  # noqa: E402
 
 
 class _CudaValueHead(torch.nn.Module):
@@ -601,6 +602,7 @@ def _trainer_for(lora: LoRA, device: torch.device) -> TrainerRank:
         model_support_handler=_IdentityModelSupportHandler(),
     )
     trainer.device = device
+    trainer._rng = TrainerRNG(device)
     trainer._slot_stack = []
     trainer._default_slot_ref = None
     trainer._skipped_forward_waves = {}
