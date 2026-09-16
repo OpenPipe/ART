@@ -2,7 +2,7 @@ import asyncio
 import json
 from types import SimpleNamespace
 
-from pydantic import BaseModel
+from pydantic import BaseModel, model_validator
 import pytest
 
 from art_inference import vllm
@@ -13,12 +13,19 @@ class Request(BaseModel):
     model: str = "model"
     messages: list[dict]
     stream: bool = False
+    stream_options: dict | None = None
     add_generation_prompt: bool = True
     continue_final_message: bool = False
     chat_template_kwargs: dict = {}
     previous_response_id: str | None = None
     tools: list = []
     tool_choice: str = "auto"
+
+    @model_validator(mode="after")
+    def validate_stream(self):
+        if self.stream_options and not self.stream:
+            raise ValueError("Stream options can only be defined when stream=True")
+        return self
 
 
 class Message(BaseModel):
@@ -190,7 +197,11 @@ def test_served_history_survives_renderer_normalization(serving, stream, action)
 
     async def run():
         user = {"role": "user", "content": "question"}
-        first = Request(messages=[user], stream=stream)
+        first = Request(
+            messages=[user],
+            stream=stream,
+            stream_options={"include_usage": True} if stream else None,
+        )
         response = await server.create_chat_completion(first)
         if stream:
             assert (await anext(response)).startswith("data: ")

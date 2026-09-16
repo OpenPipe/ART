@@ -146,10 +146,25 @@ def test_kimi_preserves_old_reasoning_when_next_turn_does_not_think():
     assert chat_template_with_preserved_thinking(configured) == configured
 
 
-@pytest.mark.parametrize("reasoning", [None, "\nthought\n"])
+@pytest.mark.parametrize("reasoning", [None, "", "\nthought\n"])
 @pytest.mark.parametrize("next_thinking", [False, True])
+@pytest.mark.parametrize(
+    "tools",
+    [
+        None,
+        [
+            {
+                "type": "function",
+                "function": {
+                    "name": "lookup",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }
+        ],
+    ],
+)
 def test_deepseek_v4_retains_prior_turns_when_generation_mode_changes(
-    reasoning, next_thinking
+    reasoning, next_thinking, tools
 ):
     from tokenizers import Tokenizer
     from tokenizers.models import WordLevel
@@ -165,10 +180,11 @@ def test_deepseek_v4_retains_prior_turns_when_generation_mode_changes(
         {"role": "assistant", "content": "answer", "reasoning_content": reasoning},
     ]
     completed = tokenizer.apply_chat_template(
-        messages, tokenize=False, enable_thinking=reasoning is not None
+        messages, tools=tools, tokenize=False, enable_thinking=reasoning is not None
     )
     continued = tokenizer.apply_chat_template(
         [*messages, {"role": "user", "content": "next"}],
+        tools=tools,
         tokenize=False,
         enable_thinking=next_thinking,
     )
@@ -178,6 +194,7 @@ def test_deepseek_v4_retains_prior_turns_when_generation_mode_changes(
         assert reasoning in continued
         assert reasoning not in tokenizer.apply_chat_template(
             [*messages, {"role": "user", "content": "next"}],
+            tools=tools,
             tokenize=False,
             enable_thinking=next_thinking,
             preserve_thinking=False,

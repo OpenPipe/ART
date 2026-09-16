@@ -54,9 +54,7 @@ def patch_deepseek_renderer(
                     thinking_mode = (
                         "thinking"
                         if any(
-                            bool(message.get(name))
-                            if prefix_only
-                            else message.get(name) is not None
+                            message.get(name) is not None
                             for name in ("reasoning", "reasoning_content", "thinking")
                         )
                         else "chat"
@@ -71,6 +69,29 @@ def patch_deepseek_renderer(
             # user in the full chat, even with drop_thinking=False.
             if prefix_only:
                 messages = messages[: index + 1]
+                message = messages[index]
+                if (
+                    message.get("role") == "assistant"
+                    and thinking_mode == "thinking"
+                    and not any(
+                        message.get(name)
+                        for name in (
+                            "reasoning",
+                            "reasoning_content",
+                            "thinking",
+                            "tool_calls",
+                        )
+                    )
+                ):
+                    # V3.2 rejects an empty reasoning field, although sampling
+                    # </think> immediately is valid. Preserve that exact block.
+                    return module.thinking_end_token + render(
+                        index, messages, "chat", *args, **kwargs
+                    )
+        elif not prefix_only:
+            # V4's encoder overrides drop_thinking when tools are present. An
+            # explicit request to remove history still controls each rendering.
+            kwargs["drop_thinking"] = True
         return render(index, messages, thinking_mode, *args, **kwargs)
 
     module.render_message = render_message
@@ -389,6 +410,7 @@ async def chat_response_prefixes(
             ("input_ids", None),
             ("n", 1),
             ("stream", False),
+            ("stream_options", None),
         )
         if name in fields
     )

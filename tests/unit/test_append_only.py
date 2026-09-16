@@ -26,7 +26,7 @@ def test_dsv32_earlier_turn_framing_survives_a_new_user_turn(reasoning):
             return messages[index]["reasoning_content"] + "END"
         return "END"
 
-    encoding = SimpleNamespace(render_message=render)
+    encoding = SimpleNamespace(render_message=render, thinking_end_token="</think>")
     preserve = True
     patch_deepseek_renderer(encoding, lambda: preserve, prefix_only=True)
     messages = [
