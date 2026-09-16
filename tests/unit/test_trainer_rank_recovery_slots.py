@@ -1,6 +1,7 @@
 """Checkpoint setup precedes the DP-local recovery loop exactly once."""
 
 from types import SimpleNamespace
+from typing import cast
 
 import pytest
 
@@ -15,7 +16,9 @@ def test_dp_recovery_ensures_before_all_searches(search_count, empty):
     requests = [] if empty else [object()]
     checkpoint = object()
     events = []
-    plan = SimpleNamespace(packed_tokens=1, logical_tokens=1)
+    plan = cast(
+        _impl._AnyForwardPlan, SimpleNamespace(packed_tokens=1, logical_tokens=1)
+    )
     bad = _impl._MemoryCheck(80, 10, False)
     fit = (plan, _impl._MemoryCheck(80, 200, True))
     refused = _impl._ForwardRefusal(plan, bad, "too large")
