@@ -11,7 +11,7 @@ keyed by topology so TP=2 calibrates itself online.
 from __future__ import annotations
 
 from types import SimpleNamespace
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 import pytest
 import torch
@@ -56,6 +56,23 @@ def test_trainer_rank_accepts_tensor_parallel_runtimes(tp: int) -> None:
     rank = TrainerRank(_runtime(tp=tp))
 
     assert rank.last_forward_telemetry is not None
+
+
+@pytest.mark.parametrize("tp", (1, 2, 4))
+@pytest.mark.parametrize("granularity", (None, "full", "selective"))
+def test_trainer_rank_recompute_support(
+    tp: int, granularity: Literal["full", "selective"] | None
+) -> None:
+    runtime = _runtime(tp=tp)
+    runtime.provider.recompute_granularity = granularity
+    if granularity == "selective":
+        with pytest.raises(
+            TrainerRankRuntimeSupportError,
+            match="selective recompute.*ART_MEGATRON_RECOMPUTE_GRANULARITY=full",
+        ):
+            TrainerRank(runtime)
+    else:
+        TrainerRank(runtime)
 
 
 def test_trainer_rank_still_refuses_pipeline_parallel_runtimes() -> None:
