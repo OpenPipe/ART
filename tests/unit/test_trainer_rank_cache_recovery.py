@@ -622,3 +622,122 @@ class TestRecovery(unittest.TestCase):
         self.assertIsNone(error)
         self.assertTrue(value[1].fits)
         self.assertTrue(state.invalid)
+
+    def test_sampling_and_reduction_errors_keep_both_diagnostics(self):
+        for phase in ("pre_sample", "release", "post_sample"):
+            for mode in ("local", "transport", "both"):
+                with self.subTest(phase=phase, mode=mode):
+                    q, c, k, n = self.make()
+                    local = ValueError("local sample or release failed")
+                    cause, context = TypeError("original cause"), LookupError("context")
+                    local.__cause__, local.__context__ = cause, context
+                    local.__suppress_context__ = True
+                    local.add_note("existing note")
+                    transport = RuntimeError("memory reduction failed")
+                    transport.__cause__ = OSError("transport cause")
+                    samples, reductions = [], []
+
+                    def available():
+                        samples.append(1)
+                        if mode != "transport" and (
+                            phase == "pre_sample"
+                            and len(samples) == 1
+                            or phase == "post_sample"
+                            and len(samples) == 2
+                        ):
+                            raise local
+                        return 10
+
+                    def reduce(values, *, op, sync_across_dp):
+                        reductions.append((op, list(values), sync_across_dp))
+                        if mode != "local" and len(reductions) == (
+                            3 if phase == "pre_sample" else 4
+                        ):
+                            raise transport
+                        return values
+
+                    q._available_memory_bytes = available
+                    q._recovery_reduce = reduce
+                    if phase == "release" and mode != "transport":
+                        c.failure = local
+                    _, error, calls = run(q, [fail(n), success(n)])
+                    self.assertIs(error, transport if mode == "transport" else local)
+                    if mode != "transport":
+                        self.assertIs(local.__cause__, cause)
+                        self.assertIs(local.__context__, context)
+                        self.assertTrue(local.__suppress_context__)
+                        self.assertEqual(local.__notes__[0], "existing note")
+                        self.assertEqual(
+                            len(local.__notes__), 2 if mode == "both" else 1
+                        )
+                        if mode == "both":
+                            self.assertIn(
+                                "OSError: transport cause", local.__notes__[1]
+                            )
+                            self.assertIn(
+                                "RuntimeError: memory reduction failed",
+                                local.__notes__[1],
+                            )
+                            self.assertIn("raise transport", local.__notes__[1])
+                    self.assertEqual(calls, 1)
+                    self.assertEqual(
+                        [x[0] for x in reductions],
+                        ["SUM", "MAX", "MIN"]
+                        + ([] if phase == "pre_sample" else ["MIN"]),
+                    )
+                    state = q._recovery_state()
+                    self.assertIsNone(state.owner)
+                    self.assertEqual(state.work, 0)
+                    self.assertEqual(state.cost, state.high)
+                    self.assertGreater(state.cost, 0)
+                    self.assertEqual(state.first_consumed, phase != "pre_sample")
+
+    def test_admission_sampling_and_reduction_error_keep_original_chain(self):
+        q, c, k, n = self.make()
+        local = ValueError("admission sample")
+        context, cause = LookupError("context"), TypeError("cause")
+        local.__context__, local.__cause__ = context, cause
+        transport = RuntimeError("admission reduction")
+        calls = []
+
+        def available():
+            raise local
+
+        def all_reduce(value, *, op, group):
+            calls.append(op)
+            if op == "MIN":
+                raise transport
+
+        q._available_memory_bytes = available
+        with patch.object(
+            _impl,
+            "dist",
+            types.SimpleNamespace(
+                is_available=lambda: True,
+                is_initialized=lambda: True,
+                ReduceOp=types.SimpleNamespace(MAX="MAX", MIN="MIN"),
+                all_reduce=all_reduce,
+            ),
+        ):
+            with self.assertRaises(ValueError) as captured:
+                q._memory_check_required(80, sync_across_dp=True)
+        self.assertIs(captured.exception, local)
+        self.assertIs(local.__context__, context)
+        self.assertIs(local.__cause__, cause)
+        self.assertIn("RuntimeError: admission reduction", local.__notes__[0])
+        self.assertEqual(calls, ["MAX", "MIN"])
+
+    def test_secondary_note_failure_never_replaces_primary(self):
+        primary, secondary = ValueError("primary"), RuntimeError("secondary")
+        context = LookupError("original context")
+        primary.__context__ = context
+        helper = _impl.TrainerRank._memory_error_with_reduction_note
+        with patch.object(
+            _impl.traceback, "format_exception", side_effect=SystemExit("renderer")
+        ):
+            self.assertIs(helper(primary, secondary), primary)
+        self.assertIs(primary.__context__, context)
+        primary.__dict__["__notes__"] = 42
+        self.assertIs(helper(primary, secondary), primary)
+        self.assertEqual(primary.__notes__, 42)
+        self.assertIs(primary.__context__, context)

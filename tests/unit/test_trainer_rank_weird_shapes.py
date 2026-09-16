@@ -780,7 +780,9 @@ def test_adaptive_planner_globally_falls_back_when_one_rank_cannot_estimate(
 ) -> None:
     rank = TrainerRank(_runtime())
     monkeypatch.setattr(rank, "_dp_rank_and_size", lambda: (0, 2))
-    monkeypatch.setattr(rank, "_all_ranks_true", lambda _local: False)
+    # Planning succeeds; only estimator availability and profile trust are false.
+    outcomes = iter((True, False, True, True, True, False))
+    monkeypatch.setattr(rank, "_all_ranks_true", lambda _local: next(outcomes))
     plans = 0
     original = rank._plan_flat_forward
 
@@ -793,6 +795,7 @@ def test_adaptive_planner_globally_falls_back_when_one_rank_cannot_estimate(
     candidate = rank._select_next_micro_batch(
         [_target_request(_tokens(index)) for index in range(4)], 0
     )
+    assert next(outcomes, None) is None
 
     assert candidate.stats_global_count == 2
     assert plans == 1
