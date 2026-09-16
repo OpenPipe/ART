@@ -3421,12 +3421,15 @@ def test_loaded_tokenizers_are_cached_by_model_and_revision(
 
     class AutoTokenizer:
         @staticmethod
-        def from_pretrained(model: str, *, revision: str | None) -> object:
+        def from_pretrained(
+            model: str, *, revision: str | None = None, **kwargs
+        ) -> object:
             loaded.append((model, revision))
             return object()
 
     transformers = ModuleType("transformers")
     setattr(transformers, "AutoTokenizer", AutoTokenizer)
+    setattr(transformers, "PreTrainedTokenizerFast", AutoTokenizer)
     monkeypatch.setitem(sys.modules, "transformers", transformers)
     _cached_tokenizer.cache_clear()
     try:
@@ -3445,7 +3448,9 @@ def test_deepseek_v4_uses_arts_protocol_renderer(
 
     class AutoTokenizer:
         @staticmethod
-        def from_pretrained(model: str, *, revision: str | None) -> object:
+        def from_pretrained(
+            model: str, *, revision: str | None = None, **kwargs
+        ) -> object:
             assert model == "deepseek-ai/DeepSeek-V4-Flash"
             assert revision is None
             return raw
@@ -3453,6 +3458,7 @@ def test_deepseek_v4_uses_arts_protocol_renderer(
     transformers = ModuleType("transformers")
     transformers.__path__ = []  # type: ignore[attr-defined]
     setattr(transformers, "AutoTokenizer", AutoTokenizer)
+    setattr(transformers, "PreTrainedTokenizerFast", AutoTokenizer)
     tokenizer_base = ModuleType("transformers.tokenization_utils_base")
     setattr(tokenizer_base, "PreTrainedTokenizerBase", object)
     monkeypatch.setitem(sys.modules, "transformers", transformers)

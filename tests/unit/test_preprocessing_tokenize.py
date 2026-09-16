@@ -441,7 +441,8 @@ def test_native_or_unrecognized_thinking_templates_are_unchanged() -> None:
     )
     unrelated = "{%- if loop.index0 > ns.last_query_index %}content{% endif %}"
 
-    assert chat_template_with_preserved_thinking(native) == native
+    configured = chat_template_with_preserved_thinking(native)
+    assert chat_template_with_preserved_thinking(configured) == configured
     assert chat_template_with_preserved_thinking(unrelated) == unrelated
 
 

@@ -8,10 +8,10 @@ from dotenv import load_dotenv
 import openai
 from openai.types.chat import ChatCompletionMessageParam
 from openpipe import AsyncOpenPipe
-from transformers.models.auto.tokenization_auto import AutoTokenizer
 from utils import cache, prompt_for_title, pull_data, score_title
 
 import art
+from art import get_tokenizer
 from art.local import LocalBackend
 from art.utils import iterate_dataset, limit_concurrency
 
@@ -37,7 +37,7 @@ def filter_on_length(data: Dataset, max_length: int, tokenizer_name: str) -> Dat
     print(
         f"Filtering dataset for max prompt length: {max_length} using tokenizer: {tokenizer_name}"
     )
-    tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
+    tokenizer = get_tokenizer(tokenizer_name)
 
     def check_length(x):
         # Ensure 'prompt' is a list of dicts
