@@ -238,7 +238,46 @@ def test_tokenized_group_skips_equality_dump_for_identical_source(
     assert group.trajectories[0].trajectory is source
 
 
-def test_public_group_tokenization_nan_json_round_trip() -> None:
+@pytest.mark.parametrize("logprob", [-0.25, math.nan])
+def test_source_rebinding_does_not_dump_unrelated_exchanges(
+    logprob: float, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from test_tokenize import _chat_exchange
+
+    exchanges = [
+        _chat_exchange(list(range(1, 2 * i + 2)), [2 * i + 2], offset=i)
+        for i in range(12)
+    ]
+    for exchange in exchanges:
+        old = exchange.response.choices[0].logprobs
+        assert old and old.content
+        old.content[0].logprob = logprob
+    tokenized = art.Trajectory(
+        exchanges=tr.TrajectoryExchanges(chat_completions=exchanges)
+    ).tokenize()
+    payload = tokenized.model_dump_json()
+    dumps = 0
+    original_dump = tr.ChatCompletionsExchange.model_dump
+
+    def counted_dump(self: tr.ChatCompletionsExchange, *args: Any, **kwargs: Any):
+        nonlocal dumps
+        dumps += 1
+        return original_dump(self, *args, **kwargs)
+
+    monkeypatch.setattr(tr.ChatCompletionsExchange, "model_dump", counted_dump)
+    restored = tr.TokenizedTrajectory.model_validate_json(payload)
+    assert isinstance(restored.history, tr.ChatCompletionsHistory)
+    sources = [s for s in restored.history.message_sources if s is not None]
+    assert dumps <= (2 * len(sources) if math.isnan(logprob) else 0)
+    assert all(
+        any(s.exchange is e for e in restored.trajectory.exchanges.chat_completions)
+        for s in sources
+    )
+    assert restored.model_dump_json() == payload
+
+
+@pytest.mark.parametrize("logprob", [-0.25, math.nan])
+def test_public_group_tokenization_nan_json_round_trip(logprob: float) -> None:
     from datetime import datetime
 
     from openai.types.chat import ChatCompletion
@@ -271,7 +310,7 @@ def test_public_group_tokenization_nan_json_round_trip() -> None:
                             "content": [
                                 {
                                     "token": f"token_id:{token_id}",
-                                    "logprob": -0.1 * token_id,
+                                    "logprob": logprob,
                                     "bytes": [],
                                     "top_logprobs": [],
                                 }
@@ -323,6 +362,37 @@ def test_public_group_tokenization_nan_json_round_trip() -> None:
     tr.TokenizedTrajectoryGroup[tr.TokenizedMultiHistoryTrajectory].model_validate_json(
         multi_json
     )
+    for group in (single, multi, single.tensorize(), multi.tensorize()):
+        for restored in (
+            type(group).model_validate_json(group.model_dump_json()),
+            tr.compact_validate(group.compact_dump(), type=type(group)),
+        ):
+            assert restored.model_dump_json() == group.model_dump_json()
+            child = restored.trajectories[0]
+            assert child.trajectory is restored.trajectory_group.trajectories[0]
+            histories = (
+                child.histories
+                if isinstance(
+                    child,
+                    (
+                        tr.TokenizedMultiHistoryTrajectory,
+                        tr.TensorizedMultiHistoryTrajectory,
+                    ),
+                )
+                else [child]
+            )
+            for history in histories:
+                assert isinstance(history.history, tr.ChatCompletionsHistory)
+                for source in history.history.message_sources:
+                    assert source is not None
+                    assert (
+                        source.exchange
+                        is child.trajectory.exchanges.chat_completions[0]
+                    )
+        payload = group.model_dump(mode="json")
+        payload["trajectory_group"]["trajectories"][0]["reward"] = 123
+        with pytest.raises(ValueError, match="does not match its source group"):
+            type(group).model_validate(payload)
 
 
 def test_tokenized_compact_round_trips_retain_source_references() -> None:

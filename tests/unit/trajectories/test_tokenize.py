@@ -4380,6 +4380,30 @@ def test_json_round_trip_preserves_exchange_types() -> None:
     assert isinstance(restored.exchanges.chat_completions[0].response, ChatCompletion)
 
 
+@pytest.mark.parametrize("grouped", [False, True])
+def test_json_round_trip_preserves_nan_response_logprobs(grouped: bool) -> None:
+    exchange = _chat_exchange([1], [2, 3])
+    logprobs = exchange.response.choices[0].logprobs
+    assert logprobs is not None and logprobs.content is not None
+    logprobs.content[1].logprob = math.nan
+    trajectory = art.Trajectory(
+        exchanges=TrajectoryExchanges(chat_completions=[exchange])
+    )
+    expected = trajectory.tokenize()
+    value = art.TrajectoryGroup([trajectory]) if grouped else trajectory
+    for _ in range(2):
+        value = type(value).model_validate_json(value.model_dump_json())
+        restored = (
+            value.trajectories[0] if isinstance(value, art.TrajectoryGroup) else value
+        )
+        actual = restored.tokenize()
+        assert actual.tokens == expected.tokens
+        assert actual.flags == expected.flags
+        assert actual.logprobs[1] == expected.logprobs[1]
+        assert math.isnan(actual.logprobs[2])
+        assert actual.flags[2] & tr.TokenFlag.SAMPLED
+
+
 def _response_exchange(
     response_id: str,
     output_id: int,

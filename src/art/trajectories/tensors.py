@@ -28,6 +28,7 @@ from . import (
     _StringInterningModel,
 )
 from ._serialization import (
+    _equal_with_nan,
     _rebind_history_sources,
     serialize_history,
     validate_history,
@@ -286,9 +287,8 @@ class TensorizedTrajectoryGroup(_StringInterningModel, Generic[TensorizedTraject
         for tensorized, trajectory in zip(
             self.trajectories, self.trajectory_group.trajectories, strict=True
         ):
-            if (
-                tensorized.trajectory is not trajectory
-                and tensorized.trajectory.model_dump() != trajectory.model_dump()
+            if tensorized.trajectory is not trajectory and not _equal_with_nan(
+                tensorized.trajectory.model_dump(), trajectory.model_dump()
             ):
                 raise ValueError(
                     "Tensorized trajectory does not match its source group"
