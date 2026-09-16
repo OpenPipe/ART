@@ -416,6 +416,11 @@ async def chat_response_prefixes(
             ("n", 1),
             ("stream", False),
             ("stream_options", None),
+            # These turns have already completed: reserve no further output and
+            # retain the entire history when observing its rendered tokens.
+            ("max_tokens", None),
+            ("max_completion_tokens", None),
+            ("truncate_prompt_tokens", None),
         )
         if name in fields
     )

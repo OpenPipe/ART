@@ -182,6 +182,16 @@ def test_deepseek_v4_retains_prior_turns_when_generation_mode_changes(
     completed = tokenizer.apply_chat_template(
         messages, tools=tools, tokenize=False, enable_thinking=reasoning is not None
     )
+    assert (
+        tokenizer.apply_chat_template(
+            messages,
+            tools=tools,
+            tokenize=False,
+            enable_thinking=reasoning is not None,
+            chat_template=None,
+        )
+        == completed
+    )
     continued = tokenizer.apply_chat_template(
         [*messages, {"role": "user", "content": "next"}],
         tools=tools,

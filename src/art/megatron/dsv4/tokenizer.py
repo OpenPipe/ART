@@ -42,10 +42,10 @@ def get_dsv4_tokenizer(
             tools: list[dict[str, Any]] | None = None,
             **kwargs: Any,
         ) -> str | list[int]:
-            if (
-                kwargs.get("chat_template", self.chat_template)
-                != DSV4_CHAT_TEMPLATE_MARKER
-            ):
+            chat_template = kwargs.get("chat_template")
+            if chat_template is None:
+                chat_template = self.chat_template
+            if chat_template != DSV4_CHAT_TEMPLATE_MARKER:
                 return super().apply_chat_template(messages, tools=tools, **kwargs)
             thinking = bool(kwargs.get("thinking", False)) or bool(
                 kwargs.get("enable_thinking", False)

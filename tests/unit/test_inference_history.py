@@ -14,6 +14,9 @@ class Request(BaseModel):
     messages: list[dict]
     stream: bool = False
     stream_options: dict | None = None
+    max_tokens: int | None = None
+    max_completion_tokens: int | None = None
+    truncate_prompt_tokens: int | None = None
     add_generation_prompt: bool = True
     continue_final_message: bool = False
     chat_template_kwargs: dict = {}
@@ -218,6 +221,51 @@ def test_served_history_survives_renderer_normalization(serving, stream, action)
         assert ("#" + action + "~\nU").encode() in bytes(server.engine.prompts[-1])
 
     asyncio.run(run())
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("budget_field", ["max_tokens", "max_completion_tokens"])
+@pytest.mark.parametrize("truncate", [None, 11])
+def test_completed_observation_has_no_second_generation_budget_or_truncation(
+    serving, stream, budget_field, truncate
+):
+    server, _ = serving
+    render = server.render_chat_request
+    completed = []
+
+    async def validated_render(request):
+        result = await render(request)
+        prompt = result[1][0]
+        if request.truncate_prompt_tokens is not None:
+            prompt["prompt_token_ids"] = prompt["prompt_token_ids"][
+                -request.truncate_prompt_tokens :
+            ]
+        output_budget = request.max_completion_tokens or request.max_tokens or 0
+        assert len(prompt["prompt_token_ids"]) + output_budget <= 48
+        if not request.add_generation_prompt:
+            completed.append(bytes(prompt["prompt_token_ids"]))
+        return result
+
+    server.render_chat_request = validated_render
+    request = Request(
+        messages=[{"role": "user", "content": "question"}],
+        stream=stream,
+        truncate_prompt_tokens=truncate,
+        max_tokens=32 if budget_field == "max_tokens" else None,
+        max_completion_tokens=32 if budget_field == "max_completion_tokens" else None,
+    )
+
+    async def run():
+        response = await server.create_chat_completion(request)
+        if stream:
+            assert [event async for event in response][-1] == "data: [DONE]\n\n"
+        else:
+            assert response.choices[0].message.content == "action"
+
+    asyncio.run(run())
+    assert b"Uquestion;Athought#action~\n" in completed
+    assert getattr(request, budget_field) == 32
+    assert request.truncate_prompt_tokens == truncate
 
 
 def test_external_observations_use_the_host_store_without_local_publication(serving):
