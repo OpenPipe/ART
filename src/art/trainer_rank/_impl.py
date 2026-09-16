@@ -1357,6 +1357,14 @@ class TrainerRank:
                 "therefore requires PP=1 with exactly one local model chunk; "
                 f"got pp={pp_size}, chunks={len(runtime.model)}"
             )
+        if getattr(runtime.provider, "recompute_granularity", None) == "selective":
+            raise TrainerRankRuntimeSupportError(
+                "TrainerRank memory planning does not support selective recompute; "
+                "its activation estimate assumes full recompute. Use "
+                "ART_MEGATRON_RECOMPUTE_GRANULARITY=full with "
+                "ART_MEGATRON_RECOMPUTE_METHOD=uniform and "
+                "ART_MEGATRON_RECOMPUTE_NUM_LAYERS=1."
+            )
         # Tensor parallelism is admitted: the vocab-parallel head, sequence-
         # parallel gather, TP padding of packed batches and sharded LoRA
         # gradient reduction pre-date the planner, memory checks all-reduce
