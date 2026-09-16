@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, Any
 from art.utils.safetensors import PreparedSafetensors, SafetensorsLayout
 
 from ..tensor_snapshot import PinnedCpuSnapshotStager
-from .data_plane import InMemoryPackedBatch, SFTBatchData, validate_packed_batch
+from .data_plane import InMemoryPackedBatch, PackedSFTBatchData, validate_packed_batch
 from .publication import (
     TrainerPublicationFailed,
     TrainerPublicationSucceeded,
@@ -82,7 +82,7 @@ class MegatronTrainJobExecutor:
     def execute_sft(
         self,
         job: SFTJobSpec,
-        batches: tuple[SFTBatchData, ...],
+        batches: tuple[PackedSFTBatchData, ...],
         sink: EventSink,
         cancelled: Event,
     ) -> dict[str, float]:

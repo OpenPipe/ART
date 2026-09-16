@@ -573,6 +573,8 @@ class NemotronHHandler(DefaultMoeHandler):
         provider.mtp_num_layers = None
         provider.mtp_hybrid_override_pattern = None
         provider.mtp_loss_scaling_factor = None
+        # Router bias belongs to the frozen base model, not the exported LoRA.
+        provider.moe_router_bias_update_rate = 0.0
         _configure_moe_padding(provider)
         provider.use_mamba_mem_eff_path = True
 

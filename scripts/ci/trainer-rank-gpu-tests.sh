@@ -20,6 +20,13 @@ test -x "${runtime_python}"
   tests/integration/megatron/lora/test_dynamic_lora_slots.py::test_trainer_rank_custom_parameter_reduction_oracle \
   'tests/integration/megatron/lora/test_dynamic_lora_slots.py::test_trainer_rank_tp_head_backward_matches_unsharded_oracle[2]'
 
+# Keep SFT distributed state and compiler workarounds in separate test processes.
+"${runtime_python}" -m pytest --tb=short \
+  tests/integration/megatron/test_sft_packing.py::test_sft_packing_loss_and_gradients
+
+"${runtime_python}" -m pytest --tb=short \
+  tests/integration/megatron/test_shared_expert_stream_handoff.py::test_compiled_shared_expert_handoff
+
 ART_MEGATRON_CONTEXT_PARALLEL_SIZE=2 \
   "${runtime_python}" -m torch.distributed.run --standalone --nproc-per-node=2 \
     dev/trainer_rank_check.py \
