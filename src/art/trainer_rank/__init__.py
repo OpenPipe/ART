@@ -253,14 +253,11 @@ class TrainerRank(_impl.TrainerRank):
         ART moves its packed model inputs and labels internally without mutating
         the caller-owned `ForwardInput` objects.
 
-        With context parallelism, per-position outputs are local sequence shards,
-        not full sequences or necessarily equal contiguous splits. Each active
-        `ForwardOutput.positions` maps its rows to the request's flattened input
-        positions, including for hidden states, logits, top-k and target logprobs.
-        Index full-sequence masks/labels by these positions before using them.
-        For global means/pools, reduce local sums and counts with `dp_reduce`
-        (which includes context-parallel ranks), then divide; do not average
-        local means. No context-parallel output gather is performed.
+        Per-position outputs contain the full flattened input sequence in source
+        order, including with context parallelism. TP/CP ranks compute the same
+        loss on these replicated outputs; ART routes gradients to owning rows
+        without multiplying them by the number of replicas. `dp_reduce` combines
+        only distinct data-parallel batches.
 
         Empty local microbatches are skipped unless `yield_empty=True`. Every
         rank must use the same setting. When a wave skips ranks, TrainerRank
@@ -342,8 +339,8 @@ class TrainerRank(_impl.TrainerRank):
     ) -> ForwardOutputs:
         """Forward inputs already local to this data-parallel rank.
 
-        Outputs remain context-parallel-local; use `ForwardOutput.positions`
-        to align masks and readouts as described in `forward_micro_batches`.
+        Outputs contain full sequences in source order on every TP/CP rank,
+        with the same loss and reduction contract as `forward_micro_batches`.
 
         Per-input checkpoints and `no_grad` values override the method defaults.
         `no_grad=None` inherits the ambient PyTorch grad mode; `True` disables
@@ -364,6 +361,7 @@ class TrainerRank(_impl.TrainerRank):
         *,
         op: dist.ReduceOp.RedOpType = dist.ReduceOp.SUM,
     ) -> None:
+        """Reduce in place over data-parallel batches, excluding TP/CP replicas."""
         super().dp_reduce(tensor, op=op)
 
     def optim_step(

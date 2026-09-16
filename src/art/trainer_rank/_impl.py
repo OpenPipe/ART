@@ -184,19 +184,7 @@ class _LocalLoRASlotRef:
 
 @dataclass(frozen=True)
 class ForwardOutput(Generic[LogprobsT, TopKT, LogitsT, HiddenStatesT]):
-    """Per-request results, local to this context-parallel rank.
-
-    ``positions`` maps axis 0 of every returned tensor (including both ``top_k``
-    tensors) to offsets in the request's flattened ``input_tokens``. It is a
-    1-D int64 tensor on the output device: ``arange(input_tokens.numel())``
-    without context parallelism, and possibly empty/noncontiguous with it.
-    ``None`` denotes a request with no requested output fields.
-
-    Select full-sequence masks/labels with ``index_select(0, output.positions)``
-    before applying them to local outputs. Positions do not apply a next-token
-    shift; any alignment with target tokens is supplied by the caller. Exclude
-    the first source token with ``positions != 0``, not by slicing a local row.
-    """
+    """Per-request tensors in flattened input order, replicated across TP/CP."""
 
     target_logprobs: LogprobsT
     top_k: TopKT
@@ -204,7 +192,6 @@ class ForwardOutput(Generic[LogprobsT, TopKT, LogitsT, HiddenStatesT]):
     hidden_states: HiddenStatesT
     checkpoint: str | None = None
     no_grad: bool = False
-    positions: torch.Tensor | None = None
 
 
 @dataclass(slots=True)
@@ -629,6 +616,34 @@ class _SlotGraphSentinel(torch.autograd.Function):
         return grad_outputs[0], None
 
 
+class _GatherContextParallelRows(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx: FunctionCtx,
+        tensor: torch.Tensor,
+        positions: torch.Tensor,
+        length: int,
+        group: dist.ProcessGroup,
+    ) -> torch.Tensor:
+        ctx.save_for_backward(positions)
+        # Each source row has one owner. Scatter + SUM handles unequal/empty
+        # shards without padded all-gather buffers, including for full logits.
+        output = tensor.new_zeros((length, *tensor.shape[1:]))
+        output.index_copy_(0, positions, tensor)
+        dist.all_reduce(output, group=group)
+        return output
+
+    @staticmethod
+    def backward(
+        ctx: FunctionCtx, *grad_outputs: torch.Tensor
+    ) -> tuple[torch.Tensor, None, None, None]:
+        (positions,) = cast(tuple[torch.Tensor, ...], getattr(ctx, "saved_tensors"))
+        # The caller's loss is replicated over CP, just as over TP after the
+        # sequence-parallel gather with tensor_parallel_output_grad=False.
+        # Route one copy to its owner, without summing CP copies of the loss.
+        return grad_outputs[0].index_select(0, positions), None, None, None
+
+
 class _CustomSlotGraphSentinel(torch.autograd.Function):
     @staticmethod
     def forward(
@@ -881,6 +896,7 @@ class _PreparedPackedForward:
     packed_seq_params: "PackedSeqParams | None"
     positions_by_item: tuple[torch.Tensor, ...]
     source_positions_by_item: tuple[torch.Tensor, ...]
+    context_parallel_group: dist.ProcessGroup | None = None
 
 
 type _RowMatch = tuple[torch.Tensor, torch.Tensor, tuple[int, ...]]
@@ -3027,7 +3043,7 @@ class TrainerRank:
         dist.all_reduce(
             tensor,
             op=op,
-            group=ps.get_data_parallel_group(with_context_parallel=True),
+            group=ps.get_data_parallel_group(with_context_parallel=False),
         )
 
     def optim_step(
@@ -3799,6 +3815,10 @@ class TrainerRank:
         for param, grad in zip(params, grads, strict=True):
             if bool(getattr(param, "allreduce", True)):
                 group = ps.get_data_parallel_group(with_context_parallel=True)
+                if getattr(param, "_art_custom_checkpoint_param", False):
+                    # Custom heads consume replicated full-sequence outputs;
+                    # average their CP copies while still summing DP batches.
+                    grad.div_(ps.get_context_parallel_world_size())
             else:
                 group = ps.get_expert_data_parallel_group()
             if group is not None and group.size() > 1:
@@ -4826,7 +4846,6 @@ class TrainerRank:
                 hidden_states=track(output.hidden_states),
                 checkpoint=output.checkpoint,
                 no_grad=output.no_grad,
-                positions=output.positions,
             )
             for output in outputs
         ]
@@ -4959,7 +4978,7 @@ class TrainerRank:
         self,
         requests: Sequence[AnyForwardInput],
     ) -> int:
-        total = _active_logical_tokens(requests) * _dtype_size(torch.long)
+        total = 0
         for request in requests:
             seq_len = int(request.input_tokens.numel())
             if request.target_tokens is not None:
@@ -5111,6 +5130,10 @@ class TrainerRank:
         static_compute = max(
             static_compute, packed_tokens * self._moe_output_bytes_per_token
         )
+        if signature.topology[2] > 1:
+            # Local head results coexist with full CP outputs during gathering.
+            # Uneven rank plans can assign all of an item's rows to one rank.
+            static_compute += output_bytes
         # A profile learned under lighter sharing (lower logical/packed ratio)
         # underestimates the per-packed-token footprint of a deeper-shared
         # plan; scale the trusted estimate up by the ratio gap.
@@ -5303,7 +5326,67 @@ class TrainerRank:
         hidden_by_row = self._gather_sequence_parallel_hidden(
             self._decoder_hidden(prepared)
         )
-        return self._project_head(items, prepared, hidden_by_row)
+        outputs = self._project_head(items, prepared, hidden_by_row)
+        group = prepared.context_parallel_group
+        if group is None:
+            return outputs
+        tensors = [
+            tensor
+            for output in outputs
+            for tensor in (
+                output.target_logprobs,
+                output.logits,
+                output.hidden_states,
+                None if output.top_k is None else output.top_k.logprobs,
+                None if output.top_k is None else output.top_k.tokens,
+            )
+            if tensor is not None
+        ]
+        grad_flags = [False for _ in tensors]
+        if torch.is_grad_enabled():
+            flags = torch.tensor(
+                [
+                    tensor.is_floating_point()
+                    and (tensor.requires_grad or hidden_by_row.requires_grad)
+                    for tensor in tensors
+                ],
+                device=hidden_by_row.device,
+                dtype=torch.int32,
+            )
+            dist.all_reduce(flags, op=dist.ReduceOp.MAX, group=group)
+            grad_flags = flags.tolist()
+        needs_grad = iter(grad_flags)
+
+        def gather(tensor: torch.Tensor | None) -> torch.Tensor | None:
+            if tensor is None:
+                return None
+            if next(needs_grad) and not tensor.requires_grad:
+                # Empty shards must still enter decoder backward collectives.
+                # A frozen decoder with a trainable head only needs a leaf.
+                tensor = tensor + hidden_by_row.reshape(-1)[:1].sum() * 0.0
+                tensor.requires_grad_(True)
+            return _GatherContextParallelRows.apply(tensor, positions, length, group)
+
+        for index, (item, output, source_positions) in enumerate(
+            zip(items, outputs, prepared.source_positions_by_item, strict=True)
+        ):
+            positions = source_positions.to(device=hidden_by_row.device)
+            length = int(item.input_ids.numel())
+            outputs[index] = replace(
+                output,
+                target_logprobs=gather(output.target_logprobs),
+                logits=gather(output.logits),
+                hidden_states=gather(output.hidden_states),
+                top_k=(
+                    TopK(
+                        cast(torch.Tensor, gather(output.top_k.logprobs)),
+                        cast(torch.Tensor, gather(output.top_k.tokens)),
+                    )
+                    if output.top_k is not None
+                    else None
+                ),
+            )
+        return outputs
 
     def _decoder_hidden(
         self,
@@ -5365,10 +5448,6 @@ class TrainerRank:
             else None
         )
         device = hidden_by_row.device
-        source_positions = tuple(
-            positions.to(device=device)
-            for positions in prepared.source_positions_by_item
-        )
         target_logprobs = [None for _ in items]
         logits: list[torch.Tensor | None] = [None for _ in items]
         top_k: list[TopK | None] = [None for _ in items]
@@ -5382,9 +5461,8 @@ class TrainerRank:
             if item.request.logits or item.request.top_k is not None:
                 projected_rows.append(positions)
             if item.labels is not None:
-                labels = item.labels.to(device=device).index_select(
-                    0, source_positions[index]
-                )
+                source_positions = prepared.source_positions_by_item[index].to(device)
+                labels = item.labels.to(device=device).index_select(0, source_positions)
                 label_rows[index] = labels
                 target_logprobs[index] = torch.zeros(
                     tuple(labels.shape),
@@ -5474,7 +5552,6 @@ class TrainerRank:
                     if item.request.hidden_states
                     else None
                 ),
-                positions=source_positions[index],
             )
             for index, (item, positions) in enumerate(
                 zip(items, prepared.positions_by_item, strict=True)
@@ -5921,6 +5998,7 @@ class TrainerRank:
             packed_seq_params=prepared.packed_seq_params,
             positions_by_item=tuple(pair[0] for pair in local_position_pairs),
             source_positions_by_item=tuple(pair[1] for pair in local_position_pairs),
+            context_parallel_group=ps.get_context_parallel_group(),
         )
 
     def _topology(self) -> "ParallelTopology":

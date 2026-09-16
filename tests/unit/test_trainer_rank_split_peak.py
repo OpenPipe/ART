@@ -151,9 +151,7 @@ def test_profile_order_change_cannot_drop_completed_split_floor(monkeypatch):
     monkeypatch.setattr(torch.cuda, "max_memory_allocated", lambda _: 10_100)
     rank._record_split_memory_floor(plan, 100, 1_200)
     # The real profile update changes only cost/order, not requests or geometry.
-    rank._update_memory_profile(
-        b, b.output_bytes + 2_600, retained_bytes=b.output_bytes + 100
-    )
+    rank._update_memory_profile(b, 3_000, retained_bytes=500)
     assert rank._plan_cost(b).ephemeral > rank._plan_cost(a).ephemeral
     before = dict(rank._memory_profiles)
     monkeypatch.setattr(rank, "_available_memory_bytes", lambda: 10_000)
@@ -179,9 +177,7 @@ def _counter_split(monkeypatch):
         100,
         retained_compute_bytes_per_token=0,
     )
-    monkeypatch.setattr(
-        rank, "_available_memory_bytes", lambda: 10_000 + 2 * child.output_bytes
-    )
+    monkeypatch.setattr(rank, "_available_memory_bytes", lambda: 10_000)
     counters: dict[str, Any] = dict(allocated=100, peak=100, resets=[], executed=0)
     monkeypatch.setattr(tr, "_telemetry_phase", lambda *a, **k: nullcontext())
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)

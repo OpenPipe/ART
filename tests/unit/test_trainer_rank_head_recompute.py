@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 from contextlib import nullcontext
+from datetime import timedelta
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
 import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
 
 from art.megatron.prefix_tree_packing import prefix_tree_pack
 from art.trainer_rank import ForwardInput, TrainerRank, _impl
@@ -26,8 +29,7 @@ def _direct(function, *args, use_reentrant=False, **kwargs):
     return function(*args, **kwargs)
 
 
-@pytest.fixture
-def local_head(monkeypatch):
+def _patch_local_head(monkeypatch):
     monkeypatch.setattr(_impl, "_HEAD_CHUNK_TOKENS", 16)
     monkeypatch.setattr(_impl, "_language_model", lambda model: model)
     monkeypatch.setattr(_impl, "_all_reduce_tensor_parallel_max", lambda value: value)
@@ -49,8 +51,9 @@ def local_head(monkeypatch):
 @pytest.mark.parametrize("include_logits", (False, True))
 @pytest.mark.parametrize("multi_target", (False, True))
 def test_recomputed_head_preserves_outputs_and_arbitrary_loss_gradients(
-    local_head, top_k, include_logits, multi_target
+    monkeypatch, top_k, include_logits, multi_target
 ):
+    _patch_local_head(monkeypatch)
     generator = torch.Generator().manual_seed(11)
     weight = torch.randn(65, 7, generator=generator) / 3
     hidden = torch.randn(41, 7, generator=generator)
@@ -141,107 +144,196 @@ def test_recomputed_head_preserves_outputs_and_arbitrary_loss_gradients(
     )
 
 
-@pytest.mark.parametrize("cp_size", (1, 2, 4))
-@pytest.mark.parametrize("fields", ("hidden", "targets", "all"))
-def test_output_positions_align_sharded_fields_masks_and_gradients(
-    local_head, cp_size, fields
+@pytest.mark.parametrize("cp_size,dp_size", ((2, 1), (4, 1), (2, 2)))
+def test_context_parallel_outputs_match_full_sequence(cp_size, dp_size, tmp_path):
+    mp.spawn(
+        _context_parallel_worker,
+        args=(cp_size, dp_size, f"file://{tmp_path / 'cp'}", "gloo"),
+        nprocs=cp_size * dp_size,
+        join=True,
+    )
+
+
+@pytest.mark.parametrize("cp_size", (2, 4))
+def test_context_parallel_outputs_cuda(cp_size, tmp_path):
+    if not torch.cuda.is_available() or torch.cuda.device_count() < cp_size:
+        pytest.skip(f"requires {cp_size} CUDA devices")
+    mp.spawn(
+        _context_parallel_worker,
+        args=(cp_size, 1, f"file://{tmp_path / 'cp'}", "nccl"),
+        nprocs=cp_size,
+        join=True,
+    )
+
+
+def _context_parallel_worker(rank, cp_size, dp_size, init_method, backend):
+    from megatron.core import parallel_state as ps
+
+    device = torch.device("cpu" if backend == "gloo" else f"cuda:{rank}")
+    if device.type == "cuda":
+        torch.cuda.set_device(device)
+    dist.init_process_group(
+        backend,
+        init_method=init_method,
+        rank=rank,
+        world_size=cp_size * dp_size,
+        timeout=timedelta(seconds=90),
+    )
+    try:
+        cp_groups = [
+            dist.new_group(list(range(dp * cp_size, (dp + 1) * cp_size)))
+            for dp in range(dp_size)
+        ]
+        dp_groups = [
+            dist.new_group(list(range(cp, cp_size * dp_size, cp_size)))
+            for cp in range(cp_size)
+        ]
+        cp_rank, dp_rank = rank % cp_size, rank // cp_size
+        cp_group, dp_group = cp_groups[dp_rank], dp_groups[cp_rank]
+        with pytest.MonkeyPatch.context() as monkeypatch:
+            _patch_local_head(monkeypatch)
+            monkeypatch.setattr(ps, "get_context_parallel_world_size", lambda: cp_size)
+            monkeypatch.setattr(
+                ps,
+                "get_data_parallel_group",
+                lambda *, with_context_parallel: (
+                    dist.group.WORLD if with_context_parallel else dp_group
+                ),
+            )
+            monkeypatch.setattr(ps, "get_tensor_model_parallel_group", lambda **_: None)
+            for mode in (
+                "hidden",
+                "targets",
+                "all",
+                "logits",
+                "head_only",
+                "frozen",
+                "no_grad",
+            ):
+                _check_context_parallel_case(
+                    cp_rank, dp_rank, cp_size, dp_size, cp_group, device, mode
+                )
+    finally:
+        dist.destroy_process_group()
+
+
+def _check_context_parallel_case(
+    cp_rank, dp_rank, cp_size, dp_size, cp_group, device, mode
 ):
     tokens = [torch.tensor(row) for row in ([1, 2, 3, 4, 5, 6, 7], [1, 2, 3, 8, 9])]
     packed = prefix_tree_pack(tokens, max_depth=1)
-    generator = torch.Generator().manual_seed(911)
-    model = SimpleNamespace(
-        output_layer=_Head(torch.randn(11, 5, generator=generator)),
-        vocab_size=11,
-        share_embeddings_and_output_weights=False,
-        _scale_logits=lambda value: value,
-    )
-    trainer = object.__new__(TrainerRank)
-    trainer.runtime = SimpleNamespace(model=[model])
-    hidden = torch.randn(packed.tokens.numel(), 5, generator=generator).requires_grad_()
-    requests = [
-        ForwardInput(
-            input_tokens=row,
-            target_tokens=(
-                torch.stack((row, row.roll(1)), dim=1) if fields != "hidden" else None
-            ),
-            hidden_states=fields != "targets",
-            logits=fields == "all",
-            top_k=3 if fields == "all" else None,
+    generator = torch.Generator(device=device).manual_seed(911)
+    features = torch.randn(9, 3, generator=generator, device=device) + dp_rank / 5
+    decoder_weight = torch.randn(3, 5, generator=generator, device=device)
+    head_weight = torch.randn(11, 5, generator=generator, device=device)
+    probe_weight = torch.randn(5, 2, generator=generator, device=device)
+    requests = []
+    for index, row in enumerate(tokens):
+        labels = torch.stack((row, row.roll(1)), dim=1)
+        labels[::2] = -100
+        if index == 1:
+            labels.fill_(-100)
+        requests.append(
+            ForwardInput(
+                input_tokens=row,
+                target_tokens=labels if mode not in ("hidden", "logits") else None,
+                hidden_states=mode not in ("targets", "logits"),
+                logits=mode not in ("hidden", "targets"),
+                top_k=3 if mode not in ("hidden", "targets", "logits") else None,
+            )
         )
-        for row in tokens
-    ]
-    items = [trainer._forward_item(request) for request in requests]
-    full = trainer._project_head(
-        items,
-        SimpleNamespace(
-            positions_by_item=packed.positions_by_sequence,
-            source_positions_by_item=tuple(torch.arange(len(row)) for row in tokens),
-        ),
-        hidden,
-    )
-    for output, row in zip(full, tokens, strict=True):
-        torch.testing.assert_close(output.positions, torch.arange(len(row)))
-
-    # Uneven, noncontiguous ownership; the last CP4 rank owns no source rows.
+    # Unequal, reversed ownership with a shared prefix; CP4 rank 3 is empty.
     owners = torch.tensor([0, 1, 1, 2, 0, 1, 1, 2, 0]) % cp_size
-    seen = [[] for _ in items]
-    local_loss = hidden.sum() * 0
-    full_loss = hidden.sum() * 0
-    for output, row in zip(full, tokens, strict=True):
-        values = output.hidden_states if fields == "hidden" else output.target_logprobs
-        full_loss = full_loss + values[row % 2 == 1].square().sum()
-    for cp_rank in range(cp_size):
-        rows = torch.nonzero(owners == cp_rank).flatten().flip(0)
-        # Include a padding row that must never appear in public positions.
-        dispatched = torch.cat((rows, torch.tensor([-1])))
-        pairs = [
-            _impl._local_position_pairs(dispatched[None], positions)
-            for positions in packed.positions_by_sequence
-        ]
-        local_hidden = torch.cat((hidden[rows], hidden.new_zeros((1, 5))))
-        outputs = trainer._project_head(
-            items,
-            SimpleNamespace(
-                positions_by_item=tuple(pair[0] for pair in pairs),
-                source_positions_by_item=tuple(pair[1] for pair in pairs),
-            ),
-            local_hidden,
-        )
-        for index, (output, reference, row) in enumerate(
-            zip(outputs, full, tokens, strict=True)
-        ):
-            positions = output.positions
-            assert positions is not None and positions.dtype == torch.long
-            assert positions.device == local_hidden.device
-            assert not positions.requires_grad
-            torch.testing.assert_close(
-                row[positions], packed.tokens.flatten()[dispatched[pairs[index][0]]]
-            )
-            seen[index].extend(positions.tolist())
-            for field in ("hidden_states", "target_logprobs", "logits"):
-                actual, expected = getattr(output, field), getattr(reference, field)
-                if expected is not None:
-                    torch.testing.assert_close(actual, expected[positions])
-            if output.top_k is not None:
-                torch.testing.assert_close(
-                    output.top_k.tokens, reference.top_k.tokens[positions]
-                )
-                torch.testing.assert_close(
-                    output.top_k.logprobs, reference.top_k.logprobs[positions]
-                )
-            mask = (row % 2 == 1).index_select(0, positions)
-            values = (
-                output.hidden_states if fields == "hidden" else output.target_logprobs
-            )
-            local_loss = local_loss + values[mask].square().sum()
-    assert [sorted(positions) for positions in seen] == [
-        list(range(len(row))) for row in tokens
+    rows = torch.nonzero(owners == cp_rank).flatten().flip(0)
+    dispatched = torch.cat((rows, torch.tensor([-1])))
+    pairs = [
+        _impl._local_position_pairs(dispatched[None], positions)
+        for positions in packed.positions_by_sequence
     ]
-    torch.testing.assert_close(local_loss, full_loss)
-    parameters = (
-        (hidden, model.output_layer.weight) if fields != "hidden" else (hidden,)
-    )
-    torch.testing.assert_close(
-        torch.autograd.grad(local_loss, parameters),
-        torch.autograd.grad(full_loss, parameters),
-    )
+
+    def run(local):
+        decoder = torch.nn.Parameter(
+            decoder_weight.clone(), requires_grad=mode not in ("frozen", "head_only")
+        )
+        head = _Head(head_weight)
+        head.weight.requires_grad_(mode != "frozen")
+        probe = torch.nn.Parameter(probe_weight.clone(), requires_grad=mode != "frozen")
+        trainer = object.__new__(TrainerRank)
+        trainer._skipped_forward_waves = {}
+        trainer.runtime = SimpleNamespace(
+            model=[
+                SimpleNamespace(
+                    output_layer=head,
+                    vocab_size=11,
+                    share_embeddings_and_output_weights=False,
+                    _scale_logits=lambda value: value,
+                )
+            ]
+        )
+        trainer._tag_custom_parameters((probe,))
+        with torch.set_grad_enabled(mode != "no_grad"):
+            hidden = features @ decoder
+            if local:
+                hidden = torch.cat((hidden[rows], hidden.new_zeros((1, 5))))
+            trainer._decoder_hidden = lambda _: hidden
+            trainer._gather_sequence_parallel_hidden = lambda value: value
+            outputs = trainer._forward_packed(
+                [trainer._forward_item(request) for request in requests],
+                SimpleNamespace(
+                    positions_by_item=(
+                        tuple(pair[0] for pair in pairs)
+                        if local
+                        else packed.positions_by_sequence
+                    ),
+                    source_positions_by_item=(
+                        tuple(pair[1] for pair in pairs)
+                        if local
+                        else tuple(torch.arange(len(row)) for row in tokens)
+                    ),
+                    context_parallel_group=cp_group if local else None,
+                ),
+            )
+            tensors, terms = [], []
+            for output, row in zip(outputs, tokens, strict=True):
+                assert not hasattr(output, "positions")
+                values = [output.target_logprobs, output.logits, output.hidden_states]
+                if output.top_k is not None:
+                    values.append(output.top_k.logprobs)
+                    tensors.append(output.top_k.tokens)
+                for value in values:
+                    if value is not None:
+                        assert value.shape[0] == len(row)
+                        tensors.append(value)
+                        terms.append(value.mean().square() + value.square().mean())
+                if output.hidden_states is not None:
+                    # The original failing caller expression needs no CP mapping.
+                    selected = output.hidden_states[1:][(row[1:] % 2 == 1).to(device)]
+                    terms.append((selected @ probe).square().mean())
+            loss = torch.stack(terms).sum()
+            if mode not in ("frozen", "no_grad"):
+                loss.backward()
+        return trainer, tensors, loss.detach(), (decoder, head.weight, probe)
+
+    reference = run(False)
+    actual = run(True)
+    for value, expected in zip(actual[1], reference[1], strict=True):
+        torch.testing.assert_close(value, expected)
+        assert value.requires_grad == expected.requires_grad
+    torch.testing.assert_close(actual[2], reference[2])
+    expected_loss = reference[2].clone()
+    dist.all_reduce(expected_loss)
+    expected_loss /= cp_size
+    trainer = actual[0]
+    trainer.dp_reduce(actual[2])
+    torch.testing.assert_close(actual[2], expected_loss)
+    count = torch.tensor(sum(len(row) for row in tokens), device=device)
+    trainer.dp_reduce(count)
+    assert count.item() == dp_size * sum(len(row) for row in tokens)
+    if mode in ("frozen", "no_grad"):
+        return
+    reduced = trainer._reduce_dynamic_grads(actual[3], scale_grads=0.5)
+    for grad, param in zip(reduced, reference[3], strict=True):
+        expected = torch.zeros_like(param) if param.grad is None else param.grad.clone()
+        dist.all_reduce(expected)
+        expected *= 0.5 / cp_size
+        torch.testing.assert_close(grad, expected, atol=2e-5, rtol=2e-5)

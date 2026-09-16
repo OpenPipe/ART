@@ -86,6 +86,34 @@ def _signature():
     return _MemorySignature((1, 1, 1, 1), (1, None), 1, (), True, (True,))
 
 
+def test_cp_memory_charges_local_and_gathered_outputs():
+    rank = _rank()
+    signature = replace(_signature(), topology=(1, 1, 4, 1))
+    output_bytes = 1 << 30
+    estimate = rank._estimate_required_memory_bytes_from_values(
+        packed_tokens=16, output_bytes=output_bytes, signature=signature
+    )
+    compute = 16 * 2048 * 2 * 14
+    assert estimate == int((compute + 2 * output_bytes) * 1.1)
+    # A warm profile includes gather workspace already; do not add it twice.
+    rank._update_memory_profile(
+        SimpleNamespace(
+            signature=signature,
+            packed_tokens=16,
+            output_bytes=output_bytes,
+            active_logical_tokens=16,
+        ),
+        compute + 2 * output_bytes,
+        retained_bytes=None,
+    )
+    assert (
+        rank._estimate_required_memory_bytes_from_values(
+            packed_tokens=16, output_bytes=output_bytes, signature=signature
+        )
+        == estimate
+    )
+
+
 def test_supported_constructor_and_original_shape(layer):
     rank = _rank(layer)
     assert rank._moe_output_bytes_per_token == (512 + 3 * 2048) * 8 * 2
@@ -272,8 +300,8 @@ def test_summed_group_envelope_and_retained_profile_unchanged():
     )
     assert len(plan.groups) == 2
     assert plan.packed_tokens == 16
-    assert plan.output_bytes == 16 * (4 + 8)
-    assert rank._plan_cost(plan).required == int((16 * 65536 + 16 * (4 + 8)) * 1.1)
+    assert plan.output_bytes == 16 * 4
+    assert rank._plan_cost(plan).required == int((16 * 65536 + 16 * 4) * 1.1)
     plan = replace(plan, packed_tokens=200, logical_tokens=200, output_bytes=4000)
     required = rank._plan_cost(plan).required
     assert required == int((200 * 65536 + 4000) * 1.1)
