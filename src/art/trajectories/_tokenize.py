@@ -5576,6 +5576,10 @@ def _tokenize_chat_view(
                         "Could not prove a sampled history message boundary with this "
                         "tokenizer"
                     )
+        if content_bounds_proven:
+            assert sampled_bounds is not None
+            # Proven message bounds outrank approximate matches in earlier context.
+            search_cursor = sampled_bounds[0]
         full_matches = (
             locations(full_exact, search_cursor) if sampled and full_exact else []
         )
