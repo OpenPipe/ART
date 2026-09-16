@@ -299,7 +299,7 @@ def plan_floor(rank: Any, plan: Any) -> tuple[int, int]:
         if not group.grad_enabled:
             # Earlier gradient groups remain live during a later reference
             # group. Only its existing MoE component enters this stage.
-            workspace = max(workspace, *(rows * s.moe_bytes_per_row for s in shapes))
+            workspace = max(workspace, rank._moe_workspace_bytes(rows))
             continue
         buckets = cp1_buckets(group.packed.segments)
         if sum(s.length for s in group.packed.segments) != rows:
@@ -308,7 +308,7 @@ def plan_floor(rank: Any, plan: Any) -> tuple[int, int]:
         workspace = max(
             workspace,
             *(
-                rows * rank._moe_checkpoint_grad_bytes_per_token
+                rank._moe_workspace_bytes(rows, checkpoint_grad=True)
                 + s.pending(rows, buckets)
                 for s in shapes
             ),

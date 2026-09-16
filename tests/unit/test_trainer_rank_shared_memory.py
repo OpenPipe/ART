@@ -120,9 +120,9 @@ def test_shared_return_in_actual_constructor_and_plan(layer, gate, no_grad):
     else:
         assert g.plan_floor(rank, plan) == (
             8296857600,
-            50640 * checkpoint_coefficient + 3157761952,
+            50640 * (checkpoint_coefficient + 128) + 3157761952,
         )
-        assert rank._plan_cost(plan).required == (23552156355 if gate else 23323992771)
+        assert rank._plan_cost(plan).required == (23559286467 if gate else 23331122883)
     selected = rank._select_next_micro_batch(requests, 0)
     assert (
         selected.check.estimated_required_bytes
@@ -141,9 +141,9 @@ def test_original_norm_installation_preserves_shared_return(layer, gated):
     assert rank._moe_checkpoint_grad_bytes_per_token == checkpoint_coefficient
     assert g.plan_floor(rank, plan) == (
         8296857600,
-        50640 * checkpoint_coefficient + 3157761952,
+        50640 * (checkpoint_coefficient + 128) + 3157761952,
     )
-    expected = 23552156355 if gated else 23323992771
+    expected = 23559286467 if gated else 23331122883
     assert rank._memory_check(plan).estimated_required_bytes == expected
     assert rank._plan_cost(plan).required == expected
 
@@ -302,7 +302,12 @@ def test_pre_gate_cache_precedes_owned_dispatcher_and_is_checkpoint_only(layer):
     groups = ((19, True), (23, False))
     assert rank._checkpoint_memory_floor(groups) == (
         19 * 40 * 4096,
-        max(19 * 196608, 23 * 192512),
+        max(
+            19 * (196608 + 128),
+            23 * 192512,
+            19 * (196608 - 32768 + 128) + 10485760,
+            23 * (192512 - 32768 + 128) + 10485760,
+        ),
     )
     for mode in (None, "selective"):
         rank.runtime.model[0].decoder.config.recompute_granularity = mode

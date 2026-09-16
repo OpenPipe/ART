@@ -126,11 +126,14 @@ def test_actual_constructor_cache_and_full_plan(pending_rank):
     assert (
         plan.packed_tokens == plan.logical_tokens == 50640 and plan.request_count == 8
     )
-    assert g.plan_floor(rank, plan) == (8296857600, 9541386240 + 3157761952)
+    assert g.plan_floor(rank, plan) == (
+        8296857600,
+        9541386240 + 50640 * 128 + 3157761952,
+    )
     assert (
         rank._memory_check(plan).estimated_required_bytes
         == rank._plan_cost(plan).required
-        == 23095829187
+        == 23102959299
     )
     selected = rank._select_next_micro_batch(requests, 0)
     assert (
@@ -154,9 +157,9 @@ def test_original_installed_norm_preserves_pending_floor(layer):
     assert rank._moe_output_bytes_per_token == 188416
     assert g.model_shapes(rank) is not None
     plan = rank._plan_flat_forward(full_requests())
-    assert g.plan_floor(rank, plan) == (8296857600, 12699148192)
-    assert rank._memory_check(plan).estimated_required_bytes == 23095829187
-    assert rank._plan_cost(plan).required == 23095829187
+    assert g.plan_floor(rank, plan) == (8296857600, 12705630112)
+    assert rank._memory_check(plan).estimated_required_bytes == 23102959299
+    assert rank._plan_cost(plan).required == 23102959299
     assert rank._estimate_flat_forward(full_requests()) is None
     for requests in ([], full_requests(no_grad=True)):
         assert g.plan_floor(rank, rank._plan_flat_forward(requests)) == (0, 0)

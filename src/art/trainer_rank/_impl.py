@@ -1360,16 +1360,55 @@ def _shared_expert_output_bytes_per_token(layer: torch.nn.Module) -> int:
     return hidden * 2
 
 
+def _expert_lora_weight_storage(lora: Any) -> tuple[int, int, int] | None:
+    """New padded weights, transposes and effective rank for the Quack path.
+
+    Original contiguous parameters are already in the allocator baseline. This
+    excludes padding-concatenation temporaries and all backward GEMM workspace.
+    """
+    from art.megatron.lora import LoRA
+
+    a, b = getattr(lora, "A_T", None), getattr(lora, "B_T", None)
+    if (
+        type(lora) is not LoRA
+        or "forward" in vars(lora)
+        or "active_lora_tensors" in vars(lora)
+        or lora._forward_hooks
+        or lora._forward_pre_hooks
+        or not isinstance(a, torch.Tensor)
+        or not isinstance(b, torch.Tensor)
+        or a.ndim != 3
+        or b.ndim != 3
+        or a.dtype not in (torch.float16, torch.bfloat16)
+        or b.dtype != a.dtype
+        or not a.is_contiguous()
+        or not b.is_contiguous()
+        or a.shape[0] != b.shape[0]
+        or a.shape[2] != b.shape[1]
+        or min(*a.shape, *b.shape) <= 0
+        or min(a.shape[1], b.shape[2]) <= 1
+        or (a.shape[2] >= 8 and a.shape[2] % 8)
+    ):
+        return None
+    effective = max(8, a.shape[2])
+    transposes = a.shape[0] * effective * (a.shape[1] + b.shape[2]) * a.element_size()
+    return (transposes if a.shape[2] < 8 else 0, transposes, effective)
+
+
 def _moe_output_bytes_per_token(
     model: Sequence[torch.nn.Module],
     shape: ParallelShape,
     *,
     checkpoint_grad: bool = False,
+    converted_stages: list[tuple[int, int]] | None = None,
 ) -> int:
     """Known routed-expert working set, not a complete model/compiled bound."""
     if shape != ParallelShape(tp=1, cp=1):
         return 0
-    from megatron.core.extensions.transformer_engine import TERowParallelGroupedLinear
+    from megatron.core.extensions.transformer_engine import (
+        TEColumnParallelGroupedLinear,
+        TERowParallelGroupedLinear,
+    )
     from megatron.core.transformer.moe.experts import TEGroupedMLP
     from megatron.core.transformer.moe.moe_layer import BaseMoELayer, MoELayer
     from megatron.core.transformer.moe.router import TopKRouter
@@ -1436,6 +1475,7 @@ def _moe_output_bytes_per_token(
             ):
                 return 0
             features = 2 * fc2.out_features
+            enclosing_fc1 = None
             inputs = getattr(lora, "A_T", None)
             if (
                 isinstance(inputs, torch.Tensor)
@@ -1470,6 +1510,7 @@ def _moe_output_bytes_per_token(
                     # remain live at the FC2 sum, including in the observed
                     # compiled path. This is one stage, not a backward bound.
                     features += 2 * fc2.out_features + fc1.out_features
+                    enclosing_fc1 = fc1
             shared = _shared_expert_output_bytes_per_token(layer)
             if (
                 checkpoint_grad
@@ -1480,10 +1521,107 @@ def _moe_output_bytes_per_token(
                 # Gate-score backward saves a distinct pre-gate X. Charge it
                 # beside this layer's returned X, not another layer's maximum.
                 shared += shared
-            coefficient = max(
-                coefficient,
-                config.moe_router_topk * features * weights.element_size() + shared,
+            row_bytes = (
+                config.moe_router_topk * features * weights.element_size() + shared
             )
+            coefficient = max(coefficient, row_bytes)
+            storage = _expert_lora_weight_storage(lora)
+            if converted_stages is not None and storage is not None:
+                padded, transposes, effective = storage
+                saved_fc1, rank_fc1 = 0, 0
+                routed_size = config.moe_router_topk * weights.element_size()
+                if enclosing_fc1 is not None:
+                    adapter = getattr(enclosing_fc1, "lora", None)
+                    base = getattr(enclosing_fc1, "linear_fc1", None)
+                    first = _expert_lora_weight_storage(adapter)
+                    if (
+                        first is not None
+                        and adapter is not None
+                        and base is not None
+                        and type(base) is TEColumnParallelGroupedLinear
+                        and "forward" not in vars(base)
+                        and not base._forward_hooks
+                        and not base._forward_pre_hooks
+                        and adapter.A_T.dtype == weights.dtype
+                        and adapter.A_T.shape[:2]
+                        == (weights.shape[0], fc2.out_features)
+                        and adapter.B_T.shape[2] == enclosing_fc1.out_features
+                    ):
+                        first_padding, first_transposes, first_rank = first
+                        # FC1 retains both routed H inputs and its base O1
+                        # while producing adapter O1. Its sum is not live yet.
+                        converted_stages.append(
+                            (
+                                routed_size
+                                * (
+                                    2 * fc2.out_features
+                                    + 2 * enclosing_fc1.out_features
+                                    + first_rank
+                                )
+                                + shared,
+                                first_padding + first_transposes,
+                            )
+                        )
+                        # At the subsequent sum, only grad-enabled execution
+                        # retains padding/tmp; the two transposes have died.
+                        converted_stages.append(
+                            (
+                                routed_size
+                                * (
+                                    2 * fc2.out_features
+                                    + 3 * enclosing_fc1.out_features
+                                    + (first_rank if checkpoint_grad else 0)
+                                )
+                                + shared,
+                                first_padding if checkpoint_grad else 0,
+                            )
+                        )
+                        if checkpoint_grad:
+                            saved_fc1, _, rank_fc1 = first
+                # At the second GEMM, the FC2 sum does not exist yet: replace
+                # that H with tmp. Both weight transposes are still local.
+                converted_stages.append(
+                    (
+                        row_bytes
+                        + routed_size * (effective + rank_fc1 - fc2.out_features),
+                        padded + transposes + saved_fc1,
+                    )
+                )
+                if checkpoint_grad:
+                    # The transposes die at return, but padding/tmp are saved
+                    # through backward. Exact fused FC1 saves also remain live.
+                    converted_stages.append(
+                        (
+                            row_bytes + routed_size * (effective + rank_fc1),
+                            padded + saved_fc1,
+                        )
+                    )
+                    if rank_fc1 and inputs is not None and inputs.shape[2] < effective:
+                        # At FC2 backward return, nominal gradient copies
+                        # coexist with effective gradients and FC1 saves.
+                        # Unpadded returns alias; original parameters are not
+                        # new storage. This is a checkpoint eager-stage floor.
+                        experts_count, input_width, rank = inputs.shape
+                        nominal = experts_count * rank * weights.element_size()
+                        copies = nominal * (
+                            input_width + (fc2.out_features if experts_count > 1 else 0)
+                        )
+                        converted_stages.append(
+                            (
+                                routed_size
+                                * (
+                                    2 * input_width
+                                    + 2 * fc2.out_features
+                                    + 2 * effective
+                                    + rank_fc1
+                                ),
+                                padded
+                                + transposes
+                                + copies
+                                + saved_fc1
+                                + 2 * (experts_count + 1) * 4,
+                            )
+                        )
     return coefficient
 
 
@@ -1554,18 +1692,32 @@ class TrainerRank:
         self._parallel_shape = ParallelShape(
             tp=tp_size, cp=cp_size, ep=ep_size, etp=etp_size
         )
+        forward_stages: list[tuple[int, int]] = []
+        gradient_stages: list[tuple[int, int]] = []
         self._moe_output_bytes_per_token = (
-            _moe_output_bytes_per_token(runtime.model, self._parallel_shape)
+            _moe_output_bytes_per_token(
+                runtime.model, self._parallel_shape, converted_stages=forward_stages
+            )
             if self._moe_layers
             else 0
         )
         # Both modes inspect original owners before dispatcher caches are installed.
         self._moe_checkpoint_grad_bytes_per_token = (
             _moe_output_bytes_per_token(
-                runtime.model, self._parallel_shape, checkpoint_grad=True
+                runtime.model,
+                self._parallel_shape,
+                checkpoint_grad=True,
+                converted_stages=gradient_stages,
             )
             if self._moe_layers
             else 0
+        )
+        # Discard partial walks if a later layer has an unsupported owner.
+        self._moe_forward_stages = (
+            tuple(forward_stages) if self._moe_output_bytes_per_token else ()
+        )
+        self._moe_gradient_stages = (
+            tuple(gradient_stages) if self._moe_checkpoint_grad_bytes_per_token else ()
         )
         selection = select_scoring(
             device_capability=capability,
@@ -3334,6 +3486,39 @@ class TrainerRank:
             raise ValueError("Invalid constructor checkpoint MoE coefficient")
         return gradient
 
+    def _moe_workspace_bytes(self, rows: int, *, checkpoint_grad: bool = False) -> int:
+        """Maximum of same-layer affine stages, not a retained multi-layer bank.
+
+        Cached at construction before dispatcher wrapping; model/slot shapes
+        must remain unchanged, as for the existing row coefficient. Ordinary
+        non-checkpoint gradients retain only the prior forward-stage coverage.
+        """
+        coefficient = (
+            self._checkpoint_moe_bytes_per_token()
+            if checkpoint_grad
+            else self._moe_output_bytes_per_token
+        )
+        stages = getattr(
+            self,
+            "_moe_gradient_stages" if checkpoint_grad else "_moe_forward_stages",
+            (),
+        )
+        if type(stages) is not tuple or any(
+            type(stage) is not tuple
+            or len(stage) != 2
+            or any(type(value) is not int or value < 0 for value in stage)
+            for stage in stages
+        ):
+            raise ValueError("Invalid constructor converted-weight stages")
+        return (
+            max(
+                rows * coefficient,
+                *(rows * per_row + fixed for per_row, fixed in stages),
+            )
+            if stages and rows > 0
+            else rows * coefficient
+        )
+
     def _checkpoint_memory_floor(
         self, group_rows: tuple[tuple[int, bool], ...]
     ) -> tuple[int, int]:
@@ -3399,9 +3584,9 @@ class TrainerRank:
         ):
             return 0, 0
         retained = gradient_rows * layers * self._hidden_size * 2
-        gradient_moe = self._checkpoint_moe_bytes_per_token()
+        self._checkpoint_moe_bytes_per_token()
         workspace = max(
-            rows * (gradient_moe if grad else self._moe_output_bytes_per_token)
+            self._moe_workspace_bytes(rows, checkpoint_grad=grad)
             for rows, grad in group_rows
         )
         return retained, workspace
@@ -5728,9 +5913,7 @@ class TrainerRank:
         )
         # Groups execute sequentially: summed packed rows conservatively bound
         # this FC2 component, not all workspace or retained graphs.
-        static_compute = max(
-            static_compute, packed_tokens * self._moe_output_bytes_per_token
-        )
+        static_compute = max(static_compute, self._moe_workspace_bytes(packed_tokens))
         # A profile learned under lighter sharing (lower logical/packed ratio)
         # underestimates the per-packed-token footprint of a deeper-shared
         # plan; scale the trusted estimate up by the ratio gap.
