@@ -153,7 +153,7 @@ def _hybrid_rank(monkeypatch: pytest.MonkeyPatch, tp: int) -> TrainerRank:
 )
 def test_sharded_floor_covers_recorded_native_gdn_peaks(monkeypatch, tp, peak):
     # H200, 64-layer Qwen3.8-27B, LoRA r1, SP, cold/warm max, 2,048 tokens.
-    # Source evidence: dev/trainer_rank_recompute_memory.csv at 22f628d6.
+    # First unsharded campaign, linked from dev/trainer_rank_recompute_memory.md.
     rank = _hybrid_rank(monkeypatch, tp)
     assert rank._memory_check(_plan(rank, tokens=2048)).estimated_required_bytes >= peak
 
