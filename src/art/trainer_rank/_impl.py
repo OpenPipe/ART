@@ -13,6 +13,7 @@ from collections.abc import (
     Sequence,
 )
 from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import dataclass, replace
 from dataclasses import field as dataclass_field
@@ -3856,7 +3857,9 @@ class TrainerRank:
                 return estimates[width]
             indices, local_inputs = local_slice(width)
             local_requests = list(_flatten(local_inputs))
-            values = self._estimate_flat_forward(local_requests, checkpoint=checkpoint)
+            values = self._estimate_flat_forward(
+                local_requests, checkpoint=checkpoint, sync_planning_errors=True
+            )
             if not self._all_ranks_true(values is not None):
                 estimates[width] = None
                 return None
@@ -3868,16 +3871,15 @@ class TrainerRank:
                 output_bytes: int,
                 signature: _MemorySignature,
             ) -> tuple[_MemoryCheck, int, int, _MemorySignature]:
+                with self._planning_status(True):
+                    required = self._estimate_required_memory_bytes_from_values(
+                        packed_tokens=packed_tokens,
+                        output_bytes=output_bytes,
+                        signature=signature,
+                        logical_tokens=logical_tokens,
+                    )
                 return (
-                    self._memory_check_required(
-                        self._estimate_required_memory_bytes_from_values(
-                            packed_tokens=packed_tokens,
-                            output_bytes=output_bytes,
-                            signature=signature,
-                            logical_tokens=logical_tokens,
-                        ),
-                        sync_across_dp=True,
-                    ),
+                    self._memory_check_required(required, sync_across_dp=True),
                     packed_tokens,
                     output_bytes,
                     signature,
@@ -3891,6 +3893,7 @@ class TrainerRank:
                     checkpoint=checkpoint,
                     exact=exact,
                     memory_minimal=memory_minimal,
+                    sync_planning_errors=True,
                 )
                 return None if estimated is None else priced(*estimated)
 
@@ -3964,12 +3967,16 @@ class TrainerRank:
                 # materialized plan, trying the cost-optimal layouts first and
                 # the memory-minimal layouts if those do not fit.
                 plan = materialize(width)
-                check = self._memory_check(plan, sync_across_dp=True)
+                check = self._memory_check(
+                    plan, sync_across_dp=True, sync_planning_errors=True
+                )
                 if not check.fits and not layout_modes.get(width, False):
                     layout_modes[width] = True
                     plans.pop(width, None)
                     plan = materialize(width)
-                    check = self._memory_check(plan, sync_across_dp=True)
+                    check = self._memory_check(
+                        plan, sync_across_dp=True, sync_planning_errors=True
+                    )
                 trusted = self._all_ranks_have_memory_profile(
                     packed_tokens=plan.packed_tokens,
                     signature=plan.signature,
@@ -3990,6 +3997,7 @@ class TrainerRank:
                     list(_flatten(local_inputs)),
                     checkpoint=checkpoint,
                     memory_minimal=layout_modes.get(width, False),
+                    sync_planning_errors=True,
                 )
                 plans[width] = plan
             return plan
@@ -4002,7 +4010,9 @@ class TrainerRank:
             check = (
                 estimated[0]
                 if estimated is not None
-                else self._memory_check(plan, sync_across_dp=True)
+                else self._memory_check(
+                    plan, sync_across_dp=True, sync_planning_errors=True
+                )
             )
             cold_start = not self._all_ranks_have_memory_profile(
                 packed_tokens=plan.packed_tokens,
@@ -4448,60 +4458,71 @@ class TrainerRank:
         checkpoint: AdapterSelection = Unset,
         memory_minimal: bool = False,
         ensure_slots: bool = True,
+        sync_planning_errors: bool = False,
     ) -> _FlatForwardPlan:
-        plans: list[_ForwardGroupPlan] = []
-        output_bytes = self._estimate_group_request_output_bytes(requests)
-        logical_tokens = sum(int(request.input_tokens.numel()) for request in requests)
-        groups = self._group_active_request_indices(
-            requests, checkpoint=checkpoint, ensure_slots=ensure_slots
-        )
-        selected_max_depth = 0
-        for (slot_ref, grad_enabled), group_indices in groups:
-            items = tuple(
-                self._forward_item(requests[index]) for index in group_indices
+        with self._planning_status(sync_planning_errors):
+            plans: list[_ForwardGroupPlan] = []
+            output_bytes = self._estimate_group_request_output_bytes(requests)
+            logical_tokens = sum(
+                int(request.input_tokens.numel()) for request in requests
             )
-            group_input_ids = tuple(item.input_ids for item in items)
-            tree, layout = self._select_group_layout(
-                group_input_ids,
-                memory_minimal=memory_minimal,
-                grad_enabled=grad_enabled,
-            )
-            selected_max_depth = max(selected_max_depth, layout.maximum_depth)
-            started = time.perf_counter()
-            packed = materialize_prefix_tree_layout(
-                group_input_ids, tree, layout, verify_shared_tokens=False
-            )
-            self._planning_seconds_accum += time.perf_counter() - started
-            plans.append(
-                _ForwardGroupPlan(
-                    slot_ref=slot_ref,
-                    grad_enabled=grad_enabled,
-                    request_indices=tuple(group_indices),
-                    items=items,
-                    packed=packed,
-                )
-            )
-
-        return _FlatForwardPlan(
-            request_count=len(requests),
-            output_metadata=tuple(
-                self._forward_output_metadata(request, checkpoint=checkpoint)
-                for request in requests
-            ),
-            groups=tuple(plans),
-            packed_tokens=sum(
-                self._physical_tokens(int(plan.packed.tokens.numel())) for plan in plans
-            ),
-            logical_tokens=logical_tokens,
-            output_bytes=output_bytes,
-            signature=self._memory_signature_from_requests(
+        if sync_planning_errors and ensure_slots:
+            self._ensure_checkpoint_slots_for(requests, checkpoint=checkpoint)
+        with self._planning_status(sync_planning_errors):
+            groups = self._group_active_request_indices(
                 requests,
-                slot_group_count=len(plans),
-                grad_modes=tuple(mode for (_, mode), _ in groups),
-            ),
-            selected_max_depth=selected_max_depth,
-            inactive_logical_tokens=logical_tokens - _active_logical_tokens(requests),
-        )
+                checkpoint=checkpoint,
+                ensure_slots=ensure_slots and not sync_planning_errors,
+            )
+            selected_max_depth = 0
+            for (slot_ref, grad_enabled), group_indices in groups:
+                items = tuple(
+                    self._forward_item(requests[index]) for index in group_indices
+                )
+                group_input_ids = tuple(item.input_ids for item in items)
+                tree, layout = self._select_group_layout(
+                    group_input_ids,
+                    memory_minimal=memory_minimal,
+                    grad_enabled=grad_enabled,
+                )
+                selected_max_depth = max(selected_max_depth, layout.maximum_depth)
+                started = time.perf_counter()
+                packed = materialize_prefix_tree_layout(
+                    group_input_ids, tree, layout, verify_shared_tokens=False
+                )
+                self._planning_seconds_accum += time.perf_counter() - started
+                plans.append(
+                    _ForwardGroupPlan(
+                        slot_ref=slot_ref,
+                        grad_enabled=grad_enabled,
+                        request_indices=tuple(group_indices),
+                        items=items,
+                        packed=packed,
+                    )
+                )
+
+            return _FlatForwardPlan(
+                request_count=len(requests),
+                output_metadata=tuple(
+                    self._forward_output_metadata(request, checkpoint=checkpoint)
+                    for request in requests
+                ),
+                groups=tuple(plans),
+                packed_tokens=sum(
+                    self._physical_tokens(int(plan.packed.tokens.numel()))
+                    for plan in plans
+                ),
+                logical_tokens=logical_tokens,
+                output_bytes=output_bytes,
+                signature=self._memory_signature_from_requests(
+                    requests,
+                    slot_group_count=len(plans),
+                    grad_modes=tuple(mode for (_, mode), _ in groups),
+                ),
+                selected_max_depth=selected_max_depth,
+                inactive_logical_tokens=logical_tokens
+                - _active_logical_tokens(requests),
+            )
 
     def _estimate_flat_forward(
         self,
@@ -4510,6 +4531,7 @@ class TrainerRank:
         checkpoint: AdapterSelection = Unset,
         exact: bool = False,
         memory_minimal: bool = False,
+        sync_planning_errors: bool = False,
     ) -> tuple[int, int, _MemorySignature] | None:
         """Estimate packed tokens for width probing.
 
@@ -4523,40 +4545,52 @@ class TrainerRank:
         content) and is used only inside the band where those bounds disagree.
         """
 
-        groups = self._group_active_request_indices(requests, checkpoint=checkpoint)
-        packed_tokens = 0
-        for (_slot, grad_enabled), group_indices in groups:
-            if exact:
-                _, layout = self._select_group_layout(
-                    tuple(
-                        requests[index].input_tokens.reshape(-1).to(dtype=torch.long)
+        if sync_planning_errors:
+            self._ensure_checkpoint_slots_for(requests, checkpoint=checkpoint)
+        with self._planning_status(sync_planning_errors):
+            groups = self._group_active_request_indices(
+                requests,
+                checkpoint=checkpoint,
+                ensure_slots=not sync_planning_errors,
+            )
+            packed_tokens = 0
+            for (_slot, grad_enabled), group_indices in groups:
+                if exact:
+                    _, layout = self._select_group_layout(
+                        tuple(
+                            requests[index]
+                            .input_tokens.reshape(-1)
+                            .to(dtype=torch.long)
+                            for index in group_indices
+                        ),
+                        memory_minimal=memory_minimal,
+                        grad_enabled=grad_enabled,
+                    )
+                    packed_tokens += self._physical_tokens(layout.packed_tokens)
+                    continue
+                # Radix depth is bounded by the number of rows, so ``len(group)``
+                # is an unlimited-sharing depth for this group; it is a bound for
+                # estimation, not a sharing policy.
+                group_packed_tokens = estimate_prefix_tree_packed_tokens(
+                    (
+                        requests[index].input_tokens.reshape(-1)
                         for index in group_indices
                     ),
-                    memory_minimal=memory_minimal,
-                    grad_enabled=grad_enabled,
+                    max_depth=len(group_indices) if memory_minimal else 0,
                 )
-                packed_tokens += self._physical_tokens(layout.packed_tokens)
-                continue
-            # Radix depth is bounded by the number of rows, so ``len(group)``
-            # is an unlimited-sharing depth for this group; it is a bound for
-            # estimation, not a sharing policy.
-            group_packed_tokens = estimate_prefix_tree_packed_tokens(
-                (requests[index].input_tokens.reshape(-1) for index in group_indices),
-                max_depth=len(group_indices) if memory_minimal else 0,
-            )
-            if group_packed_tokens is None:
-                return None
-            packed_tokens += self._physical_tokens(group_packed_tokens)
+                if group_packed_tokens is None:
+                    return None
+                packed_tokens += self._physical_tokens(group_packed_tokens)
 
-        return (
-            packed_tokens,
-            self._estimate_group_request_output_bytes(requests),
-            self._memory_signature_from_requests(
-                requests,
-                slot_group_count=len(groups),
-                grad_modes=tuple(mode for (_, mode), _ in groups),
-            ),
-        )
+            return (
+                packed_tokens,
+                self._estimate_group_request_output_bytes(requests),
+                self._memory_signature_from_requests(
+                    requests,
+                    slot_group_count=len(groups),
+                    grad_modes=tuple(mode for (_, mode), _ in groups),
+                ),
+            )
 
     def _ensure_checkpoint_slots_for(
         self,
@@ -4976,16 +5010,16 @@ class TrainerRank:
         forward: _FlatForwardPlan,
         *,
         sync_across_dp: bool = False,
+        sync_planning_errors: bool = False,
     ) -> _MemoryCheck:
-        return self._memory_check_required(
-            self._estimate_required_memory_bytes_from_values(
+        with self._planning_status(sync_planning_errors):
+            required = self._estimate_required_memory_bytes_from_values(
                 packed_tokens=forward.packed_tokens,
                 output_bytes=forward.output_bytes,
                 signature=forward.signature,
                 logical_tokens=forward.active_logical_tokens,
-            ),
-            sync_across_dp=sync_across_dp,
-        )
+            )
+        return self._memory_check_required(required, sync_across_dp=sync_across_dp)
 
     def _memory_check_required(
         self,
@@ -5133,6 +5167,30 @@ class TrainerRank:
             and profile.packed_tokens * _MEMORY_PROFILE_TRUST_GROWTH >= packed_tokens
         )
         return self._all_ranks_true(local)
+
+    @contextmanager
+    def _planning_status(self, enabled: bool) -> Generator[None, None, None]:
+        """Exchange pure local planning errors before any later WORLD check."""
+        if not enabled:
+            yield
+            return
+        primary: BaseException | None = None
+        try:
+            yield
+        except BaseException as exc:
+            primary = exc
+        exchange_error: BaseException | None = None
+        try:
+            succeeded = self._all_ranks_true(primary is None)
+        except BaseException as exc:
+            exchange_error = exc
+        # Leave the exchange's except block before raising the original error.
+        if primary is not None:
+            raise primary
+        if exchange_error is not None:
+            raise exchange_error
+        if not succeeded:
+            raise RuntimeError("Local planning failed on another DP rank")
 
     def _all_ranks_true(self, local: bool) -> bool:
         if not (dist.is_available() and dist.is_initialized()):
