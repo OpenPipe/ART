@@ -26,7 +26,7 @@ from pathlib import Path
 import struct
 import threading
 import time
-from types import TracebackType
+from types import MethodType, TracebackType
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -53,6 +53,7 @@ from art.megatron.prefix_tree_packing import (
     _local_position_pairs,
     estimate_prefix_tree_packed_tokens,
 )
+from art.trainer_rank import _gdn_memory
 from art.trainer_rank._planner_cost import (
     COEFFICIENT_VERSION_FALLBACK,
     ModelGeometry,
@@ -1203,6 +1204,162 @@ def _configure_moe_dispatcher_caches(model: Sequence[torch.nn.Module]) -> None:
                 )
 
 
+def _shared_expert_output_bytes_per_token(layer: torch.nn.Module) -> int:
+    """One supported shared return held across routed compute, not all saves.
+
+    Gated backward can also save a distinct pre-gate result. This mode-neutral
+    component intentionally omits that separate term; compiled storage may alias.
+    """
+    from megatron.core.extensions.transformer_engine import (
+        TEColumnParallelLinear,
+        TELayerNormColumnParallelLinear,
+        TERowParallelLinear,
+    )
+    from megatron.core.transformer.moe.shared_experts import SharedExpertMLP
+
+    from art.megatron.lora import (
+        LoRA,
+        SelfAttentionLinearProjLoRA,
+        SharedExpertsLinearFC1LoRA,
+        SharedExpertsLinearFC2LoRA,
+    )
+
+    shared = getattr(layer, "shared_experts", None)
+    if type(shared) is not SharedExpertMLP:
+        return 0
+    config = getattr(layer, "config", None)
+    shared_config = getattr(shared, "config", None)
+    expected = {
+        "params_dtype": torch.bfloat16,
+        "moe_shared_expert_overlap": False,
+        "sequence_parallel": False,
+        "fp32_residual_connection": False,
+        "add_bias_linear": False,
+        "use_te_activation_func": False,
+        "bias_activation_fusion": False,
+        "gated_linear_unit": True,
+        "cuda_graph_impl": "none",
+    }
+    if (
+        getattr(layer, "use_shared_expert", None) is not True
+        or getattr(layer, "shared_expert_overlap", None) is not False
+        or getattr(layer, "shared_experts_recompute", None) is not False
+        or getattr(layer, "moe_layer_recompute", None) is not False
+        or getattr(layer, "fwd_execution_map", None)
+        != ["route", "expert_compute", "postprocess"]
+        or any(
+            name in vars(layer)
+            for name in (
+                "shared_experts_compute",
+                "route",
+                "preprocess",
+                "dispatch",
+                "routed_experts_compute",
+                "combine",
+                "postprocess",
+            )
+        )
+        or any(
+            type(getattr(c, name, None)) is not type(value) or getattr(c, name) != value
+            for c in (config, shared_config)
+            for name, value in expected.items()
+        )
+        or any(
+            getattr(c, name, None)
+            for c in (config, shared_config)
+            for name in ("fp8", "fp4", "moe_latent_size")
+        )
+        or any(
+            (type(getattr(config, name, None)) is not int or getattr(config, name) != 1)
+            for name in (
+                "tensor_model_parallel_size",
+                "context_parallel_size",
+                "pipeline_model_parallel_size",
+                "expert_model_parallel_size",
+                "expert_tensor_parallel_size",
+            )
+        )
+    ):
+        return 0
+    hidden = getattr(config, "hidden_size", None)
+    width = getattr(config, "moe_shared_expert_intermediate_size", None)
+    if (
+        type(hidden) is not int
+        or hidden <= 0
+        or type(width) is not int
+        or width <= 0
+        or getattr(shared_config, "hidden_size", None) != hidden
+        or getattr(shared_config, "ffn_hidden_size", None) != width
+        or getattr(shared_config, "moe_shared_expert_intermediate_size", None) != width
+        or getattr(shared_config, "activation_func", None)
+        is not torch.nn.functional.silu
+        or getattr(shared, "activation_func", None) is not torch.nn.functional.silu
+        or type(getattr(shared, "use_shared_expert_gate", None)) is not bool
+    ):
+        return 0
+    fc1, fc2 = getattr(shared, "linear_fc1", None), getattr(shared, "linear_fc2", None)
+    row = getattr(fc2, "row_parallel_lora", None)
+    lora = getattr(row, "lora", None)
+    base1, base2 = getattr(fc1, "linear_fc1", None), getattr(row, "linear_proj", None)
+    sites = (
+        (shared, SharedExpertMLP),
+        (fc1, SharedExpertsLinearFC1LoRA),
+        (fc2, SharedExpertsLinearFC2LoRA),
+        (row, SelfAttentionLinearProjLoRA),
+        (lora, LoRA),
+        (base2, TERowParallelLinear),
+        (getattr(fc1, "gate_lora", None), LoRA),
+        (getattr(fc1, "up_lora", None), LoRA),
+    )
+    if (
+        type(base1) not in (TEColumnParallelLinear, TELayerNormColumnParallelLinear)
+        or any(type(site) is not cls for site, cls in sites)
+        or any(
+            "forward" in vars(site)
+            or cast(Any, site)._forward_hooks
+            or cast(Any, site)._forward_pre_hooks
+            for site in (base1, *(site for site, _ in sites))
+        )
+        or getattr(fc1, "non_gated", None) is not False
+        or getattr(fc1, "out_features", None) != 2 * width
+        or getattr(getattr(row, "provider", None), "tensor_model_parallel_size", None)
+        != 1
+        or getattr(getattr(row, "provider", None), "sequence_parallel", None)
+        is not False
+    ):
+        return 0
+    weights = (
+        (getattr(base1, "weight", None), (2 * width, hidden)),
+        (getattr(base2, "weight", None), (hidden, width)),
+    )
+    for adapter, inputs, outputs in (
+        (cast(Any, fc1).gate_lora, hidden, width),
+        (cast(Any, fc1).up_lora, hidden, width),
+        (lora, width, hidden),
+    ):
+        a, b = getattr(adapter, "A_T", None), getattr(adapter, "B_T", None)
+        if (
+            not isinstance(a, torch.Tensor)
+            or not isinstance(b, torch.Tensor)
+            or a.ndim != 2
+            or b.ndim != 2
+            or a.shape[1] <= 0
+            or a.shape[1] != b.shape[0]
+        ):
+            return 0
+        weights += ((a, (inputs, a.shape[1])), (b, (a.shape[1], outputs)))
+    if shared.use_shared_expert_gate:
+        weights += ((getattr(shared, "gate_weight", None), (1, hidden)),)
+    if any(
+        not isinstance(weight, torch.Tensor)
+        or weight.dtype is not torch.bfloat16
+        or tuple(weight.shape) != shape
+        for weight, shape in weights
+    ):
+        return 0
+    return hidden * 2
+
+
 def _moe_output_bytes_per_token(
     model: Sequence[torch.nn.Module], shape: ParallelShape
 ) -> int:
@@ -1312,7 +1469,8 @@ def _moe_output_bytes_per_token(
                     features += 2 * fc2.out_features + fc1.out_features
             coefficient = max(
                 coefficient,
-                config.moe_router_topk * features * weights.element_size(),
+                config.moe_router_topk * features * weights.element_size()
+                + _shared_expert_output_bytes_per_token(layer),
             )
     return coefficient
 
@@ -2816,13 +2974,27 @@ class TrainerRank:
         )
         packed_tokens = 0
         unshared_packed_tokens = 0
-        for _, group_indices in groups:
+        head_workspace_bytes = 0
+        group_rows: list[tuple[int, bool]] = []
+        for (_slot, grad_enabled), group_indices in groups:
             estimated = estimate_prefix_tree_packed_tokens(
                 (rows[index] for index in group_indices),
                 max_depth=len(group_indices),
             )
             assert estimated is not None  # rows are CPU copies
-            packed_tokens += self._physical_tokens(estimated)
+            physical_rows = self._physical_tokens(estimated)
+            packed_tokens += physical_rows
+            group_rows.append((physical_rows, grad_enabled))
+            head_requests = tuple(requests[index] for index in group_indices)
+            head_workspace_bytes = max(
+                head_workspace_bytes,
+                self._group_head_workspace_bytes(
+                    self._head_projection_rows(head_requests, lower_bound=True),
+                    head_requests,
+                    grad_enabled=grad_enabled,
+                    lower_bound=True,
+                ),
+            )
             unshared_packed_tokens += self._physical_tokens(
                 sum(int(rows[index].numel()) for index in group_indices)
             )
@@ -2838,6 +3010,8 @@ class TrainerRank:
             output_bytes=output_bytes,
             signature=signature,
             logical_tokens=logical_tokens,
+            group_rows=tuple(group_rows),
+            head_workspace_bytes=head_workspace_bytes,
         )
         profile = self._memory_profiles.get(signature)
         if (
@@ -2857,12 +3031,346 @@ class TrainerRank:
         ):
             # A larger layout may trust retained compute where full sharing
             # cannot. Its full-required retention is not a pruning lower bound.
-            # Charge only outputs here; exact plan costs keep both trust guards.
+            # Keep outputs and the independent source retention floor; exact
+            # plan costs keep both trust guards.
             return _SubforwardCost(
                 required=cost.required,
-                retained=min(cost.retained, int(output_bytes * _MEMORY_SAFETY_FACTOR)),
+                retained=min(
+                    cost.retained,
+                    int(
+                        (
+                            output_bytes
+                            + self._checkpoint_memory_floor(tuple(group_rows))[0]
+                        )
+                        * _MEMORY_SAFETY_FACTOR
+                    ),
+                ),
             )
         return cost
+
+    def _head_workspace_bytes(self, rows: int) -> int:
+        """One dense BF16 head tensor, not complete statistics/backward memory."""
+        if (
+            rows <= 0
+            or self._padded_vocab_size is None
+            or len(self.runtime.model) != 1
+            or self._topology_key()[1:] != (1, 1, 1)
+        ):
+            return 0
+        try:
+            model = _language_model(self.runtime.model[0])
+        except (AttributeError, RuntimeError):
+            return 0
+        try:
+            from megatron.core.tensor_parallel.layers import ColumnParallelLinear
+        except ModuleNotFoundError as error:
+            if error.name != "megatron":
+                raise
+            return 0
+
+        head = getattr(model, "output_layer", None)
+        if head is None or type(head) is not ColumnParallelLinear:
+            return 0
+        weight = head.weight
+        if (
+            weight is None
+            and getattr(model, "share_embeddings_and_output_weights", False) is True
+        ):
+            weight = getattr(
+                getattr(getattr(model, "embedding", None), "word_embeddings", None),
+                "weight",
+                None,
+            )
+        if weight is None:
+            return 0
+        config = getattr(model, "config", None)
+        if (
+            type(weight) not in (torch.Tensor, torch.nn.Parameter)
+            or weight.dtype is not torch.bfloat16
+            or tuple(weight.shape) != (self._padded_vocab_size, self._hidden_size)
+            or head.output_size_per_partition != self._padded_vocab_size
+            or head.output_size != self._padded_vocab_size
+            or head.input_size != self._hidden_size
+            or getattr(config, "params_dtype", None) is not torch.bfloat16
+            or getattr(config, "fp32_residual_connection", None) is not False
+            or getattr(config, "fp8", None)
+            or getattr(config, "fp4", None)
+            or "forward" in vars(head)
+            or "_forward_impl" in vars(head)
+            or getattr(head, "_forward_hooks", None)
+            or getattr(head, "_forward_pre_hooks", None)
+            or any(
+                name in vars(self)
+                for name in (
+                    "_project_head",
+                    "_project_vocab_parallel",
+                    "_local_head_stats",
+                    "_local_logits_from_hidden_rows",
+                )
+            )
+        ):
+            return 0
+        return min(rows, _HEAD_CHUNK_TOKENS) * int(self._padded_vocab_size) * 2
+
+    def _head_projection_rows(
+        self,
+        requests: Sequence[AnyForwardInput],
+        *,
+        positions: Sequence[torch.Tensor] | None = None,
+        lower_bound: bool = False,
+    ) -> int:
+        """Per-group logical bounds or exact packed union; no device-label read.
+
+        A single sequence's valid rows cannot alias each other. Across requests
+        they may share: max is a lower bound, sum an upper bound. Ignore labels
+        only when every label on that input row is -100, as projection does.
+        Device-label validity is unknown: use all rows for capacity, zero only
+        for the rejection lower bound; never copy labels from the device here.
+        """
+        if not self._head_workspace_bytes(1):
+            return 0
+        if positions is not None and any(row.device.type != "cpu" for row in positions):
+            positions = None  # Capacity bound without reading device positions.
+        counts: list[int] = []
+        projected: set[int] = set()
+        for index, request in enumerate(requests):
+            offsets = None
+            if request.logits or request.top_k is not None:
+                count = int(request.input_tokens.numel())
+            elif request.target_tokens is not None:
+                count = int(request.input_tokens.numel())
+                if request.target_tokens.device.type != "cpu":
+                    if lower_bound:
+                        count = 0
+                else:
+                    labels = request.target_tokens.to(dtype=torch.long)
+                    valid = (labels != -100).reshape(count, -1).any(dim=1)
+                    offsets = torch.nonzero(valid, as_tuple=False).reshape(-1)
+                    count = int(offsets.numel())
+            else:
+                continue
+            if positions is None:
+                counts.append(count)
+            else:
+                row = positions[index]
+                if offsets is not None:
+                    row = row.index_select(0, offsets)
+                for position in row.tolist():
+                    projected.add(int(position))
+                    if len(projected) >= _HEAD_CHUNK_TOKENS:
+                        return _HEAD_CHUNK_TOKENS
+        return min(
+            _HEAD_CHUNK_TOKENS,
+            (max(counts, default=0) if lower_bound else sum(counts))
+            if positions is None
+            else len(projected),
+        )
+
+    def _head_target_chunk_rows(
+        self,
+        requests: Sequence[AnyForwardInput],
+        *,
+        positions: Sequence[torch.Tensor] | None = None,
+        lower_bound: bool = False,
+    ) -> int:
+        """Largest projected chunk reached by labelled rows, or row bounds.
+
+        Mixed outputs do not remove target backward. Its dense indexing result
+        spans the whole projected chunk, including rows requested only as logits
+        or top-k. Ignored labels still execute backward if another output
+        projects their rows. Without a layout, valid rows give a rejection lower
+        bound; possible overlap with any labelled request gives capacity.
+        """
+        targets = tuple(
+            replace(request, logits=False, top_k=None) for request in requests
+        )
+        if positions is None or any(row.device.type != "cpu" for row in positions):
+            if lower_bound:
+                return self._head_projection_rows(targets, lower_bound=True)
+            return (
+                self._head_projection_rows(requests)
+                if any(
+                    request.target_tokens is not None and request.input_tokens.numel()
+                    for request in requests
+                )
+                else 0
+            )
+        projected: set[int] = set()
+        labelled: set[int] = set()
+        for request, row in zip(requests, positions, strict=True):
+            target_row = row[:0]
+            if request.target_tokens is not None and int(row.numel()):
+                labelled.update(row.tolist())
+                labels = request.target_tokens
+                if labels.device.type == "cpu":
+                    valid = (
+                        (labels.to(dtype=torch.long) != -100)
+                        .reshape(len(row), -1)
+                        .any(dim=1)
+                    )
+                    target_row = row.index_select(
+                        0, torch.nonzero(valid, as_tuple=False).reshape(-1)
+                    )
+                elif not lower_bound:
+                    target_row = row
+            projected.update(
+                (
+                    row if request.logits or request.top_k is not None else target_row
+                ).tolist()
+            )
+        targeted = labelled & projected
+        if not targeted:
+            return 0
+        first_target = min(targeted)
+        first_index = sum(position < first_target for position in projected)
+        chunk_start = first_index // _HEAD_CHUNK_TOKENS * _HEAD_CHUNK_TOKENS
+        return min(_HEAD_CHUNK_TOKENS, len(projected) - chunk_start)
+
+    def _group_head_workspace_bytes(
+        self,
+        rows: int,
+        requests: Sequence[AnyForwardInput],
+        *,
+        grad_enabled: bool,
+        positions: Sequence[torch.Tensor] | None = None,
+        lower_bound: bool = False,
+    ) -> int:
+        """One logits buffer, or logits + both dense target-backward gradients.
+
+        The supported head path overlaps indexing and statistics gradients
+        with recomputed logits; cold library workspaces remain outside this
+        component. Pair each group's mode with its own projected rows.
+        """
+        dense = self._head_workspace_bytes(rows)
+        if (
+            not dense
+            or not grad_enabled
+            or not any(request.target_tokens is not None for request in requests)
+        ):
+            return dense
+        from megatron.core.models.common.language_module.language_module import (
+            LanguageModule,
+        )
+
+        model = _language_model(self.runtime.model[0])
+        scale = getattr(model, "_scale_logits", None)
+        if (
+            type(scale) is MethodType
+            and scale.__self__ is model
+            and scale.__func__ is LanguageModule._scale_logits
+            and getattr(model.config, "use_mup", None) is False
+        ):
+            # IndexBackward's dense result overlaps saved logits and grad_logits.
+            # The FP32 fallback already exceeds this three-buffer component.
+            target_dense = (
+                self._head_workspace_bytes(
+                    self._head_target_chunk_rows(
+                        requests, positions=positions, lower_bound=lower_bound
+                    )
+                )
+                if any(
+                    request.logits or request.top_k is not None for request in requests
+                )
+                else dense
+            )
+            return max(dense, 3 * target_dense)
+        return dense
+
+    def _plan_head_workspace_bytes(self, plan: _FlatForwardPlan) -> int:
+        peak = 0
+        for group in plan.groups:
+            requests = tuple(item.request for item in group.items)
+            peak = max(
+                peak,
+                self._group_head_workspace_bytes(
+                    self._head_projection_rows(
+                        requests, positions=group.packed.positions_by_sequence
+                    ),
+                    requests,
+                    grad_enabled=group.grad_enabled,
+                    positions=group.packed.positions_by_sequence,
+                ),
+            )
+        return peak
+
+    def _plan_group_rows(self, plan: _FlatForwardPlan) -> tuple[tuple[int, bool], ...]:
+        return tuple(
+            (
+                self._physical_tokens(int(group.packed.tokens.numel())),
+                group.grad_enabled,
+            )
+            for group in plan.groups
+        )
+
+    def _checkpoint_memory_floor(
+        self, group_rows: tuple[tuple[int, bool], ...]
+    ) -> tuple[int, int]:
+        """Conservative saved-boundary charge and one disjoint MoE workspace.
+
+        Count actual local full/uniform/1 boundaries, including aliases, rather
+        than claiming measured distinct storage. Only this call's new groups
+        enter the term; already-live graphs remain in the availability baseline.
+        This is not a bound for custom preprocessing, attention, or all backward.
+        """
+        gradient_rows = sum(rows for rows, grad in group_rows if grad)
+        if not gradient_rows or len(self.runtime.model) != 1:
+            return 0, 0
+        try:
+            decoder = _language_model(self.runtime.model[0]).decoder
+        except (AttributeError, RuntimeError):
+            return 0, 0
+        try:
+            from megatron.core.transformer.transformer_block import TransformerBlock
+        except ModuleNotFoundError as error:
+            if error.name != "megatron":
+                raise
+            return 0, 0
+
+        if type(decoder) is not TransformerBlock:
+            return 0, 0
+        config = decoder.config
+        layers = len(decoder.layers)
+        expected = {
+            "recompute_granularity": "full",
+            "recompute_method": "uniform",
+            "recompute_num_layers": 1,
+            "distribute_saved_activations": False,
+            "sequence_parallel": False,
+            "fp32_residual_connection": False,
+            "cpu_offloading": False,
+            "cuda_graph_impl": "none",
+        }
+        if (
+            decoder.training is not True
+            or layers <= 0
+            or layers != decoder.num_layers_per_pipeline_rank
+            or layers != config.num_layers
+            or config.hidden_size != self._hidden_size
+            or config.params_dtype is not torch.bfloat16
+            or self._param_dtype_size != 2
+            or next(self.runtime.model[0].parameters()).dtype is not torch.bfloat16
+            or self._topology_key()[1:] != (1, 1, 1)
+            or _expert_parallel_shape(self.runtime.provider) != (1, 1)
+            or any(
+                type(getattr(config, name, None)) is not type(value)
+                or getattr(config, name) != value
+                for name, value in expected.items()
+            )
+            or getattr(config, "fp8", None)
+            or getattr(config, "fp4", None)
+            or any(
+                name in vars(decoder)
+                for name in ("forward", "_checkpointed_forward", "_get_layer")
+            )
+            or getattr(decoder, "_forward_hooks", None)
+            or getattr(decoder, "_forward_pre_hooks", None)
+        ):
+            return 0, 0
+        retained = gradient_rows * layers * self._hidden_size * 2
+        workspace = (
+            max(rows for rows, _grad in group_rows) * self._moe_output_bytes_per_token
+        )
+        return retained, workspace
 
     def _plan_cost(self, plan: _FlatForwardPlan) -> _SubforwardCost:
         return self._subforward_cost(
@@ -2870,6 +3378,9 @@ class TrainerRank:
             output_bytes=plan.output_bytes,
             signature=plan.signature,
             logical_tokens=plan.active_logical_tokens,
+            group_rows=self._plan_group_rows(plan),
+            head_workspace_bytes=self._plan_head_workspace_bytes(plan),
+            checkpoint_floor=_gdn_memory.plan_floor(self, plan),
         )
 
     def _subforward_cost(
@@ -2879,12 +3390,18 @@ class TrainerRank:
         output_bytes: int,
         signature: _MemorySignature,
         logical_tokens: int,
+        group_rows: tuple[tuple[int, bool], ...] = (),
+        head_workspace_bytes: int = 0,
+        checkpoint_floor: tuple[int, int] = (0, 0),
     ) -> _SubforwardCost:
         required = self._estimate_required_memory_bytes_from_values(
             packed_tokens=packed_tokens,
             output_bytes=output_bytes,
             signature=signature,
             logical_tokens=logical_tokens,
+            group_rows=group_rows,
+            head_workspace_bytes=head_workspace_bytes,
+            checkpoint_floor=checkpoint_floor,
         )
         retained = self._retained_memory_bytes(
             signature,
@@ -2892,6 +3409,9 @@ class TrainerRank:
             logical_tokens=logical_tokens,
             output_bytes=output_bytes,
             required=required,
+            checkpoint_retained_bytes=max(
+                self._checkpoint_memory_floor(group_rows)[0], checkpoint_floor[0]
+            ),
         )
         return _SubforwardCost(required=required, retained=retained)
 
@@ -2903,6 +3423,7 @@ class TrainerRank:
         logical_tokens: int,
         output_bytes: int,
         required: int,
+        checkpoint_retained_bytes: int = 0,
     ) -> int:
         """Forward-retained bytes, independent of a later backward peak.
 
@@ -2918,8 +3439,10 @@ class TrainerRank:
         ratio = logical_tokens / max(1, packed_tokens)
         if ratio > profile.logical_per_packed * _MEMORY_PROFILE_TRUST_GROWTH:
             return required
-        retained = output_bytes + profile.retained_compute_bytes_per_token * max(
-            packed_tokens, logical_tokens / profile.logical_per_packed
+        retained = output_bytes + max(
+            checkpoint_retained_bytes,
+            profile.retained_compute_bytes_per_token
+            * max(packed_tokens, logical_tokens / profile.logical_per_packed),
         )
         return min(required, int(retained * _MEMORY_SAFETY_FACTOR))
 
@@ -3870,6 +4393,8 @@ class TrainerRank:
                 packed_tokens: int,
                 output_bytes: int,
                 signature: _MemorySignature,
+                group_rows: tuple[tuple[int, bool], ...],
+                head_workspace_bytes: int,
             ) -> tuple[_MemoryCheck, int, int, _MemorySignature]:
                 with self._planning_status(True):
                     required = self._estimate_required_memory_bytes_from_values(
@@ -3877,6 +4402,8 @@ class TrainerRank:
                         output_bytes=output_bytes,
                         signature=signature,
                         logical_tokens=logical_tokens,
+                        group_rows=group_rows,
+                        head_workspace_bytes=head_workspace_bytes,
                     )
                 return (
                     self._memory_check_required(required, sync_across_dp=True),
@@ -4532,7 +5059,7 @@ class TrainerRank:
         exact: bool = False,
         memory_minimal: bool = False,
         sync_planning_errors: bool = False,
-    ) -> tuple[int, int, _MemorySignature] | None:
+    ) -> tuple[int, int, _MemorySignature, tuple[tuple[int, bool], ...], int] | None:
         """Estimate packed tokens for width probing.
 
         Cheap mode (``exact=False``) is one O(tokens) CPU walk of the packing
@@ -4553,10 +5080,22 @@ class TrainerRank:
                 checkpoint=checkpoint,
                 ensure_slots=not sync_planning_errors,
             )
+            if (
+                any(mode for (_, mode), _ in groups)
+                and _gdn_memory.model_shapes(self) is not None
+            ):
+                # Pending saves require the actual bucket/replayed-tail geometry.
+                # Existing unavailable handling materializes before admission.
+                return None
             packed_tokens = 0
+            head_workspace_bytes = 0
+            group_rows: list[tuple[int, bool]] = []
             for (_slot, grad_enabled), group_indices in groups:
+                head_requests = tuple(requests[index] for index in group_indices)
+                lower = self._head_projection_rows(head_requests, lower_bound=True)
+                upper = self._head_projection_rows(head_requests)
                 if exact:
-                    _, layout = self._select_group_layout(
+                    tree, layout = self._select_group_layout(
                         tuple(
                             requests[index]
                             .input_tokens.reshape(-1)
@@ -4566,7 +5105,51 @@ class TrainerRank:
                         memory_minimal=memory_minimal,
                         grad_enabled=grad_enabled,
                     )
-                    packed_tokens += self._physical_tokens(layout.packed_tokens)
+                    physical_rows = self._physical_tokens(layout.packed_tokens)
+                    packed_tokens += physical_rows
+                    group_rows.append((physical_rows, grad_enabled))
+                    projected = upper
+                    positions = None
+                    mixed_targets = (
+                        grad_enabled
+                        and any(
+                            request.target_tokens is not None
+                            for request in head_requests
+                        )
+                        and any(
+                            request.logits or request.top_k is not None
+                            for request in head_requests
+                        )
+                    )
+                    if lower != upper or (
+                        mixed_targets
+                        and self._head_target_chunk_rows(
+                            head_requests, lower_bound=True
+                        )
+                        != self._head_target_chunk_rows(head_requests)
+                    ):
+                        packed = materialize_prefix_tree_layout(
+                            tuple(
+                                request.input_tokens.reshape(-1).to(dtype=torch.long)
+                                for request in head_requests
+                            ),
+                            tree,
+                            layout,
+                            verify_shared_tokens=False,
+                        )
+                        projected = self._head_projection_rows(
+                            head_requests, positions=packed.positions_by_sequence
+                        )
+                        positions = packed.positions_by_sequence
+                    head_workspace_bytes = max(
+                        head_workspace_bytes,
+                        self._group_head_workspace_bytes(
+                            projected,
+                            head_requests,
+                            grad_enabled=grad_enabled,
+                            positions=positions,
+                        ),
+                    )
                     continue
                 # Radix depth is bounded by the number of rows, so ``len(group)``
                 # is an unlimited-sharing depth for this group; it is a bound for
@@ -4580,7 +5163,18 @@ class TrainerRank:
                 )
                 if group_packed_tokens is None:
                     return None
-                packed_tokens += self._physical_tokens(group_packed_tokens)
+                physical_rows = self._physical_tokens(group_packed_tokens)
+                packed_tokens += physical_rows
+                group_rows.append((physical_rows, grad_enabled))
+                head_workspace_bytes = max(
+                    head_workspace_bytes,
+                    self._group_head_workspace_bytes(
+                        lower if memory_minimal else upper,
+                        head_requests,
+                        grad_enabled=grad_enabled,
+                        lower_bound=memory_minimal,
+                    ),
+                )
 
             return (
                 packed_tokens,
@@ -4590,6 +5184,8 @@ class TrainerRank:
                     slot_group_count=len(groups),
                     grad_modes=tuple(mode for (_, mode), _ in groups),
                 ),
+                tuple(group_rows),
+                head_workspace_bytes,
             )
 
     def _ensure_checkpoint_slots_for(
@@ -5018,6 +5614,9 @@ class TrainerRank:
                 output_bytes=forward.output_bytes,
                 signature=forward.signature,
                 logical_tokens=forward.active_logical_tokens,
+                group_rows=self._plan_group_rows(forward),
+                head_workspace_bytes=self._plan_head_workspace_bytes(forward),
+                checkpoint_floor=_gdn_memory.plan_floor(self, forward),
             )
         return self._memory_check_required(required, sync_across_dp=sync_across_dp)
 
@@ -5079,6 +5678,9 @@ class TrainerRank:
         output_bytes: int,
         signature: _MemorySignature,
         logical_tokens: int | None = None,
+        group_rows: tuple[tuple[int, bool], ...] = (),
+        head_workspace_bytes: int = 0,
+        checkpoint_floor: tuple[int, int] = (0, 0),
     ) -> int:
         if packed_tokens <= 0:
             return output_bytes
@@ -5115,6 +5717,12 @@ class TrainerRank:
                 static_compute,
                 int(profiled.bytes_per_token * profiled_tokens),
             )
+        retained, workspace = self._checkpoint_memory_floor(group_rows)
+        compute = max(
+            compute,
+            max(retained, checkpoint_floor[0])
+            + max(workspace, head_workspace_bytes, checkpoint_floor[1]),
+        )
         return int((output_bytes + compute) * _MEMORY_SAFETY_FACTOR)
 
     def _available_memory_bytes(self) -> int:

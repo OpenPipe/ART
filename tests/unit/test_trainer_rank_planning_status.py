@@ -103,6 +103,7 @@ def _worker(index: int, directory: Path) -> None:
         ):
             rank = TrainerRank.__new__(TrainerRank)
             rank.device = torch.device("cpu")
+            rank._padded_vocab_size = None
             rank._planning_seconds_accum = 0.0
             rank._dp_rank_and_size = lambda: (index, 2)
             rank._physical_tokens = lambda tokens: tokens
@@ -110,7 +111,7 @@ def _worker(index: int, directory: Path) -> None:
             rank._estimate_group_request_output_bytes = lambda requests: 0
             rank._memory_signature_from_requests = lambda *args, **kwargs: None
             rank._forward_item = lambda request: SimpleNamespace(
-                input_ids=request.input_tokens
+                input_ids=request.input_tokens, request=request
             )
             rank._forward_output_metadata = lambda *args, **kwargs: (None, True)
 
@@ -190,7 +191,7 @@ def _worker(index: int, directory: Path) -> None:
                     error = caught
                 if mode in ("estimate", "materialize", "price"):
                     if index == 0:
-                        assert error is primary
+                        assert error is primary, (mode, repr(error))
                         assert error.__cause__ is cause and error.__context__ is context
                     else:
                         assert type(error) is RuntimeError

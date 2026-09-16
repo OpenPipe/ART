@@ -15,7 +15,6 @@ from art.trainer_rank import (
     AdapterSelection,
     ForwardInput,
     ForwardOutput,
-    TopK,
     TrainerRank,
     TrainerRankMemoryError,
     Unset,
@@ -225,10 +224,12 @@ def test_planner_handles_vineppo_nested_shape_and_request_mix() -> None:
     estimate = rank._estimate_flat_forward(flat)
 
     assert estimate is not None
-    packed_tokens, output_bytes, signature = estimate
+    packed_tokens, output_bytes, signature, group_rows, head_workspace_bytes = estimate
     assert packed_tokens == plan.packed_tokens
     assert output_bytes == plan.output_bytes
     assert signature == plan.signature
+    assert group_rows == rank._plan_group_rows(plan)
+    assert head_workspace_bytes == rank._plan_head_workspace_bytes(plan)
     assert plan.request_count == 12
     assert plan.signature.request_mix == (
         "target:(2,)",
@@ -936,10 +937,12 @@ def test_heterogeneous_slots_split_packing_without_losing_output_estimates(
     estimate = rank._estimate_flat_forward(requests)
 
     assert estimate is not None
-    packed_tokens, output_bytes, signature = estimate
+    packed_tokens, output_bytes, signature, group_rows, head_workspace_bytes = estimate
     assert packed_tokens == plan.packed_tokens
     assert output_bytes == plan.output_bytes
     assert signature == plan.signature
+    assert group_rows == rank._plan_group_rows(plan)
+    assert head_workspace_bytes == rank._plan_head_workspace_bytes(plan)
     assert plan.signature.slot_group_count == 4
     assert {group.slot_ref for group in plan.groups} == {
         "student",
