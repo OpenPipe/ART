@@ -1225,7 +1225,7 @@ def _shared_expert_output_bytes_per_token(layer: torch.nn.Module) -> int:
     )
 
     shared = getattr(layer, "shared_experts", None)
-    if type(shared) is not SharedExpertMLP:
+    if shared is None or type(shared) is not SharedExpertMLP:
         return 0
     config = getattr(layer, "config", None)
     shared_config = getattr(shared, "config", None)

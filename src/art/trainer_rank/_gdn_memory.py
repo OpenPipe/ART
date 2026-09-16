@@ -191,7 +191,7 @@ def model_shapes(rank: Any) -> tuple[int, tuple[Shape, ...]] | None:
     shapes = []
     for layer in decoder.layers:
         gdn = getattr(layer, "self_attention", None)
-        if type(gdn) is not GatedDeltaNet:
+        if gdn is None or type(gdn) is not GatedDeltaNet:
             continue
         if (
             getattr(gdn.forward, "__func__", None) is not _prefix_tree_forward
