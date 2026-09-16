@@ -519,6 +519,7 @@ class TestRecovery(unittest.TestCase):
         q, c, k, n = self.make()
         value = success(n)
         q._find_admissible_forward = lambda *a, **kw: value
+        q._ensure_checkpoint_slots_for = lambda *a, **kw: None
 
         def forbidden(*a, **kw):
             raise AssertionError("unnecessary added admission collective")

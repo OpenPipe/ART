@@ -2507,11 +2507,14 @@ class TrainerRank:
         checkpoint: AdapterSelection,
         context: str,
     ) -> tuple[_AnyForwardPlan, _MemoryCheck]:
+        # DP-local recovery may retry asymmetrically; checkpoint setup is WORLD.
+        self._ensure_checkpoint_slots_for(requests, checkpoint=checkpoint)
         result = self._recover_admission(
             lambda: self._find_admissible_forward(
                 requests,
                 checkpoint=checkpoint,
                 refusal_prefix="forward is predicted to exceed available memory",
+                ensure_slots=False,
             ),
             lambda value: value,
             lambda value, check: (value[0], check),
@@ -2527,6 +2530,7 @@ class TrainerRank:
         *,
         checkpoint: AdapterSelection,
         refusal_prefix: str,
+        ensure_slots: bool = True,
     ) -> tuple[_AnyForwardPlan, _MemoryCheck] | _ForwardRefusal:
         """Find an admissible plan: unsplit first, then the bounded split ladder.
 
@@ -2538,12 +2542,14 @@ class TrainerRank:
         refusal worded as "unable to find a feasible split": the search is
         bounded, so this is not a claim that none exists.
 
-        Checkpoint slots are ensured exactly once, up front; everything after
-        plans with ``ensure_slots=False`` so the number of collectives this
-        rank performs does not depend on its (DP-local) inputs.
+        Checkpoint slots are ensured up front unless the caller already did
+        so before entering a DP-local retry loop. Everything after plans with
+        ``ensure_slots=False`` so the number of collectives this rank performs
+        does not depend on its (DP-local) inputs.
         """
 
-        self._ensure_checkpoint_slots_for(requests, checkpoint=checkpoint)
+        if ensure_slots:
+            self._ensure_checkpoint_slots_for(requests, checkpoint=checkpoint)
         plan = self._plan_flat_forward(
             requests, checkpoint=checkpoint, ensure_slots=False
         )
