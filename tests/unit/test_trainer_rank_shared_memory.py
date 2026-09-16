@@ -125,6 +125,18 @@ def test_shared_return_in_actual_constructor_and_plan(layer, gate, no_grad):
     )
 
 
+@pytest.mark.parametrize("gated", [False, True])
+def test_original_norm_installation_preserves_shared_return(layer, gated):
+    layer = shared_layer(layer, gated)
+    rank, _ = rank_with_moe(layer, install_hooks=True)
+    assert _shared_expert_output_bytes_per_token(layer) == 4096
+    assert rank._moe_output_bytes_per_token == 192512
+    plan = rank._plan_flat_forward(full_requests())
+    assert g.plan_floor(rank, plan) == (8296857600, 50640 * 192512 + 3157761952)
+    assert rank._memory_check(plan).estimated_required_bytes == 23323992771
+    assert rank._plan_cost(plan).required == 23323992771
+
+
 mutations = {
     "no shared": lambda x: delattr(x, "shared_experts"),
     "disabled shared": lambda x: setattr(x, "use_shared_expert", False),

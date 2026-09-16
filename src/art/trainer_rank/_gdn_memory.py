@@ -7,6 +7,7 @@ partial floor; other shared-expert saves, AOT saves and workspace remain unprice
 """
 
 from dataclasses import dataclass
+from types import MethodType
 from typing import Any, Sequence
 
 
@@ -143,7 +144,7 @@ def model_shapes(rank: Any) -> tuple[int, tuple[Shape, ...]] | None:
     from megatron.core.transformer.transformer_block import TransformerBlock
     from transformer_engine.pytorch import RMSNorm
 
-    from art.megatron.gdn.operator import _prefix_tree_forward
+    from art.megatron.gdn.operator import _empty_safe_norm_forward, _prefix_tree_forward
     from art.megatron.lora import LoRA, SelfAttentionLinearProjLoRA
 
     config = decoder.config
@@ -219,13 +220,31 @@ def model_shapes(rank: Any) -> tuple[int, tuple[Shape, ...]] | None:
             return None
         hk, hv, dk, dv, kernel = dimensions
         conv = 2 * hk * dk + hv * dv
+        norm = gdn.out_norm
+        if type(norm) is not RMSNorm:
+            return None
+        forward = getattr(norm, "forward", None)
+        physical = getattr(norm, "_art_empty_safe_norm_physical_forward", None)
         if (
             gdn.conv1d.weight.dtype is not torch.bfloat16
             or tuple(gdn.conv1d.weight.shape) != (conv, 1, kernel)
-            or type(gdn.out_norm) is not RMSNorm
             or gdn.out_norm.weight.numel() != dv
             or gdn.out_norm.weight.dtype is not torch.bfloat16
-            or "forward" in vars(gdn.out_norm)
+            # Original GDN setup installs this wrapper even for nonempty CP1.
+            # Its nonempty path delegates unchanged to the saved bound method.
+            or (
+                "forward" in vars(norm)
+                and not (
+                    type(forward) is MethodType
+                    and forward.__self__ is norm
+                    and forward.__func__ is _empty_safe_norm_forward
+                    and getattr(norm, "_art_empty_safe_norm_hooked", None) is True
+                    and physical is not None
+                    and type(physical) is MethodType
+                    and physical.__self__ is norm
+                    and physical.__func__ is RMSNorm.forward
+                )
+            )
             or gdn.out_norm._forward_hooks
             or gdn.out_norm._forward_pre_hooks
         ):

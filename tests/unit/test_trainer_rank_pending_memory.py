@@ -21,7 +21,7 @@ def module(cls):
     return obj
 
 
-def rank_with_moe(moe_layer):
+def rank_with_moe(moe_layer, *, install_hooks=False):
     from megatron.core.ssm.gated_delta_net import GatedDeltaNet
     from megatron.core.transformer.transformer_block import TransformerBlock
     from transformer_engine.pytorch import RMSNorm
@@ -80,6 +80,10 @@ def rank_with_moe(moe_layer):
     model.config = decoder.config
     model.decoder = decoder
     model._preprocess = lambda: None
+    if install_hooks:
+        from art.megatron.gdn.operator import install_gdn_island_hooks
+
+        install_gdn_island_hooks([model])
     r: Any = TrainerRank(
         cast(
             Any,
@@ -137,6 +141,120 @@ def test_actual_constructor_cache_and_full_plan(pending_rank):
         requests, tuple(r.input_tokens for r in requests), checkpoint=Unset
     )
     assert lower.required <= rank._memory_check(plan).estimated_required_bytes
+
+
+def test_original_installed_norm_preserves_pending_floor(layer):
+    from art.megatron.gdn.operator import _empty_safe_norm_forward
+
+    rank, gd = rank_with_moe(_enclosing_moe(layer), install_hooks=True)
+    norm = gd.out_norm
+    assert norm.forward.__func__ is _empty_safe_norm_forward
+    assert norm.forward.__self__ is norm
+    assert norm._art_empty_safe_norm_physical_forward.__func__ is type(norm).forward
+    assert rank._moe_output_bytes_per_token == 188416
+    assert g.model_shapes(rank) is not None
+    plan = rank._plan_flat_forward(full_requests())
+    assert g.plan_floor(rank, plan) == (8296857600, 12699148192)
+    assert rank._memory_check(plan).estimated_required_bytes == 23095829187
+    assert rank._plan_cost(plan).required == 23095829187
+    assert rank._estimate_flat_forward(full_requests()) is None
+    for requests in ([], full_requests(no_grad=True)):
+        assert g.plan_floor(rank, rank._plan_flat_forward(requests)) == (0, 0)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "foreign wrapper",
+        "unbound wrapper",
+        "wrong wrapper self",
+        "spoofed wrapper",
+        "missing marker",
+        "false marker",
+        "integer marker",
+        "missing physical",
+        "wrong physical self",
+        "wrong physical function",
+        "recursive physical",
+        "unbound physical",
+        "spoofed physical",
+        "forward hook",
+        "pre hook",
+    ],
+)
+def test_installed_norm_rejects_changed_ownership(layer, mutation):
+    from art.megatron.gdn.operator import _empty_safe_norm_forward
+
+    rank, gd = rank_with_moe(_enclosing_moe(layer), install_hooks=True)
+    norm = gd.out_norm
+    other = module(type(norm))
+    physical = norm._art_empty_safe_norm_physical_forward
+    if mutation == "foreign wrapper":
+        norm.forward = MethodType(lambda self, x: x, norm)
+    elif mutation == "unbound wrapper":
+        norm.forward = _empty_safe_norm_forward
+    elif mutation == "wrong wrapper self":
+        norm.forward = MethodType(_empty_safe_norm_forward, other)
+    elif mutation == "spoofed wrapper":
+        norm.forward = SimpleNamespace(__self__=norm, __func__=_empty_safe_norm_forward)
+    elif mutation == "missing marker":
+        del norm._art_empty_safe_norm_hooked
+    elif mutation in ("false marker", "integer marker"):
+        norm._art_empty_safe_norm_hooked = False if mutation == "false marker" else 1
+    elif mutation == "missing physical":
+        del norm._art_empty_safe_norm_physical_forward
+    elif mutation == "wrong physical self":
+        norm._art_empty_safe_norm_physical_forward = other.forward
+    elif mutation == "wrong physical function":
+        norm._art_empty_safe_norm_physical_forward = MethodType(lambda self, x: x, norm)
+    elif mutation == "recursive physical":
+        norm._art_empty_safe_norm_physical_forward = norm.forward
+    elif mutation == "unbound physical":
+        norm._art_empty_safe_norm_physical_forward = type(norm).forward
+    elif mutation == "spoofed physical":
+        norm._art_empty_safe_norm_physical_forward = SimpleNamespace(
+            __self__=norm, __func__=physical.__func__
+        )
+    elif mutation == "forward hook":
+        norm.register_forward_hook(lambda *args: None)
+    else:
+        norm.register_forward_pre_hook(lambda *args: None)
+    assert g.model_shapes(rank) is None
+    assert g.plan_floor(rank, rank._plan_flat_forward(full_requests())) == (0, 0)
+
+
+def test_original_norm_wrapper_nonempty_delegation():
+    from art.megatron.gdn.operator import _empty_safe_norm_forward
+
+    # TE execution is CUDA-specific. This CPU leaf tests only the unchanged
+    # wrapper's delegation and original exception; it is not norm math evidence.
+    x, result = torch.ones(2, 128), torch.ones(2, 128)
+    calls = []
+    original = ValueError("physical forward failed")
+
+    def physical(value, *args, **kwargs):
+        calls.append((value, args, kwargs))
+        if kwargs.get("fail"):
+            raise original
+        return result
+
+    norm = SimpleNamespace(_art_empty_safe_norm_physical_forward=physical)
+    assert _empty_safe_norm_forward(norm, x, "argument", flag=True) is result
+    assert calls[0][0] is x and calls[0][1:] == (("argument",), {"flag": True})
+    with pytest.raises(ValueError) as caught:
+        _empty_safe_norm_forward(norm, x, fail=True)
+    assert caught.value is original
+
+
+def test_unsupported_norm_owner_is_not_inspected(layer):
+    class UnknownNorm(torch.nn.Module):
+        @property
+        def forward(self):
+            raise AssertionError("Unsupported owner must be rejected first")
+
+    rank, gd = rank_with_moe(_enclosing_moe(layer), install_hooks=True)
+    gd.out_norm = UnknownNorm()
+    assert g.model_shapes(rank) is None
 
 
 def test_pending_no_grad_empty_mixed_and_learned_max(pending_rank):
