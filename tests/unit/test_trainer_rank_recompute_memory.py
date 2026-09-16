@@ -134,6 +134,78 @@ def test_profile_cannot_erase_recompute_floor() -> None:
     assert rank._memory_check(plan).estimated_required_bytes > cold
 
 
+def _hybrid_rank(monkeypatch: pytest.MonkeyPatch, tp: int) -> TrainerRank:
+    rank = _rank(
+        "selective",
+        sequence_parallel=True,
+        linear_num_key_heads=16,
+        linear_key_head_dim=128,
+        linear_num_value_heads=48,
+        linear_value_head_dim=128,
+    )
+    rank._gdn_layers = 48
+    monkeypatch.setattr(rank, "_topology_key", lambda: (1, tp, 1, 1))
+    return rank
+
+
+@pytest.mark.parametrize(
+    "tp,peak", [(1, 33758228992), (2, 19541553664), (4, 11132523008)]
+)
+def test_sharded_floor_covers_recorded_native_gdn_peaks(monkeypatch, tp, peak):
+    # H200, 64-layer Qwen3.8-27B, LoRA r1, SP, cold/warm max, 2,048 tokens.
+    # Source evidence: dev/trainer_rank_recompute_memory.csv at 22f628d6.
+    rank = _hybrid_rank(monkeypatch, tp)
+    assert rank._memory_check(_plan(rank, tokens=2048)).estimated_required_bytes >= peak
+
+
+def test_tp4_admits_eight_k_sibling_pair_and_prices_actual_layer_mix(monkeypatch):
+    rank = _hybrid_rank(monkeypatch, 4)
+    monkeypatch.setattr(rank, "_available_memory_bytes", lambda: 119 * 2**30)
+    plan = replace(
+        _plan(rank, tokens=13928), logical_tokens=16384, output_bytes=16384 * 5120 * 2
+    )
+    check = rank._memory_check(plan)
+    assert check.fits
+    rank._gdn_layers = 64
+    assert (
+        rank._memory_check(plan).estimated_required_bytes
+        > check.estimated_required_bytes
+    )
+    rank._gdn_layers = 0
+    assert (
+        rank._memory_check(plan).estimated_required_bytes
+        < check.estimated_required_bytes
+    )
+
+
+def test_sp_discount_excludes_gathered_lora_inputs(monkeypatch):
+    rank = _hybrid_rank(monkeypatch, 4)
+    plan = _plan(rank, tokens=2048)
+    tp4 = rank._memory_check(plan).estimated_required_bytes
+    rank._sequence_parallel = False
+    assert rank._memory_check(plan).estimated_required_bytes > tp4
+    monkeypatch.setattr(rank, "_topology_key", lambda: (1, 1, 1, 1))
+    assert tp4 > rank._memory_check(plan).estimated_required_bytes / 4
+
+
+def test_gathered_inputs_cover_attention_only_cold_peak(monkeypatch):
+    # Dividing the old whole estimate by TP misses this 1,439,530,496-byte peak.
+    rank = _rank(
+        "selective",
+        hidden_size=2048,
+        ffn_hidden_size=6144,
+        num_layers=28,
+        num_attention_heads=16,
+        kv_channels=128,
+        sequence_parallel=True,
+    )
+    monkeypatch.setattr(rank, "_topology_key", lambda: (1, 2, 1, 1))
+    assert (
+        rank._memory_check(_plan(rank, tokens=1024)).estimated_required_bytes
+        >= 1439530496
+    )
+
+
 def test_non_full_estimate_covers_retained_gated_mlp_tensors() -> None:
     # Selective core-attention recompute leaves this MLP graph live. Count
     # distinct saved activation storage, excluding model parameters/views.

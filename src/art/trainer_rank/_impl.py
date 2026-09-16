@@ -1362,8 +1362,8 @@ class TrainerRank:
         # gradient reduction pre-date the planner, memory checks all-reduce
         # within the TP x CP group, the memory profile is keyed by topology so
         # TP calibrates itself online, and the fitted layout cost model prices
-        # TP explicitly. Known limitation: the cold static memory estimate
-        # ignores sharding (conservative).
+        # TP explicitly. The cold retained-activation floor also distinguishes
+        # tensor/sequence-parallel storage from gathered LoRA inputs.
         self.runtime: TrainingRuntime = runtime
         self.device: torch.device = next(runtime.model[0].parameters()).device
         self._param_dtype_size = _dtype_size(next(runtime.model[0].parameters()).dtype)
@@ -1384,6 +1384,13 @@ class TrainerRank:
             getattr(metadata_model, "config", None),
             "recompute_granularity",
             getattr(runtime.provider, "recompute_granularity", None),
+        )
+        self._sequence_parallel = bool(
+            getattr(
+                getattr(metadata_model, "config", None),
+                "sequence_parallel",
+                getattr(runtime.provider, "sequence_parallel", False),
+            )
         )
         # Layers that run the gated-delta-net path (Qwen3.5-4B: 24 of 32); the
         # cost model prices GDN state hand-offs per GDN layer, not per layer.
@@ -5138,28 +5145,45 @@ class TrainerRank:
                 geometry.moe_topk * geometry.moe_ffn_hidden_size
                 + geometry.moe_shared_expert_ffn,
             )
+            hidden = self._hidden_size
             attention_width = max(
-                self._hidden_size,
-                geometry.num_attention_heads * geometry.kv_channels,
+                hidden, geometry.num_attention_heads * geometry.kv_channels
+            )
+            gdn_width = max(
+                hidden,
                 2 * geometry.gdn_key_heads * geometry.gdn_key_head_dim
                 + 2 * geometry.gdn_value_heads * geometry.gdn_value_head_dim,
             )
-            # Megatron's selective-recompute model retains per-layer attention,
-            # norm and MLP tensors (arxiv.org/abs/2205.05198). Charge four FFN
-            # widths for gated MLPs, and routed hidden rows for MoE. Do not take
-            # TP/CP/EP or optional selective-module discounts without measured
-            # evidence; the default core_attn checkpoint leaves the MLP live.
-            layer_features = (
-                9 * attention_width
-                + 4 * ffn_width
-                + 2 * self._hidden_size * max(0, geometry.moe_topk - 1)
+            tp = max(1, self._topology_key()[1])
+            sp = tp if self._sequence_parallel else 1
+            gdn_layers = min(self._num_layers, self._gdn_layers)
+            # Split Megatron's 9H attention/norm term into 5H of norms/residuals
+            # (sequence parallel) and projection intermediates (tensor parallel).
+            # Gated MLPs retain four FFN widths. ART's column-parallel LoRA path
+            # additionally retains gathered H-wide inputs to attention and MLP,
+            # even with SP. Price hybrid layers separately, not at the max width.
+            layer_features = 5 * hidden / sp + 2 * hidden
+            if geometry.moe_experts:
+                # Routed/shared expert storage gets no TP/EP discount without
+                # evidence for expert sharding and imbalanced dispatch.
+                layer_features += 4 * ffn_width + 2 * hidden * max(
+                    0, geometry.moe_topk - 1
+                )
+            else:
+                layer_features += 4 * ffn_width / tp
+            retained_features = (
+                self._num_layers * layer_features
+                + (
+                    (self._num_layers - gdn_layers) * (9 * attention_width - 5 * hidden)
+                    + gdn_layers * (9 * gdn_width - 5 * hidden)
+                )
+                / tp
             )
+            # Optional selective modules retain the conservative undiscounted
+            # floor until their effective native checkpoint boundaries are tested.
             static_compute = max(
                 static_compute,
-                packed_tokens
-                * self._num_layers
-                * self._param_dtype_size
-                * layer_features,
+                packed_tokens * self._param_dtype_size * retained_features,
             )
         # Groups execute sequentially: summed packed rows conservatively bound
         # this FC2 component, not all workspace or retained graphs.

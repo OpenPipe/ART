@@ -21,6 +21,11 @@ envs:
   MKL_NUM_THREADS: "1"
   PYTHONUNBUFFERED: "1"
   TOKENIZERS_PARALLELISM: "false"
+  MODEL: Qwen/Qwen3.8-27B
+  MODES: selective none
+  MODULES: core_attn
+  CALIBRATION_ARGS: --pairs --tokens 2048 4096 8192 --reported-pair
+  EVIDENCE_DIR: scratch/recompute-memory-sharded
 
 setup: |
   INSTALL_VLLM_RUNTIME=false bash src/art/megatron/setup.sh
@@ -28,13 +33,13 @@ setup: |
 run: |
   set -euo pipefail
   export PYTHONPATH="$PWD/src:$PWD"
-  for mode in selective none full; do
+  for mode in ${MODES}; do
     timeout --signal=TERM --kill-after=30s 20m \
       megatron_runtime/.venv/bin/python -m torch.distributed.run \
       --standalone --nproc-per-node="$ART_MEGATRON_TENSOR_MODEL_PARALLEL_SIZE" \
-      dev/trainer_rank_recompute_memory.py --mode "$mode" \
-      --tokens 1024 2048 3072 4096 --reported-pair \
-      --evidence "scratch/recompute-memory/tp$ART_MEGATRON_TENSOR_MODEL_PARALLEL_SIZE-$mode.jsonl"
+      dev/trainer_rank_recompute_memory.py --model "$MODEL" --mode "$mode" \
+      --modules ${MODULES} ${CALIBRATION_ARGS} \
+      --evidence "$EVIDENCE_DIR/tp$ART_MEGATRON_TENSOR_MODEL_PARALLEL_SIZE-$mode.jsonl"
   done
 
 config:

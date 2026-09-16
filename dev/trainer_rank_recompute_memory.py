@@ -30,10 +30,17 @@ def main() -> None:
     parser.add_argument("--tokens", type=int, nargs="+", default=[1024, 2048, 4096])
     parser.add_argument("--repeat", type=int, default=2)
     parser.add_argument("--reported-pair", action="store_true")
+    parser.add_argument(
+        "--pairs", action="store_true", help="Two sequences at each token length"
+    )
+    parser.add_argument("--prefix-fraction", type=float, default=0.3)
+    parser.add_argument("--modules", nargs="+", default=["core_attn"])
     parser.add_argument("--evidence", type=Path, required=True)
     args = parser.parse_args()
     if args.repeat < 1 or args.layers < 0 or any(n < 1 for n in args.tokens):
         parser.error("repeat/tokens must be positive and layers nonnegative")
+    if not 0 <= args.prefix_fraction < 1:
+        parser.error("prefix-fraction must be in [0, 1)")
     load_dotenv(".env")
     from trainer_rank_support import load_random_checkpoints
 
@@ -49,7 +56,7 @@ def main() -> None:
         provider.recompute_granularity = None if args.mode == "none" else args.mode
         provider.recompute_method = "uniform" if args.mode == "full" else None
         provider.recompute_num_layers = 1 if args.mode == "full" else None
-        provider.recompute_modules = ["core_attn"] if args.mode == "selective" else []
+        provider.recompute_modules = args.modules if args.mode == "selective" else []
 
     def emit(row):
         gathered = [None] * dist.get_world_size()
@@ -88,6 +95,8 @@ def main() -> None:
             "recompute_modules": runtime.provider.recompute_modules,
             "geometry": rank._geometry.as_dict(),
             "layers": rank._num_layers,
+            "gdn_layers": rank._gdn_layers,
+            "sequence_parallel": rank._sequence_parallel,
             "topology_dp_tp_cp_pp": rank._topology_key(),
             "dtype": str(next(runtime.model[0].parameters()).dtype),
             "device": torch.cuda.get_device_name(),
@@ -97,7 +106,12 @@ def main() -> None:
             "transformer_layers_compiled": runtime.transformer_layers_compiled,
         }
         args.evidence.parent.mkdir(parents=True, exist_ok=True)
-        workloads = [([length], 0) for length in args.tokens]
+        workloads = [
+            ([length, length], int(length * args.prefix_fraction))
+            if args.pairs
+            else ([length], 0)
+            for length in args.tokens
+        ]
         if args.reported_pair:
             # Same logical/fully-shared packed counts as #913; synthetic IDs.
             workloads.append(([19221, 19222], 5733))
