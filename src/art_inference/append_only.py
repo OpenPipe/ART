@@ -105,7 +105,12 @@ def patch_harmony(module: Any, preserves: Callable[[], bool], namespace: str) ->
     def render(messages):
         if not preserves():
             return original(messages)
-        from openai_harmony import Conversation, RenderConversationConfig, Role
+        # Harmony is provided by the inference engine's environment.
+        from openai_harmony import (  # ty: ignore[unresolved-import]
+            Conversation,
+            RenderConversationConfig,
+            Role,
+        )
 
         encoding = module.get_encoding()
         config = RenderConversationConfig(auto_drop_analysis=False)
