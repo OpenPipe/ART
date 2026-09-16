@@ -146,6 +146,7 @@ def test_recomputed_head_preserves_outputs_and_arbitrary_loss_gradients(
 
 @pytest.mark.parametrize("cp_size,dp_size", ((2, 1), (4, 1), (2, 2)))
 def test_context_parallel_outputs_match_full_sequence(cp_size, dp_size, tmp_path):
+    pytest.importorskip("megatron.core")
     mp.spawn(
         _context_parallel_worker,
         args=(cp_size, dp_size, f"file://{tmp_path / 'cp'}", "gloo"),
@@ -158,6 +159,7 @@ def test_context_parallel_outputs_match_full_sequence(cp_size, dp_size, tmp_path
 def test_context_parallel_outputs_cuda(cp_size, tmp_path):
     if not torch.cuda.is_available() or torch.cuda.device_count() < cp_size:
         pytest.skip(f"requires {cp_size} CUDA devices")
+    pytest.importorskip("megatron.core")
     mp.spawn(
         _context_parallel_worker,
         args=(cp_size, 1, f"file://{tmp_path / 'cp'}", "nccl"),

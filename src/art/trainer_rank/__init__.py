@@ -254,8 +254,8 @@ class TrainerRank(_impl.TrainerRank):
         the caller-owned `ForwardInput` objects.
 
         Per-position outputs contain the full flattened input sequence in source
-        order, including with context parallelism. TP/CP ranks compute the same
-        loss on these replicated outputs; ART routes gradients to owning rows
+        order, including with context parallelism. Callers must compute identical
+        losses on every TP/CP replica; ART routes gradients to owning rows
         without multiplying them by the number of replicas. `dp_reduce` combines
         only distinct data-parallel batches.
 

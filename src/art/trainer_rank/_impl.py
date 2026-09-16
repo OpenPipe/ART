@@ -3040,6 +3040,7 @@ class TrainerRank:
         self._guard_forward_collective("dp_reduce")
         from megatron.core import parallel_state as ps
 
+        # Public outputs are CP-replicated; internal shard reductions still include CP.
         dist.all_reduce(
             tensor,
             op=op,
