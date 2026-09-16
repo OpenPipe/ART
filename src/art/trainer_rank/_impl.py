@@ -5159,23 +5159,27 @@ class TrainerRank:
             gdn_layers = min(self._num_layers, self._gdn_layers)
             # Split Megatron's 9H attention/norm term into 5H of norms/residuals
             # (sequence parallel) and projection intermediates (tensor parallel).
-            # Gated MLPs retain four FFN widths. ART's column-parallel LoRA path
+            # Gated MLPs also retain unfused gate/up and LoRA sums: four FFN
+            # widths underpredicted native eager peaks; charge six in both modes
+            # since torch.compile can fall back to eager. GDN's projection,
+            # convolution and recurrent streams use a separate seven-width term
+            # (see dev/trainer_rank_recompute_memory.md). ART's LoRA path
             # additionally retains gathered H-wide inputs to attention and MLP,
             # even with SP. Price hybrid layers separately, not at the max width.
             layer_features = 5 * hidden / sp + 2 * hidden
             if geometry.moe_experts:
                 # Routed/shared expert storage gets no TP/EP discount without
                 # evidence for expert sharding and imbalanced dispatch.
-                layer_features += 4 * ffn_width + 2 * hidden * max(
+                layer_features += 6 * ffn_width + 2 * hidden * max(
                     0, geometry.moe_topk - 1
                 )
             else:
-                layer_features += 4 * ffn_width / tp
+                layer_features += 6 * ffn_width / tp
             retained_features = (
                 self._num_layers * layer_features
                 + (
                     (self._num_layers - gdn_layers) * (9 * attention_width - 5 * hidden)
-                    + gdn_layers * (9 * gdn_width - 5 * hidden)
+                    + gdn_layers * (7 * gdn_width - 5 * hidden)
                 )
                 / tp
             )

@@ -188,8 +188,20 @@ def test_sp_discount_excludes_gathered_lora_inputs(monkeypatch):
     assert tp4 > rank._memory_check(plan).estimated_required_bytes / 4
 
 
-def test_gathered_inputs_cover_attention_only_cold_peak(monkeypatch):
-    # Dividing the old whole estimate by TP misses this 1,439,530,496-byte peak.
+@pytest.mark.parametrize(
+    "packed,logical,peak",
+    [
+        (1742, 2048, 3043651584),
+        (6964, 8192, 11941280768),
+        (13928, 16384, 23861987840),
+        (27854, 32768, 47563188736),
+    ],
+)
+def test_gathered_inputs_cover_attention_only_cold_peak(
+    monkeypatch, packed, logical, peak
+):
+    # Native eager Qwen3-1.7B TP2 paired requests at d31f9423, max across ranks
+    # and cold/warm repetitions. Four FFN widths missed all four peaks.
     rank = _rank(
         "selective",
         hidden_size=2048,
@@ -200,10 +212,12 @@ def test_gathered_inputs_cover_attention_only_cold_peak(monkeypatch):
         sequence_parallel=True,
     )
     monkeypatch.setattr(rank, "_topology_key", lambda: (1, 2, 1, 1))
-    assert (
-        rank._memory_check(_plan(rank, tokens=1024)).estimated_required_bytes
-        >= 1439530496
+    plan = replace(
+        _plan(rank, tokens=packed),
+        logical_tokens=logical,
+        output_bytes=logical * 2048 * 2,
     )
+    assert rank._memory_check(plan).estimated_required_bytes >= peak
 
 
 def test_non_full_estimate_covers_retained_gated_mlp_tensors() -> None:
