@@ -2,7 +2,7 @@
 
 import sys
 
-from art_inference import chat_template as _implementation
-from art_inference.chat_template import *  # noqa: F403
+from art_inference import append_only as _implementation
+from art_inference.append_only import *  # noqa: F403
 
 sys.modules[__name__] = _implementation

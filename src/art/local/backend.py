@@ -16,9 +16,9 @@ from types import TracebackType
 from typing import TYPE_CHECKING, Any, AsyncIterator, Iterable, Literal, cast
 import warnings
 
+from art.tokenizer import get_tokenizer
 from art.utils.chat_template import (
     chat_template_with_preserved_thinking,
-    configure_preserved_thinking_chat_template,
 )
 from art.utils.lifecycle import (
     PROCESS_SHUTDOWN_TIMEOUT_SECONDS,
@@ -40,7 +40,6 @@ import numpy as np
 from pydantic import BaseModel, ConfigDict
 import torch
 from tqdm import auto as tqdm
-from transformers import AutoTokenizer
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 from typing_extensions import Self
 
@@ -196,7 +195,9 @@ def _apply_configured_chat_template(
 ) -> None:
     chat_template = _configured_chat_template_value(internal_config)
     if chat_template is not None:
-        tokenizer.chat_template = chat_template
+        tokenizer.chat_template = cast(
+            str, chat_template_with_preserved_thinking(chat_template)
+        )
 
 
 def _model_support_handler(
@@ -241,9 +242,9 @@ def _apply_configured_chat_template_server_args(
         chat_template = _model_support_default_chat_template(
             base_model, internal_config
         )
-    if chat_template is None and _should_probe_preserve_thinking_template(base_model):
+    if chat_template is None and base_model is not None:
         try:
-            tokenizer = AutoTokenizer.from_pretrained(base_model)
+            tokenizer = get_tokenizer(base_model)
         except (OSError, ValueError) as error:
             warnings.warn(
                 f"Could not load {base_model!r} to configure prior-thinking "
@@ -252,13 +253,14 @@ def _apply_configured_chat_template_server_args(
                 stacklevel=2,
             )
         else:
-            default = getattr(tokenizer, "chat_template", None)
-            preserved = chat_template_with_preserved_thinking(default)
-            if preserved != default:
-                chat_template = cast(str, preserved)
+            template = getattr(tokenizer, "chat_template", None)
+            if isinstance(template, str) and ("{{" in template or "{%" in template):
+                chat_template = template
     if chat_template is None:
         return
-    server_args.setdefault("chat_template", chat_template)
+    server_args.setdefault(
+        "chat_template", chat_template_with_preserved_thinking(chat_template)
+    )
     if chat_template_content_format := internal_config.get(
         "chat_template_content_format"
     ):
@@ -267,13 +269,6 @@ def _apply_configured_chat_template_server_args(
             chat_template_content_format,
         )
     config_dict["server_args"] = server_args
-
-
-def _should_probe_preserve_thinking_template(base_model: str | None) -> bool:
-    if base_model is None:
-        return False
-    model_name = base_model.rstrip("/").rsplit("/", 1)[-1]
-    return model_name.startswith(("Qwen3-", "Qwen3.5-"))
 
 
 def _tokenizer_cache_key(
@@ -287,12 +282,7 @@ def _tokenizer_cache_key(
 
 
 def _load_training_tokenizer(base_model: str) -> PreTrainedTokenizerBase:
-    return cast(
-        PreTrainedTokenizerBase,
-        configure_preserved_thinking_chat_template(
-            AutoTokenizer.from_pretrained(base_model)
-        ),
-    )
+    return get_tokenizer(base_model)
 
 
 class LocalBackend:

@@ -197,13 +197,11 @@ def _check_corpus_tokenizer(corpus: dict[str, Any], model: str) -> dict[str, Any
     compares vocabulary sizes; it fails the cell loudly on any difference.
     """
 
-    from transformers import AutoTokenizer
+    from art import get_tokenizer
 
     corpus_model = str(corpus.get("tokenizer_model") or "")
-    model_tokenizer = AutoTokenizer.from_pretrained(model, trust_remote_code=True)
-    corpus_tokenizer = AutoTokenizer.from_pretrained(
-        corpus_model, trust_remote_code=True
-    )
+    model_tokenizer = get_tokenizer(model, trust_remote_code=True)
+    corpus_tokenizer = get_tokenizer(corpus_model, trust_remote_code=True)
     sample = corpus["groups"][0]["histories"][0]["tokens"][:256]
     problems = []
     if len(model_tokenizer) != len(corpus_tokenizer):

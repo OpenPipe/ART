@@ -1,6 +1,8 @@
+import asyncio
 import json
 from pathlib import Path
-from typing import cast
+from types import SimpleNamespace
+from typing import Any, cast
 
 from tinker import EncodedTextChunk, ModelInput
 from tinker_cookbook import renderers
@@ -73,6 +75,32 @@ def _get_test_renderer(name: str, tokenizer: FakeTokenizer) -> renderers.Rendere
 
 def test_get_renderer_name_autodetects_qwen3_5() -> None:
     assert get_renderer_name("Qwen/Qwen3.5-35B-A3B") == "qwen3_5_disable_thinking"
+
+
+def test_tinker_normalizes_tool_arguments_for_mapping_templates():
+    from art.tinker.server import OpenAICompatibleTinkerServerWorker
+
+    class Tokenizer:
+        chat_template = (
+            "{% for k, v in tool_call.function.arguments.items() %}{{ k }}{% endfor %}"
+        )
+
+        def apply_chat_template(self, messages, **kwargs):
+            assert messages[0]["tool_calls"][0]["function"]["arguments"] == {"x": 1}
+            return [1, 2]
+
+    worker = OpenAICompatibleTinkerServerWorker(
+        _renderers={"model": cast(Any, SimpleNamespace(tokenizer=Tokenizer()))}
+    )
+    message = {
+        "role": "assistant",
+        "tool_calls": [{"function": {"name": "lookup", "arguments": '{"x": 1}'}}],
+    }
+    assert asyncio.run(worker.prompt_tokens("model", cast(Any, [message]), None)) == [
+        1,
+        2,
+    ]
+    assert message["tool_calls"][0]["function"]["arguments"] == '{"x": 1}'
 
 
 def test_qwen3_5_generation_prompt_matches_hf_suffixes() -> None:
