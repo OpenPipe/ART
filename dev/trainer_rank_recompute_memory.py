@@ -98,6 +98,7 @@ def main() -> None:
             "gdn_layers": rank._gdn_layers,
             "sequence_parallel": rank._sequence_parallel,
             "topology_dp_tp_cp_pp": rank._topology_key(),
+            "parallel_shape": asdict(rank._parallel_shape),
             "dtype": str(next(runtime.model[0].parameters()).dtype),
             "device": torch.cuda.get_device_name(),
             "device_total_bytes": torch.cuda.get_device_properties(0).total_memory,
@@ -167,6 +168,13 @@ def main() -> None:
                 loss = torch.stack(terms).sum()
                 loss.backward()
                 torch.cuda.synchronize()
+                backward_peak = torch.cuda.max_memory_allocated()
+                backward_seconds = time.monotonic() - started
+                gradients = [
+                    p.grad
+                    for p in rank._checkpoint_slots[slot].params
+                    if p.grad is not None
+                ]
                 emit(
                     {
                         **row,
@@ -175,17 +183,21 @@ def main() -> None:
                         "baseline_reserved_bytes": reserved,
                         "forward_peak_delta_bytes": forward_peak - baseline,
                         "retained_delta_bytes": retained - baseline,
-                        "forward_backward_peak_delta_bytes": torch.cuda.max_memory_allocated()
-                        - baseline,
+                        "forward_backward_peak_delta_bytes": backward_peak - baseline,
                         "peak_reserved_bytes": torch.cuda.max_memory_reserved(),
                         "forward_seconds": forward_seconds,
-                        "forward_backward_seconds": time.monotonic() - started,
+                        "forward_backward_seconds": backward_seconds,
                         "finite_loss": bool(torch.isfinite(loss).item()),
+                        "gradient_tensors": len(gradients),
+                        "finite_gradients": bool(gradients)
+                        and all(
+                            bool(torch.isfinite(g).all().item()) for g in gradients
+                        ),
                         "estimate_covers_forward": check.estimated_required_bytes
                         >= forward_peak - baseline,
                     }
                 )
-                del outputs, loss, terms
+                del outputs, loss, terms, gradients
                 rank.zero_grad()
     finally:
         dist.destroy_process_group()
