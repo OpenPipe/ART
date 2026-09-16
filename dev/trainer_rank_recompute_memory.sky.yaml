@@ -1,0 +1,51 @@
+# Launch with --infra k8s/cks-wb3 --idle-minutes-to-autostop 10 --down.
+# Set ART_CALIBRATION_SOURCE_SHA to the commit synced in workdir.
+name: trainer-rank-recompute-memory
+workdir: .
+
+resources:
+  infra: k8s/cks-wb3
+  accelerators: H200:4
+  cpus: 32+
+  memory: 256+
+  image_id: docker:docker.io/bradhiltonnw/art-gpu:latest
+
+envs:
+  ART_CALIBRATION_SOURCE_SHA: unset
+  ART_MEGATRON_TENSOR_MODEL_PARALLEL_SIZE: "4"
+  ART_MEGATRON_CONTEXT_PARALLEL_SIZE: "1"
+  ART_MEGATRON_DATA_PARALLEL_SIZE: "1"
+  ART_MEGATRON_PIPELINE_MODEL_PARALLEL_SIZE: "1"
+  OMP_NUM_THREADS: "1"
+  OPENBLAS_NUM_THREADS: "1"
+  MKL_NUM_THREADS: "1"
+  PYTHONUNBUFFERED: "1"
+  TOKENIZERS_PARALLELISM: "false"
+
+setup: |
+  INSTALL_VLLM_RUNTIME=false bash src/art/megatron/setup.sh
+
+run: |
+  set -euo pipefail
+  export PYTHONPATH="$PWD/src:$PWD"
+  for mode in selective none full; do
+    timeout --signal=TERM --kill-after=30s 20m \
+      megatron_runtime/.venv/bin/python -m torch.distributed.run \
+      --standalone --nproc-per-node="$ART_MEGATRON_TENSOR_MODEL_PARALLEL_SIZE" \
+      dev/trainer_rank_recompute_memory.py --mode "$mode" \
+      --tokens 1024 2048 3072 4096 --reported-pair \
+      --evidence "scratch/recompute-memory/tp$ART_MEGATRON_TENSOR_MODEL_PARALLEL_SIZE-$mode.jsonl"
+  done
+
+config:
+  kubernetes:
+    pod_config:
+      spec:
+        schedulerName: binpack-scheduler
+        activeDeadlineSeconds: 7200
+        containers:
+          - name: ray-node
+            imagePullPolicy: Always
+            env:
+              - name: UV_LINK_MODE
+                value: copy
