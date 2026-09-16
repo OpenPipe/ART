@@ -18,6 +18,35 @@ FLA_CHUNK_SIZE = 64
 # kernels recover some parallelism at larger state shapes. Communication terms
 # below still use exact bytes moved.
 _RUNTIME_STATE_THROUGHPUT_EXPONENT = 0.75
+# The GDN layer's dense work (input projection, output projection) runs on the
+# GDN layout, so it follows a rank's GDN-owned tokens; priced from its FLOPs at
+# the throughput the paired planner A/B campaigns fitted jointly on Qwen3.5-4B,
+# Qwen3.5-27B and Qwen3.5-35B-A3B (H200 bf16, 982 paired layouts, 2026-09-09).
+_RUNTIME_DENSE_ACHIEVED_TFLOPS = 156.0
+
+
+def _dense_tokens_per_ms(
+    *,
+    hidden_size: int,
+    local_key_heads: int,
+    local_value_heads: int,
+    key_dim: int,
+    value_dim: int,
+    achieved_tflops: float = _RUNTIME_DENSE_ACHIEVED_TFLOPS,
+) -> float:
+    """Tokens per millisecond of one rank's GDN projections (forward + backward).
+
+    The fused input projection maps hidden to 2 (q, k) x key width + 2 (v, z) x
+    value width + 2 x value heads (b, a); the output projection maps the value
+    width back to hidden. Backward is about twice the forward.
+    """
+
+    in_proj_dim = 2 * local_key_heads * key_dim + 2 * local_value_heads * value_dim
+    in_proj_dim += 2 * local_value_heads
+    flops = (
+        3.0 * 2.0 * float(hidden_size) * (in_proj_dim + local_value_heads * value_dim)
+    )
+    return achieved_tflops * 1e12 / flops * 1e-3
 
 
 def _dtype_bytes(dtype: Any) -> int:
@@ -143,6 +172,13 @@ class GdnPlannerConfig:
     key/value dim 128. Production callers should construct this with
     ``from_model_shape`` so the same fitted hardware model scales by the actual
     GDN state size instead of acting as a per-model profile.
+
+    The per-rank critical path is the recurrent work (padded per bucket) plus
+    the dense projection work of every GDN-owned token
+    (``runtime_dense_tokens_per_ms``): the paired planner A/B on Qwen3.5-4B
+    (2026-09-09) showed a rank holding one 12.5k-token sequence costs about
+    2 us per token, twice the recurrent rate alone, which is what makes
+    chaining a long sequence across ranks pay off.
     """
 
     cp_chain_beam_width: int = 2
@@ -150,8 +186,12 @@ class GdnPlannerConfig:
     cp_chain_beam_candidate_limit: int = 16
     cp_chain_beam_max_steps: int = 4
     # Chain buckets add extra collectives and kernel shapes; require a
-    # measurable runtime win before selecting them over local execution.
-    cp_chain_min_runtime_delta_ms: float = 4.0
+    # measurable runtime win before selecting them over local execution. The
+    # paired campaigns put the model's error at about 5 ms per layer (rms); on
+    # the paired validation against the previous planner every chain that
+    # measured slower on Qwen3.5-4B was predicted to save under 2 ms, and a
+    # 2 ms gate keeps 97% of the measured gains on 4B and 99% on 27B.
+    cp_chain_min_runtime_delta_ms: float = 2.0
     runtime_hidden_bytes_per_token: int = 4096
     runtime_layout_exchange_count: int = 4
     # Global all-to-all token counts are priced against aggregate CP bandwidth.
@@ -161,18 +201,24 @@ class GdnPlannerConfig:
     # recurrent communication work that is not captured by token counts alone.
     runtime_local_recurrent_tokens_per_ms: float = 1_500.0
     runtime_chain_recurrent_tokens_per_ms: float = 1_400.0
-    runtime_local_bucket_launch_ms: float = 0.20
-    runtime_chain_bucket_launch_ms: float = 0.20
+    # Dense (projection) work per GDN-owned token on a rank, chained or not; the
+    # default is the reference shape's rate.
+    runtime_dense_tokens_per_ms: float = 772.0
+    runtime_local_bucket_launch_ms: float = 2.2
+    runtime_chain_bucket_launch_ms: float = 2.2
     runtime_local_segment_launch_ms: float = 0.005
     runtime_cp_summary_bytes_per_segment: int = 4_194_304
     runtime_cp_summary_exchange_count_per_bucket: int = 8
     # Summary collectives move small state tensors and do not sustain the large
-    # hidden-state all-to-all bandwidth used by the layout exchange term.
-    runtime_cp_summary_bandwidth_bytes_per_ms: float = 80_000_000.0
+    # hidden-state all-to-all bandwidth used by the layout exchange term. The
+    # paired campaigns do not expose a per-byte summary cost beyond the
+    # per-segment scan below (the two are collinear), so the bandwidth is set
+    # high and the per-segment and per-bucket costs carry the chain overhead.
+    runtime_cp_summary_bandwidth_bytes_per_ms: float = 10_000_000_000.0
     runtime_cp_summary_collective_latency_ms: float = 0.0
     runtime_cp_summary_compute_segments_per_ms: float = 320.0
-    runtime_cp_suffix_scan_latency_ms: float = 2.0
-    runtime_cp_suffix_scan_segments_per_ms: float = 15.0
+    runtime_cp_suffix_scan_latency_ms: float = 2.8
+    runtime_cp_suffix_scan_segments_per_ms: float = 3.5
     runtime_parent_state_bytes_per_exchange: int = 262_144
     runtime_parent_state_bandwidth_bytes_per_ms: float = 56_000_000.0
     runtime_parent_state_latency_ms: float = 0.0
@@ -257,11 +303,18 @@ class GdnPlannerConfig:
         parent_state_bandwidth = 56_000_000.0 * ref_parent_state_bytes / 262_144.0
         config = cls(
             runtime_hidden_bytes_per_token=int(hidden_size) * int(dtype_bytes),
+            runtime_dense_tokens_per_ms=_dense_tokens_per_ms(
+                hidden_size=int(hidden_size),
+                local_key_heads=local_key_heads,
+                local_value_heads=local_value_heads,
+                key_dim=key_dim,
+                value_dim=value_dim,
+            ),
             runtime_local_recurrent_tokens_per_ms=1_500.0 * recurrent_scale,
             runtime_chain_recurrent_tokens_per_ms=1_400.0 * recurrent_scale,
             runtime_cp_summary_bytes_per_segment=summary_state_elements * 4,
             runtime_cp_summary_compute_segments_per_ms=320.0 * summary_scale,
-            runtime_cp_suffix_scan_segments_per_ms=15.0 * summary_scale,
+            runtime_cp_suffix_scan_segments_per_ms=3.5 * summary_scale,
             runtime_parent_state_bytes_per_exchange=(
                 conv_state_bytes + recurrent_state_bytes
             ),
@@ -917,6 +970,11 @@ def _best_search_owner(
     for rank, tokens in enumerate(on_rank_tokens):
         projected_loads = list(rank_loads)
         projected_loads[rank] += segment_length
+        # The owner choice balances recurrent work only. Pricing the dense work
+        # here as well moved local segments toward token balance at the cost of
+        # more layout exchange; on the paired validation those owner-only
+        # changes were noise at the median with a +14% outlier, while every
+        # measured gain came from the chain decisions, which do price it.
         rank_runtime_ms = max(
             load / planner_config.runtime_local_recurrent_tokens_per_ms
             for load in projected_loads
@@ -1224,6 +1282,7 @@ def _score_chain_segment_keys(
         cross_rank_token_count=cross_rank_token_count,
         parent_state_exchange_count=parent_state_exchange_count,
         planner_config=planner_config,
+        rank_token_counts=tuple(rank_loads),
     )
 
 
@@ -1282,6 +1341,7 @@ def _predict_gdn_plan_runtime_ms(
     cross_rank_token_count: int,
     parent_state_exchange_count: int,
     planner_config: GdnPlannerConfig,
+    rank_token_counts: tuple[int, ...] = (),
 ) -> float:
     """Predict exposed fwd+bwd runtime for a GDN CP plan in milliseconds.
 
@@ -1313,6 +1373,7 @@ def _predict_gdn_plan_runtime_ms(
         chain_work = (
             chain_runtime.rank_work[rank] if rank < len(chain_runtime.rank_work) else 0
         )
+        owned_tokens = rank_token_counts[rank] if rank < len(rank_token_counts) else 0
         rank_runtime_ms = max(
             rank_runtime_ms,
             _predict_local_rank_runtime_ms(
@@ -1321,7 +1382,8 @@ def _predict_gdn_plan_runtime_ms(
                 segment_count=local_segment_count,
                 planner_config=planner_config,
             )
-            + chain_work / planner_config.runtime_chain_recurrent_tokens_per_ms,
+            + chain_work / planner_config.runtime_chain_recurrent_tokens_per_ms
+            + owned_tokens / planner_config.runtime_dense_tokens_per_ms,
         )
     return (
         rank_runtime_ms

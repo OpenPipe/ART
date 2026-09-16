@@ -527,6 +527,100 @@ gathered world-wide compile statuses; both cells were re-measured cleanly
 and folded into the certificate as held-out cells (shipped-table regret 0%
 and 2.8%; the training cells and therefore the table are unchanged).
 
+## GDN planner: dense work follows the GDN layout (2026-09-09)
+
+The paired planner A/B of issue #854 left a tail on the GDN classes: on
+Qwen3.5-4B the largest Ellavox group's unshared layout got 23% slower at CP4
+although its attention plan was better, because the GDN planner stopped
+chaining one 12.6k-token sequence across the ranks when the attention layout
+shifted (design brief above). The GDN planner's runtime model
+(`GdnPlannerConfig`) priced a rank's GDN work by a recurrent rate alone; but
+after the attention-to-GDN all-to-all the whole GDN layer — input projection,
+convolution, recurrence, output projection — runs on the GDN layout, so a
+rank pays the projections for every GDN token it owns, chained or not.
+
+**Measurement.** `--gdn-ab` times every layout of a cell under the production
+GDN planner and under two forced decisions that bracket its choice — never
+chain, chain every legal segment — in alternating rounds on the same node
+with the attention planner unchanged, so the paired difference is the GDN
+decision's own cost. Campaigns on Qwen3.5-4B (CP2, CP4), Qwen3.5-27B (CP2,
+CP4) and Qwen3.5-35B-A3B (CP2 EP1/EP2, CP4 EP2/EP4): 982 layouts. Chaining
+everything is the wrong move on most layouts (short segments; the chain
+overhead dominates), but where it wins it wins big and the model missed it:
+one 12.5k-token sequence at CP4 measures 16.7 ms per GDN layer faster chained
+on 4B (the model said 3.8), 48 ms on 27B; the production planner kept 243 of
+246 4B layouts and 103 of 123 27B CP4 layouts local.
+
+**Fit.** With a per-owned-token dense term the model's error on the paired
+deltas drops from 10.1 to 5.2 ms per layer (rms) across the three classes,
+and the regret of choosing between the two arms by the model from 1,082 to
+297 ms per layer summed over the 982 layouts. The recurrent rates and the
+exchange costs are held at their shipped values; the fit sets the dense
+throughput to about 156 TFLOP/s (617 tokens/ms on the 4B shape, 224 on 27B,
+772 on the 35B reference; the projection FLOPs come from the model shape),
+the bucket launch to 2.2 ms (was 0.2), the suffix scan to 2.8 ms per bucket
+and 3.5 segments/ms at the reference shape (was 2.0 and 15), and exposes no
+per-byte summary-exchange cost beyond the per-segment scan (the two are
+collinear; the bandwidth is set high). The chain gate moves from 4.0 to
+2.0 ms: on the paired validation every chain that measured slower on 4B was
+predicted to save under 2 ms per layer, and 2 ms keeps 97% of the measured
+gain on 4B and 99% on 27B. Replaying the production planner on the
+campaigns (layouts whose decision is one of the measured arms): regret 421 →
+31 ms per layer on 4B, 1,471 → 17 on 27B, 359 → 75 on 35B; 44 / 53 / 66
+layouts newly chain where chaining measured faster, 0 / 2 / 5 where it
+measured slower (at most 6.9 ms per layer, one 27B g6 layout). The dense
+term does not enter the owner search: pricing it there moved local segments
+toward token balance at the cost of more layout exchange, which the
+validation measured as noise at the median with a +14% outlier on a
+heterogeneous synthetic cell, while every measured gain came from the chain
+decisions.
+
+**Validation against main.** The recalibrated planner was validated against main's GDN planner in
+alternating rounds on the same node, attention planner unchanged
+(`--gdn-legacy-ab`; Qwen3.5-4B at CP2 and CP4, Qwen3.5-27B at CP2 and CP4,
+Qwen3.5-35B-A3B at CP2 EP1/EP2 and CP4 EP1 (synthetic cells) / EP2 / EP4).
+Layouts whose chain decision differs between the two planners, and the rest:
+
+| class | layouts | chain decision changed | faster > 2% | slower > 2% | other layouts | production selection |
+| --- | --- | --- | --- | --- | --- | --- |
+| Qwen3.5-4B | 274 | 72, median −15.2% | 69 | 1 (+3.0%) | 174, ±0.5% | −6.9% at CP4, 0.0% at CP2 |
+| Qwen3.5-27B | 274 | 95, median −17.8% | 90 | 1 | 151, ±0.3% | 0.0% (its production picks were already chained at CP4) |
+| Qwen3.5-35B-A3B | 574 | 119, median −3.7% | 70 | 11 (worst +6.5%) | 371 (+30 synthetic CP4), ±1% | +0.5% to −0.3% per shape |
+
+The best layout per real-data group improves by 15–43% at CP4 and 21–34% at
+CP2 on 4B (the long Ellavox sequences now chain), by up to 30% per layout on
+27B, and is within ±1% on 35B, whose tail of slower chains (the model
+over-predicts chain savings on that class by about 2×) is the residual this
+change leaves open.
+
+**Re-certification.** The three GDN tables were re-measured on every admitted CP > 1 cell by the
+same campaign (the current-planner rows) and refit with their checked-in
+recipes, carrying the certificates' aggregates for the cells the GDN planner
+does not touch — named explicitly: the CP1 and TP2 × CP1 shapes
+(`--carry-shapes`) and, on the dense table, the attention-only Qwen3-4B
+geometry (`--carry-cells`); every other certificate cell must be re-measured
+or the re-certification is refused, and the lists are recorded in the
+certificate (`--from-certificate` with evidence):
+
+| table | cells | pairwise | p95 regret | max regret | before |
+| --- | --- | --- | --- | --- | --- |
+| dense-h2560 (Qwen3.5-4B, Qwen3-4B) | 58 | 99.0% | 1.2% | 1.9% | 98.7% / 1.9% / 2.8% |
+| gdn-moe-h2048 (Qwen3.5-35B-A3B) | 80 | 97.8% | 2.2% | 4.2% | 96.6% / 2.7% / 4.2% |
+| dense-gdn-h5120 (Qwen3.5-27B) | not refit | | | | 98.6% / 3.9% / 4.6% (kept) |
+
+The 27B refit fails its held-out gate on one cell, Ellavox g3 at CP4, by
+11.3%: under the new planner the deep `uniform_depth_3` layout's long GDN
+segments chain and it becomes 10% faster than the shallow layouts the ten
+terms prefer, a difference the layout features cannot express (a CP-split of
+the GDN level term does not recover it, nor does fitting the CP > 1 cells
+alone). The shipped 27B table is kept: under the new planner its picks are
+within 2.7% of the new best on the other 13 CP4 cells and its g3 pick is
+22% faster than before (regret against a new best, not a regression);
+withholding the shape would hand the group to version 1, which loses up to
+33% there. A second stage that prices shortlisted layouts with the planners'
+own calibrated models fixes g3 (4.0%) but, in its pure form, mis-ranks two
+synthetic CP4 cells by 7–8%; a fitted GDN-aware re-ranker is the follow-up.
+
 ## Width feasibility is decided by the memory-minimal layout
 
 The cost-optimal layout can decline sharing at one width and accept it at a

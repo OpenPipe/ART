@@ -574,6 +574,7 @@ class _MemoryCheck:
 class _MemoryProfile:
     bytes_per_token: float
     packed_tokens: int
+    # Active execution rows only; total-input telemetry can include inactive rows.
     logical_per_packed: float = 1.0
     # Historical forward-retained/forward-peak ratio for calibration telemetry,
     # max-merged only from forward-return observations. Admission uses the
@@ -901,6 +902,12 @@ class _FlatForwardPlan:
     output_bytes: int
     signature: _MemorySignature
     selected_max_depth: int = 0
+    inactive_logical_tokens: int = 0
+
+    @property
+    def active_logical_tokens(self) -> int:
+        # Keep total-input telemetry while pricing only executed requests.
+        return self.logical_tokens - self.inactive_logical_tokens
 
     @property
     def subforward_count(self) -> int:
@@ -1195,6 +1202,120 @@ def _configure_moe_dispatcher_caches(model: Sequence[torch.nn.Module]) -> None:
                 )
 
 
+def _moe_output_bytes_per_token(
+    model: Sequence[torch.nn.Module], shape: ParallelShape
+) -> int:
+    """Known routed-expert working set, not a complete model/compiled bound."""
+    if shape != ParallelShape(tp=1, cp=1):
+        return 0
+    from megatron.core.extensions.transformer_engine import TERowParallelGroupedLinear
+    from megatron.core.transformer.moe.experts import TEGroupedMLP
+    from megatron.core.transformer.moe.moe_layer import BaseMoELayer, MoELayer
+    from megatron.core.transformer.moe.router import TopKRouter
+    from megatron.core.transformer.moe.token_dispatcher import (
+        MoEAlltoAllTokenDispatcher,
+    )
+
+    from art.megatron.lora import LoRA, MLPExpertsLinearFC1LoRA, MLPExpertsLinearFC2LoRA
+
+    coefficient = 0
+    for chunk in model:
+        for layer in chunk.modules():
+            if not isinstance(layer, BaseMoELayer):
+                continue
+            experts = getattr(layer, "experts", None)
+            fc2: Any = getattr(experts, "linear_fc2", None)
+            lora: Any = getattr(fc2, "lora", None)
+            dispatcher = getattr(layer, "token_dispatcher", None)
+            sites = (
+                (layer, MoELayer),
+                (experts, TEGroupedMLP),
+                (fc2, MLPExpertsLinearFC2LoRA),
+                (lora, LoRA),
+                (getattr(fc2, "linear_fc2", None), TERowParallelGroupedLinear),
+                (getattr(layer, "router", None), TopKRouter),
+            )
+            if (
+                any(
+                    type(site) is not expected
+                    or "forward" in vars(site)
+                    or getattr(site, "_forward_hooks", None)
+                    or getattr(site, "_forward_pre_hooks", None)
+                    for site, expected in sites
+                )
+                or type(dispatcher) is not MoEAlltoAllTokenDispatcher
+            ):
+                return 0
+            config = layer.config
+            if (
+                config.moe_expert_capacity_factor is not None
+                or config.moe_pad_expert_input_to_capacity
+                or config.moe_router_padding_for_quantization
+                or config.fp8
+                or config.fp4
+                or config.moe_latent_size is not None
+                or config.cuda_graph_impl != "none"
+                or any(
+                    name in vars(dispatcher)
+                    for name in (
+                        "preprocess",
+                        "dispatch_preprocess",
+                        "dispatch_postprocess",
+                    )
+                )
+                or "routing" in vars(layer.router)
+            ):
+                return 0
+            weights = lora.B_T
+            if (
+                weights.dtype not in (torch.float16, torch.bfloat16)
+                or weights.shape[-1] != fc2.out_features
+                or fc2.out_features != config.hidden_size
+                or getattr(layer.router, "topk", None) != config.moe_router_topk
+            ):
+                return 0
+            features = 2 * fc2.out_features
+            inputs = getattr(lora, "A_T", None)
+            if (
+                isinstance(inputs, torch.Tensor)
+                and inputs.ndim == weights.ndim == 3
+                and inputs.dtype == weights.dtype
+                and inputs.shape[0] == weights.shape[0]
+                and inputs.shape[-1] == weights.shape[-2]
+                and inputs.shape[-2] > 0
+            ):
+                # Eager FC2 keeps x, base_out and adapter_out while producing
+                # their sum. Compilers may reuse storage; other workspace is
+                # not covered. Unknown input metadata keeps the prior pair.
+                features = inputs.shape[-2] + 3 * fc2.out_features
+                fc1 = getattr(experts, "linear_fc1", None)
+                if (
+                    type(fc1) is MLPExpertsLinearFC1LoRA
+                    and "forward" not in vars(fc1)
+                    and not getattr(fc1, "_forward_hooks", None)
+                    and not getattr(fc1, "_forward_pre_hooks", None)
+                    and fc1.fused_gate_up
+                    and not fc1.non_gated
+                    and fc1.out_features == 2 * inputs.shape[-2]
+                    and getattr(dispatcher, "ep_size", None) == 1
+                    and getattr(dispatcher, "tp_size", None) == 1
+                    and getattr(dispatcher, "num_local_experts", 0) > 1
+                    and getattr(config, "moe_permute_fusion", False)
+                    and getattr(experts, "offload_expert_fc1", None) is False
+                    and getattr(experts, "offload_moe_act", None) is False
+                    and getattr(experts, "activation_recompute", None) is False
+                ):
+                    # The two dispatched H-wide inputs and FC1 gate/up sum
+                    # remain live at the FC2 sum, including in the observed
+                    # compiled path. This is one stage, not a backward bound.
+                    features += 2 * fc2.out_features + fc1.out_features
+            coefficient = max(
+                coefficient,
+                config.moe_router_topk * features * weights.element_size(),
+            )
+    return coefficient
+
+
 class TrainerRank:
     def __init__(self, runtime: TrainingRuntime) -> None:
         pp_size = int(getattr(runtime.provider, "pipeline_model_parallel_size", 1) or 1)
@@ -1262,6 +1383,11 @@ class TrainerRank:
         self._parallel_shape = ParallelShape(
             tp=tp_size, cp=cp_size, ep=ep_size, etp=etp_size
         )
+        self._moe_output_bytes_per_token = (
+            _moe_output_bytes_per_token(runtime.model, self._parallel_shape)
+            if self._moe_layers
+            else 0
+        )
         selection = select_scoring(
             device_capability=capability,
             device_memory_bytes=device_memory,
@@ -1317,6 +1443,8 @@ class TrainerRank:
         self._hybridep_buffer_id: int | None = None
         self._hybridep_rows_high_water = 0
         self._memory_profiles: dict[_MemorySignature, _MemoryProfile] = {}
+        self._split_memory_floors: dict[bytes, int] = {}
+        self._split_memory_floor_status = "not_observed"
         self._last_global_micro_batch_size: int | None = None
         self._skipped_forward_waves: dict[object, tuple[int, int, int]] = {}
         # Bounded LRU: steady-state hits are temporally local (identical
@@ -2117,6 +2245,7 @@ class TrainerRank:
                     yield batch
                 finally:
                     self._skipped_forward_waves.pop(token, None)
+                    del batch
         finally:
             batches.close()
 
@@ -2155,18 +2284,23 @@ class TrainerRank:
                 candidate = self._select_next_micro_batch(
                     items, start, checkpoint=checkpoint
                 )
+            self._snapshot_planning_telemetry(candidate.plan, candidate.check)
             if isinstance(candidate.plan, _FlatForwardPlan):
                 tracked_outputs, memory_baseline = (
                     self._run_flat_plan_with_memory_tracking(
                         candidate.plan,
+                        check=candidate.check,
                         context="forward_micro_batches",
                     )
                 )
             else:
-                tracked_outputs = self._execute_admitted_plan(
-                    candidate.plan, context="forward_micro_batches"
+                tracked_outputs, memory_baseline, forward_peak = (
+                    self._execute_split_plan_with_memory_tracking(
+                        candidate.plan,
+                        check=candidate.check,
+                        context="forward_micro_batches",
+                    )
                 )
-                memory_baseline = None
             flat_outputs = iter(tracked_outputs)
             outputs = [_unflatten(item, flat_outputs) for item in candidate.inputs]
             stop = start + candidate.stats_global_count
@@ -2214,6 +2348,12 @@ class TrainerRank:
             # to the forward's return, already recorded for this same plan.
             if isinstance(candidate.plan, _FlatForwardPlan):
                 self._update_peak_memory_profile(candidate.plan, memory_baseline)
+            elif memory_baseline is not None:
+                self._record_split_memory_floor(
+                    candidate.plan, memory_baseline, forward_peak
+                )
+            # Only the caller may retain completed outputs into the next wave.
+            del tracked_outputs, flat_outputs, outputs
             start = stop
 
     @overload
@@ -2283,30 +2423,43 @@ class TrainerRank:
             self._reset_planning_telemetry()
             materialized = _materialize(inputs)
             requests = list(_flatten(materialized))
-            plan = self._plan_admissible_forward(
+            plan, check = self._plan_admissible_forward(
                 requests, checkpoint=checkpoint, context="dp_rank_forward"
             )
             tracked_outputs = self._execute_admitted_plan(
-                plan, context="dp_rank_forward"
+                plan, check=check, context="dp_rank_forward"
             )
             return _unflatten(materialized, iter(tracked_outputs))
 
     def _execute_admitted_plan(
-        self, plan: _AnyForwardPlan, *, context: str
+        self, plan: _AnyForwardPlan, *, check: _MemoryCheck, context: str
     ) -> list[AnyForwardOutput]:
         if isinstance(plan, _FlatForwardPlan):
             outputs, _baseline = self._run_flat_plan_with_memory_tracking(
-                plan, context=context
+                plan, check=check, context=context
             )
             return outputs
+        outputs, _baseline, _peak = self._execute_split_plan_with_memory_tracking(
+            plan, check=check, context=context
+        )
+        return outputs
+
+    def _execute_split_plan_with_memory_tracking(
+        self, plan: _SplitForwardPlan, *, check: _MemoryCheck, context: str
+    ) -> tuple[list[AnyForwardOutput], int | None, int]:
+        baseline, peak = None, 0
         merged: list[AnyForwardOutput | None] = [None] * plan.request_count
         for ordinal, (subforward, indices) in enumerate(
             zip(plan.subforwards, plan.request_indices, strict=True)
         ):
             try:
-                outputs, _baseline = self._run_flat_plan_with_memory_tracking(
-                    subforward, context=context
+                outputs, child_baseline = self._run_flat_plan_with_memory_tracking(
+                    subforward, check=check, context=context
                 )
+                if child_baseline is not None:
+                    if baseline is None:
+                        baseline = child_baseline
+                    peak = max(peak, int(torch.cuda.max_memory_allocated(self.device)))
             except TrainerRankMemoryError as error:
                 # Model execution already began, so no replanning is possible
                 # and the caller must not mistake this for an up-front refusal.
@@ -2322,7 +2475,7 @@ class TrainerRank:
                 merged[index] = output
         if any(output is None for output in merged):
             raise AssertionError("split execution did not cover every request")
-        return cast(list[AnyForwardOutput], merged)
+        return cast(list[AnyForwardOutput], merged), baseline, peak
 
     def _plan_admissible_forward(
         self,
@@ -2330,7 +2483,7 @@ class TrainerRank:
         *,
         checkpoint: AdapterSelection,
         context: str,
-    ) -> _AnyForwardPlan:
+    ) -> tuple[_AnyForwardPlan, _MemoryCheck]:
         """Plan one forward (splitting if needed), recording telemetry, or raise."""
 
         found = self._find_admissible_forward(
@@ -2343,7 +2496,7 @@ class TrainerRank:
             raise found.error(context)
         plan, check = found
         self._snapshot_planning_telemetry(plan, check)
-        return plan
+        return plan, check
 
     def _find_admissible_forward(
         self,
@@ -2449,10 +2602,10 @@ class TrainerRank:
         measures it on a real cell.
 
         Cost: the cheap full-sharing lower bound (one O(tokens) CPU scan per
-        chunk) rejects a rung without planning anything. A rung that survives
-        is priced exactly with cost-optimal layouts and, failing that, with
-        memory-minimal layouts, whose packed tokens equal the lower bound — so
-        the planner runs for at most one rung, the one that executes.
+        chunk) can reject a rung without planning it. A surviving rung is
+        priced exactly with cost-optimal and then memory-minimal layouts.
+        Retained-profile trust boundaries can make the bound optimistic, so
+        more than one rung may need exact planning before one executes.
         """
 
         lower = [
@@ -2477,27 +2630,176 @@ class TrainerRank:
                 for chunk in chunks
             ]
             costs = [self._plan_cost(plan) for plan in plans]
-            check = self._split_rung_check(costs)
+            # Bind original request mappings; floor keys normalize execution order.
+            order = sorted(range(len(plans)), key=lambda i: (-costs[i].ephemeral, i))
+            split = _SplitForwardPlan(
+                subforwards=tuple(plans[i] for i in order),
+                request_indices=tuple(tuple(chunks[i]) for i in order),
+                request_count=len(requests),
+            )
+            check = self._split_plan_memory_check(split, costs)
             if check.fits:
-                # Larger ephemeral first minimizes the running forward peak;
-                # ties keep chunk order, so the partition is deterministic.
-                order = sorted(
-                    range(len(plans)), key=lambda i: (-costs[i].ephemeral, i)
-                )
-                return (
-                    _SplitForwardPlan(
-                        subforwards=tuple(plans[i] for i in order),
-                        request_indices=tuple(tuple(chunks[i]) for i in order),
-                        request_count=len(requests),
-                    ),
-                    check,
-                )
+                return split, check
         return None, check
 
     def _split_rung_check(self, costs: Sequence[_SubforwardCost]) -> _MemoryCheck:
         return self._memory_check_required(
             sum(cost.retained for cost in costs) + max(cost.ephemeral for cost in costs)
         )
+
+    @staticmethod
+    def _split_memory_key(plan: _SplitForwardPlan) -> bytes | None:
+        # Bound traversal and hashing; retain only a digest, never tensor values,
+        # token tables or graphs. Oversized structural identities stay unlearned.
+        if len(plan.subforwards) > 1024:
+            return None
+        digest, remaining, nodes = (
+            hashlib.sha256(),
+            262144 - 32 * len(plan.subforwards),
+            65536,
+        )
+
+        def feed(value: Any) -> None:
+            nonlocal remaining, nodes
+            nodes -= 1
+            if nodes < 0:
+                raise ValueError("split key node cap")
+            if isinstance(value, tuple):
+                remaining -= 2
+                if remaining < 0:
+                    raise ValueError("split key byte cap")
+                feed(len(value))
+                digest.update(b"(")
+                for child in value:
+                    feed(child)
+                digest.update(b")")
+                return
+            if value is not None and type(value) not in (str, int, bool):
+                raise ValueError("unsupported split key field")
+            if isinstance(value, str) and len(value) > 4096:
+                raise ValueError("split key string cap")
+            if isinstance(value, int) and value.bit_length() > 64:
+                raise ValueError("split key integer cap")
+            encoded = repr(value).encode()
+            remaining -= len(encoded) + 1
+            if remaining < 0:
+                raise ValueError("split key byte cap")
+            digest.update(encoded + b";")
+
+        try:
+            feed((plan.request_count, len(plan.subforwards)))
+            outer, children = digest, []
+            for p, indices in zip(plan.subforwards, plan.request_indices, strict=True):
+                digest = hashlib.sha256()
+                signature = p.signature
+                feed(
+                    (
+                        indices,
+                        signature.topology,
+                        signature.planner_coefficients,
+                        signature.slot_group_count,
+                        signature.request_mix,
+                        signature.grad_enabled,
+                        signature.grad_modes,
+                        p.packed_tokens,
+                        p.logical_tokens,
+                        p.inactive_logical_tokens,
+                        p.output_bytes,
+                        p.output_metadata,
+                        p.selected_max_depth,
+                        len(p.groups),
+                    )
+                )
+                for g in p.groups:
+                    slot = (
+                        None
+                        if g.slot_ref is None
+                        else ("checkpoint", g.slot_ref.name)
+                        if isinstance(g.slot_ref, _LocalLoRASlotRef)
+                        else (g.slot_ref.kind, g.slot_ref.name)
+                    )
+                    feed(
+                        (
+                            slot,
+                            g.grad_enabled,
+                            g.request_indices,
+                            len(g.packed.segments),
+                        )
+                    )
+                    for segment in g.packed.segments:
+                        feed(
+                            (
+                                segment.sequence_indices,
+                                segment.start,
+                                segment.end,
+                                segment.packed_start,
+                                segment.group_id,
+                                segment.parent_id,
+                            )
+                        )
+                    feed(len(g.items))
+                    for item in g.items:
+                        feed(
+                            (
+                                tuple(item.input_ids.shape),
+                                str(item.input_ids.dtype),
+                                None
+                                if item.labels is None
+                                else (tuple(item.labels.shape), str(item.labels.dtype)),
+                                item.request.top_k,
+                                item.request.logits,
+                                item.request.hidden_states,
+                            )
+                        )
+                children.append(digest.digest())
+        except ValueError:
+            return None
+        # Cost/profile updates may reorder the same children. Each digest still
+        # binds its original request mapping/partition; retain the observed max
+        # across execution orders, not an unmeasured bound for every order.
+        outer.update(b"".join(sorted(children)))
+        return outer.digest()
+
+    def _record_split_memory_floor(
+        self, plan: _SplitForwardPlan, baseline: int, forward_peak: int
+    ) -> None:
+        # Only normal caller completion learns a floor; child retained profiles
+        # stay forward-only. Keep earlier child peaks despite their later resets.
+        key = self._split_memory_key(plan)
+        if key is None:
+            self._split_memory_floor_status = "unsupported_key"
+            return
+        if (
+            key not in self._split_memory_floors
+            and len(self._split_memory_floors) >= 1024
+        ):
+            self._split_memory_floor_status = "cache_full_not_learned"
+            return
+        observed = max(
+            0,
+            max(forward_peak, int(torch.cuda.max_memory_allocated(self.device)))
+            - baseline,
+        )
+        self._split_memory_floors[key] = max(
+            self._split_memory_floors.get(key, 0), observed
+        )
+        self._split_memory_floor_status = "recorded"
+
+    def _split_plan_memory_check(
+        self, plan: _SplitForwardPlan, costs: Sequence[_SubforwardCost]
+    ) -> _MemoryCheck:
+        required = sum(cost.retained for cost in costs) + max(
+            cost.ephemeral for cost in costs
+        )
+        key = self._split_memory_key(plan)
+        empirical = (
+            0
+            if key is None
+            else int(self._split_memory_floors.get(key, 0) * _MEMORY_SAFETY_FACTOR)
+        )
+        # Same existing reduction order and count; never reduce while returning
+        # from caller work, where a failed/empty peer may not participate.
+        return self._memory_check_required(max(required, empirical))
 
     def _split_chunk_lower_cost(
         self,
@@ -2506,12 +2808,13 @@ class TrainerRank:
         *,
         checkpoint: AdapterSelection,
     ) -> _SubforwardCost:
-        """Cheapest possible cost of a chunk: its full-sharing packed tokens."""
+        """Optimistic cost across layout and profile-trust boundaries."""
 
         groups = self._group_active_request_indices(
             requests, checkpoint=checkpoint, ensure_slots=False
         )
         packed_tokens = 0
+        unshared_packed_tokens = 0
         for _, group_indices in groups:
             estimated = estimate_prefix_tree_packed_tokens(
                 (rows[index] for index in group_indices),
@@ -2519,23 +2822,53 @@ class TrainerRank:
             )
             assert estimated is not None  # rows are CPU copies
             packed_tokens += self._physical_tokens(estimated)
-        return self._subforward_cost(
-            packed_tokens=packed_tokens,
-            output_bytes=self._estimate_group_request_output_bytes(requests),
-            signature=self._memory_signature_from_requests(
-                requests,
-                slot_group_count=len(groups),
-                grad_modes=tuple(mode for (_, mode), _ in groups),
-            ),
-            logical_tokens=sum(int(row.numel()) for row in rows),
+            unshared_packed_tokens += self._physical_tokens(
+                sum(int(rows[index].numel()) for index in group_indices)
+            )
+        output_bytes = self._estimate_group_request_output_bytes(requests)
+        signature = self._memory_signature_from_requests(
+            requests,
+            slot_group_count=len(groups),
+            grad_modes=tuple(mode for (_, mode), _ in groups),
         )
+        logical_tokens = _active_logical_tokens(requests)
+        cost = self._subforward_cost(
+            packed_tokens=packed_tokens,
+            output_bytes=output_bytes,
+            signature=signature,
+            logical_tokens=logical_tokens,
+        )
+        profile = self._memory_profiles.get(signature)
+        if (
+            profile is not None
+            and profile.retained_compute_bytes_per_token is not None
+            and logical_tokens / max(1, packed_tokens)
+            > profile.logical_per_packed * _MEMORY_PROFILE_TRUST_GROWTH
+            and logical_tokens
+            / max(
+                1,
+                min(
+                    unshared_packed_tokens,
+                    profile.packed_tokens * _MEMORY_PROFILE_TRUST_GROWTH,
+                ),
+            )
+            <= profile.logical_per_packed * _MEMORY_PROFILE_TRUST_GROWTH
+        ):
+            # A larger layout may trust retained compute where full sharing
+            # cannot. Its full-required retention is not a pruning lower bound.
+            # Charge only outputs here; exact plan costs keep both trust guards.
+            return _SubforwardCost(
+                required=cost.required,
+                retained=min(cost.retained, int(output_bytes * _MEMORY_SAFETY_FACTOR)),
+            )
+        return cost
 
     def _plan_cost(self, plan: _FlatForwardPlan) -> _SubforwardCost:
         return self._subforward_cost(
             packed_tokens=plan.packed_tokens,
             output_bytes=plan.output_bytes,
             signature=plan.signature,
-            logical_tokens=plan.logical_tokens,
+            logical_tokens=plan.active_logical_tokens,
         )
 
     def _subforward_cost(
@@ -2584,11 +2917,8 @@ class TrainerRank:
         ratio = logical_tokens / max(1, packed_tokens)
         if ratio > profile.logical_per_packed * _MEMORY_PROFILE_TRUST_GROWTH:
             return required
-        retained = (
-            output_bytes
-            + profile.retained_compute_bytes_per_token
-            * packed_tokens
-            * max(1.0, ratio / profile.logical_per_packed)
+        retained = output_bytes + profile.retained_compute_bytes_per_token * max(
+            packed_tokens, logical_tokens / profile.logical_per_packed
         )
         return min(required, int(retained * _MEMORY_SAFETY_FACTOR))
 
@@ -3474,6 +3804,31 @@ class TrainerRank:
         *,
         checkpoint: AdapterSelection = Unset,
     ) -> _CandidateMicroBatch[ForwardInputsT]:
+        candidate = self._search_next_micro_batch(items, start, checkpoint=checkpoint)
+        # A later width check may observe less available memory.
+        # Do not return an earlier width's cached budget as the final admission.
+        check = self._memory_check_required(
+            candidate.check.estimated_required_bytes,
+            sync_across_dp=True,
+        )
+        if not check.fits:
+            self._snapshot_planning_telemetry(candidate.plan, check)
+            raise _memory_error(
+                context="forward_micro_batches",
+                message="selected microbatch exceeds freshly sampled available memory",
+                packed_tokens=candidate.plan.packed_tokens,
+                logical_tokens=candidate.plan.logical_tokens,
+                check=check,
+            )
+        return replace(candidate, check=check)
+
+    def _search_next_micro_batch(
+        self,
+        items: Sequence[ForwardInputsT],
+        start: int,
+        *,
+        checkpoint: AdapterSelection = Unset,
+    ) -> _CandidateMicroBatch[ForwardInputsT]:
         dp_rank, dp_size = self._dp_rank_and_size()
         remaining, min_width, granularity = _wave_geometry(len(items), start, dp_size)
         if min_width <= 0:
@@ -3506,9 +3861,7 @@ class TrainerRank:
                 estimates[width] = None
                 return None
             assert values is not None
-            logical_tokens = sum(
-                int(request.input_tokens.numel()) for request in local_requests
-            )
+            logical_tokens = _active_logical_tokens(local_requests)
 
             def priced(
                 packed_tokens: int,
@@ -3576,18 +3929,16 @@ class TrainerRank:
                         )
                         assert exact is not None
                         selected = exact
+                        # The minimum wave may execute cold after trust fails.
+                        # Keep its materialization paired with the retained check.
+                        layout_modes[width] = memory_minimal
                         if selected[0].fits and (
                             not profiled or trusted(selected[1], selected[3])
                         ):
-                            layout_modes[width] = memory_minimal
                             break
-                    else:
-                        # Nothing fit and trusted; keep the memory-minimal
-                        # pricing so the recorded failure is the monotone one.
-                        if not selected[0].fits:
-                            layout_modes.pop(width, None)
                 elif minimal_bound is not None:
                     selected = minimal_bound
+                    layout_modes[width] = True
                 if not selected[0].fits:
                     exact_failed_width = (
                         width
@@ -3679,20 +4030,38 @@ class TrainerRank:
                 refusal_prefix = (
                     "smallest DP microbatch is predicted to exceed available memory"
                 )
-                found = self._find_admissible_forward(
-                    list(_flatten(local_inputs)),
-                    checkpoint=checkpoint,
-                    refusal_prefix=refusal_prefix,
-                )
-                agreed = self._all_ranks_true(not isinstance(found, _ForwardRefusal))
+                admission_error: BaseException | None = None
+                try:
+                    found = self._find_admissible_forward(
+                        list(_flatten(local_inputs)),
+                        checkpoint=checkpoint,
+                        refusal_prefix=refusal_prefix,
+                    )
+                except BaseException as exc:
+                    admission_error, found = exc, None
+                try:
+                    agreed = self._all_ranks_true(
+                        admission_error is None
+                        and not isinstance(found, _ForwardRefusal)
+                    )
+                except BaseException:
+                    if admission_error is not None:
+                        raise admission_error
+                    raise
+                if admission_error is not None:
+                    raise admission_error
+                assert found is not None
                 if isinstance(found, _ForwardRefusal):
+                    self._snapshot_planning_telemetry(found.plan, found.check)
                     raise found.error("forward_micro_batches")
                 if not agreed:
+                    self._snapshot_planning_telemetry(first.plan, first.check)
                     raise _memory_error(
                         context="forward_micro_batches",
                         message=(
                             f"{refusal_prefix} on another DP rank, which was "
-                            "unable to find a feasible split for its share"
+                            "unable to complete admission or find a feasible split "
+                            "for its share"
                         ),
                         packed_tokens=first.plan.packed_tokens,
                         logical_tokens=first.plan.logical_tokens,
@@ -4131,6 +4500,7 @@ class TrainerRank:
                 grad_modes=tuple(mode for (_, mode), _ in groups),
             ),
             selected_max_depth=selected_max_depth,
+            inactive_logical_tokens=logical_tokens - _active_logical_tokens(requests),
         )
 
     def _estimate_flat_forward(
@@ -4248,6 +4618,7 @@ class TrainerRank:
         self,
         plan: _FlatForwardPlan,
         *,
+        check: _MemoryCheck,
         context: str,
     ) -> tuple[list[AnyForwardOutput], int | None]:
         if torch.cuda.is_available() and self.device.type == "cuda":
@@ -4272,7 +4643,10 @@ class TrainerRank:
                 message="CUDA OOM occurred despite the planner estimate",
                 packed_tokens=plan.packed_tokens,
                 logical_tokens=plan.logical_tokens,
-                check=self._memory_check(plan),
+                # Preserve the selected admission, including the whole rung's
+                # budget for a split. Rechecking here observes failed state and
+                # can enter collectives that successful peers never reach.
+                check=check,
             ) from exc
         if baseline is not None:
             self._update_peak_memory_profile(
@@ -4608,7 +4982,7 @@ class TrainerRank:
                 packed_tokens=forward.packed_tokens,
                 output_bytes=forward.output_bytes,
                 signature=forward.signature,
-                logical_tokens=forward.logical_tokens,
+                logical_tokens=forward.active_logical_tokens,
             ),
             sync_across_dp=sync_across_dp,
         )
@@ -4619,18 +4993,36 @@ class TrainerRank:
         *,
         sync_across_dp: bool = False,
     ) -> _MemoryCheck:
-        available = self._available_memory_bytes()
         if dist.is_available() and dist.is_initialized():
             group = None if sync_across_dp else self._forward_memory_group()
             values = torch.tensor(
-                [float(required), float(available)],
+                [float(required), 0.0],
                 device=self.device if self.device.type == "cuda" else "cpu",
                 dtype=torch.float64,
             )
             dist.all_reduce(values[0], op=dist.ReduceOp.MAX, group=group)
-            dist.all_reduce(values[1], op=dist.ReduceOp.MIN, group=group)
             required = int(values[0].item())
-            available = int(values[1].item())
+            error: BaseException | None = None
+            try:
+                available = self._available_memory_bytes()
+            except BaseException as exc:
+                error, available = exc, -1
+            try:
+                # A healthy communicator carries local failure to every peer
+                # in the existing MIN. This cannot repair a poisoned backend.
+                values[1] = available
+                dist.all_reduce(values[1], op=dist.ReduceOp.MIN, group=group)
+                available = int(values[1].item())
+            except BaseException:
+                if error is not None:
+                    raise error
+                raise
+            if error is not None:
+                raise error
+            if available < 0:
+                raise RuntimeError("Memory admission failed on another rank")
+        else:
+            available = self._available_memory_bytes()
         return _MemoryCheck(
             estimated_required_bytes=required,
             available_bytes=available,
@@ -4664,22 +5056,30 @@ class TrainerRank:
             * self._param_dtype_size
             * activation_factor
         )
+        # Groups execute sequentially: summed packed rows conservatively bound
+        # this FC2 component, not all workspace or retained graphs.
+        static_compute = max(
+            static_compute, packed_tokens * self._moe_output_bytes_per_token
+        )
         # A profile learned under lighter sharing (lower logical/packed ratio)
         # underestimates the per-packed-token footprint of a deeper-shared
         # plan; scale the trusted estimate up by the ratio gap.
-        ratio_scale = 1.0
+        # Normalize before multiplying: cancelling packed tokens through two
+        # float operations can otherwise make a larger warm layout cheaper.
+        profiled_tokens: int | float = packed_tokens
         if profiled is not None and logical_tokens is not None:
-            current_ratio = logical_tokens / max(1, packed_tokens)
-            ratio_scale = max(1.0, current_ratio / profiled.logical_per_packed)
-        if (
-            profiled is None
-            or profiled.packed_tokens * _MEMORY_PROFILE_TRUST_GROWTH < packed_tokens
-        ):
+            profiled_tokens = max(
+                packed_tokens, logical_tokens / profiled.logical_per_packed
+            )
+        # The trust window limits calibration growth, not the empirical floor.
+        # Dropping that floor beyond the window can admit a larger request that
+        # was refused just inside it, even below a previously observed peak.
+        if profiled is None:
             compute = static_compute
         else:
             compute = max(
                 static_compute,
-                int(profiled.bytes_per_token * packed_tokens * ratio_scale),
+                int(profiled.bytes_per_token * profiled_tokens),
             )
         return int((output_bytes + compute) * _MEMORY_SAFETY_FACTOR)
 
@@ -4687,9 +5087,29 @@ class TrainerRank:
         if not (torch.cuda.is_available() and self.device.type == "cuda"):
             return 1 << 60
         free, total = torch.cuda.mem_get_info(self.device)
-        allocated = int(torch.cuda.memory_allocated(self.device))
-        reserved = int(torch.cuda.memory_reserved(self.device))
-        reusable_reserved = max(0, reserved - allocated)
+        if torch.cuda.get_allocator_backend() == "native":
+            stats = torch.cuda.memory_stats(self.device)
+            allocated = stats.get("allocated_bytes.all.current")
+            active = stats.get("active_bytes.all.current")
+            reserved = stats.get("reserved_bytes.all.current")
+            if (
+                type(allocated) is int
+                and type(active) is int
+                and type(reserved) is int
+                and 0 <= allocated <= active <= reserved
+            ):
+                # Pending frees remain active until ordinary event collection.
+                # This excludes them, not split/private-pool incompatibilities.
+                reusable_reserved = reserved - active
+            else:
+                # Incomplete native counters cannot establish reusable cache.
+                allocated = int(torch.cuda.memory_allocated(self.device))
+                reusable_reserved = 0
+        else:
+            # Preserve the previous, unqualified policy for other backends.
+            allocated = int(torch.cuda.memory_allocated(self.device))
+            reserved = int(torch.cuda.memory_reserved(self.device))
+            reusable_reserved = max(0, reserved - allocated)
         reserve = int(total * _MEMORY_RESERVE_FRACTION)
         available = max(0, int(free) + reusable_reserved - reserve)
         if os.environ.get(_TEST_HOOKS_ENV) == "1":
@@ -4765,7 +5185,7 @@ class TrainerRank:
                 0 if previous is None else previous.packed_tokens,
             ),
             logical_per_packed=max(
-                plan.logical_tokens / max(1, plan.packed_tokens),
+                plan.active_logical_tokens / max(1, plan.packed_tokens),
                 1.0 if previous is None else previous.logical_per_packed,
             ),
             retained_fraction=retained_fraction,
@@ -5445,6 +5865,17 @@ def _validate_top_k(top_k: int, model: object) -> None:
     vocab_size = _padded_vocab_size(model)
     if top_k > vocab_size:
         raise ValueError(f"top_k={top_k} exceeds vocabulary size {vocab_size}")
+
+
+def _active_logical_tokens(requests: Sequence[AnyForwardInput]) -> int:
+    return sum(
+        int(request.input_tokens.numel())
+        for request in requests
+        if request.target_tokens is not None
+        or request.logits
+        or request.top_k is not None
+        or request.hidden_states
+    )
 
 
 def _request_mix_key(request: AnyForwardInput) -> str:

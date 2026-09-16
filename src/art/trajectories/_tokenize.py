@@ -170,6 +170,28 @@ def _unique_prompt_suffix_end(prompt: str, rendered: str, *, after: int) -> int 
     return after + start + best
 
 
+def _common_prefix_length(left: str | list[int], right: str | list[int]) -> int:
+    """Compare growing blocks natively, then locate the first unequal element."""
+    if not left or not right or left[0] != right[0]:
+        return 0
+    limit = min(len(left), len(right))
+    matched, end = 1, 2
+    while matched < limit:
+        end = min(end, limit)
+        if left[matched:end] != right[matched:end]:
+            high = end - 1
+            while matched < high:
+                middle = (matched + high + 1) // 2
+                if left[matched:middle] == right[matched:middle]:
+                    matched = middle
+                else:
+                    high = middle - 1
+            return matched
+        matched = end
+        end *= 2
+    return matched
+
+
 def _assistant_char_spans(
     messages: list[dict[str, Any]],
     rendered: str,
@@ -190,13 +212,7 @@ def _assistant_char_spans(
             generated = completed[len(prompt) :]
         else:
             prior = render(messages[:message_index], add_generation_prompt=False)
-            shared = 0
-            while (
-                shared < len(prompt)
-                and shared < len(completed)
-                and prompt[shared] == completed[shared]
-            ):
-                shared += 1
+            shared = _common_prefix_length(prompt, completed)
             anchored = not (
                 shared < len(prior)
                 or prompt[: len(prior)] != prior
@@ -249,13 +265,7 @@ def _assistant_char_spans(
                 continue
         if not generated:
             continue
-        start = 0
-        while (
-            start < len(prompt)
-            and start < len(rendered)
-            and prompt[start] == rendered[start]
-        ):
-            start += 1
+        start = _common_prefix_length(prompt, rendered)
         retained_start = next(
             (
                 offset
@@ -770,6 +780,9 @@ def _sampled_evidence_fingerprint(
             choice for choice in exchange.response.choices if choice.index == index
         )
         choice_extra = choice.model_extra or {}
+        prompt = choice_extra.get("prompt_token_ids")
+        if prompt is None:
+            prompt = (exchange.response.model_extra or {}).get("prompt_token_ids")
         evidence = {
             "message": choice.message.model_dump(
                 mode="json",
@@ -785,6 +798,7 @@ def _sampled_evidence_fingerprint(
                 },
                 exclude_none=True,
             ),
+            "prompt_token_ids": prompt,
             "token_ids": choice_extra.get("token_ids"),
             "logprobs": _chat_logprob_fingerprint_evidence(choice),
             "finish_reason": choice.finish_reason,
@@ -796,9 +810,13 @@ def _sampled_evidence_fingerprint(
             choice for choice in exchange.response.choices if choice.index == index
         )
         choice_extra = choice.model_extra or {}
+        prompt = choice_extra.get("prompt_token_ids")
+        if prompt is None:
+            prompt = (exchange.response.model_extra or {}).get("prompt_token_ids")
         logprobs = _dump(choice.logprobs)
         evidence = {
             "text": choice.text,
+            "prompt_token_ids": prompt,
             "token_ids": choice_extra.get("token_ids"),
             "logprobs": {
                 key: logprobs[key]
@@ -815,7 +833,7 @@ def _sampled_evidence_fingerprint(
             generation = _string_dict(generations[index]) or {}
             evidence = {
                 key: generation[key]
-                for key in ("output_tokens", "output_indices")
+                for key in ("prompt_token_ids", "output_tokens", "output_indices")
                 if key in generation
             }
         else:
@@ -832,6 +850,7 @@ def _sampled_evidence_fingerprint(
                 block.model_dump(mode="json", exclude_none=True)
                 for block in exchange.response.content
             ],
+            "prompt_token_ids": response_extra.get("prompt_token_ids"),
             "token_ids": response_extra.get("token_ids"),
             "logprobs": response_extra.get("logprobs"),
             "stop_reason": exchange.response.stop_reason,
@@ -855,7 +874,9 @@ def _source_key(
         prompt_index=prompt_index,
         # Internal projection may copy an exchange to isolate one choice. A
         # source-specific identity remains stable across those copies without
-        # hashing a growing request or unrelated choices.
+        # hashing rendered request data or unrelated choices. Captured prompt
+        # IDs remain part of the identity: equal output evidence can have
+        # different causal contexts even when response IDs are reused.
         evidence_fingerprint=_sampled_evidence_fingerprint(
             exchange, protocol=protocol, index=index
         ),
@@ -4046,11 +4067,9 @@ def _tokenize_exact_projected_chat_history(
         return None
     final_key = _sampled_source_key(final_source)
     final_stop_reason = _source_stop_evidence(final_source, final_key)[0]
-    terminal_boundary = (
-        (length_stop_boundaries or {}).get(final_key)
-        if final_stop_reason == "length"
-        else None
-    )
+    # A terminal synthetic stop can accompany an earlier length-stop boundary;
+    # neither tail is sampled, and both must retain their renderer proof.
+    terminal_boundary = (length_stop_boundaries or {}).get(final_key)
     # Unlike a nonterminal truncation, the final sampled output needs no
     # synthetic boundary to connect it to a later prompt.
     if terminal_boundary is not None and not terminal_boundary.tail:
@@ -4065,7 +4084,17 @@ def _tokenize_exact_projected_chat_history(
     )
     terminal_flags = (
         [
-            *([TokenFlag.ASSISTANT] * len(terminal_boundary.tail)),
+            *(
+                [
+                    TokenFlag.ASSISTANT
+                    | (
+                        TokenFlag.OUTPUT
+                        if final_stop_reason == "stop"
+                        else TokenFlag(0)
+                    )
+                ]
+                * len(terminal_boundary.tail)
+            ),
             *([TokenFlag(0)] * len(terminal_boundary.following)),
         ]
         if terminal_boundary is not None
@@ -4097,7 +4126,11 @@ def _tokenize_exact_projected_chat_history(
     if terminal_boundary is not None:
         flags[
             len(final_prompt) + len(final_output) + len(terminal_boundary.tail) - 1
-        ] = TokenFlag.STOP
+        ] = TokenFlag.STOP | (
+            TokenFlag.ASSISTANT | TokenFlag.OUTPUT
+            if final_stop_reason == "stop"
+            else TokenFlag(0)
+        )
     source_keys: list[_SampledSourceKey | None] = [
         *([None] * len(final_prompt)),
         *([final_key] * len(final_output)),
@@ -5214,7 +5247,6 @@ def _tokenize_chat_view(
         _projection_matches is True
         and chat_template is None
         and chat_template_kwargs is None
-        and not _history_needs_synthetic_stop(history, resolved_tokenizer)
     ):
         sampled_message_indices: list[int] = []
         seen_signatures: set[tuple[object, ...]] = set()
@@ -5243,15 +5275,43 @@ def _tokenize_chat_view(
             source = history.message_sources[message_index]
             assert source is not None
             source_key = _sampled_source_key(source)
-            if _source_stop_evidence(source, source_key)[0] != "length":
+            stop_reason = _source_stop_evidence(source, source_key)[0]
+            output = _source_output_tokens(source, source_key)
+            synthetic_stop = (
+                stop_reason == "stop"
+                and bool(_terminator_ids(resolved_tokenizer))
+                and output is not None
+                and not _sampled_stop_suffix(
+                    output,
+                    source=source,
+                    source_key=source_key,
+                    tokenizer=resolved_tokenizer,
+                )
+            )
+            if synthetic_stop and position + 1 < len(sampled_message_indices):
+                length_stop_boundaries_complete = False
+                break
+            if stop_reason != "length" and not synthetic_stop:
                 continue
-            length_stop_count += 1
+            length_stop_count += stop_reason == "length"
             bounds = (
                 direct_bounds[message_index]
                 if direct_bounds
                 else marked_bounds.get(message_index)
                 or probed_bounds.get(message_index)
             )
+            if synthetic_stop and bounds is not None:
+                # Tool part bounds can omit sampled closing markup. Prove the
+                # complete sampled prefix before appending only its remainder.
+                assert output is not None
+                rendered_start = bounds[0]
+                while rendered_start and assistant_mask[rendered_start - 1]:
+                    rendered_start -= 1
+                bounds = _prove_exact_length_stopped_assistant_prefix(
+                    locations(output, rendered_start),
+                    assistant_mask,
+                    expected_start=rendered_start,
+                )
             if position + 1 < len(sampled_message_indices) and source_matches_context(
                 source
             ):
@@ -5285,11 +5345,13 @@ def _tokenize_chat_view(
                     else marked_bounds.get(next_message_index)
                     or probed_bounds.get(next_message_index)
                 )
+                # Part bounds can start after sampled tool-call markup; the
+                # next generation boundary is the assistant span's start.
                 next_prompt_end = (
-                    next_bounds[0]
-                    if next_bounds is not None
-                    else _next_assistant_span_start(assistant_mask, after=bounds[1])
+                    _next_assistant_span_start(assistant_mask, after=bounds[1])
                     if bounds is not None
+                    else next_bounds[0]
+                    if next_bounds is not None
                     else None
                 )
             else:
@@ -5310,7 +5372,7 @@ def _tokenize_chat_view(
                 else None
             )
             if boundary is None:
-                if position + 1 < len(sampled_message_indices):
+                if synthetic_stop or position + 1 < len(sampled_message_indices):
                     length_stop_boundaries_complete = False
                     break
                 # A terminal length stop needs no renderer-owned tail: the

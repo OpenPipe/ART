@@ -215,3 +215,117 @@ def test_planner_variant_switch_clears_the_registered_layout_cache(monkeypatch) 
         assert not rank._layout_selection_cache
     finally:
         driver._set_planner_variant("current")
+
+
+def test_gdn_planner_variants_bracket_the_chain_decision() -> None:
+    """The GDN A/B arms force the chain-versus-local decision both ways without
+    touching anything else: ``gdn-local`` can never meet the chain gate,
+    ``gdn-chain`` always meets it and skips the beam search."""
+
+    from dataclasses import fields
+
+    pytest.importorskip("megatron.core")
+    from art.megatron.gdn.gdn_prefix_tree import GdnPlannerConfig
+
+    base = GdnPlannerConfig()
+    assert driver._gdn_variant_config(base, "current") is base
+    assert driver._gdn_variant_config(None, "gdn-local") is None
+    local = driver._gdn_variant_config(base, "gdn-local")
+    chain = driver._gdn_variant_config(base, "gdn-chain")
+    assert local.cp_chain_min_runtime_delta_ms == float("inf")
+    assert chain.cp_chain_min_runtime_delta_ms == float("-inf")
+    assert chain.cp_chain_beam_max_steps == 0
+    for variant in (local, chain):
+        changed = {
+            f.name
+            for f in fields(base)
+            if getattr(variant, f.name) != getattr(base, f.name)
+        }
+        assert changed <= {"cp_chain_min_runtime_delta_ms", "cp_chain_beam_max_steps"}
+    with pytest.raises(ValueError):
+        driver._gdn_variant_config(base, "other")
+    for variant in driver._GDN_VARIANTS:
+        assert variant in driver._PLANNER_VARIANTS
+
+
+def test_contract_accepts_the_yield_empty_flag_only_when_it_is_off_by_default() -> None:
+    """PR #864 added ``yield_empty`` to the public forwards as a keyword-only flag
+    that defaults to False; the contract phase tolerates exactly that."""
+
+    import inspect
+
+    import art.trainer_rank as trainer_rank
+
+    for method_name in ("forward_micro_batches", "dp_rank_forward"):
+        parameters = driver._public_parameters(
+            getattr(trainer_rank.TrainerRank, method_name)
+        )
+        assert set(parameters) <= {"inputs", "checkpoint", "no_grad", "yield_empty"}
+        flag = parameters.get("yield_empty")
+        if flag is not None:
+            assert flag.kind is inspect.Parameter.KEYWORD_ONLY
+            assert flag.default is False
+
+
+def test_gdn_legacy_variant_is_the_planner_before_the_dense_term() -> None:
+    """The validation arm restores main's GDN planner: no dense projection
+    term, the previous chain overheads and gate, nothing else changed, so an
+    8k-token sequence that the production planner chains across four ranks
+    stays on one rank."""
+
+    from dataclasses import fields
+
+    pytest.importorskip("megatron.core.packed_seq_params")
+    import torch
+
+    from art.megatron.context_parallel.layout_index import TokenLayoutIndex
+    from art.megatron.gdn.gdn_prefix_tree import (
+        GdnPlannerConfig,
+        build_gdn_global_execution_decision,
+        parse_gdn_prefix_tree_segments,
+    )
+    from art.megatron.prefix_tree_packing import prefix_tree_pack
+
+    current = GdnPlannerConfig.from_model_shape(
+        hidden_size=2560,
+        tensor_model_parallel_size=1,
+        linear_num_key_heads=16,
+        linear_num_value_heads=32,
+        linear_key_head_dim=128,
+        linear_value_head_dim=128,
+    )
+    legacy = driver._gdn_variant_config(current, "gdn-legacy")
+    changed = {
+        f.name
+        for f in fields(current)
+        if getattr(legacy, f.name) != getattr(current, f.name)
+    }
+    assert changed == {
+        "runtime_dense_tokens_per_ms",
+        "runtime_local_bucket_launch_ms",
+        "runtime_chain_bucket_launch_ms",
+        "runtime_cp_summary_bandwidth_bytes_per_ms",
+        "runtime_cp_suffix_scan_latency_ms",
+        "runtime_cp_suffix_scan_segments_per_ms",
+        "cp_chain_min_runtime_delta_ms",
+    }
+    assert legacy.runtime_dense_tokens_per_ms >= 1e12
+    assert legacy.cp_chain_min_runtime_delta_ms == 4.0
+    assert legacy.runtime_cp_suffix_scan_segments_per_ms == pytest.approx(15.0)
+    pack = prefix_tree_pack((torch.arange(1, 8_193),), max_depth=1)
+    spec = parse_gdn_prefix_tree_segments(
+        group_ids=pack.group_ids, parent_ids=pack.parent_ids
+    )
+    n = spec.real_token_count
+    ranges = tuple((((n * r) // 4, (n * (r + 1)) // 4, 0),) for r in range(4))
+    layout = TokenLayoutIndex(
+        ownership_ranges_by_rank=ranges,
+        token_counts_by_rank=tuple(e - s for ((s, e, _),) in ranges),
+    )
+    chained = build_gdn_global_execution_decision(
+        spec, cp_size=4, attention_token_layout_index=layout, planner_config=current
+    )
+    local = build_gdn_global_execution_decision(
+        spec, cp_size=4, attention_token_layout_index=layout, planner_config=legacy
+    )
+    assert any(chained.chained_nodes) and not any(local.chained_nodes)

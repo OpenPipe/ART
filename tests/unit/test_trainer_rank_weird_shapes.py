@@ -22,6 +22,7 @@ from art.trainer_rank import (
 )
 from art.trainer_rank._impl import (
     _CheckpointSlot,
+    _FlatForwardPlan,
     _flatten,
     _MemoryCheck,
     _MemoryProfile,
@@ -456,36 +457,53 @@ def test_width_search_survives_non_monotone_cost_optimal_layouts(
     1, fails at 2, fits at 3 in this case). Feasibility must instead be judged
     by the memory-minimal layout, which is monotone, so the search reaches
     width 3 instead of stopping at the spurious failure.
+
+    Where exactly one saved copy stops paying for the extra level depends on
+    the fitted cost model (CPU-only planning scores with the default dense
+    table, which is re-certified as the runtime changes), so the test finds a
+    shared-prefix length in that window instead of pinning one.
     """
 
-    # 150 shared tokens on the attention model: one saved copy (width 2) does
-    # not pay for the extra level under the fitted cost model (the default
-    # dense table, re-certified 2026-09-08; the window is 130-160 shared
-    # tokens), two saved copies (width 3) do.
-    shared = tuple(range(10_000, 10_150))
-    inputs = [_target_request(_tokens(*shared, tail)) for tail in (1, 2, 3)]
-    rank = TrainerRank(_attention_runtime())
-    monkeypatch.setattr(rank, "_dp_rank_and_size", lambda: (0, 1))
-    monkeypatch.setattr(rank, "_all_ranks_have_memory_profile", lambda **_kwargs: True)
-    monkeypatch.setattr(
-        rank,
-        "_run_flat_plan_with_memory_tracking",
-        lambda plan, **_kwargs: (
-            [ForwardOutput(None, None, None, None) for _ in range(plan.request_count)],
-            None,
-        ),
-    )
-    # Confirm the non-monotone premise under the production cost model.
-    two = rank._plan_flat_forward(inputs[:2])
-    three = rank._plan_flat_forward(inputs)
-    assert two.packed_tokens == 302, two.packed_tokens
-    assert three.packed_tokens == 153, three.packed_tokens
-    _set_packed_token_budget(monkeypatch, rank, 300)
+    def plans(shared_len: int) -> tuple[TrainerRank, list, int, int]:
+        shared = tuple(range(10_000, 10_000 + shared_len))
+        inputs = [_target_request(_tokens(*shared, tail)) for tail in (1, 2, 3)]
+        rank = TrainerRank(_attention_runtime())
+        monkeypatch.setattr(rank, "_dp_rank_and_size", lambda: (0, 1))
+        monkeypatch.setattr(
+            rank, "_all_ranks_have_memory_profile", lambda **_kwargs: True
+        )
+        monkeypatch.setattr(
+            rank,
+            "_run_flat_plan_with_memory_tracking",
+            lambda plan, **_kwargs: (
+                [
+                    ForwardOutput(None, None, None, None)
+                    for _ in range(plan.request_count)
+                ],
+                None,
+            ),
+        )
+        two = rank._plan_flat_forward(inputs[:2]).packed_tokens
+        three = rank._plan_flat_forward(inputs).packed_tokens
+        return rank, inputs, two, three
+
+    # One saved copy (width 2) does not pay for the extra level under the
+    # production cost model, two saved copies (width 3) do: width 2 replays the
+    # prefix (2 * shared + 2 tokens), width 3 shares it (shared + 3 tokens).
+    for shared_len in range(40, 400, 10):
+        rank, inputs, two, three = plans(shared_len)
+        if two == 2 * shared_len + 2 and three == shared_len + 3:
+            break
+    else:
+        pytest.fail("no shared-prefix length makes the cost-optimal width non-monotone")
+    # A budget between the two: the cost-optimal width-2 layout does not fit,
+    # the width-3 one does.
+    _set_packed_token_budget(monkeypatch, rank, (two + three) // 2)
 
     batches = list(rank.forward_micro_batches(inputs))
 
     assert [batch.stats.global_count for batch in batches] == [3]
-    assert batches[0].stats.packed_tokens <= 300
+    assert batches[0].stats.packed_tokens <= (two + three) // 2
 
 
 def test_dp_rank_forward_falls_back_to_memory_minimal_layout_before_refusing(
@@ -515,6 +533,104 @@ def test_dp_rank_forward_falls_back_to_memory_minimal_layout_before_refusing(
     assert len(outputs) == 2
     assert executed == [42]
     assert rank.last_forward_telemetry()["selected_max_depth"] == 2
+
+
+@pytest.mark.parametrize(
+    "profile", ("absent", "tiny", "tiny_roomy", "trusted", "peer_untrusted")
+)
+def test_minimum_wave_materializes_the_layout_its_check_priced(
+    monkeypatch: pytest.MonkeyPatch, profile: str
+) -> None:
+    inputs = [_target_request(_tokens(*range(10_000, 10_040), tail)) for tail in (1, 2)]
+    rank = TrainerRank(_attention_runtime())
+    monkeypatch.setattr(rank, "_dp_rank_and_size", lambda: (0, 1))
+    unshared = rank._plan_flat_forward(inputs)
+    shared = rank._plan_flat_forward(inputs, memory_minimal=True)
+    assert (unshared.packed_tokens, shared.packed_tokens) == (82, 42)
+    if profile != "absent":
+        rank._memory_profiles[shared.signature] = _MemoryProfile(
+            bytes_per_token=0.0,
+            packed_tokens=1 if profile.startswith("tiny") else shared.packed_tokens,
+        )
+    if profile == "peer_untrusted":
+        # Local geometry is trusted, but another DP rank reports otherwise.
+        monkeypatch.setattr(rank, "_all_ranks_have_memory_profile", lambda **_: False)
+    shared_required = rank._memory_check(shared).estimated_required_bytes
+    unshared_required = rank._memory_check(unshared).estimated_required_bytes
+    assert shared_required < unshared_required
+    available = (
+        unshared_required
+        if profile == "tiny_roomy"
+        else (shared_required + unshared_required) // 2
+    )
+    monkeypatch.setattr(rank, "_available_memory_bytes", lambda: available)
+
+    candidate = rank._select_next_micro_batch([inputs], 0)
+
+    assert candidate.check.fits
+    assert isinstance(candidate.plan, _FlatForwardPlan)
+    assert candidate.plan.packed_tokens == shared.packed_tokens
+    assert rank._memory_check(candidate.plan) == candidate.check
+    assert candidate.cold_start == (profile != "trusted")
+
+
+@pytest.mark.parametrize("stage", ("bound", "exact"))
+def test_minimum_wave_rejection_keeps_its_layout_mode(
+    monkeypatch: pytest.MonkeyPatch, stage: str
+) -> None:
+    inputs = [_target_request(_tokens(*range(10_000, 10_040), tail)) for tail in (1, 2)]
+    rank = TrainerRank(_attention_runtime())
+    monkeypatch.setattr(rank, "_dp_rank_and_size", lambda: (0, 1))
+    shared = rank._plan_flat_forward(inputs, memory_minimal=True)
+    required = rank._memory_check(shared).estimated_required_bytes
+    available = iter(
+        (required - 1, required + 1, required - 1, required - 1)
+        if stage == "exact"
+        else (required - 1, required - 1)
+    )
+    monkeypatch.setattr(rank, "_available_memory_bytes", lambda: next(available))
+    modes: list[bool] = []
+    original_plan = rank._plan_flat_forward
+
+    def plan(requests, **kwargs):
+        modes.append(kwargs.get("memory_minimal", False))
+        return original_plan(requests, **kwargs)
+
+    original_error = RuntimeError("The split ladder owns the subsequent refusal")
+
+    def find(*args, **kwargs):
+        raise original_error
+
+    monkeypatch.setattr(rank, "_plan_flat_forward", plan)
+    monkeypatch.setattr(rank, "_find_admissible_forward", find)
+    with pytest.raises(RuntimeError) as caught:
+        rank._select_next_micro_batch([inputs], 0)
+    assert caught.value is original_error
+    assert modes == [True]
+    assert next(available, None) is None
+
+
+def test_minimum_wave_empty_dp_rank_keeps_collective_check_sequence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rank = TrainerRank(_attention_runtime())
+    monkeypatch.setattr(rank, "_dp_rank_and_size", lambda: (1, 2))
+    peer_required = iter((82, 42, 82, 42, 42))
+    local_checks: list[tuple[int, bool]] = []
+
+    def check(required: int, *, sync_across_dp: bool = False) -> _MemoryCheck:
+        local_checks.append((required, sync_across_dp))
+        remote = next(peer_required)
+        return _MemoryCheck(remote, 60, remote <= 60)
+
+    monkeypatch.setattr(rank, "_memory_check_required", check)
+    candidate = rank._select_next_micro_batch([[_target_request(_tokens(1, 2))]], 0)
+
+    assert candidate.indices == ()
+    assert candidate.plan.packed_tokens == 0
+    assert candidate.check == _MemoryCheck(42, 60, True)
+    assert local_checks == [(0, True)] * 4 + [(42, True)]
+    assert next(peer_required, None) is None
 
 
 def test_profiled_steady_state_keeps_the_wide_shared_wave(
