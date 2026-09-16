@@ -1357,14 +1357,6 @@ class TrainerRank:
                 "therefore requires PP=1 with exactly one local model chunk; "
                 f"got pp={pp_size}, chunks={len(runtime.model)}"
             )
-        if getattr(runtime.provider, "recompute_granularity", None) == "selective":
-            raise TrainerRankRuntimeSupportError(
-                "TrainerRank memory planning does not support selective recompute; "
-                "its activation estimate assumes full recompute. Use "
-                "ART_MEGATRON_RECOMPUTE_GRANULARITY=full with "
-                "ART_MEGATRON_RECOMPUTE_METHOD=uniform and "
-                "ART_MEGATRON_RECOMPUTE_NUM_LAYERS=1."
-            )
         # Tensor parallelism is admitted: the vocab-parallel head, sequence-
         # parallel gather, TP padding of packed batches and sharded LoRA
         # gradient reduction pre-date the planner, memory checks all-reduce
@@ -1387,6 +1379,11 @@ class TrainerRank:
             getattr(getattr(metadata_model, "config", None), "num_layers", 0)
             or getattr(runtime.provider, "num_layers", 1)
             or 1
+        )
+        self._recompute_granularity = getattr(
+            getattr(metadata_model, "config", None),
+            "recompute_granularity",
+            getattr(runtime.provider, "recompute_granularity", None),
         )
         # Layers that run the gated-delta-net path (Qwen3.5-4B: 24 of 32); the
         # cost model prices GDN state hand-offs per GDN layer, not per layer.
@@ -5134,6 +5131,36 @@ class TrainerRank:
             * self._param_dtype_size
             * activation_factor
         )
+        if signature.grad_enabled and self._recompute_granularity != "full":
+            geometry = self._geometry
+            ffn_width = max(
+                geometry.ffn_hidden_size or 4 * self._hidden_size,
+                geometry.moe_topk * geometry.moe_ffn_hidden_size
+                + geometry.moe_shared_expert_ffn,
+            )
+            attention_width = max(
+                self._hidden_size,
+                geometry.num_attention_heads * geometry.kv_channels,
+                2 * geometry.gdn_key_heads * geometry.gdn_key_head_dim
+                + 2 * geometry.gdn_value_heads * geometry.gdn_value_head_dim,
+            )
+            # Megatron's selective-recompute model retains per-layer attention,
+            # norm and MLP tensors (arxiv.org/abs/2205.05198). Charge four FFN
+            # widths for gated MLPs, and routed hidden rows for MoE. Do not take
+            # TP/CP/EP or optional selective-module discounts without measured
+            # evidence; the default core_attn checkpoint leaves the MLP live.
+            layer_features = (
+                9 * attention_width
+                + 4 * ffn_width
+                + 2 * self._hidden_size * max(0, geometry.moe_topk - 1)
+            )
+            static_compute = max(
+                static_compute,
+                packed_tokens
+                * self._num_layers
+                * self._param_dtype_size
+                * layer_features,
+            )
         # Groups execute sequentially: summed packed rows conservatively bound
         # this FC2 component, not all workspace or retained graphs.
         static_compute = max(
