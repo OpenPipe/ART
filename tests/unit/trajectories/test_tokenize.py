@@ -646,6 +646,73 @@ def test_exact_output_boundaries_survive_prefix_order_drift_and_length_stop() ->
         history.tokenize(tokenizer=tokenizer, chat_template="explicit override")
 
 
+def test_length_stop_preserves_served_prompt_with_retokenized_demonstration() -> None:
+    class Tokenizer(_BoundaryTokenizer):
+        def decode(self, token_ids: list[int], **kwargs: object) -> str:
+            return "".join({2: "\n", 30: "\n\n"}.get(t, str(t)) for t in token_ids)
+
+        def apply_chat_template(
+            self,
+            messages: list[dict[str, Any]],
+            *,
+            add_generation_prompt: bool,
+            **kwargs: object,
+        ) -> list[int]:
+            tokens = super().apply_chat_template(
+                messages, add_generation_prompt=add_generation_prompt, **kwargs
+            )
+            # The first newline belongs to the generation prefix; the next
+            # belongs to the assistant. The served prompt merges them.
+            return [*tokens, 2] if add_generation_prompt else tokens
+
+    exchange = _chat_exchange([1, 30, 3, 2], [4], offset=1)
+    exchange.response.choices[0].finish_reason = "length"
+    trajectory = art.Trajectory(
+        exchanges=TrajectoryExchanges(chat_completions=[exchange])
+    )
+    tokenizer = Tokenizer(
+        ("user", [1]), ("assistant", [2, 2]), ("user", [3]), ("assistant", [2, 4, 9])
+    )
+    tokenized = trajectory.tokenize(tokenizer=tokenizer)
+    assert tokenized.tokens == [1, 30, 3, 2, 4]
+    assert not tokenized.flags[1] & (tr.TokenFlag.SAMPLED | tr.TokenFlag.OUTPUT)
+    assert tokenized.flags[4] == _SAMPLED_ASSISTANT_OUTPUT
+    assert tokenized.logprobs[4] == -0.4
+
+
+@pytest.mark.parametrize(
+    "text,mask",
+    [("different", [True, True]), ("\n\n", [True, False]), ("\ufffd", [True, True])],
+)
+def test_mask_translation_rejects_changed_text_or_ambiguous_boundaries(
+    text: str, mask: list[bool]
+) -> None:
+    from art.trajectories._tokenize import _translate_token_mask
+
+    tokenizer = cast(
+        tr.Tokenizer,
+        SimpleNamespace(
+            decode=lambda tokens, **kwargs: "\n\n" if tokens == [1, 2] else text
+        ),
+    )
+    with pytest.raises(ValueError, match="Cannot preserve assistant boundaries"):
+        _translate_token_mask([1, 2], [3, 4], mask, tokenizer=tokenizer)
+
+
+@pytest.mark.parametrize(
+    "mask", [[False, True], [True, False], [True, True], [False, False]]
+)
+def test_merged_whitespace_token_inherits_mask_of_its_characters(
+    mask: list[bool],
+) -> None:
+    from art.trajectories._tokenize import _translate_token_mask
+
+    tokenizer = cast(
+        tr.Tokenizer, SimpleNamespace(decode=lambda tokens, **kwargs: "\n\n")
+    )
+    assert _translate_token_mask([1, 2], [3], mask, tokenizer=tokenizer) == [any(mask)]
+
+
 def test_exact_length_boundary_with_multiple_parts_and_prefix_drift() -> None:
     first = _chat_exchange([1], [2, 9])
     second = _chat_exchange([1, 2, 9, 3], [4, 5], offset=1)

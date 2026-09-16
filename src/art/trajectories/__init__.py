@@ -1350,6 +1350,20 @@ class TokenizedTrajectoryGroup(_StringInterningModel, Generic[TokenizedTrajector
 
         return dump_tokenized_trajectory_group(self)
 
+    @overload
+    def tensorize(
+        self: TokenizedTrajectoryGroup[TokenizedTrajectory],
+        *,
+        device: torch.device | str | None = None,
+    ) -> TensorizedTrajectoryGroup[TensorizedTrajectory]: ...
+
+    @overload
+    def tensorize(
+        self: TokenizedTrajectoryGroup[TokenizedMultiHistoryTrajectory],
+        *,
+        device: torch.device | str | None = None,
+    ) -> TensorizedTrajectoryGroup[TensorizedMultiHistoryTrajectory]: ...
+
     def tensorize(
         self, *, device: torch.device | str | None = None
     ) -> (

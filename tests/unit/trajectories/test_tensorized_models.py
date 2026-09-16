@@ -6,6 +6,7 @@ import math
 import pickle
 import subprocess
 import sys
+from typing import assert_type
 
 from openai.types.chat import ChatCompletion
 import pytest
@@ -253,6 +254,7 @@ def test_trajectory_and_group_tensorize_retain_mutable_sources() -> None:
         trajectories=[tokenized],
     )
     tensorized_group = tokenized_group.tensorize()
+    assert_type(tensorized_group, tr.TensorizedTrajectoryGroup[tr.TensorizedTrajectory])
     assert tensorized_group.trajectory_group is source_group
     assert tensorized_group.trajectories[0].trajectory is trajectory
     group_metrics: dict[str, float | int | bool] = {"batch": 2}
@@ -260,6 +262,20 @@ def test_trajectory_and_group_tensorize_retain_mutable_sources() -> None:
     tensorized_group.metadata = {"name": "updated"}
     assert source_group.metrics == {"batch": 2}
     assert source_group.metadata == {"name": "updated"}
+
+    multi_group = tr.TokenizedTrajectoryGroup[tr.TokenizedMultiHistoryTrajectory](
+        trajectory_group=source_group,
+        trajectories=[
+            tr.TokenizedMultiHistoryTrajectory(
+                trajectory=trajectory, histories=[tokenized]
+            )
+        ],
+    ).tensorize()
+    assert_type(
+        multi_group, tr.TensorizedTrajectoryGroup[tr.TensorizedMultiHistoryTrajectory]
+    )
+    assert multi_group.trajectory_group is source_group
+    assert len(multi_group.trajectories[0].histories) == 1
 
 
 def test_tensorized_compact_round_trips_inferred_and_typed() -> None:
