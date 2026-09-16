@@ -269,6 +269,7 @@ def _rebind_history_sources(
         MessagesExchange,
         ResponsesExchange,
         Trajectory,
+        _Exchange,
     )
 
     exchange_types = (
@@ -278,7 +279,7 @@ def _rebind_history_sources(
         MessagesExchange,
     )
 
-    def exchanges(value: object) -> list[BaseModel]:
+    def exchanges(value: object) -> list[_Exchange]:
         if not isinstance(value, Trajectory):
             return []
         return [
@@ -319,10 +320,13 @@ def _rebind_history_sources(
                         if replacement is not item:
                             object.__setattr__(value, name, replacement)
                         continue
+                    # Reject unrelated calls before dumping their full payloads.
                     matches = [
                         exchange
                         for exchange in canonical
                         if type(exchange) is type(item)
+                        and exchange.start_time == item.start_time
+                        and exchange.end_time == item.end_time
                         and (
                             exchange == item
                             or _equal_with_nan(exchange.model_dump(), item.model_dump())

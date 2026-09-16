@@ -239,6 +239,44 @@ def test_tokenized_group_skips_equality_dump_for_identical_source(
 
 
 @pytest.mark.parametrize("logprob", [-0.25, math.nan])
+def test_source_rebinding_does_not_dump_unrelated_exchanges(
+    logprob: float, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from test_tokenize import _chat_exchange
+
+    exchanges = [
+        _chat_exchange(list(range(1, 2 * i + 2)), [2 * i + 2], offset=i)
+        for i in range(12)
+    ]
+    for exchange in exchanges:
+        old = exchange.response.choices[0].logprobs
+        assert old and old.content
+        old.content[0].logprob = logprob
+    tokenized = art.Trajectory(
+        exchanges=tr.TrajectoryExchanges(chat_completions=exchanges)
+    ).tokenize()
+    payload = tokenized.model_dump_json()
+    dumps = 0
+    original_dump = tr.ChatCompletionsExchange.model_dump
+
+    def counted_dump(self: tr.ChatCompletionsExchange, *args: Any, **kwargs: Any):
+        nonlocal dumps
+        dumps += 1
+        return original_dump(self, *args, **kwargs)
+
+    monkeypatch.setattr(tr.ChatCompletionsExchange, "model_dump", counted_dump)
+    restored = tr.TokenizedTrajectory.model_validate_json(payload)
+    assert isinstance(restored.history, tr.ChatCompletionsHistory)
+    sources = [s for s in restored.history.message_sources if s is not None]
+    assert dumps <= (2 * len(sources) if math.isnan(logprob) else 0)
+    assert all(
+        any(s.exchange is e for e in restored.trajectory.exchanges.chat_completions)
+        for s in sources
+    )
+    assert restored.model_dump_json() == payload
+
+
+@pytest.mark.parametrize("logprob", [-0.25, math.nan])
 def test_public_group_tokenization_nan_json_round_trip(logprob: float) -> None:
     from datetime import datetime
 
