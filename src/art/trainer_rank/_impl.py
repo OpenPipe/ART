@@ -1361,7 +1361,10 @@ def _shared_expert_output_bytes_per_token(layer: torch.nn.Module) -> int:
 
 
 def _moe_output_bytes_per_token(
-    model: Sequence[torch.nn.Module], shape: ParallelShape
+    model: Sequence[torch.nn.Module],
+    shape: ParallelShape,
+    *,
+    checkpoint_grad: bool = False,
 ) -> int:
     """Known routed-expert working set, not a complete model/compiled bound."""
     if shape != ParallelShape(tp=1, cp=1):
@@ -1467,10 +1470,19 @@ def _moe_output_bytes_per_token(
                     # remain live at the FC2 sum, including in the observed
                     # compiled path. This is one stage, not a backward bound.
                     features += 2 * fc2.out_features + fc1.out_features
+            shared = _shared_expert_output_bytes_per_token(layer)
+            if (
+                checkpoint_grad
+                and shared
+                and getattr(layer.shared_experts, "use_shared_expert_gate", False)
+                is True
+            ):
+                # Gate-score backward saves a distinct pre-gate X. Charge it
+                # beside this layer's returned X, not another layer's maximum.
+                shared += shared
             coefficient = max(
                 coefficient,
-                config.moe_router_topk * features * weights.element_size()
-                + _shared_expert_output_bytes_per_token(layer),
+                config.moe_router_topk * features * weights.element_size() + shared,
             )
     return coefficient
 
@@ -1544,6 +1556,14 @@ class TrainerRank:
         )
         self._moe_output_bytes_per_token = (
             _moe_output_bytes_per_token(runtime.model, self._parallel_shape)
+            if self._moe_layers
+            else 0
+        )
+        # Both modes inspect original owners before dispatcher caches are installed.
+        self._moe_checkpoint_grad_bytes_per_token = (
+            _moe_output_bytes_per_token(
+                runtime.model, self._parallel_shape, checkpoint_grad=True
+            )
             if self._moe_layers
             else 0
         )
@@ -3302,6 +3322,18 @@ class TrainerRank:
             for group in plan.groups
         )
 
+    def _checkpoint_moe_bytes_per_token(self) -> int:
+        forward = self._moe_output_bytes_per_token
+        gradient = self._moe_checkpoint_grad_bytes_per_token
+        if (
+            type(forward) is not int
+            or forward < 0
+            or type(gradient) is not int
+            or gradient < forward
+        ):
+            raise ValueError("Invalid constructor checkpoint MoE coefficient")
+        return gradient
+
     def _checkpoint_memory_floor(
         self, group_rows: tuple[tuple[int, bool], ...]
     ) -> tuple[int, int]:
@@ -3367,8 +3399,10 @@ class TrainerRank:
         ):
             return 0, 0
         retained = gradient_rows * layers * self._hidden_size * 2
-        workspace = (
-            max(rows for rows, _grad in group_rows) * self._moe_output_bytes_per_token
+        gradient_moe = self._checkpoint_moe_bytes_per_token()
+        workspace = max(
+            rows * (gradient_moe if grad else self._moe_output_bytes_per_token)
+            for rows, grad in group_rows
         )
         return retained, workspace
 

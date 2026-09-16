@@ -189,6 +189,7 @@ def model_shapes(rank: Any) -> tuple[int, tuple[Shape, ...]] | None:
     moe = rank._moe_output_bytes_per_token
     if type(moe) is not int or moe < 0 or (rank._moe_layers and not moe):
         raise ValueError("Invalid constructor MoE coefficient for GDN pending floor")
+    rank._checkpoint_moe_bytes_per_token()
     shapes = []
     for layer in decoder.layers:
         gdn = getattr(layer, "self_attention", None)
@@ -306,6 +307,10 @@ def plan_floor(rank: Any, plan: Any) -> tuple[int, int]:
         retained += rows * layers * rank._hidden_size * 2
         workspace = max(
             workspace,
-            *(rows * s.moe_bytes_per_row + s.pending(rows, buckets) for s in shapes),
+            *(
+                rows * rank._moe_checkpoint_grad_bytes_per_token
+                + s.pending(rows, buckets)
+                for s in shapes
+            ),
         )
     return retained, workspace

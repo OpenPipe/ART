@@ -104,6 +104,8 @@ def coefficient(layer):
 def test_shared_return_in_actual_constructor_and_plan(layer, gate, no_grad):
     rank, _ = rank_with_moe(shared_layer(layer, gate))
     assert rank._moe_output_bytes_per_token == 192512
+    checkpoint_coefficient = 196608 if gate else 192512
+    assert rank._moe_checkpoint_grad_bytes_per_token == checkpoint_coefficient
     shapes = g.model_shapes(rank)
     assert shapes is not None and shapes[1][0].moe_bytes_per_row == 192512
     requests = full_requests(no_grad)
@@ -116,8 +118,11 @@ def test_shared_return_in_actual_constructor_and_plan(layer, gate, no_grad):
         assert g.plan_floor(rank, plan) == (0, 0)
         assert rank._plan_cost(plan).required == 10723911264
     else:
-        assert g.plan_floor(rank, plan) == (8296857600, 50640 * 192512 + 3157761952)
-        assert rank._plan_cost(plan).required == 23323992771
+        assert g.plan_floor(rank, plan) == (
+            8296857600,
+            50640 * checkpoint_coefficient + 3157761952,
+        )
+        assert rank._plan_cost(plan).required == (23552156355 if gate else 23323992771)
     selected = rank._select_next_micro_batch(requests, 0)
     assert (
         selected.check.estimated_required_bytes
@@ -132,9 +137,15 @@ def test_original_norm_installation_preserves_shared_return(layer, gated):
     assert _shared_expert_output_bytes_per_token(layer) == 4096
     assert rank._moe_output_bytes_per_token == 192512
     plan = rank._plan_flat_forward(full_requests())
-    assert g.plan_floor(rank, plan) == (8296857600, 50640 * 192512 + 3157761952)
-    assert rank._memory_check(plan).estimated_required_bytes == 23323992771
-    assert rank._plan_cost(plan).required == 23323992771
+    checkpoint_coefficient = 196608 if gated else 192512
+    assert rank._moe_checkpoint_grad_bytes_per_token == checkpoint_coefficient
+    assert g.plan_floor(rank, plan) == (
+        8296857600,
+        50640 * checkpoint_coefficient + 3157761952,
+    )
+    expected = 23552156355 if gated else 23323992771
+    assert rank._memory_check(plan).estimated_required_bytes == expected
+    assert rank._plan_cost(plan).required == expected
 
 
 mutations = {
@@ -197,7 +208,15 @@ def test_unsupported_shared_branch_keeps_prior_routed_component(layer, name):
     mutations[name](layer)
     assert _shared_expert_output_bytes_per_token(layer) == 0
     assert coefficient(layer) == 188416
-    assert _rank(layer)._moe_output_bytes_per_token == 188416
+    assert (
+        _moe_output_bytes_per_token(
+            [layer], ParallelShape(tp=1, cp=1), checkpoint_grad=True
+        )
+        == 188416
+    )
+    rank = _rank(layer)
+    assert rank._moe_output_bytes_per_token == 188416
+    assert rank._moe_checkpoint_grad_bytes_per_token == 188416
 
 
 def test_shared_return_has_no_topk_or_layer_multiplier(layer):
@@ -241,3 +260,116 @@ def test_reference_group_has_shared_stage_but_no_pending_save(layer):
     retained, workspace = g.plan_floor(rank, one)
     assert g.plan_floor(rank, mixed) == (retained, max(workspace, 4096 * 192512))
     assert g.plan_floor(rank, rank._plan_flat_forward([reference])) == (0, 0)
+
+
+def test_pre_gate_is_same_layer_stage_not_sum_of_separate_maxima(layer):
+    import copy
+
+    shared_layer(layer)
+    other = copy.deepcopy(layer)
+    del other.shared_experts
+    other.experts.linear_fc2.lora.A_T = torch.nn.Parameter(
+        torch.empty(256, 640, 8, dtype=torch.bfloat16)
+    )
+    other.experts.linear_fc1.out_features = 1280
+    shape = ParallelShape(tp=1, cp=1)
+    # Routed-only width640 wins forward; gated width512 wins recomputation.
+    assert _moe_output_bytes_per_token([layer, other], shape) == 194560
+    assert (
+        _moe_output_bytes_per_token([layer, other], shape, checkpoint_grad=True)
+        == 196608
+    )
+    assert (
+        _moe_output_bytes_per_token([layer, layer], shape, checkpoint_grad=True)
+        == 196608
+    )
+    layer.config.moe_router_topk = layer.router.topk = 4
+    assert (
+        _moe_output_bytes_per_token([layer], shape, checkpoint_grad=True)
+        == 4 * (3 * 512 + 5 * 2048) * 2 + 2 * 4096
+    )
+
+
+def test_pre_gate_cache_precedes_owned_dispatcher_and_is_checkpoint_only(layer):
+    rank, _ = rank_with_moe(shared_layer(layer))
+    assert (
+        _moe_output_bytes_per_token(
+            rank.runtime.model, rank._parallel_shape, checkpoint_grad=True
+        )
+        == 0
+    )  # Installed dispatcher partials must not be repriced.
+    assert rank._moe_checkpoint_grad_bytes_per_token == 196608
+    groups = ((19, True), (23, False))
+    assert rank._checkpoint_memory_floor(groups) == (
+        19 * 40 * 4096,
+        max(19 * 196608, 23 * 192512),
+    )
+    for mode in (None, "selective"):
+        rank.runtime.model[0].decoder.config.recompute_granularity = mode
+        assert rank._checkpoint_memory_floor(groups) == (0, 0)
+        assert g.plan_floor(rank, rank._plan_flat_forward(full_requests())) == (0, 0)
+
+
+@pytest.mark.parametrize("gradient_first", [False, True])
+def test_pre_gate_mixed_reference_and_exact_cost_mode_selection(layer, gradient_first):
+    rank, _ = rank_with_moe(shared_layer(layer))
+    grad = ForwardInput(
+        input_tokens=torch.arange(67), hidden_states=True, no_grad=False
+    )
+    reference = ForwardInput(
+        input_tokens=torch.arange(4096), hidden_states=True, no_grad=True
+    )
+    single = rank._plan_flat_forward([grad])
+    requests = [grad, reference] if gradient_first else [reference, grad]
+    mixed = rank._plan_flat_forward(requests)
+    retained, workspace = g.plan_floor(rank, single)
+    assert g.plan_floor(rank, mixed) == (retained, max(workspace, 4096 * 192512))
+    assert (
+        rank._memory_check(mixed).estimated_required_bytes
+        == rank._plan_cost(mixed).required
+    )
+    assert rank._checkpoint_memory_floor(rank._plan_group_rows(mixed)) == (
+        67 * 40 * 4096,
+        4096 * 192512,
+    )
+    # A reference-only path must not read or validate the unused gradient cache.
+    rank._moe_checkpoint_grad_bytes_per_token = None
+    reference_plan = rank._plan_flat_forward([reference])
+    assert g.plan_floor(rank, reference_plan) == (0, 0)
+    assert rank._checkpoint_memory_floor(rank._plan_group_rows(reference_plan)) == (
+        0,
+        0,
+    )
+    assert (
+        rank._memory_check(reference_plan).estimated_required_bytes
+        == rank._plan_cost(reference_plan).required
+    )
+
+
+@pytest.mark.parametrize("bad", [None, True, -1, 1.5, 192511])
+def test_invalid_pre_gate_cache_stays_inside_planning_status(layer, bad):
+    rank, _ = rank_with_moe(shared_layer(layer))
+    requests = full_requests()
+    plan = rank._plan_flat_forward(requests)
+    rank._moe_checkpoint_grad_bytes_per_token = bad
+    statuses = []
+    rank._all_ranks_true = lambda value: (statuses.append(value), value)[1]
+    rank._memory_check_required = lambda *a, **kw: pytest.fail(
+        "memory reduction entered"
+    )
+    for call in (
+        lambda: rank._memory_check(
+            plan, sync_planning_errors=True, sync_across_dp=True
+        ),
+        lambda: rank._estimate_flat_forward(requests, sync_planning_errors=True),
+    ):
+        with pytest.raises(
+            ValueError, match="Invalid constructor checkpoint MoE coefficient"
+        ):
+            call()
+        assert statuses == [False]
+        statuses.clear()
+    with pytest.raises(
+        ValueError, match="Invalid constructor checkpoint MoE coefficient"
+    ):
+        rank._plan_cost(plan)
