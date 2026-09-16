@@ -680,6 +680,59 @@ def test_length_stop_preserves_served_prompt_with_retokenized_demonstration() ->
     assert tokenized.logprobs[4] == -0.4
 
 
+def test_hidden_demo_reasoning_cannot_advance_past_sampled_message() -> None:
+    class Tokenizer(_CharacterTemplateTokenizer):
+        def apply_chat_template(
+            self, messages: list[dict[str, Any]], **kwargs: Any
+        ) -> str | list[int]:
+            return super().apply_chat_template(
+                [
+                    {
+                        **message,
+                        "content": message.get("content")
+                        or message.get("reasoning", ""),
+                    }
+                    for message in messages
+                ],
+                **kwargs,
+            )
+
+    tokenizer = Tokenizer()
+    messages = [
+        {"role": "user", "content": "demo"},
+        {"role": "assistant", "reasoning": "repeat", "content": "shown"},
+        {"role": "user", "content": "start"},
+    ]
+    prompt = tokenizer.apply_chat_template(messages, add_generation_prompt=True)
+    assert isinstance(prompt, list)
+    first = _chat_exchange(prompt, tokenizer._encode("repeat"))
+    first.request["messages"] = cast(list[ChatCompletionMessageParam], messages)
+    data = first.response.model_dump(mode="python")
+    data["choices"][0].update(
+        finish_reason="length", message={"role": "assistant", "reasoning": "repeat"}
+    )
+    first.response = ChatCompletion.model_validate(data)
+    following = [
+        *messages,
+        data["choices"][0]["message"],
+        {"role": "user", "content": "next"},
+    ]
+    prompt = tokenizer.apply_chat_template(following, add_generation_prompt=True)
+    assert isinstance(prompt, list)
+    second = _chat_exchange(prompt, tokenizer._encode("answer§"), offset=1)
+    second.request["messages"] = cast(list[ChatCompletionMessageParam], following)
+    tokenized = art.Trajectory(
+        exchanges=TrajectoryExchanges(chat_completions=[first, second])
+    ).tokenize(tokenizer=tokenizer, chat_template="explicit override")
+
+    sampled = [
+        token
+        for token, flag in zip(tokenized.tokens, tokenized.flags, strict=True)
+        if flag & tr.TokenFlag.SAMPLED
+    ]
+    assert sampled == tokenizer._encode("repeatanswer§")
+
+
 @pytest.mark.parametrize(
     "text,mask",
     [("different", [True, True]), ("\n\n", [True, False]), ("\ufffd", [True, True])],
