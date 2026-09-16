@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from contextlib import contextmanager
 from dataclasses import fields, is_dataclass
+import math
 import threading
 from typing import Any, Literal, SupportsIndex, cast
 
@@ -234,6 +235,26 @@ def validate_history(value: object) -> object:
     return model.model_validate(data)
 
 
+def _equal_with_nan(left: Any, right: Any) -> bool:
+    """Compare serialized source data, treating unknown log probabilities as equal."""
+    if left is right:
+        return True
+    if isinstance(left, dict) and isinstance(right, dict):
+        return left.keys() == right.keys() and all(
+            _equal_with_nan(value, right[key]) for key, value in left.items()
+        )
+    if isinstance(left, (list, tuple)) and type(left) is type(right):
+        return len(left) == len(right) and all(
+            _equal_with_nan(a, b) for a, b in zip(left, right, strict=True)
+        )
+    return left == right or (
+        isinstance(left, float)
+        and isinstance(right, float)
+        and math.isnan(left)
+        and math.isnan(right)
+    )
+
+
 def _rebind_history_sources(
     history: object,
     trajectory: object | None = None,
@@ -257,7 +278,7 @@ def _rebind_history_sources(
         MessagesExchange,
     )
 
-    def exchanges(value: object) -> list[object]:
+    def exchanges(value: object) -> list[BaseModel]:
         if not isinstance(value, Trajectory):
             return []
         return [
@@ -301,7 +322,11 @@ def _rebind_history_sources(
                     matches = [
                         exchange
                         for exchange in canonical
-                        if type(exchange) is type(item) and exchange == item
+                        if type(exchange) is type(item)
+                        and (
+                            exchange == item
+                            or _equal_with_nan(exchange.model_dump(), item.model_dump())
+                        )
                     ]
                     if matches:
                         object.__setattr__(value, name, matches[0])

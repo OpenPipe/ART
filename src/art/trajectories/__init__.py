@@ -76,6 +76,7 @@ if TYPE_CHECKING:
 from ..types import Messages, MessagesAndChoices, Tools
 from ._serialization import (
     _CompactModel,
+    _equal_with_nan,
     _rebind_history_sources,
     _StringInterningModel,
     _StringPool,
@@ -1330,9 +1331,8 @@ class TokenizedTrajectoryGroup(_StringInterningModel, Generic[TokenizedTrajector
         for tokenized, trajectory in zip(
             self.trajectories, self.trajectory_group.trajectories, strict=True
         ):
-            if (
-                tokenized.trajectory is not trajectory
-                and tokenized.trajectory.model_dump() != trajectory.model_dump()
+            if tokenized.trajectory is not trajectory and not _equal_with_nan(
+                tokenized.trajectory.model_dump(), trajectory.model_dump()
             ):
                 raise ValueError("Tokenized trajectory does not match its source group")
             tokenized.trajectory = trajectory

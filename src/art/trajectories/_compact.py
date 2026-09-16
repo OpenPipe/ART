@@ -20,7 +20,7 @@ from . import (
     TrajectoryGroup,
     _load_tensors,
 )
-from ._serialization import _rebind_history_sources
+from ._serialization import _equal_with_nan, _rebind_history_sources
 
 _FORMAT = "art.trajectories"
 _VERSION = 1
@@ -405,7 +405,7 @@ def _compact_group_data(data: dict[str, pydantic.JsonValue]) -> None:
             dict[str, pydantic.JsonValue],
             dict(_mapping(item, "Tokenized trajectory")),
         )
-        if child.pop("trajectory", None) != source:
+        if not _equal_with_nan(child.pop("trajectory", None), source):
             raise ValueError("Tokenized trajectory does not match its source group")
         registry = _ExchangeDataRegistry.from_trajectory_data(source)
         if "history" in child:
