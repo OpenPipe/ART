@@ -231,6 +231,7 @@ jobs:
             tests/unit/test_trainer_rank_ignored_mixed_head.py \
             tests/unit/test_trainer_rank_pending_memory.py \
             tests/unit/test_trainer_rank_shared_memory.py \
+            tests/unit/test_trainer_rank_converted_memory.py \
             tests/unit/test_trainer_rank_split.py \
             tests/acceptance/trainer_rank_planner \
             tests/integration/megatron/model_support/test_dispatcher_graph_retention.py \
@@ -260,4 +261,5 @@ jobs:
             --ignore=tests/unit/test_trainer_rank_mixed_head_memory.py \
             --ignore=tests/unit/test_trainer_rank_ignored_mixed_head.py \
             --ignore=tests/unit/test_trainer_rank_pending_memory.py \
-            --ignore=tests/unit/test_trainer_rank_shared_memory.py
+            --ignore=tests/unit/test_trainer_rank_shared_memory.py \
+            --ignore=tests/unit/test_trainer_rank_converted_memory.py
