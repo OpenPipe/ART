@@ -2,8 +2,9 @@
 
 Run with torchrun; use a fresh process per mode/topology. Random weights keep
 the native model geometry and kernels without downloading a checkpoint. This
-measures memory, not pretrained-model correctness. Refused plans are recorded
-without execution. Each repetition clears the learned memory profile, while
+measures memory, not pretrained-model correctness. Like public admission, try
+the minimum-memory layout before refusing an unsplit request; never split or
+bypass the budget. Each repetition clears the learned memory profile, while
 sample 0 includes cold compilation/autotuning. Output is one JSONL row per rank.
 """
 
@@ -127,6 +128,7 @@ def main() -> None:
                 ForwardInput(input_tokens=item, hidden_states=True) for item in tokens
             ]
             plan = rank._plan_flat_forward(requests, checkpoint=slot)
+            memory_minimal = False
             for sample in range(args.repeat):
                 rank.zero_grad()
                 rank._memory_profiles.clear()
@@ -135,6 +137,12 @@ def main() -> None:
                 dist.barrier()
                 torch.cuda.synchronize()
                 check = rank._memory_check(plan)
+                if not check.fits and not memory_minimal:
+                    plan = rank._plan_flat_forward(
+                        requests, checkpoint=slot, memory_minimal=True
+                    )
+                    memory_minimal = True
+                    check = rank._memory_check(plan)
                 row = {
                     "lengths": lengths,
                     "shared_prefix": prefix,
@@ -142,6 +150,7 @@ def main() -> None:
                     "packed_tokens": plan.packed_tokens,
                     "output_bytes": plan.output_bytes,
                     "selected_max_depth": plan.selected_max_depth,
+                    "memory_minimal": memory_minimal,
                     "sample": sample,
                     "admission": asdict(check),
                 }
