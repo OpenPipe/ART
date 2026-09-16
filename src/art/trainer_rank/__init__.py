@@ -253,6 +253,15 @@ class TrainerRank(_impl.TrainerRank):
         ART moves its packed model inputs and labels internally without mutating
         the caller-owned `ForwardInput` objects.
 
+        With context parallelism, per-position outputs are local sequence shards,
+        not full sequences or necessarily equal contiguous splits. Each active
+        `ForwardOutput.positions` maps its rows to the request's flattened input
+        positions, including for hidden states, logits, top-k and target logprobs.
+        Index full-sequence masks/labels by these positions before using them.
+        For global means/pools, reduce local sums and counts with `dp_reduce`
+        (which includes context-parallel ranks), then divide; do not average
+        local means. No context-parallel output gather is performed.
+
         Empty local microbatches are skipped unless `yield_empty=True`. Every
         rank must use the same setting. When a wave skips ranks, TrainerRank
         collective methods raise if called from its loop body; fully populated
@@ -332,6 +341,9 @@ class TrainerRank(_impl.TrainerRank):
         no_grad: bool | None = None,
     ) -> ForwardOutputs:
         """Forward inputs already local to this data-parallel rank.
+
+        Outputs remain context-parallel-local; use `ForwardOutput.positions`
+        to align masks and readouts as described in `forward_micro_batches`.
 
         Per-input checkpoints and `no_grad` values override the method defaults.
         `no_grad=None` inherits the ambient PyTorch grad mode; `True` disables

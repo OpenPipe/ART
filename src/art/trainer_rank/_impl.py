@@ -184,12 +184,27 @@ class _LocalLoRASlotRef:
 
 @dataclass(frozen=True)
 class ForwardOutput(Generic[LogprobsT, TopKT, LogitsT, HiddenStatesT]):
+    """Per-request results, local to this context-parallel rank.
+
+    ``positions`` maps axis 0 of every returned tensor (including both ``top_k``
+    tensors) to offsets in the request's flattened ``input_tokens``. It is a
+    1-D int64 tensor on the output device: ``arange(input_tokens.numel())``
+    without context parallelism, and possibly empty/noncontiguous with it.
+    ``None`` denotes a request with no requested output fields.
+
+    Select full-sequence masks/labels with ``index_select(0, output.positions)``
+    before applying them to local outputs. Positions do not apply a next-token
+    shift; any alignment with target tokens is supplied by the caller. Exclude
+    the first source token with ``positions != 0``, not by slicing a local row.
+    """
+
     target_logprobs: LogprobsT
     top_k: TopKT
     logits: LogitsT
     hidden_states: HiddenStatesT
     checkpoint: str | None = None
     no_grad: bool = False
+    positions: torch.Tensor | None = None
 
 
 @dataclass(slots=True)
@@ -4811,6 +4826,7 @@ class TrainerRank:
                 hidden_states=track(output.hidden_states),
                 checkpoint=output.checkpoint,
                 no_grad=output.no_grad,
+                positions=output.positions,
             )
             for output in outputs
         ]
@@ -4943,7 +4959,7 @@ class TrainerRank:
         self,
         requests: Sequence[AnyForwardInput],
     ) -> int:
-        total = 0
+        total = _active_logical_tokens(requests) * _dtype_size(torch.long)
         for request in requests:
             seq_len = int(request.input_tokens.numel())
             if request.target_tokens is not None:
@@ -5349,6 +5365,10 @@ class TrainerRank:
             else None
         )
         device = hidden_by_row.device
+        source_positions = tuple(
+            positions.to(device=device)
+            for positions in prepared.source_positions_by_item
+        )
         target_logprobs = [None for _ in items]
         logits: list[torch.Tensor | None] = [None for _ in items]
         top_k: list[TopK | None] = [None for _ in items]
@@ -5362,8 +5382,9 @@ class TrainerRank:
             if item.request.logits or item.request.top_k is not None:
                 projected_rows.append(positions)
             if item.labels is not None:
-                source_positions = prepared.source_positions_by_item[index].to(device)
-                labels = item.labels.to(device=device).index_select(0, source_positions)
+                labels = item.labels.to(device=device).index_select(
+                    0, source_positions[index]
+                )
                 label_rows[index] = labels
                 target_logprobs[index] = torch.zeros(
                     tuple(labels.shape),
@@ -5453,6 +5474,7 @@ class TrainerRank:
                     if item.request.hidden_states
                     else None
                 ),
+                positions=source_positions[index],
             )
             for index, (item, positions) in enumerate(
                 zip(items, prepared.positions_by_item, strict=True)

@@ -272,8 +272,8 @@ def test_summed_group_envelope_and_retained_profile_unchanged():
     )
     assert len(plan.groups) == 2
     assert plan.packed_tokens == 16
-    assert plan.output_bytes == 16 * 4
-    assert rank._plan_cost(plan).required == int((16 * 65536 + 16 * 4) * 1.1)
+    assert plan.output_bytes == 16 * (4 + 8)
+    assert rank._plan_cost(plan).required == int((16 * 65536 + 16 * (4 + 8)) * 1.1)
     plan = replace(plan, packed_tokens=200, logical_tokens=200, output_bytes=4000)
     required = rank._plan_cost(plan).required
     assert required == int((200 * 65536 + 4000) * 1.1)

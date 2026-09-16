@@ -3078,12 +3078,14 @@ def test_trainer_rank_graph_tracking_does_not_copy_outputs() -> None:
     trainer = TrainerRank(_runtime())
     ref = _slot_ref("teacher")
     source = torch.ones(4, requires_grad=True) * 2
-    output = ForwardOutput(source, None, None, None)
+    positions = torch.tensor([0, 2, 7, 8])
+    output = ForwardOutput(source, None, None, None, positions=positions)
 
     tracked = trainer._track_slot_graph_outputs(ref, [output])[0]
 
     assert tracked.target_logprobs is not None
     assert tracked.target_logprobs.data_ptr() == source.data_ptr()
+    assert tracked.positions is positions
 
 
 def test_trainer_rank_retained_backward_keeps_slot_graph_guard() -> None:
@@ -3821,8 +3823,11 @@ def test_forward_plan_estimates_output_memory_for_request_combo() -> None:
     topk_bytes = 3 * 5 * (4 + 8)
     logits_bytes = 3 * 10 * 4
     hidden_bytes = 3 * 4 * 4
+    positions_bytes = 3 * 8
     assert estimate is not None and estimate[0] == plan.packed_tokens
-    assert plan.output_bytes == target_bytes + topk_bytes + logits_bytes + hidden_bytes
+    assert plan.output_bytes == (
+        target_bytes + topk_bytes + logits_bytes + hidden_bytes + positions_bytes
+    )
 
 
 def test_disconnected_outputs_keep_zero_graph_anchor() -> None:
