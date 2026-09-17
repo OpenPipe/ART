@@ -68,6 +68,7 @@ from art.trainer_rank._prefix_tree_planner import (
     prefix_tree_layout_candidates,
     select_prefix_tree_layout,
 )
+from art.trainer_rank._rng import TrainerRNG, caller_group
 from art.trainer_rank._telemetry import phase as _telemetry_phase
 
 if TYPE_CHECKING:
@@ -1385,6 +1386,7 @@ class TrainerRank:
         # tensor/sequence-parallel storage from gathered LoRA inputs.
         self.runtime: TrainingRuntime = runtime
         self.device: torch.device = next(runtime.model[0].parameters()).device
+        self._rng = TrainerRNG(self.device)
         self._param_dtype_size = _dtype_size(next(runtime.model[0].parameters()).dtype)
         try:
             metadata_model = _language_model(runtime.model[0])
@@ -1626,6 +1628,7 @@ class TrainerRank:
             raise TrainerRankSlotStateError(
                 "Custom checkpoint object registration differs across ranks"
             )
+        self._rng.synchronize(caller_group())
         slot = self._checkpoint_slots[checkpoint_name]
         existing = slot.custom.get(name)
         registered = None if existing is None else existing.kind
@@ -2296,20 +2299,24 @@ class TrainerRank:
         if not isinstance(yield_empty, bool):
             raise TypeError("yield_empty must be a bool")
         enabled = torch.is_grad_enabled() if no_grad is None else not no_grad
+        self._guard_forward_collective("forward_micro_batches")
+        with torch.set_grad_enabled(enabled):
+            items = [_materialize(item) for item in inputs]
         batches = self._forward_micro_batches(
-            inputs, checkpoint=checkpoint, yield_empty=yield_empty
+            items, checkpoint=checkpoint, yield_empty=yield_empty
         )
         token = object()
         try:
             while True:
                 self._guard_forward_collective("forward_micro_batches")
-                with torch.set_grad_enabled(enabled):
+                with torch.set_grad_enabled(enabled), self._rng.model():
                     try:
                         batch = next(batches)
                     except StopIteration:
                         return
                 if not yield_empty and not batch.outputs:
                     continue
+                self._rng.synchronize(caller_group())
                 if (
                     not yield_empty
                     and batch.stats.global_count < self._dp_rank_and_size()[1]
@@ -2339,12 +2346,11 @@ class TrainerRank:
 
     def _forward_micro_batches(
         self,
-        inputs: Iterable[ForwardInputs],
+        items: Sequence[ForwardInputs],
         *,
         checkpoint: AdapterSelection,
         yield_empty: bool,
     ) -> Generator[MicroBatch[ForwardInputs, ForwardOutputs], None, None]:
-        items = [_materialize(item) for item in inputs]
         requests = list(_flatten(items))
         self._validate_replicated_top_level_count(len(items), yield_empty=yield_empty)
         for _, indices in self._group_active_request_indices(
@@ -2497,17 +2503,22 @@ class TrainerRank:
     ) -> ForwardOutputs:
         self._guard_forward_collective("dp_rank_forward")
         enabled = torch.is_grad_enabled() if no_grad is None else not no_grad
+        # Iterating caller inputs can consume their RNG (e.g. a data loader).
+        # Only ART's planning/model work belongs to the private stream.
         with torch.set_grad_enabled(enabled):
-            self._reset_planning_telemetry()
             materialized = _materialize(inputs)
             requests = list(_flatten(materialized))
+        with torch.set_grad_enabled(enabled), self._rng.model():
+            self._reset_planning_telemetry()
             plan, check = self._plan_admissible_forward(
                 requests, checkpoint=checkpoint, context="dp_rank_forward"
             )
             tracked_outputs = self._execute_admitted_plan(
                 plan, check=check, context="dp_rank_forward"
             )
-            return _unflatten(materialized, iter(tracked_outputs))
+            outputs = _unflatten(materialized, iter(tracked_outputs))
+        self._rng.synchronize(caller_group())
+        return outputs
 
     def _execute_admitted_plan(
         self, plan: _AnyForwardPlan, *, check: _MemoryCheck, context: str
