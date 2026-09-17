@@ -5831,6 +5831,70 @@ def test_template_change_rerenders_scaffold_but_preserves_sampled_output() -> No
     assert tokenized.flags[1] == (_SAMPLED_ASSISTANT_OUTPUT)
 
 
+@pytest.mark.parametrize("reasoning", ["a", "a§"])
+def test_sampled_tail_does_not_consume_adjacent_assistant(
+    reasoning: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        "art.trajectories._tokenize._WARNED_PREFIX_RETOKENIZATION", False
+    )
+
+    class Tokenizer(_CharacterTemplateTokenizer):
+        def apply_chat_template(
+            self,
+            messages: list[dict[str, Any]],
+            *,
+            tokenize: bool = True,
+            add_generation_prompt: bool,
+            **kwargs: object,
+        ) -> str | list[int]:
+            text = "".join(
+                str(message.get("reasoning") or "")
+                + str(message.get("content") or "")
+                + ("§" if message["role"] == "assistant" else "")
+                for message in messages
+            )
+            return self._encode(text) if tokenize else text
+
+    tokenizer = Tokenizer()
+    prompt = tokenizer._encode("question")
+    output = [7001, *tokenizer._encode(reasoning[1:] + "b§")]
+    first = _chat_exchange(prompt, output)
+    first.request["messages"] = [{"role": "user", "content": "question"}]
+    data = first.response.model_dump(mode="python")
+    data["choices"][0]["message"] = {
+        "role": "assistant",
+        "reasoning": reasoning,
+        "content": "b",
+    }
+    first.response = ChatCompletion.model_validate(data)
+    second_output = tokenizer._encode("cd§")
+    second = _chat_exchange([*prompt, *output], second_output, offset=1)
+    second.request["messages"] = [
+        *first.request["messages"],
+        cast(ChatCompletionMessageParam, data["choices"][0]["message"]),
+    ]
+    second.response.choices[0].message.content = "cd"
+    history = art.Trajectory(
+        exchanges=TrajectoryExchanges(chat_completions=[first, second])
+    ).chat_completions_history()
+    history.chat_template = "rerender"
+
+    with pytest.warns(UserWarning, match="preserved the original sampled token IDs"):
+        tokenized = history.tokenize(tokenizer=tokenizer)
+
+    assert tokenized.tokens == [*prompt, *output, *second_output]
+    assert tokenized.logprobs[len(prompt) :] == [
+        -token / 10 for token in [*output, *second_output]
+    ]
+    assert tokenized.flags[len(prompt) :] == [
+        _SAMPLED_ASSISTANT_OUTPUT
+        | (tr.TokenFlag.STOP if index == len(tokens) - 1 else 0)
+        for tokens in (output, second_output)
+        for index in range(len(tokens))
+    ]
+
+
 def test_complete_sampled_tool_call_replaces_rendered_closing_markup(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

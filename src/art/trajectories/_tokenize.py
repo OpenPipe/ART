@@ -5729,12 +5729,30 @@ def _tokenize_chat_view(
                 source_key=_sampled_source_key(source),
                 tokenizer=resolved_tokenizer,
             ):
-                # A sampled stop replaces the renderer's remaining assistant tail.
-                tail_end = end
-                while tail_end < len(rendered) and assistant_mask[tail_end]:
-                    tail_end += 1
-                if tail_end > end and stop_mask[tail_end - 1]:
-                    end = tail_end
+                # Adjacent assistants can share a role mask. Prove this message's
+                # end before replacing its rendered closing markup and stop.
+                completed = probe_render(
+                    messages[: message_index + 1], add_generation_prompt=False
+                )
+                rendered_completed = (
+                    canonical_render_to_rendered(completed)
+                    if completed is not None
+                    else None
+                )
+                if (
+                    rendered_completed is not None
+                    and rendered[: len(rendered_completed)] == rendered_completed
+                ):
+                    tail_mask, tail_stops = _assistant_stop_masks(
+                        rendered_completed,
+                        assistant_mask[: len(rendered_completed)],
+                        resolved_tokenizer,
+                    )
+                    tail_end = end
+                    while tail_end < len(tail_mask) and tail_mask[tail_end]:
+                        tail_end += 1
+                    if tail_end > end and tail_stops[tail_end - 1]:
+                        end = tail_end
             replacements.append(
                 (
                     start,
