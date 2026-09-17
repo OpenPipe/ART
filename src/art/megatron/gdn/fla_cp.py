@@ -468,7 +468,11 @@ def _suffix_summary_exclusive_and_full(
         recv_from=rank + 1 if rank + 1 < world_size else None,
     )
     full = inclusive if rank == 0 else torch.empty_like(summary)
-    dist.broadcast(full, src=0, group=group)  # ty: ignore[possibly-missing-attribute]
+    dist.broadcast(  # ty: ignore[possibly-missing-attribute]
+        full,
+        src=dist.get_global_rank(group, 0),  # ty: ignore[possibly-missing-attribute]
+        group=group,
+    )
     return exclusive, full
 
 
@@ -547,7 +551,13 @@ def _scan_fwd_initial_state(summary: Tensor | None, h0: Tensor) -> Tensor:
 def _broadcast_chain_final_state(final_state: Tensor | None, group: Any) -> Tensor:
     if final_state is None:
         raise RuntimeError("native FLA CP did not produce a local final state")
-    owner = dist.get_world_size(group) - 1  # ty: ignore[possibly-missing-attribute]
+    # ``src`` is a global rank; the chain owner is the last rank *of the CP
+    # group*, whose global rank only equals ``cp_size - 1`` when the group is
+    # ranks 0..cp_size-1 (TP 1, DP 1). Translate explicitly.
+    owner = dist.get_global_rank(  # ty: ignore[possibly-missing-attribute]
+        group,
+        dist.get_world_size(group) - 1,  # ty: ignore[possibly-missing-attribute]
+    )
     final_state = final_state.contiguous()
     dist.broadcast(final_state, src=owner, group=group)  # ty: ignore[possibly-missing-attribute]
     return final_state

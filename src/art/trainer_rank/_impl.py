@@ -942,6 +942,12 @@ class _FlatForwardPlan:
         return self.logical_tokens - self.inactive_logical_tokens
 
     @property
+    def grad_segment_count(self) -> int:
+        return sum(
+            len(group.packed.segments) for group in self.groups if group.grad_enabled
+        )
+
+    @property
     def subforward_count(self) -> int:
         return 1
 
@@ -1362,8 +1368,8 @@ class TrainerRank:
         # gradient reduction pre-date the planner, memory checks all-reduce
         # within the TP x CP group, the memory profile is keyed by topology so
         # TP calibrates itself online, and the fitted layout cost model prices
-        # TP explicitly. Known limitation: the cold static memory estimate
-        # ignores sharding (conservative).
+        # TP explicitly. The cold retained-activation floor also distinguishes
+        # tensor/sequence-parallel storage from gathered LoRA inputs.
         self.runtime: TrainingRuntime = runtime
         self.device: torch.device = next(runtime.model[0].parameters()).device
         self._param_dtype_size = _dtype_size(next(runtime.model[0].parameters()).dtype)
@@ -1379,6 +1385,28 @@ class TrainerRank:
             getattr(getattr(metadata_model, "config", None), "num_layers", 0)
             or getattr(runtime.provider, "num_layers", 1)
             or 1
+        )
+        memory_config = getattr(metadata_model, "config", None) or runtime.provider
+
+        def memory_field(name: str, default: Any = None) -> Any:
+            return getattr(
+                memory_config, name, getattr(runtime.provider, name, default)
+            )
+
+        self._recompute_granularity = memory_field("recompute_granularity", None)
+        self._recompute_modules: frozenset[str] = frozenset(
+            memory_field("recompute_modules", ()) or ()
+        )
+        self._sequence_parallel = bool(memory_field("sequence_parallel", False))
+        self._attention_output_gate = bool(memory_field("attention_output_gate", False))
+        # Native fused SwiGLU retains gate/up and the output (3F). Eager
+        # unfused SwiGLU also retains SiLU and offset tensors (5F). Compilation
+        # may fall back, so only the native fusion setting earns this discount.
+        self._mlp_activation_factor = (
+            3
+            if memory_field("bias_activation_fusion", False)
+            and not memory_field("use_te_activation_func", False)
+            else 5 + 2 * (memory_field("activation_func_clamp_value", None) is not None)
         )
         # Layers that run the gated-delta-net path (Qwen3.5-4B: 24 of 32); the
         # cost model prices GDN state hand-offs per GDN layer, not per layer.
@@ -1400,6 +1428,10 @@ class TrainerRank:
             )
         spec = getattr(runtime, "model_support_spec", None)
         self._moe_layers = _moe_layer_count(runtime.model[0])
+        self._checkpointed_moe_layers = sum(
+            getattr(module, "moe_layer_recompute", False) is True
+            for module in runtime.model[0].modules()
+        )
         is_moe = bool(
             self._moe_layers
             or getattr(spec, "is_moe", False)
@@ -2901,6 +2933,7 @@ class TrainerRank:
             output_bytes=plan.output_bytes,
             signature=plan.signature,
             logical_tokens=plan.active_logical_tokens,
+            gdn_segments=plan.grad_segment_count,
         )
 
     def _subforward_cost(
@@ -2910,12 +2943,14 @@ class TrainerRank:
         output_bytes: int,
         signature: _MemorySignature,
         logical_tokens: int,
+        gdn_segments: int = 0,
     ) -> _SubforwardCost:
         required = self._estimate_required_memory_bytes_from_values(
             packed_tokens=packed_tokens,
             output_bytes=output_bytes,
             signature=signature,
             logical_tokens=logical_tokens,
+            gdn_segments=gdn_segments,
         )
         retained = self._retained_memory_bytes(
             signature,
@@ -3913,6 +3948,12 @@ class TrainerRank:
                         output_bytes=output_bytes,
                         signature=signature,
                         logical_tokens=logical_tokens,
+                        # A radix tree has fewer than twice as many segments as
+                        # active requests; the exact plan uses its actual count.
+                        gdn_segments=2
+                        * sum(
+                            _request_mix_key(r) != "inactive" for r in local_requests
+                        ),
                     )
                 return (
                     self._memory_check_required(required, sync_across_dp=True),
@@ -5054,6 +5095,7 @@ class TrainerRank:
                 output_bytes=forward.output_bytes,
                 signature=forward.signature,
                 logical_tokens=forward.active_logical_tokens,
+                gdn_segments=forward.grad_segment_count,
             )
         return self._memory_check_required(required, sync_across_dp=sync_across_dp)
 
@@ -5115,6 +5157,7 @@ class TrainerRank:
         output_bytes: int,
         signature: _MemorySignature,
         logical_tokens: int | None = None,
+        gdn_segments: int = 0,
     ) -> int:
         if packed_tokens <= 0:
             return output_bytes
@@ -5126,6 +5169,95 @@ class TrainerRank:
             * self._param_dtype_size
             * activation_factor
         )
+        if signature.grad_enabled and self._recompute_granularity != "full":
+            geometry = self._geometry
+            hidden = self._hidden_size
+            tp = max(1, self._topology_key()[1])
+            sp = tp if self._sequence_parallel else 1
+            # Gathered LoRA inputs alias norm output without sequence sharding.
+            gathered = hidden if sp > 1 else 0
+            common = 2 * hidden / sp + gathered
+            attention_width = (
+                geometry.num_attention_heads * geometry.kv_channels or hidden
+            )
+            kv_width = geometry.num_query_groups * geometry.kv_channels or hidden
+            gated = self._attention_output_gate
+            attention = (
+                common + ((7 if gated else 5) * attention_width + 3 * kv_width) / tp
+            )
+            if 0 < geometry.num_query_groups < tp:
+                # SelfAttentionLinearQKVLoRA constructs global QKV before
+                # slicing it when KV groups cannot be partitioned across TP.
+                attention += ((2 if gated else 1) * attention_width + 2 * kv_width) * (
+                    1 - 1 / tp
+                )
+            gdn = (
+                common
+                + (
+                    4 * geometry.gdn_key_heads * geometry.gdn_key_head_dim
+                    + 8 * geometry.gdn_value_heads * geometry.gdn_value_head_dim
+                )
+                / tp
+            )
+            ffn_width = geometry.ffn_hidden_size or 4 * hidden
+            mlp = common + self._mlp_activation_factor * ffn_width / tp
+            if geometry.moe_experts:
+                # Keep the worst-case dispatch envelope: random-weight runs
+                # cannot establish an EP discount for pretrained routing.
+                ffn_width = (
+                    geometry.moe_topk * geometry.moe_ffn_hidden_size
+                    + geometry.moe_shared_expert_ffn
+                ) or ffn_width
+                mlp = (
+                    common + 6 * ffn_width + 2 * hidden * max(0, geometry.moe_topk - 1)
+                )
+            gdn_layers = min(self._num_layers, self._gdn_layers)
+            retained_features = (
+                (self._num_layers - gdn_layers) * attention
+                + gdn_layers * gdn
+                + self._num_layers * mlp
+            )
+            if self._recompute_granularity == "selective":
+                checkpointed = (
+                    self._checkpointed_moe_layers
+                    if geometry.moe_experts
+                    else self._num_layers
+                    if "mlp" in self._recompute_modules
+                    else 0
+                )
+                # Checkpoints keep their input (and MoE's external norm); one
+                # live MLP still needs workspace, including worst-case dispatch.
+                checkpoint_input = (2 if geometry.moe_experts else 1) * hidden / sp
+                retained_features -= max(0, checkpointed - 1) * (mlp - checkpoint_input)
+            # Each GDN segment can retain an initial and a final recurrent
+            # state (fp32), plus convolution history. Unlike token activations,
+            # these do not shrink with segment length.
+            gdn_state_bytes = (
+                2
+                * gdn_segments
+                * gdn_layers
+                / tp
+                * (
+                    4
+                    * geometry.gdn_value_heads
+                    * geometry.gdn_key_head_dim
+                    * geometry.gdn_value_head_dim
+                    + self._param_dtype_size
+                    * (
+                        2 * geometry.gdn_key_heads * geometry.gdn_key_head_dim
+                        + geometry.gdn_value_heads * geometry.gdn_value_head_dim
+                    )
+                    * max(0, geometry.gdn_conv_kernel - 1)
+                )
+            )
+            static_compute = max(
+                static_compute,
+                # Cold eager runs allocate ~58 MiB beyond warm retention for
+                # native kernel initialization; a slope alone misses short inputs.
+                64 * 2**20
+                + gdn_state_bytes
+                + packed_tokens * self._param_dtype_size * retained_features,
+            )
         # Groups execute sequentially: summed packed rows conservatively bound
         # this FC2 component, not all workspace or retained graphs.
         static_compute = max(

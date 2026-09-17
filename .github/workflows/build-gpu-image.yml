@@ -71,6 +71,7 @@ jobs:
 
     env:
       SKY_INFRA: k8s/cks-wb3
+      BUILD_CLUSTER_NAME: art-gpu-build-${{ github.run_id }}-${{ github.run_attempt }}
       PREWARM_INFRAS: ${{ inputs.prewarm_infras || 'k8s/cks-wb3 k8s/ext-collab2 k8s/serverless-training-central' }}
 
     steps:
@@ -196,6 +197,7 @@ jobs:
           PREWARM_TIMEOUT="${PREWARM_TIMEOUT:-30m}"
 
           args=(
+            --cluster-name "${BUILD_CLUSTER_NAME}"
             --infra "${SKY_INFRA}"
             --image-repo "${IMAGE_REPO}"
             --pull-image-repo "${PULL_IMAGE_REPO}"
@@ -217,6 +219,12 @@ jobs:
 
           bash scripts/build-gpu-image.sh "${args[@]}"
 
+      - name: Remove temporary image builder
+        if: ${{ always() }}
+        run: |
+          kubectl --context cks-wb3 delete pod -n default "${BUILD_CLUSTER_NAME}" \
+            --ignore-not-found --wait=false
+
       - name: Smoke launch prewarmed image
         if: ${{ github.event_name != 'workflow_dispatch' || inputs.smoke_launch }}
         env:
@@ -236,6 +244,7 @@ jobs:
             free -h || true
             ps -eo pid,ppid,stat,rss,comm,args | grep -E 'SkyPilot|sky|python' || true
             "${sky_cmd[@]}" api status || true
+            "${sky_cmd[@]}" logs --provision "${cluster}" || true
             if [ -f "${HOME}/.sky/api_server/server.log" ]; then
               tail -n 240 "${HOME}/.sky/api_server/server.log" || true
             fi
@@ -263,6 +272,7 @@ jobs:
               --infra "${SKY_INFRA}" \
               --gpus "${SMOKE_GPUS}" \
               --image-id "docker:${SMOKE_IMAGE_REPO}:${IMAGE_TAG}" \
+              --config kubernetes.remote_identity.cks-wb3=skypilot-workload \
               --config kubernetes.pod_config.spec.schedulerName=binpack-scheduler \
               --config kubernetes.pod_config.spec.activeDeadlineSeconds=604800 \
               "EXPECTED_ART_IMAGE_REVISION=${GITHUB_SHA} python -c '${smoke_code}'"
