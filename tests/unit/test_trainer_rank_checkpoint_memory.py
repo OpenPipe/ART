@@ -8,7 +8,7 @@ import pytest
 import torch
 
 from art.trainer_rank import ForwardInput, TrainerRank
-from art.trainer_rank._impl import Unset, _MemoryProfile
+from art.trainer_rank._impl import Unset, _ForwardRefusal, _MemoryProfile
 
 
 def rank():
@@ -133,7 +133,10 @@ def test_per_group_padding_precedes_gradient_filter():
     r._physical_tokens = lambda n: n + (-n % 8)
     values = r._estimate_flat_forward(requests(9, 17))
     assert values[0] == 40 and values[3] == ((16, True), (24, False))
-    assert r._checkpoint_memory_floor(values[3]) == (16 * 40 * 4096, 24 * 188416)
+    assert r._checkpoint_memory_floor(values[3]) == (
+        16 * 40 * 4096,
+        24 * (188416 + 4 * 2048 * 2),
+    )
 
 
 def test_no_grad_enclosure_empty_and_unsupported():
@@ -351,8 +354,62 @@ def test_no_grad_enclosure_uses_max_group_and_affine_stage():
     mixed = ((3, True), (11, False))
     assert r._checkpoint_memory_floor(mixed) == (
         3 * 40 * 2048 * 2,
-        max(3 * 188416, 11 * 188416, 11 + 1_000_000),
+        max(3 * 188416, max(11 * 188416, 11 + 1_000_000) + 4 * 11 * 2048 * 2),
     )
+
+
+@pytest.mark.parametrize("gradient_first", [False, True])
+def test_mixed_plan_keeps_reference_enclosure(gradient_first):
+    r = rank()
+    gradient, reference = requests(1, 10_000)
+    req = [gradient, reference] if gradient_first else [reference, gradient]
+    reference_plan = r._plan_flat_forward([reference])
+    mixed = r._plan_flat_forward(req)
+    reference_cost = r._plan_cost(reference_plan).required
+    mixed_cost = r._plan_cost(mixed).required
+    assert mixed_cost >= reference_cost
+    # The exact plan and cheap split bound must retain the same group charge.
+    assert r._memory_check(mixed).estimated_required_bytes == mixed_cost
+    assert (
+        r._split_chunk_lower_cost(
+            req, tuple(x.input_tokens for x in req), checkpoint=Unset
+        ).required
+        == mixed_cost
+    )
+    assert not r._memory_profiles
+
+
+@pytest.mark.parametrize("fits", [False, True])
+def test_reference_prefix_search_agrees_with_mixed_demand(fits):
+    r = rank()
+    # This uninitialized CPU fixture declares DP1; all pricing/search stays real.
+    r._dp_rank_and_size = lambda: (0, 1)
+    gradient, reference = requests(1, 10_000)
+    req = [reference, gradient]
+    reference_plan = r._plan_flat_forward([reference])
+    mixed = r._plan_flat_forward(req)
+    # Retain the review witness's budget between its old nonmonotone costs.
+    budget = r._plan_cost(mixed).required if fits else 2_207_849_881
+    r._available_memory_bytes = lambda: budget
+    assert r._memory_check(reference_plan).fits is fits
+    assert r._memory_check(mixed).fits is fits
+    selected = r._search_next_micro_batch(req, 0)
+    if fits:
+        assert not isinstance(selected, _ForwardRefusal)
+        assert selected.check.fits and selected.cold_start
+        assert selected.stats_global_count == 1
+        assert (
+            selected.check.estimated_required_bytes
+            >= r._plan_cost(reference_plan).required
+        )
+    else:
+        assert isinstance(selected, _ForwardRefusal)
+        assert not selected.check.fits
+        assert (
+            selected.check.estimated_required_bytes
+            == r._plan_cost(reference_plan).required
+        )
+    assert not r._memory_profiles
 
 
 @pytest.mark.parametrize(

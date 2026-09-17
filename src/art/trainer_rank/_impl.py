@@ -925,6 +925,7 @@ class _MemorySignature:
     request_mix: tuple[str, ...]
     grad_enabled: bool
     grad_modes: tuple[bool, ...]
+    slot_shapes: tuple[tuple[bool, tuple[tuple[int, ...], ...]], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -1410,7 +1411,23 @@ def _shared_expert_output_bytes_per_token(layer: torch.nn.Module) -> int:
     return hidden * 2
 
 
-def _expert_lora_weight_storage(lora: Any) -> tuple[int, int, int] | None:
+def _slot_lora_tensors(
+    lora: Any, slot_ref: "LoRASlotRef | None" = None
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """Read the selected owner directly, without changing the execution context."""
+    if slot_ref is None:
+        return lora.A_T, lora.B_T
+    if slot_ref.name is None:
+        return None
+    from art.megatron.lora import LoRA
+
+    slot = LoRA._slot(lora, slot_ref)
+    return None if slot is None else (slot.A_T, slot.B_T)
+
+
+def _expert_lora_weight_storage(
+    lora: Any, slot_ref: "LoRASlotRef | None" = None
+) -> tuple[int, int, int] | None:
     """New padded weights, transposes and effective rank for the Quack path.
 
     Original contiguous parameters are already in the allocator baseline. This
@@ -1418,10 +1435,14 @@ def _expert_lora_weight_storage(lora: Any) -> tuple[int, int, int] | None:
     """
     from art.megatron.lora import LoRA
 
-    a, b = getattr(lora, "A_T", None), getattr(lora, "B_T", None)
+    if type(lora) is not LoRA or "_slot" in vars(lora):
+        return None
+    tensors = _slot_lora_tensors(lora, slot_ref)
+    if tensors is None:
+        return None
+    a, b = tensors
     if (
-        type(lora) is not LoRA
-        or "forward" in vars(lora)
+        "forward" in vars(lora)
         or "active_lora_tensors" in vars(lora)
         or lora._forward_hooks
         or lora._forward_pre_hooks
@@ -1451,6 +1472,7 @@ def _moe_output_bytes_per_token(
     *,
     checkpoint_grad: bool = False,
     converted_stages: list[tuple[int, int]] | None = None,
+    slot_ref: "LoRASlotRef | None" = None,
 ) -> int:
     """Known routed-expert working set, not a complete model/compiled bound."""
     if shape != ParallelShape(tp=1, cp=1):
@@ -1507,16 +1529,27 @@ def _moe_output_bytes_per_token(
                 or config.cuda_graph_impl != "none"
                 or any(
                     name in vars(dispatcher)
-                    for name in (
-                        "preprocess",
-                        "dispatch_preprocess",
-                        "dispatch_postprocess",
+                    for name in ("preprocess", "dispatch_postprocess")
+                )
+                or (
+                    "dispatch_preprocess" in vars(dispatcher)
+                    and not (
+                        slot_ref is not None
+                        and slot_ref.name is not None
+                        and type(dispatcher.dispatch_preprocess) is partial
+                        and dispatcher.dispatch_preprocess.func
+                        is _moe_dispatch_preprocess
+                        and dispatcher.dispatch_preprocess.args == (dispatcher,)
+                        and not dispatcher.dispatch_preprocess.keywords
                     )
                 )
                 or "routing" in vars(layer.router)
             ):
                 return 0
-            weights = lora.B_T
+            tensors = _slot_lora_tensors(lora, slot_ref)
+            # Enclosing row storage is still charged for an inactive adapter;
+            # only selected tensors create converted weights.
+            inputs, weights = tensors if tensors is not None else (lora.A_T, lora.B_T)
             if (
                 weights.dtype not in (torch.float16, torch.bfloat16)
                 or weights.shape[-1] != fc2.out_features
@@ -1526,7 +1559,6 @@ def _moe_output_bytes_per_token(
                 return 0
             features = 2 * fc2.out_features
             enclosing_fc1 = None
-            inputs = getattr(lora, "A_T", None)
             if (
                 isinstance(inputs, torch.Tensor)
                 and inputs.ndim == weights.ndim == 3
@@ -1575,7 +1607,7 @@ def _moe_output_bytes_per_token(
                 config.moe_router_topk * features * weights.element_size() + shared
             )
             coefficient = max(coefficient, row_bytes)
-            storage = _expert_lora_weight_storage(lora)
+            storage = _expert_lora_weight_storage(lora, slot_ref)
             if converted_stages is not None and storage is not None:
                 padded, transposes, effective = storage
                 saved_fc1, rank_fc1 = 0, 0
@@ -1583,7 +1615,12 @@ def _moe_output_bytes_per_token(
                 if enclosing_fc1 is not None:
                     adapter = getattr(enclosing_fc1, "lora", None)
                     base = getattr(enclosing_fc1, "linear_fc1", None)
-                    first = _expert_lora_weight_storage(adapter)
+                    first = _expert_lora_weight_storage(adapter, slot_ref)
+                    first_tensors = (
+                        _slot_lora_tensors(adapter, slot_ref)
+                        if first is not None
+                        else None
+                    )
                     if (
                         first is not None
                         and adapter is not None
@@ -1592,10 +1629,11 @@ def _moe_output_bytes_per_token(
                         and "forward" not in vars(base)
                         and not base._forward_hooks
                         and not base._forward_pre_hooks
-                        and adapter.A_T.dtype == weights.dtype
-                        and adapter.A_T.shape[:2]
+                        and first_tensors is not None
+                        and first_tensors[0].dtype == weights.dtype
+                        and first_tensors[0].shape[:2]
                         == (weights.shape[0], fc2.out_features)
-                        and adapter.B_T.shape[2] == enclosing_fc1.out_features
+                        and first_tensors[1].shape[2] == enclosing_fc1.out_features
                     ):
                         first_padding, first_transposes, first_rank = first
                         # FC1 retains both routed H inputs and its base O1
@@ -3123,6 +3161,7 @@ class TrainerRank:
                         signature.request_mix,
                         signature.grad_enabled,
                         signature.grad_modes,
+                        signature.slot_shapes,
                         p.packed_tokens,
                         p.logical_tokens,
                         p.inactive_logical_tokens,
@@ -3266,6 +3305,7 @@ class TrainerRank:
             requests,
             slot_group_count=len(groups),
             grad_modes=tuple(mode for (_, mode), _ in groups),
+            slot_groups=tuple(key for key, _ in groups),
         )
         logical_tokens = _active_logical_tokens(requests)
         cost = self._subforward_cost(
@@ -3274,6 +3314,7 @@ class TrainerRank:
             signature=signature,
             logical_tokens=logical_tokens,
             group_rows=tuple(group_rows),
+            slot_refs=tuple(ref for (ref, _), _ in groups),
             head_workspace_bytes=head_workspace_bytes,
             # The average CP load is an optimistic bound, not an admission cost.
             retained_tokens=(packed_tokens + signature.topology[2] - 1)
@@ -3580,12 +3621,19 @@ class TrainerRank:
             raise ValueError("Invalid constructor checkpoint MoE coefficient")
         return gradient
 
-    def _moe_workspace_bytes(self, rows: int, *, checkpoint_grad: bool = False) -> int:
+    def _moe_workspace_bytes(
+        self,
+        rows: int,
+        *,
+        checkpoint_grad: bool = False,
+        slot_ref: "LoRASlotRef | None" = None,
+    ) -> int:
         """Maximum of same-layer affine stages, not a retained multi-layer bank.
 
-        Cached at construction before dispatcher wrapping; model/slot shapes
-        must remain unchanged, as for the existing row coefficient. Ordinary
-        non-checkpoint gradients retain only the prior forward-stage coverage.
+        The constructor cache covers original tensors. Explicit slots are
+        repriced from their tensor metadata and original owners, including
+        this rank's exact dispatcher wrapper. Ordinary non-checkpoint gradients
+        retain only forward-stage coverage.
         """
         coefficient = (
             self._checkpoint_moe_bytes_per_token()
@@ -3597,6 +3645,20 @@ class TrainerRank:
             "_moe_gradient_stages" if checkpoint_grad else "_moe_forward_stages",
             (),
         )
+        if slot_ref is not None and slot_ref.name is not None:
+            selected: list[tuple[int, int]] = []
+            coefficient = (
+                _moe_output_bytes_per_token(
+                    self.runtime.model,
+                    self._parallel_shape,
+                    checkpoint_grad=checkpoint_grad,
+                    converted_stages=selected,
+                    slot_ref=slot_ref,
+                )
+                if self._moe_layers
+                else 0
+            )
+            stages = tuple(selected) if coefficient else ()
         if type(stages) is not tuple or any(
             type(stage) is not tuple
             or len(stage) != 2
@@ -3614,14 +3676,16 @@ class TrainerRank:
         )
 
     def _checkpoint_memory_floor(
-        self, group_rows: tuple[tuple[int, bool], ...]
+        self,
+        group_rows: tuple[tuple[int, bool], ...],
+        slot_refs: tuple["LoRASlotRef | None", ...] | None = None,
     ) -> tuple[int, int]:
         """Conservative saved-boundary charge and one disjoint MoE workspace.
 
         Count actual local full/uniform/1 boundaries, including aliases, rather
         than claiming measured distinct storage. Only this call's new groups
         enter the term; already-live graphs remain in the availability baseline.
-        No-grad calls also keep decoder input, current layer input, its MLP
+        No-grad groups also keep decoder input, current layer input, its MLP
         residual and norm output across the MoE stage. Count these four row
         tensors separately from returned outputs, allowing storage aliases.
         This is not a bound for custom preprocessing, attention, or all backward.
@@ -3683,10 +3747,11 @@ class TrainerRank:
         retained = gradient_rows * layers * self._hidden_size * 2
         if gradient_rows:
             self._checkpoint_moe_bytes_per_token()
+        refs = (None,) * len(group_rows) if slot_refs is None else slot_refs
         workspace = max(
-            self._moe_workspace_bytes(rows, checkpoint_grad=grad)
-            + (0 if gradient_rows else 4 * rows * self._hidden_size * 2)
-            for rows, grad in group_rows
+            self._moe_workspace_bytes(rows, checkpoint_grad=grad, slot_ref=ref)
+            + (0 if grad else 4 * rows * self._hidden_size * 2)
+            for (rows, grad), ref in zip(group_rows, refs, strict=True)
         )
         return retained, workspace
 
@@ -3698,6 +3763,7 @@ class TrainerRank:
             logical_tokens=plan.active_logical_tokens,
             gdn_segments=plan.grad_segment_count,
             group_rows=self._plan_group_rows(plan),
+            slot_refs=tuple(g.slot_ref for g in plan.groups),
             head_workspace_bytes=self._plan_head_workspace_bytes(plan),
             checkpoint_floor=_gdn_memory.plan_floor(self, plan),
             retained_tokens=self._plan_retained_tokens(plan),
@@ -3712,6 +3778,7 @@ class TrainerRank:
         logical_tokens: int,
         gdn_segments: int = 0,
         group_rows: tuple[tuple[int, bool], ...] = (),
+        slot_refs: tuple["LoRASlotRef | None", ...] | None = None,
         head_workspace_bytes: int = 0,
         checkpoint_floor: tuple[int, int] = (0, 0),
         retained_tokens: int | None = None,
@@ -3723,6 +3790,7 @@ class TrainerRank:
             logical_tokens=logical_tokens,
             gdn_segments=gdn_segments,
             group_rows=group_rows,
+            slot_refs=slot_refs,
             head_workspace_bytes=head_workspace_bytes,
             checkpoint_floor=checkpoint_floor,
             retained_tokens=retained_tokens,
@@ -3734,7 +3802,8 @@ class TrainerRank:
             output_bytes=output_bytes,
             required=required,
             checkpoint_retained_bytes=max(
-                self._checkpoint_memory_floor(group_rows)[0], checkpoint_floor[0]
+                self._checkpoint_memory_floor(group_rows, slot_refs)[0],
+                checkpoint_floor[0],
             ),
         )
         return _SubforwardCost(required=required, retained=retained)
@@ -5368,6 +5437,7 @@ class TrainerRank:
                     requests,
                     slot_group_count=len(plans),
                     grad_modes=tuple(mode for (_, mode), _ in groups),
+                    slot_groups=tuple(key for key, _ in groups),
                 ),
                 selected_max_depth=selected_max_depth,
                 inactive_logical_tokens=logical_tokens
@@ -5403,6 +5473,12 @@ class TrainerRank:
                 checkpoint=checkpoint,
                 ensure_slots=not sync_planning_errors,
             )
+            if self._moe_layers and any(
+                ref is not None and ref.name is not None for (ref, _), _ in groups
+            ):
+                # This cheap return type has no slot metadata. Materialize the
+                # exact plan instead of admitting with the constructor rank.
+                return None
             if (
                 any(mode for (_, mode), _ in groups)
                 and _gdn_memory.model_shapes(self) is not None
@@ -5515,6 +5591,7 @@ class TrainerRank:
                     requests,
                     slot_group_count=len(groups),
                     grad_modes=tuple(mode for (_, mode), _ in groups),
+                    slot_groups=tuple(key for key, _ in groups),
                 ),
                 tuple(group_rows),
                 head_workspace_bytes,
@@ -5904,8 +5981,12 @@ class TrainerRank:
         *,
         slot_group_count: int,
         grad_modes: Iterable[bool],
+        slot_groups: Iterable[tuple["LoRASlotRef | None", bool]] = (),
     ) -> _MemorySignature:
         modes = tuple(sorted(grad_modes))
+        shapes = tuple(
+            sorted((grad, self._slot_memory_shapes(ref)) for ref, grad in slot_groups)
+        )
         return _MemorySignature(
             topology=self._topology_key(),
             planner_coefficients=(self._coefficient_version, self._coefficient_table),
@@ -5915,7 +5996,35 @@ class TrainerRank:
             ),
             grad_enabled=any(modes),
             grad_modes=modes,
+            slot_shapes=shapes if any(any(shape) for _, shape in shapes) else (),
         )
+
+    def _slot_memory_shapes(
+        self, ref: "LoRASlotRef | None"
+    ) -> tuple[tuple[int, ...], ...]:
+        """Separate empirical trust across actual selected adapter layouts."""
+        if (
+            ref is None
+            or ref.name is None
+            or isinstance(ref, _LocalLoRASlotRef)
+            or not (getattr(self, "_moe_layers", 0) or getattr(self, "_gdn_layers", 0))
+        ):
+            # Generic/no-component planning must not import Megatron or walk
+            # model owners just to construct its existing memory signature.
+            return ()
+        from art.megatron.lora import LoRA
+
+        shapes = []
+        for chunk in self.runtime.model:
+            for module in chunk.modules():
+                if type(module) is LoRA:
+                    tensors = _slot_lora_tensors(module, ref)
+                    shapes.append(
+                        ()
+                        if tensors is None
+                        else (tensors[0].ndim, *tensors[0].shape, *tensors[1].shape)
+                    )
+        return tuple(shapes)
 
     def _topology_key(self) -> tuple[int, int, int, int]:
         try:
@@ -5956,6 +6065,7 @@ class TrainerRank:
                 logical_tokens=forward.active_logical_tokens,
                 gdn_segments=forward.grad_segment_count,
                 group_rows=self._plan_group_rows(forward),
+                slot_refs=tuple(g.slot_ref for g in forward.groups),
                 head_workspace_bytes=self._plan_head_workspace_bytes(forward),
                 checkpoint_floor=_gdn_memory.plan_floor(self, forward),
                 retained_tokens=self._plan_retained_tokens(forward),
@@ -6378,6 +6488,7 @@ class TrainerRank:
         logical_tokens: int | None = None,
         gdn_segments: int = 0,
         group_rows: tuple[tuple[int, bool], ...] = (),
+        slot_refs: tuple["LoRASlotRef | None", ...] | None = None,
         head_workspace_bytes: int = 0,
         checkpoint_floor: tuple[int, int] = (0, 0),
         retained_tokens: int | None = None,
@@ -6489,8 +6600,14 @@ class TrainerRank:
             )
         # Groups execute sequentially: summed packed rows conservatively bound
         # this FC2 component, not all workspace or retained graphs.
-        static_compute = max(static_compute, self._moe_workspace_bytes(packed_tokens))
-        retained, workspace = self._checkpoint_memory_floor(group_rows)
+        static_compute = max(
+            static_compute,
+            *(
+                self._moe_workspace_bytes(packed_tokens, slot_ref=ref)
+                for ref in (slot_refs or (None,))
+            ),
+        )
+        retained, workspace = self._checkpoint_memory_floor(group_rows, slot_refs)
         static_compute = max(
             static_compute,
             max(retained, checkpoint_floor[0])

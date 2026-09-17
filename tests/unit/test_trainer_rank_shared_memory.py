@@ -308,9 +308,9 @@ def test_pre_gate_cache_precedes_owned_dispatcher_and_is_checkpoint_only(layer):
         19 * 40 * 4096,
         max(
             19 * (196608 + 128),
-            23 * 192512,
+            23 * (192512 + 4 * 2048 * 2),
             19 * (196608 - 32768 + 128) + 10485760,
-            23 * (192512 - 32768 + 128) + 10485760,
+            23 * (192512 - 32768 + 128 + 4 * 2048 * 2) + 10485760,
         ),
     )
     for mode in (None, "selective"):
@@ -339,7 +339,7 @@ def test_pre_gate_mixed_reference_and_exact_cost_mode_selection(layer, gradient_
     )
     assert rank._checkpoint_memory_floor(rank._plan_group_rows(mixed)) == (
         67 * 40 * 4096,
-        4096 * 192512,
+        4096 * (192512 + 4 * 2048 * 2),
     )
     # A reference-only path must not read or validate the unused gradient cache.
     rank._moe_checkpoint_grad_bytes_per_token = None

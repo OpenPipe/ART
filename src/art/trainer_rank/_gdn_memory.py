@@ -120,13 +120,19 @@ class Shape:
         )
 
 
-def model_shapes(rank: Any) -> tuple[int, tuple[Shape, ...]] | None:
+def model_shapes(
+    rank: Any, slot_ref: Any = None
+) -> tuple[int, tuple[Shape, ...]] | None:
     """Conditional original-owner metadata; no model execution or CUDA read."""
     if not getattr(rank, "_gdn_layers", 0):
         return None
     import torch
 
-    from art.trainer_rank._impl import _expert_parallel_shape, _language_model
+    from art.trainer_rank._impl import (
+        _expert_parallel_shape,
+        _language_model,
+        _slot_lora_tensors,
+    )
 
     if (
         len(rank.runtime.model) != 1
@@ -257,13 +263,23 @@ def model_shapes(rank: Any) -> tuple[int, tuple[Shape, ...]] | None:
             if (
                 "forward" in vars(out)
                 or "forward" in vars(lora)
+                or "active_lora_tensors" in vars(lora)
+                or "_slot" in vars(lora)
                 or out._forward_hooks
                 or lora._forward_hooks
                 or out._forward_pre_hooks
                 or lora._forward_pre_hooks
             ):
                 return None
-            a, b = lora.A_T, lora.B_T
+            # Keep the previous conservative inactive-adapter enclosure.
+            tensors = _slot_lora_tensors(
+                lora,
+                None if slot_ref is not None and slot_ref.name is None else slot_ref,
+            )
+            if tensors is None:
+                shapes.append(Shape(hk, hv, dk, dv, kernel, 0, moe))
+                continue
+            a, b = tensors
             if (
                 a.ndim != 2
                 or b.ndim != 2
@@ -273,8 +289,7 @@ def model_shapes(rank: Any) -> tuple[int, tuple[Shape, ...]] | None:
                 or a.shape[1] != b.shape[0]
             ):
                 return None
-            # Slots share these declared shapes; charging an inactive adapter
-            # conservatively adds a term, without inspecting/changing its slot.
+            # Use the admitted slot rank without changing its active context.
             lora_rank = int(a.shape[1])
         shapes.append(Shape(hk, hv, dk, dv, kernel, lora_rank, moe))
     return (len(decoder.layers), tuple(shapes)) if shapes else None
@@ -288,18 +303,20 @@ def plan_floor(rank: Any, plan: Any) -> tuple[int, int]:
     gradients = [g for g in plan.groups if g.grad_enabled]
     if not gradients:
         return 0, 0
-    model = model_shapes(rank)
-    if model is None:
-        return 0, 0
-    layers, shapes = model
     retained = 0
     workspace = 0
     for group in plan.groups:
         rows = int(group.packed.tokens.numel())
+        model = model_shapes(rank, group.slot_ref)
+        if model is None:
+            return 0, 0
+        layers, shapes = model
         if not group.grad_enabled:
             # Earlier gradient groups remain live during a later reference
             # group. Only its existing MoE component enters this stage.
-            workspace = max(workspace, rank._moe_workspace_bytes(rows))
+            workspace = max(
+                workspace, rank._moe_workspace_bytes(rows, slot_ref=group.slot_ref)
+            )
             continue
         buckets = cp1_buckets(group.packed.segments)
         if sum(s.length for s in group.packed.segments) != rows:
@@ -308,7 +325,9 @@ def plan_floor(rank: Any, plan: Any) -> tuple[int, int]:
         workspace = max(
             workspace,
             *(
-                rank._moe_workspace_bytes(rows, checkpoint_grad=True)
+                rank._moe_workspace_bytes(
+                    rows, checkpoint_grad=True, slot_ref=group.slot_ref
+                )
                 + s.pending(rows, buckets)
                 for s in shapes
             ),

@@ -125,7 +125,7 @@ def test_reference_and_gradient_keep_distinct_stage_modes(layer, order, rank_val
     retained, workspace = rank._checkpoint_memory_floor(groups)
     assert retained == 3 * 40 * 2048 * 2
     assert workspace == max(
-        expected(3, rank_value, True), expected(9, rank_value, False)
+        expected(3, rank_value, True), expected(9, rank_value, False) + 4 * 9 * 2048 * 2
     )
     assert (
         rank._memory_check(plan).estimated_required_bytes
