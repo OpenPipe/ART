@@ -45,7 +45,7 @@ def main() -> None:
     parser.add_argument(
         "--concentrate-routing",
         action="store_true",
-        help="Send every token to the first top-k experts",
+        help="Concentrate 31/32 of tokens on the first expert rank",
     )
     parser.add_argument("--evidence", type=Path, required=True)
     args = parser.parse_args()
@@ -96,9 +96,24 @@ def main() -> None:
 
                     def gating(inputs, original=module.gating):
                         logits = original(inputs)
-                        selected = (
-                            torch.arange(logits.shape[-1], device=logits.device)
-                            < runtime.provider.moe_router_topk
+                        experts = logits.shape[-1]
+                        ep = runtime.provider.expert_model_parallel_size
+                        rows = torch.arange(
+                            logits.numel() // experts, device=logits.device
+                        ).reshape(*logits.shape[:-1], 1)
+                        # Fully empty EP peers crash TE's grouped GEMM. Leave
+                        # 1/32 of tokens on peers while stressing near-max load.
+                        owner = (
+                            torch.where(
+                                rows % 32 == 0, 1 + (rows // 32) % max(1, ep - 1), 0
+                            )
+                            if ep > 1
+                            else torch.zeros_like(rows)
+                        )
+                        expert = torch.arange(experts, device=logits.device)
+                        selected = (expert >= owner * (experts // ep)) & (
+                            expert
+                            < owner * (experts // ep) + runtime.provider.moe_router_topk
                         )
                         return logits + selected * 10000
 
