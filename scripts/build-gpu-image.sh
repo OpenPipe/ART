@@ -799,7 +799,7 @@ wait_for_mutable_tag_convergence() {
       clear_mutable_tag="${prewarm_clear_mutable_tag}"
     fi
     pod="${pod_base}-${attempt}"
-    delete_pods_without_wait "${pod}"
+    delete_pods_best_effort "${pod}"
     "${kubectl_cmd[@]}" apply -n "${prewarm_namespace}" -f - <<EOF
 apiVersion: v1
 kind: Pod

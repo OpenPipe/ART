@@ -71,6 +71,7 @@ jobs:
 
     env:
       SKY_INFRA: k8s/cks-wb3
+      BUILD_CLUSTER_NAME: art-gpu-build-${{ github.run_id }}-${{ github.run_attempt }}
       PREWARM_INFRAS: ${{ inputs.prewarm_infras || 'k8s/cks-wb3 k8s/ext-collab2 k8s/serverless-training-central' }}
 
     steps:
@@ -196,6 +197,7 @@ jobs:
           PREWARM_TIMEOUT="${PREWARM_TIMEOUT:-30m}"
 
           args=(
+            --cluster-name "${BUILD_CLUSTER_NAME}"
             --infra "${SKY_INFRA}"
             --image-repo "${IMAGE_REPO}"
             --pull-image-repo "${PULL_IMAGE_REPO}"
@@ -216,6 +218,12 @@ jobs:
           fi
 
           bash scripts/build-gpu-image.sh "${args[@]}"
+
+      - name: Remove temporary image builder
+        if: ${{ always() }}
+        run: |
+          kubectl --context cks-wb3 delete pod -n default "${BUILD_CLUSTER_NAME}" \
+            --ignore-not-found --wait=false
 
       - name: Smoke launch prewarmed image
         if: ${{ github.event_name != 'workflow_dispatch' || inputs.smoke_launch }}
