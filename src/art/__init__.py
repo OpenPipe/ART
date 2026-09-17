@@ -71,6 +71,7 @@ from .metrics import (
 from .model import Model, TrainableModel
 from .pipeline_tuner import PipelineAutotuneConfig, PipelineRuntimeConfig
 from .serverless import ServerlessBackend
+from .tokenizer import get_tokenizer
 from .trajectories import (
     Trajectory,
     TrajectoryGroup,
@@ -116,6 +117,7 @@ __all__ = [
     "PIPELINE_RL_METRIC_DEFINITIONS",
     "PIPELINE_RL_SCORE_METRICS",
     "get_megatron_runtime_config",
+    "get_tokenizer",
     "init_megatron_runtime_config",
     "ServerlessBackend",
     "ServerlessTrainResult",

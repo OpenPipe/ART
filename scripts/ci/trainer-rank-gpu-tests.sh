@@ -9,6 +9,7 @@ runtime_python="$(
 test -x "${runtime_python}"
 
 "${runtime_python}" -m pytest --tb=short \
+  tests/unit/test_trainer_rank_head_recompute.py \
   tests/unit/test_trainer_rank_custom_tensors.py \
   tests/integration/megatron/cp_attn/test_attention_packed_vs_flattened.py \
   'tests/integration/megatron/gdn_shared_prefix/test_gdn_cp_packed_correctness.py::test_gdn_cp_packed_sibling_order_matches_cp1_oracle[2]' \
@@ -19,6 +20,13 @@ test -x "${runtime_python}"
   tests/integration/megatron/lora/test_dynamic_lora_slots.py::test_trainer_rank_custom_objects_train_and_become_stale_on_cuda \
   tests/integration/megatron/lora/test_dynamic_lora_slots.py::test_trainer_rank_custom_parameter_reduction_oracle \
   'tests/integration/megatron/lora/test_dynamic_lora_slots.py::test_trainer_rank_tp_head_backward_matches_unsharded_oracle[2]'
+
+# Keep SFT distributed state and compiler workarounds in separate test processes.
+"${runtime_python}" -m pytest --tb=short \
+  tests/integration/megatron/test_sft_packing.py::test_sft_packing_loss_and_gradients
+
+"${runtime_python}" -m pytest --tb=short \
+  tests/integration/megatron/test_shared_expert_stream_handoff.py::test_compiled_shared_expert_handoff
 
 ART_MEGATRON_CONTEXT_PARALLEL_SIZE=2 \
   "${runtime_python}" -m torch.distributed.run --standalone --nproc-per-node=2 \

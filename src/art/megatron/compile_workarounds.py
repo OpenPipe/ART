@@ -105,6 +105,15 @@ def _install_te_triton_mask_map_workaround() -> None:
         _disable_attr(permutation, name)
 
 
+def _install_shared_expert_handoff_workaround() -> None:
+    from megatron.core.transformer.moe.shared_experts import SharedExpertMLP
+
+    # AOT drops standalone CUDA wait_stream graphs. Keep both ownership
+    # handoffs eager, but leave shared-expert math compiled on its side stream.
+    for name in ("pre_forward_comm", "get_output"):
+        _disable_attr(SharedExpertMLP, name)
+
+
 def install_torch_compile_workarounds(
     config: CompileWorkaroundConfig | None = None,
 ) -> None:
@@ -139,6 +148,8 @@ def install_torch_compile_workarounds(
 
     if "context_parallel_attention" in flags:
         _install_context_parallel_attention_workaround()
+    if "shared_expert_stream_handoffs" in flags:
+        _install_shared_expert_handoff_workaround()
     if _SELF_ATTN_LINEAR_PROJ_REDUCE_SCATTER_WORKAROUND_FLAG in flags:
         _install_self_attn_linear_proj_reduce_scatter_workaround()
     if "moe_postprocess" in flags:

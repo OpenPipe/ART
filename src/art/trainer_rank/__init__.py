@@ -253,6 +253,12 @@ class TrainerRank(_impl.TrainerRank):
         ART moves its packed model inputs and labels internally without mutating
         the caller-owned `ForwardInput` objects.
 
+        Per-position outputs contain the full flattened input sequence in source
+        order, including with context parallelism. Callers must compute identical
+        losses on every TP/CP replica; ART routes gradients to owning rows
+        without multiplying them by the number of replicas. `dp_reduce` combines
+        only distinct data-parallel batches.
+
         Empty local microbatches are skipped unless `yield_empty=True`. Every
         rank must use the same setting. When a wave skips ranks, TrainerRank
         collective methods raise if called from its loop body; fully populated
@@ -333,6 +339,9 @@ class TrainerRank(_impl.TrainerRank):
     ) -> ForwardOutputs:
         """Forward inputs already local to this data-parallel rank.
 
+        Outputs contain full sequences in source order on every TP/CP rank,
+        with the same loss and reduction contract as `forward_micro_batches`.
+
         Per-input checkpoints and `no_grad` values override the method defaults.
         `no_grad=None` inherits the ambient PyTorch grad mode; `True` disables
         grads and `False` enables them.
@@ -352,6 +361,7 @@ class TrainerRank(_impl.TrainerRank):
         *,
         op: dist.ReduceOp.RedOpType = dist.ReduceOp.SUM,
     ) -> None:
+        """Reduce in place over data-parallel batches, excluding TP/CP replicas."""
         super().dp_reduce(tensor, op=op)
 
     def optim_step(

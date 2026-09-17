@@ -1,11 +1,18 @@
 from __future__ import annotations
 
+from contextvars import ContextVar
 import copy
 from typing import Any
 
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
-from art.megatron.dsv4.encoding import encode_messages
+from art.megatron.dsv4 import encoding
+from art_inference.append_only import patch_deepseek_renderer, preserves_history
+
+_PRESERVE_HISTORY: ContextVar[bool] = ContextVar(
+    "art_dsv4_preserve_history", default=True
+)
+patch_deepseek_renderer(encoding, _PRESERVE_HISTORY.get)
 
 DSV4_CHAT_TEMPLATE_MARKER = "deepseek_v4_python_encoder enable_thinking"
 
@@ -35,12 +42,28 @@ def get_dsv4_tokenizer(
             tools: list[dict[str, Any]] | None = None,
             **kwargs: Any,
         ) -> str | list[int]:
+            chat_template = kwargs.get("chat_template")
+            if chat_template is None:
+                chat_template = self.chat_template
+            if chat_template != DSV4_CHAT_TEMPLATE_MARKER:
+                return super().apply_chat_template(messages, tools=tools, **kwargs)
             thinking = bool(kwargs.get("thinking", False)) or bool(
                 kwargs.get("enable_thinking", False)
             )
             thinking_mode = "thinking" if thinking else "chat"
             conversation = kwargs.get("conversation", messages)
-            rendered_messages = list(conversation)
+            rendered_messages = [
+                {
+                    **message,
+                    "reasoning": message.get(
+                        "reasoning",
+                        message.get("reasoning_content", message.get("thinking")),
+                    ),
+                }
+                if message.get("role") == "assistant"
+                else message
+                for message in conversation
+            ]
             if tools:
                 rendered_messages.insert(0, {"role": "system", "tools": tools})
 
@@ -55,12 +78,17 @@ def get_dsv4_tokenizer(
             else:
                 reasoning_effort = "high"
 
-            prompt = encode_messages(
-                rendered_messages,
-                thinking_mode=thinking_mode,
-                drop_thinking=kwargs.get("drop_thinking", True),
-                reasoning_effort=reasoning_effort,
-            )
+            preserve = preserves_history(kwargs)
+            token = _PRESERVE_HISTORY.set(preserve)
+            try:
+                prompt = encoding.encode_messages(
+                    rendered_messages,
+                    thinking_mode=thinking_mode,
+                    drop_thinking=not preserve,
+                    reasoning_effort=reasoning_effort,
+                )
+            finally:
+                _PRESERVE_HISTORY.reset(token)
             if not kwargs.get("tokenize", True):
                 return prompt
             tokenizer_kwargs = {

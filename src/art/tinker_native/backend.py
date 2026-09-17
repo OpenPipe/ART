@@ -25,9 +25,12 @@ from openai.types.chat.chat_completion_token_logprob import ChatCompletionTokenL
 from openai.types.chat.completion_create_params import CompletionCreateParams
 from openai.types.completion_usage import CompletionUsage
 import tinker
-from tinker_cookbook import renderers, tokenizer_utils
+from tinker_cookbook import renderers
+from tinker_cookbook.tokenizer_utils import Tokenizer as CookbookTokenizer
 import torch
 import uvicorn
+
+from art.tokenizer import get_tokenizer
 
 from .. import dev
 from ..adapter_leases import pin_inference_step, pinned_inference_step
@@ -715,12 +718,15 @@ class TinkerNativeBackend:
         service_client = tinker.ServiceClient()
         rest_client = service_client.create_rest_client()
 
-        tokenizer = tokenizer_utils.get_tokenizer(model.base_model)
+        tokenizer = get_tokenizer(model.base_model)
         renderer = renderers.get_renderer(
             name=config.renderer_name,
-            tokenizer=tokenizer,
+            # Cookbook's annotation omits the fast HF tokenizers it accepts.
+            tokenizer=cast(CookbookTokenizer, tokenizer),
             model_name=model.base_model,
         )
+        if hasattr(renderer, "strip_thinking_from_history"):
+            setattr(renderer, "strip_thinking_from_history", False)
 
         saved_state = model.read_state() or {}
         tinker_run_ids = list(saved_state.get(STATE_KEY_RUN_IDS, []))

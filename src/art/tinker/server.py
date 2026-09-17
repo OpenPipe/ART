@@ -29,14 +29,24 @@ from openai.types.completion_usage import CompletionUsage
 from pydantic import BaseModel, Field, SkipValidation, TypeAdapter
 import tinker
 from tinker_cookbook import renderers
-from tinker_cookbook.tokenizer_utils import get_tokenizer
+from tinker_cookbook.tokenizer_utils import Tokenizer as CookbookTokenizer
 from transformers.tokenization_utils_base import BatchEncoding
 import uvicorn
 
-from art.tinker.prefix_cache import LRUTrieCache
 from art.tinker.renderers import get_renderer_name, is_qwen3_dot_family_model
+from art.token_prefix import TokenPrefixStore
+from art.tokenizer import get_tokenizer
 from art.types import Message, Tools
-from art.utils.chat_template import default_chat_template_kwargs_for_tokenizer
+from art.utils.append_only import (
+    chat_prefix_observations,
+    has_renderable_tool_arguments,
+    output_prefix_observations,
+    preserves_history,
+)
+from art.utils.chat_template import (
+    default_chat_template_kwargs_for_tokenizer,
+    normalize_tool_call_arguments_for_chat_template,
+)
 from mp_actors import close_proxy, move_to_child_process
 
 
@@ -120,7 +130,7 @@ class OpenAICompatibleTinkerServer:
     port: int | None = None
     num_workers: int | None = None
     max_concurrent_sampling_clients: int | None = None
-    _prefix_cache: LRUTrieCache = field(default_factory=LRUTrieCache)
+    _prefix_cache: TokenPrefixStore = field(default_factory=TokenPrefixStore)
     _task: asyncio.Task[None] | None = None
     _tenants: dict[str, "OpenAICompatibleTinkerServerTenant"] = field(
         default_factory=dict
@@ -366,19 +376,30 @@ class OpenAICompatibleTinkerServer:
             worker = next(workers)
             tenant = self._get_request_tenant(request)
             samplable_model = await tenant.get_samplable_model(body["model"])
+            template_kwargs = cast(dict[str, Any], body).get("chat_template_kwargs")
+            preserve = preserves_history(template_kwargs)
+            scope = json.dumps(
+                [id(tenant), samplable_model.base_model, template_kwargs],
+                sort_keys=True,
+            )
             rendered_prompt_tokens = await worker.prompt_tokens(
                 base_model=samplable_model.base_model,
                 messages=list(body["messages"]),
                 tools=list(body.get("tools", [])) if "tools" in body else None,
+                chat_template_kwargs=template_kwargs,
             )
             prompt_tokens = rendered_prompt_tokens
-            prefix_entry = self._prefix_cache.lookup(rendered_prompt_tokens)
-            if prefix_entry is not None and prefix_entry.rendered_len <= len(
+            prefix_entry = (
+                self._prefix_cache.lookup(scope, rendered_prompt_tokens, None)
+                if preserve
+                else None
+            )
+            if prefix_entry is not None and prefix_entry.rendered_length <= len(
                 rendered_prompt_tokens
             ):
                 prompt_tokens = (
                     list(prefix_entry.raw_prefix)
-                    + rendered_prompt_tokens[prefix_entry.rendered_len :]
+                    + rendered_prompt_tokens[prefix_entry.rendered_length :]
                 )
             try:
                 async with samplable_model.sampling_client() as sampling_client:
@@ -407,18 +428,20 @@ class OpenAICompatibleTinkerServer:
                 raise HTTPException(status_code=e.status_code, detail=detail) from e
             (
                 chat_completion,
-                token_discrepancies,
-            ) = await worker.chat_completion_and_token_discrepancies(
+                prefixes,
+            ) = await worker.chat_completion_and_prefixes(
                 base_model=samplable_model.base_model,
                 sample_response=sample_response,
                 model_name=body["model"],
-                prompt_tokens=len(prompt_tokens),
+                prompt_tokens=prompt_tokens,
+                rendered_prompt=rendered_prompt_tokens,
+                messages=list(body["messages"]),
+                tools=list(body.get("tools", [])) if "tools" in body else None,
+                chat_template_kwargs=template_kwargs,
             )
-            for rendered_response_tokens, raw_response_tokens in token_discrepancies:
-                self._prefix_cache.insert(
-                    rendered_prompt_tokens + rendered_response_tokens,
-                    prompt_tokens + raw_response_tokens,
-                )
+            if preserve:
+                for rendered, raw, edits in prefixes:
+                    self._prefix_cache.insert(scope, rendered, raw, "content", edits)
             return chat_completion
 
         server_config = uvicorn.Config(
@@ -550,14 +573,24 @@ class OpenAICompatibleTinkerServerWorker:
         base_model: str,
         messages: list[ChatCompletionMessageParam],
         tools: list[ChatCompletionToolUnionParam] | None,
+        *,
+        add_generation_prompt: bool = True,
+        chat_template_kwargs: dict[str, Any] | None = None,
     ) -> list[int]:
         normalized_messages = _normalize_qwen3_dot_messages(base_model, messages)
         tokenizer = self._get_renderer(base_model).tokenizer
-        chat_template_kwargs = default_chat_template_kwargs_for_tokenizer(tokenizer)
+        normalized_messages = normalize_tool_call_arguments_for_chat_template(
+            normalized_messages, getattr(tokenizer, "chat_template", None)
+        )
+        chat_template_kwargs = {
+            **default_chat_template_kwargs_for_tokenizer(tokenizer),
+            **(chat_template_kwargs or {}),
+        }
         encoding = tokenizer.apply_chat_template(
             cast(Any, normalized_messages),
             tools=cast(Any, tools),
-            add_generation_prompt=True,
+            tokenize=True,
+            add_generation_prompt=add_generation_prompt,
             **chat_template_kwargs,
         )
         if isinstance(encoding, BatchEncoding):
@@ -590,28 +623,69 @@ class OpenAICompatibleTinkerServerWorker:
         )
         return (result.token_ids, result.choice_offsets) if result is not None else None
 
-    async def chat_completion_and_token_discrepancies(
+    async def chat_completion_and_prefixes(
         self,
         base_model: str,
         sample_response: tinker.SampleResponse,
         model_name: str,
-        prompt_tokens: int,
-    ) -> tuple[ChatCompletion, list[tuple[list[int], list[int]]]]:
+        prompt_tokens: list[int],
+        rendered_prompt: list[int],
+        messages: list[ChatCompletionMessageParam],
+        tools: list[ChatCompletionToolUnionParam] | None,
+        chat_template_kwargs: dict[str, Any] | None = None,
+    ) -> tuple[ChatCompletion, list[tuple[list[int], list[int], tuple[Any, ...]]]]:
         renderer = self._get_renderer(base_model)
         choices: list[Choice] = []
-        token_discrepancies: list[tuple[list[int], list[int]]] = []
+        prefixes = []
         for i, sequence in enumerate(sample_response.sequences):
             assert sequence.logprobs is not None, "Logprobs are required"
             assert len(sequence.tokens) == len(sequence.logprobs), (
                 "Tokens and logprobs must have the same length"
             )
-            rendered_response_tokens = renderer.tokenizer.encode(
-                renderer.tokenizer.decode(sequence.tokens)
-            )
-            if rendered_response_tokens != sequence.tokens:
-                token_discrepancies.append((rendered_response_tokens, sequence.tokens))
             message, _ = renderer.parse_response(sequence.tokens)
             openai_message = renderer.to_openai_message(message)
+            if preserves_history(chat_template_kwargs):
+                prefixes.extend(
+                    output_prefix_observations(
+                        renderer.tokenizer,
+                        rendered_prompt,
+                        prompt_tokens,
+                        sequence.tokens,
+                    )
+                )
+            if preserves_history(
+                chat_template_kwargs
+            ) and has_renderable_tool_arguments(openai_message):
+
+                async def render(assistant: dict[str, Any]) -> list[int]:
+                    return await self.prompt_tokens(
+                        base_model,
+                        [*messages, cast(Any, assistant)],
+                        tools,
+                        add_generation_prompt=False,
+                        chat_template_kwargs=chat_template_kwargs,
+                    )
+
+                reasoning = {
+                    key: openai_message[key]
+                    for key in ("reasoning", "reasoning_content", "thinking")
+                    if openai_message.get(key) is not None
+                }
+                prefixes.extend(
+                    chat_prefix_observations(
+                        renderer.tokenizer,
+                        rendered_prompt,
+                        await render(openai_message),
+                        prompt_tokens,
+                        sequence.tokens,
+                        reasoning_prompt=await render(
+                            {"role": "assistant", "content": "", **reasoning}
+                        )
+                        if reasoning
+                        else None,
+                        complete=sequence.stop_reason == "stop",
+                    )
+                )
             tool_calls = (
                 [
                     ChatCompletionMessageFunctionToolCall(
@@ -635,10 +709,12 @@ class OpenAICompatibleTinkerServerWorker:
                 Choice(
                     finish_reason=sequence.stop_reason,
                     index=i,
-                    message=ChatCompletionMessage(
-                        content=openai_message.get("content") or None,
-                        role="assistant",
-                        tool_calls=tool_calls,  # type: ignore
+                    message=ChatCompletionMessage.model_validate(
+                        {
+                            **openai_message,
+                            "role": "assistant",
+                            "tool_calls": tool_calls,
+                        }
                     ),
                     logprobs=ChoiceLogprobs(
                         content=[
@@ -669,18 +745,19 @@ class OpenAICompatibleTinkerServerWorker:
                 object="chat.completion",
                 usage=CompletionUsage(
                     completion_tokens=completion_tokens,
-                    prompt_tokens=prompt_tokens,
-                    total_tokens=completion_tokens + prompt_tokens,
+                    prompt_tokens=len(prompt_tokens),
+                    total_tokens=completion_tokens + len(prompt_tokens),
                 ),
             ),
-            token_discrepancies,
+            prefixes,
         )
 
     def _get_renderer(self, base_model: str) -> renderers.Renderer:
         if base_model not in self._renderers:
             self._renderers[base_model] = renderers.get_renderer(
                 name=get_renderer_name(base_model),
-                tokenizer=get_tokenizer(base_model),
+                # Cookbook's annotation omits the fast HF tokenizers it accepts.
+                tokenizer=cast(CookbookTokenizer, get_tokenizer(base_model)),
                 model_name=base_model,
             )
         return self._renderers[base_model]

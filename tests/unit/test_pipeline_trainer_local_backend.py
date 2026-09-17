@@ -746,7 +746,7 @@ def test_local_backend_get_packed_tensors_warns_and_drops_overlong_results(
 
     with (
         patch(
-            "art.local.backend.AutoTokenizer.from_pretrained",
+            "art.local.backend.get_tokenizer",
             return_value=short_result._tokenizer,
         ),
         patch("transformers.AutoImageProcessor.from_pretrained", return_value=None),

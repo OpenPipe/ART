@@ -742,3 +742,153 @@ class TestRecovery(unittest.TestCase):
         self.assertIs(helper(primary, secondary), primary)
         self.assertEqual(primary.__notes__, 42)
         self.assertIs(primary.__context__, context)
+
+
+def _check_dense_cp_exact_demand_recovery(monkeypatch, *, fits_after_release):
+    import pytest
+    from test_trainer_rank_recompute_memory import _hybrid_rank
+    import torch
+
+    from art.megatron.model_support.handlers.qwen3_5 import Qwen35DenseHandler
+    from art.megatron.routing_replay import ParallelTopology
+    from art.trainer_rank import ForwardInput, TrainerRankMemoryError
+
+    # Declared CPU topology and inert model fixture. The real CP/GDN layout
+    # planner computes retained tokens; its result is never stubbed.
+    rank = _hybrid_rank(monkeypatch, 2)
+    monkeypatch.delattr(rank, "_topology_key")
+    topology = ParallelTopology(tp=2, ep=1, cp=2, sp=True)
+    monkeypatch.setattr(rank, "_topology", lambda: topology)
+    monkeypatch.setattr(rank, "_dp_rank_and_size", lambda: (0, topology.dp))
+    rank.runtime.provider.tensor_model_parallel_size = 2
+    rank.runtime.provider.context_parallel_size = 2
+    rank.runtime.model_support_handler = Qwen35DenseHandler()
+    assert rank._topology_key() == (1, 2, 2, 1)
+    assert rank._dp_rank_and_size() == (0, 1)
+    assert rank.device.type == "cpu" and not rank._geometry.moe_experts
+    requests = [
+        ForwardInput(input_tokens=torch.arange(4096), hidden_states=True),
+        ForwardInput(
+            input_tokens=torch.cat(
+                (torch.arange(1228), torch.arange(1228, 4096) + 10000)
+            ),
+            hidden_states=True,
+        ),
+    ]
+    budget, search_number = 0, 0
+    plan_fields: tuple[int, int, int] | None = None
+    exact_rows, estimates, searches, releases, errors = [], [], [], [], []
+    monkeypatch.setattr(rank, "_available_memory_bytes", lambda: budget)
+    monkeypatch.setattr(
+        rank, "_execute_flat_plan", lambda *a, **kw: pytest.fail("No model execution")
+    )
+    monkeypatch.setattr(
+        torch.cuda, "empty_cache", lambda *a, **kw: pytest.fail("No CUDA release")
+    )
+    estimate = rank._estimate_required_memory_bytes_from_values
+    check = rank._memory_check
+    search = rank._search_next_micro_batch
+    cheap = rank._estimate_flat_forward
+    error_factory = _impl._ForwardRefusal.error
+
+    def observed_estimate(**kwargs):
+        value = estimate(**kwargs)
+        if plan_fields is not None:
+            packed, retained, segments = plan_fields
+            assert kwargs["retained_tokens"] == retained
+            assert kwargs["gdn_segments"] == segments
+            exact_rows.append((search_number, packed, retained, segments, value))
+        return value
+
+    def observed_check(plan, **kwargs):
+        nonlocal plan_fields
+        previous = plan_fields
+        plan_fields = (
+            plan.packed_tokens,
+            rank._plan_retained_tokens(plan),
+            plan.grad_segment_count,
+        )
+        assert plan_fields[1] > 0 and plan_fields[2] > 0
+        try:
+            return check(plan, **kwargs)
+        finally:
+            plan_fields = previous
+
+    def observed_cheap(*args, **kwargs):
+        value = cheap(*args, **kwargs)
+        estimates.append((search_number, value is None))
+        assert value is None, "Dense CP must reach exact-plan pricing"
+        return value
+
+    def observed_search(*args, **kwargs):
+        nonlocal search_number
+        search_number += 1
+        value = search(*args, **kwargs)
+        searches.append(value)
+        return value
+
+    def observed_error(refused, context):
+        error = error_factory(refused, context)
+        errors.append(error)
+        return error
+
+    def release_facade(refused_check, **kwargs):
+        nonlocal budget
+        # Only availability changes. The actual outer recovery/search remain;
+        # this CPU test does not exercise allocator policy or CUDA release.
+        assert kwargs["sync_across_dp"] is True
+        assert not releases and refused_check.estimated_required_bytes > 1
+        # A split refusal can carry only an optimistic lower bound. Restore
+        # the first actual flat-plan demand observed before this release.
+        exact = next(row[1:] for row in exact_rows if row[0] == search_number)
+        assert refused_check.estimated_required_bytes <= exact[-1]
+        releases.append(exact)
+        budget = exact[-1] if fits_after_release else 1
+        return True
+
+    monkeypatch.setattr(
+        rank, "_estimate_required_memory_bytes_from_values", observed_estimate
+    )
+    monkeypatch.setattr(rank, "_memory_check", observed_check)
+    monkeypatch.setattr(rank, "_estimate_flat_forward", observed_cheap)
+    monkeypatch.setattr(rank, "_search_next_micro_batch", observed_search)
+    monkeypatch.setattr(_impl._ForwardRefusal, "error", observed_error)
+    monkeypatch.setattr(rank, "_try_cache_recovery", release_facade)
+    if fits_after_release:
+        selected = rank._select_next_micro_batch([requests], 0)
+        assert selected.check.fits
+        assert selected.check.estimated_required_bytes == releases[0][-1]
+        assert selected.check.available_bytes == budget and len(errors) == 1
+    else:
+        with pytest.raises(TrainerRankMemoryError) as caught:
+            rank._select_next_micro_batch([requests], 0)
+        assert len(errors) == 2 and caught.value is errors[1]
+        assert caught.value.__cause__ is errors[0] and errors[0] is not errors[1]
+    assert search_number == len(searches) == 2 and len(releases) == 1
+    assert isinstance(searches[0], _impl._ForwardRefusal)
+    assert {number for number, _ in estimates} == {1, 2}
+    assert all(unavailable for _, unavailable in estimates)
+    before = {row[1:] for row in exact_rows if row[0] == 1}
+    after = {row[1:] for row in exact_rows if row[0] == 2}
+    assert before and after and after <= before
+    if fits_after_release:
+        plan = selected.plan
+        assert (
+            plan.packed_tokens,
+            rank._plan_retained_tokens(plan),
+            plan.grad_segment_count,
+            selected.check.estimated_required_bytes,
+        ) == releases[0]
+        assert releases[0] in before
+    else:
+        assert before == after
+    assert rank._recovery_state().owner is None
+    assert not torch.cuda.is_initialized()
+
+
+def test_dense_cp_exact_demand_fits_after_recovery(monkeypatch):
+    _check_dense_cp_exact_demand_recovery(monkeypatch, fits_after_release=True)
+
+
+def test_dense_cp_exact_demand_refuses_after_recovery(monkeypatch):
+    _check_dense_cp_exact_demand_recovery(monkeypatch, fits_after_release=False)

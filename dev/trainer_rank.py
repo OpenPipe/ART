@@ -5,9 +5,9 @@ from typing import Any, cast
 import torch
 import torch.distributed as dist
 from trainer_rank_support import load_random_checkpoints
-from transformers import AutoTokenizer
 import typer
 
+from art import get_tokenizer
 from art.trainer_rank import AdamParams, ForwardInput, TrainerRank
 
 
@@ -34,9 +34,7 @@ def main(
 
         from art.megatron import train as megatron_train
 
-        tokenizer = cast(
-            Any, AutoTokenizer.from_pretrained(model, trust_remote_code=True)
-        )
+        tokenizer = cast(Any, get_tokenizer(model, trust_remote_code=True))
         inputs: list[ForwardInput[torch.Tensor, None, None, None]] = []
         rows = load_dataset("roneneldan/TinyStories", split="train", streaming=True)
         for row in islice(rows, samples):
