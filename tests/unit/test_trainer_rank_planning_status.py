@@ -105,10 +105,12 @@ def _worker(index: int, directory: Path) -> None:
             rank = TrainerRank.__new__(TrainerRank)
             rank.device = torch.device("cpu")
             rank._padded_vocab_size = None
+            rank._moe_layers = rank._gdn_layers = 0
+            rank._slot_stack = []
+            rank._default_slot_ref = None
             rank._planning_seconds_accum = 0.0
             rank._dp_rank_and_size = lambda: (index, 2)
             rank._physical_tokens = lambda tokens: tokens
-            rank._resolve_slot_ref = lambda request, **_: request.no_grad
             rank._estimate_group_request_output_bytes = lambda requests: 0
             rank._memory_signature_from_requests = lambda *args, **kwargs: None
             rank._forward_item = lambda request: SimpleNamespace(

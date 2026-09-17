@@ -807,11 +807,6 @@ def test_adaptive_planner_probes_new_heterogeneous_signatures(
 ) -> None:
     rank = TrainerRank(_runtime())
     monkeypatch.setattr(rank, "_dp_rank_and_size", lambda: (0, 1))
-    monkeypatch.setattr(
-        rank,
-        "_resolve_slot_ref",
-        lambda request, **_kwargs: request.checkpoint,
-    )
     for index in range(4):
         rank._checkpoint_slots.setdefault(f"S{index}", _CheckpointSlot()).params = ()
     inputs = [
