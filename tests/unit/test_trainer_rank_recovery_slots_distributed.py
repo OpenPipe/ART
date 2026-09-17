@@ -95,8 +95,16 @@ def worker(index, mode, directory):
         packed_tokens=1,
         logical_tokens=1,
         active_logical_tokens=1,
+        grad_segment_count=0,
         output_bytes=0,
-        signature=None,
+        signature=_impl._MemorySignature(
+            topology=(2, 1, 1, 1),
+            planner_coefficients=(0, None),
+            slot_group_count=1,
+            request_mix=("hidden_states",),
+            grad_enabled=False,
+            grad_modes=(False,),
+        ),
     )
     rank._plan_flat_forward = lambda *args, **kwargs: plan
     rank._estimate_required_memory_bytes_from_values = lambda **kwargs: 80

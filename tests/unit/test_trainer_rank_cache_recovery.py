@@ -4,6 +4,7 @@ from contextlib import nullcontext
 import math
 import os
 import types
+from typing import cast
 import unittest
 from unittest.mock import patch
 
@@ -762,7 +763,10 @@ def _check_dense_cp_exact_demand_recovery(monkeypatch, *, fits_after_release):
     monkeypatch.setattr(rank, "_dp_rank_and_size", lambda: (0, topology.dp))
     rank.runtime.provider.tensor_model_parallel_size = 2
     rank.runtime.provider.context_parallel_size = 2
-    rank.runtime.model_support_handler = Qwen35DenseHandler()
+    # _hybrid_rank supplies an inert namespace, not TrainingRuntime's property.
+    runtime = cast(types.SimpleNamespace, rank.runtime)
+    assert isinstance(runtime, types.SimpleNamespace)
+    runtime.model_support_handler = Qwen35DenseHandler()
     assert rank._topology_key() == (1, 2, 2, 1)
     assert rank._dp_rank_and_size() == (0, 1)
     assert rank.device.type == "cpu" and not rank._geometry.moe_experts
@@ -873,6 +877,7 @@ def _check_dense_cp_exact_demand_recovery(monkeypatch, *, fits_after_release):
     assert before and after and after <= before
     if fits_after_release:
         plan = selected.plan
+        assert isinstance(plan, _impl._FlatForwardPlan)
         assert (
             plan.packed_tokens,
             rank._plan_retained_tokens(plan),
