@@ -1381,28 +1381,24 @@ class TrainerRank:
             or 1
         )
         memory_config = getattr(metadata_model, "config", None) or runtime.provider
-        self._recompute_granularity = getattr(
-            memory_config, "recompute_granularity", None
-        )
-        self._recompute_modules = frozenset(
-            getattr(memory_config, "recompute_modules", ()) or ()
-        )
-        self._sequence_parallel = bool(
-            getattr(memory_config, "sequence_parallel", False)
-        )
-        self._attention_output_gate = bool(
-            getattr(memory_config, "attention_output_gate", False)
-        )
+
+        def memory_field(name: str, default: Any = None) -> Any:
+            return getattr(
+                memory_config, name, getattr(runtime.provider, name, default)
+            )
+
+        self._recompute_granularity = memory_field("recompute_granularity", None)
+        self._recompute_modules = frozenset(memory_field("recompute_modules", ()) or ())
+        self._sequence_parallel = bool(memory_field("sequence_parallel", False))
+        self._attention_output_gate = bool(memory_field("attention_output_gate", False))
         # Native fused SwiGLU retains gate/up and the output (3F). Eager
         # unfused SwiGLU also retains SiLU and offset tensors (5F). Compilation
         # may fall back, so only the native fusion setting earns this discount.
         self._mlp_activation_factor = (
             3
-            if getattr(memory_config, "bias_activation_fusion", False)
-            and not getattr(memory_config, "use_te_activation_func", False)
-            else 5
-            + 2
-            * (getattr(memory_config, "activation_func_clamp_value", None) is not None)
+            if memory_field("bias_activation_fusion", False)
+            and not memory_field("use_te_activation_func", False)
+            else 5 + 2 * (memory_field("activation_func_clamp_value", None) is not None)
         )
         # Layers that run the gated-delta-net path (Qwen3.5-4B: 24 of 32); the
         # cost model prices GDN state hand-offs per GDN layer, not per layer.
