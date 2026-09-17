@@ -245,6 +245,7 @@ def test_sp_discount_excludes_gathered_lora_inputs(monkeypatch):
 @pytest.mark.parametrize(
     "packed,logical,peak",
     [
+        (436, 512, 829413888),  # Cold 256-token pair before adding workspace.
         (1742, 2048, 3043651584),
         (6964, 8192, 11941280768),
         (13928, 16384, 23861987840),
@@ -326,3 +327,44 @@ def test_non_full_estimate_covers_retained_gated_mlp_tensors() -> None:
         < retained(False)
         <= rank._memory_check(_plan(rank, tokens=32)).estimated_required_bytes
     )
+
+
+def test_moe_discount_uses_effective_native_checkpoint_count(monkeypatch):
+    rank = _rank(
+        "selective",
+        sequence_parallel=True,
+        num_moe_experts=256,
+        moe_router_topk=8,
+        moe_ffn_hidden_size=512,
+        moe_shared_expert_intermediate_size=512,
+        recompute_modules=["moe"],
+    )
+    monkeypatch.setattr(rank, "_topology_key", lambda: (1, 4, 1, 1))
+    plan = _plan(rank, tokens=4096)
+    # A module list alone cannot guarantee the native MoE checkpoint is active.
+    undiscounted = rank._memory_check(plan).estimated_required_bytes
+    rank._checkpointed_moe_layers = rank._num_layers
+    assert rank._memory_check(plan).estimated_required_bytes < undiscounted
+    rank._recompute_granularity = None
+    assert rank._memory_check(plan).estimated_required_bytes == undiscounted
+
+
+def test_short_hybrid_pairs_pay_for_recurrent_states(monkeypatch):
+    rank = _hybrid_rank(monkeypatch, 4)
+    requests = [
+        ForwardInput(input_tokens=torch.arange(64) + offset, hidden_states=True)
+        for offset in (0, 100)
+    ]
+    plan = rank._plan_flat_forward(requests)
+    assert plan.grad_segment_count == 2
+    estimate = rank._memory_check(plan).estimated_required_bytes
+    # Cold eager TP4 at 45297a4af missed this peak without segment states.
+    assert 892974592 <= estimate <= 1.2 * 892974592
+    assert rank._plan_cost(plan).required == estimate
+    rank._memory_profiles[plan.signature] = _MemoryProfile(0, plan.packed_tokens)
+    assert rank._memory_check(plan).estimated_required_bytes == estimate
+    inactive = rank._plan_flat_forward(
+        requests + [ForwardInput(input_tokens=torch.arange(1000))]
+    )
+    assert inactive.grad_segment_count == 2
+    assert rank._memory_check(inactive).estimated_required_bytes == estimate

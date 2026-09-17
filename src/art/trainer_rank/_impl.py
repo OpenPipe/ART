@@ -942,6 +942,12 @@ class _FlatForwardPlan:
         return self.logical_tokens - self.inactive_logical_tokens
 
     @property
+    def grad_segment_count(self) -> int:
+        return sum(
+            len(group.packed.segments) for group in self.groups if group.grad_enabled
+        )
+
+    @property
     def subforward_count(self) -> int:
         return 1
 
@@ -2925,6 +2931,7 @@ class TrainerRank:
             output_bytes=plan.output_bytes,
             signature=plan.signature,
             logical_tokens=plan.active_logical_tokens,
+            gdn_segments=plan.grad_segment_count,
         )
 
     def _subforward_cost(
@@ -2934,12 +2941,14 @@ class TrainerRank:
         output_bytes: int,
         signature: _MemorySignature,
         logical_tokens: int,
+        gdn_segments: int = 0,
     ) -> _SubforwardCost:
         required = self._estimate_required_memory_bytes_from_values(
             packed_tokens=packed_tokens,
             output_bytes=output_bytes,
             signature=signature,
             logical_tokens=logical_tokens,
+            gdn_segments=gdn_segments,
         )
         retained = self._retained_memory_bytes(
             signature,
@@ -3937,6 +3946,12 @@ class TrainerRank:
                         output_bytes=output_bytes,
                         signature=signature,
                         logical_tokens=logical_tokens,
+                        # A radix tree has fewer than twice as many segments as
+                        # active requests; the exact plan uses its actual count.
+                        gdn_segments=2
+                        * sum(
+                            _request_mix_key(r) != "inactive" for r in local_requests
+                        ),
                     )
                 return (
                     self._memory_check_required(required, sync_across_dp=True),
@@ -5078,6 +5093,7 @@ class TrainerRank:
                 output_bytes=forward.output_bytes,
                 signature=forward.signature,
                 logical_tokens=forward.active_logical_tokens,
+                gdn_segments=forward.grad_segment_count,
             )
         return self._memory_check_required(required, sync_across_dp=sync_across_dp)
 
@@ -5139,6 +5155,7 @@ class TrainerRank:
         output_bytes: int,
         signature: _MemorySignature,
         logical_tokens: int | None = None,
+        gdn_segments: int = 0,
     ) -> int:
         if packed_tokens <= 0:
             return output_bytes
@@ -5210,11 +5227,34 @@ class TrainerRank:
                 # live MLP still needs workspace, including worst-case dispatch.
                 checkpoint_input = (2 if geometry.moe_experts else 1) * hidden / sp
                 retained_features -= max(0, checkpointed - 1) * (mlp - checkpoint_input)
+            # Each GDN segment can retain an initial and a final recurrent
+            # state (fp32), plus convolution history. Unlike token activations,
+            # these do not shrink with segment length.
+            gdn_state_bytes = (
+                2
+                * gdn_segments
+                * gdn_layers
+                / tp
+                * (
+                    4
+                    * geometry.gdn_value_heads
+                    * geometry.gdn_key_head_dim
+                    * geometry.gdn_value_head_dim
+                    + self._param_dtype_size
+                    * (
+                        2 * geometry.gdn_key_heads * geometry.gdn_key_head_dim
+                        + geometry.gdn_value_heads * geometry.gdn_value_head_dim
+                    )
+                    * max(0, geometry.gdn_conv_kernel - 1)
+                )
+            )
             static_compute = max(
                 static_compute,
                 # Cold eager runs allocate ~58 MiB beyond warm retention for
                 # native kernel initialization; a slope alone misses short inputs.
-                64 * 2**20 + packed_tokens * self._param_dtype_size * retained_features,
+                64 * 2**20
+                + gdn_state_bytes
+                + packed_tokens * self._param_dtype_size * retained_features,
             )
         # Groups execute sequentially: summed packed rows conservatively bound
         # this FC2 component, not all workspace or retained graphs.

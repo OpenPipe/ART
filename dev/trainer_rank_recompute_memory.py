@@ -34,6 +34,9 @@ def main() -> None:
     parser.add_argument(
         "--pairs", action="store_true", help="Two sequences at each token length"
     )
+    parser.add_argument(
+        "--sequences", type=int, default=0, help="Override sequence count per batch"
+    )
     parser.add_argument("--prefix-fraction", type=float, default=0.3)
     parser.add_argument("--modules", nargs="+", default=["core_attn"])
     parser.add_argument(
@@ -48,6 +51,8 @@ def main() -> None:
     args = parser.parse_args()
     if args.repeat < 1 or args.layers < 0 or any(n < 1 for n in args.tokens):
         parser.error("repeat/tokens must be positive and layers nonnegative")
+    if args.sequences < 0:
+        parser.error("sequences must be nonnegative")
     if not 0 <= args.prefix_fraction < 1:
         parser.error("prefix-fraction must be in [0, 1)")
     load_dotenv(".env")
@@ -144,10 +149,9 @@ def main() -> None:
             },
         }
         args.evidence.parent.mkdir(parents=True, exist_ok=True)
+        count = args.sequences or (2 if args.pairs else 1)
         workloads = [
-            ([length, length], int(length * args.prefix_fraction))
-            if args.pairs
-            else ([length], 0)
+            ([length] * count, int(length * args.prefix_fraction) if count > 1 else 0)
             for length in args.tokens
         ]
         if args.reported_pair:
@@ -184,6 +188,7 @@ def main() -> None:
                     "shared_prefix": prefix,
                     "logical_tokens": plan.logical_tokens,
                     "packed_tokens": plan.packed_tokens,
+                    "grad_segment_count": plan.grad_segment_count,
                     "output_bytes": plan.output_bytes,
                     "selected_max_depth": plan.selected_max_depth,
                     "memory_minimal": memory_minimal,
