@@ -5831,6 +5831,91 @@ def test_template_change_rerenders_scaffold_but_preserves_sampled_output() -> No
     assert tokenized.flags[1] == (_SAMPLED_ASSISTANT_OUTPUT)
 
 
+def test_complete_sampled_tool_call_replaces_rendered_closing_markup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "art.trajectories._tokenize._WARNED_PREFIX_RETOKENIZATION", False
+    )
+
+    class ToolTokenizer(_CharacterTemplateTokenizer):
+        def __call__(self, text: str, **kwargs: object) -> dict[str, object]:
+            return {"input_ids": self._encode(text)}
+
+        def apply_chat_template(
+            self,
+            messages: list[dict[str, Any]],
+            *,
+            tokenize: bool = True,
+            add_generation_prompt: bool,
+            **kwargs: object,
+        ) -> str | list[int]:
+            text = ""
+            for message in messages:
+                if message["role"] == "user":
+                    text += f"<u>{message['content']}</u>"
+                else:
+                    function = message["tool_calls"][0]["function"]
+                    text += (
+                        f"<a>{message.get('reasoning', '')}"
+                        f"<tool name={function['name']}>"
+                        f"{function['arguments']}</tool>§"
+                    )
+            if add_generation_prompt:
+                text += "<a>"
+            return self._encode(text) if tokenize else text
+
+    tokenizer = ToolTokenizer()
+    prompt = tokenizer._encode("<u>turn 0</u><a>")
+    output = tokenizer._encode('thought\n<native name=lookup>{"x":1}</native>§')
+    exchange = _chat_exchange(prompt, output)
+    data = exchange.response.model_dump(mode="python")
+    data["choices"][0].update(
+        finish_reason="tool_calls",
+        message={
+            "role": "assistant",
+            "content": None,
+            "reasoning": "thought\n",
+            "tool_calls": [
+                {
+                    "id": "call-1",
+                    "type": "function",
+                    "function": {"name": "lookup", "arguments": '{"x":1}'},
+                }
+            ],
+        },
+    )
+    exchange.response = ChatCompletion.model_validate(data)
+    next_prompt = [*prompt, *output, *tokenizer._encode("<u>continue</u><a>")]
+    following = _chat_exchange(next_prompt, output, offset=1)
+    following.request["messages"] = [
+        {"role": "user", "content": "turn 0"},
+        cast(ChatCompletionMessageParam, data["choices"][0]["message"]),
+        {"role": "user", "content": "continue"},
+    ]
+    following_data = following.response.model_dump(mode="python")
+    following_data["choices"][0].update(
+        finish_reason="tool_calls", message=data["choices"][0]["message"]
+    )
+    following.response = ChatCompletion.model_validate(following_data)
+    history = art.Trajectory(
+        exchanges=TrajectoryExchanges(chat_completions=[exchange, following])
+    ).chat_completions_history()
+    history.chat_template = "rerender"
+
+    with pytest.warns(UserWarning, match="preserved the original sampled token IDs"):
+        tokenized = history.tokenize(tokenizer=tokenizer)
+
+    assert tokenized.tokens == [*next_prompt, *output]
+    assert tokenized.logprobs[len(prompt) : len(prompt) + len(output)] == [
+        -token / 10 for token in output
+    ]
+    assert tokenized.flags[len(prompt) : len(prompt) + len(output)] == [
+        _SAMPLED_ASSISTANT_OUTPUT | (tr.TokenFlag.STOP if token == 9 else 0)
+        for token in output
+    ]
+
+
 def test_template_change_preserves_complete_exact_sampled_suffix() -> None:
     exchange = _chat_exchange([1], [2, 3])
     history = art.Trajectory(
@@ -8312,6 +8397,8 @@ def test_exchange_training_requires_logprobs_unless_allowed() -> None:
         ("7", None),
         ("0", "missing_stop"),
         ("0", "wrong_stop"),
+        ("0", "extra_boundary_newline"),
+        ("0", "extra_boundary_text"),
         ("0", "changed_sampled_token"),
         ("7", "changed_sampled_token"),
         ("7", "unrendered_sampled_token"),
@@ -8389,13 +8476,20 @@ def test_length_boundary_preserves_output_despite_probe_suffix_collision(
         prompt.remove(9)
     elif corruption == "wrong_stop":
         prompt[prompt.index(9)] = tokenizer._encode("!")[0]
+    elif corruption in {"extra_boundary_newline", "extra_boundary_text"}:
+        boundary_start = len(first_choice.model_extra["prompt_token_ids"]) + len(
+            first_choice.model_extra["token_ids"]
+        )
+        prompt[boundary_start:boundary_start] = tokenizer._encode(
+            "\n" if corruption == "extra_boundary_newline" else "!"
+        )
     elif corruption in {"changed_sampled_token", "unrendered_sampled_token"}:
         prefix = first_choice.model_extra["prompt_token_ids"]
         prompt[len(prefix)] = tokenizer._encode("!")[0]
     trajectory = art.Trajectory(
         exchanges=TrajectoryExchanges(chat_completions=exchanges)
     )
-    if corruption in {"missing_stop", "wrong_stop"}:
+    if corruption in {"missing_stop", "wrong_stop", "extra_boundary_text"}:
         with pytest.raises(ValueError, match="Could not uniquely locate"):
             _tokenize_trajectory_with_trace(trajectory, tokenizer=tokenizer)
         return
