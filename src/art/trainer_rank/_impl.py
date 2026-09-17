@@ -2901,6 +2901,9 @@ class TrainerRank:
             output_bytes=output_bytes,
             signature=signature,
             logical_tokens=logical_tokens,
+            # The average CP load is an optimistic bound, not an admission cost.
+            retained_tokens=(packed_tokens + signature.topology[2] - 1)
+            // signature.topology[2],
         )
         profile = self._memory_profiles.get(signature)
         if (
@@ -2934,6 +2937,7 @@ class TrainerRank:
             signature=plan.signature,
             logical_tokens=plan.active_logical_tokens,
             gdn_segments=plan.grad_segment_count,
+            retained_tokens=self._plan_retained_tokens(plan),
         )
 
     def _subforward_cost(
@@ -2944,6 +2948,7 @@ class TrainerRank:
         signature: _MemorySignature,
         logical_tokens: int,
         gdn_segments: int = 0,
+        retained_tokens: int | None = None,
     ) -> _SubforwardCost:
         required = self._estimate_required_memory_bytes_from_values(
             packed_tokens=packed_tokens,
@@ -2951,6 +2956,7 @@ class TrainerRank:
             signature=signature,
             logical_tokens=logical_tokens,
             gdn_segments=gdn_segments,
+            retained_tokens=retained_tokens,
         )
         retained = self._retained_memory_bytes(
             signature,
@@ -4630,6 +4636,15 @@ class TrainerRank:
                 checkpoint=checkpoint,
                 ensure_slots=not sync_planning_errors,
             )
+            if (
+                self._topology_key()[2] > 1
+                and self._recompute_granularity != "full"
+                and not self._geometry.moe_experts
+                and any(grad for (_, grad), _ in groups)
+            ):
+                # CP token ownership can be uneven. Use the existing exact-plan
+                # fallback; a global token count alone cannot price its peak.
+                return None
             packed_tokens = 0
             for (_slot, grad_enabled), group_indices in groups:
                 if exact:
@@ -5096,6 +5111,7 @@ class TrainerRank:
                 signature=forward.signature,
                 logical_tokens=forward.active_logical_tokens,
                 gdn_segments=forward.grad_segment_count,
+                retained_tokens=self._plan_retained_tokens(forward),
             )
         return self._memory_check_required(required, sync_across_dp=sync_across_dp)
 
@@ -5150,6 +5166,24 @@ class TrainerRank:
         except (AssertionError, ImportError, RuntimeError, ValueError):
             return None
 
+    def _plan_retained_tokens(self, plan: _FlatForwardPlan) -> int:
+        if (
+            plan.signature.topology[2] <= 1
+            or not plan.signature.grad_enabled
+            or self._recompute_granularity == "full"
+            or self._geometry.moe_experts
+        ):
+            return plan.packed_tokens
+        topology = self._topology()
+        # Bound each group's largest attention/GDN layout, including TP padding.
+        # Groups can place their peak on different ranks; summing is conservative.
+        return sum(
+            self._physical_tokens(
+                max(1, self._max_rank_model_tokens(group.packed, topology=topology))
+            )
+            for group in plan.groups
+        )
+
     def _estimate_required_memory_bytes_from_values(
         self,
         *,
@@ -5158,6 +5192,7 @@ class TrainerRank:
         signature: _MemorySignature,
         logical_tokens: int | None = None,
         gdn_segments: int = 0,
+        retained_tokens: int | None = None,
     ) -> int:
         if packed_tokens <= 0:
             return output_bytes
@@ -5256,7 +5291,13 @@ class TrainerRank:
                 # native kernel initialization; a slope alone misses short inputs.
                 64 * 2**20
                 + gdn_state_bytes
-                + packed_tokens * self._param_dtype_size * retained_features,
+                + (
+                    packed_tokens
+                    if retained_tokens is None or geometry.moe_experts
+                    else retained_tokens
+                )
+                * self._param_dtype_size
+                * retained_features,
             )
         # Groups execute sequentially: summed packed rows conservatively bound
         # this FC2 component, not all workspace or retained graphs.
@@ -5954,7 +5995,9 @@ class TrainerRank:
             _pad_packed_batch(batch, multiple=int(topology.tp)) for batch in batches
         )
         sequence_length = max(int(batch.tokens.shape[1]) for batch in padded)
-        rows = tuple(self._hybridep_rows(batch, topology=topology) for batch in padded)
+        rows = tuple(
+            self._max_rank_model_tokens(batch, topology=topology) for batch in padded
+        )
         current = fused_a2a._hybrid_ep_buffer
         live = self._has_live_hybridep_graphs()
         # The buffer must hold the busiest rank's planned rows: cost-aware CP
@@ -6019,7 +6062,7 @@ class TrainerRank:
 
         _set_hybridep_token_count(rows)
 
-    def _hybridep_rows(
+    def _max_rank_model_tokens(
         self,
         batch: PrefixTreePack,
         *,

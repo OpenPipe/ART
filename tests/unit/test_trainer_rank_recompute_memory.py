@@ -368,3 +368,76 @@ def test_short_hybrid_pairs_pay_for_recurrent_states(monkeypatch):
     )
     assert inactive.grad_segment_count == 2
     assert rank._memory_check(inactive).estimated_required_bytes == estimate
+
+
+@pytest.mark.parametrize("granularity", (None, "selective"))
+def test_cp_prices_uneven_local_tokens_and_preserves_segment_states(
+    monkeypatch, granularity
+):
+    rank = _hybrid_rank(monkeypatch, 2)
+    rank._recompute_granularity = granularity
+    monkeypatch.setattr(rank, "_topology_key", lambda: (1, 2, 4, 1))
+    monkeypatch.setattr(rank, "_topology", lambda: SimpleNamespace(cp=4))
+    # An uneven plan puts 3/4 of the rows on one rank, including TP padding.
+    monkeypatch.setattr(
+        rank, "_max_rank_model_tokens", lambda batch, **_: batch.tokens.numel() * 3 // 4
+    )
+    requests = [ForwardInput(input_tokens=torch.arange(4097), hidden_states=True)]
+    plan = rank._plan_flat_forward(requests)
+    assert rank._plan_retained_tokens(plan) == 3072
+    estimate = rank._memory_check(plan).estimated_required_bytes
+    assert rank._plan_cost(plan).required == estimate
+    values = dict(
+        packed_tokens=plan.packed_tokens,
+        output_bytes=plan.output_bytes,
+        signature=plan.signature,
+        gdn_segments=plan.grad_segment_count,
+    )
+    price = rank._estimate_required_memory_bytes_from_values
+    assert price(**values, retained_tokens=1026) < estimate < price(**values)
+    state_costs = [
+        price(**values, retained_tokens=n)
+        - price(**{**values, "gdn_segments": 0}, retained_tokens=n)
+        for n in (1026, 3072, plan.packed_tokens)
+    ]
+    assert max(state_costs) - min(state_costs) <= 1
+    assert min(state_costs) > 0
+    rank._memory_profiles[plan.signature] = _MemoryProfile(0, plan.packed_tokens)
+    assert rank._memory_check(plan).estimated_required_bytes == estimate
+    # Width selection must reach exact CP pricing even when the old global
+    # token bound would refuse. Both ordinary and memory-minimal probes defer.
+    for exact in (False, True):
+        assert rank._estimate_flat_forward(requests, exact=exact) is None
+    monkeypatch.setattr(rank, "_dp_rank_and_size", lambda: (0, 1))
+    monkeypatch.setattr(rank, "_available_memory_bytes", lambda: estimate)
+    assert rank._search_next_micro_batch(requests, 0).check.fits
+    from art.trainer_rank._impl import Unset
+
+    lower = rank._split_chunk_lower_cost(
+        requests, [requests[0].input_tokens], checkpoint=Unset
+    )
+    assert lower.required <= estimate
+
+
+@pytest.mark.parametrize("kind", ("full", "no_grad", "moe"))
+def test_cp_keeps_existing_full_no_grad_and_moe_costs(monkeypatch, kind):
+    rank = _rank(
+        "full" if kind == "full" else "selective",
+        **({"num_moe_experts": 64} if kind == "moe" else {}),
+    )
+    monkeypatch.setattr(rank, "_topology_key", lambda: (1, 1, 2, 1))
+    monkeypatch.setattr(
+        rank,
+        "_max_rank_model_tokens",
+        lambda *a, **kw: pytest.fail("unexpected CP plan"),
+    )
+    plan = _plan(rank, no_grad=kind == "no_grad")
+    assert rank._plan_retained_tokens(plan) == plan.packed_tokens
+    assert rank._memory_check(plan).estimated_required_bytes == (
+        rank._estimate_required_memory_bytes_from_values(
+            packed_tokens=plan.packed_tokens,
+            output_bytes=plan.output_bytes,
+            signature=plan.signature,
+            gdn_segments=plan.grad_segment_count,
+        )
+    )
