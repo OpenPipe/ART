@@ -24,7 +24,6 @@ from pydantic import BaseModel
 
 from ..utils.chat_template import (
     chat_template_with_preserved_thinking,
-    configure_preserved_thinking_chat_template,
     default_chat_template_kwargs_for_template,
     normalize_tool_call_arguments_for_chat_template,
 )
@@ -56,9 +55,6 @@ from . import (
 )
 from ._history import _model_matches
 from ._protocols import Exchange
-
-if TYPE_CHECKING:
-    from transformers import PreTrainedTokenizerBase
 
 _TOKEN_ID = re.compile(r"token_id:(\d+)$")
 _WARNED_PREFIX_RETOKENIZATION = False
@@ -1607,22 +1603,10 @@ def _tokenizer_config(model: str, base_model: str | None) -> _TokenizerConfig:
 
 @lru_cache(maxsize=8)
 def _cached_tokenizer(base_model: str, revision: str | None) -> Tokenizer:
-    try:
-        from transformers import AutoTokenizer
-    except ImportError as exc:
-        raise RuntimeError(
-            "Tokenizer fallback requires ART's backend or tinker dependencies"
-        ) from exc
-    try:
-        tokenizer = AutoTokenizer.from_pretrained(
-            base_model,
-            revision=revision,
-        )
-        if base_model.startswith("deepseek-ai/DeepSeek-V4-"):
-            from ..megatron.dsv4.tokenizer import get_dsv4_tokenizer
+    from ..tokenizer import get_tokenizer
 
-            tokenizer = get_dsv4_tokenizer(cast("PreTrainedTokenizerBase", tokenizer))
-        return _as_tokenizer(configure_preserved_thinking_chat_template(tokenizer))
+    try:
+        return _as_tokenizer(get_tokenizer(base_model, revision=revision))
     except Exception as exc:
         raise ValueError(
             f"Could not load tokenizer for {base_model!r}; pass base_model explicitly"
@@ -5592,6 +5576,10 @@ def _tokenize_chat_view(
                         "Could not prove a sampled history message boundary with this "
                         "tokenizer"
                     )
+        if content_bounds_proven:
+            assert sampled_bounds is not None
+            # Proven message bounds outrank approximate matches in earlier context.
+            search_cursor = sampled_bounds[0]
         full_matches = (
             locations(full_exact, search_cursor) if sampled and full_exact else []
         )

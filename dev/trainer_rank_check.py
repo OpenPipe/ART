@@ -226,34 +226,10 @@ def _local_outputs(
     rank: TrainerRank,
     indexed_requests: Sequence[tuple[int, ForwardInput]],
 ) -> list[dict[str, object]]:
-    from art.megatron.lora import use_lora_slot
-
-    requests = [request for _, request in indexed_requests]
-    plan = rank._plan_flat_forward(requests)
-    outputs: list[ForwardOutput] = [
-        ForwardOutput(None, None, None, None) for _ in requests
-    ]
-    sources: list[torch.Tensor] = [torch.empty(0, dtype=torch.long) for _ in requests]
-    for group in plan.groups:
-        prepared = rank._prepare_packed_forward(group.packed)
-        with use_lora_slot(group.slot_ref):
-            group_outputs = rank._forward_packed(group.items, prepared)
-        for index, source, output in zip(
-            group.request_indices,
-            prepared.source_positions_by_item,
-            group_outputs,
-            strict=True,
-        ):
-            sources[index] = source
-            outputs[index] = output
+    outputs = rank.dp_rank_forward([request for _, request in indexed_requests])
     return [
-        _output_record(global_index, source, output)
-        for (global_index, _), source, output in zip(
-            indexed_requests,
-            sources,
-            outputs,
-            strict=True,
-        )
+        _output_record(index, torch.arange(request.input_tokens.numel()), output)
+        for (index, request), output in zip(indexed_requests, outputs, strict=True)
     ]
 
 

@@ -38,16 +38,19 @@ class InMemoryPackedBatch(BaseModel):
             self._mapped = None
 
 
-class SFTBatchData(BaseModel):
-    """Typed in-memory SFT payload sent directly to warm trainer actors."""
-
+class _SFTBatchStats(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True, extra="forbid", frozen=True)
 
-    trajectory_tensors: tuple[dict[str, Any], ...]
     learning_rate: float
     num_trajectories: int
     num_tokens: int
     num_trainable_tokens: int
+
+
+class SFTBatchData(_SFTBatchStats):
+    """One tokenized optimizer batch, before trainer-specific packing."""
+
+    trajectory_tensors: tuple[dict[str, Any], ...]
 
     @model_validator(mode="after")
     def _validate_trajectories(self) -> "SFTBatchData":
@@ -61,6 +64,26 @@ class SFTBatchData(BaseModel):
         if self.num_tokens < 1 or self.num_trainable_tokens < 1:
             raise ValueError("SFT batch must contain trainable tokens")
         return self
+
+
+class PackedSFTBatchData(_SFTBatchStats):
+    """Packed microbatches belonging to exactly one optimizer update."""
+
+    rows: tuple[dict[str, Any], ...]
+
+
+def pack_sft_batches(
+    batches: tuple[SFTBatchData, ...], *, seq_len: int
+) -> tuple[PackedSFTBatchData, ...]:
+    from art.preprocessing.sft import pack_sft_batch
+
+    return tuple(
+        PackedSFTBatchData(
+            **batch.model_dump(exclude={"trajectory_tensors"}),
+            rows=pack_sft_batch(batch.trajectory_tensors, seq_len=seq_len),
+        )
+        for batch in batches
+    )
 
 
 def validate_packed_batch(batch: InMemoryPackedBatch) -> None:

@@ -9,6 +9,7 @@ def apply_vllm_runtime_patches() -> None:
         patch_gemma4_moe_lora_support,
     )
     from art_vllm_runtime.glm52_patches import apply_glm52_vllm_runtime_patches
+    from art_vllm_runtime.history import patch_history
     from art_vllm_runtime.moe_lora_patches import (
         patch_local_3d_moe_dummy_lora,
         patch_small_batch_moe_lora_intermediate_dtype,
@@ -19,6 +20,7 @@ def apply_vllm_runtime_patches() -> None:
     patch_policy_token_spans()
     patch_gemma4_moe_lora_support()
     subclass_chat_completion_request()
+    patch_history()
     patch_nonstreaming_chat_response_offload()
     patch_local_3d_moe_dummy_lora()
     patch_small_batch_moe_lora_intermediate_dtype()

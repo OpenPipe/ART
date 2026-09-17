@@ -185,6 +185,8 @@ class _LocalLoRASlotRef:
 
 @dataclass(frozen=True)
 class ForwardOutput(Generic[LogprobsT, TopKT, LogitsT, HiddenStatesT]):
+    """Per-request tensors in flattened input order, replicated across TP/CP."""
+
     target_logprobs: LogprobsT
     top_k: TopKT
     logits: LogitsT
@@ -615,6 +617,34 @@ class _SlotGraphSentinel(torch.autograd.Function):
         return grad_outputs[0], None
 
 
+class _GatherContextParallelRows(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx: FunctionCtx,
+        tensor: torch.Tensor,
+        positions: torch.Tensor,
+        length: int,
+        group: dist.ProcessGroup,
+    ) -> torch.Tensor:
+        ctx.save_for_backward(positions)
+        # Each source row has one owner. Scatter + SUM handles unequal/empty
+        # shards without padded all-gather buffers, including for full logits.
+        output = tensor.new_zeros((length, *tensor.shape[1:]))
+        output.index_copy_(0, positions, tensor)
+        dist.all_reduce(output, group=group)
+        return output
+
+    @staticmethod
+    def backward(
+        ctx: FunctionCtx, *grad_outputs: torch.Tensor
+    ) -> tuple[torch.Tensor, None, None, None]:
+        (positions,) = cast(tuple[torch.Tensor, ...], getattr(ctx, "saved_tensors"))
+        # The caller's loss is replicated over CP, just as over TP after the
+        # sequence-parallel gather with tensor_parallel_output_grad=False.
+        # Route one copy to its owner, without summing CP copies of the loss.
+        return grad_outputs[0].index_select(0, positions), None, None, None
+
+
 class _CustomSlotGraphSentinel(torch.autograd.Function):
     @staticmethod
     def forward(
@@ -867,6 +897,7 @@ class _PreparedPackedForward:
     packed_seq_params: "PackedSeqParams | None"
     positions_by_item: tuple[torch.Tensor, ...]
     source_positions_by_item: tuple[torch.Tensor, ...]
+    context_parallel_group: dist.ProcessGroup | None = None
 
 
 type _RowMatch = tuple[torch.Tensor, torch.Tensor, tuple[int, ...]]
@@ -910,6 +941,12 @@ class _FlatForwardPlan:
     def active_logical_tokens(self) -> int:
         # Keep total-input telemetry while pricing only executed requests.
         return self.logical_tokens - self.inactive_logical_tokens
+
+    @property
+    def grad_segment_count(self) -> int:
+        return sum(
+            len(group.packed.segments) for group in self.groups if group.grad_enabled
+        )
 
     @property
     def subforward_count(self) -> int:
@@ -1639,8 +1676,8 @@ class TrainerRank:
         # gradient reduction pre-date the planner, memory checks all-reduce
         # within the TP x CP group, the memory profile is keyed by topology so
         # TP calibrates itself online, and the fitted layout cost model prices
-        # TP explicitly. Known limitation: the cold static memory estimate
-        # ignores sharding (conservative).
+        # TP explicitly. The cold retained-activation floor also distinguishes
+        # tensor/sequence-parallel storage from gathered LoRA inputs.
         self.runtime: TrainingRuntime = runtime
         self.device: torch.device = next(runtime.model[0].parameters()).device
         self._param_dtype_size = _dtype_size(next(runtime.model[0].parameters()).dtype)
@@ -1656,6 +1693,28 @@ class TrainerRank:
             getattr(getattr(metadata_model, "config", None), "num_layers", 0)
             or getattr(runtime.provider, "num_layers", 1)
             or 1
+        )
+        memory_config = getattr(metadata_model, "config", None) or runtime.provider
+
+        def memory_field(name: str, default: Any = None) -> Any:
+            return getattr(
+                memory_config, name, getattr(runtime.provider, name, default)
+            )
+
+        self._recompute_granularity = memory_field("recompute_granularity", None)
+        self._recompute_modules: frozenset[str] = frozenset(
+            memory_field("recompute_modules", ()) or ()
+        )
+        self._sequence_parallel = bool(memory_field("sequence_parallel", False))
+        self._attention_output_gate = bool(memory_field("attention_output_gate", False))
+        # Native fused SwiGLU retains gate/up and the output (3F). Eager
+        # unfused SwiGLU also retains SiLU and offset tensors (5F). Compilation
+        # may fall back, so only the native fusion setting earns this discount.
+        self._mlp_activation_factor = (
+            3
+            if memory_field("bias_activation_fusion", False)
+            and not memory_field("use_te_activation_func", False)
+            else 5 + 2 * (memory_field("activation_func_clamp_value", None) is not None)
         )
         # Layers that run the gated-delta-net path (Qwen3.5-4B: 24 of 32); the
         # cost model prices GDN state hand-offs per GDN layer, not per layer.
@@ -1677,6 +1736,10 @@ class TrainerRank:
             )
         spec = getattr(runtime, "model_support_spec", None)
         self._moe_layers = _moe_layer_count(runtime.model[0])
+        self._checkpointed_moe_layers = sum(
+            getattr(module, "moe_layer_recompute", False) is True
+            for module in runtime.model[0].modules()
+        )
         is_moe = bool(
             self._moe_layers
             or getattr(spec, "is_moe", False)
@@ -3184,6 +3247,9 @@ class TrainerRank:
             logical_tokens=logical_tokens,
             group_rows=tuple(group_rows),
             head_workspace_bytes=head_workspace_bytes,
+            # The average CP load is an optimistic bound, not an admission cost.
+            retained_tokens=(packed_tokens + signature.topology[2] - 1)
+            // signature.topology[2],
         )
         profile = self._memory_profiles.get(signature)
         if (
@@ -3527,10 +3593,13 @@ class TrainerRank:
         Count actual local full/uniform/1 boundaries, including aliases, rather
         than claiming measured distinct storage. Only this call's new groups
         enter the term; already-live graphs remain in the availability baseline.
+        No-grad calls also keep decoder input, current layer input, its MLP
+        residual and norm output across the MoE stage. Count these four row
+        tensors separately from returned outputs, allowing storage aliases.
         This is not a bound for custom preprocessing, attention, or all backward.
         """
         gradient_rows = sum(rows for rows, grad in group_rows if grad)
-        if not gradient_rows or len(self.runtime.model) != 1:
+        if not group_rows or len(self.runtime.model) != 1:
             return 0, 0
         try:
             decoder = _language_model(self.runtime.model[0]).decoder
@@ -3587,6 +3656,7 @@ class TrainerRank:
         self._checkpoint_moe_bytes_per_token()
         workspace = max(
             self._moe_workspace_bytes(rows, checkpoint_grad=grad)
+            + (0 if gradient_rows else 4 * rows * self._hidden_size * 2)
             for rows, grad in group_rows
         )
         return retained, workspace
@@ -3597,9 +3667,11 @@ class TrainerRank:
             output_bytes=plan.output_bytes,
             signature=plan.signature,
             logical_tokens=plan.active_logical_tokens,
+            gdn_segments=plan.grad_segment_count,
             group_rows=self._plan_group_rows(plan),
             head_workspace_bytes=self._plan_head_workspace_bytes(plan),
             checkpoint_floor=_gdn_memory.plan_floor(self, plan),
+            retained_tokens=self._plan_retained_tokens(plan),
         )
 
     def _subforward_cost(
@@ -3609,18 +3681,22 @@ class TrainerRank:
         output_bytes: int,
         signature: _MemorySignature,
         logical_tokens: int,
+        gdn_segments: int = 0,
         group_rows: tuple[tuple[int, bool], ...] = (),
         head_workspace_bytes: int = 0,
         checkpoint_floor: tuple[int, int] = (0, 0),
+        retained_tokens: int | None = None,
     ) -> _SubforwardCost:
         required = self._estimate_required_memory_bytes_from_values(
             packed_tokens=packed_tokens,
             output_bytes=output_bytes,
             signature=signature,
             logical_tokens=logical_tokens,
+            gdn_segments=gdn_segments,
             group_rows=group_rows,
             head_workspace_bytes=head_workspace_bytes,
             checkpoint_floor=checkpoint_floor,
+            retained_tokens=retained_tokens,
         )
         retained = self._retained_memory_bytes(
             signature,
@@ -3751,10 +3827,11 @@ class TrainerRank:
         self._guard_forward_collective("dp_reduce")
         from megatron.core import parallel_state as ps
 
+        # Public outputs are CP-replicated; internal shard reductions still include CP.
         dist.all_reduce(
             tensor,
             op=op,
-            group=ps.get_data_parallel_group(with_context_parallel=True),
+            group=ps.get_data_parallel_group(with_context_parallel=False),
         )
 
     def optim_step(
@@ -4526,6 +4603,10 @@ class TrainerRank:
         for param, grad in zip(params, grads, strict=True):
             if bool(getattr(param, "allreduce", True)):
                 group = ps.get_data_parallel_group(with_context_parallel=True)
+                if getattr(param, "_art_custom_checkpoint_param", False):
+                    # Custom heads consume replicated full-sequence outputs;
+                    # average their CP copies while still summing DP batches.
+                    grad.div_(ps.get_context_parallel_world_size())
             else:
                 group = ps.get_expert_data_parallel_group()
             if group is not None and group.size() > 1:
@@ -4621,6 +4702,12 @@ class TrainerRank:
                         output_bytes=output_bytes,
                         signature=signature,
                         logical_tokens=logical_tokens,
+                        # A radix tree has fewer than twice as many segments as
+                        # active requests; the exact plan uses its actual count.
+                        gdn_segments=2
+                        * sum(
+                            _request_mix_key(r) != "inactive" for r in local_requests
+                        ),
                         group_rows=group_rows,
                         head_workspace_bytes=head_workspace_bytes,
                     )
@@ -5306,6 +5393,15 @@ class TrainerRank:
                 # Pending saves require the actual bucket/replayed-tail geometry.
                 # Existing unavailable handling materializes before admission.
                 return None
+            if (
+                self._topology_key()[2] > 1
+                and self._recompute_granularity != "full"
+                and not self._geometry.moe_experts
+                and any(grad for (_, grad), _ in groups)
+            ):
+                # CP token ownership can be uneven. Use the existing exact-plan
+                # fallback; a global token count alone cannot price its peak.
+                return None
             packed_tokens = 0
             head_workspace_bytes = 0
             group_rows: list[tuple[int, bool]] = []
@@ -5833,9 +5929,11 @@ class TrainerRank:
                 output_bytes=forward.output_bytes,
                 signature=forward.signature,
                 logical_tokens=forward.active_logical_tokens,
+                gdn_segments=forward.grad_segment_count,
                 group_rows=self._plan_group_rows(forward),
                 head_workspace_bytes=self._plan_head_workspace_bytes(forward),
                 checkpoint_floor=_gdn_memory.plan_floor(self, forward),
+                retained_tokens=self._plan_retained_tokens(forward),
             )
         return self._memory_check_required(required, sync_across_dp=sync_across_dp)
 
@@ -5890,6 +5988,30 @@ class TrainerRank:
         except (AssertionError, ImportError, RuntimeError, ValueError):
             return None
 
+    def _plan_retained_tokens(self, plan: _FlatForwardPlan) -> int:
+        if (
+            plan.signature.topology[2] <= 1
+            or not plan.signature.grad_enabled
+            or self._recompute_granularity == "full"
+            or self._geometry.moe_experts
+        ):
+            return plan.packed_tokens
+        topology = self._topology()
+        # Bound each group's largest attention/GDN layout, including TP padding.
+        # Groups can place their peak on different ranks; summing is conservative.
+        return sum(
+            self._physical_tokens(
+                max(
+                    1,
+                    self._max_rank_model_tokens(
+                        _pad_packed_batch(group.packed, multiple=int(topology.tp)),
+                        topology=topology,
+                    ),
+                )
+            )
+            for group in plan.groups
+        )
+
     def _estimate_required_memory_bytes_from_values(
         self,
         *,
@@ -5897,9 +6019,11 @@ class TrainerRank:
         output_bytes: int,
         signature: _MemorySignature,
         logical_tokens: int | None = None,
+        gdn_segments: int = 0,
         group_rows: tuple[tuple[int, bool], ...] = (),
         head_workspace_bytes: int = 0,
         checkpoint_floor: tuple[int, int] = (0, 0),
+        retained_tokens: int | None = None,
     ) -> int:
         if packed_tokens <= 0:
             return output_bytes
@@ -5911,9 +6035,114 @@ class TrainerRank:
             * self._param_dtype_size
             * activation_factor
         )
+        if signature.grad_enabled and self._recompute_granularity != "full":
+            geometry = self._geometry
+            hidden = self._hidden_size
+            tp = max(1, self._topology_key()[1])
+            sp = tp if self._sequence_parallel else 1
+            # Gathered LoRA inputs alias norm output without sequence sharding.
+            gathered = hidden if sp > 1 else 0
+            common = 2 * hidden / sp + gathered
+            attention_width = (
+                geometry.num_attention_heads * geometry.kv_channels or hidden
+            )
+            kv_width = geometry.num_query_groups * geometry.kv_channels or hidden
+            gated = self._attention_output_gate
+            attention = (
+                common + ((7 if gated else 5) * attention_width + 3 * kv_width) / tp
+            )
+            if 0 < geometry.num_query_groups < tp:
+                # SelfAttentionLinearQKVLoRA constructs global QKV before
+                # slicing it when KV groups cannot be partitioned across TP.
+                attention += ((2 if gated else 1) * attention_width + 2 * kv_width) * (
+                    1 - 1 / tp
+                )
+            gdn = (
+                common
+                + (
+                    4 * geometry.gdn_key_heads * geometry.gdn_key_head_dim
+                    + 8 * geometry.gdn_value_heads * geometry.gdn_value_head_dim
+                )
+                / tp
+            )
+            ffn_width = geometry.ffn_hidden_size or 4 * hidden
+            mlp = common + self._mlp_activation_factor * ffn_width / tp
+            if geometry.moe_experts:
+                # Keep the worst-case dispatch envelope: random-weight runs
+                # cannot establish an EP discount for pretrained routing.
+                ffn_width = (
+                    geometry.moe_topk * geometry.moe_ffn_hidden_size
+                    + geometry.moe_shared_expert_ffn
+                ) or ffn_width
+                mlp = (
+                    common + 6 * ffn_width + 2 * hidden * max(0, geometry.moe_topk - 1)
+                )
+            gdn_layers = min(self._num_layers, self._gdn_layers)
+            retained_features = (
+                (self._num_layers - gdn_layers) * attention
+                + gdn_layers * gdn
+                + self._num_layers * mlp
+            )
+            if self._recompute_granularity == "selective":
+                checkpointed = (
+                    self._checkpointed_moe_layers
+                    if geometry.moe_experts
+                    else self._num_layers
+                    if "mlp" in self._recompute_modules
+                    else 0
+                )
+                # Checkpoints keep their input (and MoE's external norm); one
+                # live MLP still needs workspace, including worst-case dispatch.
+                checkpoint_input = (2 if geometry.moe_experts else 1) * hidden / sp
+                retained_features -= max(0, checkpointed - 1) * (mlp - checkpoint_input)
+            # Each GDN segment can retain an initial and a final recurrent
+            # state (fp32), plus convolution history. Unlike token activations,
+            # these do not shrink with segment length.
+            gdn_state_bytes = (
+                2
+                * gdn_segments
+                * gdn_layers
+                / tp
+                * (
+                    4
+                    * geometry.gdn_value_heads
+                    * geometry.gdn_key_head_dim
+                    * geometry.gdn_value_head_dim
+                    + self._param_dtype_size
+                    * (
+                        2 * geometry.gdn_key_heads * geometry.gdn_key_head_dim
+                        + geometry.gdn_value_heads * geometry.gdn_value_head_dim
+                    )
+                    * max(0, geometry.gdn_conv_kernel - 1)
+                )
+            )
+            static_compute = max(
+                static_compute,
+                # Cold eager runs allocate ~58 MiB beyond warm retention for
+                # native kernel initialization; a slope alone misses short inputs.
+                64 * 2**20
+                + gdn_state_bytes
+                + (
+                    packed_tokens
+                    if retained_tokens is None or geometry.moe_experts
+                    else retained_tokens
+                )
+                * self._param_dtype_size
+                * retained_features,
+            )
         # Groups execute sequentially: summed packed rows conservatively bound
         # this FC2 component, not all workspace or retained graphs.
         static_compute = max(static_compute, self._moe_workspace_bytes(packed_tokens))
+        retained, workspace = self._checkpoint_memory_floor(group_rows)
+        static_compute = max(
+            static_compute,
+            max(retained, checkpoint_floor[0])
+            + max(workspace, head_workspace_bytes, checkpoint_floor[1]),
+        )
+        if signature.topology[2] > 1:
+            # Local head results coexist with full CP outputs during gathering.
+            # Uneven rank plans can assign all of an item's rows to one rank.
+            static_compute += output_bytes
         # A profile learned under lighter sharing (lower logical/packed ratio)
         # underestimates the per-packed-token footprint of a deeper-shared
         # plan; scale the trusted estimate up by the ratio gap.
@@ -5934,12 +6163,6 @@ class TrainerRank:
                 static_compute,
                 int(profiled.bytes_per_token * profiled_tokens),
             )
-        retained, workspace = self._checkpoint_memory_floor(group_rows)
-        compute = max(
-            compute,
-            max(retained, checkpoint_floor[0])
-            + max(workspace, head_workspace_bytes, checkpoint_floor[1]),
-        )
         return int((output_bytes + compute) * _MEMORY_SAFETY_FACTOR)
 
     def _available_memory_bytes(self) -> int:
@@ -6112,7 +6335,67 @@ class TrainerRank:
         hidden_by_row = self._gather_sequence_parallel_hidden(
             self._decoder_hidden(prepared)
         )
-        return self._project_head(items, prepared, hidden_by_row)
+        outputs = self._project_head(items, prepared, hidden_by_row)
+        group = prepared.context_parallel_group
+        if group is None:
+            return outputs
+        tensors = [
+            tensor
+            for output in outputs
+            for tensor in (
+                output.target_logprobs,
+                output.logits,
+                output.hidden_states,
+                None if output.top_k is None else output.top_k.logprobs,
+                None if output.top_k is None else output.top_k.tokens,
+            )
+            if tensor is not None
+        ]
+        grad_flags = [False for _ in tensors]
+        if torch.is_grad_enabled():
+            flags = torch.tensor(
+                [
+                    tensor.is_floating_point()
+                    and (tensor.requires_grad or hidden_by_row.requires_grad)
+                    for tensor in tensors
+                ],
+                device=hidden_by_row.device,
+                dtype=torch.int32,
+            )
+            dist.all_reduce(flags, op=dist.ReduceOp.MAX, group=group)
+            grad_flags = flags.tolist()
+        needs_grad = iter(grad_flags)
+
+        def gather(tensor: torch.Tensor | None) -> torch.Tensor | None:
+            if tensor is None:
+                return None
+            if next(needs_grad) and not tensor.requires_grad:
+                # Empty shards must still enter decoder backward collectives.
+                # A frozen decoder with a trainable head only needs a leaf.
+                tensor = tensor + hidden_by_row.reshape(-1)[:1].sum() * 0.0
+                tensor.requires_grad_(True)
+            return _GatherContextParallelRows.apply(tensor, positions, length, group)
+
+        for index, (item, output, source_positions) in enumerate(
+            zip(items, outputs, prepared.source_positions_by_item, strict=True)
+        ):
+            positions = source_positions.to(device=hidden_by_row.device)
+            length = int(item.input_ids.numel())
+            outputs[index] = replace(
+                output,
+                target_logprobs=gather(output.target_logprobs),
+                logits=gather(output.logits),
+                hidden_states=gather(output.hidden_states),
+                top_k=(
+                    TopK(
+                        cast(torch.Tensor, gather(output.top_k.logprobs)),
+                        cast(torch.Tensor, gather(output.top_k.tokens)),
+                    )
+                    if output.top_k is not None
+                    else None
+                ),
+            )
+        return outputs
 
     def _decoder_hidden(
         self,
@@ -6547,7 +6830,9 @@ class TrainerRank:
             _pad_packed_batch(batch, multiple=int(topology.tp)) for batch in batches
         )
         sequence_length = max(int(batch.tokens.shape[1]) for batch in padded)
-        rows = tuple(self._hybridep_rows(batch, topology=topology) for batch in padded)
+        rows = tuple(
+            self._max_rank_model_tokens(batch, topology=topology) for batch in padded
+        )
         current = fused_a2a._hybrid_ep_buffer
         live = self._has_live_hybridep_graphs()
         # The buffer must hold the busiest rank's planned rows: cost-aware CP
@@ -6612,7 +6897,7 @@ class TrainerRank:
 
         _set_hybridep_token_count(rows)
 
-    def _hybridep_rows(
+    def _max_rank_model_tokens(
         self,
         batch: PrefixTreePack,
         *,
@@ -6724,6 +7009,7 @@ class TrainerRank:
             packed_seq_params=prepared.packed_seq_params,
             positions_by_item=tuple(pair[0] for pair in local_position_pairs),
             source_positions_by_item=tuple(pair[1] for pair in local_position_pairs),
+            context_parallel_group=ps.get_context_parallel_group(),
         )
 
     def _topology(self) -> "ParallelTopology":

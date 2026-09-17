@@ -100,7 +100,8 @@ def test_actual_plan_cost_and_admission(layer, rank_value, grad, output):
         assert pending[0] == retained == 8 * 40 * 2048 * 2
         assert pending[1] >= workspace
     else:
-        assert (retained, workspace) == pending == (0, 0)
+        assert retained == 0 and pending == (0, 0)
+        assert workspace == expected(8, rank_value, False) + 4 * 8 * 2048 * 2
     assert required >= int((plan.output_bytes + expected(8, rank_value, grad)) * 1.1)
     rank._available_memory_bytes = lambda: required - 1
     assert not rank._memory_check(plan).fits

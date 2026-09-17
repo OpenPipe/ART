@@ -123,6 +123,28 @@ Set `assistant_turns="last"` to calculate loss only on the final assistant
 message in each JSONL row. Earlier assistant messages remain available as
 context. If omitted, the helper trains on all assistant turns.
 
+## Packed training with Megatron
+
+Megatron automatically packs the tokenized examples in each SFT optimizer batch
+into prefix-tree rows. Identical unsupervised prefixes can share computation;
+assistant-turn selection, prediction targets, and branch-local context are
+preserved. No caller-side packing is required, including when the serverless
+deployment uses Megatron.
+
+`batch_size` still controls examples per optimizer update. The trainer's
+`packed_sequence_length` limits tokens per packed row, independently of the
+per-example context limit. A batch can produce several rows whose gradients are
+accumulated into one update. Packing never combines separate optimizer batches
+or advances the learning-rate schedule for individual rows. Examples too long
+for a packed row are not silently truncated by the packer.
+
+Larger example batches can make better use of packing, but change the optimization
+batch size; ART does not increase it automatically to fill a row. Rows retain
+their actual lengths rather than padding every SFT forward to the capacity.
+
+SFT preparation runs on the CPU before trainer-rank fanout. It shares the packing
+planner with RL, not RL's queue, autotuner, or packing-lookahead orchestration.
+
 ## Distillation
 
 Distillation trains a smaller model on completions from a larger teacher model. Generate responses from the teacher, wrap them as trajectories, and fine-tune:

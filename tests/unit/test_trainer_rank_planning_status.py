@@ -97,6 +97,7 @@ def _worker(index: int, directory: Path) -> None:
             "estimate",
             "materialize",
             "price",
+            "cp_plan",
             "empty",
             "unequal",
             "unavailable",
@@ -151,6 +152,13 @@ def _worker(index: int, directory: Path) -> None:
                 return 0
 
             rank._estimate_required_memory_bytes_from_values = price
+
+            def retained_tokens(plan):
+                if index == 0 and mode == "cp_plan":
+                    raise primary
+                return plan.packed_tokens
+
+            rank._plan_retained_tokens = retained_tokens
             patches = pytest.MonkeyPatch()
             patches.setattr(_impl, "estimate_prefix_tree_packed_tokens", estimate)
             patches.setattr(_impl, "materialize_prefix_tree_layout", materialize)
@@ -182,14 +190,14 @@ def _worker(index: int, directory: Path) -> None:
                     if mode == "unavailable":
                         assert not rank._all_ranks_true(values is not None)
                     plan = rank._plan_flat_forward(requests, sync_planning_errors=True)
-                    if mode == "price":
+                    if mode in ("price", "cp_plan"):
                         rank._memory_check(
                             plan, sync_across_dp=True, sync_planning_errors=True
                         )
                     assert plan.request_count == len(requests)
                 except BaseException as caught:
                     error = caught
-                if mode in ("estimate", "materialize", "price"):
+                if mode in ("estimate", "materialize", "price", "cp_plan"):
                     if index == 0:
                         assert error is primary, (mode, repr(error))
                         assert error.__cause__ is cause and error.__context__ is context

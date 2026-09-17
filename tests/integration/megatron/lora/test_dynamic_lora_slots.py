@@ -272,7 +272,7 @@ def _custom_parameter_reduction_worker(
         torch.testing.assert_close(parameter, torch.tensor(1.0, device=device))
         (parameter * float(rank + 1)).backward()
         (reduced,) = trainer._reduce_dynamic_grads((parameter,), scale_grads=1.0)
-        expected = {"dp": 3.0, "tp": 1.5, "cp": 3.0, "tp_cp": 5.0}[topology]
+        expected = {"dp": 3.0, "tp": 1.5, "cp": 1.5, "tp_cp": 2.5}[topology]
         torch.testing.assert_close(reduced, torch.tensor(expected, device=device))
     finally:
         if getattr(ps, "model_parallel_is_initialized", lambda: False)():

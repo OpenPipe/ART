@@ -69,7 +69,7 @@ from art.megatron.routing_replay import (
     build_moe_routing_replay_bundle_from_packed_tensors,
     prepare_moe_routing_replay_boundaries,
 )
-from art.megatron.runtime.data_plane import SFTBatchData
+from art.megatron.runtime.data_plane import PackedSFTBatchData
 from art.megatron.runtime.specs import (
     PackedTokenScore,
     ResidentLoraExport,
@@ -116,6 +116,7 @@ from art.megatron.training.microbatches import (
     select_indexed_inputs,
     select_micro_inputs,
     select_sft_micro_inputs,
+    sft_global_microbatch_count,
 )
 from art.megatron.training.model_chunks import (
     ModelChunks,
@@ -828,7 +829,7 @@ def execute_megatron_rl_job(
 def execute_megatron_sft_job(
     runtime: TrainingRuntime,
     job: SFTJobSpec,
-    batches: tuple[SFTBatchData, ...],
+    batches: tuple[PackedSFTBatchData, ...],
     *,
     progress_sink: Callable[[int, int, dict[str, float]], None],
     adapter_ready_sink: Callable[[], None],
@@ -847,10 +848,6 @@ def execute_megatron_sft_job(
     try:
         configure_moe_routing_replay(runtime)
         adapter_dtypes = _prepare_rl_training_state(runtime, job)
-        grad_accumulation_sequences = int(job.config.batch_size)
-        grad_accumulation_sequences = resolve_global_grad_accumulation_sequences(
-            grad_accumulation_sequences
-        )
         assert runtime.optimizer is not None
         runtime.optimizer.config.clip_grad = job.max_grad_norm
         for param_group in runtime.optimizer.param_groups:
@@ -863,20 +860,18 @@ def execute_megatron_sft_job(
 
                 raise TrainingCancelledError("SFT job was cancelled")
             started = time.perf_counter()
-            trajectory_tensors = list(batch.trajectory_tensors)
+            trajectory_tensors = list(batch.rows)
+            grad_accumulation_sequences = sft_global_microbatch_count(
+                len(trajectory_tensors), provider=runtime.provider
+            )
             template = _clone_sft_tensors(trajectory_tensors[0])
             zero_template = _zero_contribution_sft_inputs(template)
-            # Scheduling uses run-global sample IDs while each payload only owns one
-            # batch. Prefix aliases place this window in global index space without
-            # copying tensors, then selected IDs are rebased for local lookup.
-            sample_offset = batch_index * grad_accumulation_sequences
-            scheduled_tensors = [
-                trajectory_tensors[0]
-            ] * sample_offset + trajectory_tensors
+            # Packed rows, not source examples, are schedule microbatches. Each
+            # payload still owns exactly one optimizer update and learning rate.
             hybridep_token_counts = (
                 build_sft_hybridep_token_counts(
-                    trajectory_tensors=scheduled_tensors,
-                    step_index=batch_index,
+                    trajectory_tensors=trajectory_tensors,
+                    step_index=0,
                     global_grad_accumulation_sequences=(grad_accumulation_sequences),
                     topology=topology,
                     provider=runtime.provider,
@@ -894,14 +889,11 @@ def execute_megatron_sft_job(
                 required_capacity=max(hybridep_token_counts or (), default=0),
             )
             scheduled_indices = build_micro_sample_indices(
-                step_index=batch_index,
-                num_sequences=len(scheduled_tensors),
+                step_index=0,
+                num_sequences=len(trajectory_tensors),
                 global_grad_accumulation_sequences=grad_accumulation_sequences,
             )
-            micro_indices = [
-                None if index is None else index - sample_offset
-                for index in scheduled_indices
-            ]
+            micro_indices = scheduled_indices
             step_result = run_megatron_sft_step(
                 model_chunks=runtime.model,
                 provider=runtime.provider,
@@ -919,13 +911,26 @@ def execute_megatron_sft_job(
                     runtime.optimizer_snapshot_barrier.wait_before_mutation
                 ),
             )
+            _validate_train_step_result_finite(runtime, step_result)
             elapsed = time.perf_counter() - started
             final_metrics = {
                 "loss/train": float(step_result.reduced_loss.item()),
                 "loss/learning_rate": batch.learning_rate,
                 "loss/grad_norm": float(step_result.grad_norm),
                 "throughput/train_executed_tok_equiv_per_s": (
-                    batch.num_tokens / elapsed if elapsed else 0.0
+                    step_result.workload.executed_token_equivalents / elapsed
+                    if elapsed
+                    else 0.0
+                ),
+                "throughput/train_logical_tok_per_s": batch.num_tokens / elapsed
+                if elapsed
+                else 0.0,
+                "data/gradient_step_nonpadding_logical_tokens": float(batch.num_tokens),
+                "data/gradient_step_loss_bearing_tokens": float(
+                    step_result.workload.loss_bearing_tokens
+                ),
+                "data/gradient_step_executed_token_equivalents": float(
+                    step_result.workload.executed_token_equivalents
                 ),
                 **step_result.pipeline_metrics,
             }

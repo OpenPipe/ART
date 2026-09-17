@@ -136,10 +136,12 @@ def test_per_group_padding_precedes_gradient_filter():
     assert r._checkpoint_memory_floor(values[3]) == (16 * 40 * 4096, 24 * 188416)
 
 
-def test_no_grad_empty_and_unsupported_keep_prior_estimate():
+def test_no_grad_enclosure_empty_and_unsupported():
     r = rank()
     assert r._checkpoint_memory_floor(()) == (0, 0)
-    assert r._checkpoint_memory_floor(((8192, False),)) == (0, 0)
+    assert r._checkpoint_memory_floor(((8192, False),)) == (
+        0, 8192 * (188416 + 4 * 2048 * 2)
+    )
     values = r._estimate_flat_forward(requests())
     baseline = price(r, values).required
     r.runtime.model[0].decoder.eval()
@@ -295,3 +297,56 @@ def test_malformed_flag_types_do_not_claim_supported_schedule(field, value):
     r = rank()
     setattr(r.runtime.model[0].decoder.config, field, value)
     assert r._checkpoint_memory_floor(((10, True),)) == (0, 0)
+
+
+@pytest.mark.parametrize("profile_rate", [None, 1, 1_000_000])
+def test_no_grad_enclosure_exact_lower_and_profile(profile_rate):
+    r = rank()
+    req = [ForwardInput(input_tokens=torch.arange(17), hidden_states=True, no_grad=True)]
+    values = r._estimate_flat_forward(req, exact=True)
+    n, out, sig, groups, _ = values
+    if profile_rate is not None:
+        r._memory_profiles[sig] = _MemoryProfile(
+            bytes_per_token=profile_rate, packed_tokens=n, logical_per_packed=1,
+        )
+    expected = int((out + max(n * (188416 + 4 * 2048 * 2), n * (profile_rate or 0))) * 1.1)
+    plan = r._plan_flat_forward(req)
+    assert groups == r._plan_group_rows(plan) == ((n, False),)
+    assert r._checkpoint_memory_floor(groups) == (0, n * (188416 + 4 * 2048 * 2))
+    assert price(r, values).required == r._memory_check(plan).estimated_required_bytes == expected
+    assert r._split_chunk_lower_cost(req, tuple(x.input_tokens for x in req), checkpoint=Unset).required == expected
+    r._available_memory_bytes = lambda: expected - 1
+    assert not r._memory_check(plan).fits
+    r._available_memory_bytes = lambda: expected
+    assert r._memory_check(plan).fits
+
+
+def test_no_grad_enclosure_uses_max_group_and_affine_stage():
+    r = rank()
+    r._moe_forward_stages = ((1, 1_000_000),)
+    groups = ((3, False), (11, False))
+    assert r._checkpoint_memory_floor(groups) == (
+        0, max(max(rows * 188416, rows + 1_000_000) + 4 * rows * 2048 * 2 for rows, _ in groups)
+    )
+    mixed = ((3, True), (11, False))
+    assert r._checkpoint_memory_floor(mixed) == (
+        3 * 40 * 2048 * 2, max(3 * 188416, 11 * 188416, 11 + 1_000_000)
+    )
+
+
+@pytest.mark.parametrize("field,value", [
+    ("recompute_granularity", None), ("recompute_granularity", "selective"),
+    ("recompute_method", "block"), ("recompute_num_layers", True),
+    ("cpu_offloading", True), ("params_dtype", torch.float32),
+])
+def test_no_grad_enclosure_config_guard(field, value):
+    r = rank()
+    setattr(r.runtime.model[0].decoder.config, field, value)
+    assert r._checkpoint_memory_floor(((11, False),)) == (0, 0)
+
+
+@pytest.mark.parametrize("cp", [2, 4])
+def test_no_grad_enclosure_keeps_cp_fallback(cp):
+    r = rank()
+    r._topology_key = lambda: (1, 1, cp, 1)
+    assert r._checkpoint_memory_floor(((11, False),)) == (0, 0)

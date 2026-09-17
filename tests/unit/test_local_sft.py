@@ -38,7 +38,7 @@ def test_qwen_rollout_server_uses_preserve_thinking_template(
         lambda *_args: None,
     )
     monkeypatch.setattr(
-        "art.local.backend.AutoTokenizer.from_pretrained",
+        "art.local.backend.get_tokenizer",
         lambda _model: tokenizer,
     )
     config: dict[str, Any] = {}
@@ -49,24 +49,21 @@ def test_qwen_rollout_server_uses_preserve_thinking_template(
     assert "preserve_thinking is defined and preserve_thinking is true" in configured
 
 
-def test_non_qwen_rollout_server_does_not_load_template(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_all_model_families_use_the_default_tokenizer(monkeypatch):
     monkeypatch.setattr(
-        "art.local.backend._model_support_default_chat_template",
-        lambda *_args: None,
+        "art.local.backend._model_support_default_chat_template", lambda *_: None
     )
-    monkeypatch.setattr(
-        "art.local.backend.AutoTokenizer.from_pretrained",
-        lambda _model: pytest.fail("non-Qwen templates should not be loaded eagerly"),
-    )
-    config: dict[str, Any] = {}
+    calls = []
 
-    _apply_configured_chat_template_server_args(
-        config, {}, base_model="meta-llama/Llama-3.1-8B-Instruct"
-    )
+    def load(model):
+        calls.append(model)
+        return type("Tokenizer", (), {"chat_template": "{{ messages }}"})()
 
-    assert config == {}
+    monkeypatch.setattr("art.local.backend.get_tokenizer", load)
+    config = {}
+    _apply_configured_chat_template_server_args(config, {}, base_model="other/family")
+    assert calls == ["other/family"]
+    assert config["server_args"]["chat_template"] == "{{ messages }}"
 
 
 def test_explicit_server_template_avoids_tokenizer_loading(
@@ -77,7 +74,7 @@ def test_explicit_server_template_avoids_tokenizer_loading(
         lambda *_args: pytest.fail("explicit template should win before model support"),
     )
     monkeypatch.setattr(
-        "art.local.backend.AutoTokenizer.from_pretrained",
+        "art.local.backend.get_tokenizer",
         lambda _model: pytest.fail("explicit template should avoid hub access"),
     )
     config: dict[str, Any] = {"server_args": {"chat_template": "explicit"}}
@@ -97,7 +94,7 @@ def test_qwen_template_load_failure_is_a_warned_fallback(
         lambda *_args: None,
     )
     monkeypatch.setattr(
-        "art.local.backend.AutoTokenizer.from_pretrained",
+        "art.local.backend.get_tokenizer",
         lambda _model: (_ for _ in ()).throw(ValueError("bad tokenizer")),
     )
     config: dict[str, Any] = {}
@@ -119,7 +116,7 @@ def _local_sft_patches(
     with ExitStack() as stack:
         for patcher in (
             patch(
-                "art.local.backend.AutoTokenizer.from_pretrained",
+                "art.local.backend.get_tokenizer",
                 return_value=object(),
             ),
             patch.object(
@@ -257,3 +254,22 @@ async def test_local_sft_skipped_batch_does_not_consume_learning_rate(
     assert [call["learning_rate"] for call in calls] == [1e-4, 1e-4]
     assert [batch.learning_rate for batch in captured_batches] == [1e-4]
     assert results[0]["data/step_num_dropped_trajectories"] == 1.0
+
+
+def test_python_encoder_marker_is_not_passed_as_a_jinja_template(monkeypatch):
+    monkeypatch.setattr(
+        "art.local.backend._model_support_default_chat_template", lambda *_: None
+    )
+    monkeypatch.setattr(
+        "art.local.backend.get_tokenizer",
+        lambda _: type(
+            "Tokenizer",
+            (),
+            {"chat_template": "deepseek_v4_python_encoder enable_thinking"},
+        )(),
+    )
+    config = {}
+    _apply_configured_chat_template_server_args(
+        config, {}, base_model="deepseek-ai/DeepSeek-V4-Flash"
+    )
+    assert "chat_template" not in config.get("server_args", {})
