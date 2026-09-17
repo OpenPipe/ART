@@ -426,6 +426,7 @@ def test_cp_keeps_existing_full_no_grad_and_moe_costs(monkeypatch, kind):
         "full" if kind == "full" else "selective",
         **({"num_moe_experts": 64} if kind == "moe" else {}),
     )
+
     monkeypatch.setattr(rank, "_topology_key", lambda: (1, 1, 2, 1))
     monkeypatch.setattr(
         rank,
@@ -441,4 +442,26 @@ def test_cp_keeps_existing_full_no_grad_and_moe_costs(monkeypatch, kind):
             signature=plan.signature,
             gdn_segments=plan.grad_segment_count,
         )
+    )
+
+
+def test_cp_floor_covers_recorded_uneven_27b_pair(monkeypatch):
+    # Native H200 CP2, 4k siblings: rank 0 peaks at 62.918 GiB with 4,096
+    # local tokens. Dividing the 6,964 global packed tokens by CP misses it.
+    rank = _hybrid_rank(monkeypatch, 1)
+    signature = replace(_plan(rank).signature, topology=(1, 1, 2, 1))
+    values: dict[str, Any] = dict(
+        packed_tokens=6964,
+        output_bytes=8192 * 5120 * 2,
+        signature=signature,
+        gdn_segments=3,
+    )
+    peak = 62.918 * 2**30
+    estimate = rank._estimate_required_memory_bytes_from_values(
+        **values, retained_tokens=4096
+    )
+    assert peak <= estimate <= 1.12 * peak
+    assert (
+        rank._estimate_required_memory_bytes_from_values(**values, retained_tokens=3482)
+        < peak
     )
