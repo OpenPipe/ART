@@ -36,6 +36,9 @@ def main() -> None:
     )
     parser.add_argument("--prefix-fraction", type=float, default=0.3)
     parser.add_argument("--modules", nargs="+", default=["core_attn"])
+    parser.add_argument(
+        "--components", action="store_true", help="Attribute eager layer allocations"
+    )
     parser.add_argument("--evidence", type=Path, required=True)
     args = parser.parse_args()
     if args.repeat < 1 or args.layers < 0 or any(n < 1 for n in args.tokens):
@@ -78,6 +81,8 @@ def main() -> None:
         )
         for chunk in runtime.model:
             chunk.train()
+        if args.components and runtime.transformer_layers_compiled:
+            parser.error("--components requires ART_DISABLE_MEGATRON_COMPILE=1")
         rank = TrainerRank(runtime)
         [slot] = load_random_checkpoints(
             runtime, rank, 1, base_model=args.model, lora_rank=1
@@ -106,6 +111,17 @@ def main() -> None:
             "torch": torch.__version__,
             "cuda": torch.version.cuda,
             "transformer_layers_compiled": runtime.transformer_layers_compiled,
+            "activation_config": {
+                name: str(getattr(runtime.provider, name, None))
+                for name in (
+                    "bias_activation_fusion",
+                    "use_te_activation_func",
+                    "gated_linear_unit",
+                    "activation_func",
+                    "attention_output_gate",
+                    "qk_layernorm",
+                )
+            },
         }
         args.evidence.parent.mkdir(parents=True, exist_ok=True)
         workloads = [
@@ -161,9 +177,51 @@ def main() -> None:
                 reserved = torch.cuda.memory_reserved()
                 torch.cuda.reset_peak_memory_stats()
                 started = time.monotonic()
+                components, handles, entries = [], [], {}
+                if args.components:
+                    from megatron.core.transformer.transformer_layer import (
+                        TransformerLayer,
+                    )
+
+                    def enter(module, inputs):
+                        entries[id(module)] = torch.cuda.memory_allocated()
+
+                    def leave(name):
+                        def record(module, inputs, output):
+                            components.append(
+                                {
+                                    "name": name,
+                                    "type": type(module).__name__,
+                                    "input_shape": list(inputs[0].shape)
+                                    if inputs and isinstance(inputs[0], torch.Tensor)
+                                    else None,
+                                    "retained_delta_bytes": torch.cuda.memory_allocated()
+                                    - entries[id(module)],
+                                }
+                            )
+
+                        return record
+
+                    for name, layer in runtime.model[0].named_modules():
+                        if isinstance(layer, TransformerLayer):
+                            for part, module in (
+                                ("layer", layer),
+                                ("attention", layer.self_attention),
+                                ("mlp", layer.mlp),
+                            ):
+                                handles.extend(
+                                    (
+                                        module.register_forward_pre_hook(enter),
+                                        module.register_forward_hook(
+                                            leave(f"{name}.{part}")
+                                        ),
+                                    )
+                                )
                 # Direct execution isolates the selected unsplit plan. It uses
                 # the same native forward as public admission, with no split.
                 outputs = rank._execute_flat_plan(plan)
+                for handle in handles:
+                    handle.remove()
                 torch.cuda.synchronize()
                 forward_peak = torch.cuda.max_memory_allocated()
                 retained = torch.cuda.memory_allocated()
@@ -188,6 +246,7 @@ def main() -> None:
                     {
                         **row,
                         "status": "measured",
+                        "components": components,
                         "baseline_allocated_bytes": baseline,
                         "baseline_reserved_bytes": reserved,
                         "forward_peak_delta_bytes": forward_peak - baseline,
