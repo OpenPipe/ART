@@ -236,6 +236,7 @@ jobs:
             free -h || true
             ps -eo pid,ppid,stat,rss,comm,args | grep -E 'SkyPilot|sky|python' || true
             "${sky_cmd[@]}" api status || true
+            "${sky_cmd[@]}" logs --provision "${cluster}" || true
             if [ -f "${HOME}/.sky/api_server/server.log" ]; then
               tail -n 240 "${HOME}/.sky/api_server/server.log" || true
             fi
@@ -263,6 +264,7 @@ jobs:
               --infra "${SKY_INFRA}" \
               --gpus "${SMOKE_GPUS}" \
               --image-id "docker:${SMOKE_IMAGE_REPO}:${IMAGE_TAG}" \
+              --config kubernetes.remote_identity.cks-wb3=skypilot-workload \
               --config kubernetes.pod_config.spec.schedulerName=binpack-scheduler \
               --config kubernetes.pod_config.spec.activeDeadlineSeconds=604800 \
               "EXPECTED_ART_IMAGE_REVISION=${GITHUB_SHA} python -c '${smoke_code}'"
