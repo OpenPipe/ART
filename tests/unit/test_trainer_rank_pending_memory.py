@@ -146,6 +146,20 @@ def test_actual_constructor_cache_and_full_plan(pending_rank):
     assert lower.required <= rank._memory_check(plan).estimated_required_bytes
 
 
+@pytest.mark.parametrize("fits_after", (False, True))
+def test_exact_pending_demand_survives_recovery(monkeypatch, pending_rank, fits_after):
+    from test_trainer_rank_cache_recovery import _check_component_demand_recovery
+
+    requests = full_requests()
+    plan = pending_rank._plan_flat_forward(requests)
+    assert pending_rank._estimate_flat_forward(requests) is None
+    assert g.plan_floor(pending_rank, plan) == (8296857600, 12705630112)
+    assert pending_rank._memory_check(plan).estimated_required_bytes == 23102959299
+    _check_component_demand_recovery(
+        monkeypatch, pending_rank, requests, fits_after=fits_after
+    )
+
+
 def test_original_installed_norm_preserves_pending_floor(layer):
     from art.megatron.gdn.operator import _empty_safe_norm_forward
 

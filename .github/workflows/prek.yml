@@ -234,6 +234,8 @@ jobs:
             tests/unit/test_trainer_rank_shared_memory.py \
             tests/unit/test_trainer_rank_converted_memory.py \
             tests/unit/test_trainer_rank_split.py \
+            tests/unit/test_trainer_rank_cache_recovery.py::test_dense_cp_exact_demand_fits_after_recovery \
+            tests/unit/test_trainer_rank_cache_recovery.py::test_dense_cp_exact_demand_refuses_after_recovery \
             tests/acceptance/trainer_rank_planner \
             tests/integration/megatron/test_sft_packing.py::test_sft_packing_preserves_training_targets \
             tests/integration/megatron/model_support/test_dispatcher_graph_retention.py \
@@ -248,6 +250,8 @@ jobs:
       - name: Run unit tests
         run: |
           uv run --no-sync pytest --nbval --current-env --tb=short tests/unit \
+            --deselect=tests/unit/test_trainer_rank_cache_recovery.py::test_dense_cp_exact_demand_fits_after_recovery \
+            --deselect=tests/unit/test_trainer_rank_cache_recovery.py::test_dense_cp_exact_demand_refuses_after_recovery \
             --ignore=tests/unit/test_megatron_reference_logprobs.py \
             --ignore=tests/unit/test_moe_routing_replay.py \
             --ignore=tests/unit/test_moe_routing_real_path.py \

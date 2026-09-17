@@ -232,6 +232,8 @@ def test_split_ladder_is_bounded_and_refuses_when_one_request_cannot_fit(
     # bounded ladder (2, 4, 8 subforwards), whose failed rungs are rejected
     # with cheap bounds — the planner runs only for the unsplit attempts.
     _packed_budget(monkeypatch, rank, 9)
+    # Recovery must observe the same controlled budget as ordinary admission.
+    monkeypatch.setattr(rank, "_available_memory_bytes", lambda: 9)
 
     with pytest.raises(TrainerRankMemoryError) as exc_info:
         rank.dp_rank_forward(inputs)

@@ -62,6 +62,79 @@ def test_actual_admission_rejects_below_dense_head_tensor(grad, budget):
     assert not r._memory_check(plan).fits
 
 
+@pytest.mark.parametrize("fits_after", (False, True))
+def test_mixed_checkpoint_head_demand_survives_recovery(monkeypatch, fits_after):
+    from test_trainer_rank_cache_recovery import _check_component_demand_recovery
+
+    r = rank()
+    requests = [request(8, grad=True), request(16, grad=False, hidden=True)]
+    values = r._estimate_flat_forward(requests, exact=True)
+    assert values[3] == ((8, True), (16, False))
+    assert r._checkpoint_memory_floor(values[3])[0] == 8 * 40 * 2048 * 2
+    assert values[4] == 3 * 8 * 248320 * 2
+    _check_component_demand_recovery(monkeypatch, r, requests, fits_after=fits_after)
+
+
+def test_recovery_keeps_profile_demand_above_cold_head_floor(monkeypatch):
+    from test_trainer_rank_cache_recovery import _check_component_demand_recovery
+
+    r = rank()
+    requests = [request(1, grad=True)]  # One row cannot be split smaller.
+    plan = r._plan_flat_forward(requests)
+    cold = r._memory_check(plan).estimated_required_bytes
+    r._update_memory_profile(plan, 4 * cold, retained_bytes=plan.output_bytes)
+    assert r._memory_check(plan).estimated_required_bytes > cold
+    _check_component_demand_recovery(
+        monkeypatch, r, requests, fits_after=False, after_available=cold
+    )
+
+
+def test_real_head_split_fits_before_cache_recovery(monkeypatch):
+    from test_trainer_rank_split import _recording_executor
+
+    from art.trainer_rank import TrainerRank, _impl
+
+    r = rank()
+    monkeypatch.setattr(r, "_dp_rank_and_size", lambda: (0, 1))
+    requests = [
+        replace(request(8), input_tokens=torch.arange(8) + 100 * i) for i in range(4)
+    ]
+    whole = r._plan_flat_forward(requests)
+    r._update_memory_profile(
+        whole, r._plan_cost(whole).required, retained_bytes=whole.output_bytes
+    )
+    children = [r._plan_flat_forward(requests[i : i + 2]) for i in (0, 2)]
+    left, right = [r._plan_cost(child) for child in children]
+    budget = max(left.required, left.retained + right.required)
+    assert 0 < left.retained and budget < r._plan_cost(whole).required
+    total = 10 * r._plan_cost(whole).required
+    free = budget + int(total * _impl._MEMORY_RESERVE_FRACTION)
+    probe = TrainerRank.__new__(TrainerRank)
+    probe.device = torch.device("cuda")
+    monkeypatch.delenv(_impl._TEST_HOOKS_ENV, raising=False)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_allocator_backend", lambda: "native")
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device: (free, total))
+    monkeypatch.setattr(torch.cuda, "memory_allocated", lambda device: 0)
+    monkeypatch.setattr(torch.cuda, "memory_reserved", lambda device: total)
+    monkeypatch.setattr(
+        r, "_available_memory_bytes", lambda: TrainerRank._available_memory_bytes(probe)
+    )
+    monkeypatch.setattr(
+        r, "_try_cache_recovery", lambda *a, **kw: pytest.fail("Split already fits")
+    )
+    executed = _recording_executor(monkeypatch, r)
+    batches = list(r.forward_micro_batches([requests]))
+    assert len(batches) == 1 and batches[0].stats.subforward_count == 2
+    assert batches[0].stats.global_count == 1 and len(executed) == 2
+    assert [
+        [int(output.target_logprobs.item()) for output in group]
+        for group in batches[0].outputs
+    ] == [[7, 107, 207, 307]]
+    assert r.last_forward_telemetry()["subforward_request_indices"] == ((0, 1), (2, 3))
+    assert not torch.cuda.is_initialized()
+
+
 def test_outputs_retention_and_empirical_peak_are_counted_once():
     r = rank()
     plan = r._plan_flat_forward([request(grad=True)])

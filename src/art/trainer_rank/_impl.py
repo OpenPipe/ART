@@ -26,6 +26,7 @@ from pathlib import Path
 import struct
 import threading
 import time
+import traceback
 from types import MethodType, TracebackType
 from typing import (
     TYPE_CHECKING,
@@ -567,6 +568,18 @@ class TrainerRankSlotStateError(RuntimeError):
     pass
 
 
+@dataclass
+class _CacheRecoveryState:
+    # Local, lifetime measurements; reductions never replace these ledgers.
+    cost: float = 0.0
+    work: float = 0.0
+    high: float = 0.0
+    first_consumed: bool = False
+    invalid: bool = False
+    owner: object | None = None
+    lock: Any = dataclass_field(default_factory=threading.Lock)
+
+
 @dataclass(frozen=True)
 class _MemoryCheck:
     estimated_required_bytes: int
@@ -1044,9 +1057,9 @@ def _memory_error(
 
 @dataclass(frozen=True)
 class _ForwardRefusal:
-    """Why no admissible plan was found. ``plan`` is the unsplit call."""
+    """Why admission failed, with the last relevant local plan and check."""
 
-    plan: _FlatForwardPlan
+    plan: _AnyForwardPlan
     check: _MemoryCheck
     message: str
 
@@ -1836,6 +1849,7 @@ class TrainerRank:
         self._hybridep_graph_tracking = False
         self._hybridep_buffer_id: int | None = None
         self._hybridep_rows_high_water = 0
+        self._cache_recovery_state = _CacheRecoveryState()
         self._memory_profiles: dict[_MemorySignature, _MemoryProfile] = {}
         self._split_memory_floors: dict[bytes, int] = {}
         self._split_memory_floor_status = "not_observed"
@@ -2841,35 +2855,43 @@ class TrainerRank:
     def _execute_split_plan_with_memory_tracking(
         self, plan: _SplitForwardPlan, *, check: _MemoryCheck, context: str
     ) -> tuple[list[AnyForwardOutput], int | None, int]:
-        baseline, peak = None, 0
-        merged: list[AnyForwardOutput | None] = [None] * plan.request_count
-        for ordinal, (subforward, indices) in enumerate(
-            zip(plan.subforwards, plan.request_indices, strict=True)
-        ):
-            try:
-                outputs, child_baseline = self._run_flat_plan_with_memory_tracking(
-                    subforward, check=check, context=context
-                )
-                if child_baseline is not None:
-                    if baseline is None:
-                        baseline = child_baseline
-                    peak = max(peak, int(torch.cuda.max_memory_allocated(self.device)))
-            except TrainerRankMemoryError as error:
-                # Model execution already began, so no replanning is possible
-                # and the caller must not mistake this for an up-front refusal.
-                raise TrainerRankPartialExecutionError(
-                    f"{context}: subforward {ordinal + 1} of "
-                    f"{plan.subforward_count} failed during execution "
-                    f"({ordinal} of {plan.subforward_count} completed). {error}",
-                    predicted_peak_bytes=error.predicted_peak_bytes,
-                    usable_limit_bytes=error.usable_limit_bytes,
-                    suggestion=error.suggestion,
-                ) from error
-            for index, output in zip(indices, outputs, strict=True):
-                merged[index] = output
-        if any(output is None for output in merged):
-            raise AssertionError("split execution did not cover every request")
-        return cast(list[AnyForwardOutput], merged), baseline, peak
+        state = self._recovery_state()
+        work_before = state.work
+        try:
+            baseline, peak = None, 0
+            merged: list[AnyForwardOutput | None] = [None] * plan.request_count
+            for ordinal, (subforward, indices) in enumerate(
+                zip(plan.subforwards, plan.request_indices, strict=True)
+            ):
+                try:
+                    outputs, child_baseline = self._run_flat_plan_with_memory_tracking(
+                        subforward, check=check, context=context
+                    )
+                    if child_baseline is not None:
+                        if baseline is None:
+                            baseline = child_baseline
+                        peak = max(
+                            peak, int(torch.cuda.max_memory_allocated(self.device))
+                        )
+                except TrainerRankMemoryError as error:
+                    # Model execution already began, so no replanning is possible
+                    # and the caller must not mistake this for an up-front refusal.
+                    raise TrainerRankPartialExecutionError(
+                        f"{context}: subforward {ordinal + 1} of "
+                        f"{plan.subforward_count} failed during execution "
+                        f"({ordinal} of {plan.subforward_count} completed). {error}",
+                        predicted_peak_bytes=error.predicted_peak_bytes,
+                        usable_limit_bytes=error.usable_limit_bytes,
+                        suggestion=error.suggestion,
+                    ) from error
+                for index, output in zip(indices, outputs, strict=True):
+                    merged[index] = output
+            if any(output is None for output in merged):
+                raise AssertionError("split execution did not cover every request")
+            return cast(list[AnyForwardOutput], merged), baseline, peak
+        except BaseException:
+            state.work = work_before
+            raise
 
     def _plan_admissible_forward(
         self,
@@ -2878,19 +2900,22 @@ class TrainerRank:
         checkpoint: AdapterSelection,
         context: str,
     ) -> tuple[_AnyForwardPlan, _MemoryCheck]:
-        """Plan one forward (splitting if needed), recording telemetry, or raise."""
-
-        found = self._find_admissible_forward(
-            requests,
-            checkpoint=checkpoint,
-            refusal_prefix="forward is predicted to exceed available memory",
+        # DP-local recovery may retry asymmetrically; checkpoint setup is WORLD.
+        self._ensure_checkpoint_slots_for(requests, checkpoint=checkpoint)
+        result = self._recover_admission(
+            lambda: self._find_admissible_forward(
+                requests,
+                checkpoint=checkpoint,
+                refusal_prefix="forward is predicted to exceed available memory",
+                ensure_slots=False,
+            ),
+            lambda value: value,
+            lambda value, check: (value[0], check),
+            context=context,
+            sync_across_dp=False,
         )
-        if isinstance(found, _ForwardRefusal):
-            self._snapshot_planning_telemetry(found.plan, found.check)
-            raise found.error(context)
-        plan, check = found
-        self._snapshot_planning_telemetry(plan, check)
-        return plan, check
+        self._snapshot_planning_telemetry(*result)
+        return result
 
     def _find_admissible_forward(
         self,
@@ -2898,6 +2923,7 @@ class TrainerRank:
         *,
         checkpoint: AdapterSelection,
         refusal_prefix: str,
+        ensure_slots: bool = True,
     ) -> tuple[_AnyForwardPlan, _MemoryCheck] | _ForwardRefusal:
         """Find an admissible plan: unsplit first, then the bounded split ladder.
 
@@ -2909,12 +2935,14 @@ class TrainerRank:
         refusal worded as "unable to find a feasible split": the search is
         bounded, so this is not a claim that none exists.
 
-        Checkpoint slots are ensured exactly once, up front; everything after
-        plans with ``ensure_slots=False`` so the number of collectives this
-        rank performs does not depend on its (DP-local) inputs.
+        Checkpoint slots are ensured up front unless the caller already did
+        so before entering a DP-local retry loop. Everything after plans with
+        ``ensure_slots=False`` so the number of collectives this rank performs
+        does not depend on its (DP-local) inputs.
         """
 
-        self._ensure_checkpoint_slots_for(requests, checkpoint=checkpoint)
+        if ensure_slots:
+            self._ensure_checkpoint_slots_for(requests, checkpoint=checkpoint)
         plan = self._plan_flat_forward(
             requests, checkpoint=checkpoint, ensure_slots=False
         )
@@ -4629,23 +4657,13 @@ class TrainerRank:
         *,
         checkpoint: AdapterSelection = Unset,
     ) -> _CandidateMicroBatch[ForwardInputsT]:
-        candidate = self._search_next_micro_batch(items, start, checkpoint=checkpoint)
-        # A later width check may observe less available memory.
-        # Do not return an earlier width's cached budget as the final admission.
-        check = self._memory_check_required(
-            candidate.check.estimated_required_bytes,
+        return self._recover_admission(
+            lambda: self._search_next_micro_batch(items, start, checkpoint=checkpoint),
+            lambda value: (value.plan, value.check),
+            lambda value, check: replace(value, check=check),
+            context="forward_micro_batches",
             sync_across_dp=True,
         )
-        if not check.fits:
-            self._snapshot_planning_telemetry(candidate.plan, check)
-            raise _memory_error(
-                context="forward_micro_batches",
-                message="selected microbatch exceeds freshly sampled available memory",
-                packed_tokens=candidate.plan.packed_tokens,
-                logical_tokens=candidate.plan.logical_tokens,
-                check=check,
-            )
-        return replace(candidate, check=check)
 
     def _search_next_micro_batch(
         self,
@@ -4653,7 +4671,7 @@ class TrainerRank:
         start: int,
         *,
         checkpoint: AdapterSelection = Unset,
-    ) -> _CandidateMicroBatch[ForwardInputsT]:
+    ) -> _CandidateMicroBatch[ForwardInputsT] | _ForwardRefusal:
         dp_rank, dp_size = self._dp_rank_and_size()
         remaining, min_width, granularity = _wave_geometry(len(items), start, dp_size)
         if min_width <= 0:
@@ -4884,9 +4902,12 @@ class TrainerRank:
                 except BaseException as exc:
                     admission_error, found = exc, None
                 try:
-                    agreed = self._all_ranks_true(
-                        admission_error is None
-                        and not isinstance(found, _ForwardRefusal)
+                    outcome = self._admission_outcome(
+                        0
+                        if admission_error is not None
+                        else 1
+                        if isinstance(found, _ForwardRefusal)
+                        else 2
                     )
                 except BaseException:
                     if admission_error is not None:
@@ -4895,21 +4916,16 @@ class TrainerRank:
                 if admission_error is not None:
                     raise admission_error
                 assert found is not None
+                if outcome == 0:
+                    raise RuntimeError("Memory admission failed on another DP rank")
                 if isinstance(found, _ForwardRefusal):
-                    self._snapshot_planning_telemetry(found.plan, found.check)
-                    raise found.error("forward_micro_batches")
-                if not agreed:
-                    self._snapshot_planning_telemetry(first.plan, first.check)
-                    raise _memory_error(
-                        context="forward_micro_batches",
-                        message=(
-                            f"{refusal_prefix} on another DP rank, which was "
-                            "unable to complete admission or find a feasible split "
-                            "for its share"
-                        ),
-                        packed_tokens=first.plan.packed_tokens,
-                        logical_tokens=first.plan.logical_tokens,
-                        check=first.check,
+                    return found
+                if outcome == 1:
+                    return _ForwardRefusal(
+                        found[0],
+                        found[1],
+                        f"{refusal_prefix} on another DP rank, which was unable "
+                        "to find a feasible split for its share",
                     )
                 split_plan, split_check = found
                 return _CandidateMicroBatch(
@@ -5573,6 +5589,7 @@ class TrainerRank:
             torch.cuda.reset_peak_memory_stats(self.device)
         else:
             baseline = None
+        started = self._recovery_clock() if baseline is not None else None
         try:
             with _telemetry_phase(
                 "forward",
@@ -5594,10 +5611,17 @@ class TrainerRank:
                 # can enter collectives that successful peers never reach.
                 check=check,
             ) from exc
+        finished = self._recovery_clock() if baseline is not None else None
+        seconds = None if started is None or finished is None else finished - started
         if baseline is not None:
             self._update_peak_memory_profile(
                 plan, baseline, int(torch.cuda.memory_allocated(self.device))
             )
+        if seconds is not None and plan.packed_tokens > 0:
+            try:
+                self._record_recovery_work(context, seconds)
+            except Exception:
+                self._recovery_state().invalid = True
         return outputs, baseline
 
     def _update_peak_memory_profile(
@@ -5938,6 +5962,337 @@ class TrainerRank:
             )
         return self._memory_check_required(required, sync_across_dp=sync_across_dp)
 
+    def _admission_outcome(self, local: int) -> int:
+        """Existing world fallback MIN: error=0, refusal=1, fit=2."""
+        if not (dist.is_available() and dist.is_initialized()):
+            return local
+        value = torch.tensor(
+            local,
+            device=self.device if self.device.type == "cuda" else "cpu",
+            dtype=torch.int32,
+        )
+        dist.all_reduce(value, op=dist.ReduceOp.MIN)
+        return int(value.item())
+
+    def _recover_admission(
+        self,
+        search: Callable[[], Any],
+        describe: Callable[[Any], tuple[_AnyForwardPlan, _MemoryCheck]],
+        update: Callable[[Any, _MemoryCheck], Any],
+        *,
+        context: str,
+        sync_across_dp: bool,
+    ) -> Any:
+        """Pure search, at most one smaller-plan refresh, then one recovery."""
+        original: TrainerRankMemoryError | None = None
+        refused: _ForwardRefusal | None = None
+
+        def finish(value: Any) -> Any:
+            nonlocal refused
+            if isinstance(value, _ForwardRefusal):
+                refused = value
+                return None
+            plan, check = describe(value)
+            if sync_across_dp:
+                check = self._memory_check_required(
+                    check.estimated_required_bytes, sync_across_dp=True
+                )
+            if check.fits:
+                return update(value, check)
+            refused = _ForwardRefusal(
+                plan, check, "selected plan exceeds freshly sampled available memory"
+            )
+            return None
+
+        value = search()
+        result = finish(value)
+        if result is not None:
+            return result
+        assert refused is not None
+        original = refused.error(context)
+        state = self._recovery_state()
+        started = self._recovery_clock()
+        owner = object()
+        with state.lock:
+            if state.owner is None:
+                state.owner = owner
+        primary: BaseException | None = None
+        try:
+            if not isinstance(value, _ForwardRefusal):
+                # A formerly fitting width is not proof that the minimum cannot fit.
+                value = search()
+                result = finish(value)
+                if result is not None:
+                    return result
+                if not isinstance(value, _ForwardRefusal):
+                    # Counters moved again: do not loop or reclaim for a large width.
+                    assert refused is not None
+                    self._snapshot_planning_telemetry(refused.plan, refused.check)
+                    raise refused.error(context) from original
+            assert refused is not None
+            if self._try_cache_recovery(
+                refused.check,
+                sync_across_dp=sync_across_dp,
+                owner=owner,
+                started=started,
+            ):
+                value = search()
+                result = finish(value)
+                if result is not None:
+                    return result
+            assert refused is not None
+            self._snapshot_planning_telemetry(refused.plan, refused.check)
+            latest = refused.error(context)
+            raise latest from original
+        except BaseException as exc:
+            primary = exc
+            raise
+        finally:
+            # Includes control, release, resample and repeated search; no idle.
+            try:
+                finished = self._recovery_clock()
+                elapsed = (
+                    None if started is None or finished is None else finished - started
+                )
+                with state.lock:
+                    if (
+                        elapsed is None
+                        or not math.isfinite(elapsed)
+                        or elapsed <= 0
+                        or not math.isfinite(state.cost + elapsed)
+                    ):
+                        state.invalid = True
+                    else:
+                        state.cost += elapsed
+                        state.high = max(state.high, elapsed)
+            except Exception:
+                state.invalid = True
+            except BaseException as exc:
+                state.invalid = True
+                if primary is None:
+                    primary = exc
+                    raise
+            finally:
+                try:
+                    with state.lock:
+                        if state.owner is owner:
+                            state.owner = None
+                except Exception:
+                    state.invalid = True
+                except BaseException:
+                    state.invalid = True
+                    if primary is None:
+                        raise
+
+    def _recovery_clock(self) -> float | None:
+        try:
+            value = time.perf_counter()
+            if type(value) is float and math.isfinite(value):
+                return value
+        except Exception:
+            pass
+        self._recovery_state().invalid = True
+        return None
+
+    def _record_recovery_work(self, context: str, seconds: float) -> None:
+        if context not in ("forward_micro_batches", "dp_rank_forward"):
+            return
+        state = self._recovery_state()
+        try:
+            with state.lock:
+                if (
+                    not math.isfinite(seconds)
+                    or seconds < 0
+                    or not math.isfinite(state.work + seconds)
+                ):
+                    state.invalid = True
+                else:
+                    state.work += seconds
+        except Exception:
+            state.invalid = True
+
+    def _recovery_state(self) -> _CacheRecoveryState:
+        state = getattr(self, "_cache_recovery_state", None)
+        if state is None:
+            state = self._cache_recovery_state = _CacheRecoveryState()
+        return state
+
+    def _recovery_reduce(
+        self,
+        values: list[float],
+        *,
+        op: Literal["MAX", "MIN", "SUM"],
+        sync_across_dp: bool,
+    ) -> list[float]:
+        if not (dist.is_available() and dist.is_initialized()):
+            return values
+        tensor = torch.tensor(
+            values,
+            device=self.device if self.device.type == "cuda" else "cpu",
+            dtype=torch.float64,
+        )
+        dist.all_reduce(
+            tensor,
+            op=getattr(dist.ReduceOp, op),
+            group=None if sync_across_dp else self._forward_memory_group(),
+        )
+        return [float(value) for value in tensor.tolist()]
+
+    @staticmethod
+    def _memory_error_with_reduction_note(
+        error: BaseException, exchange_error: BaseException | None
+    ) -> BaseException:
+        # Raise outside the exchange handler to preserve the local error's chain.
+        # A secondary poisoned-communicator failure is diagnostic, not the primary.
+        if exchange_error is not None and exchange_error is not error:
+            try:
+                BaseException.add_note(
+                    error,
+                    "Secondary memory reduction failure:\n"
+                    + "".join(traceback.format_exception(exchange_error)),
+                )
+            except BaseException:
+                # Exception rendering must never replace the original failure.
+                pass
+        return error
+
+    def _try_cache_recovery(
+        self,
+        check: _MemoryCheck,
+        *,
+        sync_across_dp: bool,
+        owner: object,
+        started: float | None,
+    ) -> bool:
+        state = self._recovery_state()
+        now = self._recovery_clock()
+        elapsed = None if now is None or started is None else now - started
+        with state.lock:
+            invalid = (
+                state.invalid
+                or state.owner is not owner
+                or elapsed is None
+                or not math.isfinite(elapsed)
+                or elapsed < 0
+            )
+            projected = state.cost if elapsed is None else state.cost + elapsed
+            invalid |= any(
+                not math.isfinite(value) or value < 0
+                for value in (
+                    projected,
+                    state.work,
+                    state.high,
+                    projected + state.high,
+                )
+            )
+            local_cost = [0.0, 0.0] if invalid else [projected, state.high]
+        # SUM costs deliberately overcharges parallel ranks; unlike MAX of
+        # lifetime costs, it cannot miss episodes with different slow ranks.
+        costs = self._recovery_reduce(
+            local_cost, op="SUM", sync_across_dp=sync_across_dp
+        )
+        invalid |= any(not math.isfinite(value) for value in (*costs, sum(costs)))
+        values = self._recovery_reduce(
+            [
+                float(check.estimated_required_bytes),
+                0.0 if invalid else state.work,
+                float(state.first_consumed),
+                float(invalid),
+            ],
+            op="MAX",
+            sync_across_dp=sync_across_dp,
+        )
+        required = int(values[0])
+        state.first_consumed = bool(values[2])
+        state.invalid |= bool(values[3])
+        if state.invalid:
+            return False
+        error: BaseException | None = None
+        needed = False
+        cap_blocks = False
+        try:
+            available = self._available_memory_bytes()
+            if (
+                available < required
+                and self.device.type == "cuda"
+                and torch.cuda.is_available()
+                and torch.cuda.get_allocator_backend() == "native"
+            ):
+                free, total = torch.cuda.mem_get_info(self.device)
+                needed = int(free) < required + int(total * _MEMORY_RESERVE_FRACTION)
+                if os.environ.get(_TEST_HOOKS_ENV) == "1":
+                    limit = os.environ.get(_TEST_MEMORY_LIMIT_ENV)
+                    if limit:
+                        cap_blocks = required > max(
+                            0,
+                            int(limit) - int(torch.cuda.memory_allocated(self.device)),
+                        )
+        except BaseException as exc:
+            error, available = exc, -1
+        exchange_error: BaseException | None = None
+        try:
+            sampled = self._recovery_reduce(
+                [
+                    float(available),
+                    -float(needed),
+                    float(not cap_blocks),
+                    float(not state.invalid),
+                ],
+                op="MIN",
+                sync_across_dp=sync_across_dp,
+            )
+        except BaseException as exc:
+            if error is None:
+                raise
+            exchange_error = exc
+        if error is not None:
+            raise self._memory_error_with_reduction_note(error, exchange_error)
+        if sampled[0] < 0:
+            raise RuntimeError("Memory recovery sampling failed on another rank")
+        state.invalid |= not bool(sampled[3])
+        if required <= sampled[0]:
+            return True
+        if sampled[1] == 0 or sampled[2] == 0 or state.invalid:
+            return False
+        if state.first_consumed and not (
+            costs[1] > 0 and sum(costs) <= 0.05 * values[1]
+        ):
+            return False
+        # Every peer enters this block. Only locally deficient native ranks call
+        # the process-wide allocator operation. Test-only caps cannot trigger it.
+        state.first_consumed = True
+        attempted = False
+        try:
+            if needed:
+                # The control exchange can change allocator state. Check the
+                # physical condition again immediately before the sole call.
+                free, total = torch.cuda.mem_get_info(self.device)
+                if int(free) < required + int(total * _MEMORY_RESERVE_FRACTION):
+                    attempted = True
+                    torch.cuda.empty_cache()
+            available = self._available_memory_bytes()
+        except BaseException as exc:
+            error, available = exc, -1
+        exchange_error: BaseException | None = None
+        try:
+            sampled = self._recovery_reduce(
+                [float(available), -float(attempted)],
+                op="MIN",
+                sync_across_dp=sync_across_dp,
+            )
+        except BaseException as exc:
+            if error is None:
+                raise
+            exchange_error = exc
+        else:
+            state.first_consumed |= bool(sampled[1])
+        if error is not None:
+            raise self._memory_error_with_reduction_note(error, exchange_error)
+        if sampled[0] < 0:
+            raise RuntimeError("Memory recovery failed on another rank")
+        # Rebuild pure search caches even when this fresh sample decreased.
+        return True
+
     def _memory_check_required(
         self,
         required: int,
@@ -5958,18 +6313,19 @@ class TrainerRank:
                 available = self._available_memory_bytes()
             except BaseException as exc:
                 error, available = exc, -1
+            exchange_error: BaseException | None = None
             try:
                 # A healthy communicator carries local failure to every peer
                 # in the existing MIN. This cannot repair a poisoned backend.
                 values[1] = available
                 dist.all_reduce(values[1], op=dist.ReduceOp.MIN, group=group)
                 available = int(values[1].item())
-            except BaseException:
-                if error is not None:
-                    raise error
-                raise
+            except BaseException as exc:
+                if error is None:
+                    raise
+                exchange_error = exc
             if error is not None:
-                raise error
+                raise self._memory_error_with_reduction_note(error, exchange_error)
             if available < 0:
                 raise RuntimeError("Memory admission failed on another rank")
         else:
@@ -6171,23 +6527,10 @@ class TrainerRank:
             return 1 << 60
         free, total = torch.cuda.mem_get_info(self.device)
         if torch.cuda.get_allocator_backend() == "native":
-            stats = torch.cuda.memory_stats(self.device)
-            allocated = stats.get("allocated_bytes.all.current")
-            active = stats.get("active_bytes.all.current")
-            reserved = stats.get("reserved_bytes.all.current")
-            if (
-                type(allocated) is int
-                and type(active) is int
-                and type(reserved) is int
-                and 0 <= allocated <= active <= reserved
-            ):
-                # Pending frees remain active until ordinary event collection.
-                # This excludes them, not split/private-pool incompatibilities.
-                reusable_reserved = reserved - active
-            else:
-                # Incomplete native counters cannot establish reusable cache.
-                allocated = int(torch.cuda.memory_allocated(self.device))
-                reusable_reserved = 0
+            # Cached bytes are not physical free memory. This sample does not
+            # reserve memory for execution or the caller's later backward.
+            allocated = int(torch.cuda.memory_allocated(self.device))
+            reusable_reserved = 0
         else:
             # Preserve the previous, unqualified policy for other backends.
             allocated = int(torch.cuda.memory_allocated(self.device))
