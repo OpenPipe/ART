@@ -75,7 +75,9 @@ def _rank(layer=None):
             SimpleNamespace(
                 model=[model],
                 optimizer=None,
-                provider=SimpleNamespace(hidden_size=2048, num_layers=40),
+                provider=SimpleNamespace(
+                    hidden_size=2048, num_layers=40, recompute_granularity="full"
+                ),
                 model_support_handler=SimpleNamespace(build_gdn_execution_spec=False),
             ),
         )

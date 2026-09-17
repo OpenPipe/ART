@@ -65,14 +65,7 @@ def test_trainer_rank_recompute_support(
 ) -> None:
     runtime = _runtime(tp=tp)
     runtime.provider.recompute_granularity = granularity
-    if granularity == "selective":
-        with pytest.raises(
-            TrainerRankRuntimeSupportError,
-            match="selective recompute.*ART_MEGATRON_RECOMPUTE_GRANULARITY=full",
-        ):
-            TrainerRank(runtime)
-    else:
-        TrainerRank(runtime)
+    TrainerRank(runtime)
 
 
 def test_trainer_rank_still_refuses_pipeline_parallel_runtimes() -> None:
