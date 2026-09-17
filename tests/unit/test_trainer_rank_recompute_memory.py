@@ -157,7 +157,59 @@ def test_sharded_floor_covers_recorded_native_gdn_peaks(monkeypatch, tp, peak):
     # H200, 64-layer Qwen3.8-27B, LoRA r1, SP, cold/warm max, 2,048 tokens.
     # First unsharded campaign, linked from dev/trainer_rank_recompute_memory.md.
     rank = _hybrid_rank(monkeypatch, tp)
-    assert rank._memory_check(_plan(rank, tokens=2048)).estimated_required_bytes >= peak
+    estimate = rank._memory_check(_plan(rank, tokens=2048)).estimated_required_bytes
+    assert peak <= estimate <= 1.2 * peak
+
+
+@pytest.mark.parametrize(
+    "tp,mlp,packed,logical,peak_gib",
+    [
+        (4, False, 4096, 4096, 20.613),
+        (4, False, 6964, 8192, 35.090),
+        (4, False, 13928, 16384, 69.924),
+        (8, False, 4096, 4096, 14.529),
+        (8, False, 6968, 8192, 24.654),
+        (8, False, 13928, 16384, 48.950),
+        (4, True, 4096, 4096, 11.213),
+        (4, True, 6964, 8192, 19.006),
+        (4, True, 13928, 16384, 37.881),
+    ],
+)
+def test_hybrid_estimate_is_close_to_recorded_peaks(
+    monkeypatch, tp, mlp, packed, logical, peak_gib
+):
+    # Native H200 cold/warm witnesses in the calibration report. Coverage alone
+    # would allow the former 60%-high estimate; also check useful admission.
+    rank = _hybrid_rank(monkeypatch, tp)
+    rank._recompute_modules = frozenset(("core_attn", "mlp") if mlp else ("core_attn",))
+    plan = replace(_plan(rank, tokens=packed), output_bytes=logical * 5120 * 2)
+    estimate = rank._memory_check(plan).estimated_required_bytes / 2**30
+    assert peak_gib <= estimate <= 1.15 * peak_gib
+
+
+def test_native_fusion_discount_is_independent_of_compilation(monkeypatch):
+    rank = _hybrid_rank(monkeypatch, 4)
+    plan = _plan(rank, tokens=4096)
+    fused = rank._memory_check(plan).estimated_required_bytes
+    rank.runtime.transformer_layers_compiled = False
+    assert rank._memory_check(plan).estimated_required_bytes == fused
+    rank._mlp_activation_factor = 5
+    assert rank._memory_check(plan).estimated_required_bytes > fused
+
+
+def test_mlp_discount_requires_selective_and_keeps_one_live_workspace(monkeypatch):
+    rank = _hybrid_rank(monkeypatch, 4)
+    rank._recompute_granularity = None
+    plan = _plan(rank)
+    unrecomputed = rank._memory_check(plan).estimated_required_bytes
+    rank._recompute_modules = frozenset(("mlp",))
+    assert rank._memory_check(plan).estimated_required_bytes == unrecomputed
+    rank._recompute_granularity = "selective"
+    assert rank._memory_check(plan).estimated_required_bytes < unrecomputed
+    rank._num_layers = 1
+    checkpointed = rank._memory_check(plan).estimated_required_bytes
+    rank._recompute_modules = frozenset()
+    assert rank._memory_check(plan).estimated_required_bytes == checkpointed
 
 
 def test_tp4_admits_eight_k_sibling_pair_and_prices_actual_layer_mix(monkeypatch):

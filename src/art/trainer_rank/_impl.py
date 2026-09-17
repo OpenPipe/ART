@@ -1424,6 +1424,10 @@ class TrainerRank:
             )
         spec = getattr(runtime, "model_support_spec", None)
         self._moe_layers = _moe_layer_count(runtime.model[0])
+        self._checkpointed_moe_layers = sum(
+            getattr(module, "moe_layer_recompute", False) is True
+            for module in runtime.model[0].modules()
+        )
         is_moe = bool(
             self._moe_layers
             or getattr(spec, "is_moe", False)
@@ -5185,11 +5189,10 @@ class TrainerRank:
             if geometry.moe_experts:
                 # Keep the worst-case dispatch envelope: random-weight runs
                 # cannot establish an EP discount for pretrained routing.
-                ffn_width = max(
-                    ffn_width,
+                ffn_width = (
                     geometry.moe_topk * geometry.moe_ffn_hidden_size
-                    + geometry.moe_shared_expert_ffn,
-                )
+                    + geometry.moe_shared_expert_ffn
+                ) or ffn_width
                 mlp = (
                     common + 6 * ffn_width + 2 * hidden * max(0, geometry.moe_topk - 1)
                 )
@@ -5199,17 +5202,23 @@ class TrainerRank:
                 + gdn_layers * gdn
                 + self._num_layers * mlp
             )
-            if (
-                self._recompute_granularity == "selective"
-                and "mlp" in self._recompute_modules
-                and not geometry.moe_experts
-            ):
-                # Checkpointed dense MLPs keep their input; one live MLP still
-                # needs its full workspace during the forward.
-                retained_features -= max(0, self._num_layers - 1) * (mlp - hidden / sp)
+            if self._recompute_granularity == "selective":
+                checkpointed = (
+                    self._checkpointed_moe_layers
+                    if geometry.moe_experts
+                    else self._num_layers
+                    if "mlp" in self._recompute_modules
+                    else 0
+                )
+                # Checkpoints keep their input (and MoE's external norm); one
+                # live MLP still needs workspace, including worst-case dispatch.
+                checkpoint_input = (2 if geometry.moe_experts else 1) * hidden / sp
+                retained_features -= max(0, checkpointed - 1) * (mlp - checkpoint_input)
             static_compute = max(
                 static_compute,
-                packed_tokens * self._param_dtype_size * retained_features,
+                # Cold eager runs allocate ~58 MiB beyond warm retention for
+                # native kernel initialization; a slope alone misses short inputs.
+                64 * 2**20 + packed_tokens * self._param_dtype_size * retained_features,
             )
         # Groups execute sequentially: summed packed rows conservatively bound
         # this FC2 component, not all workspace or retained graphs.

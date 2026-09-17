@@ -39,6 +39,11 @@ def main() -> None:
     parser.add_argument(
         "--components", action="store_true", help="Attribute eager layer allocations"
     )
+    parser.add_argument(
+        "--concentrate-routing",
+        action="store_true",
+        help="Send every token to the first top-k experts",
+    )
     parser.add_argument("--evidence", type=Path, required=True)
     args = parser.parse_args()
     if args.repeat < 1 or args.layers < 0 or any(n < 1 for n in args.tokens):
@@ -79,6 +84,20 @@ def main() -> None:
             provider_configure=configure,
             print_env=False,
         )
+        if args.concentrate_routing:
+            # Stress dispatch imbalance without replacing native routing/experts.
+            for module in runtime.model[0].modules():
+                if type(module).__name__ == "TopKRouter":
+
+                    def gating(inputs, original=module.gating):
+                        logits = original(inputs)
+                        selected = (
+                            torch.arange(logits.shape[-1], device=logits.device)
+                            < runtime.provider.moe_router_topk
+                        )
+                        return logits + selected * 10000
+
+                    module.gating = gating
         for chunk in runtime.model:
             chunk.train()
         if args.components and runtime.transformer_layers_compiled:
@@ -94,6 +113,7 @@ def main() -> None:
             or subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),
             "model": args.model,
             "initialization": "random",
+            "concentrated_routing": args.concentrate_routing,
             "lora_rank": 1,
             "mode": rank._recompute_granularity,
             "recompute_method": runtime.provider.recompute_method,
