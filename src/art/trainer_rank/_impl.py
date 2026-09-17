@@ -5179,7 +5179,13 @@ class TrainerRank:
         # Groups can place their peak on different ranks; summing is conservative.
         return sum(
             self._physical_tokens(
-                max(1, self._max_rank_model_tokens(group.packed, topology=topology))
+                max(
+                    1,
+                    self._max_rank_model_tokens(
+                        _pad_packed_batch(group.packed, multiple=int(topology.tp)),
+                        topology=topology,
+                    ),
+                )
             )
             for group in plan.groups
         )
