@@ -11,6 +11,7 @@ import pytest
 
 from art import TrainableModel
 from art.utils.sft import (
+    SFTChunk,
     create_lr_schedule,
     create_sft_dataset_iterator,
     iterate_file,
@@ -305,6 +306,58 @@ def test_create_sft_dataset_iterator_initial_step():
     assert len(resumed_chunks) == 1
     # Resumed chunk should have the same LRs as the second full chunk
     assert resumed_chunks[0].config.learning_rate == all_chunks[1].config.learning_rate
+
+
+@pytest.mark.parametrize("dataset_size", [5, 6])
+@pytest.mark.parametrize("shuffle", [False, True])
+@pytest.mark.parametrize("initial_step", range(8))
+def test_create_sft_dataset_iterator_resume_batches(
+    dataset_size, shuffle, initial_step
+):
+    # Each epoch has three batches, so its second chunk has only one batch.
+    trajs = _make_trajectories(dataset_size)
+    all_chunks = list(
+        create_sft_dataset_iterator(
+            trajs,
+            chunk_size=2,
+            epochs=2,
+            batch_size=2,
+            shuffle=shuffle,
+            show_progress=False,
+        )
+    )
+    resumed_chunks = list(
+        create_sft_dataset_iterator(
+            trajs,
+            chunk_size=2,
+            epochs=2,
+            batch_size=2,
+            shuffle=shuffle,
+            initial_step=initial_step,
+            show_progress=False,
+        )
+    )
+
+    def batches(chunks: list[SFTChunk]):
+        result = []
+        for chunk in chunks:
+            lrs = chunk.config.learning_rate
+            assert isinstance(lrs, list)
+            for offset, lr in zip(
+                range(0, len(chunk.trajectories), 2), lrs, strict=True
+            ):
+                result.append(
+                    (
+                        chunk.trajectories[offset : offset + 2],
+                        lr,
+                        chunk.step + offset // 2,
+                        chunk.epoch,
+                        chunk.epoch_step + offset // 2,
+                    )
+                )
+        return result
+
+    assert batches(resumed_chunks) == batches(all_chunks)[initial_step:]
 
 
 def test_create_sft_dataset_iterator_deterministic():
