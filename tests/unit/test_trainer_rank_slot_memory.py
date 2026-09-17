@@ -77,7 +77,9 @@ def test_selected_rank_prices_real_loaded_parameters(layer, base, selected, grad
     adapter = layer.experts.linear_fc2.lora
     active = adapter._slot(ref)
     expected_transposes = 256 * max(8, selected) * (512 + 2048) * 2
-    assert _expert_lora_weight_storage(adapter, ref)[1] == expected_transposes
+    storage = _expert_lora_weight_storage(adapter, ref)
+    assert storage is not None
+    assert storage[1] == expected_transposes
     assert active.A_T.shape[-1] == selected and adapter.A_T.shape[-1] == base
     for rows in (1, 64, 50640):
         assert rank._moe_workspace_bytes(
@@ -128,8 +130,11 @@ def test_mixed_slot_context_and_exact_search_fallback(layer):
 def test_gdn_pending_uses_selected_output_rank(layer):
     rank, gd = rank_with_moe(weights(layer, 8))
     small, large = load_slot(rank, "small", 1), load_slot(rank, "large", 64)
-    small_shape = _gdn_memory.model_shapes(rank, small)[1][0]
-    large_shape = _gdn_memory.model_shapes(rank, large)[1][0]
+    small_shapes = _gdn_memory.model_shapes(rank, small)
+    large_shapes = _gdn_memory.model_shapes(rank, large)
+    assert small_shapes is not None and large_shapes is not None
+    small_shape = small_shapes[1][0]
+    large_shape = large_shapes[1][0]
     assert (small_shape.output_lora_rank, large_shape.output_lora_rank) == (1, 64)
     p = rank._plan_flat_forward(
         [request("large", rows=65, grad=True)], ensure_slots=False
@@ -207,7 +212,9 @@ def test_slot_pricing_retains_original_owner_guards(layer, kind):
             if kind == "foreign"
             else partial(_moe_dispatch_preprocess, object())
             if kind == "wrong owner"
-            else partial(_moe_dispatch_preprocess, dispatcher, hidden_states=None)
+            else partial(
+                _moe_dispatch_preprocess, dispatcher, hidden_states=torch.empty(0)
+            )
         )
         assert rank._moe_workspace_bytes(1, slot_ref=ref) == 0
 

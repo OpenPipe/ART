@@ -1498,7 +1498,7 @@ def _moe_output_bytes_per_token(
             experts = getattr(layer, "experts", None)
             fc2: Any = getattr(experts, "linear_fc2", None)
             lora: Any = getattr(fc2, "lora", None)
-            dispatcher = getattr(layer, "token_dispatcher", None)
+            dispatcher: Any = getattr(layer, "token_dispatcher", None)
             sites = (
                 (layer, MoELayer),
                 (experts, TEGroupedMLP),
