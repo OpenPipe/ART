@@ -187,16 +187,16 @@ def test_warm_admission_rechecks_current_residency(monkeypatch):
     )
     monkeypatch.delenv("ART_TRAINER_RANK_TEST_HOOKS", raising=False)
     # Fresh memory accounting observes newly resident state without discarding
-    # a valid incremental profile; cached free blocks remain reusable.
+    # a valid incremental profile; cache alone is not physical availability.
     for allocated, reserved, fits in [
         (10_000, 10_000, True),
         (90_000, 90_000, False),
-        (10_000, 90_000, True),
+        (10_000, 90_000, False),
     ]:
         state.update(allocated=allocated, reserved=reserved)
         check = rank._memory_check(plan)
         assert check.estimated_required_bytes == required
-        assert check.available_bytes == total - allocated - 3000
+        assert check.available_bytes == total - reserved - 3000
         assert check.fits == fits
         assert rank._memory_profiles[plan.signature] == profile
 

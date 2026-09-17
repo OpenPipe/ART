@@ -211,6 +211,12 @@ def _counter_split(monkeypatch):
 
 def test_completed_iterator_preserves_caller_peak_for_next_admission(monkeypatch):
     rank, requests, counters = _counter_split(monkeypatch)
+    # This fixture's 10,000-byte admission budget is synthetic, not a physical
+    # deficit. Keep its learned-floor refusal independent of cache recovery.
+    monkeypatch.setattr(torch.cuda, "get_allocator_backend", lambda: "native")
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda _: (1_000_000, 1_000_000))
+    releases = []
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: releases.append(True))
     iterator = rank.forward_micro_batches([requests], yield_empty=True)
     batch = next(iterator)
     assert batch.stats.subforward_count == counters["executed"] == 2
@@ -224,6 +230,8 @@ def test_completed_iterator_preserves_caller_peak_for_next_admission(monkeypatch
     with pytest.raises(tr.TrainerRankMemoryError):
         next(rank.forward_micro_batches([requests], yield_empty=True))
     assert counters["executed"] == 2
+
+    assert releases == []
 
 
 @pytest.mark.parametrize("termination", ["throw", "close"])
@@ -306,7 +314,7 @@ def test_empty_dp_rank_retains_global_selection_collective_sequence(monkeypatch)
 
             patch.setattr(rank, "_search_next_micro_batch", searched)
 
-            def reduce(value, op, group):
+            def reduce(value, op, group=None):
                 trace.append(("global" if group is None else "local", str(op)))
                 if group is None:
                     value.fill_(
