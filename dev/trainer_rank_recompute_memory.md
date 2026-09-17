@@ -79,6 +79,12 @@ The existing static heuristic and routed FC2 bound remain floors. Profiles can
 only increase the estimate, and output storage and the 10% safety factor are
 applied afterward. Full-recompute and no-grad requests keep their existing path.
 
+The floor also applies with recompute disabled (`None`), including the `none`
+override and EP-overlap MoE trainers. Previously admitted workloads may now split
+or, for indivisible groups, be refused. Balanced MoE routing can be priced about
+3× above its measured peak because the allowance protects uneven dispatch.
+Caladan's full-recompute default is unaffected.
+
 ## Cross-checks and remaining conservatism
 
 The [CSV](trainer_rank_recompute_memory.csv) includes short-input failures that
@@ -175,7 +181,54 @@ runs in `scratch/recompute-memory-components/` and `scratch/recompute-memory-tig
 
 The [previous report](https://github.com/OpenPipe/ART/blob/57f9de2f9/dev/trainer_rank_recompute_memory.md)
 records the looser estimate and the earlier full-recompute underestimation.
-This work does not validate that legacy path, larger LoRA ranks, CP, pretrained
-routing distributions, arbitrary deep prefix trees, or other hardware/kernels.
+This initial campaign does not validate that legacy path, larger LoRA ranks, CP,
+pretrained routing distributions, arbitrary deep prefix trees, or other hardware/kernels.
 These measurements support the calibrated native paths, not a universal memory
 bound.
+
+## Context-parallel follow-up (#922)
+
+Dense selective and disabled-recompute floors now use the largest actual
+attention/GDN token load on any CP rank, summed across forward groups and padded
+as execution pads them. Balanced layouts approach a 1/CP token discount. Uneven
+layouts must use their actual load: the 27B 4k pair packs 6,964 global tokens but
+puts 4,096 on its busiest rank. Dividing by two would underprice its observed
+62.918 GiB peak. GDN segment states and cold workspace are not divided by CP;
+gathered outputs, the old static floor, and profile floors remain unchanged.
+
+Width selection uses the existing exact-plan fallback for these CP requests,
+reusing the native planner cache. This requires more CPU planning than a global
+token-count probe. The average CP load is used only as an optimistic split-search
+bound. MoE retains the previous estimate because expert dispatch can concentrate
+tokens from multiple CP ranks; it needs separate calibration before a discount.
+
+The follow-up measurements use two local H200s, TP1/CP2, eager native execution,
+bf16, rank-1 LoRA, random weights, and paired sequences with 30% shared prefixes.
+The [CP CSV](trainer_rank_recompute_memory_cp.csv) records maxima across ranks and
+both repetitions, including source hashes and forward/backward peaks. Values
+below are incremental allocated GiB and include the existing 10% estimate margin.
+
+| Model / tokens per sequence | Recompute | Previous estimate | CP estimate | Forward peak |
+| --- | --- | ---: | ---: | ---: |
+| 27B / 2,048 | selective | 69.123 | 34.954 | 31.518 |
+| 27B / 4,096 | selective | 117.374 | 69.524 | 62.918 |
+| 4B / 4,096 | selective | 41.478 | 20.922 | 18.727 |
+| 4B / 4,096 | none | 41.478 | 20.922 | 19.356 |
+| 4B / 4,096 | selective + mlp | 25.760 | 13.063 | 11.581 |
+| 1.7B / 4,096 | selective | 21.002 | 15.477 | 13.932 |
+
+All 13 cells (52 rank-samples) cover the measured forward peak, with at least 8.1%
+headroom; every backward completes with finite losses and adapter gradients.
+The 64-token 4B pair's cold backward peaks above its forward estimate (0.699 vs
+0.602 GiB); admission estimates forward memory, not arbitrary caller backward.
+Estimator source is `7d5fb47ce164fce3801cc8df1ce531c3a84832f5`; the initial 4B
+selective series uses `7467f35bb179ae11de6dfd960ff1b037ab4b8690`, before a TP-padding
+correction that does not change TP1. The CSV records both source and driver hashes.
+
+The 27B 4k pair now fits its 81.868 GiB incremental budget and completes backward;
+the previous estimate would refuse it. To reproduce, use the command above with
+TP=1, CP=2, `ART_DISABLE_MEGATRON_COMPILE=1`, and `--nproc-per-node=2`.
+Use `--model Qwen/Qwen3.5-4B` for the 4B checks and `--mode none` or
+`--modules core_attn mlp` for the other modes. Raw JSONL is retained under
+`scratch/recompute-memory-cp/`. This extends calibration to these dense CP2
+paths; larger CP sizes, combined TP/CP, and MoE CP remain uncalibrated.

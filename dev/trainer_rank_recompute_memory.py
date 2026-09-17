@@ -204,6 +204,7 @@ def main() -> None:
                     "logical_tokens": plan.logical_tokens,
                     "packed_tokens": plan.packed_tokens,
                     "grad_segment_count": plan.grad_segment_count,
+                    "retained_tokens": rank._plan_retained_tokens(plan),
                     "output_bytes": plan.output_bytes,
                     "selected_max_depth": plan.selected_max_depth,
                     "memory_minimal": memory_minimal,
