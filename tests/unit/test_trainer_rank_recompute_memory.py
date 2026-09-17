@@ -68,7 +68,7 @@ def test_reported_cold_request_is_refused_before_execution(
     rank = _rank(granularity)
     monkeypatch.setattr(rank, "_topology_key", lambda: (1, tp, 1, 1))
     monkeypatch.setattr(rank, "_dp_rank_and_size", lambda: (0, 1))
-    monkeypatch.setattr(rank, "_available_memory_bytes", lambda: int(119.289e9))
+    monkeypatch.setattr(rank, "_available_memory_bytes", lambda: int(119.289 * 2**30))
     monkeypatch.setattr(
         rank, "_execute_flat_plan", lambda _: pytest.fail("unsafe forward admitted")
     )
@@ -138,6 +138,8 @@ def _hybrid_rank(monkeypatch: pytest.MonkeyPatch, tp: int) -> TrainerRank:
     rank = _rank(
         "selective",
         sequence_parallel=True,
+        bias_activation_fusion=True,
+        attention_output_gate=True,
         linear_num_key_heads=16,
         linear_key_head_dim=128,
         linear_num_value_heads=48,
@@ -208,6 +210,7 @@ def test_gathered_inputs_cover_attention_only_cold_peak(
         ffn_hidden_size=6144,
         num_layers=28,
         num_attention_heads=16,
+        num_query_groups=8,
         kv_channels=128,
         sequence_parallel=True,
     )

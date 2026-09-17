@@ -1380,17 +1380,29 @@ class TrainerRank:
             or getattr(runtime.provider, "num_layers", 1)
             or 1
         )
+        memory_config = getattr(metadata_model, "config", None) or runtime.provider
         self._recompute_granularity = getattr(
-            getattr(metadata_model, "config", None),
-            "recompute_granularity",
-            getattr(runtime.provider, "recompute_granularity", None),
+            memory_config, "recompute_granularity", None
+        )
+        self._recompute_modules = frozenset(
+            getattr(memory_config, "recompute_modules", ()) or ()
         )
         self._sequence_parallel = bool(
-            getattr(
-                getattr(metadata_model, "config", None),
-                "sequence_parallel",
-                getattr(runtime.provider, "sequence_parallel", False),
-            )
+            getattr(memory_config, "sequence_parallel", False)
+        )
+        self._attention_output_gate = bool(
+            getattr(memory_config, "attention_output_gate", False)
+        )
+        # Native fused SwiGLU retains gate/up and the output (3F). Eager
+        # unfused SwiGLU also retains SiLU and offset tensors (5F). Compilation
+        # may fall back, so only the native fusion setting earns this discount.
+        self._mlp_activation_factor = (
+            3
+            if getattr(memory_config, "bias_activation_fusion", False)
+            and not getattr(memory_config, "use_te_activation_func", False)
+            else 5
+            + 2
+            * (getattr(memory_config, "activation_func_clamp_value", None) is not None)
         )
         # Layers that run the gated-delta-net path (Qwen3.5-4B: 24 of 32); the
         # cost model prices GDN state hand-offs per GDN layer, not per layer.
@@ -5140,51 +5152,61 @@ class TrainerRank:
         )
         if signature.grad_enabled and self._recompute_granularity != "full":
             geometry = self._geometry
-            ffn_width = max(
-                geometry.ffn_hidden_size or 4 * self._hidden_size,
-                geometry.moe_topk * geometry.moe_ffn_hidden_size
-                + geometry.moe_shared_expert_ffn,
-            )
             hidden = self._hidden_size
-            attention_width = max(
-                hidden, geometry.num_attention_heads * geometry.kv_channels
-            )
-            gdn_width = max(
-                hidden,
-                2 * geometry.gdn_key_heads * geometry.gdn_key_head_dim
-                + 2 * geometry.gdn_value_heads * geometry.gdn_value_head_dim,
-            )
             tp = max(1, self._topology_key()[1])
             sp = tp if self._sequence_parallel else 1
-            gdn_layers = min(self._num_layers, self._gdn_layers)
-            # Split Megatron's 9H attention/norm term into 5H of norms/residuals
-            # (sequence parallel) and projection intermediates (tensor parallel).
-            # Gated MLPs also retain unfused gate/up and LoRA sums: four FFN
-            # widths underpredicted native eager peaks; charge six in both modes
-            # since torch.compile can fall back to eager. GDN's projection,
-            # convolution and recurrent streams use a separate seven-width term
-            # (see dev/trainer_rank_recompute_memory.md). ART's LoRA path
-            # additionally retains gathered H-wide inputs to attention and MLP,
-            # even with SP. Price hybrid layers separately, not at the max width.
-            layer_features = 5 * hidden / sp + 2 * hidden
-            if geometry.moe_experts:
-                # Routed/shared expert storage gets no TP/EP discount without
-                # evidence for expert sharding and imbalanced dispatch.
-                layer_features += 6 * ffn_width + 2 * hidden * max(
-                    0, geometry.moe_topk - 1
+            # Gathered LoRA inputs alias norm output without sequence sharding.
+            gathered = hidden if sp > 1 else 0
+            common = 2 * hidden / sp + gathered
+            attention_width = (
+                geometry.num_attention_heads * geometry.kv_channels or hidden
+            )
+            kv_width = geometry.num_query_groups * geometry.kv_channels or hidden
+            gated = self._attention_output_gate
+            attention = (
+                common + ((7 if gated else 5) * attention_width + 3 * kv_width) / tp
+            )
+            if 0 < geometry.num_query_groups < tp:
+                # SelfAttentionLinearQKVLoRA constructs global QKV before
+                # slicing it when KV groups cannot be partitioned across TP.
+                attention += ((2 if gated else 1) * attention_width + 2 * kv_width) * (
+                    1 - 1 / tp
                 )
-            else:
-                layer_features += 6 * ffn_width / tp
-            retained_features = (
-                self._num_layers * layer_features
+            gdn = (
+                common
                 + (
-                    (self._num_layers - gdn_layers) * (9 * attention_width - 5 * hidden)
-                    + gdn_layers * (7 * gdn_width - 5 * hidden)
+                    4 * geometry.gdn_key_heads * geometry.gdn_key_head_dim
+                    + 8 * geometry.gdn_value_heads * geometry.gdn_value_head_dim
                 )
                 / tp
             )
-            # Optional selective modules retain the conservative undiscounted
-            # floor until their effective native checkpoint boundaries are tested.
+            ffn_width = geometry.ffn_hidden_size or 4 * hidden
+            mlp = common + self._mlp_activation_factor * ffn_width / tp
+            if geometry.moe_experts:
+                # Keep the worst-case dispatch envelope: random-weight runs
+                # cannot establish an EP discount for pretrained routing.
+                ffn_width = max(
+                    ffn_width,
+                    geometry.moe_topk * geometry.moe_ffn_hidden_size
+                    + geometry.moe_shared_expert_ffn,
+                )
+                mlp = (
+                    common + 6 * ffn_width + 2 * hidden * max(0, geometry.moe_topk - 1)
+                )
+            gdn_layers = min(self._num_layers, self._gdn_layers)
+            retained_features = (
+                (self._num_layers - gdn_layers) * attention
+                + gdn_layers * gdn
+                + self._num_layers * mlp
+            )
+            if (
+                self._recompute_granularity == "selective"
+                and "mlp" in self._recompute_modules
+                and not geometry.moe_experts
+            ):
+                # Checkpointed dense MLPs keep their input; one live MLP still
+                # needs its full workspace during the forward.
+                retained_features -= max(0, self._num_layers - 1) * (mlp - hidden / sp)
             static_compute = max(
                 static_compute,
                 packed_tokens * self._param_dtype_size * retained_features,
