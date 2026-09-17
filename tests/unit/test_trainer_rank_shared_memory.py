@@ -116,7 +116,11 @@ def test_shared_return_in_actual_constructor_and_plan(layer, gate, no_grad):
     )
     if no_grad:
         assert g.plan_floor(rank, plan) == (0, 0)
-        assert rank._plan_cost(plan).required == 10723911264
+        assert rank._checkpoint_memory_floor(rank._plan_group_rows(plan)) == (
+            0,
+            50640 * (192512 + 4 * 2048 * 2),
+        )
+        assert rank._plan_cost(plan).required == 11636565600
     else:
         assert g.plan_floor(rank, plan) == (
             8296857600,
@@ -339,11 +343,12 @@ def test_pre_gate_mixed_reference_and_exact_cost_mode_selection(layer, gradient_
     )
     # A reference-only path must not read or validate the unused gradient cache.
     rank._moe_checkpoint_grad_bytes_per_token = None
+    rank._moe_gradient_stages = None
     reference_plan = rank._plan_flat_forward([reference])
     assert g.plan_floor(rank, reference_plan) == (0, 0)
     assert rank._checkpoint_memory_floor(rank._plan_group_rows(reference_plan)) == (
         0,
-        0,
+        4096 * (192512 + 4 * 2048 * 2),
     )
     assert (
         rank._memory_check(reference_plan).estimated_required_bytes

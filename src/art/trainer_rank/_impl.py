@@ -3653,7 +3653,8 @@ class TrainerRank:
         ):
             return 0, 0
         retained = gradient_rows * layers * self._hidden_size * 2
-        self._checkpoint_moe_bytes_per_token()
+        if gradient_rows:
+            self._checkpoint_moe_bytes_per_token()
         workspace = max(
             self._moe_workspace_bytes(rows, checkpoint_grad=grad)
             + (0 if gradient_rows else 4 * rows * self._hidden_size * 2)
