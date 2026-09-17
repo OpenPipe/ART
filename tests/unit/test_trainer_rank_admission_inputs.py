@@ -10,7 +10,7 @@ from test_trainer_rank_recompute_memory import _hybrid_rank
 import torch
 
 from art.trainer_rank import ForwardInput, _gdn_memory
-from art.trainer_rank._impl import Unset
+from art.trainer_rank._impl import Unset, _FlatForwardPlan
 
 
 def record_prices(monkeypatch, rank):
@@ -122,6 +122,7 @@ def test_cp_gdn_segments_groups_and_retained_tokens_reach_exact_search(monkeypat
     # The outer sequence contains one multi-request wave. A flat list would
     # instead let width search select separate top-level requests.
     selected = rank._search_next_micro_batch([requests], 0)
+    assert isinstance(selected.plan, _FlatForwardPlan)
     assert selected.check.fits and selected.plan.grad_segment_count == 2
     assert selected.check.estimated_required_bytes == cost.required
     assert calls
