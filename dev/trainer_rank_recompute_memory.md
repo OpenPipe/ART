@@ -1,128 +1,150 @@
-# Recompute memory calibration, September 16, 2026
+# Recompute memory calibration
 
-The sharded retained-activation estimate admits the requested Qwen3.8-27B
-selective TP4 series (two sequences of 2k, 4k, and 8k tokens), bounds measured
-forward peaks in compiled and eager execution, and refuses #913's original long
-pair before execution. It accounts for the actual 48 GDN / 16 attention layers.
+The revised estimate is **10–13% above measured 27B peaks** for the paired
+2k-and-larger workloads, including MLP recompute. The previous TP4 estimate was
+about 60% high. The new floor admits a 12k TP4 pair and, at TP8, the original
+19,221 + 19,222-token pair from #913. Both complete forward and backward.
 
-The [CSV](trainer_rank_recompute_memory.csv) records final estimator commit
-`aef12a9e8502d181fbc614198a4bc4b438a34e9f`, plus an earlier eager-execution failure
-as a negative control. Each row aggregates all ranks and two repetitions for one
-model/topology/mode/shape. Peaks are maxima; available memory is the minimum;
-refusals have blank measurement fields. Source and driver hashes are per row.
+All numbers below are **incremental allocated GiB above the pre-forward
+baseline**, not total GPU use or reserved memory. The estimate includes the
+existing 10% safety margin. Measurements use native H200 execution with bf16,
+rank-1 LoRA, random model/adaptor weights, SP enabled, and DP/CP/PP=1.
 
-## Requested TP4 calibration
+## Requested 27B series and admission boundary
 
-All values are **incremental allocated GiB above the pre-forward baseline**,
-not total GPU usage or reserved memory. Model/adaptor weights are random; this
-measures the native runtime's memory behavior, not pretrained correctness.
+Qwen3.8-27B has 48 GDN and 16 full-attention layers. Pairs share 30% of their
+prefix; the planner chooses the layout, including TP padding.
 
-Qwen3.8-27B, 64 layers, bf16, LoRA rank 1, selective `core_attn`, SP enabled:
+| Tokens per sequence | TP | Packed tokens | Previous estimate | New estimate | Compiled forward | Eager forward |
+| --: | --: | --: | --: | --: | --: | --: |
+| 2,048 | 4 | 4,096 | 32.974 | 22.854 | 20.513 | 20.550 |
+| 4,096 | 4 | 6,964 | 56.075 | 38.789 | 35.077 | 35.071 |
+| 8,192 | 4 | 13,928 | 112.151 | 77.273 | 69.800 | 69.926 |
+| 12,288 | 4 | 20,892 | — | 115.757 | 104.661 | 104.780 |
+| 2,048 | 8 | 4,096 | 19.259 | 15.917 | 14.462 | — |
+| 4,096 | 8 | 6,968 | 32.775 | 27.027 | 24.613 | — |
+| 8,192 | 8 | 13,928 | 65.513 | 53.835 | 48.947 | — |
+| 16,384 | 8 | 27,856 | 131.025 | 107.484 | 97.649 | — |
+| 19,221 + 19,222 | 8 | 32,712 | 153.866 | 126.188 | 114.665 | — |
 
-| Tokens per sequence | Packed tokens | Estimate | Compiled forward | Eager forward | Compiled forward + backward |
-| --: | --: | --: | --: | --: | --: |
-| 2,048 | 4,096 | 32.974 | 20.576 | 20.613 | 20.759 |
-| 4,096 | 6,964 | 56.075 | 35.088 | 35.079 | 35.482 |
-| 8,192 | 13,928 | 112.151 | 69.811 | 69.924 | 70.598 |
+The 12k TP4 and original long TP8 shapes were not used to fit the component
+coefficients. The latter was previously refused, so its true selective peak
+was unknown. TP4 still refuses the original pair, now at 181.075 GiB. The new
+8k TP4 estimate fits both the measured budget and #913's 119.289 GiB budget.
+The issue's error labels say GB but divide bytes by 1024³.
 
-Each pair shares 30% of its prefix. The planner chose an unshared layout for the
-2k pair and shared layouts for 4k/8k; token counts include TP padding. The compiled
-run's pre-forward allocation was at most 13.007 GiB, with a usable incremental
-budget of at least 120.004 GiB. The 8k prediction also fits the issue's 119.289 GiB
-budget. No-recompute peaks were 20.577 / 35.090 / 69.816 GiB under the same estimates.
+Adding `mlp` to selective recomputation at TP4 gives:
 
-The original synthetic sibling geometry (19,221 + 19,222 logical tokens, sharing
-5,733 prefix tokens) is refused at TP4 with a 263.403 GiB estimate for 32,712 packed
-tokens. This is an admission result, **not a measured long-pair selective peak**.
+| Tokens per sequence | Estimate | Forward peak | Forward + backward peak |
+| --: | --: | --: | --: |
+| 2,048 | 12.567 | 11.150 | 11.209 |
+| 4,096 | 21.300 | 19.006 | 19.163 |
+| 8,192 | 42.294 | 37.881 | 38.195 |
+| 16,384 | 84.283 | 75.761 | 76.393 |
 
-## What changed in the estimate
+## What is being priced
 
-For gradient-enabled non-full recompute, the retained floor is the packed token
-count times dtype bytes times the sum of layer storage. Dense layers retain
-`5H/SP + 2H + 6F/TP`, plus `(9A - 5H)/TP` for each attention layer or
-`(7G - 5H)/TP` for each GDN layer. Here `H` is hidden width, `F` is FFN width,
-`A = max(H, heads * head_dim)`, `G = max(H, 2*key_width + 2*value_width)`, and
-`SP` is TP when sequence parallel is enabled, otherwise 1.
+Component hooks on eager native layers separated MLP, attention, and GDN
+retention. They exposed native activation fusion as the main MLP distinction:
+Qwen3.8 uses fused SwiGLU even in eager execution, while Qwen3-1.7B uses the
+unfused path. Compilation alone is not a reliable discount because it can fall
+back to eager.
 
-- The norm/residual term follows the SP distinction in
-  [Megatron's activation model](https://github.com/NVIDIA/Megatron-LM/blob/main/megatron/training/theoretical_memory_usage.py).
-  Projection and dense MLP storage receive TP discounts. The separate `2H`
-  remains replicated because ART's LoRA wrappers retain gathered attention and
-  MLP inputs even with SP (`return_layernorm_output_gathered` and
-  `_column_parallel_lora_input` in `src/art/megatron/lora.py`).
-- Four FFN widths covered compiled attention-only runs but underestimated eager
-  execution. Six cover the measured eager gate/up activations and LoRA sums.
-  Both execution modes use six: compilation can fall back to eager.
-- GDN uses its own seven-width calibrated envelope for projection, convolution,
-  and recurrent storage. Charge it only to actual GDN layers, instead of charging
-  every layer the maximum of attention and GDN widths. This is an empirical
-  envelope for the measured native paths, not an exact tensor-liveness proof.
-- Routed/shared expert FFN and dispatch storage receive no TP/EP/ETP discount.
-  Optional `mlp`/`moe` recomputation receives no discount in this revision.
-- The existing static estimate and MoE FC2 estimate remain floors. Learned
-  profiles can only raise the estimate; output bytes and the existing 10% safety
-  margin are still applied. No-grad and full-recompute paths are unchanged.
+Let H be hidden width, F dense FFN width, Q the full query width, KV the full
+key/value width, and K/V the GDN key/value widths. SP is TP when sequence
+parallel is enabled, otherwise 1. The common per-component term is
+`2H/SP + gathered`, with `gathered = H` when SP>1 and zero otherwise: without
+sequence sharding, the LoRA input aliases norm output.
 
-## Additional evidence
+- Dense MLP storage is `common + cF/TP`: c=3 for native fused activations,
+  c=5 for unfused SwiGLU, with an additional allowance for unfused clamping.
+  These count gate/up, activation output, and the unfused SiLU/offset tensors.
+- Full attention costs `common + (5Q + 3KV)/TP`, with another `2Q/TP` for
+  output gating. If KV groups are fewer than TP ranks, ART's replicated-QKV
+  LoRA path adds the global QKV storage that survives slicing. Omitting that
+  term underprices TP8.
+- GDN costs `common + (4K + 8V)/TP`. Attention and GDN terms are multiplied by
+  their actual layer counts. These are calibrated envelopes of the measured
+  native paths, not an exact liveness proof for every kernel.
+- Checkpointed dense MLPs retain their inputs. Native MoE checkpoint flags
+  determine the discounted MoE layer count; its external norm is also priced.
+  One full MLP workspace remains charged, including worst-case expert dispatch.
+- Each gradient-enabled prefix segment gets an allowance for initial/final GDN
+  recurrent states (fp32) and convolution history. Exact plans use actual
+  segment counts; cheap admission uses the radix-tree bound, and optimistic
+  pruning omits this nonnegative term. A separate 64 MiB allowance covers the
+  observed roughly 58 MiB cold kernel setup cost.
 
-Qwen3.8-27B selective TP8, compiled:
+The existing static heuristic and routed FC2 bound remain floors. Profiles can
+only increase the estimate, and output storage and the 10% safety factor are
+applied afterward. Full-recompute and no-grad requests keep their existing path.
 
-| Tokens per sequence | Estimate | Forward peak |
-| --: | --: | --: |
-| 2,048 | 19.259 | 14.524 |
-| 4,096 | 32.775 | 24.612 |
-| 8,192 | 65.513 | 48.947 |
+## Cross-checks and remaining conservatism
 
-No-recompute peaks were 14.525 / 24.614 / 48.950 GiB. The final estimate refuses
-16k pairs (131.025 GiB) and the original long pair (153.866 GiB) at TP8. Those
-selective peaks remain unmeasured; TP sharding does not remove gathered storage,
-and the estimate can still over-refuse near capacity.
+The [CSV](trainer_rank_recompute_memory.csv) includes short-input failures that
+motivated the fixed costs. Without segment states, a 64-token 27B TP4 pair was
+estimated at 0.776 GiB against 0.832 GiB observed. The corrected estimate is
+0.934 GiB against a fresh eager peak of 0.842 GiB. Eight unshared 64-token
+sequences at TP2 also pass: 6.294 estimated versus 5.262 observed. Larger
+8-sequence batches and 4B MLP-checkpointed pairs provide additional checks.
 
-The eager attention-only negative control is Qwen3-1.7B TP2, pairs of
-1,024 / 4,096 / 8,192 / 16,384 tokens. Before the six-FFN correction, predictions
-were 2.567 / 10.262 / 20.524 / 41.046 GiB against observed
-2.835 / 11.121 / 22.223 / 44.297 GiB. Re-running the final code produced the same
-peaks with estimates 3.181 / 12.717 / 25.434 / 50.863 GiB. The smallest observed
-headroom in the final campaign is 12.2%. Recorded peaks are regression witnesses:
-restoring the old estimator fails all four, and dropping the gathered-input term
-fails three.
+Qwen3.5-4B TP2 with MLP recompute, pairs of 2,048 / 5,120 / 10,240 tokens and a
+50% common prefix, yields estimates 7.253 / 17.872 / 26.801 against peaks
+6.443 / 16.036 / 24.078 GiB. A 9B TP2 check used previously unmeasured 5k / 10k
+lengths with a 60% prefix: 25.002 / 49.936 estimated against 22.832 / 45.405 GiB,
+before adding the nonnegative segment-state term.
 
-A held-out Qwen3.5-9B model at TP2 used pairs of 3,072 / 6,144 tokens with a 60%
-shared prefix, after coefficients were fixed. Estimates 23.158 / 46.305 GiB covered
-forward peaks 14.155 / 28.005 GiB and forward/backward peaks 14.352 / 28.399 GiB.
+The unfused attention-only eager control is covered from 64 through 16,384
+tokens per sequence. Its larger inputs have about 9% headroom. Compiled-only
+Qwen3-1.7B peaks are lower: 12.172 / 24.275 estimated against 8.832 / 17.515 GiB
+for 4k / 8k pairs. That remaining 38–39% overestimate preserves the eager
+fallback allowance; it does not apply to the natively fused 27B MLP.
 
-Adding `mlp` to selective recomputation on the 27B at TP4 reduced the 2k / 4k /
-8k forward peaks to 11.213 / 19.006 / 37.881 GiB, under the same estimates.
-Qwen3.5-35B-A3B at TP4/EP4/ETP1 used 1k / 2k / 4k pairs: estimates
-16.852 / 33.705 / 57.310 GiB covered default selective peaks
-4.536 / 8.277 / 13.990 GiB. Adding `moe` reduced them to
-2.622 / 4.536 / 7.710 GiB. These runs support keeping the current undiscounted
-floor; they do not establish per-module discounts or bounds on pretrained routing
-imbalance. Compiled attention-only selective and no-recompute controls also pass.
+MoE cannot assume balanced expert dispatch. Qwen3.5-35B-A3B, TP4/EP4/ETP1:
 
-The final campaign contains **46 cells: 296 measured rank-samples and 48 refused
-rank-samples**. Every measured forward was covered, every backward completed
-without CUDA OOM, and every loss and adapter gradient was finite. The CSV also
-includes four cells / 16 rank-samples from the earlier eager negative control;
-those failed coverage checks are intentionally preserved, not final-code failures.
+| Tokens per sequence | Default estimate | Balanced peak | Concentrated peak | With `moe`: estimate | Balanced peak | Concentrated peak |
+| --: | --: | --: | --: | --: | --: | --: |
+| 1,500 | 18.283 | 6.483 | 13.941 | 4.290 | 3.749 | 4.056 |
+| 3,000 | 31.023 | 10.380 | 23.027 | 7.236 | 5.681 | 6.193 |
+| 6,000 | 61.878 | 20.297 | 45.639 | 14.305 | 11.291 | 12.343 |
 
-## Method, reproduction, and limits
+The concentrated eager run routes about 31/32 of tokens to the first expert
+rank; the balanced run uses the native random-weight router with compilation.
+Their difference includes both routing and execution mode. The routed term
+uses actual top-k expert plus shared FFN widths, not the unrelated dense FFN
+fallback. It still makes no EP/ETP discount and is deliberately loose for
+balanced routing. MoE recomputation removes most of that retained storage.
 
-NVIDIA H200, PyTorch 2.11.0+cu128, CUDA 12.8, bf16, DP/CP/PP=1. Each mode runs in a
-fresh process. Every repetition clears learned memory profiles, gradients, and
-unused cached allocations. Sample 0 includes any first-execution compilation and
-autotuning; sample 1 is warm. Both contribute to reported maxima.
+A fully concentrated stress attempt segfaulted in Transformer Engine's grouped
+GEMM on peers receiving zero tokens, before a complete measurement. The revised
+stress keeps those peers nonempty. This kernel limitation is not fixed by the
+memory estimate and is not counted as a successful calibration cell.
 
-The driver plans paired hidden-state requests with gradients, tries the
-minimum-memory layout if admission refuses, and executes the unsplit native plan
-only if it fits. It then backpropagates a mean-square hidden-state loss. There is
-no admission bypass, splitting, or optimizer step. Forward/backward peaks include
-the diagnostic loss; finite-gradient checks happen after peak/timing collection.
-Raw JSONL also records geometry, every rank/sample, timing, and allocator totals.
-Driver SHA-256: `42e9898ce34d566da5b9ebd2d3ef608317ae61b2d51f3ede058216d2ee61e788`.
+## Evidence and reproduction
 
-On a configured GPU machine, after
-`INSTALL_VLLM_RUNTIME=false bash src/art/megatron/setup.sh`:
+The final campaign contains **45 cells, 360 measured rank-samples, and 4 refused
+rank-samples**. Every measured forward is covered; every backward completes;
+all measured losses and adapter gradients are finite. The smallest observed
+forward headroom is 5.4%. The CSV also preserves earlier controls and negative
+controls as separate phases, with the actual source/driver hash for each row.
+It aggregates maximum peaks across every rank and both repetitions, and minimum
+available memory. Refusals have no invented observed peak.
+
+Estimator source: `850e20a2c4c60247430b3d2f4e463eaf860f92a7`. Stress-driver-only
+revision: `7760536e7bf10e4054d708383a1333e7b9f0e120`. A later type annotation does
+not change the calculation. Native execution uses PyTorch 2.11.0+cu128, CUDA
+12.8, and H200s. Component instrumentation was used only for diagnosis; final
+measurements have no component hooks.
+
+Every sample clears learned profiles, gradients, and unused cached allocations.
+The first workload in each process includes cold kernel setup; later lengths
+can reuse initialized kernels. CSV `first_` and `repeat_` columns refer to the
+two executions of each shape, not independent fresh processes. The driver tries
+the minimum-memory layout before refusing, executes no split or budget bypass,
+and backpropagates a mean-square hidden-state loss. Peak collection precedes
+the finite-gradient checks. No optimizer step is included.
+
+After `INSTALL_VLLM_RUNTIME=false bash src/art/megatron/setup.sh`:
 
 ```sh
 ART_MEGATRON_TENSOR_MODEL_PARALLEL_SIZE=4 \
@@ -131,29 +153,29 @@ ART_MEGATRON_DATA_PARALLEL_SIZE=1 \
 ART_MEGATRON_PIPELINE_MODEL_PARALLEL_SIZE=1 \
 uv run --project megatron_runtime --no-sync python -m torch.distributed.run \
   --standalone --nproc-per-node=4 dev/trainer_rank_recompute_memory.py \
-  --mode selective --pairs --tokens 2048 4096 8192 --reported-pair \
-  --evidence scratch/recompute-memory/tp4-selective.jsonl
+  --mode selective --pairs --tokens 64 256 2048 4096 8192 12288 --reported-pair \
+  --evidence scratch/recompute-memory-calibrated/tp4-selective.jsonl
 ```
 
-Use `--mode none`, `ART_DISABLE_MEGATRON_COMPILE=1`, or `--modules core_attn mlp`
-for the corresponding controls. Change both process count and TP for TP8.
-The [SkyPilot task](trainer_rank_recompute_memory.sky.yaml) defaults to TP4 on
-free Kubernetes; pass the synced commit as `ART_CALIBRATION_SOURCE_SHA` and use
-`--idle-minutes-to-autostop 15 --down`.
+Use `ART_DISABLE_MEGATRON_COMPILE=1` for eager, `--modules core_attn mlp` for
+dense MLP checkpoints, or `--modules core_attn moe` for MoE checkpoints.
+`--sequences 8 --prefix-fraction 0` checks many short unshared sequences.
+`--concentrate-routing` enables the expert-imbalance stress. When running four
+processes on an eight-GPU host, also set
+`ART_MEGATRON_EXPERT_MODEL_PARALLEL_SIZE=4` and
+`ART_MEGATRON_EXPERT_TENSOR_PARALLEL_SIZE=1` for the MoE case.
 
-Final cluster jobs: `art-915-sharded-tp4-0916:4` (selective/none), `:5` (eager),
-`:6` (MLP recompute), `:7` (MoE), `:8` (MoE recompute), all on free `k8s/cks-wb3`;
-`art-915-sharded-tp8-ext-0916:2` on free `k8s/ext-collab2`. TP2 controls ran locally.
-The clusters used 15-minute autodown and two-hour pod deadlines. Raw evidence is
-retained locally under `scratch/recompute-memory-final/`. No paid clusters were
-used; both clusters were explicitly torn down after successful jobs and evidence
-retrieval.
+The [SkyPilot task](trainer_rank_recompute_memory.sky.yaml) uses free Kubernetes.
+Final jobs: `art-915-tight-tp4-0917:6,7,8,9` and
+`art-915-tight-tp8-0917:5,7`; TP2 controls ran locally. Both clusters had autodown
+and two-hour pod deadlines and were explicitly torn down after evidence
+retrieval. No paid clusters were used. Raw JSONL is retained locally under
+`scratch/recompute-memory-calibrated/`, with diagnostic and negative-control
+runs in `scratch/recompute-memory-components/` and `scratch/recompute-memory-tight/`.
 
-The [first unsharded campaign](https://github.com/OpenPipe/ART/blob/be21a2599/dev/trainer_rank_recompute_memory.csv)
-remains historical evidence. It also found underestimation in the unchanged full
-recompute heuristic (for the long group, 5.894 GiB estimated versus 13.647 GiB
-observed at TP2). This PR does not validate or fix that legacy path. Larger LoRA
-ranks, pretrained routing imbalance, CP, deeper prefix trees, mixed gradient
-groups, and other kernels/hardware are not calibrated by these measurements.
-Conservative expert/module pricing remains deliberate; these results support
-removing the selective guard for the measured paths, not a universal memory bound.
+The [previous report](https://github.com/OpenPipe/ART/blob/57f9de2f9/dev/trainer_rank_recompute_memory.md)
+records the looser estimate and the earlier full-recompute underestimation.
+This work does not validate that legacy path, larger LoRA ranks, CP, pretrained
+routing distributions, arbitrary deep prefix trees, or other hardware/kernels.
+These measurements support the calibrated native paths, not a universal memory
+bound.

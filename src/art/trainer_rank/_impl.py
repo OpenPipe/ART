@@ -1394,7 +1394,9 @@ class TrainerRank:
             )
 
         self._recompute_granularity = memory_field("recompute_granularity", None)
-        self._recompute_modules = frozenset(memory_field("recompute_modules", ()) or ())
+        self._recompute_modules: frozenset[str] = frozenset(
+            memory_field("recompute_modules", ()) or ()
+        )
         self._sequence_parallel = bool(memory_field("sequence_parallel", False))
         self._attention_output_gate = bool(memory_field("attention_output_gate", False))
         # Native fused SwiGLU retains gate/up and the output (3F). Eager
