@@ -4182,6 +4182,23 @@ def _tokenize_exact_projected_chat_history(
         if _source_stop_evidence(source, source_key)[0] == "length":
             boundary = (length_stop_boundaries or {}).get(source_key)
             next_prompt = _chat_source_prompt_tokens(sampled_sources[index + 1])
+            if boundary is not None and next_prompt is not None:
+                rendered_boundary = [*boundary.tail, *boundary.following]
+                native_boundary = next_prompt[end:]
+                extra = len(native_boundary) - len(rendered_boundary)
+                decode = getattr(tokenizer, "decode", None)
+                if (
+                    extra > 0
+                    and native_boundary[extra:] == rendered_boundary
+                    and callable(decode)
+                    and decode(native_boundary[:extra]).isspace()
+                ):
+                    # Services may insert whitespace before a truncated turn's
+                    # proven stop tail. Keep those served, nonsampled tokens.
+                    boundary = _RenderedLengthStopBoundary(
+                        tail=(*native_boundary[:extra], *boundary.tail),
+                        following=boundary.following,
+                    )
             boundary_end = (
                 end + len(boundary.tail) + len(boundary.following)
                 if boundary is not None
@@ -5706,6 +5723,36 @@ def _tokenize_chat_view(
                 multi_generation_response or len(parts) != 1 or parts[0][0] != "content"
             ):
                 start = generation_start
+            if _sampled_stop_suffix(
+                full_exact,
+                source=source,
+                source_key=_sampled_source_key(source),
+                tokenizer=resolved_tokenizer,
+            ):
+                # Adjacent assistants can share a role mask. Prove this message's
+                # end before replacing its rendered closing markup and stop.
+                completed = probe_render(
+                    messages[: message_index + 1], add_generation_prompt=False
+                )
+                rendered_completed = (
+                    canonical_render_to_rendered(completed)
+                    if completed is not None
+                    else None
+                )
+                if (
+                    rendered_completed is not None
+                    and rendered[: len(rendered_completed)] == rendered_completed
+                ):
+                    tail_mask, tail_stops = _assistant_stop_masks(
+                        rendered_completed,
+                        assistant_mask[: len(rendered_completed)],
+                        resolved_tokenizer,
+                    )
+                    tail_end = end
+                    while tail_end < len(tail_mask) and tail_mask[tail_end]:
+                        tail_end += 1
+                    if tail_end > end and tail_stops[tail_end - 1]:
+                        end = tail_end
             replacements.append(
                 (
                     start,
