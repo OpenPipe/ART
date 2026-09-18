@@ -3137,7 +3137,9 @@ def test_trainer_rank_retained_backward_keeps_slot_graph_guard() -> None:
 def test_trainer_rank_tracks_each_independent_output_graph() -> None:
     trainer = TrainerRank(_runtime())
     ref = _slot_ref("teacher")
-    first, second = _tracked_targets(trainer, ref, 2, 3)
+    # Each physical forward group has its own tracking call and cache lifetime.
+    first = _tracked_targets(trainer, ref, 2)[0]
+    second = _tracked_targets(trainer, ref, 3)[0]
 
     first.sum().backward()
     with pytest.raises(TrainerRankSlotStateError, match="live backward graph"):
