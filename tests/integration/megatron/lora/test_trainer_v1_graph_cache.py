@@ -8,6 +8,7 @@ import pytest
 torch = pytest.importorskip("torch")
 pytest.importorskip("megatron.core")
 
+from art.megatron.context_parallel.types import ParallelTopology  # noqa: E402
 from art.megatron.lora import LoRA, LoRASlotRef, use_lora_slot  # noqa: E402
 from art.megatron.prefix_tree_packing import prefix_tree_pack  # noqa: E402
 from art.trainer_rank import (  # noqa: E402
@@ -52,7 +53,7 @@ def test_group_cache_routes_old_gradients_after_optimizer_update(
         references = tuple(
             value.detach().clone().requires_grad_() for value in originals
         )
-        monkeypatch.setattr(trainer, "_topology", lambda: (1, 1, 1, 1))
+        monkeypatch.setattr(trainer, "_topology", lambda: ParallelTopology())
         monkeypatch.setattr(
             trainer,
             "_prepare_packed_forward",
@@ -152,7 +153,7 @@ def test_native_stale_logprob_correction_keeps_original_gradient_age(mode, monke
         historical = [value.detach().clone().requires_grad_() for value in parameters]
         tokens = torch.arange(12)
         x = tokens.to(device).float().reshape(-1, 4) / 13
-        monkeypatch.setattr(trainer, "_topology", lambda: (1, 1, 1, 1))
+        monkeypatch.setattr(trainer, "_topology", lambda: ParallelTopology())
         monkeypatch.setattr(
             trainer,
             "_prepare_packed_forward",
