@@ -1,0 +1,11 @@
+# config.yaml
+name: ms-swift-megatron
+
+# Single node; single H200 on CoreWeave K8s
+num_nodes: 1
+resources:
+  infra: k8s
+  accelerators: H200:2 # uses the cluster's GPU label catalog
+  cpus: 16+
+  memory: 64+
+  image_id: docker:bradhiltonnw/ms-swift-megatron:skypilot
