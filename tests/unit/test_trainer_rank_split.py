@@ -48,6 +48,7 @@ from art.trainer_rank import (
     TrainerRank,
     TrainerRankMemoryError,
     TrainerRankPartialExecutionError,
+    TrainerRankSlotStateError,
 )
 from art.trainer_rank._impl import (
     Unset,
@@ -957,7 +958,7 @@ def test_split_subforwards_track_independent_slot_graphs(
     monkeypatch.setattr(rank, "_slot_ref", lambda name: _SlotRef(name))
     monkeypatch.setattr(rank, "_resolve_slot_ref", lambda request, **_kwargs: ref)
     monkeypatch.setattr(rank, "_validate_hybridep_topology", lambda: None)
-    topology = object()
+    topology = SimpleNamespace(tp=1, cp=1, dp=1, pp=1, sp=False)
     monkeypatch.setattr(rank, "_topology", lambda: topology)
     monkeypatch.setattr(rank, "_capture_lora_version", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(rank, "_configure_hybridep", lambda *_args, **_kwargs: None)
@@ -991,10 +992,18 @@ def test_split_subforwards_track_independent_slot_graphs(
             [(packet.handle, packet.gradients) for packet in packets]
         )
 
+    def assert_pending_graph() -> None:
+        with pytest.raises(TrainerRankSlotStateError, match="live backward graph"):
+            rank._guard_slot_can_load(ref)
+        with pytest.raises(TrainerRankSlotStateError, match="not been backpropagated"):
+            rank._guard_checkpoint_can_step("teacher")
+
     cache = rank._forward_graph_cache()
     assert len(cache.handles()) == 2
+    assert_pending_graph()
     backward(first)
     assert len(cache.handles()) == 1
+    assert_pending_graph()
     backward(second)
     assert cache.handles() == ()
     rank._guard_slot_can_load(ref)
