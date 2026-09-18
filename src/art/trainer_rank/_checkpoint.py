@@ -885,6 +885,9 @@ def prepare_checkpoint_save(
                 raise trainer._slot_state_error(
                     f"Unknown checkpoint on at least one rank: {checkpoint_name!r}"
                 )
+            from ._heads import synchronize_head_buffers
+
+            synchronize_head_buffers(trainer, (checkpoint_name,))
             config = deepcopy(_validate_save_state(trainer, checkpoint_name))
             if any(value != config for value in _gather(config, group)):
                 raise trainer._slot_state_error(
@@ -1540,6 +1543,22 @@ def _forward_custom_payload(
     return PreparedCustomPayload(payload.records, payload.tensors, {})
 
 
+def _reserve_generation(trainer: TrainerRank, group: dist.ProcessGroup | None) -> int:
+    state = trainer._version_state()
+    generation = (
+        max(
+            (
+                state.generation,
+                *(slot.generation for slot in trainer._checkpoint_slots.values()),
+            )
+        )
+        + 1
+    )
+    # Keep the high-water mark even if creation rolls back or a snapshot is discarded.
+    state.generation = max(_gather(generation, group))
+    return state.generation
+
+
 def snapshot_checkpoint(trainer: TrainerRank, source: str, destination: str) -> bool:
     """Clone one loaded checkpoint into a forward-only resident slot."""
     from art.trainer_rank._impl import (
@@ -1574,6 +1593,7 @@ def snapshot_checkpoint(trainer: TrainerRank, source: str, destination: str) -> 
         source,
         destination,
         dict(source_slot.config),
+        source_slot.generation,
         source_slot.revision,
         destination_slot is not None,
     )
@@ -1588,6 +1608,7 @@ def snapshot_checkpoint(trainer: TrainerRank, source: str, destination: str) -> 
     destination_ref = trainer._slot_ref(destination)
     custom: dict[str, _CustomObject] = {}
     trackers: list[_CustomTensorTracker] = []
+    generation = _reserve_generation(trainer, group)
     try:
         for chunk in trainer.runtime.model:
             for module in chunk.modules():
@@ -1628,6 +1649,7 @@ def snapshot_checkpoint(trainer: TrainerRank, source: str, destination: str) -> 
             custom=custom,
             custom_payload=_forward_custom_payload(source_slot.custom_payload),
             snapshot=True,
+            generation=generation,
         )
         for tracker in trackers:
             tracker.active = True
@@ -1891,6 +1913,7 @@ def load_checkpoint(
     temporary = f"__art_loading_{uuid.uuid4().hex}"
     snapshot = _slot_snapshot(trainer)
     previous = trainer._checkpoint_slots.get(name)
+    generation = _reserve_generation(trainer, group)
     try:
         loaded = _phase(
             lambda: trainer._load_checkpoint_slot(
@@ -1950,6 +1973,9 @@ def load_checkpoint(
         def commit() -> None:
             _commit_slot(trainer, temporary, name)
             staged = trainer._checkpoint_slots.pop(temporary)
+            staged.generation = generation
+            # Reload invalidates old graphs, but publication ordering still uses
+            # this slot's revision independently of the graph generation.
             staged.revision = 0 if previous is None else previous.revision + 1
             trainer._checkpoint_slots[name] = staged
 

@@ -274,7 +274,7 @@ def main() -> None:
                 ]
                 assert len(terms) == len(requests)
                 loss = torch.stack(terms).sum()
-                loss.backward()
+                rank.backward(loss)
                 torch.cuda.synchronize()
                 backward_peak = torch.cuda.max_memory_allocated()
                 backward_seconds = time.monotonic() - started

@@ -140,7 +140,7 @@ def test_trainer_rank_custom_objects_train_and_become_stale_on_cuda() -> None:
         output = head.score(torch.randn(3, 4, device=device))["value"] * gain + running
         with pytest.raises(TrainerRankSlotStateError, match="live backward graph"):
             trainer._guard_slot_can_load(trainer._slot_ref("A"))
-        output.sum().backward()
+        trainer.backward(output.sum())
         before = tuple(param.detach().clone() for param in head.parameters()) + (
             gain.detach().clone(),
         )
@@ -270,7 +270,8 @@ def _custom_parameter_reduction_worker(
             checkpoint="A",
         )
         torch.testing.assert_close(parameter, torch.tensor(1.0, device=device))
-        (parameter * float(rank + 1)).backward()
+        trainer.backward(parameter * float(rank + 1))
+        assert parameter.grad is not None
         (reduced,) = trainer._reduce_dynamic_grads((parameter,), scale_grads=1.0)
         expected = {"dp": 3.0, "tp": 1.5, "cp": 1.5, "tp_cp": 2.5}[topology]
         torch.testing.assert_close(reduced, torch.tensor(expected, device=device))

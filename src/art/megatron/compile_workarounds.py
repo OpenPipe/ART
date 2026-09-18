@@ -1,9 +1,14 @@
 from __future__ import annotations
 
+from copy import copy
+from functools import wraps
 import os
 from typing import Any
+import weakref
 
 import torch
+from torch._C import _current_graph_task_id
+from torch._C._autograd import _get_current_graph_task_keep_graph
 
 from art.megatron.model_support.spec import CompileWorkaroundConfig
 
@@ -11,6 +16,112 @@ _INSTALLED_CONFIG: tuple[frozenset[str], str] | None = None
 _SELF_ATTN_LINEAR_PROJ_REDUCE_SCATTER_WORKAROUND_FLAG = (
     "disable_compile_self_attn_linear_proj_reduce_scatter"
 )
+
+
+def install_te_reusable_backward() -> None:
+    """Preserve TE's saved-tensor metadata until the final backward."""
+    from transformer_engine.pytorch.module.layernorm_linear import _LayerNormLinear
+    from transformer_engine.pytorch.module.layernorm_mlp import _LayerNormMLP
+    from transformer_engine.pytorch.module.linear import _Linear
+    from transformer_engine.pytorch.ops.fuser import _OperationFuserAutogradFunction
+
+    for function in (
+        _OperationFuserAutogradFunction,
+        _Linear,
+        _LayerNormLinear,
+        _LayerNormMLP,
+    ):
+        _preserve_te_backward_metadata(function)
+
+
+def _preserve_te_backward_metadata(function) -> None:
+    original = function.backward
+    if getattr(original, "__art_reusable_backward__", False):
+        return
+
+    @wraps(original)
+    def backward(ctx, *gradients):
+        if not _get_current_graph_task_keep_graph():
+            return original(ctx, *gradients)
+        tensor_objects = ctx.tensor_objects
+        if any(value is not None for value in tensor_objects):
+            raise RuntimeError(
+                "Retained backward is not supported for Transformer Engine quantized saved tensors"
+            )
+        contexts = getattr(ctx, "basic_op_ctxs", ())
+        ranges = [op_ctx._saved_tensors_range for op_ctx in contexts]
+        try:
+            return original(ctx, *gradients)
+        finally:
+            ctx.tensor_objects = tensor_objects
+            for op_ctx, tensor_range in zip(contexts, ranges, strict=True):
+                op_ctx._saved_tensors_range = tensor_range
+                # Do not keep unpacked tensors alive between backward calls,
+                # including when an operation raises before TE's own cleanup.
+                op_ctx.saved_tensors = None
+
+    setattr(backward, "__art_reusable_backward__", True)
+    setattr(function, "backward", staticmethod(backward))
+
+
+def install_reusable_checkpoint_backward() -> None:
+    """Rebuild selective checkpoint outputs separately for each backward."""
+    from megatron.core.tensor_parallel.random import CheckpointWithoutOutput
+
+    original = CheckpointWithoutOutput._recompute
+    if getattr(original, "__art_reusable_backward__", False):
+        return
+    fields = ("run_function", "rng_states", "outputs", "ctx")
+    original_discard = CheckpointWithoutOutput.discard_output_and_register_recompute
+
+    @wraps(original_discard)
+    def discard(self, hook_tensor):
+        # TransformerLayer retains the controller on the module. Transfer its
+        # recipe to the graph hook so eviction can release the physical graph.
+        if self.ctx is None:
+            owned_ref = getattr(self, "_art_recompute_owner", None)
+            if owned_ref is None:
+                return original_discard(self, hook_tensor)
+            owned = owned_ref()
+            if owned is None:
+                return
+        else:
+            owned = copy(self)
+            self._art_recompute_owner = weakref.ref(owned)
+        try:
+            return original_discard(owned, hook_tensor)
+        except BaseException:
+            for field in fields:
+                setattr(owned, field, None)
+            raise
+        finally:
+            for field in fields:
+                setattr(self, field, None)
+
+    @wraps(original)
+    def recompute(self, gradient):
+        if not _get_current_graph_task_keep_graph():
+            return original(self, gradient)
+        task = _current_graph_task_id()
+        if getattr(self, "_art_recompute_task", None) == task:
+            return
+        # The inner autograd graph is consumed normally. Preserve the forward
+        # recipe so the next outer backward recomputes a fresh inner graph.
+        state = tuple(getattr(self, field) for field in fields)
+        try:
+            result = original(self, gradient)
+            self._art_recompute_task = task
+            return result
+        except BaseException:
+            state = (None,) * len(fields)
+            raise
+        finally:
+            for field, value in zip(fields, state, strict=True):
+                setattr(self, field, value)
+
+    setattr(recompute, "__art_reusable_backward__", True)
+    setattr(CheckpointWithoutOutput, "_recompute", recompute)
+    setattr(CheckpointWithoutOutput, "discard_output_and_register_recompute", discard)
 
 
 def _require_attr(obj: Any, name: str) -> Any:

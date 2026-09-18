@@ -4,6 +4,7 @@ from typing import Any, cast
 import pytest
 import torch
 from torch._dynamo.testing import CompileCounter
+from torch._functorch import config as functorch_config
 
 from art.megatron.flex_attn.compiled import _needs_blackwell_wide_head_tile
 from art.megatron.model_support.handlers.gemma4 import (
@@ -35,11 +36,23 @@ def test_dynamic_projection_parameters_reuse_compiled_graph() -> None:
     torch._dynamo.reset()
     counter = CompileCounter()
     try:
-        with torch._dynamo.config.patch(
-            force_parameter_static_shapes=True, recompile_limit=32
+        with (
+            torch._dynamo.config.patch(
+                force_parameter_static_shapes=True, recompile_limit=32
+            ),
+            functorch_config.patch(donated_buffer=True),
+            cast(Any, torch.compiler.config).patch(cache_key_tag="existing-tag"),
         ):
             _configure_dynamo()
             assert not torch._dynamo.config.force_parameter_static_shapes
+            assert not functorch_config.donated_buffer
+            assert torch.compiler.config.cache_key_tag == (
+                "existing-tag|art-retained-backward-v1"
+            )
+            _configure_dynamo()
+            assert torch.compiler.config.cache_key_tag == (
+                "existing-tag|art-retained-backward-v1"
+            )
             compiled = [
                 torch.compile(_DynamicProjection(width), backend=counter)
                 for width in (8, 4, 16, 32, 12, 20, 24, 28, 36, 40)
@@ -78,9 +91,17 @@ def test_disabled_training_compile_does_not_change_dynamo_policy(
         lambda: pytest.fail("disabled compilation must not mutate Dynamo config"),
     )
 
-    assert not compile_module.configure_training_compile(
-        model=[], provider=object(), provider_bundle=cast(Any, bundle)
-    )
+    with (
+        functorch_config.patch(donated_buffer=True),
+        cast(Any, torch.compiler.config).patch(cache_key_tag="existing-tag"),
+    ):
+        assert not compile_module.configure_training_compile(
+            model=[], provider=object(), provider_bundle=cast(Any, bundle)
+        )
+        assert not functorch_config.donated_buffer
+        assert torch.compiler.config.cache_key_tag == (
+            "existing-tag|art-retained-backward-v1"
+        )
 
 
 def test_wide_head_tile_workaround_is_blackwell_only(monkeypatch) -> None:

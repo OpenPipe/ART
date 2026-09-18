@@ -237,7 +237,7 @@ def test_planner_handles_vineppo_nested_shape_and_request_mix() -> None:
     )
 
 
-def test_forward_micro_batches_preserves_nested_vineppo_groups(
+def test_forward_batches_preserves_nested_vineppo_groups(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     rank = TrainerRank(_runtime())
@@ -260,7 +260,7 @@ def test_forward_micro_batches_preserves_nested_vineppo_groups(
     )
     groups = _vineppo_like_inputs()
 
-    micro_batches = list(rank.forward_micro_batches(groups))
+    micro_batches = list(rank.forward_batches(groups))
 
     assert [batch.indices for batch in micro_batches] == [(0, 1, 2, 3)]
     assert micro_batches[0].select(groups) == groups
@@ -271,7 +271,7 @@ def test_forward_micro_batches_preserves_nested_vineppo_groups(
     )
 
 
-def test_forward_micro_batches_prewarms_next_wave_during_yield(
+def test_forward_batches_prewarms_next_wave_during_yield(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     rank = TrainerRank(_runtime())
@@ -290,7 +290,7 @@ def test_forward_micro_batches_prewarms_next_wave_during_yield(
         ),
     )
 
-    generator = rank.forward_micro_batches(inputs)
+    generator = rank.forward_batches(inputs)
     first = next(generator)
     assert first.stats.global_count == 4
 
@@ -363,7 +363,7 @@ def test_speculative_planning_uses_immutable_snapshots(
     original_rows = tuple(row.clone() for row in _rows(inputs[4:8]))
     original_key = rank._layout_cache_key(original_rows)
 
-    generator = rank.forward_micro_batches(inputs)
+    generator = rank.forward_batches(inputs)
     next(generator)
     # The caller mutates its (aliased) input tensors while suspended.
     for request in inputs[4:8]:
@@ -388,7 +388,7 @@ def test_speculative_planning_warms_this_dp_ranks_local_slice(
     # Local budget of 4 items per rank -> global waves of 8 at DP2.
     rank = _prewarmed_rank(monkeypatch, inputs, inputs[0:8:2], dp=(0, 2))
 
-    generator = rank.forward_micro_batches(inputs)
+    generator = rank.forward_batches(inputs)
     first = next(generator)
     assert first.stats.global_count == 8
     future = rank._speculative_planning_future
@@ -432,7 +432,7 @@ def test_width_search_lets_prefix_sharing_widen_the_wave(
     # (4,002); the wave must still take both requests.
     _set_packed_token_budget(monkeypatch, rank, 2_400)
 
-    batches = list(rank.forward_micro_batches(inputs))
+    batches = list(rank.forward_batches(inputs))
 
     assert [batch.stats.global_count for batch in batches] == [2]
 
@@ -500,13 +500,13 @@ def test_width_search_survives_non_monotone_cost_optimal_layouts(
     # the width-3 one does.
     _set_packed_token_budget(monkeypatch, rank, (two + three) // 2)
 
-    batches = list(rank.forward_micro_batches(inputs))
+    batches = list(rank.forward_batches(inputs))
 
     assert [batch.stats.global_count for batch in batches] == [3]
     assert batches[0].stats.packed_tokens <= (two + three) // 2
 
 
-def test_dp_rank_forward_falls_back_to_memory_minimal_layout_before_refusing(
+def test_forward_falls_back_to_memory_minimal_layout_before_refusing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     shared = tuple(range(10_000, 10_040))
@@ -528,7 +528,7 @@ def test_dp_rank_forward_falls_back_to_memory_minimal_layout_before_refusing(
     # Cost-optimal layout declines sharing (82 tokens); full sharing (42) fits.
     _set_packed_token_budget(monkeypatch, rank, 60)
 
-    outputs = rank.dp_rank_forward(inputs)
+    outputs = rank.forward(inputs)
 
     assert len(outputs) == 2
     assert executed == [42]
@@ -666,24 +666,24 @@ def test_profiled_steady_state_keeps_the_wide_shared_wave(
     )
     _set_packed_token_budget(monkeypatch, rank, 1_100)
 
-    batches = list(rank.forward_micro_batches(inputs))
+    batches = list(rank.forward_batches(inputs))
 
     assert [batch.stats.global_count for batch in batches] == [16]
     assert not batches[0].stats.cold_start
 
 
-def test_forward_micro_batches_telemetry_reports_hidden_speculation(
+def test_forward_batches_telemetry_reports_hidden_speculation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     inputs = _unshared_requests(8)
     rank = _prewarmed_rank(monkeypatch, inputs, inputs[:4])
-    list(rank.forward_micro_batches(inputs))
+    list(rank.forward_batches(inputs))
     telemetry = rank.last_forward_telemetry()
     assert telemetry["planning_ms"] > 0.0
     assert "speculative_planning_ms" in telemetry
 
 
-@pytest.mark.parametrize("api", ("dp_rank_forward", "forward_micro_batches"))
+@pytest.mark.parametrize("api", ("forward", "forward_batches"))
 def test_forward_preserves_caller_owned_nested_input_tensors(
     api: str,
     monkeypatch: pytest.MonkeyPatch,
@@ -710,10 +710,10 @@ def test_forward_preserves_caller_owned_nested_input_tensors(
         for _request, inputs, targets in tensors
     ]
 
-    if api == "dp_rank_forward":
-        rank.dp_rank_forward(groups)
+    if api == "forward":
+        rank.forward(groups)
     else:
-        list(rank.forward_micro_batches(groups))
+        list(rank.forward_batches(groups))
 
     for (request, inputs, targets), (expected_inputs, expected_targets) in zip(
         tensors, snapshots, strict=True
@@ -855,7 +855,7 @@ def test_adaptive_planner_grows_stable_window_to_largest_aligned_fit(
     assert candidate.rejected_candidates <= 2
 
 
-def test_forward_micro_batches_shrinks_when_memory_budget_drops(
+def test_forward_batches_shrinks_when_memory_budget_drops(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     rank = TrainerRank(_runtime())
@@ -889,7 +889,7 @@ def test_forward_micro_batches_shrinks_when_memory_budget_drops(
     _set_packed_token_budget(monkeypatch, rank, lambda: available["packed_tokens"])
     monkeypatch.setattr(rank, "_run_flat_plan_with_memory_tracking", run)
 
-    batches = list(rank.forward_micro_batches(inputs))
+    batches = list(rank.forward_batches(inputs))
 
     assert [batch.stats.global_count for batch in batches] == [8, 3, 3]
     assert [batch.stats.available_bytes for batch in batches] == [
@@ -949,13 +949,13 @@ def test_heterogeneous_slots_split_packing_without_losing_output_estimates(
     }
 
 
-@pytest.mark.parametrize("api", ("dp_rank_forward", "forward_micro_batches"))
+@pytest.mark.parametrize("api", ("forward", "forward_batches"))
 def test_forward_raises_before_expected_oom_with_actionable_context(
     api: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     rank = TrainerRank(_runtime())
-    if api == "dp_rank_forward":
+    if api == "forward":
         monkeypatch.setattr(
             rank,
             "_memory_check",
@@ -977,9 +977,9 @@ def test_forward_raises_before_expected_oom_with_actionable_context(
 
     with pytest.raises(TrainerRankMemoryError) as exc_info:
         (
-            rank.dp_rank_forward(request)
-            if api == "dp_rank_forward"
-            else next(iter(rank.forward_micro_batches(request)))
+            rank.forward(request)
+            if api == "forward"
+            else next(iter(rank.forward_batches(request)))
         )
 
     message = str(exc_info.value)

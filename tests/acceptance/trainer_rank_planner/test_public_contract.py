@@ -4,10 +4,9 @@ These tests encode the public-surface half of the holistic-planner landing
 contract (research thread behavior spec, frozen 2026-08-31):
 
 - ``TrainerRank`` exposes no prefix-sharing depth, microbatch width,
-  head-chunk, or memory-safety policy knob. Its constructor accepts only the
-  training runtime.
-- ``forward_micro_batches`` and ``dp_rank_forward`` accept only
-  ``inputs``, ``checkpoint``, and ``no_grad``, plus ``yield_empty`` on the iterator.
+  head-chunk, or memory-safety policy knob. Its constructor accepts the training runtime and immutable forward policy.
+- ``forward_batches`` and ``forward`` accept only
+  ``inputs``, ``options``, ``checkpoint``, and ``no_grad``, plus ``yield_empty`` on the iterator.
 - ``TrainerRankMemoryError`` reports only a predicted peak, the usable limit,
   and an actionable reduction suggestion. It carries no infeasibility proof.
 
@@ -60,11 +59,10 @@ def _parameters(callable_: Any) -> dict[str, inspect.Parameter]:
     }
 
 
-def test_constructor_accepts_only_the_training_runtime() -> None:
+def test_constructor_accepts_runtime_and_forward_options() -> None:
     parameters = _parameters(trainer_rank.TrainerRank.__init__)
-    assert list(parameters) == ["runtime"], (
-        "TrainerRank must accept exactly one constructor argument (the training"
-        f" runtime); found {sorted(parameters)}"
+    assert list(parameters) == ["runtime", "options"], (
+        f"Unexpected TrainerRank constructor parameters: {sorted(parameters)}"
     )
 
 
@@ -78,12 +76,12 @@ def test_constructor_rejects_policy_knob(knob: str) -> None:
     ), "TrainerRank.__init__ must not accept **kwargs (knobs could pass silently)"
 
 
-@pytest.mark.parametrize("method_name", ("forward_micro_batches", "dp_rank_forward"))
+@pytest.mark.parametrize("method_name", ("forward_batches", "forward"))
 def test_forward_method_signatures_are_knob_free(method_name: str) -> None:
     method = getattr(trainer_rank.TrainerRank, method_name)
     parameters = _parameters(method)
-    allowed = {"inputs", "checkpoint", "no_grad"}
-    if method_name == "forward_micro_batches":
+    allowed = {"inputs", "options", "checkpoint", "no_grad"}
+    if method_name == "forward_batches":
         allowed.add("yield_empty")
         assert parameters["yield_empty"].default is False
     assert set(parameters) <= allowed, (
@@ -117,7 +115,7 @@ def test_memory_error_reports_actionable_fields_without_proof() -> None:
 def test_no_public_test_anchor_hook() -> None:
     """Forced layout anchors are test-only; they must not be public API."""
 
-    for method_name in ("__init__", "forward_micro_batches", "dp_rank_forward"):
+    for method_name in ("__init__", "forward_batches", "forward"):
         parameters = _parameters(getattr(trainer_rank.TrainerRank, method_name))
         leaked = [
             name
