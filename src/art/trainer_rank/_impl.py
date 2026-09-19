@@ -1027,6 +1027,8 @@ class _SubforwardCost:
     checkpoint_retained: int = 0
     checkpoint_workspace: int = 0
     checkpoint_input_gradient: int = 0
+    # Already in required; backward allowance must not reorder forward execution.
+    checkpoint_peak_increment: int = 0
 
     @property
     def ephemeral(self) -> int:
@@ -3095,7 +3097,13 @@ class TrainerRank:
             ]
             costs = [self._plan_cost(plan) for plan in plans]
             # Bind original request mappings; floor keys normalize execution order.
-            order = sorted(range(len(plans)), key=lambda i: (-costs[i].ephemeral, i))
+            order = sorted(
+                range(len(plans)),
+                key=lambda i: (
+                    -(costs[i].ephemeral - costs[i].checkpoint_peak_increment),
+                    i,
+                ),
+            )
             split = _SplitForwardPlan(
                 subforwards=tuple(plans[i] for i in order),
                 request_indices=tuple(tuple(chunks[i]) for i in order),
@@ -3836,6 +3844,7 @@ class TrainerRank:
         checkpoint_workspace = max(
             checkpoint_workspace, head_workspace_bytes, checkpoint_floor[1]
         )
+        forward_required = required
         if gradient:
             required = max(
                 required,
@@ -3850,6 +3859,7 @@ class TrainerRank:
             checkpoint_retained=checkpoint_retained,
             checkpoint_workspace=checkpoint_workspace,
             checkpoint_input_gradient=gradient,
+            checkpoint_peak_increment=required - forward_required,
         )
 
     def _retained_memory_bytes(

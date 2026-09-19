@@ -91,6 +91,7 @@ def test_no_grad_and_unsupported_checkpoint_do_not_gain_extent(unsupported):
         r.runtime.model[0].decoder.config.recompute_num_layers = 2
     cost = price(r, values)
     assert cost.checkpoint_input_gradient == 0
+    assert cost.checkpoint_peak_increment == 0
     assert cost.required == cost.retained
 
 
@@ -172,3 +173,55 @@ def test_finite_backward_profile_is_not_added_to_static_gradient_extent():
     assert r._plan_cost(plan).required == int(
         (plan.output_bytes + plan.packed_tokens * rate) * 1.1
     )
+
+
+def test_unequal_checkpoint_gradients_preserve_cold_split_execution_order():
+    r = rank()
+    req = [
+        ForwardInput(input_tokens=torch.arange(rows), hidden_states=True)
+        for rows in (17, 29)
+    ]
+    costs = [r._plan_cost(r._plan_flat_forward([q])) for q in req]
+    assert (
+        0 < costs[0].checkpoint_input_gradient < costs[1].checkpoint_input_gradient
+    )
+    assert costs[0].ephemeral < costs[1].ephemeral
+    # Cold forward retention was the entire pre-gradient requirement: both
+    # original priorities are zero, so the stable original order must survive.
+    assert all(c.ephemeral == c.checkpoint_peak_increment for c in costs)
+    r._available_memory_bytes = lambda: 1 << 60
+    split, check = r._admit_split_rung(
+        ((0,), (1,)), req, [q.input_tokens for q in req], checkpoint=Unset
+    )
+    assert split is not None and check.fits
+    assert check.estimated_required_bytes == r._split_required_memory(costs)
+    assert split.request_indices == ((0,), (1,)), split.request_indices
+
+
+@pytest.mark.parametrize("fully_masked", [False, True])
+def test_split_priority_subtracts_only_uncovered_gradient_peak(fully_masked):
+    r = rank()
+    plan = r._plan_flat_forward(requests(17, 19))
+    cold = r._plan_cost(plan)
+    # Place a real learned peak between the two static estimates, or above both.
+    measured = (
+        cold.required + 10**7
+        if fully_masked
+        else (cold.retained + cold.required) / 2
+    )
+    rate = (measured / 1.1 - plan.output_bytes) / plan.packed_tokens
+    profile(r, plan, rate=rate)
+    cost = r._plan_cost(plan)
+    old_required = int((plan.output_bytes + int(plan.packed_tokens * rate)) * 1.1)
+    assert cold.retained < old_required
+    assert cost.required == max(cold.required, old_required)
+    assert (
+        cost.ephemeral - cost.checkpoint_peak_increment
+        == old_required - cost.retained
+    )
+    if fully_masked:
+        assert cost.checkpoint_peak_increment == 0
+    else:
+        assert 0 < cost.checkpoint_peak_increment < int(
+            cost.checkpoint_input_gradient * 1.1
+        )
