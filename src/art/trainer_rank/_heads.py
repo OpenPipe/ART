@@ -587,13 +587,30 @@ def execute_head_operation(
     payload: Any,
     *,
     coordinate: Callable[[Callable[[], None]], None] | None = None,
+    local_lookup: bool = False,
 ) -> Any:
     """Execute on every physical rank inside the owning trainer operation queue."""
     if hasattr(trainer, "_rank"):
         return trainer._invoke("head", kind, payload)
     if kind == "head_lookup":
+        from ._impl import Unset
+
         checkpoint, name = payload
-        checkpoint = trainer._resolve_custom_checkpoint(checkpoint)
+        if local_lookup and checkpoint is Unset:
+            ref = (
+                trainer._slot_stack[-1]
+                if trainer._slot_stack
+                else trainer._default_slot_ref
+            )
+            checkpoint = None if ref is None else ref.name
+        # Reopening a loaded head is DP-local; lazy loading is still global.
+        if not local_lookup or checkpoint is None:
+            checkpoint = trainer._resolve_custom_checkpoint(checkpoint)
+        elif checkpoint not in trainer._checkpoint_slots:
+            raise trainer._slot_state_error(
+                f"Load checkpoint {checkpoint!r} across all ranks before a logical-DP head lookup"
+            )
+        assert checkpoint is not None
         return checkpoint, export_head(
             trainer, checkpoint, name
         ) if name in trainer._checkpoint_slots[checkpoint].custom else None
@@ -1319,15 +1336,13 @@ def logical_register_head(
     flush_logical_heads(view)
 
     checkpoint, state = view._invoke("head", "head_lookup", (checkpoint, name))
+    if state is not None and state.kind != kind:
+        raise ValueError(f"Checkpoint object {name!r} is already a {state.kind}")
     registry = _logical_heads(view)
     current = registry.get((checkpoint, name))
     if current is not None and not current.invalid and state is not None:
         current.refresh(state)
         if not current.invalid:
-            if state.kind != kind:
-                raise ValueError(
-                    f"Checkpoint object {name!r} is already a {state.kind}"
-                )
             return current.value
     if state is None:
         value = factory()

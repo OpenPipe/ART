@@ -156,7 +156,23 @@ class _Executor:
             raise RuntimeError(self.state.release_error)
         if self.state.pending_release is not None:
             raise RuntimeError("Previous callback release is still pending")
-        pending = tuple(self.state.released)
+        synchronize_heads = (
+            self.stopped
+            and self.mode == "rank"
+            and self.rank._dp_rank_and_size()[1] > 1
+            and any(
+                custom.kind == "buffer"
+                or (
+                    custom.kind == "module"
+                    and next(cast(torch.nn.Module, custom.value).buffers(), None)
+                    is not None
+                )
+                for slot in getattr(self.rank, "_checkpoint_slots", {}).values()
+                for custom in slot.custom.values()
+            )
+        )
+        # Piggyback presence so empty replicas still join a needed reconciliation.
+        pending = (tuple(self.state.released), synchronize_heads)
         gathered: list[Any] = [pending]
         loop = asyncio.get_running_loop()
         if self.distributed:
@@ -187,10 +203,16 @@ class _Executor:
         self.state.pending_release = None
         try:
             release.completed.result()
-            handles = {handle for values in release.gathered for handle in values}
+            handles = {handle for values, _ in release.gathered for handle in values}
             for handle in handles:
                 self.state.graphs.pop(handle, None)
             self.state.released.difference_update(handles)
+            if any(synchronize for _, synchronize in release.gathered):
+                from ._heads import synchronize_head_buffers
+
+                # Every DP session has stopped. Unequal callbacks/yields cannot
+                # enter this WORLD collective early, including after failure.
+                synchronize_head_buffers(self.rank)
         except BaseException as error:
             self.state.release_error = (
                 f"Callback release reconciliation failed: {error}"
@@ -512,7 +534,11 @@ class _Executor:
             if self.mode == "zero" and args[0] == "head_export":
                 synchronize_head_buffers(self.rank)
             return execute_head_operation(
-                self.rank, *args, coordinate=self._coordinated_preflight, **kwargs
+                self.rank,
+                *args,
+                coordinate=self._coordinated_preflight,
+                local_lookup=self.mode == "rank",
+                **kwargs,
             )
         if op == "reduce_value":
             tensor = args[0].to(self.rank.device)

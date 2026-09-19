@@ -9,7 +9,15 @@ from test_trainer_rank_commands import _Rank
 from art.trainer_rank._commands import _Executor, _Release
 
 
-def test_completed_release_is_finalized_before_queued_done_callback():
+@pytest.mark.parametrize("peer_buffers", [False, True])
+def test_completed_release_is_finalized_before_queued_done_callback(
+    monkeypatch, peer_buffers
+):
+    synchronized = []
+    monkeypatch.setattr(
+        "art.trainer_rank._heads.synchronize_head_buffers", synchronized.append
+    )
+
     async def run():
         rank: Any = _Rank()
         executor = _Executor(rank, "zero")
@@ -17,7 +25,9 @@ def test_completed_release_is_finalized_before_queued_done_callback():
         state.graphs["zero:old:dp:0"] = (rank.weight,)
         state.released.add("zero:old:dp:0")
         completed = asyncio.get_running_loop().create_future()
-        release = state.pending_release = _Release(completed, [tuple(state.released)])
+        release = state.pending_release = _Release(
+            completed, [(tuple(state.released), False), ((), peer_buffers)]
+        )
         completed.set_result(None)
         completed.add_done_callback(lambda _: executor._finish_release(release))
         await executor._join_release()
@@ -27,6 +37,7 @@ def test_completed_release_is_finalized_before_queued_done_callback():
         state.graphs["zero:new:dp:0"] = (rank.weight,)
         await asyncio.sleep(0)
         assert tuple(state.graphs) == ("zero:new:dp:0",)
+        assert synchronized == ([rank] if peer_buffers else [])
 
     asyncio.run(run())
 
@@ -40,7 +51,7 @@ def test_background_cleanup_failure_is_reported_and_blocks_next_entry(cancelled)
         reports = []
         loop.set_exception_handler(lambda _loop, context: reports.append(context))
         completed = loop.create_future()
-        release = executor.state.pending_release = _Release(completed, [()])
+        release = executor.state.pending_release = _Release(completed, [((), False)])
         completed.add_done_callback(lambda _: executor._finish_release(release))
         if cancelled:
             completed.cancel()
