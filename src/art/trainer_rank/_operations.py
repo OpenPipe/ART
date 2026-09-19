@@ -206,9 +206,6 @@ async def execute_operation(rank_zero: Any, operation: TrainerOperation) -> Any:
             result = rank_zero.open_forward_batches(**payload)
         elif operation.kind == "batches_close":
             result = rank_zero.close_forward_batches(payload["handle"])
-            pending = ledger.outcomes.get(payload.get("pending_operation"))
-            if pending is not None:
-                await _abandon(rank_zero, pending)
         elif operation.kind.startswith("head_"):
             from ._heads import execute_head_operation
 

@@ -278,18 +278,22 @@ def test_batch_pulls_and_close_are_identified_without_advancing_twice():
         await execute_operation(
             rank, TrainerOperation.capture(("client", 3), "acknowledge", ((2, 3), ()))
         )
+        # A lost pull is abandoned independently of closing its iterator.
+        await execute_operation(
+            rank, TrainerOperation.capture(("client", 3), "acknowledge", ((3,), (2,)))
+        )
         close = TrainerOperation.capture(
             ("client", 3),
             "batches_close",
-            {"handle": "iterator", "pending_operation": next_wave.id},
+            {"handle": "iterator"},
         )
         await execute_operation(rank, close)
         await execute_operation(rank, close)
         assert events == [
             "open",
             "next",
-            ("close", "iterator"),
             ("release", ("packet",)),
+            ("close", "iterator"),
         ]
         await execute_operation(
             rank, TrainerOperation.capture(close.id, "acknowledge", ((), ()))
