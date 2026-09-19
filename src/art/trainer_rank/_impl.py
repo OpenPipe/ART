@@ -4194,12 +4194,13 @@ class TrainerRank:
         width = normalize(self._last_global_micro_batch_size or min_width)
         if width > best:
             fit, trusted = fits(width)
-            if fit:
+            if fit and trusted:
                 best = width
-                if not trusted:
-                    return candidate(best)
-            else:
+            elif not fit:
                 failed = width
+            # A prior call may have used a different checkpoint/output mix.
+            # Calibrate an unseen signature through the normal growth below;
+            # the cached width alone is not evidence that its backward fits.
 
         while failed is None and best < remaining:
             width = normalize(max(best + 1, best * 2))
