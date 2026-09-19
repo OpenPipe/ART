@@ -22,7 +22,7 @@ def test_update_identity_replays_outcome_without_applying_again():
             optim_step=lambda **kwargs: calls.append(kwargs) or {"step": len(calls)},
         )
         operation = TrainerOperation.capture(
-            "step-1", "optim_step", {"params": {"lr": 1}}
+            ("client", 1), "optim_step", {"params": {"lr": 1}}
         )
         assert await execute_operation(rank, operation) == {"step": 1}
         assert await execute_operation(rank, operation) == {"step": 1}
@@ -30,10 +30,12 @@ def test_update_identity_replays_outcome_without_applying_again():
         with pytest.raises(ValueError, match="different arguments"):
             await execute_operation(
                 rank,
-                TrainerOperation.capture("step-1", "optim_step", {"params": {"lr": 2}}),
+                TrainerOperation.capture(
+                    ("client", 1), "optim_step", {"params": {"lr": 2}}
+                ),
             )
         await execute_operation(
-            rank, TrainerOperation.capture("ack", "acknowledge", ["step-1"])
+            rank, TrainerOperation.capture(("client", 1), "acknowledge", ((), ()))
         )
         with pytest.raises(OperationResultReleasedError):
             await execute_operation(rank, operation)
@@ -56,12 +58,18 @@ def test_failed_gradient_identity_preserves_original_error():
         rank = SimpleNamespace(
             _rank=SimpleNamespace(), backward_packets=backward_packets
         )
-        operation = TrainerOperation.capture("backward-1", "backward", {"packets": ()})
+        operation = TrainerOperation.capture(("client", 1), "backward", {"packets": ()})
         for _ in range(2):
             with pytest.raises(TrainerRankSlotStateError) as error:
                 await execute_operation(rank, operation)
             assert type(error.value) is type(stale)
             assert str(error.value) == str(stale)
+        assert len(calls) == 1
+        await execute_operation(
+            rank, TrainerOperation.capture(operation.id, "acknowledge", ((), ()))
+        )
+        with pytest.raises(OperationResultReleasedError):
+            await execute_operation(rank, operation)
         assert len(calls) == 1
 
     asyncio.run(run())
@@ -80,7 +88,7 @@ def test_concurrent_retry_waiter_cancellation_does_not_cancel_update():
             return calls
 
         rank = SimpleNamespace(_rank=SimpleNamespace(), optim_step=optim_step)
-        operation = TrainerOperation.capture("step-1", "optim_step", {})
+        operation = TrainerOperation.capture(("client", 1), "optim_step", {})
         original = asyncio.create_task(execute_operation(rank, operation))
         await entered.wait()
         retry = asyncio.create_task(execute_operation(rank, operation))
@@ -98,7 +106,9 @@ def test_concurrent_retry_waiter_cancellation_does_not_cancel_update():
 def test_operation_captures_tensor_arguments_at_submission():
     async def run():
         source = torch.tensor([2.0])
-        operation = TrainerOperation.capture("forward-1", "forward", {"inputs": source})
+        operation = TrainerOperation.capture(
+            ("client", 1), "forward", {"inputs": source}
+        )
         source.add_(10)
         rank = SimpleNamespace(
             _rank=SimpleNamespace(),
@@ -108,6 +118,137 @@ def test_operation_captures_tensor_arguments_at_submission():
         assert torch.equal(
             await execute_operation(rank, operation), torch.tensor([6.0])
         )
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("cuda_tag", [False, True])
+def test_operation_codec_remaps_storages_and_preserves_aliases(monkeypatch, cuda_tag):
+    from test_trainer_command_transport import _check_payload, _payload
+
+    async def run():
+        source = _payload("cpu")
+        with monkeypatch.context() as capture:
+            if cuda_tag:
+                capture.setattr(
+                    torch.serialization,
+                    "_package_registry",
+                    [
+                        (0, lambda storage: "cuda:7", lambda storage, location: None),
+                        *torch.serialization._package_registry,
+                    ],
+                )
+            operation = TrainerOperation.capture(
+                ("client", 1), "optim_step", {"value": source}
+            )
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+        rank = SimpleNamespace(_rank=SimpleNamespace(), optim_step=lambda value: value)
+        result = await execute_operation(rank, operation)
+        _check_payload(result)
+        assert result.base.untyped_storage() is not source.base.untyped_storage()
+
+    asyncio.run(run())
+
+
+def test_acknowledgement_bounds_history_including_unadmitted_holes():
+    async def run():
+        calls = []
+        rank = SimpleNamespace(
+            _rank=SimpleNamespace(), optim_step=lambda: calls.append(1)
+        )
+        # ID 1 is still pending. Odd IDs after it were cancelled before admission.
+        for sequence in range(2, 2002, 2):
+            await execute_operation(
+                rank, TrainerOperation.capture(("client", sequence), "optim_step", {})
+            )
+            await execute_operation(
+                rank,
+                TrainerOperation.capture(
+                    ("client", sequence), "acknowledge", ((1,), ())
+                ),
+            )
+        ledger = rank._rank._operation_outcomes
+        assert not ledger.outcomes
+        assert len(ledger.acknowledged) == 1
+        state = ledger.acknowledged["client"]
+        assert state.through == 2000 and state.pending == {1}
+        for sequence in (2, 3, 1999, 2000):
+            with pytest.raises(OperationResultReleasedError):
+                await execute_operation(
+                    rank,
+                    TrainerOperation.capture(("client", sequence), "optim_step", {}),
+                )
+        await execute_operation(
+            rank, TrainerOperation.capture(("client", 1), "optim_step", {})
+        )
+        await execute_operation(
+            rank, TrainerOperation.capture(("client", 2000), "acknowledge", ((), ()))
+        )
+        assert not state.pending and not ledger.outcomes
+        assert len(calls) == 1001
+
+    asyncio.run(run())
+
+
+def test_out_of_order_acknowledgements_never_resurrect_ids_or_retire_other_sessions():
+    async def run():
+        calls = []
+        rank = SimpleNamespace(
+            _rank=SimpleNamespace(), optim_step=lambda: calls.append(1)
+        )
+        for through, pending in (
+            (5, (1, 3, 4)),
+            (3, (1,)),
+            (6, (1, 4, 6)),
+            (5, (1, 2, 3)),
+        ):
+            await execute_operation(
+                rank,
+                TrainerOperation.capture(
+                    ("client", through), "acknowledge", (pending, ())
+                ),
+            )
+        state = rank._rank._operation_outcomes.acknowledged["client"]
+        assert state.through == 6 and state.pending == {1, 6}
+        for sequence in (2, 3, 4, 5):
+            with pytest.raises(OperationResultReleasedError):
+                await execute_operation(
+                    rank,
+                    TrainerOperation.capture(("client", sequence), "optim_step", {}),
+                )
+        for identity in (("client", 1), ("client", 6), ("client", 7), ("other", 3)):
+            operation = TrainerOperation.capture(identity, "optim_step", {})
+            await execute_operation(rank, operation)
+            await execute_operation(rank, operation)
+        assert len(calls) == 4
+
+    asyncio.run(run())
+
+
+def test_retiring_running_update_fences_retries_until_completion_is_dropped():
+    async def run():
+        entered, release = asyncio.Event(), asyncio.Event()
+        calls = []
+
+        async def optim_step():
+            calls.append(1)
+            entered.set()
+            await release.wait()
+            raise ValueError("failed after mutation")
+
+        rank = SimpleNamespace(_rank=SimpleNamespace(), optim_step=optim_step)
+        operation = TrainerOperation.capture(("client", 1), "optim_step", {})
+        original = asyncio.create_task(execute_operation(rank, operation))
+        await entered.wait()
+        await execute_operation(
+            rank, TrainerOperation.capture(operation.id, "acknowledge", ((), ()))
+        )
+        with pytest.raises(OperationResultReleasedError):
+            await execute_operation(rank, operation)
+        release.set()
+        with pytest.raises(ValueError, match="failed after mutation"):
+            await original
+        assert len(calls) == 1 and not rank._rank._operation_outcomes.outcomes
 
     asyncio.run(run())
 
@@ -123,18 +264,24 @@ def test_batch_pulls_and_close_are_identified_without_advancing_twice():
             close_forward_batches=lambda handle: events.append(("close", handle)),
             release_forward=lambda handles: events.append(("release", tuple(handles))),
         )
-        opening = TrainerOperation.capture("open", "batches_open", {"inputs": []})
+        opening = TrainerOperation.capture(
+            ("client", 1), "batches_open", {"inputs": []}
+        )
         assert await execute_operation(rank, opening) == "iterator"
         assert await execute_operation(rank, opening) == "iterator"
         next_wave = TrainerOperation.capture(
-            "next", "batches_next", {"handle": "iterator"}
+            ("client", 2), "batches_next", {"handle": "iterator"}
         )
         first = await execute_operation(rank, next_wave)
         assert await execute_operation(rank, next_wave) is first
+        # Other results can be acknowledged while this wave's reply is lost.
+        await execute_operation(
+            rank, TrainerOperation.capture(("client", 3), "acknowledge", ((2, 3), ()))
+        )
         close = TrainerOperation.capture(
-            "close",
+            ("client", 3),
             "batches_close",
-            {"handle": "iterator", "pending_operation": "next"},
+            {"handle": "iterator", "pending_operation": next_wave.id},
         )
         await execute_operation(rank, close)
         await execute_operation(rank, close)
@@ -144,6 +291,12 @@ def test_batch_pulls_and_close_are_identified_without_advancing_twice():
             ("close", "iterator"),
             ("release", ("packet",)),
         ]
+        await execute_operation(
+            rank, TrainerOperation.capture(close.id, "acknowledge", ((), ()))
+        )
+        assert not rank._rank._operation_outcomes.outcomes
+        with pytest.raises(OperationResultReleasedError):
+            await execute_operation(rank, next_wave)
 
     asyncio.run(run())
 
@@ -175,7 +328,7 @@ def test_failed_outcome_releases_traceback_activations_and_replays_error(
             forward=forward,
             export_forward=lambda output: output,
         )
-        operation = TrainerOperation.capture("failed", "forward", {})
+        operation = TrainerOperation.capture(("client", 1), "forward", {})
         for _ in range(3):
             try:
                 await execute_operation(rank, operation)
@@ -190,7 +343,10 @@ def test_failed_outcome_releases_traceback_activations_and_replays_error(
             gc.collect()
             assert references[0]() is None
         assert len(references) == 1
-        assert rank._rank._operation_outcomes["failed"].completion.exception() is None
+        assert (
+            rank._rank._operation_outcomes.outcomes[operation.id].completion.exception()
+            is None
+        )
 
     asyncio.run(run())
 
@@ -208,7 +364,7 @@ def test_concurrent_failed_retry_has_independent_error_without_retained_tracebac
             raise ValueError("update rejected")
 
         rank = SimpleNamespace(_rank=SimpleNamespace(), optim_step=optim_step)
-        operation = TrainerOperation.capture("failed", "optim_step", {})
+        operation = TrainerOperation.capture(("client", 1), "optim_step", {})
         original = asyncio.create_task(execute_operation(rank, operation))
         await entered.wait()
         retry = asyncio.create_task(execute_operation(rank, operation))
@@ -267,7 +423,9 @@ def test_failed_exported_backward_replays_once_and_releases_only_consumed_graphs
         else:
             setattr(view, "_submit_backward", fail)
         operation = TrainerOperation.capture(
-            "backward", "backward", {"packets": packets, "retain_graph": retain_graph}
+            ("client", 1),
+            "backward",
+            {"packets": packets, "retain_graph": retain_graph},
         )
         for _ in range(2):
             try:
@@ -288,7 +446,7 @@ def test_failed_exported_backward_replays_once_and_releases_only_consumed_graphs
             await execute_operation(
                 view,
                 TrainerOperation.capture(
-                    "retry-intentionally", "backward", {"packets": packets}
+                    ("client", 2), "backward", {"packets": packets}
                 ),
             )
             gc.collect()
@@ -314,7 +472,7 @@ def test_malformed_nonretained_backward_preserves_unrelated_exports():
                 await execute_operation(
                     view,
                     TrainerOperation.capture(
-                        "invalid",
+                        ("client", 1),
                         "backward",
                         {"packets": (CotangentPacket(handle, gradients),)},
                     ),

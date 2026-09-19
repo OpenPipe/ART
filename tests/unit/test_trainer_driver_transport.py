@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import replace
 import gc
-from typing import Any
+from typing import Any, cast
 import weakref
 
 import pytest
@@ -48,7 +48,7 @@ class _TransportRank(_Rank):
 
 def _operation(view, kind, payload, identity=None):
     return execute_operation(
-        view, TrainerOperation.capture(identity or str(id(payload)), kind, payload)
+        view, TrainerOperation.capture((identity or str(id(payload)), 1), kind, payload)
     )
 
 
@@ -253,3 +253,31 @@ def test_transport_release_drops_cpu_payload_without_collecting_cycles():
     finally:
         if enabled:
             gc.enable()
+
+
+@pytest.mark.parametrize("kind", ["forward", "batches_open"])
+def test_abandoned_reply_releases_native_graphs_and_iterators(kind):
+    async def run():
+        rank = cast(Any, _TransportRank())
+        view = _view(_Executor(rank, "zero"))
+        state = rank._rank_command_state
+        operation = TrainerOperation.capture(
+            ("client", 1),
+            kind,
+            {"inputs": _input(3) if kind == "forward" else [_input(3)]},
+        )
+        await execute_operation(view, operation)
+        if kind == "forward":
+            assert state.graphs and state.exports
+        else:
+            assert state.iterators and state.batch_inputs
+        acknowledgement = TrainerOperation.capture(
+            operation.id, "acknowledge", ((), (1,))
+        )
+        await execute_operation(view, acknowledgement)
+        await execute_operation(view, acknowledgement)
+        assert not state.graphs and not state.exports
+        assert not state.iterators and not state.batch_inputs
+        assert not rank._operation_outcomes.outcomes
+
+    asyncio.run(run())

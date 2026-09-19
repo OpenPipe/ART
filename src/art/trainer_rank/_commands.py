@@ -8,7 +8,6 @@ from contextlib import asynccontextmanager, nullcontext
 from dataclasses import dataclass, field, replace
 from functools import partial
 import inspect
-from io import BytesIO
 from typing import TYPE_CHECKING, Any, Literal, TypeVar, cast
 import weakref
 
@@ -16,7 +15,7 @@ import cloudpickle
 import torch
 import torch.distributed as dist
 
-from . import _impl
+from . import _impl, _transport
 
 if TYPE_CHECKING:
     from . import TrainerRank
@@ -60,11 +59,7 @@ class _Command:
 
 
 def _encode_command(command: _Command) -> bytes:
-    # Torch owns storage serialization so nested modules and tensor views keep
-    # their shared storages. Cloudpickle still supports callback-local objects.
-    stream = BytesIO()
-    torch.save(command, stream, pickle_module=cloudpickle)
-    return stream.getvalue()
+    return _transport.encode(command)
 
 
 @dataclass(frozen=True)
@@ -274,11 +269,7 @@ class _Executor:
     def _decode(self, payload: Any) -> _Command:
         error, decoded = None, None
         try:
-            # A leader's CUDA ordinal is not a peer's local model device. Decode
-            # storages on CPU; native command handlers place them on their rank.
-            decoded = torch.load(
-                BytesIO(payload), map_location="cpu", weights_only=False
-            )
+            decoded = _transport.decode(payload)
         except Exception as exc:
             error = f"Command deserialization failed: {exc}"
         failures = self._gather(error)
