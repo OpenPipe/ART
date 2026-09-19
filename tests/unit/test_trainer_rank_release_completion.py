@@ -1,12 +1,12 @@
 """Pending callback cleanup remains observable and ordered after failure."""
 
 import asyncio
-from typing import Any
+from typing import Any, cast
 
 import pytest
 from test_trainer_rank_commands import _Rank
 
-from art.trainer_rank._commands import _Executor, _Release
+from art.trainer_rank._commands import _Executor, _Release, join_rank_callback_release
 
 
 @pytest.mark.parametrize("peer_buffers", [False, True])
@@ -19,14 +19,16 @@ def test_completed_release_is_finalized_before_queued_done_callback(
     )
 
     async def run():
-        rank: Any = _Rank()
+        rank = cast(Any, _Rank())
         executor = _Executor(rank, "zero")
         state = executor.state
         state.graphs["zero:old:dp:0"] = (rank.weight,)
         state.released.add("zero:old:dp:0")
         completed = asyncio.get_running_loop().create_future()
         release = state.pending_release = _Release(
-            completed, [(tuple(state.released), False), ((), peer_buffers)]
+            completed,
+            [(tuple(state.released), False), ((), peer_buffers)],
+            executor._finish_release,
         )
         completed.set_result(None)
         completed.add_done_callback(lambda _: executor._finish_release(release))
@@ -45,13 +47,15 @@ def test_completed_release_is_finalized_before_queued_done_callback(
 @pytest.mark.parametrize("cancelled", [False, True])
 def test_background_cleanup_failure_is_reported_and_blocks_next_entry(cancelled):
     async def run():
-        rank: Any = _Rank()
+        rank = cast(Any, _Rank())
         executor = _Executor(rank, "zero")
         loop = asyncio.get_running_loop()
         reports = []
         loop.set_exception_handler(lambda _loop, context: reports.append(context))
         completed = loop.create_future()
-        release = executor.state.pending_release = _Release(completed, [((), False)])
+        release = executor.state.pending_release = _Release(
+            completed, [((), False)], executor._finish_release
+        )
         completed.add_done_callback(lambda _: executor._finish_release(release))
         if cancelled:
             completed.cancel()
@@ -73,7 +77,7 @@ def test_background_cleanup_failure_is_reported_and_blocks_next_entry(cancelled)
 
 def test_success_in_unrelated_exception_handler_still_awaits_cleanup(monkeypatch):
     async def run():
-        rank: Any = _Rank()
+        rank = cast(Any, _Rank())
         executor = _Executor(rank, "zero")
         started, finish = asyncio.Event(), asyncio.Event()
 
@@ -95,5 +99,25 @@ def test_success_in_unrelated_exception_handler_still_awaits_cleanup(monkeypatch
         assert not pending.done()
         finish.set()
         await pending
+
+    asyncio.run(run())
+
+
+def test_checkpoint_fence_defers_cancellation_without_cancelling_release():
+    async def run():
+        rank = cast(Any, _Rank())
+        executor = _Executor(rank, "zero")
+        completed = asyncio.get_running_loop().create_future()
+        executor.state.pending_release = _Release(
+            completed, [((), False)], executor._finish_release
+        )
+        pending = asyncio.create_task(join_rank_callback_release(rank))
+        await asyncio.sleep(0)
+        pending.cancel()
+        await asyncio.sleep(0)
+        assert not pending.done() and not completed.cancelled()
+        completed.set_result(None)
+        assert isinstance(await pending, asyncio.CancelledError)
+        assert executor.state.pending_release is None
 
     asyncio.run(run())

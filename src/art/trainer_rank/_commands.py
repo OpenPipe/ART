@@ -73,6 +73,7 @@ class _OutputPacket:
 class _Release:
     completed: asyncio.Future[None]
     gathered: list[Any]
+    finish: Callable[[_Release], None]
 
 
 @dataclass
@@ -109,6 +110,33 @@ def rank_callback_leader(rank: TrainerRank, *, mode: Mode = "rank") -> bool:
         if mode == "zero"
         else get_rank_callback_metadata(rank) is not None
     )
+
+
+async def join_rank_callback_release(
+    rank: TrainerRank,
+) -> asyncio.CancelledError | None:
+    """Settle prior callback cleanup, returning any deferred cancellation."""
+    state: _State | None = getattr(rank, "_rank_command_state", None)
+    if state is None:
+        return None
+    cancelled = None
+    if release := state.pending_release:
+        while True:
+            try:
+                await asyncio.shield(release.completed)
+                break
+            except asyncio.CancelledError as error:
+                if release.completed.cancelled():
+                    break
+                cancelled = error
+            except Exception:
+                break  # Finalization records and reports the terminal error.
+        # A done callback may still be queued; ownership must be settled
+        # synchronously before this actor can execute another command.
+        release.finish(release)
+    if state.release_error is not None:
+        raise RuntimeError(state.release_error)
+    return cancelled
 
 
 class _Executor:
@@ -192,7 +220,9 @@ class _Executor:
         else:
             completed = loop.create_future()
             completed.set_result(None)
-        release = self.state.pending_release = _Release(completed, gathered)
+        release = self.state.pending_release = _Release(
+            completed, gathered, self._finish_release
+        )
         # The callback's exception can reach its controller before every DP
         # sibling exits. Keep ownership until their matching cleanup completes.
         completed.add_done_callback(lambda _: self._finish_release(release))
@@ -222,24 +252,7 @@ class _Executor:
             )
 
     async def _join_release(self) -> asyncio.CancelledError | None:
-        cancelled = None
-        if release := self.state.pending_release:
-            while True:
-                try:
-                    await asyncio.shield(release.completed)
-                    break
-                except asyncio.CancelledError as error:
-                    if release.completed.cancelled():
-                        break
-                    cancelled = error
-                except Exception:
-                    break  # Finalization records and reports the terminal error.
-            # A done callback may still be queued; ownership must be settled
-            # synchronously before this actor can execute another command.
-            self._finish_release(release)
-        if self.state.release_error is not None:
-            raise RuntimeError(self.state.release_error)
-        return cancelled
+        return await join_rank_callback_release(self.rank)
 
     async def reconcile_releases(
         self, *, defer_cancellation: bool = False
