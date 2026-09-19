@@ -843,9 +843,6 @@ def test_adaptive_planner_does_not_reuse_wide_window_for_cold_signature(
 ) -> None:
     rank = TrainerRank(_runtime())
     monkeypatch.setattr(rank, "_dp_rank_and_size", lambda: (0, 1))
-    monkeypatch.setattr(
-        rank, "_resolve_slot_ref", lambda request, **_kwargs: request.checkpoint
-    )
     for name in ("policy", "adversary", "third"):
         rank._checkpoint_slots.setdefault(name, _CheckpointSlot()).params = ()
     inputs = [
