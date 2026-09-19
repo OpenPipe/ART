@@ -1,4 +1,6 @@
 import asyncio
+from copy import deepcopy
+import json
 from types import SimpleNamespace
 
 from pydantic import BaseModel
@@ -138,6 +140,68 @@ def test_explicit_rewriting_bypasses_observation(options):
         )
         == []
     )
+
+
+@pytest.mark.parametrize("arguments", [{"id": 3}, '{  "id": 3  }'])
+def test_response_observation_accepts_structured_tool_arguments(arguments):
+    class Function(BaseModel):
+        name: str
+        arguments: str
+
+    class ToolCall(BaseModel):
+        id: str
+        type: str
+        function: Function
+
+    class Message(BaseModel):
+        role: str
+        content: str | None = None
+        tool_calls: list[ToolCall] | None = None
+
+    class Request(BaseModel):
+        messages: list[Message]
+
+    tokenizer = Tokenizer()
+    request = Request(messages=[Message(role="user", content="question")])
+    message = {
+        "role": "assistant",
+        "content": None,
+        "tool_calls": [
+            {
+                "id": "call",
+                "type": "function",
+                "function": {"name": "lookup", "arguments": arguments},
+            }
+        ],
+    }
+    original_request = request.model_dump(mode="python")
+    original_message = deepcopy(message)
+    rendered_arguments: list[str] = []
+
+    async def render(value: Request) -> list[int]:
+        if len(value.messages) == 1:
+            return tokenizer.encode("prompt:")
+        calls = value.messages[-1].tool_calls
+        assert calls
+        function = calls[0].function
+        rendered_arguments.append(function.arguments)
+        return tokenizer.encode("prompt:toolEND")
+
+    observations = asyncio.run(
+        chat_response_prefixes(
+            tokenizer,
+            request,
+            tokenizer.encode("prompt:"),
+            [(message, tokenizer.encode("toolEND"), True)],
+            render,
+        )
+    )
+
+    expected = json.dumps(arguments) if isinstance(arguments, dict) else arguments
+    assert rendered_arguments == [expected]
+    assert observations
+    assert request.model_dump(mode="python") == original_request
+    assert message == original_message
 
 
 def test_custom_stop_does_not_delete_the_template_terminator():

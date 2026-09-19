@@ -426,6 +426,25 @@ async def chat_response_prefixes(
     )
 
     async def complete(message: Mapping[str, Any]) -> list[int] | None:
+        calls = message.get("tool_calls")
+        if isinstance(calls, list):
+            message = {
+                **message,
+                "tool_calls": [
+                    {
+                        **call,
+                        "function": {
+                            **call["function"],
+                            "arguments": json.dumps(call["function"]["arguments"]),
+                        },
+                    }
+                    if isinstance(call, Mapping)
+                    and isinstance(call.get("function"), Mapping)
+                    and isinstance(call["function"].get("arguments"), Mapping)
+                    else call
+                    for call in calls
+                ],
+            }
         return await render(
             type(request).model_validate({**payload, "messages": [*messages, message]})
         )
