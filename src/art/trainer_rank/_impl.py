@@ -4174,11 +4174,9 @@ class TrainerRank:
             fit, trusted = fits(width)
             if fit and trusted:
                 best = width
-            elif not fit:
-                failed = width
-            # A prior call may have used a different checkpoint/output mix.
-            # Calibrate an unseen signature through the normal growth below;
-            # the cached width alone is not evidence that its backward fits.
+            # A cached width from another checkpoint/output mix is only a
+            # shortcut when it fits a trusted profile. Otherwise grow below;
+            # a cached binary-search bound can also jump to an unprofiled mix.
 
         while failed is None and best < remaining:
             width = normalize(max(best + 1, best * 2))

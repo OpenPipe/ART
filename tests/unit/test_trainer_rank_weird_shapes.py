@@ -837,8 +837,10 @@ def test_adaptive_planner_probes_new_heterogeneous_signatures(
     ]
 
 
+@pytest.mark.parametrize("budget", [None, 32])
 def test_adaptive_planner_does_not_reuse_wide_window_for_cold_signature(
     monkeypatch: pytest.MonkeyPatch,
+    budget: int | None,
 ) -> None:
     rank = TrainerRank(_runtime())
     monkeypatch.setattr(rank, "_dp_rank_and_size", lambda: (0, 1))
@@ -858,6 +860,8 @@ def test_adaptive_planner_does_not_reuse_wide_window_for_cold_signature(
     # A prior no-grad evaluation can leave a wide window even though the
     # combined training signature has never completed a forward/backward.
     rank._last_global_micro_batch_size = 64
+    if budget is not None:
+        _set_packed_token_budget(monkeypatch, rank, budget)
 
     candidate = rank._select_next_micro_batch(inputs, 0)
 
@@ -866,14 +870,18 @@ def test_adaptive_planner_does_not_reuse_wide_window_for_cold_signature(
     assert candidate.plan.signature.slot_group_count == 2
 
 
+@pytest.mark.parametrize("budget", [None, 32])
 def test_adaptive_planner_ramps_after_inactive_prefix(
     monkeypatch: pytest.MonkeyPatch,
+    budget: int | None,
 ) -> None:
     rank = TrainerRank(_runtime())
     rank._last_global_micro_batch_size = 64
     monkeypatch.setattr(rank, "_dp_rank_and_size", lambda: (0, 1))
     # Frozen-control reference trajectories contain no trained histories.
     inputs = [(), ()] + [(_target_request(_tokens(i)),) for i in range(62)]
+    if budget is not None:
+        _set_packed_token_budget(monkeypatch, rank, budget)
 
     candidate = rank._select_next_micro_batch(inputs, 0)
 
