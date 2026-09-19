@@ -215,7 +215,7 @@ def test_registration_materializes_factory_state_and_persistent_buffers():
     source = TiedHead()
     state = execute_head_operation(
         trainer, "head_register", HeadRegistration("student", "head", "module", source)
-    )
+    ).state
     assert list(state.parameters) == ["left"]
     assert list(state.buffers) == ["offset"]
     registered = trainer._checkpoint_slots["student"].custom["head"].value
@@ -579,7 +579,7 @@ def test_remote_registration_of_existing_frozen_snapshot_keeps_frozen_parameters
     source = TiedHead()
     state = execute_head_operation(
         trainer, "head_register", HeadRegistration("snapshot", "head", "module", source)
-    )
+    ).state
     assert source.left.requires_grad
     assert not state.parameters["left"].requires_grad
     live = LiveHead(state, source, CotangentCollector())

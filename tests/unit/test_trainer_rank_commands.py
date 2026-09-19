@@ -636,7 +636,7 @@ def test_logical_head_factory_runs_once_and_head_only_client_backward():
     def register(view):
         parameter = view.parameter("gain", factory, checkpoint="student")
         assert view.parameter("gain", factory, checkpoint="student") is parameter
-        return view._invoke("head", "head_export", (("student", "gain"),))[0]
+        return view._invoke("head", "head_export", (("student", "gain"),))[0].state
 
     state = asyncio.run(run_rank_callback(trainer, register, mode="zero")).value
     assert calls == [True]

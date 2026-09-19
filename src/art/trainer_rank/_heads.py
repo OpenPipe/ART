@@ -522,6 +522,18 @@ class HeadState:
 
 
 @dataclass(frozen=True)
+class HeadObservation:
+    sequence: int
+    state: HeadState | None
+
+
+def _observe_head(trainer: TrainerRank, state: HeadState | None) -> HeadObservation:
+    sequence = getattr(trainer, "_head_observation_sequence", 0) + 1
+    setattr(trainer, "_head_observation_sequence", sequence)
+    return HeadObservation(sequence, state)
+
+
+@dataclass(frozen=True)
 class HeadBufferUpdate:
     version: Any
     name: str
@@ -597,13 +609,18 @@ def execute_head_operation(
             lambda: deepcopy(registration.value),
             checkpoint=checkpoint,
         )
-        return export_head(trainer, checkpoint, registration.name)
+        return _observe_head(
+            trainer, export_head(trainer, checkpoint, registration.name)
+        )
     if kind == "head_export":
         return tuple(
-            export_head(trainer, checkpoint, name)
-            if checkpoint in trainer._checkpoint_slots
-            and name in trainer._checkpoint_slots[checkpoint].custom
-            else None
+            _observe_head(
+                trainer,
+                export_head(trainer, checkpoint, name)
+                if checkpoint in trainer._checkpoint_slots
+                and name in trainer._checkpoint_slots[checkpoint].custom
+                else None,
+            )
             for checkpoint, name in payload
         )
     if kind == "head_publish":
@@ -1316,7 +1333,7 @@ def logical_register_head(
         value = factory()
         state = view._invoke(
             "head", "head_register", HeadRegistration(checkpoint, name, kind, value)
-        )
+        ).state
     else:
         value = deepcopy(view._rank._checkpoint_slots[checkpoint].custom[name].value)
     value = (
@@ -1356,7 +1373,8 @@ def refresh_logical_heads(view: Any) -> None:
     keys = tuple(key for key, head in registry.items() if not head.invalid)
     if keys:
         states = view._executor.invoke("head", "head_export", keys)
-        for key, state in zip(keys, states, strict=True):
+        for key, observation in zip(keys, states, strict=True):
+            state = observation.state
             if state is None:
                 registry[key].invalid = True
             else:
