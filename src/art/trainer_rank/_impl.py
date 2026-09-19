@@ -2363,24 +2363,37 @@ class TrainerRank:
                     items, start, checkpoint=checkpoint
                 )
             self._snapshot_planning_telemetry(candidate.plan, candidate.check)
-            if isinstance(candidate.plan, _FlatForwardPlan):
-                tracked_outputs, memory_baseline = (
-                    self._run_flat_plan_with_memory_tracking(
-                        candidate.plan,
-                        check=candidate.check,
-                        context="forward_micro_batches",
-                    )
-                )
-            else:
-                tracked_outputs, memory_baseline, forward_peak = (
-                    self._execute_split_plan_with_memory_tracking(
-                        candidate.plan,
-                        check=candidate.check,
-                        context="forward_micro_batches",
-                    )
-                )
+            tracked_outputs: list[AnyForwardOutput] = []
+            outputs: list[Any] = []
             flat_outputs = iter(tracked_outputs)
-            outputs = [_unflatten(item, flat_outputs) for item in candidate.inputs]
+            error: BaseException | None = None
+            try:
+                if isinstance(candidate.plan, _FlatForwardPlan):
+                    tracked_outputs, memory_baseline = (
+                        self._run_flat_plan_with_memory_tracking(
+                            candidate.plan,
+                            check=candidate.check,
+                            context="forward_micro_batches",
+                        )
+                    )
+                else:
+                    tracked_outputs, memory_baseline, forward_peak = (
+                        self._execute_split_plan_with_memory_tracking(
+                            candidate.plan,
+                            check=candidate.check,
+                            context="forward_micro_batches",
+                        )
+                    )
+                flat_outputs = iter(tracked_outputs)
+                outputs = [_unflatten(item, flat_outputs) for item in candidate.inputs]
+            except BaseException as exc:
+                error = exc
+            try:
+                self._release_cached_memory_for_backward(candidate.plan, error=error)
+            except BaseException:
+                # Do not retain our completed graph through a new handoff traceback.
+                del tracked_outputs, flat_outputs, outputs
+                raise
             stop = start + candidate.stats_global_count
             if stop < len(items):
                 self._last_global_micro_batch_size = max(
@@ -2433,6 +2446,40 @@ class TrainerRank:
             # Only the caller may retain completed outputs into the next wave.
             del tracked_outputs, flat_outputs, outputs
             start = stop
+
+    def _release_cached_memory_for_backward(
+        self, plan: _AnyForwardPlan, *, error: BaseException | None = None
+    ) -> None:
+        # Every WORLD wave reaches this before the public iterator skips empty
+        # outputs. Forward has already executed: never replan or retry here.
+        with self._cache_recovery_episode() as (owner, started):
+            exchange_error: BaseException | None = None
+            try:
+                failed, gradients = self._recovery_reduce(
+                    [
+                        float(error is not None),
+                        float(any(group.grad_enabled for group in plan.groups)),
+                    ],
+                    op="MAX",
+                    sync_across_dp=True,
+                )
+            except BaseException as exc:
+                if error is None:
+                    raise
+                exchange_error = exc
+            if error is not None:
+                raise self._memory_error_with_reduction_note(error, exchange_error)
+            if failed:
+                raise RuntimeError("Forward failed on another rank before handoff")
+            if not gradients:
+                return
+            self._try_cache_recovery(
+                None,
+                sync_across_dp=True,
+                owner=owner,
+                started=started,
+                handoff_grad=any(group.grad_enabled for group in plan.groups),
+            )
 
     @overload
     def dp_rank_forward(
@@ -5186,14 +5233,7 @@ class TrainerRank:
             return result
         assert refused is not None
         original = refused.error(context)
-        state = self._recovery_state()
-        started = self._recovery_clock()
-        owner = object()
-        with state.lock:
-            if state.owner is None:
-                state.owner = owner
-        primary: BaseException | None = None
-        try:
+        with self._cache_recovery_episode() as (owner, started):
             if not isinstance(value, _ForwardRefusal):
                 # A formerly fitting width is not proof that the minimum cannot fit.
                 value = search()
@@ -5220,6 +5260,18 @@ class TrainerRank:
             self._snapshot_planning_telemetry(refused.plan, refused.check)
             latest = refused.error(context)
             raise latest from original
+
+    @contextmanager
+    def _cache_recovery_episode(self) -> Iterator[tuple[object, float | None]]:
+        state = self._recovery_state()
+        started = self._recovery_clock()
+        owner = object()
+        with state.lock:
+            if state.owner is None:
+                state.owner = owner
+        primary: BaseException | None = None
+        try:
+            yield owner, started
         except BaseException as exc:
             primary = exc
             raise
@@ -5334,11 +5386,12 @@ class TrainerRank:
 
     def _try_cache_recovery(
         self,
-        check: _MemoryCheck,
+        check: _MemoryCheck | None,
         *,
         sync_across_dp: bool,
         owner: object,
         started: float | None,
+        handoff_grad: bool = False,
     ) -> bool:
         state = self._recovery_state()
         now = self._recovery_clock()
@@ -5370,7 +5423,7 @@ class TrainerRank:
         invalid |= any(not math.isfinite(value) for value in (*costs, sum(costs)))
         values = self._recovery_reduce(
             [
-                float(check.estimated_required_bytes),
+                float(check.estimated_required_bytes) if check is not None else 0.0,
                 0.0 if invalid else state.work,
                 float(state.first_consumed),
                 float(invalid),
@@ -5387,16 +5440,20 @@ class TrainerRank:
         needed = False
         cap_blocks = False
         try:
-            available = self._available_memory_bytes()
+            available = self._available_memory_bytes() if check is not None else 0
             if (
-                available < required
+                (available < required if check is not None else handoff_grad)
                 and self.device.type == "cuda"
                 and torch.cuda.is_available()
                 and torch.cuda.get_allocator_backend() == "native"
             ):
                 free, total = torch.cuda.mem_get_info(self.device)
                 needed = int(free) < required + int(total * _MEMORY_RESERVE_FRACTION)
-                if os.environ.get(_TEST_HOOKS_ENV) == "1":
+                if check is None:
+                    needed &= int(torch.cuda.memory_reserved(self.device)) > int(
+                        torch.cuda.memory_allocated(self.device)
+                    )
+                elif os.environ.get(_TEST_HOOKS_ENV) == "1":
                     limit = os.environ.get(_TEST_MEMORY_LIMIT_ENV)
                     if limit:
                         cap_blocks = required > max(
@@ -5426,7 +5483,7 @@ class TrainerRank:
         if sampled[0] < 0:
             raise RuntimeError("Memory recovery sampling failed on another rank")
         state.invalid |= not bool(sampled[3])
-        if required <= sampled[0]:
+        if check is not None and required <= sampled[0]:
             return True
         if sampled[1] == 0 or sampled[2] == 0 or state.invalid:
             return False
@@ -5444,9 +5501,37 @@ class TrainerRank:
                 # physical condition again immediately before the sole call.
                 free, total = torch.cuda.mem_get_info(self.device)
                 if int(free) < required + int(total * _MEMORY_RESERVE_FRACTION):
-                    attempted = True
-                    torch.cuda.empty_cache()
-            available = self._available_memory_bytes()
+                    if check is not None:
+                        attempted = True
+                        torch.cuda.empty_cache()
+                    else:
+                        allocated = int(torch.cuda.memory_allocated(self.device))
+                        reserved = int(torch.cuda.memory_reserved(self.device))
+                        if reserved > allocated:
+                            # A soft trigger, not calibrated library demand. The
+                            # native release affects unused caches process-wide.
+                            evidence = dict(
+                                device=str(self.device),
+                                reserve_trigger_bytes=int(
+                                    total * _MEMORY_RESERVE_FRACTION
+                                ),
+                                physical_free_before_bytes=int(free),
+                                allocated_bytes=allocated,
+                                reserved_before_bytes=reserved,
+                            )
+                            with _telemetry_phase(
+                                "gradient_handoff_cache_release", evidence
+                            ):
+                                attempted = True
+                                with torch.cuda.device(self.device):
+                                    torch.cuda.empty_cache()
+                                evidence["physical_free_after_bytes"] = int(
+                                    torch.cuda.mem_get_info(self.device)[0]
+                                )
+                                evidence["reserved_after_bytes"] = int(
+                                    torch.cuda.memory_reserved(self.device)
+                                )
+            available = self._available_memory_bytes() if check is not None else 0
         except BaseException as exc:
             error, available = exc, -1
         exchange_error: BaseException | None = None
@@ -5466,7 +5551,9 @@ class TrainerRank:
             raise self._memory_error_with_reduction_note(error, exchange_error)
         if sampled[0] < 0:
             raise RuntimeError("Memory recovery failed on another rank")
-        # Rebuild pure search caches even when this fresh sample decreased.
+        # Admission rebuilds pure search caches even when the sample decreased.
+        # Handoff ignores this return: denied/insufficient recovery still yields
+        # the completed outputs, with no claim that backward will fit.
         return True
 
     def _memory_check_required(
