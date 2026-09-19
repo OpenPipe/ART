@@ -857,8 +857,8 @@ def test_adaptive_planner_does_not_reuse_wide_window_for_cold_signature(
     ]
     warm = rank._plan_flat_forward(inputs[:1])
     rank._memory_profiles[warm.signature] = _MemoryProfile(0.0, 1_000_000)
-    # A prior no-grad evaluation can leave a wide window even though the
-    # combined training signature has never completed a forward/backward.
+    # A prior wave can leave a wide window even though the combined training
+    # signature has never completed a forward/backward.
     rank._last_global_micro_batch_size = 64
     if budget is not None:
         _set_packed_token_budget(monkeypatch, rank, budget)
@@ -890,14 +890,26 @@ def test_adaptive_planner_ramps_after_inactive_prefix(
     assert candidate.cold_start
 
 
-def test_adaptive_planner_grows_stable_window_to_largest_aligned_fit(
+@pytest.mark.parametrize(("cached", "max_estimates"), [(512, 9), (800, 10)])
+def test_adaptive_planner_searches_stable_window_to_largest_aligned_fit(
     monkeypatch: pytest.MonkeyPatch,
+    cached: int,
+    max_estimates: int,
 ) -> None:
     rank = TrainerRank(_runtime())
-    rank._last_global_micro_batch_size = 512
+    rank._last_global_micro_batch_size = cached
     monkeypatch.setattr(rank, "_dp_rank_and_size", lambda: (0, 1))
     monkeypatch.setattr(rank, "_all_ranks_have_memory_profile", lambda **_kwargs: True)
     _set_packed_token_budget(monkeypatch, rank, 700)
+    estimate_calls = 0
+    original_estimate = rank._estimate_flat_forward
+
+    def estimate(requests, **kwargs):
+        nonlocal estimate_calls
+        estimate_calls += 1
+        return original_estimate(requests, **kwargs)
+
+    monkeypatch.setattr(rank, "_estimate_flat_forward", estimate)
 
     candidate = rank._select_next_micro_batch(
         [_target_request(_tokens(index)) for index in range(900)],
@@ -905,7 +917,8 @@ def test_adaptive_planner_grows_stable_window_to_largest_aligned_fit(
     )
 
     assert candidate.stats_global_count == 672
-    assert candidate.rejected_candidates <= 2
+    assert candidate.rejected_candidates <= 3
+    assert estimate_calls <= max_estimates
 
 
 def test_forward_micro_batches_shrinks_when_memory_budget_drops(
