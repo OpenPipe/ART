@@ -837,6 +837,71 @@ def test_adaptive_planner_probes_new_heterogeneous_signatures(
     ]
 
 
+@pytest.mark.parametrize(
+    ("budget", "cached_profiled"), [(None, False), (32, False), (32, True)]
+)
+def test_adaptive_planner_does_not_reuse_wide_window_for_cold_signature(
+    monkeypatch: pytest.MonkeyPatch,
+    budget: int | None,
+    cached_profiled: bool,
+) -> None:
+    rank = TrainerRank(_runtime())
+    monkeypatch.setattr(rank, "_dp_rank_and_size", lambda: (0, 1))
+    monkeypatch.setattr(
+        rank, "_resolve_slot_ref", lambda request, **_kwargs: request.checkpoint
+    )
+    for name in ("policy", "adversary", "third"):
+        rank._checkpoint_slots.setdefault(name, _CheckpointSlot()).params = ()
+    inputs = [
+        _target_request(
+            _tokens(index),
+            checkpoint="third"
+            if index >= 32
+            else "policy"
+            if index % 2 == 0
+            else "adversary",
+        )
+        for index in range(64)
+    ]
+    warm = rank._plan_flat_forward(inputs[:1])
+    rank._memory_profiles[warm.signature] = _MemoryProfile(0.0, 1_000_000)
+    if cached_profiled:
+        # The cached three-slot plan is trusted, but its two-slot prefix is not.
+        warm = rank._plan_flat_forward(inputs)
+        rank._memory_profiles[warm.signature] = _MemoryProfile(0.0, 1_000_000)
+    # A prior wave can leave a wide window even though the combined training
+    # signature has never completed a forward/backward.
+    rank._last_global_micro_batch_size = 64
+    if budget is not None:
+        _set_packed_token_budget(monkeypatch, rank, budget)
+
+    candidate = rank._select_next_micro_batch(inputs, 0)
+
+    assert candidate.stats_global_count == 2
+    assert candidate.cold_start
+    assert candidate.plan.signature.slot_group_count == 2
+
+
+@pytest.mark.parametrize("budget", [None, 32])
+def test_adaptive_planner_ramps_after_inactive_prefix(
+    monkeypatch: pytest.MonkeyPatch,
+    budget: int | None,
+) -> None:
+    rank = TrainerRank(_runtime())
+    rank._last_global_micro_batch_size = 64
+    monkeypatch.setattr(rank, "_dp_rank_and_size", lambda: (0, 1))
+    # Frozen-control reference trajectories contain no trained histories.
+    inputs = [(), ()] + [(_target_request(_tokens(i)),) for i in range(62)]
+    if budget is not None:
+        _set_packed_token_budget(monkeypatch, rank, budget)
+
+    candidate = rank._select_next_micro_batch(inputs, 0)
+
+    assert candidate.stats_global_count == 4
+    assert candidate.plan.request_count == 2
+    assert candidate.cold_start
+
+
 def test_adaptive_planner_grows_stable_window_to_largest_aligned_fit(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
