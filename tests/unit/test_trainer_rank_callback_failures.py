@@ -3,18 +3,16 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import timedelta
+from contextlib import closing
 import gc
 from multiprocessing.connection import Connection
-import sys
-from types import ModuleType, SimpleNamespace
 from typing import Any
 
 import pytest
 from test_trainer_rank_commands import _input, _loss_tree, _Rank
 import torch
-import torch.distributed as dist
 import torch.multiprocessing as mp
+from trainer_rank_test_support import gloo_group, megatron_topology
 
 from art.trainer_rank import run_rank_callback, run_rank_callback_stream
 
@@ -111,30 +109,12 @@ async def _serve(rank: Any, connection: Connection, kind: str) -> None:
 
 def _worker(physical: int, rendezvous: str, connection: Connection, kind: str) -> None:
     torch.set_num_threads(1)
-    dist.init_process_group(
-        "gloo",
-        init_method=f"file://{rendezvous}",
-        rank=physical,
-        world_size=2,
-        timeout=timedelta(seconds=12),
-    )
-    try:
-        groups = [dist.new_group([0]), dist.new_group([1])]
-        ps = SimpleNamespace(
-            get_tensor_model_parallel_rank=lambda: 0,
-            get_context_parallel_rank=lambda: 0,
-            get_data_parallel_rank=lambda: physical,
-            get_data_parallel_world_size=lambda: 2,
-            get_tensor_and_context_parallel_group=lambda **kwargs: groups[physical],
-        )
-        megatron, core = ModuleType("megatron"), ModuleType("megatron.core")
-        setattr(core, "parallel_state", ps)
-        setattr(megatron, "core", core)
-        sys.modules.update({"megatron": megatron, "megatron.core": core})
+    with (
+        gloo_group(physical, f"file://{rendezvous}", timeout=12),
+        closing(connection),
+        megatron_topology(physical, dp_size=2, tp_size=1),
+    ):
         asyncio.run(_serve(_Rank(physical, 2), connection, kind))
-    finally:
-        connection.close()
-        dist.destroy_process_group()
 
 
 async def _gather(executions):

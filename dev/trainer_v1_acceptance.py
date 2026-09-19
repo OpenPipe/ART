@@ -15,7 +15,6 @@ import json
 import os
 from pathlib import Path
 import resource
-import subprocess
 import sys
 import time
 import traceback
@@ -23,9 +22,16 @@ import traceback
 import torch
 import torch.distributed as dist
 from trainer_rank_diag import rank0_checked
-from trainer_rank_support import load_random_checkpoints
+from trainer_v1_support import (
+    _cached_backward,
+    _leaves,
+    build_rank,
+    load_checkpoint,
+    nccl_group,
+    source_commits,
+)
 
-from art.trainer_rank import ForwardInput, TrainerRank
+from art.trainer_rank import ForwardInput
 
 
 def _requests(checkpoint, offset, lengths, options=None):
@@ -45,12 +51,6 @@ def _requests(checkpoint, offset, lengths, options=None):
     return [[leaves[0], *leaves[1:2]], leaves[2:]] if len(leaves) > 1 else leaves
 
 
-def _leaves(tree):
-    if isinstance(tree, (list, tuple)):
-        return [leaf for item in tree for leaf in _leaves(item)]
-    return [tree]
-
-
 def _loss_and_cotangents(first, second):
     a = torch.cat([leaf.target_logprobs for leaf in _leaves(first)])
     b = torch.cat([leaf.target_logprobs for leaf in _leaves(second)])
@@ -66,14 +66,6 @@ def _loss_and_cotangents(first, second):
         db.detach().split([x.target_logprobs.numel() for x in _leaves(second)])
     )
     return loss, tensors, gradients
-
-
-def _cached_backward(rank, loss):
-    with rank._gradient_transaction():
-        packets = rank._forward_cotangent_collector().backward(loss)
-        rank._forward_graph_cache().backward_many(
-            [(packet.handle, packet.gradients) for packet in packets]
-        )
 
 
 def _canonical_gradients(rank, checkpoint):
@@ -189,33 +181,21 @@ def main():
     device = int(os.environ["LOCAL_RANK"])
     if args.reverse_devices:
         device = int(os.environ["LOCAL_WORLD_SIZE"]) - 1 - device
-    torch.cuda.set_device(device)
-    dist.init_process_group("nccl")
-    try:
+    with nccl_group(device):
         from megatron.core import parallel_state as ps
-
-        from art.megatron.train import build_training_runtime
 
         if args.mode in ("oracle", "retained") and dist.get_world_size() != 1:
             raise ValueError(
                 "The mathematical global-loss oracle requires one physical rank"
             )
-        torch.manual_seed(90217)
-        runtime = build_training_runtime(
-            model_identifier=args.model,
-            provider_configure=(lambda p: setattr(p, "num_layers", args.layers))
-            if args.layers
-            else None,
+        physical = build_rank(
+            args.model,
+            layers=args.layers or None,
             print_env=dist.get_rank() == 0,
         )
-        for chunk in runtime.model:
-            chunk.eval()
-        physical = TrainerRank(runtime)
         if args.mode == "control" and ps.get_data_parallel_world_size() != 1:
             raise ValueError("A physical topology control requires DP=1")
-        (checkpoint,) = load_random_checkpoints(
-            runtime, physical, 1, base_model=args.model, lora_rank=2
-        )
+        checkpoint = load_checkpoint(physical, args.model)
         options = None
         if args.mode == "retained":
             from art.trainer_rank import ForwardOptions
@@ -230,7 +210,7 @@ def main():
         second = _requests(checkpoint, 113, [19], options)
         callbacks = 0
         cache_before_backward = None
-        hidden_size = runtime.provider.hidden_size
+        hidden_size = physical.runtime.provider.hidden_size
 
         def head_factory():
             head = torch.nn.Linear(
@@ -472,18 +452,7 @@ def main():
                 },
                 "device": torch.cuda.get_device_name(),
                 "torch": torch.__version__,
-                "source_commit": subprocess.check_output(
-                    ["git", "rev-parse", "HEAD"],
-                    cwd=Path(sys.modules["art.trainer_rank"].__file__)
-                    .resolve()
-                    .parents[3],
-                    text=True,
-                ).strip(),
-                "harness_commit": subprocess.check_output(
-                    ["git", "rev-parse", "HEAD"],
-                    cwd=Path(__file__).resolve().parent.parent,
-                    text=True,
-                ).strip(),
+                **source_commits(),
                 "measurements": measurements,
                 "comparison": comparison,
                 "retention": args.retention if args.mode == "retained" else None,
@@ -501,8 +470,6 @@ def main():
             print(json.dumps(metadata), flush=True)
 
         rank0_checked("trainer v1 global-loss acceptance", finish)
-    finally:
-        dist.destroy_process_group()
 
 
 if __name__ == "__main__":

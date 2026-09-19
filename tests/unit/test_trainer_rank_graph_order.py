@@ -1,12 +1,12 @@
 """Physical peers must enter cached/replayed backward collectives identically."""
 
-from datetime import timedelta
 from types import SimpleNamespace
 
 import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
+from trainer_rank_test_support import gloo_group
 
 from art.trainer_rank import TrainerRank, _graphs
 from art.trainer_rank._impl import _CheckpointSlot
@@ -32,14 +32,7 @@ class _Collective(torch.autograd.Function):
 
 
 def _worker(rank, rendezvous, fail_replay):
-    dist.init_process_group(
-        "gloo",
-        init_method=rendezvous,
-        rank=rank,
-        world_size=2,
-        timeout=timedelta(seconds=30),
-    )
-    try:
+    with gloo_group(rank, rendezvous):
         names = iter(("z", "a") if rank == 0 else ("a", "z"))
         setattr(_graphs, "uuid4", lambda: SimpleNamespace(hex=next(names)))
         cache = _graphs.GraphCache()
@@ -103,8 +96,6 @@ def _worker(rank, rendezvous, fail_replay):
         completed = torch.tensor(1)
         dist.all_reduce(completed)
         assert completed.item() == 2
-    finally:
-        dist.destroy_process_group()
 
 
 @pytest.mark.parametrize("fail_replay", [False, True])

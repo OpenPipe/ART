@@ -9,14 +9,12 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 import torch
-import torch.distributed as dist
 from torch.multiprocessing.reductions import StorageWeakRef
-from trainer_rank_support import load_random_checkpoints
+from trainer_v1_support import build_rank, load_checkpoint, nccl_group
 
 from art.trainer_rank import (
     ForwardInput,
     ForwardOptions,
-    TrainerRank,
     TrainerRankMemoryError,
     run_rank_callback,
 )
@@ -28,23 +26,16 @@ def main():
     args = parser.parse_args()
     load_dotenv(".env")
     torch.set_num_threads(2)
-    torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", "0")))
-    dist.init_process_group("nccl")
-    try:
-        from art.megatron.train import build_training_runtime
-
+    with nccl_group(int(os.environ.get("LOCAL_RANK", "0"))):
         os.environ["ART_TRAINER_RANK_TEST_HOOKS"] = "1"
-        torch.manual_seed(716)
-        runtime = build_training_runtime(
-            model_identifier="Qwen/Qwen3-0.6B",
+        rank = build_rank(
+            "Qwen/Qwen3-0.6B",
+            seed=716,
+            layers=2,
+            eval_mode=False,
             model_initialization="random",
-            provider_configure=lambda provider: setattr(provider, "num_layers", 2),
-            print_env=False,
         )
-        rank = TrainerRank(runtime)
-        (checkpoint,) = load_random_checkpoints(
-            runtime, rank, 1, base_model="Qwen/Qwen3-0.6B", lora_rank=2
-        )
+        checkpoint = load_checkpoint(rank, "Qwen/Qwen3-0.6B")
         request = ForwardInput(
             input_tokens=torch.arange(32),
             hidden_states=True,
@@ -173,8 +164,6 @@ def main():
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(json.dumps(rows, indent=2))
         print("HEAD_MEMORY=" + json.dumps(rows), flush=True)
-    finally:
-        dist.destroy_process_group()
 
 
 if __name__ == "__main__":

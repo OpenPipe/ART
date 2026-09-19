@@ -16,18 +16,23 @@ import os
 from pathlib import Path
 import resource
 import statistics
-import subprocess
-import sys
 import time
 import weakref
 
 from dotenv import load_dotenv
 import torch
 import torch.distributed as dist
-from trainer_rank_support import load_random_checkpoints
-from trainer_v1_acceptance import _cached_backward, _leaves
+from trainer_v1_support import (
+    _cached_backward,
+    _leaves,
+    build_rank,
+    deterministic_kernels,
+    load_checkpoint,
+    nccl_group,
+    source_commits,
+)
 
-from art.trainer_rank import AdamParams, ForwardInput, TrainerRank
+from art.trainer_rank import AdamParams, ForwardInput
 
 
 def main():
@@ -53,39 +58,16 @@ def main():
         parser.error("Delayed graphs require v1; use gpu as the delayed oracle")
     load_dotenv(".env")
     if args.deterministic:
-        os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
-        torch.use_deterministic_algorithms(True)
-        import art.megatron.flex_attn.compiled as flex
-
-        flex._FORCED_FLEX_BACKEND = "TRITON"
-        flex._FORCED_FLEX_KERNEL_OPTIONS = {"BACKEND": "TRITON"}
-        flex.dense_compiled_flex_attention = flex.triton_dense_compiled_flex_attention
-        flex.sparse_compiled_flex_attention = flex.triton_sparse_compiled_flex_attention
+        deterministic_kernels()
     for axis in ("TENSOR_MODEL", "CONTEXT", "DATA", "PIPELINE_MODEL"):
         os.environ[f"ART_MEGATRON_{axis}_PARALLEL_SIZE"] = "1"
     os.environ["ART_TRAINER_RANK_TEST_HOOKS"] = "1"
     os.environ["ART_TRAINER_RANK_TEST_ANCHOR"] = "no_sharing"
-    torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
-    dist.init_process_group("nccl")
-    try:
+    with nccl_group():
         if dist.get_world_size() != 1:
             raise ValueError("This paired benchmark requires one physical rank")
-        from art.megatron.train import build_training_runtime
-
-        torch.manual_seed(90217)
-        runtime = build_training_runtime(
-            model_identifier=args.model,
-            provider_configure=(lambda p: setattr(p, "num_layers", args.layers))
-            if args.layers
-            else None,
-            print_env=False,
-        )
-        for chunk in runtime.model:
-            chunk.eval()
-        rank = TrainerRank(runtime)
-        (checkpoint,) = load_random_checkpoints(
-            runtime, rank, 1, base_model=args.model, lora_rank=2
-        )
+        rank = build_rank(args.model, layers=args.layers or None)
+        checkpoint = load_checkpoint(rank, args.model)
         forward = getattr(rank, "forward", None) or rank.dp_rank_forward
         options = None
         if args.mode != "baseline":
@@ -279,20 +261,11 @@ def main():
             "arguments": {
                 k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()
             },
-            "source_commit": subprocess.check_output(
-                ["git", "rev-parse", "HEAD"],
-                cwd=Path(sys.modules["art.trainer_rank"].__file__).resolve().parents[3],
-                text=True,
-            ).strip(),
-            "harness_commit": subprocess.check_output(
-                ["git", "rev-parse", "HEAD"],
-                cwd=Path(__file__).resolve().parent.parent,
-                text=True,
-            ).strip(),
+            **source_commits(),
             "torch": torch.__version__,
             "device": torch.cuda.get_device_name(),
-            "layers": runtime.provider.num_layers,
-            "dtype": str(next(runtime.model[0].parameters()).dtype),
+            "layers": rank.runtime.provider.num_layers,
+            "dtype": str(next(rank.runtime.model[0].parameters()).dtype),
             "initial_fixed_objective": initial_eval,
             "final_fixed_objective": final_eval,
             "median_tokens_per_second": statistics.median(
@@ -322,8 +295,6 @@ def main():
             raise AssertionError(
                 f"Fixed objective did not improve: {initial_eval} -> {final_eval}"
             )
-    finally:
-        dist.destroy_process_group()
 
 
 if __name__ == "__main__":

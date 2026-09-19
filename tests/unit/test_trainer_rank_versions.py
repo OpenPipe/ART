@@ -1,18 +1,16 @@
 from __future__ import annotations
 
 from contextlib import nullcontext
-from datetime import timedelta
 import gc
 from pathlib import Path
-import time
 from types import SimpleNamespace
 import weakref
 
 import pytest
 import torch
 import torch.distributed as dist
-import torch.multiprocessing as mp
 from torch.utils.checkpoint import checkpoint
+from trainer_rank_test_support import gloo_group, spawn_and_join
 
 from art.trainer_rank import TrainerRank, TrainerRankSlotStateError
 from art.trainer_rank._impl import _CheckpointSlot
@@ -316,14 +314,7 @@ def test_explicit_head_cotangents_join_model_gradient_transaction() -> None:
 
 
 def _divergent_version_worker(rank: int, rendezvous: str) -> None:
-    dist.init_process_group(
-        "gloo",
-        init_method=rendezvous,
-        rank=rank,
-        world_size=2,
-        timeout=timedelta(seconds=30),
-    )
-    try:
+    with gloo_group(rank, rendezvous):
         trainer, current = _trainer()
         version = trainer._capture_checkpoint_version("student")
         if rank == 0:
@@ -340,26 +331,17 @@ def _divergent_version_worker(rank: int, rendezvous: str) -> None:
         completed = torch.tensor(1)
         dist.all_reduce(completed)
         assert completed.item() == 2
-    finally:
-        dist.destroy_process_group()
 
 
 def test_divergent_optimizer_provenance_rejects_collectively_before_mutation(
     tmp_path: Path,
 ) -> None:
-    processes = mp.spawn(
+    spawn_and_join(
         _divergent_version_worker,
         args=(f"file://{tmp_path / 'versions'}",),
-        nprocs=2,
-        join=False,
+        timeout=90,
+        failure="Divergent version preflight did not complete collectively",
     )
-    deadline = time.monotonic() + 90
-    while time.monotonic() < deadline:
-        if processes.join(timeout=1):
-            return
-    for process in processes.processes:
-        process.terminate()
-    pytest.fail("Divergent version preflight did not complete collectively")
 
 
 def test_transaction_coalesces_many_children_but_keeps_each_origin() -> None:
@@ -455,14 +437,7 @@ def test_gradient_assignment_failure_rolls_back_earlier_publication() -> None:
 
 
 def _transaction_exit_failure_worker(rank: int, rendezvous: str, nested: bool) -> None:
-    dist.init_process_group(
-        "gloo",
-        init_method=rendezvous,
-        rank=rank,
-        world_size=2,
-        timeout=timedelta(seconds=15),
-    )
-    try:
+    with gloo_group(rank, rendezvous, timeout=15):
         trainer, current = _trainer()
         version = trainer._capture_checkpoint_version("student")
         trainer._commit_versioned_gradients(
@@ -515,8 +490,6 @@ def _transaction_exit_failure_worker(rank: int, rendezvous: str, nested: bool) -
         completed = torch.tensor(1)
         dist.all_reduce(completed)
         assert completed.item() == 2
-    finally:
-        dist.destroy_process_group()
 
 
 @pytest.mark.parametrize("nested", [False, True])
@@ -524,16 +497,9 @@ def test_local_replay_failure_uses_same_collective_exit_phase_on_every_rank(
     tmp_path: Path,
     nested: bool,
 ) -> None:
-    processes = mp.spawn(
+    spawn_and_join(
         _transaction_exit_failure_worker,
         args=(f"file://{tmp_path / 'exit'}", nested),
-        nprocs=2,
-        join=False,
+        timeout=60,
+        failure="Transaction success/failure exit phases did not match",
     )
-    deadline = time.monotonic() + 60
-    while time.monotonic() < deadline:
-        if processes.join(timeout=1):
-            return
-    for process in processes.processes:
-        process.terminate()
-    pytest.fail("Transaction success/failure exit phases did not match")

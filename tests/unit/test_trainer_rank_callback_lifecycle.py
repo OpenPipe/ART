@@ -1,16 +1,14 @@
 """Checkpoint scopes and delayed cleanup stay within their callback session."""
 
 import asyncio
-from datetime import timedelta
 import gc
-import sys
-from types import ModuleType, SimpleNamespace
 from typing import Any
 
 import pytest
 from test_trainer_rank_commands import _input, _Rank
 import torch.distributed as dist
 import torch.multiprocessing as mp
+from trainer_rank_test_support import gloo_group, megatron_topology
 
 from art.trainer_rank import run_rank_callback
 
@@ -95,26 +93,10 @@ def test_retained_callback_iterator_closes_before_stop_and_cannot_reenter(mode):
 
 
 def _lifecycle_worker(physical, rendezvous):
-    dist.init_process_group(
-        "gloo",
-        init_method=f"file://{rendezvous}",
-        rank=physical,
-        world_size=2,
-        timeout=timedelta(seconds=15),
-    )
-    try:
-        megatron, core = ModuleType("megatron"), ModuleType("megatron.core")
-        setattr(
-            core,
-            "parallel_state",
-            SimpleNamespace(
-                get_tensor_model_parallel_rank=lambda: physical,
-                get_context_parallel_rank=lambda: 0,
-                get_tensor_and_context_parallel_group=lambda: dist.group.WORLD,
-            ),
-        )
-        setattr(megatron, "core", core)
-        sys.modules.update({"megatron": megatron, "megatron.core": core})
+    with (
+        gloo_group(physical, f"file://{rendezvous}", timeout=15),
+        megatron_topology(physical, dp_size=1, tp_size=2),
+    ):
         for mode in ("zero", "rank"):
             rank: Any = _CheckpointRank()
             held = []
@@ -174,8 +156,6 @@ def _lifecycle_worker(physical, rendezvous):
             rank.zero_grad = zero_grad
             asyncio.run(run_rank_callback(rank, following, mode=mode))
             dist.barrier()
-    finally:
-        dist.destroy_process_group()
 
 
 def test_delayed_callback_cleanup_and_checkpoint_scopes_leave_gloo_reusable(tmp_path):

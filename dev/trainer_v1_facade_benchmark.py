@@ -15,9 +15,9 @@ import time
 from dotenv import load_dotenv
 import torch
 import torch.distributed as dist
-from trainer_rank_support import load_random_checkpoints
+from trainer_v1_support import build_rank, load_checkpoint, nccl_group
 
-from art.trainer_rank import ForwardInput, ForwardOptions, TrainerRank, _commands
+from art.trainer_rank import ForwardInput, ForwardOptions, _commands
 
 
 def main():
@@ -29,9 +29,7 @@ def main():
     parser.add_argument("--profile", action="store_true")
     args = parser.parse_args()
     load_dotenv(".env")
-    torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
-    dist.init_process_group("nccl")
-    try:
+    with nccl_group():
         world = dist.get_world_size()
         for axis in ("TENSOR_MODEL", "CONTEXT", "DATA", "PIPELINE_MODEL"):
             os.environ[f"ART_MEGATRON_{axis}_PARALLEL_SIZE"] = str(
@@ -39,20 +37,8 @@ def main():
             )
         os.environ["ART_TRAINER_RANK_TEST_HOOKS"] = "1"
         os.environ["ART_TRAINER_RANK_TEST_ANCHOR"] = "no_sharing"
-        from art.megatron.train import build_training_runtime
-
-        torch.manual_seed(90217)
-        runtime = build_training_runtime(
-            model_identifier="Qwen/Qwen3-0.6B",
-            provider_configure=lambda p: setattr(p, "num_layers", args.layers),
-            print_env=False,
-        )
-        for chunk in runtime.model:
-            chunk.eval()
-        physical = TrainerRank(runtime)
-        (checkpoint,) = load_random_checkpoints(
-            runtime, physical, 1, base_model="Qwen/Qwen3-0.6B", lora_rank=2
-        )
+        physical = build_rank("Qwen/Qwen3-0.6B", layers=args.layers)
+        checkpoint = load_checkpoint(physical, "Qwen/Qwen3-0.6B")
         options = ForwardOptions(
             backward_state="gpu", output_device="model", stale_gradient_corrections=()
         )
@@ -227,8 +213,6 @@ def main():
                     "cumulative"
                 ).print_stats(100)
         print("FACADE_SUMMARY=" + json.dumps(summary), flush=True)
-    finally:
-        dist.destroy_process_group()
 
 
 if __name__ == "__main__":

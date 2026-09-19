@@ -4,40 +4,13 @@ from collections import namedtuple
 from contextlib import nullcontext
 from dataclasses import replace
 from itertools import permutations
-from types import SimpleNamespace
-from typing import Any, cast
+from typing import Any
 
 import pytest
+from test_trainer_rank_active_memory import _rank
 import torch
 
 from art.trainer_rank import _impl as tr
-
-
-class _Model(torch.nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.weight = torch.nn.Parameter(torch.zeros((), dtype=torch.bfloat16))
-        self.config = SimpleNamespace(hidden_size=8, num_layers=4, padded_vocab_size=32)
-        self.decoder = object()
-
-    def _preprocess(self, *args, **kwargs):
-        return None
-
-
-def _rank():
-    return tr.TrainerRank(
-        cast(
-            Any,
-            SimpleNamespace(
-                model=[_Model()],
-                optimizer=None,
-                provider=SimpleNamespace(
-                    hidden_size=8, num_layers=4, recompute_granularity="full"
-                ),
-                model_support_handler=SimpleNamespace(build_gdn_execution_spec=False),
-            ),
-        )
-    )
 
 
 def _requests(count=2, length=100):

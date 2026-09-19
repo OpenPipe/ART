@@ -13,33 +13,29 @@ import time
 from dotenv import load_dotenv
 import torch
 import torch.distributed as dist
-from trainer_rank_support import load_random_checkpoints
+from trainer_v1_support import (
+    _cached_backward,
+    _leaves,
+    build_rank,
+    deterministic_kernels,
+    load_checkpoint,
+    nccl_group,
+)
 
 from art.trainer_rank import (
     ForwardInput,
     ForwardOptions,
-    TrainerRank,
     TrainerRankMemoryError,
 )
 from art.trainer_rank._impl import _SplitForwardPlan
 from art.trainer_rank._memory_policy import host_memory_budget, placement_cost
 
 
-def _leaves(tree):
-    if isinstance(tree, (list, tuple)):
-        return [leaf for child in tree for leaf in _leaves(child)]
-    return [tree]
-
-
 def _backward(rank, outputs):
     loss = sum(
         output.hidden_states.float().mean() for output in _leaves(outputs)
     ).square()
-    with rank._gradient_transaction():
-        packets = rank._forward_cotangent_collector().backward(loss)
-        rank._forward_graph_cache().backward_many(
-            [(p.handle, p.gradients) for p in packets]
-        )
+    _cached_backward(rank, loss)
     return float(loss.detach().cpu())
 
 
@@ -54,22 +50,12 @@ def main():
     args = parser.parse_args()
     load_dotenv(".env")
     if args.deterministic:
-        os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
-        torch.use_deterministic_algorithms(True)
-        import art.megatron.flex_attn.compiled as flex
-
-        flex._FORCED_FLEX_BACKEND = "TRITON"
-        flex._FORCED_FLEX_KERNEL_OPTIONS = {"BACKEND": "TRITON"}
-        flex.dense_compiled_flex_attention = flex.triton_dense_compiled_flex_attention
-        flex.sparse_compiled_flex_attention = flex.triton_sparse_compiled_flex_attention
-    torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", "0")))
-    dist.init_process_group("nccl")
-    try:
+        deterministic_kernels()
+    with nccl_group(int(os.environ.get("LOCAL_RANK", "0"))):
         if dist.get_world_size() != 1:
             raise ValueError("This admission oracle uses one physical rank")
         os.environ["ART_TRAINER_RANK_TEST_HOOKS"] = "1"
         os.environ["ART_TRAINER_RANK_TEST_ANCHOR"] = "no_sharing"
-        from art.megatron.train import build_training_runtime
 
         def configure(provider):
             provider.num_layers = args.layers
@@ -78,19 +64,13 @@ def main():
             provider.recompute_num_layers = None
             provider.recompute_modules = []
 
-        torch.manual_seed(913)
-        runtime = build_training_runtime(
-            model_identifier=args.model,
+        rank = build_rank(
+            args.model,
+            seed=913,
             model_initialization="random",
             provider_configure=configure,
-            print_env=False,
         )
-        for chunk in runtime.model:
-            chunk.eval()
-        rank = TrainerRank(runtime)
-        (checkpoint,) = load_random_checkpoints(
-            runtime, rank, 1, base_model=args.model, lora_rank=2
-        )
+        checkpoint = load_checkpoint(rank, args.model)
         forward = getattr(rank, "forward", None) or rank.dp_rank_forward
         batches = getattr(rank, "forward_batches", None) or rank.forward_micro_batches
         options = lambda state, device: ForwardOptions(
@@ -375,8 +355,6 @@ def main():
                 default=str,
             )
         )
-    finally:
-        dist.destroy_process_group()
 
 
 if __name__ == "__main__":

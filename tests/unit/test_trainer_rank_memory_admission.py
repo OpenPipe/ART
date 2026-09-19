@@ -1,46 +1,21 @@
 from dataclasses import replace
 from types import SimpleNamespace
-from typing import Any, cast
 
 import pytest
+from test_trainer_rank_active_memory import _rank
 import torch
 
 from art.trainer_rank import (
     ForwardInput,
     ForwardOptions,
     ImportanceSamplingGradientCorrection,
-    TrainerRank,
     _impl,
 )
 
 
 @pytest.fixture
 def rank(monkeypatch):
-    class Model(torch.nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.weight = torch.nn.Parameter(torch.zeros((), dtype=torch.bfloat16))
-            self.config = SimpleNamespace(
-                hidden_size=8, num_layers=4, padded_vocab_size=32
-            )
-            self.decoder = object()
-
-        def _preprocess(self, *args, **kwargs):
-            return None
-
-    result = TrainerRank(
-        cast(
-            Any,
-            SimpleNamespace(
-                model=[Model()],
-                optimizer=None,
-                provider=SimpleNamespace(
-                    hidden_size=8, num_layers=4, recompute_granularity="full"
-                ),
-                model_support_handler=SimpleNamespace(build_gdn_execution_spec=False),
-            ),
-        )
-    )
+    result = _rank()
     monkeypatch.setattr(result, "_graph_memory_policy_enabled", lambda: True)
     monkeypatch.setattr(result, "_available_memory_bytes", lambda: 250)
     monkeypatch.setattr(result, "_available_cpu_memory_bytes", lambda: 1_000_000)

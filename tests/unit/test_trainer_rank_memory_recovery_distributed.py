@@ -9,6 +9,7 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
+from trainer_rank_test_support import gloo_group
 
 from art.trainer_rank import _impl
 from art.trainer_rank._memory_policy import ForwardMemoryCost
@@ -16,14 +17,7 @@ from art.trainer_rank._options import resolve_forward_options
 
 
 def _reclaim_worker(index: int, directory: str, sync_across_dp: bool) -> None:
-    dist.init_process_group(
-        "gloo",
-        init_method=f"file://{directory}/rendezvous",
-        rank=index,
-        world_size=2,
-        timeout=timedelta(seconds=30),
-    )
-    try:
+    with gloo_group(index, f"file://{directory}/rendezvous"):
         rank = object.__new__(_impl.TrainerRank)
         rank.device = torch.device("cpu")
         rank._graph_memory_policy_enabled = lambda: True
@@ -56,8 +50,6 @@ def _reclaim_worker(index: int, directory: str, sync_across_dp: bool) -> None:
         dist.all_gather_object(gathered, result)
         if index == 0:
             Path(directory, "results.json").write_text(json.dumps(gathered))
-    finally:
-        dist.destroy_process_group()
 
 
 @pytest.mark.parametrize("sync_across_dp", [False, True])
@@ -70,14 +62,7 @@ def test_failed_offload_does_not_strand_a_physical_peer(tmp_path, sync_across_dp
 
 
 def _fallback_worker(index: int, directory: str, sync_across_dp: bool) -> None:
-    dist.init_process_group(
-        "gloo",
-        init_method=f"file://{directory}/rendezvous",
-        rank=index,
-        world_size=2,
-        timeout=timedelta(seconds=30),
-    )
-    try:
+    with gloo_group(index, f"file://{directory}/rendezvous"):
         rank = object.__new__(_impl.TrainerRank)
         rank.device = torch.device("cpu")
         rank._forward_memory_group = lambda: dist.group.WORLD
@@ -113,8 +98,6 @@ def _fallback_worker(index: int, directory: str, sync_across_dp: bool) -> None:
         )
         assert candidates[2][0] == "cpu"
         assert candidates[2][2]["source"] == "insufficient_samples"
-    finally:
-        dist.destroy_process_group()
 
 
 @pytest.mark.parametrize("sync_across_dp", [False, True])
