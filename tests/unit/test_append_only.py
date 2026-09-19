@@ -142,148 +142,102 @@ def test_explicit_rewriting_bypasses_observation(options):
     )
 
 
+class StrictFunction(BaseModel):
+    name: str
+    arguments: str
+
+
+class StrictToolCall(BaseModel):
+    id: str
+    type: str
+    function: StrictFunction
+
+
+class StrictMessage(BaseModel):
+    role: str
+    content: str | None = None
+    tool_calls: list[StrictToolCall] | None = None
+    function_call: StrictFunction | None = None
+
+
+class StrictRequest(BaseModel):
+    messages: list[StrictMessage]
+
+
+@pytest.mark.filterwarnings("ignore:Pydantic serializer warnings")
 @pytest.mark.parametrize(
-    ("arguments", "legacy"),
+    ("arguments", "legacy", "historical"),
     [
-        ({"id": 3}, False),
-        ('{  "id": 3  }', False),
-        ({"id": 3}, True),
+        ({"id": 3}, False, False),
+        ('{  "id": 3  }', False, False),
+        ({"id": 3}, True, False),
+        ({"previous": True}, False, True),
     ],
-    ids=("mapping", "string", "legacy-mapping"),
+    ids=("mapping", "string", "legacy-mapping", "historical-mapping"),
 )
-def test_response_observation_accepts_structured_tool_arguments(arguments, legacy):
-    class Function(BaseModel):
-        name: str
-        arguments: str
-
-    class ToolCall(BaseModel):
-        id: str
-        type: str
-        function: Function
-
-    class Message(BaseModel):
-        role: str
-        content: str | None = None
-        tool_calls: list[ToolCall] | None = None
-        function_call: Function | None = None
-
-    class Request(BaseModel):
-        messages: list[Message]
-
+def test_response_observation_accepts_structured_tool_arguments(
+    arguments, legacy, historical
+):
     tokenizer = Tokenizer()
-    request = Request(messages=[Message(role="user", content="question")])
-    function = {"name": "lookup", "arguments": arguments}
-    message = {"role": "assistant", "content": None}
-    if legacy:
-        message["function_call"] = function
-    else:
-        message["tool_calls"] = [
-            {
-                "id": "call",
-                "type": "function",
-                "function": function,
-            }
-        ]
-    original_request = request.model_dump(mode="python")
-    original_message = deepcopy(message)
-    rendered_arguments: list[str] = []
-
-    async def render(value: Request) -> list[int]:
-        if len(value.messages) == 1:
-            return tokenizer.encode("prompt:")
-        completed = value.messages[-1]
+    messages = [StrictMessage(role="user", content="question")]
+    if historical:
+        function = StrictFunction(name="previous", arguments="{}")
+        object.__setattr__(function, "arguments", arguments)
+        messages.extend(
+            [
+                StrictMessage(
+                    role="assistant",
+                    tool_calls=[
+                        StrictToolCall(
+                            id="previous", type="function", function=function
+                        )
+                    ],
+                ),
+                StrictMessage(role="user", content="next"),
+            ]
+        )
+    request = StrictRequest(messages=messages)
+    message = {"role": "assistant", "content": "answer"}
+    if not historical:
+        function = {"name": "lookup", "arguments": arguments}
         if legacy:
-            assert completed.function_call
-            rendered_arguments.append(completed.function_call.arguments)
+            message["function_call"] = function
         else:
-            assert completed.tool_calls
-            rendered_arguments.append(completed.tool_calls[0].function.arguments)
-        return tokenizer.encode("prompt:toolEND")
+            message["tool_calls"] = [
+                {"id": "call", "type": "function", "function": function}
+            ]
+    original_request = request.model_dump(mode="python", warnings=False)
+    original_message = deepcopy(message)
+    rendered_arguments: list[list[str]] = []
+
+    async def render(value: StrictRequest) -> list[int]:
+        if len(value.messages) == len(request.messages):
+            return tokenizer.encode("prompt:")
+        completed: list[str] = []
+        for rendered_message in value.messages:
+            completed.extend(
+                call.function.arguments for call in rendered_message.tool_calls or []
+            )
+            if rendered_message.function_call:
+                completed.append(rendered_message.function_call.arguments)
+        rendered_arguments.append(completed)
+        return tokenizer.encode("prompt:answerEND")
 
     observations = asyncio.run(
         chat_response_prefixes(
             tokenizer,
             request,
             tokenizer.encode("prompt:"),
-            [(message, tokenizer.encode("toolEND"), True)],
+            [(message, tokenizer.encode("answerEND"), True)],
             render,
         )
     )
 
     expected = json.dumps(arguments) if isinstance(arguments, dict) else arguments
-    assert rendered_arguments == [expected]
+    assert rendered_arguments == [[expected]]
     assert observations
-    assert request.model_dump(mode="python") == original_request
+    assert request.model_dump(mode="python", warnings=False) == original_request
     assert message == original_message
-
-
-def test_response_observation_restores_mutated_history_tool_arguments():
-    class Function(BaseModel):
-        name: str
-        arguments: str
-
-    class ToolCall(BaseModel):
-        id: str
-        type: str
-        function: Function
-
-    class Message(BaseModel):
-        role: str
-        content: str | None = None
-        tool_calls: list[ToolCall] | None = None
-
-    class Request(BaseModel):
-        messages: list[Message]
-
-    tokenizer = Tokenizer()
-    request = Request(
-        messages=[
-            Message(role="user", content="question"),
-            Message(
-                role="assistant",
-                tool_calls=[
-                    ToolCall(
-                        id="prior",
-                        type="function",
-                        function=Function(name="lookup", arguments='{"id": 3}'),
-                    )
-                ],
-            ),
-        ]
-    )
-    prior = request.messages[-1].tool_calls
-    assert prior
-    object.__setattr__(prior[0].function, "arguments", {"id": 3})
-    rendered_arguments = []
-
-    async def render(value: Request) -> list[int]:
-        if len(value.messages) == 2:
-            return tokenizer.encode("prompt:")
-        calls = value.messages[-2].tool_calls
-        assert calls
-        rendered_arguments.append(calls[0].function.arguments)
-        return tokenizer.encode("prompt:answerEND")
-
-    with pytest.warns(UserWarning, match="Expected `str`"):
-        observations = asyncio.run(
-            chat_response_prefixes(
-                tokenizer,
-                request,
-                tokenizer.encode("prompt:"),
-                [
-                    (
-                        {"role": "assistant", "content": "answer"},
-                        tokenizer.encode("answerEND"),
-                        True,
-                    )
-                ],
-                render,
-            )
-        )
-
-    assert rendered_arguments == ['{"id": 3}']
-    assert observations
-    assert prior[0].function.arguments == {"id": 3}
 
 
 def test_custom_stop_does_not_delete_the_template_terminator():
