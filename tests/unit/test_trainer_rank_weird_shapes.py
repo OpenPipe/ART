@@ -837,6 +837,51 @@ def test_adaptive_planner_probes_new_heterogeneous_signatures(
     ]
 
 
+def test_adaptive_planner_does_not_reuse_wide_window_for_cold_signature(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rank = TrainerRank(_runtime())
+    monkeypatch.setattr(rank, "_dp_rank_and_size", lambda: (0, 1))
+    monkeypatch.setattr(
+        rank, "_resolve_slot_ref", lambda request, **_kwargs: request.checkpoint
+    )
+    for name in ("policy", "adversary"):
+        rank._checkpoint_slots.setdefault(name, _CheckpointSlot()).params = ()
+    inputs = [
+        _target_request(
+            _tokens(index), checkpoint="policy" if index % 2 == 0 else "adversary"
+        )
+        for index in range(64)
+    ]
+    warm = rank._plan_flat_forward(inputs[:1])
+    rank._memory_profiles[warm.signature] = _MemoryProfile(0.0, 1_000_000)
+    # A prior no-grad evaluation can leave a wide window even though the
+    # combined training signature has never completed a forward/backward.
+    rank._last_global_micro_batch_size = 64
+
+    candidate = rank._select_next_micro_batch(inputs, 0)
+
+    assert candidate.stats_global_count == 2
+    assert candidate.cold_start
+    assert candidate.plan.signature.slot_group_count == 2
+
+
+def test_adaptive_planner_ramps_after_inactive_prefix(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rank = TrainerRank(_runtime())
+    rank._last_global_micro_batch_size = 64
+    monkeypatch.setattr(rank, "_dp_rank_and_size", lambda: (0, 1))
+    # Frozen-control reference trajectories contain no trained histories.
+    inputs = [(), ()] + [(_target_request(_tokens(i)),) for i in range(62)]
+
+    candidate = rank._select_next_micro_batch(inputs, 0)
+
+    assert candidate.stats_global_count == 4
+    assert candidate.plan.request_count == 2
+    assert candidate.cold_start
+
+
 def test_adaptive_planner_grows_stable_window_to_largest_aligned_fit(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
