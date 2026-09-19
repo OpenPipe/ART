@@ -105,7 +105,7 @@ def test_required_and_learned_retained_use_max_not_sum():
     )
     cost = price(r, values)
     old = max(n * 2048 * 2 * 14, n * 188416)
-    assert cost.required == int((out + max(old, retained + work)) * 1.1)
+    assert cost.required == int((out + max(old, 2 * retained + work)) * 1.1)
     assert cost.retained == int((out + retained) * 1.1)
     r._memory_profiles[sig] = replace(
         r._memory_profiles[sig],
@@ -248,7 +248,7 @@ def test_split_keeps_complete_order_and_checks_each_new_subforward():
         logical_per_packed=1,
         retained_compute_bytes_per_token=1,
     )
-    limit = 160_000_000
+    limit = 250_000_000
     used = 0
     r._available_memory_bytes = lambda: limit - used
     result = r._find_admissible_forward(req, checkpoint=Unset, refusal_prefix="test")

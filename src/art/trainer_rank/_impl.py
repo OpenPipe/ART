@@ -1023,6 +1023,10 @@ class _SubforwardCost:
 
     required: int
     retained: int
+    # Before the safety factor, separate from observed forward retention.
+    checkpoint_retained: int = 0
+    checkpoint_workspace: int = 0
+    checkpoint_input_gradient: int = 0
 
     @property
     def ephemeral(self) -> int:
@@ -3103,9 +3107,22 @@ class TrainerRank:
         return None, check
 
     def _split_rung_check(self, costs: Sequence[_SubforwardCost]) -> _MemoryCheck:
-        return self._memory_check_required(
-            sum(cost.retained for cost in costs) + max(cost.ephemeral for cost in costs)
+        return self._memory_check_required(self._split_required_memory(costs))
+
+    @staticmethod
+    def _split_required_memory(costs: Sequence[_SubforwardCost]) -> int:
+        required = sum(cost.retained for cost in costs) + max(
+            cost.ephemeral for cost in costs
         )
+        if any(cost.checkpoint_input_gradient for cost in costs):
+            # The caller owns all returned graphs. A calibrated forward-retained
+            # discount cannot replace the sum of their input-gradient extents.
+            checkpoint = sum(
+                cost.checkpoint_retained + cost.checkpoint_input_gradient
+                for cost in costs
+            ) + max(cost.checkpoint_workspace for cost in costs)
+            required = max(required, int(checkpoint * _MEMORY_SAFETY_FACTOR))
+        return required
 
     @staticmethod
     def _split_memory_key(plan: _SplitForwardPlan) -> bytes | None:
@@ -3249,9 +3266,7 @@ class TrainerRank:
     def _split_plan_memory_check(
         self, plan: _SplitForwardPlan, costs: Sequence[_SubforwardCost]
     ) -> _MemoryCheck:
-        required = sum(cost.retained for cost in costs) + max(
-            cost.ephemeral for cost in costs
-        )
+        required = self._split_required_memory(costs)
         key = self._split_memory_key(plan)
         empirical = (
             0
@@ -3340,8 +3355,8 @@ class TrainerRank:
             # cannot. Its full-required retention is not a pruning lower bound.
             # Keep outputs and the independent source retention floor; exact
             # plan costs keep both trust guards.
-            return _SubforwardCost(
-                required=cost.required,
+            return replace(
+                cost,
                 retained=min(
                     cost.retained,
                     int(
@@ -3794,6 +3809,10 @@ class TrainerRank:
             head_workspace_bytes=head_workspace_bytes,
             checkpoint_floor=checkpoint_floor,
             retained_tokens=retained_tokens,
+            include_checkpoint_input_gradient=False,
+        )
+        checkpoint_retained, checkpoint_workspace = self._checkpoint_memory_floor(
+            group_rows, slot_refs
         )
         retained = self._retained_memory_bytes(
             signature,
@@ -3802,11 +3821,36 @@ class TrainerRank:
             output_bytes=output_bytes,
             required=required,
             checkpoint_retained_bytes=max(
-                self._checkpoint_memory_floor(group_rows, slot_refs)[0],
+                checkpoint_retained,
                 checkpoint_floor[0],
             ),
         )
-        return _SubforwardCost(required=required, retained=retained)
+        # One logical BF16 input gradient per eligible full/uniform/1 boundary.
+        # This partial peak allowance is not evidence of simultaneous distinct
+        # backing stores, nor a bound for compiler saves or other backward work.
+        # Keep it out of forward retention, including the cold fallback above.
+        gradient = checkpoint_retained
+        checkpoint_retained = output_bytes + max(
+            checkpoint_retained, checkpoint_floor[0]
+        )
+        checkpoint_workspace = max(
+            checkpoint_workspace, head_workspace_bytes, checkpoint_floor[1]
+        )
+        if gradient:
+            required = max(
+                required,
+                int(
+                    (checkpoint_retained + checkpoint_workspace + gradient)
+                    * _MEMORY_SAFETY_FACTOR
+                ),
+            )
+        return _SubforwardCost(
+            required=required,
+            retained=retained,
+            checkpoint_retained=checkpoint_retained,
+            checkpoint_workspace=checkpoint_workspace,
+            checkpoint_input_gradient=gradient,
+        )
 
     def _retained_memory_bytes(
         self,
@@ -6492,6 +6536,7 @@ class TrainerRank:
         head_workspace_bytes: int = 0,
         checkpoint_floor: tuple[int, int] = (0, 0),
         retained_tokens: int | None = None,
+        include_checkpoint_input_gradient: bool = True,
     ) -> int:
         if packed_tokens <= 0:
             return output_bytes
@@ -6611,7 +6656,8 @@ class TrainerRank:
         static_compute = max(
             static_compute,
             max(retained, checkpoint_floor[0])
-            + max(workspace, head_workspace_bytes, checkpoint_floor[1]),
+            + max(workspace, head_workspace_bytes, checkpoint_floor[1])
+            + (retained if include_checkpoint_input_gradient else 0),
         )
         if signature.topology[2] > 1:
             # Local head results coexist with full CP outputs during gathering.
