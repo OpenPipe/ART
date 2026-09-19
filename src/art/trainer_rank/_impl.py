@@ -1821,6 +1821,8 @@ class TrainerRank:
             if self._moe_layers
             else 0
         )
+        # A declined component is distinct from a qualified cache later damaged.
+        self._moe_memory_supported = self._moe_output_bytes_per_token > 0
         # Both modes inspect original owners before dispatcher caches are installed.
         self._moe_checkpoint_grad_bytes_per_token = (
             _moe_output_bytes_per_token(

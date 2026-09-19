@@ -193,9 +193,19 @@ def model_shapes(
     # Like the existing static floor, this cache requires unchanged model,
     # dtype and topology since construction; rebuilding the rank invalidates it.
     moe = rank._moe_output_bytes_per_token
-    if type(moe) is not int or moe < 0 or (rank._moe_layers and not moe):
+    if (
+        type(moe) is not int
+        or moe < 0
+        or (
+            rank._moe_layers
+            and not moe
+            and getattr(rank, "_moe_memory_supported", True) is not False
+        )
+    ):
         raise ValueError("Invalid constructor MoE coefficient for GDN pending floor")
     rank._checkpoint_moe_bytes_per_token()
+    if rank._moe_layers and not moe:
+        return None
     shapes = []
     for layer in decoder.layers:
         gdn = getattr(layer, "self_attention", None)

@@ -323,6 +323,40 @@ def test_invalid_cached_coefficient_stops_before_memory_reduction(pending_rank, 
     assert statuses == [False]
 
 
+@pytest.mark.parametrize("unsupported", ["capacity", "forward hook"])
+def test_constructor_declined_moe_keeps_generic_admission(layer, unsupported):
+    layer = _enclosing_moe(layer)
+    if unsupported == "capacity":
+        layer.config.moe_expert_capacity_factor = 1.0
+    else:
+        layer.experts.linear_fc2.register_forward_hook(lambda *args: None)
+    rank, _ = rank_with_moe(layer)
+    # The actual constructor declines this component; no cache is overwritten.
+    assert rank._moe_output_bytes_per_token == 0
+    assert rank._moe_checkpoint_grad_bytes_per_token == 0
+    assert g.model_shapes(rank) is None
+    requests = full_requests()
+    assert rank._estimate_flat_forward(requests) is not None
+    plan = rank._plan_flat_forward(requests)
+    assert g.plan_floor(rank, plan) == (0, 0)
+    required = rank._plan_cost(plan).required
+    # Generic checkpoint-input accounting still applies without a MoE component.
+    gradient = 50640 * 40 * 2048 * 2
+    assert required == int((plan.output_bytes + 2 * gradient) * 1.1)
+    rank._available_memory_bytes = lambda: required - 1
+    assert not rank._memory_check(plan).fits
+    rank._available_memory_bytes = lambda: required
+    assert rank._memory_check(plan).fits
+
+
+def test_declined_moe_does_not_hide_invalid_gradient_cache(layer):
+    layer.config.moe_expert_capacity_factor = 1.0
+    rank, _ = rank_with_moe(_enclosing_moe(layer))
+    rank._moe_checkpoint_grad_bytes_per_token = -1
+    with pytest.raises(ValueError, match="Invalid constructor checkpoint MoE"):
+        rank._estimate_flat_forward(full_requests())
+
+
 @pytest.mark.parametrize(
     "field,value",
     [
