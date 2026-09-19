@@ -29,9 +29,7 @@ def test_pending_cold_peak_does_not_become_forward_retention(pending_rank):
     assert cost.checkpoint_input_gradient == gradient
     # Exact previous cold estimate, including outputs and its one safety factor.
     assert cost.retained == 23102959299
-    assert cost.required == int(
-        (plan.output_bytes + 2 * gradient + 12705630112) * 1.1
-    )
+    assert cost.required == int((plan.output_bytes + 2 * gradient + 12705630112) * 1.1)
     assert r._memory_check(plan).estimated_required_bytes == cost.required
     profile(r, plan)
     warm = r._plan_cost(plan)
@@ -182,9 +180,7 @@ def test_unequal_checkpoint_gradients_preserve_cold_split_execution_order():
         for rows in (17, 29)
     ]
     costs = [r._plan_cost(r._plan_flat_forward([q])) for q in req]
-    assert (
-        0 < costs[0].checkpoint_input_gradient < costs[1].checkpoint_input_gradient
-    )
+    assert 0 < costs[0].checkpoint_input_gradient < costs[1].checkpoint_input_gradient
     assert costs[0].ephemeral < costs[1].ephemeral
     # Cold forward retention was the entire pre-gradient requirement: both
     # original priorities are zero, so the stable original order must survive.
@@ -205,9 +201,7 @@ def test_split_priority_subtracts_only_uncovered_gradient_peak(fully_masked):
     cold = r._plan_cost(plan)
     # Place a real learned peak between the two static estimates, or above both.
     measured = (
-        cold.required + 10**7
-        if fully_masked
-        else (cold.retained + cold.required) / 2
+        cold.required + 10**7 if fully_masked else (cold.retained + cold.required) / 2
     )
     rate = (measured / 1.1 - plan.output_bytes) / plan.packed_tokens
     profile(r, plan, rate=rate)
@@ -216,12 +210,13 @@ def test_split_priority_subtracts_only_uncovered_gradient_peak(fully_masked):
     assert cold.retained < old_required
     assert cost.required == max(cold.required, old_required)
     assert (
-        cost.ephemeral - cost.checkpoint_peak_increment
-        == old_required - cost.retained
+        cost.ephemeral - cost.checkpoint_peak_increment == old_required - cost.retained
     )
     if fully_masked:
         assert cost.checkpoint_peak_increment == 0
     else:
-        assert 0 < cost.checkpoint_peak_increment < int(
-            cost.checkpoint_input_gradient * 1.1
+        assert (
+            0
+            < cost.checkpoint_peak_increment
+            < int(cost.checkpoint_input_gradient * 1.1)
         )
