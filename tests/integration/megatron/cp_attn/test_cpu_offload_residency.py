@@ -29,7 +29,6 @@ from art.preprocessing.pack import PackedTensors  # noqa: E402
 from art.trainer_rank._graphs import GraphCache  # noqa: E402
 from art.trainer_rank._memory_policy import (  # noqa: E402
     ForwardMemoryCost,
-    choose_memory_placement,
     placement_cost,
 )
 
@@ -204,33 +203,16 @@ def _check(rank, device):
     )
     cap = old.gpu_required_bytes + resident
     assert old.gpu_required_bytes <= cap < corrected.gpu_required_bytes
-    assert (
-        choose_memory_placement(
-            [cost] * count,
-            gpu_available_bytes=cap,
-            cpu_available_bytes=1 << 40,
-            backward_state="cpu",
-            output_device="cpu",
-        )
-        is None
+    replay_plan = placement_cost(
+        [cost] * count, backward_state="replay", output_device="cpu"
     )
-    replay_plan = choose_memory_placement(
-        [cost] * count,
-        gpu_available_bytes=cap,
-        cpu_available_bytes=1 << 40,
-        backward_state="replay",
-        output_device="cpu",
-    )
-    assert replay_plan is not None
+    assert replay_plan.gpu_required_bytes <= cap
+    assert replay_plan.cpu_required_bytes <= 1 << 40
     replay = run("replay", count)
     assert replay["peak"] <= cap
-    partial_plan = choose_memory_placement(
-        [cost] * count,
-        gpu_available_bytes=corrected.gpu_required_bytes,
-        cpu_available_bytes=1 << 40,
-        output_device="cpu",
-    )
-    assert partial_plan is not None and partial_plan.backward_state == "cpu"
+    retained = placement_cost([cost] * count, backward_state="gpu", output_device="cpu")
+    assert corrected.gpu_required_bytes < retained.gpu_required_bytes
+    assert corrected.cpu_required_bytes <= 1 << 40
     partial = run("cpu", count)
     assert cap < partial["peak"] <= corrected.gpu_required_bytes
     print(

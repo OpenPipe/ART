@@ -7,7 +7,6 @@ from art.trainer_rank._memory_policy import (
     ForwardMemoryCost,
     HostMemoryBudget,
     MemoryScope,
-    choose_memory_placement,
     choose_output_placements,
     host_memory_budget,
     local_rank_count,
@@ -198,95 +197,9 @@ def test_root_cost_keeps_outputs_and_backward_restore_workspace(
     assert placement.gpu_retained_bytes == retained
 
 
-@pytest.mark.parametrize(
-    "gpu,cpu,state,device",
-    [
-        (290, 15, "gpu", "model"),
-        (259, 225, "cpu", "model"),
-        (130, 224, "replay", "model"),
-        (129, 45, "replay", "cpu"),
-    ],
-)
-def test_admission_prefers_retention_and_admits_previously_refused_roots(
-    gpu, cpu, state, device
-):
-    placement = choose_memory_placement(
-        ROOT, gpu_available_bytes=gpu, cpu_available_bytes=cpu, output_device="auto"
-    )
-    assert placement is not None
-    assert (placement.backward_state, placement.output_device) == (state, device)
-    assert placement.gpu_required_bytes <= gpu
-    assert placement.cpu_required_bytes <= cpu
-
-
-@pytest.mark.parametrize("gpu,cpu", [(99, 1000), (259, 14), (129, 44)])
-def test_policy_never_admits_without_cpu_capacity_or_one_child_workspace(gpu, cpu):
-    assert (
-        choose_memory_placement(
-            ROOT, gpu_available_bytes=gpu, cpu_available_bytes=cpu, output_device="auto"
-        )
-        is None
-    )
-
-
-def test_disable_levels_and_explicit_output_opt_out_are_authoritative():
-    assert (
-        choose_memory_placement(
-            ROOT,
-            gpu_available_bytes=129,
-            cpu_available_bytes=1000,
-            allow_cpu_offload=False,
-            output_device="model",
-        )
-        is None
-    )
-    assert (
-        choose_memory_placement(
-            ROOT,
-            gpu_available_bytes=130,
-            cpu_available_bytes=224,
-            allow_replay=False,
-        )
-        is None
-    )
-    forced = choose_memory_placement(
-        ROOT,
-        gpu_available_bytes=1000,
-        cpu_available_bytes=1000,
-        backward_state="replay",
-        output_device="cpu",
-    )
-    assert forced is not None
-    assert (forced.backward_state, forced.output_device) == ("replay", "cpu")
-
-
-@pytest.mark.parametrize(
-    "kwargs",
-    [
-        {"backward_state": "cpu", "allow_cpu_offload": False},
-        {"backward_state": "replay", "allow_replay": False},
-        {"backward_state": "typo"},
-        {"output_device": "typo"},
-    ],
-)
-def test_invalid_policy_raises_before_admission(kwargs):
-    with pytest.raises(ValueError):
-        choose_memory_placement(
-            ROOT, gpu_available_bytes=1000, cpu_available_bytes=1000, **kwargs
-        )
-
-
 def test_no_grad_cpu_outputs_release_gpu_storage_without_replay():
     costs = (ForwardMemoryCost(100, 80, 80, backward_required=False),) * 3
-    placement = choose_memory_placement(
-        costs,
-        gpu_available_bytes=100,
-        cpu_available_bytes=240,
-        allow_cpu_offload=False,
-        allow_replay=False,
-        output_device="auto",
-    )
-    assert placement is not None
+    placement = placement_cost(costs, backward_state="gpu", output_device="cpu")
     assert (placement.backward_state, placement.output_device) == ("gpu", "cpu")
     assert placement.gpu_required_bytes == 100
     assert placement.cpu_required_bytes == 240

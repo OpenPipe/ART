@@ -15,7 +15,6 @@ from art.trainer_rank._graphs import GraphCache
 from art.trainer_rank._impl import _CheckpointSlot
 from art.trainer_rank._memory_policy import (
     ForwardMemoryCost,
-    choose_memory_placement,
     host_memory_budget,
     placement_cost,
 )
@@ -187,27 +186,13 @@ def test_real_root_memory_and_gradient_policy(workload, state, device):
     _run_root(workload, state, device)
 
 
-def test_real_root_admitted_by_replay_with_cpu_outputs(workload):
+def test_real_root_replay_with_cpu_outputs_fits_budget(workload):
     *_, cost = workload
     budget = cost.peak_bytes + 8 * 1024**2
     cpu_budget = host_memory_budget(local_world_size=2).available_bytes
-    assert (
-        choose_memory_placement(
-            (cost,) * 4,
-            gpu_available_bytes=budget,
-            cpu_available_bytes=cpu_budget,
-            backward_state="gpu",
-            output_device="model",
-        )
-        is None
-    )
-    chosen = choose_memory_placement(
-        (cost,) * 4,
-        gpu_available_bytes=budget,
-        cpu_available_bytes=cpu_budget,
-        output_device="auto",
-    )
-    assert chosen is not None
-    assert (chosen.backward_state, chosen.output_device) == ("replay", "cpu")
-    measured = _run_root(workload, chosen.backward_state, chosen.output_device)
+    retained = placement_cost((cost,) * 4, backward_state="gpu", output_device="model")
+    replay = placement_cost((cost,) * 4, backward_state="replay", output_device="cpu")
+    assert replay.gpu_required_bytes <= budget < retained.gpu_required_bytes
+    assert replay.cpu_required_bytes <= cpu_budget
+    measured = _run_root(workload, "replay", "cpu")
     assert measured["gpu_peak_bytes"] <= budget
