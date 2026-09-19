@@ -1,4 +1,6 @@
 import asyncio
+from copy import deepcopy
+import json
 from types import SimpleNamespace
 
 from pydantic import BaseModel
@@ -138,6 +140,104 @@ def test_explicit_rewriting_bypasses_observation(options):
         )
         == []
     )
+
+
+class StrictFunction(BaseModel):
+    name: str
+    arguments: str
+
+
+class StrictToolCall(BaseModel):
+    id: str
+    type: str
+    function: StrictFunction
+
+
+class StrictMessage(BaseModel):
+    role: str
+    content: str | None = None
+    tool_calls: list[StrictToolCall] | None = None
+    function_call: StrictFunction | None = None
+
+
+class StrictRequest(BaseModel):
+    messages: list[StrictMessage]
+
+
+@pytest.mark.filterwarnings("ignore:Pydantic serializer warnings")
+@pytest.mark.parametrize(
+    ("arguments", "legacy", "historical"),
+    [
+        ({"id": 3}, False, False),
+        ('{  "id": 3  }', False, False),
+        ({"id": 3}, True, False),
+        ({"previous": True}, False, True),
+    ],
+    ids=("mapping", "string", "legacy-mapping", "historical-mapping"),
+)
+def test_response_observation_accepts_structured_tool_arguments(
+    arguments, legacy, historical
+):
+    tokenizer = Tokenizer()
+    messages = [StrictMessage(role="user", content="question")]
+    if historical:
+        function = StrictFunction(name="previous", arguments="{}")
+        object.__setattr__(function, "arguments", arguments)
+        messages.extend(
+            [
+                StrictMessage(
+                    role="assistant",
+                    tool_calls=[
+                        StrictToolCall(
+                            id="previous", type="function", function=function
+                        )
+                    ],
+                ),
+                StrictMessage(role="user", content="next"),
+            ]
+        )
+    request = StrictRequest(messages=messages)
+    message = {"role": "assistant", "content": "answer"}
+    if not historical:
+        function = {"name": "lookup", "arguments": arguments}
+        if legacy:
+            message["function_call"] = function
+        else:
+            message["tool_calls"] = [
+                {"id": "call", "type": "function", "function": function}
+            ]
+    original_request = request.model_dump(mode="python", warnings=False)
+    original_message = deepcopy(message)
+    rendered_arguments: list[list[str]] = []
+
+    async def render(value: StrictRequest) -> list[int]:
+        if len(value.messages) == len(request.messages):
+            return tokenizer.encode("prompt:")
+        completed: list[str] = []
+        for rendered_message in value.messages:
+            completed.extend(
+                call.function.arguments for call in rendered_message.tool_calls or []
+            )
+            if rendered_message.function_call:
+                completed.append(rendered_message.function_call.arguments)
+        rendered_arguments.append(completed)
+        return tokenizer.encode("prompt:answerEND")
+
+    observations = asyncio.run(
+        chat_response_prefixes(
+            tokenizer,
+            request,
+            tokenizer.encode("prompt:"),
+            [(message, tokenizer.encode("answerEND"), True)],
+            render,
+        )
+    )
+
+    expected = json.dumps(arguments) if isinstance(arguments, dict) else arguments
+    assert rendered_arguments == [[expected]]
+    assert observations
+    assert request.model_dump(mode="python", warnings=False) == original_request
+    assert message == original_message
 
 
 def test_custom_stop_does_not_delete_the_template_terminator():
