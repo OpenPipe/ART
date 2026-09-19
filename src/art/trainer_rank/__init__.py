@@ -9,6 +9,14 @@ import torch.distributed as dist
 
 from . import _impl
 from ._checkpoint import CheckpointManifest, materialize_lora, validate_checkpoint
+from ._heads import ModuleHandle
+from ._options import (
+    ForwardOptions,
+    ImportanceSamplingGradientCorrection,
+    ResolvedForwardOptions,
+    resolve_forward_options,
+)
+from ._options import _Unset as _Unset
 
 AdapterSelection = _impl.AdapterSelection
 AdamParams = _impl.AdamParams
@@ -42,7 +50,10 @@ ModuleT = TypeVar("ModuleT", bound=torch.nn.Module)
 for _public_type in (
     AdamParams,
     ForwardInput,
+    ForwardOptions,
     ForwardOutput,
+    ImportanceSamplingGradientCorrection,
+    ResolvedForwardOptions,
     MicroBatch,
     MicroBatchStats,
     TopK,
@@ -60,8 +71,8 @@ del _public_type
 class TrainerRank(_impl.TrainerRank):
     """Execute TrainerRank forwards using automatic, data-dependent planning.
 
-    The constructor intentionally accepts only the training runtime. Prefix
-    sharing and microbatch width are data-dependent planner decisions;
+    The constructor accepts the training runtime and optional forward policy.
+    Prefix sharing and microbatch width are data-dependent planner decisions;
     output-head chunking and memory margins are internal calibrated policy.
     None are user tuning parameters. Requires PP=1 (TrainerRank does not use
     the MCore pipeline schedule); PP>1 raises ``TrainerRankRuntimeSupportError``
@@ -69,8 +80,10 @@ class TrainerRank(_impl.TrainerRank):
     profile is keyed by topology and calibrates itself online.
     """
 
-    def __init__(self, runtime: TrainingRuntime) -> None:
-        super().__init__(runtime)
+    def __init__(
+        self, runtime: TrainingRuntime, *, options: ForwardOptions | None = None
+    ) -> None:
+        super().__init__(runtime, options=options)
 
     @property
     def hidden_size(self) -> int:
@@ -86,8 +99,8 @@ class TrainerRank(_impl.TrainerRank):
         factory: Callable[[], ModuleT],
         *,
         checkpoint: AdapterSelection = Unset,
-    ) -> ModuleT:
-        """Register or retrieve a checkpoint-owned PyTorch module."""
+    ) -> ModuleHandle:
+        """Retrieve a live module whose calls capture immutable checkpoint weights."""
         return super().module(name, factory, checkpoint=checkpoint)
 
     def parameter(
@@ -159,10 +172,11 @@ class TrainerRank(_impl.TrainerRank):
         return super().export_lora(output_dir, checkpoint_path)
 
     @overload
-    def forward_micro_batches(
+    def forward_batches(
         self,
         inputs: Iterable[ForwardInput[LogprobsT, TopKT, LogitsT, HiddenStatesT]],
         *,
+        options: ForwardOptions | None = None,
         checkpoint: AdapterSelection = Unset,
         no_grad: bool | None = None,
         yield_empty: bool = False,
@@ -174,12 +188,13 @@ class TrainerRank(_impl.TrainerRank):
     ]: ...
 
     @overload
-    def forward_micro_batches(
+    def forward_batches(
         self,
         inputs: Iterable[
             Iterable[ForwardInput[LogprobsT, TopKT, LogitsT, HiddenStatesT]]
         ],
         *,
+        options: ForwardOptions | None = None,
         checkpoint: AdapterSelection = Unset,
         no_grad: bool | None = None,
         yield_empty: bool = False,
@@ -191,12 +206,13 @@ class TrainerRank(_impl.TrainerRank):
     ]: ...
 
     @overload
-    def forward_micro_batches(
+    def forward_batches(
         self,
         inputs: Iterable[
             Iterable[Iterable[ForwardInput[LogprobsT, TopKT, LogitsT, HiddenStatesT]]]
         ],
         *,
+        options: ForwardOptions | None = None,
         checkpoint: AdapterSelection = Unset,
         no_grad: bool | None = None,
         yield_empty: bool = False,
@@ -208,7 +224,7 @@ class TrainerRank(_impl.TrainerRank):
     ]: ...
 
     @overload
-    def forward_micro_batches(
+    def forward_batches(
         self,
         inputs: Iterable[
             Iterable[
@@ -218,6 +234,7 @@ class TrainerRank(_impl.TrainerRank):
             ]
         ],
         *,
+        options: ForwardOptions | None = None,
         checkpoint: AdapterSelection = Unset,
         no_grad: bool | None = None,
         yield_empty: bool = False,
@@ -236,10 +253,11 @@ class TrainerRank(_impl.TrainerRank):
         ]
     ]: ...
 
-    def forward_micro_batches(
+    def forward_batches(
         self,
         inputs: Iterable[ForwardInputs],
         *,
+        options: ForwardOptions | None = None,
         checkpoint: AdapterSelection = Unset,
         no_grad: bool | None = None,
         yield_empty: bool = False,
@@ -254,10 +272,11 @@ class TrainerRank(_impl.TrainerRank):
         the caller-owned `ForwardInput` objects.
 
         Per-position outputs contain the full flattened input sequence in source
-        order, including with context parallelism. Callers must compute identical
-        losses on every TP/CP replica; ART routes gradients to owning rows
-        without multiplying them by the number of replicas. `dp_reduce` combines
-        only distinct data-parallel batches.
+        order, including with context parallelism. Logical callbacks execute
+        once per DP rank; use `backward(loss)` to route cotangents to internal
+        TP/CP participants. Direct physical callers must invoke matching
+        forwards and backwards on their TP/CP peers. `reduce` combines only
+        distinct data-parallel batches.
 
         Empty local microbatches are skipped unless `yield_empty=True`. Every
         rank must use the same setting. When a wave skips ranks, TrainerRank
@@ -270,28 +289,44 @@ class TrainerRank(_impl.TrainerRank):
         """
         forward = cast(
             Callable[..., Iterator[MicroBatch[ForwardInputs, ForwardOutputs]]],
-            super().forward_micro_batches,
+            super().forward_batches,
         )
         return forward(
-            inputs, checkpoint=checkpoint, no_grad=no_grad, yield_empty=yield_empty
+            inputs,
+            options=options,
+            checkpoint=checkpoint,
+            no_grad=no_grad,
+            yield_empty=yield_empty,
         )
 
     @overload
-    def dp_rank_forward(
+    def forward(
+        self,
+        inputs: ForwardInput[LogprobsT, TopKT, LogitsT, HiddenStatesT],
+        *,
+        options: ForwardOptions | None = None,
+        checkpoint: AdapterSelection = Unset,
+        no_grad: bool | None = None,
+    ) -> ForwardOutput[LogprobsT, TopKT, LogitsT, HiddenStatesT]: ...
+
+    @overload
+    def forward(
         self,
         inputs: Iterable[ForwardInput[LogprobsT, TopKT, LogitsT, HiddenStatesT]],
         *,
+        options: ForwardOptions | None = None,
         checkpoint: AdapterSelection = Unset,
         no_grad: bool | None = None,
     ) -> Sequence[ForwardOutput[LogprobsT, TopKT, LogitsT, HiddenStatesT]]: ...
 
     @overload
-    def dp_rank_forward(
+    def forward(
         self,
         inputs: Iterable[
             Iterable[ForwardInput[LogprobsT, TopKT, LogitsT, HiddenStatesT]]
         ],
         *,
+        options: ForwardOptions | None = None,
         checkpoint: AdapterSelection = Unset,
         no_grad: bool | None = None,
     ) -> Sequence[
@@ -299,12 +334,13 @@ class TrainerRank(_impl.TrainerRank):
     ]: ...
 
     @overload
-    def dp_rank_forward(
+    def forward(
         self,
         inputs: Iterable[
             Iterable[Iterable[ForwardInput[LogprobsT, TopKT, LogitsT, HiddenStatesT]]]
         ],
         *,
+        options: ForwardOptions | None = None,
         checkpoint: AdapterSelection = Unset,
         no_grad: bool | None = None,
     ) -> Sequence[
@@ -312,7 +348,7 @@ class TrainerRank(_impl.TrainerRank):
     ]: ...
 
     @overload
-    def dp_rank_forward(
+    def forward(
         self,
         inputs: Iterable[
             Iterable[
@@ -322,6 +358,7 @@ class TrainerRank(_impl.TrainerRank):
             ]
         ],
         *,
+        options: ForwardOptions | None = None,
         checkpoint: AdapterSelection = Unset,
         no_grad: bool | None = None,
     ) -> Sequence[
@@ -330,17 +367,18 @@ class TrainerRank(_impl.TrainerRank):
         ]
     ]: ...
 
-    def dp_rank_forward(
+    def forward(
         self,
         inputs: ForwardInputs,
         *,
+        options: ForwardOptions | None = None,
         checkpoint: AdapterSelection = Unset,
         no_grad: bool | None = None,
     ) -> ForwardOutputs:
         """Forward inputs already local to this data-parallel rank.
 
         Outputs contain full sequences in source order on every TP/CP rank,
-        with the same loss and reduction contract as `forward_micro_batches`.
+        with the same loss and reduction contract as `forward_batches`.
 
         Per-input checkpoints and `no_grad` values override the method defaults.
         `no_grad=None` inherits the ambient PyTorch grad mode; `True` disables
@@ -351,18 +389,18 @@ class TrainerRank(_impl.TrainerRank):
         """
         forward = cast(
             Callable[..., ForwardOutputs],
-            super().dp_rank_forward,
+            super().forward,
         )
-        return forward(inputs, checkpoint=checkpoint, no_grad=no_grad)
+        return forward(inputs, options=options, checkpoint=checkpoint, no_grad=no_grad)
 
-    def dp_reduce(
+    def reduce(
         self,
         tensor: torch.Tensor,
         *,
         op: dist.ReduceOp.RedOpType = dist.ReduceOp.SUM,
     ) -> None:
         """Reduce in place over data-parallel batches, excluding TP/CP replicas."""
-        super().dp_reduce(tensor, op=op)
+        super().reduce(tensor, op=op)
 
     def optim_step(
         self,
@@ -381,11 +419,10 @@ class TrainerRank(_impl.TrainerRank):
         norm is clipped independently. If any selected norm is nonfinite, no
         selected checkpoint is updated.
 
-        By default, caller-retained forward graphs do not block the step. ART does
-        not detach or free those graphs, and backward through one after the step is
-        unsafe: it may fail PyTorch's version checks or recompute against updated
-        checkpoint-slot weights. Pass `on_live_graphs="error"` to raise before
-        mutating any selected slot when a live graph remains on any rank.
+        Retained forwards use immutable checkpoint versions and may be consumed
+        after this step within their captured `max_gradient_staleness` policy.
+        Pass `on_live_graphs="error"` to additionally refuse updates while a
+        selected checkpoint still has a live forward graph on any rank.
         """
         return super().optim_step(
             params=params,
@@ -395,15 +432,35 @@ class TrainerRank(_impl.TrainerRank):
         )
 
 
+from ._commands import (
+    RankCallbackResult,
+    TrainerRankZero,
+    get_rank_callback_metadata,
+    rank_callback_leader,
+    run_rank_callback,
+    run_rank_callback_stream,
+)
+
 __all__ = [
+    "RankCallbackResult",
+    "TrainerRankZero",
+    "get_rank_callback_metadata",
+    "rank_callback_leader",
+    "run_rank_callback",
+    "run_rank_callback_stream",
     "AdapterSelection",
     "AdamParams",
     "CheckpointManifest",
     "ForwardInput",
+    "ForwardOptions",
+    "ImportanceSamplingGradientCorrection",
+    "ResolvedForwardOptions",
+    "resolve_forward_options",
     "ForwardOutput",
     "MicroBatch",
     "MicroBatchStats",
     "MaterializedCheckpoint",
+    "ModuleHandle",
     "materialize_lora",
     "TopK",
     "TrainerRank",

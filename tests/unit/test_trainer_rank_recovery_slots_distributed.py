@@ -134,9 +134,7 @@ def worker(index, mode, directory):
     )
     error = barrier_error = None
     try:
-        rank._plan_admissible_forward(
-            [request], checkpoint=None, context="dp_rank_forward"
-        )
+        rank._plan_admissible_forward([request], checkpoint=None, context="forward")
     except BaseException as exc:
         error = {"type": type(exc).__name__, "message": str(exc)}
     try:

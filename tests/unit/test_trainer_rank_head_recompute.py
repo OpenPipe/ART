@@ -326,10 +326,10 @@ def _check_context_parallel_case(
     dist.all_reduce(expected_loss)
     expected_loss /= cp_size
     trainer = actual[0]
-    trainer.dp_reduce(actual[2])
+    trainer.reduce(actual[2])
     torch.testing.assert_close(actual[2], expected_loss)
     count = torch.tensor(sum(len(row) for row in tokens), device=device)
-    trainer.dp_reduce(count)
+    trainer.reduce(count)
     assert count.item() == dp_size * sum(len(row) for row in tokens)
     if mode in ("frozen", "no_grad"):
         return

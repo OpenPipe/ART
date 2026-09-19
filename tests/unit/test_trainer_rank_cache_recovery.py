@@ -126,7 +126,7 @@ def run(q, items, *, sync=True):
             search,
             lambda v: v,
             lambda v, c: (v[0], c),
-            context="forward_micro_batches" if sync else "dp_rank_forward",
+            context="forward_batches" if sync else "forward",
             sync_across_dp=sync,
         )
     except BaseException as e:
@@ -155,7 +155,9 @@ class TestRecovery(unittest.TestCase):
             self.addCleanup(patcher.stop)
         q = object.__new__(_impl.TrainerRank)
         q.device = types.SimpleNamespace(type="cuda")
+        q._graph_memory_policy_enabled = lambda: False
         q._update_peak_memory_profile = lambda *a: None
+        q._record_graph_forward_time = lambda *a: None
         q._execute_flat_plan = lambda p: [object() for _ in range(p.request_count)]
         q._telemetry_signature = lambda p: {}
         q._telemetry_plan_signature = lambda p: {}
@@ -263,7 +265,7 @@ class TestRecovery(unittest.TestCase):
     def test_completed_forward_earns_next_trial(self):
         q, c, k, n = self.make()
         run(q, [fail(n), success(n)])
-        q._record_recovery_work("dp_rank_forward", 2.0)
+        q._record_recovery_work("forward", 2.0)
         c.free = 40
         v, e, count = run(q, [fail(n), success(n)])
         self.assertIsNone(e)
@@ -345,7 +347,7 @@ class TestRecovery(unittest.TestCase):
     def test_cap_refusal_in_later_trial_does_not_use_work(self):
         q, c, k, n = self.make()
         run(q, [fail(n), success(n)])
-        q._record_recovery_work("dp_rank_forward", 100)
+        q._record_recovery_work("forward", 100)
         c.free = 40
         os.environ["CONTROL_ART_HOOK"] = "1"
         os.environ["CONTROL_ART_LIMIT"] = "20"
@@ -376,8 +378,8 @@ class TestRecovery(unittest.TestCase):
 
     def test_overflowing_work_disables_recovery(self):
         q, c, k, n = self.make()
-        q._record_recovery_work("dp_rank_forward", 1e308)
-        q._record_recovery_work("dp_rank_forward", 1e308)
+        q._record_recovery_work("forward", 1e308)
+        q._record_recovery_work("forward", 1e308)
         self.assertTrue(q._recovery_state().invalid)
         v, e, count = run(q, [fail(n), success(n)])
         self.assertNotIn("release", c.events)
@@ -409,26 +411,29 @@ class TestRecovery(unittest.TestCase):
             p = plan()
             p.request_count = 1
             outputs, baseline = q._run_flat_plan_with_memory_tracking(
-                p, check=n["_MemoryCheck"](80, 170, True), context="dp_rank_forward"
+                p, check=n["_MemoryCheck"](80, 170, True), context="forward"
             )
             self.assertEqual(len(outputs), 1)
             self.assertTrue(q._recovery_state().invalid)
             self.assertEqual(q._recovery_state().work, 0)
 
     def test_forward_recording_failure_preserves_success(self):
-        q, c, k, n = self.make()
-        p = plan()
-        p.request_count = 1
+        for recorder in ("_record_graph_forward_time", "_record_recovery_work"):
+            with self.subTest(recorder=recorder):
+                q, c, k, n = self.make()
+                p = plan()
+                p.request_count = 1
 
-        def record(*a):
-            raise ValueError("recording only")
+                def record(*a):
+                    raise ValueError("recording only")
 
-        q._record_recovery_work = record
-        outputs, baseline = q._run_flat_plan_with_memory_tracking(
-            p, check=n["_MemoryCheck"](80, 170, True), context="dp_rank_forward"
-        )
-        self.assertEqual(len(outputs), 1)
-        self.assertTrue(q._recovery_state().invalid)
+                setattr(q, recorder, record)
+                outputs, baseline = q._run_flat_plan_with_memory_tracking(
+                    p, check=n["_MemoryCheck"](80, 170, True), context="forward"
+                )
+                self.assertEqual(len(outputs), 1)
+                self.assertTrue(q._recovery_state().invalid)
+                self.assertEqual(q._recovery_state().work, 0)
 
     def test_execution_oom_keeps_admission_and_cause(self):
         q, c, k, n = self.make()
@@ -442,9 +447,7 @@ class TestRecovery(unittest.TestCase):
 
         q._execute_flat_plan = execute
         try:
-            q._run_flat_plan_with_memory_tracking(
-                p, check=check, context="dp_rank_forward"
-            )
+            q._run_flat_plan_with_memory_tracking(p, check=check, context="forward")
         except Refusal as e:
             self.assertIs(e.__cause__, original)
             self.assertEqual(e.usable_limit_bytes, check.available_bytes)
@@ -480,7 +483,7 @@ class TestRecovery(unittest.TestCase):
                 outputs, baseline, peak = q._execute_split_plan_with_memory_tracking(
                     split,
                     check=n["_MemoryCheck"](80, 170, True),
-                    context="dp_rank_forward",
+                    context="forward",
                 )
             except Partial:
                 self.assertEqual(fail_at, 2)
@@ -503,14 +506,14 @@ class TestRecovery(unittest.TestCase):
         state.work = 1.0
         with self.assertRaises(ValueError):
             q._execute_split_plan_with_memory_tracking(
-                split, check=n["_MemoryCheck"](80, 170, True), context="dp_rank_forward"
+                split, check=n["_MemoryCheck"](80, 170, True), context="forward"
             )
         self.assertEqual(state.work, 1.0)
 
     def test_cross_entrypoint_progress_with_work_and_no_new_first_trial(self):
         q, c, k, n = self.make()
         run(q, [fail(n), success(n)], sync=True)
-        q._record_recovery_work("dp_rank_forward", 2.0)
+        q._record_recovery_work("forward", 2.0)
         c.free = 40
         v, e, count = run(q, [fail(n), success(n)], sync=False)
         self.assertIsNone(e)
@@ -526,9 +529,7 @@ class TestRecovery(unittest.TestCase):
             raise AssertionError("unnecessary added admission collective")
 
         q._memory_check_required = forbidden
-        result = q._plan_admissible_forward(
-            [], checkpoint=None, context="dp_rank_forward"
-        )
+        result = q._plan_admissible_forward([], checkpoint=None, context="forward")
         self.assertIs(result[1], value[1])
         self.assertNotIn("release", c.events)
 
@@ -547,7 +548,7 @@ class TestRecovery(unittest.TestCase):
             search,
             lambda v: v,
             lambda v, c: (v[0], c),
-            context="forward_micro_batches",
+            context="forward_batches",
             sync_across_dp=True,
         )
         self.assertTrue(result[1].fits)

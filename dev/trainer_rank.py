@@ -70,17 +70,17 @@ def main(
         for step in range(steps):
             loss_sum = torch.tensor(0.0, device=rank.device)
             token_count = torch.tensor(0.0, device=rank.device)
-            for micro in rank.forward_micro_batches(inputs, checkpoint=slot):
+            for micro in rank.forward_batches(inputs, checkpoint=slot):
                 loss = torch.tensor(0.0, device=rank.device)
                 for output in micro.outputs:
                     assert output.target_logprobs is not None
                     loss = loss - output.target_logprobs.sum()
                     token_count += output.target_logprobs.numel()
-                loss.backward()
+                rank.backward(loss)
                 loss_sum += loss.detach()
 
-            rank.dp_reduce(loss_sum)
-            rank.dp_reduce(token_count)
+            rank.reduce(loss_sum)
+            rank.reduce(token_count)
             scale = 1.0 / max(float(token_count.item()), 1.0)
             metrics = rank.optim_step(
                 params=AdamParams(learning_rate=lr),

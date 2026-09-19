@@ -170,6 +170,8 @@ def test_profile_order_change_cannot_drop_completed_split_floor(monkeypatch):
 
 def _counter_split(monkeypatch):
     rank = _rank()
+    # This executor injects allocator counters without creating cached graphs.
+    monkeypatch.setattr(rank, "_graph_memory_policy_enabled", lambda: False)
     monkeypatch.setattr(rank, "_dp_rank_and_size", lambda: (0, 1))
     _native_slot_fields(monkeypatch, rank)
     requests = _requests()
@@ -217,7 +219,7 @@ def test_completed_iterator_preserves_caller_peak_for_next_admission(monkeypatch
     monkeypatch.setattr(torch.cuda, "mem_get_info", lambda _: (1_000_000, 1_000_000))
     releases = []
     monkeypatch.setattr(torch.cuda, "empty_cache", lambda: releases.append(True))
-    iterator = rank.forward_micro_batches([requests], yield_empty=True)
+    iterator = rank.forward_batches([requests], yield_empty=True)
     batch = next(iterator)
     assert batch.stats.subforward_count == counters["executed"] == 2
     assert counters["resets"] == [100, 600]
@@ -228,7 +230,7 @@ def test_completed_iterator_preserves_caller_peak_for_next_admission(monkeypatch
     del batch
     counters["allocated"] = 100
     with pytest.raises(tr.TrainerRankMemoryError):
-        next(rank.forward_micro_batches([requests], yield_empty=True))
+        next(rank.forward_batches([requests], yield_empty=True))
     assert counters["executed"] == 2
 
     assert releases == []
@@ -237,7 +239,7 @@ def test_completed_iterator_preserves_caller_peak_for_next_admission(monkeypatch
 @pytest.mark.parametrize("termination", ["throw", "close"])
 def test_incomplete_caller_does_not_learn_split_peak(monkeypatch, termination):
     rank, requests, counters = _counter_split(monkeypatch)
-    iterator = rank.forward_micro_batches([requests], yield_empty=True)
+    iterator = rank.forward_batches([requests], yield_empty=True)
     batch = next(iterator)
     assert batch.stats.subforward_count == counters["executed"] == 2
     children = dict(rank._memory_profiles)
@@ -259,7 +261,7 @@ def test_partial_forward_does_not_learn_split_peak(monkeypatch):
     rank, requests, counters = _counter_split(monkeypatch)
     original = torch.cuda.OutOfMemoryError("second split child allocation")
     counters.update(fail_at=2, error=original)
-    iterator = rank.forward_micro_batches([requests], yield_empty=True)
+    iterator = rank.forward_batches([requests], yield_empty=True)
     with pytest.raises(tr.TrainerRankPartialExecutionError) as caught:
         next(iterator)
     assert "1 of 2 completed" in str(caught.value)

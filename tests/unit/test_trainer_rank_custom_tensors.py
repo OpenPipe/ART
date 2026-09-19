@@ -21,6 +21,7 @@ import torch.multiprocessing as mp
 from art.trainer_rank import (
     AdamParams,
     MaterializedCheckpoint,
+    ModuleHandle,
     TrainerRank,
     TrainerRankSlotStateError,
     Unset,
@@ -44,7 +45,7 @@ class _CustomTensorAPI(Protocol):
         factory: Callable[[], ModuleT],
         *,
         checkpoint: str | object = Unset,
-    ) -> ModuleT: ...
+    ) -> ModuleHandle: ...
 
     def parameter(
         self,
@@ -252,7 +253,8 @@ def _distributed_custom_grad_flags_worker(
         used = api.parameter("used", lambda: torch.tensor(1.0), checkpoint="student")
         api.parameter("unused", lambda: torch.tensor(2.0), checkpoint="student")
         if rank == 0:
-            (used * 3).backward()
+            with trainer._gradient_transaction():
+                (used * 3).backward()
         assert trainer._dynamic_param_step_flags(
             trainer._checkpoint_slots["student"].params
         ) == (True, False)
@@ -279,8 +281,8 @@ def test_module_accepts_class_and_lambda_factories_and_is_idempotent() -> None:
     class_head = rank.module("class_head", CountingHead, checkpoint="student")
     lambda_head = rank.module("lambda_head", value_head, checkpoint="student")
 
-    assert isinstance(class_head, CountingHead)
-    assert isinstance(lambda_head, _ValueHead)
+    assert isinstance(class_head, torch.nn.Module)
+    assert isinstance(lambda_head, torch.nn.Module)
     assert rank.module("class_head", CountingHead, checkpoint="student") is class_head
     assert rank.module("lambda_head", value_head, checkpoint="student") is lambda_head
     assert class_calls == 1
@@ -400,7 +402,8 @@ def test_custom_module_outputs_participate_in_checkpoint_graph_guards() -> None:
     with pytest.raises(TrainerRankSlotStateError, match="live backward graph"):
         trainer._guard_slot_can_load(ref)
 
-    output.sum().backward()
+    with trainer._gradient_transaction():
+        output.sum().backward()
     trainer.zero_grad()
     trainer._guard_slot_can_load(ref)
 
@@ -423,7 +426,8 @@ def test_custom_module_tracks_direct_parameter_use_and_custom_outputs(
     assert isinstance(output, _HeadOutput)
     with pytest.raises(TrainerRankSlotStateError, match="live backward graph"):
         trainer._guard_slot_can_load(trainer._slot_ref("student"))
-    output.value.sum().backward()
+    with trainer._gradient_transaction():
+        output.value.sum().backward()
     trainer.zero_grad()
     trainer._guard_slot_can_load(trainer._slot_ref("student"))
 
@@ -439,7 +443,8 @@ def test_custom_module_tracks_direct_weight_operations() -> None:
 
     with pytest.raises(TrainerRankSlotStateError, match="live backward graph"):
         trainer._guard_slot_can_load(trainer._slot_ref("student"))
-    loss.backward()
+    with trainer._gradient_transaction():
+        loss.backward()
     trainer.zero_grad()
     trainer._guard_slot_can_load(trainer._slot_ref("student"))
 
@@ -454,11 +459,13 @@ def test_custom_parameter_graph_guard_tracks_retain_and_abandonment() -> None:
     ref = trainer._slot_ref("student")
     loss = parameter.square().sum()
 
-    loss.backward(retain_graph=True)
+    with trainer._gradient_transaction():
+        loss.backward(retain_graph=True)
     trainer.zero_grad()
     with pytest.raises(TrainerRankSlotStateError, match="live backward graph"):
         trainer._guard_slot_can_load(ref)
-    loss.backward()
+    with trainer._gradient_transaction():
+        loss.backward()
     trainer.zero_grad()
     trainer._guard_slot_can_load(ref)
 
@@ -480,7 +487,8 @@ def test_custom_module_graph_tracking_allows_in_place_layers() -> None:
     )
 
     output = head(torch.ones(1, 3, requires_grad=True))
-    output.sum().backward()
+    with _trainer_rank._gradient_transaction():
+        output.sum().backward()
 
     assert head[0].weight.grad is not None
 
@@ -496,7 +504,8 @@ def test_custom_parameter_outputs_participate_in_checkpoint_graph_guards() -> No
     with pytest.raises(TrainerRankSlotStateError, match="live backward graph"):
         trainer._guard_slot_can_load(ref)
 
-    output.backward()
+    with trainer._gradient_transaction():
+        output.backward()
     trainer.zero_grad()
     trainer._guard_slot_can_load(ref)
 
@@ -507,7 +516,8 @@ def test_checkpoint_load_rejects_custom_grads_and_stale_objects() -> None:
     parameter = rank.parameter(
         "temperature", lambda: torch.tensor(2.0), checkpoint="student"
     )
-    (head(torch.ones(1)) + parameter).sum().backward()
+    with trainer._gradient_transaction():
+        (head(torch.ones(1)) + parameter).sum().backward()
     ref = trainer._slot_ref("student")
 
     with pytest.raises(TrainerRankSlotStateError, match="accumulated gradients"):
@@ -651,7 +661,8 @@ def test_selected_optimizer_step_updates_only_its_custom_checkpoint(
             for param in params
         ),
     )
-    (a * 3).backward()
+    with trainer._gradient_transaction():
+        (a * 3).backward()
     before_b = b.detach().clone()
     trainer.optim_step(
         params=AdamParams(learning_rate=1e-2, weight_decay=0.0),
@@ -677,7 +688,8 @@ def test_optimizer_skips_unused_custom_parameters(
             for param in params
         ),
     )
-    (used * 2).backward()
+    with trainer._gradient_transaction():
+        (used * 2).backward()
 
     trainer.optim_step(
         params=AdamParams(learning_rate=0.1, weight_decay=0.5),
@@ -959,7 +971,8 @@ def test_custom_tensor_names_cannot_corrupt_lora_optimizer_metadata(
             for param in params
         ),
     )
-    head.q_proj.lora_A.weight.sum().backward()
+    with trainer._gradient_transaction():
+        head.q_proj.lora_A.weight.sum().backward()
     trainer.optim_step(
         params=AdamParams(learning_rate=1e-3, weight_decay=0.0),
         checkpoints=["student"],
@@ -1271,7 +1284,7 @@ def _empty_real_lora_trainer() -> tuple[TrainerRank, _CustomTensorAPI]:
 
 def _register_custom_tensors(
     rank: _CustomTensorAPI,
-) -> tuple[_ValueHead, torch.nn.Parameter, torch.Tensor]:
+) -> tuple[ModuleHandle, torch.nn.Parameter, torch.Tensor]:
     head = rank.module("value_head", lambda: _ValueHead(3), checkpoint="student")
     temperature = rank.parameter(
         "temperature", lambda: torch.tensor(0.5), checkpoint="student"
@@ -1284,7 +1297,7 @@ def _register_custom_tensors(
 
 def _step_custom_tensors(
     trainer: TrainerRank,
-    head: _ValueHead,
+    head: ModuleHandle,
     temperature: torch.nn.Parameter,
     monkeypatch: pytest.MonkeyPatch,
     *,
@@ -1301,7 +1314,8 @@ def _step_custom_tensors(
         ),
     )
     hidden = torch.tensor([[0.25, -0.5, 1.0]])
-    (head(hidden).sum() + temperature * scale).backward()
+    with trainer._gradient_transaction():
+        (head(hidden).sum() + temperature * scale).backward()
     trainer.optim_step(
         params=AdamParams(
             learning_rate=1e-3,

@@ -31,7 +31,7 @@ document records the verified facts the acceptance suite pins).
    sharing-aware (a no-sharing token count accepts a width, and the planner's
    actual layouts are priced only when that bound would reject one); head
    chunking and memory margins are internal calibrated constants, not planner
-   decisions; `dp_rank_forward` plans once and raises
+   decisions; `forward` plans once and raises
    `TrainerRankMemoryError(predicted_peak_bytes, usable_limit_bytes,
    suggestion)` when the unsplit plan cannot be admitted (best-effort internal
    splitting is a follow-up PR); `TrainerRankRuntimeSupportError` at PP>1
@@ -632,7 +632,7 @@ memory-minimal (full-sharing) layout fits": full sharing minimizes packed
 tokens and its count is monotone in width by construction. Admission then
 executes the cost-optimal layout when it fits and the memory-minimal layout
 otherwise; the chosen mode is recorded per width so materialization builds
-exactly the layouts that were priced. `dp_rank_forward` applies the same
+exactly the layouts that were priced. `forward` applies the same
 fallback before refusing. Both bounds are cheap O(tokens) walks of the packing
 primitive (no-sharing and unlimited-depth sharing); planner pricing runs only
 inside the band where they disagree.
@@ -658,7 +658,7 @@ keeping the memory-to-throughput crossover.
 
 ## Overlapped (speculative) next-wave planning
 
-``forward_micro_batches`` pre-plans the predicted next wave (exactly the
+``forward_batches`` pre-plans the predicted next wave (exactly the
 width the search will seed with — the largest width so far — over this DP
 rank's strided slice) on a single background thread while the generator is
 suspended at the yield — i.e. during the caller's forward/backward GPU time.
@@ -681,7 +681,7 @@ if finding out is too expensive or fragile, refuse — worded as "unable to find
 a feasible split", never as a claim that none exists.
 
 Mechanism:
-- `dp_rank_forward` (and the minimum wave of `forward_micro_batches`) plans
+- `forward` (and the minimum wave of `forward_batches`) plans
   unsplit first (cost-optimal, then memory-minimal). If neither is admitted, a
   bounded, deterministic ladder tries 2, 4, ... subforwards (at most one
   request each), cutting the requests in prefix-local depth-first order into
@@ -719,7 +719,7 @@ Mechanism:
   so a cold call that cannot fit unsplit refuses until a profile exists.
   Limitation: the observation is taken at forward return and says nothing
   about backward; TrainerRank cannot see the caller's backward peak for
-  `dp_rank_forward` (the micro-batch path folds the post-yield peak into
+  `forward` (the micro-batch path folds the post-yield peak into
   `bytes_per_token`, not into the retained fraction).
 - Collectives. Ensuring checkpoint slots is a world collective; the ladder's
   length depends on this rank's DP-local inputs, so slots are ensured exactly
@@ -812,7 +812,7 @@ Gates (test-first; all failed on the refusing tree):
 - `tests/unit/test_trainer_rank_topology.py`: TP>1 constructs, PP>1 and
   multi-chunk runtimes still refuse.
 - `--phase tp2-public` (2× H200, Qwen3.5-4B full model, DP1×TP2×CP1, public
-  `dp_rank_forward`, active LoRA slot), plus the identical cell at `--tp 1`
+  `forward`, active LoRA slot), plus the identical cell at `--tp 1`
   as the control: both TP peers plan the same physical layout on every call;
   the automatic planner shares more deeply than depth-one on the hierarchical
   GRPO shape; odd packed lengths exercise sequence-parallel padding with
@@ -831,7 +831,7 @@ Gates (test-first; all failed on the refusing tree):
   the body, no bias). Measured: same-layout TP2-vs-TP1 1.39% vs the 1.31%
   reference (ratio 1.06), cross-layout ratios 1.05 (outputs) and 1.06
   (gradients), losses within 0.06%, flat per-request profile, tail = body.
-- `--phase dp2-tp2-waves` (4× H200, DP2×TP2, public `forward_micro_batches`):
+- `--phase dp2-tp2-waves` (4× H200, DP2×TP2, public `forward_batches`):
   at least two waves under the test-only cap, DP replicas with different
   payloads, identical wave shapes within each TP pair, every input returned
   exactly once in order, forward and backward per wave, automatic vs

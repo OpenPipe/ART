@@ -1,4 +1,4 @@
-# TP support gate: DP1 x TP2 x CP1 public dp_rank_forward cell (2x H200, Kubernetes).
+# TP support gate: DP1 x TP2 x CP1 public forward cell (2x H200, Kubernetes).
 #
 # First public-API execution of the automatic planner under tensor
 # parallelism on the full Qwen3.5-4B: planner-selected prefix sharing -> GDN

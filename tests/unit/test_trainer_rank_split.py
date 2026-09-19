@@ -3,7 +3,7 @@
 Written before the implementation (test-first, as for the automatic planner)
 and expected to FAIL on the pre-split tree. Contract, as agreed:
 
-- ``dp_rank_forward`` should try not to raise when splitting the call into
+- ``forward`` should try not to raise when splitting the call into
   sequential subforwards would make execution feasible. The split ladder is
   bounded and deterministic: the fewest subforwards that fit, cutting the
   requests in prefix-local depth-first order so most sharing stays inside one
@@ -23,7 +23,7 @@ and expected to FAIL on the pre-split tree. Contract, as agreed:
   would return them.
 - Refusing is acceptable when the ladder is exhausted (a single request alone
   cannot fit) — confident refusal over expensive search.
-- The same machinery applies inside ``forward_micro_batches`` when even the
+- The same machinery applies inside ``forward_batches`` when even the
   minimum wave cannot fit unsplit.
 - Telemetry reports ``subforward_count`` (``last_forward_telemetry`` and
   ``MicroBatchStats``); it is 1 for unsplit calls.
@@ -151,7 +151,7 @@ def _rank(monkeypatch: pytest.MonkeyPatch) -> TrainerRank:
     return rank
 
 
-def test_dp_rank_forward_splits_instead_of_raising(
+def test_forward_splits_instead_of_raising(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     rank = _rank(monkeypatch)
@@ -163,7 +163,7 @@ def test_dp_rank_forward_splits_instead_of_raising(
     monkeypatch.setattr(rank, "_retained_memory_bytes", lambda *_args, **_kwargs: 0)
     _packed_budget(monkeypatch, rank, 20)
 
-    outputs = rank.dp_rank_forward(inputs)
+    outputs = rank.forward(inputs)
 
     assert [int(output.target_logprobs.item()) for output in outputs] == [0, 1, 2, 3]
     assert len(executed) == 2
@@ -185,7 +185,7 @@ def test_unsplit_call_reports_a_single_subforward(
     _recording_executor(monkeypatch, rank)
     _packed_budget(monkeypatch, rank, 1_000)
 
-    rank.dp_rank_forward([_request(marker) for marker in range(4)])
+    rank.forward([_request(marker) for marker in range(4)])
 
     telemetry = rank.last_forward_telemetry()
     assert telemetry["subforward_count"] == 1
@@ -205,7 +205,7 @@ def test_split_outputs_preserve_nested_caller_order(
     monkeypatch.setattr(rank, "_retained_memory_bytes", lambda *_args, **_kwargs: 0)
     _packed_budget(monkeypatch, rank, 20)
 
-    outputs = rank.dp_rank_forward(nested)
+    outputs = rank.forward(nested)
 
     assert [
         [int(output.target_logprobs.item()) for output in group] for group in outputs
@@ -236,7 +236,7 @@ def test_split_ladder_is_bounded_and_refuses_when_one_request_cannot_fit(
     monkeypatch.setattr(rank, "_available_memory_bytes", lambda: 9)
 
     with pytest.raises(TrainerRankMemoryError) as exc_info:
-        rank.dp_rank_forward(inputs)
+        rank.forward(inputs)
 
     assert exc_info.value.predicted_peak_bytes > exc_info.value.usable_limit_bytes
     assert "smaller" in exc_info.value.suggestion
@@ -267,7 +267,7 @@ def test_split_admission_accounts_for_live_graphs_cumulatively(
     _packed_budget(monkeypatch, rank, 25)
 
     with pytest.raises(TrainerRankMemoryError):
-        rank.dp_rank_forward([_request(marker) for marker in range(4)])
+        rank.forward([_request(marker) for marker in range(4)])
 
     assert executed == []
 
@@ -291,13 +291,13 @@ def test_split_admission_uses_a_retained_profile_when_available(
         lambda *_args, **kwargs: int(kwargs["required"] * 0.1),
     )
 
-    outputs = rank.dp_rank_forward([_request(marker) for marker in range(4)])
+    outputs = rank.forward([_request(marker) for marker in range(4)])
 
     assert len(outputs) == 4
     assert len(executed) == 2
 
 
-def test_forward_micro_batches_splits_the_minimum_wave(
+def test_forward_batches_splits_the_minimum_wave(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     rank = _rank(monkeypatch)
@@ -308,7 +308,7 @@ def test_forward_micro_batches_splits_the_minimum_wave(
     items = [[_request(marker) for marker in range(4)]]
     _packed_budget(monkeypatch, rank, 20)
 
-    batches = list(rank.forward_micro_batches(items))
+    batches = list(rank.forward_batches(items))
 
     assert len(batches) == 1
     assert batches[0].stats.global_count == 1
@@ -334,10 +334,10 @@ def test_split_decisions_are_deterministic(monkeypatch: pytest.MonkeyPatch) -> N
             for plan in executed
         ]
 
-    rank.dp_rank_forward(inputs)
+    rank.forward(inputs)
     first = partition()
     executed.clear()
-    rank.dp_rank_forward(inputs)
+    rank.forward(inputs)
     second = partition()
 
     assert first == second
@@ -365,7 +365,7 @@ def test_split_ladder_ensures_checkpoint_slots_once(
     monkeypatch.setattr(rank, "_ensure_checkpoint_slots", ensure)
     _packed_budget(monkeypatch, rank, 30)
 
-    rank.dp_rank_forward([_request(marker) for marker in range(8)])
+    rank.forward([_request(marker) for marker in range(8)])
 
     assert rank.last_forward_telemetry()["subforward_count"] == 4
     assert ensured == 1
@@ -399,11 +399,11 @@ def test_retained_profile_is_trusted_only_near_its_observed_scale(
     )
 
     if expect_split:
-        rank.dp_rank_forward(inputs)
+        rank.forward(inputs)
         assert len(executed) == 2
     else:
         with pytest.raises(TrainerRankMemoryError):
-            rank.dp_rank_forward(inputs)
+            rank.forward(inputs)
         assert executed == []
 
 
@@ -860,7 +860,7 @@ def test_split_execution_failure_is_reported_as_partial_execution(
     monkeypatch.setattr(rank, "_run_flat_plan_with_memory_tracking", run)
 
     with pytest.raises(TrainerRankPartialExecutionError) as exc_info:
-        rank.dp_rank_forward([_request(marker) for marker in range(4)])
+        rank.forward([_request(marker) for marker in range(4)])
 
     message = str(exc_info.value)
     assert f"subforward {failing_ordinal + 1} of 2 failed during execution" in message
@@ -888,7 +888,7 @@ def test_forward_oom_preserves_selected_admission(
         "_execute_flat_plan",
         lambda plan: [ForwardOutput(None, None, None, None)] * plan.request_count,
     )
-    rank.dp_rank_forward([_request(9, length=5)])
+    rank.forward([_request(9, length=5)])
     assert rank.last_forward_telemetry()["predicted_peak_bytes"] == 5
     oom = torch.cuda.OutOfMemoryError("injected forward allocation failure")
     executed = 0
@@ -905,9 +905,9 @@ def test_forward_oom_preserves_selected_admission(
     inputs = [tuple(_request(marker) for marker in range(4 if split else 1))]
     with pytest.raises(TrainerRankMemoryError) as caught:
         if micro_batches:
-            next(rank.forward_micro_batches(inputs))
+            next(rank.forward_batches(inputs))
         else:
-            rank.dp_rank_forward(inputs)
+            rank.forward(inputs)
 
     error = caught.value
     assert isinstance(error, TrainerRankPartialExecutionError) == split
@@ -931,10 +931,10 @@ def test_micro_batch_refusal_replaces_previous_admission_telemetry(
     _recording_executor(monkeypatch, rank)
     available = 100
     _packed_budget(monkeypatch, rank, lambda: available)
-    rank.dp_rank_forward([_request(0, length=5)])
+    rank.forward([_request(0, length=5)])
     available = 1
     with pytest.raises(TrainerRankMemoryError) as caught:
-        next(rank.forward_micro_batches([_request(1)]))
+        next(rank.forward_batches([_request(1)]))
     telemetry = rank.last_forward_telemetry()
     assert telemetry["predicted_peak_bytes"] == caught.value.predicted_peak_bytes == 10
     assert telemetry["usable_limit_bytes"] == caught.value.usable_limit_bytes == 1
@@ -949,9 +949,7 @@ class _SlotRef:
 def test_split_subforwards_track_independent_slot_graphs(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Two subforwards on one slot carry independent slot-graph sentinels:
-    releasing the first subforward's graph keeps slot load/step blocked until
-    the second is released too."""
+    """Consuming one child keeps the other child's cached graph available."""
 
     rank = _rank(monkeypatch)
     monkeypatch.setattr(rank, "_retained_memory_bytes", lambda *_args, **_kwargs: 0)
@@ -960,7 +958,9 @@ def test_split_subforwards_track_independent_slot_graphs(
     monkeypatch.setattr(rank, "_slot_ref", lambda name: _SlotRef(name))
     monkeypatch.setattr(rank, "_resolve_slot_ref", lambda request, **_kwargs: ref)
     monkeypatch.setattr(rank, "_validate_hybridep_topology", lambda: None)
-    monkeypatch.setattr(rank, "_topology", lambda: object())
+    topology = SimpleNamespace(tp=1, cp=1, dp=1, pp=1, sp=False)
+    monkeypatch.setattr(rank, "_topology", lambda: topology)
+    monkeypatch.setattr(rank, "_capture_lora_version", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(rank, "_configure_hybridep", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(rank, "_prepare_packed_forward", lambda _packed: None)
 
@@ -977,23 +977,35 @@ def test_split_subforwards_track_independent_slot_graphs(
 
     monkeypatch.setattr(rank, "_forward_packed", forward)
     lora = ModuleType("art.megatron.lora")
-    cast(Any, lora).use_lora_slot = lambda _slot: nullcontext()
+    cast(Any, lora).use_lora_slot = lambda _slot, **_kwargs: nullcontext()
     monkeypatch.setitem(sys.modules, "art.megatron.lora", lora)
 
-    outputs = rank.dp_rank_forward([_request(marker) for marker in range(4)])
+    outputs = rank.forward([_request(marker) for marker in range(4)])
     first, second = rank.last_forward_telemetry()["subforward_request_indices"]
 
     def loss(indices: tuple[int, ...]) -> torch.Tensor:
         return torch.stack([outputs[index].target_logprobs for index in indices]).sum()
 
-    with pytest.raises(TrainerRankSlotStateError, match="live backward graph"):
-        rank._guard_slot_can_load(ref)
-    loss(first).backward()
-    with pytest.raises(TrainerRankSlotStateError, match="live backward graph"):
-        rank._guard_slot_can_load(ref)
-    with pytest.raises(TrainerRankSlotStateError, match="Cannot optim_step"):
-        rank._guard_checkpoint_can_step("teacher")
-    loss(second).backward()
+    def backward(indices: tuple[int, ...]) -> None:
+        packets = rank._forward_cotangent_collector().backward(loss(indices))
+        rank._forward_graph_cache().backward_many(
+            [(packet.handle, packet.gradients) for packet in packets]
+        )
+
+    def assert_pending_graph() -> None:
+        with pytest.raises(TrainerRankSlotStateError, match="live backward graph"):
+            rank._guard_slot_can_load(ref)
+        with pytest.raises(TrainerRankSlotStateError, match="not been backpropagated"):
+            rank._guard_checkpoint_can_step("teacher")
+
+    cache = rank._forward_graph_cache()
+    assert len(cache.handles()) == 2
+    assert_pending_graph()
+    backward(first)
+    assert len(cache.handles()) == 1
+    assert_pending_graph()
+    backward(second)
+    assert cache.handles() == ()
     rank._guard_slot_can_load(ref)
     rank._guard_checkpoint_can_step("teacher")
 

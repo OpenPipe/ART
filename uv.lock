@@ -4330,6 +4330,7 @@ source = { editable = "." }
 dependencies = [
     { name = "aiohttp" },
     { name = "anthropic" },
+    { name = "cloudpickle" },
     { name = "litellm" },
     { name = "nest-asyncio" },
     { name = "numpy" },
@@ -4504,6 +4505,7 @@ requires-dist = [
     { name = "awscli", marker = "extra == 'backend-cu130'", specifier = ">=1.38.1" },
     { name = "bitsandbytes", marker = "extra == 'backend'", specifier = ">=0.45.2,!=0.50.0" },
     { name = "bitsandbytes", marker = "extra == 'backend-cu130'", specifier = ">=0.45.2,!=0.50.0" },
+    { name = "cloudpickle", specifier = ">=3.1.1" },
     { name = "datrie", marker = "extra == 'tinker'", specifier = ">=0.8.3" },
     { name = "duckdb", marker = "extra == 'backend'", specifier = ">=1.0.0" },
     { name = "duckdb", marker = "extra == 'backend-cu130'", specifier = ">=1.0.0" },
