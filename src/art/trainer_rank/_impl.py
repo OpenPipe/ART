@@ -4196,10 +4196,9 @@ class TrainerRank:
             fit, trusted = fits(width)
             if fit and trusted:
                 best = width
-            elif trusted:
-                failed = width
-            # Only trust a cached shortcut or bound for a profiled signature.
-            # Otherwise grow below to avoid jumping to an unprofiled mix.
+            # A cached width from another checkpoint/output mix is only a
+            # shortcut when it fits a trusted profile. Otherwise grow below;
+            # a cached binary-search bound can also jump to an unprofiled mix.
 
         while failed is None and best < remaining:
             width = normalize(max(best + 1, best * 2))

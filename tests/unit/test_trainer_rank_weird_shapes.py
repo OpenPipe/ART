@@ -837,26 +837,38 @@ def test_adaptive_planner_probes_new_heterogeneous_signatures(
     ]
 
 
-@pytest.mark.parametrize("budget", [None, 32])
+@pytest.mark.parametrize(
+    ("budget", "cached_profiled"), [(None, False), (32, False), (32, True)]
+)
 def test_adaptive_planner_does_not_reuse_wide_window_for_cold_signature(
     monkeypatch: pytest.MonkeyPatch,
     budget: int | None,
+    cached_profiled: bool,
 ) -> None:
     rank = TrainerRank(_runtime())
     monkeypatch.setattr(rank, "_dp_rank_and_size", lambda: (0, 1))
     monkeypatch.setattr(
         rank, "_resolve_slot_ref", lambda request, **_kwargs: request.checkpoint
     )
-    for name in ("policy", "adversary"):
+    for name in ("policy", "adversary", "third"):
         rank._checkpoint_slots.setdefault(name, _CheckpointSlot()).params = ()
     inputs = [
         _target_request(
-            _tokens(index), checkpoint="policy" if index % 2 == 0 else "adversary"
+            _tokens(index),
+            checkpoint="third"
+            if index >= 32
+            else "policy"
+            if index % 2 == 0
+            else "adversary",
         )
         for index in range(64)
     ]
     warm = rank._plan_flat_forward(inputs[:1])
     rank._memory_profiles[warm.signature] = _MemoryProfile(0.0, 1_000_000)
+    if cached_profiled:
+        # The cached three-slot plan is trusted, but its two-slot prefix is not.
+        warm = rank._plan_flat_forward(inputs)
+        rank._memory_profiles[warm.signature] = _MemoryProfile(0.0, 1_000_000)
     # A prior wave can leave a wide window even though the combined training
     # signature has never completed a forward/backward.
     rank._last_global_micro_batch_size = 64
@@ -890,26 +902,14 @@ def test_adaptive_planner_ramps_after_inactive_prefix(
     assert candidate.cold_start
 
 
-@pytest.mark.parametrize(("cached", "max_estimates"), [(512, 9), (800, 10)])
-def test_adaptive_planner_searches_stable_window_to_largest_aligned_fit(
+def test_adaptive_planner_grows_stable_window_to_largest_aligned_fit(
     monkeypatch: pytest.MonkeyPatch,
-    cached: int,
-    max_estimates: int,
 ) -> None:
     rank = TrainerRank(_runtime())
-    rank._last_global_micro_batch_size = cached
+    rank._last_global_micro_batch_size = 512
     monkeypatch.setattr(rank, "_dp_rank_and_size", lambda: (0, 1))
     monkeypatch.setattr(rank, "_all_ranks_have_memory_profile", lambda **_kwargs: True)
     _set_packed_token_budget(monkeypatch, rank, 700)
-    estimate_calls = 0
-    original_estimate = rank._estimate_flat_forward
-
-    def estimate(requests, **kwargs):
-        nonlocal estimate_calls
-        estimate_calls += 1
-        return original_estimate(requests, **kwargs)
-
-    monkeypatch.setattr(rank, "_estimate_flat_forward", estimate)
 
     candidate = rank._select_next_micro_batch(
         [_target_request(_tokens(index)) for index in range(900)],
@@ -917,8 +917,7 @@ def test_adaptive_planner_searches_stable_window_to_largest_aligned_fit(
     )
 
     assert candidate.stats_global_count == 672
-    assert candidate.rejected_candidates <= 3
-    assert estimate_calls <= max_estimates
+    assert candidate.rejected_candidates <= 2
 
 
 def test_forward_micro_batches_shrinks_when_memory_budget_drops(
