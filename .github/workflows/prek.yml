@@ -227,6 +227,7 @@ jobs:
             tests/unit/test_trainer_rank_weird_shapes.py \
             tests/unit/test_trainer_rank_admission_inputs.py \
             tests/unit/test_trainer_rank_checkpoint_memory.py \
+            tests/unit/test_trainer_rank_checkpoint_gradient_memory.py \
             tests/unit/test_trainer_rank_slot_memory.py \
             tests/unit/test_trainer_rank_head_memory.py \
             tests/unit/test_trainer_rank_mixed_head_memory.py \
@@ -265,6 +266,7 @@ jobs:
             --ignore=tests/unit/test_trainer_rank_weird_shapes.py \
             --ignore=tests/unit/test_trainer_rank_admission_inputs.py \
             --ignore=tests/unit/test_trainer_rank_checkpoint_memory.py \
+            --ignore=tests/unit/test_trainer_rank_checkpoint_gradient_memory.py \
             --ignore=tests/unit/test_trainer_rank_slot_memory.py \
             --ignore=tests/unit/test_trainer_rank_head_memory.py \
             --ignore=tests/unit/test_trainer_rank_mixed_head_memory.py \
