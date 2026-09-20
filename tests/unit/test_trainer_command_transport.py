@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import timedelta
 import gc
 import sys
 from types import ModuleType, SimpleNamespace
@@ -12,8 +11,8 @@ import weakref
 
 import pytest
 import torch
-import torch.distributed as dist
 import torch.multiprocessing as mp
+from trainer_rank_test_support import gloo_group
 
 from art.trainer_rank import ForwardInput, ForwardOutput, TrainerRank
 from art.trainer_rank._commands import _Command, _encode_command, _Executor
@@ -130,14 +129,7 @@ def _transport_worker(physical: int, rendezvous: str, cuda: bool) -> None:
     device = torch.device(f"cuda:{1 - physical}" if cuda else "cpu")
     if cuda:
         torch.cuda.set_device(device)
-    dist.init_process_group(
-        "gloo",
-        init_method=f"file://{rendezvous}",
-        rank=physical,
-        world_size=2,
-        timeout=timedelta(seconds=30),
-    )
-    try:
+    with gloo_group(physical, f"file://{rendezvous}"):
         ps = SimpleNamespace(
             get_tensor_model_parallel_rank=lambda: physical,
             get_context_parallel_rank=lambda: 0,
@@ -225,8 +217,6 @@ def _transport_worker(physical: int, rendezvous: str, cuda: bool) -> None:
         )
         if cuda:
             assert torch.cuda.memory_allocated(physical) == foreign_before
-    finally:
-        dist.destroy_process_group()
 
 
 @pytest.mark.parametrize("cuda", [False, True], ids=["cpu", "reversed-cuda-indices"])

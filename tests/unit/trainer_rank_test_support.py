@@ -1,11 +1,10 @@
-"""Real Gloo groups and lightweight topology for trainer-rank contract tests."""
+"""Real process groups and lightweight topology for trainer-rank contract tests."""
 
 from contextlib import contextmanager
 from datetime import timedelta
 import sys
 import time
 from types import ModuleType, SimpleNamespace
-from unittest.mock import patch
 
 import pytest
 import torch.distributed as dist
@@ -13,18 +12,21 @@ import torch.multiprocessing as mp
 
 
 @contextmanager
-def gloo_group(rank, rendezvous, *, world_size=2, timeout=30):
+def process_group(rank, rendezvous, *, world_size=2, timeout=30, backend="gloo"):
     dist.init_process_group(
-        "gloo",
+        backend,
         init_method=rendezvous,
         rank=rank,
         world_size=world_size,
-        timeout=timedelta(seconds=timeout),
+        timeout=None if timeout is None else timedelta(seconds=timeout),
     )
     try:
         yield
     finally:
         dist.destroy_process_group()
+
+
+gloo_group = process_group
 
 
 @contextmanager
@@ -53,7 +55,9 @@ def megatron_topology(physical, *, dp_size, tp_size):
         ),
     )
     setattr(megatron, "core", core)
-    with patch.dict(sys.modules, {"megatron": megatron, "megatron.core": core}):
+    with pytest.MonkeyPatch.context() as modules:
+        modules.setitem(sys.modules, "megatron", megatron)
+        modules.setitem(sys.modules, "megatron.core", core)
         yield getattr(core, "parallel_state")
 
 

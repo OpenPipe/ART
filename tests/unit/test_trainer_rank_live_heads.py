@@ -2,16 +2,15 @@ from __future__ import annotations
 
 import asyncio
 from copy import deepcopy
-from dataclasses import replace
 
 import pytest
 from test_trainer_rank_custom_tensors import _trainer
 import torch
 from torch.utils.checkpoint import checkpoint
+from trainer_rank_test_support import gloo_group
 
 from art.trainer_rank import AdamParams, ModuleHandle, run_rank_callback
 from art.trainer_rank._heads import (
-    HeadBufferUpdate,
     HeadRegistration,
     LiveHead,
     execute_head_operation,
@@ -288,20 +287,9 @@ def test_constructor_staleness_applies_to_heads_before_mutating_gradients():
 
 
 def _buffer_authority_worker(process_rank, init_method):
-    from datetime import timedelta
-
-    import torch.distributed as dist
-
     from art.trainer_rank._heads import synchronize_head_buffers
 
-    dist.init_process_group(
-        "gloo",
-        rank=process_rank,
-        world_size=2,
-        init_method=init_method,
-        timeout=timedelta(seconds=30),
-    )
-    try:
+    with gloo_group(process_rank, init_method):
         trainer, rank = _trainer("student")
         head = rank.module("bn", lambda: torch.nn.BatchNorm1d(2), checkpoint="student")
         for _ in range(process_rank + 1):
@@ -309,8 +297,6 @@ def _buffer_authority_worker(process_rank, init_method):
         synchronize_head_buffers(trainer)
         torch.testing.assert_close(head.running_mean, torch.full((2,), 0.1))
         assert head.num_batches_tracked.item() == 1
-    finally:
-        dist.destroy_process_group()
 
 
 def test_distributed_persistent_buffers_use_dp_zero_authority(tmp_path):
@@ -897,20 +883,11 @@ def test_inplace_operation_snapshots_readonly_checkpoint_parameter():
 
 
 def _live_buffer_authority_worker(process_rank, init_method, asymmetric=False):
-    from datetime import timedelta
-
     import torch.distributed as dist
 
     from art.trainer_rank._heads import synchronize_head_buffers
 
-    dist.init_process_group(
-        "gloo",
-        rank=process_rank,
-        world_size=2,
-        init_method=init_method,
-        timeout=timedelta(seconds=30),
-    )
-    try:
+    with gloo_group(process_rank, init_method):
         trainer, rank = _trainer("student")
         native = rank.module(
             "head", lambda: torch.nn.BatchNorm1d(2), checkpoint="student"
@@ -952,8 +929,6 @@ def _live_buffer_authority_worker(process_rank, init_method, asymmetric=False):
             trainer, "head_publish", () if update is None else (update,)
         )
         assert native.num_batches_tracked.item() == process_rank
-    finally:
-        dist.destroy_process_group()
 
 
 def test_distributed_live_buffer_refresh_accepts_dp_zero_authority(tmp_path):
@@ -1305,19 +1280,12 @@ def test_cuda_live_buffer_views_and_functional_publication(client):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_cuda_buffer_sync_stages_cpu_authority_before_comparison(tmp_path):
-    import torch.distributed as dist
-
     from art.trainer_rank._heads import synchronize_head_buffers
 
-    dist.init_process_group(
-        "gloo", rank=0, world_size=1, init_method=f"file://{tmp_path / 'cuda_sync'}"
-    )
-    try:
+    with gloo_group(0, f"file://{tmp_path / 'cuda_sync'}", world_size=1, timeout=None):
         trainer, rank = _trainer("student")
         trainer.device = torch.device("cuda", 0)
         buffer = rank.buffer("mean", lambda: torch.ones(2), checkpoint="student")
         synchronize_head_buffers(trainer)
         torch.testing.assert_close(buffer, torch.ones(2, device="cuda"))
         assert export_head(trainer, "student", "mean").buffer_revision == 0
-    finally:
-        dist.destroy_process_group()

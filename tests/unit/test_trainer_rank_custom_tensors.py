@@ -4,7 +4,6 @@ import asyncio
 from collections.abc import Callable
 import copy
 from dataclasses import dataclass
-from datetime import timedelta
 from importlib.util import find_spec
 import io
 import json
@@ -17,6 +16,7 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
+from trainer_rank_test_support import gloo_group
 
 from art.trainer_rank import (
     AdamParams,
@@ -181,14 +181,7 @@ def _distributed_custom_registration_worker(
     init_method: str,
     mode: str,
 ) -> None:
-    dist.init_process_group(
-        "gloo",
-        init_method=init_method,
-        rank=rank,
-        world_size=world_size,
-        timeout=timedelta(seconds=30),
-    )
-    try:
+    with gloo_group(rank, init_method, world_size=world_size):
         trainer, api = _trainer("student")
         slot = trainer._checkpoint_slots["student"]
         if mode == "trainability":
@@ -232,8 +225,6 @@ def _distributed_custom_registration_worker(
         assert "head" not in slot.custom
         assert not slot.params
         dist.barrier()
-    finally:
-        dist.destroy_process_group()
 
 
 def _distributed_custom_grad_flags_worker(
@@ -241,14 +232,7 @@ def _distributed_custom_grad_flags_worker(
     world_size: int,
     init_method: str,
 ) -> None:
-    dist.init_process_group(
-        "gloo",
-        init_method=init_method,
-        rank=rank,
-        world_size=world_size,
-        timeout=timedelta(seconds=30),
-    )
-    try:
+    with gloo_group(rank, init_method, world_size=world_size):
         trainer, api = _trainer("student")
         used = api.parameter("used", lambda: torch.tensor(1.0), checkpoint="student")
         api.parameter("unused", lambda: torch.tensor(2.0), checkpoint="student")
@@ -258,8 +242,6 @@ def _distributed_custom_grad_flags_worker(
         assert trainer._dynamic_param_step_flags(
             trainer._checkpoint_slots["student"].params
         ) == (True, False)
-    finally:
-        dist.destroy_process_group()
 
 
 def test_module_accepts_class_and_lambda_factories_and_is_idempotent() -> None:

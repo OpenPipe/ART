@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from contextlib import nullcontext
-from datetime import timedelta
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -9,6 +8,7 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
+from trainer_rank_test_support import process_group
 
 from art.megatron.prefix_tree_packing import prefix_tree_pack
 from art.trainer_rank import ForwardInput, TrainerRank, _impl
@@ -174,14 +174,13 @@ def _context_parallel_worker(rank, cp_size, dp_size, init_method, backend):
     device = torch.device("cpu" if backend == "gloo" else f"cuda:{rank}")
     if device.type == "cuda":
         torch.cuda.set_device(device)
-    dist.init_process_group(
-        backend,
-        init_method=init_method,
-        rank=rank,
+    with process_group(
+        rank,
+        init_method,
         world_size=cp_size * dp_size,
-        timeout=timedelta(seconds=90),
-    )
-    try:
+        timeout=90,
+        backend=backend,
+    ):
         cp_groups = [
             dist.new_group(list(range(dp * cp_size, (dp + 1) * cp_size)))
             for dp in range(dp_size)
@@ -215,8 +214,6 @@ def _context_parallel_worker(rank, cp_size, dp_size, init_method, backend):
                 _check_context_parallel_case(
                     cp_rank, dp_rank, cp_size, dp_size, cp_group, device, mode
                 )
-    finally:
-        dist.destroy_process_group()
 
 
 def _check_context_parallel_case(
