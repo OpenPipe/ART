@@ -108,6 +108,18 @@ def _map_tensors(fn: Callable[[torch.Tensor], torch.Tensor], tree: Any) -> Any:
     return unflatten_tensors(spec, tuple(map(fn, tensors)))
 
 
+def _map_tensor_arguments(fn: Callable[[Any], Any], value: Any) -> Any:
+    """Map one argument container, preserving namedtuples and opaque values."""
+    if isinstance(value, tuple):
+        items = tuple(fn(item) for item in value)
+        return type(value)(*items) if hasattr(value, "_fields") else items
+    if isinstance(value, list):
+        return [fn(item) for item in value]
+    if isinstance(value, dict):
+        return {key: fn(item) for key, item in value.items()}
+    return value
+
+
 def _plain(tensor: torch.Tensor) -> torch.Tensor:
     if isinstance(tensor, ManagedTensor):
         with torch.enable_grad(), torch._C.DisableTorchFunctionSubclass():

@@ -11,6 +11,8 @@ import weakref
 
 import torch
 
+from ._tensors import _map_tensor_arguments, _map_tensors
+
 if TYPE_CHECKING:
     from ._impl import TrainerRank, _CustomObject, _CustomTensorTracker
 
@@ -28,8 +30,6 @@ def head_call_arguments(args: tuple[Any, ...], kwargs: dict[str, Any]) -> Any:
     call = _head_call.get()
     if call is None:
         return None
-    from ._tensors import _map_tensors
-
     changed = False
 
     def replace(value: torch.Tensor) -> torch.Tensor:
@@ -163,21 +163,7 @@ def tensor_mutation_targets(
     }
 
 
-def _map_tensor_arguments(fn: Callable[[Any], Any], value: Any) -> Any:
-    """Map one argument container, preserving namedtuples and opaque values."""
-    if isinstance(value, tuple):
-        items = tuple(fn(item) for item in value)
-        return type(value)(*items) if hasattr(value, "_fields") else items
-    if isinstance(value, list):
-        return [fn(item) for item in value]
-    if isinstance(value, dict):
-        return {key: fn(item) for key, item in value.items()}
-    return value
-
-
 def readonly_buffer_views(result: Any, snapshots: list[torch.Tensor]) -> Any:
-    from ._tensors import _map_tensors
-
     def wrap(value: torch.Tensor) -> torch.Tensor:
         with torch._C.DisableTorchFunctionSubclass():
             if any(
@@ -204,7 +190,6 @@ class _BufferSnapshotView(torch.Tensor):
     @classmethod
     def __torch_function__(cls, func, types, args=(), kwargs=None):
         from ._impl import _walk_objects
-        from ._tensors import _map_tensors
 
         kwargs = kwargs or {}
         if getattr(func, "__name__", "") in {

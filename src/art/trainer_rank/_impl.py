@@ -7806,7 +7806,6 @@ def _tracked_tensor_function(
     kwargs: dict[str, object],
 ) -> object:
     from ._heads import (
-        _map_tensor_arguments,
         _stage_local_buffers,
         head_call_arguments,
         mutates_tensor,
@@ -7814,6 +7813,7 @@ def _tracked_tensor_function(
         tensor_metadata_function,
         tensor_mutation_targets,
     )
+    from ._tensors import _map_tensor_arguments
 
     if (captured := head_call_arguments(args, kwargs)) is not None:
         return func(*captured[0], **captured[1])

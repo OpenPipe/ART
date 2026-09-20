@@ -18,6 +18,8 @@ from torch.multiprocessing.reductions import StorageWeakRef
 
 from art._tensor_residency import observe_resident_tensors
 
+from ._tensors import _map_tensor_arguments
+
 ForwardHandle = str
 type Retention = Literal["gpu", "cpu", "replay"]
 
@@ -69,14 +71,7 @@ def _restore_inputs(value: Any) -> Any:
                 if f.init
             },
         )
-    if isinstance(value, tuple):
-        items = tuple(_restore_inputs(item) for item in value)
-        return type(value)(*items) if hasattr(value, "_fields") else items
-    if isinstance(value, list):
-        return [_restore_inputs(item) for item in value]
-    if isinstance(value, dict):
-        return {key: _restore_inputs(item) for key, item in value.items()}
-    return value
+    return _map_tensor_arguments(_restore_inputs, value)
 
 
 def _tensors(value: Any) -> Iterable[torch.Tensor]:
