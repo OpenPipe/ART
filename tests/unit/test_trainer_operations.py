@@ -1,4 +1,5 @@
 import asyncio
+from collections.abc import Coroutine
 import gc
 from types import SimpleNamespace
 from typing import Any, cast
@@ -8,10 +9,18 @@ import pytest
 import torch
 
 from art.trainer_rank._operations import (
+    OperationId,
     OperationResultReleasedError,
     TrainerOperation,
     execute_operation,
 )
+
+
+def _execute(
+    rank: Any, identity: OperationId, kind: str, payload: object
+) -> Coroutine[Any, Any, Any]:
+    """Capture inline requests before returning the execution coroutine."""
+    return execute_operation(rank, TrainerOperation.capture(identity, kind, payload))
 
 
 def test_update_identity_replays_outcome_without_applying_again():
@@ -28,15 +37,8 @@ def test_update_identity_replays_outcome_without_applying_again():
         assert await execute_operation(rank, operation) == {"step": 1}
         assert len(calls) == 1
         with pytest.raises(ValueError, match="different arguments"):
-            await execute_operation(
-                rank,
-                TrainerOperation.capture(
-                    ("client", 1), "optim_step", {"params": {"lr": 2}}
-                ),
-            )
-        await execute_operation(
-            rank, TrainerOperation.capture(("client", 1), "acknowledge", ((), ()))
-        )
+            await _execute(rank, ("client", 1), "optim_step", {"params": {"lr": 2}})
+        await _execute(rank, ("client", 1), "acknowledge", ((), ()))
         with pytest.raises(OperationResultReleasedError):
             await execute_operation(rank, operation)
         assert len(calls) == 1
@@ -65,9 +67,7 @@ def test_failed_gradient_identity_preserves_original_error():
             assert type(error.value) is type(stale)
             assert str(error.value) == str(stale)
         assert len(calls) == 1
-        await execute_operation(
-            rank, TrainerOperation.capture(operation.id, "acknowledge", ((), ()))
-        )
+        await _execute(rank, operation.id, "acknowledge", ((), ()))
         with pytest.raises(OperationResultReleasedError):
             await execute_operation(rank, operation)
         assert len(calls) == 1
@@ -158,15 +158,8 @@ def test_acknowledgement_bounds_history_including_unadmitted_holes():
         )
         # ID 1 is still pending. Odd IDs after it were cancelled before admission.
         for sequence in range(2, 2002, 2):
-            await execute_operation(
-                rank, TrainerOperation.capture(("client", sequence), "optim_step", {})
-            )
-            await execute_operation(
-                rank,
-                TrainerOperation.capture(
-                    ("client", sequence), "acknowledge", ((1,), ())
-                ),
-            )
+            await _execute(rank, ("client", sequence), "optim_step", {})
+            await _execute(rank, ("client", sequence), "acknowledge", ((1,), ()))
         ledger = rank._rank._operation_outcomes
         assert not ledger.outcomes
         assert len(ledger.acknowledged) == 1
@@ -174,16 +167,9 @@ def test_acknowledgement_bounds_history_including_unadmitted_holes():
         assert state.through == 2000 and state.pending == {1}
         for sequence in (2, 3, 1999, 2000):
             with pytest.raises(OperationResultReleasedError):
-                await execute_operation(
-                    rank,
-                    TrainerOperation.capture(("client", sequence), "optim_step", {}),
-                )
-        await execute_operation(
-            rank, TrainerOperation.capture(("client", 1), "optim_step", {})
-        )
-        await execute_operation(
-            rank, TrainerOperation.capture(("client", 2000), "acknowledge", ((), ()))
-        )
+                await _execute(rank, ("client", sequence), "optim_step", {})
+        await _execute(rank, ("client", 1), "optim_step", {})
+        await _execute(rank, ("client", 2000), "acknowledge", ((), ()))
         assert not state.pending and not ledger.outcomes
         assert len(calls) == 1001
 
@@ -202,20 +188,12 @@ def test_out_of_order_acknowledgements_never_resurrect_ids_or_retire_other_sessi
             (6, (1, 4, 6)),
             (5, (1, 2, 3)),
         ):
-            await execute_operation(
-                rank,
-                TrainerOperation.capture(
-                    ("client", through), "acknowledge", (pending, ())
-                ),
-            )
+            await _execute(rank, ("client", through), "acknowledge", (pending, ()))
         state = rank._rank._operation_outcomes.acknowledged["client"]
         assert state.through == 6 and state.pending == {1, 6}
         for sequence in (2, 3, 4, 5):
             with pytest.raises(OperationResultReleasedError):
-                await execute_operation(
-                    rank,
-                    TrainerOperation.capture(("client", sequence), "optim_step", {}),
-                )
+                await _execute(rank, ("client", sequence), "optim_step", {})
         for identity in (("client", 1), ("client", 6), ("client", 7), ("other", 3)):
             operation = TrainerOperation.capture(identity, "optim_step", {})
             await execute_operation(rank, operation)
@@ -240,9 +218,7 @@ def test_retiring_running_update_fences_retries_until_completion_is_dropped():
         operation = TrainerOperation.capture(("client", 1), "optim_step", {})
         original = asyncio.create_task(execute_operation(rank, operation))
         await entered.wait()
-        await execute_operation(
-            rank, TrainerOperation.capture(operation.id, "acknowledge", ((), ()))
-        )
+        await _execute(rank, operation.id, "acknowledge", ((), ()))
         with pytest.raises(OperationResultReleasedError):
             await execute_operation(rank, operation)
         release.set()
@@ -275,13 +251,9 @@ def test_batch_pulls_and_close_are_identified_without_advancing_twice():
         first = await execute_operation(rank, next_wave)
         assert await execute_operation(rank, next_wave) is first
         # Other results can be acknowledged while this wave's reply is lost.
-        await execute_operation(
-            rank, TrainerOperation.capture(("client", 3), "acknowledge", ((2, 3), ()))
-        )
+        await _execute(rank, ("client", 3), "acknowledge", ((2, 3), ()))
         # A lost pull is abandoned independently of closing its iterator.
-        await execute_operation(
-            rank, TrainerOperation.capture(("client", 3), "acknowledge", ((3,), (2,)))
-        )
+        await _execute(rank, ("client", 3), "acknowledge", ((3,), (2,)))
         close = TrainerOperation.capture(
             ("client", 3),
             "batches_close",
@@ -295,9 +267,7 @@ def test_batch_pulls_and_close_are_identified_without_advancing_twice():
             ("release", ("packet",)),
             ("close", "iterator"),
         ]
-        await execute_operation(
-            rank, TrainerOperation.capture(close.id, "acknowledge", ((), ()))
-        )
+        await _execute(rank, close.id, "acknowledge", ((), ()))
         assert not rank._rank._operation_outcomes.outcomes
         with pytest.raises(OperationResultReleasedError):
             await execute_operation(rank, next_wave)
@@ -447,12 +417,7 @@ def test_failed_exported_backward_replays_once_and_releases_only_consumed_graphs
             hook.remove()
         if retain_graph:
             setattr(view, "_submit_backward", lambda *args, **kwargs: None)
-            await execute_operation(
-                view,
-                TrainerOperation.capture(
-                    ("client", 2), "backward", {"packets": packets}
-                ),
-            )
+            await _execute(view, ("client", 2), "backward", {"packets": packets})
             gc.collect()
             assert packet.handle not in state.exports and references[0]() is None
 
@@ -473,13 +438,11 @@ def test_malformed_nonretained_backward_preserves_unrelated_exports():
                 cast(Any, SimpleNamespace(rank=SimpleNamespace(), state=state))
             )
             with pytest.raises((ValueError, KeyError)):
-                await execute_operation(
+                await _execute(
                     view,
-                    TrainerOperation.capture(
-                        ("client", 1),
-                        "backward",
-                        {"packets": (CotangentPacket(handle, gradients),)},
-                    ),
+                    ("client", 1),
+                    "backward",
+                    {"packets": (CotangentPacket(handle, gradients),)},
                 )
             assert "unrelated" in state.exports
             assert ("known" in state.exports) is (handle == "missing")
