@@ -7968,35 +7968,21 @@ def _track_custom_object(
         return _CustomObject(custom.kind, value, custom.generation)
 
     module = cast(torch.nn.Module, custom.value)
-    parameters: dict[int, torch.nn.Parameter] = {}
-    buffers: dict[int, torch.Tensor] = {}
+    replacements: dict[tuple[str, int], torch.Tensor] = {}
     for child in module.modules():
-        for key, source in child._parameters.items():
-            if source is None:
-                continue
-            value = parameters.get(id(source))
-            if value is None:
-                with torch.no_grad():
-                    value = _TrackedParameter(
-                        source.detach().clone(), tracker, source.requires_grad
+        for kind in ("parameter", "buffer"):
+            for key, source in getattr(child, f"_{kind}s").items():
+                if source is None:
+                    continue
+                identity = (kind, id(source))
+                if identity not in replacements:
+                    replacements[identity] = cast(
+                        torch.Tensor,
+                        _track_custom_object(
+                            _CustomObject(kind, source, custom.generation), tracker
+                        ).value,
                     )
-                value.__dict__.update(
-                    (attribute, item)
-                    for attribute, item in source.__dict__.items()
-                    if attribute != "_art_tracker"
-                )
-                value._art_tracker = tracker
-                parameters[id(source)] = value
-            child._parameters[key] = value
-        for key, source in child._buffers.items():
-            if source is None:
-                continue
-            value = buffers.get(id(source))
-            if value is None:
-                with torch.no_grad():
-                    value = _TrackedTensor(source.detach().clone(), tracker)
-                buffers[id(source)] = value
-            child._buffers[key] = value
+                getattr(child, f"_{kind}s")[key] = replacements[identity]
     from ._heads import native_module_handle
 
     trainer = tracker.validate()
