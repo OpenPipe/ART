@@ -34,9 +34,7 @@ def _snapshot_trainer() -> tuple[TrainerRank, torch.nn.Parameter, torch.nn.Param
 def test_snapshot_recompute_routes_original_gradient_after_update(
     reentrant: bool,
 ) -> None:
-    trainer, current = _trainer()
-    version = trainer._capture_checkpoint_version("student")
-    old = trainer._snapshot_parameter(current, version)
+    trainer, current, old = _snapshot_trainer()
     x = torch.tensor(3.0, dtype=torch.float64, requires_grad=True)
     loss = checkpoint(lambda x: x * old.square(), x, use_reentrant=reentrant)
     with torch.no_grad():
@@ -150,9 +148,7 @@ def test_cotangent_batch_preflights_all_versions_before_any_mutation() -> None:
 
 
 def test_replacement_invalidates_origin_and_old_target() -> None:
-    trainer, current = _trainer()
-    version = trainer._capture_checkpoint_version("student")
-    snapshot = trainer._snapshot_parameter(current, version)
+    trainer, current, snapshot = _snapshot_trainer()
     new = torch.nn.Parameter(torch.tensor(5.0, dtype=torch.float64))
     trainer._checkpoint_slots["student"] = _CheckpointSlot(params=(new,), generation=1)
     with pytest.raises(TrainerRankSlotStateError, match="replaced"):
