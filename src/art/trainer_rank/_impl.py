@@ -7748,6 +7748,7 @@ def _tracked_tensor_function(
     kwargs: dict[str, object],
 ) -> object:
     from ._heads import (
+        _map_tensor_arguments,
         _stage_local_buffers,
         head_call_arguments,
         mutates_tensor,
@@ -7841,14 +7842,7 @@ def _tracked_tensor_function(
                     result = value.as_subclass(torch.Tensor)
             replacements[id(value)] = result
             return result
-        if isinstance(value, tuple):
-            values = tuple(replace(item) for item in value)
-            return type(value)(*values) if hasattr(value, "_fields") else values
-        if isinstance(value, list):
-            return [replace(item) for item in value]
-        if isinstance(value, dict):
-            return {key: replace(item) for key, item in value.items()}
-        return value
+        return _map_tensor_arguments(replace, value)
 
     result = func(
         *cast(tuple[object, ...], replace(args)),

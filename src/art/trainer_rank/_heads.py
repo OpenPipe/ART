@@ -163,6 +163,18 @@ def tensor_mutation_targets(
     }
 
 
+def _map_tensor_arguments(fn: Callable[[Any], Any], value: Any) -> Any:
+    """Map one argument container, preserving namedtuples and opaque values."""
+    if isinstance(value, tuple):
+        items = tuple(fn(item) for item in value)
+        return type(value)(*items) if hasattr(value, "_fields") else items
+    if isinstance(value, list):
+        return [fn(item) for item in value]
+    if isinstance(value, dict):
+        return {key: fn(item) for key, item in value.items()}
+    return value
+
+
 def readonly_buffer_views(result: Any, snapshots: list[torch.Tensor]) -> Any:
     from ._tensors import _map_tensors
 
@@ -866,14 +878,7 @@ class _ClientParameter(torch.nn.Parameter):
                         value._head_key
                     ]
                 return captures[id(value)]
-            if isinstance(value, tuple):
-                items = tuple(replace(item) for item in value)
-                return type(value)(*items) if hasattr(value, "_fields") else items
-            if isinstance(value, list):
-                return [replace(item) for item in value]
-            if isinstance(value, dict):
-                return {key: replace(item) for key, item in value.items()}
-            return value
+            return _map_tensor_arguments(replace, value)
 
         return func(*replace(args), **replace(kwargs))
 
@@ -998,14 +1003,7 @@ class _ClientBuffer(torch.Tensor):
                         )
                     originals[id(copies[id(value)])] = value
                 return copies[id(value)]
-            if isinstance(value, tuple):
-                items = tuple(replace(item) for item in value)
-                return type(value)(*items) if hasattr(value, "_fields") else items
-            if isinstance(value, list):
-                return [replace(item) for item in value]
-            if isinstance(value, dict):
-                return {key: replace(item) for key, item in value.items()}
-            return value
+            return _map_tensor_arguments(replace, value)
 
         result = func(*replace(args), **replace(kwargs))
         copied = [
