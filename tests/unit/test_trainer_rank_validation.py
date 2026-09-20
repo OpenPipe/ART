@@ -4,7 +4,6 @@ import asyncio
 from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, fields, replace
-from datetime import timedelta
 import gc
 from importlib.util import find_spec
 import inspect
@@ -20,7 +19,7 @@ import weakref
 import pytest
 import torch
 import torch.distributed as dist
-import torch.multiprocessing as mp
+from trainer_rank_test_support import gloo_group, spawn_and_join
 
 from art.megatron.prefix_tree_packing import prefix_tree_pack
 from art.trainer_rank import (
@@ -2201,24 +2200,13 @@ def test_checkpoint_prepare_reports_snapshot_cleanup_failure(
 def _checkpoint_load_failure_worker(
     rank: int, world_size: int, init_method: str, phase: str
 ) -> None:
-    dist.init_process_group(
-        "gloo",
-        rank=rank,
-        world_size=world_size,
-        init_method=init_method,
-        timeout=timedelta(seconds=15),
-    )
     from art.trainer_rank import _checkpoint as checkpoint_module
     from art.trainer_rank import _lora_export as lora_export_module
 
-    originals = (
-        checkpoint_module._load_adapter,
-        checkpoint_module._optimizer_state,
-        checkpoint_module._commit_slot,
-        checkpoint_module._slot_snapshot,
-        checkpoint_module._restore_slots,
-    )
-    try:
+    with (
+        gloo_group(rank, init_method, world_size=world_size, timeout=15),
+        pytest.MonkeyPatch.context() as monkeypatch,
+    ):
         trainer = TrainerRank.__new__(TrainerRank)
         trainer.runtime = SimpleNamespace(
             model=[],
@@ -2235,8 +2223,8 @@ def _checkpoint_load_failure_worker(
         trainer._validate_checkpoint_consistency = lambda *_args: ()  # type: ignore[method-assign]
         trainer._validate_loaded_checkpoint_config = lambda *_args: None  # type: ignore[method-assign]
         trainer._restore_canonical_optimizer = lambda *_args: cast(Any, object())  # type: ignore[method-assign]
-        setattr(checkpoint_module, "_slot_snapshot", lambda *_args: ())
-        setattr(checkpoint_module, "_restore_slots", lambda *_args: None)
+        monkeypatch.setattr(checkpoint_module, "_slot_snapshot", lambda *_args: ())
+        monkeypatch.setattr(checkpoint_module, "_restore_slots", lambda *_args: None)
         if phase == "export":
             if rank == 1:
                 trainer._checkpoint_slots["student"] = _CheckpointSlot(
@@ -2291,7 +2279,7 @@ def _checkpoint_load_failure_worker(
             "digest",
         )
 
-        setattr(
+        monkeypatch.setattr(
             checkpoint_module,
             "_load_adapter",
             (
@@ -2302,7 +2290,7 @@ def _checkpoint_load_failure_worker(
                 )
             ),
         )
-        setattr(
+        monkeypatch.setattr(
             checkpoint_module,
             "_optimizer_state",
             (
@@ -2315,7 +2303,7 @@ def _checkpoint_load_failure_worker(
                 )
             ),
         )
-        setattr(
+        monkeypatch.setattr(
             checkpoint_module,
             "_commit_slot",
             (
@@ -2336,40 +2324,18 @@ def _checkpoint_load_failure_worker(
         completed = torch.tensor(1)
         dist.all_reduce(completed)
         assert completed.item() == world_size
-    finally:
-        for name, value in zip(
-            (
-                "_load_adapter",
-                "_optimizer_state",
-                "_commit_slot",
-                "_slot_snapshot",
-                "_restore_slots",
-            ),
-            originals,
-            strict=True,
-        ):
-            setattr(checkpoint_module, name, value)
-        dist.destroy_process_group()
 
 
 @pytest.mark.parametrize("phase", ("read", "optimizer", "commit", "export"))
 def test_checkpoint_load_failure_is_collective_and_transactional(
     tmp_path: Path, phase: str
 ) -> None:
-    context = mp.spawn(
+    spawn_and_join(
         _checkpoint_load_failure_worker,
         args=(2, f"file://{tmp_path / f'load-{phase}'}", phase),
-        nprocs=2,
-        join=False,
+        timeout=90,
+        failure=f"collective checkpoint {phase} failure test hung",
     )
-    deadline = time.monotonic() + 90
-    while time.monotonic() < deadline:
-        if context.join(timeout=1):
-            return
-    else:
-        for process in context.processes:
-            process.terminate()
-        pytest.fail(f"collective checkpoint {phase} failure test hung")
 
 
 @pytest.mark.skipif(find_spec("megatron") is None, reason="requires Megatron")
@@ -3239,15 +3205,8 @@ def test_optim_step_rejects_invalid_live_graph_policy() -> None:
 
 
 def _live_graph_error_worker(rank: int, world_size: int, init_method: str) -> None:
-    dist.init_process_group(
-        "gloo",
-        rank=rank,
-        world_size=world_size,
-        init_method=init_method,
-        timeout=timedelta(seconds=30),
-    )
     retained: torch.Tensor | None = None
-    try:
+    with gloo_group(rank, init_method, world_size=world_size):
         trainer = TrainerRank(_runtime())
         cast(Any, trainer)._slot_ref = _slot_ref
         param = torch.nn.Parameter(torch.tensor([2.0]))
@@ -3272,24 +3231,15 @@ def _live_graph_error_worker(rank: int, world_size: int, init_method: str) -> No
         dist.all_reduce(completed)
         assert completed.item() == world_size
         assert retained is None or retained.grad_fn is not None
-    finally:
-        dist.destroy_process_group()
 
 
 def test_optim_step_live_graph_error_is_collective(tmp_path: Path) -> None:
-    context = mp.spawn(
+    spawn_and_join(
         _live_graph_error_worker,
         args=(2, f"file://{tmp_path / 'live-graph'}"),
-        nprocs=2,
-        join=False,
+        timeout=45,
+        failure="collective live-graph policy test hung",
     )
-    deadline = time.monotonic() + 45
-    while time.monotonic() < deadline:
-        if context.join(timeout=1):
-            return
-    for process in context.processes:
-        process.terminate()
-    pytest.fail("collective live-graph policy test hung")
 
 
 def test_forward_preserves_nested_shape_for_inactive_requests() -> None:
@@ -3458,14 +3408,7 @@ def test_skipped_forward_wave_cannot_resume_another_iterator(
 
 
 def _forward_yield_modes_worker(rank: int, world_size: int, init_method: str) -> None:
-    dist.init_process_group(
-        "gloo",
-        rank=rank,
-        world_size=world_size,
-        init_method=init_method,
-        timeout=timedelta(seconds=30),
-    )
-    try:
+    with gloo_group(rank, init_method, world_size=world_size):
         with pytest.MonkeyPatch.context() as monkeypatch:
             try:
                 from megatron.core import parallel_state
@@ -3541,27 +3484,19 @@ def _forward_yield_modes_worker(rank: int, world_size: int, init_method: str) ->
             completed = torch.tensor(1)
             trainer.reduce(completed)
             assert completed.item() == world_size
-    finally:
-        dist.destroy_process_group()
 
 
 @pytest.mark.parametrize("world_size", [2, 4])
 def test_forward_batches_yield_modes_collectively(
     tmp_path: Path, world_size: int
 ) -> None:
-    context = mp.spawn(
+    spawn_and_join(
         _forward_yield_modes_worker,
         args=(world_size, f"file://{tmp_path / 'forward-yields'}"),
         nprocs=world_size,
-        join=False,
+        timeout=60,
+        failure="forward yield modes test hung",
     )
-    deadline = time.monotonic() + 60
-    while time.monotonic() < deadline:
-        if context.join(timeout=1):
-            return
-    for process in context.processes:
-        process.terminate()
-    pytest.fail("forward yield modes test hung")
 
 
 def test_forward_batches_syncs_fit_decision_across_dp(

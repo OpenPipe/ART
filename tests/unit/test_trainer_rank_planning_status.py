@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from datetime import timedelta
 from pathlib import Path
 import subprocess
 import sys
@@ -77,6 +76,7 @@ def test_planning_failures_and_empty_ranks_use_aligned_status(tmp_path: Path) ->
 def _worker(index: int, directory: Path) -> None:
     import torch
     import torch.distributed as dist
+    from trainer_rank_test_support import gloo_group
 
     from art.trainer_rank import ForwardInput, TrainerRank, _impl
     from art.trainer_rank._prefix_tree_planner import (
@@ -85,14 +85,7 @@ def _worker(index: int, directory: Path) -> None:
     )
 
     torch.set_num_threads(1)
-    dist.init_process_group(
-        "gloo",
-        rank=index,
-        world_size=2,
-        init_method=f"file://{directory / 'gloo'}",
-        timeout=timedelta(seconds=10),
-    )
-    try:
+    with gloo_group(index, f"file://{directory / 'gloo'}", timeout=10):
         for mode in (
             "estimate",
             "materialize",
@@ -208,8 +201,6 @@ def _worker(index: int, directory: Path) -> None:
             finally:
                 patches.undo()
             dist.barrier()
-    finally:
-        dist.destroy_process_group()
 
 
 if __name__ == "__main__":

@@ -54,7 +54,7 @@ def megatron_topology(physical, *, dp_size, tp_size):
     )
     setattr(megatron, "core", core)
     with patch.dict(sys.modules, {"megatron": megatron, "megatron.core": core}):
-        yield
+        yield getattr(core, "parallel_state")
 
 
 def spawn_and_join(worker, args, *, timeout, failure, nprocs=2):

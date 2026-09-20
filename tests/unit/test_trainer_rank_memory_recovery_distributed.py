@@ -1,6 +1,5 @@
 """Real collectives around injected transfer failure; no CUDA memory claims."""
 
-from datetime import timedelta
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -114,14 +113,7 @@ def _head_failure_worker(index: int, directory: str, failure: str) -> None:
     from art.trainer_rank._heads import LiveHead, export_head
     from art.trainer_rank._tensors import CotangentCollector
 
-    dist.init_process_group(
-        "gloo",
-        init_method=f"file://{directory}/rendezvous",
-        rank=index,
-        world_size=2,
-        timeout=timedelta(seconds=20),
-    )
-    try:
+    with gloo_group(index, f"file://{directory}/rendezvous", timeout=20):
         trainer, api = _trainer("student")
         parameter = api.parameter("head", lambda: torch.ones(4), checkpoint="student")
         parameter.grad = torch.ones_like(parameter)
@@ -166,8 +158,6 @@ def _head_failure_worker(index: int, directory: str, failure: str) -> None:
         torch.testing.assert_close(parameter.grad, torch.ones_like(parameter))
         assert trainer._version_state()._transaction is None
         dist.barrier()
-    finally:
-        dist.destroy_process_group()
 
 
 @pytest.mark.parametrize("failure", ["copy", "stage"])

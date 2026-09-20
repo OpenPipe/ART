@@ -7,13 +7,14 @@ from datetime import timedelta
 import gc
 import sys
 import threading
-from types import ModuleType, SimpleNamespace
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
+from trainer_rank_test_support import gloo_group, megatron_topology
 
 from art.trainer_rank import (
     ForwardInput,
@@ -87,14 +88,7 @@ def _input(value):
 def _suspended_abort_worker(physical, rendezvous):
     from test_trainer_rank_custom_tensors import _trainer
 
-    dist.init_process_group(
-        "gloo",
-        init_method=f"file://{rendezvous}",
-        rank=physical,
-        world_size=2,
-        timeout=timedelta(seconds=8),
-    )
-    try:
+    with gloo_group(physical, f"file://{rendezvous}", timeout=8):
         native, _ = _trainer("student")
         native._checkpoint_process_group = dist.new_group(
             backend="gloo", timeout=timedelta(seconds=8)
@@ -165,8 +159,6 @@ def _suspended_abort_worker(physical, rendezvous):
 
         for mode in ("async", "stream", "cancel", "shutdown"):
             asyncio.run(run(mode))
-    finally:
-        dist.destroy_process_group()
 
 
 def test_suspended_callbacks_leave_physical_checkpoint_abort_responsive(tmp_path):
@@ -283,29 +275,12 @@ class _FailPhysicalBackward(torch.autograd.Function):
 
 
 def _distributed_worker(physical, rendezvous, output):
-    dist.init_process_group(
-        "gloo",
-        init_method=f"file://{rendezvous}",
-        rank=physical,
-        world_size=4,
-        timeout=timedelta(seconds=30),
-    )
-    try:
-        groups = [dist.new_group([0, 1]), dist.new_group([2, 3])]
+    with (
+        gloo_group(physical, f"file://{rendezvous}", world_size=4),
+        megatron_topology(physical, dp_size=2, tp_size=2) as ps,
+    ):
         dp_groups = [dist.new_group([0, 2]), dist.new_group([1, 3])]
         dp, tp = divmod(physical, 2)
-        ps = SimpleNamespace(
-            get_tensor_model_parallel_rank=lambda: tp,
-            get_context_parallel_rank=lambda: 0,
-            get_data_parallel_rank=lambda: dp,
-            get_data_parallel_world_size=lambda: 2,
-            get_tensor_and_context_parallel_group=lambda **kwargs: groups[dp],
-        )
-        megatron = ModuleType("megatron")
-        core = ModuleType("megatron.core")
-        setattr(core, "parallel_state", ps)
-        setattr(megatron, "core", core)
-        sys.modules.update({"megatron": megatron, "megatron.core": core})
         rank: Any = _Rank(dp, 2)
         counts = [0, 0]
 
@@ -534,13 +509,6 @@ def _distributed_worker(physical, rendezvous, output):
         dist.all_gather_object(gathered, (counts, result, per_dp, rank.steps))
         if physical == 0:
             torch.save(gathered, output)
-    except BaseException:
-        import traceback
-
-        traceback.print_exc()
-        raise
-    finally:
-        dist.destroy_process_group()
 
 
 def test_gloo_dp2_tp2_participation_and_gradients(tmp_path):
