@@ -12,11 +12,16 @@ from art.trainer_rank._heads import LiveHead, export_head, head_gradient_targets
 from art.trainer_rank._tensors import CotangentCollector
 
 
-def setup(client):
+def setup(client, values=None):
     trainer, rank = _trainer("student")
-    native = rank.parameter("p", lambda: torch.tensor(2.0), checkpoint="student")
+    factory = lambda: torch.tensor(2.0) if values is None else values.clone()
+    native = rank.parameter("p", factory, checkpoint="student")
     collector = CotangentCollector()
-    live = LiveHead(export_head(trainer, "student", "p"), torch.tensor(2.0), collector)
+    live = LiveHead(
+        export_head(trainer, "student", "p"),
+        factory() if values is None else values,
+        collector,
+    )
     parameter = live.value if client else native
     assert isinstance(parameter, torch.Tensor)
 
@@ -144,13 +149,8 @@ def test_head_hook_registries_follow_graph_lifetime():
 def test_sparse_hook_gradients_preserve_layout_and_mix_with_dense(
     client, sparse_first, mixed
 ):
-    trainer, rank = _trainer("student")
     values = torch.arange(1.0, 7).reshape(3, 2)
-    native = rank.parameter("p", lambda: values.clone(), checkpoint="student")
-    collector = CotangentCollector()
-    live = LiveHead(export_head(trainer, "student", "p"), values, collector)
-    parameter = live.value if client else native
-    assert isinstance(parameter, torch.Tensor)
+    _, native, parameter, _, _, backward = setup(client, values)
     seen = []
     parameter.register_hook(lambda gradient: seen.append(gradient.layout) or gradient)
     indices = torch.tensor([0, 2, 0])
@@ -165,25 +165,14 @@ def test_sparse_hook_gradients_preserve_layout_and_mix_with_dense(
     )
     native.grad = torch.ones_like(values)
 
-    def backward():
-        if client:
-            packets = collector.backward(loss)
-            with trainer._gradient_transaction():
-                for packet in packets:
-                    trainer._commit_versioned_gradients(
-                        head_gradient_targets(trainer, packet)
-                    )
-        else:
-            trainer.backward(loss)
-
     if not mixed:
         with pytest.raises(ValueError, match="layout"):
-            backward()
+            backward(loss)
         torch.testing.assert_close(native.grad, torch.ones_like(values))
         if client:
             assert seen == [torch.sparse_coo]
     else:
-        backward()
+        backward(loss)
         assert seen == [torch.strided]
         expected = 1 + 2 * values + torch.tensor([[2.0, 2.0], [0.0, 0.0], [1.0, 1.0]])
         torch.testing.assert_close(native.grad, expected)

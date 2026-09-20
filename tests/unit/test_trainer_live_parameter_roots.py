@@ -9,8 +9,21 @@ import pytest
 from test_trainer_rank_custom_tensors import _trainer
 import torch
 
+from art.trainer_rank import TrainerRank
 from art.trainer_rank._heads import LiveHead, export_head, head_gradient_targets
 from art.trainer_rank._tensors import CotangentCollector
+
+
+def _live_parameter(
+    factory=lambda: torch.tensor(2.0),
+) -> tuple[TrainerRank, torch.nn.Parameter, CotangentCollector, LiveHead]:
+    trainer, rank = _trainer("student")
+    parameter = rank.parameter("weight", factory, checkpoint="student")
+    collector = CotangentCollector()
+    live = LiveHead(
+        export_head(trainer, "student", "weight"), parameter.detach(), collector
+    )
+    return trainer, parameter, collector, live
 
 
 class _FailBackward(torch.autograd.Function):
@@ -46,13 +59,8 @@ def test_native_direct_root_does_not_publish_when_another_root_fails(existing):
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64, torch.complex64])
 @pytest.mark.parametrize("surface", ["native", "client"])
 def test_direct_roots_preserve_aliases_explicit_gradients_and_dtype(dtype, surface):
-    trainer, rank = _trainer("student")
-    parameter = rank.parameter(
-        "weight", lambda: torch.tensor([2.0, 3.0], dtype=dtype), checkpoint="student"
-    )
-    collector = CotangentCollector()
-    live = LiveHead(
-        export_head(trainer, "student", "weight"), parameter.detach(), collector
+    trainer, parameter, collector, live = _live_parameter(
+        lambda: torch.tensor([2.0, 3.0], dtype=dtype)
     )
     root: Any = parameter if surface == "native" else live.value
     gradients = (
@@ -83,14 +91,7 @@ def test_direct_roots_preserve_aliases_explicit_gradients_and_dtype(dtype, surfa
 
 
 def test_direct_live_root_and_old_arithmetic_keep_their_own_versions():
-    trainer, rank = _trainer("student")
-    parameter = rank.parameter(
-        "weight", lambda: torch.tensor(2.0), checkpoint="student"
-    )
-    collector = CotangentCollector()
-    live = LiveHead(
-        export_head(trainer, "student", "weight"), parameter.detach(), collector
-    )
+    trainer, parameter, collector, live = _live_parameter()
     root: Any = live.value
     old = root.square()
     parameter.data.fill_(5)
@@ -109,14 +110,7 @@ def test_direct_live_root_and_old_arithmetic_keep_their_own_versions():
 
 
 def test_client_direct_root_failure_discards_cotangents_and_revalidates_handle():
-    trainer, rank = _trainer("student")
-    parameter = rank.parameter(
-        "weight", lambda: torch.tensor(2.0), checkpoint="student"
-    )
-    collector = CotangentCollector()
-    live = LiveHead(
-        export_head(trainer, "student", "weight"), parameter.detach(), collector
-    )
+    trainer, parameter, collector, live = _live_parameter()
     root: Any = live.value
     bad = _FailBackward.apply(torch.tensor(1.0, requires_grad=True))
     with pytest.raises(RuntimeError, match="local backward failed"):
