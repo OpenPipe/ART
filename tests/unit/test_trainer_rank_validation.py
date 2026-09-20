@@ -212,6 +212,16 @@ def _output_shape(outputs: object) -> object:
     return [_output_shape(item) for item in outputs]
 
 
+def _use_strict_local_gradients(
+    trainer: TrainerRank, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        trainer,
+        "_reduce_dynamic_grads",
+        lambda params, **_kwargs: tuple(item.grad.float() for item in params),
+    )
+
+
 def _trainer_with_checkpoint(
     monkeypatch: pytest.MonkeyPatch,
     value: torch.Tensor,
@@ -219,11 +229,7 @@ def _trainer_with_checkpoint(
     trainer = TrainerRank(_runtime())
     param = torch.nn.Parameter(value.clone())
     trainer._checkpoint_slots.setdefault("student", _CheckpointSlot()).params = (param,)
-    monkeypatch.setattr(
-        trainer,
-        "_reduce_dynamic_grads",
-        lambda params, **_kwargs: tuple(item.grad.float() for item in params),
-    )
+    _use_strict_local_gradients(trainer, monkeypatch)
     return trainer, param
 
 
@@ -1650,11 +1656,7 @@ def test_weights_only_load_replaces_stale_optimizer_and_recreates_it_lazily(
     assert stale is not slot.optimizer
 
     replacement.grad = torch.ones_like(replacement)
-    monkeypatch.setattr(
-        trainer,
-        "_reduce_dynamic_grads",
-        lambda params, **_kwargs: tuple(item.grad.float() for item in params),
-    )
+    _use_strict_local_gradients(trainer, monkeypatch)
     result = trainer.optim_step(
         checkpoints=["student"],
         params=AdamParams(learning_rate=1e-3, weight_decay=0),
@@ -2386,11 +2388,7 @@ def test_real_checkpoint_codec_round_trips_with_optional_optimizer(
             "student", loaded, set(adapter)
         )
         trainer._checkpoint_slots["student"] = _CheckpointSlot(params, config)
-        monkeypatch.setattr(
-            trainer,
-            "_reduce_dynamic_grads",
-            lambda params, **_kwargs: tuple(item.grad.float() for item in params),
-        )
+        _use_strict_local_gradients(trainer, monkeypatch)
         return trainer
 
     original = make_trainer()
@@ -2411,11 +2409,7 @@ def test_real_checkpoint_codec_round_trips_with_optional_optimizer(
 
     restored_lora = LoRA("layer.q_proj", 3, 4, 2, 2, torch.float32, torch.device("cpu"))
     restored = TrainerRank(_runtime(restored_lora))
-    monkeypatch.setattr(
-        restored,
-        "_reduce_dynamic_grads",
-        lambda params, **_kwargs: tuple(item.grad.float() for item in params),
-    )
+    _use_strict_local_gradients(restored, monkeypatch)
     checkpoint_module.load_checkpoint(restored, prepared, "student")
     assert (
         restored._checkpoint_slots["student"].optimizer is not None
@@ -2528,11 +2522,7 @@ def test_optim_step_rejects_explicit_slot_subset_with_missing_grads(
     trainer._checkpoint_slots.setdefault("missing", _CheckpointSlot()).params = (
         missing,
     )
-    monkeypatch.setattr(
-        trainer,
-        "_reduce_dynamic_grads",
-        lambda params, **_kwargs: tuple(param.grad.float() for param in params),
-    )
+    _use_strict_local_gradients(trainer, monkeypatch)
 
     with pytest.raises(TrainerRankSlotStateError, match="missing"):
         trainer.optim_step(
@@ -2552,11 +2542,7 @@ def test_optim_step_implicitly_steps_only_slots_with_grads(
     trainer._checkpoint_slots.setdefault("untouched", _CheckpointSlot()).params = (
         untouched,
     )
-    monkeypatch.setattr(
-        trainer,
-        "_reduce_dynamic_grads",
-        lambda params, **_kwargs: tuple(param.grad.float() for param in params),
-    )
+    _use_strict_local_gradients(trainer, monkeypatch)
 
     before_ready = ready.detach().clone()
     before_untouched = untouched.detach().clone()
@@ -2645,11 +2631,7 @@ def test_optim_step_clips_per_checkpoint(
             master_params=(master,), optimizer=RecordingOptimizer(name, master)
         )
 
-    monkeypatch.setattr(
-        trainer,
-        "_reduce_dynamic_grads",
-        lambda params, **_kwargs: tuple(param.grad.float() for param in params),
-    )
+    _use_strict_local_gradients(trainer, monkeypatch)
     monkeypatch.setattr(
         trainer, "_dynamic_optimizer", lambda name, _params: dynamics[name]
     )
@@ -2691,11 +2673,7 @@ def test_optim_step_checks_all_checkpoint_grads_before_stepping(
         param = torch.nn.Parameter(torch.ones(1))
         param.grad = torch.full_like(param, grad)
         trainer._checkpoint_slots[name] = _CheckpointSlot(params=(param,))
-    monkeypatch.setattr(
-        trainer,
-        "_reduce_dynamic_grads",
-        lambda params, **_kwargs: tuple(param.grad.float() for param in params),
-    )
+    _use_strict_local_gradients(trainer, monkeypatch)
     monkeypatch.setattr(
         trainer,
         "_dynamic_optimizer",
@@ -2754,11 +2732,7 @@ def test_optim_step_allows_either_configuration_to_be_mapped(
     param = torch.nn.Parameter(torch.ones(1))
     param.grad = torch.ones_like(param)
     trainer._checkpoint_slots["student"] = _CheckpointSlot(params=(param,))
-    monkeypatch.setattr(
-        trainer,
-        "_reduce_dynamic_grads",
-        lambda params, **_kwargs: tuple(param.grad.float() for param in params),
-    )
+    _use_strict_local_gradients(trainer, monkeypatch)
     adam = AdamParams(learning_rate=1e-3, weight_decay=0.0)
 
     trainer.optim_step(
@@ -2778,11 +2752,7 @@ def test_optim_step_prepares_all_optimizers_before_first_update(
         param = torch.nn.Parameter(torch.ones(1))
         param.grad = torch.ones_like(param)
         trainer._checkpoint_slots[name] = _CheckpointSlot(params=(param,))
-    monkeypatch.setattr(
-        trainer,
-        "_reduce_dynamic_grads",
-        lambda params, **_kwargs: tuple(param.grad.float() for param in params),
-    )
+    _use_strict_local_gradients(trainer, monkeypatch)
 
     class RecordingOptimizer:
         def step(self) -> None:
@@ -2850,11 +2820,7 @@ def test_optim_step_implicitly_ignores_resident_forward_snapshot(
     list(
         trainer.forward_batches([_target_request(1)], checkpoint="saved", no_grad=True)
     )
-    monkeypatch.setattr(
-        trainer,
-        "_reduce_dynamic_grads",
-        lambda params, **_kwargs: tuple(param.grad.float() for param in params),
-    )
+    _use_strict_local_gradients(trainer, monkeypatch)
 
     before_student = student.detach().clone()
     before_snapshot = snapshot.detach().clone()
@@ -2900,11 +2866,7 @@ def test_dynamic_optimizer_zeroes_internal_padding_grads_before_step(
     )
     trainer = TrainerRank(runtime)
     trainer._checkpoint_slots.setdefault("student", _CheckpointSlot()).params = (param,)
-    monkeypatch.setattr(
-        trainer,
-        "_reduce_dynamic_grads",
-        lambda params, **_kwargs: tuple(item.grad.float() for item in params),
-    )
+    _use_strict_local_gradients(trainer, monkeypatch)
 
     trainer.optim_step(
         params=AdamParams(
