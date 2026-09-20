@@ -119,19 +119,13 @@ def _validate_options(options: ForwardOptions | ResolvedForwardOptions) -> None:
         value = getattr(options, name)
         if value is not Unset and type(value) is not bool:
             raise ValueError(f"{name} must be a bool")
-    if options.backward_state is not Unset and options.backward_state not in (
-        "auto",
-        "gpu",
-        "cpu",
-        "replay",
+    for name, choices in (
+        ("backward_state", ("auto", "gpu", "cpu", "replay")),
+        ("output_device", ("auto", "model", "cpu")),
     ):
-        raise ValueError(f"unknown backward_state: {options.backward_state!r}")
-    if options.output_device is not Unset and options.output_device not in (
-        "auto",
-        "model",
-        "cpu",
-    ):
-        raise ValueError(f"unknown output_device: {options.output_device!r}")
+        value = getattr(options, name)
+        if value is not Unset and value not in choices:
+            raise ValueError(f"unknown {name}: {value!r}")
     corrections = options.stale_gradient_corrections
     if corrections is not Unset:
         if any(

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from collections.abc import Callable
-from typing import TypeVar
+from collections.abc import Callable, Sequence
+from typing import Literal, TypeVar
 
 import torch
 import torch.distributed as dist
@@ -28,6 +28,10 @@ ForwardOutputs = _impl.ForwardOutputs
 MicroBatch = _impl.MicroBatch
 MicroBatchStats = _impl.MicroBatchStats
 TopK = _impl.TopK
+LogprobsT = TypeVar("LogprobsT", bound=torch.Tensor | None, covariant=True)
+TopKT = TypeVar("TopKT", bound=TopK | None, covariant=True)
+LogitsT = TypeVar("LogitsT", bound=torch.Tensor | None, covariant=True)
+HiddenStatesT = TypeVar("HiddenStatesT", bound=torch.Tensor | None, covariant=True)
 TrainerRankMemoryError = _impl.TrainerRankMemoryError
 TrainerRankPartialExecutionError = _impl.TrainerRankPartialExecutionError
 TrainerRankRuntimeSupportError = _impl.TrainerRankRuntimeSupportError
