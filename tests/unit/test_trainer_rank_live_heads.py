@@ -45,6 +45,12 @@ class TiedHead(torch.nn.Module):
         )
 
 
+def _native_head(kind="module", name="head", factory=TiedHead):
+    trainer, rank = _trainer("student")
+    native = getattr(rank, kind)(name, factory, checkpoint="student")
+    return trainer, native
+
+
 def _live_head(
     trainer, name, source, collector=None, *, checkpoint="student"
 ) -> LiveHead:
@@ -76,8 +82,7 @@ def _step(trainer, monkeypatch):
 def test_native_old_head_graph_uses_original_tied_weights_after_step(
     monkeypatch, checkpointed
 ):
-    trainer, rank = _trainer("student")
-    head = rank.module("head", lambda: TiedHead(checkpointed), checkpoint="student")
+    trainer, head = _native_head(factory=lambda: TiedHead(checkpointed))
     old_input = torch.tensor(3.0, requires_grad=True)
     old_loss = head(old_input)
     with trainer._gradient_transaction():
@@ -96,9 +101,8 @@ def test_native_old_head_graph_uses_original_tied_weights_after_step(
 
 
 def test_batchnorm_buffers_publish_once_and_old_graph_keeps_original_buffers():
-    trainer, rank = _trainer("student")
-    head = rank.module(
-        "bn", lambda: torch.nn.BatchNorm1d(2, dtype=torch.float64), checkpoint="student"
+    trainer, head = _native_head(
+        "module", "bn", lambda: torch.nn.BatchNorm1d(2, dtype=torch.float64)
     )
     initial = deepcopy(head).eval()
     head.eval()
@@ -124,8 +128,7 @@ def test_failed_module_call_does_not_publish_buffers():
             super().forward(input)
             raise RuntimeError("failed after buffer mutation")
 
-    trainer, rank = _trainer("student")
-    head = rank.module("bn", lambda: Failing(2), checkpoint="student")
+    trainer, head = _native_head("module", "bn", lambda: Failing(2))
     with pytest.raises(RuntimeError, match="failed after"):
         head(torch.ones(4, 2))
     assert head.num_batches_tracked.item() == 0
@@ -133,8 +136,7 @@ def test_failed_module_call_does_not_publish_buffers():
 
 
 def test_client_tied_head_old_backward_after_native_refresh(monkeypatch):
-    trainer, rank = _trainer("student")
-    native = rank.module("head", TiedHead, checkpoint="student")
+    trainer, native = _native_head()
     collector = CotangentCollector()
     live = _live_head(trainer, "head", TiedHead(), collector)
     old_input = torch.tensor(3.0, requires_grad=True)
@@ -153,8 +155,7 @@ def test_client_tied_head_old_backward_after_native_refresh(monkeypatch):
 
 
 def test_live_parameter_reuses_handle_and_earlier_capture_retains_version():
-    trainer, rank = _trainer("student")
-    parameter = rank.parameter("gain", lambda: torch.tensor(2.0), checkpoint="student")
+    trainer, parameter = _native_head("parameter", "gain", lambda: torch.tensor(2.0))
     collector = CotangentCollector()
     live = _live_head(trainer, "gain", torch.tensor(2.0), collector)
     handle = _tensor(live)
@@ -170,8 +171,7 @@ def test_live_parameter_reuses_handle_and_earlier_capture_retains_version():
 
 
 def test_client_buffer_publication_conflict_is_atomic():
-    trainer, rank = _trainer("student")
-    native = rank.module("bn", lambda: torch.nn.BatchNorm1d(2), checkpoint="student")
+    trainer, native = _native_head("module", "bn", lambda: torch.nn.BatchNorm1d(2))
     live = _live_head(trainer, "bn", torch.nn.BatchNorm1d(2))
     _module(live)(torch.ones(4, 2))
     update = live.take_publication()
@@ -220,8 +220,7 @@ def test_registration_materializes_factory_state_and_persistent_buffers():
 
 @pytest.mark.parametrize("reentrant", (False, True))
 def test_external_checkpoint_requires_explicit_snapshot(reentrant):
-    trainer, rank = _trainer("student")
-    head = rank.module("head", TiedHead, checkpoint="student")
+    trainer, head = _native_head()
     x = torch.tensor(3.0, requires_grad=True)
     old = checkpoint(head, x, use_reentrant=reentrant)
     head.left.data.fill_(4)
@@ -233,8 +232,7 @@ def test_external_checkpoint_requires_explicit_snapshot(reentrant):
 
 @pytest.mark.parametrize("reentrant", (False, True))
 def test_explicit_snapshot_supports_external_checkpoint(reentrant):
-    trainer, rank = _trainer("student")
-    head = rank.module("head", TiedHead, checkpoint="student")
+    trainer, head = _native_head()
     captured = head.snapshot()
     x = torch.tensor(3.0, requires_grad=True)
     old = checkpoint(captured, x, use_reentrant=reentrant)
@@ -340,8 +338,7 @@ def test_cuda_checkpoint_head_across_completed_optimizer_update(monkeypatch, cli
 
 
 def test_client_buffer_reads_keep_old_graph_and_replacement_invalidates_handle():
-    trainer, rank = _trainer("student")
-    native = rank.buffer("scale", lambda: torch.tensor(2.0), checkpoint="student")
+    trainer, native = _native_head("buffer", "scale", lambda: torch.tensor(2.0))
     collector = CotangentCollector()
     live = _live_head(trainer, "scale", torch.tensor(2.0), collector)
     x = torch.tensor(3.0, requires_grad=True)
@@ -361,8 +358,7 @@ def test_client_buffer_reads_keep_old_graph_and_replacement_invalidates_handle()
 
 
 def test_client_module_explicit_dtype_move_retains_ties_and_live_parameters():
-    trainer, rank = _trainer("student")
-    native = rank.module("head", TiedHead, checkpoint="student")
+    trainer, native = _native_head()
     live = _live_head(trainer, "head", TiedHead())
     head = _module(live).to("cpu").to(dtype=torch.float64)
     assert head.left.dtype == torch.float64
@@ -382,8 +378,7 @@ def test_client_module_explicit_dtype_move_retains_ties_and_live_parameters():
 
 
 def test_client_explicit_snapshot_supports_nonreentrant_checkpoint():
-    trainer, rank = _trainer("student")
-    native = rank.module("head", TiedHead, checkpoint="student")
+    trainer, native = _native_head()
     collector = CotangentCollector()
     live = _live_head(trainer, "head", TiedHead(), collector)
     captured = _module(live).snapshot()
@@ -400,8 +395,7 @@ def test_client_explicit_snapshot_supports_nonreentrant_checkpoint():
 
 @pytest.mark.parametrize("client", (False, True))
 def test_buffer_item_and_bitwise_mutations_publish_without_losing_handle(client):
-    trainer, rank = _trainer("student")
-    native = rank.buffer("mask", lambda: torch.tensor([1, 2]), checkpoint="student")
+    trainer, native = _native_head("buffer", "mask", lambda: torch.tensor([1, 2]))
     live = _live_head(trainer, "mask", torch.tensor([1, 2])) if client else None
     value = native if live is None else _tensor(live)
     value[0] = 4
@@ -464,8 +458,7 @@ def test_reusing_module_factory_value_does_not_share_checkpoint_storage():
 
 
 def test_registration_under_no_grad_preserves_authoritative_trainability():
-    trainer, rank = _trainer("student")
-    native = rank.module("head", TiedHead, checkpoint="student")
+    trainer, native = _native_head()
     collector = CotangentCollector()
     with torch.no_grad():
         live = _live_head(trainer, "head", TiedHead(), collector)
@@ -479,8 +472,7 @@ def test_registration_under_no_grad_preserves_authoritative_trainability():
 
 @pytest.mark.parametrize("external", (False, True))
 def test_client_reentrant_checkpoint_rejects_nested_remote_bridges(external):
-    trainer, rank = _trainer("student")
-    native = rank.module("head", TiedHead, checkpoint="student")
+    trainer, native = _native_head()
     collector = CotangentCollector()
     live = _live_head(trainer, "head", TiedHead(None if external else True), collector)
     x = torch.tensor(3.0, requires_grad=True)
@@ -563,9 +555,8 @@ def test_client_reused_module_factory_does_not_share_checkpoint_handles():
 def test_managed_model_operand_captures_live_parameter_and_keeps_old_version(operation):
     from art.trainer_rank._tensors import detach_tree
 
-    trainer, rank = _trainer("student")
-    native = rank.parameter(
-        "weight", lambda: torch.tensor([2.0, 4.0]), checkpoint="student"
+    trainer, native = _native_head(
+        "parameter", "weight", lambda: torch.tensor([2.0, 4.0])
     )
     collector = CotangentCollector()
     live = _live_head(trainer, "weight", torch.zeros(2), collector)
@@ -604,8 +595,7 @@ def test_module_buffer_reassignment_publishes(client):
             self.count = self.count + 1
             return value + self.count
 
-    trainer, rank = _trainer("student")
-    native = rank.module("head", Counter, checkpoint="student")
+    trainer, native = _native_head(factory=Counter)
     live = _live_head(trainer, "head", Counter()) if client else None
     head = native if live is None else _module(live)
     assert head(torch.tensor(0)).item() == 1
@@ -632,8 +622,7 @@ def test_failed_buffer_shape_change_rolls_back_every_buffer(client):
             self.b.resize_(2)
             return value
 
-    trainer, rank = _trainer("student")
-    native = rank.module("head", Resize, checkpoint="student")
+    trainer, native = _native_head(factory=Resize)
     live = _live_head(trainer, "head", Resize()) if client else None
     head = native if live is None else _module(live)
     before = export_head(trainer, "student", "head").buffer_revision
@@ -648,8 +637,7 @@ def test_failed_buffer_shape_change_rolls_back_every_buffer(client):
 
 @pytest.mark.parametrize("client", (False, True))
 def test_failing_handle_forward_hook_does_not_publish_buffers(client):
-    trainer, rank = _trainer("student")
-    native = rank.module("head", lambda: torch.nn.BatchNorm1d(2), checkpoint="student")
+    trainer, native = _native_head(factory=lambda: torch.nn.BatchNorm1d(2))
     live = _live_head(trainer, "head", torch.nn.BatchNorm1d(2)) if client else None
     head = native if live is None else _module(live)
 
@@ -694,8 +682,7 @@ def test_handle_hooks_share_one_buffer_publication(
                 raise RuntimeError("forward failed")
             return value + self.count
 
-    trainer, rank = _trainer("student")
-    native = rank.module("head", Counter, checkpoint="student")
+    trainer, native = _native_head(factory=Counter)
     live = _live_head(trainer, "head", Counter()) if client else None
     head = native if live is None else _module(live)
     initial = 7 if pending_before else 0
@@ -741,8 +728,7 @@ def test_handle_hooks_share_one_buffer_publication(
 
 @pytest.mark.parametrize("client", (False, True))
 def test_handle_hook_parameter_gradients_keep_original_version(client):
-    trainer, rank = _trainer("student")
-    native = rank.module("head", TiedHead, checkpoint="student")
+    trainer, native = _native_head()
     collector = CotangentCollector()
     live = _live_head(trainer, "head", TiedHead(), collector) if client else None
     head = native if live is None else _module(live)
@@ -767,8 +753,7 @@ def test_handle_hook_parameter_gradients_keep_original_version(client):
 
 @pytest.mark.parametrize("client", (False, True))
 def test_recursive_handle_hook_does_not_publish_before_outer_failure(client):
-    trainer, rank = _trainer("student")
-    native = rank.module("head", TiedHead, checkpoint="student")
+    trainer, native = _native_head()
     live = _live_head(trainer, "head", TiedHead()) if client else None
     head = native if live is None else _module(live)
 
@@ -851,10 +836,7 @@ def test_nested_handle_calls_preserve_active_captures(client, scenario):
 
 
 def test_inplace_operation_snapshots_readonly_checkpoint_parameter():
-    trainer, rank = _trainer("student")
-    parameter = rank.parameter(
-        "weight", lambda: torch.tensor(2.0), checkpoint="student"
-    )
+    trainer, parameter = _native_head("parameter", "weight", lambda: torch.tensor(2.0))
     input_value = torch.tensor(3.0, requires_grad=True)
     original = (input_value * 1).mul_(parameter)
     parameter.data.fill_(7)
@@ -1065,8 +1047,7 @@ def test_logical_registration_recovers_after_rejected_buffer_publication(mode, k
 def test_live_buffer_view_mutation_rejects_without_silent_write(
     client, grad_enabled, view
 ):
-    trainer, rank = _trainer("student")
-    native = rank.buffer("stats", lambda: torch.zeros(4), checkpoint="student")
+    trainer, native = _native_head("buffer", "stats", lambda: torch.zeros(4))
     live = _live_head(trainer, "stats", torch.zeros(4)) if client else None
     buffer = native if live is None else _tensor(live)
     revision = export_head(trainer, "student", "stats").buffer_revision
@@ -1089,8 +1070,7 @@ def test_live_buffer_view_mutation_rejects_without_silent_write(
 
 @pytest.mark.parametrize("client", (False, True))
 def test_functional_batchnorm_no_grad_publishes_buffer_changes(client):
-    trainer, rank = _trainer("student")
-    native = rank.buffer("mean", lambda: torch.zeros(2), checkpoint="student")
+    trainer, native = _native_head("buffer", "mean", lambda: torch.zeros(2))
     live = _live_head(trainer, "mean", torch.zeros(2)) if client else None
     mean = native if live is None else _tensor(live)
     before = export_head(trainer, "student", "mean").buffer_revision
@@ -1108,8 +1088,7 @@ def test_functional_batchnorm_no_grad_publishes_buffer_changes(client):
 
 @pytest.mark.parametrize("client", (False, True))
 def test_live_parameter_metadata_does_not_capture_weights(monkeypatch, client):
-    trainer, rank = _trainer("student")
-    native = rank.parameter("weight", lambda: torch.zeros(3, 4), checkpoint="student")
+    trainer, native = _native_head("parameter", "weight", lambda: torch.zeros(3, 4))
     live = _live_head(trainer, "weight", torch.zeros(3, 4)) if client else None
     value = native if live is None else _tensor(live)
 
@@ -1142,8 +1121,7 @@ def test_parameter_tensor_properties_capture_immutable_versions(
         if property_name == "imag":
             pytest.skip("imag requires a complex tensor")
         initial = initial.real.clone()
-    trainer, rank = _trainer("student")
-    native = rank.parameter("weight", lambda: initial.clone(), checkpoint="student")
+    trainer, native = _native_head("parameter", "weight", lambda: initial.clone())
     collector = CotangentCollector()
     live = _live_head(trainer, "weight", initial, collector) if client else None
     value = native if live is None else _tensor(live)
@@ -1181,8 +1159,7 @@ def test_parameter_tensor_properties_capture_immutable_versions(
 @pytest.mark.parametrize("property_name", ("T", "mT", "H", "mH", "real", "imag"))
 def test_buffer_tensor_properties_reject_unpublished_mutation(client, property_name):
     initial = torch.ones(2, 2, dtype=torch.complex64)
-    trainer, rank = _trainer("student")
-    native = rank.buffer("stats", lambda: initial.clone(), checkpoint="student")
+    trainer, native = _native_head("buffer", "stats", lambda: initial.clone())
     live = _live_head(trainer, "stats", initial) if client else None
     value = native if live is None else _tensor(live)
     with pytest.raises(RuntimeError, match="Views of live checkpoint buffers"):
@@ -1207,8 +1184,7 @@ def test_distributed_buffer_registration_mismatch_fails_on_every_rank(
 
 @pytest.mark.parametrize("client", (False, True))
 def test_module_buffer_view_mutation_rejects_without_publishing(client):
-    trainer, rank = _trainer("student")
-    native = rank.module("head", lambda: torch.nn.BatchNorm1d(2), checkpoint="student")
+    trainer, native = _native_head(factory=lambda: torch.nn.BatchNorm1d(2))
     live = _live_head(trainer, "head", torch.nn.BatchNorm1d(2)) if client else None
     head = native if live is None else _module(live)
     with pytest.raises(
@@ -1222,8 +1198,7 @@ def test_module_buffer_view_mutation_rejects_without_publishing(client):
 
 @pytest.mark.parametrize("client", (False, True))
 def test_stateful_function_on_buffer_snapshot_view_rejects(client):
-    trainer, rank = _trainer("student")
-    native = rank.buffer("mean", lambda: torch.zeros(2), checkpoint="student")
+    trainer, native = _native_head("buffer", "mean", lambda: torch.zeros(2))
     live = _live_head(trainer, "mean", torch.zeros(2)) if client else None
     mean = native if live is None else _tensor(live)
     with (
