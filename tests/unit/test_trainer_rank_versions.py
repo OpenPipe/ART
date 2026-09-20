@@ -24,6 +24,12 @@ def _trainer() -> tuple[TrainerRank, torch.nn.Parameter]:
     return trainer, parameter
 
 
+def _snapshot_trainer() -> tuple[TrainerRank, torch.nn.Parameter, torch.nn.Parameter]:
+    trainer, current = _trainer()
+    version = trainer._capture_checkpoint_version("student")
+    return trainer, current, trainer._snapshot_parameter(current, version)
+
+
 @pytest.mark.parametrize("reentrant", (False, True))
 def test_snapshot_recompute_routes_original_gradient_after_update(
     reentrant: bool,
@@ -44,10 +50,7 @@ def test_snapshot_recompute_routes_original_gradient_after_update(
 
 
 def test_coupled_versions_accumulate_and_repeated_backward_routes_once() -> None:
-    trainer, current = _trainer()
-    old = trainer._snapshot_parameter(
-        current, trainer._capture_checkpoint_version("student")
-    )
+    trainer, current, old = _snapshot_trainer()
     with torch.no_grad():
         current.fill_(3)
     trainer._checkpoint_slots["student"].revision += 1
@@ -81,10 +84,7 @@ def test_stale_backward_preserves_existing_current_gradient() -> None:
 
 
 def test_failed_backward_discards_staged_gradients_and_releases_batch() -> None:
-    trainer, current = _trainer()
-    old = trainer._snapshot_parameter(
-        current, trainer._capture_checkpoint_version("student")
-    )
+    trainer, current, old = _snapshot_trainer()
 
     def fail(_gradient: torch.Tensor) -> None:
         raise RuntimeError("local autograd failed")
@@ -123,10 +123,7 @@ def test_snapshot_backward_requires_atomic_scope_for_outer_failure(
 
 
 def test_reentrant_backward_transaction_rolls_back_completed_nested_task() -> None:
-    trainer, current = _trainer()
-    old = trainer._snapshot_parameter(
-        current, trainer._capture_checkpoint_version("student")
-    )
+    trainer, current, old = _snapshot_trainer()
     x = torch.tensor(3.0, dtype=torch.float64, requires_grad=True)
     loss = checkpoint(lambda x: x * old.square(), x, use_reentrant=True)
     with pytest.raises(RuntimeError, match="later backward failed"):
@@ -196,10 +193,7 @@ def test_accumulated_origin_is_checked_before_optimizer_mutation() -> None:
 
 
 def test_snapshot_lifetime_follows_graph_references() -> None:
-    trainer, current = _trainer()
-    snapshot = trainer._snapshot_parameter(
-        current, trainer._capture_checkpoint_version("student")
-    )
+    trainer, current, snapshot = _snapshot_trainer()
     reference = weakref.ref(snapshot)
     loss = snapshot.square()
     del snapshot
@@ -225,10 +219,7 @@ def test_replay_capture_does_not_reset_origin_age() -> None:
 
 
 def test_collective_preflight_failure_does_not_commit_local_gradients() -> None:
-    trainer, current = _trainer()
-    old = trainer._snapshot_parameter(
-        current, trainer._capture_checkpoint_version("student")
-    )
+    trainer, current, old = _snapshot_trainer()
 
     def other_rank_failed(validate) -> None:
         validate()
@@ -258,10 +249,7 @@ def test_gradient_dtype_is_validated_before_any_accumulator_is_published() -> No
 
 
 def test_nested_transaction_still_participates_in_collective_preflight() -> None:
-    trainer, current = _trainer()
-    old = trainer._snapshot_parameter(
-        current, trainer._capture_checkpoint_version("student")
-    )
+    trainer, current, old = _snapshot_trainer()
     calls = []
 
     def collective(validate) -> None:
@@ -279,10 +267,7 @@ def test_nested_transaction_still_participates_in_collective_preflight() -> None
 
 
 def test_caught_nested_backward_failure_invalidates_whole_transaction() -> None:
-    trainer, current = _trainer()
-    old = trainer._snapshot_parameter(
-        current, trainer._capture_checkpoint_version("student")
-    )
+    trainer, current, old = _snapshot_trainer()
     with pytest.raises(RuntimeError, match="nested gradient transaction failed"):
         with trainer._gradient_transaction():
             with pytest.raises(RuntimeError, match="failed"):
@@ -345,10 +330,7 @@ def test_divergent_optimizer_provenance_rejects_collectively_before_mutation(
 
 
 def test_transaction_coalesces_many_children_but_keeps_each_origin() -> None:
-    trainer, current = _trainer()
-    old = trainer._snapshot_parameter(
-        current, trainer._capture_checkpoint_version("student")
-    )
+    trainer, current, old = _snapshot_trainer()
     trainer._checkpoint_slots["student"].revision = 1
     new = trainer._snapshot_parameter(
         current, trainer._capture_checkpoint_version("student")
@@ -373,10 +355,7 @@ def test_transaction_coalesces_many_children_but_keeps_each_origin() -> None:
 
 
 def test_retained_failed_transaction_traceback_releases_staging() -> None:
-    trainer, current = _trainer()
-    old = trainer._snapshot_parameter(
-        current, trainer._capture_checkpoint_version("student")
-    )
+    trainer, current, old = _snapshot_trainer()
     saved_error = None
     reference = None
     try:
