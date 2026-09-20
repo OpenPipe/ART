@@ -1,8 +1,7 @@
 from __future__ import annotations
 
-import asyncio
-from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
-from typing import TYPE_CHECKING, Literal, TypeVar, cast, overload
+from collections.abc import Callable
+from typing import TypeVar
 
 import torch
 import torch.distributed as dist
@@ -29,10 +28,6 @@ ForwardOutputs = _impl.ForwardOutputs
 MicroBatch = _impl.MicroBatch
 MicroBatchStats = _impl.MicroBatchStats
 TopK = _impl.TopK
-LogprobsT = TypeVar("LogprobsT", bound=torch.Tensor | None, covariant=True)
-TopKT = TypeVar("TopKT", bound=TopK | None, covariant=True)
-LogitsT = TypeVar("LogitsT", bound=torch.Tensor | None, covariant=True)
-HiddenStatesT = TypeVar("HiddenStatesT", bound=torch.Tensor | None, covariant=True)
 TrainerRankMemoryError = _impl.TrainerRankMemoryError
 TrainerRankPartialExecutionError = _impl.TrainerRankPartialExecutionError
 TrainerRankRuntimeSupportError = _impl.TrainerRankRuntimeSupportError
@@ -40,9 +35,6 @@ TrainerRankSlotStateError = _impl.TrainerRankSlotStateError
 Unset = _impl.Unset
 MaterializedCheckpoint = _impl.MaterializedCheckpoint
 PushedCheckpoint = _impl.PushedCheckpoint
-
-if TYPE_CHECKING:
-    from art.megatron.train import TrainingRuntime
 
 ModuleT = TypeVar("ModuleT", bound=torch.nn.Module)
 
