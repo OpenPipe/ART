@@ -5,7 +5,6 @@ from datetime import timedelta
 import gc
 import json
 import os
-from typing import cast
 from unittest.mock import patch
 
 import pytest
@@ -16,21 +15,14 @@ import torch.multiprocessing as mp
 pytest.importorskip("megatron.core")
 
 from art.megatron.context_parallel import executor  # noqa: E402
-from art.megatron.context_parallel.runtime import (
-    prepare_megatron_context_parallel_state,
-)  # noqa: E402
-from art.megatron.context_parallel.types import (  # noqa: E402
-    ContextParallelConfig,
-    ParallelTopology,
-)
 from art.megatron.flex_attn import compiled  # noqa: E402
 from art.megatron.runtime.compile_cache import configure_reusable_backward  # noqa: E402
-from art.preprocessing.pack import PackedTensors  # noqa: E402
 from art.trainer_rank._graphs import GraphCache  # noqa: E402
 from art.trainer_rank._memory_policy import (  # noqa: E402
     ForwardMemoryCost,
     placement_cost,
 )
+from tests.support.cp_attention import prepare_cp2_attention  # noqa: E402
 
 
 @pytest.mark.skipif(
@@ -72,38 +64,7 @@ def _worker(rank, rendezvous):
 
 def _check(rank, device):
     length, heads, dim = 512, 2, 64
-    micro = cast(
-        PackedTensors,
-        {
-            "tokens": torch.arange(length)[None],
-            "group_ids": torch.ones((1, length), dtype=torch.long),
-            "parent_ids": torch.ones((1, length), dtype=torch.long),
-            "input_pos": torch.arange(length)[None],
-        },
-    )
-    state, plan, _, _ = prepare_megatron_context_parallel_state(
-        micro=micro,
-        topology=ParallelTopology(cp=2),
-        config=ContextParallelConfig(
-            planner_chunk_size=128, planner_owned_token_ms=1.0
-        ),
-        cp_group=dist.group.WORLD,
-        cp_rank=rank,
-        target_device=device,
-    )
-    indices = torch.tensor(
-        [
-            index
-            for start, end, _local_start in plan.token_layout_index.ownership_ranges_by_rank[
-                rank
-            ]
-            for index in range(start, end)
-        ],
-        device=device,
-    )
-    assert indices.numel() > 0
-    assert indices.numel() == sum(plan.local_valid_lengths)
-    executor.prepare_context_parallel_execution_state(state=state, device=device)
+    micro, state, plan, indices = prepare_cp2_attention(rank, device, length)
     torch.manual_seed(841)
     full = tuple(torch.randn(length, 1, heads, dim).to(device) for _ in range(3))
     local = tuple(value.index_select(0, indices) for value in full)
