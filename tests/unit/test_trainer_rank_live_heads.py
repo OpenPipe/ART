@@ -4,7 +4,7 @@ import asyncio
 from copy import deepcopy
 
 import pytest
-from test_trainer_rank_custom_tensors import _trainer
+from test_trainer_rank_custom_tensors import _trainer, _use_local_gradients
 import torch
 from torch.utils.checkpoint import checkpoint
 from trainer_rank_test_support import gloo_group
@@ -66,16 +66,7 @@ def _tensor(live: LiveHead) -> torch.Tensor:
 
 
 def _step(trainer, monkeypatch):
-    monkeypatch.setattr(
-        trainer,
-        "_reduce_dynamic_grads",
-        lambda params, **kwargs: tuple(
-            torch.zeros_like(p, dtype=torch.float32)
-            if p.grad is None
-            else p.grad.float()
-            for p in params
-        ),
-    )
+    _use_local_gradients(trainer, monkeypatch)
     trainer.optim_step(
         params=AdamParams(learning_rate=0.1, weight_decay=0.0), checkpoints=["student"]
     )

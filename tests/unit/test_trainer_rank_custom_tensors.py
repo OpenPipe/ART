@@ -10,7 +10,7 @@ import json
 from pathlib import Path
 import shutil
 from types import SimpleNamespace
-from typing import Any, Protocol, TypeVar, cast
+from typing import Any, cast
 
 import pytest
 import torch
@@ -24,7 +24,6 @@ from art.trainer_rank import (
     ModuleHandle,
     TrainerRank,
     TrainerRankSlotStateError,
-    Unset,
 )
 from art.trainer_rank._checkpoint import (
     PreparedCustomPayload,
@@ -34,34 +33,6 @@ from art.trainer_rank._checkpoint import (
     prepare_checkpoint,
 )
 from art.trainer_rank._impl import _CheckpointSlot
-
-ModuleT = TypeVar("ModuleT", bound=torch.nn.Module)
-
-
-class _CustomTensorAPI(Protocol):
-    def module(
-        self,
-        name: str,
-        factory: Callable[[], ModuleT],
-        *,
-        checkpoint: str | object = Unset,
-    ) -> ModuleHandle: ...
-
-    def parameter(
-        self,
-        name: str,
-        factory: Callable[[], torch.Tensor | torch.nn.Parameter],
-        *,
-        checkpoint: str | object = Unset,
-    ) -> torch.nn.Parameter: ...
-
-    def buffer(
-        self,
-        name: str,
-        factory: Callable[[], torch.Tensor],
-        *,
-        checkpoint: str | object = Unset,
-    ) -> torch.Tensor: ...
 
 
 class _ClassFactoryHead(torch.nn.Module):
@@ -160,11 +131,24 @@ def _config() -> dict[str, object]:
     }
 
 
-def _trainer(*names: str) -> tuple[TrainerRank, _CustomTensorAPI]:
+def _trainer(*names: str) -> tuple[TrainerRank, TrainerRank]:
     trainer = TrainerRank(_runtime())
     for name in names:
         trainer._checkpoint_slots[name] = _CheckpointSlot(config=cast(Any, _config()))
-    return trainer, cast(_CustomTensorAPI, trainer)
+    return trainer, trainer
+
+
+def _use_local_gradients(trainer: TrainerRank, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        trainer,
+        "_reduce_dynamic_grads",
+        lambda params, **_kwargs: tuple(
+            torch.zeros_like(param, dtype=torch.float32)
+            if param.grad is None
+            else param.grad.float()
+            for param in params
+        ),
+    )
 
 
 def test_custom_head_uses_model_hidden_size_before_forward() -> None:
@@ -633,16 +617,7 @@ def test_selected_optimizer_step_updates_only_its_custom_checkpoint(
     trainer, rank = _trainer("A", "B")
     a = rank.parameter("gain", lambda: torch.tensor(1.0), checkpoint="A")
     b = rank.parameter("gain", lambda: torch.tensor(2.0), checkpoint="B")
-    monkeypatch.setattr(
-        trainer,
-        "_reduce_dynamic_grads",
-        lambda params, **_kwargs: tuple(
-            torch.zeros_like(param, dtype=torch.float32)
-            if param.grad is None
-            else param.grad.float()
-            for param in params
-        ),
-    )
+    _use_local_gradients(trainer, monkeypatch)
     with trainer._gradient_transaction():
         (a * 3).backward()
     before_b = b.detach().clone()
@@ -660,16 +635,7 @@ def test_optimizer_skips_unused_custom_parameters(
     trainer, rank = _trainer("student")
     used = rank.parameter("used", lambda: torch.tensor(1.0), checkpoint="student")
     unused = rank.parameter("unused", lambda: torch.tensor(3.0), checkpoint="student")
-    monkeypatch.setattr(
-        trainer,
-        "_reduce_dynamic_grads",
-        lambda params, **_kwargs: tuple(
-            torch.zeros_like(param, dtype=torch.float32)
-            if param.grad is None
-            else param.grad.float()
-            for param in params
-        ),
-    )
+    _use_local_gradients(trainer, monkeypatch)
     with trainer._gradient_transaction():
         (used * 2).backward()
 
@@ -943,16 +909,7 @@ def test_custom_tensor_names_cannot_corrupt_lora_optimizer_metadata(
 ) -> None:
     trainer, rank = _real_lora_trainer()
     head = rank.module("layer", _CollisionHead, checkpoint="student")
-    monkeypatch.setattr(
-        trainer,
-        "_reduce_dynamic_grads",
-        lambda params, **_kwargs: tuple(
-            torch.zeros_like(param, dtype=torch.float32)
-            if param.grad is None
-            else param.grad.float()
-            for param in params
-        ),
-    )
+    _use_local_gradients(trainer, monkeypatch)
     with trainer._gradient_transaction():
         head.q_proj.lora_A.weight.sum().backward()
     trainer.optim_step(
@@ -1242,7 +1199,7 @@ def test_custom_checkpoint_rejects_factory_schema_mismatch(
         api.module("head", factory, checkpoint="student")
 
 
-def _real_lora_trainer() -> tuple[TrainerRank, _CustomTensorAPI]:
+def _real_lora_trainer() -> tuple[TrainerRank, TrainerRank]:
     trainer, api = _empty_real_lora_trainer()
     adapter = {
         "layer.q_proj.lora_A.weight": torch.tensor([[0.1, 0.2, 0.3], [0.4, 0.5, 0.6]]),
@@ -1256,16 +1213,16 @@ def _real_lora_trainer() -> tuple[TrainerRank, _CustomTensorAPI]:
     return trainer, api
 
 
-def _empty_real_lora_trainer() -> tuple[TrainerRank, _CustomTensorAPI]:
+def _empty_real_lora_trainer() -> tuple[TrainerRank, TrainerRank]:
     from art.megatron.lora import LoRA
 
     lora = LoRA("layer.q_proj", 3, 4, 2, 2, torch.float32, torch.device("cpu"))
     trainer = TrainerRank(_runtime(lora))
-    return trainer, cast(_CustomTensorAPI, trainer)
+    return trainer, trainer
 
 
 def _register_custom_tensors(
-    rank: _CustomTensorAPI,
+    rank: TrainerRank,
 ) -> tuple[ModuleHandle, torch.nn.Parameter, torch.Tensor]:
     head = rank.module("value_head", lambda: _ValueHead(3), checkpoint="student")
     temperature = rank.parameter(
@@ -1285,16 +1242,7 @@ def _step_custom_tensors(
     *,
     scale: float = 1.0,
 ) -> None:
-    monkeypatch.setattr(
-        trainer,
-        "_reduce_dynamic_grads",
-        lambda params, **_kwargs: tuple(
-            torch.zeros_like(param, dtype=torch.float32)
-            if param.grad is None
-            else param.grad.float()
-            for param in params
-        ),
-    )
+    _use_local_gradients(trainer, monkeypatch)
     hidden = torch.tensor([[0.25, -0.5, 1.0]])
     with trainer._gradient_transaction():
         (head(hidden).sum() + temperature * scale).backward()
