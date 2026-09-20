@@ -545,25 +545,22 @@ def _custom_tracker(custom: _CustomObject) -> _CustomTensorTracker:
     return cast(Any, custom.value)._art_tracker
 
 
-def _custom_parameters(custom: _CustomObject) -> dict[str, torch.nn.Parameter]:
-    if custom.kind == "module":
-        return dict(cast(torch.nn.Module, custom.value).named_parameters())
-    return (
-        {"": cast(torch.nn.Parameter, custom.value)}
-        if custom.kind == "parameter"
-        else {}
-    )
-
-
-def _custom_buffers(custom: _CustomObject) -> dict[str, torch.Tensor]:
-    if custom.kind == "module":
-        return dict(cast(torch.nn.Module, custom.value).named_buffers())
-    return {"": cast(torch.Tensor, custom.value)} if custom.kind == "buffer" else {}
+def _head_tensors(
+    kind: HeadKind, source: torch.nn.Module | torch.Tensor, *, parameters: bool
+) -> dict[str, torch.Tensor]:
+    if kind == "module":
+        module = cast(torch.nn.Module, source)
+        return dict(module.named_parameters() if parameters else module.named_buffers())
+    target_kind = "parameter" if parameters else "buffer"
+    return {"": cast(torch.Tensor, source)} if kind == target_kind else {}
 
 
 def export_head(trainer: TrainerRank, checkpoint: str, name: str) -> HeadState:
     custom = trainer._checkpoint_slots[checkpoint].custom[name]
-    parameters, buffers = _custom_parameters(custom), _custom_buffers(custom)
+    parameters, buffers = (
+        _head_tensors(custom.kind, custom.value, parameters=True),
+        _head_tensors(custom.kind, custom.value, parameters=False),
+    )
     return HeadState(
         trainer._capture_checkpoint_version(checkpoint),
         name,
@@ -721,7 +718,7 @@ def _stage_buffer_publications(trainer: TrainerRank, updates: Any) -> list[Any]:
             raise RuntimeError(
                 f"Custom module {update.name!r} buffers changed before publication"
             )
-        targets = _custom_buffers(custom)
+        targets = _head_tensors(custom.kind, custom.value, parameters=False)
         if update.buffers.keys() != targets.keys():
             raise ValueError("Custom module buffer keys changed before publication")
         values = []
@@ -752,7 +749,7 @@ def head_gradient_targets(
         version, max_gradient_staleness=metadata["max_gradient_staleness"]
     )
     custom = trainer._checkpoint_slots[version.checkpoint].custom[metadata["name"]]
-    parameters = _custom_parameters(custom)
+    parameters = _head_tensors(custom.kind, custom.value, parameters=True)
     if len(metadata["keys"]) != len(packet.gradients):
         raise ValueError("Custom head cotangent count does not match parameters")
     for key, gradient in zip(metadata["keys"], packet.gradients, strict=True):
@@ -772,7 +769,7 @@ def head_gradient_targets(
         (
             version,
             metadata["max_gradient_staleness"],
-            parameters[key],
+            cast(torch.nn.Parameter, parameters[key]),
             gradient.to(device=parameters[key].device, dtype=parameters[key].dtype)
             if materialize
             else gradient,
@@ -1086,20 +1083,10 @@ class LiveHead:
         self.invalid_reason = reason
 
     def parameters(self) -> dict[str, torch.Tensor]:
-        if self.state.kind == "module":
-            return dict(cast(torch.nn.Module, self.source).named_parameters())
-        return (
-            {"": cast(torch.Tensor, self.source)}
-            if self.state.kind == "parameter"
-            else {}
-        )
+        return _head_tensors(self.state.kind, self.source, parameters=True)
 
     def buffers(self) -> dict[str, torch.Tensor]:
-        if self.state.kind == "module":
-            return dict(cast(torch.nn.Module, self.source).named_buffers())
-        return (
-            {"": cast(torch.Tensor, self.source)} if self.state.kind == "buffer" else {}
-        )
+        return _head_tensors(self.state.kind, self.source, parameters=False)
 
     def capture(self, keys: tuple[str, ...] | None = None) -> dict[str, torch.Tensor]:
         import json
@@ -1235,7 +1222,7 @@ def synchronize_head_buffers(trainer: TrainerRank, checkpoints: Any = None) -> N
             if custom.kind == "parameter":
                 continue
             if custom.kind == "buffer":
-                buffers = _custom_buffers(custom)
+                buffers = _head_tensors(custom.kind, custom.value, parameters=False)
             else:
                 persistent = {
                     id(buffer)
@@ -1246,7 +1233,9 @@ def synchronize_head_buffers(trainer: TrainerRank, checkpoints: Any = None) -> N
                 }
                 buffers = {
                     key: value
-                    for key, value in _custom_buffers(custom).items()
+                    for key, value in _head_tensors(
+                        custom.kind, custom.value, parameters=False
+                    ).items()
                     if id(value) in persistent
                 }
             targets[(checkpoint, name)] = (_custom_tracker(custom), buffers)
