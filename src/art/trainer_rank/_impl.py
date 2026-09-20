@@ -1801,7 +1801,10 @@ class TrainerRank:
         *,
         checkpoint: AdapterSelection = Unset,
     ) -> torch.nn.Parameter:
-        """Return a replicated checkpoint-owned trainable parameter."""
+        """Register or retrieve a checkpoint-owned trainable tensor.
+
+        The tensor is replicated across TrainerRank processes.
+        """
         value = self._custom_object(name, "parameter", factory, checkpoint=checkpoint)
         return cast(torch.nn.Parameter, value)
 
@@ -1812,7 +1815,10 @@ class TrainerRank:
         *,
         checkpoint: AdapterSelection = Unset,
     ) -> torch.Tensor:
-        """Return a replicated checkpoint-owned persistent tensor."""
+        """Register or retrieve a checkpoint-owned persistent buffer.
+
+        The tensor is replicated across TrainerRank processes.
+        """
         value = self._custom_object(name, "buffer", factory, checkpoint=checkpoint)
         return cast(torch.Tensor, value)
 
@@ -2551,6 +2557,31 @@ class TrainerRank:
         no_grad: bool | None = None,
         yield_empty: bool = False,
     ) -> Iterator[MicroBatch[ForwardInputs, ForwardOutputs]]:
+        """Forward replicated inputs in adaptive data-parallel microbatches.
+
+        Per-input checkpoints and `no_grad` values override the method defaults.
+        `no_grad=None` inherits the ambient PyTorch grad mode; `True` disables
+        grads and `False` enables them.
+        Input and target tensors may be on a different device from the trainer;
+        ART moves its packed model inputs and labels internally without mutating
+        the caller-owned `ForwardInput` objects.
+
+        Per-position outputs contain the full flattened input sequence in source
+        order, including with context parallelism. Logical callbacks execute
+        once per DP rank; use `backward(loss)` to route cotangents to internal
+        TP/CP participants. Direct physical callers must invoke matching
+        forwards and backwards on their TP/CP peers. `reduce` combines only
+        distinct data-parallel batches.
+
+        Empty local microbatches are skipped unless `yield_empty=True`. Every
+        rank must use the same setting. When a wave skips ranks, TrainerRank
+        collective methods raise if called from its loop body; fully populated
+        waves permit them. Use `yield_empty=True` for per-wave collectives,
+        including reductions on ranks with no outputs. Exhaust or close a retained
+        iterator before making collective calls after an early exit. Guards apply
+        on the iterator's thread; raw torch.distributed calls are not guarded.
+        Collective calls must still match across ranks.
+        """
         if not isinstance(yield_empty, bool):
             raise TypeError("yield_empty must be a bool")
         enabled = torch.is_grad_enabled() if no_grad is None else not no_grad
@@ -2811,6 +2842,18 @@ class TrainerRank:
         checkpoint: AdapterSelection = Unset,
         no_grad: bool | None = None,
     ) -> ForwardOutputs:
+        """Forward inputs already local to this data-parallel rank.
+
+        Outputs contain full sequences in source order on every TP/CP rank,
+        with the same loss and reduction contract as `forward_batches`.
+
+        Per-input checkpoints and `no_grad` values override the method defaults.
+        `no_grad=None` inherits the ambient PyTorch grad mode; `True` disables
+        grads and `False` enables them.
+        Input and target tensors may be on a different device from the trainer;
+        ART moves its packed model inputs and labels internally without mutating
+        the caller-owned `ForwardInput` objects.
+        """
         self._guard_forward_collective("forward")
         enabled = torch.is_grad_enabled() if no_grad is None else not no_grad
         with torch.set_grad_enabled(enabled):
@@ -3438,6 +3481,7 @@ class TrainerRank:
         *,
         op: dist.ReduceOp.RedOpType = dist.ReduceOp.SUM,
     ) -> None:
+        """Reduce in place over data-parallel batches, excluding TP/CP replicas."""
         self._guard_forward_collective("reduce")
         from megatron.core import parallel_state as ps
 
@@ -3486,6 +3530,20 @@ class TrainerRank:
         checkpoints: Sequence[str] | None = None,
         on_live_graphs: Literal["allow", "error"] = "allow",
     ) -> dict[str, float]:
+        """Step checkpoint slots that have accumulated gradients.
+
+        A mapping assigns independent optimizer parameters to each checkpoint;
+        ``scale_grads`` may likewise map checkpoints to gradient scales. Mapping
+        keys select the checkpoints when ``checkpoints`` is omitted, and all
+        explicitly supplied checkpoint sets must match. Each checkpoint's gradient
+        norm is clipped independently. If any selected norm is nonfinite, no
+        selected checkpoint is updated.
+
+        Retained forwards use immutable checkpoint versions and may be consumed
+        after this step within their captured `max_gradient_staleness` policy.
+        Pass `on_live_graphs="error"` to additionally refuse updates while a
+        selected checkpoint still has a live forward graph on any rank.
+        """
         self._guard_forward_collective("optim_step")
         if on_live_graphs not in ("allow", "error"):
             raise ValueError(
