@@ -7,7 +7,13 @@ import pytest
 import torch
 from torch.utils.checkpoint import checkpoint
 
+from art.trainer_rank import ForwardOutput, TopK, TrainerRank
 from art.trainer_rank._graphs import GraphCache
+from art.trainer_rank._impl import _CheckpointSlot
+from art.trainer_rank._options import (
+    ImportanceSamplingGradientCorrection,
+    ResolvedForwardOptions,
+)
 
 
 def test_quantized_te_retained_backward_rejects_before_destructive_call():
@@ -275,12 +281,7 @@ def test_backward_uses_creation_order_not_wire_handle_order():
 def _corrected_cache(*, retention="gpu", policy="when_available", stale=True):
     from contextlib import contextmanager
 
-    from art.trainer_rank import ForwardOutput
     from art.trainer_rank._corrections import capture_forward_corrections
-    from art.trainer_rank._options import (
-        ImportanceSamplingGradientCorrection,
-        ResolvedForwardOptions,
-    )
 
     cache = GraphCache()
     original = torch.nn.Parameter(torch.tensor(-1.0))
@@ -353,12 +354,7 @@ def test_newer_replay_opportunistically_corrects_current_jacobian():
 def test_current_replay_rejects_changed_selected_token_events(corrections):
     from contextlib import nullcontext
 
-    from art.trainer_rank import ForwardOutput, TopK
     from art.trainer_rank._corrections import capture_forward_corrections
-    from art.trainer_rank._options import (
-        ImportanceSamplingGradientCorrection,
-        ResolvedForwardOptions,
-    )
 
     cache = GraphCache()
     parameter = torch.nn.Parameter(torch.tensor([1.0, 2.0]))
@@ -491,9 +487,6 @@ def test_replay_restores_original_autocast_context():
 
 
 def test_replay_failure_discards_transaction_and_releases_participating_records():
-    from art.trainer_rank import TrainerRank
-    from art.trainer_rank._impl import _CheckpointSlot
-
     trainer = TrainerRank.__new__(TrainerRank)
     parameter = torch.nn.Parameter(torch.tensor(2.0))
     trainer._checkpoint_slots = {"student": _CheckpointSlot(params=(parameter,))}

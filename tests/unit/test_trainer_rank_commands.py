@@ -18,6 +18,7 @@ from trainer_rank_test_support import gloo_group, megatron_topology
 
 from art.trainer_rank import (
     ForwardInput,
+    ForwardOptions,
     ForwardOutput,
     MicroBatch,
     MicroBatchStats,
@@ -26,6 +27,10 @@ from art.trainer_rank import (
     run_rank_callback,
     run_rank_callback_stream,
 )
+from art.trainer_rank._commands import _Executor, _OutputPacket, _view
+from art.trainer_rank._heads import LiveHead
+from art.trainer_rank._impl import _rebuild_forward_tree
+from art.trainer_rank._tensors import CotangentCollector, detach_tree
 
 
 class _Rank:
@@ -51,8 +56,6 @@ class _Rank:
             with torch.set_grad_enabled(enabled):
                 value = tree.input_tokens.float() * self.weight
             return ForwardOutput(None, None, None, value)
-        from art.trainer_rank._impl import _rebuild_forward_tree
-
         return _rebuild_forward_tree(
             tree, [self.forward(child, **kwargs) for child in tree]
         )
@@ -194,8 +197,6 @@ def test_native_facade_owns_backward_and_hides_zero_reduce():
 
 def test_client_packet_registry_survives_callbacks():
     rank: Any = _Rank()
-    from art.trainer_rank._tensors import CotangentCollector
-
     packet = asyncio.run(
         run_rank_callback(
             rank,
@@ -549,8 +550,6 @@ def test_released_client_graph_releases_physical_bridge():
 
 
 def test_forward_batches_captures_policy_before_iteration():
-    from art.trainer_rank import ForwardOptions
-
     rank = object.__new__(TrainerRank)
     rank._forward_options = ForwardOptions(max_gradient_staleness=1, allow_replay=False)
     rank._skipped_forward_waves = {}
@@ -590,9 +589,6 @@ def test_tuple_root_and_nested_tuple_shape(mode):
 
 def test_logical_head_factory_runs_once_and_head_only_client_backward():
     from test_trainer_rank_custom_tensors import _trainer
-
-    from art.trainer_rank._heads import LiveHead
-    from art.trainer_rank._tensors import CotangentCollector
 
     trainer, _ = _trainer("student")
     calls = []
@@ -661,9 +657,6 @@ def test_logical_iterator_captures_ambient_grad_mode(enabled):
 
 
 def test_persistent_iterator_binds_policy_and_checkpoint_and_pulls_one_wave():
-    from art.trainer_rank import ForwardOptions
-    from art.trainer_rank._tensors import CotangentCollector
-
     class Rank(_Rank):
         _capture_forward_options = TrainerRank._capture_forward_options
 
@@ -747,10 +740,6 @@ def test_persistent_iterator_captures_no_grad_before_next_callback():
 
 def test_nested_aggregate_outputs_admit_before_any_model_copy():
     from dataclasses import replace
-
-    from art.trainer_rank import ForwardOptions
-    from art.trainer_rank._commands import _Executor, _OutputPacket, _view
-    from art.trainer_rank._tensors import detach_tree
 
     rank: Any = _Rank()
     rank._available_memory_bytes = lambda: 1024 * 1024

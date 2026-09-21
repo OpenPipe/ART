@@ -10,7 +10,7 @@ import torch
 from art.trainer_rank import ForwardOptions, TrainerRankMemoryError, _impl
 from art.trainer_rank._commands import _Executor
 from art.trainer_rank._heads import LiveHead, export_head
-from art.trainer_rank._tensors import CotangentCollector
+from art.trainer_rank._tensors import CotangentCollector, detach_tree
 
 
 class _Head(torch.nn.Module):
@@ -67,8 +67,6 @@ def test_registered_head_forward_admission_and_native_backward(
             torch.ones(4, requires_grad=True),
             retention="replay",
         )
-        from art.trainer_rank._tensors import detach_tree
-
         value = rank._forward_cotangent_collector().attach(
             detach_tree(handle, tensors)
         )[0]
@@ -113,8 +111,6 @@ def test_late_registration_admits_known_staging_and_preserves_old_graph(
     assert cache.handles() == (handle,)
     monkeypatch.setattr(rank, "_available_memory_bytes", lambda: 292)
     head = rank.module("head", _Head, checkpoint="student")
-    from art.trainer_rank._tensors import detach_tree
-
     value = rank._forward_cotangent_collector().attach(detach_tree(handle, outputs))[0]
     rank.backward(head(value).sum())
     torch.testing.assert_close(
@@ -191,8 +187,6 @@ def test_nontrainable_registration_preserves_pending_graph_workspace(
     monkeypatch.setattr(rank, "_available_memory_bytes", lambda: 100)
     register()
     assert rank._checkpoint_slots["student"].params == ()
-    from art.trainer_rank._tensors import detach_tree
-
     value = rank._forward_cotangent_collector().attach(detach_tree(handle, outputs))[0]
     rank.backward(value.sum())
     assert not cache.handles()

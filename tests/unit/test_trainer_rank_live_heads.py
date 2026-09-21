@@ -16,8 +16,10 @@ from art.trainer_rank._heads import (
     execute_head_operation,
     export_head,
     head_gradient_targets,
+    logical_register_head,
 )
-from art.trainer_rank._tensors import CotangentCollector
+from art.trainer_rank._options import ForwardOptions
+from art.trainer_rank._tensors import CotangentCollector, detach_tree
 
 
 class TiedHead(torch.nn.Module):
@@ -262,8 +264,6 @@ def test_forward_hooks_see_captured_parameters_and_ties():
 
 
 def test_constructor_staleness_applies_to_heads_before_mutating_gradients():
-    from art.trainer_rank._options import ForwardOptions
-
     trainer, rank = _trainer("student")
     setattr(trainer, "_forward_options", ForwardOptions(max_gradient_staleness=0))
     head = rank.module("head", TiedHead, checkpoint="student")
@@ -429,8 +429,6 @@ def test_client_parameter_mutations_fail_before_changing_owned_values(mutation):
 
 
 def test_head_export_preserves_strict_constructor_policy_for_client():
-    from art.trainer_rank._options import ForwardOptions
-
     trainer, rank = _trainer("student")
     setattr(trainer, "_forward_options", ForwardOptions(max_gradient_staleness=0))
     rank.parameter("gain", lambda: torch.tensor(2.0), checkpoint="student")
@@ -553,8 +551,6 @@ def test_client_reused_module_factory_does_not_share_checkpoint_handles():
 
 @pytest.mark.parametrize("operation", ("model_first", "parameter_first", "linear"))
 def test_managed_model_operand_captures_live_parameter_and_keeps_old_version(operation):
-    from art.trainer_rank._tensors import detach_tree
-
     trainer, native = _native_head(
         "parameter", "weight", lambda: torch.tensor([2.0, 4.0])
     )
@@ -936,8 +932,6 @@ def test_inplace_operation_snapshots_readonly_client_tensor(kind):
 
 def test_logical_callback_reentrant_head_rejects_before_gradient_publication():
     from types import SimpleNamespace
-
-    from art.trainer_rank._heads import logical_register_head
 
     trainer, _ = _trainer("student")
     collector = CotangentCollector()
