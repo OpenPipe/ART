@@ -14,7 +14,7 @@ import gzip
 import hashlib
 import json
 import logging
-import string
+import re
 import sys
 import time
 from typing import Sequence
@@ -32,6 +32,7 @@ COMPACT_PREFIX_HEADER_DECODE_LIMIT = 64 * 1024
 # Keep the original wire domain so deployed prefix stores remain compatible.
 _DIGEST_DOMAIN = b"caladan-token-prefix\0" + COMPACT_PREFIX_VERSION.encode() + b"\0"
 _MAX_PREFIX_TOKENS = 262_144
+_TOKEN_DIGEST = re.compile(r"[0-9a-fA-F]{64}")
 _SharedPrefixEntry = tuple[str, list[int], list[int], str, tuple["PrefixEdit", ...]]
 
 
@@ -242,11 +243,8 @@ def compact_candidate_from_payload(value: object) -> CompactPrefixCandidate:
         or not 0 < rendered_length <= _MAX_PREFIX_TOKENS
         or not isinstance(rendered_digest, str)
         or not isinstance(raw_digest, str)
-        or any(
-            len(digest) != 64
-            or any(character not in string.hexdigits for character in digest)
-            for digest in (rendered_digest, raw_digest)
-        )
+        or _TOKEN_DIGEST.fullmatch(rendered_digest) is None
+        or _TOKEN_DIGEST.fullmatch(raw_digest) is None
         or not isinstance(raw_edits, list)
         or len(raw_edits) > 256
     ):
