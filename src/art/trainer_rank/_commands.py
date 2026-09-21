@@ -830,7 +830,7 @@ class _RankView:
         try:
             batch = self._combine_wave(self._invoke("batches_next", handle), items)
         except BaseException:
-            self.close_forward_batches(handle)
+            self._close_failed_iterator("batches_close", handle)
             raise
         if batch is None:
             self.close_forward_batches(handle)
@@ -839,6 +839,13 @@ class _RankView:
     def close_forward_batches(self, handle: str) -> None:
         self._invoke("batches_close", handle)
 
+    def _close_failed_iterator(self, operation: str, handle: int | str) -> None:
+        try:
+            # Pending releases and head publication must not prevent closure.
+            self._executor.invoke(operation, handle)
+        except BaseException:
+            pass  # Preserve the delivery error and any queued graph release.
+
     def _iterate_batches(
         self,
         items: Any,
@@ -846,11 +853,16 @@ class _RankView:
         handles: list[str] | None = None,
     ) -> Iterator[_impl.MicroBatch]:
         identifier = self._invoke("batches", items, **kwargs)
+        delivery_failed = False
         try:
             while True:
-                batch = self._combine_wave(
-                    self._invoke("next", identifier), items, handles
-                )
+                try:
+                    batch = self._combine_wave(
+                        self._invoke("next", identifier), items, handles
+                    )
+                except BaseException:
+                    delivery_failed = True
+                    raise
                 if batch is None:
                     return
                 yield batch
@@ -858,7 +870,10 @@ class _RankView:
             # This iterator belongs to its creating callback, even if a retained
             # traceback delays its finalizer until a later callback is serving.
             if not self._executor.stopped:
-                self._invoke("close", identifier)
+                if delivery_failed:
+                    self._close_failed_iterator("close", identifier)
+                else:
+                    self._invoke("close", identifier)
 
     def _combine_wave(
         self, wave: Any, items: Any, accumulated: list[str] | None = None

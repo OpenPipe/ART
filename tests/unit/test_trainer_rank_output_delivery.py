@@ -210,33 +210,114 @@ def test_later_packet_failure_releases_every_physical_owner(monkeypatch, kind):
         assert rank.weight.grad.item() == 7
 
 
+@pytest.mark.parametrize(
+    "delivery,close_error",
+    [
+        ("rank", False),
+        ("iterator", False),
+        ("persistent", False),
+        ("iterator", True),
+        ("persistent", True),
+    ],
+)
 def test_failed_release_preserves_delivery_error_and_retries_without_head_flush(
-    monkeypatch,
+    monkeypatch, delivery, close_error
 ):
     rank = _CachedRank()
-    executor = _Executor(rank, "rank")
+    executor = _Executor(rank, "rank" if delivery == "rank" else "zero")
     view = _view(executor)
     invoke = executor.invoke
-    failed = False
+    release_calls = 0
     flushes = []
 
-    def release_once(operation, *args, **kwargs):
-        nonlocal failed
-        if operation == "release" and not failed:
-            failed = True
-            raise RuntimeError("injected release failure")
+    def fail_release(operation, *args, **kwargs):
+        nonlocal release_calls
+        if operation == "release":
+            release_calls += 1
+            if release_calls <= (1 if delivery == "rank" else 2):
+                raise RuntimeError("injected release failure")
         return invoke(operation, *args, **kwargs)
 
-    monkeypatch.setattr(executor, "invoke", release_once)
+    monkeypatch.setattr(executor, "invoke", fail_release)
     monkeypatch.setattr(view, "_flush_heads", lambda: flushes.append(True))
     with monkeypatch.context() as patch:
+        if close_error:
+            batches = rank.forward_batches
+
+            def fail_close(*args, **kwargs):
+                try:
+                    yield from batches(*args, **kwargs)
+                finally:
+                    raise RuntimeError("injected iterator close failure")
+
+            patch.setattr(rank, "forward_batches", fail_close)
         error, _ = _fail_delivery(patch, executor, "copy")
+        if delivery == "iterator":
+            iterator = view.forward_batches([_input(3)])
+            advance = lambda: next(iterator)
+        elif delivery == "persistent":
+            handle = view.open_forward_batches([_input(3)])
+            advance = lambda: view.next_forward_batch(handle)
+        else:
+            advance = lambda: view.forward(_input(3))
         with pytest.raises(MemoryError) as failure:
-            view.forward(_input(3))
+            advance()
         assert failure.value is error and error.__traceback__ is not None
-        assert failed and len(flushes) == 1
+        assert release_calls == 1
+        assert len(flushes) == (1 if delivery == "rank" else 2)
+        assert not executor.iterators and not executor.state.iterators
+        assert not executor.state.batch_inputs
+        assert rank.closed == int(delivery != "rank")
+        assert executor.state.released == set(executor.state.graphs)
+        assert executor.state.graphs and rank.cache.handles()
+    if delivery != "rank":
+        with pytest.raises(RuntimeError, match="injected release failure"):
+            view.optim_step()
+        assert release_calls == 2 and rank.steps == 0 and len(flushes) == 2
         assert executor.state.released == set(executor.state.graphs)
         assert executor.state.graphs and rank.cache.handles()
     assert view.optim_step() == {"steps": 1}
     assert not executor.state.released and not executor.state.graphs
     assert not rank.cache.handles()
+    assert all(record() is None for record in rank.records)
+    view.backward(view.forward(_input(7)).hidden_states.sum())
+    assert rank.weight.grad.item() == 7
+    assert not executor.state.graphs and not rank.cache.handles()
+
+
+@pytest.mark.parametrize("ending", ["exhaust", "close", "throw", "close_error"])
+def test_non_delivery_iterator_closure_keeps_head_publication(monkeypatch, ending):
+    rank = _CachedRank()
+    executor = _Executor(rank, "zero")
+    view = _view(executor)
+    flushes = []
+    fail = False
+
+    def flush():
+        flushes.append(True)
+        if fail:
+            raise RuntimeError("injected close head publication failure")
+
+    monkeypatch.setattr(view, "_flush_heads", flush)
+    iterator = view.forward_batches([_input(3)])
+    output = next(iterator).outputs[0]
+    assert len(flushes) == 2
+    if ending == "exhaust":
+        with pytest.raises(StopIteration):
+            next(iterator)
+    elif ending == "throw":
+        with pytest.raises(ValueError, match="consumer failure"):
+            iterator.throw(ValueError("consumer failure"))
+    elif ending == "close_error":
+        fail = True
+        with pytest.raises(RuntimeError, match="close head publication failure"):
+            iterator.close()
+        assert rank.closed == 0 and executor.iterators
+    else:
+        iterator.close()
+    assert len(flushes) == (4 if ending == "exhaust" else 3)
+    executor.stop()
+    assert rank.closed == 1 and not executor.iterators
+    _view(_Executor(rank, "zero")).backward(output.hidden_states.sum())
+    assert rank.weight.grad.item() == 3
+    assert not executor.state.graphs and not rank.cache.handles()
