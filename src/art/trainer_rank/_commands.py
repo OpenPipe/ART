@@ -866,6 +866,7 @@ class _RankView:
                 if batch is None:
                     return
                 yield batch
+                del batch
         finally:
             # This iterator belongs to its creating callback, even if a retained
             # traceback delays its finalizer until a later callback is serving.

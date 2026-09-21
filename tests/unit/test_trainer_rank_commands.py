@@ -10,6 +10,7 @@ import sys
 import threading
 from types import SimpleNamespace
 from typing import Any
+import weakref
 
 import pytest
 import torch
@@ -655,6 +656,34 @@ def test_logical_iterator_captures_ambient_grad_mode(enabled):
         iterator.close()
 
     asyncio.run(run_rank_callback(rank, callback, mode="zero"))
+
+
+@pytest.mark.parametrize("mode", ["rank", "zero"])
+def test_logical_iterator_releases_previous_batch_before_next_forward(mode):
+    previous = []
+
+    class Rank(_Rank):
+        def forward(self, tree, **kwargs):
+            assert all(reference() is None for reference in previous)
+            return super().forward(tree, **kwargs)
+
+    rank: Any = Rank()
+
+    def callback(view):
+        for batch in view.forward_batches([_input(3), _input(5)]):
+            previous[:] = [
+                weakref.ref(batch),
+                weakref.ref(batch.outputs[0]),
+                weakref.ref(batch.outputs[0].hidden_states),
+            ]
+            view.backward(batch.outputs[0].hidden_states.sum())
+            assert not rank._rank_command_state.graphs
+            del batch
+
+    asyncio.run(run_rank_callback(rank, callback, mode=mode))
+    assert rank.weight.grad.item() == 8
+    assert rank.closed == 1
+    assert all(reference() is None for reference in previous)
 
 
 def test_persistent_iterator_binds_policy_and_checkpoint_and_pulls_one_wave():
