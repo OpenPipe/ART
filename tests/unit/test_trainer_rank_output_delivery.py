@@ -1,7 +1,9 @@
 """Undelivered logical outputs must not retain physical forward graphs."""
 
+from collections.abc import Generator
 from dataclasses import replace
 from functools import partial
+from typing import Any
 import weakref
 
 import pytest
@@ -97,7 +99,7 @@ def _fail_delivery(monkeypatch, executor, kind, *, packet_number=1):
 def test_failed_delivery_releases_registered_graph_and_native_cache(
     monkeypatch, mode, kind
 ):
-    rank = _CachedRank()
+    rank: Any = _CachedRank()
     executor = _Executor(rank, mode)
     view = _view(executor)
     with monkeypatch.context() as patch:
@@ -119,7 +121,7 @@ def test_failed_delivery_releases_registered_graph_and_native_cache(
 def test_later_wave_failure_keeps_only_previously_delivered_outputs(
     monkeypatch, delivery
 ):
-    rank = _CachedRank()
+    rank: Any = _CachedRank()
     executor = _Executor(rank, "zero")
     view = _view(executor)
     requests = [_input(3), _input(5)]
@@ -132,7 +134,9 @@ def test_later_wave_failure_keeps_only_previously_delivered_outputs(
             advance = lambda: next(iterator)
         elif delivery == "persistent":
             handle = view.open_forward_batches(requests)
-            delivered = view.next_forward_batch(handle).outputs[0]
+            batch = view.next_forward_batch(handle)
+            assert batch is not None
+            delivered = batch.outputs[0]
             advance = lambda: view.next_forward_batch(handle)
         else:
             advance = lambda: view.forward(requests)
@@ -157,7 +161,7 @@ def test_later_wave_failure_keeps_only_previously_delivered_outputs(
 
 @pytest.mark.parametrize("kind", ["copy", "attach", "assembly"])
 def test_later_packet_failure_releases_every_physical_owner(monkeypatch, kind):
-    ranks = [_CachedRank(dp, 2) for dp in range(2)]
+    ranks: list[Any] = [_CachedRank(dp, 2) for dp in range(2)]
     executors = [_Executor(rank, "zero") for rank in ranks]
     view = _view(executors[0])
     invoke = executors[0].invoke
@@ -223,7 +227,7 @@ def test_later_packet_failure_releases_every_physical_owner(monkeypatch, kind):
 def test_failed_release_preserves_delivery_error_and_retries_without_head_flush(
     monkeypatch, delivery, close_error
 ):
-    rank = _CachedRank()
+    rank: Any = _CachedRank()
     executor = _Executor(rank, "rank" if delivery == "rank" else "zero")
     view = _view(executor)
     invoke = executor.invoke
@@ -287,7 +291,7 @@ def test_failed_release_preserves_delivery_error_and_retries_without_head_flush(
 
 @pytest.mark.parametrize("ending", ["exhaust", "close", "throw", "close_error"])
 def test_non_delivery_iterator_closure_keeps_head_publication(monkeypatch, ending):
-    rank = _CachedRank()
+    rank: Any = _CachedRank()
     executor = _Executor(rank, "zero")
     view = _view(executor)
     flushes = []
@@ -301,6 +305,7 @@ def test_non_delivery_iterator_closure_keeps_head_publication(monkeypatch, endin
     monkeypatch.setattr(view, "_flush_heads", flush)
     iterator = view.forward_batches([_input(3)])
     output = next(iterator).outputs[0]
+    assert isinstance(iterator, Generator)
     assert len(flushes) == 2
     if ending == "exhaust":
         with pytest.raises(StopIteration):
