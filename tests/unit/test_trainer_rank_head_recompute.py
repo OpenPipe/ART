@@ -344,13 +344,19 @@ def _check_context_parallel_case(
 
 
 @pytest.mark.parametrize("grad", [False, True])
-@pytest.mark.parametrize("mode", ["target", "logits", "topk", "target_logits", "target_topk_logits"])
+@pytest.mark.parametrize(
+    "mode", ["target", "logits", "topk", "target_logits", "target_topk_logits"]
+)
 def test_prior_chunk_references_end_before_next_stats(monkeypatch, grad, mode):
     _patch_local_head(monkeypatch)
     monkeypatch.setattr(_impl, "_HEAD_CHUNK_TOKENS", 4)
     original_local = TrainerRank._local_logits_from_hidden_rows
     original_exp = torch.exp
-    has_target, has_logits, has_topk = "target" in mode, "logits" in mode, "topk" in mode
+    has_target, has_logits, has_topk = (
+        "target" in mode,
+        "logits" in mode,
+        "topk" in mode,
+    )
 
     refs, previous_live, observations = [], [], []
 
@@ -369,9 +375,10 @@ def test_prior_chunk_references_end_before_next_stats(monkeypatch, grad, mode):
             frame = sys._getframe().f_back
             while frame.f_code.co_name != "_project_vocab_parallel":
                 frame = frame.f_back
-            prior = [frame.f_locals.get(name) for name in (
-                "local_logits", "chunk_logits", "selected_logits"
-            )]
+            prior = [
+                frame.f_locals.get(name)
+                for name in ("local_logits", "chunk_logits", "selected_logits")
+            ]
             prior = [tensor for tensor in prior if isinstance(tensor, torch.Tensor)]
             assert not prior
             assert refs[0]() is None
@@ -386,7 +393,9 @@ def test_prior_chunk_references_end_before_next_stats(monkeypatch, grad, mode):
     )
     r = object.__new__(TrainerRank)
     r.runtime = SimpleNamespace(model=[model])
-    x = (torch.arange(40, dtype=torch.bfloat16).reshape(8, 5) / 100).requires_grad_(grad)
+    x = (torch.arange(40, dtype=torch.bfloat16).reshape(8, 5) / 100).requires_grad_(
+        grad
+    )
     item = ForwardInput(
         input_tokens=torch.arange(8),
         target_tokens=torch.arange(8) if has_target else None,
@@ -400,12 +409,23 @@ def test_prior_chunk_references_end_before_next_stats(monkeypatch, grad, mode):
         with torch.set_grad_enabled(grad):
             result = r._project_head(
                 [r._forward_item(item)],
-                SimpleNamespace(positions_by_item=(torch.arange(8),), source_positions_by_item=(torch.arange(8),)),
+                SimpleNamespace(
+                    positions_by_item=(torch.arange(8),),
+                    source_positions_by_item=(torch.arange(8),),
+                ),
                 x,
             )[0]
         assert previous_live == [False]
         assert observations == ([True] if has_target or has_topk else [])
-        outputs = [v for v in (result.target_logprobs, result.logits, result.top_k.logprobs if result.top_k else None) if v is not None]
+        outputs = [
+            v
+            for v in (
+                result.target_logprobs,
+                result.logits,
+                result.top_k.logprobs if result.top_k else None,
+            )
+            if v is not None
+        ]
         if grad:
             sum(v.float().sum() for v in outputs).backward()
             assert x.grad is not None and x.grad.isfinite().all()
