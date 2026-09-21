@@ -8,12 +8,18 @@ import weakref
 import pytest
 import torch
 
+from art.trainer_rank import (
+    TrainerRankMemoryError,
+    TrainerRankSlotStateError,
+    TrainerRankZero,
+)
 from art.trainer_rank._operations import (
     OperationId,
     OperationResultReleasedError,
     TrainerOperation,
     execute_operation,
 )
+from art.trainer_rank._tensors import CotangentCollector, CotangentPacket, detach_tree
 
 
 def _execute(
@@ -44,8 +50,6 @@ async def test_update_identity_replays_outcome_without_applying_again():
 
 
 async def test_failed_gradient_identity_preserves_original_error():
-    from art.trainer_rank import TrainerRankSlotStateError
-
     stale = TrainerRankSlotStateError("original forward is stale")
     calls = []
 
@@ -242,8 +246,6 @@ async def test_batch_pulls_and_close_are_identified_without_advancing_twice():
 async def test_failed_outcome_releases_traceback_activations_and_replays_error(
     unserializable,
 ):
-    from art.trainer_rank import TrainerRankMemoryError
-
     class UnserializableError(RuntimeError):
         def __reduce__(self):
             raise TypeError("cannot serialize this error")
@@ -319,9 +321,6 @@ async def test_failed_exported_backward_replays_once_and_releases_only_consumed_
     retain_graph,
     failure_stage,
 ):
-    from art.trainer_rank import TrainerRankZero
-    from art.trainer_rank._tensors import CotangentCollector, detach_tree
-
     state = SimpleNamespace(collector=CotangentCollector(), sequence=0, exports={})
     owner = SimpleNamespace()
     view = TrainerRankZero(
@@ -379,9 +378,6 @@ async def test_failed_exported_backward_replays_once_and_releases_only_consumed_
 
 
 async def test_malformed_nonretained_backward_preserves_unrelated_exports():
-    from art.trainer_rank import TrainerRankZero
-    from art.trainer_rank._tensors import CotangentCollector, CotangentPacket
-
     for handle, gradients in (("known", ()), ("missing", (torch.ones(1),))):
         state = SimpleNamespace(
             collector=CotangentCollector(),

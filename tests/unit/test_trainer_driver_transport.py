@@ -16,7 +16,7 @@ from art.trainer_rank import ForwardInput, ForwardOptions, ForwardOutput
 from art.trainer_rank._commands import _Executor, _view
 from art.trainer_rank._operations import TrainerOperation, execute_operation
 from art.trainer_rank._options import resolve_forward_options
-from art.trainer_rank._tensors import CotangentCollector, flatten_tensors
+from art.trainer_rank._tensors import CotangentCollector
 
 
 class _TransportRank(_Rank):
