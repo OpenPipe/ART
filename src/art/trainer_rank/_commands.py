@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncGenerator, Callable, Generator, Iterator, Sequence
-from contextlib import asynccontextmanager, nullcontext
+from contextlib import asynccontextmanager, contextmanager, nullcontext
 from dataclasses import dataclass, field, replace
 from functools import partial
 import inspect
@@ -764,16 +764,37 @@ class _RankView:
                 materialized = self._rank._capture_forward_options(
                     materialized, kwargs.get("options")
                 )
-            (packet,) = self._invoke("forward", materialized, **kwargs)
-            return self._attach(self._place_outputs([(packet, materialized)])[0])
+            packets = self._invoke("forward", materialized, **kwargs)
+            with self._release_on_error([packet.packet.handle for packet in packets]):
+                (packet,) = packets
+                return self._attach(self._place_outputs([(packet, materialized)])[0])
         single = isinstance(materialized, _impl.ForwardInput)
         roots = [materialized] if single else materialized
         outputs: list[Any] = []
-        for batch in self.forward_batches(roots, **kwargs):
-            outputs.extend(batch.outputs)
-        return (
-            outputs[0] if single else _impl._rebuild_forward_tree(materialized, outputs)
-        )
+        handles: list[str] = []
+        with self._release_on_error(handles):
+            items = self._prepare_batches(roots, kwargs)
+            for batch in self._iterate_batches(items, kwargs, handles):
+                outputs.extend(batch.outputs)
+            return (
+                outputs[0]
+                if single
+                else _impl._rebuild_forward_tree(materialized, outputs)
+            )
+
+    @contextmanager
+    def _release_on_error(self, handles: Sequence[str]) -> Iterator[None]:
+        try:
+            yield
+        except BaseException:
+            if handles:
+                try:
+                    # Followers must release their graphs too; head publication
+                    # is unrelated to reclaiming outputs never delivered.
+                    self._executor.invoke("release", tuple(handles))
+                except BaseException:
+                    self._executor.state.released.update(handles)
+            raise
 
     def forward_batches(self, inputs: Any, **kwargs: Any) -> Iterator[_impl.MicroBatch]:
         items = self._prepare_batches(inputs, kwargs)
@@ -819,12 +840,17 @@ class _RankView:
         self._invoke("batches_close", handle)
 
     def _iterate_batches(
-        self, items: Any, kwargs: dict[str, Any]
+        self,
+        items: Any,
+        kwargs: dict[str, Any],
+        handles: list[str] | None = None,
     ) -> Iterator[_impl.MicroBatch]:
         identifier = self._invoke("batches", items, **kwargs)
         try:
             while True:
-                batch = self._combine_wave(self._invoke("next", identifier), items)
+                batch = self._combine_wave(
+                    self._invoke("next", identifier), items, handles
+                )
                 if batch is None:
                     return
                 yield batch
@@ -834,7 +860,17 @@ class _RankView:
             if not self._executor.stopped:
                 self._invoke("close", identifier)
 
-    def _combine_wave(self, wave: Any, items: Any) -> _impl.MicroBatch | None:
+    def _combine_wave(
+        self, wave: Any, items: Any, accumulated: list[str] | None = None
+    ) -> _impl.MicroBatch | None:
+        handles = [packet.packet.handle for _, packet in wave if packet is not None]
+        with self._release_on_error(handles):
+            batch = self._assemble_wave(wave, items)
+            if accumulated is not None:
+                accumulated.extend(handles)
+            return batch
+
+    def _assemble_wave(self, wave: Any, items: Any) -> _impl.MicroBatch | None:
         if all(batch is None for batch, _ in wave):
             return None
         if any(batch is None for batch, _ in wave):
