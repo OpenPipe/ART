@@ -894,6 +894,7 @@ class ServerlessBackend:
         model: "Model",
         from_model: str,
         from_project: str | None = None,
+        from_entity: str | None = None,
         from_s3_bucket: str | None = None,
         not_after_step: int | None = None,
         verbose: bool = False,
@@ -912,6 +913,7 @@ class ServerlessBackend:
             model: The destination model to fork to.
             from_model: The name of the source model to fork from.
             from_project: The project of the source model. Defaults to model.project.
+            from_entity: The entity of the source model. Defaults to model.entity or api.default_entity.
             from_s3_bucket: Optional S3 bucket to pull the checkpoint from.
             not_after_step: If provided, uses the latest checkpoint <= this step.
             verbose: Whether to print verbose output.
@@ -976,7 +978,7 @@ class ServerlessBackend:
         else:
             # Pull from W&B artifacts
             api = wandb_sdk.api(api_key=self._client.api_key)
-            from_entity = model.entity or api.default_entity
+            from_entity = from_entity or model.entity or api.default_entity
 
             # Iterate all artifact versions to find the best step.
             # We avoid relying on the W&B `:latest` alias because it
@@ -1049,7 +1051,8 @@ class ServerlessBackend:
         # Copy provenance from the source model's W&B run to the destination model
         api = wandb_sdk.api(api_key=self._client.api_key)
         try:
-            source_run = api.run(f"{model.entity}/{from_project}/{from_model}")
+            source_entity = from_entity or model.entity
+            source_run = api.run(f"{source_entity}/{from_project}/{from_model}")
             source_provenance = source_run.config.get("wandb.provenance")
             if source_provenance is not None:
                 dest_run = model._get_wandb_run()

@@ -2228,6 +2228,7 @@ class LocalBackend:
         model: Model,
         from_model: str,
         from_project: str | None = None,
+        from_entity: str | None = None,
         from_s3_bucket: str | None = None,
         not_after_step: int | None = None,
         verbose: bool = False,
@@ -2239,6 +2240,7 @@ class LocalBackend:
             model: The model to fork to.
             from_model: The name of the model to fork from.
             from_project: The project of the model to fork from. Defaults to model.project.
+            from_entity: Optional entity of the model to fork from.
             from_s3_bucket: Optional S3 bucket to pull the checkpoint from. If provided,
                 will pull from S3 first. Otherwise, will fork from local disk.
             not_after_step: Optional step number. If provided, will copy the last saved

@@ -1044,6 +1044,7 @@ class TinkerNativeBackend:
         model: Model,
         from_model: str,
         from_project: str | None = None,
+        from_entity: str | None = None,
         from_s3_bucket: str | None = None,
         not_after_step: int | None = None,
         verbose: bool = False,
@@ -1058,6 +1059,7 @@ class TinkerNativeBackend:
             model: The destination model to fork to (must already be registered).
             from_model: The name of the source model to fork from.
             from_project: The project of the source model. Defaults to model.project.
+            from_entity: Optional entity of the model to fork from.
             from_s3_bucket: Not supported for TinkerNativeBackend.
             not_after_step: If provided, uses the latest checkpoint <= this step.
             verbose: Whether to print verbose output.
