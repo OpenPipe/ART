@@ -15,6 +15,7 @@ import hashlib
 import json
 import logging
 import re
+import string
 import sys
 import time
 from typing import Sequence
@@ -243,8 +244,18 @@ def compact_candidate_from_payload(value: object) -> CompactPrefixCandidate:
         or not 0 < rendered_length <= _MAX_PREFIX_TOKENS
         or not isinstance(rendered_digest, str)
         or not isinstance(raw_digest, str)
-        or _TOKEN_DIGEST.fullmatch(rendered_digest) is None
-        or _TOKEN_DIGEST.fullmatch(raw_digest) is None
+        or (
+            (
+                _TOKEN_DIGEST.fullmatch(rendered_digest) is None
+                or _TOKEN_DIGEST.fullmatch(raw_digest) is None
+            )
+            if type(rendered_digest) is str and type(raw_digest) is str
+            else any(
+                len(digest) != 64
+                or any(character not in string.hexdigits for character in digest)
+                for digest in (rendered_digest, raw_digest)
+            )
+        )
         or not isinstance(raw_edits, list)
         or len(raw_edits) > 256
     ):
