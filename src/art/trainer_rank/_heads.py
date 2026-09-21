@@ -1234,16 +1234,20 @@ def synchronize_head_buffers(trainer: TrainerRank, checkpoints: Any = None) -> N
         raise trainer._slot_state_error(
             "Custom buffer registrations differ across ranks"
         )
-    payload = (
-        {
-            key: (
-                tracker.buffer_revision,
-                {name: _plain(value).cpu() for name, value in buffers.items()},
-            )
-            for key, (tracker, buffers) in targets.items()
-        }
-        if dist.get_rank(group) == 0
-        else None
+    payload = _checkpoint._phase(
+        lambda: (
+            {
+                key: (
+                    tracker.buffer_revision,
+                    {name: _plain(value).cpu() for name, value in buffers.items()},
+                )
+                for key, (tracker, buffers) in targets.items()
+            }
+            if dist.get_rank(group) == 0
+            else None
+        ),
+        "snapshot synchronized buffers",
+        group,
     )
     authoritative = _checkpoint._gather(payload, group)[0]
     assert authoritative is not None

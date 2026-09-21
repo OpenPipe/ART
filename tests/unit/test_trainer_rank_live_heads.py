@@ -8,7 +8,7 @@ import pytest
 from test_trainer_rank_custom_tensors import _trainer, _use_local_gradients
 import torch
 from torch.utils.checkpoint import checkpoint
-from trainer_rank_test_support import gloo_group
+from trainer_rank_test_support import gloo_group, spawn_and_join
 
 from art.trainer_rank import AdamParams, ModuleHandle, run_rank_callback
 from art.trainer_rank._heads import (
@@ -295,6 +295,57 @@ def test_distributed_persistent_buffers_use_dp_zero_authority(tmp_path):
         args=(f"file://{tmp_path / 'heads'}",),
         nprocs=2,
         join=True,
+    )
+
+
+def _buffer_snapshot_failure_worker(process_rank, init_method):
+    import torch.distributed as dist
+
+    from art.trainer_rank import _heads
+
+    with gloo_group(process_rank, init_method, timeout=15):
+        trainer, rank = _trainer("student")
+        trainer._checkpoint_process_group = dist.group.WORLD
+        trainer._checkpoint_finalize_process_group = dist.group.WORLD
+        buffer = rank.buffer("counter", lambda: torch.tensor(1.0), checkpoint="student")
+        if process_rank == 1:
+            buffer.add_(1)
+        failure = MemoryError("authority buffer snapshot failed")
+
+        def fail_snapshot(value):
+            raise failure
+
+        with pytest.MonkeyPatch.context() as patch:
+            if process_rank == 0:
+                patch.setattr(_heads, "_plain", fail_snapshot)
+            with pytest.raises(
+                (MemoryError, RuntimeError), match="authority buffer snapshot failed"
+            ) as caught:
+                _heads.synchronize_head_buffers(trainer)
+            if process_rank == 0:
+                assert caught.value is failure
+            else:
+                assert isinstance(caught.value, RuntimeError)
+                assert "snapshot synchronized buffers" in str(caught.value)
+
+        assert buffer.item() == process_rank + 1
+        assert (
+            export_head(trainer, "student", "counter").buffer_revision == process_rank
+        )
+        completed = torch.tensor(1)
+        dist.all_reduce(completed, group=trainer._checkpoint_group())
+        assert completed.item() == 2
+        _heads.synchronize_head_buffers(trainer)
+        assert buffer.item() == 1
+        assert export_head(trainer, "student", "counter").buffer_revision == 2
+
+
+def test_distributed_authority_buffer_snapshot_failure_keeps_group_usable(tmp_path):
+    spawn_and_join(
+        _buffer_snapshot_failure_worker,
+        args=(f"file://{tmp_path / 'snapshot_failure'}",),
+        timeout=60,
+        failure="Authority buffer snapshot failure did not exit on every rank",
     )
 
 
