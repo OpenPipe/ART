@@ -34,7 +34,8 @@ _ResultT = TypeVar("_ResultT")
 _ValueT = TypeVar("_ValueT")
 _InputKind = Literal["trajectory", "group"]
 _Operation = Literal["tokenize", "tensorize"]
-_PROCESS_MAX_WORKERS = 4
+_PROCESS_MAX_WORKERS_DEFAULT = 4
+_PROCESS_MAX_WORKERS_CEILING = 16
 _PROCESS_MIN_ITEMS = 4
 _PROCESS_MIN_THREAD_SECONDS = 1.0
 _PROCESS_EXIT_GRACE_SECONDS = 5.0
@@ -64,6 +65,21 @@ def _cpu_capacity() -> int:
     if (limit := _cgroup_cpu_limit()) is not None:
         candidates.append(limit)
     return max(1, min(candidates))
+
+
+def _process_max_workers(capacity: int | None = None) -> int:
+    if raw := os.getenv("ART_TOKENIZE_PROCESSES"):
+        try:
+            val = int(raw)
+            if val > 0:
+                return val
+        except ValueError:
+            pass
+    cap = capacity if capacity is not None else _cpu_capacity()
+    return max(1, min(cap, _PROCESS_MAX_WORKERS_CEILING))
+
+
+_PROCESS_MAX_WORKERS = _process_max_workers()
 
 
 _EXECUTOR_LOCK = threading.Lock()
@@ -135,7 +151,10 @@ def _start_process_executor(
 ) -> tuple[ProcessPoolExecutor, int, tuple[Future[int], ...]]:
     global _PROCESS_EXECUTOR, _PROCESS_EXECUTOR_CAPACITY, _PROCESS_EXECUTOR_PID
     global _PROCESS_STARTUP
-    process_capacity = min(_PROCESS_MAX_WORKERS, capacity)
+    limit = _process_max_workers(capacity)
+    process_capacity = (
+        limit if "ART_TOKENIZE_PROCESSES" in os.environ else min(limit, capacity)
+    )
     pid = os.getpid()
     with _PROCESS_EXECUTOR_LOCK:
         if (
@@ -286,7 +305,7 @@ class _ProcessTuningState(_TuningState):
 
 @lru_cache(maxsize=128)
 def _process_tuning_state(key: tuple[object, ...]) -> _ProcessTuningState:
-    return _ProcessTuningState(_PROCESS_MAX_WORKERS)
+    return _ProcessTuningState(_process_max_workers())
 
 
 def _size_bucket(size: int) -> int:
@@ -389,7 +408,12 @@ def _observe(
 
 
 def _process_workers(key: tuple[object, ...], *, capacity: int, size: int) -> int:
-    limit = min(_PROCESS_MAX_WORKERS, capacity, size)
+    max_w = _process_max_workers(capacity)
+    limit = (
+        max(1, min(max_w, size))
+        if "ART_TOKENIZE_PROCESSES" in os.environ
+        else max(1, min(max_w, capacity, size))
+    )
     with _TUNING_LOCK:
         state = _process_tuning_state(key)
         return max(1, min(state.next_workers, limit))
@@ -406,7 +430,12 @@ def _observe_process(
 ) -> None:
     if units <= 0 or elapsed <= 0:
         return
-    limit = min(_PROCESS_MAX_WORKERS, capacity, size)
+    max_w = _process_max_workers(capacity)
+    limit = (
+        max(1, min(max_w, size))
+        if "ART_TOKENIZE_PROCESSES" in os.environ
+        else max(1, min(max_w, capacity, size))
+    )
     with _TUNING_LOCK:
         state = _process_tuning_state(key)
         if not state.warmed:
