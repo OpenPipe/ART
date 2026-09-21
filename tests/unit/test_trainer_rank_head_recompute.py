@@ -2,8 +2,10 @@ from __future__ import annotations
 
 from contextlib import nullcontext
 from datetime import timedelta
+import sys
 from types import SimpleNamespace
 from unittest.mock import patch
+import weakref
 
 import pytest
 import torch
@@ -339,3 +341,98 @@ def _check_context_parallel_case(
         dist.all_reduce(expected)
         expected *= 0.5 / cp_size
         torch.testing.assert_close(grad, expected, atol=2e-5, rtol=2e-5)
+
+
+@pytest.mark.parametrize("grad", [False, True])
+@pytest.mark.parametrize(
+    "mode", ["target", "logits", "topk", "target_logits", "target_topk_logits"]
+)
+def test_prior_chunk_references_end_before_next_stats(monkeypatch, grad, mode):
+    cuda_initialized = torch.cuda.is_initialized()
+    _patch_local_head(monkeypatch)
+    monkeypatch.setattr(_impl, "_HEAD_CHUNK_TOKENS", 4)
+    original_local = TrainerRank._local_logits_from_hidden_rows
+    original_exp = torch.exp
+    has_target, has_logits, has_topk = (
+        "target" in mode,
+        "logits" in mode,
+        "topk" in mode,
+    )
+
+    refs, previous_live, observations = [], [], []
+
+    def local(self, model, hidden, **kwargs):
+        if len(refs) == 1:
+            previous_live.append(refs[0]() is not None)
+        value = original_local(self, model, hidden, **kwargs)
+        refs.append(weakref.ref(value))
+        return value
+
+    def exp(subtraction):
+        value = original_exp(subtraction)
+        if len(refs) == 2 and not observations:
+            # Inspect only this boundary, after allocation. Do not retain
+            # a frame or a tensor between chunks to manufacture overlap.
+            frame = sys._getframe().f_back
+            while (
+                frame is not None and frame.f_code.co_name != "_project_vocab_parallel"
+            ):
+                frame = frame.f_back
+            assert frame is not None
+            prior = [
+                frame.f_locals.get(name)
+                for name in ("local_logits", "chunk_logits", "selected_logits")
+            ]
+            prior = [tensor for tensor in prior if isinstance(tensor, torch.Tensor)]
+            assert not prior
+            assert refs[0]() is None
+            observations.append(True)
+        return value
+
+    model = SimpleNamespace(
+        output_layer=_Head(torch.arange(85, dtype=torch.bfloat16).reshape(17, 5) / 100),
+        vocab_size=17,
+        share_embeddings_and_output_weights=False,
+        _scale_logits=lambda value: value,
+    )
+    r = object.__new__(TrainerRank)
+    r.runtime = SimpleNamespace(model=[model])
+    x = (torch.arange(40, dtype=torch.bfloat16).reshape(8, 5) / 100).requires_grad_(
+        grad
+    )
+    item = ForwardInput(
+        input_tokens=torch.arange(8),
+        target_tokens=torch.arange(8) if has_target else None,
+        top_k=2 if has_topk else None,
+        logits=has_logits,
+        no_grad=not grad,
+    )
+    with monkeypatch.context() as patch:
+        patch.setattr(TrainerRank, "_local_logits_from_hidden_rows", local)
+        patch.setattr(torch, "exp", exp)
+        with torch.set_grad_enabled(grad):
+            result = r._project_head(
+                [r._forward_item(item)],
+                SimpleNamespace(
+                    positions_by_item=(torch.arange(8),),
+                    source_positions_by_item=(torch.arange(8),),
+                ),
+                x,
+            )[0]
+        assert previous_live == [False]
+        assert observations == ([True] if has_target or has_topk else [])
+        outputs = [
+            v
+            for v in (
+                result.target_logprobs,
+                result.logits,
+                result.top_k.logprobs if result.top_k else None,
+            )
+            if v is not None
+        ]
+        if grad:
+            sum(v.float().sum() for v in outputs).backward()
+            assert x.grad is not None and x.grad.isfinite().all()
+            assert model.output_layer.weight.grad is not None
+            assert model.output_layer.weight.grad.isfinite().all()
+    assert torch.cuda.is_initialized() == cuda_initialized
