@@ -12,7 +12,7 @@ import pytest
 from test_trainer_rank_commands import _input, _Rank
 import torch
 
-from art.trainer_rank import ForwardInput, ForwardOptions, ForwardOutput
+from art.trainer_rank import ForwardInput, ForwardOptions, ForwardOutput, _tensors
 from art.trainer_rank._commands import _Executor, _view
 from art.trainer_rank._operations import TrainerOperation, execute_operation
 from art.trainer_rank._options import resolve_forward_options
@@ -201,8 +201,6 @@ async def test_export_failure_releases_only_failed_operation_and_counts_live_exp
     if failure_kind == "budget":
         rank._available_cpu_memory_bytes = constrained
     else:
-        from art.trainer_rank import _tensors
-
         detach = _tensors.detach_tree
 
         def reject_clone(handle, *args, **kwargs):

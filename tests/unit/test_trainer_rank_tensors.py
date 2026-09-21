@@ -1,8 +1,16 @@
 from __future__ import annotations
 
-from collections import OrderedDict, namedtuple
+from collections import OrderedDict, defaultdict, namedtuple
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
+import gc
 import pickle
+import subprocess
+import sys
+from threading import Event
+from types import SimpleNamespace
+from typing import cast
+import weakref
 
 import pytest
 import torch
@@ -306,9 +314,6 @@ def test_cpu_output_bridge_gpu_head_and_remote_model_cotangents():
 
 @pytest.mark.parametrize("managed", [False, True])
 def test_release_follows_dependent_loss_not_temporary_output(managed):
-    import gc
-    import weakref
-
     collector = CotangentCollector()
     released = []
     value = collector.attach(
@@ -332,8 +337,6 @@ def test_release_follows_dependent_loss_not_temporary_output(managed):
 
 
 def test_release_follows_retained_graph_and_all_output_branches():
-    import gc
-
     collector = CotangentCollector()
     released = []
     outputs = collector.attach(
@@ -360,8 +363,6 @@ def test_release_follows_retained_graph_and_all_output_branches():
 
 
 def test_release_dropped_and_nondifferentiable_packets():
-    import gc
-
     collector = CotangentCollector()
     released = []
     output = collector.attach(
@@ -458,9 +459,6 @@ def test_output_hooks_change_or_reject_collected_cotangents(managed):
 
 @pytest.mark.parametrize("managed", [False, True])
 def test_unrelated_failed_backward_cannot_enter_an_active_collection(managed):
-    from concurrent.futures import ThreadPoolExecutor
-    from threading import Event
-
     collector = CotangentCollector()
     a = collector.attach(
         detach_tree("a", torch.tensor(2.0, requires_grad=True)), managed=managed
@@ -693,9 +691,6 @@ def test_managed_ambiguous_cuda_devices_require_explicit_transfer():
     "container", ["set", "object", "tensor_key", "default_factory"]
 )
 def test_output_packets_reject_opaque_tensor_bearing_metadata(container):
-    from collections import defaultdict
-    from types import SimpleNamespace
-
     source = torch.tensor(3.0, requires_grad=True)
     tree = (
         {source}
@@ -711,9 +706,6 @@ def test_output_packets_reject_opaque_tensor_bearing_metadata(container):
 
 
 def test_graph_release_callback_does_not_run_at_interpreter_shutdown():
-    import subprocess
-    import sys
-
     result = subprocess.run(
         [
             sys.executable,
@@ -879,9 +871,6 @@ def test_managed_operands_defer_to_other_tensor_snapshot_dispatch(reverse):
 
 @pytest.mark.parametrize("fail", [False, True])
 def test_flatten_releases_tensor_references_without_cyclic_gc(fail):
-    import gc
-    import weakref
-
     @dataclass
     class Broken:
         value: int = 0
@@ -974,8 +963,6 @@ def test_duplicate_handle_sparse_cotangents_accumulate_in_any_order(device, layo
 
 
 def test_transformers_dataclass_mapping_packet_preserves_fields_entries_and_aliases():
-    from typing import cast
-
     from transformers.modeling_outputs import BaseModelOutput
 
     source = cast(torch.FloatTensor, torch.tensor([2.0, 3.0], requires_grad=True))
