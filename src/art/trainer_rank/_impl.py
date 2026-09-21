@@ -7251,6 +7251,7 @@ class TrainerRank:
                             k=min(k, int(selected_logits.shape[1])),
                             dim=-1,
                         )
+                        del selected_logits
                     values = _vocab_parallel_topk_from_local(
                         selected_values,
                         selected_tokens,
@@ -7263,6 +7264,8 @@ class TrainerRank:
                         raise RuntimeError("top_k output was not allocated")
                     current.logprobs[offsets] = values.logprobs
                     current.tokens[offsets] = values.tokens
+            # Do not retain prior chunk buffers while the next stats RHS runs.
+            del local_logits, chunk_logits
 
     def _local_head_stats(
         self,
