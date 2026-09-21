@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 from datetime import timedelta
 import gc
 import sys
@@ -739,8 +740,6 @@ def test_persistent_iterator_captures_no_grad_before_next_callback():
 
 
 def test_nested_aggregate_outputs_admit_before_any_model_copy():
-    from dataclasses import replace
-
     rank: Any = _Rank()
     rank._available_memory_bytes = lambda: 1024 * 1024
     view = _view(_Executor(rank, "zero"))

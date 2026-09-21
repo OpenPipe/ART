@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+from contextlib import contextmanager, nullcontext
 import gc
 from types import SimpleNamespace
+import weakref
 
 import pytest
 import torch
@@ -279,8 +281,6 @@ def test_backward_uses_creation_order_not_wire_handle_order():
 
 
 def _corrected_cache(*, retention="gpu", policy="when_available", stale=True):
-    from contextlib import contextmanager
-
     from art.trainer_rank._corrections import capture_forward_corrections
 
     cache = GraphCache()
@@ -352,8 +352,6 @@ def test_newer_replay_opportunistically_corrects_current_jacobian():
 
 @pytest.mark.parametrize("corrections", [False, True])
 def test_current_replay_rejects_changed_selected_token_events(corrections):
-    from contextlib import nullcontext
-
     from art.trainer_rank._corrections import capture_forward_corrections
 
     cache = GraphCache()
@@ -386,11 +384,6 @@ def test_current_replay_rejects_changed_selected_token_events(corrections):
 
 @pytest.mark.parametrize("checkpointing", [False, True])
 def test_abandoned_release_frees_physical_record_without_autograd(checkpointing):
-    import gc
-    import weakref
-
-    from torch.utils.checkpoint import checkpoint
-
     cache = GraphCache()
     parameter = torch.nn.Parameter(torch.randn(4, 4))
 
@@ -417,9 +410,6 @@ def test_abandoned_release_frees_physical_record_without_autograd(checkpointing)
 
 
 def test_backward_releases_unused_differentiable_output_branches():
-    import gc
-    import weakref
-
     cache = GraphCache()
     parameter = torch.nn.Parameter(torch.randn(4, 4))
     handle, outputs = cache.run(

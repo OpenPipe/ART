@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from copy import deepcopy
+from types import SimpleNamespace
 
 import pytest
 from test_trainer_rank_custom_tensors import _trainer, _use_local_gradients
@@ -931,8 +932,6 @@ def test_inplace_operation_snapshots_readonly_client_tensor(kind):
 
 
 def test_logical_callback_reentrant_head_rejects_before_gradient_publication():
-    from types import SimpleNamespace
-
     trainer, _ = _trainer("student")
     collector = CotangentCollector()
 
