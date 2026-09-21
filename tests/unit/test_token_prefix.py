@@ -281,11 +281,11 @@ def test_compact_payload_preserves_digest_subclass_validation(field: str) -> Non
 
     class ValidCharacters(str):
         def __iter__(self) -> Iterator[LiteralString]:
-            return iter("A" * 64)
+            return iter(("A",) * 64)
 
     class InvalidCharacters(str):
         def __iter__(self) -> Iterator[LiteralString]:
-            return iter("g")
+            return iter(("g",))
 
     candidate = compact_prefix_candidate([1, 2], [3, 2])
     payload = compact_candidate_payload(candidate)
