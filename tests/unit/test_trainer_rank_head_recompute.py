@@ -348,6 +348,7 @@ def _check_context_parallel_case(
     "mode", ["target", "logits", "topk", "target_logits", "target_topk_logits"]
 )
 def test_prior_chunk_references_end_before_next_stats(monkeypatch, grad, mode):
+    cuda_initialized = torch.cuda.is_initialized()
     _patch_local_head(monkeypatch)
     monkeypatch.setattr(_impl, "_HEAD_CHUNK_TOKENS", 4)
     original_local = TrainerRank._local_logits_from_hidden_rows
@@ -373,8 +374,11 @@ def test_prior_chunk_references_end_before_next_stats(monkeypatch, grad, mode):
             # Inspect only this boundary, after allocation. Do not retain
             # a frame or a tensor between chunks to manufacture overlap.
             frame = sys._getframe().f_back
-            while frame.f_code.co_name != "_project_vocab_parallel":
+            while (
+                frame is not None and frame.f_code.co_name != "_project_vocab_parallel"
+            ):
                 frame = frame.f_back
+            assert frame is not None
             prior = [
                 frame.f_locals.get(name)
                 for name in ("local_logits", "chunk_logits", "selected_logits")
@@ -431,4 +435,4 @@ def test_prior_chunk_references_end_before_next_stats(monkeypatch, grad, mode):
             assert x.grad is not None and x.grad.isfinite().all()
             assert model.output_layer.weight.grad is not None
             assert model.output_layer.weight.grad.isfinite().all()
-    assert not torch.cuda.is_initialized()
+    assert torch.cuda.is_initialized() == cuda_initialized
