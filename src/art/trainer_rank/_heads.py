@@ -106,6 +106,57 @@ _TENSOR_INSPECTION_PROPERTIES = frozenset(
         "volatile",
     }
 )
+_TENSOR_MUTATION_DUNDERS = frozenset(
+    {
+        "__setitem__",
+        "__set__",
+        "__iadd__",
+        "__isub__",
+        "__imul__",
+        "__itruediv__",
+        "__ifloordiv__",
+        "__imod__",
+        "__ipow__",
+        "__imatmul__",
+        "__iand__",
+        "__ior__",
+        "__ixor__",
+        "__ilshift__",
+        "__irshift__",
+    }
+)
+_CLIENT_BUFFER_MUTATIONS = (_TENSOR_MUTATION_DUNDERS - {"__set__", "__imatmul__"}) | {
+    "copy_",
+    "fill_",
+    "zero_",
+    "add_",
+    "sub_",
+    "mul_",
+    "div_",
+    "true_divide_",
+    "floor_divide_",
+    "remainder_",
+    "fmod_",
+    "pow_",
+    "lerp_",
+    "bitwise_and_",
+    "bitwise_or_",
+    "bitwise_xor_",
+    "bitwise_left_shift_",
+    "bitwise_right_shift_",
+    "masked_fill_",
+    "masked_scatter_",
+    "scatter_",
+    "scatter_add_",
+    "index_copy_",
+    "index_add_",
+    "index_fill_",
+    "index_put_",
+    "put_",
+    "clamp_",
+    "clamp_min_",
+    "clamp_max_",
+}
 
 
 def tensor_metadata_function(func: Callable[..., Any]) -> bool:
@@ -127,24 +178,7 @@ def mutates_tensor(func: Callable[..., Any], kwargs: Mapping[str, Any]) -> bool:
     name = getattr(func, "__name__", "")
     return (
         (name.endswith("_") and not name.endswith("__"))
-        or name
-        in {
-            "__setitem__",
-            "__set__",
-            "__iadd__",
-            "__isub__",
-            "__imul__",
-            "__itruediv__",
-            "__ifloordiv__",
-            "__imod__",
-            "__ipow__",
-            "__imatmul__",
-            "__iand__",
-            "__ior__",
-            "__ixor__",
-            "__ilshift__",
-            "__irshift__",
-        }
+        or name in _TENSOR_MUTATION_DUNDERS
         or kwargs.get("out") is not None
         or kwargs.get("inplace") is True
     )
@@ -914,53 +948,7 @@ class _ClientBuffer(torch.Tensor):
             for value in _walk_objects((args, kwargs))
         )
         if mutating and (
-            kwargs.get("out") is not None
-            or name
-            not in {
-                "__setitem__",
-                "__iadd__",
-                "__isub__",
-                "__imul__",
-                "__itruediv__",
-                "__ifloordiv__",
-                "__imod__",
-                "__ipow__",
-                "__iand__",
-                "__ior__",
-                "__ixor__",
-                "__ilshift__",
-                "__irshift__",
-                "copy_",
-                "fill_",
-                "zero_",
-                "add_",
-                "sub_",
-                "mul_",
-                "div_",
-                "true_divide_",
-                "floor_divide_",
-                "remainder_",
-                "fmod_",
-                "pow_",
-                "lerp_",
-                "bitwise_and_",
-                "bitwise_or_",
-                "bitwise_xor_",
-                "bitwise_left_shift_",
-                "bitwise_right_shift_",
-                "masked_fill_",
-                "masked_scatter_",
-                "scatter_",
-                "scatter_add_",
-                "index_copy_",
-                "index_add_",
-                "index_fill_",
-                "index_put_",
-                "put_",
-                "clamp_",
-                "clamp_min_",
-                "clamp_max_",
-            }
+            kwargs.get("out") is not None or name not in _CLIENT_BUFFER_MUTATIONS
         ):
             raise RuntimeError(
                 f"Unsupported checkpoint buffer mutation {name}; use buffer.copy_() with unchanged shape and dtype"
