@@ -54,6 +54,7 @@ from art.megatron.prefix_tree_packing import (
     _local_position_pairs,
     estimate_prefix_tree_packed_tokens,
 )
+from art.trainer_rank._backward_work import BackwardWork, region as _backward_region
 from art.trainer_rank._planner_cost import (
     COEFFICIENT_VERSION_FALLBACK,
     ModelGeometry,
@@ -576,7 +577,8 @@ class _CacheRecoveryState:
     first_consumed: bool = False
     invalid: bool = False
     owner: object | None = None
-    lock: Any = dataclass_field(default_factory=threading.Lock)
+    backward: BackwardWork | None = None
+    lock: Any = dataclass_field(default_factory=threading.RLock)
 
 
 @dataclass(frozen=True)
@@ -2344,6 +2346,9 @@ class TrainerRank:
         checkpoint: AdapterSelection,
         yield_empty: bool,
     ) -> Generator[MicroBatch[ForwardInputs, ForwardOutputs], None, None]:
+        backward = self._backward_work()
+        if backward is not None:
+            backward.harvest()
         items = [_materialize(item) for item in inputs]
         requests = list(_flatten(items))
         self._validate_replicated_top_level_count(len(items), yield_empty=yield_empty)
@@ -2394,6 +2399,8 @@ class TrainerRank:
                 # Do not retain our completed graph through a new handoff traceback.
                 del tracked_outputs, flat_outputs, outputs
                 raise
+            if backward is not None:
+                backward.attach(tracked_outputs)
             stop = start + candidate.stats_global_count
             if stop < len(items):
                 self._last_global_micro_batch_size = max(
@@ -2432,6 +2439,8 @@ class TrainerRank:
                         subforward_count=candidate.plan.subforward_count,
                     ),
                 )
+            if backward is not None:
+                backward.harvest()
             # The caller normally runs backward while the micro-batch is yielded.
             # Include that peak in future planning; forward-only profiling can
             # otherwise admit a later micro-batch that leaves no collective or
@@ -2447,6 +2456,7 @@ class TrainerRank:
             del tracked_outputs, flat_outputs, outputs
             start = stop
 
+    @_backward_region
     def _release_cached_memory_for_backward(
         self, plan: _AnyForwardPlan, *, error: BaseException | None = None
     ) -> None:
@@ -2543,6 +2553,9 @@ class TrainerRank:
         no_grad: bool | None = None,
     ) -> ForwardOutputs:
         self._guard_forward_collective("dp_rank_forward")
+        backward = self._backward_work()
+        if backward is not None:
+            backward.harvest()
         enabled = torch.is_grad_enabled() if no_grad is None else not no_grad
         with torch.set_grad_enabled(enabled):
             self._reset_planning_telemetry()
@@ -2554,6 +2567,8 @@ class TrainerRank:
             tracked_outputs = self._execute_admitted_plan(
                 plan, check=check, context="dp_rank_forward"
             )
+            if backward is not None:
+                backward.attach(tracked_outputs)
             return _unflatten(materialized, iter(tracked_outputs))
 
     def _execute_admitted_plan(
@@ -2569,6 +2584,7 @@ class TrainerRank:
         )
         return outputs
 
+    @_backward_region
     def _execute_split_plan_with_memory_tracking(
         self, plan: _SplitForwardPlan, *, check: _MemoryCheck, context: str
     ) -> tuple[list[AnyForwardOutput], int | None, int]:
@@ -4802,6 +4818,7 @@ class TrainerRank:
                 ).append(index)
         return tuple((slot_ref, tuple(indices)) for slot_ref, indices in groups.items())
 
+    @_backward_region
     def _run_flat_plan_with_memory_tracking(
         self,
         plan: _FlatForwardPlan,
@@ -5197,6 +5214,7 @@ class TrainerRank:
         dist.all_reduce(value, op=dist.ReduceOp.MIN)
         return int(value.item())
 
+    @_backward_region
     def _recover_admission(
         self,
         search: Callable[[], Any],
@@ -5345,6 +5363,25 @@ class TrainerRank:
             state = self._cache_recovery_state = _CacheRecoveryState()
         return state
 
+    def _backward_work(self) -> BackwardWork | None:
+        state = self._recovery_state()
+        started = None
+        try:
+            started = time.perf_counter_ns()
+            with state.lock:
+                if state.backward is None and not state.invalid:
+                    state.backward = BackwardWork(state.lock, self.device)
+                return state.backward
+        except BaseException:
+            # Unknown accounting cost must never become free recovery budget.
+            state.invalid = True
+            return None
+        finally:
+            if state.backward is not None:
+                # Includes lazy setup and lock wait; constructor overlap is an
+                # intentional conservative charge, not an exact subtraction.
+                state.backward._charge(started)
+
     def _recovery_reduce(
         self,
         values: list[float],
@@ -5394,27 +5431,39 @@ class TrainerRank:
         handoff_grad: bool = False,
     ) -> bool:
         state = self._recovery_state()
+        backward = self._backward_work()
+        if backward is not None:
+            backward.harvest()
         now = self._recovery_clock()
         elapsed = None if now is None or started is None else now - started
         with state.lock:
             invalid = (
                 state.invalid
+                or (backward is not None and backward.invalid)
                 or state.owner is not owner
                 or elapsed is None
                 or not math.isfinite(elapsed)
                 or elapsed < 0
             )
             projected = state.cost if elapsed is None else state.cost + elapsed
+            # B survives forward rollback. O deliberately includes observer spans
+            # also covered by recovery; reductions retain the original topology.
+            work = state.work + (0.0 if backward is None else backward.work_ns / 1e9)
+            accounted_cost = projected + (
+                0.0 if backward is None else backward.cost_ns / 1e9
+            )
             invalid |= any(
                 not math.isfinite(value) or value < 0
                 for value in (
                     projected,
                     state.work,
+                    work,
                     state.high,
                     projected + state.high,
+                    accounted_cost + state.high,
                 )
             )
-            local_cost = [0.0, 0.0] if invalid else [projected, state.high]
+            local_cost = [0.0, 0.0] if invalid else [accounted_cost, state.high]
         # SUM costs deliberately overcharges parallel ranks; unlike MAX of
         # lifetime costs, it cannot miss episodes with different slow ranks.
         costs = self._recovery_reduce(
@@ -5424,7 +5473,7 @@ class TrainerRank:
         values = self._recovery_reduce(
             [
                 float(check.estimated_required_bytes) if check is not None else 0.0,
-                0.0 if invalid else state.work,
+                0.0 if invalid else work,
                 float(state.first_consumed),
                 float(invalid),
             ],
