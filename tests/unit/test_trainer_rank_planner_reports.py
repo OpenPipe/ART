@@ -1,0 +1,292 @@
+from __future__ import annotations
+
+import json
+from pathlib import Path
+import stat
+from typing import Any
+
+import pytest
+
+from art.trainer_rank import _planner_misses as reports
+
+
+@pytest.fixture(autouse=True)
+def clear_sink():
+    reports.set_report_sink(None)
+    yield
+    reports.set_report_sink(None)
+
+
+def report(tmp_path: Path, **kwargs):
+    args: dict[str, Any] = dict(
+        predicted_peak_bytes=100,
+        observed_peak_bytes=120,
+        phase="forward_backward",
+        replay_factory=lambda: {"memory_replay": {"test": True}},
+    )
+    args.update(kwargs)
+    return reports.Reporter(5, spool_dir=tmp_path / "spool").report(**args)
+
+
+@pytest.mark.parametrize("value", ["-1", "nan", "inf", "-inf", "", "five"])
+def test_invalid_threshold_refuses(value):
+    with pytest.raises(ValueError):
+        reports.parse_options({reports.MISS_THRESHOLD_ENV: value})
+
+
+def test_options_are_independent_and_default_off():
+    assert reports.parse_options({}) == reports.Options()
+    assert reports.parse_options({reports.ALLOW_OVERSIZED_ENV: "1"}) == reports.Options(
+        True
+    )
+    assert reports.parse_options({reports.MISS_THRESHOLD_ENV: "5"}) == reports.Options(
+        False, 5
+    )
+    with pytest.raises(ValueError):
+        reports.parse_options({reports.ALLOW_OVERSIZED_ENV: "true"})
+
+
+@pytest.mark.parametrize(
+    "observed,emitted",
+    [(94, True), (95, False), (100, False), (105, False), (106, True)],
+)
+def test_threshold_strict_both_directions(tmp_path, observed, emitted):
+    called = []
+    path = report(
+        tmp_path,
+        observed_peak_bytes=observed,
+        replay_factory=lambda: called.append(True) or {},
+    )
+    assert (path is not None) == emitted
+    assert bool(called) == emitted
+    if emitted:
+        record = reports.validate_report(path.read_bytes())
+        assert record["error_pct"] == abs(observed - 100)
+    else:
+        assert not (tmp_path / "spool").exists()
+
+
+def test_disabled_oom_never_serializes_or_creates_spool(tmp_path):
+    reporter = reports.Reporter(spool_dir=tmp_path / "spool")
+    assert (
+        reporter.report(
+            predicted_peak_bytes=1,
+            observed_peak_bytes=None,
+            oom=True,
+            phase="backward",
+            replay_factory=lambda: pytest.fail("serialized"),
+        )
+        is None
+    )
+    assert not reporter.spool_dir.exists()
+
+
+def test_oom_always_records_partial_separately(tmp_path):
+    reporter = reports.Reporter(100_000, spool_dir=tmp_path / "spool")
+    path = reporter.report(
+        predicted_peak_bytes=100,
+        observed_peak_bytes=110,
+        oom=True,
+        partial_peak_bytes=110,
+        phase="backward",
+        replay_factory=lambda: {},
+    )
+    assert path is not None
+    record = reports.validate_report(path.read_bytes())
+    assert record["oom"] is True
+    assert record["observed_peak_bytes"] is record["error_pct"] is None
+    assert record["partial_peak_bytes"] == 110
+
+
+def test_sink_sees_original_durable_file_and_failure_preserves_it(tmp_path, caplog):
+    seen = []
+
+    def sink(path):
+        seen.append(path.read_bytes())
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600
+        raise OSError("secret text must not be logged")
+
+    reports.set_report_sink(sink)
+    path = report(tmp_path)
+    assert seen == [path.read_bytes()]
+    assert stat.S_IMODE(path.parent.stat().st_mode) == 0o700
+    assert "sink failed" in caplog.text
+    assert "secret text" not in caplog.text
+    assert len(list(path.parent.iterdir())) == 1
+
+
+@pytest.mark.parametrize("failure", ["serialize", "factory", "overflow"])
+def test_incomplete_replay_is_retained_and_honest(tmp_path, monkeypatch, failure):
+    def factory():
+        if failure == "factory":
+            raise RuntimeError("private payload")
+        if failure == "serialize":
+            return {"opaque": object()}
+        return {"large": "x" * 4000}
+
+    if failure == "overflow":
+        monkeypatch.setattr(reports, "MAX_REPORT_BYTES", 2048)
+    path = report(tmp_path, replay_factory=factory)
+    record = reports.validate_report(path.read_bytes())
+    assert record["replay"] is None
+    assert record["replay_complete"] is False
+    assert record["incomplete_reasons"]
+    assert b"private payload" not in path.read_bytes()
+
+
+def test_atomic_persistence_is_idempotent_and_conflicts_refuse(tmp_path):
+    original = report(tmp_path)
+    raw = original.read_bytes()
+    destination = tmp_path / "driver"
+    delivered = reports.persist_report(raw, destination)
+    assert reports.persist_report(raw, destination) == delivered
+    changed = json.loads(raw)
+    changed["phase"] = "backward"
+    with pytest.raises(ValueError, match="different bytes"):
+        reports.persist_report(reports._encode(changed), destination)
+    assert delivered.read_bytes() == raw
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "duplicate",
+        "nan",
+        "traversal",
+        "noncanonical",
+        "oom_peak",
+        "extra",
+        "wrong_percent",
+        "below_threshold",
+    ],
+)
+def test_transport_rejects_invalid_reports(tmp_path, mutation):
+    raw = report(tmp_path).read_bytes()
+    record = json.loads(raw)
+    if mutation == "duplicate":
+        raw = raw.replace(b'"format":1', b'"format":1,"format":1')
+    elif mutation == "nan":
+        raw = raw.replace(b'"threshold_pct":5', b'"threshold_pct":NaN')
+    elif mutation == "noncanonical":
+        raw = json.dumps(record).encode()
+    else:
+        if mutation == "traversal":
+            record["id"] = "../../elsewhere"
+        elif mutation == "oom_peak":
+            record["oom"] = True
+        elif mutation == "wrong_percent":
+            record["error_pct"] = 5
+        elif mutation == "below_threshold":
+            record["threshold_pct"] = 20
+        else:
+            record["unknown"] = "unregistered"
+        raw = reports._encode(record)
+    with pytest.raises(ValueError):
+        reports.persist_report(raw, tmp_path / "driver")
+    assert not (tmp_path / "driver").exists()
+
+
+def test_spool_full_preserves_first_report_and_does_not_fail_training(
+    tmp_path, monkeypatch, caplog
+):
+    path = report(tmp_path)
+    raw = path.read_bytes()
+    monkeypatch.setattr(reports, "MAX_SPOOL_REPORTS", 1)
+    assert report(tmp_path) is None
+    assert path.read_bytes() == raw
+    assert "local persistence failed" in caplog.text
+
+
+def test_spool_symlink_refuses(tmp_path):
+    target = tmp_path / "target"
+    target.mkdir(mode=0o700)
+    (tmp_path / "spool").symlink_to(target, target_is_directory=True)
+    assert report(tmp_path) is None
+    assert not list(target.iterdir())
+
+
+def test_replay_reruns_real_memory_estimator_and_prefix_layout(tmp_path):
+    from art.trainer_rank._prefix_tree_planner import (
+        build_canonical_prefix_tree,
+        plan_prefix_tree_layout,
+    )
+
+    tokens = [[1, 2, 3], [1, 2, 4]]
+    tree = build_canonical_prefix_tree(tokens)
+    layout = plan_prefix_tree_layout(tree, tree.decision_indices)
+    state: dict[str, Any] = {
+        "rank": {
+            "num_layers": 4,
+            "hidden_size": 8,
+            "param_dtype_size": 2,
+            "recompute_granularity": "full",
+            "sequence_parallel": False,
+            "attention_output_gate": False,
+            "mlp_activation_factor": 3,
+            "gdn_layers": 0,
+            "checkpointed_moe_layers": 0,
+            "recompute_modules": [],
+            "moe_output_bytes_per_token": 0,
+            "geometry": {
+                "hidden_size": 8,
+                "ffn_hidden_size": 32,
+                "num_attention_heads": 2,
+                "num_query_groups": 2,
+                "kv_channels": 4,
+            },
+            "topology": [1, 1, 1, 1],
+        },
+        "estimates": [
+            {
+                "signature": {
+                    "topology": [1, 1, 1, 1],
+                    "planner_coefficients": [2, None],
+                    "slot_group_count": 1,
+                    "request_mix": ["hidden_states"],
+                    "grad_enabled": True,
+                    "grad_modes": [True],
+                },
+                "profile": {"bytes_per_token": 100.0, "packed_tokens": 4},
+                "arguments": {
+                    "packed_tokens": 4,
+                    "output_bytes": 0,
+                    "logical_tokens": 4,
+                    "gdn_segments": 0,
+                    "retained_tokens": 4,
+                },
+                "expected_required_bytes": 440,
+            }
+        ],
+    }
+    payload = {
+        "memory_replay": state,
+        "layouts": [
+            {
+                "input_tokens": tokens,
+                "selected_decisions": list(tree.decision_indices),
+                "expected_packed_tokens": layout.packed_tokens,
+                "expected_fingerprint": layout.fingerprint,
+            }
+        ],
+    }
+    path = report(tmp_path, replay_factory=lambda: payload)
+    result = reports.replay(reports.validate_report(path.read_bytes()))
+    assert result["estimates"] == [{"required_bytes": 440, "matches": True}]
+    assert result["layouts"][0]["matches"]
+    assert result["source_matches"] is True
+    drifted = reports.validate_report(path.read_bytes())
+    drifted["replay"]["source_files"]["_impl.py"]["sha256"] = "0" * 64
+    with pytest.raises(ValueError, match="source differs"):
+        reports.replay(drifted)
+    assert reports.replay(drifted, allow_source_drift=True)["source_matches"] is False
+    state["estimates"][0]["profile"]["bytes_per_token"] = 200.0
+    changed = report(tmp_path, replay_factory=lambda: payload)
+    assert reports.replay(reports.validate_report(changed.read_bytes()))[
+        "estimates"
+    ] == [{"required_bytes": 880, "matches": False}]
+
+
+def test_incomplete_replay_refuses(tmp_path):
+    path = report(tmp_path, replay_factory=lambda: {})
+    with pytest.raises(ValueError, match="incomplete replay"):
+        reports.replay(reports.validate_report(path.read_bytes()))
