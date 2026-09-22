@@ -5,8 +5,8 @@ scheduling, gated by a completed CUDA tail. It is not CUDA kernel time. Observer
 spans are charged conservatively, including spans also timed by recovery.
 """
 
-from dataclasses import dataclass
 from contextlib import contextmanager, nullcontext
+from dataclasses import dataclass
 from functools import wraps
 import sys
 import time
@@ -40,6 +40,7 @@ def _measured(function):
 
 def region(function):
     """Exclude original forward/recovery work; meter only our transitions."""
+
     @wraps(function)
     def wrapped(rank, *args, **kwargs):
         work = rank._backward_work()
@@ -146,7 +147,10 @@ class BackwardWork:
                             work._start()
                         # Returning None preserves the original gradient object.
 
-                    self.outputs[key] = (weakref.ref(tensor), tensor.register_hook(hook))
+                    self.outputs[key] = (
+                        weakref.ref(tensor),
+                        tensor.register_hook(hook),
+                    )
 
     @_measured
     def _start(self):

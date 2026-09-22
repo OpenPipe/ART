@@ -19,7 +19,6 @@ import unittest
 from unittest.mock import patch
 import weakref
 
-
 ROOT = Path(__file__).resolve().parents[2]
 
 
@@ -102,9 +101,13 @@ class TestBackwardWork(unittest.TestCase):
             cuda=self.cuda,
             compiler=NS(is_compiling=lambda: False),
             _C=NS(_current_graph_task_id=lambda: self.task),
-            autograd=NS(Variable=NS(_execution_engine=NS(
-                queue_callback=self.callbacks.append,
-            ))),
+            autograd=NS(
+                Variable=NS(
+                    _execution_engine=NS(
+                        queue_callback=self.callbacks.append,
+                    )
+                )
+            ),
         )
         name = "_art_backward_work_control"
         spec = importlib.util.spec_from_file_location(
@@ -118,8 +121,12 @@ class TestBackwardWork(unittest.TestCase):
         self.addCleanup(self.work.close)
 
     def output(self, tensor):
-        return NS(target_logprobs=tensor, logits=tensor, hidden_states=tensor,
-                  top_k=NS(logprobs=tensor))
+        return NS(
+            target_logprobs=tensor,
+            logits=tensor,
+            hidden_states=tensor,
+            top_k=NS(logprobs=tensor),
+        )
 
     def start(self, task):
         self.task = task
@@ -141,25 +148,60 @@ class TestBackwardWork(unittest.TestCase):
     def actual_rank(self):
         source = ast.parse((ROOT / "src/art/trainer_rank/_impl.py").read_text())
         names = {"_CacheRecoveryState", "_MemoryCheck"}
-        methods = {"_recovery_state", "_backward_work", "_try_cache_recovery",
-                   "_execute_split_plan_with_memory_tracking"}
-        selected = [node for node in source.body if isinstance(node, ast.ClassDef)
-                    and node.name in names]
-        trainer = next(node for node in source.body if isinstance(node, ast.ClassDef)
-                       and node.name == "TrainerRank")
-        trainer.body = [node for node in trainer.body
-                        if isinstance(node, ast.FunctionDef) and node.name in methods]
-        ns = dict(__name__=__name__, dataclass=dataclass, dataclass_field=field,
-                  threading=threading, BackwardWork=self.module.BackwardWork,
-                  _backward_region=self.module.region, torch=self.torch,
-                  math=math, os=os, time=self.clock, cast=lambda typ, value: value,
-                  TrainerRankMemoryError=type("MemoryRefusal", (RuntimeError,), {}),
-                  _TEST_HOOKS_ENV="ART_BACKWARD_CONTROL_ONLY",
-                  _TEST_MEMORY_LIMIT_ENV="ART_BACKWARD_CONTROL_LIMIT",
-                  _MEMORY_RESERVE_FRACTION=0.05)
-        tree = ast.Module(body=[ast.ImportFrom(module="__future__", names=[
-            ast.alias(name="annotations")], level=0), *selected, trainer], type_ignores=[])
-        exec(compile(ast.fix_missing_locations(tree), "actual-accounting-methods", "exec"), ns)
+        methods = {
+            "_recovery_state",
+            "_backward_work",
+            "_try_cache_recovery",
+            "_execute_split_plan_with_memory_tracking",
+        }
+        selected = [
+            node
+            for node in source.body
+            if isinstance(node, ast.ClassDef) and node.name in names
+        ]
+        trainer = next(
+            node
+            for node in source.body
+            if isinstance(node, ast.ClassDef) and node.name == "TrainerRank"
+        )
+        trainer.body = [
+            node
+            for node in trainer.body
+            if isinstance(node, ast.FunctionDef) and node.name in methods
+        ]
+        ns = dict(
+            __name__=__name__,
+            dataclass=dataclass,
+            dataclass_field=field,
+            threading=threading,
+            BackwardWork=self.module.BackwardWork,
+            _backward_region=self.module.region,
+            torch=self.torch,
+            math=math,
+            os=os,
+            time=self.clock,
+            cast=lambda typ, value: value,
+            TrainerRankMemoryError=type("MemoryRefusal", (RuntimeError,), {}),
+            _TEST_HOOKS_ENV="ART_BACKWARD_CONTROL_ONLY",
+            _TEST_MEMORY_LIMIT_ENV="ART_BACKWARD_CONTROL_LIMIT",
+            _MEMORY_RESERVE_FRACTION=0.05,
+        )
+        tree = ast.Module(
+            body=[
+                ast.ImportFrom(
+                    module="__future__", names=[ast.alias(name="annotations")], level=0
+                ),
+                *selected,
+                trainer,
+            ],
+            type_ignores=[],
+        )
+        exec(
+            compile(
+                ast.fix_missing_locations(tree), "actual-accounting-methods", "exec"
+            ),
+            ns,
+        )
         rank = object.__new__(ns["TrainerRank"])
         rank.device = self.device
         state = rank._recovery_state()
@@ -292,14 +334,19 @@ class TestBackwardWork(unittest.TestCase):
         self.assertGreater(self.work.cost_ns, 0)
         self.assertEqual(self.work.depth, 0)
 
-    def test_ordinary_queue_fault_does_not_replace_gradient_or_erase_previous_credit(self):
+    def test_ordinary_queue_fault_does_not_replace_gradient_or_erase_previous_credit(
+        self,
+    ):
         expected = self.completed(1)
         self.work.harvest()
         tensor = Tensor(self.device)
         self.work.attach([self.output(tensor)])
         self.task = 2
-        with patch.object(self.torch.autograd.Variable._execution_engine,
-                          "queue_callback", side_effect=RuntimeError("queue")):
+        with patch.object(
+            self.torch.autograd.Variable._execution_engine,
+            "queue_callback",
+            side_effect=RuntimeError("queue"),
+        ):
             self.assertIsNone(next(iter(tensor.hooks.values()))(object()))
         self.assertTrue(self.work.disabled)
         self.work.harvest()
@@ -307,7 +354,12 @@ class TestBackwardWork(unittest.TestCase):
 
     def test_new_cancellation_at_each_observer_boundary_propagates_exact_object(self):
         original_work = self.work
-        for error_type in (KeyboardInterrupt, SystemExit, GeneratorExit, CancelledError):
+        for error_type in (
+            KeyboardInterrupt,
+            SystemExit,
+            GeneratorExit,
+            CancelledError,
+        ):
             for stage in ("attach", "hook", "callback", "harvest", "leave", "close"):
                 with self.subTest(error=error_type, stage=stage):
                     self.work = self.module.BackwardWork(threading.RLock(), self.device)
@@ -339,7 +391,10 @@ class TestBackwardWork(unittest.TestCase):
                         action = lambda: scope.__exit__(None, None, None)
                     else:
                         self.work.attach([self.output(tensor)])
-                        target, name = next(iter(self.work.outputs.values()))[1], "remove"
+                        target, name = (
+                            next(iter(self.work.outputs.values()))[1],
+                            "remove",
+                        )
                         action = self.work.close
                     with patch.object(target, name, side_effect=primary):
                         with self.assertRaises(BaseException) as caught:
@@ -357,9 +412,14 @@ class TestBackwardWork(unittest.TestCase):
         cause = ValueError("cause")
         primary.__cause__ = cause
         self.task = 1
-        with patch.object(self.clock, "perf_counter_ns", side_effect=[2000, 2001, secondary]):
-            with patch.object(self.torch.autograd.Variable._execution_engine,
-                              "queue_callback", side_effect=primary):
+        with patch.object(
+            self.clock, "perf_counter_ns", side_effect=[2000, 2001, secondary]
+        ):
+            with patch.object(
+                self.torch.autograd.Variable._execution_engine,
+                "queue_callback",
+                side_effect=primary,
+            ):
                 with self.assertRaises(KeyboardInterrupt) as caught:
                     self.work._start()
         self.assertIs(caught.exception, primary)
@@ -380,7 +440,9 @@ class TestBackwardWork(unittest.TestCase):
         primary, secondary = CancelledError("lookup"), GeneratorExit("meter")
         cause = ValueError("lookup cause")
         primary.__cause__ = cause
-        with patch.object(self.clock, "perf_counter_ns", side_effect=[primary, secondary]):
+        with patch.object(
+            self.clock, "perf_counter_ns", side_effect=[primary, secondary]
+        ):
             with self.assertRaises(CancelledError) as caught:
                 rank._backward_work()
         self.assertIs(caught.exception, primary)
@@ -412,11 +474,16 @@ class TestBackwardWork(unittest.TestCase):
                         raise primary from cause
                     return "original result"
 
-                with patch.object(self.clock, "perf_counter_ns",
-                                  side_effect=[10000, 10001, secondary, 10003]):
+                with patch.object(
+                    self.clock,
+                    "perf_counter_ns",
+                    side_effect=[10000, 10001, secondary, 10003],
+                ):
                     with self.assertRaises(BaseException) as caught:
                         body(rank)
-                self.assertIs(caught.exception, secondary if primary is None else primary)
+                self.assertIs(
+                    caught.exception, secondary if primary is None else primary
+                )
                 self.assertEqual(self.work.depth, 0)
                 if primary is not None:
                     self.assertIs(primary.__cause__, cause)
@@ -430,8 +497,11 @@ class TestBackwardWork(unittest.TestCase):
 
         with self.work.region():
             self.assertEqual(self.work.depth, 1)
-            with patch.object(self.clock, "perf_counter_ns",
-                              side_effect=[20000, secondary, 20002, 20003]):
+            with patch.object(
+                self.clock,
+                "perf_counter_ns",
+                side_effect=[20000, secondary, 20002, 20003],
+            ):
                 with self.assertRaises(KeyboardInterrupt) as caught:
                     untouched(rank)
             self.assertIs(caught.exception, secondary)
@@ -441,7 +511,9 @@ class TestBackwardWork(unittest.TestCase):
             scope.__enter__()
             self.assertEqual(self.work.depth, 2)
             another = SystemExit("secondary exit meter")
-            with patch.object(self.clock, "perf_counter_ns", side_effect=[secondary, another]):
+            with patch.object(
+                self.clock, "perf_counter_ns", side_effect=[secondary, another]
+            ):
                 with self.assertRaises(KeyboardInterrupt) as caught:
                     scope.__exit__(None, None, None)
             self.assertIs(caught.exception, secondary)
@@ -450,7 +522,9 @@ class TestBackwardWork(unittest.TestCase):
 
     def test_clock_fault_cost_overflow_and_unknown_readiness_fail_closed(self):
         prior = self.work.cost_ns
-        with patch.object(self.clock, "perf_counter_ns", side_effect=RuntimeError("clock")):
+        with patch.object(
+            self.clock, "perf_counter_ns", side_effect=RuntimeError("clock")
+        ):
             self.work.harvest()
         self.assertTrue(self.work.invalid)
         self.assertEqual(self.work.cost_ns, prior)
@@ -472,8 +546,10 @@ class TestBackwardWork(unittest.TestCase):
         self.assertTrue(self.work.disabled)
         self.assertFalse(tensor.hooks)
         self.work.disabled = False
-        with patch.dict(sys.modules, {"torch._dynamo.compiled_autograd": NS(
-            compiled_autograd_enabled=True)}):
+        with patch.dict(
+            sys.modules,
+            {"torch._dynamo.compiled_autograd": NS(compiled_autograd_enabled=True)},
+        ):
             self.start(1)
         self.assertTrue(self.work.disabled)
         self.work.disabled = False
@@ -523,8 +599,12 @@ class TestBackwardWork(unittest.TestCase):
             return values
 
         rank._recovery_reduce = reduce
-        result = rank._try_cache_recovery(ns["_MemoryCheck"](80, 0, False),
-            sync_across_dp=True, owner=state.owner, started=0.0)
+        result = rank._try_cache_recovery(
+            ns["_MemoryCheck"](80, 0, False),
+            sync_across_dp=True,
+            owner=state.owner,
+            started=0.0,
+        )
         self.assertFalse(result)
         self.assertEqual([op for op, _ in calls], ["SUM", "MAX", "MIN"])
         self.assertEqual(calls[1][1][1], 100.0)
@@ -536,21 +616,33 @@ class TestBackwardWork(unittest.TestCase):
         rank._recovery_reduce = lambda values, **kw: values
         state.owner, state.high = object(), 0.1
         check = ns["_MemoryCheck"](80, 0, False)
-        self.assertTrue(rank._try_cache_recovery(check, sync_across_dp=False,
-            owner=state.owner, started=0.0))  # Original first free release.
+        self.assertTrue(
+            rank._try_cache_recovery(
+                check, sync_across_dp=False, owner=state.owner, started=0.0
+            )
+        )  # Original first free release.
         self.cuda.free = 0
-        self.assertFalse(rank._try_cache_recovery(check, sync_across_dp=False,
-            owner=state.owner, started=0.0))
+        self.assertFalse(
+            rank._try_cache_recovery(
+                check, sync_across_dp=False, owner=state.owner, started=0.0
+            )
+        )
         # Use a genuinely completed host interval in this scalar fixture.
         self.start(1)
         self.clock.value += 30_000_000_000
         self.finish(1)
-        self.assertTrue(rank._try_cache_recovery(check, sync_across_dp=False,
-            owner=state.owner, started=0.0))
+        self.assertTrue(
+            rank._try_cache_recovery(
+                check, sync_across_dp=False, owner=state.owner, started=0.0
+            )
+        )
         self.cuda.free = 0
         self.work.invalid = True
-        self.assertFalse(rank._try_cache_recovery(check, sync_across_dp=False,
-            owner=state.owner, started=0.0))
+        self.assertFalse(
+            rank._try_cache_recovery(
+                check, sync_across_dp=False, owner=state.owner, started=0.0
+            )
+        )
 
     def test_actual_split_rollback_keeps_b_and_o_and_primary_error(self):
         rank, state, ns = self.actual_rank()
@@ -570,10 +662,16 @@ class TestBackwardWork(unittest.TestCase):
             return [object()], None
 
         rank._run_flat_plan_with_memory_tracking = execute
-        plan = NS(request_count=2, subforwards=[object(), object()],
-                  request_indices=[[0], [1]], subforward_count=2)
+        plan = NS(
+            request_count=2,
+            subforwards=[object(), object()],
+            request_indices=[[0], [1]],
+            subforward_count=2,
+        )
         with self.assertRaises(ValueError) as caught:
-            rank._execute_split_plan_with_memory_tracking(plan, check=None, context="test")
+            rank._execute_split_plan_with_memory_tracking(
+                plan, check=None, context="test"
+            )
         self.assertIs(caught.exception, primary)
         self.assertEqual(state.work, 5.0)
         self.assertEqual(self.work.work_ns, credited)
@@ -586,8 +684,14 @@ class TestBackwardWork(unittest.TestCase):
         self.start(1)
         self.clock.value += 30_000_000_000
         self.finish(1)
-        self.assertFalse(rank._try_cache_recovery(ns["_MemoryCheck"](80, 0, False),
-            sync_across_dp=False, owner=state.owner, started=0.0))
+        self.assertFalse(
+            rank._try_cache_recovery(
+                ns["_MemoryCheck"](80, 0, False),
+                sync_across_dp=False,
+                owner=state.owner,
+                started=0.0,
+            )
+        )
         self.assertTrue(state.invalid)
         self.assertEqual(self.cuda.releases, 0)
 

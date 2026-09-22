@@ -54,7 +54,8 @@ from art.megatron.prefix_tree_packing import (
     _local_position_pairs,
     estimate_prefix_tree_packed_tokens,
 )
-from art.trainer_rank._backward_work import BackwardWork, region as _backward_region
+from art.trainer_rank._backward_work import BackwardWork
+from art.trainer_rank._backward_work import region as _backward_region
 from art.trainer_rank._planner_cost import (
     COEFFICIENT_VERSION_FALLBACK,
     ModelGeometry,
