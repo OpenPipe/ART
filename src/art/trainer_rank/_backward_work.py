@@ -6,6 +6,7 @@ spans are charged conservatively, including spans also timed by recovery.
 """
 
 from dataclasses import dataclass
+from contextlib import contextmanager, nullcontext
 from functools import wraps
 import sys
 import time
@@ -42,20 +43,8 @@ def region(function):
     @wraps(function)
     def wrapped(rank, *args, **kwargs):
         work = rank._backward_work()
-        entered = work.enter() if work is not None else False
-        primary = False
-        try:
+        with work.region() if work is not None else nullcontext():
             return function(rank, *args, **kwargs)
-        except BaseException:
-            primary = True
-            raise
-        finally:
-            try:
-                if entered:
-                    work.leave()
-            except BaseException:
-                if not primary:
-                    raise
 
     return wrapped
 
@@ -225,25 +214,54 @@ class BackwardWork:
             tail.record(torch.cuda.current_stream(self.device))
             row.ended, row.tail = ended, tail
 
-    @_measured
-    def enter(self):
-        with self.lock:
-            if self.depth >= 16:
+    @contextmanager
+    def region(self):
+        """Own one exclusion count, even when a transition clock cancels."""
+        started, entered, primary = None, False, False
+        try:
+            try:
+                started = time.perf_counter_ns()
+                with self.lock:
+                    if self.depth >= 16:
+                        self.disabled = True
+                    else:
+                        self.depth += 1
+                        entered = True
+                        for row in self.rows.values():
+                            if row.ended is None:
+                                row.blocked = True
+            except Exception:
                 self.disabled = True
-                return False
-            self.depth += 1
-            for row in self.rows.values():
-                if row.ended is None:
-                    row.blocked = True
-            return True
-
-    @_measured
-    def leave(self):
-        with self.lock:
-            if self.depth <= 0:
+            except BaseException:
                 self.disabled = True
-            else:
-                self.depth -= 1
+                primary = True
+                raise
+            finally:
+                self._charge(started, primary=primary)
+            yield
+        except BaseException:
+            primary = True
+            raise
+        finally:
+            if entered:
+                started = None
+                try:
+                    try:
+                        started = time.perf_counter_ns()
+                    finally:
+                        # The exit clock must not prevent owned cleanup. Never
+                        # restore a saved depth over another thread's region.
+                        with self.lock:
+                            self.depth -= 1
+                except Exception:
+                    self.disabled = True
+                except BaseException:
+                    self.disabled = True
+                    if not primary:
+                        primary = True
+                        raise
+                finally:
+                    self._charge(started, primary=primary)
 
     @_measured
     def harvest(self):

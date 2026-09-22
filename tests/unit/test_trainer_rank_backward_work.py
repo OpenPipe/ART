@@ -174,9 +174,11 @@ class TestBackwardWork(unittest.TestCase):
         ended = self.work.rows[1].ended
         self.work.harvest()
         self.assertEqual(self.work.work_ns, 0)
-        self.work.enter()
-        self.clock.value += 10**12
-        self.work.leave()
+        cost = self.work.cost_ns
+        with self.work.region():
+            self.clock.value += 10**12
+        self.assertLess(self.work.cost_ns - cost, 1000)
+        self.assertEqual(self.work.depth, 0)
         self.assertFalse(self.work.rows[1].blocked)
         self.assertEqual(self.work.rows[1].ended, ended)
         self.cuda.events[0].ready = True
@@ -220,14 +222,13 @@ class TestBackwardWork(unittest.TestCase):
         self.finish(1)
         self.work.harvest()
         self.assertEqual(self.work.work_ns, 0)
-        self.work.enter()
-        self.completed(3)
-        self.work.leave()
+        with self.work.region():
+            self.completed(3)
         self.work.harvest()
         self.assertEqual(self.work.work_ns, 0)
         self.start(4)
-        self.work.enter()
-        self.work.leave()
+        with self.work.region():
+            pass
         self.finish(4)
         self.work.harvest()
         self.assertEqual(self.work.work_ns, 0)
@@ -289,6 +290,7 @@ class TestBackwardWork(unittest.TestCase):
         self.assertIs(primary.__cause__, cause)
         self.assertTrue(self.work.disabled)
         self.assertGreater(self.work.cost_ns, 0)
+        self.assertEqual(self.work.depth, 0)
 
     def test_ordinary_queue_fault_does_not_replace_gradient_or_erase_previous_credit(self):
         expected = self.completed(1)
@@ -331,9 +333,10 @@ class TestBackwardWork(unittest.TestCase):
                         target, name = self.cuda.events[-1], "query"
                         action = self.work.harvest
                     elif stage == "leave":
-                        self.work.enter()
+                        scope = self.work.region()
+                        scope.__enter__()
                         target, name = self.clock, "perf_counter_ns"
-                        action = self.work.leave
+                        action = lambda: scope.__exit__(None, None, None)
                     else:
                         self.work.attach([self.output(tensor)])
                         target, name = next(iter(self.work.outputs.values()))[1], "remove"
@@ -345,6 +348,7 @@ class TestBackwardWork(unittest.TestCase):
                     self.assertIs(primary.__cause__, cause)
                     self.assertTrue(self.work.disabled)
                     self.assertEqual(self.work.work_ns, 0)
+                    self.assertEqual(self.work.depth, 0)
                     self.work.close()
         self.work = original_work
 
@@ -408,12 +412,41 @@ class TestBackwardWork(unittest.TestCase):
                         raise primary from cause
                     return "original result"
 
-                with patch.object(self.work, "leave", side_effect=secondary):
+                with patch.object(self.clock, "perf_counter_ns",
+                                  side_effect=[10000, 10001, secondary, 10003]):
                     with self.assertRaises(BaseException) as caught:
                         body(rank)
                 self.assertIs(caught.exception, secondary if primary is None else primary)
+                self.assertEqual(self.work.depth, 0)
                 if primary is not None:
                     self.assertIs(primary.__cause__, cause)
+        # Enter has incremented its own count when its final charge cancels.
+        # Cleanup must remove only that count, retaining an existing outer one.
+        called = []
+
+        @self.module.region
+        def untouched(rank):
+            called.append(True)
+
+        with self.work.region():
+            self.assertEqual(self.work.depth, 1)
+            with patch.object(self.clock, "perf_counter_ns",
+                              side_effect=[20000, secondary, 20002, 20003]):
+                with self.assertRaises(KeyboardInterrupt) as caught:
+                    untouched(rank)
+            self.assertIs(caught.exception, secondary)
+            self.assertEqual(self.work.depth, 1)
+            self.assertEqual(called, [])
+            scope = self.work.region()
+            scope.__enter__()
+            self.assertEqual(self.work.depth, 2)
+            another = SystemExit("secondary exit meter")
+            with patch.object(self.clock, "perf_counter_ns", side_effect=[secondary, another]):
+                with self.assertRaises(KeyboardInterrupt) as caught:
+                    scope.__exit__(None, None, None)
+            self.assertIs(caught.exception, secondary)
+            self.assertEqual(self.work.depth, 1)
+        self.assertEqual(self.work.depth, 0)
 
     def test_clock_fault_cost_overflow_and_unknown_readiness_fail_closed(self):
         prior = self.work.cost_ns
