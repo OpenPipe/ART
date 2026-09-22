@@ -6,6 +6,7 @@ recovery/rollback methods rather than copy their decision arithmetic.
 
 import ast
 from asyncio import CancelledError
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field
 import gc
 import importlib.util
@@ -14,6 +15,7 @@ import os
 from pathlib import Path
 import sys
 import threading
+import traceback
 from types import SimpleNamespace as NS
 import unittest
 from unittest.mock import patch
@@ -153,6 +155,9 @@ class TestBackwardWork(unittest.TestCase):
             "_recovery_state",
             "_backward_work",
             "_try_cache_recovery",
+            "_cache_recovery_episode",
+            "_release_cached_memory_for_backward",
+            "_memory_error_with_reduction_note",
             "_execute_split_plan_with_memory_tracking",
         }
         selected = [
@@ -175,6 +180,8 @@ class TestBackwardWork(unittest.TestCase):
             dataclass=dataclass,
             dataclass_field=field,
             threading=threading,
+            contextmanager=contextmanager,
+            traceback=traceback,
             BackwardWork=self.module.BackwardWork,
             _backward_region=self.module.region,
             torch=self.torch,
@@ -520,6 +527,160 @@ class TestBackwardWork(unittest.TestCase):
             self.assertIs(caught.exception, secondary)
             self.assertEqual(self.work.depth, 1)
         self.assertEqual(self.work.depth, 0)
+
+    def handoff_entry_failure(
+        self, stage, primary, *, foreign_owner=False, exchange_error=None
+    ):
+        self.work = self.module.BackwardWork(threading.RLock(), self.device)
+        self.addCleanup(self.work.close)
+        rank, state, _ = self.actual_rank()
+        state.owner = original_owner = object() if foreign_owner else None
+        state.work, state.cost = 17.0, 3.0
+        self.work.work_ns = 19
+        secondary = KeyboardInterrupt(stage)
+        votes = []
+
+        def reduce(values, **kwargs):
+            votes.append((values, kwargs))
+            if exchange_error is not None:
+                raise exchange_error
+            return values
+
+        rank._recovery_reduce = reduce
+        clock = self.clock.perf_counter_ns
+        count = 0
+
+        def observer_clock():
+            nonlocal count
+            count += 1
+            if (
+                count
+                == {"lookup_clock": 1, "region_clock": 3, "region_charge": 4}[stage]
+            ):
+                raise secondary
+            return clock()
+
+        with ExitStack() as patches:
+            if stage in ("lookup_clock", "region_clock", "region_charge"):
+                patches.enter_context(
+                    patch.object(self.clock, "perf_counter_ns", observer_clock)
+                )
+            elif stage in ("lookup_state", "episode_state"):
+                values = (
+                    [secondary, state]
+                    if stage == "lookup_state"
+                    else [state, secondary]
+                )
+                patches.enter_context(
+                    patch.object(rank, "_recovery_state", side_effect=values)
+                )
+            elif stage == "episode_clock":
+                patches.enter_context(
+                    patch.object(rank, "_recovery_clock", side_effect=[secondary, 2.0])
+                )
+            else:
+                # Cancel after owner assignment, including while a foreign
+                # episode owns the state: cleanup must never clear its token.
+                lock = state.lock
+                cancel_exit = False
+
+                def episode_clock():
+                    nonlocal cancel_exit
+                    if count == 0:
+                        cancel_exit = True
+                    return 1.0
+
+                class Lock:
+                    def __enter__(self):
+                        return lock.__enter__()
+
+                    def __exit__(self, *args):
+                        nonlocal cancel_exit, count
+                        result = lock.__exit__(*args)
+                        if cancel_exit:
+                            cancel_exit = False
+                            count += 1
+                            raise secondary
+                        return result
+
+                state.lock = self.work.lock = Lock()
+                rank._recovery_clock = episode_clock
+            with self.assertRaises(BaseException) as caught:
+                rank._release_cached_memory_for_backward(
+                    NS(groups=[NS(grad_enabled=True)]), error=primary
+                )
+        self.assertIs(caught.exception, secondary if primary is None else primary)
+        self.assertEqual(
+            votes,
+            []
+            if primary is None
+            else [([1.0, 1.0], {"op": "MAX", "sync_across_dp": True})],
+        )
+        self.assertIs(state.owner, original_owner)
+        self.assertEqual(self.work.depth, 0)
+        self.assertEqual((state.work, self.work.work_ns), (17.0, 19))
+        self.assertGreaterEqual(state.cost, 3.0)
+        self.assertEqual(self.cuda.releases, 0)
+        self.assertTrue(state.invalid or self.work.invalid or self.work.disabled)
+
+    def test_saved_forward_error_reaches_failure_vote_despite_entry_cancellation(self):
+        for stage in (
+            "lookup_state",
+            "lookup_clock",
+            "region_clock",
+            "region_charge",
+            "episode_state",
+            "episode_clock",
+            "episode_owner",
+        ):
+            for error_type in (RuntimeError, CancelledError):
+                with self.subTest(stage=stage, error_type=error_type):
+                    primary = error_type("forward")
+                    primary.__cause__ = cause = ValueError("original cause")
+                    primary.__context__ = context = LookupError("original context")
+                    self.handoff_entry_failure(stage, primary)
+                    self.assertIs(primary.__cause__, cause)
+                    self.assertIs(primary.__context__, context)
+                    self.assertTrue(primary.__suppress_context__)
+        self.handoff_entry_failure(
+            "episode_owner", RuntimeError("forward"), foreign_owner=True
+        )
+        primary = RuntimeError("forward before poisoned exchange")
+        self.handoff_entry_failure(
+            "episode_clock", primary, exchange_error=SystemExit("exchange cancellation")
+        )
+        self.assertIn("exchange cancellation", "\n".join(primary.__notes__))
+
+    def test_new_entry_cancellation_propagates_and_cleans_owned_state(self):
+        for stage in (
+            "lookup_state",
+            "lookup_clock",
+            "region_clock",
+            "region_charge",
+            "episode_state",
+            "episode_clock",
+            "episode_owner",
+        ):
+            with self.subTest(stage=stage):
+                self.handoff_entry_failure(stage, None)
+        self.handoff_entry_failure("episode_owner", None, foreign_owner=True)
+
+    def test_recovery_episode_still_records_cost_and_preserves_foreign_owner(self):
+        rank, state, _ = self.actual_rank()
+        state.cost, state.high = 3.0, 0.25
+        for foreign_owner in (None, object()):
+            with self.subTest(foreign_owner=foreign_owner):
+                state.owner = foreign_owner
+                with patch.object(rank, "_recovery_clock", side_effect=[10.0, 10.5]):
+                    with rank._cache_recovery_episode() as (owner, started):
+                        self.assertEqual(started, 10.0)
+                        self.assertIs(
+                            state.owner,
+                            owner if foreign_owner is None else foreign_owner,
+                        )
+                self.assertIs(state.owner, foreign_owner)
+                self.assertFalse(state.invalid)
+        self.assertEqual((state.cost, state.high), (4.0, 0.5))
 
     def test_clock_fault_cost_overflow_and_unknown_readiness_fail_closed(self):
         prior = self.work.cost_ns

@@ -2463,7 +2463,7 @@ class TrainerRank:
     ) -> None:
         # Every WORLD wave reaches this before the public iterator skips empty
         # outputs. Forward has already executed: never replan or retry here.
-        with self._cache_recovery_episode() as (owner, started):
+        with self._cache_recovery_episode(error=error) as (owner, started):
             exchange_error: BaseException | None = None
             try:
                 failed, gradients = self._recovery_reduce(
@@ -5281,55 +5281,74 @@ class TrainerRank:
             raise latest from original
 
     @contextmanager
-    def _cache_recovery_episode(self) -> Iterator[tuple[object, float | None]]:
-        state = self._recovery_state()
-        started = self._recovery_clock()
-        owner = object()
-        with state.lock:
-            if state.owner is None:
-                state.owner = owner
-        primary: BaseException | None = None
+    def _cache_recovery_episode(
+        self, *, error: BaseException | None = None
+    ) -> Iterator[tuple[object, float | None]]:
+        state = None
+        started = None
+        owner = None
+        primary = error
         try:
+            try:
+                state = self._recovery_state()
+                started = self._recovery_clock()
+                owner = object()
+                with state.lock:
+                    if state.owner is None:
+                        state.owner = owner
+            except BaseException:
+                # A saved forward failure must still reach the WORLD status
+                # vote. Unknown accounting cost cannot enable later recovery.
+                if state is None:
+                    state = getattr(self, "_cache_recovery_state", None)
+                    if state is None:
+                        state = self._cache_recovery_state = _CacheRecoveryState()
+                state.invalid = True
+                if error is None:
+                    raise
             yield owner, started
         except BaseException as exc:
             primary = exc
             raise
         finally:
-            # Includes control, release, resample and repeated search; no idle.
-            try:
-                finished = self._recovery_clock()
-                elapsed = (
-                    None if started is None or finished is None else finished - started
-                )
-                with state.lock:
-                    if (
-                        elapsed is None
-                        or not math.isfinite(elapsed)
-                        or elapsed <= 0
-                        or not math.isfinite(state.cost + elapsed)
-                    ):
-                        state.invalid = True
-                    else:
-                        state.cost += elapsed
-                        state.high = max(state.high, elapsed)
-            except Exception:
-                state.invalid = True
-            except BaseException as exc:
-                state.invalid = True
-                if primary is None:
-                    primary = exc
-                    raise
-            finally:
+            if state is not None:
+                # Includes control, release, resample and repeated search; no idle.
                 try:
+                    finished = self._recovery_clock()
+                    elapsed = (
+                        None
+                        if started is None or finished is None
+                        else finished - started
+                    )
                     with state.lock:
-                        if state.owner is owner:
-                            state.owner = None
+                        if (
+                            elapsed is None
+                            or not math.isfinite(elapsed)
+                            or elapsed <= 0
+                            or not math.isfinite(state.cost + elapsed)
+                        ):
+                            state.invalid = True
+                        else:
+                            state.cost += elapsed
+                            state.high = max(state.high, elapsed)
                 except Exception:
                     state.invalid = True
-                except BaseException:
+                except BaseException as exc:
                     state.invalid = True
                     if primary is None:
+                        primary = exc
                         raise
+                finally:
+                    try:
+                        with state.lock:
+                            if state.owner is owner:
+                                state.owner = None
+                    except Exception:
+                        state.invalid = True
+                    except BaseException:
+                        state.invalid = True
+                        if primary is None:
+                            raise
 
     def _recovery_clock(self) -> float | None:
         try:
@@ -5365,25 +5384,30 @@ class TrainerRank:
         return state
 
     def _backward_work(self) -> BackwardWork | None:
-        state = self._recovery_state()
+        state = None
         started = None
         primary = False
         try:
+            state = self._recovery_state()
             started = time.perf_counter_ns()
             with state.lock:
                 if state.backward is None and not state.invalid:
                     state.backward = BackwardWork(state.lock, self.device)
                 return state.backward
-        except Exception:
-            # Unknown accounting cost must never become free recovery budget.
+        except BaseException as exc:
+            # Unknown accounting cost must never become free recovery budget,
+            # including a failure before state lookup returned.
+            if state is None:
+                state = getattr(self, "_cache_recovery_state", None)
+                if state is None:
+                    state = self._cache_recovery_state = _CacheRecoveryState()
             state.invalid = True
-            return None
-        except BaseException:
-            state.invalid = True
+            if isinstance(exc, Exception):
+                return None
             primary = True
             raise
         finally:
-            if state.backward is not None:
+            if state is not None and state.backward is not None:
                 # Includes lazy setup and lock wait; constructor overlap is an
                 # intentional conservative charge, not an exact subtraction.
                 state.backward._charge(started, primary=primary)

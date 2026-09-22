@@ -43,8 +43,14 @@ def region(function):
 
     @wraps(function)
     def wrapped(rank, *args, **kwargs):
-        work = rank._backward_work()
-        with work.region() if work is not None else nullcontext():
+        error = kwargs.get("error")
+        try:
+            work = rank._backward_work()
+        except BaseException:
+            if error is None:
+                raise
+            work = None
+        with work.region(error=error) if work is not None else nullcontext():
             return function(rank, *args, **kwargs)
 
     return wrapped
@@ -219,9 +225,9 @@ class BackwardWork:
             row.ended, row.tail = ended, tail
 
     @contextmanager
-    def region(self):
+    def region(self, *, error: BaseException | None = None):
         """Own one exclusion count, even when a transition clock cancels."""
-        started, entered, primary = None, False, False
+        started, entered, primary = None, False, error is not None
         try:
             try:
                 started = time.perf_counter_ns()
@@ -238,8 +244,9 @@ class BackwardWork:
                 self.disabled = True
             except BaseException:
                 self.disabled = True
-                primary = True
-                raise
+                if not primary:
+                    primary = True
+                    raise
             finally:
                 self._charge(started, primary=primary)
             yield
