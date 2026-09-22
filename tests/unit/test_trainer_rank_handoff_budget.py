@@ -7,7 +7,7 @@ import weakref
 import pytest
 import torch
 
-from art.trainer_rank import ForwardOutput, TrainerRank, _impl
+from art.trainer_rank import ForwardOutput, TrainerRank, _backward_work, _impl
 from tests.unit import test_trainer_rank_cache_recovery as recovery
 from tests.unit.test_trainer_rank_physical_reserve import allocator
 from tests.unit.test_trainer_rank_validation import (
@@ -69,6 +69,46 @@ def test_repeat_budget_has_the_same_five_percent_boundary(rig, cost, releases):
     rank._release_cached_memory_for_backward(plan(True))
     assert cuda.events.count("release") == releases
     assert state.cost == cost + 1.0 and state.work == 1000.0 and state.owner is None
+
+
+@pytest.mark.parametrize(
+    "observer_step_ns,cost,releases",
+    [(0, 40.0, 1), (1_000_000, 40.0, 0), (1_000_000, 39.0, 1)],
+)
+def test_imported_observer_cost_moves_repeat_boundary(
+    rig, observer_step_ns, cost, releases
+):
+    rank, cuda, clock, _ = rig
+    assert _impl.BackwardWork is _backward_work.BackwardWork
+    clock.observer_step_ns = observer_step_ns
+    state = rank._recovery_state()
+    state.first_consumed, state.work, state.cost, state.high = True, 1000.0, cost, 10.0
+    ticks = iter((1.0, 1.0, 2.0))
+    rank._recovery_clock = lambda: next(ticks)
+    cuda.free = 1
+    original_reduce = rank._recovery_reduce
+    observations = []
+
+    def reduce(values, *, op, sync_across_dp):
+        if op == "SUM":
+            observer = state.backward
+            assert isinstance(observer, _backward_work.BackwardWork)
+            observations.append((list(values), observer.cost_ns / 1e9))
+        elif op == "MAX" and len(values) == 4:
+            assert values[1:] == [1000.0, 1.0, 0.0]
+        return original_reduce(values, op=op, sync_across_dp=sync_across_dp)
+
+    rank._recovery_reduce = reduce
+    rank._release_cached_memory_for_backward(plan(True))
+    assert len(observations) == 1
+    operands, observer_seconds = observations[0]
+    assert operands == [cost + observer_seconds, 10.0]
+    assert (observer_seconds > 0) == (observer_step_ns > 0)
+    assert (sum(operands) <= 0.05 * 1000.0) == bool(releases)
+    assert cuda.events.count("release") == releases
+    assert state.cost == cost + 1.0 and state.work == 1000.0
+    assert state.owner is None and not state.invalid
+    assert state.backward.work_ns == 0
 
 
 @pytest.mark.parametrize("modes", [(), (False,)])
