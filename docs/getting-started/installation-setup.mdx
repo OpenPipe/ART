@@ -88,7 +88,7 @@ Tinker users install `openpipe-art[tinker]`; serverless users need only
 Instead of managing the GPUs and training processes yourself, you can optionally send inference and training requests to the W&B Training cluster, which autoscales to match your job's demand. To do so, install `openpipe-art` without any extras and use `ServerlessBackend`:
 
 ```bash
-pip install openpipe-art==0.5.20
+pip install "openpipe-art @ git+https://github.com/OpenPipe/ART.git@88d3df23285f56fbcbb4629768ba0fc17ebe2d27"
 ```
 
 

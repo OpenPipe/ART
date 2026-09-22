@@ -8,11 +8,16 @@ icon: "robot"
 ## Serverless Models
 
 The serverless examples use **Qwen 3.8 27B** (`Qwen/Qwen3.8-27B`) with
-`openpipe-art==0.5.20`. Install the published package and use `ServerlessBackend`
+ART main (pinned to `88d3df2`). Install the pinned main revision and use `ServerlessBackend`
 with your `WANDB_API_KEY`; no local GPU is required.
 
+<Note>
+  ART 0.5.20 from PyPI does not yet read W&B Inference's exact Dynamo token
+  metadata. Use the pinned main revision below for these serverless examples.
+</Note>
+
 ```bash
-pip install openpipe-art==0.5.20
+pip install "openpipe-art @ git+https://github.com/OpenPipe/ART.git@88d3df23285f56fbcbb4629768ba0fc17ebe2d27"
 ```
 
 Use `model.openai_client()` for training rollouts so ART captures the token IDs

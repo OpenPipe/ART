@@ -75,7 +75,7 @@ ART is an open-source RL framework that improves agent reliability by allowing L
 | **Summarizer (SFT + RL)** | [🏋️ Train model](https://colab.research.google.com/github/openpipe/art-notebooks/blob/main/examples/sft/sft-rl.ipynb)            | Train a document summarizer with SFT warmup then RL | [Link coming soon]                                                                                                                                                                                                          |
 | **SFT from a dataset** | [🏋️ Train model](https://colab.research.google.com/github/openpipe/art-notebooks/blob/main/examples/sft/train_from_file.ipynb)      | Fine-tune Qwen 3.8 27B on text-to-SQL from a dataset | [Link coming soon]                                                                                                                                                                                                          |
 
-Serverless notebooks use `openpipe-art==0.5.20` and `Qwen/Qwen3.8-27B`.
+Serverless notebooks use ART main (pinned to `88d3df2`) and `Qwen/Qwen3.8-27B`.
 Benchmark charts show results from their original runs.
 
 ## 📰 ART News
