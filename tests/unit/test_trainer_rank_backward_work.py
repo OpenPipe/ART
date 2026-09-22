@@ -113,10 +113,11 @@ class TestBackwardWork(unittest.TestCase):
         spec = importlib.util.spec_from_file_location(
             name, ROOT / "src/art/trainer_rank/_backward_work.py"
         )
+        assert spec is not None and spec.loader is not None
         self.module = importlib.util.module_from_spec(spec)
         with patch.dict(sys.modules, {"torch": self.torch, name: self.module}):
             spec.loader.exec_module(self.module)
-        self.module.time = self.clock
+        setattr(self.module, "time", self.clock)
         self.work = self.module.BackwardWork(threading.RLock(), self.device)
         self.addCleanup(self.work.close)
 

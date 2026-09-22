@@ -284,7 +284,8 @@ class BackwardWork:
                     self.disabled = True
                     return
                 if ready and not row.blocked:
-                    addition += row.ended - row.started
+                    # The quiescence check above excludes None under this lock.
+                    addition += row.ended - row.started  # ty: ignore[unsupported-operator]
                 if ready or row.blocked:
                     retired.append(task)
             if self.work_ns + addition > _MAX_NS:
