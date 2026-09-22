@@ -5048,7 +5048,18 @@ class TrainerRank:
                     return None
 
             tensors = [
-                (item, version(item.input_ids), version(item.labels))
+                (
+                    item,
+                    version(item.input_ids),
+                    version(item.labels),
+                    {
+                        "top_k": item.request.top_k,
+                        "logits": item.request.logits,
+                        "hidden_states": item.request.hidden_states,
+                        "no_grad": item.request.no_grad,
+                        "checkpoint": str(item.request.checkpoint),
+                    },
+                )
                 for group in plan.groups
                 for item in group.items
             ]
@@ -5105,15 +5116,11 @@ class TrainerRank:
 
                 requests = [
                     {
+                        **options,
                         "input_tokens": tensor_data(item.input_ids, input_version),
                         "target_tokens": tensor_data(item.labels, label_version),
-                        "top_k": item.request.top_k,
-                        "logits": item.request.logits,
-                        "hidden_states": item.request.hidden_states,
-                        "no_grad": item.request.no_grad,
-                        "checkpoint": str(item.request.checkpoint),
                     }
-                    for item, input_version, label_version in tensors
+                    for item, input_version, label_version, options in tensors
                 ]
                 layouts = []
                 cursor = 0
