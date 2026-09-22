@@ -14,6 +14,7 @@ from collections.abc import (
 )
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager
+from contextvars import ContextVar
 from copy import deepcopy
 from dataclasses import asdict, dataclass, replace
 from dataclasses import field as dataclass_field
@@ -611,6 +612,7 @@ class _CandidateMicroBatch(Generic[ForwardInputsT]):
     stats_global_count: int
     rejected_candidates: int
     cold_start: bool
+    fallback: _CandidateMicroBatch[ForwardInputsT] | None = None
 
 
 class _SlotGraphSentinel(torch.autograd.Function):
@@ -1375,6 +1377,12 @@ class TrainerRank:
         options = _planner_misses.parse_options(os.environ)
         self._allow_oversized_batches = options.allow_oversized_batches
         self._planner_reporter = _planner_misses.Reporter(options.threshold_pct)
+        self._planner_observation_context: ContextVar[dict[str, Any] | None] = (
+            ContextVar("trainer_rank_planner_observation", default=None)
+        )
+        self._planner_observation_generation = 0
+        self._planner_active_observations: set[int] = set()
+        self._planner_overlap_generation = 0
         self._planner_observation: dict[str, Any] | None = None
         pp_size = int(getattr(runtime.provider, "pipeline_model_parallel_size", 1) or 1)
         if pp_size > 1 or len(runtime.model) > 1:
@@ -4014,6 +4022,7 @@ class TrainerRank:
 
         estimates: dict[int, tuple[_MemoryCheck, bool, bool] | None] = {}
         plans: dict[int, _FlatForwardPlan] = {}
+        checked_plans: dict[int, _MemoryCheck] = {}
         # Per-width layout mode chosen by admission: False = cost-optimal,
         # True = memory-minimal (full sharing). Materialization must build the
         # same layouts the admitted estimate priced.
@@ -4160,6 +4169,8 @@ class TrainerRank:
                 profiled = self._all_ranks_true(plan.signature in self._memory_profiles)
             else:
                 check, trusted, profiled = result
+            if width in plans:
+                checked_plans[width] = check
             if not check.fits:
                 rejected_widths.add(width)
             return check.fits and (trusted or not profiled), trusted
@@ -4194,7 +4205,7 @@ class TrainerRank:
                 packed_tokens=plan.packed_tokens,
                 signature=plan.signature,
             )
-            return _CandidateMicroBatch(
+            selected = _CandidateMicroBatch(
                 inputs=local_inputs,
                 indices=indices,
                 plan=plan,
@@ -4203,6 +4214,27 @@ class TrainerRank:
                 rejected_candidates=len(rejected_widths),
                 cold_start=cold_start,
             )
+            checked_plans[width] = check
+            if getattr(self, "_allow_oversized_batches", False):
+                smallest = min(
+                    checked_plans,
+                    key=lambda w: (checked_plans[w].estimated_required_bytes, w),
+                )
+                if smallest != width:
+                    fallback_indices, fallback_inputs = local_slice(smallest)
+                    selected = replace(
+                        selected,
+                        fallback=_CandidateMicroBatch(
+                            inputs=fallback_inputs,
+                            indices=fallback_indices,
+                            plan=plans[smallest],
+                            check=checked_plans[smallest],
+                            stats_global_count=smallest,
+                            rejected_candidates=len(rejected_widths),
+                            cold_start=True,
+                        ),
+                    )
+            return selected
 
         first_estimate = estimate(min_width)
         if first_estimate is None or not (first_estimate[0].fits and first_estimate[1]):
@@ -4915,6 +4947,12 @@ class TrainerRank:
         if reporter is None or reporter.threshold_pct is None:
             return
         self.finish_planner_observation()
+        self._planner_observation_generation += 1
+        if self._planner_active_observations:
+            # Both the suspended caller and the newly entered forward share
+            # allocator counters; neither interval may claim a completed peak.
+            self._planner_overlap_generation = self._planner_observation_generation
+        self._planner_active_observations.add(self._planner_observation_generation)
         # A snapshot failure must still leave a durable minimal OOM report.
         self._planner_observation = {
             "predicted": check.estimated_required_bytes,
@@ -4924,6 +4962,7 @@ class TrainerRank:
             "peak": 0,
             "phase": "forward",
             "comparable": False,
+            "generation": self._planner_observation_generation,
         }
         try:
             children = (
@@ -5066,6 +5105,9 @@ class TrainerRank:
                     "group_request_indices": [
                         list(group.request_indices) for group in plan.groups
                     ],
+                    "subforward_group_counts": [
+                        len(child.groups) for child in children
+                    ],
                     "checkpoint_slots": slots,
                     "checkpoint_sources": checkpoint_sources,
                     "split_memory_floor_bytes": floor,
@@ -5090,6 +5132,7 @@ class TrainerRank:
                 "peak": 0,
                 "phase": "forward",
                 "comparable": True,
+                "generation": self._planner_observation_generation,
             }
         except Exception:
             # Reporting is auxiliary; a diagnostic failure cannot change the
@@ -5108,6 +5151,11 @@ class TrainerRank:
             return
         self.discard_planner_observation()
         if observation["baseline"] is None or not observation["comparable"]:
+            return
+        if observation["generation"] <= self._planner_overlap_generation:
+            _planner_misses._warn(
+                "overlapping forwards invalidated the allocator peak interval"
+            )
             return
         try:
             peak = max(
@@ -5144,9 +5192,10 @@ class TrainerRank:
         ):
             return
         self.discard_planner_observation()
+        overlapped = observation["generation"] <= self._planner_overlap_generation
         partial = None
         try:
-            if observation["baseline"] is not None:
+            if observation["baseline"] is not None and not overlapped:
                 partial = max(
                     0,
                     max(
@@ -5178,12 +5227,22 @@ class TrainerRank:
                 }
             except Exception:
                 oom_facts["allocator"] = None
+
+            def replay() -> dict[str, Any]:
+                result = observation["replay"]()
+                if overlapped:
+                    result["incomplete_reasons"] = [
+                        *result.get("incomplete_reasons", ()),
+                        "overlapping_forward_memory_window",
+                    ]
+                return {**result, "oom": oom_facts}
+
             self._planner_reporter.report(
                 predicted_peak_bytes=observation["predicted"],
                 observed_peak_bytes=None,
                 oom=True,
                 phase=observation["phase"],
-                replay_factory=lambda: {**observation["replay"](), "oom": oom_facts},
+                replay_factory=replay,
                 admission_peak_bytes=observation["admission"],
                 partial_peak_bytes=partial,
             )
@@ -5191,7 +5250,42 @@ class TrainerRank:
             _planner_misses._warn("could not persist planner OOM report")
 
     def discard_planner_observation(self) -> None:
+        observation = getattr(self, "_planner_observation", None)
+        if observation is not None:
+            self._planner_active_observations.discard(observation["generation"])
         self._planner_observation = None
+
+    @property
+    def _planner_observation(self) -> dict[str, Any] | None:
+        variable = getattr(self, "_planner_observation_context", None)
+        context = None if variable is None else variable.get()
+        return (
+            getattr(self, "_planner_unscoped_observation", None)
+            if context is None
+            else context.get("observation")
+        )
+
+    @_planner_observation.setter
+    def _planner_observation(self, value: dict[str, Any] | None) -> None:
+        variable = getattr(self, "_planner_observation_context", None)
+        context = None if variable is None else variable.get()
+        if context is None:
+            self._planner_unscoped_observation = value
+        else:
+            context["observation"] = value
+
+    @contextmanager
+    def planner_observation_scope(self, context: dict[str, Any]) -> Iterator[None]:
+        """Use one holder per execution, retaining it across async-generator steps.
+
+        A scope changes only diagnostic ownership. It does not serialize model
+        work or make the process-wide CUDA peak counter execution-local.
+        """
+        token = self._planner_observation_context.set(context)
+        try:
+            yield
+        finally:
+            self._planner_observation_context.reset(token)
 
     @staticmethod
     def _telemetry_plan_signature(plan: _AnyForwardPlan) -> dict[str, object]:
@@ -5588,6 +5682,19 @@ class TrainerRank:
                 or check.estimated_required_bytes < best.check.estimated_required_bytes
             ):
                 best = refused
+            if isinstance(value, _CandidateMicroBatch) and value.fallback is not None:
+                fallback = value.fallback
+                if (
+                    best is None
+                    or fallback.check.estimated_required_bytes
+                    < best.check.estimated_required_bytes
+                ):
+                    best = _ForwardRefusal(
+                        fallback.plan,
+                        fallback.check,
+                        refused.message,
+                        candidate=fallback,
+                    )
             return None
 
         value = search()

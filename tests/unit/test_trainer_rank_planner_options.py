@@ -343,3 +343,93 @@ def test_split_report_keeps_first_child_peak_across_resets(monkeypatch, tmp_path
     assert record["observed_peak_bytes"] == 600
     assert record["replay"]["subforward_request_indices"] == [[0], [1]]
     assert counters["syncs"] == 4
+
+
+def test_volatile_budget_uses_smaller_materialized_candidate(monkeypatch):
+    rank = _oversized(monkeypatch, limit=100)
+    # Force the maintained search to materialize its widths rather than use
+    # cheap scalar estimates. All fitting plans are real considered options.
+    monkeypatch.setattr(rank, "_estimate_flat_forward", lambda *a, **k: None)
+    items = [_request(i) for i in range(4)]
+    selected = rank._search_next_micro_batch(items, 0)
+    assert isinstance(selected, tr._CandidateMicroBatch)
+    assert selected.stats_global_count == 4
+    assert selected.fallback is not None
+    assert selected.fallback.indices == (0,)
+    assert selected.fallback.check.estimated_required_bytes == 10
+    monkeypatch.setattr(
+        rank,
+        "_memory_check_required",
+        lambda required, **k: tr._MemoryCheck(required, 1, False),
+    )
+    result = rank._recover_admission(
+        lambda: selected,
+        lambda value: (value.plan, value.check),
+        lambda value, check: tr.replace(value, check=check),
+        context="forward_micro_batches",
+        sync_across_dp=True,
+        admit_refusal=lambda refusal: pytest.fail("lost original candidate mapping"),
+    )
+    assert result is selected.fallback or result == selected.fallback
+    assert result.inputs == [items[0]]
+    assert result.plan.request_count == 1
+
+
+def test_interleaved_execution_scopes_preserve_both_oom_inputs(monkeypatch, tmp_path):
+    rank, first, _ = _reporting_rank(monkeypatch, tmp_path)
+    second = rank._plan_flat_forward([_request(1)])
+    one, two = {}, {}
+    check = tr._MemoryCheck(220, 10000, True)
+    with rank.planner_observation_scope(one):
+        rank._run_flat_plan_with_memory_tracking(
+            first, check=check, context="dp_rank_forward"
+        )
+    with rank.planner_observation_scope(two):
+        rank.discard_planner_observation()  # new actor execution cannot erase one
+        rank._run_flat_plan_with_memory_tracking(
+            second, check=check, context="dp_rank_forward"
+        )
+    with rank.planner_observation_scope(one):
+        rank.report_planner_oom(torch.cuda.OutOfMemoryError("first backward"))
+    with rank.planner_observation_scope(two):
+        rank.report_planner_oom(torch.cuda.OutOfMemoryError("second backward"))
+    records = _records(tmp_path)
+    assert len(records) == 2
+    assert {r["replay"]["requests"][0]["input_tokens"][-1] for r in records} == {0, 1}
+    assert all(
+        r["partial_peak_bytes"] is None and r["observed_peak_bytes"] is None
+        for r in records
+    )
+    assert all(
+        "overlapping_forward_memory_window" in r["incomplete_reasons"] for r in records
+    )
+    assert not rank._planner_active_observations
+
+
+def test_overlapping_scope_does_not_claim_completed_comparison(monkeypatch, tmp_path):
+    rank, plan, _ = _reporting_rank(monkeypatch, tmp_path)
+    one, two = {}, {}
+    check = tr._MemoryCheck(220, 10000, True)
+    for context in (one, two):
+        with rank.planner_observation_scope(context):
+            rank._run_flat_plan_with_memory_tracking(
+                plan, check=check, context="dp_rank_forward"
+            )
+    for context in (one, two):
+        with rank.planner_observation_scope(context):
+            rank.finish_planner_observation()
+    assert not _records(tmp_path)
+    assert not rank._planner_active_observations
+
+
+def test_sequential_scopes_keep_independent_completed_peaks(monkeypatch, tmp_path):
+    rank, plan, counters = _reporting_rank(monkeypatch, tmp_path)
+    for _ in range(2):
+        counters.update(allocated=100, peak=100)
+        with rank.planner_observation_scope({}):
+            rank._run_flat_plan_with_memory_tracking(
+                plan, check=tr._MemoryCheck(220, 10000, True), context="dp_rank_forward"
+            )
+            rank.finish_planner_observation()
+    assert len(_records(tmp_path)) == 2
+    assert not rank._planner_active_observations
