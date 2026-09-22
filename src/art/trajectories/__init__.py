@@ -249,6 +249,14 @@ class ChatCompletionsExchange(_Exchange):
     request: _Preserved[ChatCompletionsRequest]
     response: ChatCompletion
 
+    @pydantic.field_validator("response")
+    @classmethod
+    def attach_training_tokens(cls, response: ChatCompletion) -> ChatCompletion:
+        from ..preprocessing.dynamo_tokens import attach_dynamo_token_metadata
+
+        attach_dynamo_token_metadata(response)
+        return response
+
     @pydantic.field_serializer("response", when_used="json")
     def serialize_response(self, response: ChatCompletion) -> dict[str, Any]:
         return serialize_chat_completion(response)

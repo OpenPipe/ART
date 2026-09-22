@@ -22,6 +22,10 @@ from openai.types.chat.chat_completion import Choice
 from openai.types.responses import Response
 from pydantic import BaseModel
 
+from ..preprocessing.dynamo_tokens import (
+    COMPLETION_LOGPROBS_KEY,
+    choice_completion_logprobs,
+)
 from ..utils.chat_template import (
     chat_template_with_preserved_thinking,
     default_chat_template_kwargs_for_template,
@@ -816,6 +820,11 @@ def _sampled_evidence_fingerprint(
             "prompt_token_ids": prompt,
             "token_ids": choice_extra.get("token_ids"),
             "logprobs": _chat_logprob_fingerprint_evidence(choice),
+            **(
+                {COMPLETION_LOGPROBS_KEY: choice_completion_logprobs(choice)}
+                if COMPLETION_LOGPROBS_KEY in choice_extra
+                else {}
+            ),
             "finish_reason": choice.finish_reason,
         }
     elif protocol == "completions":
@@ -1097,6 +1106,11 @@ def _chat_choice_output_tokens(
         _field(choice, "token_ids"),
         field="Chat Completions token_ids",
     )
+    exact_logprobs = choice_completion_logprobs(choice)
+    if COMPLETION_LOGPROBS_KEY in (choice.model_extra or {}):
+        return token_ids, exact_logprobs if exact_logprobs is not None else [
+            math.nan
+        ] * len(token_ids or [])
     values = _chat_logprob_entries(choice)
     if token_ids == [] and (
         values
