@@ -423,6 +423,7 @@ def test_overlapping_scope_does_not_claim_completed_comparison(monkeypatch, tmp_
     for context in (one, two):
         with rank.planner_observation_scope(context):
             rank._complete_planner_observation()
+            rank.finish_planner_observation()
     assert not _records(tmp_path)
     assert not rank._planner_active_observations
 
@@ -511,7 +512,8 @@ def test_dp_forward_reports_at_forward_boundary_not_later_optimizer(
     [record] = _records(tmp_path)
     assert record["observed_peak_bytes"] == 250
     assert record["phase"] == "forward"
-    assert not rank._planner_active_observations
+    assert rank._planner_active_observations
+    assert rank._planner_observation["window_open"] is False
     counters["peak"] = 10000  # unrelated later optimizer allocation
     rank.finish_planner_observation()
     assert _records(tmp_path) == [record]
@@ -607,3 +609,33 @@ def test_complete_diagnostic_failure_and_cancellation_semantics(monkeypatch, tmp
     monkeypatch.setattr(rank, "discard_planner_observation", cancel)
     with pytest.raises(KeyboardInterrupt):
         rank.finish_planner_observation()
+
+
+def test_closed_dp_context_invalidates_other_executions_open_caller_window(
+    monkeypatch, tmp_path
+):
+    rank, plan, counters = _reporting_rank(monkeypatch, tmp_path)
+    monkeypatch.setattr(rank, "_available_memory_bytes", lambda: 10000)
+    one, two = {}, {}
+    with rank.planner_observation_scope(one):
+        rank._execute_admitted_plan(
+            plan, check=tr._MemoryCheck(220, 10000, True), context="dp_rank_forward"
+        )
+    [forward_report] = _records(tmp_path)
+    assert forward_report["observed_peak_bytes"] == 250
+    assert one["observation"]["window_open"] is False
+
+    iterator = rank.forward_micro_batches([_request(1)])
+    with rank.planner_observation_scope(two):
+        next(iterator)
+    # A resumes caller backward while B's yielded microbatch interval is open.
+    # No new forward occurs to announce that allocator contamination.
+    with rank.planner_observation_scope(one):
+        counters["peak"] = 10000
+        rank.finish_planner_observation()
+    with rank.planner_observation_scope(two):
+        with pytest.raises(StopIteration):
+            next(iterator)
+        rank.finish_planner_observation()
+    assert _records(tmp_path) == [forward_report]
+    assert not rank._planner_active_observations

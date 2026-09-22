@@ -582,7 +582,7 @@ class _CacheRecoveryState:
 
 
 class _PlannerObservation(dict[str, Any]):
-    """Weakly tracked while its allocator measurement window is open."""
+    """Weakly track retained execution/OOM context until execution cleanup."""
 
 
 @dataclass(frozen=True)
@@ -5195,7 +5195,8 @@ class TrainerRank:
             if observation is None or not observation["window_open"]:
                 return
             observation["window_open"] = False
-            self._planner_active_observations.pop(observation["generation"], None)
+            # Later caller/backward work can still perturb another execution's
+            # allocator window, so retain weak overlap custody until cleanup.
             phase = observation["phase"] if phase is None else phase
             observation["phase"] = "caller_after_profile"
             if observation["baseline"] is None or not observation["comparable"]:
