@@ -14,8 +14,9 @@ from collections.abc import (
 )
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager
+from contextvars import ContextVar
 from copy import deepcopy
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from dataclasses import field as dataclass_field
 from functools import partial
 import hashlib
@@ -54,6 +55,7 @@ from art.megatron.prefix_tree_packing import (
     _local_position_pairs,
     estimate_prefix_tree_packed_tokens,
 )
+from art.trainer_rank import _planner_misses
 from art.trainer_rank._planner_cost import (
     COEFFICIENT_VERSION_FALLBACK,
     ModelGeometry,
@@ -579,6 +581,10 @@ class _CacheRecoveryState:
     lock: Any = dataclass_field(default_factory=threading.Lock)
 
 
+class _PlannerObservation(dict[str, Any]):
+    """Weakly track retained execution/OOM context until execution cleanup."""
+
+
 @dataclass(frozen=True)
 class _MemoryCheck:
     estimated_required_bytes: int
@@ -610,6 +616,7 @@ class _CandidateMicroBatch(Generic[ForwardInputsT]):
     stats_global_count: int
     rejected_candidates: int
     cold_start: bool
+    fallback: _CandidateMicroBatch[ForwardInputsT] | None = None
 
 
 class _SlotGraphSentinel(torch.autograd.Function):
@@ -933,6 +940,7 @@ class _ForwardGroupPlan:
     request_indices: tuple[int, ...]
     items: tuple[_ForwardItem, ...]
     packed: PrefixTreePack
+    layout: PrefixTreeLayout | None = None
 
 
 @dataclass(frozen=True)
@@ -1061,6 +1069,8 @@ class _ForwardRefusal:
     plan: _AnyForwardPlan
     check: _MemoryCheck
     message: str
+    overridable: bool = True
+    candidate: Any = None
 
     def error(self, context: str) -> TrainerRankMemoryError:
         return _memory_error(
@@ -1369,6 +1379,18 @@ def _moe_output_bytes_per_token(
 
 class TrainerRank:
     def __init__(self, runtime: TrainingRuntime) -> None:
+        options = _planner_misses.parse_options(os.environ)
+        self._allow_oversized_batches = options.allow_oversized_batches
+        self._planner_reporter = _planner_misses.Reporter(options.threshold_pct)
+        self._planner_observation_context: ContextVar[dict[str, Any] | None] = (
+            ContextVar("trainer_rank_planner_observation", default=None)
+        )
+        self._planner_observation_generation = 0
+        self._planner_active_observations: weakref.WeakValueDictionary[
+            int, _PlannerObservation
+        ] = weakref.WeakValueDictionary()
+        self._planner_overlap_generation = 0
+        self._planner_observation: dict[str, Any] | None = None
         pp_size = int(getattr(runtime.provider, "pipeline_model_parallel_size", 1) or 1)
         if pp_size > 1 or len(runtime.model) > 1:
             raise TrainerRankRuntimeSupportError(
@@ -1439,6 +1461,12 @@ class TrainerRank:
             device_memory = int(
                 torch.cuda.get_device_properties(parameter.device).total_memory
             )
+        self._planner_device_identity = {
+            "capability": capability,
+            "total_memory_bytes": device_memory,
+            "torch": torch.__version__,
+            "cuda": torch.version.cuda,
+        }
         spec = getattr(runtime, "model_support_spec", None)
         self._moe_layers = _moe_layer_count(runtime.model[0])
         self._checkpointed_moe_layers = sum(
@@ -2431,6 +2459,7 @@ class TrainerRank:
                     candidate.plan, memory_baseline, forward_peak
                 )
             # Only the caller may retain completed outputs into the next wave.
+            self._complete_planner_observation()
             del tracked_outputs, flat_outputs, outputs
             start = stop
 
@@ -2516,10 +2545,12 @@ class TrainerRank:
             outputs, _baseline = self._run_flat_plan_with_memory_tracking(
                 plan, check=check, context=context
             )
-            return outputs
-        outputs, _baseline, _peak = self._execute_split_plan_with_memory_tracking(
-            plan, check=check, context=context
-        )
+        else:
+            outputs, _baseline, _peak = self._execute_split_plan_with_memory_tracking(
+                plan, check=check, context=context
+            )
+        # This API calibrates only forward, unlike the yielded microbatch API.
+        self._complete_planner_observation(phase="forward")
         return outputs
 
     def _execute_split_plan_with_memory_tracking(
@@ -2527,6 +2558,8 @@ class TrainerRank:
     ) -> tuple[list[AnyForwardOutput], int | None, int]:
         state = self._recovery_state()
         work_before = state.work
+        self._begin_planner_observation(plan, check)
+        self._planner_observing_split = True
         try:
             baseline, peak = None, 0
             merged: list[AnyForwardOutput | None] = [None] * plan.request_count
@@ -2562,6 +2595,8 @@ class TrainerRank:
         except BaseException:
             state.work = work_before
             raise
+        finally:
+            self._planner_observing_split = False
 
     def _plan_admissible_forward(
         self,
@@ -2583,6 +2618,7 @@ class TrainerRank:
             lambda value, check: (value[0], check),
             context=context,
             sync_across_dp=False,
+            admit_refusal=lambda refusal: (refusal.plan, refusal.check),
         )
         self._snapshot_planning_telemetry(*result)
         return result
@@ -2619,6 +2655,7 @@ class TrainerRank:
         check = self._memory_check(plan)
         if check.fits:
             return plan, check
+        best = (plan, check)
         # Best effort before splitting: the memory-minimal (full sharing)
         # layouts may fit where the cost-optimal ones do not.
         plan = self._plan_flat_forward(
@@ -2627,10 +2664,17 @@ class TrainerRank:
         check = self._memory_check(plan)
         if check.fits:
             return plan, check
+        if check.estimated_required_bytes < best[1].estimated_required_bytes:
+            best = (plan, check)
         request_count = len(requests)
         if request_count == 1:
             return _ForwardRefusal(
-                plan, check, f"{refusal_prefix}; a single request cannot be split"
+                *(
+                    best
+                    if getattr(self, "_allow_oversized_batches", False)
+                    else (plan, check)
+                ),
+                f"{refusal_prefix}; a single request cannot be split",
             )
         if self._expert_parallel_active():
             return _ForwardRefusal(
@@ -2638,7 +2682,19 @@ class TrainerRank:
                 check,
                 f"{refusal_prefix}; unable to find a feasible split: internal "
                 "splitting is disabled under expert parallelism in this release",
+                overridable=False,
             )
+        # A rejected lower bound normally avoids materializing the rung. If
+        # ranks disagree on the opt-in, keep that original behavior everywhere
+        # so the exact-pricing collectives cannot diverge within TP x CP.
+        keep_rejected = (
+            self._recovery_reduce(
+                [float(getattr(self, "_allow_oversized_batches", False))],
+                op="MIN",
+                sync_across_dp=False,
+            )[0]
+            == 1
+        )
         rows = tuple(
             request.input_tokens.detach().reshape(-1).to("cpu", torch.long)
             for request in requests
@@ -2648,16 +2704,28 @@ class TrainerRank:
         while True:
             chunks = _split_chunks(order, requests, subforward_count)
             split, check = self._admit_split_rung(
-                chunks, requests, rows, checkpoint=checkpoint
+                chunks,
+                requests,
+                rows,
+                checkpoint=checkpoint,
+                keep_rejected=keep_rejected,
             )
-            if split is not None:
+            if split is not None and check.fits:
                 return split, check
+            if (
+                split is not None
+                and check.estimated_required_bytes < best[1].estimated_required_bytes
+            ):
+                best = (split, check)
             if subforward_count >= request_count:
                 break
             subforward_count = min(request_count, subforward_count * 2)
         return _ForwardRefusal(
-            plan,
-            check,
+            *(
+                best
+                if getattr(self, "_allow_oversized_batches", False)
+                else (plan, check)
+            ),
             f"{refusal_prefix}; unable to find a feasible split: every rung of "
             "the bounded ladder (2, 4, ..., one request per subforward) is "
             "predicted to exceed available memory once all returned graphs are "
@@ -2679,6 +2747,7 @@ class TrainerRank:
         rows: Sequence[torch.Tensor],
         *,
         checkpoint: AdapterSelection,
+        keep_rejected: bool | None = None,
     ) -> tuple[_SplitForwardPlan | None, _MemoryCheck]:
         """Admit one rung of the ladder, or return its binding memory check.
 
@@ -2709,8 +2778,11 @@ class TrainerRank:
             for chunk in chunks
         ]
         check = self._split_rung_check(lower)
-        if not check.fits:
+        if keep_rejected is None:
+            keep_rejected = getattr(self, "_allow_oversized_batches", False)
+        if not check.fits and not keep_rejected:
             return None, check
+        best: tuple[_SplitForwardPlan | None, _MemoryCheck] = (None, check)
         for memory_minimal in (False, True):
             plans = [
                 self._plan_flat_forward(
@@ -2732,7 +2804,12 @@ class TrainerRank:
             check = self._split_plan_memory_check(split, costs)
             if check.fits:
                 return split, check
-        return None, check
+            if (
+                best[0] is None
+                or check.estimated_required_bytes < best[1].estimated_required_bytes
+            ):
+                best = (split, check)
+        return best if keep_rejected else (None, check)
 
     def _split_rung_check(self, costs: Sequence[_SubforwardCost]) -> _MemoryCheck:
         return self._memory_check_required(
@@ -3910,12 +3987,27 @@ class TrainerRank:
         *,
         checkpoint: AdapterSelection = Unset,
     ) -> _CandidateMicroBatch[ForwardInputsT]:
+        def admit(refusal: _ForwardRefusal) -> _CandidateMicroBatch[ForwardInputsT]:
+            dp_rank, dp_size = self._dp_rank_and_size()
+            width = min(len(items) - start, dp_size)
+            indices = _local_wave_indices(start, width, dp_rank, dp_size)
+            return _CandidateMicroBatch(
+                inputs=[items[index] for index in indices],
+                indices=indices,
+                plan=refusal.plan,
+                check=refusal.check,
+                stats_global_count=width,
+                rejected_candidates=1,
+                cold_start=True,
+            )
+
         return self._recover_admission(
             lambda: self._search_next_micro_batch(items, start, checkpoint=checkpoint),
             lambda value: (value.plan, value.check),
             lambda value, check: replace(value, check=check),
             context="forward_micro_batches",
             sync_across_dp=True,
+            admit_refusal=admit,
         )
 
     def _search_next_micro_batch(
@@ -3939,6 +4031,7 @@ class TrainerRank:
 
         estimates: dict[int, tuple[_MemoryCheck, bool, bool] | None] = {}
         plans: dict[int, _FlatForwardPlan] = {}
+        checked_plans: dict[int, _MemoryCheck] = {}
         # Per-width layout mode chosen by admission: False = cost-optimal,
         # True = memory-minimal (full sharing). Materialization must build the
         # same layouts the admitted estimate priced.
@@ -4085,6 +4178,8 @@ class TrainerRank:
                 profiled = self._all_ranks_true(plan.signature in self._memory_profiles)
             else:
                 check, trusted, profiled = result
+            if width in plans:
+                checked_plans[width] = check
             if not check.fits:
                 rejected_widths.add(width)
             return check.fits and (trusted or not profiled), trusted
@@ -4119,7 +4214,7 @@ class TrainerRank:
                 packed_tokens=plan.packed_tokens,
                 signature=plan.signature,
             )
-            return _CandidateMicroBatch(
+            selected = _CandidateMicroBatch(
                 inputs=local_inputs,
                 indices=indices,
                 plan=plan,
@@ -4128,6 +4223,27 @@ class TrainerRank:
                 rejected_candidates=len(rejected_widths),
                 cold_start=cold_start,
             )
+            checked_plans[width] = check
+            if getattr(self, "_allow_oversized_batches", False):
+                smallest = min(
+                    checked_plans,
+                    key=lambda w: (checked_plans[w].estimated_required_bytes, w),
+                )
+                if smallest != width:
+                    fallback_indices, fallback_inputs = local_slice(smallest)
+                    selected = replace(
+                        selected,
+                        fallback=_CandidateMicroBatch(
+                            inputs=fallback_inputs,
+                            indices=fallback_indices,
+                            plan=plans[smallest],
+                            check=checked_plans[smallest],
+                            stats_global_count=smallest,
+                            rejected_candidates=len(rejected_widths),
+                            cold_start=True,
+                        ),
+                    )
+            return selected
 
         first_estimate = estimate(min_width)
         if first_estimate is None or not (first_estimate[0].fits and first_estimate[1]):
@@ -4596,6 +4712,14 @@ class TrainerRank:
                         request_indices=tuple(group_indices),
                         items=items,
                         packed=packed,
+                        layout=layout
+                        if getattr(
+                            getattr(self, "_planner_reporter", None),
+                            "threshold_pct",
+                            None,
+                        )
+                        is not None
+                        else None,
                     )
                 )
 
@@ -4762,12 +4886,19 @@ class TrainerRank:
         check: _MemoryCheck,
         context: str,
     ) -> tuple[list[AnyForwardOutput], int | None]:
+        if not getattr(self, "_planner_observing_split", False):
+            self._begin_planner_observation(plan, check)
         if torch.cuda.is_available() and self.device.type == "cuda":
             torch.cuda.synchronize(self.device)
             baseline = int(torch.cuda.memory_allocated(self.device))
             torch.cuda.reset_peak_memory_stats(self.device)
         else:
             baseline = None
+        observation = getattr(self, "_planner_observation", None)
+        if observation is not None:
+            if observation["baseline"] is None:
+                observation["baseline"] = baseline
+            observation["phase"] = "forward"
         started = self._recovery_clock() if baseline is not None else None
         try:
             with _telemetry_phase(
@@ -4780,6 +4911,7 @@ class TrainerRank:
                 if torch.cuda.is_available() and self.device.type == "cuda":
                     torch.cuda.synchronize(self.device)
         except torch.cuda.OutOfMemoryError as exc:
+            self.report_planner_oom(exc)
             raise _memory_error(
                 context=context,
                 message="CUDA OOM occurred despite the planner estimate",
@@ -4801,6 +4933,8 @@ class TrainerRank:
                 self._record_recovery_work(context, seconds)
             except Exception:
                 self._recovery_state().invalid = True
+        if observation is not None:
+            observation["phase"] = "forward_and_caller"
         return outputs, baseline
 
     def _update_peak_memory_profile(
@@ -4812,6 +4946,9 @@ class TrainerRank:
         if baseline is None:
             return
         peak = int(torch.cuda.max_memory_allocated(self.device))
+        observation = getattr(self, "_planner_observation", None)
+        if observation is not None:
+            observation["peak"] = max(observation["peak"], peak)
         self._update_memory_profile(
             plan,
             max(0, peak - baseline),
@@ -4819,6 +4956,405 @@ class TrainerRank:
                 None if retained_after is None else max(0, retained_after - baseline)
             ),
         )
+
+    def _begin_planner_observation(
+        self, plan: _AnyForwardPlan, check: _MemoryCheck
+    ) -> None:
+        reporter = getattr(self, "_planner_reporter", None)
+        if reporter is None or reporter.threshold_pct is None:
+            return
+        self.finish_planner_observation()
+        self._planner_observation_generation += 1
+        if self._planner_active_observations:
+            # Both the suspended caller and the newly entered forward share
+            # allocator counters; neither interval may claim a completed peak.
+            self._planner_overlap_generation = self._planner_observation_generation
+        # A snapshot failure must still leave a durable minimal OOM report.
+        observation = _PlannerObservation(
+            {
+                "predicted": check.estimated_required_bytes,
+                "admission": check.estimated_required_bytes,
+                "replay": lambda: {
+                    "incomplete_reasons": ["planner_snapshot_unavailable"]
+                },
+                "baseline": None,
+                "peak": 0,
+                "phase": "forward",
+                "comparable": False,
+                "generation": self._planner_observation_generation,
+                "window_open": True,
+            }
+        )
+        self._planner_observation = observation
+        self._planner_active_observations[observation["generation"]] = observation
+        try:
+            children = (
+                plan.subforwards if isinstance(plan, _SplitForwardPlan) else (plan,)
+            )
+            # Freeze scalar calibration before forward updates it. Keep owned
+            # request references, not new token copies or autograd outputs.
+            costs = [self._plan_cost(child) for child in children]
+            estimates = []
+            for child, cost in zip(children, costs, strict=True):
+                estimates.append(
+                    {
+                        "signature": asdict(child.signature),
+                        "profile": asdict(profile)
+                        if (profile := self._memory_profiles.get(child.signature))
+                        else None,
+                        "arguments": {
+                            "packed_tokens": child.packed_tokens,
+                            "output_bytes": child.output_bytes,
+                            "logical_tokens": child.active_logical_tokens,
+                            "gdn_segments": child.grad_segment_count,
+                            "retained_tokens": self._plan_retained_tokens(child),
+                        },
+                        "expected_required_bytes": cost.required,
+                        "retained_bytes": cost.retained,
+                    }
+                )
+            floor = 0
+            if isinstance(plan, _SplitForwardPlan):
+                key = self._split_memory_key(plan)
+                floor = self._split_memory_floors.get(key, 0) if key is not None else 0
+            local_required = max(
+                sum(cost.retained for cost in costs)
+                + max(cost.ephemeral for cost in costs),
+                int(floor * _MEMORY_SAFETY_FACTOR),
+            )
+            rank_fields = {
+                name: getattr(self, "_" + name)
+                for name in (
+                    "num_layers",
+                    "hidden_size",
+                    "param_dtype_size",
+                    "recompute_granularity",
+                    "sequence_parallel",
+                    "attention_output_gate",
+                    "mlp_activation_factor",
+                    "gdn_layers",
+                    "checkpointed_moe_layers",
+                    "moe_output_bytes_per_token",
+                )
+            }
+            rank_fields["recompute_modules"] = sorted(self._recompute_modules)
+            rank_fields["geometry"] = asdict(self._geometry)
+            rank_fields["topology"] = list(plan.signature.topology)
+
+            def version(tensor: torch.Tensor | None) -> int | None:
+                try:
+                    return None if tensor is None else tensor._version
+                except RuntimeError:
+                    return None
+
+            tensors = [
+                (item, version(item.input_ids), version(item.labels))
+                for group in plan.groups
+                for item in group.items
+            ]
+            slots = [str(group.slot_ref) for group in plan.groups]
+            selected_names = {
+                getattr(group.slot_ref, "name", None) for group in plan.groups
+            }
+            checkpoint_sources = {
+                name: self._checkpoint_prefetch_sources[name]
+                for name in selected_names
+                if name in self._checkpoint_prefetch_sources
+            }
+            spec = getattr(self.runtime, "model_support_spec", None)
+            bridge = getattr(
+                getattr(self.runtime, "provider_bundle", None), "bridge", None
+            )
+            pretrained = getattr(bridge, "hf_pretrained", None)
+            config = getattr(pretrained, "config", pretrained)
+            model = {
+                "support_key": getattr(spec, "key", None),
+                "name_or_path": getattr(config, "_name_or_path", None),
+                "revision": getattr(config, "_commit_hash", None),
+                "dtype": str(next(self.runtime.model[0].parameters()).dtype),
+            }
+
+            def replay() -> dict[str, Any]:
+                remaining = 1_000_000
+                incomplete: set[str] = set()
+
+                def tensor_data(
+                    tensor: torch.Tensor | None, original_version: int | None
+                ) -> Any:
+                    nonlocal remaining
+                    if tensor is None:
+                        return None
+                    reason = None
+                    if (
+                        tensor.device.type != "cpu"
+                        or original_version is None
+                        or version(tensor) != original_version
+                    ):
+                        reason = "device_or_modified_input"
+                    elif tensor.numel() > remaining:
+                        reason = "token_inventory_over_limit"
+                    if reason is not None:
+                        incomplete.add(reason)
+                        return {
+                            "unavailable": reason,
+                            "shape": list(tensor.shape),
+                            "dtype": str(tensor.dtype),
+                        }
+                    remaining -= tensor.numel()
+                    return tensor.tolist()
+
+                requests = [
+                    {
+                        "input_tokens": tensor_data(item.input_ids, input_version),
+                        "target_tokens": tensor_data(item.labels, label_version),
+                        "top_k": item.request.top_k,
+                        "logits": item.request.logits,
+                        "hidden_states": item.request.hidden_states,
+                        "no_grad": item.request.no_grad,
+                        "checkpoint": str(item.request.checkpoint),
+                    }
+                    for item, input_version, label_version in tensors
+                ]
+                layouts = []
+                cursor = 0
+                for group in plan.groups:
+                    rows = [
+                        item["input_tokens"]
+                        for item in requests[cursor : cursor + len(group.items)]
+                    ]
+                    cursor += len(group.items)
+                    if group.layout is None:
+                        incomplete.add("selected_layout_unavailable")
+                    elif not all(isinstance(row, list) for row in rows):
+                        incomplete.add("layout_inputs_unavailable")
+                    else:
+                        layouts.append(
+                            {
+                                "input_tokens": rows,
+                                "selected_decisions": sorted(
+                                    group.layout.selected_decisions
+                                ),
+                                "expected_fingerprint": group.layout.fingerprint,
+                                "expected_packed_tokens": group.layout.packed_tokens,
+                            }
+                        )
+                return {
+                    "memory_replay": {"rank": rank_fields, "estimates": estimates},
+                    "layouts": layouts,
+                    "incomplete_reasons": sorted(incomplete),
+                    "model": model["name_or_path"],
+                    "model_identity": model,
+                    "requests": requests,
+                    "plan": self._telemetry_signature(plan),
+                    "subforward_request_indices": list(plan.request_indices)
+                    if isinstance(plan, _SplitForwardPlan)
+                    else [list(range(plan.request_count))],
+                    "group_request_indices": [
+                        list(group.request_indices) for group in plan.groups
+                    ],
+                    "subforward_group_counts": [
+                        len(child.groups) for child in children
+                    ],
+                    "checkpoint_slots": slots,
+                    "checkpoint_sources": checkpoint_sources,
+                    "split_memory_floor_bytes": floor,
+                    "local_admission_peak_bytes": local_required,
+                    "reduced_admission_peak_bytes": check.estimated_required_bytes,
+                    "available_bytes": check.available_bytes,
+                    "safety_factor": _MEMORY_SAFETY_FACTOR,
+                    "rank": dist.get_rank()
+                    if dist.is_available() and dist.is_initialized()
+                    else 0,
+                    "device": {
+                        "device": str(self.device),
+                        **self._planner_device_identity,
+                    },
+                }
+
+            observation.update(
+                {
+                    "predicted": round(local_required / _MEMORY_SAFETY_FACTOR),
+                    "admission": check.estimated_required_bytes,
+                    "replay": replay,
+                    "baseline": None,
+                    "peak": 0,
+                    "phase": "forward",
+                    "comparable": True,
+                    "generation": self._planner_observation_generation,
+                }
+            )
+        except Exception:
+            # Reporting is auxiliary; a diagnostic failure cannot change the
+            # model's ordinary execution or replace an OOM.
+            _planner_misses._warn("could not prepare planner-miss observation")
+
+    def _complete_planner_observation(self, *, phase: str | None = None) -> None:
+        """Close at the existing profiling boundary, retaining only OOM context."""
+        try:
+            observation = getattr(self, "_planner_observation", None)
+            if observation is None or not observation["window_open"]:
+                return
+            observation["window_open"] = False
+            # Later caller/backward work can still perturb another execution's
+            # allocator window, so retain weak overlap custody until cleanup.
+            phase = observation["phase"] if phase is None else phase
+            observation["phase"] = "caller_after_profile"
+            if observation["baseline"] is None or not observation["comparable"]:
+                return
+            if observation["generation"] <= self._planner_overlap_generation:
+                _planner_misses._warn(
+                    "overlapping forwards invalidated the allocator peak interval"
+                )
+                return
+            peak = max(
+                observation["peak"], int(torch.cuda.max_memory_allocated(self.device))
+            )
+            self._planner_reporter.report(
+                predicted_peak_bytes=observation["predicted"],
+                observed_peak_bytes=max(0, peak - observation["baseline"]),
+                phase=phase,
+                replay_factory=observation["replay"],
+                admission_peak_bytes=observation["admission"],
+            )
+        except Exception:
+            _planner_misses._warn("could not finish planner-miss observation")
+
+    def finish_planner_observation(self) -> None:
+        """Release execution context without sampling an unbounded caller peak.
+
+        ART compares completed peaks at its existing profiling boundaries:
+        dp_rank_forward's return or forward_micro_batches' iterator resume.
+        Caladan calls this at execution end. Direct callers can report a caught
+        caller OOM before cleanup, then call this method to release the context.
+        An abandoned microbatch iterator cannot mint a completed comparison.
+        """
+        try:
+            self.discard_planner_observation()
+        except Exception:
+            _planner_misses._warn("could not finish planner-miss execution")
+
+    def report_planner_oom(self, error: BaseException) -> None:
+        """Persist a caught CUDA OOM before caller cleanup, then leave it alone.
+
+        This does not suppress, retry, or recover the original failure. An OOM
+        after the profiled window retains inputs but cannot claim a partial peak
+        for that window, let alone a completed error percentage.
+        """
+        try:
+            original: BaseException | None = error
+            seen: set[int] = set()
+            while original is not None and id(original) not in seen:
+                if isinstance(original, torch.cuda.OutOfMemoryError):
+                    break
+                seen.add(id(original))
+                original = original.__cause__
+            observation = getattr(self, "_planner_observation", None)
+            if (
+                original is None
+                or not isinstance(original, torch.cuda.OutOfMemoryError)
+                or observation is None
+            ):
+                return
+            self.discard_planner_observation()
+            reasons = []
+            if observation["generation"] <= self._planner_overlap_generation:
+                reasons.append("overlapping_forward_memory_window")
+            if not observation["window_open"]:
+                reasons.append("oom_after_profiled_window")
+            partial = None
+            try:
+                if observation["baseline"] is not None and not reasons:
+                    partial = max(
+                        0,
+                        max(
+                            observation["peak"],
+                            int(torch.cuda.max_memory_allocated(self.device)),
+                        )
+                        - observation["baseline"],
+                    )
+            except Exception:
+                pass
+            oom_facts: dict[str, Any] = {
+                "type": type(original).__name__,
+                "message": str(original)[:4096],
+                "baseline_bytes": observation["baseline"],
+            }
+            try:
+                stats = torch.cuda.memory_stats(self.device)
+                oom_facts["allocator"] = {
+                    key: stats[key]
+                    for key in (
+                        "allocated_bytes.all.current",
+                        "reserved_bytes.all.current",
+                        "active_bytes.all.current",
+                        "num_ooms",
+                        "num_alloc_retries",
+                    )
+                    if key in stats
+                }
+            except Exception:
+                oom_facts["allocator"] = None
+
+            def replay() -> dict[str, Any]:
+                return {
+                    **observation["replay"](),
+                    "oom": oom_facts,
+                    "measurement_valid": not reasons,
+                    "window_reasons": reasons,
+                }
+
+            self._planner_reporter.report(
+                predicted_peak_bytes=observation["predicted"],
+                observed_peak_bytes=None,
+                oom=True,
+                phase=observation["phase"],
+                replay_factory=replay,
+                admission_peak_bytes=observation["admission"],
+                partial_peak_bytes=partial,
+            )
+        except Exception:
+            _planner_misses._warn("could not persist planner OOM report")
+
+    def discard_planner_observation(self) -> None:
+        try:
+            observation = getattr(self, "_planner_observation", None)
+            if observation is not None:
+                self._planner_active_observations.pop(observation["generation"], None)
+            self._planner_observation = None
+        except Exception:
+            _planner_misses._warn("could not discard planner-miss observation")
+
+    @property
+    def _planner_observation(self) -> dict[str, Any] | None:
+        variable = getattr(self, "_planner_observation_context", None)
+        context = None if variable is None else variable.get()
+        return (
+            getattr(self, "_planner_unscoped_observation", None)
+            if context is None
+            else context.get("observation")
+        )
+
+    @_planner_observation.setter
+    def _planner_observation(self, value: dict[str, Any] | None) -> None:
+        variable = getattr(self, "_planner_observation_context", None)
+        context = None if variable is None else variable.get()
+        if context is None:
+            self._planner_unscoped_observation = value
+        else:
+            context["observation"] = value
+
+    @contextmanager
+    def planner_observation_scope(self, context: dict[str, Any]) -> Iterator[None]:
+        """Use one holder per execution, retaining it across async-generator steps.
+
+        A scope changes only diagnostic ownership. It does not serialize model
+        work or make the process-wide CUDA peak counter execution-local.
+        """
+        token = self._planner_observation_context.set(context)
+        try:
+            yield
+        finally:
+            self._planner_observation_context.reset(token)
 
     @staticmethod
     def _telemetry_plan_signature(plan: _AnyForwardPlan) -> dict[str, object]:
@@ -5158,15 +5694,67 @@ class TrainerRank:
         *,
         context: str,
         sync_across_dp: bool,
+        admit_refusal: Callable[[_ForwardRefusal], Any] | None = None,
     ) -> Any:
         """Pure search, at most one smaller-plan refresh, then one recovery."""
         original: TrainerRankMemoryError | None = None
         refused: _ForwardRefusal | None = None
+        best: _ForwardRefusal | None = None
+
+        def reject() -> Any:
+            assert refused is not None
+            if admit_refusal is not None:
+                # Only the exhausted memory-refusal path changes. Every peer
+                # must have a supported candidate; never override an EP or
+                # failed planning/runtime capability guard.
+                allowed = (
+                    getattr(self, "_allow_oversized_batches", False)
+                    and refused.overridable
+                    and best is not None
+                )
+                selected = None
+                if allowed:
+                    assert best is not None
+                    selected = (
+                        update(best.candidate, best.check)
+                        if best.candidate is not None
+                        else admit_refusal(best)
+                    )
+                width = (
+                    selected.stats_global_count
+                    if isinstance(selected, _CandidateMicroBatch)
+                    else 0
+                )
+                agreed = self._recovery_reduce(
+                    [float(allowed), float(width), -float(width)],
+                    op="MIN",
+                    sync_across_dp=sync_across_dp,
+                )
+                if agreed[0] == 1 and agreed[1] == -agreed[2]:
+                    return selected
+            raise refused.error(context) from original
 
         def finish(value: Any) -> Any:
-            nonlocal refused
+            nonlocal refused, best
             if isinstance(value, _ForwardRefusal):
+                if sync_across_dp and admit_refusal is not None:
+                    # Minimum-wave split checks are TP x CP-local. Compare
+                    # them against larger world-priced waves on the same basis
+                    # so every DP rank retains the same logical wave width.
+                    value = replace(
+                        value,
+                        check=self._memory_check_required(
+                            value.check.estimated_required_bytes,
+                            sync_across_dp=True,
+                        ),
+                    )
                 refused = value
+                if value.overridable and (
+                    best is None
+                    or value.check.estimated_required_bytes
+                    < best.check.estimated_required_bytes
+                ):
+                    best = value
                 return None
             plan, check = describe(value)
             if sync_across_dp:
@@ -5176,8 +5764,29 @@ class TrainerRank:
             if check.fits:
                 return update(value, check)
             refused = _ForwardRefusal(
-                plan, check, "selected plan exceeds freshly sampled available memory"
+                plan,
+                check,
+                "selected plan exceeds freshly sampled available memory",
+                candidate=value,
             )
+            if (
+                best is None
+                or check.estimated_required_bytes < best.check.estimated_required_bytes
+            ):
+                best = refused
+            if isinstance(value, _CandidateMicroBatch) and value.fallback is not None:
+                fallback = value.fallback
+                if (
+                    best is None
+                    or fallback.check.estimated_required_bytes
+                    < best.check.estimated_required_bytes
+                ):
+                    best = _ForwardRefusal(
+                        fallback.plan,
+                        fallback.check,
+                        refused.message,
+                        candidate=fallback,
+                    )
             return None
 
         value = search()
@@ -5204,7 +5813,7 @@ class TrainerRank:
                     # Counters moved again: do not loop or reclaim for a large width.
                     assert refused is not None
                     self._snapshot_planning_telemetry(refused.plan, refused.check)
-                    raise refused.error(context) from original
+                    return reject()
             assert refused is not None
             if self._try_cache_recovery(
                 refused.check,
@@ -5218,8 +5827,7 @@ class TrainerRank:
                     return result
             assert refused is not None
             self._snapshot_planning_telemetry(refused.plan, refused.check)
-            latest = refused.error(context)
-            raise latest from original
+            return reject()
         except BaseException as exc:
             primary = exc
             raise
