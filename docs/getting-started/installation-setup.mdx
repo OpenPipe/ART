@@ -88,7 +88,7 @@ Tinker users install `openpipe-art[tinker]`; serverless users need only
 Instead of managing the GPUs and training processes yourself, you can optionally send inference and training requests to the W&B Training cluster, which autoscales to match your job's demand. To do so, install `openpipe-art` without any extras and use `ServerlessBackend`:
 
 ```bash
-pip install openpipe-art
+pip install openpipe-art==0.5.20
 ```
 
 
@@ -100,13 +100,14 @@ backend = ServerlessBackend()
 
 model = TrainableModel(
     name="agent-001",
+    run_name="agent-001",
     project="my-agentic-task",
-    base_model="OpenPipe/Qwen3-14B-Instruct",
+    base_model="Qwen/Qwen3.8-27B",
 )
 
 await model.register(backend)
 
-... the rest of your code ...
+# ... the rest of your code ...
 ```
 
 To learn more about the ART client and server, see the docs below.
