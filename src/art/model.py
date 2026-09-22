@@ -39,6 +39,7 @@ from .metrics_taxonomy import (
     build_data_metrics_from_summary,
     summarize_trajectory_groups,
 )
+from .preprocessing.dynamo_tokens import attach_dynamo_token_metadata
 from .preprocessing.policy_spans import (
     POLICY_TOKEN_SPANS_KEY,
     PROMPT_POLICY_TOKEN_SPANS_KEY,
@@ -94,6 +95,12 @@ def _merge_extra_body_defaults(
     for key, value in provided.items():
         if isinstance(value, dict) and isinstance(merged.get(key), dict):
             merged[key] = {**merged[key], **value}
+            if key == "nvext":
+                fields = value.get("extra_fields", [])
+                if isinstance(fields, list):
+                    merged[key]["extra_fields"] = list(
+                        dict.fromkeys([*defaults[key].get("extra_fields", []), *fields])
+                    )
         else:
             merged[key] = value
     return merged
@@ -109,6 +116,7 @@ def _attach_response_art_metadata(
     model_dump = getattr(response, "model_dump", None)
     if not choices or not callable(model_dump):
         return
+    attach_dynamo_token_metadata(response)
     response_payload = model_dump(mode="python")
     if routed_experts is not None:
         from .preprocessing.moe_routing import attach_moe_routing_metadata_to_choice
@@ -722,6 +730,7 @@ class Model(
         if self.trainable:
             body["return_token_ids"] = True
             body["return_tokens_as_token_ids"] = True
+            body["nvext"] = {"extra_fields": ["engine_data"]}
         configured_chat_template_kwargs = (
             internal_config.get("chat_template_kwargs")
             if internal_config is not None
