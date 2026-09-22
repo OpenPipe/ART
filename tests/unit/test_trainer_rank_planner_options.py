@@ -245,6 +245,42 @@ def test_nonoom_does_not_mint_oom_report(monkeypatch, tmp_path):
     assert not _records(tmp_path)
 
 
+@pytest.mark.parametrize("oom", [False, True])
+def test_delayed_report_keeps_original_request_options(monkeypatch, tmp_path, oom):
+    rank, plan, counters = _reporting_rank(monkeypatch, tmp_path)
+    request = plan.groups[0].items[0].request
+    original = {
+        "top_k": request.top_k,
+        "logits": request.logits,
+        "hidden_states": request.hidden_states,
+        "no_grad": request.no_grad,
+        "checkpoint": str(request.checkpoint),
+    }
+    output_bytes = plan.output_bytes
+    rank._run_flat_plan_with_memory_tracking(
+        plan, check=tr._MemoryCheck(220, 10000, True), context="dp_rank_forward"
+    )
+    # Caller/backward work can reuse the mutable ForwardInput before emission.
+    request.top_k = 9
+    request.logits = request.hidden_states = request.no_grad = True
+    request.checkpoint = "replacement"
+    if oom:
+        rank.report_planner_oom(torch.cuda.OutOfMemoryError("caller backward"))
+    else:
+        rank._complete_planner_observation()
+    rank.finish_planner_observation()
+    [record] = _records(tmp_path)
+    replay = record["replay"]
+    assert {name: replay["requests"][0][name] for name in original} == original
+    assert replay["memory_replay"]["estimates"][0]["arguments"]["output_bytes"] == (
+        output_bytes
+    )
+    assert record["replay_complete"]
+    assert record["incomplete_reasons"] == []
+    assert record["oom"] is oom
+    assert counters["syncs"] == 2
+
+
 def test_changed_tokens_mark_replay_incomplete(monkeypatch, tmp_path):
     rank, plan, _ = _reporting_rank(monkeypatch, tmp_path)
     rank._run_flat_plan_with_memory_tracking(
