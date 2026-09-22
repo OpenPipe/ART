@@ -378,6 +378,7 @@ def replay(
     dp, tp, cp, pp = values["topology"]
     rank._topology_key = lambda: (dp, tp, cp, pp)
     estimates = []
+    costs = []
     for item in state["estimates"]:
         signature = dict(item["signature"])
         for name in ("topology", "planner_coefficients", "request_mix", "grad_modes"):
@@ -388,15 +389,32 @@ def replay(
             if item["profile"] is not None
             else {}
         )
-        actual = rank._estimate_required_memory_bytes_from_values(
-            signature=key, **item["arguments"]
-        )
+        cost = rank._subforward_cost(signature=key, **item["arguments"])
+        costs.append(cost)
         estimates.append(
             {
-                "required_bytes": actual,
-                "matches": actual == item["expected_required_bytes"],
+                "required_bytes": cost.required,
+                "retained_bytes": cost.retained,
+                "matches": cost.required == item["expected_required_bytes"]
+                and cost.retained == item["retained_bytes"],
             }
         )
+    safety = _impl._MEMORY_SAFETY_FACTOR
+    required = max(
+        sum(cost.retained for cost in costs) + max(cost.ephemeral for cost in costs),
+        int(payload["split_memory_floor_bytes"] * safety),
+    )
+    predicted = round(required / safety)
+    aggregate = {
+        "local_admission_peak_bytes": required,
+        "predicted_peak_bytes": predicted,
+        # Reduced admission is a separately recorded cross-rank result. CPU
+        # replay verifies that join, not the absent peers' measurements.
+        "matches": required == payload["local_admission_peak_bytes"]
+        and predicted == report["predicted_peak_bytes"]
+        and safety == payload["safety_factor"]
+        and report["admission_peak_bytes"] == payload["reduced_admission_peak_bytes"],
+    }
     layouts = []
     for item in payload.get("layouts", []):
         tree = build_canonical_prefix_tree(item["input_tokens"])
@@ -413,6 +431,7 @@ def replay(
         "scope": "cpu-memory-estimator",
         "source_matches": source_matches,
         "estimates": estimates,
+        "aggregate": aggregate,
         "layouts": layouts,
     }
 
@@ -430,7 +449,9 @@ def main() -> None:
         raise ValueError("report exceeds byte limit")
     result = replay(validate_report(raw), allow_source_drift=args.allow_source_drift)
     print(json.dumps(result, sort_keys=True))
-    if not all(item["matches"] for item in result["estimates"] + result["layouts"]):
+    if not result["aggregate"]["matches"] or not all(
+        item["matches"] for item in result["estimates"] + result["layouts"]
+    ):
         raise SystemExit(1)
 
 

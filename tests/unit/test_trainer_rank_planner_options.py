@@ -96,7 +96,7 @@ def test_disagreeing_peer_refuses_override(monkeypatch):
     monkeypatch.setattr(rank, "_recovery_reduce", reduce)
     with pytest.raises(tr.TrainerRankMemoryError):
         rank.dp_rank_forward([_request(0)])
-    assert seen == [([1.0], "MIN", False)]
+    assert seen == [([1.0, 0.0, 0.0], "MIN", False)]
 
 
 def test_microbatch_override_keeps_minimum_wave_inputs(monkeypatch):
@@ -112,9 +112,9 @@ def test_microbatch_override_keeps_minimum_wave_inputs(monkeypatch):
 
 def test_nonmemory_validation_is_not_overridden(monkeypatch):
     rank = _oversized(monkeypatch)
-    with pytest.raises(ValueError, match="empty"):
+    with pytest.raises(ValueError, match="exceeds vocabulary"):
         rank.dp_rank_forward(
-            [tr.ForwardInput(input_tokens=torch.tensor([], dtype=torch.long))]
+            [tr.ForwardInput(input_tokens=torch.tensor([1]), top_k=1000)]
         )
 
 
@@ -433,3 +433,61 @@ def test_sequential_scopes_keep_independent_completed_peaks(monkeypatch, tmp_pat
             rank.finish_planner_observation()
     assert len(_records(tmp_path)) == 2
     assert not rank._planner_active_observations
+
+
+@pytest.mark.parametrize("local_refusal", [50, 150])
+def test_dp_refusal_prices_share_world_scope_before_best_choice(
+    monkeypatch, local_refusal
+):
+    rank = _oversized(monkeypatch, limit=1)
+    items = [_request(i) for i in range(4)]
+    wide = rank._plan_flat_forward(items)
+    small = rank._plan_flat_forward(items[:1])
+    candidate = tr._CandidateMicroBatch(
+        items, (0, 1, 2, 3), wide, tr._MemoryCheck(100, 200, True), 4, 0, False
+    )
+    refusal = tr._ForwardRefusal(
+        small, tr._MemoryCheck(local_refusal, 1, False), "minimum wave refused"
+    )
+    searches = iter((candidate, refusal))
+    prices = []
+
+    def world_price(required, *, sync_across_dp):
+        prices.append((required, sync_across_dp))
+        return tr._MemoryCheck(100 if len(prices) == 1 else 150, 1, False)
+
+    monkeypatch.setattr(rank, "_memory_check_required", world_price)
+    monkeypatch.setattr(rank, "_try_cache_recovery", lambda *a, **k: False)
+    result = rank._recover_admission(
+        lambda: next(searches),
+        lambda value: (value.plan, value.check),
+        lambda value, check: tr.replace(value, check=check),
+        context="forward_micro_batches",
+        sync_across_dp=True,
+        admit_refusal=lambda refused: tr.replace(
+            candidate, plan=refused.plan, check=refused.check, stats_global_count=1
+        ),
+    )
+    assert prices == [(100, True), (local_refusal, True)]
+    assert result.stats_global_count == 4
+    assert result.plan is wide
+
+
+def test_dp_disagreeing_fallback_widths_refuse_before_execution(monkeypatch):
+    rank = _oversized(monkeypatch, limit=1)
+    items = [_request(0)]
+    plan = rank._plan_flat_forward(items)
+    refusal = tr._ForwardRefusal(plan, tr._MemoryCheck(10, 1, False), "refused")
+    monkeypatch.setattr(rank, "_try_cache_recovery", lambda *a, **k: False)
+    monkeypatch.setattr(rank, "_recovery_reduce", lambda *a, **k: [1.0, 1.0, -4.0])
+    with pytest.raises(tr.TrainerRankMemoryError):
+        rank._recover_admission(
+            lambda: refusal,
+            lambda value: (value.plan, value.check),
+            lambda value, check: value,
+            context="forward_micro_batches",
+            sync_across_dp=True,
+            admit_refusal=lambda r: tr._CandidateMicroBatch(
+                items, (0,), r.plan, r.check, 1, 0, True
+            ),
+        )

@@ -936,6 +936,7 @@ class _ForwardGroupPlan:
     request_indices: tuple[int, ...]
     items: tuple[_ForwardItem, ...]
     packed: PrefixTreePack
+    layout: PrefixTreeLayout | None = None
 
 
 @dataclass(frozen=True)
@@ -4703,6 +4704,14 @@ class TrainerRank:
                         request_indices=tuple(group_indices),
                         items=items,
                         packed=packed,
+                        layout=layout
+                        if getattr(
+                            getattr(self, "_planner_reporter", None),
+                            "threshold_pct",
+                            None,
+                        )
+                        is not None
+                        else None,
                     )
                 )
 
@@ -5082,7 +5091,7 @@ class TrainerRank:
 
                 requests = [
                     {
-                        "input_tokens": tensor_data(item.input_ids, version),
+                        "input_tokens": tensor_data(item.input_ids, input_version),
                         "target_tokens": tensor_data(item.labels, label_version),
                         "top_k": item.request.top_k,
                         "logits": item.request.logits,
@@ -5090,10 +5099,34 @@ class TrainerRank:
                         "no_grad": item.request.no_grad,
                         "checkpoint": str(item.request.checkpoint),
                     }
-                    for item, version, label_version in tensors
+                    for item, input_version, label_version in tensors
                 ]
+                layouts = []
+                cursor = 0
+                for group in plan.groups:
+                    rows = [
+                        item["input_tokens"]
+                        for item in requests[cursor : cursor + len(group.items)]
+                    ]
+                    cursor += len(group.items)
+                    if group.layout is None:
+                        incomplete.add("selected_layout_unavailable")
+                    elif not all(isinstance(row, list) for row in rows):
+                        incomplete.add("layout_inputs_unavailable")
+                    else:
+                        layouts.append(
+                            {
+                                "input_tokens": rows,
+                                "selected_decisions": sorted(
+                                    group.layout.selected_decisions
+                                ),
+                                "expected_fingerprint": group.layout.fingerprint,
+                                "expected_packed_tokens": group.layout.packed_tokens,
+                            }
+                        )
                 return {
                     "memory_replay": {"rank": rank_fields, "estimates": estimates},
+                    "layouts": layouts,
                     "incomplete_reasons": sorted(incomplete),
                     "model": model["name_or_path"],
                     "model_identity": model,
@@ -5643,19 +5676,42 @@ class TrainerRank:
                     and refused.overridable
                     and best is not None
                 )
-                agreed = self._recovery_reduce(
-                    [float(allowed)], op="MIN", sync_across_dp=sync_across_dp
-                )
-                if agreed[0] == 1:
+                selected = None
+                if allowed:
                     assert best is not None
-                    if best.candidate is not None:
-                        return update(best.candidate, best.check)
-                    return admit_refusal(best)
+                    selected = (
+                        update(best.candidate, best.check)
+                        if best.candidate is not None
+                        else admit_refusal(best)
+                    )
+                width = (
+                    selected.stats_global_count
+                    if isinstance(selected, _CandidateMicroBatch)
+                    else 0
+                )
+                agreed = self._recovery_reduce(
+                    [float(allowed), float(width), -float(width)],
+                    op="MIN",
+                    sync_across_dp=sync_across_dp,
+                )
+                if agreed[0] == 1 and agreed[1] == -agreed[2]:
+                    return selected
             raise refused.error(context) from original
 
         def finish(value: Any) -> Any:
             nonlocal refused, best
             if isinstance(value, _ForwardRefusal):
+                if sync_across_dp and admit_refusal is not None:
+                    # Minimum-wave split checks are TP x CP-local. Compare
+                    # them against larger world-priced waves on the same basis
+                    # so every DP rank retains the same logical wave width.
+                    value = replace(
+                        value,
+                        check=self._memory_check_required(
+                            value.check.estimated_required_bytes,
+                            sync_across_dp=True,
+                        ),
+                    )
                 refused = value
                 if value.overridable and (
                     best is None

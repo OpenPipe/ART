@@ -255,11 +255,16 @@ def test_replay_reruns_real_memory_estimator_and_prefix_layout(tmp_path):
                     "retained_tokens": 4,
                 },
                 "expected_required_bytes": 440,
+                "retained_bytes": 440,
             }
         ],
     }
     payload = {
         "memory_replay": state,
+        "split_memory_floor_bytes": 0,
+        "local_admission_peak_bytes": 440,
+        "reduced_admission_peak_bytes": 9999,
+        "safety_factor": 1.1,
         "layouts": [
             {
                 "input_tokens": tokens,
@@ -269,9 +274,22 @@ def test_replay_reruns_real_memory_estimator_and_prefix_layout(tmp_path):
             }
         ],
     }
-    path = report(tmp_path, replay_factory=lambda: payload)
+    path = report(
+        tmp_path,
+        predicted_peak_bytes=400,
+        observed_peak_bytes=500,
+        admission_peak_bytes=9999,
+        replay_factory=lambda: payload,
+    )
     result = reports.replay(reports.validate_report(path.read_bytes()))
-    assert result["estimates"] == [{"required_bytes": 440, "matches": True}]
+    assert result["estimates"] == [
+        {"required_bytes": 440, "retained_bytes": 440, "matches": True}
+    ]
+    assert result["aggregate"] == {
+        "local_admission_peak_bytes": 440,
+        "predicted_peak_bytes": 400,
+        "matches": True,
+    }
     assert result["layouts"][0]["matches"]
     assert result["source_matches"] is True
     drifted = reports.validate_report(path.read_bytes())
@@ -280,13 +298,97 @@ def test_replay_reruns_real_memory_estimator_and_prefix_layout(tmp_path):
         reports.replay(drifted)
     assert reports.replay(drifted, allow_source_drift=True)["source_matches"] is False
     state["estimates"][0]["profile"]["bytes_per_token"] = 200.0
-    changed = report(tmp_path, replay_factory=lambda: payload)
-    assert reports.replay(reports.validate_report(changed.read_bytes()))[
-        "estimates"
-    ] == [{"required_bytes": 880, "matches": False}]
+    changed = report(
+        tmp_path,
+        predicted_peak_bytes=400,
+        observed_peak_bytes=500,
+        admission_peak_bytes=9999,
+        replay_factory=lambda: payload,
+    )
+    changed_result = reports.replay(reports.validate_report(changed.read_bytes()))
+    assert changed_result["estimates"] == [
+        {"required_bytes": 880, "retained_bytes": 880, "matches": False}
+    ]
+    assert changed_result["aggregate"]["matches"] is False
 
 
 def test_incomplete_replay_refuses(tmp_path):
     path = report(tmp_path, replay_factory=lambda: {})
     with pytest.raises(ValueError, match="incomplete replay"):
         reports.replay(reports.validate_report(path.read_bytes()))
+
+
+@pytest.mark.parametrize("floor", [0, 10_000])
+def test_actual_emitted_split_replays_layout_and_aggregate(
+    monkeypatch, tmp_path, floor
+):
+    from test_trainer_rank_split import _rank
+    import torch
+
+    from art.trainer_rank import _impl as tr
+
+    rank = _rank(monkeypatch)
+    rank._planner_reporter = reports.Reporter(0, spool_dir=tmp_path / "emitted")
+    children = []
+    for suffix in (3, 5):
+        requests = [
+            tr.ForwardInput(
+                input_tokens=torch.tensor([1, 2, token]), hidden_states=True
+            )
+            for token in (suffix, suffix + 1)
+        ]
+        child = rank._plan_flat_forward(requests)
+        rank._memory_profiles[child.signature] = tr._MemoryProfile(
+            bytes_per_token=100,
+            packed_tokens=20,
+            logical_per_packed=2,
+            retained_compute_bytes_per_token=10,
+        )
+        children.append(child)
+    plan = tr._SplitForwardPlan(tuple(children), ((0, 1), (2, 3)), 4)
+    key = rank._split_memory_key(plan)
+    assert key is not None
+    rank._split_memory_floors[key] = floor
+    costs = [rank._plan_cost(child) for child in children]
+    local = max(
+        sum(cost.retained for cost in costs) + max(cost.ephemeral for cost in costs),
+        int(floor * tr._MEMORY_SAFETY_FACTOR),
+    )
+    rank._begin_planner_observation(
+        plan, tr._MemoryCheck(local + 123, local + 1000, True)
+    )
+    observation = rank._planner_observation
+    assert observation is not None
+    assert observation["comparable"] is True
+    # Finish the real pending observation with fake allocator counters only;
+    # CPU planning and the emitted replay snapshot are otherwise maintained code.
+    observation["baseline"] = 0
+    observation["peak"] = local * 2
+    monkeypatch.setattr(torch.cuda, "max_memory_allocated", lambda *args: local * 2)
+    rank.finish_planner_observation()
+    [path] = list(rank._planner_reporter.spool_dir.glob("*.json"))
+    original = reports.validate_report(path.read_bytes())
+    result = reports.replay(original)
+    assert len(result["layouts"]) == 2
+    assert all(item["matches"] for item in result["layouts"] + result["estimates"])
+    assert result["aggregate"] == {
+        "local_admission_peak_bytes": local,
+        "predicted_peak_bytes": observation["predicted"],
+        "matches": True,
+    }
+    # These inconsistencies were formerly unchecked despite child costs matching.
+    for field in (
+        "local_admission_peak_bytes",
+        "split_memory_floor_bytes",
+        "safety_factor",
+    ):
+        changed = json.loads(path.read_bytes())
+        changed["replay"][field] += local + 1
+        assert reports.replay(changed)["aggregate"]["matches"] is False
+    for field in ("predicted_peak_bytes", "admission_peak_bytes"):
+        changed = json.loads(path.read_bytes())
+        changed[field] += 1
+        assert reports.replay(changed)["aggregate"]["matches"] is False
+    changed = json.loads(path.read_bytes())
+    changed["replay"]["memory_replay"]["estimates"][0]["retained_bytes"] += 1
+    assert reports.replay(changed)["estimates"][0]["matches"] is False
