@@ -21,14 +21,18 @@ def _measured(function):
     @wraps(function)
     def measured(self, *args, **kwargs):
         started = None
+        primary = False
         try:
             started = time.perf_counter_ns()
             return function(self, *args, **kwargs)
-        except BaseException:
-            # Accounting must not replace a training error, cancellation or grad.
+        except Exception:
             self.disabled = True
+        except BaseException:
+            self.disabled = True
+            primary = True
+            raise
         finally:
-            self._charge(started)
+            self._charge(started, primary=primary)
 
     return measured
 
@@ -39,11 +43,19 @@ def region(function):
     def wrapped(rank, *args, **kwargs):
         work = rank._backward_work()
         entered = work.enter() if work is not None else False
+        primary = False
         try:
             return function(rank, *args, **kwargs)
+        except BaseException:
+            primary = True
+            raise
         finally:
-            if entered:
-                work.leave()
+            try:
+                if entered:
+                    work.leave()
+            except BaseException:
+                if not primary:
+                    raise
 
     return wrapped
 
@@ -73,7 +85,7 @@ class BackwardWork:
         self.outputs: dict[int, tuple[Any, Any]] = {}
         self._charge(started)
 
-    def _charge(self, started):
+    def _charge(self, started, *, primary=False):
         try:
             ended = time.perf_counter_ns()
             with self.lock:
@@ -86,9 +98,15 @@ class BackwardWork:
                     self.invalid = True
                 else:
                     self.cost_ns += ended - started
-        except BaseException:
+        except Exception:
             # Preserve the positive cost already recorded, never replace by zero.
             self.invalid = True
+        except BaseException:
+            self.invalid = True
+            # A fresh cancellation propagates. Only a secondary meter failure
+            # may be suppressed while preserving an already propagating error.
+            if not primary:
+                raise
 
     def _ordinary(self):
         module = sys.modules.get("torch._dynamo.compiled_autograd")
@@ -264,9 +282,3 @@ class BackwardWork:
             for _, handle in self.outputs.values():
                 handle.remove()
             self.outputs.clear()
-
-    def __del__(self):
-        try:
-            self.close()
-        except BaseException:
-            pass

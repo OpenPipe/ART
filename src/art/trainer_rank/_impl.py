@@ -5366,21 +5366,26 @@ class TrainerRank:
     def _backward_work(self) -> BackwardWork | None:
         state = self._recovery_state()
         started = None
+        primary = False
         try:
             started = time.perf_counter_ns()
             with state.lock:
                 if state.backward is None and not state.invalid:
                     state.backward = BackwardWork(state.lock, self.device)
                 return state.backward
-        except BaseException:
+        except Exception:
             # Unknown accounting cost must never become free recovery budget.
             state.invalid = True
             return None
+        except BaseException:
+            state.invalid = True
+            primary = True
+            raise
         finally:
             if state.backward is not None:
                 # Includes lazy setup and lock wait; constructor overlap is an
                 # intentional conservative charge, not an exact subtraction.
-                state.backward._charge(started)
+                state.backward._charge(started, primary=primary)
 
     def _recovery_reduce(
         self,

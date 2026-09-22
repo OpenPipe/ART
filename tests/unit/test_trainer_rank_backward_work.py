@@ -5,6 +5,7 @@ recovery/rollback methods rather than copy their decision arithmetic.
 """
 
 import ast
+from asyncio import CancelledError
 from dataclasses import dataclass, field
 import gc
 import importlib.util
@@ -289,18 +290,130 @@ class TestBackwardWork(unittest.TestCase):
         self.assertTrue(self.work.disabled)
         self.assertGreater(self.work.cost_ns, 0)
 
-    def test_queue_failure_does_not_replace_gradient_or_erase_previous_credit(self):
+    def test_ordinary_queue_fault_does_not_replace_gradient_or_erase_previous_credit(self):
         expected = self.completed(1)
         self.work.harvest()
         tensor = Tensor(self.device)
         self.work.attach([self.output(tensor)])
         self.task = 2
         with patch.object(self.torch.autograd.Variable._execution_engine,
-                          "queue_callback", side_effect=KeyboardInterrupt("queue")):
+                          "queue_callback", side_effect=RuntimeError("queue")):
             self.assertIsNone(next(iter(tensor.hooks.values()))(object()))
         self.assertTrue(self.work.disabled)
         self.work.harvest()
         self.assertEqual(self.work.work_ns, expected)
+
+    def test_new_cancellation_at_each_observer_boundary_propagates_exact_object(self):
+        original_work = self.work
+        for error_type in (KeyboardInterrupt, SystemExit, GeneratorExit, CancelledError):
+            for stage in ("attach", "hook", "callback", "harvest", "leave", "close"):
+                with self.subTest(error=error_type, stage=stage):
+                    self.work = self.module.BackwardWork(threading.RLock(), self.device)
+                    self.callbacks.clear()
+                    self.task = 1
+                    primary, cause = error_type(stage), ValueError("original cause")
+                    primary.__cause__ = cause
+                    tensor = Tensor(self.device)
+                    if stage == "attach":
+                        target, name = tensor, "register_hook"
+                        action = lambda: self.work.attach([self.output(tensor)])
+                    elif stage == "hook":
+                        self.work.attach([self.output(tensor)])
+                        target = self.torch.autograd.Variable._execution_engine
+                        name = "queue_callback"
+                        action = lambda: next(iter(tensor.hooks.values()))(object())
+                    elif stage == "callback":
+                        self.start(1)
+                        target, name = self.cuda, "Event"
+                        action = self.callbacks.pop(0)
+                    elif stage == "harvest":
+                        self.completed(1)
+                        target, name = self.cuda.events[-1], "query"
+                        action = self.work.harvest
+                    elif stage == "leave":
+                        self.work.enter()
+                        target, name = self.clock, "perf_counter_ns"
+                        action = self.work.leave
+                    else:
+                        self.work.attach([self.output(tensor)])
+                        target, name = next(iter(self.work.outputs.values()))[1], "remove"
+                        action = self.work.close
+                    with patch.object(target, name, side_effect=primary):
+                        with self.assertRaises(BaseException) as caught:
+                            action()
+                    self.assertIs(caught.exception, primary)
+                    self.assertIs(primary.__cause__, cause)
+                    self.assertTrue(self.work.disabled)
+                    self.assertEqual(self.work.work_ns, 0)
+                    self.work.close()
+        self.work = original_work
+
+    def test_meter_propagates_new_cancellation_and_preserves_inflight_primary(self):
+        primary, secondary = KeyboardInterrupt("queue"), SystemExit("meter")
+        cause = ValueError("cause")
+        primary.__cause__ = cause
+        self.task = 1
+        with patch.object(self.clock, "perf_counter_ns", side_effect=[2000, 2001, secondary]):
+            with patch.object(self.torch.autograd.Variable._execution_engine,
+                              "queue_callback", side_effect=primary):
+                with self.assertRaises(KeyboardInterrupt) as caught:
+                    self.work._start()
+        self.assertIs(caught.exception, primary)
+        self.assertIs(primary.__cause__, cause)
+        self.assertTrue(self.work.invalid)
+        # With no primary, a newly delivered meter cancellation must escape.
+        for action in (lambda: self.work._charge(2000), self.work.harvest):
+            self.work.disabled = False
+            self.work.rows.clear()
+            clock = [secondary] if action != self.work.harvest else [3000, secondary]
+            with patch.object(self.clock, "perf_counter_ns", side_effect=clock):
+                with self.assertRaises(SystemExit) as caught:
+                    action()
+            self.assertIs(caught.exception, secondary)
+
+    def test_actual_lookup_and_constructor_cancellation_identity(self):
+        rank, state, ns = self.actual_rank()
+        primary, secondary = CancelledError("lookup"), GeneratorExit("meter")
+        cause = ValueError("lookup cause")
+        primary.__cause__ = cause
+        with patch.object(self.clock, "perf_counter_ns", side_effect=[primary, secondary]):
+            with self.assertRaises(CancelledError) as caught:
+                rank._backward_work()
+        self.assertIs(caught.exception, primary)
+        self.assertIs(primary.__cause__, cause)
+        self.assertTrue(state.invalid)
+        self.assertTrue(self.work.invalid)
+        state.invalid, state.backward = False, None
+
+        def construction(*args):
+            raise primary
+
+        with patch.dict(ns, BackwardWork=construction):
+            with self.assertRaises(CancelledError) as caught:
+                rank._backward_work()
+        self.assertIs(caught.exception, primary)
+        self.assertIs(primary.__cause__, cause)
+        self.assertTrue(state.invalid)
+
+    def test_region_cleanup_preserves_body_error_but_new_cancellation_escapes(self):
+        rank = NS(_backward_work=lambda: self.work)
+        secondary = KeyboardInterrupt("leave")
+        for primary in (None, ValueError("body"), CancelledError("body cancellation")):
+            with self.subTest(primary=primary):
+                cause = RuntimeError("body cause")
+
+                @self.module.region
+                def body(rank):
+                    if primary is not None:
+                        raise primary from cause
+                    return "original result"
+
+                with patch.object(self.work, "leave", side_effect=secondary):
+                    with self.assertRaises(BaseException) as caught:
+                        body(rank)
+                self.assertIs(caught.exception, secondary if primary is None else primary)
+                if primary is not None:
+                    self.assertIs(primary.__cause__, cause)
 
     def test_clock_fault_cost_overflow_and_unknown_readiness_fail_closed(self):
         prior = self.work.cost_ns
@@ -355,7 +468,11 @@ class TestBackwardWork(unittest.TestCase):
         del owner
         gc.collect()
         self.assertIsNone(ref())
-        self.assertEqual(tensor.hooks, {})
+        self.assertNotIn("__del__", vars(self.module.BackwardWork))
+        # No Python finalizer can intercept cancellation. Caller-retained tensors
+        # may keep a bounded weak hook; it is inert after the rank owner is gone.
+        self.assertEqual(len(tensor.hooks), 1)
+        self.assertIsNone(next(iter(tensor.hooks.values()))(object()))
 
     def test_actual_reducer_uses_sum_cost_and_max_local_sum_not_sum_of_maxima(self):
         rank, state, ns = self.actual_rank()
