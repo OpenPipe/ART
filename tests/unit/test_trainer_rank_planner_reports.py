@@ -197,6 +197,33 @@ def test_spool_full_preserves_first_report_and_does_not_fail_training(
     assert "local persistence failed" in caplog.text
 
 
+def test_uploaded_report_eviction_during_scan_keeps_new_report(tmp_path, monkeypatch):
+    old = report(tmp_path)
+    assert old is not None
+    actual_lstat = Path.lstat
+    evicted = []
+
+    def lstat(path, *args, **kwargs):
+        if path == old and not evicted:
+            # The uploader has acknowledged the old file and unlinks it after
+            # persistence enumerates it, but before its quota stat completes.
+            path.unlink()
+            evicted.append(path)
+        return actual_lstat(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "lstat", lstat)
+    monkeypatch.setattr(reports, "MAX_SPOOL_REPORTS", 1)
+    delivered = []
+    reports.set_report_sink(lambda path: delivered.append(path.read_bytes()))
+    new = report(tmp_path)
+    assert new is not None
+    assert evicted == [old]
+    assert not old.exists()
+    assert delivered == [new.read_bytes()]
+    assert reports.validate_report(delivered[0])["id"] == new.stem
+    assert list(new.parent.iterdir()) == [new]
+
+
 def test_spool_symlink_refuses(tmp_path):
     target = tmp_path / "target"
     target.mkdir(mode=0o700)
@@ -360,12 +387,12 @@ def test_actual_emitted_split_replays_layout_and_aggregate(
     observation = rank._planner_observation
     assert observation is not None
     assert observation["comparable"] is True
-    # Finish the real pending observation with fake allocator counters only;
+    # Close the real profiling window with fake allocator counters only;
     # CPU planning and the emitted replay snapshot are otherwise maintained code.
     observation["baseline"] = 0
     observation["peak"] = local * 2
     monkeypatch.setattr(torch.cuda, "max_memory_allocated", lambda *args: local * 2)
-    rank.finish_planner_observation()
+    rank._complete_planner_observation(phase="forward")
     [path] = list(rank._planner_reporter.spool_dir.glob("*.json"))
     original = reports.validate_report(path.read_bytes())
     result = reports.replay(original)

@@ -205,7 +205,12 @@ def persist_report(raw: bytes, spool_dir: Path) -> Path:
             return path
         size = count = 0
         for entry in spool_dir.iterdir():
-            item = entry.lstat()
+            try:
+                item = entry.lstat()
+            except FileNotFoundError:
+                # The uploader may prune an acknowledged report in another
+                # process after directory enumeration. It consumes no quota.
+                continue
             if not stat.S_ISREG(item.st_mode):
                 raise ValueError("unexpected nonregular spool entry")
             count += 1

@@ -1,6 +1,7 @@
 """Opt-in planner fallback/report boundaries, using real CPU plans and fake counters."""
 
 from contextlib import nullcontext
+import gc
 import json
 from pathlib import Path
 
@@ -166,7 +167,7 @@ def test_report_uses_local_prediction_before_profile_update(monkeypatch, tmp_pat
         plan, check=tr._MemoryCheck(9999, 10000, True), context="dp_rank_forward"
     )
     counters["peak"] = 500  # caller backward exceeds the earlier forward peak
-    rank.finish_planner_observation()
+    rank._complete_planner_observation()
     [record] = _records(tmp_path)
     assert record["predicted_peak_bytes"] == 200
     assert record["admission_peak_bytes"] == 9999
@@ -250,7 +251,7 @@ def test_changed_tokens_mark_replay_incomplete(monkeypatch, tmp_path):
         plan, check=tr._MemoryCheck(220, 10000, True), context="dp_rank_forward"
     )
     plan.groups[0].items[0].input_ids[0] = 123
-    rank.finish_planner_observation()
+    rank._complete_planner_observation()
     [record] = _records(tmp_path)
     assert not record["replay_complete"]
     assert "device_or_modified_input" in record["incomplete_reasons"]
@@ -337,7 +338,7 @@ def test_split_report_keeps_first_child_peak_across_resets(monkeypatch, tmp_path
         split, check=tr._MemoryCheck(440, 10000, True), context="dp_rank_forward"
     )
     counters["peak"] = 350
-    rank.finish_planner_observation()
+    rank._complete_planner_observation()
     [record] = _records(tmp_path)
     assert record["predicted_peak_bytes"] == 400
     assert record["observed_peak_bytes"] == 600
@@ -401,7 +402,11 @@ def test_interleaved_execution_scopes_preserve_both_oom_inputs(monkeypatch, tmp_
         for r in records
     )
     assert all(
-        "overlapping_forward_memory_window" in r["incomplete_reasons"] for r in records
+        "overlapping_forward_memory_window" in r["replay"]["window_reasons"]
+        and r["replay"]["measurement_valid"] is False
+        and r["replay_complete"] is True
+        and not r["incomplete_reasons"]
+        for r in records
     )
     assert not rank._planner_active_observations
 
@@ -417,7 +422,7 @@ def test_overlapping_scope_does_not_claim_completed_comparison(monkeypatch, tmp_
             )
     for context in (one, two):
         with rank.planner_observation_scope(context):
-            rank.finish_planner_observation()
+            rank._complete_planner_observation()
     assert not _records(tmp_path)
     assert not rank._planner_active_observations
 
@@ -430,7 +435,7 @@ def test_sequential_scopes_keep_independent_completed_peaks(monkeypatch, tmp_pat
             rank._run_flat_plan_with_memory_tracking(
                 plan, check=tr._MemoryCheck(220, 10000, True), context="dp_rank_forward"
             )
-            rank.finish_planner_observation()
+            rank._complete_planner_observation()
     assert len(_records(tmp_path)) == 2
     assert not rank._planner_active_observations
 
@@ -491,3 +496,114 @@ def test_dp_disagreeing_fallback_widths_refuse_before_execution(monkeypatch):
                 items, (0,), r.plan, r.check, 1, 0, True
             ),
         )
+
+
+def test_dp_forward_reports_at_forward_boundary_not_later_optimizer(
+    monkeypatch, tmp_path
+):
+    rank, plan, counters = _reporting_rank(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        rank,
+        "_plan_admissible_forward",
+        lambda *a, **k: (plan, tr._MemoryCheck(220, 10000, True)),
+    )
+    rank.dp_rank_forward([_request(0)])
+    [record] = _records(tmp_path)
+    assert record["observed_peak_bytes"] == 250
+    assert record["phase"] == "forward"
+    assert not rank._planner_active_observations
+    counters["peak"] = 10000  # unrelated later optimizer allocation
+    rank.finish_planner_observation()
+    assert _records(tmp_path) == [record]
+    assert counters["syncs"] == 2
+
+
+def test_closed_forward_keeps_backward_oom_without_false_partial_peak(
+    monkeypatch, tmp_path
+):
+    rank, plan, counters = _reporting_rank(monkeypatch, tmp_path)
+    rank._execute_admitted_plan(
+        plan, check=tr._MemoryCheck(220, 10000, True), context="dp_rank_forward"
+    )
+    counters["peak"] = 10000
+    rank.report_planner_oom(torch.cuda.OutOfMemoryError("later backward"))
+    records = _records(tmp_path)
+    assert len(records) == 2
+    [oom] = [record for record in records if record["oom"]]
+    assert oom["phase"] == "caller_after_profile"
+    assert oom["partial_peak_bytes"] is None
+    assert oom["observed_peak_bytes"] is None and oom["error_pct"] is None
+    assert oom["replay"]["window_reasons"] == ["oom_after_profiled_window"]
+    assert oom["replay_complete"]
+    assert not rank._planner_active_observations
+
+
+def test_execution_finish_does_not_complete_abandoned_microbatch_window(
+    monkeypatch, tmp_path
+):
+    rank, plan, counters = _reporting_rank(monkeypatch, tmp_path)
+    rank._run_flat_plan_with_memory_tracking(
+        plan, check=tr._MemoryCheck(220, 10000, True), context="forward_micro_batches"
+    )
+    counters["peak"] = 10000
+    rank.finish_planner_observation()
+    assert not _records(tmp_path)
+    assert not rank._planner_active_observations
+
+
+def test_abandoned_execution_does_not_poison_future_measurements(monkeypatch, tmp_path):
+    rank, plan, counters = _reporting_rank(monkeypatch, tmp_path)
+    abandoned = {}
+    with rank.planner_observation_scope(abandoned):
+        rank._run_flat_plan_with_memory_tracking(
+            plan,
+            check=tr._MemoryCheck(220, 10000, True),
+            context="forward_micro_batches",
+        )
+    assert rank._planner_active_observations
+    del abandoned
+    gc.collect()
+    assert not rank._planner_active_observations
+    counters.update(allocated=100, peak=100)
+    with rank.planner_observation_scope({}):
+        rank._execute_admitted_plan(
+            plan, check=tr._MemoryCheck(220, 10000, True), context="dp_rank_forward"
+        )
+    [record] = _records(tmp_path)
+    assert record["observed_peak_bytes"] == 250
+
+
+def test_diagnostic_registry_failure_does_not_replace_forward_oom(
+    monkeypatch, tmp_path
+):
+    rank, plan, _ = _reporting_rank(monkeypatch, tmp_path)
+    error = torch.cuda.OutOfMemoryError("original allocation failure")
+
+    def execute(plan):
+        del rank._planner_active_observations
+        raise error
+
+    monkeypatch.setattr(rank, "_execute_flat_plan", execute)
+    with pytest.raises(tr.TrainerRankMemoryError) as raised:
+        rank._run_flat_plan_with_memory_tracking(
+            plan, check=tr._MemoryCheck(220, 10000, True), context="dp_rank_forward"
+        )
+    assert raised.value.__cause__ is error
+    rank.finish_planner_observation()  # diagnostic cleanup must also be auxiliary
+
+
+def test_complete_diagnostic_failure_and_cancellation_semantics(monkeypatch, tmp_path):
+    rank, plan, _ = _reporting_rank(monkeypatch, tmp_path)
+    rank._run_flat_plan_with_memory_tracking(
+        plan, check=tr._MemoryCheck(220, 10000, True), context="dp_rank_forward"
+    )
+    del rank._planner_overlap_generation
+    rank._complete_planner_observation()  # ordinary diagnostic AttributeError is contained
+    assert not _records(tmp_path)
+
+    def cancel():
+        raise KeyboardInterrupt("do not swallow cancellation")
+
+    monkeypatch.setattr(rank, "discard_planner_observation", cancel)
+    with pytest.raises(KeyboardInterrupt):
+        rank.finish_planner_observation()

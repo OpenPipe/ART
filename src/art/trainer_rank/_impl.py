@@ -581,6 +581,10 @@ class _CacheRecoveryState:
     lock: Any = dataclass_field(default_factory=threading.Lock)
 
 
+class _PlannerObservation(dict[str, Any]):
+    """Weakly tracked while its allocator measurement window is open."""
+
+
 @dataclass(frozen=True)
 class _MemoryCheck:
     estimated_required_bytes: int
@@ -1382,7 +1386,9 @@ class TrainerRank:
             ContextVar("trainer_rank_planner_observation", default=None)
         )
         self._planner_observation_generation = 0
-        self._planner_active_observations: set[int] = set()
+        self._planner_active_observations: weakref.WeakValueDictionary[
+            int, _PlannerObservation
+        ] = weakref.WeakValueDictionary()
         self._planner_overlap_generation = 0
         self._planner_observation: dict[str, Any] | None = None
         pp_size = int(getattr(runtime.provider, "pipeline_model_parallel_size", 1) or 1)
@@ -2453,7 +2459,7 @@ class TrainerRank:
                     candidate.plan, memory_baseline, forward_peak
                 )
             # Only the caller may retain completed outputs into the next wave.
-            self.finish_planner_observation()
+            self._complete_planner_observation()
             del tracked_outputs, flat_outputs, outputs
             start = stop
 
@@ -2539,10 +2545,12 @@ class TrainerRank:
             outputs, _baseline = self._run_flat_plan_with_memory_tracking(
                 plan, check=check, context=context
             )
-            return outputs
-        outputs, _baseline, _peak = self._execute_split_plan_with_memory_tracking(
-            plan, check=check, context=context
-        )
+        else:
+            outputs, _baseline, _peak = self._execute_split_plan_with_memory_tracking(
+                plan, check=check, context=context
+            )
+        # This API calibrates only forward, unlike the yielded microbatch API.
+        self._complete_planner_observation(phase="forward")
         return outputs
 
     def _execute_split_plan_with_memory_tracking(
@@ -4961,18 +4969,24 @@ class TrainerRank:
             # Both the suspended caller and the newly entered forward share
             # allocator counters; neither interval may claim a completed peak.
             self._planner_overlap_generation = self._planner_observation_generation
-        self._planner_active_observations.add(self._planner_observation_generation)
         # A snapshot failure must still leave a durable minimal OOM report.
-        self._planner_observation = {
-            "predicted": check.estimated_required_bytes,
-            "admission": check.estimated_required_bytes,
-            "replay": lambda: {"incomplete_reasons": ["planner_snapshot_unavailable"]},
-            "baseline": None,
-            "peak": 0,
-            "phase": "forward",
-            "comparable": False,
-            "generation": self._planner_observation_generation,
-        }
+        observation = _PlannerObservation(
+            {
+                "predicted": check.estimated_required_bytes,
+                "admission": check.estimated_required_bytes,
+                "replay": lambda: {
+                    "incomplete_reasons": ["planner_snapshot_unavailable"]
+                },
+                "baseline": None,
+                "peak": 0,
+                "phase": "forward",
+                "comparable": False,
+                "generation": self._planner_observation_generation,
+                "window_open": True,
+            }
+        )
+        self._planner_observation = observation
+        self._planner_active_observations[observation["generation"]] = observation
         try:
             children = (
                 plan.subforwards if isinstance(plan, _SplitForwardPlan) else (plan,)
@@ -5157,89 +5171,108 @@ class TrainerRank:
                     },
                 }
 
-            self._planner_observation = {
-                "predicted": round(local_required / _MEMORY_SAFETY_FACTOR),
-                "admission": check.estimated_required_bytes,
-                "replay": replay,
-                "baseline": None,
-                "peak": 0,
-                "phase": "forward",
-                "comparable": True,
-                "generation": self._planner_observation_generation,
-            }
+            observation.update(
+                {
+                    "predicted": round(local_required / _MEMORY_SAFETY_FACTOR),
+                    "admission": check.estimated_required_bytes,
+                    "replay": replay,
+                    "baseline": None,
+                    "peak": 0,
+                    "phase": "forward",
+                    "comparable": True,
+                    "generation": self._planner_observation_generation,
+                }
+            )
         except Exception:
             # Reporting is auxiliary; a diagnostic failure cannot change the
             # model's ordinary execution or replace an OOM.
             _planner_misses._warn("could not prepare planner-miss observation")
 
-    def finish_planner_observation(self) -> None:
-        """Finish the last forward/caller interval, without synchronizing CUDA.
-
-        Caladan calls this at its execution boundary. Direct callers using
-        dp_rank_forward followed by backward should call it after backward;
-        forward_micro_batches also finishes when its iterator resumes.
-        """
-        observation = getattr(self, "_planner_observation", None)
-        if observation is None:
-            return
-        self.discard_planner_observation()
-        if observation["baseline"] is None or not observation["comparable"]:
-            return
-        if observation["generation"] <= self._planner_overlap_generation:
-            _planner_misses._warn(
-                "overlapping forwards invalidated the allocator peak interval"
-            )
-            return
+    def _complete_planner_observation(self, *, phase: str | None = None) -> None:
+        """Close at the existing profiling boundary, retaining only OOM context."""
         try:
+            observation = getattr(self, "_planner_observation", None)
+            if observation is None or not observation["window_open"]:
+                return
+            observation["window_open"] = False
+            self._planner_active_observations.pop(observation["generation"], None)
+            phase = observation["phase"] if phase is None else phase
+            observation["phase"] = "caller_after_profile"
+            if observation["baseline"] is None or not observation["comparable"]:
+                return
+            if observation["generation"] <= self._planner_overlap_generation:
+                _planner_misses._warn(
+                    "overlapping forwards invalidated the allocator peak interval"
+                )
+                return
             peak = max(
                 observation["peak"], int(torch.cuda.max_memory_allocated(self.device))
             )
             self._planner_reporter.report(
                 predicted_peak_bytes=observation["predicted"],
                 observed_peak_bytes=max(0, peak - observation["baseline"]),
-                phase=observation["phase"],
+                phase=phase,
                 replay_factory=observation["replay"],
                 admission_peak_bytes=observation["admission"],
             )
         except Exception:
             _planner_misses._warn("could not finish planner-miss observation")
 
+    def finish_planner_observation(self) -> None:
+        """Release execution context without sampling an unbounded caller peak.
+
+        ART compares completed peaks at its existing profiling boundaries:
+        dp_rank_forward's return or forward_micro_batches' iterator resume.
+        Caladan calls this at execution end. Direct callers can report a caught
+        caller OOM before cleanup, then call this method to release the context.
+        An abandoned microbatch iterator cannot mint a completed comparison.
+        """
+        try:
+            self.discard_planner_observation()
+        except Exception:
+            _planner_misses._warn("could not finish planner-miss execution")
+
     def report_planner_oom(self, error: BaseException) -> None:
         """Persist a caught CUDA OOM before caller cleanup, then leave it alone.
 
-        This does not suppress, retry, or recover the original failure. The
-        observed allocation peak is partial, never a completed error percentage.
+        This does not suppress, retry, or recover the original failure. An OOM
+        after the profiled window retains inputs but cannot claim a partial peak
+        for that window, let alone a completed error percentage.
         """
-        original: BaseException | None = error
-        seen: set[int] = set()
-        while original is not None and id(original) not in seen:
-            if isinstance(original, torch.cuda.OutOfMemoryError):
-                break
-            seen.add(id(original))
-            original = original.__cause__
-        observation = getattr(self, "_planner_observation", None)
-        if (
-            original is None
-            or not isinstance(original, torch.cuda.OutOfMemoryError)
-            or observation is None
-        ):
-            return
-        self.discard_planner_observation()
-        overlapped = observation["generation"] <= self._planner_overlap_generation
-        partial = None
         try:
-            if observation["baseline"] is not None and not overlapped:
-                partial = max(
-                    0,
-                    max(
-                        observation["peak"],
-                        int(torch.cuda.max_memory_allocated(self.device)),
+            original: BaseException | None = error
+            seen: set[int] = set()
+            while original is not None and id(original) not in seen:
+                if isinstance(original, torch.cuda.OutOfMemoryError):
+                    break
+                seen.add(id(original))
+                original = original.__cause__
+            observation = getattr(self, "_planner_observation", None)
+            if (
+                original is None
+                or not isinstance(original, torch.cuda.OutOfMemoryError)
+                or observation is None
+            ):
+                return
+            self.discard_planner_observation()
+            reasons = []
+            if observation["generation"] <= self._planner_overlap_generation:
+                reasons.append("overlapping_forward_memory_window")
+            if not observation["window_open"]:
+                reasons.append("oom_after_profiled_window")
+            partial = None
+            try:
+                if observation["baseline"] is not None and not reasons:
+                    partial = max(
+                        0,
+                        max(
+                            observation["peak"],
+                            int(torch.cuda.max_memory_allocated(self.device)),
+                        )
+                        - observation["baseline"],
                     )
-                    - observation["baseline"],
-                )
-        except Exception:
-            pass
-        try:
+            except Exception:
+                pass
             oom_facts: dict[str, Any] = {
                 "type": type(original).__name__,
                 "message": str(original)[:4096],
@@ -5262,13 +5295,12 @@ class TrainerRank:
                 oom_facts["allocator"] = None
 
             def replay() -> dict[str, Any]:
-                result = observation["replay"]()
-                if overlapped:
-                    result["incomplete_reasons"] = [
-                        *result.get("incomplete_reasons", ()),
-                        "overlapping_forward_memory_window",
-                    ]
-                return {**result, "oom": oom_facts}
+                return {
+                    **observation["replay"](),
+                    "oom": oom_facts,
+                    "measurement_valid": not reasons,
+                    "window_reasons": reasons,
+                }
 
             self._planner_reporter.report(
                 predicted_peak_bytes=observation["predicted"],
@@ -5283,10 +5315,13 @@ class TrainerRank:
             _planner_misses._warn("could not persist planner OOM report")
 
     def discard_planner_observation(self) -> None:
-        observation = getattr(self, "_planner_observation", None)
-        if observation is not None:
-            self._planner_active_observations.discard(observation["generation"])
-        self._planner_observation = None
+        try:
+            observation = getattr(self, "_planner_observation", None)
+            if observation is not None:
+                self._planner_active_observations.pop(observation["generation"], None)
+            self._planner_observation = None
+        except Exception:
+            _planner_misses._warn("could not discard planner-miss observation")
 
     @property
     def _planner_observation(self) -> dict[str, Any] | None:
