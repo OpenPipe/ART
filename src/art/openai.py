@@ -17,6 +17,7 @@ from openai.types.chat.chat_completion_message_function_tool_call import (
 )
 from openai.types.chat.chat_completion_message_tool_call import Function
 
+from .preprocessing.dynamo_tokens import attach_dynamo_token_metadata
 from .preprocessing.policy_spans import (
     POLICY_TOKEN_SPANS_KEY,
     PROMPT_POLICY_TOKEN_SPANS_KEY,
@@ -97,6 +98,7 @@ def _is_empty_stream_prologue(chunk: ChatCompletionChunk) -> bool:
         and chunk.object == ""
         and chunk.model == ""
         and chunk.usage is None
+        and not (chunk.model_extra or {}).get("nvext")
     )
 
 
@@ -205,6 +207,7 @@ def _init_choice(chunk_choice: ChatCompletionChunkChoice) -> Choice:
 
 
 def finalize_chat_completion(chat_completion: ChatCompletion) -> ChatCompletion:
+    attach_dynamo_token_metadata(chat_completion)
     prompt_token_ids = (chat_completion.model_extra or {}).get("prompt_token_ids")
     if prompt_token_ids is not None:
         for choice in chat_completion.choices:
@@ -218,6 +221,14 @@ def update_chat_completion(
     chat_completion: ChatCompletion, chunk: ChatCompletionChunk
 ) -> None:
     chat_completion_extra = cast(dict[str, Any], chat_completion.model_extra)
+    nvext = (chunk.model_extra or {}).get("nvext")
+    if isinstance(nvext, dict) and "engine_data" in nvext:
+        # Dynamo sends a complete snapshot in the final (possibly choice-less)
+        # chunk. Preserve it once; do not append it to streamed token deltas.
+        chat_completion_extra["nvext"] = {
+            **chat_completion_extra.get("nvext", {}),
+            **nvext,
+        }
     prompt_token_ids = getattr(chunk, "prompt_token_ids", None)
     if prompt_token_ids is not None:
         chat_completion_extra["prompt_token_ids"] = prompt_token_ids

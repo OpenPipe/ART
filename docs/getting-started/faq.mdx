@@ -89,3 +89,21 @@ Over the course of many training steps, the model learns what strategies help it
   very effective at optimizing any LLM task for which you can define a
   quantifiable reward signal.
 </Accordion>
+
+## Can ART train on rollouts served by Dynamo?
+
+Yes. ART supports both vLLM's token metadata and Dynamo's
+`nvext.engine_data`. Trainable models' `openai_client()` requests engine data
+alongside the existing vLLM token options. For a directly constructed OpenAI
+client, request `logprobs=True` and
+`extra_body={"nvext": {"extra_fields": ["engine_data"]}}`, then use ART's
+`finalize_chat_completion` for a JSON response or
+`consume_chat_completion_stream` for a stream. Captured chat exchanges also
+read Dynamo metadata automatically.
+
+ART preserves the complete sampled sequence, including reasoning and stop
+tokens, without rewriting the response's text-facing logprobs. Dynamo's engine
+metadata currently supports single-choice training responses. Multi-choice
+inference still works, but ART cannot assign one response-level token array to
+multiple choices. Streaming callers must consume the final metadata chunk;
+ending at the first finish reason can omit the tokens needed for training.
