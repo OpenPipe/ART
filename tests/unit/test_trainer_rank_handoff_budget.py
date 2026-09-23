@@ -8,6 +8,7 @@ import pytest
 import torch
 
 from art.trainer_rank import ForwardOutput, TrainerRank, _backward_work, _impl
+from art.trainer_rank import _planner_misses as reports
 from tests.unit import test_trainer_rank_cache_recovery as recovery
 from tests.unit.test_trainer_rank_physical_reserve import allocator
 from tests.unit.test_trainer_rank_validation import (
@@ -59,8 +60,13 @@ def test_handoff_consumes_the_only_first_release(rig):
 
 
 @pytest.mark.parametrize("outcome", ["fit", "refuse", "override", "error", "cancel"])
-def test_diagnostic_admission_exit_charges_one_episode(rig, outcome):
+@pytest.mark.parametrize("reporting", [False, True])
+def test_diagnostic_admission_exit_charges_one_episode(
+    rig, outcome, reporting, tmp_path
+):
     rank, cuda, _, ns = rig
+    if reporting:
+        rank._planner_reporter = reports.Reporter(5, spool_dir=tmp_path / "reports")
     rank._allow_oversized_batches = outcome == "override"
     primary = (
         KeyboardInterrupt("cancel") if outcome == "cancel" else RuntimeError("release")
@@ -102,6 +108,25 @@ def test_diagnostic_admission_exit_charges_one_episode(rig, outcome):
     assert cuda.events.count("release") == 1
     assert state.cost == state.high == 3.0
     assert state.first_consumed and state.owner is None and not state.invalid
+    if reporting:
+        if outcome == "cancel":
+            assert not rank._planner_reporter.spool_dir.exists()
+        else:
+            decision = (
+                result[1].decision
+                if outcome in {"fit", "override"}
+                else reports.validate_report(
+                    next(rank._planner_reporter.spool_dir.glob("*.json")).read_bytes()
+                )["decision"]
+            )
+            accounted = [
+                row["values"]
+                for row in decision["trace"]
+                if row["kind"] == "recovery" and row["status"] == "accounted"
+            ]
+            assert len(accounted) == 1
+            assert accounted[0]["local_cumulative_seconds"] == 3.0
+            assert accounted[0]["local_forward_work_seconds"] == 0.0
 
 
 @pytest.mark.parametrize("override", [False, True])

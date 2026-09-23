@@ -16,6 +16,7 @@ from pathlib import Path
 import sys
 import threading
 import traceback
+from types import ModuleType
 from types import SimpleNamespace as NS
 import unittest
 from unittest.mock import patch
@@ -95,6 +96,9 @@ class CUDA:
 
 
 class TestBackwardWork(unittest.TestCase):
+    module: ModuleType
+    evidence: ModuleType
+
     def setUp(self):
         self.clock, self.cuda = Clock(), CUDA()
         self.task, self.callbacks = 0, []
@@ -111,14 +115,19 @@ class TestBackwardWork(unittest.TestCase):
                 )
             ),
         )
-        name = "_art_backward_work_control"
-        spec = importlib.util.spec_from_file_location(
-            name, ROOT / "src/art/trainer_rank/_backward_work.py"
-        )
-        assert spec is not None and spec.loader is not None
-        self.module = importlib.util.module_from_spec(spec)
-        with patch.dict(sys.modules, {"torch": self.torch, name: self.module}):
-            spec.loader.exec_module(self.module)
+        for attribute, filename in (
+            ("module", "_backward_work"),
+            ("evidence", "_planner_evidence"),
+        ):
+            name = f"_art{filename}_control"
+            spec = importlib.util.spec_from_file_location(
+                name, ROOT / f"src/art/trainer_rank/{filename}.py"
+            )
+            assert spec is not None and spec.loader is not None
+            module = importlib.util.module_from_spec(spec)
+            with patch.dict(sys.modules, {"torch": self.torch, name: module}):
+                spec.loader.exec_module(module)
+            setattr(self, attribute, module)
         setattr(self.module, "time", self.clock)
         self.work = self.module.BackwardWork(threading.RLock(), self.device)
         self.addCleanup(self.work.close)
@@ -185,6 +194,7 @@ class TestBackwardWork(unittest.TestCase):
             traceback=traceback,
             BackwardWork=self.module.BackwardWork,
             _backward_region=self.module.region,
+            _planner_evidence=self.evidence,
             torch=self.torch,
             math=math,
             os=os,

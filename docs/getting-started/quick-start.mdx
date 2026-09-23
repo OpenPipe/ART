@@ -4,17 +4,18 @@ description: "Get started with ART in a few quick steps."
 icon: "forward"
 ---
 
-In this Quick Start tutorial, we'll be training Qwen3 14B Instruct to play [2048](https://play2048.co/), a simple game that requires forward planning and basic math skills.
+In this Quick Start tutorial, we'll be training Qwen 3.8 27B to play [2048](https://play2048.co/), a simple game that requires forward planning and basic math skills.
 
 <Info>
 
 Reading time: <b>15 min</b>
 
-Training time: <b>2 hours</b>
-
-Total cost: <b>Free!</b>
+Training time and cost depend on your run settings and W&B plan.
 
 </Info>
+
+The notebook installs ART main (pinned to `88d3df2`) and uses
+`Qwen/Qwen3.8-27B` with `ServerlessBackend`; no local GPU is required.
 
 ## Step 1: Provision W&B API key
 
@@ -25,7 +26,7 @@ Total cost: <b>Free!</b>
 * **W&B Weave** - record your model's traces as it generates completions
 * **W&B Artifacts** - store and manage your model's checkpoints
 
-Weights & Biases currently provides a small free tier for all the services we'll use during this quickstart, so you shouldn't need to add a credit card to get started.
+Use a W&B account with access to W&B Training.
 
 - [Weights & Biases](https://wandb.ai/home)
 

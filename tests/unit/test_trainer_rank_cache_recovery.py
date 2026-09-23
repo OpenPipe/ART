@@ -76,6 +76,12 @@ class CUDA:
     def memory_reserved(self, device):
         return self.allocated
 
+    def memory_stats(self, device):
+        return {
+            "allocated_bytes.all.current": self.memory_allocated(device),
+            "reserved_bytes.all.current": self.memory_reserved(device),
+        }
+
     def empty_cache(self):
         self.events.append("release")
         if self.failure is not None:

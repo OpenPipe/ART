@@ -37,25 +37,24 @@ The client that you'll use to generate tokens and train your model is initialize
 import art
 
 model = art.TrainableModel(
-    # the name of your model as it will appear in W&B
-    # and other observability platforms
+    # inference-serving name
     name="agent-001",
+    # durable training run and checkpoint name
+    run_name="agent-001",
     # keep your project name constant between all the models you train
     # for a given task to consistently group metrics
     project="my-agentic-task",
     # the model that you want to train from
-    base_model="OpenPipe/Qwen3-14B-Instruct",
+    base_model="Qwen/Qwen3.8-27B",
 )
 ```
 
 Once you've initialized your [backend](/fundamentals/art-backend), you can register it with your model. This sets up all the wiring to run inference and training.
 
 ```python
-# managed training
-backend = ServerlessBackend()
+from art.serverless import ServerlessBackend
 
-# local training
-backend = LocalBackend()
+backend = ServerlessBackend()  # Uses WANDB_API_KEY
 
 await model.register(backend)
 ```
@@ -104,7 +103,7 @@ messages: art.Messages = [
 ]
 chat_completion = await openai_client.chat.completions.create(
     messages=messages,
-    model=model.get_inference_name(),
+    model=model.get_inference_name(await model.get_step()),
     max_tokens=100,
     timeout=100,
     tools=[...]
