@@ -343,34 +343,21 @@ def _contains_tokens(tokens: Sequence[int], sampled: Sequence[int]) -> bool:
     return False
 
 
-def _retains_output_suffix(
+def _retains_captured_output(
     prompt: Sequence[int] | None,
     output: Sequence[int] | None,
     later_prompt: Sequence[int] | None,
 ) -> bool:
-    if (
-        prompt is None
-        or output is None
-        or later_prompt is None
-        or not _is_prefix(prompt, later_prompt)
-    ):
-        return False
-    continuation = later_prompt[len(prompt) :]
-    if not output or not continuation:
-        return False
-
-    prefix_lengths = _token_prefix_lengths(continuation)
-    matched = 0
-    for index, token in enumerate(output):
-        while matched and token != continuation[matched]:
-            matched = prefix_lengths[matched - 1]
-        if token == continuation[matched]:
-            matched += 1
-            if matched == len(continuation):
-                if index + 1 == len(output):
-                    return True
-                matched = prefix_lengths[matched - 1]
-    return matched > 0
+    # A suffix sampled under a longer prefix has different conditional
+    # probabilities. Keep it as request conditioning in the later branch;
+    # the existing split branch preserves the complete original generation.
+    return (
+        prompt is not None
+        and output is not None
+        and bool(output)
+        and later_prompt is not None
+        and _is_prefix([*prompt, *output], later_prompt)
+    )
 
 
 def _chat_generation_tokens(
@@ -464,7 +451,7 @@ def _chat_retains_sampled_reasoning(
     return True
 
 
-def _chat_retains_sampled_suffix(
+def _chat_retains_captured_output(
     branch: _Branch[Message, ChatCompletionsMessageSource, _ChatContext],
     prompt_ids: Sequence[int] | None,
     prompt_length: int,
@@ -487,7 +474,7 @@ def _chat_retains_sampled_suffix(
     prior_prompt, prior_output = _chat_generation_tokens(
         prior_source.exchange, prior_source.choice_index, cache
     )
-    return _retains_output_suffix(prior_prompt, prior_output, prompt_ids)
+    return _retains_captured_output(prior_prompt, prior_output, prompt_ids)
 
 
 def _chat_structured_generation_hit_limit(
@@ -578,7 +565,7 @@ def _anthropic_generation_tokens(
     return cache[key]
 
 
-def _anthropic_retains_sampled_suffix(
+def _anthropic_retains_captured_output(
     branch: _Branch[AnthropicMessageParam, AnthropicMessageSource, _AnthropicContext],
     prompt_ids: Sequence[int] | None,
     prompt_length: int,
@@ -597,7 +584,7 @@ def _anthropic_retains_sampled_suffix(
     prior_prompt, prior_output = _anthropic_generation_tokens(
         prior_source.exchange, cache
     )
-    return _retains_output_suffix(prior_prompt, prior_output, prompt_ids)
+    return _retains_captured_output(prior_prompt, prior_output, prompt_ids)
 
 
 def _chat_message_key(message: Message, *, visible_only: bool = False) -> str:
@@ -719,7 +706,7 @@ def chat_completions_histories(
             source_continuation = lambda branch: (
                 reconcile
                 or exact_continuation(branch)
-                or _chat_retains_sampled_suffix(
+                or _chat_retains_captured_output(
                     branch, prompt_ids, len(prompt), token_cache
                 )
             )
@@ -826,7 +813,7 @@ def anthropic_messages_histories(
             continuation = lambda branch: reconcile or exact_continuation(branch)
             source_continuation = lambda branch: (
                 continuation(branch)
-                or _anthropic_retains_sampled_suffix(
+                or _anthropic_retains_captured_output(
                     branch, prompt_ids, len(prompt), token_cache
                 )
             )
@@ -1321,7 +1308,7 @@ def _responses_split_prompt_source(
     if not 0 <= source.generation_index < len(generations):
         raise ValueError("Responses generation source index is out of bounds")
     generation = generations[source.generation_index]
-    if _retains_output_suffix(
+    if _retains_captured_output(
         generation.prompt_token_ids,
         generation.output_token_ids,
         current_prompt_ids,

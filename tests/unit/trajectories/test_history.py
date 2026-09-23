@@ -334,14 +334,15 @@ def test_contains_tokens(tokens: list[int], sampled: list[int], expected: bool) 
     [
         ([0], [], [0, 1], False),
         ([0], [1], [0], False),
-        ([0], [7, 1, 2], [0, 1, 2], True),
-        ([0], [1, 1, 1, 2], [0, 1, 1, 2], True),
+        ([0], [7, 1, 2], [0, 1, 2], False),
+        ([0], [1, 1, 1, 2], [0, 1, 1, 2], False),
         ([0], [1, 2, 3], [0, 1, 2], False),
-        ([0], [9, 1], [0, 1, 2], True),
+        ([0], [9, 1], [0, 1, 2], False),
         ([0], [1], [9, 1], False),
+        ([0], [1, 2], [0, 1, 2, 3], True),
     ],
 )
-def test_retains_output_suffix(
+def test_retains_captured_output(
     prompt: list[int],
     output: list[int],
     later_prompt: list[int],
@@ -350,7 +351,8 @@ def test_retains_output_suffix(
     history_module = importlib.import_module("art.trajectories._history")
 
     assert (
-        history_module._retains_output_suffix(prompt, output, later_prompt) is expected
+        history_module._retains_captured_output(prompt, output, later_prompt)
+        is expected
     )
 
 
@@ -383,7 +385,7 @@ def test_contains_tokens_scales_linearly() -> None:
 
     output = CountingTokens([1] * 10_000 + [2])
     later_prompt = CountingTokens([0, *([1] * 1_000), 2])
-    assert history_module._retains_output_suffix(
+    assert not history_module._retains_captured_output(
         [0], cast(Any, output), cast(Any, later_prompt)
     )
     assert output.accesses + later_prompt.accesses < 10 * (
@@ -1051,7 +1053,7 @@ def test_cross_exchange_responses_reasoning_stripping_splits_histories() -> None
     first_answer_source = histories[1].input_sources[1]
     assert first_answer_source is not None
     assert first_answer_source.exchange is first
-    assert first_answer_source.generation_index == 0
+    assert first_answer_source.generation_index is None
 
 
 @pytest.mark.parametrize(
@@ -1630,8 +1632,9 @@ def test_chat_template_stripped_reasoning_splits_exact_histories() -> None:
     assert len(histories) == 2
     assert [len(history.messages) for history in histories] == [2, 4]
     assert histories[1].message_sources[1] is not None
-    assert histories[1].message_sources[1].exchange is first
-    assert histories[1].message_sources[1].choice_index == 0
+    assert histories[1].message_sources[1].exchange is second
+    assert histories[1].message_sources[1].request_index == 1
+    assert histories[1].message_sources[1].choice_index is None
     with pytest.raises(ValueError, match="exactly one history"):
         trajectory.tokenize()
 
