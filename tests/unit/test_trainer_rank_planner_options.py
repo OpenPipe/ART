@@ -345,7 +345,7 @@ def test_fitting_path_adds_no_option_agreement_collective(monkeypatch):
 
 def test_iterator_close_preserves_pending_backward_oom_context(monkeypatch, tmp_path):
     rank, plan, _ = _reporting_rank(monkeypatch, tmp_path)
-    monkeypatch.setattr(rank, "_available_memory_bytes", lambda: 10000)
+    monkeypatch.setattr(rank, "_available_memory_bytes", lambda sample=None: 10000)
     iterator = rank.forward_micro_batches([_request(0)])
     next(iterator)
     iterator.close()
@@ -651,7 +651,7 @@ def test_closed_dp_context_invalidates_other_executions_open_caller_window(
     monkeypatch, tmp_path
 ):
     rank, plan, counters = _reporting_rank(monkeypatch, tmp_path)
-    monkeypatch.setattr(rank, "_available_memory_bytes", lambda: 10000)
+    monkeypatch.setattr(rank, "_available_memory_bytes", lambda sample=None: 10000)
     one, two = {}, {}
     with rank.planner_observation_scope(one):
         rank._execute_admitted_plan(
