@@ -8,7 +8,7 @@ from typing import cast
 import unittest
 from unittest.mock import patch
 
-from art.trainer_rank import _impl
+from art.trainer_rank import _backward_work, _impl
 
 Refusal = _impl.TrainerRankMemoryError
 Partial = _impl.TrainerRankPartialExecutionError
@@ -76,6 +76,12 @@ class CUDA:
     def memory_reserved(self, device):
         return self.allocated
 
+    def memory_stats(self, device):
+        return {
+            "allocated_bytes.all.current": self.memory_allocated(device),
+            "reserved_bytes.all.current": self.memory_reserved(device),
+        }
+
     def empty_cache(self):
         self.events.append("release")
         if self.failure is not None:
@@ -87,6 +93,14 @@ class Clock:
     def __init__(self):
         self.value = 0.0
         self.next = None
+        self.nanoseconds = 0
+        self.observer_step_ns = 0
+
+    def perf_counter_ns(self):
+        # Existing recovery cases isolate O=0; imported-module cases opt in to
+        # positive observer cost without changing the original episode clock.
+        self.nanoseconds += self.observer_step_ns
+        return self.nanoseconds
 
     def perf_counter(self):
         if self.next is not None:
@@ -153,6 +167,9 @@ class TestRecovery(unittest.TestCase):
             patcher = patch.object(_impl, name, value)
             patcher.start()
             self.addCleanup(patcher.stop)
+        observer_clock = patch.object(_backward_work, "time", clock)
+        observer_clock.start()
+        self.addCleanup(observer_clock.stop)
         q = object.__new__(_impl.TrainerRank)
         q.device = types.SimpleNamespace(type="cuda")
         q._update_peak_memory_profile = lambda *a: None
@@ -574,6 +591,9 @@ class TestRecovery(unittest.TestCase):
                     return False
 
             state.lock = Lock()
+            # This case injects faults by original recovery-lock ordinal;
+            # observer cancellation/depth has separate actual helper controls.
+            q._backward_work = lambda: None
             _, error, _ = run(q, [fail(n), success(n)])
             self.assertIs(error, original)
             self.assertEqual(state.lock.calls, 4)
@@ -599,6 +619,7 @@ class TestRecovery(unittest.TestCase):
                 return False
 
         state.lock = Lock()
+        q._backward_work = lambda: None  # Isolate original recovery-lock ordinals.
         _, error, _ = run(q, [fail(n), success(n)])
         self.assertIs(error, original)
         self.assertEqual(state.lock.calls, 4)
@@ -620,6 +641,7 @@ class TestRecovery(unittest.TestCase):
                 return False
 
         state.lock = Lock()
+        q._backward_work = lambda: None  # Isolate original recovery-lock ordinals.
         value, error, _ = run(q, [fail(n), success(n)])
         self.assertIsNone(error)
         self.assertTrue(value[1].fits)
