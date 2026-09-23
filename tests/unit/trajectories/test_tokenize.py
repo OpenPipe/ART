@@ -6733,6 +6733,11 @@ def test_rerender_rejects_sampled_text_ambiguous_with_trailing_scaffold() -> Non
         "eos_after_prefix_length",
         "eos_after_multiple_length",
         "eos_after_multiple_prefix_length",
+        "eos_after_short_length",
+        "eos_after_alternate_length",
+        "eos_after_prefix_alternate_length",
+        "eos_after_multiple_alternate_length",
+        "eos_after_multiple_prefix_alternate_length",
     ],
 )
 def test_rerender_preserves_contained_part_proof_after_message_correction(
@@ -6750,6 +6755,10 @@ def test_rerender_preserves_contained_part_proof_after_message_correction(
     )
     length_stopped = case.endswith("_length")
     case = case.removesuffix("_length")
+    alternate_eos = case.endswith("_alternate")
+    case = case.removesuffix("_alternate")
+    short_capture = case.endswith("_short")
+    case = case.removesuffix("_short")
     after_eos = case.startswith("eos_after")
     after_prefix = after_eos and case.endswith("_prefix")
     in_part_cases = {
@@ -6793,13 +6802,19 @@ def test_rerender_preserves_contained_part_proof_after_message_correction(
         eos_token_id = 999 if case in eos_cases else None
 
         def __call__(self, text: str, **kwargs: object) -> dict[str, object]:
+            if short_capture and text == content:
+                return {
+                    "input_ids": [97, 98, 1003],
+                    "offset_mapping": [(0, 1), (1, 2), (2, 4)],
+                }
             tokens, offsets = [], []
             index = 0
             while index < len(text):
                 # Standalone and rendered content can tokenize differently,
                 # while both token sequences decode to the captured text.
                 merge = (
-                    case not in {"unmerged_stop", "eos_whole"}
+                    not short_capture
+                    and case not in {"unmerged_stop", "eos_whole"}
                     and text[index : index + len(merged_content)] == merged_content
                     and (
                         case == "exact"
@@ -6830,11 +6845,13 @@ def test_rerender_preserves_contained_part_proof_after_message_correction(
             return "".join(
                 merged_content
                 if token in {1000, 1001}
+                else "§c"
+                if token == 1003
                 else eos_text
-                if token == 999
+                if token in {999, 1002}
                 else chr(token)
                 for token in tokens
-                if token != 999 or not kwargs.get("skip_special_tokens")
+                if token not in {999, 1002} or not kwargs.get("skip_special_tokens")
             )
 
         def apply_chat_template(
@@ -6883,6 +6900,10 @@ def test_rerender_preserves_contained_part_proof_after_message_correction(
             + [99]
             + ([90] if after_prefix else [])
         )
+    if short_capture:
+        output = [97, 98, 999]
+    if alternate_eos:
+        output = [1002 if token == 999 else token for token in output]
     exchange = _chat_exchange([80], output)
     exchange.request["messages"] = []
     data = exchange.response.model_dump(mode="python")
@@ -6923,6 +6944,13 @@ def test_rerender_preserves_contained_part_proof_after_message_correction(
         chat_template="rerender",
     )
     tokenizer = Tokenizer()
+    if short_capture:
+        assert tokenizer.decode(output) == "ab§"
+        assert content == "ab§c"
+        with pytest.raises(ValueError, match="cover the proven history part"):
+            tokenized = history.tokenize(tokenizer=tokenizer)
+            pytest.fail(f"Accepted incomplete capture: {tokenized.tokens}")
+        return
     if case in {"crossing", "contained_stop", "messages_stop"} | eos_cases:
         assert _sampled_stop_suffix(
             output,
@@ -8958,3 +8986,86 @@ def test_length_boundary_preserves_output_despite_probe_suffix_collision(
                 == _SAMPLED_ASSISTANT_OUTPUT
                 for i in positions
             )
+
+
+@pytest.mark.parametrize("finish_reason", ["stop", "length"])
+@pytest.mark.parametrize(
+    "captured_content,eos", [(1000, 999), (1001, 999), (1000, 1002)]
+)
+def test_rerender_rejects_unproven_sampled_part_start(
+    finish_reason: str, captured_content: int, eos: int
+) -> None:
+    class Tokenizer:
+        eos_token_id = 999
+
+        def __call__(self, text: str, **kwargs: object) -> dict[str, object]:
+            tokens, offsets = [], []
+            index = 0
+            while index < len(text):
+                merged = text[index:].startswith("abc§")
+                end = index + (3 if merged else 1)
+                tokens.append(
+                    1000 if merged else 999 if text[index] == "§" else ord(text[index])
+                )
+                offsets.append((index, end))
+                index = end
+            result: dict[str, object] = {"input_ids": tokens}
+            if kwargs.get("return_offsets_mapping"):
+                result["offset_mapping"] = offsets
+            return result
+
+        def decode(self, tokens: list[int], **kwargs: object) -> str:
+            return "".join(
+                "abc"
+                if token in {1000, 1001}
+                else "§"
+                if token in {999, 1002}
+                else chr(token)
+                for token in tokens
+                if token not in {999, 1002} or not kwargs.get("skip_special_tokens")
+            )
+
+        def apply_chat_template(
+            self,
+            messages: list[dict[str, Any]],
+            *,
+            add_generation_prompt: bool,
+            tokenize: bool = True,
+            **kwargs: object,
+        ) -> object:
+            text = "".join(
+                "PX" + message["content"] + "§"
+                if message["role"] == "assistant"
+                else "Q" + message["content"] + "R"
+                for message in messages
+            ) + ("P" if add_generation_prompt else "")
+            return self(text)["input_ids"] if tokenize else text
+
+    output = [88, captured_content, eos]
+    exchange = _chat_exchange([80], output)
+    exchange.request["messages"] = []
+    data = exchange.response.model_dump(mode="python")
+    data["choices"][0]["message"] = {"role": "assistant", "content": "abc"}
+    data["choices"][0]["finish_reason"] = finish_reason
+    exchange.response = ChatCompletion.model_validate(data)
+    source = ChatCompletionsMessageSource(exchange=exchange, choice_index=0)
+    history = tr.ChatCompletionsHistory(
+        model="test/model",
+        messages=[
+            {"role": "assistant", "content": "abc"},
+            {"role": "user", "content": "abc"},
+        ],
+        message_sources=[source, None],
+        chat_template="rerender",
+    )
+    tokenizer = Tokenizer()
+    assert tokenizer("abc")["input_ids"] == [97, 98, 99]
+    assert tokenizer.decode(output) == "Xabc§"
+    assert tokenizer.apply_chat_template(
+        [{"role": "assistant", "content": "abc"}], add_generation_prompt=False
+    ) == [80, 88, 1000, 999]
+    with pytest.raises(ValueError, match="sampled part start"):
+        tokenized = history.tokenize(tokenizer=tokenizer)
+        pytest.fail(
+            f"Accepted ambiguous part start: {tokenized.tokens}; flags={tokenized.flags}"
+        )

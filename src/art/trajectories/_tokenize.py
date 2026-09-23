@@ -5850,6 +5850,14 @@ def _tokenize_chat_view(
                 raise ValueError(
                     "Could not preserve exact sampled tokens for a corrected history part"
                 )
+            if (
+                exact is not None
+                and corrected_message_end is not None
+                and proven_part_bounds is not None
+                and sampled_bounds is not None
+                and start != sampled_bounds[0]
+            ):
+                raise ValueError("Could not prove the complete sampled part start")
             if exact is not None and rendered[start : start + len(exact)] == exact:
                 end = start + len(exact)
                 if corrected_message_end is not None and end > corrected_message_end:
@@ -5991,6 +5999,10 @@ def _tokenize_chat_view(
             )
             if synthetic_stop is not None:
                 if part_end is not None and synthetic_stop + 1 < part_end:
+                    if end < part_end:
+                        raise ValueError(
+                            "Exact sampled tokens do not cover the proven history part"
+                        )
                     # Keep the boundary without replaying replaced visible content.
                     synthetic_stop_token = rendered[synthetic_stop]
                     end = part_end
@@ -6023,8 +6035,12 @@ def _tokenize_chat_view(
             replacement_stop_mask = [False] * len(replacement)
         if synthetic_stop_token is not None:
             replacement_stop_mask = [False] * len(replacement)
-        replacement_length_stop_mask = _translate_token_mask(
-            rendered[start:end], replacement, length_stop_mask[start:end]
+        replacement_length_stop_mask = (
+            [False] * len(replacement)
+            if synthetic_stop_token is not None
+            else _translate_token_mask(
+                rendered[start:end], replacement, length_stop_mask[start:end]
+            )
         )
         if exact:
             token_ids.extend(replacement)
