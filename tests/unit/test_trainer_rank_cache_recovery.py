@@ -897,3 +897,107 @@ def test_dense_cp_exact_demand_fits_after_recovery(monkeypatch):
 
 def test_dense_cp_exact_demand_refuses_after_recovery(monkeypatch):
     _check_dense_cp_exact_demand_recovery(monkeypatch, fits_after_release=False)
+
+
+def _check_component_demand_recovery(
+    monkeypatch, rank, requests, *, fits_after, after_available=None
+):
+    """Real pricing/search/recovery, CPU plans and scalar CUDA counters only."""
+    import pytest
+
+    assert not _impl.dist.is_initialized() and not _impl.torch.cuda.is_initialized()
+    plan = rank._plan_flat_forward(requests)
+    required = rank._memory_check(plan).estimated_required_bytes
+    profiles = dict(rank._memory_profiles)
+    groups = rank._plan_group_rows(plan)
+    head = rank._plan_head_workspace_bytes(plan)
+    total = 10 * required
+    reserve = int(total * _impl._MEMORY_RESERVE_FRACTION)
+    free, phase = reserve + 1, 0
+    searches, demands, outcomes, releases, errors = [], [], [], [], []
+    estimate = rank._estimate_required_memory_bytes_from_values
+    search = rank._search_next_micro_batch
+    outcome = rank._admission_outcome
+    error_factory = _impl._ForwardRefusal.error
+
+    def observed_estimate(**kwargs):
+        value = estimate(**kwargs)
+        if (
+            kwargs.get("group_rows") == groups
+            and kwargs.get("head_workspace_bytes") == head
+        ):
+            demands.append((phase, value))
+        return value
+
+    def observed_search(*args, **kwargs):
+        nonlocal phase
+        phase += 1
+        value = search(*args, **kwargs)
+        searches.append(value)
+        return value
+
+    def observed_outcome(local):
+        value = outcome(local)
+        outcomes.append((local, value))
+        return value
+
+    def release():
+        nonlocal free
+        releases.append(phase)
+        free = reserve + (
+            after_available
+            if after_available is not None
+            else required
+            if fits_after
+            else 1
+        )
+
+    def observed_error(refused, context):
+        error = error_factory(refused, context)
+        errors.append(error)
+        return error
+
+    monkeypatch.delenv(_impl._TEST_HOOKS_ENV, raising=False)
+    # Inert CPU fixture, not an initialized MCore/distributed topology.
+    monkeypatch.setattr(rank, "_dp_rank_and_size", lambda: (0, 1))
+    monkeypatch.setattr(rank, "device", _impl.torch.device("cuda"))
+    monkeypatch.setattr(_impl.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(_impl.torch.cuda, "get_allocator_backend", lambda: "native")
+    monkeypatch.setattr(_impl.torch.cuda, "mem_get_info", lambda device: (free, total))
+    monkeypatch.setattr(_impl.torch.cuda, "memory_allocated", lambda device: 0)
+    monkeypatch.setattr(_impl.torch.cuda, "memory_reserved", lambda device: total)
+    monkeypatch.setattr(_impl.torch.cuda, "empty_cache", release)
+    monkeypatch.setattr(
+        _impl.torch.cuda, "synchronize", lambda *a: pytest.fail("No CUDA work")
+    )
+    monkeypatch.setattr(
+        rank, "_estimate_required_memory_bytes_from_values", observed_estimate
+    )
+    monkeypatch.setattr(rank, "_search_next_micro_batch", observed_search)
+    monkeypatch.setattr(rank, "_admission_outcome", observed_outcome)
+    monkeypatch.setattr(_impl._ForwardRefusal, "error", observed_error)
+    monkeypatch.setattr(rank, "_snapshot_planning_telemetry", lambda *args: None)
+    monkeypatch.setattr(
+        rank, "_execute_flat_plan", lambda *a, **kw: pytest.fail("No model execution")
+    )
+    # Cached bytes exceed demand, but are not physical-free admission credit.
+    assert rank._available_memory_bytes() == 1 < required < total
+    if fits_after:
+        selected = rank._select_next_micro_batch([requests], 0)
+        assert selected.check.fits and selected.check.available_bytes == required
+        assert selected.check.estimated_required_bytes == required
+        assert rank._plan_group_rows(selected.plan) == groups
+        assert rank._plan_head_workspace_bytes(selected.plan) == head
+        assert len(errors) == 1
+    else:
+        with pytest.raises(Refusal) as captured:
+            rank._select_next_micro_batch([requests], 0)
+        assert len(errors) == 2 and captured.value is errors[1]
+        assert captured.value.__cause__ is errors[0]
+    assert len(searches) == 2 and isinstance(searches[0], _impl._ForwardRefusal)
+    assert releases == [1] and outcomes[0] == (1, 1)
+    assert (1, required) in demands and (2, required) in demands
+    assert rank._recovery_state().first_consumed
+    assert rank._recovery_state().owner is None
+    assert rank._memory_profiles == profiles
+    assert not _impl.torch.cuda.is_initialized()

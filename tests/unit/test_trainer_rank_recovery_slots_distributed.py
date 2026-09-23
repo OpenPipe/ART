@@ -92,6 +92,7 @@ def worker(index, mode, directory):
     ]
     rank._forward_memory_group = lambda: groups[index]
     plan = SimpleNamespace(
+        groups=(),  # This slot-only fixture has no retained/head/GDN groups.
         packed_tokens=1,
         logical_tokens=1,
         active_logical_tokens=1,
