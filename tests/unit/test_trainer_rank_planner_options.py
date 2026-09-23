@@ -130,6 +130,9 @@ def _reporting_rank(monkeypatch, tmp_path):
     monkeypatch.setattr(rank, "device", torch.device("cuda:0"))
     monkeypatch.setattr(tr, "_telemetry_phase", lambda *a, **k: nullcontext())
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_allocator_backend", lambda: "native")
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda *a: (10000, 10000))
+    monkeypatch.setattr(torch.cuda, "memory_reserved", lambda *a: counters["allocated"])
 
     def synchronize(*a):
         counters["syncs"] += 1
