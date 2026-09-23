@@ -5471,6 +5471,7 @@ def _tokenize_chat_view(
         )
         exact_output_matches: list[tuple[int, int]] | None = None
         exact_output_span: tuple[int, int] | None = None
+        corrected_message_end: int | None = None
         if (
             complete_sampled_message
             and source is not None
@@ -5532,6 +5533,7 @@ def _tokenize_chat_view(
                 and rendered[: len(rendered_completed)] == rendered_completed
             ):
                 marked_bounds[message_index] = corrected_bounds
+                corrected_message_end = corrected_bounds[1]
                 if any(
                     not corrected_bounds[0] <= start <= end <= corrected_bounds[1]
                     for start, end in marked_part_bounds.get(message_index, ())
@@ -5836,9 +5838,17 @@ def _tokenize_chat_view(
                 part=part,
                 full_tokens=(full_exact, full_logprobs),
             )
+            if (
+                exact is None
+                and corrected_message_end is not None
+                and proven_part_bounds is not None
+            ):
+                raise ValueError(
+                    "Could not preserve exact sampled tokens for a corrected history part"
+                )
             if exact is not None and rendered[start : start + len(exact)] == exact:
                 end = start + len(exact)
-                if sampled_bounds is not None and end > sampled_bounds[1]:
+                if corrected_message_end is not None and end > corrected_message_end:
                     raise ValueError(
                         "Exact sampled tokens extend beyond their proven message bounds"
                     )
