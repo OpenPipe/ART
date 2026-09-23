@@ -29,11 +29,16 @@ import threading
 from typing import Any
 import uuid
 
+from . import _planner_evidence
+
 ALLOW_OVERSIZED_ENV = "ART_TRAINER_RANK_ALLOW_OVERSIZED_BATCHES"
 MISS_THRESHOLD_ENV = "ART_TRAINER_RANK_PLANNER_MISS_THRESHOLD_PCT"
 MAX_REPORT_BYTES = 16 * 1024 * 1024
 MAX_SPOOL_BYTES = 256 * 1024 * 1024
 MAX_SPOOL_REPORTS = 1024
+MAX_PLANNING_REPORT_BYTES = 256 * 1024
+MAX_PLANNING_REPORTS = 64
+MAX_PLANNING_SPOOL_BYTES = 16 * 1024 * 1024
 _SOURCE_NAMES = (
     "_impl.py",
     "_planner_cost.py",
@@ -41,6 +46,7 @@ _SOURCE_NAMES = (
     "_prefix_tree_performance_search.py",
     "_planner_misses.py",
     "_gdn_memory.py",
+    "_planner_evidence.py",
 )
 _SOURCE_BYTE_LIMIT = 1024 * 1024
 _REPORT_KEYS = frozenset(
@@ -133,9 +139,14 @@ def validate_report(raw: bytes) -> dict[str, Any]:
     record = json.loads(raw, object_pairs_hook=pairs)
     if (
         not isinstance(record, dict)
-        or set(record) != _REPORT_KEYS
+        or set(record)
+        != (
+            _REPORT_KEYS | {"event", "decision", "failure"}
+            if record.get("format") == 2
+            else _REPORT_KEYS
+        )
         or type(record.get("format")) is not int
-        or record["format"] != 1
+        or record["format"] not in (1, 2)
         or record.get("kind") != "art-planner-miss"
         or not isinstance(record.get("id"), str)
         or re.fullmatch("[0-9a-f]{32}", record["id"]) is None
@@ -162,7 +173,15 @@ def validate_report(raw: bytes) -> dict[str, Any]:
         value = record[key]
         if value is not None and (type(value) is not int or value < 0):
             raise ValueError("invalid report memory value")
-    if record["predicted_peak_bytes"] is None:
+    event = record.get("event", "oom" if record["oom"] else "estimate_miss")
+    if event not in _planner_evidence.EVENTS or record["oom"] != (event == "oom"):
+        raise ValueError("invalid planner event")
+    if record["format"] == 2:
+        _planner_evidence.validate(record["decision"], record["failure"])
+    if record["predicted_peak_bytes"] is None and event not in {
+        "planning_error",
+        "admission_refused",
+    }:
         raise ValueError("missing prediction")
     for key in ("threshold_pct", "error_pct"):
         value = record[key]
@@ -174,7 +193,12 @@ def validate_report(raw: bytes) -> dict[str, Any]:
         record["error_pct"] is not None or record["observed_peak_bytes"] is not None
     ):
         raise ValueError("OOM cannot claim a completed observation")
-    if not record["oom"]:
+    if event in {"admission_refused", "planning_error"} and any(
+        record[key] is not None
+        for key in ("observed_peak_bytes", "partial_peak_bytes", "error_pct")
+    ):
+        raise ValueError("planning failure cannot claim an execution measurement")
+    if event == "estimate_miss":
         predicted, observed = (
             record["predicted_peak_bytes"],
             record["observed_peak_bytes"],
@@ -192,7 +216,9 @@ def validate_report(raw: bytes) -> dict[str, Any]:
     return record
 
 
-def persist_report(raw: bytes, spool_dir: Path) -> Path:
+def persist_report(
+    raw: bytes, spool_dir: Path, *, planning_budget: bool = False
+) -> Path:
     """Durably retain exact bytes; duplicate delivery is safe, conflicts refuse."""
     record = validate_report(raw)
     with _spool_lock:
@@ -210,6 +236,18 @@ def persist_report(raw: bytes, spool_dir: Path) -> Path:
             ):
                 raise ValueError("existing report identity has different bytes")
             return path
+        # Rank-side ordinary planning failures may use only the first small
+        # part of the spool. OOMs/misses and delivery keep their original limit.
+        count_limit = (
+            min(MAX_SPOOL_REPORTS, MAX_PLANNING_REPORTS)
+            if planning_budget
+            else MAX_SPOOL_REPORTS
+        )
+        byte_limit = (
+            min(MAX_SPOOL_BYTES, MAX_PLANNING_SPOOL_BYTES)
+            if planning_budget
+            else MAX_SPOOL_BYTES
+        )
         size = count = 0
         for entry in spool_dir.iterdir():
             try:
@@ -222,7 +260,7 @@ def persist_report(raw: bytes, spool_dir: Path) -> Path:
                 raise ValueError("unexpected nonregular spool entry")
             count += 1
             size += item.st_size
-            if count >= MAX_SPOOL_REPORTS or size + len(raw) > MAX_SPOOL_BYTES:
+            if count >= count_limit or size + len(raw) > byte_limit:
                 raise ValueError("report spool is full; preserve and export reports")
         fd, temporary = tempfile.mkstemp(prefix=".pending-", dir=spool_dir)
         try:
@@ -258,32 +296,41 @@ class Reporter:
     def report(
         self,
         *,
-        predicted_peak_bytes: int,
+        predicted_peak_bytes: int | None,
         observed_peak_bytes: int | None,
         phase: str,
         replay_factory: Callable[[], dict[str, Any]],
         oom: bool = False,
         admission_peak_bytes: int | None = None,
         partial_peak_bytes: int | None = None,
+        event: str | None = None,
+        decision: dict[str, Any] | None = None,
+        failure: dict[str, Any] | None = None,
     ) -> Path | None:
         """Serialize only a miss; ordinary observation failures never escape."""
         threshold = self.threshold_pct
         if threshold is None:
             return None
-        if not oom and (
-            observed_peak_bytes is None
+        event = event or ("oom" if oom else "estimate_miss")
+        planning = event in {"admission_refused", "planning_error"}
+        if event == "estimate_miss" and (
+            predicted_peak_bytes is None
+            or observed_peak_bytes is None
             or abs(observed_peak_bytes - predicted_peak_bytes) * 100
             <= threshold * predicted_peak_bytes
         ):
             return None
         try:
-            if predicted_peak_bytes < 0 or (
+            if (predicted_peak_bytes is not None and predicted_peak_bytes < 0) or (
                 observed_peak_bytes is not None and observed_peak_bytes < 0
             ):
                 raise ValueError("negative memory measurement")
             record: dict[str, Any] = {
-                "format": 1,
+                "format": 2,
                 "kind": "art-planner-miss",
+                "event": event,
+                "decision": _planner_evidence.bounded(decision),
+                "failure": failure,
                 "id": uuid.uuid4().hex,
                 "occurred_at": datetime.now(timezone.utc).isoformat(),
                 "phase": phase,
@@ -299,6 +346,7 @@ class Reporter:
                     / predicted_peak_bytes
                     if not oom
                     and observed_peak_bytes is not None
+                    and predicted_peak_bytes is not None
                     and predicted_peak_bytes > 0
                     else None
                 ),
@@ -328,7 +376,17 @@ class Reporter:
                     f"replay unavailable: {type(exc).__name__}"
                 ]
                 raw = _encode(record)
-            path = persist_report(raw, self.spool_dir)
+            if planning and len(raw) > MAX_PLANNING_REPORT_BYTES:
+                record["replay"] = None
+                record["replay_complete"] = False
+                record["incomplete_reasons"] = ["planning replay exceeds report limit"]
+                raw = _encode(record)
+            path = persist_report(
+                raw,
+                self.spool_dir,
+                planning_budget=planning
+                and not (failure is not None and failure["type"] == "OutOfMemoryError"),
+            )
         except Exception as exc:
             self.failures += 1
             _warn(f"local persistence failed ({type(exc).__name__})")
@@ -387,7 +445,7 @@ def replay(
     prefix layouts. It does not rerun distributed admission or reproduce GPU
     execution, allocator fragmentation, or an OOM without the referenced model.
     """
-    if report.get("format") != 1 or report.get("kind") != "art-planner-miss":
+    if report.get("format") not in (1, 2) or report.get("kind") != "art-planner-miss":
         raise ValueError("unsupported planner report")
     if not report.get("replay_complete"):
         raise ValueError(

@@ -165,7 +165,7 @@ def test_transport_rejects_invalid_reports(tmp_path, mutation):
     raw = report(tmp_path).read_bytes()
     record = json.loads(raw)
     if mutation == "duplicate":
-        raw = raw.replace(b'"format":1', b'"format":1,"format":1')
+        raw = raw.replace(b'"format":2', b'"format":2,"format":2')
     elif mutation == "nan":
         raw = raw.replace(b'"threshold_pct":5', b'"threshold_pct":NaN')
     elif mutation == "noncanonical":
