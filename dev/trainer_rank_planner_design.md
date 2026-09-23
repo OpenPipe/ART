@@ -915,7 +915,15 @@ allowance before emission; no scope keeps standalone behavior. An atomic, fsynce
 charge ledger precedes each payload write. Exact duplicate bytes cost nothing new,
 but deletion, failed payload writes and process restart never replenish the grant.
 Changed execution, producer or allowance identity refuses. Exhaustion keeps bounded
-omitted-attempt/byte counters, including a zero allowance, without another spool.
+omitted-attempt/byte counters, including a zero allowance and ordinary failures
+following a charge, without another spool. These count failed persistence attempts,
+not unique lost reports or certain payload absence. Counter writes are best effort:
+an unreadable ledger, disk failure or process death can leave coverage incomplete.
+Unknown crash leftovers are retained and count against occupancy; a first ledger
+write interrupted before publication requires owner reconciliation, not automatic
+cleanup or a new grant. Enter the context in the actual reporting thread: plain
+threads and `run_in_executor` do not inherit it. Spools belong to one producer;
+the file lock can block if that contract is violated or storage stalls.
 Ledger/lock metadata needs a separate owner reservation. This hook neither reserves
 capacity across producers nor acknowledges transport: those are the execution
 owner's responsibilities. It adds no GPU operation or full-input capture.

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from contextvars import ContextVar
 from dataclasses import dataclass
 import fcntl
@@ -177,20 +177,24 @@ def charge(
         if len(charges) > limits.max_reports or total > limits.max_bytes:
             raise ValueError("planner charge ledger exceeds enrollment")
         identity = [hashlib.sha256(raw).hexdigest(), len(raw)]
-        if event_id in charges:
-            if charges[event_id] != identity:
-                raise ValueError("planner report ID has conflicting charged bytes")
+        if event_id in charges and charges[event_id] != identity:
+            raise ValueError("planner report ID has conflicting charged bytes")
+        try:
+            if event_id not in charges:
+                if len(charges) >= min(limits.max_reports, count_limit) or total + len(
+                    raw
+                ) > min(limits.max_bytes, byte_limit):
+                    raise ValueError("assigned planner retention exhausted")
+                charges[event_id] = identity
+                _write(path, ledger)
             yield
-            return
-        if len(charges) >= min(limits.max_reports, count_limit) or total + len(
-            raw
-        ) > min(limits.max_bytes, byte_limit):
+        except Exception:
+            # Count failed attempts even after charging (including duplicate
+            # retries blocked by crash leftovers); never refund uncertain writes.
             ledger["omitted"] = min(ledger["omitted"] + 1, 2**63 - 1)
             ledger["omitted_bytes"] = min(ledger["omitted_bytes"] + len(raw), 2**63 - 1)
-            _write(path, ledger)
-            raise ValueError("assigned planner retention exhausted")
-        charges[event_id] = identity
-        _write(path, ledger)
-        yield
+            with suppress(Exception):
+                _write(path, ledger)
+            raise
     finally:
         os.close(lock)

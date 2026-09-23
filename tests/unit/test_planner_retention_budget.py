@@ -108,7 +108,7 @@ def test_ambiguous_payload_write_keeps_charge(tmp_path, monkeypatch):
         assert emit(reporter) is None
     assert not list(bound.spool_dir.glob("[0-9a-f]*.json"))
 
-    assert ledger(bound)["omitted"] == 1
+    assert ledger(bound)["omitted"] == 2
     assert ledger(bound)["omitted_bytes"] > 0
     assert reporter.failures == 2
 
@@ -188,4 +188,47 @@ def test_interrupted_payload_is_not_duplicated_by_retry(tmp_path, bounded_by):
         reports.persist_report(raw, bound.spool_dir, retention=bound)
     assert orphan.read_bytes() == raw
     assert not committed.exists()
-    assert ledger(bound) == charge
+    assert ledger(bound)["charges"] == charge["charges"]
+    assert ledger(bound)["omitted"] == charge["omitted"] + 1
+    assert ledger(bound)["omitted_bytes"] == charge["omitted_bytes"] + len(raw)
+
+
+def test_post_charge_refusal_counts_omission_without_refund(tmp_path):
+    bound = limits(tmp_path)
+    reporter = reports.Reporter(5)
+    with reports.report_retention_scope(bound):
+        assert emit(reporter) is not None
+        original = ledger(bound)
+        orphan = bound.spool_dir / ".pending-orphan"
+        orphan.write_bytes(b"x" * bound.max_bytes)
+        assert emit(reporter) is None
+    checked = ledger(bound)
+    assert len(checked["charges"]) == len(original["charges"]) + 1
+    assert checked["omitted"] == 1
+    assert checked["omitted_bytes"] > 0
+    assert orphan.stat().st_size == bound.max_bytes
+
+
+def test_omission_write_failure_preserves_original_failure(tmp_path, monkeypatch):
+    bound = limits(tmp_path)
+    seed = emit(reports.Reporter(5, spool_dir=tmp_path / "seed"))
+    assert seed is not None
+    raw = seed.read_bytes()
+    original_write = reports._planner_retention._write
+    calls = []
+
+    def write(path, value):
+        calls.append(None)
+        if len(calls) == 2:
+            raise OSError("omission ledger unavailable")
+        original_write(path, value)
+
+    def fail(*args):
+        raise ValueError("payload failed")
+
+    monkeypatch.setattr(reports._planner_retention, "_write", write)
+    monkeypatch.setattr(reports.os, "link", fail)
+    with pytest.raises(ValueError, match="payload failed"):
+        reports.persist_report(raw, bound.spool_dir, retention=bound)
+    assert len(calls) == 2
+    assert len(ledger(bound)["charges"]) == 1
