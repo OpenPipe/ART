@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import asdict
 import json
 from pathlib import Path
 import stat
@@ -254,6 +255,7 @@ def test_replay_reruns_real_memory_estimator_and_prefix_layout(tmp_path):
             "checkpointed_moe_layers": 0,
             "recompute_modules": [],
             "moe_output_bytes_per_token": 0,
+            "moe_forward_stages": [],
             "geometry": {
                 "hidden_size": 8,
                 "ffn_hidden_size": 32,
@@ -272,6 +274,7 @@ def test_replay_reruns_real_memory_estimator_and_prefix_layout(tmp_path):
                     "request_mix": ["hidden_states"],
                     "grad_enabled": True,
                     "grad_modes": [True],
+                    "slot_shapes": [[True, [[4, 8], []]], [False, []]],
                 },
                 "profile": {"bytes_per_token": 100.0, "packed_tokens": 4},
                 "arguments": {
@@ -280,9 +283,18 @@ def test_replay_reruns_real_memory_estimator_and_prefix_layout(tmp_path):
                     "logical_tokens": 4,
                     "gdn_segments": 0,
                     "retained_tokens": 4,
+                    "group_rows": [],
                 },
                 "expected_required_bytes": 440,
                 "retained_bytes": 440,
+                "cost_components": {
+                    "required": 440,
+                    "retained": 440,
+                    "checkpoint_retained": 0,
+                    "checkpoint_workspace": 0,
+                    "checkpoint_input_gradient": 0,
+                    "checkpoint_peak_increment": 0,
+                },
             }
         ],
     }
@@ -319,11 +331,51 @@ def test_replay_reruns_real_memory_estimator_and_prefix_layout(tmp_path):
     }
     assert result["layouts"][0]["matches"]
     assert result["source_matches"] is True
+    for field in (
+        "local_admission_peak_bytes",
+        "split_memory_floor_bytes",
+        "safety_factor",
+    ):
+        changed = json.loads(path.read_bytes())
+        changed["replay"][field] += 1000
+        assert reports.replay(changed)["aggregate"]["matches"] is False
+    for field in ("predicted_peak_bytes", "admission_peak_bytes"):
+        changed = json.loads(path.read_bytes())
+        changed[field] += 1
+        assert reports.replay(changed)["aggregate"]["matches"] is False
     drifted = reports.validate_report(path.read_bytes())
     drifted["replay"]["source_files"]["_impl.py"]["sha256"] = "0" * 64
     with pytest.raises(ValueError, match="source differs"):
         reports.replay(drifted)
     assert reports.replay(drifted, allow_source_drift=True)["source_matches"] is False
+    assert "_gdn_memory.py" in reports._source_files()
+    # Frozen stages are independent inputs, not a recorded total substituted
+    # for the estimator. Changing a fixed stage changes actual recomputation.
+    staged = json.loads(path.read_bytes())
+    staged["replay"]["memory_replay"]["rank"]["moe_forward_stages"] = [[1, 1000]]
+    actual = reports.replay(staged)
+    assert actual["estimates"][0]["required_bytes"] == 1104
+    assert actual["estimates"][0]["matches"] is False
+    del staged["replay"]["memory_replay"]["rank"]["moe_forward_stages"]
+    with pytest.raises(ValueError, match="rank fields differ"):
+        reports.replay(staged)
+    for rows in (None, [[0, False]], [[4, True]]):
+        changed = json.loads(path.read_bytes())
+        changed["replay"]["memory_replay"]["estimates"][0]["arguments"][
+            "group_rows"
+        ] = rows
+        with pytest.raises(ValueError, match="immutable runtime"):
+            reports.replay(changed)
+    for field in (
+        "checkpoint_input_gradient",
+        "checkpoint_workspace",
+        "checkpoint_peak_increment",
+    ):
+        altered = json.loads(path.read_bytes())
+        altered["replay"]["memory_replay"]["estimates"][0]["cost_components"][
+            field
+        ] += 1
+        assert reports.replay(altered)["estimates"][0]["matches"] is False
     state["estimates"][0]["profile"]["bytes_per_token"] = 200.0
     changed = report(
         tmp_path,
@@ -346,7 +398,7 @@ def test_incomplete_replay_refuses(tmp_path):
 
 
 @pytest.mark.parametrize("floor", [0, 10_000])
-def test_actual_emitted_split_replays_layout_and_aggregate(
+def test_actual_emitted_split_retains_evidence_but_refuses_missing_runtime_facts(
     monkeypatch, tmp_path, floor
 ):
     from test_trainer_rank_split import _rank
@@ -378,7 +430,7 @@ def test_actual_emitted_split_replays_layout_and_aggregate(
     rank._split_memory_floors[key] = floor
     costs = [rank._plan_cost(child) for child in children]
     local = max(
-        sum(cost.retained for cost in costs) + max(cost.ephemeral for cost in costs),
+        rank._split_required_memory(costs),
         int(floor * tr._MEMORY_SAFETY_FACTOR),
     )
     rank._begin_planner_observation(
@@ -387,6 +439,7 @@ def test_actual_emitted_split_replays_layout_and_aggregate(
     observation = rank._planner_observation
     assert observation is not None
     assert observation["comparable"] is True
+    rank._moe_forward_stages = ((1, 1000),)
     # Close the real profiling window with fake allocator counters only;
     # CPU planning and the emitted replay snapshot are otherwise maintained code.
     observation["baseline"] = 0
@@ -395,27 +448,102 @@ def test_actual_emitted_split_replays_layout_and_aggregate(
     rank._complete_planner_observation(phase="forward")
     [path] = list(rank._planner_reporter.spool_dir.glob("*.json"))
     original = reports.validate_report(path.read_bytes())
-    result = reports.replay(original)
-    assert len(result["layouts"]) == 2
-    assert all(item["matches"] for item in result["layouts"] + result["estimates"])
-    assert result["aggregate"] == {
-        "local_admission_peak_bytes": local,
-        "predicted_peak_bytes": observation["predicted"],
-        "matches": True,
-    }
-    # These inconsistencies were formerly unchecked despite child costs matching.
-    for field in (
-        "local_admission_peak_bytes",
-        "split_memory_floor_bytes",
-        "safety_factor",
-    ):
-        changed = json.loads(path.read_bytes())
-        changed["replay"][field] += local + 1
-        assert reports.replay(changed)["aggregate"]["matches"] is False
-    for field in ("predicted_peak_bytes", "admission_peak_bytes"):
-        changed = json.loads(path.read_bytes())
-        changed[field] += 1
-        assert reports.replay(changed)["aggregate"]["matches"] is False
-    changed = json.loads(path.read_bytes())
-    changed["replay"]["memory_replay"]["estimates"][0]["retained_bytes"] += 1
-    assert reports.replay(changed)["estimates"][0]["matches"] is False
+    assert original["replay_complete"] is False
+    assert "immutable runtime" in original["incomplete_reasons"][0]
+    snapshot = original["replay"]
+    assert snapshot["memory_replay"]["rank"]["moe_forward_stages"] == []
+    assert len(snapshot["layouts"]) == 2
+    assert snapshot["local_admission_peak_bytes"] == local
+    assert snapshot["reduced_admission_peak_bytes"] == local + 123
+    assert [
+        item["cost_components"] for item in snapshot["memory_replay"]["estimates"]
+    ] == [asdict(cost) for cost in costs]
+    with pytest.raises(ValueError, match="immutable runtime"):
+        reports.replay(original)
+    monkeypatch.setattr("sys.argv", ["planner-replay", str(path)])
+    with pytest.raises(ValueError, match="immutable runtime"):
+        reports.main()
+    # Flipping the top-level completeness bit cannot authorize missing facts,
+    # including a family whose observed checkpoint floor happened to be zero.
+    original["replay_complete"] = True
+    for item in snapshot["memory_replay"]["estimates"]:
+        item["missing_inputs"] = []
+    with pytest.raises(ValueError, match="immutable runtime"):
+        reports.replay(original)
+
+
+@pytest.mark.parametrize("slots", [[], [[True, [[3, 8], []]], [False, []]]])
+def test_signature_json_roundtrip_is_immutable(slots):
+    from art.trainer_rank._impl import _MemorySignature
+
+    values = dict(
+        topology=[1, 1, 1, 1],
+        planner_coefficients=[2, None],
+        slot_group_count=1,
+        request_mix=["hidden_states"],
+        grad_enabled=True,
+        grad_modes=[True],
+        slot_shapes=slots,
+    )
+    old = dict(values)
+    for name in ("topology", "planner_coefficients", "request_mix", "grad_modes"):
+        old[name] = tuple(old[name])
+    with pytest.raises(TypeError, match="unhashable"):
+        hash(_MemorySignature(**old))
+    key = _MemorySignature(**reports._signature_values(json.loads(json.dumps(values))))
+    assert {key: 1}[key] == 1
+    assert key.slot_shapes == tuple(
+        (enabled, tuple(map(tuple, shapes))) for enabled, shapes in slots
+    )
+
+
+@pytest.mark.parametrize(
+    "slots",
+    [None, [[1, []]], [[True, [[True]]]], [[False, [[-1]]]], [[True]], [[True, "bad"]]],
+)
+def test_invalid_signature_shapes_refuse(slots):
+    with pytest.raises(ValueError, match="slot_shapes"):
+        reports._signature_values(
+            dict(
+                topology=[],
+                planner_coefficients=[],
+                request_mix=[],
+                grad_modes=[],
+                slot_shapes=slots,
+            )
+        )
+
+
+def test_observation_uses_checkpoint_aware_aggregate(monkeypatch, tmp_path):
+    from test_trainer_rank_split import _rank
+    import torch
+
+    from art.trainer_rank import _impl as tr
+
+    rank = _rank(monkeypatch)
+    rank._planner_reporter = reports.Reporter(0, spool_dir=tmp_path / "aggregate")
+    children = tuple(
+        rank._plan_flat_forward(
+            [tr.ForwardInput(input_tokens=torch.tensor([i, 2]), hidden_states=True)]
+        )
+        for i in (1, 3)
+    )
+    costs = [
+        tr._SubforwardCost(
+            required=220,
+            retained=110,
+            checkpoint_retained=100,
+            checkpoint_workspace=0,
+            checkpoint_input_gradient=100,
+        )
+        for _ in children
+    ]
+    old = sum(c.retained for c in costs) + max(c.ephemeral for c in costs)
+    assert old == 330
+    assert rank._split_required_memory(costs) == 440
+    monkeypatch.setattr(rank, "_plan_cost", lambda child: costs[0])
+    split = tr._SplitForwardPlan(children, ((0,), (1,)), 2)
+    rank._begin_planner_observation(split, tr._MemoryCheck(440, 500, True))
+    observation = rank._planner_observation
+    assert observation["predicted"] == 400
+    assert observation["replay"]()["local_admission_peak_bytes"] == 440

@@ -275,8 +275,8 @@ def test_delayed_report_keeps_original_request_options(monkeypatch, tmp_path, oo
     assert replay["memory_replay"]["estimates"][0]["arguments"]["output_bytes"] == (
         output_bytes
     )
-    assert record["replay_complete"]
-    assert record["incomplete_reasons"] == []
+    assert record["replay_complete"] is False
+    assert "immutable runtime" in record["incomplete_reasons"][0]
     assert record["oom"] is oom
     assert counters["syncs"] == 2
 
@@ -440,8 +440,8 @@ def test_interleaved_execution_scopes_preserve_both_oom_inputs(monkeypatch, tmp_
     assert all(
         "overlapping_forward_memory_window" in r["replay"]["window_reasons"]
         and r["replay"]["measurement_valid"] is False
-        and r["replay_complete"] is True
-        and not r["incomplete_reasons"]
+        and r["replay_complete"] is False
+        and "immutable runtime" in r["incomplete_reasons"][0]
         for r in records
     )
     assert not rank._planner_active_observations
@@ -572,7 +572,8 @@ def test_closed_forward_keeps_backward_oom_without_false_partial_peak(
     assert oom["partial_peak_bytes"] is None
     assert oom["observed_peak_bytes"] is None and oom["error_pct"] is None
     assert oom["replay"]["window_reasons"] == ["oom_after_profiled_window"]
-    assert oom["replay_complete"]
+    assert oom["replay_complete"] is False
+    assert "immutable runtime" in oom["incomplete_reasons"][0]
     assert not rank._planner_active_observations
 
 

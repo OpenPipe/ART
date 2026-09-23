@@ -5960,9 +5960,18 @@ class TrainerRank:
                             "logical_tokens": child.active_logical_tokens,
                             "gdn_segments": child.grad_segment_count,
                             "retained_tokens": self._plan_retained_tokens(child),
+                            "group_rows": self._plan_group_rows(child),
                         },
                         "expected_required_bytes": cost.required,
                         "retained_bytes": cost.retained,
+                        "cost_components": asdict(cost),
+                        # Observed costs do not reconstruct model/slot eligibility
+                        # or the head/GDN/checkpoint inputs used to derive them.
+                        "missing_inputs": [
+                            "immutable runtime group/slot, head, checkpoint and GDN facts"
+                        ]
+                        if child.groups
+                        else [],
                     }
                 )
             floor = 0
@@ -5970,8 +5979,7 @@ class TrainerRank:
                 key = self._split_memory_key(plan)
                 floor = self._split_memory_floors.get(key, 0) if key is not None else 0
             local_required = max(
-                sum(cost.retained for cost in costs)
-                + max(cost.ephemeral for cost in costs),
+                self._split_required_memory(costs),
                 int(floor * _MEMORY_SAFETY_FACTOR),
             )
             rank_fields = {
@@ -5990,6 +5998,7 @@ class TrainerRank:
                 )
             }
             rank_fields["recompute_modules"] = sorted(self._recompute_modules)
+            rank_fields["moe_forward_stages"] = getattr(self, "_moe_forward_stages", ())
             rank_fields["geometry"] = asdict(self._geometry)
             rank_fields["topology"] = list(plan.signature.topology)
 
@@ -6039,7 +6048,9 @@ class TrainerRank:
 
             def replay() -> dict[str, Any]:
                 remaining = 1_000_000
-                incomplete: set[str] = set()
+                incomplete = {
+                    reason for item in estimates for reason in item["missing_inputs"]
+                }
 
                 def tensor_data(
                     tensor: torch.Tensor | None, original_version: int | None
