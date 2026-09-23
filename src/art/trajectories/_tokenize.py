@@ -5874,6 +5874,8 @@ def _tokenize_chat_view(
                 while tail_end < len(tail_mask) and tail_mask[tail_end]:
                     tail_end += 1
                 if tail_end > end and tail_stops[tail_end - 1]:
+                    # Source evidence assigns STOP to the sampled suffix below.
+                    stop_mask[end:tail_end] = [False] * (tail_end - end)
                     end = tail_end
                     search_cursor = end
             replacement = exact if exact is not None else rendered[start:end]

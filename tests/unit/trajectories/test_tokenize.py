@@ -6711,6 +6711,7 @@ def test_rerender_rejects_sampled_text_ambiguous_with_trailing_scaffold() -> Non
         "eos_prefix",
         "eos_nonprefix",
         "eos_whole",
+        "eos_repeated",
     ],
 )
 def test_rerender_preserves_contained_part_proof_after_message_correction(
@@ -6726,8 +6727,13 @@ def test_rerender_preserves_contained_part_proof_after_message_correction(
     monkeypatch.setattr(
         "art.trajectories._tokenize._WARNED_PREFIX_RETOKENIZATION", False
     )
-    content = "abc" if case == "crossing" else "ab"
-    recognized_eos_cases = {"eos_prefix", "eos_nonprefix", "eos_whole"}
+    content = "abc" if case in {"crossing", "eos_repeated"} else "ab"
+    recognized_eos_cases = {
+        "eos_prefix",
+        "eos_nonprefix",
+        "eos_whole",
+        "eos_repeated",
+    }
     eos_cases = {
         "nonprefix_stop",
         "unmerged_stop",
@@ -6811,6 +6817,8 @@ def test_rerender_preserves_contained_part_proof_after_message_correction(
         output = [1000, 999]
     elif case == "eos_nonprefix":
         output = [1001, 999]
+    elif case == "eos_repeated":
+        output = [1001, 999, 999]
     elif case in {"unmerged_stop", "merged_whole_stop", "eos_whole"}:
         output = [97, 98, 999]
     exchange = _chat_exchange([80], output)
@@ -6852,8 +6860,10 @@ def test_rerender_preserves_contained_part_proof_after_message_correction(
             tokenizer=tokenizer,
         ) == (2 if case == "crossing" else 1)
     if case in eos_cases:
-        assert tokenizer.decode(output, skip_special_tokens=False) == "ab<eos>"
-        assert tokenizer.decode(output, skip_special_tokens=True) == "ab"
+        assert tokenizer.decode(
+            output, skip_special_tokens=False
+        ) == content + "<eos>" * (2 if case in {"eos_repeated"} else 1)
+        assert tokenizer.decode(output, skip_special_tokens=True) == content
     if case == "merged_whole_stop":
         with pytest.raises(ValueError, match="sampled content boundary"):
             history.tokenize(tokenizer=tokenizer)
@@ -6891,7 +6901,7 @@ def test_rerender_preserves_contained_part_proof_after_message_correction(
             tokenized = history.tokenize(tokenizer=tokenizer)
     else:
         tokenized = history.tokenize(tokenizer=tokenizer)
-    suffix = [81, 1000, 82, 80] if case == "exact" else [81, 97, 98, 82, 80]
+    suffix = [81, 1000, 82, 80] if case == "exact" else [81, *map(ord, content), 82, 80]
     scaffold = (
         []
         if case in {"whole", "contained_stop", "messages_stop"} | recognized_eos_cases
@@ -6900,7 +6910,12 @@ def test_rerender_preserves_contained_part_proof_after_message_correction(
     assert tokenized.tokens == [80, *output, *scaffold, *suffix]
     if case in eos_cases:
         assert tokenizer.decode(tokenized.tokens) == (
-            "Pab<eos>QabRP" if case in recognized_eos_cases else "Pab<eos>ZQabRP"
+            "P"
+            + tokenizer.decode(output)
+            + ("" if case in recognized_eos_cases else "Z")
+            + "Q"
+            + content
+            + "RP"
         )
     selected = list(range(1, len(output) + 1))
     assert [
