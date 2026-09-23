@@ -305,5 +305,5 @@ def test_capture_scope_inherits_into_to_thread(tmp_path):
 def test_capture_flag_refuses_non_boolean_without_changing_scope(tmp_path, capture):
     with pytest.raises(ValueError, match="capture must be a boolean"):
         with reports.report_retention_scope(None, capture=capture):
-            pytest.fail("invalid capture flag entered")
+            raise AssertionError("invalid capture flag entered")
     assert emit(reports.Reporter(5, spool_dir=tmp_path / "standalone")) is not None
