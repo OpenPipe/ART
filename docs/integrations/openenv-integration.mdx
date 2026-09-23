@@ -40,7 +40,7 @@ async def rollout(model: art.TrainableModel, env_client: EchoEnv) -> art.Traject
     # Use the model to generate an action
     choice = (
         await model.openai_client().chat.completions.create(
-            model=model.inference_model_name,
+            model=model.get_inference_name(await model.get_step()),
             messages=traj.messages(),
             max_completion_tokens=100,
             timeout=30,
@@ -69,10 +69,12 @@ async def main() -> None:
     backend = ServerlessBackend()
 
     # Define the model to train
+    run_name = f"openenv-echo-{datetime.now().strftime('%Y-%m-%d-%H%M%S')}"
     model = art.TrainableModel(
-        name=f"openenv-echo-{datetime.now().strftime('%Y-%m-%d-%H%M%S')}",
+        name=run_name,
+        run_name=run_name,
         project="openenv-demo",
-        base_model="OpenPipe/Qwen3-14B-Instruct",
+        base_model="Qwen/Qwen3.8-27B",
     )
     await model.register(backend)
 

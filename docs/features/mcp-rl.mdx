@@ -88,8 +88,9 @@ Optimizing against an MCP server can be surprisingly straightforward!
 ### Prerequisites
 
 - Access to an MCP server you want to train on
-- OpenRouter API key for training
-- Python environment with ART installed
+- W&B API key for serverless inference and training
+- OpenRouter API key for scenario generation and judging
+- Python environment with ART main (pinned to `88d3df2`) installed
 
 ### Basic Training Pipeline
 
@@ -100,12 +101,17 @@ import art
 from art.mcp import generate_scenarios
 from art.rewards import ruler_score_group
 from art import gather_trajectory_groups
+from art.serverless import ServerlessBackend
 
 # Initialize the model
 model = art.TrainableModel(
-    model="OpenPipe/Qwen3-14B-Instruct",
-    openrouter_api_key="your_openrouter_key"
+    name="mcp-agent-qwen38",
+    run_name="mcp-agent-qwen38",
+    project="mcp-rl",
+    base_model="Qwen/Qwen3.8-27B",
 )
+backend = ServerlessBackend()  # Uses WANDB_API_KEY
+await model.register(backend)
 
 # Generate training scenarios automatically
 scenario_collection = await generate_scenarios(
@@ -113,8 +119,7 @@ scenario_collection = await generate_scenarios(
     resources=resources_list,
     num_scenarios=100,
     show_preview=False,
-    generator_model="gpt-4o-mini",
-    generator_api_key="your_openrouter_key",
+    generator_model="openai/gpt-4o-mini",  # Uses OPENROUTER_API_KEY
 )
 
 # Gather trajectory groups
@@ -124,7 +129,7 @@ groups = await gather_trajectory_groups(
             rollout(model, scenario, False)
             for _ in range(4)  # rollouts per group
         )
-        for scenario in scenario_collection
+        for scenario in scenario_collection.scenarios
     ),
     pbar_desc="train gather step",
 )
@@ -133,9 +138,8 @@ groups = await gather_trajectory_groups(
 scored_groups = [
     await ruler_score_group(
         group,
-        judge_model="gpt-4o-mini",
+        judge_model="openrouter/openai/gpt-4o-mini",
         debug=True,
-        swallow_exceptions=True
     )
     for group in groups
 ]
