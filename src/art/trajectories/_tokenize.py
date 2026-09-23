@@ -5838,6 +5838,10 @@ def _tokenize_chat_view(
             )
             if exact is not None and rendered[start : start + len(exact)] == exact:
                 end = start + len(exact)
+                if sampled_bounds is not None and end > sampled_bounds[1]:
+                    raise ValueError(
+                        "Exact sampled tokens extend beyond their proven message bounds"
+                    )
                 search_cursor = end
             replacement = exact if exact is not None else rendered[start:end]
             if exact is None and not logprobs:

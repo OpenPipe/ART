@@ -6693,12 +6693,16 @@ def test_rerender_rejects_sampled_text_ambiguous_with_trailing_scaffold() -> Non
         history.tokenize(tokenizer=Tokenizer())
 
 
-@pytest.mark.parametrize("case", ["part", "missing", "outside", "whole", "exact"])
+@pytest.mark.parametrize(
+    "case",
+    ["part", "missing", "outside", "whole", "exact", "crossing", "contained_stop"],
+)
 def test_rerender_preserves_contained_part_proof_after_message_correction(
     case: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from art.trajectories._tokenize import (
         _sampled_source_key,
+        _sampled_stop_suffix,
         _TraceBuilder,
         tokenize_history,
     )
@@ -6706,6 +6710,7 @@ def test_rerender_preserves_contained_part_proof_after_message_correction(
     monkeypatch.setattr(
         "art.trajectories._tokenize._WARNED_PREFIX_RETOKENIZATION", False
     )
+    content = "abc" if case == "crossing" else "ab"
 
     class Tokenizer:
         def __call__(self, text: str, **kwargs: object) -> dict[str, object]:
@@ -6714,11 +6719,12 @@ def test_rerender_preserves_contained_part_proof_after_message_correction(
             while index < len(text):
                 # Standalone and rendered content can tokenize differently,
                 # while both token sequences decode to the captured text.
-                merge = text[index : index + 2] == "ab" and (
+                merge = text[index : index + len(content)] == content and (
                     case == "exact"
-                    or (text[index : index + 3] == "abZ") != (case == "outside")
+                    or (text[index : index + len(content) + 1] == content + "Z")
+                    != (case == "outside")
                 )
-                end = index + (2 if merge else 1)
+                end = index + (len(content) if merge else 1)
                 tokens.append(1000 if merge else ord(text[index]))
                 offsets.append((index, end))
                 index = end
@@ -6728,7 +6734,7 @@ def test_rerender_preserves_contained_part_proof_after_message_correction(
             return result
 
         def decode(self, tokens: list[int], **kwargs: object) -> str:
-            return "".join("ab" if token == 1000 else chr(token) for token in tokens)
+            return "".join(content if token == 1000 else chr(token) for token in tokens)
 
         def apply_chat_template(
             self,
@@ -6749,23 +6755,47 @@ def test_rerender_preserves_contained_part_proof_after_message_correction(
             return self(text)["input_ids"] if tokenize else text
 
     output = [1000] if case in {"outside", "exact"} else [97, 98]
-    message: dict[str, Any] = {"role": "assistant", "content": "ab"}
+    message: dict[str, Any] = {"role": "assistant", "content": content}
     if case == "whole":
         message["reasoning"] = "r"
         output = [114, 97, 98, 90]
+    elif case == "crossing":
+        output = [1000, 90, 81]
+    elif case == "contained_stop":
+        output = [1000, 90]
     exchange = _chat_exchange([80], output)
     exchange.request["messages"] = []
     data = exchange.response.model_dump(mode="python")
     data["choices"][0]["message"] = message
+    if case in {"crossing", "contained_stop"}:
+        stop = "ZQ" if case == "crossing" else "Z"
+        exchange.request["stop"] = stop
+        data["choices"][0]["stop_reason"] = stop
     exchange.response = ChatCompletion.model_validate(data)
     source = ChatCompletionsMessageSource(exchange=exchange, choice_index=0)
     history = tr.ChatCompletionsHistory(
         model="test/model",
-        messages=[message, {"role": "user", "content": "ab"}],
+        messages=[message, {"role": "user", "content": content}],
         message_sources=[source, None],
         chat_template="rerender",
     )
     tokenizer = Tokenizer()
+    if case in {"crossing", "contained_stop"}:
+        assert _sampled_stop_suffix(
+            output,
+            source=source,
+            source_key=_sampled_source_key(source),
+            tokenizer=tokenizer,
+        ) == (2 if case == "crossing" else 1)
+    if case == "crossing":
+        assert tokenizer(content)["input_ids"] == [97, 98, 99]
+        assert tokenizer.decode(output) == "abcZQ"
+        assert tokenizer.apply_chat_template(
+            history.messages, add_generation_prompt=True
+        ) == [80, 1000, 90, 81, 97, 98, 99, 82, 80]
+        with pytest.raises(ValueError, match="sampled history|proven message"):
+            tokenized = history.tokenize(tokenizer=tokenizer)
+        return
     if case in {"missing", "outside"}:
         with pytest.raises(ValueError, match="uniquely locate"):
             history.tokenize(tokenizer=tokenizer)
@@ -6773,15 +6803,18 @@ def test_rerender_preserves_contained_part_proof_after_message_correction(
 
     tokenized = history.tokenize(tokenizer=tokenizer)
     suffix = [81, 1000, 82, 80] if case == "exact" else [81, 97, 98, 82, 80]
-    scaffold = [] if case == "whole" else [90]
+    scaffold = [] if case in {"whole", "contained_stop"} else [90]
     assert tokenized.tokens == [80, *output, *scaffold, *suffix]
     selected = list(range(1, len(output) + 1))
     assert [
         i for i, flag in enumerate(tokenized.flags) if flag & tr.TokenFlag.SAMPLED
     ] == selected
+    sampled_flags = [_SAMPLED_ASSISTANT_OUTPUT] * len(output)
+    if case == "contained_stop":
+        sampled_flags[-1] |= tr.TokenFlag.STOP
     assert tokenized.flags == [
         tr.TokenFlag(0),
-        *([_SAMPLED_ASSISTANT_OUTPUT] * len(output)),
+        *sampled_flags,
         *([tr.TokenFlag.ASSISTANT | tr.TokenFlag.OUTPUT] * len(scaffold)),
         *([tr.TokenFlag(0)] * len(suffix)),
     ]
