@@ -444,6 +444,8 @@ def test_oversized_compact_field_is_omitted_whole(tmp_path):
     [
         {"k" * 300_000: 1},
         {str(i): "x" * 10_000 for i in range(1000)},
+        {"unlisted_fields": 0, **{str(i): "x" * 10_000 for i in range(1000)}},
+        {"omitted_field_names_truncated": -1, "k" * 300_000: 1},
     ],
 )
 def test_compaction_bounds_field_names_and_total_encoding_work(
