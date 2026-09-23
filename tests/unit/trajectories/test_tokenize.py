@@ -6725,6 +6725,14 @@ def test_rerender_rejects_sampled_text_ambiguous_with_trailing_scaffold() -> Non
         "eos_in_part_prefix_length",
         "eos_in_part_and_tail_length",
         "eos_whole_length",
+        "eos_after",
+        "eos_after_prefix",
+        "eos_after_multiple",
+        "eos_after_multiple_prefix",
+        "eos_after_length",
+        "eos_after_prefix_length",
+        "eos_after_multiple_length",
+        "eos_after_multiple_prefix_length",
     ],
 )
 def test_rerender_preserves_contained_part_proof_after_message_correction(
@@ -6742,6 +6750,8 @@ def test_rerender_preserves_contained_part_proof_after_message_correction(
     )
     length_stopped = case.endswith("_length")
     case = case.removesuffix("_length")
+    after_eos = case.startswith("eos_after")
+    after_prefix = after_eos and case.endswith("_prefix")
     in_part_cases = {
         "eos_in_part",
         "eos_in_part_prefix",
@@ -6749,6 +6759,8 @@ def test_rerender_preserves_contained_part_proof_after_message_correction(
         "eos_in_part_and_tail",
         "eos_in_part_and_tail_stop_sequence",
     }
+    if after_eos:
+        in_part_cases.add(case)
     repeated_cases = {"eos_repeated", "eos_repeated_stop_sequence"} | in_part_cases
     sequence_cases = {name for name in repeated_cases if name.endswith("stop_sequence")}
     content = (
@@ -6758,6 +6770,8 @@ def test_rerender_preserves_contained_part_proof_after_message_correction(
         if case in {"crossing"} | repeated_cases
         else "ab"
     )
+    if after_eos:
+        content = "ab" + ("§§" if "multiple" in case else "§") + "c"
     merged_content = "ab" if case in in_part_cases else content
     recognized_eos_cases = {
         "eos_prefix",
@@ -6790,7 +6804,7 @@ def test_rerender_preserves_contained_part_proof_after_message_correction(
                     and (
                         case == "exact"
                         or text[index:].startswith(
-                            merged_content + ("§Z" if case in in_part_cases else "Z")
+                            merged_content + (content[len(merged_content) :] + "Z")
                         )
                         != (case == "outside")
                     )
@@ -6862,6 +6876,13 @@ def test_rerender_preserves_contained_part_proof_after_message_correction(
         output = [1001, 999, 999]
     elif case in {"unmerged_stop", "merged_whole_stop", "eos_whole"}:
         output = [97, 98, 999]
+    if after_eos:
+        output = (
+            ([1000] if after_prefix else [97, 98])
+            + [999] * content.count("§")
+            + [99]
+            + ([90] if after_prefix else [])
+        )
     exchange = _chat_exchange([80], output)
     exchange.request["messages"] = []
     data = exchange.response.model_dump(mode="python")
@@ -6872,7 +6893,7 @@ def test_rerender_preserves_contained_part_proof_after_message_correction(
         stop = "ZQ" if case == "crossing" else "Z"
         exchange.request["stop"] = stop
         data["choices"][0]["stop_reason"] = stop
-    if case == "eos_in_part_prefix":
+    if case == "eos_in_part_prefix" or after_prefix:
         exchange.request["stop"] = "Z"
         data["choices"][0]["stop_reason"] = "Z"
     if case in sequence_cases:
@@ -6910,20 +6931,23 @@ def test_rerender_preserves_contained_part_proof_after_message_correction(
             tokenizer=tokenizer,
         ) == (
             0
-            if length_stopped
+            if length_stopped or (after_eos and not after_prefix)
             else 2
             if case == "crossing" or case in sequence_cases
             else 1
         )
     if case in eos_cases:
-        assert tokenizer.decode(output, skip_special_tokens=False) == (
-            "ab§Z"
+        expected_decoded = (
+            content + ("Z" if after_prefix else "")
+            if after_eos
+            else "ab§Z"
             if case == "eos_in_part_prefix"
             else merged_content + eos_text * (2 if case in repeated_cases else 1)
         )
-        assert tokenizer.decode(output, skip_special_tokens=True) == (
-            "abZ" if case == "eos_in_part_prefix" else merged_content
-        )
+        assert tokenizer.decode(output, skip_special_tokens=False) == expected_decoded
+        assert tokenizer.decode(
+            output, skip_special_tokens=True
+        ) == expected_decoded.replace(eos_text, "")
     if case == "merged_whole_stop":
         with pytest.raises(ValueError, match="sampled content boundary"):
             history.tokenize(tokenizer=tokenizer)
@@ -6978,6 +7002,8 @@ def test_rerender_preserves_contained_part_proof_after_message_correction(
         | recognized_eos_cases
         else [90]
     )
+    if after_prefix:
+        scaffold = []
     if length_stopped:
         scaffold = [999] + (
             [90] if case in in_part_cases and case not in recognized_eos_cases else []
@@ -6997,7 +7023,11 @@ def test_rerender_preserves_contained_part_proof_after_message_correction(
         i for i, flag in enumerate(tokenized.flags) if flag & tr.TokenFlag.SAMPLED
     ] == selected
     sampled_flags = [_SAMPLED_ASSISTANT_OUTPUT] * len(output)
-    if not length_stopped and case in {"contained_stop", "messages_stop"} | eos_cases:
+    if (
+        not length_stopped
+        and not (after_eos and not after_prefix)
+        and case in {"contained_stop", "messages_stop"} | eos_cases
+    ):
         for index in range(1, 3 if case in sequence_cases else 2):
             sampled_flags[-index] |= tr.TokenFlag.STOP
     assert tokenized.flags == [

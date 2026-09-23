@@ -4861,6 +4861,7 @@ def _tokenize_chat_view(
             bool,
             _SampledSourceKey,
             object,
+            int | None,
         ]
     ] = []
     search_cursor = 0
@@ -5661,6 +5662,7 @@ def _tokenize_chat_view(
                     True,
                     _sampled_source_key(source),
                     source,
+                    None,
                 )
             )
             search_cursor = end
@@ -5694,6 +5696,7 @@ def _tokenize_chat_view(
                     False,
                     _sampled_source_key(source),
                     source,
+                    None,
                 )
             )
             search_cursor = end
@@ -5783,6 +5786,7 @@ def _tokenize_chat_view(
                     True,
                     _sampled_source_key(source),
                     source,
+                    None,
                 )
             )
             if (
@@ -5921,6 +5925,10 @@ def _tokenize_chat_view(
                     exact is not None,
                     _sampled_source_key(source),
                     source,
+                    span[1]
+                    if corrected_message_end is not None
+                    and proven_part_bounds is not None
+                    else None,
                 )
             )
         message_replacements = replacements[replacement_start:]
@@ -5952,6 +5960,7 @@ def _tokenize_chat_view(
                     False,
                     message_replacements[0][5],
                     message_replacements[0][6],
+                    None,
                 )
             )
         if sampled and not parts and full_exact is not None:
@@ -5973,13 +5982,20 @@ def _tokenize_chat_view(
         exact,
         source_key,
         source,
+        part_end,
     ) in sorted(replacements, key=lambda item: (item[0], item[1])):
+        synthetic_stop_token: int | None = None
         if exact and _source_stop_evidence(source, source_key)[0] == "length":
             synthetic_stop = next(
                 (index for index in range(start, end) if stop_mask[index]), None
             )
             if synthetic_stop is not None:
-                end = synthetic_stop
+                if part_end is not None and synthetic_stop + 1 < part_end:
+                    # Keep the boundary without replaying replaced visible content.
+                    synthetic_stop_token = rendered[synthetic_stop]
+                    end = part_end
+                else:
+                    end = synthetic_stop
         if start < cursor:
             raise ValueError("Rendered assistant source spans overlap")
         token_ids.extend(rendered[cursor:start])
@@ -6004,6 +6020,8 @@ def _tokenize_chat_view(
                 rendered[start:end], replacement, stop_mask[start:end]
             )
         except ValueError:
+            replacement_stop_mask = [False] * len(replacement)
+        if synthetic_stop_token is not None:
             replacement_stop_mask = [False] * len(replacement)
         replacement_length_stop_mask = _translate_token_mask(
             rendered[start:end], replacement, length_stop_mask[start:end]
@@ -6041,6 +6059,11 @@ def _tokenize_chat_view(
                 )
             )
             source_keys.extend([None] * len(replacement))
+        if synthetic_stop_token is not None:
+            token_ids.append(synthetic_stop_token)
+            logprobs.append(math.nan)
+            flags.append(TokenFlag.STOP)
+            source_keys.append(None)
         cursor = end
     token_ids.extend(rendered[cursor:])
     logprobs.extend([math.nan] * (len(rendered) - cursor))
