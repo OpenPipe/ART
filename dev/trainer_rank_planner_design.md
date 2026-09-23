@@ -891,7 +891,9 @@ spool-full/process-loss limits still apply. The selected-plan replay keeps its
 existing completeness limits; this is not a full GPU failure reproduction claim.
 Planning-event reports cap size at 256KiB. Oversized replay drops bulk request
 and layout arrays first, retaining whole compact source, rank/device, model and
-estimator fields that fit; `omitted_fields` identifies every removed field.
+estimator fields that fit. Omission names and optional field inspection are
+bounded too; `omitted_fields`, `unlisted_fields` and
+`omitted_field_names_truncated` disclose that coverage.
 Such reports remain explicitly incomplete, including when an individual compact
 field itself exceeds the cap. This does not add a second capture or upload.
 After an exhausted split ladder, the ordinary refusal may retain an unsplit

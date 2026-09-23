@@ -11,6 +11,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
+from itertools import islice
 import json
 import logging
 import math
@@ -109,6 +110,8 @@ def _compact_planning_record(record: dict[str, Any]) -> dict[str, Any]:
     compact: dict[str, Any] = {
         "incomplete_reasons": reasons,
         "omitted_fields": omitted,
+        "unlisted_fields": 0,
+        "omitted_field_names_truncated": 0,
     }
     result = {
         **record,
@@ -126,19 +129,31 @@ def _compact_planning_record(record: dict[str, Any]) -> dict[str, Any]:
         "candidate_matches_check",
         "memory_replay",
     )
-    for key in dict.fromkeys((*priority, *payload)):
+    # The maintained snapshot has fewer than 32 fields. Bound optional factory
+    # fields too: neither omission names nor repeated encoding may grow without
+    # limit just because the report itself exceeds its cap.
+    selected = dict.fromkeys((*priority, *islice(payload, 64)))
+    compact["unlisted_fields"] = len(payload) - sum(key in payload for key in selected)
+
+    def omit(key: str) -> None:
+        if len(key) > 32:
+            compact["omitted_field_names_truncated"] += 1
+            key = "<field name exceeds limit>"
+        omitted.append(key)
+
+    for key in selected:
         if key not in payload or key == "incomplete_reasons":
             continue
         if key in {"requests", "layouts", "omitted_fields"}:
-            omitted.append(key)
+            omit(key)
             continue
         compact[key] = payload[key]
         try:
-            # Reserve space for explicit omission names as fields are rejected.
-            _encode(result, limit=MAX_PLANNING_REPORT_BYTES - 4096)
+            # At most 72 names, each <=32 characters (<=12 JSON bytes/character).
+            _encode(result, limit=MAX_PLANNING_REPORT_BYTES - 32 * 1024)
         except _ReportTooLarge:
             del compact[key]
-            omitted.append(key)
+            omit(key)
     return result
 
 
@@ -425,7 +440,7 @@ class Reporter:
                 record["replay"] = None
                 record["replay_complete"] = False
                 record["incomplete_reasons"] = [
-                    f"replay unavailable: {type(exc).__name__}"
+                    f"replay unavailable: {'ValueError' if isinstance(exc, _ReportTooLarge) else type(exc).__name__}"
                 ]
                 raw = _encode(record)
             path = persist_report(

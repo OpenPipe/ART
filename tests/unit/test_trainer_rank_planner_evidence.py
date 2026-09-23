@@ -439,6 +439,42 @@ def test_oversized_compact_field_is_omitted_whole(tmp_path):
     assert record["replay_complete"] is False
 
 
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"k" * 300_000: 1},
+        {str(i): "x" * 10_000 for i in range(1000)},
+    ],
+)
+def test_compaction_bounds_field_names_and_total_encoding_work(
+    tmp_path, monkeypatch, payload
+):
+    original = reports._encode
+    calls = []
+
+    def encode(*args, **kwargs):
+        calls.append(True)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(reports, "_encode", encode)
+    path = reports.Reporter(5, spool_dir=tmp_path).report(
+        predicted_peak_bytes=None,
+        observed_peak_bytes=None,
+        phase="planning",
+        event="planning_error",
+        replay_factory=lambda: payload,
+    )
+    assert path is not None and path.stat().st_size <= reports.MAX_PLANNING_REPORT_BYTES
+    assert len(calls) <= 80
+    record = reports.validate_report(path.read_bytes())
+    assert record["replay"]["source_files"] == reports._source_files()
+    assert record["replay_complete"] is False
+    assert (
+        record["replay"]["unlisted_fields"]
+        or record["replay"]["omitted_field_names_truncated"]
+    )
+
+
 def test_summary_trimming_preserves_first_selected(monkeypatch):
     decision = evidence.Decision("dp_rank_forward", sync_across_dp=False)
     decision.first = decision.selected = sample(decision)
