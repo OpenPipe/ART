@@ -8,9 +8,9 @@ from types import SimpleNamespace
 import weakref
 
 import pytest
-from test_trainer_rank_cache_recovery import TestRecovery as _RecoveryControls
+import test_trainer_rank_cache_recovery as recovery
 from test_trainer_rank_cache_recovery import fail, run
-from test_trainer_rank_planner_options import _oversized
+from test_trainer_rank_planner_options import _oversized, _reporting_rank
 from test_trainer_rank_split import _request
 
 from art.trainer_rank import _impl as tr
@@ -32,7 +32,7 @@ def sample(decision, required=100, available=90):
 
 @pytest.fixture
 def scalar(request):
-    fixture = _RecoveryControls()
+    fixture = recovery.TestRecovery()
     request.addfinalizer(fixture.doCleanups)
     return fixture.make()
 
@@ -281,3 +281,20 @@ def test_legacy_report_reader_remains_supported(tmp_path):
     for key in ("event", "decision", "failure"):
         record.pop(key)
     assert reports.validate_report(reports._encode(record))["format"] == 1
+
+
+def test_planning_oom_does_not_borrow_previous_forward(monkeypatch, tmp_path):
+    rank, plan, _ = _reporting_rank(monkeypatch, tmp_path)
+    rank._run_flat_plan_with_memory_tracking(
+        plan, check=tr._MemoryCheck(220, 10000, True), context="dp_rank_forward"
+    )
+    original = tr.torch.cuda.OutOfMemoryError("new planning allocation")
+    _, caught, _ = run(rank, [original])
+    assert caught is original
+    rank.report_planner_oom(caught)
+    rank.finish_planner_observation()
+    records = [
+        reports.validate_report(path.read_bytes()) for path in tmp_path.glob("*.json")
+    ]
+    assert [record["event"] for record in records] == ["planning_error"]
+    assert records[0]["partial_peak_bytes"] is None

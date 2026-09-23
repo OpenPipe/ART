@@ -5261,6 +5261,13 @@ class TrainerRank:
             original: BaseException | None = error
             seen: set[int] = set()
             while original is not None and id(original) not in seen:
+                if (
+                    getattr(original, "_art_planner_admission_attempt", None)
+                    is not None
+                ):
+                    # This error escaped planning, before a new forward window.
+                    # A prior caller context cannot supply its input/peak facts.
+                    return
                 if isinstance(original, torch.cuda.OutOfMemoryError):
                     break
                 seen.add(id(original))
@@ -5753,6 +5760,10 @@ class TrainerRank:
                 # Cancellation/termination keeps its original behavior. Do not
                 # turn abandoned planning into a fabricated completed event.
                 if isinstance(error, Exception):
+                    try:
+                        error._art_planner_admission_attempt = decision.id  # type: ignore[attr-defined]
+                    except Exception:
+                        pass
                     self._report_planning_failure(decision, error)
                 raise
             try:
@@ -5780,8 +5791,10 @@ class TrainerRank:
             if refused:
                 decision.selected = refusal.check.sample
                 observation.update(
-                    predicted=refusal.check.estimated_required_bytes,
                     admission=refusal.check.estimated_required_bytes,
+                    replay=lambda: {
+                        "incomplete_reasons": ["planner_snapshot_unavailable"]
+                    },
                 )
                 self._fill_planner_snapshot(refusal.plan, refusal.check, observation)
             self._planner_reporter.report(

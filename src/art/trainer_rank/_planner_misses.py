@@ -168,7 +168,10 @@ def validate_report(raw: bytes) -> dict[str, Any]:
         raise ValueError("invalid planner event")
     if record["format"] == 2:
         _planner_evidence.validate(record["decision"], record["failure"])
-    if record["predicted_peak_bytes"] is None and event != "planning_error":
+    if record["predicted_peak_bytes"] is None and event not in {
+        "planning_error",
+        "admission_refused",
+    }:
         raise ValueError("missing prediction")
     for key in ("threshold_pct", "error_pct"):
         value = record[key]
