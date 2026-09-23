@@ -298,3 +298,58 @@ def test_planning_oom_does_not_borrow_previous_forward(monkeypatch, tmp_path):
     ]
     assert [record["event"] for record in records] == ["planning_error"]
     assert records[0]["partial_peak_bytes"] is None
+
+
+def test_refresh_preserves_local_estimate_and_separate_reduced_operand(
+    scalar, monkeypatch
+):
+    rank, cuda, _, _ = scalar
+    cuda.memory_stats = lambda device: {}
+    reductions = []
+    required = iter((150, 170))
+    dist = SimpleNamespace(
+        is_available=lambda: True,
+        is_initialized=lambda: True,
+        ReduceOp=SimpleNamespace(MAX="MAX", MIN="MIN"),
+    )
+
+    def reduce(value, *, op, group):
+        reductions.append((op, group))
+        value.t.data[value.i] = next(required) if op == "MAX" else 7
+
+    dist.all_reduce = reduce
+    monkeypatch.setattr(tr, "dist", dist)
+    decision = evidence.Decision(
+        "forward_micro_batches", sync_across_dp=True, owner=rank
+    )
+    with evidence.scope(decision):
+        first = rank._memory_check_required(80, sync_across_dp=True)
+        selected = rank._refresh_memory_check(first, sync_across_dp=True)
+    assert reductions == [("MAX", None), ("MIN", None)] * 2
+    assert (
+        first.sample.local_required_bytes == selected.sample.local_required_bytes == 80
+    )
+    assert (
+        selected.sample.required_operand_bytes == first.estimated_required_bytes == 150
+    )
+    assert (
+        selected.sample.reduced_required_bytes
+        == selected.estimated_required_bytes
+        == 170
+    )
+    assert selected.sample.required_source == "previous_check"
+    assert selected.sample.required_from_ordinal == first.sample.ordinal
+    decision.selected, decision.outcome = selected.sample, "admitted"
+    evidence.validate(decision.snapshot(), None)
+
+
+def test_refresh_without_original_sample_leaves_local_requirement_unknown():
+    decision = evidence.Decision("dp_rank_forward", sync_across_dp=False)
+    with decision.refresh_of(None):
+        value = sample(decision, 150)
+    assert value.local_required_bytes is value.required_from_ordinal is None
+    assert (
+        value.required_operand_bytes == 150
+        and value.required_source == "previous_check"
+    )
+    assert sample(decision, 80).local_required_bytes == 80

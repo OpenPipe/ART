@@ -13,7 +13,7 @@ from collections.abc import (
     Sequence,
 )
 from concurrent.futures import Future, ThreadPoolExecutor
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
 from copy import deepcopy
 from dataclasses import asdict, dataclass, replace
@@ -5873,8 +5873,8 @@ class TrainerRank:
                     # so every DP rank retains the same logical wave width.
                     value = replace(
                         value,
-                        check=self._memory_check_required(
-                            value.check.estimated_required_bytes,
+                        check=self._refresh_memory_check(
+                            value.check,
                             sync_across_dp=True,
                         ),
                     )
@@ -5888,9 +5888,7 @@ class TrainerRank:
                 return None
             plan, check = describe(value)
             if sync_across_dp:
-                check = self._memory_check_required(
-                    check.estimated_required_bytes, sync_across_dp=True
-                )
+                check = self._refresh_memory_check(check, sync_across_dp=True)
             if check.fits:
                 return update(value, check)
             refused = _ForwardRefusal(
@@ -6286,6 +6284,19 @@ class TrainerRank:
             reduced_available_bytes=sampled[0],
         )
         return True
+
+    def _refresh_memory_check(
+        self, check: _MemoryCheck, *, sync_across_dp: bool
+    ) -> _MemoryCheck:
+        decision = _planner_evidence.current(self)
+        # The existing admission operand can already be a cross-rank maximum.
+        # Preserve its local producer separately; never price the plan again.
+        with (
+            decision.refresh_of(check.sample) if decision is not None else nullcontext()
+        ):
+            return self._memory_check_required(
+                check.estimated_required_bytes, sync_across_dp=sync_across_dp
+            )
 
     def _memory_check_required(
         self,

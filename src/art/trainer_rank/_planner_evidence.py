@@ -26,7 +26,10 @@ class MemorySample:
     ordinal: int
     monotonic_ns: int
     scope: str
-    local_required_bytes: int
+    local_required_bytes: int | None
+    required_operand_bytes: int
+    required_source: str
+    required_from_ordinal: int | None
     local_available_bytes: int
     reduced_required_bytes: int
     reduced_available_bytes: int
@@ -58,6 +61,7 @@ class Decision:
         self.trace: deque[dict[str, Any]] = deque(maxlen=MAX_TRACE)
         self.omitted = 0
         self.refusal: Any = None
+        self.refresh_source: tuple[MemorySample | None] | None = None
 
     def record(self, kind: str, status: str, **values: Any) -> None:
         unavailable = [
@@ -84,10 +88,22 @@ class Decision:
         self.events += 1
 
     def observe(self, **values: Any) -> MemorySample:
+        operand = values.pop("local_required_bytes")
+        parent = None if self.refresh_source is None else self.refresh_source[0]
+        if parent is not None and parent.attempt_id != self.id:
+            parent = None
         sample = MemorySample(
             attempt_id=self.id,
             ordinal=self.ordinal,
             monotonic_ns=time.monotonic_ns(),
+            required_operand_bytes=operand,
+            required_source="initial"
+            if self.refresh_source is None
+            else "previous_check",
+            required_from_ordinal=None if parent is None else parent.ordinal,
+            local_required_bytes=operand
+            if self.refresh_source is None
+            else (None if parent is None else parent.local_required_bytes),
             **values,
         )
         self.ordinal += 1
@@ -95,6 +111,14 @@ class Decision:
             self.first = sample
         self.record("memory_check", "observed", **asdict(sample))
         return sample
+
+    @contextmanager
+    def refresh_of(self, parent: MemorySample | None) -> Iterator[None]:
+        previous, self.refresh_source = self.refresh_source, (parent,)
+        try:
+            yield
+        finally:
+            self.refresh_source = previous
 
     def snapshot(self) -> dict[str, Any]:
         return {
@@ -223,6 +247,7 @@ def validate(decision: Any, failed: Any) -> None:
                 or set(sample) != {field.name for field in fields(MemorySample)}
                 or sample["attempt_id"] != decision["attempt_id"]
                 or sample["scope"] not in {"world", "tp_cp", "local"}
+                or sample["required_source"] not in {"initial", "previous_check"}
                 or not (
                     sample["allocator"] is None
                     or isinstance(sample["allocator"], str)
@@ -231,7 +256,7 @@ def validate(decision: Any, failed: Any) -> None:
             ):
                 raise ValueError("invalid planner memory sample")
             for name, value in sample.items():
-                if name in {"attempt_id", "scope", "allocator"}:
+                if name in {"attempt_id", "scope", "allocator", "required_source"}:
                     continue
                 if name in {"safety_factor", "reserve_fraction"}:
                     valid = (
@@ -244,7 +269,7 @@ def validate(decision: Any, failed: Any) -> None:
                         field.name
                         for field in fields(MemorySample)
                         if field.default is None
-                    }
+                    } | {"local_required_bytes", "required_from_ordinal"}
                     valid = (
                         value is None
                         and optional
@@ -253,6 +278,16 @@ def validate(decision: Any, failed: Any) -> None:
                     )
                 if not valid:
                     raise ValueError("invalid planner memory value")
+            if (
+                sample["required_source"] == "initial"
+                and (
+                    sample["local_required_bytes"] != sample["required_operand_bytes"]
+                    or sample["required_from_ordinal"] is not None
+                )
+                or sample["required_from_ordinal"] is not None
+                and sample["required_from_ordinal"] >= sample["ordinal"]
+            ):
+                raise ValueError("invalid refreshed requirement provenance")
         previous = -1
         for item in decision["trace"]:
             if (
