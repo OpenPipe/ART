@@ -148,7 +148,13 @@ def _compact_planning_record(record: dict[str, Any]) -> dict[str, Any]:
     for key in selected:
         if key not in payload or key == "incomplete_reasons":
             continue
-        if key in {"requests", "layouts", "omitted_fields"}:
+        if key in {
+            "requests",
+            "layouts",
+            "omitted_fields",
+            "unlisted_fields",
+            "omitted_field_names_truncated",
+        }:
             omit(key)
             continue
         compact[key] = payload[key]
