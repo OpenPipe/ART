@@ -24,7 +24,9 @@ import threading
 from typing import Any
 import uuid
 
-from . import _planner_evidence
+from . import _planner_evidence, _planner_retention
+from ._planner_retention import RetentionLimits as RetentionLimits
+from ._planner_retention import report_retention_scope as report_retention_scope
 
 ALLOW_OVERSIZED_ENV = "ART_TRAINER_RANK_ALLOW_OVERSIZED_BATCHES"
 MISS_THRESHOLD_ENV = "ART_TRAINER_RANK_PLANNER_MISS_THRESHOLD_PCT"
@@ -41,6 +43,7 @@ _SOURCE_NAMES = (
     "_prefix_tree_performance_search.py",
     "_planner_misses.py",
     "_planner_evidence.py",
+    "_planner_retention.py",
 )
 _SOURCE_BYTE_LIMIT = 1024 * 1024
 _REPORT_KEYS = frozenset(
@@ -273,10 +276,24 @@ def validate_report(raw: bytes) -> dict[str, Any]:
 
 
 def persist_report(
-    raw: bytes, spool_dir: Path, *, planning_budget: bool = False
+    raw: bytes,
+    spool_dir: Path,
+    *,
+    planning_budget: bool = False,
+    retention: RetentionLimits | None = None,
 ) -> Path:
     """Durably retain exact bytes; duplicate delivery is safe, conflicts refuse."""
     record = validate_report(raw)
+    if retention is not None:
+        if spool_dir != retention.spool_dir:
+            raise ValueError("planner report spool differs from assigned allowance")
+        _planner_retention.charge(
+            retention,
+            record["id"],
+            raw,
+            count_limit=MAX_PLANNING_REPORTS if planning_budget else MAX_SPOOL_REPORTS,
+            byte_limit=MAX_PLANNING_SPOOL_BYTES if planning_budget else MAX_SPOOL_BYTES,
+        )
     with _spool_lock:
         spool_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
         info = spool_dir.lstat()
@@ -306,6 +323,12 @@ def persist_report(
         )
         size = count = 0
         for entry in spool_dir.iterdir():
+            if retention is not None and entry.name in {
+                ".retention.lock",
+                ".retention.json",
+            }:
+                # Assigned metadata has its separate reserved allowance.
+                continue
             try:
                 item = entry.lstat()
             except FileNotFoundError:
@@ -443,11 +466,13 @@ class Reporter:
                     f"replay unavailable: {'ValueError' if isinstance(exc, _ReportTooLarge) else type(exc).__name__}"
                 ]
                 raw = _encode(record)
+            retention = _planner_retention.current_limits()
             path = persist_report(
                 raw,
-                self.spool_dir,
+                self.spool_dir if retention is None else retention.spool_dir,
                 planning_budget=planning
                 and not (failure is not None and failure["type"] == "OutOfMemoryError"),
+                retention=retention,
             )
         except Exception as exc:
             self.failures += 1
