@@ -168,3 +168,24 @@ def test_disabled_reporting_never_creates_assigned_spool(tmp_path):
     with reports.report_retention_scope(bound):
         assert emit(reports.Reporter()) is None
     assert not bound.spool_dir.exists()
+
+
+@pytest.mark.parametrize("bounded_by", ["bytes", "reports"])
+def test_interrupted_payload_is_not_duplicated_by_retry(tmp_path, bounded_by):
+    seed = emit(reports.Reporter(5, spool_dir=tmp_path / "seed"))
+    assert seed is not None
+    raw = seed.read_bytes()
+    bound = limits(
+        tmp_path,
+        **({"max_bytes": len(raw)} if bounded_by == "bytes" else {"max_reports": 1}),
+    )
+    committed = reports.persist_report(raw, bound.spool_dir, retention=bound)
+    charge = ledger(bound)
+    # Same durable state as death after payload fsync but before final link.
+    orphan = bound.spool_dir / ".pending-interrupted"
+    committed.rename(orphan)
+    with pytest.raises(ValueError, match="spool is full"):
+        reports.persist_report(raw, bound.spool_dir, retention=bound)
+    assert orphan.read_bytes() == raw
+    assert not committed.exists()
+    assert ledger(bound) == charge

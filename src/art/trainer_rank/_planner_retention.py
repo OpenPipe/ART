@@ -103,6 +103,7 @@ def _write(path: Path, value: dict[str, Any]) -> None:
         temporary.unlink(missing_ok=True)
 
 
+@contextmanager
 def charge(
     limits: RetentionLimits,
     event_id: str,
@@ -110,7 +111,7 @@ def charge(
     *,
     count_limit: int,
     byte_limit: int,
-) -> None:
+) -> Iterator[None]:
     """Commit a charge before the payload write; ambiguous writes never refund it.
 
     Payload reclamation does not change this ledger. The caller reserves bounded
@@ -179,6 +180,7 @@ def charge(
         if event_id in charges:
             if charges[event_id] != identity:
                 raise ValueError("planner report ID has conflicting charged bytes")
+            yield
             return
         if len(charges) >= min(limits.max_reports, count_limit) or total + len(
             raw
@@ -189,5 +191,6 @@ def charge(
             raise ValueError("assigned planner retention exhausted")
         charges[event_id] = identity
         _write(path, ledger)
+        yield
     finally:
         os.close(lock)

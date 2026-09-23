@@ -8,6 +8,7 @@ training. In particular an OOM's partial peak is not a completed measurement.
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
+from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
@@ -284,9 +285,9 @@ def persist_report(
 ) -> Path:
     """Durably retain exact bytes; duplicate delivery is safe, conflicts refuse."""
     record = validate_report(raw)
-    if retention is not None:
-        if spool_dir != retention.spool_dir:
-            raise ValueError("planner report spool differs from assigned allowance")
+    if retention is not None and spool_dir != retention.spool_dir:
+        raise ValueError("planner report spool differs from assigned allowance")
+    charged = (
         _planner_retention.charge(
             retention,
             record["id"],
@@ -294,7 +295,10 @@ def persist_report(
             count_limit=MAX_PLANNING_REPORTS if planning_budget else MAX_SPOOL_REPORTS,
             byte_limit=MAX_PLANNING_SPOOL_BYTES if planning_budget else MAX_SPOOL_BYTES,
         )
-    with _spool_lock:
+        if retention is not None
+        else nullcontext()
+    )
+    with _spool_lock, charged:
         spool_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
         info = spool_dir.lstat()
         if not stat.S_ISDIR(info.st_mode) or info.st_mode & 0o077:
@@ -321,6 +325,9 @@ def persist_report(
             if planning_budget
             else MAX_SPOOL_BYTES
         )
+        if retention is not None:
+            count_limit = min(count_limit, retention.max_reports)
+            byte_limit = min(byte_limit, retention.max_bytes)
         size = count = 0
         for entry in spool_dir.iterdir():
             if retention is not None and entry.name in {
