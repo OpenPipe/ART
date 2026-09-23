@@ -5876,8 +5876,13 @@ def _tokenize_chat_view(
                 if tail_end > end and tail_stops[tail_end - 1]:
                     end = tail_end
                     search_cursor = end
-            if exact is not None and corrected_message_end is not None:
-                # Source evidence assigns STOP throughout this exact replacement.
+            if (
+                exact is not None
+                and corrected_message_end is not None
+                and _source_stop_evidence(source, _sampled_source_key(source))[0]
+                != "length"
+            ):
+                # Source evidence assigns STOP; retain synthetic length boundaries.
                 stop_mask[start:end] = [False] * (end - start)
             replacement = exact if exact is not None else rendered[start:end]
             if exact is None and not logprobs:
