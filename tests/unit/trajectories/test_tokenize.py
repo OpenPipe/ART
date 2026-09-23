@@ -6708,6 +6708,9 @@ def test_rerender_rejects_sampled_text_ambiguous_with_trailing_scaffold() -> Non
         "nonprefix_stop",
         "unmerged_stop",
         "merged_whole_stop",
+        "eos_prefix",
+        "eos_nonprefix",
+        "eos_whole",
     ],
 )
 def test_rerender_preserves_contained_part_proof_after_message_correction(
@@ -6724,7 +6727,12 @@ def test_rerender_preserves_contained_part_proof_after_message_correction(
         "art.trajectories._tokenize._WARNED_PREFIX_RETOKENIZATION", False
     )
     content = "abc" if case == "crossing" else "ab"
-    eos_cases = {"nonprefix_stop", "unmerged_stop", "merged_whole_stop"}
+    recognized_eos_cases = {"eos_prefix", "eos_nonprefix", "eos_whole"}
+    eos_cases = {
+        "nonprefix_stop",
+        "unmerged_stop",
+        "merged_whole_stop",
+    } | recognized_eos_cases
 
     class Tokenizer:
         eos_token_id = 999 if case in eos_cases else None
@@ -6736,7 +6744,7 @@ def test_rerender_preserves_contained_part_proof_after_message_correction(
                 # Standalone and rendered content can tokenize differently,
                 # while both token sequences decode to the captured text.
                 merge = (
-                    case != "unmerged_stop"
+                    case not in {"unmerged_stop", "eos_whole"}
                     and text[index : index + len(content)] == content
                     and (
                         case == "exact"
@@ -6745,7 +6753,13 @@ def test_rerender_preserves_contained_part_proof_after_message_correction(
                     )
                 )
                 end = index + (len(content) if merge else 1)
-                tokens.append(1000 if merge else ord(text[index]))
+                tokens.append(
+                    1000
+                    if merge
+                    else 999
+                    if text[index] == "Z" and case in recognized_eos_cases
+                    else ord(text[index])
+                )
                 offsets.append((index, end))
                 index = end
             result: dict[str, object] = {"input_ids": tokens}
@@ -6755,7 +6769,11 @@ def test_rerender_preserves_contained_part_proof_after_message_correction(
 
         def decode(self, tokens: list[int], **kwargs: object) -> str:
             return "".join(
-                content if token == 1000 else "<eos>" if token == 999 else chr(token)
+                content
+                if token in {1000, 1001}
+                else "<eos>"
+                if token == 999
+                else chr(token)
                 for token in tokens
                 if token != 999 or not kwargs.get("skip_special_tokens")
             )
@@ -6789,9 +6807,11 @@ def test_rerender_preserves_contained_part_proof_after_message_correction(
         output = [1000, 90]
     elif case == "reasoning_only":
         message.update(reasoning=content, content="")
-    elif case == "nonprefix_stop":
+    elif case in {"nonprefix_stop", "eos_prefix"}:
         output = [1000, 999]
-    elif case in {"unmerged_stop", "merged_whole_stop"}:
+    elif case == "eos_nonprefix":
+        output = [1001, 999]
+    elif case in {"unmerged_stop", "merged_whole_stop", "eos_whole"}:
         output = [97, 98, 999]
     exchange = _chat_exchange([80], output)
     exchange.request["messages"] = []
@@ -6816,9 +6836,10 @@ def test_rerender_preserves_contained_part_proof_after_message_correction(
         source = ChatCompletionsMessageSource(
             exchange=messages_exchange, output_indices=(0,)
         )
+    messages = [message, {"role": "user", "content": content}]
     history = tr.ChatCompletionsHistory(
         model="test/model",
-        messages=[message, {"role": "user", "content": content}],
+        messages=messages,
         message_sources=[source, None],
         chat_template="rerender",
     )
@@ -6840,9 +6861,17 @@ def test_rerender_preserves_contained_part_proof_after_message_correction(
     if case == "crossing":
         assert tokenizer(content)["input_ids"] == [97, 98, 99]
         assert tokenizer.decode(output) == "abcZQ"
-        assert tokenizer.apply_chat_template(
-            history.messages, add_generation_prompt=True
-        ) == [80, 1000, 90, 81, 97, 98, 99, 82, 80]
+        assert tokenizer.apply_chat_template(messages, add_generation_prompt=True) == [
+            80,
+            1000,
+            90,
+            81,
+            97,
+            98,
+            99,
+            82,
+            80,
+        ]
         with pytest.raises(ValueError, match="sampled history|proven message"):
             history.tokenize(tokenizer=tokenizer)
         return
@@ -6863,10 +6892,16 @@ def test_rerender_preserves_contained_part_proof_after_message_correction(
     else:
         tokenized = history.tokenize(tokenizer=tokenizer)
     suffix = [81, 1000, 82, 80] if case == "exact" else [81, 97, 98, 82, 80]
-    scaffold = [] if case in {"whole", "contained_stop", "messages_stop"} else [90]
+    scaffold = (
+        []
+        if case in {"whole", "contained_stop", "messages_stop"} | recognized_eos_cases
+        else [90]
+    )
     assert tokenized.tokens == [80, *output, *scaffold, *suffix]
     if case in eos_cases:
-        assert tokenizer.decode(tokenized.tokens) == "Pab<eos>ZQabRP"
+        assert tokenizer.decode(tokenized.tokens) == (
+            "Pab<eos>QabRP" if case in recognized_eos_cases else "Pab<eos>ZQabRP"
+        )
     selected = list(range(1, len(output) + 1))
     assert [
         i for i, flag in enumerate(tokenized.flags) if flag & tr.TokenFlag.SAMPLED

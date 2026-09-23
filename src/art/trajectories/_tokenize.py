@@ -5853,6 +5853,29 @@ def _tokenize_chat_view(
                         "Exact sampled tokens extend beyond their proven message bounds"
                     )
                 search_cursor = end
+            elif (
+                exact is not None
+                and corrected_message_end is not None
+                and _sampled_stop_suffix(
+                    exact,
+                    source=source,
+                    source_key=_sampled_source_key(source),
+                    tokenizer=resolved_tokenizer,
+                )
+            ):
+                # Use the proven message end to replace its rendered stop,
+                # just as the whole-message path does for sampled stops.
+                tail_mask, tail_stops = _assistant_stop_masks(
+                    rendered[:corrected_message_end],
+                    assistant_mask[:corrected_message_end],
+                    resolved_tokenizer,
+                )
+                tail_end = end
+                while tail_end < len(tail_mask) and tail_mask[tail_end]:
+                    tail_end += 1
+                if tail_end > end and tail_stops[tail_end - 1]:
+                    end = tail_end
+                    search_cursor = end
             replacement = exact if exact is not None else rendered[start:end]
             if exact is None and not logprobs:
                 exchange = getattr(source, "exchange", None)
