@@ -6705,6 +6705,9 @@ def test_rerender_rejects_sampled_text_ambiguous_with_trailing_scaffold() -> Non
         "contained_stop",
         "messages_stop",
         "reasoning_only",
+        "nonprefix_stop",
+        "unmerged_stop",
+        "merged_whole_stop",
     ],
 )
 def test_rerender_preserves_contained_part_proof_after_message_correction(
@@ -6721,18 +6724,25 @@ def test_rerender_preserves_contained_part_proof_after_message_correction(
         "art.trajectories._tokenize._WARNED_PREFIX_RETOKENIZATION", False
     )
     content = "abc" if case == "crossing" else "ab"
+    eos_cases = {"nonprefix_stop", "unmerged_stop", "merged_whole_stop"}
 
     class Tokenizer:
+        eos_token_id = 999 if case in eos_cases else None
+
         def __call__(self, text: str, **kwargs: object) -> dict[str, object]:
             tokens, offsets = [], []
             index = 0
             while index < len(text):
                 # Standalone and rendered content can tokenize differently,
                 # while both token sequences decode to the captured text.
-                merge = text[index : index + len(content)] == content and (
-                    case == "exact"
-                    or (text[index : index + len(content) + 1] == content + "Z")
-                    != (case == "outside")
+                merge = (
+                    case != "unmerged_stop"
+                    and text[index : index + len(content)] == content
+                    and (
+                        case == "exact"
+                        or (text[index : index + len(content) + 1] == content + "Z")
+                        != (case == "outside")
+                    )
                 )
                 end = index + (len(content) if merge else 1)
                 tokens.append(1000 if merge else ord(text[index]))
@@ -6744,7 +6754,11 @@ def test_rerender_preserves_contained_part_proof_after_message_correction(
             return result
 
         def decode(self, tokens: list[int], **kwargs: object) -> str:
-            return "".join(content if token == 1000 else chr(token) for token in tokens)
+            return "".join(
+                content if token == 1000 else "<eos>" if token == 999 else chr(token)
+                for token in tokens
+                if token != 999 or not kwargs.get("skip_special_tokens")
+            )
 
         def apply_chat_template(
             self,
@@ -6775,6 +6789,10 @@ def test_rerender_preserves_contained_part_proof_after_message_correction(
         output = [1000, 90]
     elif case == "reasoning_only":
         message.update(reasoning=content, content="")
+    elif case == "nonprefix_stop":
+        output = [1000, 999]
+    elif case in {"unmerged_stop", "merged_whole_stop"}:
+        output = [97, 98, 999]
     exchange = _chat_exchange([80], output)
     exchange.request["messages"] = []
     data = exchange.response.model_dump(mode="python")
@@ -6805,13 +6823,20 @@ def test_rerender_preserves_contained_part_proof_after_message_correction(
         chat_template="rerender",
     )
     tokenizer = Tokenizer()
-    if case in {"crossing", "contained_stop", "messages_stop"}:
+    if case in {"crossing", "contained_stop", "messages_stop"} | eos_cases:
         assert _sampled_stop_suffix(
             output,
             source=source,
             source_key=_sampled_source_key(source),
             tokenizer=tokenizer,
         ) == (2 if case == "crossing" else 1)
+    if case in eos_cases:
+        assert tokenizer.decode(output, skip_special_tokens=False) == "ab<eos>"
+        assert tokenizer.decode(output, skip_special_tokens=True) == "ab"
+    if case == "merged_whole_stop":
+        with pytest.raises(ValueError, match="sampled content boundary"):
+            history.tokenize(tokenizer=tokenizer)
+        return
     if case == "crossing":
         assert tokenizer(content)["input_ids"] == [97, 98, 99]
         assert tokenizer.decode(output) == "abcZQ"
@@ -6819,7 +6844,7 @@ def test_rerender_preserves_contained_part_proof_after_message_correction(
             history.messages, add_generation_prompt=True
         ) == [80, 1000, 90, 81, 97, 98, 99, 82, 80]
         with pytest.raises(ValueError, match="sampled history|proven message"):
-            tokenized = history.tokenize(tokenizer=tokenizer)
+            history.tokenize(tokenizer=tokenizer)
         return
     if case in {"missing", "outside"}:
         with pytest.raises(ValueError, match="uniquely locate"):
@@ -6827,19 +6852,27 @@ def test_rerender_preserves_contained_part_proof_after_message_correction(
         return
     if case == "reasoning_only":
         with pytest.raises(ValueError, match="uniquely locate|preserve exact"):
-            tokenized = history.tokenize(tokenizer=tokenizer)
+            history.tokenize(tokenizer=tokenizer)
         return
 
-    tokenized = history.tokenize(tokenizer=tokenizer)
+    if case in {"whole", "unmerged_stop"}:
+        with pytest.warns(
+            UserWarning, match="preserved the original sampled token IDs"
+        ):
+            tokenized = history.tokenize(tokenizer=tokenizer)
+    else:
+        tokenized = history.tokenize(tokenizer=tokenizer)
     suffix = [81, 1000, 82, 80] if case == "exact" else [81, 97, 98, 82, 80]
     scaffold = [] if case in {"whole", "contained_stop", "messages_stop"} else [90]
     assert tokenized.tokens == [80, *output, *scaffold, *suffix]
+    if case in eos_cases:
+        assert tokenizer.decode(tokenized.tokens) == "Pab<eos>ZQabRP"
     selected = list(range(1, len(output) + 1))
     assert [
         i for i, flag in enumerate(tokenized.flags) if flag & tr.TokenFlag.SAMPLED
     ] == selected
     sampled_flags = [_SAMPLED_ASSISTANT_OUTPUT] * len(output)
-    if case in {"contained_stop", "messages_stop"}:
+    if case in {"contained_stop", "messages_stop"} | eos_cases:
         sampled_flags[-1] |= tr.TokenFlag.STOP
     assert tokenized.flags == [
         tr.TokenFlag(0),
