@@ -6045,14 +6045,23 @@ def _tokenize_chat_view(
         if exact:
             token_ids.extend(replacement)
             logprobs.extend(replacement_logprobs)
-            flags.extend(
+            replacement_flags = [
                 TokenFlag.EXACT
                 | TokenFlag.SAMPLED
                 | TokenFlag.ASSISTANT
                 | TokenFlag.OUTPUT
                 | (TokenFlag.STOP if stop else TokenFlag(0))
                 for stop in replacement_stop_mask
-            )
+            ]
+            if part_end is not None:
+                _mark_sampled_stops(
+                    replacement,
+                    replacement_flags,
+                    [source_key] * len(replacement),
+                    {source_key: source},
+                    tokenizer=resolved_tokenizer,
+                )
+            flags.extend(replacement_flags)
             source_keys.extend([source_key] * len(replacement))
             sources[source_key] = source
         else:

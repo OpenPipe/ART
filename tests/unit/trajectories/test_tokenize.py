@@ -9069,3 +9069,108 @@ def test_rerender_rejects_unproven_sampled_part_start(
         pytest.fail(
             f"Accepted ambiguous part start: {tokenized.tokens}; flags={tokenized.flags}"
         )
+
+
+@pytest.mark.parametrize("occurrences", [1, 2])
+def test_rerender_marks_stops_for_each_corrected_source_occurrence(
+    occurrences: int,
+) -> None:
+    from art.trajectories._tokenize import (
+        _sampled_source_key,
+        _TraceBuilder,
+        tokenize_history,
+    )
+
+    class Tokenizer:
+        eos_token_id = 999
+
+        def __call__(self, text: str, **kwargs: object) -> dict[str, object]:
+            tokens, offsets = [], []
+            index = 0
+            while index < len(text):
+                merged = text[index:].startswith("ab§")
+                end = index + (2 if merged else 1)
+                tokens.append(
+                    1000 if merged else 999 if text[index] == "§" else ord(text[index])
+                )
+                offsets.append((index, end))
+                index = end
+            result: dict[str, object] = {"input_ids": tokens}
+            if kwargs.get("return_offsets_mapping"):
+                result["offset_mapping"] = offsets
+            return result
+
+        def decode(self, tokens: list[int], **kwargs: object) -> str:
+            return "".join(
+                "ab" if token in {1000, 1001} else "§" if token == 999 else chr(token)
+                for token in tokens
+                if token != 999 or not kwargs.get("skip_special_tokens")
+            )
+
+        def apply_chat_template(
+            self,
+            messages: list[dict[str, Any]],
+            *,
+            add_generation_prompt: bool,
+            tokenize: bool = True,
+            **kwargs: object,
+        ) -> object:
+            text = "".join(
+                "P" + message["content"] + "§"
+                if message["role"] == "assistant"
+                else "Q" + message["content"] + "R"
+                for message in messages
+            ) + ("P" if add_generation_prompt else "")
+            return self(text)["input_ids"] if tokenize else text
+
+    output = [1001, 999]
+    exchange = _chat_exchange([80], output)
+    exchange.request["messages"] = []
+    exchange.response.choices[0].message.content = "ab"
+    source = ChatCompletionsMessageSource(exchange=exchange, choice_index=0)
+    history = tr.ChatCompletionsHistory(
+        model="test/model",
+        messages=[
+            {"role": "assistant", "content": "ab"},
+            {"role": "user", "content": "q"},
+        ]
+        * occurrences,
+        message_sources=[source, None] * occurrences,
+        chat_template="rerender",
+    )
+    tokenizer = Tokenizer()
+    assert tokenizer("ab")["input_ids"] == [97, 98]
+    assert tokenizer.decode(output) == "ab§"
+    builder = _TraceBuilder()
+    tokenized = tokenize_history(
+        history,
+        model=history.model,
+        base_model=None,
+        tokenizer=tokenizer,
+        chat_template=None,
+        chat_template_kwargs=None,
+        _trace=builder,
+    )
+    assert tokenized.tokens == [80, 1001, 999, 81, 113, 82] * occurrences + [80]
+    assert tokenized.flags == [
+        tr.TokenFlag(0),
+        _SAMPLED_ASSISTANT_OUTPUT,
+        _SAMPLED_ASSISTANT_OUTPUT | tr.TokenFlag.STOP,
+        tr.TokenFlag(0),
+        tr.TokenFlag(0),
+        tr.TokenFlag(0),
+    ] * occurrences + [tr.TokenFlag(0)]
+    assert tokenizer.decode(tokenized.tokens) == "Pab§QqR" * occurrences + "P"
+    for index in range(occurrences):
+        assert tokenized.logprobs[6 * index + 1 : 6 * index + 3] == [-100.1, -99.9]
+    assert builder.trace is not None
+    key = _sampled_source_key(source)
+    assert builder.trace.source_keys == [
+        None,
+        key,
+        key,
+        None,
+        None,
+        None,
+    ] * occurrences + [None]
+    assert builder.trace.sources == {key: source}
