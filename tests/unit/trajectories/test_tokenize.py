@@ -6693,6 +6693,122 @@ def test_rerender_rejects_sampled_text_ambiguous_with_trailing_scaffold() -> Non
         history.tokenize(tokenizer=Tokenizer())
 
 
+@pytest.mark.parametrize("case", ["part", "missing", "outside", "whole", "exact"])
+def test_rerender_preserves_contained_part_proof_after_message_correction(
+    case: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from art.trajectories._tokenize import (
+        _sampled_source_key,
+        _TraceBuilder,
+        tokenize_history,
+    )
+
+    monkeypatch.setattr(
+        "art.trajectories._tokenize._WARNED_PREFIX_RETOKENIZATION", False
+    )
+
+    class Tokenizer:
+        def __call__(self, text: str, **kwargs: object) -> dict[str, object]:
+            tokens, offsets = [], []
+            index = 0
+            while index < len(text):
+                # Standalone and rendered content can tokenize differently,
+                # while both token sequences decode to the captured text.
+                merge = text[index : index + 2] == "ab" and (
+                    case == "exact"
+                    or (text[index : index + 3] == "abZ") != (case == "outside")
+                )
+                end = index + (2 if merge else 1)
+                tokens.append(1000 if merge else ord(text[index]))
+                offsets.append((index, end))
+                index = end
+            result: dict[str, object] = {"input_ids": tokens}
+            if case != "missing" and kwargs.get("return_offsets_mapping"):
+                result["offset_mapping"] = offsets
+            return result
+
+        def decode(self, tokens: list[int], **kwargs: object) -> str:
+            return "".join("ab" if token == 1000 else chr(token) for token in tokens)
+
+        def apply_chat_template(
+            self,
+            messages: list[dict[str, Any]],
+            *,
+            add_generation_prompt: bool,
+            tokenize: bool = True,
+            **kwargs: object,
+        ) -> object:
+            text = "".join(
+                "P" + (message.get("reasoning") or "") + message["content"] + "Z"
+                if message["role"] == "assistant"
+                else "Q" + message["content"] + "R"
+                for message in messages
+            )
+            if add_generation_prompt:
+                text += "Pa" if case == "outside" else "P"
+            return self(text)["input_ids"] if tokenize else text
+
+    output = [1000] if case in {"outside", "exact"} else [97, 98]
+    message: dict[str, Any] = {"role": "assistant", "content": "ab"}
+    if case == "whole":
+        message["reasoning"] = "r"
+        output = [114, 97, 98, 90]
+    exchange = _chat_exchange([80], output)
+    exchange.request["messages"] = []
+    data = exchange.response.model_dump(mode="python")
+    data["choices"][0]["message"] = message
+    exchange.response = ChatCompletion.model_validate(data)
+    source = ChatCompletionsMessageSource(exchange=exchange, choice_index=0)
+    history = tr.ChatCompletionsHistory(
+        model="test/model",
+        messages=[message, {"role": "user", "content": "ab"}],
+        message_sources=[source, None],
+        chat_template="rerender",
+    )
+    tokenizer = Tokenizer()
+    if case in {"missing", "outside"}:
+        with pytest.raises(ValueError, match="uniquely locate"):
+            history.tokenize(tokenizer=tokenizer)
+        return
+
+    tokenized = history.tokenize(tokenizer=tokenizer)
+    suffix = [81, 1000, 82, 80] if case == "exact" else [81, 97, 98, 82, 80]
+    scaffold = [] if case == "whole" else [90]
+    assert tokenized.tokens == [80, *output, *scaffold, *suffix]
+    selected = list(range(1, len(output) + 1))
+    assert [
+        i for i, flag in enumerate(tokenized.flags) if flag & tr.TokenFlag.SAMPLED
+    ] == selected
+    assert tokenized.flags == [
+        tr.TokenFlag(0),
+        *([_SAMPLED_ASSISTANT_OUTPUT] * len(output)),
+        *([tr.TokenFlag.ASSISTANT | tr.TokenFlag.OUTPUT] * len(scaffold)),
+        *([tr.TokenFlag(0)] * len(suffix)),
+    ]
+    assert tokenized.logprobs[1 : len(output) + 1] == [-token / 10 for token in output]
+    assert all(math.isnan(value) for value in tokenized.logprobs[len(output) + 1 :])
+    builder = _TraceBuilder()
+    traced = tokenize_history(
+        history,
+        model=history.model,
+        base_model=None,
+        tokenizer=tokenizer,
+        chat_template=None,
+        chat_template_kwargs=None,
+        _trace=builder,
+    )
+    assert traced.tokens == tokenized.tokens
+    assert traced.flags == tokenized.flags
+    assert builder.trace is not None
+    key = _sampled_source_key(source)
+    assert builder.trace.source_keys == [
+        None,
+        *([key] * len(output)),
+        *([None] * (len(scaffold) + len(suffix))),
+    ]
+    assert builder.trace.sources == {key: source}
+
+
 def test_rerender_does_not_duplicate_sampled_trailing_eos() -> None:
     exchange = _chat_exchange([1], [7, 2])
     exchange.request["messages"] = [{"role": "user", "content": "question"}]

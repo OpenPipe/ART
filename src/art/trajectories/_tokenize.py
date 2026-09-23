@@ -5532,8 +5532,11 @@ def _tokenize_chat_view(
                 and rendered[: len(rendered_completed)] == rendered_completed
             ):
                 marked_bounds[message_index] = corrected_bounds
-                # The marker-derived per-part offsets describe the old render.
-                marked_part_bounds.pop(message_index, None)
+                if any(
+                    not corrected_bounds[0] <= start <= end <= corrected_bounds[1]
+                    for start, end in marked_part_bounds.get(message_index, ())
+                ):
+                    marked_part_bounds.pop(message_index, None)
             else:
                 marked_bounds.pop(message_index, None)
                 marked_part_bounds.pop(message_index, None)
