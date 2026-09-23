@@ -846,3 +846,43 @@ Head chunking and memory margins as data-dependent planner decisions;
 cost-model recalibration (including TP terms). Not planned: infeasibility
 proofs, all-rank planning/digest agreement, HybridEP/CUDA instrumentation from
 the research diff.
+
+### Opt-in scalar decision evidence
+
+The existing planner miss threshold also enables format-2 admission evidence.
+Completed measurements still report only when their absolute error exceeds the
+threshold. Final admission refusals and errors escaping the admission/recovery
+boundary report independently of that percentage; neither claims an observed
+execution peak. Errors before this boundary and uncaught process termination are
+not covered. Normal splitting/replanning, oversized admission, cache budgets,
+and original errors/cancellation remain authoritative.
+
+Each local admission attempt keeps its first and selected immutable memory
+samples separately from a 64-entry trace. Samples distinguish actual local
+required/available bytes from the existing reduced MAX-required/MIN-available
+result and record that reduction scope. Native allocator facts reuse the stats
+read underlying `memory_allocated`; no extra CUDA query, synchronization,
+collective, peak reset, or cache release is introduced. Other allocators retain
+their previous policy and leave unavailable fields null. A sample and attempt ID
+are local evidence, not a shared wave, limiting-peer identity, capacity reservation,
+or a guarantee that peers completed.
+
+The trace retains existing cache-recovery budget operands and decisions, release
+attempt/completion and before/after availability. The delta is an observation,
+not a causal measurement of reclaimed/reusable capacity. Nonfinite budget inputs
+are null with named unavailable fields. First/selected samples survive optional
+trace trimming; the core is bounded to 64KiB. Failure stacks retain at most the
+32 innermost module/function/line frames within 8KiB, eagerly copied without
+exception text, paths, locals or frame objects. OOM allocator counters are labelled
+post-unwind and remain separate from an incomplete peak.
+
+Successful admitted attempts attach this evidence to the existing report context;
+they do not publish a new event by themselves. Reporting disabled adds no sampling,
+source hashing, tensor copying or transport. Full immutable input capture, shared
+wave/participant identities, execution breadcrumbs, reserved summary storage,
+exact delivery ACKs, and aggregate spool budgets remain follow-up work. Current
+spool-full/process-loss limits still apply. The selected-plan replay keeps its
+existing completeness limits; this is not a full GPU failure reproduction claim.
+
+Caladan's format-2 reader must land before this producer is enabled, and both
+rank and driver need the updated ART validator. Old format-1 JSON remains readable.
