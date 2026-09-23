@@ -1077,6 +1077,7 @@ class _ForwardRefusal:
     message: str
     overridable: bool = True
     candidate: Any = None
+    check_matches_plan: bool = True
 
     def error(self, context: str) -> TrainerRankMemoryError:
         return _memory_error(
@@ -2736,6 +2737,9 @@ class TrainerRank:
             "the bounded ladder (2, 4, ..., one request per subforward) is "
             "predicted to exceed available memory once all returned graphs are "
             "live together",
+            # Without the override the rejected rung is not retained. Its
+            # check must not be attributed to the unsplit context plan.
+            check_matches_plan=getattr(self, "_allow_oversized_batches", False),
         )
 
     def _expert_parallel_active(self) -> bool:
@@ -5797,6 +5801,26 @@ class TrainerRank:
                     },
                 )
                 self._fill_planner_snapshot(refusal.plan, refusal.check, observation)
+                snapshot = observation["replay"]
+
+                def replay() -> dict[str, Any]:
+                    payload = snapshot()
+                    return {
+                        **payload,
+                        "candidate_matches_check": refusal.check_matches_plan,
+                        "incomplete_reasons": [
+                            *payload.get("incomplete_reasons", []),
+                            *(
+                                []
+                                if refusal.check_matches_plan
+                                else ["candidate does not describe denying check"]
+                            ),
+                        ],
+                    }
+
+                observation["replay"] = replay
+                if not refusal.check_matches_plan:
+                    observation["predicted"] = None
             self._planner_reporter.report(
                 predicted_peak_bytes=observation["predicted"],
                 observed_peak_bytes=None,

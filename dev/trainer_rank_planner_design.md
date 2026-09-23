@@ -889,8 +889,17 @@ wave/participant identities, execution breadcrumbs, reserved summary storage,
 exact delivery ACKs, and aggregate spool budgets remain follow-up work. Current
 spool-full/process-loss limits still apply. The selected-plan replay keeps its
 existing completeness limits; this is not a full GPU failure reproduction claim.
-New planning-event reports cap replay size at 256KiB, preserving scalar evidence
-with an explicit incomplete reason when replay exceeds that cap. Ordinary
+Planning-event reports cap size at 256KiB. Oversized replay drops bulk request
+and layout arrays first, retaining whole compact source, rank/device, model and
+estimator fields that fit; `omitted_fields` identifies every removed field.
+Such reports remain explicitly incomplete, including when an individual compact
+field itself exceeds the cap. This does not add a second capture or upload.
+After an exhausted split ladder, the ordinary refusal may retain an unsplit
+context plan but the final split-rung check. Its report labels
+`candidate_matches_check=false`, leaves the denied candidate prediction unknown,
+and refuses complete replay; it never attributes that check to the context plan.
+No extra rejected plan is materialized and admission behavior is unchanged.
+Ordinary
 refusals/planning errors can use only the first 64 entries/16MiB of the rank spool,
 counting all existing entries. Thus they cannot alone consume the original
 1024-entry/256MiB allowance used by misses and OOMs (including a planning event

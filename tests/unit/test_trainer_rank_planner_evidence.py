@@ -156,6 +156,53 @@ def test_final_refusal_emits_without_forward_or_memory_window(monkeypatch, tmp_p
     assert not getattr(rank, "_planner_active_observations", {})
 
 
+@pytest.mark.parametrize("override", [False, True])
+def test_exhausted_ladder_identifies_unmatched_check(monkeypatch, override):
+    rank = _oversized(monkeypatch)
+    rank._allow_oversized_batches = override
+    found = rank._find_admissible_forward(
+        [_request(i) for i in range(4)],
+        checkpoint=tr.Unset,
+        refusal_prefix="test refusal",
+    )
+    assert isinstance(found, tr._ForwardRefusal)
+    assert found.check_matches_plan is override
+
+
+@pytest.mark.parametrize("microbatch", [False, True])
+def test_unmatched_refusal_never_claims_denial_replay(
+    monkeypatch, tmp_path, microbatch
+):
+    rank = _oversized(monkeypatch)
+    rank._allow_oversized_batches = False
+    rank._planner_reporter = reports.Reporter(5, spool_dir=tmp_path / "reports")
+
+    def snapshot(plan, check, observation):
+        # Even if the context candidate's estimator is fully reproducible,
+        # its plan is not the final rejected rung that produced this check.
+        observation.update(
+            predicted=42,
+            replay=lambda: {"memory_replay": {"estimates": [42]}},
+        )
+
+    monkeypatch.setattr(rank, "_fill_planner_snapshot", snapshot)
+    with pytest.raises(tr.TrainerRankMemoryError):
+        requests = [_request(i) for i in range(4)]
+        if microbatch:
+            rank._select_next_micro_batch([requests], 0)
+        else:
+            rank.dp_rank_forward(requests)
+    record = reports.validate_report(
+        next(rank._planner_reporter.spool_dir.glob("*.json")).read_bytes()
+    )
+    assert record["replay"]["candidate_matches_check"] is False
+    assert record["predicted_peak_bytes"] is None
+    assert record["replay_complete"] is False
+    assert "candidate does not describe denying check" in record["incomplete_reasons"]
+    with pytest.raises(ValueError, match="incomplete replay"):
+        reports.replay(record)
+
+
 def test_planning_error_original_identity_and_no_prediction(scalar, tmp_path):
     rank, _, _, _ = scalar
     rank._planner_reporter = reports.Reporter(5, spool_dir=tmp_path / "reports")
@@ -332,8 +379,64 @@ def test_large_planning_replay_keeps_bounded_scalar_event(tmp_path):
     )
     assert path is not None and path.stat().st_size <= 256 * 1024
     record = reports.validate_report(path.read_bytes())
-    assert record["event"] == "planning_error" and record["replay"] is None
-    assert record["incomplete_reasons"] == ["planning replay exceeds report limit"]
+    assert record["event"] == "planning_error"
+    assert record["replay"]["omitted_fields"] == ["payload"]
+    assert "planning replay exceeds report limit" in record["incomplete_reasons"]
+
+
+@pytest.mark.parametrize("tokens", [88_576, 5_000_000])
+def test_planning_cap_preserves_compact_context(tmp_path, tokens):
+    inputs = [1] * tokens
+    compact = {
+        "rank": 3,
+        "device": {"device": "cuda:3"},
+        "model": "test-model",
+        "model_identity": {"revision": "original"},
+        "memory_replay": {"rank": {"num_layers": 3}, "estimates": [{"coefficient": 2}]},
+        "candidate_matches_check": False,
+    }
+    payload = {
+        **compact,
+        "requests": [{"input_tokens": inputs}],
+        "layouts": [{"input_tokens": [inputs]}],
+        "incomplete_reasons": ["candidate does not describe denying check"],
+    }
+    path = reports.Reporter(5, spool_dir=tmp_path).report(
+        predicted_peak_bytes=None,
+        observed_peak_bytes=None,
+        phase="planning",
+        event="admission_refused",
+        replay_factory=lambda: payload,
+    )
+    assert path is not None and path.stat().st_size <= reports.MAX_PLANNING_REPORT_BYTES
+    record = reports.validate_report(path.read_bytes())
+    for key, value in compact.items():
+        assert record["replay"][key] == value
+    assert record["replay"]["source_files"] == reports._source_files()
+    assert set(record["replay"]["omitted_fields"]) == {"requests", "layouts"}
+    assert "candidate does not describe denying check" in record["incomplete_reasons"]
+    assert not record["replay_complete"]
+    assert payload["requests"][0]["input_tokens"] is inputs
+
+
+def test_oversized_compact_field_is_omitted_whole(tmp_path):
+    path = reports.Reporter(5, spool_dir=tmp_path).report(
+        predicted_peak_bytes=None,
+        observed_peak_bytes=None,
+        phase="planning",
+        event="planning_error",
+        replay_factory=lambda: {
+            "rank": 7,
+            "memory_replay": {"estimates": ["x" * 300_000]},
+        },
+    )
+    assert path is not None and path.stat().st_size <= reports.MAX_PLANNING_REPORT_BYTES
+    record = reports.validate_report(path.read_bytes())
+    assert record["replay"]["rank"] == 7
+    assert record["replay"]["source_files"] == reports._source_files()
+    assert record["replay"]["omitted_fields"] == ["memory_replay"]
+    assert "memory_replay" not in record["replay"]
+    assert record["replay_complete"] is False
 
 
 def test_summary_trimming_preserves_first_selected(monkeypatch):
