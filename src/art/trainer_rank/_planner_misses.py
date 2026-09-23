@@ -311,13 +311,23 @@ def persist_report(
             raise ValueError("report spool must be a private directory")
         path = spool_dir / f"{record['id']}.json"
         if path.exists() or path.is_symlink():
-            info = path.lstat()
-            if (
-                not stat.S_ISREG(info.st_mode)
-                or info.st_size != len(raw)
-                or path.read_bytes() != raw
-            ):
-                raise ValueError("existing report identity has different bytes")
+            descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+            with os.fdopen(descriptor, "rb") as existing:
+                info = os.fstat(existing.fileno())
+                if (
+                    not stat.S_ISREG(info.st_mode)
+                    or info.st_size != len(raw)
+                    or existing.read(len(raw) + 1) != raw
+                ):
+                    raise ValueError("existing report identity has different bytes")
+                # A prior attempt may have linked the file but failed its
+                # durability barrier. Visibility alone cannot acknowledge it.
+                os.fsync(existing.fileno())
+            directory = os.open(spool_dir, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
             return path
         # Rank-side ordinary planning failures may use only the first small
         # part of the spool. OOMs/misses and delivery keep their original limit.

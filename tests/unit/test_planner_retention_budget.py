@@ -3,6 +3,7 @@
 import asyncio
 from dataclasses import replace
 import json
+import stat
 
 import pytest
 
@@ -233,6 +234,57 @@ def test_omission_write_failure_preserves_original_failure(tmp_path, monkeypatch
         reports.persist_report(raw, bound.spool_dir, retention=bound)
     assert len(calls) == 2
     assert len(ledger(bound)["charges"]) == 1
+
+
+@pytest.mark.parametrize("assigned", [False, True])
+@pytest.mark.parametrize("failed_barrier", ["file", "directory"])
+def test_duplicate_retry_reestablishes_durability(
+    tmp_path, monkeypatch, assigned, failed_barrier
+):
+    seed = emit(reports.Reporter(5, spool_dir=tmp_path / "seed"))
+    assert seed is not None
+    raw = seed.read_bytes()
+    bound = limits(tmp_path)
+    path = bound.spool_dir / seed.name
+    retention = bound if assigned else None
+    fsync = reports.os.fsync
+
+    def fail_after_link(fd):
+        if path.exists() and stat.S_ISDIR(reports.os.fstat(fd).st_mode):
+            raise OSError("directory barrier unavailable")
+        fsync(fd)
+
+    monkeypatch.setattr(reports.os, "fsync", fail_after_link)
+    with pytest.raises(OSError, match="directory barrier unavailable"):
+        reports.persist_report(raw, bound.spool_dir, retention=retention)
+    assert path.read_bytes() == raw  # Visible is not proof of durable custody.
+    charges = ledger(bound)["charges"] if assigned else None
+    barriers = []
+
+    def retry_barrier(fd):
+        info = reports.os.fstat(fd)
+        if stat.S_ISDIR(info.st_mode):
+            barrier = "directory"
+        elif info.st_ino == path.stat().st_ino:
+            barrier = "file"
+        else:
+            return fsync(fd)
+        barriers.append(barrier)
+        if barrier == failed_barrier:
+            raise OSError("retry barrier unavailable")
+        fsync(fd)
+
+    monkeypatch.setattr(reports.os, "fsync", retry_barrier)
+    with pytest.raises(OSError, match="retry barrier unavailable"):
+        reports.persist_report(raw, bound.spool_dir, retention=retention)
+    assert failed_barrier in barriers
+    failed_barrier = None
+    barriers.clear()
+    assert reports.persist_report(raw, bound.spool_dir, retention=retention) == path
+    assert barriers == ["file", "directory"]
+    assert path.read_bytes() == raw
+    if assigned:
+        assert ledger(bound)["charges"] == charges  # Never charge a retry twice.
 
 
 @pytest.mark.parametrize("assigned", [False, True])
