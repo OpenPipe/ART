@@ -55,16 +55,20 @@ class RetentionLimits:
         }
 
 
-_current: ContextVar[RetentionLimits | None] = ContextVar(
-    "planner_retention", default=None
+_current: ContextVar[tuple[RetentionLimits | None, bool]] = ContextVar(
+    "planner_retention", default=(None, True)
 )
 
 
 @contextmanager
-def report_retention_scope(limits: RetentionLimits | None) -> Iterator[None]:
+def report_retention_scope(
+    limits: RetentionLimits | None, *, capture: bool = True
+) -> Iterator[None]:
+    if type(capture) is not bool:
+        raise ValueError("planner capture must be a boolean")
     if limits is not None and not isinstance(limits, RetentionLimits):
         raise ValueError("invalid assigned planner retention scope")
-    token = _current.set(limits)
+    token = _current.set((limits, capture and capture_enabled()))
     try:
         yield
     finally:
@@ -72,7 +76,11 @@ def report_retention_scope(limits: RetentionLimits | None) -> Iterator[None]:
 
 
 def current_limits() -> RetentionLimits | None:
-    return _current.get()
+    return _current.get()[0]
+
+
+def capture_enabled() -> bool:
+    return _current.get()[1]
 
 
 def _encode(value: dict[str, Any]) -> bytes:

@@ -911,7 +911,14 @@ delivery retains its original limits; this is not a cross-process storage quota.
 
 An execution owner can explicitly assign `RetentionLimits` using
 `report_retention_scope`. This chooses a private spool and cumulative report/byte
-allowance before emission; no scope keeps standalone behavior. An atomic, fsynced
+allowance before emission; no scope keeps standalone behavior. An explicit
+`capture=False` suppresses report creation before replay/source hashing or I/O,
+including during construction before a rank can be bound. It differs from `None`
+(standalone retention) and a zero grant (which still accounts for omitted attempts).
+Suppression survives nested retention scopes and restores on exit; it follows
+ordinary ContextVar propagation, including `asyncio.to_thread`, but not arbitrary
+new threads. It does not disable the planner or change admission/training.
+An atomic, fsynced
 charge ledger precedes each payload write. Exact duplicate bytes cost nothing new,
 but deletion, failed payload writes and process restart never replenish the grant.
 Changed execution, producer or allowance identity refuses. Exhaustion keeps bounded

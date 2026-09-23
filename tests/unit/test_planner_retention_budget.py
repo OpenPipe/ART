@@ -1,5 +1,6 @@
 """Assigned quotas count captured bytes once, including after source reclamation."""
 
+import asyncio
 from dataclasses import replace
 import json
 
@@ -232,3 +233,77 @@ def test_omission_write_failure_preserves_original_failure(tmp_path, monkeypatch
         reports.persist_report(raw, bound.spool_dir, retention=bound)
     assert len(calls) == 2
     assert len(ledger(bound)["charges"]) == 1
+
+
+@pytest.mark.parametrize("assigned", [False, True])
+def test_capture_off_suppresses_constructor_before_replay_or_io(
+    tmp_path, monkeypatch, assigned
+):
+    bound = limits(tmp_path, max_bytes=0, max_reports=0) if assigned else None
+    replayed = []
+    sourced = []
+    monkeypatch.setattr(reports, "_source_files", lambda: sourced.append(True))
+
+    class Constructed:
+        def __init__(self):
+            self.reporter = reports.Reporter(5, spool_dir=tmp_path / "standalone")
+            self.path = emit(
+                self.reporter, replay_factory=lambda: replayed.append(True)
+            )
+
+    with reports.report_retention_scope(bound, capture=False):
+        constructed = Constructed()
+    assert constructed.path is None
+    assert constructed.reporter.failures == 0
+    assert replayed == sourced == []
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_capture_suppression_nests_and_restores_after_exception(tmp_path):
+    reporter = reports.Reporter(5, spool_dir=tmp_path / "standalone")
+    bound = limits(tmp_path)
+    with pytest.raises(RuntimeError, match="science"):
+        with reports.report_retention_scope(None, capture=False):
+            with reports.report_retention_scope(bound):
+                assert emit(reporter) is None
+            raise RuntimeError("science")
+    assert not bound.spool_dir.exists()
+    with reports.report_retention_scope(bound):
+        with reports.report_retention_scope(None, capture=False):
+            assert emit(reporter) is None
+        assert emit(reporter).parent == bound.spool_dir
+    assert emit(reporter).parent == reporter.spool_dir
+
+
+def test_capture_off_differs_from_zero_allowance(tmp_path):
+    bound = limits(tmp_path, max_bytes=0, max_reports=0)
+    reporter = reports.Reporter(5)
+    with reports.report_retention_scope(bound, capture=False):
+        assert emit(reporter) is None
+    assert not bound.spool_dir.exists()
+    with reports.report_retention_scope(bound):
+        assert emit(reporter) is None
+    assert ledger(bound)["omitted"] == 1
+
+
+def test_capture_scope_inherits_into_to_thread(tmp_path):
+    bound = limits(tmp_path)
+    reporter = reports.Reporter(5, spool_dir=tmp_path / "standalone")
+
+    async def run():
+        with reports.report_retention_scope(bound, capture=False):
+            assert await asyncio.to_thread(emit, reporter) is None
+        assert not bound.spool_dir.exists()
+        with reports.report_retention_scope(bound):
+            assert (await asyncio.to_thread(emit, reporter)).parent == bound.spool_dir
+
+    asyncio.run(run())
+    assert not reporter.spool_dir.exists()
+
+
+@pytest.mark.parametrize("capture", [None, 0, "false"])
+def test_capture_flag_refuses_non_boolean_without_changing_scope(tmp_path, capture):
+    with pytest.raises(ValueError, match="capture must be a boolean"):
+        with reports.report_retention_scope(None, capture=capture):
+            pytest.fail("invalid capture flag entered")
+    assert emit(reports.Reporter(5, spool_dir=tmp_path / "standalone")) is not None

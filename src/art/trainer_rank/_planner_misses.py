@@ -401,7 +401,7 @@ class Reporter:
     ) -> Path | None:
         """Serialize only a miss; ordinary observation failures never escape."""
         threshold = self.threshold_pct
-        if threshold is None:
+        if threshold is None or not _planner_retention.capture_enabled():
             return None
         event = event or ("oom" if oom else "estimate_miss")
         planning = event in {"admission_refused", "planning_error"}
