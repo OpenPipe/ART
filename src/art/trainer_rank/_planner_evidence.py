@@ -173,7 +173,9 @@ def failure(error: BaseException, *, phase: str) -> dict[str, Any]:
             if isinstance(module, str) and re.fullmatch(r"[A-Za-z0-9_.]{1,128}", module)
             else None,
             "function": name[:128],
-            "line": trace.tb_lineno,
+            "line": trace.tb_lineno
+            if type(trace.tb_lineno) is int and trace.tb_lineno > 0
+            else None,
         }
         if len(frames) == 32:
             omitted += 1
@@ -368,7 +370,7 @@ def validate(decision: Any, failed: Any) -> None:
                 )
                 or not isinstance(frame["function"], str)
                 or not 0 < len(frame["function"]) <= 128
-                or type(frame["line"]) is not int
-                or frame["line"] < 1
+                or frame["line"] is not None
+                and (type(frame["line"]) is not int or frame["line"] < 1)
             ):
                 raise ValueError("invalid planner failure frame")

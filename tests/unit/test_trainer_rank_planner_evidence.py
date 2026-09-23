@@ -4,7 +4,9 @@ from dataclasses import asdict
 import gc
 import json
 import math
-from types import SimpleNamespace
+import sys
+from types import FunctionType, SimpleNamespace, TracebackType
+from typing import Any
 import weakref
 
 import pytest
@@ -251,6 +253,89 @@ def test_failure_stack_is_bounded_and_retains_no_frames():
     raw = json.dumps(summary).encode()
     assert len(raw) <= 8192 and b"do not include" not in raw
     assert b"filename" not in raw and b"locals" not in raw
+
+
+@pytest.mark.parametrize("line", [-1, 0])
+def test_locationless_failure_still_persists_oom(tmp_path, line):
+    def frame():
+        return sys._getframe()
+
+    unlocated = FunctionType(frame.__code__.replace(co_linetable=b""), globals())()
+    error = RuntimeError().with_traceback(TracebackType(None, unlocated, 0, line))
+    failed = evidence.failure(error, phase="forward")
+    assert failed["frames"][0]["line"] is None
+    reporter = reports.Reporter(5, spool_dir=tmp_path / "reports")
+    assert (
+        reporter.report(
+            predicted_peak_bytes=100,
+            observed_peak_bytes=None,
+            phase="forward",
+            oom=True,
+            failure=failed,
+            replay_factory=lambda: {},
+        )
+        is not None
+    )
+
+
+def test_planning_flood_leaves_space_for_oom_and_delivery(tmp_path, monkeypatch):
+    monkeypatch.setattr(reports, "MAX_PLANNING_REPORTS", 2)
+    reporter = reports.Reporter(5, spool_dir=tmp_path / "rank")
+    args: dict[str, Any] = dict(
+        predicted_peak_bytes=None,
+        observed_peak_bytes=None,
+        phase="planning",
+        event="planning_error",
+        replay_factory=lambda: {},
+    )
+    retained = [reporter.report(**args) for _ in range(3)]
+    assert all(retained[:2]) and retained[2] is None
+    assert reporter.failures == 1
+    # Reconstructing the reporter cannot reset the spool budget.
+    assert reports.Reporter(5, spool_dir=reporter.spool_dir).report(**args) is None
+    # Neither execution OOMs nor planning OOMs use the low-priority allowance.
+    assert (
+        reporter.report(
+            **{
+                **args,
+                "failure": {
+                    "type": "OutOfMemoryError",
+                    "phase": "planning",
+                    "frames": [],
+                    "omitted_frames": 0,
+                },
+            }
+        )
+        is not None
+    )
+    assert (
+        reporter.report(
+            predicted_peak_bytes=100,
+            observed_peak_bytes=None,
+            phase="forward",
+            oom=True,
+            replay_factory=lambda: {},
+        )
+        is not None
+    )
+    # Delivery reconsumes original bytes under the existing driver budget.
+    for path in reporter.spool_dir.glob("*.json"):
+        assert reports.persist_report(path.read_bytes(), tmp_path / "driver")
+
+
+def test_large_planning_replay_keeps_bounded_scalar_event(tmp_path):
+    reporter = reports.Reporter(5, spool_dir=tmp_path / "rank")
+    path = reporter.report(
+        predicted_peak_bytes=None,
+        observed_peak_bytes=None,
+        phase="planning",
+        event="planning_error",
+        replay_factory=lambda: {"payload": "x" * 300_000},
+    )
+    assert path is not None and path.stat().st_size <= 256 * 1024
+    record = reports.validate_report(path.read_bytes())
+    assert record["event"] == "planning_error" and record["replay"] is None
+    assert record["incomplete_reasons"] == ["planning replay exceeds report limit"]
 
 
 def test_summary_trimming_preserves_first_selected(monkeypatch):

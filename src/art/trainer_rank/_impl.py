@@ -5761,7 +5761,7 @@ class TrainerRank:
                 # turn abandoned planning into a fabricated completed event.
                 if isinstance(error, Exception):
                     try:
-                        error._art_planner_admission_attempt = decision.id  # type: ignore[attr-defined]
+                        setattr(error, "_art_planner_admission_attempt", decision.id)
                     except Exception:
                         pass
                     self._report_planning_failure(decision, error)

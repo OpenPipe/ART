@@ -30,6 +30,9 @@ MISS_THRESHOLD_ENV = "ART_TRAINER_RANK_PLANNER_MISS_THRESHOLD_PCT"
 MAX_REPORT_BYTES = 16 * 1024 * 1024
 MAX_SPOOL_BYTES = 256 * 1024 * 1024
 MAX_SPOOL_REPORTS = 1024
+MAX_PLANNING_REPORT_BYTES = 256 * 1024
+MAX_PLANNING_REPORTS = 64
+MAX_PLANNING_SPOOL_BYTES = 16 * 1024 * 1024
 _SOURCE_NAMES = (
     "_impl.py",
     "_planner_cost.py",
@@ -206,7 +209,9 @@ def validate_report(raw: bytes) -> dict[str, Any]:
     return record
 
 
-def persist_report(raw: bytes, spool_dir: Path) -> Path:
+def persist_report(
+    raw: bytes, spool_dir: Path, *, planning_budget: bool = False
+) -> Path:
     """Durably retain exact bytes; duplicate delivery is safe, conflicts refuse."""
     record = validate_report(raw)
     with _spool_lock:
@@ -224,6 +229,18 @@ def persist_report(raw: bytes, spool_dir: Path) -> Path:
             ):
                 raise ValueError("existing report identity has different bytes")
             return path
+        # Rank-side ordinary planning failures may use only the first small
+        # part of the spool. OOMs/misses and delivery keep their original limit.
+        count_limit = (
+            min(MAX_SPOOL_REPORTS, MAX_PLANNING_REPORTS)
+            if planning_budget
+            else MAX_SPOOL_REPORTS
+        )
+        byte_limit = (
+            min(MAX_SPOOL_BYTES, MAX_PLANNING_SPOOL_BYTES)
+            if planning_budget
+            else MAX_SPOOL_BYTES
+        )
         size = count = 0
         for entry in spool_dir.iterdir():
             try:
@@ -236,7 +253,7 @@ def persist_report(raw: bytes, spool_dir: Path) -> Path:
                 raise ValueError("unexpected nonregular spool entry")
             count += 1
             size += item.st_size
-            if count >= MAX_SPOOL_REPORTS or size + len(raw) > MAX_SPOOL_BYTES:
+            if count >= count_limit or size + len(raw) > byte_limit:
                 raise ValueError("report spool is full; preserve and export reports")
         fd, temporary = tempfile.mkstemp(prefix=".pending-", dir=spool_dir)
         try:
@@ -288,6 +305,7 @@ class Reporter:
         if threshold is None:
             return None
         event = event or ("oom" if oom else "estimate_miss")
+        planning = event in {"admission_refused", "planning_error"}
         if event == "estimate_miss" and (
             predicted_peak_bytes is None
             or observed_peak_bytes is None
@@ -351,7 +369,17 @@ class Reporter:
                     f"replay unavailable: {type(exc).__name__}"
                 ]
                 raw = _encode(record)
-            path = persist_report(raw, self.spool_dir)
+            if planning and len(raw) > MAX_PLANNING_REPORT_BYTES:
+                record["replay"] = None
+                record["replay_complete"] = False
+                record["incomplete_reasons"] = ["planning replay exceeds report limit"]
+                raw = _encode(record)
+            path = persist_report(
+                raw,
+                self.spool_dir,
+                planning_budget=planning
+                and not (failure is not None and failure["type"] == "OutOfMemoryError"),
+            )
         except Exception as exc:
             self.failures += 1
             _warn(f"local persistence failed ({type(exc).__name__})")

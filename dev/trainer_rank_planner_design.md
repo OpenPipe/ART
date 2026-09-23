@@ -867,12 +867,18 @@ their previous policy and leave unavailable fields null. A sample and attempt ID
 are local evidence, not a shared wave, limiting-peer identity, capacity reservation,
 or a guarantee that peers completed.
 
+A refresh retains its possibly already-reduced `required_operand_bytes`
+separately. The earlier local requirement is joined by same-attempt sample
+ordinal, or left null when unavailable; it is not a new local estimate at the
+refresh timestamp. Admission is not repriced to fill this evidence.
+
 The trace retains existing cache-recovery budget operands and decisions, release
 attempt/completion and before/after availability. The delta is an observation,
 not a causal measurement of reclaimed/reusable capacity. Nonfinite budget inputs
 are null with named unavailable fields. First/selected samples survive optional
 trace trimming; the core is bounded to 64KiB. Failure stacks retain at most the
-32 innermost module/function/line frames within 8KiB, eagerly copied without
+32 innermost module/function/line frames within 8KiB (unknown line numbers are
+null), eagerly copied without
 exception text, paths, locals or frame objects. OOM allocator counters are labelled
 post-unwind and remain separate from an incomplete peak.
 
@@ -883,6 +889,14 @@ wave/participant identities, execution breadcrumbs, reserved summary storage,
 exact delivery ACKs, and aggregate spool budgets remain follow-up work. Current
 spool-full/process-loss limits still apply. The selected-plan replay keeps its
 existing completeness limits; this is not a full GPU failure reproduction claim.
+New planning-event reports cap replay size at 256KiB, preserving scalar evidence
+with an explicit incomplete reason when replay exceeds that cap. Ordinary
+refusals/planning errors can use only the first 64 entries/16MiB of the rank spool,
+counting all existing entries. Thus they cannot alone consume the original
+1024-entry/256MiB allowance used by misses and OOMs (including a planning event
+whose recorded failure type is `OutOfMemoryError`). Beyond the smaller cap,
+planning reports are dropped with the existing warning/failure counter. Driver
+delivery retains its original limits; this is not a cross-process storage quota.
 
 Caladan's format-2 reader must land before this producer is enabled, and both
 rank and driver need the updated ART validator. Old format-1 JSON remains readable.
