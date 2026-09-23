@@ -296,15 +296,13 @@ def test_planning_flood_leaves_space_for_oom_and_delivery(tmp_path, monkeypatch)
     # Neither execution OOMs nor planning OOMs use the low-priority allowance.
     assert (
         reporter.report(
-            **{
-                **args,
-                "failure": {
-                    "type": "OutOfMemoryError",
-                    "phase": "planning",
-                    "frames": [],
-                    "omitted_frames": 0,
-                },
-            }
+            **args,
+            failure={
+                "type": "OutOfMemoryError",
+                "phase": "planning",
+                "frames": [],
+                "omitted_frames": 0,
+            },
         )
         is not None
     )
