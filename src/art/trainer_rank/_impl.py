@@ -5946,7 +5946,7 @@ class TrainerRank:
             # Freeze scalar calibration before forward updates it. Keep owned
             # request references, not new token copies or autograd outputs.
             costs = [self._plan_cost(child) for child in children]
-            estimates = []
+            estimates: list[dict[str, Any]] = []
             for child, cost in zip(children, costs, strict=True):
                 estimates.append(
                     {

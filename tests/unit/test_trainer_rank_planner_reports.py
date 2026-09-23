@@ -476,7 +476,7 @@ def test_actual_emitted_split_retains_evidence_but_refuses_missing_runtime_facts
 def test_signature_json_roundtrip_is_immutable(slots):
     from art.trainer_rank._impl import _MemorySignature
 
-    values = dict(
+    values: dict[str, Any] = dict(
         topology=[1, 1, 1, 1],
         planner_coefficients=[2, None],
         slot_group_count=1,
@@ -545,5 +545,6 @@ def test_observation_uses_checkpoint_aware_aggregate(monkeypatch, tmp_path):
     split = tr._SplitForwardPlan(children, ((0,), (1,)), 2)
     rank._begin_planner_observation(split, tr._MemoryCheck(440, 500, True))
     observation = rank._planner_observation
+    assert observation is not None
     assert observation["predicted"] == 400
     assert observation["replay"]()["local_admission_peak_bytes"] == 440
