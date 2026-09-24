@@ -200,6 +200,26 @@ def test_cp_floor_prices_rank_rows(cp, rows):
     assert r._checkpoint_memory_floor((rows,)) == single != (0, 0)
 
 
+def test_cp_probe_defers_and_lower_bound_stays_below_exact(monkeypatch):
+    r = rank()
+    monkeypatch.setattr(r, "_topology_key", lambda: (1, 1, 2, 1))
+    monkeypatch.setattr(r, "_topology", lambda: SimpleNamespace(cp=2, tp=1))
+    # Uneven ownership: the busiest CP rank holds 3/4 of each group.
+    monkeypatch.setattr(
+        r, "_max_rank_model_tokens", lambda batch, **_: batch.tokens.numel() * 3 // 4
+    )
+    reqs = requests()
+    # Global counts would price the per-rank floors about cp times too high.
+    assert r._estimate_flat_forward(reqs) is None
+    plan = r._plan_flat_forward(reqs)
+    assert r._checkpoint_memory_floor(r._plan_group_rows(plan))[0] > 0
+    exact = r._plan_cost(plan)
+    lower = r._split_chunk_lower_cost(
+        reqs, [q.input_tokens for q in reqs], checkpoint=Unset
+    )
+    assert lower.required <= exact.required and lower.retained <= exact.retained
+
+
 def test_dp_empty_and_local_count():
     r = rank()
     r._topology_key = lambda: (3, 1, 1, 1)

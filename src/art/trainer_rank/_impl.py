@@ -5752,14 +5752,10 @@ class TrainerRank:
                 # Pending saves require the actual bucket/replayed-tail geometry.
                 # Existing unavailable handling materializes before admission.
                 return None
-            if (
-                self._topology_key()[2] > 1
-                and self._recompute_granularity != "full"
-                and not self._geometry.moe_experts
-                and any(grad for (_, grad), _ in groups)
-            ):
-                # CP token ownership can be uneven. Use the existing exact-plan
-                # fallback; a global token count alone cannot price its peak.
+            if self._topology_key()[2] > 1:
+                # CP token ownership can be uneven and memory floors are priced
+                # per rank. Use the existing exact-plan fallback; a global token
+                # count alone cannot price its peak.
                 return None
             packed_tokens = 0
             head_workspace_bytes = 0

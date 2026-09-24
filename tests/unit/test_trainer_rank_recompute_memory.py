@@ -421,7 +421,7 @@ def test_cp_prices_uneven_local_tokens_and_preserves_segment_states(
 
 
 @pytest.mark.parametrize("kind", ("full", "no_grad", "moe"))
-def test_cp_keeps_existing_full_no_grad_and_moe_costs(monkeypatch, kind):
+def test_cp_prices_group_rows_at_the_most_loaded_rank(monkeypatch, kind):
     rank = _rank(
         "full" if kind == "full" else "selective",
         **({"num_moe_experts": 64} if kind == "moe" else {}),
@@ -433,6 +433,11 @@ def test_cp_keeps_existing_full_no_grad_and_moe_costs(monkeypatch, kind):
         rank, "_max_rank_model_tokens", lambda batch, **_: batch.tokens.numel() - 1
     )
     plan = _plan(rank, no_grad=kind == "no_grad")
+    # Global counts cannot price per-rank floors: width probes defer to plans.
+    request = ForwardInput(
+        input_tokens=torch.tensor([1, 2]), hidden_states=True, no_grad=kind == "no_grad"
+    )
+    assert rank._estimate_flat_forward([request]) is None
     # Retention stays global for these kinds; floors use the most loaded rank.
     assert rank._plan_retained_tokens(plan) == plan.packed_tokens
     assert rank._plan_group_rows(plan) == tuple(
