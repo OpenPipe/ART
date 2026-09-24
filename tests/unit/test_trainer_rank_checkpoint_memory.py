@@ -200,13 +200,14 @@ def test_cp_floor_prices_rank_rows(cp, rows):
     assert r._checkpoint_memory_floor((rows,)) == single != (0, 0)
 
 
-def test_cp_probe_defers_and_lower_bound_stays_below_exact(monkeypatch):
+@pytest.mark.parametrize("share", [lambda n: -(-n // 2), lambda n: n * 3 // 4])
+def test_cp_probe_defers_and_lower_bound_stays_below_exact(monkeypatch, share):
     r = rank()
     monkeypatch.setattr(r, "_topology_key", lambda: (1, 1, 2, 1))
     monkeypatch.setattr(r, "_topology", lambda: SimpleNamespace(cp=2, tp=1))
-    # Uneven ownership: the busiest CP rank holds 3/4 of each group.
+    # Even (tight) and uneven ownership of each group by the busiest CP rank.
     monkeypatch.setattr(
-        r, "_max_rank_model_tokens", lambda batch, **_: batch.tokens.numel() * 3 // 4
+        r, "_max_rank_model_tokens", lambda batch, **_: share(batch.tokens.numel())
     )
     reqs = requests()
     # Global counts would price the per-rank floors about cp times too high.
@@ -218,6 +219,38 @@ def test_cp_probe_defers_and_lower_bound_stays_below_exact(monkeypatch):
         reqs, [q.input_tokens for q in reqs], checkpoint=Unset
     )
     assert lower.required <= exact.required and lower.retained <= exact.retained
+
+
+def test_cp_width_search_retries_full_sharing_inside_the_trust_window(monkeypatch):
+    r = rank()
+    r._dp_rank_and_size = lambda: (0, 1)
+    monkeypatch.setattr(r, "_topology_key", lambda: (1, 1, 2, 1))
+    monkeypatch.setattr(r, "_topology", lambda: SimpleNamespace(cp=2, tp=1))
+    monkeypatch.setattr(
+        r, "_max_rank_model_tokens", lambda batch, **_: batch.tokens.numel() * 3 // 4
+    )
+    r._available_memory_bytes = lambda: 1 << 50
+    # Cost-optimal layouts stay unshared; memory-minimal layouts share fully.
+    monkeypatch.setattr(
+        r,
+        "_layout_anchor",
+        lambda *, memory_minimal=False: (
+            "full_sharing" if memory_minimal else "no_sharing"
+        ),
+    )
+    items = [
+        ForwardInput(
+            input_tokens=torch.tensor([7, 100 + i]), hidden_states=True, no_grad=True
+        )
+        for i in range(16)
+    ]
+    signature = r._plan_flat_forward(items[:1]).signature
+    r._memory_profiles[signature] = _MemoryProfile(bytes_per_token=1, packed_tokens=2)
+    # Unshared layouts leave the 8x window above width 8; full sharing
+    # (width + 1 packed rows) stays trusted through width 15.
+    selected = r._search_next_micro_batch(items, 0)
+    assert not isinstance(selected, _ForwardRefusal)
+    assert selected.stats_global_count == 15
 
 
 def test_dp_empty_and_local_count():

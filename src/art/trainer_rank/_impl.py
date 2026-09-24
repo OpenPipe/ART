@@ -5120,25 +5120,32 @@ class TrainerRank:
             width = normalize(width)
             result = estimate(width)
             if result is None:
-                # Estimator unavailable (device inputs): admit on the
-                # materialized plan, trying the cost-optimal layouts first and
-                # the memory-minimal layouts if those do not fit.
-                plan = materialize(width)
-                check = self._memory_check(
-                    plan, sync_across_dp=True, sync_planning_errors=True
-                )
-                if not check.fits and not layout_modes.get(width, False):
-                    layout_modes[width] = True
-                    plans.pop(width, None)
-                    plan = materialize(width)
+                # Estimator unavailable (device inputs, or CP per-rank floors):
+                # admit on the materialized plan, trying the cost-optimal
+                # layouts first and the memory-minimal layouts if those do not
+                # fit or fall outside the profile's trust window.
+                def price(plan: _FlatForwardPlan) -> tuple[_MemoryCheck, bool, bool]:
                     check = self._memory_check(
                         plan, sync_across_dp=True, sync_planning_errors=True
                     )
-                trusted = self._all_ranks_have_memory_profile(
-                    packed_tokens=plan.packed_tokens,
-                    signature=plan.signature,
-                )
-                profiled = self._all_ranks_true(plan.signature in self._memory_profiles)
+                    trusted = self._all_ranks_have_memory_profile(
+                        packed_tokens=plan.packed_tokens,
+                        signature=plan.signature,
+                    )
+                    profiled = self._all_ranks_true(
+                        plan.signature in self._memory_profiles
+                    )
+                    return check, trusted, profiled
+
+                plan = materialize(width)
+                check, trusted, profiled = price(plan)
+                if (
+                    not check.fits or (profiled and not trusted)
+                ) and not layout_modes.get(width, False):
+                    layout_modes[width] = True
+                    plans.pop(width, None)
+                    plan = materialize(width)
+                    check, trusted, profiled = price(plan)
             else:
                 check, trusted, profiled = result
             if width in plans:
@@ -5729,6 +5736,7 @@ class TrainerRank:
         whose feasibility is monotone in width (valid for rejecting one).
         ``exact=True`` prices the planner's actual layouts (memoized by
         content) and is used only inside the band where those bounds disagree.
+        Under CP it returns None: per-rank floors need materialized layouts.
         """
 
         if sync_planning_errors:
