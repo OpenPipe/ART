@@ -227,6 +227,16 @@ jobs:
             tests/unit/test_trainer_rank_physical_reserve.py \
             tests/unit/test_trainer_rank_validation.py \
             tests/unit/test_trainer_rank_weird_shapes.py \
+            tests/unit/test_trainer_rank_admission_inputs.py \
+            tests/unit/test_trainer_rank_checkpoint_memory.py \
+            tests/unit/test_trainer_rank_checkpoint_gradient_memory.py \
+            tests/unit/test_trainer_rank_slot_memory.py \
+            tests/unit/test_trainer_rank_head_memory.py \
+            tests/unit/test_trainer_rank_mixed_head_memory.py \
+            tests/unit/test_trainer_rank_ignored_mixed_head.py \
+            tests/unit/test_trainer_rank_pending_memory.py \
+            tests/unit/test_trainer_rank_shared_memory.py \
+            tests/unit/test_trainer_rank_converted_memory.py \
             tests/unit/test_trainer_rank_split.py \
             tests/unit/test_trainer_rank_cache_recovery.py::test_dense_cp_exact_demand_fits_after_recovery \
             tests/unit/test_trainer_rank_cache_recovery.py::test_dense_cp_exact_demand_refuses_after_recovery \
@@ -257,4 +267,14 @@ jobs:
             --ignore=tests/unit/test_trainer_rank_handoff_budget.py \
             --ignore=tests/unit/test_trainer_rank_physical_reserve.py \
             --ignore=tests/unit/test_trainer_rank_validation.py \
-            --ignore=tests/unit/test_trainer_rank_weird_shapes.py
+            --ignore=tests/unit/test_trainer_rank_weird_shapes.py \
+            --ignore=tests/unit/test_trainer_rank_admission_inputs.py \
+            --ignore=tests/unit/test_trainer_rank_checkpoint_memory.py \
+            --ignore=tests/unit/test_trainer_rank_checkpoint_gradient_memory.py \
+            --ignore=tests/unit/test_trainer_rank_slot_memory.py \
+            --ignore=tests/unit/test_trainer_rank_head_memory.py \
+            --ignore=tests/unit/test_trainer_rank_mixed_head_memory.py \
+            --ignore=tests/unit/test_trainer_rank_ignored_mixed_head.py \
+            --ignore=tests/unit/test_trainer_rank_pending_memory.py \
+            --ignore=tests/unit/test_trainer_rank_shared_memory.py \
+            --ignore=tests/unit/test_trainer_rank_converted_memory.py
