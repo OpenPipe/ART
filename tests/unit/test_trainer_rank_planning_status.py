@@ -112,7 +112,10 @@ def _worker(index: int, directory: Path) -> None:
             rank._dp_rank_and_size = lambda: (index, 2)
             rank._physical_tokens = lambda tokens: tokens
             rank._estimate_group_request_output_bytes = lambda requests: 0
-            rank._memory_signature_from_requests = lambda *args, **kwargs: None
+            # Group rows read the plan's CP size; DP2/TP1/CP1/PP1 prices packed rows.
+            rank._memory_signature_from_requests = lambda *args, **kwargs: (
+                SimpleNamespace(topology=(2, 1, 1, 1))
+            )
             rank._forward_item = lambda request: SimpleNamespace(
                 input_ids=request.input_tokens, request=request
             )
