@@ -15,7 +15,11 @@ from art.trainer_rank import (
     TrainerRankMemoryError,
     Unset,
 )
-from art.trainer_rank._impl import _PACKED_PRICED_LOGICAL_ROW_BYTES, _request_mix_key
+from art.trainer_rank._impl import (
+    _PACKED_PRICED_LOGICAL_ROW_BYTES,
+    _packed_priced,
+    _request_mix_key,
+)
 
 
 class _Model(torch.nn.Module):
@@ -261,7 +265,7 @@ def test_direct_forward_does_not_drop_observed_peak_outside_trust(monkeypatch, n
 def test_empirical_estimate_survives_packed_trust_boundary(logical_ratio):
     rank = _rank()
     observed = rank._plan_flat_forward(_requests("target_tokens"))
-    rank._update_memory_profile(observed, 10_000, retained_bytes=1000)
+    rank._update_memory_profile(observed, 100_000, retained_bytes=1000)
     estimate = rank._estimate_required_memory_bytes_from_values
     values = [
         estimate(
@@ -279,6 +283,28 @@ def test_empirical_estimate_survives_packed_trust_boundary(logical_ratio):
     assert not rank._all_ranks_have_memory_profile(
         packed_tokens=800, signature=observed.signature
     )
+
+
+def test_packed_pricing_covers_allocator_blocks_of_fully_shared_requests():
+    # A duplicate one-token request adds no packed row but still allocates its
+    # head buffers, each rounded up to a 512 B block. Charge at least eight.
+    rank = _rank()
+    observed = rank._plan_flat_forward(_requests("target_tokens"))
+    rank._update_memory_profile(observed, 100_000, retained_bytes=1000)
+    profile = rank._memory_profiles[observed.signature]
+    assert _packed_priced(observed.signature, profile, rank._one_layer_recompute())
+    duplicates = 100_000
+
+    def estimate(logical_tokens: int) -> int:
+        return rank._estimate_required_memory_bytes_from_values(
+            packed_tokens=1,
+            logical_tokens=logical_tokens,
+            output_bytes=0,
+            signature=observed.signature,
+        )
+
+    base = profile.logical_per_packed
+    assert estimate(base + duplicates) - estimate(base) >= duplicates * 8 * 512
 
 
 @pytest.mark.parametrize(
@@ -364,7 +390,7 @@ def test_packed_pricing_is_limited_to_grad_single_target_mixes():
     for name in ("no_grad", "mixed_grad", "hidden", "wide"):
         assert estimate(name) == int(100_000 * 32 * 1.1)
     # Per-row charges must stay well below the profiled rates, or a more-shared
-    # layout could cost more: under 2 x 128 B x ratio, both costs extrapolate.
+    # layout could cost more: under two row charges per ratio, both extrapolate.
     floor = 2 * _PACKED_PRICED_LOGICAL_ROW_BYTES * 2
     rank._memory_profiles[single] = replace(
         profile, retained_compute_bytes_per_token=floor - 1
@@ -445,6 +471,19 @@ def test_packed_pricing_is_limited_to_grad_single_target_mixes():
     assert rank.runtime.model[0].training and not rank._one_layer_recompute()
     assert estimate("single") == estimate("hidden")
     rank.runtime.model[0].decoder.train()
+    assert rank._one_layer_recompute()
+    # With a decoder config, its live settings and the decoder's mode decide.
+    decoder = rank.runtime.model[0].decoder
+    decoder.config = SimpleNamespace(
+        recompute_granularity="full", recompute_method="uniform", recompute_num_layers=1
+    )
+    rank.runtime.model[0].eval()
+    decoder.train()
+    assert rank._one_layer_recompute()
+    rank.runtime.model[0].train()
+    decoder.config.recompute_num_layers = 2
+    assert not rank._one_layer_recompute()
+    decoder.config.recompute_num_layers = 1
     assert rank._one_layer_recompute()
     # Replay trusts the recorded mode instead of a live model.
     packed = estimate("single")

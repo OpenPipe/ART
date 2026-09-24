@@ -7816,31 +7816,22 @@ class TrainerRank:
         recorded = self.__dict__.get("_recorded_one_layer_recompute")
         if recorded is not None:
             return recorded  # Planner-report replay has no live model.
-        stored = (
-            self._recompute_granularity,
-            self._recompute_method,
-            self._recompute_num_layers,
-        )
+        target = ("full", "uniform", 1)
+        names = ("recompute_granularity", "recompute_method", "recompute_num_layers")
 
-        def settings(chunk: torch.nn.Module) -> tuple[Any, ...]:
+        def active(chunk: torch.nn.Module) -> bool:
             try:
-                config = _language_model(chunk).decoder.config
+                decoder = _language_model(chunk).decoder
+                config = decoder.config
             except (AttributeError, RuntimeError):
-                return stored
-            return tuple(
-                getattr(config, name, None)
-                for name in (
-                    "recompute_granularity",
-                    "recompute_method",
-                    "recompute_num_layers",
-                )
-            )
+                # No decoder config (stub or non-GPT chunk): stored settings,
+                # and every module must be training.
+                stored = tuple(getattr(self, "_" + name) for name in names)
+                return stored == target and all(m.training for m in chunk.modules())
+            settings = tuple(getattr(config, name, None) for name in names)
+            return settings == target and decoder.training is True
 
-        return all(
-            settings(chunk) == ("full", "uniform", 1)
-            and all(module.training for module in chunk.modules())
-            for chunk in self.runtime.model
-        )
+        return all(active(chunk) for chunk in self.runtime.model)
 
     def _gdn_segment_layer_bytes(self) -> float:
         """Initial and final fp32 recurrent states plus convolution history."""
@@ -8773,9 +8764,11 @@ def _active_logical_tokens(requests: Sequence[AnyForwardInput]) -> int:
 # GDN branch states are uncharged) keep the logical/packed ratio extrapolation.
 _PACKED_PRICED_MIXES = frozenset({"target:single", "inactive"})
 # The head's label copies, positions, row-match vectors and saved masks (about
-# 80-100 B) grow with logical rows. Under packed pricing, charge rows beyond the
-# profile's observed sharing with margin.
-_PACKED_PRICED_LOGICAL_ROW_BYTES = 128
+# 80-100 B) grow with logical rows. Each request's buffers are separate
+# allocations rounded up to 512 B blocks, so a fully shared one-token request
+# still holds several KiB. Under packed pricing, charge each row beyond the
+# profile's observed sharing eight blocks.
+_PACKED_PRICED_LOGICAL_ROW_BYTES = 8 * 512
 
 
 def _packed_rate_floor(profile: "_MemoryProfile") -> float:
