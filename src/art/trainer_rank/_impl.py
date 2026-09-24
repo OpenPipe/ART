@@ -7810,17 +7810,36 @@ class TrainerRank:
         """ART's default full/uniform/1 recompute, which Megatron runs in training.
 
         Forward keeps only layer inputs and backward recomputes one layer at a
-        time. Eval mode skips recompute even with gradients enabled.
+        time. Megatron checks the decoder's own mode and config, and eval mode
+        skips recompute even with gradients enabled, so read both live.
         """
         recorded = self.__dict__.get("_recorded_one_layer_recompute")
         if recorded is not None:
             return recorded  # Planner-report replay has no live model.
-        return (
+        stored = (
             self._recompute_granularity,
             self._recompute_method,
             self._recompute_num_layers,
-        ) == ("full", "uniform", 1) and all(
-            chunk.training for chunk in self.runtime.model
+        )
+
+        def settings(chunk: torch.nn.Module) -> tuple[Any, ...]:
+            try:
+                config = _language_model(chunk).decoder.config
+            except (AttributeError, RuntimeError):
+                return stored
+            return tuple(
+                getattr(config, name, None)
+                for name in (
+                    "recompute_granularity",
+                    "recompute_method",
+                    "recompute_num_layers",
+                )
+            )
+
+        return all(
+            settings(chunk) == ("full", "uniform", 1)
+            and all(module.training for module in chunk.modules())
+            for chunk in self.runtime.model
         )
 
     def _gdn_segment_layer_bytes(self) -> float:

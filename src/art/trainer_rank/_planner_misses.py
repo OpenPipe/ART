@@ -594,6 +594,8 @@ def replay(
     rank = _impl.TrainerRank.__new__(_impl.TrainerRank)
     for name in _RANK_FIELDS - {"one_layer_recompute"}:
         setattr(rank, "_" + name, values[name])
+    if type(values["one_layer_recompute"]) is not bool:
+        raise ValueError("incomplete replay: recompute mode is not recorded")
     rank._recorded_one_layer_recompute = values["one_layer_recompute"]
     rank._moe_forward_stages = tuple(tuple(row) for row in values["moe_forward_stages"])
     rank._geometry = ModelGeometry(**values["geometry"])

@@ -439,6 +439,20 @@ def test_packed_pricing_is_limited_to_grad_single_target_mixes():
     assert not rank._one_layer_recompute()
     assert estimate("single") == estimate("hidden")
     rank.runtime.model[0].train()
+    # Megatron checks the decoder's own mode, which can diverge from the chunk.
+    rank.runtime.model[0].decoder = torch.nn.Module()
+    rank.runtime.model[0].decoder.eval()
+    assert rank.runtime.model[0].training and not rank._one_layer_recompute()
+    assert estimate("single") == estimate("hidden")
+    rank.runtime.model[0].decoder.train()
+    assert rank._one_layer_recompute()
+    # Replay trusts the recorded mode instead of a live model.
+    packed = estimate("single")
+    rank._recorded_one_layer_recompute = False
+    assert estimate("single") == estimate("hidden") != packed
+    rank._recorded_one_layer_recompute = True
+    assert estimate("single") == packed
+    del rank._recorded_one_layer_recompute
     # Flattened-axis wide labels are not single-target.
     tokens = torch.arange(4).reshape(1, 4)
     wide = ForwardInput(input_tokens=tokens, target_tokens=torch.zeros(4, 3).long())
