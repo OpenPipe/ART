@@ -1798,6 +1798,17 @@ def first_occurrence_masks(
     if not values:
         return []
     if all(isinstance(history, TokenizedHistory) for history in values):
+        if len(values) == 1:
+            # Each position has a distinct full-prefix length in a single history.
+            history = values[0]
+            model, tokens, flags = history.model, history.tokens, history.flags
+            sentinel = int(where) if where is not None else None
+            hash(model)  # Preserve model/token conversion errors from the trie path.
+            mask = []
+            for token, flag in zip(tokens, flags, strict=True):
+                int(token)
+                mask.append(sentinel is None or bool(int(flag) & sentinel))
+            return [mask]
         trie = _FirstOccurrenceTrie()
         return [
             trie.mask(

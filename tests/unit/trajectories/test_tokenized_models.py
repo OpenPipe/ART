@@ -126,6 +126,32 @@ def test_first_occurrence_masks_partition_models_and_accept_generators() -> None
     assert not hasattr(art, "first_occurrence_masks")
 
 
+@pytest.mark.parametrize(
+    ("where", "expected"),
+    [
+        (None, [True, True, True]),
+        (tr.TokenFlag(0), [False, False, False]),
+        (tr.TokenFlag.OUTPUT, [False, True, False]),
+        (tr.TokenFlag.OUTPUT | tr.TokenFlag.STOP, [False, True, True]),
+    ],
+)
+def test_single_history_first_occurrences_use_prefix_lengths(
+    where: tr.TokenFlag | None, expected: list[bool]
+) -> None:
+    history = _tokenized(
+        [7, 7, 7], [tr.TokenFlag(0), tr.TokenFlag.OUTPUT, tr.TokenFlag.STOP]
+    )
+    assert tr.first_occurrence_masks(iter([history]), where=where) == [expected]
+    assert tr.first_occurrence_masks([_tokenized([], [])], where=where) == [[]]
+
+
+def test_single_history_first_occurrences_reject_mutated_lengths() -> None:
+    history = _history()
+    history.tokens.append(3)
+    with pytest.raises(ValueError, match=r"zip\(\) argument 2 is shorter"):
+        tr.first_occurrence_masks([history])
+
+
 def test_first_occurrence_preview_does_not_mutate_trie() -> None:
     trie = tr._FirstOccurrenceTrie()
 
