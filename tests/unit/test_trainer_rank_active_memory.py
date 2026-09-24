@@ -287,7 +287,7 @@ def test_empirical_estimate_survives_packed_trust_boundary(logical_ratio):
 
 def test_packed_pricing_covers_allocator_blocks_of_fully_shared_requests():
     # A duplicate one-token request adds no packed row but still allocates its
-    # head buffers, each rounded up to a 512 B block. Charge at least eight.
+    # head buffers, each rounded up to a 512 B block: nine at the measured peak.
     rank = _rank()
     observed = rank._plan_flat_forward(_requests("target_tokens"))
     rank._update_memory_profile(observed, 100_000, retained_bytes=1000)
@@ -304,7 +304,7 @@ def test_packed_pricing_covers_allocator_blocks_of_fully_shared_requests():
         )
 
     base = profile.logical_per_packed
-    assert estimate(base + duplicates) - estimate(base) >= duplicates * 8 * 512
+    assert estimate(base + duplicates) - estimate(base) >= duplicates * 9 * 512
 
 
 @pytest.mark.parametrize(

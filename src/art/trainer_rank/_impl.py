@@ -8765,10 +8765,10 @@ def _active_logical_tokens(requests: Sequence[AnyForwardInput]) -> int:
 _PACKED_PRICED_MIXES = frozenset({"target:single", "inactive"})
 # The head's label copies, positions, row-match vectors and saved masks (about
 # 80-100 B) grow with logical rows. Each request's buffers are separate
-# allocations rounded up to 512 B blocks, so a fully shared one-token request
-# still holds several KiB. Under packed pricing, charge each row beyond the
-# profile's observed sharing eight blocks.
-_PACKED_PRICED_LOGICAL_ROW_BYTES = 8 * 512
+# allocations rounded up to 512 B blocks: on an H200, a fully shared one-token
+# request peaked at nine blocks (4,616 B) at the end of head forward. Under
+# packed pricing, charge each row beyond the profile's observed sharing twelve.
+_PACKED_PRICED_LOGICAL_ROW_BYTES = 12 * 512
 
 
 def _packed_rate_floor(profile: "_MemoryProfile") -> float:

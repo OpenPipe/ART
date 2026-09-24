@@ -436,3 +436,48 @@ def test_prior_chunk_references_end_before_next_stats(monkeypatch, grad, mode):
             assert model.output_layer.weight.grad is not None
             assert model.output_layer.weight.grad.isfinite().all()
     assert torch.cuda.is_initialized() == cuda_initialized
+
+
+def test_shared_one_token_requests_fit_the_packed_row_charge(monkeypatch):
+    # A duplicate one-token request adds a logical row but no packed row. Its
+    # labels, indices, masks and output are separate CUDA allocations rounded
+    # to 512 B blocks; through backward they must fit the per-row charge.
+    if not torch.cuda.is_available():
+        pytest.skip("allocator rounding needs CUDA")
+    _patch_local_head(monkeypatch)
+    device = torch.device("cuda")
+    weight = torch.randn(1024, 64, device=device, dtype=torch.bfloat16) / 8
+    model = SimpleNamespace(
+        output_layer=_Head(weight),
+        vocab_size=1024,
+        share_embeddings_and_output_weights=False,
+        _scale_logits=lambda value: value,
+    )
+    r = object.__new__(TrainerRank)
+    r.runtime = SimpleNamespace(model=[model])
+    request = ForwardInput(
+        input_tokens=torch.tensor([7]), target_tokens=torch.tensor([5])
+    )
+
+    def peak(count: int) -> int:
+        items = [r._forward_item(request) for _ in range(count)]
+        prepared = SimpleNamespace(
+            positions_by_item=tuple(torch.tensor([0]) for _ in range(count)),
+            source_positions_by_item=tuple(torch.arange(1) for _ in range(count)),
+        )
+        hidden = torch.randn(1, 64, device=device, dtype=torch.bfloat16)
+        hidden.requires_grad_()
+        torch.cuda.synchronize()
+        torch.cuda.reset_peak_memory_stats()
+        base = torch.cuda.memory_allocated()
+        loss = torch.zeros((), device=device)
+        for output in r._project_head(items, prepared, hidden):
+            loss = loss - output.target_logprobs.sum()
+        loss.backward()
+        torch.cuda.synchronize()
+        return torch.cuda.max_memory_allocated() - base
+
+    peak(1)
+    extra = 20_000
+    per_request = (peak(1 + extra) - peak(1)) / extra
+    assert per_request <= _impl._PACKED_PRICED_LOGICAL_ROW_BYTES
