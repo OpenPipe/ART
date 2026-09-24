@@ -4,6 +4,7 @@ from copy import deepcopy
 from functools import partial
 import gc
 import pickle
+import threading
 from types import SimpleNamespace
 from typing import Any, cast
 import weakref
@@ -11,6 +12,7 @@ import weakref
 import pytest
 import torch
 from torch._dynamo.testing import CompileCounterWithBackend
+import torch.utils.checkpoint as torch_checkpoint
 
 pytest.importorskip("megatron.bridge")
 
@@ -21,7 +23,9 @@ from megatron.core.transformer.moe.token_dispatcher import (
     MoEFlexTokenDispatcher,
 )
 
+from art.megatron import lora as lora_module
 from art.trainer_rank import TrainerRank
+from art.trainer_rank._backward_work import BackwardWork
 from art.trainer_rank._impl import _configure_moe_dispatcher_caches
 
 
@@ -123,6 +127,251 @@ def cpu_checkpoint_rng(monkeypatch):
     monkeypatch.setattr(
         mcore_random, "_set_all_rng_states", lambda state: torch.set_rng_state(state)
     )
+
+
+@pytest.fixture
+def cpu_backward_events(cpu_checkpoint_rng, monkeypatch):
+    # Synthetic readiness tests engine bookkeeping, not CUDA completion. Keep
+    # production's CPU-disabled default unless a case explicitly enables it.
+    assert not torch.cuda.is_initialized()
+    assert getattr(mcore_random.checkpoint, "_art_lora_slot_context_patch", False)
+    assert getattr(torch_checkpoint.checkpoint, "_art_lora_slot_context_patch", False)
+    events = []
+    stream = object()
+
+    class ReadyEvent:
+        def __init__(self, *, enable_timing):
+            assert not enable_timing
+            events.append(self)
+
+        def record(self, actual_stream):
+            assert actual_stream is stream
+            self.task = torch._C._current_graph_task_id()
+
+        def query(self):
+            return True
+
+    monkeypatch.setattr(torch.cuda, "Event", ReadyEvent)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda device: stream)
+    # MCore leaves this flag set when recomputation raises. Restore the caller's
+    # original state at fixture teardown, without changing that failure path.
+    monkeypatch.setattr(mcore_random, "IS_CHECKPOINTING", False)
+    yield events
+    assert not torch.cuda.is_initialized()
+
+
+def _backward_inputs():
+    x = (
+        torch.linspace(-0.5, 0.5, 24, dtype=torch.float64)
+        .reshape(4, 6)
+        .requires_grad_()
+    )
+    params = [
+        torch.linspace(-0.2 + i * 0.03, 0.2 + i * 0.03, 12, dtype=torch.float64)
+        .reshape(6, 2)
+        .requires_grad_()
+        for i in range(4)
+    ]
+    return x, params
+
+
+def _backward_layer(value, a, b):
+    return torch.tanh(value + 0.25 * ((value @ a) @ b.T))
+
+
+def _backward_outputs(hidden, head):
+    output = SimpleNamespace(
+        target_logprobs=head[:, 0],
+        logits=head[:, :3],
+        hidden_states=hidden,
+        top_k=SimpleNamespace(logprobs=head[:, 3:]),
+    )
+    fields = (output.target_logprobs, output.logits, hidden, output.top_k.logprobs)
+    return output, sum(t.square().mean() + 0.07 * t.sum() for t in fields)
+
+
+@pytest.mark.parametrize(
+    "enabled", [False, True], ids=["cpu-disabled", "cpu-ready-facade"]
+)
+def test_backward_work_mixed_checkpoint(cpu_backward_events, enabled):
+    work = BackwardWork(threading.RLock(), torch.device("cpu"))
+    assert work.disabled
+    if enabled:
+        work.disabled = False
+    owned = lora_module.LoRASlotRef("lora", "owned")
+    ambient = lora_module.LoRASlotRef("lora", "ambient")
+
+    def iteration():
+        x, params = _backward_inputs()
+        reference_x, reference_params = _backward_inputs()
+        calls, inner_tasks, recomputed = [], [], []
+
+        def layer(index):
+            a, b = params[index * 2 : index * 2 + 2]
+
+            def compute(value, context):
+                assert lora_module._CURRENT_LORA_SLOT.get() is owned
+                calls.append(torch.is_grad_enabled())
+                result = _backward_layer(value, a, b)
+                if torch.is_grad_enabled():
+                    recomputed.append(weakref.ref(value))
+                    result.register_hook(
+                        lambda grad: inner_tasks.append(
+                            torch._C._current_graph_task_id()
+                        )
+                    )
+                return result, context
+
+            return compute
+
+        with lora_module.use_lora_slot(owned):
+            hidden = x
+            for i in range(2):
+                hidden, _ = mcore_random.checkpoint(layer(i), False, hidden, None)
+            head = torch_checkpoint.checkpoint(
+                lambda z: z.sin().square(),
+                hidden,
+                use_reentrant=False,
+            )
+        output, loss = _backward_outputs(hidden, head)
+        expected = reference_x
+        for i in range(2):
+            expected = _backward_layer(expected, *reference_params[i * 2 : i * 2 + 2])
+        _, reference_loss = _backward_outputs(expected, expected.sin().square())
+        work.attach([output, output])
+        assert len(work.outputs) == (4 if enabled else 0)
+        outer_tasks = []
+        for attempt in range(2):
+            before, event_count = work.work_ns, len(cpu_backward_events)
+            with lora_module.use_lora_slot(ambient):
+                loss.backward(retain_graph=attempt == 0)
+                assert lora_module._CURRENT_LORA_SLOT.get() is ambient
+            reference_loss.backward(retain_graph=attempt == 0)
+            for actual, expected_grad in zip(
+                (x, *params), (reference_x, *reference_params), strict=True
+            ):
+                assert actual.grad is not None and expected_grad.grad is not None
+                torch.testing.assert_close(
+                    actual.grad, expected_grad.grad, rtol=1e-12, atol=1e-12
+                )
+            assert work.work_ns == before
+            if enabled:
+                assert (
+                    len(work.rows) == 1 and len(cpu_backward_events) == event_count + 1
+                )
+                task, row = next(iter(work.rows.items()))
+                assert row.ended is not None and row.ended > row.started
+                assert not row.blocked and row.tail.task == task
+                outer_tasks.append(task)
+                before += row.ended - row.started
+            else:
+                assert not work.rows and len(cpu_backward_events) == event_count
+            work.harvest()
+            assert work.work_ns == before and not work.rows
+            work.harvest()
+            assert work.work_ns == before
+        assert len(calls) == 6 and sum(calls) == 4
+        assert len(inner_tasks) == 4 and not set(inner_tasks).intersection(outer_tasks)
+        assert all(type(task) is int and task >= 0 for task in inner_tasks)
+        assert len(set(outer_tasks)) == (2 if enabled else 0)
+        assert not mcore_random.is_checkpointing() and not work.invalid
+        assert work.cost_ns > 0
+        return recomputed + [
+            weakref.ref(t)
+            for t in (
+                x,
+                *params,
+                hidden,
+                head,
+                output.target_logprobs,
+                output.logits,
+                output.top_k.logprobs,
+            )
+        ]
+
+    try:
+        for _ in range(2):
+            refs = iteration()
+            gc.collect()
+            assert all(ref() is None for ref in refs)
+            work.attach([])
+            assert not work.outputs and not work.rows
+    finally:
+        work.close()
+    owner = weakref.ref(work)
+    del work
+    gc.collect()
+    assert owner() is None
+
+
+def test_backward_work_checkpoint_failure_lifetime(cpu_backward_events):
+    work = BackwardWork(threading.RLock(), torch.device("cpu"))
+    work.disabled = False  # Test-only CPU readiness facade.
+
+    def failed_iteration():
+        original = RuntimeError("checkpoint recomputation failed")
+        cause = ValueError("original cause")
+        x, params = _backward_inputs()
+        owned = lora_module.LoRASlotRef("lora", "owned")
+        ambient = lora_module.LoRASlotRef("lora", "ambient")
+
+        def compute(value, context):
+            assert lora_module._CURRENT_LORA_SLOT.get() is owned
+            if torch.is_grad_enabled():
+                raise original from cause
+            return _backward_layer(value, *params[:2]), context
+
+        with lora_module.use_lora_slot(owned):
+            hidden, _ = mcore_random.checkpoint(compute, False, x, None)
+            head = torch_checkpoint.checkpoint(
+                lambda z: z.sin().square(),
+                hidden,
+                use_reentrant=False,
+            )
+        output, loss = _backward_outputs(hidden, head)
+        work.attach([output])
+        with lora_module.use_lora_slot(ambient):
+            try:
+                loss.backward()
+            except RuntimeError as error:
+                assert error is original and error.__cause__ is cause
+            else:
+                pytest.fail("Expected the original recomputation error")
+            assert lora_module._CURRENT_LORA_SLOT.get() is ambient
+        assert len(work.rows) == 1
+        assert all(row.ended is None and row.tail is None for row in work.rows.values())
+        work.harvest()
+        assert work.work_ns == 0 and not cpu_backward_events
+        work.close()
+        assert work.closed and not work.rows and not work.outputs
+        # This fixture owns the pre-created exception captured by compute.
+        # Its traceback can retain this frame/graph. Dispose of it only after
+        # error/cause assertions; production must preserve the original error.
+        original.__traceback__ = None
+        assert original.__cause__ is cause
+        return [
+            weakref.ref(t)
+            for t in (
+                x,
+                *params,
+                hidden,
+                head,
+                output.target_logprobs,
+                output.logits,
+                output.top_k.logprobs,
+            )
+        ]
+
+    try:
+        refs = failed_iteration()
+        gc.collect()
+        assert all(ref() is None for ref in refs)
+    finally:
+        work.close()
+    owner = weakref.ref(work)
+    del work
+    gc.collect()
+    assert owner() is None
 
 
 @pytest.mark.parametrize("compiled", [False, True])

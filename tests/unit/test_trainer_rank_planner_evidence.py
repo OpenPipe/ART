@@ -1,5 +1,6 @@
 """Scalar admission evidence uses existing samples and never changes outcomes."""
 
+from contextlib import nullcontext
 from dataclasses import asdict
 import gc
 import json
@@ -226,6 +227,57 @@ def test_actual_cache_release_trace_and_nonfinite_budget(scalar, tmp_path):
     evidence.validate(value, None)
     assert value["trace"][0]["values"]["local_high_seconds"] is None
     assert value["trace"][0]["unavailable_fields"] == ["local_high_seconds"]
+
+
+def test_budget_trace_uses_completed_backward_and_observer_operands(scalar):
+    rank, cuda, _, names = scalar
+    state = rank._recovery_state()
+    backward = rank._backward_work()
+    assert backward is not None
+    state.work = 20.0
+    backward.work_ns = 30_000_000_000
+    backward.cost_ns = 500_000_000
+    ticks = iter((10.0, 11.0, 13.0))
+    rank._recovery_clock = lambda: next(ticks)
+    decision = evidence.Decision(
+        "forward_micro_batches", sync_across_dp=True, owner=rank
+    )
+    with evidence.scope(decision):
+        _, error, _ = run(rank, [fail(names), recovery.success(names)])
+    assert error is None and cuda.events.count("release") == 1
+    budget = next(
+        row["values"] for row in decision.trace if row["status"] == "budget_observed"
+    )
+    assert budget["local_projected_seconds"] == budget["reduced_cost_seconds"] == 1.5
+    assert budget["local_work_seconds"] == budget["reduced_work_seconds"] == 50.0
+    assert budget["local_recovery_seconds"] == 1.0
+    assert budget["local_forward_work_seconds"] == 20.0
+    assert state.cost == state.high == 3.0 and state.owner is None
+
+
+def test_handoff_sentinel_is_not_reported_as_available_memory(scalar):
+    rank, cuda, _, _ = scalar
+    cuda.free = 1
+    cuda.memory_reserved = lambda device: cuda.allocated + 100
+    cuda.device = lambda device: nullcontext()
+    decision = evidence.Decision(
+        "forward_micro_batches", sync_across_dp=True, owner=rank
+    )
+    with evidence.scope(decision):
+        rank._release_cached_memory_for_backward(
+            SimpleNamespace(groups=[SimpleNamespace(grad_enabled=True)])
+        )
+    assert cuda.events.count("release") == 1
+    rows = {row["status"]: row["values"] for row in decision.trace}
+    assert rows["sampled"]["local_available_bytes"] is None
+    assert rows["sampled"]["reduced_available_bytes"] is None
+    for key in (
+        "local_before_available_bytes",
+        "local_after_available_bytes",
+        "observed_available_delta_bytes",
+        "reduced_available_bytes",
+    ):
+        assert rows["completed"][key] is None
 
 
 def test_failure_stack_is_bounded_and_retains_no_frames():
