@@ -85,7 +85,11 @@ def _runtime() -> "TrainingRuntime":
         model=[_FakeGPT()],
         optimizer=None,
         provider=SimpleNamespace(
-            hidden_size=8, num_layers=4, recompute_granularity="full"
+            hidden_size=8,
+            num_layers=4,
+            recompute_granularity="full",
+            recompute_method="uniform",
+            recompute_num_layers=1,
         ),
         model_support_handler=SimpleNamespace(build_gdn_execution_spec=False),
     )  # type: ignore

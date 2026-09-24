@@ -37,7 +37,11 @@ def _rank():
                 model=[_Model()],
                 optimizer=None,
                 provider=SimpleNamespace(
-                    hidden_size=8, num_layers=4, recompute_granularity="full"
+                    hidden_size=8,
+                    num_layers=4,
+                    recompute_granularity="full",
+                    recompute_method="uniform",
+                    recompute_num_layers=1,
                 ),
                 model_support_handler=SimpleNamespace(build_gdn_execution_spec=False),
             ),
@@ -412,10 +416,29 @@ def test_packed_pricing_is_limited_to_grad_single_target_mixes():
     assert segments(3) - segments(0) == pytest.approx(
         3 * live * rank._gdn_segment_layer_bytes() * 1.1, abs=1
     )
-    # Other recompute modes keep more live per segment and row: extrapolate.
-    rank._one_layer_recompute = False
-    assert estimate("single") == int(100_000 * 32 * 1.1)
-    rank._one_layer_recompute = True
+    # Other recompute modes, and eval mode (which skips recompute), keep more
+    # live per segment and row: extrapolate.
+    for setting in (
+        ("selective", "uniform", 1),
+        (None, None, None),
+        ("full", "block", 1),
+        ("full", "uniform", 2),
+        ("full", None, None),
+    ):
+        (
+            rank._recompute_granularity,
+            rank._recompute_method,
+            rank._recompute_num_layers,
+        ) = setting
+        assert not rank._one_layer_recompute()
+        assert estimate("single") == estimate("hidden")
+    rank._recompute_granularity, rank._recompute_method = "full", "uniform"
+    rank._recompute_num_layers = 1
+    assert rank._one_layer_recompute()
+    rank.runtime.model[0].eval()
+    assert not rank._one_layer_recompute()
+    assert estimate("single") == estimate("hidden")
+    rank.runtime.model[0].train()
     # Flattened-axis wide labels are not single-target.
     tokens = torch.arange(4).reshape(1, 4)
     wide = ForwardInput(input_tokens=tokens, target_tokens=torch.zeros(4, 3).long())

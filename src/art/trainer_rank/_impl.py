@@ -1791,13 +1791,8 @@ class TrainerRank:
             )
 
         self._recompute_granularity = memory_field("recompute_granularity", None)
-        # ART's default full/uniform/1: forward keeps only layer inputs and
-        # backward recomputes one layer at a time. Unset means that default.
-        self._one_layer_recompute = (
-            self._recompute_granularity == "full"
-            and memory_field("recompute_method", None) in (None, "uniform")
-            and memory_field("recompute_num_layers", None) in (None, 1)
-        )
+        self._recompute_method = memory_field("recompute_method", None)
+        self._recompute_num_layers = memory_field("recompute_num_layers", None)
         self._recompute_modules: frozenset[str] = frozenset(
             memory_field("recompute_modules", ()) or ()
         )
@@ -4061,7 +4056,7 @@ class TrainerRank:
             return required
         rate = profile.retained_compute_bytes_per_token
         if _packed_priced(
-            signature, profile, self._one_layer_recompute
+            signature, profile, self._one_layer_recompute()
         ) and rate >= _packed_rate_floor(profile):
             # Saved head indices and masks stay live until backward.
             retained_compute = rate * packed_tokens + _packed_row_bytes(
@@ -6117,7 +6112,6 @@ class TrainerRank:
                     "hidden_size",
                     "param_dtype_size",
                     "recompute_granularity",
-                    "one_layer_recompute",
                     "sequence_parallel",
                     "attention_output_gate",
                     "mlp_activation_factor",
@@ -6127,6 +6121,7 @@ class TrainerRank:
                 )
             }
             rank_fields["recompute_modules"] = sorted(self._recompute_modules)
+            rank_fields["one_layer_recompute"] = self._one_layer_recompute()
             rank_fields["moe_forward_stages"] = getattr(self, "_moe_forward_stages", ())
             rank_fields["geometry"] = asdict(self._geometry)
             rank_fields["topology"] = list(plan.signature.topology)
@@ -7783,7 +7778,7 @@ class TrainerRank:
         # make a larger warm layout cheaper.
         profiled_tokens: int | float = packed_tokens
         packed_priced = profiled is not None and _packed_priced(
-            signature, profiled, self._one_layer_recompute
+            signature, profiled, self._one_layer_recompute()
         )
         if profiled is not None and logical_tokens is not None and not packed_priced:
             profiled_tokens = max(
@@ -7810,6 +7805,23 @@ class TrainerRank:
                 ),
             )
         return int((output_bytes + compute) * _MEMORY_SAFETY_FACTOR)
+
+    def _one_layer_recompute(self) -> bool:
+        """ART's default full/uniform/1 recompute, which Megatron runs in training.
+
+        Forward keeps only layer inputs and backward recomputes one layer at a
+        time. Eval mode skips recompute even with gradients enabled.
+        """
+        recorded = self.__dict__.get("_recorded_one_layer_recompute")
+        if recorded is not None:
+            return recorded  # Planner-report replay has no live model.
+        return (
+            self._recompute_granularity,
+            self._recompute_method,
+            self._recompute_num_layers,
+        ) == ("full", "uniform", 1) and all(
+            chunk.training for chunk in self.runtime.model
+        )
 
     def _gdn_segment_layer_bytes(self) -> float:
         """Initial and final fp32 recurrent states plus convolution history."""
