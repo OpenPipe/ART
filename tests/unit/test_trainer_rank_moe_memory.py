@@ -286,9 +286,6 @@ def test_profiles_outputs_and_empty_plan_preserve_empirical_floor():
     assert not rank._all_ranks_have_memory_profile(
         packed_tokens=801, signature=signature
     )
-    assert estimate(
-        packed_tokens=100, logical_tokens=200, output_bytes=123, signature=signature
-    ) == int((100 * 200000 + 123) * 1.1)
 
 
 def test_summed_group_envelope_and_retained_profile_unchanged():

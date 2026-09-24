@@ -552,7 +552,7 @@ def test_retained_compute_keeps_growth_and_sharing_trust_limits(
     rank._update_memory_profile(plan, 100_000, retained_bytes=60_000)
     observed = rank._plan_cost(candidate)
     if trusted:
-        assert observed.retained == 220_000
+        assert observed.retained == int((40_000 + 200 * packed_tokens) * 1.1)
         assert observed.retained < observed.required
     else:
         assert observed.retained == observed.required
@@ -579,17 +579,21 @@ def _retained_ratio_requests() -> list[ForwardInput]:
 
 
 @pytest.mark.parametrize("admit", (False, True))
-@pytest.mark.parametrize(("profile_packed", "budget_gib"), ((8000, 40), (1000, 20)))
+@pytest.mark.parametrize(
+    ("profile_packed", "budget_gib", "subforwards"), ((8000, 16, 2), (1000, 3, 4))
+)
 def test_retained_ratio_lower_bound_reaches_exact_split_admission(
     monkeypatch: pytest.MonkeyPatch,
     admit: bool,
     profile_packed: int,
     budget_gib: int,
+    subforwards: int,
 ) -> None:
     rank = _retained_ratio_rank(monkeypatch)
     # Actual packing: each child has 64k logical/no-sharing rows versus 4k
     # full-sharing rows. The latter crosses the retained-ratio limit; the
     # smaller profile also puts no-sharing beyond the packed-profile window.
+    # Sharing is priced by packed rows, so 17.19 GiB fits the whole forward.
     requests = _retained_ratio_requests()
     requests += [replace(request, no_grad=True) for request in requests]
     children = [rank._plan_flat_forward(requests[i : i + 16]) for i in (0, 16)]
@@ -600,8 +604,15 @@ def test_retained_ratio_lower_bound_reaches_exact_split_admission(
             4 * 131_072, profile_packed, retained_compute_bytes_per_token=128
         )
     costs = [rank._plan_cost(child) for child in children]
-    exact_bytes = rank._split_rung_check(costs).estimated_required_bytes
-    budget = budget_gib * 2**30 if admit else exact_bytes - 1
+    rows = [request.input_tokens for request in requests]
+    lower_costs = [
+        rank._split_chunk_lower_cost(
+            requests[i : i + 16], rows[i : i + 16], checkpoint=Unset
+        )
+        for i in (0, 16)
+    ]
+    lower_bytes = rank._split_rung_check(lower_costs).estimated_required_bytes
+    budget = budget_gib * 2**30 if admit else lower_bytes - 1
     monkeypatch.setattr(rank, "_available_memory_bytes", lambda: budget)
     exact = rank._split_rung_check(costs)
     if admit:
@@ -609,9 +620,7 @@ def test_retained_ratio_lower_bound_reaches_exact_split_admission(
             requests, checkpoint=Unset, context="test"
         )
         assert isinstance(plan, _SplitForwardPlan)
-        # The smaller profile cannot discount larger layouts after its trust
-        # window; the original 20 GiB budget now requires four subforwards.
-        assert plan.subforward_count == (2 if profile_packed == 8000 else 4)
+        assert plan.subforward_count == subforwards
         assert check == rank._split_rung_check(
             [rank._plan_cost(child) for child in plan.subforwards]
         )
@@ -637,30 +646,16 @@ def test_retained_ratio_lower_bound_reaches_exact_split_admission(
         monkeypatch.setattr(rank, "_run_flat_plan_with_memory_tracking", run)
         outputs = rank._execute_admitted_plan(plan, check=check, context="test")
         assert [output.checkpoint for output in outputs] == list(map(str, range(32)))
-    lower = rank._split_rung_check(
-        [
-            rank._split_chunk_lower_cost(
-                requests[i : i + 16],
-                [request.input_tokens for request in requests[i : i + 16]],
-                checkpoint=Unset,
-            )
-            for i in (0, 16)
-        ]
-    )
+    lower = rank._split_rung_check(lower_costs)
     assert [child.packed_tokens for child in children] == [64_000, 64_000]
     assert lower.estimated_required_bytes <= exact.estimated_required_bytes
-    assert lower.fits == (not admit or profile_packed == 8000)
-    assert exact.fits == (admit and profile_packed == 8000)
-    if not exact.fits:
-        # Reject this rung, at the lower bound or exact pricing; a later rung
-        # with smaller chunks may still fit this same budget.
-        split, rejected = rank._admit_split_rung(
-            [tuple(range(16)), tuple(range(16, 32))],
-            requests,
-            [request.input_tokens for request in requests],
-            checkpoint=Unset,
-        )
-        assert split is None and not rejected.fits
+    assert lower.fits == admit and not exact.fits
+    # The lower bound passes whenever exact pricing admits this rung; smaller
+    # budgets reject it, though a later rung with smaller chunks may fit.
+    split, rejected = rank._admit_split_rung(
+        [tuple(range(16)), tuple(range(16, 32))], requests, rows, checkpoint=Unset
+    )
+    assert (split is not None) == rejected.fits == (admit and subforwards == 2)
 
 
 @pytest.mark.parametrize(
@@ -835,7 +830,7 @@ def test_retained_ratio_original_cost_witness_stays_conservative(
     ]
     # Exact retention keeps its conservative fallback. Only treating that
     # fallback as an optimistic split-search bound was incorrect.
-    assert small.required == large.required == 36_909_886_200
+    assert (small.required, large.required) == (2_306_878_200, 4_613_745_400)
     assert small.retained == small.required and large.retained == 11_000
 
 
@@ -1090,7 +1085,13 @@ def test_warm_rounding_preserves_native_split_bound_and_exact_budget(
         rank._update_memory_profile(
             plan, peak_delta_bytes=7_864_390, retained_bytes=retained
         )
-    costs = [rank._plan_cost(plan) for plan in children]
+    # Full sharing is the cheapest layout, so it sets the exact budget.
+    costs = [
+        rank._plan_cost(
+            rank._plan_flat_forward(requests[a : a + 5], memory_minimal=True)
+        )
+        for a in (0, 5)
+    ]
     lower = [
         rank._split_chunk_lower_cost(
             requests[a : a + 5], rows[a : a + 5], checkpoint=Unset

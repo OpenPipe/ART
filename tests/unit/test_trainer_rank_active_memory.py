@@ -154,11 +154,10 @@ def test_inactive_observation_cannot_discount_later_shared_active_work(monkeypat
         monkeypatch.setattr(rank, "_available_memory_bytes", lambda: 20_000)
         checks.append(rank._memory_check(candidate))
     # Identical observed GPU work must produce identical future admission.
-    # Total-input ratios formerly discounted the second estimate to 11,985,
-    # admitting a plan that the equivalent short calibration refused.
+    # Sharing adds logical outputs, not packed activations.
     assert checks[0] == checks[1]
-    assert checks[0].estimated_required_bytes == 88_000
-    assert not checks[0].fits
+    assert checks[0].estimated_required_bytes == 11_985
+    assert checks[0].fits
 
 
 def test_warm_admission_rechecks_current_residency(monkeypatch):
@@ -252,8 +251,7 @@ def test_direct_forward_does_not_drop_observed_peak_outside_trust(monkeypatch, n
         assert rank.last_forward_telemetry()["predicted_peak_bytes"] >= 10_000
 
 
-@pytest.mark.parametrize("logical_ratio", [1, 2, 10])
-def test_empirical_estimate_survives_packed_trust_boundary(logical_ratio):
+def test_empirical_estimate_survives_packed_trust_boundary():
     rank = _rank()
     observed = rank._plan_flat_forward(_requests("target_tokens"))
     rank._update_memory_profile(observed, 10_000, retained_bytes=1000)
@@ -261,7 +259,6 @@ def test_empirical_estimate_survives_packed_trust_boundary(logical_ratio):
     values = [
         estimate(
             packed_tokens=count,
-            logical_tokens=count * logical_ratio,
             output_bytes=count * 4,
             signature=observed.signature,
         )
@@ -269,7 +266,7 @@ def test_empirical_estimate_survives_packed_trust_boundary(logical_ratio):
     ]
     assert values == sorted(values)
     rate = rank._memory_profiles[observed.signature].bytes_per_token
-    assert values[-1] == int((800 * 4 + rate * 800 * logical_ratio) * 1.1)
+    assert values[-1] == int((800 * 4 + rate * 800) * 1.1)
     assert not rank._all_ranks_have_memory_profile(
         packed_tokens=800, signature=observed.signature
     )

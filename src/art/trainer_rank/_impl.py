@@ -3976,7 +3976,6 @@ class TrainerRank:
             packed_tokens=packed_tokens,
             output_bytes=output_bytes,
             signature=signature,
-            logical_tokens=logical_tokens,
             gdn_segments=gdn_segments,
             group_rows=group_rows,
             slot_refs=slot_refs,
@@ -4054,8 +4053,7 @@ class TrainerRank:
             return required
         retained = output_bytes + max(
             checkpoint_retained_bytes,
-            profile.retained_compute_bytes_per_token
-            * max(packed_tokens, logical_tokens / profile.logical_per_packed),
+            profile.retained_compute_bytes_per_token * packed_tokens,
         )
         return min(required, int(retained * _MEMORY_SAFETY_FACTOR))
 
@@ -5025,7 +5023,6 @@ class TrainerRank:
                         packed_tokens=packed_tokens,
                         output_bytes=output_bytes,
                         signature=signature,
-                        logical_tokens=logical_tokens,
                         # A radix tree has fewer than twice as many segments as
                         # active requests; the exact plan uses its actual count.
                         gdn_segments=2
@@ -6790,7 +6787,6 @@ class TrainerRank:
                 packed_tokens=forward.packed_tokens,
                 output_bytes=forward.output_bytes,
                 signature=forward.signature,
-                logical_tokens=forward.active_logical_tokens,
                 gdn_segments=forward.grad_segment_count,
                 group_rows=self._plan_group_rows(forward),
                 slot_refs=tuple(g.slot_ref for g in forward.groups),
@@ -7636,7 +7632,6 @@ class TrainerRank:
         packed_tokens: int,
         output_bytes: int,
         signature: _MemorySignature,
-        logical_tokens: int | None = None,
         gdn_segments: int = 0,
         group_rows: tuple[tuple[int, bool], ...] = (),
         slot_refs: tuple["LoRASlotRef | None", ...] | None = None,
@@ -7775,25 +7770,16 @@ class TrainerRank:
             # Local head results coexist with full CP outputs during gathering.
             # Uneven rank plans can assign all of an item's rows to one rank.
             static_compute += output_bytes
-        # A profile learned under lighter sharing (lower logical/packed ratio)
-        # underestimates the per-packed-token footprint of a deeper-shared
-        # plan; scale the trusted estimate up by the ratio gap.
-        # Normalize before multiplying: cancelling packed tokens through two
-        # float operations can otherwise make a larger warm layout cheaper.
-        profiled_tokens: int | float = packed_tokens
-        if profiled is not None and logical_tokens is not None:
-            profiled_tokens = max(
-                packed_tokens, logical_tokens / profiled.logical_per_packed
-            )
         # The trust window limits calibration growth, not the empirical floor.
         # Dropping that floor beyond the window can admit a larger request that
         # was refused just inside it, even below a previously observed peak.
+        # Measured peaks scale with packed tokens, not with the sharing ratio.
         if profiled is None:
             compute = static_compute
         else:
             compute = max(
                 static_compute,
-                int(profiled.bytes_per_token * profiled_tokens),
+                int(profiled.bytes_per_token * packed_tokens),
             )
         return int((output_bytes + compute) * _MEMORY_SAFETY_FACTOR)
 
