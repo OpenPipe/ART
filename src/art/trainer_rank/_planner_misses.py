@@ -11,6 +11,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
+from itertools import islice
 import json
 import logging
 import math
@@ -83,15 +84,83 @@ def _warn(reason: str) -> None:
         pass
 
 
-def _encode(record: dict[str, Any]) -> bytes:
+class _ReportTooLarge(ValueError):
+    pass
+
+
+def _encode(record: dict[str, Any], *, limit: int = MAX_REPORT_BYTES) -> bytes:
     chunks = bytearray()
     encoder = json.JSONEncoder(sort_keys=True, separators=(",", ":"), allow_nan=False)
     for chunk in encoder.iterencode(record):
         encoded = chunk.encode("utf-8")
-        if len(chunks) + len(encoded) + 1 > MAX_REPORT_BYTES:
-            raise ValueError("report exceeds byte limit")
+        if len(chunks) + len(encoded) + 1 > limit:
+            raise _ReportTooLarge("report exceeds byte limit")
         chunks.extend(encoded)
     return bytes(chunks) + b"\n"
+
+
+def _compact_planning_record(record: dict[str, Any]) -> dict[str, Any]:
+    """Keep whole compact facts before bulk inputs; never claim partial replay."""
+    payload = record["replay"]
+    reasons = [
+        *record["incomplete_reasons"],
+        "planning replay exceeds report limit",
+    ]
+    omitted: list[str] = []
+    compact: dict[str, Any] = {
+        "incomplete_reasons": reasons,
+        "omitted_fields": omitted,
+        "unlisted_fields": 0,
+        "omitted_field_names_truncated": 0,
+    }
+    result = {
+        **record,
+        "replay": compact,
+        "replay_complete": False,
+        "incomplete_reasons": reasons,
+    }
+    priority = (
+        "source_files",
+        "source_scope",
+        "rank",
+        "device",
+        "model",
+        "model_identity",
+        "candidate_matches_check",
+        "memory_replay",
+    )
+    # The maintained snapshot has fewer than 32 fields. Bound optional factory
+    # fields too: neither omission names nor repeated encoding may grow without
+    # limit just because the report itself exceeds its cap.
+    selected = dict.fromkeys((*priority, *islice(payload, 64)))
+    compact["unlisted_fields"] = len(payload) - sum(key in payload for key in selected)
+
+    def omit(key: str) -> None:
+        if len(key) > 32:
+            compact["omitted_field_names_truncated"] += 1
+            key = "<field name exceeds limit>"
+        omitted.append(key)
+
+    for key in selected:
+        if key not in payload or key == "incomplete_reasons":
+            continue
+        if key in {
+            "requests",
+            "layouts",
+            "omitted_fields",
+            "unlisted_fields",
+            "omitted_field_names_truncated",
+        }:
+            omit(key)
+            continue
+        compact[key] = payload[key]
+        try:
+            # At most 72 names, each <=32 characters (<=12 JSON bytes/character).
+            _encode(result, limit=MAX_PLANNING_REPORT_BYTES - 32 * 1024)
+        except _ReportTooLarge:
+            del compact[key]
+            omit(key)
+    return result
 
 
 def _source_files() -> dict[str, dict[str, str | int]]:
@@ -361,18 +430,24 @@ class Reporter:
                 )
                 if not record["replay_complete"] and not record["incomplete_reasons"]:
                     record["incomplete_reasons"] = ["memory replay inputs unavailable"]
-                raw = _encode(record)
+                try:
+                    raw = _encode(
+                        record,
+                        limit=MAX_PLANNING_REPORT_BYTES
+                        if planning
+                        else MAX_REPORT_BYTES,
+                    )
+                except _ReportTooLarge:
+                    if not planning:
+                        raise
+                    record = _compact_planning_record(record)
+                    raw = _encode(record, limit=MAX_PLANNING_REPORT_BYTES)
             except Exception as exc:
                 record["replay"] = None
                 record["replay_complete"] = False
                 record["incomplete_reasons"] = [
-                    f"replay unavailable: {type(exc).__name__}"
+                    f"replay unavailable: {'ValueError' if isinstance(exc, _ReportTooLarge) else type(exc).__name__}"
                 ]
-                raw = _encode(record)
-            if planning and len(raw) > MAX_PLANNING_REPORT_BYTES:
-                record["replay"] = None
-                record["replay_complete"] = False
-                record["incomplete_reasons"] = ["planning replay exceeds report limit"]
                 raw = _encode(record)
             path = persist_report(
                 raw,

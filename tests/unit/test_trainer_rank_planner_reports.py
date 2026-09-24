@@ -131,6 +131,8 @@ def test_incomplete_replay_is_retained_and_honest(tmp_path, monkeypatch, failure
     assert record["replay"] is None
     assert record["replay_complete"] is False
     assert record["incomplete_reasons"]
+    if failure == "overflow":
+        assert record["incomplete_reasons"] == ["replay unavailable: ValueError"]
     assert b"private payload" not in path.read_bytes()
 
 
