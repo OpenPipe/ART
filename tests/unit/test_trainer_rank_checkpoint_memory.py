@@ -181,13 +181,23 @@ def test_actual_config_revalidated(field, value):
     assert r._checkpoint_memory_floor(((10, True),)) == (0, 0)
 
 
-@pytest.mark.parametrize("axis", [1, 2, 3])
+@pytest.mark.parametrize("axis", [1, 3])
 def test_topology_revalidated(axis):
     r = rank()
     topology = [1, 1, 1, 1]
     topology[axis] = 2
     r._topology_key = lambda: tuple(topology)
     assert r._checkpoint_memory_floor(((10, True),)) == (0, 0)
+
+
+@pytest.mark.parametrize("rows", [(10, True), (11, False)])
+@pytest.mark.parametrize("cp", [2, 4])
+def test_cp_floor_prices_rank_rows(cp, rows):
+    # Callers pass rows on the most loaded CP rank; the per-row floor matches CP1.
+    r = rank()
+    single = r._checkpoint_memory_floor((rows,))
+    r._topology_key = lambda: (1, 1, cp, 1)
+    assert r._checkpoint_memory_floor((rows,)) == single != (0, 0)
 
 
 def test_dp_empty_and_local_count():
@@ -426,11 +436,4 @@ def test_reference_prefix_search_agrees_with_mixed_demand(fits):
 def test_no_grad_enclosure_config_guard(field, value):
     r = rank()
     setattr(r.runtime.model[0].decoder.config, field, value)
-    assert r._checkpoint_memory_floor(((11, False),)) == (0, 0)
-
-
-@pytest.mark.parametrize("cp", [2, 4])
-def test_no_grad_enclosure_keeps_cp_fallback(cp):
-    r = rank()
-    r._topology_key = lambda: (1, 1, cp, 1)
     assert r._checkpoint_memory_floor(((11, False),)) == (0, 0)

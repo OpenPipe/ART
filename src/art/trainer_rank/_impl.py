@@ -1500,7 +1500,8 @@ def _moe_output_bytes_per_token(
     slot_ref: "LoRASlotRef | None" = None,
 ) -> int:
     """Known routed-expert working set, not a complete model/compiled bound."""
-    if shape != ParallelShape(tp=1, cp=1):
+    # CP shards rows, not the per-token working set; EP dispatch is not modeled.
+    if (shape.tp, shape.ep, shape.etp) != (1, 1, 1):
         return 0
     from megatron.core.extensions.transformer_engine import (
         TEColumnParallelGroupedLinear,
@@ -3461,7 +3462,9 @@ class TrainerRank:
             assert estimated is not None  # rows are CPU copies
             physical_rows = self._physical_tokens(estimated)
             packed_tokens += physical_rows
-            group_rows.append((physical_rows, grad_enabled))
+            # The most loaded CP rank holds at least an even share.
+            cp = max(1, self._topology_key()[2])
+            group_rows.append((-(-physical_rows // cp), grad_enabled))
             head_requests = tuple(requests[index] for index in group_indices)
             head_workspace_bytes = max(
                 head_workspace_bytes,
@@ -3536,7 +3539,7 @@ class TrainerRank:
             rows <= 0
             or self._padded_vocab_size is None
             or len(self.runtime.model) != 1
-            or self._topology_key()[1:] != (1, 1, 1)
+            or self._topology_key()[1::2] != (1, 1)
         ):
             return 0
         try:
@@ -3776,9 +3779,21 @@ class TrainerRank:
         return peak
 
     def _plan_group_rows(self, plan: _FlatForwardPlan) -> tuple[tuple[int, bool], ...]:
+        """Physical rows per group on the most loaded context-parallel rank."""
+        topology = self._topology() if plan.signature.topology[2] > 1 else None
         return tuple(
             (
-                self._physical_tokens(int(group.packed.tokens.numel())),
+                self._physical_tokens(
+                    int(group.packed.tokens.numel())
+                    if topology is None
+                    else max(
+                        1,
+                        self._max_rank_model_tokens(
+                            _pad_packed_batch(group.packed, multiple=int(topology.tp)),
+                            topology=topology,
+                        ),
+                    )
+                ),
                 group.grad_enabled,
             )
             for group in plan.groups
@@ -3902,8 +3917,7 @@ class TrainerRank:
             or config.params_dtype is not torch.bfloat16
             or self._param_dtype_size != 2
             or next(self.runtime.model[0].parameters()).dtype is not torch.bfloat16
-            or self._topology_key()[1:] != (1, 1, 1)
-            or _expert_parallel_shape(self.runtime.provider) != (1, 1)
+            or self._topology_key()[1::2] != (1, 1)
             or any(
                 type(getattr(config, name, None)) is not type(value)
                 or getattr(config, name) != value
@@ -7724,7 +7738,12 @@ class TrainerRank:
         static_compute = max(
             static_compute,
             *(
-                self._moe_workspace_bytes(packed_tokens, slot_ref=ref)
+                self._moe_workspace_bytes(
+                    sum(rows for rows, _ in group_rows)
+                    if signature.topology[2] > 1 and group_rows
+                    else packed_tokens,
+                    slot_ref=ref,
+                )
                 for ref in (slot_refs or (None,))
             ),
         )
