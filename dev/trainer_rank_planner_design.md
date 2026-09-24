@@ -909,5 +909,31 @@ whose recorded failure type is `OutOfMemoryError`). Beyond the smaller cap,
 planning reports are dropped with the existing warning/failure counter. Driver
 delivery retains its original limits; this is not a cross-process storage quota.
 
+An execution owner can explicitly assign `RetentionLimits` using
+`report_retention_scope`. This chooses a private spool and cumulative report/byte
+allowance before emission; no scope keeps standalone behavior. An explicit
+`capture=False` suppresses report creation before replay/source hashing or I/O,
+including during construction before a rank can be bound. It differs from `None`
+(standalone retention) and a zero grant (which still accounts for omitted attempts).
+Suppression survives nested retention scopes and restores on exit; it follows
+ordinary ContextVar propagation, including `asyncio.to_thread`, but not arbitrary
+new threads. It does not disable the planner or change admission/training.
+An atomic, fsynced
+charge ledger precedes each payload write. Exact duplicate bytes cost nothing new,
+but deletion, failed payload writes and process restart never replenish the grant.
+Changed execution, producer or allowance identity refuses. Exhaustion keeps bounded
+omitted-attempt/byte counters, including a zero allowance and ordinary failures
+following a charge, without another spool. These count failed persistence attempts,
+not unique lost reports or certain payload absence. Counter writes are best effort:
+an unreadable ledger, disk failure or process death can leave coverage incomplete.
+Unknown crash leftovers are retained and count against occupancy; a first ledger
+write interrupted before publication requires owner reconciliation, not automatic
+cleanup or a new grant. Enter the context in the actual reporting thread: plain
+threads and `run_in_executor` do not inherit it. Spools belong to one producer;
+the file lock can block if that contract is violated or storage stalls.
+Ledger/lock metadata needs a separate owner reservation. This hook neither reserves
+capacity across producers nor acknowledges transport: those are the execution
+owner's responsibilities. It adds no GPU operation or full-input capture.
+
 Caladan's format-2 reader must land before this producer is enabled, and both
 rank and driver need the updated ART validator. Old format-1 JSON remains readable.
