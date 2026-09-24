@@ -223,6 +223,8 @@ jobs:
             tests/unit/test_prefix_tree_attention_builder.py \
             tests/unit/test_prefix_tree_grad_parity.py \
             tests/unit/test_prefix_tree_packing.py \
+            tests/unit/test_trainer_rank_handoff_budget.py \
+            tests/unit/test_trainer_rank_physical_reserve.py \
             tests/unit/test_trainer_rank_validation.py \
             tests/unit/test_trainer_rank_weird_shapes.py \
             tests/unit/test_trainer_rank_split.py \
@@ -252,5 +254,7 @@ jobs:
             --ignore=tests/unit/test_prefix_tree_attention_builder.py \
             --ignore=tests/unit/test_prefix_tree_grad_parity.py \
             --ignore=tests/unit/test_prefix_tree_packing.py \
+            --ignore=tests/unit/test_trainer_rank_handoff_budget.py \
+            --ignore=tests/unit/test_trainer_rank_physical_reserve.py \
             --ignore=tests/unit/test_trainer_rank_validation.py \
             --ignore=tests/unit/test_trainer_rank_weird_shapes.py

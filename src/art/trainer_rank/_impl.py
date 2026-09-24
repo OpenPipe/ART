@@ -56,6 +56,8 @@ from art.megatron.prefix_tree_packing import (
     estimate_prefix_tree_packed_tokens,
 )
 from art.trainer_rank import _planner_evidence, _planner_misses
+from art.trainer_rank._backward_work import BackwardWork
+from art.trainer_rank._backward_work import region as _backward_region
 from art.trainer_rank._planner_cost import (
     COEFFICIENT_VERSION_FALLBACK,
     ModelGeometry,
@@ -578,7 +580,8 @@ class _CacheRecoveryState:
     first_consumed: bool = False
     invalid: bool = False
     owner: object | None = None
-    lock: Any = dataclass_field(default_factory=threading.Lock)
+    backward: BackwardWork | None = None
+    lock: Any = dataclass_field(default_factory=threading.RLock)
 
 
 class _PlannerObservation(dict[str, Any]):
@@ -2379,6 +2382,9 @@ class TrainerRank:
         checkpoint: AdapterSelection,
         yield_empty: bool,
     ) -> Generator[MicroBatch[ForwardInputs, ForwardOutputs], None, None]:
+        backward = self._backward_work()
+        if backward is not None:
+            backward.harvest()
         items = [_materialize(item) for item in inputs]
         requests = list(_flatten(items))
         self._validate_replicated_top_level_count(len(items), yield_empty=yield_empty)
@@ -2398,24 +2404,39 @@ class TrainerRank:
                     items, start, checkpoint=checkpoint
                 )
             self._snapshot_planning_telemetry(candidate.plan, candidate.check)
-            if isinstance(candidate.plan, _FlatForwardPlan):
-                tracked_outputs, memory_baseline = (
-                    self._run_flat_plan_with_memory_tracking(
-                        candidate.plan,
-                        check=candidate.check,
-                        context="forward_micro_batches",
-                    )
-                )
-            else:
-                tracked_outputs, memory_baseline, forward_peak = (
-                    self._execute_split_plan_with_memory_tracking(
-                        candidate.plan,
-                        check=candidate.check,
-                        context="forward_micro_batches",
-                    )
-                )
+            tracked_outputs: list[AnyForwardOutput] = []
+            outputs: list[Any] = []
             flat_outputs = iter(tracked_outputs)
-            outputs = [_unflatten(item, flat_outputs) for item in candidate.inputs]
+            error: BaseException | None = None
+            try:
+                if isinstance(candidate.plan, _FlatForwardPlan):
+                    tracked_outputs, memory_baseline = (
+                        self._run_flat_plan_with_memory_tracking(
+                            candidate.plan,
+                            check=candidate.check,
+                            context="forward_micro_batches",
+                        )
+                    )
+                else:
+                    tracked_outputs, memory_baseline, forward_peak = (
+                        self._execute_split_plan_with_memory_tracking(
+                            candidate.plan,
+                            check=candidate.check,
+                            context="forward_micro_batches",
+                        )
+                    )
+                flat_outputs = iter(tracked_outputs)
+                outputs = [_unflatten(item, flat_outputs) for item in candidate.inputs]
+            except BaseException as exc:
+                error = exc
+            try:
+                self._release_cached_memory_for_backward(candidate.plan, error=error)
+            except BaseException:
+                # Do not retain our completed graph through a new handoff traceback.
+                del tracked_outputs, flat_outputs, outputs
+                raise
+            if backward is not None:
+                backward.attach(tracked_outputs)
             stop = start + candidate.stats_global_count
             if stop < len(items):
                 self._last_global_micro_batch_size = max(
@@ -2454,6 +2475,8 @@ class TrainerRank:
                         subforward_count=candidate.plan.subforward_count,
                     ),
                 )
+            if backward is not None:
+                backward.harvest()
             # The caller normally runs backward while the micro-batch is yielded.
             # Include that peak in future planning; forward-only profiling can
             # otherwise admit a later micro-batch that leaves no collective or
@@ -2532,6 +2555,9 @@ class TrainerRank:
         no_grad: bool | None = None,
     ) -> ForwardOutputs:
         self._guard_forward_collective("dp_rank_forward")
+        backward = self._backward_work()
+        if backward is not None:
+            backward.harvest()
         enabled = torch.is_grad_enabled() if no_grad is None else not no_grad
         with torch.set_grad_enabled(enabled):
             self._reset_planning_telemetry()
@@ -2543,6 +2569,8 @@ class TrainerRank:
             tracked_outputs = self._execute_admitted_plan(
                 plan, check=check, context="dp_rank_forward"
             )
+            if backward is not None:
+                backward.attach(tracked_outputs)
             return _unflatten(materialized, iter(tracked_outputs))
 
     def _execute_admitted_plan(
@@ -2560,6 +2588,7 @@ class TrainerRank:
         self._complete_planner_observation(phase="forward")
         return outputs
 
+    @_backward_region
     def _execute_split_plan_with_memory_tracking(
         self, plan: _SplitForwardPlan, *, check: _MemoryCheck, context: str
     ) -> tuple[list[AnyForwardOutput], int | None, int]:
@@ -4889,6 +4918,7 @@ class TrainerRank:
                 ).append(index)
         return tuple((slot_ref, tuple(indices)) for slot_ref, indices in groups.items())
 
+    @_backward_region
     def _run_flat_plan_with_memory_tracking(
         self,
         plan: _FlatForwardPlan,
@@ -5717,6 +5747,151 @@ class TrainerRank:
         dist.all_reduce(value, op=dist.ReduceOp.MIN)
         return int(value.item())
 
+    def _backward_work(self) -> BackwardWork | None:
+        state = None
+        started = None
+        primary = False
+        try:
+            state = self._recovery_state()
+            started = time.perf_counter_ns()
+            with state.lock:
+                if state.backward is None and not state.invalid:
+                    state.backward = BackwardWork(state.lock, self.device)
+                return state.backward
+        except BaseException as exc:
+            # Unknown accounting cost must never become free recovery budget,
+            # including a failure before state lookup returned.
+            if state is None:
+                state = getattr(self, "_cache_recovery_state", None)
+                if state is None:
+                    state = self._cache_recovery_state = _CacheRecoveryState()
+            state.invalid = True
+            if isinstance(exc, Exception):
+                return None
+            primary = True
+            raise
+        finally:
+            if state is not None and state.backward is not None:
+                # Includes lazy setup and lock wait; constructor overlap is an
+                # intentional conservative charge, not an exact subtraction.
+                state.backward._charge(started, primary=primary)
+
+    @contextmanager
+    def _cache_recovery_episode(
+        self, *, error: BaseException | None = None
+    ) -> Iterator[tuple[object, float | None]]:
+        state = None
+        started = None
+        owner = None
+        primary = error
+        try:
+            try:
+                state = self._recovery_state()
+                started = self._recovery_clock()
+                owner = object()
+                with state.lock:
+                    if state.owner is None:
+                        state.owner = owner
+            except BaseException:
+                # A saved forward failure must still reach the WORLD status
+                # vote. Unknown accounting cost cannot enable later recovery.
+                if state is None:
+                    state = getattr(self, "_cache_recovery_state", None)
+                    if state is None:
+                        state = self._cache_recovery_state = _CacheRecoveryState()
+                state.invalid = True
+                if error is None:
+                    raise
+            yield owner, started
+        except BaseException as exc:
+            primary = exc
+            raise
+        finally:
+            if state is not None:
+                # Includes control, release, resample and repeated search; no idle.
+                try:
+                    finished = self._recovery_clock()
+                    elapsed = (
+                        None
+                        if started is None or finished is None
+                        else finished - started
+                    )
+                    with state.lock:
+                        if (
+                            elapsed is None
+                            or not math.isfinite(elapsed)
+                            or elapsed <= 0
+                            or not math.isfinite(state.cost + elapsed)
+                        ):
+                            state.invalid = True
+                        else:
+                            state.cost += elapsed
+                            state.high = max(state.high, elapsed)
+                        _planner_evidence.record(
+                            self,
+                            "recovery",
+                            "accounted",
+                            elapsed_seconds=elapsed,
+                            local_cumulative_seconds=state.cost,
+                            local_forward_work_seconds=state.work,
+                            local_high_seconds=state.high,
+                            invalid=state.invalid,
+                        )
+                except Exception:
+                    state.invalid = True
+                except BaseException as exc:
+                    state.invalid = True
+                    if primary is None:
+                        primary = exc
+                        raise
+                finally:
+                    try:
+                        with state.lock:
+                            if state.owner is owner:
+                                state.owner = None
+                    except Exception:
+                        state.invalid = True
+                    except BaseException:
+                        state.invalid = True
+                        if primary is None:
+                            raise
+
+    @_backward_region
+    def _release_cached_memory_for_backward(
+        self, plan: _AnyForwardPlan, *, error: BaseException | None = None
+    ) -> None:
+        # Every WORLD wave reaches this before the public iterator skips empty
+        # outputs. Forward has already executed: never replan or retry here.
+        with self._cache_recovery_episode(error=error) as (owner, started):
+            exchange_error: BaseException | None = None
+            try:
+                failed, gradients = self._recovery_reduce(
+                    [
+                        float(error is not None),
+                        float(any(group.grad_enabled for group in plan.groups)),
+                    ],
+                    op="MAX",
+                    sync_across_dp=True,
+                )
+            except BaseException as exc:
+                if error is None:
+                    raise
+                exchange_error = exc
+            if error is not None:
+                raise self._memory_error_with_reduction_note(error, exchange_error)
+            if failed:
+                raise RuntimeError("Forward failed on another rank before handoff")
+            if not gradients:
+                return
+            self._try_cache_recovery(
+                None,
+                sync_across_dp=True,
+                owner=owner,
+                started=started,
+                handoff_grad=any(group.grad_enabled for group in plan.groups),
+            )
+
+    @_backward_region
     def _recover_admission(
         self,
         search: Callable[[], Any],
@@ -5947,14 +6122,7 @@ class TrainerRank:
             return result
         assert refused is not None
         original = refused.error(context)
-        state = self._recovery_state()
-        started = self._recovery_clock()
-        owner = object()
-        with state.lock:
-            if state.owner is None:
-                state.owner = owner
-        primary: BaseException | None = None
-        try:
+        with self._cache_recovery_episode() as (owner, started):
             if not isinstance(value, _ForwardRefusal):
                 # A formerly fitting width is not proof that the minimum cannot fit.
                 value = search()
@@ -5980,55 +6148,6 @@ class TrainerRank:
             assert refused is not None
             self._snapshot_planning_telemetry(refused.plan, refused.check)
             return reject()
-        except BaseException as exc:
-            primary = exc
-            raise
-        finally:
-            # Includes control, release, resample and repeated search; no idle.
-            try:
-                finished = self._recovery_clock()
-                elapsed = (
-                    None if started is None or finished is None else finished - started
-                )
-                with state.lock:
-                    if (
-                        elapsed is None
-                        or not math.isfinite(elapsed)
-                        or elapsed <= 0
-                        or not math.isfinite(state.cost + elapsed)
-                    ):
-                        state.invalid = True
-                    else:
-                        state.cost += elapsed
-                        state.high = max(state.high, elapsed)
-                    _planner_evidence.record(
-                        self,
-                        "recovery",
-                        "accounted",
-                        elapsed_seconds=elapsed,
-                        local_cumulative_seconds=state.cost,
-                        local_work_seconds=state.work,
-                        local_high_seconds=state.high,
-                        invalid=state.invalid,
-                    )
-            except Exception:
-                state.invalid = True
-            except BaseException as exc:
-                state.invalid = True
-                if primary is None:
-                    primary = exc
-                    raise
-            finally:
-                try:
-                    with state.lock:
-                        if state.owner is owner:
-                            state.owner = None
-                except Exception:
-                    state.invalid = True
-                except BaseException:
-                    state.invalid = True
-                    if primary is None:
-                        raise
 
     def _recovery_clock(self) -> float | None:
         try:
@@ -6104,34 +6223,47 @@ class TrainerRank:
 
     def _try_cache_recovery(
         self,
-        check: _MemoryCheck,
+        check: _MemoryCheck | None,
         *,
         sync_across_dp: bool,
         owner: object,
         started: float | None,
+        handoff_grad: bool = False,
     ) -> bool:
         state = self._recovery_state()
+        backward = self._backward_work()
+        if backward is not None:
+            backward.harvest()
         now = self._recovery_clock()
         elapsed = None if now is None or started is None else now - started
         with state.lock:
             invalid = (
                 state.invalid
+                or (backward is not None and backward.invalid)
                 or state.owner is not owner
                 or elapsed is None
                 or not math.isfinite(elapsed)
                 or elapsed < 0
             )
             projected = state.cost if elapsed is None else state.cost + elapsed
+            # B survives forward rollback. O deliberately includes observer spans
+            # also covered by recovery; reductions retain the original topology.
+            work = state.work + (0.0 if backward is None else backward.work_ns / 1e9)
+            accounted_cost = projected + (
+                0.0 if backward is None else backward.cost_ns / 1e9
+            )
             invalid |= any(
                 not math.isfinite(value) or value < 0
                 for value in (
                     projected,
                     state.work,
+                    work,
                     state.high,
                     projected + state.high,
+                    accounted_cost + state.high,
                 )
             )
-            local_cost = [0.0, 0.0] if invalid else [projected, state.high]
+            local_cost = [0.0, 0.0] if invalid else [accounted_cost, state.high]
         # SUM costs deliberately overcharges parallel ranks; unlike MAX of
         # lifetime costs, it cannot miss episodes with different slow ranks.
         costs = self._recovery_reduce(
@@ -6140,8 +6272,8 @@ class TrainerRank:
         invalid |= any(not math.isfinite(value) for value in (*costs, sum(costs)))
         values = self._recovery_reduce(
             [
-                float(check.estimated_required_bytes),
-                0.0 if invalid else state.work,
+                float(check.estimated_required_bytes) if check is not None else 0.0,
+                0.0 if invalid else work,
                 float(state.first_consumed),
                 float(invalid),
             ],
@@ -6155,9 +6287,11 @@ class TrainerRank:
             self,
             "recovery",
             "budget_observed",
-            local_projected_seconds=projected,
+            local_projected_seconds=accounted_cost,
             local_high_seconds=state.high,
-            local_work_seconds=state.work,
+            local_work_seconds=work,
+            local_recovery_seconds=projected,
+            local_forward_work_seconds=state.work,
             reduced_cost_seconds=costs[0],
             reduced_high_seconds=costs[1],
             reduced_work_seconds=values[1],
@@ -6175,16 +6309,20 @@ class TrainerRank:
         needed = False
         cap_blocks = False
         try:
-            available = self._available_memory_bytes()
+            available = self._available_memory_bytes() if check is not None else 0
             if (
-                available < required
+                (available < required if check is not None else handoff_grad)
                 and self.device.type == "cuda"
                 and torch.cuda.is_available()
                 and torch.cuda.get_allocator_backend() == "native"
             ):
                 free, total = torch.cuda.mem_get_info(self.device)
                 needed = int(free) < required + int(total * _MEMORY_RESERVE_FRACTION)
-                if os.environ.get(_TEST_HOOKS_ENV) == "1":
+                if check is None:
+                    needed &= int(torch.cuda.memory_reserved(self.device)) > int(
+                        torch.cuda.memory_allocated(self.device)
+                    )
+                elif os.environ.get(_TEST_HOOKS_ENV) == "1":
                     limit = os.environ.get(_TEST_MEMORY_LIMIT_ENV)
                     if limit:
                         cap_blocks = required > max(
@@ -6221,15 +6359,15 @@ class TrainerRank:
             self,
             "recovery",
             "sampled",
-            local_available_bytes=available,
-            reduced_available_bytes=sampled[0],
+            local_available_bytes=available if check is not None else None,
+            reduced_available_bytes=sampled[0] if check is not None else None,
             local_needed=needed,
             any_needed=bool(-sampled[1]),
             local_cap_blocks=cap_blocks,
             cap_permits=bool(sampled[2]),
             invalid=state.invalid,
         )
-        if required <= sampled[0]:
+        if check is not None and required <= sampled[0]:
             _planner_evidence.record(
                 self, "recovery", "skipped", reason="fresh_sample_fits"
             )
@@ -6257,19 +6395,47 @@ class TrainerRank:
                 # physical condition again immediately before the sole call.
                 free, total = torch.cuda.mem_get_info(self.device)
                 if int(free) < required + int(total * _MEMORY_RESERVE_FRACTION):
-                    attempted = True
-                    _planner_evidence.record(
-                        self,
-                        "cache_release",
-                        "attempted",
-                        physical_free_bytes=int(free),
-                        physical_total_bytes=int(total),
-                        required_bytes=required,
-                        reserve_bytes=int(total * _MEMORY_RESERVE_FRACTION),
-                    )
-                    torch.cuda.empty_cache()
-                    _planner_evidence.record(self, "cache_release", "completed")
-            available = self._available_memory_bytes()
+                    if check is not None:
+                        attempted = True
+                        _planner_evidence.record(
+                            self,
+                            "cache_release",
+                            "attempted",
+                            physical_free_bytes=int(free),
+                            physical_total_bytes=int(total),
+                            required_bytes=required,
+                            reserve_bytes=int(total * _MEMORY_RESERVE_FRACTION),
+                        )
+                        torch.cuda.empty_cache()
+                        _planner_evidence.record(self, "cache_release", "completed")
+                    else:
+                        allocated = int(torch.cuda.memory_allocated(self.device))
+                        reserved = int(torch.cuda.memory_reserved(self.device))
+                        if reserved > allocated:
+                            # A soft trigger, not calibrated library demand. The
+                            # native release affects unused caches process-wide.
+                            evidence = dict(
+                                device=str(self.device),
+                                reserve_trigger_bytes=int(
+                                    total * _MEMORY_RESERVE_FRACTION
+                                ),
+                                physical_free_before_bytes=int(free),
+                                allocated_bytes=allocated,
+                                reserved_before_bytes=reserved,
+                            )
+                            with _telemetry_phase(
+                                "gradient_handoff_cache_release", evidence
+                            ):
+                                attempted = True
+                                with torch.cuda.device(self.device):
+                                    torch.cuda.empty_cache()
+                                evidence["physical_free_after_bytes"] = int(
+                                    torch.cuda.mem_get_info(self.device)[0]
+                                )
+                                evidence["reserved_after_bytes"] = int(
+                                    torch.cuda.memory_reserved(self.device)
+                                )
+            available = self._available_memory_bytes() if check is not None else 0
         except BaseException as exc:
             error, available = exc, -1
         exchange_error: BaseException | None = None
@@ -6296,16 +6462,22 @@ class TrainerRank:
             raise self._memory_error_with_reduction_note(error, exchange_error)
         if sampled[0] < 0:
             raise RuntimeError("Memory recovery failed on another rank")
-        # Rebuild pure search caches even when this fresh sample decreased.
+        # Admission rebuilds pure search caches even when the sample decreased.
+        # Handoff ignores this return: denied/insufficient recovery still yields
+        # the completed outputs, with no claim that backward will fit.
         _planner_evidence.record(
             self,
             "recovery",
             "completed",
             attempted=attempted,
-            local_before_available_bytes=before_available,
-            local_after_available_bytes=available,
-            observed_available_delta_bytes=available - before_available,
-            reduced_available_bytes=sampled[0],
+            local_before_available_bytes=before_available
+            if check is not None
+            else None,
+            local_after_available_bytes=available if check is not None else None,
+            observed_available_delta_bytes=(
+                available - before_available if check is not None else None
+            ),
+            reduced_available_bytes=sampled[0] if check is not None else None,
         )
         return True
 
