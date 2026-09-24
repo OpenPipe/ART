@@ -83,7 +83,10 @@ def test_same_old_signature_different_gradient_rows():
     r = rank()
     a = r._estimate_flat_forward(requests())
     b = r._estimate_flat_forward(requests(15360, 1024))
-    assert a[:3] == b[:3]
+    # Same packed rows and signature; only gradient rows, and so the gradients
+    # of their hidden-state outputs, differ.
+    assert (a[0], a[2]) == (b[0], b[2])
+    assert (a[1], b[1]) == (4096 * (2 * 1024 + 15360), 4096 * (2 * 15360 + 1024))
     assert a[3] == ((1024, True), (15360, False))
     assert b[3] == ((15360, True), (1024, False))
     assert (

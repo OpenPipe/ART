@@ -3817,10 +3817,10 @@ def test_forward_plan_estimates_output_memory_for_request_combo() -> None:
     plan = trainer._plan_flat_forward([request])
     estimate = trainer._estimate_flat_forward([request])
 
-    target_bytes = 3 * 2 * 4
+    target_bytes = 3 * 2 * (4 + 8)  # logprobs plus the head's wide-label copy
     topk_bytes = 3 * 5 * (4 + 8)
-    logits_bytes = 3 * 10 * 4
-    hidden_bytes = 3 * 4 * 4
+    logits_bytes = 2 * 3 * 10 * 4  # dense outputs plus their training gradients
+    hidden_bytes = 2 * 3 * 4 * 4
     assert estimate is not None and estimate[0] == plan.packed_tokens
     assert plan.output_bytes == target_bytes + topk_bytes + logits_bytes + hidden_bytes
 

@@ -210,7 +210,6 @@ def test_exact_selector_estimate_matches_executed_layout():
                 packed_tokens=n,
                 output_bytes=out,
                 signature=sig,
-                logical_tokens=plan.active_logical_tokens,
                 group_rows=groups,
                 head_workspace_bytes=head,
             )

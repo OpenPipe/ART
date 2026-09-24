@@ -6684,20 +6684,29 @@ class TrainerRank:
         total = 0
         for request in requests:
             seq_len = int(request.input_tokens.numel())
+            # Profiles are per packed token, so memory that grows with logical
+            # rows is priced here: wide label copies and training gradients of
+            # dense outputs.
             if request.target_tokens is not None:
-                total += int(request.target_tokens.numel()) * _dtype_size(torch.float32)
+                targets = int(request.target_tokens.numel())
+                total += targets * _dtype_size(torch.float32)
+                if request.target_tokens.ndim > 1:
+                    total += targets * _dtype_size(torch.long)
             if request.top_k is not None:
                 total += (
                     seq_len
                     * int(request.top_k)
                     * (_dtype_size(torch.float32) + _dtype_size(torch.long))
                 )
+            copies = 1 if request.no_grad else 2
             if request.logits:
                 if self._padded_vocab_size is None:
                     raise RuntimeError("logits output memory requires a GPT model")
-                total += seq_len * self._padded_vocab_size * self._param_dtype_size
+                total += (
+                    copies * seq_len * self._padded_vocab_size * self._param_dtype_size
+                )
             if request.hidden_states:
-                total += seq_len * self._hidden_size * self._param_dtype_size
+                total += copies * seq_len * self._hidden_size * self._param_dtype_size
         return total
 
     def _memory_signature_from_requests(

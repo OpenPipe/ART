@@ -156,7 +156,7 @@ def test_inactive_observation_cannot_discount_later_shared_active_work(monkeypat
     # Identical observed GPU work must produce identical future admission.
     # Sharing adds logical outputs, not packed activations.
     assert checks[0] == checks[1]
-    assert checks[0].estimated_required_bytes == 11_985
+    assert checks[0].estimated_required_bytes == 12_971
     assert checks[0].fits
 
 

@@ -1109,7 +1109,7 @@ def test_warm_rounding_preserves_native_split_bound_and_exact_budget(
 
 
 @pytest.mark.parametrize("retained", (None, 0, 7864321 / 15))
-def test_normalized_warm_profile_is_monotone_through_ratio_floor(
+def test_normalized_warm_profile_is_monotone_in_packed_tokens(
     monkeypatch: pytest.MonkeyPatch, retained: float | None
 ) -> None:
     rank = _retained_ratio_rank(monkeypatch)
@@ -1117,8 +1117,8 @@ def test_normalized_warm_profile_is_monotone_through_ratio_floor(
     rank._memory_profiles[signature] = _MemoryProfile(
         7864330 / 15, 1000, 15 / 13, retained_compute_bytes_per_token=retained
     )
-    # All counts satisfy the retained guard. The logical term dominates until
-    # N=104, then packed-token growth dominates. Check every integer count.
+    # All counts satisfy the retained guard; logical rows no longer scale the
+    # profile, so cost must grow monotonically with packed rows. Check each count.
     costs = [
         rank._subforward_cost(
             packed_tokens=packed,

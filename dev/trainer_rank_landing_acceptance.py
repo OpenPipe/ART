@@ -649,7 +649,6 @@ def phase_split_conversion(evidence: str | None, pressure: str) -> None:
                 packed_tokens=plan.packed_tokens,
                 output_bytes=plan.output_bytes,
                 signature=plan.signature,
-                logical_tokens=plan.logical_tokens,
             )
 
         def parity(
@@ -1864,7 +1863,6 @@ def phase_dp2_tp2_waves(evidence: str | None) -> None:
             packed_tokens=plan.packed_tokens,
             output_bytes=plan.output_bytes,
             signature=plan.signature,
-            logical_tokens=plan.logical_tokens,
         )
         torch.cuda.synchronize()
         cap = int(torch.cuda.memory_allocated()) + int(per_item * 2.5)
