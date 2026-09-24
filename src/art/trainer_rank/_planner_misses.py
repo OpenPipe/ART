@@ -3,13 +3,19 @@
 The sink must enqueue paths, not upload on the training thread. Reports survive
 sink failure and are JSON only; CPU replay never loads a checkpoint or executes
 training. In particular an OOM's partial peak is not a completed measurement.
+
+Grouped-plan reports retain observed cost components and plan provenance, but
+estimator replay is incomplete until immutable model/slot eligibility and
+head/checkpoint/GDN inputs can be reconstructed. Scalar ungrouped estimates use
+the maintained arithmetic and a frozen MoE stage inventory; recorded totals are
+comparison targets, never replacements for missing estimator inputs.
 """
 
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from contextlib import nullcontext
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 import hashlib
 from itertools import islice
@@ -43,6 +49,7 @@ _SOURCE_NAMES = (
     "_prefix_tree_planner.py",
     "_prefix_tree_performance_search.py",
     "_planner_misses.py",
+    "_gdn_memory.py",
     "_planner_evidence.py",
     "_planner_retention.py",
 )
@@ -515,8 +522,35 @@ class Reporter:
 _RANK_FIELDS = frozenset(
     "num_layers hidden_size param_dtype_size recompute_granularity "
     "sequence_parallel attention_output_gate mlp_activation_factor gdn_layers "
-    "checkpointed_moe_layers recompute_modules moe_output_bytes_per_token".split()
+    "checkpointed_moe_layers recompute_modules moe_output_bytes_per_token "
+    "moe_forward_stages".split()
 )
+
+
+def _signature_values(values: dict[str, Any]) -> dict[str, Any]:
+    values = dict(values)
+    for name in ("topology", "planner_coefficients", "request_mix", "grad_modes"):
+        values[name] = tuple(values[name])
+    slots = []
+    raw_slots = values.get("slot_shapes", ())
+    if not isinstance(raw_slots, (list, tuple)):
+        raise ValueError("invalid slot_shapes container")
+    for entry in raw_slots:
+        if not isinstance(entry, (list, tuple)) or len(entry) != 2:
+            raise ValueError("invalid slot_shapes entry")
+        enabled, shapes = entry
+        if type(enabled) is not bool or not isinstance(shapes, (list, tuple)):
+            raise ValueError("invalid slot_shapes types")
+        normalized = []
+        for shape in shapes:
+            if not isinstance(shape, (list, tuple)) or any(
+                type(dim) is not int or dim < 0 for dim in shape
+            ):
+                raise ValueError("invalid slot_shapes dimensions")
+            normalized.append(tuple(shape))
+        slots.append((enabled, tuple(normalized)))
+    values["slot_shapes"] = tuple(slots)
+    return values
 
 
 def replay(
@@ -528,6 +562,13 @@ def replay(
     prefix layouts. It does not rerun distributed admission or reproduce GPU
     execution, allocator fragmentation, or an OOM without the referenced model.
     """
+    if report.get("format") not in (1, 2) or report.get("kind") != "art-planner-miss":
+        raise ValueError("unsupported planner report")
+    if not report.get("replay_complete"):
+        raise ValueError(
+            "report has incomplete replay inputs: "
+            + "; ".join(report.get("incomplete_reasons", []))
+        )
     from . import _impl
     from ._planner_cost import ModelGeometry
     from ._prefix_tree_planner import (
@@ -535,10 +576,6 @@ def replay(
         plan_prefix_tree_layout,
     )
 
-    if report.get("format") not in (1, 2) or report.get("kind") != "art-planner-miss":
-        raise ValueError("unsupported planner report")
-    if not report.get("replay_complete"):
-        raise ValueError("report has incomplete replay inputs")
     payload = report["replay"]
     source_matches = payload["source_files"] == _source_files()
     if not source_matches and not allow_source_drift:
@@ -550,38 +587,54 @@ def replay(
         raise ValueError("memory replay has no candidate estimates")
     values = state["rank"]
     if set(values) != _RANK_FIELDS | {"geometry", "topology"}:
-        raise ValueError("memory replay rank fields differ")
+        raise ValueError(
+            "incomplete replay: immutable rank fields differ (including MoE stages)"
+        )
     rank = _impl.TrainerRank.__new__(_impl.TrainerRank)
     for name in _RANK_FIELDS:
         setattr(rank, "_" + name, values[name])
+    rank._moe_forward_stages = tuple(tuple(row) for row in values["moe_forward_stages"])
     rank._geometry = ModelGeometry(**values["geometry"])
     dp, tp, cp, pp = values["topology"]
     rank._topology_key = lambda: (dp, tp, cp, pp)
     estimates = []
     costs = []
     for item in state["estimates"]:
-        signature = dict(item["signature"])
-        for name in ("topology", "planner_coefficients", "request_mix", "grad_modes"):
-            signature[name] = tuple(signature[name])
-        key = _impl._MemorySignature(**signature)
+        if "cost_components" not in item:
+            raise ValueError("incomplete replay: expected cost components unavailable")
+        arguments = item["arguments"]
+        # Only the scalar, ungrouped estimator is currently reconstructible.
+        # Even an observed zero floor cannot prove runtime eligibility declined.
+        if (
+            item.get("missing_inputs")
+            or arguments.get("group_rows") not in ([], ())
+            or arguments.get("slot_refs")
+            or arguments.get("head_workspace_bytes", 0)
+            or any(arguments.get("checkpoint_floor", (0, 0)))
+        ):
+            raise ValueError(
+                "incomplete replay: immutable runtime estimator facts unavailable"
+            )
+        key = _impl._MemorySignature(**_signature_values(item["signature"]))
         rank._memory_profiles = (
             {key: _impl._MemoryProfile(**item["profile"])}
             if item["profile"] is not None
             else {}
         )
-        cost = rank._subforward_cost(signature=key, **item["arguments"])
+        cost = rank._subforward_cost(signature=key, **arguments)
         costs.append(cost)
         estimates.append(
             {
                 "required_bytes": cost.required,
                 "retained_bytes": cost.retained,
                 "matches": cost.required == item["expected_required_bytes"]
-                and cost.retained == item["retained_bytes"],
+                and cost.retained == item["retained_bytes"]
+                and asdict(cost) == item["cost_components"],
             }
         )
     safety = _impl._MEMORY_SAFETY_FACTOR
     required = max(
-        sum(cost.retained for cost in costs) + max(cost.ephemeral for cost in costs),
+        rank._split_required_memory(costs),
         int(payload["split_memory_floor_bytes"] * safety),
     )
     predicted = round(required / safety)

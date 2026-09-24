@@ -1,5 +1,6 @@
 """CPU admission contracts; injected observations are not GPU peak measurements."""
 
+import builtins
 from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any, cast
@@ -272,3 +273,42 @@ def test_empirical_estimate_survives_packed_trust_boundary(logical_ratio):
     assert not rank._all_ranks_have_memory_profile(
         packed_tokens=800, signature=observed.signature
     )
+
+
+@pytest.mark.parametrize(
+    "method,argument,fallback",
+    [
+        ("_head_workspace_bytes", 8, 0),
+        ("_checkpoint_memory_floor", ((8, True),), (0, 0)),
+    ],
+)
+@pytest.mark.parametrize(
+    "error,unavailable",
+    [
+        (ModuleNotFoundError("absent package", name="megatron"), True),
+        (ModuleNotFoundError("missing dependency", name="transformer_engine"), False),
+        (ModuleNotFoundError("partial installation", name="megatron.core"), False),
+        (ModuleNotFoundError("unspecified missing module"), False),
+        (ImportError("missing imported class"), False),
+        (RuntimeError("module initialization failed"), False),
+    ],
+    ids=["absent", "transitive", "partial", "unspecified", "class", "runtime"],
+)
+def test_optional_megatron_memory_guards(
+    monkeypatch, method, argument, fallback, error, unavailable
+):
+    rank = _rank()
+    original_import = builtins.__import__
+
+    def importing(name, *args, **kwargs):
+        if name.partition(".")[0] == "megatron":
+            raise error
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", importing)
+    if unavailable:
+        assert getattr(rank, method)(argument) == fallback
+    else:
+        with pytest.raises(type(error)) as caught:
+            getattr(rank, method)(argument)
+        assert caught.value is error
