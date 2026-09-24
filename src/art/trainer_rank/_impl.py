@@ -1791,6 +1791,13 @@ class TrainerRank:
             )
 
         self._recompute_granularity = memory_field("recompute_granularity", None)
+        # ART's default full/uniform/1: forward keeps only layer inputs and
+        # backward recomputes one layer at a time. Unset means that default.
+        self._one_layer_recompute = (
+            self._recompute_granularity == "full"
+            and memory_field("recompute_method", None) in (None, "uniform")
+            and memory_field("recompute_num_layers", None) in (None, 1)
+        )
         self._recompute_modules: frozenset[str] = frozenset(
             memory_field("recompute_modules", ()) or ()
         )
@@ -4053,7 +4060,9 @@ class TrainerRank:
         if ratio > profile.logical_per_packed * _MEMORY_PROFILE_TRUST_GROWTH:
             return required
         rate = profile.retained_compute_bytes_per_token
-        if _packed_priced(signature, profile) and rate >= _packed_rate_floor(profile):
+        if _packed_priced(
+            signature, profile, self._one_layer_recompute
+        ) and rate >= _packed_rate_floor(profile):
             # Saved head indices and masks stay live until backward.
             retained_compute = rate * packed_tokens + _packed_row_bytes(
                 profile, packed_tokens, logical_tokens
@@ -6108,6 +6117,7 @@ class TrainerRank:
                     "hidden_size",
                     "param_dtype_size",
                     "recompute_granularity",
+                    "one_layer_recompute",
                     "sequence_parallel",
                     "attention_output_gate",
                     "mlp_activation_factor",
@@ -7772,7 +7782,9 @@ class TrainerRank:
         # cancelling packed tokens through two float operations can otherwise
         # make a larger warm layout cheaper.
         profiled_tokens: int | float = packed_tokens
-        packed_priced = profiled is not None and _packed_priced(signature, profiled)
+        packed_priced = profiled is not None and _packed_priced(
+            signature, profiled, self._one_layer_recompute
+        )
         if profiled is not None and logical_tokens is not None and not packed_priced:
             profiled_tokens = max(
                 packed_tokens, logical_tokens / profiled.logical_per_packed
@@ -7789,15 +7801,9 @@ class TrainerRank:
                     profiled.bytes_per_token * profiled_tokens
                     + (
                         _packed_row_bytes(profiled, packed_tokens, logical_tokens)
-                        # Branch states grow with segments, not packed rows: one
-                        # recomputed layer at a time, or every GDN layer.
-                        + gdn_segments
-                        * self._gdn_segment_layer_bytes()
-                        * (
-                            1
-                            if self._recompute_granularity == "full"
-                            else min(self._num_layers, self._gdn_layers)
-                        )
+                        # Branch states grow with segments, not packed rows;
+                        # backward recomputes one layer at a time.
+                        + gdn_segments * self._gdn_segment_layer_bytes()
                         if packed_priced and logical_tokens is not None
                         else 0
                     )
@@ -8750,9 +8756,14 @@ def _packed_rate_floor(profile: "_MemoryProfile") -> float:
     return 2 * _PACKED_PRICED_LOGICAL_ROW_BYTES * profile.logical_per_packed
 
 
-def _packed_priced(signature: "_MemorySignature", profile: "_MemoryProfile") -> bool:
+def _packed_priced(
+    signature: "_MemorySignature", profile: "_MemoryProfile", one_layer_recompute: bool
+) -> bool:
+    # Measured only under one-layer full recompute: other recompute modes keep
+    # more GDN states and activations live per segment and logical row.
     return (
-        bool(signature.grad_modes)
+        one_layer_recompute
+        and bool(signature.grad_modes)
         and all(signature.grad_modes)
         and _PACKED_PRICED_MIXES.issuperset(signature.request_mix)
         and profile.bytes_per_token >= _packed_rate_floor(profile)

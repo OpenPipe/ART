@@ -396,8 +396,9 @@ def test_packed_pricing_is_limited_to_grad_single_target_mixes():
         gdn_value_head_dim=4,
         gdn_conv_kernel=4,
     )
-    live = 1 if rank._recompute_granularity == "full" else rank._gdn_layers
-    assert live * rank._gdn_segment_layer_bytes() > 0
+    # 2 states x 4 B x Hv=2 x dk=4 x dv=4, plus 2 B conv history of 16 rows x 3.
+    assert rank._gdn_segment_layer_bytes() == 2 * (4 * 2 * 4 * 4 + 2 * 16 * 3)
+    live = 1
 
     def segments(count):
         return rank._estimate_required_memory_bytes_from_values(
@@ -411,6 +412,10 @@ def test_packed_pricing_is_limited_to_grad_single_target_mixes():
     assert segments(3) - segments(0) == pytest.approx(
         3 * live * rank._gdn_segment_layer_bytes() * 1.1, abs=1
     )
+    # Other recompute modes keep more live per segment and row: extrapolate.
+    rank._one_layer_recompute = False
+    assert estimate("single") == int(100_000 * 32 * 1.1)
+    rank._one_layer_recompute = True
     # Flattened-axis wide labels are not single-target.
     tokens = torch.arange(4).reshape(1, 4)
     wide = ForwardInput(input_tokens=tokens, target_tokens=torch.zeros(4, 3).long())

@@ -250,6 +250,7 @@ def test_replay_reruns_real_memory_estimator_and_prefix_layout(tmp_path):
             "hidden_size": 8,
             "param_dtype_size": 2,
             "recompute_granularity": "full",
+            "one_layer_recompute": True,
             "sequence_parallel": False,
             "attention_output_gate": False,
             "mlp_activation_factor": 3,

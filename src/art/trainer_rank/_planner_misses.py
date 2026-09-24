@@ -521,7 +521,8 @@ class Reporter:
 
 _RANK_FIELDS = frozenset(
     "num_layers hidden_size param_dtype_size recompute_granularity "
-    "sequence_parallel attention_output_gate mlp_activation_factor gdn_layers "
+    "one_layer_recompute sequence_parallel attention_output_gate "
+    "mlp_activation_factor gdn_layers "
     "checkpointed_moe_layers recompute_modules moe_output_bytes_per_token "
     "moe_forward_stages".split()
 )
