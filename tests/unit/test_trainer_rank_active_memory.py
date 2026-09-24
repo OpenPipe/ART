@@ -15,6 +15,7 @@ from art.trainer_rank import (
     TrainerRankMemoryError,
     Unset,
 )
+from art.trainer_rank._impl import _PACKED_PRICED_LOGICAL_ROW_BYTES, _request_mix_key
 
 
 class _Model(torch.nn.Module):
@@ -269,7 +270,8 @@ def test_empirical_estimate_survives_packed_trust_boundary(logical_ratio):
     ]
     assert values == sorted(values)
     rate = rank._memory_profiles[observed.signature].bytes_per_token
-    assert values[-1] == int((800 * 4 + rate * 800) * 1.1)
+    row = _PACKED_PRICED_LOGICAL_ROW_BYTES * 800 * (logical_ratio - 1)
+    assert values[-1] == int((800 * 4 + rate * 800 + row) * 1.1)
     assert not rank._all_ranks_have_memory_profile(
         packed_tokens=800, signature=observed.signature
     )
@@ -312,3 +314,38 @@ def test_optional_megatron_memory_guards(
         with pytest.raises(type(error)) as caught:
             getattr(rank, method)(argument)
         assert caught.value is error
+
+
+def test_packed_pricing_is_limited_to_grad_single_target_mixes():
+    rank = _rank()
+    observed = rank._plan_flat_forward(_requests("target_tokens"))
+    rank._update_memory_profile(observed, 10_000, retained_bytes=1000)
+    single = observed.signature
+    assert single.grad_modes == (True,)
+    assert rank._memory_profiles[single].logical_per_packed == 1
+    excluded = (
+        replace(single, grad_modes=(False,)),
+        replace(single, request_mix=("hidden",)),
+        replace(single, request_mix=("target:(2,)",)),
+    )
+    for signature in excluded:
+        rank._memory_profiles[signature] = rank._memory_profiles[single]
+
+    def estimate(signature, logical_tokens=64):
+        return rank._estimate_required_memory_bytes_from_values(
+            packed_tokens=8,
+            logical_tokens=logical_tokens,
+            output_bytes=0,
+            signature=signature,
+        )
+
+    # No-grad, dense-output and wide-label signatures keep the logical/packed
+    # extrapolation; single-target sharing adds only per-row head buffers.
+    assert all(estimate(single) < estimate(signature) for signature in excluded)
+    assert estimate(single, 72) - estimate(single, 64) == pytest.approx(
+        8 * _PACKED_PRICED_LOGICAL_ROW_BYTES * 1.1, abs=1
+    )
+    # Flattened-axis wide labels are not single-target.
+    tokens = torch.arange(4).reshape(1, 4)
+    wide = ForwardInput(input_tokens=tokens, target_tokens=torch.zeros(4, 3).long())
+    assert _request_mix_key(wide) == "target:(3,)"

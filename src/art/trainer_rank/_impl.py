@@ -4054,7 +4054,7 @@ class TrainerRank:
             return required
         tokens = (
             packed_tokens
-            if _PACKED_PRICED_MIXES.issuperset(signature.request_mix)
+            if _packed_priced(signature)
             else max(packed_tokens, logical_tokens / profile.logical_per_packed)
         )
         retained = output_bytes + max(
@@ -7785,11 +7785,8 @@ class TrainerRank:
         # cancelling packed tokens through two float operations can otherwise
         # make a larger warm layout cheaper.
         profiled_tokens: int | float = packed_tokens
-        if (
-            profiled is not None
-            and logical_tokens is not None
-            and not _PACKED_PRICED_MIXES.issuperset(signature.request_mix)
-        ):
+        packed_priced = _packed_priced(signature)
+        if profiled is not None and logical_tokens is not None and not packed_priced:
             profiled_tokens = max(
                 packed_tokens, logical_tokens / profiled.logical_per_packed
             )
@@ -7801,7 +7798,15 @@ class TrainerRank:
         else:
             compute = max(
                 static_compute,
-                int(profiled.bytes_per_token * profiled_tokens),
+                int(profiled.bytes_per_token * profiled_tokens)
+                + (
+                    _PACKED_PRICED_LOGICAL_ROW_BYTES
+                    * max(
+                        0, logical_tokens - packed_tokens * profiled.logical_per_packed
+                    )
+                    if packed_priced and logical_tokens is not None
+                    else 0
+                ),
             )
         return int((output_bytes + compute) * _MEMORY_SAFETY_FACTOR)
 
@@ -8711,16 +8716,33 @@ def _active_logical_tokens(requests: Sequence[AnyForwardInput]) -> int:
     )
 
 
-# Measured flat per packed row across sharing ratios; wide labels and dense or
-# top-k outputs keep the conservative logical/packed ratio extrapolation.
+# Grad-enabled single-target training measured flat per packed row across
+# sharing ratios. Wide labels, dense or top-k outputs and no_grad forwards (whose
+# GDN branch states are uncharged) keep the logical/packed ratio extrapolation.
 _PACKED_PRICED_MIXES = frozenset({"target:single", "inactive"})
+# The head's label copies, positions, row-match vectors and saved masks (about
+# 80-100 B) grow with logical rows. Under packed pricing, charge rows beyond the
+# profile's observed sharing with margin.
+_PACKED_PRICED_LOGICAL_ROW_BYTES = 128
+
+
+def _packed_priced(signature: "_MemorySignature") -> bool:
+    return signature.grad_modes == (True,) and _PACKED_PRICED_MIXES.issuperset(
+        signature.request_mix
+    )
 
 
 def _request_mix_key(request: AnyForwardInput) -> str:
     parts = []
     if request.target_tokens is not None:
-        target = request.target_tokens
-        tail_shape = tuple(target.shape[request.input_tokens.ndim :])
+        target, inputs = request.target_tokens, request.input_tokens
+        # Match _forward_item: trailing target dims follow the input shape or a
+        # flattened token axis.
+        tail_shape = tuple(
+            target.shape[inputs.ndim :]
+            if target.shape[: inputs.ndim] == inputs.shape
+            else target.shape[1:]
+        )
         parts.append(f"target:{tail_shape or 'single'}")
     if request.top_k is not None:
         parts.append(f"topk:{int(request.top_k)}")
