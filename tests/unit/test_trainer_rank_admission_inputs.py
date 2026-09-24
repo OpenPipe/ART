@@ -28,6 +28,7 @@ def record_prices(monkeypatch, rank):
 def assert_plan_values(rank, plan, values):
     assert values["packed_tokens"] == plan.packed_tokens
     assert values["output_bytes"] == plan.output_bytes
+    assert values["logical_tokens"] == plan.active_logical_tokens
     assert values["signature"] == plan.signature
     assert values["gdn_segments"] == plan.grad_segment_count
     assert values["group_rows"] == rank._plan_group_rows(plan)

@@ -3976,6 +3976,7 @@ class TrainerRank:
             packed_tokens=packed_tokens,
             output_bytes=output_bytes,
             signature=signature,
+            logical_tokens=logical_tokens,
             gdn_segments=gdn_segments,
             group_rows=group_rows,
             slot_refs=slot_refs,
@@ -4051,9 +4052,14 @@ class TrainerRank:
         ratio = logical_tokens / max(1, packed_tokens)
         if ratio > profile.logical_per_packed * _MEMORY_PROFILE_TRUST_GROWTH:
             return required
+        tokens = (
+            packed_tokens
+            if _PACKED_PRICED_MIXES.issuperset(signature.request_mix)
+            else max(packed_tokens, logical_tokens / profile.logical_per_packed)
+        )
         retained = output_bytes + max(
             checkpoint_retained_bytes,
-            profile.retained_compute_bytes_per_token * packed_tokens,
+            profile.retained_compute_bytes_per_token * tokens,
         )
         return min(required, int(retained * _MEMORY_SAFETY_FACTOR))
 
@@ -5023,6 +5029,7 @@ class TrainerRank:
                         packed_tokens=packed_tokens,
                         output_bytes=output_bytes,
                         signature=signature,
+                        logical_tokens=logical_tokens,
                         # A radix tree has fewer than twice as many segments as
                         # active requests; the exact plan uses its actual count.
                         gdn_segments=2
@@ -6684,29 +6691,20 @@ class TrainerRank:
         total = 0
         for request in requests:
             seq_len = int(request.input_tokens.numel())
-            # Profiles are per packed token, so memory that grows with logical
-            # rows is priced here: wide label copies and training gradients of
-            # dense outputs.
             if request.target_tokens is not None:
-                targets = int(request.target_tokens.numel())
-                total += targets * _dtype_size(torch.float32)
-                if request.target_tokens.ndim > 1:
-                    total += targets * _dtype_size(torch.long)
+                total += int(request.target_tokens.numel()) * _dtype_size(torch.float32)
             if request.top_k is not None:
                 total += (
                     seq_len
                     * int(request.top_k)
                     * (_dtype_size(torch.float32) + _dtype_size(torch.long))
                 )
-            copies = 1 if request.no_grad else 2
             if request.logits:
                 if self._padded_vocab_size is None:
                     raise RuntimeError("logits output memory requires a GPT model")
-                total += (
-                    copies * seq_len * self._padded_vocab_size * self._param_dtype_size
-                )
+                total += seq_len * self._padded_vocab_size * self._param_dtype_size
             if request.hidden_states:
-                total += copies * seq_len * self._hidden_size * self._param_dtype_size
+                total += seq_len * self._hidden_size * self._param_dtype_size
         return total
 
     def _memory_signature_from_requests(
@@ -6796,6 +6794,7 @@ class TrainerRank:
                 packed_tokens=forward.packed_tokens,
                 output_bytes=forward.output_bytes,
                 signature=forward.signature,
+                logical_tokens=forward.active_logical_tokens,
                 gdn_segments=forward.grad_segment_count,
                 group_rows=self._plan_group_rows(forward),
                 slot_refs=tuple(g.slot_ref for g in forward.groups),
@@ -7641,6 +7640,7 @@ class TrainerRank:
         packed_tokens: int,
         output_bytes: int,
         signature: _MemorySignature,
+        logical_tokens: int | None = None,
         gdn_segments: int = 0,
         group_rows: tuple[tuple[int, bool], ...] = (),
         slot_refs: tuple["LoRASlotRef | None", ...] | None = None,
@@ -7779,16 +7779,29 @@ class TrainerRank:
             # Local head results coexist with full CP outputs during gathering.
             # Uneven rank plans can assign all of an item's rows to one rank.
             static_compute += output_bytes
+        # Outputs that grow with logical rows make a profile learned under
+        # lighter sharing underestimate a deeper-shared plan; scale the trusted
+        # estimate up by the ratio gap for them. Normalize before multiplying:
+        # cancelling packed tokens through two float operations can otherwise
+        # make a larger warm layout cheaper.
+        profiled_tokens: int | float = packed_tokens
+        if (
+            profiled is not None
+            and logical_tokens is not None
+            and not _PACKED_PRICED_MIXES.issuperset(signature.request_mix)
+        ):
+            profiled_tokens = max(
+                packed_tokens, logical_tokens / profiled.logical_per_packed
+            )
         # The trust window limits calibration growth, not the empirical floor.
         # Dropping that floor beyond the window can admit a larger request that
         # was refused just inside it, even below a previously observed peak.
-        # Measured peaks scale with packed tokens, not with the sharing ratio.
         if profiled is None:
             compute = static_compute
         else:
             compute = max(
                 static_compute,
-                int(profiled.bytes_per_token * packed_tokens),
+                int(profiled.bytes_per_token * profiled_tokens),
             )
         return int((output_bytes + compute) * _MEMORY_SAFETY_FACTOR)
 
@@ -8696,6 +8709,11 @@ def _active_logical_tokens(requests: Sequence[AnyForwardInput]) -> int:
         or request.top_k is not None
         or request.hidden_states
     )
+
+
+# Measured flat per packed row across sharing ratios; wide labels and dense or
+# top-k outputs keep the conservative logical/packed ratio extrapolation.
+_PACKED_PRICED_MIXES = frozenset({"target:single", "inactive"})
 
 
 def _request_mix_key(request: AnyForwardInput) -> str:
