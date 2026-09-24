@@ -550,11 +550,12 @@ def test_retained_compute_keeps_growth_and_sharing_trust_limits(
     rank._update_memory_profile(plan, 100_000, retained_bytes=None)
     unknown = rank._plan_cost(candidate)
     assert unknown.retained == unknown.required
-    rank._update_memory_profile(plan, 100_000, retained_bytes=60_000)
+    # A retained rate of 260 B clears the 2 x 128 B floor for packed pricing.
+    rank._update_memory_profile(plan, 100_000, retained_bytes=66_000)
     observed = rank._plan_cost(candidate)
     if trusted:
         rows = _PACKED_PRICED_LOGICAL_ROW_BYTES * (logical_tokens - packed_tokens)
-        assert observed.retained == int((40_000 + 200 * packed_tokens + rows) * 1.1)
+        assert observed.retained == int((40_000 + 260 * packed_tokens + rows) * 1.1)
         assert observed.retained < observed.required
     else:
         assert observed.retained == observed.required

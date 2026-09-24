@@ -4053,13 +4053,10 @@ class TrainerRank:
         if ratio > profile.logical_per_packed * _MEMORY_PROFILE_TRUST_GROWTH:
             return required
         rate = profile.retained_compute_bytes_per_token
-        if _packed_priced(signature, profile):
-            # Saved head indices and masks stay live until backward; charge them
-            # while that keeps retention monotone in packed rows.
-            retained_compute = rate * packed_tokens + (
-                _packed_row_bytes(profile, packed_tokens, logical_tokens)
-                if rate >= _PACKED_PRICED_LOGICAL_ROW_BYTES * profile.logical_per_packed
-                else 0
+        if _packed_priced(signature, profile) and rate >= _packed_rate_floor(profile):
+            # Saved head indices and masks stay live until backward.
+            retained_compute = rate * packed_tokens + _packed_row_bytes(
+                profile, packed_tokens, logical_tokens
             )
         else:
             retained_compute = rate * max(
@@ -7728,22 +7725,7 @@ class TrainerRank:
             # state (fp32), plus convolution history. Unlike token activations,
             # these do not shrink with segment length.
             gdn_state_bytes = (
-                2
-                * gdn_segments
-                * gdn_layers
-                / tp
-                * (
-                    4
-                    * geometry.gdn_value_heads
-                    * geometry.gdn_key_head_dim
-                    * geometry.gdn_value_head_dim
-                    + self._param_dtype_size
-                    * (
-                        2 * geometry.gdn_key_heads * geometry.gdn_key_head_dim
-                        + geometry.gdn_value_heads * geometry.gdn_value_head_dim
-                    )
-                    * max(0, geometry.gdn_conv_kernel - 1)
-                )
+                gdn_segments * gdn_layers * self._gdn_segment_layer_bytes()
             )
             static_compute = max(
                 static_compute,
@@ -7803,14 +7785,45 @@ class TrainerRank:
         else:
             compute = max(
                 static_compute,
-                int(profiled.bytes_per_token * profiled_tokens)
-                + (
-                    _packed_row_bytes(profiled, packed_tokens, logical_tokens)
-                    if packed_priced and logical_tokens is not None
-                    else 0
+                int(
+                    profiled.bytes_per_token * profiled_tokens
+                    + (
+                        _packed_row_bytes(profiled, packed_tokens, logical_tokens)
+                        # Branch states grow with segments, not packed rows: one
+                        # recomputed layer at a time, or every GDN layer.
+                        + gdn_segments
+                        * self._gdn_segment_layer_bytes()
+                        * (
+                            1
+                            if self._recompute_granularity == "full"
+                            else min(self._num_layers, self._gdn_layers)
+                        )
+                        if packed_priced and logical_tokens is not None
+                        else 0
+                    )
                 ),
             )
         return int((output_bytes + compute) * _MEMORY_SAFETY_FACTOR)
+
+    def _gdn_segment_layer_bytes(self) -> float:
+        """Initial and final fp32 recurrent states plus convolution history."""
+        geometry = self._geometry
+        return (
+            2
+            / max(1, self._topology_key()[1])
+            * (
+                4
+                * geometry.gdn_value_heads
+                * geometry.gdn_key_head_dim
+                * geometry.gdn_value_head_dim
+                + self._param_dtype_size
+                * (
+                    2 * geometry.gdn_key_heads * geometry.gdn_key_head_dim
+                    + geometry.gdn_value_heads * geometry.gdn_value_head_dim
+                )
+                * max(0, geometry.gdn_conv_kernel - 1)
+            )
+        )
 
     def _available_memory_bytes(self, sample: dict[str, Any] | None = None) -> int:
         if not (torch.cuda.is_available() and self.device.type == "cuda"):
@@ -8728,15 +8741,21 @@ _PACKED_PRICED_MIXES = frozenset({"target:single", "inactive"})
 _PACKED_PRICED_LOGICAL_ROW_BYTES = 128
 
 
+def _packed_rate_floor(profile: "_MemoryProfile") -> float:
+    """A per-packed rate at least twice the per-row charges it offsets.
+
+    Fewer packed rows then always cost less, with margin for rounding, so
+    lower-bound pruning over more-shared layouts stays sound.
+    """
+    return 2 * _PACKED_PRICED_LOGICAL_ROW_BYTES * profile.logical_per_packed
+
+
 def _packed_priced(signature: "_MemorySignature", profile: "_MemoryProfile") -> bool:
-    # Per-row charges must not outgrow the per-packed rate, or a more-shared
-    # layout could cost more and break lower-bound pruning.
     return (
         bool(signature.grad_modes)
         and all(signature.grad_modes)
         and _PACKED_PRICED_MIXES.issuperset(signature.request_mix)
-        and profile.bytes_per_token
-        >= _PACKED_PRICED_LOGICAL_ROW_BYTES * profile.logical_per_packed
+        and profile.bytes_per_token >= _packed_rate_floor(profile)
     )
 
 

@@ -359,17 +359,58 @@ def test_packed_pricing_is_limited_to_grad_single_target_mixes():
     # Others keep the logical/packed extrapolation: 64 / 2 profiled rows.
     for name in ("no_grad", "mixed_grad", "hidden", "wide"):
         assert estimate(name) == int(100_000 * 32 * 1.1)
-    # Per-row charges above the profiled rates would break lower-bound pruning:
-    # a small retained rate omits the rows, and a small per-packed rate
-    # extrapolates.
+    # Per-row charges must stay well below the profiled rates, or a more-shared
+    # layout could cost more: under 2 x 128 B x ratio, both costs extrapolate.
+    floor = 2 * _PACKED_PRICED_LOGICAL_ROW_BYTES * 2
     rank._memory_profiles[single] = replace(
-        profile, retained_compute_bytes_per_token=255
+        profile, retained_compute_bytes_per_token=floor - 1
     )
     assert rank._retained_memory_bytes(
         single, packed_tokens=8, logical_tokens=64, output_bytes=0, required=1 << 40
-    ) == int(255 * 8 * 1.1)
-    rank._memory_profiles[single] = replace(profile, bytes_per_token=255)
-    assert estimate("single") == int(255 * 32 * 1.1)
+    ) == int((floor - 1) * 32 * 1.1)
+    rank._memory_profiles[single] = replace(profile, bytes_per_token=floor - 1)
+    assert estimate("single") == int((floor - 1) * 32 * 1.1)
+    # At and above the floor, cost never falls as packed rows grow.
+    for rate in (floor, floor + 1, 100_000):
+        rank._memory_profiles[single] = replace(
+            profile, bytes_per_token=rate, retained_compute_bytes_per_token=rate
+        )
+        costs = [
+            rank._subforward_cost(
+                packed_tokens=packed,
+                logical_tokens=64,
+                output_bytes=0,
+                signature=single,
+            )
+            for packed in range(1, 65)
+        ]
+        assert all(a.required <= b.required for a, b in zip(costs, costs[1:]))
+        assert all(a.retained <= b.retained for a, b in zip(costs, costs[1:]))
+    # GDN branch states grow with segments, not packed rows.
+    rank._memory_profiles[single] = profile
+    rank._geometry = replace(
+        rank._geometry,
+        gdn_key_heads=1,
+        gdn_key_head_dim=4,
+        gdn_value_heads=2,
+        gdn_value_head_dim=4,
+        gdn_conv_kernel=4,
+    )
+    live = 1 if rank._recompute_granularity == "full" else rank._gdn_layers
+    assert live * rank._gdn_segment_layer_bytes() > 0
+
+    def segments(count):
+        return rank._estimate_required_memory_bytes_from_values(
+            packed_tokens=8,
+            logical_tokens=64,
+            output_bytes=0,
+            signature=single,
+            gdn_segments=count,
+        )
+
+    assert segments(3) - segments(0) == pytest.approx(
+        3 * live * rank._gdn_segment_layer_bytes() * 1.1, abs=1
+    )
     # Flattened-axis wide labels are not single-target.
     tokens = torch.arange(4).reshape(1, 4)
     wide = ForwardInput(input_tokens=tokens, target_tokens=torch.zeros(4, 3).long())
