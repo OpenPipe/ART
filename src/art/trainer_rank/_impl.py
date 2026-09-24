@@ -4052,15 +4052,20 @@ class TrainerRank:
         ratio = logical_tokens / max(1, packed_tokens)
         if ratio > profile.logical_per_packed * _MEMORY_PROFILE_TRUST_GROWTH:
             return required
-        tokens = (
-            packed_tokens
-            if _packed_priced(signature)
-            else max(packed_tokens, logical_tokens / profile.logical_per_packed)
-        )
-        retained = output_bytes + max(
-            checkpoint_retained_bytes,
-            profile.retained_compute_bytes_per_token * tokens,
-        )
+        rate = profile.retained_compute_bytes_per_token
+        if _packed_priced(signature, profile):
+            # Saved head indices and masks stay live until backward; charge them
+            # while that keeps retention monotone in packed rows.
+            retained_compute = rate * packed_tokens + (
+                _packed_row_bytes(profile, packed_tokens, logical_tokens)
+                if rate >= _PACKED_PRICED_LOGICAL_ROW_BYTES * profile.logical_per_packed
+                else 0
+            )
+        else:
+            retained_compute = rate * max(
+                packed_tokens, logical_tokens / profile.logical_per_packed
+            )
+        retained = output_bytes + max(checkpoint_retained_bytes, retained_compute)
         return min(required, int(retained * _MEMORY_SAFETY_FACTOR))
 
     def _split_request_order(
@@ -7785,7 +7790,7 @@ class TrainerRank:
         # cancelling packed tokens through two float operations can otherwise
         # make a larger warm layout cheaper.
         profiled_tokens: int | float = packed_tokens
-        packed_priced = _packed_priced(signature)
+        packed_priced = profiled is not None and _packed_priced(signature, profiled)
         if profiled is not None and logical_tokens is not None and not packed_priced:
             profiled_tokens = max(
                 packed_tokens, logical_tokens / profiled.logical_per_packed
@@ -7800,10 +7805,7 @@ class TrainerRank:
                 static_compute,
                 int(profiled.bytes_per_token * profiled_tokens)
                 + (
-                    _PACKED_PRICED_LOGICAL_ROW_BYTES
-                    * max(
-                        0, logical_tokens - packed_tokens * profiled.logical_per_packed
-                    )
+                    _packed_row_bytes(profiled, packed_tokens, logical_tokens)
                     if packed_priced and logical_tokens is not None
                     else 0
                 ),
@@ -8726,9 +8728,24 @@ _PACKED_PRICED_MIXES = frozenset({"target:single", "inactive"})
 _PACKED_PRICED_LOGICAL_ROW_BYTES = 128
 
 
-def _packed_priced(signature: "_MemorySignature") -> bool:
-    return signature.grad_modes == (True,) and _PACKED_PRICED_MIXES.issuperset(
-        signature.request_mix
+def _packed_priced(signature: "_MemorySignature", profile: "_MemoryProfile") -> bool:
+    # Per-row charges must not outgrow the per-packed rate, or a more-shared
+    # layout could cost more and break lower-bound pruning.
+    return (
+        bool(signature.grad_modes)
+        and all(signature.grad_modes)
+        and _PACKED_PRICED_MIXES.issuperset(signature.request_mix)
+        and profile.bytes_per_token
+        >= _PACKED_PRICED_LOGICAL_ROW_BYTES * profile.logical_per_packed
+    )
+
+
+def _packed_row_bytes(
+    profile: "_MemoryProfile", packed_tokens: int, logical_tokens: int
+) -> float:
+    """Head buffers for logical rows beyond the profile's observed sharing."""
+    return _PACKED_PRICED_LOGICAL_ROW_BYTES * max(
+        0, logical_tokens - packed_tokens * profile.logical_per_packed
     )
 
 

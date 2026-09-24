@@ -322,29 +322,54 @@ def test_packed_pricing_is_limited_to_grad_single_target_mixes():
     rank._update_memory_profile(observed, 10_000, retained_bytes=1000)
     single = observed.signature
     assert single.grad_modes == (True,)
-    assert rank._memory_profiles[single].logical_per_packed == 1
-    excluded = (
-        replace(single, grad_modes=(False,)),
-        replace(single, request_mix=("hidden",)),
-        replace(single, request_mix=("target:(2,)",)),
+    profile = replace(
+        rank._memory_profiles[single],
+        bytes_per_token=100_000,
+        retained_compute_bytes_per_token=50_000,
+        logical_per_packed=2,
     )
-    for signature in excluded:
-        rank._memory_profiles[signature] = rank._memory_profiles[single]
+    signatures = {
+        "single": single,
+        "multi_grad": replace(single, grad_modes=(True, True)),
+        "no_grad": replace(single, grad_modes=(False,)),
+        "mixed_grad": replace(single, grad_modes=(False, True)),
+        "hidden": replace(single, request_mix=("hidden",)),
+        "wide": replace(single, request_mix=("target:(2,)",)),
+    }
+    for signature in signatures.values():
+        rank._memory_profiles[signature] = profile
 
-    def estimate(signature, logical_tokens=64):
+    def estimate(name):
         return rank._estimate_required_memory_bytes_from_values(
             packed_tokens=8,
-            logical_tokens=logical_tokens,
+            logical_tokens=64,
             output_bytes=0,
-            signature=signature,
+            signature=signatures[name],
         )
 
-    # No-grad, dense-output and wide-label signatures keep the logical/packed
-    # extrapolation; single-target sharing adds only per-row head buffers.
-    assert all(estimate(single) < estimate(signature) for signature in excluded)
-    assert estimate(single, 72) - estimate(single, 64) == pytest.approx(
-        8 * _PACKED_PRICED_LOGICAL_ROW_BYTES * 1.1, abs=1
+    # Packed rows plus head buffers for logical rows beyond the profile's 2x.
+    rows = _PACKED_PRICED_LOGICAL_ROW_BYTES * (64 - 8 * 2)
+    assert (
+        estimate("single") == estimate("multi_grad") == int((100_000 * 8 + rows) * 1.1)
     )
+    retained = rank._retained_memory_bytes(
+        single, packed_tokens=8, logical_tokens=64, output_bytes=0, required=1 << 40
+    )
+    assert retained == int((50_000 * 8 + rows) * 1.1)
+    # Others keep the logical/packed extrapolation: 64 / 2 profiled rows.
+    for name in ("no_grad", "mixed_grad", "hidden", "wide"):
+        assert estimate(name) == int(100_000 * 32 * 1.1)
+    # Per-row charges above the profiled rates would break lower-bound pruning:
+    # a small retained rate omits the rows, and a small per-packed rate
+    # extrapolates.
+    rank._memory_profiles[single] = replace(
+        profile, retained_compute_bytes_per_token=255
+    )
+    assert rank._retained_memory_bytes(
+        single, packed_tokens=8, logical_tokens=64, output_bytes=0, required=1 << 40
+    ) == int(255 * 8 * 1.1)
+    rank._memory_profiles[single] = replace(profile, bytes_per_token=255)
+    assert estimate("single") == int(255 * 32 * 1.1)
     # Flattened-axis wide labels are not single-target.
     tokens = torch.arange(4).reshape(1, 4)
     wide = ForwardInput(input_tokens=tokens, target_tokens=torch.zeros(4, 3).long())
